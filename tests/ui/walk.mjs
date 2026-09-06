@@ -171,7 +171,8 @@ class Watcher {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const TABS = ['dashboard', 'nodes', 'alerts', 'netpath', 'netflow', 'snmp',
-              'syslog', 'ipam', 'wireless', 'configrx', 'debug', 'settings'];
+              'syslog', 'ipam', 'wireless', 'configrx', 'mapper', 'debug',
+              'settings'];
 
 async function settle(page, ms = 700) {
   try {

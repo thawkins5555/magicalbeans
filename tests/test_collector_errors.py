@@ -220,9 +220,15 @@ def test_r2_writer_thread_survives_and_running_reflects_death() -> None:
               "a batch that raises is counted as an error")
         check(collector.running,
               "the writer thread is still alive after the failing batch")
-        check(any(event.category == eventlog.ERROR
+        # wait_for, not a bare read: collector._note_write_error bumps the
+        # error counter (_sync_error_counter) BEFORE it writes the event
+        # (_log_throttled), so the wait_for above can return in the gap
+        # between those two lines. Under load that gap is wide enough to
+        # fail this check on a collector that is behaving perfectly.
+        check(wait_for(lambda: any(
+                  event.category == eventlog.ERROR
                   and "batch of flows" in event.message
-                  for event in log.all()),
+                  for event in log.all())),
               "the failure is visible in the event log, not just stderr")
 
         flow_db.insert_flows = original_insert

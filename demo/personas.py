@@ -38,11 +38,14 @@ from netpath.nodeoids import (                        # noqa: E402
     CDP_CACHE_PLATFORM, CISCO_POE_PORT_POWER_MW, DOT1D_STP_DESIGNATED_ROOT,
     DOT1D_STP_PORT_STATE, DOT1D_STP_PRIORITY, DOT1D_STP_PROTOCOL_SPEC,
     DOT1D_STP_ROOT_COST, DOT1D_STP_ROOT_PORT, DOT1D_STP_TIME_SINCE_CHANGE,
-    DOT1D_STP_TOP_CHANGES, LLDP_REM_CHASSIS_ID, LLDP_REM_CHASSIS_ID_SUBTYPE,
-    LLDP_REM_PORT_DESC, LLDP_REM_PORT_ID, LLDP_REM_PORT_ID_SUBTYPE,
-    LLDP_REM_SYS_DESC, LLDP_REM_SYS_NAME, PETH_MAIN_PSE_CONSUMPTION,
-    PETH_MAIN_PSE_OPER_STATUS, PETH_MAIN_PSE_POWER, PETH_PSE_PORT_ADMIN,
-    PETH_PSE_PORT_DETECTION, oid_key,
+    DOT1D_STP_TOP_CHANGES, DOT1Q_PVID, DOT1Q_VLAN_CURRENT_EGRESS,
+    DOT1Q_VLAN_CURRENT_UNTAGGED, DOT1Q_VLAN_STATIC_EGRESS,
+    DOT1Q_VLAN_STATIC_NAME, DOT1Q_VLAN_STATIC_UNTAGGED, LLDP_REM_CHASSIS_ID,
+    LLDP_REM_CHASSIS_ID_SUBTYPE, LLDP_REM_PORT_DESC, LLDP_REM_PORT_ID,
+    LLDP_REM_PORT_ID_SUBTYPE, LLDP_REM_SYS_DESC, LLDP_REM_SYS_NAME,
+    PETH_MAIN_PSE_CONSUMPTION, PETH_MAIN_PSE_OPER_STATUS, PETH_MAIN_PSE_POWER,
+    PETH_PSE_PORT_ADMIN, PETH_PSE_PORT_DETECTION, VTP_TRUNK_DYNAMIC_STATUS,
+    VTP_TRUNK_NATIVE_VLAN, VTP_TRUNK_VLANS_ENABLED, VTP_VLAN_NAME, oid_key,
 )
 from netpath.trapdecode import (                      # noqa: E402
     T_COUNTER32, T_COUNTER64, T_GAUGE32, T_INTEGER, T_IPADDRESS,
@@ -570,6 +573,140 @@ def vtp_vlans(vlans) -> dict:
     return entries
 
 
+# ------------------------------------------------- per-port VLAN membership
+#
+# nodepoll.read_device_vlans (the walk behind MAPPER's per-VLAN strands)
+# reads Q-BRIDGE-MIB dot1qVlanStatic*/dot1qPvid and, on Cisco gear,
+# CISCO-VTP-MIB's own trunk tables — none of which vtp_vlans/qbridge_fdb
+# above answer (those feed the unrelated per-VLAN-community MAC/FDB path).
+# The two bitmap conventions below are NOT interchangeable, reasoned from
+# each MIB's own DESCRIPTION rather than copied off nodepoll's decoder:
+#   - encode_port_list is Q-BRIDGE-MIB's PortList (RFC 4363): 1-based —
+#     bridge port 1 is octet 0's most significant bit.
+#   - encode_vlan_bitmap is CISCO-VTP-MIB's vlanTrunkPortVlansEnabled*:
+#     0-based — VLAN 0 is octet 0's most significant bit — a genuinely
+#     different origin a real agent's own firmware has to get right, and
+#     the exact distinction nodepoll._decode_port_list/_decode_vlan_bitmap
+#     document on the decoding side. Both share the same big-endian,
+#     most-significant-bit-first octet layout; they differ only in what a
+#     bit position numbers, which is why they are two functions rather
+#     than one with a "which convention" flag.
+# tests/test_port_vlans.py exercises both decoders directly against
+# hand-computed bytes, so these encoders are checked here by reasoning
+# from that same MIB layout and then confirming the round trip, not by
+# copying whatever the decoder currently happens to do.
+
+def _encode_bitmap(positions) -> bytes:
+    """Bitmap bytes for a set of 0-based bit positions (position 0 = octet
+    0's most significant bit), the shared big-endian scan both
+    encode_port_list and encode_vlan_bitmap use — they differ only in how
+    a real port/VLAN number becomes a position, not in this layout."""
+    positions = set(positions)
+    if not positions:
+        return b""
+    n_octets = max(positions) // 8 + 1
+    out = bytearray(n_octets)
+    for p in positions:
+        out[p // 8] |= 0x80 >> (p % 8)
+    return bytes(out)
+
+
+def encode_port_list(ports) -> bytes:
+    """A Q-BRIDGE-MIB PortList (dot1qVlanStatic/CurrentEgress/UntaggedPorts):
+    1-based — bridge port N sits at position N-1, so octet 0's most
+    significant bit is bridge port 1, not port 0. See nodepoll.
+    _decode_port_list, which this must round-trip through unchanged."""
+    return _encode_bitmap(p - 1 for p in ports)
+
+
+def encode_vlan_bitmap(vlans, base: int = 0) -> bytes:
+    """One CISCO-VTP-MIB vlanTrunkPortVlansEnabled* column's bitmap slice:
+    0-based — VLAN `base` sits at position 0, so octet 0's most significant
+    bit is VLAN `base` itself, unlike encode_port_list's +1 PortList
+    convention above. Only VLANs actually inside [base, base+1024) are
+    encoded; a caller builds all four real columns (base 0/1024/2048/3072)
+    by calling this once per base. See nodepoll._decode_vlan_bitmap, which
+    this must round-trip through unchanged."""
+    return _encode_bitmap(v - base for v in vlans if base <= v < base + 1024)
+
+
+def qbridge_vlan_table(vlan_names: dict | None = None,
+                       egress_ports: dict | None = None,
+                       untagged_ports: dict | None = None, *,
+                       current: bool = False) -> dict:
+    """dot1qVlanStaticName/EgressPorts/UntaggedPorts — the Q-BRIDGE-MIB
+    standards path nodepoll.read_device_vlans walks before it ever looks at
+    Cisco's own tables. `current=True` switches EgressPorts/UntaggedPorts
+    to the dot1qVlanCurrent* fallback pair nodepoll consults only when the
+    static table answered nothing at all (a VTP/GVRP client legitimately
+    carries no static configuration of its own) — that pair has no name
+    column, so `vlan_names` is ignored when `current` is set.
+
+    `egress_ports`/`untagged_ports`: {vlan: [bridge ports]}, the SAME
+    bridge-port numbering bridge_ports()/the FDB tables use, PortList-
+    encoded (encode_port_list). A port in a VLAN's egress list but not its
+    untagged list carries that VLAN tagged (a trunk); in both, untagged —
+    dot1q_pvid below names which VLAN that untagged membership actually
+    means for the port, i.e. its access/native VLAN.
+    """
+    egress_oid = DOT1Q_VLAN_CURRENT_EGRESS if current else DOT1Q_VLAN_STATIC_EGRESS
+    untagged_oid = DOT1Q_VLAN_CURRENT_UNTAGGED if current else DOT1Q_VLAN_STATIC_UNTAGGED
+    entries: dict = {}
+    if not current:
+        for vlan, name in (vlan_names or {}).items():
+            entries[f"{DOT1Q_VLAN_STATIC_NAME}.{vlan}"] = (T_OCTET_STRING, name)
+    for vlan, ports in (egress_ports or {}).items():
+        entries[f"{egress_oid}.{vlan}"] = (T_OCTET_STRING, encode_port_list(ports))
+    for vlan, ports in (untagged_ports or {}).items():
+        entries[f"{untagged_oid}.{vlan}"] = (T_OCTET_STRING, encode_port_list(ports))
+    return entries
+
+
+def dot1q_pvid(port_native: dict) -> dict:
+    """dot1qPvid.<bridge port> — the VLAN an untagged membership actually
+    means for that port, i.e. its access/native VLAN. Pairs with
+    qbridge_vlan_table's untagged-ports bitmap; keyed by the same bridge
+    port numbers, not ifIndex."""
+    return {f"{DOT1Q_PVID}.{port}": (T_INTEGER, vlan)
+            for port, vlan in port_native.items()}
+
+
+def vtp_vlan_names(names: dict) -> dict:
+    """vtpVlanName — the Cisco-only VLAN name table nodepoll prefers over
+    dot1qVlanStaticName on Cisco gear (a real VTP domain names its VLANs
+    once, the same way for every switch trunked into it, regardless of
+    which VLANs any one switch's own ports currently use). NOT the same
+    OID as vtp_vlans()'s vtpVlanState table above — that is a different
+    object (arc .2, "is this VLAN operational") answering a different
+    feature (the per-VLAN-community MAC/FDB path)."""
+    return {f"{VTP_VLAN_NAME}.{vlan}": (T_OCTET_STRING, name)
+            for vlan, name in names.items()}
+
+
+def vtp_access_decoy(if_indexes) -> dict:
+    """The vlanTrunkPortDynamicStatus/NativeVlan/VlansEnabled answer a REAL
+    Cisco access port still gives on classic IOS: notTrunking(2), plus
+    IOS's own defaults for the two columns that only mean anything for an
+    actual trunk — native VLAN 1, and "every VLAN allowed" (modelled here
+    as just VLAN 1, standing in for that default the same way
+    tests/stubs/stub_agent_vlan.py's cisco_mixed mode does). Finding 3,
+    4.54.0 review: vlanTrunkPortDynamicStatus answers for EVERY switchport,
+    not only trunks, so applying its allow-list unconditionally used to
+    throw away a correctly-read access VLAN (dot1qPvid) in favour of a
+    fabricated ~4094-VLAN trunk on every access port; nodepoll.
+    read_device_vlans now ignores this decoy in favour of the Q-BRIDGE
+    answer whenever dynamicStatus != trunking(1). Included on a couple of
+    this fleet's access ports so the demo actually exercises the gate
+    rather than merely never triggering the bug it fixes."""
+    entries: dict = {}
+    for if_index in if_indexes:
+        entries[f"{VTP_TRUNK_DYNAMIC_STATUS}.{if_index}"] = (T_INTEGER, 2)
+        entries[f"{VTP_TRUNK_NATIVE_VLAN}.{if_index}"] = (T_INTEGER, 1)
+        entries[f"{VTP_TRUNK_VLANS_ENABLED}.{if_index}"] = (
+            T_OCTET_STRING, encode_vlan_bitmap((1,), 0))
+    return entries
+
+
 def entity_sensors(port_sensors: dict, parent_label: str | None = None,
                    link_to_if: bool = True) -> dict:
     """ENTITY-MIB + ENTITY-SENSOR-MIB for a handful of sensors: entPhysical-
@@ -852,6 +989,51 @@ DOM_SENSORS = [
     ("Transceiver rx power", 1, "dBm", -5.8, 1.4),
 ]
 
+# The plant's VTP domain: one VLAN database every Cisco switch answers the
+# same way (vtp_vlan_names), whether or not a given switch's own ports
+# currently use every entry in it — a real VTP client mirrors the whole
+# database, not just what one trunk allows through. Real names, not
+# placeholders, so a strand's tooltip on the MAPPER map says something an
+# operator would actually recognise.
+PLANT_VLAN_NAMES = {
+    10: "data", 20: "voice", 30: "guest", 40: "printers", 50: "cameras",
+    60: "building-mgmt", 70: "iot", 80: "backup", 90: "dmz", 100: "mgmt",
+}
+
+# Each access switch's uplink trunk carries a different slice of the plant
+# VLAN database — real wiring-closet variation, and the reason the MAPPER
+# map this fleet seeds draws more than one identical-looking trunk. Most
+# closets carry a small, human-sized set (drawn as individual coloured
+# strands, below mapperdb.DEFAULTS' default 8-VLAN collapse threshold);
+# acc-sw-010 is deliberately the exception, a closet aggregating the whole
+# plant VLAN set, wide enough to cross that threshold and draw as one
+# thick collapsed line instead. Keyed by name (not index) because every
+# cisco_access device shares one memoised Table (Persona.table()) — the
+# uplink's own vlanTrunkPortVlansEnabled entry below reads this per
+# DeviceState at reply time via `st.name`, the same "shared table, per-
+# device value" pattern DeviceState.mac()/uptime_ticks() already use.
+_ACCESS_TRUNK_VLANS = {
+    "acc-sw-001": (10, 20),
+    "acc-sw-002": (10, 20, 30),
+    "acc-sw-003": (10, 20, 30),
+    "acc-sw-004": (10, 20, 30, 40, 50),
+    "acc-sw-005": (10, 20, 30, 40, 50),
+    "acc-sw-006": (10, 20, 30),
+    "acc-sw-007": (10, 20),
+    "acc-sw-008": (10, 20, 30),
+    "acc-sw-009": (10, 20, 30, 40, 50),
+    "acc-sw-010": tuple(PLANT_VLAN_NAMES),
+}
+_DEFAULT_TRUNK_VLANS = (10, 20, 30)
+
+
+def _access_trunk_vlans(name: str) -> tuple[int, ...]:
+    """The uplink VLAN set for the access switch named `name` — every
+    cisco_access instance beyond the ten named in _ACCESS_TRUNK_VLANS (the
+    weighted mix, at a large enough --count) gets the same ordinary
+    3-VLAN closet rather than an empty trunk."""
+    return _ACCESS_TRUNK_VLANS.get(name, _DEFAULT_TRUNK_VLANS)
+
 
 def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     access = 48
@@ -868,6 +1050,29 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
         tablet_ports={103: APPLE_OUI, 107: SAMSUNG_OUI})
     entries.update(bridge_ports(port_to_if))
     entries.update(qbridge_fdb(port_macs, vlan=10))
+    # Per-port VLAN membership (Q-BRIDGE-MIB standards path): a real
+    # closet's ports are not all on one VLAN — most desks sit on "data",
+    # a handful of ports feed IP phones on "voice", and one or two are the
+    # guest-wifi AP's uplink. Each access port carries exactly ONE VLAN
+    # untagged (dot1qPvid names it) — the corrected behaviour Finding 3
+    # (4.54.0 review) fixed: these ports must NOT pick up the uplink
+    # trunk's whole allow-list below.
+    if_to_port = {if_index: port for port, if_index in port_to_if.items()}
+    access_vlan_ports = {
+        10: [if_to_port[i] for i in range(1, access - 7)],
+        20: [if_to_port[i] for i in range(access - 7, access - 1)],
+        30: [if_to_port[i] for i in range(access - 1, access + 1)],
+    }
+    entries.update(qbridge_vlan_table(
+        vlan_names={v: PLANT_VLAN_NAMES[v] for v in access_vlan_ports},
+        egress_ports=access_vlan_ports, untagged_ports=access_vlan_ports))
+    entries.update(dot1q_pvid({port: vlan for vlan, ports in access_vlan_ports.items()
+                              for port in ports}))
+    # A couple of these same access ports also answer the Cisco trunk
+    # decoy a real IOS access port gives (see vtp_access_decoy's own
+    # comment) — proving nodepoll ignores it in favour of dot1qPvid above,
+    # not merely never triggering the bug that decoy used to cause.
+    entries.update(vtp_access_decoy([1, 2]))
     entries.update(entity_sensors({access + 1: DOM_SENSORS,
                                    access + 2: DOM_SENSORS}))
     entries.update(host_resources(1, [("Physical memory", 1024, 524288, 0.61)]))
@@ -890,6 +1095,26 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     entries.update(cdp_neighbor(
         uplink_if, device_id="core-sw-01", device_port="GigabitEthernet1/0/1",
         platform="cisco WS-C9500-24Y4C"))
+    # The same uplink is a real Cisco trunk: CISCO-VTP-MIB supersedes the
+    # Q-BRIDGE standards answer for this ONE port (uplink_if), never for
+    # the access ports above — see nodepoll.read_device_vlans' authority
+    # order. The allow-list varies per device (_access_trunk_vlans reads
+    # st.name at reply time, since every cisco_access instance shares one
+    # memoised Table — see _ACCESS_TRUNK_VLANS' own comment), which is what
+    # gives the MAPPER map more than one identical-looking trunk: most
+    # closets draw as a handful of coloured strands, acc-sw-010's draws as
+    # one collapsed line past mapperdb.DEFAULTS' 8-VLAN threshold. Every
+    # VLAN this fleet ever assigns is below 1024, so only the base-0
+    # column ever has anything to answer.
+    entries[f"{VTP_TRUNK_DYNAMIC_STATUS}.{uplink_if}"] = (T_INTEGER, 1)   # trunking
+    entries[f"{VTP_TRUNK_NATIVE_VLAN}.{uplink_if}"] = (T_INTEGER, 10)     # native: data
+    entries[f"{VTP_TRUNK_VLANS_ENABLED}.{uplink_if}"] = (
+        T_OCTET_STRING,
+        lambda st, now: encode_vlan_bitmap(_access_trunk_vlans(st.name), 0))
+    # vtpVlanName: the whole plant VLAN database, the same on every switch
+    # trunked into it, whether or not this switch's own uplink currently
+    # carries every entry — see PLANT_VLAN_NAMES' own comment.
+    entries.update(vtp_vlan_names(PLANT_VLAN_NAMES))
     # PoE: every access port capable, roughly a third actually drawing
     # power right now — a real closet switch with more PoE ports than
     # currently-plugged-in phones/APs.
@@ -918,6 +1143,11 @@ def _build_cisco_core(wrap32: bool, ports: int, vlan: str | None) -> dict:
     port_macs, port_to_if = _switch_fdb_ports(access + uplinks, 6, "core")
     entries.update(bridge_ports(port_to_if))
     entries.update(vtp_vlans(CORE_VLANS))
+    # vtpVlanName: the same whole plant VLAN database every access switch
+    # answers (PLANT_VLAN_NAMES' own comment) — core-sw-01 is this VTP
+    # domain's server, so it names every VLAN in it, not just the ones its
+    # own downlinks currently carry.
+    entries.update(vtp_vlan_names(PLANT_VLAN_NAMES))
     entries.update(entity_sensors({access + i: DOM_SENSORS
                                    for i in range(1, uplinks + 1)}))
     entries.update(host_resources(2, [("Physical memory", 1024, 2097152, 0.48)]))
@@ -950,6 +1180,17 @@ def _build_cisco_core(wrap32: bool, ports: int, vlan: str | None) -> dict:
             entries.update(cdp_neighbor(
                 n, device_id=name, device_port="GigabitEthernet1/0/49",
                 platform="cisco WS-C2960X-48FPD-L"))
+            # The core's own end of the SAME trunk acc-sw-NNN's uplink_if
+            # answers above — same allow-list per access switch
+            # (_access_trunk_vlans), same native VLAN, so both ends of one
+            # physical cable agree on what it carries. core-sw-01 is a
+            # single fixed device (unlike cisco_access, never shared with
+            # a differently-named instance), so this is computed once at
+            # build time rather than read from `st.name` at reply time.
+            entries[f"{VTP_TRUNK_DYNAMIC_STATUS}.{n}"] = (T_INTEGER, 1)
+            entries[f"{VTP_TRUNK_NATIVE_VLAN}.{n}"] = (T_INTEGER, 10)
+            entries[f"{VTP_TRUNK_VLANS_ENABLED}.{n}"] = (
+                T_OCTET_STRING, encode_vlan_bitmap(_access_trunk_vlans(name), 0))
         entries.update(dot1d_stp(priority=4096, root_cost=0, root_port=0))
         entries.update(dot1d_stp_ports({port: 5 for port in port_to_if}))
     return entries

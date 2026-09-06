@@ -12,8 +12,9 @@ fixing, not just using.
 
 - [Layout](#layout) — the file map
 - [Process model](#process-model) — threads, who owns which loop
-- [Data layer](#data-layer) — the ten databases, migrations, retention
+- [Data layer](#data-layer) — the eleven databases, migrations, retention
 - [Nodes](#nodes) — the SNMP poller, the wire, the scheduler, the write path
+- [MAPPER](#mapper) — link assembly, the render plan, VLAN membership
 - [Alerts](#alerts) — occurrences, dedup keys, rollup, notification
 - [NetPath](#netpath) · [NetFlow](#netflow) · [SNMP Trap](#snmp-trap) · [Syslog](#syslog) · [IPAM](#ipam)
 - [Self-update (`selfupdate.py`)](#self-update-selfupdatepy)
@@ -132,7 +133,7 @@ tests/
 
 One process, several threads, no external dependencies beyond the standard
 library (PySide6 only for the console window). `netpath/__main__.py`'s
-`main()` builds a `Service` (`web/service.py`), which opens ten SQLite
+`main()` builds a `Service` (`web/service.py`), which opens eleven SQLite
 connections and starts every background worker, then either hands it to a
 `WebServer` alone (`--headless`) or to both a `WebServer` and a
 `ConsoleWindow` (default). Every module below is a thread or a pool of
@@ -204,7 +205,7 @@ trace scheduler this class was copied from.
 
 ## Data layer
 
-Ten SQLite files, every `*Database` class subclassing `SqliteStore`
+Eleven SQLite files, every `*Database` class subclassing `SqliteStore`
 (`netpath/sqlitebase.py`). `sqlitebase.connect()` opens the file at
 owner-only permissions (mode 0600, POSIX only) and sets `busy_timeout=5000`,
 `cache_size=-20000` and `mmap_size=268435456` once, here, so no module can
@@ -270,10 +271,15 @@ message rows never disagree; `nodesdb.py` and `alertsdb.py` keep their own
 dominant one. `Service.run_maintenance()` (`web/service.py`) calls
 `Service._trim_db()` for each of the seven databases that has a
 `max_*_db_mb` setting (netpath, flow, syslog, snmp, ipam, nodes, alerts —
-not `app.db`, `wireless.db` or `configrx.db`, none of which has a size cap),
-plus the day-based retention prunes for each module,
+not `app.db`, `wireless.db`, `configrx.db` or `mapper.db`, none of which
+has a size cap), plus the day-based retention prunes for each module,
 `AppDatabase.prune_hostnames()` for the reverse-DNS cache and
-`AppDatabase.prune_asn_cache()` for the ASN/owner cache.
+`AppDatabase.prune_asn_cache()` for the ASN/owner cache. `nodes.db`'s own
+retention prune now covers `vlans`/`vlan_ports`/`port_vlans` too
+(`prune_vlans`/`prune_vlan_ports`/`prune_port_vlans`, called from
+`run_maintenance` on the same `mac_table_retention_days` clock as
+`prune_neighbors` — see MAPPER below for why that clock rather than a
+fourth setting).
 
 | File | Owner class | Holds |
 | --- | --- | --- |
@@ -282,10 +288,12 @@ plus the day-based retention prunes for each module,
 | `flows.db` | `FlowDatabase` (`flowdb.py`) | `flows`, `exporters`, `interfaces`, NetFlow's own settings |
 | `syslog.db` | `SyslogDatabase` (`syslogdb.py`) | `logs`, `log_counts` (hourly rollup), the FTS5 index, Syslog's own settings |
 | `ipam.db` | `IpamDatabase` (`ipamdb.py`) | `subnets`, `hosts`, `conflicts`, `scans`, `dhcp_servers`, `dhcp_scopes`, `dhcp_leases`, `dhcp_scope_history` (leased-IP trend), IPAM's own settings |
-| `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `device_groups` (organizational, unrelated to `groups`), `devices`, `interfaces`, `metrics`/`samples`/`samples_hourly`, `device_events`/`interface_events`, `mib_files`/`mib_objects`, `discovery_jobs`/`discovery_results`, Nodes' own settings |
-| `alerts.db` | `AlertsDatabase` (`alertsdb.py`) | `rules`, `templates`, `alerts`, `notifications`, `meta` (per-source evaluation cursors), `smtp_credential`, Alerts' own settings |
+| `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `device_groups` (organizational, unrelated to `groups`), `devices`, `interfaces`, `metrics`/`samples`/`samples_hourly`, `device_events`/`interface_events`, `mib_files`/`mib_objects`, `discovery_jobs`/`discovery_results`, `vlans`/`vlan_ports`/`port_vlans` (per-port VLAN membership, for MAPPER), Nodes' own settings |
+| `alerts.db` | `AlertsDatabase` (`alertsdb.py`) | `rules`, `templates`, `alerts`, `notifications`, `meta` (per-source evaluation cursors), `smtp_credential`, `device_thresholds` (per-device threshold-rule overrides), Alerts' own settings |
+| `snmptraps.db` | `SnmpTrapDatabase` (`snmptrapdb.py`) | `traps` (received traps and informs, decoded), `trap_counts` (hourly rollup), SNMP Trap's own settings |
 | `wireless.db` | `WirelessDatabase` (`wirelessdb.py`) | `controllers` (each with its own SNMP credential columns), `access_points`, `radios`, Wireless' own settings |
 | `configrx.db` | `ConfigRxDatabase` (`configrxdb.py`) | `device_config` (per-device backup settings, SSH credential and optional enable secret, keyed by a Nodes device id with no real FK), `backups` (zlib-compressed, hash-deduped), ConfigRX's own settings |
+| `mapper.db` | `MapperDatabase` (`mapperdb.py`) | `maps`, `map_nodes` (devices/unmanaged peers placed on a map, and where), `vlan_colors` (a global VLAN colour override, not per-map), Mapper's own settings |
 
 ---
 
@@ -847,7 +855,7 @@ action button — is always drawn and never offered for hiding; and a stored
 choice containing no non-fixed column falls back to the defaults, or
 unticking everything would leave a table of nothing but checkboxes, the one
 state with no way out. Storage is a `table_columns` key in the owning
-module's own settings scope (`/api/settings`, nine scopes), never
+module's own settings scope (`/api/settings`, ten scopes), never
 `localStorage`, for the reason `wirelessdb.py:95` gives: Reset layout clears
 per-browser *widths* and must not eat a settings choice. Sort state lives on
 a `view.*Sort` object per table and, since 4.37.0, is seeded from the
@@ -1778,6 +1786,462 @@ so it inherits the heading's size — a line in the body would render as
 
 ---
 
+## MAPPER
+
+MAPPER (`mapper.py`, `mapperdb.py`, `web/static/mapper.js`) is a manually-
+built L2 map: an operator places devices and unmanaged peers on a named
+map and MAPPER draws the links between whatever is placed, resolved live
+against `nodesdb`'s neighbour and VLAN tables. Nothing here polls anything
+of its own — `web/service.py`'s `_apply_mapper` is a documented no-op, and
+`Service.mapper_db`'s path is derived from `configrx_db_path`'s directory
+rather than taking an eleventh constructor argument, specifically so every
+existing call site building a `Service` (every test, `demo/`,
+`__main__.py`'s path resolution) keeps working unmodified.
+
+### Storage (`mapperdb.py`)
+
+`maps` / `map_nodes` / `vlan_colors`. A map row is just a name and notes;
+`map_nodes` is one row per device or unmanaged peer placed on one map,
+`device_id` and `peer_key` mutually exclusive (`add_node` raises unless
+exactly one is set) and enforced unique per map through **two partial
+indexes** — `ux_map_nodes_device` (`WHERE device_id IS NOT NULL`) and
+`ux_map_nodes_peer` (`WHERE peer_key <> ''`) — rather than one composite
+`UNIQUE(map_id, device_id, peer_key)`: because the column that is not this
+row's identity is always NULL/`''`, a single composite index would let the
+same device land on a map twice as long as each row's NULL device_id or
+empty peer_key made the tuples look distinct to SQLite. Each identity gets
+its own guarantee in the column that actually carries it. `vlan_colors` is
+deliberately global rather than per-map: VLAN 20 should draw the same
+colour on every map, or a strand followed from one map to another would
+appear to change identity for no reason. Deleting a map cascades onto its
+`map_nodes` through the schema's own `ON DELETE CASCADE` (`foreign_keys=ON`
+is one of `SqliteStore.PRAGMAS`), not a second `DELETE` in `delete_map` —
+one place decides what deleting a map takes with it.
+
+`update_nodes` (the bulk position/label/role write a drag-end or an
+align/distribute action sends) validates every item's `role` **before**
+the first `UPDATE` runs, not inside the write loop — a bug caught during
+this release: raising partway through the loop left the earlier rows of
+that same call already written into a transaction nothing there commits or
+rolls back, so the next unrelated commit on the connection would silently
+adopt half a drag. The whole batch is validated up front instead, so a bad
+item fails the call before anything is written.
+
+### Link assembly (`mapper.py`) — pure, no sqlite3/SNMP/HTTP
+
+This module re-does, properly and with VLANs added, the reasoning the
+pre-4.53.0 fleet-wide L2 graph carried in `web/api.py`'s deleted
+`_topology_dedup_key`/`_topology_unknown_identity` (4.53.0's changelog:
+"a separate module will replace the graph itself" — this one). Every
+function is a plain transform over rows/dicts a caller hands in, which is
+what makes `tests/test_mapper_links.py` exhaustive with no database or
+poller in the loop.
+
+- **`peer_identity(row)`** is what folds two unmatched neighbour rows into
+  the same unmanaged peer: chassis id first (LLDP/CDP chassis ids are
+  supposed to be globally unique, normally a MAC), then sysName (weaker —
+  two sites can both name a phone the same thing — but still better than
+  nothing), then a `(device_id, if_index, protocol)` fallback for a row
+  with no identity at all. Each branch is prefixed (`chassis:`, `sysname:`,
+  `row:`) so a chassis id that happens to look like a sysName string can
+  never collide with one across the branch boundary.
+- **`link_identity(device_id, if_index, matched_id, matched_if_index)`** is
+  a link's *undirected* identity, so a cable walked from both ends folds
+  into one line rather than drawing twice. When `matched_if_index` is
+  known — nodesdb's join of the remote chassis MAC to the remote device's
+  own interface — the key is `frozenset({(A, ifA), (B, ifB)})`: sorted
+  before stringifying (`_link_id`) so the id does not depend on which end
+  happened to be walked first, which matters because an id that changed
+  with insertion order would look to the UI like the link itself had
+  changed every time one end re-walked before the other. **A sysName-only
+  match cannot be folded this way and deliberately isn't**: nodesdb only
+  tells this code "these sysNames match", not which of the matched
+  device's own ports faces this cable, so guessing would risk pairing a
+  row against the *wrong* port on a multi-homed device. It gets its own
+  per-row key (`("name-match", device_id, if_index)`) instead — drawn as a
+  second, one-directional line rather than a wrong guess.
+- **VLANs on a link are the union of what each end's own port reports,
+  never the intersection.** A trunk is only really usable for a VLAN both
+  ends allow, so intersection looks like the "more correct" answer — but
+  one end very often has no VLAN data at all (an unmanaged peer has no
+  VLAN MIB to ask; plenty of managed devices answer no VLAN MIB either),
+  and intersecting anything with the empty set is the empty set. That
+  would erase every VLAN on the link the moment either end is VLAN-blind,
+  a strictly worse failure than occasionally showing a VLAN the far end
+  doesn't carry.
+- **A VLAN membership that has aged out no longer draws, matching how a
+  stale neighbour link already behaved — a gap caught by review.** Before
+  this release's fix, `api._mapper_port_vlans` read every `port_vlans` row
+  for a device regardless of `present`, so a VLAN a trunk had genuinely
+  stopped carrying kept drawing on the map, unchanged, until
+  `prune_port_vlans` eventually deleted the row after
+  `mac_table_retention_days` (7 days by default) — up to a week of a
+  removed VLAN reading as still-present, on a map where the link it rode
+  had already gone stale or dropped. `_mapper_port_vlans` now drops
+  `present = 0` rows and any row older than `stale_after_s`, the identical
+  two checks `assemble_links` already applies to the neighbour rows
+  themselves (see its own "Presence and staleness" paragraph) — the same
+  `stale_link_hours` setting, `None` when a caller means "trust `present`
+  alone", passed through from `get_mapper_map`.
+- **A Cisco switch answering the same neighbour over both LLDP and CDP on
+  the same port used to be counted twice.** `assemble_links` now dedupes a
+  peer's `seen_via` entries on `(device_id, if_index)` before appending —
+  a bug found during this release: without it, "Add neighbours" reported
+  the same physical cable as two, because a Cisco device answering both
+  protocols for one neighbour produced two rows that both reached the
+  peer-building code path.
+- **`vlan_color_index(vlan, overrides=None)`** is a Knuth-style
+  multiplicative hash into a 16-entry table (`(vlan * _KNUTH_MULTIPLIER) &
+  0xFFFFFFFF`, top 4 bits kept) rather than `vlan % 16`: real sites number
+  VLANs in round, evenly-spaced blocks (10, 20, 30, …, 100, 200), and every
+  one of those is a multiple of 10, so `% 16` walks the same handful of
+  residues over and over and collides most of a site's VLANs onto a few
+  colours — precisely the "which colour is which VLAN" confusion the
+  feature exists to prevent. `_KNUTH_MULTIPLIER` (1248904971) was chosen by
+  searching odd 32-bit integers (multiplying by an odd constant is a
+  bijection mod 2**32, so no VLAN id is ever folded onto another one's
+  product — only the top bits kept afterward can collide) for one that
+  keeps those specific round numbers scattered; `tests/test_mapper_links.py`
+  asserts this over exactly the round-number ids a real network uses.
+  `overrides` (from `mapperdb.vlan_colors()`) lets an operator pin one
+  VLAN to a specific slot without touching the hash for every other one.
+- **`render_plan(link, threshold, max_strands, width_min, width_max,
+  color_overrides)`** is why the render plan is computed here, server
+  side, rather than in `mapper.js`: the drawing maths — which VLANs
+  collapse into which strand offsets, how wide a collapsed trunk gets —
+  has to live in exactly one place or two browsers open on the same map
+  could disagree about what a threshold-straddling link looks like, and a
+  future change to the maths would have to be made (and tested) in one
+  file rather than kept in step across a Python service and a browser
+  script. Three modes: `"plain"` (0 known VLANs — still a real link, drawn
+  as one neutral line, `known: False` so the UI can tell "no VLAN data at
+  all" apart from "exactly one VLAN"), `"strands"` (fewer than `threshold`
+  VLANs AND fewer than `max_strands`, one strand per VLAN, offsets spaced
+  `width_min * 2` apart and centred so the bundle never drifts as the VLAN
+  count changes), and `"collapsed"` (at or above `threshold`, OR at or
+  above `max_strands`, one line whose width linearly interpolates between
+  `width_min` at `threshold` and `width_max` at `max_strands`, clamped at
+  both ends — a link sitting exactly at `threshold` draws at `width_min`,
+  the same width the last strand mode used, so the transition has no
+  visible jump). **`max_strands` is checked independently of `threshold` —
+  "count < threshold AND count < max_strands", not "count < threshold"
+  alone — because it is a genuine ceiling on how many strands are EVER
+  drawn individually, not only a bound on how far the collapsed width can
+  scale; an earlier version of `render_plan` used it for the width
+  interpolation alone, so a `vlan_collapse_threshold` misconfigured well
+  above `max_strand_vlans` could still draw hundreds of individual
+  strands. `_check_mapper_settings` now refuses to store a
+  `max_strand_vlans` at or below `vlan_collapse_threshold` going forward
+  (that pair would leave no strand mode ever reachable), but `render_plan`
+  itself has no way to know its caller validated anything, so it enforces
+  the cap unconditionally either way.**
+
+**`detect_role(vendor, sys_descr, sys_object_id, platform, unmanaged)`** is
+a node's auto-detected role, pure and side-effect free — a classification
+over fields `nodesdb` already has, no new polling. `unmanaged=True` returns
+`"unmanaged"` unconditionally before any other field is even read: an
+unmanaged CDP/LLDP peer has no device row of its own, only whatever its
+neighbour report happened to say about it, far too thin a signal to guess
+switch/router/firewall/ap/server from. Every blank field returns `""`, the
+honest "found no signal", kept distinct from an operator's own explicit
+"switch" pick by a separate `role_auto` flag (`api._mapper_node_role`)
+rather than overloading the same string for both meanings. Rule order
+after that — firewall, then AP, then router, then switch, then server,
+then a `"switch"` default — matters, because several vendors' sysDescr
+vocabulary only disambiguates in that order: **Fortinet and Cisco are
+deliberately absent from `_FIREWALL_ONLY_VENDORS`** even though both sell
+firewalls, because both vendor keys also cover switches, routers and APs
+from the same maker (FortiGate/FortiSwitch/FortiAP all answer vendor
+`fortinet`; ASA/Firepower sit alongside Catalyst/ISR/Aironet under
+`cisco`) — only a model-line word in the sysDescr text itself
+(`_FIREWALL_HINTS`, `_AP_HINTS`) can tell them apart, so the vendor key
+alone is trusted only for a maker whose entire catalog really is one kind
+of box (`_FIREWALL_ONLY_VENDORS`: Palo Alto, SonicWall, Check Point,
+WatchGuard, pfSense). Switch hints are checked before the server rule so a
+switch that also happens to run embedded Linux in its sysDescr banner
+still reads as the switch it is, not a server. **The default for a
+managed device with a signal but no specific match is `"switch"`, not
+`""`**: the all-fields-blank check above already ruled out "nothing at
+all", and on an LLDP/CDP-walked L2 map an unclassified box is far more
+often a switch than a
+router, firewall or AP — defaulting to the common case leaves less for an
+operator's manual override to correct than defaulting to a generic glyph
+every plain switch would otherwise need hand-classifying out of.
+`api._mapper_node_role` prefers `map_nodes.role` (an operator's own
+override) whenever it is set, calling `detect_role` only otherwise — the
+two `""` meanings (mapperdb's "unset" storage value vs. detect_role's own
+"no signal") are never compared to each other, only ever asked as two
+separate questions, which is what keeps them from colliding.
+
+**`api._mapper_node_name(label, resolved)`** is the fix for a node whose
+operator-set label was being ignored by both the drawn name and the CSV
+export: `get_mapper_map`'s `name` and `get_mapper_map_export`'s
+`device_name` callable both used to read straight from the resolved
+device/peer identity, so renaming a node on the map changed nothing an
+operator could see reflected back, including in what they exported. Both
+now read `name`/`resolved_name` from this one function instead, so a
+label fix in one place fixes both consumers — `resolved_name` is kept
+alongside `name` precisely so a client can still show "renamed from
+`resolved_name`" without losing that fact the moment a label is set.
+
+### A map GET's cost, and what a review found still wrong in the render — 4.54.0
+
+**`get_mapper_map` reads only the devices a map actually places, not the
+whole fleet — a fix, not the original design.** Before this release,
+`get_mapper_map` called `nodesdb.all_neighbours()` and the fleet-wide
+VLAN-membership read behind it directly: every neighbour row and every
+`port_vlans` row in the database, inside the shared `nodesdb` lock, on
+every single map refresh — 33.7 s on a synthetic 2,000-device fleet, for a
+map placing two of them. `nodesdb.neighbours_for_devices(device_ids)` and
+`api._mapper_port_vlans`'s own `port_vlans_for_devices(device_ids)` (both
+chunked the same way `devices_by_ids` already is, for the same "a page-
+sized bulk selection can still be hundreds wide" reason) cut that to
+0.037 s for the same two-device map. This is sound specifically because
+`assemble_links`'s own `on_map(device_id)` check drops any neighbour row
+whose OBSERVING device is not on the map before it ever looks at the far
+end (see its own docstring's processing-order paragraph): every row that
+could matter to a map of `device_ids` has its own `device_id` among them,
+so restricting the read to those ids loses nothing `all_neighbours()`
+would have contributed.
+
+**A strand's VLAN used to be conveyed by colour alone.** `mapper.js`'s
+`drawLink` gave every strand of a "strands"-mode link the identical
+`aria-label`/tooltip — the whole LINK's own text, naming no VLAN at all —
+so colour was the only signal distinguishing strand N from strand N+1,
+invisible to a colour-blind viewer or a screen reader. Every strand now
+gets its own per-VLAN `aria-label` (`role="img"`, discoverable by a screen
+reader's browse cursor even when not a Tab stop) and its own mouse
+tooltip. Only the FIRST strand of a bundle is `focusable`/`role="button"`
+and a Tab stop at all — the same single stop a `"collapsed"` link already
+gets — deliberately not one Tab stop per strand: up to `max_strand_vlans`
+(30) identically-shaped stops for one link was worse than one, and would
+make a `"strands"` link behave nothing like a `"collapsed"` one for no
+reason a keyboard user would understand. That one stop's `aria-label`
+lists every VLAN on the link by id/name (`linkAriaLabel`), not just a
+count.
+
+**Three MAPPER settings that drew nothing at all, now wired up.**
+`show_port_labels` (a small label at each end of a link naming that end's
+own port, `link.a_port`/`b_port`) and `show_vlan_labels` (the VLAN id on
+each strand, or the VLAN count on a collapsed trunk) both existed in
+`mapperdb.DEFAULTS` — on by default — with nothing in `mapper.js` reading
+either before this release; `drawLink`/`drawPortLabels` now gate on them.
+Separately, a node's detail pane (`linkDetailHtml`'s node-side
+counterpart) grew an actual rename control (`#mpd-rename`/
+`#mpd-rename-save`), calling the same `PUT /api/mapper/maps/{id}/nodes`
+bulk-update route `api._mapper_node_name` (above) already renders
+correctly — the write path existed, but nothing in the interface reached
+it from a node's own detail view before this release.
+
+**A second review, after all of the above had shipped, found a third
+fleet-wide read the first review's own fix (above) had not touched.**
+`_mapper_vlans_json` still called `nodesdb.all_vlans()` — every VLAN row
+in the whole fleet — to name a handful of VLAN ids a map's own links
+already carry, inside the same shared lock `neighbours_for_devices`/
+`port_vlans_for_devices` were introduced to get out from under: measured
+at 88.2 ms on 2,000 devices × 50 VLANs, for a map placing two of them.
+`nodesdb.vlans_for_devices(device_ids)` — the same chunked-IN-clause shape
+as the other `*_for_devices` accessors, sound for the same reason: every
+VLAN id `_mapper_vlans_json` could ever need a name for was read off a
+link, and a link only exists between two devices this map places — cuts
+that to 0.2 ms for the same two-device map. The true cost of a map GET
+was always the sum of all three fleet-wide reads, not the two the first
+review happened to name; `tests/test_mapper_api.py` now disables every
+`all_*` accessor `nodesdb` has (not just the ones a reviewer happened to
+name) and asserts a map GET still returns 200, so a fourth one added
+later fails the same way rather than shipping unnoticed. `all_vlans`,
+`all_port_vlans`, `all_vlan_ports` and `vlan_ports_for` — the fleet-wide
+accessors nothing else called — are removed as dead; `all_neighbours`,
+`vlans_for` and `port_vlans_for` stay, because tests still call them.
+
+**The same review found `vlan_ports` was being written and pruned on
+every poll and read by nothing at all.** `api._mapper_vlan_ports`, built
+from the new `vlan_ports_for_devices(device_ids)` (`nodesdb.py`, the same
+bounded shape as `port_vlans_for_devices`), feeds four new fields onto
+every link `get_mapper_map` returns — `a_port_mode`/`a_native_vlan`/
+`b_port_mode`/`b_native_vlan` — read from each end's own
+`(device_id, if_index)` row, never the far end's, the same locality rule
+`_mapper_port_vlans` already applies to `port_vlans`. This is a stronger
+source than the link's own `native_vlan` (`mapper.assemble_links`, which
+only ever derives one from `port_vlans.tagged` and only from the A side):
+a device's own `vlan_ports` row is what it actually reports its port
+configured with. `mapper.js`'s link tooltip shows the mode beside each
+port and, when `a_native_vlan`/`b_native_vlan` disagree, names the
+mismatch explicitly ("Native VLAN 1 on X, 99 on Y — mismatched") rather
+than falling back to the link's own single, weaker `native_vlan` — a real
+misconfiguration worth seeing rather than averaging away. `present = 0`
+and stale-by-`seen_ts` rows are dropped, the same two checks
+`_mapper_port_vlans` already applies, so a port that stopped reporting a
+mode reads as unknown rather than keeping the mode it last had.
+
+**And a gating gap, not a data one: several MAPPER write controls were
+gated only once, at render.** The maps dialog's Rename and Delete, the
+align dialog's eight buttons, and the VLAN colour swatch/picker built
+their `disabled` attribute from a one-shot `App.canWrite('mapper') ? ''
+: 'disabled'` ternary at render time and were never wired into
+`applyPermissions()`'s periodic re-check the way every other write
+control in the product already is (see "Gating disables; it never
+hides", below) — a write permission revoked while any of those stayed
+open left a control that still looked enabled until the operator closed
+and reopened it. All now carry `data-requires-write="mapper"`, exactly
+like every other write control `applyPermissions` walks.
+
+### Nodes' per-port VLAN membership (`nodesdb.py`, `nodeoids.py`, `nodepoll.py`)
+
+Three new `nodesdb.py` tables rather than one, because they answer three
+different questions and age independently: **`vlans`** — which VLANs a
+device knows about at all, keyed `(device_id, vlan)`; **`vlan_ports`** —
+which of its ports are trunk vs. access and a trunk's native VLAN, keyed
+`(device_id, if_index)`, since a port has exactly one mode and native VLAN
+at a time; **`port_vlans`** — the actual many-to-many a link's strands are
+drawn from, keyed `(device_id, if_index, vlan)`. All three follow the same
+present-flag ageing UPSERT `replace_neighbors` established: every stored
+row for a device is marked `present = 0` at the start of a walk, then each
+row the walk actually saw is upserted back to `present = 1` with a fresh
+`seen_ts` — so a VLAN or membership nothing has seen recently reads as
+*stale*, not as a topology change that never happened.
+
+`nodepoll.read_device_vlans(device_id)` is the walk, four sources in
+authority order:
+
+1. **`dot1dBasePortIfIndex`** resolves a BRIDGE-MIB bridge port number to
+   the ifIndex the rest of the app keys interfaces by — the same table the
+   FDB walk already resolves through its own private `_bridge_port_map`.
+   Absent entirely on some small switches, which is not the same fact as
+   "this device has no ports": `resolve()` falls back to treating the
+   bridge port number *as* the ifIndex directly, since plenty of small
+   switches number 1:1 and never populate this table — a wrong guess on a
+   device numbered differently only misattributes which port a VLAN
+   belongs to, a smaller loss than dropping every membership the device
+   reports.
+2. **Q-BRIDGE-MIB**, the standards path: `dot1qVlanStaticName`/
+   `...EgressPorts`/`...UntaggedPorts`, falling back to the
+   `dot1qVlanCurrent*` pair only where the static table came back empty —
+   a VTP/GVRP client legitimately carries no static configuration of its
+   own. A port in the egress bitmap but not the untagged one carries that
+   VLAN tagged; in both, untagged (`dot1qPvid` names which VLAN that
+   untagged membership actually is, i.e. the port's native VLAN).
+3. **CISCO-VTP-MIB, Cisco only** (`detected_vendor(device) == "cisco"`,
+   the same gate `_walk_cdp` uses) — **and a Cisco answer for a port
+   genuinely trunking supersedes whatever the standards path said about
+   that same port**, rather than merging with it: `vlanTrunkPortVlansEnabled`
+   (split across four OIDs — base 0/1024/2048/3072, since the base MIB
+   predates VLANs above 1024) is the trunk's *configured* allow-list, while
+   classic IOS's own `dot1q` egress bitmap often reflects only VLANs with a
+   currently active member — a narrower, more volatile fact than what is
+   actually configured to cross the trunk. `read_device_vlans` deletes any
+   membership the standards path recorded for a port before writing the
+   Cisco answer over it. **The supersede is gated on
+   `vlanTrunkPortDynamicStatus == trunking(1)` for that same port — a real
+   defect, caught by review, in an earlier version of this code that
+   applied it unconditionally.** On real IOS, `vlanTrunkPortDynamicStatus`
+   answers a row for EVERY switchport, access included, reporting
+   `notTrunking(2)` — and such a port still answers `vlanTrunkPortVlansEnabled`
+   with its configured allow-list (IOS's own default: every VLAN) and
+   `vlanTrunkPortNativeVlan` with IOS's default of 1, neither of which is a
+   fact about that access port at all. Applying the Cisco override
+   unconditionally threw away a correctly-read access VLAN (`dot1qPvid`,
+   via the standards path) in favour of a fabricated ~4094-VLAN trunk on
+   every access port in the fleet. A port with `dynamicStatus != trunking`
+   (`notTrunking`, or a port this column simply never covers) now keeps
+   whatever the standards path already recorded for it, and is merely
+   labelled `"access"` when IOS says outright that it is one.
+4. **`mac_entries`' own `vlan` column**, evidence rather than
+   configuration, consulted only for a port neither (2) nor (3) described
+   at all: a VLAN whose traffic this device has learned on a port is
+   evidence that VLAN crosses it even though no VLAN table said so, but
+   never allowed to override an authoritative answer.
+
+**PortList and VLAN-bitmap decoding** (`nodepoll._decode_port_list`,
+`_decode_vlan_bitmap`) share one octet/bit scan (`_bit_positions`) but NOT
+the same numbering — an off-by-one here, caught by review, meant every
+Cisco trunk VLAN id `read_device_vlans` reported was one too high before
+this release. A Q-BRIDGE-MIB PortList is 1-based: per RFC 4363, the most
+significant bit of octet 0 is bridge port **1**, so `_decode_port_list`
+adds 1 to the raw bit position (`i * 8 + bit + 1`). A CISCO-VTP-MIB
+`vlanTrunkPortVlansEnabled*` bitmap is 0-based: per that MIB's own
+DESCRIPTION, the most significant bit of octet 0 is VLAN **0**, so
+`_decode_vlan_bitmap` adds the column's own base (0/1024/2048/3072)
+straight to the raw bit position with no PortList-style `+ 1`
+(`base + i * 8 + bit`). Same big-endian, most-significant-bit-first octet
+layout, genuinely different origin — encoding a bitmap by taking one
+function's output and shifting it by the other's base would reproduce
+exactly this bug, which is why `demo/personas.py`'s own encoders
+(`encode_port_list`, `encode_vlan_bitmap`) are two separate functions
+reasoned from each MIB's DESCRIPTION rather than one relabelled as the
+other. `_decode_port_list` accepts whichever form the shared OCTET STRING
+decoder (`trapdecode._octets_text`) produced — plain text, colon-separated
+hex (its MAC special case) or space-separated hex — plus raw bytes
+directly, since all of those round-trip losslessly to the same bit
+pattern; see "OCTET STRING decoding is best-effort, not lossless" below
+for the one part of this path that is not.
+
+`vlan_interval_s` (device/group setting, default 3600 s like
+`lldp_interval_s`, 0 disables it) schedules `_maybe_walk_vlans` exactly
+the way `_maybe_walk_lldp` schedules the neighbour walk, sharing the same
+`_mac_executor` thread pool — a separate pool from the ping/SNMP poll
+pool, so this walk cannot itself saturate it. It is editable per device
+(`#nd-f-vlaninterval`) and per group (`#nd-p-vlaninterval`) in `nodes.js`,
+the same pair of fields `lldp_interval_s` already has — a gap caught by
+review: this setting shipped with no control anywhere in the interface,
+so every device would have started its hourly walk on upgrade with no way
+to retune or disable it.
+
+**OCTET STRING decoding is best-effort, not lossless — a known limit, not
+a bug still open.** `_decode_port_list` (and, through it, `_decode_vlan_bitmap`)
+works from whatever `_octets_from_value` hands it, which for a value that
+came off the wire as text is `trapdecode._octets_text`'s printable
+rendering of the raw octets — the raw bytes themselves are discarded at
+BER-parse time in `trapdecode.py` and never reach this code. That
+rendering is not reversible in general: `_octets_text` collapses `0x0A`
+(LF), `0x0D` (CR) and `0x20` (space) to the identical character, and a
+short run of hex-looking characters with no separator is genuinely
+ambiguous between "these are literal printable bytes" and "this is one
+non-printable byte, hex-encoded" — `tests/test_port_vlans.py` pins the
+current, considerably tighter heuristic instead of asserting a lossless
+round-trip it cannot deliver. Precisely what it now does and does not
+manage, since an overstated limit is as unhelpful as an unstated one:
+
+- A lone `0x20` byte survives, where the previous code's `.strip()` threw
+  it away silently and returned no ports at all. `0x0A` and `0x0D` do
+  **not** survive as themselves — all three render as the same single
+  character, so all three read back as `0x20`, i.e. port 3. A PortList
+  setting ports 5 and 7 is indistinguishable from one setting port 3.
+- A literal printable byte is no longer mistaken for hex: `0x41` ("A")
+  used to be reinterpreted as `0x0A` and reported as ports 5 and 7 instead
+  of ports 2 and 8. That specific class of error is gone.
+- A run matching the uppercase-hex-pair shape is still read AS hex, so the
+  text `"12"` becomes one byte `0x12` rather than two literal characters,
+  and `"10 20 30"` becomes three bytes rather than eight. That is the
+  right default — an agent's PortList reaches `_octets_text` as hex far
+  more often than a switch answers in literal decimal — but it is a
+  default, not a certainty, and no amount of care at this layer can make
+  it one without the bytes `trapdecode.py` already discarded. **This affects the
+pre-existing LLDP chassis-id path too** (`lldp_neighbor`'s `chassis_id`,
+read through the same shared OCTET STRING decoder), not only this VLAN
+walk — it was simply never named as a limitation until this release's own
+review went looking for one.
+
+### Per-device threshold overrides (see Alerts, below)
+
+`alertsdb.device_thresholds`, `AlertEngine._evaluate_thresholds`'s
+per-rule override lookup, and the `Occurrence.rule_key` fix a same-metric
+Warning/Critical pair required are covered under "Per-device threshold
+overrides, and a cross-match bug", in the Alerts section below — they are
+an Alerts mechanism through and through. `GET`/`POST /api/alerts/device-thresholds` back two
+surfaces: the device dialog's TEMPERATURE ALERTS section (`nodes.js`,
+rendered from the same hardware fetch that already had the chassis
+reading) and the Overrides column and dialog on Alerts → RULES
+(`alerts.js`). Both carry `data-requires-write="alerts"` even inside the
+Nodes dialog, a deliberate cross-module gate: the control lives on a
+Nodes screen but the decision it takes is an Alerts one. `nodes.js` calls
+`App.applyPermissions()` itself after inserting that markup, because
+`applyPermissions` otherwise only reruns on a config-version change and
+the gate would sit unapplied on freshly rendered controls until some
+unrelated event happened to trigger it.
+
+---
+
 ## Alerts
 
 ### Rule storage (`alertsdb.py`)
@@ -1792,7 +2256,7 @@ occurrence increments one alert instead of opening a duplicate" behavior
 lives in the database's own conflict resolution, not in application code
 that could race between a read and a write.
 
-24 built-in rules and 5 built-in templates are seeded via `INSERT OR
+44 built-in rules and 6 built-in templates are seeded via `INSERT OR
 IGNORE` keyed on each row's unique `key`, run on every open — idempotent,
 so a re-open never duplicates, and an admin's edit to a built-in rule's
 severity or a template's wording survives a restart because the seed
@@ -1976,6 +2440,126 @@ gets the sustained behaviour rather than silently keeping the old one.
 `for_seconds` had to be added in four places or it would be dropped
 silently at each: `_migrate`, `_RULE_EDITABLE`, `put_alerts_rule`'s
 allow-list, and `_rule_json`.
+
+### Per-device threshold overrides, and a cross-match bug (`alertsdb.py`, `alertengine.py`, `alertrules.py`) — 4.54.0
+
+`alertsdb.device_thresholds` is one table for every threshold-kind rule
+rather than a temperature-specific one, keyed `(device_id, rule_key)` with
+no surrogate id — a core switch in a hot closet and an access switch in an
+air-conditioned comms room do not share a sane chassis-temperature limit,
+and the same per-device tuning is just as sensible for CPU or memory
+whenever a site wants it, so this serves all of them with no further
+migration. `threshold`/`clear_threshold` NULL means "inherit the rule's own
+value" — the same convention `rules.flap_window_s` already uses — so an
+override that only wants `enabled = 0` (turn the rule off for one device,
+distinct from setting the threshold sky-high: it also has no
+`clear_threshold` to speak of) does not have to restate the rule's own
+numbers. `_check_threshold_direction` (`alertsdb.py`) rejects an override
+whose effective `clear_threshold` would not sit below its effective
+`threshold`: `evaluate_threshold` has exactly one direction wired in
+(breach at or above threshold, clear below `clear_threshold`), checked
+against all twenty threshold-kind `_BUILTIN_RULES` rather than assumed.
+
+`AlertEngine._evaluate_thresholds` reads every rule's override map once
+per rule per tick (`device_threshold_map(rule_key)` → `{device_id: row}`),
+not once per device — the same batching `metrics_for_keys` already exists
+for, on a table that is usually empty or a handful of rows. A device with
+`enabled = 0` is skipped before its streak is touched at all, and is never
+written into `live_streaks`, so re-enabling it later starts a fresh streak
+rather than resuming whatever was counted before it was switched off.
+
+**A device with `enabled = 0` used to strand an open alert forever — a
+regression caught by a second review, since the engine skipped the device
+before it ever reached the branch that clears one.** A threshold alert
+normally clears by being re-evaluated and found to have recovered; once a
+device is skipped outright, nothing re-evaluates it, so an alert already
+open when the override was set would sit open no matter how long the
+device stayed cool. `_evaluate_thresholds` now resolves it in the same
+step it skips the device: `self.db.resolve_by_dedup(f"{rule['key']}:
+device:{device_id}", by="")`, following `_sweep_netpath_alerts`'s own
+precedent for a destination taken out of rotation — "disabling ... is a
+normal thing to do while working on" the thing it measures. `by=""` marks
+it automatic rather than a hand resolve (re-enabling the rule for this
+device and breaching again must open a fresh alert, not find itself
+permanently suppressed by `operator_resolved_since`'s seven-day window),
+and no clear email is sent, the same reasoning `_sweep_netpath_alerts`
+already uses: nobody needs telling that a rule they just turned off for
+this device has stopped being evaluated. This is a distinct case from a
+rule disabled globally or a device deleted outright — both make the whole
+rule or the whole device disappear at once, a rarer action after which an
+operator expects things to vanish from Alerts; a per-device override is
+the small, routine kind of change that must not have that effect.
+
+**The streak key stays `(rule_id, device_id)` — it does NOT widen to
+include the effective threshold/clear pair, and an earlier version of this
+work that did widen it shipped a real regression, caught by review before
+release.** `_child_first_breach_ts` — a rollup parent's hand-resolve asking
+"did an operator resolve the run behind this occurrence" — has only a rule
+and a device to look the streak up by; there is no occurrence carrying a
+threshold/clear pair to widen that lookup key with, so it can only ever
+ask by `(rule_id, device_id)`. Widening `_breach_streaks`' own key broke
+that lookup silently: the entry the OLD three/four-element key produced
+was never found by the two-element key `_child_first_breach_ts` asks for,
+so a rollup parent resolved by hand could never confirm the child's run
+had actually closed — resolving Critical by hand re-opened Warning on the
+very next breach, the exact noise the rollup exists to prevent. The fix
+keeps the key a plain two-tuple and carries the effective `threshold`/
+`clear_threshold` pair a streak was counted under INSIDE the entry instead
+(`self._breach_streaks[(rule_id, device_id)] = (last sample ts, streak,
+first_breach_ts, threshold, clear_threshold)`): `_evaluate_thresholds`
+compares the entry's stored pair against the current one on every tick,
+and a mismatch resets the streak exactly as if the device had never been
+seen before — same observable behaviour (a changed override starts a
+fresh streak) as the regression's widened key, without breaking the
+lookup a plain two-tuple key alone can satisfy. A deleted device's key
+still drops out on its own, unaffected, the moment `live_streaks` replaces
+`self._breach_streaks` each tick. `evaluate_threshold`'s own signature and
+tests stay untouched — the effective threshold/clear pair is handed to it
+as a plain `dict(rule)` copy with just those two fields swapped, since
+`sqlite3.Row` and `dict` satisfy the same `.keys()` + `__getitem__`
+protocol either way.
+
+**The mismatch that resets a streak is not only a device's own override
+changing.** For a device with no override at all, the "effective" pair
+compared each tick is simply the rule's own `threshold`/`clear_threshold`
+— so editing a rule's own numbers moves the effective pair for every
+device evaluated against it, exactly the same as if each of them had just
+had an override set, cleared, or edited. This is deliberate: a streak (and
+a `for_seconds` run) counted against numbers that no longer apply is not
+evidence of anything under the new ones. It has an operator-visible
+consequence worth spelling out, though: resetting `first_breach_ts`
+means `_operator_resolved` no longer recognizes the run as the one an
+operator resolved by hand, so an alert that was hand-resolved but is
+still genuinely breaching re-opens as a new run the next time this rule's
+threshold or clear point is edited — the same as if the device had never
+been seen before. There is no special case to suppress this; it follows
+from the same comparison that makes a device override behave correctly.
+
+**A bug this release's own build uncovered, not introduced by it.**
+`AlertEngine._apply` matched an occurrence to a rule on `(kind,
+source_kind)` alone. Two threshold rules can legitimately share a
+`source_kind` — the shipped `ups_battery_low`/`ups_battery_replace` pair
+already did — and `_apply` had no way to tell which of the two rules
+actually raised a given occurrence: an occurrence `_evaluate_thresholds`
+built while evaluating ONE rule's own streak also matched the OTHER rule
+sharing the metric, double-incrementing it under the wrong rule's message
+and quietly defeating the streak accounting `evaluate_threshold` had just
+done. It went unnoticed until `temp_chassis_critical` — deliberately
+reading the same `temp_chassis_c` metric as `temp_chassis_high` on purpose
+— made the symptom visible in this release's own testing.
+`alertrules.Occurrence` gained `rule_key: str = ""` (empty for every
+occurrence not raised by a threshold evaluation, and for one parked before
+this field existed — both load and match exactly as before), set to the
+raising rule's own `key` in `_evaluate_thresholds`; `_apply` now narrows a
+`kind == "threshold"` occurrence carrying a `rule_key` to the one rule that
+key names before matching against anything else. `alertrules.ROLLED_UP_BY`
+gained `"temp_chassis_high": "temp_chassis_critical"` on the strength of
+the same mechanism the outage rollups already use, not a new one: the
+entry isn't an outage rollup (`_rollup_parent`'s case 1 — a same-entity
+open parent alert — is entity-kind generic and doesn't care), it just
+reuses the existing map to express "an open Critical already says what
+Warning is about to say" for a same-metric pair instead of an
+unreachable-device implication.
 
 ### Alert mutes (`alertsdb.py`, `alertengine._muted`)
 
@@ -3806,7 +4390,7 @@ payload still sees one object. Before the split the poll was 10.9 KB
 every two seconds, of which 6–7 KB could not have changed since the last;
 it is 4.5 KB identity, 1.3 KB on the wire. The poll also lost its
 duplicated `app_db.user()` lookup, two `SELECT *`-then-`len()` counts
-(`conflict_count()`, `controller_count()` are `COUNT(*)`), and its ten
+(`conflict_count()`, `controller_count()` are `COUNT(*)`), and its eleven
 `size_bytes()` and the hostname-cache figures go through
 `Service.cached_poll(key, ttl_s, compute)` — at most once per ten
 seconds across every open tab, since neither means anything at
@@ -4436,9 +5020,13 @@ response key its values come back under (`"netflow": "flow_settings"`, and
 so on). `post_settings` validates and ranges-checks the body, then for any
 scope but `global`/`netpath` calls `Service.apply_settings(scope, values)` —
 one table-driven method (`_MODULE_SCOPES` in `service.py`, mapping each of
-the eight module scopes to its settings attribute, database attribute,
-event-log line and reconfigure function) that replaced eight near-identical
-`apply_<scope>_settings` methods. `apply_global_settings` and
+the nine module scopes — from 4.54.0, `mapper` joins the original eight —
+to its settings attribute, database attribute, event-log line and
+reconfigure function) that replaced eight near-identical
+`apply_<scope>_settings` methods. `mapper`'s own reconfigure function,
+`_apply_mapper`, is a documented no-op: MAPPER has no worker to restart,
+and the entry exists so `post_settings` needs no special case that skips
+calling one for exactly this module. `apply_global_settings` and
 `apply_netpath_settings` keep their own methods, since both write
 `self.settings` — the combined global-and-NetPath dict — rather than a
 module's own settings attribute. The maintenance sweep's seven size-cap
@@ -4946,21 +5534,69 @@ every other page just waits for the observer.
 ### Themes, breakpoints, pointer capture and kiosk (`tokens.css`, `boot.js`, `app.js`) — 4.46.0
 
 - **Themes.** `tokens.css` is a base `:root` block (dark, `color-scheme:
-  dark`) plus `:root[data-theme="contrast"]` and `:root[data-theme="light"]`
-  blocks that redefine every surface, text, structure, emphasis, meaning
-  and selection token. Dark is the *absence* of the attribute, so a browser
-  that never chose stores nothing. The choice lives in
-  `localStorage['sappiwhere.theme']`, per browser: `boot.js` reads it and
-  sets `documentElement.dataset.theme` before `<body>` parses on all three
-  pages (it is loaded by `login.html` and `ssh.html` now and is in
-  `PUBLIC_PATHS`; its tab half returns early off the application page);
-  `App.setTheme()` changes it live, a `storage` listener follows other
-  tabs, and Settings' Appearance fieldset is the UI. The `--canvas-*` set is
-  untouched by both themes. `tests/test_design_tokens.py` parses the file
-  per block and recomputes every pair per theme — light at AA, contrast at
-  AAA — and requires each theme block to define the full themed set, so a
-  dark tone inherited onto a light ground fails instead of vanishing.
-  `theme.py` (the console window) stays on the dark values.
+  dark`) plus, from 4.54.0, six `:root[data-theme="…"]` blocks — `contrast`,
+  `light`, `midnight`, `nord`, `solarized`, `slate` — each redefining every
+  surface, text, structure, emphasis, meaning and selection token. Dark is
+  the *absence* of the attribute, so a browser that never chose stores
+  nothing. The choice lives in `localStorage['sappiwhere.theme']`, per
+  browser: `boot.js` reads it and sets `documentElement.dataset.theme`
+  before `<body>` parses on all three pages (it is loaded by `login.html`
+  and `ssh.html` now and is in `PUBLIC_PATHS`; its tab half returns early
+  off the application page); `App.setTheme()` changes it live, a `storage`
+  listener follows other tabs, and Settings' Appearance fieldset is the UI.
+  `boot.js`'s `THEMES` array and `app.js`'s own copy must list the same
+  seven ids — a theme one file rejects that the other stored silently
+  reverts to dark on whichever reload hits the disagreeing file first. The
+  `--canvas-*` set (route/map canvas chrome — background, hairline, grid,
+  text, the status colours) is untouched by all seven, with one exception
+  from 4.54.0: `--canvas-vlan-1..16`, below. `tests/test_design_tokens.py`
+  parses the file per block and recomputes every pair per theme — light,
+  midnight, nord, solarized and slate at ordinary AA, contrast at AAA —
+  and requires each theme block to define the full themed set, so a dark
+  tone inherited onto a light ground fails instead of vanishing. From
+  4.54.0 the same file also enforces two sixteen-entry VLAN palettes, both
+  keyed by `vlan_color_index` and both held to the same two checks: each
+  hue at least 3:1 against its own ground, and — since a hue nudged
+  towards ANY of the other fifteen is as much a bug as one nudged towards
+  its neighbour in the rotation — every one of the 120 pairs within a
+  palette at least `VLAN_DISTANCE_FLOOR` (10.0) apart in CIE76
+  (`lab()`/`delta_e76()`, the test file's own sRGB → CIE L\*a\*b\*
+  conversion), not just adjacent-in-rotation pairs. **The two palettes are
+  not interchangeable, and treating them as one was a defect two separate
+  reviews caught before release, at two different layers.**
+  `--canvas-vlan-1..16` is tuned against `--canvas`: a MAPPER trunk strand
+  itself (`mapper.js`'s `drawLink`, `var(--canvas-vlan-N)`) draws on
+  `#mp-canvas`, whose background is `--canvas` — white in every theme but
+  Contrast, the same route-canvas idiom NetPath's own graph already
+  established — not `--panel`. `--vlan-1..16` is tuned against `--panel`
+  instead. Nine or ten of the sixteen `--vlan-*` hues fall under 3:1
+  measured against white (`--vlan-4` lands near 1.5:1), which is what made
+  the second palette necessary in the first place rather than reusing the
+  first one for both grounds — the first review caught the strand itself
+  needing its own copy. **A second review, after that fix had shipped,
+  caught that MAPPER's own chrome — the VLAN table's colour swatch and its
+  sixteen-swatch colour picker — still read `--vlan-1..16`, the
+  `--panel`-tuned palette, rather than the `--canvas-vlan-1..16` a strand
+  is actually stroked with:** in Dark, Midnight, Nord and Solarized, not
+  one of the sixteen pairs was the same colour, so picking "Colour 1" off
+  the swatch showed a hue the map never actually drew for VLAN 1 (Dark:
+  swatch `--vlan-1` #DA6C6C, strand `--canvas-vlan-1` #862727). The table
+  swatch (`mapper.js`'s `VLAN_COLUMNS`) and the picker
+  (`openVlanColorPicker`) both read `--canvas-vlan-N` now, the same value
+  the strand is stroked with; `.mp-swatch`'s own CSS border also moved
+  from `--hairline` (a 1.3–1.6:1 surface-step divider, not meant to be
+  seen on its own) to `--line` (≥3.38:1 against `--panel` in every theme),
+  so the swatch still reads as a square even where its `--canvas-vlan-*`
+  fill sits close to invisible against `--panel` (worst case, Nord:
+  ~1.03:1 fill-on-panel). `--vlan-1..16` is no longer read by any part of
+  the interface, though it stays defined and held to the same two checks
+  in `test_design_tokens.py`. `--canvas-vlan-1..16` needs its own override
+  only under `data-theme="contrast"` (the one theme where `--canvas`
+  itself goes dark), reusing the light-on-dark `--vlan-1..16` rotation
+  there for the same reason in reverse — the other six themes share one
+  definition, since `--canvas` is the identical white for all of them.
+  `theme.py` (the console window) stays on the dark values, unchanged by
+  any of the six new theme blocks.
 - **Breakpoints.** `@media (max-width: 1200px)` makes the fixed widths
   fluid; `(max-width: 900px)` stacks `[data-splitter].cols` and the NetPath
   page (both selectors the row rule uses, since boot.js's first-frame rule
@@ -5329,7 +5965,7 @@ almost all the time cannot starve the one with output to send. That wait is
 `poll()` where the platform has it and a `selectors` object (epoll or kqueue
 there, `select` on Windows) where it does not — deliberately *not*
 `select.select`, which cannot express a descriptor at or above `FD_SETSIZE`
-and, given this process holds ten databases with their WAL companions, three
+and, given this process holds eleven databases with their WAL companions, three
 UDP listeners, every poll worker's socket and one descriptor per open HTTP
 connection, was reached routinely: past 1,024 the call raised on every pass
 and the reader spun, burning a core for an idle terminal. The wait's answer

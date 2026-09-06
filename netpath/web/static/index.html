@@ -38,6 +38,7 @@
        (netpath/wirelessdb.py polls the FORTINET-FORTIGATE-MIB). -->
   <button class="tab" data-tab="wireless">FORTI-AP</button>
   <button class="tab" data-tab="configrx">CONFIGRX</button>
+  <button class="tab" data-tab="mapper">MAPPER</button>
   <button class="tab tab--group-start" data-tab="netpath" data-group-start>ROUTES</button>
   <button class="tab" data-tab="netflow">NETFLOW</button>
   <button class="tab" data-tab="syslog">SYSLOG</button>
@@ -1026,6 +1027,65 @@
       <div id="cxrs-results-wrap" class="table-wrap" hidden><table id="cxrs-results-table"></table></div>
      </div>
     </div>
+   </div>
+  </div>
+</section>
+
+<!-- ============================= MAPPER ============================= -->
+<!-- Placed here (immediately after CONFIGRX) rather than beside NETPATH's
+     section further up the file: this file's page-section order has never
+     tracked the tab strip's visual order (page-netpath already sits above
+     page-ipam/page-wireless/page-configrx, despite ROUTES coming after all
+     three on the tab strip — see boot.js's TABS and app.js's ROUTE_TABS,
+     which both order by DOM position, not tab-strip position). MAPPER's
+     tab button joins the strip right after CONFIGRX (see #tabs above), and
+     this section follows that same, already-established convention. -->
+<section id="page-mapper" class="page">
+  <div class="card strip">
+    <span id="mp-dot" class="dot"></span>
+    <span id="mp-status" class="stat">No map selected</span>
+    <span id="mp-counters" class="hint"></span>
+    <span class="grow"></span>
+    <button id="mp-refresh">Refresh</button>
+    <button id="mp-maps" data-requires-write="mapper">Maps</button>
+    <button id="mp-settings" class="module-settings" data-requires-write="mapper">Settings</button>
+  </div>
+
+  <div class="bar wrap">
+    <label>Map <select id="mp-map"></select></label>
+    <button id="mp-add-device" data-requires-write="mapper">Add device</button>
+    <button id="mp-add-neighbours" data-requires-write="mapper">Add neighbours</button>
+    <button id="mp-remove-node" data-requires-write="mapper">Remove</button>
+    <span class="grow"></span>
+    <label>Snap <input type="checkbox" id="mp-snap" data-requires-write="mapper"></label>
+    <button id="mp-align" data-requires-write="mapper">Align</button>
+    <button id="mp-fit">Fit</button>
+    <button id="mp-zoom-out">Zoom out</button>
+    <button id="mp-zoom-in">Zoom in</button>
+    <button id="mp-export-png">Export PNG</button>
+    <button id="mp-export-csv">Export CSV</button>
+  </div>
+
+  <div class="cols" data-splitter="mapper-body">
+   <div class="pane pad-x pad-b" data-grow="4">
+    <header class="bar">
+      <span class="section">MAP</span>
+      <span id="mp-map-name" class="hint"></span>
+      <span class="grow"></span>
+      <span id="mp-legend" class="hint"></span>
+    </header>
+    <!-- #mp-canvas carries its own flex chain and touch-action in app.css,
+         which explains why; both are load-bearing, not decoration. -->
+    <div id="mp-canvas" class="map-canvas"><svg id="mp-svg"></svg></div>
+   </div>
+   <div class="divider"></div>
+   <div class="pane pad-x pad-b" data-grow="1">
+    <header class="bar">
+      <span id="mp-detail-name" class="section">SELECTION</span>
+    </header>
+    <div id="mp-detail" class="detail" data-empty="Select a device or a link."></div>
+    <header class="bar"><span class="section">VLANS ON THIS MAP</span></header>
+    <div class="table-wrap"><table id="mapper-vlan-table"></table></div>
    </div>
   </div>
 </section>

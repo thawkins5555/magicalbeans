@@ -97,6 +97,10 @@ const App = (() => {
           <option value="dark">Dark</option>
           <option value="light">Light</option>
           <option value="contrast">High contrast</option>
+          <option value="midnight">Midnight</option>
+          <option value="nord">Nord</option>
+          <option value="solarized">Solarized</option>
+          <option value="slate">Slate</option>
         </select></label>
         <p class="hint">Stored in this browser, not on the server: it applies at once,
           to every account that signs in on this machine.</p>
@@ -204,7 +208,7 @@ const App = (() => {
   const MODULE_NAMES = {
     nodes: 'Nodes', alerts: 'Alerts', netpath: 'Routes', netflow: 'NetFlow',
     snmp: 'SNMP traps', syslog: 'Syslog', ipam: 'IPAM', wireless: 'FortiWireless',
-    configrx: 'ConfigRX', settings: 'Settings', ssh: 'SSH',
+    configrx: 'ConfigRX', mapper: 'Mapper', settings: 'Settings', ssh: 'SSH',
   };
 
   function writeDeniedReason(module) {
@@ -4421,15 +4425,18 @@ const App = (() => {
 
   /* ------------------------------------------------------------- theme
 
-     Three palettes in tokens.css — dark (the default, no attribute), light
-     and high contrast — selected per BROWSER, not per account: it is a
-     property of the screen and the eyes in front of it, and a shared NOC
-     workstation keeps its choice across sign-ins. boot.js reads the same
-     key before first paint so no frame is drawn in the wrong theme; this
-     is the half that changes it while the page is up. Charts follow for
-     free: every fill in the product is a var(--token). */
+     Seven palettes in tokens.css — dark (the default, no attribute),
+     light, high contrast, midnight, nord, solarized and slate — selected
+     per BROWSER, not per account: it is a property of the screen and the
+     eyes in front of it, and a shared NOC workstation keeps its choice
+     across sign-ins. boot.js reads the same key before first paint so no
+     frame is drawn in the wrong theme; this is the half that changes it
+     while the page is up. Charts follow for free: every fill in the
+     product is a var(--token). This list and boot.js's own copy must
+     agree, or a theme stored by one and rejected by the other silently
+     reverts to dark on the next reload that hits the other file first. */
   const THEME_KEY = 'sappiwhere.theme';
-  const THEMES = ['dark', 'light', 'contrast'];
+  const THEMES = ['dark', 'light', 'contrast', 'midnight', 'nord', 'solarized', 'slate'];
 
   function currentTheme() {
     const theme = document.documentElement.dataset.theme;
@@ -4577,7 +4584,7 @@ const App = (() => {
 
   const ROUTE_TABS = ['dashboard', 'nodes', 'alerts', 'netpath', 'netflow',
                       'snmp', 'syslog', 'ipam', 'wireless', 'configrx',
-                      'debug', 'settings'];
+                      'mapper', 'debug', 'settings'];
 
   // Set while writeRoute is changing location.hash, so the hashchange it
   // fires (pushState does not, assigning location.hash does) is not read
@@ -4922,6 +4929,12 @@ const App = (() => {
                   alerts: 'alerts_refresh_s', syslog: 'syslog_refresh_s',
                   ipam: 'ipam_refresh_s', wireless: 'wireless_refresh_s',
                   configrx: 'configrx_refresh_s', debug: 'debug_refresh_s' }[page];
+    // 'mapper' is deliberately absent: its cadence is refresh_interval_s in
+    // mapperdb's own settings, per map module rather than in the global
+    // settings table every key above reads, and duplicating it here would
+    // be a second place for one fact. It falls through to the 2 s default
+    // and mapper.js gates its own reload against its setting, so this
+    // ticks the page without fetching on every tick.
     const seconds = Number(state.settings[key]);
     // The floor was 0.1 s, so one mistyped refresh setting made every open
     // tab hit a heavy endpoint ten times a second. A second is already

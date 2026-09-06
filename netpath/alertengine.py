@@ -101,11 +101,19 @@ class AlertEngine(Worker):
         self.netpath_db = netpath_db
         self.log = log or NullLog()
         self._stop = threading.Event()
-        # (rule_id, device_id) -> (last sample ts, streak, first breach ts).
-        # The sample ts is what makes the streak count polls rather than
-        # ticks; the first breach ts is what lets for_seconds measure a
-        # duration. See _evaluate_thresholds.
-        self._breach_streaks: dict[tuple, tuple[float | None, int, float | None]] = {}
+        # (rule_id, device_id) -> (last sample ts, streak, first breach ts,
+        # effective threshold, effective clear). The sample ts is what makes
+        # the streak count polls rather than ticks; the first breach ts is
+        # what lets for_seconds measure a duration; the trailing pair is the
+        # threshold/clear this streak was counted under, so a changed device
+        # override can be detected and the streak reset without widening the
+        # key itself. See _evaluate_thresholds and _child_first_breach_ts —
+        # the latter looks a streak up by (rule_id, device_id) alone, on
+        # behalf of a rollup parent resolved by hand, so the key has to stay
+        # a plain two-tuple no matter what else changes about how a streak is
+        # counted.
+        self._breach_streaks: dict[tuple, tuple[float | None, int, float | None,
+                                                float | None, float | None]] = {}
         # DHCP scopes keep (last polled_ts, streak, first breach ts) rather
         # than a bare count: the engine ticks every few seconds but DHCP is
         # polled every few minutes, so for_polls must count polls, not
@@ -1082,6 +1090,12 @@ class AlertEngine(Worker):
         rules = [r for r in self.db.rules() if r["enabled"] and r["kind"] == "threshold"]
         if not rules:
             return occurrences
+        # Per-device overrides, read once per RULE per tick rather than once
+        # per DEVICE: the same regression the metrics_for_keys batching right
+        # below already exists to avoid, on a table that is usually empty or
+        # a handful of rows. See AlertsDatabase.device_threshold_map.
+        overrides_by_rule = {r["id"]: self.db.device_threshold_map(r["key"])
+                             for r in rules}
         # One query for the keys the enabled rules actually name, instead of
         # a full `SELECT *` per device: at 2,000 devices with ~90 metrics
         # each that was 400,000 rows every five seconds to evaluate four live
@@ -1123,16 +1137,109 @@ class AlertEngine(Worker):
                          and now - sample_ts > stale_after)
                 if stale:
                     value, sample_ts = None, None
+                # An override row for a device Nodes no longer knows about is
+                # harmless by construction: this loop only ever looks one up
+                # for a device_id it already pulled from metrics_by_device_key
+                # / devices_by_ids above, so a deleted device's leftover row
+                # is simply never fetched, let alone acted on.
+                override = overrides_by_rule.get(rule["id"], {}).get(device_id)
+                if override is not None and not override["enabled"]:
+                    # enabled=0 means this rule never fires for THIS device —
+                    # and must not simply freeze whatever is already open.
+                    # This is not the same case as a rule disabled globally
+                    # or a device removed entirely: both of those make the
+                    # WHOLE rule (or the whole device) go away at once, a
+                    # rarer, bigger action after which an operator expects to
+                    # find things on the Alerts page rather than have them
+                    # vanish. A per-device override is the small, routine
+                    # kind of change _sweep_netpath_alerts already describes
+                    # for a destination taken out of rotation — "disabling
+                    # ... is a normal thing to do while working on" the
+                    # thing it measures — and it carries the same fix: there
+                    # is nothing left to evaluate for this (rule, device)
+                    # pair, so resolve whatever is open now rather than
+                    # leave it stuck at whatever value it last saw. by=''
+                    # so this reads as an automatic close, not a hand
+                    # resolve — re-enabling the rule for this device and
+                    # breaching again must open a fresh alert, not find
+                    # itself permanently suppressed. No clear email either,
+                    # same precedent: nobody needs telling that a rule they
+                    # just turned off for this device has stopped being
+                    # evaluated.
+                    resolved = self.db.resolve_by_dedup(
+                        f"{rule['key']}:device:{device_id}", by="")
+                    if resolved:
+                        self.counters["resolved"] += 1
+                    # Skip before touching the streak at all, and never
+                    # written into live_streaks below, so turning it back on
+                    # later starts a fresh streak rather than resuming
+                    # whatever was counted before it was switched off.
+                    continue
+                threshold = rule["threshold"]
+                clear_threshold = rule["clear_threshold"]
+                eval_rule = rule
+                if override is not None:
+                    # NULL on the override row means "inherit the rule's own
+                    # value" (see the device_thresholds schema comment in
+                    # alertsdb.py), so only a non-NULL column overrides it.
+                    if override["threshold"] is not None:
+                        threshold = override["threshold"]
+                    if override["clear_threshold"] is not None:
+                        clear_threshold = override["clear_threshold"]
+                    if (threshold != rule["threshold"]
+                            or clear_threshold != rule["clear_threshold"]):
+                        # evaluate_threshold's own signature stays untouched —
+                        # its hysteresis state machine, and its tests, do not
+                        # need to know overrides exist. It reads threshold/
+                        # clear_threshold off whatever mapping it is handed,
+                        # and sqlite3.Row already satisfies the same mapping
+                        # protocol (.keys() + __getitem__) a plain dict does,
+                        # so a dict copy with just those two fields swapped is
+                        # indistinguishable to it from a real rule row.
+                        eval_rule = dict(rule)
+                        eval_rule["threshold"] = threshold
+                        eval_rule["clear_threshold"] = clear_threshold
+                # Keyed on (rule, device) alone — NOT the effective
+                # threshold/clear pair. _child_first_breach_ts has to find
+                # this same streak again given only a rule and a device (it
+                # is asked on behalf of a rollup PARENT resolved by hand,
+                # long after the breach occurrence itself is gone), so the
+                # key has to stay a plain two-tuple. The effective pair is
+                # carried INSIDE the entry instead, and compared below: a
+                # changed device override must still start a fresh streak
+                # rather than resume one counted under the OLD numbers, but
+                # now that is enforced by resetting the entry rather than by
+                # abandoning its key.
                 streak_key = (rule["id"], device_id)
-                previous_ts, streak, first_breach_ts = self._breach_streaks.get(
-                    streak_key, (None, 0, None))
+                previous_ts, streak, first_breach_ts, prev_threshold, prev_clear = (
+                    self._breach_streaks.get(streak_key, (None, 0, None, None, None)))
+                if prev_threshold != threshold or prev_clear != clear_threshold:
+                    # The EFFECTIVE pair moved since the streak was last
+                    # counted — either the override changed (set, cleared, or
+                    # edited) or, with no override in play, the RULE's own
+                    # threshold/clear_threshold was edited. Both are treated
+                    # exactly like a device this tick has never seen before:
+                    # no prior sample to compare against, no streak, no open
+                    # run. This is a deliberate behaviour change from before
+                    # 4.54.0, when a rule edit left every device's streak (and
+                    # first_breach_ts) untouched: a streak counted against
+                    # numbers that no longer apply is not evidence of
+                    # anything, so it must not count toward for_polls under
+                    # the new ones, and first_breach_ts resetting means
+                    # _operator_resolved no longer recognizes the run as the
+                    # one an operator resolved by hand — a hand-resolved but
+                    # still-breaching alert re-opens as a new run the next
+                    # time this rule's numbers are edited. That is intended:
+                    # it is the same "changed override" reasoning above,
+                    # just as true when the change comes from the rule's own
+                    # row instead of a device's override of it.
+                    previous_ts, streak, first_breach_ts = None, 0, None
                 if stale:
                     # Absent means the run resets too: otherwise
                     # breach_seconds would span the silent gap and fire
                     # for_seconds instantly on resume, and _operator_resolved
                     # would still see the old run's first_breach_ts.
                     first_breach_ts = None
-                threshold = rule["threshold"]
                 over = (value is not None and threshold is not None
                         and value >= threshold)
                 if not over:
@@ -1145,7 +1252,7 @@ class AlertEngine(Worker):
                 # polled must not accumulate breach seconds while silent.
                 breach_seconds = (0.0 if first_breach_ts is None or sample_ts is None
                                   else max(0.0, sample_ts - first_breach_ts))
-                result = evaluate_threshold(rule, value, streak, breach_seconds)
+                result = evaluate_threshold(eval_rule, value, streak, breach_seconds)
                 if result == "clear":
                     # The run ends on an OBSERVED CLEAR, not on the first
                     # sample under the threshold. Between clear_threshold and
@@ -1159,8 +1266,11 @@ class AlertEngine(Worker):
                     first_breach_ts = None
                 # Into the per-tick dict, which replaces the stored one at the
                 # end of the pass: state kept per (rule, device) forever leaked
-                # an entry for every deleted device.
-                live_streaks[streak_key] = (sample_ts, streak, first_breach_ts)
+                # an entry for every deleted device. The effective pair rides
+                # along so the NEXT tick can tell a real override change from
+                # business as usual (see the comparison above).
+                live_streaks[streak_key] = (
+                    sample_ts, streak, first_breach_ts, threshold, clear_threshold)
                 if result == "":
                     continue
                 if label is None:
@@ -1177,7 +1287,16 @@ class AlertEngine(Worker):
                         message=f"{label}: {rule['name']} ({value})",
                         device_name=device["name"] or "", device_ip=device["ip"],
                         extra={"metric_label": metric["label"] if metric else rule["source_kind"],
-                              "value": str(value), "threshold": str(rule["threshold"])})
+                              # The EFFECTIVE threshold (device override, if
+                              # any), not rule["threshold"]: the extra is what
+                              # the email/UI shows as "Threshold:", and that
+                              # must read as the number this device was
+                              # actually judged against.
+                              "value": str(value), "threshold": str(threshold)},
+                        # Pins this occurrence to THIS rule so _apply cannot
+                        # cross-match it onto another rule sharing the same
+                        # source_kind — see Occurrence.rule_key's own comment.
+                        rule_key=rule["key"] or "")
                     if self._operator_resolved(rule, occurrence, first_breach_ts):
                         # An operator resolved this exact breach run by hand;
                         # it stays closed until a clear observation (which
@@ -1873,7 +1992,15 @@ class AlertEngine(Worker):
     def _child_first_breach_ts(self, rule, occurrence: Occurrence):
         """When the breach run behind this threshold occurrence began, out of
         the streak state its evaluator already keeps, or None for an
-        occurrence that is an event rather than a run."""
+        occurrence that is an event rather than a run.
+
+        Looked up by (rule, device) alone, which is all a rollup parent's
+        resolve gives us here — there is no occurrence carrying a threshold/
+        clear pair to widen this key with. This is exactly
+        _evaluate_thresholds's own streak key, by design: see the comment on
+        self._breach_streaks and on streak_key there. entry[2] is
+        first_breach_ts regardless of whatever else the tuple carries.
+        """
         if occurrence.kind == "threshold":
             try:
                 streak_key = (rule["id"], int(occurrence.entity_id))
@@ -2120,6 +2247,22 @@ class AlertEngine(Worker):
                                 "wireless_event", "threshold", "dhcp_threshold",
                                 "netpath_threshold", "system"):
                 if (rule["source_kind"] or "") and rule["source_kind"] != occurrence.source_kind:
+                    continue
+            if rule["kind"] == "threshold" and occurrence.rule_key:
+                # Two threshold rules CAN legitimately share a source_kind —
+                # ups_battery_low/ups_battery_replace already did, and
+                # temp_chassis_high/temp_chassis_critical now read the same
+                # temp_chassis_c metric on purpose (see alertsdb._BUILTIN_
+                # RULES). Without this, the occurrence _evaluate_thresholds
+                # built for evaluating ONE of them also matched the OTHER
+                # here (same kind, same source_kind), double-incrementing it
+                # with the wrong rule's message and defeating the streak
+                # accounting evaluate_threshold just did for its own rule.
+                # occurrence.rule_key pins an occurrence to the one rule that
+                # actually raised it; empty (every occurrence not from
+                # _evaluate_thresholds, and one parked before this field
+                # existed) leaves matching exactly as it was.
+                if rule["key"] != occurrence.rule_key:
                     continue
             if (rule["kind"] in ("syslog", "trap")
                     and not (rule["source_kind"] or "")

@@ -120,6 +120,7 @@ reachable.
 | Nodes SNMP polling | UDP | 161 (fixed) | GET/GETBULK to each configured device, on its own poll interval |
 | Nodes ping monitoring | ICMP Echo Request (type 8) | — | One ping per device with ping enabled, on its own poll interval |
 | Nodes per-device or per-subnet discovery | ICMP Echo Request (type 8), then UDP 161 | — | Same shape as IPAM's own subnet sweep, plus an SNMP identity probe against whatever answers |
+| Nodes per-port VLAN membership walk, for MAPPER | UDP | 161 (fixed) | Q-BRIDGE-MIB column walk against every device, plus CISCO-VTP-MIB on Cisco gear, on `vlan_interval_s` (default one hour, 0 disables it) — the same port and the same GET/GETBULK shape as ordinary SNMP polling, no new port and no new device credential |
 | Alerts email notification | TCP (SMTP) | 25/587/465 (server-dependent) | Only if email notification is enabled; none, STARTTLS or SSL/TLS per the configured server |
 | Wireless SNMP polling | UDP | 161 (fixed) | GETNEXT to each configured FortiGate Wireless Controller, on its own poll interval — never to the APs behind it individually |
 | ConfigRX config backup | TCP (SSH) | 22 (configurable per device) | Only for a device with backup enabled and a credential stored; read-only — one fixed "show config" command, plus, for a vendor whose login shell is not already privileged EXEC (currently just Cisco ASA), a fixed `enable` step; never a push |
@@ -200,9 +201,9 @@ configured SMTP server.
 
 ## Storage
 
-Ten SQLite databases and nothing else. No registry keys, no temporary files
-left behind, no writes to the application folder at runtime — the code
-directory can be read-only.
+Eleven SQLite databases and nothing else. No registry keys, no temporary
+files left behind, no writes to the application folder at runtime — the
+code directory can be read-only.
 
 ### Where
 
@@ -218,8 +219,9 @@ directory can be read-only.
 | `alerts.db` | Rules, email templates, alerts, notification history, Alerts settings, an optional SMTP credential | Alert volume — normally light; a flapping device or a noisy threshold is the exception |
 | `wireless.db` | Controllers, access points, per-radio detail, Wireless settings, optional SNMP credentials | Controller count × AP count per controller — normally small, a handful of controllers rather than hundreds |
 | `configrx.db` | Per-device backup configuration, stored config backups (compressed, hash-deduped), ConfigRX settings, optional SSH and enable-mode credentials | Device count × how often a device's config actually changes — an unchanged config never adds a row |
+| `mapper.db` | Named maps, the devices and unmanaged peers placed on each and where, a VLAN colour override table, Mapper settings | Number of maps × devices placed on them — hand-placed bookkeeping, not per-poll samples, so it stays small regardless of fleet size |
 
-The split is deliberate. The nine record files each hold one module's data
+The split is deliberate. The ten record files each hold one module's data
 and that module's own settings; nothing else goes in them. Configuration
 read by more than one module, and the accounts that guard all of it, are in
 `app.db`, which is not subject to any size cap and is never trimmed by
@@ -239,7 +241,7 @@ usability — DPAPI will not decrypt it there, and the credential needs
 re-entering on the new machine. Everything else in each file restores
 normally.
 
-All ten sit in one folder, chosen at first run:
+All eleven sit in one folder, chosen at first run:
 
 | Platform | Default location |
 | --- | --- |
@@ -267,6 +269,11 @@ py -m netpath --db D:\data\netpath.db --flow-db D:\data\flows.db `
 Running as a service, set these explicitly. The default resolves against the
 service account's profile, which is a surprising place to find several
 gigabytes of flow records later.
+
+`mapper.db` has no flag of its own — it is small, hand-placed bookkeeping
+rather than something worth pointing at its own volume, so it always lives
+beside `configrx.db`, in whichever folder `--configrx-db` (or the default)
+resolves to.
 
 Each database is in WAL mode, so each has two companions beside it:
 
@@ -331,6 +338,7 @@ Rough shapes to start from:
 | Alerts | alert volume | normally the smallest of all — resolved alerts and notification history, not a per-poll log |
 | Wireless | controller count × AP count | a few KB per AP; normally tiny, since a site has a handful of controllers, not hundreds |
 | ConfigRX | device count × how often configs actually change | a device's own config text, compressed, once per change — most devices add nothing between backups |
+| Mapper | maps × devices placed on them | negligible — a row per placed device/peer, not a sample; a fleet-sized map with a few hundred nodes on it is still kilobytes |
 
 ### What a port costs
 
@@ -400,13 +408,15 @@ Three limits, checked every 15 minutes, in this order:
    samples and device/interface events for Nodes, resolved alerts and
    notification history for Alerts — never the current-state tables
    (devices, polling profiles, interfaces, MIB objects, rules, templates)
-   that describe things as they are configured now, not a log. Wireless
-   and ConfigRX have no absolute size cap of their own — Wireless because
-   its data volume is inherently small (a handful of controllers and their
-   APs, not per-poll samples), ConfigRX because retention (1) and the
-   per-device count cap (2) together already bound it, and its own
-   hash-dedup means an unchanging fleet of devices adds nothing between
-   backups regardless.
+   that describe things as they are configured now, not a log. Wireless,
+   ConfigRX and Mapper have no absolute size cap of their own — Wireless
+   because its data volume is inherently small (a handful of controllers
+   and their APs, not per-poll samples), ConfigRX because retention (1)
+   and the per-device count cap (2) together already bound it, and its
+   own hash-dedup means an unchanging fleet of devices adds nothing between
+   backups regardless, and Mapper for the same reason as Wireless — a map
+   is hand-placed layout, not per-poll samples, so nothing in it grows on
+   its own.
 
 The size cap wins over the other two: if retention says keep 30 days but the
 cap is reached at 9, the ninth day is where it stops. That is deliberate —

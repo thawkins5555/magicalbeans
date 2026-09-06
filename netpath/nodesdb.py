@@ -230,6 +230,82 @@ CREATE INDEX IF NOT EXISTS ix_neighbors_device ON neighbors(device_id);
 CREATE INDEX IF NOT EXISTS ix_neighbors_sys_name ON neighbors(sys_name);
 CREATE INDEX IF NOT EXISTS ix_neighbors_chassis_id ON neighbors(chassis_id);
 
+-- Per-port VLAN membership, for MAPPER's per-VLAN trunk strands (a link
+-- carrying N VLANs draws as N coloured strands below the configured
+-- threshold). Three tables rather than one because they answer three
+-- different questions and age independently: which VLANs this device
+-- knows about at all (`vlans`), which of its ports are trunk vs. access and
+-- what a trunk's native VLAN is (`vlan_ports`), and which VLANs actually
+-- cross which port (`port_vlans` — the many-to-many the map draws). Same
+-- present-flag ageing scheme as `neighbors`/`mac_entries` throughout: a
+-- VLAN or membership row a walk no longer sees is marked present=0 and
+-- keeps its last seen_ts rather than vanishing outright, because a trunk
+-- that stops carrying a VLAN for one vlan_interval_s cycle should read as
+-- "not seen recently", not as a topology change that never happened; the
+-- three prune_vlans*/prune_vlan_ports/prune_port_vlans functions are what
+-- eventually drop a row nothing has confirmed in a long time.
+--
+-- vlans: (device_id, vlan) is the key rather than adding an id column —
+-- exactly mac_entries' and neighbors' own reasoning: nothing outside this
+-- table ever needs to reference one of these rows by a surrogate id, and a
+-- natural key makes the present-flag UPSERT a single ON CONFLICT clause.
+CREATE TABLE IF NOT EXISTS vlans (
+    device_id     INTEGER NOT NULL,
+    vlan          INTEGER NOT NULL,
+    name          TEXT NOT NULL DEFAULT '',
+    seen_ts       REAL NOT NULL,
+    first_seen_ts REAL NOT NULL,
+    present       INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (device_id, vlan)
+);
+-- vlan_ports: one row per port this device reports as VLAN-aware at all
+-- (mode 'trunk'/'access'/'' — '' meaning "seen in a membership below but
+-- neither table said which"), keyed by (device_id, if_index) since a port
+-- has exactly one mode and (for a trunk) one native VLAN at a time. Read by
+-- vlan_ports_for_devices for MAPPER's link detail (a_port_mode/
+-- a_native_vlan and their b_ counterparts in get_mapper_map) — the
+-- device's own reported native VLAN, a stronger source than the `native_vlan`
+-- mapper.assemble_links derives from port_vlans.tagged.
+CREATE TABLE IF NOT EXISTS vlan_ports (
+    device_id     INTEGER NOT NULL,
+    if_index      INTEGER NOT NULL,
+    mode          TEXT NOT NULL DEFAULT '',   -- 'trunk' | 'access' | ''
+    native_vlan   INTEGER,
+    seen_ts       REAL NOT NULL,
+    first_seen_ts REAL NOT NULL,
+    present       INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (device_id, if_index)
+);
+-- port_vlans: the actual membership — this VLAN crosses this port, tagged
+-- or not. Keyed by all three of (device_id, if_index, vlan) because that
+-- triple is the fact being recorded; `tagged` is not part of the key
+-- (unlike mac_entries' vlan column, which can legitimately see the same
+-- MAC on two VLANs) since a port carries a given VLAN exactly one way at
+-- a time — a trunk that somehow answered both tagged and untagged for the
+-- same VLAN would just have its second answer win the UPSERT, same as any
+-- other re-observed fact.
+CREATE TABLE IF NOT EXISTS port_vlans (
+    device_id     INTEGER NOT NULL,
+    if_index      INTEGER NOT NULL,
+    vlan          INTEGER NOT NULL,
+    tagged        INTEGER NOT NULL DEFAULT 1, -- 0 = untagged/native on this port
+    seen_ts       REAL NOT NULL,
+    first_seen_ts REAL NOT NULL,
+    present       INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (device_id, if_index, vlan)
+);
+-- The map reads none of these three tables fleet-wide: vlans_for_devices/
+-- vlan_ports_for_devices/port_vlans_for_devices (MAPPER's own bounded shape,
+-- devices_by_ids' "many known ids, one indexed read" applied to each table)
+-- and the single-device vlans_for/port_vlans_for all filter by device_id,
+-- one id or a handful via IN(...) — never nothing — so this index is what
+-- keeps every one of them off a full table scan (port_vlans_for's optional
+-- if_index narrows a primary-key prefix already, so no separate index earns
+-- its keep there) — same reasoning as ix_neighbors_device.
+CREATE INDEX IF NOT EXISTS ix_vlans_device ON vlans(device_id);
+CREATE INDEX IF NOT EXISTS ix_vlan_ports_device ON vlan_ports(device_id);
+CREATE INDEX IF NOT EXISTS ix_port_vlans_device ON port_vlans(device_id);
+
 CREATE TABLE IF NOT EXISTS metrics (
     id              INTEGER PRIMARY KEY,
     device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
@@ -519,7 +595,7 @@ _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
                      "mib_file_id", "ping_count", "ping_timeout_ms",
                      "unreachable_ping_only", "vendor_oid", "location_oid",
                      "mac_table_interval_s", "lldp_interval_s", "poe_enabled",
-                     "stp_enabled")
+                     "stp_enabled", "vlan_interval_s")
 
 _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
                    "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
@@ -527,7 +603,7 @@ _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
                    "mib_file_id", "ping_count", "ping_timeout_ms",
                    "unreachable_ping_only", "vendor_oid", "location_oid",
                    "mac_table_interval_s", "lldp_interval_s", "poe_enabled",
-                   "stp_enabled")
+                   "stp_enabled", "vlan_interval_s")
 
 # vendor_override is deliberately NOT an _OVERRIDE_COLUMNS entry: a vendor is a
 # fact about one box, not something a polling profile should hand down.
@@ -850,6 +926,9 @@ class NodesDatabase(SqliteStore):
         self.ensure_columns("devices", {
             # LLDP/CDP walk interval, inheritable like mac_table_interval_s.
             "lldp_interval_s": "INTEGER",
+            # Per-port VLAN membership walk interval, inheritable the same
+            # way — its own cadence (see _merge_config), not the poll cycle.
+            "vlan_interval_s": "INTEGER",
             # PoE and STP ride the regular poll cycle, so they need only an
             # on/off switch; defaulted on in _merge_config because the
             # capability probe makes the walk free on a device without them.
@@ -875,7 +954,7 @@ class NodesDatabase(SqliteStore):
         })
         self.ensure_columns("groups", {
             "lldp_interval_s": "INTEGER", "poe_enabled": "INTEGER",
-            "stp_enabled": "INTEGER",
+            "stp_enabled": "INTEGER", "vlan_interval_s": "INTEGER",
         })
         # Per-port PoE and STP state, the same kind of fact as oper_status
         # and refreshed by the same poll cycle rather than a table of its own.
@@ -1609,6 +1688,11 @@ class NodesDatabase(SqliteStore):
         # that choice on every upgrade.
         if config.get("lldp_interval_s") is None:
             config["lldp_interval_s"] = 3600
+        # VLAN membership: same fallback, same reasoning, as lldp_interval_s
+        # immediately above — its own hour-wide cadence, off the poll cycle,
+        # with 0 staying an explicit opt-out on every upgrade.
+        if config.get("vlan_interval_s") is None:
+            config["vlan_interval_s"] = 3600
         # PoE and STP ride the poll cycle rather than a walk of their own
         # (see the devices.poe_capable/stp_capable migration comment), so
         # there is no cost to default them on — a device that does not
@@ -2025,6 +2109,42 @@ class NodesDatabase(SqliteStore):
                 " ORDER BY n.device_id, n.if_index, n.protocol, n.rem_index"
                 ).fetchall()
 
+    def neighbours_for_devices(self, device_ids) -> list[sqlite3.Row]:
+        """all_neighbours(), restricted to neighbour rows OBSERVED BY one of
+        `device_ids` — devices_by_ids' own "many known ids, one indexed
+        read" shape, applied here so MAPPER's map GET can read the handful
+        of devices actually placed instead of the whole fleet. This is
+        sound for MAPPER specifically because a link needs BOTH ends placed
+        (mapper.assemble_links's own on_map(device_id) check drops any row
+        whose observing device is not on the map before it ever looks at
+        the far end), and a peer "Add neighbours" can offer is by
+        definition a neighbour of some device already placed — so every row
+        that could matter to a map of `device_ids` has its device_id among
+        them; nothing reachable through n.device_id being excluded is ever
+        lost.
+
+        Same IN-clause chunking as devices_by_ids, for the same reason: a
+        map's device list is a handful of ids out of a fleet that can run
+        to thousands, but a page-sized bulk selection could still be
+        hundreds wide, so this stays chunked rather than assuming "a map is
+        always small". Order is unspecified across chunks (each chunk is
+        ordered like all_neighbours(), but a caller with thousands of ids
+        gets more than one chunk) — see devices_by_ids' own docstring.
+        Empty `device_ids` returns [] without touching the database."""
+        ids = list(dict.fromkeys(int(d) for d in device_ids))
+        if not ids:
+            return []
+        rows: list[sqlite3.Row] = []
+        with self._lock:
+            for start in range(0, len(ids), self._IDS_PER_QUERY):
+                chunk = ids[start:start + self._IDS_PER_QUERY]
+                marks = ",".join("?" * len(chunk))
+                rows += self._conn.execute(
+                    self._NEIGHBOR_MATCH_SQL + f" WHERE n.device_id IN ({marks})"
+                    " ORDER BY n.device_id, n.if_index, n.protocol, n.rem_index",
+                    chunk).fetchall()
+        return rows
+
     # ---------------------------------------------------- upstream suggestions
     #
     # alertrules.py's ROLLED_UP_BY comment (~250-266) explains why the L2
@@ -2111,6 +2231,229 @@ class NodesDatabase(SqliteStore):
             return 0
         with self._lock:
             cur = self._conn.execute("DELETE FROM neighbors WHERE seen_ts < ?",
+                                     (time.time() - older_than_s,))
+            self._conn.commit()
+        return cur.rowcount or 0
+
+    # ------------------------------------------------------- VLAN membership
+
+    def replace_vlans(self, device_id: int, entries: list[dict],
+                      now: float | None = None) -> int:
+        """Merge one VLAN walk's id/name list into the device's history —
+        replace_neighbors' present-flag ageing, applied to `vlans`: every
+        row already stored for this device is marked present=0 first, then
+        each of this walk's rows is upserted with present=1 and a fresh
+        seen_ts. A VLAN nothing described this walk (retired, or a device
+        that stopped answering the name table) keeps its row and last
+        seen_ts rather than vanishing outright, for the same reason a
+        dropped neighbour does.
+
+        `entries` is a list of {"vlan": int, "name": str}. Empty is a
+        genuine "this device names no VLANs right now" and ages every row;
+        read_device_vlans returning None (not this method being called with
+        []) is what leaves storage untouched — see its own docstring."""
+        now = now if now is not None else time.time()
+        rows = []
+        for entry in entries:
+            try:
+                vlan = int(entry["vlan"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            rows.append((device_id, vlan, str(entry.get("name") or ""), now, now))
+        with self._lock:
+            self._conn.execute(
+                "UPDATE vlans SET present = 0 WHERE device_id = ?", (device_id,))
+            self._conn.executemany(
+                "INSERT INTO vlans(device_id, vlan, name, seen_ts, first_seen_ts,"
+                " present) VALUES (?,?,?,?,?,1)"
+                " ON CONFLICT(device_id, vlan) DO UPDATE SET"
+                " name = excluded.name, seen_ts = excluded.seen_ts, present = 1",
+                rows)
+            self._conn.commit()
+        return len(rows)
+
+    def replace_vlan_ports(self, device_id: int, entries: list[dict],
+                           now: float | None = None) -> int:
+        """replace_vlans' own ageing UPSERT, applied to `vlan_ports`:
+        entries is [{"if_index": int, "mode": str, "native_vlan": int|None}]."""
+        now = now if now is not None else time.time()
+        rows = []
+        for entry in entries:
+            try:
+                if_index = int(entry["if_index"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            native_vlan = entry.get("native_vlan")
+            rows.append((device_id, if_index, str(entry.get("mode") or ""),
+                        int(native_vlan) if native_vlan is not None else None,
+                        now, now))
+        with self._lock:
+            self._conn.execute(
+                "UPDATE vlan_ports SET present = 0 WHERE device_id = ?", (device_id,))
+            self._conn.executemany(
+                "INSERT INTO vlan_ports(device_id, if_index, mode, native_vlan,"
+                " seen_ts, first_seen_ts, present) VALUES (?,?,?,?,?,?,1)"
+                " ON CONFLICT(device_id, if_index) DO UPDATE SET"
+                " mode = excluded.mode, native_vlan = excluded.native_vlan,"
+                " seen_ts = excluded.seen_ts, present = 1", rows)
+            self._conn.commit()
+        return len(rows)
+
+    def replace_port_vlans(self, device_id: int, entries: list[dict],
+                           now: float | None = None) -> int:
+        """replace_vlans' own ageing UPSERT, applied to `port_vlans`:
+        entries is [{"if_index": int, "vlan": int, "tagged": bool}]."""
+        now = now if now is not None else time.time()
+        rows = []
+        for entry in entries:
+            try:
+                if_index = int(entry["if_index"])
+                vlan = int(entry["vlan"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            rows.append((device_id, if_index, vlan,
+                        1 if entry.get("tagged", True) else 0, now, now))
+        with self._lock:
+            self._conn.execute(
+                "UPDATE port_vlans SET present = 0 WHERE device_id = ?", (device_id,))
+            self._conn.executemany(
+                "INSERT INTO port_vlans(device_id, if_index, vlan, tagged,"
+                " seen_ts, first_seen_ts, present) VALUES (?,?,?,?,?,?,1)"
+                " ON CONFLICT(device_id, if_index, vlan) DO UPDATE SET"
+                " tagged = excluded.tagged, seen_ts = excluded.seen_ts,"
+                " present = 1", rows)
+            self._conn.commit()
+        return len(rows)
+
+    def vlans_for(self, device_id: int) -> list[sqlite3.Row]:
+        """Every VLAN this device has ever named, present and stale alike —
+        the device-detail counterpart of neighbours_of."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM vlans WHERE device_id = ? ORDER BY vlan",
+                (device_id,)).fetchall()
+
+    def vlans_for_devices(self, device_ids) -> list[sqlite3.Row]:
+        """vlans_for(), restricted to `device_ids` — devices_by_ids' "many
+        known ids, one indexed read" shape, applied here so MAPPER's map GET
+        only reads the VLAN names of devices it actually places instead of
+        the whole fleet's `vlans` table. Sound for the same reason
+        neighbours_for_devices/port_vlans_for_devices are: a VLAN only
+        matters to a map if some link on that map carries it, and every
+        such VLAN was named by a device the map places (see
+        _mapper_vlans_json) — a VLAN named only by a device nowhere near
+        this map was never going to be shown regardless of which rows this
+        read could see.
+
+        Same IN-clause chunking as devices_by_ids/neighbours_for_devices/
+        port_vlans_for_devices, for the same SQLITE_MAX_VARIABLE_NUMBER
+        reason. Empty `device_ids` returns [] without touching the
+        database."""
+        ids = list(dict.fromkeys(int(d) for d in device_ids))
+        if not ids:
+            return []
+        rows: list[sqlite3.Row] = []
+        with self._lock:
+            for start in range(0, len(ids), self._IDS_PER_QUERY):
+                chunk = ids[start:start + self._IDS_PER_QUERY]
+                marks = ",".join("?" * len(chunk))
+                rows += self._conn.execute(
+                    f"SELECT * FROM vlans WHERE device_id IN ({marks})"
+                    " ORDER BY device_id, vlan", chunk).fetchall()
+        return rows
+
+    def port_vlans_for(self, device_id: int,
+                       if_index: int | None = None) -> list[sqlite3.Row]:
+        """Every VLAN membership row stored for this device (optionally one
+        port), present and stale alike — mac_entries_for's own shape."""
+        sql = "SELECT * FROM port_vlans WHERE device_id = ?"
+        args: list = [device_id]
+        if if_index is not None:
+            sql += " AND if_index = ?"
+            args.append(if_index)
+        with self._lock:
+            return self._conn.execute(sql + " ORDER BY if_index, vlan", args).fetchall()
+
+    def vlan_ports_for_devices(self, device_ids) -> list[sqlite3.Row]:
+        """Every `vlan_ports` row (a port's trunk/access mode and, for a
+        trunk, its device-reported native VLAN) for one of `device_ids` —
+        port_vlans_for_devices' own shape, applied to the sibling table so
+        MAPPER can show a link end's mode and native VLAN the way an
+        operator reading a trunk diagram expects, without a fleet-wide read.
+        Sound for the same reason port_vlans_for_devices is: a link end's
+        mode/native VLAN is read from that end's OWN (device_id, if_index),
+        never the far end's, so a map only ever needs vlan_ports for the
+        devices it places.
+
+        Same IN-clause chunking as the other *_for_devices accessors, for
+        the same reason. Empty `device_ids` returns [] without touching the
+        database."""
+        ids = list(dict.fromkeys(int(d) for d in device_ids))
+        if not ids:
+            return []
+        rows: list[sqlite3.Row] = []
+        with self._lock:
+            for start in range(0, len(ids), self._IDS_PER_QUERY):
+                chunk = ids[start:start + self._IDS_PER_QUERY]
+                marks = ",".join("?" * len(chunk))
+                rows += self._conn.execute(
+                    f"SELECT * FROM vlan_ports WHERE device_id IN ({marks})"
+                    " ORDER BY device_id, if_index", chunk).fetchall()
+        return rows
+
+    def port_vlans_for_devices(self, device_ids) -> list[sqlite3.Row]:
+        """Every `port_vlans` row for one of `device_ids` — devices_by_ids'
+        "many known ids, one indexed read" shape, applied here so MAPPER's
+        map GET only reads the ports of devices actually placed. Sound for
+        the same reason neighbours_for_devices is: a link's VLAN strands
+        are drawn from each row's OWN (device_id, if_index) local port (see
+        mapper._port_vlans), never the far end's, so a map only ever needs
+        port_vlans for the devices it places — the far end's membership, if
+        it has any, is read when that device's own map places IT.
+
+        Same IN-clause chunking as devices_by_ids/neighbours_for_devices,
+        for the same SQLITE_MAX_VARIABLE_NUMBER reason. Empty `device_ids`
+        returns [] without touching the database."""
+        ids = list(dict.fromkeys(int(d) for d in device_ids))
+        if not ids:
+            return []
+        rows: list[sqlite3.Row] = []
+        with self._lock:
+            for start in range(0, len(ids), self._IDS_PER_QUERY):
+                chunk = ids[start:start + self._IDS_PER_QUERY]
+                marks = ",".join("?" * len(chunk))
+                rows += self._conn.execute(
+                    f"SELECT * FROM port_vlans WHERE device_id IN ({marks})"
+                    " ORDER BY device_id, if_index, vlan", chunk).fetchall()
+        return rows
+
+    def prune_vlans(self, older_than_s: float) -> int:
+        """Drop VLAN rows nothing has refreshed for this long — prune_
+        neighbors' own by-age rule, applied to `vlans`."""
+        if older_than_s <= 0:
+            return 0
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM vlans WHERE seen_ts < ?",
+                                     (time.time() - older_than_s,))
+            self._conn.commit()
+        return cur.rowcount or 0
+
+    def prune_vlan_ports(self, older_than_s: float) -> int:
+        """Drop vlan_ports rows nothing has refreshed for this long."""
+        if older_than_s <= 0:
+            return 0
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM vlan_ports WHERE seen_ts < ?",
+                                     (time.time() - older_than_s,))
+            self._conn.commit()
+        return cur.rowcount or 0
+
+    def prune_port_vlans(self, older_than_s: float) -> int:
+        """Drop port_vlans rows nothing has refreshed for this long."""
+        if older_than_s <= 0:
+            return 0
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM port_vlans WHERE seen_ts < ?",
                                      (time.time() - older_than_s,))
             self._conn.commit()
         return cur.rowcount or 0

@@ -13,6 +13,7 @@ right shape, not IpamWorker's coarser "unseen = immediately due" one.
 from __future__ import annotations
 
 import random
+import re
 import socket
 import sqlite3
 import threading
@@ -35,6 +36,21 @@ from .trapdecode import localized_key
 from .worker import Worker, ago
 
 MAX_UDP = 65535
+
+# Bounds on read_device_vlans' walk (see its own docstring): the number of
+# distinct VLAN ids one walk will keep and write, the lowest-numbered ones
+# kept when a device reports more. A device with a garbled or enormous VLAN
+# range (a bad agent, or a trunk allow-list read as if every bit meant a
+# real VLAN) must not turn one scheduled walk into an unbounded number of
+# stored rows — the same "cap rather than fail" idiom the class-level
+# _MAX_VLAN_CONTEXTS/_VLAN_WALK_BUDGET_S use for _cisco_vlan_fdb's per-VLAN-
+# community sweep. Deliberately MODULE-level rather than a same-named class
+# attribute: this walk has no per-VLAN SNMP context to size against (it
+# bounds the OUTPUT of a handful of column walks, not a loop that opens one
+# SNMP session per VLAN), and giving it its own class attribute of the same
+# name as the existing one would silently shadow it in the class namespace.
+_MAX_VLANS = 512
+_VLAN_WALK_BUDGET_S = 20.0
 
 # RFC 3414 §5's usmStats counters, the objects an agent names in the
 # Report-PDU it answers a v3 request it would not process with. Reported by
@@ -406,6 +422,130 @@ def _format_cdp_address(raw) -> str:
     return text
 
 
+def _int_keyed(column: dict) -> dict:
+    """A `_walk_column` result with every index suffix parsed to int,
+    dropping anything that is not one. Several VLAN-walk columns below are
+    indexed by a bare bridge port or ifIndex (a single arc), and this is
+    the one-line version of the `try: int(suffix) except...: continue` loop
+    every other table walk in this file already repeats inline — worth
+    naming once here because the VLAN walk needs it five separate times."""
+    out = {}
+    for suffix, value in column.items():
+        try:
+            out[int(suffix)] = value
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+# trapdecode._octets_text's own two non-literal branches, and only those:
+# its six-byte MAC-address special case always joins with ':' and always
+# lowercase hex (`f"{b:02x}"`); its general fallback always joins with ' '
+# and always UPPERCASE hex (`f"{b:02X}"`). A literal run that merely looks
+# hex-ish (a single odd-length token, or one that mixes case, or one whose
+# groups run together with no separating space) can never have come out of
+# either branch, so it is deliberately NOT matched here — see
+# _octets_from_value.
+_HEX_MAC_RE = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$")
+_HEX_OCTETS_RE = re.compile(r"^[0-9A-F]{2}(?: [0-9A-F]{2})*$")
+
+
+def _octets_from_value(raw) -> bytes:
+    """The bytes behind a PortList/VLAN-bitmap OCTET STRING, whether `raw`
+    is already bytes (callers and tests that have them directly) or has
+    been through this app's shared OCTET_STRING decoder for a live walk
+    (trapdecode._octets_text — the same one _format_cdp_address documents):
+    plain text when every byte happened to be printable, colon-separated
+    lowercase hex when the string was exactly six bytes and not all
+    printable (that decoder's MAC-address special case), or space-separated
+    uppercase hex otherwise.
+
+    That decode is NOT losslessly reversible, despite this file previously
+    documenting it as such, and this function cannot make it so — the raw
+    octets are gone before it is ever called. `trapdecode._decode_value`
+    returns an OCTET STRING's printable rendering as the value itself, so
+    the bytes are discarded at BER-parse time; recovering them would mean
+    re-implementing v1/v2c/v3 parsing here. INTERNALS.md records this as a
+    known limit of the whole SNMP path — the LLDP chassis-id decode has it
+    too — rather than of this function alone.
+
+    What this DOES do is narrow the guess to the shapes `_octets_text`
+    provably produces — its six-group lowercase colon-hex MAC form, or a
+    run of space-separated uppercase hex pairs — instead of the previous
+    heuristic, which reinterpreted any printable one-or-two-character hex
+    look-alike and so turned a literal "A" (0x41, ports 2 and 8) into 0x0A
+    (ports 5 and 7).
+
+    Two ambiguities are irreducible, and are resolved the way that is right
+    more often on real hardware rather than pretended away:
+
+      - 0x0A, 0x0D and 0x20 all render as the same single space, so all
+        three read back as 0x20 (port 3). A PortList setting ports 5 and 7
+        is indistinguishable from one setting port 3.
+      - A run matching the uppercase-hex-pair shape is read AS hex, so the
+        text "12" becomes the one byte 0x12 rather than the two literal
+        characters "1" and "2". An agent's PortList reaches `_octets_text`
+        as hex far more often than a switch answers with literal decimal
+        text, so this is the better default — but it is a default, not a
+        certainty.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw)
+    text = str(raw or "")
+    if not text:
+        return b""
+    if _HEX_MAC_RE.match(text):
+        return bytes(int(part, 16) for part in text.split(":"))
+    if _HEX_OCTETS_RE.match(text):
+        return bytes(int(part, 16) for part in text.split(" "))
+    return text.encode("latin-1", "replace")
+
+
+def _bit_positions(octets: bytes):
+    """(octet index, bit index within it — 0 the most significant) for
+    every set bit of a big-endian bitmap, the scan _decode_port_list and
+    _decode_vlan_bitmap share; they differ only in how a position becomes
+    a port or VLAN number (see _decode_vlan_bitmap's own docstring)."""
+    for i, byte in enumerate(octets):
+        for bit in range(8):
+            if byte & (0x80 >> bit):
+                yield i, bit
+
+
+def _decode_port_list(raw) -> list[int]:
+    """Bridge port numbers set in a Q-BRIDGE-MIB PortList OCTET STRING
+    (dot1qVlanStatic/CurrentEgressPorts, …UntaggedPorts).
+
+    A PortList (RFC 4363) is a big-endian bitmap: the most significant bit
+    of byte 0 is bridge port 1, the next bit down is port 2, ... the least
+    significant bit of byte 0 is port 8, the most significant bit of byte 1
+    is port 9, and so on — 1-based, unlike CISCO-VTP-MIB's own bitmaps (see
+    _decode_vlan_bitmap, which shares this function's octet-decoding and
+    bit-scan but not its 1-based numbering).
+
+    `raw` is either raw bytes, or text already through this app's shared
+    OCTET_STRING decoder — see _octets_from_value for how that text is
+    turned back into bytes, and why that is best-effort rather than
+    lossless for a short run of bytes that all happen to be printable.
+    """
+    return [i * 8 + bit + 1 for i, bit in _bit_positions(_octets_from_value(raw))]
+
+
+def _decode_vlan_bitmap(raw, base: int) -> list[int]:
+    """VLAN ids set in one of CISCO-VTP-MIB's four vlanTrunkPortVlansEnabled*
+    bitmaps (see nodeoids' VTP_TRUNK_VLANS_ENABLED* block for the four
+    OIDs and their base offsets). Same big-endian, most-significant-bit-
+    first octet scan _decode_port_list uses — but 0-based, NOT 1-based
+    like that PortList convention: CISCO-VTP-MIB's own DESCRIPTION says
+    the first octet specifies VLANs 0 through 7, its most significant bit
+    the LOWEST-numbered of those, not "the lowest VLAN plus one" the way a
+    PortList's octet 0 reserves its most significant bit for bridge port 1
+    rather than port 0. Adding `base` (0, 1024, 2048 or 3072 — one per
+    column) places the result in the right thousand."""
+    return [base + i * 8 + bit
+           for i, bit in _bit_positions(_octets_from_value(raw))]
+
+
 class _OidWalkJob:
     """A whole-device SNMP walk, run on its own thread.
 
@@ -687,6 +827,11 @@ class NodePoller(Worker):
         # see _maybe_walk_lldp.
         self._next_lldp_walk: dict[int, float] = {}
         self._lldp_running: set[int] = set()
+        # device_id -> when its per-port VLAN membership was last walked,
+        # and which walks are in flight — _next_lldp_walk/_lldp_running's
+        # own shape, its own cadence (vlan_interval_s), see _maybe_walk_vlans.
+        self._next_vlan_walk: dict[int, float] = {}
+        self._vlan_running: set[int] = set()
         self._engines = EngineCache()
         self._discovery_jobs: dict[int, DiscoveryJob] = {}
         # device_id -> the whole-device OID walk running or last finished for
@@ -769,7 +914,10 @@ class NodePoller(Worker):
                          # reads that produced data (a device whose
                          # capability probe was negative never bumps them).
                          "lldp_walks": 0, "poe_polls": 0, "stp_polls": 0,
-                         "rf_polls": 0}
+                         "rf_polls": 0,
+                         # vlan_walks: completed per-port VLAN membership
+                         # walks, lldp_walks' own counter.
+                         "vlan_walks": 0}
 
     def start(self, settings: dict | None = None) -> None:
         self.stop()
@@ -1135,6 +1283,7 @@ class NodePoller(Worker):
                     self._submit(device_id)
             self._maybe_walk_mac_table(device, config, now)
             self._maybe_walk_lldp(device, config, now)
+            self._maybe_walk_vlans(device, config, now)
 
     # How long the pool has to look saturated before it is worth telling
     # somebody. A burst at the top of a poll cycle is normal; five minutes
@@ -1187,7 +1336,7 @@ class NodePoller(Worker):
         entry per device ever deleted.
         """
         for cache in (self._next_run, self._last_ping, self._next_mac_walk,
-                      self._next_lldp_walk,
+                      self._next_lldp_walk, self._next_vlan_walk,
                       self._credentials, self._credential_probe_failed,
                       self._addresses_read, self._bulk_repetitions,
                       self._sensor_read):
@@ -1263,6 +1412,35 @@ class NodePoller(Worker):
         except (RuntimeError, AttributeError):
             with self._lock:
                 self._lldp_running.discard(device_id)
+
+    def _maybe_walk_vlans(self, device, config: dict, now: float) -> None:
+        """Queue a per-port VLAN membership walk when this device's own
+        interval has come round — _maybe_walk_lldp's own scheduling, applied
+        to vlan_interval_s instead of lldp_interval_s, sharing the same
+        executor for the same reason: another whole-device table walk of
+        hundreds of rows, off the poll pool."""
+        interval = float(config.get("vlan_interval_s") or 0)
+        if interval <= 0 or not config.get("snmp_enabled", True):
+            return
+        if device["status"] == "down" or device["consecutive_fail"]:
+            return
+        device_id = device["id"]
+        due = self._next_vlan_walk.get(device_id)
+        if due is None:
+            self._next_vlan_walk[device_id] = now + random.uniform(0, interval)
+            return
+        if now < due:
+            return
+        with self._lock:
+            if device_id in self._vlan_running:
+                return
+            self._vlan_running.add(device_id)
+        self._next_vlan_walk[device_id] = now + interval
+        try:
+            self._mac_executor.submit(self._run_vlan_table, device_id)
+        except (RuntimeError, AttributeError):
+            with self._lock:
+                self._vlan_running.discard(device_id)
 
     def _submit(self, device_id: int) -> bool:
         """True when this call put the device on the pool; False when it was
@@ -4333,6 +4511,289 @@ class NodePoller(Worker):
         finally:
             with self._lock:
                 self._lldp_running.discard(device_id)
+
+    # ------------------------------------------------- VLAN membership
+
+    def read_device_vlans(self, device_id: int) -> dict | None:
+        """Every VLAN this device names, which of its ports are trunk/
+        access (and a trunk's native VLAN), and which VLANs actually cross
+        which port — the whole-device counterpart of read_device_neighbors,
+        with the same None-vs-dict contract: None means nothing answered at
+        all (storage untouched by _run_vlan_table); a dict — even one whose
+        lists are all empty — is a genuine "walked, and this is what came
+        back", which is what lets a membership that has truly gone away age
+        its stored rows out instead of sitting present forever.
+
+        Four sources, applied in authority order:
+          (a) dot1dBasePortIfIndex resolves a BRIDGE-MIB bridge port number
+              to the ifIndex the rest of the app keys interfaces by (the
+              same table the FDB walk resolves through _bridge_port_map).
+              Absent entirely on some small switches, which is not the same
+              fact as "this device has no ports": see `resolve` below for
+              why the bridge port number is used as the ifIndex directly
+              rather than dropping every membership the device reports.
+          (b) Q-BRIDGE-MIB dot1qVlanStatic*/dot1qVlanCurrent* — the
+              standards path. The current-table columns are consulted only
+              where their static counterpart came back empty: a VTP/GVRP
+              client legitimately carries no static configuration of its
+              own.
+          (c) CISCO-VTP-MIB, Cisco only (detected_vendor gate, same one
+              _walk_cdp uses) — and a Cisco answer for a port SUPERSEDES
+              whatever the standards path said about that same port.
+              vlanTrunkPortVlansEnabled is the trunk's configured allow
+              list; dot1q's own egress bitmap on classic IOS often reflects
+              only VLANs with a currently active member, which is a
+              narrower and more volatile fact than what is actually
+              configured to cross the trunk.
+          (d) mac_entries' own vlan column, for a port neither (b) nor (c)
+              described at all: a VLAN whose traffic this device has
+              learned on a port is evidence that VLAN crosses it, even
+              though no VLAN table said so. Evidence, not configuration —
+              reached only for a port with no authoritative answer, and
+              never allowed to override one.
+        """
+        device = self.db.device(device_id)
+        if device is None:
+            return None
+        config = self.working_config(device)
+        if not config.get("snmp_enabled", True):
+            return None
+
+        # The budget goes INTO each walk (see _cisco_vlan_fdb's own
+        # comment on why): checking only between walks would let the last
+        # one of eight start after the budget was already spent.
+        deadline = time.time() + _VLAN_WALK_BUDGET_S
+        answered = False
+
+        def walk(oid: str, *, evidence: bool = True) -> dict:
+            nonlocal answered
+            column = self._walk_column(device, config, oid, deadline=deadline)
+            if column and evidence:
+                answered = True
+            return column
+
+        # (a) bridge port -> ifIndex. BRIDGE-MIB, not a VLAN table: it only
+        # helps interpret a bridge port number the VLAN columns below might
+        # report, and answering it is not itself evidence this device has
+        # ANY VLAN-related MIB at all — a switch with nothing but plain
+        # bridging support would otherwise flip `answered` true here and
+        # get a genuine "walked, found nothing" dict below (aging every
+        # stored row to present=0 and logging a 0-row walk every hour)
+        # instead of the None this docstring promises for "nothing VLAN-
+        # related answered". evidence=False keeps this call out of that
+        # decision entirely.
+        port_map = _int_keyed(walk(nodeoids.DOT1D_BASE_PORT_IFINDEX,
+                                   evidence=False))
+
+        def resolve(bridge_port: int):
+            if port_map:
+                return port_map.get(bridge_port)
+            # dot1dBasePortIfIndex did not answer at all. Plenty of small
+            # switches number their bridge ports 1:1 with ifIndex and never
+            # populate this table, so treating the bridge port number as
+            # the ifIndex directly recovers real data on exactly those
+            # devices — a wrong guess on a device numbered differently only
+            # misattributes which port a VLAN belongs to, a smaller loss
+            # than dropping every membership this device reports.
+            return bridge_port
+
+        described_ports: set = set()
+        port_mode: dict = {}
+        port_native: dict = {}
+        memberships: dict = {}   # (if_index, vlan) -> tagged
+        vlan_names: dict = {}
+
+        # (b) standards path
+        static_names = walk(nodeoids.DOT1Q_VLAN_STATIC_NAME)
+        egress = walk(nodeoids.DOT1Q_VLAN_STATIC_EGRESS)
+        if not egress:
+            egress = walk(nodeoids.DOT1Q_VLAN_CURRENT_EGRESS)
+        untagged = walk(nodeoids.DOT1Q_VLAN_STATIC_UNTAGGED)
+        if not untagged:
+            untagged = walk(nodeoids.DOT1Q_VLAN_CURRENT_UNTAGGED)
+
+        if static_names:
+            for suffix, value in static_names.items():
+                try:
+                    vlan_names[int(suffix)] = str(value or "")
+                except (TypeError, ValueError):
+                    continue
+        else:
+            # No static VLAN table at all — the current-table bitmaps' own
+            # suffixes are the only standards-path evidence a VLAN id
+            # exists, and dot1qVlanCurrentTable has no name column to go
+            # with them.
+            for suffix in set(egress) | set(untagged):
+                try:
+                    vlan_names.setdefault(int(suffix), "")
+                except (TypeError, ValueError):
+                    continue
+
+        def port_sets(column: dict) -> dict:
+            out = {}
+            for suffix, raw in column.items():
+                try:
+                    vlan = int(suffix)
+                except (TypeError, ValueError):
+                    continue
+                ports = set()
+                for bridge_port in _decode_port_list(raw):
+                    if_index = resolve(bridge_port)
+                    if if_index is not None:
+                        ports.add(if_index)
+                out[vlan] = ports
+            return out
+
+        egress_ports = port_sets(egress)
+        untagged_ports = port_sets(untagged)
+        # A port present in egress but not untagged is tagged; present in
+        # both is untagged (dot1qPvid below is which VLAN that untagged
+        # membership actually means for the port, i.e. its native VLAN).
+        for vlan in set(egress_ports) | set(untagged_ports):
+            eg = egress_ports.get(vlan, set())
+            un = untagged_ports.get(vlan, set())
+            for if_index in eg | un:
+                described_ports.add(if_index)
+                memberships[(if_index, vlan)] = if_index not in un
+
+        for suffix, value in walk(nodeoids.DOT1Q_PVID).items():
+            try:
+                bridge_port = int(suffix)
+                native = int(value)
+            except (TypeError, ValueError):
+                continue
+            if_index = resolve(bridge_port)
+            if if_index is None:
+                continue
+            port_native[if_index] = native
+            described_ports.add(if_index)
+
+        # (c) Cisco path — supersedes (b) per port
+        if detected_vendor(device).lower() == "cisco":
+            for suffix, value in walk(nodeoids.VTP_VLAN_NAME).items():
+                try:
+                    vlan_names[int(suffix)] = str(value or "")
+                except (TypeError, ValueError):
+                    continue
+
+            trunk_status = _int_keyed(walk(nodeoids.VTP_TRUNK_DYNAMIC_STATUS))
+            trunk_native = _int_keyed(walk(nodeoids.VTP_TRUNK_NATIVE_VLAN))
+
+            cisco_vlans_by_port: dict = {}
+            for oid, base in (
+                (nodeoids.VTP_TRUNK_VLANS_ENABLED, 0),
+                (nodeoids.VTP_TRUNK_VLANS_ENABLED_2K, 1024),
+                (nodeoids.VTP_TRUNK_VLANS_ENABLED_3K, 2048),
+                (nodeoids.VTP_TRUNK_VLANS_ENABLED_4K, 3072),
+            ):
+                for suffix, raw in walk(oid).items():
+                    try:
+                        if_index = int(suffix)
+                    except (TypeError, ValueError):
+                        continue
+                    cisco_vlans_by_port.setdefault(if_index, set()).update(
+                        _decode_vlan_bitmap(raw, base))
+
+            cisco_ports = (set(trunk_status) | set(trunk_native)
+                          | set(cisco_vlans_by_port))
+            for if_index in cisco_ports:
+                status = trunk_status.get(if_index)
+                # The trunk allow-list is only meaningful for a port that is
+                # actually trunking. On classic IOS, vlanTrunkPortDynamicStatus
+                # carries a row for EVERY switchport -- access ports included,
+                # reporting notTrunking(2) -- and such a port still answers
+                # vlanTrunkPortVlansEnabled with its configured allow list
+                # (default: all VLANs) and vlanTrunkPortNativeVlan (default:
+                # 1). Applying those unconditionally, as this used to, threw
+                # away a correctly-read access VLAN (dot1qPvid, via the
+                # standards path) in favour of a fabricated ~4094-VLAN trunk
+                # on every access port. So: only status == trunking(1) gets
+                # the Cisco override below; anything else (notTrunking, or a
+                # port this column simply never covers) keeps whatever the
+                # standards path already recorded for it, and is merely
+                # labelled here when IOS says outright that it is an access
+                # port.
+                if status != 1:
+                    if status == 2:
+                        port_mode[if_index] = "access"
+                    continue
+
+                # Supersede: drop whatever the standards path recorded for
+                # this port before writing the Cisco answer over it.
+                for key in [k for k in memberships if k[0] == if_index]:
+                    del memberships[key]
+                described_ports.add(if_index)
+                port_mode[if_index] = "trunk"
+                native = trunk_native.get(if_index)
+                if native is not None:
+                    port_native[if_index] = native
+                vlans = cisco_vlans_by_port.get(if_index, set())
+                if vlans:
+                    for vlan in vlans:
+                        memberships[(if_index, vlan)] = not (
+                            native is not None and vlan == native)
+                elif native is not None:
+                    memberships[(if_index, native)] = False
+
+        if not answered:
+            return None
+
+        # (d) mac_entries fallback — evidence, not configuration, only for
+        # a port neither (b) nor (c) described at all.
+        for row in self.db.mac_entries_for(device_id):
+            if_index = row["if_index"]
+            if if_index in described_ports:
+                continue
+            vlan_text = str(row["vlan"] or "").strip()
+            if not vlan_text.isdigit():
+                continue
+            memberships.setdefault((if_index, int(vlan_text)), True)
+
+        # Bound the write: keep the lowest _MAX_VLANS ids seen, the same
+        # "cap rather than fail" idiom _cisco_vlan_fdb's _MAX_VLAN_CONTEXTS
+        # slice uses.
+        all_vlan_ids = set(vlan_names) | {vlan for _, vlan in memberships}
+        kept_vlans = set(sorted(all_vlan_ids)[:_MAX_VLANS])
+
+        vlans_out = [{"vlan": vlan, "name": vlan_names.get(vlan, "")}
+                    for vlan in sorted(kept_vlans)]
+        port_ifindexes = (set(port_mode) | set(port_native)
+                         | {if_index for if_index, _ in memberships})
+        ports_out = [
+            {"if_index": if_index, "mode": port_mode.get(if_index, ""),
+             "native_vlan": port_native.get(if_index)}
+            for if_index in sorted(port_ifindexes)]
+        memberships_out = [
+            {"if_index": if_index, "vlan": vlan, "tagged": tagged}
+            for (if_index, vlan), tagged in memberships.items()
+            if vlan in kept_vlans]
+
+        return {"vlans": vlans_out, "ports": ports_out,
+                "memberships": memberships_out}
+
+    def _run_vlan_table(self, device_id: int) -> None:
+        """One scheduled per-port VLAN membership walk, mirroring
+        _run_lldp_table exactly: a worker thread must never die quietly,
+        and a device that answers no VLAN table at all leaves its stored
+        rows alone rather than deleting them — see read_device_vlans'
+        None contract."""
+        try:
+            result = self.read_device_vlans(device_id)
+            if result is None:
+                return
+            self.db.replace_vlans(device_id, result["vlans"])
+            self.db.replace_vlan_ports(device_id, result["ports"])
+            stored = self.db.replace_port_vlans(device_id, result["memberships"])
+            self._bump("vlan_walks")
+            self.log.add(NODES, f"Learned {stored} VLAN membership row(s) on "
+                                f"device #{device_id}")
+        except Exception:
+            self._bump("errors")
+            self.log.add(ERROR, f"VLAN walk failed for device #{device_id}",
+                         detail=traceback.format_exc())
+        finally:
+            with self._lock:
+                self._vlan_running.discard(device_id)
 
     # Bounds for the OID browser. Generous enough to be useful on a switch,
     # small enough that a dialog someone is sitting in front of cannot hang:

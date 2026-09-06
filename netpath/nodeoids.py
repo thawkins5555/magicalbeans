@@ -250,6 +250,75 @@ DOT1D_STP_PORT_STATE_ENUM = {1: "disabled", 2: "blocking", 3: "listening",
                              4: "learning", 5: "forwarding", 6: "broken"}
 DOT1D_STP_PROTOCOL_SPEC_ENUM = {1: "unknown", 2: "decLb100", 3: "ieee8021d"}
 
+# -------------------------------------------------------- VLAN membership
+#
+# Per-port VLAN membership, for MAPPER's per-VLAN trunk strands. Bridge-port
+# numbering is the same BRIDGE-MIB concept the FDB walk already resolves to
+# ifIndex (nodepoll._bridge_port_map) — dot1dBasePortIfIndex is repeated here
+# under its own public name because the VLAN walk lives beside the LLDP/CDP
+# walk rather than inside the FDB code that already has a private constant
+# for it, and nodepoll's LLDP block already sets the convention of naming
+# every OID it uses here rather than reaching for a class constant.
+DOT1D_BASE_PORT_IFINDEX = "1.3.6.1.2.1.17.1.4.1.2"    # dot1dBasePortIfIndex
+
+# Q-BRIDGE-MIB (RFC 4363) dot1qVlanStaticTable: the VLANs an operator has
+# configured, by bridge-port bitmap. "Static" is walked first because it is
+# what was actually configured; dot1qVlanCurrentTable (the "current" pair
+# below) is VTP/GVRP's *learned* view and is only consulted when the static
+# table is empty — a device running VTP client mode legitimately has no
+# static VLANs of its own.
+DOT1Q_VLAN_STATIC_NAME     = "1.3.6.1.2.1.17.7.1.4.3.1.1"  # dot1qVlanStaticName
+# dot1qVlanStaticEgressPorts / dot1qVlanStaticUntaggedPorts: PortList OCTET
+# STRINGs, a big-endian bitmap where the most significant bit of byte 0 is
+# bridge port 1 — see nodepoll._decode_port_list, which decodes both. A port
+# in the egress set but not the untagged set carries this VLAN tagged; a
+# port in both carries it untagged (dot1qPvid below names which VLAN that
+# untagged membership actually is for that port, i.e. its access/native VLAN).
+DOT1Q_VLAN_STATIC_EGRESS   = "1.3.6.1.2.1.17.7.1.4.3.1.2"  # dot1qVlanStaticEgressPorts
+DOT1Q_VLAN_STATIC_UNTAGGED = "1.3.6.1.2.1.17.7.1.4.3.1.4"  # dot1qVlanStaticUntaggedPorts
+# dot1qVlanCurrentTable's fallback pair — same PortList shape, indexed by
+# (VlanTimeMark, VlanIndex) rather than VlanIndex alone, but nodepoll's walk
+# only ever asks for TimeMark 0 so the suffix reads the same either way.
+DOT1Q_VLAN_CURRENT_EGRESS   = "1.3.6.1.2.1.17.7.1.4.2.1.4"  # dot1qVlanCurrentEgressPorts
+DOT1Q_VLAN_CURRENT_UNTAGGED = "1.3.6.1.2.1.17.7.1.4.2.1.5"  # dot1qVlanCurrentUntaggedPorts
+# dot1qPvid: a port's native/access VLAN — the one it hands untagged frames
+# on the wire, regardless of what else the egress/untagged bitmaps say.
+DOT1Q_PVID = "1.3.6.1.2.1.17.7.1.4.5.1.1"   # dot1qPvid
+
+# CISCO-VTP-MIB, read only on Cisco gear (same vendor gate _walk_cdp uses):
+# classic IOS answers VTP's own tables far more reliably than Q-BRIDGE, and
+# vlanTrunkPortVlansEnabled is the trunk's *configured allow-list*, which is
+# not the same fact as dot1q's egress bitmap above — see nodepoll's
+# read_device_vlans docstring for why a Cisco answer for a port supersedes
+# the standards answer for that same port rather than merging with it.
+VTP_VLAN_NAME = "1.3.6.1.4.1.9.9.46.1.3.1.1.4"    # vtpVlanName
+# vtpVlanState is ALSO read as nodepoll's own private _VTP_VLAN_STATE
+# constant (same OID, "1.3.6.1.4.1.9.9.46.1.3.1.1.2") for the classic-IOS
+# per-VLAN-community FDB trick that predates this module. That constant is
+# left alone rather than repointed here — this is only the shared name for
+# code that wants it without reaching into a class body.
+VTP_VLAN_STATE = "1.3.6.1.4.1.9.9.46.1.3.1.1.2"   # vtpVlanState (1 = operational)
+
+# vlanTrunkPortVlansEnabled and its three extended columns: together a
+# 4096-VLAN-wide bitmap split across four OIDs because the base MIB predates
+# VLANs above 1024. Each is up to 128 octets, big-endian/MSB-first like the
+# dot1q egress bitmaps above, but NOT the same layout — CISCO-VTP-MIB's own
+# DESCRIPTION says the most significant bit of octet 0 is VLAN 0, the next
+# bit down VLAN 1, and so on, i.e. 0-based, where a Q-BRIDGE PortList's
+# octet 0 reserves its most significant bit for bridge port 1, i.e.
+# 1-based. Same PortList shape does NOT mean same origin — see
+# nodepoll._decode_vlan_bitmap, which shares _decode_port_list's octet
+# decoding and bit-scan but adds the column's base (0, 1024, 2048 or 3072)
+# straight to the 0-based bit position, with no PortList-style +1.
+VTP_TRUNK_VLANS_ENABLED     = "1.3.6.1.4.1.9.9.46.1.6.1.1.4"   # base 0
+VTP_TRUNK_VLANS_ENABLED_2K  = "1.3.6.1.4.1.9.9.46.1.6.1.1.17"  # base 1024
+VTP_TRUNK_VLANS_ENABLED_3K  = "1.3.6.1.4.1.9.9.46.1.6.1.1.18"  # base 2048
+VTP_TRUNK_VLANS_ENABLED_4K  = "1.3.6.1.4.1.9.9.46.1.6.1.1.19"  # base 3072
+VTP_TRUNK_NATIVE_VLAN   = "1.3.6.1.4.1.9.9.46.1.6.1.1.5"    # vlanTrunkPortNativeVlan
+VTP_TRUNK_DYNAMIC_STATUS = "1.3.6.1.4.1.9.9.46.1.6.1.1.14"  # vlanTrunkPortDynamicStatus
+
+VTP_TRUNK_DYNAMIC_STATUS_ENUM = {1: "trunking", 2: "notTrunking"}
+
 # ---------------------------------------------------------- PtP radio links
 #
 # Point-to-point wireless bridges: a PtP link has exactly one

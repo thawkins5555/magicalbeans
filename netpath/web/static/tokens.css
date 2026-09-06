@@ -64,8 +64,35 @@
   --cat-7: #8F76E8;
   --cat-8: #DC5A5A;
 
+  /* VLAN palette: one strand per VLAN on a MAPPER trunk, so unlike --cat-1..8 (drawn as filled
+     areas, where 3:1 against the panel is the whole test) these are 1.5px lines that also have to
+     stay apart from EACH OTHER, side by side, in all seven themes — checked the same way --cat-1..8
+     was, simulating protanopia and deuteranopia and comparing in CIE Lab, not just eyeballed.
+     Sixteen hues evenly spaced 22.5 degrees apart (HSL, one lightness/saturation pair per theme
+     "family") hold a 12.7 CIE76 gap here against the dark panel; kept clear of --ok/--warn/--fail's
+     hues so a strand is never misread as a status. Light-ground themes cannot use this set as-is —
+     see --vlan-* under :root[data-theme="light"] and the other light theme below. */
+  --vlan-1: #DA6C6C;
+  --vlan-2: #DA956C;
+  --vlan-3: #DABF6C;
+  --vlan-4: #CDDA6C;
+  --vlan-5: #A3DA6C;
+  --vlan-6: #7ADA6C;
+  --vlan-7: #6CDA88;
+  --vlan-8: #6CDAB1;
+  --vlan-9: #6CDADA;
+  --vlan-10: #6CB1DA;
+  --vlan-11: #6C88DA;
+  --vlan-12: #7A6CDA;
+  --vlan-13: #A36CDA;
+  --vlan-14: #CD6CDA;
+  --vlan-15: #DA6CBF;
+  --vlan-16: #DA6C95;
+
   /* Route canvas: NetPath draws its route on white on purpose (it prints); greys tuned for black have no
-     contrast there, so it keeps its own set. */
+     contrast there, so it keeps its own set. MAPPER's own canvas (#mp-canvas) is drawn on this same white
+     ground in every theme but Contrast -- see --canvas-vlan-* below for why the VLAN strand palette needed
+     its own counterpart here rather than reusing --vlan-1..16. */
   --canvas: #FFFFFF;
   --canvas-panel: #F4F6F9;
   --canvas-hairline: #C9D2DD;
@@ -78,6 +105,40 @@
   --canvas-warn: #9A6510;
   --canvas-fail: #B3261E;
   --canvas-blocked: #A63D10;
+
+  /* VLAN palette, second copy: --vlan-1..16 above is tuned against --panel, which is what a VLAN
+     swatch in the colour-picker dialog actually draws on -- but a MAPPER strand itself is drawn on
+     #mp-canvas, whose background is --canvas (white in every theme except Contrast), not --panel. Nine
+     or ten of the sixteen --vlan-* hues fall under 3:1 measured on white (--vlan-4 lands near 1.5:1),
+     which a code review caught as strands that were nearly invisible in dark/midnight/nord/solarized.
+     Rather than re-theme #mp-canvas to a dark ground -- which would undo the same white-canvas-in-
+     every-theme idiom NetPath's route canvas already established, and MAPPER's own --canvas-panel/
+     --canvas-text/--canvas-grid chrome already fully commits to -- the strand palette gets a dedicated
+     counterpart, exactly the way the route canvas's own tones already work. These are the existing
+     Light-theme rotation (dark-on-white, chosen for that ground already) reused verbatim: same sixteen
+     hues, same 22.5-degree spacing, and since --canvas is the same #FFFFFF for dark/light/midnight/
+     nord/solarized/slate, one definition here covers all six -- only Contrast (whose --canvas goes
+     dark) needs its own override below, and reuses the ORIGINAL light-on-dark --vlan-1..16 rotation
+     for the same reason in reverse. tests/test_design_tokens.py checks this pairing (--canvas-vlan-*
+     against --canvas) at the 3:1 floor in all seven themes -- the pairing that is actually drawn --
+     while the original --vlan-1..16 section keeps checking against --panel, which is what the
+     swatches actually draw on. */
+  --canvas-vlan-1: #862727;
+  --canvas-vlan-2: #864B27;
+  --canvas-vlan-3: #866F27;
+  --canvas-vlan-4: #7A8627;
+  --canvas-vlan-5: #578627;
+  --canvas-vlan-6: #338627;
+  --canvas-vlan-7: #27863F;
+  --canvas-vlan-8: #278663;
+  --canvas-vlan-9: #278686;
+  --canvas-vlan-10: #276386;
+  --canvas-vlan-11: #273F86;
+  --canvas-vlan-12: #332786;
+  --canvas-vlan-13: #572786;
+  --canvas-vlan-14: #7A2786;
+  --canvas-vlan-15: #86276F;
+  --canvas-vlan-16: #86274B;
 
   /* Type: seven sizes in rem, so the browser's text-size setting and a wall-display density scale both work.
      --fs-glyph is not a text size: it sizes the status marks (●▲■◆○) and nothing else may use it. */
@@ -169,6 +230,25 @@
   --canvas-warn: #F0C25A;
   --canvas-fail: #FF8F8A;
   --canvas-blocked: #FFA07A;
+  /* --canvas goes dark here, not white, so the strand palette has to go back to the light-on-dark
+     rotation -- the ORIGINAL --vlan-1..16 values (the base block's, tuned for --panel's near-black),
+     not the dark-on-white --canvas-vlan-* the other six themes share. */
+  --canvas-vlan-1: #DA6C6C;
+  --canvas-vlan-2: #DA956C;
+  --canvas-vlan-3: #DABF6C;
+  --canvas-vlan-4: #CDDA6C;
+  --canvas-vlan-5: #A3DA6C;
+  --canvas-vlan-6: #7ADA6C;
+  --canvas-vlan-7: #6CDA88;
+  --canvas-vlan-8: #6CDAB1;
+  --canvas-vlan-9: #6CDADA;
+  --canvas-vlan-10: #6CB1DA;
+  --canvas-vlan-11: #6C88DA;
+  --canvas-vlan-12: #7A6CDA;
+  --canvas-vlan-13: #A36CDA;
+  --canvas-vlan-14: #CD6CDA;
+  --canvas-vlan-15: #DA6CBF;
+  --canvas-vlan-16: #DA6C95;
 }
 
 /* Light: the route canvas's palette applied to the chrome. The badge fills (--fail, --warn, --accent) carry
@@ -202,4 +282,221 @@
   --shadow-pop: 0 12px 40px rgba(20, 30, 45, 0.25);
   --shadow-float: 0 6px 20px rgba(20, 30, 45, 0.2);
   --scrim: rgba(20, 30, 45, 0.45);
+
+  /* The dark set's --vlan-* hues are too light to hold 3:1 against a white-ish panel, the same
+     problem the badge tones solve above by going dark-on-light instead of light-on-dark. Same 16
+     hues, same 22.5-degree spacing, re-lit for this ground: 3.5:1 lowest against --panel here, and
+     the pairwise CIE76 gap (10.4 at its tightest) is what tests/test_design_tokens.py's VLAN_DISTANCE_FLOOR is measured from. */
+  --vlan-1: #862727;
+  --vlan-2: #864B27;
+  --vlan-3: #866F27;
+  --vlan-4: #7A8627;
+  --vlan-5: #578627;
+  --vlan-6: #338627;
+  --vlan-7: #27863F;
+  --vlan-8: #278663;
+  --vlan-9: #278686;
+  --vlan-10: #276386;
+  --vlan-11: #273F86;
+  --vlan-12: #332786;
+  --vlan-13: #572786;
+  --vlan-14: #7A2786;
+  --vlan-15: #86276F;
+  --vlan-16: #86274B;
+}
+
+/* Midnight: deeper and cooler than Dark, for a NOC watched at 3am — every surface pushed further
+   towards blue-black so a screen that has to stay lit all night throws less light into the room.
+   The darker ground buys margin rather than spending it: --fail on --raised, the tightest pair
+   Dark has at 4.86:1, sits at 5.84:1 here. What it trades away is saturation, not contrast — the
+   accent and status hues are pulled a little cooler and a little less vivid than Dark's so nothing
+   reads as neon at 3am. */
+:root[data-theme="midnight"] {
+  --bg: #070A10;
+  --panel: #0C1119;
+  --raised: #121A24;
+  --hairline: #232E3C;
+  --grid: #1A2330;
+  --text: #D9E2EE;
+  --muted: #8996A8;
+  --dim: #7E8CA0;
+  --line: #5C6A80;
+  --data-neutral: #57687C;
+  --accent: #6C9BF5;
+  --accent-hover: #8FB2FF;
+  --focus: #9FC3FF;
+  --ok: #3FC463;
+  --warn: #E7B84C;
+  --fail: #FF5D63;
+  --blocked: #FF9466;
+  --overrun: #48C2C4;
+  --error: #A98CF7;
+  --nodata: #161D28;
+  --selected: #152238;
+  --checked: #1B2C4A;
+  --checked-strong: #25396A;
+  /* Same eight roles as Dark: a NOC map already reads these hues as "series 3" or "series 6" and a
+     theme swap should not retrain that, so only their background (implicitly, via --raised/--panel
+     above) moves, not the hues themselves. */
+  --cat-1: #5B8DEB;
+  --cat-2: #CF7638;
+  --cat-3: #2FA886;
+  --cat-4: #B0881A;
+  --cat-5: #D1609A;
+  --cat-6: #4F9A3A;
+  --cat-7: #8F76E8;
+  --cat-8: #DC5A5A;
+}
+
+/* Nord: the Nord community palette's desaturated arctic blues and greys (polar night surfaces,
+   frost accents, aurora status hues) — see www.nordtheme.com. What it trades away: Nord's own
+   surface steps (nord0/nord1/nord2) sit within about three luminance points of each other by
+   design, which is too little room to also hold --fail/--blocked/--error at 4.5:1 against
+   --raised, so --raised here is lightened only a little past --panel (rather than the fourth,
+   more separated step Dark uses) and the aurora accents are lifted a few points brighter than
+   canonical Nord to still clear that floor — the closest, --fail on --raised, lands at 4.01:1
+   before the lift and needed the push. */
+:root[data-theme="nord"] {
+  --bg: #2E3440;
+  --panel: #333A47;
+  --raised: #3A4150;
+  --hairline: #4C566A;
+  --grid: #434C5E;
+  --text: #ECEFF4;
+  --muted: #C6CFE0;
+  --dim: #B0BBCE;
+  --line: #8592A6;
+  --data-neutral: #8896AC;
+  --accent: #9DCAC9;
+  --accent-hover: #B3D8D7;
+  --focus: #C0E5E4;
+  --ok: #ACC99A;
+  --warn: #EBCB8B;
+  --fail: #F29CA6;
+  --blocked: #E9A188;
+  --overrun: #93CBDB;
+  --error: #D2A8D2;
+  --nodata: #363E4C;
+  --selected: #374357;
+  --checked: #3B4C68;
+  --checked-strong: #48628C;
+  /* Nord's own eight named accents (frost + aurora), not a re-hue of Dark's set — Nord is
+     recognised by these particular hues. */
+  --cat-1: #81A1C1;
+  --cat-2: #D08770;
+  --cat-3: #A3BE8C;
+  --cat-4: #EBCB8B;
+  --cat-5: #B48EAD;
+  --cat-6: #88C0D0;
+  --cat-7: #5E81AC;
+  --cat-8: #BF616A;
+  /* --vlan-12 is the only strand that does not clear 3:1 against this theme's unusually light
+     --panel at the base hue (2.71:1); lifted in lightness only, same hue, same position in the
+     16-hue rotation, so it still sits the same distance from its two neighbours. */
+  --vlan-12: #A097D8;
+}
+
+/* Solarized: Solarized Dark's ochre-tinted base tones (base03/02 surfaces, the accent hues Ethan
+   Schoonover named yellow/orange/red/magenta/violet/blue/cyan/green) — see ethanschoonover.com/solarized.
+   What it trades away: canonical Solarized's secondary text (base01, about 3.5:1 on base03) is
+   below this product's 4.5:1 floor for --muted/--dim on more than one surface, so both are lifted
+   well past their canonical luminance — this is the theme where "ochre-tinted" shows up in the
+   accents (the yellow/orange/red family below) rather than in a warm grey, because a grey warm
+   enough to read as ochre and still clear 4.5:1 on --raised stopped looking like a neutral tone at
+   all. --raised itself is kept close to --panel for the same reason the Nord theme is: the accent
+   hues, not the surface steps, are what carry this theme's brightness budget. */
+:root[data-theme="solarized"] {
+  --bg: #012B36;
+  --panel: #0A3540;
+  --raised: #0E3A46;
+  --hairline: #2E5661;
+  --grid: #123F4B;
+  --text: #BCCBCF;
+  --muted: #B7C8CC;
+  --dim: #93A8AD;
+  --line: #6C8A92;
+  --data-neutral: #65838A;
+  --accent: #6FB2EE;
+  --accent-hover: #8AC0F0;
+  --focus: #A0CEF3;
+  --ok: #9FBF3B;
+  --warn: #E0A631;
+  --fail: #FF7A6E;
+  --blocked: #F5904F;
+  --overrun: #5FCBC0;
+  --error: #C7A6EE;
+  --nodata: #0C3D49;
+  --selected: #123E49;
+  --checked: #164753;
+  --checked-strong: #1D5765;
+  /* Solarized's own eight accents, canonical hues (yellow/orange/cyan/blue/violet/red/magenta/
+     green), reordered so the pair drawn on the same chart are never adjacent hues. */
+  --cat-1: #268BD2;
+  --cat-2: #CB4B16;
+  --cat-3: #2AA198;
+  --cat-4: #B58900;
+  --cat-5: #D33682;
+  --cat-6: #859900;
+  --cat-7: #6C71C4;
+  --cat-8: #DC322F;
+}
+
+/* Slate: a warm neutral LIGHT theme, paper-grey rather than the existing Light theme's climb to a
+   near-white. What it trades away: Light's crisp white --raised (the highest-contrast card surface
+   this product has) for a softer, warmer lift that never reaches pure white — so Slate's ceiling
+   for a badge fill's contrast against --raised is a little lower than Light's, though still clear
+   of every floor below. */
+:root[data-theme="slate"] {
+  color-scheme: light;
+  --bg: #EBE7E0;
+  --panel: #F4F1EA;
+  --raised: #FBF9F5;
+  --hairline: #D2CABC;
+  --grid: #DFD8CC;
+  --text: #2B2620;
+  --muted: #5A5347;
+  --dim: #6A6255;
+  --line: #82796A;
+  --data-neutral: #7C7466;
+  --accent: #33629E;
+  --accent-hover: #26507F;
+  --focus: #1D4A87;
+  --ok: #1B6B34;
+  --warn: #835613;
+  --fail: #AE2A20;
+  --blocked: #9C4113;
+  --overrun: #146B62;
+  --error: #6E4098;
+  --nodata: #E3DDD0;
+  --selected: #DDE7F2;
+  --checked: #CBDCF0;
+  --checked-strong: #B4CDEA;
+  /* Dark's eight hues, darkened and saturated the same way the badge tones above are — light-on-
+     dark does not survive the trip to a paper-coloured ground unless it goes dark-on-light too. */
+  --cat-1: #2F5FC4;
+  --cat-2: #A6460B;
+  --cat-3: #1D7A6E;
+  --cat-4: #8A6112;
+  --cat-5: #9A2F6A;
+  --cat-6: #3F7A2E;
+  --cat-7: #74459E;
+  --cat-8: #A6291F;
+  /* Same re-lit rotation the existing Light theme uses under :root[data-theme="light"] — a second
+     light theme needs the same fix for the same reason, not a fresh derivation. */
+  --vlan-1: #862727;
+  --vlan-2: #864B27;
+  --vlan-3: #866F27;
+  --vlan-4: #7A8627;
+  --vlan-5: #578627;
+  --vlan-6: #338627;
+  --vlan-7: #27863F;
+  --vlan-8: #278663;
+  --vlan-9: #278686;
+  --vlan-10: #276386;
+  --vlan-11: #273F86;
+  --vlan-12: #332786;
+  --vlan-13: #572786;
+  --vlan-14: #7A2786;
+  --vlan-15: #86276F;
+  --vlan-16: #86274B;
 }

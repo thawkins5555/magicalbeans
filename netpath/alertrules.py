@@ -45,6 +45,21 @@ class Occurrence:
     # occurrences are stored as JSON and replayed through Occurrence(**row),
     # so a row written before this field existed must still load.
     managed: bool | None = None
+    # kind="threshold" only: the source rule's own key. Two threshold rules
+    # CAN legitimately share a source_kind — ups_battery_low/
+    # ups_battery_replace already did, and temp_chassis_high/
+    # temp_chassis_critical now read the same temp_chassis_c metric on
+    # purpose (see alertsdb._BUILTIN_RULES) — and AlertEngine._apply matches
+    # an occurrence against every enabled rule with the same (kind,
+    # source_kind), not just the one that raised it. Without this field, an
+    # occurrence _evaluate_thresholds built for evaluating ONE rule's own
+    # threshold/streak also matched the OTHER rule sharing the metric,
+    # double-incrementing it with the wrong rule's message. Left "" (falsy,
+    # and the default for every other kind) so _apply's extra check only
+    # ever narrows a threshold occurrence to its own rule, never changes
+    # matching for anything else — including a pending occurrence parked
+    # before this field existed, which loads with "" the same way.
+    rule_key: str = ""
 
 
 def dedup_key(rule, occurrence: Occurrence) -> str:
@@ -280,6 +295,18 @@ ROLLED_UP_BY = {
     # from the next trace rather than needing to be un-suppressed.
     "netpath_path_unstable": "netpath_unreachable",
     "netpath_latency_high": "netpath_unreachable",
+    # Not an outage rollup like every entry above — both rules read the SAME
+    # temp_chassis_c metric (see alertsdb._BUILTIN_RULES), so a device at
+    # 90 C breaches both. Reusing ROLLED_UP_BY here rather than inventing a
+    # second suppression mechanism: "an open Critical already says what
+    # Warning is about to say" is exactly the shape this map already exists
+    # to express, and _rollup_parent's case 1 (a same-entity open parent
+    # alert) is entity-kind generic — it only special-cases device_down for
+    # the topology cases (2 and 3), which a same-metric pair like this one
+    # has no use for and simply never reaches. _apply's own is_new handling
+    # (ROLLS_UP, built from this map) is what retroactively resolves a
+    # Warning that opened moments before Critical did in the same tick.
+    "temp_chassis_high": "temp_chassis_critical",
 }
 
 # The rules that roll up under a given parent, the other way round — built

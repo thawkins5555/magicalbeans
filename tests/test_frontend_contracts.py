@@ -651,6 +651,91 @@ check(not _missing_header,
       "every <table id> in index.html gets a header row from its renderer (missing: %s)"
       % (", ".join(_missing_header) or "none"))
 
+# ---------------------------------------------------------------------------
+# 28. MAPPER (4.54.0 re-review): the one Tab stop a "strands" link gets names
+#     the whole link, the legend swatch and colour picker show the colour
+#     that is actually drawn, and every write control in mapper.js's own
+#     markup is wired into the same data-requires-write re-check every other
+#     module's write control already gets.
+#
+# 28a. drawLink's strands branch used to give EVERY strand — the focusable
+#      one (i === 0, the single Tab stop a "strands" link gets) included —
+#      the identical per-VLAN aria-label/tooltip, so a keyboard user Tabbing
+#      to a seven-VLAN trunk heard "VLAN 10 strand on the link." and nothing
+#      about the other six, or either end. linkAriaLabel/linkTooltip (the
+#      whole-link text, already used by "collapsed"/"plain" links) were
+#      defined but never reached from strands mode at all.
+MAPPER = read("mapper.js")
+DRAW_LINK = MAPPER[MAPPER.index("function drawLink("):MAPPER.index("function drawPortLabels(")]
+check("i === 0" in DRAW_LINK,
+      "drawLink's strands branch still singles out the first strand as the one Tab stop")
+check("ariaLabel: linkAriaLabel(link)" in DRAW_LINK and "tooltip: linkTooltip(link)" in DRAW_LINK,
+      "the focusable strand (i === 0) is wired to the WHOLE-LINK label/tooltip, "
+      "not a per-strand one — a keyboard user's one Tab stop must say every VLAN "
+      "and both ends, the same as a collapsed link's single stop already does")
+check("`VLAN ${vlanDisplay(strand.vlan)} strand on the link.`" in DRAW_LINK,
+      "the non-focusable strands still carry their OWN per-VLAN role=\"img\" label, "
+      "so a screen reader's browse cursor can still tell strand N from strand N+1")
+
+# 28b. The VLAN table's swatch and the 16-swatch colour picker used to fill
+#      with --vlan-N (tuned against --panel, what the swatch itself sits on)
+#      while drawLink strokes the strand itself with --canvas-vlan-N (tuned
+#      against --canvas, MAPPER's white drawing surface in every theme but
+#      Contrast) — in Dark, Midnight, Nord and Solarized NONE of the sixteen
+#      pairs match (Dark: swatch #DA6C6C, strand #862727), so picking
+#      "Colour 1" showed a pastel that was never the maroon actually drawn.
+#      Both now read the same --canvas-vlan-* family the strand itself uses.
+VLAN_TABLE_BLOCK = MAPPER[MAPPER.index("const VLAN_COLUMNS"):MAPPER.index("let vlanSort")]
+PICKER_BLOCK = MAPPER[MAPPER.index("function openVlanColorPicker("):
+                       MAPPER.index("/* ----------------------------------------------------------- settings */")]
+STRAND_STROKE = "stroke: `var(--canvas-vlan-" in DRAW_LINK
+check(STRAND_STROKE, "drawLink strokes a strand with --canvas-vlan-N (the pairing "
+      "this swatch/picker check assumes stays put)")
+check("var(--canvas-vlan-" in VLAN_TABLE_BLOCK and "var(--vlan-" not in VLAN_TABLE_BLOCK,
+      "the VLAN table's swatch fills with --canvas-vlan-*, the same family the "
+      "strand is stroked with, not the --panel-tuned --vlan-*")
+check("var(--canvas-vlan-" in PICKER_BLOCK and "var(--vlan-" not in PICKER_BLOCK,
+      "the colour picker's 16 swatches fill with --canvas-vlan-*, matching the "
+      "table swatch and the strand stroke")
+# --canvas-vlan-* was never tuned against --panel, and the swatch sits on
+# --panel (worst case, Nord: ~1.03:1 fill-on-panel, functionally invisible) —
+# .mp-swatch needs a border that clears the GRAPHIC_ON 3:1 floor on --panel
+# regardless of how the fill itself lands, so the swatch is always at least
+# legible as a square. --hairline (a 1.3-1.6:1 surface-step divider in every
+# theme) is not that border; --line (>=3.38:1 against --panel everywhere) is.
+APP_CSS = read("app.css")
+SWATCH_RULE = APP_CSS[APP_CSS.index(".mp-swatch {"):APP_CSS.index(".mp-swatch.selected")]
+check("border: 1px solid var(--line)" in SWATCH_RULE,
+      ".mp-swatch's border is --line, which clears 3:1 against --panel in every "
+      "theme, not --hairline (1.3-1.6:1) which would leave the swatch's own "
+      "shape unreadable wherever its --canvas-vlan-* fill sits close to --panel")
+
+# 28c. Every write control mapper.js writes into its own markup (as opposed
+#      to a Save/Create/Delete button App.modal renders from a spec object,
+#      which every module already leaves ungated the same way) carries
+#      data-requires-write="mapper" — the maps dialog's Rename/Delete, the
+#      align dialog's eight buttons and the VLAN colour swatch/picker used a
+#      one-shot `App.canWrite('mapper') ? '' : 'disabled'` ternary instead
+#      and were never wired into applyPermissions()'s re-check, so a write
+#      permission revoked while any of those stayed open left a control that
+#      still looked enabled until the operator closed and reopened it.
+MAPPER_WRITE_MARKERS = [
+    "data-rename=", "data-delete=", 'data-align=', "data-vlan-swatch=", "data-color-index=",
+]
+mapper_ungated = []
+for _marker in MAPPER_WRITE_MARKERS:
+    for _match in re.finditer(r"<button[^>]*%s[^>]*>" % re.escape(_marker), MAPPER):
+        if 'data-requires-write="mapper"' not in _match.group(0):
+            _line_no = MAPPER.count("\n", 0, _match.start()) + 1
+            mapper_ungated.append("%s:%d" % (_marker, _line_no))
+check(bool(MAPPER_WRITE_MARKERS) and all(
+    re.search(r"<button[^>]*%s" % re.escape(_marker), MAPPER) for _marker in MAPPER_WRITE_MARKERS),
+    "every write-control marker checked below is still present in mapper.js "
+    "(a marker renamed out from under this check would silently stop checking anything)")
+check(not mapper_ungated,
+      "every write control in mapper.js's own markup carries "
+      "data-requires-write=\"mapper\" (missing: %s)" % (", ".join(mapper_ungated) or "none"))
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

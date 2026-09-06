@@ -27,6 +27,13 @@
     alertSort: App.recallSort('alerts', { key: 'last_ts', descending: true }),
     rules: [],
     rulesSelected: null,
+    // Fleet-wide device_thresholds rows (every rule, every device), from
+    // /api/alerts/device-thresholds with no device_id — the Rules table
+    // reads this to say how many devices override each threshold rule, and
+    // deviceOverridesDialog re-fetches its own filtered copy on open rather
+    // than reuse this one, since a dialog opened from a stale poll should
+    // not show an override that was removed a refresh ago.
+    deviceThresholds: [],
     templates: [],
     templatesSelected: null,
     hist: null,
@@ -802,10 +809,25 @@
 
   /* --------------------------------------------------------------- rules */
 
+  // A rule can carry device_thresholds only when it is kind='threshold' —
+  // alertsdb.set_device_threshold refuses every other kind, since
+  // dhcp_threshold/netpath_threshold measure a scope or a destination, not
+  // a device, and device_thresholds is keyed by device_id. So this column
+  // has something to show only for the rules the fleet actually keys
+  // overrides against — temp_chassis_high/critical among them, but nothing
+  // about this is hard-coded to those two keys.
+  function overridesCellHtml(r) {
+    if (r.kind !== 'threshold') return '';
+    const count = view.deviceThresholds.filter((o) => o.rule_key === r.key).length;
+    return `<button type="button" class="ar-overrides-btn" data-rule-key="${r.key}">${
+      count ? `${count} device override${count === 1 ? '' : 's'}` : 'No overrides'}</button>`;
+  }
+
   function drawRulesTable() {
     const table = App.el('alerts-rules-table');
     table.innerHTML = '<caption class="sr-only">Alert rules</caption><thead><tr><th scope="col">Name</th>' +
-      '<th scope="col">Kind</th><th scope="col">Sev</th><th scope="col">On</th></tr></thead>';
+      '<th scope="col">Kind</th><th scope="col">Sev</th><th scope="col">On</th>' +
+      '<th scope="col">Overrides</th></tr></thead>';
     const body = document.createElement('tbody');
     for (const r of view.rules) {
       const tr = document.createElement('tr');
@@ -814,12 +836,189 @@
         `<td>${escape(r.kind)}${r.source_kind ? `: ${escape(r.source_kind)}` : ''}</td>` +
         `<td><span class="sev sev-${r.severity}">${
           escape(App.state.severities?.[r.severity] || r.severity)}</span></td>` +
-        `<td>${r.enabled ? 'yes' : 'no'}</td>`;
+        `<td>${r.enabled ? 'yes' : 'no'}</td>` +
+        `<td>${overridesCellHtml(r)}</td>`;
       tr.onclick = () => { view.rulesSelected = r.id; drawRulesTable(); };
+      const overridesBtn = tr.querySelector('.ar-overrides-btn');
+      if (overridesBtn) {
+        // stopPropagation so opening the dialog does not also fire the row
+        // click above (harmless either way — it only changes the selection
+        // highlight — but a click that visibly does two things at once
+        // reads as a bug even when neither half is wrong).
+        overridesBtn.onclick = (event) => {
+          event.stopPropagation();
+          deviceOverridesDialog(r).catch((error) =>
+            App.toast(`Could not open overrides: ${error.message}`, 'fail'));
+        };
+      }
       body.appendChild(tr);
     }
     table.appendChild(body);
     App.wireRowKeyboard(body);
+  }
+
+  /* ------------------------------------------- device threshold overrides
+
+     A threshold rule's per-device overrides (alertsdb.device_thresholds),
+     opened from the "N device overrides" button the Rules table now carries
+     for every kind='threshold' rule — see overridesCellHtml above for why
+     only that kind. Modelled on windowsDialog just above: a plain table
+     built as a template string (auto-decorated sortable by app.js's
+     MutationObserver, the same as every other plain table in a dialog —
+     App.grid's own column-resize/persisted-width machinery is overkill for
+     a handful of rows shown rarely), Edit/Remove per row gated by a
+     `disabled` computed once at render rather than data-requires-write,
+     since — like the windows table — this markup is rebuilt fresh on every
+     open rather than sitting in static markup applyPermissions() can find. */
+
+  function overrideRowHtml(o, deviceIdx, writable) {
+    const device = deviceIdx.byId.get(o.device_id);
+    const name = device ? escape(device.name || device.ip) : `device #${o.device_id} (deleted)`;
+    const nameCell = device
+      ? `<a class="linkish inline" href="${App.buildRoute('nodes', ['device', o.device_id])}">${name}</a>`
+      : name;
+    const gate = writable ? '' : ' disabled title="Needs Alerts write"';
+    return `<tr data-device-id="${o.device_id}">
+      <td>${nameCell}</td>
+      <td>${o.threshold != null ? o.threshold : '— (inherit)'}</td>
+      <td>${o.clear_threshold != null ? o.clear_threshold : '— (inherit)'}</td>
+      <td>${o.enabled ? 'yes' : 'no'}</td>
+      <td><button type="button" class="ado-edit" data-device-id="${o.device_id}"${gate}>Edit</button>
+        <button type="button" class="ado-remove" data-device-id="${o.device_id}"${gate}>Remove</button></td>
+    </tr>`;
+  }
+
+  /* The add/edit form for one device's override of `rule`. `options.existing`
+     (a device_thresholds row) means edit — the device is fixed and named;
+     otherwise `options.deviceChoices` is who has none yet to pick from. This
+     dialog replaces #modal-box the same way addWindowDialog replaces
+     windowsDialog, so there is no "back" except reopening the list fresh —
+     which Save does, on success, the same as addWindowDialog. */
+  function overrideFormDialog(rule, options) {
+    const editing = !!options.existing;
+    const o = options.existing || {};
+    App.modal(editing ? `${rule.name}: ${options.deviceName || `device #${o.device_id}`}`
+                       : `${rule.name}: add device override`, `
+      ${editing ? '' : `<label>Device <select id="ado-device">${
+        options.deviceChoices.map((d) => `<option value="${d.id}">${escape(d.name || d.ip)}</option>`).join('')
+      }</select></label>`}
+      <label>Threshold override <input id="ado-threshold" type="number" step="0.1"
+        placeholder="${rule.threshold ?? ''} (inherit)" value="${o.threshold ?? ''}"></label>
+      <label>Clear threshold override <input id="ado-clear" type="number" step="0.1"
+        placeholder="${rule.clear_threshold ?? ''} (inherit)" value="${o.clear_threshold ?? ''}"></label>
+      <label class="check"><input type="checkbox" id="ado-enabled" ${o.enabled === false ? '' : 'checked'}>
+        Rule enabled for this device</label>
+      <p class="hint">Blank threshold/clear boxes inherit the rule's own number (currently ${
+        rule.threshold ?? '—'} / ${rule.clear_threshold ?? '—'}). The clear point is where the
+        alert closes again, so it has to sit BELOW the threshold — lowering the threshold on its
+        own is refused whenever the inherited clear point would end up above it, so lower both.
+        Unticking "Rule enabled" turns this rule off for this one device without touching its
+        numbers — the same as setting neither box and clearing the tick alone.</p>`, [
+      // Cancel closes outright rather than reopening the list — the same
+      // choice addWindowDialog/bulkMuteDialog make for their own "add"
+      // sub-dialog stacked on a list dialog. Save below DOES reopen the
+      // list, the same asymmetry those two already have: an edit that
+      // happened is worth returning to see, one that didn't is not worth a
+      // second round trip to fetch a list that has not changed.
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Save', primary: true, onClick: async (box) => {
+        const deviceId = editing ? o.device_id : Number(box.querySelector('#ado-device').value);
+        if (!deviceId) throw new Error('Choose a device');
+        const t = box.querySelector('#ado-threshold').value.trim();
+        const c = box.querySelector('#ado-clear').value.trim();
+        // Caught here as a sentence rather than left to alertsdb's own
+        // ValueError, which arrives as a bare toast naming two numbers the
+        // operator only supplied one of: a blank clear box INHERITS the
+        // rule's, so "lower this device's threshold to 60" against a rule
+        // clearing at 65 is refused for a reason nothing on screen says.
+        const effT = t === '' ? rule.threshold : Number(t);
+        const effC = c === '' ? rule.clear_threshold : Number(c);
+        if (effT !== null && effT !== undefined && effC !== null && effC !== undefined
+            && Number(effC) >= Number(effT)) {
+          throw new Error(
+            `The clear point (${effC}${c === '' ? ', inherited from the rule' : ''}) must be `
+            + `below the threshold (${effT}${t === '' ? ', inherited from the rule' : ''}), `
+            + 'or the alert could never close. Lower the clear point too.');
+        }
+        await App.post('/api/alerts/device-thresholds', {
+          device_id: deviceId, rule_key: rule.key,
+          threshold: t === '' ? null : Number(t),
+          clear_threshold: c === '' ? null : Number(c),
+          enabled: box.querySelector('#ado-enabled').checked,
+        });
+        App.closeModal();
+        await deviceOverridesDialog(rule);
+      } },
+    ]);
+  }
+
+  async function deviceOverridesDialog(rule) {
+    const writable = App.canWrite('alerts');
+    const [{ device_thresholds }, deviceIdx] = await Promise.all([
+      App.get('/api/alerts/device-thresholds'),
+      App.deviceIndex(),
+    ]);
+    const rows = (device_thresholds || []).filter((o) => o.rule_key === rule.key)
+      .sort((a, b) => {
+        const an = (deviceIdx.byId.get(a.device_id) || {}).name || '';
+        const bn = (deviceIdx.byId.get(b.device_id) || {}).name || '';
+        return an.localeCompare(bn);
+      });
+    const box = App.modal(`${rule.name}: device overrides`, `
+      <p class="hint">The rule's own numbers — threshold ${rule.threshold ?? '—'}, clear ${
+        rule.clear_threshold ?? '—'} — apply to every device with no row below.</p>
+      <div class="table-wrap"><table id="ar-overrides-table">
+        <caption class="sr-only">Per-device overrides for ${escape(rule.name)}</caption>
+        <thead><tr><th scope="col">Device</th><th scope="col">Threshold</th>
+          <th scope="col">Clear</th><th scope="col">Enabled</th><th scope="col"></th></tr></thead>
+        <tbody>${rows.length ? rows.map((o) => overrideRowHtml(o, deviceIdx, writable)).join('')
+          : '<tr><td colspan="5" class="hint">No per-device overrides for this rule.</td></tr>'}</tbody>
+      </table></div>`, [
+      { label: 'Close', onClick: App.closeModal },
+      ...(writable ? [{ label: 'Add override', onClick: async () => {
+        // Nodes read is what serves the picker (same dependency
+        // scopeSources() above carries) — told apart from "nothing left to
+        // add" so an account with Alerts write but no Nodes read gets an
+        // honest reason rather than a list that looks complete by accident.
+        let devices;
+        try {
+          ({ devices } = await App.get('/api/nodes/devices'));
+        } catch (error) {
+          App.toast(`Could not read the device list: ${error.message}`, 'fail');
+          return;
+        }
+        const already = new Set(rows.map((o) => o.device_id));
+        const choices = (devices || []).filter((d) => !already.has(d.id));
+        if (!choices.length) {
+          App.toast('Every device already has an override for this rule.', 'info');
+          return;
+        }
+        overrideFormDialog(rule, { deviceChoices: choices });
+      } }] : []),
+    ], { buttonsTop: true });
+    if (!writable) return box;
+    for (const btn of box.querySelectorAll('.ado-edit')) {
+      btn.onclick = () => {
+        const o = rows.find((x) => x.device_id === Number(btn.dataset.deviceId));
+        if (!o) return;
+        const device = deviceIdx.byId.get(o.device_id);
+        overrideFormDialog(rule, { existing: o, deviceName: device ? (device.name || device.ip) : null });
+      };
+    }
+    for (const btn of box.querySelectorAll('.ado-remove')) {
+      btn.onclick = () => {
+        const o = rows.find((x) => x.device_id === Number(btn.dataset.deviceId));
+        if (!o) return;
+        const device = deviceIdx.byId.get(o.device_id);
+        const name = device ? (device.name || device.ip) : `device #${o.device_id}`;
+        App.confirmDestructive('Remove override',
+          `<p>Remove the ${escape(rule.name)} override for <b>${escape(name)}</b>?</p>` +
+          '<p class="hint">This device goes back to the rule’s own numbers.</p>', 'Remove',
+          () => App.post('/api/alerts/device-thresholds', { device_id: o.device_id, rule_key: rule.key, clear: true }),
+          () => deviceOverridesDialog(rule));
+      };
+    }
+    return box;
   }
 
   function templateOptionsHtml(selectedId) {
@@ -1451,7 +1650,7 @@
     if (view.pageFilterSig !== null && view.pageFilterSig !== filterSig) view.pageOffset = 0;
     view.pageFilterSig = filterSig;
     const generation = ++view.refreshGen;
-    const [overview, list, total, rules, ruleExtras, templates, mutes] =
+    const [overview, list, total, rules, ruleExtras, templates, mutes, deviceThresholds] =
       await Promise.all([
       App.get('/api/alerts/overview', { t0, t1, bucket }),
       App.get('/api/alerts', { ...f, limit: view.pageLimit, offset: view.pageOffset }),
@@ -1462,6 +1661,10 @@
       App.get('/api/alerts/rules/extras'),
       App.get('/api/alerts/templates'),
       App.get('/api/alerts/mutes'),
+      // Fleet-wide (no device_id): the Rules table's own "N overrides" count
+      // per threshold rule, the same one call the overrides dialog itself
+      // would otherwise have to make a second time on every row.
+      App.get('/api/alerts/device-thresholds'),
     ]);
     // A newer refresh already redrew this, or the operator has left.
     if (view.refreshGen !== generation || App.state.tab !== 'alerts') return;
@@ -1485,6 +1688,7 @@
     view.rules = rules.rules;
     view.ruleExtras = ruleExtras.rules || {};
     view.templates = templates.templates;
+    view.deviceThresholds = deviceThresholds.device_thresholds || [];
     // entity_id -> until_ts, for the devices with an active mute. The server
     // only ever returns unexpired ones, so presence here means muted.
     view.mutes = new Map(mutes.mutes.filter((m) => m.entity_kind === 'device')

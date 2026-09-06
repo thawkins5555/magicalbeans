@@ -21,13 +21,14 @@ are protected is in `CREDENTIAL-SECURITY.md`.
 - [IPAM — address inventory, conflicts, DHCP visibility](#ipam--address-inventory-conflicts-dhcp-visibility)
 - [Wireless — Fortinet AP dashboard](#wireless--fortinet-ap-dashboard)
 - [ConfigRX — SSH config backups](#configrx--ssh-config-backups)
+- [MAPPER — manually built L2 maps](#mapper--manually-built-l2-maps)
 - [Debug](#debug)
 - [Settings](#settings)
 - [Data](#data)
 - [Deliberate limits](#deliberate-limits)
 
-The twelve tabs sit flat in one strip, in frequency order — **Dashboard**,
-**Alerts** · **Nodes**, **IPAM**, **FORTI-AP**, **CONFIGRX** ·
+The thirteen tabs sit flat in one strip, in frequency order — **Dashboard**,
+**Alerts** · **Nodes**, **IPAM**, **FORTI-AP**, **CONFIGRX**, **MAPPER** ·
 **Routes**, **NetFlow**, **Syslog**, **SNMP Trap** · **Settings**, **Debug**
 — with a hairline before the first tab of each group after the first,
 standing in for the four labelled sections (Now/Inventory/Telemetry/Admin)
@@ -52,7 +53,7 @@ is described under **Dashboard** below. A tab the signed-in account has no
 read access to is hidden from the tab bar entirely.
 
 **Only Dashboard's own script loads before the page is usable.** Each of the
-other eleven modules — 1.17 MB uncompressed between them, around 324 KB
+other twelve modules — 1.17 MB uncompressed between them, around 324 KB
 gzipped, before 4.49.0 — now loads the first time its tab is actually
 selected rather than unconditionally on every visit, at no cost to what
 opening a tab for the first time looks like: the tab reads as still-working,
@@ -83,9 +84,9 @@ is dragged.
 **Every selection has a URL.** From 4.39.0 the address bar carries the
 open tab and the selected thing — `#/nodes`, `#/nodes?status=down`,
 `#/nodes/device/41`, `#/nodes/device/41/port/3`, `#/alerts/12`,
-`#/netpath/2`, `#/configrx/device/41/backup/9`, and `#/snmp/5512`,
-`#/syslog/8801` and `#/wireless/3` for a trap, a message and an access
-point. From 4.48.0 a tab's own subtabs carry the same URL — `#/nodes/discovery`,
+`#/netpath/2`, `#/configrx/device/41/backup/9`, `#/mapper/3` for a named
+map, and `#/snmp/5512`, `#/syslog/8801` and `#/wireless/3` for a trap, a
+message and an access point. From 4.48.0 a tab's own subtabs carry the same URL — `#/nodes/discovery`,
 `#/settings/users` — so a pasted link lands a colleague on the pane that was
 actually open, not just the tab. Back walks the selections, a reload lands where you were,
 and a link pasted into a ticket or an email opens what it names for
@@ -98,9 +99,10 @@ panel sizes and column widths, per browser rather than per account. **It
 also keeps the view itself**: the column a table was sorted on and which
 way, whatever was typed into a search box, every dropdown filter, and the
 sub-tab a page was on (Devices or Discovery, Subnets or DHCP) all come back
-as they were. That covers the nine pages that have filters and sortable
+as they were. That covers the ten pages that have filters and sortable
 tables — Nodes, Alerts, Syslog, SNMP Trap, NetFlow, IPAM, Wireless,
-ConfigRX and Debug. **Settings** remembers only which of its own subtabs
+ConfigRX, MAPPER and Debug — MAPPER's own share being which map was open
+and the VLAN table's sort. **Settings** remembers only which of its own subtabs
 was open, the same per-browser way, since it has no filters or tables of
 its own to keep; Dashboard has nothing of the kind at all, and NetPath
 keeps its own time window per destination instead, since there the window
@@ -178,9 +180,9 @@ rather than records to work through.
 
 ### Themes
 
-Three, chosen in the **Account** dialog under **Appearance · this
-browser**: Dark
-(the default), Light, and High contrast. The choice is stored in the browser,
+Seven, chosen in the **Account** dialog under **Appearance · this
+browser**: Dark (the default), Light, High contrast, and, new in 4.54.0,
+Midnight, Nord, Solarized and Slate. The choice is stored in the browser,
 not on the server — it belongs to the screen and the eyes in front of it, so
 a shared NOC workstation keeps it across sign-ins and every account on that
 machine sees it. It applies at once, needs no Apply, and the sign-in page
@@ -188,6 +190,21 @@ follows it. Light is the route canvas's palette applied to the whole
 interface; High contrast keeps the same hues and pushes them apart to at
 least 7:1. Charts follow the theme because every colour in the product is a
 token.
+
+The four new ones are each their own thing, not a recolouring exercise:
+**Midnight** pushes every surface further towards blue-black than Dark, for
+a NOC screen that stays lit all night and would rather throw less light
+into the room; **Nord** and **Solarized** are the two community palettes of
+those names, kept close to their canonical hues while lifting whichever
+tones would otherwise fall short of this product's own contrast floors;
+**Slate** is a second light theme, a warm paper-grey alternative to Light's
+climb to near-white for a room that finds a stark white panel harder on the
+eyes for a whole shift. All seven — old and new alike — are held to the
+same accessibility harness (`tests/test_design_tokens.py`): the same
+text/muted/dim/line hierarchy, the same minimum contrast pairs, and, from
+4.54.0, the same sixteen-colour VLAN palette MAPPER's trunk strands use,
+each theme's sixteen hues checked pairwise so two VLANs on the same trunk
+are never confusable in any of the seven.
 
 ### Any width
 
@@ -212,7 +229,7 @@ onto it afterward.
 - **The tab bar and every subtab bar behave like the tabs they say they
   are.** ArrowRight/ArrowLeft and Home/End move both focus and selection
   along the strip, and only the active tab sits in the page's own Tab
-  order, so leaving the strip is one stop rather than twelve. One shared
+  order, so leaving the strip is one stop rather than thirteen. One shared
   helper wires the same roving-tabindex behaviour onto every module's own
   subtab row — a device's INTERFACES/NEIGHBOURS/BRIDGE & RF/EVENTS group
   included — so no module has to implement it for itself.
@@ -952,9 +969,21 @@ From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
   stale rather than gone. A neighbour is best-effort matched to a known
   device by sysName or chassis MAC. The device pane's own NEIGHBOURS
   subtab (below) lists what that device's ports have reported; from
-  4.53.0 there is no fleet-wide picture of the whole neighbour table —
-  the TOPOLOGY subtab that used to draw one is retired, and a separate
-  module is planned to replace it.
+  4.53.0 there is no fleet-wide *automatic* picture of the whole neighbour
+  table — the TOPOLOGY subtab that used to draw one is retired. **MAPPER**
+  (below) is the module that replaces it, manually rather than
+  automatically: nothing on a MAPPER map is drawn until an operator places
+  it there.
+- **From 4.54.0, Nodes also walks each device's per-port VLAN membership**
+  — which VLANs it names, which of its ports are trunk or access, and
+  which VLANs actually cross which port — over Q-BRIDGE-MIB and, on Cisco
+  gear, CISCO-VTP-MIB, on its own schedule (**Learn VLAN membership every N
+  seconds**, `vlan_interval_s`, inherited like MAC learning and LLDP and
+  defaulting to the same hour). This is what lets MAPPER draw a trunk's
+  VLANs as individual coloured strands rather than one anonymous line;
+  there is no page of its own for it in Nodes, the same way the MAC table
+  and the neighbour table feed MAPPER and the device pane rather than a
+  dedicated tab of their own.
 - **The device pane gains NEIGHBOURS and BRIDGE & RF sections.** NEIGHBOURS
   lists what that device's own ports have reported; BRIDGE & RF shows STP
   bridge and per-port state (BRIDGE-MIB) and, for a radio, RSSI, remote
@@ -1146,11 +1175,11 @@ alerts and optionally emailing about them.
 
 ### Rules
 
-- **43 built-in rules** ship enabled: a device not responding, a device
+- **44 built-in rules** ship enabled: a device not responding, a device
   recovering, a device rebooting, SNMP authentication failing, a device
   needing unsupported SNMPv3 privacy, a poll running longer than its own
   interval, a device whose vendor MIB is missing, an interface going
-  down/up/flapping, nineteen CPU/memory/interface-utilization/
+  down/up/flapping, twenty CPU/memory/interface-utilization/
   error-and-discard-rate/disk/ping-latency/packet-loss/UPS/
   environmental thresholds, a critical or cold-start SNMP trap, a
   linkDown trap from a device Nodes is not itself polling, a critical
@@ -1168,6 +1197,39 @@ alerts and optionally emailing about them.
   separate temperature rules rather than one, because a comms room, a
   switch chassis and an SFP's DOM reading have different normal ranges
   entirely (see Nodes → Devices and polling).
+- **From 4.54.0, chassis temperature has a Warning/Critical pair.** The
+  existing "Chassis temperature high" (75 °C, clears at 65 °C) is joined by
+  a second, hotter rule, "Chassis temperature critical" (85 °C, clears at
+  78 °C) — a device climbing past the vendor major-alarm range warrants a
+  second, more urgent alert rather than only a louder version of the
+  first, and Warning is suppressed while Critical is open so a device
+  running hot raises one alert, not two saying the same thing at
+  different volumes. Both read the same `temp_chassis_c` metric on
+  purpose. **A device can also override any threshold rule's own
+  numbers, or turn it off entirely, just for itself** — a core switch in a
+  hot closet and an access switch in an air-conditioned comms room do not
+  share a sane chassis-temperature limit, and a per-device override
+  answers that without lowering the fleet-wide default for everyone else.
+  Turning a rule off for one device resolves any alert of its own already
+  open for that device rather than leaving it stuck open forever — the
+  device is no longer evaluated against that rule at all, so nothing is
+  left to hold the alert open with; re-enabling the rule later starts
+  clean rather than resuming whatever streak was counted before. Set it
+  in either of two places: the device dialog's **TEMPERATURE ALERTS**
+  section, which shows both rules beside that device's own current
+  chassis reading so a number is chosen against a measurement rather than
+  in the abstract, or from Alerts → RULES, where a threshold rule's
+  **Overrides** column says how many devices override it and opens a list
+  to add, edit or remove them. Both are gated on `alerts: write`, not
+  `nodes: write`, including the one inside the device dialog — it changes
+  when an alert fires, which is an Alerts decision no matter which screen
+  it is taken from. **Editing a rule's own threshold or clear point resets
+  every device's breach streak against it**, override or no override —
+  a streak counted against numbers that no longer apply is not evidence of
+  anything — which means an alert an operator hand-resolved, if it is
+  still genuinely breaching, re-opens as a new run the next time that
+  rule's numbers are edited, the same as if the device had never been
+  seen before.
 - **Three of those 35 are new in 4.39.0**, and each one reports a failure
   that previously had nobody to report it. `snmp_failing_ping_ok` fires
   when a device answers ping while its SNMP agent has stopped answering —
@@ -2367,6 +2429,120 @@ to a manual name in Nodes.
 
 ---
 
+## MAPPER — manually built L2 maps
+
+A hand-built Layer 2 network map, in the idiom of SolarWinds, PRTG or
+Auvik: a canvas where you place the devices that matter to a particular
+site or floor and connect them the way they are actually cabled, rather
+than a diagram that lays itself out and redraws under you every time
+something changes. It replaces what the Nodes → TOPOLOGY graph used to
+offer automatically, deliberately traded for something an operator builds
+and owns — new in 4.54.0, gated by its own `mapper` permission alongside
+every other tab.
+
+- **A map starts blank, and stays whatever you put on it.** There can be
+  several, named and switched between from the **Map** dropdown — one per
+  site, one per floor, whatever grouping makes sense — shared by every
+  account with MAPPER read access, not private to whoever built it.
+  **Add device** places anything already in Nodes' own inventory;
+  **Add neighbours**, used on a device already on the map, offers whatever
+  CDP or LLDP has actually seen adjacent to it — a managed device not yet
+  on this map, or an unmanaged peer (an AP, a phone, anything with no SNMP
+  of its own) that never will be, drawn dashed and visually distinct from
+  a monitored device. Drag anything anywhere; **Snap** rounds a drag to a
+  grid, and **Align** lines up or evenly spaces whatever is currently
+  selected. Nothing here ever adds or moves something on its own.
+- **A trunk carrying several VLANs draws as several coloured strands, one
+  per VLAN, side by side** — the point of the whole module: the VLAN count
+  on a link is legible from the drawing itself, without opening a dialog
+  to ask. Each VLAN keeps the same colour everywhere it appears on every
+  map, so a strand followed from one drawing to another never seems to
+  change identity. Past a configurable count — **Collapse trunks at N
+  VLANs** in MAPPER's own Settings, 8 by default, 1 to 30 — a link stops
+  drawing as individual strands (past a point that reads as noise, not
+  detail) and becomes one thick line instead, its width scaling with how
+  many VLANs it actually carries. Hovering or clicking a link — strand,
+  collapsed or plain — lists every VLAN it carries regardless of which way
+  it happened to draw. Colour is never the only way a strand is told
+  apart: every strand carries its own accessible name, and the single
+  strand a keyboard Tab actually reaches carries the whole link's — both
+  ends, both ports, every VLAN, the protocols — while the rest each carry
+  their own per-VLAN name for a screen reader's browse cursor; either way
+  a colour-blind viewer or a screen reader gets the same information a
+  sighted viewer reads off the colour. **Show port labels** and **Show
+  VLAN labels**, on by default in MAPPER's own Settings, put a small label
+  at each end of every link (the port it leaves from) and on every strand
+  or collapsed line (its VLAN, or its VLAN count) — turn either off on a
+  busy map where the labels start to crowd the lines.
+- **The legend above the canvas always says what the current threshold
+  is and what a dashed line means.** It reads the collapse threshold back
+  in words ("Trunks of 8+ VLANs draw as one thick line, scaled by count;
+  fewer draw as one coloured strand per VLAN") so the setting never has to
+  be looked up elsewhere, and calls out that a dashed line means *no VLAN
+  data at all* — a genuinely different fact from "this link carries
+  exactly one VLAN", which draws as a single, solid strand. If two placed
+  devices have no CDP/LLDP adjacency between them at all, the legend says
+  so plainly rather than leaving an operator to wonder whether the link is
+  missing by mistake or because nothing has been seen.
+- **What CDP and LLDP contribute, and what they cannot.** A link only ever
+  draws between two devices (or a device and an unmanaged peer) that Nodes'
+  own neighbour walk has actually reported adjacent to each other, folded
+  into one line whether the cable was walked from one end or both — MAPPER
+  never infers a connection that nothing has reported. The VLANs shown on
+  a link are the union of what each end's own port claims, which means a
+  link's VLAN count can only ever be as complete as the more forthcoming of
+  its two ends: an unmanaged peer has no VLAN table of its own to ask, and
+  a managed device that doesn't answer Q-BRIDGE-MIB or CISCO-VTP-MIB
+  contributes nothing there either, though the link itself still draws as
+  long as a neighbour report exists.
+- **A link's tooltip names each end's own trunk/access mode, and calls out
+  a native-VLAN mismatch by name.** Alongside every VLAN the link
+  carries, hovering or clicking shows the mode each device itself reports
+  for its own port and, for a trunk, the native VLAN that port is
+  configured with — read from the same per-port VLAN walk as the strands
+  themselves, not inferred from which VLAN happens to cross the port
+  untagged. The two ends can genuinely disagree, and when they do the
+  tooltip says so plainly ("Native VLAN 1 on core-sw-1, 99 on access-sw-4
+  — mismatched") rather than averaging the two into a single figure that
+  would hide a real misconfiguration.
+- **A node shows its role, its live status and, optionally, its
+  numbers.** Role — switch, router, firewall, access point, server or
+  unmanaged — is auto-detected from the same vendor and sysDescr
+  information Nodes already has, so a placed device usually arrives
+  correctly iconed with nothing to configure; an unmanaged peer, having
+  none of that to go on, always draws as unmanaged. A device the
+  detection gets wrong, or simply can't call, can be overridden by hand
+  per node — the override always wins once set. Status is a device's
+  ordinary up/down/unsupported colour from Nodes, paired with the same
+  shape `App.statusMark` uses everywhere else in the product so it is
+  never colour alone. Three optional badges — chassis temperature, CPU,
+  port count — are off by default (a fresh map should not arrive
+  cluttered) and switched on per map in MAPPER's Settings for an operator
+  who wants them.
+- **A node can be renamed on the map without touching Nodes.** The label
+  you give it there is what draws and what the CSV export names it by;
+  leave it blank and both fall back to the device's own resolved name (or,
+  for an unmanaged peer, whatever its neighbour report called it).
+- **Export** gives you a PNG of the canvas exactly as drawn, for a ticket
+  or a handover document, and a CSV of every link on the map — both ends,
+  both ports, which protocols confirmed it, the VLAN count, the VLAN list
+  itself, the native VLAN and when it was last seen — built from the same
+  figures the drawing itself uses, so the export can never disagree with
+  what is on screen.
+- **The map refreshes on the page's own cadence while it is the visible
+  tab** (MAPPER's own **Refresh interval**, 30 seconds by default; 0 turns
+  auto-refresh off and leaves the **Refresh** button as the only way),
+  and dragging a node never triggers one — a reload mid-drag would fight
+  the very thing an operator is doing.
+- **Map style** — modern, classic, blueprint or minimal, in MAPPER's own
+  Settings — is a second, independent choice from the seven app-wide
+  colour themes under **Appearance** (above): a map's line weights and
+  node chrome are a MAPPER concern of their own, worth choosing separately
+  from whether the rest of the interface runs Dark, Light or one of the
+  four newer themes.
+
+---
+
 ## Debug
 
 What the background threads are doing, right now. Nothing here is written to
@@ -2421,6 +2597,7 @@ Configuration sits at the level it belongs to.
 | **Settings** button, top right of Syslog | Listener and ports, volume limits, sources, time handling, retention |
 | **Settings** button, top right of Wireless | Poller on/off, poll interval — controllers themselves are managed from **Controllers**, next to it |
 | **Settings** button, top right of ConfigRX | Worker on/off, backup interval, capture timeout, retention (days and per-device count) |
+| **Settings** button, top right of MAPPER | Collapse threshold and strand-count cap, strand width bounds, port/VLAN labels, stale-link cutoff, map style, grid size, badges, refresh interval |
 | **Add** / **Edit** on a destination | That destination's own probe settings, and — Edit only — continuous per-hop probing |
 
 The Settings tab holds only what crosses module boundaries. Reverse DNS is the
@@ -2436,8 +2613,8 @@ every other module's subtabs are. From 4.53.0 the LDAP directory settings
 that used to live on the Tokens subtab are on Sign-in instead, alongside
 session and lockout policy, which is why Tokens now only holds API tokens.
 **Modules** is one list linking to all
-nine per-module Settings dialogs (Nodes, Alerts, Routes/NetPath, NetFlow,
-SNMP Trap, Syslog, IPAM, FORTI-AP, ConfigRX) rather than each
+ten per-module Settings dialogs (Nodes, Alerts, Routes/NetPath, NetFlow,
+SNMP Trap, Syslog, IPAM, FORTI-AP, ConfigRX, MAPPER) rather than each
 module's own Settings button being the only way to reach it — one place
 that answers "where is the setting for X" without already knowing which
 tab it lives on.
@@ -2504,7 +2681,8 @@ password ends every session on that account, this one included.
 
 Every account has an explicit **read** or **write** grant per module —
 Nodes, Alerts, NetPath, NetFlow, SNMP Trap, Syslog, IPAM, Wireless,
-ConfigRX, SSH, Settings, Debug and — new in 4.39.0 — Admin, set from
+ConfigRX, MAPPER (new in 4.54.0), SSH, Settings, Debug and — new in
+4.39.0 — Admin, set from
 **Settings → Users** (itself gated on Admin write access). The grid there
 offers a handful of **role presets** — Viewer, Operator, Admin — that fill
 it in one click as a starting point rather than a lock (one manual change
@@ -2586,7 +2764,7 @@ nobody can reach the application at all.
 
 ## Data
 
-Ten SQLite files, in WAL mode. One for the application, nine for records.
+Eleven SQLite files, in WAL mode. One for the application, ten for records.
 
 | File | Holds |
 | --- | --- |
@@ -2600,6 +2778,7 @@ Ten SQLite files, in WAL mode. One for the application, nine for records.
 | `alerts.db` | Rules, email templates, alerts, notification history, Alerts settings, an optional SMTP credential |
 | `wireless.db` | Wireless controllers, access points, per-radio detail, Wireless settings, optional SNMP credentials |
 | `configrx.db` | Per-device backup configuration (keyed by a Nodes device id, no real foreign key — see ConfigRX below), stored config backups, ConfigRX settings, optional SSH credentials |
+| `mapper.db` | Named maps, the devices and unmanaged peers placed on each one and where, a VLAN colour override table, Mapper settings |
 
 Each record file holds its own module's data and its own module's settings, and
 nothing else. Anything read by more than one module — the reverse-DNS settings
@@ -2613,9 +2792,12 @@ again.
 Default location is `%APPDATA%\netpath-monitor\` on Windows and
 `~/.local/share/netpath-monitor/` elsewhere; override with `--db`, `--flow-db`,
 `--snmp-db`, `--syslog-db`, `--app-db`, `--ipam-db`, `--nodes-db`,
-`--alerts-db`, `--wireless-db` and `--configrx-db`. All ten upgrade their
-schema automatically on launch, and an install that predates `app.db`
-moves its settings, accounts and name cache into it on the first start.
+`--alerts-db`, `--wireless-db` and `--configrx-db`. `mapper.db` has no flag
+of its own — it is small, hand-placed bookkeeping rather than something
+worth pointing at its own volume, so it always sits beside `configrx.db`
+in whichever folder that resolves to. All eleven upgrade their schema
+automatically on launch, and an install that predates `app.db` moves its
+settings, accounts and name cache into it on the first start.
 
 ---
 

@@ -378,6 +378,31 @@ ROUTES = [
     ("DELETE", r"^/api/nodes/mibs/(\d+)$", api.delete_nodes_mib, ("nodes", W)),
     ("POST", r"^/api/nodes/mibs/(\d+)/resolve$", api.post_nodes_mib_resolve, ("nodes", W)),
     ("PUT", r"^/api/nodes/mibs/(\d+)/objects/(\d+)$", api.put_nodes_mib_object, ("nodes", W)),
+    # MAPPER: manually-built L2 maps. No worker of its own (see service.py's
+    # _apply_mapper) — every route here reads/writes mapperdb's placements
+    # or nodesdb's live data, nothing polls on a schedule. Grouped with the
+    # Nodes routes above rather than at the end of the file: the MAPPER tab
+    # joins the NODES group in the shell (see index.html), and this is the
+    # module whose routes it is "beside" in the sense server.py's own
+    # comment above ROUTES means.
+    ("GET", r"^/api/mapper/maps$", api.get_mapper_maps, ("mapper", R)),
+    ("POST", r"^/api/mapper/maps$", api.post_mapper_map, ("mapper", W)),
+    ("PUT", r"^/api/mapper/maps/(\d+)$", api.put_mapper_map, ("mapper", W)),
+    ("DELETE", r"^/api/mapper/maps/(\d+)$", api.delete_mapper_map, ("mapper", W)),
+    ("GET", r"^/api/mapper/maps/(\d+)$", api.get_mapper_map, ("mapper", R)),
+    ("POST", r"^/api/mapper/maps/(\d+)/nodes$", api.post_mapper_map_nodes, ("mapper", W)),
+    ("PUT", r"^/api/mapper/maps/(\d+)/nodes$", api.put_mapper_map_nodes, ("mapper", W)),
+    ("DELETE", r"^/api/mapper/maps/(\d+)/nodes/(\d+)$",
+     api.delete_mapper_map_node, ("mapper", W)),
+    # Matched before the "(\d+)" map route above would ever get the chance:
+    # "candidates" and "export.csv" are not \d+, so there is no actual
+    # ordering hazard, but this keeps every /maps/(\d+)/... sub-route
+    # grouped together rather than interleaved with the bare map routes.
+    ("GET", r"^/api/mapper/maps/(\d+)/candidates$",
+     api.get_mapper_map_candidates, ("mapper", R)),
+    ("GET", r"^/api/mapper/maps/(\d+)/export\.csv$",
+     api.get_mapper_map_export, ("mapper", R)),
+    ("POST", r"^/api/mapper/vlan-color$", api.post_mapper_vlan_color, ("mapper", W)),
     ("GET", r"^/api/alerts/overview$", api.get_alerts_overview, ("alerts", R)),
     ("GET", r"^/api/alerts$", api.get_alerts, ("alerts", R)),
     ("GET", r"^/api/alerts/export\.csv$", api.get_alerts_export, ("alerts", R)),
@@ -412,6 +437,14 @@ ROUTES = [
     ("DELETE", r"^/api/alerts/smtp/credential$", api.delete_alerts_smtp_credential, ("alerts", W)),
     ("POST", r"^/api/alerts/smtp/test$", api.post_alerts_smtp_test, ("alerts", W)),
     ("POST", r"^/api/alerts/engine$", api.post_alerts_engine, ("alerts", W)),
+    # Per-device chassis-temperature (and future threshold-rule) overrides —
+    # an Alerts concern even though the device dialog that edits one is most
+    # often opened from the MAPPER tab, see api.py's own comment above
+    # get_alerts_device_thresholds for why this is not under /api/mapper.
+    ("GET", r"^/api/alerts/device-thresholds$",
+     api.get_alerts_device_thresholds, ("alerts", R)),
+    ("POST", r"^/api/alerts/device-thresholds$",
+     api.post_alerts_device_threshold, ("alerts", W)),
     ("GET", r"^/api/wireless/overview$", api.get_wireless_overview, ("wireless", R)),
     ("GET", r"^/api/wireless/controllers$", api.get_wireless_controllers, ("wireless", R)),
     ("POST", r"^/api/wireless/controllers$", api.post_wireless_controller, ("wireless", W)),

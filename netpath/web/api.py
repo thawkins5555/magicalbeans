@@ -40,6 +40,7 @@ from .. import configrx_compliance
 from .. import configrx_redact
 from .. import sshterm
 from .. import enterprises, mibcatalog, vendorid
+from .. import mapper
 from .. import nodesdb
 from .. import db as netpathdb
 from .. import report as reportmod
@@ -300,6 +301,7 @@ _CONFIG_MODULE_KEYS = {
     "alerts": ("alerts_settings",),
     "wireless": ("wireless_settings",),
     "configrx": ("configrx_settings", "configrx_vendors"),
+    "mapper": ("mapper_settings",),
 }
 _STATE_MODULE_KEYS = {
     "netflow": ("collector",),
@@ -380,6 +382,7 @@ def get_config(service, params, body) -> dict:
         "alerts_settings": service.alerts_settings,
         "wireless_settings": service.wireless_settings,
         "configrx_settings": service.configrx_settings,
+        "mapper_settings": service.mapper_settings,
         # The vendor override <select> is built from this, not a JS copy of
         # configrx.VENDORS — label and key only, nothing a client
         # could use to influence what a backup sends over SSH. Order matches
@@ -511,7 +514,7 @@ def _storage(service) -> dict:
               ("syslog", service.syslog_db), ("snmp", service.snmp_db),
               ("ipam", service.ipam_db), ("nodes", service.nodes_db),
               ("alerts", service.alerts_db), ("wireless", service.wireless_db),
-              ("configrx", service.configrx_db))
+              ("configrx", service.configrx_db), ("mapper", service.mapper_db))
     result = {f"{name}_path": db.path for name, db in stores}
     result.update({f"{name}_bytes": db.size_bytes() for name, db in stores})
     return result
@@ -1386,6 +1389,7 @@ SETTINGS_SCOPES = {
     "alerts": "alerts_settings",
     "wireless": "wireless_settings",
     "configrx": "configrx_settings",
+    "mapper": "mapper_settings",
 }
 
 
@@ -1478,15 +1482,90 @@ def _check_settings_ranges(values: dict) -> None:
 
 def _scope_defaults(scope: str) -> dict:
     """The defaults dict whose value types a scope's settings must match."""
-    from .. import (alertsdb, appdb, configrxdb, db, flowdb, ipamdb, nodesdb,
-                    snmptrapdb, syslogdb, wirelessdb)
+    from .. import (alertsdb, appdb, configrxdb, db, flowdb, ipamdb, mapperdb,
+                    nodesdb, snmptrapdb, syslogdb, wirelessdb)
     return {
         "netpath": db.NETPATH_DEFAULTS, "netflow": flowdb.DEFAULTS,
         "syslog": syslogdb.DEFAULTS, "snmp": snmptrapdb.DEFAULTS,
         "ipam": ipamdb.DEFAULTS, "nodes": nodesdb.DEFAULTS,
         "alerts": alertsdb.DEFAULTS, "wireless": wirelessdb.DEFAULTS,
-        "configrx": configrxdb.DEFAULTS,
+        "configrx": configrxdb.DEFAULTS, "mapper": mapperdb.DEFAULTS,
     }.get(scope, appdb.GLOBAL_DEFAULTS)
+
+
+# Mirrors index.html's own min/max on the MAPPER settings dialog's VLAN
+# collapse threshold, the same way _GLOBAL_SETTINGS_RANGES mirrors the
+# global Settings page's inputs -- kept apart from that dict because it is
+# not a global setting, and _check_settings_ranges only ever checks
+# _GLOBAL_SETTINGS_RANGES regardless of scope. map_style has no numeric
+# range to speak of (it is one of mapperdb.MAP_STYLES), so it gets its own
+# membership check rather than being forced into a (low, high) shape that
+# does not fit it.
+def _check_mapper_settings(service, values: dict) -> None:
+    from .. import mapperdb
+
+    if "vlan_collapse_threshold" in values:
+        threshold = values["vlan_collapse_threshold"]
+        if threshold < 1 or threshold > 30:
+            raise ValueError("vlan_collapse_threshold must be between 1 and 30")
+    # max_strand_vlans is mapper.render_plan's genuine cap (mirrors
+    # index.html's own "Never draw more than N strands" input, min 1 max
+    # 200) — validated at all once it actually means that, so a stray huge
+    # or zero/negative value can no longer reach render_plan and produce
+    # nonsense strand counts or a divide-by-zero-shaped span.
+    if "max_strand_vlans" in values:
+        max_strands = values["max_strand_vlans"]
+        if max_strands < 1 or max_strands > 200:
+            raise ValueError("max_strand_vlans must be between 1 and 200")
+    # Below 0.5 (index.html's own floor for the same field) a strand's
+    # width -- and, per render_plan's symmetric spacing, every OTHER
+    # strand's offset from the link's centre line, since offsets are
+    # multiples of width_min*2 -- collapses toward zero, drawing every
+    # strand of a multi-VLAN link on top of the same line.
+    if "link_width_min" in values:
+        width_min = values["link_width_min"]
+        if width_min < 0.5:
+            raise ValueError("link_width_min must be at least 0.5")
+    if "link_width_max" in values:
+        width_max = values["link_width_max"]
+        if width_max < 1:
+            raise ValueError("link_width_max must be at least 1")
+    # Cross-field checks below read whichever side of a pair THIS request
+    # does not mention from the currently-applied settings (post_settings
+    # calls this before apply_settings merges/saves, so mapper_settings is
+    # still last request's values) -- a request naming only one of a pair
+    # is exactly how an operator moving one slider at a time would call
+    # this, and it must be checked against what the other one actually is,
+    # not skipped for want of both being named in the same body.
+    if "vlan_collapse_threshold" in values or "max_strand_vlans" in values:
+        threshold = values.get(
+            "vlan_collapse_threshold", service.mapper_settings.get(
+                "vlan_collapse_threshold", mapperdb.DEFAULTS["vlan_collapse_threshold"]))
+        max_strands = values.get(
+            "max_strand_vlans", service.mapper_settings.get(
+                "max_strand_vlans", mapperdb.DEFAULTS["max_strand_vlans"]))
+        # <=, not <: at max_strand_vlans == vlan_collapse_threshold, render_
+        # plan's span (max_strands - threshold) is 0, and a link exactly at
+        # the threshold already takes the collapsed branch (count < threshold
+        # is false there) -- so it draws at width_max instead of the width_min
+        # the strand mode one VLAN fewer would have used, the exact
+        # discontinuity this finding reproduced.
+        if max_strands <= threshold:
+            raise ValueError(
+                "max_strand_vlans must be greater than vlan_collapse_threshold "
+                f"({threshold}), or a link exactly at the threshold draws at "
+                "the maximum width instead of the minimum")
+    if "link_width_min" in values or "link_width_max" in values:
+        width_min = values.get(
+            "link_width_min", service.mapper_settings.get(
+                "link_width_min", mapperdb.DEFAULTS["link_width_min"]))
+        width_max = values.get(
+            "link_width_max", service.mapper_settings.get(
+                "link_width_max", mapperdb.DEFAULTS["link_width_max"]))
+        if width_max < width_min:
+            raise ValueError("link_width_max must be at least link_width_min")
+    if "map_style" in values and values["map_style"] not in mapperdb.MAP_STYLES:
+        raise ValueError(f"Unknown map_style: {values['map_style']!r}")
 
 
 def post_settings(service, params, body) -> dict:
@@ -1515,6 +1594,8 @@ def post_settings(service, params, body) -> dict:
     # int() until the database was edited by hand.
     values = coerce_settings(_scope_defaults(scope), values, strict=True)
     _check_settings_ranges(values)
+    if scope == "mapper":
+        _check_mapper_settings(service, values)
     # The keys, never the values: a settings value can be a credential-
     # adjacent path or a hostname, and an audit trail is a record of what
     # was touched, not a second copy of the configuration.
@@ -2461,6 +2542,10 @@ def _device_json(row, reveal: bool = False) -> dict:
         # models, read defensively for a row fetched before the migration
         # that added them has run.
         "lldp_interval_s": (row["lldp_interval_s"] if "lldp_interval_s" in row.keys() else None),
+        # Per-port VLAN membership walk interval, inheritable and defensively
+        # keyed the same way lldp_interval_s immediately above is -- added in
+        # the same migration, read the same way for a row from before it ran.
+        "vlan_interval_s": (row["vlan_interval_s"] if "vlan_interval_s" in row.keys() else None),
         "poe_enabled": (_tri(row["poe_enabled"]) if "poe_enabled" in row.keys() else None),
         "stp_enabled": (_tri(row["stp_enabled"]) if "stp_enabled" in row.keys() else None),
         # The capability probe's verdict — True/False once probed, None
@@ -2557,6 +2642,13 @@ def _group_json(service, row, reveal: bool = False) -> dict:
         "ping_count": row["ping_count"], "ping_timeout_ms": row["ping_timeout_ms"],
         "unreachable_ping_only": row["unreachable_ping_only"],
         "mac_table_interval_s": row["mac_table_interval_s"],
+        # Per-port VLAN membership walk interval, the group/profile side of
+        # the same override device rows expose (see _device_json) — a
+        # profile's own value here is what an inheriting device's blank
+        # override falls back to (nodesdb._merge_config), so the front end
+        # needs it to show what "inherit" actually means, the same reason
+        # mac_table_interval_s is already here.
+        "vlan_interval_s": (row["vlan_interval_s"] if "vlan_interval_s" in row.keys() else None),
         "vendor_oid": row["vendor_oid"] or "",
         "location_oid": row["location_oid"] or "",
         "is_default": bool(row["is_default"]),
@@ -2653,13 +2745,13 @@ _DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id",
                          "snmp_enabled", "oid_set", "mib_file_id",
                          "ping_count", "ping_timeout_ms", "unreachable_ping_only",
                          "vendor_oid", "location_oid", "mac_table_interval_s",
-                         "vendor_override", "upstream_id")
+                         "vlan_interval_s", "vendor_override", "upstream_id")
 _GROUP_EDITABLE_BODY = ("name", "snmp_version", "community", "v3_user",
                         "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
                         "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
                         "mib_file_id", "ping_count", "ping_timeout_ms",
                         "unreachable_ping_only", "vendor_oid", "location_oid",
-                        "mac_table_interval_s")
+                        "mac_table_interval_s", "vlan_interval_s")
 
 
 def get_nodes_overview(service, params, body) -> dict:
@@ -5423,6 +5515,58 @@ def post_alerts_engine(service, params, body) -> dict:
             "status": service.alert_engine.status_text()}
 
 
+# Per-device overrides of a threshold rule's own numbers (alertsdb's
+# device_thresholds table) -- a MAPPER-adjacent feature (a device dialog
+# opened from the map wants to tune its own chassis-temperature limits),
+# but the data and the rule it overrides are entirely an Alerts concern, so
+# it lives beside the rest of the module's routes rather than under
+# /api/mapper. See alertsdb.set_device_threshold for the validation this
+# wraps: an unknown or non-threshold rule_key, or a clear_threshold on the
+# wrong side of threshold, is its ValueError, not a second check here.
+
+def _device_threshold_json(row) -> dict:
+    return {"device_id": row["device_id"], "rule_key": row["rule_key"],
+            "threshold": row["threshold"], "clear_threshold": row["clear_threshold"],
+            "enabled": bool(row["enabled"]), "updated_ts": row["updated_ts"]}
+
+
+def get_alerts_device_thresholds(service, params, body) -> dict:
+    """Every override, or (with `device_id`) just one device's -- the fleet
+    Alert Rules page and a single device's dialog share this route the same
+    way they share alertsdb.device_thresholds itself."""
+    device_id = params.get("device_id")
+    rows = service.alerts_db.device_thresholds(int(device_id) if device_id else None)
+    return {"device_thresholds": [_device_threshold_json(row) for row in rows]}
+
+
+def post_alerts_device_threshold(service, params, body) -> dict:
+    """Set an override, or (`clear: true`) remove it. One route for both,
+    the same shape post_ipam_conflict_resolve-style routes elsewhere in this
+    file already use for "do the thing, or undo it" pairs that share every
+    other field."""
+    if "device_id" not in body:
+        raise ValueError("device_id is required")
+    device_id = int(body["device_id"])
+    rule_key = str(body.get("rule_key", "") or "")
+    if not rule_key:
+        raise ValueError("rule_key is required")
+    if body.get("clear"):
+        removed = service.alerts_db.clear_device_threshold(device_id, rule_key)
+        _audit(service, params, "alerts.device_threshold.clear", target=str(device_id),
+              detail=f"rule_key={rule_key}")
+        return {"ok": True, "removed": removed}
+    threshold = body.get("threshold")
+    clear_threshold = body.get("clear_threshold")
+    service.alerts_db.set_device_threshold(
+        device_id, rule_key,
+        threshold=float(threshold) if threshold is not None else None,
+        clear_threshold=float(clear_threshold) if clear_threshold is not None else None,
+        enabled=bool(body.get("enabled", True)))
+    _audit(service, params, "alerts.device_threshold.set", target=str(device_id),
+          detail=f"rule_key={rule_key}")
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------- wireless
 
 def _controller_json(row, reveal: bool = False) -> dict:
@@ -6405,6 +6549,505 @@ def delete_ssh_device_hostkey(service, params, body, device_id) -> dict:
                         detail=f"The next connection to {host} port {port} will store"
                                f" whatever key it is offered.")
     return {"ok": True, "removed": 1 if removed else 0}
+
+
+# ------------------------------------------------------------------- mapper
+#
+# MAPPER draws a manually-built map: mapperdb owns where a device or
+# unmanaged peer was dropped and what an operator called it, and everything
+# about what is actually cabled together (LLDP/CDP, VLAN membership) is read
+# live from nodesdb through netpath/mapper.py's pure assembly functions —
+# there is no MAPPER poller and nothing here caches a link across requests.
+
+def _mapper_map_json(row) -> dict:
+    return {"id": row["id"], "name": row["name"], "notes": row["notes"],
+            "created_ts": row["created_ts"], "updated_ts": row["updated_ts"]}
+
+
+def get_mapper_maps(service, params, body) -> dict:
+    maps = []
+    for row in service.mapper_db.maps():
+        # One nodes() read per map, not per node: with maps numbering in the
+        # tens at most (they are hand-built, never auto-created) this is a
+        # handful of queries, not a fleet-scale cost.
+        entry = _mapper_map_json(row)
+        entry["node_count"] = len(service.mapper_db.nodes(row["id"]))
+        maps.append(entry)
+    return {"maps": maps, "settings": service.mapper_settings}
+
+
+def post_mapper_map(service, params, body) -> dict:
+    name = str(body.get("name", "") or "")
+    notes = str(body.get("notes", "") or "")
+    # create_map itself raises ValueError, with an operator-readable
+    # message, for a blank or a case-insensitively duplicate name -- left to
+    # surface unchanged rather than caught and reworded here.
+    map_id = service.mapper_db.create_map(name, notes)
+    _audit(service, params, "mapper.map.create", target=str(map_id),
+          detail=f"name={name}")
+    return {"id": map_id}
+
+
+def put_mapper_map(service, params, body, map_id) -> dict:
+    before = _require(service.mapper_db.map_row(map_id), "map")
+    # A caller renaming only stays on its own name; one editing only notes
+    # (notes omitted entirely) leaves them alone via rename_map's own
+    # notes=None meaning "unchanged" -- not the same as notes="", which
+    # clears them.
+    name = str(body.get("name", before["name"]) or "")
+    notes = body.get("notes")
+    service.mapper_db.rename_map(map_id, name, notes=notes)
+    _audit(service, params, "mapper.map.rename", target=str(map_id),
+          detail=f"name={name}")
+    return {"ok": True}
+
+
+def delete_mapper_map(service, params, body, map_id) -> dict:
+    before = service.mapper_db.map_row(map_id)
+    ok = service.mapper_db.delete_map(map_id)
+    if before is not None:
+        _audit(service, params, "mapper.map.delete", target=str(map_id),
+              detail=f"name={before['name']}")
+    return {"ok": ok}
+
+
+def _mapper_vlans_json(service, links, device_ids, color_overrides: dict) -> list[dict]:
+    """{"vlan","name","color_index","link_count"} for every VLAN carried by
+    at least one link on THIS map -- not the fleet-wide VLAN list, which
+    would show entries for a switch nowhere near this drawing. `name` is
+    whichever device happened to name that VLAN id first (nodesdb.
+    vlans_for_devices is bounded to `device_ids` but still spans every
+    device on the map, and VLAN naming is not guaranteed consistent across
+    them, but showing no name at all when some device on the map clearly
+    knows one would be a worse default).
+
+    vlans_for_devices, not a fleet-wide read: every VLAN id that could
+    possibly appear in `counts` was read off a link, and a link only exists
+    between two devices this map places (assemble_links's on_map check), so
+    a VLAN this map could ever need naming for was necessarily named by one
+    of `device_ids` -- reading the fleet's whole `vlans` table to resolve a
+    handful of ids was exactly the cost this route's report measured (87 ms
+    at 2,000 devices x 50 VLANs)."""
+    counts: dict[int, int] = {}
+    for link in links:
+        for vlan in link["vlans"]:
+            counts[vlan] = counts.get(vlan, 0) + 1
+    if not counts:
+        return []
+    names: dict[int, str] = {}
+    for row in service.nodes_db.vlans_for_devices(device_ids):
+        vlan = row["vlan"]
+        if vlan in counts and row["name"] and vlan not in names:
+            names[vlan] = row["name"]
+    return [
+        {"vlan": vlan, "name": names.get(vlan, ""),
+         "color_index": mapper.vlan_color_index(vlan, color_overrides),
+         "link_count": count}
+        for vlan, count in sorted(counts.items())
+    ]
+
+
+def _mapper_port_vlans(service, device_ids, *, now: float,
+                       stale_after_s: float | None) -> dict:
+    """(device_id, if_index) -> [{"vlan","tagged"}], the shape
+    mapper.assemble_links wants, built once from nodesdb's port_vlans table
+    for just the devices this map places (port_vlans_for_devices) rather
+    than one port_vlans_for() call per neighbour row -- or, before this,
+    the whole fleet's port_vlans table for a map that might place six
+    devices (see get_mapper_map's own report on that cost).
+
+    present=0 and stale-by-seen_ts rows are dropped -- the same two checks
+    mapper.assemble_links already applies to the neighbour rows themselves
+    (see its docstring's Presence-and-staleness paragraph). Without this, a
+    VLAN a trunk stopped carrying still drew on the map, unchanged, until
+    prune_port_vlans eventually dropped the row after
+    mac_table_retention_days (7 days by default) -- a removed VLAN reading
+    as still-present for up to a week, when the link it rode already
+    dropped a stale/removed neighbour at `stale_after_s`. `stale_after_s`
+    is `None` for a caller that trusts `present` alone, the same meaning
+    assemble_links gives it."""
+    out: dict = {}
+    for row in service.nodes_db.port_vlans_for_devices(device_ids):
+        if not row["present"]:
+            continue
+        seen_ts = row["seen_ts"]
+        if stale_after_s is not None and seen_ts is not None \
+                and (now - seen_ts) > stale_after_s:
+            continue
+        out.setdefault((row["device_id"], row["if_index"]), []).append(
+            {"vlan": row["vlan"], "tagged": bool(row["tagged"])})
+    return out
+
+
+def _mapper_vlan_ports(service, device_ids, *, now: float,
+                       stale_after_s: float | None) -> dict:
+    """(device_id, if_index) -> {"mode","native_vlan"}, built once from
+    nodesdb's `vlan_ports` table for just the devices this map places
+    (vlan_ports_for_devices) -- _mapper_port_vlans' own shape, applied to
+    the sibling table so get_mapper_map can label each link end with the
+    trunk/access mode and device-reported native VLAN an operator reading a
+    trunk diagram expects, rather than leaving that table written every
+    poll and read by nothing.
+
+    present=0 and stale-by-seen_ts rows are dropped, the same two checks
+    _mapper_port_vlans applies and for the same reason: a port that stopped
+    reporting a mode should read as "unknown", not keep showing a mode from
+    before it went stale."""
+    out: dict = {}
+    for row in service.nodes_db.vlan_ports_for_devices(device_ids):
+        if not row["present"]:
+            continue
+        seen_ts = row["seen_ts"]
+        if stale_after_s is not None and seen_ts is not None \
+                and (now - seen_ts) > stale_after_s:
+            continue
+        out[(row["device_id"], row["if_index"])] = {
+            "mode": row["mode"] or None, "native_vlan": row["native_vlan"]}
+    return out
+
+
+def _mapper_node_role(row, *, unmanaged: bool, device=None) -> tuple[str, bool]:
+    """(role, role_auto) for one map node. The operator's own override
+    (map_nodes.role, non-empty) always wins; otherwise the role comes from
+    mapper.detect_role(), fed whatever identity this node actually has to
+    detect from -- a peer has no device row of its own (only its
+    neighbour's view of it), so it goes through detect_role(unmanaged=True)
+    rather than being handed empty vendor/sysDescr fields that would
+    otherwise read as "no signal" instead of "definitely unmanaged".
+    `role_auto` is True whenever the override was empty, so the front end's
+    role <select> can show "Auto (switch)" rather than pretending the
+    operator chose it."""
+    override = row["role"]
+    if override:
+        return override, False
+    if device is None:
+        return mapper.detect_role(unmanaged=unmanaged), True
+    return mapper.detect_role(
+        vendor=device["vendor"] or "", sys_descr=device["sys_descr"] or "",
+        sys_object_id=device["sys_object_id"] or ""), True
+
+
+def _mapper_node_name(label: str, resolved: str) -> tuple[str, str]:
+    """(name, resolved_name) for one map node. `name` is what draws on the
+    map AND what the CSV export reads (get_mapper_map_export builds its
+    device_name callable straight from these nodes' own "name", so fixing
+    it here fixes both consumers at once, per the operator's own report
+    that a renamed node still showed its original name in the export).
+    `resolved_name` -- named for "the identity resolved from live data",
+    not "device_name", because this same function also names an unmanaged
+    peer's resolved identity, which is not a device at all -- is kept
+    alongside so the UI can still show "renamed from resolved_name" without
+    losing that fact the moment an operator renames a node."""
+    return (label or resolved), resolved
+
+
+def get_mapper_map(service, params, body, map_id) -> dict:
+    """The whole drawing: this map's own placements, resolved against
+    nodesdb's live device/neighbour/VLAN data through mapper.assemble_links
+    and mapper.render_plan. Nothing here is cached across requests -- see
+    the module comment above."""
+    map_row = _require(service.mapper_db.map_row(map_id), "map")
+    node_rows = service.mapper_db.nodes(map_id)
+
+    device_ids = [row["device_id"] for row in node_rows if row["device_id"] is not None]
+    # devices_by_ids, not devices(): this map's placements are a handful of
+    # ids out of a fleet that can run to thousands, and devices_by_ids exists
+    # for exactly this "many known ids, one indexed read" shape (see its own
+    # docstring) rather than pulling every device in the fleet to resolve a
+    # dozen placements.
+    devices_by_id = {row["id"]: row for row in service.nodes_db.devices_by_ids(device_ids)}
+
+    settings = service.mapper_settings
+    badge_temp = bool(settings.get("badge_temp"))
+    badge_cpu = bool(settings.get("badge_cpu"))
+    badge_ports = bool(settings.get("badge_ports"))
+
+    # One fleet-wide query per badge kind actually switched on (mirrors the
+    # alert engine's own metrics_for_keys use for the same reason: a
+    # per-device metrics() read here would be one query per node on the map
+    # instead of at most two for the whole map), keyed by device_id so
+    # building each node below is a dict lookup, not a query.
+    temp_by_device: dict = {}
+    cpu_by_device: dict = {}
+    metric_keys = [key for key, on in
+                   (("temp_chassis_c", badge_temp), ("cpu_pct", badge_cpu)) if on]
+    if metric_keys:
+        for row in service.nodes_db.metrics_for_keys(metric_keys):
+            target = temp_by_device if row["key"] == "temp_chassis_c" else cpu_by_device
+            target[row["device_id"]] = row["last_value"]
+    # Ports has no fleet-wide accessor to mirror metrics_for_keys with (see
+    # this route's report for why), so it costs one interfaces() call per
+    # device actually on the map -- never per link, never per the fleet --
+    # and only when the badge is switched on at all.
+    port_count_by_device: dict = {}
+    if badge_ports:
+        for device_id in device_ids:
+            port_count_by_device[device_id] = len(service.nodes_db.interfaces(device_id))
+
+    now = time.time()
+    stale_hours = float(settings.get("stale_link_hours", 24.0))
+    stale_after_s = (stale_hours * 3600.0) if stale_hours > 0 else None
+    port_vlans = _mapper_port_vlans(
+        service, device_ids, now=now, stale_after_s=stale_after_s)
+    vlan_ports = _mapper_vlan_ports(
+        service, device_ids, now=now, stale_after_s=stale_after_s)
+    port_label = _neighbor_local_port_labeler(service)
+    placed_device_ids = set(device_ids)
+    placed_peer_keys = {row["peer_key"] for row in node_rows if row["peer_key"]}
+
+    def on_map(key) -> bool:
+        return key in placed_device_ids or key in placed_peer_keys
+
+    # neighbours_for_devices, not all_neighbours(): assemble_links only ever
+    # uses a neighbour row whose OWN device_id is on_map (see its docstring's
+    # processing-order paragraph, step 2), so a row observed by a device this
+    # map does not place can never produce a link OR a peer on it -- reading
+    # the whole fleet's neighbour table to draw a handful of placements was
+    # exactly the cost this route's report measured (12.4s at 10k rows).
+    links, peers = mapper.assemble_links(
+        service.nodes_db.neighbours_for_devices(device_ids), port_vlans=port_vlans,
+        port_label=port_label, on_map=on_map, now=now,
+        stale_after_s=stale_after_s)
+
+    color_overrides = service.mapper_db.vlan_colors()
+    threshold = int(settings.get("vlan_collapse_threshold", 8))
+    max_strands = int(settings.get("max_strand_vlans", 30))
+    width_min = float(settings.get("link_width_min", 1.5))
+    width_max = float(settings.get("link_width_max", 14.0))
+    for link in links:
+        # Each end's own vlan_ports row (never the far end's -- same
+        # locality rule _mapper_vlan_ports' docstring gives port_vlans):
+        # the device-reported trunk/access mode and, for a trunk, its
+        # native VLAN -- a stronger source than the link's own
+        # `native_vlan`, which mapper.assemble_links only derives from
+        # port_vlans.tagged and only ever from the a side. b_* stays None
+        # for an unmanaged peer (no b_device_id) or a matched row with no
+        # far-end if_index (see mapper.assemble_links).
+        a_info = vlan_ports.get((link["a_device_id"], link["a_if_index"]))
+        link["a_port_mode"] = a_info["mode"] if a_info else None
+        link["a_native_vlan"] = a_info["native_vlan"] if a_info else None
+        b_info = None
+        if link["b_device_id"] is not None and link["b_if_index"] is not None:
+            b_info = vlan_ports.get((link["b_device_id"], link["b_if_index"]))
+        link["b_port_mode"] = b_info["mode"] if b_info else None
+        link["b_native_vlan"] = b_info["native_vlan"] if b_info else None
+        link["plan"] = mapper.render_plan(
+            link, threshold=threshold, max_strands=max_strands,
+            width_min=width_min, width_max=width_max,
+            color_overrides=color_overrides)
+
+    peers_by_key = {peer["peer_key"]: peer for peer in peers}
+
+    nodes = []
+    for row in node_rows:
+        device_id = row["device_id"]
+        if device_id is None:
+            peer = peers_by_key.get(row["peer_key"])
+            name, resolved_name = _mapper_node_name(
+                row["label"], peer["name"] if peer else row["peer_key"])
+            role, role_auto = _mapper_node_role(row, unmanaged=True)
+            nodes.append({
+                "id": row["id"], "device_id": None, "peer_key": row["peer_key"],
+                "label": row["label"], "name": name, "resolved_name": resolved_name,
+                "role": role, "role_auto": role_auto, "x": row["x"], "y": row["y"],
+                "status": None, "ip": (peer["address"] if peer else None),
+                "unmanaged": True, "missing": False,
+                "temp_c": None, "cpu_pct": None, "port_count": None,
+            })
+            continue
+        device = devices_by_id.get(device_id)
+        if device is None:
+            # Placed, then deleted from Nodes entirely (from this device or
+            # another browser tab). It must still draw -- silently dropping
+            # a node an operator can see is worse than showing it with
+            # nothing live left to say -- so it is marked two ways: a
+            # `status` value no real device ever has, and a `missing` flag
+            # for a client that would rather branch on that than compare
+            # strings. There is no device row left to detect a role from,
+            # so detect_role sees blanks and reports "" (role_auto True)
+            # unless the operator had already overridden it before deletion.
+            name, resolved_name = _mapper_node_name(
+                row["label"], f"(deleted device #{device_id})")
+            role, role_auto = _mapper_node_role(row, unmanaged=False, device=None)
+            nodes.append({
+                "id": row["id"], "device_id": device_id, "peer_key": "",
+                "label": row["label"], "name": name, "resolved_name": resolved_name,
+                "role": role, "role_auto": role_auto, "x": row["x"], "y": row["y"],
+                "status": "missing", "ip": None, "unmanaged": False,
+                "missing": True,
+                "temp_c": None, "cpu_pct": None, "port_count": None,
+            })
+            continue
+        name, resolved_name = _mapper_node_name(row["label"], namelookup.device_name(device))
+        role, role_auto = _mapper_node_role(row, unmanaged=False, device=device)
+        nodes.append({
+            "id": row["id"], "device_id": device_id, "peer_key": "",
+            "label": row["label"], "name": name, "resolved_name": resolved_name,
+            "role": role, "role_auto": role_auto, "x": row["x"], "y": row["y"],
+            "status": device["status"], "ip": device["ip"], "unmanaged": False,
+            "missing": False,
+            "temp_c": temp_by_device.get(device_id) if badge_temp else None,
+            "cpu_pct": cpu_by_device.get(device_id) if badge_cpu else None,
+            "port_count": port_count_by_device.get(device_id) if badge_ports else None,
+        })
+
+    return {
+        "map": _mapper_map_json(map_row),
+        "nodes": nodes,
+        "links": links,
+        "peers": peers,
+        "vlans": _mapper_vlans_json(service, links, device_ids, color_overrides),
+        "settings": settings,
+    }
+
+
+def post_mapper_map_nodes(service, params, body, map_id) -> dict:
+    """Add one device or one unmanaged peer to the map -- exactly one of
+    `device_id`/`peer_key`, exactly what mapperdb.add_node itself enforces,
+    so a bad body is a 400 from there rather than a second check here that
+    could disagree with it."""
+    _require(service.mapper_db.map_row(map_id), "map")
+    device_id = body.get("device_id")
+    if device_id is not None:
+        device_id = int(device_id)
+        _require(service.nodes_db.device(device_id), "device")
+    peer_key = str(body.get("peer_key", "") or "")
+    node_id = service.mapper_db.add_node(
+        map_id, device_id=device_id, peer_key=peer_key,
+        label=str(body.get("label", "") or ""), role=str(body.get("role", "") or ""),
+        x=float(body.get("x", 0.0) or 0.0), y=float(body.get("y", 0.0) or 0.0))
+    _audit(service, params, "mapper.node.add", target=str(map_id),
+          detail=(f"device_id={device_id}" if device_id is not None
+                 else f"peer_key={peer_key}"))
+    return {"id": node_id}
+
+
+def put_mapper_map_nodes(service, params, body, map_id) -> dict:
+    """Bulk position/label/role write -- one call per drag-end or
+    align/distribute action, not one call per node moved. Not audited: a
+    drag is UI state, not an accountability-worthy change the way adding or
+    removing a node from the topology is (see post_mapper_map_nodes and
+    delete_mapper_map_node), and an audit line per drag would drown the
+    trail in noise nobody would ever want to read back."""
+    _require(service.mapper_db.map_row(map_id), "map")
+    updates = body.get("updates")
+    if not isinstance(updates, list):
+        raise ValueError("updates must be a list")
+    clean = []
+    for item in updates:
+        if not isinstance(item, dict) or "id" not in item:
+            continue
+        entry = {"id": int(item["id"])}
+        if "x" in item:
+            entry["x"] = float(item["x"])
+        if "y" in item:
+            entry["y"] = float(item["y"])
+        if "label" in item:
+            entry["label"] = str(item["label"] or "")
+        if "role" in item:
+            entry["role"] = str(item["role"] or "")
+        clean.append(entry)
+    changed = service.mapper_db.update_nodes(map_id, clean)
+    return {"changed": changed}
+
+
+def delete_mapper_map_node(service, params, body, map_id, node_id) -> dict:
+    ok = service.mapper_db.remove_node(map_id, node_id)
+    if ok:
+        _audit(service, params, "mapper.node.remove", target=str(map_id),
+              detail=f"node_id={node_id}")
+    return {"ok": ok}
+
+
+def get_mapper_map_candidates(service, params, body, map_id) -> dict:
+    """What "Add device" and "Add neighbours" both offer: every device not
+    already on this map, and separately -- for neighbours -- only what
+    LLDP/CDP has actually seen adjacent to a device this map already has,
+    each carrying which placed device saw it and on which of THAT device's
+    own ports. A device or peer can appear in both lists; that is not a bug
+    to dedupe away, it is the difference between browsing the whole fleet
+    and being offered what is actually cabled to what is already here."""
+    _require(service.mapper_db.map_row(map_id), "map")
+    node_rows = service.mapper_db.nodes(map_id)
+    placed_device_ids = {row["device_id"] for row in node_rows if row["device_id"] is not None}
+    placed_peer_keys = {row["peer_key"] for row in node_rows if row["peer_key"]}
+
+    devices = [
+        {"id": d["id"], "name": namelookup.device_name(d), "ip": d["ip"],
+         "status": d["status"], "vendor": d["vendor"]}
+        for d in service.nodes_db.devices() if d["id"] not in placed_device_ids]
+
+    port_label = _neighbor_local_port_labeler(service)
+    seen_devices: set = set()
+    seen_peers: set = set()
+    neighbours = []
+    # neighbours_for_devices, not all_neighbours(): every row this loop can
+    # possibly use has already been filtered to device_id in
+    # placed_device_ids below, so asking nodesdb for exactly that set of
+    # devices' rows -- not the whole fleet -- returns the same rows without
+    # the fleet-wide join cost get_mapper_map's own report measured.
+    for row in service.nodes_db.neighbours_for_devices(placed_device_ids):
+        if row["device_id"] not in placed_device_ids or not row["present"]:
+            continue
+        if row["protocol"] not in mapper.LINK_PROTOCOLS:
+            continue
+        local_port = port_label(row["device_id"], row["if_index"])
+        matched_id = row["matched_device_id"]
+        if matched_id is not None:
+            if matched_id in placed_device_ids or matched_id in seen_devices:
+                continue
+            seen_devices.add(matched_id)
+            neighbours.append({
+                "kind": "device", "device_id": matched_id,
+                "name": row["matched_device_name"] or "",
+                "seen_from_device_id": row["device_id"], "seen_from_port": local_port,
+            })
+        else:
+            peer_key = mapper.peer_identity(row)
+            if peer_key in placed_peer_keys or peer_key in seen_peers:
+                continue
+            seen_peers.add(peer_key)
+            neighbours.append({
+                "kind": "peer", "peer_key": peer_key,
+                "name": row["sys_name"] or row["platform"] or row["chassis_id"] or peer_key,
+                "platform": row["platform"] or "", "address": row["remote_address"] or "",
+                "seen_from_device_id": row["device_id"], "seen_from_port": local_port,
+            })
+    return {"devices": devices, "neighbours": neighbours}
+
+
+def get_mapper_map_export(service, params, body, map_id) -> dict:
+    """CSV of this map's links -- built on top of get_mapper_map rather than
+    re-running link assembly a second way, so the export can never disagree
+    with what the drawing itself shows."""
+    payload = get_mapper_map(service, params, body, map_id)
+    names = {node["device_id"]: node["name"] for node in payload["nodes"]
+             if node["device_id"] is not None}
+
+    def device_name(device_id) -> str:
+        return names.get(device_id) or f"Device {device_id}"
+
+    rows = mapper.link_csv_rows(payload["links"], device_name)
+    return _csv_response("mapper-links", mapper.LINK_CSV_HEADER, rows)
+
+
+def post_mapper_vlan_color(service, params, body) -> dict:
+    """Set (or, with color_index omitted/null, clear) one VLAN's colour
+    override -- global, not per-map, see mapperdb.vlan_colors' own
+    docstring for why."""
+    if "vlan" not in body:
+        raise ValueError("vlan is required")
+    vlan = int(body["vlan"])
+    color_index = body.get("color_index")
+    if color_index is not None:
+        color_index = int(color_index)
+        if not (0 <= color_index < mapper.VLAN_PALETTE_SIZE):
+            raise ValueError(
+                f"color_index must be between 0 and {mapper.VLAN_PALETTE_SIZE - 1}")
+    service.mapper_db.set_vlan_color(vlan, color_index)
+    _audit(service, params, "mapper.vlan_color.set", target=str(vlan),
+          detail=f"color_index={color_index}")
+    return {"ok": True}
 
 
 # --------------------------------------------------------------------- auth

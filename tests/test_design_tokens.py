@@ -9,6 +9,7 @@ colour or a pixel font size written anywhere else, and the retired --faint
 tone coming back under its old name.
 """
 
+import itertools
 import os
 import re
 import sys
@@ -45,6 +46,41 @@ def contrast(a, b):
     return (hi + 0.05) / (lo + 0.05)
 
 
+def lab(hex_colour):
+    # sRGB -> CIE L*a*b*, for the VLAN palette's pairwise distance check
+    # below: a Euclidean distance in Lab tracks perceived colour difference
+    # far better than one in raw RGB, which is why CIE76 (this) or better is
+    # what the MAPPER spec asks for rather than a plain hex diff.
+    hex_colour = hex_colour.lstrip("#")
+    r, g, b = [int(hex_colour[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+
+    def lin(c):
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    r, g, b = lin(r), lin(g), lin(b)
+    x = r * 0.4124 + g * 0.3576 + b * 0.1805
+    y = r * 0.2126 + g * 0.7152 + b * 0.0722
+    z = r * 0.0193 + g * 0.1192 + b * 0.9505
+    xn, yn, zn = 0.95047, 1.0, 1.08883
+    x, y, z = x / xn, y / yn, z / zn
+
+    def f(t):
+        return t ** (1 / 3) if t > 0.008856 else (7.787 * t + 16 / 116)
+
+    fx, fy, fz = f(x), f(y), f(z)
+    return (116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz))
+
+
+def delta_e76(hex_a, hex_b):
+    # The plain Euclidean distance in Lab space. "CIE76" because later,
+    # perceptually-truer formulae (CIE94, CIEDE2000) exist and are fine to
+    # swap in later — this is the floor the MAPPER spec asked for ("CIE76 or
+    # better"), not a ceiling on what a future edit may use.
+    l1, a1, b1 = lab(hex_a)
+    l2, a2, b2 = lab(hex_b)
+    return ((l1 - l2) ** 2 + (a1 - a2) ** 2 + (b1 - b2) ** 2) ** 0.5
+
+
 tokens_css = read(STATIC, "tokens.css")
 # One dict per block: the bare :root is the dark default, and each
 # :root[data-theme="…"] block is a set of overrides on top of it. The pairs
@@ -53,7 +89,7 @@ tokens_css = read(STATIC, "tokens.css")
 # measured against that theme's light ground and fails, instead of being
 # invisible in a browser.
 BLOCKS = re.findall(r':root(?:\[data-theme="([a-z]+)"\])?\s*\{(.*?)\n\}', tokens_css, re.S)
-check(len(BLOCKS) == 3, "tokens.css has a base block and two theme blocks (found %d)" % len(BLOCKS))
+check(len(BLOCKS) == 7, "tokens.css has a base block and six theme blocks (found %d)" % len(BLOCKS))
 BASE = {}
 OVERRIDES = {}
 for theme_name, body_text in BLOCKS:
@@ -78,7 +114,8 @@ if all(name in TOKENS for name in SPACE_STEPS):
 THEMES = {"dark": dict(BASE)}
 for theme_name, values in OVERRIDES.items():
     THEMES[theme_name] = dict(BASE, **values)
-check(sorted(THEMES) == ["contrast", "dark", "light"], "the themes are dark, light and contrast")
+check(sorted(THEMES) == ["contrast", "dark", "light", "midnight", "nord", "slate", "solarized"],
+      "the themes are dark, light, contrast, midnight, nord, solarized and slate")
 # Every role a light ground makes unreadable if left dark. A theme block
 # must say each one explicitly.
 THEMED_ROLES = ["--bg", "--panel", "--raised", "--hairline", "--grid", "--text", "--muted",
@@ -89,9 +126,15 @@ for theme_name, values in OVERRIDES.items():
     missing = [role for role in THEMED_ROLES if role not in values]
     check(not missing, "theme %s redefines every themed role (missing %s)" % (theme_name, missing or "none"))
 check("color-scheme: dark" in BLOCKS[0][1], "the base block declares color-scheme: dark")
-check("color-scheme: light" in OVERRIDES.get("light", {}).get("color-scheme", "")
-      or "color-scheme: light" in tokens_css.split('[data-theme="light"]')[1],
-      "the light theme declares color-scheme: light")
+# Every theme with a light ground needs its own color-scheme: light, so the browser draws its own
+# chrome (scrollbars, the date picker, a <select>) to match — a set rather than one more
+# string-split per theme, since Slate is not the only light theme any more and will not be the
+# last one either.
+LIGHT_SCHEME_THEMES = {"light", "slate"}
+for theme_name, body_text in BLOCKS:
+    if theme_name in LIGHT_SCHEME_THEMES:
+        check("color-scheme: light" in body_text,
+              "the %s theme declares color-scheme: light" % theme_name)
 
 
 def tok(name, theme="dark"):
@@ -147,8 +190,12 @@ GRAPHIC_ON = [
     # above for an unrelated reason and is not repeated here.
     ("--ok", "--raised", 3.0), ("--warn", "--raised", 3.0), ("--fail", "--raised", 3.0),
 ]
-# High contrast is held to AAA: 7:1 for text, 4.5:1 for a line or a ring.
-FLOOR_LIFT = {"dark": (0.0, 0.0), "light": (0.0, 0.0), "contrast": (2.5, 1.5)}
+# High contrast is held to AAA: 7:1 for text, 4.5:1 for a line or a ring. The four new themes are
+# ordinary AA, like Dark and Light — only Contrast is asked to do more, and that floor is not
+# changing here.
+FLOOR_LIFT = {"dark": (0.0, 0.0), "light": (0.0, 0.0), "contrast": (2.5, 1.5),
+              "midnight": (0.0, 0.0), "nord": (0.0, 0.0), "solarized": (0.0, 0.0),
+              "slate": (0.0, 0.0)}
 for theme_name in sorted(THEMES):
     text_lift, graphic_lift = FLOOR_LIFT[theme_name]
     for fg, bg, floor in TEXT_ON:
@@ -168,7 +215,79 @@ for theme_name in sorted(THEMES):
           "[%s] text > muted > dim > line against the page" % theme_name)
 
 # --------------------------------------------------------------------------
-# 2. The desktop console carries the same values.
+# 2. The VLAN palette: one strand per VLAN on a MAPPER trunk. Unlike the
+#    fixed-role pairs above, these sixteen also have to stay apart from EACH
+#    OTHER — a MAPPER trunk lays them down as 1.5px lines side by side, and a
+#    hue too close to its neighbour is a bug a screenshot will not show.
+#    --ok/--warn/--fail already carry a fixed meaning elsewhere in the app;
+#    the sixteen VLAN hues are chosen clear of those (by hue, checked by eye
+#    and under simulated protanopia/deuteranopia the way --cat-1..8's
+#    comment above describes — sixteen swatches do not fit a numeric floor
+#    the way the pairwise check below does, so that part stays a design
+#    check, not an automated one).
+VLAN_ROLES = ["--vlan-%d" % n for n in range(1, 17)]
+# Not a colour-science standard: the tightest pair this file actually
+# produces is the light-ground rotation ("light" and "slate" both reuse it)
+# at 10.40 apart in CIE76. The floor sits just under that, so a future edit
+# that lets two VLAN hues drift together fails here before it is visible on
+# screen, without being so tight that float rounding trips it.
+VLAN_DISTANCE_FLOOR = 10.0
+for theme_name in sorted(THEMES):
+    values = THEMES[theme_name]
+    missing = [role for role in VLAN_ROLES if role not in values]
+    check(not missing, "[%s] all sixteen --vlan-* tokens are defined (missing %s)"
+          % (theme_name, missing or "none"))
+    if missing:
+        continue
+    for role in VLAN_ROLES:
+        ratio = contrast(tok(role, theme_name), tok("--panel", theme_name))
+        check(ratio >= 3.0, "[%s] %s on --panel = %.2f:1 (floor 3.0)" % (theme_name, role, ratio))
+    # Every one of the 120 pairs, not just neighbours in the hue rotation: a
+    # hue nudged towards a non-adjacent one is just as much a MAPPER bug as
+    # one nudged towards its neighbour, since which sixteen VLANs land next
+    # to each other on a given trunk is decided by the network, not by us.
+    hexes = [tok(role, theme_name) for role in VLAN_ROLES]
+    min_gap = min(delta_e76(a, b) for a, b in itertools.combinations(hexes, 2))
+    check(min_gap >= VLAN_DISTANCE_FLOOR,
+          "[%s] closest pair among the sixteen VLAN hues is %.2f apart (floor %.1f)"
+          % (theme_name, min_gap, VLAN_DISTANCE_FLOOR))
+
+# --------------------------------------------------------------------------
+# 2b. The pairing actually drawn on a MAPPER trunk is --canvas-vlan-*
+#     against --canvas, not --vlan-* against --panel: mapper.js's drawLink
+#     strokes a strand with --canvas-vlan-N because the strand is drawn on
+#     #mp-canvas (background: var(--canvas)), not on a --panel surface. The
+#     VLAN table's swatch and the colour picker read --canvas-vlan-* too, as
+#     of the second review pass: they name a colour the operator is about to
+#     see on the canvas, so showing them the --panel-tuned value meant the
+#     legend and the line disagreed in four of the seven themes. Section 2
+#     above still holds --vlan-* to its own contract because tokens.css
+#     still defines it, and because a swatch on --panel needs its own
+#     readable border either way (.mp-swatch uses var(--line), not
+#     var(--hairline), for exactly that reason). A code review caught nine or
+#     ten of the sixteen --vlan-* hues failing 3:1 on white before
+#     --canvas-vlan-* existed (--vlan-4 measured ~1.5:1) — this is the check
+#     that catches a regression back to that bug, by checking the ground the
+#     strand is actually drawn on instead of --panel.
+CANVAS_VLAN_ROLES = ["--canvas-vlan-%d" % n for n in range(1, 17)]
+for theme_name in sorted(THEMES):
+    values = THEMES[theme_name]
+    missing = [role for role in CANVAS_VLAN_ROLES if role not in values]
+    check(not missing, "[%s] all sixteen --canvas-vlan-* tokens are defined (missing %s)"
+          % (theme_name, missing or "none"))
+    if missing:
+        continue
+    for role in CANVAS_VLAN_ROLES:
+        ratio = contrast(tok(role, theme_name), tok("--canvas", theme_name))
+        check(ratio >= 3.0, "[%s] %s on --canvas = %.2f:1 (floor 3.0)" % (theme_name, role, ratio))
+    hexes = [tok(role, theme_name) for role in CANVAS_VLAN_ROLES]
+    min_gap = min(delta_e76(a, b) for a, b in itertools.combinations(hexes, 2))
+    check(min_gap >= VLAN_DISTANCE_FLOOR,
+          "[%s] closest pair among the sixteen --canvas-vlan-* hues is %.2f apart (floor %.1f)"
+          % (theme_name, min_gap, VLAN_DISTANCE_FLOOR))
+
+# --------------------------------------------------------------------------
+# 3. The desktop console carries the same values.
 #
 # theme.py is read as text rather than imported: it needs PySide6, which a
 # headless install does not have, and the values are what matter here.
@@ -204,7 +323,7 @@ loose = re.findall(r"#[0-9A-Fa-f]{6}\b", stylesheet)
 check(not loose, "theme.py stylesheet writes no hex of its own (found %s)" % (loose or "none"))
 
 # --------------------------------------------------------------------------
-# 3. Nothing else writes a value the tokens own.
+# 4. Nothing else writes a value the tokens own.
 SHEETS = ["app.css", "ssh.css"]
 for sheet in SHEETS:
     body = read(STATIC, sheet)
@@ -279,7 +398,7 @@ for name in sorted(os.listdir(STATIC)):
                   % (name, radius[:3] or "none"))
 
 # --------------------------------------------------------------------------
-# 4. tokens.css is where it has to be: first on every page, and public.
+# 5. tokens.css is where it has to be: first on every page, and public.
 # The asset URLs carry `?v=__SW_VERSION__`, substituted with the running
 # version as the file is loaded (server.py's static cache) so that a
 # year-long immutable cache cannot outlive the release that filled it. These
@@ -313,7 +432,7 @@ for page in ("index.html", "login.html", "ssh.html"):
           "%s: the inline mark is coloured by the theme, not by hex" % page)
 
 # --------------------------------------------------------------------------
-# 5. The landmark and the skip link.
+# 6. The landmark and the skip link.
 index = re.sub(r"<!--.*?-->", "", read(STATIC, "index.html"), flags=re.S)
 check(index.count("<main") == 1, "index.html has exactly one <main>")
 check('href="#view"' in index and 'id="view"' in index,

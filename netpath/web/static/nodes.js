@@ -1308,6 +1308,8 @@
       <div id="ndd-vendor" class="hint">Loading\u2026</div>
       <p class="section">HARDWARE SENSORS</p>
       <div id="ndd-hardware"><p class="hint">Reading sensors\u2026</p></div>
+      <p class="section">TEMPERATURE ALERTS</p>
+      <div id="ndd-temp-alerts"><p class="hint">Reading thresholds\u2026</p></div>
       <p class="section">DOM / SFP SENSORS</p>
       <div id="ndd-dom"><p class="hint">Reading sensors\u2026</p></div>
       <p class="section">INTERFACES</p>
@@ -1451,11 +1453,24 @@
             return `<tr><td>${escape(s.label)}</td><td>${escape(value)}</td>` +
               `<td>${escape(s.status || '')}</td></tr>`;
           }).join('') + '</tbody></table>';
+        // The chassis-temperature reading this same read_hardware() call
+        // already carries (r.metrics, keyed by metric key rather than the
+        // display label the table above renders) is what lets the
+        // TEMPERATURE ALERTS section below show a number against a reading
+        // instead of a bare threshold in the abstract — no second SNMP walk
+        // for it.
+        const chassis = (r.metrics || []).find((m) => m.key === 'temp_chassis_c');
+        renderTempAlerts(box, deviceId, current,
+          chassis ? chassis.value : null, (chassis && chassis.unit) || '°C');
       })
       .catch(() => {
         const holder = box.querySelector('#ndd-hardware');
         if (holder && current()) holder.innerHTML =
           '<p class="hint">Sensor read failed — the device may not answer SNMP requests.</p>';
+        // The sensor walk failing tells us nothing about whether an override
+        // exists — device_thresholds has no dependency on SNMP succeeding —
+        // so the section still renders, just without a live reading beside it.
+        renderTempAlerts(box, deviceId, current, null, '°C');
       });
 
     App.get(`/api/nodes/devices/${deviceId}/dom`)
@@ -1481,6 +1496,181 @@
         if (holder && current()) holder.innerHTML =
           '<p class="hint">Sensor read failed — the device may not answer ENTITY-MIB requests.</p>';
       });
+  }
+
+  /* ------------------------------------------- temperature alert overrides
+
+     4.54.0 gave chassis-temperature alerting a per-device threshold override
+     (alertsdb.device_thresholds), reachable both from here — a device's own
+     dialog is where an operator notices "this one closet runs hot" — and
+     from Alerts' Rules subtab, which owns the fleet-wide view. This half
+     talks to /api/alerts/rules and /api/alerts/device-thresholds — Alerts
+     routes — from inside Nodes: that is a plain HTTP call like any other
+     App.get, not a reach into App.pages.alerts, which is the one kind of
+     cross-module touch a lazy module must never make. */
+
+  // temp_chassis_high/critical are the two chassis-temperature threshold
+  // rules device_thresholds can override (alertsdb._BUILTIN_RULES); the
+  // label is what a device dialog operator recognises, the rule's own
+  // `name` is the fuller sentence Alerts' Rules list shows instead.
+  const TEMP_RULE_KEYS = ['temp_chassis_high', 'temp_chassis_critical'];
+  const TEMP_RULE_LABELS = { temp_chassis_high: 'Warning', temp_chassis_critical: 'Critical' };
+
+  function fmtTemp(value) {
+    return value == null ? '—' : `${value}°C`;
+  }
+
+  /* One rule's block: the effective threshold/clear (the override's own
+     number, or the rule's when the override leaves it null — "inherit" is
+     the storage convention, see alertsdb.device_thresholds' own comment),
+     whether that is an override or the rule's own default, and the controls
+     to change it. Inputs and buttons that write carry
+     data-requires-write="alerts" rather than "nodes" — deliberately: this
+     is nodes.js markup, but what it changes is when an ALERT fires, which is
+     Alerts' call to gate, not Nodes'. renderTempAlerts calls
+     App.applyPermissions() itself right after this is inserted (see below)
+     rather than waiting for the poll that would normally do it, since that
+     poll only runs on a config-version change, not on every tick — an
+     account with nodes:write but no alerts:write must never see these as
+     live buttons even for the few seconds until one of those happens. */
+  function tempRuleBlockHtml(rule, override) {
+    if (!rule) return '';
+    const key = rule.key;
+    const label = TEMP_RULE_LABELS[key] || rule.name;
+    const overridden = !!override;
+    const effThreshold = overridden && override.threshold != null ? override.threshold : rule.threshold;
+    const effClear = overridden && override.clear_threshold != null ? override.clear_threshold : rule.clear_threshold;
+    const disabledForDevice = overridden && !override.enabled;
+    const status = disabledForDevice
+      ? 'disabled for this device'
+      : `fires at ${fmtTemp(effThreshold)}, clears at ${fmtTemp(effClear)}`;
+    return `<div class="ndd-temp-rule" data-rule-key="${key}">
+      <div class="bar"><b>${escape(label)}</b>
+        <span class="hint">${status} — ${overridden ? 'overridden' : 'inherited from the rule'}</span>
+        <span class="grow"></span>
+        ${overridden ? `<button type="button" class="ndd-temp-clear" data-rule-key="${key}"
+          data-requires-write="alerts">Clear override</button>` : ''}
+      </div>
+      <label>Threshold override <input type="number" step="0.1" class="ndd-temp-thr" data-rule-key="${key}"
+        placeholder="${rule.threshold ?? ''} (inherit)"
+        value="${overridden && override.threshold != null ? override.threshold : ''}"
+        data-requires-write="alerts"></label>
+      <label>Clear threshold override <input type="number" step="0.1" class="ndd-temp-clr" data-rule-key="${key}"
+        placeholder="${rule.clear_threshold ?? ''} (inherit)"
+        value="${overridden && override.clear_threshold != null ? override.clear_threshold : ''}"
+        data-requires-write="alerts"></label>
+      <p class="hint">Where the temperature has to fall back to before the alert clears —
+        left blank, it inherits the rule's own clear point (currently ${fmtTemp(rule.clear_threshold)}).
+        It must sit strictly below whatever the threshold above resolves to (this override's, or
+        the rule's), or the alert could never clear.</p>
+      <label class="check"><input type="checkbox" class="ndd-temp-disable" data-rule-key="${key}"
+        ${disabledForDevice ? 'checked' : ''} data-requires-write="alerts"> Disable this rule for this device</label>
+      <div class="row start"><button type="button" class="ndd-temp-save" data-rule-key="${key}"
+        data-requires-write="alerts">Save override</button></div>
+    </div>`;
+  }
+
+  /* Fetches the two chassis rules and this device's overrides of them, and
+     paints #ndd-temp-alerts. `chassisValue`/`unit` are the current reading
+     already read by the hardware fetch above (or null when SNMP failed) —
+     read once there, not a second time here, so this never walks anything
+     of its own. */
+  async function renderTempAlerts(box, deviceId, current, chassisValue, unit) {
+    const holder = box.querySelector('#ndd-temp-alerts');
+    if (!holder || !current()) return;
+    if (!App.canRead('alerts')) {
+      holder.innerHTML = '<p class="hint">Needs Alerts read access to show ' +
+        'chassis-temperature thresholds.</p>';
+      return;
+    }
+    let rules, overrides;
+    try {
+      const [rulePayload, overridePayload] = await Promise.all([
+        App.get('/api/alerts/rules'),
+        App.get('/api/alerts/device-thresholds', { device_id: deviceId }),
+      ]);
+      rules = rulePayload.rules || [];
+      overrides = overridePayload.device_thresholds || [];
+    } catch (error) {
+      if (current()) holder.innerHTML =
+        `<p class="hint">Could not read alert thresholds: ${escape(error.message)}</p>`;
+      return;
+    }
+    if (!current()) return;
+    const byKey = new Map(rules.filter((r) => TEMP_RULE_KEYS.includes(r.key)).map((r) => [r.key, r]));
+    const overrideByKey = new Map(overrides.map((o) => [o.rule_key, o]));
+    const reload = () => renderTempAlerts(box, deviceId, current, chassisValue, unit);
+    holder.innerHTML = (chassisValue != null
+        ? `<p class="hint">Current chassis temperature: <b>${escape(fmtTemp(chassisValue))}</b></p>`
+        : '<p class="hint">No current chassis-temperature reading.</p>') +
+      TEMP_RULE_KEYS.map((key) => tempRuleBlockHtml(byKey.get(key), overrideByKey.get(key))).join('');
+    for (const btn of holder.querySelectorAll('.ndd-temp-save')) {
+      btn.onclick = async () => {
+        const key = btn.dataset.ruleKey;
+        const rule = byKey.get(key);
+        const block = holder.querySelector(`.ndd-temp-rule[data-rule-key="${key}"]`);
+        const thr = block.querySelector('.ndd-temp-thr').value.trim();
+        const clr = block.querySelector('.ndd-temp-clr').value.trim();
+        const wantDisabled = block.querySelector('.ndd-temp-disable').checked;
+        const thrNum = thr === '' ? null : Number(thr);
+        const clrNum = clr === '' ? null : Number(clr);
+        // Mirrors alertsdb._check_threshold_direction: evaluate_threshold
+        // only ever clears on a value FALLING below clear_threshold, so a
+        // clear point at or above the threshold could never let the alert
+        // clear at all. Checked here, before the request, so the common
+        // mistake this finding was filed over — lowering a device's Warning
+        // threshold without also lowering its own clear point, which the
+        // rule's inherited 65°C then sits above — reads as a sentence
+        // instead of the server's raw ValueError toast.
+        if (thrNum !== null || clrNum !== null) {
+          const effThr = thrNum !== null ? thrNum : rule.threshold;
+          const effClr = clrNum !== null ? clrNum : rule.clear_threshold;
+          if (effThr != null && effClr != null && !(effClr < effThr)) {
+            App.toast(`Clear threshold (${effClr}°C) must be strictly below the ` +
+              `threshold (${effThr}°C) it clears, or ${TEMP_RULE_LABELS[key] || key} could ` +
+              'never clear. Lower the clear threshold too, or raise the threshold.', 'fail');
+            return;
+          }
+        }
+        btn.disabled = true;
+        try {
+          await App.post('/api/alerts/device-thresholds', {
+            device_id: deviceId, rule_key: key,
+            threshold: thrNum, clear_threshold: clrNum,
+            enabled: !wantDisabled,
+          });
+          App.toast(`${TEMP_RULE_LABELS[key] || key} override saved`, 'ok');
+          await reload();
+        } catch (error) {
+          App.toast(`Save failed: ${error.message}`, 'fail');
+          btn.disabled = false;
+        }
+      };
+    }
+    for (const btn of holder.querySelectorAll('.ndd-temp-clear')) {
+      btn.onclick = () => {
+        const key = btn.dataset.ruleKey;
+        const rule = byKey.get(key);
+        // confirmDestructive opens its own App.modal, which overwrites
+        // #modal-box's markup wholesale — the same physical element `box`
+        // still points at, but no longer holding this dialog's content by
+        // the time the confirm resolves. reload() (a plain re-render of
+        // #ndd-temp-alerts) would find nothing to render into, so both
+        // branches instead reopen the whole device dialog fresh, the same
+        // recovery editDevice()'s own Clear credential confirm uses.
+        App.confirmDestructive('Clear override',
+          `<p>Clear the ${escape((rule || {}).name || key)} override for this device?</p>` +
+          '<p class="hint">It goes back to the rule’s own threshold and clear point. The ' +
+          'numbers here cannot be recovered once cleared.</p>', 'Clear',
+          () => App.post('/api/alerts/device-thresholds', { device_id: deviceId, rule_key: key, clear: true }),
+          () => deviceDialog(deviceId));
+      };
+    }
+    // See this function's own doc comment: applyPermissions only reruns on
+    // a config-version change, not every poll, so a control just inserted
+    // with data-requires-write would otherwise stay enabled for a read-only
+    // account until one happens to land.
+    App.applyPermissions();
   }
 
   /* ------------------------------------------ vendor identification */
@@ -2420,6 +2610,7 @@
       ping_count: pick('ping_count'), ping_timeout_ms: pick('ping_timeout_ms'),
       unreachable_ping_only: pick('unreachable_ping_only'),
       mac_table_interval_s: pick('mac_table_interval_s'),
+      vlan_interval_s: pick('vlan_interval_s'),
       mib_file_id: profile.mib_file_id,
       vendor_oid: profile.vendor_oid, location_oid: profile.location_oid,
     };
@@ -2460,6 +2651,7 @@
     set('#nd-f-pingtimeout', inheritText(eff.ping_timeout_ms, (v) => `${v} ms`));
     opt('#nd-f-pingonly', inheritOption(eff.unreachable_ping_only, yesNo));
     set('#nd-f-mactable', inheritText(eff.mac_table_interval_s, (v) => (Number(v) ? `${v} s` : 'off')));
+    set('#nd-f-vlaninterval', inheritText(eff.vlan_interval_s, (v) => (Number(v) ? `${v} s` : 'off')));
     const mib = (view.mibFiles || []).find((f) => f.id === eff.mib_file_id);
     opt('#nd-f-mib', inheritOption(mib ? (mib.module || mib.filename) : (eff.mib_file_id ? eff.mib_file_id : null)));
     set('#nd-f-vendoroid', inheritText(eff.vendor_oid));
@@ -2544,6 +2736,14 @@
           GETBULK walk costs only a few dozen requests per switch, so 300
           (five minutes) is a sensible starting point. 0 switches it off for
           this device whatever the profile says.</p>
+        <label>Walk VLAN membership every <input id="nd-f-vlaninterval" type="number"
+          min="0" step="60"
+          value="${d.vlan_interval_s ?? ''}"> s</label>
+        <p class="hint">How often each port's VLAN membership is re-walked (Q-BRIDGE/CISCO-VTP,
+          falling back to VLANs seen in the MAC table) — this is what MAPPER's strand colours
+          come from. Same shape as MAC address learning above: blank inherits the profile, an
+          explicit <b>0 turns it off</b> for this device, and 3600 (one hour) is the shipped
+          default so a fleet with no opinion still gets a walk, not silence.</p>
         <label>Custom MIB <select id="nd-f-mib">${mibOptionsHtml(d.mib_file_id)}</select></label>
         <p class="hint">Polls that MIB's own scalar objects alongside the usual metrics,
           shown under its own names — see Nodes → MIBs to upload one first. The
@@ -2692,6 +2892,7 @@
     overrides.ping_timeout_ms = blankToNull(box.querySelector('#nd-f-pingtimeout').value);
     overrides.unreachable_ping_only = blankToNull(box.querySelector('#nd-f-pingonly').value);
     overrides.mac_table_interval_s = blankToNull(box.querySelector('#nd-f-mactable').value);
+    overrides.vlan_interval_s = blankToNull(box.querySelector('#nd-f-vlaninterval').value);
     // Always sent, like the tri-states: "" is how the operator clears an
     // upstream, and the server accepts "", null and 0 as "none".
     const upstream = box.querySelector('#nd-f-upstream');
@@ -3632,6 +3833,12 @@
         walk uses GETBULK, so it now costs only a few dozen SNMP requests per
         switch rather than hundreds to thousands — <b>300 (five minutes)</b>
         is a sensible starting point.</p>
+      <label>Walk VLAN membership every <input id="nd-p-vlaninterval" type="number" min="0"
+        step="60" placeholder="inherit" value="${p.vlan_interval_s ?? ''}"> s</label>
+      <p class="hint">Per-port VLAN membership (Q-BRIDGE/CISCO-VTP, falling back to VLANs
+        seen in the MAC table) — MAPPER's strand colours come from this. <b>3600 (one
+        hour) is the shipped default</b>; an explicit 0 switches it off for every device
+        on this profile that does not override it.</p>
       <label>Custom MIB <select id="nd-p-mib">${mibOptionsHtml(p.mib_file_id, true)}</select></label>
       <p class="hint">Polls that MIB's own scalar objects for every device on this
         profile (unless a device overrides it), shown under its own names.</p>
@@ -3664,6 +3871,7 @@
       // Blank inherits (NULL); an explicit 0 means "never walk", which is
       // the shipped behaviour and a real choice, not the same as blank.
       mac_table_interval_s: blankToNull(box.querySelector('#nd-p-mactable').value),
+      vlan_interval_s: blankToNull(box.querySelector('#nd-p-vlaninterval').value),
       mib_file_id: Number(box.querySelector('#nd-p-mib').value) || null,
       ...identityOidValues(box, true),
     };

@@ -96,7 +96,8 @@ function readCreds(file) {
 /* ------------------------------------------------------------- collectors */
 
 const TABS = ['dashboard', 'nodes', 'alerts', 'netpath', 'netflow', 'snmp',
-              'syslog', 'ipam', 'wireless', 'configrx', 'debug', 'settings'];
+              'syslog', 'ipam', 'wireless', 'configrx', 'mapper', 'debug',
+              'settings'];
 
 // Subtabs are `.subtab[data-subtab=...]` inside each page section, in the
 // order the tab strip itself lists them.
@@ -108,7 +109,12 @@ const SUBTABS = {
   // census could see the button but this walk never reached it, exactly the
   // gap the previous campaign's report on this same file warned would
   // recur once the app grew past this list again.
-  nodes: ['devices', 'topology', 'discovery', 'profiles', 'reports'],
+  // 'topology' left this list in 4.54.0, one release after the subtab itself
+  // went in 4.53.0: naming a subtab that no longer exists made every step
+  // keyed to it record "absent" rather than "failed", so the census read as
+  // coverage the walk was not actually getting. The MAPPER module replaced
+  // that view and has no subtabs of its own.
+  nodes: ['devices', 'discovery', 'profiles', 'reports'],
   alerts: ['current', 'rules'],
   ipam: ['subnets', 'conflicts', 'dhcp'],
   // ConfigRX (4.50.0) had no entry here at all — its own three subtabs
@@ -132,7 +138,7 @@ const MODULE_SETTINGS = [
   ['netpath', '#netpath-settings'], ['netflow', '#nf-settings'],
   ['snmp', '#sn-settings'], ['syslog', '#sl-settings'],
   ['ipam', '#ipam-settings'], ['wireless', '#wl-settings'],
-  ['configrx', '#cx-settings'],
+  ['configrx', '#cx-settings'], ['mapper', '#mp-settings'],
 ];
 
 // The three "send a test packet to ourselves" dialogs, each gated on its own
@@ -143,7 +149,8 @@ const LOOPBACK_TESTS = [
   ['syslog-test', 'syslog', '#sl-test'],
 ];
 
-const THEMES = ['dark', 'light', 'contrast'];
+const THEMES = ['dark', 'light', 'contrast', 'midnight', 'nord', 'solarized',
+                'slate'];
 const VIEWPORTS = [[1920, 1080], [1366, 768], [1280, 720]];
 
 /**
@@ -167,6 +174,7 @@ const DESTRUCTIVE_SKIP = new Map([
   ['copy-password', 'left alone per campaign policy (see team lead guidance)'],
   ['signout', "would end this account's session mid-walk"],
   ['nd-import-devices', 'destructive unless fed a file this walk would then have to remove'],
+  ['mp-remove-node', 'destructive: takes a device off a map the walk cannot put back'],
   ['update-now', 'destructive: installs an update and restarts the app'],
 ]);
 
@@ -201,6 +209,11 @@ const SAFE_CLICKS = [
   ['ipam', 'subnets', 'ipam-search-btn'],
   ['wireless', null, 'wl-apply'], ['wireless', null, 'wl-clear'],
   ['configrx', null, 'cx-apply'],
+  // MAPPER's view controls only. Refresh re-reads, Fit and the two zooms move
+  // the viewport and nothing else; the map itself starts blank on a fresh
+  // install, which is the state these have to survive.
+  ['mapper', null, 'mp-refresh'], ['mapper', null, 'mp-fit'],
+  ['mapper', null, 'mp-zoom-in'], ['mapper', null, 'mp-zoom-out'],
   ['debug', null, 'dbg-cats-all'], ['debug', null, 'dbg-cats-none'],
   // This walk never dirties any field, so Revert is a pure no-op read and
   // Apply submits nothing that differs from what the server already has.
@@ -219,6 +232,7 @@ const SAFE_EXPORTS = [
   ['syslog', null, 'sl-export-csv'],
   ['ipam', 'subnets', 'ipam-hosts-export-csv'],
   ['wireless', null, 'wl-export-csv'],
+  ['mapper', null, 'mp-export-csv'],
   // nd-rep-avail-export-csv sits on Reports' own landing subtab
   // (availability), so it is visible the moment 'reports' is selected —
   // exportAvailReportCsv (nodes.js) toasts a warning and returns rather than
@@ -569,19 +583,27 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
     return `opened popup "${title}"`;
   });
 
-  // ---- Upstream suggestions (Nodes/Topology bar — nodes.js:5060). Not
-  // write-gated: reading suggestions only needs nodes:read, and the dialog
-  // itself hides its own Apply button for an account that cannot use it,
-  // so this is one dialog every account can at least open.
+  // ---- Upstream suggestions. Not write-gated: reading suggestions only
+  // needs nodes:read, and the dialog itself hides its own Apply button for
+  // an account that cannot use it, so this is one dialog every account can
+  // at least open.
+  //
+  // 4.53.0 deleted the Nodes TOPOLOGY subtab and moved this button into the
+  // Nodes top strip, renaming it nd-upstream-suggestions; this step kept
+  // selecting the dead subtab and looking for the old id, so it recorded
+  // "absent" on every run instead of driving the dialog. nodes.js injects
+  // the button after #nd-manage-devgroups rather than declaring it in
+  // index.html, so it exists only once the module has initialised — hence
+  // the settle before the gate check rather than a bare query.
   await guarded(recorder, step('dlg:upstream-suggestions'), async () => {
     await selectTab(page, 'nodes');
-    await page.click('#page-nodes .subtab[data-subtab="topology"]').catch(() => {});
+    await page.click('#page-nodes .subtab[data-subtab="devices"]').catch(() => {});
     await settle(page, 600);
-    const gate = await gateState(page, '#nd-topo-upstream-suggestions');
+    const gate = await gateState(page, '#nd-upstream-suggestions');
     if (!gate.present || !gate.visible) {
-      return 'absent — #nd-topo-upstream-suggestions not visible';
+      return 'absent — #nd-upstream-suggestions not visible';
     }
-    await page.click('#nd-topo-upstream-suggestions', { timeout: 5000 });
+    await page.click('#nd-upstream-suggestions', { timeout: 5000 });
     await page.waitForSelector('#modal:not([hidden])', { timeout: 10000 });
     await settle(page, 500);
     await shoot(page, dir, shot('dlg', 'upstream-suggestions'));

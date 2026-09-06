@@ -12,7 +12,20 @@ from __future__ import annotations
 
 MODULES = (
     "netpath", "netflow", "snmp", "syslog", "ipam", "nodes", "alerts",
-    "wireless", "configrx", "settings", "debug",
+    "wireless", "configrx",
+    # MAPPER (4.54): a real tab, like every module above it, so it takes an
+    # ordinary slot among them rather than being appended past "settings"
+    # the way ssh/admin below are — those two are appended because they are
+    # NOT tabs and have no natural slot to begin with; mapper has one (it
+    # sits with the Nodes group in the shell, see index.html). Slotted after
+    # "configrx" rather than after "nodes" itself so this tuple's position
+    # (the only thing that matters here — user_permissions is keyed
+    # (username, module), so no account's grant moves no matter where a new
+    # module is inserted) still puts "ssh" and "admin" last, which is all
+    # test_web_security.py actually pins: MODULES[-2:] == ("ssh", "admin").
+    # This placement keeps that true.
+    "mapper",
+    "settings", "debug",
     # Not a tab: the interactive SSH terminal opened from a Nodes device.
     # Its own module because ConfigRX write means "may back up configs", a
     # boundary of exactly two fixed read-only commands, and an interactive

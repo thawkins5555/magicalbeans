@@ -384,6 +384,15 @@ body.tiny .brand span { display: none; }
 .nd-summary .nd-v { color: var(--text); overflow-wrap: anywhere; }
 .nd-summary .nd-err { color: var(--fail); }
 .nd-summary .warn-text { color: var(--warn); }
+/* The device dialog's two chassis-temperature rule blocks (TEMPERATURE
+   ALERTS, 4.54.0): a plain top border between them, the same divider
+   .scope-trend already uses, rather than a full <fieldset> box each — this
+   is two short forms stacked, not two visually distinct panels. */
+.ndd-temp-rule + .ndd-temp-rule {
+  margin-top: var(--space-md);
+  padding-top: var(--space-md);
+  border-top: 1px solid var(--hairline);
+}
 /* The interfaces/events subtabs take whatever height is left under the
    status timeline. min-height:0 for the same reason as above: without it
    the tables grow to their content height instead of scrolling inside
@@ -1626,6 +1635,129 @@ body.kiosk td { padding: 6px 10px; }
 body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
 .card.strip .figures { display: inline-flex; gap: 14px; }
 .card.strip .figure-value { font-size: var(--fs-lg); }
+
+/* -------------------------------------------------------------- mapper
+
+   The manually-built L2 map: a role-iconed box per device or unmanaged
+   peer, drawn on an SVG canvas the operator pans, zooms and drags nodes
+   around on. The pan/zoom idiom is copied from netpath.js's route canvas
+   (same --canvas-* surface, same fit/translate math) but nothing is
+   shared code-wise: NetPath's canvas is a diagram recomputed fresh every
+   poll, MAPPER's is a *place* — nodes keep the position they were dropped
+   at, so the drawing code has an entirely different job (read x/y back,
+   never lay out from scratch) even where the visual language matches. */
+/* Same trap #ipam-dhcp-body hit (4.53.0 CHANGELOG): #mp-canvas is a plain
+   block wrapper around #mp-svg with nothing of its own in the flex chain,
+   so without `display:flex; flex-direction:column; min-height:0; flex:1`
+   here its containing .pane's own flex:1 has nothing to flex against —
+   the canvas grows to the SVG's natural (near-zero) content size instead
+   of filling the pane, and the pan/zoom surface never gets a box of its
+   own to clip or scroll within. touch-action:none is the other half of
+   the contract this canvas has to keep — every
+   drag here — a node, the rubber-band, a pan — is Pointer Events with
+   setPointerCapture, never mousedown/mouseup, and a browser left free to
+   scroll or pinch-zoom the page out from under a captured pointer defeats
+   that capture as surely as never taking it. Not enforced by
+   tests/test_layout_contracts.py the way #route-svg/.brush svg's touch-action is (that
+   test's Pointer Events checks cover mapper.js's drag code generically, not this
+   selector by name) — this comment is what pins the requirement here, so removing the
+   rule below would not be caught by that test the way it would be for the route canvas. */
+#mp-canvas {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  touch-action: none;
+  position: relative;
+  background: var(--canvas);
+  border: 1px solid var(--canvas-hairline);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+#mp-svg { width: 100%; height: 100%; display: block; cursor: grab; user-select: none; -webkit-user-select: none; }
+#mp-svg.dragging { cursor: grabbing; }
+
+/* Node chrome. rx is set per map style from script (mapper.js), the same
+   exemption netpath.js's own node boxes already use — SVG geometry is the
+   diagram's own, not a design token (see test_design_tokens.py's comment
+   on netpath's rx: 5). Selection and focus both read against
+   --canvas-accent, the same accent the route canvas points with, so a
+   device picked here and a hop picked there read as the same kind of act. */
+.mp-node-box { fill: var(--canvas-panel); stroke: var(--canvas-hairline); }
+.mp-node.selected .mp-node-box,
+.mp-node:focus-visible .mp-node-box { stroke: var(--canvas-accent); stroke-width: 2; }
+.mp-node { cursor: pointer; }
+.mp-node:focus { outline: none; }   /* the box above IS the focus ring on an SVG group */
+/* An unmanaged peer — never polled itself, only ever seen as someone
+   else's neighbour row — must never be mistaken for a monitored device. */
+.mp-node.unmanaged .mp-node-box { stroke-dasharray: 4 3; }
+/* A node whose device has since been removed from Nodes: a second, wider
+   dash and the fail tone, rather than silently drawing as though the
+   device were still there — the tooltip and detail pane say why. */
+.mp-node.gone .mp-node-box { stroke-dasharray: 1 4; stroke: var(--fail); }
+.mp-node-label { fill: var(--canvas-text); font-family: var(--ui); font-size: var(--fs-2xs); }
+.mp-node-sub { fill: var(--canvas-muted); font-family: var(--mono); font-size: var(--fs-2xs); }
+.mp-node-icon { fill: none; stroke: var(--canvas-muted); stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+
+/* Links. .mp-link is the one selector every drawn strand, collapsed trunk
+   and plain line carries, so the per-style stroke-linejoin below applies
+   uniformly whatever a given link's plan.mode drew. */
+.mp-link { fill: none; stroke-linecap: round; }
+.mp-link.selected { filter: brightness(1.35); }
+/* known:false ("no VLAN data at all") must read differently from "one
+   VLAN, drawn as a single strand" — this dash is that difference;
+   #mp-legend spells it out in words for a viewer who cannot rely on the
+   visual alone. */
+.mp-link.unknown { stroke-dasharray: 5 4; }
+/* A VLAN picked in the table dims every strand that is not it rather than
+   hiding them outright, so the rest of the topology stays legible while
+   the chosen VLAN's path stands out from it. */
+.mp-link.dimmed { opacity: 0.22; }
+.mp-link-label { fill: var(--canvas-muted); font-family: var(--mono); font-size: var(--fs-2xs); }
+
+/* The grid: drawn only when snap-to-grid is on or the style calls for it
+   (mapper.js's shouldDrawGrid decides which); the per-style strength of
+   it, once drawn, is a CSS-only choice kept here. */
+.mp-grid-line { stroke: var(--canvas-grid); }
+
+/* Rubber-band multi-select, dragged from empty canvas. */
+.mp-rubber { fill: var(--canvas-accent); fill-opacity: 0.12; stroke: var(--canvas-accent); stroke-dasharray: 3 2; }
+
+/* The four map styles (mapperdb.MAP_STYLES), toggled by mapper.js setting
+   data-map-style on #mp-canvas. Real differences an operator would
+   choose between, not four names for the same look: modern is the
+   default — a soft radius (set in script) and a lifted shadow, grid only
+   on demand; classic is the flat, square-jointed NMS look with no shadow;
+   blueprint inverts to a technical-drawing feel — square corners, mitred
+   joins and the grid always on, drawn stronger; minimal drops the shadow
+   and keeps the least visual weight of the four while staying rounded,
+   so a dense map does not turn into graph paper. */
+[data-map-style="modern"] .mp-node-box { filter: drop-shadow(var(--shadow-float)); }
+[data-map-style="modern"] .mp-link { stroke-linejoin: round; }
+[data-map-style="classic"] .mp-link { stroke-linejoin: miter; }
+[data-map-style="blueprint"] .mp-link { stroke-linejoin: miter; }
+[data-map-style="blueprint"] .mp-grid-line { stroke: var(--canvas-accent); opacity: 0.35; }
+[data-map-style="minimal"] .mp-link { stroke-linejoin: round; }
+
+/* The VLAN table's colour swatch and the 16-colour picker it opens. Both now fill
+   with --canvas-vlan-N (mapper.js) -- the colour actually stroked on #mp-canvas --
+   rather than the --panel-tuned --vlan-N that used to live here and could be a
+   different lightness from the strand it named. --canvas-vlan-* was never tuned
+   against --panel, though, and this swatch sits on --panel: the border carries the
+   shape at the --line/--panel floor (>=3.38:1 in every theme, worst case Nord's
+   ~1.03:1 fill-on-panel) so the swatch always reads as a square even when its
+   fill all but disappears into the panel behind it. --hairline (a 1.3-1.6:1
+   surface-step divider, not a boundary meant to be seen on its own) isn't enough. */
+.mp-swatch {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.mp-swatch.selected { outline: 2px solid var(--focus); outline-offset: 1px; }
+.mp-swatch-grid { display: flex; flex-wrap: wrap; gap: var(--space-sm); }
 
 /* ----------------------------------------------------------- breakpoints
    Density above keys on height only, so a narrow, tall window still got the

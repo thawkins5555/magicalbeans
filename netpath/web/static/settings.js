@@ -307,10 +307,16 @@
         `<span class="meter"><i style="width:${share * 100}%"></i></span>` +
         `${App.bytes(bytes || 0)} used${cap ? ` · ${pct}%` : ''}`;
     }
-    const total = (storage.trace_bytes || 0) + (storage.flow_bytes || 0)
-      + (storage.snmp_bytes || 0) + (storage.syslog_bytes || 0)
-      + (storage.app_bytes || 0) + (storage.ipam_bytes || 0)
-      + (storage.nodes_bytes || 0) + (storage.alerts_bytes || 0);
+    // Summed from whatever _storage actually reported rather than from a
+    // hand-written list of eight: wireless.db and configrx.db were already
+    // in the payload and already missing from that list, so "on disk in
+    // total" had been understating the real figure by two whole files, and
+    // mapper.db (4.54.0) would have made it three. Every *_bytes key the
+    // server sends counts, so the next database to arrive is counted the
+    // day it ships instead of the day somebody notices.
+    const total = Object.keys(storage)
+      .filter((key) => key.endsWith('_bytes'))
+      .reduce((sum, key) => sum + (storage[key] || 0), 0);
     App.el('set-sizes').textContent =
       `${App.bytes(total)} on disk in total. Sizes include each file's `
       + 'write-ahead log, which is why they can grow between prunes and shrink after one.';
@@ -1005,7 +1011,7 @@
      Module settings otherwise live in two places: a button on each
      module's own strip, and nowhere else — so "where is the setting for
      X" has no answer that does not start with already knowing which tab.
-     This lists all nine and opens the same dialog the module's own button
+     This lists all ten and opens the same dialog the module's own button
      does, rather than duplicating it. */
   const MODULE_DIALOGS = [
     ['nodes', 'Nodes', 'nd-settings'],
@@ -1017,6 +1023,7 @@
     ['ipam', 'IPAM', 'ipam-settings'],
     ['wireless', 'FortiWireless', 'wl-settings'],
     ['configrx', 'ConfigRX', 'cx-settings'],
+    ['mapper', 'Mapper', 'mp-settings'],
   ];
 
   function buildModulesPane() {

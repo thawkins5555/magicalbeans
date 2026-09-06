@@ -612,6 +612,67 @@ def step_ipam(client: Client, log: SeedLog) -> dict:
     return {"subnet_id": subnet_id, "scan_status": status}
 
 
+def step_mapper(client: Client, log: SeedLog, plan, device_ids: dict) -> dict:
+    """5b. One MAPPER map with Site-A's core and its access switches on it.
+
+    A map genuinely starts blank -- that is the product's behaviour and this
+    step does not change it. But a blank map draws nothing, so the browser
+    walk would only ever photograph MAPPER's empty state and never its
+    strands, its collapsed trunks or its VLAN table, which is the whole
+    point of the module. Placing the Site-A devices by the same API call
+    the operator's own "Add device" makes leaves the walk with a map that
+    has real CDP/LLDP links and real VLAN membership across them.
+
+    Positions are laid out by hand rather than left at (0, 0): every node at
+    the origin is one box, not a topology, and the walk's screenshot would
+    show a single stack. The core sits centred above a row of its access
+    switches -- the shape an operator would drag them into anyway.
+    """
+    client.step = "5b-mapper"
+    have = {m["name"]: m["id"] for m in client.get("/api/mapper/maps")["maps"]}
+    name = "Site-A core"
+    map_id = have.get(name)
+    if map_id is None:
+        status, payload, _ = client.raw(
+            "POST", "/api/mapper/maps",
+            {"name": name, "notes": "Seeded by demo/seed.py"})
+        if status >= 400:
+            print("[5b] mapper map -> HTTP %d %s" % (status, error_text(payload)))
+            log.note("5b-mapper", "map refused", status=status)
+            return {"map_id": 0, "placed": 0}
+        map_id = payload["id"]
+
+    site_a = [entry for entry in plan if (entry.get("site") or "") == "Site-A"]
+    core = next((e for e in site_a if e.get("index") == 0), None)
+    others = [e for e in site_a if e.get("index") != 0]
+    placed = failed = 0
+    # The core centred over a row of everything behind it. 220px apart is
+    # wider than the node box so the labels do not collide, and the row is
+    # centred on the core rather than starting under it.
+    row_y, spacing = 320.0, 220.0
+    start_x = 400.0 - spacing * (max(len(others), 1) - 1) / 2
+    laid_out = []
+    if core:
+        laid_out.append((core, 400.0, 120.0))
+    for i, entry in enumerate(others):
+        laid_out.append((entry, start_x + i * spacing, row_y))
+    for entry, x, y in laid_out:
+        device_id = device_ids.get(entry.get("name") or "")
+        if not device_id:
+            continue
+        status, payload, _ = client.raw(
+            "POST", "/api/mapper/maps/%d/nodes" % map_id,
+            {"device_id": device_id, "x": x, "y": y})
+        if status < 400:
+            placed += 1
+        else:
+            failed += 1
+    print("[5b] mapper: map %r (id %d), %d device(s) placed%s"
+          % (name, map_id, placed, "; %d failed" % failed if failed else ""))
+    log.note("5b-mapper", "map seeded", map_id=map_id, placed=placed, failed=failed)
+    return {"map_id": map_id, "placed": placed, "failed": failed}
+
+
 def step_wireless(client: Client, log: SeedLog) -> dict:
     """6. The FortiGate wireless controller, then a poll."""
     client.step = "6-wireless"
@@ -1133,6 +1194,8 @@ def main(argv=None) -> int:
                 client, log, plan, summary["devices"]["ids_by_name"])
         summary["netpath"] = step_netpath(client, log)
         summary["ipam"] = step_ipam(client, log)
+        summary["mapper"] = step_mapper(
+            client, log, plan, summary["devices"]["ids_by_name"])
         summary["wireless"] = step_wireless(client, log)
         summary["configrx"] = step_configrx(
             client, log, summary["devices"]["ids_by_name"], args.ssh_base_port)

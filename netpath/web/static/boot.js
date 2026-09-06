@@ -4,7 +4,7 @@
 (function () {
   // Every page loads this. Dark is the default, and is the ABSENCE of the
   // attribute, so a browser that never chose stores nothing.
-  var THEMES = ['dark', 'light', 'contrast'];
+  var THEMES = ['dark', 'light', 'contrast', 'midnight', 'nord', 'solarized', 'slate'];
   var theme = 'dark';
   try {
     theme = localStorage.getItem('sappiwhere.theme') || 'dark';
@@ -17,7 +17,8 @@
 
   var DEFAULT_TAB = 'dashboard';
   var TABS = ['dashboard', 'nodes', 'alerts', 'netpath', 'netflow', 'snmp',
-              'syslog', 'ipam', 'wireless', 'configrx', 'debug', 'settings'];
+              'syslog', 'ipam', 'wireless', 'configrx', 'mapper', 'debug',
+              'settings'];
   var tab = null;
   // A hash route beats the remembered tab, the order app.js applies too.
   try {

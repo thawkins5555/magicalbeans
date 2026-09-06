@@ -522,8 +522,10 @@ returning anything but `ok`.
    hardware.
 5. **The databases are independent.** A corrupt `flows.db` costs you flow
    history and nothing else; delete it and the application recreates it empty
-   on the next start. Do not do that with `nodes.db`, `alerts.db` or
-   `configrx.db` without a backup — those hold configuration, not just records.
+   on the next start. Do not do that with `nodes.db`, `alerts.db`,
+   `configrx.db` or `mapper.db` without a backup — those hold configuration,
+   not just records; `mapper.db` in particular is hand-placed map layout
+   with nothing elsewhere to rebuild it from.
 6. **Then find out why.** Corruption in SQLite is almost always the storage
    underneath: a database on an NFS or SMB share, a volume that lies about
    flushes, or a disk that is failing. On Linux, check `dmesg` and SMART

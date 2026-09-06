@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.54.0 — A map of your own](#4540--a-map-of-your-own)
 - [4.53.0 — Two lanes on the timeline, and the sensors under the hood](#4530--two-lanes-on-the-timeline-and-the-sensors-under-the-hood)
 - [4.52.0 — One base class, in place of ten copies](#4520--one-base-class-in-place-of-ten-copies)
 - [4.51.0 — The patterns this codebase already knew](#4510--the-patterns-this-codebase-already-knew)
@@ -120,6 +121,386 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 4.54.0 — A map of your own
+
+Seven items from a single work order, each its own paragraph below in the
+order it was asked for, then what the build turned up along the way.
+
+**A new MAPPER module: a manually-built L2 network map, in the idiom of
+SolarWinds, PRTG or Auvik.** `netpath/mapperdb.py` (`MapperDatabase`, new
+`mapper.db`) stores named maps and the devices or unmanaged peers placed on
+each one; `netpath/mapper.py` is a pure, dependency-free transform layer —
+`peer_identity`, `link_identity`, `assemble_links`, `vlan_color_index`,
+`render_plan`, `link_csv_rows` — that turns `nodesdb.all_neighbours()` rows
+and live VLAN membership into the links and render instructions a map
+draws; nothing SQL or SNMP lives there, so the drawing maths is
+exhaustively unit-tested (`tests/test_mapper_links.py`) without a database
+or a poller in the loop. `netpath/web/static/mapper.js` is the page itself,
+gated by a new `mapper` permission module (`permissions.py`, slotted after
+`configrx` so every module ahead of it keeps its existing column), with its
+own routes under `/api/mapper/*` (`web/server.py`, `web/api.py`) and a
+`mapper` settings scope (`Service._MODULE_SCOPES`) whose apply function is
+a deliberate no-op — MAPPER polls nothing of its own; every request reads
+`nodesdb` live. 4.53.0's changelog said of the deleted Nodes → TOPOLOGY
+graph that "a separate module will replace the graph itself" — this is
+that module, and it does not attempt what TOPOLOGY did: TOPOLOGY drew
+itself automatically from whatever LLDP/CDP had seen; MAPPER draws only
+what an operator has placed.
+
+**Maps start blank; devices are added by hand and dragged freely.** There
+is no auto-layout: `mapperdb.add_node`/`update_nodes` store a device or an
+unmanaged CDP/LLDP peer's position as `map_nodes.x`/`y`, taken throughout
+`mapper.js` to mean the box's centre, and a drag writes it back debounced
+500 ms after the pointer settles (retried every 5 s on a failed write,
+never dropped). **Add device** and **Add neighbours** are the only way
+anything appears on a map — an unmanaged peer with no SNMP of its own
+(a phone, an AP) is identified by `mapper.peer_identity`: chassis id first,
+then sysName, then a `(device_id, if_index, protocol)` fallback, each
+branch prefixed (`chassis:`, `sysname:`, `row:`) so a chassis id that
+happens to look like a sysName string can never collide with one across
+the branch boundary. This is the explicit point of departure from an
+auto-drawn topology graph: a map is a *place* an operator built, not a
+diagram that reflows under them every time a neighbour table changes.
+**Node role (switch/router/firewall/AP/server/unmanaged) is auto-detected
+from what Nodes already knows about a device, with a manual override.**
+`mapper.detect_role(vendor, sys_descr, sys_object_id, platform,
+unmanaged)` classifies a node from vendor and sysDescr text alone — no new
+polling, no new storage — and `api._mapper_node_role` prefers an
+operator's own `map_nodes.role` when one is set, falling back to
+`detect_role` and reporting `role_auto: true` so the front end can label
+an undetected pick "Auto (switch)" rather than pretending the operator
+chose it. Fortinet and Cisco are deliberately absent from the
+vendor-only firewall list (`_FIREWALL_ONLY_VENDORS`) even though both sell
+firewalls: both vendor keys also cover switches, routers and APs from the
+same maker, so only a model-line word in the sysDescr (`fortigate` vs.
+`fortiap`, `asa`/`firepower` vs. `catalyst`/`nexus`) can tell them apart —
+the vendor key alone is only trusted for a maker whose entire catalog
+really is one kind of box (Palo Alto, SonicWall, Check Point, WatchGuard,
+pfSense). A managed device that answered SNMP but matched nothing more
+specific defaults to "switch" rather than "": on an LLDP/CDP-walked L2 map
+an unclassified box is far more often a switch than a router, firewall or
+AP, so the common case needs no manual correction and the odd one does.
+An unmanaged peer, having no device row of its own to classify, always
+detects as `unmanaged`, unconditionally, before any other field is read.
+
+**Multi-coloured lines: a trunk carrying several VLANs draws one strand
+per VLAN.** `mapper.render_plan` is computed once, server-side, so
+`mapper.js` never re-derives a width or an offset (and two browsers can
+never draw the same link two different ways): below the collapse
+threshold each VLAN gets its own thin, coloured strand, offset
+perpendicular to the link and centred on its centre line so the bundle
+never drifts as the VLAN count changes. Colour comes from
+`mapper.vlan_color_index`, a Knuth-style multiplicative hash into a
+sixteen-entry palette — `tokens.css`'s new `--canvas-vlan-1..16` for a
+strand itself (drawn on the white-in-every-theme `#mp-canvas`; see "New
+coloured themes", below, for why that needed its own palette rather than
+reusing MAPPER's chrome colours) — deliberately not
+`vlan % 16`, which collides most of a real site's round-numbered VLANs
+(10, 20, 30, …) onto the same handful of residues; the multiplier
+(`_KNUTH_MULTIPLIER = 1248904971`) was chosen by search for one that keeps
+those specific round numbers scattered, checked in
+`tests/test_mapper_links.py`. A link with no VLAN data at all draws thin,
+neutral and dashed (`known: false`) rather than looking like an ordinary
+single-VLAN strand — collapsing those two would misreport a VLAN-blind
+trunk as a one-VLAN access link.
+
+**A configurable threshold for how many VLANs draw as individual strands
+before collapsing into one thick, count-scaled line.**
+`mapperdb.DEFAULTS["vlan_collapse_threshold"]` (8, range 1–30, enforced by
+`api._check_mapper_settings`) is where strands give way to one line; a
+second, independent ceiling, `max_strand_vlans` (30), is a genuine hard cap
+on how many strands `render_plan` ever draws individually — checked on its
+own, not folded into "count < threshold" — so a misconfigured
+`vlan_collapse_threshold` left well above it can never make a 400-VLAN
+trunk draw 400 individual strands; it still collapses at `max_strand_vlans`
+regardless. The same number is also where the collapsed width scale tops
+out at `link_width_max` — one setting doing both jobs, which is why the
+settings dialog's own label spells out the second half. Width interpolates
+linearly between `link_width_min` and `link_width_max` across the span
+from `vlan_collapse_threshold` to `max_strand_vlans`, clamped at both ends,
+and a link sitting exactly at the threshold draws at `link_width_min` —
+the same width the last strand would have used — so the strands-to-
+collapsed transition has no visible jump. `_check_mapper_settings` also
+refuses to store a `max_strand_vlans` at or below `vlan_collapse_threshold`
+— that pair would leave no strand mode ever reachable at all.
+
+**Link information from CDP and LLDP.** `mapper.assemble_links` folds
+`nodesdb.all_neighbours()` rows into undirected links via
+`mapper.link_identity`: a cable walked from both ends (device A's neighbour
+row matched to B, and separately B's matched to A) produces the identical
+`frozenset({(A, ifA), (B, ifB)})` key regardless of which end answered
+first, so it draws once, not twice. A VLAN on a link is the **union** of
+what each end's own port reports, never the intersection — intersecting
+with an unmanaged peer's inevitable empty VLAN set would erase every VLAN
+the moment either end is VLAN-blind, a strictly worse failure than
+occasionally showing a VLAN the far end doesn't carry. A membership that
+has aged out of `port_vlans` (present=0, or older than the same
+`stale_link_hours` cutoff a stale neighbour link already used) no longer
+draws — it used to keep showing on the map, unchanged, for up to
+`mac_table_retention_days` (7 by default) after the trunk stopped carrying
+it. Per-port VLAN membership itself is new: three `nodesdb.py` tables
+(`vlans`, `vlan_ports`, `port_vlans`), populated by
+`nodepoll.read_device_vlans` over Q-BRIDGE-MIB (`dot1qVlanStatic*`/
+`dot1qVlanCurrent*`, `dot1qPvid`) and, on Cisco gear, CISCO-VTP-MIB's own
+trunk-allow-list bitmaps — a Cisco answer for a port genuinely trunking
+(`vlanTrunkPortDynamicStatus == trunking(1)`) supersedes the standards
+answer for that same port, because classic IOS's own `dot1q` egress bitmap
+often reflects only VLANs with a currently active member rather than the
+trunk's actual configured allow-list; a port IOS reports as `notTrunking`
+keeps whatever the standards path already said, since that same column
+answers for every switchport, access included, and an access port's
+default allow-list is not a fact about that port at all. `vlan_interval_s`
+(new, and — like `lldp_interval_s` — editable per device and per group,
+defaulting to the same 3600 s, 0 to disable) schedules the walk.
+
+**Configurable alerts on chassis temperature.** A new built-in rule,
+`temp_chassis_critical` (85.0/78.0, severity 2), reads the same
+`temp_chassis_c` metric as the existing `temp_chassis_high` (75.0/65.0,
+severity 4, itself unchanged) — a device climbing past the vendor
+major-alarm range now gets a second, more urgent alert rather than a
+louder copy of the first, and `alertrules.ROLLED_UP_BY` suppresses Warning
+while Critical is open so that reads as one alert, not two saying the same
+thing at different volumes. A new `device_thresholds` table
+(`alertsdb.py`) and `GET`/`POST /api/alerts/device-thresholds` let a
+device override any threshold rule's own numbers, or turn it off outright
+for that device alone, independently of the fleet-wide default — a core
+switch in a hot closet and an access switch in an air-conditioned comms
+room do not share a sane chassis-temperature limit. Turning a rule off
+for a device resolves any alert of its own already open for that device
+rather than stranding it (see the second review, below) — the device
+stops being evaluated against that rule at all, so there is nothing left
+to hold an alert open with. An operator sets one from either end: the
+device dialog's new TEMPERATURE ALERTS section (`nodes.js`), which shows
+both rules against that device's own current chassis reading, or the
+Overrides column added to Alerts → RULES (`alerts.js`), which says how
+many devices override a threshold rule before you open anything. Every
+control on both is gated `alerts: write` rather than `nodes: write` —
+the device dialog's included, since what it changes is when an alert
+fires, not what Nodes knows.
+
+**New coloured themes and styles in Settings.** Four app-wide themes join
+Dark, Light and High contrast — Midnight (a cooler, darker Dark for a NOC
+watched at 3am), Nord, Solarized and Slate (a second, warmer light theme)
+— all seven held to the same WCAG contrast harness
+(`tests/test_design_tokens.py`), which now also enforces two new
+sixteen-entry palettes: `--canvas-vlan-1..16`, tuned against `--canvas` —
+the ground `#mp-canvas` draws on, white in every theme but Contrast, the
+same route-canvas idiom NetPath's own graph already used — and read by
+everything that actually draws a VLAN's colour: the strand itself, the
+VLAN table's swatch, and the sixteen-swatch colour picker; and
+`--vlan-1..16`, tuned against `--panel` instead, nine or ten of whose
+sixteen hues fall under 3:1 measured against white, which is why
+`--canvas-vlan-1..16` needed its own copy rather than reusing it for both
+grounds. Both palettes also hold every one of their own 120 pairs at least
+10.0 apart in CIE76, so two VLANs on the same trunk are never confusable
+either way. A separate, MAPPER-only **map style**
+setting — modern / classic / blueprint / minimal (`mapperdb.MAP_STYLES`) —
+is independent of the app-wide colour theme, since a map's line weights
+and node chrome are a MAPPER concern even for an operator running the
+app itself in Light.
+
+**From the build.** `AlertEngine._apply` matched an occurrence to a rule
+on `(kind, source_kind)` alone, so any two threshold rules sharing a
+metric cross-matched — an occurrence built for evaluating one rule's own
+streak also matched the other, double-incrementing it under the wrong
+rule's message. This was not new with `temp_chassis_critical`: the shipped
+`ups_battery_low`/`ups_battery_replace` pair already shared `source_kind`
+and already had this bug, undetected until a second temperature rule made
+it obvious. Every `Occurrence` a threshold evaluation raises now carries
+its own rule's `key` (`alertrules.Occurrence.rule_key`), and `_apply`
+narrows a threshold occurrence to the rule that actually raised it before
+matching anything else. Separately, `MapperDatabase.update_nodes` validated
+each item in a bulk position/label/role update *inside* its write loop, so
+a bad `role` partway through a batch left the earlier writes of that same
+call applied inside an open transaction nothing rolled back; validation now
+runs over the whole batch before the first `UPDATE` executes. And
+`mapper.assemble_links` originally counted a neighbour twice when a Cisco
+switch reported the same physical port over both LLDP and CDP; the
+neighbour list is now deduped by `(device_id, if_index)` before it is
+offered as a peer, so "Add neighbours" reports one cable, not two. A node
+relabelled on the map also didn't reach its own name or its CSV export:
+`get_mapper_map` built `name` straight from the device's own resolved name
+and `get_mapper_map_export` built its CSV from the same field, so a
+renamed node still showed — and exported — its original device name.
+Both now go through `api._mapper_node_name(label, resolved)`, which
+prefers the operator's label and keeps the resolved identity alongside it
+as `resolved_name` for a client that wants to show "renamed from X".
+
+**A code review of this branch, after the above was written, found a
+dozen further defects in the same MAPPER/Alerts work — every one fixed
+before this release, none of them shipped.** Four are already folded into
+the descriptions above rather than repeated here: the Cisco trunk-allow-
+list gate on `vlanTrunkPortDynamicStatus == trunking(1)` ("Cisco gear",
+above — it was being applied to every switchport, access included); the
+aged-out VLAN memberships that kept drawing on a map for up to
+`mac_table_retention_days` ("Link information from CDP and LLDP", above);
+`max_strand_vlans` becoming a genuine independent cap rather than only a
+width-interpolation span ("A configurable threshold", above); and a strand
+needing its own `--canvas-vlan-1..16` palette rather than MAPPER's chrome
+colours, since a strand draws on white-in-every-theme `#mp-canvas`, not the
+`--panel` ground `--vlan-1..16` is tuned against ("Multi-coloured lines"
+and "New coloured themes", both above). The rest, in full:
+
+The device-threshold work widened the alert engine's breach-streak key to
+include the effective threshold/clear pair; that broke
+`_child_first_breach_ts`, which a rollup parent's hand-resolve looks up by
+`(rule_id, device_id)` alone and can only ever look up that way — so
+resolving Critical by hand no longer found the run it was meant to close,
+and Warning re-opened on the very next breach, the exact noise the rollup
+exists to prevent. The streak key is `(rule_id, device_id)` again, with the
+thresholds a streak was counted under stored inside the entry and the
+streak reset when they change, rather than folded into the key itself.
+
+CISCO-VTP-MIB's own VLAN bitmap is 0-based (octet 0's most significant bit
+is VLAN 0) but was being decoded with Q-BRIDGE PortList's 1-based scan
+(octet 0's most significant bit is bridge port 1), so every Cisco trunk
+VLAN id nodepoll read was one too high — fixed in `_decode_vlan_bitmap`.
+
+A map GET read `nodesdb.all_neighbours()` — every neighbour row in the
+whole fleet — inside the shared `nodesdb` lock, on every refresh: 33.7 s
+on a synthetic 2,000-device fleet, for a map placing two devices. New
+bounded accessors, `nodesdb.neighbours_for_devices` and
+`port_vlans_for_devices` (chunked like `devices_by_ids`), read only the
+devices a map actually places: 0.037 s for that same two-device map.
+
+A strand's VLAN was also conveyed by colour alone, so a colour-blind or
+screen-reader user had no way to tell one VLAN's strand from its
+neighbour's; each strand now carries its own accessible name and tooltip
+naming its VLAN, with only the first strand of a bundle taking a Tab stop
+(that one stop's label lists every VLAN on the link, not just a count).
+
+Three settings that had no effect at all now do something: `show_port_labels`
+and `show_vlan_labels` actually draw their labels, and a node can be
+renamed from its own detail pane. And `vlan_interval_s` had no control
+anywhere in the interface — every device would have started its hourly
+VLAN walk on upgrade with no way to retune or disable it; it is now an
+editable device and group setting exactly like `lldp_interval_s`, 0
+included (see "Link information from CDP and LLDP", above).
+
+Finally, an honest partial fix rather than a full one: `_decode_port_list`'s
+own heuristic for a printable-text OCTET STRING (the form the shared
+decoder hands it when raw bytes are unavailable) is considerably tighter
+now, though it cannot be made fully lossless — two cases (`0x0A`/`0x0D`/
+`0x20` rendering identically; a lone two-hex-character run) are genuinely
+ambiguous without the original bytes. See INTERNALS.md for the detail;
+this affects the pre-existing LLDP chassis-id path too, not only the new
+VLAN walk.
+
+The review also caught two things an upgrading operator needs to know that
+this entry did not originally say. **No existing account is granted
+MAPPER on upgrade** — the same as `wireless` and `configrx` when they
+shipped: `ssh` and `admin` are the only modules ever backfilled onto
+existing accounts, because both carved a capability out of a module
+people already held, where MAPPER is a genuinely new one. An administrator
+has to grant it before anyone sees the tab. And **every device begins an
+hourly per-port VLAN walk the moment this release starts**, the same way
+every device already began an hourly LLDP walk when that shipped — it is
+retunable per device and per group, and 0 turns it off, but nothing about
+upgrading turns it off by default.
+
+Two stale entries in `demo/ui_walk.mjs`, found while wiring MAPPER into the
+same walk: it still selected the `topology` subtab 4.53.0 deleted from
+Nodes, and still looked for `#nd-topo-upstream-suggestions` after that
+button was renamed to `#nd-upstream-suggestions` and moved into the Nodes
+top strip in the same release — so that dialog step recorded "absent" on
+every run since, instead of driving it. Both are fixed, and `demo/seed.py`
+now seeds one MAPPER map (Site-A's core and its access switches, wired by
+real CDP/LLDP and VLAN data) so the walk photographs strands and a
+collapsed trunk rather than only ever finding MAPPER's blank starting
+state.
+
+**A second, independent review, once everything above had already
+shipped, found six more defects in the same MAPPER/Alerts work — two of
+them bugs the first review's own fixes had introduced.** The first
+review's strand-accessibility fix (above) shipped with the exact bug it
+was written to fix: `drawLink`'s `"strands"` branch gave the first
+strand's Tab stop the same per-VLAN `aria-label` as every other strand,
+so a keyboard user landing on a seven-VLAN trunk still heard only "VLAN
+10 strand on the link," not the whole link. The focusable strand now
+actually carries `linkAriaLabel`/`linkTooltip` — both ends, both ports,
+every VLAN, the protocols — while every other strand keeps its own
+per-VLAN `role="img"` name for a screen reader's browse cursor. The
+second: the VLAN table's swatch and its sixteen-swatch colour picker had
+always painted `--vlan-N` (the `--panel`-tuned palette) while the strand
+itself was stroked with `--canvas-vlan-N`, and the two were never the
+same colour for the same VLAN in Dark, Midnight, Nord or Solarized — not
+one of the sixteen pairs matched, so picking a colour off the swatch
+showed something the map never actually drew. Both now read
+`--canvas-vlan-N`, and the swatch's own border moved from `--hairline` (a
+1.3–1.6:1 surface-step divider) to `--line` (≥3.38:1 against `--panel` in
+every theme), so the swatch still reads as a square where its fill nearly
+disappears into the panel behind it (worst case, Nord: ~1.03:1).
+
+The other four: a per-device override with `enabled = 0` used to freeze
+whatever alert was already open for that device — the engine skipped the
+device before it ever reached the clear branch, so "turn it off entirely"
+(above) left a stuck-open alert nothing would close even once the device
+cooled. `_evaluate_thresholds` now resolves it the moment it sees
+`enabled = 0`, the same way `_sweep_netpath_alerts` already resolves a
+destination taken out of rotation: `resolve_by_dedup` against
+`{rule_key}:device:{device_id}`, `by=""` so it reads as automatic rather
+than a hand resolve, no clear email — re-enabling the rule for that
+device later starts a clean streak rather than resuming a suppressed one.
+Separately, widening the breach-streak entry to carry the effective
+threshold/clear pair (above) resets a device's streak, and its
+`first_breach_ts`, whenever a rule's own threshold or clear point is
+edited, not only when a device's own override changes — with no override
+in play, the "effective pair" a device is judged against is just the
+rule's own numbers, and those moved too. That is deliberate (a streak
+counted against numbers that no longer apply is not evidence of
+anything), but it is operator-visible in a way nothing here said yet: a
+hand-resolved alert that is still genuinely breaching re-opens as a new
+run the moment its rule's threshold or clear point is next edited, the
+same as if the device had never been seen before.
+
+`vlan_ports` — written and pruned by every poll since "Link information
+from CDP and LLDP" (above) — was being read by nothing at all.
+`vlan_ports_for_devices` now feeds four new per-link fields,
+`a_port_mode`/`a_native_vlan`/`b_port_mode`/`b_native_vlan` — each end's
+own device-reported trunk/access mode and native VLAN — into the link
+tooltip, which shows the mode beside each port and names a native-VLAN
+mismatch across the two ends explicitly, since that is a real
+misconfiguration worth seeing rather than averaging away. And a third
+fleet-wide read had survived the first review's own fix for the other
+two: `_mapper_vlans_json` still called `nodesdb.all_vlans()` — every VLAN
+the whole fleet knows — on every map GET, measured at 88.2 ms on 2,000
+devices × 50 VLANs. A new bounded `nodesdb.vlans_for_devices`, the same
+shape as `neighbours_for_devices` and `port_vlans_for_devices` (above),
+cuts that to 0.2 ms for a two-device map — the true cost of a map GET is
+the sum of all three bounded reads, not just the two the first review
+happened to name. `all_vlans`, `all_port_vlans`, `all_vlan_ports` and
+`vlan_ports_for` (the fleet-wide accessors nothing else called) are
+removed; `all_neighbours`, `vlans_for` and `port_vlans_for` stay, because
+tests still call them.
+
+Last, a gating gap rather than a data one: the maps dialog's Rename and
+Delete, the align dialog's eight buttons and the VLAN colour picker gated
+themselves with a one-shot `App.canWrite('mapper') ? '' : 'disabled'` at
+render time and were never wired into `applyPermissions()`'s periodic
+re-check, unlike every other write control in the product. A write
+permission revoked while any of those stayed open left a control that
+still looked enabled until the operator closed and reopened it. All now
+carry `data-requires-write="mapper"`.
+
+New test suites: `tests/test_mapper_db.py` (`MapperDatabase`),
+`tests/test_mapper_links.py` (link assembly and the render plan, pure —
+no database), `tests/test_port_vlans.py` (the VLAN walk and its three
+`nodesdb` tables, against `tests/stubs/stub_agent_vlan.py`),
+`tests/test_temp_thresholds.py` (`temp_chassis_critical`, device
+overrides, and the `_apply` cross-match fix) and `tests/test_mapper_api.py`
+(the `/api/mapper/*` routes end to end). Two existing suites also changed
+in the second review: `tests/test_frontend_contracts.py` had no MAPPER
+coverage of any kind — exactly how the strand's `aria-label` and the
+swatch's colour family both shipped wrong in the first place — and now
+pins the focusable strand's whole-link label, the shared
+`--canvas-vlan-*` family across the strand/swatch/picker, and the
+`data-requires-write="mapper"` gate on every write control `mapper.js`
+renders; and `tests/test_collector_errors.py`'s writer-thread test read
+the event log once, right after the counter it actually waited on, but
+`_note_write_error` bumps that counter before it writes the event, so the
+read could land in the gap between the two and fail on a collector
+behaving correctly — it now polls instead of reading once.
 
 ### 4.53.0 — Two lanes on the timeline, and the sensors under the hood
 

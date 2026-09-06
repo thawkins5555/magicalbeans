@@ -147,6 +147,38 @@ CREATE TABLE IF NOT EXISTS smtp_credential (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     password_enc BLOB
 );
+
+-- Per-device overrides of a threshold rule's own numbers. Generic over
+-- rule_key rather than a temp-specific table: a core switch in a hot closet
+-- and an access switch in a comms room do not share a sane chassis-
+-- temperature threshold, and neither will CPU or memory once a site wants
+-- the same per-device tuning for those — one table, keyed by whichever
+-- threshold-kind rule it overrides, serves all of them with no further
+-- migration.
+--
+-- threshold/clear_threshold NULL means "inherit the rule's own value" —
+-- the same NULL-is-the-shipped-default convention rules.flap_window_s and
+-- friends already use above — so an override that only wants to disable a
+-- rule for one device (enabled=0) does not also have to restate its
+-- numbers. enabled=0 means the rule never fires for this device at all,
+-- distinct from setting threshold sky-high: it also has no clear_threshold
+-- to speak of, and reads as "off" on the device's own page rather than a
+-- number an operator has to interpret.
+--
+-- No id/rowid surrogate: (device_id, rule_key) is exactly the fact this
+-- table records — at most one override per rule per device — so it is the
+-- natural primary key, and AlertEngine.device_threshold_map's per-tick read
+-- (see alertengine._evaluate_thresholds) wants exactly this device_id ->
+-- row shape with no join required to get there.
+CREATE TABLE IF NOT EXISTS device_thresholds (
+    device_id       INTEGER NOT NULL,
+    rule_key        TEXT NOT NULL,
+    threshold       REAL,
+    clear_threshold REAL,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    updated_ts      REAL NOT NULL,
+    PRIMARY KEY (device_id, rule_key)
+);
 """
 
 DEFAULTS = {
@@ -420,13 +452,51 @@ def validate_webhook_url(url: str) -> None:
             " a private (RFC1918) address")
 
 
+def _check_threshold_direction(rule: sqlite3.Row, threshold, clear_threshold) -> None:
+    """Raise ValueError if `threshold`/`clear_threshold` (either may be None,
+    meaning "inherit `rule`'s own value") would leave a device override with
+    no real hysteresis gap to clear through.
+
+    evaluate_threshold (alertrules.py) has exactly one direction wired in:
+    a value AT OR ABOVE threshold breaches, a value BELOW clear_threshold
+    clears — there is no "low is bad, clears on rising" mode to invert to.
+    Checked here, not assumed: every threshold-kind row in
+    alertsdb._BUILTIN_RULES was read for this feature, and all nineteen (now
+    twenty) already have clear_threshold <= threshold, several of them
+    intentionally equal for a quantised metric with no gap to leave (UPS
+    battery status, NetPath's 100%-loss unreachable rule). So "high threshold
+    rule, clear_threshold strictly below threshold" is not a hard-coded
+    special case, it is the only direction this evaluator has ever supported
+    — the branch a future low-water metric would need is simply absent
+    because nothing in this codebase has needed it yet.
+
+    Only checked when the CALLER is actually setting one of the two numbers.
+    A call that only touches `enabled` (both None, pure inherit) has nothing
+    numeric to validate — rejecting it would refuse a plain "turn this rule
+    off for one device" on the three rules above whose OWN shipped threshold
+    equals its own clear_threshold, over a comparison that call never asked
+    for.
+    """
+    if threshold is None and clear_threshold is None:
+        return
+    effective_threshold = rule["threshold"] if threshold is None else threshold
+    effective_clear = rule["clear_threshold"] if clear_threshold is None else clear_threshold
+    if effective_threshold is None or effective_clear is None:
+        return
+    if not (effective_clear < effective_threshold):
+        raise ValueError(
+            f"clear_threshold ({effective_clear}) must be below threshold"
+            f" ({effective_threshold}) for rule '{rule['key']}', or the"
+            " alert could never clear")
+
+
 _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "clear_threshold", "for_polls", "for_seconds", "template_id",
                   "flap_window_s", "flap_min_transitions", "auto_resolve_after_s",
                   "notify")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 43 built-in rules: 8 device_event + 3 interface_event + 19 threshold +
+# 44 built-in rules: 8 device_event + 3 interface_event + 20 threshold +
 # 3 trap + 1 syslog + 1 ipam + 2 wireless_event + 1 dhcp_threshold +
 # 3 netpath_threshold + 2 system. Each `template` name is a
 # templates.key —
@@ -517,6 +587,21 @@ _BUILTIN_RULES = [
     # themselves ship (Cisco/Juniper environmental major-alarm levels
     # commonly sit in the 75-85 C range for this kind of sensor).
     ("temp_chassis_high", "Chassis temperature high", "threshold", "temp_chassis_c", 4, "threshold_breach", 75.0, 65.0, 2),
+    # Critical sits ABOVE temp_chassis_high on the same metric, on purpose:
+    # a chassis climbing past the vendor major-alarm range warrants a second,
+    # more urgent alert rather than only a louder version of the first one.
+    # severity 2 is this scale's actual "critical" (see alertrules.
+    # SEVERITY_NAMES[2]) — 4 (temp_chassis_high's own "warning") would have
+    # made the two indistinguishable in the inbox and on the severity filter.
+    # Both rules reading temp_chassis_c means a device at 90 C breaches both;
+    # alertrules.ROLLED_UP_BY suppresses temp_chassis_high while Critical is
+    # open so that is one alert, not two saying the same thing at different
+    # volumes — see that map's own comment for why this is a ROLLED_UP_BY
+    # case rather than an outage rollup. temp_chassis_high itself is
+    # UNCHANGED — same key, same name, same shipped 75.0/65.0 — so an
+    # upgraded install's already-seeded rule (and any operator tuning of it)
+    # survives exactly as it was.
+    ("temp_chassis_critical", "Chassis temperature critical", "threshold", "temp_chassis_c", 2, "threshold_breach", 85.0, 78.0, 2),
     # Optic: comfortably above the "40-55 C is normal DOM" range, in line
     # with SFF-8472's own typical vendor-set high-warning/high-alarm
     # thresholds for a commercial-temperature transceiver.
@@ -1198,6 +1283,80 @@ class AlertsDatabase(SqliteStore):
                 "DELETE FROM rules WHERE id = ? AND is_builtin = 0"
                 " AND id NOT IN (SELECT DISTINCT rule_id FROM alerts)",
                 (rule_id,))
+            self._conn.commit()
+            return (cursor.rowcount or 0) > 0
+
+    # ------------------------------------------------------- device thresholds
+
+    def device_thresholds(self, device_id: int | None = None) -> list[sqlite3.Row]:
+        """Every override, or just `device_id`'s — the fleet view and a
+        single device's page share this one accessor. An override whose
+        device was since deleted from Nodes still comes back here (nothing
+        in this table references `devices`, on purpose — see
+        AlertEngine._evaluate_thresholds' own comment on why that is
+        harmless): the fleet view is exactly where an operator would notice
+        and clean up a leftover row for a device that no longer exists.
+        """
+        with self._lock:
+            if device_id is None:
+                return self._conn.execute(
+                    "SELECT * FROM device_thresholds ORDER BY device_id, rule_key"
+                ).fetchall()
+            return self._conn.execute(
+                "SELECT * FROM device_thresholds WHERE device_id = ?"
+                " ORDER BY rule_key", (device_id,)).fetchall()
+
+    def device_threshold_map(self, rule_key: str) -> dict[int, sqlite3.Row]:
+        """device_id -> override, for one rule — the shape
+        AlertEngine._evaluate_thresholds wants, read once per rule per tick
+        rather than once per device: this evaluator runs every 5 s over the
+        whole fleet, and a query per device here would be the same
+        regression metrics_for_keys' own batching already exists to avoid.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM device_thresholds WHERE rule_key = ?",
+                (rule_key,)).fetchall()
+        return {row["device_id"]: row for row in rows}
+
+    def set_device_threshold(self, device_id: int, rule_key: str, *,
+                             threshold: float | None, clear_threshold: float | None,
+                             enabled: bool = True, now: float | None = None) -> None:
+        """Create or replace `device_id`'s override of `rule_key`.
+
+        `rule_key` must name a threshold-kind rule: device_thresholds only
+        means anything to AlertEngine._evaluate_thresholds, which reads
+        rule.threshold/clear_threshold the same way for every kind='threshold'
+        row and no other kind at all. _check_threshold_direction is the other
+        half of the validation — see its own docstring for why "clear_threshold
+        below threshold" is the one direction this evaluator ever supports,
+        not an assumption this function is making.
+        """
+        rule = self.rule_by_key(rule_key)
+        if rule is None or rule["kind"] != "threshold":
+            raise ValueError(
+                f"'{rule_key}' does not name an existing threshold rule")
+        _check_threshold_direction(rule, threshold, clear_threshold)
+        now = time.time() if now is None else now
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO device_thresholds(device_id, rule_key, threshold,"
+                " clear_threshold, enabled, updated_ts) VALUES (?,?,?,?,?,?)"
+                " ON CONFLICT(device_id, rule_key) DO UPDATE SET"
+                " threshold = excluded.threshold,"
+                " clear_threshold = excluded.clear_threshold,"
+                " enabled = excluded.enabled, updated_ts = excluded.updated_ts",
+                (device_id, rule_key, threshold, clear_threshold,
+                 1 if enabled else 0, now))
+            self._conn.commit()
+
+    def clear_device_threshold(self, device_id: int, rule_key: str) -> bool:
+        """False when there was no override to remove, so a caller can tell
+        "deleted" from "there was nothing there"."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM device_thresholds WHERE device_id = ? AND rule_key = ?",
+                (device_id, rule_key))
             self._conn.commit()
             return (cursor.rowcount or 0) > 0
 

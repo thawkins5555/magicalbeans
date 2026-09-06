@@ -341,9 +341,10 @@ Route changes are recorded as a path signature per trace and drawn as ticks, but
 
 ## Display: themes, small screens, the wall
 
-Three themes — Dark, Light, High contrast — under **Appearance · this
-browser**, in the **Account** dialog reachable from the top bar, stored per
-browser so a shared workstation keeps its choice across sign-ins. The layout
+Seven themes — Dark, Light, High contrast, Midnight, Nord, Solarized and
+Slate — under **Appearance · this browser**, in the **Account** dialog
+reachable from the top bar, stored per browser so a shared workstation
+keeps its choice across sign-ins. The layout
 works down to a 768 px tablet; every drag works from a finger or a pen, and
 pane splitters and column widths can be changed from the keyboard (arrow keys
 on a splitter, Alt+Arrow on a column header).
@@ -388,7 +389,7 @@ bookmarked, and pasted into a ticket. Back and Forward work.
 
 | Route | Opens |
 | --- | --- |
-| `#/nodes` | a tab, by name — the same for `#/alerts`, `#/netpath`, `#/netflow`, `#/snmp`, `#/syslog`, `#/ipam`, `#/wireless`, `#/configrx`, `#/debug`, `#/settings` |
+| `#/nodes` | a tab, by name — the same for `#/alerts`, `#/netpath`, `#/netflow`, `#/snmp`, `#/syslog`, `#/ipam`, `#/wireless`, `#/configrx`, `#/mapper`, `#/debug`, `#/settings` |
 | `#/nodes/device/1234` | that device selected, detail pane open |
 | `#/nodes/device/1234/port/7` | that device with interface index 7 open |
 | `#/alerts/998` | that alert |
@@ -661,8 +662,8 @@ Then confirm the version, as below. The databases are never touched by any of
 this — they live outside the application folder by default, in
 `%APPDATA%\netpath-monitor\`. Read [Backup and restore](#backup-and-restore)
 before an upgrade that crosses a schema change; the short version is that a
-copy of the ten `.db` files taken while the service is stopped is a complete,
-restorable backup.
+copy of the eleven `.db` files taken while the service is stopped is a
+complete, restorable backup.
 
 On Linux the equivalent is `systemctl stop sappiwhere`, replace the directory,
 `systemctl start sappiwhere`. There is also an in-application update path — the
@@ -832,7 +833,9 @@ netpath/
                    polling
   nodepoll.py      NodePoller: the per-device SNMP/ping scheduler
   nodesdb.py       nodes.db: devices, polling profiles, interfaces, polled
-                   metrics/samples, state events, uploaded MIBs, discovery
+                   metrics/samples, state events, uploaded MIBs, discovery,
+                   per-port VLAN membership (`vlans`/`vlan_ports`/
+                   `port_vlans`, for MAPPER)
   nodediscover.py  per-device and per-subnet discovery: ping sweep plus
                    best-effort SNMP v1/v2c identification
   snmppoll.py      SNMP wire format for the Nodes poller: GET/GETNEXT/
@@ -844,7 +847,8 @@ netpath/
   mibcatalog.py    curated catalog of vendor MIB bundles, installed on demand
   mibparse.py      stdlib-only, best-effort MIB text parser
   alertsdb.py      alerts.db: rule definitions, open/acked/resolved alerts,
-                   email templates, notification history, SMTP settings
+                   per-device threshold-rule overrides, email templates,
+                   notification history, SMTP settings
   alertrules.py    alert rule/occurrence matching, flapping and threshold
                    hysteresis evaluators
   alertengine.py   AlertEngine: the 5-second evaluation scheduler that
@@ -864,6 +868,13 @@ netpath/
                    bounded-regex compiler so a query can't hang; rule sets:
                    must-match/must-not-match checks against each device's
                    latest capture
+  mapper.py        MAPPER's pure link-assembly and render-plan layer: folds
+                   LLDP/CDP neighbour rows into undirected links, computes
+                   each link's drawn strands/collapse/colours; no sqlite3,
+                   no SNMP, no HTTP
+  mapperdb.py      mapper.db: named maps, the devices/unmanaged peers
+                   placed on each and where, a VLAN colour override table,
+                   Mapper settings
   hostkeys.py      remembered SSH host keys, shared by ConfigRX and the
                    SSH terminal; refuses a changed key
   sshterm.py       interactive SSH sessions for the browser terminal
@@ -888,14 +899,14 @@ netpath/
                    scheduler, resolver and collectors
     api.py         JSON endpoints — one function per route, grouped by
                    NetPath, NetFlow, syslog, IPAM, auth and users, plus
-                   nodes, alerts, snmp, wireless, configrx, ssh, debug,
-                   settings, dashboard, audit, maintenance, update,
+                   nodes, alerts, snmp, wireless, configrx, mapper, ssh,
+                   debug, settings, dashboard, audit, maintenance, update,
                    platform, config, tokens and password
     server.py      HTTP(S) server: routing, sessions/cookies, access log,
                    serving static/
     wsock.py       RFC 6455 WebSocket framing, server side, stdlib only
     static/        the browser interface
-      index.html   the twelve-tab shell
+      index.html   the thirteen-tab shell
       login.html   the sign-in page
       tokens.css   the design tokens: every colour, text size and
                    spacing value, with its measured contrast
@@ -919,6 +930,8 @@ netpath/
       wireless.js  Wireless tab: FortiGate-managed APs at a glance
       configrx.js  ConfigRX tab: device list, stored backups, read-only
                    backup viewer
+      mapper.js    MAPPER tab: manually-built L2 map, pan/zoom/drag
+                   canvas, VLAN-strand links, PNG/CSV export
       debug.js     Debug tab: trace workers, event log
       settings.js  Settings tab: reverse DNS, refresh interval, database
                    locations, maintenance
@@ -1020,7 +1033,7 @@ gh release create "$TAG" SHA256SUMS --title "SappiWhere 4.53.0" --notes-file -
 
 ## Backup and restore
 
-Ten SQLite databases, all in WAL mode, all written by one live process.
+Eleven SQLite databases, all in WAL mode, all written by one live process.
 **Copying only the `.db` file while the service is writing gives a torn
 backup** — every database also has a `-wal` (committed transactions not yet
 folded into the main file) and usually a `-shm`. Do not use `cp`, `rsync` or
@@ -1030,7 +1043,7 @@ three files of every database at once.
 What to back up is everything in the data directory
 (`~/.local/share/netpath-monitor/` on Linux/macOS,
 `%APPDATA%\netpath-monitor\` on Windows, or wherever `--db`/`--nodes-db`/etc.
-point): the ten `.db` files, and `secret.salt` — the per-install salt the
+point): the eleven `.db` files, and `secret.salt` — the per-install salt the
 portable secret store (non-Windows hosts with a passphrase configured;
 `netpath/secretstore.py`, `CREDENTIAL-SECURITY.md`) derives its encryption
 key from. `NETWORK-AND-STORAGE-REQUIREMENTS.md` says what each database
@@ -1065,7 +1078,7 @@ portable secret store ever encrypted, permanently:
 set -eu
 SRC="$HOME/.local/share/netpath-monitor"; DST="/backup/sappiwhere/$(date +%F)"
 mkdir -p "$DST"
-for f in app nodes alerts netpath flows snmptraps syslog ipam wireless configrx; do
+for f in app nodes alerts netpath flows snmptraps syslog ipam wireless configrx mapper; do
     [ -f "$SRC/$f.db" ] || continue
     sqlite3 "$SRC/$f.db" ".backup '$DST/$f.db'"
 done

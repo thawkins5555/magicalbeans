@@ -26,6 +26,7 @@ from ..fortipoll import WirelessPoller
 from .. import ipam_scan
 from ..ipamdb import IpamDatabase
 from ..ipam_worker import IpamWorker
+from ..mapperdb import MapperDatabase
 from ..mibparse import known_oids_for, load_into, resolve_all
 from ..monitor import AsnResolver, HopProber, Monitor, Resolver
 from ..nodepoll import NodePoller
@@ -92,6 +93,16 @@ def _apply_alerts(service, settings) -> None:
     service.alert_engine.reconfigure(settings)
 
 
+def _apply_mapper(service, settings) -> None:
+    """No-op: MAPPER has no background worker to restart or reconfigure —
+    it reads nodesdb live on every request instead of polling anything of
+    its own (see mapperdb's module docstring). The settings save this is
+    called from is itself the whole effect; this function exists only so
+    `apply_settings` below has the same four-tuple shape for every scope,
+    rather than `post_settings` needing a special case that skips calling
+    an apply function for exactly one module."""
+
+
 # scope -> (settings attribute, database attribute, event-log line, effect).
 # `netpath` and `global` are not here: both write self.settings rather than
 # a module's own dict and have their own methods.
@@ -106,6 +117,14 @@ _MODULE_SCOPES = {
     "ipam": ("ipam_settings", "ipam_db", "IPAM settings applied", _apply_ipam),
     "nodes": ("nodes_settings", "nodes_db", "Nodes settings applied", _apply_nodes),
     "alerts": ("alerts_settings", "alerts_db", "Alerts settings applied", _apply_alerts),
+    # Settings-only module: this same generic merge/save/apply_fn/log/
+    # bump_config path (see apply_settings below) already supports one —
+    # the shape does not assume every scope restarts a worker, only that
+    # apply_fn does *something* with the merged settings, and "nothing" is
+    # a valid something. That is what keeps post_settings from needing a
+    # bespoke branch for mapper: it dispatches through this table exactly
+    # like every module with a worker does.
+    "mapper": ("mapper_settings", "mapper_db", "Mapper settings applied", _apply_mapper),
 }
 
 
@@ -147,6 +166,17 @@ class Service:
         self.alerts_db = AlertsDatabase(alerts_db_path)
         self.wireless_db = WirelessDatabase(wireless_db_path)
         self.configrx_db = ConfigRxDatabase(configrx_db_path)
+        # No mapper_db_path constructor parameter: Service.__init__ is called
+        # positionally by every test in tests/, by demo/ and by __main__.py's
+        # own path-resolution helpers (flow_path_for and friends), all sized
+        # to the ten arguments above. Adding an eleventh would break every one
+        # of those call sites for a store that needs no CLI override of its
+        # own (mapper.db holds only manually-placed map bookkeeping, nothing
+        # an operator would ever want on a different disk or volume than the
+        # rest). So its path is derived instead, the same directory
+        # configrx_db_path already resolved to.
+        self.mapper_db = MapperDatabase(
+            str(Path(configrx_db_path).parent / "mapper.db"))
         # Global keys and NetPath keys, merged for reading. Each store filters
         # this dict down to what it owns when it is written back.
         self.settings = {**self.app_db.settings(), **self.db.settings()}
@@ -163,6 +193,7 @@ class Service:
         self.alerts_settings = self.alerts_db.settings()
         self.wireless_settings = self.wireless_db.settings()
         self.configrx_settings = self.configrx_db.settings()
+        self.mapper_settings = self.mapper_db.settings()
 
         self.hop_prober = HopProber(self.db, log=self.log)
         self.monitor = Monitor(
@@ -442,6 +473,11 @@ class Service:
             self.alerts_db.close()
             self.wireless_db.close()
             self.configrx_db.close()
+            # No worker reads or writes this one (see _apply_mapper), but
+            # the connection itself still wants a clean close like every
+            # other store here — otherwise a temp-dir test teardown on
+            # Windows can find the file still held open.
+            self.mapper_db.close()
             self.app_db.close()
 
     # ------------------------------------------------------------- settings
@@ -925,6 +961,18 @@ class Service:
         # retention setting governs both rather than adding a second knob for
         # the same "device stopped being walked" problem.
         self.nodes_db.prune_neighbors(
+            float(self.nodes_settings.get("mac_table_retention_days", 7)) * 86400)
+        # VLAN membership (Q-BRIDGE/VTP) and the two per-port VLAN tables age
+        # out on the same clock as neighbours and the MAC table: all three
+        # are "device stopped answering this walk", the same failure mode
+        # mac_table_retention_days already governs, so a fourth (or sixth)
+        # setting for the identical question would just be one more knob an
+        # operator has to know exists.
+        self.nodes_db.prune_vlans(
+            float(self.nodes_settings.get("mac_table_retention_days", 7)) * 86400)
+        self.nodes_db.prune_vlan_ports(
+            float(self.nodes_settings.get("mac_table_retention_days", 7)) * 86400)
+        self.nodes_db.prune_port_vlans(
             float(self.nodes_settings.get("mac_table_retention_days", 7)) * 86400)
         self._trim_db("max_nodes_db_mb", self.nodes_db, "Nodes database",
                       "oldest samples")
