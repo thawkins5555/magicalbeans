@@ -4,44 +4,29 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SappiWhere</title>
-<!-- Every load used to 404 on /favicon.ico. SVG so one file covers
-     every size a browser or a pinned tab asks for. -->
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/tokens.css?v=__SW_VERSION__">
 <link rel="stylesheet" href="/app.css?v=__SW_VERSION__">
-<!-- Marks which tab should paint first, before <body> has a single byte of
-     content to render — see app.css's html[data-tab] rules and boot.js.
-     A plain <script src> (no defer, no module) so it still blocks parsing
-     right here, that split second before <body>, rather than racing it.
-     It is a separate file rather than an inline block because the server
-     sends `default-src 'self'`, under which an inline <script> is refused
-     outright and this never ran at all. -->
+<!-- Marks which tab should paint first, before <body> is parsed (see
+     app.css's html[data-tab] rules). No defer and no module, so it still
+     blocks right here; a separate file rather than an inline block because
+     the server sends `default-src 'self'`. -->
 <script src="/boot.js?v=__SW_VERSION__"></script>
 </head>
 <body>
 
-<!-- The document starts with a way past the twelve-item tab bar. The name
-     itself is the wordmark at the left of the strip (the <h1> below): the
-     mark is favicon.svg's route drawn with classes so the theme colours it,
-     and the word drops out under tiny density and in kiosk mode. -->
-<!-- #view is the <main> around the page sections below. This used to say
-     #tabs — the twelve-item nav the link exists to skip. app.js moves focus
-     to the active page on activation, because <main> is display: contents
-     and has no box of its own to focus. -->
+<!-- Skips the twelve-item tab bar. It targets #view, the <main> around
+     the page sections below, not #tabs — the nav the link exists to skip.
+     app.js moves focus to the active page, since <main> is display:
+     contents and has no box of its own to focus. -->
 <a class="skip-link" href="#view">Skip to the current view</a>
 
-<!-- .topbar holds the brand, the tab strip and the utility group side by
-     side. #tabs is the ONLY thing that scrolls (overflow-x, below): the
-     utility group — who is signed in, the way to the Account dialog, Sign
-     out, and #conn, "the one honest signal during an outage" — sits outside
-     it entirely, so narrowing the window can never scroll it out of reach.
-     #tabs and #tabs-utility must stay adjacent siblings: the overflow fade
-     (app.css) is drawn on the utility group with a `+` selector against
-     #tabs, not on #tabs itself, so it never scrolls with the strip's own
-     content. The twelve tabs are flat, direct children of #tabs — the one
-     role="tablist" here and its twelve role="tab" buttons — with a hairline
-     before the first tab of each of the three groups after Now (Nodes,
-     Routes, Settings) standing in for the labels a group used to carry. -->
+<!-- #tabs is the ONLY thing here that scrolls; the utility group sits
+     outside it so narrowing the window can never scroll it out of reach.
+     The two must stay adjacent siblings: app.css draws the overflow fade on
+     the utility group with a `+` selector against #tabs. The twelve tabs
+     are flat, direct children of #tabs; the attribute on three of them
+     marks where a hairline stands in for a group label. -->
 <div class="topbar">
 <h1 class="brand"><a href="#/dashboard" title="Dashboard"><svg class="mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path class="mark-route" d="M6 22 L13 12 L20 20 L26 10"/><circle class="mark-start" cx="6" cy="22" r="3.1"/><circle class="mark-hop" cx="13" cy="12" r="2.6"/><circle class="mark-hop" cx="20" cy="20" r="2.6"/><circle class="mark-end" cx="26" cy="10" r="3.4"/></svg><span>SappiWhere</span></a></h1>
 <nav id="tabs" role="tablist" aria-label="Views">
@@ -49,11 +34,8 @@
   <button class="tab" data-tab="alerts">ALERTS<span id="alerts-tab-badge" class="badge" hidden></span></button>
   <button class="tab tab--group-start" data-tab="nodes" data-group-start>NODES</button>
   <button class="tab" data-tab="ipam">IPAM</button>
-  <!-- Wireless support is FortiGate-only (netpath/wirelessdb.py polls the
-       FORTINET-FORTIGATE-MIB); the tab says FORTIWIRELESS rather than
-       plain WIRELESS, which read as "every wireless estate" and only
-       corrected itself once an Aruba or Ubiquiti shop opened the page and
-       found nothing there. -->
+  <!-- FORTIWIRELESS, not WIRELESS: support is FortiGate-only
+       (netpath/wirelessdb.py polls the FORTINET-FORTIGATE-MIB). -->
   <button class="tab" data-tab="wireless">FORTIWIRELESS</button>
   <button class="tab tab--proper" data-tab="configrx">ConfigRX</button>
   <button class="tab tab--group-start" data-tab="netpath" data-group-start>ROUTES</button>
@@ -64,11 +46,8 @@
   <button class="tab" data-tab="debug">DEBUG</button>
 </nav>
 <!-- Each of these three carries an icon AND a text label (.label): below
-     ~480px (app.css) the label is hidden and the icon shown instead — the
-     accessible name comes from title/aria-label either way, so nothing a
-     screen reader announces or a tooltip shows changes, only how much of
-     the bar the button costs. #whoami and #conn are untouched here: #conn
-     ("the one honest signal during an outage") keeps its place below too. -->
+     ~480px (app.css) the label is hidden and the icon shown instead. The
+     accessible name is on title/aria-label either way. -->
 <div id="tabs-utility" class="tabs-utility">
   <button id="global-search-btn" class="linkish icon-toggle" title="Search (/)" aria-label="Search"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.6"/><line x1="10.2" y1="10.2" x2="14" y2="14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg><span class="label">Search</span></button>
   <span id="whoami" class="conn user"></span>
@@ -79,19 +58,15 @@
 </div>
 </div>
 
-<!-- Wall display. Shown only when the page was opened as /?kiosk=1 (app.js
-     initKiosk): the tab strip is hidden, the root font grows a quarter, and
-     this one thin line says what is on screen, whose session it is and how
-     long that session has left — the absolute ceiling used to arrive as an
-     unexplained sign-in page overnight. -->
+<!-- Wall display, shown only for /?kiosk=1 (app.js initKiosk): no tab
+     strip, a quarter larger root font, and one thin line saying what is on
+     screen, whose session it is and how long that session has left. -->
 <div id="kiosk-bar" class="kiosk-bar" hidden
      title="Press 1-9 on a connected keyboard to jump straight to a view">
   <span class="brand" aria-hidden="true"><svg class="mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path class="mark-route" d="M6 22 L13 12 L20 20 L26 10"/><circle class="mark-start" cx="6" cy="22" r="3.1"/><circle class="mark-hop" cx="13" cy="12" r="2.6"/><circle class="mark-hop" cx="20" cy="20" r="2.6"/><circle class="mark-end" cx="26" cy="10" r="3.4"/></svg></span>
   <span id="kiosk-tab" class="kiosk-tab"></span>
-  <!-- Only drawn when ?rotate=... names more than one view (App.drawKioskBar):
-       a dot per stop in the rotation, the current one filled, and the plain
-       word "next" rather than assuming everyone reads a countdown at a
-       glance from across a room. -->
+  <!-- Only drawn when ?rotate=... names more than one view
+       (App.drawKioskBar): a dot per stop, the current one filled. -->
   <span id="kiosk-dots" class="kiosk-dots" hidden></span>
   <span id="kiosk-next" class="kiosk-next" hidden></span>
   <span class="grow"></span>
@@ -99,18 +74,15 @@
   <span id="kiosk-session" class="kiosk-session"></span>
 </div>
 
-<!-- The one main landmark, around all twelve views; exactly one is shown at
-     a time. Before this the only <main> in the document was inside the
-     NetPath page, so eleven of the twelve views had no landmark at all. -->
+<!-- The one main landmark, around all twelve views; exactly one is shown
+     at a time. -->
 <main id="view" class="views">
 <!-- =========================== DASHBOARD ============================ -->
 <section id="page-dashboard" class="page">
-  <div class="dash-scroll pad-x pad-b" style="padding-top:14px">
+  <div class="dash-scroll pad-x pad-b pad-t">
     <h2>Dashboard</h2>
     <p class="hint">Everything below is drawn from what your account can
       read. Every count links through to the tab that can act on it.</p>
-    <!-- Tiles are built by dashboard.js; the grid itself is markup so the
-         page has a shape before the first fetch lands. -->
     <div id="dash-grid" class="dash-grid"></div>
   </div>
 </section>
@@ -128,10 +100,8 @@
     <button id="nd-toggle" data-requires-write="nodes">Start poller</button>
     <button id="nd-settings" class="module-settings" data-requires-write="nodes">Settings</button>
   </div>
-  <!-- P1-9: a finished/cancelled scan no longer pops its approval dialog on
-       every arrival at this tab — that ambushed whoever opened it next,
-       in every session. This line offers the same dialog instead of
-       forcing it; nodes.js's drawDiscStrip hides it when nothing is
+  <!-- Offers the discovery approval dialog rather than forcing it open on
+       arrival; nodes.js's drawDiscStrip hides this when nothing is
        unreviewed. -->
   <div class="bar wrap" id="nd-disc-strip" hidden>
     <span id="nd-disc-strip-text" class="hint"></span>
@@ -167,10 +137,8 @@
       <span class="hint">Tick the box above the rows to select them all</span>
       <span id="nd-count" class="hint"></span>
     </div>
-    <!-- Server-side paging (4.47.0): the full-fleet fetch this table always
-         made cost 2.86 MB decoded and a table fill up to ~1s at 2,000
-         devices. A page size, a prev/next pair and a total answer the
-         question a spinner used to. -->
+    <!-- Server-side paging: the full-fleet fetch this table used to make
+         cost 2.86 MB decoded at 2,000 devices. -->
     <div class="bar wrap">
       <label>Rows per page <select id="nd-page-size">
         <option value="100">100</option>
@@ -183,16 +151,14 @@
       <button id="nd-page-next" aria-label="Next page">Next &rsaquo;</button>
     </div>
     <!-- What a MAC-address search resolved to. Its own line rather than
-         inside the filter bar: it can name several ports, and it must not
-         push the filters around as it appears and disappears. -->
+         inside the filter bar: it can name several ports, and must not push
+         the filters around as it appears and disappears. -->
     <div class="bar wrap" id="nd-mac-note" hidden></div>
     <div class="bar wrap" id="nd-bulk-bar" hidden>
       <span id="nd-bulk-count" class="hint"></span>
       <!-- data-requires-write on the buttons themselves, never on the bar:
-           the bar's visibility is owned by the selection. Every one of these
-           writes, and only Re-identify said so — a read-only account could
-           press Delete on forty devices and get a 403 with nothing to
-           explain it. -->
+           the bar's visibility is owned by the selection, and
+           applyPermissions is hide-only. -->
       <button id="nd-bulk-poll" data-requires-write="nodes">Poll now</button>
       <button id="nd-bulk-identify" data-requires-write="nodes">Re-identify</button>
       <button id="nd-bulk-profile" data-requires-write="nodes">Set profile</button>
@@ -203,12 +169,9 @@
       <button id="nd-bulk-clear">Clear selection</button>
     </div>
     <div class="cols" data-splitter="nodes-devices">
-      <!-- The devices table's own columns ask for more room than the old
-           2/3 split gave them at any laptop width, so the right-most column
-           was cut mid-value before anyone had touched the divider. 3/2 gives
-           the table the larger share instead; LAYOUT_VERSION in app.js is
-           bumped alongside this so a browser holding the old split takes
-           the new one. -->
+      <!-- 3/2, not 2/3: the devices table's own columns need the larger
+           share at laptop widths. LAYOUT_VERSION in app.js is bumped
+           alongside any change here so a stored split is discarded. -->
       <div class="pane" data-grow="3">
         <div class="table-wrap"><table id="nodes-table"></table></div>
       </div>
@@ -222,26 +185,19 @@
             <button id="nd-poll-now" data-requires-write="nodes">Poll now</button>
             <button id="nd-browse-oids">Browse OIDs</button>
             <button id="nd-edit-device" data-requires-write="nodes">Edit</button>
-            <!-- Opens the SSH window (ssh.html) on its own permission
-                 module: ConfigRX write means "may back this device up",
-                 which is a far narrower thing than an interactive shell.
-                 Removing a device now lives inside the Edit dialog. The
-                 "?" is wired by nodes.js's help entry and sits outside any
-                 label, as App.helpLink documents. -->
+            <!-- Opens ssh.html on its own permission module: ConfigRX
+                 write means "may back this device up", far narrower than an
+                 interactive shell. -->
             <button id="nd-ssh-device" data-requires-write="ssh">SSH</button>
             <span id="nd-ssh-help" data-requires-write="ssh"></span>
-            <!-- P1-4: a plain outbound link to the device's own web UI, set
-                 by nodes.js from the selected device's IP. No write gate —
-                 unlike SSH it opens nothing on this server, just a tab in
-                 the browser. -->
+            <!-- A plain outbound link to the device's own web UI, set by
+                 nodes.js from the selected device's IP. No write gate:
+                 unlike SSH it opens nothing on this server. -->
             <a id="nd-web-device" class="linkish" target="_blank" rel="noopener" hidden>WEB</a>
           </div>
           <div id="nd-d-summary" class="nd-summary"></div>
-          <!-- The status timeline, with its own range picker: "how long has
-               it been down" is asked over its own span. Per-metric bandwidth
-               charting is a per-port question and lives in the port dialog
-               (click an interface below), not here; packet loss lives in the
-               device dialog (double-click the device), alongside it. -->
+          <!-- The status timeline has its own range picker: "how long has
+               it been down" is asked over its own span. -->
           <div class="bar">
             <span class="section">STATUS</span>
             <select id="nd-d-range" aria-label="Status timeline range"></select>
@@ -261,21 +217,18 @@
                 <button id="nd-if-export-csv">Export CSV</button></div>
               <div class="table-wrap"><table id="nd-if-table"></table></div>
             </div>
-            <!-- LLDP/CDP rows this device's own ports reported (Tier 1 #5's
-                 UI half). A stale row (present=0) stays listed with its last
-                 seen_ts rather than vanishing — see nodesdb's ageing scheme —
-                 so the "(stale)" hint on that row is real information, not
-                 a bug. -->
+            <!-- LLDP/CDP rows this device's own ports reported. A stale
+                 row (present=0) stays listed with its last seen_ts rather
+                 than vanishing, so "(stale)" is real information. -->
             <div id="nd-d-sub-neighbours" class="subpage">
               <div class="bar"><span class="grow"></span>
                 <button id="nd-nb-export-csv">Export CSV</button></div>
               <div class="table-wrap"><table id="nd-nb-table"></table></div>
             </div>
-            <!-- STP bridge state, the PSE power budget/consumption pair, and
-                 PtP radio RF (RSSI/SNR/capacity and Cambium's own scalars) —
-                 all three are per-device capabilities most devices simply
-                 don't have, so each section says so plainly when absent
-                 rather than showing an empty table. -->
+            <!-- STP state, the PSE power pair and PtP radio RF are
+                 per-device capabilities most devices don't have, so each
+                 says so plainly when absent rather than showing an empty
+                 table. -->
             <div id="nd-d-sub-capabilities" class="subpage">
               <div id="nd-cap-stp" class="hint"></div>
               <div id="nd-cap-poe" class="hint"></div>
@@ -301,15 +254,13 @@
       <button id="nd-topo-reset">Reset view</button>
       <button id="nd-topo-export-csv">Export CSV</button>
     </div>
-    <!-- Solid border for a known device, dashed for one LLDP/CDP reported
-         but nothing in Nodes could confirm — see the legend text below. -->
     <div class="bar wrap">
-      <span class="hint"><svg width="14" height="10" style="vertical-align:-1px"><circle cx="5" cy="5" r="4" fill="var(--ok)"></circle></svg> up
-        &nbsp;<svg width="14" height="10" style="vertical-align:-1px"><circle cx="5" cy="5" r="4" fill="var(--fail)"></circle></svg> down
-        &nbsp;<svg width="14" height="10" style="vertical-align:-1px"><circle cx="5" cy="5" r="4" fill="var(--line)"></circle></svg> unknown/unidentified
+      <span class="hint"><svg width="14" height="10" class="dot-inline"><circle cx="5" cy="5" r="4" fill="var(--ok)"></circle></svg> up
+        &nbsp;<svg width="14" height="10" class="dot-inline"><circle cx="5" cy="5" r="4" fill="var(--fail)"></circle></svg> down
+        &nbsp;<svg width="14" height="10" class="dot-inline"><circle cx="5" cy="5" r="4" fill="var(--line)"></circle></svg> unknown/unidentified
         &nbsp;&mdash; a dashed box is a neighbour nothing in Nodes could be matched to.</span>
     </div>
-    <div id="nd-topo-canvas" class="canvas chart" style="height:65vh">
+    <div id="nd-topo-canvas" class="canvas chart canvas-tall">
       <svg id="nd-topo-svg"></svg>
     </div>
   </div>
@@ -359,15 +310,9 @@
     </div>
   </div>
 
-  <!-- netpath/report.py answers "what was our uptime last month" and "which
-       links came closest to saturation" from history the fleet already
-       stores (400 days of every metric); before this, nothing in the
-       shipped JS ever called either route. Two reports, one subtab: an
-       operator picking a period and, for Availability, a device group, gets
-       the SLA-review number and its worst offenders without scrolling
-       through 2,000 rows in server order; Top-N answers "which N" for
-       whatever metric a review needs. Both are read-only (nodes:read),
-       so a viewer account can use this in full. -->
+  <!-- Two reports over netpath/report.py, one subtab: Availability (a
+       period and optionally a device group) and Top-N. Both are read-only
+       (nodes:read), so a viewer account can use them in full. -->
   <div id="nodes-sub-reports" class="subpage">
     <nav class="subtabs nested">
       <button class="subtab active" data-subtab="availability">AVAILABILITY</button>
@@ -466,12 +411,9 @@
       <span class="hint">Tick the box above the rows to select them all</span>
       <span id="alerts-count" class="hint"></span>
     </div>
-    <!-- Paging past the 2,000-row screen cap (4.47.0): the campaign that
-         found alerts_truncated at fleet scale was an operator paging
-         through an incident looking at a truncated view exactly when
-         completeness mattered. Prev/next walks past the cap; the export
-         button above always gets the whole filtered set regardless of
-         which page is on screen. -->
+    <!-- Paging past the 2,000-row screen cap: prev/next walks past it, and
+         the export button above always gets the whole filtered set
+         regardless of which page is on screen. -->
     <div class="bar wrap" id="alerts-pager" hidden>
       <button id="alerts-page-prev" aria-label="Previous page">&lsaquo; Prev</button>
       <span id="alerts-page-summary" class="hint"></span>
@@ -816,10 +758,6 @@
         <button id="ipam-edit-subnet" data-requires-write="ipam">Edit</button>
         <button id="ipam-add-subnet" class="primary" data-requires-write="ipam">Add</button>
       </div>
-      <!-- The alive/seen-before/never-seen legend used to be repeated here
-           a third time: the subnet donut (ipam.js) now carries a centre
-           figure and its own legend, and the table's own status column
-           already says the same word per row. -->
       <div class="table-wrap"><table id="ipam-subnet-table"></table></div>
     </aside>
     <div class="divider"></div>
@@ -848,15 +786,14 @@
       addresses — either directly on the wire across two scans, or the wire disagrees with what
       the DHCP server's own lease record says. Neither side clears itself; mark one resolved once
       you know what happened.</p>
-    <div class="table-wrap pad-x pad-b" style="flex:1"><table id="ipam-conflicts-table"></table></div>
+    <div class="table-wrap pad-x pad-b"><table id="ipam-conflicts-table"></table></div>
   </div>
 
   <div id="ipam-sub-dhcp" class="subpage">
-    <!-- Shown instead of the form on a host with no PowerShell: reading a
-         Windows DHCP server needs it, and the whole subtab rendered in full
-         on Linux with Windows-only help text and no hint it could not work.
-         ipam.js unhides one of these two on start-up from /api/platform. -->
-    <div id="ipam-dhcp-unavailable" class="pad-x pad-b" hidden style="padding-top:14px">
+    <!-- Shown instead of the form on a host with no PowerShell, which
+         reading a Windows DHCP server needs. ipam.js unhides one of these
+         two on start-up from /api/platform. -->
+    <div id="ipam-dhcp-unavailable" class="pad-x pad-b pad-t" hidden>
       <h2>DHCP is a Windows feature</h2>
       <p class="hint" id="ipam-dhcp-unavailable-why"></p>
     </div>
@@ -918,9 +855,8 @@
   <div class="bar wrap">
     <label>Search <input id="wl-q" size="26" placeholder="AP name, MAC or model"></label>
     <label>Controller <select id="wl-controller"><option value="">All controllers</option></select></label>
-    <!-- One age for the whole page: every AP in the list was reported by
-         the same controller poll, so a per-AP "last seen" said the same
-         thing on every row. -->
+    <!-- One age for the whole page: every AP was reported by the same
+         controller poll. -->
     <span id="wl-last-reported" class="hint"></span>
     <label>Show <select id="wl-state">
       <option value="all" selected>All</option>
@@ -946,11 +882,9 @@
     <header class="bar">
       <span id="wl-detail-name" class="section">AP DETAIL</span>
       <span class="grow"></span>
-      <!-- No data-requires-write here: these are shown dynamically per
-           selection, so drawApActions() owns their .hidden and checks
-           canWrite itself (applyPermissions only ever hides, and a
-           one-shot hide can't gate a control that feature code shows
-           later). -->
+      <!-- No data-requires-write here: drawApActions() shows these per
+           selection and checks canWrite itself, because applyPermissions
+           only ever hides and cannot gate a control shown later. -->
       <button id="wl-oos" data-requires-write="wireless" hidden>Mark out of service</button>
       <button id="wl-remove-ap" data-requires-write="wireless" hidden>Remove</button>
     </header>
@@ -986,13 +920,10 @@
     <span class="grow"></span>
       <span class="hint">Tick the box above the rows to select them all</span>
   </div>
-  <!-- data-requires-write sits on the buttons, not the bar:
-       drawBulkBar() owns the bar's .hidden (selection), the attribute
-       gates the actions. applyPermissions() is one-way (hide only), so
-       these no longer fight even on the same element — but a
-       selection-shown container still must not carry the attribute, or a
-       read-only account's bar would be hidden once and never legitimately
-       shown. Same shape as the Nodes bulk bar. -->
+  <!-- data-requires-write on the buttons, not the bar: drawBulkBar() owns
+       the bar's .hidden. A selection-shown container must never carry the
+       attribute, or applyPermissions' one-way hide would keep it hidden
+       for a read-only account forever. -->
   <div class="bar wrap" id="cx-bulk-bar" hidden>
     <span id="cx-bulk-count" class="hint"></span>
     <button id="cx-bulk-settings" data-requires-write="configrx">Settings for selected</button>
@@ -1014,19 +945,15 @@
     <header class="bar wrap">
       <span id="cx-backup-header" class="section">BACKUPS</span>
       <span class="grow"></span>
-      <!-- Diffs the selected row against the next-OLDER one in this list —
-           the one-click "what changed last time" case; ConfigRX diff (Tier
-           2) picking two specific backups instead is the checkbox pair
-           below. Hidden until a backup with an older neighbour is selected
-           — see selectBackup/drawBackups. -->
+      <!-- Diffs the selected row against the next-OLDER one: the one-click
+           "what changed last time". Picking two specific backups is the
+           checkbox pair below. -->
       <button id="cx-backup-diff-prev" data-requires-write="configrx" hidden>Diff with previous</button>
       <button id="cx-backup-now" data-requires-write="configrx" hidden>Back up now</button>
       <button id="cx-device-settings" data-requires-write="configrx" hidden>Device settings</button>
     </header>
-    <!-- data-requires-write sits on the Delete/Diff buttons, not the bar:
-         the bar is shown by the selection, and applyPermissions() is
-         hide-only, so a hidden bar that later reappears would bring the
-         buttons back. Diff selected only ever appears once exactly two
+    <!-- data-requires-write on the Delete/Diff buttons, not the bar (see
+         the bulk bar above). Diff selected appears only once exactly two
          rows are ticked — see drawBackupBulkBar. -->
     <div class="bar wrap" id="cx-backup-bulk" hidden>
       <span id="cx-backup-bulk-count" class="hint"></span>
@@ -1047,9 +974,7 @@
     <div id="cx-device-compliance" class="hint"></div>
     <pre id="cx-viewer" class="detail" data-empty="Select a device to see its stored backups."></pre>
     <!-- Replaces the plain viewer above while a diff is open (see
-         showDiff/closeDiff): a unified diff, coloured line-by-line with the
-         same tokens the rest of the product uses for "added"/"removed" —
-         see app.css's .cx-diff-add/.cx-diff-rem. -->
+         showDiff/closeDiff). -->
     <div id="cx-diff-wrap" hidden>
       <p id="cx-diff-meta" class="hint"></p>
       <pre id="cx-diff" class="detail"></pre>
@@ -1058,12 +983,10 @@
   </div>
   </div>
 
-  <!-- Cross-device search (netpath/configrx_search.py): a query nothing
-       else in ConfigRX can answer, over every device's latest stored
-       (always redacted, regardless of that device's own store_secrets
-       setting) capture. Read-only end to end — see configrx_search.py's
-       own module docstring for why a search index built only from redacted
-       text is what makes that safe. -->
+  <!-- Cross-device search over every device's latest stored capture,
+       always redacted regardless of that device's own store_secrets
+       setting. Read-only end to end: the index is built only from redacted
+       text, which is what makes it safe. -->
   <div id="configrx-sub-search" class="subpage">
    <div class="bar wrap">
     <label>Query <input id="cxse-q" size="30" placeholder="e.g. snmp-server community public"></label>
@@ -1088,10 +1011,9 @@
    <div id="cxse-wrap" class="table-wrap" hidden><table id="cxse-results"></table></div>
   </div>
 
-  <!-- Compliance rule sets (netpath/configrx_compliance.py): named must-
-       match/must-not-match rules scoped to a device group, evaluated after
-       every capture and on the hourly sweep, with one pass/fail result per
-       device stored rather than recomputed on every view. -->
+  <!-- Compliance rule sets: named must-match/must-not-match rules scoped
+       to a device group, evaluated after every capture and on the hourly
+       sweep, with one stored result per device. -->
   <div id="configrx-sub-compliance" class="subpage">
    <div class="cols" data-splitter="configrx-compliance-body">
     <div class="pane pad-x pad-b" data-grow="1">
@@ -1162,7 +1084,7 @@
     <button id="dbg-clear">Clear</button>
     <button id="dbg-export">Export</button>
   </header>
-  <div class="cols pad-x pad-b" data-splitter="debug-events" style="flex:1;min-height:0">
+  <div class="cols pad-x pad-b" data-splitter="debug-events">
     <div class="pane" data-grow="3"><div class="table-wrap"><table id="dbg-events"></table></div></div>
     <div class="divider"></div>
     <div class="pane" data-grow="2"><pre id="dbg-detail" class="detail" data-empty="Select an event to see its detail — the exact command that ran and the raw output it returned."></pre></div>
@@ -1173,11 +1095,8 @@
 
 <!-- =========================== SETTINGS ============================ -->
 <section id="page-settings" class="page">
-  <!-- Eleven fieldsets used to be one 3,760px scroll with no way to jump
-       partway down it. Seven subtabs, same nav/subpage/recallSub grammar as
-       every other multi-section page, so #/settings/users is addressable
-       and a page-wide search for "where do I change X" has somewhere
-       shorter to look than Ctrl-F over the whole thing. -->
+  <!-- Seven subtabs, the same nav/subpage/recallSub grammar as every other
+       multi-section page, so #/settings/users is addressable. -->
   <nav class="subtabs">
     <button class="subtab active" data-subtab="general">GENERAL</button>
     <button class="subtab" data-subtab="retention">DATA &amp; RETENTION</button>
@@ -1188,24 +1107,19 @@
     <button class="subtab" data-subtab="modules">MODULES</button>
     <button class="subtab" data-subtab="audit">AUDIT</button>
   </nav>
-  <!-- Each subpage carries .scroll itself (rather than one shared wrapper
-       around all seven) so it is a direct child of .page, a sibling of the
-       nav above, exactly like every other multi-section page's subpages —
-       the shape App.wireSubtabGroups (app.js) pairs a .subtab with its
-       .subpage by. A shared wrapper here left the subpages nested one
-       level too deep for that pairing to find them. -->
-  <p class="hint pad-x" style="padding-top:10px">
+  <!-- Each subpage carries .scroll itself rather than sharing one wrapper,
+       so it stays a direct child of .page and a sibling of the nav — the
+       shape App.wireSubtabGroups pairs a .subtab with its .subpage by. -->
+  <p class="hint pad-x pad-t-sm">
     These apply across every module. NetPath's worker pool, retention and
     destination defaults are under Settings on the NetPath tab; the
     collector's listener, sampling and storage are under Settings on the
     NetFlow tab.
   </p>
     <div id="settings-sub-general" class="subpage scroll active">
-    <!-- Appearance (theme, and now the wall-display/kiosk launcher) is a
-         per-browser choice, not a server setting, and used to lead this
-         page ahead of every setting that actually lives on the server. It
-         now lives in the Account dialog, reachable from every page; this is
-         the pointer left in its old place. -->
+    <!-- Appearance (theme, and the wall-display launcher) is a per-browser
+         choice, not a server setting, so it lives in the Account dialog.
+         This is the pointer left in its old place. -->
     <p class="hint">Appearance — theme and the wall-display view — moved to
       <button type="button" class="linkish" id="open-account-appearance">Account</button>
       in the top bar, since it is a per-browser choice rather than a server
@@ -1315,8 +1229,8 @@
       <p class="hint">Your own password is changed from the <b>Account</b> button in the top
         bar, reachable regardless of what you have access to here — everything below needs
         write access to Settings.</p>
-      <div class="table-wrap" style="max-height:220px"><table id="users-table"></table></div>
-      <div class="row" style="margin-top:10px">
+      <div class="table-wrap short"><table id="users-table"></table></div>
+      <div class="row gap-t">
         <input id="new-username" placeholder="username" size="18" aria-label="New username">
         <input id="new-password" type="password" placeholder="initial password" size="22" aria-label="Initial password">
         <button type="button" id="gen-password" aria-label="Generate a random initial password">Generate</button>
@@ -1326,12 +1240,10 @@
         <label class="check"><input type="radio" name="new-auth-source" id="new-auth-ldap" value="ldap">
           Sign in via LDAP directory</label>
       </div>
-      <!-- Twelve modules times three raw radios, with a staged Apply beside
-           it, used to be the only way to grant anyone anything. A preset
-           sets the whole grid in one click; "copy from" repeats an account
-           that already has the shape a new one needs; either still leaves
-           every radio open to a one-off change afterwards, which switches
-           the preset back to Custom (see settings.js). -->
+      <!-- A preset sets the whole twelve-module grid in one click; "copy
+           from" repeats an account that already has the shape a new one
+           needs. Either still leaves every radio open to a one-off change,
+           which switches the preset back to Custom (settings.js). -->
       <div class="row" id="new-perm-tools">
         <label>Role <select id="new-perm-preset">
           <option value="custom">Custom</option>
@@ -1377,11 +1289,11 @@
         client refuses to do it until this is switched on. Prefer <code>ldaps://</code> instead of
         turning this on wherever the directory supports it.</p>
       <label>Connection timeout <input type="number" id="set-ldap-timeout" min="1" max="120" step="1"> s</label>
-      <div class="row" style="margin-top:8px">
+      <div class="row gap-t-sm">
         <button id="ldap-apply" data-requires-write="admin">Save directory settings</button>
       </div>
       <p class="hint" id="ldap-status"></p>
-      <div class="row" style="margin-top:8px">
+      <div class="row gap-t-sm">
         <input id="ldap-test-username" placeholder="test username" size="16" aria-label="Test username">
         <input id="ldap-test-password" type="password" placeholder="test password" size="18" aria-label="Test password">
         <button id="ldap-test" type="button" data-requires-write="admin">Test connection</button>
@@ -1397,8 +1309,8 @@
         so an unattended script does not have to hold a person's password against the sign-in
         timeout above. Send it as <code>Authorization: Bearer &lt;token&gt;</code>. The token
         itself is shown once, right after you create it, and never again.</p>
-      <div class="table-wrap" style="max-height:220px"><table id="tokens-table"></table></div>
-      <div class="row" style="margin-top:10px">
+      <div class="table-wrap short"><table id="tokens-table"></table></div>
+      <div class="row gap-t">
         <input id="new-token-username" placeholder="account username" size="16" aria-label="Token account username">
         <input id="new-token-label" placeholder="label — what this is for" size="26" aria-label="Token label">
         <input id="new-token-expires" type="number" min="1" step="1" placeholder="expires in days (blank = never)" size="12" aria-label="Token expiry, in days">
@@ -1433,9 +1345,8 @@
 
     <fieldset>
       <legend>MAINTENANCE</legend>
-      <!-- .wrap because this row carries nine buttons with sentence-length
-           labels: .row alone cannot wrap, so every label folded onto two
-           lines at 1366px rather than the row folding onto two rows. -->
+      <!-- .wrap because this row carries nine sentence-length labels: .row
+           alone cannot wrap, so the labels fold instead of the row. -->
       <div class="row wrap">
         <button data-maint="redns" data-requires-write="settings">Re-run reverse DNS</button>
         <button data-maint="prune_traces" data-requires-write="settings">Delete old traces</button>
@@ -1451,10 +1362,8 @@
     </fieldset>
     </div>
 
-    <!-- One place that answers "where is the setting for X" without already
-         knowing: module settings otherwise live in one place — a button on
-         each module's own strip, and nowhere else — so this lists all nine
-         and opens the same dialog the module's own button does. -->
+    <!-- Module settings otherwise live only on each module's own strip, so
+         this lists all nine and opens the same dialog that button does. -->
     <div id="settings-sub-modules" class="subpage scroll">
     <fieldset>
       <legend>MODULE SETTINGS</legend>
@@ -1465,15 +1374,10 @@
     </fieldset>
     </div>
 
-    <!-- The on-disk audit trail (appdb.py's audit table) is written and
-         served (GET /api/audit) and, before this, had no page anywhere
-         that read it — the one feature whose entire purpose is to be read
-         by a person, unreadable by any person. Read-only throughout:
-         there is nothing here that writes to the trail, matching the API
-         underneath it exactly. Addressable at #/settings/audit, and its
-         target filter reads ?target=<kind>:<value> from the URL (query
-         below), so a device's own page can one day link straight to its
-         own history the same way target itself already names it. -->
+    <!-- The on-disk audit trail (appdb.py's audit table, GET /api/audit).
+         Read-only throughout — nothing here writes to the trail, matching
+         the API underneath it. Addressable at #/settings/audit, and its
+         target filter reads ?target=<kind>:<value> from the URL. -->
     <div id="settings-sub-audit" class="subpage scroll">
     <fieldset>
       <legend>AUDIT TRAIL</legend>
@@ -1492,8 +1396,8 @@
         <button id="audit-apply">Search</button>
         <button id="audit-clear">Clear</button>
       </div>
-      <div class="table-wrap" style="max-height:420px"><table id="audit-table"></table></div>
-      <div class="row" style="margin-top:6px">
+      <div class="table-wrap tall"><table id="audit-table"></table></div>
+      <div class="row gap-t-xs">
         <span class="hint" id="audit-status"></span>
         <span class="grow"></span>
         <button id="audit-more" hidden>Load older</button>
@@ -1510,31 +1414,22 @@
 </section>
 </main>
 
-<!-- Where anything that only mutated a button label or a status line
-     also gets said out loud. One region for the whole application:
-     several would compete, and a screen reader would read whichever
-     changed last rather than what just happened. -->
+<!-- Where anything that only mutated a button label or a status line also
+     gets said out loud. One region for the whole application: several
+     would compete for what a screen reader reads. -->
 <div id="live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
 <!-- The visible half of the line above. App.toast writes here; the same
-     text has already gone through App.announce into #live, so this copy is
-     hidden from assistive technology rather than being read out twice. -->
+     text already went through App.announce into #live, so this copy is
+     hidden from assistive technology rather than read out twice. -->
 <div id="toasts" class="toasts" aria-hidden="true"></div>
 
 <div id="modal" class="modal" hidden><div class="modal-box" id="modal-box"></div></div>
 
-<!-- `defer` on both scripts below, and never on boot.js above: they
-     download in parallel while the markup parses and run in this order,
-     finishing before DOMContentLoaded — which is also what makes app.js's
-     start-up ordering sound (see the end of app.js). boot.js must keep
-     blocking: its whole job is to run before <body>.
-
-     The other eleven modules — everything but Dashboard — used to sit
-     here too, thirteen unconditional <script defer> tags totalling 1.17 MB
-     uncompressed on every single visit, most of it for tabs a given
-     operator may never open. Each of those now loads the first time its
-     own tab is actually selected (app.js's ensureModuleReady), not before
-     — there is nothing to tag here for a script that may never be
-     fetched at all. -->
+<!-- `defer` on both, and never on boot.js above: they download in
+     parallel and run in this order, before DOMContentLoaded, which is what
+     makes app.js's start-up ordering sound. Every other module is fetched
+     the first time its own tab is selected (app.js's ensureModuleReady),
+     so it has no tag here at all. -->
 <script src="/app.js?v=__SW_VERSION__" defer></script>
 <script src="/dashboard.js?v=__SW_VERSION__" defer></script>
 </body>

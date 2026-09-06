@@ -1,35 +1,9 @@
-"""UPS-MIB battery/output health (RFC 1628) and the device-level
-ENTITY-SENSOR-MIB environmental read (RFC 3433) -- the gap: a UPS's own
-*traps* were already decoded (trapoids.py) and its enterprise arc already
-named a vendor (enterprises.py, nodeoids.VENDOR_HEALTH's neighbours), but
-nothing ever asked a UPS how it was doing, and an environmental monitor's
-sensors were reachable only through read_dom()'s interface dialog, which
-requires an ifIndex mapping a chassis sensor never has.
-
-Four sections, matching the four things asked for:
-  1. nodeoids.UPS_HEALTH decoded correctly off real BER wire responses,
-     through the actual poll path (nodepoll._poll_snmp_scalars) --
-     including the /10 voltage scale, the column_first/column_max table
-     reductions, the "not a UPS" cost gate, and the APC TimeTicks runtime
-     fallback.
-  2. nodepoll._decode_entity_sensor's RFC 3433 arithmetic against synthetic
-     scale/precision combinations, including a negative exponent.
-  3. A sensor with no ifIndex mapping now visible at DEVICE level
-     (_poll_environment) while read_dom()'s own, unchanged, port-only view
-     still sees only what it always saw -- AND that a temperature reading
-     lands in temp_optic_c/temp_ambient_c/temp_chassis_c correctly, the fix
-     for a real false-positive incident this shipped with for about a day
-     (one "temp_c" key covering a room, a chassis and an SFP's DOM at once
-     read as ten false "Temperature high" alerts on a healthy fleet). The
-     "cannot be determined" case (no humidity sensor anywhere on the
-     device) must default to chassis, never ambient.
-  4. Each new built-in alert rule (alertsdb._BUILTIN_RULES) opening and
-     clearing against synthetic metric samples, through a real AlertEngine
-     tick -- not evaluate_threshold alone.
-  5. alertsdb's _retire_temp_high migration: an installation that already
-     seeded the old single "temp_high" rule gets it disabled (not deleted
-     -- that would cascade-delete its alert history) and its open alerts
-     resolved with an explanatory note, on the next startup.
+"""UPS-MIB health (RFC 1628) and device-level ENTITY-SENSOR-MIB reads (RFC 3433).
+Covers: nodeoids.UPS_HEALTH decoded off real BER responses through the poll
+path (voltage scale, table reductions, "not a UPS" gate, APC runtime fallback);
+_decode_entity_sensor's scale/precision arithmetic; sensors without an ifIndex
+visible at device level and landing in the right temp_optic/ambient/chassis_c
+key; the built-in alert rules through a real AlertEngine tick; _retire_temp_high.
 """
 import os
 import socket

@@ -57,14 +57,10 @@
     request: 0,
   };
 
-  // One implementation, in app.js. This was twelve copies of the same
-  // three lines, which is how one of them came to be missing a
-  // character while the others were not.
   const escape = App.escapeHtml;
 
   const clampSpan = (s) => Math.min(Math.max(s, 60), 2592000 * 4);
 
-  // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = App.ago;
 
   // How many flow records the table asks the server for. The select's three
@@ -127,11 +123,7 @@
 
   function filters() {
     return {
-      dimension: App.el('nf-dimension').value,
-      src: App.el('nf-src').value.trim(),
-      dst: App.el('nf-dst').value.trim(),
-      port: App.el('nf-port').value.trim(),
-      protocol: App.el('nf-protocol').value,
+      ...App.filterValues('nf', ['dimension', 'src', 'dst', 'port', 'protocol']),
       // The exporter list is filled from the response below, so on the load
       // after a reload the restored choice is not on the element yet and the
       // first fetch would ignore it. Once the list exists the control answers
@@ -667,17 +659,14 @@
 
   function settingsDialog() {
     const s = App.state.flowSettings || {};
-    const check = (id, label, on) =>
-      `<label class="check"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}> ${label}</label>`;
-    const number = (id, label, value, attrs = '') =>
-      `<label>${label} <input id="${id}" type="number" ${attrs} value="${value}"></label>`;
+    const { check, number } = App.form;
     const settingsBox = App.modal('NetFlow settings', `
       <fieldset><legend>COLLECTOR</legend>
         ${check('n-enabled', 'Run the collector', s.enabled)}
-        <label>Bind address <input id="n-bind" value="${escape(s.bind_address)}"></label>
+        ${App.form.text('n-bind', 'Bind address', escape(s.bind_address))}
         ${number('n-port', 'UDP port', s.port, 'min=1 max=65535')}
         ${number('n-buffer', 'Receive buffer (KB)', s.socket_buffer_kb, 'min=64')}
-        <div class="row" style="justify-content:flex-start;gap:14px">
+        <div class="row start">
           ${check('n-v5', 'v5', s.accept_v5)}
           ${check('n-v9', 'v9', s.accept_v9)}
           ${check('n-ipfix', 'IPFIX', s.accept_ipfix)}
@@ -715,9 +704,7 @@
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
         { queued: 'Saving…', done: 'Saved' }, (async () => {
-        const on = (id) => box.querySelector(id).checked;
-        const num = (id) => Number(box.querySelector(id).value);
-        const text = (id) => box.querySelector(id).value.trim();
+        const { on, num, text } = App.form.readers(box);
         await App.post('/api/settings', { scope: 'netflow', values: {
           enabled: on('#n-enabled'), bind_address: text('#n-bind'),
           port: num('#n-port'), socket_buffer_kb: num('#n-buffer'),
@@ -796,30 +783,6 @@
   function drawStatus() {
     const server = App.state.serverState || {};
     const collector = server.collector || { counters: {}, decoder: {} };
-
-    const text = collector.status || 'Collector stopped';
-    const failed = /^Could not bind/.test(text);
-    const status = App.el('nf-status');
-    App.setText(status, text);
-    if (status.title !== text) status.title = text;
-    if (status.classList.contains('error') !== failed) status.classList.toggle('error', failed);
-    // Wired once, reading the live title, rather than a fresh closure ten
-    // times a second from fastTick.
-    if (!status.onmousemove) {
-      status.tabIndex = 0;
-      status.onmousemove = (event) => App.tooltip(status.title, event);
-      status.onmouseleave = App.hideTooltip;
-      status.onfocus = () => {
-        const box = status.getBoundingClientRect();
-        App.tooltip(status.title, { clientX: box.left + box.width / 2, clientY: box.bottom });
-      };
-      status.onblur = App.hideTooltip;
-    }
-
-    App.setBg(App.el('nf-dot'), collector.running
-      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)'));
-    App.setText(App.el('nf-toggle'), collector.running ? 'Stop collector' : 'Start collector');
-
     const counters = collector.counters || {};
     const decoder = collector.decoder || {};
     const parts = [`${counters.packets || 0} packets`,
@@ -844,7 +807,8 @@
       const age = Math.round((Date.now() - view.fetchedAt) / 1000);
       parts.push(`charts ${age}s old`);
     }
-    App.setText(App.el('nf-counters'), parts.join(' · '));
+    App.strip('nf', collector, { stopped: 'Collector stopped', start: 'Start collector',
+      stop: 'Stop collector', parts, tooltip: true });
   }
 
   async function refresh() {
@@ -1010,19 +974,8 @@
     // the flow table").
     App.el('nf-settings').onclick = settingsDialog;
     App.el('nf-test').onclick = sendTestPacket;
-    App.el('nf-toggle').onclick = async () => {
-      const running = (App.state.serverState.collector || {}).running;
-      await App.post('/api/netflow/collector', { action: running ? 'stop' : 'start' });
-      await App.loadState();
-      refresh();
-    };
-    // Dragging a divider changes the drawing area, so the SVG has to be
-    // rebuilt for the new size, not just stretched.
-    for (const event of ['resize', 'panes-resized']) {
-      window.addEventListener(event, () => {
-        if (App.state.tab === 'netflow') drawChart();
-      });
-    }
+    App.wireToggle('nf-toggle', 'collector', '/api/netflow/collector', refresh);
+    App.onRelayout('netflow', drawChart);
 
     // Restored before resetWindow(), which reads the range straight off
     // nf-range to size the first window — after it, the window would be

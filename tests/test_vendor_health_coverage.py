@@ -1,9 +1,8 @@
-"""The vendor-health coverage sweep's two additions to nodeoids.VENDOR_HEALTH:
-CISCO-ENVMON-MIB temperature (Cisco had none at all — 862 of the review's
-2,000-device estate are Cisco 2960X access switches) and JUNIPER-MIB
-jnxOperatingBuffer memory (Juniper had cpu_pct/temp_chassis_c but no
-mem_pct). Both decoded off real BER wire responses through the actual poll
-path (nodepoll._poll_vendor_health), not asserted by inspection.
+"""Two additions to nodeoids.VENDOR_HEALTH: CISCO-ENVMON-MIB temperature
+(Cisco had none at all) and JUNIPER-MIB jnxOperatingBuffer memory (Juniper
+had cpu_pct/temp_chassis_c but no mem_pct). Both decoded off real BER wire
+responses through the actual poll path (nodepoll._poll_vendor_health), not
+asserted by inspection.
 """
 from _paths import spawn_stub, tmpdir
 

@@ -1,14 +1,9 @@
-"""4.49.0: DELETE /api/alerts/rules/<id> refuses to delete a CUSTOM rule
-that has raised real alert history, naming the count and offering the
-alternative in the same sentence — rules.id is alerts.rule_id's own
-ON DELETE CASCADE parent, so deleting a rule with history used to
-silently destroy every alert it ever raised, resolved history included,
-behind a confirmation dialog that only ever asked "Remove <name>?".
-
-alertsdb.alert_count_for_rule/remove_rule (the storage-layer half of this
-fix) are covered by test_alertsdb_rollup_and_rules.py; this suite is the
-API layer: the actual HTTP refusal message, that nothing gets deleted
-when it fires, and that a rule with no history still deletes normally.
+"""DELETE /api/alerts/rules/<id> refuses to delete a CUSTOM rule that has raised
+real alert history, naming the count and offering the alternative in the
+same sentence: rules.id is alerts.rule_id's ON DELETE CASCADE parent, so the
+delete would destroy every alert the rule ever raised. The storage half is
+covered by test_alertsdb_rollup_and_rules.py; this suite is the HTTP refusal
+message, that nothing is deleted when it fires, and the no-history delete.
 """
 import http.client
 import json

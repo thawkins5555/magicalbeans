@@ -22,33 +22,15 @@ from email.message import EmailMessage
 from email.utils import formataddr
 from urllib.parse import urlparse
 
-# O-60: severity used to live only in the sign-off, "-- SappiWhere, error",
-# where it cost a tap to see. Invisible at rehearsal scale (a handful of
-# emails an hour) and obvious at real scale: Tier B's single site outage
-# produced 29 near-identical subjects differing only by device name, and the
-# one fact that decides whether an operator gets out of bed — is this
-# critical or informational — sat at the bottom of the body. Every subject
-# below now leads with {{severity_tag}} (see build_context — a bracketed,
-# upper-case severity name, "[CRITICAL]") instead. The sign-off drops
-# {{severity_name}} in the same change: once it is in the subject, a
-# sign-off ending in a bare severity word ("-- SappiWhere, error") reads as
-# a truncation, not information, so it is just "-- SappiWhere" now.
-#
-# This does not reopen the mail-threading question it looks like it would.
-# A renotify of a still-open alert reuses this same template against the
-# SAME alert row, whose severity does not change while it stays open, so
-# every "still open" email for one alert carries the same tag. A clear
-# renders a DIFFERENT template (device_up, unconditionally — see
-# alertengine._notify_clear) with different subject wording already, so an
-# open notice and its eventual recovery notice were never going to thread
-# together by subject text, tag or no tag.
-#
-# Existing installs: changing the dict here only seeds a NEW alerts.db
-# (_seed_templates is INSERT OR IGNORE). Reaching an existing, unedited
-# install is alertsdb._PREVIOUS_BUILTIN_TEMPLATES/_migrate_templates's job —
-# every template below has its pre-this-change text added there so the
-# upgrade is not silently new-installs-only, the same discipline 4.32.0's
-# device_up wording change already established.
+from .worker import Worker
+
+# Every subject leads with {{severity_tag}}: whether an alert is critical
+# or informational is what decides whether an operator gets out of bed,
+# and a site outage produces subjects that otherwise differ only by
+# device name. Changing a template here only seeds a NEW alerts.db
+# (_seed_templates is INSERT OR IGNORE); reaching an existing, unedited
+# install is alertsdb._PREVIOUS_BUILTIN_TEMPLATES/_migrate_templates's
+# job, so every change here needs its old text added there too.
 BUILTIN_TEMPLATES = {
     "device_down": {
         "name": "Device not responding",
@@ -230,8 +212,7 @@ def build_context(alert_row, rule_row, extra: dict | None = None) -> dict:
         "severity_name": SEVERITY_NAMES[severity] if 0 <= severity <= 7 else str(severity),
         # A bracketed, upper-case tag for the front of a subject line —
         # "[CRITICAL]" — so severity is legible in a notification preview
-        # without opening the message. See O-60: the same fact severity_name
-        # already carries, just where it is actually read first.
+        # without opening the message.
         "severity_tag": "[{}]".format(
             (SEVERITY_NAMES[severity] if 0 <= severity <= 7 else str(severity)).upper()),
         "count": alert_row["count"],
@@ -396,7 +377,7 @@ class MailJob:
     alert_ids: list | None = None
 
 
-class MailQueue:
+class MailQueue(Worker):
     """A bounded queue of MailJobs drained by one worker thread.
 
     Sending used to happen inline on the alert engine's tick. At the shipped
@@ -419,6 +400,8 @@ class MailQueue:
     needs that database to have its own lock — AlertsDatabase does.
     """
 
+    THREAD_NAME = "alert-mail"
+
     def __init__(self, *, maxsize: int = QUEUE_SIZE, on_result=None,
                  on_breaker=None, failures_to_open: int = BREAKER_FAILURES,
                  cooldown_s: float = BREAKER_COOLDOWN_S):
@@ -429,24 +412,17 @@ class MailQueue:
         self.cooldown_s = float(cooldown_s)
         self._lock = threading.Lock()
         self._stopping = threading.Event()
-        self._thread: threading.Thread | None = None
         self._busy = False
         self._failures = 0
         self._open_since: float | None = None
 
     # ------------------------------------------------------------ lifecycle
 
-    @property
-    def running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
-
     def start(self) -> None:
         if self.running:
             return
         self._stopping.clear()
-        self._thread = threading.Thread(target=self._run, name="alert-mail",
-                                        daemon=True)
-        self._thread.start()
+        self._spawn(target=self._run)
 
     def stop(self) -> None:
         """Ask the worker to finish and wait up to two seconds for it.
@@ -456,11 +432,8 @@ class MailQueue:
         for a dead relay is a shutdown that appears to hang. The thread is a
         daemon, so an abandoned send cannot keep the process alive.
         """
-        thread = self._thread
-        self._thread = None
         self._stopping.set()
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
+        self._join()
 
     # -------------------------------------------------------------- submit
 
@@ -477,10 +450,6 @@ class MailQueue:
 
     def depth(self) -> int:
         return self._queue.qsize()
-
-    def breaker_open(self) -> bool:
-        with self._lock:
-            return self._open_since is not None
 
     def wait_idle(self, timeout: float = 5.0) -> bool:
         """True once nothing is queued and nothing is in flight. For callers
@@ -585,9 +554,9 @@ class MailQueue:
 
 # --------------------------------------------------------- outbound webhook
 
-# ~40 lines of urllib buys Slack, Teams, PagerDuty and every ticketing
-# system at once, per the review this shipped from: one HTTP POST, JSON
-# body, at the same points email already fires. The JSON shape is FIXED —
+# One HTTP POST with a JSON body, at the same points email already fires,
+# reaches Slack, Teams, PagerDuty and every ticketing system. The JSON shape
+# is FIXED —
 # not run through the {{token}} template engine the way the subject line is
 # — so a receiver can parse it without knowing this application's template
 # syntax. It is documented here, once, rather than only in whichever engine
@@ -705,7 +674,7 @@ class WebhookJob:
     alert_ids: list | None = None
 
 
-class WebhookQueue:
+class WebhookQueue(Worker):
     """A bounded queue of WebhookJobs drained by one worker thread — the
     same shape as MailQueue and for the same reason: a slow or dead
     receiver must cost the worker thread time, never the engine tick, which
@@ -719,32 +688,24 @@ class WebhookQueue:
     about for a channel the spec deliberately keeps simple.
     """
 
+    THREAD_NAME = "alert-webhook"
+
     def __init__(self, *, maxsize: int = WEBHOOK_QUEUE_SIZE, on_result=None):
         self._queue: queue.Queue = queue.Queue(maxsize=max(1, int(maxsize)))
         self._on_result = on_result
         self._stopping = threading.Event()
-        self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._busy = False
-
-    @property
-    def running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
 
     def start(self) -> None:
         if self.running:
             return
         self._stopping.clear()
-        self._thread = threading.Thread(target=self._run, name="alert-webhook",
-                                        daemon=True)
-        self._thread.start()
+        self._spawn(target=self._run)
 
     def stop(self) -> None:
-        thread = self._thread
-        self._thread = None
         self._stopping.set()
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
+        self._join()
 
     def submit(self, job: WebhookJob) -> bool:
         if not self.running:

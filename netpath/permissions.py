@@ -1,32 +1,11 @@
-"""The per-module read/write permission model. Deliberately its own small
-module rather than folded into appdb.py or eventlog.py: eventlog.CATEGORIES
-is a different, non-matching taxonomy (built for the Debug page's log
-filter, missing Syslog/Dashboard/Settings/Debug, including non-module
-system/error categories) and was never meant to double as an authorization
-module list.
-
-MODULES is the exhaustive list of gate-able modules — one per top-level
-tab, including the two added alongside this feature (Wireless, ConfigRX),
-plus "ssh", the one entry with no tab of its own: an interactive shell on a
-device is a different power from reading or backing up its config, so it is
-its own module, granted to nobody by default.
-"dashboard" is intentionally excluded: it's an aggregate view of whatever
-other modules a user can already read, not a module with its own data to
-gate (see api.get_state's per-section filtering).
-
-configrx's read tier is the least obvious grant in this table, so it is
-worth stating plainly what it hands over: GET /api/configrx/backups/<id>
-gives a configrx:read account a device's stored configuration verbatim —
-secrets redacted, but topology intact, meaning interface addressing, ACLs,
-routes and VPN peers for every device with a capture on file. Reading one
-backup's content used to require write, the same as every other module's
-read/write split; a security review ahead of 4.48.1 raised the question
-of whether "read" should carry that much and the operator's answer was
-yes, on the reasoning that seeing what changed on a switch is the point
-of the module and should not itself require the permission to change one
-(see server.py's ROUTES comment beside that route for the fuller
-argument). Granting configrx:read is granting that, not merely "may see
-backup metadata" — know it before handing it out.
+"""The per-module read/write permission model. MODULES is the exhaustive
+list of gate-able modules — one per top-level tab, plus "ssh" (an
+interactive shell is a different power from reading/backing up a config,
+granted to nobody by default). configrx:read is the least obvious grant:
+it hands over a device's full stored configuration (secrets redacted,
+topology intact — addressing, ACLs, routes, VPN peers), not merely backup
+metadata, on the reasoning that seeing a change should not require the
+permission to make one.
 """
 
 from __future__ import annotations

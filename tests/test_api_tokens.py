@@ -1,19 +1,9 @@
-"""API tokens (Tier 1 #10): service-account credentials that authenticate a
-request the same way a session cookie does, but never expire from idleness.
-
-Driven the way test_web_gates.py and test_security_fixes.py drive their own
-checks: a real Service + WebServer on a free loopback port, everything
-through plain HTTP requests — the layer between the socket and the handler
-(server.py's Bearer handling) is exactly what this is testing, so calling a
-handler function directly would miss the point.
-
-Covers: issue -> authenticate a real request with it -> revoke -> refused;
-an expired token refused; the gate matrix (read allowed, write refused) for
-a read-only account's token, matching what its session would get; the raw
-token never appearing in any response body or the audit log; hash-only
-storage in app.db; last_used_ts updating (and being rate-limited); no idle
-timeout where a session would have one; and that a Bearer header does
-nothing useful on the login and kiosk-heartbeat paths.
+"""API tokens: service-account credentials that authenticate a request the way
+a session cookie does but never expire from idleness. A real Service +
+WebServer on a loopback port driven through plain HTTP, as test_web_gates.py
+and test_web_security.py do, because server.py's Bearer handling is the layer
+under test. Covers issue/authenticate/revoke, expiry, the read/write gate
+matrix, no raw-token leak, hash-only storage, last_used_ts, no idle timeout.
 """
 import hashlib
 import http.client

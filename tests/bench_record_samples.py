@@ -2,16 +2,13 @@
 
 Deliberately not a test_*.py: throughput depends on the disk under it, so
 this prints numbers rather than asserting them (run_all.py only picks up
-test_*.py). It exists so the claim in the 4.39.0 notes — that batching a
-poll's samples into one transaction is worth roughly two orders of
-magnitude — can be re-checked on any machine rather than taken on trust.
+test_*.py).
 
     python3 tests/bench_record_samples.py [rows] [preload]
 
-`rows` is how many samples one "poll" writes (default 500, a 500-port
-chassis's four rates per port is more); `preload` is how many sample rows
-are already in the table, since the review measured the per-row path
-degrading from 13,731/s on an empty file to 2,181/s at 5M rows.
+`rows` is how many samples one "poll" writes (default 500); `preload` is
+how many rows already sit in the table, to measure the per-row path at
+different table sizes.
 """
 import os
 import sys

@@ -1,45 +1,9 @@
-"""Regression suite for four lifecycle defects found in a review of the
-service's start/stop/self-update path (REVIEW-OPERATOR-4.50.md and the task
-that followed it):
-
-1. Monitor._loop (netpath/monitor.py) had no exception guard around its
-   tick body, unlike every sibling scheduler in the same file. One
-   transient `sqlite3.OperationalError: database is locked` -- a failure
-   RUNBOOK.md documents as expected under contention -- killed the trace
-   scheduler thread permanently, silently: the web UI stayed up, every
-   other collector kept running, and nothing said tracing itself had
-   stopped.
-
-2. run_headless (netpath/__main__.py) caught only KeyboardInterrupt, and
-   nothing in the package installed a signal.signal handler. RUNBOOK.md's
-   documented stop procedure -- `systemctl stop/restart sappiwhere`,
-   `nssm stop SappiWhere` -- delivers SIGTERM, whose default disposition
-   kills the process outright, skipping the `finally` that releases the
-   port and drains in-flight work.
-
-3. selfupdate.apply() (netpath/selfupdate.py) called _run_before_restart()
-   -- which stops the listener and shuts down every worker and database --
-   and only then attempted _swap_in(). A failure there (or in the
-   write_meta() calls right after a successful swap) used to return
-   {"ok": False, ...} with nothing scheduled to bring the service back,
-   leaving the process alive but completely inert.
-
-4. ipam_worker.py's stop() dropped cancel_futures=True (unlike every other
-   pool-owning worker's stop()), and a genuinely inert `except
-   (DhcpUnavailable, Exception)` named a subclass its own superclass
-   already covers.
-
-Sections 1-3 below drive the fixed code directly (a real Monitor/Database
-for section 1, the real run_headless for section 2 with only its
-database/socket work swapped for lightweight fakes, and the real apply()
-for section 3 with only the network boundary and the restart itself
-mocked away -- following test_security_fixes.py's own pattern for that).
-Section 4 is a source-level check for the two ipam_worker.py one-liners,
-since neither has any lifecycle behaviour worth spinning up a worker for.
-
-Nothing here ever lets a real restart or process exit happen: _swap_in,
-schedule_restart and the actual OS restart functions are monkeypatched out
-in every test that reaches anywhere near them.
+"""Service start/stop/self-update lifecycle: Monitor._loop's exception guard
+around its tick body, run_headless's SIGTERM handling for a clean shutdown,
+selfupdate.apply()'s recovery when _swap_in() or write_meta() fails after
+workers are already stopped, and ipam_worker.stop()'s cancel_futures.
+Drives the real code with only the network boundary and the actual restart
+mocked out -- following test_web_security.py's own pattern for that.
 """
 import inspect
 import io
@@ -303,7 +267,7 @@ check("2. the wait loop waits on the stop event now, not a fixed time.sleep(1)",
 # =====================================================================
 # 3 & 4. selfupdate.apply(): a post-teardown failure still restarts
 # =====================================================================
-# Reuses test_security_fixes.py's own pattern for driving apply() offline:
+# Reuses test_web_security.py's own pattern for driving apply() offline:
 # _fetch_json/_fetch_bytes stand in for the network boundary, and a real
 # AppDatabase provides .meta()/.settings()/.path. _swap_in and
 # schedule_restart are always mocked here -- this suite must never let a

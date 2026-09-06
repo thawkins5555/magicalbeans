@@ -1,5 +1,5 @@
 /* The Alerts page: open/acked/resolved alerts with a histogram, rules and
-   email templates. Table/modal patterns follow snmp.js and ipam.js. */
+   email templates. Table/modal patterns follow events.js and ipam.js. */
 (() => {
 
   const view = {
@@ -44,13 +44,9 @@
     pageOffset: 0,
     pageLimit: 300,
     pageFilterSig: null,
-    // Bumped on every refresh() — window_() recomputes t1 = Date.now() / 1000
-    // on every tick, so two overlapping polls never share a URL and app.js's
-    // per-path abort-dedupe (call(), around line 551) cannot cancel either
-    // one. Without this, a slow poll N that resolves after a faster poll N+1
-    // overwrites the view and the DOM with the OLDER window — silently,
-    // exactly during the slow-server case this page exists to surface. Same
-    // pattern as configrx.js's refreshGen / searchGen.
+    // Bumped per refresh() and checked before painting: t1 moves every
+    // tick, so two overlapping polls never share a URL and app.js's
+    // per-path abort-dedupe cannot cancel either one.
     refreshGen: 0,
   };
 
@@ -65,12 +61,8 @@
     netpath_target: 'a NetPath destination',
   };
 
-  // One implementation, in app.js. This was twelve copies of the same three
-  // lines, which is how one of them came to be missing a character while the
-  // others were not — this copy omitted the apostrophe.
   const escape = App.escapeHtml;
 
-  // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = (ts) => App.ago(ts, '\u2014');
 
   /* Fills in the two device-address links beside the object line once the
@@ -102,16 +94,14 @@
 
   function filters() {
     return {
-      state: App.el('alerts-filter-state').value,
-      severity: App.el('alerts-filter-sev').value,
+      ...App.filterValues('alerts-filter',
+        { state: 'state', severity: 'sev', device: 'device', q: 'text' }),
       // The rule list is filled by the refresh below, so on the load after a
       // reload the restored choice is not on the element yet; the first fetch
       // has to honour it or the list contradicts the filter for a tick. Once
       // the list exists the control answers for itself — including "any rule",
       // which the old `value || saved` form could not express.
       rule_id: App.controlOrSaved('alerts', 'alerts-filter-rule'),
-      device: App.el('alerts-filter-device').value.trim(),
-      q: App.el('alerts-filter-text').value.trim(),
     };
   }
 
@@ -120,9 +110,8 @@
   function drawStatus() {
     const server = App.state.serverState || {};
     const alerts = server.alerts || { counters: {} };
-    App.setText(App.el('alerts-status'), alerts.status || 'Alert engine stopped');
-    App.setBg(App.el('alerts-dot'), alerts.running ? 'var(--ok)' : 'var(--line)');
-    App.setText(App.el('alerts-toggle'), alerts.running ? 'Stop alert engine' : 'Start alert engine');
+    App.strip('alerts', alerts, { stopped: 'Alert engine stopped',
+      start: 'Start alert engine', stop: 'Stop alert engine' });
     const c = alerts.counters || {};
     if (App.state.kiosk) {
       // Deliberately open_count, not unresolvedCount below: a wall display
@@ -166,7 +155,7 @@
     const badge = App.el('alerts-open-badge');
     const unresolvedCount = alerts.unresolved_count ?? alerts.open_count ?? 0;
     App.setText(badge, String(unresolvedCount));
-    if (badge.hidden !== (unresolvedCount === 0)) badge.hidden = unresolvedCount === 0;
+    App.setHidden(badge, unresolvedCount === 0);
     // Both injected in init() (see its own comment on why) rather than
     // declared with data-requires-write, so this is what keeps them honest
     // against a grant that changes while the page is open.
@@ -337,9 +326,7 @@
 
 
   function drawBulkBar() {
-    const n = view.checked.size;
-    App.el('alerts-bulk-bar').hidden = n === 0;
-    if (n) App.el('alerts-bulk-count').textContent = `${n} selected`;
+    App.bulkBar(view.checked, 'alerts-bulk-bar', 'alerts-bulk-count');
   }
 
   /* A bulk action changes state for potentially every alert on screen,
@@ -1202,7 +1189,7 @@
   }
 
   function recipientsListHtml(list) {
-    if (!list.length) return '<p class="hint">No recipients yet.</p>';
+    if (!list.length) return App.emptyState('No recipients yet.');
     const rows = list.map((addr, index) => `
       <tr>
         <td>${escape(addr)}</td>
@@ -1214,10 +1201,7 @@
   function settingsDialog() {
     const s = App.state.alertsSettings || {};
     const recipients = normalizeRecipients(s.smtp_to_default);
-    const check = (id, label, on) =>
-      `<label class="check"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}> ${label}</label>`;
-    const number = (id, label, value, attrs = '') =>
-      `<label>${label} <input id="${id}" type="number" ${attrs} value="${value}"></label>`;
+    const { check, number } = App.form;
     const box = App.modal('Alerts settings', `
       <fieldset><legend>ENGINE</legend>
         ${check('as-enabled', 'Run the alert engine', s.enabled)}
@@ -1226,7 +1210,7 @@
       </fieldset>
       <fieldset><legend>EMAIL SERVER</legend>
         ${check('as-email', 'Send email notifications', s.email_enabled)}
-        <label>SMTP host <input id="as-host" value="${escape(s.smtp_host || '')}"></label>
+        ${App.form.text('as-host', 'SMTP host', escape(s.smtp_host || ''))}
         ${number('as-port', 'Port', s.smtp_port, 'min=1 max=65535')}
         <label>Security <select id="as-security">
           <option value="none" ${s.smtp_security === 'none' ? 'selected' : ''}>None</option>
@@ -1234,7 +1218,7 @@
           <option value="ssl" ${s.smtp_security === 'ssl' ? 'selected' : ''}>SSL/TLS</option>
         </select></label>
         ${check('as-verify', 'Verify server certificate', s.smtp_verify_cert !== false)}
-        <label>Username <input id="as-user" value="${escape(s.smtp_username || '')}"></label>
+        ${App.form.text('as-user', 'Username', escape(s.smtp_username || ''))}
         ${App.canStoreSecrets()
           ? `<label>Password <input id="as-pass" type="password"
           placeholder="${s.has_smtp_credential ? 'stored — leave blank to keep' : ''}"></label>`
@@ -1242,8 +1226,8 @@
         <p class="hint" id="as-cred-status"></p>
       </fieldset>
       <fieldset><legend>IDENTITY &amp; RECIPIENTS</legend>
-        <label>From address <input id="as-from" value="${escape(s.smtp_from || '')}"></label>
-        <label>From name <input id="as-fromname" value="${escape(s.smtp_from_name || '')}"></label>
+        ${App.form.text('as-from', 'From address', escape(s.smtp_from || ''))}
+        ${App.form.text('as-fromname', 'From name', escape(s.smtp_from_name || ''))}
         <p class="hint">Default recipients</p>
         <div id="as-to-list">${recipientsListHtml(recipients)}</div>
         <label>Add recipient <input id="as-to-add" placeholder="name@example.com"></label>
@@ -1339,9 +1323,7 @@
       } },
       { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
         { queued: 'Saving…', done: 'Saved' }, (async () => {
-        const on = (id) => box.querySelector(id).checked;
-        const num = (id) => Number(box.querySelector(id).value);
-        const text = (id) => box.querySelector(id).value.trim();
+        const { on, num, text } = App.form.readers(box);
         const password = (box.querySelector('#as-pass') || {}).value || '';
         if (password) {
           try {
@@ -1481,11 +1463,7 @@
       App.get('/api/alerts/templates'),
       App.get('/api/alerts/mutes'),
     ]);
-    // A newer refresh already redrew this — a later tick, a filter change, or
-    // the operator leaving this tab entirely while the above was in flight —
-    // so painting this answer now would only put a stale window back on
-    // screen. One Promise.all, so every write below lands together: one
-    // guard, right after it resolves and before any of them, covers them all.
+    // A newer refresh already redrew this, or the operator has left.
     if (view.refreshGen !== generation || App.state.tab !== 'alerts') return;
     view.hist = overview.buckets;
     view.histPlot = App.plottedRange(overview.buckets, bucket, t0, t1);
@@ -1608,7 +1586,7 @@
       // where the operator last set it — pressing Clear and then wondering
       // where an alert went, because State was still "acknowledged" from an
       // earlier triage pass. alerts-range stays out on purpose, the same as
-      // every other list page's own range control (see syslog.js/snmp.js):
+      // every other list page's own range control (see events.js):
       // it has no empty option, so clearing it to '' would just snap to
       // whichever option happens to be first rather than a deliberate
       // default — sticky is the right behaviour here, not a bug.
@@ -1687,12 +1665,8 @@
           { queued: 'Resolving…' }, bulkResolve()));
     };
     App.el('alerts-bulk-clear').onclick = () => { view.checked.clear(); drawTable(); };
-    App.el('alerts-toggle').onclick = async () => {
-      const running = (App.state.serverState.alerts || {}).running;
-      await App.post('/api/alerts/engine', { action: running ? 'stop' : 'start' });
-      await App.loadState();
-      App.refreshNow('alerts');
-    };
+    App.wireToggle('alerts-toggle', 'alerts', '/api/alerts/engine',
+      () => App.refreshNow('alerts'));
     App.el('alerts-settings').onclick = settingsDialog;
     // Both injected rather than declared in index.html: neither has a
     // subpage of its own — everything either does lives inside a modal, the
@@ -1719,11 +1693,7 @@
     App.el('alerts-add-template').onclick = addTemplate;
     App.el('alerts-edit-template').onclick = () => editTemplate(view.templatesSelected);
 
-    for (const event of ['resize', 'panes-resized']) {
-      window.addEventListener(event, () => {
-        if (App.state.tab === 'alerts') drawHistogram();
-      });
-    }
+    App.onRelayout('alerts', drawHistogram);
 
     // Last thing in init(): the range and severity lists above are filled
     // and nothing has been fetched, so the first refresh reads these back
@@ -1732,14 +1702,7 @@
     selectSub(App.recallSub('alerts', 'current'));
   }
 
-  function selectSub(name) {
-    for (const btn of document.querySelectorAll('#page-alerts > .subtabs > .subtab')) {
-      btn.classList.toggle('active', btn.dataset.subtab === name);
-    }
-    for (const page of document.querySelectorAll('#page-alerts > .subpage')) {
-      page.classList.toggle('active', page.id === `alerts-sub-${name}`);
-    }
-  }
+  function selectSub(name) { App.selectSub('alerts', name); }
 
   App.pages.alerts = { init, refresh, activate, fastTick: drawStatus };
 })();

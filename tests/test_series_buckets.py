@@ -298,7 +298,7 @@ roll_db.close()
 # §4.5 F5: trim_to_size ran VACUUM inside the module lock up to six times —
 # 6.49 s per VACUUM at 2 million rows, a 38.9 s stall for the whole call,
 # during which every poll worker, the alert tick and every HTTP handler
-# waited on the same lock. dbmaint frees pages in short steps instead.
+# waited on the same lock. sqlitebase frees pages in short steps instead.
 
 trim_path = os.path.join(TMPDIR, "trim.db")
 trim_db = NodesDatabase(trim_path)
@@ -367,7 +367,7 @@ nodes_db.close()
 # operator waits for the window took 26 seconds on 840 MB of real data.
 # The conversion belongs to maintenance, not to startup.
 import tempfile as _tempfile, threading as _threading, time as _time
-from netpath import dbopen as _dbopen, dbmaint as _dbmaint
+from netpath import sqlitebase as _dbopen, sqlitebase as _dbmaint
 
 _dir = _tempfile.mkdtemp()
 _path = os.path.join(_dir, "startup.db")

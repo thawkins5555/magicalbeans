@@ -1,16 +1,9 @@
-"""Item 4: `/api/platform`'s `secret_store` flag, wired to the real
-`netpath.dpapi.available()` instead of the hard-coded `False` it carried
-before this change — see CREDENTIAL-SECURITY.md's "A gap this workstream
-did not close" for the defect this closes.
-
-Drives a real Service + WebServer against the *real* dpapi/secretstore
-modules (not the reversible stand-in most other suites install — see
-test_secretstore.py's own note on why) so the two passphrase sources this
-suite toggles are the exact ones an operator would configure. Fixtures
-(`reset`, `passphrase_file`, the throwaway salt path) mirror
-test_secretstore.py's own — this is the second suite exercising the real
-implementation, not a copy of its unit tests.
-"""
+"""`/api/platform`'s `secret_store` flag, wired to the real
+`netpath.dpapi.available()`; see CREDENTIAL-SECURITY.md. Drives a real
+Service + WebServer against the real dpapi/secretstore modules (not the
+reversible stand-in most other suites install; see test_secretstore.py) so the
+two passphrase sources toggled here are the ones an operator configures.
+Fixtures (`reset`, `passphrase_file`, salt path) mirror test_secretstore.py's."""
 import http.client
 import json
 import os

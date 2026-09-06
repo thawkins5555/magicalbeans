@@ -1,19 +1,13 @@
-"""The web server.
-
-Standard library only: `http.server` with a threading mixin, plus `ssl` when a
-certificate is configured. That keeps the deployment to "install PySide6 or
-don't" rather than pulling a web framework and its dependency tree onto a
-machine whose job is watching the network.
+"""The web server: `http.server` with a threading mixin, plus `ssl` when a
+certificate is configured. Standard library only.
 
 Every route carries a (module, level) permission and needs a signed-in
-session — a browser's `sw_session` cookie, or (Tier 1 #10) an
-`Authorization: Bearer <token>` API token, checked the same place and
-against the same permission gates; see `permissions.py` and the ROUTES
-table below. A token never mints a cookie session and is exempt from the
-idle timeout that a cookie session is subject to — see `_route`'s handling
-of the two. Without `--cert` this is plain HTTP, so the session cookie,
-every credential typed into the interface and every bearer token sent
-cross the network in the clear — bind to 127.0.0.1, or give it a
+session — a browser's `sw_session` cookie, or an `Authorization: Bearer`
+API token, checked in the same place against the same gates (see
+`permissions.py` and the ROUTES table below). A token never mints a cookie
+session and is exempt from the idle timeout a cookie session is subject to.
+Without `--cert` this is plain HTTP and every cookie, credential and bearer
+token crosses the network in the clear — bind to 127.0.0.1, or give it a
 certificate.
 """
 
@@ -42,12 +36,11 @@ from .service import Service
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
-# Content types by extension, written down rather than asked of
-# `mimetypes.guess_type`. That function consults the Windows registry, where
-# .js has been known to resolve to text/plain — and every response here
-# carries `X-Content-Type-Options: nosniff`, under which a script served as
-# text/plain is refused outright and the application does not load. The
-# charset is stated for every text type so a browser never has to guess it.
+# Content types by extension, not `mimetypes.guess_type`: that consults the
+# Windows registry, where .js has been known to resolve to text/plain — and
+# under the `X-Content-Type-Options: nosniff` every response carries, a
+# script served as text/plain is refused and the application does not load.
+# The charset is stated for every text type so a browser never guesses it.
 MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
@@ -128,15 +121,12 @@ class StaticCache:
         with open(full, "rb") as handle:
             body = handle.read()
         content_type = content_type_for(full)
-        # The markup asks for its assets as `/app.js?v=__SW_VERSION__`, and the
-        # version is put in here rather than written into the file, because a
-        # hand-maintained copy of it is a copy that drifts — and this one has
-        # teeth: an asset URL is served immutable for a year, so a static file
-        # that changed while the version did not would go on being served from
-        # every warm cache until the next release. Substituting at load time
-        # means bumping __version__ re-versions every URL and nothing else has
-        # to remember. Done before the ETag and the gzip, so both describe the
-        # bytes that actually go out.
+        # The markup asks for its assets as `/app.js?v=__SW_VERSION__` and
+        # the version is substituted here rather than written into the file:
+        # an asset URL is served immutable for a year, so a hand-maintained
+        # copy that drifted would keep serving stale bytes from every warm
+        # cache. Done before the ETag and the gzip, so both describe the bytes
+        # that actually go out.
         if content_type.startswith("text/html"):
             from .. import __version__
             body = body.replace(b"__SW_VERSION__", __version__.encode("ascii"))
@@ -220,19 +210,18 @@ ROUTES = [
     ("POST", r"^/api/heartbeat$", api.post_heartbeat, None),
     ("GET", r"^/api/session$", api.get_session, None),
     # Accounts and their grants are the `admin` capability's, not
-    # Settings'. Settings write used to be all of this as well: an account
-    # granted it to change a retention cap could grant itself every module,
-    # reset anyone's password and trigger the self-update.
+    # Settings': an account granted Settings write to change a retention cap
+    # must not thereby be able to grant itself every module, reset anyone's
+    # password and trigger the self-update.
     ("GET", r"^/api/users$", api.get_users, ("admin", W)),
     ("POST", r"^/api/users$", api.post_user, ("admin", W)),
     ("DELETE", r"^/api/users$", api.delete_user, ("admin", W)),
     ("POST", r"^/api/users/permissions$", api.post_user_permissions, ("admin", W)),
     ("POST", r"^/api/password$", api.post_password, _password_requirement),
-    # API tokens (Tier 1 #10): a service-account credential, not a person's
-    # — issuing or revoking one is exactly as administrative an act as
-    # creating or deleting the account it authenticates as, so it sits
-    # behind the same `admin` gate as the routes above rather than being
-    # self-service. See api.post_token's docstring for the fuller reasoning.
+    # An API token is a service-account credential, not a person's:
+    # issuing or revoking one is as administrative an act as creating or
+    # deleting the account it authenticates as, so it sits behind the same
+    # `admin` gate rather than being self-service.
     ("GET", r"^/api/tokens$", api.get_tokens, ("admin", R)),
     ("POST", r"^/api/tokens$", api.post_token, ("admin", W)),
     ("DELETE", r"^/api/tokens$", api.delete_token, ("admin", W)),
@@ -290,10 +279,9 @@ ROUTES = [
     ("GET", r"^/api/ipam/dhcp/scope-history$", api.get_ipam_dhcp_scope_history, ("ipam", R)),
     ("GET", r"^/api/nodes/overview$", api.get_nodes_overview, ("nodes", R)),
     ("GET", r"^/api/nodes/mac-search$", api.get_nodes_mac_search, ("nodes", R)),
-    # The L2 topology view (Tier 1 #5's UI half): the fleet-wide link graph,
-    # and its own CSV export — matched before the "export.csv" suffix could
-    # ever be confused with a device id, the same ordering rule the devices
-    # export above already follows.
+    # The fleet-wide L2 link graph and its own CSV export — matched before
+    # the "export.csv" suffix could be confused with a device id, the same
+    # ordering rule the devices export above follows.
     ("GET", r"^/api/nodes/topology$", api.get_nodes_topology, ("nodes", R)),
     ("GET", r"^/api/nodes/topology/export\.csv$", api.get_nodes_topology_export, ("nodes", R)),
     ("GET", r"^/api/nodes/devices$", api.get_nodes_devices, ("nodes", R)),
@@ -333,15 +321,14 @@ ROUTES = [
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces$", api.get_nodes_device_interfaces, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces/export\.csv$",
      api.get_nodes_device_interfaces_export, ("nodes", R)),
-    # The device detail pane's Neighbours section (Tier 1 #5's UI half):
+    # The device detail pane's Neighbours section:
     # one device's own LLDP/CDP rows, present and stale alike.
     ("GET", r"^/api/nodes/devices/(\d+)/neighbors$", api.get_nodes_device_neighbors, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/neighbors/export\.csv$",
      api.get_nodes_device_neighbors_export, ("nodes", R)),
-    # The upstream-suggestions review flow (Tier 1 #5's other UI half): a
-    # candidate devices.upstream_id per device, derived from the neighbour
-    # match above, for an operator to review — reading the list is a plain
-    # "nodes" read, applying an accepted batch needs write.
+    # The upstream-suggestions review flow: a candidate
+    # devices.upstream_id per device, derived from the neighbour match above.
+    # Reading the list is a plain "nodes" read; applying a batch needs write.
     ("GET", r"^/api/nodes/upstream-suggestions$",
      api.get_nodes_upstream_suggestions, ("nodes", R)),
     ("POST", r"^/api/nodes/upstream-suggestions/apply$",
@@ -458,42 +445,31 @@ ROUTES = [
      api.delete_configrx_device_enable_secret, ("configrx", W)),
     ("GET", r"^/api/configrx/devices/(\d+)/backups$", api.get_configrx_device_backups, ("configrx", R)),
     ("POST", r"^/api/configrx/devices/(\d+)/backup$", api.post_configrx_device_backup, ("configrx", W)),
-    # The backup's CONTENT, not its metadata: reading a stored config is a
-    # read, the same as the listing beside it (dates, sizes, hashes,
-    # whether it was redacted) — a read-only operator needs both to answer
-    # "has this switch changed". get_configrx_backup itself is what still
-    # guards a verbatim (store_secrets) capture: a caller without ConfigRX
-    # write gets it redacted rather than 403ing outright.
+    # The backup's CONTENT, not just its metadata: reading a stored config
+    # is a read, so a read-only operator can answer "has this switch
+    # changed". get_configrx_backup still guards a verbatim (store_secrets)
+    # capture — a caller without ConfigRX write gets it redacted rather than
+    # a 403.
     #
-    # Weakened from write to read deliberately, and reviewed as such: the
-    # redaction strips secrets, not topology, so a read-only account can now
-    # see interface addressing, ACLs, routes and VPN peers for any device
-    # with a stored capture. That is a wider grant than "read" carries in
-    # most other modules, it was raised as such by this release's security
-    # review, and the operator's answer was to keep it — being able to see
-    # what changed on a switch without holding the permission to change it
-    # is the point of the module. Narrow it here, not in the handler, if
-    # that judgement is ever revisited.
+    # Deliberately read, not write: redaction strips secrets, not topology,
+    # so a read-only account can see interface addressing, ACLs, routes and
+    # VPN peers for any device with a stored capture. That is a wider grant
+    # than "read" carries elsewhere, and it is the point of the module.
+    # Narrow it here, not in the handler, if that is ever revisited.
     ("GET", r"^/api/configrx/backups/(\d+)$", api.get_configrx_backup, ("configrx", R)),
-    # Revisited (4.49.0): a diff hands over the same device configuration
-    # lines reading one backup's content already does — a caller who can
-    # fetch two backups could already reconstruct the diff by hand without
-    # this route at all, so gating it stricter than the content it diffs
-    # bought nothing except making the most common thing anyone does with a
-    # backup ("what changed before the line stopped") need the same grant
-    # as pushing a credential. Matched before the "(\d+)" backup route above
-    # could ever apply, though "diff" would never match \d+ anyway.
+    # A diff hands over the same configuration lines reading one backup's
+    # content already does — a caller who can fetch two backups can
+    # reconstruct it by hand — so it is gated the same as the content it
+    # diffs. Matched before the "(\d+)" backup route above.
     ("GET", r"^/api/configrx/diff$", api.get_configrx_diff, ("configrx", R)),
     ("POST", r"^/api/configrx/backups/bulk-delete$",
      api.post_configrx_backups_bulk_delete, ("configrx", W)),
     ("DELETE", r"^/api/configrx/backups/(\d+)$", api.delete_configrx_backup, ("configrx", W)),
     ("POST", r"^/api/configrx/worker$", api.post_configrx_worker, ("configrx", W)),
-    # Cross-device config search and compliance rule sets (netpath/
-    # configrx_search.py, netpath/configrx_compliance.py) — search results
-    # and compliance results never carry an unredacted secret or a matched
-    # line respectively (see both modules' own docstrings), so both read
-    # as a plain configrx read, matching diff/backup's own R gate above;
-    # rule-set/rule CRUD changes monitoring policy, so W.
+    # Cross-device config search and compliance rule sets. Neither result
+    # ever carries an unredacted secret, so both read as a plain configrx
+    # read, matching diff/backup above; rule-set/rule CRUD changes
+    # monitoring policy, so W.
     ("GET", r"^/api/configrx/search$", api.get_configrx_search, ("configrx", R)),
     ("GET", r"^/api/configrx/rule-sets$", api.get_configrx_rule_sets, ("configrx", R)),
     ("POST", r"^/api/configrx/rule-sets$", api.post_configrx_rule_set, ("configrx", W)),
@@ -512,13 +488,11 @@ ROUTES = [
      api.post_configrx_rule_set_evaluate, ("configrx", W)),
     ("GET", r"^/api/configrx/devices/(\d+)/compliance$",
      api.get_configrx_device_compliance, ("configrx", R)),
-    # The remembered SSH host key for a device: shown and forgotten in
-    # ConfigRX's device dialog, so both routes are ConfigRX's. Forgetting is
-    # what lets the next connection accept a new key, and configrx write
-    # already decides which port and which credential that connection uses —
-    # it is the permission that already says which box is trusted, so it is
-    # the right holder of "start over with this device's key". Trusting a new
-    # key from inside the terminal stays ("ssh", W).
+    # The remembered SSH host key for a device, shown and forgotten in
+    # ConfigRX's device dialog. Forgetting lets the next connection accept a
+    # new key, and configrx write already decides which port and credential
+    # that connection uses — the permission that already says which box is
+    # trusted. Trusting a new key from inside the terminal stays ("ssh", W).
     ("GET", r"^/api/ssh/devices/(\d+)/hostkey$", api.get_ssh_device_hostkey, ("configrx", R)),
     ("DELETE", r"^/api/ssh/devices/(\d+)/hostkey$", api.delete_ssh_device_hostkey, ("configrx", W)),
     # The terminal window. Read is meaningless for a shell — you either get
@@ -536,7 +510,7 @@ ROUTES = [
     # this host's own code: both are administrator acts, not settings.
     ("POST", r"^/api/maintenance$", api.post_maintenance, ("admin", W)),
     ("POST", r"^/api/update$", api.post_update, ("admin", W)),
-    # Front-end additions (workstream E), appended so they never share
+    # Front-end additions, appended so they never share
     # a hunk with the module routes above. `/api/alerts/total` cannot
     # collide with `/api/alerts/(\d+)`, which only matches digits.
     ("GET", r"^/api/alerts/total$", api.get_alerts_total, ("alerts", R)),
@@ -568,19 +542,18 @@ PUBLIC_PATHS = {"/login", "/login.html", "/login.js", "/tokens.css", "/app.css",
                 "/favicon.ico", "/favicon.svg"}
 PUBLIC_API = {"/api/login", "/api/session"}
 
-# What an account whose password must still be changed may reach. Everything
-# else under /api/ is refused until it has been: the seeded admin/admin
-# account is a way in, not an account, and the flag saying so was enforced
-# only by the bundled UI (app.js) — anything talking to the API directly was
-# exempt, so a fresh install was owned by whoever reached the port first.
-# Static files are untouched: the browser has to be able to load the app in
-# order to show the change-password dialog at all.
+# What an account whose password must still be changed may reach.
+# Everything else under /api/ is refused until it has been: the seeded
+# admin/admin account is a way in, not an account, and enforcing that in the
+# bundled UI alone would exempt anything talking to the API directly. Static
+# files are untouched — the browser has to load the app to show the
+# change-password dialog at all.
 MUST_CHANGE_API = {"/api/session", "/api/logout", "/api/state", "/api/config",
                    "/api/heartbeat", "/api/password"}
 
 SESSION_COOKIE = "sw_session"
 
-# `Authorization: Bearer <token>` — an API token (Tier 1 #10), checked
+# `Authorization: Bearer <token>` — an API token, checked
 # wherever the session cookie above is checked, in `_route` below. Case-
 # insensitive per RFC 9110 §11.1 (the scheme name, not the token itself).
 BEARER_RE = re.compile(r"^Bearer\s+(\S+)$", re.IGNORECASE)
@@ -592,14 +565,12 @@ class LengthRequired(ValueError):
     body gets."""
 
 
-# How many source addresses the access log remembers at once. `recent` has
-# always been a bounded deque; `clients` was a plain dict with nothing
-# removing entries, so every address that ever made a request stayed for
-# the life of the process along with its user-agent string — every
-# port-scanner source, every health-check probe, every DHCP-reassigned
-# laptop. A thousand is far more than any real operator population and
-# still a bounded amount of memory and of work for the console, which
-# re-sorts this dict once a second.
+# How many source addresses the access log remembers at once. Unbounded,
+# every address that ever made a request would stay for the life of the
+# process with its user-agent string — every port scanner, health check and
+# DHCP-reassigned laptop. A thousand is far more than any real operator
+# population and still bounded work for the console, which re-sorts this
+# dict once a second.
 MAX_TRACKED_CLIENTS = 1000
 
 
@@ -636,7 +607,7 @@ class AccessLog:
             entry = {"ts": time.time(), "client": client, "method": method,
                      "path": path, "status": status, "ms": ms}
             if not path.startswith(("/app.", "/netpath.js", "/netflow.js",
-                                    "/snmp.js", "/syslog.js", "/debug.js",
+                                    "/events.js", "/debug.js",
                                     "/settings.js", "/ssh.js", "/ssh.css",
                                     "/vendor/")):
                 self.recent.appendleft(entry)
@@ -681,28 +652,24 @@ class AccessLog:
 class Handler(BaseHTTPRequestHandler):
     server_version = "SappiWhere"
     sys_version = ""
-    # HTTP/1.1, for keep-alive. The default here is HTTP/1.0, under which
-    # every response closed the connection and a page load opened one TCP
-    # (or TLS) connection per script — around twenty. Three things in this
-    # file leaned on that and are unaffected: the WebSocket handshake writes
-    # its own 101 status line (wsock.py) and sets close_connection; _body
-    # refuses Transfer-Encoding outright, so a chunked request is still
-    # 411 and never misread; and every response leaves through _send with a
-    # Content-Length, or is a 304 with no body — the two things a persistent
-    # connection needs to know where one response ends. What changes is the
-    # resource profile: a browser holds a handful of idle connections per
-    # tab, each on a daemon thread, until `timeout` below closes them.
+    # HTTP/1.1, for keep-alive: under 1.0 every response closed the
+    # connection and a page load opened around twenty. Three things depend
+    # on this staying safe: the WebSocket handshake writes its own 101 status
+    # line and sets close_connection; _body refuses Transfer-Encoding, so a
+    # chunked request is 411 and never misread; and every response leaves
+    # through _send with a Content-Length or is a bodyless 304. The cost is
+    # a handful of idle connections per tab, each on a daemon thread, until
+    # `timeout` below closes them.
     protocol_version = "HTTP/1.1"
     service: Service = None      # set on the server instance
     access: AccessLog = None
 
-    # socketserver only calls settimeout() when this is not None, so without
-    # it a half-open connection sat in readline() forever holding its
-    # thread — one slow-loris socket per thread, with no cap on either.
-    # Thirty seconds is far longer than any legitimate client needs to
-    # finish sending a request. The terminal's WebSocket replaces this with
-    # its own timeout the moment it takes the socket over (wsock.WebSocket),
-    # so a quiet shell is not affected.
+    # socketserver only calls settimeout() when this is not None; without
+    # it a half-open connection sits in readline() forever holding its
+    # thread — one slow-loris socket per thread. Thirty seconds is far longer
+    # than any legitimate client needs to finish sending a request. The
+    # terminal's WebSocket replaces this with its own timeout when it takes
+    # the socket over, so a quiet shell is not affected.
     timeout = 30
 
     # ------------------------------------------------------------ plumbing
@@ -788,17 +755,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
         # No external resources are loaded, so this can be strict.
-        # `connect-src 'self'` is what the terminal window's WebSocket needs
-        # and all it needs: current browsers count a same-origin ws:// (or
-        # wss://) URL as 'self', while the bare scheme-sources `ws: wss:`
-        # this used to carry matched *any* host, which would let every page
-        # in the product open a socket anywhere. `frame-ancestors 'none'`
-        # keeps the terminal — Trust button and all — out of anyone's
-        # iframe. `form-action 'self'` is what stops injected markup from
-        # posting an operator's typing off-site, and `base-uri 'none'`
-        # stops an injected <base> from repointing every relative URL on
-        # the page. Inline styles stay allowed for the terminal emulator,
-        # which injects its own <style>.
+        # `connect-src 'self'` is all the terminal's WebSocket needs:
+        # browsers count a same-origin ws:// or wss:// URL as 'self', while
+        # the bare scheme-sources `ws: wss:` would match any host at all.
+        # `frame-ancestors 'none'` keeps the terminal — Trust button and all
+        # — out of anyone's iframe, `form-action 'self'` stops injected
+        # markup posting an operator's typing off-site, and `base-uri 'none'`
+        # stops an injected <base> repointing every relative URL. Inline
+        # styles stay allowed for the terminal emulator's own <style>.
         self.send_header("Content-Security-Policy",
                          "default-src 'self'; style-src 'self' 'unsafe-inline';"
                          " connect-src 'self'; frame-ancestors 'none';"
@@ -825,9 +789,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # Every request body this app takes is JSON, and every one of them is
     # small — a device, a rule, a settings block. Anything past this is
-    # refused before a byte is read, rather than being pulled into memory
-    # first: a single mistyped Content-Length used to be a 128 MiB
-    # allocation, and that was the general limit for every route.
+    # refused before a byte is read, so a mistyped Content-Length cannot
+    # become a large allocation.
     MAX_BODY_BYTES = 16 * 1024 * 1024
 
     # The exception, and the only one: a MIB upload carries a base64-encoded
@@ -852,10 +815,10 @@ class Handler(BaseHTTPRequestHandler):
         """Consume a request body the handler never read, before answering.
 
         A refusal that comes before the handler — not signed in, must change
-        password, wrong content type, wrong origin — used to respond with the
-        POST body still sitting unread in the socket. Under HTTP/1.0 the
-        close threw it away. Under a persistent connection it is the first
-        bytes of the next request, and that request fails to parse. Small
+        password, wrong content type, wrong origin — would otherwise answer
+        with the POST body still unread in the socket. Under a persistent
+        connection those are the first bytes of the next request, which then
+        fails to parse. Small
         bodies are read and dropped so the connection stays usable; anything
         larger, or chunked, closes the connection instead, which is also
         what the 411 for chunked bodies needs."""
@@ -881,12 +844,10 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def _body(self, limit: int | None = None) -> dict:
-        # Chunked bodies were read as Content-Length 0, i.e. as an empty
-        # body, and the request then ran with default arguments — POST
-        # /api/settings with no body resolves to apply_global_settings({}).
-        # Harmless as deployed (HTTP/1.0, no keep-alive) and a hole the
-        # moment a reverse proxy forwards a chunked request, so it is
-        # refused outright rather than silently reinterpreted.
+        # Refused outright rather than read as Content-Length 0: an empty
+        # body runs the request with default arguments (POST /api/settings
+        # with no body resolves to apply_global_settings({})), which is a
+        # hole the moment a reverse proxy forwards a chunked request.
         if (self.headers.get("Transfer-Encoding") or "").strip():
             raise LengthRequired(
                 "This server reads Content-Length only; send the body with a "
@@ -911,10 +872,9 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             return {}
         # Underscore-prefixed keys are this layer's, not the caller's — the
-        # same rule the query string has always had. Only the body was
-        # exempt, and post_login read `_agent` out of it, so the session
-        # list showed whatever the client claimed instead of its real
-        # User-Agent (arbitrary markup included).
+        # same rule the query string has. Without it a caller could supply
+        # its own `_agent` and have the session list show whatever it
+        # claimed, arbitrary markup included.
         return {k: v for k, v in body.items() if not str(k).startswith("_")}
 
     # -------------------------------------------------------------- routing
@@ -1050,17 +1010,14 @@ class Handler(BaseHTTPRequestHandler):
             if method in ("POST", "PUT", "DELETE") and path != "/api/heartbeat":
                 self.service.sessions.touch(token)
         else:
-            # No cookie session: an API token (Tier 1 #10) may still
-            # authenticate this request, checked against `Authorization`
-            # rather than `Cookie`. Deliberately never sets params["_token"]
-            # — that key is the SessionStore's, and a token has no entry
-            # there to touch, get or extend. That single omission is what
-            # makes "no idle timeout for a token" and "a token cannot mint
-            # a browser session" true without any further special-casing
-            # below: sessions.touch("") and sessions.get("") are both
-            # no-ops (see auth.SessionStore), and no Set-Cookie is ever
-            # produced from anywhere but the login route's own response
-            # handling further down.
+            # No cookie session: an API token may still authenticate this
+            # request, checked against `Authorization` rather than `Cookie`.
+            # Deliberately never sets params["_token"] — that key is the
+            # SessionStore's, and a token has no entry there. That single
+            # omission is what makes "no idle timeout for a token" and "a
+            # token cannot mint a browser session" true with no further
+            # special-casing: sessions.touch("") and sessions.get("") are
+            # both no-ops, and only the login route ever sets a cookie.
             match = BEARER_RE.match((self.headers.get("Authorization") or "").strip())
             if match:
                 username = self.service.authenticate_api_token(
@@ -1143,18 +1100,14 @@ class Handler(BaseHTTPRequestHandler):
                     # Origin, checked here rather than in wsock: this is the
                     # CSRF gate for a route that has none of the usual ones.
                     # An upgrade is a GET, so the JSON content-type check
-                    # above never sees it, and the session cookie is
-                    # SameSite=*Strict* — which is site-scoped, not
-                    # origin-scoped, so another port on this host or a
-                    # sibling subdomain is "same site" and its page could
-                    # otherwise open this socket with the operator's cookie
-                    # and drive a shell. A browser always sends Origin on an
-                    # upgrade, so a missing one is refused too (hence
-                    # require_origin); it is a check about who is asking,
-                    # which is this layer's business, not the framing's.
-                    # Same helper as the POST/PUT/DELETE rule above, so the
-                    # two cannot drift — and it compares the scheme as well
-                    # as the netloc, which this check used not to.
+                    # above never sees it, and SameSite=Strict is site-scoped
+                    # — another port on this host or a sibling subdomain is
+                    # "same site" and its page could otherwise open this
+                    # socket with the operator's cookie and drive a shell. A
+                    # browser always sends Origin on an upgrade, so a missing
+                    # one is refused too (require_origin). Same helper as the
+                    # POST/PUT/DELETE rule above, scheme included, so the two
+                    # cannot drift.
                     if not self._same_origin(require_origin=True):
                         self._json({"error": "Cross-origin WebSocket refused"}, 403)
                         return
@@ -1200,17 +1153,13 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._json({"error": str(exc)}, 400)
             except OverflowError:
-                # A number the caller sent that is too large to be one.
-                # Every `(\d+)` route arg is turned into an int a few lines
-                # up with a bare int(), which happily parses thirty digits,
-                # and a numeric query filter goes the same way through
-                # _num(). Neither is a valid row id or port, but the place
-                # that finds that out is sqlite3's parameter binding, which
-                # raises OverflowError ("Python int too large to convert to
-                # SQLITE_INTEGER") — not a ValueError, so this used to fall
-                # through to the 500 below and report a server fault for
-                # what is plainly a bad request. The message stays generic:
-                # which parameter overflowed is not worth reflecting back.
+                # A number too large to be a row id or a port. int() parses
+                # thirty digits happily, and the place that finds out is
+                # sqlite3's parameter binding, which raises OverflowError,
+                # not ValueError — without this arm a plainly bad request
+                # would be reported as a server fault. The message stays
+                # generic: which parameter overflowed is not worth
+                # reflecting back.
                 self._json({"error": "A numeric value in that request is out "
                                      "of range"}, 400)
             except Exception as exc:
@@ -1248,16 +1197,13 @@ class Handler(BaseHTTPRequestHandler):
         # An update replaces the files underneath a browser that already has
         # the old ones. The shell is never cached so a reload always picks up
         # new script tags, and the scripts carry a validator so the browser
-        # can tell stale from current instead of guessing. `no-cache` (not
-        # `immutable`): the URLs are fixed names, so the browser must ask;
-        # what changed is that asking is now answered from memory with a
-        # content hash, and the answer carries the same headers as a 200.
+        # can tell stale from current. `no-cache`, not `immutable`: the URLs
+        # are fixed names, so the browser must ask, and the ask is answered
+        # from memory against a content hash.
         #
         # `?v=` is the one exception: index.html spells it out with the
-        # running __version__, so the URL itself changes on every release and
-        # a year-long cache never serves a byte the release after it wrote.
-        # A warm reload used to mean sixteen conditional requests answered
-        # 304 — cheap on a LAN, sixteen round trips over a NOC's VPN.
+        # running __version__, so the URL changes on every release and a
+        # year-long cache never serves a byte from the release before it.
         if candidate.endswith(".html"):
             cache = {"Cache-Control": "no-store"}
         elif versioned:

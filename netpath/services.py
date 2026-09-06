@@ -1,18 +1,8 @@
-"""Port and protocol names, so charts read as applications rather than numbers.
-
-Three sources, in order: names the site has declared, a small curated table for
-the ones worth presenting nicely, and the operating system's own services file
-for everything else registered with IANA.
-
-The curated table names registrations and the industrial protocols this
-product exists for. It does not name what software the traffic might be,
-because these labels are read off a chart and taken to a meeting: "Metasploit
-(4444)" is an accusation the flow record cannot support, and a port with a
-registration that ordinary software also uses is better shown under that
-registration -- or under nothing, which lets the OS services file answer --
-than under a guess. A port whose meaning is site-specific belongs in the
-NetFlow settings' custom port list, where a person takes responsibility for
-it.
+"""Port and protocol names, so charts read as applications rather than
+numbers. Three sources in order: site-declared names, a small curated
+table, then the OS services file. The curated table names registrations
+and this product's industrial protocols only — never a guess at what
+software the traffic might be (a flow record can't support that accusation).
 """
 
 from __future__ import annotations

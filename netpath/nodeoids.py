@@ -1,6 +1,6 @@
 """Built-in polled-metric OID catalog for the Nodes poller.
 
-Not a MIB compiler (same framing as trapoids.py). A fixed table of OIDs
+Not a MIB compiler (same framing as trapdecode.py). A fixed table of OIDs
 this app polls by default, split into "always poll" (near-universal
 SNMPv2-MIB scalars and the IF-MIB interface table) and "poll if the vendor
 OID resolves" (best-effort — a failed GET on one of these is silently
@@ -68,25 +68,15 @@ UCD_SNMP = {           # UCD-SNMP-MIB — net-snmp / most Linux agents
     "mem_total_kb": "1.3.6.1.4.1.2021.4.5.0",
     "load1":        "1.3.6.1.4.1.2021.10.1.3.1",
 }
-# A HOST_RESOURCES dict with the two OIDs above used to live here, named but
-# never read — the 4.35.0 review's own finding, still true two releases
-# later. GENERIC_HEALTH below and HR_STORAGE_TYPE/UNITS/SIZE/USED/RAM/
-# FIXED_DISK further down are the real, live definitions of the same two
-# HOST-RESOURCES-MIB tables; keeping a second, unread copy beside them is
-# how a future fix gets applied to the wrong one. Removed rather than
-# wired up, since GENERIC_HEALTH's single-column shape and the storage
-# constants' multi-column shape are already the two real consumers and
-# don't share a dict either.
+# GENERIC_HEALTH below and HR_STORAGE_TYPE/UNITS/SIZE/USED/RAM/FIXED_DISK
+# further down are the live definitions of the two HOST-RESOURCES-MIB tables;
+# there is deliberately no second, unread copy of them beside these.
 
 # ------------------------------------------------------------ vendor health
 #
-# The review's §4.1 S9: the poller read no vendor health at all — no CPU or
-# memory from Cisco, Fortinet or Juniper, HOST-RESOURCES-MIB defined above
-# and never referenced — so `cpu_high`, `mem_high` and `disk_high` could
-# only ever fire on a device running net-snmp. These are the scalars that
-# make those rules live on real network gear, keyed by the vendor's own
-# enterprise arc so a device is only ever asked for objects its maker
-# defines.
+# Without these, `cpu_high`, `mem_high` and `disk_high` could only ever fire
+# on a device running net-snmp. Keyed by the vendor's own enterprise arc, so
+# a device is only ever asked for objects its maker defines.
 #
 # Each probe is (metric key, label, unit, OID, how):
 #   "scalar"       the OID is already an instance; read it in the GET
@@ -156,22 +146,12 @@ GENERIC_HEALTH = (
 )
 
 # hrStorageTable: type, allocation unit, size and used, per storage unit.
-# One walk, two completely different questions an operator asks about it,
-# filtered by hrStorageType: hrStorageFixedDisk is the row meant by "disk"
-# (nodepoll._host_resources_disk_pct), hrStorageRam is the row meant by
-# "memory" (nodepoll._host_resources_mem_pct, the HOST-RESOURCES fallback
-# for mem_pct on anything that answers none of UCD-SNMP, a Fortinet scalar
-# or the Cisco memory pool — a Windows host, a printer, most appliances).
-# Both readers exclude every other row in the table on purpose:
-# hrStorageVirtualMemory (swap, or swap-plus-physical depending on the
-# agent) counted as either disk or RAM would make an ordinary machine read
-# as critically low on memory or a disk mysteriously full of nothing;
-# hrStorageOther/RamDisk/CompactDisc/etc. are neither. Both readers are a
-# used/size RATIO, so HR_STORAGE_UNITS never needs multiplying in: size and
-# used share one hrStorageAllocationUnits scale factor on a given row (RFC
-# 2790), and that factor cancels out of a ratio exactly the way it does for
-# disk_pct already — it would only matter to a reader that wanted an
-# absolute size in bytes, which neither of these is.
+# One walk, two questions, filtered by hrStorageType: hrStorageFixedDisk is
+# "disk", hrStorageRam is "memory". Both readers exclude every other row on
+# purpose — hrStorageVirtualMemory (swap) counted as either would make an
+# ordinary machine read as critically low on memory. Both are a used/size
+# RATIO, so HR_STORAGE_UNITS never multiplies in: size and used share one
+# allocation-unit factor per row (RFC 2790) and it cancels out.
 HR_STORAGE_TYPE = "1.3.6.1.2.1.25.2.3.1.2"
 HR_STORAGE_UNITS = "1.3.6.1.2.1.25.2.3.1.4"
 HR_STORAGE_SIZE = "1.3.6.1.2.1.25.2.3.1.5"
@@ -187,25 +167,18 @@ IP_ADDR_TABLE = "1.3.6.1.2.1.4.20.1.1"
 
 # -------------------------------------------------------------- L2 topology
 #
-# LLDP-MIB (IEEE 802.1AB-2005) lldpRemTable — "what is plugged into what",
-# the walk the review's Tier 1 #5 named as entirely missing. Each row is one
-# neighbour heard on one local port, indexed by
+# LLDP-MIB (IEEE 802.1AB-2005) lldpRemTable — "what is plugged into what".
+# Each row is one neighbour heard on one local port, indexed by
 # lldpRemTimeMark.lldpRemLocalPortNum.lldpRemIndex (three arcs); the columns
 # below are walked separately (one GETBULK column walk each, the same shape
 # _walk_column already uses for the FDB) and joined back together on that
 # shared index suffix in nodepoll._run_lldp_table.
 #
-# lldpRemLocalPortNum is NOT necessarily an ifIndex — RFC 802.1AB leaves how
-# a local port is numbered to lldpLocPortTable, which maps it to a port only
-# via lldpLocPortIdSubtype/lldpLocPortId (interfaceAlias, macAddress, ...),
-# not to ifIndex directly. In practice the overwhelming majority of agents
-# this app polls (net-snmp's own LLDP implementation included) number
-# lldpLocPortNum identically to ifIndex, so that identity is used directly
-# rather than resolving the local-port table — the same pragmatic call
-# CISCO_MEMORY_* above makes for a vendor table nobody here has walked
-# against every implementation. A device that numbers them differently
-# stores neighbours against the wrong local port rather than not at all,
-# which read_device_lldp_neighbors's docstring says plainly.
+# lldpRemLocalPortNum is NOT necessarily an ifIndex: RFC 802.1AB maps a
+# local port to lldpLocPortTable, not to ifIndex. Nearly every agent this
+# app polls numbers them identically, so the identity is used directly
+# rather than resolving that table. A device that numbers them differently
+# stores neighbours against the wrong local port rather than not at all.
 LLDP_REM_CHASSIS_ID_SUBTYPE = "1.0.8802.1.1.2.1.4.1.1.4"
 LLDP_REM_CHASSIS_ID         = "1.0.8802.1.1.2.1.4.1.1.5"
 LLDP_REM_PORT_ID_SUBTYPE    = "1.0.8802.1.1.2.1.4.1.1.6"
@@ -279,7 +252,7 @@ DOT1D_STP_PROTOCOL_SPEC_ENUM = {1: "unknown", 2: "decLb100", 3: "ieee8021d"}
 
 # ---------------------------------------------------------- PtP radio links
 #
-# Point-to-point wireless bridges (Tier 1 #8): a PtP link has exactly one
+# Point-to-point wireless bridges: a PtP link has exactly one
 # remote end, so its RF quality is a handful of scalars, not a walkable
 # table — read the same way VENDOR_HEALTH's "scalar" probes are, one GET,
 # best-effort, and stored as ordinary metric samples so the existing
@@ -287,14 +260,9 @@ DOT1D_STP_PROTOCOL_SPEC_ENUM = {1: "unknown", 2: "decLb100", 3: "ieee8021d"}
 # nodepoll._poll_rf_metrics). Keyed by enterprise arc exactly like
 # VENDOR_HEALTH, so a device that is not a radio costs nothing extra.
 #
-# The instance numbering below matches what this app's own demo fleet
-# answers (demo/personas.py's ubiquiti_airfiber/cambium_ptp personas), which
-# is the only ground truth available without a live unit of either vendor
-# on hand — the same caveat CISCO_MEMORY_* above has always carried for a
-# vendor table this app has not walked against every firmware. A real
-# airFiber's AIRFIBER-MIB and a real PTP 670's CAMBIUM-PTP670-MIB should be
-# checked against a live device and this table adjusted if its numbering
-# differs.
+# The instance numbering matches this app's demo personas, the only ground
+# truth available without a live unit; check it against a real airFiber or
+# PTP 670 before trusting the numbering.
 RF_METRICS = {
     41112: (    # Ubiquiti airFiber/airMAX
         ("rf_rssi_dbm", "RSSI", "dBm", "1.3.6.1.4.1.41112.1.3.2.1.1.0", "scalar"),
@@ -324,38 +292,22 @@ RF_VENDOR_ARCS = frozenset(RF_METRICS)
 
 # ------------------------------------------------------------- UPS-MIB
 #
-# UPS-MIB (RFC 1628), 1.3.6.1.2.1.33. The gap this closes: trapoids.py
-# already decodes upsTrapOnBattery/upsTrapAlarmEntryAdded/etc as UPS
-# *traps* (a UPS can shout), and VENDOR_HEALTH above already names the
-# APC/Eaton/Vertiv enterprise arcs for identification — but nothing has
-# ever polled 1.3.6.1.2.1.33 itself, so nothing has ever ASKED a UPS how
-# it is: no charge, no runtime, no load, no "replace battery".
+# UPS-MIB (RFC 1628), 1.3.6.1.2.1.33: charge, runtime, load and "replace
+# battery" straight from the UPS.
 #
-# Unlike VENDOR_HEALTH, this table is not keyed by enterprise arc. A UPS's
-# maker varies far more than a switch's does — APC's arc is 318, Eaton's
-# 534, Vertiv/Liebert's 476, and plenty of small UPS brands sit on a
-# rebadged OEM card under yet another arc entirely — and UPS-MIB is the
-# one object tree nearly all of them answer regardless, which is the
-# whole reason it was standardised. Keying it to an arc would mean
-# maintaining a vendor list for every UPS a site might plug in for no
-# benefit: see nodepoll._poll_ups_health for how it is gated instead (a
+# Unlike VENDOR_HEALTH, this table is NOT keyed by enterprise arc. A UPS's
+# maker varies far more than a switch's does — and plenty of small brands
+# sit on a rebadged OEM card under an arc of their own — while UPS-MIB is
+# the one object tree nearly all of them answer regardless. See
+# nodepoll._poll_ups_health for how it is gated instead (a
 # cheap scalar GET first, on every device, and the two table walks only
 # when that GET proves the device worth asking further).
 #
-# (metric key, label, unit, OID, how, scale) — one field longer than
-# VENDOR_HEALTH's tuples. `scale` is the multiplier applied to the raw
-# number the agent returns before it becomes the stored metric value,
-# defaulting to 1.0 for every probe but one: RFC 1628 defines
-# upsBatteryVoltage in tenths of a volt, and storing 240 as "24.0 V" would
-# read as a UPS wired for a mains voltage rather than a 24 V battery
-# string. Nothing else here needs scaling — upsInputVoltage and
-# upsOutputPercentLoad are already whole Volts/percent, and the two enum
-# scalars (battery status, output source) are stored as their raw integer
-# code rather than decoded to text, the same way if_admin_status and
-# if_oper_status are: an alert rule's threshold evaluator only ever
-# compares numbers (see alertsdb._BUILTIN_RULES' ups_battery_low/
-# ups_battery_replace/ups_on_battery for why that matters), and enum_text()
-# below still renders the code as a label wherever the UI wants one.
+# (metric key, label, unit, OID, how, scale) — one field more than
+# VENDOR_HEALTH. `scale` is 1.0 everywhere but upsBatteryVoltage, which RFC
+# 1628 reports in tenths of a volt. The two enum scalars are stored as their
+# raw integer code, like if_admin_status/if_oper_status, because a threshold
+# evaluator only compares numbers; enum_text() renders the label.
 UPS_BATTERY_STATUS       = "1.3.6.1.2.1.33.1.2.1.0"
 UPS_SECONDS_ON_BATTERY   = "1.3.6.1.2.1.33.1.2.2.0"
 UPS_ESTIMATED_MINUTES    = "1.3.6.1.2.1.33.1.2.3.0"
@@ -401,19 +353,11 @@ UPS_HEALTH = (
      "column_max", 1.0),
 )
 
-# APC PowerNet-MIB's upsAdvBatteryRunTimeRemaining, in TimeTicks (hundredths
-# of a second rather than UPS-MIB's whole minutes). Consulted only when the
-# standard upsEstimatedMinutesRemaining scalar above did not answer, and
-# only on APC's own arc (318) -- the same "ask the vendor's own object only
-# once the standard one has been tried and failed" order GENERIC_HEALTH
-# already follows for CPU. Unlike every other OID in this file, this one
-# is NOT cross-checked against a live APC unit or a bundled MIB in this
-# build: it is the object every apcupsd/check_apc-style monitoring script
-# this author has seen uses for the same reading, which is real but
-# secondhand corroboration, the same standing enterprises.py's CURATED
-# table (rather than VERIFIED) already gives that kind of evidence. Written
-# here rather than added to enterprises.py because it names a MIB object,
-# not a vendor arc.
+# APC PowerNet-MIB's upsAdvBatteryRunTimeRemaining, in TimeTicks rather
+# than UPS-MIB's whole minutes. Consulted only on APC's arc (318) and only
+# once the standard upsEstimatedMinutesRemaining did not answer. NOT
+# cross-checked against a live unit or a bundled MIB: corroborated only by
+# what apcupsd-style scripts read for the same value.
 APC_BATTERY_RUNTIME_TIMETICKS = "1.3.6.1.4.1.318.1.1.1.2.2.3.0"
 
 
@@ -427,7 +371,7 @@ ENUMS = {
 
 
 def enum_text(key: str, value) -> str:
-    """Delegates to the same table shape trapoids.enum_text() uses, kept
+    """Delegates to the same table shape trapdecode.enum_text() uses, kept
     separate because Nodes' keys are short metric names, not raw OIDs."""
     table = ENUMS.get(key)
     if not table:
@@ -471,7 +415,7 @@ def enterprise_root(sys_object_id: str) -> str:
     Empty for anything outside the enterprises subtree — a device whose
     sysObjectID sits in the standard tree has no vendor MIB at all, which
     vendor_for() alone can't tell you: it longest-prefix-matches
-    trapoids.WELL_KNOWN, which names standard nodes too ("system" for
+    trapdecode.WELL_KNOWN, which names standard nodes too ("system" for
     1.3.6.1.2.1.1)."""
     oid = (sys_object_id or "").strip().strip(".")
     if not oid.startswith(ENTERPRISES + "."):
@@ -483,13 +427,13 @@ def enterprise_root(sys_object_id: str) -> str:
 
 
 def vendor_for(sys_object_id: str) -> str:
-    """Longest-prefix match against trapoids.WELL_KNOWN's vendor-root
+    """Longest-prefix match against trapdecode.WELL_KNOWN's vendor-root
     entries, reused rather than duplicated; then, for an arc that table
     does not name, the bundled enterprise-number list (enterprises.py) —
     so a device under an arc this app holds no MIB for still gets a name
     rather than a number. Callers that need to know how much to trust the
     name ask enterprises.is_verified()."""
-    from .trapoids import WELL_KNOWN
+    from .trapdecode import WELL_KNOWN
     if not sys_object_id:
         return ""
     oid = sys_object_id.strip(".")
@@ -597,18 +541,15 @@ GENERIC_AGENT_VENDORS = frozenset({"netSnmp", "ucdavis"})
 # answer is matched case-insensitively against the needle, so an object that
 # exists but says something else proves nothing.
 #
-# Read in a SEPARATE best-effort GET, never merged into the identity request.
-# An SNMPv1 agent asked for an object it does not implement answers noSuchName
-# with the whole varbind list echoed back as nulls -- and nodepoll only raises
-# on authorizationError, so sysDescr, sysObjectID, sysName and sysLocation
-# would all come back blank with no exception to catch. One unanswerable OID
-# must not be able to blank a device's identity.
-# Display names live in enterprises.py, beside the arc table that already
-# carries one for every vendor named by an arc -- a second table here would
-# drift out of step with it. The KEY is still what everything that behaves
-# per-vendor compares against (ConfigRX's backup command, the Cisco per-VLAN
-# MAC read, discovery's profile suggestion), so it stays a lowercase/camelCase
-# token and is never rewritten to a pretty string.
+# Read in a SEPARATE best-effort GET, never merged into the identity
+# request: an SNMPv1 agent asked for an object it does not implement answers
+# noSuchName with the whole varbind list echoed back as nulls, so one
+# unanswerable OID here would blank sysDescr, sysObjectID, sysName and
+# sysLocation with no exception to catch.
+#
+# Display names live in enterprises.py, beside the arc table. The KEY stays
+# a lowercase/camelCase token, never a pretty string: it is what every
+# per-vendor behaviour compares against.
 def vendor_label(vendor: str) -> str:
     """A vendor key as its maker's own name, or the key unchanged."""
     from . import enterprises
@@ -719,3 +660,74 @@ def suggest_group(sys_descr: str, sys_object_id: str, groups: list) -> int | Non
         if group["is_default"]:
             return group["id"]
     return None
+
+
+# ---------------------------------------------------------------------------
+# FortiGate Wireless Controller (fgWc) OIDs, hand-listed from the vendor's
+# FORTINET-CORE-MIB.mib / FORTINET-FORTIGATE-MIB.mib rather than parsed at
+# runtime -- the same "not a MIB compiler" convention the rest of this file
+# uses. Three tables, all indexed by (fgVdEntIndex, WtpId[, RadioId]):
+#
+#   fortinet(1.3.6.1.4.1.12356).fnFortiGateMib(101).fgWc(14).fgWcWtpTables(4)
+#     .fgWcWtpConfigTable(3)         -- the AP's configured name
+#     .fgWcWtpSessionTable(4)        -- live status, MAC, model, client count
+#     .fgWcWtpSessionRadioTable(5)   -- per-radio channel/tx power/clients
+# ---------------------------------------------------------------------------
+
+FORTINET = "1.3.6.1.4.1.12356"
+FG_MIB = f"{FORTINET}.101"
+FG_WC = f"{FG_MIB}.14"
+WTP_TABLES = f"{FG_WC}.4"
+
+# Column OIDs, relative to each table's own entry base
+# (<WTP_TABLES>.<table>.1.<column>) -- the base itself, not a leaf value.
+WTP_CONFIG_ENTRY = f"{WTP_TABLES}.3.1"
+WTP_SESSION_ENTRY = f"{WTP_TABLES}.4.1"
+WTP_SESSION_RADIO_ENTRY = f"{WTP_TABLES}.5.1"
+
+# fgWcWtpConfigEntry (config -- admin-set, not live status)
+WTP_CONFIG_NAME = f"{WTP_CONFIG_ENTRY}.3"          # DisplayString
+
+# fgWcWtpSessionEntry (live status)
+# fgWcWtpSessionWtpIpAddress: the AP's own address as the controller sees it,
+# read from the session table this module already walks — so it costs no extra
+# SNMP. It is what makes a per-AP response time possible at all: the module
+# never talks to an AP directly, only to the controller.
+WTP_SESSION_IP = f"{WTP_SESSION_ENTRY}.3"           # InetAddress
+WTP_SESSION_MAC = f"{WTP_SESSION_ENTRY}.6"          # PhysAddress
+WTP_SESSION_CONNECTION_STATE = f"{WTP_SESSION_ENTRY}.7"   # INTEGER, see below
+WTP_SESSION_MODEL = f"{WTP_SESSION_ENTRY}.12"       # DisplayString
+WTP_SESSION_STATION_COUNT = f"{WTP_SESSION_ENTRY}.17"      # Gauge32
+
+# fgWcWtpSessionRadioEntry (per-radio, indexed by an additional RadioId)
+WTP_RADIO_MODE = f"{WTP_SESSION_RADIO_ENTRY}.3"             # FgWcWtpRadioMode
+WTP_RADIO_CHANNEL = f"{WTP_SESSION_RADIO_ENTRY}.7"          # FgWcWtpRadioChannelNumber
+# fgWcWtpSessionRadioOperatingPower. The MIB's DESCRIPTION reads, verbatim:
+# "Represents the current operating power of this radio, in dBm." Observed
+# FortiOS does not do that: a FAP-231F reports values like 51 here, and
+# 51 dBm is ~126 W EIRP, roughly a thousand times what any indoor AP can
+# emit (a FortiAP's conducted output tops out near 20 dBm). What it is
+# actually reporting is FortiOS's own 0-100 tx-power *level* percentage.
+# Hence the auto-detection in fortipoll.py rather than a blanket "dBm"
+# label: values above a plausible dBm ceiling are read as a percentage,
+# and the raw number is always shown so the guess can be checked.
+WTP_RADIO_OPERATING_POWER = f"{WTP_SESSION_RADIO_ENTRY}.8"  # Integer32
+WTP_RADIO_STATION_COUNT = f"{WTP_SESSION_RADIO_ENTRY}.9"    # Gauge32
+
+# The highest conducted output any Wi-Fi radio plausibly reports in dBm.
+# 30 dBm is 1 W, already above every regulatory domain's indoor limit, so a
+# value above it did not come from a dBm-reporting agent.
+MAX_PLAUSIBLE_DBM = 30
+
+# FgWcWtpRadioMode, quoted from the MIB's own TEXTUAL-CONVENTION. Worth
+# polling because it explains an otherwise baffling radio: a FAP-231F's
+# third radio is a dedicated scanner, so its "power" describes a receiver.
+RADIO_MODE = {
+    0: "other", 1: "not present", 2: "disabled", 3: "ap",
+    4: "monitor", 5: "sniffer",
+}
+
+CONNECTION_STATE = {
+    0: "other", 1: "offline", 2: "online",
+    3: "downloading_image", 4: "connected_image", 5: "standby",
+}

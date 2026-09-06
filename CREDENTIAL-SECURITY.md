@@ -459,7 +459,7 @@ command (`show running-config`, `show full-configuration`, and so on),
 and for those few vendors, the fixed `enable` command followed by the
 device's own stored enable secret (the next subsection) — sent back only
 as the answer to that device's own password prompt, never as a command in
-its own right. All of it is sourced from `configrx_vendors.VENDORS`, a
+its own right. All of it is sourced from `configrx.VENDORS`, a
 hardcoded dictionary, never from request text; the pattern that recognises
 the device's password prompt is likewise fixed there and is never used to
 build anything sent to the device. A device's vendor-override field is

@@ -4,8 +4,8 @@ What to do when the monitoring itself is the thing that has gone wrong. Written
 for whoever is on call, not for whoever built it: each section is a symptom you
 can see on a screen, then the checks in the order worth doing them.
 
-`README.md` is setup, `BACKUP-RESTORE.md` is recovery from backup,
-`INTERNALS.md` is why any of this works the way it does.
+`README.md` is setup, its "Backup and restore" section is recovery from
+backup, `INTERNALS.md` is why any of this works the way it does.
 
 ---
 
@@ -517,8 +517,9 @@ returning anything but `ok`.
    two commands from wherever you unzipped it.
    If that returns `ok`, move it into place and start the service. Schemas
    migrate forward on open, so a recovered file from an older release is fine.
-4. **Otherwise restore from backup** — `BACKUP-RESTORE.md`, and note the DPAPI
-   caveat if you are restoring onto different hardware.
+4. **Otherwise restore from backup** — see `README.md`'s "Backup and restore"
+   section, and note the DPAPI caveat if you are restoring onto different
+   hardware.
 5. **The databases are independent.** A corrupt `flows.db` costs you flow
    history and nothing else; delete it and the application recreates it empty
    on the next start. Do not do that with `nodes.db`, `alerts.db` or

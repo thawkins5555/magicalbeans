@@ -1,45 +1,41 @@
-"""Socket facts the three collectors share: dual-stack binds, source
-addresses, and how many datagrams the kernel threw away before anyone read
-them.
+"""What the three UDP listeners share: dual-stack binds, source addresses,
+kernel drop counts, and the UdpReceiver base they all subclass.
 
-All three listeners bound AF_INET only, so a device sending syslog or traps
-from an IPv6 management address could not reach the collector at all — no
-bind error, no rejection counter, just silence, with nothing to tell "not
-configured" apart from "cannot be received". `bind` here asks for a
-dual-stack socket and falls back to IPv4 where the platform will not give
-one, and `normalise_source` folds the `::ffff:a.b.c.d` form a dual-stack
-socket reports back to the dotted quad the allow lists and the device
-correlation are written in.
+`bind` asks for a dual-stack socket and falls back to IPv4 where the platform
+will not give one; `normalise_source` folds the `::ffff:a.b.c.d` form a
+dual-stack socket reports back to the dotted quad the allow lists and the
+device correlation are written in.
 
-The drop counter:
-
-Every collector counts a message it had to drop because its own queue was
-full, but that only fires once the message has already been read off the
-socket.  The real loss point under load is the socket receive buffer, and
-nothing read it back: the review offered 300,000 syslog messages at 38k/s,
-93,412 were stored, 206,588 were dropped by the kernel, and the status strip
-said "93,412 messages · 93,412 stored" with a loss counter of zero.  That is
-worse than an outage, because it looks fine.
-
-Linux publishes the figure as the last column of ``/proc/net/udp`` and
-``/proc/net/udp6``, one row per bound socket, keyed on the local address and
-port in hex.  No other platform this application runs on exposes anything
-comparable cheaply, so there the counter is simply absent rather than
-guessed at — an absent number is honest, a fabricated one is not.
+counters["dropped"] only ever counted a message the application itself threw
+away, after it had been read off the socket. The real loss point under load
+is the socket receive buffer, which Linux publishes as the last column of
+``/proc/net/udp``/``udp6``, keyed on the local address and port in hex. No
+other platform this runs on exposes anything comparable cheaply, so there the
+counter is absent rather than guessed at.
 """
 
 from __future__ import annotations
 
+import collections
 import logging
 import os
+import queue
 import socket
 import sys
+import threading
 import time
+import traceback
+
+from .eventlog import ERROR, NullLog
 
 log = logging.getLogger(__name__)
 
 PROC_FILES = ("/proc/net/udp", "/proc/net/udp6")
 POLL_INTERVAL_S = 5.0
+
+# Cap on the "first message from ..." memories: their keys are spoofable
+# source addresses, so they are LRUs rather than unbounded sets.
+MAX_SEEN_SOURCES = 4096
 
 
 def bind(kind: int, address: str, port: int, buffer_bytes: int = 0,
@@ -188,3 +184,252 @@ class KernelDrops:
             self._baseline = raw
         self._value = max(0, raw - self._baseline)
         return self._value
+
+
+def lru_add(store: collections.OrderedDict, key, cap: int = MAX_SEEN_SOURCES) -> bool:
+    """True the first time `key` is offered to `store` since it was cleared.
+
+    The key is a source address, which anyone with network reach can vary, so
+    the memory is bounded and least-recently-used rather than growing for the
+    life of the process.
+    """
+    if key in store:
+        store.move_to_end(key)
+        return False
+    store[key] = None
+    while len(store) > cap:
+        store.popitem(last=False)
+    return True
+
+
+class UdpReceiver:
+    """What the three UDP listeners share: sockets, threads, drops, status.
+
+    Subclasses own their settings, decoding and writer thread; they supply
+    _handle_datagram for one datagram and _listening_text for the head of the
+    status line.
+    """
+
+    NOUN = "Collector"
+    PORT_LABEL = "UDP"
+    # The word the kernel-drop line names the port by ("NetFlow", "trap",
+    # "syslog").
+    DROPS_PORT_NOUN = "UDP"
+    LOG_CATEGORY: str | None = None
+    # Whether stop() files a "<NOUN> stopped" line; only the flow collector did.
+    STOP_LOG = False
+    QUEUE_SIZE = 20_000
+    COUNTERS: dict = {}
+
+    def __init__(self, log=None):
+        self.log = log or NullLog()
+        self._stop = threading.Event()
+        self._threads: list[threading.Thread] = []
+        self._udp: socket.socket | None = None
+        self._tcp: socket.socket | None = None
+        self._queue: queue.Queue = queue.Queue(maxsize=self.QUEUE_SIZE)
+        self._seen: collections.OrderedDict = collections.OrderedDict()
+        self.counters: dict = dict(self.COUNTERS)
+        self.error: str | None = None
+        self.bound: tuple[str, int] | None = None
+        self.family = socket.AF_INET
+        self.rcvbuf = 0
+        self.ports: dict[str, int] = {}
+        # A receive thread must never be able to die on message content, so
+        # its per-datagram work is guarded and the failures counted here;
+        # _crash records a thread that ended anyway, so the status strip can
+        # say "stopped unexpectedly" instead of looking like an operator stop.
+        self._loop_errors = 0
+        self._crash: str | None = None
+        self._drops: KernelDrops | None = None
+        self._drops_logged = False
+        self._log_times: dict[str, float] = {}
+
+    # --------------------------------------------------------------- lifecycle
+
+    @property
+    def running(self) -> bool:
+        # Every thread, not any of them: a dead writer with a live receiver
+        # left this True while nothing at all was being stored, and the status
+        # strip went on reading "listening ... last message just now".
+        return bool(self._threads) and all(t.is_alive() for t in self._threads)
+
+    def _reset_for_start(self) -> None:
+        self.error = None
+        self._crash = None
+        self._loop_errors = 0
+        self._stop.clear()
+        self._seen.clear()
+
+    def _bind(self, kind: int, address: str, port: int, buffer_bytes: int):
+        """A listening socket, with the clamped-receive-buffer warning."""
+        sock, self.family = bind(kind, address, port, buffer_bytes)
+        try:
+            self.rcvbuf = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        except OSError:
+            self.rcvbuf = 0
+        if kind == socket.SOCK_DGRAM and self.rcvbuf and self.rcvbuf < buffer_bytes:
+            # Linux reports back twice what it granted, so a readback below
+            # the request means net.core.rmem_max clamped it, the commonest
+            # reason for kernel drops under load.
+            self.log.add(ERROR,
+                         f"The receive buffer was clamped to {self.rcvbuf} bytes "
+                         f"(asked for {buffer_bytes})",
+                         detail="Raise net.core.rmem_max on this host, or lower "
+                                "the buffer size in Settings so the two agree.")
+        return sock
+
+    def _arm_kernel_drops(self, port: int) -> None:
+        """Start counting the kernel's own loss on `port`, where it is published.
+
+        The counter key is absent rather than zero on a platform that does not
+        publish the figure: an absent number is honest, a fabricated one is not.
+        """
+        self._drops = KernelDrops(port) if supported() else None
+        self._drops_logged = False
+        if self._drops is not None:
+            self.counters["kernel_dropped"] = 0
+        else:
+            self.counters.pop("kernel_dropped", None)
+
+    def _spawn(self, target, name: str) -> None:
+        thread = threading.Thread(target=lambda: self._guard(target, name),
+                                  name=name, daemon=True)
+        thread.start()
+        self._threads.append(thread)
+
+    def _guard(self, target, name: str) -> None:
+        """Run a receiver thread and remember how it ended, so a crash reads
+        as "stopped unexpectedly" rather than as an operator stop."""
+        try:
+            target()
+        except Exception as exc:
+            self._crash = f"{name}: {exc}"
+            self.log.add(ERROR, f"The {name} thread stopped unexpectedly: {exc}",
+                         detail=traceback.format_exc())
+        else:
+            if not self._stop.is_set():
+                self._crash = f"{name} ended unexpectedly"
+
+    def stop(self) -> None:
+        if self.STOP_LOG and self.LOG_CATEGORY and self.running:
+            self.log.add(self.LOG_CATEGORY, f"{self.NOUN} stopped")
+        self._stop.set()
+        for sock in (self._udp, self._tcp):
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        self._udp = self._tcp = None
+        for thread in self._threads:
+            if thread.is_alive():
+                thread.join(timeout=2)
+        self._threads = []
+        self.bound = None
+
+    # ------------------------------------------------------------------ access
+
+    def _first_from(self, source: str) -> bool:
+        """True the first time a source is seen since the last start."""
+        return lru_add(self._seen, source)
+
+    # ------------------------------------------------------------------ errors
+
+    def _poll_kernel_drops(self) -> None:
+        """Read back the kernel's own loss counter for the bound port.
+
+        counters["dropped"] only counts a message the writer queue could not
+        take, which is loss the application caused; datagrams the socket
+        buffer discarded before anyone read them were invisible.
+        """
+        if self._drops is None:
+            return
+        value = self._drops.poll()
+        if value is None:
+            return
+        previous = self.counters.get("kernel_dropped", 0)
+        self.counters["kernel_dropped"] = value
+        if value > previous and not self._drops_logged:
+            self._drops_logged = True
+            self.log.add(ERROR,
+                         f"The kernel is dropping datagrams on "
+                         f"{self.DROPS_PORT_NOUN} port "
+                         f"{self._drops.port}: {value} lost before they could "
+                         f"be read",
+                         detail="The socket receive buffer is full: the sender "
+                                "is faster than this host can drain it. Raise "
+                                "the buffer size in Settings, and on Linux "
+                                "raise net.core.rmem_max to at least that "
+                                "value.")
+
+    def _log_throttled(self, key: str, message: str, detail: str = "",
+                       target: str = "", interval_s: float = 60.0) -> bool:
+        """Log one line per `key` per interval, so a flood of anything cannot
+        fill the event log. True when this call did log."""
+        now = time.time()
+        if now - self._log_times.get(key, 0.0) < interval_s:
+            return False
+        self._log_times[key] = now
+        self.log.add(ERROR, message, target=target, detail=detail)
+        return True
+
+    def _sync_error_counter(self) -> None:
+        """Republish counters["errors"] after _loop_errors changed. Overridden
+        where a decoder keeps errors of its own to add in."""
+        self.counters["errors"] = self._loop_errors
+
+    def _note_error(self, exc: Exception) -> None:
+        """Count a datagram the receive path could not process, and log at
+        most one traceback a minute so a flood cannot fill the event log."""
+        self._loop_errors += 1
+        self._sync_error_counter()
+        self._log_throttled("receive", f"Receive error: {exc}",
+                            detail=traceback.format_exc())
+
+    # ----------------------------------------------------------------- threads
+
+    def _receive_udp(self) -> None:
+        sock = self._udp
+        while not self._stop.is_set() and sock is not None:
+            try:
+                data, address = sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                self._handle_datagram(data, address)
+            except Exception as exc:
+                self._note_error(exc)
+
+    def _handle_datagram(self, data: bytes, address) -> None:
+        """One datagram, already read off the socket. Anything it raises is
+        counted and throttled by _receive_udp."""
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------ status
+
+    def _listening_text(self) -> str:
+        """The head of the status line while the receiver is up: where it is
+        listening, and how long ago the last message arrived."""
+        raise NotImplementedError
+
+    def _status_parts(self) -> list[str]:
+        """Per-receiver tail of the status line: throttled, truncated, and the
+        other counters worth surfacing."""
+        return []
+
+    def status_text(self) -> str:
+        if self.error:
+            return self.error
+        if not self.running:
+            if self._crash:
+                return f"{self.NOUN} stopped unexpectedly: {self._crash}"
+            return f"{self.NOUN} stopped"
+        parts = [self._listening_text()]
+        lost = self.counters.get("kernel_dropped", 0)
+        if lost:
+            parts.append(f"{lost} dropped by the kernel")
+        parts.extend(self._status_parts())
+        return " · ".join(parts)

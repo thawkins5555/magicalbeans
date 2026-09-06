@@ -1,4 +1,4 @@
-"""PoE and STP polling (Tier 1 #7): PSE budget/consumption and per-port
+"""PoE and STP polling: PSE budget/consumption and per-port
 state stored via nodepoll._poll_poe, bridge state and per-port state via
 _poll_stp, the topology-change counter recorded as an ordinary metric
 sample, the capability probe remembered so a non-PoE/non-STP device is

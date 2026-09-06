@@ -1,22 +1,9 @@
 """netpath/report.py's top_metric_ranking(): correctness on a small,
-hand-checkable fixture, then the realistic-scale cost this task explicitly
-asked to be measured rather than assumed.
-
-The correctness fixture is deliberately tiny — a handful of interfaces with
-known peak/mean values, so every assertion below can be checked by eye
-against the numbers seeded into it, rather than against another piece of
-code that could share this module's own mistakes.
-
-The scale fixture is not: 2,000 devices x 48 ports x six metric families is
-what NETWORK-AND-STORAGE-REQUIREMENTS.md's own "how many devices" section
-already uses as the shipped product's realistic ceiling, and it is run here
-because a query that is only ever exercised at a few hundred rows in CI
-would never have caught the "too many SQL variables" and "SQLite reordered
-the join the wrong way" failures this module's own docstring describes —
-both were found by actually generating this many rows, not by reasoning
-about the schema. It is marked slow (see SLOW_S below) rather than skipped:
-a regression here is exactly the kind of thing that should fail CI, not
-quietly stop being checked once it takes a while.
+hand-checkable fixture, then a realistic-scale cost check. The scale
+fixture (2,000 devices x 48 ports x six metric families,
+NETWORK-AND-STORAGE-REQUIREMENTS.md's own ceiling) is what actually
+catches "too many SQL variables" and join-ordering regressions; it is
+marked slow rather than skipped, since a regression here should fail CI.
 """
 import os
 import sys

@@ -1,26 +1,11 @@
 """A curated catalog of vendor MIB bundles that can be fetched on demand.
 
-Why a catalog and not "ship every MIB there is": the obvious answer to "can
-you include all of cisco/cisco-mibs?" is no, and for reasons worth writing
-down. That repository is 2,921 MIB files and roughly 350 MB of text, with no
-license file of its own; `mib_files` stores each file's full text in SQLite
-and `all_known_oids()` loads every resolved object into a dict on each
-resolve, so bundling it would multiply this app's database size by two orders
-of magnitude to give an operator ten MIBs they actually poll. Worse, it would
-do so silently at install time, on a box that may have no internet access and
-no say in the matter.
-
-So: the standard IETF MIBs every device answers are *bundled* (netpath/mibs/,
-seeded on first start), and everything vendor-specific lives here as a named
-bundle an admin picks and installs deliberately. The catalog is static data —
-no network access to read it, so the list below is the "list to choose from"
-even on an air-gapped install; only pressing Install reaches out.
-
-Each bundle names its upstream explicitly. Nothing is mirrored or
-redistributed by this project: the files are fetched at install time from the
-vendor's or the distribution's own public repository, and an operator who
-would rather not fetch anything can download the same files by hand and use
-the ordinary MIB upload (which accepts a zip).
+Standard IETF MIBs are bundled (netpath/mibs/); vendor-specific bundles
+are fetched here, deliberately, rather than shipped — a single vendor's
+full MIB repository can be hundreds of MB and would multiply this app's
+database size for MIBs most installs never poll. The catalog itself is
+static (no network access to read it); only pressing Install reaches out,
+to the vendor's own public repository — nothing is mirrored here.
 """
 
 from __future__ import annotations
@@ -58,7 +43,7 @@ class Bundle:
     # bundle would decode — install it". Never guessed: a wrong arc would
     # suggest the wrong bundle for every device under it.
     arcs: tuple[int, ...] = ()
-    # The canonical vendor key (trapoids.WELL_KNOWN / enterprises.py
+    # The canonical vendor key (trapdecode.WELL_KNOWN / enterprises.py
     # spelling) behind the display label in `vendor`, so the UI, ConfigRX
     # and the identification evidence all compare one string.
     vendor_key: str = ""

@@ -1,17 +1,9 @@
-"""The poller's scheduling thread: what one pass costs, that a settings
-change is picked up, and that the thread survives a database error.
-
-§4.1 S5 / §4.5 F4 measured 4,001 SQLite statements a second at 2,000
-devices — the loop re-read the whole device table and called
-effective_config() per device, which itself reads the settings table four
-times and the device's group once, all under the lock every poll worker
-needs. §4.1 S2: the same loop had no exception guard, so one transient
-database error stopped all polling permanently, silently, with
-`poller.error` still None.
-
-No SNMP traffic here — the pass is driven directly, the way
-test_series_buckets.py drives the database directly.
-"""
+"""The poller's scheduling thread: what one pass costs, that a settings change
+is picked up, and that the thread survives a database error. One pass must not
+re-read the whole device table or call effective_config() per device under
+the shared lock, and one transient database error must not stop polling
+silently with `poller.error` still None. No SNMP traffic here: the pass is
+driven directly, the way test_series_buckets.py drives the database directly."""
 import os
 import sys
 import threading

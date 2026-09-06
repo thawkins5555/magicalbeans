@@ -1,21 +1,9 @@
-"""tracer.expected_budget()'s ceiling — the second instance, in one night's
-own campaign, of the shape a downstream review's `poll_interval_s x
-down_after_failures` finding already named: three fields (max_hops, probes,
-timeout_s), each individually bounded and each individually justified
-against its own mechanism (db.py's MAX_MAX_HOPS/MAX_PROBES/MAX_TIMEOUT_S),
-multiply together in this one formula with nothing ever checking the
-PRODUCT. On Windows (parallel=1, since tracer.PROBE_PARALLELISM's 16-way
-value is Linux-only) the three individually-sane maxima computed a
-153,015-second (42.5 hour) worst case for a single trace — occupying one of,
-at most, trace_workers (bounded to 64) worker slots for a day and a half,
-from nothing more hostile than a fat-fingered "make it thorough" target
-configuration.
-
-Fixed by MAX_EXPECTED_BUDGET_S, a ceiling on the computed value rather than
-a further tightening of any one input — see tracer.py's own comment above
-expected_budget() for why capping the product, not the factors, is what
-survives a fourth field joining this formula the way these three did without
-anyone computing what they multiply to.
+"""tracer.expected_budget()'s ceiling: max_hops, probes and timeout_s are each
+individually bounded (db.py's MAX_MAX_HOPS/MAX_PROBES/MAX_TIMEOUT_S) but
+multiply together in this one formula, and the worst legal combination on
+Windows (parallel=1) computes a multi-day budget for a single trace.
+MAX_EXPECTED_BUDGET_S caps the computed product rather than any one factor;
+this suite proves the cap holds and that ordinary inputs are unaffected.
 """
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 

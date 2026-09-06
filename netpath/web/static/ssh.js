@@ -1,24 +1,14 @@
-/* The SSH window.
-
-   A standalone page like login.html: it shares app.css and nothing else, so
-   none of the application's own machinery (boot.js, app.js, the refresh
-   loop, App.modal) is loaded into a window that exists to hold one terminal.
-   Everything below talks to one WebSocket, whose protocol is documented in
-   INTERNALS: text frames are JSON control messages in both directions,
-   binary frames are terminal bytes.
-
-   xterm.js and its fit addon are vendored under /vendor/ (see
-   vendor/README.txt) — the CSP here is `default-src 'self'` and appliances
-   are routinely installed with no route out, so a CDN is not an option. */
+/* The SSH terminal: a standalone page like login.html, sharing only
+   app.css. One WebSocket carries the session — text frames are JSON
+   control messages, binary frames are terminal bytes (see INTERNALS).
+   Vendored xterm.js 5.5.0 and addon-fit 0.10.0 are checked in unmodified;
+   see vendor/LICENSE-xterm.txt. */
 (() => {
   'use strict';
 
   const params = new URLSearchParams(window.location.search);
   const deviceId = Number(params.get('device')) || 0;
-  /* The opener passes the display name so the window has a title and a
-     header before the first API call answers; displayName() itself is
-     private to nodes.js and the precedence it encodes is not worth
-     duplicating here. Whatever the API returns wins once it arrives. */
+  // The opener's name is a placeholder; the API's own answer wins once it arrives.
   const openerName = params.get('name') || '';
 
   const el = (id) => document.getElementById(id);
@@ -42,9 +32,7 @@
   let lastSize = { cols: 0, rows: 0 };
   const encoder = new TextEncoder();
 
-  /* Close codes the server uses (INTERNALS: the WebSocket protocol).
-     Anything else is reported by number, which is more use to whoever is
-     reading it than a flat "connection lost". */
+  // Close codes the server uses (INTERNALS); anything else is reported by number.
   const CLOSE_WORDS = {
     1000: '',
     1001: 'the window is closing',
@@ -55,18 +43,13 @@
     4429: 'too many SSH sessions are already open',
   };
 
-  // -------------------------------------------------------------- chrome
-
   function setStatus(kind, text) {
     statusEl.textContent = text;
     statusEl.className = 'ssh-status is-' + kind;
     disconnectBtn.disabled = !(socket && socket.readyState === WebSocket.OPEN);
   }
 
-  /* The notice bar sits above the terminal and takes its own height when it
-     is shown, so showing or hiding one changes how many rows are left. Refit
-     afterwards or the bottom rows — the prompt among them — stay clipped
-     until the window happens to be resized. */
+  // Showing/hiding the notice changes how many rows are left; refit or the bottom rows stay clipped.
   function setNotice(text, kind) {
     noticeEl.textContent = text || '';
     noticeEl.className = 'ssh-notice' + (kind ? ' is-' + kind : '');
@@ -78,8 +61,7 @@
     const shown = nameEl.textContent || openerName || 'device';
     const ip = device ? device.ip : '';
     document.title = ip ? `SSH — ${shown} (${ip})` : `SSH — ${shown}`;
-    // xterm renders to a canvas a screen reader cannot see; the accessible
-    // name at least says whose shell a tab lands the operator in.
+    // xterm renders to a canvas a screen reader cannot see; this at least names whose shell it is.
     termEl.setAttribute('aria-label',
       ip ? `Terminal session with ${shown} (${ip})` : `Terminal session with ${shown}`);
   }
@@ -88,28 +70,13 @@
     box.hidden = !visible;
   }
 
-  // -------------------------------------------------------------- sr log
-
-  /* #ssh-log mirrors completed lines of device output as plain text, for a
-     screen reader that cannot read xterm's canvas even with screenReaderMode
-     on. Buffered rather than pushed byte-for-byte: a device echoes typed
-     characters back one at a time, and announcing a line before Enter ends
-     it would read every keystroke of a typed username out loud. */
+  // #ssh-log mirrors completed output lines as plain text for a screen reader,
+  // which cannot read xterm's canvas; buffered, or a typed username would be
+  // announced one keystroke at a time.
   const logDecoder = new TextDecoder();
   let logBuffer = '';
   const LOG_MAX_LINES = 500;
-  /* Most device prompts ("acc-sw-001#") arrive with no trailing newline —
-     the device is done talking and waiting for a keystroke, not about to
-     print a new line — so the code above left them sitting in logBuffer
-     forever: the one line a screen-reader user most needs (the device is
-     ready; here is its output) was the one line #ssh-log never announced,
-     for the entire session, unless something later happened to send a bare
-     "\n". Announcing on every byte would read a typed username out loud one
-     letter at a time, which is exactly what the buffering above exists to
-     avoid; announcing after a short silence does not, because a real typist
-     leaves less than this between keystrokes far more often than not, and
-     the cost when they do pause is an extra, harmless read of a line that
-     is about to be completed anyway — not the silence this replaces. */
+  // Most device prompts carry no trailing newline, so a line is announced after a short idle gap.
   const LOG_IDLE_MS = 400;
   let logIdleTimer = null;
 
@@ -149,9 +116,7 @@
     }
   }
 
-  /* Written into the terminal rather than onto the one-line notice: connect
-     failures carry ConfigRX's guidance text, which runs to several lines and
-     matters more than it fits. */
+  // Written into the terminal, not the one-line notice: connect failures carry guidance text that runs to several lines.
   function writeMessage(text, colour) {
     if (!term || !text) return;
     logLine(text);
@@ -159,29 +124,13 @@
     term.write('\r\n' + colourOn + text.replace(/\n/g, '\r\n') + '\u001b[0m\r\n');
   }
 
-  // ------------------------------------------------------------ terminal
-
   function cssVar(name, fallback) {
     const value = getComputedStyle(document.documentElement)
       .getPropertyValue(name).trim();
     return value || fallback;
   }
 
-  /* The 16-colour ANSI palette, read from the application's tokens rather
-     than copied, so the terminal keeps matching the rest of the product if
-     a theme's colours ever move. The six hues keep one tone for both their
-     base and bright slot — an accent already chosen for contrast against
-     that theme's own background needs to exist, not be lightened or
-     darkened again, the same principle Solarized's light and dark variants
-     use the identical hues for. --nodata/--text/--line/--muted/--dim are
-     different roles, not opposite ends of one ladder, and on the dark
-     themes they happen to double as black/white/brightBlack; the light
-     theme needs the ladder read the other way, or "white" text vanishes
-     into white paper — black/white/brightBlack/brightWhite are the one
-     group that has to be picked by the resolved theme rather than by
-     token role, which is what left brightWhite a hardcoded #FFFFFF (1:1
-     on light) and six bright hues undefined (xterm's own dark-terminal
-     defaults, #FFFF00 among them, 1.07:1 on light) in the first place. */
+  // Reads the application's tokens rather than copying them; black/white/brightBlack/brightWhite follow the resolved theme.
   function ansiColors() {
     const light = document.documentElement.getAttribute('data-theme') === 'light';
     const red = cssVar('--fail', '#F8544C'), green = cssVar('--ok', '#3FB950'),
@@ -215,9 +164,7 @@
       setStatus('error', 'The terminal library did not load');
       return false;
     }
-    // Defensive: nothing today calls buildTerminal() a second time, but a
-    // reconnect that ever grows one must not leave the previous Terminal's
-    // helper textarea behind, stacked a second time in the tab order.
+    // Defensive: a second call must not leave the previous Terminal's helper textarea stacked in the tab order.
     if (term) {
       term.dispose();
       term = null;
@@ -229,11 +176,9 @@
       theme: theme(),
       cursorBlink: true,
       scrollback: 5000,
-      // The device decides what a newline means; translating here would
-      // corrupt anything full-screen (a vendor menu, top, vi).
+      // The device decides what a newline means; translating here would corrupt anything full-screen (a menu, top, vi).
       convertEol: false,
-      // xterm's own accessibility layer: a live region that tracks what is
-      // actually rendered, on top of #ssh-log's own coarser line-by-line one.
+      // xterm's own live-region accessibility layer, on top of #ssh-log.
       screenReaderMode: true,
     });
     if (window.FitAddon && window.FitAddon.FitAddon) {
@@ -241,23 +186,15 @@
       term.loadAddon(fitAddon);
     }
     term.open(termEl);
-    /* #ssh-term, not this textarea, is the one stop in the tab order — see
-       the focus listener below, which hands real keyboard focus on to it. */
+    // #ssh-term, not this textarea, is the one stop in the tab order; the focus listener below hands focus on to it.
     const helper = termEl.querySelector('.xterm-helper-textarea');
     if (helper) helper.tabIndex = -1;
     if (!termEl.dataset.focusWired) {
       termEl.dataset.focusWired = '1';
       termEl.addEventListener('focus', () => { if (term) term.focus(); });
     }
-    /* A terminal that keeps Tab has to publish some other way out, or it is
-       a keyboard trap. The way out is Ctrl+F6, not Escape: Escape is a real
-       keystroke to the device — vi, less, a menu-driven switch console all
-       need it, and this window exists to reach exactly those — so spending
-       it on focus management would cost an operator the key they use most
-       and hand back one they use once. Ctrl+F6 is the platform convention
-       for leaving a widget that captures the tab key, and nothing on a
-       switch's shell reads it. Documented in the hint line under the
-       header, which is what the guideline actually asks for. */
+    // A terminal that keeps Tab needs another way out or it is a keyboard trap. Ctrl+F6, not Escape, since Escape
+    // is a real keystroke to the device (vi, less, a menu console); documented in the hint line under the header.
     term.attachCustomKeyEventHandler((event) => {
       if (event.type === 'keydown' && event.key === 'F6' && event.ctrlKey) {
         reconnectBtn.focus();
@@ -265,8 +202,7 @@
       }
       return true;
     });
-    /* Keystrokes go out as binary frames exactly as typed; the server
-       forwards them to the channel without looking at them. */
+    // Keystrokes go out as binary frames exactly as typed.
     term.onData((data) => {
       if (socket && socket.readyState === WebSocket.OPEN) {
         socket.send(encoder.encode(data));
@@ -276,11 +212,8 @@
     return true;
   }
 
-  /* Sizes the terminal to the window and records the result in lastSize,
-     telling nobody. Returns true when the size actually changed. Kept apart
-     from fit() because the size is needed before the session exists: the
-     `open` message carries it, and a `resize` that arrives first is a
-     protocol error the server closes the socket on. */
+  // Sizes the terminal and records it in lastSize; returns true if it changed. Kept apart from fit() because the
+  // size is needed before the session exists — a `resize` before `open` is a protocol error.
   function measure() {
     if (!fitAddon) return false;
     try {
@@ -307,8 +240,6 @@
     fitTimer = window.setTimeout(fit, 80);
   });
 
-  // ----------------------------------------------------------- transport
-
   function send(message) {
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify(message));
@@ -325,9 +256,7 @@
     show(credsBox, false);
     show(hostkeyBox, false);
     setStatus('connecting', 'Connecting…');
-    // A reconnect starts a new device session; a partial line left over
-    // from the last one (its final, promptless prompt, most likely) is not
-    // this session's output and must not be glued onto whatever it sends.
+    // A reconnect starts a new device session; a partial line left over from the last one must not be glued on.
     window.clearTimeout(logIdleTimer);
     logBuffer = '';
     let ws;
@@ -342,12 +271,7 @@
 
     ws.onopen = () => {
       if (socket !== ws) return;
-      // Measure before the first message: the server sizes the pty from the
-      // cols/rows in `open`, and a wrong size there is a wrapped prompt for
-      // the life of the session. measure() rather than fit() because `open`
-      // has to be the first message on the socket — anything a notice shown
-      // in the meantime changed rides out in `open` itself, and every later
-      // change goes as a `resize` through fit().
+      // The server sizes the pty from `open`'s cols/rows, so measure() (not fit()) runs first — `open` is sent first.
       measure();
       send({ type: 'open', cols: lastSize.cols || 80, rows: lastSize.rows || 24 });
       setStatus('connecting', 'Opening the session…');
@@ -383,17 +307,8 @@
         window.location.href = '/login';
         return;
       }
-      // The server's own status:closed control frame (handleControl, below)
-      // already said something specific when it had something specific to
-      // say — "Closed after 10 minute(s) idle" for an idle timeout capped
-      // by the operator's own live web-session setting, which
-      // CLOSE_WORDS[4408]'s fixed phrase cannot express since it has no
-      // idea what that setting currently is. Read off the socket itself
-      // (ws.__closeMessage, set only when that frame carried a real
-      // message), never a module-level variable, so it can only ever be
-      // the explanation THIS close accompanied — a later, unrelated close
-      // on a different socket starts with nothing stashed and falls
-      // through to CLOSE_WORDS exactly as before.
+      // Prefer the server's own status:closed message (stashed on this socket by handleControl) over the fixed
+      // CLOSE_WORDS phrase; kept on the socket itself so an unrelated close on a different socket never inherits it.
       if (ws.__closeMessage) {
         setStatus('closed', ws.__closeMessage);
         setNotice(`${ws.__closeMessage}.`, event.code >= 4400 ? 'warn' : '');
@@ -430,11 +345,7 @@
         } else if (message.state === 'connecting') {
           setStatus('connecting', message.message || 'Connecting…');
         } else {
-          // Stashed on the socket itself, not overwritten with a blank
-          // one when this frame carries no message of its own — ws.onclose
-          // reads this before falling back to CLOSE_WORDS, and only when
-          // there is something worth preferring over that table's fixed
-          // phrase for the code the close actually arrives with.
+          // Only when this frame actually carries one; ws.onclose reads this before falling back to CLOSE_WORDS.
           if (ws && message.message) ws.__closeMessage = message.message;
           setStatus('closed', message.message || 'Disconnected');
         }
@@ -470,10 +381,7 @@
     return (text || '').split('\n')[0].trim();
   }
 
-  /* paramiko surfaces a bare socket.error on a failed TCP connect —
-     "[Errno None] Unable to connect to port 2201 on 127.0.0.250" — which
-     names neither the fix nor where to make it. Recognise that shape and
-     say what an operator actually needs instead. */
+  // paramiko surfaces a bare socket.error on a failed TCP connect; recognise that shape and say what an operator needs.
   function friendlyError(text) {
     const raw = text || '';
     if (!/unable to connect to port/i.test(raw) && !/^\[errno/i.test(raw)) return raw;
@@ -483,8 +391,6 @@
       'the device is reachable and listening on that port, or change the port ' +
       'under ConfigRX → Device settings.';
   }
-
-  // ------------------------------------------------------------ overlays
 
   const CRED_REASONS = {
     'none-stored': 'No SSH credential is stored for this device in ConfigRX.',
@@ -515,8 +421,7 @@
       return;
     }
     send({ type: 'auth', username: user.value.trim(), password: pass.value });
-    // Nothing typed here is kept: the field is emptied the moment it has
-    // been sent, and the page never puts it anywhere else.
+    // Nothing typed here is kept: the field is emptied the moment it is sent.
     pass.value = '';
     show(credsBox, false);
     setStatus('connecting', 'Signing in…');
@@ -547,8 +452,6 @@
     setStatus('closed', 'Disconnected — the new host key was not trusted');
   });
 
-  // -------------------------------------------------------------- header
-
   reconnectBtn.addEventListener('click', () => {
     setNotice('');
     if (device) connect();
@@ -561,14 +464,10 @@
     setNotice('');
   });
 
-  /* A closed window must not leave a session (and an SSH channel into the
-     device) open behind it: the server tears the session down when the
-     socket closes, so closing it here is the whole cleanup. */
+  // A closed window must not leave the device's SSH channel open; the server tears the session down on close.
   window.addEventListener('beforeunload', () => {
     closeSocket(1000, 'window closed');
   });
-
-  // ---------------------------------------------------------------- boot
 
   async function load() {
     setStatus('connecting', 'Looking the device up…');
@@ -592,9 +491,7 @@
       return;
     }
     if (!response.ok) {
-      // This also covers the route being absent altogether (an older server,
-      // or one whose SSH service failed to start): a connection problem,
-      // said in the one place this window says connection problems.
+      // Also covers the route being absent (an older server, or one whose SSH service failed to start).
       const detail = payload.error ? `${payload.error} (HTTP ${response.status})`
         : `HTTP ${response.status}`;
       setStatus('error', `Could not reach the SSH service — ${detail}`);
@@ -604,8 +501,6 @@
 
     device = payload.device || { id: deviceId, ip: '' };
     device.ssh_port = payload.ssh_port || 22;
-    // The server resolves the display-name precedence once and sends the
-    // answer as `name`; the opener's name is only the stand-in until it does.
     nameEl.textContent = device.name || openerName;
     ipEl.textContent = device.ip ? `${device.ip}:${device.ssh_port}` : '';
     setTitle();

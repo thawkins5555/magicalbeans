@@ -18,7 +18,7 @@ fixing, not just using.
 - [NetPath](#netpath) · [NetFlow](#netflow) · [SNMP Trap](#snmp-trap) · [Syslog](#syslog) · [IPAM](#ipam)
 - [Self-update (`selfupdate.py`)](#self-update-selfupdatepy)
 - [Auth (`auth.py`)](#auth-authpy) · [Permissions](#permissions-permissionspy-appdbs-user_permissions)
-- [Wireless](#wireless-fortinetoidspy-wirelessdbpy-fortipollpy) · [ConfigRX](#configrx-configrxdbpy-configrxpy-configrx_vendorspy)
+- [Wireless](#wireless-nodeoidspy-wirelessdbpy-fortipollpy) · [ConfigRX](#configrx-configrxdbpy-configrxpy)
 - [Web layer](#web-layer) — routing, the API, the browser application
 - [Tests (`tests/`)](#tests-tests)
 
@@ -41,12 +41,16 @@ netpath/
   syslogparse.py   RFC 3164 / RFC 5424 parsing
   syslogd.py       syslog UDP/TCP listener
   syslogdb.py      syslog storage, rollup counts, FTS5 trigram search
-  trapdecode.py    SNMP trap BER/ASN.1 decode + encode, v3 USM auth
-  trapoids.py      well-known OID names, enum tables, default severities
+  trapdecode.py    SNMP trap BER/ASN.1 decode + encode, v3 USM auth;
+                   well-known OID names, enum tables, default severities
   snmptrapd.py     SNMP trap UDP listener
   snmptrapdb.py    SNMP trap storage, rollup counts
-  namelookup.py    reverse DNS: system resolver, direct PTR query, nslookup
-  procs.py         subprocess launch without a console window
+  namelookup.py    reverse DNS: system resolver, direct PTR query, nslookup;
+                   shared "best display name for an IP", used by Syslog,
+                   Alerts and NetPath alike
+  worker.py        subprocess launch without a console window; ago(ts)
+                   elapsed-time formatting; the Worker mixin background
+                   workers subclass for start/stop/status plumbing
   auth.py          password hashing, sessions, login throttling
   eventlog.py      bounded in-memory event buffer
   appdb.py         app.db: global settings, users, shared reverse-DNS cache
@@ -55,7 +59,9 @@ netpath/
   ipam_scan.py     ping sweep, ARP table read, MAC normalization
   ipam_dhcp.py     PowerShell scripts that query a DHCP server
   ipam_worker.py   IPAM scheduler: subnet scans, DHCP polls, conflict checks
-  nodeoids.py      built-in polled-metric OID catalog for the Nodes poller
+  nodeoids.py      built-in polled-metric OID catalog for the Nodes poller;
+                   also the OID constants for FortiGate Wireless Controller
+                   polling
   nodepoll.py      NodePoller: the per-device SNMP/ping scheduler
   nodesdb.py       nodes.db: devices, profiles, interfaces, metrics/
                    samples, state events, uploaded MIBs, discovery jobs
@@ -76,21 +82,19 @@ netpath/
   alertengine.py   AlertEngine: the 5-second evaluation scheduler,
                    drains events/traps/syslog/IPAM into alerts
   alertmail.py     alert email: {{token}} template rendering, stdlib SMTP
-  fortinetoids.py  OID constants for FortiGate Wireless Controller polling
   fortipoll.py     WirelessPoller: polls FortiGate controllers for
                    managed APs over SNMP
   wirelessdb.py    wireless.db: controller storage and SNMP credentials
   configrxdb.py    configrx.db: backup config storage, keyed to Nodes'
                    device ids
-  configrx.py      ConfigRxWorker: scheduled read-only SSH config pulls
-  configrx_vendors.py     per-vendor allow-list of the exact commands a
-                   backup may send over SSH
+  configrx.py      ConfigRxWorker: scheduled read-only SSH config pulls;
+                   per-vendor allow-list of the exact commands a backup
+                   may send over SSH
   configrx_redact.py      strips secrets from a captured config before
                    it is stored
-  configrx_search.py      cross-device search over stored configs, with
-                   a bounded-regex compiler
-  configrx_compliance.py  rule sets: must/must-not-match checks against
-                   each device's latest capture
+  configrx_compliance.py  cross-device search over stored configs, with a
+                   bounded-regex compiler; rule sets: must/must-not-match
+                   checks against each device's latest capture
   hostkeys.py      remembered SSH host keys, shared by ConfigRX and the
                    SSH terminal
   sshterm.py       interactive SSH sessions for the browser terminal,
@@ -98,18 +102,18 @@ netpath/
   permissions.py   the per-module read/write permission model
   report.py        availability and link-saturation reports, from
                    history Nodes and Alerts already keep
-  hostresolve.py   shared "best display name for an IP", used by
-                   Syslog, Alerts and NetPath alike
-  dbmaint.py       incremental-vacuum space reclamation without
-                   VACUUM's stop-the-world lock
-  dbopen.py        opens a SQLite file with owner-only file permissions
-  settingsutil.py  type coercion for settings dicts to/from the
-                   settings table
+  sqlitebase.py    the `SqliteStore` base class every database module
+                   subclasses (open/pragma/migrate/close, settings,
+                   trim/reclaim); opens a SQLite file with owner-only
+                   file permissions, incremental-vacuum space
+                   reclamation without VACUUM's stop-the-world lock,
+                   and settings-dict type coercion
   secretstore.py   portable secret store: passphrase-derived key,
                    stand-in for DPAPI off Windows
   ldapclient.py    minimal LDAPv3 simple-bind client for directory auth
-  udpsock.py       dual-stack UDP bind and drop-counter helpers shared
-                   by the three collectors
+  udpsock.py       dual-stack UDP bind and drop-counter helpers, and
+                   the `UdpReceiver` base class the three collectors
+                   subclass
   web/
     __init__.py    exports Service and WebServer
     service.py     Service: owns every database and background worker
@@ -134,6 +138,19 @@ connections and starts every background worker, then either hands it to a
 `ConsoleWindow` (default). Every module below is a thread or a pool of
 threads owned by `Service`; there is no separate process for any collector
 or scheduler.
+
+Most of these workers — `Monitor`, `Resolver` and `AsnResolver` (all in
+`monitor.py`), `NodePoller`, `WirelessPoller`, `AlertEngine`,
+`ConfigRxWorker`, `IpamWorker`, and `alertmail`'s `MailQueue`/
+`WebhookQueue` — mix in `worker.Worker` (`netpath/worker.py`) rather than
+each hand-rolling the same thread handle, counter bump and status ladder:
+`running` (is the thread alive), `_spawn`/`_join` (start/stop the thread),
+`_bump(key)` (a locked counter increment), and `status_text()` (falls back
+through an error, then `STOPPED_TEXT`, then the worker's own
+`_running_text()`). `worker.py` also holds `hidden()` — keyword arguments
+that suppress a console window for a spawned subprocess, used by `tracer.py`
+and `ipam_scan.py` — and `ago(ts)`, the one relative-time wording
+(`"3m ago"`) every status strip's elapsed-time text is built from.
 
 `Service.start()` order matters: `Monitor` (traces) and `Resolver`
 (reverse DNS) start first, then the NetFlow `Collector` and
@@ -187,19 +204,28 @@ trace scheduler this class was copied from.
 
 ## Data layer
 
-Ten SQLite files, each opened with `PRAGMA journal_mode=WAL` and (for
-files with foreign keys) `PRAGMA foreign_keys=ON`. Every `*Database`
-class follows the same shape: a `SCHEMA` string of `CREATE TABLE IF NOT
-EXISTS` statements run at connect time, followed by a `_migrate()` method
-that reads `PRAGMA table_info(<table>)`, diffs the column names against
-what the code now expects, and issues `ALTER TABLE ... ADD COLUMN` for
-whatever is missing — because `CREATE TABLE IF NOT EXISTS` silently
-leaves an existing table alone, an upgraded install needs the new columns
-added explicitly or the first write touching them fails. Every write goes
-through an `RLock` (`db.py`, `appdb.py`) or plain `Lock`
-(`flowdb.py`, `syslogdb.py`, `ipamdb.py`) held for the duration of the
-SQL, since `check_same_thread=False` lets any worker thread use the
-connection directly.
+Ten SQLite files, every `*Database` class subclassing `SqliteStore`
+(`netpath/sqlitebase.py`). `sqlitebase.connect()` opens the file at
+owner-only permissions (mode 0600, POSIX only) and sets `busy_timeout=5000`,
+`cache_size=-20000` and `mmap_size=268435456` once, here, so no module can
+forget one. `SqliteStore.__init__` then runs, under the store's own `RLock`
+(every database now uses an `RLock`, where some previously used a plain
+`Lock`; `check_same_thread=False` lets any worker thread use the connection
+directly, so something has to serialise them): the uniform `PRAGMAS` —
+`journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, the same three
+on every database, where three of the ten (`netpath.db`, `ipam.db`,
+`app.db`) previously ran `synchronous=FULL` — then `_before_schema()`
+(appdb's hook to read the file as it was before `SCHEMA` runs),
+`enable_incremental_vacuum()` (see below), the class's own `SCHEMA` string
+of `CREATE TABLE IF NOT EXISTS` statements, `_migrate()`, a commit, and
+finally `_after_open()` (nodesdb and alertsdb seed rows here, once the
+schema is in place). `_migrate()` calls `self.ensure_columns(table,
+columns)` for whichever columns are missing — it diffs `PRAGMA
+table_info(<table>)` against what the code now expects, issues `ALTER TABLE
+... ADD COLUMN` for the difference, and returns the names actually added so
+a caller can gate a one-time backfill on it — because `CREATE TABLE IF NOT
+EXISTS` silently leaves an existing table alone, an upgraded install needs
+the new columns added explicitly or the first write touching them fails.
 
 **Indexes on migrated columns go in `_migrate()`, never in `SCHEMA`.** The
 schema script runs first, and `CREATE TABLE IF NOT EXISTS` on an existing
@@ -213,17 +239,40 @@ install; `tests/test_upgrade_from_previous.py` now opens databases in the
 previous release's shape, and `nodesdb.py` carries the rule at both the
 schema and the migration site.
 
-**Size caps** share one algorithm across `Database.trim_to_size()`,
-`FlowDatabase.trim_to_size()`, `SyslogDatabase.trim_to_size()` and
-`IpamDatabase.trim_to_size()`: while the file is over its cap, delete the
-oldest ~15% of the dominant table (traces, flows, syslog messages, DHCP
-scan history respectively) in one transaction, `VACUUM`, then
-`PRAGMA wal_checkpoint(TRUNCATE)` — VACUUM alone doesn't shrink the file
-in WAL mode, since freed pages sit in the write-ahead log until it's
-checkpointed and truncated. Capped at 6 iterations so a runaway cap
-setting can't loop forever. `Service.run_maintenance()` (`web/service.py`)
-calls all four every 15 minutes, plus the day-based retention prunes for
-each module, `AppDatabase.prune_hostnames()` for the reverse-DNS cache and
+**Settings** are `SqliteStore.settings()`/`save_settings()`: a flat
+`key`/`value` table, JSON-encoded, read back against the class's own
+`DEFAULTS` dict and coerced to each default's type
+(`sqlitebase.coerce_settings`, tolerant here — a value that will not coerce
+is replaced by its default rather than raising, so a database already
+holding a bad value still starts the service). `save_settings` writes only the keys it
+owns, so one merged settings dict can be handed to every store in turn and
+each takes only what it recognises; `alertsdb` and `configrxdb` wrap both
+methods with their own credential/webhook handling before calling `super()`.
+
+**Size caps** share one algorithm, `SqliteStore.trim_to_size(max_bytes,
+budget_s=None)`: while `_trim_size()` (`size_bytes()` by default — the file
+plus its `-wal`/`-shm` — unless overridden) is over the cap, find the id
+span of `TRIM_TABLE`, delete down to `TRIM_FLOOR` rows in adaptive
+lock-bounded batches (`_delete_batches`, whose chunk size backs off when one
+batch holds the write lock too long and grows again when it doesn't) via
+`_trim_delete`, then reclaim the freed pages in short slices through
+`enable_incremental_vacuum`'s incremental-vacuum path rather than a
+blocking `VACUUM` — the write lock is the one the ingest thread needs, and
+holding it across a whole-file rewrite stalls ingest for seconds at a time.
+Capped at 40 delete/reclaim passes so a runaway cap setting can't loop
+forever. `db.py`'s `Database` overrides `_trim_size` to `live_size_bytes()`
+(free pages a prune hasn't reclaimed yet would otherwise look like rows
+still inside the retention window) and `_trim_delete` to remove a trace's
+hops before the trace row itself; `syslogdb.py` routes `_trim_delete`
+through its own FTS-aware `_delete_logs()` so the search index and the
+message rows never disagree; `nodesdb.py` and `alertsdb.py` keep their own
+`trim_to_size()` entirely, since each spans several tables rather than one
+dominant one. `Service.run_maintenance()` (`web/service.py`) calls
+`Service._trim_db()` for each of the seven databases that has a
+`max_*_db_mb` setting (netpath, flow, syslog, snmp, ipam, nodes, alerts —
+not `app.db`, `wireless.db` or `configrx.db`, none of which has a size cap),
+plus the day-based retention prunes for each module,
+`AppDatabase.prune_hostnames()` for the reverse-DNS cache and
 `AppDatabase.prune_asn_cache()` for the ASN/owner cache.
 
 | File | Owner class | Holds |
@@ -309,7 +358,7 @@ The poller caches the index against `nodesdb.mib_generation()` and rebuilds
 only when the corpus changes.
 
 **Precedence** is `vendorid.decide`, in one place: manual > learned > a real
-vendor arc in sysObjectID (`trapoids.WELL_KNOWN` at high, the enterprise list
+vendor arc in sysObjectID (`trapdecode.WELL_KNOWN` at high, the enterprise list
 at high if verified else medium) > the walk (an arc an installed MIB names
 objects under, by score; then a catalog arc; then any named arc — high with
 score ≥ 0.5 and ≥ 10 named, else medium) > a sysDescr word at low > the
@@ -450,7 +499,7 @@ serves itself, so adding one moves nothing else.
 the *displayed* name and a custom OID may supply it; `vendor_detected` is
 always what `identify_vendor()` worked out. Three readers behave differently
 per vendor and must use the detected one — `configrx._backup_device` (an
-exact `configrx_vendors.resolve()` dict lookup that "Cisco Systems, Inc."
+exact `configrx.resolve()` dict lookup that "Cisco Systems, Inc."
 fails), `nodepoll.read_mac_table`'s `is_cisco` gate, and
 `nodeoids.suggest_group` (which reads sysObjectID itself, so it was already
 safe). `nodesdb.detected_vendor(row)` is the single place that rule lives,
@@ -1050,8 +1099,8 @@ column is needed. Entries are deduplicated on the `(mac, vlan)` pair,
 since the same address legitimately appears in several VLANs.
 
 Note that **the MIB catalog cannot widen any of this**: the poller uses
-hardcoded numeric OIDs throughout (`nodepoll.py`, `nodeoids.py`,
-`fortinetoids.py`) and uploaded MIBs only ever supply display names.
+hardcoded numeric OIDs throughout (`nodepoll.py`, `nodeoids.py`) and
+uploaded MIBs only ever supply display names.
 Adding Q-BRIDGE and the Cisco path is what changed the coverage.
 
 Returns `None` (not `[]`) when the device answers no forwarding table at
@@ -1061,7 +1110,7 @@ zero MACs learned right now" render as different messages.
 
 **Vendor identification** (`nodeoids.identify_vendor`): two sources with
 different standing, reported separately so a guess is never mistaken for a
-fact. `vendor_for()` longest-prefix-matches `trapoids.WELL_KNOWN`, which the
+fact. `vendor_for()` longest-prefix-matches `trapdecode.WELL_KNOWN`, which the
 Trap page's own decoding already uses — one table, not two — and 4.28.0 widened
 its enterprise arcs from 19 to cover every vendor `mibcatalog.py` ships a
 bundle for, plus industrial and wireless names. **Every added arc was read out
@@ -1123,7 +1172,7 @@ its own row cap and wall-clock budget and reports which one it hit, so a
 truncated walk cannot be mistaken for a device's complete answer. Names come
 from `_oid_name_table()` — `nodesdb.all_known_oids()` inverted (it stores
 name → OID, for `mibparse.resolve`'s `known` dict) merged over
-`trapoids.WELL_KNOWN` — matched longest-prefix, so an object's own OID matches
+`trapdecode.WELL_KNOWN` — matched longest-prefix, so an object's own OID matches
 exactly while an instance or table row matches its column and keeps the rest as
 the index. An OID nothing describes stays a number.
 
@@ -1194,7 +1243,7 @@ was already stored — the whole existing fleet on an upgrade, and every
 device promoted from Discovery, whose sysObjectID `seed_identity`
 pre-fills. One guard remains: the check returns early unless
 `nodeoids.enterprise_root()` is non-empty, specifically because
-`vendor_for()` longest-prefix-matches `trapoids.WELL_KNOWN`, which names
+`vendor_for()` longest-prefix-matches `trapdecode.WELL_KNOWN`, which names
 standard-tree nodes too ("system" for 1.3.6.1.2.1.1), so a device with a
 standard-tree sysObjectID would otherwise be reported as missing a
 "system MIB" that does not exist.
@@ -1325,8 +1374,8 @@ with a `snmp_enabled = 0` override so it doesn't fail SNMP every poll.
 
 ### MIB parser (`mibparse.py`)
 
-Not a MIB compiler, the same framing `trapoids.py` uses for its own OID
-name table. The whole strategy is one regex anchored on the literal
+Not a MIB compiler, the same framing `trapdecode.py`'s own OID name table
+uses. The whole strategy is one regex anchored on the literal
 `::=` token: `_OBJECT_TYPE_RE`/`_OBJECT_ID_RE`/`_MODULE_IDENTITY_RE`/
 `_NOTIFICATION_RE` find `NAME (OBJECT-TYPE|OBJECT IDENTIFIER|
 MODULE-IDENTITY|OBJECT-IDENTITY|NOTIFICATION-TYPE) ... ::= { ... }`
@@ -1467,7 +1516,7 @@ group that is a name rather than a row id.
 
 Twenty-one files ship under `netpath/mibs/`, about 900 KB in total. Three
 are hand-authored: `enterprise-roots.mib` (public IANA Private Enterprise
-Number arcs for ~20 common vendors, matching `trapoids.WELL_KNOWN`'s own
+Number arcs for ~20 common vendors, matching `trapdecode.WELL_KNOWN`'s own
 number-to-name table), `enterprise-roots-2.mib` and `if-mib-core.mib` (an OBJECT-TYPE subset of RFC
 2863's IF-MIB covering exactly the columns `nodeoids.IF_TABLE`/`IFX_TABLE`
 already poll — kept although the full IF-MIB now ships too, because a
@@ -1484,7 +1533,7 @@ An arc added after a release is a **new file**, not a new line in
 8691, added in 4.32.0). Seeding is tracked by filename, exactly so that a MIB
 an admin deleted is never resurrected — which also means an edit to an
 already-seeded file reaches no existing install. A new filename does. Vendor
-identification itself never depends on this: it reads `trapoids.WELL_KNOWN` in
+identification itself never depends on this: it reads `trapdecode.WELL_KNOWN` in
 code, so only the MIB browser and upload resolution are affected.
 
 `Service._seed_default_mibs()` runs once from `start()`, before
@@ -2355,7 +2404,7 @@ than the window being evaluated.
 Each drain that produces a device- or IP-backed `Occurrence`
 (`_drain_device_events`, both `_drain_interface_events` label sites,
 `_drain_syslog`, `_drain_ipam_conflicts`, `_evaluate_thresholds`) builds
-its `entity_label` through `hostresolve.resolve_name()` (see Syslog's
+its `entity_label` through `namelookup.resolve_name()` (see Syslog's
 "Host cross-referencing," below) rather than the `device["name"] or
 device["ip"]` every one of them used independently before — falling
 back to the bare IP as the final resort, since the Object column should
@@ -2541,7 +2590,7 @@ means. From 4.49.0 that figure is capped at `MAX_EXPECTED_BUDGET_S` (600 s):
 as well as into the traceroute/tracert command line itself, and until this
 release none of the three (nor `interval_s`, nor the settings-level
 `trace_workers`) was checked for being anything past *a number* —
-`coerce_settings` (`settingsutil.py`) only ever confirms the type.
+`coerce_settings` (`sqlitebase.py`) only ever confirms the type.
 `db.py`'s `_clamp_target_fields()` now bounds all five on `add_target`/
 `update_target`/`save_settings` (`interval_s` 5 s–30 days, `max_hops`
 1–255 — one byte on the wire, so no path is ever longer regardless of what
@@ -2836,7 +2885,10 @@ wrong clock would otherwise stretch every chart's time axis to fit it.
 
 ### Collector threading (`collector.py`)
 
-Two threads, deliberately: `_receive()` does nothing but
+`Collector` subclasses `udpsock.UdpReceiver` (bind, the receive-thread
+guard, the kernel-drop poll, throttled error logging, the LRU of seen
+exporters, `status_text()`) and adds what is specific to NetFlow: two
+threads, deliberately. `_receive()` does nothing but
 `sock.recvfrom()`, a version/allow-list check, and `decoder.decode()`,
 then hands the resulting flows to a bounded `queue.Queue`; `_write()`
 drains that queue and calls `db.insert_flows()` in batches (every 1
@@ -2953,7 +3005,7 @@ time, but the route graph needs a span to draw traces from.
 
 ## SNMP Trap
 
-### Decoding (`trapdecode.py`, `trapoids.py`)
+### Decoding (`trapdecode.py`)
 
 `Reader` walks a byte range and returns `(tag, value_start, value_end)`
 TLVs as absolute offsets into the original datagram rather than slices —
@@ -2989,14 +3041,15 @@ this app takes no third-party dependencies — the trap is stored with
 engine_boots, engine_time, ciphertext) -> bytes | None`), so decryption
 lands here without restructuring anything.
 
-`trapoids.py` is a name table, not a MIB compiler — parsing SMIv1/SMIv2
+The OID name table at the bottom of `trapdecode.py` is just that — not a
+MIB compiler; parsing SMIv1/SMIv2
 ASN.1 modules is a substantial parser project of its own and out of scope
 for a stdlib-only app. `Decoder.resolve_oid()` does exact-match first,
 then walks the OID's arcs looking for the longest known *prefix* so an
 unrecognized instance under a known table entry still resolves
 (`ifDescr.7` for `1.3.6.1.2.1.2.2.1.2.7`). `Decoder.severity_for()` does
 the same longest-prefix-wins search over `severity_rules`, which starts
-from `trapoids.DEFAULT_SEVERITY_RULES` and is re-sorted by `-len(prefix)`
+from `trapdecode.DEFAULT_SEVERITY_RULES` and is re-sorted by `-len(prefix)`
 whenever admin-supplied rules are appended in `configure()`, so a specific
 rule always beats a vendor-wide one regardless of the order either list
 was written in.
@@ -3011,8 +3064,9 @@ Python values, so nothing can be lost in a round trip through the decoder.
 
 ### Listener (`snmptrapd.py`)
 
-Same rx/tx split as NetFlow's and Syslog's collectors, UDP only — SNMP has
-no TCP transport in practice. `_accepted_source()` gates before decoding
+Same `udpsock.UdpReceiver` base as NetFlow's and Syslog's collectors
+(`NOUN = "Receiver"`), and the same rx/tx split, UDP only — SNMP has no TCP
+transport in practice. `_accepted_source()` gates before decoding
 (a rejected packet is never parsed, same as Syslog); `_accepted_community()`
 necessarily runs after, since the community lives inside the packet.
 `_enqueue()` filters on `trap.severity > min_severity` before the queue,
@@ -3092,9 +3146,16 @@ in full, just with some of its structured data unlabelled.
 
 ### Listener (`syslogd.py`)
 
-Same rx/tx split as NetFlow's collector, and the same reasoning: a device
-misbehaving can produce thousands of lines a second, so the receive path
-only reads, parses and enqueues. TCP is handled by `_read_stream()`,
+Same `udpsock.UdpReceiver` base and the same rx/tx split as NetFlow's
+collector, and the same reasoning: a device misbehaving can produce
+thousands of lines a second, so the receive path only reads, parses and
+enqueues. `SyslogCollector` now inherits `UdpReceiver.running` — `bool(self.
+_threads) and all(t.is_alive() for t in self._threads)` — rather than a
+per-class copy; with a UDP thread, a TCP accept thread and a writer thread
+all in play, a dead writer used to leave `running` true with nothing
+actually being stored, and it now reports stopped the moment any one
+thread has died, matching what the trap receiver's `running` already did.
+TCP is handled by `_read_stream()`,
 which reassembles a byte stream into messages under either framing in
 use in the wild: RFC 6587 octet-counting (`"123 <13>..."` — a decimal
 length, a space, then exactly that many bytes) is detected by checking
@@ -3150,20 +3211,20 @@ stored table SQL for `trigram` and `source`) gets the index dropped and
 rebuilt once in the background, in chunks, without blocking search in the
 meantime — it just scans until the backfill catches up.
 
-### Host cross-referencing (`hostresolve.py`, `api.py get_syslog_search`)
+### Host cross-referencing (`namelookup.py`, `api.py get_syslog_search`)
 
 The `host` column stored in `logs` is exactly what `syslogparse.parse()`
 found in the message — often empty, or just the sending device's own IP
 repeated, since not every device bothers to self-report a real hostname.
 Rather than rewrite that stored value, `get_syslog_search` fills the gap
 at read time: for every row whose `host` is falsy or equal to its own
-`source`, it calls `hostresolve.resolve_name(nodes_db, app_db, ip)`. A
+`source`, it calls `namelookup.resolve_name(nodes_db, app_db, ip)`. A
 message that already carries its own real hostname is never touched;
 this only ever fills what the device left blank.
 
-`hostresolve.resolve_name()` is a small shared module (not folded into
-`nodesdb.py` or `appdb.py`, to avoid making either database module
-depend on the other) used by both this and Alerts' `entity_label`
+`namelookup.resolve_name()` lives in the shared name-lookup module (not
+folded into `nodesdb.py` or `appdb.py`, to avoid making either database
+module depend on the other) used by both this and Alerts' `entity_label`
 computation (`alertengine.py`, below). It replaced three previously
 independent and disagreeing precedences that all existed at once before
 this: `nodes.js`'s own device-list display (`sys_name || name || ip`),
@@ -3291,9 +3352,12 @@ one subprocess instead of hundreds. `read_arp_table()` picks the command
 by platform (`arp -a` parsed by `_parse_windows_arp()`, `ip neigh` by
 `_parse_linux_neigh()` — preferred over `arp -an` where `ip` exists, on
 Linux — or `arp -an` by `_parse_bsd_arp()` on macOS/BSD), and
-`normalize_mac()` handles the three formats those commands actually
+`mac_colon()` handles the three formats those commands actually
 print: colon-separated, dash-separated with zero-padded octets
-(Windows), and Cisco's unpadded dotted-quad-of-hex form.
+(Windows), and Cisco's unpadded dotted-quad-of-hex form — returning the
+colon-separated form or `None`, the opposite convention from `nodesdb`'s
+own `normalize_mac()` above, which is why the two were renamed apart
+rather than left to be confused with each other.
 
 ### DHCP polling (`ipam_dhcp.py`)
 
@@ -3678,8 +3742,9 @@ The two routes are the same payload split by *what changes it* (4.43.0).
 changes: every `*_settings` block, `permissions`, `update`, `version`, the
 constant vocabularies (`severities`, `facilities`, `trap_kinds`,
 `dimensions`, `categories`). It carries `config_version`, an integer
-`Service.bump_config()` moves from every `apply_*_settings`,
-`save_listener_settings`, and the account and grant writers in `api.py`.
+`Service.bump_config()` moves from `apply_settings`, `apply_global_settings`,
+`apply_netpath_settings`, `save_listener_settings`, and the account and
+grant writers in `api.py`.
 `/api/state` — `api.get_state()` — is what changes on its own: each
 worker's `running`/`status`/`counters`, the counts behind the tab badges,
 the session clocks, `storage`, `dns`; it repeats `config_version`. The
@@ -3717,11 +3782,11 @@ at all.
 
 ---
 
-## Wireless (`fortinetoids.py`, `wirelessdb.py`, `fortipoll.py`)
+## Wireless (`nodeoids.py`, `wirelessdb.py`, `fortipoll.py`)
 
-**OIDs** (`fortinetoids.py`) are hand-listed constants, not parsed from
-a MIB at runtime — the same "not a MIB compiler" convention `trapoids.py`
-and `nodeoids.py` already use for other fixed, known vendor tables (see
+**OIDs** (`nodeoids.py`) are hand-listed constants, not parsed from
+a MIB at runtime — the same "not a MIB compiler" convention `trapdecode.py`
+already uses for other fixed, known vendor tables (see
 Nodes above). Three tables under `fgWc` (`1.3.6.1.4.1.12356.101.14`),
 all indexed by `(fgVdEntIndex, WtpId[, RadioId])`: `fgWcWtpConfigTable`
 (the AP's configured name), `fgWcWtpSessionTable` (live status/MAC/
@@ -3736,7 +3801,7 @@ FortiOS does not honour that: a FAP-231F reports values like 51, and
 conducted ceiling. It is reporting FortiOS's own 0–100 power *level*.
 `api._power_unit()` therefore decides per controller rather than
 hard-coding either reading: if any of that controller's radios reports
-above `fortinetoids.MAX_PLAUSIBLE_DBM` (30 dBm = 1 W, already above every
+above `nodeoids.MAX_PLAUSIBLE_DBM` (30 dBm = 1 W, already above every
 indoor regulatory limit), the whole column is read as a percentage, since
 no radio in one chassis switches units. `wireless_settings
 ["radio_power_unit"]` (`auto`/`dbm`/`percent`) forces it. The raw integer
@@ -3808,7 +3873,7 @@ which is safe because the lock is an `RLock` and `add_ap_event` takes it
 again — the same thing the existing `ap_returned` call in `upsert_ap` does.
 
 `_OFFLINE_STATE` is deliberately the single string `"offline"` rather than
-"anything that is not online". `fortinetoids.CONNECTION_STATE` also contains
+"anything that is not online". `nodeoids.CONNECTION_STATE` also contains
 `downloading_image` and `connected_image` — which every AP passes through on
 a routine firmware upgrade — plus `standby` (held in reserve on purpose) and
 `other` (the controller did not say). Alerting on "not online" would raise and
@@ -3855,7 +3920,7 @@ from the same walk). The extra selectable columns (`radio_count`,
 `channels`, `radio_station_count`) are derived in `_ap_json` from radio
 rows the poller already walks, so adding one costs no extra SNMP.
 
-### Per-AP response time (`fortipoll.py`, `fortinetoids.py`)
+### Per-AP response time (`fortipoll.py`, `nodeoids.py`)
 
 The module's stated design is that it talks to the controller and never to an
 AP, so a per-AP latency figure had nowhere to come from — `access_points` had
@@ -3878,7 +3943,7 @@ reports as offline is not probed at all, and `PING_BUDGET_S` bounds the whole
 controller's sweep so a rack of unreachable APs cannot each add a timeout to
 the poll cycle.
 
-## ConfigRX (`configrxdb.py`, `configrx.py`, `configrx_vendors.py`)
+## ConfigRX (`configrxdb.py`, `configrx.py`)
 
 **No device table of its own.** Per the explicit product decision,
 ConfigRX operates entirely on Nodes' existing device list — the device
@@ -3899,10 +3964,10 @@ already privileged EXEC (`vendor.enable_command` set — currently just
 enable secret, sent back only as the answer to that device's own password
 prompt (`_do_enable`, matched against `vendor.enable_password_re`, never
 built into anything sent). All of it is sourced from
-`configrx_vendors.VENDORS`, a hardcoded dict, never from anything the API
+`configrx.VENDORS`, a hardcoded dict, never from anything the API
 or UI accepts as free text. A device's `vendor_override` field is free
 text, but it only ever selects *which* vendor's fixed commands to use
-(`configrx_vendors.resolve()` does a dict lookup); an unrecognized value
+(`configrx.resolve()` does a dict lookup); an unrecognized value
 simply fails to resolve and the backup is skipped with a clear error,
 never used as literal command text. There is no exec-command endpoint, no
 command parameter anywhere in `api.py`'s ConfigRX handlers, and no
@@ -4124,11 +4189,12 @@ for de-duplicating concurrent triggers of the same device) rather than
 device here has exactly one fixed SSH credential rather than a
 group/profile fallback chain.
 
-### Cross-device search and compliance (`configrx_search.py`, `configrx_compliance.py`) — 4.49.0
+### Cross-device search and compliance (`configrx_compliance.py`) — 4.49.0
 
 The query nothing before this pass could answer: `configrx.diff_texts`
 compares two backups of the *same* device; nothing kept a searchable copy
-of more than one device's capture at once. `configrx_search.py` builds one
+of more than one device's capture at once. The search half of
+`configrx_compliance.py` builds one
 — `configrxdb.config_lines`, one row per device's latest capture, FTS5
 trigram-indexed the same way syslog search already is, falling back to a
 full scan for a query too short to index — and it is built **only from
@@ -4301,6 +4367,34 @@ exceptions rather than building HTTP responses themselves. A handful of
 *expected* failure — a DHCP server not answering, no update available —
 reserving raised exceptions for genuinely unexpected conditions.
 
+**Shared route helpers.** `_page(params, default, cap)` is the `(limit,
+offset)` every paginated list route reads and clamps. `_require(row, what)`
+hands `row` back or raises `ValueError(f"No such {what}")` — the shape every
+not-found route used to build by hand. `_pick(body, allowed)` is the
+allow-list filter an update route runs its body through before anything
+reaches a database column. `_encrypt_secret(secret, unavailable)` is the one
+place a credential is DPAPI/passphrase-encrypted for storage, raising the
+caller's own `unavailable` wording when neither is configured; the SNMPv3
+credential routes build on it through `_store_v3_credential(...)` and
+`_clear_credential(...)`, each keeping its own log/audit message and
+"unavailable" text verbatim while the encrypt-then-store-then-log-then-audit
+shape itself is written once.
+
+**Settings dispatch.** `SETTINGS_SCOPES` maps a settings scope to the
+response key its values come back under (`"netflow": "flow_settings"`, and
+so on). `post_settings` validates and ranges-checks the body, then for any
+scope but `global`/`netpath` calls `Service.apply_settings(scope, values)` —
+one table-driven method (`_MODULE_SCOPES` in `service.py`, mapping each of
+the eight module scopes to its settings attribute, database attribute,
+event-log line and reconfigure function) that replaced eight near-identical
+`apply_<scope>_settings` methods. `apply_global_settings` and
+`apply_netpath_settings` keep their own methods, since both write
+`self.settings` — the combined global-and-NetPath dict — rather than a
+module's own settings attribute. The maintenance sweep's seven size-cap
+trims (trace, flow, syslog, snmp, ipam, nodes, alerts) each go through
+`Service._trim_db(key, db, label, noun, **kwargs)` in place of a repeated
+"is the cap set; if so, trim and log" block.
+
 ### Backup deletion and in-flight state (`configrxdb.py`, `configrx.py`)
 
 `delete_backup` / `delete_backups` sit beside `prune`, which was previously
@@ -4433,8 +4527,9 @@ everything: it checks whether `STATE_MS` (2000ms) has elapsed since the
 last `/api/state` poll and if so fetches it, then calls the active tab's
 `fastTick()` (a cheap local repaint, e.g. counting up an elapsed-time
 column) every beat and its `refresh()` (an actual server fetch) only
-once `App.rateFor(tab)` — read from the per-module refresh-interval
-setting — has elapsed. One shared heartbeat rather than one
+once `rateFor(tab)` — an internal helper, not exported on `App` — reads the
+per-module refresh-interval setting and says it has elapsed. One shared
+heartbeat rather than one
 `setInterval` per module avoids several independent timers drifting
 against each other while still letting NetPath poll every 2 seconds and
 NetFlow's aggregations poll every 30.
@@ -4456,7 +4551,8 @@ Three things about that shape are load-bearing:
   raises `submit`, which is where the handler runs — running it from the
   click as well would run it twice.
 * **The button row is found by `.modal-buttons`, not `.row`.** Three
-  dialog bodies (netflow.js, snmp.js, syslog.js) lay out checkboxes in a
+  dialog bodies (netflow.js, and events.js's snmp and syslog settings
+  dialogs) lay out checkboxes in a
   `<div class="row">` of their own, and only the accident that all three
   pass `{buttonsTop}` kept the buttons out of them.
 * **`runModalAction()` owns every press.** It clears the error slot, calls
@@ -4517,8 +4613,8 @@ script read any of those five fields and the summary said `status up`.
 legend, Dashboard (`Workers`, all eight): Nodes and Wireless *poller*,
 Alerts *alert engine*, NetFlow and Syslog *collector*, SNMP *receiver*, IPAM
 and ConfigRX *worker*. `POST /api/ipam/worker {action}` is the IPAM toggle
-the other seven already had, implemented by `apply_ipam_settings` so it
-persists like the settings checkbox. The two search handlers name their cap
+the other seven already had, implemented through `Service.apply_settings("ipam",
+...)` so it persists like the settings checkbox. The two search handlers name their cap
 (`SEARCH_ROW_CAP`) and return `limit`/`cap`/`truncated`; `App.countLabel`
 renders "N of M shown" for every list.
 
@@ -4688,6 +4784,26 @@ simply absent from the results, indistinguishable to the operator either way.
 The rule for the frontend since 4.45.0 is that a module draws nothing it
 could have asked `App` for. The pieces and where they came from:
 
+- **Worker status strips and settings dialogs.** `App.strip(prefix, worker,
+  opts)` draws a module's `<prefix>-status`/`-dot`/`-toggle`/`-counters`
+  fastTick card through the write-only-if-changed guards, and
+  `App.wireToggle(buttonId, stateKey, route, after)` is the paired start/stop
+  button — together these replace what eight modules each drew by hand.
+  `App.form` holds the three settings-field builders (`check`/`number`/
+  `text`) and `form.readers(box)` the three value readers, replacing six
+  verbatim copies across the module settings dialogs. `App.bulkBar(set,
+  barId, labelId)`, `App.selectSub(page, name, opts)` (ARIA-aware subtab
+  selection), `App.onRelayout(tab, fn)` (resize handling) and
+  `App.filterValues(prefix, keys)` (reading a filter row into a query
+  object) each replace one hand-rolled copy per module. `App.watchJob(button,
+  opts)`, built on `App.settleButton(button, resting, holdMs)`, drives the
+  "queue an action, then poll until it lands" pattern (ConfigRX backups,
+  Nodes' MIB installs, upstream-suggestion apply). `App.emptyState(message)`/
+  `App.loading()` are the two one-line markup helpers used in place of the
+  ad hoc "no data"/"Loading…" strings each module used to write out. SNMP
+  Trap and Syslog no longer have their own copies of any of this: `events.js`
+  builds both tabs from one `eventsPage(spec)` factory, registered as
+  `App.pages.snmp` and `App.pages.syslog`.
 - **Surfaces.** One selector list in `app.css` paints every panel-like
   element (`.panel, .card, fieldset, .table-wrap, .canvas.chart, .detail,
   .login-box, .ssh-panel, .modal-box, …`); a second list gives the floating
@@ -4698,19 +4814,20 @@ could have asked `App` for. The pieces and where they came from:
   overlay with the deepest shadow): elevation reads as lightness on a dark
   theme, and the old darker box read as a hole.
 - **Type in tables.** `table` is set in `--ui`; `td.mono`/`th.mono` opt a
-  column back into `--mono`. `grid()` decides per column with
-  `App.isMono(column)`: an explicit `column.mono` wins, otherwise the key is
-  matched against `MONO_KEYS` (ip, mac, oid, port, hex, id-like, time-like
-  keys). The class goes on both the header and the cell so sort arrows and
-  numbers line up. Hand-built tables (IPAM conflicts) add the class
-  themselves.
+  column back into `--mono`. `grid()` decides per column with the internal
+  `isMono(column)` helper (not exported on `App`): an explicit `column.mono`
+  wins, otherwise the key is matched against `MONO_KEYS` (ip, mac, oid, port,
+  hex, id-like, time-like keys). The class goes on both the header and the
+  cell so sort arrows and numbers line up. Hand-built tables (IPAM
+  conflicts) add the class themselves.
 - **`App.stackedHistogram(svg, host, {buckets, unit, span, onBucket, empty,
   minHeight})`.** One drawing for the Alerts, SNMP and Syslog severity
   histograms: legend for the severities present, gridlines with counts,
   time ticks, swatch tooltip rows via `App.tooltip`, and a transparent hit
   rect per bucket **only when `onBucket` is given** — so a chart without a
-  click has no pointer cursor. `App.SEV_COLOR` is the one severity→token
-  map. Syslog and SNMP wrap `onBucket` in `pinWindow`, which unticks Live,
+  click has no pointer cursor. `SEV_COLOR` (an internal array, not exported
+  on `App`) is the one severity→token map. Syslog and SNMP wrap `onBucket`
+  in `pinWindow`, which unticks Live,
   reveals `#sl-live`/`#sn-live` ("Return to live") and announces the pin;
   `returnToLive` reverses it.
 - **`App.filterBar(tab, {text, selects, apply, clear, clears, onEnter,
@@ -5348,7 +5465,7 @@ it was pinned.
 **The scoped boundary.** "Only `pager_off` + `show_config` — plus, for a
 vendor needing it, one fixed `enable` escalation answered with that
 device's own stored secret — are ever sent" remains true and is still the
-point of `configrx_vendors.py`, but it is now a property of the **backup
+point of `configrx.py`'s vendor table, but it is now a property of the **backup
 path** rather than of the application: the terminal in `sshterm.py` is a
 real shell a person types into, behind its own `ssh` permission that
 nobody holds by default, and it neither uses the vendor table, the enable
@@ -5388,8 +5505,8 @@ are checked in as the publisher's own UMD bundle, byte for byte, and served
 from `/vendor/` like any other static file — `_static` already resolves
 nested paths and types them from the extension. Today that is xterm.js
 5.5.0 (`window.Terminal`) and `@xterm/addon-fit` 0.10.0
-(`window.FitAddon.FitAddon`), with their MIT licence as `LICENSE-xterm.txt`
-and `README.txt` recording the versions and where they came from. There is
+(`window.FitAddon.FitAddon`), with their MIT licence as `LICENSE-xterm.txt`,
+whose header also records the versions and where they came from. There is
 no build step and no local patching: a fix applied to a vendored file is
 invisible to the next update and would be silently lost, so anything that
 needs changing is worked around in first-party code. The same obligation

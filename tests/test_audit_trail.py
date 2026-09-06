@@ -1,34 +1,9 @@
-"""4.49.0: the audit trail's widening from authentication/credential/
-destructive-admin actions only (its original scope) to the configuration
-changes an operator needs to answer for after the fact — NetPath
-destinations, devices and their bulk operations, device groups, polling
-profiles, MIBs, alert rule definitions, IPAM subnets, and ConfigRX backup
-deletion. Before this, "who changed the CPU threshold from 90 to 99 last
-March" was unanswerable; this suite proves each new call site actually
-writes a row with the right action/target, via appdb.audit_query, driven
-against a real Service+WebServer.
-
-One test per action, plus three cross-cutting checks worth their own
-assertions:
-  - a device edit's vendor_override gets its OWN audit line, not folded
-    into the generic field diff (they are different kinds of change).
-  - the SNMP community string never appears in an audit detail, even when
-    it is the field that changed (device edits and polling-profile edits
-    both carry it).
-  - put_alerts_rule's threshold/clear_threshold/enabled sort first in the
-    diff, ahead of whatever else changed.
-  - configrx.store_secrets' target is device:{ip}, not a bare device id
-    (the one pre-existing inconsistency this pass corrected).
-
-post_target (creating a NetPath destination) calls service.monitor.
-trace_now() on success, which would otherwise spawn a REAL tracert/
-traceroute subprocess against an address nothing answers — real
-subprocess time this suite has no use for and, at fleet scale, the kind
-of shared-machine resource contention this campaign's coordination rules
-exist to avoid (measured hitting this the slow way once while writing
-test_target_validation.py). netpath.monitor.run_trace is monkeypatched to
-an instant stub for this whole file, the same technique
-test_service_shutdown.py already uses for the same reason.
+"""The audit trail records configuration changes too: NetPath destinations,
+devices and bulk operations, groups, polling profiles, MIBs, alert rules,
+IPAM subnets and ConfigRX backup deletion each write a row with the right
+action/target, checked via appdb.audit_query against a real Service and
+WebServer. vendor_override gets its own line, the SNMP community never shows
+in a detail, threshold fields sort first, and run_trace is stubbed instant.
 """
 import base64
 import http.client
@@ -383,7 +358,7 @@ END
     # section is the route settings.js actually calls (auditFetchPage()) —
     # t0/t1 plus the filters, answering {rows, truncated, usernames,
     # actions} — not the old since/limit cursor shape covered separately
-    # in test_api_tokens.py / test_ldap_auth.py / test_security_fixes.py.
+    # in test_api_tokens.py / test_ldap_auth.py / test_web_security.py.
     print("GET /api/audit: filtered, paginated search")
     now = time.time()
 

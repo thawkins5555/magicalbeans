@@ -1,28 +1,8 @@
-"""Vendor identification from what a device actually answers.
-
-Pure functions: nothing here opens a socket or a database. The poller and
-the discovery sweep hand in a `getnext` callable and walked rows; the
-database hands in its MIB objects; this module decides and explains.
-
-The idea that makes it affordable
----------------------------------
-Vendor identity lives entirely under 1.3.6.1.4.1 (`enterprises`). Which
-enterprise arcs a device populates can be enumerated in (arcs + 1) GETNEXTs
-by *hopping*: GETNEXT 1.3.6.1.4.1 lands on the first populated arc N;
-GETNEXT 1.3.6.1.4.1.(N+1) skips arc N entirely and lands on the next. A
-device usually populates two to six arcs, so this is cheaper than one poll
-— and it finds vendors this app holds no MIB for, because the arc number
-alone names them through enterprises.py.
-
-Precedence (see decide())
--------------------------
-manual > learned > a real vendor arc in sysObjectID > the walk > sysDescr >
-a generic-agent arc > nothing. A real vendor arc in sysObjectID is an IANA
-assignment and stays authoritative; the walk decides only when sysObjectID
-is a generic agent (net-snmp, UCD) or outside `enterprises`, where it
-outranks the sysDescr substring guess. The walk never substitutes a
-different arc for a real one: OEM gear routinely implements the chipset
-vendor's arc alongside its own.
+"""Vendor identification from what a device actually answers. Pure
+functions — no socket, no database. Enumerates populated enterprise arcs
+(1.3.6.1.4.1.*) by GETNEXT-hopping past each one found, cheaper than a
+full walk. Precedence (see decide()): manual > learned > a real vendor arc
+in sysObjectID > the walk > sysDescr > a generic-agent arc > nothing.
 """
 
 from __future__ import annotations
@@ -31,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import enterprises
-from .nodeoids import ENTERPRISES, GENERIC_AGENT_VENDORS, enterprise_arc, oid_key, \
+from .nodeoids import ENTERPRISES, enterprise_arc, oid_key, \
     vendor_for, vendor_from_descr
 
 MAX_ARCS = 64
@@ -239,11 +219,11 @@ def arc_name(arc: int | None) -> str:
 def _arc_confidence(arc: int) -> str:
     """How much to trust a name that came from the arc number alone: high
     when the arc has been cross-checked against a real device's sysObjectID
-    or a bundled MIB (trapoids.WELL_KNOWN or enterprises.VERIFIED), medium
+    or a bundled MIB (trapdecode.WELL_KNOWN or enterprises.VERIFIED), medium
     for an entry that has not. Checked against the tables directly —
     vendor_for() now falls back to the curated list too, so it can no longer
     tell the two apart."""
-    from .trapoids import WELL_KNOWN
+    from .trapdecode import WELL_KNOWN
     if f"{ENTERPRISES}.{arc}" in WELL_KNOWN or enterprises.is_verified(arc):
         return "high"
     return "medium"

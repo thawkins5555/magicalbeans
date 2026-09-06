@@ -1,19 +1,14 @@
 """WirelessPoller: polls each configured FortiGate Wireless Controller for
 its managed APs over SNMP.
 
-Reuses the Nodes poller's low-level SNMP plumbing wholesale rather than
-reinventing it: `nodepoll._Session` (one UDP socket per poll, with
-retry), `nodepoll.EngineCache` (v3 engine discovery caching, keyed here
-by controller id instead of device id), `nodepoll.credential_for()`
-(decrypt-just-before-use, discard after), and `snmppoll`'s wire-format
-functions. Same v1/v2c/v3 noAuthNoPriv/authNoPriv-only limitation as
-Nodes (snmppoll raises SnmpUnsupported for v3 authPriv).
+Reuses the Nodes poller's SNMP plumbing: `nodepoll._Session`,
+`nodepoll.EngineCache` (keyed here by controller id), `credential_for()`
+and `snmppoll`'s wire-format functions. Same v1/v2c/v3
+noAuthNoPriv/authNoPriv-only limitation as Nodes.
 
-Table walking here is repeated GETNEXT, not GETBULK: this poller manages a
-handful of controllers, not an estate of switches with hundreds-of-rows
-forwarding tables, so the request-count problem GETBULK solves for
-nodepoll.py's own `_walk_column` (4.34) does not arise here, and it is not
-worth introducing a second table-walking idiom for one small poller.
+Table walking here is repeated GETNEXT, not GETBULK: a handful of
+controllers is not an estate of switches, so the request-count problem
+GETBULK solves for nodepoll's `_walk_column` does not arise.
 """
 
 from __future__ import annotations
@@ -26,16 +21,17 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from . import fortinetoids as oids
+from . import nodeoids as oids
 from .eventlog import ERROR, NullLog, WIRELESS
 from .nodeoids import oid_key
 from .nodepoll import EngineCache, _Session, credential_for
 from .snmppoll import (
-    PDU_GET, PDU_GETNEXT, PDU_REPORT, SnmpError, SnmpTimeout,
+    PDU_GETNEXT, PDU_REPORT, SnmpError,
     build_request, build_v3_request, discovery_probe,
 )
 from .trapdecode import localized_key
 from .wirelessdb import WirelessDatabase
+from .worker import Worker
 
 # Only decides whether a string is already in dotted form; it is not a
 # validator for whether the address is routable.
@@ -55,32 +51,28 @@ class _AuthFailure(SnmpError):
     pass
 
 
-class WirelessPoller:
+class WirelessPoller(Worker):
+    STOPPED_TEXT = "Poller stopped"
+    THREAD_NAME = "wireless-poller"
+
     def __init__(self, db: WirelessDatabase, log=None):
         self.db = db
         self.log = log or NullLog()
         self._engines = EngineCache()
         self._executor: ThreadPoolExecutor | None = None
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
         self._queued: set[int] = set()
         self._lock = threading.Lock()
         # Reset per controller in _poll_controller; defined here so the
         # helper is safe to call before a poll has started.
         self._ping_deadline = 0.0
         self.counters = {"polls": 0, "ok": 0, "errors": 0}
-        self.error: str | None = None
-
-    @property
-    def running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
 
     def start(self, settings: dict | None = None) -> None:
         self.stop()
         self._stop.clear()
         self._executor = ThreadPoolExecutor(max_workers=4)
-        self._thread = threading.Thread(target=self._loop, name="wireless-poller", daemon=True)
-        self._thread.start()
+        self._spawn()
 
     def stop(self) -> None:
         """Fast: cancels queued work and returns without waiting for a poll
@@ -91,9 +83,7 @@ class WirelessPoller:
         self._stop.set()
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2)
-        self._thread = None
+        self._join()
 
     def _inflight_ids(self) -> set[int]:
         with self._lock:
@@ -108,17 +98,12 @@ class WirelessPoller:
             time.sleep(0.05)
         return not self._inflight_ids()
 
-    # _poll_controller's own bound is PING_BUDGET_S for the per-AP sweep
-    # (unconditional) plus one worst-case SNMP failure: a controller that
-    # is not answering fails its very first GETNEXT and _poll_controller
-    # returns right there (the walks all share one outer try/except), so a
-    # dead controller costs one timeout×(retries+1), not ten. What this
-    # does NOT model is a large, healthy controller's successful walk time
-    # across many APs — that is not bounded by a timeout at all, since
-    # nothing is failing, and _run_one's guard below is the backstop for
-    # whatever this approximation misses, the same as it is for a very-
-    # high-port-count device in netpath/nodepoll.py.
-    _SNMP_FAILURE_BUDGET_S = 3.0 * (2 + 1)   # matches _walk_column's _Session(..., 3.0, 2)
+    # A controller that is not answering fails its first GETNEXT and
+    # _poll_controller returns there (the walks share one outer try/except),
+    # so a dead controller costs one timeout×(retries+1), not ten. A large
+    # healthy controller's successful walk time is not bounded by a timeout
+    # at all; _run_one's guard is the backstop for that.
+    _SNMP_FAILURE_BUDGET_S = 3.0 * (2 + 1)   # _walk_column's _Session(..., 3.0, 2)
 
     def _inflight_budget_s(self, ceiling_s: float = 30.0) -> float:
         if not self._inflight_ids():
@@ -132,13 +117,6 @@ class WirelessPoller:
         under a poll still writing its result."""
         self.stop()
         self.drain(max(drain_s, self._inflight_budget_s()))
-
-    def status_text(self) -> str:
-        if self.error:
-            return self.error
-        if not self.running:
-            return "Poller stopped"
-        return "Running"
 
     def poll_now(self, controller_id: int) -> None:
         with self._lock:
@@ -167,12 +145,6 @@ class WirelessPoller:
                         self.poll_now(controller["id"])
             self._stop.wait(1.0)
 
-    def _bump(self, key: str, by: int = 1) -> None:
-        """counters[...] += 1 from a pool worker is a read-modify-write on a
-        shared dict; under the lock the totals stay exact."""
-        with self._lock:
-            self.counters[key] = self.counters.get(key, 0) + by
-
     def _run_one(self, controller_id: int) -> None:
         try:
             controller = self.db.controller(controller_id)
@@ -183,17 +155,11 @@ class WirelessPoller:
             self._bump("ok")
         except Exception as exc:
             self._bump("errors")
-            # Same two non-bug shapes as NodePoller._run_one (netpath/
-            # nodepoll.py) and Monitor._run_one (netpath/monitor.py):
-            # "Cannot operate on a closed database" while _stop is set
-            # means this poll ran past shutdown()'s drain window (bounded
-            # by _inflight_budget_s, not unlimited); a foreign key failure
-            # with the controller now gone means it was deleted mid-poll,
-            # an ordinary operator action. Neither is a bug, so neither
-            # gets the traceback below, which would read exactly like a
-            # crash in a log an operator checks right after a stop or a
-            # delete. The same exceptions for any OTHER reason still get
-            # the full treatment.
+            # Two shapes that are not bugs and so get no traceback: "Cannot
+            # operate on a closed database" while _stop is set (this poll ran
+            # past shutdown()'s drain window), and a foreign key failure with
+            # the controller now gone (deleted mid-poll). The same exceptions
+            # for any other reason still get the full treatment.
             controller_gone = False
             if isinstance(exc, sqlite3.IntegrityError):
                 try:

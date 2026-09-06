@@ -1,42 +1,22 @@
 """Device personas for the SappiWhere demo fleet.
 
-A *persona* is a recipe for one kind of box: the ordered OID table it
-answers, the shape of its interface table, its forwarding database, its
-vendor-arc objects. A *device state* (``DeviceState``) is one instance of
-a persona on one loopback IP, carrying the behaviour knobs the demo drives
-(alive/dead, reboot, wrong community, slow, tooBig, 32-bit wrap, flapping
-ports, v1-only, v3 mode).
+A persona is a recipe for one kind of box: its OID table, interface table,
+forwarding database, vendor-arc objects. A device state (``DeviceState``)
+is one instance of a persona on one loopback IP, carrying the behaviour
+knobs the demo drives (alive/dead, reboot, wrong community, slow, tooBig,
+32-bit wrap, flapping ports, v1-only, v3 mode).
 
-The OID table is deliberately SHARED between every device of the same
-persona variant: every value that differs per device, or with time, is a
-callable ``fn(state, now)`` evaluated at reply time, so a thousand-device
-fleet costs one table per persona rather than a thousand copies of it.
+The OID table is shared across every device of one persona variant: values
+that differ per device or with time are ``fn(state, now)`` callables
+evaluated at reply time, so a thousand-device fleet costs one table per
+persona, not a thousand copies (``entries = {oid_str: (ber_tag,
+constant_or_callable)}``). Ordering is numeric
+(``netpath.nodeoids.oid_key``), matching a real agent's GETNEXT/GETBULK
+walk order.
 
-    entries = {oid_str: (ber_tag, constant_or_callable)}
-
-Ordering is numeric (``netpath.nodeoids.oid_key``), which is what makes
-GETNEXT/GETBULK walks come out in the same order a real agent's do.
-
-Public surface the seed script depends on (keep stable)::
-
-    fleet_plan(count) -> list[dict]
-        [{index, ip, name, persona, site, snmp_version, community,
-          profile, knobs}, ...]
-        index 0 is the core switch, index 1 the wireless controller, and
-        indices 2..29 are the fixed SPECIALS below (13 is the ConfigRX SSH
-        demo device, pinned to 127.0.0.1). Everything from 30 on is a
-        deterministic weighted mix.
-
-    SPECIALS -> dict[int, dict]
-        {index: {ip, persona, profile, knob, note}} — the devices whose
-        misbehaviour the demo is built around.
-
-    ip_for(index) -> "127.0.x.y"
-    PROFILES -> dict[str, dict]  (snmp_version/community/v3 user+password)
-    SITES -> tuple[str, ...]
-
-    build_device(entry) -> DeviceState
-    PERSONAS -> dict[str, Persona]
+demo/seed.py imports ``fleet_plan``, ``SPECIALS``, ``ip_for``,
+``PROFILES``, ``SITES``, ``build_device`` and ``PERSONAS`` directly — keep
+these names and shapes stable.
 
 Stdlib only, like the app.
 """
@@ -52,7 +32,7 @@ from bisect import bisect_right
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from netpath import fortinetoids as fgoids            # noqa: E402
+from netpath import nodeoids as fgoids            # noqa: E402
 from netpath.nodeoids import (                        # noqa: E402
     CDP_CACHE_ADDRESS, CDP_CACHE_DEVICE_ID, CDP_CACHE_DEVICE_PORT,
     CDP_CACHE_PLATFORM, CISCO_POE_PORT_POWER_MW, DOT1D_STP_DESIGNATED_ROOT,
@@ -664,10 +644,9 @@ def arc_objects(arc: int, extra_scalars: dict | None = None) -> dict:
 
 # ---------------------------------------------------------- L2 topology
 #
-# LLDP/CDP neighbours, PoE and STP were three of 4.47.0's Tier 1 features
-# and none of them had ever been answered by this fleet — the Topology
+# LLDP/CDP neighbours, PoE and STP need real fleet data for the Topology
 # tab, the device pane's Neighbours/Bridge&RF subtabs and the upstream-
-# suggestion feature all had nothing to draw. What follows makes a
+# suggestion feature to have anything to draw. What follows makes a
 # specific, deliberate SUBSET of the fleet answer all four, shaped to
 # match the site plan fleet_plan() already describes rather than wired so
 # every device claims to neighbour every other one (which would light up
@@ -1533,30 +1512,18 @@ def _room_temp_c(st, now):
 
 
 def _build_room_alert(wrap32: bool, ports: int, vlan: str | None) -> dict:
-    # ENTITY-SENSOR-MIB (RFC 3433) is the standards-based half of this
-    # persona: type 8 is temperature in °C, type 9 is %RH, exactly the two
-    # readings an AVTECH Room Alert exposes (nodepoll's own
-    # _SENSOR_TYPE_UNITS agrees, nodepoll.py:2926-2928).
+    # ENTITY-SENSOR-MIB (RFC 3433): type 8 is temperature in °C, type 9 is
+    # %RH, the two readings an AVTECH Room Alert exposes.
     #
-    # entity_sensors() is called with link_to_if=False on purpose: a Room
-    # Alert's temperature/humidity probes belong to the chassis, not to any
-    # port, so no entAliasMappingIdentifier row is published for them. That
-    # means nodepoll.read_dom() (the interface dialog's on-demand DOM read,
-    # which still gates on that mapping) correctly finds nothing here — but
-    # nodepoll._poll_environment (nodepoll.py:3081), the whole-device
-    # ENTITY-SENSOR-MIB walk added specifically because a chassis sensor has
-    # no port to be "on", finds and polls them regardless: temp_c and
-    # humidity_pct become real metrics, and alertsdb's temp_high/
-    # humidity_high thresholds (35°C/30°C, 80%/70%RH) evaluate against them.
-    # The temp_hot SPECIALS knob (index 15) pushes the reading past 35°C —
-    # see selftest.test_room_alert_dom for both halves proven together.
+    # entity_sensors() uses link_to_if=False: a Room Alert's probes belong
+    # to the chassis, not a port, so nodepoll._poll_environment's
+    # whole-device walk (not the per-port DOM read) is what polls them into
+    # temp_c/humidity_pct for alertsdb's temp_high/humidity_high gates. The
+    # temp_hot SPECIALS knob (index 15) pushes the reading past 35°C.
     #
-    # AVTECH's own enterprise arc (20916, CURATED — medium confidence, see
-    # enterprises.py's own docstring — as "avtech" in netpath/enterprises.py)
-    # is what identifies this persona; its Device MIB is not bundled in this
-    # tree and is far less documented than an RFC MIB, so the scalars under
-    # it below are representative, not cross-checked column numbers the way
-    # the ENTITY-SENSOR-MIB ones above are.
+    # AVTECH's enterprise arc (20916, "avtech" in netpath/enterprises.py)
+    # identifies this persona; its Device MIB is not bundled here, so the
+    # scalars below are representative, not cross-checked column numbers.
     entries = system_scalars(
         "AVTECH Room Alert 32E, firmware 4.42",
         "1.3.6.1.4.1.20916.1.8.2", services=64)

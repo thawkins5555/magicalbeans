@@ -1,30 +1,9 @@
-"""The remembered SSH host keys, shared by ConfigRX's backups and the
-interactive SSH terminal.
-
-One store, one rule. The first time this app reaches a host on a port it
-stores the key that host presented and carries on — network gear rarely
-carries a stable known_hosts entry anywhere, and refusing every first
-connection would only teach an operator to click past the warning. Every
-connection after that must present the same key; a different one is refused
-and reported, with both fingerprints and the date the old key was first seen,
-so the two things it can mean — the device was rebuilt, or something is
-sitting in the middle of the session — are a decision someone makes rather
-than one this app makes for them.
-
-Keys are compared BY THEIR BYTES (`key.asbytes()`), never by name. An RSA
-host key negotiates as `rsa-sha2-256` or `rsa-sha2-512` while the key object's
-`get_name()` still says `ssh-rsa`, so the same key can arrive under more than
-one label from the same device; a name comparison reports a key change that
-never happened. The stored fingerprint is the SHA-256 of those same bytes, in
-OpenSSH's `SHA256:<base64, no padding>` form, so what this app shows can be
-read against `ssh-keyscan` / `ssh-keygen -lf` output directly.
-
-The store is keyed by (host, port), matching paramiko's own known_hosts
-convention: the bare host for port 22, `[host]:port` for anything else.
-
-paramiko is imported lazily, inside the functions that need it, exactly as
-configrx.py does — the app must start on a machine that has no paramiko, and
-this module is imported from the web layer.
+"""Remembered SSH host keys, shared by ConfigRX's backups and the terminal.
+Trust-on-first-use, keyed by (host, port); a changed key is refused and
+reported with both fingerprints rather than silently accepted or replaced.
+Keys are compared BY THEIR BYTES, never by name — the same RSA key can
+negotiate under more than one algorithm label. paramiko is imported lazily,
+since the app must start on a machine that has none.
 """
 
 from __future__ import annotations
@@ -64,12 +43,8 @@ def _when(ts) -> str:
 
 class HostKeyChanged(Exception):
     """A host presented a key that is not the one this app remembers for it.
-
-    Carries both fingerprints, the new key's type and the date the old key was
-    first seen, because the message an operator needs names all four; and the
-    new key object itself, so a caller that decides to trust it can store it
-    without reconnecting to look at it again.
-    """
+    Carries both fingerprints, the new key type and date first seen, plus
+    the new key object itself so trusting it needs no reconnect."""
 
     def __init__(self, host: str, port: int, old_fingerprint: str,
                  new_fingerprint: str, key_type: str = "",
@@ -94,18 +69,9 @@ class HostKeyChanged(Exception):
 
 class HostKeyStore:
     """The (host, port) -> host key table, as paramiko wants to see it.
-
-    Constructed with the ConfigRX database (that is where the table lives —
-    ConfigRX is the module that owns SSH for these devices), and used the same
-    way from both callers:
-
-        store = HostKeyStore(configrx_db)
-        store.prepare(client, host, port)          # load what we remember
-        policy = store.policy(host, port)
-        client.set_missing_host_key_policy(policy)
-        client.connect(...)                        # may raise HostKeyChanged
-        store.record_seen(host, port)
-    """
+    Constructed with the ConfigRX database (where the table lives). Usage:
+    prepare() to load, policy() for set_missing_host_key_policy, then
+    connect() (may raise HostKeyChanged), then record_seen()."""
 
     def __init__(self, db):
         self.db = db
@@ -166,20 +132,11 @@ class HostKeyStore:
         return key
 
     def policy(self, host: str, port: int):
-        """A `paramiko.MissingHostKeyPolicy` for this host and port.
-
-        Reached when paramiko has no key loaded for the host — normally the
-        first connection, which is stored and accepted, with the fingerprint
-        and type left on `policy.stored_new` / `policy.stored_type` so the
-        caller can say that it happened, and say it about the right key.
-
-        It re-reads the store rather than trusting that `prepare` was called,
-        or that it could rebuild what it found: if a key IS stored and the
-        bytes differ, this refuses, whatever the two keys' types are.
-
-        The class is built inside the function because paramiko is imported
-        lazily; the module must import on a machine without it.
-        """
+        """A `paramiko.MissingHostKeyPolicy` for this host and port. Reached
+        on first connection (stored and accepted, with the fingerprint left
+        on `policy.stored_new`/`stored_type`) or when the stored bytes
+        differ from what the host just presented (refused). Built inside
+        the function since paramiko is imported lazily."""
         import paramiko
 
         store = self
@@ -218,15 +175,10 @@ class HostKeyStore:
             row["first_seen_ts"] if row else None, new_key)
 
     def as_changed(self, exc, host: str, port: int) -> HostKeyChanged:
-        """paramiko's own `BadHostKeyException` — what `SSHClient.connect`
-        raises when the key loaded by `prepare` is not the one the host
-        presented — as this app's `HostKeyChanged`, with the stored row's
-        first-seen date filled in from the store, which the exception does
-        not carry.
-
-        Passing an already-mapped `HostKeyChanged` straight back is
-        deliberate: a caller can funnel both exception types through one line.
-        """
+        """paramiko's `BadHostKeyException` as this app's `HostKeyChanged`,
+        with first-seen filled in from the store. Passing an already-mapped
+        `HostKeyChanged` straight back lets a caller funnel both through
+        one line."""
         if isinstance(exc, HostKeyChanged):
             return exc
         row = self.stored(host, port)

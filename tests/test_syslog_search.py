@@ -1,4 +1,4 @@
-"""Tier 0 fix T0-2: syslogdb._fts_query() honours the app's universal `*`
+"""syslogdb._fts_query() honours the app's universal `*`
 prefix convention (`interfac*`) instead of quoting the asterisk literally
 and matching nothing. Covers the query-builder in isolation (so the
 assertions hold whether or not this SQLite build has FTS5/trigram) and an

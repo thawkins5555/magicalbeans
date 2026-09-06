@@ -1,26 +1,9 @@
-"""mem_pct's new HOST-RESOURCES-MIB fallback (hrStorageRam), and the shared
-hrStorageTable walk it now shares with disk_pct.
-
-The gap: a Windows host, a printer, or most appliances answer none of
-UCD-SNMP, a Fortinet scalar or the Cisco memory pool -- the only three
-sources mem_pct ever had -- so a device correctly identified as `microsoft`
-still reported cpu_pct and disk_pct (both already covered by HOST-RESOURCES-
-MIB) and NO mem_pct at all, on a live 250-device campaign. hrStorageRam sits
-in the exact table disk_pct already walks for hrStorageFixedDisk, so this is
-new arithmetic on data the poller was already paying for -- not a new
-request.
-
-Three things this suite has to prove:
-  1. mem_pct is produced for a device that answers none of the three
-     existing sources, using hrStorageRam, and correctly EXCLUDES
-     hrStorageVirtualMemory (deliberately given the worst-looking
-     percentage in the fixture, so an accidental inclusion cannot pass by
-     coincidence) the same way disk_pct already excludes it.
-  2. hrStorageType/Size/Used is walked ONCE per poll for both disk_pct and
-     mem_pct together, not once each -- the whole point of using data
-     "already being walked" rather than adding a second walk beside it.
-  3. A device with no HOST-RESOURCES-MIB support at all still reports
-     nothing for any of the three metrics, rather than erroring.
+"""mem_pct's HOST-RESOURCES-MIB fallback (hrStorageRam) and the hrStorageTable
+walk it shares with disk_pct. Proves: mem_pct is produced for a device that
+answers none of UCD-SNMP, the Fortinet scalar or the Cisco memory pool, and
+excludes hrStorageVirtualMemory as disk_pct does; hrStorageType/Size/Used is
+walked ONCE per poll for both metrics; and a device with no HOST-RESOURCES-MIB
+support reports nothing for any of the three metrics rather than erroring.
 """
 import time
 

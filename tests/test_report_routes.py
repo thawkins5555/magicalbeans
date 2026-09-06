@@ -1,24 +1,9 @@
-"""4.49.0: the two /api/nodes/reports/* routes on top of netpath/report.py's
-device_availability_report and top_metric_ranking (report.py itself, and its
-query correctness/cost at scale, is covered by test_report_availability.py
-and test_report_topn.py — this suite is the thin dispatch layer: query-string
-parsing, "no device_ids means the whole fleet", and the synchronous-request
-refusal for a whole-fleet top-metrics ask spanning more than a week).
-
-Covers:
-  - GET /api/nodes/reports/availability with no device_ids reports on every
-    device on file; device_ids narrows it; an explicit t0/t1 is honoured.
-  - GET /api/nodes/reports/top-metrics: key is required; rank_by must be
-    'peak' or 'mean'; ranks against samples_hourly (seeded directly, the
-    same way test_report_topn.py's own fixture is built, since the hourly
-    rollup runs on its own schedule, not synchronously with a live sample).
-  - Ranking the WHOLE fleet (no device_ids) over more than 7 days is
-    refused outright; the same window narrowed to specific device_ids is
-    allowed — report.py's own docstring measured the whole-fleet, month-
-    long shape at ~100s, too slow for a synchronous request.
-  - Both routes are gated ("nodes", read): a nodes:read account may read
-    both; an account with no nodes grant is refused both.
-"""
+"""The two /api/nodes/reports/* routes over netpath/report.py, which is itself
+covered by test_report_availability.py and test_report_topn.py; this suite is
+the thin dispatch layer. Covers: availability with no device_ids reports the
+whole fleet, device_ids narrows it, t0/t1 are honoured; top-metrics requires a
+key and a rank_by of 'peak'|'mean', ranking seeded samples_hourly; fleet-wide
+ranking over more than 7 days is refused; both routes are gated "nodes" read."""
 import http.client
 import json
 import os

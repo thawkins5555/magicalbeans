@@ -1,22 +1,9 @@
-"""netpath/report.py's device_availability_report(), against real
-NodesDatabase/AlertsDatabase instances (in-memory, same schema and public
-methods the running application uses) rather than hand-rolled fakes — the
-whole point of this report is that device_status_segments, windows() and
-mutes() are the source of truth, so a test double for any of them would be
-testing this module's assumptions about them, not the module itself.
-
-Five things, matching what the task asked this module to prove:
-  1. a device up the whole window reads 100%
-  2. two separate outages report as two outages, with the right total
-     downtime, the right longest outage, and the right MTTR
-  3. a device added mid-window is not charged for the time before it
-     existed
-  4. a maintenance-window device and a muted device are both
-     distinguishable from a genuinely down one — three devices, same raw
-     down time, three different net figures
-  5. (test_report_topn.py covers top-N ranking separately, and the
-     realistic-scale query cost)
-"""
+"""netpath/report.py's device_availability_report(), against real in-memory
+NodesDatabase/AlertsDatabase instances rather than fakes, since
+device_status_segments, windows() and mutes() are the source of truth. Proves:
+a device up all window reads 100%; two outages report the right total,
+longest and MTTR; a device added mid-window is not charged for time before it
+existed; maintenance and muted devices differ from a genuinely down one."""
 import os
 import sys
 import time

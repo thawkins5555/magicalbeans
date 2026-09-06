@@ -11,8 +11,7 @@
 </head>
 <body class="login-page">
 <main class="login-box">
-  <!-- The mark is favicon.svg's route, drawn here with classes so it
-       takes its colours from the theme rather than from hex. -->
+  <!-- favicon.svg's route, drawn here with classes so it takes its colours from the theme, not hex. -->
   <h1 class="brand"><svg class="mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path class="mark-route" d="M6 22 L13 12 L20 20 L26 10"/><circle class="mark-start" cx="6" cy="22" r="3.1"/><circle class="mark-hop" cx="13" cy="12" r="2.6"/><circle class="mark-hop" cx="20" cy="20" r="2.6"/><circle class="mark-end" cx="26" cy="10" r="3.4"/></svg><span>SappiWhere</span></h1>
 
   <form id="login-form" autocomplete="on">
@@ -27,17 +26,11 @@
     <p id="login-error" class="err" role="alert" hidden></p>
     <button id="login-button" type="submit" class="primary">Sign in</button>
   </form>
-  <!-- Shown only on a fresh install nobody has signed in to (the server
-       says so on /api/session). Until then a first-run administrator faced
-       this form with no hint that a default account existed. -->
+  <!-- Shown only on a fresh install nobody has signed in to (/api/session says so). -->
   <p id="login-note" class="hint" hidden>First time here? Sign in as
     <b>admin</b> with the password <b>admin</b>. You will be asked to choose a
     new password before anything else.</p>
-  <!-- The rest of the interface names its own version in the Account
-       dialog; this page had nothing at all before it, which left no way to
-       tell a stale bookmark or a caching proxy from an actual upgrade
-       without signing in first. Set from /api/session, which already
-       answers before there is a session. -->
+  <!-- Set from /api/session, which already answers before there is a session. -->
   <p id="login-version" class="hint" hidden></p>
 
 </main>

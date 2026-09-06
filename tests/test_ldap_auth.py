@@ -1,19 +1,9 @@
-"""LDAP simple-bind directory authentication (Tier 1 #10).
-
-Three layers, cheapest first:
-
-  1. The hand-rolled BER encoder, against a known-good byte vector composed
-     by hand and cited to RFC 4511 fields (no server involved at all).
-  2. netpath.ldapclient.simple_bind against a scripted fake LDAP server on a
-     local socket (a thread, the same shape test_security_fixes.py's SMTP
-     spy already uses) — success, invalidCredentials, referral, a garbage
-     response, a stalled directory (read timeout), and the cleartext
-     refusal, each asserting both the client's behaviour and what the fake
-     server actually received.
-  3. The real login route end to end: an ldap-mapped account signs in
-     through the fake server, a wrong password is refused, the directory
-     being down fails closed with its own distinct error, a local account
-     is unaffected by any of it, and the last-local-admin safeguard holds.
+"""LDAP simple-bind directory authentication, three layers cheapest first:
+the hand-rolled BER encoder against known-good byte vectors, simple_bind
+against a scripted fake LDAP server (success, invalidCredentials,
+referral, garbage, a stalled directory, the cleartext refusal), and the
+real login route end to end -- an ldap-mapped account, a wrong password,
+a directory that is down, a local account, and the last-local-admin safeguard.
 """
 import http.client
 import json
@@ -29,7 +19,7 @@ TMPDIR = tmpdir("ldap_auth_")
 
 from netpath import ldapclient
 from netpath.web import Service, WebServer
-from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER
+from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER, SessionStore
 
 failures = []
 
@@ -208,7 +198,7 @@ class FakeLdapServer:
     back whatever bytes it returns (or nothing at all, if it returns None
     — simulating a directory that accepts a connection and then hangs).
 
-    Threaded, like the SMTP spy in test_security_fixes.py. `received`
+    Threaded, like the SMTP spy in test_web_security.py. `received`
     records every (dn, password) actually parsed off the wire, so a test
     can assert what the server saw, not just what the client claims it
     sent — the whole point of testing against a real socket instead of
@@ -664,7 +654,7 @@ try:
         # The same guard, exercised directly (it is mostly a backstop: no
         # route ever lets an account edit its own grants or delete itself,
         # so this is the only way to see it fire with nothing else in the
-        # way — the same approach test_security_fixes.py's D8 uses for the
+        # way — the same approach test_web_security.py's D8 uses for the
         # plain "last administrator" guard this one extends).
         import netpath.web.api as api_mod
         try:
@@ -686,6 +676,141 @@ finally:
     while time.time() < deadline and service.node_poller.worker_state():
         time.sleep(0.1)
     service.shutdown()
+
+
+# =========================================================================
+# 5. simple_bind's empty-password guard, and destroy_user's case-folding.
+#
+# Merged from test_auth_review_fixes.py: an empty password is a legal,
+# distinct "unauthenticated bind" under RFC 4511 §4.2 that many directories
+# answer with resultCode 0 -- so simple_bind and authenticate_ldap both
+# refuse an empty password before any of it can reach the wire.
+# destroy_user() used to match sessions case-sensitively while every
+# account lookup elsewhere is COLLATE NOCASE, so a password reset could
+# kill zero sessions for the live (differently-cased) one.
+# =========================================================================
+
+def empty_password_and_session_case_checks():
+    print("simple_bind: empty password refused before any network access")
+
+    # Nothing listens on port 1 (a reserved, unassigned port) on loopback: if
+    # simple_bind's empty-password guard did not fire first and it actually
+    # tried to connect, that attempt would fail with LDAPConnectError, not
+    # LDAPInvalidCredentials -- so seeing the latter is proof the guard ran
+    # before _parse_url/socket work, not just that the bind eventually failed
+    # somehow.
+    dead_url = "ldaps://127.0.0.1:1"
+
+    try:
+        ldapclient.simple_bind(dead_url, "uid=alice,ou=people,dc=example,dc=com", "")
+        check("empty password: did not raise (unexpected)", False)
+    except ldapclient.LDAPInvalidCredentials:
+        check("empty password raises LDAPInvalidCredentials, not "
+              "LDAPConnectError — proof it never touched the socket", True)
+    except ldapclient.LDAPError as exc:
+        check("empty password raises LDAPInvalidCredentials, not something else",
+              False, repr(exc))
+
+    # The guard must not depend on allow_cleartext, a valid dn, or any other
+    # argument -- an empty password is refused unconditionally.
+    try:
+        ldapclient.simple_bind("ldap://127.0.0.1:1", "uid=alice,ou=people,dc=example,dc=com",
+                               "", allow_cleartext=True)
+        check("empty password over ldap://+allow_cleartext: did not raise "
+              "(unexpected)", False)
+    except ldapclient.LDAPInvalidCredentials:
+        check("empty password is refused the same way over ldap:// with "
+              "allow_cleartext=True", True)
+    except ldapclient.LDAPError as exc:
+        check("empty password over ldap://+allow_cleartext raises "
+              "LDAPInvalidCredentials, not something else", False, repr(exc))
+
+    # A non-empty password still reaches the bind path (the guard is not
+    # overly broad -- it only catches the empty case).
+    print("simple_bind: a non-empty password still reaches the network")
+
+    try:
+        ldapclient.simple_bind(dead_url, "uid=alice,ou=people,dc=example,dc=com",
+                               "not-empty")
+        check("non-empty password: did not raise (unexpected — nothing is "
+              "listening on this port)", False)
+    except ldapclient.LDAPConnectError:
+        check("non-empty password gets past the empty-password guard and "
+              "reaches the connect attempt (LDAPConnectError on a dead port)",
+              True)
+    except ldapclient.LDAPError as exc:
+        check("non-empty password should reach LDAPConnectError on a dead "
+              "port, not something else", False, repr(exc))
+
+    # Service.authenticate_ldap returns False for an empty password without
+    # needing a real (or even reachable) directory -- defence in depth over
+    # simple_bind's own guard.
+    print("authenticate_ldap: empty password refused before ldapclient is asked")
+
+    auth_tmpdir = tmpdir("auth_review_fixes_")
+    auth_service = Service(
+        os.path.join(auth_tmpdir, "netpath.db"), os.path.join(auth_tmpdir, "flows.db"),
+        os.path.join(auth_tmpdir, "syslog.db"), os.path.join(auth_tmpdir, "app.db"),
+        os.path.join(auth_tmpdir, "ipam.db"), os.path.join(auth_tmpdir, "snmptraps.db"),
+        os.path.join(auth_tmpdir, "nodes.db"), os.path.join(auth_tmpdir, "alerts.db"),
+        os.path.join(auth_tmpdir, "wireless.db"), os.path.join(auth_tmpdir, "configrx.db"))
+    auth_service.start()
+
+    try:
+        # ldap_url is deliberately left unset/unreachable: if authenticate_ldap's
+        # own empty-password guard did not fire, this would fall through into
+        # ldapclient and raise LdapUnavailable (a misconfigured/unreachable
+        # directory) rather than returning False -- so a clean False here is
+        # proof the guard is in authenticate_ldap itself, not just inherited
+        # from simple_bind by accident.
+        result = auth_service.authenticate_ldap("alice", "")
+        check("authenticate_ldap('alice', '') returns False without raising",
+              result is False, repr(result))
+
+        # Setting a real (if unreachable) ldap_url changes nothing about the
+        # empty-password answer -- still refused before any directory is asked.
+        auth_service.settings["ldap_url"] = "ldaps://127.0.0.1:1"
+        auth_service.settings["ldap_bind_dn_template"] = \
+            "uid={username},ou=people,dc=example,dc=com"
+        result = auth_service.authenticate_ldap("alice", "")
+        check("…still False once ldap_url is configured (defence in depth, "
+              "not just an accident of no config)", result is False, repr(result))
+    finally:
+        auth_service.shutdown()
+
+    # SessionStore.destroy_user matches case-insensitively, agreeing with
+    # app.db's COLLATE NOCASE account lookups.
+    print("SessionStore.destroy_user: case-insensitive, like every account lookup")
+
+    store = SessionStore()
+    token = store.create("bob.smith", client="127.0.0.1", agent="test")
+    check("the session was actually created", store.get(token) is not None)
+
+    ended = store.destroy_user("Bob.Smith")
+    check("destroy_user('Bob.Smith') ends a session created as 'bob.smith'",
+          ended == 1, ended)
+    check("…and the session is actually gone", store.get(token) is None)
+
+    # The reverse casing direction, and a completely different case shape, to
+    # make sure this is a real casefold and not a lucky one-off comparison.
+    token2 = store.create("BOB.SMITH")
+    ended2 = store.destroy_user("bob.smith")
+    check("destroy_user('bob.smith') ends a session created as 'BOB.SMITH'",
+          ended2 == 1, ended2)
+    check("…and that session is gone too", store.get(token2) is None)
+
+    # A session for an unrelated user must survive -- this is case-INsensitive
+    # matching of the same account, not a match-everything bug.
+    token3 = store.create("carol")
+    ended3 = store.destroy_user("Bob.Smith")
+    check("destroy_user for an account with no live sessions returns 0",
+          ended3 == 0, ended3)
+    check("…and an unrelated account's session is untouched",
+          store.get(token3) is not None)
+    store.destroy(token3)
+
+
+empty_password_and_session_case_checks()
 
 sys.exit(1 if failures else 0)
 

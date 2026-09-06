@@ -1,22 +1,9 @@
 """The static handler and the response path, driven over a real socket.
-
-Nothing tested any of this before: not the security headers, not the 304
-path, not the content type, not the traversal guard. Each of these was a
-finding of the serving-layer review, and each is one request to pin.
-
-  * a revalidated response (304) carries the same security headers as the
-    200 it stands in for — it used to carry none, and revalidation is the
-    steady state for every script and stylesheet;
-  * a script is text/javascript with a charset whatever the host's registry
-    says, because every response is `nosniff` and a script served as
-    text/plain is refused outright;
-  * gzip is sent when asked for, with Vary, and never when not asked for or
-    when the client says `gzip;q=0`; JSON is compressed too;
-  * the ETag is a content hash, so identical bytes revalidate as identical;
-  * HEAD returns the headers of the GET with no body;
-  * a path that escapes static/ is refused;
-  * the sign-in page and everything it links load before there is a session.
-"""
+Pins: a 304 carries the same security headers as the 200 it stands in for;
+scripts are text/javascript with a charset regardless of the host registry
+(every response is nosniff); gzip only when asked for, with Vary, JSON too;
+the ETag is a content hash; HEAD returns GET's headers with no body; a path
+escaping static/ is refused; the sign-in page loads before any session."""
 
 import gzip
 import http.client

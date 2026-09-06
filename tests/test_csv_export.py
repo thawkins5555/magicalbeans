@@ -1,19 +1,9 @@
-"""Item 1 of the API-heavy trio: `GET /api/<module>/export.csv` on every
-operator-facing table.
-
-Covers, against a real Service + WebServer over loopback: the current
-filter honoured (devices, syslog), RFC 4180 quoting of a value carrying a
-comma, an embedded quote and a newline all at once, the permission gate
-(read is enough, but only for the module the route belongs to — the same
-semantics test_web_gates.py already pins for the JSON routes), the
-Content-Disposition-style filename the JSON payload carries, and the
-alerts export actually exceeding the old 2,000-row screen cap.
-
-Every export route answers JSON — {csv, filename, count, truncated, cap}
-— rather than a raw file (see api.py's `_csv_response` docstring for why);
-this suite reads `csv` back with Python's own csv module rather than
-string-matching it, so a quoting bug that still "looks right" eyeballed
-would still fail here.
+"""`GET /api/<module>/export.csv` on every operator-facing table, against a real
+Service + WebServer over loopback: the current filter honoured (devices, syslog),
+RFC 4180 quoting of a comma, embedded quote and newline at once, the per-module
+read gate (as test_web_gates.py pins for the JSON routes), the filename in the
+JSON payload, and alerts exceeding the 2,000-row screen cap. Routes answer JSON
+{csv, filename, count, truncated, cap}; `csv` is parsed with the csv module.
 """
 import csv
 import http.client

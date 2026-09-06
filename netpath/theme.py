@@ -56,26 +56,6 @@ BLOCKED = QColor("#FF8A65")
 OVERRUN = QColor("#4DB6AC")
 NODATA = QColor("#1E242D")
 
-STATUS_COLORS = {
-    "ok": OK,
-    "warn": WARN,
-    "fail": FAIL,
-    "blocked": BLOCKED,
-    "overrun": OVERRUN,
-    "error": ERROR,
-    "none": NODATA,
-}
-
-STATUS_LABELS = {
-    "ok": "Healthy",
-    "warn": "Degraded",
-    "fail": "No reply",
-    "blocked": "Refused (ICMP unreachable)",
-    "overrun": "Skipped \u2014 previous trace still running",
-    "error": "Probe failed",
-    "none": "No data",
-}
-
 # Categorical palette for stacked flow charts: the same eight hues the web
 # NetFlow chart uses (--cat-1 .. --cat-8), chosen for separation under
 # protanopia simulation as well as in normal vision, and clear of the status
@@ -86,10 +66,6 @@ SERIES = [
     QColor("#D1609A"), QColor("#4F9A3A"), QColor("#8F76E8"), QColor("#DC5A5A"),
 ]
 SERIES_OTHER = DATA_NEUTRAL
-
-
-def series_color(index: int) -> QColor:
-    return SERIES[index % len(SERIES)]
 
 
 MONO_FAMILIES = [
@@ -115,10 +91,6 @@ def ui_font(size: int = 10, bold: bool = False) -> QFont:
     font.setPointSize(size)
     font.setBold(bold)
     return font
-
-
-def status_color(status: str) -> QColor:
-    return STATUS_COLORS.get(status, NODATA)
 
 
 STYLESHEET = f"""

@@ -1,16 +1,9 @@
-"""Tier 0 fix T0-3: every entry in the shipped MIB catalog must be
-installable by its own installer -- fetch_file()'s per-file size cap
-(max_mib_bytes) has to clear the largest real vendor file the catalog
-names, or the one-click Install button fails on a file nobody uploaded
-themselves.
+"""Every entry in the shipped MIB catalog must be installable by its own
+installer: fetch_file()'s per-file size cap (max_mib_bytes) has to clear the
+largest real vendor file the catalog names, or one-click Install fails.
 
-No network access here (offline like every other suite): rather than
-fetching upstream and measuring, this pins the largest sizes actually
-observed for the catalog's files (recorded below, at the time this suite
-was written) as a documented floor, and asserts the enforced cap clears
-that floor with real headroom. That keeps the invariant checkable without
-depending on GitHub being reachable, while still catching the exact bug
-this fixes: a shipped entry whose real file is bigger than the cap."""
+Offline like every other suite: the largest sizes observed for the catalog's
+files are pinned below as a documented floor, and the cap must clear it."""
 from _paths import tmpdir  # noqa: F401  (repo root on sys.path)
 
 from netpath import mibcatalog

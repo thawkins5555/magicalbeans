@@ -1,14 +1,9 @@
-"""Item 3 of the API-heavy trio: `POST /api/nodes/devices/bulk-import`.
-
-Covers, against a real Service + WebServer over loopback: the JSON-array
-form and the CSV-text form (including column aliases and a profile/group
-named rather than id'd), per-row dispositions (created/duplicate/invalid),
-transactionality — a batch containing one row that fails validation still
-inserts every row that passed, and nothing beyond that gets written even
-where the underlying insert itself is made to fail — the permission gate
-(same as single-device creation: nodes write), and that a created device
-gets the same post-add queueing the single POST route triggers (a first
-poll, and identification where SNMP is enabled).
+"""`POST /api/nodes/devices/bulk-import`, driven against a real Service +
+WebServer over loopback: the JSON-array and CSV-text forms (column aliases, a
+profile/group named rather than id'd), per-row created/duplicate/invalid
+dispositions, transactionality (rows that passed validation are inserted and
+nothing beyond that, even when the insert itself fails), the nodes-write
+permission gate, and the same post-add queueing the single POST route does.
 """
 import http.client
 import json

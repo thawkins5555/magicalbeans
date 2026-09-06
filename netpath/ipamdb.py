@@ -1,51 +1,18 @@
 """Storage for the IPAM module: subnets, discovered addresses, conflicts, and
 what a Windows DHCP server reports about its scopes and leases.
 
-Two things land in this file that come from very different places and are
-kept apart by a `source` marker rather than separate tables, because a host
-row and a lease row describe the same kind of fact — an IP is in use — and
-most of the useful work (conflict detection) is comparing them:
-
-* **Discovered** — from SappiWhere's own ping sweep and a look at the local
-  ARP table afterward. This only sees MAC addresses on the same broadcast
-  domain as whichever machine runs SappiWhere; it cannot see across a router.
-* **Reported** — pulled read-only from a Windows DHCP server's own idea of
-  its scopes and leases. This has no such limit, but is bounded by whatever
-  the DHCP server has itself observed or been told; a static IP assigned
-  outside DHCP is invisible to it.
-
-Neither view is complete on its own, and a live host on a real subnet is the
-overlap between them. That is also where most of the value of catching a
-conflict lives: a device answering on the wire with a MAC the DHCP server
-never handed that address to is either squatting on a reservation or the
-DHCP server's records are stale, and either is worth a look.
+Discovered rows (ping sweep plus the local ARP table) and reported rows (a
+DHCP server's own records) share the tables behind a `source` marker: neither
+view is complete, and a conflict is a disagreement between them.
 """
 
 from __future__ import annotations
 
 import ipaddress
-import json
-import logging
 import sqlite3
-import threading
 import time
 
-from . import dbmaint, dbopen, settingsutil
-
-log = logging.getLogger(__name__)
-
-# Trimming a database back under its size cap: rows are deleted in fixed
-# batches, each in its own short transaction, so the write lock is never held
-# for more than one batch. The old shape deleted 15% of the table and then
-# VACUUMed the whole file with the lock held, up to six times per maintenance
-# pass — measured at a 4.1 s stall on one insert against a 232 MB file, and it
-# still finished above the cap and reported success.
-TRIM_CHUNK = 2_000           # rows per lock acquisition, adapted below
-TRIM_CHUNK_MIN = 500
-TRIM_CHUNK_MAX = 50_000
-TRIM_LOCK_TARGET_S = 0.15    # how long one batch may hold the write lock
-TRIM_PASSES = 40             # delete/reclaim rounds before giving up
-TRIM_BUDGET_S = 30.0         # wall clock for one trim_to_size call
+from .sqlitebase import SqliteStore
 
 
 def scope_size(start_ip: str, end_ip: str) -> int | None:
@@ -227,67 +194,19 @@ DEFAULTS = {
 }
 
 
-class IpamDatabase:
-    def __init__(self, path: str):
-        self.path = path
-        self._lock = threading.RLock()
-        self._conn = dbopen.connect(path)
-        self._conn.row_factory = sqlite3.Row
-        with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            dbmaint.enable_incremental_vacuum(self._conn, "ipam.db")
-            self._conn.executescript(SCHEMA)
-            self._migrate()
-            self._conn.commit()
+class IpamDatabase(SqliteStore):
+    SCHEMA = SCHEMA
+    DEFAULTS = DEFAULTS
+    LABEL = "ipam.db"
+    # Scan history is the one table here that grows without bound: subnets,
+    # hosts and open conflicts are all bounded by what is on the network.
+    TRIM_TABLE = "scans"
+    TRIM_FLOOR = 200
 
     def _migrate(self) -> None:
-        """Add columns introduced after a database was first created.
-
-        CREATE TABLE IF NOT EXISTS silently leaves an existing table alone, so
-        an install from before the credential fields existed needs them added
-        explicitly or the next write to dhcp_servers fails.
-        """
-        servers = {row["name"] for row in
-                  self._conn.execute("PRAGMA table_info(dhcp_servers)").fetchall()}
-        for column, definition in [("username", "TEXT"), ("password_enc", "BLOB")]:
-            if column not in servers:
-                self._conn.execute(
-                    f"ALTER TABLE dhcp_servers ADD COLUMN {column} {definition}")
-
-        scopes = {row["name"] for row in
-                 self._conn.execute("PRAGMA table_info(dhcp_scopes)").fetchall()}
-        if "router" not in scopes:
-            self._conn.execute("ALTER TABLE dhcp_scopes ADD COLUMN router TEXT")
-
-    def close(self) -> None:
-        with self._lock:
-            self._conn.close()
-
-    # -------------------------------------------------------------- settings
-
-    def settings(self) -> dict:
-        values = dict(DEFAULTS)
-        with self._lock:
-            rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
-        for row in rows:
-            if row["key"] in values:
-                try:
-                    values[row["key"]] = json.loads(row["value"])
-                except (ValueError, TypeError):
-                    pass
-        return settingsutil.coerce_settings(DEFAULTS, values, strict=False)
-
-    def save_settings(self, values: dict) -> None:
-        with self._lock:
-            for key, value in values.items():
-                if key not in DEFAULTS:
-                    continue
-                self._conn.execute(
-                    "INSERT INTO settings(key, value) VALUES (?,?)"
-                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (key, json.dumps(value)))
-            self._conn.commit()
+        self.ensure_columns("dhcp_servers",
+                            {"username": "TEXT", "password_enc": "BLOB"})
+        self.ensure_columns("dhcp_scopes", {"router": "TEXT"})
 
     # --------------------------------------------------------------- subnets
 
@@ -726,80 +645,3 @@ class IpamDatabase:
                 " ORDER BY (l.hostname LIKE ?) DESC, l.ip"
                 " LIMIT ?",
                 (like, like, like, like, f"{query}%", limit)).fetchall()
-
-    # ------------------------------------------------------------------ size
-
-    def size_bytes(self) -> int:
-        import os
-        total = 0
-        for suffix in ("", "-wal", "-shm"):
-            try:
-                total += os.path.getsize(self.path + suffix)
-            except OSError:
-                pass
-        return total
-
-    def trim_to_size(self, max_bytes: int) -> int:
-        """Delete the oldest scan records until the file fits under the cap.
-
-        Scan history is the one table here that grows without bound —
-        subnets, hosts and open conflicts are all bounded by what currently
-        exists on the network, not by time.
-        """
-        if max_bytes <= 0:
-            return 0
-        removed = 0
-        deadline = time.monotonic() + TRIM_BUDGET_S
-        for _ in range(TRIM_PASSES):
-            size = self.size_bytes()
-            if size <= max_bytes:
-                break
-            with self._lock:
-                bounds = self._conn.execute(
-                    "SELECT MIN(id) AS lo, MAX(id) AS hi FROM scans").fetchone()
-            low, high = bounds["lo"], bounds["hi"]
-            # Ids are handed out in arrival order, so the id span is both the
-            # right definition of "oldest" — immune to a device with a wrong
-            # clock — and a proxy for the row count that costs one index probe
-            # rather than the full scan a COUNT(*) would.
-            deletable = 0 if low is None else max(0, high - low + 1 - 200)
-            if deletable:
-                span = high - low + 1
-                want = min(deletable, max(1, int(
-                    span * (1.0 - max_bytes / float(size)) * 1.1)))
-                cut = low + want
-                chunk = TRIM_CHUNK
-                while low < cut and time.monotonic() < deadline:
-                    upper = min(low + chunk, cut)
-                    started = time.monotonic()
-                    with self._lock:
-                        cursor = self._conn.execute(
-                            "DELETE FROM scans"
-                            " WHERE id >= ? AND id < ?", (low, upper))
-                        removed += cursor.rowcount or 0
-                        self._conn.commit()
-                    held = time.monotonic() - started
-                    low = upper
-                    # Keep one batch's lock hold near TRIM_LOCK_TARGET_S
-                    # however large the rows turn out to be — a trap with its
-                    # raw frame stored costs an order of magnitude more than a
-                    # syslog line, and one fixed batch size cannot suit both.
-                    if held > TRIM_LOCK_TARGET_S:
-                        chunk = max(TRIM_CHUNK_MIN, chunk // 2)
-                    elif held < TRIM_LOCK_TARGET_S / 4:
-                        chunk = min(TRIM_CHUNK_MAX, chunk * 2)
-            # Hand the freed pages back, in short slices outside the lock
-            # block. reclaim takes the lock itself and reacquires it in a
-            # tight loop, and a Python lock is not fair, so it is asked for a
-            # little at a time rather than for one long run.
-            while time.monotonic() < deadline:
-                if not dbmaint.reclaim(self._conn, self._lock, pages=500,
-                                       budget_s=0.2, label="ipam.db"):
-                    break
-            if not deletable or time.monotonic() >= deadline:
-                break
-        if self.size_bytes() > max_bytes:
-            log.warning("%s: %d bytes after removing %d rows, still above the "
-                        "%d byte cap; continuing at the next maintenance pass",
-                        "ipam.db", self.size_bytes(), removed, max_bytes)
-        return removed

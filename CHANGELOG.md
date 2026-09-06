@@ -4,6 +4,8 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.52.0 — One base class, in place of ten copies](#4520--one-base-class-in-place-of-ten-copies)
+- [4.51.0 — The patterns this codebase already knew](#4510--the-patterns-this-codebase-already-knew)
 - [4.50.0 — The last mile, walked](#4500--the-last-mile-walked)
 - [4.49.0 — The estate it couldn't see](#4490--the-estate-it-couldnt-see)
 - [4.48.0 — The interface, reviewed](#4480--the-interface-reviewed)
@@ -117,6 +119,48 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 4.52.0 — One base class, in place of ten copies
+
+A simplification release: no new features, and no behaviour change except
+where named below.
+
+**`SqliteStore` (`netpath/sqlitebase.py`)** replaces the copy-pasted open/
+pragma/migrate/close/trim lifecycle duplicated across all ten databases
+(`db`, `flowdb`, `snmptrapdb`, `syslogdb`, `wirelessdb`, `configrxdb`,
+`appdb`, `nodesdb`, `alertsdb`, `ipamdb`). Every database now opens with the
+same pragmas — `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON` —
+which is new only for `netpath.db`, `ipam.db` and `app.db`; every schema
+with a foreign key already ran with them on, so this closes a pragma drift
+rather than changing behaviour.
+
+**`UdpReceiver` (`netpath/udpsock.py`)** replaces the pasted-in receive-loop
+plumbing in the NetFlow collector, the SNMP trap receiver and the syslog
+collector. One fix falls out of sharing the code: the syslog collector now
+reports itself stopped if *any* of its threads has died, like the trap
+receiver already did, not only when all of them have. The `Worker` mixin
+(`netpath/worker.py`) does the same for the node and wireless pollers, the
+alert engine, the ConfigRX and IPAM workers, and the mail queues.
+
+**Module merges** (the old module names are gone; import from the new homes):
+`dbopen.py`+`dbmaint.py`+`settingsutil.py` → `sqlitebase.py`; `procs.py` →
+`worker.py`; `trapoids.py` → `trapdecode.py`; `fortinetoids.py` →
+`nodeoids.py`; `hostresolve.py` → `namelookup.py`; `configrx_vendors.py` →
+`configrx.py`; `configrx_search.py` → `configrx_compliance.py`.
+`ipam_scan.normalize_mac` is renamed `mac_colon`, internal-only, so two
+incompatible functions of that name stop being confused with each other.
+
+**`snmp.js` and `syslog.js` merge into `events.js`**, one page factory
+registering both tabs with no visible change, and shared `app.js` helpers
+replace copies that had quietly drifted apart module to module.
+
+**Housekeeping**: the seven point-in-time review documents are deleted;
+`RELEASE.md`, `QUICKSTART.md` and `BACKUP-RESTORE.md` fold into sections of
+`README.md`; a handful of orphaned scripts are removed; test suites are
+renamed by subject rather than by review round and the smallest merged; and
+a repo-wide comment sweep keeps one-line whys and drops provenance,
+measurements and review-ticket citations — none of it behaviour, and this
+file is where that history still lives.
 
 ### 4.51.0 — The patterns this codebase already knew
 

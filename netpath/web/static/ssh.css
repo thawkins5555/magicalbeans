@@ -1,11 +1,7 @@
-/* The SSH window: a standalone popup, so it loads app.css for the palette
-   and the shared widgets (.bar, button, input, .hint, .err) and adds only
-   what a terminal window needs on top. Nothing here is used by the main
-   application page. */
+/* The SSH window: a standalone popup. Loads app.css for the palette and
+   shared widgets, and adds only what a terminal window needs on top. */
 
 body.ssh-page {
-  /* app.css already makes <body> a column flexbox that never scrolls; the
-     terminal takes whatever the header leaves and scrolls inside itself. */
   background: var(--bg);
 }
 
@@ -20,8 +16,7 @@ body.ssh-page {
   color: var(--muted);
   flex: none;
 }
-/* The one place the connection state is spelled out. Its colour is the
-   state: connected is unremarkable, anything else asks to be read. */
+/* Colour is the state: connected is unremarkable, anything else asks to be read. */
 .ssh-status {
   font-size: var(--fs-xs);
   color: var(--muted);
@@ -36,17 +31,14 @@ body.ssh-page {
 .ssh-status.is-closed { color: var(--muted); }
 .ssh-status.is-error { color: var(--fail); }
 
-/* A key is set in the monospace face at the surrounding size, not left to the
-   user agent — an unstyled <kbd> brings a third font family in at its own
-   default size, which is the same debt <code> already carries elsewhere. */
+/* An unstyled <kbd> brings a third font family in at its own default size. */
 .ssh-kbd-hint kbd {
   font: inherit;
   font-family: var(--mono);
   color: var(--text);
 }
 
-/* Published once, plainly, rather than left implicit: the terminal below is
-   the one control on this page a keyboard cannot Tab out of on its own. */
+/* The terminal below is the one control on this page a keyboard cannot Tab out of on its own. */
 .ssh-kbd-hint {
   margin: 0;
   padding: 4px 12px;
@@ -73,8 +65,7 @@ body.ssh-page {
 .ssh-notice.is-warn { color: var(--warn); }
 .ssh-notice.is-error { color: var(--fail); }
 
-/* min-height:0 or the terminal's own scrollback grows this flex item
-   instead of scrolling inside it. */
+/* min-height:0, or the terminal's own scrollback grows this flex item instead of scrolling inside it. */
 .ssh-term {
   flex: 1;
   min-height: 0;
@@ -82,11 +73,7 @@ body.ssh-page {
   background: var(--bg);
 }
 
-/* ------------------------------------------------------------- overlays
-   The scrim, the card's surface and shadow, its heading and its labels all
-   come from app.css (.modal/.ssh-overlay, .panel.float, .panel-title, the
-   eyebrow list) — this page used to restate every one of them. What is left
-   here is the card's width and the block layout of its labels. */
+/* Overlays: the scrim, surface, shadow and heading come from app.css; only the card's width and label layout stay here. */
 .ssh-panel {
   width: 460px;
   max-width: calc(100vw - 32px);

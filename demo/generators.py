@@ -1,26 +1,19 @@
 #!/usr/bin/env python3
 """Traffic generators for the SappiWhere demo: NetFlow, SNMP traps, syslog.
 
-Everything here is both an importable API and a CLI.  Each sender binds its
-socket to a *source* address (a 127.0.x.y loopback alias belonging to one
-simulated device) before sending, because all three of the app's listeners
-attribute what they receive to the packet's source IP and nothing else:
+Importable API and CLI. Each sender binds to a source address (a
+127.0.x.y loopback alias for one simulated device) before sending,
+because the app's listeners attribute traffic by source IP alone:
 
     netpath/collector.py:168   exporter = address[0]
     netpath/snmptrapd.py:195   source   = address[0]
     netpath/syslogd.py:208     source   = address[0]
 
-So the only way to make one collector see forty devices is forty source
-addresses.  On Linux the whole of 127.0.0.0/8 is local, so binding
-127.0.3.7 needs no interface configuration at all.
+so forty devices need forty source addresses (127.0.0.0/8 is all local on
+Linux, no interface config needed). Every packet is decoded and checked
+in-process by the app's own decoder before sending, so a generator never
+emits what the app would silently drop.
 
-Nothing is sent before it has been decoded in-process by the app's own
-decoder and checked field by field - a generator that emits packets the app
-silently drops is worse than no generator, because the demo then fails
-somewhere else entirely.
-
-CLI
----
     python3 demo/generators.py netflow --sources 127.0.1.1,127.0.1.2 \\
         --rate 20 --duration 30 --version mixed
     python3 demo/generators.py traps   --count 8 --rate 5 --duration 20 --mix storm
@@ -485,7 +478,7 @@ IF_ADMIN_STATUS = "1.3.6.1.2.1.2.2.1.7"
 IF_OPER_STATUS = "1.3.6.1.2.1.2.2.1.8"
 IF_ALIAS = "1.3.6.1.2.1.31.1.1.1.18"
 # BGP4-MIB bgpPeerEntry.  bgpPeerState is .2 and bgpPeerRemoteAddr is .7 in
-# the published MIB; netpath/trapoids.py:51 has .7 down as bgpPeerState, so
+# the published MIB; netpath/trapdecode.py's WELL_KNOWN had .7 down as bgpPeerState, so
 # these are sent at their real OIDs and the app's label for .7 is wrong.
 BGP_PEER_STATE = "1.3.6.1.2.1.15.3.1.2"
 BGP_PEER_REMOTE_ADDR = "1.3.6.1.2.1.15.3.1.7"

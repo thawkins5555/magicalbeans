@@ -1,19 +1,9 @@
-"""The shared SSH host-key store: what it remembers, what it refuses, and
-what ConfigRX's backup path does with both.
-
-Everything here is paramiko-on-paramiko — the stub SSH device (a real
-paramiko server) presents a real host key, and the store is exercised through
-`paramiko.SSHClient` exactly as ConfigRX and the SSH terminal drive it, rather
-than by calling the policy in isolation. The interesting cases are only
-reachable that way: paramiko checks a loaded key itself and raises its own
-BadHostKeyException, which is a different code path from the policy's.
-
-A "changed host key" is produced honestly: the stub is closed and a new one is
-started on the SAME port with a freshly generated key, which is what a rebuilt
-device (or something sitting in the middle) looks like from here. The stub
-picks a free port itself, so the pinning shim below is how it is asked to come
-back on the port it had — the stub file itself stays what workstream A ships.
-"""
+"""The shared SSH host-key store: what it remembers, what it refuses, and what
+ConfigRX's backup path does with both. Everything is paramiko-on-paramiko: the
+stub SSH device presents a real host key and the store is exercised through
+`paramiko.SSHClient` as ConfigRX and the SSH terminal drive it, since paramiko
+raises its own BadHostKeyException on a loaded key. A "changed host key" is a
+new stub started on the SAME port with a fresh key, via the pinning shim below."""
 import base64
 import hashlib
 import http.client

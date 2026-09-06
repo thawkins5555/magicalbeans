@@ -1,22 +1,9 @@
-"""ConfigRX on the industrial vendors added for the 2,000-device plant
-estate survey: Moxa EDS/IKS/ICS-series switches, Siemens SCALANCE X/S
-switches, and Rockwell/Allen-Bradley Stratix switches (Cisco IOS-based,
-reusing the "cisco" command set under the "rockwellautomation" vendor
-key SNMP auto-detection resolves to).
-
-Drives the real `_pull_config` -> `_clean_output` -> `_capture_problem`
-chain (nothing here reimplements ConfigRX's capture logic) against each
-persona in demo/fake_ssh.py's PERSONAS, shared verbatim with
-`stubs.stub_ssh_device.StubDevice(persona=...)`, the same pattern
-test_configrx_cisco_platforms.py uses for the existing Cisco platforms.
-
-Unlike that file's Cisco personas, none of these three vendor entries are
-hardware-verified — see the "Documentation-sourced only" block in
-netpath/configrx_vendors.py for what each is actually sourced from. This
-file proves the command set that documentation describes round-trips
-through ConfigRX's real capture chain against a scripted double of that
-CLI; it cannot and does not claim to prove a real Moxa/SCALANCE/Stratix
-device would answer the same way.
+"""ConfigRX on the industrial vendors: Moxa EDS/IKS/ICS, Siemens SCALANCE X/S
+and Rockwell Stratix (Cisco IOS-based, "cisco" commands under the
+"rockwellautomation" vendor key). Drives the real _pull_config -> _clean_output
+-> _capture_problem chain against each persona in demo/fake_ssh.py's PERSONAS,
+as test_configrx_cisco_platforms.py does. None of the three is hardware-verified
+(see "Documentation-sourced only" in netpath/configrx.py's VENDORS table).
 """
 import os
 import sys
@@ -30,7 +17,7 @@ except ImportError:                       # run_all.py reports this as SKIP
     raise SystemExit(77)
 
 from demo import fake_ssh  # noqa: E402
-from netpath import configrx, configrx_vendors  # noqa: E402
+from netpath import configrx  # noqa: E402
 from stubs import stub_ssh_device  # noqa: E402
 
 FAILS = []
@@ -75,7 +62,7 @@ check("this suite's persona list matches demo.fake_ssh.PERSONAS (nothing renamed
 
 for name, (vendor_key, marker, expected_sent) in INDUSTRIAL_PERSONAS.items():
     persona = fake_ssh.PERSONAS[name]
-    vendor = configrx_vendors.resolve(vendor_key)
+    vendor = configrx.resolve(vendor_key)
     check(f"{name}: vendor '{vendor_key}' is registered", vendor is not None)
     if vendor is None:
         continue
@@ -95,7 +82,7 @@ for name, (vendor_key, marker, expected_sent) in INDUSTRIAL_PERSONAS.items():
 
     # A fresh device for the safety-boundary check: proves nothing beyond
     # this vendor's own pager_off + show_config ever crossed the wire, the
-    # same guarantee configrx_vendors.py's module docstring makes for every
+    # same guarantee the VENDORS table's own comment makes for every
     # entry in VENDORS.
     device = stub_ssh_device.StubDevice(persona=persona)
     try:
@@ -115,7 +102,7 @@ for name, (vendor_key, marker, expected_sent) in INDUSTRIAL_PERSONAS.items():
 # would if resolve() ever stopped lowercasing its argument.
 print("rockwellautomation: resolve() finds the lowercase key from the mixed-case canonical form")
 check("resolve() is case-insensitive on the canonical vendor key",
-      configrx_vendors.resolve("rockwellAutomation") is configrx_vendors.resolve("rockwellautomation"))
+      configrx.resolve("rockwellAutomation") is configrx.resolve("rockwellautomation"))
 
 
 print()

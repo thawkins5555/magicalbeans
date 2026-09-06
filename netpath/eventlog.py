@@ -1,13 +1,8 @@
-"""A bounded in-memory event log -- bounded in both of its collections.
-
-Every background worker writes here: the trace scheduler, the traceroute
-subprocess wrapper, the reverse-DNS resolver and the flow collector. The debug
-page reads it. Nothing is written to disk — this is for watching what the app
-is doing right now, not for retention.
-
-Writers are worker threads and the reader is the Qt main thread, so the deque
-is guarded by a lock and readers pull by sequence number rather than holding a
-reference to the buffer.
+"""A bounded in-memory event log, written by every background worker (trace
+scheduler, traceroute wrapper, reverse-DNS resolver, flow collector) and
+read by the debug page — for watching what the app is doing now, never
+written to disk. Guarded by a lock; readers pull by sequence number rather
+than holding a reference to the buffer.
 """
 
 from __future__ import annotations
@@ -15,7 +10,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import OrderedDict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 # Categories are fixed so the debug page can offer them as filters without
 # discovering them at runtime.

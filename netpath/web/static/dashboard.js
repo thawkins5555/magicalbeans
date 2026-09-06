@@ -157,8 +157,8 @@
         ${notes ? `<span class="dash-row-note">${notes}</span>` : ''}
       </a>`;
     }).join('');
-    return tile('Workers', rows || '<p class="hint">No worker is readable '
-                + 'with your access.</p>', { wide: true });
+    return tile('Workers', rows || App.emptyState('No worker is readable '
+                + 'with your access.'), { wide: true });
   }
 
   function storageTile(stores) {
@@ -216,7 +216,7 @@
     }
     const d = view.dashboard;
     if (!d) {
-      root.innerHTML = '<p class="hint">Loading…</p>';
+      root.innerHTML = App.loading();
       return;
     }
     const parts = [];

@@ -1,31 +1,19 @@
-"""Storage for the Alerts module: rule definitions, open/acknowledged/
-resolved alerts, email templates, notification history, SMTP settings and
-credential, and per-source evaluation cursors.
-
-Alert volume is orders of magnitude lower than trap or syslog volume, so
-unlike `syslogdb.py`/`snmptrapdb.py` there is no hourly rollup table for the
-histogram — a live `GROUP BY` over `alerts` is always cheap enough, the same
-reasoning `snmptrapdb.py` already used to justify skipping FTS5 search.
-
-Exactly one OPEN or ACKED alert may exist per `dedup_key` at a time (a
-partial unique index, not a full UNIQUE constraint, because the same
-dedup_key legitimately recurs after a prior alert resolves) — a repeated
-occurrence increments that alert's `count` rather than opening a duplicate.
+"""Storage for the Alerts module: rules, open/acknowledged/resolved alerts,
+email templates, notification history, SMTP settings and credential, and
+per-source evaluation cursors. At most one OPEN or ACKED alert exists per
+`dedup_key` (a partial unique index, since the key recurs after a resolve);
+a repeat increments that alert's `count` rather than opening a duplicate.
 """
 
 from __future__ import annotations
 
 import ipaddress
 import json
-import os
 import sqlite3
-import threading
 import time
 from urllib.parse import urlparse
 
-from . import dbmaint
-from . import dbopen
-from . import settingsutil
+from .sqlitebase import SqliteStore, reclaim
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rules (
@@ -295,9 +283,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_mute_entity
 -- recurrence is NULL (a one-off window, exactly [start_ts, end_ts)) or
 -- 'weekly' (the same clock-time span recurs every 7 days from start_ts,
 -- forever, until the window is deleted or edited) — see is_window_active.
--- Deliberately the only two shapes: a monthly maintenance calendar is a
--- feature in its own right, and "none or weekly" already covers the case
--- the review asked for, a recurring weekend cutover.
+-- Deliberately the only two shapes: "none or weekly" covers the recurring
+-- weekend cutover, and a monthly calendar is a feature in its own right.
 CREATE TABLE IF NOT EXISTS maintenance_windows (
     id                INTEGER PRIMARY KEY,
     name              TEXT NOT NULL,
@@ -695,37 +682,13 @@ _EVENT_NOTICE_REBIND = {
 # MIB uploads — and mailing them is not.
 _BUILTIN_NOTIFY_OFF = ("mib_missing",)
 
-# Template text as shipped by the PREVIOUS release, verbatim, for every
-# built-in whose wording has since changed.
-#
-# _seed_templates inserts OR IGNORE, so an install that already has an
-# alerts.db keeps its templates forever — which is right for one an operator
-# edited and wrong for one nobody has touched, since that one is simply the
-# old shipped text sitting where the new shipped text belongs. _migrate uses
-# this to tell those two apart: a body that still matches exactly what the
-# last release shipped is one nobody has edited.
-#
-# 4.32.0: the recovery template said "is responding again as of {{last_time}}",
-# and last_time on a resolution notification is when the OUTAGE last recurred —
-# a moment before the recovery, not the recovery. It now names the recovery
-# time and how long the outage lasted.
-#
-# O-60 (this release): severity moved from the sign-off into the subject —
-# every subject now leads with {{severity_tag}}, and the sign-off drops the
-# now-redundant {{severity_name}} down to a bare "-- SappiWhere". All six
-# built-ins changed, not just device_up, which is why this list grew from one
-# entry to six.
-#
-# Each key's value is a LIST of every wording a previous release shipped,
-# tried in the order given — not just the one immediately before this
-# release. device_up alone has carried two: the original text, and the
-# 4.32.0 rewording above. An install that skipped several releases (or
-# whose upgrade path missed a migration for some other reason) may still be
-# sitting on either one, and a single-entry dict here would only ever catch
-# whichever version happened to be most recent, silently stranding anyone
-# further back. Each entry is tried independently against the live
-# subject/body; at most one can ever match, since a template can only hold
-# one piece of text at a time.
+# Template text as shipped by previous releases, verbatim, for every built-in
+# whose wording has since changed. _seed_templates inserts OR IGNORE, so an
+# existing install keeps its templates for ever — right for one an operator
+# edited, wrong for one nobody touched. A body that still matches a shipped
+# wording exactly is one nobody edited, and _migrate_templates rewrites it.
+# Each key holds every past wording, tried in order, so an install that
+# skipped releases is still recognised.
 _PREVIOUS_BUILTIN_TEMPLATES = {
     "device_down": [
         {   # as shipped through 4.48.0, before severity moved into the subject
@@ -794,141 +757,61 @@ _PREVIOUS_BUILTIN_TEMPLATES = {
 }
 
 
-class AlertsDatabase:
-    def __init__(self, path: str):
-        self.path = path
-        self._lock = threading.RLock()
-        # dbopen.connect narrows the file (and its -wal/-shm companions) to
-        # the owner: this database holds the SMTP credential blob and every
-        # recipient address, and the process umask was leaving it 0644.
-        self._conn = dbopen.connect(path)
-        self._conn.row_factory = sqlite3.Row
-        with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            self._enable_incremental_vacuum()
-            self._conn.executescript(SCHEMA)
-            self._conn.executescript(PENDING_SCHEMA)
-            self._migrate()
-            self._conn.commit()
+class AlertsDatabase(SqliteStore):
+    SCHEMA = SCHEMA + PENDING_SCHEMA
+    DEFAULTS = DEFAULTS
+    LABEL = "alerts"
+
+    def _after_open(self) -> None:
         self._seed_templates()
         self._seed_rules()
         self._run_named_migrations()
 
-    def _enable_incremental_vacuum(self) -> None:
-        """dbmaint.enable_incremental_vacuum, with the empty-file case covered.
-
-        auto_vacuum can only be changed on a database that has no tables yet,
-        or by a VACUUM that rewrites the file — and in WAL mode the pragma
-        alone does not take even on an empty file. dbopen.connect switches to
-        WAL as it opens, so it can tighten the -wal/-shm modes immediately,
-        which means by the time this runs a brand-new alerts.db is already in
-        WAL. The helper's own VACUUM fallback is guarded on page_count > 1
-        and therefore does not fire for a file that has only its header page,
-        so without this a fresh install would stay on auto_vacuum=NONE and
-        trim_to_size would reclaim nothing. One VACUUM of an empty file costs
-        nothing; on an existing database the helper has already handled it.
-        """
-        if dbmaint.enable_incremental_vacuum(self._conn, "alerts"):
-            return
-        try:
-            if self._conn.execute("PRAGMA page_count").fetchone()[0] <= 1:
-                self._conn.execute("VACUUM")
-                dbmaint.enable_incremental_vacuum(self._conn, "alerts")
-        except sqlite3.DatabaseError:
-            pass
-
     def _migrate(self) -> None:
-        """Add columns introduced after a database was first created.
-
-        CREATE TABLE IF NOT EXISTS leaves an existing table alone, so a column
-        added to `rules` after some installs already have an alerts.db has to
-        be added explicitly — the same convention nodesdb.py, wirelessdb.py
-        and db.py already use for their own post-release columns.
-        """
-        rules = {row["name"] for row in
-                 self._conn.execute("PRAGMA table_info(rules)").fetchall()}
-        for column in ("flap_window_s", "flap_min_transitions", "for_seconds",
-                       "auto_resolve_after_s"):
-            if column not in rules:
-                self._conn.execute(
-                    f"ALTER TABLE rules ADD COLUMN {column} INTEGER")
-        if "notify" not in rules:
-            self._conn.execute(
-                "ALTER TABLE rules ADD COLUMN notify INTEGER NOT NULL DEFAULT 1")
+        added = self.ensure_columns("rules", {
+            "flap_window_s": "INTEGER",
+            "flap_min_transitions": "INTEGER",
+            "for_seconds": "INTEGER",
+            "auto_resolve_after_s": "INTEGER",
+            "notify": "INTEGER NOT NULL DEFAULT 1",
+        })
+        if "notify" in added:
             self._conn.execute(
                 "UPDATE rules SET notify = 0 WHERE key = 'mib_missing'")
-        if "for_seconds" not in rules:
-            # Seed the shipped default onto an existing database, so an
-            # install that already has alerts.db gets sustained packet loss
-            # rather than the pre-4.31 single-sample behaviour. Only this
-            # one rule: every other threshold keeps counting polls.
+        if "for_seconds" in added:
+            # Seed the shipped default onto an existing database so it gets
+            # sustained packet loss rather than single-sample behaviour. Only
+            # this rule: every other threshold keeps counting polls.
             self._conn.execute(
                 "UPDATE rules SET for_seconds = 60 WHERE key = 'packet_loss_high'")
         self._migrate_templates()
-        alerts = {row["name"] for row in
-                  self._conn.execute("PRAGMA table_info(alerts)").fetchall()}
-        for column, kind, default in (("last_notified_ts", "REAL", None),
-                                      ("extra_json", "TEXT", "'{}'")):
-            if column not in alerts:
-                self._conn.execute(
-                    f"ALTER TABLE alerts ADD COLUMN {column} {kind}"
-                    + (f" NOT NULL DEFAULT {default}" if default else ""))
-        if "rollup_note" not in alerts:
+        self.ensure_columns("alerts", {
+            "last_notified_ts": "REAL",
+            "extra_json": "TEXT NOT NULL DEFAULT '{}'",
             # What this alert absorbed, one line per rolled-up alert. Its own
-            # column rather than appended to `detail`, which open_or_increment
-            # overwrites every time the same alert recurs.
-            self._conn.execute(
-                "ALTER TABLE alerts ADD COLUMN rollup_note TEXT NOT NULL DEFAULT ''")
-        if "rolled_up_into" not in alerts:
+            # column rather than appended to `detail`, which
+            # open_or_increment overwrites every time the alert recurs.
+            "rollup_note": "TEXT NOT NULL DEFAULT ''",
             # The id of the alert THIS one was absorbed into, or NULL. A
-            # child a rollup resolves (alertengine._absorb_subordinates/
-            # _absorb_downstream) writes resolved_by='' — deliberately the
-            # same value a genuine auto-clear writes, since a non-empty
-            # resolved_by means "an operator resolved this" to
-            # operator_resolved_since, and a rollup absorption must not
-            # block the child from reopening once it is still breaching
-            # after the outage that swallowed it ends. That leaves nothing
-            # on the CHILD's own row saying why it cleared — only a
-            # freeform note on the PARENT's rollup_note said so, unreadable
-            # from the child's side. A foreign key rather than a boolean:
-            # it does everything IS NOT NULL already would, plus lets a
-            # screen fold the child under its actual parent by id, and
-            # survives the parent itself later being resolved (alerts are
-            # never deleted, only resolved, so the id stays valid).
-            # ON DELETE SET NULL rather than CASCADE: a parent row being
-            # deleted (should that ever happen by some future path) must
-            # not take every alert it once absorbed down with it.
-            self._conn.execute(
-                "ALTER TABLE alerts ADD COLUMN rolled_up_into INTEGER"
-                " REFERENCES alerts(id) ON DELETE SET NULL")
-        # ix_alerts_rolled_up_into backs alerts_rolled_up_into(parent_id), a
-        # parent's own detail view asking "what did I absorb" as a real
-        # query instead of parsing rollup_note's freeform text. In _migrate
-        # rather than SCHEMA for the same reason ix_alerts_state_resolved
-        # is, just below — see that index's own comment.
+            # child a rollup resolves writes resolved_by='' — the same value
+            # an auto-clear writes, so it can reopen — which leaves nothing
+            # on the child's own row saying why it cleared. ON DELETE SET
+            # NULL, not CASCADE: deleting a parent must not take the alerts
+            # it absorbed with it.
+            "rolled_up_into":
+                "INTEGER REFERENCES alerts(id) ON DELETE SET NULL",
+        })
+        # Both indexes here rather than in SCHEMA: that script runs before
+        # this method, so an index over a column added just above would fail
+        # on an upgraded install.
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_alerts_rolled_up_into"
             " ON alerts(rolled_up_into)")
-        # Backs operator_resolved_since, which the engine runs once per tick:
-        # state = 'resolved' AND resolved_ts >= ?, grouped by dedup_key. That
-        # is a range scan, and a range scan needs the equality column first
-        # and the ranged one second — ix_alerts_dedup_state led with
-        # dedup_key, the column this query does not constrain at all, so
-        # SQLite had to walk every resolved alert ever recorded and test each
-        # one. Leading with (state, resolved_ts) seeks straight to the recent
-        # hand resolves, and carrying dedup_key as the third column keeps the
-        # whole query inside the index. ix_alerts_dedup_state is dropped
-        # rather than kept alongside: operator_resolved_since is the only
-        # caller that asks about resolved rows at all, ux_alerts_active_dedup
-        # is a PARTIAL index over open/acked and so can never serve them, and
-        # a second index leading with dedup_key would be write cost for a
-        # query nothing makes.
-        #
-        # In _migrate rather than SCHEMA on purpose — see INTERNALS' rule
-        # about indexes and migrated columns, and the 4.34.0 start-up failure
-        # that produced it.
+        # Backs operator_resolved_since (state = 'resolved' AND resolved_ts
+        # >= ?, grouped by dedup_key): a range scan needs the equality column
+        # first. ix_alerts_dedup_state led with dedup_key, which that query
+        # does not constrain, and is dropped rather than kept — nothing else
+        # asks about resolved rows.
         self._conn.execute("DROP INDEX IF EXISTS ix_alerts_dedup_state")
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_alerts_state_resolved"
@@ -1168,10 +1051,6 @@ class AlertsDatabase:
                     (current["subject"], current["body"], now, key,
                      previous["subject"], previous["body"]))
 
-    def close(self) -> None:
-        with self._lock:
-            self._conn.close()
-
     def _seed_templates(self) -> None:
         from . import alertmail
         now = time.time()
@@ -1209,18 +1088,10 @@ class AlertsDatabase:
     # --------------------------------------------------------------- settings
 
     def settings(self) -> dict:
-        values = dict(DEFAULTS)
+        values = super().settings()
         with self._lock:
-            rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
             cred = self._conn.execute(
                 "SELECT password_enc FROM smtp_credential WHERE id = 1").fetchone()
-        for row in rows:
-            if row["key"] in values:
-                try:
-                    values[row["key"]] = json.loads(row["value"])
-                except (ValueError, TypeError):
-                    pass
-        values = settingsutil.coerce_settings(DEFAULTS, values, strict=False)
         values["notify_rollup_delay_s"] = max(0, min(
             int(values.get("notify_rollup_delay_s", 0) or 0),
             NOTIFY_ROLLUP_DELAY_MAX_S))
@@ -1230,15 +1101,7 @@ class AlertsDatabase:
     def save_settings(self, values: dict) -> None:
         if "webhook_url" in values:
             validate_webhook_url(values["webhook_url"])
-        with self._lock:
-            for key, value in values.items():
-                if key not in DEFAULTS:
-                    continue
-                self._conn.execute(
-                    "INSERT INTO settings(key, value) VALUES (?,?)"
-                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (key, json.dumps(value)))
-            self._conn.commit()
+        super().save_settings(values)
 
     def set_smtp_credential(self, password_enc: bytes) -> None:
         with self._lock:
@@ -1447,13 +1310,8 @@ class AlertsDatabase:
               text: str | None = None, t0: float | None = None,
               t1: float | None = None, limit: int = 300,
               offset: int = 0) -> list[sqlite3.Row]:
-        # `offset` (4.47.0): additive, defaults to 0, so every existing
-        # caller that never knew paging existed still gets the first
-        # `limit` rows exactly as before. It is what lets an operator who
-        # has already looked at the newest 2,000 alerts ask for the next
-        # 2,000 rather than being stuck re-reading the same page — the
-        # /api/alerts route above pairs this with count_alerts() for the
-        # total the browser needs to know there is a next page at all.
+        # `offset` defaults to 0, so an unpaged caller gets the first
+        # `limit` rows as before; the route pairs it with count_alerts().
         where, params = self._alert_filter(state, severity, rule_id,
                                            device_text, text, t0, t1)
         with self._lock:
@@ -1672,12 +1530,6 @@ class AlertsDatabase:
                                (pending_id,))
             self._conn.commit()
 
-    def pending_count(self) -> int:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM pending_alerts").fetchone()
-        return row["n"] if row else 0
-
     # -------------------------------------------------------------- mutes
 
     def mute(self, entity_kind: str, entity_id: str, hours: float,
@@ -1704,11 +1556,8 @@ class AlertsDatabase:
     def mute_many(self, entity_kind: str, entity_ids: list[str], hours: float,
                   by: str = "", reason: str = "") -> list[sqlite3.Row]:
         """Bulk mute: one call, one hour figure, one reason, applied to every
-        id in `entity_ids` — the "hundreds of API calls" the review's planned
-        cutover reduces to one. Same ad-hoc cap as a single mute() and the
-        same replace-on-remute behaviour, just looped: a maintenance WINDOW
-        (below) is the mechanism for something longer than MAX_MUTE_HOURS,
-        this is still the ad-hoc one."""
+        id in `entity_ids`. Same cap and replace-on-remute as mute(); a
+        maintenance window is the mechanism for longer than MAX_MUTE_HOURS."""
         hours = max(0.0, min(float(hours), MAX_MUTE_HOURS))
         if hours <= 0 or not entity_ids:
             return []
@@ -2270,15 +2119,6 @@ class AlertsDatabase:
 
     # ------------------------------------------------------------------ storage
 
-    def size_bytes(self) -> int:
-        total = 0
-        for suffix in ("", "-wal", "-shm"):
-            try:
-                total += os.path.getsize(self.path + suffix)
-            except OSError:
-                pass
-        return total
-
     def prune(self, retention_days: float, max_rows: int = 0) -> int:
         """Deletes resolved alerts (and, via the FK, their notifications)
         older than the cutoff. Open/acknowledged alerts are never pruned
@@ -2312,13 +2152,9 @@ class AlertsDatabase:
         """Delete the oldest resolved alerts until the file fits, reclaiming
         the freed pages between passes.
 
-        The reclaim runs OUTSIDE the delete's lock block, not inside it.
-        VACUUM rewrites the whole file under an exclusive lock, and on a
-        connection shared with the engine's tick thread it cannot be issued
-        outside the module lock without interleaving with other statements —
-        which is why it used to sit inside. Incremental vacuum frees pages in
-        short steps that each take and release the lock, so a trim never
-        blocks a write for longer than one step.
+        The reclaim runs outside the delete's lock block: incremental vacuum
+        frees pages in short steps that each take and release the lock, so a
+        trim never blocks a write for longer than one step.
         """
         if max_bytes <= 0:
             return 0
@@ -2343,5 +2179,5 @@ class AlertsDatabase:
                     self._conn.commit()
             if exhausted:
                 break
-            dbmaint.reclaim(self._conn, self._lock, label="alerts")
+            reclaim(self._conn, self._lock, label="alerts")
         return removed

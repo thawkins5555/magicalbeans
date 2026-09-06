@@ -61,12 +61,14 @@ for fn in ("function ago(", "function when(", "function timeCell(", "function ag
     check(fn in APP, f"app.js defines {fn.split()[1]}")
 
 # --------------------------------------------------------------------------
-# 2. Honest counts.
-for name, unit in (("syslog.js", "messages"), ("snmp.js", "traps")):
-    body = read(name)
-    check(f"App.countLabel(search.{unit}.length, total)" in body,
-          f"{name}: the count says what it is out of")
-    check("} shown`" not in body, f"{name}: no bare 'N shown'")
+# 2. Honest counts. The two search pages are one module (events.js), so the
+# count is written once — off the rows the search returned and the total the
+# histogram summed over the same window and filters. "N of M shown", never a
+# bare "N shown", which said nothing about what was left out.
+EVENTS = read("events.js")
+check(bool(re.search(r"App\.countLabel\(\s*[\w.]+\.length,\s*total\s*\)", EVENTS)),
+      "events.js: the count says what it is out of")
+check("} shown`" not in EVENTS, "events.js: no bare 'N shown'")
 
 # --------------------------------------------------------------------------
 # 3. Every refresh rate the loop reads has a control.
@@ -82,24 +84,27 @@ check('id="set-refresh-debug" min="1"' in INDEX, "the Debug rate input cannot as
 
 # --------------------------------------------------------------------------
 # 4. One noun per module: status fallback, toggle pair, and the Dashboard.
+# Keyed by module (the tab), not by file: Syslog and SNMP Trap are two pages
+# of one file, and each still has to carry its own noun in full.
 NOUNS = {
-    "nodes.js": ("Poller stopped", "Stop poller", "Start poller"),
-    "alerts.js": ("Alert engine stopped", "Stop alert engine", "Start alert engine"),
-    "netflow.js": ("Collector stopped", "Stop collector", "Start collector"),
-    "snmp.js": ("Receiver stopped", "Stop receiver", "Start receiver"),
-    "syslog.js": ("Collector stopped", "Stop collector", "Start collector"),
-    "wireless.js": ("Poller stopped", "Stop poller", "Start poller"),
-    "configrx.js": ("Worker stopped", "Stop worker", "Start worker"),
-    "ipam.js": ("Worker stopped", "Stop worker", "Start worker"),
+    "nodes": ("nodes.js", "Poller stopped", "Stop poller", "Start poller"),
+    "alerts": ("alerts.js", "Alert engine stopped", "Stop alert engine", "Start alert engine"),
+    "netflow": ("netflow.js", "Collector stopped", "Stop collector", "Start collector"),
+    "snmp": ("events.js", "Receiver stopped", "Stop receiver", "Start receiver"),
+    "syslog": ("events.js", "Collector stopped", "Stop collector", "Start collector"),
+    "wireless": ("wireless.js", "Poller stopped", "Stop poller", "Start poller"),
+    "configrx": ("configrx.js", "Worker stopped", "Stop worker", "Start worker"),
+    "ipam": ("ipam.js", "Worker stopped", "Stop worker", "Start worker"),
 }
-for name, (stopped, stop, start) in NOUNS.items():
+for module, (name, stopped, stop, start) in NOUNS.items():
     body = read(name)
     check(stopped in body and stop in body and start in body,
-          f"{name}: strip and toggle agree on the noun ({stopped!r})")
+          f"{module} ({name}): strip and toggle agree on the noun ({stopped!r})")
 check('id="ipam-toggle"' in INDEX and "/api/ipam/worker" in read("ipam.js"), "IPAM has a start/stop toggle")
-check("<legend>LISTENER</legend>" not in read("snmp.js") and "<legend>RECEIVER</legend>" in read("snmp.js"),
+check("<legend>LISTENER</legend>" not in EVENTS and "<legend>RECEIVER</legend>" in EVENTS,
       "SNMP settings call it a receiver, like its strip")
-check("<legend>LISTENER</legend>" not in read("syslog.js"), "Syslog settings call it a collector, like its strip")
+check("<legend>COLLECTOR</legend>" in EVENTS,
+      "Syslog settings call it a collector, like its strip")
 check("tile('Workers'" in read("dashboard.js"), "the Dashboard tile is 'Workers'")
 check("App.tile" in read("dashboard.js") and "function tile(" not in read("dashboard.js"),
       "the Dashboard draws its tiles with the shared App.tile")
@@ -113,7 +118,8 @@ check("btn.textContent = 'Poll now'" in read("wireless.js"), "the wireless Poll 
 # --------------------------------------------------------------------------
 # 6. The zone is stated.
 check('id="set-timezone"' in INDEX and "timeZoneLabel" in read("settings.js"), "Settings names the time zone")
-check(read("syslog.js").count("title: App.timeZoneTitle()") == 1, "the Syslog Time column carries the zone")
+check(EVENTS.count("title: App.timeZoneTitle()") == 1,
+      "the Syslog and SNMP Time column — one shared definition — carries the zone")
 
 print()
 if failures:

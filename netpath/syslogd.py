@@ -16,105 +16,60 @@ import time
 import traceback
 
 from . import udpsock
-from .eventlog import ERROR, NullLog, SYSTEM
+from .eventlog import ERROR, SYSTEM
 from .syslogdb import SyslogDatabase
 from .syslogparse import parse
+from .worker import ago
 
 BATCH = 500
 FLUSH_S = 1.0
-# Cap on the "first message from ..." memory and on the per-source rate
-# buckets: both are keyed on a spoofable source address, so both are LRUs
-# rather than unbounded dicts.
-MAX_SEEN_SOURCES = 4096
+# The per-source rate buckets are keyed on a spoofable source address, so the
+# dict is an LRU rather than an unbounded one.
 MAX_RATE_SOURCES = 4096
 
 # The most one TCP-framed message may be, either framing. RFC 6587 octet
-# counting reads a length prefix of up to ten digits -- up to 9,999,999,999 --
-# and the newline framing below it has no length prefix at all, so nothing
-# ahead of this constant bounds how large a single message can grow to before
-# it is even looked at. Measured directly, before this existed: a connection
-# declaring a 2 GB octet count and trickling 1 MB/s toward it held the
-# collector's own traced memory at 42 MB after 50 MB sent (peak 82.5 MB --
-# `buffer += chunk` briefly holds both the old and new buffer at once) with
-# every counter -- messages, errors, rejected, dropped -- still at zero: the
-# connection just sits there, unauthenticated, on 514/tcp, accumulating.
-# `_max_tcp_clients` (default 64) bounds how many connections can each be
-# doing this at once, but nothing bounded any one of them on its own.
-#
-# 1 MB is already the ceiling the newline-framing path used for its own
-# "no newline yet, and this has gone on too long" cutoff before this fix
-# unified the two; no real syslog message -- even one carrying a sizeable
-# RFC 5424 structured-data block -- comes close to it.
+# counting reads a length prefix of up to ten digits and the newline framing
+# has no length prefix at all, so without this nothing bounds how large a
+# single message can grow before it is even looked at: a connection declaring
+# a 2 GB octet count and trickling bytes toward it grows the buffer without
+# limit while every counter stays at zero. No real syslog message — even one
+# carrying a sizeable RFC 5424 structured-data block — comes close to 1 MB.
 MAX_TCP_MESSAGE_BYTES = 1_000_000
 
 
-def _ago(ts: float) -> str:
-    if not ts:
-        return "never"
-    age = time.time() - ts
-    if age < 5:
-        return "just now"
-    if age < 90:
-        return f"{age:.0f}s ago"
-    if age < 5400:
-        return f"{age / 60:.0f}m ago"
-    return f"{age / 3600:.1f}h ago"
+class SyslogCollector(udpsock.UdpReceiver):
+    NOUN = "Collector"
+    DROPS_PORT_NOUN = "syslog"
+    LOG_CATEGORY = SYSTEM
+    QUEUE_SIZE = 100_000
+    COUNTERS = {"messages": 0, "stored": 0, "collapsed": 0,
+                "dropped": 0, "rejected": 0, "filtered": 0,
+                "errors": 0, "throttled": 0, "tcp_refused": 0,
+                "tcp_oversized": 0, "tcp_clients": 0,
+                "last_message": 0.0}
 
-
-class SyslogCollector:
     def __init__(self, db: SyslogDatabase, log=None, on_batch=None):
+        super().__init__(log)
         self.db = db
-        self.log = log or NullLog()
         self.on_batch = on_batch
-        self._stop = threading.Event()
-        self._threads: list[threading.Thread] = []
-        self._udp: socket.socket | None = None
-        self._tcp: socket.socket | None = None
-        self._queue: queue.Queue = queue.Queue(maxsize=100_000)
-        self.error: str | None = None
-        self.bound: tuple[str, int] | None = None
-        self.family = socket.AF_INET
-        self.counters = {"messages": 0, "stored": 0, "collapsed": 0,
-                         "dropped": 0, "rejected": 0, "filtered": 0,
-                         "errors": 0, "throttled": 0, "tcp_refused": 0,
-                         "tcp_oversized": 0, "tcp_clients": 0,
-                         "last_message": 0.0}
-        # A receive thread must never die on message content; failures are
-        # counted here and _crash records a thread that ended anyway so the
-        # status strip does not read like a deliberate stop.
-        self._last_error_log = 0.0
-        self._crash: str | None = None
-        self._drops: udpsock.KernelDrops | None = None
-        self._drops_logged = False
-        self.ports: dict[str, int] = {}
         self._allowed: set[str] = set()
         self._auto_accept = True
         self._use_receive_time = False
         self._min_severity = 7
         self._max_chars = 2048
-        self._seen: collections.OrderedDict = collections.OrderedDict()
         # source -> [tokens, last refill]. One float pair per source, refilled
         # lazily on arrival, so throttling costs O(1) per message and cannot
         # grow past MAX_RATE_SOURCES entries however many addresses appear.
         self._buckets: collections.OrderedDict = collections.OrderedDict()
         self._rate = 0.0
-        self._last_throttle_log = 0.0
-        self._last_oversized_log = 0.0
         self._max_tcp_clients = 64
         self._clients: list[threading.Thread] = []
-
-    @property
-    def running(self) -> bool:
-        return any(thread.is_alive() for thread in self._threads)
 
     # --------------------------------------------------------------- lifecycle
 
     def start(self, settings: dict) -> bool:
         self.stop()
-        self.error = None
-        self._crash = None
-        self._stop.clear()
-        self._seen.clear()
+        self._reset_for_start()
 
         allow = str(settings.get("allowed_sources", "") or "")
         self._allowed = {item.strip() for item in allow.replace(",", "\n").split("\n")
@@ -133,7 +88,7 @@ class SyslogCollector:
         port = int(settings.get("port", 514))
         tcp_port = int(settings.get("tcp_port", 0)) or port
         buffer_bytes = int(settings.get("socket_buffer_kb", 4096)) * 1024
-        self.ports: dict[str, int] = {}
+        self.ports = {}
 
         try:
             if settings.get("accept_udp", True):
@@ -151,10 +106,10 @@ class SyslogCollector:
             hint = ""
             code = getattr(exc, "errno", None)
             if code in (13, 1):
-                hint = (" \u2014 ports below 1024 need administrator or root "
+                hint = (" — ports below 1024 need administrator or root "
                         "rights. Use 5140 and point devices at it instead.")
             elif code in (48, 98, 10048):
-                hint = (" \u2014 another process already holds it. On Windows: "
+                hint = (" — another process already holds it. On Windows: "
                         "Get-NetUDPEndpoint -LocalPort " + str(port) +
                         " | Select OwningProcess. Another syslog daemon is the "
                         "usual answer; change the port in Settings if so.")
@@ -167,12 +122,11 @@ class SyslogCollector:
             self.error = "Neither UDP nor TCP is enabled"
             return False
 
-        self._drops = (udpsock.KernelDrops(port)
-                       if self._udp is not None and udpsock.supported() else None)
-        self._drops_logged = False
-        if self._drops is not None:
-            self.counters["kernel_dropped"] = 0
+        if self._udp is not None:
+            self._arm_kernel_drops(port)
         else:
+            self._drops = None
+            self._drops_logged = False
             self.counters.pop("kernel_dropped", None)
 
         self.bound = (address, port)
@@ -186,115 +140,24 @@ class SyslogCollector:
         self.log.add(SYSTEM, f"Syslog listening on {address} ({where})")
         return True
 
-    def _bind(self, kind, address: str, port: int, buffer_bytes: int):
-        sock, self.family = udpsock.bind(kind, address, port, buffer_bytes)
-        try:
-            granted = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
-            if kind == socket.SOCK_DGRAM and granted < buffer_bytes:
-                # Linux reports back twice what it granted, so a readback
-                # below the request means net.core.rmem_max clamped it — the
-                # commonest reason for kernel drops under load.
-                self.log.add(ERROR,
-                             f"The receive buffer was clamped to {granted} bytes "
-                             f"(asked for {buffer_bytes})",
-                             detail="Raise net.core.rmem_max on this host, or "
-                                    "lower the buffer size in Settings so the "
-                                    "two agree.")
-        except OSError:
-            pass
-        return sock
-
-    def _spawn(self, target, name: str) -> None:
-        thread = threading.Thread(target=lambda: self._guard(target, name),
-                                  name=name, daemon=True)
-        thread.start()
-        self._threads.append(thread)
-
-    def _guard(self, target, name: str) -> None:
-        """Run a collector thread and remember how it ended, so a crash reads
-        as "stopped unexpectedly" rather than as an operator stop."""
-        try:
-            target()
-        except Exception as exc:
-            self._crash = f"{name}: {exc}"
-            self.log.add(ERROR, f"The {name} thread stopped unexpectedly: {exc}",
-                         detail=traceback.format_exc())
-        else:
-            if not self._stop.is_set() and name != "syslog-tcp-client":
-                self._crash = f"{name} ended unexpectedly"
-
-
-    def _poll_kernel_drops(self) -> None:
-        """Read back the kernel's own loss counter for the bound port.
-
-        counters["dropped"] only counts a message the writer queue could not
-        take, which is loss the application caused; datagrams the socket
-        buffer discarded before anyone read them were invisible. The key is
-        absent on platforms that do not publish the figure.
-        """
-        if self._drops is None:
-            return
-        value = self._drops.poll()
-        if value is None:
-            return
-        previous = self.counters.get("kernel_dropped", 0)
-        self.counters["kernel_dropped"] = value
-        if value > previous and not self._drops_logged:
-            self._drops_logged = True
-            self.log.add(ERROR,
-                         f"The kernel is dropping datagrams on syslog port "
-                         f"{self._drops.port}: {value} lost before they could "
-                         f"be read",
-                         detail="The socket receive buffer is full: the sender "
-                                "is faster than this host can drain it. Raise "
-                                "the buffer size in Settings, and on Linux "
-                                "raise net.core.rmem_max to at least that "
-                                "value.")
-
-    def _note_error(self, exc: Exception) -> None:
-        """Count a message the receive path could not process; log at most one
-        traceback a minute so a flood cannot fill the event log."""
-        self.counters["errors"] += 1
-        now = time.time()
-        if now - self._last_error_log >= 60:
-            self._last_error_log = now
-            self.log.add(ERROR, f"Receive error: {exc}",
-                         detail=traceback.format_exc())
-
     def stop(self) -> None:
-        self._stop.set()
-        for sock in (self._udp, self._tcp):
-            if sock is not None:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-        self._udp = self._tcp = None
-        for thread in self._threads + self._clients:
+        super().stop()
+        for thread in self._clients:
             if thread.is_alive():
                 thread.join(timeout=2)
-        self._threads = []
         self._clients = []
         self.counters["tcp_clients"] = 0
-        self.bound = None
 
-    # ----------------------------------------------------------------- threads
+    # ------------------------------------------------------------------ errors
 
+    def _note_error(self, exc: Exception) -> None:
+        # The counters survive a restart, so errors are accumulated in the
+        # counter itself rather than republished from a per-run total.
+        self.counters["errors"] += 1
+        self._log_throttled("receive", f"Receive error: {exc}",
+                            detail=traceback.format_exc())
 
-    def _first_from(self, source: str) -> bool:
-        """True the first time a source is seen since the last start.
-
-        The set is keyed on the datagram's source address, which anyone with
-        network reach can vary, so it is bounded and least-recently-used
-        rather than growing for the life of the process.
-        """
-        if source in self._seen:
-            self._seen.move_to_end(source)
-            return False
-        self._seen[source] = None
-        while len(self._seen) > MAX_SEEN_SOURCES:
-            self._seen.popitem(last=False)
-        return True
+    # ------------------------------------------------------------------ access
 
     def _accepted(self, source: str) -> bool:
         if self._allowed:
@@ -304,9 +167,8 @@ class SyslogCollector:
     def _within_rate(self, source: str, now: float) -> bool:
         """A token bucket per source, refilled lazily.
 
-        The only volume controls were a global severity floor and a global
-        queue, so one device in a debug loop consumed the whole queue and
-        evicted every other device's messages — and `dropped` could not say
+        Without it one device in a debug loop consumed the whole queue and
+        evicted every other device's messages, and `dropped` could not say
         whose. O(1) per message and bounded in memory.
         """
         if self._rate <= 0:
@@ -326,6 +188,8 @@ class SyslogCollector:
         bucket[0] -= 1.0
         return True
 
+    # ----------------------------------------------------------------- threads
+
     def _enqueue(self, data: bytes, source: str) -> None:
         # Counted after the access check, not before: a rejected source used
         # to refresh "last message just now", so the status strip read healthy
@@ -336,17 +200,15 @@ class SyslogCollector:
         now = time.time()
         if not self._within_rate(source, now):
             self.counters["throttled"] += 1
-            if now - self._last_throttle_log >= 60:
-                self._last_throttle_log = now
-                self.log.add(ERROR,
-                             f"Throttling syslog from {source}: more than "
-                             f"{self._rate:.0f} messages a second",
-                             target=source,
-                             detail="Messages above the per-source rate are "
-                                    "discarded so one noisy device cannot "
-                                    "evict everyone else's. Raise or clear "
-                                    "the per-source rate in Settings to keep "
-                                    "them all.")
+            self._log_throttled("throttle",
+                                f"Throttling syslog from {source}: more than "
+                                f"{self._rate:.0f} messages a second",
+                                target=source,
+                                detail="Messages above the per-source rate are "
+                                       "discarded so one noisy device cannot "
+                                       "evict everyone else's. Raise or clear "
+                                       "the per-source rate in Settings to keep "
+                                       "them all.")
             return
         self.counters["messages"] += 1
         self.counters["last_message"] = now
@@ -368,19 +230,8 @@ class SyslogCollector:
         except queue.Full:
             self.counters["dropped"] += 1
 
-    def _receive_udp(self) -> None:
-        sock = self._udp
-        while not self._stop.is_set() and sock is not None:
-            try:
-                data, address = sock.recvfrom(65535)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            try:
-                self._enqueue(data, udpsock.normalise_source(address[0]))
-            except Exception as exc:
-                self._note_error(exc)
+    def _handle_datagram(self, data: bytes, address) -> None:
+        self._enqueue(data, udpsock.normalise_source(address[0]))
 
     def _receive_tcp(self) -> None:
         sock = self._tcp
@@ -415,23 +266,20 @@ class SyslogCollector:
     def _note_oversized(self, source: str, declared: int | None = None) -> None:
         """Count a TCP message that hit MAX_TCP_MESSAGE_BYTES, and log at most
         one line a minute so a sender doing this repeatedly cannot fill the
-        event log the same way a flood of anything else here could."""
+        event log."""
         self.counters["tcp_oversized"] += 1
-        now = time.time()
-        if now - self._last_oversized_log >= 60:
-            self._last_oversized_log = now
-            what = (f"a declared length of {declared:,} bytes" if declared is not None
-                    else f"no newline within {MAX_TCP_MESSAGE_BYTES:,} bytes")
-            self.log.add(ERROR,
-                         f"Oversized TCP syslog message from {source} refused "
-                         f"({what})",
-                         target=source,
-                         detail="No real syslog message approaches "
-                                f"{MAX_TCP_MESSAGE_BYTES:,} bytes. Without this "
-                                "cap the sender's own claimed size (octet "
-                                "counting) or an unterminated line (newline "
-                                "framing) would grow this connection's buffer "
-                                "without limit.")
+        what = (f"a declared length of {declared:,} bytes" if declared is not None
+                else f"no newline within {MAX_TCP_MESSAGE_BYTES:,} bytes")
+        self._log_throttled("oversized",
+                            f"Oversized TCP syslog message from {source} refused "
+                            f"({what})",
+                            target=source,
+                            detail="No real syslog message approaches "
+                                   f"{MAX_TCP_MESSAGE_BYTES:,} bytes. Without this "
+                                   "cap the sender's own claimed size (octet "
+                                   "counting) or an unterminated line (newline "
+                                   "framing) would grow this connection's buffer "
+                                   "without limit.")
 
     def _read_stream(self, client: socket.socket, source: str) -> None:
         """A TCP stream is a byte stream, so messages must be reassembled.
@@ -440,16 +288,12 @@ class SyslogCollector:
         the far more common newline separation. Neither may grow the buffer
         past MAX_TCP_MESSAGE_BYTES.
 
-        The two framings are refused differently because they can be
-        recovered from differently. Octet counting is refused the moment the
-        *declared* length is read, before a single byte of the body is
-        buffered toward it -- and the connection is then closed outright,
-        because there is no honest way to resynchronise past a bad length:
-        the only way to find where the next frame starts is to read past
-        `length` bytes of this one, which is exactly the commitment being
-        refused. Newline framing keeps the connection open and simply
-        resumes from the next `\\n` it finds, since finding one costs nothing
-        extra and does not depend on trusting anything the sender claimed.
+        The two framings are refused differently because they can be recovered
+        from differently. Octet counting is refused the moment the *declared*
+        length is read and the connection is then closed outright, because the
+        only way to find where the next frame starts is to read past `length`
+        bytes of this one — exactly the commitment being refused. Newline
+        framing keeps the connection open and resumes from the next `\\n`.
         """
         client.settimeout(30)
         buffer = b""
@@ -510,15 +354,12 @@ class SyslogCollector:
                 try:
                     stored, collapsed = self.db.insert(pending)
                     self.counters["stored"] += stored
-                    # A row's own repeat_count already carries a collapsed
-                    # message forward (see syslogdb._collapse), so nothing is
-                    # lost — but "stored" alone undercounts "messages" by
-                    # exactly this much, and a reader with no way to see that
-                    # reads it as an unexplained gap instead of a storm being
-                    # folded into fewer rows.
+                    # A row's own repeat_count carries a collapsed message
+                    # forward (see syslogdb._collapse), so nothing is lost —
+                    # but "stored" alone undercounts "messages" by exactly
+                    # this much, and reads as an unexplained gap without it.
                     self.counters["collapsed"] += collapsed
                 except Exception:
-                    import traceback
                     traceback.print_exc()
                 pending.clear()
                 last_flush = time.time()
@@ -532,27 +373,20 @@ class SyslogCollector:
 
     # ------------------------------------------------------------------ status
 
-    def status_text(self) -> str:
-        if self.error:
-            return self.error
-        if not self.running:
-            if self._crash:
-                return f"Collector stopped unexpectedly: {self._crash}"
-            return "Collector stopped"
+    def _listening_text(self) -> str:
         address, _ = self.bound or ("?", 0)
         where = ", ".join(f"{name} {value}" for name, value in self.ports.items())
         base = f"Listening on {address} ({where})"
         last = self.counters["last_message"]
-        text = (f"{base} \u00b7 last message {_ago(last)}" if last
-                else f"{base} \u00b7 waiting for messages")
-        parts = [text]
-        lost = self.counters.get("kernel_dropped", 0)
-        if lost:
-            parts.append(f"{lost} dropped by the kernel")
+        return (f"{base} · last message {ago(last)}" if last
+                else f"{base} · waiting for messages")
+
+    def _status_parts(self) -> list[str]:
+        parts = []
         if self.counters["throttled"]:
             parts.append(f"{self.counters['throttled']} throttled")
         if self.counters["tcp_clients"]:
             parts.append(f"{self.counters['tcp_clients']} TCP clients")
         if self.counters["tcp_oversized"]:
             parts.append(f"{self.counters['tcp_oversized']} oversized TCP messages refused")
-        return " \u00b7 ".join(parts)
+        return parts

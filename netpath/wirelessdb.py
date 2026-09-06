@@ -1,22 +1,16 @@
 """WirelessDatabase: FortiGate Wireless Controller polling storage.
 
-One or a handful of controllers (unlike Nodes' potentially-hundreds of
-devices), each polled directly over SNMP for its managed APs — no
-polling-profile system needed, so a controller carries its own SNMP
-credential columns directly, the same shape devices/device_groups use in
-nodesdb.py (snmp_version/community/v3_user/v3_auth_proto/
-v3_auth_pass_enc, DPAPI-encrypted, decrypted just before use and never
-returned).
+A handful of controllers, each polled directly over SNMP for its managed APs,
+so a controller carries its own SNMP credential columns rather than a polling
+profile. The v3 auth password is DPAPI-encrypted and never returned.
 """
 
 from __future__ import annotations
 
-import os
 import sqlite3
-import threading
 import time
 
-from . import dbmaint, dbopen, settingsutil
+from .sqlitebase import SqliteStore, reclaim
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS controllers (
@@ -41,7 +35,7 @@ CREATE TABLE IF NOT EXISTS access_points (
     wtp_id          TEXT NOT NULL,     -- the controller's own WTP identifier (usually a serial)
     vdom            TEXT NOT NULL DEFAULT '',
     name            TEXT,
-    status          TEXT NOT NULL DEFAULT 'other',   -- see fortinetoids.CONNECTION_STATE
+    status          TEXT NOT NULL DEFAULT 'other',   -- see nodeoids.CONNECTION_STATE
     model           TEXT,
     mac_address     TEXT,
     station_count   INTEGER,
@@ -97,7 +91,7 @@ DEFAULTS = {
     "table_columns": "",
     # How to read fgWcWtpSessionRadioOperatingPower. The MIB says dBm;
     # observed FortiOS reports its own 0-100 tx-power level in the same
-    # object (see fortinetoids.WTP_RADIO_OPERATING_POWER). "auto" decides
+    # object (see nodeoids.WTP_RADIO_OPERATING_POWER). "auto" decides
     # per controller from the values that controller actually returns;
     # "dbm" and "percent" force one reading when an operator knows better.
     "radio_power_unit": "auto",
@@ -107,76 +101,18 @@ CONTROLLER_EDITABLE = ("name", "ip", "enabled", "snmp_version", "community",
                        "v3_user", "v3_auth_proto")
 
 
-class WirelessDatabase:
-    def __init__(self, path: str):
-        self.path = path
-        self._lock = threading.RLock()
-        # dbopen.connect rather than sqlite3.connect: this file holds the
-        # controllers' SNMP community strings and DPAPI blobs, and was being
-        # created 0644 for any local account to read.
-        self._conn = dbopen.connect(path)
-        self._conn.row_factory = sqlite3.Row
-        with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            dbmaint.enable_incremental_vacuum(self._conn, "wireless.db")
-            self._conn.executescript(SCHEMA)
-            self._migrate()
-            self._conn.commit()
+class WirelessDatabase(SqliteStore):
+    SCHEMA = SCHEMA
+    DEFAULTS = DEFAULTS
+    LABEL = "wireless.db"
 
     def _migrate(self) -> None:
-        """Adds columns an older database predates. Same shape as
-        nodesdb._migrate: diff PRAGMA table_info and ALTER TABLE what's
-        missing, never rewrite the CREATE TABLE above."""
-        aps = {row["name"] for row in
-               self._conn.execute("PRAGMA table_info(access_points)").fetchall()}
-        for column, decl in (("ip", "TEXT"), ("response_ms", "REAL")):
-            if column not in aps:
-                self._conn.execute(
-                    f"ALTER TABLE access_points ADD COLUMN {column} {decl}")
-        if "out_of_service" not in aps:
-            self._conn.execute(
-                "ALTER TABLE access_points ADD COLUMN"
-                " out_of_service INTEGER NOT NULL DEFAULT 0")
-        radios = {row["name"] for row in
-                  self._conn.execute("PRAGMA table_info(radios)").fetchall()}
-        if "mode" not in radios:
-            # fgWcWtpSessionRadioMode. Stored as the decoded text, not the
-            # raw enum, because that is what every reader of this row wants
-            # and the mapping lives in one place (fortinetoids.RADIO_MODE).
-            self._conn.execute("ALTER TABLE radios ADD COLUMN mode TEXT")
-
-    def close(self) -> None:
-        with self._lock:
-            self._conn.close()
-
-    # -------------------------------------------------------------- settings
-
-    def settings(self) -> dict:
-        values = dict(DEFAULTS)
-        with self._lock:
-            rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
-        for row in rows:
-            if row["key"] in values:
-                import json
-                try:
-                    values[row["key"]] = json.loads(row["value"])
-                except (ValueError, TypeError):
-                    pass
-        return settingsutil.coerce_settings(DEFAULTS, values, strict=False)
-
-    def save_settings(self, values: dict) -> None:
-        import json
-        with self._lock:
-            for key, value in values.items():
-                if key not in DEFAULTS:
-                    continue
-                self._conn.execute(
-                    "INSERT INTO settings(key, value) VALUES (?,?)"
-                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (key, json.dumps(value)))
-            self._conn.commit()
+        self.ensure_columns("access_points", {
+            "ip": "TEXT", "response_ms": "REAL",
+            "out_of_service": "INTEGER NOT NULL DEFAULT 0"})
+        # fgWcWtpSessionRadioMode, stored decoded rather than as the raw enum
+        # so the mapping lives in one place (nodeoids.RADIO_MODE).
+        self.ensure_columns("radios", {"mode": "TEXT"})
 
     # ------------------------------------------------------------ controllers
 
@@ -284,7 +220,7 @@ class WirelessDatabase:
             return row["id"]
 
     # The one connection state that unambiguously means "this AP is not
-    # working" (fortinetoids.CONNECTION_STATE). Deliberately narrow: the
+    # working" (nodeoids.CONNECTION_STATE). Deliberately narrow: the
     # states around it are `downloading_image` and `connected_image`, which an
     # AP passes through during a routine firmware upgrade, plus `standby` (an
     # AP held in reserve on purpose) and `other`, which means the controller
@@ -429,39 +365,28 @@ class WirelessDatabase:
         return row["m"] or 0
 
     def prune_ap_events(self, retention_days: float = 90) -> int:
-        """Same shape as nodesdb's device_events retention: lifecycle
-        events are a log, not an archive. Called from the service
-        maintenance loop."""
+        """Lifecycle events are a log, not an archive. Called from the
+        service maintenance loop."""
         with self._lock:
             cur = self._conn.execute(
                 "DELETE FROM ap_events WHERE ts < ?",
                 (time.time() - retention_days * 86400,))
             removed = cur.rowcount or 0
             self._conn.commit()
-        # Reclaim after the lock, in steps, as every other database does.
+        # Reclaim after the lock, in steps.
         if removed:
-            dbmaint.reclaim(self._conn, self._lock, label="ap_events")
+            reclaim(self._conn, self._lock, label="ap_events")
         return removed
 
     def prune_stale(self, controller_id: int, seen_wtp_ids: set[tuple[str, str]],
                     stale_after_polls: int = 5) -> list[dict]:
-        """Ages an AP out only after `stale_after_polls` consecutive polls
-        that didn't see it, for a controller whose own poll otherwise
-        succeeded — a real "this AP is gone", not "the controller was
-        briefly unreachable" (record_poll's ok=False case never calls
-        this, so a transient controller outage doesn't wipe its whole AP
-        list) or "one GETNEXT reply got lost on an otherwise-fine poll"
-        (a single miss on lossy SNMP-over-UDP just increments the
-        counter; upsert_ap resets it back to 0 the moment the AP is seen
-        again).
+        """Age an AP out after `stale_after_polls` consecutive polls that
+        did not see it, and return the APs removed.
 
-        An AP a human has marked out of service is exempt entirely: it is
-        never aged out and never counted as missing, so the marking (and
-        the row carrying it) survives the controller dropping it, which is
-        precisely what happens once it is unracked.
-
-        Returns the APs actually removed, so the caller can raise a real
-        event for each rather than letting them vanish silently."""
+        Only called for a controller whose own poll succeeded, so a transient
+        controller outage cannot wipe its AP list. An AP marked out of service
+        is exempt: it is never aged out and never counted as missing.
+        """
         threshold = max(1, stale_after_polls)
         removed: list[dict] = []
         with self._lock:
@@ -498,14 +423,3 @@ class WirelessDatabase:
                     f"{ap['name']} is no longer reported by its controller"
                     f" (missing from {ap['missed_polls']} consecutive polls)")
         return removed
-
-    # ------------------------------------------------------------- maintenance
-
-    def size_bytes(self) -> int:
-        total = 0
-        for suffix in ("", "-wal", "-shm"):
-            try:
-                total += os.path.getsize(self.path + suffix)
-            except OSError:
-                pass
-        return total

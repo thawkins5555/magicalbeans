@@ -4,25 +4,14 @@
     python3 demo/scenario.py --count 250 --out demo/out
     python3 demo/scenario.py --count 25  --out demo/out --fast --skip-ui
 
-This script owns every process it needs and stops all of them in a `finally`,
-even when a step raises:
+Owns every process it starts (an SMTP sink, `demo/fleet.py`, the app run
+with `PATH=demo/bin:$PATH` so it picks up the scripted ping/traceroute
+shims, `demo/seed.py`, the incident steps, then `demo/ui_walk.mjs`) and
+stops them all in a `finally` even when a step raises.
 
-  * an SMTP sink on 127.0.0.1:1025 (`python3 -m smtpd -n -c DebuggingServer`,
-    with a stdlib fallback for Python 3.12+ where `smtpd` was removed), its
-    stdout in `out/mail-<count>.log`
-  * `demo/fleet.py --count N --control-port 8099` (the simulated devices)
-  * `python3 -m netpath --headless ... --db out/data-<count>/netpath.db`, run
-    with `PATH=demo/bin:$PATH` so it picks up the scripted ping/traceroute
-    shims rather than the real ones
-  * `demo/seed.py`, then the eight incident steps, then `demo/ui_walk.mjs`
-
-Around every incident step it takes a metric snapshot — `/api/state`,
-`/api/debug` (node_counters, per-worker elapsed), open alerts grouped by
-rule, the mail sink's message count, the app's CPU% and RSS (from
-`/proc/<pid>/stat` and `/proc/<pid>/status` on Linux, or `GetProcessTimes`
-and `GetProcessMemoryInfo` via ctypes on Windows), and the fleet's own
-`/state` — and writes `out/results-<count>.json` plus a readable
-`out/results-<count>.md`.
+Around every incident step it snapshots `/api/state`, `/api/debug`, open
+alerts, the mail sink's message count and the app's CPU%/RSS, writing
+`out/results-<count>.json` plus a readable `out/results-<count>.md`.
 """
 
 from __future__ import annotations
@@ -618,10 +607,8 @@ class Scenario:
     # device, so the single device it exists for (personas.py's
     # "configrx-ssh-01", pinned to that address) is re-pointed by ssh_port
     # and vendor_override across these personas rather than one device per
-    # persona. (label, --base-port offset, configrx_vendors.py key, whether
-    # the vendor needs the enable secret.) demo/configrx_probe.py exercises
-    # the full 12-persona matrix directly against the capture functions,
-    # without this one-device-at-a-time constraint.
+    # persona. (label, --base-port offset, configrx.py VENDORS key, whether
+    # the vendor needs the enable secret.)
     CONFIGRX_SWEEP = (
         ("cisco-nxos", 7, "cisco-nxos", False,
          "a large capture — the baseline the next persona's shrinks against"),
@@ -1122,9 +1109,7 @@ class Scenario:
                 "One live device (`%s`) re-pointed across demo/fake_ssh.py's "
                 "personas — the fake server binds only 127.0.0.1, and Nodes "
                 "requires a unique IP per device, so one device stands in "
-                "for all of them in turn. `demo/configrx_probe.py` covers "
-                "every persona directly against the capture functions, "
-                "without that constraint." % sweep.get("device"),
+                "for all of them in turn." % sweep.get("device"),
                 "",
                 "| Persona (127.0.0.1:port) | Vendor | What it proves | Result |",
                 "| --- | --- | --- | --- |",

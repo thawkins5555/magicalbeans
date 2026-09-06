@@ -1,67 +1,31 @@
 """ConfigRxDatabase: SSH config-backup storage.
 
-ConfigRX has no device table of its own — per the explicit product
-decision, it reuses Nodes' existing device list wholesale. This database
-only stores ConfigRX's own per-device backup configuration (SSH port/
-username/password, backup-enabled flag, vendor override), keyed by the
-Nodes device id with no real cross-database foreign key — the same
-pattern Alerts already uses for its own `entity_id` columns, since a
-SQLite database file cannot enforce a foreign key into a different file.
-
-The SSH password is DPAPI-encrypted at rest (dpapi.py, the only secret
-storage this app has), exactly like every other stored credential here:
-never returned from any read method as anything but a has_credential
-boolean at the API layer, decrypted only immediately before an SSH
-connection and discarded right after (see configrx.ConfigRxWorker). The
-optional per-device enable secret (enable_secret_enc, for a vendor whose
-login shell is not already privileged EXEC) follows the identical
-discipline, one column over — see set_credential/set_enable_secret below.
-
-A backup's content is stored zlib-compressed and only when its hash
-differs from that device's most recently stored backup — an unchanged
-config does not grow the database on every scheduled pull.
-
-One table here is not ConfigRX's alone: `ssh_host_keys` is the remembered
-host key per (host, port), written and checked by both the backup worker
-and the interactive SSH terminal. It lives in this database because this
-is where SSH for these devices already lives; it is keyed by address, not
-by device id, and so survives nothing else about a device changing.
+Rows are keyed by the Nodes device id, with no cross-file foreign key. SSH
+passwords and enable secrets are DPAPI-encrypted and never returned by a read
+method. Backups are zlib-compressed and stored only when the hash changes.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
 import threading
 import time
 import zlib
 
-from . import configrx_redact, dbmaint, dbopen, settingsutil
+from . import configrx_redact
+from .sqlitebase import SqliteStore, reclaim
 
-# RETURNING (SQLite 3.35, March 2021) is what makes a targeted FTS delete
-# possible — see _delete_search_lines below, the same reasoning
-# syslogdb.py's own _delete_logs docstring gives for why a full
-# `INSERT INTO ..._fts(..._fts) VALUES('rebuild')` is avoided whenever a
-# more surgical delete is available.
+# RETURNING (SQLite 3.35) is what makes the targeted FTS delete in
+# _delete_search_lines possible instead of a whole-index rebuild.
 HAS_RETURNING = sqlite3.sqlite_version_info >= (3, 35)
 _REBUILD_INTERVAL_S = 3600.0
 
-# One-time backfill for the cross-device search index (config_lines /
-# config_lines_fts) on an install that already has a backup history:
-# ConfigRxWorker._backup_device only ever calls replace_search_lines on a
-# changed or suspect capture, so a device whose configuration has not
-# moved since before search shipped — or since it last actually backed up
-# at all — has empty search rows that no ordinary poll would ever fill
-# (see that method's `unchanged` branch, which checks has_search_lines on
-# every poll for exactly this reason but only for devices still being
-# polled). Chunked by device_id and resumable, the same shape as
-# syslogdb.SyslogDatabase's own FTS backfill and for the identical
-# reasons: holding _lock for the whole fleet would stall every other
-# reader/writer of this database for as long as it takes, and an install
-# with thousands of devices must not have its ConfigRX worker startup
-# blocked on it.
+# One-time backfill of the cross-device search index for an install whose
+# backup history predates it: replace_search_lines only runs on a changed
+# capture, so an unchanged device would never fill its rows. Chunked by
+# device_id and resumable so the fleet is never indexed under one lock hold.
 SEARCH_BACKFILL_CHUNK_DEVICES = 200
 SEARCH_BACKFILL_STOP_TIMEOUT_S = 5.0
 _SEARCH_BACKFILL_CURSOR_KEY = "_search_backfill_cursor"
@@ -74,7 +38,7 @@ CREATE TABLE IF NOT EXISTS device_config (
     ssh_username         TEXT,
     ssh_password_enc     BLOB,
     -- DPAPI-encrypted exactly like ssh_password_enc, for the handful of
-    -- vendors (configrx_vendors.Vendor.enable_command) whose login shell
+    -- vendors (configrx.Vendor.enable_command) whose login shell
     -- is not already privileged EXEC. NULL for every other device, and
     -- for one of these vendors with no secret stored yet: the escalation
     -- is still attempted, answering the device's password prompt with an
@@ -142,12 +106,12 @@ CREATE TABLE IF NOT EXISTS ssh_host_keys (
     PRIMARY KEY (host, port)
 );
 
--- Cross-device search index (configrx_search.py): each device's LATEST
+-- Cross-device search index (configrx_compliance.py): each device's LATEST
 -- capture, one row per line so a match carries its own line number
 -- without re-splitting a whole capture at read time. Always built from
 -- REDACTED text, regardless of a device's store_secrets setting or that
 -- capture's own `redacted` flag on the backups row — see
--- configrx_search.py's module docstring for why a cross-device search
+-- configrx_compliance.py's module docstring for why a cross-device search
 -- view earns the same "redact unconditionally" treatment
 -- get_configrx_diff already gives a comparison view, rather than the
 -- single-backup route's permission-gated one: a search box is probed with
@@ -183,7 +147,7 @@ CREATE TABLE IF NOT EXISTS compliance_rules (
     rule_set_id INTEGER NOT NULL REFERENCES compliance_rule_sets(id) ON DELETE CASCADE,
     description TEXT NOT NULL,
     kind        TEXT NOT NULL,      -- configrx_compliance.RuleKind
-    -- Validated through configrx_search.compile_bounded before this row is
+    -- Validated through configrx_compliance.compile_bounded before this row is
     -- ever written (see add_rule), so a rule set can never be SAVED with a
     -- pattern that would hang an evaluation later.
     pattern     TEXT NOT NULL,
@@ -256,58 +220,32 @@ DEVICE_CONFIG_EDITABLE = ("backup_enabled", "ssh_port", "ssh_username",
 _UNCHANGED = object()
 
 
-class ConfigRxDatabase:
+class ConfigRxDatabase(SqliteStore):
+    SCHEMA = SCHEMA
+    DEFAULTS = DEFAULTS
+    LABEL = "configrx.db"
+
     def __init__(self, path: str):
-        self.path = path
-        self._lock = threading.RLock()
-        # dbopen.connect rather than sqlite3.connect: this file holds every
-        # captured device config (communities, TACACS/RADIUS keys, IPsec
-        # pre-shared keys, enable secrets) and the DPAPI-wrapped SSH
-        # passwords, and was being created 0644.
-        self._conn = dbopen.connect(path)
-        self._conn.row_factory = sqlite3.Row
         self.search_fts = False
         self._last_search_rebuild: float | None = None
         self._search_backfill_stop = threading.Event()
         self._search_backfill_thread: threading.Thread | None = None
-        with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            dbmaint.enable_incremental_vacuum(self._conn, "configrx.db")
-            self._conn.executescript(SCHEMA)
-            self._migrate()
-            self._enable_search_fts()
-            self._conn.commit()
+        super().__init__(path)
 
     def _migrate(self) -> None:
-        """Adds columns a database created by an older build predates. Same
-        shape as nodesdb._migrate and wirelessdb._migrate: diff PRAGMA
-        table_info against what the CREATE TABLE above declares and ALTER
-        TABLE in what is missing, never rewrite the CREATE. Idempotent, so
-        it runs on every open."""
-        wanted = {
-            "device_config": [("store_secrets", "INTEGER NOT NULL DEFAULT 0"),
-                              ("enable_secret_enc", "BLOB")],
-            "backups": [("redacted", "INTEGER NOT NULL DEFAULT 0")],
-        }
-        for table, columns in wanted.items():
-            present = {row["name"] for row in
-                       self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
-            for name, declaration in columns:
-                if name not in present:
-                    self._conn.execute(
-                        f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+        self.ensure_columns("device_config", {
+            "store_secrets": "INTEGER NOT NULL DEFAULT 0",
+            "enable_secret_enc": "BLOB"})
+        self.ensure_columns("backups", {"redacted": "INTEGER NOT NULL DEFAULT 0"})
+        self._enable_search_fts()
 
     def _enable_search_fts(self) -> None:
-        """Same tokenizer choice and the same reasoning as
-        syslogdb.SyslogDatabase._enable_fts: `trigram` indexes every
-        three-character run rather than whole words, which is what lets a
-        search for part of a directive ("snmp-server community") or a
-        bare IP octet run find it mid-line. Absent silently — same
-        graceful degrade as syslogdb — on a build with no FTS5, or an
-        SQLite older than 3.34 (trigram's own floor); config_lines itself
-        still exists and is still searched, by full scan."""
+        """Create the line-search index where the build has FTS5.
+
+        `trigram` indexes every three-character run rather than whole words,
+        so part of a directive or a bare IP octet is findable mid-line. Absent
+        silently otherwise; config_lines is then searched by full scan.
+        """
         try:
             self._conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS config_lines_fts USING fts5("
@@ -318,42 +256,14 @@ class ConfigRxDatabase:
             self.search_fts = False
 
     def close(self) -> None:
-        # Same shutdown shape as syslogdb.SyslogDatabase.close(): signal
-        # first, then give the backfill thread a bounded window to notice
-        # and land on a chunk boundary (it persists the cursor as it goes,
-        # so a thread that does not make the window within the timeout
-        # just resumes from wherever it last got to, next start).
+        # Signal first, then give the backfill thread a bounded window to land
+        # on a chunk boundary; it persists its cursor, so one that misses the
+        # window just resumes from there next start.
         self._search_backfill_stop.set()
         thread = self._search_backfill_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=SEARCH_BACKFILL_STOP_TIMEOUT_S)
-        with self._lock:
-            self._conn.close()
-
-    # -------------------------------------------------------------- settings
-
-    def settings(self) -> dict:
-        values = dict(DEFAULTS)
-        with self._lock:
-            rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
-        for row in rows:
-            if row["key"] in values:
-                try:
-                    values[row["key"]] = json.loads(row["value"])
-                except (ValueError, TypeError):
-                    pass
-        return settingsutil.coerce_settings(DEFAULTS, values, strict=False)
-
-    def save_settings(self, values: dict) -> None:
-        with self._lock:
-            for key, value in values.items():
-                if key not in DEFAULTS:
-                    continue
-                self._conn.execute(
-                    "INSERT INTO settings(key, value) VALUES (?,?)"
-                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (key, json.dumps(value)))
-            self._conn.commit()
+        super().close()
 
     # ----------------------------------------------------------- device_config
 
@@ -423,7 +333,7 @@ class ConfigRxDatabase:
 
     def set_enable_secret(self, device_id: int, enable_secret_enc: bytes | None) -> None:
         """Sets or (passed None) clears just the enable secret, independent
-        of the SSH credential — for a vendor with configrx_vendors.Vendor.
+        of the SSH credential — for a vendor with configrx.Vendor.
         enable_command, stored and decrypted exactly like ssh_password_enc
         (see configrx.ConfigRxWorker._backup_device)."""
         with self._lock:
@@ -476,11 +386,6 @@ class ConfigRxDatabase:
             return self._conn.execute(
                 "SELECT * FROM ssh_host_keys WHERE host = ? AND port = ?",
                 (host, int(port))).fetchone()
-
-    def host_keys(self) -> list:
-        with self._lock:
-            return self._conn.execute(
-                "SELECT * FROM ssh_host_keys ORDER BY host, port").fetchall()
 
     def store_host_key(self, host: str, port: int, key_type: str, key_b64: str,
                        fingerprint: str, trusted_by: str = "") -> None:
@@ -612,11 +517,8 @@ class ConfigRxDatabase:
             return cur.rowcount or 0
 
     def prune(self, retention_days: float, retention_count_per_device: int) -> int:
-        """retention_days=0 deletes every backup regardless of age — the
-        same "0 means everything" convention alertsdb.prune()/syslogdb.
-        prune() already use for their own manual "prune now" actions —
-        while retention_count_per_device=0 means no count-based cap at
-        all (skipped), matching syslogdb.prune()'s max_rows=0 convention."""
+        """retention_days=0 deletes every backup regardless of age;
+        retention_count_per_device=0 skips the count-based cap."""
         removed = 0
         with self._lock:
             cutoff = time.time() - retention_days * 86400
@@ -636,9 +538,9 @@ class ConfigRxDatabase:
                             f"DELETE FROM backups WHERE id IN ({marks})", stale)
                         removed += cur.rowcount or 0
             self._conn.commit()
-        # Reclaim after the lock, in steps, as every other database does.
+        # Reclaim after the lock, in steps.
         if removed:
-            dbmaint.reclaim(self._conn, self._lock, label="backups")
+            reclaim(self._conn, self._lock, label="backups")
         return removed
 
     # ------------------------------------------------------------ search index
@@ -652,7 +554,7 @@ class ConfigRxDatabase:
         configrx.diff_texts's own docstring draws for the diff path.
         configrx.ConfigRxWorker._backup_device is the one caller, and it
         redacts unconditionally before calling this, regardless of that
-        device's store_secrets setting — see configrx_search.py's module
+        device's store_secrets setting — see configrx_compliance.py's module
         docstring for why.
         """
         lines = redacted_text.split("\n")
@@ -686,12 +588,11 @@ class ConfigRxDatabase:
                 (device_id,)).fetchone() is not None
 
     def _delete_search_lines(self, device_id: int) -> None:
-        """Must be called with the lock held (replace_search_lines and
-        forget_device both already hold it). Same RETURNING-based targeted
-        FTS delete as syslogdb._delete_logs, for the identical reason: a
-        full `INSERT INTO config_lines_fts(config_lines_fts) VALUES
-        ('rebuild')` re-indexes the WHOLE table, however many — or few —
-        of one device's lines are actually being replaced."""
+        """Drop one device's lines and their index entries. Lock held.
+
+        RETURNING hands back what FTS5 needs to retire each entry, so the cost
+        is proportional to the lines removed rather than a whole re-index.
+        """
         if self.search_fts and HAS_RETURNING:
             rows = self._conn.execute(
                 "DELETE FROM config_lines WHERE device_id = ? RETURNING id, line",
@@ -708,10 +609,8 @@ class ConfigRxDatabase:
             self._rebuild_search_index()
 
     def _rebuild_search_index(self) -> None:
-        """Pre-3.35 fallback, at most once an hour — same shape and same
-        reasoning as syslogdb._rebuild_index: orphaned index rows are
-        harmless (search joins on the rowid and drops what config_lines no
-        longer has), so the rebuild is housekeeping, not correctness."""
+        """Pre-3.35 fallback, at most once an hour. Orphaned index rows are
+        harmless — search joins on the rowid — so this is housekeeping."""
         now = time.monotonic()
         if (self._last_search_rebuild is not None
                 and now - self._last_search_rebuild < _REBUILD_INTERVAL_S):
@@ -722,7 +621,7 @@ class ConfigRxDatabase:
     def search_fts_match(self, fts_query: str, device_ids: list[int] | None,
                          limit: int) -> list[sqlite3.Row]:
         """Rows (device_id, line_no, line) the FTS index says match —
-        configrx_search.py builds `fts_query` and applies the wall-clock
+        configrx_compliance.py builds `fts_query` and applies the wall-clock
         budget; this method is pure SQL."""
         where = ""
         params: list = [fts_query]
@@ -773,23 +672,13 @@ class ConfigRxDatabase:
             return 0
 
     def _write_search_backfill_cursor(self, cursor: int) -> None:
-        """Persists `cursor` as a permanent high-water mark, never cleared
-        back to "nothing to resume": unlike syslogdb's row-id cursor
-        (where every new row above the watermark genuinely needs
-        indexing), a device_id once walked here never needs walking
-        again. Its first-ever capture always calls replace_search_lines
-        itself (add_backup's hash comparison can never call a brand new
-        device's first backup "unchanged" — there is nothing yet to
-        compare it to), and _backup_device's own `unchanged` branch keeps
-        it indexed forever after that via has_search_lines. So the ONLY
-        device_ids this backfill will ever need to look at are ones that
-        already had backups before this cursor existed. Clearing the
-        marker on completion (the way syslogdb does, where completion is
-        provisional — the table can grow again at any time) would make
-        every later start_search_backfill call re-scan the entire
-        `backups` table from device_id 0 forever, for a fleet that will
-        never again have anything for it to find. Caller holds the lock
-        and commits."""
+        """Persist `cursor` as a permanent high-water mark, never cleared.
+
+        A device_id once walked never needs walking again: its first capture
+        always indexes itself, and has_search_lines keeps it indexed after
+        that. Clearing the marker would re-scan `backups` from 0 for ever.
+        Caller holds the lock and commits.
+        """
         self._conn.execute(
             "INSERT INTO settings(key, value) VALUES (?, ?)"
             " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -797,9 +686,7 @@ class ConfigRxDatabase:
 
     def start_search_backfill(self) -> None:
         """Kicks off the one-time search-index backfill on a background
-        thread, called from ConfigRxWorker.start() (configrx.py) — the
-        same point service.py already starts syslogdb's own index
-        backfill from, not from every backup.
+        thread, called from ConfigRxWorker.start() (configrx.py).
 
         A no-op, cheaply, in the case that matters most: a fleet that has
         already been fully walked (by a previous run, or because it never
@@ -855,22 +742,14 @@ class ConfigRxDatabase:
                 with self._lock:
                     self._write_search_backfill_cursor(cursor)
                     self._conn.commit()
-                # Same courtesy pause syslogdb._backfill makes between
-                # chunks, so a fleet-wide backfill never monopolizes this
-                # connection against a backup landing or a search running
-                # concurrently on the worker's or the API's own threads.
+                # Courtesy pause between chunks so a fleet-wide backfill
+                # never monopolizes this connection against a backup landing
+                # or a search running on another thread.
                 time.sleep(0.02)
         except sqlite3.Error:
-            # The connection closing under this chunk is close()'s own
-            # doing (shutdown mid-fleet), not a genuine failure — the same
-            # non-bug shape as syslogdb._backfill's identical catch. The
-            # cursor persisted after the last completed chunk is where the
-            # next start resumes from either way.
+            # The connection closing under this chunk is close()'s doing, not
+            # a failure; the persisted cursor is where the next start resumes.
             return
-        # Nothing left with device_id > cursor: the cursor already sits at
-        # the highest device_id `backups` had when the last chunk was
-        # written, which is exactly the permanent high-water mark this
-        # method's own docstring describes — left as is, not cleared.
 
     def backfill_one_device(self, device_id: int) -> None:
         """Indexes device_id from its latest stored backup, unless it is
@@ -880,7 +759,7 @@ class ConfigRxDatabase:
         secrets-free (store_secrets was off when it was captured) or still
         needs a redaction pass now (store_secrets was on) — the same
         unconditional "search is always redacted, regardless of
-        store_secrets" rule from configrx_search.py's module docstring,
+        store_secrets" rule from configrx_compliance.py's module docstring,
         just applied after the fact instead of at capture time.
 
         Public (not prefixed) because it is also exactly the tool a
@@ -947,7 +826,7 @@ class ConfigRxDatabase:
     def add_rule(self, rule_set_id: int, description: str, kind: str,
                 pattern: str, ordinal: int = 0) -> int:
         """The caller (configrx_compliance.add_rule) is what runs `pattern`
-        through configrx_search.compile_bounded before this is ever
+        through configrx_compliance.compile_bounded before this is ever
         called — this method just stores what it is given."""
         with self._lock:
             cur = self._conn.execute(
@@ -1000,14 +879,3 @@ class ConfigRxDatabase:
             return self._conn.execute(
                 "SELECT * FROM compliance_results WHERE rule_set_id = ?",
                 (rule_set_id,)).fetchall()
-
-    # ------------------------------------------------------------- maintenance
-
-    def size_bytes(self) -> int:
-        total = 0
-        for suffix in ("", "-wal", "-shm"):
-            try:
-                total += os.path.getsize(self.path + suffix)
-            except OSError:
-                pass
-        return total

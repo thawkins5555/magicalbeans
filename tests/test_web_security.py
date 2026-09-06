@@ -1,18 +1,9 @@
-"""The security fixes from the network-engineer review, probed against a
-real server.
-
-The application is started the way the security reviewer started it — a
-`Service` over ten SQLite files in a throwaway directory and a `WebServer`
-on a free loopback port — and every check below is an HTTP request against
-that instance, not a call into a handler. That is deliberate: most of these
-defects were in the layer between the socket and the handler (the route
-table, the session gate, the headers), and a unit test that calls the
-handler directly would have passed on every one of them.
-
-Nothing here needs the network, paramiko or DPAPI: `netpath.dpapi` is
-replaced with a reversible stand-in before anything that stores a
-credential is imported, and the self-update checks mock `urllib` at the two
-functions that use it.
+"""Security properties of the web layer, probed against a real server: a
+`Service` over ten SQLite files and a `WebServer` on a free loopback port,
+with every check an HTTP request rather than a handler call, because the
+route table, session gate and headers sit between the socket and the handler.
+Nothing needs the network, paramiko or DPAPI: `netpath.dpapi` is replaced with
+a reversible stand-in and the self-update checks mock `urllib`.
 """
 import base64
 import hashlib
@@ -476,7 +467,7 @@ def main() -> int:
         SERVICE.app_db.save_settings({"updates_enabled": False})
 
     # -------------------------------------------- D4 credential retargeting
-    # The listener the review used: anything that reaches it is recorded, so
+    # The listener: anything that reaches it is recorded, so
     # "no AUTH was seen" is a fact about the wire, not about the code.
     seen = []
     listener = socket.socket()
@@ -620,9 +611,9 @@ def main() -> int:
                         bad.append(f"{os.path.basename(path)}={oct(mode)}")
             return bad
 
-        # The three this workstream owns. dbopen.connect is adopted by each
-        # database module as its workstream touches it; the remaining seven
-        # are listed rather than failed so this suite reports progress
+        # The three this workstream owns. sqlitebase.connect is adopted by
+        # each database module as its workstream touches it; the remaining
+        # seven are listed rather than failed so this suite reports progress
         # instead of blocking on another agent's file.
         check("D5 app.db, wireless.db and configrx.db are owner-only",
               not loose_modes(("app", "wireless", "configrx")),
@@ -630,7 +621,7 @@ def main() -> int:
         remaining = loose_modes(("netpath", "flows", "syslog", "ipam",
                                  "snmptraps", "nodes", "alerts"))
         if remaining:
-            print("      note: still to adopt dbopen.connect — "
+            print("      note: still to adopt sqlitebase.connect — "
                   + ", ".join(sorted({r.split("=")[0] for r in remaining})))
 
         from netpath import __main__ as entry
@@ -1250,7 +1241,7 @@ end
     #
     # Empty is the honest answer to "what changed in the text you are allowed
     # to see". It used to be a misleading answer to "did anything change",
-    # which is what an operator clicking Diff is actually asking — O-57:
+    # which is what an operator clicking Diff is actually asking:
     # the response now distinguishes "identical" (the two rows genuinely are
     # the same) from "differs only in redacted material" (`identical` is
     # False and `redacted_only_change` is True), rather than reporting
@@ -1603,19 +1594,19 @@ end
 
     # ------------------------------------------- D19 the served vendor list
     # configrx.js used to carry its own hand-typed copy of the eleven keys
-    # in configrx_vendors.VENDORS — a second copy of the hard safety
+    # in configrx.VENDORS — a second copy of the hard safety
     # boundary of ConfigRX's backup path, free to drift from the table it
     # was supposed to mirror. /api/config now serves it instead, built from
     # VENDORS in its own iteration order, and it is one of the configrx
     # module's config keys so it is dropped for an account without ConfigRX
     # read, same as configrx_settings beside it.
     print("configrx_vendors served, not mirrored")
-    from netpath import configrx_vendors
+    from netpath import configrx
 
     status, _h, payload = req("GET", "/api/config", cookie=admin_cookie)
     served_vendors = payload.get("configrx_vendors")
     expected_vendors = [{"key": key, "label": vendor.label}
-                        for key, vendor in configrx_vendors.VENDORS.items()]
+                        for key, vendor in configrx.VENDORS.items()]
     check("D19 the served list matches configrx_vendors.VENDORS exactly "
           "(same keys, same labels, same order)",
           served_vendors == expected_vendors,
@@ -1631,7 +1622,7 @@ end
           served_vendors)
     check("D19 …all eleven vendor keys are present",
           served_vendors is not None
-          and {entry["key"] for entry in served_vendors} == set(configrx_vendors.VENDORS),
+          and {entry["key"] for entry in served_vendors} == set(configrx.VENDORS),
           served_vendors)
 
     status, _h, payload = req("GET", "/api/config", cookie=debug_cookie)

@@ -1,7 +1,7 @@
 """B15: settings must be coerced to the type their default declares, so a
 `null` or a browser NaN cannot brick startup.
 
-Style of test_security_fixes.py: a real Service + WebServer on a free
+Style of test_web_security.py: a real Service + WebServer on a free
 loopback port, over a throwaway directory, checked with plain HTTP requests.
 Section (d) exercises the POST /api/settings 400-on-bad-input behavior that
 the lead adds in api.py's post_settings hook (strict=True); those checks are
@@ -25,7 +25,7 @@ dpapi_mod.available = lambda: True
 dpapi_mod.protect = lambda plaintext: b"FAKE:" + bytes(plaintext)
 dpapi_mod.unprotect = lambda ciphertext: bytes(ciphertext)[5:]
 
-from netpath import settingsutil  # noqa: E402
+from netpath import sqlitebase as settingsutil  # noqa: E402
 from netpath import appdb as appdb_module  # noqa: E402
 from netpath import db as db_module  # noqa: E402
 from netpath import nodesdb as nodesdb_module  # noqa: E402

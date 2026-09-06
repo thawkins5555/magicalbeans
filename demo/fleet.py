@@ -1,14 +1,10 @@
 """A whole SNMP fleet in one process.
 
 Every simulated device gets its own loopback address and its own UDP
-socket bound to the real SNMP port::
-
-    127.0.0.2:161, 127.0.0.3:161, 127.0.0.4:161, ...
-
-which is what lets the UNMODIFIED app poll them. netpath/nodeoids.py:12
-hard-wires DEFAULT_SNMP_PORT = 161 and netpath/fortipoll.py:49 does the
-same, so a stub on a random high port could never be reached by anything
-but a test; a stub on 127.0.0.x:161 is indistinguishable from real gear.
+socket bound to the real SNMP port (127.0.0.2:161, 127.0.0.3:161, ...) so
+the UNMODIFIED app can poll them — nodeoids.py and fortipoll.py hard-wire
+DEFAULT_SNMP_PORT = 161, so a stub on any other port could never be
+reached the same way.
 
     python3 demo/fleet.py --count 300 [--control-port 8099]
                           [--scenario demo/scenario.json] [--quiet]
@@ -16,30 +12,14 @@ but a test; a stub on 127.0.0.x:161 is indistinguishable from real gear.
 One line containing "listening" is printed once every socket is bound —
 the same banner contract tests/_paths.spawn_stub() waits for.
 
-Design notes
-------------
-* The device sockets are sharded across selectors.DefaultSelector
-  instances, MAX_SOCKETS_PER_SHARD each, one selector loop per shard
-  running in its own thread. This exists because selectors.DefaultSelector
-  on Windows is selectors.SelectSelector, and select() there is capped at
-  FD_SETSIZE (512) file descriptors — a single selector simply cannot hold
-  a 1000- or 2000-device fleet. Below that cap, though, each shard's loop
-  is purely reactive exactly as a single selector would be: nothing is
-  recomputed on a timer, and every time-varying value (uptime, counters,
-  flapping ports, the scheduled outage and reboot devices) is derived from
-  the clock at reply time. Idle CPU is therefore ~0 regardless of fleet
-  size, and a device answers on whichever shard's thread holds its socket
-  without the shards needing to know about each other.
-* A slow device's reply is computed on arrival and parked on a due-time
-  heap that its shard's selector loop drains, so one 2.6 s device cannot
-  stall that loop (and, since the heap is per shard, cannot stall any
-  other shard's loop either) and a hundred of them cannot queue behind
-  each other. (A fixed-size thread pool was the obvious alternative and is
-  wrong: with 87 devices at 400 ms and 8 workers, replies queue ~4 s deep
-  and the poller sees timeouts no device actually caused.)
-* A control HTTP server on 127.0.0.1:<control-port> exposes GET /state and
-  POST /event, so a demo script can knock devices over and bring them back
-  while the app watches.
+Device sockets are sharded across several selectors.DefaultSelector
+threads because Windows' selector is capped at FD_SETSIZE (512) fds, too
+few for a large fleet; each shard is otherwise purely reactive, so idle
+CPU stays ~0 regardless of fleet size. A slow device's reply is computed
+on arrival and parked on its shard's due-time heap so one slow device
+cannot stall the others. A control HTTP server on
+127.0.0.1:<control-port> exposes GET /state and POST /event, so a demo
+script can knock devices over and bring them back while the app watches.
 """
 
 from __future__ import annotations
@@ -289,8 +269,7 @@ def handle_packet(dev: DeviceState, data: bytes, now: float | None = None) -> by
     out (or None to drop the datagram, which is what a dead device, a wrong
     community and a wrong SNMP version all look like on the wire).
 
-    Importable and callable with no socket bound, which is what
-    demo/selftest.py exercises.
+    Importable and callable with no socket bound.
     """
     now = time.time() if now is None else now
     if not dev.is_alive(now):

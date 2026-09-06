@@ -1,73 +1,14 @@
-"""Update this install from the GitHub repository.
+"""Update this install from the GitHub repository (stdlib only): check the
+tip of `main`, download its tarball, swap it in for the running `netpath`
+package, and re-exec.
 
-Standard library only, matching the rest of the headless service. There is no
-configuration for this: the repository, branch and app layout are all fixed,
-because the whole point is one button in Settings, not another thing to set up.
-
-The flow behind that button:
-
-0. Refuse outright unless the `updates_enabled` global setting is on. It is
-   off by default: on a change-controlled network, "this host installs
-   whatever the internet offers it, when anyone presses a button" is not a
-   default anyone would choose, and before 4.37 there was no way to say no.
-1. Ask GitHub's API for the current tip of the `main` branch.
-2. If that commit is what is already installed (`update_installed_commit` in
-   app.db), stop there — nothing to do.
-3. Otherwise download that commit's tarball, capped at MAX_DOWNLOAD_BYTES.
-4. Unpack into a temp directory with the archive's own mode bits discarded,
-   sanity-check it looks like this application, quiesce the workers, and
-   swap it in for the running `netpath` package.
-5. Re-exec the process so the swapped-in code is what actually runs next.
-
-SECURITY NOTE — accepted debt, to be resolved
----------------------------------------------
-Step 1 follows a **mutable branch**, and step 3 verifies nothing about what
-it downloads beyond the size cap and "does this look like SappiWhere".
-
-That means: whoever can push to `main` — the repo owner, a stolen GitHub
-credential, a CI token, a pull request merged by accident — chooses the code
-every install in the fleet will run at the next press of this button, on
-hosts that hold the plant's SNMP communities and SSH credentials. There is
-no tag, no digest and no signature in the path. This is the same exposure
-recorded as S-B1 in REVIEW-NETWORK-ENGINEER.md.
-
-It is deliberate and temporary. 4.39.0 had shipped the hardened version of
-this — newest published tag, verified against a `SHA256SUMS` published as a
-release asset — but that left every install already in the field unable to
-reach 4.39.0 through the button at all, since their own copy of this file
-predates the setting the hardened path is gated behind. Restoring the branch
-pull is what gets the fleet moving again.
-
-The pieces to put it back are still here and still tested: `latest_tag()`,
-`published_digest()` and `tarball_name()` below are the verified path, and
-RELEASE.md still describes how a release publishes the digest they read.
-Re-hardening is a change to `apply()` plus its tests, not a rewrite.
-
-Until then, an installation that cannot accept "whoever holds push access to
-this repository can run code here" should leave `updates_enabled` off — the
-default — and install by hand. That is the mitigation available today.
-
-The databases live outside this directory entirely (see NETWORK-AND-STORAGE-
-REQUIREMENTS.md), so none of this ever touches them. Only the `netpath`
-package directory is replaced; the previous copy is kept as one `.bak`
-alongside it in case something needs to be recovered by hand.
-
-Re-exec rather than a clean shutdown and restart: `os.execv` replaces this
-process image in place, so it keeps the same PID under systemd/NSSM and picks
-up the new files on the next import. Sessions are in-memory (see appdb.py),
-so everyone signed in — this request included — is signed out by it; the web
-UI expects that and sends people back to the sign-in page once it sees the
-server answering again.
-
-`cacert.pem` beside this file is Mozilla's CA bundle, the same one `pip` and
-`certifi` vendor, checked in rather than pulled from a package at run time so
-a headless install still needs nothing but the standard library. It exists
-because a locked-down Windows server's own certificate store can be missing
-whatever root GitHub's certificate chains to, with no route to Windows
-Update's on-demand fetch to fill the gap — `urlopen()`'s default context
-then fails with CERTIFICATE_VERIFY_FAILED even though the machine can reach
-github.com fine. Trusting this bundle in addition to — not instead of — the
-system store means either one having the right root is enough.
+SECURITY NOTE — accepted debt: step 1 follows the mutable `main` branch and
+the download is checked only for size and "looks like SappiWhere", not any
+signature or digest — whoever can push to main controls what every install
+runs next. The verified path (newest tag + published SHA256SUMS) still
+exists and is tested (`latest_tag`, `published_digest`, `tarball_name`);
+`apply()` just doesn't call it yet. Until it does, leave `updates_enabled`
+off (the default) and install by hand.
 """
 
 from __future__ import annotations
@@ -99,8 +40,8 @@ UPDATES_ENABLED_KEY = "updates_enabled"
 
 USER_AGENT = "SappiWhere-Updater"
 
-# The published digest list, as a release asset. Named here because
-# RELEASE.md tells whoever cuts a release to attach a file with this name.
+# The published digest list, as a release asset — see the Releasing section
+# of README.md for the name a release must attach it under.
 SUMS_ASSET = "SHA256SUMS"
 
 # A source tarball of this application is a couple of megabytes. The cap is
@@ -136,11 +77,8 @@ def _ssl_context() -> ssl.SSLContext:
     return context
 
 
-# ------------------------------------------------------- the network boundary
-# Everything that reaches the network goes through these two functions, and
-# nothing else in this module imports urllib. That is what makes the update
-# path testable offline: a suite replaces these two and exercises the tag
-# choice, the digest check and the refusals without a socket.
+# Everything that reaches the network goes through these two functions —
+# nothing else here imports urllib — so tests can replace them and run offline.
 
 def _fetch_json(url: str, timeout: float = 10.0):
     request = urllib.request.Request(
@@ -169,20 +107,15 @@ _VERSION_PART = re.compile(r"\d+")
 
 
 def _version_key(tag: str) -> tuple:
-    """Sortable form of a tag name: the run of numbers in it, in order.
-    "v4.39.0" sorts above "v4.36.1" and above "v4.9.0", which plain string
-    order gets wrong. A tag with no numbers sorts below every tag that has
-    some rather than raising."""
+    """Sortable form of a tag name: the run of numbers in it, in order, so
+    "v4.39.0" sorts above "v4.9.0" (plain string order gets that wrong)."""
     return tuple(int(part) for part in _VERSION_PART.findall(tag)) or (-1,)
 
 
 def latest_commit(timeout: float = 10.0) -> dict:
-    """The current tip of BRANCH, from GitHub's commits API.
-
-    What `apply()` installs. A branch tip moves, and nothing here proves who
-    moved it — see the SECURITY NOTE at the top of this module for what that
-    costs and what has to change to get the verified path back.
-    """
+    """The current tip of BRANCH, from GitHub's commits API — what apply()
+    installs. See the module's SECURITY NOTE: a branch tip moves, and
+    nothing here proves who moved it."""
     head = _fetch_json(
         f"https://api.github.com/repos/{OWNER}/{REPO}/commits/{BRANCH}",
         timeout=timeout)
@@ -196,15 +129,9 @@ def latest_commit(timeout: float = 10.0) -> dict:
 
 
 def latest_tag(timeout: float = 10.0) -> dict:
-    """The newest published tag, from GitHub's tags API — the equivalent of
-    `git ls-remote --tags`. Chosen by version order rather than by the
-    order the API happens to return, so a tag pushed out of sequence does
-    not become "the newest".
-
-    Part of the verified path that `apply()` does not currently use; kept
-    (and kept tested) so re-hardening is a change to `apply()` rather than a
-    rewrite. See the SECURITY NOTE at the top of this module.
-    """
+    """The newest published tag, from GitHub's tags API, chosen by version
+    order (not API return order). Part of the verified path apply() does
+    not currently use — see the module's SECURITY NOTE."""
     tags = _fetch_json(f"https://api.github.com/repos/{OWNER}/{REPO}/tags",
                        timeout=timeout)
     named = [t for t in (tags or []) if t.get("name")]
@@ -223,14 +150,9 @@ def tarball_name(tag: str) -> str:
 
 
 def published_digest(tag: str, timeout: float = 10.0) -> str:
-    """The SHA-256 the release for `tag` published for its source tarball.
-
-    Read from the release's SHA256SUMS *asset*, not from a file inside the
-    archive: a digest carried by the thing it describes proves nothing.
-
-    Part of the verified path that `apply()` does not currently use. See the
-    SECURITY NOTE at the top of this module.
-    """
+    """The SHA-256 the release for `tag` published, read from the release's
+    SHA256SUMS asset (a digest carried inside the archive it describes would
+    prove nothing). Part of the verified path apply() does not use yet."""
     release = _fetch_json(
         f"https://api.github.com/repos/{OWNER}/{REPO}/releases/tags/{tag}",
         timeout=timeout)
@@ -243,7 +165,7 @@ def published_digest(tag: str, timeout: float = 10.0) -> str:
         raise ValueError(
             f"the release for {tag} publishes no {SUMS_ASSET}, so the "
             f"download cannot be checked against anything — refusing to "
-            f"install it (see RELEASE.md)")
+            f"install it (see the Releasing section of README.md)")
     wanted = tarball_name(tag)
     text = _fetch_bytes(asset_url, timeout=timeout,
                         max_bytes=1024 * 1024).decode("utf-8", "replace")
@@ -259,13 +181,8 @@ def published_digest(tag: str, timeout: float = 10.0) -> str:
 
 def _download_tarball(ref: str, dest_path: str, timeout: float = 60.0) -> str:
     """The tarball for `ref`, written to `dest_path`. Returns its SHA-256.
-
-    `ref` is a commit id for the branch pull `apply()` does, and codeload
-    also accepts `refs/tags/<tag>` for the verified path, so one function
-    serves both. The digest is returned whether or not anything checks it:
-    it costs nothing to compute while the bytes are in hand, and it is what
-    the verified path compares.
-    """
+    `ref` is a commit id for apply()'s branch pull; codeload also accepts
+    `refs/tags/<tag>` for the (currently unused) verified path."""
     url = f"https://codeload.github.com/{OWNER}/{REPO}/tar.gz/{ref}"
     raw = _fetch_bytes(url, timeout=timeout, max_bytes=MAX_DOWNLOAD_BYTES)
     with open(dest_path, "wb") as handle:
@@ -275,16 +192,8 @@ def _download_tarball(ref: str, dest_path: str, timeout: float = 60.0) -> str:
 
 def _safe_extract(tar: tarfile.TarFile, dest: str) -> None:
     """Only ordinary files and directories, only inside `dest`, and never
-    with the archive's own permissions.
-
-    codeload tarballs never legitimately need symlinks or device nodes; this
-    is defense in depth against a corrupted or tampered archive rather than
-    anything expected of our own repository. The mode bits are replaced
-    outright rather than trusted: `extractall` restores whatever the archive
-    carried, so an archive claiming 0777 (or setuid) on a file would get it,
-    and nothing in this application has any use for a mode other than "the
-    owner may write it, anyone may read it".
-    """
+    with the archive's own permissions — defense in depth against a
+    corrupted or tampered archive."""
     dest_real = os.path.realpath(dest)
     members = []
     for member in tar.getmembers():
@@ -322,19 +231,9 @@ def _swap_in(new_netpath: str) -> None:
 
 
 def _relaunch_args() -> list[str]:
-    """The command that starts this app fresh, as the `netpath` module
-    rather than a bare script path.
-
-    `sys.argv` alone is not enough to rebuild this: `-m netpath` rewrites
-    `sys.argv[0]` to `__main__.py`'s resolved file path, and launching that
-    path directly — rather than through `-m` — drops the package context
-    every relative import in this app depends on (`from . import
-    selfupdate`, `from .web import Service`, and so on), crashing on the
-    very first one with "attempted relative import with no known parent
-    package". `-m netpath` is what actually restores that context; the
-    rest of the original argv, past whatever argv[0] happened to be,
-    still carries the flags this was launched with.
-    """
+    """The command that starts this app fresh via `-m netpath`, not a bare
+    script path — launching `sys.argv[0]` directly drops the package
+    context every relative import here depends on."""
     return [sys.executable, "-m", "netpath"] + sys.argv[1:]
 
 
@@ -359,24 +258,11 @@ def _log_restart(line: str) -> None:
 
 
 def _restart_windows() -> None:
-    """Windows has no true in-place exec — Python's `os.execv` emulates it by
-    starting a new process and then ending this one, and if a supervisor
-    (a Windows service wrapper, a job-object-based process tree) is watching
-    this process, its cleanup can kill that new process the instant this one
-    exits, so the "restart" silently becomes a stop.
-
-    Spawn the replacement first and only end this one once it exists. Headless
-    gets a fully detached, windowless child, matching how it already runs.
-    A console/GUI session gets its replacement in a new, visible console
-    instead of a hidden detached one — some antivirus/EDR products treat "a
-    process spawns a windowless child and immediately exits" as a hallmark of
-    something trying to hide, and would rather block or kill exactly that
-    shape of restart. Either way this also tries to break out of any job
-    object this process is in; if that is refused and a supervisor kills the
-    child alongside this process anyway, that supervisor's own restart policy
-    is the fallback — the files `_swap_in` already put in place are what the
-    next launch reads regardless of which path actually restarts it.
-    """
+    """Windows has no true in-place exec: spawn the replacement first and
+    only end this process once it exists, so a watching supervisor's
+    cleanup can't kill the new process before it's up. A visible console
+    (not a detached child) for non-headless runs, since some AV/EDR treats
+    "spawns a windowless child and exits" as suspicious."""
     import subprocess
 
     headless = "--headless" in sys.argv or "--web" in sys.argv
@@ -397,9 +283,7 @@ def _restart_windows() -> None:
     os._exit(0)
 
 
-# Set by __main__.py once the web server and service exist, so the restart
-# can release the port and close the databases before spawning a replacement
-# rather than after — see the note on _before_restart in schedule_restart().
+# Set by __main__.py once the web server and service exist.
 _before_restart_hook = None
 
 
@@ -414,17 +298,9 @@ def set_before_restart_hook(fn) -> None:
 
 def _run_before_restart() -> None:
     """Release the port and stop the collectors, pollers and workers. Runs
-    at most once per process.
-
-    `apply()` calls this BEFORE the package directory is replaced, not
-    after. The window between the swap and the re-exec is one where the
-    process runs already-imported old code while every lazy import (this
-    application has many: `from .. import dpapi` inside handlers, `from
-    ..auth import …` inside post_login) resolves against the new tree.
-    Collectors, the ConfigRX worker and the DHCP poller used to keep
-    running straight through it. Now nothing is running by the time the
-    files change.
-    """
+    at most once per process. apply() calls this BEFORE the package
+    directory is replaced, so nothing is running while lazy imports would
+    otherwise resolve against a half-swapped tree."""
     global _before_restart_done
     if _before_restart_done or _before_restart_hook is None:
         return
@@ -437,16 +313,10 @@ def _run_before_restart() -> None:
 
 
 def schedule_restart(delay: float = 1.5) -> None:
-    """Restart after `delay` seconds, so the response to this request has
-    time to reach the browser first.
-
-    The replacement is spawned only after the hook has released the port and
-    closed the databases, not before: spawning first and cleaning up after
-    left a window where the new process tried to bind the same port and open
-    the same SQLite files while the old one was still holding both, lost
-    that race, and died — and by the time the old process finally let go,
-    there was nobody left to take its place.
-    """
+    """Restart after `delay` seconds, so the response reaches the browser
+    first. The replacement is spawned only after the port and databases are
+    released — spawning first raced the old process for the same port/files
+    and lost."""
     def _go():
         time.sleep(delay)
         _run_before_restart()          # a no-op when apply() already did it
@@ -518,28 +388,15 @@ def apply(app_db) -> dict:
                                           "SappiWhere — refusing to install it"}
 
         # Nothing of ours runs while the files change: the listener is down
-        # and every worker has stopped. Everything that could fail and leave
-        # the install broken has already happened by this point.
+        # and every worker has stopped.
         db_path = getattr(app_db, "path", "")
         _run_before_restart()
         try:
             _swap_in(new_netpath)
         except OSError as exc:
-            # _run_before_restart() has already happened: the listener is
-            # down and every worker, collector and database is closed. That
-            # makes "return the error and leave the process as it is" the
-            # one answer that is never acceptable here — the process would
-            # stay alive with nothing running behind it, indefinitely, until
-            # an operator noticed the box had gone dark. _swap_in's own
-            # except clause has already put the previous netpath/ back for
-            # any failure inside shutil.move (a locked file under Windows
-            # AV/EDR real-time scanning, or ENOSPC), so what is on disk here
-            # is the same install this process booted from. Restarting onto
-            # it is what a service manager or `nssm`/`systemd` restart would
-            # do anyway, and schedule_restart()'s own before-restart call is
-            # a documented no-op once _run_before_restart() has already run
-            # once — so this is not a second teardown, just the restart that
-            # has to happen regardless of which branch got us here.
+            # _swap_in already restored the previous netpath/ on failure, so
+            # restarting here comes back up on the same install it booted from
+            # rather than leaving the process alive with nothing running.
             schedule_restart()
             return {"ok": False, "error": f"Update downloaded but could not be "
                                           f"installed: {exc}. Restarting on the "
@@ -554,14 +411,8 @@ def apply(app_db) -> dict:
                 except OSError:
                     pass  # cosmetic only — the package swap is what matters
 
-        # The hook above closed app.db, so the markers go through a
-        # short-lived connection of their own rather than the handle the
-        # service was using. They are bookkeeping, not the restart — a
-        # failure writing any one of them must not skip schedule_restart()
-        # below (apply()'s own docstring promises it never raises, and an
-        # unguarded write_meta escaping here would also leave the
-        # newly-swapped code never actually loaded, which matters far more
-        # than one stale marker).
+        # app.db is already closed, so these go through a short-lived connection
+        # of their own; a write failure must not skip schedule_restart() below.
         from .appdb import write_meta
         try:
             write_meta(db_path, INSTALLED_COMMIT_KEY, sha)

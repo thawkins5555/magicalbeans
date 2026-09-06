@@ -1,42 +1,9 @@
-"""4.49.0: bounds-checking the NetPath target fields that reach a subprocess
-argument, a worst-case runtime budget, or the scheduler's own arithmetic —
-netpath/db.py's _clamp_target_fields already clamps these silently as a
-backstop for any caller that is not this route (a test, a migration, a
-future internal path); this suite is the visible half, against a real
-Service+WebServer: POST/PUT /api/netpath/targets and POST /api/settings
-(scope=netpath) reject an out-of-range value with a 400 naming the field
-and both bounds, rather than silently rewrite it the way db.py's own
-backstop does.
-
-Also covers the one-line addition of `truncated_ttls` to GET
-/api/netpath/topology's response (analysis.Topology already computed and
-carried this; nothing in the JSON surfaced it before now) — a shape check,
-not a forced-truncation scenario (constructing one needs 65+ distinct
-addresses answering at a single TTL in one trace, out of proportion to
-what this one-line wiring fix needs proving).
-
-Bounds under test (netpath/db.py's own MIN_*/MAX_* constants):
-  interval_s   5 .. 2,592,000 (30 days)
-  max_hops     1 .. 255
-  probes       1 .. 20
-  timeout_s    0.1 .. 30.0
-  warn_rtt_ms  0 .. (open-ended)
-  warn_loss    0 .. 100
-  trace_workers, default_interval_s/max_hops/probes/timeout_s: the same
-  bounds, via POST /api/settings (scope=netpath).
-
-post_target calls service.monitor.trace_now() on every successful create,
-which would otherwise spawn a REAL tracert/traceroute subprocess against
-whatever host this test uses — against an address nothing answers, at the
-very max_hops=255/timeout_s=30.0 bounds this suite specifically creates
-targets at, that is minutes of real subprocess time per target, exactly
-the kind of shared-machine resource contention this campaign's coordination
-rules exist to avoid (measured hitting this the slow way once while writing
-this suite: 174s and climbing). netpath.monitor.run_trace is monkeypatched
-to an instant stub for this whole file, the same technique
-test_service_shutdown.py already uses for the same reason — this suite is
-about the route's field validation, not the tracer subprocess, which has
-its own coverage elsewhere.
+"""NetPath target field validation over HTTP, against a real Service+WebServer:
+POST/PUT /api/netpath/targets and POST /api/settings (scope=netpath) reject
+an out-of-range interval_s/max_hops/probes/timeout_s/warn_* value with a 400
+naming the field and both bounds (netpath/db.py's MIN_*/MAX_* constants),
+rather than silently clamping. Also a shape check that GET /api/netpath/topology
+carries `truncated_ttls`. netpath.monitor.run_trace is stubbed (no real tracer).
 """
 import http.client
 import json

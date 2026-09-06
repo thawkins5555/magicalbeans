@@ -1,4 +1,4 @@
-"""PtP wireless RF metrics (Tier 1 #8): RSSI/SNR/capacity/remote-RSSI for
+"""PtP wireless RF metrics: RSSI/SNR/capacity/remote-RSSI for
 Ubiquiti airFiber and Cambium PTP, read via nodepoll._poll_rf_metrics and
 stored through the ordinary metric-samples path so history/series charts
 work for free; a non-radio vendor arc never sends a single packet for it;

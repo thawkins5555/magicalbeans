@@ -2,14 +2,14 @@
 (fgWcWtpConfigTable / fgWcWtpSessionTable / fgWcWtpSessionRadioTable) for
 testing WirelessPoller's GETNEXT table-walking end to end, without a real
 FortiGate Wireless Controller. Only implements what the poller actually
-uses: v2c GETNEXT over exactly the OIDs in fortinetoids.py."""
+uses: v2c GETNEXT over exactly the fgWc OIDs in nodeoids.py."""
 import socket
 import sys
 
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))  # the repo root, from tests/stubs/
-from netpath import fortinetoids as oids  # noqa: E402
+from netpath import nodeoids as oids  # noqa: E402
 from netpath.snmppoll import decode_response  # noqa: E402
 from netpath.trapdecode import (  # noqa: E402
     PDU_RESPONSE, T_END_OF_MIB_VIEW, T_SEQUENCE, V2C, _tlv, enc_int,

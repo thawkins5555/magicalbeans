@@ -7,52 +7,26 @@ moved to appdb.py, which is what every module reads them from.
 
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
-import threading
 import time
 
 from statistics import mean
 
-from . import dbmaint, dbopen, settingsutil
+from .sqlitebase import (  # re-exported: tests adjust netpath.db.TRIM_CHUNK
+    TRIM_BUDGET_S, TRIM_CHUNK, TRIM_CHUNK_MAX, TRIM_CHUNK_MIN, SqliteStore)
 from .tracer import TraceResult
 
 log = logging.getLogger(__name__)
 
-# Trimming a database back under its size cap: rows are deleted in fixed
-# batches, each in its own short transaction, so the write lock is never held
-# for more than one batch. The old shape deleted 15% of the table and then
-# VACUUMed the whole file with the lock held, up to six times per maintenance
-# pass — measured at a 4.1 s stall on one insert against a 232 MB file, and it
-# still finished above the cap and reported success.
-TRIM_CHUNK = 2_000           # rows per lock acquisition, adapted below
-TRIM_CHUNK_MIN = 500
-TRIM_CHUNK_MAX = 50_000
-TRIM_LOCK_TARGET_S = 0.15    # how long one batch may hold the write lock
-TRIM_PASSES = 40             # delete/reclaim rounds before giving up
-TRIM_BUDGET_S = 30.0         # wall clock for one full (periodic-timer) call
-
-# prune()'s reclaim pass gets this much time of its own, on top of
-# older_than_days' delete budget, rather than sharing one deadline with it.
-# A delete sweep that runs long (a big backlog) used to leave nothing for
-# reclaim -- measured at zero pages freed after a 30s delete pass on 1.5M
-# rows -- which is harmless now that trim_to_size no longer trusts
-# unreclaimed freelist pages as if they were live data (see
-# live_size_bytes), but still meant the file sat needlessly large until the
-# next maintenance pass happened to have spare budget.
+# prune()'s reclaim pass gets this much time of its own rather than sharing
+# older_than_days' delete deadline: a long delete sweep would otherwise leave
+# reclaim nothing, and the file would sit large until a later pass had spare.
 PRUNE_RECLAIM_BUDGET_S = 5.0
 
-# A settings save runs maintenance synchronously on the HTTP thread
-# (Service.apply_global_settings -> run_maintenance(force=True)); with a
-# real backlog the default TRIM_BUDGET_S made every such save block the
-# request for up to ~30s per call (measured 30.3s/30.1s/30.0s on
-# successive saves). Retention still has to run on that path -- skipping it
-# entirely would mean a burst of settings saves could outrun the periodic
-# timer's enforcement -- so it gets a short leash instead of the full one;
-# a backlog too big to clear in one short pass gets worked down over
-# several saves, the same way it is worked down over several periodic
-# passes today.
+# A settings save runs maintenance synchronously on the HTTP thread, so that
+# path gets a short leash instead of the full TRIM_BUDGET_S; a backlog too big
+# for one short pass is worked down over several saves.
 FORCED_PRUNE_BUDGET_S = 2.0
 
 SCHEMA = """
@@ -139,56 +113,19 @@ NETPATH_DEFAULTS = {
 APP_DEFAULTS = NETPATH_DEFAULTS
 
 # Bounds on the numbers a target row (add_target/update_target) or the
-# matching global defaults (save_settings) may carry. Neither route validated
-# these before now -- coerce_settings (settingsutil.py) only checks that a
-# value is *a number*, never that it is a sane one -- and four of them are not
-# cosmetic: they are handed straight to a subprocess argument, a per-run
-# time budget, or a thread pool size.
-#
-#   max_hops  -> tracer._build_command's "-h"/"-m": a raw CLI argument to the
-#                traceroute/tracert binary, and a term in expected_budget's
-#                worst-case-runtime arithmetic. TTL is one byte on the wire,
-#                so no path is ever more than 255 hops regardless of what a
-#                target claims.
-#   probes    -> tracer._build_command's "-q" (Linux only; Windows tracert
-#                always sends exactly 3 and ignores this): how many probe
-#                packets go out at *every* hop, and also a term in
-#                expected_budget. An unbounded value is both a probe flood
-#                against every router on the path and a way to stretch one
-#                trace's worst-case runtime arbitrarily far.
-#   timeout_s -> tracer._build_command's "-w": too low starves every probe
-#                before a reply can arrive; too high multiplies through
-#                expected_budget the same way an inflated probes count does.
-#   interval_s -> monitor.py's scheduler: `next_run = last_run + interval_s`.
-#                At or below zero a target is perpetually "due", so the
-#                scheduler launches a fresh traceroute subprocess against it
-#                as fast as the worker pool can turn them over -- a spawn
-#                storm and a probe flood aimed at one destination, the same
-#                shape ipam_scan.py's own docstring already describes for an
-#                unpaced ping sweep.
-#   trace_workers -> service.py hands this straight to
-#                ThreadPoolExecutor(max_workers=...); it is a settings-level
-#                default, not a per-target field, but the same "never
-#                checked past being a number" gap.
-#
-# warn_rtt_ms/warn_loss reach neither a subprocess, a loop bound nor an
-# allocation -- only classify()'s comparison in monitor.py -- so they are
-# clamped to what is merely sane (non-negative; a percentage) rather than
-# to a mechanism-driven ceiling.
+# matching global defaults (save_settings) may carry. coerce_settings only
+# checks that a value is a number, never that it is a sane one, and these
+# reach a subprocess argument (max_hops, probes, timeout_s), a scheduler
+# interval, or a thread-pool size. warn_rtt_ms/warn_loss reach only a
+# comparison, so they are merely clamped to sane.
 MIN_INTERVAL_S, MAX_INTERVAL_S = 5.0, 30 * 24 * 3600.0
 MIN_MAX_HOPS, MAX_MAX_HOPS = 1, 255
 MIN_PROBES, MAX_PROBES = 1, 20
 MIN_TIMEOUT_S, MAX_TIMEOUT_S = 0.1, 30.0
 MIN_TRACE_WORKERS, MAX_TRACE_WORKERS = 1, 64
-# Mirrors api.py's _GLOBAL_SETTINGS_RANGES entry for the same key. That check
-# only runs on a save over HTTP; a value already sitting in the settings
-# table -- written before this floor existed, or by a script -- reaches
-# prune() through settings() -> coerce_settings(strict=False), which checks
-# type but never range. coerce_settings has no notion of per-key bounds, so
-# the clamp happens here, right after it, rather than by teaching it one.
-# Left unclamped, a stored 0 computes cutoff = time.time() (prune's own
-# `time.time() - older_than_days * 86400`) and deletes every trace, every
-# maintenance pass, forever.
+# A stored 0 would make prune()'s cutoff time.time() and delete every trace on
+# every maintenance pass; settings() clamps it after coercion, which has no
+# notion of per-key bounds.
 MIN_TRACE_RETENTION_DAYS, MAX_TRACE_RETENTION_DAYS = 1, 3650
 
 
@@ -228,67 +165,30 @@ def _clamp_target_fields(fields: dict) -> dict:
     return fields
 
 
-class Database:
+class Database(SqliteStore):
+    SCHEMA = SCHEMA
+    DEFAULTS = APP_DEFAULTS
+    LABEL = "netpath.db"
+    TRIM_TABLE = "traces"
+    TRIM_FLOOR = 200
+
     def __init__(self, path: str):
-        self.path = path
         # Set by prune(): whether its last call finished the whole sweep
         # inside budget, or gave up with rows past the cutoff still in the
-        # table. api.py's manual "prune traces now" action reports a plain
-        # row count either way; this lets that message (or any other
-        # caller) tell a completed sweep from a partial one without prune()
-        # changing what it returns.
+        # table, so a caller can tell a partial sweep from a complete one.
         self.last_prune_incomplete = False
-        self._lock = threading.RLock()
-        self._conn = dbopen.connect(path)
-        self._conn.row_factory = sqlite3.Row
-        with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            dbmaint.enable_incremental_vacuum(self._conn, "netpath.db")
-            self._conn.executescript(SCHEMA)
-            self._migrate()
-            self._conn.commit()
+        super().__init__(path)
 
     def _migrate(self) -> None:
-        """Add columns introduced after a database was first created.
-
-        CREATE TABLE IF NOT EXISTS silently leaves an existing table alone, so
-        new columns have to be added explicitly or an upgraded install fails on
-        first write.
-        """
-        traces = {row["name"] for row in
-                  self._conn.execute("PRAGMA table_info(traces)").fetchall()}
-        for column, definition in [("icmp_code", "TEXT"), ("icmp_from", "TEXT")]:
-            if column not in traces:
-                self._conn.execute(
-                    f"ALTER TABLE traces ADD COLUMN {column} {definition}")
-
-        targets = {row["name"] for row in
-                   self._conn.execute("PRAGMA table_info(targets)").fetchall()}
-        if "timeout_s" not in targets:
-            self._conn.execute(
-                "ALTER TABLE targets ADD COLUMN timeout_s REAL NOT NULL DEFAULT 2.0")
-        if "hop_probe_enabled" not in targets:
-            self._conn.execute(
-                "ALTER TABLE targets ADD COLUMN hop_probe_enabled INTEGER NOT NULL DEFAULT 0")
-
-    def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        self.ensure_columns("traces", {"icmp_code": "TEXT", "icmp_from": "TEXT"})
+        self.ensure_columns("targets", {
+            "timeout_s": "REAL NOT NULL DEFAULT 2.0",
+            "hop_probe_enabled": "INTEGER NOT NULL DEFAULT 0"})
 
     # -------------------------------------------------------------- settings
 
     def settings(self) -> dict:
-        values = dict(APP_DEFAULTS)
-        with self._lock:
-            rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
-        for row in rows:
-            if row["key"] in values:
-                try:
-                    values[row["key"]] = json.loads(row["value"])
-                except (ValueError, TypeError):
-                    pass
-        coerced = settingsutil.coerce_settings(NETPATH_DEFAULTS, values, strict=False)
+        coerced = super().settings()
         if "trace_retention_days" in coerced:
             coerced["trace_retention_days"] = _clamp(
                 coerced["trace_retention_days"], MIN_TRACE_RETENTION_DAYS,
@@ -311,16 +211,7 @@ class Database:
         _clamp_target_fields(defaulted)
         for key, value in defaulted.items():
             values[f"default_{key}"] = value
-        with self._lock:
-            for key, value in values.items():
-                if key not in APP_DEFAULTS:
-                    continue
-                self._conn.execute(
-                    "INSERT INTO settings(key, value) VALUES (?,?)"
-                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (key, json.dumps(value)),
-                )
-            self._conn.commit()
+        super().save_settings(values)
 
     # ---------------------------------------------------------------- targets
 
@@ -540,13 +431,6 @@ class Database:
                 " GROUP BY ip ORDER BY seen DESC LIMIT ?", (limit,)).fetchall()
         return [row["ip"] for row in rows]
 
-    def hop_ip_count(self) -> int:
-        """Distinct hop addresses, for the "pending lookups" figure."""
-        with self._lock:
-            return self._conn.execute(
-                "SELECT COUNT(DISTINCT ip) AS n FROM hops"
-                " WHERE ip IS NOT NULL").fetchone()["n"] or 0
-
     def destination_ip(self, target_id: int) -> str | None:
         """Address of the final hop of the most recent trace that got through.
 
@@ -725,47 +609,13 @@ class Database:
                 (trace_id,),
             ).fetchall()
 
-    def data_span(self, target_id: int) -> tuple[float, float] | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT MIN(started_ts) AS lo, MAX(started_ts) AS hi"
-                " FROM traces WHERE target_id=?",
-                (target_id,),
-            ).fetchone()
-        if not row or row["lo"] is None:
-            return None
-        return float(row["lo"]), float(row["hi"])
-
-    def size_bytes(self) -> int:
-        """On-disk size, counting the WAL, which can be a large share of it."""
-        import os
-        total = 0
-        for suffix in ("", "-wal", "-shm"):
-            try:
-                total += os.path.getsize(self.path + suffix)
-            except OSError:
-                pass
-        return total
-
     def live_size_bytes(self) -> int:
-        """Estimated size of the *live* data: pages actually holding rows,
-        excluding both the WAL and any page already on SQLite's freelist.
+        """Size of the *live* data: pages holding rows, excluding the WAL and
+        anything already on SQLite's freelist.
 
-        trim_to_size decides how much to delete from this, not from
-        size_bytes(). size_bytes() is a file-size figure that counts
-        freelist pages and the WAL as if they were rows still in the table.
-        A prune() that used its whole time budget on deletes and never
-        reached reclaim (its own docstring covers why that happens) leaves
-        exactly that: a large freelist and an unshrunk file, with nothing
-        actually wrong. Deciding from size_bytes() there reads that
-        unreclaimed-but-already-free space as more rows to delete on top of
-        the ones prune() already removed -- measured on a synthetic 2M-trace
-        database as a trim_to_size call deleting 98,999 rows that were still
-        inside the retention window, on a database that was already at 99 MB
-        of live data against a 406 MB cap once fully reclaimed. Free pages
-        get reclaimed by the reclaim() calls below and by the next prune();
-        they are never a reason to delete a row that is not itself past
-        either retention rule.
+        What trim_to_size measures against the cap. size_bytes() counts free
+        pages a prune() has not yet reclaimed as if they were rows, which
+        would delete traces still inside the retention window.
         """
         with self._lock:
             page_count = self._conn.execute("PRAGMA page_count").fetchone()[0]
@@ -773,103 +623,28 @@ class Database:
             page_size = self._conn.execute("PRAGMA page_size").fetchone()[0]
         return max(0, page_count - freelist_count) * page_size
 
-    def trim_to_size(self, max_bytes: int, budget_s: float = TRIM_BUDGET_S) -> int:
-        """Delete the oldest traces, and their hops, until the *live* data
-        fits under the cap -- see live_size_bytes() for why "live" and not
-        "the file"."""
-        if max_bytes <= 0:
-            return 0
-        removed = 0
-        deadline = time.monotonic() + budget_s
-        for _ in range(TRIM_PASSES):
-            size = self.live_size_bytes()
-            if size <= max_bytes:
-                break
-            with self._lock:
-                bounds = self._conn.execute(
-                    "SELECT MIN(id) AS lo, MAX(id) AS hi FROM traces").fetchone()
-            low, high = bounds["lo"], bounds["hi"]
-            # Ids are handed out in arrival order, so the id span is both the
-            # right definition of "oldest" — immune to a device with a wrong
-            # clock — and a proxy for the row count that costs one index probe
-            # rather than the full scan a COUNT(*) would.
-            deletable = 0 if low is None else max(0, high - low + 1 - 200)
-            if deletable:
-                span = high - low + 1
-                want = min(deletable, max(1, int(
-                    span * (1.0 - max_bytes / float(size)) * 1.1)))
-                cut = low + want
-                chunk = TRIM_CHUNK
-                while low < cut and time.monotonic() < deadline:
-                    upper = min(low + chunk, cut)
-                    started = time.monotonic()
-                    with self._lock:
-                        self._conn.execute(
-                            "DELETE FROM hops"
-                            " WHERE trace_id >= ? AND trace_id < ?",
-                            (low, upper))
-                        cursor = self._conn.execute(
-                            "DELETE FROM traces"
-                            " WHERE id >= ? AND id < ?", (low, upper))
-                        removed += cursor.rowcount or 0
-                        self._conn.commit()
-                    held = time.monotonic() - started
-                    low = upper
-                    # Keep one batch's lock hold near TRIM_LOCK_TARGET_S
-                    # however large the rows turn out to be — a trap with its
-                    # raw frame stored costs an order of magnitude more than a
-                    # syslog line, and one fixed batch size cannot suit both.
-                    if held > TRIM_LOCK_TARGET_S:
-                        chunk = max(TRIM_CHUNK_MIN, chunk // 2)
-                    elif held < TRIM_LOCK_TARGET_S / 4:
-                        chunk = min(TRIM_CHUNK_MAX, chunk * 2)
-            # Hand the freed pages back, in short slices outside the lock
-            # block. reclaim takes the lock itself and reacquires it in a
-            # tight loop, and a Python lock is not fair, so it is asked for a
-            # little at a time rather than for one long run.
-            while time.monotonic() < deadline:
-                if not dbmaint.reclaim(self._conn, self._lock, pages=500,
-                                       budget_s=0.2, label="netpath.db"):
-                    break
-            if not deletable or time.monotonic() >= deadline:
-                break
-        live = self.live_size_bytes()
-        if live > max_bytes:
-            log.warning("%s: %d live bytes after removing %d rows, still above "
-                        "the %d byte cap; continuing at the next maintenance "
-                        "pass", "netpath.db", live, removed, max_bytes)
-        return removed
+    def _trim_size(self) -> int:
+        return self.live_size_bytes()
+
+    def _trim_delete(self, low: int, upper: int) -> int:
+        """Hops first, then their traces. Lock held, no commit."""
+        self._conn.execute(
+            "DELETE FROM hops WHERE trace_id >= ? AND trace_id < ?", (low, upper))
+        cursor = self._conn.execute(
+            "DELETE FROM traces WHERE id >= ? AND id < ?", (low, upper))
+        return cursor.rowcount or 0
+
     def prune(self, older_than_days: float, budget_s: float = TRIM_BUDGET_S) -> int:
         """Delete every trace (and its hops) older than `older_than_days`.
 
-        Batched in the same adaptive, lock-bounded chunks trim_to_size uses
-        thirty lines above, for the same reason: one DELETE spanning months
-        of per-hop rows held the write lock — and so the trace scheduler and
-        anything else on this connection, including a request on the HTTP
-        thread that triggered this via a settings save — for as long as the
-        whole sweep took. TRIM_LOCK_TARGET_S's own comment has the
-        measurement (4.1s stalled) that shape was fixed for; prune() simply
-        never got the same fix, since it sits beside a comment about the
-        VACUUM it used to call rather than the DELETE beside that comment.
+        Batched in adaptive, lock-bounded chunks: one DELETE spanning months
+        of per-hop rows holds the write lock, and so the trace scheduler, for
+        as long as the whole sweep takes. The id range only chunks the sweep —
+        each batch still filters on started_ts, so a device with a wrong clock
+        cannot make prune() drop the wrong rows.
 
-        The id range a batch touches is only how the sweep is chunked, not
-        what it deletes — each batch's own DELETE still filters on
-        started_ts, so a device with a wrong clock (trim_to_size's own
-        reason for preferring id ordering there) cannot make prune() keep or
-        drop the wrong rows here.
-
-        `budget_s` bounds only the delete loop below; the reclaim pass that
-        follows gets its own fixed PRUNE_RECLAIM_BUDGET_S regardless of how
-        much of `budget_s` the deletes used, rather than sharing what is
-        left of one deadline. A big backlog used to consume the whole shared
-        deadline on deletes and leave reclaim nothing to run with at all
-        (measured: zero pages freed after a 30s delete pass) — harmless
-        after live_size_bytes() (trim_to_size's fix) stopped a large
-        freelist from being mistaken for live rows, but still meant space
-        this call had already earned back sat unreclaimed until whatever
-        later pass had spare budget. `Service._run_maintenance_body` passes
-        a short `budget_s` on the forced/synchronous settings-save path so
-        that request is bounded; the periodic timer keeps the long default.
+        `budget_s` bounds only the delete loop; the reclaim pass that follows
+        gets its own PRUNE_RECLAIM_BUDGET_S.
         """
         cutoff = time.time() - older_than_days * 86400
         with self._lock:
@@ -880,54 +655,32 @@ class Database:
         if low is None:
             self.last_prune_incomplete = False
             return 0
-        removed = 0
         deadline = time.monotonic() + budget_s
-        chunk = TRIM_CHUNK
         cut = high + 1   # exclusive: every id in [low, cut) is a candidate
-        while low < cut and time.monotonic() < deadline:
-            upper = min(low + chunk, cut)
-            started = time.monotonic()
-            with self._lock:
-                self._conn.execute(
-                    "DELETE FROM hops WHERE trace_id IN (SELECT id FROM traces"
-                    " WHERE id >= ? AND id < ? AND started_ts < ?)",
-                    (low, upper, cutoff))
-                cursor = self._conn.execute(
-                    "DELETE FROM traces"
-                    " WHERE id >= ? AND id < ? AND started_ts < ?",
-                    (low, upper, cutoff))
-                removed += cursor.rowcount or 0
-                self._conn.commit()
-            held = time.monotonic() - started
-            low = upper
-            # Same target, same adaptation as trim_to_size: a trace with its
-            # raw frame stored costs far more per row than a bare hop.
-            if held > TRIM_LOCK_TARGET_S:
-                chunk = max(TRIM_CHUNK_MIN, chunk // 2)
-            elif held < TRIM_LOCK_TARGET_S / 4:
-                chunk = min(TRIM_CHUNK_MAX, chunk * 2)
+
+        def delete(lo: int, up: int) -> int:
+            self._conn.execute(
+                "DELETE FROM hops WHERE trace_id IN (SELECT id FROM traces"
+                " WHERE id >= ? AND id < ? AND started_ts < ?)",
+                (lo, up, cutoff))
+            cursor = self._conn.execute(
+                "DELETE FROM traces"
+                " WHERE id >= ? AND id < ? AND started_ts < ?",
+                (lo, up, cutoff))
+            return cursor.rowcount or 0
+
+        # The chunk bounds are passed from this module's globals rather than
+        # left to the base's, because they are the ones tests adjust.
+        removed, low = self._delete_batches(
+            low, cut, deadline, delete, chunk=TRIM_CHUNK,
+            chunk_min=TRIM_CHUNK_MIN, chunk_max=TRIM_CHUNK_MAX)
         self.last_prune_incomplete = low < cut
         if self.last_prune_incomplete:
             log.warning("netpath.db: prune of traces older than %.1f days did "
                         "not finish within its budget; continuing at the next "
                         "maintenance pass", older_than_days)
         if removed:
-            # Nothing deleted means nothing to give back. The old code
-            # rewrote the whole file with VACUUM on every call regardless,
-            # which on a netpath.db holding months of per-hop rows froze the
-            # trace scheduler and the UI for seconds at a time. Handed back
-            # in the same short, lock-releasing slices trim_to_size uses,
-            # rather than one longer reclaim() call at whatever its own
-            # defaults are, for the same reason the deletes above are
-            # chunked: this can now run under a settings-save request too.
-            #
-            # Its own deadline, not `deadline` above: that one may already
-            # be spent (a big backlog can use the whole delete budget), and
-            # reclaim is worth a little dedicated time even then -- see the
-            # docstring's PRUNE_RECLAIM_BUDGET_S paragraph.
-            reclaim_deadline = time.monotonic() + PRUNE_RECLAIM_BUDGET_S
-            while time.monotonic() < reclaim_deadline:
-                if not dbmaint.reclaim(self._conn, self._lock, pages=500,
-                                       budget_s=0.2, label="netpath.db"):
-                    break
+            # Its own deadline, not `deadline` above: that one may already be
+            # spent on deletes, and reclaim is worth a little time even then.
+            self._reclaim_until(time.monotonic() + PRUNE_RECLAIM_BUDGET_S)
         return removed

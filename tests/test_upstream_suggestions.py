@@ -1,32 +1,9 @@
-"""4.49.0: the upstream-suggestions review flow (nodesdb.upstream_suggestions/
-set_upstream_ids, and the two /api/nodes/upstream-suggestions routes on top).
-
-alertrules.py:250-266 explains why the LLDP/CDP neighbour match nodesdb
-already computes may never drive alert rollup by itself — it is a
-best-effort guess, and only an operator-confirmed devices.upstream_id may
-be trusted there. What was missing was the means for an operator to turn
-one of those guesses into an upstream_id at fleet scale instead of visiting
-2,000 Edit dialogs one at a time. This suite is that means, driven against a
-real Service and WebServer over loopback, with neighbour/interface rows
-seeded directly through nodesdb's own accessors (test_nodes_topology.py's
-own shortcut) rather than a live SNMP walk.
-
-Covers:
-  - A clean single-match suggestion (chassis-MAC match, both present and
-    stale, plus a plain sysName-only match) carries the right match_kind
-    and confidence, and is not `ambiguous`.
-  - A device whose neighbour rows resolve to two different real devices
-    comes back `ambiguous`, both candidates listed, neither picked.
-  - A stale neighbour row (present=0) is marked `stale` and scored down
-    rather than treated as equally trustworthy as a fresh one.
-  - POST .../apply refuses a batch that would create a two-device cycle,
-    and separately one that would create a three-device cycle — neither
-    individual pair is invalid on its own, only the batch together.
-  - A valid batch applies in one call and the assigned devices drop out of
-    the suggestions list on the next read.
-  - Both routes are gated ("nodes", read/write as appropriate): a
-    nodes:read account may read but not apply; an account with no nodes
-    grant at all is refused both.
+"""The upstream-suggestions flow (nodesdb.upstream_suggestions/set_upstream_ids
+and the two /api/nodes/upstream-suggestions routes), against a real Service and
+WebServer with neighbour rows seeded through nodesdb's accessors. Covers: single
+chassis-MAC and sysName matches carry match_kind/confidence; two candidates come
+back `ambiguous`; stale rows are scored down; apply refuses two- and three-device
+cycles; a valid batch applies and drops from the list; both routes are gated.
 """
 import http.client
 import json

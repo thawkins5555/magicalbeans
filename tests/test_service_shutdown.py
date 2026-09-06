@@ -1,16 +1,9 @@
-"""B5: `Service.shutdown()` used to close the databases while a maintenance
-sweep was still running.
-
-`run_maintenance` runs on the timer thread every minute and, forced, on
-whatever HTTP thread called `apply_global_settings` (a settings save).
-Before the fix, `shutdown()` never joined the timer thread and held no lock
-around the stop/close sequence, so a sweep in flight on either thread could
-call into a database `shutdown()` had just closed underneath it, raising
-`sqlite3.ProgrammingError: Cannot operate on a closed database`.
-
-This suite never starts the timer thread (`service.start()` is not needed to
-exercise `run_maintenance`/`shutdown()` directly) and drives both from plain
-threads instead."""
+"""`Service.shutdown()` must not close the databases while a maintenance
+sweep is still running: `run_maintenance` runs on the timer thread every
+minute and, forced, on whatever HTTP thread called `apply_global_settings`.
+`shutdown()` joins the timer thread and holds a lock around the
+stop/close sequence so a sweep in flight cannot touch a closed database.
+This suite drives both from plain threads, without starting the timer."""
 import io
 import os
 import shutil
@@ -191,8 +184,7 @@ def instant_run_trace(host, **kwargs):
 
 service3.db.record_trace = closed_db_record_trace
 # 3a/3b call _run_one directly rather than through a real trace, so they do
-# not depend on this host actually having a working tracert/traceroute —
-# see REVIEW-OPERATOR-4.50.md's W-1/W-2 on how little that can be assumed.
+# not depend on this host actually having a working tracert/traceroute.
 monitor_mod.run_trace = instant_run_trace
 
 # 3a. Forced directly rather than by racing a real shutdown against a real

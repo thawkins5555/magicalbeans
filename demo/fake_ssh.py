@@ -5,23 +5,18 @@ Each persona listens on its own loopback port and behaves like a device
 shell: a login banner, a prompt, an acknowledgement of the vendor's
 pager-off command, and a scripted reply to its show-config command.
 Personas cover the cases ConfigRX's _read_until_prompt / _capture_problem
-claim to handle: a Cisco that thinks for seconds after "Building
-configuration...", a device that ignores pager-off and pages anyway, one
-that hangs up mid-config, one whose banner ends in a menu rather than a
-prompt, one that rejects the command, several Cisco platforms with
-different pager-off/show verbs (NX-OS, IOS-XR, an SG/CBS switch that
-rejects its own pager-off and pages instead), a WLC whose privileged
-prompt ends '>' with no enable step, and an ASA that must escalate via
-`enable` + a stored secret before it will do anything at all.
+claim to handle: slow builds, pagers, mid-config hangups, menu banners,
+rejected commands, several Cisco platforms with different pager-off/show
+verbs, a WLC with no enable step, and an ASA that must escalate via
+`enable` + a stored secret first.
 
     python3 demo/fake_ssh.py [--base-port 2201] [--host-key PATH] [--read-timeout SECS]
 
 Accepts any username with password "demo". Needs paramiko (not a
 SappiWhere dependency for anything but ConfigRX). Never used by the app
-itself; demo/configrx_probe.py drives it — and, with --read-timeout 0, a
-live interactive session against sshterm.py can drive it too, for testing
-that side's own idle timeout instead of ConfigRX's scripted probe (see
---read-timeout's own help text).
+itself; PERSONAS is imported directly by the ConfigRX test suites, and
+--read-timeout 0 lets a live interactive session against sshterm.py drive
+this fixture too, to exercise that side's own idle timeout.
 """
 from __future__ import annotations
 
@@ -125,7 +120,7 @@ ACC_LEGACY_CONFIG = "\n".join(
 # Lifted close to the manual's own `show running-config` example (hostname,
 # hashed passwords and IP swapped for plant-plausible fakes) rather than
 # invented, since that's the one piece of real Moxa output this research
-# turned up — see netpath/configrx_vendors.py's "moxa" entry for the source.
+# turned up — see netpath/configrx.py's "moxa" entry for the source.
 MOXA_CONFIG = "\n".join(
     ["Building configuration ...", "!",
      "login mode cli", "auto-import", "no auto-backup",
@@ -158,7 +153,7 @@ SIEMENS_CONFIG = "\n".join(
        for i in range(1, 9)]
     + ["!", "end"])
 # Rockwell/Allen-Bradley Stratix — genuinely runs Cisco IOS/IOS-XE (see the
-# "rockwellautomation" entry in configrx_vendors.py for sourcing), so this
+# "rockwellautomation" entry in configrx.py for sourcing), so this
 # reuses Cisco IOS config shape rather than inventing a distinct syntax —
 # that reuse is itself the honest choice here, not a shortcut.
 STRATIX_CONFIG = "\n".join(
@@ -252,7 +247,7 @@ PERSONAS = {
                       "pager_off": ["terminal length 0"], "show": "show running-config",
                       "config": MOXA_CONFIG, "mode": "normal"},
     # No pager_off command exists for this platform (see the "siemens"
-    # entry in configrx_vendors.py); this persona never sends --More--
+    # entry in configrx.py); this persona never sends --More--
     # either, so it isn't exercising the generic pager fallback — that
     # path is already covered by "cisco-pager" above.
     "siemens-scalance": {"banner": "cli# ", "prompt": "cli#",
@@ -458,9 +453,9 @@ def main():
         help="how long a session's channel waits for the client's next "
              "line before hanging up from the device side (default: 30). "
              "0 or negative disables it (the channel blocks indefinitely "
-             "instead). ConfigRX's own scripted probe (configrx_probe.py) "
-             "never needs more than a few seconds of silence, which is what "
-             "the default is sized for — but a live SSH TERMINAL session "
+             "instead). ConfigRX's own capture never needs more than a few "
+             "seconds of silence, which is what the default is sized for "
+             "— but a live SSH TERMINAL session "
              "sitting idle to exercise the app's own 900s idle timeout "
              "(sshterm.IDLE_TIMEOUT_S) would be hung up on by this fixture "
              "at the 30s default long before that timer could ever fire, "

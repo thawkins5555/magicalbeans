@@ -21,7 +21,7 @@ from _paths import free_udp_port, tmpdir
 
 TMPDIR = tmpdir("collectors_hardening_")
 
-from netpath import hostresolve, nfdecode, tracer, trapdecode, trapoids, udpsock
+from netpath import namelookup, nfdecode, tracer, trapdecode, udpsock
 from netpath.db import Database as NetPathDb
 from netpath.monitor import HopProber
 from netpath.tracer import PingResult
@@ -335,9 +335,9 @@ def test_c2_template_guards_and_bounded_caches() -> None:
     flow_db = FlowDatabase(db_path("c2-flows.db"))
     collector = Collector(flow_db)
     firsts = sum(1 for i in range(5000) if collector._first_from(f"10.9.{i // 256}.{i % 256}"))
-    check(firsts == 5000 and len(collector._seen_exporters) <= 4096,
+    check(firsts == 5000 and len(collector._seen) <= 4096,
           f"the seen-exporter set is capped at 4096 "
-          f"({len(collector._seen_exporters)} held)")
+          f"({len(collector._seen)} held)")
     flow_db.close()
 
 
@@ -970,23 +970,23 @@ def test_c8_device_correlation_through_aliases() -> None:
     core = _device_row(7, "10.0.0.1", "10.0.0.1", "core-sw-a")
     nodes = FakeNodes({"10.0.0.1": core})
 
-    check(hostresolve.resolve_name(nodes, None, "10.0.0.1") == "core-sw-a",
+    check(namelookup.resolve_name(nodes, None, "10.0.0.1") == "core-sw-a",
           "the polling address still resolves as before")
-    check(hostresolve.resolve_name(nodes, None, "192.168.255.7") is None,
+    check(namelookup.resolve_name(nodes, None, "192.168.255.7") is None,
           "an address the device is not known to own resolves to nothing")
 
     nodes.aliases["192.168.255.7"] = 7
-    check(hostresolve.resolve_name(nodes, None, "192.168.255.7") == "core-sw-a",
+    check(namelookup.resolve_name(nodes, None, "192.168.255.7") == "core-sw-a",
           "once the alias is known, the loopback address names the device")
 
     names = {"192.168.255.7": ""}
-    filled = hostresolve.fill_from_nodes(nodes, names, ["192.168.255.7"])
+    filled = namelookup.fill_from_nodes(nodes, names, ["192.168.255.7"])
     check(names["192.168.255.7"] == "core-sw-a" and filled,
           "NetPath hop labels resolve through the alias table too")
 
     legacy = LegacyNodes({"10.0.0.1": core})
-    check(hostresolve.resolve_name(legacy, None, "192.168.255.7") is None
-          and hostresolve.resolve_name(legacy, None, "10.0.0.1") == "core-sw-a",
+    check(namelookup.resolve_name(legacy, None, "192.168.255.7") is None
+          and namelookup.resolve_name(legacy, None, "10.0.0.1") == "core-sw-a",
           "a nodes database without the alias table is simply skipped")
 
     # --- the v1 agent address is learned from the trap --------------------
@@ -995,17 +995,17 @@ def test_c8_device_correlation_through_aliases() -> None:
     traps = TrapCollector(trap_db, nodes_db=nodes)
     try:
         for _ in range(50):
-            traps._enqueue(v1_trap(agent_addr="192.168.255.7"),
+            traps._handle_datagram(v1_trap(agent_addr="192.168.255.7"),
                            ("10.0.0.1", 40000))
         check(nodes.recorded == [(7, ["192.168.255.7"], "trap_agent_addr")],
               f"the agent address is recorded once, not once per trap "
               f"({len(nodes.recorded)} write(s))")
-        check(hostresolve.resolve_name(nodes, None, "192.168.255.7") == "core-sw-a",
+        check(namelookup.resolve_name(nodes, None, "192.168.255.7") == "core-sw-a",
               "so the next message from that address names the device")
 
         # An unknown source teaches nothing, and must not cost the trap.
         before = len(nodes.recorded)
-        traps._enqueue(v1_trap(agent_addr="192.168.255.9"), ("10.99.99.99", 40000))
+        traps._handle_datagram(v1_trap(agent_addr="192.168.255.9"), ("10.99.99.99", 40000))
         check(len(nodes.recorded) == before,
               "a trap from a source that maps to no device records nothing")
         check(traps.counters["traps"] == 51,
@@ -1016,7 +1016,7 @@ def test_c8_device_correlation_through_aliases() -> None:
     # Without a nodes database at all the collector behaves exactly as before.
     trap_db = SnmpTrapDatabase(db_path("c8-nonodes.db"))
     traps = TrapCollector(trap_db)
-    traps._enqueue(v1_trap(agent_addr="192.168.255.7"), ("10.0.0.1", 40000))
+    traps._handle_datagram(v1_trap(agent_addr="192.168.255.7"), ("10.0.0.1", 40000))
     check(traps.counters["traps"] == 1,
           "a collector with no nodes database still accepts the trap")
     trap_db.close()
@@ -1467,8 +1467,8 @@ def test_c10_exporter_versions_and_per_sampler_rates() -> None:
         # address distinguishes them, so both arrive on the same socket from
         # 127.0.0.1 — send them as one exporter each by driving _handle
         # directly, which is the code path the receive thread takes.
-        collector._handle(v5_packet(), ("10.1.1.5", 40000))
-        collector._handle(v9_flow_packet(), ("10.1.1.9", 40000))
+        collector._handle_datagram(v5_packet(), ("10.1.1.5", 40000))
+        collector._handle_datagram(v9_flow_packet(), ("10.1.1.9", 40000))
         check(wait_for(lambda: len(flow_db.exporters()) == 2, 8.0),
               "both exporters are recorded")
         versions = {row["address"]: row["version"] for row in flow_db.exporters()}
@@ -1582,7 +1582,7 @@ def v2c_trap(trap_oid: str, varbinds: bytes, community: str = "public") -> bytes
 
 
 def test_c11_bgp_oids_and_visible_truncation() -> None:
-    """trapoids labelled 1.3.6.1.2.1.15.3.1.7 as bgpPeerState and hung the
+    """The OID table labelled 1.3.6.1.2.1.15.3.1.7 as bgpPeerState and hung the
     state enum off it. It is bgpPeerRemoteAddr; the state is .1.2. A real
     bgpBackwardTransition therefore rendered as
     "bgpPeerState.198.51.100.75=198.51.100.75" — a peer stuck in a state that
@@ -1591,12 +1591,12 @@ def test_c11_bgp_oids_and_visible_truncation() -> None:
     the figure."""
     print("C11: BGP trap OIDs, and truncation that is visible")
 
-    check(trapoids.WELL_KNOWN["1.3.6.1.2.1.15.3.1.7"] == "bgpPeerRemoteAddr",
+    check(trapdecode.WELL_KNOWN["1.3.6.1.2.1.15.3.1.7"] == "bgpPeerRemoteAddr",
           "1.3.6.1.2.1.15.3.1.7 is bgpPeerRemoteAddr")
-    check(trapoids.WELL_KNOWN["1.3.6.1.2.1.15.3.1.2"] == "bgpPeerState",
+    check(trapdecode.WELL_KNOWN["1.3.6.1.2.1.15.3.1.2"] == "bgpPeerState",
           "and bgpPeerState is 1.3.6.1.2.1.15.3.1.2")
-    check("1.3.6.1.2.1.15.3.1.2" in trapoids.ENUMS
-          and "1.3.6.1.2.1.15.3.1.7" not in trapoids.ENUMS,
+    check("1.3.6.1.2.1.15.3.1.2" in trapdecode.ENUMS
+          and "1.3.6.1.2.1.15.3.1.7" not in trapdecode.ENUMS,
           "the state enum moved with it")
 
     decoder = trapdecode.Decoder()

@@ -62,14 +62,10 @@
     pageLimit: 500,
     pageTotal: 0,
     pageFilterSig: null,
-    // Bumped on every refresh() — the devices fetch below is built from
-    // live filter/pagination controls, so two overlapping refreshes (one
-    // fired by the poll tick, one by an operator changing a filter or page
-    // mid-fetch) can carry different query strings and app.js's per-path
-    // abort-dedupe cannot cancel either. Without this, the older response
-    // landing last overwrites view.devices — and the table — with the wrong
-    // group's devices while the filter controls already read the new one.
-    // Same pattern as configrx.js's searchGen / app.js's gsearchRun.
+    // Bumped per refresh() and checked before painting: the devices fetch
+    // is built from live filter/pagination controls, so two overlapping
+    // refreshes carry different query strings and app.js's per-path
+    // abort-dedupe cannot cancel either.
     refreshGen: 0,
     // Fleet-wide reports (netpath/report.py via /api/nodes/reports/*):
     // fetched only on "Run report", never on the poll tick — the top-N
@@ -83,12 +79,8 @@
     repTopnSort: App.recallSort('nodes-rep-topn', { key: 'peak', descending: true }),
   };
 
-  // One implementation, in app.js. This was twelve copies of the same
-  // three lines, which is how one of them came to be missing a
-  // character while the others were not.
   const escape = App.escapeHtml;
 
-  // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = App.ago;
 
   /* App.helpLink's own accessible name is the bare word "Help", the same on
@@ -136,10 +128,8 @@
   function drawStatus() {
     const server = App.state.serverState || {};
     const nodes = server.nodes || { counters: {} };
-    const text = nodes.status || 'Poller stopped';
-    App.setText(App.el('nd-status'), text);
-    App.setBg(App.el('nd-dot'), nodes.running ? 'var(--ok)' : 'var(--line)');
-    App.setText(App.el('nd-toggle'), nodes.running ? 'Stop poller' : 'Start poller');
+    App.strip('nd', nodes, { stopped: 'Poller stopped', start: 'Start poller',
+      stop: 'Stop poller' });
     const counts = nodes.device_counts || {};
     const c = nodes.counters || {};
     const parts = [`${counts.total || 0} device(s)`, `${counts.up || 0} up`,
@@ -459,9 +449,7 @@
 
 
   function drawBulkBar() {
-    const n = view.devicesChecked.size;
-    App.el('nd-bulk-bar').hidden = n === 0;
-    if (n) App.el('nd-bulk-count').textContent = `${n} selected`;
+    App.bulkBar(view.devicesChecked, 'nd-bulk-bar', 'nd-bulk-count');
   }
 
   function bulkClearSelection() {
@@ -488,20 +476,7 @@
     if (button.disabled) return;
     // No confirm dialog: polling a device only reads it, and is exactly what
     // the scheduler does on its own every interval.
-    const settle = (text) => {
-      button.disabled = false;
-      button.textContent = text;
-      // The label IS the result — 'Queued for 12 devices', 'Failed' —
-      // and a label rewritten in place is a silent DOM mutation to a
-      // screen reader, so the result is said once as well. Inside the
-      // branch, because the resting label is not a result.
-      if (text !== 'Poll now') {
-        App.announce(text);
-        setTimeout(() => {
-          if (button.textContent === text) button.textContent = 'Poll now';
-        }, 3000);
-      }
-    };
+    const settle = App.settleButton(button, 'Poll now');
     button.disabled = true;
     button.textContent = 'Polling…';
     let result;
@@ -531,20 +506,7 @@
     if (!ids.length) return;
     const button = App.el('nd-bulk-identify');
     if (!button || button.disabled) return;
-    const settle = (text) => {
-      button.disabled = false;
-      button.textContent = text;
-      // The label IS the result — 'Queued for 12 devices', 'Failed' —
-      // and a label rewritten in place is a silent DOM mutation to a
-      // screen reader, so the result is said once as well. Inside the
-      // branch, because the resting label is not a result.
-      if (text !== 'Re-identify') {
-        App.announce(text);
-        setTimeout(() => {
-          if (button.textContent === text) button.textContent = 'Re-identify';
-        }, 4000);
-      }
-    };
+    const settle = App.settleButton(button, 'Re-identify', 4000);
     button.disabled = true;
     button.textContent = 'Starting…';
     let result;
@@ -754,34 +716,12 @@
     link.hidden = false;
   }
 
-  /* Every module that knows a device links back to it — App.deviceLink,
-     alerts.js's loadDeviceLinks, snmp.js/syslog.js/ipam.js/wireless.js's own
-     copies — but Nodes never linked the other way. The device pane is the
-     page an operator is on first, during an outage, by construction: a
-     device went dark, so they opened the device. From there, "does this
-     have open alerts", "did its configuration change", "what has it
-     logged" used to mean switching tabs and re-finding the same device by
-     hand, in each one, four times.
-
-     Built the same way those inbound links already are — App.buildRoute,
-     and the exact query key or route part each target module's own
-     activate() already reads (alerts: ?device=, matching entity_label's
-     free-text filter the way an operator typing a name into that box
-     already would; ConfigRX: #/configrx/device/<id>, already read by its
-     activate(); syslog/snmp: ?source=<ip>, the same key loadDeviceLinks
-     below already uses for the identical question asked from an alert) —
-     not a fifth way to construct a route.
-
-     No count fetched per link: this runs on every drawDetailHeader, i.e.
-     every refresh tick for whichever device is selected, and a count would
-     mean a request per device per refresh to earn a number nothing else on
-     this line costs anything to show. A link with no number beats one that
-     costs a poll cycle per device.
-
-     Gated on canRead, not canWrite: these are read-only questions about the
-     device, asked from a pane an account with only Nodes read already
-     sees — an account without (say) Alerts read must not be shown a link
-     that only 403s. */
+  /* Links from the device pane out to what the other modules know about
+     the same device, through App.buildRoute and the exact query key each
+     target's own activate() already reads. No count is fetched per link:
+     this runs on every refresh tick for the selected device. Gated on
+     canRead — an account without Alerts read must not be shown a link that
+     only 403s. */
   function deviceCrossLinksHtml(d) {
     if (!d || !d.id) return '';
     const links = [];
@@ -920,18 +860,13 @@
   }
 
   /* Centered moving average over {ts, value} (raw) or {ts, avg, min, max}
-     (bucketed/rollup) points, for the Smoothed checkbox. Time-aware rather
-     than count-based: a count-based window meant a burst of 3 s focus-poll
-     samples smoothed over the same handful of points as 30 s of normal
-     polling, so the effective smoothing span swung with cadence instead of
-     staying put. The window instead targets a fixed ~90 s of wall-clock
-     time — clamp(round(90 / median spacing), 3, 25) — and shrinks at the
-     edges rather than reaching past the data. Only the `avg`/`value` column
-     is smoothed; `min`/`max` on a bucketed point pass through unchanged
-     (they're already a bucket's real extremes — averaging them would blur
-     out the spikes they exist to show). Whether the caller keeps or drops
-     those unsmoothed min/max afterwards is the caller's call (see
-     drawSeriesChart's band logic). */
+     (bucketed) points, for the Smoothed checkbox. Time-aware, not
+     count-based: a count-based window let the effective smoothing span swing
+     with polling cadence. It targets a fixed ~90 s of wall clock —
+     clamp(round(90 / median spacing), 3, 25) — and shrinks at the edges
+     rather than reaching past the data. Only `avg`/`value` is smoothed;
+     `min`/`max` are already a bucket's real extremes, and averaging them
+     would blur out the spikes they exist to show. */
   function movingAverage(points) {
     const n = points.length;
     if (n < 3) return points;
@@ -1467,7 +1402,7 @@
         `<td>${a.objects} object${a.objects === 1 ? '' : 's'}${a.capped ? ' (capped)' : ''}</td>` +
         `<td class="hint">${mib}</td></tr>`;
     }).join('')}</table>`
-      : (ev.hop ? '<p class="hint">No enterprise arcs answered.</p>' : '');
+      : (ev.hop ? App.emptyState('No enterprise arcs answered.') : '');
     const walk = ev.walk && ev.walk.objects != null && ev.hop
       ? `<p class="hint">Walked ${ev.walk.objects} object(s) in ${ev.hop.requests + (ev.walk.requests || 0)} ` +
         `request(s), ${(ev.walk.elapsed_s || 0).toFixed(1)}s` +
@@ -1622,7 +1557,7 @@
   function ifaceEventsHtml(ifIndex, payload) {
     const events = (((payload || view.events || {}).interface_events) || [])
       .filter((e) => e.if_index === ifIndex).sort((a, b) => b.ts - a.ts).slice(0, 20);
-    if (!events.length) return '<p class="hint">No events recorded for this port.</p>';
+    if (!events.length) return App.emptyState('No events recorded for this port.');
     return `<div class="table-wrap scrollbox small"><table><caption class="sr-only">Recent events on this port</caption>` +
       events.map((e) => `<tr><td>${App.timeCell(e.ts)}</td><td>${escape(e.kind)}</td>` +
         `<td class="msg">${escape(e.detail || '')}</td></tr>`).join('') +
@@ -2130,7 +2065,7 @@
         const dom = box.querySelector('#ifd-dom');
         if (!dom || !current()) return;
         if (!r.sensors || !r.sensors.length) {
-          dom.innerHTML = '<p class="hint">No DOM/sensor data available from this device for this port.</p>';
+          dom.innerHTML = App.emptyState('No DOM/sensor data available from this device for this port.');
           return;
         }
         dom.innerHTML = '<table><caption class="sr-only">Optics and environment sensors</caption><tr><th scope="col">Sensor</th><th scope="col">Value</th><th scope="col">Status</th></tr>' +
@@ -2153,7 +2088,7 @@
           return;
         }
         if (!r.macs || !r.macs.length) {
-          mac.innerHTML = '<p class="hint">No MAC addresses currently learned on this port.</p>';
+          mac.innerHTML = App.emptyState('No MAC addresses currently learned on this port.');
           return;
         }
         // The VLAN column only earns its place when the source actually knew
@@ -3019,12 +2954,7 @@
   }
 
   function selectReportsSub(name) {
-    for (const btn of document.querySelectorAll('#nodes-sub-reports > .subtabs > .subtab')) {
-      btn.classList.toggle('active', btn.dataset.subtab === name);
-    }
-    for (const page of document.querySelectorAll('#nodes-sub-reports > .subpage')) {
-      page.classList.toggle('active', page.id === `nd-rep-sub-${name}`);
-    }
+    App.selectSub('nodes', name, { host: 'nodes-sub-reports', prefix: 'nd-rep-sub-' });
   }
 
   /* ---------------------------------------------------------- bulk import
@@ -3200,18 +3130,13 @@
     const d = view.detail;
     const box = App.modal(`Edit ${displayName(d)}`, deviceForm(d), [
       { label: 'Cancel', onClick: App.closeModal },
-      // Both irreversible, both sat in the same row as Save with no visual
-      // weight of their own — a misclick between "Save" and "Remove" cost
-      // nothing to make and everything to notice. danger is the same tier
-      // confirmDestructive's own confirm button uses, and (see modal() in
-      // app.js) is peeled to the start of the row away from Save, so the
-      // two are no longer indistinguishable at a glance. Each still opens
-      // its own confirm rather than acting immediately.
-      // Harmless today only because the dialog itself needs nodes write to
-      // open at all (nd-edit-device carries data-requires-write) — but that
-      // is exactly why this should already match Remove below rather than
-      // wait for some other route into editDevice() to make it reachable
-      // on its own.
+      // Both irreversible, and a misclick between "Save" and "Remove" costs
+      // nothing to make and everything to notice. `danger` is the tier
+      // confirmDestructive's own confirm uses, and modal() peels it to the
+      // start of the row away from Save. Each still opens its own confirm.
+      // The canWrite gate is belt-and-braces — this dialog already needs
+      // nodes write to open — so a future route into editDevice() cannot
+      // reach it ungated.
       ...(App.canWrite('nodes') ? [{ label: 'Clear credential', danger: true, onClick: () => {
         App.confirmDestructive('Clear credential',
           `<p>Clear the SNMP credential stored on <b>${escape(displayName(d))}</b>?</p>` +
@@ -3255,7 +3180,7 @@
      to manage (a list, add, rename, remove). */
 
   function deviceGroupListHtml() {
-    if (!view.deviceGroups.length) return '<p class="hint">No groups yet.</p>';
+    if (!view.deviceGroups.length) return App.emptyState('No groups yet.');
     const rows = view.deviceGroups.map((g) => `
       <tr data-devgroup-id="${g.id}">
         <td><input type="text" class="devgroup-name" value="${escape(g.name)}"
@@ -3374,18 +3299,14 @@
       }, (confirmed) => { if (!confirmed) editDevice(); });
   }
 
-  /* The one window.open in the application. A separate window rather than a
-     modal because a shell is not a dialog: it is kept open beside the rest
-     of the product, resized, and lived in. The name keys it to the device,
-     so a second SSH click on the same device raises the window it already
-     has instead of opening a rival session. `noopener` cannot be in the
-     feature string for that: a window opened with it is treated as `_blank`,
-     the name is discarded, and every click would open another window and
-     another shell. Clearing `opener` on the handle does the same job — the
-     window is same-origin, so we still get the handle back — and focus()
-     raises the existing window on the second click. The display name rides
-     in the URL because displayName() is private here — the window replaces
-     it with whatever /api/ssh/devices/<id> reports. */
+  /* The one window.open in the application: a shell is not a dialog, it is
+     kept open beside the product, resized and lived in. The name keys the
+     window to the device, so a second click raises the session it already
+     has. `noopener` cannot be in the feature string for that — a window
+     opened with it is treated as `_blank` and the name is discarded, so
+     every click would open a rival shell; clearing `opener` on the
+     same-origin handle does the same job. The display name rides in the URL
+     and is replaced by whatever /api/ssh/devices/<id> reports. */
   function sshDevice() {
     if (!view.detail || !App.canWrite('ssh')) return;
     const d = view.detail;
@@ -3435,7 +3356,7 @@
   }
 
   function credentialsListHtml(credentials) {
-    if (!credentials.length) return '<p class="hint">No additional credentials yet.</p>';
+    if (!credentials.length) return App.emptyState('No additional credentials yet.');
     const rows = credentials.map((c) => `
       <tr>
         <td>${escape(c.label || '—')}</td>
@@ -3574,7 +3495,7 @@
       <label>Poll interval <input id="nd-p-interval" type="number" min="10" value="${p.poll_interval_s || 120}"> s</label>
       <label>SNMP timeout <input id="nd-p-timeout" type="number" step="0.5" min="0.5" value="${p.snmp_timeout_s || 3}"> s</label>
       <label>SNMP retries <input id="nd-p-retries" type="number" min="0" value="${p.snmp_retries != null ? p.snmp_retries : 2}"></label>
-      <div style="display:flex;justify-content:flex-start;gap:14px">
+      <div class="row start">
         <label class="check"><input type="checkbox" id="nd-p-ping" ${p.ping_enabled !== false ? 'checked' : ''}> Ping</label>${helpLinkNamed('nodes.profile.ping', 'Ping')}
         <label class="check"><input type="checkbox" id="nd-p-snmp" ${p.snmp_enabled !== false ? 'checked' : ''}> SNMP</label>${helpLinkNamed('nodes.profile.snmp', 'SNMP')}
       </div>
@@ -4518,8 +4439,7 @@
     const allow_ping_only = App.el('disc-pingonly').checked;
     const s = App.state.nodesSettings || {};
     const timeout = s.default_snmp_timeout_s || 3;
-    const number = (id, label, value, attrs = '') =>
-      `<label>${label} <input id="${id}" type="number" ${attrs} value="${value}"></label>`;
+    const { number } = App.form;
     // Per-scan timing only — the values apply to this one sweep and are
     // never written back to any profile or setting.
     App.modal(`Start discovery of ${target}`, `
@@ -4532,7 +4452,7 @@
       ${number('disc-o-snmpretry', 'SNMP retries (per credential)', 0, 'min=0 max=5')}`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Start scan', primary: true, onClick: async (box) => {
-        const num = (id) => Number(box.querySelector(id).value);
+        const { num } = App.form.readers(box);
         let result;
         try {
           result = await App.post('/api/nodes/discovery', {
@@ -4983,10 +4903,7 @@
 
   function settingsDialog() {
     const s = App.state.nodesSettings || {};
-    const check = (id, label, on) =>
-      `<label class="check"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}> ${label}</label>`;
-    const number = (id, label, value, attrs = '') =>
-      `<label>${label} <input id="${id}" type="number" ${attrs} value="${value}"></label>`;
+    const { check, number } = App.form;
     const detailChosen = new Set(String(s.detail_fields || '')
       .split(',').map((f) => f.trim()).filter(Boolean));
     const settingsBox = App.modal('Nodes settings', `
@@ -5105,8 +5022,7 @@
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
         { queued: 'Saving…', done: 'Saved' }, (async () => {
-        const on = (id) => box.querySelector(id).checked;
-        const num = (id) => Number(box.querySelector(id).value);
+        const { on, num } = App.form.readers(box);
         await App.post('/api/settings', { scope: 'nodes', values: {
           enabled: on('#np-enabled'), poll_workers: num('#np-workers'),
           default_interval_s: num('#np-interval'), focus_poll_interval_s: num('#np-focus'),
@@ -5191,10 +5107,7 @@
       loadDiscJobsIfNeeded(),
       topologyVisible() ? loadTopology().catch(() => {}) : Promise.resolve(),
     ]);
-    // A newer refresh already redrew this — a filter or page change, or the
-    // operator leaving this tab, while the above was in flight — so this
-    // answer (built from filters/offset that may no longer be current) must
-    // not overwrite what the newer one already painted.
+    // A newer refresh already redrew this, or the operator has left.
     if (view.refreshGen !== generation || App.state.tab !== 'nodes') return;
     view.devices = devices.devices;
     view.pageTotal = devices.total != null ? devices.total : view.devices.length;
@@ -5498,69 +5411,31 @@
        however long the device took to answer. Completion is the device's own
        last_poll_ts moving; `polling` (the server's live worker state) is what
        distinguishes still-running from queued behind other work. */
-    App.el('nd-poll-now').onclick = async () => {
+    App.el('nd-poll-now').onclick = () => {
       const button = App.el('nd-poll-now');
       const deviceId = view.selected;
       if (!deviceId || button.disabled) return;
-      const before = (view.devices.find((d) => d.id === deviceId) || {}).last_poll_ts || 0;
-      const settle = (text) => {
-        button.disabled = false;
-        button.textContent = text;
-        // The label IS the result — 'Queued for 12 devices', 'Failed' —
-        // and a label rewritten in place is a silent DOM mutation to a
-        // screen reader, so the result is said once as well. Inside the
-        // branch, because the resting label is not a result.
-        if (text !== 'Poll now') {
-          App.announce(text);
-          setTimeout(() => {
-            if (button.textContent === text) button.textContent = 'Poll now';
-          }, 2500);
-        }
-      };
-      button.disabled = true;
-      button.textContent = 'Polling…';
-      try {
-        const result = await App.post(`/api/nodes/devices/${deviceId}/poll`, {});
-        if (result && result.queued === false) {
-          // A poll for this device was already in flight, so this click
-          // started nothing. Watching last_poll_ts from here would report
-          // "Polled" off the other poll's completion.
-          settle('Already polling…');
-          return;
-        }
-      } catch (error) {
-        settle('Failed');
-        return;
-      }
-      // Bounded: a device on a long SNMP timeout with retries can genuinely
-      // take a while, and giving up silently would put us back where we
-      // started — so say it is still going rather than pretend it finished.
-      const deadline = Date.now() + 90000;
-      const check = async () => {
+      App.watchJob(button, {
+        post: `/api/nodes/devices/${deviceId}/poll`,
+        poll: `/api/nodes/devices/${deviceId}`,
+        tsKey: 'last_poll_ts',
+        before: (view.devices.find((d) => d.id === deviceId) || {}).last_poll_ts || 0,
+        busyKey: 'polling',
         // Stop if the operator moved on: another device, or another tab.
-        if (view.selected !== deviceId || App.state.tab !== 'nodes') {
-          settle('Poll now');
-          return;
-        }
-        let payload;
-        try {
-          payload = await App.get(`/api/nodes/devices/${deviceId}`);
-        } catch (error) {
-          settle('Poll now');
-          return;
-        }
-        const device = payload.device || {};
-        if ((device.last_poll_ts || 0) > before) {
+        alive: () => view.selected === deviceId && App.state.tab === 'nodes',
+        deadlineMs: 90000,
+        // 'Already polling…': a poll for this device was already in flight,
+        // so this click started nothing, and watching last_poll_ts from here
+        // would report "Polled" off the other poll's completion.
+        labels: { resting: 'Poll now', queueing: 'Polling…', queued: 'Queued…',
+          accepted: 'Polling…', busy: 'Polling…',
+          already: 'Already polling…', holdMs: 2500 },
+        done: async (device, settle) => {
           settle('Polled');
           await loadDetail();
           App.refreshNow('nodes');
-          return;
-        }
-        if (Date.now() > deadline) { settle('Still running…'); return; }
-        button.textContent = device.polling ? 'Polling…' : 'Queued…';
-        setTimeout(check, 1000);
-      };
-      setTimeout(check, 600);
+        },
+      });
     };
     App.filterBar('nodes', {
       text: ['nd-q'],
@@ -5610,12 +5485,8 @@
       App.refreshNow('nodes');
     };
     App.el('nd-settings').onclick = settingsDialog;
-    App.el('nd-toggle').onclick = async () => {
-      const running = (App.state.serverState.nodes || {}).running;
-      await App.post('/api/nodes/collector', { action: running ? 'stop' : 'start' });
-      await App.loadState();
-      App.refreshNow('nodes');
-    };
+    App.wireToggle('nd-toggle', 'nodes', '/api/nodes/collector',
+      () => App.refreshNow('nodes'));
     App.el('disc-start').onclick = startDiscovery;
     App.el('disc-promote').onclick = promoteSelected;
 
@@ -5652,13 +5523,7 @@
     // The device table's own redraw is here too: narrowDevicePane() reads
     // live layout, so crossing the width where Response/Vendor default off
     // only takes effect once something asks the table to redraw.
-    for (const event of ['resize', 'panes-resized']) {
-      window.addEventListener(event, () => {
-        if (App.state.tab !== 'nodes') return;
-        drawStatusTimeline();
-        drawTable();
-      });
-    }
+    App.onRelayout('nodes', () => { drawStatusTimeline(); drawTable(); });
 
     // Last thing in init(): every list this page builds above is filled and
     // nothing has been fetched, so refresh() reads the restored values out
@@ -5677,12 +5542,7 @@
   }
 
   function selectSub(name) {
-    for (const btn of document.querySelectorAll('#page-nodes > .subtabs > .subtab')) {
-      btn.classList.toggle('active', btn.dataset.subtab === name);
-    }
-    for (const page of document.querySelectorAll('#page-nodes > .subpage')) {
-      page.classList.toggle('active', page.id === `nodes-sub-${name}`);
-    }
+    App.selectSub('nodes', name);
     // Coming back to Discovery: the live re-fetch was off while this pane was
     // hidden, so whatever the selected sweep found in the meantime is not on
     // screen yet. One fetch now rather than waiting for the next tick — and
@@ -5700,29 +5560,18 @@
   }
 
   function selectDetailSub(name) {
-    for (const btn of document.querySelectorAll('#nd-detail .subtabs > .subtab')) {
-      btn.classList.toggle('active', btn.dataset.subtab === name);
-    }
-    for (const page of document.querySelectorAll('#nd-detail .subpage')) {
-      page.classList.toggle('active', page.id === `nd-d-sub-${name}`);
-    }
+    App.selectSub('nodes', name, { host: 'nd-d-subs', prefix: 'nd-d-sub-' });
   }
 
   /* ------------------------------------------------ upstream suggestions
 
-     alertrules.py's ROLLED_UP_BY comment explains why a device's alerts get
-     folded under its upstream's outage rather than opening 108 device_down
-     and 108 packet_loss_high alerts for one switch going dark: it needs
-     devices.upstream_id set, and that comment is explicit that a guessed
-     neighbour match may never drive that on its own. Before this dialog the
-     only way to set it was one Edit dialog per device — thousands of clicks
-     with a topology diagram open in another window to know what to type, at
-     fleet scale. This is the other half: nodesdb.upstream_suggestions()
-     already computed the same LLDP/CDP matches the Topology diagram draws,
-     for every device with no upstream_id yet; this dialog is what turns one
-     of those into an operator's decision instead of a guess. Nothing here
-     ever applies one on its own — every assignment sent to the apply route
-     came from a checkbox or a radio an operator actually set. */
+     Rolling a device's alerts up under its upstream's outage (alertrules.py's
+     ROLLED_UP_BY) needs devices.upstream_id set, and a guessed neighbour
+     match may never drive that on its own. nodesdb.upstream_suggestions()
+     computes the same LLDP/CDP matches the Topology diagram draws; this
+     dialog is what turns one into an operator's decision. Nothing here ever
+     applies one by itself — every assignment sent to the apply route came
+     from a checkbox or a radio an operator actually set. */
 
   const CONFIDENCE_COLOR = { high: 'var(--ok)', medium: 'var(--warn)', low: 'var(--muted)' };
   const MATCH_KIND_LABEL = { chassis_mac: 'MAC address match', sys_name: 'name match' };

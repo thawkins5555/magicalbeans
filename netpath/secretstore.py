@@ -1,64 +1,9 @@
-"""The portable secret store: a stand-in for Windows DPAPI on hosts that
-don't have it, for the one design CREDENTIAL-SECURITY.md's analysis calls
-"genuinely equivalent to DPAPI for the file-theft case" — a passphrase
-supplied at start-up, a key derived from it with scrypt, held in memory and
-never written to disk. `dpapi.py` is the module every caller in this
-application actually imports; this one is the implementation it dispatches
-to when `os.name != "nt"` and a passphrase source is configured. See
-CREDENTIAL-SECURITY.md, "The portable secret store", for the full analysis
-of why this design was chosen over a key file beside the database (protects
-against nothing) or the platform keyring (wrong fit for a headless server,
-and a third-party dependency this application does not take).
-
-What this module does NOT try to be: a key-file scheme. The 32-byte "key"
-that actually encrypts data is derived from the passphrase every time it is
-needed (and then cached in memory, keyed on which passphrase produced it,
-so a changed passphrase source is noticed rather than masked by the
-cache — see `_keys_for`) — nothing that could decrypt a stored credential
-is ever written to disk. What IS written to disk is a per-install salt
-(`_salt_path`), which is not a secret: its only job is
-to make the same passphrase derive a different key on every install, so a
-password reused across two installs of this application does not hand an
-attacker who breaks one of them a working key for the other. An attacker who
-already has the salt file gains nothing without the passphrase too.
-
-Blob format (see `protect`/`_unpack` for the exact byte layout):
-
-    MAGIC(4) | version(1) | scrypt_n(4) | scrypt_r(4) | scrypt_p(4) |
-    nonce(16) | ciphertext(len(plaintext)) | mac(32)
-
-`MAGIC` (b"NPSS") is what lets `dpapi.py` tell a portable-store blob apart
-from an opaque DPAPI blob without guessing — a real DPAPI blob is CMS-ish
-binary with no reason to ever start with these four bytes, but the tag
-means `dpapi.py` doesn't have to rely on that being merely unlikely, it can
-dispatch on it directly. The scrypt parameters travel with every blob (not
-just implied by this module's current constants) so that raising the cost
-in a future release doesn't strand credentials encrypted under the old one:
-`unprotect` always uses whatever a blob says was used to make it.
-
-Encryption is encrypt-then-MAC: a keystream is built by running
-HMAC-SHA256(key_enc, nonce || counter) for successive 32-bit counters and
-concatenating the digests, then XORed with the plaintext — the textbook
-"keyed hash in counter mode" construction, built entirely from
-`hashlib`/`hmac`, no invented cipher. `key_enc` and `key_mac` are two
-independent 32-byte keys, both derived from the same scrypt output with
-distinct HMAC labels (see `_derive_keys`) — never the same bytes doing two
-jobs. The MAC covers version || nonce || ciphertext, exactly as the design
-brief for this module specifies, and NOT the header's own salt/n/r/p fields
-explicitly — it does not need to. Those fields feed the key derivation, so
-an attacker who tampers with them derives a different key_mac than the one
-that produced the stored MAC, and the comparison fails anyway. The MAC
-comparison itself is `hmac.compare_digest`, not `==` — constant-time, so a
-timing side channel cannot be used to guess the MAC one byte at a time.
-
-What this module deliberately does not solve: re-keying. A credential
-encrypted under one passphrase stays encrypted under it; there is no re-key
-operation. Changing the passphrase means every stored credential becomes
-undecryptable and has to be re-entered — see CREDENTIAL-SECURITY.md. What it
-does solve is a rotated passphrase *source* being noticed: a corrected or
-rotated passphrase file (or environment variable) takes effect on the very
-next `protect()`/`unprotect()` call this process makes, not only after a
-restart — see `_keys_for`'s docstring for the defect this fixes.
+"""The portable secret store: a stand-in for Windows DPAPI on hosts without
+it. A start-up passphrase is stretched with scrypt into an encrypt-then-MAC
+key pair (HMAC-SHA256 counter-mode cipher, constant-time MAC compare), kept
+in memory only. Blob: MAGIC(4)|version(1)|scrypt_n/r/p(4 each)|nonce(16)|
+ciphertext|mac(32) — see `protect`/`_unpack`. No re-keying: a changed
+passphrase strands every credential encrypted under the old one.
 """
 
 from __future__ import annotations
@@ -75,10 +20,8 @@ from collections import OrderedDict
 MAGIC = b"NPSS"
 VERSION = 1
 
-# OWASP Password Storage Cheat Sheet, 2024 figures — the same figures
-# auth.py uses for login password hashing (see auth.py's SCRYPT_N/R/P).
-# Recorded in every blob rather than only assumed, so raising these later
-# does not break decrypting what is already stored (see module docstring).
+# Same figures auth.py uses for login password hashing. Recorded in every
+# blob (not just assumed) so raising these later doesn't strand old blobs.
 SCRYPT_N = 1 << 17
 SCRYPT_R = 8
 SCRYPT_P = 1
@@ -87,18 +30,9 @@ SALT_BYTES = 16
 NONCE_BYTES = 16
 MAC_BYTES = 32          # SHA-256 digest size
 
-# A fixed ceiling on the memory any single scrypt call may use, sized to
-# exactly what SCRYPT_N/R/P above need. (n, r, p) for unprotect() come from
-# the blob's own header, not from these constants — that is the whole point
-# of recording them, so a future release can raise the cost without
-# breaking older blobs — but a blob's header is also the one place in this
-# module that is not fully trusted (a corrupted file, or a deliberately
-# hostile one). Deriving `maxmem` from n*r themselves, the way auth.py does
-# for its own always-trusted constants, would let a blob claiming a huge n
-# ask this process to allocate however much memory it likes; capped at a
-# fixed ceiling instead, an oversized claim fails fast with ValueError
-# (caught below and turned into SecretStoreError) rather than trying to
-# honour it.
+# Fixed ceiling, not derived from the blob's own (untrusted) n/r/p header —
+# a hostile blob claiming a huge n must fail fast, not get however much
+# memory it asks for.
 _SCRYPT_MAXMEM = SCRYPT_N * SCRYPT_R * 256
 
 ENV_PASSPHRASE_FILE = "NETPATH_SECRET_PASSPHRASE_FILE"
@@ -115,24 +49,15 @@ class SecretStoreError(Exception):
 
 def configured() -> bool:
     """A passphrase source is named, whether or not it will actually work
-    once read (bad file permissions, an empty file, a garbled scrypt
-    parameter...). Mirrors dpapi.available() being just `os.name == "nt"`
-    regardless of whether CryptProtectData will actually succeed — the
-    detailed reason for failure, if there is one, surfaces from protect()
-    or unprotect(), not from this cheap, side-effect-free check. Called by
-    dpapi.available(), which is what the web UI gates every credential
-    field on."""
+    once read — mirrors dpapi.available()'s cheap, side-effect-free check;
+    a detailed failure surfaces from protect()/unprotect() instead."""
     return bool(os.environ.get(ENV_PASSPHRASE_FILE) or os.environ.get(ENV_PASSPHRASE))
 
 
 def _load_passphrase() -> bytes:
-    """The passphrase, per the documented order: a file (preferred — the
-    only source an unattended restart can plausibly use safely, and even
-    then only if nothing but its owner can read it), then a plain
-    environment variable (documented as weaker: visible to anything that
-    can read this process's environment, e.g. /proc/<pid>/environ), then a
-    refusal naming both. Raises SecretStoreError with a message meant to be
-    shown to whoever configured this, not logged and hidden from them."""
+    """The passphrase: a file (preferred, owner-only readable) then a plain
+    env var (weaker — visible via /proc/<pid>/environ), then
+    SecretStoreError naming both, meant to be shown to whoever configured this."""
     file_path = os.environ.get(ENV_PASSPHRASE_FILE)
     if file_path:
         try:
@@ -182,11 +107,8 @@ def _load_passphrase() -> bytes:
 
 def _default_data_dir() -> str:
     """The same folder __main__.default_db_path() puts the databases in.
-    Duplicated here rather than imported — this module has no business
-    depending on the entry point, and the test suite constructs a Service
-    directly over throwaway database paths without ever importing
-    __main__ — but the resolution logic itself must stay identical, since
-    a salt file that moves between runs is a salt file that stops working."""
+    Duplicated rather than imported (this module has no business depending
+    on the entry point), but must stay identical or the salt file moves."""
     if os.name == "nt":
         base = os.environ.get("APPDATA", os.path.expanduser("~"))
     else:
@@ -202,11 +124,8 @@ def _salt_path() -> str:
 
 
 def _install_salt() -> bytes:
-    """A random value generated once per install and kept next to the
-    databases it protects (mode 600, like them — not because the salt is
-    secret, but because there is no reason to advertise it either). Not
-    itself part of the key: it is scrypt input, there so the same
-    passphrase does not derive the same key on two different installs."""
+    """Generated once per install; scrypt input, not a secret itself — its
+    job is making the same passphrase derive a different key per install."""
     path = _salt_path()
     try:
         with open(path, "rb") as fh:
@@ -306,12 +225,7 @@ def _derive_keys(passphrase: bytes, salt: bytes, n: int, r: int, p: int) -> tupl
         master = hashlib.scrypt(passphrase, salt=salt, n=n, r=r, p=p, dklen=32,
                                 maxmem=_SCRYPT_MAXMEM)
     except ValueError as exc:
-        # Belt and suspenders: _sane_scrypt_params() above is meant to be
-        # the real guard, but a genuinely valid, in-range (n, r, p) can
-        # still ask for more than _SCRYPT_MAXMEM allows (a lower-N blob
-        # from an older, cheaper release never will; a higher one, from a
-        # release with a raised default, correctly can) — land here rather
-        # than as a raw ValueError out of a MAC-checking function.
+        # Belt and suspenders: an in-range (n, r, p) can still exceed _SCRYPT_MAXMEM.
         raise SecretStoreError(
             f"This credential's stored scrypt parameters (n={n}, r={r}, "
             f"p={p}) ask for more memory than this build allows: {exc}") from exc
@@ -321,55 +235,12 @@ def _derive_keys(passphrase: bytes, salt: bytes, n: int, r: int, p: int) -> tupl
 
 
 def _keys_for(n: int, r: int, p: int) -> tuple[bytes, bytes]:
-    """The derived keys for one (n, r, p, passphrase) combination, computed
-    once and cached in memory for the rest of the process — "held in
-    memory only" is the property this design is chosen for, and
-    re-running scrypt on every single protect()/unprotect() call
-    (nodepoll.py alone can make one of these calls per device, per poll
-    cycle) would be needlessly slow without buying anything extra: the raw
-    passphrase is not what is being protected by not caching it, the
-    derived key already is the secret.
-
-    The passphrase source is read fresh on *every* call, cache hit or
-    miss — that part is cheap (a small file, or a single environment
-    variable lookup) — and a digest of what it returns is folded into the
-    cache key alongside (n, r, p). This used to cache on (n, r, p) alone,
-    which are the same three module constants on every protect() call;
-    the very first key derived in a process satisfied every later
-    protect() in that process, forever, and the passphrase source was
-    never looked at again. An operator who believed their passphrase had
-    leaked, rewrote the passphrase file, and re-entered every stored
-    credential through the UI was silently re-encrypting all of them
-    under the OLD, leaked key, because nothing ever missed that cache
-    entry to notice the file had changed — this docstring used to claim
-    "a corrected/rotated passphrase file takes effect on the next key
-    this process has not already derived", which was false in practice,
-    since there was never such a key. Hashing the passphrase into the
-    cache key fixes that: a changed passphrase produces a different
-    digest, which misses the cache and re-derives, so a corrected or
-    rotated passphrase file takes effect on the very next
-    protect()/unprotect() call this process makes — no restart required.
-    A cache miss for an unchanged passphrase still means only one of two
-    things: the first call in this process, or a blob made under
-    different scrypt parameters after this module's defaults changed in a
-    later release.
-
-    Only a digest of the passphrase is ever kept in the cache — never the
-    passphrase itself — the same reasoning the module docstring gives for
-    not writing it to disk applies equally to not holding it in memory
-    any longer than the one call that needs it.
-
-    Two consequences of reading the source on every call, both deliberate
-    and neither free. The read is a stat and a short file read per
-    protect()/unprotect(), which nodepoll can make once per device per poll
-    cycle; that is a syscall pair against a page the OS has cached, against
-    an scrypt run this still avoids. And a passphrase source that becomes
-    unreadable AFTER startup — the file deleted, its permissions tightened,
-    a transient I/O error — now fails the next credential operation instead
-    of being masked indefinitely by a cache that never looked again. That
-    is the correct behaviour for a store whose whole contract is "the
-    configured passphrase decides", but it is a change: the failure surfaces
-    at the next poll rather than at the next restart."""
+    """The derived keys for one (n, r, p, passphrase) combination, cached in
+    memory keyed on (n, r, p, sha256(passphrase)) rather than (n, r, p)
+    alone — the passphrase source is re-read every call (cheap) so a
+    rotated file or env var re-derives and takes effect immediately, not
+    only after a restart. Only the passphrase's digest is ever cached,
+    never the passphrase itself."""
     passphrase = _load_passphrase()
     passphrase_tag = hashlib.sha256(passphrase).digest()
     cache_key = (n, r, p, passphrase_tag)

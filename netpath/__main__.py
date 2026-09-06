@@ -212,25 +212,10 @@ def run_headless(args) -> int:
         # which can land while the interpreter is anywhere at all.
         stop_event.set()
 
-    # RUNBOOK.md's documented way to stop this service is `systemctl
-    # stop sappiwhere` (or `restart`) on Linux and `nssm stop SappiWhere` on
-    # Windows, and both deliver SIGTERM. Its default disposition kills the
-    # process outright, which skipped the `finally` below entirely — ten
-    # SQLite databases killed mid-WAL-checkpoint, open SSH sessions to live
-    # network devices simply gone, and an in-flight trace never drained.
-    # SIGINT gets the same handler for consistency and because a plain
-    # `kill` from a shell defaults to it too; the `except KeyboardInterrupt`
-    # below stays as a fallback for whatever this loop does not cover, so an
-    # interactive Ctrl+C still works even if, for some reason, no handler
-    # below was installed. SIGBREAK is what NSSM actually delivers to a
-    # console process on `nssm stop` on Windows — it has no true SIGTERM —
-    # so it is handled the same way there, when Python defines it at all.
-    #
-    # Guarded rather than called bare: signal.signal raises ValueError when
-    # called off the main thread, and this is reachable from contexts other
-    # than a plain `python -m netpath` launch, so a platform or thread that
-    # cannot install a handler degrades to the old Ctrl+C-only behaviour
-    # instead of crashing the service on startup.
+    # SIGTERM (systemctl stop / nssm stop) defaults to killing the process
+    # outright, skipping the `finally` below — SIGBREAK is what NSSM actually
+    # sends on Windows. Guarded: signal.signal raises off the main thread, so
+    # that degrades to Ctrl+C-only rather than crashing on startup.
     for _sig_name in ("SIGTERM", "SIGINT", "SIGBREAK"):
         _sig = getattr(signal, _sig_name, None)
         if _sig is None:
@@ -287,21 +272,10 @@ def _line_buffer_stdio() -> None:
 
     CPython only line-buffers a stream connected to a terminal; redirected to
     a file or a pipe — exactly what a service manager gives it — it switches
-    to block buffering, and holds output in an 8 KB buffer until that fills
-    or the process exits. That is invisible in a console window, where every
-    print appears to work, and it is exactly how this went unnoticed: nothing
-    here is wrong until something downstream is watching the log rather than
-    the terminal. Measured on this machine: run_headless's banner sat in the
-    buffer for the full two minutes a redirected run was left running, with
-    the server already answering requests the whole time. Whoever is
-    watching that log concludes the process never started when it is
-    actually up, but the worse case is the line right below this one -
-    the "serving ... without TLS" warning exists to reach someone before
-    they type a password into an unencrypted page, and a buffered process
-    can run for hours without ever printing it. Reconfiguring both streams
-    once, here, before run_headless or run_console prints anything, fixes
-    every print in the process rather than chasing flush=True through each
-    call site one at a time.
+    to block buffering and can hold output for hours with the server already
+    answering requests, including the "serving ... without TLS" warning that
+    exists to reach someone before they type a password into an unencrypted
+    page. Reconfigured once, here, rather than chasing flush=True per call site.
     """
     for name in ("stdout", "stderr"):
         stream = getattr(sys, name, None)

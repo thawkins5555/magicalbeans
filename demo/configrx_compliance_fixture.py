@@ -1,54 +1,34 @@
 #!/usr/bin/env python3
 """A realistic ConfigRX compliance demonstration — not a unit test.
 
-`netpath/configrx_search.py` and `netpath/configrx_compliance.py` have unit
-tests, but nobody had ever run a plant's actual day-one rule set against
-REAL captures and looked at what came out. This script is that run: it
-pulls real configs over real SSH from five of demo/fake_ssh.py's personas
-(four purpose-built access switches plus the existing "fortinet" persona,
-reused as an out-of-scope device — see fake_ssh.py's own ACC_*_CONFIG
-comment for why those four exist), builds the five rules a network
-engineer would genuinely write first, evaluates them, and prints the
-result the way an operator would read it: which devices pass, which fail,
-which rules they fail, and how long the whole fleet took.
+Runs a plant's day-one rule set against REAL captures pulled over real SSH
+from five of demo/fake_ssh.py's personas (four purpose-built access
+switches plus "fortinet" as an out-of-scope device), evaluates the five
+rules a network engineer would write first, and prints which devices
+pass, which fail, which rules they fail, and how long the fleet took.
 
     python3 demo/configrx_compliance_fixture.py [--out demo/out/configrx_compliance]
 
-Offline by design — see the module docstring's own note in
-configrx_search.py about why this whole feature was built to work without
-a running app: two throwaway SQLite databases in --out, real SSH servers
+Offline by design: two throwaway SQLite databases in --out, SSH servers
 this script starts itself on loopback ports nothing else uses, no HTTP,
-no app, no fleet.py, no port conflict with a live scale campaign.
+no app, no fleet.py.
 
-Two things this run establishes that a synthetic string test cannot,
-because they only show up against real device text and a real evaluation:
+Establishes two things a synthetic string test cannot: whether the
+250-character line cap (configrx_compliance.MAX_LINE_CHARS_FOR_MATCH) is
+comfortable against a real Cisco running-config's longest lines, and
+whether the redaction boundary holds — acc-legacy's plaintext password is
+unfindable by literal search in the redacted index, yet the same line
+still fails its compliance rule (which reads the real capture, not the
+index).
 
-  1. Whether the 250-character line cap (configrx_search.
-     MAX_LINE_CHARS_FOR_MATCH) and the compliance-per-line design it drives
-     are comfortable against a real Cisco running-config's longest lines,
-     not just synthetic worst cases.
-  2. Whether the redaction boundary holds in practice: acc-legacy's
-     plaintext password line is exactly the case where the cross-device
-     search index must contain "<redacted>" and never the password itself
-     — this script searches for the literal password value and asserts it
-     is unfindable, then asserts the SAME line still fails its compliance
-     rule (which reads the real capture, not the redacted index — see
-     configrx_compliance.py's own module docstring for why that is the
-     right design, not an oversight).
-
-It also surfaces something neither of those was looking for: a rule that
-checks a SECRET-SHAPED VALUE (a specific SNMP community string, not just
-"is a community configured at all") can only ever be meaningfully
-evaluated against a device with store_secrets on — a redacted capture
-replaces "public" and "MySecretCommunity2026" with the identical literal
-"<redacted>" token, so the rule cannot tell a default community from a
-good one once redaction has run. A rule checking whether a directive
-merely EXISTS (telnet enabled, a plaintext-password marker) is unaffected,
-because redaction preserves a line's shape — see configrx_redact.py's own
-docstring — and only replaces the token inside it. This script
-demonstrates both halves: the SNMP rule run once against a store_secrets
-capture (where it works) and once against a normally-redacted one (where
-it cannot), side by side.
+It also surfaces a case neither of those was looking for: a rule checking
+a SECRET-SHAPED VALUE (a specific SNMP community, not just "is one
+configured") can only be meaningfully evaluated with store_secrets on —
+redaction replaces every community with the same "<redacted>" token, so
+the rule cannot tell a default from a good one once redacted. A rule
+checking a directive merely EXISTS is unaffected, since redaction
+preserves a line's shape. This script runs the SNMP rule once with
+store_secrets on and once normally redacted, side by side.
 """
 
 from __future__ import annotations
@@ -69,7 +49,6 @@ import paramiko  # noqa: E402
 
 from demo import fake_ssh  # noqa: E402
 from netpath import configrx, configrx_compliance, configrx_redact  # noqa: E402
-from netpath import configrx_search, configrx_vendors  # noqa: E402
 from netpath.configrxdb import ConfigRxDatabase  # noqa: E402
 from netpath.nodesdb import NodesDatabase  # noqa: E402
 from stubs import stub_ssh_device  # noqa: E402
@@ -130,7 +109,7 @@ def pull_real_capture(persona_name: str, vendor_key: str) -> tuple[str, str]:
     _pull_config exactly as ConfigRxWorker._backup_device does. Not a
     string handed straight to the database — see the module docstring."""
     persona = fake_ssh.PERSONAS[persona_name]
-    vendor = configrx_vendors.resolve(vendor_key)
+    vendor = configrx.resolve(vendor_key)
     device = stub_ssh_device.StubDevice(persona=persona)
     try:
         client = connect(device.port)
@@ -218,7 +197,7 @@ def main() -> int:
         # Exactly configrx.py's own _backup_device split: the STORED backup
         # respects store_secrets (verbatim when it's on); the cross-device
         # SEARCH index is redacted unconditionally, regardless — see
-        # configrx_search.py's module docstring for why that is stricter
+        # configrx_compliance.py's module docstring for why that is stricter
         # than the storage decision on purpose.
         if store_secrets:
             stored_text = cleaned
@@ -237,8 +216,8 @@ def main() -> int:
          for line in (configrx_db.backup_content(configrx_db.backups_for(device_ids[name], limit=1)[0]["id"])
                      or "").split("\n")), default=0)
     print(f"\nLongest single line across every real capture: {longest_line} characters "
-         f"(configrx_search.MAX_LINE_CHARS_FOR_MATCH is "
-         f"{configrx_search.MAX_LINE_CHARS_FOR_MATCH}).")
+         f"(configrx_compliance.MAX_LINE_CHARS_FOR_MATCH is "
+         f"{configrx_compliance.MAX_LINE_CHARS_FOR_MATCH}).")
 
     print("\nBuilding the plant's day-one rule set (4 fleet-wide rules, 1 scoped "
          "to Access Switches):")
@@ -284,7 +263,7 @@ def main() -> int:
     print("\n" + "=" * 72)
     print("Redaction boundary: does search leak what compliance is allowed to see?")
     print("=" * 72)
-    result = configrx_search.search(configrx_db, LEGACY_PLAINTEXT_PASSWORD, mode="text")
+    result = configrx_compliance.search(configrx_db, LEGACY_PLAINTEXT_PASSWORD, mode="text")
     print(f"Searching for the literal plaintext password value "
          f"({LEGACY_PLAINTEXT_PASSWORD!r}): {len(result['matches'])} match(es) "
          f"— {'LEAK' if result['matches'] else 'not findable, as designed'}.")
@@ -307,7 +286,7 @@ def main() -> int:
         raw_backup_id = configrx_db.backups_for(demo_device_id, limit=1)[0]["id"]
         raw_text = configrx_db.backup_content(raw_backup_id)
         redacted_text, _ = configrx_redact.redact(raw_text)
-        snmp_rule = configrx_search.compile_bounded(RULES[1][2])
+        snmp_rule = configrx_compliance.compile_bounded(RULES[1][2])
         raw_hit = bool(snmp_rule.search(raw_text))
         redacted_hit = bool(snmp_rule.search(redacted_text))
         print(f"acc-sw-104's real capture (store_secrets=True, as captured): "

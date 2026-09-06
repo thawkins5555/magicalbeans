@@ -1,6 +1,6 @@
 /* The Wireless page: an at-a-glance table of Fortinet APs behind one or
    more FortiGate Wireless Controllers, polled over SNMP (the controller
-   only — never the APs themselves). Modeled on snmp.js's table+detail
+   only — never the APs themselves). Modeled on events.js's table+detail
    layout, without the histogram (a handful of controllers generates
    nothing worth charting). Controller CRUD lives in its own modal,
    reached from the status strip, the same way Nodes' device-group
@@ -22,12 +22,8 @@
     apSort: App.recallSort('wireless-aps', { key: 'name', descending: false }),
   };
 
-  // One implementation, in app.js. This was twelve copies of the same
-  // three lines, which is how one of them came to be missing a
-  // character while the others were not.
   const escape = App.escapeHtml;
 
-  // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = App.ago;
 
   /* Fortinet's AP states mapped onto the five tones App.statusMark draws.
@@ -47,9 +43,6 @@
   function drawStatus() {
     const server = App.state.serverState || {};
     const wireless = server.wireless || { counters: {} };
-    App.setText(App.el('wl-status'), wireless.status || 'Poller stopped');
-    App.setBg(App.el('wl-dot'), wireless.running ? 'var(--ok)' : 'var(--line)');
-    App.setText(App.el('wl-toggle'), wireless.running ? 'Stop poller' : 'Start poller');
     const counts = wireless.ap_counts || {};
     const c = wireless.counters || {};
     const parts = [`${wireless.controller_count || 0} controller(s)`,
@@ -57,7 +50,8 @@
       `${counts.offline || 0} offline`];
     if (counts.out_of_service) parts.push(`${counts.out_of_service} out of service`);
     parts.push(`${c.polls || 0} polls · ${c.errors || 0} errors`);
-    App.setText(App.el('wl-counters'), parts.join(' · '));
+    App.strip('wl', wireless, { stopped: 'Poller stopped', start: 'Start poller',
+      stop: 'Stop poller', parts });
     App.setText(App.el('wl-last-reported'), view.lastReportedTs
       ? `last reported ${ago(view.lastReportedTs)}` : 'never reported');
   }
@@ -457,9 +451,8 @@
     }
 
     const search = await App.get('/api/wireless/aps', {
-      q: App.el('wl-q').value.trim(),
+      ...App.filterValues('wl', ['q', 'state']),
       controller_id: filterSelect.value || undefined,
-      state: App.el('wl-state').value,
     });
     view.aps = search.aps;
     view.lastReportedTs = search.last_reported_ts;
@@ -483,9 +476,8 @@
 
   function exportApsCsv() {
     App.exportCsv('/api/wireless/aps/export.csv', {
-      q: App.el('wl-q').value.trim(),
+      ...App.filterValues('wl', ['q', 'state']),
       controller_id: App.el('wl-controller').value || undefined,
-      state: App.el('wl-state').value,
     });
   }
 
@@ -526,12 +518,8 @@
           App.refreshNow('wireless');
         });
     };
-    App.el('wl-toggle').onclick = async () => {
-      const running = (App.state.serverState.wireless || {}).running;
-      await App.post('/api/wireless/collector', { action: running ? 'stop' : 'start' });
-      await App.loadState();
-      App.refreshNow('wireless');
-    };
+    App.wireToggle('wl-toggle', 'wireless', '/api/wireless/collector',
+      () => App.refreshNow('wireless'));
 
     // Last thing in init(): refresh() reads all three straight off the DOM,
     // so the first search already carries them.

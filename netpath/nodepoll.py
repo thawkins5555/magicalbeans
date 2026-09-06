@@ -27,11 +27,12 @@ from .nodediscover import DiscoveryJob
 from .nodeoids import DEFAULT_SNMP_PORT
 from .nodesdb import NodesDatabase, detected_vendor
 from .snmppoll import (
-    ERROR_STATUS, PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_REPORT, Response,
+    PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_REPORT, Response,
     SnmpError, SnmpTimeout, SnmpUnsupported, build_request, build_v3_request,
     decode_response, discovery_probe,
 )
 from .trapdecode import localized_key
+from .worker import Worker, ago
 
 MAX_UDP = 65535
 
@@ -125,11 +126,9 @@ class EngineCache:
         engineTime is the agent's own clock in seconds, and RFC 3414 §3.2
         rejects an authenticated message whose engineTime is more than 150
         seconds from the agent's. Sending back the value learned at
-        discovery — as this did — means every v3 device starts failing 150
-        seconds after its first poll and keeps failing until something
-        invalidates the entry, which the review saw as a spurious
-        auth_fail roughly every third poll. The elapsed wall time since
-        the value was learned is added instead.
+        discovery would make every v3 device start failing 150 seconds
+        after its first poll, so the elapsed wall time since it was learned
+        is added.
         """
         with self._lock:
             entry = self._entries.get(device_id)
@@ -216,16 +215,13 @@ class _Session:
     def request(self, packet: bytes, expect_request_id: int | None = None) -> Response:
         """Send, wait for OUR reply, decode it.
 
-        A UDP socket accepts whatever arrives. The first reading of this
-        took the first datagram it got — so a late answer to attempt 1 was
-        consumed as the answer to attempt 2 (the review reproduced it on a
-        device that answers in 2.6 s with a 2 s timeout), and anything
-        sent from any other address could be answered with. Now a datagram
-        is dropped and the wait continues when it did not come from the
-        device, or when it carries a different request id than the one
-        sent. A Report-PDU is exempt from the id test: an agent reports an
-        engine mismatch against its own msgID, and dropping it would turn
-        one v3 resync into a timeout.
+        A UDP socket accepts whatever arrives, so taking the first datagram
+        would let a late answer to attempt 1 be read as the answer to
+        attempt 2, and let any other address answer at all. A datagram from
+        the wrong peer, or carrying a different request id, is dropped and
+        the wait continues. A Report-PDU is exempt from the id test: an
+        agent reports an engine mismatch against its own msgID, and dropping
+        it would turn one v3 resync into a timeout.
 
         Retries on timeout up to self.retries times; raises SnmpTimeout if
         every attempt times out.
@@ -351,29 +347,19 @@ def detect_reboot(uptime_ticks: int, uptime_ts: float, previous_ticks: int | Non
 
 
 def _interface_reassigned(prior: "sqlite3.Row | dict", row: dict) -> bool:
-    """True only when there is affirmative evidence that the physical port
-    answering at this ifIndex changed between `prior` (last poll's stored
-    row) and `row` (this poll's fresh read) -- used to decide, on the poll
-    a reboot is first observed, whether an oper_status transition at this
-    ifIndex is real or an artifact of the agent renumbering ifIndex across
-    the reload (a stack member reboot can move port 5 from ifIndex 10 to
-    14).
+    """True only on affirmative evidence that the physical port at this
+    ifIndex changed between `prior` and `row` — a stack member reboot can
+    move port 5 from ifIndex 10 to 14.
 
-    ifPhysAddress (the port's burned-in MAC) is checked first: it is tied
-    to the hardware itself, not to how the agent currently names or
-    numbers the port, so it survives a stack member being renumbered
-    without the physical port changing (descr encodes the member number
-    and would differ across such a renumbering even though the port is
-    the same). ifDescr is the fallback for rows/platforms that leave
-    phys_addr blank (common for logical or aggregate interfaces).
+    ifPhysAddress first: the burned-in MAC is tied to the hardware, not to
+    how the agent numbers the port, so it survives a renumbering that descr
+    (which encodes the member number) would not. ifDescr is the fallback
+    where phys_addr is blank, common on logical interfaces.
 
-    A field that is empty/None on either side is never treated as
-    evidence of a change -- only a genuine disagreement between two
-    non-empty values counts. Otherwise a platform that simply doesn't
-    populate one of these columns would have every reboot treated as an
-    ifIndex reassignment, silently reintroducing the bug this function
-    exists to fix (every post-reboot oper_status comparison suppressed,
-    forever)."""
+    A field empty on either side is never evidence — only a disagreement
+    between two non-empty values counts. Otherwise a platform that does not
+    populate either column would have every reboot read as a reassignment,
+    suppressing every post-reboot oper_status comparison forever."""
     for field in ("phys_addr", "descr"):
         old = prior[field] if field in prior.keys() else None
         new = row.get(field)
@@ -418,19 +404,6 @@ def _format_cdp_address(raw) -> str:
     if len(octets) == 4 and all(0 <= o <= 255 for o in octets):
         return ".".join(str(o) for o in octets)
     return text
-
-
-def _ago(ts: float) -> str:
-    if not ts:
-        return "never"
-    age = time.time() - ts
-    if age < 5:
-        return "just now"
-    if age < 90:
-        return f"{age:.0f}s ago"
-    if age < 5400:
-        return f"{age / 60:.0f}m ago"
-    return f"{age / 3600:.1f}h ago"
 
 
 class _OidWalkJob:
@@ -686,13 +659,15 @@ class _VendorIdJob:
             poller._bump("identifications")
 
 
-class NodePoller:
+class NodePoller(Worker):
+    STOPPED_TEXT = "Poller stopped"
+    THREAD_NAME = "node-poller"
+
     def __init__(self, db: NodesDatabase, log=None):
         self.db = db
         self.log = log or NullLog()
         self._executor: ThreadPoolExecutor | None = None
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._queued: dict[int, float] = {}
         self._started: dict[int, float] = {}
@@ -757,28 +732,19 @@ class NodePoller:
         # guarded) so the poller runs standalone in tests and scripts.
         self.alert_engine = None
         # device_id -> index into db.credential_candidates(device) that last
-        # worked, so a profile with several alternate credentials (a
-        # mixed-vendor subnet, say) costs one extra request only on a
-        # device's first poll or after its cached credential stops working,
-        # not on every poll thereafter. In-memory and process-lifetime only,
-        # the same tradeoff EngineCache above already makes.
+        # worked, so a multi-credential profile costs an extra request only
+        # on a device's first poll or after its cached credential stops
+        # working. In memory and process-lifetime only, like EngineCache.
         self._credentials: dict[int, int] = {}
         # device_id -> when an on-demand credential probe last failed for it,
         # so a device that is simply down does not re-sweep its profile's
         # candidates on every dialog a human opens. See working_config().
         self._credential_probe_failed: dict[int, float] = {}
-        # device_id set: the devices whose SNMP is currently failing on
-        # AUTHENTICATION, as this process has observed it. auth_fail is
-        # recorded on entering the set and auth_ok only on leaving it, which
-        # is what makes both of them transitions. Reading the previous poll's
-        # snmp_ok/snmp_error off the device row could not do that: any failure
-        # recovering looked like an auth recovery (a WAN device that times out
-        # one poll in ten wrote an auth_ok on every recovery), and a
-        # multi-credential profile whose recorded error alternates between an
-        # auth string and a timeout re-recorded auth_fail every other poll.
-        # In memory and process-lifetime only, like _credentials above: a
-        # restart re-records one auth_fail per still-failing device, which is
-        # one event, not one per poll.
+        # device_id set: devices whose SNMP is currently failing on
+        # AUTHENTICATION. auth_fail is recorded on entering the set and
+        # auth_ok only on leaving it, which is what makes both transitions --
+        # see _poll_device for why the device row cannot answer that. In
+        # memory and process-lifetime only, like _credentials above.
         self._auth_failing: set[int] = set()
         # (device_id, expires_ts, interval_s): the device currently selected
         # in a browser polls at interval_s until expires_ts. Renewed by the
@@ -788,25 +754,12 @@ class NodePoller:
         self.counters = {"polls": 0, "ok": 0, "timeout": 0, "auth_fail": 0,
                          "unsupported": 0, "errors": 0, "overruns": 0,
                          "mac_walks": 0, "identifications": 0,
-                         # Tier 1 #5/#7/#8: one counter per new walk, the
-                         # same shape mac_walks already has — lldp_walks
-                         # counts completed LLDP/CDP walks, poe_polls/
-                         # stp_polls/rf_polls count poll-cycle reads that
-                         # actually produced data (a device whose capability
-                         # probe came back negative never bumps them again).
+                         # lldp_walks counts completed LLDP/CDP walks;
+                         # poe_polls/stp_polls/rf_polls count poll-cycle
+                         # reads that produced data (a device whose
+                         # capability probe was negative never bumps them).
                          "lldp_walks": 0, "poe_polls": 0, "stp_polls": 0,
                          "rf_polls": 0}
-        self.error: str | None = None
-
-    def _bump(self, key: str, by: int = 1) -> None:
-        """counters[...] += 1 from a pool worker is a read-modify-write on a
-        shared dict; under the lock the totals stay exact."""
-        with self._lock:
-            self.counters[key] = self.counters.get(key, 0) + by
-
-    @property
-    def running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
 
     def start(self, settings: dict | None = None) -> None:
         self.stop()
@@ -815,8 +768,7 @@ class NodePoller:
         self._executor = ThreadPoolExecutor(max_workers=workers)
         self._mac_executor = ThreadPoolExecutor(
             max_workers=self._MAC_WALK_WORKERS, thread_name_prefix="mac-walk")
-        self._thread = threading.Thread(target=self._loop, name="node-poller", daemon=True)
-        self._thread.start()
+        self._spawn()
 
     def reconfigure(self, settings: dict) -> None:
         """Hot pool resize, matching Monitor.set_workers: build a new
@@ -852,9 +804,7 @@ class NodePoller:
         if self._mac_executor:
             self._mac_executor.shutdown(wait=False, cancel_futures=True)
             self._mac_executor = None
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2)
-        self._thread = None
+        self._join()
 
     def _inflight_ids(self) -> set[int]:
         with self._lock:
@@ -956,9 +906,8 @@ class NodePoller:
     def pool_state(self) -> dict:
         """How much of the poll pool is in use right now.
 
-        The review found the gauge on this counted queued and running
-        together against the pool size, so it read "48 of 32 busy" — which
-        is not wrong so much as unsayable. The two are separate here.
+        Queued and running are counted separately: together against the
+        pool size they produced gauges reading "48 of 32 busy".
         """
         with self._lock:
             busy = len(self._started)
@@ -967,16 +916,12 @@ class NodePoller:
         return {"busy": busy, "queued": queued, "workers": workers,
                 "saturated": bool(workers and busy >= workers and queued)}
 
-    def status_text(self) -> str:
-        if self.error:
-            return self.error
-        if not self.running:
-            return "Poller stopped"
+    def _running_text(self) -> str:
         n = self.db.device_count()
         pool = self.pool_state()
         return (f"Polling {n} device(s) · {pool['busy']} busy and "
                 f"{pool['queued']} queued of {pool['workers']} worker(s) · "
-                f"last poll {_ago(self._last_completed)}")
+                f"last poll {ago(self._last_completed)}")
 
     def worker_state(self) -> dict:
         with self._lock:
@@ -1190,8 +1135,7 @@ class NodePoller:
         """Raise (and clear) a system alert when every poll worker is busy
         and devices are still waiting.
 
-        §4.1 S5 and the review's Tier 2 list: nothing said the pool was the
-        bottleneck, so a fleet that had outgrown poll_workers looked like a
+        Without it, a fleet that had outgrown poll_workers looked like a
         fleet of slow devices. The alert names the number to raise.
         """
         pool = self.pool_state()
@@ -1230,8 +1174,7 @@ class NodePoller:
 
         Every one of these is keyed by device id and kept for the process
         lifetime, so without this a long-running install accumulates an
-        entry per device ever deleted — small individually, unbounded
-        together, and the review asked for the cleanup by name.
+        entry per device ever deleted.
         """
         for cache in (self._next_run, self._last_ping, self._next_mac_walk,
                       self._next_lldp_walk,
@@ -1372,18 +1315,11 @@ class NodePoller:
             self._poll_device(device, config)
         except Exception as exc:
             self._bump("errors")
-            # Same two non-bug shapes as Monitor._run_one (netpath/
-            # monitor.py), the poller's own worst case rather than a
-            # trace's: "Cannot operate on a closed database" while _stop is
-            # set means this poll ran past shutdown()'s drain window
-            # (bounded by _inflight_budget_s, not unlimited) and the
-            # database closed under it. A foreign key failure with the
-            # device now gone means it was deleted mid-poll — an ordinary
-            # operator action, not a bug. Neither gets the traceback below,
-            # which would read exactly like a crash in a log an operator
-            # checks right after a stop or a delete. The same exceptions
-            # for any OTHER reason are still a real bug and still get the
-            # full treatment.
+            # Two shapes that are not bugs and so get no traceback:
+            # "Cannot operate on a closed database" while _stop is set (this
+            # poll ran past shutdown()'s drain window), and a foreign key
+            # failure with the device now gone (deleted mid-poll). The same
+            # exceptions for any other reason still get the full treatment.
             device_gone = False
             if isinstance(exc, sqlite3.IntegrityError):
                 try:
@@ -1449,10 +1385,8 @@ class NodePoller:
         snmp_error = ""
         # Whether SNMP failed because the device refuses something this
         # poller does not speak, rather than because it is unreachable.
-        # Decided by exception type: the old test looked for the substring
-        # "unsupported" in the message, and no message this raises has ever
-        # contained it, so the whole `unsupported` status, its device event
-        # and the rule that watches for it were unreachable code.
+        # Decided by exception type, never by a substring of the message:
+        # no message this raises contains the word "unsupported".
         snmp_unsupported = False
         identity = None
         uptime_ticks = None
@@ -1546,12 +1480,9 @@ class NodePoller:
             self._bump("ok")
 
         # ---------------------------------------------------------- debug
-        # A per-poll trace, the same idea as monitor.py's own trace-logging
-        # convention (command + raw output in `detail`) — this is the
-        # concrete answer to "there should be a way to debug this": before
-        # this, `eventlog.NODES` was imported and never once used, so a
-        # device silently failing to poll left no record anywhere beyond
-        # its own current status/error fields.
+        # A per-poll trace, the same shape monitor.py logs a trace with
+        # (command + raw output in `detail`), so a device silently failing
+        # to poll leaves a record beyond its own status/error fields.
         detail_lines = [
             f"ping       {'n/a' if ping_ok is None else ('ok' if ping_ok else 'no reply')}"
             + (f" ({ping_rtt_ms:.0f} ms)" if ping_rtt_ms is not None else ""),
@@ -1577,34 +1508,16 @@ class NodePoller:
         elif status == "unsupported" and was_status != "unsupported":
             self.db.record_device_event(device_id, "unsupported", snmp_error)
 
-        # Both of these are TRANSITIONS, the same discipline as the up/down
-        # events above, and for the same reason: a device event is a fact
-        # about a change, and an alert an operator resolved by hand must not
-        # be re-opened by the next poll simply repeating what the last one
-        # said. Recorded on every failing poll, "SNMP authentication failing"
-        # came back within a poll interval however often it was resolved.
-        #
-        # The transition is held HERE, in _auth_failing, rather than derived
-        # from the device row's previous snmp_ok/snmp_error. That row cannot
-        # answer the question:
-        #
-        # - "SNMP failed last poll and works now" is not "the credentials
-        #   were rejected and are now accepted". A device on a lossy WAN link
-        #   that times out one poll in ten recovered into an auth_ok every
-        #   time, and every one of those became an alert occurrence.
-        # - A profile with several candidate credentials re-raises the LAST
-        #   candidate's error, so the recorded error can alternate between an
-        #   auth string and a timeout while nothing about the device changed.
-        #   Comparing this poll's error text with the last one's then read as
-        #   "a different auth error, a new fact" every other poll — exactly
-        #   the repeat this is supposed to suppress.
-        #
-        # So: entering the set records auth_fail, leaving it (SNMP actually
-        # working) records auth_ok, and everything else — a timeout while
-        # already failing, a second identical auth failure, a different auth
-        # error for the same broken profile — records nothing at all. A
-        # timeout recovery for a device that was never failing on auth is not
-        # an auth recovery and records nothing.
+        # TRANSITIONS, like the up/down events above: an alert an operator
+        # resolved by hand must not re-open because the next poll repeated
+        # what the last one said. The transition is held here, in
+        # _auth_failing, rather than derived from the device row's previous
+        # snmp_ok/snmp_error, which cannot answer it — a device that times
+        # out one poll in ten would "recover" into an auth_ok every time, and
+        # a multi-credential profile re-raises whichever candidate's error
+        # came last, so the recorded text alternates while nothing changed.
+        # Entering the set records auth_fail, leaving it records auth_ok,
+        # everything else records nothing.
         auth_failing = bool(snmp_ok is False and isinstance(snmp_error, str)
                             and "auth" in snmp_error.lower())
         with self._lock:
@@ -1619,21 +1532,15 @@ class NodePoller:
         if auth_event is not None:
             self.db.record_device_event(device_id, auth_event[0], auth_event[1])
 
-        # A switch whose SNMP agent has died but which still answers ICMP is
-        # reachable and broken, so `unreachable_ping_only` rightly keeps it
-        # out of device_down — and before this nothing else said anything at
-        # all, so a dead agent on a live switch was invisible. This is the
-        # event the `snmp_failing_ping_ok` rule watches.
+        # A switch whose SNMP agent has died but still answers ICMP is
+        # reachable and broken; `unreachable_ping_only` keeps it out of
+        # device_down, so this is the event `snmp_failing_ping_ok` watches.
         #
-        # Unlike the auth events above this one is recorded on EVERY failing
-        # poll, and deliberately: the rule carries `auto_resolve_after_s`,
-        # which measures from the alert's last occurrence, so the repeats are
-        # what keep it open while the agent is still dead and their stopping
-        # is what closes it. Recording it as a transition instead would
-        # freeze `last_ts` and the alert would announce an all-clear an hour
-        # later with the agent still down — a false all-clear, which is worse
-        # than the repeat this discipline otherwise avoids. An auth failure
-        # has its own event above and is excluded here.
+        # Recorded on EVERY failing poll, not as a transition: the rule
+        # carries `auto_resolve_after_s`, measured from the alert's last
+        # occurrence, so the repeats keep it open while the agent is dead and
+        # their stopping closes it. A transition would freeze `last_ts` and
+        # announce a false all-clear an hour later.
         if (not auth_failing and snmp_ok is False and ping_ok
                 and not snmp_unsupported):
             self.db.record_device_event(
@@ -1642,13 +1549,10 @@ class NodePoller:
                 f"{snmp_error}")
 
         # Hoisted out of the branch below: the interface block needs it too.
-        # A device that has just restarted has restarted its interface
-        # counters with it, and counter_rate cannot tell a reset apart from
-        # a 32-bit wrap — it computes (2**32 - previous + current) / dt and
-        # reports a switch that has been up for eight seconds as carrying
-        # 220 Mbps. One poll's rates are dropped instead; the counters
-        # themselves are still stored, so the poll after this one measures
-        # against the post-reboot baseline and is correct.
+        # A restarted device restarted its interface counters too, and
+        # counter_rate cannot tell a reset from a 32-bit wrap. One poll's
+        # rates are dropped; the counters are still stored, so the next poll
+        # measures against the post-reboot baseline.
         rebooted = False
         if uptime_ticks is not None:
             rebooted, note = detect_reboot(
@@ -1680,12 +1584,9 @@ class NodePoller:
             interface_ids = result["ids"]
             rate_rows: list[dict] = []
             # The device-level worst case of each per-interface rate. The
-            # shipped threshold rules (if_in_util_high, if_out_util_high,
-            # if_in_errors_high, if_out_errors_high, if_in_discards_high,
-            # if_out_discards_high) all read a metric with no interface
-            # suffix, and nothing has ever recorded one — six rules that
-            # could not fire on any device. "The worst port on this box" is
-            # what a device-level rule can usefully mean.
+            # six shipped if_*_high threshold rules all read a metric with
+            # no interface suffix, and "the worst port on this box" is what
+            # a device-level rule can usefully mean.
             worst: dict[str, float] = {}
             for row in interfaces:
                 if_index = row["if_index"]
@@ -1763,24 +1664,13 @@ class NodePoller:
                     "ts": sample_ts})
                 interface_id = interface_ids.get(if_index)
                 # Suppressed only when `rebooted` AND _interface_reassigned
-                # says the port at this ifIndex actually changed: some
-                # platforms (stack members, some firmware upgrades)
-                # renumber ifIndex across a reload, so on the poll that
-                # first observes a reboot, `prior` at this if_index may
-                # describe a physically different port than the new row --
-                # comparing their oper_status would then fabricate a
-                # link_up/link_down event on a port that never actually
-                # changed. But a reboot alone is not evidence of a
-                # renumbering: on the overwhelming majority of platforms
-                # ifIndex is stable across a reload, and a reboot is
-                # exactly when a port that was up and does not come back
-                # is most likely to happen. Skipping the comparison for
-                # every reboot regardless of identity meant that case could
-                # never fire an interface_down alert on any platform, and a
-                # missed link_down is far worse than an occasional
+                # says the port at this ifIndex really changed: some
+                # platforms renumber ifIndex across a reload, and comparing
+                # oper_status across a renumbering fabricates a link event.
+                # A reboot alone is not evidence of renumbering, though, and
+                # a missed link_down is far worse than an occasional
                 # fabricated one -- so the comparison still runs whenever
-                # the prior and current rows agree (or we simply can't
-                # tell, e.g. phys_addr/descr blank on one side).
+                # the prior and current rows agree, or cannot be told apart.
                 if (interface_id is not None and prior is not None
                         and not (rebooted and _interface_reassigned(prior, row))):
                     if prior["oper_status"] and prior["oper_status"] != row.get("oper_status"):
@@ -1815,13 +1705,9 @@ class NodePoller:
         # ---------------------------------------- PoE / STP / environment
         #
         # After the interface rows above are written, not before: PoE and
-        # STP write per-port columns onto `interfaces` keyed by
-        # (device_id, if_index), and a row that does not exist yet updates
-        # nothing. Each of the three is its own best-effort, independently
-        # gated read (see their own docstrings) — a device that fails one
-        # must not lose the others, so each gets its own try rather than
-        # sharing the block above's exception handling with the fields the
-        # device's up/down status actually depends on.
+        # STP write per-port columns keyed by (device_id, if_index), and a
+        # row that does not exist yet updates nothing. Each of the three
+        # gets its own try, so a device that fails one keeps the others.
         if snmp_ok and config.get("snmp_enabled"):
             if config.get("poe_enabled", True):
                 try:
@@ -1857,16 +1743,12 @@ class NodePoller:
         merged with the credential this device actually answers on.
 
         effective_config() resolves a device's overrides over its profile's
-        own columns, which is the profile's PRIMARY credential and nothing
-        else. But a profile can carry alternates (group_credentials, for a
-        mixed-vendor subnet), and the scheduled poller finds whichever one
-        works and caches it in self._credentials. Any on-demand read that
-        built its own config straight from effective_config() therefore
-        queried a device that answers on an alternate with the wrong
-        community — every request ignored, every read a timeout, on a device
-        the poller shows as up. That is what made the OID browser report
-        "the device stopped answering" for every device, and what left the
-        MAC-address and DOM reads quietly empty on the same devices.
+        PRIMARY credential and nothing else. A profile can carry alternates
+        (group_credentials, for a mixed-vendor subnet) and the poller caches
+        whichever one works in self._credentials, so an on-demand read built
+        straight from effective_config() would query a device answering on
+        an alternate with the wrong community: every read a timeout, on a
+        device the poller shows as up.
 
         One candidate (the overwhelmingly common case, and any device with
         its own credential override) costs nothing extra: it *is*
@@ -2013,16 +1895,11 @@ class NodePoller:
         last-known-good candidate (from self._credentials) first; on a
         cache miss, or if that candidate no longer works, walks the full
         candidate list from db.credential_candidates() in order. Every
-        failure mode a single-credential poll could hit (SnmpTimeout,
-        SnmpUnsupported, _AuthFailure, or any other SnmpError) is credential
-        -specific in a mixed profile — a v3 authPriv alternate is
-        SnmpUnsupported while a v2c alternate right after it might work
-        fine — so all of SnmpError's subclasses are caught uniformly here
-        and only re-raised, as the last one seen, once every candidate has
-        failed. Returns (winning_config, identity, uptime_ticks, metrics);
-        raises the same exception _poll_snmp_scalars alone would if no
-        candidate works, so the caller's existing except chain still
-        classifies the failure exactly as before this feature existed."""
+        failure mode is credential-specific in a mixed profile — a v3
+        authPriv alternate raises SnmpUnsupported while a v2c alternate
+        right after it works — so every SnmpError subclass is caught
+        uniformly and only the last one re-raised, once every candidate has
+        failed. Returns (winning_config, identity, uptime_ticks, metrics)."""
         device_id = device["id"]
         candidates = self.db.credential_candidates(device)
         cached_index = self._credentials.get(device_id)
@@ -2080,28 +1957,17 @@ class NodePoller:
         # "…y.0" are both reasonable things to type and only one of them
         # answers; whichever does is used. See nodeoids.identity_oid_variants.
         #
-        # On v2c and v3 they ride in the SAME GET as the standard scalars, for
-        # no extra round trip: an object the agent does not implement comes
-        # back as a per-varbind noSuchObject and the rest of the response is
-        # unharmed. SNMPv1 has no such thing — it answers a request containing
-        # one unimplemented object with noSuchName and the whole varbind list
-        # echoed back as nulls, and _check_error_status raises only on
-        # authorizationError, so merging them there silently blanked sysDescr,
-        # sysObjectID, sysName and sysLocation on every v1 device with a custom
-        # identity OID set. By construction at least one of the two forms
-        # cannot answer, so on v1 they are read separately and best-effort.
-        # Read without the usual `or 1` fallback, which turns a configured 0
-        # (v1) into 1 (v2c) and would make the branch below unreachable for
-        # exactly the devices it protects.
-        #
-        # _snmp_get's own `int(config.get("snmp_version") or 1)` fallback used
-        # to apply the identical coercion — a configured 0 (v1) collapsing to
-        # 1 (v2c) — which meant a device configured for v1 was actually polled
-        # as v2c and the noSuchName case above could never arise. That
-        # coercion is now fixed (`config.get("snmp_version", 1)` only defaults
-        # a missing key, never an explicit 0), so this split is what actually
-        # protects a v1 device's identity fields, now that v1 devices are
-        # really polled as v1.
+        # On v2c and v3 they ride in the SAME GET as the standard scalars,
+        # for no extra round trip: an unimplemented object comes back as a
+        # per-varbind noSuchObject and the rest of the response is unharmed.
+        # SNMPv1 has no such thing — it answers noSuchName with the whole
+        # varbind list echoed back as nulls, which would blank sysDescr,
+        # sysObjectID, sysName and sysLocation on every v1 device with a
+        # custom identity OID set. By construction at least one of the two
+        # forms cannot answer, so on v1 they are read separately and
+        # best-effort. Note the missing `or 1`: that fallback turns a
+        # configured 0 (v1) into 1 (v2c) and would make this branch
+        # unreachable for exactly the devices it protects.
         configured_version = config.get("snmp_version")
         is_v1 = configured_version is not None and int(configured_version) == 0
         custom = nodeoids.identity_oid_variants(config)
@@ -2171,7 +2037,7 @@ class NodePoller:
         # above rather than folded into _poll_vendor_health's per-arc loop.
         metrics.extend(self._poll_ups_health(device, config, identity,
                                              already={m[0] for m in metrics}))
-        # Tier 1 #8: RSSI/SNR/capacity for a PtP wireless bridge — the same
+        # RSSI/SNR/capacity for a PtP wireless bridge — the same
         # arc-gated, best-effort scalar shape _poll_vendor_health uses just
         # above, kept as its own method because RF is not "health" and has
         # its own OID table (nodeoids.RF_METRICS).
@@ -2246,10 +2112,9 @@ class NodePoller:
     def _worst_storage_pct(types: dict, sizes: dict, used: dict,
                            wanted_type: str) -> float | None:
         """The fullest hrStorageTable row of one hrStorageType, as a
-        percentage — the one computation disk_pct and mem_pct both are,
-        filtered to a different type. See nodeoids.HR_STORAGE_TYPE's
-        comment for why no allocation-unit scaling belongs here: a
-        used/size ratio does not need it."""
+        percentage — disk_pct and mem_pct are the same computation over a
+        different type. No allocation-unit scaling: a used/size ratio does
+        not need it."""
         worst = None
         for index, kind in types.items():
             if str(kind).strip(".") != wanted_type:
@@ -2276,22 +2141,14 @@ class NodePoller:
                                        nodeoids.HR_STORAGE_FIXED_DISK)
 
     def _host_resources_mem_pct(self, types: dict, sizes: dict, used: dict):
-        """Physical memory, as a percentage, from the SAME already-walked
+        """Physical memory as a percentage, from the same already-walked
         hrStorageTable _host_resources_disk_pct reads — the HOST-RESOURCES
-        fallback for mem_pct, tried only when neither UCD-SNMP, a Fortinet
-        scalar nor the Cisco memory pool answered (see _poll_vendor_health):
-        a Windows server or endpoint, a printer, most appliances answer
-        none of those three and so have never had a mem_pct at all, on a
-        fleet where cpu_pct and disk_pct already worked for them through
-        this exact table.
+        fallback for mem_pct, tried only when UCD-SNMP, the Fortinet scalar
+        and the Cisco memory pool all failed to answer.
 
-        hrStorageRam is the physical-memory row alone. hrStorageVirtualMemory
-        (swap, or swap-plus-physical depending on the agent) is a different
-        row under a different type and is never read here, for the same
-        reason the disk reader above excludes it: counting swap as physical
-        memory would make a machine with a perfectly ordinary swap file read
-        as critically low on RAM, the mirror image of the page-cache mistake
-        that filter was already written to prevent.
+        hrStorageRam only: hrStorageVirtualMemory (swap) sits under a
+        different type and is never counted, because a machine with an
+        ordinary swap file would otherwise read as critically low on RAM.
         """
         return self._worst_storage_pct(types, sizes, used, nodeoids.HR_STORAGE_RAM)
 
@@ -2374,15 +2231,9 @@ class NodePoller:
             for key, label, unit, oid, how in nodeoids.GENERIC_HEALTH:
                 add(key, label, unit,
                     self._health_column(device, config, oid, how))
-        # hrStorageTable answers BOTH disk_pct's and mem_pct's HOST-
-        # RESOURCES fallback, so it is walked once (see
-        # _host_resources_storage_rows) and only when at least one of the
-        # two is still missing — a Cisco box that already has mem_pct from
-        # its own memory pool, or a net-snmp box that already has it from
-        # UCD-SNMP, costs nothing extra here, and one that answers neither
-        # (a Windows host, a printer, most appliances) now gets mem_pct for
-        # the first time from a table this poll was already reading for
-        # disk_pct alone.
+        # hrStorageTable answers BOTH disk_pct's and mem_pct's HOST-RESOURCES
+        # fallback, so it is walked once and only when at least one of the two
+        # is still missing.
         if "disk_pct" not in known or "mem_pct" not in known:
             types, sizes, used = self._host_resources_storage_rows(device, config)
             if types:
@@ -2396,14 +2247,11 @@ class NodePoller:
         return metrics
 
     def _poll_rf_metrics(self, device, config: dict, identity: dict) -> list[tuple]:
-        """RSSI/SNR/link-capacity for a point-to-point wireless bridge
-        (Tier 1 #8), gated on the vendor arc this same poll's identity
-        already worked out — RF_METRICS has no entry for anything that
-        isn't a radio, so the scalar GET below is never sent to (and never
-        costs so much as one packet against) a device this doesn't apply
-        to. Recorded through record_metric_samples like every other metric
-        here, which is what gives the future UI wave a chart with history
-        for free rather than "current value only".
+        """RSSI/SNR/link-capacity for a point-to-point wireless bridge,
+        gated on the vendor arc this poll's identity already worked out:
+        RF_METRICS has no entry for anything that is not a radio, so the
+        GET below never costs a packet against a device it does not apply
+        to.
         """
         arc = identity.get("vendor_arc") if identity else None
         if arc is None:
@@ -2436,25 +2284,13 @@ class NodePoller:
         why keying this to a vendor list would not work for a UPS the way
         it does for a switch or router.
 
-        Cost is controlled two ways, one per poll and one forever. Within
-        a single poll: the first read is one GET of every scalar in the
-        table, no more expensive than the UCD-SNMP read every device
-        already gets, and the two per-line TABLE reads (upsInputVoltage,
-        upsOutputPercentLoad — each its own GETBULK walk) are only
-        attempted once that GET shows at least one scalar answered.
-        Across polls: devices.ups_capable is the same probe-once-remember
-        memory _poll_poe/_poll_stp already use for their own tables — NULL
-        until the first attempt, then True or False, persisted, so a
-        confirmed-not-a-UPS device is skipped entirely (not even the one
-        scalar GET) on every later poll rather than paying that GET
-        forever. Without this a fleet of 2,000 devices with 100 real UPSs
-        sent 1,900 pointless GETs every poll, indefinitely — one extra
-        request on a device that cannot answer is fine; the same request
-        forever is the regression this guards against. Recorded only on
-        the FIRST probe (capable is None), the same "a miss on the first
-        probe is a verdict, a miss later is just a miss" rule _poll_poe's
-        own docstring states — a UPS that times out one poll must not be
-        relabelled incapable off that alone.
+        Cost is bounded twice. Within a poll: one GET of every scalar in
+        the table, and the two per-line table walks only once that GET
+        shows a scalar answered. Across polls: devices.ups_capable is the
+        probe-once-remember memory _poll_poe/_poll_stp use, so a confirmed
+        not-a-UPS is skipped entirely rather than paying that GET forever.
+        Recorded only on the FIRST probe (capable is None) — a UPS that
+        times out one poll must not be relabelled incapable.
         """
         metrics: list[tuple] = []
         capable = device["ups_capable"]
@@ -2531,24 +2367,17 @@ class NodePoller:
 
     def _check_vendor_mib(self, device_id: int, previous, identity: dict | None,
                           defer_assignment: bool = False) -> None:
-        """Vendor autodetection already happens on every poll
-        (nodeoids.vendor_for on the device's sysObjectID). This is the
-        other half the user asked for: if the vendor is identified but no
-        uploaded MIB actually describes that vendor's objects, say so, so
-        an admin knows there is a MIB to go and add rather than wondering
-        why a device's own metrics never appear.
+        """Says so when a device's vendor is identified but no uploaded MIB
+        describes that vendor's objects, so an admin knows there is a MIB to
+        add rather than wondering why the metrics never appear.
 
-        Coverage is re-evaluated on every poll and compared against the
-        persisted per-device verdict (devices.mib_covered), with events
-        recorded only on transitions — the same stored-previous-state
-        shape every status transition above uses. Keying off sysObjectID
-        changes instead (as the first cut did) made the whole feature
-        inert for any device whose identity was already stored — every
-        pre-existing device on an upgrade, and every device promoted from
-        Discovery (seed_identity pre-fills sysObjectID) — and could
-        neither clear when the MIB was later uploaded nor re-fire when a
-        covering MIB was deleted. mib_present pairs with mib_missing in
-        alertrules.CLEARS, so the upload auto-resolves the alert."""
+        Coverage is re-evaluated every poll and compared against the
+        persisted verdict (devices.mib_covered), with events on transitions
+        only — keying off sysObjectID changes instead would make the feature
+        inert for every device whose identity was already stored, and could
+        neither clear on a later upload nor re-fire on a deletion.
+        mib_present pairs with mib_missing in alertrules.CLEARS, so the
+        upload auto-resolves the alert."""
         if not identity:
             return
         sys_object_id = identity.get("sys_object_id") or ""
@@ -2608,18 +2437,13 @@ class NodePoller:
                          vendor: str, preferred: int | None = None) -> None:
         """Point a device at its own vendor's MIB once one is present.
 
-        Uploading a MIB used to do nothing for polling until somebody went
-        to each device and set the Custom MIB override by hand, so the
-        common case — install the bundle for the vendor you actually run —
-        left every device still undecoded. Assignment happens only where the
-        operator has expressed no preference — and a preference can live on
-        the polling profile as well as the device: mib_file_id is an
-        _OVERRIDE_COLUMNS entry, so a device-level auto-assignment layered
-        over a group whose MIB was chosen by hand would *beat* that choice,
-        the opposite of standing aside. Hence the effective (device-or-group)
-        value is what is checked, not the device column alone. It is an
-        ordinary override afterwards and can be cleared or changed from the
-        device like any other.
+        Assignment happens only where the operator has expressed no
+        preference — and a preference can live on the polling profile as
+        well as the device: mib_file_id is an _OVERRIDE_COLUMNS entry, so a
+        device-level auto-assignment layered over a group whose MIB was
+        chosen by hand would BEAT that choice. Hence the effective
+        (device-or-group) value is what is checked, not the device column.
+        It is an ordinary override afterwards.
         """
         device = self.db.device(device_id)
         if device is None:
@@ -2797,15 +2621,11 @@ class NodePoller:
         failed GET never fails the whole poll; a device that doesn't
         answer any of this MIB's objects just contributes nothing).
 
-        mibparse.py stores an OBJECT-TYPE's own OID exactly as its MIB
-        clause names it (its position in the tree) — for a genuine
-        scalar, the actual instance to GET is that OID with the standard
-        ".0" suffix appended, the same convention nodeoids.SYSTEM_SCALARS'
-        own hand-written OIDs already bake in. Table objects are out of
-        scope here, same as HOST-RESOURCES-MIB never being walked above —
-        appending ".0" to a table column's OID (rather than a real row
-        index) always misses, so it just silently contributes nothing
-        rather than a per-row index-walk this pass doesn't attempt."""
+        mibparse stores an OBJECT-TYPE's OID as its MIB clause names it, so
+        the instance to GET is that OID plus the standard ".0" — the same
+        convention nodeoids.SYSTEM_SCALARS' hand-written OIDs bake in. Table
+        objects are out of scope: ".0" on a table column always misses, and
+        so contributes nothing rather than raising."""
         objects = [o for o in self.db.mib_objects(mib_file_id, resolved_only=True)
                   if not o["is_notification"]]
         if not objects:
@@ -2821,24 +2641,19 @@ class NodePoller:
                     continue
                 if not isinstance(vb["value"], (int, float)):
                     continue   # a string/OID-valued object isn't a chartable metric
-                # Always stored as "gauge": a Counter-typed object is
-                # charted at its raw, ever-increasing value rather than a
-                # computed per-second rate — the same deliberate scope
-                # limit as no table-walk support. Rate computation needs a
-                # previous-value/previous-ts baseline per metric (see
-                # counter_rate() above, used for interface octet/error
-                # counters), which isn't worth building for an arbitrary,
-                # admin-picked MIB object in this pass.
+                # Always "gauge": a Counter-typed object is charted at its
+                # raw value, not a rate. A rate needs a per-metric baseline
+                # (see counter_rate), which an arbitrary admin-picked MIB
+                # object does not get.
                 metrics.append((f"mib_{obj['name']}", obj["name"], "", "gauge", vb["value"]))
         except SnmpError:
             pass   # best-effort: this MIB's objects aren't answered by this device
         return metrics
 
-    # A device the walk enumerated but whose per-interface GETs stopped
-    # answering used to be read at N x timeout x (retries + 1) — 77 minutes
-    # for a 512-port chassis at the shipped defaults, all of it on one poll
-    # worker. Half the device's own poll interval is the budget, with a
-    # floor so a 3-second focus poll still reads something.
+    # Without a budget, a device the walk enumerated but whose
+    # per-interface GETs stop answering costs N x timeout x (retries + 1) on
+    # one poll worker — over an hour for a large chassis. Half the device's
+    # own poll interval, with a floor so a 3-second focus poll still reads.
     _INTERFACE_BUDGET_FRACTION = 0.5
     _INTERFACE_BUDGET_FLOOR_S = 3.0
     _INTERFACE_GIVE_UP_TIMEOUTS = 3
@@ -2916,11 +2731,9 @@ class NodePoller:
         interfaces were found before the device stopped answering.
 
         `complete` is what lets the caller decide whether an interface the
-        walk did not produce is really gone. A walk cut short by a
-        timeout, the row cap, an agent answering out of order, or a
-        per-interface read this poll abandoned is not evidence of absence,
-        and deleting on it takes the interfaces' link-event history with
-        them.
+        walk did not produce is really gone: a walk cut short is not
+        evidence of absence, and deleting on it takes the interfaces'
+        link-event history with them.
         """
         interval = float(config.get("poll_interval_s") or 120)
         deadline = time.time() + max(self._INTERFACE_BUDGET_FLOOR_S,
@@ -2964,10 +2777,9 @@ class NodePoller:
                 continue
             consecutive_timeouts = 0
             # Stamped right after this interface's own GET returns, not at
-            # poll start: at 3 s focus-poll cadence the gap between an
-            # earlier poll-start timestamp and when the counter was actually
-            # read was up to ±17% of dt. This is the timestamp counter_rate
-            # and update_interface_rates use below for this row.
+            # poll start: at a 3 s focus cadence that gap is a large
+            # fraction of dt. This is the timestamp counter_rate and
+            # update_interface_rates use for this row.
             sample_ts = time.time()
 
             def _val(table, key, _values=values, _index=if_index):
@@ -2979,33 +2791,24 @@ class NodePoller:
 
             speed = _val(nodeoids.IF_TABLE, "if_speed")
             high_speed = _val(nodeoids.IFX_TABLE, "if_high_speed")
-            # ifSpeed is a Gauge32 that RFC 2863 defines as saturating at
-            # 4294967295 for any link it cannot express in 32 bits of
-            # bits/sec -- a real 10G+ port reports exactly that sentinel
-            # here, which is why ifHighSpeed (Mbit/s) exists. Tempting to
-            # treat the sentinel as "speed unknown" (None) instead of a
-            # literal ~4.295 Gbit/s denominator, but that would only trade
-            # one wrong number for a missing one: in_util/out_util below
-            # are clamped into [0, 100] precisely so a row stuck with the
-            # sentinel (ifHighSpeed absent) still reports a bounded,
-            # honest-enough utilization instead of losing the metric
-            # outright.
+            # ifSpeed is a Gauge32 that RFC 2863 saturates at 4294967295 for
+            # any link it cannot express in 32 bits of bits/sec, which is why
+            # ifHighSpeed (Mbit/s) exists. The sentinel is left as a literal
+            # denominator rather than treated as "unknown": in_util/out_util
+            # are clamped to [0, 100], so a row stuck with it still reports a
+            # bounded number instead of losing the metric.
             speed_bps = (float(high_speed) * 1_000_000 if isinstance(high_speed, (int, float)) and high_speed
                         else (float(speed) if isinstance(speed, (int, float)) else None))
             hc_in = _val(nodeoids.IFX_TABLE, "if_hc_in_octets")
             hc_out = _val(nodeoids.IFX_TABLE, "if_hc_out_octets")
             in_octets = hc_in if isinstance(hc_in, (int, float)) else _val(nodeoids.IF_TABLE, "if_in_octets")
             out_octets = hc_out if isinstance(hc_out, (int, float)) else _val(nodeoids.IF_TABLE, "if_out_octets")
-            # in_octets/out_octets fall back from the ifXTable 64-bit
-            # counters to the ifTable 32-bit ones independently of each
-            # other above, so the bit width used for the wrap maths below
-            # has to be tracked independently too. A flaky agent that
-            # answers ifHCInOctets but not ifHCOutOctets for this row (a
-            # partial per-varbind failure) would otherwise get a single
-            # combined width of 64 applied to the genuinely 32-bit
-            # ifOutOctets fallback: when that counter wraps, counter_rate's
-            # `bit_width >= 64` branch returns None instead of computing
-            # the wrap-adjusted rate, and the sample is silently dropped.
+            # in_octets and out_octets fall back from the 64-bit ifXTable
+            # counters to the 32-bit ifTable ones independently, so the wrap
+            # width has to be tracked independently too: an agent answering
+            # ifHCInOctets but not ifHCOutOctets would otherwise apply a
+            # width of 64 to a genuinely 32-bit counter, and counter_rate
+            # would drop the sample at every wrap.
             in_octet_bits = 64 if isinstance(hc_in, (int, float)) else 32
             out_octet_bits = 64 if isinstance(hc_out, (int, float)) else 32
 
@@ -3070,36 +2873,24 @@ class NodePoller:
         walk did not produce need to know the difference — a walk cut
         short is not evidence that anything is gone.
 
-        v2c and v3 walk with GETBULK — one request answers up to
-        `settings["snmp_bulk_max_repetitions"]` rows instead of one GETNEXT
-        per row, which is where the whole cost of a forwarding-table walk
-        used to go. v1 has no GETBULK PDU and always uses GETNEXT. Either
-        way the walk runs on one shared `_Session` (one UDP socket) rather
-        than opening a fresh one per row. Per response, every varbind is
-        taken in order until the first one that leaves `base_oid`'s
-        subtree, answers `noSuchObject`/`noSuchInstance`/`endOfMibView`, or
-        is not lexicographically after the request (a misbehaving agent
-        echoing itself, or going backwards) — the next request resumes
-        from the last accepted OID. A device that answers a GETBULK with
-        `error_status == 1` (tooBig, its reply would not fit) is retried
-        at half the repetitions; at one repetition it falls back to
-        GETNEXT for the rest of this walk rather than looping on tooBig
-        forever. Stops when the walk leaves the subtree or hits
+        v2c and v3 walk with GETBULK, up to
+        `settings["snmp_bulk_max_repetitions"]` rows per request; v1 has no
+        GETBULK PDU and uses GETNEXT. Either way the walk runs on one shared
+        `_Session`. Per response, varbinds are taken in order until the first
+        that leaves the subtree, answers noSuchObject/noSuchInstance/
+        endOfMibView, or is not lexicographically after the request (an agent
+        echoing itself or going backwards); the next request resumes from the
+        last accepted OID. A GETBULK answered `error_status == 1` (tooBig) is
+        retried at half the repetitions, then falls back to GETNEXT rather
+        than looping. Stops at the subtree end or
         `settings["snmp_walk_max_rows"]` (logged once, not per row).
 
-        `noSuchObject`/`noSuchInstance`/`endOfMibView` and "left the
-        subtree" are all genuine, substantive "that's the end of the
-        table" signals — handled the same way regardless of
-        `raise_on_timeout`. A `SnmpTimeout` mid-walk is different: it
-        means the device stopped answering, not that the table ended, so
-        by default (every on-demand/best-effort caller — DOM/sensor
-        reads, a custom MIB poll) it's still swallowed the same way any
-        other `SnmpError` here always has been, but a caller whose result
-        actually drives the device's own up/down status
-        (`_poll_interfaces`, via `_walk_indexes`) opts in to
-        `raise_on_timeout=True` so a genuine mid-poll timeout is reported
-        as the real failure it is instead of masquerading as "this
-        device just doesn't have any more rows."""
+        A mid-walk SnmpTimeout means the device stopped answering, not that
+        the table ended, so a caller whose result drives the device's own
+        up/down status (_poll_interfaces, via _walk_indexes) passes
+        raise_on_timeout=True rather than have it read as "no more rows".
+        Best-effort callers leave it swallowed like any other SnmpError.
+        """
         settings = self.db.settings()
         max_rows = int(settings.get("snmp_walk_max_rows", 16384) or 16384)
         # GETBULK does not exist in v1, so whether to use it is decided on
@@ -3238,14 +3029,11 @@ class NodePoller:
         entPhySensorValue is supposed to be (an unpopulated row, or an
         agent answering the wrong ASN.1 type for this instance).
 
-        Factored out of read_dom so it and _poll_environment do the exact
-        same scaling arithmetic in exactly one place. Before this, only
-        read_dom had it — reachable solely through entAliasMappingIdentifier,
-        which maps a sensor to the PORT it rides on. An environmental
-        monitor's temperature and humidity probes belong to the chassis,
-        not to any port, map to nothing in that table, and so were
-        invisible everywhere in this app: read_dom returned [] and the
-        interface dialog said "no sensors" for a device that had plenty.
+        Shared by read_dom and _poll_environment so the scaling arithmetic
+        lives in one place. Reached without entAliasMappingIdentifier, which
+        maps a sensor to the port it rides on: an environmental monitor's
+        probes belong to the chassis, map to nothing in that table, and
+        would otherwise be invisible everywhere in this app.
         """
         if not isinstance(raw, (int, float)):
             return None
@@ -3344,31 +3132,16 @@ class NodePoller:
         sensors.sort(key=lambda s: s["entity"])
         return sensors
 
-    # How often the whole-device ENTITY-SENSOR-MIB walk in _poll_environment
-    # runs, per device. Six column walks (type, scale, precision, value,
-    # status, units, plus physical descr for a label — the same set
-    # read_dom already does, just for every entity rather than one port's)
-    # is the same shape of cost the LLDP/MAC walks are, so it gets a
-    # cadence rather than running on the poll cycle — but a temperature or
-    # a humidity reading does not change between one poll and the next the
-    # way an interface counter does, so there is nothing to buy by
-    # re-walking it that often either.
+    # How often _poll_environment's whole-device ENTITY-SENSOR-MIB walk runs
+    # per device. Six column walks cost what the LLDP/MAC walks do, so it
+    # gets a cadence rather than the poll cycle; a temperature reading does
+    # not change poll to poll the way an interface counter does. Fixed, not
+    # a per-device column, and in memory only (see _sensor_read).
     #
-    # Fixed here rather than a per-device config column the way
-    # lldp_interval_s/mac_table_interval_s are: adding one of those means a
-    # schema migration, a group-inheritance column and a settings-page
-    # control, none of which is this change's to make. A fixed cadence,
-    # in-memory only (see _sensor_read, and _refresh_addresses just above
-    # for the identical tradeoff already made for ipAddrTable), costs
-    # nothing extra to add and re-walks once per process restart at worst.
-    #
-    # Kept safely under alertengine's threshold_stale_s (900s shipped
-    # default): a metric older than that reads as "absent" to a threshold
-    # rule (see alertengine._evaluate_thresholds), and a sensor cadence
-    # equal to or slower than that would make the temperature/humidity rules
-    # flicker in and out of "no data" between refreshes instead of holding
-    # a value. Five minutes leaves three refreshes of margin inside that
-    # 900-second window.
+    # Must stay well under alertengine's threshold_stale_s (900 s default):
+    # a metric older than that reads as absent to a threshold rule, so a
+    # slower cadence would flicker the temperature/humidity rules in and out
+    # of "no data".
     _SENSOR_REFRESH_S = 300.0
 
     def _walk_port_mapped_entities(self, device, config: dict) -> tuple[set, dict]:
@@ -3379,14 +3152,11 @@ class NodePoller:
         candidate sensor.
 
         port_entities is every entPhysicalIndex entAliasMappingIdentifier
-        names as riding on some interface — unfiltered by which one,
-        unlike read_dom()'s own port_entities, which keeps only the rows
-        naming the one ifIndex a human opened a dialog for. contained_in
-        is entPhysicalContainedIn verbatim, exactly as read_dom builds it.
-        Kept as its own method, separate from read_dom's identical-shaped
-        inline code, so read_dom's behaviour is not this method's to
-        risk — see _decode_entity_sensor's docstring for why that
-        matters."""
+        names as riding on some interface — unfiltered by which one, unlike
+        read_dom()'s own, which keeps only the rows naming the one ifIndex a
+        human opened a dialog for. contained_in is entPhysicalContainedIn
+        verbatim. Kept separate from read_dom's inline equivalent so
+        read_dom's behaviour is not this method's to risk."""
         alias = self._walk_column(device, config, self._ENT_ALIAS_MAPPING)
         prefix = self._IF_INDEX_COLUMN + "."
         port_entities = set()
@@ -3409,63 +3179,31 @@ class NodePoller:
     def _poll_environment(self, device_id: int, device, config: dict,
                           already: set, now: float) -> None:
         """Device-level temperature/humidity from ENTITY-SENSOR-MIB (RFC
-        3433) — a Room Alert-class environmental monitor, or any switch,
-        router or PDU that exposes its own chassis sensors through the
-        standard MIB rather than (or in addition to) a vendor-specific one.
+        3433) — an environmental monitor, or any device exposing its own
+        chassis sensors through the standard MIB.
 
-        Deliberately does NOT require entAliasMappingIdentifier to decide
-        whether a sensor is WORTH READING — see _decode_entity_sensor's
-        docstring for why that gate on read_dom() made an environmental
-        monitor's sensors unreachable everywhere in this app. It DOES use
-        that same mapping to decide WHICH metric key a temperature reading
-        becomes, which is the fix for a real incident this shipped with
-        for about a day: 45 C is a perfectly healthy switch chassis and a
-        perfectly ordinary SFP DOM reading runs 40-55 C, but is a warning
-        sign in a comms closet — one "temp_c" key and one threshold rule
-        covering all three read as ten false "Temperature high" alerts on
-        a 25-device fleet with one Room Alert and some healthy switches in
-        it, the exact mib_missing-email-storm shape the product's own
-        prior review already burned an operator's trust on once. So a
-        temperature reading is classified into one of three keys before it
-        is ever stored, and the three get three separate rules with three
-        separate defaults instead of fighting over one:
+        A sensor is read whether or not it maps to a port; the mapping only
+        decides WHICH key a temperature becomes, because 45 C is healthy on
+        a chassis, ordinary on an SFP, and a warning in a comms closet. One
+        "temp_c" key under one threshold rule alerts on all three:
 
-        - temp_optic_c: the sensor maps to a port (via the same containment
-          walk read_dom uses, generalised to "any port" by
-          _walk_port_mapped_entities) — an SFP/QSFP's own DOM temperature,
-          normal well above ambient.
-        - temp_ambient_c: the sensor maps to no port, AND this device also
-          answers at least one humidity sensor. A chassis essentially never
-          carries one; a dedicated room/rack environmental monitor (Room
-          Alert and the like) always does, on any vendor's arc, which is
-          why this is the humidity table itself rather than a vendor check
-          — it generalises past AVTECH for free.
-        - temp_chassis_c: everything else unmapped — the DEFAULT for "an
-          ordinary switch or router's own internal board/PSU/fan sensor",
-          chosen deliberately as the fallback rather than temp_ambient_c:
-          a device this cannot positively identify as an environmental
-          monitor must not have its plain chassis warmth silently read as
-          a room getting hot, which is the mistake being fixed here.
-          Lands in the SAME key jnxOperatingTable's reading uses (see
-          VENDOR_HEALTH), so a device answering both never reports two
-          disagreeing chassis temperatures.
+        - temp_optic_c: the sensor maps to a port (the containment walk
+          read_dom uses, generalised by _walk_port_mapped_entities).
+        - temp_ambient_c: unmapped, AND this device also answers a humidity
+          sensor. A chassis essentially never does and a room monitor always
+          does, on any vendor's arc — so this generalises past one vendor.
+        - temp_chassis_c: everything else unmapped, and the deliberate
+          default: a device that cannot be positively identified as an
+          environmental monitor must not have its own warmth read as a room
+          getting hot. Same key jnxOperatingTable uses, so a device
+          answering both never reports two disagreeing temperatures.
 
-        Best-effort and gated two ways. Within the cadence window
-        (_SENSOR_REFRESH_S — see that constant's comment) nothing runs at
-        all. Across polls, once the cadence lets a walk through:
-        devices.sensor_capable is the same probe-once-remember memory
-        _poll_poe/_poll_stp/_poll_ups_health use for their own tables —
-        NULL until the first attempt, then True or False, persisted, so a
-        device confirmed to have no ENTITY-SENSOR-MIB support is skipped
-        entirely rather than retried every _SENSOR_REFRESH_S forever. That
-        distinction is the whole difference between "one wasted walk on a
-        switch that will never answer it" and "one wasted walk every five
-        minutes, indefinitely, on every such switch in a 2,000-device
-        fleet" — the second is a real, compounding cost the first is not.
-        Recorded only on the FIRST probe (capable is None), the same rule
-        every other capability memory in this file already follows: a
-        device already confirmed capable that simply times out once must
-        not be relabelled incapable off that alone.
+        Best-effort, gated twice: nothing runs inside the _SENSOR_REFRESH_S
+        window, and devices.sensor_capable is the probe-once-remember memory
+        _poll_poe/_poll_stp/_poll_ups_health also use, so a device with no
+        support is skipped rather than re-walked forever. Recorded only on
+        the FIRST probe: a device already confirmed capable that times out
+        once must not be relabelled incapable.
         """
         capable = device["sensor_capable"]
         if capable == 0:
@@ -3715,17 +3453,11 @@ class NodePoller:
         port — same on-demand-while-the-dialog-is-open shape as read_dom()
         above: walked only when a human asks, never on the poll cycle.
 
-        Three sources, because no single one covers the field. Q-BRIDGE's
-        dot1qTpFdbTable is what a VLAN-aware switch actually populates and
-        is tried first; the original BRIDGE-MIB dot1dTpFdbTable is the
-        fallback; and classic Cisco IOS, which populates neither globally,
-        is read per VLAN through the community@vlan convention. The first
-        source that yields anything wins — they describe the same port, so
-        merging them would double-count.
-
-        Note the MIB catalog has nothing to do with this: polling uses these
-        numeric OIDs directly, and an uploaded MIB only ever supplies display
-        names. Reading more tables is the only thing that widens coverage.
+        Three sources, because no single one covers the field: Q-BRIDGE's
+        dot1qTpFdbTable first, the original BRIDGE-MIB dot1dTpFdbTable as
+        fallback, and classic Cisco IOS per VLAN through the community@vlan
+        convention. The first that yields anything wins — they describe the
+        same port, so merging them would double-count.
 
         Returns None (not []) when the device answers none of them, so the
         dialog can say "no data" instead of "zero MACs learned on this
@@ -3900,7 +3632,7 @@ class NodePoller:
             return None
 
     def _poll_poe(self, device_id: int, device, config: dict) -> None:
-        """POWER-ETHERNET-MIB (Tier 1 #7): PSE budget/consumption and
+        """POWER-ETHERNET-MIB: PSE budget/consumption and
         per-port admin/detection state, read every poll once the device is
         known to answer it.
 
@@ -3985,7 +3717,7 @@ class NodePoller:
                 device_id, [{"if_index": i, **fields} for i, fields in rows.items()])
 
     def _poll_stp(self, device_id: int, device, config: dict) -> None:
-        """BRIDGE-MIB dot1dStp (Tier 1 #7): bridge-wide spanning-tree state
+        """BRIDGE-MIB dot1dStp: bridge-wide spanning-tree state
         every poll once the device is known to be a bridge, plus per-port
         state joined onto the SAME bridge-port -> ifIndex map the MAC table
         walk already resolves (_bridge_port_map) — dot1dStpPort IS
@@ -4341,10 +4073,8 @@ class NodePoller:
         a job can report progress without exposing its list.
 
         GETBULK on v2c and v3, over one shared socket, the same way
-        _walk_column already walks a table column. This was one GETNEXT and
-        one fresh UDP socket per row: the review put a fleet-wide first
-        identification at about 2.8 hours, almost all of it round trips
-        that a single GETBULK could have answered forty at a time.
+        _walk_column already walks a table column — a GETNEXT and a fresh
+        socket per row put a fleet-wide first identification in the hours.
         """
         deadline = time.time() + budget_s
         rows: list[dict] = []

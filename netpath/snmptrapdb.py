@@ -1,65 +1,17 @@
 """Storage for received SNMP traps.
 
-No FTS5, unlike syslog. Syslog needs a trigram index because a busy firewall
-produces millions of rows a day. Traps are two to four orders of magnitude
-rarer, and the useful queries are on indexed columns (`ts`, `severity`,
-`source`, `trap_oid`) — a `LIKE` over `varbind_text`, already narrowed by the
-time window, reads a handful of rows.
-
-Varbinds are stored as one JSON column, not a child table. A varbind list is
-read exactly once, whole, by the detail panel of a selected row; it is never
-joined, grouped or aggregated. A child table would add write amplification of
-five to twenty times on the hot insert path, a second index, and a second
-query on every detail click, to buy an ability nothing asks for. Free-text
-search over the varbinds is already served by the denormalized
-`varbind_text` column.
+No FTS5, unlike syslog: traps are rarer and the useful queries are on indexed
+columns, so a LIKE over `varbind_text` inside the time window reads a handful
+of rows. Varbinds are one JSON column: read whole, once, never joined.
 """
 
 from __future__ import annotations
 
 import json
-import logging
-import os
 import sqlite3
-import threading
 import time
 
-from . import dbmaint, dbopen, settingsutil
-
-log = logging.getLogger(__name__)
-
-# Trimming a database back under its size cap: rows are deleted in fixed
-# batches, each in its own short transaction, so the write lock is never held
-# for more than one batch. The old shape deleted 15% of the table and then
-# VACUUMed the whole file with the lock held, up to six times per maintenance
-# pass — measured at a 4.1 s stall on one insert against a 232 MB file, and it
-# still finished above the cap and reported success.
-TRIM_CHUNK = 2_000           # rows per lock acquisition, adapted below
-TRIM_CHUNK_MIN = 500
-TRIM_CHUNK_MAX = 50_000
-TRIM_LOCK_TARGET_S = 0.15    # how long one batch may hold the write lock
-TRIM_PASSES = 40             # delete/reclaim rounds before giving up
-TRIM_BUDGET_S = 30.0         # wall clock for one trim_to_size call
-
-# This database's SIZE CAP (max_snmp_db_mb, what trim_to_size above is given
-# as max_bytes) lives in appdb.py's GLOBAL_DEFAULTS, not here — every
-# module's own *_db_mb setting does, one place, so Settings can show them
-# side by side. Documented here anyway, since this is the module an operator
-# sizing that cap would actually open:
-#
-#   A 250-device review install logged a 75-second trap burst that wrote
-#   98.6 MB — 38% of the 256 MB the cap shipped at — which is roughly
-#   1.3 MB/s, ~197 MB of traps per minute sustained. At that rate a REAL
-#   storm (a site-wide power event, a flapping upstream link fanning traps
-#   out from everything behind it) reaches a 256 MB cap in under four
-#   minutes and starts discarding trap HISTORY while the incident that
-#   produced it is still active — the exact moment an operator most needs
-#   all of it. retention_days (90, above) is meant to be what decides how
-#   long trap history lives; a cap this tight let the size limit win that
-#   argument silently, deleting rows the day-count setting had not asked to
-#   lose yet. max_snmp_db_mb is 1024 in appdb.py now, matching
-#   max_syslog_db_mb and max_nodes_db_mb — both of which see comparable or
-#   worse burst volume and were never shipped at 256 to begin with.
+from .sqlitebase import SqliteStore
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS traps (
@@ -159,48 +111,16 @@ DEFAULTS = {
 }
 
 
-class SnmpTrapDatabase:
+class SnmpTrapDatabase(SqliteStore):
+    SCHEMA = SCHEMA
+    DEFAULTS = DEFAULTS
+    LABEL = "snmptraps.db"
+    TRIM_TABLE = "traps"
+    TRIM_FLOOR = 5000
+
     def __init__(self, path: str):
-        self.path = path
-        self._lock = threading.RLock()
-        self._conn = dbopen.connect(path)
-        self._conn.row_factory = sqlite3.Row
         self.store_raw = False
-        with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            dbmaint.enable_incremental_vacuum(self._conn, "snmptraps.db")
-            self._conn.executescript(SCHEMA)
-            self._conn.commit()
-
-    def close(self) -> None:
-        with self._lock:
-            self._conn.close()
-
-    # --------------------------------------------------------------- settings
-
-    def settings(self) -> dict:
-        values = dict(DEFAULTS)
-        with self._lock:
-            rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
-        for row in rows:
-            if row["key"] in values:
-                try:
-                    values[row["key"]] = json.loads(row["value"])
-                except (ValueError, TypeError):
-                    pass
-        return settingsutil.coerce_settings(DEFAULTS, values, strict=False)
-
-    def save_settings(self, values: dict) -> None:
-        with self._lock:
-            for key, value in values.items():
-                if key not in DEFAULTS:
-                    continue
-                self._conn.execute(
-                    "INSERT INTO settings(key, value) VALUES (?,?)"
-                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (key, json.dumps(value)))
-            self._conn.commit()
+        super().__init__(path)
 
     # ------------------------------------------------------------------ write
 
@@ -348,17 +268,11 @@ class SnmpTrapDatabase:
         return buckets
 
     def traps_since(self, last_id: int, limit: int | None = 500) -> list[sqlite3.Row]:
-        """Rows newer than last_id, oldest first. The alert engine reads
-        forward by id and keeps its own cursor, so it never re-reads a trap
-        and never depends on wall-clock ordering — a device with a bad
-        clock can file a trap timestamped in the past; its rowid is still
-        monotonic.
+        """Rows newer than last_id, oldest first.
 
-        `limit` is the caller's per-tick budget; None means "everything newer",
-        which only a caller that has already sized the backlog with max_id()
-        should ask for. The engine used to take the 500 default once per
-        five-second tick, i.e. 100 rows/s against a measured ingest of nearly
-        12,000/s, so a busy site fell behind for ever with no way to see it.
+        By id, not by ts: a device with a bad clock can file a trap
+        timestamped in the past, and its rowid is still monotonic. `limit` is
+        the caller's per-tick budget; None means everything newer.
         """
         with self._lock:
             if limit is None:
@@ -405,15 +319,6 @@ class SnmpTrapDatabase:
 
     # ------------------------------------------------------------ maintenance
 
-    def size_bytes(self) -> int:
-        total = 0
-        for suffix in ("", "-wal", "-shm"):
-            try:
-                total += os.path.getsize(self.path + suffix)
-            except OSError:
-                pass
-        return total
-
     def prune(self, retention_days: float, max_rows: int) -> int:
         removed = 0
         cutoff = time.time() - retention_days * 86400
@@ -429,69 +334,4 @@ class SnmpTrapDatabase:
                     " ORDER BY ts ASC LIMIT ?)", (total - max_rows,))
                 removed += cursor.rowcount or 0
             self._conn.commit()
-        return removed
-
-    def trim_to_size(self, max_bytes: int) -> int:
-        """Delete the oldest traps until the file fits under the cap.
-
-        Batched and reclaimed rather than deleted-and-VACUUMed: insert()
-        takes the same lock, so a whole-file rewrite under it blocked the
-        receiver's writer thread and filled the queue behind it.
-        """
-        if max_bytes <= 0:
-            return 0
-        removed = 0
-        deadline = time.monotonic() + TRIM_BUDGET_S
-        for _ in range(TRIM_PASSES):
-            size = self.size_bytes()
-            if size <= max_bytes:
-                break
-            with self._lock:
-                bounds = self._conn.execute(
-                    "SELECT MIN(id) AS lo, MAX(id) AS hi FROM traps").fetchone()
-            low, high = bounds["lo"], bounds["hi"]
-            # Ids are handed out in arrival order, so the id span is both the
-            # right definition of "oldest" — immune to a device with a wrong
-            # clock — and a proxy for the row count that costs one index probe
-            # rather than the full scan a COUNT(*) would.
-            deletable = 0 if low is None else max(0, high - low + 1 - 5000)
-            if deletable:
-                span = high - low + 1
-                want = min(deletable, max(1, int(
-                    span * (1.0 - max_bytes / float(size)) * 1.1)))
-                cut = low + want
-                chunk = TRIM_CHUNK
-                while low < cut and time.monotonic() < deadline:
-                    upper = min(low + chunk, cut)
-                    started = time.monotonic()
-                    with self._lock:
-                        cursor = self._conn.execute(
-                            "DELETE FROM traps"
-                            " WHERE id >= ? AND id < ?", (low, upper))
-                        removed += cursor.rowcount or 0
-                        self._conn.commit()
-                    held = time.monotonic() - started
-                    low = upper
-                    # Keep one batch's lock hold near TRIM_LOCK_TARGET_S
-                    # however large the rows turn out to be — a trap with its
-                    # raw frame stored costs an order of magnitude more than a
-                    # syslog line, and one fixed batch size cannot suit both.
-                    if held > TRIM_LOCK_TARGET_S:
-                        chunk = max(TRIM_CHUNK_MIN, chunk // 2)
-                    elif held < TRIM_LOCK_TARGET_S / 4:
-                        chunk = min(TRIM_CHUNK_MAX, chunk * 2)
-            # Hand the freed pages back, in short slices outside the lock
-            # block. reclaim takes the lock itself and reacquires it in a
-            # tight loop, and a Python lock is not fair, so it is asked for a
-            # little at a time rather than for one long run.
-            while time.monotonic() < deadline:
-                if not dbmaint.reclaim(self._conn, self._lock, pages=500,
-                                       budget_s=0.2, label="snmptraps.db"):
-                    break
-            if not deletable or time.monotonic() >= deadline:
-                break
-        if self.size_bytes() > max_bytes:
-            log.warning("%s: %d bytes after removing %d rows, still above the "
-                        "%d byte cap; continuing at the next maintenance pass",
-                        "snmptraps.db", self.size_bytes(), removed, max_bytes)
         return removed

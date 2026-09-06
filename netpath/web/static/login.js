@@ -1,5 +1,4 @@
-/* The sign-in page. Deliberately small: it shares the stylesheet and nothing
-   else, so none of the application loads for someone who is not signed in. */
+// The sign-in page: shares the stylesheet and nothing else of the application.
 (() => {
   const form = document.getElementById('login-form');
   const error = document.getElementById('login-error');
@@ -39,17 +38,12 @@
         document.getElementById('password').focus();
         return;
       }
-      // A fresh sign-in always lands on Dashboard, whatever tab was open
-      // last time — app.js's own reload-preserves-tab logic (same
-      // 'sappiwhere.tab' key) takes over for every reload after this one.
-      try { localStorage.setItem('sappiwhere.tab', 'dashboard'); } catch (e) { /* private browsing, or storage full: not worth failing */ }
-      // ...unless they were sent here from a link. A 401 on #/alerts/998
-      // redirects to /login, and signing in should finish the journey rather
-      // than dropping them on the Dashboard with the link lost. The hash is
-      // preserved by the redirect, so it is still here to hand back.
+      // A fresh sign-in lands on Dashboard; app.js's reload-preserves-tab
+      // logic takes over for every reload after this one.
+      try { localStorage.setItem('sappiwhere.tab', 'dashboard'); } catch (e) { /* private browsing, or storage full */ }
+      // ...unless a redirect (e.g. a 401 on #/alerts/998) preserved a hash to finish the journey to.
       const wanted = String(window.location.hash || '');
-      // The query string rides along too: a wall display opened as
-      // /?kiosk=1 and bounced through sign-in should come back as one.
+      // The query string rides along too, so a kiosk link bounced through sign-in still comes back as one.
       const search = String(window.location.search || '');
       window.location.href = `/${search}${wanted.startsWith('#/') ? wanted : ''}`;
     } catch (err) {
@@ -62,8 +56,7 @@
 
   form.addEventListener('submit', submit);
 
-  // Already signed in? Do not make them type it again. And on a fresh
-  // install nobody has signed in to, say that the default account exists.
+  // Already signed in? Do not make them type it again; on a fresh install, say the default account exists.
   fetch('/api/session')
     .then((r) => r.json())
     .then((d) => {
@@ -74,8 +67,7 @@
         const user = document.getElementById('username');
         if (user && !user.value) user.value = 'admin';
       }
-      // Not every build sends d.version — /api/session gained it in 4.48.0 —
-      // so this draws only once something supplies one.
+      // Not every build sends d.version, so this draws only once something supplies one.
       const versionEl = document.getElementById('login-version');
       if (versionEl && d.version) {
         versionEl.textContent = `v${d.version}`;

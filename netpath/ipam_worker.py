@@ -15,8 +15,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .eventlog import ERROR, IPAM, NullLog, SYSTEM
 from .ipam_dhcp import poll as dhcp_poll
-from .ipam_scan import SubnetTooLarge, normalize_mac, read_arp_table, sweep, usable_addresses
+from .ipam_scan import SubnetTooLarge, mac_colon, read_arp_table, sweep, usable_addresses
 from .ipamdb import IpamDatabase, scope_size
+from .worker import Worker
 
 # How many subnet scans may run at once. Each one calls sweep(), which builds
 # its own ThreadPoolExecutor of `ping_workers` (64) threads and runs one
@@ -59,7 +60,9 @@ def credential_for_server(server) -> tuple[str | None, str | None]:
     return username, password
 
 
-class IpamWorker:
+class IpamWorker(Worker):
+    THREAD_NAME = "ipam-worker"
+
     def __init__(self, db: IpamDatabase, log=None, global_settings=None):
         self.db = db
         self.log = log or NullLog()
@@ -70,7 +73,6 @@ class IpamWorker:
         # simply has no deny list.
         self._global_settings = global_settings
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._next_scan: dict[int, float] = {}
         self._next_dhcp_poll: dict[int, float] = {}
@@ -92,16 +94,11 @@ class IpamWorker:
         self._scan_started: dict[int, float] = {}
         self._poll_started: dict[int, float] = {}
 
-    @property
-    def running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
-
     def start(self) -> None:
         if self.running:
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, name="ipam-worker", daemon=True)
-        self._thread.start()
+        self._spawn()
         self.log.add(SYSTEM, "IPAM worker started")
 
     def stop(self) -> None:
@@ -293,7 +290,7 @@ class IpamWorker:
 
             for ip in addresses:
                 is_alive = bool(alive_map.get(ip))
-                mac = normalize_mac(arp.get(ip)) if ip in arp else None
+                mac = mac_colon(arp.get(ip)) if ip in arp else None
                 if is_alive:
                     alive_count += 1
                 previous = self.db.record_host(ip, subnet_id, is_alive, mac)
@@ -309,7 +306,7 @@ class IpamWorker:
 
                 lease = self.db.dhcp_lease_for_ip(ip)
                 if lease and lease["mac"] and lease["polled_ts"] >= dhcp_cutoff:
-                    lease_mac = normalize_mac(lease["mac"])
+                    lease_mac = mac_colon(lease["mac"])
                     if lease_mac and lease_mac != mac:
                         if self.db.record_conflict(ip, lease_mac, mac, "scan_dhcp"):
                             new_conflicts += 1

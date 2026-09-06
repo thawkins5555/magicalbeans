@@ -1,81 +1,9 @@
-"""The two reports an operator is asked for by name every month, computed
-from history the application was already keeping and answering to nobody:
-how available was a device over some window, and which links came closest
-to saturation.
-
-Both read history that already exists — nodesdb.py's `device_events` (state
-transitions) and `samples_hourly` (the year-scale rollup `analysis.py`'s
-sibling module never reads) — and nothing here writes anything. This module
-sits above nodesdb.py and alertsdb.py rather than inside either: it reaches
-into their SQLite connections directly for the handful of aggregate queries
-neither module exposes as public methods (see `_conn` below), rather than
-adding methods to files someone else is editing this hour, and calls their
-existing public methods — `device_status_segments`, `windows`, `mutes` —
-for everything they already do correctly. If those aggregate queries earn
-their place, the natural next step is promoting them to real methods on
-`NodesDatabase`; that is a decision for whoever owns that file, not this one.
-
-Why `device_status_segments` is the source of truth for "was it up", and
-`devices.status`/`last_up_ts`/`last_down_ts` are not: the device row only
-ever holds the CURRENT status and the timestamp of the most recent
-transition into up or down. There is no column anywhere holding "how long
-was it down last Tuesday" — that only exists as the sequence of `down`/`up`
-rows in `device_events`, which `device_status_segments` (nodesdb.py:2676)
-already turns into ordered, non-overlapping [start, end, status) segments
-covering an arbitrary window. Building availability on anything else would
-be building it on a snapshot, not a history.
-
-Four ways a gap in that history is NOT the same as "the device was down",
-and what this module actually does about each one — spelled out here
-because getting this wrong is worse than not reporting it at all; an
-availability figure that quietly counts the wrong things is exactly the
-kind of number somebody puts in front of a manager and later has to
-retract:
-
-1. **The device did not exist yet.** `devices.created_ts` is exact and
-   permanent, so the window used for each device is clipped to
-   `[max(t0, created_ts), t1]` and how much was cut off is reported
-   (`excluded_before_created_s`) rather than silently shrinking the
-   window with no trace of it having happened.
-2. **A maintenance window covered it.** `alertsdb.maintenance_windows`
-   rows are never deleted by age — `windows()` returns "past, active and
-   future" by its own docstring — so this is the one exclusion this module
-   can compute with full retroactive accuracy for any window, including
-   one from months ago. `is_window_active` (alertsdb.py:333) only answers
-   "is this covering right now", so `_window_occurrences` below
-   generalises the same arithmetic (including the weekly-recurrence
-   modulo) to "which of this row's occurrences overlap an arbitrary past
-   span" — every occurrence, not just the current one, since a month-long
-   report can cross several weekly recurrences of the same window.
-3. **The device was muted.** This is the one gap this module can only
-   partly close, and that limitation is reported, not hidden.
-   `alertsdb.purge_expired_mutes` DELETES an `alert_mutes` row once its
-   `until_ts` passes — unlike a maintenance window, a mute that already
-   lapsed before this report ran leaves no trace anywhere. So only a mute
-   that is STILL active (its row still exists) can be excluded
-   retroactively, using its own `created_ts`/`until_ts` as the covered
-   span; a mute from three weeks ago that has since expired and been
-   purged is invisible here, and its downtime — if it had any — reads as
-   ordinary down time. `MUTE_HISTORY_CAVEAT` below is attached to every
-   report so this is never missed by a reader who only looks at the
-   numbers.
-4. **The poller itself was stopped**, so nothing was being recorded for
-   anyone, not just this device. `device_status_segments` cannot invent a
-   down segment from silence — it only marks time "down" where a `down`
-   event actually says so — so a poller outage cannot manufacture false
-   down time here. What it CAN do is carry the last known status forward
-   through a stretch where nothing happened, which silently assumes
-   continuity ("it was up before, so it's still up") across a gap that
-   might really have been a stopped poller rather than a boring, healthy
-   month. Rather than build a fleet-wide silence detector — expensive
-   over `samples_hourly` at scale, and still only ever a guess — every
-   segment longer than `GAP_FLAG_S` is flagged in the device's own
-   `caveats` with its span, so a reader can cross-check it against
-   RUNBOOK.md's "The poller has stopped" section rather than trust the
-   number blind.
-
-Standard library only, same as everything else this application is built
-from.
+"""Availability and top-N-saturation reports, computed read-only from
+history nodesdb.py/alertsdb.py already keep (device_events, samples_hourly,
+maintenance_windows, mutes). A history gap is not necessarily downtime: it
+is clipped to the device's created_ts, excluded where a maintenance window
+or a still-active mute covers it, and flagged (not hidden) past GAP_FLAG_S
+in case it was really a stopped poller rather than a quiet, healthy device.
 """
 
 from __future__ import annotations
@@ -87,22 +15,13 @@ from dataclasses import asdict, dataclass, field
 
 from netpath.analysis import clamp_window
 
-# A segment (of any status) longer than this with no transition inside it
-# is flagged rather than trusted outright — see point 4 above. Three hours
-# is well past any shipped poll_interval_s (60-120s typical, and the
-# down_after grace on top of that), so a real poll cycle running normally
-# never trips it; a genuinely quiet, healthy device that just never changed
-# state for a week WILL trip it, and that is the honest tradeoff of a
-# constant threshold instead of a fleet-wide silence query — flagged, not
-# hidden, costs nothing at report time either way.
+# A segment longer than this with no transition inside it is flagged rather
+# than trusted outright — it might be a stopped poller, not a quiet device.
+# Well past any shipped poll_interval_s, so a normal poll cycle never trips it.
 GAP_FLAG_S = 3 * 3600.0
 
-# Every ad-hoc mute this report can retroactively see is bounded by this —
-# see point 3 above and alertsdb.MAX_MUTE_HOURS, which this deliberately
-# does not import a hard dependency on beyond documenting the same number:
-# a mute is never more than a day, so "the mute might explain more than a
-# day of the gap" is never the right suspicion; "the mute already expired
-# and was purged before this report ran" is the one that is often right.
+# Bounds how much of a gap an ad-hoc mute can retroactively explain (matches
+# alertsdb.MAX_MUTE_HOURS' one-day ceiling without a hard import dependency).
 MUTE_HISTORY_CAVEAT = (
     "ad-hoc device mutes are deleted once they expire, so only a mute "
     "still active when this report ran could be excluded; a mute that "
@@ -254,15 +173,9 @@ def device_availability_report(nodesdb, device_ids: list[int], t0: float, t1: fl
                                *, alertsdb=None, now: float | None = None
                                ) -> AvailabilityReport:
     """Availability, outage count, total downtime, longest outage and MTTR
-    for each of `device_ids` over [t0, t1].
-
-    `alertsdb` is optional so a caller — or a test — that only has a
-    NodesDatabase still gets a correct report; without it, every device's
-    `caveats` says plainly that maintenance/mute exclusion was skipped, and
-    `down_s` includes every reason for the gap this module cannot resolve
-    without one, rather than pretending the exclusion ran and finding
-    nothing to exclude.
-    """
+    for each of `device_ids` over [t0, t1]. `alertsdb` is optional — without
+    it, `caveats` says maintenance/mute exclusion was skipped rather than
+    pretending it ran and found nothing to exclude."""
     t0, t1 = clamp_window(t0, t1)
     now = time.time() if now is None else now
     global_caveats = [MUTE_HISTORY_CAVEAT]
@@ -464,72 +377,9 @@ def top_metric_ranking(nodesdb, key: str, t0: float, t1: float, *,
                        device_ids: list[int] | None = None
                        ) -> TopMetricReport:
     """The top (or bottom) `n` metric series by peak or mean value over
-    [t0, t1] — "which twenty links came closest to saturation" is
-    `key="if_in_util_pct.%", like=True, rank_by="peak"`; "which devices ran
-    hottest" is `key="cpu_pct", rank_by="mean"`.
-
-    Reads samples_hourly, never samples: three days of raw samples is not
-    a month, and a raw scan at fleet scale would not finish (see the module
-    docstring's sibling reasoning in analysis.py's own MAX_BUCKETS comment
-    for the same "bound it here, don't trust the caller" instinct). One
-    query, structured as a CTE rather than resolving candidate ids in
-    Python first and passing them back as a giant `IN (...)` list — at
-    fleet scale (2,000 devices x 48 ports is 96,000 candidate metrics for
-    one interface-metric family) that list blows past SQLite's own bound
-    parameter ceiling (`sqlite3.OperationalError: too many SQL variables`,
-    hit while first writing this against a 2,000-device benchmark).
-
-    `candidates` (metrics joined to devices, filtered by key/like and,
-    optionally, `device_ids`) is small — one row per series, not one per
-    hour — so `metrics.key` having no index of its own (only
-    `UNIQUE(device_id, key)`) costs nothing here. The join from
-    `candidates` to `samples_hourly` is a CROSS JOIN rather than a plain
-    JOIN for a reason worth being explicit about, because getting it wrong
-    silently un-does the entire point of this function: a plain JOIN
-    leaves SQLite free to reorder the two tables, and against a realistic
-    fleet-sized `samples_hourly` (many metric families mixed together,
-    not just the one being ranked) it chooses to start from
-    `ix_samples_hourly_hour` and filter every row in the hour range by a
-    per-row lookup into `candidates` — which scans every OTHER metric
-    family's rows in that hour range too, not just the ones this call
-    asked for. CROSS JOIN disables that reordering in SQLite specifically,
-    forcing `candidates` (small) to drive the loop and `samples_hourly`
-    (huge) to be probed by its own primary key once per candidate, which
-    is the entire reason that table's key leads on metric_id.
-
-    Measured (this function itself, not a simplified stand-in — see
-    tests/test_report_topn.py for the exact fixture), 2,000 devices x 48
-    ports x six interface-metric families (576,000 series, 97.3M rows in
-    samples_hourly, a realistic mix of families rather than only the one
-    ranked), ranking one family (96,000 candidate series) over one week
-    of hourly rows: **22-23 seconds**, for either `rank_by`. Isolating
-    just the join strategy on a smaller version of the same fixture (see
-    this module's own dev notes) showed why CROSS JOIN is not optional:
-    a plain JOIN there measured **45.8s** against the same row count, and
-    critically its cost scales with the WHOLE table (it degrades further
-    as more unrelated metric families are added), where the CROSS JOIN
-    plan's cost stayed flat regardless, because it never touches them.
-
-    A month (730h vs the 168h measured) projects to roughly **95-100
-    seconds** at this scale — too slow for an interactive request against
-    the full fleet, and the remaining cost is inherent to samples_hourly
-    being a ROWID table: its primary key is an index into rowids, not the
-    row's own storage, so satisfying it still costs one extra rowid
-    lookup per matched row on top of the index search. Declaring
-    samples_hourly `WITHOUT ROWID` — so `(metric_id, hour)` becomes the
-    actual clustering key and `n`/`vmin`/`vavg`/`vmax` live inline with it
-    — would remove that second lookup; that is a genuine schema migration
-    on a table this module does not own, so it is specified here rather
-    than made. Until then, a caller running this across the whole fleet
-    over a month or more should treat it as a background/scheduled
-    report, not an interactive one; `query_ms` below is exactly the
-    number to watch for that decision, and narrowing `device_ids` to the
-    devices actually in scope (team lead's own example — "these thirty
-    devices" — rather than the whole fleet) is the other lever a caller
-    already has without any schema change at all.
-
-    `query_ms` on the returned report is the wall-clock cost of the whole
-    query, so a caller or a test can watch it rather than guess at it.
+    [t0, t1], read from samples_hourly (never samples — a raw scan would not
+    finish at fleet scale). `query_ms` on the result is the wall-clock cost
+    of the whole query, for a caller to watch on a wide/long request.
     """
     t0, t1 = clamp_window(t0, t1)
     h0 = int(t0 // 3600) * 3600
@@ -556,18 +406,11 @@ def top_metric_ranking(nodesdb, key: str, t0: float, t1: float, *,
         f" c.device_name, c.device_ip, MAX(sh.vmax) AS peak,"
         f" SUM(sh.vavg * sh.n) AS sum_avg_n, SUM(sh.n) AS total_n,"
         f" COUNT(*) AS n_hours"
-        # CROSS JOIN, deliberately: a plain JOIN here left SQLite free to
-        # reorder the two tables, and it chose to start from
-        # ix_samples_hourly_hour and filter candidates.metric_id by rowid
-        # lookup per row — fine when this metric family is most of the
-        # table, ruinous once samples_hourly holds the other families a
-        # real fleet actually has (measured: 46s vs 14s across 97M rows,
-        # six metric families, one queried — see tests/test_report_topn.py
-        # and this function's own docstring). CROSS JOIN in SQLite disables
-        # that reordering, forcing `candidates` (small) to drive the loop
-        # and `samples_hourly` (huge) to be probed by its own primary key
-        # per candidate, which is the whole reason this table's key leads
-        # on metric_id.
+        # CROSS JOIN, deliberately: it disables SQLite's join reordering, forcing
+        # small `candidates` to drive the loop and huge `samples_hourly` to be
+        # probed by its own primary key per candidate — a plain JOIN let SQLite
+        # start from the hour index instead and scan every unrelated metric
+        # family's rows in range too.
         f" FROM candidates c CROSS JOIN samples_hourly sh ON sh.metric_id = c.metric_id"
         f" WHERE sh.hour >= ? AND sh.hour <= ? GROUP BY c.metric_id",
         params).fetchall()

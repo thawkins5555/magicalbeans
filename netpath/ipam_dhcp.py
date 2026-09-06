@@ -1,41 +1,9 @@
-"""Read-only polling of a Windows DHCP server's scopes and leases.
-
-Two ways to authenticate, and a server can use either:
-
-* **Ambient identity** (the default). The DhcpServer module's own `Get-*`
-  cmdlets are called with `-ComputerName`, which authenticates as whichever
-  Windows account is running SappiWhere — or, if Windows Credential Manager
-  on this machine has an entry for that server's name, whatever credential
-  Windows itself picks for that target. This needs the `DhcpServer` module
-  installed locally (on the machine running SappiWhere), talks to the DHCP
-  server over its own RPC endpoint, and needs nothing enabled there beyond
-  what the DHCP Server role already opens.
-
-* **A stored credential**, for a server whose `username` and `password_enc`
-  columns are set. The username and the *already-decrypted* password are
-  passed in by the caller — this module never touches DPAPI itself, see
-  dpapi.py — and the script runs the same query through `Invoke-Command
-  -Credential`, over PowerShell remoting. That scriptblock executes ON the
-  DHCP server rather than being relayed through it, so this path needs WinRM
-  reachable on the DHCP server and the `DhcpServer` module present there,
-  which a real DHCP server almost always already has since it ships with the
-  role. It does not need the module installed on the SappiWhere machine.
-
-Either way, nothing here can write to a DHCP server. The scripts below are
-fixed constants, never built from user input. The server name, and the
-username and password when a stored credential is used, all travel as
-environment variables rather than being woven into command text, so there is
-no string for any of them to inject into. Every DHCP cmdlet called is a
-`Get-`; `Invoke-Command` only ever runs the one fixed scriptblock defined in
-this file, never a string built at runtime.
-
-The password exists as plaintext for as short a window as this design
-allows: decrypted by the caller just before the call, read by PowerShell out
-of an environment variable and immediately wrapped in a SecureString, and
-never written to a log, an error message, or disk. It is still plaintext in
-memory for that window, in the Python process and the child PowerShell
-process both — there is no way to hand a script a password it can use
-without it existing somewhere before that use.
+"""Read-only polling of a Windows DHCP server's scopes and leases, via
+PowerShell `DhcpServer` cmdlets — either ambient Windows identity
+(`-ComputerName`, local module) or a stored credential over
+`Invoke-Command -Credential` (module runs on the DHCP server itself). All
+scripts are fixed constants; server name/username/password travel as
+environment variables, never woven into command text.
 """
 
 from __future__ import annotations
@@ -47,9 +15,9 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 
-from .procs import hidden
+from .worker import hidden
 
 IS_WINDOWS = os.name == "nt"
 
@@ -178,13 +146,8 @@ try {
 
 
 class DhcpUnavailable(Exception):
-    """PowerShell, the DhcpServer module, or the target server did not answer.
-
-    Distinct from a plain connection failure so the caller can show the
-    person a reason rather than a bare traceback: no PowerShell on this host,
-    the RSAT DHCP tools are not installed, or the remote call itself failed
-    (unreachable, access denied, no matching Credential Manager entry).
-    """
+    """PowerShell, the DhcpServer module, or the target server did not
+    answer — no PowerShell/RSAT tools, or the remote call itself failed."""
 
 
 def _powershell_binary() -> str:
@@ -258,18 +221,9 @@ def _friendly_error(message: str) -> str:
 
 
 def _raw_output_message(returncode: int, stdout: str, stderr: str) -> str:
-    """Build a diagnostic message that shows exactly what PowerShell printed,
-    for cases where we could not make sense of it (empty output, or output
-    that was not the JSON we expected). Used instead of a generic summary so
-    the person editing the DHCP server can see the real error — a module not
-    found, an access-denied, a WinRM trust failure — rather than just being
-    told parsing failed.
-
-    Whole stdout and stderr, not just the last line: the JSON line is always
-    last when things succeed, but when they don't, the useful detail (an
-    exception message, a stack trace) is usually earlier and would otherwise
-    be thrown away.
-    """
+    """Shows exactly what PowerShell printed when its output could not be
+    parsed as the expected JSON. Whole stdout/stderr, not just the last
+    line — the useful detail on failure is often earlier."""
     parts = [f"PowerShell exited with code {returncode}."]
     if stdout:
         parts.append(f"stdout:\n{stdout}")
@@ -375,16 +329,10 @@ class DhcpSnapshot:
 
 def poll(server: str, timeout_s: float = 30.0,
         username: str | None = None, password: str | None = None) -> DhcpSnapshot:
-    """One read-only snapshot of every scope, lease and reservation.
-
-    Raises DhcpUnavailable on anything short of success — no partial results,
-    since the caller replaces its stored snapshot wholesale and a partial one
-    would look like scopes or leases had been deleted from the server.
-
-    Pass username and password already decrypted — this function never
-    touches DPAPI, so if a caller is storing an encrypted credential, it must
-    decrypt it just before this call and let it go out of scope right after.
-    """
+    """One read-only snapshot of every scope, lease and reservation. Raises
+    DhcpUnavailable on anything short of success — no partial results, since
+    the caller replaces its stored snapshot wholesale. Pass username/password
+    already decrypted; this function never touches DPAPI."""
     payload = _run(_SCRIPT, server, timeout_s, username, password)
 
     reservations = _as_list(payload.get("reservations"))

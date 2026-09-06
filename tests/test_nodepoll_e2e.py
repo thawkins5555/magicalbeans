@@ -1,11 +1,8 @@
-"""End-to-end NodePoller test against a stub UDP SNMP agent (v2c only) —
-plan section 6.3's "without a real agent" path. Exercises the full
-_poll_device -> _snmp_get -> _poll_snmp_scalars/_poll_interfaces ->
-nodesdb.record_poll/replace_interfaces/record_metric_sample chain with no
-external dependency.
-
-Not part of the shipped test suite — a throwaway verification script.
-"""
+"""End-to-end NodePoller test against a stub UDP SNMP agent (v2c only), the
+plan's "without a real agent" path. Exercises the full _poll_device ->
+_snmp_get -> _poll_snmp_scalars/_poll_interfaces -> nodesdb.record_poll/
+replace_interfaces/record_metric_sample chain with no external dependency.
+Its StubAgent is reused by test_nodediscover_e2e.py and test_poller_behaviour.py."""
 import os
 import shutil
 import socket

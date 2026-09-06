@@ -1,18 +1,9 @@
-"""The SSH terminal end to end: the real web server, the real session
-registry, a real paramiko device.
-
-Everything here is in one process on loopback — there is no `ssh` binary in
-this environment and never will be, so the device is `tests/stubs/
-stub_ssh_device.py`, a paramiko server, and the browser is the small
-WebSocket client below. What is being proved is the protocol the terminal
-page depends on: the upgrade goes through the same permission gate as any
-other route, an open message reaches a shell, keystrokes arrive at the
-device, output comes back as binary frames, a device with no stored
-credential asks for one, and the session's limits and audit trail hold.
-
-DPAPI is monkeypatched before anything imports it, exactly as the ConfigRX
-suites do: this is not Windows, and what is under test is the plumbing
-around the credential, not the encryption of it."""
+"""The SSH terminal end to end: real web server, real session registry, and
+a paramiko stub device (tests/stubs/stub_ssh_device.py), all on loopback.
+Proves the protocol the terminal page depends on: the upgrade passes the
+permission gate, an open message reaches a shell, keystrokes reach the
+device, output returns as binary frames, a device without a stored credential
+asks for one, and session limits and the audit trail hold. DPAPI is stubbed."""
 import base64
 import http.client
 import json

@@ -1,27 +1,9 @@
-"""Wave 4, job 1/3: the API + gates surfacing Tier 1's already-committed
-LLDP/CDP, PoE, STP and PtP RF polling — driven against a real Service and
-WebServer over loopback, with the backend rows seeded directly through
-nodesdb's own accessors (the same shortcut test_poe_stp.py's two_ports()
-and test_lldp_topology.py's "best-effort device match" section take) rather
-than a live SNMP walk, since this suite is about the routes on top of that
-data, not the walk itself.
-
-Covers:
-  - GET /api/nodes/topology: nodes+edges shape, a matched pair of LLDP rows
-    (each device reporting the other) deduplicated into ONE edge, and an
-    unmatched neighbour drawn as its own synthetic "unknown" node.
-  - GET /api/nodes/devices/<id>/neighbors: the detail-pane shape.
-  - GET /api/nodes/devices/<id>/interfaces carries poe_admin/poe_detect_
-    status/poe_power_mw/stp_state; GET .../<id> carries poe_capable/
-    stp_capable/stp_root_id and friends.
-  - RF metrics (recorded exactly as nodepoll._poll_rf_metrics would) are
-    reachable through the ordinary /metrics and /series endpoints — nothing
-    RF-specific needed on the wire, which is the point.
-  - Every new route is gated ("nodes", read): a nodes:read account is let
-    in, an account with no nodes grant at all is refused.
-  - Both new CSV exports (topology, and one device's neighbours) round-trip
-    through Python's own csv module.
-"""
+"""The API and gates over LLDP/CDP, PoE, STP and PtP RF polling, driven against
+a real Service + WebServer over loopback with rows seeded through nodesdb's
+own accessors rather than a live walk. Covers /api/nodes/topology (matched
+LLDP pairs deduplicated into one edge, unmatched neighbours as synthetic
+"unknown" nodes), the neighbours route, PoE/STP fields on interface and device
+routes, RF via plain /metrics and /series, "nodes" read gating, and both CSVs."""
 import csv
 import http.client
 import io

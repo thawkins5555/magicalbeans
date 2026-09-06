@@ -1,17 +1,9 @@
-"""Regression coverage for the independent review's collector findings.
-
-One crafted NetFlow options record used to permanently kill flow storage
-while the status strip kept reading healthy (the critical finding); the
-template cache was keyed on fields any unauthenticated sender controls
-outright; a malformed SNMP trap could take 199 good ones down with it in one
-batch; and syslog stored control and ANSI escape bytes verbatim. Each test
-below proves one of those is now closed, the same way the neighbouring
-hardening suites do it: build the actual malformed bytes, feed them to the
-real decoder or a real listener on a loopback port, and check what came out
-the other side.
-
-Plain script, no pytest: run it, read the PASS lines, non-zero exit on
-failure.
+"""Collector hardening: a crafted NetFlow options record cannot kill flow
+storage while the status strip reads healthy, the template cache is not keyed
+on sender-controlled fields, one malformed SNMP trap does not take the rest of
+its batch down, and syslog strips control and ANSI escape bytes. Each test
+builds the actual malformed bytes and feeds them to the real decoder or a real
+listener on a loopback port. Plain script, no pytest; non-zero exit on failure.
 """
 import shutil
 import socket
@@ -121,7 +113,7 @@ def build_v1_trap_with_oversized_ints() -> bytes:
     encoded as BER values far longer than any real SNMP field: the SNMP
     spec's own INTEGER is Integer32 and TimeTicks is 32-bit unsigned, but BER
     itself puts no limit on how many bytes a magnitude occupies -- exactly
-    the gap the review found undecoded."""
+    the gap left undecoded."""
     generic_raw = _tlv(0x02, b"\x7f" + b"\xff" * 19)     # 20-byte INTEGER
     specific_raw = _tlv(0x02, b"\x7f" + b"\xff" * 19)    # 20-byte INTEGER
     uptime_raw = _tlv(0x43, b"\xff" * 9)                 # 9-byte TimeTicks

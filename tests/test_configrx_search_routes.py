@@ -1,17 +1,9 @@
-"""4.49.0: the routes on top of netpath/configrx_search.py (cross-device
-config search) and netpath/configrx_compliance.py (compliance rule sets) —
-both modules' own correctness, redaction and regex-safety guarantees are
-covered by test_configrx_search_compliance.py; this suite is the thin
-dispatch layer, driven against a real Service+WebServer: query-string
-parsing, an UnsafeRegex reaching the ordinary ValueError->400 path
-unchanged, rule-set/rule CRUD plus their audit lines, the manual evaluate
-route, and both compliance-results read routes.
-
-Search lines are seeded directly via replace_search_lines() — the same
-shortcut every other suite in this repo takes for data a live poll would
-otherwise produce (test_nodes_topology.py's neighbour rows, and so on) —
-since populating them for real means a live SSH capture through
-ConfigRxWorker, which is not what this suite is testing.
+"""The HTTP routes on top of netpath/configrx_compliance.py (cross-device config
+search and compliance rule sets), driven against a real Service+WebServer:
+query-string parsing, UnsafeRegex reaching the ordinary ValueError->400 path,
+rule-set/rule CRUD plus audit lines, the manual evaluate route, and both
+compliance-results read routes. The module's own guarantees are covered by
+test_configrx_search_compliance.py; search lines come from replace_search_lines().
 """
 import http.client
 import json

@@ -1,16 +1,9 @@
-"""notify_rollup_delay_s: an alert opens immediately, as always, but its
-FIRST email is held for the configured window and re-checked at flush time —
-see AlertEngine._sweep_notify_rollup and _skip_held_open_notify. This is the
-fix for the review's 499-device outage: 377 device-down alerts each opening
-within seconds of the next, faster than the poll cycle could reach the core
-switch behind all of them, produced 1,355 emails in 241 seconds and burned
-the whole hourly budget before anyone could read any of them.
-
-Structured like test_alert_engine_fixes.py: numbered sections sharing one
-harness, driving engine._tick() by hand rather than a real thread so nothing
-here is timing-dependent — "the window elapsed" is simulated by back-dating
-opened_ts directly, the same trick test_alert_engine_fixes.py's A6 section
-uses for auto-resolve intervals.
+"""notify_rollup_delay_s: an alert opens immediately, but its FIRST email is
+held for the configured window and re-checked at flush time (see
+AlertEngine._sweep_notify_rollup and _skip_held_open_notify), so a wide
+outage cannot burn the hourly email budget before the poll cycle reaches the
+core switch behind it. Numbered sections share one harness and drive
+engine._tick() by hand; "the window elapsed" is a back-dated opened_ts.
 """
 import os
 import sqlite3
@@ -37,7 +30,7 @@ MAIL_SETTINGS = {"email_enabled": True, "smtp_host": "relay.invalid",
 def build(**settings):
     """(nodes, alerts, snmp, syslog, ipam, engine, folder) on fresh temp
     databases, with email on and a 240 s roll-up hold by default — the
-    opposite defaults from test_alert_engine_fixes.py's build(), because
+    opposite defaults from test_alert_engine.py's build(), because
     this suite is specifically about what happens during and after that
     hold. `folder` is returned so a section that wants a second engine
     against the same files (the restart section) does not have to
@@ -248,7 +241,7 @@ try:
     nodes.update_device(leaf, upstream_id=core)
 
     # The downstream device is noticed down first — the exact race the
-    # review's 499-device outage hit: a poll cycle reaches the leaves before
+    # 499-device outage hit: a poll cycle reaches the leaves before
     # it reaches the core that explains all of them.
     nodes.record_device_event(leaf, "down", "stopped responding")
     engine._tick()

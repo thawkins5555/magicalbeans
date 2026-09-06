@@ -1,16 +1,9 @@
-"""4.50.0: a compliance rule's pattern can BE the secret it checks for — the
-Add-rule dialog says so outright ("a rule can check a secret's actual
-value") — so GET /api/configrx/rule-sets/{id}/rules must gate the `pattern`
-field the same way get_configrx_backup already gates unredacted backup
-content: a configrx:read account (no write) gets every other field but not
-the pattern itself, while a configrx:write account round-trips it unchanged.
-Before this fix the route returned `pattern` verbatim to any configrx read,
-letting a reader pull the same secret out of the rule that checks for it
-even though the equivalent backup route already refused them the value.
-
-This suite is deliberately narrow (just the permission boundary on one
-field) rather than duplicating test_configrx_search_routes.py's broader rule
-CRUD coverage.
+"""A compliance rule's pattern can BE the secret it checks for, so
+GET /api/configrx/rule-sets/{id}/rules gates the `pattern` field the same way
+get_configrx_backup gates unredacted backup content: a configrx:read account
+gets every other field but not the pattern, while a configrx:write account
+round-trips it unchanged. Deliberately narrow (one field's permission boundary);
+test_configrx_search_routes.py covers the broader rule CRUD.
 """
 import http.client
 import json

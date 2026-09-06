@@ -1,0 +1,478 @@
+"""The SQLite foundation every database module in the application sits on.
+
+Opening a file with owner-only modes and the app's pragmas, converting it to
+incremental auto-vacuum and reclaiming space without VACUUM, coercing settings
+values to the types their defaults declare, and trimming a table to a size cap
+in lock-bounded batches.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import sqlite3
+import stat
+import threading
+import time
+
+log = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------- open
+
+def _tighten(path: str) -> None:
+    """chmod 0600 the database and its WAL/SHM files where that is meaningful."""
+    if os.name == "nt":
+        return
+    for suffix in ("", "-wal", "-shm"):
+        candidate = path + suffix
+        try:
+            current = stat.S_IMODE(os.stat(candidate).st_mode)
+        except OSError:
+            continue
+        if current & 0o077:
+            try:
+                os.chmod(candidate, 0o600)
+            except OSError:
+                pass
+
+
+def connect(path: str, **kwargs) -> sqlite3.Connection:
+    """Open ``path`` like ``sqlite3.connect`` and restrict it to the owner.
+
+    In-memory databases (``:memory:`` or empty path) are returned untouched.
+    ``check_same_thread`` defaults to False because every database in the
+    application is shared by worker threads behind its own lock.
+    """
+    kwargs.setdefault("check_same_thread", False)
+    conn = sqlite3.connect(path, **kwargs)
+    # Set here rather than per caller so no module can forget one. Without
+    # busy_timeout a second writer gets SQLITE_BUSY immediately instead of
+    # waiting out the one write transaction held under the module lock;
+    # cache_size (negative = KiB) and mmap_size (a ceiling the OS may use,
+    # not an allocation) otherwise stay at SQLite's small stock defaults.
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA cache_size=-20000")
+        conn.execute("PRAGMA mmap_size=268435456")
+    except sqlite3.DatabaseError:
+        pass
+    if path and path != ":memory:" and not path.startswith("file:"):
+        _tighten(path)
+        try:
+            # Creating the WAL files early lets their modes be fixed here
+            # rather than at the first write on a shared connection.
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.DatabaseError:
+            pass
+        _tighten(path)
+    return conn
+
+
+# --------------------------------------------------------------- reclaiming
+
+INCREMENTAL = 2
+
+# An existing database is converted at open only when it is at most this many
+# pages — about 8 MB at the default page size. The conversion is a whole-file
+# VACUUM, and doing seven of them at startup is how launching the application
+# came to take half a minute on a real fleet's data.
+CONVERT_AT_OPEN_PAGES = 2000
+
+
+def enable_incremental_vacuum(conn: sqlite3.Connection, label: str = "",
+                              max_pages: int | None = CONVERT_AT_OPEN_PAGES) -> bool:
+    """Switch ``conn``'s database to incremental auto-vacuum.
+
+    An existing database created with ``auto_vacuum=NONE`` needs one
+    whole-file ``VACUUM`` to rebuild its page map, so by default that happens
+    only for a database small enough for it to be imperceptible; ``reclaim``
+    converts the rest by passing ``max_pages=None``. Returns True when the
+    database is in incremental mode afterwards.
+    """
+    try:
+        mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+    except sqlite3.DatabaseError:
+        return False
+    if mode == INCREMENTAL:
+        return True
+    try:
+        pages = conn.execute("PRAGMA page_count").fetchone()[0]
+    except sqlite3.DatabaseError:
+        return False
+    if max_pages is not None and pages > max_pages:
+        # Not now: this is the startup path.
+        return False
+    try:
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+        if mode != INCREMENTAL:
+            # The pragma alone only takes on a database with no pages at all,
+            # and opening one in WAL mode already writes page 1 — so even a
+            # brand-new file needs the VACUUM for the setting to stick.
+            started = time.monotonic()
+            conn.execute("VACUUM")
+            if pages > 1:
+                log.info("%s: converted to incremental auto-vacuum in %.1f s",
+                         label or "database", time.monotonic() - started)
+            mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+    except sqlite3.DatabaseError as exc:
+        log.warning("%s: could not enable incremental vacuum: %s", label or "database", exc)
+        return False
+    return mode == INCREMENTAL
+
+
+def reclaim(conn: sqlite3.Connection, lock: threading.Lock | threading.RLock,
+            pages: int = 2000, budget_s: float = 2.0, label: str = "") -> int:
+    """Free unused pages in steps of ``pages`` until none remain or the time
+    budget is spent.  Each step runs inside ``lock``; the lock is released
+    between steps.  Returns the number of pages freed.
+    """
+    # Whatever the open path was too large to convert. This runs from the
+    # prune and trim paths, so the one-time whole-file rewrite lands on the
+    # maintenance timer where a pause is expected rather than at startup.
+    with lock:
+        enable_incremental_vacuum(conn, label, max_pages=None)
+    freed = 0
+    deadline = time.monotonic() + max(0.0, budget_s)
+    while True:
+        with lock:
+            try:
+                before = conn.execute("PRAGMA freelist_count").fetchone()[0]
+                if before <= 0:
+                    break
+                conn.execute(f"PRAGMA incremental_vacuum({int(pages)})")
+                after = conn.execute("PRAGMA freelist_count").fetchone()[0]
+            except sqlite3.DatabaseError as exc:
+                log.warning("%s: incremental vacuum failed: %s", label or "database", exc)
+                break
+        freed += max(0, before - after)
+        if after <= 0 or after == before or time.monotonic() >= deadline:
+            break
+        # Release the GIL before reacquiring the lock. A Python lock is not
+        # fair: without this the loop reacquires it before a waiting writer is
+        # ever scheduled, so releasing it between steps bought the writer
+        # nothing.
+        time.sleep(0)
+    with lock:
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.DatabaseError:
+            pass
+    return freed
+
+
+# ------------------------------------------------------------------ settings
+
+_BOOL_TRUE = {"true", "1", "yes", "on"}
+_BOOL_FALSE = {"false", "0", "no", "off"}
+
+
+def _coerce_bool(value):
+    if isinstance(value, bool):
+        return value, True
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value == 0:
+            return False, True
+        if value == 1:
+            return True, True
+        return None, False
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _BOOL_TRUE:
+            return True, True
+        if text in _BOOL_FALSE:
+            return False, True
+    return None, False
+
+
+def _coerce_number(value, kind):
+    if isinstance(value, bool) or value is None:
+        return None, False
+    if isinstance(value, (int, float)):
+        num = value
+    elif isinstance(value, str):
+        try:
+            num = float(value)
+        except (ValueError, TypeError):
+            return None, False
+    else:
+        return None, False
+    if isinstance(num, float) and (math.isnan(num) or math.isinf(num)):
+        return None, False
+    return (int(num) if kind is int else float(num)), True
+
+
+def _coerce_list_of_str(value):
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return list(value), True
+    return None, False
+
+
+def _coerce_str(value):
+    if isinstance(value, bool):
+        return None, False
+    if isinstance(value, str):
+        return value, True
+    if isinstance(value, (int, float)):
+        return str(value), True
+    return None, False
+
+
+def coerce_settings(defaults: dict, values: dict, *, strict: bool) -> dict:
+    """Coerce each key in `values` that also exists in `defaults` to match
+    that default's type. Keys not present in `defaults` are dropped.
+
+    strict=True: a value that cannot be coerced raises
+    ValueError(f"{key} must be a {kind}"). strict=False: it is replaced with
+    the default value instead, so a database already holding a bad value (a
+    null, or a browser NaN) still starts the service.
+
+    Only the keys present in `values` come back: post_settings hands the
+    result to an apply_* method that update()s the live dict, so a result
+    padded out with every default would reset each setting the request did
+    not mention.
+    """
+    result = {}
+    for key, value in values.items():
+        if key not in defaults:
+            continue
+        default = defaults[key]
+        if isinstance(default, bool):
+            coerced, ok = _coerce_bool(value)
+            kind = "true/false value"
+        elif isinstance(default, int):
+            coerced, ok = _coerce_number(value, int)
+            kind = "number"
+        elif isinstance(default, float):
+            coerced, ok = _coerce_number(value, float)
+            kind = "number"
+        elif isinstance(default, list):
+            coerced, ok = _coerce_list_of_str(value)
+            kind = "list of strings"
+        elif isinstance(default, str):
+            coerced, ok = _coerce_str(value)
+            kind = "string"
+        else:
+            coerced, ok = value, True
+        if ok:
+            result[key] = coerced
+        elif strict:
+            raise ValueError(f"{key} must be a {kind}")
+        else:
+            result[key] = default
+    return result
+
+
+# --------------------------------------------------------------------- trim
+
+TRIM_CHUNK = 2_000           # rows per lock acquisition, adapted below
+TRIM_CHUNK_MIN = 500
+TRIM_CHUNK_MAX = 50_000
+TRIM_LOCK_TARGET_S = 0.15    # how long one batch may hold the write lock
+TRIM_PASSES = 40             # delete/reclaim rounds before giving up
+TRIM_BUDGET_S = 30.0         # wall clock for one full trim_to_size call
+
+
+class SqliteStore:
+    """One SQLite file: opened, migrated, settings-carrying, size-capped.
+
+    Subclasses set SCHEMA/DEFAULTS/LABEL and, where they trim, TRIM_TABLE and
+    TRIM_FLOOR; they hook in with _before_schema/_migrate/_after_open.
+    """
+
+    SCHEMA = ""
+    DEFAULTS: dict = {}
+    LABEL = "database"
+    PRAGMAS = ("journal_mode=WAL", "synchronous=NORMAL", "foreign_keys=ON")
+    TRIM_TABLE = ""
+    TRIM_FLOOR = 200
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.RLock()
+        self._conn = connect(path)
+        self._conn.row_factory = sqlite3.Row
+        with self._lock:
+            for pragma in self.PRAGMAS:
+                self._conn.execute(f"PRAGMA {pragma}")
+            self._before_schema()
+            enable_incremental_vacuum(self._conn, self.LABEL)
+            if self.SCHEMA:
+                self._conn.executescript(self.SCHEMA)
+            self._migrate()
+            self._conn.commit()
+        self._after_open()
+
+    # ------------------------------------------------------------- lifecycle
+
+    def _before_schema(self) -> None:
+        """Anything that must observe the file as it was before SCHEMA ran."""
+
+    def _migrate(self) -> None:
+        """Columns and indexes added after a database was first created."""
+
+    def _after_open(self) -> None:
+        """Seeding and other work that needs the schema in place."""
+
+    def ensure_columns(self, table: str, columns) -> set[str]:
+        """Add whichever of `columns` the table does not have, and return the
+        names added so a caller can gate a one-time backfill on it.
+
+        `columns` is a mapping of column name to its SQL type, or any iterable
+        of (name, type) pairs.
+        """
+        have = {row["name"] for row in
+                self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        items = columns.items() if hasattr(columns, "items") else columns
+        added: set[str] = set()
+        for name, definition in items:
+            if name in have:
+                continue
+            self._conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+            added.add(name)
+        return added
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    def size_bytes(self) -> int:
+        """The file and its WAL/SHM companions on disk."""
+        total = 0
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                total += os.path.getsize(self.path + suffix)
+            except OSError:
+                pass
+        return total
+
+    # -------------------------------------------------------------- settings
+
+    def settings(self) -> dict:
+        values = dict(self.DEFAULTS)
+        with self._lock:
+            rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
+        for row in rows:
+            if row["key"] in values:
+                try:
+                    values[row["key"]] = json.loads(row["value"])
+                except (ValueError, TypeError):
+                    pass
+        return coerce_settings(self.DEFAULTS, values, strict=False)
+
+    def save_settings(self, values: dict) -> None:
+        """Store the keys this store owns. Anything else in the dict is
+        ignored, so one merged settings dict can be handed to each store in
+        turn and each takes only what it owns."""
+        with self._lock:
+            for key, value in values.items():
+                if key not in self.DEFAULTS:
+                    continue
+                self._conn.execute(
+                    "INSERT INTO settings(key, value) VALUES (?,?)"
+                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, json.dumps(value)),
+                )
+            self._conn.commit()
+
+    # ------------------------------------------------------------------ trim
+
+    def _trim_size(self) -> int:
+        """The figure trim_to_size compares against the cap."""
+        return self.size_bytes()
+
+    def _trim_delete(self, low: int, upper: int) -> int:
+        """Delete ids in [low, upper) from TRIM_TABLE; returns rows removed.
+
+        Called with the lock held and without committing — _delete_batches
+        owns both.
+        """
+        cursor = self._conn.execute(
+            f"DELETE FROM {self.TRIM_TABLE} WHERE id >= ? AND id < ?",
+            (low, upper))
+        return cursor.rowcount or 0
+
+    def _delete_batches(self, low: int, cut: int, deadline: float, delete=None,
+                        *, chunk: int | None = None, chunk_min: int | None = None,
+                        chunk_max: int | None = None) -> tuple[int, int]:
+        """Delete ids in [low, cut) in batches until `deadline`.
+
+        Returns (rows removed, the id reached). `delete` defaults to
+        _trim_delete; the chunk bounds default to this module's, and are
+        passed explicitly by callers whose own module globals are the ones
+        tests adjust.
+        """
+        delete = delete or self._trim_delete
+        batch = TRIM_CHUNK if chunk is None else chunk
+        smallest = TRIM_CHUNK_MIN if chunk_min is None else chunk_min
+        largest = TRIM_CHUNK_MAX if chunk_max is None else chunk_max
+        removed = 0
+        while low < cut and time.monotonic() < deadline:
+            upper = min(low + batch, cut)
+            started = time.monotonic()
+            with self._lock:
+                removed += delete(low, upper)
+                self._conn.commit()
+            held = time.monotonic() - started
+            low = upper
+            # Keep one batch's lock hold near TRIM_LOCK_TARGET_S however large
+            # the rows turn out to be — a trap with its raw frame stored costs
+            # an order of magnitude more than a syslog line, and one fixed
+            # batch size cannot suit both.
+            if held > TRIM_LOCK_TARGET_S:
+                batch = max(smallest, batch // 2)
+            elif held < TRIM_LOCK_TARGET_S / 4:
+                batch = min(largest, batch * 2)
+        return removed, low
+
+    def _reclaim_until(self, deadline: float) -> None:
+        # In short slices, outside the delete batches' lock block: reclaim
+        # takes the lock itself and reacquires it in a tight loop, and a
+        # Python lock is not fair.
+        while time.monotonic() < deadline:
+            if not reclaim(self._conn, self._lock, pages=500, budget_s=0.2,
+                           label=self.LABEL):
+                break
+
+    def trim_to_size(self, max_bytes: int, budget_s: float | None = None) -> int:
+        """Delete the oldest rows until the store fits under the cap.
+
+        Batched and reclaimed rather than deleted-and-VACUUMed: the write lock
+        is the one the ingest thread needs, and holding it across a whole-file
+        rewrite stalls ingest for seconds at a time.
+        """
+        if max_bytes <= 0:
+            return 0
+        removed = 0
+        deadline = time.monotonic() + (TRIM_BUDGET_S if budget_s is None else budget_s)
+        for _ in range(TRIM_PASSES):
+            size = self._trim_size()
+            if size <= max_bytes:
+                break
+            with self._lock:
+                bounds = self._conn.execute(
+                    f"SELECT MIN(id) AS lo, MAX(id) AS hi FROM {self.TRIM_TABLE}"
+                ).fetchone()
+            low, high = bounds["lo"], bounds["hi"]
+            # Ids are handed out in arrival order, so the id span is both the
+            # right definition of "oldest" — immune to a device with a wrong
+            # clock — and a proxy for the row count that costs one index probe
+            # rather than the full scan a COUNT(*) would.
+            deletable = 0 if low is None else max(0, high - low + 1 - self.TRIM_FLOOR)
+            if deletable:
+                span = high - low + 1
+                want = min(deletable, max(1, int(
+                    span * (1.0 - max_bytes / float(size)) * 1.1)))
+                batch_removed, _ = self._delete_batches(low, low + want, deadline)
+                removed += batch_removed
+            self._reclaim_until(deadline)
+            if not deletable or time.monotonic() >= deadline:
+                break
+        if self._trim_size() > max_bytes:
+            log.warning("%s: %d bytes after removing %d rows, still above the "
+                        "%d byte cap; continuing at the next maintenance pass",
+                        self.LABEL, self._trim_size(), removed, max_bytes)
+        return removed

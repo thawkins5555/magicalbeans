@@ -1,13 +1,7 @@
-"""Decoders for NetFlow v5, NetFlow v9 and IPFIX (v10).
-
-v5 is a fixed 48-byte record and needs no state. v9 and IPFIX are
-template-driven: the exporter periodically sends a template describing the
-layout of the data records that follow, and until that template arrives the
-data records are undecodable. Templates are cached per
-(exporter, observation domain, template id) because ids are only unique within
-a domain, and an exporter that reboots will reuse ids for different layouts.
-
-Nothing here touches the database or the network; feed it bytes, get Flows.
+"""Decoders for NetFlow v5, NetFlow v9 and IPFIX (v10). v5 is fixed and
+stateless; v9/IPFIX are template-driven, cached per (exporter, observation
+domain, template id) since ids are only unique within a domain. Nothing
+here touches the database or network — feed it bytes, get Flows.
 """
 
 from __future__ import annotations
@@ -19,33 +13,18 @@ import time
 from dataclasses import dataclass, field
 
 # Template ids, observation domains and exporter addresses all come off the
-# wire, so both caches are keyed on data an attacker (or a rebooting exporter
-# that never reuses a domain) chooses. Bounded, least-recently-used, and
-# generous enough for a few thousand exporters' worth of real templates.
-# Kept as the historical name for the *overall* order of magnitude this
-# module has always targeted; the template cache itself is no longer one
-# flat LRU of this size -- see MAX_TEMPLATES_PER_EXPORTER below for why, and
-# for the bound that actually governs it now.
+# wire, i.e. attacker-chosen. Kept as the historical overall-order-of-magnitude
+# name; MAX_TEMPLATES_PER_EXPORTER below is the bound that actually governs
+# the per-exporter cache now.
 MAX_TEMPLATES = 4096
 MAX_SAMPLING = 4096
 
-# A real exporter's own template set is small: even a chassis exporting
-# several protocols at once (v4, v6, MPLS, BGP next-hop, plus a couple of
-# options templates for sampling and interface metadata) rarely reaches a
-# few dozen distinct (domain, template_id) layouts. 64 is generous headroom
-# above that ceiling per exporter.
-#
-# The old single MAX_TEMPLATES-sized cache was keyed
-# (exporter, domain, template_id), and domain and template_id are both wire
-# data the *sending source* controls outright -- no spoofing required.
-# Varying the 4-byte observation-domain field once per packet let one source
-# mint unlimited distinct keys in the one cache every exporter shared, and
-# evict every real exporter's templates well before their own resend cycle
-# came around: a few thousand 32-byte packets was enough to make every other
-# exporter's data flowsets undecodable (counted in stats["no_template"])
-# until each one happened to resend, often minutes later. Bounding the cache
-# *per exporter* means the worst a flood from one source can do is push out
-# its own earlier templates.
+# Per-exporter cap, not a single shared MAX_TEMPLATES-sized cache: domain and
+# template_id are both wire data the sending source controls, so one flooding
+# source varying the domain field could mint unlimited keys in a shared cache
+# and evict every OTHER exporter's templates. Per-exporter bounding means a
+# flood can only push out its own earlier templates. 64 is generous headroom
+# above what any real exporter's template set needs.
 MAX_TEMPLATES_PER_EXPORTER = 64
 # How many distinct exporter addresses the template cache remembers at all,
 # matching collector.py's MAX_SEEN_SOURCES: the address is the datagram's

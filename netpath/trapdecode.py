@@ -16,8 +16,6 @@ import struct
 import time
 from dataclasses import dataclass, field
 
-from . import trapoids
-
 # Universal tags
 T_INTEGER      = 0x02
 T_OCTET_STRING = 0x04
@@ -64,17 +62,12 @@ SNMP_TRAP_ENTERPRISE_0 = "1.3.6.1.6.3.1.1.4.3.0"
 
 MAX_DATAGRAM = 65535
 
-# SNMP's own wire types bound these fields far tighter than a BER INTEGER's
-# own encoding does. RFC 2578 7.1: plain "INTEGER" as used by SNMP -- the v1
-# generic-trap/specific-trap fields and the v2/v3 request-id -- is Integer32,
-# a 4-byte signed value, -2147483648..2147483647; TimeTicks (7.1.8, used for
-# the agent-uptime field) is unsigned 32-bit, 0..4294967295. Nothing enforced
-# either range at decode time, so a crafted 20-byte BER INTEGER produced a
-# Python int SQLite's int64 bind cannot hold (traps.generic, .specific and
-# .uptime are all stored as plain INTEGER columns): the OverflowError it
-# raised on the next executemany took the whole in-flight batch of up to
-# BATCH traps down with it -- see snmptrapd.py's _insert_batch for the other
-# half of this fix.
+# SNMP's wire types bound these fields far tighter than BER does. RFC 2578
+# 7.1: SNMP's "INTEGER" (the v1 generic/specific trap fields, the v2/v3
+# request-id) is Integer32; TimeTicks (7.1.8, agent uptime) is unsigned
+# 32-bit. Unclamped, a crafted 20-byte BER INTEGER produces a Python int
+# SQLite's int64 bind cannot hold, and the OverflowError takes a whole
+# in-flight batch of traps with it -- see snmptrapd._insert_batch.
 _INT32_MIN, _INT32_MAX = -2147483648, 2147483647
 _UINT32_MAX = 4294967295
 
@@ -385,8 +378,8 @@ class Decoder:
             "v3": 0, "v3_encrypted": 0, "v3_auth_ok": 0,
             "v3_auth_failed": 0, "v3_unverified": 0, "v3_no_user": 0,
         }
-        self.oid_names: dict[str, str] = dict(trapoids.WELL_KNOWN)
-        self.severity_rules: list[tuple[str, int]] = list(trapoids.DEFAULT_SEVERITY_RULES)
+        self.oid_names: dict[str, str] = dict(WELL_KNOWN)
+        self.severity_rules: list[tuple[str, int]] = list(DEFAULT_SEVERITY_RULES)
         self.users: dict[str, tuple[str, str]] = {}   # user -> (auth_proto, auth_pass)
         self.max_varbinds = 64
         self.max_value_chars = 512
@@ -397,7 +390,7 @@ class Decoder:
         self.max_varbinds = max(1, int(settings.get("max_varbinds", 64)))
         self.max_value_chars = max(32, int(settings.get("max_value_chars", 512)))
 
-        names = dict(trapoids.WELL_KNOWN)
+        names = dict(WELL_KNOWN)
         for line in str(settings.get("oid_names", "") or "").splitlines():
             line = line.split("#", 1)[0].strip()
             if "=" not in line:
@@ -408,7 +401,7 @@ class Decoder:
                 names[oid] = name              # a user entry overrides a built-in
         self.oid_names = names
 
-        rules = list(trapoids.DEFAULT_SEVERITY_RULES)
+        rules = list(DEFAULT_SEVERITY_RULES)
         for line in str(settings.get("severity_rules", "") or "").splitlines():
             line = line.split("#", 1)[0].strip()
             if "=" not in line:
@@ -561,7 +554,7 @@ class Decoder:
             second = trap.varbinds[1]
             if second["type"] == "OID":
                 trap.trap_oid = str(second["value"] or "")
-        trap.trap_kind = trapoids.KIND_BY_OID.get(trap.trap_oid, "enterpriseSpecific")
+        trap.trap_kind = KIND_BY_OID.get(trap.trap_oid, "enterpriseSpecific")
 
     def _read_varbinds(self, data, start, end) -> list[dict]:
         out = []
@@ -587,13 +580,13 @@ class Decoder:
                 continue                    # one bad varbind must not lose the trap
             out.append({"oid": oid, "name": self.resolve_oid(oid),
                        "type": kind, "value": value,
-                       "text": trapoids.enum_text(oid, kind, value, text)})
+                       "text": enum_text(oid, kind, value, text)})
         return out
 
     def _finish(self, trap: Trap) -> None:
         trap.trap_name = self.resolve_oid(trap.trap_oid)
         if not trap.trap_kind:
-            trap.trap_kind = trapoids.KIND_BY_OID.get(trap.trap_oid, "enterpriseSpecific")
+            trap.trap_kind = KIND_BY_OID.get(trap.trap_oid, "enterpriseSpecific")
         trap.severity = self.severity_for(trap.trap_oid)
         parts = [f"{vb['name']}={vb['text']}" for vb in trap.varbinds]
         trap.varbind_text = " ".join(parts)[:4000]
@@ -640,17 +633,11 @@ class Decoder:
             # and is worth storing: who sent it, from which engine, as which
             # user.
             #
-            # Decryption would go here. DES-CBC (RFC 3414) and AES-128/192/256
-            # -CFB (RFC 3826) both need a block cipher, which the standard
-            # library does not provide and this app takes no third-party
-            # dependencies. A pure-Python AES/DES module could be added as
-            # netpath/trapcrypto.py exposing
-            #     decrypt(protocol, localized_key, priv_params, engine_boots,
-            #             engine_time, ciphertext) -> bytes | None
-            # and this branch would call it and fall through to the ScopedPDU
-            # parse below on success. Until then an authPriv trap is stored
-            # with everything the message header carries in the clear and
-            # flagged in the UI.
+            # Not decrypted: DES-CBC (RFC 3414) and AES-CFB (RFC 3826)
+            # both need a block cipher the standard library does not
+            # provide, and this app takes no third-party dependencies. An
+            # authPriv trap is stored with everything the header carries in
+            # the clear and flagged in the UI.
             self.stats["v3_encrypted"] += 1
             trap.auth_state = "encrypted"
             trap.trap_oid = ""
@@ -806,6 +793,224 @@ def build_inform_response(version: int, community: str, request_id: int,
     pdu = _tlv(PDU_RESPONSE,
                enc_int(request_id) + enc_int(0) + enc_int(0) + varbind_list_raw)
     return _tlv(T_SEQUENCE, enc_int(version) + enc_octets(community) + pdu)
+
+
+# ---------------------------------------------------------------------------
+# SNMP OID names, enum tables, and default severity rules.
+#
+# A name table, not a MIB compiler: parsing SMIv1/SMIv2 ASN.1 modules is a
+# parser project of its own and out of scope for a stdlib-only app. This
+# table plus the admin-editable `oid_names` setting (see Decoder.configure)
+# covers the traps a site actually cares about.
+# ---------------------------------------------------------------------------
+
+WELL_KNOWN = {
+    # -------------------------------------------------- SNMPv2-MIB (system)
+    "1.3.6.1.2.1.1":           "system",
+    "1.3.6.1.2.1.1.1":         "sysDescr",
+    "1.3.6.1.2.1.1.2":         "sysObjectID",
+    "1.3.6.1.2.1.1.3":         "sysUpTime",
+    "1.3.6.1.2.1.1.4":         "sysContact",
+    "1.3.6.1.2.1.1.5":         "sysName",
+    "1.3.6.1.2.1.1.6":         "sysLocation",
+    "1.3.6.1.2.1.1.7":         "sysServices",
+    # --------------------------------------------- SNMPv2-MIB (trap group)
+    "1.3.6.1.6.3.1.1.4.1":     "snmpTrapOID",
+    "1.3.6.1.6.3.1.1.4.3":     "snmpTrapEnterprise",
+    "1.3.6.1.6.3.1.1.5.1":     "coldStart",
+    "1.3.6.1.6.3.1.1.5.2":     "warmStart",
+    "1.3.6.1.6.3.1.1.5.3":     "linkDown",
+    "1.3.6.1.6.3.1.1.5.4":     "linkUp",
+    "1.3.6.1.6.3.1.1.5.5":     "authenticationFailure",
+    "1.3.6.1.6.3.1.1.5.6":     "egpNeighborLoss",
+    "1.3.6.1.6.3.18.1.3":      "snmpTrapAddress",
+    "1.3.6.1.6.3.18.1.4":      "snmpTrapCommunity",
+    # ------------------------------------------------------------- IF-MIB
+    "1.3.6.1.2.1.2.2.1.1":     "ifIndex",
+    "1.3.6.1.2.1.2.2.1.2":     "ifDescr",
+    "1.3.6.1.2.1.2.2.1.3":     "ifType",
+    "1.3.6.1.2.1.2.2.1.4":     "ifMtu",
+    "1.3.6.1.2.1.2.2.1.5":     "ifSpeed",
+    "1.3.6.1.2.1.2.2.1.6":     "ifPhysAddress",
+    "1.3.6.1.2.1.2.2.1.7":     "ifAdminStatus",
+    "1.3.6.1.2.1.2.2.1.8":     "ifOperStatus",
+    "1.3.6.1.2.1.31.1.1.1.1":  "ifName",
+    "1.3.6.1.2.1.31.1.1.1.15": "ifHighSpeed",
+    "1.3.6.1.2.1.31.1.1.1.18": "ifAlias",
+    # ------------------------------------------------- BRIDGE-MIB / RSTP
+    "1.3.6.1.2.1.17.0.1":      "newRoot",
+    "1.3.6.1.2.1.17.0.2":      "topologyChange",
+    # ---------------------------------------------------------- BGP4-MIB
+    "1.3.6.1.2.1.15.7.1":      "bgpEstablished",
+    "1.3.6.1.2.1.15.7.2":      "bgpBackwardTransition",
+    # bgpPeerRemoteAddr is .1.7 and bgpPeerState is .1.2, not the other way
+    # round: a real bgpBackwardTransition rendered as
+    # "bgpPeerState.198.51.100.75=198.51.100.75", which reads as a peer stuck
+    # in a state that does not exist and hides the state that does.
+    "1.3.6.1.2.1.15.3.1.2":    "bgpPeerState",
+    "1.3.6.1.2.1.15.3.1.7":    "bgpPeerRemoteAddr",
+    "1.3.6.1.2.1.15.3.1.14":   "bgpPeerLastError",
+    # ----------------------------------------------------------- UPS-MIB
+    "1.3.6.1.2.1.33.2.1":      "upsTrapOnBattery",
+    "1.3.6.1.2.1.33.2.2":      "upsTrapTestCompleted",
+    "1.3.6.1.2.1.33.2.3":      "upsTrapAlarmEntryAdded",
+    "1.3.6.1.2.1.33.2.4":      "upsTrapAlarmEntryRemoved",
+    # -------------------------------------------------------- ENTITY-MIB
+    "1.3.6.1.2.1.47.1.1.1.1.2": "entPhysicalDescr",
+    "1.3.6.1.2.1.47.1.1.1.1.7": "entPhysicalName",
+    # ------------------------------------------- vendor roots (prefixes)
+    "1.3.6.1.4.1.9":           "cisco",
+    "1.3.6.1.4.1.9.9.41.2.0.1": "clogMessageGenerated",
+    "1.3.6.1.4.1.9.9.43.2.0.1": "ciscoConfigManEvent",
+    "1.3.6.1.4.1.9.9.187.0.1": "cbgpFsmStateChange",
+    "1.3.6.1.4.1.232":         "hpCompaq",
+    "1.3.6.1.4.1.311":         "microsoft",
+    "1.3.6.1.4.1.318":         "apc",
+    "1.3.6.1.4.1.674":         "dell",
+    "1.3.6.1.4.1.789":         "netApp",
+    "1.3.6.1.4.1.1916":        "extremeNetworks",
+    "1.3.6.1.4.1.1991":        "brocade",
+    "1.3.6.1.4.1.2011":        "huawei",
+    "1.3.6.1.4.1.2021":        "ucdavis",
+    "1.3.6.1.4.1.2636":        "juniper",
+    "1.3.6.1.4.1.3375":        "f5",
+    "1.3.6.1.4.1.4526":        "netgear",
+    "1.3.6.1.4.1.6876":        "vmware",
+    "1.3.6.1.4.1.8072":        "netSnmp",
+    "1.3.6.1.4.1.12356":       "fortinet",
+    "1.3.6.1.4.1.14988":       "mikrotik",
+    "1.3.6.1.4.1.25461":       "paloAlto",
+    "1.3.6.1.4.1.25506":       "h3c",
+    "1.3.6.1.4.1.30065":       "arista",
+    # --- added 4.28.0. Every arc below was read out of that vendor's own MIB
+    # text (the "::= { enterprises N }" line), not from memory: a wrong arc
+    # silently mislabels every device under it, which is worse than a blank
+    # Vendor column. The MIB catalog shipped bundles for vendors this table
+    # could not even name, so a device could have its MIB installed and still
+    # show no vendor at all.
+    "1.3.6.1.4.1.11":          "hp",             # HP-ICF-OID
+    "1.3.6.1.4.1.161":         "motorola",       # Cambium's Canopy/PMP line
+                                                 # still registers under
+                                                 # Motorola's arc, so this is
+                                                 # named for the arc's owner
+                                                 # rather than for Cambium.
+    "1.3.6.1.4.1.171":         "dlink",
+    "1.3.6.1.4.1.248":         "hirschmann",
+    "1.3.6.1.4.1.476":         "vertiv",         # Liebert / Emerson
+    "1.3.6.1.4.1.534":         "eaton",
+    "1.3.6.1.4.1.664":         "adtran",
+    "1.3.6.1.4.1.890":         "zyxel",
+    "1.3.6.1.4.1.2604":        "sophos",
+    "1.3.6.1.4.1.2606":        "rittal",
+    "1.3.6.1.4.1.2620":        "checkPoint",
+    "1.3.6.1.4.1.3097":        "watchguard",
+    "1.3.6.1.4.1.4413":        "broadcom",       # NETGEAR's managed switches
+                                                 # run OEM'd Broadcom FASTPATH
+                                                 # and report here; so do other
+                                                 # FASTPATH OEMs, hence the
+                                                 # arc's real owner, not
+                                                 # "netgear".
+    "1.3.6.1.4.1.5951":        "citrix",         # NetScaler
+    "1.3.6.1.4.1.6027":        "dellNetworking", # Force10 line; 674 is the
+                                                 # separate Dell/OpenManage arc
+    "1.3.6.1.4.1.6574":        "synology",
+    "1.3.6.1.4.1.8691":        "moxa",           # MOXA-GENERAL-MIB
+    "1.3.6.1.4.1.8741":        "sonicwall",
+    "1.3.6.1.4.1.11863":       "tpLink",
+    "1.3.6.1.4.1.12276":       "f5Networks",     # 3375 is F5's other arc
+    "1.3.6.1.4.1.13742":       "raritan",
+    "1.3.6.1.4.1.14823":       "aruba",
+    "1.3.6.1.4.1.25053":       "ruckus",
+    "1.3.6.1.4.1.26928":       "aerohive",
+    "1.3.6.1.4.1.41112":       "ubiquiti",
+    "1.3.6.1.4.1.47196":       "arubaCx",        # HPE's ArubaOS-CX line
+}
+
+# The short label the table column and the kind filter show.
+KIND_BY_OID = {
+    "1.3.6.1.6.3.1.1.5.1": "coldStart",
+    "1.3.6.1.6.3.1.1.5.2": "warmStart",
+    "1.3.6.1.6.3.1.1.5.3": "linkDown",
+    "1.3.6.1.6.3.1.1.5.4": "linkUp",
+    "1.3.6.1.6.3.1.1.5.5": "authenticationFailure",
+    "1.3.6.1.6.3.1.1.5.6": "egpNeighborLoss",
+    "1.3.6.1.2.1.17.0.1":  "newRoot",
+    "1.3.6.1.2.1.17.0.2":  "topologyChange",
+    "1.3.6.1.2.1.15.7.1":  "bgpEstablished",
+    "1.3.6.1.2.1.15.7.2":  "bgpBackwardTransition",
+    "1.3.6.1.2.1.33.2.1":  "upsOnBattery",
+}
+
+# Every kind the filter dropdown offers, in the order it offers them.
+KINDS = ["coldStart", "warmStart", "linkDown", "linkUp",
+         "authenticationFailure", "egpNeighborLoss", "newRoot",
+         "topologyChange", "bgpEstablished", "bgpBackwardTransition",
+         "upsOnBattery", "enterpriseSpecific", "encrypted"]
+
+# Longest prefix wins; the decoder re-sorts after appending user rules.
+# The scale is syslog's, deliberately: 0 emergency … 7 debug. A future
+# alerting engine can then treat a trap and a syslog line as the same kind of
+# thing without translating between two severity vocabularies.
+DEFAULT_SEVERITY_RULES = [
+    ("1.3.6.1.6.3.1.1.5.1", 4),   # coldStart            -> warning
+    ("1.3.6.1.6.3.1.1.5.2", 4),   # warmStart            -> warning
+    ("1.3.6.1.6.3.1.1.5.3", 3),   # linkDown             -> error
+    ("1.3.6.1.6.3.1.1.5.4", 5),   # linkUp               -> notice
+    ("1.3.6.1.6.3.1.1.5.5", 4),   # authenticationFailure-> warning
+    ("1.3.6.1.6.3.1.1.5.6", 3),   # egpNeighborLoss      -> error
+    ("1.3.6.1.2.1.15.7.1",  5),   # bgpEstablished       -> notice
+    ("1.3.6.1.2.1.15.7.2",  3),   # bgpBackwardTransition-> error
+    ("1.3.6.1.2.1.17.0.1",  4),   # newRoot              -> warning
+    ("1.3.6.1.2.1.17.0.2",  5),   # topologyChange       -> notice
+    ("1.3.6.1.2.1.33.2.1",  2),   # upsTrapOnBattery     -> critical
+]
+
+# The shortest OID that can be a table column here (1.3.6.1.2.1.x.y.1.z is
+# seven arcs), so walking back through a varbind's instance index can never
+# reach so far up the tree that it matches an unrelated table.
+MIN_COLUMN_ARCS = 7
+
+# Enum-valued objects worth showing by name rather than as a bare number.
+ENUMS = {
+    "1.3.6.1.2.1.2.2.1.7": {1: "up", 2: "down", 3: "testing"},          # ifAdminStatus
+    "1.3.6.1.2.1.2.2.1.8": {1: "up", 2: "down", 3: "testing",
+                            4: "unknown", 5: "dormant", 6: "notPresent",
+                            7: "lowerLayerDown"},                        # ifOperStatus
+    "1.3.6.1.2.1.15.3.1.2": {1: "idle", 2: "connect", 3: "active",
+                             4: "opensent", 5: "openconfirm",
+                             6: "established"},                          # bgpPeerState
+}
+
+
+def enum_text(oid: str, kind: str, value, fallback: str) -> str:
+    """Name a numeric enum where one is known: 'down (2)' rather than '2'.
+
+    A varbind names a column plus its instance index, and the index is not
+    always one arc: ifOperStatus.7 has one, but bgpPeerState is indexed by the
+    peer's IP address, so the instance is four. Stripping a single arc found
+    the column for the first and never for the second, which is why the BGP
+    state was rendered as a bare number even once its OID was right. Walk the
+    prefixes instead, shortest index first, stopping well before the arcs that
+    make up the column itself.
+    """
+    if kind != "INTEGER":
+        return fallback
+    table = ENUMS.get(oid)
+    arcs = oid.split(".")
+    # An instance index of more than eight arcs is not something any of these
+    # tables uses, and MIN_COLUMN_ARCS keeps the walk from reaching up into
+    # the OID tree far enough to hit an unrelated table.
+    for depth in range(1, 9):
+        if table or len(arcs) - depth < MIN_COLUMN_ARCS:
+            break
+        table = ENUMS.get(".".join(arcs[:len(arcs) - depth]))
+    if not table:
+        return fallback
+    try:
+        name = table.get(int(value) if value is not None else None)
+    except (TypeError, ValueError):
+        return fallback
+    return f"{name} ({value})" if name else fallback
 
 
 if __name__ == "__main__":

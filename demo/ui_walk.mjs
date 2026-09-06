@@ -5,186 +5,34 @@
  *   node demo/ui_walk.mjs --base http://127.0.0.1:8443 \
  *        --creds demo/out/creds.txt --out demo/out/ui --tag 250
  *
- * The claim this file exists to support is "every tab, every subtab, every
- * dialog and every button was exercised, across three accounts, three
- * themes and three viewports" - so it drives THREE accounts (admin, the
- * read-only `viewer`, and `noc`, seed.py's nodes+alerts-write operator),
- * runs the dialog walk and a button census under every one of them, and
- * proves the operator-level permission boundary at the server rather than
- * settling for a button's disabled attribute.
+ * Proves "every tab, subtab, dialog and button was exercised" across three
+ * accounts (admin, read-only `viewer`, and `noc` - seed.py's nodes+alerts-
+ * write operator), three themes and three viewports, and checks the
+ * operator-level permission boundary at the server rather than trusting a
+ * button's disabled attribute.
  *
- * Produces, in --out:
- *   tab-<name>-<tag>.png             every top-level tab, admin pass
- *   sub-<tab>-<name>-<tag>.png       every subtab (admin pass), including
- *                                    Nodes' Topology, Discovery, Profiles &
- *                                    MIBs and Reports (4.50.0 — its own
- *                                    nested availability/top-metrics tablist
- *                                    is driven by the feature:nodes-*-report
- *                                    steps below, not screenshot here on its
- *                                    own), the device-detail pane's four
- *                                    nested subtabs, ConfigRX's Devices,
- *                                    Search and Compliance (also 4.50.0 —
- *                                    see feature:configrx-search-* and
- *                                    dlg:configrx-compliance-* below for
- *                                    what actually runs on them), and
- *                                    Settings' eight (general/retention/
- *                                    signin/users/directory/maintenance/
- *                                    modules/audit)
- *   sub-viewer-<tab>-<name>-<tag>.png  the same subtabs under `viewer`, and
- *   sub-noc-<tab>-<name>-<tag>.png     under `noc` - subtabs used to be
- *                                    walked on the admin pass only
- *   dlg-<name>-<tag>.png            every dialog admin could open: device
- *                                   detail/interface, Add device, profile
- *                                   editor + help, device groups, the MIB
- *                                   catalog and Upload MIB, alert rule, every
- *                                   module's Settings, the three loopback
- *                                   tests, Account, the Users grid, and
- *                                   ConfigRX's device-settings and
- *                                   bulk-settings dialogs (both carry the SSH
- *                                   credential fields — there is no separate
- *                                   credential dialog to capture), an
- *                                   actual SSH terminal session (a real
- *                                   popup window, not a #modal dialog —
- *                                   gated on a module ("ssh") seed.py never
- *                                   grants viewer or noc at all, so only
- *                                   admin ever opens it), and the Nodes
- *                                   Topology bar's upstream-suggestions
- *                                   review dialog (nodes:read only — the
- *                                   dialog itself hides Apply for an
- *                                   account that cannot use it), and
- *                                   ConfigRX's Compliance rule-set list, a
- *                                   created-evaluated-then-deleted rule set
- *                                   and its per-device results (4.50.0 —
- *                                   configrx:write, admin only; the rule
- *                                   set this walk creates is always gone
- *                                   again before the step returns)
- *   dlg-viewer-<name>-<tag>.png      the same dialog walk run under `viewer`,
- *   dlg-noc-<name>-<tag>.png         and under `noc`. A screenshot exists
- *                                    only for a dialog that actually OPENED;
- *                                    walk-<tag>.json records the other two
- *                                    possibilities instead of silently
- *                                    skipping them: `absent` (the control is
- *                                    not on the page, or the seed left no row
- *                                    to select) and `refused` (the control IS
- *                                    present and visible but disabled by the
- *                                    write gate, with whatever reason the UI
- *                                    itself shows in its title). Neither one
- *                                    is a gap in coverage or a failure of
- *                                    this walk — a dialog an account cannot
- *                                    reach is the permission boundary working.
- *   feature-<name>-<tag>.png        a MAC search on Nodes, ConfigRX's
- *                                   inline config viewer and unified diff
- *                                   (viewer/diff are panes, not dialogs),
- *                                   also run under `viewer` and `noc`; and,
- *                                   4.50.0's Nodes Reports (availability run
- *                                   over 90 days, plus its own caveats box
- *                                   when the report actually emits one, and
- *                                   top-N by the cpu_pct metric) and
- *                                   ConfigRX Search (a query that matches —
- *                                   "interface" is real indexed content on
- *                                   this instance — and one built to return
- *                                   the genuine empty state), all read-only
- *                                   and so also run under `viewer` and `noc`
- *   theme-<theme>-<name>-<tag>.png  every top-level tab under each of the
- *                                   three themes (dark, light, contrast),
- *                                   set via localStorage before first paint
- *   theme-<account>-<theme>-<name>-<tag>.png  the same, under `viewer` and
- *                                   `noc` too — see --matrix below
- *   viewport-<WxH>-<name>-<tag>.png every top-level tab at 1920x1080,
- *                                   1366x768 and 1280x720
- *   viewport-<account>-<WxH>-<name>-<tag>.png  the same, under `viewer` and
- *                                   `noc` too — see --matrix below
- *   kiosk-<name>-<tag>.png          a kiosk-mode (?kiosk=1) session: a few
- *                                   tabs, plus proof a non-kioskSafe dialog
- *                                   degrades to a toast instead of opening
- *   viewer-<name>-<tag>.png         the same top-level tabs as the read-only
- *                                   `viewer` account
- *   noc-<name>-<tag>.png            and as `noc`, seed.py's nodes+alerts-
- *                                   write operator account
- *   buttons-<account>-<tag>.json    a census, per tab, of every visible
- *                                   button / [role=button] / .subtab / write-
- *                                   gated control for that account — id,
- *                                   accessible label, disabled state and
- *                                   whatever disabled-reason the UI itself
- *                                   shows — cross-referenced against every
- *                                   control this walk actually clicked (a
- *                                   real DOM click event tracked from page
- *                                   load, not a guess from which steps
- *                                   passed — this includes the top-level tab
- *                                   strip, which selectTab() now clicks for
- *                                   real before falling back to its JS call).
- *                                   cross_reference reconciles the id-less
- *                                   controls (listed, not just counted) and
- *                                   splits not_activated into
- *                                   skipped_destructive (this campaign's own
- *                                   policy — see DESTRUCTIVE_SKIP),
- *                                   refused_or_absent (the write gate, or
- *                                   the seed left no data — the permission
- *                                   boundary working) and not_reached (an
- *                                   actual coverage gap) — only the last one
- *                                   is a gap "every button was exercised"
- *                                   has not yet closed for that account.
- *                                   driveSafeControls (called before the
- *                                   census runs) widens what gets exercised
- *                                   first: every filter apply/clear, export,
- *                                   pager and collector toggle safe enough
- *                                   to drive without changing state this
- *                                   walk cannot put back.
- *   console-<tag>.json              console errors/warnings, page errors,
- *                                   failed requests and every response >= 400
- *                                   (from every pass above — admin, viewer,
- *                                   noc, kiosk, theme x3, viewport x3)
- *   metrics-<tag>.json              nodes-table fill time, long tasks — a
- *                                   count and longest duration overall
- *                                   (longtask_entries_observed/_longest_ms),
- *                                   longtasks_by_tab and longtasks_by_phase
- *                                   (coarse: which of the twelve tabs or
- *                                   which of walkDialogs/driveSafeControls/
- *                                   census was running when each one
- *                                   landed), and `longtasks` itself — every
- *                                   entry the PerformanceObserver saw across
- *                                   the whole admin pass, each with
- *                                   start_ms, duration_ms, which tab
- *                                   App.state.tab named when the entry's
- *                                   callback fired, and the Long Tasks
- *                                   API's own `attribution` (usually just a
- *                                   containerType of "same-origin" — the
- *                                   browser does not name a function; a CDP
- *                                   Profiler session around a specific
- *                                   moment is still what answers that).
- *                                   Admin pass only, since that is the only
- *                                   context with the PerformanceObserver.
- *                                   payload size, each account's visible
- *                                   tabs/write-controls/permissions, and —
- *                                   when demo/out/ping_state.json exists —
- *                                   the ICMP shim's own per-host call
- *                                   counters, folded in under
- *                                   ping_shim_calls / ping_shim_calls_total
- *   walk-<tag>.json                 per-step ok/skipped/failed, including
- *                                   `<account>:action:alerts-ack-all` and
- *                                   `<account>:action:device-edit` — two
- *                                   write attempts made straight against the
- *                                   API, not through a button (a disabled
- *                                   button proves the UI hid the action, not
- *                                   that the server would refuse it), that
- *                                   must succeed for `noc` (nodes+alerts
- *                                   write) and come back HTTP 403 for
- *                                   `viewer` (read everywhere). The HTTP
- *                                   status and the server's own message are
- *                                   recorded as evidence either way, never as
- *                                   a pass/fail assertion of this walk's own.
+ * Writes PNG screenshots per tab/subtab/dialog/feature/theme/viewport/
+ * account into --out, plus JSON evidence: `buttons-<account>-<tag>.json`
+ * (every visible control, cross-referenced against what was actually
+ * clicked, split into skipped_destructive/refused_or_absent/not_reached),
+ * `console-<tag>.json` (console/page errors and any HTTP >= 400 response),
+ * `metrics-<tag>.json` (nodes-table fill time and long-task attribution),
+ * and `walk-<tag>.json` (per-step ok/skipped/failed, including two direct
+ * API write attempts that must succeed for `noc` and come back 403 for
+ * `viewer`). A screenshot only exists for a dialog that opened;
+ * walk-<tag>.json's `absent` and `refused` cover the other two cases -
+ * neither is a coverage gap, a boundary an account cannot reach is the
+ * point.
  *
  * Nothing here fails the whole run: every step is wrapped, recorded and
  * stepped over. Playwright is the globally installed one (`npm root -g`);
  * Chromium comes from PLAYWRIGHT_BROWSERS_PATH.
  *
- * --matrix full|scale (default full) sizes the theme and viewport passes,
- * which are the ones that multiply: `full` is the 3 accounts x 3 themes x
- * 3 viewports x 12 tabs sweep the 250-device tier can afford. `scale` runs
- * them admin-only, at one theme and one viewport — for the 1000/2000-
- * device tiers, where the full sweep would not finish in a reasonable time.
- * The base admin/viewer/noc passes (one iteration each, not a matrix) run
- * either way.
+ * --matrix full|scale (default full) sizes the theme/viewport passes: full
+ * is 3 accounts x 3 themes x 3 viewports x 12 tabs; scale runs admin-only
+ * at one theme/viewport for the 1000/2000-device tiers, where full would
+ * not finish in time. The base admin/viewer/noc passes (one iteration
+ * each, not a matrix) run either way.
  */
 
 import { createRequire } from 'node:module';
@@ -354,11 +202,8 @@ const SAFE_CLICKS = [
   ['wireless', null, 'wl-apply'], ['wireless', null, 'wl-clear'],
   ['configrx', null, 'cx-apply'],
   ['debug', null, 'dbg-cats-all'], ['debug', null, 'dbg-cats-none'],
-  // Settings' Revert/Apply footer is fixed across every subtab (see the
-  // comment above index.html's own fieldsets), and this walk never dirties
-  // any field, so Revert is a pure no-op read and Apply submits nothing
-  // that differs from what the server already has — safe, per team-lead's
-  // go-ahead, specifically because nothing here changes any input first.
+  // This walk never dirties any field, so Revert is a pure no-op read and
+  // Apply submits nothing that differs from what the server already has.
   // Revert before Apply so a stray dirty flag from an earlier step is
   // cleared rather than (safely) resubmitted.
   ['settings', null, 'set-revert'], ['settings', null, 'set-apply'],
@@ -587,10 +432,9 @@ async function rawApi(page, method, url, body) {
 /* ------------------------------------------------------------------- walk */
 
 async function walkTabs(page, dir, tag, recorder, prefix = 'tab', longtaskSink = null) {
-  // Theme and viewport passes stay admin-only-and-fast, exactly as before;
-  // the account passes (admin/'tab', 'viewer', 'noc') now all walk subtabs
-  // too — that used to be admin-only, which meant "every subtab" was never
-  // actually true for the other two accounts.
+  // Theme and viewport passes stay admin-only-and-fast; the account passes
+  // (admin/'tab', 'viewer', 'noc') all walk subtabs so "every subtab" is
+  // actually true for all three accounts, not just admin.
   const walksSubtabs = !prefix.startsWith('theme-') && !prefix.startsWith('viewport-');
   const seen = [];
   for (const tab of TABS) {
@@ -835,10 +679,7 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
     // REPORT_TOP_METRICS_WHOLE_FLEET_MAX_WINDOW_S caps a whole-fleet (no
     // device_ids — "any group" here is exactly that) top-N request at 7
     // days flat, independent of fleet size, and refuses anything wider
-    // with a 400 rather than run it — confirmed against this instance:
-    // 90 days here failed outright ("too slow for a live request"). See
-    // the report to team-lead for why that fixed cap reads as a rough
-    // edge on a fleet this small, not a bug in this walk.
+    // with a 400 rather than run it.
     await page.click('#nd-rep-topn-30d', { timeout: 5000 });
     await page.click('#nd-rep-topn-90d', { timeout: 5000 });
     await page.click('#nd-rep-topn-7d', { timeout: 5000 });
@@ -1100,7 +941,7 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
     return 'absent — no device has two or more stored backups to diff';
   });
 
-  // ---- ConfigRX: SEARCH subtab (new in 4.50.0 — netpath/configrx_search.py).
+  // ---- ConfigRX: SEARCH subtab (new in 4.50.0 — netpath/configrx_compliance.py).
   // Read-only end to end (configrx:read), so this runs the same for all
   // three accounts. Two queries, not one: "interface" is real indexed
   // content on this instance (the same string this release's search-index
@@ -1381,7 +1222,7 @@ async function harvestControls(page, scopeSelector, tabLabel) {
  * scattered across walkTabs/walkDialogs/writeBoundaryActions/
  * driveSafeControls, and a real DOM click event is the one signal that
  * reaches all of them for free — including selectTab()'s own click on the
- * tab strip (see its comment above for why that used to be the one gap).
+ * tab strip.
  */
 async function installActivationTracker(context) {
   await context.addInitScript(() => {
@@ -1407,7 +1248,7 @@ async function installActivationTracker(context) {
  * back — see the constants above for the reasoning per group. Nothing here
  * deletes or removes anything; DESTRUCTIVE_SKIP is recorded separately, as
  * `skipped` with its reason, so the census can tell "unsafe to click" apart
- * from "the walk never got there" the way team-lead asked.
+ * from "the walk never got there".
  */
 async function driveSafeControls(page, dir, tag, recorder, account) {
   const visit = async (tab, subtab) => {
@@ -1507,7 +1348,7 @@ async function driveSafeControls(page, dir, tag, recorder, account) {
  * one summary step is recorded, and the census itself is wrapped so a DOM
  * surprise here cannot take down the run.
  *
- * cross_reference reconciles two populations that used to be conflated:
+ * cross_reference reconciles two distinct populations:
  * `total_harvested` is every visible control this scan found, id or no id;
  * `enumerated_with_id` (chrome + every tab's own count, which is why both
  * are reported) is the subset an id can address at all, and is the

@@ -1,20 +1,9 @@
-"""The syslog TCP listener's two RFC 6587 framings, against a memory-safety
-gap neither had: nothing bounded how large a single message's declared
-length (octet counting) or unterminated line (newline framing) could grow
-the per-connection buffer to before this file's own MAX_TCP_MESSAGE_BYTES
-existed. 514/tcp takes input from anyone who can open a connection, with no
-authentication ahead of it — the same unauthenticated-by-design shape as
-514/udp and 162/udp.
-
-Measured before the fix (a real SyslogCollector on a loopback socket, one
-connection, tracemalloc watching this process's own traced allocations):
-declaring an octet count of 2 GB and then trickling 1 MB/s toward it left
-the collector holding 42 MB (peak 82.5 MB — `buffer += chunk` briefly holds
-both the old and new buffer at once) after only 50 MB had been sent, with
-every counter — messages, errors, rejected, dropped — still at zero. Nothing
-told an operator it was happening, and `_max_tcp_clients` (default 64) bounds
-how many connections can each be doing this at once but not how large any
-one of them grows.
+"""The syslog TCP listener's two RFC 6587 framings (octet counting and
+newline framing) against a real SyslogCollector on a loopback socket.
+Proves MAX_TCP_MESSAGE_BYTES bounds the per-connection buffer: an oversized
+declared octet count or an unterminated line is rejected and counted rather
+than growing memory without limit. 514/tcp is unauthenticated by design, so
+this bound is the only thing between a hostile connection and the heap.
 """
 import socket
 import time

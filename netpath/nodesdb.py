@@ -1,27 +1,17 @@
 """Storage for the Nodes module: devices, polling groups ("profiles"),
-interfaces, polled metrics and their samples, device/interface state
-events, uploaded vendor MIBs, and discovery jobs.
-
-Two tables are genuinely unbounded and pruned by age/size: `samples` (raw
-metric points) and `device_events`/`interface_events` (state transitions).
-Everything else — `devices`, `groups`, `interfaces`, `mib_files`/
-`mib_objects` — describes the network as it is configured and currently
-known, not a log, and is never trimmed by age or size; only explicit
-deletion removes a row from those tables. This mirrors the same bounded/
-unbounded split `ipamdb.py`'s `scans` (pruned) vs. `subnets`/`hosts`
-(never pruned by age) already established in this codebase.
+interfaces, polled metrics and their samples, state events, vendor MIBs and
+discovery jobs. Only `samples` and the two event tables are unbounded and
+pruned by age or size; the rest describe the network as configured.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import sqlite3
-import threading
 import time
 
-from . import dbmaint, dbopen, settingsutil
+from .sqlitebase import SqliteStore, reclaim
 
 log = logging.getLogger(__name__)
 
@@ -421,12 +411,8 @@ DEFAULTS = {
     # keep loss sampling steady on a device polled rarely, or to ping less
     # often than a fast focus poll would.
     "ping_interval_s": 0,
-    # Raw samples are the expensive table — the review measured 9.1 GB a day
-    # at 2,000 devices with 48 ports each — and are what series() reads for
-    # a window up to three days wide. Anything wider reads samples_hourly,
-    # which compact_rollup fills, so keeping months of raw points bought
-    # nothing but disk. Three days of raw, and the rollups carry the long
-    # history at about a thousandth of the size.
+    # Raw samples are the expensive table and are what series() reads for a
+    # window up to three days wide; anything wider reads samples_hourly.
     "sample_retention_days": 3,
     "rollup_retention_days": 400,    # hourly rollups; what a year-wide chart reads
     # Per metric, not across the whole table: the old whole-table 50,000
@@ -708,130 +694,61 @@ def _group_upstream_candidates(rows) -> dict[int, dict]:
     return result
 
 
-class NodesDatabase:
+class NodesDatabase(SqliteStore):
+    SCHEMA = SCHEMA
+    DEFAULTS = DEFAULTS
+    LABEL = "nodes"
+
     def __init__(self, path: str):
-        self.path = path
-        self._lock = threading.RLock()
         # Bumped by every write that could change what or how a device is
         # polled. The scheduler holds one merged config per device and
         # rebuilds it only when this moves — see config_generation().
         self._config_generation = 0
         self._warned_no_window = False
-        # dbopen.connect narrows the file (and its -wal/-shm companions) to
-        # the owner: nodes.db holds every profile's community string and
-        # every stored v3 credential blob.
-        self._conn = dbopen.connect(path)
-        self._conn.row_factory = sqlite3.Row
-        with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            # Before the schema runs: auto_vacuum can be set with a plain
-            # pragma only while the database is still empty, so a new
-            # nodes.db takes it for free and only an existing one pays the
-            # one-time VACUUM that converts it (logged).
-            dbmaint.enable_incremental_vacuum(self._conn, "nodes")
-            self._conn.executescript(SCHEMA)
-            self._migrate()
-            self._conn.commit()
+        super().__init__(path)
+
+    def _after_open(self) -> None:
         self._seed()
 
-    def close(self) -> None:
-        with self._lock:
-            self._conn.close()
-
     def _migrate(self) -> None:
-        """Add columns introduced after a database was first created.
-
-        CREATE TABLE IF NOT EXISTS silently leaves an existing table alone,
-        so a column added to devices/groups after some installs already
-        have a nodes.db has to be added explicitly or an upgraded install
-        fails the moment anything queries it — the same convention `db.py`
-        and `ipamdb.py` already use for their own post-release columns.
-        """
-        devices = {row["name"] for row in
-                   self._conn.execute("PRAGMA table_info(devices)").fetchall()}
-        if "device_group_id" not in devices:
-            self._conn.execute(
-                "ALTER TABLE devices ADD COLUMN device_group_id INTEGER"
-                " REFERENCES device_groups(id) ON DELETE SET NULL")
-        if "display_name_source" not in devices:
-            self._conn.execute(
-                "ALTER TABLE devices ADD COLUMN display_name_source TEXT"
-                " NOT NULL DEFAULT 'auto'")
-        if "mib_file_id" not in devices:
-            self._conn.execute(
-                "ALTER TABLE devices ADD COLUMN mib_file_id INTEGER"
-                " REFERENCES mib_files(id) ON DELETE SET NULL")
-        # Per-device ping tuning and down-logic override, all nullable so
-        # NULL keeps meaning "inherit the profile, then the global setting".
-        for column in ("ping_count", "ping_timeout_ms", "unreachable_ping_only"):
-            if column not in devices:
-                self._conn.execute(
-                    f"ALTER TABLE devices ADD COLUMN {column} INTEGER")
-        # Seconds between forwarding-table walks; 0 (the shipped default)
-        # means never. NULL keeps meaning "inherit the profile".
-        if "mac_table_interval_s" not in devices:
-            self._conn.execute(
-                "ALTER TABLE devices ADD COLUMN mac_table_interval_s INTEGER")
-        # Identity OIDs: when set, the poller reads the device's vendor and
-        # location from these instead of deriving vendor from sysObjectID and
-        # reading sysLocation. NULL/"" keeps today's behaviour exactly, which
-        # is the whole backward-compatibility story for this feature.
-        for column in ("vendor_oid", "location_oid"):
-            if column not in devices:
-                self._conn.execute(
-                    f"ALTER TABLE devices ADD COLUMN {column} TEXT")
-        if "vendor_detected" not in devices:
-            # What identify_vendor() worked out from sysObjectID/sysDescr,
-            # kept separately from `vendor` (which a custom OID may have
-            # replaced for display). ConfigRX's command choice, the Cisco
-            # MAC-table gate and discovery's profile suggestion all read this
-            # one, so naming a device "Acme Networks Ltd" cannot quietly stop
-            # its backups working.
-            self._conn.execute(
-                "ALTER TABLE devices ADD COLUMN vendor_detected TEXT")
-        if "vendor_source" not in devices:
-            # 'sysObjectID' | 'sysDescr' | 'oid' | '' — which of the three
-            # spoke. It was computed on every poll and thrown away; an
-            # operator looking at a vendor name deserves to know whether it
-            # is an IANA arc assignment or a substring guess.
-            self._conn.execute(
-                "ALTER TABLE devices ADD COLUMN vendor_source TEXT")
-        if "vendor_arc" not in devices:
-            # The enterprise arc identify_vendor()/vendorid.decide() worked
-            # out this poll, or NULL. NOT the same fact as vendor_source:
-            # a device whose sysObjectID sits under a real, just-unnamed arc
-            # gets vendor_source='sysDescr' with a real arc here, while a
-            # PLC or appliance that answers only a generic net-snmp
-            # sysObjectID and was named from its sysDescr text gets
-            # vendor_source='sysDescr' too but NULL here — the two read
-            # identically by vendor_source alone. This column is what a
-            # device pane needs to tell "named with confidence but has no
-            # arc a vendor-health table could ever be keyed on" (Rockwell-
-            # class PLCs, the review's own finding) apart from every other
-            # sysDescr-sourced name, so an empty health section can say why
-            # instead of reading as a fault. See nodepoll._poll_vendor_health
-            # and nodeoids.VENDOR_HEALTH, which are keyed on exactly this
-            # value already — this just stops throwing it away afterward.
-            self._conn.execute("ALTER TABLE devices ADD COLUMN vendor_arc INTEGER")
-        if "mib_covered" not in devices:
-            # Last vendor-MIB coverage verdict for this device: NULL =
-            # never evaluated (or not applicable), 0/1 = uncovered/covered.
-            # Persisted so the poller records mib_missing/mib_present on
-            # *transitions* only, however coverage changed (a MIB uploaded
-            # or deleted), rather than keying off sysObjectID changes.
-            self._conn.execute(
-                "ALTER TABLE devices ADD COLUMN mib_covered INTEGER")
-        # Vendor identification (4.32): the operator's own answer, how sure
-        # the automatic one is, the stored explanation, and which sysObjectID
-        # it was worked out for — so the walk runs once, not once per poll,
-        # and again only when the device's identity actually changes.
-        for column, kind in (("vendor_override", "TEXT"), ("vendor_confidence", "TEXT"),
-                             ("vendor_evidence", "TEXT"), ("identified_ts", "REAL"),
-                             ("identified_sys_object_id", "TEXT")):
-            if column not in devices:
-                self._conn.execute(f"ALTER TABLE devices ADD COLUMN {column} {kind}")
+        # All nullable unless stated: NULL means "inherit the profile, then
+        # the global setting", which is what _merge_config reads.
+        self.ensure_columns("devices", {
+            "device_group_id":
+                "INTEGER REFERENCES device_groups(id) ON DELETE SET NULL",
+            "display_name_source": "TEXT NOT NULL DEFAULT 'auto'",
+            "mib_file_id": "INTEGER REFERENCES mib_files(id) ON DELETE SET NULL",
+            "ping_count": "INTEGER",
+            "ping_timeout_ms": "INTEGER",
+            "unreachable_ping_only": "INTEGER",
+            # Seconds between forwarding-table walks; 0 means never.
+            "mac_table_interval_s": "INTEGER",
+            # When set, the poller reads vendor and location from these
+            # instead of deriving them from sysObjectID/sysLocation.
+            "vendor_oid": "TEXT",
+            "location_oid": "TEXT",
+            # What identify_vendor() worked out, kept apart from `vendor`
+            # (which a custom OID may have replaced for display): ConfigRX,
+            # the Cisco MAC-table gate and discovery all read this one.
+            "vendor_detected": "TEXT",
+            # 'sysObjectID' | 'sysDescr' | 'oid' | '' — which of the three spoke.
+            "vendor_source": "TEXT",
+            # The enterprise arc, or NULL. Not the same fact as
+            # vendor_source: a device named from sysDescr may still sit
+            # under a real arc, and vendor-health tables key on this.
+            "vendor_arc": "INTEGER",
+            # NULL = never evaluated, 0/1 = uncovered/covered. Persisted so
+            # the poller records mib_missing/mib_present on transitions only.
+            "mib_covered": "INTEGER",
+            # The operator's own answer, how sure the automatic one is, its
+            # explanation, and which sysObjectID it was worked out for — so
+            # the walk runs again only when the identity changes.
+            "vendor_override": "TEXT",
+            "vendor_confidence": "TEXT",
+            "vendor_evidence": "TEXT",
+            "identified_ts": "REAL",
+            "identified_sys_object_id": "TEXT",
+        })
         # Not in SCHEMA's own CREATE INDEX block: that script runs before this
         # method, so an index on a column added just above would fail on an
         # upgraded install the same way querying the column itself would.
@@ -839,180 +756,110 @@ class NodesDatabase:
             "CREATE INDEX IF NOT EXISTS ix_devices_device_group"
             " ON devices(device_group_id)")
 
-        groups = {row["name"] for row in
-                  self._conn.execute("PRAGMA table_info(groups)").fetchall()}
-        if "mib_file_id" not in groups:
-            self._conn.execute(
-                "ALTER TABLE groups ADD COLUMN mib_file_id INTEGER"
-                " REFERENCES mib_files(id) ON DELETE SET NULL")
-        for column in ("ping_count", "ping_timeout_ms", "unreachable_ping_only",
-                       "mac_table_interval_s"):
-            if column not in groups:
-                self._conn.execute(
-                    f"ALTER TABLE groups ADD COLUMN {column} INTEGER")
-        for column in ("vendor_oid", "location_oid"):
-            if column not in groups:
-                self._conn.execute(
-                    f"ALTER TABLE groups ADD COLUMN {column} TEXT")
+        self.ensure_columns("groups", {
+            "mib_file_id": "INTEGER REFERENCES mib_files(id) ON DELETE SET NULL",
+            "ping_count": "INTEGER",
+            "ping_timeout_ms": "INTEGER",
+            "unreachable_ping_only": "INTEGER",
+            "mac_table_interval_s": "INTEGER",
+            "vendor_oid": "TEXT",
+            "location_oid": "TEXT",
+        })
 
-        interfaces = {row["name"] for row in
-                      self._conn.execute("PRAGMA table_info(interfaces)").fetchall()}
-        for column in ("last_in_errors", "last_out_errors"):
-            if column not in interfaces:
-                self._conn.execute(
-                    f"ALTER TABLE interfaces ADD COLUMN {column} INTEGER")
-        # ifInDiscards/ifOutDiscards (the counters that say a link is
-        # congested rather than broken) and their rates, alongside the error
-        # pair above.
-        for column in ("last_in_discards", "last_out_discards"):
-            if column not in interfaces:
-                self._conn.execute(
-                    f"ALTER TABLE interfaces ADD COLUMN {column} INTEGER")
-        for column in ("in_discard_rate", "out_discard_rate"):
-            if column not in interfaces:
-                self._conn.execute(
-                    f"ALTER TABLE interfaces ADD COLUMN {column} REAL")
-        # ifCounterDiscontinuityTime (RFC 2863): the sysUpTime at which this
-        # interface's counters were last reset. Stored so a rate is not
-        # computed across a reset — an agent that restarts its counters
-        # otherwise reads as one enormous burst of traffic.
-        if "discontinuity_ts" not in interfaces:
-            self._conn.execute(
-                "ALTER TABLE interfaces ADD COLUMN discontinuity_ts REAL")
+        self.ensure_columns("interfaces", {
+            "last_in_errors": "INTEGER",
+            "last_out_errors": "INTEGER",
+            # ifInDiscards/ifOutDiscards: congested rather than broken.
+            "last_in_discards": "INTEGER",
+            "last_out_discards": "INTEGER",
+            "in_discard_rate": "REAL",
+            "out_discard_rate": "REAL",
+            # ifCounterDiscontinuityTime (RFC 2863), so a rate is never
+            # computed across a counter reset — that reads as one huge burst.
+            "discontinuity_ts": "REAL",
+        })
 
-        jobs = {row["name"] for row in
-                self._conn.execute("PRAGMA table_info(discovery_jobs)").fetchall()}
-        if "allow_ping_only" not in jobs:
-            self._conn.execute(
-                "ALTER TABLE discovery_jobs ADD COLUMN allow_ping_only INTEGER"
-                " NOT NULL DEFAULT 0")
-        if "reviewed" not in jobs:
+        self.ensure_columns("discovery_jobs", {
+            "allow_ping_only": "INTEGER NOT NULL DEFAULT 0",
             # Pre-upgrade jobs count as already reviewed, or every old
             # finished job would pop an approval dialog on first open.
-            self._conn.execute(
-                "ALTER TABLE discovery_jobs ADD COLUMN reviewed INTEGER"
-                " NOT NULL DEFAULT 1")
-        results = {row["name"] for row in
-                   self._conn.execute("PRAGMA table_info(discovery_results)").fetchall()}
-        # What the sweep's arc hop found (4.32), carried into the device on
+            "reviewed": "INTEGER NOT NULL DEFAULT 1",
+        })
+        # What the sweep's arc hop found, carried into the device on
         # promotion so its first poll starts from the same evidence.
-        for column in ("arcs", "vendor_source", "vendor_confidence",
-                       "suggest_bundle", "vendor_evidence"):
-            if column not in results:
-                self._conn.execute(
-                    f"ALTER TABLE discovery_results ADD COLUMN {column} TEXT")
+        self.ensure_columns("discovery_results", {
+            "arcs": "TEXT", "vendor_source": "TEXT", "vendor_confidence": "TEXT",
+            "suggest_bundle": "TEXT", "vendor_evidence": "TEXT",
+        })
 
-        mac_entries = {row["name"] for row in
-                      self._conn.execute("PRAGMA table_info(mac_entries)").fetchall()}
-        # present/first_seen_ts (4.34): a MAC entry now survives a walk that
-        # no longer sees it (present=0) instead of being deleted outright —
-        # see the CREATE TABLE comment above. Every pre-existing row was, by
-        # definition, seen on its own seen_ts and nothing else is known
-        # about when it first appeared, so first_seen_ts backfills to that.
-        if "first_seen_ts" not in mac_entries:
-            self._conn.execute("ALTER TABLE mac_entries ADD COLUMN first_seen_ts REAL")
+        # A MAC entry survives a walk that no longer sees it (present=0)
+        # rather than being deleted outright.
+        added = self.ensure_columns("mac_entries", {
+            "first_seen_ts": "REAL",
+            "present": "INTEGER NOT NULL DEFAULT 1",
+        })
+        if "first_seen_ts" in added:
+            # Nothing is known about a pre-existing row beyond its seen_ts.
             self._conn.execute(
                 "UPDATE mac_entries SET first_seen_ts = seen_ts WHERE first_seen_ts IS NULL")
-        if "present" not in mac_entries:
-            self._conn.execute(
-                "ALTER TABLE mac_entries ADD COLUMN present INTEGER NOT NULL DEFAULT 1")
         # Here and not in SCHEMA's CREATE INDEX block: that script runs
         # before this, and on a pre-4.34 database `present` only exists once
-        # the ALTER above has run. 4.34.0 had it in both places and could not
-        # open any existing nodes.db.
+        # the ALTER above has run.
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_mac_entries_mac_present"
             " ON mac_entries(mac, present, seen_ts)")
         # The alert engine asks for one metric key across the whole fleet
-        # twelve times a minute (metrics_for_keys). Without this the plan is
-        # a full scan of `metrics`, which at 2,000 devices × ~90 keys is
-        # 180,000 rows per lookup; the UNIQUE(device_id, key) index leads
-        # with device_id and cannot serve a key-first query.
+        # twelve times a minute (metrics_for_keys); the UNIQUE(device_id, key)
+        # index leads with device_id and cannot serve a key-first query.
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_metrics_key ON metrics(key)")
-        # The device this one sits behind: the access switch's uplink, the
-        # site's edge router. Operator-set, nullable, and self-referential
-        # without a foreign key on purpose — a REFERENCES devices(id) here
-        # would need ON DELETE SET NULL to be enforced, and this database
-        # opens with foreign_keys off on some upgrade paths. The alert engine
+        # The device this one sits behind. Operator-set, nullable and
+        # self-referential without a foreign key on purpose: the alert engine
         # treats an id that no longer exists as no upstream at all, which is
-        # the same outcome without depending on the pragma.
-        if "upstream_id" not in devices:
-            self._conn.execute("ALTER TABLE devices ADD COLUMN upstream_id INTEGER")
+        # the same outcome ON DELETE SET NULL would give.
+        self.ensure_columns("devices", {"upstream_id": "INTEGER"})
         # Walked downwards ("what is behind this outage") far more often than
         # upwards, and the upward walk is by primary key anyway.
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_devices_upstream"
             " ON devices(upstream_id)")
 
-        # LLDP/CDP neighbour walk (Tier 1 #5): its own opt-out interval,
-        # inheritable device-over-group exactly like mac_table_interval_s —
-        # NULL keeps meaning "inherit", see _merge_config.
-        devices = {row["name"] for row in
-                   self._conn.execute("PRAGMA table_info(devices)").fetchall()}
-        if "lldp_interval_s" not in devices:
-            self._conn.execute("ALTER TABLE devices ADD COLUMN lldp_interval_s INTEGER")
-        # PoE and STP (Tier 1 #7) ride the regular poll cycle rather than a
-        # walk of their own, so what they need per device/group is only an
-        # on/off switch, not an interval; NULL means "inherit" like every
-        # other override column. Defaulted on in _merge_config, because the
-        # capability probe below already makes the walk free on a device
-        # that does not answer the table.
-        for column in ("poe_enabled", "stp_enabled"):
-            if column not in devices:
-                self._conn.execute(f"ALTER TABLE devices ADD COLUMN {column} INTEGER")
-        # The capability probe's memory: NULL = not yet probed (probe this
-        # poll), 0/1 = probed once and remembered, so a device without the
-        # table pays for the walk exactly once rather than on every poll.
-        # Never inherited — whether a *specific box* answers PoE or STP is a
-        # fact about that box, not something a profile should hand down, so
-        # these are deliberately absent from _OVERRIDE_COLUMNS.
-        for column in ("poe_capable", "stp_capable"):
-            if column not in devices:
-                self._conn.execute(f"ALTER TABLE devices ADD COLUMN {column} INTEGER")
-        # Same capability memory, same reasoning, for UPS-MIB and the
-        # device-level ENTITY-SENSOR-MIB scan: added after poe_capable/
-        # stp_capable, and NOT alongside them above, because those two
-        # shipped gated on exactly this pattern from the start while
-        # ups_capable/sensor_capable did not — see nodepoll._poll_ups_health
-        # and _poll_environment for what closed that gap and why a device
-        # confirmed neither should stop paying for either, forever, rather
-        # than once.
-        for column in ("ups_capable", "sensor_capable"):
-            if column not in devices:
-                self._conn.execute(f"ALTER TABLE devices ADD COLUMN {column} INTEGER")
-        # Bridge-wide STP state (BRIDGE-MIB dot1dStp), refreshed every poll
-        # once stp_capable is known true. Descriptive device state, the same
-        # shape sys_name/vendor already are, not a time series — the one
-        # STP number worth charting, the topology-change counter, goes
-        # through the ordinary metrics/samples path instead (see
-        # nodepoll._run_stp), which is what gives the future alerting/UI
-        # wave a rate-of-change rule for free.
-        for column, kind in (("stp_protocol_spec", "TEXT"), ("stp_priority", "INTEGER"),
-                             ("stp_root_id", "TEXT"), ("stp_root_cost", "INTEGER"),
-                             ("stp_root_port", "INTEGER"),
-                             ("stp_time_since_change_s", "REAL")):
-            if column not in devices:
-                self._conn.execute(f"ALTER TABLE devices ADD COLUMN {column} {kind}")
-
-        groups = {row["name"] for row in
-                  self._conn.execute("PRAGMA table_info(groups)").fetchall()}
-        for column in ("lldp_interval_s", "poe_enabled", "stp_enabled"):
-            if column not in groups:
-                self._conn.execute(f"ALTER TABLE groups ADD COLUMN {column} INTEGER")
-
-        # Per-port PoE and STP state, alongside the admin/oper status pair
-        # interfaces already carries — a PoE port's power draw and an STP
-        # port's forwarding state are exactly the same kind of fact as
-        # oper_status, refreshed by the same replace_interfaces()-adjacent
-        # poll cycle rather than deserving their own table.
-        interfaces = {row["name"] for row in
-                      self._conn.execute("PRAGMA table_info(interfaces)").fetchall()}
-        for column in ("poe_admin", "poe_detect_status", "stp_state"):
-            if column not in interfaces:
-                self._conn.execute(f"ALTER TABLE interfaces ADD COLUMN {column} TEXT")
-        if "poe_power_mw" not in interfaces:
-            self._conn.execute("ALTER TABLE interfaces ADD COLUMN poe_power_mw INTEGER")
+        self.ensure_columns("devices", {
+            # LLDP/CDP walk interval, inheritable like mac_table_interval_s.
+            "lldp_interval_s": "INTEGER",
+            # PoE and STP ride the regular poll cycle, so they need only an
+            # on/off switch; defaulted on in _merge_config because the
+            # capability probe makes the walk free on a device without them.
+            "poe_enabled": "INTEGER",
+            "stp_enabled": "INTEGER",
+            # The capability probe's memory: NULL = not yet probed, 0/1 =
+            # probed once and remembered. Never inherited — whether a
+            # specific box answers is a fact about that box, so these are
+            # deliberately absent from _OVERRIDE_COLUMNS.
+            "poe_capable": "INTEGER",
+            "stp_capable": "INTEGER",
+            "ups_capable": "INTEGER",
+            "sensor_capable": "INTEGER",
+            # Bridge-wide STP state (BRIDGE-MIB dot1dStp), refreshed every
+            # poll once stp_capable is true. Device state, not a time series;
+            # the topology-change counter goes through metrics/samples.
+            "stp_protocol_spec": "TEXT",
+            "stp_priority": "INTEGER",
+            "stp_root_id": "TEXT",
+            "stp_root_cost": "INTEGER",
+            "stp_root_port": "INTEGER",
+            "stp_time_since_change_s": "REAL",
+        })
+        self.ensure_columns("groups", {
+            "lldp_interval_s": "INTEGER", "poe_enabled": "INTEGER",
+            "stp_enabled": "INTEGER",
+        })
+        # Per-port PoE and STP state, the same kind of fact as oper_status
+        # and refreshed by the same poll cycle rather than a table of its own.
+        self.ensure_columns("interfaces", {
+            "poe_admin": "TEXT", "poe_detect_status": "TEXT",
+            "stp_state": "TEXT", "poe_power_mw": "INTEGER",
+        })
 
     def _seed(self) -> None:
         """Creates a `Default` polling profile if none exists yet. Idempotent
@@ -1044,18 +891,6 @@ class NodesDatabase:
 
     # --------------------------------------------------------------- settings
 
-    def settings(self) -> dict:
-        values = dict(DEFAULTS)
-        with self._lock:
-            rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
-        for row in rows:
-            if row["key"] in values:
-                try:
-                    values[row["key"]] = json.loads(row["value"])
-                except (ValueError, TypeError):
-                    pass
-        return settingsutil.coerce_settings(DEFAULTS, values, strict=False)
-
     def _private_setting(self, key: str, default=None):
         """A settings row this module keeps for itself. Not in DEFAULTS, so
         settings() never returns it and save_settings() cannot be made to
@@ -1080,15 +915,8 @@ class NodesDatabase:
             self._conn.commit()
 
     def save_settings(self, values: dict) -> None:
+        super().save_settings(values)
         with self._lock:
-            for key, value in values.items():
-                if key not in DEFAULTS:
-                    continue
-                self._conn.execute(
-                    "INSERT INTO settings(key, value) VALUES (?,?)"
-                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (key, json.dumps(value)))
-            self._conn.commit()
             self._config_generation += 1
 
     # ----------------------------------------------------------------- groups
@@ -1351,12 +1179,8 @@ class NodesDatabase:
                text: str | None = None, device_group_id: int | None = None,
                exclude_up: bool = False, limit: int | None = None,
                offset: int = 0) -> list[sqlite3.Row]:
-        # `limit`/`offset` (4.47.0): both additive and both default to the
-        # pre-paging behaviour — `limit=None` runs no LIMIT clause at all,
-        # so a caller that has never heard of paging (there is still no
-        # guarantee this API layer's get_nodes_devices is the only one)
-        # gets the whole matching set back exactly as before. Passing a
-        # limit is what the paged Devices table now does.
+        # `limit=None` runs no LIMIT clause at all, so an unpaged caller
+        # gets the whole matching set back.
         where, params = self._device_filter_clause(
             group_id, status, text, device_group_id, exclude_up)
         query = f"SELECT * FROM devices{where} ORDER BY name COLLATE NOCASE, ip"
@@ -2128,7 +1952,7 @@ class NodesDatabase:
     # also walked LLDP/CDP) by comparing (device_id, if_index) endpoint
     # pairs, instead of guessing from device ids alone and drawing a link
     # twice or collapsing two different physical links into one.
-    # matched_by_name_id/matched_by_mac_id (4.49.0): the two joins' own ids,
+    # matched_by_name_id/matched_by_mac_id: the two joins' own ids,
     # ungrouped, alongside the COALESCE this always returned — for
     # upstream_suggestions()'s confidence scoring, which needs to know
     # whether the chassis-MAC join independently agrees with whichever id
@@ -2499,13 +2323,10 @@ class NodesDatabase:
     def record_metric_samples(self, device_id: int, rows: list) -> dict:
         """Every metric one poll produced, in one transaction.
 
-        `rows` is a sequence of (key, label, unit, kind, ts, value). The
-        whole poll's samples used to go through record_metric_sample one at
-        a time, each with its own commit: a 500-port chassis is ~2,000
-        fsyncs per poll, and the review measured 2,181 rows/s that way
-        against 150,832/s batched. Here it is one SELECT of the device's
-        existing metric ids, one INSERT for keys never seen before, one
-        UPDATE of the current values, and one INSERT for the samples.
+        `rows` is a sequence of (key, label, unit, kind, ts, value). One
+        SELECT of the device's existing metric ids, one INSERT for keys never
+        seen before, one UPDATE of the current values, one INSERT for the
+        samples — a per-sample commit is ~2,000 fsyncs on a 500-port chassis.
 
         `kind` is written only when the metric row is created. Changing a
         metric's kind under a chart that has months of history in the other
@@ -3172,11 +2993,6 @@ class NodesDatabase:
                 (sys_object_id,)).fetchone()
         return (row["vendor"] if row else "") or ""
 
-    def learned_vendors(self) -> list[sqlite3.Row]:
-        with self._lock:
-            return self._conn.execute(
-                "SELECT * FROM vendor_learned ORDER BY set_ts DESC").fetchall()
-
     def learned_row(self, sys_object_id: str) -> sqlite3.Row | None:
         if not sys_object_id:
             return None
@@ -3378,33 +3194,15 @@ class NodesDatabase:
 
     # -------------------------------------------------------------- storage
 
-    def size_bytes(self) -> int:
-        total = 0
-        for suffix in ("", "-wal", "-shm"):
-            try:
-                total += os.path.getsize(self.path + suffix)
-            except OSError:
-                pass
-        return total
-
     _CAP_MIN_SQLITE = (3, 25, 0)   # window functions
 
     def cap_samples_per_metric(self, n: int, chunk: int = 200) -> int:
         """Keep at most the newest `n` raw samples of EACH metric.
 
-        The cap this replaces counted the whole table: 50,000 rows total
-        survived every maintenance pass, which at 2,000 devices and ~90
-        metrics each is 0.29 samples per metric — every chart empty, every
-        threshold streak reset — and the single DELETE of the other ~11
-        million rows held the process lock for tens of seconds. This
-        deletes per metric with a window function, in chunks of `chunk`
-        metrics, taking the lock for each chunk and releasing it in
-        between, so a poll worker waits for one chunk at most.
-
-        Window functions need SQLite 3.25. On anything older this does
-        nothing and says so once, rather than raising in the maintenance
-        thread — the alternative would be the whole-table delete this
-        exists to remove.
+        Per metric with a window function, in chunks of `chunk` metrics,
+        taking the lock for each chunk and releasing it in between, so a poll
+        worker waits for one chunk at most. Window functions need SQLite
+        3.25; on anything older this does nothing and says so once.
         """
         if n <= 0:
             return 0
@@ -3449,12 +3247,9 @@ class NodesDatabase:
         removed = 0
         now = time.time()
         with self._lock:
-            # Unconditional, like every other module's prune() — a caller
-            # that wants "delete everything now" (the Settings page's
-            # maintenance button) passes 0, which computes a cutoff of
-            # "now" and so matches every existing row; a 0 that instead
-            # skipped the DELETE entirely would make that button silently
-            # do nothing, as it originally did before this fix.
+            # Unconditional: a caller that wants "delete everything now" (the
+            # Settings page's maintenance button) passes 0, which computes a
+            # cutoff of "now" and so matches every existing row.
             cursor = self._conn.execute(
                 "DELETE FROM samples WHERE ts < ?", (now - sample_days * 86400,))
             removed += cursor.rowcount or 0
@@ -3477,23 +3272,17 @@ class NodesDatabase:
             self._conn.commit()
         removed += self.cap_samples_per_metric(max_samples_per_metric)
         if removed:
-            # Freed pages go back to the operating system in short steps
-            # with the lock released between them, rather than through a
-            # VACUUM that rewrites the whole file under an exclusive lock.
-            dbmaint.reclaim(self._conn, self._lock, label="nodes")
+            # Freed pages go back in short steps with the lock released
+            # between them, not through a whole-file VACUUM.
+            reclaim(self._conn, self._lock, label="nodes")
         return removed
 
     def trim_to_size(self, max_bytes: int) -> int:
-        """Delete the oldest raw samples until the file is back under its
-        cap.
+        """Delete the oldest raw samples until the file is back under its cap.
 
-        The deletes are the same as before; what changed is how the space
-        comes back. This used to run VACUUM inside the module lock, up to
-        six times — the review measured 6.49 s per VACUUM at 2 million rows
-        and a 38.9 s stall for the whole call, during which every poll
-        worker, the alert tick and every HTTP handler waited. dbmaint's
-        incremental reclaim frees pages in short steps, releasing the lock
-        between them, so nothing waits longer than one step."""
+        Incremental reclaim rather than VACUUM: a whole-file rewrite under
+        the module lock stalls every poll worker and HTTP handler.
+        """
         if max_bytes <= 0:
             return 0
         removed = 0
@@ -3511,5 +3300,5 @@ class NodesDatabase:
                     " ORDER BY ts ASC LIMIT ?)", (chunk,))
                 removed += cursor.rowcount or 0
                 self._conn.commit()
-            dbmaint.reclaim(self._conn, self._lock, label="nodes")
+            reclaim(self._conn, self._lock, label="nodes")
         return removed

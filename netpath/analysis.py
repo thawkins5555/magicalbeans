@@ -8,52 +8,27 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from statistics import mean
 
-# Ordered worst-last so max() picks the most severe status in a bucket.
 # Worst-last, so max() picks the most severe status in a bucket. "blocked"
-# ranks above "fail" because it is the more specific finding: silence tells you
-# nothing, a refusal names the router and the reason.
-# "overrun" sits above the network faults because it is a measurement fault:
-# whatever the path was doing, this slot produced no data and the schedule is
-# the reason. Hiding it under a green neighbour would bury the fix.
+# ranks above "fail" (a refusal names the reason; silence does not), and
+# "overrun" above both (a measurement fault, not a network one).
 STATUS_ORDER = {"none": 0, "ok": 1, "warn": 2, "fail": 3, "blocked": 4,
                 "overrun": 5, "error": 6}
 
 
-# The timeline's own ceilings, applied inside build_timeline() so that no
-# caller can ask for an unbounded allocation.
-#
-# `t0`, `t1` and the pixel width they are derived from all arrive as query
-# parameters on a GET that only needs the read-only role, and nothing between
-# the query string and here bounded any of them. `n_buckets` works out to
-# roughly min(span / interval, width / MIN_BLOCK_PX), so `t1=1e9&width=1e6`
-# allocated 326,798 Bucket objects -- each with a Counter, plus two
-# list-of-lists entries and a dict in the JSON response -- and `width=3e7`
-# would have reached about ten million, some 4 GB, from one request.
-#
-# 2,000 blocks is already finer than any screen can draw: the UI's own
-# smallest block is a few pixels, so a 4K display asks for at most ~1,000.
-# Beyond the cap the window is kept and the buckets are widened to fit,
-# which is what a caller asking for a decade of history actually wants.
+# Ceiling on build_timeline()'s bucket count: t0/t1/width arrive unbounded from
+# a GET's query string, and an extreme span+width could otherwise allocate
+# millions of Bucket objects from one request. Beyond the cap the window is
+# kept and buckets are widened to fit instead.
 MAX_BUCKETS = 2000
 # Seconds since the epoch that a window may name: 1970-01-01 to 2100-01-01,
 # and at most ten years wide.
 MAX_TIMESTAMP = 4102444800.0
 MAX_SPAN_S = 10 * 366 * 24 * 3600.0
 
-# build_topology's own ceiling: the most distinct addresses at one TTL,
-# *within a single trace*, that are paired into edges against the next TTL's
-# own set. Nothing bounds how many different IPs a trace's own probes can
-# return at one hop -- it is genuine ECMP path diversity, or a malformed
-# trace, whichever produced the rows -- and pairing every one of them against
-# every one of the next hop's is O(fanout^2): measured at 0.4 s for a fanout
-# of 20 and 1.2 s for 40, on a single trace, before this cap existed. A real
-# hop's ECMP diversity is a handful of parallel uplinks, essentially never
-# above sixteen, so 64 is invisible to every real network and turns the
-# worst case into a bounded 4,096 edge increments per hop-pair per trace.
-# Deliberately not a cap on how many nodes are drawn -- accumulated over many
-# traces a TTL can and should show more than 64 distinct addresses over time,
-# and only the O(n^2) edge-pairing within one trace is what this bounds; see
-# Topology.truncated_ttls for how a hit is reported rather than hidden.
+# build_topology's ceiling on distinct addresses paired into edges at one TTL
+# within a single trace — pairing is O(fanout^2), and real ECMP diversity is
+# never more than a handful of uplinks. Not a cap on nodes drawn overall
+# (accumulated across traces); see Topology.truncated_ttls for how a hit is reported.
 MAX_HOP_FANOUT = 64
 
 

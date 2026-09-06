@@ -1,13 +1,9 @@
-"""The layout and input contracts 4.46.0 introduced, pinned as text.
+"""The layout and input contracts, pinned as text.
 
-Width breakpoints exist and the fixed widths are fluid under them; every
-drag in the product is a captured pointer gesture rather than a mouse-only
-one, so a finger and a pen work and a drag that leaves its element still
-ends; the pane splitters are real separators the keyboard can move; kiosk
-mode is a query flag the stylesheet and the script both answer to. Each of
-these was a comment or a convention before, and a convention that lives only
-in a comment is one that comes back.
-"""
+Width breakpoints exist and the fixed widths are fluid under them; every drag
+is a captured pointer gesture (a finger and a pen work, and a drag that leaves
+its element still ends); the pane splitters are real separators the keyboard
+can move; kiosk mode is a query flag the stylesheet and the script both obey."""
 
 import os
 import re

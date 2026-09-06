@@ -3,17 +3,16 @@
 See also: `FEATURES.md` for what each module does, `INTERNALS.md` for how
 each one actually works — file by file, mechanism by mechanism —
 `NETWORK-AND-STORAGE-REQUIREMENTS.md` for ports and protocols, `CHANGELOG.md`
-for the build history, and `CREDENTIAL-SECURITY.md` for exactly how passwords
-and stored credentials are protected.
-
-New in this release: `QUICKSTART.md` takes a new installation from unpacked to
-first device polled, `BACKUP-RESTORE.md` covers the ten database files, and
-`RUNBOOK.md` is what to do at 02:00 when something has stopped.
+for the build history, `CREDENTIAL-SECURITY.md` for exactly how passwords
+and stored credentials are protected, and `RUNBOOK.md` for what to do at
+02:00 when something has stopped. [Quick start](#quick-start),
+[Releasing](#releasing) and [Backup and restore](#backup-and-restore) are
+sections of this document.
 
 ## Contents
 
 - [NetPath](#netpath) — the traceroute monitor this application started as
-- [Install and run](#install-and-run) · [Accounts](#accounts)
+- [Install and run](#install-and-run) · [Quick start](#quick-start) · [Accounts](#accounts)
 - [A shortcut with no terminal window](#a-shortcut-with-no-terminal-window)
 - [The service console](#the-service-console)
 - [Using it](#using-it) — [concurrency](#concurrency-and-timeouts), [the three lanes](#the-three-lanes), [snapshots](#snapshot-vs-aggregate), [hop names](#hop-names), [silent hops](#silent-hops)
@@ -28,6 +27,8 @@ first device polled, `BACKUP-RESTORE.md` covers the ten database files, and
 - [Running as a service](#running-as-a-service) — systemd and NSSM
 - [Layout](#layout)
 - [Notes and limits](#notes-and-limits)
+- [Releasing](#releasing)
+- [Backup and restore](#backup-and-restore)
 
 Twelve tabs at the top of the window, in frequency order with a hairline marking where each of four groups used to be labelled: **Dashboard** and **Alerts**, a rule engine over Nodes/traps/syslog/IPAM with email notification; **Nodes**, an SNMP poller and device inventory, **IPAM**, subnet discovery, conflict detection, and read-only DHCP visibility, **FortiWireless**, a Fortinet access-point dashboard, and **ConfigRX**, SSH configuration backups; **Routes**, the scheduled traceroute monitor (the NetPath module this application started as, named on screen for what it shows), **NetFlow**, a flow collector, **Syslog**, a message collector, and **SNMP Trap**, a trap and inform receiver; **Settings** and **Debug**, a live view of what the background threads are doing. Who is signed in, the **Account** control — which also holds the version number and the per-browser Appearance settings — and **Sign out** sit beside the tabs rather than inside the scrolling strip, so narrowing the window never hides them; below about 480 px those three collapse to icons to leave more of the strip for the tabs themselves.
 
@@ -134,6 +135,51 @@ py -m netpath --db .\netpath.db --flow-db .\flows.db --syslog-db .\syslog.db --a
 The default folder is `%APPDATA%\netpath-monitor\` on Windows and
 `~/.local/share/netpath-monitor/` elsewhere. That folder name is unchanged so
 existing databases keep working.
+
+## Quick start
+
+From an unpacked copy to a device being polled, an alert you trust, and a path
+being watched. About twenty minutes, most of it waiting for a poll.
+
+1. **Start the service** (see [Install and run](#install-and-run) above), bound
+   to loopback first: `--host 127.0.0.1`. Open it up deliberately once the
+   admin password is changed and, ideally, a certificate is in place.
+2. **Sign in as `admin`/`admin`.** The server refuses every API call except
+   sign-out and the password change itself until you pick a new one. Then,
+   straight away, make yourself a second account with the `admin` capability
+   on **Settings → Users** — one account is one lost password away from a
+   stopped service.
+3. **Add a polling profile** — **Nodes → Settings → Polling profiles → Add.**
+   A v2c profile with your read community, a 120 s poll interval and ping
+   enabled is a reasonable first one; a profile can hold several credentials,
+   tried in order, for a fleet with more than one community.
+4. **Add your first device** — **Nodes → Add device**, address plus that
+   profile, name left blank so it takes `sysName`. It polls within its
+   interval; selecting it forces a three-second cadence while you watch.
+   Fill in **Upstream device** once you have more than a rack — an outage
+   behind it then opens one alert instead of fifty.
+5. **Check the poll worked**: a green status, a vendor and an interface count
+   within a couple of minutes. `unknown` with no error means not polled yet;
+   `auth_fail` means the wrong community; `down` immediately means neither
+   ping nor SNMP answered; up with no interfaces on an SNMPv1-only device
+   means setting the profile's version to 1.
+6. **Add a Routes destination** — **Routes → Add**, an address you care about
+   reaching, five minutes, default hops and probes. This is the module that
+   answers "is it us or is it them" during an incident.
+7. **Turn on email** — **Alerts → Settings → Notifications**, SMTP server,
+   port, security mode, From/To, then send a test. On Linux, macOS or BSD a
+   stored SMTP password needs `NETPATH_SECRET_PASSPHRASE_FILE` (or the weaker
+   `NETPATH_SECRET_PASSPHRASE`) set before the service starts — see
+   `CREDENTIAL-SECURITY.md` §10 — otherwise the field refuses the value
+   rather than accepting and losing it; an unauthenticated internal relay
+   works either way.
+8. **The next hour, roughly in order of value**: set `sample_retention_days`
+   and `rollup_retention_days` (Nodes → Settings) for the history you want;
+   point devices' syslog and traps here (UDP 514/162 — both listeners are off
+   by default); run a discovery sweep or bulk-import the rest of the fleet
+   (Nodes); fill in Upstream device everywhere; read `RUNBOOK.md` once, before
+   you need it; set up [backups](#backup-and-restore); run it as a
+   [service](#running-as-a-service) rather than in a terminal.
 
 ## A shortcut with no terminal window
 
@@ -613,9 +659,10 @@ Remove-PSSession $s
 
 Then confirm the version, as below. The databases are never touched by any of
 this — they live outside the application folder by default, in
-`%APPDATA%\netpath-monitor\`. Read `BACKUP-RESTORE.md` before an upgrade that
-crosses a schema change; the short version is that a copy of the ten `.db` files
-taken while the service is stopped is a complete, restorable backup.
+`%APPDATA%\netpath-monitor\`. Read [Backup and restore](#backup-and-restore)
+before an upgrade that crosses a schema change; the short version is that a
+copy of the ten `.db` files taken while the service is stopped is a complete,
+restorable backup.
 
 On Linux the equivalent is `systemctl stop sappiwhere`, replace the directory,
 `systemctl start sappiwhere`. There is also an in-application update path — the
@@ -762,12 +809,16 @@ netpath/
   syslogparse.py   RFC 3164 and RFC 5424 message parsing
   syslogd.py       syslog UDP/TCP listener
   syslogdb.py      syslog storage, rollup counts, trigram substring search
-  trapdecode.py    SNMP trap BER/ASN.1 decoding and encoding, v3 USM auth
-  trapoids.py      well-known trap OID names, enum tables, default severities
+  trapdecode.py    SNMP trap BER/ASN.1 decoding and encoding, v3 USM auth;
+                   well-known trap OID names, enum tables, default severities
   snmptrapd.py     SNMP trap UDP listener
   snmptrapdb.py    SNMP trap storage, rollup counts
-  namelookup.py    reverse DNS: system resolver, direct PTR query, nslookup
-  procs.py         launching child processes with no console window
+  namelookup.py    reverse DNS: system resolver, direct PTR query, nslookup;
+                   shared "best-known display name for an IP", used by
+                   Syslog, Alerts and NetPath alike
+  worker.py        launching child processes with no console window;
+                   ago(ts) elapsed-time formatting; the Worker mixin
+                   background workers subclass
   auth.py          password hashing, users, sessions, login throttling
   eventlog.py      bounded in-memory event buffer shared by all workers
   appdb.py         shared settings and accounts (app.db)
@@ -776,7 +827,9 @@ netpath/
   ipam_scan.py     subnet ping sweep and ARP-table reconciliation
   ipam_dhcp.py     polls a Windows DHCP server's scopes, leases and reservations
   ipam_worker.py   background scheduler for subnet scans and DHCP polling
-  nodeoids.py      built-in polled-metric OID catalog for the Nodes poller
+  nodeoids.py      built-in polled-metric OID catalog for the Nodes poller;
+                   also OID constants for FortiGate Wireless Controller
+                   polling
   nodepoll.py      NodePoller: the per-device SNMP/ping scheduler
   nodesdb.py       nodes.db: devices, polling profiles, interfaces, polled
                    metrics/samples, state events, uploaded MIBs, discovery
@@ -797,22 +850,20 @@ netpath/
   alertengine.py   AlertEngine: the 5-second evaluation scheduler that
                    drains events/traps/syslog/IPAM into alerts
   alertmail.py     alert email: {{token}} template rendering, stdlib SMTP
-  fortinetoids.py  OID constants for FortiGate Wireless Controller polling
   fortipoll.py     WirelessPoller: polls FortiGate controllers for managed
                    APs over SNMP
   wirelessdb.py    wireless.db: controller storage and SNMP credentials
   configrxdb.py    configrx.db: backup config storage, keyed to Nodes'
                    own device ids
   configrx.py      ConfigRxWorker: scheduled read-only "show config" pulls
-                   over SSH, the backup path's safety boundary
-  configrx_vendors.py    per-vendor allow-list of the exact commands a
-                   backup may ever send over SSH
+                   over SSH, the backup path's safety boundary; per-vendor
+                   allow-list of the exact commands a backup may ever send
   configrx_redact.py     strips secrets (community strings, PSKs, enable
                    passwords) from a captured config before it is stored
-  configrx_search.py     cross-device search over stored configs, with a
-                   bounded-regex compiler so a query can't hang
-  configrx_compliance.py rule sets: must-match/must-not-match checks
-                   against each device's latest capture
+  configrx_compliance.py cross-device search over stored configs, with a
+                   bounded-regex compiler so a query can't hang; rule sets:
+                   must-match/must-not-match checks against each device's
+                   latest capture
   hostkeys.py      remembered SSH host keys, shared by ConfigRX and the
                    SSH terminal; refuses a changed key
   sshterm.py       interactive SSH sessions for the browser terminal
@@ -820,18 +871,17 @@ netpath/
   permissions.py   the per-module read/write permission model
   report.py        availability and link-saturation reports, computed
                    from history Nodes and Alerts already keep
-  hostresolve.py   shared "best-known display name for an IP", used by
-                   Syslog, Alerts and NetPath alike
-  dbmaint.py       incremental-vacuum space reclamation without VACUUM's
-                   stop-the-world lock
-  dbopen.py        opens a SQLite file with owner-only file permissions
-  settingsutil.py  type coercion for settings dicts loaded from or
-                   written to the settings table
+  sqlitebase.py    the SqliteStore base class every database module
+                   subclasses (open/pragma/migrate/close, settings,
+                   trim/reclaim); opens a SQLite file with owner-only
+                   file permissions, incremental-vacuum space reclamation
+                   without VACUUM's stop-the-world lock, and settings-dict
+                   type coercion
   secretstore.py   the portable secret store: a passphrase-derived key,
                    a stand-in for DPAPI on hosts without it
   ldapclient.py    a minimal LDAPv3 simple-bind client for directory auth
-  udpsock.py       dual-stack UDP bind and drop-counter helpers shared
-                   by the three collectors
+  udpsock.py       dual-stack UDP bind and drop-counter helpers, and the
+                   UdpReceiver base class the three collectors subclass
   web/
     __init__.py    exports Service and WebServer
     service.py     headless service: opens the databases, starts the
@@ -858,8 +908,9 @@ netpath/
                    tiles, worst-ten offender lists
       netpath.js   Routes tab: route graph, timeline, destinations
       netflow.js   NetFlow tab: traffic chart, top-N, flow table, filters
-      snmp.js      SNMP Trap tab: hourly histogram, trap table, varbinds
-      syslog.js    Syslog tab: message table, filters, collector settings
+      events.js    SNMP Trap tab (hourly histogram, trap table, varbinds)
+                   and Syslog tab (message table, filters, collector
+                   settings), one shared page factory
       ipam.js      IPAM tab: subnets & hosts, conflicts, DHCP
       nodes.js     Nodes tab: device inventory, per-device drill-down
                    chart, discovery, polling profiles, vendor MIBs
@@ -876,7 +927,9 @@ netpath/
       ssh.css      styling for the SSH popup, on top of app.css
       ssh.js       the SSH window: xterm.js terminal driven over a
                    WebSocket
-      vendor/      vendored third-party JS (xterm.js and its fit addon)
+      vendor/      vendored third-party JS (xterm.js and its fit addon),
+                   with `LICENSE-xterm.txt` recording their versions,
+                   provenance and the no-build-step/no-patching rule
 ```
 
 Traces and hops go in `traces` and `hops`, with resolved names in `hostnames`. A hop row exists per distinct address seen at that TTL in that run, plus a null-address row when every probe timed out — that is what lets a single run show a fork, and what makes the `no reply` boxes appear in the graph.
@@ -900,3 +953,169 @@ CSV export of the current window's traces. (Alerting on NetPath status
 transitions used to be listed here and has shipped — the rules are
 `netpath_unreachable`, `netpath_path_unstable` and `netpath_latency_high` on the
 Alerts tab.)
+
+## Releasing
+
+Self-update is off by default (`updates_enabled`, in Settings). An install
+that leaves it off never contacts GitHub at all, and is updated by replacing
+the `netpath` directory by hand.
+
+**What the Update button does today**: `GET .../commits/main` for the current
+tip of the branch; stop if that commit is already recorded as installed;
+download `codeload.github.com/.../tar.gz/<sha>`, capped at 64 MiB with
+nothing verifying those bytes beyond the cap; unpack, stop every worker,
+replace the `netpath` package, record the commit, and re-exec. Whoever can
+push to `main` therefore chooses what every install with the setting on will
+run at the next press, on hosts holding SNMP communities and SSH credentials.
+That is known, deliberate and temporary — see the SECURITY NOTE at the top of
+`netpath/selfupdate.py` for what has to change to put the verified path below
+back in use. If that exposure is not acceptable, leave `updates_enabled` off
+— the default — and replace the directory by hand instead.
+
+**The verified path** (implemented; not what the button currently uses): the
+newest published tag by version order, that tag's GitHub release, and in its
+asset list a file called exactly `SHA256SUMS` — no asset, no install. The
+tag's tarball is downloaded and hashed as it streams, compared against
+`SHA256SUMS`'s line for `<repo>-<tag>.tar.gz`, and only a match is unpacked
+and swapped in. It proves the tarball is byte-for-byte what the release
+named; it does not prove who named it — there is no signature.
+
+**Cutting a release:**
+
+```sh
+# 1. Tag the commit and push the tag.
+git tag -a v4.52.0 -m "SappiWhere 4.52.0"
+git push origin v4.52.0
+
+# 2. Hash the tarball GitHub actually serves for that tag — the same URL the
+#    updater uses. Do not build your own tarball; the digest must be of the
+#    bytes the updater will receive.
+TAG=v4.52.0
+curl -fsSL -o "magicalbeans-$TAG.tar.gz" \
+  "https://codeload.github.com/thawkins5555/magicalbeans/tar.gz/refs/tags/$TAG"
+sha256sum "magicalbeans-$TAG.tar.gz" > SHA256SUMS
+
+# 3. Create the release for that tag and attach SHA256SUMS as an asset —
+#    a release asset, never a file committed in the repository: a digest
+#    that travels inside the archive it describes proves nothing.
+gh release create "$TAG" SHA256SUMS --title "SappiWhere 4.52.0" --notes-file -
+```
+
+`SHA256SUMS` is `sha256sum`'s own format, checkable by hand with
+`sha256sum -c SHA256SUMS`; extra lines for other files are ignored.
+
+**Checklist:**
+
+- [ ] `CHANGELOG.md` has the release's section, and `netpath/__init__.py`
+      carries the version being tagged — load-bearing at runtime, since it
+      lands in every static asset's URL (`app.js?v=...`, served `public,
+      max-age=31536000, immutable`). Bump it for any release that changes a
+      static file, however small; a browser holding an old URL never asks
+      again for up to a year.
+- [ ] `python3 tests/run_all.py` is green.
+- [ ] Tag pushed.
+- [ ] `SHA256SUMS` generated from the codeload tarball for that tag.
+- [ ] Release created for the tag with `SHA256SUMS` attached.
+- [ ] `sha256sum -c SHA256SUMS` passes against a freshly downloaded tarball.
+
+## Backup and restore
+
+Ten SQLite databases, all in WAL mode, all written by one live process.
+**Copying only the `.db` file while the service is writing gives a torn
+backup** — every database also has a `-wal` (committed transactions not yet
+folded into the main file) and usually a `-shm`. Do not use `cp`, `rsync` or
+a snapshot on a running instance unless it is genuinely atomic across all
+three files of every database at once.
+
+What to back up is everything in the data directory
+(`~/.local/share/netpath-monitor/` on Linux/macOS,
+`%APPDATA%\netpath-monitor\` on Windows, or wherever `--db`/`--nodes-db`/etc.
+point): the ten `.db` files, and `secret.salt` — the per-install salt the
+portable secret store (non-Windows hosts with a passphrase configured;
+`netpath/secretstore.py`, `CREDENTIAL-SECURITY.md`) derives its encryption
+key from. `NETWORK-AND-STORAGE-REQUIREMENTS.md` says what each database
+holds.
+
+**Method 1 — stop, copy, start.** Simple, complete, needs a maintenance
+window. A clean shutdown checkpoints and removes the `-wal` files; archiving
+the whole directory (not a `*.db` glob) also picks up `secret.salt`
+automatically:
+
+```bash
+systemctl stop sappiwhere
+tar czf sappiwhere-$(date +%F).tar.gz -C ~/.local/share netpath-monitor
+systemctl start sappiwhere
+```
+
+```powershell
+Stop-Service SappiWhere
+Compress-Archive -Path $env:APPDATA\netpath-monitor\* -DestinationPath D:\backups\sappiwhere-$(Get-Date -f yyyy-MM-dd).zip
+Start-Service SappiWhere
+```
+
+**Method 2 — `sqlite3 .backup`, no downtime.** Takes a read lock, copies
+pages, retries any changed underneath it, and folds the WAL in, leaving one
+self-contained `.db` with no `-wal` beside it. Unlike Method 1 it does not
+sweep up `secret.salt` for free, so the script must copy it explicitly —
+skipping it is how a restore onto new hardware loses every credential the
+portable secret store ever encrypted, permanently:
+
+```bash
+#!/bin/sh
+set -eu
+SRC="$HOME/.local/share/netpath-monitor"; DST="/backup/sappiwhere/$(date +%F)"
+mkdir -p "$DST"
+for f in app nodes alerts netpath flows snmptraps syslog ipam wireless configrx; do
+    [ -f "$SRC/$f.db" ] || continue
+    sqlite3 "$SRC/$f.db" ".backup '$DST/$f.db'"
+done
+[ -f "$SRC/secret.salt" ] && cp -p "$SRC/secret.salt" "$DST/secret.salt"
+sqlite3 "$DST/nodes.db" "PRAGMA integrity_check;"    # sanity, not a formality
+```
+
+Run it as the account that owns the files — from 4.39.0 the directory is
+`0700` and the databases (and `secret.salt`) `0600`. Back up `configrx.db` at
+the cadence of your change-control process, not your metrics; it is the file
+whose loss cannot be reconstructed by waiting. There is no in-application
+backup; **Settings → Maintenance** prunes and vacuums but does not export.
+
+**Restoring**, in order: stop the service; move the current directory aside
+rather than deleting it; restore the files (including any `-wal`/`-shm` for a
+Method 1 archive — a Method 2 backup has neither); fix ownership and modes
+(service account, `0700` on the directory, `0600` on the files); start it and
+watch the log — schemas migrate forward automatically, so restoring an older
+release's backup into a newer install is supported; then verify by signing
+in, checking the device count, checking the alert rules, and opening one
+ConfigRX backup. The databases are independent, so restoring one alone (say
+`configrx.db` from a week ago) is fine; the only cross-file references are
+alert rows naming a device id in `nodes.db`, and a mismatch there just
+renders as an id rather than a name.
+
+**The DPAPI caveat.** On Windows, every encrypted credential — the DHCP
+credential, SNMPv3 authentication passwords, the SMTP password, the wireless
+controller's SNMP credential, ConfigRX's SSH password and its optional
+per-device enable secret — is protected in machine-and-account scope.
+Restoring onto the same machine and service account works, including
+credentials; restoring onto a different account or different hardware brings
+back ciphertext that will not decrypt, and each credential needs re-entering
+— budget for that during disaster recovery, and keep them in a password
+manager rather than a text file next to the backup. A Linux/macOS/BSD backup
+follows the same shape if a passphrase-based secret store
+(`netpath/secretstore.py`) was configured on the host it came from, and has
+nothing to lose if one never was. SSH host keys are not encrypted and restore
+cleanly, and account passwords (scrypt hashes) restore fine everywhere.
+
+Verify a backup you already have:
+
+```bash
+sqlite3 /backup/sappiwhere/2026-09-01/nodes.db "PRAGMA integrity_check;"
+sqlite3 /backup/sappiwhere/2026-09-01/nodes.db "SELECT COUNT(*) FROM devices;"
+```
+
+`integrity_check` returning anything but `ok` means that backup is not one;
+a count that is zero when it should not be means the copy was taken mid-write
+or as the wrong user.
+
+Not in any backup: sessions and the Debug tab's event buffer (both in memory,
+reset on restart, deliberately) and anything a collector did not receive
+while the service was down — nothing here backfills.

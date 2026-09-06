@@ -198,7 +198,7 @@ check(not guarded, "no module re-implements app.js's write-only-if-changed "
 # 10. One device-lookup cache, in app.js, not one per module.
 #
 # "Which device has this IP (or this id)" was answered five times: ipam.js,
-# snmp.js, syslog.js and wireless.js each cached the whole unpaged device
+# wireless.js and both event pages each cached the whole unpaged device
 # list behind a 30-second clock (loadDeviceByIp), and alerts.js kept a
 # fifth, differently shaped cache for the same cross-link the other way
 # (device id -> ip). What the five share, past the naming, is the idiom: an
@@ -225,7 +225,7 @@ check(not device_cached, "no module keeps its own device-by-ip/id cache in "
 # ---------------------------------------------------------------------------
 # 11. One histogram-range narrower, in app.js, not one per module.
 #
-# alerts.js, snmp.js and syslog.js each carried a character-for-character
+# alerts.js and both event pages each carried a character-for-character
 # copy of the fix for a handful of events inside a day-long window plotting
 # as a sliver at the far right of an otherwise-empty chart — one copy's own
 # comment admitted it was done "independently in each owned module rather
@@ -521,7 +521,7 @@ check("ws.__closeMessage = message.message" in _handle_control,
 # stamped BEFORE `await page.refresh()` began — so a refresh() slower than
 # its own poll interval (precisely what a degrading server produces) let the
 # very next 100ms tick launch a second, fully concurrent refresh() for the
-# same tab. Separately, syslog.js and snmp.js recompute t1 = Date.now() / 1000
+# same tab. Separately, events.js recomputes t1 = Date.now() / 1000
 # on every Live tick, so two overlapping polls never share a URL and app.js's
 # own per-path abort-dedupe (call()) cannot cancel either one; nodes.js's
 # devices fetch has the same shape against live filter/pagination controls,
@@ -538,7 +538,7 @@ check("ws.__closeMessage = message.message" in _handle_control,
 # most confusing to the next reader.
 check("page.refreshing" in APP,
       "master()'s poll gate does not let a tab's refresh() overlap itself")
-for _name in ("syslog.js", "snmp.js", "nodes.js", "netpath.js", "configrx.js", "alerts.js"):
+for _name in ("events.js", "nodes.js", "netpath.js", "configrx.js", "alerts.js"):
     _body = read(_name)
     check("refreshGen" in _body,
           "%s's periodic refresh() carries a generation token" % _name)

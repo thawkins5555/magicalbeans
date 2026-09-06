@@ -1,17 +1,9 @@
-"""What one poll does: the transactions it writes, and the datagrams it
-is willing to believe.
-
-The review's §4.5 F3 measured one commit per metric sample — roughly 2,500
-transactions for a 500-port chassis and ~288,000 per cycle across a
-2,000-device fleet. The fix is a small number of batched transactions per
-poll, so the thing to assert is not "it is faster" (a timing test is a
-flaky test) but *how many transactions a poll takes*, counted exactly, off
-sqlite3's own statement trace.
-
-Also asserts that the batched writers store the same values the one-row
-writers did, since record_metric_sample and update_interface_rate are now
-wrappers around them.
-"""
+"""What one poll does: the transactions it writes, and the datagrams it is
+willing to believe. A poll takes a small, fixed number of batched
+transactions, asserted not as "it is faster" (a timing test is a flaky test)
+but as an exact count taken off sqlite3's own statement trace. Also asserts
+the batched writers store the same values record_metric_sample and
+update_interface_rate do, since those are thin wrappers around them."""
 import json
 import os
 import socket

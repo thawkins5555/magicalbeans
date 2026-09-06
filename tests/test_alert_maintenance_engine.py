@@ -1,12 +1,9 @@
-"""Maintenance windows at the engine's own occurrence-gating layer: an
-active window silences new alerts for its covered devices exactly like a
-manual mute, a future window is inert until its start, and a held roll-up
-notification for a covered alert follows the same mute rule email already
-does — left pending, not decided, until the window is no longer covering it.
-
-Drives engine._tick() directly, on the same harness test_alert_engine_fixes.py
-uses, rather than importing from it: that module runs its own numbered
-sections at import time, which this suite does not want to repeat.
+"""Maintenance windows at the engine's occurrence-gating layer: an active
+window silences new alerts for its covered devices exactly like a manual
+mute, a future window is inert until its start, and a held roll-up
+notification for a covered alert stays pending, not decided, until the
+window no longer covers it. Drives engine._tick() directly on the same
+harness shape test_alert_engine.py uses, without importing that module.
 """
 import os
 import sqlite3

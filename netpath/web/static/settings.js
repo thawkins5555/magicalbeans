@@ -591,12 +591,8 @@
   }
 
   function auditFilters() {
-    return {
-      username: App.el('audit-user').value,
-      action: App.el('audit-action').value,
-      target: App.el('audit-target').value.trim(),
-      q: App.el('audit-q').value.trim(),
-    };
+    return App.filterValues('audit',
+      { username: 'user', action: 'action', target: 'target', q: 'q' });
   }
 
   /* `target` follows "<kind>:<value>" for credential.store/clear and
@@ -767,9 +763,6 @@
 
   /* ------------------------------------------------------------- users */
 
-  // One implementation, in app.js. This was twelve copies of the same
-  // three lines, which is how one of them came to be missing a
-  // character while the others were not.
   const escape = App.escapeHtml;
 
   const when = App.when;
@@ -984,14 +977,7 @@
      Eleven fieldsets used to be one scroll with no way to jump partway
      down it. Same nav/subpage/recallSub grammar every other multi-section
      page already uses, so #/settings/users is addressable and Back works. */
-  function selectSub(name) {
-    for (const btn of document.querySelectorAll('#page-settings > .subtabs > .subtab')) {
-      btn.classList.toggle('active', btn.dataset.subtab === name);
-    }
-    for (const page of document.querySelectorAll('#page-settings > .subpage')) {
-      page.classList.toggle('active', page.id === `settings-sub-${name}`);
-    }
-  }
+  function selectSub(name) { App.selectSub('settings', name); }
 
   /* -------------------------------------------------------- module pane
      Module settings otherwise live in two places: a button on each
@@ -1135,9 +1121,8 @@
       anyone who can push to that repository chooses the code this host runs at the
       next press of the button, on a machine holding your SNMP communities and SSH
       credentials.</p>
-      <p>This is a known, temporary state, recorded as S-B1 in
-      <code>REVIEW-NETWORK-ENGINEER.md</code>. If that is not acceptable here, leave
-      this off and replace the <code>netpath</code> folder by hand.</p>` },
+      <p>Nothing in this path verifies what it downloaded. If that is not acceptable
+      here, leave this off and replace the <code>netpath</code> folder by hand.</p>` },
   });
 
   function init() {

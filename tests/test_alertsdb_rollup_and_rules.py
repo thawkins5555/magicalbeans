@@ -1,20 +1,9 @@
-"""Two additions to alertsdb.py, specified by the alert-rollup work in
-alertengine.py (ping-shims) but implemented here since alertsdb.py is not
-that agent's file:
-
-  1. alerts.rolled_up_into — a foreign key to the alert a rollup absorbed
-     this one into, distinct from resolved_by (which stays '' for a
-     rollup absorption exactly as it always has, so an operator-resolve
-     check does not mistake one for a hand resolve). resolve_by_dedup's
-     new optional parameter sets it; every existing call site that omits
-     the parameter is unaffected. alerts_rolled_up_into(parent_id) reads
-     it back, structured, for a parent's own detail view.
-  2. alert_count_for_rule + a hardened remove_rule — deleting a custom
-     rule with real alert history would cascade-delete that history
-     (rules.id is alerts.rule_id's ON DELETE CASCADE parent); the count
-     is what a caller uses to refuse with "N alerts reference this rule"
-     instead of disabling, and the WHERE clause is defense in depth for
-     any caller that does not check first.
+"""Two alertsdb.py contracts used by the alert-rollup work in alertengine.py:
+alerts.rolled_up_into, a foreign key to the alert a rollup absorbed this one
+into (set by resolve_by_dedup's optional parameter, read back by
+alerts_rolled_up_into, and distinct from resolved_by, which stays ''); and
+alert_count_for_rule plus a hardened remove_rule, so a caller can refuse to
+delete a custom rule with alert history instead of cascade-deleting it.
 """
 import time
 

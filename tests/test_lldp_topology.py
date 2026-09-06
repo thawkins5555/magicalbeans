@@ -1,4 +1,4 @@
-"""LLDP/CDP neighbour walk (Tier 1 #5): the live walk against stub_agent_l2,
+"""LLDP/CDP neighbour walk: the live walk against stub_agent_l2,
 CDP as a fallback/supplement on Cisco, present-flag ageing (mirroring
 mac_entries), the best-effort device-match join, and lldp_interval_s
 scheduling/inheritance (0 = off, mirroring mac_table_interval_s)."""

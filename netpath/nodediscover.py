@@ -1,18 +1,9 @@
 """Per-device and per-subnet discovery: a ping sweep (reused from
-ipam_scan.py, not reimplemented) followed by best-effort SNMP v1/v2c
-identification of whatever responded.
-
-DiscoveryJob runs on its own daemon thread, one per active job — this
-mirrors IpamWorker's per-job-thread shape, not Monitor's pool, because a
-discovery sweep is a one-shot bounded task, not a recurring per-target
-schedule. NodePoller (nodepoll.py) owns a dict of active jobs and starts
-one per API call.
-
-SNMPv3 identification is deliberately out of scope: v3 requires a known
-username to even attempt authentication, which a blind sweep does not
-have — a v3 device is added manually, with its real credentials, once an
-admin already knows it is there (from this module's ping-only result, or
-simply from knowing the network).
+ipam_scan.py) followed by best-effort SNMP v1/v2c identification.
+DiscoveryJob runs one daemon thread per active job (a one-shot bounded
+task, unlike Monitor's recurring pool); NodePoller owns the active-job
+dict. SNMPv3 is out of scope — it needs a known username a blind sweep
+does not have.
 """
 
 from __future__ import annotations
@@ -31,7 +22,7 @@ from .ipam_scan import (DEFAULT_PROBES_PER_SECOND, SubnetTooLarge,
                         usable_addresses)
 from .nodeoids import DEFAULT_SNMP_PORT
 from .nodesdb import NodesDatabase
-from .snmppoll import PDU_GET, PDU_GETNEXT, SnmpError, V2C, build_request, decode_response
+from .snmppoll import PDU_GET, PDU_GETNEXT, SnmpError, V2C, build_request
 
 
 

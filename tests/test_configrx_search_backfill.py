@@ -1,42 +1,9 @@
-"""The config-search index gap: a device backed up as `unchanged` never
-reached configrx.ConfigRxWorker._backup_device's indexing call, because
-that call sat inside `if backup_id is not None:` — the branch taken only
-when a capture DIFFERS from the last stored one. A device whose config is
-stable (the normal steady state of a well-run network) was invisible to
-cross-device search permanently: replace_search_lines has exactly one
-caller in the whole codebase, and nothing ever ran it for an unchanged
-capture.
-
-Reproduced here two ways, matching how it was found live:
-
-  1. End to end, driving the real SSH capture path (stub_ssh_device +
-     demo.fake_ssh's "cisco" persona) through ConfigRxWorker.backup_now
-     twice: the first capture is `changed` (a device's first-ever backup
-     always is — nothing to compare against yet), the second is
-     `unchanged` (same persona, same output). BEFORE THE FIX, the device
-     had a stored backup and zero config_lines rows at that point, and
-     `configrx_search.search()` found nothing — silent, total, and (short
-     of the config actually changing) permanent. This section proves the
-     fix instead: the device is searchable after the UNCHANGED capture,
-     not just the first CHANGED one.
-
-  2. Directly against ConfigRxDatabase, isolating the exact mechanics:
-     - has_search_lines() reads back False right after a bare add_backup
-       (nothing indexes on its own — that has always been, and remains,
-       ConfigRxWorker's job), reproducing the exact state the live
-       instance was found in ("backups had a stored capture and
-       config_lines had 0 rows").
-     - backfill_one_device() closes that gap for one device, respecting
-       the stored `redacted` flag on its latest backup exactly the way
-       ConfigRxWorker._backup_device's own store_secrets branch does.
-     - start_search_backfill() closes it for a whole fleet: chunked (a
-       small SEARCH_BACKFILL_CHUNK_DEVICES here, to actually exercise more
-       than one chunk without a fleet-sized fixture), and resumable — an
-       interruption mid-fleet is picked up again from the persisted
-       cursor rather than restarting, and a device already indexed by the
-       time its chunk is reached (a real capture landed for it while the
-       backfill was still walking earlier devices) is left alone rather
-       than redundantly replaced.
+"""A device backed up as `unchanged` is still indexed for cross-device config
+search (ConfigRxWorker._backup_device indexes every capture, not only a changed
+one). Proved end to end via stub_ssh_device + demo.fake_ssh's "cisco" persona
+through ConfigRxWorker.backup_now twice, then directly against ConfigRxDatabase:
+has_search_lines(), backfill_one_device() honouring the stored `redacted` flag,
+and start_search_backfill() running chunked, resumable, across a whole fleet.
 """
 from __future__ import annotations
 
@@ -82,7 +49,7 @@ import netpath.dpapi as dpapi  # noqa: E402
 importlib.reload(dpapi)
 check("the real secret store is configured", dpapi.available() is True)
 
-from netpath import configrx_search as cs  # noqa: E402
+from netpath import configrx_compliance as cs  # noqa: E402
 from netpath.web import Service  # noqa: E402
 
 print("end to end: an UNCHANGED capture is searchable, not just the first CHANGED one")

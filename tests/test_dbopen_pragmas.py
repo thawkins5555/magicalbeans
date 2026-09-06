@@ -1,13 +1,12 @@
-"""Tier 0 fix T0-5: dbopen.connect() sets busy_timeout, cache_size and
-mmap_size centrally, so every one of the app's ten SQLite files gets a
-sane wait-under-contention instead of an immediate SQLITE_BUSY, without
-each database module having to remember to ask for it itself."""
+"""sqlitebase.connect() sets busy_timeout, cache_size and mmap_size
+centrally, so every one of the app's SQLite files waits under contention
+instead of getting an immediate SQLITE_BUSY."""
 import os
 import sqlite3
 
 from _paths import tmpdir  # noqa: F401  (repo root on sys.path)
 
-from netpath import dbopen
+from netpath import sqlitebase as dbopen
 
 TMP = tmpdir("dbopen_pragmas_")
 

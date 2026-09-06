@@ -1,18 +1,9 @@
 """The alert rows the web API hands the page, and the device mute that hangs
-off them.
-
-Everything here goes through a real `Service` and `WebServer` over loopback
-HTTP with real sessions and real permission checks, because the questions are
-about the wire format and about who is allowed to do what — neither of which
-calling the handler functions directly would answer honestly.
-
-The point of the device id on an alert row: Mute silences a *device*, and the
-engine's suppression already resolves an interface alert to the switch the
-port is on. The page cannot know that rule, so the API states it — a device
-alert resolves to its own device, an interface alert to its parent, and
-anything structurally outside Nodes (a syslog message, a DHCP scope) to
-nothing at all, which is what makes the Mute control disable itself with a
-reason instead of quietly vanishing.
+off them. Everything goes through a real `Service` and `WebServer` over
+loopback HTTP with real sessions and permission checks, because the
+questions are about the wire format and who may do what. The device id on an
+alert row resolves a device alert to its own device, an interface alert to
+its parent, and anything outside Nodes to nothing (Mute disables itself).
 """
 import http.client
 import json

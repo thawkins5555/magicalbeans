@@ -1,7 +1,7 @@
 """Test that app.db, wireless.db, and configrx.db reclaim space after pruning.
 
-Pattern of test_alert_engine_fixes.py lines 1113-1155: each database that
-implements incremental auto-vacuum via dbmaint should shrink after its prune
+Pattern of test_alert_engine.py: each database that
+implements incremental auto-vacuum via sqlitebase should shrink after its prune
 method deletes rows, without needing an explicit VACUUM statement.
 """
 import json

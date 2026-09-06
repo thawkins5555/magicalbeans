@@ -1,12 +1,9 @@
-"""The outbound webhook channel: delivered at the same points email is
-(open, clear, renotify — through the same _notify _webhook_notify hooks
-into — and the roll-up digest), its own hourly budget, a failure recorded
-against the alert, and a redirect refused outright.
-
-A real local http.server.HTTPServer stands in for the receiver — Slack,
-PagerDuty, whatever — rather than a monkeypatch of alertmail.send_webhook,
-so what is under test is the real urllib request this application makes on
-the wire, headers included.
+"""The outbound webhook channel: delivered at the same points email is (open,
+clear, renotify, and the roll-up digest), its own hourly budget, a failure
+recorded against the alert, and a redirect refused outright. A real local
+http.server.HTTPServer stands in for the receiver rather than a monkeypatch
+of alertmail.send_webhook, so what is under test is the real urllib request
+this application makes on the wire, headers included.
 """
 import http.client
 import json

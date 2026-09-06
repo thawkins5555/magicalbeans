@@ -1,30 +1,27 @@
 #!/usr/bin/env python3
 """Seed a running SappiWhere instance with the demo fleet.
 
-Standard library only. Talks to the app the same way a browser does — an
-`http.client` connection carrying the `sw_session` cookie, every write sent
-as `application/json` because `netpath/web/server.py:468-472` refuses any
-other content type on POST/PUT/DELETE.
+Standard library only. Talks to the app like a browser: an `http.client`
+connection carrying the `sw_session` cookie, every write sent as
+`application/json` because `netpath/web/server.py` refuses any other
+content type on POST/PUT/DELETE.
 
     python3 demo/seed.py --base http://127.0.0.1:8443 --count 250 --out demo/out
 
 Every step prints one line and appends an entry to `<out>/seed_log.json`
-recording the endpoint, the HTTP status and the server's error text. Steps
-that are *expected* to fail on Linux (anything that stores a secret, which
-goes through Windows DPAPI) are called anyway and their refusal recorded as
-evidence — see `netpath/web/api.py:2453` and friends.
+recording the endpoint, HTTP status and the server's error text. Steps
+expected to fail on Linux (storing a secret, which goes through Windows
+DPAPI) are called anyway and their refusal recorded as evidence.
 
-The script is idempotent: it looks up device groups, polling profiles,
-NetPath targets, subnets and controllers by name before creating them, and
-skips devices whose IP is already present.
+Idempotent: looks up device groups, polling profiles, NetPath targets,
+subnets and controllers by name before creating them, and skips devices
+whose IP is already present.
 
-By default it tunes six settings away from what the application ships so a
-20-minute run on a loopback fleet exercises paths that would otherwise take
-days to reach — a 60 s poll interval, 32 workers, `cpu_high` at 20%,
-`response_time_high` at 5 ms, no new-device grace, and a raised email cap.
-Those overrides are exactly why campaign numbers cannot be read as capacity
-figures. `--defaults` makes none of them, so the same campaign can be run once
-at the shipped configuration and the two columns compared like for like.
+By default it tunes six settings away from what the application ships (poll
+interval, worker count, alert thresholds, new-device grace, email cap) so a
+short loopback run exercises paths that would otherwise take days —
+which is why campaign numbers cannot be read as capacity figures.
+`--defaults` skips the overrides for a like-for-like comparison.
 """
 
 from __future__ import annotations
@@ -637,7 +634,7 @@ def step_wireless(client: Client, log: SeedLog) -> dict:
 
 
 # demo/fake_ssh.py's PERSONAS dict, in its insertion order, mapped to a
-# --base-port offset and the netpath/configrx_vendors.py key each one backs
+# --base-port offset and the netpath/configrx.py VENDORS key each one backs
 # up as. Kept here rather than imported: fake_ssh.py needs paramiko and this
 # script is stdlib-only so it can seed a fleet on a host that has none.
 SSH_DEMO_PERSONAS = {

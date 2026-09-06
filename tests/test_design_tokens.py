@@ -246,7 +246,7 @@ space_uses = sum(APP_CSS.count("var(%s)" % name) for name in SPACE_STEPS)
 check(space_uses > 50, "app.css actually uses the spacing scale (%d references)" % space_uses)
 check("var(--radius-pill)" in APP_CSS, "app.css uses --radius-pill for the half-height shapes")
 check(".row.start { justify-content: flex-start; gap: 14px; }" in APP_CSS,
-      "one .row.start modifier (nodes.js/netflow.js/syslog.js/snmp.js no longer "
+      "one .row.start modifier (nodes.js/netflow.js/events.js no longer "
       "each carry this as an identical inline style)")
 check(".status-fg { color: var(--ok); }" in APP_CSS
       and all(".status-fg.%s {" % tone in APP_CSS

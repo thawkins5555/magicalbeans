@@ -1,42 +1,9 @@
-"""Regression coverage for the 4.50.0 poller review fixes:
-
-  Fix 1 (nodepoll.py): in_octets/out_octets each fall back from the
-  ifXTable 64-bit counter to the ifTable 32-bit one independently of the
-  other, so the bit width fed to counter_rate has to be tracked
-  independently too -- one combined flag applied to both counters let a
-  32-bit fallback (a row that answered ifHCInOctets but not
-  ifHCOutOctets) hit counter_rate's `bit_width >= 64` branch on a real
-  wrap and silently return None instead of the wrap-adjusted rate.
-
-  Fix 3 (nodepoll.py): in_util/out_util are now clamped into [0, 100].
-  ifSpeed's RFC 2863 sentinel (4294967295) used as the denominator when
-  ifHighSpeed is missing for a row could otherwise push a fast port's
-  reported utilization above 100%, up to counter_rate's own ~1.3x
-  rate-vs-speed rejection ceiling.
-
-  Fix 4 (fortipoll.py): _walk_column now stops as soon as GETNEXT quits
-  returning a lexicographically-advancing OID, the same guard
-  nodepoll.py's own walk (_walk_column_status) already had, instead of
-  spinning through all 4096 iterations against a broken or malicious
-  agent that keeps answering with the same row.
-
-  Fix 2, take 2 (nodepoll.py ~1784, _interface_reassigned): the original
-  Fix 2 gated every link-transition comparison on `not rebooted`, to stop
-  a stack member's ifIndex renumbering (port 5 moving from ifIndex 10 to
-  14 across a reload) from fabricating a link event by comparing two
-  different physical ports. That over-corrected: it suppressed the
-  comparison for every reboot on every platform, so a port that was up
-  before a reload and simply never came back could never produce an
-  interface_down alert -- the single most common post-maintenance
-  failure, permanently blind on every platform, not just the ones that
-  renumber. The fix suppresses the comparison only when `rebooted` AND
-  `_interface_reassigned` finds the prior and current rows' phys_addr (or,
-  failing that, descr) actually disagree, i.e. only when there is real
-  evidence the ifIndex now names a different port. The three tests below
-  drive this end to end against a real poll/reboot rig, modeled on
-  `test_nodepoll_e2e.py`'s StubAgent and this file's own
-  `_OneInterfaceAgent`.
-"""
+"""Poller behaviour, driven end to end against stub SNMP agents: in/out octet
+counters track their 32/64-bit width independently (a mixed ifXTable/ifTable
+row still rates correctly across a wrap); in_util/out_util are clamped to
+[0, 100] even with ifSpeed's RFC 2863 sentinel as the denominator; fortipoll's
+_walk_column stops once GETNEXT stops advancing; and a post-reboot link
+transition is suppressed only when _interface_reassigned sees a real port swap."""
 import os
 import socket
 import threading
@@ -588,7 +555,7 @@ def test_link_down_recorded_without_reboot():
     an ordinary up -> down with no reboot involved at all must still
     record a link_down exactly as before. (test_nodepoll_e2e.py's poll 3
     already covers this end to end; kept here too, directly alongside the
-    two reboot scenarios above, as the third leg the review asked for.)"""
+    two reboot scenarios above, as the third leg of that coverage.)"""
     agent, db, poller, device_id = _setup_reassignable_device(
         "poller_review_no_reboot_", "no-reboot-stub")
     try:
@@ -632,7 +599,7 @@ def test_fortipoll_walk_terminates_on_stuck_oid():
         calls["n"] += 1
         # First call advances into the table (one real row); every call
         # after that echoes the same row back, exactly the misbehaviour
-        # the review found unguarded.
+        # that was left unguarded.
         row_oid = f"{base_oid}.1"
         return types.SimpleNamespace(varbinds=[
             {"oid": row_oid, "type": "OctetString", "value": "AP0001"}])

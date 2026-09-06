@@ -1,36 +1,19 @@
 """The application's own database: settings, accounts and the shared name cache.
 
-Everything here crosses module boundaries or belongs to the application rather
-than to one of its collectors. The three data files — netpath.db, flows.db and
-syslog.db — hold records and their own module's settings, and nothing else.
-
-What lives here and why:
-
-* **Global settings.** The Settings tab holds what more than one module reads:
-  reverse DNS, refresh intervals, the web listener, session lifetimes and the
-  per-database size caps. Module settings stay with their module.
-* **Users.** Accounts are the application's, not the traceroute module's. They
-  also want a different backup policy from network data: small, precious, and
-  nothing you would ever want trimmed by a size cap.
-* **The reverse-DNS cache.** NetPath names hop addresses from it, NetFlow names
-  flow endpoints and Syslog names sending devices. It followed the `dns_*`
-  settings into the global scope.
-
-Sessions and login throttling are deliberately absent: both are in-memory in
-auth.py, so a restart logs everyone out. That is the safe default and keeps
-tokens out of any file.
+Everything here crosses module boundaries: the settings more than one module
+reads, accounts and their permissions, and the reverse-DNS/ASN caches.
+Sessions and login throttling are deliberately in-memory in auth.py instead.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import sqlite3
-import threading
 import time
 
-from . import dbmaint, dbopen, settingsutil
+from . import sqlitebase
+from .sqlitebase import SqliteStore, reclaim
 
 log_module = logging.getLogger(__name__)
 
@@ -122,7 +105,7 @@ CREATE INDEX IF NOT EXISTS ix_audit_username ON audit(username);
 CREATE INDEX IF NOT EXISTS ix_audit_action ON audit(action);
 CREATE INDEX IF NOT EXISTS ix_audit_target ON audit(target);
 
--- API tokens (Tier 1 #10): service-account credentials that authenticate an
+-- API tokens: service-account credentials that authenticate an
 -- HTTP request the same way a session cookie does, but never expire from
 -- idleness and never go through the browser at all — see server.py's Bearer
 -- handling. A token belongs to an account and carries exactly that
@@ -248,7 +231,7 @@ GLOBAL_DEFAULTS = {
     # A discovery job whose whole target is inside the list fails saying so
     # rather than quietly finding nothing.
     "never_scan_cidrs": "",
-    # LDAP simple-bind directory authentication (Tier 1 #10). Off by
+    # LDAP simple-bind directory authentication. Off by
     # default, and every key here is administrator-only (ADMIN_ONLY_SETTINGS
     # below) the same way updates_enabled is: this is a policy decision
     # about who may sign in at all, not a preference a settings:write
@@ -283,48 +266,25 @@ GLOBAL_DEFAULTS = {
 MIGRATED_TABLES = ("users", "hostnames")
 
 
-class AppDatabase:
-    def __init__(self, path: str):
-        self.path = path
-        self._lock = threading.RLock()
-        # dbopen.connect rather than sqlite3.connect: this file holds the
-        # scrypt password hashes and the permission grants, and was being
-        # created 0644 for any local account to read.
-        self._conn = dbopen.connect(path)
-        self._conn.row_factory = sqlite3.Row
-        with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            had_permissions_table = self._conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table'"
-                " AND name='user_permissions'").fetchone() is not None
-            dbmaint.enable_incremental_vacuum(self._conn, "app.db")
-            self._conn.executescript(SCHEMA)
-            self._migrate()
-            self._conn.commit()
-        # Neither backfill runs here. On an install that predates app.db the
-        # accounts they grant against are still in netpath.db at this point:
-        # Service.__init__ copies them over with migrate_from() immediately
-        # after this constructor returns, and then calls
+class AppDatabase(SqliteStore):
+    SCHEMA = SCHEMA
+    DEFAULTS = GLOBAL_DEFAULTS
+    LABEL = "app.db"
+
+    def _before_schema(self) -> None:
+        # Neither backfill runs at open. On an install that predates app.db
+        # the accounts they grant against are still in netpath.db here:
+        # Service.__init__ calls migrate_from() and then
         # backfill_permissions(). Running against the empty table would set
         # the ssh marker having granted nobody, permanently.
-        self._needs_full_backfill = not had_permissions_table
+        self._needs_full_backfill = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table'"
+            " AND name='user_permissions'").fetchone() is None
 
     def _migrate(self) -> None:
-        """Add columns introduced after `users` was first created.
-
-        CREATE TABLE IF NOT EXISTS silently leaves an existing table alone,
-        so `auth_source` (Tier 1 #10) has to be added explicitly for an
-        install that already has an app.db — the same convention nodesdb.py,
-        db.py and the rest already use for their own post-release columns.
-        Every existing account defaults to 'local', which is exactly what it
-        already was.
-        """
-        columns = {row["name"] for row in
-                   self._conn.execute("PRAGMA table_info(users)").fetchall()}
-        if "auth_source" not in columns:
-            self._conn.execute(
-                "ALTER TABLE users ADD COLUMN auth_source TEXT NOT NULL"
-                " DEFAULT 'local'")
+        # Every existing account defaults to 'local', which is what it was.
+        self.ensure_columns(
+            "users", {"auth_source": "TEXT NOT NULL DEFAULT 'local'"})
 
     def backfill_permissions(self, log=None) -> None:
         """Grants the permissions an upgrade owes existing accounts. Call it
@@ -461,10 +421,6 @@ class AppDatabase:
                     " level) VALUES (?,?,?)",
                     (username, "ssh", permissions.WRITE))
 
-    def close(self) -> None:
-        with self._lock:
-            self._conn.close()
-
     def meta(self, key: str) -> str | None:
         with self._lock:
             row = self._conn.execute(
@@ -477,35 +433,6 @@ class AppDatabase:
                 "INSERT INTO meta(key, value) VALUES (?,?)"
                 " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, value))
-            self._conn.commit()
-
-    # -------------------------------------------------------------- settings
-
-    def settings(self) -> dict:
-        values = dict(GLOBAL_DEFAULTS)
-        with self._lock:
-            rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
-        for row in rows:
-            if row["key"] in values:
-                try:
-                    values[row["key"]] = json.loads(row["value"])
-                except (ValueError, TypeError):
-                    pass
-        return settingsutil.coerce_settings(GLOBAL_DEFAULTS, values, strict=False)
-
-    def save_settings(self, values: dict) -> None:
-        """Store the global keys. Anything else in the dict is ignored, so a
-        merged settings dict can be handed to this and to Database in turn and
-        each takes only what it owns."""
-        with self._lock:
-            for key, value in values.items():
-                if key not in GLOBAL_DEFAULTS:
-                    continue
-                self._conn.execute(
-                    "INSERT INTO settings(key, value) VALUES (?,?)"
-                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (key, json.dumps(value)),
-                )
             self._conn.commit()
 
     # ----------------------------------------------------------------- users
@@ -912,7 +839,7 @@ class AppDatabase:
             self._conn.commit()
         # Reclaim after the lock, in steps, as every other database does.
         if removed:
-            dbmaint.reclaim(self._conn, self._lock, label="hostnames")
+            reclaim(self._conn, self._lock, label="hostnames")
         return removed
 
     # -------------------------------------------------------------- asn_cache
@@ -972,19 +899,8 @@ class AppDatabase:
             self._conn.commit()
         # Reclaim after the lock, in steps, as every other database does.
         if removed:
-            dbmaint.reclaim(self._conn, self._lock, label="asn_cache")
+            reclaim(self._conn, self._lock, label="asn_cache")
         return removed
-
-    # ------------------------------------------------------------------ size
-
-    def size_bytes(self) -> int:
-        total = 0
-        for suffix in ("", "-wal", "-shm"):
-            try:
-                total += os.path.getsize(self.path + suffix)
-            except OSError:
-                pass
-        return total
 
 
 def write_meta(path: str, key: str, value: str) -> None:
@@ -996,7 +912,7 @@ def write_meta(path: str, key: str, value: str) -> None:
     """
     if not path:
         return
-    conn = dbopen.connect(path)
+    conn = sqlitebase.connect(path)
     try:
         conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY,"
                      " value TEXT)")
@@ -1026,7 +942,7 @@ def write_audit(path: str, username: str, client: str, action: str,
     if not path:
         return
     try:
-        conn = dbopen.connect(path)
+        conn = sqlitebase.connect(path)
         try:
             conn.execute(
                 "INSERT INTO audit(ts, username, client, action, target,"
@@ -1068,7 +984,7 @@ def migrate_from(app_db: AppDatabase, legacy_path: str, log=None) -> dict:
     # Every step below is INSERT OR REPLACE, so running it again is safe and is
     # the only way a half-finished migration ever completes.
 
-    source = dbopen.connect(legacy_path)
+    source = sqlitebase.connect(legacy_path)
     source.row_factory = sqlite3.Row
     try:
         present = {row["name"] for row in source.execute(

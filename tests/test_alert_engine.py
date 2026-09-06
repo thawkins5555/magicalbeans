@@ -1,12 +1,9 @@
-"""The alert-engine correctness fixes of 4.39.0, each section proving one
-finding from the alerting review is closed.
-
-Structured as numbered sections that share one harness (`build()` returns
-the six objects the engine needs plus the engine) and are otherwise
-independent — each builds its own temporary databases, so a failure in one
-cannot cascade into the next. Drives `engine._tick()` directly rather than
-starting the engine thread: every fix here is about what one tick does, and
-a real thread would make the assertions time-dependent.
+"""Alert-engine correctness: each numbered section proves one tick of
+AlertEngine does the right thing for one rule of the alerting contract.
+Sections share one harness (`build()` returns the engine and the six objects
+it needs) but each builds its own temporary databases, so a failure cannot
+cascade. Drives `engine._tick()` directly rather than starting the engine
+thread, so nothing here is time-dependent.
 """
 import json
 import os
@@ -797,7 +794,7 @@ ok(f"a fresh install binds {len(REBOUND)} non-outage rules to event_notice "
    f"and leaves the outage and recovery rules alone")
 
 event_tpl = alerts.template_by_key("event_notice")
-# O-60: every built-in subject now leads with {{severity_tag}} ("[CRITICAL]"),
+# Every built-in subject now leads with {{severity_tag}} ("[CRITICAL]"),
 # so severity is legible in a notification preview without opening the
 # message — the rule-name/entity-label part this assertion is actually about
 # is unchanged.

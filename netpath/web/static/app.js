@@ -313,27 +313,14 @@ const App = (() => {
     updateTabShortcuts();
     updateTabGroups();
     /* A control the account may not use is DISABLED and says why, rather
-       than being deleted from the page.
-
-       Hiding taught a read-only operator that their install simply does not
-       have the feature: Nodes with no Add device, no Settings and no way to
-       tell whether that was a permission or a build. Support calls came in
-       for features that were there all along. Worse, hiding was one-way —
-       it could never un-hide, because writing hidden=false made this
-       function a second owner of .hidden for every bar whose visibility
-       belongs to app state (a bulk bar shown by selection), and every
-       loadState() then un-hid what feature code had just hidden.
-
-       Disabling has neither problem. `disabled` on a control is owned by
-       this function alone; nothing else in the app enables a control it did
-       not itself disable for an in-flight request. It is re-applied on
-       every loadState(), so a permission that changes mid-session settles
-       within one poll in both directions instead of waiting for a reload.
-
-       The pattern is the one alerts.js already shipped for the mute button:
-       disabled, plus a title, plus one visible line under the bar — because
-       a disabled control with only a tooltip is unreadable on a touch
-       screen and invisible to anyone who does not think to hover it. */
+       than deleted from the page. Hiding taught a read-only operator that
+       their install did not have the feature, and it was one-way: writing
+       hidden=false made this a second owner of .hidden for every bar whose
+       visibility belongs to app state. `disabled` is owned by this function
+       alone and is re-applied on every loadState(), so a permission that
+       changes mid-session settles within one poll in both directions.
+       Disabled plus a title plus one visible line under the bar, because a
+       tooltip alone is unreadable on a touch screen. */
     const denied = [];
     for (const el of document.querySelectorAll('[data-requires-write]')) {
       const allowed = canWrite(el.dataset.requiresWrite);
@@ -354,34 +341,37 @@ const App = (() => {
 
   /* ---------------------------------------------------- lazy modules
 
-     Twelve tabs, one script each, all thirteen files (this one plus the
-     twelve) loaded unconditionally on every visit used to cost 1.17 MB
-     uncompressed (~324 KB gzipped) whether or not the operator ever opened
-     eleven of those twelve tabs — worst exactly where it is least
-     affordable, a tablet on plant Wi-Fi. dashboard.js stays eager
-     (index.html's own <script defer>, alongside this file and boot.js):
-     Dashboard is the tab everyone lands on, and it is what start() below
-     still initialises unconditionally, the same way it always has. Every
-     other module's <script> tag is gone from index.html; its file is
-     fetched the first time its tab actually becomes current, through
-     ensureModuleReady, called only from selectTab/applyRoute.
-
-     A module's name is its filename's stem (nodes -> nodes.js) for every
-     one of the eleven, so there is nothing to keep in step beyond the one
-     name this never applies to. */
+     One script per tab, all loaded unconditionally, cost 1.17 MB on every
+     visit whether or not the operator opened eleven of the twelve tabs.
+     dashboard.js stays eager (it is the tab everyone lands on, and what
+     start() initialises); every other module is fetched the first time its
+     tab becomes current, through ensureModuleReady. */
+  /* A tab whose module is not a file of its own says so here: SNMP Trap and
+     Syslog are one page factory (events.js) registering both App.pages
+     entries. Everything else resolves to its own stem. */
+  const MODULE_FILES = { snmp: 'events', syslog: 'events' };
   function isLazyModule(name) { return name !== 'dashboard'; }
-  function moduleScriptUrl(name) { return `/${name}.js${ASSET_VERSION_QUERY}`; }
+  function moduleScriptUrl(name) {
+    return `/${MODULE_FILES[name] || name}.js${ASSET_VERSION_QUERY}`;
+  }
 
-  const loadedScripts = new Set();
+  /* Deduped by URL as well as by tab name (moduleLoads, below): two tabs
+     sharing one file must share one fetch, whether the second selection
+     lands while the first is still in flight or long after it finished. A
+     failed load drops out so a later attempt can genuinely retry. */
+  const scriptLoads = new Map();
   function loadScript(src) {
-    if (loadedScripts.has(src)) return Promise.resolve();
-    return new Promise((resolve, reject) => {
+    const inFlight = scriptLoads.get(src);
+    if (inFlight) return inFlight;
+    const promise = new Promise((resolve, reject) => {
       const el = document.createElement('script');
       el.src = src;
-      el.onload = () => { loadedScripts.add(src); resolve(); };
+      el.onload = () => resolve();
       el.onerror = () => reject(new Error(`could not load ${src}`));
       document.head.appendChild(el);
-    });
+    }).catch((error) => { scriptLoads.delete(src); throw error; });
+    scriptLoads.set(src, promise);
+    return promise;
   }
 
   /* The only visible sign a script is still in flight: the same accent
@@ -404,22 +394,15 @@ const App = (() => {
   // the same second, and must share one fetch and one init(), never three.
   const moduleLoads = new Map();
 
-  /* Resolves once `name`'s module is loaded AND initialised. dashboard (and
-     any name lazy loading does not apply to) resolves immediately with
-     whatever start() already registered and initialised. A module already
-     marked __ready also resolves immediately — init() runs exactly once
-     per module, no matter how many times this is called for it.
+  /* Resolves once `name`'s module is loaded AND initialised; init() runs
+     exactly once per module however often this is called.
 
-     A module whose script fails to fetch, or whose own init() throws,
-     degrades exactly the way brokenPages already degrades a module that
-     failed during eager startup (below, in start()): the tab is hidden,
-     the failure is logged once, aria-keyshortcuts/has-overflow are
-     recalculated for the tab that just disappeared, and the operator is
-     moved off it if it was the one they were looking at. Never a blank
-     pane with nothing said about why, and never a silent retry loop —
-     the tab being hidden is what stops a second attempt, the same "a
-     reload is the way back" contract a permission-denied or broken module
-     already has. */
+     A module whose script fails to fetch, or whose init() throws, degrades
+     the way brokenPages already degrades one that failed during eager
+     startup: the tab is hidden, the failure is logged once, the shortcut and
+     overflow state are recalculated, and the operator is moved off it. The
+     tab being hidden is what stops a second attempt — a reload is the way
+     back, as it is for a permission-denied module. */
   function ensureModuleReady(name) {
     if (!isLazyModule(name)) return Promise.resolve(pages[name]);
     if (pages[name] && pages[name].__ready) return Promise.resolve(pages[name]);
@@ -476,20 +459,15 @@ const App = (() => {
 
   /* ---------------------------------------------------- host capabilities
 
-     Six features across four tabs store a secret and every one goes through
-     `netpath/dpapi.py` — Windows DPAPI on Windows, or a portable
-     passphrase-based store on any other host once one is configured (see
-     CREDENTIAL-SECURITY.md's "The portable secret store"). Before either was
-     known to the front end, the credential fields on Linux rendered in
-     full, the operator typed a password and the save came back 400; IPAM's
-     DHCP form rendered completely, with Windows-only help text, on a host
-     where it could never work. `/api/platform` answers once at start-up
-     (the answer cannot change while the process runs) and these two
-     helpers are what the forms ask.
+     Six credential-storing features go through `netpath/dpapi.py`: Windows
+     DPAPI, or the portable passphrase store on any other host once one is
+     configured (CREDENTIAL-SECURITY.md). `/api/platform` answers once at
+     start-up — the answer cannot change while the process runs — and these
+     two helpers are what the forms ask, so a field that could only ever be
+     refused server-side is not offered.
 
-     Defaults assume the host CAN do it: if the fetch fails, the operator
-     gets today's behaviour — a form and a server-side refusal — rather than
-     a wrongly disabled feature. */
+     Defaults assume the host CAN: a failed fetch leaves a form and a
+     server-side refusal rather than a wrongly disabled feature. */
   state.platform = { is_windows: true, powershell: true, secret_store: false,
                      credential_store: null };
 
@@ -655,7 +633,7 @@ const App = (() => {
     }
   }
 
-  /* ip -> device, id -> device: ipam.js, snmp.js, syslog.js and wireless.js
+  /* ip -> device, id -> device: ipam.js, events.js and wireless.js
      each fetched the whole unpaged /api/nodes/devices list on their own
      30-second clock to answer "which device is this address", and
      alerts.js kept a third, differently-shaped cache (device id -> ip) for
@@ -690,13 +668,13 @@ const App = (() => {
      (`#/nodes/device/<id>`), or leaves it as escaped plain text when no
      device on the fleet has that address. Async, because the index may
      need a fetch — callers enhance a placeholder already on screen (the
-     pattern snmp.js/syslog.js/ipam.js/wireless.js all use) rather than
+     pattern events.js/ipam.js/wireless.js all use) rather than
      block a render on it.
 
      This is the plain two-state case only: a caller that wants a
      different link label than the address itself (wireless.js links a
      controller's *name* to its device), an "add this address as a device"
-     fallback when nothing matches (snmp.js, syslog.js), or the device
+     fallback when nothing matches (events.js), or the device
      object for some other purpose (alerts.js reads a device's ip back out
      by id) needs the object deviceIndex() resolves to, not this. */
   async function deviceLink(ip) {
@@ -821,25 +799,15 @@ const App = (() => {
     live.textContent = message;
   }
 
-  /* The visible half of announce().
+  /* The visible half of announce(): a screen reader heard that a bulk
+     acknowledge affected eleven alerts and a sighted operator heard nothing.
 
-     announce() has been the whole of it: a screen reader heard that a bulk
-     acknowledge had affected eleven alerts, and a sighted operator heard
-     nothing at all. Everything else in the product said it by rewriting a
-     label in place — five hand-written `settle()` copies across nodes.js
-     and configrx.js — or by calling native alert(), which stops the world
-     for a sentence and cannot be styled, positioned or read by anything
-     that is not in front of the browser.
-
-     One region, bottom right, above the modal layer (z-index 20) because a
-     dialog's action is the commonest thing that has something to report.
-     `aria-hidden` on the region is deliberate and not an oversight: the
-     text has already gone through announce() into #live, and a second copy
-     in the accessibility tree would say everything twice.
-
-     `tone` is the meaning, matching App.statusMark: ok, warn, fail, info.
-     A failure stays up longer than a confirmation, because it is the one
-     the operator may need to read twice or copy into a ticket. */
+     One region, bottom right, above the modal layer, since a dialog's action
+     is the commonest thing with something to report. `aria-hidden` on the
+     region is deliberate: the text has already gone through announce() into
+     #live, and a second copy would say everything twice. `tone` matches
+     App.statusMark; a failure stays up longest because it is the one that
+     may need to be read twice or copied into a ticket. */
   const TOAST_MS = { fail: 12000, warn: 9000, ok: 5000, info: 6000 };
 
   function toast(message, tone = 'info') {
@@ -1143,25 +1111,17 @@ const App = (() => {
 
   /* ------------------------------------------------ one time vocabulary
 
-     Seven modules each carried their own ago(), in three behaviours: four
-     capped at hours (a device unpolled for a week read "168.0h ago"), two
-     had a days tier, one turned into a bare wall clock after ninety minutes.
-     Six "Time" columns showed HH:MM:SS with no date over windows up to four
-     months wide. Sixteen detail lines called toLocaleString() each their
-     own way, and nothing anywhere said which time zone any of it was in.
-     Every timestamp the browser shows now goes through one of these:
+     Every timestamp the browser shows goes through one of these, in the
+     browser's local zone, and says which zone where it can. The wire carries
+     epoch seconds everywhere; the server never formats a time.
 
-       ago(ts)        "just now", "3.2h ago", "7.0d ago", "in 40s"  — relative
+       ago(ts)        "just now", "3.2h ago", "7.0d ago", "in 40s"
        when(ts)       "4 Mar 14:32:07", with the year when it is not this one
-       timeCell(ts)   for a Time column: the clock alone if today, else the
-                      date too; the full when() in the title
+       timeCell(ts)   a Time column: the clock alone if today, else the date
+                      too; the full when() in the title
        agoCell(ts)    a relative figure with the absolute in its title
        isoLocal(ts)   "2026-09-03T14:32:07+02:00", for an export
-       timeZoneLabel  "Europe/Berlin (UTC+02:00)" — this browser's zone
-
-     Everything is the browser's local zone, and says so where it can (the
-     Time headers' titles, the Settings page). The wire carries epoch seconds
-     everywhere; the server never formats a time for the browser. */
+       timeZoneLabel  "Europe/Berlin (UTC+02:00)" */
   function ago(ts, empty = 'never') {
     if (!ts) return empty;
     const age = Date.now() / 1000 - ts;
@@ -1536,38 +1496,11 @@ const App = (() => {
   // onto longer.
   const JOB_REVERT_MS = 4000;
 
-  /* Generalises the one thing in this product that already told an operator
-     what happened rather than leaving a table to eventually agree with the
-     click — ConfigRX's "Back up now" (configrx.js): queueing, then queued
-     or running, then the real outcome, the button disabled throughout. Six
-     actions shipped with no outcome message at all before this — Add
-     device, Acknowledge, bulk Acknowledge, Trace now, Back up now and every
-     module Settings Save — and Acknowledge was the sharpest: the detail
-     pane kept offering "Acknowledge" after it had worked, so the only way
-     to tell was to re-read the State column.
-
-     `labels` is `{ queued, done, fail }`. `queued` is shown the instant the
-     button is pressed, before `promise` has settled — a caller free to go
-     on writing to the same button's textContent from inside its own async
-     work (the way ConfigRX's watch loop moves between "Queued…" and
-     "Backing up…") gets that multi-phase text for free, since this only
-     touches the button again once `promise` settles. `done`/`fail` are
-     each either a string or a function of the resolved value/rejection,
-     defaulting to the resolved value when it is itself a string (else
-     "Done"), and to the same sentence a dialog's own .modal-error already
-     shows (failureText) for a failure.
-
-     The outcome is toasted (App.toast, which announces it) and written
-     onto the button itself, briefly, so both a sighted operator watching
-     the button and one who has looked away catch it. A failure inside an
-     open dialog goes to .modal-error instead of a second toast — the place
-     every other dialog failure already lands — the same choice
-     reportActionFailure makes.
-
-     Returns the settled promise, so a modal button spec's onClick can
-     `return App.runJob(...)`: the rejection still propagates, and
-     runModalAction's own disable/error handling composes with this rather
-     than fighting it. */
+  /* Holds a button down for one request and reports the outcome on it, and
+     in a toast. `labels` is `{ queued, done, fail }`; `done`/`fail` may be
+     functions of the resolved value/rejection. Returns the settled promise,
+     so a modal button's onClick can `return App.runJob(...)` and let
+     runModalAction's own handling compose with this. */
   function runJob(button, labels, promise) {
     if (!button) return promise;
     const opts = labels || {};
@@ -1600,6 +1533,85 @@ const App = (() => {
       }
       throw error;
     });
+  }
+
+  /* Work handed to a worker thread: the POST returning means "queued", and
+     the only honest "done" is a timestamp the server owns moving past what
+     it was before the click. The button carries the whole report — it holds
+     itself down, says which stage the work is at, and settles on the
+     result, announced once because a label rewritten in place is a silent
+     DOM mutation to a screen reader. Bounded by `deadlineMs`: giving up
+     silently would put the operator back where they started.
+
+     `poll` is the GET whose payload carries `tsKey`; `before` is that
+     timestamp as it stood at the click; `alive()` says whether the thing
+     watched is still the thing on screen; `busyKey` is the payload flag
+     that tells running apart from queued; `done(row, settle)` owns the
+     final label and whatever follows it; `onError` replaces the default
+     'Failed' settle for a caller that reports a refusal its own way. */
+  /* The label IS the result — 'Queued for 12 devices', 'Failed' — and a
+     label rewritten in place is a silent DOM mutation to a screen reader,
+     so a result is also said once. Only a result: the resting label coming
+     back is not one. */
+  function settleButton(button, resting, holdMs = 3000) {
+    return (text) => {
+      button.disabled = false;
+      button.textContent = text;
+      if (text === resting) return;
+      announce(text);
+      window.setTimeout(() => {
+        if (button.textContent === text) button.textContent = resting;
+      }, holdMs);
+    };
+  }
+
+  function watchJob(button, opts) {
+    const labels = Object.assign({
+      resting: button.textContent, queueing: 'Working…', queued: 'Queued…',
+      busy: 'Working…', done: 'Done', already: 'Already queued…',
+      running: 'Still running…', failed: 'Failed', holdMs: 3000,
+    }, opts.labels || {});
+    // Shown between the POST being accepted and the first poll, where a
+    // caller may already know which of the two states it is in.
+    if (labels.accepted === undefined) labels.accepted = labels.queued;
+    const settle = settleButton(button, labels.resting, labels.holdMs);
+    const alive = opts.alive || (() => true);
+    const before = opts.before || 0;
+    const deadline = Date.now() + (opts.deadlineMs || 90000);
+    button.disabled = true;
+    button.textContent = labels.queueing;
+    return (async () => {
+      let result;
+      try {
+        result = await post(opts.post, opts.body || {});
+      } catch (error) {
+        if (opts.onError) { settle(labels.resting); opts.onError(error); }
+        else settle(labels.failed);
+        return;
+      }
+      if (result && result.queued === false) { settle(labels.already); return; }
+      button.textContent = labels.accepted;
+      const tick = async () => {
+        if (!alive()) { settle(labels.resting); return; }
+        let payload;
+        try {
+          payload = await get(opts.poll);
+        } catch (error) {
+          settle(labels.resting);
+          return;
+        }
+        const row = (payload && payload.device) || {};
+        if ((row[opts.tsKey] || 0) > before) {
+          if (opts.done) await opts.done(row, settle);
+          else settle(labels.done);
+          return;
+        }
+        if (Date.now() > deadline) { settle(labels.running); return; }
+        button.textContent = opts.busyKey && row[opts.busyKey] ? labels.busy : labels.queued;
+        window.setTimeout(tick, 1000);
+      };
+      window.setTimeout(tick, 600);
+    })();
   }
 
   /* "A name is required", said once, in the place every dialog already
@@ -1645,6 +1657,24 @@ const App = (() => {
     if (firstEmpty) firstEmpty.focus();
     return false;
   }
+
+  /* The three field shapes a module settings dialog is built from, and the
+     three readers that get the answers back out of it. Six dialogs carried
+     character-for-character copies of both halves. `readers(box)` binds to
+     one dialog body: `{ on, num, text }` take a selector, not an id. */
+  const form = {
+    check: (id, label, on) =>
+      `<label class="check"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}> ${label}</label>`,
+    number: (id, label, value, attrs = '') =>
+      `<label>${label} <input id="${id}" type="number" ${attrs} value="${value}"></label>`,
+    text: (id, label, value, attrs = '') =>
+      `<label>${label} <input id="${id}"${attrs ? ` ${attrs}` : ''} value="${value}"></label>`,
+    readers: (box) => ({
+      on: (id) => box.querySelector(id).checked,
+      num: (id) => Number(box.querySelector(id).value),
+      text: (id) => box.querySelector(id).value.trim(),
+    }),
+  };
 
   function runModalAction(spec, box, button) {
     const generation = box.dataset.modalGen;
@@ -1702,25 +1732,17 @@ const App = (() => {
     // Buttons default to the top, sticky, so Save is reachable without
     // scrolling past every field first — most dialogs are long forms; a
     // short confirm passes {buttonsTop: false} to stay bottom-anchored.
-    /* The body and the buttons go inside a real <form>.
+    /* The body and the buttons go inside a real <form>, because a field with
+       no form around it has nowhere to submit to and Enter did nothing in
+       any dialog here. The primary button is the form's submit button, which
+       is what makes implicit submission work with more than one field.
 
-       Enter did nothing in any of the fifty-odd dialogs in this product
-       before that: the box was an <h2>, some markup and a row of <button>s
-       with onclick handlers, and a form field with no form around it has
-       nowhere to submit to. The primary button below is the form's submit
-       button, which is what makes implicit submission work — a form with no
-       submit button only submits on Enter when it has exactly one field,
-       and every dialog here has more.
+       `novalidate`: the messages for a bad value are this app's own
+       (showModalError, and the inline field errors), and the browser's
+       native bubble would fight with them.
 
-       `novalidate` because the messages this app shows for a bad value are
-       its own (showModalError, and the inline field errors beside the
-       field), and the browser's native bubble would fight with them.
-
-       The button row carries its own class rather than being found as
-       '.row': three dialog bodies lay out checkboxes in a <div class="row">
-       of their own (netflow.js, snmp.js, syslog.js), and only the fact that
-       all three happen to pass {buttonsTop} keeps the buttons out of them
-       today. */
+       The button row is found by its own class, never as '.row' — three
+       dialog bodies lay out checkboxes in a .row of their own. */
     const errorHtml = '<p class="modal-error" id="modal-error" hidden></p>';
     const openForm = '<form class="modal-form" novalidate>';
     box.innerHTML = options.buttonsTop !== false
@@ -1956,33 +1978,21 @@ const App = (() => {
   }
 
   /* --------------------------------------------------------------- search
-     Nine independent per-page search boxes and no way to ask the product a
-     question without already knowing which tab owns the answer first. "/"
-     opens this one instead of focusing whichever box the current page
-     happens to have; it queries devices, MACs/interfaces (the same
-     mac-search endpoint nodes.js's own MAC lookup uses — a hit reads the
-     way that one already does), alerts, NetPath destinations, IPAM hosts
-     and subnets, syslog messages and wireless access points, through
-     endpoints the product already had, and routes to a hit through the
-     hash exactly as every other selection in this app does.
 
-     Eight independent groups, eight independent try/catches: one lookup
-     failing (a slow endpoint, a device timing out) used to cost every
-     group after it in whatever order they happened to be written in this
-     function — the comment here promised "a failed lookup just leaves
-     that group out" while a single try/catch around the whole function
-     did not deliver that at all. A group that has nothing to add (no
-     permission, no match) is simply absent; a group that failed is
-     logged and also simply absent — indistinguishable to the operator,
-     which is the point: a working search that came back empty must not
-     look different from a search one dependency broke.
+     "/" opens one search across devices, MACs/interfaces, alerts, NetPath
+     destinations, IPAM hosts and subnets, syslog messages and wireless
+     access points, over endpoints the product already had, and routes to a
+     hit through the hash like every other selection here.
 
-     Not yet covered: interface descriptions/aliases and a device's
-     sys_location (both need a server-side query that does not exist
-     yet — api.py/nodesdb.py are another agent's files) and ConfigRX's
-     stored configurations (a search endpoint for it is being built
-     separately; see the marked gap below rather than a guess at its
-     shape). */
+     Each group gets its own try/catch: one lookup failing must not cost
+     every group written after it. A group with nothing to add and a group
+     that failed are both simply absent — indistinguishable on purpose, so a
+     working search that came back empty does not look different from one a
+     dependency broke.
+
+     Not yet covered: interface descriptions/aliases and sys_location (no
+     server-side query exists), and ConfigRX's stored configurations (see the
+     marked gap below rather than a guess at its shape). */
   let gsearchTrigger = null;
   let gsearchToken = 0;
   let gsearchTimer = null;
@@ -2223,30 +2233,20 @@ const App = (() => {
     }
   }
 
-  /* One confirmation shape for everything that destroys stored data, so
-     no button deletes on a single click. Body should name the collateral
-     damage; `confirmLabel` is the destructive verb ("Remove", "Delete",
-     "Clear"). Matches the eight hand-written confirms this app already
-     had — Cancel first, the destructive action as the danger button.
+  /* One confirmation shape for everything that destroys stored data, so no
+     button deletes on a single click. The body should name the collateral
+     damage; `confirmLabel` is the destructive verb.
 
-     The confirm button is `danger`, not `primary`: "Delete 40 devices" used
-     to render identically to Save and, being the form's implicit submit
-     button, fire on Enter in a field. danger is never the submit button
-     (see modal(), which only ever makes primary type=submit), so the
-     destructive action now needs an actual click — and modal()'s own
-     auto-focus already lands on Cancel, the first button in the row, so
-     nothing here changes which control the keyboard opens on.
+     The confirm button is `danger`, not `primary`: modal() only ever makes
+     primary type=submit, so the destructive action needs an actual click
+     rather than firing on Enter in a field, and auto-focus still lands on
+     Cancel.
 
      There is only one modal box, so a confirm raised from inside another
-     dialog replaces it. Such callers pass `afterClose(confirmed)` to
-     reopen their parent — which is how removing a wireless controller
-     already behaves. It is told whether the action ran, since a parent
-     rebuilt from now-stale data is usually only wanted on cancel.
-
-     `onConfirm` is called with the dialog's own confirm button, so a caller
-     that wants the queued/outcome treatment can wrap its body in
-     `App.runJob(button, ...)` — the button already carries modal()'s own
-     disable/error handling, so runJob only adds the label and the toast. */
+     dialog replaces it; such callers pass `afterClose(confirmed)` to reopen
+     their parent, and are told whether the action ran. `onConfirm` is called
+     with the dialog's own confirm button, so a caller can wrap its body in
+     App.runJob(button, ...). */
   function confirmDestructive(title, bodyHtml, confirmLabel, onConfirm,
                               afterClose = null) {
     const done = (confirmed) => {
@@ -2290,16 +2290,9 @@ const App = (() => {
     }, text));
   }
 
-  /* The stacked-by-severity histogram three pages draw.
-
-     Syslog's and SNMP's copies were character-for-character identical apart
-     from six substitutions; Alerts' was the same shape minus everything that
-     made it readable — no axis, no gridlines, no tick labels — and with a
-     pointer cursor promising a click it never wired. One implementation now:
-     a legend naming each severity in its colour (none of the three had one,
-     so the colours were learnable only by hovering), y gridlines, x ticks,
-     a tooltip whose rows carry swatches, and a click only where the caller
-     gives one — with the cursor to match.
+  /* The stacked-by-severity histogram three pages draw: a legend naming each
+     severity in its colour, y gridlines, x ticks, a tooltip whose rows carry
+     swatches, and a click only where the caller gives one.
 
        buckets      [{t0, t1?, total, by_severity: {sev: count}}]
        unit         the plural noun for the tooltip: 'messages'
@@ -2426,7 +2419,7 @@ const App = (() => {
     });
   }
 
-  /* stackedHistogram's only consumers (alerts.js, snmp.js, syslog.js) each
+  /* stackedHistogram's only consumers (alerts.js, events.js) each
      carried an identical copy of this: a handful of events inside a
      day-long window used to plot as one sliver of bars at the far right of
      an otherwise-empty chart. When whatever buckets have anything in them
@@ -2524,6 +2517,21 @@ const App = (() => {
     }
   }
 
+  /* Read a filter bar off the DOM: `{ key: <#prefix-key>.value.trim() }`.
+     `keys` is a list when every request field is named after its own
+     control, or a `{ requestKey: idSuffix }` map when they diverge (Alerts'
+     `severity` lives on #alerts-filter-sev). Trimming a <select> is a
+     no-op, so both kinds of control go through the same line. */
+  function filterValues(prefix, keys) {
+    const pairs = Array.isArray(keys) ? keys.map((k) => [k, k]) : Object.entries(keys);
+    const out = {};
+    for (const [key, suffix] of pairs) {
+      const field = el(`${prefix}-${suffix}`);
+      out[key] = field ? field.value.trim() : '';
+    }
+    return out;
+  }
+
   /* A tile and a figure: the Dashboard's building blocks, shared so the
      wall-display strips (kiosk mode) and any future summary use the same
      markup and the same CSS (.tile, .figures, .figure). A figure is one
@@ -2599,6 +2607,67 @@ const App = (() => {
   function setHtml(el, html) { if (el && el.innerHTML !== html) el.innerHTML = html; }
   function setBg(el, color) { if (el && el.style.background !== color) el.style.background = color; }
   function setHidden(el, hidden) { if (el && el.hidden !== hidden) el.hidden = hidden; }
+
+  /* A tooltip is positioned, not laid out, so a 300-character bind failure
+     would otherwise leave the window as one line. */
+  function wrapText(text, width = 72) {
+    const out = [];
+    let line = '';
+    for (const word of String(text).split(/\s+/)) {
+      if (line && (line + ' ' + word).length > width) { out.push(line); line = word; }
+      else line = line ? `${line} ${word}` : word;
+    }
+    if (line) out.push(line);
+    return out.join('\n');
+  }
+
+  /* One module status card: `<prefix>-status`, `-dot`, `-toggle`,
+     `-counters`. Every module's drawStatus is a fastTick, so all four go
+     through the write-only-if-changed guards above. The nouns are the
+     caller's — this decides nothing about what a worker is called.
+     `tooltip: true` additionally carries the full status as a title (the
+     line is ellipsized, so a bind failure would otherwise be unreadable)
+     and marks it .error; those handlers are wired once and read the live
+     title rather than being re-closured ten times a second. */
+  function strip(prefix, worker, opts = {}) {
+    const status = el(`${prefix}-status`);
+    const text = worker.status || opts.stopped;
+    const failed = Boolean(opts.tooltip) && /^Could not bind/.test(text);
+    setText(status, text);
+    if (opts.tooltip && status) {
+      if (status.title !== text) status.title = text;
+      if (status.classList.contains('error') !== failed) status.classList.toggle('error', failed);
+      if (!status.onmousemove) {
+        status.tabIndex = 0;
+        status.onmousemove = (event) => tooltip(wrapText(status.title), event);
+        status.onmouseleave = hideTooltip;
+        status.onfocus = () => {
+          const box = status.getBoundingClientRect();
+          tooltip(wrapText(status.title),
+            { clientX: box.left + box.width / 2, clientY: box.bottom });
+        };
+        status.onblur = hideTooltip;
+      }
+    }
+    setBg(el(`${prefix}-dot`), worker.running
+      ? 'var(--ok)' : (failed ? 'var(--fail)' : 'var(--line)'));
+    setText(el(`${prefix}-toggle`), worker.running ? opts.stop : opts.start);
+    if (opts.parts) setText(el(`${prefix}-counters`), opts.parts.join(' · '));
+  }
+
+  /* The start/stop button beside that strip. `after` is what the module
+     does to catch up once /api/state has been re-read — the poll rate is
+     seconds and the button has to look right immediately. */
+  function wireToggle(buttonId, stateKey, route, after) {
+    const button = el(buttonId);
+    if (!button) return;
+    button.onclick = async () => {
+      const running = ((state.serverState || {})[stateKey] || {}).running;
+      await post(route, { action: running ? 'stop' : 'start' });
+      await loadState();
+      if (after) after();
+    };
+  }
 
   /* ------------------------------------------------- status patterns
 
@@ -2937,6 +3006,15 @@ const App = (() => {
     window.dispatchEvent(new Event('panes-resized'));
   }
 
+  /* The listening half of the event above. A chart drawn to the size of its
+     pane has to be rebuilt when that size changes, not stretched — and only
+     for the tab actually on screen. */
+  function onRelayout(tab, fn) {
+    for (const event of ['resize', 'panes-resized']) {
+      window.addEventListener(event, () => { if (state.tab === tab) fn(); });
+    }
+  }
+
   /* ------------------------------------------------------- table columns */
 
   /* Set by grid() when it is about to wipe a table that holds the focused
@@ -2983,30 +3061,13 @@ const App = (() => {
 
   /* ---------------------------------------------------------- view state
 
-     What the operator has the page *set to* — which column each table is
-     sorted by, what is typed in the filter bars, which sub-view is open —
-     as opposed to what the page looks like (splitter sizes, column widths)
-     or what the account has chosen (which columns exist). A reload used to
-     drop all of it: you came back to an unsorted table and an empty search
-     box, on a page you had spent a minute setting up.
-
-     Per browser and per browser only. The values are the operator's own
-     filter text — device names, addresses, a rule id — written to the same
-     localStorage as the tab and the column widths, and never sent anywhere.
-     `Reset panel sizes` deliberately leaves this key alone: it means "put
-     the furniture back", not "throw away what I was looking at".
-
-     Per browser, but not shared between the people using it: the store
-     records the username it was written for, a different one signing in
-     discards the whole store before any page restores from it, and signing
-     out removes the key outright. One operator's search terms are their own
-     work and must not pre-fill the next shift's filter bars on the NOC
-     workstation they share.
-
-     Deliberately NOT stored: the Live/Follow checkboxes on Syslog, Traps,
-     NetFlow and Debug. Persisting "Live off" would hand somebody a page
-     that has silently stopped moving, with nothing on screen to say why —
-     the one setting where remembering the last state is the wrong answer.
+     What the operator has the page set to: sort, filter text, open sub-view.
+     Local to this browser and never sent anywhere; the store records the
+     username it was written for, and a different one signing in discards it
+     whole — filter text is the operator's own work and must not pre-fill the
+     next shift's bars on a shared NOC workstation. The Live/Follow checkboxes
+     are deliberately NOT stored: restoring "Live off" hands somebody a page
+     that has silently stopped moving with nothing on screen to say why.
 
      Shape: {user: username,
              sort: {gridName: {key, descending}},
@@ -3014,13 +3075,10 @@ const App = (() => {
 
   const VIEW_KEY = 'sappiwhere.view';
 
-  /* The parsed store, kept in memory. Every fetch path with a late-filled
-     select reads it — Nodes twice a tick, Alerts and ConfigRX once — and
-     typing in a filter box writes it on every keystroke, so parsing and
-     re-serialising a JSON blob each time was real work for nothing. The one
-     thing a cache can get wrong is a SECOND TAB writing the same key, so the
-     browser's own `storage` event drops it: that event fires in every other
-     tab but not the one that wrote, which is exactly the rule this needs. */
+  /* The parsed store, kept in memory: it is read and written per keystroke.
+     Dropped on the browser's own `storage` event, which fires in every tab
+     but the one that wrote — exactly the second-tab case a cache gets
+     wrong. */
   let viewCache = null;
 
   function loadView() {
@@ -3311,6 +3369,23 @@ const App = (() => {
         observer.observe(tab, { attributes: true, attributeFilter: ['class'] });
       }
       wireRovingTabs(nav, () => tabs.filter((t) => !t.hidden), (tab) => tab.click());
+    }
+  }
+
+  /* The other half of a sub-tab group: which button and which pane carry
+     `.active`. wireSubtabGroups above owns the ARIA that follows from it
+     (its MutationObserver watches exactly this class), so a module only
+     ever needs to say which one is current. `opts.host`/`opts.prefix`
+     serve the one group that is nested inside a subpage rather than
+     directly under a page (Nodes → Reports). */
+  function selectSub(page, name, opts = {}) {
+    const host = opts.host || `page-${page}`;
+    const prefix = opts.prefix || `${page}-sub-`;
+    for (const btn of document.querySelectorAll(`#${host} > .subtabs > .subtab`)) {
+      btn.classList.toggle('active', btn.dataset.subtab === name);
+    }
+    for (const pane of document.querySelectorAll(`#${host} > .subpage`)) {
+      pane.classList.toggle('active', pane.id === `${prefix}${name}`);
     }
   }
 
@@ -3669,6 +3744,17 @@ const App = (() => {
     box.title = box.checked ? 'Clear selection' : name;
   }
 
+  /* The bar of bulk actions a ticked row reveals: shown while anything is
+     ticked, and saying how many. Returns the count, since a bar with a
+     second rule of its own (ConfigRX needs exactly two backups to diff)
+     has already asked the same question. */
+  function bulkBar(set, barId, labelId) {
+    const n = set.size;
+    setHidden(el(barId), n === 0);
+    if (n) setText(el(labelId), `${n} selected`);
+    return n;
+  }
+
   /* One full-width row carrying the same look a detail pane's empty state
      already has (.empty) — Syslog and SNMP used to render their header over
      a wholly empty tbody with no word about it, NetFlow drew three
@@ -3688,6 +3774,12 @@ const App = (() => {
     tbody.appendChild(tr);
     return tbody;
   }
+
+  /* The same two states outside a table: a pane with nothing in it yet, and
+     one whose first fetch is still in flight. Twenty hand-written copies of
+     one <p> between them. */
+  function emptyState(message) { return `<p class="hint">${escapeHtml(message)}</p>`; }
+  function loading() { return '<p class="hint">Loading…</p>'; }
 
   /* Builds a table body from column descriptors: `cell(row)` renders when
      given, otherwise the raw field with an em dash for blank. This is what
@@ -3775,23 +3867,15 @@ const App = (() => {
     return tbody;
   }
 
-  /* A row a mouse can open has to be a row a keyboard can open.
+  /* A row a mouse can open has to be a row a keyboard can open: Enter and
+     Space run the `tr.onclick` the module already attached, and the arrows
+     move between rows.
 
-     Every module attaches its row behaviour as `tr.onclick` inside the
-     onRow callback above, so the keyboard half is added once here rather
-     than ten times across nine files: Enter and Space run the handler the
-     row already has, and the arrows move between rows. Selecting a row to
-     fill a detail pane is the core gesture of most of this application and
-     it was reachable only with a pointer.
-
-     Only one row per table sits in the tab order at a time, moved by the
-     arrows. Making all of them tabbable would put three hundred stops
-     between the Syslog table and anything after it — reachable, but not
-     usable, which is the failure mode this is meant to fix.
-
-     No role is imposed on the row: a <tr> told it is a button stops being
-     a row, and the table's own semantics are worth more than the label.
-     Exported, so the tables that build their own bodies can call it too. */
+     Only one row per table is in the tab order at a time, moved by the
+     arrows — making all of them tabbable would put three hundred stops
+     between the Syslog table and anything after it. No role is imposed: a
+     <tr> told it is a button stops being a row, and the table's own
+     semantics are worth more than the label. */
   function wireRowKeyboard(tbody) {
     const rows = [...tbody.rows].filter((tr) => tr.onclick);
     if (!rows.length) return;
@@ -3972,24 +4056,18 @@ const App = (() => {
     updateTabOverflow();
   }
 
-  /* The tab strip's right-edge fade (app.css's has-overflow rule, drawn on
-     .tabs-utility so it never scrolls with the strip) is only shown while
-     there is actually more to scroll TO — Chromium paints no scrollbar of
-     its own until the pointer is over the strip, so without this the strip
-     looked simply truncated at rest below ~1500px. Checked on load, on
-     every resize, on every scroll of the strip itself, and by the
-     ResizeObserver in start() (below) that watches #tabs for a width change
-     a window resize alone would miss. That observer does NOT catch the
-     ALERTS tab growing or shrinking as the open count's digit count
-     changes: a child growing inside a flex item with overflow-x:auto moves
-     #tabs's scrollWidth without moving #tabs's own allocated box, and a
-     ResizeObserver only fires on the latter. loadState() (below) calls this
-     directly, right after it writes the badge, to cover that case; a tab
-     hidden or shown by applyPermissions or brokenPages can change the
-     answer too, so both call this as well.
-     `max` is how much is left to scroll: without comparing scrollLeft
-     against it, the fade stayed lit once scrolled all the way to the real
-     right edge, where there is nothing left for it to warn about. */
+  /* The tab strip's right-edge fade, shown only while there is more to
+     scroll to — Chromium paints no scrollbar until the pointer is over the
+     strip, so the strip otherwise looked simply truncated at rest.
+
+     Called from every place that can change the answer, because no single
+     one covers them all: load, resize, the strip's own scroll, start()'s
+     ResizeObserver on #tabs, and loadState() right after it writes the
+     alerts badge — the badge grows a child inside the strip, moving
+     scrollWidth without moving #tabs's own box, which is all a
+     ResizeObserver watches. applyPermissions and brokenPages call it too.
+     `max` is what is left to scroll: without it the fade stayed lit at the
+     real right edge, where there is nothing to warn about. */
   function updateTabOverflow() {
     const tabs = document.getElementById('tabs');
     if (!tabs) return;
@@ -4172,10 +4250,8 @@ const App = (() => {
 
   /* ------------------------------------------------------------- routing
 
-     Nothing in this application could be linked to: no URL changed as the
-     operator moved, Back did nothing, and an escalation was prose — "open
-     Nodes, search for core-sw-01, click the third row". Every selection
-     worth naming now has a hash route.
+     Every selection worth naming has a hash route, so an escalation can be a
+     link rather than prose.
 
          #/nodes                            a tab
          #/nodes?status=down                a tab with its filter set
@@ -4186,14 +4262,11 @@ const App = (() => {
          #/configrx/device/4/backup/91      a stored configuration
          #/snmp/5512  #/syslog/8801  #/wireless/3
 
-     The tab change is a pushState, so Back walks the tabs. Selecting a row
-     inside a tab is a replaceState: an operator clicking down a list of
-     devices should not have to press Back forty times to leave.
-
-     Modules take a route through their existing `activate(opts)` — the entry
-     point netpath.js already had for NetFlow's "view route" jump — and report
-     a selection back with App.setRoute(). A module that implements neither
-     still works: it simply has no deeper routes than its own tab. */
+     A tab change is a pushState, so Back walks the tabs; selecting a row
+     inside a tab is a replaceState, so clicking down a list does not cost
+     forty presses of Back. Modules take a route through `activate(opts)` and
+     report a selection back with App.setRoute(); one that implements neither
+     still works, with no routes deeper than its own tab. */
 
   const ROUTE_TABS = ['dashboard', 'nodes', 'alerts', 'netpath', 'netflow',
                       'snmp', 'syslog', 'ipam', 'wireless', 'configrx',
@@ -4798,26 +4871,16 @@ const App = (() => {
     window.addEventListener('resize', applyDensity);
     document.addEventListener('visibilitychange', onVisibilityChange);
 
-    // Every module initialises inside its own try/catch, because this loop
-    // used to be the single point of failure for the entire application: one
-    // module throwing here meant selectTab() and restartTimer() below were
-    // never reached, so the page painted whatever boot.js had marked and then
-    // sat there, frozen, with no error anywhere a user could see.
+    // Every module initialises inside its own try/catch: this loop was the
+    // single point of failure for the whole application, and /api/state
+    // deliberately omits a module's block for an account that cannot read it
+    // (_STATE_MODULE_KEYS in api.py), so one module throwing here cost the
+    // operator every module they COULD read. Each fails alone now.
     //
-    // That was not hypothetical. /api/state deliberately omits a module's
-    // block for an account that cannot read it (_STATE_MODULE_KEYS in
-    // api.py), so an account without NetFlow access reached a `for` over an
-    // undefined `dimensions` list and lost the whole app — including the
-    // modules it *could* read. Each module now fails alone: its tab is
-    // hidden, the rest of the app starts normally.
-    //
-    // Lazy modules (above) are not loaded yet at this point in start(), so
-    // `pages` holds only Dashboard here — the one module still eager
-    // (index.html). This loop is what ensureModuleReady's own init() call
-    // mirrors for every other module, the first time its tab is selected;
-    // __ready marks a module init() must never run for twice, whichever of
-    // the two places did it.
-    const strip = stripTabs();
+    // Only Dashboard is in `pages` at this point — every lazy module init()s
+    // through ensureModuleReady on its first selection instead; __ready is
+    // what stops either place running init() twice.
+    const tabButtons = stripTabs();
     for (const [name, page] of Object.entries(pages)) {
       if (!page.init) continue;
       try {
@@ -4829,7 +4892,7 @@ const App = (() => {
         // experience than not offering it. A reload is the way back, exactly
         // as it is for a permission granted mid-session.
         brokenPages.add(name);
-        const tab = strip.find((t) => t.dataset.tab === name);
+        const tab = tabButtons.find((t) => t.dataset.tab === name);
         if (tab) tab.hidden = true;
         console.error(`${name}: module failed to start, tab hidden`, error);
       }
@@ -4867,60 +4930,43 @@ const App = (() => {
     restartTimer();
   }
 
-  // `const App` at the top of this file is a global LEXICAL binding: it is
-  // reachable as a bare identifier from the other page scripts, but it is NOT
-  // a property of window, so anything evaluating `window.App` — a
-  // bookmarklet, an extension, an automated check — saw undefined. Exposed
-  // deliberately, and only here, at the end of the module.
-  //
   // Started from here rather than an inline script in the page: the server
-  // sends a strict Content-Security-Policy, and 'self' does not permit inline
-  // script.
-  //
-  // Only dashboard.js still carries `defer` alongside this file — the other
-  // eleven modules are lazy now (see "lazy modules" above) and are never
-  // fetched at all until their tab is first selected, so "every module has
-  // run before start()" stopped being true the day that landed. It was
-  // never what this branch depended on anyway: start() only initialises
-  // whatever `pages` already holds (Dashboard, at this point) and leaves
-  // ensureModuleReady to init() every other module on its own first
-  // selection, so nothing here needed all thirteen files present, only
-  // dashboard.js. Before `defer`, this file ran while the parser was still
-  // at its own <script> tag: readyState was already 'interactive', start()
-  // was called synchronously, and dashboard.js — the one module start()
-  // actually needs at this point — had not even been fetched yet. It
-  // worked only because start()'s first `await loadState()` yielded long
-  // enough for the parser to reach it. The branch for 'interactive' stays
-  // for a page that loads this file without defer.
+  // sends a strict Content-Security-Policy, and 'self' does not permit
+  // inline script. start() only initialises whatever `pages` already holds
+  // (Dashboard); every other module init()s on its own first selection,
+  // through ensureModuleReady. The 'interactive' branch is for a page that
+  // loads this file without `defer`.
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => { start(); });
   } else {
     start();
   }
 
+  /* What the modules (and tests/ui/walk.mjs) may call. A function used only
+     inside this file is not listed here — it stays where it is, private. */
   const api = {
-    state, pages, start, selectTab, loadState, loadConfig, refreshNow, rateFor,
-    parseRoute, buildRoute, setRoute, applyRoute,
+    state, pages, selectTab, loadState, refreshNow,
+    buildRoute, setRoute,
     get, post, put, del, saveCsv, exportCsv, deviceIndex, deviceLink,
     clock, stamp, span, duration, ago, when, timeCell, agoCell, isoLocal,
-    SEV_COLOR, emptyText, stackedHistogram, plottedRange, filterBar, isMono,
+    emptyText, stackedHistogram, plottedRange, filterBar, filterValues,
     timeZoneLabel, timeZoneTitle, countLabel,
-    bytes, rate, fillRanges, RANGES, wheelWindow,
+    bytes, rate, fillRanges, wheelWindow,
     modal, modalToken, modalIsCurrent,
     closeModal, requestCloseModal, confirmDestructive, el, svgNode,
-    setText, setHtml, setBg, setHidden,
+    setText, setHtml, setBg, setHidden, strip, wireToggle,
     tooltip, hideTooltip, toast, showModalError, clearModalError, requireFields,
-    runJob, emptyRow,
+    runJob, watchJob, settleButton, form, emptyRow, emptyState, loading, bulkBar,
     announce, desktopNotifyEnabled, setDesktopNotify, titleForAlerts,
     canStoreSecrets, credentialUnavailableHtml,
-    registerHelp, helpLink, showHelp, closeHelp,
-    resetLayout, setTheme, currentTheme, tile, figure, figures,
+    registerHelp, helpLink,
+    resetLayout, onRelayout, setTheme, currentTheme, tile, figure, figures,
     recallSort, rememberSort, restoreControls, rememberControls,
     rememberControl, savedControl, controlOrSaved, syncControls,
-    recallSub, rememberSub,
-    grid, a11yTable, sortRows, canRead, canWrite, applyPermissions, accountModal, wireRowKeyboard,
+    recallSub, rememberSub, selectSub,
+    grid, sortRows, canRead, canWrite, applyPermissions, accountModal, wireRowKeyboard,
     statusPatternDefs, statusPatternUrl, statusMark,
-    visibleColumns, columnPickerHtml, readColumnPicker, drawRows, escapeHtml,
+    visibleColumns, readColumnPicker, drawRows, escapeHtml,
     refreshSelectAll, columnPickerFieldset, wireColumnPickers,
   };
   window.App = api;

@@ -127,7 +127,12 @@ Ports used: **8443** (app), **8099** (fleet control), **1025** (SMTP sink),
 | `bin/ping`, `bin/traceroute` | Scripted stand-ins put at the front of `PATH`, so NetPath traces a network that does not exist. Paths come from `routes.json`. |
 | `seed.py` | Fills a running app over its HTTP API: groups, profiles, devices, NetPath targets, IPAM, wireless, ConfigRX, settings, alert rules, users. `--defaults` seeds without tuning anything the application ships — see [Campaign settings vs shipped defaults](#campaign-settings-vs-shipped-defaults). |
 | `ui_walk.mjs` | Drives the browser with Playwright: every tab (by `data-tab`, so a label rename cannot break it), every subtab including Nodes' Topology and the device-detail pane's four nested ones, every dialog it can reach (device groups, the MIB catalog, Upload MIB, ConfigRX's device-settings and bulk-settings dialogs, and the rest), a MAC search and ConfigRX's inline config viewer and diff, a kiosk-mode (`?kiosk=1`) pass, and every top-level tab again under each of the three themes and at three viewport sizes — screenshots, console log, timing metrics. |
-| `scenario.py` | The conductor. Starts everything, runs `seed.py`, runs the eight incidents, runs `ui_walk.mjs`, writes the report, stops everything. |
+| `scenario.py` | The conductor. Starts everything, runs `seed.py`, runs the nine incident steps, runs `ui_walk.mjs`, writes the report, stops everything. |
+| `configrx_compliance_fixture.py` | A realistic ConfigRX compliance demonstration, not a unit test: seeds a plant-shaped rule set and capture data against a real `ConfigRxDatabase`. |
+| `fake_ssh.py` | Fake SSH devices (paramiko) for exercising ConfigRX's capture logic — one persona per loopback port, sharing personas with `tests/stubs/stub_ssh_device.py`. |
+| `routes.json` | The scripted traceroute paths `bin/ping`/`bin/traceroute` read: multihop, route change, refused, silent, dead and degraded, keyed by destination IP. |
+| `bin/ping.cmd`, `bin/traceroute.cmd`, `bin/tracert.cmd` | Windows shims: each resolves a Python interpreter and re-execs the matching extension-less script in this directory, since `CreateProcess` never consults `PATHEXT` for a bare name. |
+| `__init__.py` | Empty — makes `demo/` importable as a package. |
 | `.gitignore` | Ignores `out/`. |
 
 ### Where the fleet roster is documented
@@ -266,13 +271,14 @@ node demo/ui_walk.mjs --base http://127.0.0.1:8443 \
 | Step | Action | Base duration |
 | --- | --- | --- |
 | 1 | baseline, nothing happening | 120 s |
-| 2 | core switch down + the 500 `Site-A` access switches behind it down | 180 s |
-| 3 | interface 7 flapping on 100 access switches | 120 s |
-| 4 | reboot 20 devices | 120 s |
-| 5 | SNMP auth failure on 5 devices | 90 s |
-| 6 | trap storm + syslog burst (part over TCP with octet framing) | 60 s of traffic |
-| 7 | NetFlow burst, mixed v5/v9, 200 flows/s | 60 s of traffic |
-| 8 | recovery: everything back up, flapping stopped, auth restored | 180 s |
+| 2 | core switch down + the 500 `Site-A` access switches behind it down | 240 s |
+| 3 | outage recovery: core and Site-A back | 150 s |
+| 4 | interface 7 flapping on 100 access switches | 120 s |
+| 5 | reboot 20 devices | 120 s |
+| 6 | SNMP auth failure on 5 devices | 90 s |
+| 7 | trap storm + syslog burst (part over TCP with octet framing) | 75 s of traffic |
+| 8 | NetFlow burst, mixed v5/v9, 200 flows/s | 75 s of traffic |
+| 9 | recovery: flapping stopped, auth restored | 150 s |
 
 Before and after each step it snapshots `/api/state`, `/api/debug`
 (`node_counters` including overruns, plus per-worker elapsed), open alerts

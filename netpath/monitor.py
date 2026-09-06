@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import socket
 import sqlite3
 import threading
 import time
@@ -12,6 +11,7 @@ from .db import Database
 from .eventlog import DNS, ERROR, NullLog, SYSTEM, TRACE
 from .namelookup import asn_lookup, reverse
 from .tracer import TraceResult, expected_budget, ping, run_trace
+from .worker import Worker
 
 
 def classify(result: TraceResult, warn_rtt_ms: float, warn_loss: float) -> str:
@@ -38,12 +38,14 @@ def classify(result: TraceResult, warn_rtt_ms: float, warn_loss: float) -> str:
     return "ok"
 
 
-class Monitor:
+class Monitor(Worker):
     """Runs traces on a schedule and writes them to the database.
 
     `on_complete(target_id)` is called from a worker thread, so a Qt UI should
     only use it to set a flag and refresh from its own timer.
     """
+
+    THREAD_NAME = "netpath-scheduler"
 
     def __init__(self, db: Database, workers: int = 4, on_complete=None, log=None):
         self.db = db
@@ -52,7 +54,6 @@ class Monitor:
         self.workers = workers
         self._executor = ThreadPoolExecutor(max_workers=workers)
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
         self._inflight: set[int] = set()
         # Queued and started are tracked separately: with more destinations
         # than workers a trace can sit in the pool queue, and "waiting for a
@@ -67,10 +68,6 @@ class Monitor:
         # operator poking around in a debugger or a future status endpoint
         # something to look at.
         self._loop_errors = 0
-
-    @property
-    def running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
 
     def set_workers(self, count: int) -> None:
         """Resize the pool. Traces already running finish on the old pool."""
@@ -87,16 +84,15 @@ class Monitor:
         if self.running:
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, name="netpath-scheduler", daemon=True)
-        self._thread.start()
+        self._spawn()
         self.log.add(SYSTEM, f"Scheduler started with {self.workers} worker threads")
 
     def stop(self, wait: bool = False) -> None:
         if self.running:
             self.log.add(SYSTEM, "Scheduler stopped")
         self._stop.set()
-        if wait and self._thread:
-            self._thread.join(timeout=5)
+        if wait:
+            self._join(timeout=5)
 
     def drain(self, timeout_s: float = 3.0) -> bool:
         """Wait for in-flight traces to finish. True if they all did."""
@@ -321,26 +317,14 @@ class Monitor:
             if self.on_complete:
                 self.on_complete(target_id)
         except Exception as exc:  # a scheduler thread must never die quietly
-            # ...with two exceptions to that rule, both an in-flight trace
-            # losing the row it was about to write to, for a reason that is
-            # not a bug:
-            #
-            # "Cannot operate on a closed database" while _stop is set means
-            # this trace ran past shutdown()'s drain window (bounded by
-            # _inflight_budget_s, not unlimited) and the database closed
-            # under it — an accepted, bounded consequence of stopping
-            # promptly rather than waiting on the network forever.
-            #
-            # A foreign key failure on record_trace's INSERT, with the
-            # target now gone, means it was deleted mid-trace — an ordinary
-            # operator action the check right before record_trace above
-            # already catches; this is only the residual window between
-            # that check and the INSERT itself.
-            #
-            # Neither gets the traceback below, which would read exactly
-            # like a crash in a log an operator checks right after a stop or
-            # a delete. The same exceptions for any OTHER reason are still a
-            # real bug and still get the full treatment.
+            # ...with two exceptions, both an in-flight trace losing the row
+            # it was about to write to for a reason that is not a bug:
+            # "Cannot operate on a closed database" while _stop is set (this
+            # trace ran past shutdown()'s drain window), and a foreign key
+            # failure on record_trace's INSERT with the target now gone
+            # (deleted mid-trace, in the residual window after the check
+            # above). Neither gets the traceback below; the same exceptions
+            # for any other reason still do.
             target_gone = False
             if isinstance(exc, sqlite3.IntegrityError):
                 try:
@@ -365,7 +349,7 @@ class Monitor:
                 self._started.pop(target_id, None)
 
 
-class Resolver:
+class Resolver(Worker):
     """Fills in reverse-DNS names for hop addresses, out of band.
 
     Traces themselves run numerically (-n / -d). Asking traceroute to resolve
@@ -379,6 +363,8 @@ class Resolver:
     server for an address, and that's the only name anything here will ever
     have for them.
     """
+
+    THREAD_NAME = "netpath-resolver"
 
     def __init__(self, db: Database, app_db, workers: int = 8,
                  poll_s: float = 15.0,
@@ -404,7 +390,6 @@ class Resolver:
         self.workers = workers
         self._executor = ThreadPoolExecutor(max_workers=workers)
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
         self._pending: set[str] = set()
         # When each pending lookup was submitted, for the Debug page — a
         # reverse lookup has no separate queued/running distinction worth
@@ -433,11 +418,10 @@ class Resolver:
             previous.shutdown(wait=False)
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if self.running:
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, name="netpath-resolver", daemon=True)
-        self._thread.start()
+        self._spawn()
         self.log.add(SYSTEM, f"Reverse DNS resolver started "
                              f"({self.workers} threads, {self.timeout_s:.0f}s timeout)")
 
@@ -535,7 +519,7 @@ class Resolver:
             self._started.pop(ip, None)
 
 
-class AsnResolver:
+class AsnResolver(Worker):
     """Fills in ASN/organization for hop addresses, out of band — the same
     pattern as Resolver, against the longer-lived asn_cache table instead of
     the hostnames cache, since ASN assignment changes far less often than a
@@ -543,6 +527,8 @@ class AsnResolver:
     (db.distinct_hop_ips()), so there is no separate IP-discovery mechanism:
     every hop that gets a reverse-DNS name is a candidate for an ASN too.
     """
+
+    THREAD_NAME = "netpath-asn"
 
     def __init__(self, db: Database, app_db, workers: int = 4,
                  poll_s: float = 30.0, timeout_s: float = 3.0,
@@ -559,7 +545,6 @@ class AsnResolver:
         self.log = log or NullLog()
         self._executor = ThreadPoolExecutor(max_workers=workers)
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
         self._pending: set[str] = set()
         self._lock = threading.Lock()
 
@@ -579,11 +564,10 @@ class AsnResolver:
             previous.shutdown(wait=False)
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if self.running:
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, name="netpath-asn", daemon=True)
-        self._thread.start()
+        self._spawn()
         self.log.add(SYSTEM, f"ASN/owner resolver started "
                              f"({self.workers} threads, {self.timeout_s:.0f}s timeout)")
 
@@ -631,7 +615,7 @@ class AsnResolver:
             self._pending.discard(ip)
 
 
-class HopProber:
+class HopProber(Worker):
     """Continuous, MTR-style per-hop probing for targets that opt in.
 
     A scheduled traceroute (Monitor) says what the path looked like at one
@@ -647,6 +631,8 @@ class HopProber:
     on a production network, not just background CPU.
     """
 
+    THREAD_NAME = "netpath-hopprobe"
+
     def __init__(self, db: Database, workers: int = 8, interval_s: float = 4.0,
                  timeout_s: float = 1.5, log=None):
         self.db = db
@@ -656,7 +642,6 @@ class HopProber:
         self.log = log or NullLog()
         self._executor = ThreadPoolExecutor(max_workers=workers)
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
         self._enabled: set[int] = set()
         self._hops: dict[int, set[str]] = {}
         self._lock = threading.Lock()
@@ -669,10 +654,6 @@ class HopProber:
         self._inflight: set[tuple[int, str]] = set()
         self._pending: list[tuple[int, str, object]] = []
         self.overruns = 0
-
-    @property
-    def running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
 
     def set_enabled(self, target_id: int, enabled: bool) -> None:
         with self._lock:
@@ -727,8 +708,7 @@ class HopProber:
                 self.refresh_hops(target_id)
         except Exception:
             pass
-        self._thread = threading.Thread(target=self._loop, name="netpath-hopprobe", daemon=True)
-        self._thread.start()
+        self._spawn()
         self.log.add(SYSTEM, f"Continuous hop probing started "
                              f"({self.workers} threads, every {self.interval_s:.0f}s)")
 

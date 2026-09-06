@@ -1,40 +1,9 @@
-"""Interactive SSH sessions for the terminal window.
-
-ConfigRX already opens SSH connections to these devices, but for one narrow
-purpose: log in, turn the pager off, ask for the running config, hang up.
-That boundary is deliberate and stays where it is (see configrx._pull_config).
-This module is the other thing entirely — a real shell, whatever the operator
-types, driven from a browser tab over a WebSocket.
-
-The shape:
-
-* One `SshSessionRegistry` on the Service, holding the live sessions so the
-  application can end them on shutdown and refuse the seventeenth.
-* One `SshSession` per socket, owning the paramiko client and the shell
-  channel. Two threads: the request handler's own thread reads the WebSocket
-  and writes keystrokes into the channel; a pump thread reads channel output
-  and writes binary frames back. A third, tiny, timer thread is the session's
-  heartbeat: it hangs up on an idle session, and it re-asks once a second
-  whether this session is still allowed to exist. A shell outlives the
-  request that opened it by hours, so being authorised at the upgrade is not
-  enough — signing out, a session expiring, an account deleted or the `ssh`
-  permission taken away all close the shell (4401), and every failed login
-  is counted — against the account and the device, not against the socket,
-  which is free to open again — and audited, so the page cannot be used as
-  a password oracle.
-* The credential is ConfigRX's stored one for that device when there is one
-  — decrypted at connect time and dropped immediately, exactly as the backup
-  path does — and otherwise typed into the page and sent once over the
-  socket. Neither is stored by this module, written to any log, or included
-  in any event or error text. Keystrokes are never logged either: what is
-  audited is that a session happened, by whom, from where, and for how long.
-* Host keys come from the shared store (hostkeys.HostKeyStore, also used by
-  ConfigRX backups). First connection stores the key and says so; a changed
-  key refuses the connection and offers the operator both fingerprints.
-
-The protocol these frames carry is documented in INTERNALS; the short
-version is JSON text frames for control, binary frames for terminal bytes,
-in both directions.
+"""Interactive SSH sessions for the terminal window — a real shell over a
+WebSocket, distinct from ConfigRX's narrow pull-the-config-and-hang-up use.
+`SshSessionRegistry` tracks live `SshSession`s (paramiko + a pump thread and
+a heartbeat that re-checks authorisation and idle timeout every second).
+Credentials/keystrokes are never logged; frames are JSON (control) and
+binary (terminal bytes) — see INTERNALS.
 """
 
 from __future__ import annotations
@@ -63,25 +32,10 @@ CONNECT_TIMEOUT_S = 10
 # holds its slot against both caps for the life of the process, and four of
 # them lock an account out of its own terminals.
 HANDSHAKE_TIMEOUT_S = 15
-# Idle timeout: no *keystrokes* for this long ends the session, mirroring
-# the web session's own "presence, not the tab being open" rule (auth.py's
-# SessionStore.touch). A shell left open on a switch overnight is a real
-# risk; a shell being watched is never idle for a quarter of an hour.
-#
-# This is a ceiling, not a promise: a keystroke both refreshes this and
-# touches the web session (see _touch_web_session), so the two clocks are
-# reset together and then run in parallel. The web session's own idle
-# timeout (session_idle_minutes, ten by default) is shorter than this, so
-# without capping, this branch of _watch_tick was dead code at every
-# default install — the web session always expired five minutes before a
-# shell could ever be idle long enough to say so itself, and the operator
-# was told "you were signed out" instead of the truer, gentler "your
-# terminal timed out". _watch_tick reads this against
-# service.sessions.idle_seconds (the live, reconfigurable value the web
-# layer actually enforces) and uses whichever is smaller, so the more
-# specific reason wins whenever it is the one that is actually true, and an
-# administrator who raises session_idle_minutes past this gets the full
-# fifteen minutes they'd expect.
+# Idle timeout: no *keystrokes* for this long ends the session (mirrors
+# auth.py's SessionStore.touch "presence, not tab open" rule). _watch_tick
+# uses whichever of this and the live session_idle_minutes is smaller, so
+# raising the web session timeout past this still gets the full 15 minutes.
 IDLE_TIMEOUT_S = 900
 # Concurrent sessions across the whole application. Each one costs a socket,
 # a paramiko transport and three threads; sixteen is far past what a team of
@@ -284,17 +238,10 @@ class SshSessionRegistry:
         ws.close(CLOSE_TOO_MANY, "Too many SSH sessions")
 
     def shutdown(self) -> None:
-        """End every session. Called before the databases close, because a
-        session that is still running will write a closing device event.
-
-        Concurrently, under one budget for all of them: `stop()` sends a
-        closing status and a close frame, both of which take the socket's
-        I/O lock, and a pump thread writing into a browser that stopped
-        reading can hold that lock for `wsock.SEND_TIMEOUT_S`. Serially
-        that is sixteen timeouts one after another — minutes — before the
-        drain loop was even reached. Anything still live when the budget
-        runs out has its socket shut down by force, which takes no lock and
-        is what makes a parked write fail at once.
+        """End every session before the databases close (a running session
+        writes a closing device event). Concurrent, under one shared budget —
+        serially, sixteen sessions each blocked on a stuck socket would be
+        minutes; anything still live when the budget runs out is force-closed.
         """
         with self._lock:
             self._stopping = True
@@ -487,12 +434,8 @@ class SshSession:
             return                                    # reported already
 
     def _refuse_after_failures(self, seconds: float, announce: bool) -> None:
-        """This account has spent its refused logins against this device —
-        on this socket or on one it has since closed. Say how long the wait
-        is, close 4429 (the code the page's table already means "too many"),
-        and audit the refusal *itself* once per cooling-off period: a
-        reconnecting client should read as one line, not as five hundred
-        refused logins."""
+        """This account is locked out on this device. Close 4429 and audit
+        the refusal once per cooling-off period, not once per reconnect."""
         minutes = max(1, -(-int(seconds) // 60))
         self._error(f"Too many failed logins for this device. Try again in "
                     f"about {minutes} minute(s).")
@@ -715,11 +658,9 @@ class SshSession:
         self.stop()
 
     def _touch_web_session(self) -> None:
-        """Someone is typing, so the web session is not idle either — the
-        same "a deliberate action is presence" rule server.py applies to a
-        POST. Rate-limited: a shell is a lot of keystrokes and each touch is
-        a lock and a clock read, and the session's idle timeout is measured
-        in hours."""
+        """Someone is typing, so the web session is not idle either. Rate-
+        limited — a shell is a lot of keystrokes and each touch costs a lock
+        and a clock read."""
         now = time.time()
         if not self.token or now - self._last_touch < TOUCH_INTERVAL_S:
             return
@@ -749,15 +690,10 @@ class SshSession:
     # ---------------------------------------------------------------- idle
 
     def _idle_watch(self) -> None:
-        """The session's own heartbeat, once a second: is the person who
-        opened this still signed in, do they still hold `ssh` write, has the
-        socket got as far as its `open` message, and has anyone typed
-        lately. Authorisation is not settled once at the upgrade — a shell
-        can outlive the sign-in that opened it by hours, and signing out,
-        expiring, being deleted or having the permission taken away must all
-        end it. It runs from the moment the slot is taken rather than from
-        the moment a shell exists, because a socket waiting for its `open`
-        message is already holding that slot."""
+        """Once a second: still signed in, still holds `ssh` write, socket
+        past its `open` message, anyone typed lately. Authorisation is not
+        settled once at the upgrade — a shell can outlive the sign-in that
+        opened it by hours."""
         ticks = 0
         while not self._stopped.wait(1.0):
             ticks += 1
@@ -765,13 +701,8 @@ class SshSession:
                 if self._watch_tick(ticks):
                     return
             except Exception:
-                # This loop is the only thing enforcing the idle timeout,
-                # the sign-out check and the permission check, and it is one
-                # daemon thread: an exception from the session store, the
-                # socket or the audit path used to end it silently and leave
-                # the shell running with none of them. A tick that fails is
-                # a tick lost, not a control switched off — so it is
-                # reported once and the next one is taken.
+                # This one loop enforces the idle timeout, sign-out and permission
+                # checks; a failed tick must not silently disable all three.
                 if not self._watch_failed:
                     self._watch_failed = True
                     log.exception("The SSH session watchdog for device %s "
@@ -779,12 +710,8 @@ class SshSession:
                                   self.device_id)
 
     def _effective_idle_s(self) -> float:
-        """IDLE_TIMEOUT_S, capped to whatever the web session actually
-        survives on its own (service.sessions.idle_seconds — live and
-        reconfigurable, not the constant this module started with). A shell
-        must not advertise a window longer than the login that contains it:
-        past that cap the "you were signed out" check below would fire
-        first regardless, for a less specific reason than the true one."""
+        """IDLE_TIMEOUT_S, capped to the live web session timeout — a shell
+        must not advertise a window longer than the login containing it."""
         if not self.token:
             return IDLE_TIMEOUT_S
         return min(IDLE_TIMEOUT_S, self.service.sessions.idle_seconds)
@@ -792,19 +719,9 @@ class SshSession:
     def _watch_tick(self, ticks: int) -> bool:
         """One beat of the watchdog. True when the session is over and the
         loop should end."""
-        # Checked ahead of the sign-out/permission checks below, but only
-        # once a shell exists: at a default install the web session's own
-        # idle timeout is shorter than IDLE_TIMEOUT_S, so "no keystrokes for
-        # the effective window" and "the web session has expired" become
-        # true within the same tick. When they do, the more specific, more
-        # informative reason — the terminal itself timed out, not "you were
-        # signed out" — is the one that should reach the operator, since it
-        # is the one actually true of what they did (or didn't do) in this
-        # shell. Before `open`, this says nothing about idleness — see the
-        # handshake timeout below instead — so it stays out of the way of
-        # the sign-out check for a socket parked waiting on `open` (that
-        # window is covered by the sign-out/permission checks below on
-        # every tick, exactly as before).
+        # Checked ahead of sign-out/permission below, and only once a shell
+        # exists, so a terminal timeout reads as itself rather than as "you
+        # were signed out" when both would otherwise fire the same tick.
         if self._open_seen:
             effective_idle_s = self._effective_idle_s()
             if time.time() - self._last_input >= effective_idle_s:

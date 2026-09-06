@@ -1,9 +1,8 @@
 """The application without a user interface.
 
-Everything that was previously owned by the Qt main window — the databases, the
-trace scheduler, the reverse-DNS resolver, the flow collector and the event log
-— lives here instead. The desktop window and the web server are both just
-front ends over this.
+The databases, the trace scheduler, the reverse-DNS resolver, the collectors,
+the pollers and the event log all live here. The web server is a front end
+over this.
 """
 
 from __future__ import annotations
@@ -40,6 +39,74 @@ from ..syslogdb import SyslogDatabase
 from ..wirelessdb import WirelessDatabase
 
 MAINTENANCE_INTERVAL_S = 900
+
+
+def _restart(worker, settings, enabled_default) -> None:
+    """Stop a collector/worker and start it again only if its settings say
+    it is enabled. `enabled_default` is what an absent "enabled" key means
+    for this scope — the three event collectors treat it as off, the
+    pollers as on."""
+    worker.stop()
+    if settings.get("enabled", enabled_default):
+        worker.start(settings)
+
+
+def _apply_netflow(service, settings) -> None:
+    # Interface and port name tables are rebuilt before the collector comes
+    # back up, so the first flow it decodes already resolves against them.
+    service._apply_interface_names()
+    service._apply_port_names()
+    _restart(service.collector, settings, None)
+
+
+def _apply_syslog(service, settings) -> None:
+    _restart(service.syslog, settings, None)
+
+
+def _apply_snmp(service, settings) -> None:
+    _restart(service.snmp, settings, None)
+
+
+def _apply_wireless(service, settings) -> None:
+    _restart(service.wireless, settings, True)
+
+
+def _apply_configrx(service, settings) -> None:
+    _restart(service.configrx, settings, True)
+
+
+def _apply_ipam(service, settings) -> None:
+    # Started or stopped by `enabled`, never bounced: the DHCP poller reads
+    # its own settings each cycle, so a live one needs no restart.
+    if settings.get("enabled", True):
+        service.ipam.start()
+    else:
+        service.ipam.stop()
+
+
+def _apply_nodes(service, settings) -> None:
+    service.node_poller.reconfigure(settings)
+
+
+def _apply_alerts(service, settings) -> None:
+    service.alert_engine.reconfigure(settings)
+
+
+# scope -> (settings attribute, database attribute, event-log line, effect).
+# `netpath` and `global` are not here: both write self.settings rather than
+# a module's own dict and have their own methods.
+_MODULE_SCOPES = {
+    "netflow": ("flow_settings", "flow_db", "NetFlow settings applied", _apply_netflow),
+    "syslog": ("syslog_settings", "syslog_db", "Syslog settings applied", _apply_syslog),
+    "snmp": ("snmp_settings", "snmp_db", "SNMP trap settings applied", _apply_snmp),
+    "wireless": ("wireless_settings", "wireless_db", "Wireless settings applied",
+                 _apply_wireless),
+    "configrx": ("configrx_settings", "configrx_db", "ConfigRX settings applied",
+                 _apply_configrx),
+    "ipam": ("ipam_settings", "ipam_db", "IPAM settings applied", _apply_ipam),
+    "nodes": ("nodes_settings", "nodes_db", "Nodes settings applied", _apply_nodes),
+    "alerts": ("alerts_settings", "alerts_db", "Alerts settings applied", _apply_alerts),
+}
 
 
 class LdapUnavailable(Exception):
@@ -88,8 +155,7 @@ class Service:
         self.ipam_settings = self.ipam_db.settings()
         self.snmp_settings = self.snmp_db.settings()
         self.nodes_settings = self.nodes_db.settings()
-        # The one in-flight MIB catalog install, if any (see
-        # install_mib_bundle); the UI polls its status. The lock makes
+        # The one in-flight MIB catalog install, if any. The lock makes
         # "is one already running?" and "claim it" one step — the web server
         # is threaded, so two clicks land on two threads.
         self._mib_job = None
@@ -140,12 +206,9 @@ class Service:
             self.alerts_db, nodes_db=self.nodes_db, snmp_db=self.snmp_db,
             syslog_db=self.syslog_db, ipam_db=self.ipam_db, app_db=self.app_db,
             wireless_db=self.wireless_db, netpath_db=self.db, log=self.log)
-        # The poller raises one alert about itself — that its worker pool is
-        # saturated and devices are being polled late — through the engine's
-        # system-occurrence path. Wired here rather than passed to the
-        # constructor because the engine is built last, after everything it
-        # reads from; the poller guards every use, so it runs standalone
-        # (tests, scripts) with this left unset.
+        # Wired after construction because the engine is built last, after
+        # everything it reads from; the poller guards every use, so it runs
+        # standalone (tests, scripts) with this left unset.
         self.node_poller.alert_engine = self.alert_engine
 
         self.sessions = SessionStore(
@@ -166,13 +229,10 @@ class Service:
         # out from under either of them.
         self._maintenance_lock = threading.Lock()
         self.started_at = time.time()
-        # Bumped by every write to something /api/config carries — a
-        # settings block, an account's grants. The browser polls /api/state
-        # and refetches /api/config only when this number moves, so the
-        # 6-7 KB of configuration that used to ride along on every poll now
-        # crosses the wire once per change. Monotonic within a process; a
-        # restart starting again from 1 is fine, because the client compares
-        # for inequality, not order.
+        # Bumped by every write to something /api/config carries. The
+        # browser refetches /api/config only when this number moves.
+        # Monotonic within a process; a restart starting again from 1 is
+        # fine, because the client compares for inequality, not order.
         self.config_version = 1
         # Per-poll figures that are expensive to compute and cannot usefully
         # change faster than an operator can read them: storage sizes (30
@@ -189,11 +249,9 @@ class Service:
             return
         self.app_db.add_user(DEFAULT_USER, hash_password(DEFAULT_PASSWORD),
                              must_change=True)
-        # There's no one else yet to grant this account access — it has to
-        # start with everything, the same as an upgrading install's
-        # existing accounts get backfilled to (AppDatabase's own
-        # _backfill_full_permissions, for the different case of a table
-        # that didn't exist before this feature shipped).
+        # There is no one else yet to grant this account access, so it
+        # starts with everything — the same grant an upgrading install's
+        # existing accounts are backfilled to.
         self.app_db.set_permissions(
             DEFAULT_USER, {m: permissions.WRITE for m in permissions.MODULES})
         self.log.add(SYSTEM, f"Created the default {DEFAULT_USER} account. "
@@ -216,16 +274,11 @@ class Service:
         """
         from .. import ldapclient
 
-        # Defence in depth: ldapclient.simple_bind already refuses a
-        # zero-length password before it ever opens a socket (RFC 4513
-        # §5.1.2 — a non-empty DN with an empty password is a legal LDAP
-        # "unauthenticated bind", which many directories answer with
-        # resultCode 0/success rather than invalidCredentials, so this
-        # cannot be left to the directory to reject). Checking again here
-        # costs nothing and means this route's safety does not rest on
-        # remembering to keep calling into ldapclient correctly — a future
-        # caller of authenticate_ldap, or a refactor of simple_bind's own
-        # guard, cannot silently reopen the empty-password bind.
+        # Defence in depth; ldapclient.simple_bind refuses this too. A
+        # non-empty DN with an empty password is a legal LDAP "unauthenticated
+        # bind" (RFC 4513 §5.1.2), which many directories answer with
+        # success rather than invalidCredentials, so it cannot be left to the
+        # directory to reject.
         if password == "":
             return False
 
@@ -266,14 +319,10 @@ class Service:
         row = self.app_db.api_token_by_hash(token_hash)
         if row is None:
             return None
-        # Defense in depth over the indexed SQL equality match above: an
-        # explicit constant-time comparison of the exact bytes matched,
-        # documented rather than relied on implicitly (see
-        # ldapclient.constant_time_hash_eq and auth.hash_api_token's
-        # docstring for why an indexed lookup is fine here in the first
-        # place — the token's 256 bits of entropy is what actually protects
-        # it, the same property that makes SessionStore's own plain dict
-        # lookup by session token fine).
+        # Defence in depth over the indexed SQL equality match above: an
+        # explicit constant-time comparison of the exact bytes matched. The
+        # token's 256 bits of entropy is what actually protects it, which is
+        # why the indexed lookup is fine in the first place.
         from .. import ldapclient
         if not ldapclient.constant_time_hash_eq(row["token_hash"], token_hash):
             return None
@@ -326,14 +375,12 @@ class Service:
         self._apply_interface_names()
         self._apply_port_names()
 
-        # Nodes and Wireless polling both call into ipam_scan.ping_many();
-        # on a host with no ICMP socket available (Windows, or Linux without
-        # CAP_NET_RAW or a ping_group_range grant) that silently falls back
-        # to one `ping` subprocess per probe, which is real fork/exec cost
-        # a fleet-sized poll cycle pays for on every run — measured turning
-        # a 2,000-device cycle from under a minute into minutes, with
-        # nothing anywhere telling the operator why. Said once here, at the
-        # volume level a wrong choice deserves.
+        # Nodes and Wireless polling both call ipam_scan.ping_many(); with
+        # no ICMP socket available (Windows, or Linux without CAP_NET_RAW or
+        # a ping_group_range grant) that falls back to one `ping` subprocess
+        # per probe, which turns a fleet-sized poll cycle from under a minute
+        # into minutes. Said once here, since nothing else tells the operator
+        # why the cycle got slow.
         ping_mode = ipam_scan.ping_mode_summary()
         if ping_mode["path"] == "socket":
             self.log.add(SYSTEM, f"ICMP ping using an unprivileged {ping_mode['kind']} "
@@ -361,10 +408,10 @@ class Service:
     def shutdown(self) -> None:
         self._stop.set()
         # run_maintenance also runs on an HTTP thread (apply_global_settings
-        # forces one on a settings save) and the timer thread below was
-        # never joined here, so either could still be pruning when the
-        # databases are closed further down — join the timer, then hold the
-        # same lock run_maintenance holds around the whole close sequence.
+        # forces one on a settings save), so either it or the timer thread
+        # could still be pruning when the databases close below — join the
+        # timer, then hold the lock run_maintenance holds for the whole
+        # close sequence.
         if self._maintenance_thread is not None:
             self._maintenance_thread.join(timeout=10.0)
             self._maintenance_thread = None
@@ -448,12 +495,11 @@ class Service:
         return self.settings
 
     def apply_netpath_settings(self, values: dict) -> dict:
-        # Only the keys netpath.db actually owns. self.settings is one dict
-        # holding both the global and the NetPath keys, so an unfiltered
-        # update() let a netpath:write account inject web_host, web_cert or
-        # session_idle_minutes into the live settings every other part of
-        # the app reads — persisted or not, save_settings only writes the
-        # NetPath subset, so the injected values simply sat there.
+        # Only the keys netpath.db owns. self.settings holds the global and
+        # the NetPath keys in one dict, so an unfiltered update() would let a
+        # netpath:write account inject web_host, web_cert or
+        # session_idle_minutes into the settings every other part of the app
+        # reads.
         from ..db import APP_DEFAULTS as NETPATH_KEYS
         self.settings.update({k: v for k, v in values.items() if k in NETPATH_KEYS})
         self.db.save_settings(self.settings)
@@ -462,84 +508,31 @@ class Service:
         self.bump_config()
         return self.settings
 
-    def apply_netflow_settings(self, values: dict) -> dict:
-        self.flow_settings.update(values)
-        self.flow_db.save_settings(self.flow_settings)
-        self._apply_interface_names()
-        self._apply_port_names()
-        self.collector.stop()
-        if self.flow_settings.get("enabled"):
-            self.collector.start(self.flow_settings)
-        self.log.add(SYSTEM, "NetFlow settings applied")
+    def apply_settings(self, scope: str, values: dict) -> dict:
+        """One module's settings saved and applied: merge, persist, restart
+        or reconfigure whatever the scope owns, log it, and bump /api/config.
+        Returns the scope's live settings dict. KeyError for a scope that is
+        not a module — `global` and `netpath` have their own methods."""
+        settings_attr, db_attr, label, apply_fn = _MODULE_SCOPES[scope]
+        settings = getattr(self, settings_attr)
+        settings.update(values)
+        getattr(self, db_attr).save_settings(settings)
+        apply_fn(self, settings)
+        self.log.add(SYSTEM, label)
         self.bump_config()
-        return self.flow_settings
+        return settings
 
-    def apply_syslog_settings(self, values: dict) -> dict:
-        self.syslog_settings.update(values)
-        self.syslog_db.save_settings(self.syslog_settings)
-        self.syslog.stop()
-        if self.syslog_settings.get("enabled"):
-            self.syslog.start(self.syslog_settings)
-        self.log.add(SYSTEM, "Syslog settings applied")
-        self.bump_config()
-        return self.syslog_settings
-
-    def apply_snmp_settings(self, values: dict) -> dict:
-        self.snmp_settings.update(values)
-        self.snmp_db.save_settings(self.snmp_settings)
-        self.snmp.stop()
-        if self.snmp_settings.get("enabled"):
-            self.snmp.start(self.snmp_settings)
-        self.log.add(SYSTEM, "SNMP trap settings applied")
-        self.bump_config()
-        return self.snmp_settings
-
-    def apply_ipam_settings(self, values: dict) -> dict:
-        self.ipam_settings.update(values)
-        self.ipam_db.save_settings(self.ipam_settings)
-        if self.ipam_settings.get("enabled", True):
-            self.ipam.start()
-        else:
-            self.ipam.stop()
-        self.log.add(SYSTEM, "IPAM settings applied")
-        self.bump_config()
-        return self.ipam_settings
-
-    def apply_nodes_settings(self, values: dict) -> dict:
-        self.nodes_settings.update(values)
-        self.nodes_db.save_settings(self.nodes_settings)
-        self.node_poller.reconfigure(self.nodes_settings)
-        self.log.add(SYSTEM, "Nodes settings applied")
-        self.bump_config()
-        return self.nodes_settings
-
-    def apply_alerts_settings(self, values: dict) -> dict:
-        self.alerts_settings.update(values)
-        self.alerts_db.save_settings(self.alerts_settings)
-        self.alert_engine.reconfigure(self.alerts_settings)
-        self.log.add(SYSTEM, "Alerts settings applied")
-        self.bump_config()
-        return self.alerts_settings
-
-    def apply_wireless_settings(self, values: dict) -> dict:
-        self.wireless_settings.update(values)
-        self.wireless_db.save_settings(self.wireless_settings)
-        self.wireless.stop()
-        if self.wireless_settings.get("enabled", True):
-            self.wireless.start(self.wireless_settings)
-        self.log.add(SYSTEM, "Wireless settings applied")
-        self.bump_config()
-        return self.wireless_settings
-
-    def apply_configrx_settings(self, values: dict) -> dict:
-        self.configrx_settings.update(values)
-        self.configrx_db.save_settings(self.configrx_settings)
-        self.configrx.stop()
-        if self.configrx_settings.get("enabled", True):
-            self.configrx.start(self.configrx_settings)
-        self.log.add(SYSTEM, "ConfigRX settings applied")
-        self.bump_config()
-        return self.configrx_settings
+    def _trim_db(self, key: str, db, label: str, noun: str, **kwargs) -> None:
+        """Trim one database to its `max_*_db_mb` setting, if that setting is
+        set at all — 0 means no cap, and no trim call. Extra kwargs go
+        straight to trim_to_size (the trace database passes its budget)."""
+        cap = int(self.settings.get(key, 0)) * 1024 * 1024
+        if not cap:
+            return
+        removed = db.trim_to_size(cap, **kwargs)
+        if removed:
+            self.log.add(SYSTEM, f"{label} over its {cap // 1048576} MB cap: "
+                                 f"removed {removed} {noun}")
 
     # -------------------------------------------------------- MIB catalog
 
@@ -653,10 +646,8 @@ class Service:
             seeded = True
         if seeded:
             # The bundled set is a dependency graph, not a list: Q-BRIDGE-MIB
-            # hangs off P-BRIDGE-MIB, ENTITY-SENSOR-MIB off ENTITY-MIB. One
-            # sweep in filename order happens to work today, but a file added
-            # later would silently land half-resolved, so finish the job the
-            # way the catalog installer does.
+            # hangs off P-BRIDGE-MIB, ENTITY-SENSOR-MIB off ENTITY-MIB, so one
+            # sweep in filename order can leave a file half-resolved.
             summary = resolve_all(self.nodes_db, max_bytes)
             self.nodes_settings["seeded_mib_files"] = ",".join(sorted(already))
             self.nodes_db.save_settings(self.nodes_settings)
@@ -853,38 +844,20 @@ class Service:
             self._maintenance_lock.release()
 
     def _run_maintenance_body(self, force: bool = False) -> None:
-        # A forced pass runs synchronously on the HTTP thread that asked for
-        # it (apply_global_settings, on every settings save) rather than on
-        # the maintenance timer thread. netpath.db is the only store here
-        # with per-hop rows at real fleet volume, and at db.TRIM_BUDGET_S
-        # its own prune()/trim_to_size() calls were measured stalling that
-        # request for up to ~30s each with a backlog -- three settings
-        # saves in a row, three ~30s hangs. The periodic timer call
-        # (force=False) keeps the full budget, since it isn't blocking a
-        # request and a real backlog still needs to be worked down; a
-        # forced call gets a short one instead of skipping retention
-        # outright, so a burst of settings saves can't outrun what
-        # retention is supposed to enforce -- it just chips away at a large
-        # backlog across more calls, the same as the periodic path already
-        # does once TRIM_PASSES or its own budget runs out in one call.
+        # A forced pass runs on the HTTP thread that asked for it
+        # (apply_global_settings, on every settings save), so netpath.db --
+        # the only store here with per-hop rows at fleet volume -- gets a
+        # short budget rather than stalling that request while it works down
+        # a backlog. The periodic timer call keeps the full budget; a forced
+        # one still does some retention work, so a burst of settings saves
+        # cannot outrun what retention enforces.
         prune_budget = FORCED_PRUNE_BUDGET_S if force else TRIM_BUDGET_S
         self.db.prune(float(self.settings.get("trace_retention_days", 90)),
                       budget_s=prune_budget)
-        cap = int(self.settings.get("max_trace_db_mb", 0)) * 1024 * 1024
-        if cap:
-            removed = self.db.trim_to_size(cap, budget_s=prune_budget)
-            if removed:
-                self.log.add(SYSTEM, f"Trace database over its "
-                                     f"{cap // 1048576} MB cap: removed "
-                                     f"{removed} oldest traces")
-
-        cap = int(self.settings.get("max_flow_db_mb", 0)) * 1024 * 1024
-        if cap:
-            removed = self.flow_db.trim_to_size(cap)
-            if removed:
-                self.log.add(SYSTEM, f"Flow database over its "
-                                     f"{cap // 1048576} MB cap: removed "
-                                     f"{removed} oldest flow records")
+        self._trim_db("max_trace_db_mb", self.db, "Trace database",
+                      "oldest traces", budget_s=prune_budget)
+        self._trim_db("max_flow_db_mb", self.flow_db, "Flow database",
+                      "oldest flow records")
 
         self.flow_db.prune(float(self.flow_settings.get("retention_days", 14)),
                            int(self.flow_settings.get("max_flows", 5_000_000)))
@@ -909,21 +882,10 @@ class Service:
         self.ipam_db.prune_scope_history(
             float(self.ipam_settings.get("dhcp_history_days", 35)))
 
-        cap = int(self.settings.get("max_syslog_db_mb", 0)) * 1024 * 1024
-        if cap:
-            removed = self.syslog_db.trim_to_size(cap)
-            if removed:
-                self.log.add(SYSTEM, f"Syslog database over its "
-                                     f"{cap // 1048576} MB cap: removed "
-                                     f"{removed} oldest messages")
-
-        cap = int(self.settings.get("max_snmp_db_mb", 0)) * 1024 * 1024
-        if cap:
-            removed = self.snmp_db.trim_to_size(cap)
-            if removed:
-                self.log.add(SYSTEM, f"SNMP trap database over its "
-                                     f"{cap // 1048576} MB cap: removed "
-                                     f"{removed} oldest traps")
+        self._trim_db("max_syslog_db_mb", self.syslog_db, "Syslog database",
+                      "oldest messages")
+        self._trim_db("max_snmp_db_mb", self.snmp_db, "SNMP trap database",
+                      "oldest traps")
 
         self.wireless_db.prune_ap_events()
 
@@ -934,20 +896,13 @@ class Service:
             self.log.add(SYSTEM, f"ConfigRX: removed {removed} old backup(s) "
                                  f"past retention")
 
-        cap = int(self.settings.get("max_ipam_db_mb", 0)) * 1024 * 1024
-        if cap:
-            removed = self.ipam_db.trim_to_size(cap)
-            if removed:
-                self.log.add(SYSTEM, f"IPAM database over its "
-                                     f"{cap // 1048576} MB cap: removed "
-                                     f"{removed} oldest scan records")
+        self._trim_db("max_ipam_db_mb", self.ipam_db, "IPAM database",
+                      "oldest scan records")
 
         # Before the prune, not after: compact_rollup summarises complete
         # hours of raw samples into samples_hourly, and pruning first would
         # delete an hour before it had been summarised. A chart wider than
-        # three days reads only the rollups, so this is what puts anything
-        # in a month- or year-wide window at all — it was written in 4.24
-        # and never called from anywhere until now.
+        # three days reads only the rollups.
         written = self.nodes_db.compact_rollup()
         if written:
             self.log.add(SYSTEM, f"Nodes: summarised {written} metric-hour(s) "
@@ -966,29 +921,15 @@ class Service:
         self.nodes_db.prune_mac_entries(
             float(self.nodes_settings.get("mac_table_retention_days", 7)) * 86400)
         # LLDP/CDP neighbour rows nothing has refreshed in as long — the
-        # same present=0-then-age-out shape mac_entries uses (see the
-        # neighbors schema comment), so the same retention setting governs
-        # both rather than adding a second knob for what is the same
-        # "device stopped being walked" problem. prune_neighbors has existed
-        # since the neighbours table shipped but was never actually called
-        # from anywhere, so a device dropped from the walk schedule kept its
-        # present=1 rows forever and the table only ever grew.
+        # same present=0-then-age-out shape mac_entries uses, so the same
+        # retention setting governs both rather than adding a second knob for
+        # the same "device stopped being walked" problem.
         self.nodes_db.prune_neighbors(
             float(self.nodes_settings.get("mac_table_retention_days", 7)) * 86400)
-        cap = int(self.settings.get("max_nodes_db_mb", 0)) * 1024 * 1024
-        if cap:
-            removed = self.nodes_db.trim_to_size(cap)
-            if removed:
-                self.log.add(SYSTEM, f"Nodes database over its "
-                                     f"{cap // 1048576} MB cap: removed "
-                                     f"{removed} oldest samples")
+        self._trim_db("max_nodes_db_mb", self.nodes_db, "Nodes database",
+                      "oldest samples")
 
         self.alerts_db.prune(
             float(self.alerts_settings.get("retention_days", 180)))
-        cap = int(self.settings.get("max_alerts_db_mb", 0)) * 1024 * 1024
-        if cap:
-            removed = self.alerts_db.trim_to_size(cap)
-            if removed:
-                self.log.add(SYSTEM, f"Alerts database over its "
-                                     f"{cap // 1048576} MB cap: removed "
-                                     f"{removed} oldest resolved alerts")
+        self._trim_db("max_alerts_db_mb", self.alerts_db, "Alerts database",
+                      "oldest resolved alerts")

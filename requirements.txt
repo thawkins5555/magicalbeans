@@ -1,13 +1,6 @@
 PySide6>=6.5
-# The one deliberate exception to this app's stdlib-only dependency rule:
-# ConfigRX's SSH connectivity, chosen specifically because it keeps a
-# device's SSH password entirely in-process (never on a command line or
-# in a process list) — see CREDENTIAL-SECURITY.md.
-# Capped below 5.0: paramiko 5 deleted every SHA-1 key exchange outright
-# (paramiko.kex_group1 is gone, kex_gex keeps only KexGexSHA256, _key_info
-# has no plain ssh-rsa), so a switch that offers nothing newer cannot be
-# reached at all and no setting brings it back. 3.x still implements them
-# and merely leaves them out of its preferred list, which ConfigRX puts
-# back when allow_legacy_ssh is on. Raise this cap once the fleet you back
-# up speaks a modern key exchange.
+# The one non-stdlib dependency: ConfigRX's SSH connectivity (keeps a
+# device's SSH password entirely in-process — see CREDENTIAL-SECURITY.md).
+# Capped below 5.0: paramiko 5 removed SHA-1 key exchange outright, so a
+# switch offering nothing newer becomes unreachable; 3.x still offers it via allow_legacy_ssh.
 paramiko>=3.4,<5

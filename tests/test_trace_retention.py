@@ -1,55 +1,9 @@
-"""O-6x: `netpath.db`'s age-based trace retention (`trace_retention_days`) was
-never actually applied by the automatic maintenance sweep.
-
-`Service._run_maintenance_body` (netpath/web/service.py) calls `.prune(...)`
-on every other database it owns -- flow_db, syslog_db, snmp_db, ipam_db,
-nodes_db, alerts_db, configrx_db -- passing each the matching *_retention_days
-setting. For `self.db` (netpath.db, the trace store) it called only
-`trim_to_size(cap)`, a *size* cap, and never `self.db.prune(days)`, the *age*
-retention the Settings UI's "Keep traces for N days" field and
-`trace_retention_days` promise. The only caller of `db.prune()` was the manual
-`POST /api/maintenance {"action": "prune_traces"}` action in api.py -- so a
-configured retention period did nothing unless an administrator clicked a
-button. This suite proves the automatic path now applies it, using a real
-`Service` and its real periodic sweep entry point (`run_maintenance`) rather
-than calling `db.prune()` directly, since `db.prune()` working in isolation
-(covered by test_collectors_hardening.py) was never in question -- only
-whether anything automatic ever calls it.
-
-Sections 3 and 4 cover a hazard that making prune() automatic exposed:
-`trace_retention_days` had no server-side range check (only the Settings
-page's own `min="1"` input, which an API client can skip). Before this
-change that was nearly harmless -- prune() only ran when an admin clicked
-"Prune traces now". Now it runs every maintenance interval, and `prune(0)`
-computes `cutoff = time.time() - 0`, i.e. now, deleting every trace, every
-interval, forever. `_GLOBAL_SETTINGS_RANGES` in api.py now carries
-`"trace_retention_days": (1, 3650)`; section 3 proves that floor is actually
-enforced over HTTP, and section 4 proves the automatic sweep, left at its
-shipped 90-day default, prunes only what has actually aged out and nothing
-still inside the window.
-
-Sections 5-7 cover a follow-on review finding: making prune() automatic
-exposed a *different* way retention could destroy in-window data.
-`Service._run_maintenance_body` ran `self.db.prune(...)` and then
-`self.db.trim_to_size(cap)` back to back. trim_to_size decided how much to
-delete from `size_bytes()` -- the raw file, which counts freelist pages and
-the WAL as if they were live rows -- so a prune() that spent its whole
-budget deleting and never reached reclaim (measured: zero pages freed after
-a 30s delete pass on a 1.5M-row backlog) left a large freelist that
-trim_to_size then read as "still over cap" and deleted real, in-retention
-rows to correct -- measured at 22% of in-retention traces lost in one
-maintenance pass on a synthetic 2M-trace database. Section 5 reproduces
-that shape without needing millions of rows. Section 6 covers the same
-review's second finding: a settings save now runs this same prune/trim pair
-synchronously on the HTTP thread, and at the periodic sweep's 30s budget
-that stalled the request by up to 30s per save. Section 7 closes the
-loophole in section 3's HTTP-only floor: a `trace_retention_days` of 0
-already sitting in the settings table (from before the floor existed, or
-from a script) reaches coerce_settings(strict=False), which checks type but
-never range, so it was never re-clamped on load.
-
-Plain script, no pytest: run it, read the PASS lines, non-zero exit on
-failure."""
+"""Age-based trace retention (`trace_retention_days`) through the real
+`Service` maintenance sweep (`run_maintenance`), not `db.prune()` in isolation.
+Proves: the sweep prunes aged-out traces and nothing inside the window; the
+(1, 3650) floor is enforced over HTTP and re-clamped on load when a 0 already
+sits in the settings table; trim_to_size after prune never deletes in-retention
+rows over freelist/WAL bloat; and a settings save does not stall on the prune."""
 import http.client
 import json
 import os
@@ -434,7 +388,7 @@ shutil.rmtree(os.path.join(TMPDIR, "t6b"), ignore_errors=True)
 # --------------------- 7. a trace_retention_days of 0 already sitting in
 # the settings table -- written before the (1, 3650) floor existed (section
 # 3 above), or by a script that bypassed the API entirely -- must not reach
-# prune() unclamped. coerce_settings(strict=False) (settingsutil.py) checks
+# prune() unclamped. coerce_settings(strict=False) (sqlitebase.py) checks
 # only type, never range, so this floor has to be applied again right after
 # it, on every load, not just on save.
 

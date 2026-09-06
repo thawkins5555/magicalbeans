@@ -1,9 +1,7 @@
 name: tests
 
-# The review's finding U-N11/§6 #13: the suites in tests/ are good and nothing
-# ran them. Two jobs here — the Python suites on both platforms this
-# application ships to, and the browser walk that PERFORMANCE_REVIEW.md used to
-# claim existed. See tests/README.md.
+# Runs the Python suites on both platforms this application ships to, plus
+# a browser walk. See tests/README.md.
 
 on:
   push:
@@ -32,9 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # test_upgrade_from_previous.py checks out the previous main commit
-          # and creates every database with the previous release's own code.
-          # With a shallow clone it finds no history and skips that half.
+          # test_upgrade_from_previous.py needs the previous commit's history.
           fetch-depth: 0
 
       - uses: actions/setup-python@v5
@@ -46,24 +42,12 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends iputils-ping traceroute
-          # Deliberate. test_nodepoll_e2e.py used to pass only on machines with
-          # no `ping` binary: 127.0.0.1 answers ICMP, unreachable_ping_only kept
-          # the device 'up', and it never reached 'down'. It now disables ping
-          # on the test profile, and this line is what keeps that honest.
+          # test_nodepoll_e2e.py depends on ping actually working here, not just being absent.
           ping -c1 -W1 127.0.0.1
 
-      - name: Install paramiko (Linux)
-        if: runner.os == 'Linux'
-        # The only third-party package this repository allows, and only for
-        # ConfigRX and the SSH terminal. Without it, five suites
-        # (test_configrx_cisco_platforms.py, test_configrx_industrial.py,
-        # test_configrx_search_backfill.py, test_ssh_hostkeys.py,
-        # test_ssh_terminal.py) exit 77 and run_all.py reports SKIP. Installed
-        # on both legs of the matrix below, so those suites run on Windows too.
-        run: python -m pip install --disable-pip-version-check "paramiko<5"
-
-      - name: Install paramiko (Windows)
-        if: runner.os == 'Windows'
+      - name: Install paramiko
+        # The only third-party package this repository allows; without it,
+        # five ConfigRX/SSH suites exit 77 and run_all.py reports SKIP.
         run: python -m pip install --disable-pip-version-check "paramiko<5"
 
       - name: Report the environment
@@ -78,8 +62,7 @@ jobs:
 
       - name: Run the suites (Windows)
         if: runner.os == 'Windows'
-        # `python3` is not reliably on PATH on the Windows images; setup-python
-        # always provides `python`. Same script, same behaviour.
+        # setup-python guarantees `python`, not reliably `python3`, on Windows.
         run: python tests/run_all.py
 
   ui-walk:
@@ -118,10 +101,7 @@ jobs:
 
       - name: Start the simulated fleet
         run: |
-          # One UDP socket per simulated device on 127.0.0.2 upwards, all on
-          # port 161, so the unmodified poller polls them as it would real gear.
-          # Port 161 is privileged, hence sudo; -E keeps the environment and the
-          # explicit PATH keeps the setup-python interpreter.
+          # Binds real port 161 (privileged, hence sudo) so the unmodified poller can reach these devices.
           ulimit -n 8192
           mkdir -p demo/out
           sudo -E env "PATH=$PATH" python3 -u demo/fleet.py \
@@ -136,10 +116,7 @@ jobs:
 
       - name: Start the application
         run: |
-          # demo/bin goes first on PATH so NetPath's traceroute and the poller's
-          # ping are the scripted stand-ins that know about the simulated fleet.
-          # Root again: the trap (162), syslog (514) and NetFlow (2055)
-          # listeners bind privileged ports once seeding enables them.
+          # demo/bin first on PATH so ping/traceroute are the scripted stand-ins; sudo binds the privileged trap/syslog/NetFlow ports once seeding enables them.
           mkdir -p demo/out/data
           sudo -E env "PATH=$PWD/demo/bin:$PATH" python3 -u -m netpath --headless \
               --host 127.0.0.1 --port "$APP_PORT" \
@@ -154,18 +131,12 @@ jobs:
       - name: Check the forced password change on a pristine instance
         if: hashFiles('tests/ui/pristine_login.mjs') != ''
         run: |
-          # Must run BEFORE seeding: seed.py's first step changes the admin
-          # password and clears must_change, which is the state this walks in
-          # before. The app started above is still untouched, so no second
-          # instance is needed — and the check only observes, leaving the
-          # shipped admin/admin and must_change exactly as it found them.
+          # Must run before seeding, which clears must_change; this step only observes.
           node tests/ui/pristine_login.mjs --base "http://127.0.0.1:$APP_PORT"
 
       - name: Seed devices, profiles and targets
         run: |
-          # Writes demo/out/creds.txt, which the walk signs in with. It also
-          # clears the forced first-run password change, which the walk cannot
-          # do for itself.
+          # Writes demo/out/creds.txt (the walk's login) and clears the forced first-run password change.
           sudo chown -R "$USER" demo/out
           python3 demo/seed.py --base "http://127.0.0.1:$APP_PORT" \
               --count "$FLEET_COUNT" --out demo/out
@@ -184,9 +155,7 @@ jobs:
       - name: Check a failed job leaves no unhandled rejection
         if: hashFiles('tests/ui/failed_job_no_pageerror.mjs') != ''
         run: |
-          # Deliberately provokes a server refusal, so it cannot live in
-          # walk.mjs — that walk asserts an admin session sees no console error
-          # and no response >= 400, which this would trip on purpose.
+          # Deliberately provokes a server refusal, so it cannot live in walk.mjs's own clean-run assertion.
           node tests/ui/failed_job_no_pageerror.mjs \
               --base "http://127.0.0.1:$APP_PORT" --creds demo/out/creds.txt
 

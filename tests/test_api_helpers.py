@@ -1,28 +1,9 @@
-"""The API-layer defects a hostile full-codebase review of 4.50.0 found, each
-one pinned by the request that used to produce the wrong answer.
-
-Everything goes through a real `Service` and `WebServer` over loopback HTTP
-with real sessions and real permission checks, the same way test_alerts_api.py
-does — three of these findings are about who may do what, and calling the
-handlers directly would answer that question dishonestly.
-
-What is covered, and why each one mattered:
-
-  1. A settings:write grant, deliberately weaker than admin, could rewrite the
-     session lifetime for every account on the host and repoint the listener's
-     TLS material. Those keys were classified as sensitive server internals
-     but never added to ADMIN_ONLY_SETTINGS.
-  2. A stored ConfigRX backup was served verbatim to a ConfigRX-read caller
-     whenever the row's `redacted` flag was set — and that flag records "we
-     ran the redactor", not "the redactor removed something".
-  3. A threshold rule could be saved with a blank threshold or clear
-     threshold, producing a rule that either never clears or breaches on
-     every device at once.
-  4. An oversized integer in a route or a query answered 500 rather than 400.
-  5. An unbounded time window sized an allocation from t1 - t0.
-  6. A CSV export wrote a cell beginning "=" as the spreadsheet's own formula.
-  7. Deleting a device dropped its Nodes row before its ConfigRX credentials.
-  8. ?limit=-1 on the discovery list read as SQLite's "no limit".
+"""API-layer contracts, each pinned by the request that would give the wrong
+answer, through a real `Service` and `WebServer` over loopback HTTP: session
+lifetime and TLS settings are admin-only; a ConfigRX backup is never served
+unredacted to a read-only caller; a threshold rule needs both thresholds;
+oversized integers and unbounded time windows answer 400; a CSV cell cannot
+start a formula; device delete drops ConfigRX credentials; ?limit=-1 clamps.
 """
 import http.client
 import json

@@ -12,10 +12,17 @@
     wireless: 'FortiWireless', configrx: 'ConfigRX', system: 'System',
     error: 'Errors',
   };
-  const STATUS_COLOR = {
-    ok: 'var(--ok)', warn: 'var(--warn)', fail: 'var(--fail)',
-    blocked: 'var(--blocked)', error: 'var(--error)', none: 'var(--line)',
+  /* app.css's .status-fg base+modifier set, so a worker's status word is
+     coloured by a class rather than by an inline style mixing this file's
+     own copy of the token names in. An unlisted status stays inherit. */
+  const STATUS_CLASS = {
+    ok: 'status-fg', warn: 'status-fg warn', fail: 'status-fg bad',
+    blocked: 'status-fg blocked', error: 'status-fg err', none: 'status-fg line',
   };
+  function statusSpan(status) {
+    const cls = STATUS_CLASS[status];
+    return `<span${cls ? ` class="${cls}"` : ''}>${escape(status)}</span>`;
+  }
 
   const view = {
     seq: 0, events: [], paused: false, selected: null, targets: new Set(),
@@ -32,14 +39,8 @@
     discScans: [], discCells: [], discFetchedAt: 0,
   };
 
-  // One implementation, in app.js. This was twelve copies of the same
-  // three lines, which is how one of them came to be missing a
-  // character while the others were not.
   const escape = App.escapeHtml;
 
-  // One relative-time vocabulary for the whole product: App.ago (app.js).
-  // This copy used to turn into a bare wall clock after ninety minutes, so a
-  // worker last run three days ago read "03:14:22".
   const ago = (ts) => App.ago(ts, '\u2014');
 
   function until(ts) {
@@ -73,15 +74,11 @@
     return { text: `${value.toFixed(1)}s`, colour: 'var(--accent)' };
   }
 
-  // Written only when the rendered string actually changes: idle, a worker's
-  // elapsed time rounds to the same tenth of a second across several 100ms
-  // beats, and setting textContent/style.color to the value they already
-  // hold still counts as a DOM mutation, so writing unconditionally here
-  // used to churn the Debug page thousands of times over an idle ten seconds.
-  function setCellText(cell, text) {
-    if (cell.textContent !== text) cell.textContent = text;
-  }
-
+  // Written only when the value actually changes: idle, a worker's elapsed
+  // time rounds to the same tenth of a second across several 100ms beats,
+  // and writing it unconditionally still queues a DOM mutation. The text
+  // goes through App.setText; app.js has no style.color equivalent, so
+  // this one guard stays here.
   function setCellColour(cell, colour) {
     if (cell.style.color !== colour) cell.style.color = colour;
   }
@@ -93,7 +90,7 @@
         const worker = view.workers[index];
         if (!worker || worker.elapsed === null || worker.elapsed === undefined) return;
         const { text, colour } = elapsedText(worker, extra);
-        setCellText(cell, text);
+        App.setText(cell, text);
         setCellColour(cell, colour);
       });
     }
@@ -101,28 +98,28 @@
       const extra = (Date.now() - view.dnsFetchedAt) / 1000;
       view.dnsCells.forEach((cell, index) => {
         const worker = view.dnsWorkers[index];
-        if (worker) setCellText(cell, `${(worker.elapsed + extra).toFixed(1)}s`);
+        if (worker) App.setText(cell, `${(worker.elapsed + extra).toFixed(1)}s`);
       });
     }
     if (view.ipamCells.length) {
       const extra = (Date.now() - view.ipamFetchedAt) / 1000;
       view.ipamCells.forEach((cell, index) => {
         const worker = view.ipamWorkers[index];
-        if (worker) setCellText(cell, `${(worker.elapsed + extra).toFixed(1)}s`);
+        if (worker) App.setText(cell, `${(worker.elapsed + extra).toFixed(1)}s`);
       });
     }
     if (view.nodeCells.length) {
       const extra = (Date.now() - view.nodeFetchedAt) / 1000;
       view.nodeCells.forEach((cell, index) => {
         const worker = view.nodeWorkers[index];
-        if (worker) setCellText(cell, `${(worker.elapsed + extra).toFixed(1)}s`);
+        if (worker) App.setText(cell, `${(worker.elapsed + extra).toFixed(1)}s`);
       });
     }
     if (view.discCells.length) {
       const extra = (Date.now() - view.discFetchedAt) / 1000;
       view.discCells.forEach((cell, index) => {
         const scan = view.discScans[index];
-        if (scan) setCellText(cell, `${(scan.elapsed + extra).toFixed(1)}s`);
+        if (scan) App.setText(cell, `${(scan.elapsed + extra).toFixed(1)}s`);
       });
     }
   }
@@ -147,8 +144,7 @@
         worker.duration ? `${worker.duration.toFixed(1)}s` : '—',
         until(worker.next_run),
         `${worker.interval_s}s`,
-        `<span style="color:${STATUS_COLOR[worker.status] || 'inherit'}">${
-          escape(worker.status)}</span>`,
+        statusSpan(worker.status),
       ].map((value) => `<td>${value}</td>`).join('');
       body.appendChild(tr);
     }
@@ -157,29 +153,36 @@
     for (const row of body.children) view.cells.push(row.children[3]);
   }
 
+  /* The four live-worker lists below are one table four times: a caption, a
+     header row, one sentence when nothing is running, and a last column
+     whose seconds fastTick keeps counting up locally. Returns those last
+     cells, in row order, for the caller to hand to fastTick. */
+  function drawWorkerTable(id, caption, columns, rows, empty, cells) {
+    const table = App.el(id);
+    table.innerHTML = `<caption class="sr-only">${caption}</caption><thead><tr>${
+      columns.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
+    const body = document.createElement('tbody');
+    if (!rows.length) App.emptyRow(body, columns, empty);
+    for (const row of rows) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = cells(row).map((value) => `<td>${value}</td>`).join('');
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+    App.wireRowKeyboard(body);
+    const last = columns.length - 1;
+    return [...body.children]
+      .filter((tr) => tr.children.length > last).map((tr) => tr.children[last]);
+  }
+
   const DNS_COLUMNS = ['Address', 'Elapsed'];
 
   function drawDnsWorkers(workers) {
     view.dnsWorkers = workers;
     view.dnsFetchedAt = Date.now();
-    view.dnsCells = [];
-    const table = App.el('dbg-dns');
-    table.innerHTML =
-      `<caption class="sr-only">Name-lookup workers</caption><thead><tr>${DNS_COLUMNS.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
-    const body = document.createElement('tbody');
-    if (!workers.length) {
-      body.innerHTML = '<tr><td colspan="2" class="empty">Nothing pending — every known address is already named or not due for a re-check</td></tr>';
-    }
-    for (const worker of workers) {
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${escape(worker.ip)}</td><td>${worker.elapsed.toFixed(1)}s</td>`;
-      body.appendChild(tr);
-    }
-    table.appendChild(body);
-    App.wireRowKeyboard(body);
-    for (const row of body.children) {
-      if (row.children.length > 1) view.dnsCells.push(row.children[1]);
-    }
+    view.dnsCells = drawWorkerTable('dbg-dns', 'Name-lookup workers', DNS_COLUMNS, workers,
+      'Nothing pending — every known address is already named or not due for a re-check',
+      (w) => [escape(w.ip), `${w.elapsed.toFixed(1)}s`]);
   }
 
   const IPAM_COLUMNS = ['Agent', 'Elapsed'];
@@ -187,25 +190,10 @@
   function drawIpamWorkers(workers) {
     view.ipamWorkers = workers;
     view.ipamFetchedAt = Date.now();
-    view.ipamCells = [];
-    const table = App.el('dbg-ipam');
-    table.innerHTML =
-      `<caption class="sr-only">IPAM workers</caption><thead><tr>${IPAM_COLUMNS.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
-    const body = document.createElement('tbody');
-    if (!workers.length) {
-      body.innerHTML = '<tr><td colspan="2" class="empty">Nothing running — no subnet scan or DHCP poll in progress right now</td></tr>';
-    }
-    for (const worker of workers) {
-      const tr = document.createElement('tr');
-      const kind = worker.kind === 'poll' ? 'DHCP poll' : 'Subnet scan';
-      tr.innerHTML = `<td>${kind}: ${escape(worker.label)}</td><td>${worker.elapsed.toFixed(1)}s</td>`;
-      body.appendChild(tr);
-    }
-    table.appendChild(body);
-    App.wireRowKeyboard(body);
-    for (const row of body.children) {
-      if (row.children.length > 1) view.ipamCells.push(row.children[1]);
-    }
+    view.ipamCells = drawWorkerTable('dbg-ipam', 'IPAM workers', IPAM_COLUMNS, workers,
+      'Nothing running — no subnet scan or DHCP poll in progress right now',
+      (w) => [`${w.kind === 'poll' ? 'DHCP poll' : 'Subnet scan'}: ${escape(w.label)}`,
+        `${w.elapsed.toFixed(1)}s`]);
   }
 
   const NODE_COLUMNS = ['Device', 'Elapsed'];
@@ -213,25 +201,10 @@
   function drawNodeWorkers(workers) {
     view.nodeWorkers = workers;
     view.nodeFetchedAt = Date.now();
-    view.nodeCells = [];
-    const table = App.el('dbg-nodes');
-    table.innerHTML =
-      `<caption class="sr-only">Poller workers</caption><thead><tr>${NODE_COLUMNS.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
-    const body = document.createElement('tbody');
-    if (!workers.length) {
-      body.innerHTML = '<tr><td colspan="2" class="empty">Nothing polling right now</td></tr>';
-    }
-    for (const worker of workers) {
-      const tr = document.createElement('tr');
-      const kind = worker.kind === 'queued' ? 'Queued' : 'Polling';
-      tr.innerHTML = `<td>${kind}: ${escape(worker.label)}</td><td>${worker.elapsed.toFixed(1)}s</td>`;
-      body.appendChild(tr);
-    }
-    table.appendChild(body);
-    App.wireRowKeyboard(body);
-    for (const row of body.children) {
-      if (row.children.length > 1) view.nodeCells.push(row.children[1]);
-    }
+    view.nodeCells = drawWorkerTable('dbg-nodes', 'Poller workers', NODE_COLUMNS, workers,
+      'Nothing polling right now',
+      (w) => [`${w.kind === 'queued' ? 'Queued' : 'Polling'}: ${escape(w.label)}`,
+        `${w.elapsed.toFixed(1)}s`]);
   }
 
   const DISC_COLUMNS = ['Scan', 'Progress', 'Found', 'Elapsed'];
@@ -239,27 +212,10 @@
   function drawDiscScans(scans) {
     view.discScans = scans;
     view.discFetchedAt = Date.now();
-    view.discCells = [];
-    const table = App.el('dbg-disc');
-    table.innerHTML =
-      `<caption class="sr-only">Discovery scans</caption><thead><tr>${DISC_COLUMNS.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
-    const body = document.createElement('tbody');
-    if (!scans.length) {
-      body.innerHTML = '<tr><td colspan="4" class="empty">No discovery scan running right now</td></tr>';
-    }
-    for (const scan of scans) {
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${escape(scan.label)}</td>` +
-        `<td>${scan.probed} of ${scan.total} probed</td>` +
-        `<td>${scan.identified} SNMP · ${scan.responded} ping</td>` +
-        `<td>${scan.elapsed.toFixed(1)}s</td>`;
-      body.appendChild(tr);
-    }
-    table.appendChild(body);
-    App.wireRowKeyboard(body);
-    for (const row of body.children) {
-      if (row.children.length > 3) view.discCells.push(row.children[3]);
-    }
+    view.discCells = drawWorkerTable('dbg-disc', 'Discovery scans', DISC_COLUMNS, scans,
+      'No discovery scan running right now',
+      (row) => [escape(row.label), `${row.probed} of ${row.total} probed`,
+        `${row.identified} SNMP · ${row.responded} ping`, `${row.elapsed.toFixed(1)}s`]);
   }
 
   function categoriesOn() {

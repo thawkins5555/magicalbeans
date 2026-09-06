@@ -1,30 +1,9 @@
-"""A child alert that opened before its parent, or before an ancestor's
-outage covered it, must not sit on the Alerts page for the rest of the
-outage.
-
-Two separate gaps this closes, both in alertengine.py:
-
-  Gap 1 (alertengine.py's own _absorb_subordinates already closes this one
-  for the SAME device, and this file's first section only proves it stays
-  closed): a device's own device_down opens after packet_loss_high (say)
-  already did — climbing loss is visible several polls before "down" is
-  confirmed by consecutive failures, so the child always arrives first.
-  _absorb_subordinates resolves it the moment device_down opens.
-
-  Gap 2 (this file's real subject, and the one alertengine.py did not
-  already close): a device whose OWN device_down alert never opens at all,
-  because an ancestor's outage rolled it up first (_rollup_parent's
-  upstream-outage case, or _absorb_downstream the other way round) — was
-  still left with its OTHER already-open children on the page. The
-  absorption every other child gets is hung off its OWN device_down
-  opening (is_new in _apply), and a topology-covered device's device_down
-  never does that, in either direction. _rollup_parent's case 4 and
-  _absorb_children_of close it: a child rolls up exactly as far as
-  device_down itself does, ancestor included.
-
-Drives engine._tick() directly, the same harness shape test_alert_engine_
-fixes.py uses, for the same reason: every fix here is about what one tick
-does, and a real thread would make the assertions time-dependent.
+"""A child alert that opened before its parent, or before an ancestor's outage
+covered it, must not sit on the Alerts page for the rest of the outage.
+Section 1 proves _absorb_subordinates resolves a device's own earlier
+children when its device_down opens; the rest prove _rollup_parent's case 4
+and _absorb_children_of roll a child up exactly as far as device_down itself
+does, ancestor included. Drives engine._tick() like test_alert_engine.py.
 """
 import os
 import sqlite3
@@ -47,7 +26,7 @@ _SEQ = [0]
 def build(**settings):
     """(nodes, alerts, snmp, syslog, ipam, engine) on fresh temp databases.
 
-    rollup_enabled defaults on here (unlike test_alert_engine_fixes.py's
+    rollup_enabled defaults on here (unlike test_alert_engine.py's
     build(), which defaults it off) — every section in this file is about
     rollup behaviour specifically, so there is no case here that wants it
     off by default.
@@ -77,7 +56,7 @@ def add_device(nodes, ip, name, **fields):
 
 def set_status(nodes, device_ids, status):
     """The status column a poll would have written — see
-    test_alert_engine_fixes.py's identical helper for why this is written
+    test_alert_engine.py's identical helper for why this is written
     directly rather than through record_poll."""
     conn = sqlite3.connect(nodes.path)
     conn.executemany("UPDATE devices SET status = ? WHERE id = ?",
@@ -105,7 +84,7 @@ def open_rows(alerts, rule_key, entity_id=None):
 def open_loss(nodes, engine, did, base, offsets=(0, 65)):
     """Records ping_loss_pct high enough to breach packet_loss_high at each
     offset (seconds from `base`), ticking after each — the same two-sample
-    pattern test_alert_engine_fixes.py's F11 section uses to get a child
+    pattern test_alert_engine.py's F11 section uses to get a child
     alert open before anything else has happened to the device."""
     for offset in offsets:
         nodes.record_metric_sample(did, "ping_loss_pct", "Loss", "%", "gauge",

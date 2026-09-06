@@ -1,26 +1,9 @@
-"""Wave 4, job 2: a diff between two of a device's stored ConfigRX backups
-(Tier 2 — "the hashes that detect the change are already stored").
-
-Covers, first against configrx.diff_texts() directly (the stdlib difflib
-wiring, no server involved), then against a real Service+WebServer:
-
-  - diff_texts() produces the expected unified-diff hunks for two known
-    texts, and an empty diff for two identical ones.
-  - GET /api/configrx/diff redacts BOTH backups a second time regardless of
-    how they were stored: a secret present in both never appears in the
-    diff, and a secret that merely changed value renders as no line at all
-    (both sides collapse onto the same "<redacted>" token) — the documented
-    choice, see api.get_configrx_diff's own docstring.
-  - Two backups with the same content hash (the same row picked twice, or
-    two distinct rows that happen to match) take the empty-diff fast path.
-  - The default adjacent pair (no from/to) diffs the two most recent
-    backups; from/to name any other pair; a pair spanning two different
-    devices, or a device with fewer than two backups, is refused.
-  - The gate matches get_configrx_backup exactly (4.49.0: diffing two
-    backups a configrx:read account can already fetch individually is not
-    a write, so it no longer needs one): a configrx:write account may
-    diff, so may a configrx:read-only account, and an account holding
-    write on an unrelated module is refused.
+"""Diffing two of a device's stored ConfigRX backups: configrx.diff_texts()
+directly (expected hunks; empty diff for identical texts), then the
+GET /api/configrx/diff route against a real Service+WebServer: both sides
+re-redacted so a secret never appears (a changed secret renders as no line),
+the same-hash empty-diff fast path, default adjacent pair vs explicit from/to,
+cross-device/single-backup pairs refused, and get_configrx_backup's read gate.
 """
 import http.client
 import json

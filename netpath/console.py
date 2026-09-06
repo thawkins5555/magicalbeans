@@ -1,12 +1,7 @@
-"""The service console.
-
-What used to be the whole desktop application is now a small window that runs
-the server and shows what it is doing. The interface itself moved to the
-browser, so this exists to answer three questions without a browser: is the
-server up, who is connected, and how do I change the port or restart it.
-
-Closing this window stops the service, so anywhere it should keep running
-unattended wants the headless mode instead — see `--headless`.
+"""The service console: a small window that runs the server and answers,
+without a browser, whether it's up, who's connected, and how to change the
+port or restart it. Closing this window stops the service — use
+`--headless` anywhere it should keep running unattended.
 """
 
 from __future__ import annotations
@@ -550,14 +545,7 @@ class ConsoleWindow(QMainWindow):
             self.url_label.setText(self.server.error or "")
 
         # What is actually true and worth knowing at a glance: whether the
-        # traffic is encrypted, and how far the listener reaches. Until
-        # 4.39.0 this card told the operator, once a second, that the product
-        # had no sign-in -- text left over from before auth.py, the login
-        # page, the per-module read/write permissions, the forced first-run
-        # password change and the sign-in throttling existed. Someone who
-        # believes it either fronts the appliance with a reverse proxy it does
-        # not need, or reads it after deploying and concludes that the login
-        # page they have been using is decorative.
+        # traffic is encrypted, and how far the listener reaches.
         reach = ("reachable from every interface on this host"
                  if str(self.server.host) in ("", "0.0.0.0", "::")
                  else f"reachable on {self.server.host} only")

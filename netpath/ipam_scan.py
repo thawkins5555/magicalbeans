@@ -32,7 +32,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from .procs import hidden
+from .worker import hidden
 
 IS_WINDOWS = os.name == "nt"
 
@@ -93,8 +93,11 @@ def usable_addresses(cidr: str, max_addresses: int) -> list[str]:
     return [str(ip) for ip in net.hosts()]
 
 
-def normalize_mac(text: str | None) -> str | None:
+def mac_colon(text: str | None) -> str | None:
     """Lower-case, colon-separated, zero-padded, or None.
+
+    Not nodesdb.normalize_mac, which returns bare hex or "": the two are
+    deliberately different shapes, hence the different name.
 
     Windows prints dashes with each octet zero-padded (00-11-22-...); Linux
     and Windows print colons the same way; BSD's arp does not zero-pad a
@@ -119,18 +122,10 @@ def normalize_mac(text: str | None) -> str | None:
 
 
 def _ping_command(ip: str, timeout_ms: int) -> list[str]:
-    # Resolved through PATH rather than left as a bare "ping" for
-    # subprocess.run to find on its own: on Windows, CreateProcess appends
-    # only ".exe" to an extensionless name and never consults PATHEXT, so a
-    # bare "ping" always lands on C:\WINDOWS\system32\ping.EXE regardless of
-    # what sits earlier on PATH. tracer.py:436's _ping_command already does
-    # this same shutil.which("ping") for the same reason; this one did not,
-    # so the two callers of the same binary resolved it two different ways -
-    # on Windows only one of them honoured PATH. That is not cosmetic: it is
-    # what let ping_once()/ping_many() below (which is what nodepoll's
-    # reachability check actually calls) reach C:\WINDOWS\system32\ping.EXE
-    # instead of a PATH override such as the demo harness's ICMP substitute,
-    # so a device the harness had taken "down" kept reading as "up" here.
+    # shutil.which, not a bare "ping": on Windows CreateProcess appends only
+    # ".exe" and never consults PATHEXT, so a bare name always lands on
+    # system32\ping.EXE and ignores a PATH override such as the demo
+    # harness's ICMP substitute.
     exe = shutil.which("ping") or "ping"
     if IS_WINDOWS:
         return [exe, "-n", "1", "-w", str(timeout_ms), ip]
@@ -139,38 +134,23 @@ def _ping_command(ip: str, timeout_ms: int) -> list[str]:
 
 # ---------------------------------------------------------- socket ICMP
 #
-# ping_once/ping_many used to be one `subprocess.run(["ping", ...])` per
-# probe. At three probes per device per poll that is 3,000 fork/execs a
-# poll cycle across 1,000 devices — measured at 88-134 process creations a
-# second and a load average of 15 on four cores, almost none of it actual
-# network work. A raw or unprivileged-datagram ICMP socket does the same
-# probe without spawning anything: build the echo request by hand (the
-# checksum is the one part the kernel will not do for you), send it, and
-# wait for the matching reply with select() against a deadline — the same
-# shape as the subprocess path had, minus the process.
+# A subprocess `ping` per probe is 3,000 fork/execs a poll cycle across a
+# thousand devices, almost none of it network work. A raw or
+# unprivileged-datagram ICMP socket does the same probe without spawning:
+# build the echo request by hand (the checksum is the one part the kernel
+# will not do), send it, and select() for the matching reply.
 #
 # NETPATH_PING_MODE picks the implementation:
-#   unset / "auto"  — use a socket if one can be opened here, else the old
-#                     subprocess path. Detected once per process, not once
-#                     per probe (see _icmp_socket_kind).
-#   "socket"        — demand the fast path; raise instead of silently
-#                     falling back, so a deployment can confirm it landed.
-#   "subprocess"    — always fork/exec `ping`, exactly as before. This is
-#                     the demo harness's override: demo/bin/ping is a
-#                     scripted stand-in on PATH that makes a simulated
-#                     device (a plain loopback address — 127.0.0.x) look
-#                     "down" by refusing to answer, per its own docstring.
-#                     A real ICMP socket does not go through PATH at all;
-#                     it would reach that loopback address directly, and
-#                     the kernel always answers a loopback echo whether or
-#                     not the fleet has taken the simulated device down,
-#                     silently defeating the demo's failure scenarios.
-#                     demo/ is off limits to this change, so this is the
-#                     one place that can say it: demo/scenario.py's
-#                     start_app() needs one more line —
-#                     env["NETPATH_PING_MODE"] = "subprocess" — beside
-#                     where it already sets PATH to demo/bin, to keep that
-#                     guarantee on every host the demo runs on.
+#   unset / "auto"  — socket if one can be opened, else subprocess.
+#                     Detected once per process (see _icmp_socket_kind).
+#   "socket"        — demand the fast path; raise rather than fall back.
+#   "subprocess"    — always fork/exec `ping`. This is what lets the demo
+#                     harness work: demo/bin/ping is a PATH stand-in that
+#                     makes a simulated device (a 127.0.0.x address) look
+#                     down by refusing to answer, and a real ICMP socket
+#                     would bypass PATH and get the kernel's own loopback
+#                     reply instead. demo/scenario.py must set this
+#                     alongside the PATH it already sets.
 _PING_MODE_ENV = "NETPATH_PING_MODE"
 
 _ICMP_ECHO_REQUEST = 8
@@ -493,7 +473,7 @@ def _parse_windows_arp(output: str) -> dict[str, str]:
     for line in output.splitlines():
         match = _WIN_ARP_LINE.match(line)
         if match:
-            mac = normalize_mac(match.group(2))
+            mac = mac_colon(match.group(2))
             if mac:
                 table[match.group(1)] = mac
     return table
@@ -506,7 +486,7 @@ def _parse_linux_neigh(output: str) -> dict[str, str]:
             continue                    # no MAC learned, not a sighting
         match = _LINUX_NEIGH_LINE.match(line)
         if match:
-            mac = normalize_mac(match.group(2))
+            mac = mac_colon(match.group(2))
             if mac:
                 table[match.group(1)] = mac
     return table
@@ -519,7 +499,7 @@ def _parse_bsd_arp(output: str) -> dict[str, str]:
             continue
         match = _BSD_ARP_LINE.search(line)
         if match:
-            mac = normalize_mac(match.group(2))
+            mac = mac_colon(match.group(2))
             if mac:
                 table[match.group(1)] = mac
     return table

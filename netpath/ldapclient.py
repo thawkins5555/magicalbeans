@@ -1,34 +1,9 @@
 """A minimal LDAPv3 simple-bind client — enough to verify a username and
-password against a directory, and nothing else.
-
-The standard library ships no LDAP client, and this application runs on the
-standard library alone by policy (see CREDENTIAL-SECURITY.md's own framing
-of that constraint for the secret store). Pulling in python-ldap or ldap3
-would mean shipping a C extension or a third-party dependency tree onto a
-box whose job is watching a network, for a feature that needs exactly one
-thing: send a BindRequest, read the BindResponse's resultCode. So this hand-
-rolls the handful of ASN.1 BER structures RFC 4511 defines for that one
-exchange and stops there.
-
-What this deliberately does NOT do:
-  * No search. There is nothing here to look an entry up by; the caller
-    must already know (or be able to template) the bind DN.
-  * No referrals. A BindResponse carrying a referral is treated as a
-    failure with a clear message — following one would mean implementing
-    LDAP URL parsing and a second connection, for a directory topology this
-    application has no way to reason about safely.
-  * No SASL, no StartTLS. Only two transports: `ldaps://` (TLS from the
-    first byte, via ssl.create_default_context — the same trust store every
-    other TLS client in this codebase uses) or `ldap://` with the
-    password sent as plaintext, refused unless the caller explicitly opts
-    in (`allow_cleartext=True`) — see simple_bind's docstring.
-  * No connection pooling, no retries. One bind is one TCP (or TLS)
-    connection, opened, used once, unbound and closed.
-
-RFC 4511 §4.1.1 (LDAPMessage), §4.2 (BindRequest/BindResponse) and §4.1.9
-(LDAPResult, which BindResponse's non-referral fields come from) are the
-sections this file implements; each encoder/decoder below cites the field
-it is building or reading.
+password against a directory (send a BindRequest, read the resultCode),
+hand-rolling the handful of ASN.1 BER structures RFC 4511 needs for that,
+since the standard library ships no LDAP client and this app is stdlib-only.
+No search, no referral-following, no SASL/StartTLS (only `ldaps://` or
+`ldap://` with cleartext requiring an explicit opt-in), no pooling/retries.
 """
 
 from __future__ import annotations
@@ -199,21 +174,8 @@ TAG_REFERRAL = 0xA3
 
 
 def encode_bind_request(message_id: int, dn: str, password: str) -> bytes:
-    """RFC 4511 §4.2:
-
-        BindRequest ::= [APPLICATION 0] SEQUENCE {
-             version                 INTEGER (1..127),
-             name                    LDAPDN,
-             authentication          AuthenticationChoice }
-        AuthenticationChoice ::= CHOICE {
-             simple                  [0] OCTET STRING, ... }
-
-    wrapped in the LDAPMessage envelope every LDAP PDU travels in:
-
-        LDAPMessage ::= SEQUENCE {
-             messageID       MessageID,
-             protocolOp      CHOICE { bindRequest BindRequest, ... } }
-    """
+    """RFC 4511 §4.2 BindRequest (version, name, simple-auth OCTET STRING),
+    wrapped in the LDAPMessage envelope every LDAP PDU travels in."""
     version = _ber_integer(3)
     name = _ber_tlv(TAG_OCTET_STRING, dn.encode("utf-8"))
     authentication = _ber_tlv(TAG_AUTH_SIMPLE, password.encode("utf-8"))
@@ -371,42 +333,19 @@ def _recv_message(sock) -> bytes:
 def simple_bind(url: str, dn: str, password: str, *,
                 timeout: float = DEFAULT_TIMEOUT_S,
                 allow_cleartext: bool = False) -> None:
-    """Verify `dn`/`password` against the directory at `url`. Returns
-    (nothing) on success; raises LDAPInvalidCredentials, LDAPReferralError,
-    LDAPBindError, LDAPConnectError, LDAPProtocolError or LDAPConfigError
-    otherwise. Always unbinds and closes the connection before returning,
-    on every path — success, failure or exception.
-
-    `url` must be "ldaps://host[:port]" (TLS from the first byte, via
-    ssl.create_default_context — the platform trust store, exactly like
-    every other outbound TLS client in this codebase) or "ldap://host[:port]"
-    (no transport security at all: refused with LDAPConfigError unless
-    `allow_cleartext` is explicitly True, because a simple bind's password
-    is sent as plaintext inside the BindRequest and without TLS that means
-    on the wire in the clear). There is no StartTLS support — see the
-    module docstring for what this client deliberately does not do.
+    """Verify `dn`/`password` against the directory at `url`. Returns on
+    success; raises LDAPInvalidCredentials/LDAPReferralError/LDAPBindError/
+    LDAPConnectError/LDAPProtocolError/LDAPConfigError otherwise. `url` must
+    be ldaps:// or ldap:// (refused unless `allow_cleartext` is True, since
+    a simple bind's password is plaintext). Always unbinds before returning.
     """
     if password == "":
-        # RFC 4511 §4.2: a BindRequest with a non-empty name and a
-        # zero-length simple password is not "wrong credentials" at all —
-        # it is a distinct, legal operation called an "unauthenticated
-        # bind", and the directory is entitled to answer it with resultCode
-        # 0 (success) rather than 49 (invalidCredentials), because as far
-        # as the protocol is concerned no credential was being checked.
-        # RFC 4513 §5.1.2 says a client SHOULD prohibit sending one for
-        # exactly this reason. Left unchecked, this client would forward
-        # the bind, get resultCode 0 back from any directory that follows
-        # the RFC literally, and report success — so POST /api/login with
-        # {"password": ""} would mint a real session for any ldap-mapped
-        # username with no credential verified whatsoever. Refused here,
-        # before _parse_url or any socket is opened: an empty password is
-        # never valid no matter what url or dn accompany it, so there is
-        # nothing to gain from reaching the network first. Raising
-        # LDAPInvalidCredentials rather than LDAPConfigError is deliberate:
-        # authenticate_ldap already maps that exception to False, so the
-        # login route answers "wrong username or password" and records a
-        # normal failed sign-in — the same outcome as any other bad
-        # credential, not a distinct "misconfigured" error.
+        # RFC 4511 an "unauthenticated bind" (non-empty name, zero-length
+        # password) is a distinct legal operation that a directory may answer
+        # with success — a directory following the RFC literally would let
+        # {"password": ""} mint a real session for any ldap-mapped username.
+        # Refused before any socket is opened; LDAPInvalidCredentials (not
+        # LDAPConfigError) so this reads as an ordinary failed sign-in.
         raise LDAPInvalidCredentials(
             "empty password refused before bind (RFC 4513 section 5.1.2 "
             "prohibits an unauthenticated bind)")

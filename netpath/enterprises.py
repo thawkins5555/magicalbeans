@@ -1,39 +1,21 @@
 """IANA enterprise numbers -> vendor, for arcs no uploaded MIB describes.
 
-Every arc in both tables below is hand-authored from the IANA Private
-Enterprise Number registry (www.iana.org/assignments/enterprise-numbers),
-which is not reachable from the build environment. What separates the two
-tables is corroboration, not origin:
-
 - VERIFIED: cross-checked against a real device's sysObjectID or a bundled
-  MIB — the arc has been seen in the field or read out of MIB text in this
-  tree. These decide a vendor at high confidence.
+  MIB. These decide a vendor at high confidence.
 - CURATED: not cross-checked in this build. These decide at *medium*
   confidence, and the arc number is always written into the device's
-  evidence, so a wrong entry is auditable and scoped to devices nothing
-  else can name. Keep this list conservative: a vendor mislabelled is
-  worse than a vendor left as a number.
+  evidence, so a wrong entry is auditable.
 
-Neither table was transcribed from vendor MIB modules, which is what this
-docstring claimed until 4.39.0: the tree holds vendor MIB text for exactly
-one of the 53 VERIFIED arcs (Moxa's 8691), and the file that ships those
-arcs — mibs/enterprise-roots.mib — says as much in terms.
-
-One vendor, one key. A manufacturer that holds several arcs (HPE holds
-five) is keyed under one canonical name through VENDOR_ALIASES, so the
-Nodes vendor filter shows one row per manufacturer rather than one per
-arc; the arc's own label stays available as a model hint through
-arc_label(). Keys match trapoids.WELL_KNOWN and nodeoids.SYSDESCR_VENDORS
-wherever both name the same vendor, so the walk, the sysObjectID table and
-the sysDescr guess all agree on one spelling ("phoenixContact", not three
-variants).
+A multi-arc vendor (HPE holds five) is keyed under one canonical name via
+VENDOR_ALIASES, kept consistent with trapdecode.WELL_KNOWN and
+nodeoids.SYSDESCR_VENDORS.
 """
 
 from __future__ import annotations
 
 # arc -> (vendor key, display name)
 VERIFIED: dict[int, tuple[str, str]] = {
-    # trapoids.WELL_KNOWN roots — every one read from MIB text.
+    # trapdecode.WELL_KNOWN roots — every one read from MIB text.
     9: ("cisco", "Cisco"),
     11: ("hp", "HP / HPE"),
     161: ("motorola", "Motorola"),          # Cambium's Canopy/PMP line lives here
@@ -261,9 +243,7 @@ def is_verified(arc) -> bool:
 
 # Vendors identified by sysDescr alone, which therefore have no arc to be
 # keyed by here, and still deserve to read as their own name rather than as
-# a camelCase token. Empty since 4.39.0: Rockwell Automation was the only
-# entry and now has arc 95 above, so it is reachable from a sysObjectID as
-# well as from a sysDescr substring.
+# a camelCase token. Currently empty — every known vendor is reachable by arc.
 ARCLESS_DISPLAY: dict[str, str] = {}
 
 # An aliased arc's label names a model, not a manufacturer, so it must not

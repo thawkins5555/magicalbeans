@@ -1,16 +1,9 @@
 """The parsers, resolvers and small in-memory tables, under the inputs a
-fuzz run and a fresh-eyes review found: a MIB whose IMPORTS block never
-closes, a truncated MIB that is all macro headers and no clauses, a reversed
-dependency chain, an enum value longer than Python's own integer guard, a
-DNS answer from the wrong host, and the vendor and port tables around them.
-
-No database and no subprocess; the only sockets are loopback UDP, from a
-fake resolver this file starts and stops itself. Everything else is a pure
-function or an in-memory object, so the suite is deterministic and finishes
-in a few seconds. The timing assertions carry a wide margin on purpose —
-each one is two to three orders of magnitude below what the unfixed code
-measured, so a loaded build machine cannot make them flap, and a return of
-the quadratic behaviour cannot make them pass.
+fuzz run found: a MIB whose IMPORTS block never closes, a truncated MIB
+with no clauses, a reversed dependency chain, an oversized enum value, a
+DNS answer from the wrong host, and the vendor/port tables around them. No
+database and no subprocess; the only sockets are loopback UDP, from a fake
+resolver this file starts and stops itself. Timing bounds carry a wide margin.
 """
 import hashlib
 import json
@@ -20,6 +13,7 @@ import time
 from _paths import REPO_ROOT, STUBS_DIR
 
 from netpath import mibparse
+from netpath import syslogparse
 
 MIB_DIR = os.path.join(REPO_ROOT, "netpath", "mibs")
 EXPECTED_PATH = os.path.join(STUBS_DIR, "mib_parse_expected.json")
@@ -518,9 +512,9 @@ check("reverse() no longer calls the process-global socket timeout setter",
 check("the query id no longer comes from the Mersenne Twister",
       "random.randint" not in source and "os.urandom" in source)
 
-# The leak the review reproduced: while reverse() ran, every socket created
-# anywhere in the process was born with the resolver's timeout, and eight
-# concurrent workers left the global set for good.
+# The leak: while reverse() ran, every socket created anywhere in the
+# process was born with the resolver's timeout, and eight concurrent
+# workers left the global set for good.
 socket.setdefaulttimeout(None)
 observed: set = set()
 stop = threading.Event()
@@ -780,10 +774,9 @@ from netpath import analysis                         # noqa: E402
 
 now = 1_700_000_000.0
 
-# The review's own reproduction: t0/t1 and the pixel width they are derived
-# from come straight off a query string that only needs the read-only role.
-# t1=1e9 with a wide viewport allocated 326,798 buckets; width=3e7 would have
-# reached about ten million, some 4 GB, from one GET.
+# t0/t1 and the pixel width they are derived from come straight off a
+# query string that only needs the read-only role, so an unclamped window
+# or block width can request an unbounded number of buckets from one GET.
 for label, (t0, t1, bucket_s) in {
     "t1=1e9, 3 s blocks": (0.0, 1e9, 3.0),
     "a decade of 1 s blocks": (now - 10 * 365 * 86400, now, 1.0),
@@ -1095,6 +1088,119 @@ check("port_name still reads as a name and a number",
       and services.port_name(0, resolve=False) == "0",
       services.port_name(502))
 
+
+# --------------------------------- H12: syslogparse/mibparse quadratic-time DoS
+#
+# Merged from test_syslog_mib_dos_fixes.py: two quadratic-time bugs a fuzz
+# campaign found in files that take input straight off the wire
+# (syslogparse.py, unauthenticated on 514/udp+tcp) and off an upload
+# (mibparse.py). Both bugs shared one shape: a hand-written loop whose
+# per-iteration cost was assumed O(1) but was actually O(remaining input),
+# because each iteration threw away a Python string and rebuilt a shorter
+# one from a slice. Every timing bound here carries a wide margin -- this
+# suite can run in a session shared with other CPU-bound work.
+
+def syslog_mib_dos_regressions():
+    print("H12 syslogparse: many small SD-ELEMENTs no longer costs O(elements^2)")
+
+    def sd_message(count: int, tail: bytes = b" tail") -> bytes:
+        elements = b"".join(b"[a]" for _ in range(count))
+        return (b"<134>1 2024-01-01T00:00:00Z host app 1 msgid " + elements + tail)
+
+    # 500,000 elements is the exact size that did not finish in 8 s before the
+    # fix; this bound is nowhere near what this machine measures undisturbed,
+    # on purpose, to survive a busy shared machine.
+    many_small, elapsed = timed(syslogparse.parse, sd_message(500_000), "10.0.0.1")
+    check("500,000 tiny SD-ELEMENTs parse in under 5 s (unfixed: did not finish in 8s)",
+          elapsed < 5.0, f"{elapsed:.3f}s")
+
+    # The cap (MAX_SD_ELEMENTS) is what makes the above true independent of
+    # size at all -- confirm growing the input further doesn't grow the time.
+    huge_small, elapsed_huge = timed(syslogparse.parse, sd_message(4_000_000), "10.0.0.1")
+    check("4,000,000 tiny SD-ELEMENTs cost about the same as 500,000 (the cap, not just linearity)",
+          elapsed_huge < 5.0, f"{elapsed_huge:.3f}s")
+
+    # Control: a handful of large elements must stay linear in their own size
+    # and must NOT be truncated by the element-count cap, proving the fix is
+    # algorithmic and not a length cap wearing a disguise.
+    big_value = "x" * 500_000
+    big_elements = "".join(f'[e{i} k="{big_value}"]' for i in range(10))
+    big_msg = (f"<134>1 2024-01-01T00:00:00Z host app 1 msgid {big_elements} tail").encode()
+    _, elapsed_big = timed(syslogparse.parse, big_msg, "10.0.0.1")
+    check("10 large (500 KB) SD-ELEMENTs — ~5 MB total — still parse in under 8 s",
+          elapsed_big < 8.0, f"{elapsed_big:.3f}s")
+
+    # Correctness, not just speed: a "fix" that stopped parsing structured
+    # data at all would pass every timing check above.
+    entry = syslogparse.parse(sd_message(10), "10.0.0.1")
+    check("10 SD-ELEMENTs (well under the cap) are still fully stripped",
+          entry.message == "tail", repr(entry.message))
+
+    cap = syslogparse.MAX_SD_ELEMENTS
+    at_cap = syslogparse.parse(sd_message(cap), "10.0.0.1")
+    check(f"exactly MAX_SD_ELEMENTS ({cap}) elements are all stripped",
+          at_cap.message == "tail", repr(at_cap.message))
+
+    over_cap_msg = (b"<134>1 2024-01-01T00:00:00Z host app 1 msgid "
+                    + b"".join(f"[e{i}]".encode() for i in range(cap + 5)) + b" tail")
+    over_cap = syslogparse.parse(over_cap_msg, "10.0.0.1")
+    check("past the cap, the surplus elements are kept verbatim as message text, not dropped",
+          over_cap.message == "[e64][e65][e66][e67][e68] tail", repr(over_cap.message))
+
+    print("H12 mibparse: comment/string masking no longer costs O(markers x length)")
+
+    # 2,000,000 units (~6 MB) is comfortably inside the shipped 8 MB cap.
+    no_newlines = "-- " * 2_000_000
+    result, elapsed = timed(mibparse.parse, no_newlines,
+                            max_bytes=64 * 1024 * 1024, budget_s=999999)
+    check("2,000,000 '-- ' units with no newline anywhere parse in under 10 s",
+          elapsed < 10.0, f"{elapsed:.3f}s, {len(no_newlines):,} chars")
+
+    # Control: the identical content, but with a newline after every unit
+    # (so the comment closes on the newline instead of forcing an
+    # end-of-file scan) must stay just as fast.
+    with_newlines = "-- \n" * 2_000_000
+    _, elapsed_ctrl = timed(mibparse.parse, with_newlines,
+                            max_bytes=64 * 1024 * 1024, budget_s=999999)
+    check("the same content WITH newlines is unaffected (already-linear case stays linear)",
+          elapsed_ctrl < 12.0, f"{elapsed_ctrl:.3f}s")
+
+    # A "fix" that made masking fast by returning the input unmasked would
+    # pass the timing checks above but break every regex that depends on
+    # `--`/`::=` inside a comment or string being inert.
+    tricky = mibparse.parse(
+        'F DEFINITIONS ::= BEGIN\n'
+        '-- a comment with a fake ::= { mib-2 999 } in it\n'
+        'a OBJECT-TYPE\n  SYNTAX Integer32\n'
+        '  DESCRIPTION "text with -- two dashes and a literal ::= { x 1 } in it"\n'
+        '  ::= { mib-2 7 }\nEND', max_bytes=1024 * 1024)
+    found = {o.name: o for o in tricky.objects}
+    check("masking still makes a fake '::= { }' inside a comment or string inert",
+          list(found) == ["a"] and found["a"].last_arc == "7", str(list(found)))
+    check("...while DESCRIPTION text itself still comes back unmasked",
+          "-- two dashes" in found["a"].description
+          and "::= { x 1 }" in found["a"].description, found["a"].description)
+
+    # Before the fix, parse()'s wall-clock budget was checked only after
+    # _strip_comments_and_strings() returned, so a masking phase slow enough
+    # to blow the budget on its own always finished first regardless. The
+    # masking loop now takes its own deadline and checks it periodically
+    # from inside, so a slow pass is cut off early instead.
+    slow_but_linear = "-- " * 3_000_000     # ~9 MB, comfortably under the 64 MB cap given below
+    started = time.perf_counter()
+    try:
+        mibparse.parse(slow_but_linear, max_bytes=64 * 1024 * 1024, budget_s=0.05)
+        check("a tiny budget on a large no-newline file raises MibParseTimeout", False,
+              "parse() returned normally")
+    except mibparse.MibParseTimeout:
+        elapsed_budget = time.perf_counter() - started
+        check("a tiny budget on a large no-newline file raises MibParseTimeout", True)
+        check("...and does so well before a full masking pass would complete "
+              "(proves the check fires from inside the loop, not only after it)",
+              elapsed_budget < 3.0, f"{elapsed_budget:.3f}s")
+
+
+syslog_mib_dos_regressions()
 
 if failures:
     print(f"\nFAILED: {len(failures)} check(s): {', '.join(failures)}")

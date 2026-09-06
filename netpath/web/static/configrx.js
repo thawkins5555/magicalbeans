@@ -34,15 +34,10 @@
     // being drawn needs a way to tell "am I still the current one" apart
     // from merely comparing view.search.ran (true for any two searches).
     searchGen: 0,
-    // Bumped on every periodic refresh() (below) — the devices fetch it
-    // makes is built from live filter controls (cx-q, cx-enabled-only,
-    // cx-filter-vendor), so two overlapping refreshes (a poll tick racing a
-    // filter change) can carry different query strings and app.js's
-    // per-path abort-dedupe cannot cancel either one. Without this, the
-    // older response landing last overwrites view.devices — and the table —
-    // with the wrong filter's devices while the controls already read the
-    // new one. Same pattern as searchGen just above, which this module's
-    // own search already used; the periodic refresh() had not.
+    // Bumped per periodic refresh() and checked before painting: the
+    // devices fetch is built from live filter controls, so two overlapping
+    // refreshes carry different query strings and app.js's per-path
+    // abort-dedupe cannot cancel either one.
     refreshGen: 0,
     // Rule sets (netpath/configrx_compliance.py). null (not []) means "not
     // fetched yet" — refreshRuleSets() is only ever called once up front,
@@ -63,12 +58,8 @@
     deviceCompliance: null,
   };
 
-  // One implementation, in app.js. This was twelve copies of the same
-  // three lines, which is how one of them came to be missing a
-  // character while the others were not.
   const escape = App.escapeHtml;
 
-  // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = App.ago;
 
   function bytesText(n) {
@@ -130,9 +121,6 @@
   function drawStatus() {
     const server = App.state.serverState || {};
     const worker = server.configrx || { counters: {} };
-    App.el('cx-status').textContent = worker.status || 'Worker stopped';
-    App.el('cx-dot').style.background = worker.running ? 'var(--ok)' : 'var(--line)';
-    App.el('cx-toggle').textContent = worker.running ? 'Stop worker' : 'Start worker';
     const c = worker.counters || {};
     const parts = [`${c.backups || 0} backup(s) run`, `${c.changed || 0} changed`,
       `${c.suspect || 0} suspect`, `${c.unchanged || 0} unchanged`, `${c.errors || 0} errors`];
@@ -145,7 +133,8 @@
       if (ssh.legacy_implemented === false) parts.push('no SHA-1 key exchange');
       else if (ssh.legacy_offered === false) parts.push('legacy SSH off');
     }
-    App.el('cx-counters').textContent = parts.join(' · ');
+    App.strip('cx', worker, { stopped: 'Worker stopped', start: 'Start worker',
+      stop: 'Stop worker', parts });
   }
 
   /* --------------------------------------------------------------- subtabs
@@ -158,12 +147,7 @@
      App.rememberSub, and whatever else switching panes needs to kick off. */
 
   function selectSub(name) {
-    for (const btn of document.querySelectorAll('#page-configrx > .subtabs > .subtab')) {
-      btn.classList.toggle('active', btn.dataset.subtab === name);
-    }
-    for (const page of document.querySelectorAll('#page-configrx > .subpage')) {
-      page.classList.toggle('active', page.id === `configrx-sub-${name}`);
-    }
+    App.selectSub('configrx', name);
     view.activeSub = name;
     // Fetched once, lazily — a rule set list a device's own compliance
     // summary might already have pulled in (loadDeviceCompliance) is not
@@ -340,9 +324,7 @@
   }
 
   function drawBulkBar() {
-    const n = view.devicesChecked.size;
-    App.el('cx-bulk-bar').hidden = n === 0;
-    if (n) App.el('cx-bulk-count').textContent = `${n} selected`;
+    App.bulkBar(view.devicesChecked, 'cx-bulk-bar', 'cx-bulk-count');
   }
 
   /* Everything the single-device settings dialog covers, applied to every
@@ -432,20 +414,7 @@
     if (!ids.length) return;
     const button = App.el('cx-bulk-backup');
     if (button.disabled) return;
-    const settle = (text) => {
-      button.disabled = false;
-      button.textContent = text;
-      // The label IS the result — 'Queued for 12 devices', 'Failed' —
-      // and a label rewritten in place is a silent DOM mutation to a
-      // screen reader, so the result is said once as well. Inside the
-      // branch, because the resting label is not a result.
-      if (text !== 'Back up selected') {
-        App.announce(text);
-        setTimeout(() => {
-          if (button.textContent === text) button.textContent = 'Back up selected';
-        }, 4000);
-      }
-    };
+    const settle = App.settleButton(button, 'Back up selected', 4000);
     button.disabled = true;
     button.textContent = 'Queueing…';
     let result;
@@ -610,12 +579,10 @@
   }
 
   function drawBackupBulkBar() {
-    const n = view.backupsChecked.size;
-    App.el('cx-backup-bulk').hidden = n === 0;
-    if (n) App.el('cx-backup-bulk-count').textContent = `${n} selected`;
+    const n = App.bulkBar(view.backupsChecked, 'cx-backup-bulk', 'cx-backup-bulk-count');
     // Diffing needs exactly two backups picked — one is "diff with
     // previous" above, and more than two has no obvious pairing to draw.
-    App.el('cx-backup-diff-selected').hidden = n !== 2;
+    App.setHidden(App.el('cx-backup-diff-selected'), n !== 2);
   }
 
   /* The adjacent OLDER backup to `id` in the server's own newest-first
@@ -737,7 +704,7 @@
       `${App.stamp(result.from.ts)} → ${App.stamp(result.to.ts)}` +
       ` — +${result.additions} / −${result.removals}` +
       (result.identical ? ' — no differences' : '');
-    // An empty diff is ambiguous on its own (O-57): this route redacts both
+    // An empty diff is ambiguous on its own: this route redacts both
     // sides a second time no matter what each backup's own stored flag
     // says, so a secret that only changed VALUE — a rotated enable secret,
     // a new SNMP community, a changed local password — renders as the
@@ -844,14 +811,11 @@
     }
   }
 
-  /* The keys configrx_vendors.VENDORS knows, served by /api/config as
+  /* The vendor keys configrx.py knows, served by /api/config as
      configrx_vendors — label and key only, nothing that lets this page
-     influence what a backup sends — plus free text (the "Other" option
-     and its own box) for anything not in that table, which is exactly
-     what vendor_override is documented as being for (e.g. HP/Aruba has
-     no SNMP enterprise root registered in nodeoids.vendor_for() to
-     auto-detect from, and a platform this build has not shipped a Vendor
-     entry for yet still needs somewhere to type its key). */
+     influence what a backup sends — plus free text ("Other" and its own
+     box) for a platform this build has no entry for, or one with no SNMP
+     enterprise root to auto-detect from. */
   const VENDOR_OTHER = '__other__';
 
   function vendorChoices() {
@@ -943,7 +907,7 @@
           just Cisco ASA — and is saved only together with the SSH password above.</p>
       </fieldset>
       <fieldset><legend>HOST KEY</legend>
-        <div id="cx-hostkey"><p class="hint">Loading…</p></div>
+        <div id="cx-hostkey">${App.loading()}</div>
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (m) => {
@@ -1079,9 +1043,9 @@
   /* ------------------------------------------------------------- search
 
      GET /api/configrx/search: one query against every device's latest
-     stored capture — always the redacted text (configrx_search.py's own
-     module docstring), regardless of that device's store_secrets setting,
-     which is what makes this safe to expose as a read rather than a write.
+     stored capture — always the redacted text, regardless of that device's
+     store_secrets setting, which is what makes this safe to expose as a
+     read rather than a write.
      Run on demand (a button/Enter, not the page's own refresh tick) —
      unlike the devices list, there is no "current" search to keep live. */
 
@@ -1099,13 +1063,11 @@
      whatever the Devices subtab's own filters currently hold, because this
      exists to answer one question honestly: "is a 0-match result actually
      evidence of a clean estate, or is there simply nothing here to search
-     yet?" A search only ever reaches a device's LATEST stored capture
-     (configrx_search.py's own module docstring), so a device that has
-     never backed up successfully is invisible to it no matter what the
-     query is — and that is a fact about coverage, not about the query,
-     which is exactly what a bare "No matches" cannot say on its own. Only
-     fetched when a search actually comes back empty, not on every
-     keystroke. */
+     yet?" A search only ever reaches a device's LATEST stored capture, so
+     a device that has never backed up successfully is invisible to it — a
+     fact about coverage, not about the query, and one a bare "No matches"
+     cannot say on its own. Only fetched when a search actually comes back
+     empty. */
   async function searchCoverageNote() {
     let devices;
     try {
@@ -1604,10 +1566,7 @@
     if (vendor) params.vendor = vendor;
     const generation = ++view.refreshGen;
     const result = await App.get('/api/configrx/devices', params);
-    // A newer refresh already redrew this — a filter change, or the operator
-    // leaving this tab, while the above was in flight — so this answer
-    // (built from filters that may no longer be current) must not overwrite
-    // what the newer one already painted.
+    // A newer refresh already redrew this, or the operator has left.
     if (view.refreshGen !== generation || App.state.tab !== 'configrx') return;
     view.devices = result.devices;
     drawVendorFilter(result.devices, vendorSelect);
@@ -1676,26 +1635,14 @@
         .sort((a, b) => a.ts - b.ts);
       if (older && newer) showDiff(older.id, newer.id);
     };
-    // Both buttons carry data-requires-write="configrx" in index.html, left
-    // over from before 4.48.0 moved fetching a single stored backup to
-    // ConfigRX read (get_configrx_backup). Diffing two backups a reader can
-    // already open one at a time is not a write, and it is the single most
-    // common thing anyone does with a config backup — "what changed on this
-    // switch before it stopped answering" is a reader's question, not a
-    // writer's. Undone here rather than in the markup (not mine to edit):
-    // the attribute is stripped so applyPermissions' generic write-gate
-    // (app.js), which only ever walks `[data-requires-write]`, never reaches
-    // these two again — but loadState() runs applyPermissions() before any
-    // module's init() (see app.js's start()), so a read-only account has
-    // already had both buttons disabled-with-reason by the time this line
-    // runs; stripping the attribute alone would stop future re-disabling
-    // without ever undoing that first pass. So this also reverses it by
-    // hand, the same way applyWriteGate's own "allowed" branch would.
-    // /api/configrx/diff itself still requires write server-side
-    // (server.py:479) — until that changes to match get_configrx_backup's
-    // R, a read-only account clicking either button gets showDiff's own
-    // "Could not diff these backups: ..." toast instead of a 403 with no
-    // explanation, which is at least an honest answer while the two catch up.
+    // Diffing two backups a reader can already open one at a time is a read.
+    // Both buttons still carry data-requires-write in index.html, so the
+    // attribute is stripped (applyPermissions only ever walks it) and the
+    // first pass it already made — loadState runs applyPermissions before any
+    // module init() — is reversed by hand, as applyWriteGate's "allowed"
+    // branch would. /api/configrx/diff still requires write server-side, so
+    // until that catches up a reader gets showDiff's own toast, not a bare
+    // 403.
     for (const id of ['cx-backup-diff-prev', 'cx-backup-diff-selected']) {
       const btn = App.el(id);
       btn.removeAttribute('data-requires-write');
@@ -1714,84 +1661,39 @@
     /* Backing up with the worker stopped used to report success and do
        nothing — the queue it went into was never being drained. The server
        now refuses it, so say why rather than swallowing the rejection. */
-    App.el('cx-backup-now').onclick = async () => {
-      if (!view.selectedDeviceId) return;
-      const button = App.el('cx-backup-now');
-      const settle = (text) => {
-        button.disabled = false;
-        button.textContent = text;
-        // The label IS the result — 'Queued for 12 devices', 'Failed' —
-        // and a label rewritten in place is a silent DOM mutation to a
-        // screen reader, so the result is said once as well. Inside the
-        // branch, because the resting label is not a result.
-        if (text !== 'Back up now') {
-          App.announce(text);
-          setTimeout(() => {
-            if (button.textContent === text) button.textContent = 'Back up now';
-          }, 3000);
-        }
-      };
-      button.disabled = true;
-      button.textContent = 'Queueing…';
-      try {
-        const deviceId = view.selectedDeviceId;
-        const before = (view.devices.find((d) => d.id === deviceId) || {})
-          .last_backup_ts || 0;
-        const result = await App.post(
-          `/api/configrx/devices/${deviceId}/backup`, {});
-        if (result.queued === false) { settle('Already queued…'); return; }
-        button.textContent = 'Queued…';
-        // Bounded, and reporting real state rather than a guess: a backup runs
-        // on a worker thread, so the POST returning means "queued". The device
-        // row now carries backing_up/backup_queued, and last_backup_ts moving
-        // is what "done" actually means. Same shape as the Nodes Poll now
-        // button, which had exactly this problem first.
-        const deadline = Date.now() + 180000;
-        const watch = async () => {
-          if (view.selectedDeviceId !== deviceId || App.state.tab !== 'configrx') {
-            settle('Back up now');
-            return;
+    App.el('cx-backup-now').onclick = () => {
+      const deviceId = view.selectedDeviceId;
+      if (!deviceId) return;
+      App.watchJob(App.el('cx-backup-now'), {
+        post: `/api/configrx/devices/${deviceId}/backup`,
+        poll: `/api/configrx/devices/${deviceId}`,
+        tsKey: 'last_backup_ts',
+        before: (view.devices.find((d) => d.id === deviceId) || {}).last_backup_ts || 0,
+        busyKey: 'backing_up',
+        alive: () => view.selectedDeviceId === deviceId && App.state.tab === 'configrx',
+        deadlineMs: 180000,
+        labels: { resting: 'Back up now', queueing: 'Queueing…', queued: 'Queued…',
+          busy: 'Backing up…', already: 'Already queued…' },
+        done: async (device, settle) => {
+          const failed = device.last_backup_status === 'error';
+          settle(failed ? 'Failed' : (device.last_backup_status || 'Done'));
+          // The button label flicking to "Failed" said THAT it failed and
+          // nothing else — the reason lived only in the Last backup
+          // column's title, which nobody is hovering right after a click.
+          if (failed) {
+            App.toast(`Backup of ${device.name || device.ip || 'this device'} `
+              + `failed: ${device.last_backup_error || 'unknown error'}`, 'fail');
           }
-          let payload;
-          try {
-            payload = await App.get(`/api/configrx/devices/${deviceId}`, {});
-          } catch (error) {
-            settle('Back up now');
-            return;
-          }
-          const device = payload.device || {};
-          if ((device.last_backup_ts || 0) > before) {
-            const failed = device.last_backup_status === 'error';
-            settle(failed ? 'Failed' : (device.last_backup_status || 'Done'));
-            // The button label flicking to "Failed" said THAT it failed and
-            // nothing else — the reason lived only in the Last backup
-            // column's title, which nobody is hovering right after a click.
-            if (failed) {
-              App.toast(`Backup of ${device.name || device.ip || 'this device'} `
-                + `failed: ${device.last_backup_error || 'unknown error'}`, 'fail');
-            }
-            await selectDevice(deviceId);
-            App.refreshNow('configrx');
-            return;
-          }
-          if (Date.now() > deadline) { settle('Still running…'); return; }
-          button.textContent = device.backing_up ? 'Backing up…' : 'Queued…';
-          setTimeout(watch, 1000);
-        };
-        setTimeout(watch, 600);
-      } catch (error) {
-        settle('Back up now');
-        App.modal('Cannot back up now',
+          await selectDevice(deviceId);
+          App.refreshNow('configrx');
+        },
+        onError: (error) => App.modal('Cannot back up now',
           `<p>${escape(error.message)}</p>`,
-          [{ label: 'Close', primary: true, onClick: App.closeModal }]);
-      }
+          [{ label: 'Close', primary: true, onClick: App.closeModal }]),
+      });
     };
-    App.el('cx-toggle').onclick = async () => {
-      const running = (App.state.serverState.configrx || {}).running;
-      await App.post('/api/configrx/worker', { action: running ? 'stop' : 'start' });
-      await App.loadState();
-      App.refreshNow('configrx');
-    };
+    App.wireToggle('cx-toggle', 'configrx', '/api/configrx/worker',
+      () => App.refreshNow('configrx'));
 
     for (const btn of document.querySelectorAll('#page-configrx > .subtabs > .subtab')) {
       btn.onclick = () => {

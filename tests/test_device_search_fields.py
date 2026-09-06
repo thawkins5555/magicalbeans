@@ -1,18 +1,9 @@
-"""Device search (nodesdb.devices/devices_count `text` filter) matches what
-an operator actually knows about a device, not just its name/IP/sys_name/MAC.
-
-Before this fix, `_device_filter_clause` only LIKE-matched three columns
-(ip, name, sys_name) plus an optional MAC subquery. sys_location, sys_descr
-(model/description), sys_contact and vendor are stored on every device row
-and returned by the API, but were never searched — an operator who knows
-"the Moxa in Site-B" and not its name/IP had no way to find it. This suite
-proves each of the four newly-searched fields now matches, that the
-pre-existing name/IP/sys_name/MAC behaviour is unchanged, and that a search
-match tracks a device live across rename/re-identify/update/delete — there
-is no separate index to go stale because the search reads the devices
-table's own columns directly (see nodesdb.py's _device_filter_clause for
-the measurement that justified plain LIKE over an FTS table at 2,000
-devices).
+"""Device search (nodesdb.devices/devices_count `text` filter) matches what an
+operator knows about a device: sys_location, sys_descr, sys_contact and vendor
+as well as name/IP/sys_name/MAC. Proves each of the four fields matches, that
+name/IP/sys_name/MAC behaviour is unchanged, and that a match tracks a device
+live across rename/re-identify/update/delete, since the search reads the
+devices table's own columns (see nodesdb.py's _device_filter_clause).
 """
 import sys
 

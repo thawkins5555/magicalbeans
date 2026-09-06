@@ -1,20 +1,9 @@
-"""Bulk Resolve, through the real HTTP route, resolves and stays resolved.
-
-`tests/test_alert_operator_resolve.py` proves the engine rule that makes this
-work by driving AlertEngine directly. This suite proves the operator's actual
-path: three devices down, their outages ticked in the list, one
-`POST /api/alerts/bulk-resolve` carrying all three ids, "Resolved 3 of 3" —
-and then the next engine tick, which is where it used to go wrong. Within
-five seconds of the click the engine re-opened one "Packet loss to device
-high" per device (a device that answers nothing records 100 % loss on every
-poll), each with its own email, because a rollup child is only suppressed
-while its parent alert is OPEN.
-
-Real `Service` and `WebServer` on a loopback port, the same shape as
-`tests/test_ssh_hostkeys.py` section 10. Nothing is started that polls or
-ticks on its own: the poll results are written the way nodepoll writes them
-and the engine is ticked by hand, so the test is deterministic rather than
-timing-dependent.
+"""Bulk Resolve, through the real HTTP route, resolves and stays resolved:
+three devices down, one `POST /api/alerts/bulk-resolve` carrying all three
+ids, and then the next engine tick must not re-open a rollup child per
+device. test_alert_operator_resolve.py proves the engine rule by driving
+AlertEngine directly; this suite drives a real `Service` and `WebServer` on
+loopback, writing poll results by hand and ticking the engine by hand.
 """
 import http.client
 import json

@@ -8,6 +8,7 @@ this file stays about the data.
 from __future__ import annotations
 
 import csv
+import functools
 import io
 import ipaddress
 import sqlite3
@@ -20,7 +21,7 @@ import time
 from ..alertrules import device_id_for
 from ..alertsdb import is_window_active
 from ..analysis import availability, build_timeline, build_topology, clamp_window
-from .. import hostresolve
+from .. import namelookup
 from ..services import format_bytes, format_packets, format_rate, port_name, protocol_name
 from ..tracer import expected_budget, unreachable_text
 from ..flowdb import DIMENSIONS
@@ -32,13 +33,11 @@ from ..eventlog import (ALERTS as ALERTS_CATEGORY, CATEGORIES,
                         WIRELESS as WIRELESS_CATEGORY)
 from ..syslogparse import FACILITIES, SEVERITIES, facility_name, severity_name
 from ..trapdecode import GENERIC_NAMES, VERSION_NAMES, enc_octets, format_ticks
-from .. import trapoids
+from .. import trapdecode
 from .. import nodeoids
 from .. import configrx
 from .. import configrx_compliance
 from .. import configrx_redact
-from .. import configrx_search
-from .. import configrx_vendors
 from .. import sshterm
 from .. import enterprises, mibcatalog, vendorid
 from .. import nodesdb
@@ -52,34 +51,12 @@ MIN_BLOCK_PX = 3
 
 # ---------------------------------------------------------------------- CSV
 #
-# Every export route below answers with JSON, not a raw file download: the
-# response machinery in server.py sends one fully-buffered body per request
-# and has no Content-Disposition path, and building one just for CSV would
-# be a second way to hand a file to a browser alongside the one the OID
-# walk download already established. get_nodes_device_oid_walk hands the
-# file back as a `text` field and lets the browser do the Blob-and-anchor
-# trick client-side (App.download, app.js) — every export here follows
-# that precedent instead of inventing a competing mechanism.
-#
-# The csv module is what actually does the quoting: a device name with an
-# embedded comma, a syslog message with an embedded quote or newline, is
-# exactly what RFC 4180 quoting exists for, and hand-joining strings with
-# commas gets it wrong the first time either shows up. The BOM is prepended
-# to the text itself, not a header, since there is no raw response for a
-# header to sit on — Excel opens a BOM-led file as UTF-8 instead of
-# guessing a system codepage and mangling anything outside ASCII.
-#
-# RFC 4180 quoting is not the whole job, because the program that opens
-# these files is a spreadsheet, not a CSV parser. Excel and Sheets treat a
-# cell whose text begins with = + - or @ as a formula, and the DDE forms of
-# that (=cmd|'\u2026'!A0) prompt to launch a program. The content here is not
-# ours: a syslog message is written by anything that can reach UDP/514,
-# which needs no account and no HTTP request at all, and a device name, an
-# interface description or an LLDP neighbour's name comes from the device.
-# So an unauthenticated sender on the network could put a formula in a
-# syslog line, wait for an operator to export a search and open it, and get
-# the prompt on the analyst's workstation. A leading apostrophe is the
-# conventional inert prefix: the spreadsheet drops it and shows the text.
+# A spreadsheet treats a cell beginning = + - or @ as a formula, and the DDE
+# forms prompt to launch a program — while the content here is written by
+# whatever can reach UDP/514 or answer an SNMP walk, not by an operator. The
+# leading apostrophe is the conventional inert prefix. Exports answer as
+# JSON (server.py has no Content-Disposition path); the browser saves the
+# `text` field itself.
 _CSV_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
 
 
@@ -124,15 +101,13 @@ def _audit(service, params, action: str, target: str = "",
     work and is gone on the next restart, this is the record that answers
     "who changed that" a month later.
 
-    Originally scoped to authentication, authorization, credential and
-    destructive-administration actions only; widened in 4.49.0 to cover
-    configuration changes an operator needs to answer for after the fact —
-    NetPath destinations, devices and their bulk operations, device groups,
-    polling profiles (including the literal "who changed the threshold"
-    case), MIBs, alert rule definitions, IPAM subnets, and ConfigRX backup
-    deletion — because "who changed the CPU threshold from 90 to 99 last
-    March" was unanswerable before this, which is a compliance blocker on
-    a site under an ISO or food-safety regime. Still not a second copy of
+    Covers authentication, authorization, credential and destructive-
+    administration actions, plus the configuration changes an operator has
+    to answer for after the fact: NetPath destinations, devices and their
+    bulk operations, device groups, polling profiles, MIBs, alert rule
+    definitions, IPAM subnets and ConfigRX backup deletion. "Who changed the
+    CPU threshold from 90 to 99 last March" is a compliance question on a
+    site under an ISO or food-safety regime. Still not a second copy of
     the event log: this is the durable record, that is the live ring.
     """
     service.app_db.audit(params.get("_username", ""), params.get("_client", ""),
@@ -175,19 +150,107 @@ def _num(params, key, default=None, cast=float):
         return default
 
 
+def _page(params, default, cap) -> tuple[int, int]:
+    """The (limit, offset) every paginated list route reads from the query
+    string, clamped: limit into [1, cap], offset at 0 or above. SQLite reads
+    a negative LIMIT as "no limit", so an unclamped ?limit=-1 returns the
+    whole table instead of a page."""
+    limit = max(1, min(int(_num(params, "limit", default, int) or default), cap))
+    offset = max(0, int(_num(params, "offset", 0, int) or 0))
+    return limit, offset
+
+
+def _require(row, what: str):
+    """`row` back, or ValueError("No such <what>") — the not-found shape
+    server.py turns into a 404-equivalent error response."""
+    if not row:
+        raise ValueError(f"No such {what}")
+    return row
+
+
+def _pick(body: dict, allowed) -> dict:
+    """Only the keys of `body` an update route is allowed to write. The
+    allow-list is the boundary: anything not named here never reaches a
+    database column, whatever the caller sent."""
+    return {k: v for k, v in body.items() if k in allowed}
+
+
+def _encrypt_secret(secret: str, unavailable: str) -> bytes:
+    """A secret encrypted for storage, or ValueError.
+
+    `unavailable` is the caller's own "this machine cannot store one"
+    message, worded for the field the operator is actually looking at.
+    The plaintext is dropped from this frame before returning either way:
+    with neither DPAPI nor a configured passphrase store, nothing here
+    writes a plaintext password or a weaker cipher instead.
+    """
+    from .. import dpapi
+
+    if not dpapi.available():
+        raise ValueError(unavailable)
+    try:
+        return dpapi.protect(secret.encode("utf-8"))
+    except dpapi.DpapiUnavailable as exc:
+        raise ValueError(str(exc))
+    finally:
+        secret = None
+
+
+def _v3_fields(body: dict) -> tuple[str, str, str]:
+    """(user, auth_proto, password) from an SNMPv3 credential body — all
+    three required, since a v3 credential is meaningless without them."""
+    user = str(body.get("v3_user", "")).strip()
+    password = str(body.get("v3_auth_pass", ""))
+    auth_proto = str(body.get("v3_auth_proto", "")).strip()
+    if not user or not password or not auth_proto:
+        raise ValueError("A username, auth protocol, and password are all required")
+    return user, auth_proto, password
+
+
+def _store_v3_credential(service, params, body, *, store, category, message,
+                         target, unavailable) -> dict:
+    """Store one SNMPv3 credential: validate the body, encrypt the password,
+    hand (user, auth_proto, encrypted) to `store`, then log and audit it.
+
+    `store` is the caller's own database call, `unavailable` its own wording
+    for a host that cannot encrypt. The password never leaves this frame.
+    """
+    user, auth_proto, password = _v3_fields(body)
+    try:
+        encrypted = _encrypt_secret(password, unavailable)
+    finally:
+        password = None
+    store(user, auth_proto, encrypted)
+    service.log.add(category, message)
+    _audit(service, params, "credential.store", target=target,
+           detail=f"SNMPv3 user {user}")
+    return {"ok": True}
+
+
+def _clear_credential(service, params, *, clear, category, message=None,
+                      target=None) -> dict:
+    """Drop one stored credential via the caller's own `clear` call, then
+    log and audit it. `message`/`target` are omitted by the routes that
+    write only one of the two records today."""
+    clear()
+    if target is not None:
+        _audit(service, params, "credential.clear", target=target)
+    if message:
+        service.log.add(category, message)
+    return {"ok": True}
+
+
 def _window(params, default_span_s: float = 3600.0) -> tuple[float, float]:
     """The (t0, t1) every windowed route reads from the query string.
 
-    Runs through analysis.clamp_window, which is the same rule the NetPath
-    side has always applied and which this helper used to skip. Skipping it
-    mattered because `_num(..., float)` happily parses "inf", "nan" and
-    "1e18": nothing here rejected them, and t1 <= t0 does not catch a NaN or
-    an infinity. A caller could then hand a downstream aggregator a span of
-    1e18 seconds, and flowdb.overview sizes its per-series lists from
-    (t1 - t0) / bucket_s — an allocation with no ceiling but the machine's
-    memory, attempted on the request thread of a host that is also polling
-    devices and receiving flows. clamp_window bounds the magnitude, the
-    ordering and the span, and returns a sane pair for input that is not a
+    Runs through analysis.clamp_window, the same rule the NetPath side
+    applies. It matters because `_num(..., float)` happily parses "inf",
+    "nan" and "1e18", and a t1 <= t0 check catches neither: a span of 1e18
+    seconds reaches flowdb.overview, which sizes its per-series lists from
+    (t1 - t0) / bucket_s — an allocation bounded only by the machine's
+    memory, on the request thread of a host that is also polling devices and
+    receiving flows. clamp_window bounds the magnitude, the ordering and the
+    span, and returns a sane pair for input that is not a
     finite number at all."""
     t1 = _num(params, "t1", time.time())
     t0 = _num(params, "t0", t1 - default_span_s)
@@ -218,22 +281,16 @@ def _id_list(raw) -> list[int] | None:
 
 # ------------------------------------------------------------------ general
 
-# get_state is one omnibus endpoint every open tab polls regardless of
-# which module it's looking at, so it's never permission-gated as a whole
-# (the Dashboard it feeds is always reachable) — instead each per-module
-# section is dropped from the response below when the signed-in user
-# can't read that module, rather than the request being refused outright.
+# get_state is one omnibus endpoint every open tab polls, so it is never
+# permission-gated as a whole; each per-module section is dropped from the
+# response instead when the signed-in account cannot read that module.
 #
-# The payload is two routes since 4.43.0. /api/config is what changes only
-# when an operator changes it — every settings block, the grants, the constant
-# vocabularies — and carries `config_version`; /api/state is what changes on
-# its own — running flags, counters, counts, clocks — and repeats the version
-# so the browser knows when to fetch the other half. Before the split every
-# poll of every tab carried both: measured 10.9 KB every two seconds, of
-# which 6-7 KB could not have changed since the last one.
-#
-# Both maps below are applied the same way: a module's keys are dropped for
-# an account that cannot read it.
+# The payload is two routes. /api/config changes only when an operator
+# changes something — settings blocks, grants, constant vocabularies — and
+# carries `config_version`; /api/state changes on its own — running flags,
+# counters, clocks — and repeats the version so the browser knows when to
+# fetch the other half. Both maps below drop a module's keys for an account
+# that cannot read it.
 _CONFIG_MODULE_KEYS = {
     "netflow": ("flow_settings", "dimensions"),
     "syslog": ("syslog_settings",),
@@ -257,13 +314,11 @@ _STATE_MODULE_KEYS = {
 }
 
 # Global settings only a Settings reader may see. "settings" itself stays in
-# every response — every module's own refresh cadence lives in it and every
-# tab needs those — but these keys are server internals with no reason to
-# reach an account without Settings access: where the listener binds and
-# which TLS material it loads, how long a sign-in lasts, which resolver the
-# nslookup subprocesses are pointed at, and — Tier 1 #10 — the directory's
-# address, its bind DN template (which names the plant's LDAP tree
-# structure) and its cleartext opt-out.
+# every response — every module's refresh cadence lives in it — but these
+# keys are server internals: where the listener binds and which TLS material
+# it loads, how long a sign-in lasts, which resolver the nslookup
+# subprocesses are pointed at, and the directory's address, bind DN template
+# (which names the plant's LDAP tree structure) and cleartext opt-out.
 SETTINGS_ONLY_KEYS = ("web_host", "web_port", "web_cert", "web_key",
                       "session_idle_minutes", "session_max_hours",
                       "dns_server", "asn_server",
@@ -272,10 +327,10 @@ SETTINGS_ONLY_KEYS = ("web_host", "web_port", "web_cert", "web_key",
 
 
 def _visible_settings(settings: dict, granted: dict) -> dict:
-    """`settings` as this caller may see it. One rule, used by both the
-    endpoint that reads the settings and the one that writes them — they
-    disagreed before, and post_settings echoing the unfiltered dict was
-    half of the escalation the review found."""
+    """`settings` as this caller may see it. One rule for both the endpoint
+    that reads the settings and the one that writes them: if they disagreed,
+    post_settings echoing the unfiltered dict would hand back exactly what
+    SETTINGS_ONLY_KEYS exists to withhold."""
     if _permissions.allows(granted.get("settings"), _permissions.READ):
         return settings
     return {k: v for k, v in settings.items() if k not in SETTINGS_ONLY_KEYS}
@@ -319,18 +374,18 @@ def get_config(service, params, body) -> dict:
         "facilities": FACILITIES,
         "syslog_settings": service.syslog_settings,
         "snmp_settings": service.snmp_settings,
-        "trap_kinds": list(trapoids.KINDS),
+        "trap_kinds": list(trapdecode.KINDS),
         "ipam_settings": service.ipam_settings,
         "nodes_settings": service.nodes_settings,
         "alerts_settings": service.alerts_settings,
         "wireless_settings": service.wireless_settings,
         "configrx_settings": service.configrx_settings,
         # The vendor override <select> is built from this, not a JS copy of
-        # configrx_vendors.VENDORS — label and key only, nothing a client
+        # configrx.VENDORS — label and key only, nothing a client
         # could use to influence what a backup sends over SSH. Order matches
         # the table's own (Python dicts keep insertion order).
         "configrx_vendors": [{"key": key, "label": vendor.label}
-                             for key, vendor in configrx_vendors.VENDORS.items()],
+                             for key, vendor in configrx.VENDORS.items()],
     }
     _drop_unreadable(result, granted, _CONFIG_MODULE_KEYS)
     # "settings" itself stays present even without Settings access — every
@@ -350,15 +405,13 @@ def get_state(service, params, body) -> dict:
     session = service.sessions.get(params.get("_token", ""))
     idle_remaining = (service.sessions.idle_seconds - (time.time() - session["last_seen"])
                       if session else None)
-    # The absolute ceiling is the other way a session ends, and staying at the
-    # keyboard does not move it. It used to arrive with no warning at all: a
-    # wallboard left up overnight simply became the sign-in page. Sent the
-    # same way as the idle figure — server-authoritative, so a browser clock
-    # that disagrees cannot make the countdown lie.
+    # The absolute ceiling is the other way a session ends, and staying at
+    # the keyboard does not move it. Server-authoritative like the idle
+    # figure, so a browser clock that disagrees cannot make the countdown
+    # lie.
     max_remaining = (service.sessions.max_seconds - (time.time() - session["created"])
                      if session else None)
     granted = service.app_db.permissions_for(params.get("_username", ""))
-    # One lookup, not two: this expression used to call user() twice.
     account = service.app_db.user(session["username"]) if session else None
     names = service.cached_poll("hostname_stats", 10, service.hostname_stats)
     # One lookup, not two: open_worst and unresolved_count below both read
@@ -523,16 +576,12 @@ def get_targets(service, params, body) -> dict:
                         for row in rows]}
 
 
-# Bounds a NetPath target's own numeric fields (or the matching default_*
-# global settings, see _GLOBAL_SETTINGS_RANGES below) may not exceed —
-# db.py's own MIN_*/MAX_* constants, referenced rather than re-typed, so the
-# two enforcement points (this 400 and db.py's _clamp_target_fields backstop
-# for any OTHER caller — a test, a migration, a future internal path) can
-# never quietly disagree about what "in range" means. See db.py's own
-# comment above those constants for the mechanism each field reaches
-# (a subprocess argument, expected_budget's runtime math, or monitor.py's
-# scheduler — interval_s at or below zero is a self-inflicted spawn storm
-# against one destination).
+# Bounds a NetPath target's numeric fields may not exceed. db.py's own
+# MIN_*/MAX_* constants are referenced rather than re-typed, so this 400 and
+# db.py's _clamp_target_fields backstop can never disagree about what "in
+# range" means. Each field reaches a subprocess argument, expected_budget's
+# arithmetic, or monitor.py's scheduler — an interval_s at or below zero is
+# a spawn storm against one destination.
 _TARGET_FIELD_RANGES = {
     "interval_s": (int, netpathdb.MIN_INTERVAL_S, netpathdb.MAX_INTERVAL_S),
     "max_hops": (int, netpathdb.MIN_MAX_HOPS, netpathdb.MAX_MAX_HOPS),
@@ -598,14 +647,12 @@ def put_target(service, params, body, target_id: int) -> dict:
     # changed afterward; update_target itself never reads the row it is
     # about to overwrite.
     before = service.db.target(target_id)
-    fields = {k: v for k, v in body.items()
-              if k in {"host", "label", "interval_s", "max_hops", "probes",
-                       "warn_rtt_ms", "warn_loss", "timeout_s", "enabled"}}
-    # The same check the add route makes. Without it the validation there was
-    # worth nothing: add a destination with a host that resolves, then edit it
-    # to anything at all, and the traceroute thread spends every interval
-    # failing against a name that cannot exist — which is the state this
-    # release added that validation to stop.
+    fields = _pick(body, {"host", "label", "interval_s", "max_hops", "probes",
+                          "warn_rtt_ms", "warn_loss", "timeout_s", "enabled"})
+    # The same check the add route makes: without it, a destination could be
+    # added with a host that resolves and then edited to anything at all,
+    # leaving the traceroute thread failing every interval against a name
+    # that cannot exist.
     if "host" in fields:
         # str() first, the way the add route does it: `ip_address(123)` is a
         # perfectly valid address object, so an integer would be stored as
@@ -761,7 +808,7 @@ def get_topology(service, params, body) -> dict:
         rows = service.db.hop_rows_for_trace(trace["id"])
         ips = {r["ip"] for r in rows}
         names = service.app_db.hostnames(ips)
-        from_nodes = hostresolve.fill_from_nodes(service.nodes_db, names, ips)
+        from_nodes = namelookup.fill_from_nodes(service.nodes_db, names, ips)
         asn_data = service.app_db.asn_info(ips)
         topo = build_topology(rows, dest_ip=service.db.destination_ip(target_id),
                               hostnames=names, asn_data=asn_data)
@@ -791,8 +838,8 @@ def get_topology(service, params, body) -> dict:
     # than in monitor.Resolver because service.nodes_db is already in hand at
     # this layer — and because baking a Nodes name into the DNS cache would
     # have it aged out on a DNS schedule and go stale when the device is
-    # renamed. See hostresolve.fill_from_nodes for the precedence.
-    from_nodes = hostresolve.fill_from_nodes(service.nodes_db, names, ips)
+    # renamed. See namelookup.fill_from_nodes for the precedence.
+    from_nodes = namelookup.fill_from_nodes(service.nodes_db, names, ips)
     asn_data = service.app_db.asn_info(ips)
     # Aged against t1, the end of the window being drawn, so panning back into
     # last month still shows the path as it stood then. The pinned-snapshot
@@ -867,7 +914,7 @@ def _flow_label(service, dimension: str, key, names: dict | None = None) -> str:
         # table cannot disagree about what a device is called. filterByBar
         # sends the key rather than this label, so filtering still keys off
         # the address.
-        return hostresolve.resolve_name(
+        return namelookup.resolve_name(
             service.nodes_db, service.app_db, text) or text
     if dimension in ("Source AS", "Destination AS"):
         return f"AS{text}"
@@ -880,15 +927,12 @@ def _flow_label(service, dimension: str, key, names: dict | None = None) -> str:
 
 
 # flowdb.overview allocates one float per bucket per series, so the bucket
-# count — not the span — is what decides how much memory a chart request
-# costs. The ladder below stops at 14 days, and every wider span used to
-# fall through to a flat six-hour bucket however wide it actually was, so
-# the count kept growing with the window instead of levelling off. A
-# configured bucket_seconds could do the same from the other direction: a
-# ten-second bucket over a year is 3.15 million of them. Both are bounded
-# here by widening the bucket until the count fits, which is the same thing
-# analysis.build_timeline does for its own MAX_BUCKETS rather than
-# narrowing the window the operator asked for.
+# count — not the span — decides what a chart request costs in memory. A
+# span past the ladder's last rung, or a configured bucket_seconds far too
+# small for the window (a ten-second bucket over a year is 3.15 million of
+# them), is bounded by widening the bucket until the count fits rather than
+# narrowing the window the operator asked for — the same thing
+# analysis.build_timeline does for its own MAX_BUCKETS.
 FLOW_MAX_BUCKETS = 5000
 
 
@@ -918,9 +962,7 @@ def get_flow_overview(service, params, body) -> dict:
     top_n = int(service.flow_settings.get("top_n", 10))
 
     # One aggregate pass over the window feeds the chart, the top-N bars and
-    # the totals line together; they used to be three separate scans (four,
-    # counting the one series() made internally), which is what made a wide
-    # window crawl.
+    # the totals line together, rather than a scan each.
     times, series, bucket_s, top_rows, totals = service.flow_db.overview(
         t0, t1, dimension, filters, bucket, series_limit=8, top_limit=top_n)
 
@@ -954,11 +996,10 @@ def get_flow_overview(service, params, body) -> dict:
     }
 
 
-# The screen has always asked for the top 250 records by whichever order
-# is selected (nf-order in index.html); FLOW_EXPORT_CAP is the export
-# ceiling item 1 asked every capped list to lift — comfortably past what
-# one export click should ever hand back, still far short of "do not
-# buffer a million rows".
+# The screen asks for the top 250 records by whichever order is selected
+# (nf-order in index.html); FLOW_EXPORT_CAP is the taller export ceiling —
+# past what one export click should hand back, still far short of buffering
+# a million rows.
 FLOW_SCREEN_LIMIT = 250
 FLOW_EXPORT_CAP = 20000
 
@@ -982,15 +1023,13 @@ def _flow_records_rows(service, params, limit: int) -> tuple[list[dict], bool]:
         names = {ip: name for ip, name
                  in service.app_db.hostnames(addresses).items() if name}
     interfaces = service.flow_db.interface_names()
-    # A page of records comes from a handful of exporters, so one lookup per
-    # distinct address is cheap. Resolved through the shared helper rather
-    # than a bespoke query, so the Exporter column agrees with Syslog's Host
-    # column and Alerts' Object column about what a device is called:
-    # SNMP sysName, then a manual name that is not just the address, then
-    # the reverse-DNS cache.
+    # Resolved through the shared helper rather than a bespoke query, so the
+    # Exporter column agrees with Syslog's Host column and Alerts' Object
+    # column about what a device is called: SNMP sysName, then a manual name
+    # that is not just the address, then the reverse-DNS cache.
     exporter_names = {}
     for address in {r["exporter"] for r in rows if r["exporter"]}:
-        name = hostresolve.resolve_name(service.nodes_db, service.app_db, address)
+        name = namelookup.resolve_name(service.nodes_db, service.app_db, address)
         if name and name != address:
             exporter_names[address] = name
     # Flow-to-path correlation: which NetPath target (if any) last traced a
@@ -1142,12 +1181,10 @@ ws_ssh_device.hijack = True
 
 # Which module's grant an event category belongs to. eventlog.CATEGORIES is
 # a display taxonomy, not an authorization one, so the mapping is written
-# out here rather than assumed. The three that name no module of their own
-# go to `settings`: `system` carries sign-in history and account changes,
-# `error` carries every module's failure detail (including ConfigRX's), and
-# `dns` names the addresses the resolver is working through. Holding
-# `debug` alone still shows the worker tables, counters and schedules,
-# which is what the Debug page is for.
+# out rather than assumed. The three naming no module go to `settings`:
+# `system` carries sign-in history and account changes, `error` every
+# module's failure detail, `dns` the addresses the resolver is working
+# through.
 _EVENT_CATEGORY_MODULE = {
     "trace": "netpath",
     "dns": "settings",
@@ -1202,12 +1239,10 @@ def get_debug(service, params, body) -> dict:
                 entry["elapsed"] = now - (work.get("queued") or now)
         workers.append(entry)
 
-    # The event log is one stream carrying every module's events, and
-    # `debug: read` was enough to read all of them — device names and
+    # One stream carries every module's events — device names and
     # addresses, DHCP server labels, ConfigRX failure detail, sign-in
-    # history — with no grant on any of those modules. Each category is
-    # filtered by the module it belongs to, so the Debug page shows a
-    # caller their own modules' events and nothing else.
+    # history — so `debug: read` alone must not read all of it. Each
+    # category is filtered by the module it belongs to.
     granted = service.app_db.permissions_for(params.get("_username", ""))
     visible = {category for category, module in _EVENT_CATEGORY_MODULE.items()
                if _permissions.allows(granted.get(module), _permissions.READ)}
@@ -1251,11 +1286,10 @@ def get_debug(service, params, body) -> dict:
             })
         ipam_workers.sort(key=lambda row: row["elapsed"], reverse=True)
 
-    # One row per device currently being polled or queued to be — the
-    # same "join worker_state against the entity list for a label" shape
-    # the NetPath `workers` table above already uses, just without that
-    # table's per-target budget/schedule columns, since a device's poll
-    # has no fixed budget the way a trace's hop/probe counts imply one.
+    # One row per device currently being polled or queued to be — the same
+    # shape the NetPath `workers` table above uses, without its per-target
+    # budget/schedule columns: a device's poll has no fixed budget the way a
+    # trace's hop/probe counts imply one.
     node_state = service.node_poller.worker_state()
     node_workers = []
     if node_state:
@@ -1334,48 +1368,37 @@ def post_debug_clear(service, params, body) -> dict:
 
 # ----------------------------------------------------------------- settings
 
-# Which module owns each settings scope, and what POST /api/settings does
-# with it: {scope: (Service method name, response key)}. The route table
-# derives the permission from THIS table (server._settings_requirement)
-# rather than from permissions.MODULES — a module in MODULES with no entry
-# here (`debug` was one) used to be authorized against itself and then fall
-# through to the global writer, which is how a debug:write account rewrote
-# the listener's bind address, TLS paths and the DNS server. Anything not
-# named here is the Settings module's, by construction.
+# Every settings scope a module owns, and the key POST /api/settings answers
+# with: {scope: response key}. The route table derives the permission from
+# THIS table (server._settings_requirement) rather than from
+# permissions.MODULES — a module in MODULES with no entry here (`debug` was
+# one) was authorized against itself and then fell through to the global
+# writer, which is how a debug:write account rewrote the listener's bind
+# address, TLS paths and the DNS server. Anything not named here is the
+# Settings module's, by construction.
 SETTINGS_SCOPES = {
-    "netpath": ("apply_netpath_settings", "settings"),
-    "netflow": ("apply_netflow_settings", "flow_settings"),
-    "syslog": ("apply_syslog_settings", "syslog_settings"),
-    "snmp": ("apply_snmp_settings", "snmp_settings"),
-    "ipam": ("apply_ipam_settings", "ipam_settings"),
-    "nodes": ("apply_nodes_settings", "nodes_settings"),
-    "alerts": ("apply_alerts_settings", "alerts_settings"),
-    "wireless": ("apply_wireless_settings", "wireless_settings"),
-    "configrx": ("apply_configrx_settings", "configrx_settings"),
+    "netpath": "settings",
+    "netflow": "flow_settings",
+    "syslog": "syslog_settings",
+    "snmp": "snmp_settings",
+    "ipam": "ipam_settings",
+    "nodes": "nodes_settings",
+    "alerts": "alerts_settings",
+    "wireless": "wireless_settings",
+    "configrx": "configrx_settings",
 }
 
 
 # Global settings that are not an operator's to change even with Settings
-# write: turning this host's self-update on decides whether it will replace
-# its own code from the internet, and the ldap_* keys decide who may sign
-# in at all and where a password gets sent — both are administrator
-# decisions in the same sense creating an account is, not preferences.
-#
-# The session_* and web_* keys are here for the same reason, and were
-# missed when "admin" was first carved out of "settings" (see
-# permissions.py's docstring for why that split exists at all). They are
-# already classified as sensitive server internals by SETTINGS_ONLY_KEYS
-# below — "where the listener binds and which TLS material it loads, how
-# long a sign-in lasts" — but classifying them only hid them from a reader
-# without Settings access; nothing stopped a plain settings:write grant,
-# deliberately weaker than admin, from writing them. That grant could
-# extend session_idle_minutes and session_max_hours for every account on
-# the host (apply_global_settings hands them straight to
-# SessionStore.configure, so it takes effect immediately, not at the next
-# restart), or repoint web_cert/web_key/web_host/web_port at material of
-# its own choosing for the next start. Deciding how long a sign-in lasts
-# and which certificate the listener presents is an administrator's call
-# in exactly the sense the ldap_* keys already were.
+# write. Turning self-update on decides whether this host replaces its own
+# code from the internet; the ldap_* keys decide who may sign in at all and
+# where a password gets sent; session_* decides how long every account's
+# sign-in lasts (applied immediately, not at the next restart); web_* decides
+# which certificate the listener presents and where it binds. Each is an
+# administrator's call in the same sense creating an account is.
+# SETTINGS_ONLY_KEYS below only hides them from a reader — this is what
+# stops a settings:write grant, deliberately weaker than admin, writing
+# them.
 ADMIN_ONLY_SETTINGS = ("updates_enabled", "ldap_enabled", "ldap_url",
                       "ldap_bind_dn_template", "ldap_allow_cleartext",
                       "ldap_timeout_s",
@@ -1394,11 +1417,10 @@ def _may_change_admin_settings(service, params) -> bool:
     return _is_admin(service, params)
 
 
-# Mirrors the min/max already on each of these inputs in index.html: the
-# Settings page refuses an out-of-range number before ever posting, but an
-# API client can skip the browser entirely, so this route holds the global
-# scope's numeric settings to the same bounds. None as a high means the
-# field is open-ended (a database cap has a floor, never a ceiling).
+# Mirrors the min/max on each of these inputs in index.html: the Settings
+# page refuses an out-of-range number before posting, but an API client can
+# skip the browser. None as a high means the field is open-ended (a database
+# cap has a floor, never a ceiling).
 _GLOBAL_SETTINGS_RANGES = {
     "dns_workers": (1, 32),
     "dns_timeout_s": (0.5, 30),
@@ -1416,12 +1438,10 @@ _GLOBAL_SETTINGS_RANGES = {
     "dashboard_refresh_s": (1, 3600),
     "debug_refresh_s": (1, 60),
     "max_trace_db_mb": (16, None),
-    # The age cap beside the size cap. It had no entry here at all, which
-    # only survived because prune() used to run solely from the manual
-    # maintenance action; now that the maintenance pass calls it every
-    # interval, a 0 posted straight to the API (the Settings page's own
-    # input says min="1", but a client can skip the browser) computes a
-    # cutoff of "now" and deletes every trace, again and again, silently.
+    # The age cap beside the size cap. The maintenance pass calls prune()
+    # every interval, so a 0 posted straight to the API (the Settings page's
+    # input says min="1", but a client can skip the browser) would compute a
+    # cutoff of "now" and silently delete every trace, over and over.
     "trace_retention_days": (1, 3650),
     "max_flow_db_mb": (16, None),
     "max_snmp_db_mb": (16, None),
@@ -1431,16 +1451,12 @@ _GLOBAL_SETTINGS_RANGES = {
     "max_alerts_db_mb": (16, None),
     "session_idle_minutes": (1, 1440),
     "session_max_hours": (1, 168),
-    # These five are netpath-scope, not global, but land in this same flat
+    # These five are netpath-scope, not global, but land in the same flat
     # dict because _check_settings_ranges only cares whether a key is
-    # PRESENT in the submitted values, never which scope it came from — see
-    # _validate_target_fields/_TARGET_FIELD_RANGES above for what each one
-    # actually reaches (trace_workers -> a ThreadPoolExecutor size; the
-    # rest are what a new target is created from when the caller does not
-    # specify its own). Referencing db.py's own MIN_*/MAX_* constants
-    # rather than repeating the numbers, unlike every other entry above,
-    # so this can never quietly drift from the bounds add_target/
-    # update_target enforce for a target's own fields.
+    # PRESENT, never which scope it came from. trace_workers is a
+    # ThreadPoolExecutor size; the rest are what a new target is created
+    # from. Referencing db.py's MIN_*/MAX_* rather than repeating the
+    # numbers, so this cannot drift from what add_target enforces.
     "trace_workers": (netpathdb.MIN_TRACE_WORKERS, netpathdb.MAX_TRACE_WORKERS),
     "default_interval_s": (netpathdb.MIN_INTERVAL_S, netpathdb.MAX_INTERVAL_S),
     "default_max_hops": (netpathdb.MIN_MAX_HOPS, netpathdb.MAX_MAX_HOPS),
@@ -1474,7 +1490,7 @@ def _scope_defaults(scope: str) -> dict:
 
 
 def post_settings(service, params, body) -> dict:
-    from ..settingsutil import coerce_settings
+    from ..sqlitebase import coerce_settings
 
     scope = str(body.get("scope", "global"))
     values = body.get("values") or {}
@@ -1482,25 +1498,21 @@ def post_settings(service, params, body) -> dict:
         raise ValueError("values must be an object")
     granted = service.app_db.permissions_for(params.get("_username", ""))
     # Only the keys this scope would actually write. A per-module scope
-    # discards anything outside its own defaults a few lines below, so a
-    # netpath-scope POST that happens to carry web_cert never sets web_cert
-    # — and refusing the whole request because the key was *mentioned* would
-    # turn a harmless ignored field into a 403, which is a behaviour change
-    # in its own right and one an existing suite pins deliberately (a
-    # module-scope write that names a global key is accepted, and the global
-    # key is dropped). Filtering by the scope's own defaults keeps that
-    # contract intact while still refusing the write that would really land.
+    # discards anything outside its own defaults below, so a netpath-scope
+    # POST carrying web_cert never sets web_cert — and refusing the whole
+    # request because the key was *mentioned* would turn a harmlessly ignored
+    # field into a 403. Filtering by the scope's own defaults still refuses
+    # the write that would really land.
     scope_keys = _scope_defaults(scope)
     touched = [key for key in ADMIN_ONLY_SETTINGS
                if key in values and key in scope_keys]
     if touched and not _may_change_admin_settings(service, params):
         raise _permissions.Forbidden(
             f"Changing {', '.join(touched)} needs administrator access")
-    # Typed before anything is written. The apply_* methods update and save
-    # first and coerce later (or never), and the loaders hand back whatever
-    # was stored, so a null or "abc" for a numeric key was persisted and
-    # then raised from the next start's int() — every start, until the
-    # database was edited by hand.
+    # Typed before anything is written: apply_settings saves first and the
+    # loaders hand back whatever was stored, so a null or "abc" for a
+    # numeric key would persist and then raise from every subsequent start's
+    # int() until the database was edited by hand.
     values = coerce_settings(_scope_defaults(scope), values, strict=True)
     _check_settings_ranges(values)
     # The keys, never the values: a settings value can be a credential-
@@ -1508,15 +1520,16 @@ def post_settings(service, params, body) -> dict:
     # was touched, not a second copy of the configuration.
     _audit(service, params, "settings.change", target=scope,
            detail=", ".join(sorted(str(k) for k in values)) or "nothing")
-    entry = SETTINGS_SCOPES.get(scope)
-    if entry is None:
+    key = SETTINGS_SCOPES.get(scope)
+    if key is None:
         applied = service.apply_global_settings(values)
         return {"settings": _visible_settings(applied, granted)}
-    method, key = entry
-    applied = getattr(service, method)(values)
-    # NetPath's apply returns the merged settings dict, which carries the
-    # global keys too; every other scope returns only its own module's.
-    return {key: _visible_settings(applied, granted) if key == "settings" else applied}
+    if scope == "netpath":
+        # NetPath's apply returns the merged settings dict, which carries the
+        # global keys too; every other scope returns only its own module's.
+        applied = service.apply_netpath_settings(values)
+        return {key: _visible_settings(applied, granted)}
+    return {key: service.apply_settings(scope, values)}
 
 
 def post_update(service, params, body) -> dict:
@@ -1536,9 +1549,8 @@ def post_update(service, params, body) -> dict:
                         f"restarting")
         # Through a connection of its own, not the service's: a successful
         # apply() has already stopped everything and closed app.db, so the
-        # ordinary audit path could only fail here — which is what it did,
-        # losing the record of who replaced this host's code and writing a
-        # traceback to the log on every successful update.
+        # ordinary audit path can only fail here — and the record of who
+        # replaced this host's code is the one that must survive.
         from ..appdb import write_audit
         write_audit(db_path, str(params.get("_username", "")),
                     str(params.get("_client", "")), "update.installed",
@@ -1626,7 +1638,7 @@ def get_audit(service, params, body) -> dict:
     if "t0" in params or "t1" in params:
         return _get_audit_search(service, params)
     since = int(_num(params, "since", 0, int) or 0)
-    limit = int(_num(params, "limit", 500, int) or 500)
+    limit, _offset = _page(params, 500, _appdb.AUDIT_MAX_LIMIT)
     rows = service.app_db.audit_events(since, limit)
     return {
         "events": [{"id": row["id"], "ts": row["ts"],
@@ -1635,7 +1647,7 @@ def get_audit(service, params, body) -> dict:
                     "detail": row["detail"]} for row in rows],
         "last_id": rows[-1]["id"] if rows else since,
         "max_id": service.app_db.audit_last_id(),
-        "limit": min(max(1, limit), _appdb.AUDIT_MAX_LIMIT),
+        "limit": limit,
     }
 
 
@@ -1653,7 +1665,7 @@ def _get_audit_search(service, params) -> dict:
     """
     t1 = _num(params, "t1", time.time())
     t0 = _num(params, "t0", t1 - 2592000)
-    limit = int(_num(params, "limit", 200, int) or 200)
+    limit, _offset = _page(params, 200, _appdb.AUDIT_MAX_LIMIT)
     before_id = _num(params, "before_id", None, int)
     rows = service.app_db.audit_query(
         t0, t1, username=params.get("username") or "",
@@ -1709,11 +1721,10 @@ def get_syslog_overview(service, params, body) -> dict:
 # read "300 of 4,120 shown" instead of "300 shown".
 SEARCH_ROW_CAP = 2000
 
-# Item 1: the on-screen search stays capped at SEARCH_ROW_CAP — that is a
-# "do not try to render this many table rows" limit, not a data limit —
-# but an export exists precisely to leave with more than a screen can
-# hold, so both the syslog and SNMP trap exports get this taller ceiling
-# instead.
+# The on-screen search stays capped at SEARCH_ROW_CAP — a "do not try to
+# render this many table rows" limit, not a data limit. An export exists to
+# leave with more than a screen can hold, so both the syslog and SNMP trap
+# exports get this taller ceiling instead.
 EXPORT_ROW_CAP = 20000
 
 
@@ -1725,20 +1736,14 @@ def _syslog_search_rows(service, params, cap: int, *,
     filters = _syslog_filters(params)
 
     started = time.time()
-    # The screen's own request carries a `limit` (300 on-screen default,
-    # or whatever page size the UI asked for) that this bounds against
-    # `cap` — SEARCH_ROW_CAP for the screen. The export handler below asks
-    # for use_request_limit=False instead of threading its own `limit`
-    # through: the export buttons never send a limit param at all, so a
-    # request has no way to distinguish "the caller explicitly wants only
-    # 300 rows" from "the caller sent nothing and 300 is just the
-    # screen's on-screen default" — reading that default as a request
-    # here is what silently capped every export at 300 rows while the
-    # response's own cap field still said EXPORT_ROW_CAP. An export
-    # always wants every matching row up to the export ceiling, full stop.
+    # The screen's request carries a `limit` this bounds against `cap`. The
+    # export handler passes use_request_limit=False instead: the export
+    # buttons send no limit at all, so nothing here could tell "the caller
+    # wants only 300 rows" from "the caller sent nothing and 300 is the
+    # screen's default" — and an export always wants every matching row up
+    # to the export ceiling.
     if use_request_limit:
-        limit = int(_num(params, "limit", 300, int) or 300)
-        effective = min(limit, cap)
+        effective = _page(params, 300, cap)[0]
     else:
         effective = cap
     rows = service.syslog_db.search(t0, t1, filters, limit=effective + 1)
@@ -1755,19 +1760,17 @@ def _syslog_search_rows(service, params, cap: int, *,
                  service.app_db.hostnames({row["source"] for row in rows}).items()
                  if name}
 
-    # The message itself only supplies a host when the device bothers to
-    # self-report one; fill the gap (blank, or just the source IP
-    # repeated) from whichever of the Nodes SNMP identity or the DNS
-    # cache knows a real name for that address — Nodes first, since it's
-    # a locally-managed, polled identity rather than a PTR record. Unlike
-    # the Source column's resolved name above, this always runs — it's
-    # filling in what the Host column is supposed to mean, not an opt-in
-    # display toggle.
+    # The message supplies a host only when the device self-reports one;
+    # fill the gap from the Nodes SNMP identity or the DNS cache, Nodes
+    # first since it is a locally-managed polled identity rather than a PTR
+    # record. Unlike the Source column's resolved name above this always
+    # runs: it fills in what the Host column means, rather than being an
+    # opt-in display toggle.
     resolved_hosts = {}
     need = {row["source"] for row in rows
             if not row["host"] or row["host"] == row["source"]}
     for ip in need:
-        name = hostresolve.resolve_name(service.nodes_db, service.app_db, ip)
+        name = namelookup.resolve_name(service.nodes_db, service.app_db, ip)
         if name:
             resolved_hosts[ip] = name
 
@@ -1903,8 +1906,7 @@ def _snmp_trap_rows(service, params, cap: int, *,
     # own on-screen default arriving unasked, so export ignores the
     # request's limit entirely and always asks for the full cap.
     if use_request_limit:
-        limit = int(_num(params, "limit", 300, int) or 300)
-        effective = min(limit, cap)
+        effective = _page(params, 300, cap)[0]
     else:
         effective = cap
     rows = service.snmp_db.search(t0, t1, filters, limit=effective + 1)
@@ -2115,8 +2117,7 @@ def put_ipam_subnet(service, params, body, subnet_id) -> dict:
     # Fetched before the update — update_subnet itself never reads the row
     # it is about to change, so this is the only "before" available.
     before = service.ipam_db.subnet(subnet_id)
-    fields = {k: v for k, v in body.items() if k in
-             ("cidr", "label", "vlan", "enabled")}
+    fields = _pick(body, ("cidr", "label", "vlan", "enabled"))
     service.ipam_db.update_subnet(subnet_id, **fields)
     if before is not None and fields:
         detail = _audit_diff(before, fields) or "no change"
@@ -2136,16 +2137,13 @@ def delete_ipam_subnet(service, params, body, subnet_id) -> dict:
 
 
 def post_ipam_subnet_scan(service, params, body, subnet_id) -> dict:
-    if not service.ipam_db.subnet(subnet_id):
-        raise ValueError("No such subnet")
+    _require(service.ipam_db.subnet(subnet_id), "subnet")
     service.ipam.scan_now(subnet_id)
     return {"ok": True}
 
 
 def post_ipam_subnet_clear(service, params, body, subnet_id) -> dict:
-    subnet = service.ipam_db.subnet(subnet_id)
-    if not subnet:
-        raise ValueError("No such subnet")
+    subnet = _require(service.ipam_db.subnet(subnet_id), "subnet")
     if subnet_id in service.ipam.state()["scanning"]:
         raise ValueError(
             "A scan of this subnet is running right now — wait for it to "
@@ -2234,10 +2232,8 @@ def post_ipam_dhcp_server(service, params, body) -> dict:
 
 
 def put_ipam_dhcp_server(service, params, body, server_id) -> dict:
-    existing = service.ipam_db.dhcp_server(server_id)
-    if not existing:
-        raise ValueError("No such DHCP server")
-    fields = {k: v for k, v in body.items() if k in ("address", "label", "enabled")}
+    existing = _require(service.ipam_db.dhcp_server(server_id), "DHCP server")
+    fields = _pick(body, ("address", "label", "enabled"))
     # A stored credential belongs to the machine it was stored for. Pointing
     # the row at a different address and then pressing Test or Poll would
     # otherwise hand that account's password to whatever answers there —
@@ -2263,8 +2259,7 @@ def delete_ipam_dhcp_server(service, params, body, server_id) -> dict:
 
 
 def post_ipam_dhcp_server_poll(service, params, body, server_id) -> dict:
-    if not service.ipam_db.dhcp_server(server_id):
-        raise ValueError("No such DHCP server")
+    _require(service.ipam_db.dhcp_server(server_id), "DHCP server")
     service.ipam.poll_dhcp_now(server_id)
     return {"ok": True}
 
@@ -2273,9 +2268,7 @@ def post_ipam_dhcp_server_test(service, params, body, server_id) -> dict:
     from ..ipam_dhcp import DhcpUnavailable, test_connection
     from ..ipam_worker import credential_for_server
 
-    server = service.ipam_db.dhcp_server(server_id)
-    if not server:
-        raise ValueError("No such DHCP server")
+    server = _require(service.ipam_db.dhcp_server(server_id), "DHCP server")
 
     # Testing an in-progress edit checks whatever is currently typed, before
     # it is saved; otherwise fall back to whatever credential already exists.
@@ -2297,24 +2290,16 @@ def post_ipam_dhcp_server_test(service, params, body, server_id) -> dict:
 
 
 def post_ipam_dhcp_server_credential(service, params, body, server_id) -> dict:
-    from .. import dpapi
-
-    server = service.ipam_db.dhcp_server(server_id)
-    if not server:
-        raise ValueError("No such DHCP server")
+    server = _require(service.ipam_db.dhcp_server(server_id), "DHCP server")
     username = str(body.get("username", "")).strip()
     password = str(body.get("password", ""))
     if not username or not password:
         raise ValueError("A username and password are both required")
-    if not dpapi.available():
-        raise ValueError(
+    try:
+        encrypted = _encrypt_secret(password, (
             "This machine cannot encrypt a stored credential — DPAPI is "
             "Windows-only. Use Windows Credential Manager instead: "
-            f"cmdkey /add:{server['address']} /user:<account> /pass:<password>")
-    try:
-        encrypted = dpapi.protect(password.encode("utf-8"))
-    except dpapi.DpapiUnavailable as exc:
-        raise ValueError(str(exc))
+            f"cmdkey /add:{server['address']} /user:<account> /pass:<password>"))
     finally:
         password = None
     service.ipam_db.set_dhcp_credential(server_id, username, encrypted)
@@ -2326,15 +2311,13 @@ def post_ipam_dhcp_server_credential(service, params, body, server_id) -> dict:
 
 
 def delete_ipam_dhcp_server_credential(service, params, body, server_id) -> dict:
-    server = service.ipam_db.dhcp_server(server_id)
-    if not server:
-        raise ValueError("No such DHCP server")
-    service.ipam_db.clear_dhcp_credential(server_id)
-    service.log.add(IPAM_CATEGORY, f"Cleared the stored credential for DHCP "
-                                   f"server {server['label']}")
-    _audit(service, params, "credential.clear",
-           target=f"dhcp:{server['address']}")
-    return {"ok": True}
+    server = _require(service.ipam_db.dhcp_server(server_id), "DHCP server")
+    return _clear_credential(
+        service, params,
+        clear=functools.partial(service.ipam_db.clear_dhcp_credential, server_id),
+        category=IPAM_CATEGORY,
+        message=f"Cleared the stored credential for DHCP server {server['label']}",
+        target=f"dhcp:{server['address']}")
 
 
 def _scope_subnet(scope_id: str, mask: str) -> str | None:
@@ -2474,10 +2457,9 @@ def _device_json(row, reveal: bool = False) -> dict:
         "ping_count": row["ping_count"], "ping_timeout_ms": row["ping_timeout_ms"],
         "unreachable_ping_only": row["unreachable_ping_only"],
         "mac_table_interval_s": row["mac_table_interval_s"],
-        # LLDP/CDP, PoE and STP polling (Tier 1 #5/#7): the same
-        # inherit-via-NULL override columns mac_table_interval_s already
-        # models, exposed the same defensive way for a row from before the
-        # migration that added them.
+        # The same inherit-via-NULL override columns mac_table_interval_s
+        # models, read defensively for a row fetched before the migration
+        # that added them has run.
         "lldp_interval_s": (row["lldp_interval_s"] if "lldp_interval_s" in row.keys() else None),
         "poe_enabled": (_tri(row["poe_enabled"]) if "poe_enabled" in row.keys() else None),
         "stp_enabled": (_tri(row["stp_enabled"]) if "stp_enabled" in row.keys() else None),
@@ -2748,15 +2730,11 @@ def _device_rows_json(service, params, rows) -> list[dict]:
     return devices
 
 
-# Item 2 of the API-heavy trio: get_nodes_devices returned the whole fleet
-# every time, unconditionally — 2.86 MB decoded and a ~1s table fill at
-# 2,000 devices, measured. Paging is opt-in rather than the new default:
-# a caller that sends neither `limit` nor `offset` still gets everything
-# back, exactly as before this existed, because nothing here can be sure
-# it is the only caller (see test_frontend_contracts.py and tests/ui/ for
-# what is pinned against the no-params shape). nodes.js is the one caller
-# switched onto the paged form; DEVICE_LIST_DEFAULT_LIMIT is its default
-# page size.
+# Paging here is opt-in, not the default: a caller that sends neither
+# `limit` nor `offset` still gets the whole fleet back, because nothing here
+# can be sure it is the only caller (test_frontend_contracts.py and tests/ui/
+# pin the no-params shape). nodes.js is the caller on the paged form, and
+# DEVICE_LIST_DEFAULT_LIMIT is its page size.
 DEVICE_LIST_DEFAULT_LIMIT = 500
 DEVICE_LIST_MAX_LIMIT = 2000
 
@@ -2767,9 +2745,7 @@ def get_nodes_devices(service, params, body) -> dict:
     if params.get("limit") is None and params.get("offset") is None:
         rows = service.nodes_db.devices(**filters)
         return {"devices": _device_rows_json(service, params, rows), "total": total}
-    offset = max(0, int(_num(params, "offset", 0, int) or 0))
-    limit = max(1, min(int(_num(params, "limit", DEVICE_LIST_DEFAULT_LIMIT, int)
-                        or DEVICE_LIST_DEFAULT_LIMIT), DEVICE_LIST_MAX_LIMIT))
+    limit, offset = _page(params, DEVICE_LIST_DEFAULT_LIMIT, DEVICE_LIST_MAX_LIMIT)
     rows = service.nodes_db.devices(limit=limit, offset=offset, **filters)
     return {"devices": _device_rows_json(service, params, rows),
             "total": total, "limit": limit, "offset": offset}
@@ -2813,7 +2789,7 @@ def get_nodes_mac_search(service, params, body) -> dict:
             continue
         locations.append({
             "device_id": row["device_id"],
-            "device_name": hostresolve.device_name(device),
+            "device_name": namelookup.device_name(device),
             "if_index": row["if_index"],
             "if_descr": row["if_descr"] or f"Interface {row['if_index']}",
             "mac": row["mac"], "vlan": row["vlan"], "seen_ts": row["seen_ts"],
@@ -2876,8 +2852,7 @@ def get_nodes_device_neighbors(service, params, body, device_id) -> dict:
     replace_neighbors' ageing scheme); the client marks a stale one rather
     than this route filtering it out, the same choice get_nodes_device_
     events makes for interface events."""
-    if not service.nodes_db.device(device_id):
-        raise ValueError("No such device")
+    _require(service.nodes_db.device(device_id), "device")
     rows = service.nodes_db.neighbours_of(device_id)
     label = _neighbor_local_port_labeler(service)
     return {"neighbors": [_neighbor_json(r, label(device_id, r["if_index"])) for r in rows]}
@@ -2897,17 +2872,12 @@ def get_nodes_device_neighbors_export(service, params, body, device_id) -> dict:
 
 # ------------------------------------------------------ upstream suggestions
 #
-# alertrules.py:250-266 explains why the neighbour-match join above is never
-# allowed to drive alert rollup on its own — it is a best-effort guess, and
-# an operator-confirmed devices.upstream_id is the only thing ROLLED_UP_BY's
-# downstream-outage suppression may trust. What that comment leaves open is
-# the MEANS: nothing before 4.49.0 ever offered nodesdb's own matches to an
-# operator to review, so the only path to a working rollup at fleet scale was
-# 2,000 manual Edit-dialog visits. These two routes are that means — a read
-# route listing the suggestions with their evidence, and a write route that
-# applies a batch an operator has reviewed. Nothing here ever applies a
-# suggestion by itself; see post_nodes_upstream_suggestions_apply's own
-# docstring for the one path that writes devices.upstream_id.
+# The neighbour-match join above is a best-effort guess, and only an
+# operator-confirmed devices.upstream_id may drive ROLLED_UP_BY's
+# downstream-outage suppression (see alertrules.py). These two routes are how
+# an operator confirms one at fleet scale: a read route listing the
+# suggestions with their evidence, and a write route applying a reviewed
+# batch. Nothing here ever applies a suggestion by itself.
 UPSTREAM_SUGGESTIONS_DEFAULT_LIMIT = 500
 UPSTREAM_SUGGESTIONS_MAX_LIMIT = 2000
 
@@ -2932,7 +2902,7 @@ def _upstream_suggestion_json(service, label, suggestion: dict) -> dict:
         })
     return {
         "device_id": suggestion["device_id"],
-        "device_name": hostresolve.device_name(device) if device else None,
+        "device_name": namelookup.device_name(device) if device else None,
         "device_ip": device["ip"] if device else None,
         "ambiguous": suggestion["ambiguous"],
         "candidates": candidates,
@@ -2961,9 +2931,8 @@ def get_nodes_upstream_suggestions(service, params, body) -> dict:
         return {"suggestions": [_upstream_suggestion_json(service, label, s)
                                 for s in suggestions],
                 "total": total}
-    offset = max(0, int(_num(params, "offset", 0, int) or 0))
-    limit = max(1, min(int(_num(params, "limit", UPSTREAM_SUGGESTIONS_DEFAULT_LIMIT, int)
-                        or UPSTREAM_SUGGESTIONS_DEFAULT_LIMIT), UPSTREAM_SUGGESTIONS_MAX_LIMIT))
+    limit, offset = _page(params, UPSTREAM_SUGGESTIONS_DEFAULT_LIMIT,
+                          UPSTREAM_SUGGESTIONS_MAX_LIMIT)
     suggestions = service.nodes_db.upstream_suggestions(limit=limit, offset=offset)
     return {"suggestions": [_upstream_suggestion_json(service, label, s)
                             for s in suggestions],
@@ -3077,14 +3046,12 @@ def post_nodes_upstream_suggestions_apply(service, params, body) -> dict:
     return {"ok": True, "updated": len(cleaned)}
 
 
-# Item 5's fleet-wide view: an L2 link graph, shaped for the client to draw
-# directly rather than handing over the raw neighbour rows and making every
-# caller re-derive the same graph. Two facts make the shaping worth doing
-# here instead of in the browser: only nodesdb knows which chassis-id/
-# sysName matches resolved to a real device (the join _NEIGHBOR_MATCH_SQL
-# already computes), and only the server can afford an interfaces() read per
-# reporting device to label a local port — the client would otherwise need
-# a second request per device just to draw port labels on hover.
+# An L2 link graph shaped for the client to draw directly rather than
+# handing over raw neighbour rows. Shaped here because only nodesdb knows
+# which chassis-id/sysName matches resolved to a real device
+# (_NEIGHBOR_MATCH_SQL), and only the server can afford an interfaces() read
+# per reporting device to label a local port — the client would otherwise
+# need a second request per device just to draw port labels on hover.
 def _topology_dedup_key(device_id, if_index, matched_id, matched_if_index):
     """The undirected identity of one physical link. LLDP/CDP is normally
     walked from BOTH ends — the switch that owns this port and the device
@@ -3124,7 +3091,7 @@ def get_nodes_topology(service, params, body) -> dict:
     is the wrong failure mode for a topology view."""
     devices = service.nodes_db.devices()
     device_by_id = {row["id"]: row for row in devices}
-    nodes = [{"id": row["id"], "name": hostresolve.device_name(row) or row["ip"],
+    nodes = [{"id": row["id"], "name": namelookup.device_name(row) or row["ip"],
               "status": row["status"], "ip": row["ip"], "unknown": False}
              for row in devices]
 
@@ -3178,7 +3145,7 @@ def _topology_export_rows(service) -> list:
         matched_id = row["matched_device_id"]
         matched_name = row["matched_device_name"] if "matched_device_name" in row.keys() else None
         rows.append([
-            row["device_id"], hostresolve.device_name(device) if device else "",
+            row["device_id"], namelookup.device_name(device) if device else "",
             row["if_index"], label(row["device_id"], row["if_index"]),
             row["protocol"], row["chassis_id"], row["sys_name"],
             row["port_id"] or row["port_descr"], row["platform"], row["remote_address"],
@@ -3206,12 +3173,10 @@ def post_nodes_device(service, params, body) -> dict:
     group_id = body.get("group_id")
     device_group_id = body.get("device_group_id")
     _check_display_name_source(body)
-    # The same two fields put_nodes_device handles specially; add_device's
-    # filter dropped them without a word, so a device created with an
-    # upstream or a vendor pin got neither. Validated before the insert so
-    # a refused value does not leave a half-configured device behind (0 is
-    # never a device id, and a device cannot be its own upstream before it
-    # exists).
+    # The same two fields put_nodes_device handles specially, validated
+    # before the insert so a refused value does not leave a half-configured
+    # device behind (0 is never a device id, and a device cannot be its own
+    # upstream before it exists).
     upstream_id = (_clean_upstream_id(service, 0, body["upstream_id"])
                    if "upstream_id" in body else None)
     vendor_override = str(body.get("vendor_override") or "").strip()
@@ -3257,9 +3222,7 @@ def post_nodes_device(service, params, body) -> dict:
 
 
 def get_nodes_device(service, params, body, device_id) -> dict:
-    row = service.nodes_db.device(device_id)
-    if not row:
-        raise ValueError("No such device")
+    row = _require(service.nodes_db.device(device_id), "device")
     reveal = _may_read_secrets(service, params, "nodes")
     device = _device_json(row, reveal)
     # effective_config resolves the profile's own community into the
@@ -3314,14 +3277,12 @@ def _identification_json(service, row) -> dict:
         "learned_from": learned_from,
         "suggest_bundle": suggest,
         "vendor_display": enterprises.display_name(row["vendor_detected"] or row["vendor"] or ""),
-        # The enterprise arc this device's sysObjectID actually sits under,
-        # or None. vendor_source/vendor_confidence alone cannot tell apart
-        # a device with a real but unnamed arc from one that only answers a
-        # generic net-snmp sysObjectID and so has no arc at all — the
-        # second case can never receive VENDOR_HEALTH (keyed by arc), no
-        # matter what MIB work happens, so a device pane needs this to say
-        # "no health metrics because there's no enterprise ID to key them
-        # by" instead of showing a blank pane that reads as a fault.
+        # The enterprise arc this device's sysObjectID sits under, or None.
+        # vendor_source/vendor_confidence cannot tell a real but unnamed arc
+        # apart from a generic net-snmp sysObjectID with no arc at all, and
+        # only the second can never receive VENDOR_HEALTH (keyed by arc) —
+        # so a device pane can say why the health section is empty instead
+        # of showing a blank that reads as a fault.
         "vendor_arc": row["vendor_arc"] if "vendor_arc" in keys else None,
         "learnable": learnable, "learn_reason": learn_reason,
     }
@@ -3352,8 +3313,7 @@ def _clean_upstream_id(service, device_id, value):
         raise ValueError("upstream_id must be a device id")
     if upstream == int(device_id):
         raise ValueError("A device cannot be its own upstream device")
-    if not service.nodes_db.device(upstream):
-        raise ValueError("No such upstream device")
+    _require(service.nodes_db.device(upstream), "upstream device")
     return upstream
 
 
@@ -3362,9 +3322,9 @@ def _device_address(body) -> str:
 
     Devices are keyed by address and nothing here resolves names — the poller
     speaks SNMP and ICMP straight to what is stored — so a hostname is not a
-    device address, and neither is `999.999.1.oops`, which this used to accept
-    without a word. An unpollable row looked exactly like a device that was
-    merely down, forever, which is the worst way to be told about a typo.
+    device address, and neither is `999.999.1.oops`. Accepting one would
+    store an unpollable row that looks exactly like a device merely down,
+    forever — the worst way to be told about a typo.
 
     IPv6 is allowed because the rest of the stack already handles it; a
     zone index is not, since it means nothing on another machine.
@@ -3385,22 +3345,18 @@ def put_nodes_device(service, params, body, device_id) -> dict:
     # Captured for the audit diff below — this existence check discarded
     # the row entirely before now, though it was already the "before" side
     # of every field this route can change.
-    before = service.nodes_db.device(device_id)
-    if not before:
-        raise ValueError("No such device")
+    before = _require(service.nodes_db.device(device_id), "device")
     _check_display_name_source(body)
-    fields = {k: v for k, v in body.items() if k in _DEVICE_EDITABLE_BODY}
+    fields = _pick(body, _DEVICE_EDITABLE_BODY)
     if "upstream_id" in fields:
         fields["upstream_id"] = _clean_upstream_id(
             service, device_id, fields["upstream_id"])
     result = {"ok": True}
     if "vendor_override" in fields:
-        # Not a plain column write: setting a vendor by hand also teaches
-        # the fleet (when the sysObjectID is specific enough) and clearing
-        # it re-decides the row, both of which nodesdb.set_vendor_override
-        # owns. Everything else in the body still goes the ordinary way.
-        # Audited on its own line rather than folded into the generic diff
-        # below — a vendor pin is a different kind of change from the rest.
+        # Not a plain column write: setting a vendor by hand also teaches the
+        # fleet (when the sysObjectID is specific enough) and clearing it
+        # re-decides the row, both of which nodesdb.set_vendor_override owns.
+        # Audited on its own line rather than folded into the generic diff.
         value = fields.pop("vendor_override")
         value = str(value or "").strip()
         if len(value) > 64:
@@ -3419,22 +3375,15 @@ def put_nodes_device(service, params, body, device_id) -> dict:
 
 
 def delete_nodes_device(service, params, body, device_id) -> dict:
-    row = service.nodes_db.device(device_id)
-    if not row:
-        raise ValueError("No such device")
-    # ConfigRX first, Nodes second. These are two databases, so this cannot
-    # be one transaction and one of the two orders has to be wrong on a
-    # crash — the question is only which residue is survivable. Dropping the
-    # nodes row first leaves configrx.db holding this device_id's
-    # device_config row, with its ssh_password_enc and enable_secret_enc
-    # still in it, keyed on an id nothing owns any more. devices.id is
-    # INTEGER PRIMARY KEY without AUTOINCREMENT, so SQLite reissues the
-    # highest freed rowid to the next device added: delete the newest
-    # device, have this call fail or the process die between the two lines,
-    # add a device, and that new and entirely unrelated device silently
-    # inherits the old one's stored SSH credentials, with nothing logged.
-    # This order fails the other way instead — a nodes row that outlives its
-    # ConfigRX config, which the operator can simply delete again.
+    row = _require(service.nodes_db.device(device_id), "device")
+    # ConfigRX first, Nodes second. Two databases, so this cannot be one
+    # transaction and one order has to be wrong on a crash; the question is
+    # which residue is survivable. Nodes-first would leave configrx.db
+    # holding this device_id's ssh_password_enc and enable_secret_enc keyed
+    # on an id nothing owns — and devices.id is INTEGER PRIMARY KEY without
+    # AUTOINCREMENT, so SQLite reissues the freed rowid and the next device
+    # added would silently inherit those credentials. This order fails the
+    # other way: a nodes row outliving its ConfigRX config, deletable again.
     service.configrx_db.forget_device(device_id)
     service.nodes_db.remove_device(device_id)
     service.log.add(NODES_CATEGORY, f"Removed device {row['ip']}")
@@ -3443,18 +3392,11 @@ def delete_nodes_device(service, params, body, device_id) -> dict:
 
 
 # The 16 MB body cap leaves room for well over a million integers, and an
-# id list that long is a mistake or an attack rather than a fleet: it costs
-# real time and memory before anything can reject it on its merits. This is
-# the ceiling on that, nothing more.
-#
-# It is deliberately far above any list the interface can produce. The
-# SQLite parameter limit that a bulk id list actually runs into
-# (SQLITE_MAX_VARIABLE_NUMBER, 999 on builds older than 3.32) is handled
-# where it belongs, by chunking the statement in nodesdb._id_chunks — not
-# by capping the request. An earlier version of this guard capped at 900 to
-# stay under that limit, which broke the Devices page's own select-all at
-# its shipped 1000-row page size: the fix for a 500 nobody had hit turned
-# into a 400 an operator would hit on an ordinary afternoon.
+# id list that long is a mistake or an attack rather than a fleet. This is
+# the ceiling on that, deliberately far above any list the interface can
+# produce: the SQLite parameter limit (SQLITE_MAX_VARIABLE_NUMBER, 999 on
+# builds older than 3.32) is handled by chunking in nodesdb._id_chunks, not
+# by capping the request, so this never refuses an ordinary select-all.
 BULK_DEVICE_ID_MAX = 50000
 
 
@@ -3487,11 +3429,10 @@ def post_nodes_devices_bulk_update(service, params, body) -> dict:
     service.nodes_db.bulk_update_devices(device_ids, **fields)
     service.log.add(NODES_CATEGORY,
                     f"Bulk-updated {len(device_ids)} device(s): {', '.join(fields)}")
-    # The fields changed, not one line per device — a real batch (hundreds
-    # or thousands of ids) would blow the 512-char detail clip instantly,
-    # and "was device N touched by this bulk op" is a known, accepted gap
-    # (see this route's own audit-widening discussion): no per-device
-    # target this can carry without a many-to-many audit-target table.
+    # The fields changed, not one line per device: a batch of hundreds would
+    # blow the 512-char detail clip instantly. "Was device N touched by this
+    # bulk op" is an accepted gap — there is no per-device target this can
+    # carry without a many-to-many audit-target table.
     _audit(service, params, "device.bulk_update", target=f"{len(device_ids)} devices",
           detail=", ".join(fields))
     return {"ok": True, "updated": len(device_ids)}
@@ -3511,15 +3452,13 @@ def post_nodes_devices_bulk_delete(service, params, body) -> dict:
 
 # ------------------------------------------------------------ bulk import
 #
-# Item 3: onboarding was measured at 16.6 devices/s through the single-
-# device POST route — 2,000 devices is over two minutes of API round
-# trips before any of them has even been polled once. This route accepts
-# the same fields the single POST accepts (see _DEVICE_EDITABLE_BODY),
-# either as a JSON array of device objects or as pasted CSV text with a
-# header row, validates every row before writing anything, and inserts
-# whatever validated in one transaction (nodesdb.add_devices_bulk) — a
-# conflict partway through cannot leave the fleet half-imported while the
-# per-row disposition list below says otherwise.
+# Onboarding a fleet one POST at a time is minutes of round trips before
+# anything has been polled once. This route accepts the same fields the
+# single POST accepts (see _DEVICE_EDITABLE_BODY), as a JSON array or as
+# pasted CSV with a header row, validates every row before writing anything,
+# and inserts whatever validated in one transaction — a conflict partway
+# through cannot leave the fleet half-imported while the per-row disposition
+# list below says otherwise.
 #
 # Accepted CSV columns (case-insensitive, spaces or underscores either
 # way): address (or ip, required), name, group (or group_id — a polling
@@ -3677,11 +3616,9 @@ def post_nodes_devices_bulk_import(service, params, body) -> dict:
     if created:
         service.log.add(NODES_CATEGORY, f"Bulk-imported {len(created)} device(s)")
         # The same post-add machinery post_nodes_device triggers for one
-        # device, batched: a first poll and, where SNMP is enabled, a
-        # vendor identification walk — the bulk-poll and bulk-identify
-        # routes above are the un-batched originals this mirrors. Best
-        # effort: a poller that cannot queue one of these does not undo an
-        # insert that has already committed.
+        # device, batched: a first poll and, where SNMP is enabled, a vendor
+        # identification walk. Best effort — a poller that cannot queue one
+        # does not undo an insert that has already committed.
         for device_id in device_ids:
             try:
                 service.node_poller.poll_now(device_id)
@@ -3700,8 +3637,7 @@ def post_nodes_devices_bulk_import(service, params, body) -> dict:
 
 
 def post_nodes_device_poll(service, params, body, device_id) -> dict:
-    if not service.nodes_db.device(device_id):
-        raise ValueError("No such device")
+    _require(service.nodes_db.device(device_id), "device")
     # queued=False means a poll for this device was already in flight, so
     # this click started nothing. The button says so rather than reporting
     # "Polled" off the other poll's completion.
@@ -3729,23 +3665,20 @@ def post_nodes_device_focus(service, params, body, device_id) -> dict:
     selected on the Nodes tab; the short TTL means fast polling lapses on
     its own when the tab is left or the browser closes — deselection
     never needs its own request."""
-    if not service.nodes_db.device(device_id):
-        raise ValueError("No such device")
+    _require(service.nodes_db.device(device_id), "device")
     interval = float(service.nodes_settings.get("focus_poll_interval_s", 3))
     service.node_poller.set_focus(device_id, ttl_s=15, interval_s=interval)
     return {"ok": True, "interval_s": interval}
 
 
 def get_nodes_device_dom(service, params, body, device_id, if_index) -> dict:
-    if not service.nodes_db.device(device_id):
-        raise ValueError("No such device")
+    _require(service.nodes_db.device(device_id), "device")
     sensors = service.node_poller.read_dom(int(device_id), int(if_index))
     return {"sensors": sensors}
 
 
 def get_nodes_device_mac_table(service, params, body, device_id, if_index) -> dict:
-    if not service.nodes_db.device(device_id):
-        raise ValueError("No such device")
+    _require(service.nodes_db.device(device_id), "device")
     macs = service.node_poller.read_mac_table(int(device_id), int(if_index))
     return {"macs": macs, "supported": macs is not None}
 
@@ -3754,7 +3687,7 @@ def _oid_name_table(service) -> dict:
     """OID -> name, from every uploaded MIB plus the built-in well-known
     table the Trap page already decodes with. One table, so uploading a MIB
     improves the OID browser the same moment it improves trap decoding."""
-    names = dict(trapoids.WELL_KNOWN)
+    names = dict(trapdecode.WELL_KNOWN)
     # all_known_oids() is name -> OID (it feeds mibparse.resolve's `known`
     # dict); the browser needs the inverse.
     for name, oid in service.nodes_db.all_known_oids().items():
@@ -3781,9 +3714,7 @@ def get_nodes_device_oids(service, params, body, device_id) -> dict:
     """One subtree of a device's SNMP tree, walked live and decoded against
     every MIB this app knows. `oid` picks the subtree; without it the
     device's default set is reported so the dialog knows what to offer."""
-    device = service.nodes_db.device(device_id)
-    if not device:
-        raise ValueError("No such device")
+    device = _require(service.nodes_db.device(device_id), "device")
     bases = service.node_poller.browse_bases(int(device_id))
     base = (params.get("oid") or "").strip()
     if not base:
@@ -3817,8 +3748,7 @@ def post_nodes_device_oid_walk(service, params, body, device_id) -> dict:
     already running for this device. Refused politely rather than queued —
     a second walk of the same device would just fight the first for the
     agent's attention."""
-    if not service.nodes_db.device(device_id):
-        raise ValueError("No such device")
+    _require(service.nodes_db.device(device_id), "device")
     return {"walk": service.node_poller.start_oid_walk(int(device_id))}
 
 
@@ -3852,9 +3782,7 @@ def post_nodes_device_identify(service, params, body, device_id) -> dict:
 
 
 def get_nodes_device_identify(service, params, body, device_id) -> dict:
-    row = service.nodes_db.device(device_id)
-    if not row:
-        raise ValueError("No such device")
+    row = _require(service.nodes_db.device(device_id), "device")
     return {"job": service.node_poller.identify_status(int(device_id)),
             "result": {"vendor": row["vendor"], "vendor_detected": row["vendor_detected"],
                        "vendor_source": row["vendor_source"] or "",
@@ -3955,9 +3883,7 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
                             build_v3_request, discovery_probe)
     from ..trapdecode import localized_key
 
-    row = service.nodes_db.device(device_id)
-    if not row:
-        raise ValueError("No such device")
+    row = _require(service.nodes_db.device(device_id), "device")
     config = service.nodes_db.effective_config(row)
     # The edit form's overrides are tri-state (null means "inherit from
     # the profile", distinct from an explicit false) — an explicit null
@@ -4038,14 +3964,12 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
 
 
 def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
-    if not service.nodes_db.device(device_id):
-        raise ValueError("No such device")
+    _require(service.nodes_db.device(device_id), "device")
     rows = service.nodes_db.interfaces(device_id)
     keys = rows[0].keys() if rows else ()
-    # poe_admin/poe_detect_status/poe_power_mw/stp_state (Tier 1 #7): read
-    # defensively like every other column a migration added, since a row
-    # fetched before this wave's ALTER TABLE ran on this database simply
-    # will not have them yet on the very first call after an upgrade.
+    # poe_admin/poe_detect_status/poe_power_mw/stp_state are read
+    # defensively like every other column a migration added: a row fetched
+    # before the ALTER TABLE has run on this database will not have them.
     return {"interfaces": [
         {"id": r["id"], "if_index": r["if_index"], "descr": r["descr"],
          "alias": r["alias"], "phys_addr": r["phys_addr"], "speed_bps": r["speed_bps"],
@@ -4077,8 +4001,7 @@ def get_nodes_device_interfaces_export(service, params, body, device_id) -> dict
 
 
 def get_nodes_device_metrics(service, params, body, device_id) -> dict:
-    if not service.nodes_db.device(device_id):
-        raise ValueError("No such device")
+    _require(service.nodes_db.device(device_id), "device")
     rows = service.nodes_db.metrics(device_id)
     return {"metrics": [
         {"id": r["id"], "key": r["key"], "label": r["label"], "unit": r["unit"],
@@ -4087,8 +4010,7 @@ def get_nodes_device_metrics(service, params, body, device_id) -> dict:
 
 
 def get_nodes_device_series(service, params, body, device_id) -> dict:
-    if not service.nodes_db.device(device_id):
-        raise ValueError("No such device")
+    _require(service.nodes_db.device(device_id), "device")
     metric_id = params.get("metric_id")
     if not metric_id:
         raise ValueError("metric_id is required")
@@ -4102,8 +4024,7 @@ def get_nodes_device_series(service, params, body, device_id) -> dict:
 
 
 def get_nodes_device_timeline(service, params, body, device_id) -> dict:
-    if not service.nodes_db.device(device_id):
-        raise ValueError("No such device")
+    _require(service.nodes_db.device(device_id), "device")
     t0, t1 = _window(params)
     segments = service.nodes_db.device_status_segments(device_id, t0, t1)
     return {"t0": t0, "t1": t1, "segments": segments}
@@ -4111,25 +4032,14 @@ def get_nodes_device_timeline(service, params, body, device_id) -> dict:
 
 # ------------------------------------------------------------------ reports
 #
-# netpath/report.py owns the actual computation (device_availability_report,
+# netpath/report.py owns the computation (device_availability_report,
 # top_metric_ranking) and the four ways a gap in device_status_segments is
-# NOT the same as "the device was down" — see that module's own docstring.
-# These two routes are the thin dispatch on top of it: query-string parsing,
-# resolving "no device_ids given" to the whole fleet, and, for the top-N
-# ranking, refusing a request shaped the way report.py's own docstring
-# measured at 95-100 seconds rather than letting it block a request thread.
-#
-# A week (604800s) is the exact span top_metric_ranking's docstring measured
-# at 22-23s against a 2,000-device/6-metric-family fixture; a month projects
-# to ~95-100s there. That is the only number either route enforces — the
-# report author's own two suggested levers (narrow device_ids, or route a
-# long whole-fleet ask through something other than a synchronous request)
-# are both offered to the caller: device_ids narrows it, and the refusal
-# below is what stands in for "the background/scheduled path" until one
-# exists. device_availability_report has no equivalent documented cost at
-# fleet scale (report.py's own docstring/benchmarks only measured top-N), so
-# nothing here caps it — a real number should replace this comment, not a
-# guess, if a fleet-wide availability report turns out to be slow too.
+# NOT "the device was down". These two routes are the thin dispatch on top:
+# query-string parsing, resolving "no device_ids given" to the whole fleet,
+# and refusing a whole-fleet top-N request wider than a week rather than
+# letting it block a request thread for minutes. Narrowing device_ids is the
+# caller's way round it. device_availability_report has no equivalent known
+# cost at fleet scale, so nothing here caps it.
 REPORT_TOP_METRICS_WHOLE_FLEET_MAX_WINDOW_S = 7 * 86400.0
 REPORT_TOP_METRICS_MAX_N = 500
 
@@ -4154,13 +4064,13 @@ def get_nodes_reports_top_metrics(service, params, body) -> dict:
     [t0, t1] (default the last 7 days) — "which twenty links came closest to
     saturation" is `key=if_in_util_pct.%&like=1`; "which devices ran
     hottest" is `key=cpu_pct&rank_by=mean`. See report.top_metric_ranking
-    for the query itself and the measured cost at fleet scale.
+    for the query itself and its cost at fleet scale.
 
     A whole-fleet-equivalent ask over more than 7 days is refused outright
-    rather than left to block the request thread for the ~100s report.py's
-    own docstring measured at that shape — narrow `device_ids` or ask for a
-    shorter window instead. "Whole-fleet-equivalent" is measured by how
-    many devices this request actually resolves to (`device_ids` omitted
+    rather than left to block the request thread for minutes — narrow
+    `device_ids` or ask for a shorter window instead. "Whole-fleet-
+    equivalent" is scaled by how many devices this request resolves to
+    (`device_ids` omitted
     ends up covering every device on file, same as `device_ids` naming
     every device explicitly — the two must refuse identically, since they
     produce the identical query), scaled against the window: half the
@@ -4198,8 +4108,7 @@ def get_nodes_reports_top_metrics(service, params, body) -> dict:
 
 
 def get_nodes_device_events(service, params, body, device_id) -> dict:
-    if not service.nodes_db.device(device_id):
-        raise ValueError("No such device")
+    _require(service.nodes_db.device(device_id), "device")
     since_s = _num(params, "since_s", None)
     device_events = service.nodes_db.device_events(device_id=device_id, since_s=since_s)
     interface_events = [
@@ -4216,43 +4125,27 @@ def get_nodes_device_events(service, params, body, device_id) -> dict:
 
 
 def post_nodes_device_credential(service, params, body, device_id) -> dict:
-    from .. import dpapi
-
-    row = service.nodes_db.device(device_id)
-    if not row:
-        raise ValueError("No such device")
-    user = str(body.get("v3_user", "")).strip()
-    password = str(body.get("v3_auth_pass", ""))
-    auth_proto = str(body.get("v3_auth_proto", "")).strip()
-    if not user or not password or not auth_proto:
-        raise ValueError("A username, auth protocol, and password are all required")
-    if not dpapi.available():
-        raise ValueError(
+    row = _require(service.nodes_db.device(device_id), "device")
+    return _store_v3_credential(
+        service, params, body,
+        store=functools.partial(service.nodes_db.set_device_credential, device_id),
+        category=NODES_CATEGORY,
+        message=f"Stored an SNMPv3 credential for {row['ip']}",
+        target=f"device:{row['ip']}",
+        unavailable=(
             "This machine cannot encrypt a stored credential — DPAPI is "
             "Windows-only. The device can still be reached by typing the "
-            "password into Test each time; nothing will be saved here.")
-    try:
-        encrypted = dpapi.protect(password.encode("utf-8"))
-    except dpapi.DpapiUnavailable as exc:
-        raise ValueError(str(exc))
-    finally:
-        password = None
-    service.nodes_db.set_device_credential(device_id, user, auth_proto, encrypted)
-    service.log.add(NODES_CATEGORY, f"Stored an SNMPv3 credential for {row['ip']}")
-    _audit(service, params, "credential.store", target=f"device:{row['ip']}",
-           detail=f"SNMPv3 user {user}")
-    return {"ok": True}
+            "password into Test each time; nothing will be saved here."))
 
 
 def delete_nodes_device_credential(service, params, body, device_id) -> dict:
-    row = service.nodes_db.device(device_id)
-    if not row:
-        raise ValueError("No such device")
-    service.nodes_db.clear_device_credential(device_id)
-    _audit(service, params, "credential.clear", target=f"device:{row['ip']}")
-    service.log.add(NODES_CATEGORY,
-                    f"Cleared the stored SNMPv3 credential for {row['ip']}")
-    return {"ok": True}
+    row = _require(service.nodes_db.device(device_id), "device")
+    return _clear_credential(
+        service, params,
+        clear=functools.partial(service.nodes_db.clear_device_credential, device_id),
+        category=NODES_CATEGORY,
+        message=f"Cleared the stored SNMPv3 credential for {row['ip']}",
+        target=f"device:{row['ip']}")
 
 
 def _device_group_json(row) -> dict:
@@ -4274,8 +4167,7 @@ def post_nodes_device_group(service, params, body) -> dict:
 
 
 def put_nodes_device_group(service, params, body, device_group_id) -> dict:
-    if not service.nodes_db.device_group(device_group_id):
-        raise ValueError("No such device group")
+    _require(service.nodes_db.device_group(device_group_id), "device group")
     name = str(body.get("name", "")).strip()
     if not name:
         raise ValueError("A name is required")
@@ -4286,9 +4178,7 @@ def put_nodes_device_group(service, params, body, device_group_id) -> dict:
 
 
 def delete_nodes_device_group(service, params, body, device_group_id) -> dict:
-    row = service.nodes_db.device_group(device_group_id)
-    if not row:
-        raise ValueError("No such device group")
+    row = _require(service.nodes_db.device_group(device_group_id), "device group")
     service.nodes_db.remove_device_group(device_group_id)
     service.log.add(NODES_CATEGORY, f"Removed device group {row['name']}")
     _audit(service, params, "device_group.delete", target=row["name"])
@@ -4318,10 +4208,8 @@ def put_nodes_group(service, params, body, group_id) -> dict:
     # put_nodes_device had: this is the literal "changed the threshold from
     # 90 to 99" case, since poll intervals/community defaults live in
     # _GROUP_EDITABLE_BODY.
-    before = service.nodes_db.group(group_id)
-    if not before:
-        raise ValueError("No such polling profile")
-    fields = {k: v for k, v in body.items() if k in _GROUP_EDITABLE_BODY}
+    before = _require(service.nodes_db.group(group_id), "polling profile")
+    fields = _pick(body, _GROUP_EDITABLE_BODY)
     service.nodes_db.update_group(group_id, **fields)
     detail = _audit_diff(before, fields)
     if detail:
@@ -4331,9 +4219,7 @@ def put_nodes_group(service, params, body, group_id) -> dict:
 
 
 def delete_nodes_group(service, params, body, group_id) -> dict:
-    row = service.nodes_db.group(group_id)
-    if not row:
-        raise ValueError("No such polling profile")
+    row = _require(service.nodes_db.group(group_id), "polling profile")
     in_use = service.nodes_db.device_count_for_group(group_id)
     if in_use:
         raise ValueError(f"{in_use} device(s) still use this profile — "
@@ -4345,9 +4231,7 @@ def delete_nodes_group(service, params, body, group_id) -> dict:
 
 
 def post_nodes_group_default(service, params, body, group_id) -> dict:
-    row = service.nodes_db.group(group_id)
-    if not row:
-        raise ValueError("No such polling profile")
+    row = _require(service.nodes_db.group(group_id), "polling profile")
     service.nodes_db.set_default_group(group_id)
     service.log.add(NODES_CATEGORY, f"{row['name']} is now the default polling profile")
     _audit(service, params, "profile.set_default", target=f"profile:{row['name']}")
@@ -4355,62 +4239,41 @@ def post_nodes_group_default(service, params, body, group_id) -> dict:
 
 
 def post_nodes_group_credential(service, params, body, group_id) -> dict:
-    from .. import dpapi
-
-    row = service.nodes_db.group(group_id)
-    if not row:
-        raise ValueError("No such polling profile")
-    user = str(body.get("v3_user", "")).strip()
-    password = str(body.get("v3_auth_pass", ""))
-    auth_proto = str(body.get("v3_auth_proto", "")).strip()
-    if not user or not password or not auth_proto:
-        raise ValueError("A username, auth protocol, and password are all required")
-    if not dpapi.available():
-        raise ValueError(
+    row = _require(service.nodes_db.group(group_id), "polling profile")
+    return _store_v3_credential(
+        service, params, body,
+        store=functools.partial(service.nodes_db.set_group_credential, group_id),
+        category=NODES_CATEGORY,
+        message=f"Stored an SNMPv3 credential for profile {row['name']}",
+        target=f"profile:{row['name']}",
+        unavailable=(
             "This machine cannot encrypt a stored credential — DPAPI is "
-            "Windows-only.")
-    try:
-        encrypted = dpapi.protect(password.encode("utf-8"))
-    except dpapi.DpapiUnavailable as exc:
-        raise ValueError(str(exc))
-    finally:
-        password = None
-    service.nodes_db.set_group_credential(group_id, user, auth_proto, encrypted)
-    service.log.add(NODES_CATEGORY,
-                    f"Stored an SNMPv3 credential for profile {row['name']}")
-    _audit(service, params, "credential.store", target=f"profile:{row['name']}",
-           detail=f"SNMPv3 user {user}")
-    return {"ok": True}
+            "Windows-only."))
 
 
 def delete_nodes_group_credential(service, params, body, group_id) -> dict:
-    row = service.nodes_db.group(group_id)
-    if not row:
-        raise ValueError("No such polling profile")
-    service.nodes_db.clear_group_credential(group_id)
-    service.log.add(NODES_CATEGORY,
-                    f"Cleared the stored SNMPv3 credential for profile {row['name']}")
-    return {"ok": True}
+    row = _require(service.nodes_db.group(group_id), "polling profile")
+    return _clear_credential(
+        service, params,
+        clear=functools.partial(service.nodes_db.clear_group_credential, group_id),
+        category=NODES_CATEGORY,
+        message=f"Cleared the stored SNMPv3 credential for profile {row['name']}")
 
 
 # ---------------------------------------------------- additional credentials
 #
 # A profile's own snmp_version/community/v3_* columns (above) are its
-# always-present "primary" credential. These endpoints manage the
-# ADDITIONAL credentials a profile can hold in its group_credentials table
-# — alternates the poller tries, in order, for any device on this profile
-# that doesn't answer the primary. Same shape throughout as the primary
-# credential's own endpoints just above.
+# always-present "primary" credential. These endpoints manage the ADDITIONAL
+# credentials in its group_credentials table — alternates the poller tries,
+# in order, for a device that does not answer the primary.
 
 _GROUP_CREDENTIAL_EDITABLE = ("label", "snmp_version", "community", "v3_user",
                               "v3_auth_proto")
 
 
 def post_nodes_group_credentials(service, params, body, group_id) -> dict:
-    row = service.nodes_db.group(group_id)
-    if not row:
-        raise ValueError("No such polling profile")
-    fields = {k: v for k, v in body.items() if k in _GROUP_CREDENTIAL_EDITABLE}
+    row = _require(service.nodes_db.group(group_id), "polling profile")
+    fields = _pick(body, _GROUP_CREDENTIAL_EDITABLE)
     credential_id = service.nodes_db.add_group_credential(group_id, **fields)
     service.log.add(NODES_CATEGORY,
                     f"Added an additional SNMP credential to profile {row['name']}")
@@ -4419,59 +4282,48 @@ def post_nodes_group_credentials(service, params, body, group_id) -> dict:
 
 def put_nodes_group_credential(service, params, body, group_id, credential_id) -> dict:
     cred = service.nodes_db.group_credential(credential_id)
-    if not cred or cred["group_id"] != int(group_id):
-        raise ValueError("No such credential")
-    fields = {k: v for k, v in body.items() if k in _GROUP_CREDENTIAL_EDITABLE}
+    cred = _require(cred if cred and cred["group_id"] == int(group_id) else None,
+                    "credential")
+    fields = _pick(body, _GROUP_CREDENTIAL_EDITABLE)
     service.nodes_db.update_group_credential(credential_id, **fields)
     return {"ok": True}
 
 
 def delete_nodes_group_credential_row(service, params, body, group_id, credential_id) -> dict:
     cred = service.nodes_db.group_credential(credential_id)
-    if not cred or cred["group_id"] != int(group_id):
-        raise ValueError("No such credential")
+    cred = _require(cred if cred and cred["group_id"] == int(group_id) else None,
+                    "credential")
     service.nodes_db.remove_group_credential(credential_id)
     return {"ok": True}
 
 
 def post_nodes_group_credential_secret(service, params, body, group_id, credential_id) -> dict:
-    from .. import dpapi
-
     cred = service.nodes_db.group_credential(credential_id)
-    if not cred or cred["group_id"] != int(group_id):
-        raise ValueError("No such credential")
-    user = str(body.get("v3_user", "")).strip()
-    password = str(body.get("v3_auth_pass", ""))
-    auth_proto = str(body.get("v3_auth_proto", "")).strip()
-    if not user or not password or not auth_proto:
-        raise ValueError("A username, auth protocol, and password are all required")
-    if not dpapi.available():
-        raise ValueError(
+    cred = _require(cred if cred and cred["group_id"] == int(group_id) else None,
+                    "credential")
+    return _store_v3_credential(
+        service, params, body,
+        store=functools.partial(service.nodes_db.set_group_credential_password,
+                                credential_id),
+        category=NODES_CATEGORY,
+        message=("Stored an SNMPv3 credential for an additional "
+                 f"credential on profile {cred['label'] or credential_id}"),
+        target=f"profile-credential:{cred['label'] or credential_id}",
+        unavailable=(
             "This machine cannot encrypt a stored credential — DPAPI is "
-            "Windows-only.")
-    try:
-        encrypted = dpapi.protect(password.encode("utf-8"))
-    except dpapi.DpapiUnavailable as exc:
-        raise ValueError(str(exc))
-    finally:
-        password = None
-    service.nodes_db.set_group_credential_password(credential_id, user, auth_proto, encrypted)
-    service.log.add(NODES_CATEGORY, "Stored an SNMPv3 credential for an additional "
-                                    f"credential on profile {cred['label'] or credential_id}")
-    _audit(service, params, "credential.store",
-           target=f"profile-credential:{cred['label'] or credential_id}",
-           detail=f"SNMPv3 user {user}")
-    return {"ok": True}
+            "Windows-only."))
 
 
 def delete_nodes_group_credential_secret(service, params, body, group_id, credential_id) -> dict:
     cred = service.nodes_db.group_credential(credential_id)
-    if not cred or cred["group_id"] != int(group_id):
-        raise ValueError("No such credential")
-    service.nodes_db.clear_group_credential_password(credential_id)
-    _audit(service, params, "credential.clear",
-           target=f"profile-credential:{cred['label'] or credential_id}")
-    return {"ok": True}
+    cred = _require(cred if cred and cred["group_id"] == int(group_id) else None,
+                    "credential")
+    return _clear_credential(
+        service, params,
+        clear=functools.partial(service.nodes_db.clear_group_credential_password,
+                                credential_id),
+        category=NODES_CATEGORY,
+        target=f"profile-credential:{cred['label'] or credential_id}")
 
 
 def _discovery_communities_for_group(service, group_id: int) -> str:
@@ -4519,8 +4371,7 @@ def post_nodes_discovery(service, params, body) -> dict:
     group_id = body.get("group_id")
     if not group_id:
         raise ValueError("A polling profile is required")
-    if not service.nodes_db.group(group_id):
-        raise ValueError("No such polling profile")
+    _require(service.nodes_db.group(group_id), "polling profile")
     allow_ping_only = bool(body.get("allow_ping_only"))
     communities = _discovery_communities_for_group(service, group_id)
     if not communities and not allow_ping_only:
@@ -4528,10 +4379,9 @@ def post_nodes_discovery(service, params, body) -> dict:
             "This profile has no v1/v2c communities for discovery to try. "
             "Pick a profile with one, or allow ping-only devices.")
     # The never-scan list and the probe rate are global settings the
-    # discovery job cannot see on its own (its settings dict is Nodes'),
-    # so they are carried in with the per-job overrides. They are NOT
-    # settable from the request body — a scan does not get to choose how
-    # gentle it is with a plant segment.
+    # discovery job cannot see on its own, so they are carried in with the
+    # per-job overrides. Not settable from the request body: a scan does not
+    # get to choose how gentle it is with a plant segment.
     overrides = {
         "discovery_communities": communities,
         "never_scan_cidrs": service.settings.get("never_scan_cidrs", ""),
@@ -4556,17 +4406,12 @@ def post_nodes_discovery(service, params, body) -> dict:
 
 
 def get_nodes_discovery(service, params, body) -> dict:
-    # Clamped like every other paginated list route in this file. It was the
-    # one that wasn't: SQLite reads a negative LIMIT as "no limit", so
-    # ?limit=-1 returned the whole discovery_jobs table instead of a page.
-    limit = max(1, min(int(_num(params, "limit", 50, int) or 50), 500))
+    limit, _offset = _page(params, 50, 500)
     return {"jobs": [_discovery_job_json(r) for r in service.nodes_db.discovery_jobs(limit)]}
 
 
 def get_nodes_discovery_job(service, params, body, job_id) -> dict:
-    job = service.nodes_db.discovery_job(job_id)
-    if not job:
-        raise ValueError("No such discovery job")
+    job = _require(service.nodes_db.discovery_job(job_id), "discovery job")
     results = service.nodes_db.discovery_results(job_id)
     installed = {mib["filename"] for mib in service.nodes_db.mib_files()}
     # One pass over the fleet rather than a device_by_ip() per row — a scan
@@ -4581,8 +4426,7 @@ def delete_nodes_discovery_job(service, params, body, job_id) -> dict:
     """DELETE on a running scan cancels it (the row stays, so its partial
     results can still be reviewed); DELETE on any finished/cancelled/
     errored scan removes it — and its results — from the list for good."""
-    if not service.nodes_db.discovery_job(job_id):
-        raise ValueError("No such discovery job")
+    _require(service.nodes_db.discovery_job(job_id), "discovery job")
     if service.node_poller.discovery_running(job_id):
         service.node_poller.cancel_discovery(job_id)
         return {"ok": True, "cancelled": True}
@@ -4591,8 +4435,7 @@ def delete_nodes_discovery_job(service, params, body, job_id) -> dict:
 
 
 def post_nodes_discovery_promote(service, params, body, job_id) -> dict:
-    if not service.nodes_db.discovery_job(job_id):
-        raise ValueError("No such discovery job")
+    _require(service.nodes_db.discovery_job(job_id), "discovery job")
     result_ids = body.get("result_ids") or []
     if not result_ids:
         raise ValueError("result_ids is required")
@@ -4605,8 +4448,7 @@ def post_nodes_discovery_promote(service, params, body, job_id) -> dict:
 def post_nodes_discovery_reviewed(service, params, body, job_id) -> dict:
     """The approve/deny dialog for this job was answered (or dismissed) —
     either way it must never pop again, whatever was or wasn't added."""
-    if not service.nodes_db.discovery_job(job_id):
-        raise ValueError("No such discovery job")
+    _require(service.nodes_db.discovery_job(job_id), "discovery job")
     service.nodes_db.mark_job_reviewed(job_id)
     return {"ok": True}
 
@@ -4668,8 +4510,7 @@ def post_nodes_mib(service, params, body) -> dict:
     A zip is accepted too, and is the point of the feature: a vendor ships
     its MIBs as one archive whose members import each other in no particular
     order, so the whole set is stored first and resolved to a fixpoint
-    afterwards. That makes upload order irrelevant, which is the single thing
-    that used to make importing a real vendor bundle painful."""
+    afterwards, which makes upload order irrelevant."""
     import base64
     from .. import mibcatalog, mibparse
 
@@ -4777,18 +4618,14 @@ def get_nodes_mib_catalog_status(service, params, body) -> dict:
 
 
 def get_nodes_mib(service, params, body, mib_file_id) -> dict:
-    row = service.nodes_db.mib_file(mib_file_id)
-    if not row:
-        raise ValueError("No such MIB file")
+    row = _require(service.nodes_db.mib_file(mib_file_id), "MIB file")
     objects = service.nodes_db.mib_objects(mib_file_id)
     return {"file": _mib_file_json(row),
             "objects": [_mib_object_json(r) for r in objects]}
 
 
 def delete_nodes_mib(service, params, body, mib_file_id) -> dict:
-    row = service.nodes_db.mib_file(mib_file_id)
-    if not row:
-        raise ValueError("No such MIB file")
+    row = _require(service.nodes_db.mib_file(mib_file_id), "MIB file")
     service.nodes_db.remove_mib_file(mib_file_id)
     service._snmp_settings_with_mibs()
     service.log.add(NODES_CATEGORY, f"Removed MIB {row['filename']}")
@@ -4804,9 +4641,7 @@ def post_nodes_mib_resolve(service, params, body, mib_file_id) -> dict:
     CISCO-PROCESS-MIB, then hit resolve" story."""
     from .. import mibparse
 
-    row = service.nodes_db.mib_file(mib_file_id)
-    if not row:
-        raise ValueError("No such MIB file")
+    row = _require(service.nodes_db.mib_file(mib_file_id), "MIB file")
     if not row["content"]:
         raise ValueError("This file's original text was not retained "
                          "(uploaded before this feature could re-resolve) "
@@ -4834,8 +4669,7 @@ def put_nodes_mib_object(service, params, body, mib_file_id, obj_id) -> dict:
     objects = {r["id"]: r for r in service.nodes_db.mib_objects(mib_file_id)}
     if obj_id not in objects:
         raise ValueError("No such MIB object")
-    fields = {k: v for k, v in body.items()
-             if k in ("name", "oid", "description", "syntax", "enums")}
+    fields = _pick(body, ("name", "oid", "description", "syntax", "enums"))
     service.nodes_db.update_mib_object(obj_id, **fields)
     service._snmp_settings_with_mibs()
     return {"ok": True}
@@ -4875,11 +4709,10 @@ def _alert_device_ids(service, rows) -> set:
 
 
 def _alert_json(row, present_ids: set) -> dict:
-    """One alert row on the wire. `present_ids` is required, not optional: it
-    is what decides whether device_id is reported at all, and a caller that
-    forgot it used to get every alert silently reported as being about no
-    device — the Mute control greyed out across the whole page for no visible
-    reason. Build it with _alert_device_ids.
+    """One alert row on the wire. `present_ids` is required, not optional:
+    it decides whether device_id is reported at all, and omitting it reports
+    every alert as being about no device — which greys out the Mute control
+    across the page for no visible reason. Build it with _alert_device_ids.
 
     No device_name: the page renders the entity_label the engine already put
     on the alert, and never read one."""
@@ -4980,32 +4813,27 @@ def _alerts_rows_json(service, rows) -> list[dict]:
     return alerts
 
 
-# Item 2: the campaign that measured alerts_truncated at fleet scale found
-# an operator paging through an incident looking at a truncated view at
-# exactly the moment completeness mattered — GET /api/alerts capped `limit`
-# at 2,000 with no way to see the rest. ALERTS_LIST_CAP is unchanged (still
-# the per-page ceiling a browser table should ever try to render); `offset`
-# is what is new, so a page past the cap is one more request away instead
-# of unreachable, and `total` says how many pages that is.
+# ALERTS_LIST_CAP is the per-page ceiling a browser table should ever try
+# to render, not a data limit: `offset` puts a page past the cap one request
+# away rather than out of reach, and `total` says how many pages there are,
+# so an operator paging through an incident is never quietly shown a
+# truncated view.
 ALERTS_LIST_CAP = 2000
 
 
 def get_alerts(service, params, body) -> dict:
     filters = _alert_filters(params)
-    limit = min(int(_num(params, "limit", 300, int) or 300), ALERTS_LIST_CAP)
-    offset = max(0, int(_num(params, "offset", 0, int) or 0))
+    limit, offset = _page(params, 300, ALERTS_LIST_CAP)
     rows = service.alerts_db.alerts(limit=limit, offset=offset, **filters)
     total = service.alerts_db.count_alerts(**filters)
     return {"alerts": _alerts_rows_json(service, rows), "total": total,
             "limit": limit, "offset": offset}
 
 
-# The export ceiling item 1 asked for explicitly: "alerts export must be
-# able to exceed the old 2,000 cap". 50,000 is comfortably past anything a
-# real incident produces (the alert engine already collapses repeats into
-# one row's `count`, so 50,000 open rows is 50,000 distinct problems, not
-# 50,000 flaps) while still bounding the one CSV this route will ever
-# build in memory per request.
+# The export ceiling. 50,000 is comfortably past anything a real incident
+# produces — the alert engine collapses repeats into one row's `count`, so
+# 50,000 rows is 50,000 distinct problems, not 50,000 flaps — while still
+# bounding the CSV this route builds in memory per request.
 ALERTS_EXPORT_CAP = 50000
 
 
@@ -5024,9 +4852,7 @@ def get_alerts_export(service, params, body) -> dict:
 
 
 def get_alert(service, params, body, alert_id) -> dict:
-    row = service.alerts_db.alert(alert_id)
-    if not row:
-        raise ValueError("No such alert")
+    row = _require(service.alerts_db.alert(alert_id), "alert")
     alert = _alert_json(row, _alert_device_ids(service, [row]))
     rule = service.alerts_db.rule(row["rule_id"])
     alert["rule_name"] = rule["name"] if rule else ""
@@ -5038,8 +4864,7 @@ def get_alert(service, params, body, alert_id) -> dict:
 
 
 def post_alert_ack(service, params, body, alert_id) -> dict:
-    if not service.alerts_db.alert(alert_id):
-        raise ValueError("No such alert")
+    _require(service.alerts_db.alert(alert_id), "alert")
     service.alerts_db.acknowledge(alert_id, params.get("_username", ""),
                                   str(body.get("note", "")))
     _audit(service, params, "alert.ack", target=str(alert_id))
@@ -5047,16 +4872,14 @@ def post_alert_ack(service, params, body, alert_id) -> dict:
 
 
 def post_alert_unack(service, params, body, alert_id) -> dict:
-    if not service.alerts_db.alert(alert_id):
-        raise ValueError("No such alert")
+    _require(service.alerts_db.alert(alert_id), "alert")
     service.alerts_db.unacknowledge(alert_id)
     _audit(service, params, "alert.unack", target=str(alert_id))
     return {"ok": True}
 
 
 def post_alert_resolve(service, params, body, alert_id) -> dict:
-    if not service.alerts_db.alert(alert_id):
-        raise ValueError("No such alert")
+    _require(service.alerts_db.alert(alert_id), "alert")
     service.alerts_db.resolve(alert_id, params.get("_username", ""))
     _audit(service, params, "alert.resolve", target=str(alert_id))
     return {"ok": True}
@@ -5093,8 +4916,7 @@ def post_alerts_mute(service, params, body) -> dict:
         device = service.nodes_db.device(int(entity_id))
     except (TypeError, ValueError):
         device = None
-    if device is None:
-        raise ValueError("No such device")
+    _require(device, "device")
     try:
         hours = float(body.get("hours", 1))
     except (TypeError, ValueError):
@@ -5138,9 +4960,7 @@ def _bulk_mute_device_ids(service, body) -> list[str]:
     except (TypeError, ValueError):
         raise ValueError("device_ids must be device ids")
     present = {row["id"] for row in service.nodes_db.devices_by_ids(wanted)}
-    ids = [i for i in ids if int(i) in present]
-    if not ids:
-        raise ValueError("No such device(s)")
+    ids = _require([i for i in ids if int(i) in present], "device(s)")
     return sorted(ids, key=int)
 
 
@@ -5250,8 +5070,7 @@ def post_alerts_window(service, params, body) -> dict:
 
 
 def put_alerts_window(service, params, body, window_id) -> dict:
-    if not service.alerts_db.window(window_id):
-        raise ValueError("No such maintenance window")
+    _require(service.alerts_db.window(window_id), "maintenance window")
     fields = _window_body_fields(service, body)
     service.alerts_db.update_window(window_id, **fields)
     _audit(service, params, "alert.window_update", target=str(window_id))
@@ -5265,8 +5084,7 @@ def delete_alerts_window(service, params, body, window_id) -> dict:
 
 
 def post_alerts_window_end(service, params, body, window_id) -> dict:
-    if not service.alerts_db.window(window_id):
-        raise ValueError("No such maintenance window")
+    _require(service.alerts_db.window(window_id), "maintenance window")
     changed = service.alerts_db.end_window_now(window_id)
     _audit(service, params, "alert.window_end", target=str(window_id))
     return {"window": _window_json(service.alerts_db.window(window_id)),
@@ -5354,19 +5172,16 @@ def _validated_threshold_fields(kind: str, row, fields: dict) -> dict:
     continuous one does."""
     if kind not in _THRESHOLD_RULE_KINDS:
         return fields
-    # Only what this request is actually setting. Reading the stored value
-    # back for a key the body never mentioned, and then refusing on it, made
-    # an unrelated edit impossible: a custom rule created before this check
-    # existed could have a NULL threshold (the create route allowed it), and
-    # every PUT against it — including the operator's likely first move,
-    # disabling the noisy thing — was refused until a threshold was supplied.
-    # A rule that is already stored is not this request's to validate. It
-    # also meant untouched stored values were copied back into `fields` and
-    # rewritten on every save, which is an invisible write nobody asked for.
+    # Only what this request is actually setting. A rule already stored is
+    # not this request's to validate: reading a key the body never mentioned
+    # back and refusing on it would make an unrelated edit — disabling a
+    # noisy rule with a NULL threshold, say — impossible, and would copy
+    # untouched stored values back into `fields` to be rewritten on every
+    # save.
     #
     # `threshold` is still required when the request supplies it as null, or
-    # when a rule is being created or changed INTO a threshold kind, because
-    # those are the paths that produce a rule that can never raise at all.
+    # when a rule is created or changed INTO a threshold kind: those are the
+    # paths that produce a rule that can never raise at all.
     creating_or_retyping = row is None or "kind" in fields
     for name in ("threshold", "clear_threshold"):
         if name in fields:
@@ -5406,10 +5221,9 @@ def post_alerts_rule(service, params, body) -> dict:
         raise ValueError("Unrecognized rule kind")
     if service.alerts_db.rule_by_key(key):
         raise ValueError(f"A rule with key '{key}' already exists")
-    fields = {k: v for k, v in body.items() if k in
-             ("severity", "enabled", "device_filter", "threshold",
-              "clear_threshold", "for_polls", "for_seconds", "template_id",
-              "auto_resolve_after_s", "notify")}
+    fields = _pick(body, ("severity", "enabled", "device_filter", "threshold",
+                          "clear_threshold", "for_polls", "for_seconds",
+                          "template_id", "auto_resolve_after_s", "notify"))
     fields = _validated_threshold_fields(kind, None, fields)
     rule_id = service.alerts_db.add_rule(key, name, kind, source_kind, **fields)
     service.log.add(ALERTS_CATEGORY, f"Added alert rule {name}")
@@ -5419,24 +5233,21 @@ def post_alerts_rule(service, params, body) -> dict:
 
 
 # threshold/clear_threshold/enabled first in an update's audit detail — the
-# literal "changed the threshold from 90 to 99" case a post-mortem asks
-# for — so that if the combined diff still overflows the 512-char clip
-# appdb.audit applies, these three are the ones that survive it rather
-# than whatever happened to be last in the request body.
+# "changed the threshold from 90 to 99" a post-mortem asks for — so if the
+# diff overflows the 512-char clip appdb.audit applies, these three survive
+# rather than whatever was last in the request body.
 _ALERT_RULE_AUDIT_PRIORITY = ("threshold", "clear_threshold", "enabled")
 
 
 def put_alerts_rule(service, params, body, rule_id) -> dict:
-    row = service.alerts_db.rule(rule_id)
-    if not row:
-        raise ValueError("No such rule")
+    row = _require(service.alerts_db.rule(rule_id), "rule")
     allowed_keys = ("name", "severity", "enabled", "device_filter", "threshold",
                     "clear_threshold", "for_polls", "for_seconds", "template_id",
                     "flap_window_s", "flap_min_transitions",
                     "auto_resolve_after_s", "notify")
     if not row["is_builtin"]:
         allowed_keys = allowed_keys + ("kind", "source_kind")
-    fields = {k: v for k, v in body.items() if k in allowed_keys}
+    fields = _pick(body, allowed_keys)
     # The kind an update leaves in place, not the one it arrived with: a
     # built-in cannot change kind at all, and a custom rule that is changing
     # kind has to satisfy the rules of the kind it is becoming.
@@ -5456,20 +5267,14 @@ def put_alerts_rule(service, params, body, rule_id) -> dict:
 
 
 def delete_alerts_rule(service, params, body, rule_id) -> dict:
-    row = service.alerts_db.rule(rule_id)
-    if not row:
-        raise ValueError("No such rule")
+    row = _require(service.alerts_db.rule(rule_id), "rule")
     if row["is_builtin"]:
         raise ValueError("A built-in rule cannot be deleted — disable it instead")
-    # rules.id is alerts.rule_id's ON DELETE CASCADE parent, so a rule with
-    # real history deletes that history along with it — a confirmation
-    # dialog reading only "Remove <name>?" says nothing about that. The
-    # refusal names the count and offers the alternative in the same
-    # sentence, so an operator who wanted the rule gone learns `enabled`
-    # exists at the moment they need it, rather than being told no with
-    # nowhere to go. remove_rule's own WHERE clause refuses this too (see
-    # its docstring) — this check is what turns that into a message an
-    # operator can act on instead of a silent no-op.
+    # rules.id is alerts.rule_id's ON DELETE CASCADE parent, so deleting a
+    # rule with history deletes that history too. remove_rule's own WHERE
+    # clause refuses this as well; this check is what turns that silent
+    # no-op into a message naming the count and offering `enabled` as the
+    # alternative.
     count = service.alerts_db.alert_count_for_rule(rule_id)
     if count:
         raise ValueError(
@@ -5503,18 +5308,14 @@ def post_alerts_template(service, params, body) -> dict:
 
 
 def put_alerts_template(service, params, body, template_id) -> dict:
-    if not service.alerts_db.template(template_id):
-        raise ValueError("No such template")
-    fields = {k: v for k, v in body.items()
-             if k in ("name", "subject", "body", "is_html")}
+    _require(service.alerts_db.template(template_id), "template")
+    fields = _pick(body, ("name", "subject", "body", "is_html"))
     service.alerts_db.update_template(template_id, **fields)
     return {"ok": True}
 
 
 def post_alerts_template_reset(service, params, body, template_id) -> dict:
-    row = service.alerts_db.template(template_id)
-    if not row:
-        raise ValueError("No such template")
+    row = _require(service.alerts_db.template(template_id), "template")
     if not row["is_builtin"]:
         raise ValueError("Only a built-in template has shipped text to reset to")
     service.alerts_db.reset_template(template_id)
@@ -5522,9 +5323,7 @@ def post_alerts_template_reset(service, params, body, template_id) -> dict:
 
 
 def delete_alerts_template(service, params, body, template_id) -> dict:
-    row = service.alerts_db.template(template_id)
-    if not row:
-        raise ValueError("No such template")
+    row = _require(service.alerts_db.template(template_id), "template")
     if row["is_builtin"]:
         raise ValueError(
             "A built-in template cannot be deleted — a rule referencing "
@@ -5549,17 +5348,13 @@ def post_alerts_template_preview(service, params, body, template_id) -> dict:
     """
     from .. import alertmail
 
-    row = service.alerts_db.template(template_id)
-    if not row:
-        raise ValueError("No such template")
+    row = _require(service.alerts_db.template(template_id), "template")
     subject = str(body["subject"]) if "subject" in body else row["subject"]
     template_body = str(body["body"]) if "body" in body else row["body"]
     is_html = bool(body["is_html"]) if "is_html" in body else bool(row["is_html"])
     alert_id = body.get("alert_id")
     if alert_id:
-        alert_row = service.alerts_db.alert(int(alert_id))
-        if not alert_row:
-            raise ValueError("No such alert")
+        alert_row = _require(service.alerts_db.alert(int(alert_id)), "alert")
         rule_row = service.alerts_db.rule(alert_row["rule_id"])
         context = alertmail.build_context(alert_row, rule_row)
     else:
@@ -5585,20 +5380,14 @@ def post_alerts_template_preview(service, params, body, template_id) -> dict:
 
 
 def post_alerts_smtp_credential(service, params, body) -> dict:
-    from .. import dpapi
-
     password = str(body.get("password", ""))
     if not password:
         raise ValueError("A password is required")
-    if not dpapi.available():
-        raise ValueError(
+    try:
+        encrypted = _encrypt_secret(password, (
             "This machine cannot encrypt a stored credential — DPAPI is "
             "Windows-only. A test email can still use a password typed "
-            "into Test each time; nothing will be saved here.")
-    try:
-        encrypted = dpapi.protect(password.encode("utf-8"))
-    except dpapi.DpapiUnavailable as exc:
-        raise ValueError(str(exc))
+            "into Test each time; nothing will be saved here."))
     finally:
         password = None
     service.alerts_db.set_smtp_credential(encrypted)
@@ -5608,18 +5397,18 @@ def post_alerts_smtp_credential(service, params, body) -> dict:
 
 
 def delete_alerts_smtp_credential(service, params, body) -> dict:
-    service.alerts_db.clear_smtp_credential()
-    service.log.add(ALERTS_CATEGORY, "Cleared the stored SMTP credential")
-    _audit(service, params, "credential.clear", target="smtp")
-    return {"ok": True}
+    return _clear_credential(
+        service, params, clear=service.alerts_db.clear_smtp_credential,
+        category=ALERTS_CATEGORY, message="Cleared the stored SMTP credential",
+        target="smtp")
 
 
 # The body fields that decide WHERE the test email goes and how the
-# connection to it is protected. Overriding any of them and letting the
-# stored password be used is how a stored SMTP credential was made to walk
-# out to any host and port on the network (`AUTH PLAIN` in the clear, to a
-# listener of the caller's choosing). Testing an unsaved host is still
-# allowed — with the password for that host typed in beside it.
+# connection is protected. Overriding any of them while letting the STORED
+# password be used would walk that credential out to any host and port on
+# the network (`AUTH PLAIN` in the clear, to a listener of the caller's
+# choosing). Testing an unsaved host is still allowed — with the password
+# for that host typed in beside it.
 _SMTP_DESTINATION_KEYS = ("smtp_host", "smtp_port", "smtp_security",
                           "smtp_verify_cert")
 
@@ -5776,7 +5565,7 @@ def _power_unit(service, powers) -> str:
     an entire controller's column to "% level", so a FAP-231F's serving
     radios at a genuine 17 and 20 dBm were relabelled as percentages.
     """
-    from ..fortinetoids import MAX_PLAUSIBLE_DBM
+    from ..nodeoids import MAX_PLAUSIBLE_DBM
 
     configured = str(service.wireless_settings.get("radio_power_unit", "auto"))
     if configured in ("dbm", "percent"):
@@ -5801,7 +5590,7 @@ def _ap_json(service, row) -> dict:
         "status": row["status"], "model": row["model"],
         "mac_address": row["mac_address"], "station_count": row["station_count"],
         # The AP's own address as the controller reports it, and the
-        # round-trip to it. None where it was not measured — an AP that does
+        # round-trip to it. None where there is no reading — an AP that does
         # not answer ICMP is not an AP with a 0 ms response.
         "ip": row["ip"] or "",
         "response_ms": row["response_ms"],
@@ -5859,10 +5648,8 @@ def post_wireless_controller(service, params, body) -> dict:
 
 
 def put_wireless_controller(service, params, body, controller_id) -> dict:
-    existing = service.wireless_db.controller(controller_id)
-    if not existing:
-        raise ValueError("No such controller")
-    fields = {k: v for k, v in body.items() if k in _CONTROLLER_EDITABLE_BODY}
+    existing = _require(service.wireless_db.controller(controller_id), "controller")
+    fields = _pick(body, _CONTROLLER_EDITABLE_BODY)
     # Same rule as the DHCP server above: the stored SNMPv3 password was
     # stored for one controller at one address, so moving the row to a
     # different address forgets it rather than offering it to whatever
@@ -5880,57 +5667,46 @@ def put_wireless_controller(service, params, body, controller_id) -> dict:
 
 
 def delete_wireless_controller(service, params, body, controller_id) -> dict:
-    row = service.wireless_db.controller(controller_id)
-    if not row:
-        raise ValueError("No such controller")
+    row = _require(service.wireless_db.controller(controller_id), "controller")
     service.wireless_db.remove_controller(controller_id)
     service.log.add(WIRELESS_CATEGORY, f"Removed wireless controller {row['name']}")
     return {"ok": True}
 
 
-def post_wireless_controller_credential(service, params, body, controller_id) -> dict:
-    from .. import dpapi
+def _store_controller_credential(service, controller_id, user, auth_proto, encrypted):
+    # The controller row carries the v3 identity the poller reads; the secret
+    # is stored apart from it. Both are written, or the store call fails.
+    service.wireless_db.update_controller(controller_id, v3_user=user,
+                                          v3_auth_proto=auth_proto)
+    service.wireless_db.set_credential(controller_id, encrypted)
 
-    row = service.wireless_db.controller(controller_id)
-    if not row:
-        raise ValueError("No such controller")
-    user = str(body.get("v3_user", "")).strip()
-    password = str(body.get("v3_auth_pass", ""))
-    auth_proto = str(body.get("v3_auth_proto", "")).strip()
-    if not user or not password or not auth_proto:
-        raise ValueError("A username, auth protocol, and password are all required")
-    if not dpapi.available():
-        raise ValueError(
+
+def post_wireless_controller_credential(service, params, body, controller_id) -> dict:
+    row = _require(service.wireless_db.controller(controller_id), "controller")
+    return _store_v3_credential(
+        service, params, body,
+        store=functools.partial(_store_controller_credential, service, controller_id),
+        category=WIRELESS_CATEGORY,
+        message=f"Stored an SNMPv3 credential for {row['name']}",
+        target=f"controller:{row['ip']}",
+        unavailable=(
             "This machine cannot encrypt a stored credential — DPAPI is "
             "Windows-only. Use a v1/v2c community, or SNMPv3 "
-            "noAuthNoPriv, instead.")
-    try:
-        encrypted = dpapi.protect(password.encode("utf-8"))
-    except dpapi.DpapiUnavailable as exc:
-        raise ValueError(str(exc))
-    finally:
-        password = None
-    service.wireless_db.update_controller(controller_id, v3_user=user, v3_auth_proto=auth_proto)
-    service.wireless_db.set_credential(controller_id, encrypted)
-    service.log.add(WIRELESS_CATEGORY, f"Stored an SNMPv3 credential for {row['name']}")
-    _audit(service, params, "credential.store",
-           target=f"controller:{row['ip']}", detail=f"SNMPv3 user {user}")
-    return {"ok": True}
+            "noAuthNoPriv, instead."))
 
 
 def delete_wireless_controller_credential(service, params, body, controller_id) -> dict:
-    row = service.wireless_db.controller(controller_id)
-    if not row:
-        raise ValueError("No such controller")
-    service.wireless_db.set_credential(controller_id, None)
-    service.log.add(WIRELESS_CATEGORY, f"Cleared the stored SNMPv3 credential for {row['name']}")
-    _audit(service, params, "credential.clear", target=f"controller:{row['ip']}")
-    return {"ok": True}
+    row = _require(service.wireless_db.controller(controller_id), "controller")
+    return _clear_credential(
+        service, params,
+        clear=functools.partial(service.wireless_db.set_credential, controller_id, None),
+        category=WIRELESS_CATEGORY,
+        message=f"Cleared the stored SNMPv3 credential for {row['name']}",
+        target=f"controller:{row['ip']}")
 
 
 def post_wireless_controller_poll(service, params, body, controller_id) -> dict:
-    if not service.wireless_db.controller(controller_id):
-        raise ValueError("No such controller")
+    _require(service.wireless_db.controller(controller_id), "controller")
     service.wireless.poll_now(controller_id)
     return {"ok": True}
 
@@ -5983,9 +5759,7 @@ def get_wireless_aps_export(service, params, body) -> dict:
 
 
 def post_wireless_ap_service(service, params, body, ap_id) -> dict:
-    ap = service.wireless_db.access_point(int(ap_id))
-    if ap is None:
-        raise ValueError("No such access point")
+    ap = _require(service.wireless_db.access_point(int(ap_id)), "access point")
     service.wireless_db.set_out_of_service(int(ap_id), bool(body.get("out_of_service")))
     return {"ok": True, "out_of_service": bool(body.get("out_of_service"))}
 
@@ -5994,9 +5768,7 @@ def delete_wireless_ap(service, params, body, ap_id) -> dict:
     """Removes one AP row by hand. Needed because an out-of-service AP is
     deliberately exempt from prune_stale — without this there would be no
     way to retire one permanently once the controller stops reporting it."""
-    ap = service.wireless_db.access_point(int(ap_id))
-    if ap is None:
-        raise ValueError("No such access point")
+    ap = _require(service.wireless_db.access_point(int(ap_id)), "access point")
     service.wireless_db.remove_ap(int(ap_id))
     return {"ok": True}
 
@@ -6020,13 +5792,13 @@ def post_wireless_collector(service, params, body) -> dict:
 
 
 def post_ipam_worker(service, params, body) -> dict:
-    """Start or stop the IPAM worker from its strip. Goes through
-    apply_ipam_settings so the choice persists exactly as the checkbox in
-    the settings dialog does — the only control there used to be."""
+    """Start or stop the IPAM worker from its strip. Goes through the same
+    apply_settings the settings dialog does, so the choice persists exactly
+    as the checkbox there does — the only control there used to be."""
     action = str(body.get("action", "")).lower()
     if action not in ("start", "stop"):
         raise ValueError("action must be start or stop")
-    service.apply_ipam_settings({"enabled": action == "start"})
+    service.apply_settings("ipam", {"enabled": action == "start"})
     return {"running": service.ipam.running,
             "enabled": bool(service.ipam_settings.get("enabled", True))}
 
@@ -6054,10 +5826,8 @@ def _configrx_device_json(service, device_row, worker_state=None) -> dict:
         "vendor": device_row["vendor"],
         # The vendor this device would ACTUALLY back up as, resolved the same
         # way configrx._backup_device resolves it: the explicit override, then
-        # what SNMP detected (not the displayed vendor, which a custom vendor
-        # OID may have replaced with a free-text name). The list used to show
-        # Nodes' vendor verbatim while the worker used something else, so a
-        # device could read "cisco" and back up as "hp" with no sign of it.
+        # what SNMP detected — not the displayed vendor, which a custom vendor
+        # OID may have replaced with free text.
         "effective_vendor": override or nodesdb.detected_vendor(device_row) or "",
         "vendor_is_override": bool(override),
         "backup_enabled": bool(config["backup_enabled"]) if config else False,
@@ -6093,19 +5863,16 @@ def _configrx_backup_json(row) -> dict:
 
 
 def delete_configrx_backup(service, params, body, backup_id) -> dict:
-    row = service.configrx_db.backup(backup_id)
-    if row is None:
-        raise ValueError("No such backup")
+    row = _require(service.configrx_db.backup(backup_id), "backup")
     removed = service.configrx_db.delete_backup(backup_id)
     if removed:
         service.log.add(CONFIGRX_CATEGORY,
                         f"Deleted a stored config backup for device {row['device_id']}")
-        # "Who destroyed the evidence" — this product has no restore-to-
-        # device capability at all (configrx_redact.py says so explicitly),
-        # so a deleted backup's config content is gone for good, not just
-        # rolled back. device.ip preferred over the bare id, matching every
-        # other device-scoped audit target; falls back to the id itself on
-        # the rare row whose device has since been removed.
+        # There is no restore-to-device capability here, so a deleted
+        # backup's config content is gone for good — which makes "who deleted
+        # it" worth recording. device.ip over the bare id, matching every
+        # other device-scoped audit target, falling back to the id on a row
+        # whose device has since been removed.
         device = service.nodes_db.device(row["device_id"])
         target = f"device:{device['ip']}" if device else f"device:{row['device_id']}"
         _audit(service, params, "configrx.backup_delete", target=target,
@@ -6161,20 +5928,15 @@ def get_configrx_devices(service, params, body) -> dict:
 
 
 def get_configrx_device(service, params, body, device_id) -> dict:
-    device = service.nodes_db.device(device_id)
-    if not device:
-        raise ValueError("No such device")
+    device = _require(service.nodes_db.device(device_id), "device")
     return {"device": _configrx_device_json(
         service, device, service.configrx.worker_state())}
 
 
 def post_configrx_device_config(service, params, body, device_id) -> dict:
-    device = service.nodes_db.device(device_id)
-    if not device:
-        raise ValueError("No such device")
-    fields = {k: v for k, v in body.items()
-             if k in ("backup_enabled", "ssh_port", "ssh_username",
-                      "vendor_override", "store_secrets")}
+    device = _require(service.nodes_db.device(device_id), "device")
+    fields = _pick(body, ("backup_enabled", "ssh_port", "ssh_username",
+                          "vendor_override", "store_secrets"))
     if "ssh_port" in fields:
         try:
             port = int(fields["ssh_port"])
@@ -6186,8 +5948,7 @@ def post_configrx_device_config(service, params, body, device_id) -> dict:
     if "store_secrets" in fields:
         fields["store_secrets"] = 1 if fields["store_secrets"] else 0
         # device:{ip}, not a bare device_id — the same target shape every
-        # other device-scoped audit line in this file uses (normalized
-        # 4.49.0; this was the one inconsistent site).
+        # other device-scoped audit line in this file uses.
         _audit(service, params,
                "configrx.store_secrets", target=f"device:{device['ip']}",
                detail="on — captures will be stored verbatim"
@@ -6205,9 +5966,8 @@ def post_configrx_devices_bulk_config(service, params, body) -> dict:
     # layer has always allowed it (DEVICE_CONFIG_EDITABLE), and only this
     # allow-list withheld it, which meant a bulk settings dialog could set
     # everything about a batch of switches except who to log in as.
-    fields = {k: v for k, v in body.items()
-             if k in ("backup_enabled", "ssh_port", "vendor_override",
-                      "ssh_username")}
+    fields = _pick(body, ("backup_enabled", "ssh_port", "vendor_override",
+                          "ssh_username"))
     if not fields:
         raise ValueError("Nothing to update")
     existing = {d["id"] for d in service.nodes_db.devices_by_ids(device_ids)}
@@ -6259,25 +6019,19 @@ def post_configrx_devices_bulk_backup(service, params, body) -> dict:
 
 
 def post_configrx_devices_bulk_credential(service, params, body) -> dict:
-    from .. import dpapi
-
     device_ids = _bulk_device_ids(body)
     username = str(body.get("ssh_username", "")).strip()
     password = str(body.get("ssh_password", ""))
     if not username or not password:
         raise ValueError("A username and password are both required")
-    if not dpapi.available():
-        raise ValueError(
+    try:
+        # Encrypted once, not once per device: it is the same plaintext going
+        # to every selected device, so there is no reason to pay for (or add a
+        # second window of exposure from) a repeated encrypt call.
+        encrypted = _encrypt_secret(password, (
             "This machine cannot encrypt a stored credential — DPAPI is "
             "Windows-only, so ConfigRX refuses to store an SSH password "
-            "here rather than keep it in plain text.")
-    try:
-        # Encrypted once, not once per device: it is the same plaintext
-        # going to every selected device, so there is no reason to pay for
-        # (or add a second window of exposure from) a repeated DPAPI call.
-        encrypted = dpapi.protect(password.encode("utf-8"))
-    except dpapi.DpapiUnavailable as exc:
-        raise ValueError(str(exc))
+            "here rather than keep it in plain text."))
     finally:
         password = None
     updated = 0
@@ -6292,20 +6046,15 @@ def post_configrx_devices_bulk_credential(service, params, body) -> dict:
 
 
 def post_configrx_device_credential(service, params, body, device_id) -> dict:
-    from .. import dpapi
-
-    row = service.nodes_db.device(device_id)
-    if not row:
-        raise ValueError("No such device")
+    row = _require(service.nodes_db.device(device_id), "device")
     username = str(body.get("ssh_username", "")).strip()
     password = str(body.get("ssh_password", ""))
     if not username or not password:
         raise ValueError("A username and password are both required")
-    if not dpapi.available():
-        raise ValueError(
-            "This machine cannot encrypt a stored credential — DPAPI is "
-            "Windows-only, so ConfigRX refuses to store an SSH password "
-            "here rather than keep it in plain text.")
+    unavailable = (
+        "This machine cannot encrypt a stored credential — DPAPI is "
+        "Windows-only, so ConfigRX refuses to store an SSH password "
+        "here rather than keep it in plain text.")
     # The enable secret is separate and optional, with set_credential's own
     # three-way contract: the key absent from the body leaves whatever is
     # already stored untouched, present-and-empty clears it, present-and-
@@ -6315,12 +6064,10 @@ def post_configrx_device_credential(service, params, body, device_id) -> dict:
     if "enable_secret" in body:
         enable_secret = str(body.get("enable_secret") or "")
         enable_kwargs["enable_secret_enc"] = (
-            dpapi.protect(enable_secret.encode("utf-8")) if enable_secret else None)
+            _encrypt_secret(enable_secret, unavailable) if enable_secret else None)
         enable_secret = None
     try:
-        encrypted = dpapi.protect(password.encode("utf-8"))
-    except dpapi.DpapiUnavailable as exc:
-        raise ValueError(str(exc))
+        encrypted = _encrypt_secret(password, unavailable)
     finally:
         password = None
     service.configrx_db.set_credential(device_id, username, encrypted, **enable_kwargs)
@@ -6331,13 +6078,13 @@ def post_configrx_device_credential(service, params, body, device_id) -> dict:
 
 
 def delete_configrx_device_credential(service, params, body, device_id) -> dict:
-    row = service.nodes_db.device(device_id)
-    if not row:
-        raise ValueError("No such device")
-    service.configrx_db.clear_credential(device_id)
-    service.log.add(CONFIGRX_CATEGORY, f"Cleared the stored SSH credential for {row['ip']}")
-    _audit(service, params, "credential.clear", target=f"configrx:{row['ip']}")
-    return {"ok": True}
+    row = _require(service.nodes_db.device(device_id), "device")
+    return _clear_credential(
+        service, params,
+        clear=functools.partial(service.configrx_db.clear_credential, device_id),
+        category=CONFIGRX_CATEGORY,
+        message=f"Cleared the stored SSH credential for {row['ip']}",
+        target=f"configrx:{row['ip']}")
 
 
 def delete_configrx_device_enable_secret(service, params, body, device_id) -> dict:
@@ -6346,9 +6093,7 @@ def delete_configrx_device_enable_secret(service, params, body, device_id) -> di
     one. Clearing the whole credential (above) still clears both, per this
     release's security review; this is the narrower operation that was
     missing beside it."""
-    row = service.nodes_db.device(device_id)
-    if not row:
-        raise ValueError("No such device")
+    row = _require(service.nodes_db.device(device_id), "device")
     service.configrx_db.clear_enable_secret(device_id)
     service.log.add(CONFIGRX_CATEGORY, f"Cleared the stored enable secret for {row['ip']}")
     _audit(service, params, "credential.clear", target=f"configrx:{row['ip']}",
@@ -6357,8 +6102,7 @@ def delete_configrx_device_enable_secret(service, params, body, device_id) -> di
 
 
 def get_configrx_device_backups(service, params, body, device_id) -> dict:
-    if not service.nodes_db.device(device_id):
-        raise ValueError("No such device")
+    _require(service.nodes_db.device(device_id), "device")
     # No "changed since previous" flag to compute here: ConfigRxDatabase.
     # add_backup only ever inserts a row when the hash differs from the
     # device's prior backup, so every stored row already IS a change —
@@ -6374,26 +6118,16 @@ def get_configrx_backup(service, params, body, backup_id) -> dict:
     with store_secrets on) is the one case that still needs guarding: a
     caller without ConfigRX write gets it through the same redaction pass
     get_configrx_diff always applies, never the stored secrets themselves."""
-    row = service.configrx_db.backup(backup_id)
-    if not row:
-        raise ValueError("No such backup")
+    row = _require(service.configrx_db.backup(backup_id), "backup")
     content = service.configrx_db.backup_content(backup_id)
     backup_json = _configrx_backup_json(row)
     # Redact on the way out for anyone without ConfigRX write, whatever the
-    # stored flag says. That flag used to gate this, and it could not carry
-    # the weight: configrx._backup_device writes `redacted=not store_secrets`
-    # — "we ran the redactor" — not "the redactor found and removed
-    # something". Every pattern in configrx_redact was anchored on Cisco-IOS
-    # or FortiOS directive syntax while ConfigRX ships backup support for
-    # Juniper, MikroTik, HP/Aruba, Moxa, Siemens and Rockwell too, so for
-    # those vendors redact() matched nothing, returned the config verbatim,
-    # and the row was still stamped redacted=True. Trusting that stamp here
-    # then served a Juniper RADIUS key or an IKE pre-shared key in full to a
-    # caller holding only ConfigRX read — the one thing this branch exists
-    # to prevent. The pattern list has since been widened, but the read path
-    # must not depend on that list being complete: redaction is idempotent,
-    # so re-running it over an already-redacted config costs one pass and
-    # removes the flag from the trust boundary entirely.
+    # stored flag says. The flag means "we ran the redactor", not "the
+    # redactor found and removed something" — a vendor no pattern matches is
+    # stored verbatim and still stamped redacted=True, so trusting it would
+    # serve a RADIUS key or an IKE pre-shared key in full to a caller holding
+    # only ConfigRX read. Redaction is idempotent, so re-running it here
+    # costs one pass and takes the flag out of the trust boundary.
     if not _may_read_secrets(service, params, "configrx"):
         content, _ = configrx_redact.redact(content or "")
         backup_json["redacted"] = True
@@ -6439,7 +6173,7 @@ def get_configrx_diff(service, params, body) -> dict:
     and those are very different things for an operator to be told. Both
     backups' own `sha256` (of the stored bytes, never redacted) still
     tells the two apart even when their redacted bodies render identically,
-    so `redacted_only_change` (O-57) is set whenever the visible diff is
+    so `redacted_only_change` is set whenever the visible diff is
     empty but the underlying backups are not actually the same — a rotated
     enable secret or a changed SNMP community are exactly this case, and
     without this flag they render as a clean, reassuring empty diff, which
@@ -6467,12 +6201,11 @@ def get_configrx_diff(service, params, body) -> dict:
             raise ValueError("Both backups must belong to this device")
 
     from_json, to_json = _configrx_backup_json(from_row), _configrx_backup_json(to_row)
-    # Fast path (TESTS: "same-hash pair returns empty diff fast-path"): two
-    # rows with the same content hash cannot diff to anything, whether that
-    # is one backup picked for both ends or two distinct rows that happen
-    # to match (a config reverted to something backed up before). Skipping
-    # redact()+unified_diff here is not just an optimisation — it also means
-    # picking the same backup twice never runs a diff over its own secrets.
+    # Two rows with the same content hash cannot diff to anything, whether
+    # that is one backup picked for both ends or a config reverted to
+    # something backed up before. Not just an optimisation: skipping
+    # redact()+unified_diff means picking the same backup twice never runs a
+    # diff over its own secrets.
     if from_row["id"] == to_row["id"] or from_row["sha256"] == to_row["sha256"]:
         return {"diff": "", "additions": 0, "removals": 0,
                 "from": from_json, "to": to_json, "identical": True,
@@ -6485,12 +6218,10 @@ def get_configrx_diff(service, params, body) -> dict:
     text, additions, removals = configrx.diff_texts(
         from_redacted, to_redacted,
         _configrx_backup_label(from_row), _configrx_backup_label(to_row))
-    # Reaching here already means from_row["sha256"] != to_row["sha256"]
-    # (the fast path above caught the equal-hash case), so these two rows
-    # are never actually identical — an empty `text` here is only ever the
-    # O-57 case: the stored bytes genuinely differ, and that difference is
-    # entirely inside material configrx_redact.redact() maps onto the same
-    # literal token on both sides, so nothing about it survives into the
+    # The fast path above caught the equal-hash case, so these two rows are
+    # never identical: an empty `text` means the stored bytes differ entirely
+    # inside material configrx_redact.redact() maps onto the same literal
+    # token on both sides, so nothing about the difference survives into the
     # rendered diff.
     return {"diff": text, "additions": additions, "removals": removals,
             "from": from_json, "to": to_json, "identical": False,
@@ -6498,8 +6229,7 @@ def get_configrx_diff(service, params, body) -> dict:
 
 
 def post_configrx_device_backup(service, params, body, device_id) -> dict:
-    if not service.nodes_db.device(device_id):
-        raise ValueError("No such device")
+    _require(service.nodes_db.device(device_id), "device")
     config = service.configrx_db.device_config(device_id)
     if not config or not config["backup_enabled"]:
         raise ValueError("Backup is not enabled for this device")
@@ -6530,15 +6260,12 @@ def post_configrx_worker(service, params, body) -> dict:
 
 # ------------------------------------------------------- search + compliance
 #
-# netpath/configrx_search.py and netpath/configrx_compliance.py: cross-device
-# config search, and the compliance rule sets that turn a repeated search
-# into a standing pass/fail column. Both modules already redact/bound
-# everything that needs it (see their own module docstrings) — these routes
-# are the thin dispatch on top, matching this file's own gate convention
-# (search and compliance results never carry an unredacted secret or a
-# matched line respectively, so both read as "configrx", R; rule-set/rule
-# CRUD changes monitoring policy, so "configrx", W, the same split
-# device-config/credential POST routes already use).
+# netpath/configrx_compliance.py: cross-device config search, and the
+# compliance rule sets that turn a repeated search into a standing pass/fail
+# column. That module redacts and bounds everything that needs it, so these
+# routes are the thin dispatch on top — neither result carries an unredacted
+# secret, so both read as ("configrx", R); rule-set/rule CRUD changes
+# monitoring policy, so ("configrx", W).
 
 def _configrx_search_json(service, result: dict) -> dict:
     """search()'s raw {device_id, line_no, line} rows, with each match's
@@ -6551,7 +6278,7 @@ def _configrx_search_json(service, result: dict) -> dict:
         device = devices.get(m["device_id"])
         matches.append({
             "device_id": m["device_id"],
-            "device_name": hostresolve.device_name(device) if device else None,
+            "device_name": namelookup.device_name(device) if device else None,
             "device_ip": device["ip"] if device else None,
             "line_no": m["line_no"], "line": m["line"],
         })
@@ -6563,8 +6290,8 @@ CONFIGRX_SEARCH_MAX_LIMIT = 2000
 
 def get_configrx_search(service, params, body) -> dict:
     """One query against every device's latest redacted capture — see
-    configrx_search.search. `mode=regex` runs a bounded regular expression
-    (configrx_search.UnsafeRegex, a ValueError subclass, reaches server.py's
+    configrx_compliance.search. `mode=regex` runs a bounded regular expression
+    (configrx_compliance.UnsafeRegex, a ValueError subclass, reaches server.py's
     ordinary ValueError->400 handling unchanged, so a refused pattern comes
     back as a plain 400 naming what was wrong with it, not a 500)."""
     query = str(params.get("query", "")).strip()
@@ -6572,9 +6299,9 @@ def get_configrx_search(service, params, body) -> dict:
         raise ValueError("query is required")
     mode = str(params.get("mode") or "text")
     device_ids = _id_list(params.get("device"))
-    limit = max(1, min(int(_num(params, "limit", configrx_search.DEFAULT_LIMIT, int)
-                        or configrx_search.DEFAULT_LIMIT), CONFIGRX_SEARCH_MAX_LIMIT))
-    result = configrx_search.search(service.configrx_db, query, mode=mode,
+    limit, _offset = _page(params, configrx_compliance.DEFAULT_LIMIT,
+                           CONFIGRX_SEARCH_MAX_LIMIT)
+    result = configrx_compliance.search(service.configrx_db, query, mode=mode,
                                     device_ids=device_ids, limit=limit)
     return _configrx_search_json(service, result)
 
@@ -6598,19 +6325,15 @@ def post_configrx_rule_set(service, params, body) -> dict:
 
 
 def get_configrx_rule_set(service, params, body, rule_set_id) -> dict:
-    row = service.configrx_db.rule_set(rule_set_id)
-    if not row:
-        raise ValueError("No such rule set")
+    row = _require(service.configrx_db.rule_set(rule_set_id), "rule set")
     return {"rule_set": dict(row)}
 
 
 def put_configrx_rule_set(service, params, body, rule_set_id) -> dict:
     # Fetched before the update — update_rule_set itself never reads the
     # row it is about to change.
-    before = service.configrx_db.rule_set(rule_set_id)
-    if not before:
-        raise ValueError("No such rule set")
-    fields = {k: v for k, v in body.items() if k in ("name", "device_group_id", "enabled")}
+    before = _require(service.configrx_db.rule_set(rule_set_id), "rule set")
+    fields = _pick(body, ("name", "device_group_id", "enabled"))
     service.configrx_db.update_rule_set(rule_set_id, **fields)
     detail = _audit_diff(before, fields)
     if detail:
@@ -6620,9 +6343,7 @@ def put_configrx_rule_set(service, params, body, rule_set_id) -> dict:
 
 
 def delete_configrx_rule_set(service, params, body, rule_set_id) -> dict:
-    row = service.configrx_db.rule_set(rule_set_id)
-    if not row:
-        raise ValueError("No such rule set")
+    row = _require(service.configrx_db.rule_set(rule_set_id), "rule set")
     service.configrx_db.delete_rule_set(rule_set_id)
     service.log.add(CONFIGRX_CATEGORY, f"Removed ConfigRX rule set {row['name']}")
     _audit(service, params, "configrx.rule_set.delete", target=row["name"])
@@ -6630,18 +6351,14 @@ def delete_configrx_rule_set(service, params, body, rule_set_id) -> dict:
 
 
 def _compliance_rule_json(row, reveal: bool) -> dict:
-    # A rule's pattern is not incidental text that MIGHT contain a secret
-    # (the way a backup line might) — the Add-rule dialog tells the author
-    # outright that this is the point ("a rule can check a secret's actual
-    # value"), so the pattern itself can simply BE the community string or
-    # password it checks for. That makes it the same class of value
-    # get_configrx_backup already gates behind ConfigRX write, not the
-    # plain read this route otherwise matches (see the search/compliance
-    # comment on the route table in server.py). There is no partial
-    # redaction to fall back on the way a backup has: the whole pattern IS
-    # the value, so a caller without write gets every other field — kind,
-    # description, ordinal, id — and an explicit `pattern_hidden` flag
-    # rather than a pattern that silently reads as empty.
+    # A rule's pattern is not text that MIGHT contain a secret the way a
+    # backup line is: the Add-rule dialog says outright that a rule can check
+    # a secret's actual value, so the pattern can simply BE the community
+    # string or password. That puts it behind ConfigRX write, not this
+    # route's plain read. There is no partial redaction to fall back on —
+    # the whole pattern IS the value — so a caller without write gets every
+    # other field plus an explicit `pattern_hidden` flag rather than a
+    # pattern that silently reads as empty.
     fields = dict(row)
     if not reveal:
         fields["pattern"] = None
@@ -6650,22 +6367,19 @@ def _compliance_rule_json(row, reveal: bool) -> dict:
 
 
 def get_configrx_rule_set_rules(service, params, body, rule_set_id) -> dict:
-    if not service.configrx_db.rule_set(rule_set_id):
-        raise ValueError("No such rule set")
+    _require(service.configrx_db.rule_set(rule_set_id), "rule set")
     reveal = _may_read_secrets(service, params, "configrx")
     return {"rules": [_compliance_rule_json(r, reveal) for r in service.configrx_db.rules_for(rule_set_id)]}
 
 
 def post_configrx_rule_set_rule(service, params, body, rule_set_id) -> dict:
-    row = service.configrx_db.rule_set(rule_set_id)
-    if not row:
-        raise ValueError("No such rule set")
+    row = _require(service.configrx_db.rule_set(rule_set_id), "rule set")
     description = str(body.get("description", "")).strip()
     kind = str(body.get("kind", ""))
     pattern = str(body.get("pattern", ""))
     ordinal = int(body.get("ordinal", 0) or 0)
     # configrx_compliance.add_rule raises ValueError for a bad kind or an
-    # empty description, and configrx_search.UnsafeRegex (itself a
+    # empty description, and configrx_compliance.UnsafeRegex (itself a
     # ValueError) for a pattern unsafe to ever run — all three reach
     # server.py's ordinary ValueError->400 handling unchanged.
     rule_id = configrx_compliance.add_rule(
@@ -6676,13 +6390,9 @@ def post_configrx_rule_set_rule(service, params, body, rule_set_id) -> dict:
 
 
 def delete_configrx_rule_set_rule(service, params, body, rule_set_id, rule_id) -> dict:
-    rule_set = service.configrx_db.rule_set(rule_set_id)
-    if not rule_set:
-        raise ValueError("No such rule set")
-    rule = next((r for r in service.configrx_db.rules_for(rule_set_id)
-                if r["id"] == int(rule_id)), None)
-    if rule is None:
-        raise ValueError("No such rule")
+    rule_set = _require(service.configrx_db.rule_set(rule_set_id), "rule set")
+    rule = _require(next((r for r in service.configrx_db.rules_for(rule_set_id)
+                          if r["id"] == int(rule_id)), None), "rule")
     service.configrx_db.delete_rule(rule_id)
     _audit(service, params, "configrx.rule.delete", target=rule_set["name"],
           detail=rule["description"])
@@ -6694,9 +6404,7 @@ def post_configrx_rule_set_evaluate(service, params, body, rule_set_id) -> dict:
     happens on every new capture and on ConfigRxWorker's own hourly sweep,
     so this exists for an operator who just edited a rule set and does not
     want to wait for either."""
-    row = service.configrx_db.rule_set(rule_set_id)
-    if not row:
-        raise ValueError("No such rule set")
+    row = _require(service.configrx_db.rule_set(rule_set_id), "rule set")
     count = configrx_compliance.evaluate_all(
         service.configrx_db, service.nodes_db, rule_set_id=rule_set_id)
     _audit(service, params, "configrx.rule_set.evaluate", target=row["name"],
@@ -6717,8 +6425,7 @@ def _compliance_result_json(row) -> dict:
 def get_configrx_rule_set_results(service, params, body, rule_set_id) -> dict:
     """Every device's latest result for one rule set — the column a
     2,000-row device list reads, one query rather than one per device."""
-    if not service.configrx_db.rule_set(rule_set_id):
-        raise ValueError("No such rule set")
+    _require(service.configrx_db.rule_set(rule_set_id), "rule set")
     rows = service.configrx_db.compliance_results_for_rule_set(rule_set_id)
     return {"results": [_compliance_result_json(r) for r in rows]}
 
@@ -6726,31 +6433,25 @@ def get_configrx_rule_set_results(service, params, body, rule_set_id) -> dict:
 def get_configrx_device_compliance(service, params, body, device_id) -> dict:
     """The per-device tab equivalent of the route above: every rule set's
     latest result for one device."""
-    if not service.nodes_db.device(device_id):
-        raise ValueError("No such device")
+    _require(service.nodes_db.device(device_id), "device")
     rows = service.configrx_db.compliance_results_for_device(device_id)
     return {"results": [_compliance_result_json(r) for r in rows]}
 
 
 # ------------------------------------------------------------- ssh host keys
 # The remembered host key for a device, and forgetting it. Both live under
-# /api/ssh/ rather than /api/configrx/ because the key is shared: the SSH
-# terminal stores and checks the same row. Reading one is a ConfigRX read (it
-# is shown in ConfigRX's device dialog); forgetting one is an `ssh` WRITE,
-# because it is the act that lets the next connection to that device accept
-# whatever key it is offered.
-#
-# There is no HTTP route for trusting a NEW key: that decision is only ever
-# taken with the offered key in hand, over the terminal's own socket, so
-# there is no endpoint here through which a key could be trusted blind.
+# /api/ssh/ because the key is shared: the terminal stores and checks the
+# same row. Reading one is a ConfigRX read (it is shown in ConfigRX's device
+# dialog); forgetting one is an `ssh` WRITE, since it is what lets the next
+# connection accept whatever key it is offered. There is no route for
+# trusting a NEW key — that decision is only ever taken with the offered key
+# in hand, over the terminal's own socket.
 
 def _ssh_device_host(service, device_id):
     """(device row, ip, port) for a device, or ValueError. The port is
     ConfigRX's stored SSH port, since that is the port this app connects on
     and the store is keyed by (host, port)."""
-    device = service.nodes_db.device(device_id)
-    if not device:
-        raise ValueError("No such device")
+    device = _require(service.nodes_db.device(device_id), "device")
     config = service.configrx_db.device_config(device_id)
     port = int(config["ssh_port"]) if config and config["ssh_port"] else 22
     return device, device["ip"], port
@@ -6787,13 +6488,12 @@ def _client(params) -> str:
     return params.get("_client", "")
 
 
-# At most this many password verifications at once. Each one is a scrypt
-# at N=2^17 — about 128 MiB and half a second — on an endpoint that needs
-# no session, so unbounded concurrency was both a memory DoS (30 parallel
-# attempts is ~4 GB) and the reason the throttle's sleep did not bite: the
-# server is threaded, so twelve simultaneous guesses each slept five
-# seconds in parallel and the effective rate was one attempt per 0.9 s
-# rather than one per five.
+# At most this many password verifications at once. Each is a scrypt at
+# N=2^17 — about 128 MiB and half a second — on an endpoint that needs no
+# session, so unbounded concurrency is both a memory exhaustion (30 parallel
+# attempts is ~4 GB) and the thing that defeats the throttle: the server is
+# threaded, so simultaneous guesses would sleep out their five seconds in
+# parallel.
 _LOGIN_SLOTS = threading.Semaphore(4)
 
 _dummy_hash_value: str | None = None
@@ -6805,12 +6505,11 @@ def _dummy_hash() -> str:
     now.
 
     The point of hashing when the account does not exist is that the time
-    taken says nothing about whether it does. The hardcoded string this
-    replaces named N=2^14 while stored hashes use 2^17, so a missing
-    account answered about nine times faster — measured 0.055 s against
-    0.48 s — and the endpoint was a username oracle. Derived from
-    hash_password so it cannot drift from the real cost again, including
-    onto the PBKDF2 fallback where scrypt is unavailable.
+    taken says nothing about whether it does — a fixed hash at cheaper
+    parameters than the stored ones would answer faster and make this
+    endpoint a username oracle. Derived from hash_password so it cannot
+    drift from the real cost, including onto the PBKDF2 fallback where
+    scrypt is unavailable.
     """
     global _dummy_hash_value
     with _dummy_hash_lock:
@@ -6829,11 +6528,11 @@ def post_login(service, params, body) -> dict:
     password = str(body.get("password", ""))
     client = _client(params)
 
-    # Validated before it is used as a throttle key or written anywhere.
-    # An unvalidated name reached both: a 200 KB username produced a 200 KB
-    # event, which is a cheap way to push every other event out of the
-    # 3,000-entry ring. Every name that is not a username shares one key
-    # and one log line, so trying millions of them costs one entry.
+    # Validated before it is used as a throttle key or written anywhere: a
+    # 200 KB username would otherwise produce a 200 KB event, a cheap way to
+    # push everything else out of the 3,000-entry ring. Every name that is
+    # not a username shares one key and one log line, so trying millions of
+    # them costs one entry.
     try:
         username = check_username(str(body.get("username", "")))
     except AuthError:
@@ -6862,10 +6561,9 @@ def post_login(service, params, body) -> dict:
         stored = row["password"] if row else None
 
         # Hash something even when the account does not exist, so the time
-        # taken cannot be used to discover which usernames are real. This
-        # only distinguishes "no such account" from "an account exists" —
-        # it says nothing about whether that account is local or LDAP, so
-        # it stays exactly as it was for both kinds of account.
+        # taken cannot be used to discover which usernames are real. Only
+        # "no such account" versus "an account exists" — it says nothing
+        # about whether that account is local or LDAP.
         if stored is None:
             verify_password(password, _dummy_hash())
             service.throttle.record_failure(username, client)
@@ -6878,13 +6576,12 @@ def post_login(service, params, body) -> dict:
         auth_source = row["auth_source"]
 
         if auth_source == "ldap":
-            # An LDAP-mapped account (Tier 1 #10): the directory verifies
-            # the password, not the (empty, never-consulted) local hash. If
-            # the feature is switched off this account simply cannot sign
-            # in — it never falls back to checking an empty local hash,
-            # which verify_password already refuses outright regardless
-            # (see its own `if not stored` guard), but failing here first
-            # gives a clearer audit trail than "wrong password" would.
+            # An LDAP-mapped account: the directory verifies the password,
+            # not the empty, never-consulted local hash. With the feature
+            # switched off this account simply cannot sign in — it never
+            # falls back to an empty local hash (verify_password refuses that
+            # anyway), and failing here first gives a clearer audit trail
+            # than "wrong password".
             if not service.settings.get("ldap_enabled"):
                 service.throttle.record_failure(username, client)
                 service.log.add(
@@ -6933,18 +6630,17 @@ def post_login(service, params, body) -> dict:
     service.app_db.touch_login(row["username"])
 
     # Upgrade the stored hash quietly, now that we hold the password. Local
-    # accounts only: an LDAP account's stored hash is the empty string it
-    # was created with and is never meant to become anything else —
-    # needs_rehash("") would otherwise say True (an unrecognised scheme
-    # "needs" upgrading) and this would happily hash the directory
+    # accounts only: an LDAP account's stored hash is the empty string it was
+    # created with, and needs_rehash("") says True (an unrecognised scheme
+    # "needs" upgrading), so without the guard this would hash the directory
     # password into a local hash nothing ever checks.
     if auth_source == "local" and needs_rehash(stored):
         service.app_db.set_password(row["username"], hash_password(password),
                                 must_change=bool(row["must_change"]))
 
-    # The real User-Agent header, not a body field. The session list claims
-    # to show what signed in; it used to show whatever the caller put in a
-    # body key called "_agent", markup and all.
+    # The real User-Agent header, not a body field: the session list claims
+    # to show what signed in, so a caller-supplied "_agent" would let it show
+    # anything, markup included.
     token = service.sessions.create(row["username"], client,
                                     str(params.get("_agent", "")))
     service.log.add(SYSTEM_CATEGORY, f"{row['username']} signed in from {client}")
@@ -7008,12 +6704,10 @@ def _first_run(service) -> bool:
 
 
 def get_session(service, params, body) -> dict:
-    # The version goes to the sign-in page as well as to a signed-in one: it
-    # is the first thing asked for when someone reports a problem, and the
-    # page that shows it to an operator who cannot get in yet is the page
-    # they are looking at. It is not a secret — the login page is served
-    # before any session exists, and so is every asset the version is
-    # stamped on.
+    # The version goes to the sign-in page as well as to a signed-in one:
+    # it is the first thing asked for when someone reports a problem. Not a
+    # secret — every asset the version is stamped on is already served
+    # before any session exists.
     from .. import __version__
     session = service.sessions.get(params.get("_token", ""))
     if not session:
@@ -7062,14 +6756,11 @@ def post_user(service, params, body) -> dict:
         raise ValueError(f"There is already an account called {username}")
 
     if auth_source == "ldap":
-        # No local password hash is stored at all — the directory is the
-        # only place this account's credential lives (post_login's ldap
-        # branch never consults it), so there is nothing here for a
-        # database compromise to steal for this account. must_change is
-        # meaningless without a local password to change, so it starts
-        # False rather than locking the account behind a change it has no
-        # route to make (post_password refuses a password change for an
-        # ldap account outright — see there).
+        # No local password hash at all — the directory is the only place
+        # this account's credential lives, so a database compromise finds
+        # nothing here for it. must_change is meaningless without a local
+        # password to change, so it starts False rather than locking the
+        # account behind a change it has no route to make.
         service.app_db.add_user(username, "", must_change=False, auth_source="ldap")
     else:
         password = str(body.get("password", ""))
@@ -7101,8 +6792,8 @@ def _last_admin_guard(service, target: str, keeps_admin: bool) -> None:
     Deleting the last *account* was already refused; losing the last
     administrator is the same trap by a different route — an install with
     no admin has no way back into its own user management short of editing
-    app.db by hand. Extended for LDAP accounts (Tier 1 #10): an
-    administrator that exists only in the directory is no fallback at all
+    app.db by hand. LDAP accounts do not count: an administrator that
+    exists only in the directory is no fallback at all
     if the directory is down or unreachable, so at least one *local*
     admin:write account must always remain — an ldap admin does not count
     toward keeping this guard satisfied, only toward the plain "some admin
@@ -7137,9 +6828,9 @@ def post_user_permissions(service, params, body) -> dict:
         raise ValueError(f"No account called {username}")
     me = params.get("_username", "")
     # Nobody edits their own grants. An administrator who wants a different
-    # set asks another administrator for it, which is what makes the grid a
-    # record of a decision rather than of a self-service action — and it
-    # closes the "grant yourself every module" step the review found.
+    # set asks another administrator for it, which makes the grid a record
+    # of a decision rather than a self-service action — and closes the
+    # "grant yourself every module" escalation.
     if username.lower() == me.lower():
         raise ValueError(
             "You cannot change your own permissions. Ask another "
@@ -7201,12 +6892,10 @@ def post_password(service, params, body) -> dict:
         raise ValueError(f"No account called {target}")
 
     if row["auth_source"] == "ldap":
-        # There is no local password for this account at all — post_login's
-        # ldap branch never looks at `row["password"]` (kept as "" since
-        # creation), so setting one here would do nothing but sit unused
-        # and misleadingly suggest a local fallback exists when it does
-        # not. The directory is the only place this account's password is
-        # ever changed.
+        # post_login's ldap branch never looks at `row["password"]`, so
+        # setting one here would sit unused while suggesting a local
+        # fallback exists. The directory is the only place this account's
+        # password is ever changed.
         raise ValueError(
             f"{target} signs in through the directory (LDAP); there is no "
             f"local password to change here.")
@@ -7237,21 +6926,13 @@ def post_password(service, params, body) -> dict:
 
 # ------------------------------------------------------------- API tokens
 #
-# A token (Tier 1 #10) belongs to an account and carries exactly that
-# account's grants — there is no separate permission model to keep in sync
-# with permissions.py, and nothing about how a request is authorized
-# changes once it is past authentication (see server.py's Bearer handling).
-# All three routes are administrator-only, the same gate account creation,
-# deletion and permission changes already sit behind, rather than
-# self-service for one's own account: a token is a durable, unattended
-# credential with no idle timeout, and deciding that one should exist for a
-# given account is exactly the kind of decision this application already
-# treats as an administrative act rather than something any signed-in
-# account does to itself — the same reasoning post_user_permissions'
-# "nobody edits their own grants" already rests on. An account cannot even
-# see its own permission grid change without another administrator's
-# say-so; it should not be able to hand itself a credential that outlives
-# every session outright, either.
+# A token belongs to an account and carries exactly that account's grants:
+# there is no second permission model to keep in sync, and nothing about how
+# a request is authorized changes once it is past authentication. All three
+# routes are administrator-only rather than self-service — a token is a
+# durable, unattended credential with no idle timeout, so handing one out is
+# the same class of decision as creating an account or changing its grants,
+# which nobody may do for themselves either.
 
 def get_tokens(service, params, body) -> dict:
     """Metadata for every token — never the token itself, which existed
@@ -7344,14 +7025,12 @@ def delete_token(service, params, body) -> dict:
 
 # ---------------------------------------------------------------- LDAP test
 #
-# A dry-run bind, so an administrator configuring the directory finds out
-# whether ldap_url/ldap_bind_dn_template/ldap_allow_cleartext actually work
-# before flipping ldap_enabled on for a real account — the same "test
-# before you trust it" shape post_alerts_smtp_test and post_snmp_test
-# already give their own modules. Never creates a session and never
-# consults or changes any stored account; it is purely a bind attempt
-# against either the saved settings or the overrides in the body, so the
-# settings dialog can be tested before Apply is even pressed.
+# A dry-run bind, so an administrator finds out whether
+# ldap_url/ldap_bind_dn_template/ldap_allow_cleartext work before turning
+# ldap_enabled on for a real account. Never creates a session and never
+# consults or changes a stored account: purely a bind against the saved
+# settings or the overrides in the body, so the dialog can be tested before
+# Apply is pressed.
 
 def post_ldap_test(service, params, body) -> dict:
     from .. import ldapclient
@@ -7391,23 +7070,12 @@ def post_ldap_test(service, params, body) -> dict:
     return {"ok": ok, "message": message}
 
 
-# ---------------------------------------------------------------------------
-# Everything below this line is the browser front end's own additions
-# (workstream E). They are appended rather than filed beside their relatives
-# so the front-end work and the module work never touch the same hunk.
-# ---------------------------------------------------------------------------
 
-
-# `GET /api/alerts` caps its answer (300 by default, 2,000 hard) and the list
-# said "300 shown" with no total, so an operator ticking select-all
-# acknowledged 300 of however many there really were. This gives the same
-# filters an honest denominator.
-#
-# alerts.db has no filtered COUNT of its own, and alertsdb.py belongs to
-# another workstream, so the count is taken by asking for ids up to a cap and
-# saying so when the cap is what answered: "300 of 5,000+ shown" is honest,
-# "300 shown" was not. If a `count_alerts` ever lands on the database object
-# this uses it instead, and the cap stops applying.
+# An honest denominator for the same filters `GET /api/alerts` applies, so
+# an operator ticking select-all knows how many rows that really is. Where
+# the database offers a filtered `count_alerts` this uses it; otherwise it
+# asks for ids up to a cap and says when the cap is what answered — "300 of
+# 5,000+ shown" is honest, "300 shown" is not.
 ALERT_TOTAL_CAP = 5000
 
 
@@ -7425,18 +7093,12 @@ def get_alerts_total(service, params, body) -> dict:
             "capped": capped, "cap": ALERT_TOTAL_CAP}
 
 
-# Six features across four tabs store a secret, and every one of them goes
-# through Windows DPAPI: on Linux the credential fields render in full, the
-# operator types a password, and the save comes back 400. IPAM's DHCP form is
-# the worst of it — it renders completely, with Windows-only help text, on a
-# host where `ipam_dhcp.IS_WINDOWS` is False and nothing can ever work.
-#
-# This says so once, up front, so the front end can gate a form instead of
-# letting somebody fill it in and be refused. It is deliberately a route of
-# its own rather than another key on /api/state: the answer cannot change
-# while the process is running, so it is fetched once at start-up and never
-# polled. Nothing here is a secret — it is which of this host's features can
-# work at all — so read on any module is enough.
+# Which of this host's features can work at all, so the front end can gate a
+# credential form instead of letting somebody fill it in and be refused with
+# a 400. A route of its own rather than a key on /api/state: the answer
+# cannot change while the process is running, so it is fetched once at
+# start-up and never polled. Nothing here is a secret, so read on any module
+# is enough.
 def get_platform(service, params, body) -> dict:
     """What this host can and cannot do, for the forms that depend on it."""
     from .. import dpapi
@@ -7454,15 +7116,13 @@ def get_platform(service, params, body) -> dict:
         "platform": {
             "is_windows": bool(dpapi.IS_WINDOWS),
             "powershell": powershell,
-            # dpapi.available() is the same call every credential route
-            # already makes before it accepts a POST: true unconditionally
-            # on Windows, true off Windows once secretstore.configured() has
-            # a passphrase (NETPATH_SECRET_PASSPHRASE_FILE or
-            # NETPATH_SECRET_PASSPHRASE — see CREDENTIAL-SECURITY.md §10).
-            # This used to be hard-coded False here, which is the "gap this
-            # workstream did not close" that document called out by name:
-            # a configured Linux host accepted a credential posted to the
-            # API directly while its own browser form stayed greyed out.
+            # The same call every credential route makes before accepting a
+            # POST: true unconditionally on Windows, true off Windows once
+            # secretstore.configured() has a passphrase
+            # (NETPATH_SECRET_PASSPHRASE_FILE or NETPATH_SECRET_PASSPHRASE,
+            # see CREDENTIAL-SECURITY.md §10). Answered rather than assumed,
+            # so a configured Linux host's form is not greyed out while the
+            # API accepts the same credential.
             "secret_store": bool(dpapi.available()),
             "credential_store": ("Windows DPAPI" if dpapi.IS_WINDOWS
                                  else ("Portable secret store" if dpapi.available()
@@ -7473,16 +7133,13 @@ def get_platform(service, params, body) -> dict:
 
 # --------------------------------------------------------------- dashboard
 #
-# The Dashboard was a 385-byte placeholder and `login.js` makes it the
-# landing page after every sign-in, so the screen every shift starts on said
-# "nothing here yet". These two endpoints answer the questions a tile grid
-# asks; everything else the grid needs is already on /api/state, which every
-# tab polls anyway.
+# The landing page after every sign-in. These two endpoints answer the
+# questions a tile grid asks; everything else the grid needs is on
+# /api/state, which every tab polls anyway.
 #
-# Permission-gated the way get_state is: never refused outright (the tab is
-# always reachable), but a section the signed-in account cannot read is
-# absent rather than empty, so the front end can leave the tile out instead
-# of drawing a zero that is not true.
+# Permission-gated the way get_state is: never refused outright, but a
+# section the account cannot read is absent rather than empty, so the front
+# end leaves the tile out instead of drawing a zero that is not true.
 
 # The metric keys the "worst" lists are built from. Named here rather than in
 # the front end because they are the poller's vocabulary (nodepoll.py:1281,
@@ -7520,10 +7177,9 @@ def get_dashboard(service, params, body) -> dict:
         summary = service.alerts_db.open_summary()
         # One severity-1 outage must never be hidden behind forty severity-6
         # notices, so the tile is coloured by the worst open severity and
-        # broken down by severity rather than shown as one total. There is no
-        # per-severity COUNT on alerts.db and alertsdb.py belongs to another
-        # workstream, so the breakdown is counted from the open rows up to a
-        # bound and says when the bound is what answered.
+        # broken down by severity rather than shown as one total. The
+        # breakdown is counted from the open rows up to a bound, and says
+        # when the bound is what answered.
         by_severity: dict[str, int] = {}
         rows = service.alerts_db.alerts(state="unresolved",
                                         limit=ALERT_TOTAL_CAP + 1)
@@ -7541,8 +7197,6 @@ def get_dashboard(service, params, body) -> dict:
         }
 
     # Every background process, each by the noun its own tab uses for it.
-    # This tile used to list three of the eight and call them all
-    # "collectors".
     collectors = []
     for module, name, obj in (
             ("nodes", "Nodes poller", getattr(service, "node_poller", None)),
@@ -7667,12 +7321,11 @@ def _int_or_none(value):
         return None
 
 
-# Two fields the database and the write paths already carry but the existing
-# serializers do not return yet, so a form has no way to show what is
-# currently set. `_device_json` and `_rule_json` live in modules another
-# workstream owns; rather than reach into them, these two small routes hand
-# the front end the missing values, and both disappear the moment the
-# serializers carry them (the front end merges whatever it is given).
+# Two fields the database and the write paths carry but the list
+# serializers do not return, so a form has no way to show what is currently
+# set. These two routes hand the front end the missing values; the front end
+# merges whatever it is given, so they can disappear once the serializers
+# carry them.
 
 
 def get_nodes_device_upstream(service, params, body, device_id) -> dict:
@@ -7683,9 +7336,7 @@ def get_nodes_device_upstream(service, params, body, device_id) -> dict:
     instead of five hundred — but nothing in the UI could set it, and
     `_device_json` does not return it, so a form had nothing to show.
     """
-    row = service.nodes_db.device(device_id)
-    if not row:
-        raise ValueError("No such device")
+    row = _require(service.nodes_db.device(device_id), "device")
     keys = row.keys()
     upstream = row["upstream_id"] if "upstream_id" in keys else None
     # Everything except this device: the server refuses self and unknown ids

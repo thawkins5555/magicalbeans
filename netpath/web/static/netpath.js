@@ -38,13 +38,9 @@
     timeline: null,
     topology: null,
     drag: null,
-    // Bumped on every refresh() — Live recomputes t0/t1 on every tick (below),
-    // so two overlapping polls never share a URL and app.js's per-path
-    // abort-dedupe cannot cancel either one. Checked after each of refresh()'s
-    // sequential awaits: without it, a slow poll that resolves after a faster
-    // one overwrites view.timeline/view.topology and the DOM with an older
-    // window — or with the target/window the operator has since left. Same
-    // pattern as configrx.js's searchGen / app.js's gsearchRun.
+    // Bumped per refresh() and checked after each of its sequential
+    // awaits: Live recomputes t0/t1 every tick, so two overlapping polls
+    // never share a URL and app.js's abort-dedupe cannot cancel either.
     refreshGen: 0,
   };
 
@@ -268,9 +264,6 @@
     });
   }
 
-  // One implementation, in app.js. This was twelve copies of the same
-  // three lines, which is how one of them came to be missing a
-  // character while the others were not.
   const escape = App.escapeHtml;
 
   function targetForm(target) {
@@ -1250,8 +1243,7 @@
     if (App.state.tab !== 'netpath') return;
     const generation = ++view.refreshGen;
     const payload = await App.get('/api/netpath/targets');
-    // A newer refresh already redrew this — the operator switched targets,
-    // dragged the window, or left the tab while the above was in flight.
+    // A newer refresh already redrew this, or the operator has left.
     if (view.refreshGen !== generation || App.state.tab !== 'netpath') return;
     view.targets = payload.targets;
     pruneWindows();

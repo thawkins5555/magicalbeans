@@ -1,18 +1,9 @@
-"""The application must open databases written by the previous release.
-
-4.34.0 could not: an index on a column the migration adds was also in the
-schema script, which runs first, so every existing nodes.db failed to open.
-Every other suite starts from empty files and never sees an upgrade.
-
-Three parts. The first always runs: a fresh nodes.db is rebuilt into its
-4.33 shape (the mac_entries table without first_seen_ts/present, and without
-the index on them) and reopened. The second needs git history: the previous
-main commit is exported with `git archive`, every database is created by
-that tree's own Service, and the current Service is started on them — the
-exact path that failed. It is skipped, loudly, when git cannot export. The
-third is the other upgrade that has no fresh-install equivalent: accounts
-that still live in a legacy netpath.db and the permissions the migration
-owes them."""
+"""The application must open databases written by the previous release; every
+other suite starts from empty files and never sees an upgrade. Three parts:
+a fresh nodes.db rebuilt into its pre-migration shape and reopened; the
+previous main commit exported with `git archive`, its Service creating every
+database, and the current Service started on them (skipped loudly when git
+cannot export); and legacy netpath.db accounts receiving migrated permissions."""
 import os
 import sqlite3
 import subprocess

@@ -1,31 +1,9 @@
-"""Static checks for the Nodes -> REPORTS subtab (nodes.js/index.html).
-
-netpath/report.py's two routes — GET /api/nodes/reports/availability and
-GET /api/nodes/reports/top-metrics — are covered end to end on the backend
-by test_report_availability.py, test_report_topn.py and test_report_routes.py.
-Nothing in the shipped JavaScript called either one until this screen: this
-suite is the frontend half, in the same style as test_frontend_contracts.py
-(it reads the shipped files as text and asserts what must be true of them,
-rather than driving a browser — tests/ui/walk.mjs is where that lives).
-
-Covers:
-  - both report routes are actually called from nodes.js
-  - the REPORTS subtab and its two nested reports (AVAILABILITY, TOP-N BY
-    METRIC) exist, following the same subtab/subpage markup every other
-    Nodes subtab uses
-  - the screen is read-only end to end: no data-requires-write control
-    anywhere in it, matching what a "nodes": read grant can already do
-  - CSV export is client-built (report.py has no export.csv route of its
-    own) but still goes out through App.saveCsv, the one function that
-    hands a browser a file, rather than a second implementation of it
-  - tables go through App.grid/App.sortRows/App.drawRows, not a fourth
-    hand-rolled table renderer
-  - a run button's own request runs inside the App.runJob promise, not
-    before it — see nodes.js's own comment on this: a device-group lookup
-    before that call would leave the button clickable long enough for a
-    second click to abort the first request as "superseded" and report a
-    failure that never happened
-"""
+"""Static checks for the Nodes -> REPORTS subtab (nodes.js/index.html), in the
+style of test_frontend_contracts.py: shipped files read as text, no browser.
+Covers: both report routes are called from nodes.js; the subtab and its
+AVAILABILITY / TOP-N BY METRIC subpages use the standard subtab markup; no
+data-requires-write control anywhere; CSV export goes through App.saveCsv;
+tables use App.grid/sortRows/drawRows; a run request runs inside App.runJob."""
 import os
 import re
 import sys

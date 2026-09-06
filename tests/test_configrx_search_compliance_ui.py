@@ -1,21 +1,9 @@
-"""ConfigRX search and compliance UI (4.50.0): netpath/configrx_search.py and
-netpath/configrx_compliance.py shipped with a full set of routes
-(test_configrx_search_routes.py) and no frontend calling any of them —
-nothing in configrx.js searched a device's capture or touched a rule set,
-and nothing in index.html offered a way to try.
-
-This suite is the frontend counterpart to test_frontend_contracts.py: it
-reads the shipped configrx.js and index.html as text and asserts the small
-number of things that must be true of them — every one of the twelve routes
-is actually called by the shipped JS, every control that writes carries the
-`data-requires-write="configrx"` gate the rest of the product uses (disabled,
-never hidden, for a read-only account), destructive actions go through
-App.confirmDestructive rather than a hand-rolled dialog, and the new SEARCH
-and COMPLIANCE subtabs exist and are wired the way Nodes' own subtabs are.
-
-Nothing here starts a server or a browser — see test_configrx_search_routes.py
-for the routes' own behaviour and tests/ui/walk.mjs for a real browser
-walking the pages this file only checks the markup and script of.
+"""ConfigRX search and compliance UI, the frontend counterpart to
+test_frontend_contracts.py: reads the shipped configrx.js and index.html as
+text and asserts that every configrx_compliance route is called by the JS,
+every writing control carries the `data-requires-write="configrx"` gate,
+destructive actions go through App.confirmDestructive, and the SEARCH and
+COMPLIANCE subtabs are wired like Nodes' own. No server or browser is started.
 """
 import os
 import re
@@ -224,8 +212,9 @@ check("the three subpages exist, positionally matching the three subtabs",
                 r'id="configrx-sub-compliance" class="subpage"', CONFIGRX_SECTION) is not None)
 check("configrx.js owns a selectSub() that toggles .active on the right pane",
       "function selectSub(name)" in JS
-      and "#page-configrx > .subtabs > .subtab" in JS
-      and "#page-configrx > .subpage" in JS)
+      and (("#page-configrx > .subtabs > .subtab" in JS
+            and "#page-configrx > .subpage" in JS)
+           or "App.selectSub('configrx'," in JS))
 check("subtab selection is remembered with App.rememberSub and restored with "
       "App.recallSub, the same contract every other module's subtabs use",
       "App.rememberSub('configrx'," in JS and "App.recallSub('configrx'," in JS)

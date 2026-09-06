@@ -1,60 +1,9 @@
-"""Cross-device configuration search and compliance rule sets
-(netpath/configrx_search.py, netpath/configrx_compliance.py, and the
-schema/storage netpath/configrxdb.py added for both) — the query nothing
-in ConfigRX could answer before: "which of my devices has/does not have
-X" across every device's latest capture, and a compliance baseline
-evaluated on a schedule rather than recomputed on every page view.
-
-Runs entirely against ConfigRxDatabase directly, with a small stand-in
-for the two nodes_db methods configrx_compliance actually calls
-(device() and devices(device_group_id=...), plus record_metric_samples)
-rather than a real NodesDatabase and its own migrations along for the
-ride. Neither feature has an HTTP route wired to it yet — see the report
-handed to team-lead — so there is no server here the way
-test_configrx_diff.py has one; this is what that route's own test should
-build on once it exists.
-
-Covers:
-  - a plain substring search finding the same line across several
-    devices' captures, through the FTS5 index when available and through
-    the full-scan fallback when the query is too short to index;
-  - a bounded regular-expression search, and the three shapes of
-    catastrophic-backtracking pattern compile_bounded refuses outright
-    (nested repetition, quantified alternation, chained adjacent
-    quantifiers with nothing disambiguating between them) each refused in
-    well under the time they would actually run for if they were not;
-  - a pattern that PASSES that structural check still bounded to a small
-    fraction of a second by the per-line length cap, against a
-    deliberately long pathological-shaped line — tight enough that
-    raising MAX_LINE_CHARS_FOR_MATCH back up, or removing the cap
-    entirely, would make this assertion fail rather than continuing to
-    pass by accident;
-  - the search index holding only redacted text regardless of what the
-    "raw" capture (as ConfigRxWorker would compute it for a
-    store_secrets-on device) contains — the same invariant
-    configrx_search.py's own module docstring states;
-  - a compliance rule set passing some devices and failing others, with
-    the failing rules named in the stored result;
-  - a device with no stored capture at all reading as "not_assessed",
-    never a silent "pass", and contributing no compliance_fail_count
-    metric sample;
-  - a rule set scoped to one device group evaluating only devices in that
-    group, leaving no result at all for a device outside it;
-  - a rule's pattern (and kind) validated at add_rule time, before it is
-    ever stored;
-  - forget_device removing a device's search-index rows and compliance
-    results along with its backups;
-  - a bounded outer repeat of an already-ambiguous group, like the dotted-
-    quad IP idiom (\d{1,3}\.){3}\d{1,3}, is NOT refused as unsafe — only
-    an unbounded outer repeat (+, *, {n,}) of one is;
-  - a compliance sweep against an adversarial MUST_NOT_MATCH rule
-    (measured, not assumed: the worst-case shape compile_bounded still
-    lets through, against enough worst-case lines to blow well past the
-    budget if the deadline were not checked) is bounded by
-    COMPLIANCE_SWEEP_BUDGET_S rather than left to run for the hours this
-    shape would otherwise cost across a real fleet, with a device it
-    never reaches left untouched and a device it starts but cannot finish
-    marked not_yet_assessed rather than a silent pass.
+"""Cross-device config search and compliance rule sets (configrx_compliance.py,
+storage in configrxdb.py), driven directly against ConfigRxDatabase with a small
+nodes_db stand-in; routes are covered by test_configrx_search_routes.py. Covers
+substring search (FTS5 and full-scan fallback), bounded regex search and what
+compile_bounded refuses, per-line and per-sweep time budgets, a redacted-only
+index, pass/fail/not_assessed results, group scoping, and forget_device cleanup.
 """
 from __future__ import annotations
 
@@ -66,7 +15,7 @@ import _paths  # noqa: F401
 
 from netpath import configrx_compliance as cc
 from netpath import configrx_redact
-from netpath import configrx_search as cs
+from netpath import configrx_compliance as cs
 from netpath.configrxdb import ConfigRxDatabase
 
 TMPDIR = _paths.tmpdir("configrx_search_")
@@ -188,7 +137,7 @@ print("a pattern that PASSES the structural check is still bounded by the length
 # maximum backtracking the (allowed-through) pattern below can do, on a
 # line four times longer than what MAX_LINE_CHARS_FOR_MATCH lets it see.
 # If that constant were raised back up, or the truncation removed, this
-# would take many seconds to minutes instead (see configrx_search.py's
+# would take many seconds to minutes instead (see configrx_compliance.py's
 # module docstring for the measurements) and the assertion below would
 # fail rather than continuing to pass by accident.
 long_line = "a" * (cs.MAX_LINE_CHARS_FOR_MATCH * 4) + "!"
@@ -211,7 +160,7 @@ verbatim = ("hostname sw-secret\n"
            "enable secret 5 $1$abc$XXXXXXXXXXXXXXXXXXXXXX\n")
 # What ConfigRxWorker._backup_device computes for the search index even
 # when store_secrets is ON for this device — see configrx.py's own
-# comment at the call site, and configrx_search.py's module docstring for
+# comment at the call site, and configrx_compliance.py's module docstring for
 # why this must never be the verbatim text.
 redacted_text, _count = configrx_redact.redact(verbatim)
 db.replace_search_lines(50, redacted_text)
@@ -359,7 +308,7 @@ check("the compliance result is gone too", db.compliance_result(6, rule_set_id) 
 # quantifier (cannot itself blow up whatever it wraps) from an unbounded
 # one (+, *, {n,}) that can. Fixed by teaching the check the difference —
 # see _quantifier_at's "unbounded" flag and _has_nested_repetition's own
-# docstring in configrx_search.py.
+# docstring in configrx_compliance.py.
 
 print("a fixed-count outer repeat of an ambiguous group is not refused "
       "(the dotted-quad idiom written with a bounded group)")
@@ -385,7 +334,7 @@ for still_unsafe in (r"(a+)+", r"(a|aa)+", r"((a+){3})+", r"(\d{1,3}\.){3,}"):
 #
 # Found by the same adversarial pass, and severe rather than merely slow:
 # evaluate_all/evaluate_device_all_rule_sets had NO wall-clock ceiling at
-# all, unlike configrx_search.py's own _scan(), whose docstring explains
+# all, unlike configrx_compliance.py's own _scan(), whose docstring explains
 # exactly why one is needed ("a device with thousands of lines could still
 # add those up... without a check this fine-grained"). A MUST_NOT_MATCH
 # rule that legitimately never matches must scan every line to prove that

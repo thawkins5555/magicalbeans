@@ -1,10 +1,8 @@
 """netpath.web.wsock: the handshake and the framing, on a socketpair.
-
-No HTTP server and no SSH here — this is the transport on its own, driven
-by hand-built client frames, so that a framing bug is caught as a framing
-bug rather than as a terminal that mysteriously stops echoing. The other
-side of the same contract (a real upgrade over the real server, and a
-session on top of it) is tests/test_ssh_terminal.py."""
+No HTTP server and no SSH: the transport on its own, driven by hand-built
+client frames, so a framing bug is caught as a framing bug. The other side
+of the same contract (a real upgrade over the real server, and a session on
+top of it) is tests/test_ssh_terminal.py."""
 import email
 import os
 import socket

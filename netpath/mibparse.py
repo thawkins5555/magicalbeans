@@ -1,45 +1,11 @@
-"""A stdlib-only, best-effort MIB text parser.
-
-Not a compliant ASN.1/SMI compiler — a real vendor MIB is parsed the way a
-person skimming it would: find every `NAME OBJECT-TYPE ... ::= { PARENT
-NUMBER }` (or `OBJECT IDENTIFIER`, `MODULE-IDENTITY`, `OBJECT-IDENTITY`,
-or `NOTIFICATION-TYPE`) clause with a regex anchored on the literal
-`::=` token, and resolve `PARENT` against
-whatever OIDs are already known — this file's own siblings resolved so
-far, plus everything the app already knows from nodeoids.py/trapoids.py/
-previously uploaded MIBs.
-
-Explicit non-goals, matching trapoids.py's own "not a MIB compiler"
-framing:
-  - IMPORTS is recorded for information (which symbol names which FROM
-    module) but never resolved by fetching that module automatically — a
-    MIB that imports from a module this app has not also been given stays
-    partially unresolved until that module is uploaded too and a
-    re-resolve is requested.
-  - No macro bodies are actually parsed (SYNTAX, ACCESS, STATUS, INDEX,
-    etc.) beyond pulling SYNTAX's textual type name, an INTEGER enum
-    table when present, and DESCRIPTION's quoted text — everything else
-    in an OBJECT-TYPE clause is ignored.
-  - A bare `Foo ::= TEXTUAL-CONVENTION ...` type alias is counted
-    (ParseResult.textual_conventions) but not modeled: it names a type,
-    not an OID, so there is nothing in it to resolve or poll. The count
-    is there so a module that is nothing else — SNMPv2-TC is exactly
-    that, 16 conventions and no objects — reports what it is rather than
-    "nothing was recognized in this file", which reads as a failed
-    import. TEXTUAL-CONVENTION clauses that do define an object still
-    match the "NAME ... ::= { ... }"-shaped OBJECT-TYPE scan as before.
-
-Why every scan below is written as "find the next landmark, then look
-forward a bounded distance" rather than as one regex per clause: a lazy
-`(.*?)` between a macro keyword and its `::=` re-reads the rest of the
-file from every candidate start, so a truncated MIB — all the headers,
-none of the closing clauses, which is exactly how a half-downloaded file
-looks — costs O(n^2). CPython's `re` does not release the GIL while it
-matches, so that is not a slow request but a frozen appliance: no web UI,
-no poller timers, no trap or syslog drain, for as long as it runs. Every
-pass here is linear in the file, and `parse()` carries a wall-clock
-budget on top so no single upload can hold the interpreter for long even
-if some input shape defeats the analysis.
+"""A stdlib-only, best-effort MIB text parser — not a compliant ASN.1/SMI
+compiler. Finds `NAME ... ::= { PARENT NUMBER }`-shaped clauses by regex
+and resolves PARENT against already-known OIDs; does not parse macro
+bodies beyond SYNTAX/DESCRIPTION, and does not auto-fetch IMPORTS. Every
+scan is "find the landmark, then look a bounded distance forward" rather
+than one greedy regex per clause, since CPython's `re` holds the GIL and a
+truncated file could otherwise cost O(n^2); `parse()` also carries a
+wall-clock budget.
 """
 
 from __future__ import annotations
@@ -133,41 +99,16 @@ _MASK_OPEN_RE = re.compile(r'"|--')
 
 def _strip_comments_and_strings(text: str, deadline: float | None = None,
                                 budget_s: float = 0.0) -> str:
-    """Masks `-- comment` (to the next `--` or end of line, per ASN.1
-    comment syntax) and `"quoted strings"` with spaces of the same
-    length, preserving every other byte's offset. Never removes bytes —
-    only overwrites them — so a later regex match's span still indexes
-    correctly into the *original* text when the caller wants the real
-    (unmasked) content back, e.g. a DESCRIPTION's actual text.
-
-    This is what lets the structural regexes below treat `--` or `::=`
-    appearing inside a comment or a quoted description as inert text
-    instead of real syntax.
-
-    Written as "copy the span up to the next `"` or `--`, then blank that
-    one span" rather than as a per-character walk: `list(text)` cost nine
-    bytes of memory per input byte and 3.6 s on an 8 MB file before any
-    regex had run, for a pass that only ever blanks two kinds of span.
-
-    `no_newline_from` caches the result of the "where does this comment end"
-    search below: once a search for the next `\\n` comes up empty, no later
-    search — starting further along the same string — can find one either,
-    so it is never searched for again. Without this, a file whose ASN.1 `--`
-    comments run to end-of-file with nothing to close them and no newline
-    anywhere in between (one long logical line, which is exactly how a
-    minified or half-downloaded MIB looks) paid one full end-of-file scan
-    *per comment marker* — O(markers x length) — the same bug class this
-    function's own docstring already names two instances of, a third one,
-    found by fuzzing rather than by review. The equivalent search for the
-    next `--` (a comment's other possible closer) does not need the same
-    cache: each one only ever looks for a `--` that a *later* iteration of
-    this same loop would otherwise have opened a new comment on, so at most
-    one such search per call can come up empty, however large the file is.
-
-    `deadline`/`budget_s` let a caller with its own wall-clock budget (see
-    parse()) be checked from inside this loop rather than only after it
-    returns — a budget checked solely between phases cannot bound the phase
-    it is checked after, which is exactly how the bug above outlasted it."""
+    """Masks `-- comment` and `"quoted strings"` with spaces of the same
+    length, preserving every other byte's offset, so structural regexes
+    below treat `--`/`::=` inside a comment or string as inert and a later
+    match's span still indexes into the original text. Copies spans rather
+    than walking per-character (`list(text)` was far too slow on large
+    files). `no_newline_from` caches an empty "next newline" search so an
+    unterminated end-of-file comment can't cost one full scan per comment
+    marker. `deadline`/`budget_s` are checked inside this loop, not just
+    between phases, so a single pathological phase can't outlast the budget.
+    """
     parts: list[str] = []
     i, n = 0, len(text)
     no_newline_from: int | None = None
@@ -262,19 +203,11 @@ _DESCRIPTION_RE = re.compile(r'\bDESCRIPTION\s+"([^"]*)"', re.DOTALL)
 
 
 def _parse_oid_tail(braces_text: str):
-    """The whole strategy in one function: tokenize whatever is inside a
-    `::= { ... }` clause into arc names/numbers, without parsing anything
-    about how it got there. Returns (parent_name, last_arc, literal_oid)
-    with exactly one of (parent_name and last_arc) or literal_oid set.
-
-    A fully-numeric brace body (`{ 1 3 6 1 4 1 9999 }`) needs no parent
-    resolution at all. Otherwise the FIRST token is the symbolic parent —
-    not necessarily the second-to-last, because a clause can carry more
-    than one trailing arc (`{ ifMIB 2 0 }`, a NOTIFICATION-TYPE's usual
-    shape) as well as annotated intermediate arcs written for readability
-    (`{ iso org(3) dod(6) 1 }`); every token after the first contributes
-    one arc to `last_arc`, joined with '.', so resolve() can append the
-    whole chain to the parent's OID in one step."""
+    """Tokenizes what is inside a `::= { ... }` clause into arc names/
+    numbers. Returns (parent_name, last_arc, literal_oid) with exactly one
+    of (parent_name and last_arc) or literal_oid set — the first token is
+    the symbolic parent, and every token after it (there can be more than
+    one trailing arc) joins into `last_arc` with '.'."""
     tokens = re.findall(r"[A-Za-z][\w-]*(?:\(-?\d+\))?|-?\d+", braces_text)
     if not tokens:
         return None, None, None
@@ -311,15 +244,10 @@ def _imports_span(masked_text: str) -> tuple[int, int, int] | None:
 
 
 def _parse_imports(masked_text: str, body_start: int, body_end: int) -> dict[str, str]:
-    """symbol -> module, read by walking the block once.
-
-    The block reads `sym, sym, sym FROM Module sym FROM Module ...`, so
-    every `FROM` closes the run of symbols since the previous one. Written
-    as a scan because the regex this replaces (`([\\w,\\s-]+?)\\s+FROM\\s+...`)
-    re-expanded its lazy symbol run from every start position whenever a
-    stretch of the block held no `FROM` at all — a truncated import list
-    cost 66 s at 64 KB.
-    """
+    """symbol -> module, read by walking the block once: `sym, sym FROM
+    Module sym FROM Module ...`, each `FROM` closing the run since the
+    previous one. A scan rather than a lazy regex, which re-expanded its
+    symbol run from every start position on a truncated import list."""
     imports: dict[str, str] = {}
     position = body_start
     for group in _IMPORT_FROM_RE.finditer(masked_text, body_start, body_end):
@@ -344,16 +272,9 @@ def _iter_macro_clauses(masked_text: str, head_re: re.Pattern,
                         limit: int = MACRO_CLAUSE_LIMIT):
     """Yield (name, body_start, body_end, brace_text) for every
     `NAME <macro> ...body... ::= { ... }` clause, in one left-to-right pass.
-
-    The window in which the closing `::= { ... }` is looked for stops at
-    whichever comes first: `limit` bytes, or the next header of the same
-    macro. Both bounds matter. The second is what makes the pass linear —
-    the sum of all windows is at most the length of the file — and it is
-    also the more faithful reading: one macro's clause has never legally
-    contained another's header, so a header with no clause of its own
-    should be skipped rather than allowed to swallow the definition that
-    follows it.
-    """
+    The search window for the closing `::= { ... }` stops at `limit` bytes
+    or the next header of the same macro, whichever comes first — the
+    latter is what keeps the pass linear overall."""
     text_len = len(masked_text)
     heads = head_re.finditer(masked_text)
     head = next(heads, None)
@@ -385,21 +306,12 @@ def _extract_enums(body_original: str) -> dict[int, str] | None:
 
 def parse(text: str, max_bytes: int = 8 * 1024 * 1024,
           budget_s: float | None = None) -> ParseResult:
-    """Best-effort. Never raises for malformed input — a file with zero
-    recognizable definitions comes back as a ParseResult with an empty
-    object list and a note explaining why, not an exception.
-
-    Two guards do raise, both subclasses of ValueError so the upload
-    endpoint keeps turning them into a 400 with their own message:
-    `MibTooLarge` for the byte cap, checked before any scanning so a
-    pasted multi-megabyte file is refused cheaply, and `MibParseTimeout`
-    for the wall-clock budget, checked between every phase and, within the
-    ones that scan the file more than once per pass — the comment/string
-    masking, and the object-scanning loops below it — periodically inside
-    them too, so no single phase can itself outlast the budget uncaught.
-    Nothing else escapes: an enum value too long for `int()`, a truncated
-    clause, an unterminated string are all just definitions that do not
-    get recorded."""
+    """Best-effort — never raises for malformed input; a file with zero
+    recognizable definitions comes back as an empty ParseResult with a
+    note. Two guards do raise (both ValueError subclasses the upload
+    endpoint turns into a 400): `MibTooLarge` (byte cap, checked first)
+    and `MibParseTimeout` (wall-clock budget, checked between and within
+    phases so no single phase can outlast it)."""
     if len(text.encode("utf-8", "replace")) > max_bytes:
         raise MibTooLarge(f"File exceeds the {max_bytes:,} byte limit")
 
@@ -517,34 +429,16 @@ def parse(text: str, max_bytes: int = 8 * 1024 * 1024,
 
 
 def resolve(objects: list[ParsedObject], known: dict[str, str]) -> tuple[int, list[str]]:
-    """Resolves every object whose parent is known — either already in
-    `known` (pre-seeded by the caller with WELL_KNOWN_ROOTS plus every OID
-    this app already has a name for) or itself resolvable from one of
-    those. Mutates each ParsedObject's `.oid` in place. Returns
-    (resolved_count, sorted unresolved parent names) — the latter is
-    exactly the diagnostic that makes upload order visible: uploading a
-    dependent MIB before the one that defines its parent branch leaves it
-    with unresolved=["thatParentName"], and calling resolve() again after
-    the dependency is uploaded (or after the caller adds its objects into
-    `known` via all_known_oids()) finishes the job without re-parsing
-    anything.
-
-    Resolution follows the dependency chain instead of repeating passes
-    over the whole list. A MIB is free to list an object before the parent
-    it hangs off — legal, and usual in generated MIBs — and the old
-    "keep sweeping until a sweep gains nothing" loop then needed one sweep
-    per link, i.e. O(n^2): a 20,000-object file took 26 s. Here each
-    object is walked up to the first ancestor with a known OID and the
-    chain is filled in from the top down, so every object is visited once
-    whether it resolves or not; the same 20,000-object file takes under
-    0.1 s. `visiting` guards the walk against a MIB whose parents form a
-    cycle, and `dead` remembers a chain that ended nowhere so a second
-    object hanging off it does not walk it again."""
+    """Resolves every object whose parent is known (in `known`, pre-seeded
+    with WELL_KNOWN_ROOTS plus already-named OIDs, or resolvable from one
+    of those). Mutates each ParsedObject's `.oid` in place. Returns
+    (resolved_count, sorted unresolved parent names) — calling resolve()
+    again after the dependency MIB is uploaded finishes the job. Walks
+    each object's parent chain once rather than repeated sweeps (was
+    O(n^2)); `visiting` guards against a cycle, `dead` memoises a chain
+    that led nowhere."""
     known = dict(known)
-    # Only unresolved objects are worth indexing: an object that already
-    # carries a literal numeric OID has never been fed back into `known` by
-    # this function (resolve_all does that between files), so a walk must
-    # stop at it rather than continue through it.
+    # Only unresolved objects are worth indexing — resolve_all feeds resolved ones back into `known`.
     by_name: dict[str, ParsedObject] = {}
     for obj in objects:
         if obj.oid is None and obj.parent is not None:
@@ -598,24 +492,12 @@ def known_oids_for(nodes_db) -> dict[str, str]:
 
 
 def resolve_all(nodes_db, max_bytes: int, max_passes: int = 8) -> dict:
-    """Re-resolve every stored MIB against every other, to a fixpoint.
-
-    `resolve()` already follows a chain within one file; what it cannot do
-    on its own is see a parent that lives in a *different* file. That is
-    the whole reason MIB upload order used to matter: CISCO-PROCESS-MIB
-    uploaded before CISCO-SMI resolved nothing, and only a manual Resolve
-    on each file afterwards finished the chain. Every file's objects are
-    therefore resolved as one list, so a chain that crosses files is
-    followed exactly like one that does not, in a single walk — where the
-    previous code re-swept all files up to `max_passes` (8) times, one
-    sweep per link of cross-file depth, at up to 400 files per bundle.
-    `max_passes` is accepted and ignored, so an existing caller keeps
-    working.
-
-    Only files whose object set actually changed are written back, so calling
-    this when everything is already resolved is a read-only no-op rather than
-    a rewrite of every row.
-    """
+    """Re-resolve every stored MIB against every other, to a fixpoint —
+    resolve() alone cannot see a parent that lives in a different file, so
+    every file's objects are resolved as one combined list in a single
+    walk. `max_passes` is accepted and ignored, kept for caller
+    compatibility. Only files whose object set actually changed are
+    written back."""
     rows = [row for row in nodes_db.mib_files() if row["content"]]
     parsed: dict[int, ParseResult] = {}
     failed = 0

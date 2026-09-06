@@ -1,11 +1,8 @@
-"""4.49.0: GET /api/nodes/devices/<id> surfaces devices.vendor_arc alongside
-vendor_source/vendor_confidence — the enterprise arc a device's sysObjectID
-actually sits under, or None. Needed because vendor_source/vendor_confidence
-alone cannot distinguish a device with a real but unnamed arc from one that
-only answers a generic net-snmp sysObjectID and therefore has NO arc at
-all — the second case can never receive VENDOR_HEALTH (keyed by arc), and
-a device pane needs vendor_arc to say why, rather than showing a blank
-pane an operator reads as a fault.
+"""GET /api/nodes/devices/<id> surfaces devices.vendor_arc alongside
+vendor_source/vendor_confidence: the enterprise arc a device's sysObjectID
+sits under, or None. This is what lets a device pane distinguish a real but
+unnamed arc from a generic net-snmp sysObjectID with no arc at all, which
+can never receive VENDOR_HEALTH (keyed by arc), and say why.
 """
 import http.client
 import json

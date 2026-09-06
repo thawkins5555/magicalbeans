@@ -1,49 +1,10 @@
 """RFC 6455 WebSocket framing, server side, standard library only.
 
-The app already owns its HTTP server (a threading `http.server` with one
-daemon thread per connection), and that shape makes a WebSocket cheap: a
-handler can answer the upgrade itself and then keep the socket for the life
-of the conversation, because there is no keep-alive pipeline behind it to
-unwind and no event loop whose thread it would be blocking. So rather than
-add a dependency for one page, the ~250 lines of framing that page needs
-live here.
-
-What this implements, and what it deliberately does not:
-
-* The handshake (`accept`), validating `Upgrade`, `Connection`,
-  `Sec-WebSocket-Version: 13` and `Sec-WebSocket-Key`, and answering with
-  the `Sec-WebSocket-Accept` digest. The status line is written by hand as
-  HTTP/1.1: the server's `protocol_version` is HTTP/1.0 and a browser will
-  not accept a 101 announced as HTTP/1.0. Whether the *caller* is allowed
-  to be here at all — the session cookie, the permission, and the `Origin`
-  of the page asking — is settled in server.py before this is reached.
-* Text, binary and continuation frames, with masked payloads (a client
-  frame that is not masked is a protocol error, per the RFC), ping answered
-  with pong, and the close handshake echoed. Every other opcode is
-  reserved, and a reserved one fails the connection (§5.2) rather than
-  being reassembled as though it were data.
-* One lock around *all* socket I/O, not merely around sending. A session
-  has two threads on one socket — the one reading it and the one pumping
-  the SSH channel into it — and under TLS that would be a concurrent
-  `SSL_read`/`SSL_write` on a single `SSLSocket`, which OpenSSL does not
-  support: a post-handshake message arriving mid-`show tech-support` can
-  kill the connection with a record error. So after the 101 this stops
-  using the handler's `rfile`/`wfile` buffers and talks to the socket
-  itself. The reader waits for readability *outside* the lock and then
-  takes it only for a non-blocking read, so the thread that is idle 99% of
-  the time cannot starve the one with output to send; the sender holds it
-  under a real timeout (`SEND_TIMEOUT_S`). That timeout is the other half
-  of the bargain: no thread can be parked in socket I/O holding the lock,
-  so `close()`, the idle watchdog and the registry's shutdown are all
-  bounded.
-* A frame/message ceiling (`MAX_MESSAGE_BYTES`). A terminal's keystrokes
-  are tiny; anything near a megabyte is a bug or an attack, and without a
-  cap the length field alone is an out-of-memory kill.
-
-Not implemented, because nothing here needs it: extensions (the handshake
-never negotiates one, so RSV bits must be zero), subprotocol selection, and
-client-side masking — this end never masks, which is exactly what the RFC
-requires of a server.
+Handshake, text/binary/continuation frames with masked payloads, ping/pong
+and the close handshake; no extensions, no subprotocols, and this end never
+masks. The 101 is written as HTTP/1.1 by hand because the server's
+`protocol_version` is HTTP/1.0 and no browser accepts a 101 announced that
+way. Who is allowed to be here at all is settled in server.py first.
 """
 
 from __future__ import annotations
@@ -75,11 +36,7 @@ OP_PONG = 0xA
 _CONTROL_OPS = (OP_CLOSE, OP_PING, OP_PONG)
 # Every opcode the RFC defines. The rest — 0x3-0x7 (reserved non-control)
 # and 0xB-0xF (reserved control) — "MUST fail the WebSocket connection"
-# (§5.2). Without that they missed the control branch and the continuation
-# branch alike and were reassembled as if they were text or binary, and a
-# reserved *control* opcode also escaped the "fragmented control frame" and
-# "oversized control frame" guards, since those ask whether the opcode is
-# one of the three above.
+# (§5.2) rather than be reassembled as though they were data.
 _DEFINED_OPS = (OP_CONT, OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG)
 
 # One frame, and one reassembled message, may not exceed this. Generous for
@@ -87,14 +44,10 @@ _DEFINED_OPS = (OP_CONT, OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG)
 # cannot exhaust memory.
 MAX_MESSAGE_BYTES = 2 * 1024 * 1024
 
-# How long the reader waits for the socket to become readable before
-# looking around. The wait itself is outside the I/O lock and the read that
-# follows it is non-blocking, so a reader parked on a terminal nobody is
-# typing at never keeps the pump thread off the socket. A quarter of a
-# second is short enough that a `close()` from another thread is noticed at
-# once and long enough that an idle session is not spinning. A read that
-# ends mid-TLS-record loses nothing — OpenSSL keeps its own state between
-# calls, which is exactly why those calls must not overlap.
+# How long the reader waits for readability before looking around. The wait
+# is outside the I/O lock and the read after it is non-blocking, so an idle
+# reader never keeps the pump thread off the socket, and a `close()` from
+# another thread is noticed within a quarter second.
 READ_SLICE_S = 0.25
 # How long one write may block. A browser that stops reading (a laptop shut
 # mid-`show tech-support`) must not pin the socket forever: past this the
@@ -105,14 +58,11 @@ SEND_TIMEOUT_S = 15
 # stream, not a frame.
 _RECV_BYTES = 65536
 
-# `poll()` where the platform has it (Linux, the BSDs), `selectors` — which
-# is epoll/kqueue there and `select` on Windows — everywhere else. NOT
-# `select.select`: it cannot express a descriptor at or above FD_SETSIZE
-# (1024) and raises ValueError for one, and this application reaches that
-# number on an ordinary busy appliance (ten databases with their WAL and
-# SHM companions, three UDP listeners, the poller's worker sockets, one
-# descriptor per open HTTP connection). Windows' select has no such ceiling
-# on the descriptor's *value*, which is why the fallback is safe there.
+# `poll()` where the platform has it, `selectors` everywhere else. NOT
+# `select.select`: it raises ValueError for a descriptor at or above
+# FD_SETSIZE (1024), and this application reaches that number on an
+# ordinary busy appliance. Windows' select has no such ceiling on the
+# descriptor's value, so the fallback is safe there.
 _HAS_POLL = hasattr(select, "poll")
 
 # Close codes this module sends on its own behalf. The application's own
@@ -219,7 +169,9 @@ class WebSocket:
 
     `recv()` is single-reader: one thread owns it. `send_*` and `close()`
     are safe from any thread. Everything touching the socket goes through
-    `_io_lock`, so the two threads never overlap on it.
+    `_io_lock`, so the two threads never overlap on it — under TLS a
+    concurrent SSL_read/SSL_write on one SSLSocket is not merely interleaved
+    output, it kills the connection with a record error.
     """
 
     def __init__(self, sock, initial: bytes = b""):
@@ -451,9 +403,6 @@ class WebSocket:
     def send_binary(self, data: bytes) -> bool:
         return self._send_frame(OP_BINARY, bytes(data))
 
-    def send_ping(self, data: bytes = b"") -> bool:
-        return self._send_frame(OP_PING, data)
-
     def close(self, code: int = CLOSE_NORMAL, reason: str = "") -> None:
         """Send a close frame (best effort) and stop the socket.
 
@@ -467,22 +416,15 @@ class WebSocket:
             if not self.closed:
                 self.closed = True
                 self._write(_frame(OP_CLOSE, payload))
-        # Windows resets a connection that is closed with data still unread in
-        # its receive buffer, and a reset discards whatever WE last sent — so
-        # the peer loses the close frame naming the reason, and reads a bare
-        # ConnectionResetError instead of "There are already 16 SSH sessions".
-        # Draining what the peer already sent turns that reset back into an
-        # orderly FIN.
+        # Windows resets a connection closed with data still unread in its
+        # receive buffer, and a reset discards whatever WE last sent — so the
+        # peer loses the close frame naming the reason. Draining what the peer
+        # already sent turns that reset back into an orderly FIN.
         #
-        # Only from the thread that owns recv(). close() is called from
-        # elsewhere as a matter of course — the idle watchdog, the registry's
-        # shutdown, the SSH pump reporting the session ended — and the reading
-        # thread is parked in recv() at that moment. On a plain socket two
-        # concurrent recv()s merely split bytes nobody wants; under TLS they
-        # are two threads inside one SSL object, which OpenSSL does not allow
-        # and which corrupts rather than raising something the except clause
-        # below could catch. Everyone else sets the flag and lets the reader
-        # drain on its way out, after the shutdown has woken it.
+        # Only from the thread that owns recv(): under TLS a second reader is
+        # two threads inside one SSL object, which corrupts rather than
+        # raising. Everyone else sets the flag and lets the reader drain on
+        # its way out, after the shutdown has woken it.
         reader = self._reader
         if reader is None or reader is threading.current_thread():
             # Nobody else is inside recv(): either no read has started yet

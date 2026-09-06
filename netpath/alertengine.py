@@ -21,11 +21,12 @@ import traceback
 from dataclasses import asdict
 
 from . import alertmail
-from . import hostresolve
+from . import namelookup
 from .alertrules import CLEARS, ROLLED_UP_BY, ROLLS_UP, ROLLUP_ENTITY_KINDS, \
     UNMANAGED_ONLY_RULES, Occurrence, dedup_key, device_id_for, \
     evaluate_flapping, evaluate_threshold, match_device, syslog_signature
 from .eventlog import ALERTS, ERROR, NODES, NullLog
+from .worker import Worker, ago
 
 TICK_S = 5.0
 
@@ -38,22 +39,15 @@ TICK_S = 5.0
 OPERATOR_RESOLVE_WINDOW_S = 7 * 86400.0
 
 # How much of a source backlog one tick will work through. A collector that
-# has been storing while the engine was stopped (or a syslog burst) can leave
-# hundreds of thousands of rows behind the cursor; draining all of them in one
-# tick would hold the tick thread for minutes and starve every other source.
-# The drains therefore page forward until one of these two budgets is spent,
-# and whatever is left is reported as counters["backlog"] so an operator can
-# see the engine is behind rather than guessing from a quiet Alerts page. The
-# cursor still only advances over rows that were actually applied, so nothing
-# is skipped — the next tick simply carries on from where this one stopped.
+# stored while the engine was stopped can leave hundreds of thousands of rows
+# behind the cursor, and draining them all in one tick would starve every
+# other source. Whatever is left is reported as counters["backlog"]; the
+# cursor only advances over rows actually applied, so nothing is skipped.
 DRAIN_ROW_BUDGET = 5000
 DRAIN_TIME_BUDGET_S = 2.0
 
-# The sane range for notify_rollup_delay_s. 3600 is generous — an hour is
-# already longer than an operator would plausibly want an outage's first
-# notice held — and exists only so a fat-fingered setting cannot make every
-# alert wait until doomsday; 0 (the lower bound) is the escape hatch that
-# disables the hold entirely. See AlertEngine._notify_rollup_delay.
+# The sane range for notify_rollup_delay_s: an hour is longer than anyone
+# would hold an outage's first notice, and 0 disables the hold entirely.
 NOTIFY_ROLLUP_DELAY_MAX_S = 3600.0
 
 # More than this many alerts sendable in one roll-up flush go out as a
@@ -75,20 +69,10 @@ DIGEST_THRESHOLD = 3
 SUPPRESSED = object()
 
 
-def _ago(ts: float) -> str:
-    if not ts:
-        return "never"
-    age = time.time() - ts
-    if age < 5:
-        return "just now"
-    if age < 90:
-        return f"{age:.0f}s ago"
-    if age < 5400:
-        return f"{age / 60:.0f}m ago"
-    return f"{age / 3600:.1f}h ago"
+class AlertEngine(Worker):
+    STOPPED_TEXT = "Alert engine stopped"
+    THREAD_NAME = "alert-engine"
 
-
-class AlertEngine:
     def __init__(self, db, *, nodes_db, snmp_db, syslog_db, ipam_db, app_db=None,
                  wireless_db=None, netpath_db=None, log=None):
         self.db = db
@@ -104,7 +88,6 @@ class AlertEngine:
         self.netpath_db = netpath_db
         self.log = log or NullLog()
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
         # (rule_id, device_id) -> (last sample ts, streak, first breach ts).
         # The sample ts is what makes the streak count polls rather than
         # ticks; the first breach ts is what lets for_seconds measure a
@@ -129,21 +112,16 @@ class AlertEngine:
         # whose first_breach_ts is at or before this timestamp is the same
         # run an operator already resolved, and does not re-open.
         self._operator_resolves: dict[str, float] = {}
-        # Rollup PARENT dedup keys this engine has seen resolved by hand while
-        # the parent's condition was still true, and when the cover started.
+        # Rollup PARENT dedup keys resolved by hand while the parent's
+        # condition was still true, and when the cover started.
         # _operator_resolves only reaches back OPERATOR_RESOLVE_WINDOW_S, so
-        # without this a device hand-resolved and left down went quiet for
-        # exactly seven days and then opened every still-breaching child in a
-        # single tick — one row and one email per rule per device, a week
-        # after anybody did anything. A cover ends when the device answers
-        # (_still_true false), never on a clock. In memory, so a restart
-        # forgets it exactly as the threshold gate already documents.
+        # without this a device hand-resolved and left down opens every
+        # still-breaching child in one tick seven days later. A cover ends
+        # when the device answers, never on a clock.
         self._parent_covers: dict[str, float] = {}
         # rule key -> the enabled rule row, rebuilt once per tick from the
-        # rules _tick already reads. _parent_operator_resolved needs a
-        # rollup parent's rule for its dedup key on every suppressed
-        # occurrence, and a rule_by_key() query per occurrence would be one
-        # more read on the hot path for a table that cannot change mid-tick.
+        # rules _tick already reads: _parent_operator_resolved needs one per
+        # suppressed occurrence, and the table cannot change mid-tick.
         self._rules_by_key: dict = {}
         # dedup-key-shaped ("<entity_kind>:<entity_id>") -> whether that
         # entity's rollup parent condition still holds, memoised for the
@@ -191,20 +169,14 @@ class AlertEngine:
                          "rolled_up": 0, "muted": 0, "apply_errors": 0,
                          "backlog": 0, "webhooks_sent": 0, "webhook_errors": 0,
                          "webhook_suppressed": 0}
-        self.error: str | None = None
         self._last_tick_ts: float = 0.0
-
-    @property
-    def running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
 
     def start(self) -> None:
         self.stop()
         self._stop.clear()
         self._mail.start()
         self._webhook.start()
-        self._thread = threading.Thread(target=self._loop, name="alert-engine", daemon=True)
-        self._thread.start()
+        self._spawn()
 
     def reconfigure(self, settings: dict) -> None:
         enabled = settings.get("enabled", True)
@@ -215,21 +187,15 @@ class AlertEngine:
 
     def stop(self) -> None:
         self._stop.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2)
-        self._thread = None
+        self._join()
         self._mail.stop()
         self._webhook.stop()
 
     def shutdown(self) -> None:
         self.stop()
 
-    def status_text(self) -> str:
-        if self.error:
-            return self.error
-        if not self.running:
-            return "Alert engine stopped"
-        return f"Running · last tick {_ago(self._last_tick_ts)}"
+    def _running_text(self) -> str:
+        return f"Running · last tick {ago(self._last_tick_ts)}"
 
     def state(self) -> dict:
         return {"running": self.running, "last_tick": self._last_tick_ts}
@@ -529,7 +495,7 @@ class AlertEngine:
         device_by_ip fallback would repeat exactly the lookup that produced
         that answer, once per row. The DNS-cache half still runs.
         """
-        return hostresolve.resolve_name(
+        return namelookup.resolve_name(
             self.nodes_db if device is not None else None, self.app_db,
             source, device=device) or source
 
@@ -739,7 +705,7 @@ class AlertEngine:
             device = self.nodes_db.device(row["device_id"])
             if device is None:
                 continue
-            label = hostresolve.resolve_name(
+            label = namelookup.resolve_name(
                 self.nodes_db, self.app_db, device["ip"], device=device) or device["ip"]
             # The paired alert is resolved BEFORE the occurrence is built, not
             # after: resolving is what hands back the outage's own opened_ts,
@@ -796,7 +762,7 @@ class AlertEngine:
         for child in self.nodes_db.devices_by_ids(child_ids):
             if not child["enabled"] or child["status"] != "down":
                 continue
-            label = hostresolve.resolve_name(
+            label = namelookup.resolve_name(
                 self.nodes_db, self.app_db, child["ip"], device=child) or child["ip"]
             occurrence = Occurrence(
                 kind="device_event", source_kind="down", entity_kind="device",
@@ -827,7 +793,7 @@ class AlertEngine:
             device = self.nodes_db.device(interface["device_id"])
             if device is None:
                 continue
-            device_label = hostresolve.resolve_name(
+            device_label = namelookup.resolve_name(
                 self.nodes_db, self.app_db, device["ip"], device=device) or device["ip"]
             label = f"{device_label} / {interface['descr'] or interface['if_index']}"
             occurrences.append(Occurrence(
@@ -869,7 +835,7 @@ class AlertEngine:
             device = self.nodes_db.device(interface["device_id"])
             if device is None:
                 continue
-            device_label = hostresolve.resolve_name(
+            device_label = namelookup.resolve_name(
                 self.nodes_db, self.app_db, device["ip"], device=device) or device["ip"]
             label = f"{device_label} / {interface['descr'] or interface['if_index']}"
             occurrences.append(Occurrence(
@@ -977,7 +943,7 @@ class AlertEngine:
         max_id = cursor
         for row in rows:
             max_id = max(max_id, row["id"])
-            label = hostresolve.resolve_name(
+            label = namelookup.resolve_name(
                 self.nodes_db, self.app_db, row["ip"]) or row["ip"]
             occurrences.append(Occurrence(
                 kind="ipam", source_kind="", entity_kind="ipam",
@@ -1074,42 +1040,28 @@ class AlertEngine:
     def _evaluate_thresholds(self, settings) -> list[Occurrence]:
         """Device metrics against their threshold rules.
 
-        The streak advances on a NEW SAMPLE, not on an engine tick. This
-        engine ticks every five seconds; a device is polled every sixty by
-        default, so counting ticks made `for_polls = 2` mean "ten seconds"
-        and, worse, kept counting a value that had stopped changing — one
-        bad sample satisfied any for_polls a few ticks later and went on
-        satisfying it forever. metric["last_ts"] is what tells the two
-        apart, exactly as _evaluate_dhcp_thresholds gates on polled_ts.
+        The streak advances on a NEW SAMPLE, not on an engine tick: this
+        engine ticks every five seconds against a sixty-second default poll,
+        so counting ticks would make `for_polls = 2` mean ten seconds and
+        would keep counting a value that had stopped changing.
+        metric["last_ts"] tells the two apart, as
+        _evaluate_dhcp_thresholds gates on polled_ts. The same state carries
+        first_breach_ts, so for_seconds measures in sample time.
 
-        The same state carries first_breach_ts, so a rule with for_seconds
-        can ask how long the breach has actually lasted in sample time
-        rather than in ticks.
+        It also settles whether an operator resolved THIS breach run: a hand
+        resolve in _operator_resolves at or after first_breach_ts keeps the
+        run closed rather than reopening as a new row, which
+        open_or_increment (open/acked rows only) is blind to. A clear
+        observation resets first_breach_ts, so the next breach is a new run.
 
-        It also settles whether an operator resolved THIS breach run: if
-        _operator_resolves (refreshed once per tick from
-        AlertsDatabase.operator_resolved_since) has a hand resolve at or
-        after first_breach_ts, the run stays closed rather than reopening as
-        a new row — an operator resolving an alert while its condition still
-        holds is exactly the case this streak is otherwise blind to, since
-        open_or_increment only ever looks at open/acked rows. A clear
-        observation resets first_breach_ts (above), so the very next breach
-        is a new run and opens normally.
+        That gate is keyed on the alert's OWN dedup key: resolving a rollup
+        PARENT never touched the children's keys, and children are absorbed
+        with resolved_by '' precisely so they stay free to re-open. Covering
+        those is _parent_operator_resolved's job, in _apply.
 
-        That gate is keyed on the alert's OWN dedup key, which is the whole
-        of it: an operator who resolves a rollup PARENT — "Device not
-        responding" for a device that is still down — never touched the
-        children's keys, and the engine writes '' when it absorbs a child
-        precisely so children stay free to re-open. Covering those is
-        _parent_operator_resolved's job, applied in _apply where rollup is
-        decided rather than here, since a suppressed child never reaches an
-        alert row at all.
-
-        This is in-memory state, so a restart forgets it: the first tick
-        after restart rebuilds every streak from scratch, first_breach_ts
-        becomes "since restart", and a still-breaching alert an operator had
-        resolved re-opens once more. Deliberately not persisted — see
-        INTERNALS.md.
+        In-memory state, so a restart rebuilds every streak from scratch and
+        a still-breaching alert an operator resolved re-opens once more.
+        Deliberately not persisted — see INTERNALS.md.
         """
         occurrences = []
         rules = [r for r in self.db.rules() if r["enabled"] and r["kind"] == "threshold"]
@@ -1199,7 +1151,7 @@ class AlertEngine:
                 if label is None:
                     # Resolved at most once per device per tick, and only for
                     # a device that has something to report.
-                    label = hostresolve.resolve_name(
+                    label = namelookup.resolve_name(
                         self.nodes_db, self.app_db, device["ip"],
                         device=device) or device["ip"]
                 if result == "breach":
@@ -1226,12 +1178,10 @@ class AlertEngine:
                         # time(s)" when the metric had been sampled 480
                         # times: the number meant engine ticks.
                         #
-                        # Still raised when nothing is open for this key,
-                        # because that is how a threshold re-derives itself —
-                        # after a rollup parent clears, or after an alert is
-                        # resolved while the breach continues, the next tick
-                        # has to be able to open it again without waiting for
-                        # a fresh sample.
+                        # Still raised when nothing is open for this key:
+                        # that is how a threshold re-derives itself after a
+                        # rollup parent clears, or after a resolve while the
+                        # breach continues.
                         if open_keys is None:
                             open_keys = self.db.open_dedup_keys()
                         if dedup_key(rule, occurrence) in open_keys:
@@ -1253,10 +1203,9 @@ class AlertEngine:
         """DHCP scope utilization, evaluated the same way as a device
         threshold but against IPAM rather than Nodes.
 
-        This cannot reuse _evaluate_thresholds: that one iterates
-        nodes_db.devices(), reads values out of the Nodes metrics table and
-        stamps entity_kind="device". A DHCP scope is none of those, so it
-        gets its own evaluator and its own rule kind.
+        It cannot reuse _evaluate_thresholds, which iterates nodes_db
+        devices and stamps entity_kind="device"; a DHCP scope is none of
+        those, so it gets its own evaluator and rule kind.
 
         Utilization is (leased + reserved) / range size, computed exactly
         the way the DHCP page computes it (api.get_ipam_dhcp_scopes), so
@@ -1678,28 +1627,20 @@ class AlertEngine:
         2. The parent is `device_down`, it is NOT open, and the device is
            still down. That is the case an operator creates by triaging: the
            natural action on an outage is to resolve it, and the moment they
-           did, every child re-derived on the next tick. The review measured
-           three fresh alerts and three fresh emails within five seconds for
-           a device that was still down — and device_down could not come back
-           to re-suppress them, because it is event-driven and no second
-           `down` event is ever recorded. Triaging an outage was punished
-           with more noise than it removed.
+           did, every child re-derived on the next tick — device_down cannot
+           come back to re-suppress them, because it is event-driven and no
+           second `down` event is ever recorded. Triaging an outage would
+           otherwise be punished with more noise than it removed.
         3. `device_down` itself, for a device whose upstream is down. This is
            the topology half: without it a core switch failure arrives as one
            alert per access switch behind it, each true and none of them the
            one worth reading.
-        4. A child rule (case 1's `parent_key`), where the device's OWN
-           device_down is not open for the same reason case 3 exists at
-           all — an ancestor's outage got there first, and this device's own
-           device_down alert is never going to open one to check against.
-           A child rolls up exactly as far as device_down itself does, so it
-           asks the same topology question case 3 asks, just on behalf of a
-           different rule. Without this, a device fully covered by a site
-           outage still opened (or kept open) its own packet_loss_high,
-           cpu_high and the rest, because their own rollup check only ever
-           looked for THIS device's own device_down — which a topology
-           cover guarantees never exists — and never thought to ask whether
-           an ancestor covered it instead.
+        4. A child rule (case 1's `parent_key`) whose device's OWN
+           device_down is not open for the same reason case 3 exists: an
+           ancestor's outage got there first, so there is never a
+           device_down alert to check against. A child rolls up exactly as
+           far as device_down does, so it asks case 3's topology question on
+           behalf of a different rule.
         """
         if occurrence.entity_kind not in ROLLUP_ENTITY_KINDS:
             return None
@@ -1729,13 +1670,10 @@ class AlertEngine:
                 covered = self._upstream_outage(parent_rule, occurrence)
                 if covered is not None:
                     return covered
-            # Whether the outage behind it is still real by the OPERATOR-
-            # resolved route is _parent_operator_resolved's question,
-            # immediately below this in _apply: it asks the same predicate
-            # but also remembers the cover (so it outlives the resolve
-            # window) and says so once in the Nodes log. Answering it here
-            # as well suppressed the occurrence before that ran, so the
-            # cover was silent and forgotten on the next restart.
+            # The operator-resolved route is _parent_operator_resolved's
+            # question, immediately below this in _apply: it asks the same
+            # predicate but also remembers the cover and logs it once.
+            # Answering it here too would suppress before that runs.
             return None
         if (rule["key"] or "") == "device_down" and occurrence.entity_kind == "device":
             return self._upstream_outage(rule, occurrence)
@@ -1848,47 +1786,31 @@ class AlertEngine:
         """True when an operator resolved this occurrence's rollup PARENT by
         hand and the parent's condition still holds.
 
-        The gap this closes. A rollup child is suppressed only while its
-        parent alert is open or acknowledged (_rollup_parent ->
-        open_by_dedup), because a resolved parent must not suppress anything
-        forever. But an operator resolving "Device not responding" for a
-        device that is still down released, in the same breath, every alert
-        that outage was hiding: a dead device reports 100 % packet loss on
-        every poll, so "Packet loss to device high" was guaranteed to be
-        breaching and opened again on the very next tick — one new row and
-        one new email per device, five seconds after "Resolved N of N".
-        Acknowledge did not do this, which is what made the difference look
-        arbitrary. The 4.34.0 operator-resolve gate could not see it either:
-        that one is keyed on the CHILD's own dedup key, and nobody ever
-        resolved the child — the engine absorbs children with resolved_by ''
-        precisely so they stay free to re-open.
+        A rollup child is otherwise suppressed only while its parent alert
+        is open or acknowledged, because a resolved parent must not suppress
+        forever. But resolving "Device not responding" for a device that is
+        still down releases every alert the outage was hiding — a dead
+        device reports 100 % loss on every poll — so they all re-open on the
+        next tick. The threshold gate cannot see this: it is keyed on the
+        CHILD's own dedup key, and nobody resolved the child.
 
-        So the rule is: an operator's resolve of a parent covers the children
-        it was hiding, for as long as the parent's condition still holds.
-        "Still holds" is asked of current state, never of the resolve:
+        So: an operator's resolve of a parent covers the children it was
+        hiding, for as long as the parent's condition still holds. "Still
+        holds" is asked of current state, never of the resolve:
 
-        - `device_down`: the device's status is still "down" — exactly
-          _still_true's predicate for a held `down` occurrence, and the same
-          question the outage alert itself answers. The moment the device
-          answers again the suppression ends by itself, and a child that is
-          still breaching on its own account (a device that is up but lossy)
-          opens normally. Once a cover has taken effect its parent key is
-          remembered in _parent_covers, so it outlives the hand resolve
-          falling out of OPERATOR_RESOLVE_WINDOW_S: a device that is still
-          down is still down, whatever the calendar says, and the alternative
-          was every child of a long-dead device opening at once exactly seven
-          days after somebody resolved its outage.
-        - a parent with no such state to re-read (`netpath_unreachable`): the
-          child's own breach run must have begun at or before the resolve —
+        - `device_down`: the device's status is still "down", the same
+          question the outage alert answers. Once a cover takes effect its
+          parent key is remembered in _parent_covers, so it outlives the
+          resolve falling out of OPERATOR_RESOLVE_WINDOW_S — otherwise every
+          child of a long-dead device opens at once seven days later.
+        - a parent with no such state to re-read (`netpath_unreachable`):
+          the child's breach run must have begun at or before the resolve,
           the same first_breach_ts <= resolved_ts test the threshold gate
-          uses. A trace that gets through resets that run, so the next
-          breach is a new one and opens.
+          uses.
 
-        Costs no query at all: the parent rule comes from the per-tick
-        _rules_by_key map, the hand resolve from the per-tick
-        _operator_resolves cache, and the device read behind the condition is
-        memoised per tick in _parent_conditions, so N children of one dead
-        device ask once.
+        Costs no query: the parent rule comes from _rules_by_key, the resolve
+        from _operator_resolves, and the device read is memoised per tick in
+        _parent_conditions, so N children of one dead device ask once.
         """
         parent_key = ROLLED_UP_BY.get(rule["key"] or "")
         if not parent_key or occurrence.entity_kind not in ROLLUP_ENTITY_KINDS:
@@ -2028,34 +1950,23 @@ class AlertEngine:
         the very next tick, so a metric that is genuinely still breaching
         re-opens without anything having to un-suppress it.
 
-        That re-derivation covers every threshold child, but not the
-        event-driven one: poll_overrun is a momentary event with no CLEARS
-        pair, so nothing re-opens it from state. Absorbing it is still
-        right — the next overrun after the device recovers records its own
-        event and opens a fresh alert — but the mechanism is a new event,
-        not a re-derivation.
+        That re-derivation covers every threshold child but not the
+        event-driven poll_overrun, which has no CLEARS pair; absorbing it is
+        still right, since the next overrun after recovery opens a fresh
+        alert from its own event.
 
-        Deliberately silent: no clear email goes out for an absorbed alert.
-        Fewer emails for one outage is the whole point, and "packet loss
-        recovered" while the device is still down would be a lie.
+        Deliberately silent: no clear email for an absorbed alert. "Packet
+        loss recovered" while the device is still down would be a lie.
 
-        resolved_by is '' here, not a "rolled up into <parent>" string: that
-        line is recorded on the PARENT's rollup_note instead (below), which
-        is where an operator looking at the outage would read it. Writing it
-        onto the child's own resolved_by would make an automatic rollup look
-        exactly like a hand resolve to operator_resolved_since, and once the
-        device recovers a still-breaching child threshold has to be free to
-        re-open on the very next tick's re-derivation, not stay suppressed as
-        though someone had resolved that breach run themselves.
+        resolved_by is '' here, not "rolled up into <parent>": that line goes
+        on the PARENT's rollup_note. Writing it onto the child would make an
+        automatic rollup indistinguishable from a hand resolve to
+        operator_resolved_since, and a still-breaching child must be free to
+        re-open on the next tick's re-derivation.
 
-        Silent absorption is also the case the roll-up notification hold
-        exists to catch: a child absorbed here may have opened moments ago
-        with its own first email still held (see _sweep_notify_rollup), and
-        that email must now never go out — nobody should be told about an
-        alert this same tick just decided was never a separate problem. This
-        closes that out immediately, right where the absorption happens,
-        rather than leaving it for the flush sweep to work out later from
-        state alone.
+        A child absorbed here may have opened moments ago with its first
+        email still held (see _sweep_notify_rollup); that email must never go
+        out, so it is closed out here rather than left to the flush sweep.
         """
         for child_key in ROLLS_UP.get(parent_rule["key"] or "", ()):
             child_rule = self.db.rule_by_key(child_key)
@@ -2134,36 +2045,21 @@ class AlertEngine:
         "device_down" - packet_loss_high, cpu_high, and the rest.
 
         Exists for the two places a device's OWN device_down alert never
-        opens an alert row at all, so _absorb_subordinates' is_new branch —
-        the only other thing that calls this same resolve — never runs for
-        it: a downstream device _absorb_downstream just resolved (its own
-        device_down absorbed into the ancestor whose alert got there first),
-        and a device whose own "down" event arrives after an ancestor's
-        alert is already open (_rollup_parent's upstream-outage answer, in
-        _apply below). Both leave a device fully covered by a site outage in
-        every way except this one: whatever it had already opened on its own
-        account — a packet_loss_high alert that started climbing before the
-        outage reached it, say — has nothing left to trigger its absorption,
-        because the device_down alert that absorption is normally hung off
-        of is precisely the one that never opened here.
+        opens a row, so _absorb_subordinates' is_new branch never runs for
+        it: a downstream device _absorb_downstream just resolved, and a
+        device whose "down" event arrives after an ancestor's alert is
+        already open. In both, whatever the device had already opened on its
+        own account has nothing left to trigger its absorption.
 
-        Bounded the same way _absorb_subordinates already is: one indexed
-        resolve_by_dedup per name in ROLLS_UP["device_down"] (a short, fixed
-        list — about a dozen rule keys), never a scan of the alerts table,
-        so a site outage covering a hundred devices this way costs a
-        hundred times a fixed dozen lookups, not a hundred passes over
-        however large the table has grown.
+        Bounded like _absorb_subordinates: one indexed resolve_by_dedup per
+        name in ROLLS_UP["device_down"] (about a dozen keys), never a scan.
 
         note_alert_id names the alert an operator would find the note on —
-        the ancestor's, when the site outage has one open. It is None for
-        the operator-resolved-but-still-down cover _rollup_parent's
-        SUPPRESSED answer represents, which has no open row to write a note
-        onto either — the same asymmetry _apply's own SUPPRESSED branch
-        already has for the device_down alert itself, reused here via
-        _ROLLUP_NO_ROW_REASON. Doubles as resolve_by_dedup's rolled_up_into:
-        the alert a screen would fold a child under is exactly the alert an
-        operator would find the rollup note on, so the same "None means no
-        open row to point at" rule serves both.
+        the ancestor's, where the outage has one open; None for the
+        operator-resolved-but-still-down cover, which has no open row (see
+        _ROLLUP_NO_ROW_REASON). Doubles as resolve_by_dedup's
+        rolled_up_into, since the alert a screen folds a child under is the
+        alert the note is on.
         """
         probe = Occurrence(kind="device_event", source_kind="down",
                            entity_kind="device", entity_id=device_id,
@@ -2686,47 +2582,30 @@ class AlertEngine:
         """Deliver (or finally give up on) the FIRST notification of every
         alert whose notify_rollup_delay_s hold has elapsed.
 
-        Reads alerts_due_first_notify — last_notified_ts IS NULL and old
-        enough — rather than keeping its own queue: the row IS the queue, so
-        a restart mid-hold picks up exactly where it left off, and nothing
-        here has to reconcile in-memory state against the database on the
-        way back up. A no-op whenever the hold itself is off (delay <= 0),
-        which is what makes 0 an exact passthrough — nothing below this
-        point runs at all, and _apply's own synchronous _notify call is the
-        only thing that ever fires.
+        Reads alerts_due_first_notify rather than keeping its own queue:
+        the row IS the queue, so a restart mid-hold picks up where it left
+        off. A no-op when the hold is off (delay <= 0), which is what makes
+        0 an exact passthrough.
 
         Per due alert, in order:
 
-        1. Already resolved. The two paths that resolve one on purpose — a
-           genuine recovery through _notify_clear, an absorption through
-           _absorb_subordinates/_absorb_downstream — already recorded why and
-           stamped the clock themselves, right when it happened (see
-           _skip_held_open_notify), so last_notified_ts would no longer be
-           NULL and this alert would not even be in the due list. Reaching
-           this branch at all means something else closed it first — an
-           operator's hand resolve, most likely — so there is nothing more
-           specific to say than that it cleared before its notice went out.
+        1. Already resolved. The two paths that resolve one on purpose stamp
+           last_notified_ts themselves (see _skip_held_open_notify), so this
+           branch means something else closed it — a hand resolve, most
+           likely — and there is nothing more specific to say than that it
+           cleared before its notice went out.
         2. Still covered by a rollup parent RIGHT NOW, asked with the exact
-           predicate _apply itself asks before opening a fresh occurrence
-           (_rollup_parent, then _parent_operator_resolved): an ancestor's
-           outage alert opened after this one did and has not yet reached
-           the absorption pass for it (a race the review's 499-device outage
-           hit at 250+ devices), or an operator resolved that ancestor's
-           alert by hand while its condition still holds — the one case
-           nothing else in the engine retroactively resolves this alert for.
-        3. Muted. Left pending rather than decided — a mute is temporary, and
-           a device unmuted before the operator ever sees this in the UI
-           should still get the notice once the mute lifts, not lose it.
-           Mirrors _notify_clear's own mute check, which is likewise a quiet
-           skip rather than a recorded "not sent".
-        4. Otherwise sendable, and handed to _notify one at a time (three or
-           fewer real alerts in this flush) or to _send_digest as a batch
-           (more than three) — see DIGEST_THRESHOLD.
+           predicate _apply asks before opening a fresh occurrence
+           (_rollup_parent, then _parent_operator_resolved).
+        3. Muted. Left pending rather than decided — a mute is temporary,
+           and a device unmuted before anyone sees this should still get the
+           notice. Mirrors _notify_clear's own mute check.
+        4. Otherwise sendable, one at a time or as a digest — see
+           DIGEST_THRESHOLD.
 
-        The system-rule and notify-column guards _notify itself opens with
-        are asked here too, before any of the above: a rule this engine will
-        never mail, held or not, must not sit "due" forever re-asking the
-        same question every five seconds.
+        The system-rule and notify-column guards _notify opens with are
+        asked here first: a rule this engine will never mail must not sit
+        "due" forever, re-asking every five seconds.
         """
         delay = self._notify_rollup_delay(settings)
         if delay <= 0:
@@ -2801,22 +2680,15 @@ class AlertEngine:
         max_emails_per_hour — the whole point of coalescing a mass outage's
         alerts is that it costs the budget one send, not one per alert.
 
-        Deliberately not _notify with a batch template: every built-in and
-        custom template is written for one alert's tokens, and a digest has
-        no single {{device_name}} to render. Plain text, in the same style
-        _notify's own templates use, built directly rather than through
-        alertmail.render — there is no per-alert template to look up here,
-        each alert already rendered as a plain "label: message" line is
-        exactly what an operator scanning a mass-outage digest wants, and a
-        one-off format earns its own bespoke building over recruiting the
-        token substitution machinery for a job it was not shaped for.
+        Not _notify with a batch template: every template is written for
+        one alert's tokens and a digest has no single {{device_name}} to
+        render, so the body is built directly rather than through
+        alertmail.render.
 
-        Guards mirror _notify's own, in the same order, because a digest is
-        still just several first notifications going out together: the
-        hourly budget, then whether email is even configured, then whether
-        there is anyone to send it to. Each guard that stops the send still
-        has to close out every alert's pending decision, or they would sit
-        "due" forever asking the same question every tick.
+        Guards mirror _notify's, in the same order — hourly budget, email
+        configured, somebody to send to. Each guard that stops the send must
+        still close out every alert's pending decision, or they sit "due"
+        forever.
         """
         # The webhook channel's own digest, entirely independent of email's
         # below it — same reasoning as _notify's own webhook call.

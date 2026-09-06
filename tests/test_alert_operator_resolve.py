@@ -1,15 +1,9 @@
-"""An alert resolved by an operator does not re-open for the same breach
-run: only a clear observation followed by a fresh breach re-opens it. Drives
-AlertEngine directly against a threshold rule (cpu_high) and a NetPath
-threshold rule (netpath_unreachable), and separately proves the engine's own
+"""An alert resolved by an operator does not re-open for the same breach run:
+only a clear observation followed by a fresh breach re-opens it. Drives
+AlertEngine directly against cpu_high and netpath_unreachable, and proves
 auto-resolve (resolved_by == '') is not mistaken for a hand resolve.
-
-Sections 4-7 are the rollup half of the same promise: resolving a "Device not
-responding" alert by hand also covers the alerts that outage was hiding, for
-as long as the device is still down. Before 4.37.0, resolving three device
-outages released their suppressed children within one tick — three fresh
-"Packet loss to device high" rows, and three more emails, five seconds after
-"Resolved 3 of 3".
+Sections 4-7 cover the rollup half: a hand-resolved "Device not responding"
+alert keeps covering the alerts its outage hides while the device is down.
 """
 import os
 import sqlite3

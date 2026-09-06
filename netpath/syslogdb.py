@@ -1,49 +1,19 @@
 """Storage for collected syslog.
 
-Two decisions here are about staying quick under volume.
-
-The hourly counts the timeline draws are kept in a rollup table updated as
-messages land, so the last 24 hours costs 24 rows to read rather than a scan of
-however many million messages arrived. Without it the timeline would get slower
-every day the collector runs.
-
-Message search uses FTS5 with the trigram tokenizer where SQLite has it, which
-almost every build does. Trigram indexes three-character runs rather than
-words, so a search for part of a word finds it: `face` matches `interface`. A
-`LIKE '%needle%'` does the same thing but cannot use an index and reads every
-row in the window; on a day of logs from a chatty firewall that is seconds per
-keystroke. The scan is kept as the fallback for builds without FTS5 or with an
-SQLite too old for trigram, and for queries under three characters, which
-trigram cannot index. The app says which one is in use.
+The timeline reads an hourly rollup table rather than scanning messages.
+Search uses FTS5 with the trigram tokenizer where SQLite has it, falling back
+to a LIKE scan otherwise and for queries under three characters.
 """
 
 from __future__ import annotations
 
 import collections
-import json
-import logging
-import os
 import sqlite3
 import threading
 import time
 
-from . import dbmaint, dbopen, settingsutil
 from .eventlog import ERROR, NullLog, SYSTEM
-
-log = logging.getLogger(__name__)
-
-# Trimming a database back under its size cap: rows are deleted in fixed
-# batches, each in its own short transaction, so the write lock is never held
-# for more than one batch. The old shape deleted 15% of the table and then
-# VACUUMed the whole file with the lock held, up to six times per maintenance
-# pass — measured at a 4.1 s stall on one insert against a 232 MB file, and it
-# still finished above the cap and reported success.
-TRIM_CHUNK = 2_000           # rows per lock acquisition, adapted below
-TRIM_CHUNK_MIN = 500
-TRIM_CHUNK_MAX = 50_000
-TRIM_LOCK_TARGET_S = 0.15    # how long one batch may hold the write lock
-TRIM_PASSES = 40             # delete/reclaim rounds before giving up
-TRIM_BUDGET_S = 30.0         # wall clock for one trim_to_size call
+from .sqlitebase import SqliteStore
 
 # RETURNING (SQLite 3.35, March 2021) is what makes a targeted FTS delete
 # possible: an external-content FTS5 table cannot work out what a deleted row
@@ -120,7 +90,13 @@ DEFAULTS = {
 }
 
 
-class SyslogDatabase:
+class SyslogDatabase(SqliteStore):
+    SCHEMA = SCHEMA
+    DEFAULTS = DEFAULTS
+    LABEL = "syslog.db"
+    TRIM_TABLE = "logs"
+    TRIM_FLOOR = 5000
+
     BACKFILL_CHUNK = 20_000
     # How long close() waits for a chunk already in progress to notice the
     # stop event and land before the connection underneath it is closed —
@@ -128,17 +104,10 @@ class SyslogDatabase:
     BACKFILL_STOP_TIMEOUT_S = 10.0
 
     def __init__(self, path: str, log=None):
-        self.path = path
-        # Optional and defaulted, unlike its siblings in nodesdb.py/
-        # ipamdb.py/alertsdb.py, none of which take the application's
-        # EventLog at all: a dropped-index rebuild silently downgrading
-        # search to scanning for the rest of the process, with nothing
-        # anywhere saying so, is exactly the kind of fact an operator needs
-        # and the module logger (below) never reaches the UI to tell them.
+        # The EventLog is optional but wanted: a dropped index silently
+        # downgrading search to scanning for the rest of the process is a
+        # fact an operator needs, and the module logger never reaches the UI.
         self.log = log or NullLog()
-        self._lock = threading.RLock()
-        self._conn = dbopen.connect(path)
-        self._conn.row_factory = sqlite3.Row
         self.fts = False
         self._last_rebuild: float | None = None
         # Last row stored per source, for consecutive-duplicate collapsing.
@@ -157,27 +126,12 @@ class SyslogDatabase:
         self._backfill_thread: threading.Thread | None = None
         self.index_ready = True
         self.index_progress = (0, 0)
-        with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            dbmaint.enable_incremental_vacuum(self._conn, "syslog.db")
-            self._conn.executescript(SCHEMA)
-            self._migrate()
-            self._enable_fts()
-            self._conn.commit()
+        super().__init__(path)
 
     def _migrate(self) -> None:
-        """Add columns introduced after a database was first created.
-
-        CREATE TABLE IF NOT EXISTS leaves an existing table alone, so an
-        install from before repeat collapsing needs the column added
-        explicitly or the next insert fails.
-        """
-        columns = {row["name"] for row in
-                   self._conn.execute("PRAGMA table_info(logs)").fetchall()}
-        if "repeat_count" not in columns:
-            self._conn.execute("ALTER TABLE logs ADD COLUMN repeat_count"
-                               " INTEGER NOT NULL DEFAULT 1")
+        self.ensure_columns(
+            "logs", {"repeat_count": "INTEGER NOT NULL DEFAULT 1"})
+        self._enable_fts()
 
     def _enable_fts(self) -> None:
         """Create the search index, rebuilding it if its shape has changed.
@@ -391,33 +345,7 @@ class SyslogDatabase:
         thread = self._backfill_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=self.BACKFILL_STOP_TIMEOUT_S)
-        with self._lock:
-            self._conn.close()
-
-    # --------------------------------------------------------------- settings
-
-    def settings(self) -> dict:
-        values = dict(DEFAULTS)
-        with self._lock:
-            rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
-        for row in rows:
-            if row["key"] in values:
-                try:
-                    values[row["key"]] = json.loads(row["value"])
-                except (ValueError, TypeError):
-                    pass
-        return settingsutil.coerce_settings(DEFAULTS, values, strict=False)
-
-    def save_settings(self, values: dict) -> None:
-        with self._lock:
-            for key, value in values.items():
-                if key not in DEFAULTS:
-                    continue
-                self._conn.execute(
-                    "INSERT INTO settings(key, value) VALUES (?,?)"
-                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (key, json.dumps(value)))
-            self._conn.commit()
+        super().close()
 
     # ------------------------------------------------------------------ write
 
@@ -796,25 +724,17 @@ class SyslogDatabase:
 
     # ------------------------------------------------------------ maintenance
 
-    def size_bytes(self) -> int:
-        total = 0
-        for suffix in ("", "-wal", "-shm"):
-            try:
-                total += os.path.getsize(self.path + suffix)
-            except OSError:
-                pass
-        return total
+    def _trim_delete(self, low: int, upper: int) -> int:
+        return self._delete_logs("id >= ? AND id < ?", (low, upper))
 
     def _delete_logs(self, where: str, params) -> int:
         """Delete matching log rows and their index entries, without a rebuild.
 
-        `INSERT INTO logs_fts(logs_fts) VALUES('rebuild')` costs a full
-        re-index of the whole table however few rows were removed — measured
-        at 18.6 s to delete a single row from a million, with the write lock
-        held the whole time, every fifteen minutes once retention bites.
+        `INSERT INTO logs_fts(logs_fts) VALUES('rebuild')` re-indexes the
+        whole table however few rows were removed, with the write lock held.
         RETURNING hands back exactly the column values FTS5 needs to retire
-        each row's entries, so the cost becomes proportional to what was
-        actually deleted. Must be called with the lock held.
+        each row's entries, so the cost is proportional to what was deleted.
+        Must be called with the lock held.
         """
         if self.fts and HAS_RETURNING:
             rows = self._conn.execute(
@@ -866,67 +786,4 @@ class SyslogDatabase:
                     "id IN (SELECT id FROM logs ORDER BY ts ASC LIMIT ?)",
                     (total - max_rows,))
             self._conn.commit()
-        return removed
-
-    def trim_to_size(self, max_bytes: int) -> int:
-        """Delete the oldest messages until the file fits under the cap.
-
-        Batched and reclaimed rather than deleted-and-VACUUMed: the write
-        lock is the one the syslog writer thread needs, and holding it
-        across a whole-file rewrite stalled ingest for seconds at a time.
-        """
-        if max_bytes <= 0:
-            return 0
-        removed = 0
-        deadline = time.monotonic() + TRIM_BUDGET_S
-        for _ in range(TRIM_PASSES):
-            size = self.size_bytes()
-            if size <= max_bytes:
-                break
-            with self._lock:
-                bounds = self._conn.execute(
-                    "SELECT MIN(id) AS lo, MAX(id) AS hi FROM logs").fetchone()
-            low, high = bounds["lo"], bounds["hi"]
-            # Ids are handed out in arrival order, so the id span is both the
-            # right definition of "oldest" — immune to a device with a wrong
-            # clock — and a proxy for the row count that costs one index probe
-            # rather than the full scan a COUNT(*) would.
-            deletable = 0 if low is None else max(0, high - low + 1 - 5000)
-            if deletable:
-                span = high - low + 1
-                want = min(deletable, max(1, int(
-                    span * (1.0 - max_bytes / float(size)) * 1.1)))
-                cut = low + want
-                chunk = TRIM_CHUNK
-                while low < cut and time.monotonic() < deadline:
-                    upper = min(low + chunk, cut)
-                    started = time.monotonic()
-                    with self._lock:
-                        removed += self._delete_logs(
-                            "id >= ? AND id < ?", (low, upper))
-                        self._conn.commit()
-                    held = time.monotonic() - started
-                    low = upper
-                    # Keep one batch's lock hold near TRIM_LOCK_TARGET_S
-                    # however large the rows turn out to be — a trap with its
-                    # raw frame stored costs an order of magnitude more than a
-                    # syslog line, and one fixed batch size cannot suit both.
-                    if held > TRIM_LOCK_TARGET_S:
-                        chunk = max(TRIM_CHUNK_MIN, chunk // 2)
-                    elif held < TRIM_LOCK_TARGET_S / 4:
-                        chunk = min(TRIM_CHUNK_MAX, chunk * 2)
-            # Hand the freed pages back, in short slices outside the lock
-            # block. reclaim takes the lock itself and reacquires it in a
-            # tight loop, and a Python lock is not fair, so it is asked for a
-            # little at a time rather than for one long run.
-            while time.monotonic() < deadline:
-                if not dbmaint.reclaim(self._conn, self._lock, pages=500,
-                                       budget_s=0.2, label="syslog.db"):
-                    break
-            if not deletable or time.monotonic() >= deadline:
-                break
-        if self.size_bytes() > max_bytes:
-            log.warning("%s: %d bytes after removing %d rows, still above the "
-                        "%d byte cap; continuing at the next maintenance pass",
-                        "syslog.db", self.size_bytes(), removed, max_bytes)
         return removed

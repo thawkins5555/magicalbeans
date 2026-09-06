@@ -1,15 +1,9 @@
-"""Item 2 of the API-heavy trio: server-side paging for the Devices list
-and the Alerts list.
+"""Server-side paging for the Devices list and the Alerts list.
 
 Devices (nodesdb.devices/devices_count via GET /api/nodes/devices):
 limit/offset math, a `total` that ignores the page, and the no-params call
-still returning the whole matching set unpaged — the backward-compatible
-form item 2 explicitly asked to keep for one release.
-
-Alerts (alertsdb.alerts via GET /api/alerts): `offset` walking past
-ALERTS_LIST_CAP, with `total` (from the existing count_alerts helper)
-staying honest about how many pages there are.
-"""
+still returning the whole matching set unpaged. Alerts (alertsdb.alerts via
+GET /api/alerts): `offset` past ALERTS_LIST_CAP, with `total` staying honest."""
 import http.client
 import json
 import os

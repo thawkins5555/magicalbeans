@@ -19,12 +19,8 @@
     scopeTrendWindow: '24h', scopeTrend: [],
   };
 
-  // One implementation, in app.js. This was twelve copies of the same
-  // three lines, which is how one of them came to be missing a
-  // character while the others were not.
   const escape = App.escapeHtml;
 
-  // One relative-time vocabulary for the whole product: App.ago (app.js).
   const ago = App.ago;
 
   /* A small utilization donut, drawn with the standard stroke-dasharray
@@ -159,26 +155,22 @@
 
   function selectSub(name) {
     view.sub = name;
-    for (const btn of document.querySelectorAll('#page-ipam .subtab')) {
-      btn.classList.toggle('active', btn.dataset.subtab === name);
-    }
-    for (const page of document.querySelectorAll('#page-ipam .subpage')) {
-      page.classList.toggle('active', page.id === `ipam-sub-${name}`);
-    }
+    App.selectSub('ipam', name);
   }
 
   /* ---------------------------------------------------------------- status */
 
   function drawStatus() {
     const ipam = (App.state.serverState || {}).ipam || {};
-    App.setBg(App.el('ipam-dot'), ipam.running ? 'var(--ok)' : 'var(--line)');
-    App.setText(App.el('ipam-status'), ipam.running ? 'Worker running' : 'Worker stopped');
-    const toggle = App.el('ipam-toggle');
-    if (toggle) App.setText(toggle, ipam.running ? 'Stop worker' : 'Start worker');
     const parts = [];
     if (ipam.scanning && ipam.scanning.length) parts.push(`scanning ${ipam.scanning.length} subnet(s)`);
     if (ipam.polling && ipam.polling.length) parts.push(`polling ${ipam.polling.length} DHCP server(s)`);
-    App.setText(App.el('ipam-counters'), parts.join(' · '));
+    // The only strip whose sentence is not a worker-supplied status line:
+    // /api/state carries no `status` for IPAM, so both halves are spelled
+    // out here rather than falling back to the stopped text alone.
+    App.strip('ipam', { running: ipam.running,
+      status: ipam.running ? 'Worker running' : 'Worker stopped' },
+    { stopped: 'Worker stopped', start: 'Start worker', stop: 'Stop worker', parts });
 
     const badge = App.el('ipam-conflict-badge');
     const count = ipam.open_conflicts || 0;
@@ -1097,10 +1089,7 @@
 
   function settingsDialog() {
     const s = App.state.ipamSettings || {};
-    const check = (id, label, on) =>
-      `<label class="check"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}> ${label}</label>`;
-    const number = (id, label, value, attrs = '') =>
-      `<label>${label} <input id="${id}" type="number" ${attrs} value="${value}"></label>`;
+    const { check, number } = App.form;
     const settingsBox = App.modal('IPAM settings', `
       <fieldset><legend>SCANNING</legend>
         ${check('i-enabled', 'Run the IPAM worker', s.enabled)}
@@ -1131,8 +1120,7 @@
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
         { queued: 'Saving…', done: 'Saved' }, (async () => {
-        const on = (id) => box.querySelector(id).checked;
-        const num = (id) => Number(box.querySelector(id).value);
+        const { on, num } = App.form.readers(box);
         await App.post('/api/settings', { scope: 'ipam', values: {
           enabled: on('#i-enabled'),
           scan_interval_minutes: num('#i-interval'),
@@ -1238,15 +1226,8 @@
       };
     }
     // The one module whose strip said "Worker stopped" with no way to start
-    // it: the only control was a checkbox inside the settings dialog. Same
-    // route shape as the other seven toggles, and it persists like that
-    // checkbox does.
-    App.el('ipam-toggle').onclick = async () => {
-      const running = ((App.state.serverState || {}).ipam || {}).running;
-      await App.post('/api/ipam/worker', { action: running ? 'stop' : 'start' });
-      await App.loadState();
-      drawStatus();
-    };
+    // it: the only control was a checkbox inside the settings dialog.
+    App.wireToggle('ipam-toggle', 'ipam', '/api/ipam/worker', drawStatus);
     App.el('ipam-settings').onclick = settingsDialog;
     App.el('ipam-add-subnet').onclick = addSubnet;
     App.el('ipam-edit-subnet').onclick = editSubnet;

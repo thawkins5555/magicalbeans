@@ -1,23 +1,10 @@
 """Local users, password hashing and sessions.
 
-Passwords are never stored, only verified against a hash. The hash is scrypt
-with the parameters OWASP currently recommends (N=2^17, r=8, p=1 — about
-128 MiB per verification), falling back to PBKDF2-HMAC-SHA256 at 600,000
-iterations if the SSL library underneath is too old for scrypt. The stored
-string records which was used and with what parameters, so raising the cost
-later does not invalidate existing passwords: they are rehashed on the next
-successful login.
-
-Sessions live in memory only. Restarting the service logs everyone out, which
-is the safe default and avoids a token surviving in a file that also holds
-network data.
-
-This module has no concept of roles or per-module access itself — an
-account here is just a username, a password hash, and a session. Per-
-module read/write permissions are a layer above it (see `permissions.py`
-and `appdb.py`'s `user_permissions` table); adding an account is still an
-administrative act, since it's the point at which those grants are
-decided.
+Passwords are never stored, only a scrypt hash (falling back to PBKDF2 if
+scrypt is unavailable); the stored string records which and with what
+parameters, so raising the cost later rehashes on next login rather than
+invalidating existing passwords. Sessions live in memory only. Roles and
+per-module permissions are a layer above this module — see permissions.py.
 """
 
 from __future__ import annotations
@@ -25,7 +12,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import os
 import re
 import secrets
 import threading
@@ -57,11 +43,10 @@ COMMON_PASSWORDS = {
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$")
 
-# API tokens (Tier 1 #10): a service-account credential that authenticates
-# an HTTP request the same way a session cookie does, checked wherever the
-# cookie is (server.py's Bearer handling), but never expires from idleness
-# and carries exactly the owning account's permission grants — see
-# appdb.api_tokens for the storage side.
+# API tokens: a service-account credential that authenticates an HTTP request
+# the same way a session cookie does (server.py's Bearer handling), but never
+# expires from idleness and carries exactly the owning account's permission
+# grants — see appdb.api_tokens for the storage side.
 #
 # Prefixed the way GitHub's and Slack's tokens are: a leak scanner (or a
 # human skimming a log dump) can recognise "sw_api_…" as a credential on
@@ -77,24 +62,11 @@ def generate_api_token() -> str:
 
 
 def hash_api_token(raw_token: str) -> str:
-    """The SHA-256 hex digest of a token, which is what is actually stored
-    and looked up (appdb.api_token_by_hash) — never the token itself.
-
-    Deliberately not scrypt, and deliberately not salted, unlike
-    hash_password above. Both of those exist to make a *human-chosen*
-    secret expensive to brute-force offline, because a password's real
-    entropy is far below its length — dictionaries and pattern-mangling get
-    an attacker most of the way there. A token from generate_api_token() has
-    256 bits of entropy from `secrets.token_urlsafe`, chosen uniformly at
-    random: there is no dictionary to run, no pattern to mangle, and no
-    feasible amount of hardware makes searching a 256-bit space practical
-    before the heat death of the universe. A slow, salted hash would only
-    make every legitimate request pay a scrypt call for no matching benefit
-    — the entropy is already doing the work a salt and a cost factor exist
-    to add for a weaker secret. A plain SHA-256 lookup is what lets an
-    automation script authenticate on every request without a
-    half-second-per-call tax.
-    """
+    """The SHA-256 hex digest of a token — what is actually stored and
+    looked up (appdb.api_token_by_hash), never the token itself.
+    Deliberately not scrypt/salted like hash_password: a 256-bit random
+    token has no dictionary to defend against, so a fast lookup costs
+    nothing a slow hash would have bought."""
     return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
 
 
@@ -265,13 +237,9 @@ class SessionStore:
             return dict(session, token=token)
 
     def touch(self, token: str) -> dict | None:
-        """Validate and mark the session as used just now.
-
-        Called for requests that represent a deliberate action — a POST, PUT
-        or DELETE, or the heartbeat the browser sends when it has detected
-        real mouse or keyboard input — so the idle clock tracks presence
-        rather than an open tab.
-        """
+        """Validate and mark the session as used just now — called only for
+        a deliberate action (POST/PUT/DELETE or an activity heartbeat), so
+        the idle clock tracks presence rather than an open tab."""
         session = self.get(token)
         if session is None:
             return None
@@ -286,26 +254,11 @@ class SessionStore:
             self._sessions.pop(token, None)
 
     def destroy_user(self, username: str) -> int:
-        """Used when a password changes or an account is removed — both are
-        incident-response actions that only work if they actually end the
-        sessions a stolen credential is still holding.
-
-        Matched case-insensitively (casefold both sides) because every
-        account lookup elsewhere in this application is: app_db.user(),
-        set_password() and remove_user() all resolve the username against
-        a COLLATE NOCASE column. A session was created from whatever casing
-        the account signed in with (SessionStore.create is never told to
-        normalise it), so an exact, case-sensitive match here would silently
-        depend on the caller happening to pass that same casing back. It
-        does not, reliably: an administrator resetting "Bob.Smith"'s
-        password types the case variant on screen, the DB row updates
-        correctly under NOCASE, the caller reports "N session(s) ended" —
-        and if the live session was created as "bob.smith", N is 0 and the
-        compromised session that this reset exists to kill keeps working.
-        Casefolding here keeps this method's notion of "same account" in
-        agreement with app.db's, so the caller's casing can never be the
-        thing silently deciding whether the sessions die.
-        """
+        """Used on password change or account removal, to actually end the
+        sessions a stolen credential is still holding. Matched case-
+        insensitively to agree with app_db's COLLATE NOCASE username lookup
+        — an exact match could silently miss a session created under
+        different casing and leave a compromised session alive."""
         target = username.casefold()
         with self._lock:
             gone = [token for token, session in self._sessions.items()

@@ -1,20 +1,9 @@
-"""O-60: severity moved from the alert email's sign-off into its subject.
-
-Found by reading the actual SMTP sink transcript from a live run, not by
-reading code: every built-in subject was a near-identical "SappiWhere:
-<device> is not responding" and the one fact that decides whether an
-operator gets out of bed sat at the bottom of the body, behind a tap.
-
-Three things this suite has to prove:
-  1. build_context's new severity_tag token, bracketed and upper-case.
-  2. Every one of the six built-in templates actually leads its subject
-     with {{severity_tag}} and no longer ends its body in the now-redundant
-     {{severity_name}}.
-  3. The upgrade path — alertsdb._migrate_templates, extended to try every
-     wording a key has EVER shipped, not just the one immediately before
-     this release, so an install several versions behind still gets
-     migrated in one step. And, just as important, that a template an
-     operator has actually customised is never touched.
+"""Severity leads the alert email's subject, not its sign-off. Proves:
+build_context's severity_tag token is bracketed and upper-case; every one of
+the six built-in templates leads its subject with {{severity_tag}} and no
+longer ends its body in {{severity_name}}; and alertsdb._migrate_templates
+upgrades an unedited template from any wording that key has ever shipped in
+one step, while a template an operator has customised is never touched.
 """
 from _paths import tmpdir
 
@@ -72,7 +61,7 @@ db = AlertsDatabase(f"{TMPDIR}/unedited.db")
 now_before = db.template_by_key("device_down")["updated_ts"]
 with db._lock:
     # Simulate a pre-upgrade install: an unedited device_down template still
-    # holding exactly the wording this release shipped BEFORE O-60 (the one
+    # holding exactly the wording shipped BEFORE this change (the one
     # entry in _PREVIOUS_BUILTIN_TEMPLATES["device_down"]).
     db._conn.execute(
         "UPDATE templates SET subject = ?, body = ?, updated_ts = 1.0"

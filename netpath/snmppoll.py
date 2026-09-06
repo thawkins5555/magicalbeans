@@ -1,6 +1,7 @@
 """SNMP request/response wire format for the Nodes poller: GET/GETNEXT/
 GETBULK/SET request builders, a Response-PDU decoder, and v1/v2c/v3
-(noAuthNoPriv/authNoPriv only — see decision #2) message assembly.
+(noAuthNoPriv/authNoPriv only — no privacy/encryption support) message
+assembly.
 
 Every BER/ASN.1 primitive is imported from trapdecode.py rather than
 duplicated — this file is purely the poller-specific half of the same wire
@@ -61,7 +62,7 @@ class SnmpAuthError(SnmpError):
 
 
 class SnmpUnsupported(SnmpError):
-    """authPriv requested; deferred per decision #2."""
+    """authPriv (privacy/encryption) requested — not implemented."""
 
 
 # --------------------------------------------------------------------- build
@@ -110,12 +111,10 @@ def build_v3_request(msg_id: int, request_id: int, pdu_tag: int, oids, *,
                      user: str, auth_proto: str | None = None,
                      auth_key: bytes | None = None, non_repeaters: int = 0,
                      max_repetitions: int = 10) -> bytes:
-    """authNoPriv or noAuthNoPriv only (decision #2). Builds the full
-    message with the auth-parameters field zero-filled, then — if signing
-    — computes the HMAC over the assembled bytes with that field zeroed and
-    splices the real digest in, mirroring Decoder._verify_v3's
-    blank-then-hash exactly so the two are provably the same operation in
-    reverse."""
+    """authNoPriv or noAuthNoPriv only. Builds the message with the auth-
+    parameters field zero-filled, then (if signing) HMACs the assembled
+    bytes with that field still zeroed and splices the digest in — mirrors
+    Decoder._verify_v3's blank-then-hash exactly, in reverse."""
     signing = bool(auth_proto and auth_key)
     digest_len = AUTH_PROTOCOLS[auth_proto][1] if signing else 0
     flags = FLAG_AUTH if signing else 0

@@ -1,24 +1,9 @@
-"""ConfigRX on Cisco platforms beyond plain IOS/IOS-XE: NX-OS and IOS-XR
-(same commands, different banner), an SG/CBS switch that rejects its own
-pager-off command and pages instead, a WLC whose privileged prompt ends
-'>' with no enable step, and an ASA that must escalate via `enable` and a
-stored secret before it will run anything at all.
-
-Drives the real `_pull_config` -> `_clean_output` -> `_capture_problem`
-chain (nothing here reimplements ConfigRX's capture logic) against every
-Cisco persona in demo/fake_ssh.py's PERSONAS, shared verbatim with
-`stubs.stub_ssh_device.StubDevice(persona=...)` rather than a second,
-drifting copy of the same scripted device. Each persona proves either a
-stored capture with the config's own text present, or the exact refusal
-message this release promises: cisco-truncate and unprivileged (both
-pre-existing failure shapes, re-checked here on the vendor path a real
-Cisco device also uses) and cisco-asa given the WRONG enable secret.
-
-The final section is the one end-to-end case that goes through a real
-`Service`, a real (portable, passphrase-file-backed) secret store, and
-`ConfigRxWorker.backup_now` rather than calling `_pull_config` directly —
-proving the enable secret this file's DB column stores is the one the
-worker actually decrypts and sends.
+"""ConfigRX on Cisco platforms beyond IOS/IOS-XE: NX-OS, IOS-XR, an SG/CBS
+switch that pages despite pager-off, a WLC with no enable step, and an ASA that
+must escalate via `enable` with a stored secret. Drives the real _pull_config
+-> _clean_output -> _capture_problem chain against every Cisco persona in
+demo/fake_ssh.py's PERSONAS via stubs.stub_ssh_device.StubDevice, then one
+end-to-end case through a real Service, secret store and backup_now.
 """
 import os
 import stat
@@ -36,7 +21,7 @@ except ImportError:                       # run_all.py reports this as SKIP
     raise SystemExit(77)
 
 from demo import fake_ssh  # noqa: E402
-from netpath import configrx, configrx_vendors  # noqa: E402
+from netpath import configrx  # noqa: E402
 from stubs import stub_ssh_device  # noqa: E402
 
 FAILS = []
@@ -82,7 +67,7 @@ check("this suite's persona list matches demo.fake_ssh.PERSONAS (nothing renamed
 
 for name, (vendor_key, enable_secret, marker) in CISCO_PERSONAS.items():
     persona = fake_ssh.PERSONAS[name]
-    vendor = configrx_vendors.resolve(vendor_key)
+    vendor = configrx.resolve(vendor_key)
     check(f"{name}: vendor '{vendor_key}' is registered", vendor is not None)
     if vendor is None:
         continue
@@ -108,7 +93,7 @@ print("cisco-asa: a wrong enable secret never reaches privileged mode")
 device = stub_ssh_device.StubDevice(persona=fake_ssh.PERSONAS["cisco-asa"])
 try:
     client = connect(device.port)
-    raw, ended = configrx._pull_config(client, configrx_vendors.resolve("cisco-asa"),
+    raw, ended = configrx._pull_config(client, configrx.resolve("cisco-asa"),
                                        max_s=15, enable_secret="not-the-secret")
     client.close()
     cleaned = configrx._clean_output(raw)
@@ -125,7 +110,7 @@ print("cisco-asa: only enable, the stored secret, pager-off and show are ever se
 device = stub_ssh_device.StubDevice(persona=fake_ssh.PERSONAS["cisco-asa"])
 try:
     client = connect(device.port)
-    configrx._pull_config(client, configrx_vendors.resolve("cisco-asa"), max_s=15,
+    configrx._pull_config(client, configrx.resolve("cisco-asa"), max_s=15,
                           enable_secret="demo")
     client.close()
     sent = b"".join(device.sent_bytes).decode("utf-8", "replace")
@@ -142,7 +127,7 @@ check("_learn_prompt strips the trailing space and keeps the trailing '>'",
 device = stub_ssh_device.StubDevice(persona=fake_ssh.PERSONAS["cisco-wlc"])
 try:
     client = connect(device.port)
-    raw, ended = configrx._pull_config(client, configrx_vendors.resolve("cisco-wlc"), max_s=15)
+    raw, ended = configrx._pull_config(client, configrx.resolve("cisco-wlc"), max_s=15)
     client.close()
     sent = b"".join(device.sent_bytes).decode("utf-8", "replace")
     check("no 'enable' was ever sent to a vendor with no enable_command",

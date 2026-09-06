@@ -1,32 +1,18 @@
 """ConfigRxWorker: pulls a read-only "show config" snapshot from each
 enabled device over SSH, on a schedule.
 
-The hard safety boundary of the BACKUP PATH lives here: `_pull_config()`
-is the only place in this module that talks to a device's shell, and it
-sends exactly the fixed vendor.pager_off lines plus vendor.show_config
-from configrx_vendors.py — plus, for the few vendors whose login shell is
-not already privileged EXEC, the fixed vendor.enable_command and the
-device's own stored enable secret, sent back only as the answer to that
-device's own password prompt — nothing else, ever. There is no free-form
-command execution anywhere in ConfigRX, by construction.
+The hard safety boundary of the BACKUP PATH lives here: `_pull_config()` is
+the only place in this module that talks to a device's shell, and it sends
+exactly the fixed vendor.pager_off lines, vendor.show_config, and — where
+the login shell is not already privileged EXEC — vendor.enable_command with
+the device's own stored enable secret, sent only as the answer to that
+device's password prompt. There is no free-form command execution anywhere
+in ConfigRX, by construction. (The interactive SSH terminal, sshterm.py, is
+a different feature behind its own `ssh` permission; nothing crosses.)
 
-That is a statement about backups, not about the whole application. The
-interactive SSH terminal (sshterm.py) is a different feature with a
-different boundary: it is a real shell, a human types into it, and it is
-gated behind its own `ssh` permission which nobody holds by default.
-Nothing on this path can send anything the operator typed there, and
-nothing there runs through this module.
-
-The SSH password follows this app's one credential discipline
-(nodepoll.credential_for's shape): decrypted from its DPAPI blob
-immediately before opening the connection, held only in a local variable,
-and discarded (the variable is reassigned to None) the moment the
-connection attempt finishes, success or failure.
-
-Scheduler shape mirrors fortipoll.WirelessPoller (a small
-ThreadPoolExecutor, a 1s-tick scanning loop) rather than nodepoll.py's
-larger multi-candidate-credential machinery, since a device here has
-exactly one fixed SSH credential.
+The SSH password follows this app's credential discipline: decrypted from
+its DPAPI blob immediately before connecting, held in a local variable, and
+discarded the moment the attempt finishes either way.
 """
 
 from __future__ import annotations
@@ -38,14 +24,111 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 
 from . import configrx_compliance
 from . import configrx_redact
-from . import configrx_vendors
 from .configrxdb import ConfigRxDatabase
 from .hostkeys import HostKeyChanged, HostKeyStore
 from .nodesdb import detected_vendor
 from .eventlog import CONFIGRX, ERROR, NullLog
+from .worker import Worker
+
+# ---------------------------------------------------------------------------
+# The hard safety boundary of the BACKUP path: an exhaustive, per-vendor
+# allow-list of exactly what a backup may ever send over an SSH session.
+# Nothing on that path sends anything beyond a vendor's `pager_off` lines
+# (session-scoped, read-only pagination settings) and its single
+# `show_config` command; there is no free-form command execution anywhere in
+# ConfigRX, by construction -- nothing here accepts arbitrary text and no
+# code path builds a command from anything other than these fixed strings.
+#
+# A vendor whose privileged EXEC mode is not the login mode (Cisco ASA) also
+# carries `enable_command` -- always the literal `enable`, never anything
+# else. The only other thing that can cross the wire because of it is the
+# device's OWN stored enable secret, sent back verbatim as the answer to
+# that device's own password prompt (`enable_password_re` only recognises
+# that prompt in the device's output, never builds a command). No vendor
+# entry accepts a secret from anywhere other than the encrypted per-device
+# credential this backup already holds.
+#
+# That guarantee is about backups. The interactive SSH terminal (sshterm.py)
+# is a separate feature with a separate boundary -- a real shell, driven by a
+# human, behind its own `ssh` permission that nobody holds by default -- and
+# it neither uses this table nor reaches the backup path. ConfigRX write
+# still means only "may back up configs".
+#
+# Vendor keys are lowercase, matching nodeoids.vendor_for()'s output (itself
+# sourced from trapdecode.WELL_KNOWN's vendor-root names) so a Nodes device's
+# already-detected vendor can be used directly; a device_config row's
+# vendor_override is free text for anyone WELL_KNOWN or vendor_for() doesn't
+# cover (e.g. "hp"/"aruba", which has no SNMP enterprise root registered
+# there today).
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Vendor:
+    label: str
+    pager_off: tuple = field(default_factory=tuple)
+    show_config: str = ""
+    # "" (the default) means this vendor's login shell is already privileged
+    # EXEC — _pull_config never attempts the escalation. Set only for a
+    # vendor whose login mode is user EXEC (prompt ends '>') and needs a
+    # separate step to reach the mode `show_config` requires.
+    enable_command: str = ""
+    # How _pull_config recognises the device's OWN password prompt for
+    # enable_command, in the device's own output — never used to build
+    # anything sent to the device.
+    enable_password_re: str = r"[Pp]assword:"
+
+
+VENDORS = {
+    # --- Hardware-verified: exercised against real devices of these platforms. ---
+    "cisco": Vendor("Cisco IOS/IOS-XE", ("terminal length 0",), "show running-config"),
+    "cisco-nxos": Vendor("Cisco NX-OS", ("terminal length 0",), "show running-config"),
+    "cisco-iosxr": Vendor("Cisco IOS-XR", ("terminal length 0",), "show running-config"),
+    "cisco-sb": Vendor("Cisco Small Business SG/CBS",
+                       ("terminal datadump",), "show running-config"),
+    "cisco-asa": Vendor("Cisco ASA", ("terminal pager 0",), "show running-config",
+                       enable_command="enable"),
+    "cisco-wlc": Vendor("Cisco WLC AireOS", ("config paging disable",), "show run-config"),
+    "fortinet": Vendor("Fortinet FortiOS",
+                       ("config system console", "set output standard", "end"),
+                       "show full-configuration"),
+    "juniper": Vendor("Juniper Junos", ("set cli screen-length 0",), "show configuration"),
+    "mikrotik": Vendor("MikroTik RouterOS", (), "/export"),
+    "hp": Vendor("HP/Aruba", ("no page",), "show running-config"),
+    "aruba": Vendor("HP/Aruba", ("no paging",), "show running-config"),
+
+    # --- Documentation-sourced only: built from vendor CLI manuals rather
+    # than a live capture, so treat a capture from real hardware as suspect
+    # until it has been eyeballed once. ---
+    #
+    # Moxa EDS/IKS/ICS/PT-series, classic "CLI FW_5.x" only. Moxa's newer
+    # Next-generation OS (RKS-G4000 and friends) exposes config backup only
+    # through `copy running-config <tftp/...>` and is NOT covered here.
+    "moxa": Vendor("Moxa EDS/IKS/ICS-series (CLI FW_5.x)",
+                   ("terminal length 0",), "show running-config"),
+    #
+    # Siemens SCALANCE X/S-series. pager_off is empty BY DESIGN: no
+    # pager-off command is documented for these, and models that page hit
+    # _pull_config's own generic "-- more --" responder instead. Siemens's
+    # enterprise arc (4196) covers the whole Siemens tree, so an S7 PLC on
+    # it simply fails to connect rather than producing a false capture.
+    "siemens": Vendor("Siemens SCALANCE (CLI)", (), "show running-config"),
+    #
+    # Rockwell/Allen-Bradley Stratix switches run genuine Cisco IOS/IOS-XE,
+    # so this entry is deliberately identical to "cisco" above. The key must
+    # be lowercase to match resolve()'s lowercasing of vendor_for()'s
+    # canonical "rockwellAutomation" (enterprises.py, arc 95).
+    "rockwellautomation": Vendor("Rockwell Stratix (Cisco IOS/IOS-XE)",
+                                 ("terminal length 0",), "show running-config"),
+}
+
+
+def resolve(vendor_key: str) -> Vendor | None:
+    return VENDORS.get((vendor_key or "").strip().lower()) or None
+
 
 CONNECT_TIMEOUT_S = 10
 # Quiet fallback for a device whose prompt could not be learned. Deliberately
@@ -451,7 +534,7 @@ def _read_until_match(channel, pattern, max_s: float,
             return "".join(chunks), "matched"
 
 
-def _do_enable(channel, vendor: configrx_vendors.Vendor, enable_secret: str
+def _do_enable(channel, vendor: Vendor, enable_secret: str
               ) -> tuple[str, str]:
     """Sends vendor.enable_command — the ONLY thing this function ever sends
     besides the device's own stored enable secret, answering the password
@@ -476,7 +559,7 @@ def _do_enable(channel, vendor: configrx_vendors.Vendor, enable_secret: str
     return resp, ended
 
 
-def _pull_config(client, vendor: configrx_vendors.Vendor,
+def _pull_config(client, vendor: Vendor,
                  max_s: float, enable_secret: str = "") -> tuple[str, str]:
     """The only function in this file that talks to a device's shell.
 
@@ -489,7 +572,8 @@ def _pull_config(client, vendor: configrx_vendors.Vendor,
     asks for one (see _do_enable). Every one of these is a fixed, in-band
     answer to a prompt the device itself raised — none of them carries
     anything an operator typed or anything not already nailed down in
-    configrx_vendors.py — so the boundary (only pager_off, show_config and,
+    the vendor table in this module — so the boundary (only pager_off,
+    show_config and,
     for these vendors, the fixed enable step ever run on the device) is
     intact.
 
@@ -532,18 +616,12 @@ def _pull_config(client, vendor: configrx_vendors.Vendor,
             pass
 
 
-# Two floors, because "too short to be a config" means different things
-# depending on how the read ended.
-#
-# When the device gave its prompt back, the command demonstrably ran to
-# completion, so a short result is genuinely a short config — a stripped-down
-# MikroTik /export really is only a few lines. The floor there only has to
-# reject a capture that is nothing but an error line ("% Invalid input
-# detected...", "Permission denied") or the ~45-character banner failure this
-# release exists to stop.
-#
-# When the read ended any other way there is no such evidence, so the floor is
-# the one that says "a real running-config is hundreds of lines".
+# Two floors, because "too short to be a config" depends on how the read
+# ended. A returned prompt proves the command ran, so a short result is
+# genuinely a short config (a stripped-down MikroTik /export is a few lines)
+# and the floor only has to reject an error line or a banner. Any other
+# ending has no such evidence, so the floor says "a real running-config is
+# hundreds of lines".
 MIN_CONFIG_CHARS = 200
 MIN_PROMPT_TERMINATED_CHARS = 80
 
@@ -603,14 +681,16 @@ def diff_texts(old_text: str, new_text: str, old_label: str, new_label: str
     return "".join(hunks), additions, removals
 
 
-class ConfigRxWorker:
+class ConfigRxWorker(Worker):
+    STOPPED_TEXT = "Worker stopped"
+    THREAD_NAME = "configrx-worker"
+
     def __init__(self, db: ConfigRxDatabase, nodes_db, log=None):
         self.db = db
         self.nodes_db = nodes_db
         self.log = log or NullLog()
         self._executor: ThreadPoolExecutor | None = None
         self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
         # Two maps, not one set: a device in the middle of an SSH session and
         # one waiting behind three others are different things to an operator
         # watching a backup, and the single set could not tell them apart —
@@ -622,7 +702,6 @@ class ConfigRxWorker:
         self._lock = threading.Lock()
         self.counters = {"backups": 0, "changed": 0, "unchanged": 0, "errors": 0,
                         "suspect": 0, "compliance_truncated": 0}
-        self.error: str | None = None
         # Last settings start() was handed; only allow_legacy_ssh is read from
         # here (the loop reads the rest from the database each pass).
         self.settings: dict = {}
@@ -635,10 +714,6 @@ class ConfigRxWorker:
         # set someone just edited, or a device group someone just re-scoped
         # one to, rather than waiting for that device's next backup.
         self._last_compliance_sweep = 0.0
-
-    @property
-    def running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
 
     def start(self, settings: dict | None = None) -> None:
         self.stop()
@@ -658,8 +733,7 @@ class ConfigRxWorker:
             _apply_legacy_algorithms(
                 paramiko, bool(self.settings.get("allow_legacy_ssh", False)))
         self._executor = ThreadPoolExecutor(max_workers=4)
-        self._thread = threading.Thread(target=self._loop, name="configrx-worker", daemon=True)
-        self._thread.start()
+        self._spawn()
         # One-time catch-up for an install that already has a backup
         # history predating (or never yet reindexed under) the `unchanged`
         # branch's has_search_lines check in _backup_device below — see
@@ -673,21 +747,18 @@ class ConfigRxWorker:
         self._stop.set()
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2)
-        self._thread = None
+        self._join()
 
     def status_text(self) -> str:
+        # The paramiko check sits between error and running: a worker that
+        # cannot run for want of the library should say so, not "stopped".
+        # Cached probe (see paramiko_available); start() re-checks, so
+        # installing paramiko and restarting the worker is enough.
         if self.error:
             return self.error
-        # Cached probe (see paramiko_available); start() re-checks, so
-        # installing paramiko and restarting the worker is enough — no
-        # app restart needed.
         if not paramiko_available():
             return PARAMIKO_MISSING
-        if not self.running:
-            return "Worker stopped"
-        return "Running"
+        return super().status_text()
 
     class NotRunning(RuntimeError):
         """Asked to back up while the worker is stopped. Its own type so the
@@ -743,17 +814,11 @@ class ConfigRxWorker:
                     stats: dict = {}
                     configrx_compliance.evaluate_all(self.db, self.nodes_db, stats=stats)
                     if stats.get("truncated"):
-                        # evaluate_all's own COMPLIANCE_SWEEP_BUDGET_S ceiling
-                        # was reached before every device x rule-set pair in
-                        # scope was checked — expected occasionally under a
-                        # rule shaped like a typo, not a sign this loop is
-                        # broken. Counted here (worker_state already exposes
-                        # self.counters) so an operator can see a sweep is
-                        # giving up early rather than that being invisible,
-                        # the same "no counter tells anyone" gap this was
-                        # written to close. The next sweep, or the next
-                        # per-device evaluation right after its own backup,
-                        # picks up whatever this one left not-yet-assessed.
+                        # COMPLIANCE_SWEEP_BUDGET_S was reached before every
+                        # device x rule-set pair was checked — expected under
+                        # a rule shaped like a typo, not a broken loop.
+                        # Counted so an operator can see a sweep giving up
+                        # early; the next sweep picks up the rest.
                         self.counters["compliance_truncated"] += 1
                         self.log.add(
                             CONFIGRX, "ConfigRX compliance sweep ran out of "
@@ -827,12 +892,12 @@ class ConfigRxWorker:
         if not config or not config["backup_enabled"]:
             return
 
-        # detected_vendor rather than device["vendor"]: configrx_vendors.resolve
+        # detected_vendor rather than device["vendor"]: resolve()
         # is an exact dict lookup, and a device whose custom vendor OID answers
         # "Cisco Systems, Inc." must still back up as cisco. The explicit
         # per-device override still wins over both.
         vendor_key = (config["vendor_override"] or detected_vendor(device) or "")
-        vendor = configrx_vendors.resolve(vendor_key)
+        vendor = resolve(vendor_key)
         if vendor is None:
             self.db.record_backup_attempt(
                 device_id, ok=False, status="error",
@@ -991,35 +1056,19 @@ class ConfigRxWorker:
                             "Stored verbatim: this device has \"keep secrets in "
                             "backups\" switched on"))
 
-            # The cross-device search index (configrx_search.py) is built
-            # ONLY from redacted text, regardless of this device's own
-            # store_secrets setting — `cleaned` above is redacted already
-            # when store_secrets is off, but reused verbatim otherwise, so
-            # a device with it ON needs its own separate redaction pass
-            # here. See configrx_search.py's module docstring for why a
-            # cross-device search view gets this stricter, unconditional
-            # treatment — the same one get_configrx_diff already gives a
-            # comparison view — rather than the single-backup route's
-            # permission-gated one.
-            #
-            # This branch always replaces the index, unconditionally: a
-            # changed or suspect capture means `cleaned` (and so
-            # search_text) is genuinely new content, never what is already
-            # indexed. The `unchanged` branch below is the opposite case —
-            # see its own comment for why it does NOT call this on every
-            # poll.
+            # The cross-device search index is built ONLY from redacted
+            # text, whatever this device's store_secrets says: `cleaned` is
+            # already redacted when it is off, so a device with it ON needs
+            # its own pass here. A changed or suspect capture is genuinely
+            # new content, so this branch always replaces the index; see the
+            # `unchanged` branch below for why that one does not.
             search_text = cleaned if not store_secrets else configrx_redact.redact(cleaned)[0]
             self.db.replace_search_lines(device_id, search_text)
-            # Compliance re-evaluates right away too, so a rule set someone
-            # is watching reflects this exact change rather than waiting
-            # for the next periodic sweep (see _loop and
-            # configrx_compliance.py's own module docstring for why the
-            # sweep exists at all: on a schedule and on a new capture,
-            # never recomputed from a page load). Bounded by
-            # evaluate_device_all_rule_sets' own default budget — this
-            # runs on this device's own executor thread, not the loop
-            # thread, but a rule that never finishes here still ties up a
-            # worker slot other devices' backups need.
+            # Compliance re-evaluates right away, so a rule set someone is
+            # watching reflects this change rather than waiting for the
+            # periodic sweep. Bounded by evaluate_device_all_rule_sets' own
+            # budget: this runs on an executor thread, and a rule that never
+            # finishes still holds a slot other devices' backups need.
             compliance_stats: dict = {}
             configrx_compliance.evaluate_device_all_rule_sets(
                 self.db, self.nodes_db, device_id, stats=compliance_stats)
@@ -1035,28 +1084,14 @@ class ConfigRxWorker:
         else:
             self.counters["unchanged"] += 1
             self.db.record_backup_attempt(device_id, ok=True, status="unchanged" + note)
-            # `cleaned` here is byte-identical to the content already sitting
-            # in `backups` (that is what "unchanged" means — add_backup's own
-            # hash comparison is what set backup_id to None), so the
-            # redacted text this device's search rows SHOULD hold is
-            # identical to what they already hold, if they were ever
-            # populated. Re-deriving and re-storing it on every poll would
-            # be pure waste at fleet scale: replace_search_lines deletes and
-            # re-inserts every line of this capture, in the FTS shadow
-            # table too, and this branch is the steady state for a
-            # well-run network — most devices, most polls, forever.
-            #
-            # has_search_lines is one indexed lookup (ix_config_lines_device)
-            # that tells us whether that cost was already paid. It has NOT
-            # been for a device whose configuration has never changed since
-            # this feature shipped — that device has always taken this
-            # branch and so has never once reached the indexing call in the
-            # `if` above — or for one a not-yet-run or still-in-progress
-            # backfill (start_search_backfill, called from start() below)
-            # has not reached yet. In either of those cases, and only then,
-            # this pays for redact()+replace_search_lines once; every
-            # following unchanged poll for that device finds the rows
-            # already there and skips it again.
+            # "Unchanged" means `cleaned` is byte-identical to what is
+            # already stored, so the search rows this device should hold are
+            # what it already holds — and replace_search_lines re-inserts
+            # every line, in the FTS shadow table too. This branch is the
+            # steady state for a well-run network, so that cost must not be
+            # paid every poll. has_search_lines is one indexed lookup saying
+            # whether it was ever paid at all: a device whose config never
+            # changed, or one the backfill has not reached, pays once here.
             if not self.db.has_search_lines(device_id):
                 search_text = (cleaned if not store_secrets
                               else configrx_redact.redact(cleaned)[0])

@@ -121,7 +121,6 @@ a.figure:focus-visible .figure-value { text-decoration: underline; }
 .figure.ok .figure-value { color: var(--ok); }
 .figure.warn .figure-value { color: var(--warn); }
 .figure.fail .figure-value { color: var(--fail); }
-.figure-label { color: var(--muted); font-size: var(--fs-xs); }
 .dash-sev-list { margin-top: 10px; display: flex; flex-direction: column; gap: 2px; }
 .dash-sev-row,
 .dash-row {
@@ -166,15 +165,11 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
 .dash-bar-fill.bad { background: var(--fail); }
 
 /* ----------------------------------------------------------------- brand
-   The wordmark: favicon.svg's route, drawn inline with classes so the theme
-   colours it, and the name in the tab face. An <h1>, a sibling of #tabs
-   directly inside .topbar (not one of its tabs) on the application page,
-   centred above the form on sign-in, the mark alone in the SSH window's bar.
-   flex: none so it never competes with #tabs's flex: 1 1 auto for the
-   strip's width; the border-right now runs the full height of .topbar
-   (align-items: stretch) rather than just the tab row's, which is the point
-   — it reads as a divider between the identity and the views, not a rule
-   drawn mid-row. */
+   favicon.svg's route drawn inline with classes so the theme colours it,
+   plus the name. An <h1> sibling of #tabs inside .topbar, not one of its
+   tabs. flex: none so it never competes with #tabs for the strip's width;
+   the border-right runs the full height of .topbar so it reads as a divider
+   between the identity and the views. */
 .brand {
   display: flex;
   align-items: center;
@@ -198,17 +193,11 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
 body.tiny .brand span { display: none; }
 
 /* ------------------------------------------------------------------ tabs
-   The strip used to need 1,747px before anything was cut, and at 1366px —
-   the commonest NOC laptop width — it dropped Settings, most of Debug,
-   #conn and Sign out with no visible sign there was more to see.
-   `overflow-x: auto` was already here, but Chromium paints no scrollbar
-   until the pointer is actually over the strip, so at rest it simply looked
-   truncated.
-
-   .topbar splits the old single row in two: #tabs, which scrolls, and
-   .tabs-utility, which does not. The utility group — who is signed in, the
-   way to Account, Sign out, and #conn ("the one honest signal during an
-   outage") — can now never scroll out of reach, whatever the width. */
+   .topbar is two parts: #tabs, which scrolls, and .tabs-utility, which does
+   not — so the utility group (who is signed in, Account, Sign out, and
+   #conn, "the one honest signal during an outage") can never scroll out of
+   reach at any width. Chromium paints no scrollbar on #tabs until the
+   pointer is over it, which is what the fade below is for. */
 .topbar {
   display: flex;
   align-items: stretch;
@@ -239,27 +228,12 @@ body.tiny .brand span { display: none; }
   scroll-padding-inline: 0 26px;
 }
 #tabs > * { flex: none; }
-/* The twelve tabs are flat, direct children of #tabs — one role="tablist"
-   and twelve role="tab" buttons, no wrapper between them (tests/ui/walk.mjs
-   asserts exactly that). .tab--group-start draws a hairline standing in for
-   the label a wrapping <div data-label> used to draw with generated
-   content, without introducing another layer for a hidden tab to orphan.
-   index.html marks the group boundaries themselves with the fixed
-   data-group-start attribute (Nodes, Routes, Settings) and also carries
-   this class on the same three buttons, as the correct answer for an
-   account that can read everything — so the strip is not briefly
-   hairline-less on the very first paint, before app.js has run. app.js's
-   updateTabGroups() is the one place that changes the answer after that:
-   it recomputes this class from data-group-start on every tab whenever a
-   permission or a broken module can have hidden the marked tab, and hands
-   the hairline to whichever tab of the group is actually first VISIBLE —
-   so hiding the marked tab moves the hairline along with its group
-   instead of deleting it.
-   Written as .tab.tab--group-start (specificity 0,2,0,0), not the bare
-   class alone, so the padding-left survives the two breakpoints below that
-   redeclare .tab's own padding as a shorthand (1500px, 360px) — a bare
-   class here would lose that fight by source order and the divider gap
-   would vanish under 1500px. */
+/* The hairline standing in for a tab group's label. index.html marks the
+   boundaries with data-group-start and carries this class for first paint;
+   app.js's updateTabGroups() moves it to whichever tab of the group is
+   actually visible. Written as .tab.tab--group-start (0,2,0), not the bare
+   class: the 1500px and 360px breakpoints below redeclare .tab's padding as
+   a shorthand, and a bare class would lose to them on source order. */
 .tab.tab--group-start {
   border-left: 1px solid var(--hairline);
   margin-left: var(--space-xs);
@@ -281,21 +255,12 @@ body.tiny .brand span { display: none; }
    that flips: see there for why. */
 .icon-toggle { display: inline-flex; align-items: center; gap: 4px; }
 .icon-toggle .ico { display: none; width: 16px; height: 16px; flex: none; }
-/* The overflow fade, moved off #tabs itself (app.css used to draw it as
-   #tabs::after, an absolutely positioned child of the scroll container —
-   which meant it scrolled WITH scrollLeft, sitting at the visible right
-   edge only while the strip was at rest. Scroll it and the fade drifted
-   into the middle of the strip, washing out whichever tab sat under it,
-   while the real right edge went un-faded.
-   Drawn here instead, on the utility group that never scrolls: `right:
-   100%` of .tabs-utility is #tabs's real right edge, whatever #tabs's own
-   scrollLeft is. Shown only while #tabs actually has more to scroll to
-   (app.js toggles #tabs.has-overflow on load, on resize, and on scroll, by
-   comparing scrollWidth to clientWidth at both ends), so "there is more" is
-   visible at rest rather than only once a pointer finds the scrollbar.
-   No z-index needed: .tabs-utility is #tabs's next sibling, so its ::before
-   paints after #tabs's own tabs in source order and sits on top of them at
-   the shared stacking level, exactly like #tabs::after used to. */
+/* The overflow fade. Drawn on the utility group, which never scrolls, not
+   on #tabs itself: `right: 100%` of .tabs-utility is #tabs's real right
+   edge whatever #tabs's own scrollLeft is, so the fade cannot drift into
+   the middle of the strip. Shown only while #tabs has more to scroll to
+   (app.js toggles .has-overflow). No z-index needed: .tabs-utility is
+   #tabs's next sibling, so its ::before paints over the tabs already. */
 #tabs.has-overflow + .tabs-utility::before {
   content: '';
   position: absolute;
@@ -395,15 +360,11 @@ body.tiny .brand span { display: none; }
 .subpage { display: none; flex: 1; min-height: 0; flex-direction: column; }
 .subpage.active { display: flex; }
 
-/* #nd-detail (the Nodes device drill-down) has no class of its own, so
-   without this it's a plain block element — its .subpage children's
-   flex:1 has nothing to flex against, so the interfaces/events tables
-   grow to their full content height instead of being bounded and
-   scrollable, and the outer [data-splitter] > .pane's overflow:hidden
-   then silently clips the overflow instead of scrolling it. This app's
-   own [hidden] { display: none !important; } rule above always wins
-   regardless of rule order, so this coexists safely with the existing
-   .hidden toggle in nodes.js. */
+/* #nd-detail (the Nodes device drill-down) has no class of its own, and
+   its .subpage children's flex:1 needs something to flex against, or the
+   interfaces/events tables grow to full content height and the outer
+   [data-splitter] > .pane clips them instead of scrolling. [hidden]'s
+   !important above still wins, so nodes.js's toggle is unaffected. */
 #nd-detail { display: flex; flex-direction: column; min-height: 0; flex: 1; }
 /* The device drill-down's own header. Both of these were inheriting the
    dimmest styles in the palette — the name from .section (11px --muted,
@@ -502,23 +463,14 @@ body.stale .page { opacity: 0.42; filter: grayscale(0.4); }
 .page.active { display: flex; flex-direction: column; }
 #page-netpath.active { flex-direction: row; }
 
-/* First paint only. boot.js sets data-tab on <html> synchronously, before
-   any of the markup above has been parsed, and generates the matching rule
-   pair into a <style> of its own — so what paints on a reload is that rule,
-   not the .active classes above, which only exist once app.js's selectTab()
-   has run (seconds later, after every module script and the first API call).
-
-   The rule used to be written out here, one selector per tab, and that is
-   exactly how it rotted: the list named ten tabs while the product shipped
-   twelve, so an operator whose last tab was Wireless or ConfigRX reloaded
-   into a blank page with no tab underlined until the scripts had finished.
-   Generating it from the stored name cannot drift.
-
-   NetPath is the one page that lays its panes out in a row rather than a
-   column, and it needs to say so before the scripts run like every other
-   page does. The extra .page here is not decoration: it outweighs the
-   generated rule, which is appended after this stylesheet and would
-   otherwise win on source order and stand the page up in a column. */
+/* First paint only. boot.js sets data-tab on <html> synchronously and
+   generates the matching rule pair itself, so a reload paints from that
+   rather than from the .active classes above, which only exist once
+   app.js's selectTab() has run. NetPath is the one page laid out in a row,
+   and it has to say so before the scripts run; the extra .page is not
+   decoration — it outweighs boot.js's generated rule, which is appended
+   after this stylesheet and would otherwise stand the page up in a
+   column. */
 html[data-tab="netpath"] #page-netpath.page { flex-direction: row; }
 
 /* --------------------------------------------------------------- widgets */
@@ -580,15 +532,11 @@ button.danger:disabled:hover { background: var(--grid); filter: none; }
    and carries the reason in its title; one line under the bar says the same
    thing where a tooltip cannot be reached. Nothing is hidden — the operator
    can see the feature exists and what it would need. */
-/* No opacity here, deliberately: dimming a control that is already drawn in
-   the disabled tone would take that tone back below the contrast floor, and
-   the reason for disabling it is a sentence, not a shade. Now one per page
-   (App.explainDeniedGroups) rather than one per container, appended to the
-   page's own root — which carries no padding of its own, unlike the bars
-   and fieldsets that used to sit beside it — so it gets the same 12px
-   gutter a .bar has. Settings' notes land inside .scroll instead, which
-   already insets everything else there 16px; matching that padding on top
-   would double the indent, so they get none of their own. */
+/* No opacity, deliberately: dimming a control already drawn in the
+   disabled tone would take that tone below the contrast floor, and the
+   reason for disabling it is a sentence, not a shade. One per page
+   (App.explainDeniedGroups), appended to the page root, which carries no
+   padding of its own — hence the .bar-matching gutter here. */
 .write-denied-why { margin: 6px 0 0; padding: 0 var(--space-md); }
 #page-settings .scroll > .write-denied-why { padding: 0; }
 button.icon { width: 32px; padding: var(--space-xs) 0; text-align: center; }
@@ -647,10 +595,14 @@ label { color: var(--muted); display: inline-flex; align-items: center; gap: 6px
 label.check { cursor: pointer; }
 input[type=checkbox] { accent-color: var(--accent); }
 
-/* --faint is 2.50:1 on --bg at 11px, roughly half of what AA asks for, and
-   .hint is not decorative: it carries every device's IP address, the mute
-   tag, alert counts and every empty state. --muted is 5.18:1. */
-.hint { color: var(--muted); font-size: var(--fs-xs); }
+/* The quiet secondary line, wherever it appears. --faint was 2.50:1 on
+   --bg at 11px, roughly half of what AA asks for, and none of these is
+   decorative: .hint alone carries every device's IP address, the mute tag,
+   alert counts and every empty state. --muted is 5.18:1. */
+.figure-label, .hint, .target-list .host, .host, .gsearch-hit .meta {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
 /* A paragraph of .hint prose used to run to a 250-character line (1858px
    wide) with nothing capping its measure. `ch` rather than a pixel width so
    the cap tracks the font rather than fighting it at a different size. */
@@ -725,15 +677,10 @@ body.tiny .terms { display: none; }
 
 /* ------------------------------------------------------------ the panel
 
-   One surface. Seven rule sets used to repeat "--panel, 1px --hairline,
-   --radius" and differ only in padding, and two more (.bars, .timeline)
-   had drifted to no border at all. The surface is declared once here and
-   every panel-shaped class joins the selector; each keeps only the
-   geometry that is genuinely its own. A new panel-shaped thing adds its
-   class to this list rather than writing the three properties again.
-
-   .panel.float is the lifted tier — a dialog, the sign-in card, the SSH
-   overlay's card — rounder and with the one dialog shadow. */
+   One surface, declared once. A new panel-shaped thing joins this selector
+   rather than writing --panel/--hairline/--radius again, and keeps only the
+   geometry that is genuinely its own. .panel.float is the lifted tier — a
+   dialog, the sign-in card, the SSH overlay's card. */
 .panel, .card, fieldset, .target-list, .detail, .subnet-detail, .table-wrap,
 .canvas.chart, .bars, .timeline, .scrollbox,
 .login-box, .ssh-panel, .modal-box, .gsearch-box {
@@ -745,12 +692,6 @@ body.tiny .terms { display: none; }
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-pop);
 }
-/* A panel that carries a state colours its border, the way the toast and
-   the two banners already did each in their own words. */
-.panel.tone-ok, .tone-ok { border-color: var(--ok); }
-.panel.tone-warn, .tone-warn { border-color: var(--warn); }
-.panel.tone-fail, .tone-fail, .tone-bad { border-color: var(--fail); }
-
 .card { padding: 10px var(--space-md); }
 .card.strip {
   display: flex;
@@ -775,14 +716,10 @@ body.tiny .terms { display: none; }
 /* ---------------------------------------------------------- the eyebrow
 
    The small uppercase label above a group — a card's title, a fieldset's
-   legend, a pane's section heading, the labels on the sign-in form. Six
-   copies of the same four declarations existed, differing by whether they
-   remembered text-transform. Declared once. Margins stay with the element.
-
-   .panel-title is the other heading: a thing's name, in sentence case at
-   --fs-md, for a device pane, a subnet detail, a dialog. The bare h2 rule
-   catches the two page headings that were rendering at the user agent's
-   1.5em default because nothing in the system had reached them. */
+   legend, a pane's section heading, the labels on the sign-in form —
+   declared once. Margins stay with the element. Below it, the other
+   heading: a thing's name, in sentence case at --fs-md. The bare h2 in
+   that list is what reaches the two page headings nothing else does. */
 .eyebrow, .section, .card h3, .sidebar h2, legend,
 .login-box label, .ssh-panel label {
   color: var(--muted);
@@ -791,7 +728,7 @@ body.tiny .terms { display: none; }
   text-transform: uppercase;
 }
 .card h3 { margin: 0 0 6px; }
-.panel-title, #nd-d-name, .subnet-detail-title, .modal-box h2, .ssh-panel h2, h2 {
+#nd-d-name, .subnet-detail-title, .modal-box h2, .ssh-panel h2, h2 {
   font: 600 var(--fs-md)/1.3 var(--ui);
   color: var(--text);
   letter-spacing: 0;
@@ -800,16 +737,10 @@ body.tiny .terms { display: none; }
 }
 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); }
 
-/* Status said three ways at once: a shape, a colour and a word.
-
-   Colour alone used to be the whole encoding. The ok/warn/fail hues are
-   inseparable for a protan viewer — measured 3.8 ΔE apart, where 10 is the
-   floor for a categorical set — and they collapse to three near-identical
-   greys in the screenshot somebody pastes into a ticket. The shape carries
-   the meaning on its own; the colour confirms it for everyone who can see
-   it. The Nodes device list already followed dot-plus-word and is where
-   this came from; this makes it the rule and gives the three modules that
-   had each inlined their own 8px dot one implementation to share. */
+/* Status said three ways at once: a shape, a colour and a word. The
+   ok/warn/fail hues are inseparable for a protan viewer and collapse to
+   three near-identical greys in a pasted screenshot, so the shape has to
+   carry the meaning on its own and the colour only confirms it. */
 .status { display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; }
 .status-mark { flex: none; font-size: var(--fs-glyph); line-height: 1; font-style: normal; }
 .status-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -863,7 +794,6 @@ body.tiny .terms { display: none; }
   font-weight: 700;
 }
 .target-list .name { color: var(--text); }
-.target-list .host { color: var(--muted); font-size: var(--fs-xs); }
 /* This is the paragraph that decodes the whole texture vocabulary. It was
    set in --faint at 2.5:1 — the least legible prose on the page. */
 .legend { color: var(--muted); font-size: var(--fs-xs); margin: 0; }
@@ -871,7 +801,6 @@ body.tiny .terms { display: none; }
 /* Sidebar table rows (IPAM's subnets and DHCP servers) want the same weight
    .target-list already gives its <li> rows, but aren't inside one. */
 .name { color: var(--text); font-weight: 600; }
-.host { color: var(--muted); font-size: var(--fs-xs); }
 
 /* A subnet row: a small utilization donut beside its label, rather than a
    second column, so it reads as part of the row instead of a separate table
@@ -930,15 +859,11 @@ body.tiny .terms { display: none; }
   border: 1px solid var(--canvas-hairline);
   border-radius: var(--radius);
   overflow: hidden;
-  /* A histogram's sr-only data table (App.histogramTable) is absolutely
-     positioned to clip to 1x1px, but a <table> in auto layout ignores a
-     width narrower than its content needs — so without a positioned
-     ancestor of its own, it used its containing block's, sized at its real,
-     wide, unclipped layout width. Alerts' canvas sits directly in the
-     subpage rather than inside a .pane (which already clips), so that
-     width reached all the way to #page-alerts's own overflow: visible and
-     pushed the page 34px past 320px. Every other histogram host happened to
-     have a clipping .pane in between and never showed it. */
+  /* The containing block for a histogram's sr-only data table
+     (App.histogramTable): it clips to 1x1px, but a <table> in auto layout
+     sizes to its content against its containing block, so without this
+     Alerts' canvas — the one not inside a clipping .pane — pushed the page
+     34px past 320px. */
   position: relative;
 }
 .canvas svg {
@@ -976,8 +901,16 @@ body.compact .canvas.small, body.tiny .canvas.small { min-height: 120px; }
 .split.events { padding: 0 var(--space-md) var(--space-md); }
 .pad-x { padding: 0 var(--space-md); }
 .pad-b { padding-bottom: 10px; }
+.pad-t { padding-top: 14px; }
+.pad-t-sm { padding-top: 10px; }
+.gap-t { margin-top: 10px; }
+.gap-t-sm { margin-top: var(--space-sm); }
+.gap-t-xs { margin-top: 6px; }
+.canvas-tall { height: 65vh; }
+.dot-inline { vertical-align: -1px; }
+.table-wrap.short { max-height: 220px; }
+.table-wrap.tall { max-height: 420px; }
 .pane { display: flex; flex-direction: column; min-width: 0; flex: 1; }
-.pane.grow-pane { flex: 2; }
 .bars { flex: 1; overflow: auto; padding: 6px; }
 .bar-row { position: relative; height: 24px; margin-bottom: 2px; }
 .bar-fill { position: absolute; inset: 0 auto 0 0; border-radius: var(--radius-sm); opacity: 0.55; }
@@ -1134,12 +1067,9 @@ td.msg { white-space: pre-wrap; word-break: break-word; }
 /* ---------------------------------------------------------- empty states
 
    A detail pane waiting for a selection says so from its data-empty
-   attribute, and only while it is empty: the moment a module writes
+   attribute, and only while it is empty — the moment a module writes
    content the sentence is gone, and clearing the pane brings it back with
-   no code. Before this the sentence was the <pre>'s own text — English set
-   in the monospace reserved for machine output — and five panes plus two
-   .hint divs each did it their own way. The .empty class is the same look
-   for an element that is not a <pre>. */
+   no code. .empty is the same look for an element that is not a <pre>. */
 .detail:empty::before {
   content: attr(data-empty);
   font-family: var(--ui);
@@ -1197,18 +1127,12 @@ fieldset {
   padding: 10px 14px 14px;
 }
 legend { padding: 0 var(--space-xs); }
-/* A shared control column, instead of each label's own text width deciding
-   where its control starts — control left edges used to spread 42px within
-   one fieldset. label.check leads with its box, not a text column, so it
-   keeps a plain row.
-
-   grid-auto-flow: column, not the grid default of row: a label with a unit
-   after its control ("Poll interval <input> s") is three inline items, not
-   two, and row-flow wrapped the third into a new implicit row under the
-   label text — the unit landing on its own line, the very bug this
-   codebase already has elsewhere (nodes.js's number()). Column-flow instead
-   opens a third, content-sized column after the 1fr one for it, which is
-   where "s" was already sitting under the old flex row. */
+/* A shared control column, so control left edges do not spread with each
+   label's own text width. label.check leads with its box, not a text
+   column, so it keeps a plain row. grid-auto-flow: column, not the grid
+   default of row: a label with a unit after its control ("Poll interval
+   <input> s") is three inline items, and row-flow wraps the third onto a
+   line of its own. */
 fieldset label {
   display: grid;
   grid-template-columns: minmax(140px, max-content) 1fr;
@@ -1448,13 +1372,9 @@ body.login-page {
   overflow: auto;
 }
 /* The alert email template editor needs room for a subject/body pair
-   alongside a token palette; every other modal in the app is a plain
-   form and stays at the default width. Every other modal's <label>s
-   happen to wrap one-per-line simply because they are narrow enough
-   relative to the default 760px width — at 960px, several short labels
-   (Name/Subject/Body) fit on one packed row instead, so this width
-   variant forces one field per line explicitly rather than relying on
-   the same happy accident. */
+   beside a token palette. At 960px several short labels would pack onto one
+   row, so this variant forces one field per line explicitly rather than
+   relying on the narrowness that keeps every other modal in line. */
 .modal-box.wide { max-width: 960px; }
 /* The "?" beside a setting (App.helpLink) and the panel it opens
    (App.showHelp). The panel reuses .modal/.modal-box for its look and
@@ -1587,16 +1507,12 @@ body.login-page {
 .toast.info { border-left-color: var(--accent); }
 .err { color: var(--fail); }
 .warn-text { color: var(--warn); }
-/* A status word or phrase coloured by what it says — nodes.js's oper-status
-   ("up"/"down") and STP-state text, debug.js's worker-status text — each of
-   which carried its own three-to-six-branch inline `style="color:${…}"`
-   lookup. One class per tone, the same base+modifier shape .dash-bar-fill
-   already uses (.bad/.warn there too), so the branch lives in the markup
-   (which class a value maps to) rather than being re-typed as a ternary or
-   an object literal in every module that shows a status. Not every tone
-   here applies to every caller — STP's "disabled" wants .muted, a worker
-   that has never run wants .line — so this is the full token vocabulary a
-   status can use, not a fixed enum of the states any one caller has. */
+/* A status word coloured by what it says — nodes.js's oper-status and
+   STP-state text, debug.js's worker-status text. One class per tone, the
+   base+modifier shape .dash-bar-fill already uses, so the branch lives in
+   the markup rather than as an inline style lookup per module. This is the
+   full token vocabulary a status may use, not the states of any one
+   caller. */
 .status-fg { color: var(--ok); }
 .status-fg.warn { color: var(--warn); }
 .status-fg.bad { color: var(--fail); }
@@ -1606,12 +1522,10 @@ body.login-page {
 .status-fg.line { color: var(--line); }
 
 /* ------------------------------------------------------------- search
-   The global search opened with "/" (App.initGlobalSearch): nine
-   independent per-page search boxes and no way to ask the product a
-   question without already knowing which tab owns the answer. A command
-   palette rather than another use of #modal, since it has to work with a
-   dialog already open behind it (searching for the device a form refers
-   to) without touching that dialog's own state. */
+   The global search opened with "/". A command palette rather than another
+   use of #modal, since it has to work over a dialog already open behind it
+   (searching for the device that dialog refers to) without touching that
+   dialog's own state. */
 .gsearch {
   position: fixed;
   inset: 0;
@@ -1660,7 +1574,6 @@ body.login-page {
   cursor: pointer;
 }
 .gsearch-hit .name { font-weight: 600; }
-.gsearch-hit .meta { color: var(--muted); font-size: var(--fs-xs); }
 .gsearch-hit:hover, .gsearch-hit.active { background: var(--raised); }
 .gsearch-empty { padding: var(--space-lg); color: var(--muted); font-size: var(--fs-xs); }
 .gsearch-hint {
@@ -1707,20 +1620,13 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
 .card.strip .figure-value { font-size: var(--fs-lg); }
 
 /* ----------------------------------------------------------- breakpoints
-   Width, at last. Density above keys on height only, so a narrow, tall
-   window — a tablet, a half-screen split — got the full sidebar and a
-   420 px dialog. Three steps: below 1200 px the fixed widths become fluid;
-   below 900 px the side-by-side layouts stack; below ~360 px (a 320 px
-   viewport, the floor this responsive pass targets) several pages'
-   filter bars and dialogs are themselves wider than the screen — Nodes at
-   417px, Alerts 394, NetFlow 503, the Add device dialog 417 — and it was
-   the page, not any one control, that carried the body past the viewport
-   (`body { overflow: hidden }` clips rather than scrolls, so that overflow
-   read as content silently cut off, not as a scrollbar). The .cols
-   splitters keep working when stacked because wireDivider reads the flex
-   direction when a drag starts, not once at load. 768 px is the floor the
-   layout is measured at; below it nothing is clipped, but nothing is
-   designed. */
+   Density above keys on height only, so a narrow, tall window still got the
+   full sidebar and a 420px dialog. Width steps: below 1200px the fixed
+   widths become fluid, below 900px the side-by-side layouts stack, below
+   480px/360px the top bar sheds text. `body { overflow: hidden }` clips
+   rather than scrolls, so anything wider than the viewport reads as content
+   silently cut off. The .cols splitters keep working when stacked because
+   wireDivider reads the flex direction per drag, not once at load. */
 @media (max-width: 1200px) {
   .sidebar { width: 240px; }
   .modal-box { min-width: 0; width: min(760px, calc(100vw - 32px)); }
@@ -1741,35 +1647,19 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
   .card.strip { flex-wrap: wrap; row-gap: 6px; }
   .card.strip > .stat, .card.strip > .hint { white-space: normal; }
 }
-/* Below ~480px the utility group's three text buttons — Search, Account,
-   Sign out — cost more width than the twelve-tab strip sitting beside them:
-   at 360px they, plus #conn, ran to roughly two thirds of the whole bar,
-   leaving DASHBOARD and a sliver of ALERTS the only tabs with any room at
-   all. Collapsed to icon buttons (index.html's .icon-toggle) they cost a
-   fixed ~20px each instead of a name's width — nothing a screen reader
-   announces or a tooltip shows changes, since the accessible name was
-   always aria-label/title, never the visible text. #conn keeps its exact
-   place: it is the one thing in this bar that earns it, unlike the three
-   buttons beside it. */
+/* Search, Account and Sign out collapse to their icons rather than starving
+   the tab strip beside them. Nothing a screen reader announces changes:
+   the accessible name was always aria-label/title, never the visible text.
+   #conn is deliberately untouched here. */
 @media (max-width: 480px) {
   .icon-toggle .label { display: none; }
   .icon-toggle .ico { display: block; }
 }
-/* The tab strip is the one piece of this breakpoint owned here: it must
-   absorb its own overflow rather than pushing the body wider, whatever a
-   page underneath it does. #tabs already scrolls its own content at every
-   width (min-width: 0 keeps the flex item from being forced to its
-   content's full size); .tabs-utility gets the same min-width: 0 here — a
-   flex: none item is still a flex ITEM, and without it .tabs-utility's own
-   content (a username, "connecting…", three buttons) refused to shrink
-   below its natural width and starved #tabs of the room .tabs-utility's own
-   flex: none was supposed to leave it. The brand's wordmark text and the
-   username go entirely rather than truncating, which between them reclaim
-   roughly 140px — real estate #conn ("the one honest signal during an
-   outage") needs more than a name already visible after Sign out does.
-   Nodes/Alerts/NetFlow's own filter bars and the Add device dialog need the
-   same "shrink or scroll, never push" treatment where their markup lives
-   (nodes.js, alerts.js, netflow.js), which is outside this file. */
+/* The strip absorbs its own overflow rather than pushing the body wider.
+   .tabs-utility needs min-width: 0 too — a flex: none item is still a flex
+   ITEM, and without it its content refuses to shrink and starves #tabs of
+   the room flex: none was meant to leave. The wordmark and the username go
+   entirely rather than truncating; #conn stays. */
 @media (max-width: 360px) {
   .tab { padding: var(--space-sm) 10px; }
   .tabs-utility { gap: 6px; padding: 0 var(--space-sm); min-width: 0; }

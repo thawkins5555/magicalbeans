@@ -1,96 +1,41 @@
-/* The design tokens: every colour, text size and letter-spacing the
-   interface uses, in one file, with the contrast each pair was measured at.
-
-   This is the authority. app.css, ssh.css and the module scripts read these
-   by name and never write a hex colour or a pixel font size of their own;
-   theme.py carries the same values for the desktop console and
-   tests/test_design_tokens.py fails if the two drift, or if any pair below
-   falls under the ratio written beside it. Linked before app.css from every
-   page — index.html, login.html and ssh.html — and listed in PUBLIC_PATHS
-   (server.py) because the sign-in page needs it before there is a session.
-
-   Contrast figures are WCAG 2.x relative-luminance ratios. AA asks 4.5:1 of
-   text under 18.66px bold or 24px regular — which is every line of text in
-   this product — and 3:1 of a graphical object or control boundary that
-   carries meaning. A tone is named for its ROLE, not its value: a light
-   theme later redefines the values under :root[data-theme] and nothing else
-   has to move. */
+/* Design tokens: every colour, text size and letter-spacing the interface
+   uses, in one file. app.css, ssh.css and the module scripts read these by
+   name and never write a hex colour or pixel font size of their own;
+   theme.py mirrors the same values for the desktop console. A tone is named
+   for its ROLE, not its value, so a theme redefines it under
+   :root[data-theme] and nothing else has to move. */
 :root {
-  /* Dark is the default and needs no attribute. boot.js sets
-     data-theme="light" or "contrast" on <html> before first paint from the
-     browser's stored choice; the two blocks at the end of this file redefine
-     the tones under those attributes and nothing else in the product has to
-     know. color-scheme tells the browser which way to draw the parts it
-     owns: scrollbars, the date picker, a <select>'s dropdown. */
+  /* Dark is the default; boot.js sets data-theme from the stored choice
+     before first paint. color-scheme tells the browser which way to draw
+     the parts it owns (scrollbars, the date picker, a <select>). */
   color-scheme: dark;
 
-  /* ------------------------------------------------------------ surfaces
-     Four steps of dark, each one a hairline apart. --bg is the page and the
-     dialog; --panel is a card on it; --raised is a table's alternate stripe
-     and its header, a button and a field; --hairline is the border between
-     any two of them. --grid is the faint rule inside a table body. */
+  /* Surfaces: four steps of dark, each a hairline apart. */
   --bg: #0E1116;
   --panel: #151A21;
   --raised: #1B222B;
   --hairline: #2A323D;
   --grid: #222933;
 
-  /* ---------------------------------------------------------- text tones
-     Three tiers, and the dimmest still passes AA on the darkest surface it
-     is allowed on.
-
-       --text   14.6:1 on --bg, 12.4:1 on --raised     the content
-       --muted   6.6:1 on --bg,  5.6:1 on --raised     labels, hints, headers
-       --dim     5.8:1 on --bg,  4.9:1 on --raised     metadata: timings,
-                                                       axis labels, the
-                                                       version in the corner
-
-     --dim was #808B98 and --fail #F85149; both cleared AA on --bg and
-     --raised and neither did on --selected — 4.29:1 and 4.43:1 on the one
-     row the operator has open — because no pair list checked that surface.
-     Each is brightened by the smallest step that clears it (4.52 and 4.50).
-
-     --muted was #7C8794, which measured 4.39:1 on --raised — under AA for
-     every table header and every hint on a zebra stripe. There used to be a
-     fourth tier, --faint (#4C5561, 2.5:1), and it was used as text: the
-     legend explaining the whole colour-blind-safe texture vocabulary was set
-     in it. It no longer exists. What was structural about it is --line,
-     below; what was prose is --dim or --muted. */
+  /* Text tones: three tiers, the dimmest still passing AA on the darkest surface it is allowed on. */
   --text: #DCE3EA;
   --muted: #8F9AA7;
   --dim: #848F9C;
 
-  /* ------------------------------------------------------------ structure
-     Not text, but must still be seen: pane dividers, column grips, the ring
-     of an empty status mark, the scrollbar thumb. 3.1:1 on --raised, which
-     is the darkest surface a grip sits on (a table header). */
+  /* Structure: not text, but must still be seen — dividers, grips, the ring of an empty status mark. */
   --line: #646E7C;
-  /* The fill for "none of this yet" in a chart — the remaining capacity of
-     a subnet, the track of a storage meter, the eighth-and-onwards NetFlow
-     series. 3.05:1 on --panel. Its predecessor (#3A4552) was documented as
-     3:1 and measured 1.79:1; the number here is computed by the test. */
+  /* The fill for "none of this yet" in a chart — remaining subnet capacity, a meter's track, a NetFlow overflow series. */
   --data-neutral: #606A78;
 
-  /* ------------------------------------------------------------ emphasis */
+  /* Emphasis */
   --accent: #7AA2F7;
   --accent-hover: #97B6FF;   /* a primary button under the pointer */
-  /* Light enough to read as a ring against every surface in this palette
-     (9.6:1 on --bg) and distinct from --accent, so a focused primary button
-     does not draw a ring in its own fill colour. */
+  /* Distinct from --accent, so a focused primary button does not draw a ring in its own fill colour. */
   --focus: #9EC1FF;
 
-  /* ------------------------------------------------------------- meaning
-     Each of these means ONE thing, and the shape drawn with it carries the
-     same meaning (App.statusMark, the status textures), so the colour is
-     never the only signal.
-       --ok       healthy, running, up
-       --warn     degraded, approaching a limit, needs a look
-       --fail     down, refused, error — and the badge fill for the worst
-       --blocked  a hop that answered "unreachable" (NetPath only)
-       --overrun  a trace skipped because the previous one was still running
-       --error    a probe that itself failed (NetPath only)
-       --nodata   a chart cell with no sample in it
-     All four text-carrying tones clear 4.5:1 on --bg. */
+  /* Meaning: each token is ONE status, and the shape drawn with it (App.statusMark) carries the same meaning,
+     so colour is never the only signal — ok/warn/fail/blocked (an unreachable hop)/overrun (trace skipped)/
+     error (a failed probe, NetPath only)/nodata (no sample). */
   --ok: #3FB950;
   --warn: #E3B341;
   --fail: #F8544C;
@@ -99,38 +44,17 @@
   --error: #A371F7;
   --nodata: #1E242D;
 
-  /* ------------------------------------------------------------ selection
-     Two different facts about a row, two different tints, and they compose:
-       --selected         open in the detail pane (one row at a time)
-       --checked          ticked for a bulk action (any number)
-       --checked-strong   both at once
-     --selected is a blue-grey a step off --raised rather than the old
-     --hairline, which put --muted at 3.5:1 on the one row the operator is
-     reading; it is 4.9:1 here. The selected row also carries an accent bar
-     at its left edge (app.css), so selection is not carried by tint alone.
-
-     A measured exception, recorded rather than quietly held: --checked-strong
-     is the one surface where a tone can sit below AA. It is deliberately the
-     strongest tint — "ticked AND open" has to be unmistakable — and contrast
-     is a luminance relationship, so the tint that stands out most against the
-     row is also the one that leaves the least room for ink. Solving for a
-     value where every tone clears 4.5:1 lands all three tints within 0.03 of
-     each other (dark) or inverts their order (light): the affordance is worth
-     more than the last tenth of a ratio on the rarest surface in the product.
-     --text (7.45:1 dark, 11.27:1 light) and --muted (light) hold there; the
-     quietest metadata tone does not, so nothing that only appears in --dim is
-     drawn on a row in that state. The contrast theme, which claims more, was
-     moved until it does clear it. */
+  /* Selection: --selected (open in the detail pane), --checked (ticked for bulk action) and --checked-strong
+     (both) compose; the selected row also carries an accent bar at its left edge (app.css), so tint is never
+     the only signal. --checked-strong is a deliberate, recorded exception below the AA floor every other tone
+     here clears — the strongest tint has to be unmistakable, and nothing that only appears in --dim is drawn
+     on a row in that state. */
   --selected: #1E2837;
   --checked: #22304A;
   --checked-strong: #2E4470;
 
-  /* ------------------------------------------------- categorical (charts)
-     Eight hues for stacked NetFlow series, chosen for separation under
-     protanopia simulation as well as in normal vision (netflow.js documents
-     the ΔE budget). Adjacent bands are the pairs the eye compares; the
-     legend and tooltip carry a swatch for the rest. A ninth series onwards
-     is --data-neutral, not a ninth hue. */
+  /* Categorical: eight hues for stacked NetFlow series, chosen for separation under protanopia simulation too.
+     A ninth series onwards is --data-neutral, not a ninth hue. */
   --cat-1: #5B8DEB;
   --cat-2: #CF7638;
   --cat-3: #2FA886;
@@ -140,47 +64,23 @@
   --cat-7: #8F76E8;
   --cat-8: #DC5A5A;
 
-  /* -------------------------------------------------------- route canvas
-     NetPath draws its route on white on purpose — it is the pane addresses
-     are read off, and it prints. Greys that work on black have no contrast
-     on white, so it has its own set. */
+  /* Route canvas: NetPath draws its route on white on purpose (it prints); greys tuned for black have no
+     contrast there, so it keeps its own set. */
   --canvas: #FFFFFF;
   --canvas-panel: #F4F6F9;
   --canvas-hairline: #C9D2DD;
   --canvas-grid: #E4E9F0;
   --canvas-text: #161C24;
   --canvas-muted: #55606E;
-  /* Was #8A94A2, 2.8:1 on the node box — under AA for the eyebrow text and
-     share figures set in it. 4.6:1 now. */
   --canvas-faint: #66707E;
   --canvas-accent: #2F5FC4;
   --canvas-ok: #1B7F3B;
   --canvas-warn: #9A6510;
   --canvas-fail: #B3261E;
-  /* A refused hop. The dark palette's --blocked (a light salmon) was drawn
-     on the white canvas at 2.2:1 — the single most alarming route state in
-     the least visible ink. 5.9:1 on the node box. */
   --canvas-blocked: #A63D10;
 
-  /* ------------------------------------------------------------- type
-     Seven sizes, in rem so the browser's own text-size setting is honoured
-     and so a wall-display density can scale the whole interface from one
-     root value. The pixel figures are at the default 16px root.
-
-       --fs-2xs  11px  eyebrows only: uppercase, letter-spaced, 600 weight
-                       (section titles, sub-tabs, legends) and chart axis
-                       labels. Never a sentence.
-       --fs-xs   12px  the floor for prose: hints, table bodies, metadata
-       --fs-sm   13px  the interface itself: body, buttons, fields
-       --fs-md   14px  a pane's title
-       --fs-lg   15px  a dialog's heading
-       --fs-xl   20px  the wordmark on the sign-in page
-       --fs-2xl  22px  a dashboard figure
-
-     Before this there were ten pixel sizes and one rem in the stylesheet.
-     Hints were 11px; they are 12px now, which is the one visible change.
-     --fs-glyph is not a text size: it is the ●▲■◆○ status marks, sized to
-     sit in a 12px line, and nothing else may use it. */
+  /* Type: seven sizes in rem, so the browser's text-size setting and a wall-display density scale both work.
+     --fs-glyph is not a text size: it sizes the status marks (●▲■◆○) and nothing else may use it. */
   --fs-2xs: 0.6875rem;
   --fs-xs: 0.75rem;
   --fs-sm: 0.8125rem;
@@ -190,52 +90,31 @@
   --fs-2xl: 1.375rem;
   --fs-glyph: 0.5625rem;
 
-  /* Two trackings, in em so they scale with the size they are applied to.
-     There were five pixel values, spread from 0.5 to 1.4 with no rule. */
+  /* Tracking, in em so it scales with the size it is applied to. */
   --track-wide: 0.12em;   /* uppercase eyebrows */
   --track-tab: 0.06em;    /* tab and sub-tab labels, the wordmark */
 
   --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
   --ui: Inter, "SF Pro Text", "Segoe UI", Ubuntu, "DejaVu Sans", sans-serif;
 
-  /* ------------------------------------------------------------- spacing
-     Four steps, each a multiple of 4. Measured over every rendered element
-     there were 20 distinct padding/margin values and 8 distinct gaps with
-     no relationship between them — a control's padding, a dialog's margin
-     and a row's gap each picked their own number. Not everything in the
-     interface is one of these four: a hairline offset, an icon's own
-     dimensions and a handful of genuinely different gaps stay their own
-     numbers, but a control now reaches for one of these first. */
+  /* Spacing: four steps, each a multiple of 4. Not everything uses one of these — a hairline offset, an icon's
+     own dimensions and a handful of genuinely different gaps stay their own numbers. */
   --space-xs: 4px;
   --space-sm: 8px;
   --space-md: 12px;
   --space-lg: 16px;
 
-  /* --------------------------------------------------------- shape, depth
-     Three radii: a control, a panel, a dialog. One shadow, for the things
-     that float — a dialog, a toast, the sign-in card. */
+  /* Shape and depth: three radii (control, panel, dialog); a pill radius past half the box's shorter side is
+     capped there by the browser, so one large value works for all of them; two shadows and one scrim. */
   --radius-sm: 4px;
   --radius: 6px;
   --radius-lg: 8px;
-  /* A fully rounded end whatever the element's own height — the badge, a
-     meter's fill, a divider's cap, the scrollbar thumb. Each of those used
-     to tune its own radius to half its own height by hand and the four
-     shapes had drifted to four different pixel values (2, 3, 5, 9px); a
-     radius past half the box's shorter side is capped there by the
-     browser, so one large value is a pill on all of them. */
   --radius-pill: 999px;
-  /* Two shadows and one scrim. --shadow-pop lifts a dialog or the sign-in
-     card off the page; --shadow-float is the lighter lift for a toast, a
-     banner or a tooltip. The scrim is what dims the page behind a dialog.
-     There were five hand-written rgba shadows and two scrims at 0.55 and
-     0.6 before these three. */
   --shadow-pop: 0 12px 40px rgba(0, 0, 0, 0.5);
   --shadow-float: 0 6px 20px rgba(0, 0, 0, 0.45);
   --scrim: rgba(0, 0, 0, 0.55);
 
-  /* ------------------------------------------------------------ stacking
-     Every fixed layer, in order, so nothing is ever given a z-index by
-     guessing a number bigger than the last one. */
+  /* Stacking: every fixed layer, in order, so nothing is given a z-index by guessing a bigger number. */
   --z-sticky: 1;      /* table headers, a dialog's top button row */
   --z-divider: 2;     /* pane splitters, over the panes they separate */
   --z-modal: 20;
@@ -247,32 +126,13 @@
   --z-skip: 100;      /* the skip link, when it has focus */
 }
 
-/* ================================================================ themes
-   Every value below is a role from the block above given a new value, and
-   tests/test_design_tokens.py recomputes every contrast pair for each
-   theme exactly as it does for the dark one — light at the same AA floors,
-   high contrast at AAA (7:1 text, 4.5:1 graphics). A theme block must
-   define the full set of surfaces, text tones, structure, emphasis, meaning
-   and selection tokens: a dark tone inherited by accident onto a light
-   ground is invisible, and the test refuses a block that leaves one out.
+/* Themes: each value below is a role from the block above given a new value. A theme block must define the
+   full set of surfaces, text, structure, emphasis, meaning and selection tokens, or a dark tone inherited by
+   accident onto a light ground goes invisible. theme.py (the desktop console) stays on the dark palette. */
 
-   The --canvas-* set is untouched by both: the route canvas is already a
-   light palette measured on white, and it prints. The desktop console
-   (theme.py) stays on the dark palette; it is a service window, not the
-   operator's screen. */
-
-/* High contrast: the same hues, pushed apart. Near-black ground, near-white
-   text at 18.5:1, every tone at least 7:1 as text and 4.5:1 as a line. A
-   white focus ring, because on this ground the accent is a colour and a
-   ring must be a flash. */
+/* High contrast: the same hues, pushed apart — every tone at least 7:1 as text, 4.5:1 as a line. */
 :root[data-theme="contrast"] {
   --bg: #07090C;
-  /* The theme whose whole purpose is separation had the weakest surface
-     separation of the three: --bg to --raised measured 1.09 here against
-     1.18 in both other themes, and --bg to --panel 1.03 against 1.08 — so
-     on the theme an operator picks when they cannot tell things apart,
-     alternate table rows and panel edges were the hardest to. The ladder is
-     now 1.21 and 1.07, at or above the dark theme's own step. */
   --panel: #0E1319;
   --raised: #182029;
   --hairline: #2E3745;
@@ -294,19 +154,9 @@
   --nodata: #161B22;
   --selected: #1A2537;
   --checked: #22314F;
-  /* Was #2F4778, on which the quietest semantic tone measured 3.89:1. This
-     clears AA for every tone that appears as row text and still reads as
-     the strongest of the three tints (1.55 against --raised, where --checked
-     is 1.27), so "ticked and open" stays unmistakable. */
   --checked-strong: #2A3E66;
 
-  /* The route canvas is deliberately a light palette in the other two
-     themes — it is the pane addresses are read off, and it prints. Here it
-     was the same white slab, 1500x540, in a near-black interface: the
-     largest glare source in the product, on the one theme an operator
-     chooses because brightness and low separation are the problem. The
-     canvas follows the theme it is drawn in; the light palette is still
-     what the other two themes use, and still what prints from them. */
+  /* The canvas follows this theme too: a white slab would be the largest glare source on a near-black ground. */
   --canvas: #0E1319;
   --canvas-panel: #182029;
   --canvas-hairline: #2E3745;
@@ -321,21 +171,11 @@
   --canvas-blocked: #FFA07A;
 }
 
-/* Light: the route canvas's palette applied to the chrome. The canvas has
-   been a light theme measured against white since 4.42.0; the surfaces,
-   greys and semantic hues here are its values, with the selection tints
-   and shadows that a light ground needs. The badge fills (--fail, --warn,
-   --accent) carry --bg as their text, so each is dark enough to hold white
-   text AND to read as text on white — the canvas hues already do both. */
+/* Light: the route canvas's palette applied to the chrome. The badge fills (--fail, --warn, --accent) carry
+   --bg as their text, so each is dark enough to hold white text and to read as text on white. */
 :root[data-theme="light"] {
   color-scheme: light;
-  /* The page is tinted and the surfaces climb towards white, which is the
-     conventional light-theme reading and the one this block used to have
-     backwards: with --bg pure white there was no headroom left, so --panel
-     (92.0% luminance) and --raised (84.3%) were both DARKER than the page
-     and every card, tile, dialog and sign-in box read as a recess cut into
-     it rather than as something lifted off it. Nothing else in the product
-     changed — every consumer asks for the role, not the value. */
+  /* Surfaces climb towards white, so a card, tile or dialog reads as lifted off the page, not recessed into it. */
   --bg: #EEF1F5;
   --panel: #F8FAFC;
   --raised: #FFFFFF;
@@ -349,12 +189,6 @@
   --accent: #2F5FC4;
   --accent-hover: #244FA8;
   --focus: #1D4FB8;
-  /* --ok was #1B7F3B and --warn #9A6510, which measured 4.31:1 and 4.21:1 as
-     text on the old --raised — under AA on every alternate row of every
-     table, for "unchanged", "oper up" and the warning severity word. They
-     now measure 7.16:1 and 6.74:1 on --raised. The pair list in
-     tests/test_design_tokens.py only ever checked a semantic tone against
-     --bg, which is why both sat here failing and green. */
   --ok: #146530;
   --warn: #7F520C;
   --fail: #B3261E;

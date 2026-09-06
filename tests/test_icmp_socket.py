@@ -1,19 +1,9 @@
-"""The socket-based ICMP path ipam_scan.ping_once/ping_many use in place of
-one `ping` subprocess per probe (see the module comment in ipam_scan.py
-above _PING_MODE_ENV).
-
-Covers: the checksum and wire framing (build/parse round trip, independent
-of any real network), capability detection falling back to the subprocess
-path when a socket cannot be opened at all, the NETPATH_PING_MODE override
-(the mechanism the demo harness needs to keep its scripted `ping` shim in
-charge), and — where this host actually has ICMP socket access — that a
-real probe still works and that sweep()'s probes-per-second pacing still
-holds when the probe itself is now cheap instead of a subprocess spawn.
-
-A locked-down host with no ICMP socket access at all (no CAP_NET_RAW, no
-ping_group_range) still runs every check here: the ones that need a real
-socket skip individually rather than the whole suite exiting SKIP, since
-the checksum/framing/override checks do not need one.
+"""The socket-based ICMP path ipam_scan.ping_once/ping_many use instead of one
+`ping` subprocess per probe (see ipam_scan.py above _PING_MODE_ENV). Covers the
+checksum and wire framing (build/parse round trip), fallback to the subprocess
+path when no socket can be opened, the NETPATH_PING_MODE override, and, where
+this host has ICMP socket access, a real probe and sweep()'s probes-per-second
+pacing. Checks needing a real socket skip individually, not the whole suite.
 """
 from __future__ import annotations
 

@@ -2641,7 +2641,7 @@ moves its settings, accounts and name cache into it on the first start.
   vendor not in that list, needs a vendor override set to a value on the
   list before it can be backed up, or it's skipped with a clear error.
   This is deliberate: adding a new vendor means adding its fixed,
-  read-only show-command to `configrx_vendors.py`, never accepting one
+  read-only show-command to `configrx.py`'s vendor table, never accepting one
   typed into a field.
 - **ConfigRX never pushes a configuration change, to any device, ever.**
   There is no code path in this module capable of it — no free-form
