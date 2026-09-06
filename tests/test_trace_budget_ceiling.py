@@ -30,12 +30,8 @@ MAX_HOPS, MAX_PROBES, MAX_TIMEOUT_S = 255, 20, 30.0
 windows_worst = tracer.expected_budget(MAX_HOPS, MAX_PROBES, MAX_TIMEOUT_S, parallel=1)
 linux_worst = tracer.expected_budget(MAX_HOPS, MAX_PROBES, MAX_TIMEOUT_S, parallel=16)
 
-# The pre-fix numbers, so a reader (or a future test failure) sees exactly
-# what this used to compute to, not just what it computes to now. Deleting
-# either MAX_EXPECTED_BUDGET_S or the min() around it in tracer.py makes
-# windows_worst come back as uncapped_windows (153,015.0) instead — a
-# concrete, non-vacuous way this test fails without the fix, not merely a
-# re-confirmation of today's passing behaviour.
+# The uncapped values: removing MAX_EXPECTED_BUDGET_S or the min() around it in
+# tracer.py makes windows_worst come back as 153,015 s, so this check fails concretely.
 uncapped_windows = MAX_HOPS * MAX_PROBES * MAX_TIMEOUT_S + 15   # 153,015s
 uncapped_linux = -(-MAX_HOPS // 16) * MAX_PROBES * MAX_TIMEOUT_S + 15  # ceil(255/16)=16 -> 9,615s
 
