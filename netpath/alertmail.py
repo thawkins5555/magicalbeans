@@ -432,8 +432,12 @@ class MailQueue(Worker):
         for a dead relay is a shutdown that appears to hang. The thread is a
         daemon, so an abandoned send cannot keep the process alive.
         """
+        # _thread is cleared first, so a submit() racing this restarts a
+        # worker rather than enqueuing behind one that is exiting.
+        thread, self._thread = self._thread, None
         self._stopping.set()
-        self._join()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
 
     # -------------------------------------------------------------- submit
 
@@ -704,8 +708,10 @@ class WebhookQueue(Worker):
         self._spawn(target=self._run)
 
     def stop(self) -> None:
+        thread, self._thread = self._thread, None
         self._stopping.set()
-        self._join()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
 
     def submit(self, job: WebhookJob) -> bool:
         if not self.running:

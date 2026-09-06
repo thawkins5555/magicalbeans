@@ -104,7 +104,7 @@ class Collector(udpsock.UdpReceiver):
         self._loop_errors += 1
         self._sync_error_counter()
         self._log_throttled("write", f"A batch of flows failed to write: {exc}",
-                            detail=traceback.format_exc())
+                            detail=traceback.format_exc)
 
     # ----------------------------------------------------------------- threads
 

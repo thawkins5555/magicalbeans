@@ -731,8 +731,8 @@ def main() -> int:
     test_empty_passphrase_file_refused()
     test_nonce_never_repeats()
     test_scrypt_parameters_recorded_in_blob()
-    test_real_dpapi_through_the_dhcp_credential_route()
     credential_review_fixes_checks()
+    test_real_dpapi_through_the_dhcp_credential_route()
     reset()
     return 0
 

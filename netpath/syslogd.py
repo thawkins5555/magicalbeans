@@ -155,7 +155,7 @@ class SyslogCollector(udpsock.UdpReceiver):
         # counter itself rather than republished from a per-run total.
         self.counters["errors"] += 1
         self._log_throttled("receive", f"Receive error: {exc}",
-                            detail=traceback.format_exc())
+                            detail=traceback.format_exc)
 
     # ------------------------------------------------------------------ access
 
@@ -240,8 +240,14 @@ class SyslogCollector(udpsock.UdpReceiver):
                 client, address = sock.accept()
             except socket.timeout:
                 continue
-            except OSError:
-                break
+            except OSError as exc:
+                # A peer that reset between SYN and accept, or a brief EMFILE, is
+                # not a reason to end the listener; a closed socket is.
+                if self._stop.is_set() or self._tcp is None:
+                    break
+                self._note_error(exc)
+                time.sleep(0.05)
+                continue
             # One thread per connection with no cap and a list that only ever
             # grew: a device that reconnects per message, or a scanner,
             # exhausted threads and then memory. Dead ones are reaped on every

@@ -128,11 +128,12 @@ where named below.
 **`SqliteStore` (`netpath/sqlitebase.py`)** replaces the copy-pasted open/
 pragma/migrate/close/trim lifecycle duplicated across all ten databases
 (`db`, `flowdb`, `snmptrapdb`, `syslogdb`, `wirelessdb`, `configrxdb`,
-`appdb`, `nodesdb`, `alertsdb`, `ipamdb`). Every database now opens with the
-same pragmas — `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON` —
-which is new only for `netpath.db`, `ipam.db` and `app.db`; every schema
-with a foreign key already ran with them on, so this closes a pragma drift
-rather than changing behaviour.
+`appdb`, `nodesdb`, `alertsdb`, `ipamdb`). Every database opens through one
+`PRAGMAS` tuple: `journal_mode=WAL` and `foreign_keys=ON` everywhere (every
+schema with a foreign key already ran with it on), `synchronous=NORMAL` on
+the seven that set it before, and `synchronous=FULL` kept on `netpath.db`,
+`ipam.db` and `app.db`, which never lowered it. No database changes
+durability.
 
 **`UdpReceiver` (`netpath/udpsock.py`)** replaces the pasted-in receive-loop
 plumbing in the NetFlow collector, the SNMP trap receiver and the syslog

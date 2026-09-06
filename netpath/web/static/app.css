@@ -1416,6 +1416,7 @@ body.login-page {
    to hint text. Dimmer only so the port stays the subject of the dialog. */
 .modal-box h2 .ifd-parent { color: var(--muted); font-weight: 600; }
 .modal-box .row { justify-content: flex-end; margin-top: 14px; }
+.modal-box .row.start { justify-content: flex-start; }
 .modal-box .row.top {
   margin: 0 0 var(--space-md);
   padding-bottom: var(--space-md);

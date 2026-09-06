@@ -166,6 +166,8 @@ def _clamp_target_fields(fields: dict) -> dict:
 
 
 class Database(SqliteStore):
+    # Durability kept at SQLite's default: these rows must survive a power loss.
+    PRAGMAS = ("journal_mode=WAL", "synchronous=FULL", "foreign_keys=ON")
     SCHEMA = SCHEMA
     DEFAULTS = APP_DEFAULTS
     LABEL = "netpath.db"

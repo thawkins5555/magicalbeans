@@ -195,6 +195,8 @@ DEFAULTS = {
 
 
 class IpamDatabase(SqliteStore):
+    # Durability kept at SQLite's default: these rows must survive a power loss.
+    PRAGMAS = ("journal_mode=WAL", "synchronous=FULL", "foreign_keys=ON")
     SCHEMA = SCHEMA
     DEFAULTS = DEFAULTS
     LABEL = "ipam.db"

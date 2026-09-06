@@ -212,9 +212,9 @@ forget one. `SqliteStore.__init__` then runs, under the store's own `RLock`
 (every database now uses an `RLock`, where some previously used a plain
 `Lock`; `check_same_thread=False` lets any worker thread use the connection
 directly, so something has to serialise them): the uniform `PRAGMAS` —
-`journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, the same three
-on every database, where three of the ten (`netpath.db`, `ipam.db`,
-`app.db`) previously ran `synchronous=FULL` — then `_before_schema()`
+`journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON` by default;
+`netpath.db`, `ipam.db` and `app.db` override the tuple to keep
+`synchronous=FULL`, as they always had — then `_before_schema()`
 (appdb's hook to read the file as it was before `SCHEMA` runs),
 `enable_incremental_vacuum()` (see below), the class's own `SCHEMA` string
 of `CREATE TABLE IF NOT EXISTS` statements, `_migrate()`, a commit, and

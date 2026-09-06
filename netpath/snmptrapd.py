@@ -123,7 +123,7 @@ class TrapCollector(udpsock.UdpReceiver):
         # counter itself rather than republished from a per-run total.
         self.counters["errors"] += 1
         self._log_throttled("receive", f"Receive error: {exc}",
-                            detail=traceback.format_exc())
+                            detail=traceback.format_exc)
 
     # ------------------------------------------------------------------ access
 

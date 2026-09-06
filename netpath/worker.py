@@ -72,8 +72,13 @@ class Worker:
         self._thread.start()
 
     def _join(self, timeout: float = 2.0) -> None:
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=timeout)
+        """Wait for the loop to end. A thread that outlives the timeout stays
+        attached, so running() is honest and start() cannot spawn a second."""
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                return
         self._thread = None
 
     def _bump(self, key: str, by: int = 1) -> None:

@@ -225,6 +225,7 @@ class UdpReceiver:
         self.log = log or NullLog()
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
+        self._lingering: list[threading.Thread] = []
         self._udp: socket.socket | None = None
         self._tcp: socket.socket | None = None
         self._queue: queue.Queue = queue.Queue(maxsize=self.QUEUE_SIZE)
@@ -255,6 +256,11 @@ class UdpReceiver:
         return bool(self._threads) and all(t.is_alive() for t in self._threads)
 
     def _reset_for_start(self) -> None:
+        # A thread stop() gave up on must end before _stop is cleared, or it
+        # would wake up and run beside the ones start() is about to spawn.
+        for thread in self._lingering:
+            thread.join(timeout=30)
+        self._lingering = [t for t in self._lingering if t.is_alive()]
         self.error = None
         self._crash = None
         self._loop_errors = 0
@@ -325,6 +331,7 @@ class UdpReceiver:
         for thread in self._threads:
             if thread.is_alive():
                 thread.join(timeout=2)
+        self._lingering += [t for t in self._threads if t.is_alive()]
         self._threads = []
         self.bound = None
 
@@ -363,14 +370,17 @@ class UdpReceiver:
                                 "raise net.core.rmem_max to at least that "
                                 "value.")
 
-    def _log_throttled(self, key: str, message: str, detail: str = "",
+    def _log_throttled(self, key: str, message: str, detail="",
                        target: str = "", interval_s: float = 60.0) -> bool:
         """Log one line per `key` per interval, so a flood of anything cannot
-        fill the event log. True when this call did log."""
+        fill the event log. True when this call did log. `detail` may be a
+        callable, evaluated only when the line is logged."""
         now = time.time()
         if now - self._log_times.get(key, 0.0) < interval_s:
             return False
         self._log_times[key] = now
+        if callable(detail):
+            detail = detail()
         self.log.add(ERROR, message, target=target, detail=detail)
         return True
 
@@ -385,7 +395,7 @@ class UdpReceiver:
         self._loop_errors += 1
         self._sync_error_counter()
         self._log_throttled("receive", f"Receive error: {exc}",
-                            detail=traceback.format_exc())
+                            detail=traceback.format_exc)
 
     # ----------------------------------------------------------------- threads
 
@@ -395,6 +405,10 @@ class UdpReceiver:
             try:
                 data, address = sock.recvfrom(65535)
             except socket.timeout:
+                continue
+            except ConnectionResetError:
+                # Windows reports an ICMP port-unreachable for a datagram this
+                # socket sent (an inform ack) as a reset on the next recvfrom.
                 continue
             except OSError:
                 break
