@@ -902,9 +902,11 @@
           : App.credentialUnavailableHtml('An SSH password')}
         <p class="hint">Stored encrypted; never shown again once saved. ConfigRX only ever
           runs one fixed, read-only "show config" command for this device's vendor — there
-          is no way to run any other command from here. The enable secret is only needed for
-          a platform whose login lands in user EXEC rather than privileged mode — currently
-          just Cisco ASA — and is saved only together with the SSH password above.</p>
+          is no way to run any other command from here. The enable secret is only needed
+          when this account's login lands in user EXEC rather than privileged mode — Cisco
+          IOS/IOS-XE, NX-OS, IOS-XR, SG/CBS, ASA and Rockwell Stratix all carry that step
+          when applicable, and everything else ignores it — and is saved only together
+          with the SSH password above.</p>
       </fieldset>
       <fieldset><legend>HOST KEY</legend>
         <div id="cx-hostkey">${App.loading()}</div>

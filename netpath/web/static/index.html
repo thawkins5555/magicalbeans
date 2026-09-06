@@ -34,10 +34,10 @@
   <button class="tab" data-tab="alerts">ALERTS<span id="alerts-tab-badge" class="badge" hidden></span></button>
   <button class="tab tab--group-start" data-tab="nodes" data-group-start>NODES</button>
   <button class="tab" data-tab="ipam">IPAM</button>
-  <!-- FORTIWIRELESS, not WIRELESS: support is FortiGate-only
+  <!-- FORTI-AP, not WIRELESS: support is FortiGate-only
        (netpath/wirelessdb.py polls the FORTINET-FORTIGATE-MIB). -->
-  <button class="tab" data-tab="wireless">FORTIWIRELESS</button>
-  <button class="tab tab--proper" data-tab="configrx">ConfigRX</button>
+  <button class="tab" data-tab="wireless">FORTI-AP</button>
+  <button class="tab" data-tab="configrx">CONFIGRX</button>
   <button class="tab tab--group-start" data-tab="netpath" data-group-start>ROUTES</button>
   <button class="tab" data-tab="netflow">NETFLOW</button>
   <button class="tab" data-tab="syslog">SYSLOG</button>
@@ -112,7 +112,6 @@
 
   <nav class="subtabs">
     <button class="subtab active" data-subtab="devices">DEVICES</button>
-    <button class="subtab" data-subtab="topology">TOPOLOGY</button>
     <button class="subtab" data-subtab="discovery">DISCOVERY</button>
     <button class="subtab" data-subtab="profiles">PROFILES &amp; MIBS</button>
     <button class="subtab" data-subtab="reports">REPORTS</button>
@@ -189,11 +188,11 @@
                  write means "may back this device up", far narrower than an
                  interactive shell. -->
             <button id="nd-ssh-device" data-requires-write="ssh">SSH</button>
+            <!-- Opens the device's own web UI in a new tab, set by nodes.js
+                 from the selected device's IP. No write gate: unlike SSH it
+                 opens nothing on this server. -->
+            <button id="nd-web-device" hidden>WEB</button>
             <span id="nd-ssh-help" data-requires-write="ssh"></span>
-            <!-- A plain outbound link to the device's own web UI, set by
-                 nodes.js from the selected device's IP. No write gate:
-                 unlike SSH it opens nothing on this server. -->
-            <a id="nd-web-device" class="linkish" target="_blank" rel="noopener" hidden>WEB</a>
           </div>
           <div id="nd-d-summary" class="nd-summary"></div>
           <!-- The status timeline has its own range picker: "how long has
@@ -240,28 +239,6 @@
           </div>
         </div>
       </aside>
-    </div>
-  </div>
-
-  <div id="nodes-sub-topology" class="subpage">
-    <div class="bar wrap">
-      <span class="section">L2 TOPOLOGY</span>
-      <span id="nd-topo-count" class="hint"></span>
-      <span class="grow"></span>
-      <span class="hint">Scroll to zoom, drag to pan, click a device to open it</span>
-      <button id="nd-topo-zoom-out" aria-label="Zoom out">−</button>
-      <button id="nd-topo-zoom-in" aria-label="Zoom in">+</button>
-      <button id="nd-topo-reset">Reset view</button>
-      <button id="nd-topo-export-csv">Export CSV</button>
-    </div>
-    <div class="bar wrap">
-      <span class="hint"><svg width="14" height="10" class="dot-inline"><circle cx="5" cy="5" r="4" fill="var(--ok)"></circle></svg> up
-        &nbsp;<svg width="14" height="10" class="dot-inline"><circle cx="5" cy="5" r="4" fill="var(--fail)"></circle></svg> down
-        &nbsp;<svg width="14" height="10" class="dot-inline"><circle cx="5" cy="5" r="4" fill="var(--line)"></circle></svg> unknown/unidentified
-        &nbsp;&mdash; a dashed box is a neighbour nothing in Nodes could be matched to.</span>
-    </div>
-    <div id="nd-topo-canvas" class="canvas chart canvas-tall">
-      <svg id="nd-topo-svg"></svg>
     </div>
   </div>
 
@@ -816,8 +793,8 @@
         <span class="section">SCOPES</span>
         <span class="grow"></span>
         <select id="ipam-scope-sort" aria-label="Sort scopes by">
-          <option value="least" selected>Sort: Least available</option>
-          <option value="most">Sort: Most available</option>
+          <option value="least" selected>Sort: Least available (%)</option>
+          <option value="most">Sort: Most available (%)</option>
           <option value="name">Sort: Name</option>
           <option value="ip">Sort: IP address</option>
         </select>
@@ -1102,7 +1079,7 @@
     <button class="subtab" data-subtab="retention">DATA &amp; RETENTION</button>
     <button class="subtab" data-subtab="signin">SIGN-IN</button>
     <button class="subtab" data-subtab="users">USERS</button>
-    <button class="subtab" data-subtab="directory">TOKENS &amp; DIRECTORY</button>
+    <button class="subtab" data-subtab="directory">TOKENS</button>
     <button class="subtab" data-subtab="maintenance">MAINTENANCE</button>
     <button class="subtab" data-subtab="modules">MODULES</button>
     <button class="subtab" data-subtab="audit">AUDIT</button>
@@ -1221,6 +1198,41 @@
         regardless of activity. Changing either applies to every session at the next check, not
         only new ones.</p>
     </fieldset>
+
+    <fieldset data-requires-write="admin">
+      <legend>DIRECTORY (LDAP)</legend>
+      <p class="hint">Lets accounts created below with "Sign in via LDAP directory" verify their
+        password against a directory server instead of a locally stored one. Local accounts are
+        unaffected either way, and stay available as a fallback — which is also why the last
+        local administrator can never be removed while only directory administrators remain (see
+        the USERS section below).</p>
+      <label class="check"><input type="checkbox" id="set-ldap-enabled"> Enable LDAP sign-in</label>
+      <label>Directory URL <input id="set-ldap-url" placeholder="ldaps://dc.example.com:636" size="34"></label>
+      <label>Bind DN template
+        <input id="set-ldap-template" placeholder="uid={username},ou=people,dc=example,dc=com" size="46"></label>
+      <p class="hint"><code>{username}</code> is replaced with the account's username, which may
+        only contain letters, digits, dot, dash and underscore — the same rule every username in
+        this application already follows — so nothing typed at sign-in can change which entry the
+        bind targets.</p>
+      <label class="check"><input type="checkbox" id="set-ldap-cleartext">
+        Allow sending the password without TLS (ldap:// only)</label>
+      <p class="hint">Off by default. A simple bind sends the password inside the request itself
+        — without TLS (an <code>ldaps://</code> URL) that is in the clear on the wire, and this
+        client refuses to do it until this is switched on. Prefer <code>ldaps://</code> instead of
+        turning this on wherever the directory supports it.</p>
+      <label>Connection timeout <input type="number" id="set-ldap-timeout" min="1" max="120" step="1"> s</label>
+      <div class="row gap-t-sm">
+        <button id="ldap-apply" data-requires-write="admin">Save directory settings</button>
+      </div>
+      <p class="hint" id="ldap-status"></p>
+      <div class="row gap-t-sm">
+        <input id="ldap-test-username" placeholder="test username" size="16" aria-label="Test username">
+        <input id="ldap-test-password" type="password" placeholder="test password" size="18" aria-label="Test password">
+        <button id="ldap-test" type="button" data-requires-write="admin">Test connection</button>
+      </div>
+      <p class="hint" id="ldap-test-status">Tests a bind against the settings above (or the saved
+        ones, for any left blank) without saving anything or creating a session.</p>
+    </fieldset>
     </div>
 
     <div id="settings-sub-users" class="subpage scroll">
@@ -1267,41 +1279,6 @@
     </div>
 
     <div id="settings-sub-directory" class="subpage scroll">
-    <fieldset data-requires-write="admin">
-      <legend>DIRECTORY (LDAP)</legend>
-      <p class="hint">Lets accounts created below with "Sign in via LDAP directory" verify their
-        password against a directory server instead of a locally stored one. Local accounts are
-        unaffected either way, and stay available as a fallback — which is also why the last
-        local administrator can never be removed while only directory administrators remain (see
-        the USERS section below).</p>
-      <label class="check"><input type="checkbox" id="set-ldap-enabled"> Enable LDAP sign-in</label>
-      <label>Directory URL <input id="set-ldap-url" placeholder="ldaps://dc.example.com:636" size="34"></label>
-      <label>Bind DN template
-        <input id="set-ldap-template" placeholder="uid={username},ou=people,dc=example,dc=com" size="46"></label>
-      <p class="hint"><code>{username}</code> is replaced with the account's username, which may
-        only contain letters, digits, dot, dash and underscore — the same rule every username in
-        this application already follows — so nothing typed at sign-in can change which entry the
-        bind targets.</p>
-      <label class="check"><input type="checkbox" id="set-ldap-cleartext">
-        Allow sending the password without TLS (ldap:// only)</label>
-      <p class="hint">Off by default. A simple bind sends the password inside the request itself
-        — without TLS (an <code>ldaps://</code> URL) that is in the clear on the wire, and this
-        client refuses to do it until this is switched on. Prefer <code>ldaps://</code> instead of
-        turning this on wherever the directory supports it.</p>
-      <label>Connection timeout <input type="number" id="set-ldap-timeout" min="1" max="120" step="1"> s</label>
-      <div class="row gap-t-sm">
-        <button id="ldap-apply" data-requires-write="admin">Save directory settings</button>
-      </div>
-      <p class="hint" id="ldap-status"></p>
-      <div class="row gap-t-sm">
-        <input id="ldap-test-username" placeholder="test username" size="16" aria-label="Test username">
-        <input id="ldap-test-password" type="password" placeholder="test password" size="18" aria-label="Test password">
-        <button id="ldap-test" type="button" data-requires-write="admin">Test connection</button>
-      </div>
-      <p class="hint" id="ldap-test-status">Tests a bind against the settings above (or the saved
-        ones, for any left blank) without saving anything or creating a session.</p>
-    </fieldset>
-
     <fieldset data-requires-write="admin">
       <legend>API TOKENS</legend>
       <p class="hint">A token authenticates automation the same way a signed-in session
@@ -1410,6 +1387,7 @@
     <span class="grow"></span>
     <button id="set-revert" data-requires-write="settings">Revert</button>
     <button id="set-apply" class="primary" data-requires-write="settings">Apply changes</button>
+    <span id="set-apply-status" class="hint" role="status" aria-live="polite"></span>
   </div>
 </section>
 </main>

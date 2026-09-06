@@ -283,6 +283,16 @@ RF_METRICS = {
          "1.3.6.1.4.1.17713.21.1.2.4.0", "scalar"),
     ),
 }
+# This table is keyed by enterprise arc, but a NanoBeam/NanoStation/etc.
+# airOS radio answers sysObjectID under arc 10002 (Frogfoot's PEN, reused by
+# airOS — see enterprises.py's matching comment on that arc), not 41112 —
+# while the scalar OIDs it actually implements are still the 41112 ones
+# above, because that arc names Ubiquiti's real MIB, not its sysObjectID.
+# identity["vendor_arc"] (what nodepoll._poll_rf_metrics keys this dict by)
+# is therefore 10002 for one of these radios, and would find nothing here
+# without this second entry — same tuple object, not a copy, so the two
+# stay identical by construction rather than by two edits agreeing.
+RF_METRICS[10002] = RF_METRICS[41112]
 
 # Enterprise arcs RF_METRICS covers — the gate that keeps the RF read off
 # every non-radio device's poll, named separately so nodepoll doesn't
@@ -480,6 +490,22 @@ SYSDESCR_VENDORS: tuple[tuple[str, str], ...] = (
     ("procurve", "hp"),
     ("aruba", "aruba"),
     ("ubiquiti", "ubiquiti"),
+    # airOS/UniFi lines rarely say "Ubiquiti" in sysDescr itself (typically
+    # "Linux NanoBeam 5AC ..." or "Linux UBNT ..." — see enterprises.py's
+    # arc-10002 entry for why sysObjectID alone often can't tell either).
+    # Each of these model/product-family words is specific enough on its own
+    # to name the vendor without the word "ubiquiti" anywhere in the string.
+    ("ubnt", "ubiquiti"),
+    ("airos", "ubiquiti"),
+    ("nanobeam", "ubiquiti"),
+    ("nanostation", "ubiquiti"),
+    ("litebeam", "ubiquiti"),
+    ("powerbeam", "ubiquiti"),
+    ("airmax", "ubiquiti"),
+    ("airfiber", "ubiquiti"),
+    ("edgeos", "ubiquiti"),
+    ("edgerouter", "ubiquiti"),
+    ("unifi", "ubiquiti"),
     ("mikrotik", "mikrotik"),
     ("routeros", "mikrotik"),
     ("fortigate", "fortinet"),

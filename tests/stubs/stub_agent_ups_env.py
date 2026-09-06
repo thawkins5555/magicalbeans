@@ -40,6 +40,20 @@ Modes:
              is a dedicated environmental monitor, so it must land in
              temp_chassis_c, never temp_ambient_c -- the "cannot be
              determined must not silently become ambient" case.
+  hardware   `sensors`' four entities plus a fifth (#5, a bias-current
+             reading) reached only through entPhysicalContainedIn -- #5 has
+             no entAliasMappingIdentifier row of its own, only a containment
+             pointer to #1 (which does), the read_hardware/read_dom_all
+             chain-resolution case _entity_port_map exists for. Entity #1
+             also gets an entPhysicalName distinct from its
+             entPhysicalDescr, so read_hardware's name preference (and
+             read_dom's indifference to it) can both be checked from the
+             same walk. Adds CISCO-ENVMON-MIB: one supply row (normal), one
+             fan row (warning), one temperature row (critical, with a
+             threshold) -- a Cisco sysObjectID, so the vendor gate in
+             read_hardware would pass were it driven by sysObjectID alone
+             (tests still set vendor_detected directly; a full identify
+             walk is not this stub's job).
 
 Two control datagrams, on the same socket as SNMP itself (see
 stub_agent_fdb.py, which established this convention):
@@ -66,6 +80,12 @@ GENERIC_SCALARS = {
 }
 APC_SCALARS = {**GENERIC_SCALARS,
                "1.3.6.1.2.1.1.2.0": ("str", "1.3.6.1.4.1.318.1.1.1")}
+# Enterprise arc 9 (Cisco) sysObjectID, for the "hardware" mode -- the tests
+# against it set vendor_detected on the device row directly rather than
+# running a full identify walk, so this is here only so the mode looks like
+# a real Cisco agent's scalar batch, not because anything reads it back.
+CISCO_SCALARS = {**GENERIC_SCALARS,
+                 "1.3.6.1.2.1.1.2.0": ("str", "1.3.6.1.4.1.9.1.1")}
 
 # ----------------------------------------------------------------- UPS-MIB
 UPS_TABLE = {
@@ -147,6 +167,43 @@ _DROP_ENTITY_2 = (
 SENSOR_TABLE_NO_HUMIDITY = {oid: value for oid, value in SENSOR_TABLE.items()
                            if oid not in _DROP_ENTITY_2}
 
+# ------------------------------------------- read_hardware / read_dom_all
+# Entity 5: a bias-current reading with NO entAliasMappingIdentifier row of
+# its own -- only entPhysicalContainedIn pointing at entity 1, which IS
+# aliased to ifIndex 1. Proves the containment-chain resolution
+# _entity_port_map does (read_dom's own inline walk-up, generalised) reaches
+# a sensor mounted on a port-mapped entity rather than aliased directly.
+# Entity 1 also gets an entPhysicalName distinct from its entPhysicalDescr,
+# so read_hardware's name preference can be told apart from read_dom's
+# indifference to this column (read_dom never walks it).
+HARDWARE_TABLE = {
+    **SENSOR_TABLE,
+    "1.3.6.1.2.1.47.1.1.1.1.7.1": ("str", "Gi0/1 SFP module"),   # entPhysicalName, entity 1
+
+    "1.3.6.1.2.1.47.1.1.1.1.2.5": ("str", "Xcvr bias current"),  # entPhysicalDescr
+    "1.3.6.1.2.1.99.1.1.1.1.5": ("int", 5),     # #5 type: amperes
+    "1.3.6.1.2.1.99.1.1.1.2.5": ("int", 9),     # #5 scale: units
+    "1.3.6.1.2.1.99.1.1.1.3.5": ("int", 0),     # #5 precision: 0
+    "1.3.6.1.2.1.99.1.1.1.4.5": ("int", 35),    # #5 value: 35 A
+    "1.3.6.1.2.1.99.1.1.1.5.5": ("int", 1),     # #5 status: ok
+    "1.3.6.1.2.1.47.1.1.1.1.4.5": ("int", 1),   # entPhysicalContainedIn: 5 -> 1
+}
+
+# CISCO-ENVMON-MIB (1.3.6.1.4.1.9.9.13): one row each of supply/fan/
+# temperature status, the three enum-driven tables read_hardware's
+# _read_cisco_envmon walks. State enum: 1 normal, 2 warning, 3 critical,
+# 4 shutdown, 5 notPresent, 6 notFunctioning.
+CISCO_ENVMON_TABLE = {
+    "1.3.6.1.4.1.9.9.13.1.5.1.2.1": ("str", "PSU 1"),
+    "1.3.6.1.4.1.9.9.13.1.5.1.3.1": ("int", 1),        # normal
+    "1.3.6.1.4.1.9.9.13.1.4.1.2.1": ("str", "Fan tray 1"),
+    "1.3.6.1.4.1.9.9.13.1.4.1.3.1": ("int", 2),        # warning
+    "1.3.6.1.4.1.9.9.13.1.3.1.2.1": ("str", "Hot spot"),
+    "1.3.6.1.4.1.9.9.13.1.3.1.3.1": ("int", 55),       # value: 55 C
+    "1.3.6.1.4.1.9.9.13.1.3.1.4.1": ("int", 70),       # threshold: 70 C
+    "1.3.6.1.4.1.9.9.13.1.3.1.6.1": ("int", 3),        # critical
+}
+
 MODE = "ups"
 
 
@@ -161,6 +218,8 @@ def table_for():
         return {**GENERIC_SCALARS, **SENSOR_TABLE}
     if MODE == "sensors_no_humidity":
         return {**GENERIC_SCALARS, **SENSOR_TABLE_NO_HUMIDITY}
+    if MODE == "hardware":
+        return {**CISCO_SCALARS, **HARDWARE_TABLE, **CISCO_ENVMON_TABLE}
     return dict(GENERIC_SCALARS)
 
 

@@ -1620,7 +1620,8 @@ end
           served_vendors is not None
           and all(set(entry) == {"key", "label"} for entry in served_vendors),
           served_vendors)
-    check("D19 …all eleven vendor keys are present",
+    check("D19 …every vendor key in configrx.VENDORS is present, none dropped "
+          "or added in translation",
           served_vendors is not None
           and {entry["key"] for entry in served_vendors} == set(configrx.VENDORS),
           served_vendors)

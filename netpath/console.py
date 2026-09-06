@@ -210,7 +210,6 @@ class ConsoleWindow(QMainWindow):
 
         layout.addWidget(self._status_card())
         layout.addWidget(self._listener_card())
-        layout.addWidget(self._collectors_card())
         layout.addWidget(self._storage_card())
 
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -380,18 +379,6 @@ class ConsoleWindow(QMainWindow):
         outer.addWidget(self.listener_hint)
         return card
 
-    def _collectors_card(self) -> QFrame:
-        card = QFrame()
-        card.setObjectName("card")
-        outer = QVBoxLayout(card)
-        outer.setContentsMargins(14, 10, 14, 10)
-        outer.addWidget(section("Collectors"))
-        self.collectors_label = QLabel("")
-        self.collectors_label.setObjectName("stat")
-        self.collectors_label.setWordWrap(True)
-        outer.addWidget(self.collectors_label)
-        return card
-
     # -------------------------------------------------------------- actions
 
     def _storage_card(self) -> QFrame:
@@ -557,7 +544,6 @@ class ConsoleWindow(QMainWindow):
               "except the login page itself."
             + (f"  Last error: {self.server.error}" if self.server.error else ""))
 
-        self._refresh_collectors()
         self._refresh_storage()
         self._fill_clients(snapshot)
         self._fill_requests(snapshot)
@@ -579,23 +565,6 @@ class ConsoleWindow(QMainWindow):
             self.output_view.verticalScrollBar().setValue(
                 self.output_view.verticalScrollBar().maximum())
         self.output_hint.setText(f"{count} line(s)")
-
-    def _refresh_collectors(self) -> None:
-        service = self.service
-        names = service.hostname_stats()
-        parts = [
-            f"NetPath   {'running' if service.monitor.running else 'stopped'} \u00b7 "
-            f"{len(service.db.targets())} destinations \u00b7 "
-            f"{service.monitor.workers} workers",
-            f"NetFlow   {service.collector.status_text()}",
-            f"SNMP      {service.snmp.status_text()}",
-            f"Syslog    {service.syslog.status_text()}",
-            f"Nodes     {service.node_poller.status_text()}",
-            f"Alerts    {service.alert_engine.status_text()}",
-            f"DNS       {names['named']}/{names['cached']} named"
-            + (f", {names['pending']} pending" if names["pending"] else ""),
-        ]
-        self.collectors_label.setText("\n".join(parts))
 
     def _fill_clients(self, snapshot: dict) -> None:
         """The CLIENT_ROWS most recently seen clients, redrawn only when

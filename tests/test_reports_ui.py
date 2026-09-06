@@ -50,8 +50,8 @@ check('data-subtab="reports"' in NODES_SECTION and 'id="nodes-sub-reports"' in N
 TOP_NAV = NODES_SECTION[NODES_SECTION.index('<nav class="subtabs">'):
                          NODES_SECTION.index('</nav>')]
 check(re.findall(r'data-subtab="(\w+)"', TOP_NAV)
-      == ["devices", "topology", "discovery", "profiles", "reports"],
-      "REPORTS is a fifth top-level Nodes subtab, after Profiles & MIBs, "
+      == ["devices", "discovery", "profiles", "reports"],
+      "REPORTS is a fourth top-level Nodes subtab, after Profiles & MIBs, "
       "not a nested view mistaken for one")
 
 # ---------------------------------------------------------------------------

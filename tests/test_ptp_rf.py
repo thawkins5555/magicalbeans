@@ -103,8 +103,10 @@ config = db.effective_config(device)
 metrics = poller._poll_rf_metrics(device, config, {"vendor_arc": 9})
 check("a non-radio vendor arc is never walked (no RF_METRICS entry, no request sent)",
       metrics == [], metrics)
-check("RF_METRICS itself only names the two radio arcs this plan covers",
-      set(nodeoids.RF_METRICS) == {41112, 17713}, set(nodeoids.RF_METRICS))
+check("RF_METRICS itself only names the radio arcs this plan covers -- Ubiquiti's "
+      "own PEN (41112), Cambium's (17713), and Frogfoot's (10002, reused by "
+      "airOS and aliased here to 41112's own probes -- see nodeoids.py's comment)",
+      set(nodeoids.RF_METRICS) == {41112, 17713, 10002}, set(nodeoids.RF_METRICS))
 db.close()
 
 print()

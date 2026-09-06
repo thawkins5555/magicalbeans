@@ -545,6 +545,55 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
     return `${before.sort} -> ${after.sort}`;
   });
 
+  await check('a hand-built table (not the shared grid) sorts too', async () => {
+    // Debug's worker tables are plain markup a module built for itself —
+    // no App.grid involved — and the ones this pass wired up rather than
+    // #dbg-workers itself, whose live "elapsed" column is rewritten every
+    // beat by fastTick and would make a post-sort comparison flaky for
+    // reasons that have nothing to do with sorting.
+    await selectTab(page, 'debug');
+    await settle(page, 900);
+    const before = await page.evaluate(() => {
+      const table = document.getElementById('dbg-nodes');
+      const th = table && [...table.querySelectorAll('thead th')]
+        .find((t) => t.classList.contains('sortable'));
+      return {
+        present: Boolean(table),
+        grid: table ? table.classList.contains('grid') : null,
+        sortable: Boolean(th),
+        role: th ? th.getAttribute('role') : null,
+        focusable: th ? th.tabIndex === 0 : null,
+        ariaSort: th ? th.getAttribute('aria-sort') : null,
+      };
+    });
+    assert(before.present, '#dbg-nodes did not render');
+    assert(before.grid === false, '#dbg-nodes unexpectedly carries the shared grid class');
+    assert(before.sortable,
+           '#dbg-nodes has no sortable header — the document-level hand-table hook did not reach it');
+    assert(before.role === 'columnheader', 'a hand-built sortable header has no role="columnheader"');
+    assert(before.focusable, 'a hand-built sortable header is not keyboard-focusable');
+    assert(before.ariaSort === 'none', `expected aria-sort="none" before any click, found ${before.ariaSort}`);
+    await page.click('#dbg-nodes thead th.sortable');
+    const clicked = await page.evaluate(() => {
+      const th = document.querySelector('#dbg-nodes thead th.sortable');
+      return th.getAttribute('aria-sort');
+    });
+    assert(clicked === 'ascending' || clicked === 'descending',
+           `clicking a hand-built header left aria-sort as ${clicked}`);
+    // Debug polls at least every couple of seconds; this table's own
+    // renderer (drawWorkerTable) rebuilds the whole header and body from
+    // scratch on every one of those ticks, in the server's own order — the
+    // one moment a click-driven sort with no memory behind it would be lost.
+    await sleep(4000);
+    const survived = await page.evaluate(() => {
+      const th = document.querySelector('#dbg-nodes thead th.sortable');
+      return th ? th.getAttribute('aria-sort') : null;
+    });
+    assert(survived === clicked,
+           `#dbg-nodes' sort did not survive its own refresh redraw (was ${clicked}, now ${survived})`);
+    return `#dbg-nodes sorts (${clicked}) and survives a redraw`;
+  });
+
   await check('the status timeline is textured and keyboard reachable (E3)',
     async () => {
       await selectTab(page, 'nodes');
@@ -669,19 +718,22 @@ async function checkDialog(page, dir, tag) {
 
   await closeAnything(page);
 
-  await check('the WEB link on a selected device points at http://<ip>/', async () => {
+  await check('the WEB button on a selected device points at http://<ip>/', async () => {
     await selectTab(page, 'nodes');
     await settle(page, 900);
     await page.waitForSelector('#nodes-table tbody tr', { timeout: 20000 });
     await page.click('#nodes-table tbody tr:first-child');
     await sleep(500);
     const web = await page.evaluate(() => {
+      // A <button>, not an <a>: the target URL is stashed in a data
+      // attribute and opened on click (nodes.js drawWebLink/wiring), so it
+      // matches SSH's styling instead of looking like a link.
       const el = document.getElementById('nd-web-device');
-      return { hidden: el ? el.hidden : true, href: el ? el.getAttribute('href') : null };
+      return { hidden: el ? el.hidden : true, url: el ? el.dataset.url : null };
     });
-    assert(!web.hidden, 'the WEB link stayed hidden with a device selected');
-    assert(web.href && web.href.startsWith('http://'), `href was ${web.href}`);
-    return web.href;
+    assert(!web.hidden, 'the WEB button stayed hidden with a device selected');
+    assert(web.url && web.url.startsWith('http://'), `url was ${web.url}`);
+    return web.url;
   });
 
   await check('a discovery result for an already-added IP is not checkable', async () => {
@@ -786,17 +838,17 @@ async function checkRouting(page, base, dir, tag) {
   /* A device selection routed to #/nodes/device/<id> and survived a
      reload, but switching to a top-level subtab left the URL unchanged, so
      the URL described a screen that was not on screen and Back restored a
-     pane the history entry never named (Phase 6). Nodes' TOPOLOGY subtab
-     exercises the fix: clicking it now writes #/nodes/topology, and a cold
-     reload of that URL lands back on TOPOLOGY, not on whatever DEVICES
+     pane the history entry never named (Phase 6). Nodes' DISCOVERY subtab
+     exercises the fix: clicking it now writes #/nodes/discovery, and a cold
+     reload of that URL lands back on DISCOVERY, not on whatever DEVICES
      left in localStorage. */
   await check('a subtab route survives a reload', async () => {
     await selectTab(page, 'nodes');
     await settle(page, 900);
-    await page.click('#page-nodes > .subtabs > [data-subtab="topology"]');
+    await page.click('#page-nodes > .subtabs > [data-subtab="discovery"]');
     await sleep(600);
     const subtabHash = await page.evaluate(() => window.location.hash);
-    assert(subtabHash === '#/nodes/topology', `hash is "${subtabHash}"`);
+    assert(subtabHash === '#/nodes/discovery', `hash is "${subtabHash}"`);
     await page.reload({ waitUntil: 'domcontentloaded' });
     await ready(page);
     await sleep(2500);
@@ -808,8 +860,8 @@ async function checkRouting(page, base, dir, tag) {
     }));
     assert(state.hash === subtabHash, `hash became "${state.hash}", was "${subtabHash}"`);
     assert(state.tab === 'nodes', `landed on the ${state.tab} tab`);
-    assert(state.active && state.active.subtab === 'topology',
-           `the active subtab is "${state.active && state.active.subtab}", not topology`);
+    assert(state.active && state.active.subtab === 'discovery',
+           `the active subtab is "${state.active && state.active.subtab}", not discovery`);
     // Leave Nodes the way every other check here found it.
     await page.click('#page-nodes > .subtabs > [data-subtab="devices"]').catch(() => {});
     await sleep(400);

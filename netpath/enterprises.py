@@ -174,6 +174,25 @@ CURATED: dict[int, tuple[str, str]] = {
     # instead, which most current models do, already gets full
     # temperature/humidity support without this.
     20916: ("avtech", "AVTECH Software (Room Alert)"),
+    # NOT Ubiquiti's own PEN -- 10002 belongs to Frogfoot Networks, but
+    # Ubiquiti's airOS (airMAX/airFiber M-series and AC radios: NanoBeam,
+    # NanoStation, LiteBeam, PowerBeam, airFiber) answers sysObjectID under
+    # this arc anyway, apparently because airOS reuses a Frogfoot agent
+    # build rather than shipping its own sysObjectID root. Ubiquiti's real
+    # arc (41112, VERIFIED above) is where these radios' own scalar OIDs
+    # still live -- see nodeoids.RF_METRICS' matching comment -- so this
+    # entry exists only to name the device, not to describe its MIB.
+    # Deliberately the SAME display name as 41112's, not a distinguishing
+    # one: display_name()/_DISPLAY below key off the vendor string alone and
+    # pick whichever of a duplicated key's entries it meets first, so a
+    # different label here would make "Ubiquiti" read as something else
+    # depending on dict iteration order. Not cross-checked against a live
+    # unit or a bundled MIB in this build (same standing as every other
+    # CURATED entry), so a device on this arc that turns out not to be
+    # airOS reads as "ubiquiti" wrongly rather than "unknown enterprise arc
+    # 10002" -- the sysDescr substring rule in nodeoids.SYSDESCR_VENDORS is
+    # the belt-and-braces check for that.
+    10002: ("ubiquiti", "Ubiquiti"),
 }
 
 # Verified always wins over a curated guess for the same arc.

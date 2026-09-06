@@ -1060,6 +1060,23 @@ the device's own `entPhySensorUnitsDisplay` string as the unit — no
 vendor unit tables. A device without ENTITY-MIB support returns `[]`,
 which the dialog reports as "no DOM/sensor data" rather than an error.
 
+**Whole-device hardware and DOM (`NodePoller.read_hardware`,
+`read_dom_all`) — 4.53.0.** `_read_entity_sensors` generalises the same
+`entAliasMappingIdentifier`/`entPhysicalContainedIn` walk above (via the
+new `_entity_port_map`, entity → ifIndex for every entity on the device
+at once) into a whole-device sensor list, shared by both: `read_hardware`
+combines it with the already-polled cpu_pct/mem_pct/temp_*/humidity_pct
+metrics (`_hardware_metrics`, a plain `metrics()` read, nothing walked)
+and, on Cisco gear (`detected_vendor(device) == "cisco"`),
+CISCO-ENVMON-MIB power-supply/fan/temperature state
+(`_read_cisco_envmon`); `read_dom_all` is the same entity list filtered
+to rows that resolved to a port, the device-wide counterpart of
+`read_dom` above. Two routes back them, `GET
+/api/nodes/devices/<id>/hardware` and `.../dom` (`api.py`,
+`server.py`), read by the device dialog's HARDWARE SENSORS and DOM / SFP
+SENSORS sections (`nodes.js`); both walk only while that dialog is open,
+same reasoning as `read_dom`.
+
 **MAC address table** (`NodePoller.read_mac_table`): same on-demand shape
 as `read_dom` above — walked only while the interface dialog is open.
 `dot1dBasePortIfIndex` (bridge port → ifIndex) is read first to find
@@ -1627,6 +1644,40 @@ continuous-line renderer, which has no notion of a discrete state. It's
 fetched alongside the rest of `loadDetail()`'s `Promise.all`, using the
 same `t0`/`t1` window the metric chart's range picker already drives, so
 switching the range re-fetches both together.
+
+**Split SNMP/ping lanes (`nodesdb.device_method_segments`) — 4.53.0.**
+The combined segments above follow `devices.status`, which is whichever
+method `unreachable_ping_only` prefers (ping, by default) — a dead SNMP
+agent behind a healthy ping never shows there. Four new
+transition-only `device_events.kind` values, `snmp_up`/`snmp_down`/
+`ping_up`/`ping_down`, are recorded by `nodepoll._poll_device` on a real
+change in `snmp_ok`/`ping_ok` (compared against the pre-update device
+row, seeded on first observation, never written when that poll didn't
+touch the method at all). An install upgraded from before the lanes
+existed already has `snmp_ok`/`ping_ok` populated, so no transition would
+ever fire for an unchanged device: once per device per process the poller
+asks `nodesdb.has_method_events` and, if nothing was ever recorded, treats
+the previous values as unknown so that poll seeds both lanes. The kinds
+are listed once, in `nodesdb.TIMELINE_ONLY_EVENT_KINDS`: the alert engine
+skips them (they carry no meaning `up`/`down`/`snmp_error`/`auth_fail`
+doesn't already cover), and the overview histogram and the device
+dialog's EVENT LOG exclude them inside the query
+(`device_events(exclude_kinds=)`) so an outage is one row, not three.
+`device_method_segments(device_id, t0, t1)` walks each method's events
+through the same pairwise-segment logic as `device_status_segments`
+(both now share `_event_segments`, parameterised on which kinds count
+and what the final segment's status is), keyed off `devices.snmp_ok`/
+`ping_ok` for the live end-of-window status, and returns `{"snmp":
+[...], "ping": [...]}` with `None` in place of a method's list when it
+has never once recorded a transition — a method not polled at all, or
+history from before this version. `get_nodes_device_timeline` (`api.py`)
+adds this as `methods`, plus `methods_enabled` (from the device's
+effective config, not the per-poll `polling` flag) so the frontend can
+tell "never split" from "no transitions yet" before any have been
+recorded. `nodes.js` draws two lanes, SNMP above PING, sharing the same
+per-segment drawing code (`drawTimelineLane`) the combined view uses,
+and falls back to the single lane when either `methods_enabled` says
+only one method runs or the matching list is `None`.
 
 ### MAC search (`nodesdb.py`, `nodes.js`)
 
@@ -4849,6 +4900,48 @@ could have asked `App` for. The pieces and where they came from:
   `{authenticated: false, first_run: bool}`; `_first_run` is a user-count
   and two column reads, never a password check. `login.js` unhides
   `#login-note` and pre-fills the username when it is true.
+
+### Sortable hand-built tables (`App.sortableTable`, `app.js`) — 4.53.0
+
+`App.grid` tables were already sortable; the close to twenty plain
+`<table>`s each module built for itself — dialog device lists, the Debug
+page's worker tables, Settings' permission grid — were not, and teaching
+each one to opt in just means the next hand-built table forgets to.
+Instead one pair of listeners delegated on `document` (click, and
+Enter/Space on a focused header) makes every plain table with a header
+row sortable on its own; `.grid` tables are explicitly skipped since
+`App.grid` already handles its own.
+
+`plainHeaderRow(table)` finds the header row in either shape this
+codebase's hand-built tables use — a real `<thead>`, or a bare first
+`<tr>` of `<th>` cells — and `decoratePlainHeader` marks each cell with
+`.sortable`, a caret, `role="columnheader"` and `tabindex="0"` the first
+time it sees that exact (post-rebuild) `<th>`, skipping a header with no
+visible text or a control inside it (a select-all checkbox, an actions
+column). `sniffColumnKind` reads a column's own rendered cell text
+(`numeric`/`ip`/`date`/text, by an 80% majority rule) rather than being
+told, since a hand-built table has no column metadata to declare a kind
+with; blank cells (`''`/`'—'`/`'-'`/`'–'`, this codebase's own "nothing
+here" convention) always sort last regardless of direction, and a row
+with a `colspan` cell (an empty-state or group-header row) is left
+pinned wherever its renderer put it.
+
+The one thing delegation can't give a table that redraws itself with
+`table.innerHTML = head; table.appendChild(newBody)` on every refresh
+tick is memory of its own sort — the clicked `<th>` is destroyed and
+rebuilt moments later. The chosen column and direction are kept instead
+as `dataset.sortCol`/`dataset.sortDesc` on the `<table>` element itself,
+which `App.el(id)` hands back unchanged across such a rebuild, and a
+`MutationObserver` on `document.body` (`watchPlainTables`, started once
+at load) reapplies them (`reapplyPlainSort`) whenever a table's header or
+body actually changes — the one hook that reaches every renderer without
+editing any of them. `sortPlainTable` skips the DOM move when the wanted
+order already matches the current one, so `reapplyPlainSort` calling it
+on every redraw of an already-sorted table doesn't loop the observer
+against its own writes. `App.sortableTable(table)` (decorate + reapply)
+is the one public entry a caller needs when it fills and reads back a
+table synchronously, before the observer would otherwise reach it —
+every other page just waits for the observer.
 
 ### Themes, breakpoints, pointer capture and kiosk (`tokens.css`, `boot.js`, `app.js`) — 4.46.0
 

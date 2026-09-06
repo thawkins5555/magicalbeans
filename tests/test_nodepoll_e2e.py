@@ -313,8 +313,10 @@ def main():
     #     unreachable_ping_only (the default) rightly keeps it out of
     #     device_down — it is reachable and broken, not down — and before
     #     4.39.0 nothing else said anything at all, so a dead agent on a
-    #     live switch was invisible. It records an `snmp_error` event per
-    #     failing poll, which the snmp_failing_ping_ok rule watches.
+    #     live switch was invisible. It records an `snmp_error` event, which
+    #     the snmp_failing_ping_ok rule watches, once `snmp_fail_alert_after`
+    #     (default 3) consecutive failing polls are reached — not the first
+    #     one, so a single blip does not open the alert.
     if shutil.which("ping") is None:
         print("SKIP: no ping on this machine; "
               "the SNMP-failing-while-ping-succeeds case needs it")
@@ -340,13 +342,45 @@ def main():
         assert device["ping_ok"], "the device did answer ping"
         assert device["snmp_ok"] == 0, device["snmp_ok"]
         events = db.device_events(device_id, kinds=["snmp_error"])
-        assert len(events) == 3, \
-            f"expected one event per failing poll, got {len(events)}"
+        # 3 failing polls, default snmp_fail_alert_after=3: only the poll
+        # that REACHES the threshold fires, not each one along the way.
+        assert len(events) == 1, \
+            f"expected exactly one event once the threshold was reached, got {len(events)}"
         assert "replies to ping" in events[0]["detail"], events[0]["detail"]
         assert len(db.device_events(device_id, kinds=["down"])) == before_down, \
             "a reachable device must not record a new down event"
         print(f"ping-ok: {len(events)} snmp_error event(s) recorded while status "
               f"stayed {device['status']!r} OK")
+
+        # --- snmp_fail_alert_after gates snmp_error behind N CONSECUTIVE
+        #     qualifying failures, not the first one, so a single missed
+        #     poll does not open the snmp_failing_ping_ok alert. Set to 2:
+        #     the first failing poll (after SNMP recovers, resetting the
+        #     poller's in-memory count) must record nothing, the second
+        #     must record exactly one.
+        db.save_settings({"snmp_fail_alert_after": 2})
+        agent.alive = True
+        do_poll()  # let SNMP recover -> resets the poller's fail counter
+        assert db.device(device_id)["snmp_ok"], \
+            "agent is back up; SNMP should have recovered before the threshold test"
+        before_threshold = len(db.device_events(device_id, kinds=["snmp_error"]))
+        agent.alive = False
+        do_poll()
+        after_first = len(db.device_events(device_id, kinds=["snmp_error"]))
+        assert after_first == before_threshold, \
+            (f"snmp_fail_alert_after=2: the FIRST failing poll must not fire "
+             f"snmp_error yet, got {after_first - before_threshold} new event(s)")
+        do_poll()
+        after_second = len(db.device_events(device_id, kinds=["snmp_error"]))
+        assert after_second == before_threshold + 1, \
+            (f"snmp_fail_alert_after=2: the SECOND consecutive failing poll "
+             f"must fire exactly one snmp_error, got "
+             f"{after_second - before_threshold} new event(s)")
+        agent.alive = True
+        do_poll()
+        db.save_settings({"snmp_fail_alert_after": 3})  # restore the default
+        print("snmp_fail_alert_after=2: first failing poll silent, "
+              "second poll fires snmp_error OK")
 
     # --- polls 9-15: SNMP authentication events are TRANSITIONS
     # A credential that is wrong stays wrong on every poll, so recording

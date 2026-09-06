@@ -27,7 +27,7 @@ are protected is in `CREDENTIAL-SECURITY.md`.
 - [Deliberate limits](#deliberate-limits)
 
 The twelve tabs sit flat in one strip, in frequency order — **Dashboard**,
-**Alerts** · **Nodes**, **IPAM**, **FortiWireless**, **ConfigRX** ·
+**Alerts** · **Nodes**, **IPAM**, **FORTI-AP**, **CONFIGRX** ·
 **Routes**, **NetFlow**, **Syslog**, **SNMP Trap** · **Settings**, **Debug**
 — with a hairline before the first tab of each group after the first,
 standing in for the four labelled sections (Now/Inventory/Telemetry/Admin)
@@ -85,7 +85,7 @@ open tab and the selected thing — `#/nodes`, `#/nodes?status=down`,
 `#/nodes/device/41`, `#/nodes/device/41/port/3`, `#/alerts/12`,
 `#/netpath/2`, `#/configrx/device/41/backup/9`, and `#/snmp/5512`,
 `#/syslog/8801` and `#/wireless/3` for a trap, a message and an access
-point. From 4.48.0 a tab's own subtabs carry the same URL — `#/nodes/topology`,
+point. From 4.48.0 a tab's own subtabs carry the same URL — `#/nodes/discovery`,
 `#/settings/users` — so a pasted link lands a colleague on the pane that was
 actually open, not just the tab. Back walks the selections, a reload lands where you were,
 and a link pasted into a ticket or an email opens what it names for
@@ -216,7 +216,16 @@ onto it afterward.
   helper wires the same roving-tabindex behaviour onto every module's own
   subtab row — a device's INTERFACES/NEIGHBOURS/BRIDGE & RF/EVENTS group
   included — so no module has to implement it for itself.
-- **Every chart, the route graph, the timeline and the topology map are
+- **Every table sorts by clicking a column, from 4.53.0** — every hand-built
+  table in every page and dialog, not only the ones already built as a
+  sortable grid. Numbers, IPv4 addresses, dates and text are told apart
+  from the column's own values, blank cells always sort last, and a
+  table's sort survives being redrawn (a live refresh, an updated dialog)
+  because it is remembered on the table itself and reapplied afterward,
+  not lost the way a plain table's own state used to be. Reachable from
+  the keyboard the same way a grid's header already was: Tab to a column
+  heading, Enter or Space to sort by it.
+- **Every chart, the route graph and the timeline are
   reachable without a pointer.** Each carries a label built from the same
   summary its own header already shows, a visually hidden table stands
   beside a histogram with the buckets its bars draw, and a tooltip answers
@@ -718,8 +727,9 @@ from — never the password. **Remove** now lives in the device's Edit dialog, b
 credential, so the pane's buttons are the things you do *to* a device
 rather than the one thing you do to get rid of it.
 
-**A WEB button sits beside SSH**, a plain link to the device's own web
-interface (`http://<ip>/`, IPv6 bracketed) opened in a new tab. Unlike
+**A WEB button sits beside SSH**, styled to match it and, from 4.53.0, a
+button rather than a link, opening the device's own web interface
+(`http://<ip>/`, IPv6 bracketed) in a new tab. Unlike
 SSH it carries no permission of its own — it opens nothing on this
 server, only a tab in the browser — so it shows for anyone who can see the
 device at all, once the device has an address to link to.
@@ -731,6 +741,14 @@ a chart panel. It's built from `device_events` (a sparse transition log,
 not a dense per-poll sample table), so a device that's been up for a week
 with zero events still renders as one solid "up" segment rather than
 appearing to have no data. The range dropdown beside it sets the window.
+
+**From 4.53.0, a device polled by both SNMP and ping draws two lanes
+instead of one** — SNMP above, PING below — since the combined status
+column follows whichever method `unreachable_ping_only` prefers (ping, by
+default) and can hide a dead SNMP agent behind a healthy ping. Each lane
+is built the same way as the combined timeline, from its own sparse
+transition log; a device polled by only one method, or with no per-method
+history from before this version, still draws the single combined lane.
 
 **Packet loss is charted in the device dialog** — double-click a device row
 — on its own time frame, with its own range dropdown: "how long has this been
@@ -746,6 +764,19 @@ stop at three days, because a wider metric window reads from an hourly rollup
 table that nothing populates — a 7-day option would be permanently empty. The
 status timeline keeps every range, since it is built from the event log rather
 than from samples.
+
+**From 4.53.0, the device dialog also has a HARDWARE SENSORS section and a
+device-wide DOM / SFP SENSORS table.** HARDWARE SENSORS shows the latest
+polled CPU/memory/temperature figures, a live whole-device
+ENTITY-SENSOR-MIB walk (every sensor the device answers, not one port's
+worth), and — on Cisco gear — CISCO-ENVMON-MIB's own power-supply, fan and
+temperature status for hardware old enough to predate ENTITY-SENSOR-MIB.
+DOM / SFP SENSORS is the same device-wide walk's optic readings, grouped by
+port, so a transceiver problem is visible without opening every interface
+in turn; the per-interface dialog's own DOM section (below) is unchanged.
+Both walk only while the dialog is open, the same as the OID browser and
+MAC table, and a device that answers nothing for a section shows that
+plainly rather than an error.
 
 **The per-port bandwidth chart holds still under live polling.** Selecting a
 device polls it every few seconds, and a chart drawn from every one of those
@@ -909,7 +940,7 @@ anything wins. Devices that answer none of them show "no MAC address
 data" instead of an empty table. Per-interface "show run" still appears as a placeholder
 until SSH integration lands.
 
-### Topology, neighbours, PoE and STP
+### Neighbours, PoE and STP
 
 From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
 
@@ -919,12 +950,11 @@ From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
   present/ageing semantics as the MAC table: a neighbour that drops off a
   port is marked absent rather than erased, so a stale link is visible as
   stale rather than gone. A neighbour is best-effort matched to a known
-  device by sysName or chassis MAC.
-- **A TOPOLOGY subtab** draws the stored neighbour table as a pan-and-zoom
-  map, coloured by device status, with port names on hover; an
-  unidentified neighbour — seen over LLDP/CDP but not itself polled —
-  still gets its own node, dashed, rather than being left out. It exports
-  CSV like every other table.
+  device by sysName or chassis MAC. The device pane's own NEIGHBOURS
+  subtab (below) lists what that device's ports have reported; from
+  4.53.0 there is no fleet-wide picture of the whole neighbour table —
+  the TOPOLOGY subtab that used to draw one is retired, and a separate
+  module is planned to replace it.
 - **The device pane gains NEIGHBOURS and BRIDGE & RF sections.** NEIGHBOURS
   lists what that device's own ports have reported; BRIDGE & RF shows STP
   bridge and per-port state (BRIDGE-MIB) and, for a radio, RSSI, remote
@@ -1141,7 +1171,11 @@ alerts and optionally emailing about them.
 - **Three of those 35 are new in 4.39.0**, and each one reports a failure
   that previously had nobody to report it. `snmp_failing_ping_ok` fires
   when a device answers ping while its SNMP agent has stopped answering —
-  the case where a switch sat green with no counters behind it.
+  the case where a switch sat green with no counters behind it. From
+  4.53.0 it waits for **SNMP polls missed before "SNMP failing" alert**
+  (Nodes → Settings, default 3, beside **Consecutive failures before
+  "down"**) consecutive qualifying failures before it opens, rather than
+  the first one, so a single missed poll no longer raises it on its own.
   `poll_pool_saturated` fires when every poll worker has been busy for five
   minutes, which is the fleet outgrowing its worker count rather than any
   one device failing. `smtp_failing` fires when the mail path itself stops
@@ -1238,7 +1272,9 @@ real, unrelated fault because of a guess is the one failure this feature must
 never have, so the neighbour table alone never sets `upstream_id`.
 
 **From 4.49.0, reviewing that guess no longer means one Edit dialog per
-device.** A button on the TOPOLOGY subtab opens a dialog listing every
+device.** An **Upstream suggestions** button in the Nodes top strip
+(moved there in 4.53.0, when the TOPOLOGY subtab it used to sit on was
+retired) opens a dialog listing every
 device with no `upstream_id` set whose own collected neighbours matched
 another monitored device, ranked by evidence — a MAC-address match rated
 above a name match, a neighbour nothing has confirmed on the last walk rated
@@ -2191,16 +2227,28 @@ to a manual name in Nodes.
   `terminal pager 0`; Cisco WLC (AireOS) `show run-config`, after `config
   paging disable`; FortiOS `show full-configuration`; Junos `show
   configuration`; MikroTik RouterOS `/export`; HP/Aruba `show
-  running-config` — each preceded, where the platform needs it, by that
+  running-config`; from 4.53.0, Ubiquiti airOS (NanoBeam, NanoStation,
+  LiteBeam, PowerBeam, airFiber — a busybox shell, not a router CLI, so no
+  pager command applies) `cat /tmp/system.cfg` — each preceded, where the
+  platform needs it, by that
   one session-scoped pagination-disable command. An unrecognized vendor is
   skipped with a clear error rather than guessed at.
 - **A platform whose login lands in user EXEC, not privileged, escalates
-  first.** Cisco ASA is the one that ships this way: before its
-  pagination-disable command, ConfigRX sends the literal `enable` and,
+  first.** Cisco ASA always ships this way; from 4.53.0, Cisco IOS/IOS-XE,
+  NX-OS, IOS-XR, Small Business (SG/CBS) and Rockwell's Cisco-IOS-based
+  Stratix switches carry the same escalation, since a TACACS+/RADIUS
+  profile that doesn't grant privilege 15 by default lands those there
+  too. Before its pagination-disable command, a device whose learned
+  login prompt ends `>` gets the literal `enable` sent and,
   when the device's own prompt asks for one, the enable secret stored for
-  that device (below) — never a secret from anywhere else. A capture that
+  that device (below) — never a secret from anywhere else; a login that
+  already lands at a privileged `#` prompt skips this step entirely. A
+  capture that
   never actually reaches privileged mode is refused rather than stored.
-  Past that one step, ConfigRX still never enters a device's configuration
+  Cisco WLC (AireOS) is deliberately excluded even though its own prompt
+  also ends `>` — that is just AireOS's ordinary prompt character, not a
+  separate unprivileged mode. Past that one step, ConfigRX still never
+  enters a device's configuration
   mode and never sends anything beyond its fixed pager-off, enable and
   show-config commands.
 - **A stored backup can be deleted**, one at a time or several at once from
@@ -2382,11 +2430,14 @@ different query server, since a resolver good enough for internal reverse DNS
 may not be able to reach the public internet, which the ASN lookup needs.
 
 **The Settings tab has subtabs of its own** — General, Data & retention,
-Sign-in, Users, Tokens & directory, Maintenance, Modules and, from
+Sign-in, Users, Tokens, Maintenance, Modules and, from
 4.49.0, Audit — addressable in the URL (`#/settings/users`) the same way
-every other module's subtabs are. **Modules** is one list linking to all
+every other module's subtabs are. From 4.53.0 the LDAP directory settings
+that used to live on the Tokens subtab are on Sign-in instead, alongside
+session and lockout policy, which is why Tokens now only holds API tokens.
+**Modules** is one list linking to all
 nine per-module Settings dialogs (Nodes, Alerts, Routes/NetPath, NetFlow,
-SNMP Trap, Syslog, IPAM, FortiWireless, ConfigRX) rather than each
+SNMP Trap, Syslog, IPAM, FORTI-AP, ConfigRX) rather than each
 module's own Settings button being the only way to reach it — one place
 that answers "where is the setting for X" without already knowing which
 tab it lives on.
@@ -2636,7 +2687,8 @@ moves its settings, accounts and name cache into it on the first start.
 - **ConfigRX can only back up a device whose vendor it recognizes.** A
   fixed, deliberately short allow-list — six Cisco platform families (IOS/
   IOS-XE, NX-OS, IOS-XR, Small Business, ASA, WLC), FortiOS, Junos,
-  MikroTik, HP/Aruba — is the entire set of "show config" commands this
+  MikroTik, HP/Aruba and, from 4.53.0, Ubiquiti airOS — is the entire set
+  of "show config" commands this
   app knows how to run; a device Nodes couldn't identify, or one from a
   vendor not in that list, needs a vendor override set to a value on the
   list before it can be backed up, or it's skipped with a clear error.

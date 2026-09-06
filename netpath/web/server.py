@@ -279,11 +279,6 @@ ROUTES = [
     ("GET", r"^/api/ipam/dhcp/scope-history$", api.get_ipam_dhcp_scope_history, ("ipam", R)),
     ("GET", r"^/api/nodes/overview$", api.get_nodes_overview, ("nodes", R)),
     ("GET", r"^/api/nodes/mac-search$", api.get_nodes_mac_search, ("nodes", R)),
-    # The fleet-wide L2 link graph and its own CSV export — matched before
-    # the "export.csv" suffix could be confused with a device id, the same
-    # ordering rule the devices export above follows.
-    ("GET", r"^/api/nodes/topology$", api.get_nodes_topology, ("nodes", R)),
-    ("GET", r"^/api/nodes/topology/export\.csv$", api.get_nodes_topology_export, ("nodes", R)),
     ("GET", r"^/api/nodes/devices$", api.get_nodes_devices, ("nodes", R)),
     # Same filters as the list above, exported as CSV: matched before the
     # `(\d+)$` device route below on purpose, though \d+ would never match
@@ -305,6 +300,10 @@ ROUTES = [
     # happens to call it while a row is selected.
     ("POST", r"^/api/nodes/devices/(\d+)/focus$", api.post_nodes_device_focus, ("nodes", W)),
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces/(\d+)/dom$", api.get_nodes_device_dom, ("nodes", R)),
+    # Device-wide counterparts of the two routes above, for the device
+    # dialog's HARDWARE SENSORS and DOM / SFP SENSORS sections.
+    ("GET", r"^/api/nodes/devices/(\d+)/hardware$", api.get_nodes_device_hardware, ("nodes", R)),
+    ("GET", r"^/api/nodes/devices/(\d+)/dom$", api.get_nodes_device_dom_all, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces/(\d+)/mac-table$", api.get_nodes_device_mac_table, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/oids$", api.get_nodes_device_oids, ("nodes", R)),
     # A whole-device walk is a live SNMP job, not a read of stored data, so

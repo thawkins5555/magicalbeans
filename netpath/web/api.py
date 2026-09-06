@@ -2465,10 +2465,10 @@ def _device_json(row, reveal: bool = False) -> dict:
         "stp_enabled": (_tri(row["stp_enabled"]) if "stp_enabled" in row.keys() else None),
         # The capability probe's verdict — True/False once probed, None
         # until the first poll gets to it — and, once stp_capable is true,
-        # the bridge-wide state a topology/device pane reads. Per-port PoE
-        # power and STP state live on the interfaces rows instead (see
-        # get_nodes_device_interfaces); the topology-change COUNT is a
-        # metric with history (see get_nodes_device_metrics), not a column
+        # the bridge-wide state the device pane's BRIDGE & RF subtab reads.
+        # Per-port PoE power and STP state live on the interfaces rows
+        # instead (see get_nodes_device_interfaces); the topology-change
+        # COUNT is a metric with history (see get_nodes_device_metrics), not a column
         # here — this is the device's current bridge identity, not a series.
         "poe_capable": (bool(row["poe_capable"]) if "poe_capable" in row.keys()
                         and row["poe_capable"] is not None else None),
@@ -2672,7 +2672,12 @@ def get_nodes_overview(service, params, body) -> dict:
     t1 = _num(params, "t1", time.time())
     t0 = _num(params, "t0", t1 - 86400)
     bucket = _num(params, "bucket", 3600)
-    events = service.nodes_db.device_events(since_s=max(0.0, time.time() - t0))
+    # The per-method timeline kinds are left out: an outage already counts
+    # once as `down`, and counting its snmp_down/ping_down too would triple
+    # every bar (and spend the read's row limit three times as fast).
+    events = service.nodes_db.device_events(
+        since_s=max(0.0, time.time() - t0),
+        exclude_kinds=tuple(nodesdb.TIMELINE_ONLY_EVENT_KINDS))
     buckets: dict[int, int] = {}
     for row in events:
         if row["ts"] < t0 or row["ts"] > t1:
@@ -2809,7 +2814,7 @@ def get_nodes_mac_search(service, params, body) -> dict:
 def _neighbor_local_port_labeler(service):
     """A (device_id, if_index) -> label closure for LLDP/CDP rows, backed by
     one interfaces() read per device it is actually asked about rather than
-    the whole fleet's — a topology draw only ever touches the handful of
+    the whole fleet's — a neighbours read only ever touches the handful of
     devices that reported a neighbour, not the thousands that did not.
     Falls back to "if <N>" for a port whose interface row has not been
     polled yet (or was deleted since), which is still a legible label."""
@@ -3044,126 +3049,6 @@ def post_nodes_upstream_suggestions_apply(service, params, body) -> dict:
     service.log.add(NODES_CATEGORY,
                     f"Applied {len(cleaned)} upstream suggestion(s)")
     return {"ok": True, "updated": len(cleaned)}
-
-
-# An L2 link graph shaped for the client to draw directly rather than
-# handing over raw neighbour rows. Shaped here because only nodesdb knows
-# which chassis-id/sysName matches resolved to a real device
-# (_NEIGHBOR_MATCH_SQL), and only the server can afford an interfaces() read
-# per reporting device to label a local port — the client would otherwise
-# need a second request per device just to draw port labels on hover.
-def _topology_dedup_key(device_id, if_index, matched_id, matched_if_index):
-    """The undirected identity of one physical link. LLDP/CDP is normally
-    walked from BOTH ends — the switch that owns this port and the device
-    across the cable, if it walks its own table too — so the same cable
-    arrives as two rows: (A, ifA) matched to (B, ifB), and separately
-    (B, ifB) matched to (A, ifA). matched_if_index (nodesdb's join of the
-    remote chassis MAC to the remote device's OWN interface) is what makes
-    those two rows produce the identical frozenset key below, so the second
-    row folds onto the first instead of drawing the same cable twice. A
-    sysName-only match (no MAC, so no matched_if_index) cannot be paired
-    this way — it gets its own key per row, which is a real second line on
-    screen rather than a wrong guess at which port to pair it against."""
-    if matched_if_index is not None:
-        return frozenset({(device_id, if_index), (matched_id, matched_if_index)})
-    return ("name-match", device_id, if_index)
-
-
-def _topology_unknown_identity(row) -> str:
-    """What makes two unmatched neighbour rows the SAME unknown neighbour —
-    an AP or phone with no SNMP of its own, seen from two switches, ought to
-    draw as one node with two edges, not two disconnected "unknown" boxes.
-    Falls back to a row-unique key when neither a chassis id nor a sysName
-    was reported at all, which is the honest answer for "nothing here
-    identifies this neighbour beyond the port it was seen on"."""
-    return (row["chassis_id"] or row["sys_name"]
-            or f"row:{row['device_id']}:{row['if_index']}:{row['protocol']}:{row['rem_index']}")
-
-
-def get_nodes_topology(service, params, body) -> dict:
-    """The fleet-wide L2 graph a topology view draws: every Nodes device as
-    a node (id/name/status/ip), plus one edge per distinct LLDP/CDP link —
-    deduplicated per _topology_dedup_key so the ordinary case (both ends of
-    a cable walk their own table) draws one line, not two. A neighbour with
-    no device join (nothing in Nodes answers that chassis id or sysName)
-    still draws, as its own synthetic node — dropping it would make an
-    unmanaged AP or phone invisible instead of clearly unidentified, which
-    is the wrong failure mode for a topology view."""
-    devices = service.nodes_db.devices()
-    device_by_id = {row["id"]: row for row in devices}
-    nodes = [{"id": row["id"], "name": namelookup.device_name(row) or row["ip"],
-              "status": row["status"], "ip": row["ip"], "unknown": False}
-             for row in devices]
-
-    label = _neighbor_local_port_labeler(service)
-    edges_by_key: dict = {}
-    unknown_nodes: dict = {}
-    for row in service.nodes_db.all_neighbours():
-        if not row["present"]:
-            continue    # the live graph, not the history — a vanished link should stop drawing
-        device_id, if_index = row["device_id"], row["if_index"]
-        matched_id = row["matched_device_id"]
-        matched_if_index = row["matched_if_index"] if "matched_if_index" in row.keys() else None
-        local_label = label(device_id, if_index)
-        remote_port = row["port_id"] or row["port_descr"] or ""
-
-        is_unknown = matched_id is None or matched_id not in device_by_id
-        if not is_unknown:
-            b_id, b_port = matched_id, (remote_port or label(matched_id, matched_if_index))
-            key = _topology_dedup_key(device_id, if_index, matched_id, matched_if_index)
-        else:
-            identity = _topology_unknown_identity(row)
-            unk = unknown_nodes.get(identity)
-            if unk is None:
-                unk = {"id": f"unknown:{identity}",
-                       "name": row["sys_name"] or row["platform"] or row["chassis_id"]
-                               or "Unidentified neighbour",
-                       "status": "unknown", "ip": row["remote_address"] or "", "unknown": True}
-                unknown_nodes[identity] = unk
-            b_id, b_port = unk["id"], remote_port
-            key = ("unknown", identity, device_id, if_index)
-
-        edge = edges_by_key.get(key)
-        if edge is None:
-            edge = {"id": f"e{len(edges_by_key)}", "a_device_id": device_id,
-                    "a_port": local_label, "b_device_id": b_id, "b_port": b_port,
-                    "protocols": [], "unknown": is_unknown, "seen_ts": row["seen_ts"]}
-            edges_by_key[key] = edge
-        if row["protocol"] not in edge["protocols"]:
-            edge["protocols"].append(row["protocol"])
-        edge["seen_ts"] = max(edge["seen_ts"], row["seen_ts"])
-
-    return {"nodes": nodes + list(unknown_nodes.values()), "edges": list(edges_by_key.values())}
-
-
-def _topology_export_rows(service) -> list:
-    device_by_id = {row["id"]: row for row in service.nodes_db.devices()}
-    label = _neighbor_local_port_labeler(service)
-    rows = []
-    for row in service.nodes_db.all_neighbours():
-        device = device_by_id.get(row["device_id"])
-        matched_id = row["matched_device_id"]
-        matched_name = row["matched_device_name"] if "matched_device_name" in row.keys() else None
-        rows.append([
-            row["device_id"], namelookup.device_name(device) if device else "",
-            row["if_index"], label(row["device_id"], row["if_index"]),
-            row["protocol"], row["chassis_id"], row["sys_name"],
-            row["port_id"] or row["port_descr"], row["platform"], row["remote_address"],
-            matched_id, matched_name, bool(row["present"]), row["seen_ts"], row["first_seen_ts"],
-        ])
-    return rows
-
-
-def get_nodes_topology_export(service, params, body) -> dict:
-    """The neighbours/topology table as CSV: every stored LLDP/CDP row,
-    present and stale alike (an export exists to leave with the whole
-    picture, not only the live graph the on-screen view draws), fleet-wide
-    like get_nodes_devices_export rather than filtered to one device."""
-    header = ["device_id", "device_name", "if_index", "local_port", "protocol",
-             "remote_chassis_id", "remote_sys_name", "remote_port", "platform",
-             "remote_address", "matched_device_id", "matched_device_name",
-             "present", "seen_ts", "first_seen_ts"]
-    return _csv_response("topology", header, _topology_export_rows(service))
 
 
 def post_nodes_device(service, params, body) -> dict:
@@ -3677,6 +3562,22 @@ def get_nodes_device_dom(service, params, body, device_id, if_index) -> dict:
     return {"sensors": sensors}
 
 
+def get_nodes_device_hardware(service, params, body, device_id) -> dict:
+    """Whole-device counterpart of get_nodes_device_dom: the device
+    dialog's HARDWARE SENSORS section, not one interface's DOM table."""
+    _require(service.nodes_db.device(device_id), "device")
+    return service.node_poller.read_hardware(int(device_id))
+
+
+def get_nodes_device_dom_all(service, params, body, device_id) -> dict:
+    """Every port's DOM/SFP reading in one call, for the device dialog's
+    DOM / SFP SENSORS section -- read_dom() above stays the interface
+    dialog's own one-port read."""
+    _require(service.nodes_db.device(device_id), "device")
+    sensors = service.node_poller.read_dom_all(int(device_id))
+    return {"sensors": sensors}
+
+
 def get_nodes_device_mac_table(service, params, body, device_id, if_index) -> dict:
     _require(service.nodes_db.device(device_id), "device")
     macs = service.node_poller.read_mac_table(int(device_id), int(if_index))
@@ -4024,10 +3925,26 @@ def get_nodes_device_series(service, params, body, device_id) -> dict:
 
 
 def get_nodes_device_timeline(service, params, body, device_id) -> dict:
-    _require(service.nodes_db.device(device_id), "device")
+    device = service.nodes_db.device(device_id)
+    _require(device, "device")
     t0, t1 = _window(params)
     segments = service.nodes_db.device_status_segments(device_id, t0, t1)
-    return {"t0": t0, "t1": t1, "segments": segments}
+    # Per-method (snmp/ping) segments alongside the combined `segments`
+    # above (kept — report.py and any other existing caller reads that),
+    # for the timeline's split-lane view. `methods_enabled` is which methods
+    # this device currently has enabled at all, from its effective profile
+    # — the UI needs that to decide split-vs-single BEFORE any per-method
+    # event has ever been recorded (a device polled by both since before
+    # this version shipped has methods["snmp"/"ping"] == None until its
+    # first transition). Named `methods_enabled`, not `polling`: a device
+    # row's own `polling` field already means "a poll is running right now"
+    # (see worker_state() below) — an unrelated, easily-confused meaning.
+    methods = service.nodes_db.device_method_segments(device_id, t0, t1)
+    config = service.nodes_db.effective_config(device)
+    methods_enabled = {"snmp": bool(config.get("snmp_enabled")),
+                       "ping": bool(config.get("ping_enabled"))}
+    return {"t0": t0, "t1": t1, "segments": segments, "methods": methods,
+            "methods_enabled": methods_enabled}
 
 
 # ------------------------------------------------------------------ reports
@@ -4110,7 +4027,13 @@ def get_nodes_reports_top_metrics(service, params, body) -> dict:
 def get_nodes_device_events(service, params, body, device_id) -> dict:
     _require(service.nodes_db.device(device_id), "device")
     since_s = _num(params, "since_s", None)
-    device_events = service.nodes_db.device_events(device_id=device_id, since_s=since_s)
+    # The per-method lane events are drawn on the timeline, never listed:
+    # every outage would otherwise show three rows (down, snmp_down,
+    # ping_down) that all say the same thing. Same exclusion the overview
+    # histogram applies.
+    device_events = service.nodes_db.device_events(
+        device_id=device_id, since_s=since_s,
+        exclude_kinds=tuple(nodesdb.TIMELINE_ONLY_EVENT_KINDS))
     interface_events = [
         {"id": ev["id"], "interface_id": ev["interface_id"],
          "if_index": ev["if_index"], "descr": ev["descr"],
@@ -6059,7 +5982,9 @@ def post_configrx_device_credential(service, params, body, device_id) -> dict:
     # three-way contract: the key absent from the body leaves whatever is
     # already stored untouched, present-and-empty clears it, present-and-
     # non-empty (re)encrypts and stores it. Needed only by a vendor whose
-    # login shell is not already privileged EXEC (currently just cisco-asa).
+    # login shell may not already be privileged EXEC (configrx.VENDORS'
+    # enable_command entries: Cisco IOS/IOS-XE, NX-OS, IOS-XR, SG/CBS, ASA,
+    # and Rockwell Stratix).
     enable_kwargs = {}
     if "enable_secret" in body:
         enable_secret = str(body.get("enable_secret") or "")

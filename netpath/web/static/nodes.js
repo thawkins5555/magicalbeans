@@ -28,11 +28,8 @@
     ifaceSort: App.recallSort('nodes-ifaces', { key: 'if_index', descending: false }),
     events: null,
     // LLDP/CDP neighbours for the selected device's own ports (Tier 1 #5's
-    // UI half) and the fleet-wide L2 graph the Topology subtab draws from —
-    // two different shapes of the same underlying table, fetched by
-    // different routes (see loadDetail / loadTopology).
+    // UI half), fetched alongside the rest of loadDetail.
     neighbors: [],
-    topology: null,
     discJobs: [],
     discSelected: null,
     discResults: [],
@@ -706,13 +703,15 @@
 
   /* P1-4: the WEB button beside SSH, a plain link to the device's own web
      UI rather than anything this app opens a socket for — IPv6 needs its
-     host bracketed in a URL, IPv4 does not. */
+     host bracketed in a URL, IPv4 does not. The URL is stashed on the
+     button (it's a <button>, not an <a>, so it matches SSH's styling) and
+     opened on click by the one-time wiring below. */
   function drawWebLink(d) {
     const link = App.el('nd-web-device');
     if (!link) return;
     const ip = d && d.ip;
     if (!ip) { link.hidden = true; return; }
-    link.href = `http://${ip.includes(':') ? `[${ip}]` : ip}/`;
+    link.dataset.url = `http://${ip.includes(':') ? `[${ip}]` : ip}/`;
     link.hidden = false;
   }
 
@@ -1039,10 +1038,82 @@
     return geo;
   }
 
+  /* One lane's worth of coloured segments — extracted from
+     drawStatusTimeline so the split SNMP/ping view and the single combined
+     view (below) share the exact same per-segment drawing (colour,
+     texture, tooltip, keyboard focus) instead of two copies of it. `y`/`h`
+     place the lane within the shared SVG; `prefix` (split view only) tags
+     the tooltip/aria-label with which lane it is, since two lanes on one
+     axis would otherwise both just say "Down 14:02 – 14:47". */
+  function drawTimelineLane(svg, segments, { t0, span, x, y, h, width, prefix }) {
+    if (!segments || !segments.length) {
+      svg.appendChild(App.svgNode('text', {
+        x: width / 2, y: y + h / 2 + 4, 'text-anchor': 'middle',
+        fill: 'var(--muted)', 'font-size': 'var(--fs-2xs)' }, 'No history in this window'));
+      return;
+    }
+    segments.forEach((seg, index) => {
+      const x0 = x(seg.ts_start);
+      const w = Math.max(x(seg.ts_end) - x0, 1);
+      // device_status_segments/device_method_segments (nodesdb.py) only
+      // ever report "unknown" for the very first segment, and only when
+      // they found no event before the window at all — so this is never a
+      // genuinely ambiguous state, it is the device (or method) not having
+      // been watched yet. Flat fill, no texture, and its own label rather
+      // than "Unknown  hh:mm – hh:mm", so the absence reads as absence
+      // instead of one more state to decode.
+      const isPreHistory = index === 0 && seg.status === 'unknown' && seg.ts_start <= t0;
+      // Two endpoints and how long between them: this label is the only
+      // channel a keyboard or screen-reader user has to the timeline, and
+      // "Down 14:02 – 14:47" left them doing the subtraction.
+      const label = (prefix ? `${prefix}: ` : '') + (isPreHistory
+        ? `No data before ${App.stamp(seg.ts_end, span)}`
+        : `${seg.status[0].toUpperCase()}${seg.status.slice(1)}` +
+          `  ${App.stamp(seg.ts_start, span)} – ${App.stamp(seg.ts_end, span)}` +
+          ` (${App.duration(seg.ts_end - seg.ts_start) || 'under a second'})`);
+      // The segment is a <g> rather than a bare rect so the colour, the
+      // texture over it and the keyboard focus are one thing the operator
+      // can Tab to and read, instead of a colour with a mouse-only tooltip.
+      const group = App.svgNode('g', {
+        tabindex: 0, role: 'img', 'aria-label': label,
+        class: 'timeline-seg',
+      });
+      group.appendChild(App.svgNode('title', {}, label));
+      group.appendChild(App.svgNode('rect', {
+        x: x0, y, width: w, height: h,
+        fill: isPreHistory ? 'var(--nodata)' : (STATUS_COLOR[seg.status] || 'var(--nodata)'),
+      }));
+      // Colour is never the only signal: every non-`up` state carries its
+      // own texture (see App.statusPatternDefs) — except pre-history, which
+      // is deliberately plain, the same way `none`/`up`/`ok` are.
+      const pattern = isPreHistory ? null : App.statusPatternUrl(seg.status, svg);
+      if (pattern) {
+        group.appendChild(App.svgNode('rect', { x: x0, y, width: w, height: h, fill: pattern }));
+      }
+      group.addEventListener('mousemove', (event) => App.tooltip(label, event));
+      group.addEventListener('mouseleave', App.hideTooltip);
+      group.addEventListener('focus', () => {
+        const box = group.getBoundingClientRect();
+        App.tooltip(label, { clientX: box.left + box.width / 2, clientY: box.bottom });
+      });
+      group.addEventListener('blur', App.hideTooltip);
+      svg.appendChild(group);
+    });
+  }
+
   /* Colored segments, one per real status change, across the full window
      width — modeled on NetPath's own status-lane rects (netpath.js), not
      drawSeriesChart's continuous-line renderer, since a status timeline
-     is discrete state over time rather than a numeric series. */
+     is discrete state over time rather than a numeric series.
+
+     A device polled by both SNMP and ping splits into two half-height
+     lanes, because the combined `segments` effectively follows ping alone
+     (unreachable_ping_only keeps a device with a dead SNMP agent but a
+     live ping "up") — one lane shows the fault the other hides. A device
+     with only one method polled, or one predating this split (`methods`
+     never populated because no per-method event has ever been recorded
+     for it — see nodesdb.device_method_segments), stays a single
+     full-height lane exactly as before. */
   function drawStatusTimeline() {
     const el = App.el('nd-status-timeline');
     if (!el) return;
@@ -1068,54 +1139,37 @@
     const { t0, t1, segments } = data;
     const span = Math.max(t1 - t0, 1);
     const x = (ts) => ((ts - t0) / span) * width;
-    segments.forEach((seg, index) => {
-      const x0 = x(seg.ts_start);
-      const w = Math.max(x(seg.ts_end) - x0, 1);
-      // device_status_segments (nodesdb.py) only ever reports "unknown" for
-      // the very first segment, and only when it found no event before the
-      // window at all — so this is never a genuinely ambiguous state, it is
-      // the device not having been watched yet. Flat fill, no texture, and
-      // its own label rather than "Unknown  hh:mm – hh:mm", so the absence
-      // reads as absence instead of one more state to decode.
-      const isPreHistory = index === 0 && seg.status === 'unknown' && seg.ts_start <= t0;
-      // Two endpoints and how long between them: this label is the only
-      // channel a keyboard or screen-reader user has to the timeline, and
-      // "Down 14:02 – 14:47" left them doing the subtraction.
-      const label = isPreHistory
-        ? `No data before ${App.stamp(seg.ts_end, span)}`
-        : `${seg.status[0].toUpperCase()}${seg.status.slice(1)}` +
-          `  ${App.stamp(seg.ts_start, span)} – ${App.stamp(seg.ts_end, span)}` +
-          ` (${App.duration(seg.ts_end - seg.ts_start) || 'under a second'})`;
-      // The segment is a <g> rather than a bare rect so the colour, the
-      // texture over it and the keyboard focus are one thing the operator
-      // can Tab to and read, instead of a colour with a mouse-only tooltip.
-      const group = App.svgNode('g', {
-        tabindex: 0, role: 'img', 'aria-label': label,
-        class: 'timeline-seg',
-      });
-      group.appendChild(App.svgNode('title', {}, label));
-      group.appendChild(App.svgNode('rect', {
-        x: x0, y: 0, width: w, height: barH,
-        fill: isPreHistory ? 'var(--nodata)' : (STATUS_COLOR[seg.status] || 'var(--nodata)'),
-      }));
-      // Colour is never the only signal: every non-`up` state carries its
-      // own texture (see App.statusPatternDefs) — except pre-history, which
-      // is deliberately plain, the same way `none`/`up`/`ok` are.
-      const pattern = isPreHistory ? null : App.statusPatternUrl(seg.status, svg);
-      if (pattern) {
-        group.appendChild(App.svgNode('rect', {
-          x: x0, y: 0, width: w, height: barH, fill: pattern,
-        }));
-      }
-      group.addEventListener('mousemove', (event) => App.tooltip(label, event));
-      group.addEventListener('mouseleave', App.hideTooltip);
-      group.addEventListener('focus', () => {
-        const box = group.getBoundingClientRect();
-        App.tooltip(label, { clientX: box.left + box.width / 2, clientY: box.bottom });
-      });
-      group.addEventListener('blur', App.hideTooltip);
-      svg.appendChild(group);
-    });
+    const methodsEnabled = data.methods_enabled || {};
+    const methods = data.methods || {};
+    const bothPolled = !!(methodsEnabled.snmp && methodsEnabled.ping);
+    // Neither lane has ever recorded a per-method transition: a device
+    // added before this version shipped, or one that has genuinely never
+    // been polled yet. Either way there is no per-method history to draw
+    // two lanes from, so this falls back to the single combined lane
+    // rather than showing two lanes of nothing but "unknown".
+    const hasMethodData = methods.snmp != null || methods.ping != null;
+    const split = bothPolled && hasMethodData;
+    if (split) {
+      const laneGap = 2;
+      const laneH = Math.max((barH - laneGap) / 2, 6);
+      const laneLabel = (text, y) => svg.appendChild(App.svgNode('text', {
+        x: 3, y: y + laneH / 2 + 3, 'text-anchor': 'start', fill: 'var(--text)',
+        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
+        style: 'paint-order: stroke; stroke: var(--panel); stroke-width: 3px',
+      }, text));
+      drawTimelineLane(svg, methods.snmp,
+        { t0, span, x, y: 0, h: laneH, width, prefix: 'SNMP' });
+      drawTimelineLane(svg, methods.ping,
+        { t0, span, x, y: laneH + laneGap, h: laneH, width, prefix: 'PING' });
+      // Small left-side labels, drawn last so they sit on top of the
+      // segments they name rather than being painted over by them; the
+      // stroke behind the text (above) is what keeps them legible over
+      // whatever colour the segment underneath happens to be.
+      laneLabel('SNMP', 0);
+      laneLabel('PING', laneH + laneGap);
+    } else {
+      drawTimelineLane(svg, segments, { t0, span, x, y: 0, h: barH, width });
+    }
     svg.appendChild(App.svgNode('text', {
       x: 0, y: height - 2, 'text-anchor': 'start', fill: 'var(--dim)',
       'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
@@ -1252,6 +1306,10 @@
         <svg id="ndd-loss-chart-svg"></svg></div>
       <p class="section">VENDOR IDENTIFICATION</p>
       <div id="ndd-vendor" class="hint">Loading\u2026</div>
+      <p class="section">HARDWARE SENSORS</p>
+      <div id="ndd-hardware"><p class="hint">Reading sensors\u2026</p></div>
+      <p class="section">DOM / SFP SENSORS</p>
+      <div id="ndd-dom"><p class="hint">Reading sensors\u2026</p></div>
       <p class="section">INTERFACES</p>
       <div class="table-wrap scrollbox large"><table id="ndd-if-table"></table></div>
       <p class="section">EVENT LOG</p>
@@ -1367,6 +1425,62 @@
       box.querySelector('#ndd-summary').innerHTML =
         '<span class="err">Could not read this device.</span>';
     });
+
+    // Hardware sensors and DOM/SFP sensors are their own on-demand SNMP
+    // reads (see nodepoll.read_hardware/read_dom_all) — several table
+    // walks each, so they run only while this dialog is open, same
+    // reasoning as the interface dialog's own DOM fetch below, and
+    // independently of the Promise.all above so a slow sensor walk never
+    // holds up the summary/interfaces/events paint.
+    App.get(`/api/nodes/devices/${deviceId}/hardware`)
+      .then((r) => {
+        const holder = box.querySelector('#ndd-hardware');
+        if (!holder || !current()) return;
+        const rows = [...(r.metrics || []), ...(r.sensors || []), ...(r.envmon || [])];
+        if (!rows.length) {
+          holder.innerHTML = App.emptyState(
+            'This device exposes no hardware sensors over SNMP.');
+          return;
+        }
+        holder.innerHTML = '<table><caption class="sr-only">Hardware sensors</caption>' +
+          '<thead><tr><th scope="col">Sensor</th><th scope="col">Value</th>' +
+          '<th scope="col">Status</th></tr></thead><tbody>' +
+          rows.map((s) => {
+            const value = s.value == null ? ''
+              : `${s.value} ${s.unit || ''}`.trim();
+            return `<tr><td>${escape(s.label)}</td><td>${escape(value)}</td>` +
+              `<td>${escape(s.status || '')}</td></tr>`;
+          }).join('') + '</tbody></table>';
+      })
+      .catch(() => {
+        const holder = box.querySelector('#ndd-hardware');
+        if (holder && current()) holder.innerHTML =
+          '<p class="hint">Sensor read failed — the device may not answer SNMP requests.</p>';
+      });
+
+    App.get(`/api/nodes/devices/${deviceId}/dom`)
+      .then((r) => {
+        const holder = box.querySelector('#ndd-dom');
+        if (!holder || !current()) return;
+        const rows = r.sensors || [];
+        if (!rows.length) {
+          holder.innerHTML = App.emptyState(
+            'No DOM/SFP sensor data available from this device');
+          return;
+        }
+        holder.innerHTML = '<table><caption class="sr-only">DOM and SFP sensors by port</caption>' +
+          '<thead><tr><th scope="col">Port</th><th scope="col">Sensor</th>' +
+          '<th scope="col">Value</th><th scope="col">Status</th></tr></thead><tbody>' +
+          rows.map((s) =>
+            `<tr><td>${escape(s.if_name || `port ${s.if_index}`)}</td>` +
+            `<td>${escape(s.label)}</td><td>${s.value} ${escape(s.unit)}</td>` +
+            `<td>${escape(s.status)}</td></tr>`).join('') + '</tbody></table>';
+      })
+      .catch(() => {
+        const holder = box.querySelector('#ndd-dom');
+        if (holder && current()) holder.innerHTML =
+          '<p class="hint">Sensor read failed — the device may not answer ENTITY-MIB requests.</p>';
+      });
   }
 
   /* ------------------------------------------ vendor identification */
@@ -2993,8 +3107,9 @@
     ].sort((a, b) => a.row - b.row);
     let html = `<p><b>${escape(summary)}</b></p>`;
     if (problems.length) {
-      html += '<div class="table-wrap"><table><thead><tr><th>Row</th><th>Address</th>' +
-        '<th>Problem</th></tr></thead><tbody>' +
+      html += '<div class="table-wrap"><table><caption class="sr-only">Import problems</caption>' +
+        '<thead><tr><th scope="col">Row</th><th scope="col">Address</th>' +
+        '<th scope="col">Problem</th></tr></thead><tbody>' +
         problems.map((p) => `<tr><td>${p.row}</td><td>${escape(p.ip || '')}</td>` +
           `<td>${escape(p.kind)}: ${escape(p.reason || '')}</td></tr>`).join('') +
         '</tbody></table></div>';
@@ -4048,372 +4163,6 @@
     return !!pane && pane.classList.contains('active');
   }
 
-  /* -------------------------------------------------------- topology
-
-     The L2 link graph (Tier 1 #5's UI half): every Nodes device as a box,
-     one line per distinct LLDP/CDP link (already deduplicated server-side
-     — see api.get_nodes_topology), drawn with plain SVG and the same
-     pan/zoom technique netpath.js's traceroute hop graph uses (own
-     view/frame state, a wheel handler that zooms on the point under the
-     cursor, pointer-capture drag to pan) rather than a charting library.
-     discoveryVisible()'s own pattern: fetched only while this subtab is
-     actually on screen, not on every refresh tick regardless. */
-  function topologyVisible() {
-    const pane = document.getElementById('nodes-sub-topology');
-    return !!pane && pane.classList.contains('active');
-  }
-
-  async function loadTopology() {
-    view.topology = await App.get('/api/nodes/topology');
-    drawTopology();
-  }
-
-  const TOPO_NODE_W = 160, TOPO_NODE_H = 40, TOPO_COL_GAP = 70,
-        TOPO_ROW_GAP = 14, TOPO_COMP_GAP = 36;
-  // Zoom/pan is view state, not data — kept out of `view` (which recallSort
-  // and friends treat as the module's persisted shape) the same way
-  // netpath.js keeps its own route-canvas transform in its own object.
-  const topoState = { zoom: 1, pan: { x: 0, y: 0 }, frame: null,
-    userZoom: false, panDrag: null, dragMoved: false };
-
-  /* device/synthetic-node id -> {x, y}. Connected LLDP/CDP components are
-     laid out as a layered tree from their own highest-degree node (BFS
-     depth = column, siblings stacked in a row) — legible for the star and
-     chain shapes real switch fabrics actually form, and tolerant of a
-     non-tree edge (a redundant link) since layout only follows the BFS
-     spanning tree while EVERY edge still gets drawn afterwards. A device
-     with no reported neighbour at all is not given a lone tall block of
-     its own — it goes into a compact grid appended below the connected
-     components, which is what keeps a fleet of mostly-unpolled devices
-     from turning into a very long, mostly-empty column of single boxes. */
-  function topoLayout(nodes, edges) {
-    const adjacency = new Map();
-    for (const node of nodes) adjacency.set(String(node.id), new Set());
-    for (const edge of edges) {
-      const a = String(edge.a_device_id), b = String(edge.b_device_id);
-      if (!adjacency.has(a) || !adjacency.has(b)) continue;
-      adjacency.get(a).add(b);
-      adjacency.get(b).add(a);
-    }
-    const visited = new Set();
-    const components = [];
-    for (const node of nodes) {
-      const id = String(node.id);
-      if (visited.has(id)) continue;
-      const members = [];
-      const queue = [id];
-      visited.add(id);
-      while (queue.length) {
-        const current = queue.shift();
-        members.push(current);
-        for (const neighbour of adjacency.get(current)) {
-          if (!visited.has(neighbour)) { visited.add(neighbour); queue.push(neighbour); }
-        }
-      }
-      components.push(members);
-    }
-    const isolated = components.filter((c) => c.length === 1).map((c) => c[0]);
-    const connected = components.filter((c) => c.length > 1)
-      .sort((a, b) => b.length - a.length);
-
-    const positions = new Map();
-    let yCursor = 0;
-    for (const members of connected) {
-      const root = members.reduce((best, id) =>
-        (adjacency.get(id).size > adjacency.get(best).size ? id : best), members[0]);
-      const depth = new Map([[root, 0]]);
-      const queue = [root];
-      while (queue.length) {
-        const current = queue.shift();
-        for (const neighbour of adjacency.get(current)) {
-          if (!depth.has(neighbour)) {
-            depth.set(neighbour, depth.get(current) + 1);
-            queue.push(neighbour);
-          }
-        }
-      }
-      const layers = new Map();
-      for (const id of members) {
-        const d = depth.has(id) ? depth.get(id) : 0;
-        if (!layers.has(d)) layers.set(d, []);
-        layers.get(d).push(id);
-      }
-      const maxLen = Math.max(...[...layers.values()].map((l) => l.length));
-      const compHeight = maxLen * (TOPO_NODE_H + TOPO_ROW_GAP) - TOPO_ROW_GAP;
-      for (const [depthLevel, ids] of [...layers.entries()].sort((a, b) => a[0] - b[0])) {
-        const blockH = ids.length * (TOPO_NODE_H + TOPO_ROW_GAP) - TOPO_ROW_GAP;
-        let y = yCursor + (compHeight - blockH) / 2;
-        for (const id of ids) {
-          positions.set(id, { x: depthLevel * (TOPO_NODE_W + TOPO_COL_GAP), y });
-          y += TOPO_NODE_H + TOPO_ROW_GAP;
-        }
-      }
-      yCursor += compHeight + TOPO_COMP_GAP;
-    }
-    if (isolated.length) {
-      const cols = Math.max(4, Math.ceil(Math.sqrt(isolated.length)));
-      isolated.forEach((id, i) => {
-        const col = i % cols, row = Math.floor(i / cols);
-        positions.set(id, { x: col * (TOPO_NODE_W + TOPO_COL_GAP),
-                            y: yCursor + row * (TOPO_NODE_H + TOPO_ROW_GAP) });
-      });
-    }
-    return positions;
-  }
-
-  function truncateLabel(text, max = 20) {
-    const s = String(text || '');
-    return s.length > max ? `${s.slice(0, max - 1)}…` : s;
-  }
-
-  /* Mirrors the status-timeline segments above: tabindex plus a focus/blur
-     pair that shows the same tooltip a mouse gets, so a hover-only detail on
-     the topology graph is not lost to the keyboard. `onActivate`, when
-     given, also wires Enter/Space to whatever the element's own click does,
-     since a focusable node or edge that only a mouse can act on is still
-     a trap. */
-  function wireHoverTip(element, tipText, onActivate) {
-    element.tabIndex = 0;
-    element.setAttribute('role', onActivate ? 'button' : 'img');
-    element.setAttribute('aria-label', tipText.replace(/\n/g, '; '));
-    element.addEventListener('mousemove', (event) => {
-      if (!topoState.panDrag) App.tooltip(tipText, event);
-    });
-    element.addEventListener('mouseleave', App.hideTooltip);
-    element.addEventListener('focus', () => {
-      if (topoState.panDrag) return;
-      const box = element.getBoundingClientRect();
-      App.tooltip(tipText, { clientX: box.left + box.width / 2, clientY: box.bottom });
-    });
-    element.addEventListener('blur', App.hideTooltip);
-    if (onActivate) {
-      element.addEventListener('keydown', (event) => {
-        if (event.key !== 'Enter' && event.key !== ' ') return;
-        event.preventDefault();
-        onActivate();
-      });
-    }
-  }
-
-  function topoNodeBox(x, y, node) {
-    const g = App.svgNode('g', { transform: `translate(${x},${y})` });
-    const color = node.unknown ? 'var(--line)' : (STATUS_COLOR[node.status] || 'var(--line)');
-    g.appendChild(App.svgNode('rect', {
-      width: TOPO_NODE_W, height: TOPO_NODE_H, rx: 5,
-      fill: 'var(--raised)', stroke: color, 'stroke-width': node.unknown ? 1 : 1.5,
-      'stroke-dasharray': node.unknown ? '4 3' : null,
-    }));
-    g.appendChild(App.svgNode('circle', { cx: 13, cy: TOPO_NODE_H / 2, r: 4, fill: color }));
-    g.appendChild(App.svgNode('text', {
-      x: 25, y: TOPO_NODE_H / 2 + 4, fill: 'var(--text)',
-      'font-family': 'var(--ui)', 'font-size': 'var(--fs-2xs)',
-    }, truncateLabel(node.name || node.ip || `#${node.id}`)));
-    const tipText = node.unknown
-      ? `${node.name || 'Unidentified neighbour'} — not in Nodes`
-      : `${node.name}${node.ip && node.ip !== node.name ? ` (${node.ip})` : ''} — ${node.status}`;
-    const activate = node.unknown ? null : () => {
-      if (topoState.dragMoved) return;
-      App.rememberSub('nodes', 'devices');
-      selectSub('devices');
-      selectDevice(node.id);
-    };
-    wireHoverTip(g, tipText, activate);
-    if (activate) {
-      g.style.cursor = 'pointer';
-      g.addEventListener('click', activate);
-    }
-    return g;
-  }
-
-  function topologyEmptyState(svg, wrap, message) {
-    // A lattice of every device as its own disconnected box (the isolated
-    // grid in topoLayout) is not a topology — it is 62 identical boxes with
-    // nothing to say about how they relate. When there is nothing to draw
-    // this shows the same plain .empty block every other page uses instead,
-    // rather than filling the canvas with a picture of the absence.
-    // style.display, not the `hidden` property: a bare <svg> root does not
-    // reflect `.hidden` onto the content attribute in every engine, so
-    // [hidden]'s display:none never applied and the box stayed laid out at
-    // its full height with the message pushed below the fold.
-    svg.style.display = 'none';
-    let empty = wrap.querySelector(':scope > .empty');
-    if (!empty) {
-      empty = document.createElement('div');
-      empty.className = 'empty';
-      wrap.appendChild(empty);
-    }
-    empty.textContent = message;
-    wrap.removeAttribute('tabindex');
-    wrap.removeAttribute('role');
-    wrap.removeAttribute('aria-label');
-  }
-
-  function drawTopology() {
-    const svg = App.el('nd-topo-svg');
-    const wrap = App.el('nd-topo-canvas');
-    if (!svg || !wrap) return;
-    svg.innerHTML = '';
-    svg.style.display = '';
-    const empty = wrap.querySelector(':scope > .empty');
-    if (empty) empty.remove();
-    const box = wrap.getBoundingClientRect();
-    const width = Math.max(box.width, 300), height = Math.max(box.height, 200);
-    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
-    const topo = view.topology;
-    const countText = topo
-      ? `${topo.nodes.length} device(s), ${topo.edges.length} link(s)` : 'no devices';
-    App.el('nd-topo-count').textContent = topo ? countText : '';
-    if (!topo || !topo.nodes.length) {
-      topologyEmptyState(svg, wrap, 'No devices yet. Add one on the Devices subtab to see it here.');
-      return;
-    }
-    if (!topo.edges.length) {
-      topologyEmptyState(svg, wrap, `${topo.nodes.length} device(s), no links between them yet. ` +
-        'LLDP or CDP has to be enabled and answering on them before a connection can be drawn here.');
-      return;
-    }
-    wrap.tabIndex = 0;
-    wrap.setAttribute('role', 'img');
-    wrap.setAttribute('aria-label', `Neighbour topology: ${countText}. Tab into it for each device and link.`);
-
-    const positions = topoLayout(topo.nodes, topo.edges);
-    const group = App.svgNode('g');
-    const edgeLayer = App.svgNode('g');
-    const nodeLayer = App.svgNode('g');
-    group.append(edgeLayer, nodeLayer);
-    svg.appendChild(group);
-
-    const byId = new Map(topo.nodes.map((n) => [String(n.id), n]));
-    for (const edge of topo.edges) {
-      const a = positions.get(String(edge.a_device_id));
-      const b = positions.get(String(edge.b_device_id));
-      if (!a || !b) continue;
-      const line = App.svgNode('line', {
-        x1: a.x + TOPO_NODE_W / 2, y1: a.y + TOPO_NODE_H / 2,
-        x2: b.x + TOPO_NODE_W / 2, y2: b.y + TOPO_NODE_H / 2,
-        stroke: edge.unknown ? 'var(--line)' : 'var(--accent)', 'stroke-width': 1.5,
-        'stroke-dasharray': edge.unknown ? '5 4' : null,
-      });
-      const aNode = byId.get(String(edge.a_device_id)) || {};
-      const bNode = byId.get(String(edge.b_device_id)) || {};
-      const tipText = `${aNode.name || edge.a_device_id} (${edge.a_port || '—'}) ` +
-        `↔ ${bNode.name || edge.b_device_id} (${edge.b_port || '—'})\n` +
-        `${(edge.protocols || []).join(', ').toUpperCase()}` +
-        `${edge.unknown ? ' — unidentified neighbour' : ''}`;
-      line.style.cursor = 'pointer';
-      // click, not just hover, so a touch or keyboard-driven pointer can
-      // still get at the local/remote port label the task calls for.
-      const showLink = () => {
-        if (topoState.dragMoved) return;
-        App.toast(tipText.replace('\n', ' — '), 'ok');
-      };
-      wireHoverTip(line, tipText, showLink);
-      line.addEventListener('click', showLink);
-      edgeLayer.appendChild(line);
-    }
-    for (const node of topo.nodes) {
-      const p = positions.get(String(node.id));
-      if (p) nodeLayer.appendChild(topoNodeBox(p.x, p.y, node));
-    }
-    topoFit(svg, group, width, height);
-  }
-
-  /* Pan/zoom: netpath.js's own fit/translation/pointerAt/wheelZoom/
-     beginPan/movePan/endPan technique, scoped to topoState and this
-     module's own element ids rather than shared code, since the two
-     graphs' node/edge shapes have nothing else in common. */
-  function topoFit(svg, group, width, height) {
-    const bounds = group.getBBox ? group.getBBox() : null;
-    if (!bounds || !bounds.width) return;
-    if (!topoState.userZoom) {
-      topoState.zoom = Math.min(width / (bounds.width + 80), height / (bounds.height + 80), 1);
-      topoState.pan = { x: 0, y: 0 };
-    }
-    topoState.frame = { width, height, cx: bounds.x + bounds.width / 2, cy: bounds.y + bounds.height / 2 };
-    const t = topoTranslation(topoState.zoom);
-    group.setAttribute('transform', `translate(${t.tx},${t.ty}) scale(${topoState.zoom})`);
-  }
-
-  function topoTranslation(scale) {
-    const f = topoState.frame;
-    return { tx: f.width / 2 - f.cx * scale + topoState.pan.x,
-             ty: f.height / 2 - f.cy * scale + topoState.pan.y };
-  }
-
-  function topoPointerAt(event, svg) {
-    const rect = svg.getBoundingClientRect();
-    return {
-      x: (event.clientX - rect.left) * (topoState.frame.width / Math.max(rect.width, 1)),
-      y: (event.clientY - rect.top) * (topoState.frame.height / Math.max(rect.height, 1)),
-    };
-  }
-
-  function topoWheelZoom(event) {
-    if (!topoState.frame) return;
-    event.preventDefault();
-    const factor = event.deltaY < 0 ? 1.15 : 1 / 1.15;
-    const from = topoState.zoom;
-    const to = from * factor;
-    if (to < 0.15 || to > 4) return;
-    const svg = App.el('nd-topo-svg');
-    const pointer = topoPointerAt(event, svg);
-    const before = topoTranslation(from);
-    const sceneX = (pointer.x - before.tx) / from;
-    const sceneY = (pointer.y - before.ty) / from;
-    const f = topoState.frame;
-    topoState.pan.x = pointer.x - sceneX * to - (f.width / 2 - f.cx * to);
-    topoState.pan.y = pointer.y - sceneY * to - (f.height / 2 - f.cy * to);
-    topoState.zoom = to;
-    topoState.userZoom = true;
-    drawTopology();
-  }
-
-  function topoBeginPan(event) {
-    if (event.button !== 0 || !event.isPrimary || !topoState.frame) return;
-    event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    const selection = window.getSelection();
-    if (selection) selection.removeAllRanges();
-    topoState.panDrag = { x: event.clientX, y: event.clientY, pan: { ...topoState.pan } };
-    topoState.dragMoved = false;
-    App.el('nd-topo-svg').classList.add('dragging');
-  }
-
-  function topoMovePan(event) {
-    if (!topoState.panDrag) return;
-    const svg = App.el('nd-topo-svg');
-    const rect = svg.getBoundingClientRect();
-    const scaleX = topoState.frame.width / Math.max(rect.width, 1);
-    const scaleY = topoState.frame.height / Math.max(rect.height, 1);
-    const dx = (event.clientX - topoState.panDrag.x) * scaleX;
-    const dy = (event.clientY - topoState.panDrag.y) * scaleY;
-    App.hideTooltip();
-    if (Math.abs(dx) + Math.abs(dy) > 3) { topoState.dragMoved = true; topoState.userZoom = true; }
-    topoState.pan.x = topoState.panDrag.pan.x + dx;
-    topoState.pan.y = topoState.panDrag.pan.y + dy;
-    drawTopology();
-  }
-
-  function topoEndPan() {
-    if (!topoState.panDrag) return;
-    topoState.panDrag = null;
-    App.el('nd-topo-svg').classList.remove('dragging');
-  }
-
-  function topoZoomBy(factor) {
-    const next = topoState.zoom * factor;
-    if (next < 0.15 || next > 4) return;
-    topoState.zoom = next;
-    topoState.userZoom = true;
-    drawTopology();
-  }
-
-  function topoResetView() {
-    topoState.userZoom = false;
-    topoState.pan = { x: 0, y: 0 };
-    drawTopology();
-  }
-
   /* The selected job's `id:state:probed:responded:identified` as of the last
      tick the Discovery pane was actually on screen. The jobs list carries all
      five, so "has this sweep moved?" is answered by the list fetch that
@@ -4915,6 +4664,8 @@
         ${number('np-timeout', 'Default SNMP timeout', s.default_snmp_timeout_s, 'min=0.5 step=0.5')} s
         ${number('np-retries', 'Default SNMP retries', s.default_snmp_retries, 'min=0')}
         ${number('np-downafter', 'Consecutive failures before "down"', s.down_after_failures, 'min=1')}
+        ${number('np-snmpfailafter', 'SNMP polls missed before "SNMP failing" alert',
+                 s.snmp_fail_alert_after, 'min=1')}
         ${check('np-pingonly', 'A device is DOWN only when ping and SNMP both fail', s.unreachable_ping_only)}
         <p class="hint">With this on (the default), a device that still answers ping
           but whose SNMP is failing stays UP and shows its SNMP error, rather than
@@ -5028,6 +4779,7 @@
           default_interval_s: num('#np-interval'), focus_poll_interval_s: num('#np-focus'),
           default_snmp_timeout_s: num('#np-timeout'),
           default_snmp_retries: num('#np-retries'), down_after_failures: num('#np-downafter'),
+          snmp_fail_alert_after: num('#np-snmpfailafter'),
           unreachable_ping_only: on('#np-pingonly'),
           ping_count: num('#np-pingcount'),
           ping_timeout_ms: num('#np-pingtimeout'),
@@ -5105,7 +4857,6 @@
       App.get('/api/nodes/device-groups'),
       App.get('/api/nodes/mibs'),
       loadDiscJobsIfNeeded(),
-      topologyVisible() ? loadTopology().catch(() => {}) : Promise.resolve(),
     ]);
     // A newer refresh already redrew this, or the operator has left.
     if (view.refreshGen !== generation || App.state.tab !== 'nodes') return;
@@ -5366,31 +5117,17 @@
     App.el('nd-import-devices').onclick = importDevicesDialog;
     App.el('nd-export-csv').onclick = exportDevicesCsv;
     App.el('nd-if-export-csv').onclick = exportInterfacesCsv;
-    // Topology: pointer events carry the pan/zoom gesture; the buttons are
-    // the keyboard/no-wheel fallback — see topoZoomBy/topoResetView.
-    const topoSvg = App.el('nd-topo-svg');
-    if (topoSvg) {
-      topoSvg.addEventListener('wheel', topoWheelZoom, { passive: false });
-      topoSvg.addEventListener('pointerdown', topoBeginPan);
-      topoSvg.addEventListener('pointermove', topoMovePan);
-      topoSvg.addEventListener('pointerup', topoEndPan);
-      topoSvg.addEventListener('pointercancel', topoEndPan);
-    }
-    App.el('nd-topo-zoom-in').onclick = () => topoZoomBy(1.25);
-    App.el('nd-topo-zoom-out').onclick = () => topoZoomBy(0.8);
-    App.el('nd-topo-reset').onclick = topoResetView;
-    App.el('nd-topo-export-csv').onclick = () => App.exportCsv('/api/nodes/topology/export.csv', {});
     // Injected rather than declared in index.html, the same reason alerts.js
     // hand-builds its own Maintenance windows/Bulk mute buttons: this needs
-    // no write grant to open (reading suggestions is a Nodes-read question,
-    // same as the diagram beside it), so it is not behind data-requires-write
-    // — the dialog itself hides Apply for an account that cannot use it.
+    // no write grant to open (reading suggestions is a Nodes-read question),
+    // so it is not behind data-requires-write — the dialog itself hides
+    // Apply for an account that cannot use it.
     const upstreamBtn = document.createElement('button');
-    upstreamBtn.id = 'nd-topo-upstream-suggestions';
+    upstreamBtn.id = 'nd-upstream-suggestions';
     upstreamBtn.textContent = 'Upstream suggestions';
     upstreamBtn.onclick = () => upstreamSuggestionsDialog().catch((error) =>
       App.toast(`Could not open upstream suggestions: ${error.message}`, 'fail'));
-    App.el('nd-topo-export-csv').insertAdjacentElement('afterend', upstreamBtn);
+    App.el('nd-manage-devgroups').insertAdjacentElement('afterend', upstreamBtn);
     App.el('nd-page-size').onchange = () => { view.pageOffset = 0; App.refreshNow('nodes'); };
     App.el('nd-page-prev').onclick = () => {
       view.pageOffset = Math.max(0, view.pageOffset - view.pageLimit);
@@ -5403,6 +5140,10 @@
     };
     App.el('nd-edit-device').onclick = editDevice;
     App.el('nd-ssh-device').onclick = sshDevice;
+    App.el('nd-web-device').onclick = (ev) => {
+      const url = ev.currentTarget.dataset.url;
+      if (url) window.open(url, '_blank', 'noopener');
+    };
     // The "?" beside it, from the one helper that renders every help link.
     App.el('nd-ssh-help').innerHTML = App.helpLink('nodes.device.ssh');
     App.el('nd-browse-oids').onclick = oidBrowser;
@@ -5550,13 +5291,6 @@
     if (name === 'discovery' && view.discSelected) {
       loadDiscResults().catch(() => {});
     }
-    // Coming to Topology the same way: the live re-fetch above only runs
-    // while this subtab was already on screen, so switching TO it needs
-    // its own fetch rather than waiting for the next refresh tick — and a
-    // freshly opened pane with a stale svg from last time reads as broken.
-    if (name === 'topology') {
-      loadTopology().catch(() => {});
-    }
   }
 
   function selectDetailSub(name) {
@@ -5568,8 +5302,8 @@
      Rolling a device's alerts up under its upstream's outage (alertrules.py's
      ROLLED_UP_BY) needs devices.upstream_id set, and a guessed neighbour
      match may never drive that on its own. nodesdb.upstream_suggestions()
-     computes the same LLDP/CDP matches the Topology diagram draws; this
-     dialog is what turns one into an operator's decision. Nothing here ever
+     turns the same LLDP/CDP matches into candidates for this dialog, which
+     is what turns one into an operator's decision. Nothing here ever
      applies one by itself — every assignment sent to the apply route came
      from a checkbox or a radio an operator actually set. */
 
@@ -5666,37 +5400,22 @@
     const suggestions = payload.suggestions || [];
     const writable = App.canWrite('nodes');
     if (!suggestions.length) {
-      // total: 0 alone covers three different situations an operator reads
-      // very differently — LLDP/CDP has never walked; it walked and nothing
+      // total: 0 covers a few different situations an operator reads very
+      // differently — LLDP/CDP has never walked; it walked and nothing
       // reported resolved to a known device; or it resolved plenty, but
-      // every one of those devices already has an upstream set, and this
-      // is a finished job, not an empty one. lldp_walks (node_poller's own
-      // counter, already on App.state from every poll) tells the first
-      // apart from the other two for free. Telling THOSE two apart needs a
-      // second look: the fleet-wide topology graph draws a line for every
-      // matched neighbour regardless of upstream_id, so edges with no
-      // suggestions left is "done", and no edges at all is "found nothing".
-      // One extra fetch, only on the empty path, never on every poll.
+      // every one of those devices already has an upstream set. lldp_walks
+      // (node_poller's own counter, already on App.state from every poll)
+      // tells the first apart from the rest for free; the rest collapse
+      // into one honest sentence rather than a second fetch to tell them
+      // apart.
       const walks = ((App.state.serverState || {}).nodes || {}).counters || {};
-      let lead;
-      if (!walks.lldp_walks) {
-        lead = 'No suggestions yet. Neighbour discovery (LLDP/CDP) runs as ' +
+      const lead = !walks.lldp_walks
+        ? 'No suggestions yet. Neighbour discovery (LLDP/CDP) runs as ' +
           'part of the regular poll cycle and has not completed a walk yet ' +
-          '— check back once devices have been polled a few times.';
-      } else {
-        let hasLinks = false;
-        try {
-          const topo = await App.get('/api/nodes/topology');
-          hasLinks = (topo.edges || []).length > 0;
-        } catch (error) { /* best effort: falls back to the generic sentence */ }
-        lead = hasLinks
-          ? 'No upstream suggestions right now — every device with a ' +
-            'matched neighbour already has an upstream set. Nothing left ' +
-            'to review.'
-          : 'No upstream suggestions right now — neighbour discovery has ' +
-            'run, but none of the reported neighbours matched another ' +
-            'device in this fleet.';
-      }
+          '— check back once devices have been polled a few times.'
+        : 'No upstream suggestions right now — either every device with a ' +
+          'matched neighbour already has an upstream set, or none of the ' +
+          'reported neighbours matched another device in this fleet.';
       App.modal('Upstream suggestions', `<p class="hint">${lead}</p>`,
         [{ label: 'Close', onClick: App.closeModal }]);
       return;

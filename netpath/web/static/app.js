@@ -3691,6 +3691,313 @@ const App = (() => {
     (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;',
               "'": '&#39;', '`': '&#96;' }[c]));
 
+  /* ------------------------------------------------- sortable hand tables
+
+     Click-to-sort was the grid's trick alone: every plain <table> a module
+     builds for itself — a dialog's device list, the Debug page's worker
+     tables, Settings' permission grid, close to twenty of them — sat there
+     unsortable, because sorting was something a caller opted a grid into
+     and none of these ever went through the grid. Teaching each renderer to
+     opt in is also teaching the next one that gets written, forever, so
+     instead one delegated pair of listeners on `document` makes every plain
+     table with a header row sortable on its own, the same way a11yTable
+     just above already reaches into markup none of these functions asked it
+     to touch.
+
+     The one thing a delegated listener cannot do for a table that redraws
+     itself with `table.innerHTML = head; table.appendChild(newBody)` on
+     every refresh tick is remember what it was sorted by — the very <th> a
+     click landed on is destroyed and rebuilt moments later with no memory
+     of its own. So the choice is kept as a dataset pair on the <table>
+     element itself, which persists across that rebuild (App.el(id) hands
+     back the same node every tick; only its children are ever replaced),
+     and a MutationObserver on document.body reapplies it whenever such a
+     table's body changes — the one hook that reaches every one of these
+     renderers without editing any of them. */
+
+  // '—'/'-' are this codebase's own convention for "nothing here" (App.when,
+  // App.agoCell and a dozen hand-built cells all use it), so a sort has to
+  // recognise it as empty too or "no value yet" rows would sort as if a
+  // dash outranked every real one.
+  function isBlankCell(text) {
+    return text === '' || text === '—' || text === '-' || text === '–';
+  }
+
+  // The header row a plain (non-grid) table sorts by, in either shape this
+  // codebase's own hand-built tables use: a real <thead>, or — several
+  // dialogs and the interface drill-down's sensor/MAC tables — a bare first
+  // <tr> of <th> cells with no <thead> wrapper at all. A .grid table is
+  // App.grid's own and is never handled here.
+  function plainHeaderRow(table) {
+    if (!table || table.tagName !== 'TABLE' || table.classList.contains('grid')) return null;
+    const tr = table.tHead ? table.tHead.rows[0]
+      : (table.tBodies[0] && table.tBodies[0].rows[0]);
+    return (tr && tr.cells.length && [...tr.cells].every((c) => c.tagName === 'TH'))
+      ? tr : null;
+  }
+
+  // Every row the sort may reorder, minus the header (folded into the same
+  // <tbody> when there is no <thead> to hold it apart) and minus any row
+  // App.emptyRow-shaped — a colspan wider than one cell, an empty-state or
+  // group-header sentence rather than a data row — which the caller for
+  // this table decided belongs wherever it is, so a sort leaves it in place
+  // at the end rather than mixing it into the ordering.
+  function plainSortableRows(table, header) {
+    const rows = (table.tHead ? [...table.tBodies].flatMap((b) => [...b.rows])
+      : [...table.tBodies[0].rows]).filter((r) => r !== header);
+    const pinned = rows.filter((r) => [...r.cells].some((c) => c.hasAttribute('colspan')));
+    const movable = rows.filter((r) => !pinned.includes(r));
+    return { movable, pinned };
+  }
+
+  // The leading number in the cell, commas and a currency/percent/unit
+  // symbol stripped from around it — "$1,234.50", "42%" and "3.2 Mbps" all
+  // read as their number, the same forgiving read App.rate's own callers
+  // already expect of a formatted figure.
+  function numericCellValue(text) {
+    const match = text.replace(/,/g, '').match(/-?\d+(\.\d+)?/);
+    return match ? parseFloat(match[0]) : null;
+  }
+
+  const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+
+  function ipv4Value(text) {
+    const m = text.match(IPV4_RE);
+    if (!m) return null;
+    const octets = m.slice(1, 5).map(Number);
+    return octets.some((o) => o > 255) ? null
+      : octets.reduce((acc, o) => acc * 256 + o, 0);
+  }
+
+  // A whole cell that reads as one number plus decoration, not a number
+  // buried inside a sentence — "Row 5" and "invalid: bad checksum 4" must
+  // not sort as 5 and 4, so the match has to cover the entire trimmed text.
+  function looksNumeric(text) {
+    return /^[+-]?[$€£]?[\d,]+(\.\d+)?\s*[%a-zA-Z°/]*$/.test(text)
+      && numericCellValue(text) !== null;
+  }
+
+  function looksLikeDate(text) {
+    return !looksNumeric(text) && !Number.isNaN(Date.parse(text));
+  }
+
+  function looksLikeIp(text) {
+    return IPV4_RE.test(text) || (text.includes(':') && /^[0-9a-fA-F:]+$/.test(text));
+  }
+
+  // Sniffed from the column's own rendered text rather than declared by a
+  // caller — a hand-built table has no column metadata to declare it with —
+  // the same majority-rules read isMono above gives a column name, applied
+  // here to its values instead.
+  function sniffColumnKind(values) {
+    const seen = values.filter((v) => !isBlankCell(v));
+    if (!seen.length) return 'text';
+    const ratio = (test) => seen.filter(test).length / seen.length;
+    if (ratio(looksLikeIp) > 0.8) return 'ip';
+    if (ratio(looksLikeDate) > 0.8) return 'date';
+    if (ratio(looksNumeric) > 0.8) return 'numeric';
+    return 'text';
+  }
+
+  function rawCompare(a, b, kind) {
+    if (kind === 'numeric') return (numericCellValue(a) ?? 0) - (numericCellValue(b) ?? 0);
+    if (kind === 'date') return Date.parse(a) - Date.parse(b);
+    if (kind === 'ip') {
+      const av = ipv4Value(a);
+      const bv = ipv4Value(b);
+      // A v4 address sorts numerically; a v6 address sorts as the string it
+      // is — there is no shorter numeric form worth parsing one into here —
+      // and the two mixed in one column fall back to the same string
+      // compare rather than a value only one side actually has.
+      return (av !== null && bv !== null) ? av - bv : a.localeCompare(b);
+    }
+    return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+  }
+
+  // Blank cells sort last whichever direction the column runs — reversing a
+  // sort must not drag "nothing here yet" rows up past real ones — so the
+  // direction only ever flips the comparison between two cells that both
+  // hold something.
+  function cellCompare(a, b, kind, descending) {
+    const aBlank = isBlankCell(a);
+    const bBlank = isBlankCell(b);
+    if (aBlank && bBlank) return 0;
+    if (aBlank) return 1;
+    if (bBlank) return -1;
+    const cmp = rawCompare(a, b, kind);
+    return descending ? -cmp : cmp;
+  }
+
+  // Reorders `table`'s body to sort by its `colIndex`-th column, and marks
+  // the header the way App.grid marks its own. Skips the actual DOM move
+  // when the rows are already in the wanted order — reapplyPlainSort below
+  // calls this on every redraw a sorted table makes, and appendChild-ing an
+  // unchanged order would still fire the childList mutation the reapply is
+  // watching for, looping the observer against its own writes forever.
+  function sortPlainTable(table, colIndex, descending) {
+    const header = plainHeaderRow(table);
+    if (!header || !header.cells[colIndex]) return;
+    const { movable, pinned } = plainSortableRows(table, header);
+    const values = movable.map((r) =>
+      (r.cells[colIndex] ? r.cells[colIndex].textContent.trim() : ''));
+    const kind = sniffColumnKind(values);
+    const order = movable.map((row, i) => ({ row, value: values[i] }));
+    order.sort((a, b) => cellCompare(a.value, b.value, kind, descending));
+    const wanted = [...order.map((o) => o.row), ...pinned];
+    const current = [...movable, ...pinned];
+    const unchanged = wanted.length === current.length
+      && wanted.every((row, i) => row === current[i]);
+    if (!unchanged) {
+      const body = table.tBodies[table.tBodies.length - 1];
+      const frag = document.createDocumentFragment();
+      for (const row of wanted) frag.appendChild(row);
+      body.appendChild(frag);
+    }
+    [...header.cells].forEach((th, i) => {
+      const caret = th.querySelector(':scope > .sort-caret');
+      th.classList.remove('sort-asc', 'sort-desc');
+      if (i === colIndex) {
+        th.classList.add(descending ? 'sort-desc' : 'sort-asc');
+        th.setAttribute('aria-sort', descending ? 'descending' : 'ascending');
+        if (caret) caret.textContent = descending ? '▼' : '▲';
+      } else if (th.classList.contains('sortable')) {
+        th.setAttribute('aria-sort', 'none');
+      }
+    });
+  }
+
+  // textContent alone, not what a sighted user reads: the discovery jobs
+  // table's Action column is `<th><span class="sr-only">Action</span></th>`
+  // — a name for a screen reader, not a label anyone sees to sort by — and
+  // counting it as a label would put a lone caret over an otherwise blank
+  // header, sorting a column of Cancel/Remove buttons by their own text.
+  function visibleHeaderText(th) {
+    if (!th.querySelector('.sr-only')) return th.textContent.trim();
+    const clone = th.cloneNode(true);
+    for (const hidden of clone.querySelectorAll('.sr-only')) hidden.remove();
+    return clone.textContent.trim();
+  }
+
+  // Marks up a plain table's header the way App.grid marks its own —
+  // .sortable, a caret, role and tabindex — the first time this exact <th>
+  // is seen (a rebuilt header is a brand new element, so this simply runs
+  // again next tick rather than ever finding stale state to skip). A column
+  // with nothing to sort by — a select-all checkbox, an actions column with
+  // no visible label — has no column config here to say `sortable: false`
+  // with, so an empty or control-only header opts itself out, the same
+  // outcome App.grid's callers reach by hand.
+  //
+  // role stays "columnheader", not "button": aria-sort is only defined for
+  // a columnheader/rowheader role, so a plain table's header keeps the same
+  // role the grid's own already carries, rather than reading correctly to
+  // the eye and announcing nothing useful to a screen reader.
+  function decoratePlainHeader(table) {
+    const header = plainHeaderRow(table);
+    if (!header) return;
+    for (const th of header.cells) {
+      if (th.classList.contains('sortable')) continue;
+      if (!visibleHeaderText(th) || th.querySelector('input, button, select, a, label')) continue;
+      th.classList.add('sortable');
+      th.setAttribute('role', 'columnheader');
+      th.tabIndex = 0;
+      if (!th.hasAttribute('aria-sort')) th.setAttribute('aria-sort', 'none');
+      const caret = document.createElement('span');
+      caret.className = 'sort-caret';
+      caret.textContent = '▲';
+      caret.setAttribute('aria-hidden', 'true');
+      th.appendChild(caret);
+    }
+  }
+
+  function reapplyPlainSort(table) {
+    if (table.dataset.sortCol === undefined) return;
+    sortPlainTable(table, Number(table.dataset.sortCol), table.dataset.sortDesc === '1');
+  }
+
+  function activatePlainSort(th) {
+    const table = th.closest('table');
+    const header = plainHeaderRow(table);
+    if (!header || th.parentElement !== header) return;
+    const colIndex = [...header.cells].indexOf(th);
+    const descending = table.dataset.sortCol === String(colIndex)
+      ? table.dataset.sortDesc !== '1' : false;
+    table.dataset.sortCol = String(colIndex);
+    table.dataset.sortDesc = descending ? '1' : '0';
+    sortPlainTable(table, colIndex, descending);
+  }
+
+  // The public door into all of the above, for the one caller that cannot
+  // just wait for the MutationObserver below to reach its table on its own
+  // — a table filled and read back for layout in the same synchronous
+  // block. Everything else in the product never has to call this: opening
+  // any tab, dialog or Debug's worker list is enough.
+  function sortableTable(table) {
+    decoratePlainHeader(table);
+    reapplyPlainSort(table);
+    return table;
+  }
+
+  document.addEventListener('click', (event) => {
+    const th = event.target.closest('th.sortable');
+    if (!th) return;
+    const table = th.closest('table');
+    if (!table || table.classList.contains('grid')) return;
+    // A click that lands on a control inside the header — the discovery
+    // dialog's select-all checkbox lives in the first <th> of a plain table
+    // exactly like App.grid's own does — is a click on that control, not a
+    // sort request. The boxes themselves already call stopPropagation for
+    // this; this is the backstop for the header that adds one later and
+    // forgets.
+    if (event.target.closest('input, button, select, a, label')) return;
+    activatePlainSort(th);
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ' && event.key !== 'Spacebar') return;
+    const th = event.target;
+    if (!th.classList || !th.classList.contains('sortable') || th.tagName !== 'TH') return;
+    const table = th.closest('table');
+    if (!table || table.classList.contains('grid')) return;
+    // Space would otherwise scroll the pane out from under the table, same
+    // reasoning as App.grid's own header keydown above.
+    event.preventDefault();
+    activatePlainSort(th);
+  });
+
+  // Watches for exactly the two things a plain table's own renderer does to
+  // it: a fresh header (needs decorating) and a fresh body (needs whatever
+  // sort was last chosen for it re-applied, since drawRows/innerHTML redraw
+  // in the server's own order every time, not the order a click last left
+  // it in). `childList` on the whole document body rather than one observer
+  // per table, because nothing here knows the full set of table ids up
+  // front — Settings alone builds several past first paint, on demand,
+  // inside a dialog. Cheap in practice: most ticks touch one tab's tables,
+  // and reapplyPlainSort no-ops instantly for a table with no stored sort.
+  function watchPlainTables() {
+    const observer = new MutationObserver((mutations) => {
+      const tables = new Set();
+      for (const mutation of mutations) {
+        const table = mutation.target.nodeType === 1 ? mutation.target.closest('table') : null;
+        if (table) tables.add(table);
+        for (const node of mutation.addedNodes) {
+          if (node.nodeType !== 1) continue;
+          if (node.tagName === 'TABLE') tables.add(node);
+          else if (node.querySelectorAll) {
+            for (const t of node.querySelectorAll('table')) tables.add(t);
+          }
+        }
+      }
+      for (const table of tables) {
+        if (!table.isConnected || table.classList.contains('grid')) continue;
+        decoratePlainHeader(table);
+        reapplyPlainSort(table);
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+  if (document.body) watchPlainTables();
+  else document.addEventListener('DOMContentLoaded', watchPlainTables);
+
   /* ------------------------------------------------- choosing columns
 
      Which columns a table shows. Lifted out of the Wireless module, which
@@ -4345,7 +4652,7 @@ const App = (() => {
     return true;
   }
 
-  /* A tab's own top-level subtabs (Nodes' DEVICES/TOPOLOGY/…, Alerts',
+  /* A tab's own top-level subtabs (Nodes' DEVICES/DISCOVERY/…, Alerts',
      IPAM's, Settings') are not entity selections — they have no module of
      their own to hand a route to — so they are matched and clicked here,
      generically, before the route reaches the module at all. Clicking the
@@ -4968,6 +5275,7 @@ const App = (() => {
     statusPatternDefs, statusPatternUrl, statusMark,
     visibleColumns, readColumnPicker, drawRows, escapeHtml,
     refreshSelectAll, columnPickerFieldset, wireColumnPickers,
+    sortableTable,
   };
   window.App = api;
   return api;

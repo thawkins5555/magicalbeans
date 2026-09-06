@@ -57,7 +57,15 @@ CISCO_PERSONAS = {
 }
 DOCUMENTED_REFUSAL = {
     "cisco-truncate": "The device closed the connection before the config finished",
-    "unprivileged": "too short to be a config",
+    # "unprivileged" is the exact bug "cisco" now carries enable_command
+    # for: an account whose login lands in user EXEC ('>'). Before that fix
+    # this landed straight on show running-config's "% Invalid input..." and
+    # was reported as the generic, misleading "too short to be a config".
+    # Now _pull_config tries to escalate first — this persona has no
+    # enable_command handling at all, so the attempt fails and the account
+    # never reaches privileged EXEC, which is the correct, actionable
+    # diagnosis for what this persona models (no working enable secret).
+    "unprivileged": "The account did not reach privileged mode",
 }
 
 print("every Cisco persona in demo.fake_ssh.PERSONAS")
@@ -131,6 +139,44 @@ try:
     client.close()
     sent = b"".join(device.sent_bytes).decode("utf-8", "replace")
     check("no 'enable' was ever sent to a vendor with no enable_command",
+          "enable" not in sent, repr(sent))
+finally:
+    device.close()
+
+# ------------------- 4b. plain "cisco": enable only fires on a '>' prompt
+# The bug this section exists for: an SSH account that lands in user EXEC
+# (prompt ends '>') got "% Invalid input detected at '^' marker." back from
+# `show running-config`, which _capture_problem could only ever report as
+# "too short to be a config" — because "cisco" carried no enable_command at
+# all. Two personas, same vendor key, prove both halves: a '>' login
+# escalates via enable before pager_off/show, and a '#' login (already
+# privileged) never sends enable in the first place.
+print("cisco: a '>' prompt escalates via enable, then sends pager_off and show")
+device = stub_ssh_device.StubDevice(persona=fake_ssh.PERSONAS["cisco-unpriv-enable"])
+try:
+    client = connect(device.port)
+    raw, ended = configrx._pull_config(client, configrx.resolve("cisco"), max_s=15,
+                                       enable_secret="demo")
+    client.close()
+    cleaned = configrx._clean_output(raw)
+    problem = configrx._capture_problem(cleaned, ended)
+    check("STORED (no capture problem)", problem == "", problem)
+    check("the captured text is this persona's own config",
+          "hostname acc-sw-001" in cleaned, cleaned[:200])
+    sent = b"".join(device.sent_bytes).decode("utf-8", "replace")
+    check("sent bytes are exactly enable, the secret, pager_off, then show — in that order",
+          sent == "enable\ndemo\nterminal length 0\nshow running-config\n", repr(sent))
+finally:
+    device.close()
+
+print("cisco: a '#' prompt (already privileged) never sends enable")
+device = stub_ssh_device.StubDevice(persona=fake_ssh.PERSONAS["cisco"])
+try:
+    client = connect(device.port)
+    configrx._pull_config(client, configrx.resolve("cisco"), max_s=15)
+    client.close()
+    sent = b"".join(device.sent_bytes).decode("utf-8", "replace")
+    check("no 'enable' was ever sent to an account already at a '#' prompt",
           "enable" not in sent, repr(sent))
 finally:
     device.close()

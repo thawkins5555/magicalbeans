@@ -594,6 +594,63 @@ _clear_secret = CONFIGRX[CONFIGRX.index("function wireEnableSecretClear("):
 check("App.confirmDestructive(" in _clear_secret,
       "#cx-enable-secret-clear confirms before deleting the stored enable secret")
 
+# ---------------------------------------------------------------------------
+# 26. Every table sorts by clicking a header, one way or the other. App.grid
+#     is the shared, ~30-caller way; the close to twenty tables a module
+#     built for itself instead (a dialog's device list, Debug's worker
+#     tables, Settings' permission grid) never had either, so app.js now
+#     runs a second mechanism for those — App.sortableTable plus a
+#     document-level click/keydown pair and the MutationObserver that keeps
+#     a redrawn table's sort intact. This is the one-line-of-grep guard that
+#     a later pass does not quietly delete half of that (all three, or none,
+#     since a click handler with no MutationObserver behind it would lose
+#     its sort on the very first live poll tick).
+check("function sortableTable(table)" in APP, "app.js defines App.sortableTable")
+check(bool(re.search(r"sortableTable\s*,\s*\n?\s*\};", APP))
+      or bool(re.search(r"\bsortableTable,", APP[APP.index("const api = {"):])),
+      "App.sortableTable is exported on the api object")
+check("new MutationObserver" in APP and "reapplyPlainSort" in APP,
+      "app.js re-applies a plain table's remembered sort via a MutationObserver")
+check(bool(re.search(r"addEventListener\('click',[\s\S]{0,200}th\.sortable", APP))
+      and bool(re.search(r"addEventListener\('keydown',[\s\S]{0,300}th\.sortable"
+                          r"|addEventListener\('keydown',[\s\S]{0,300}classList\.contains\('sortable'\)", APP)),
+      "app.js wires delegated click and keydown handlers for plain sortable headers")
+
+# ---------------------------------------------------------------------------
+# 27. Every <table id="..."> placeholder in index.html ends up with a header
+#     row one way or another — App.grid builds its own, or the module that
+#     fills it writes a <thead> (or a bare first row of <th>) into the
+#     markup it hands the table. A table with neither is exactly the gap
+#     this pass exists to close: with no header there is nothing for either
+#     sort mechanism to attach to, by hand or by the document-level hook.
+#
+#     This cannot check proximity between the id and its header markup —
+#     three different indirections are in play (a direct `App.grid(App.el(
+#     'id'), …)`, debug.js's one `drawWorkerTable(id, columns, …)` shared by
+#     five tables, events.js's one shared renderer keyed off a `tableId`
+#     field in a spec object far from where it is declared) and a fourth is
+#     free to appear tomorrow. What it checks instead: the file that
+#     mentions the id at all also builds *some* header markup somewhere —
+#     which turns "this table was wired up with no header at all" (the
+#     failure this pass fixed for real, in nodes.js's CSV-import table) into
+#     a fast, if coarse, static check, while two card-style tables that
+#     never had column headers (sorted by their own control instead) are
+#     named exemptions rather than a loophole the regex could be fooled by.
+_HEADERLESS_BY_DESIGN = {"ipam-subnet-table", "ipam-dhcp-scope-table"}
+_table_ids = re.findall(r'<table id="([a-zA-Z0-9_-]+)"', INDEX)
+_missing_header = []
+for _table_id in _table_ids:
+    if _table_id in _HEADERLESS_BY_DESIGN:
+        continue
+    owners = [name for name in MODULES if ("'%s'" % _table_id) in read(name)]
+    if not owners or not any(
+            "App.grid(" in read(name) or "<thead" in read(name) or re.search(r"<th[ >]", read(name))
+            for name in owners):
+        _missing_header.append(_table_id)
+check(not _missing_header,
+      "every <table id> in index.html gets a header row from its renderer (missing: %s)"
+      % (", ".join(_missing_header) or "none"))
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

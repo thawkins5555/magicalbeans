@@ -30,7 +30,7 @@ sections of this document.
 - [Releasing](#releasing)
 - [Backup and restore](#backup-and-restore)
 
-Twelve tabs at the top of the window, in frequency order with a hairline marking where each of four groups used to be labelled: **Dashboard** and **Alerts**, a rule engine over Nodes/traps/syslog/IPAM with email notification; **Nodes**, an SNMP poller and device inventory, **IPAM**, subnet discovery, conflict detection, and read-only DHCP visibility, **FortiWireless**, a Fortinet access-point dashboard, and **ConfigRX**, SSH configuration backups; **Routes**, the scheduled traceroute monitor (the NetPath module this application started as, named on screen for what it shows), **NetFlow**, a flow collector, **Syslog**, a message collector, and **SNMP Trap**, a trap and inform receiver; **Settings** and **Debug**, a live view of what the background threads are doing. Who is signed in, the **Account** control — which also holds the version number and the per-browser Appearance settings — and **Sign out** sit beside the tabs rather than inside the scrolling strip, so narrowing the window never hides them; below about 480 px those three collapse to icons to leave more of the strip for the tabs themselves.
+Twelve tabs at the top of the window, in frequency order with a hairline marking where each of four groups used to be labelled: **Dashboard** and **Alerts**, a rule engine over Nodes/traps/syslog/IPAM with email notification; **Nodes**, an SNMP poller and device inventory, **IPAM**, subnet discovery, conflict detection, and read-only DHCP visibility, **FORTI-AP**, a Fortinet access-point dashboard, and **CONFIGRX**, SSH configuration backups; **Routes**, the scheduled traceroute monitor (the NetPath module this application started as, named on screen for what it shows), **NetFlow**, a flow collector, **Syslog**, a message collector, and **SNMP Trap**, a trap and inform receiver; **Settings** and **Debug**, a live view of what the background threads are doing. Who is signed in, the **Account** control — which also holds the version number and the per-browser Appearance settings — and **Sign out** sit beside the tabs rather than inside the scrolling strip, so narrowing the window never hides them; below about 480 px those three collapse to icons to leave more of the strip for the tabs themselves.
 
 ## NetPath
 
@@ -984,13 +984,13 @@ named; it does not prove who named it — there is no signature.
 
 ```sh
 # 1. Tag the commit and push the tag.
-git tag -a v4.52.0 -m "SappiWhere 4.52.0"
-git push origin v4.52.0
+git tag -a v4.53.0 -m "SappiWhere 4.53.0"
+git push origin v4.53.0
 
 # 2. Hash the tarball GitHub actually serves for that tag — the same URL the
 #    updater uses. Do not build your own tarball; the digest must be of the
 #    bytes the updater will receive.
-TAG=v4.52.0
+TAG=v4.53.0
 curl -fsSL -o "magicalbeans-$TAG.tar.gz" \
   "https://codeload.github.com/thawkins5555/magicalbeans/tar.gz/refs/tags/$TAG"
 sha256sum "magicalbeans-$TAG.tar.gz" > SHA256SUMS
@@ -998,7 +998,7 @@ sha256sum "magicalbeans-$TAG.tar.gz" > SHA256SUMS
 # 3. Create the release for that tag and attach SHA256SUMS as an asset —
 #    a release asset, never a file committed in the repository: a digest
 #    that travels inside the archive it describes proves nothing.
-gh release create "$TAG" SHA256SUMS --title "SappiWhere 4.52.0" --notes-file -
+gh release create "$TAG" SHA256SUMS --title "SappiWhere 4.53.0" --notes-file -
 ```
 
 `SHA256SUMS` is `sha256sum`'s own format, checkable by hand with

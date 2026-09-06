@@ -1,9 +1,9 @@
 """The API and gates over LLDP/CDP, PoE, STP and PtP RF polling, driven against
 a real Service + WebServer over loopback with rows seeded through nodesdb's
-own accessors rather than a live walk. Covers /api/nodes/topology (matched
-LLDP pairs deduplicated into one edge, unmatched neighbours as synthetic
-"unknown" nodes), the neighbours route, PoE/STP fields on interface and device
-routes, RF via plain /metrics and /series, "nodes" read gating, and both CSVs."""
+own accessors rather than a live walk. Covers the per-device neighbours route
+(the best-effort device match joined in as matched_device_id/name), PoE/STP
+fields on interface and device routes, RF via plain /metrics and /series,
+"nodes" read gating, and both CSVs."""
 import csv
 import http.client
 import io
@@ -130,39 +130,6 @@ try:
          "sys_name": "unmanaged-ap", "port_id": "eth0", "platform": "generic-ap"},
     ])
 
-    # ------------------------------------------------------------ topology
-    print("GET /api/nodes/topology")
-    status, payload = call("GET", "/api/nodes/topology", token=admin)
-    check("200", status == 200, (status, payload))
-    node_ids = {n["id"] for n in payload["nodes"]}
-    check("every real device is a node", {core_id, edge_id, ap_id} <= node_ids, node_ids)
-    real_edges = [e for e in payload["edges"] if not e["unknown"]]
-    unk_edges = [e for e in payload["edges"] if e["unknown"]]
-    check("the reciprocal core<->edge link dedups to exactly one edge",
-          len(real_edges) == 1, payload["edges"])
-    if real_edges:
-        e = real_edges[0]
-        check("...naming both device ids",
-              {e["a_device_id"], e["b_device_id"]} == {core_id, edge_id}, e)
-        check("...with both ports labelled from each device's own interfaces()",
-              e["a_port"] in ("Gi0/1",) and e["b_port"] in ("Gi0/1",), e)
-    check("the unmatched neighbour is exactly one edge, marked unknown",
-          len(unk_edges) == 1, payload["edges"])
-    unknown_node_ids = [n["id"] for n in payload["nodes"] if n.get("unknown")]
-    check("...pointing at a synthetic node, not a real device id",
-          len(unknown_node_ids) == 1 and isinstance(unknown_node_ids[0], str)
-          and unknown_node_ids[0].startswith("unknown:"), unknown_node_ids)
-    if unk_edges:
-        check("...that edge's b_device_id is the synthetic node",
-              unk_edges[0]["b_device_id"] == unknown_node_ids[0], unk_edges[0])
-
-    status, csv_payload = call("GET", "/api/nodes/topology/export.csv", token=admin)
-    check("topology export.csv", status == 200 and "csv" in csv_payload, (status, csv_payload))
-    if status == 200:
-        rows = read_csv(csv_payload["csv"])
-        check("...header plus at least the 3 stored neighbour rows",
-              len(rows) >= 4, len(rows))
-
     # ------------------------------------------------------ per-device view
     print("GET /api/nodes/devices/<id>/neighbors")
     status, payload = call("GET", f"/api/nodes/devices/{core_id}/neighbors", token=admin)
@@ -269,8 +236,6 @@ try:
     outsider = login("topo-outsider", "TopoOutsiderPW2026")
 
     for path in (
-        "/api/nodes/topology",
-        "/api/nodes/topology/export.csv",
         f"/api/nodes/devices/{core_id}/neighbors",
         f"/api/nodes/devices/{core_id}/neighbors/export.csv",
     ):

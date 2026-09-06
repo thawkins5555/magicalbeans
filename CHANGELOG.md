@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.53.0 — Two lanes on the timeline, and the sensors under the hood](#4530--two-lanes-on-the-timeline-and-the-sensors-under-the-hood)
 - [4.52.0 — One base class, in place of ten copies](#4520--one-base-class-in-place-of-ten-copies)
 - [4.51.0 — The patterns this codebase already knew](#4510--the-patterns-this-codebase-already-knew)
 - [4.50.0 — The last mile, walked](#4500--the-last-mile-walked)
@@ -119,6 +120,158 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 4.53.0 — Two lanes on the timeline, and the sensors under the hood
+
+Fifteen items from a single work order, each noted in the order it was
+asked for.
+
+**The desktop console window loses its Collectors card.** `ConsoleWindow`
+(`netpath/console.py`) dropped `_collectors_card()` and
+`_refresh_collectors()` along with the layout line and refresh call that
+used them — the per-worker status lines it printed (NetPath, NetFlow, SNMP,
+Syslog, Nodes, Alerts, DNS) are visible elsewhere and the card was retired
+rather than kept in sync twice.
+
+**The ConfigRX tab now reads `CONFIGRX`**, not `ConfigRX` — the `tab--proper`
+CSS rule that gave it mixed-case, smaller, tracked type (`app.css`) is
+deleted, and `index.html`'s tab button drops that class and its old label,
+so it shouts in caps like every other tab.
+
+**The FortiWireless tab is now labelled `FORTI-AP`.** Only the text changed
+(`index.html`); `data-tab="wireless"` and everything it routes to are
+untouched.
+
+**Settings' Apply changes button now says what it did.** A new
+`#set-apply-status` span beside it (`index.html`) shows "Applying…" while
+the request is in flight, "Applied" or the error message when it returns,
+and a toast fires on failure too (`settings.js`); the button disables for
+the duration so a slow save can't be clicked twice.
+
+**LDAP directory settings moved from TOKENS & DIRECTORY to SIGN-IN.** The
+`DIRECTORY (LDAP)` fieldset now sits in the SIGN-IN subtab of Settings, and
+the subtab that used to carry it is relabelled `TOKENS` since API tokens are
+all that's left there (`index.html`); every field id (`set-ldap-*`,
+`ldap-apply`, `ldap-test`, …) is unchanged.
+
+**The device status timeline splits into SNMP and PING lanes when both are
+polled.** `nodepoll._poll_device` now records transition-only events —
+`snmp_up`/`snmp_down`/`ping_up`/`ping_down` — alongside the existing
+`up`/`down`; `nodesdb.device_method_segments` walks them into per-method
+segments the same way `device_status_segments` already does for the
+combined status, and `get_nodes_device_timeline` (`api.py`) returns them as
+`methods` plus `methods_enabled` (which methods this device currently
+polls, so the UI can tell "never split" from "no transitions recorded
+yet"). `nodes.js` draws two lanes, SNMP above PING, sharing the single-lane
+drawing code; a device polled by only one method, or with no per-method
+history from before this version, still gets the one combined lane. The
+alert engine ignores the four new kinds outright (`alertengine.py`) — they
+carry no meaning `up`/`down`/`snmp_error`/`auth_fail` don't already cover.
+
+**ConfigRX Cisco backups now escalate to enable mode when the login lands
+in user EXEC.** `% Invalid input detected` on `show running-config` was
+always that: a TACACS+/RADIUS profile that doesn't grant privilege 15 by
+default. `cisco`, `cisco-nxos`, `cisco-iosxr`, `cisco-sb` and
+`rockwellautomation` now carry `enable_command="enable"`, same as
+`cisco-asa` already did (`configrx.py`); `_pull_config` sends it only when
+the learned prompt ends `>`, so a privilege-15 login is untouched, and the
+stored enable secret is only ever sent back as the answer to that device's
+own password prompt. `cisco-wlc` is deliberately excluded — AireOS's `>` is
+just its normal prompt character, not a separate unprivileged mode.
+
+**Ubiquiti NanoBeam/NanoStation/LiteBeam/PowerBeam/airFiber radios are now
+auto-identified.** airOS answers `sysObjectID` under enterprise arc 10002 —
+Frogfoot Networks' PEN, which airOS's agent build reuses — so
+`enterprises.py` now maps that arc to `ubiquiti` alongside Ubiquiti's own
+arc 41112, and `nodeoids.RF_METRICS` gets a matching alias so the RF-metrics
+poll still finds the right OIDs under either arc. `nodeoids.SYSDESCR_VENDORS`
+gains sysDescr substring hints (`ubnt`, `airos`, `nanobeam`, `nanostation`,
+`litebeam`, `powerbeam`, `airmax`, `airfiber`, `edgeos`, `edgerouter`,
+`unifi`) as the belt-and-braces check for a device that answers a generic
+`sysObjectID` instead.
+
+**ConfigRX gained a Ubiquiti vendor entry.** `configrx.py`'s `VENDORS` now
+has `"ubiquiti"` — no pager command, `cat /tmp/system.cfg` in place of a
+"show" command, since airOS is a busybox shell rather than a router CLI —
+fixing the "Unrecognized vendor '(none)'" error a Ubiquiti radio identified
+by the previous item would otherwise hit.
+
+**The Nodes → TOPOLOGY subtab is gone.** The pan-and-zoom L2 graph page,
+its JS (`topoLayout`/`drawTopology`/pan-zoom handlers in `nodes.js`), its
+CSS, and `/api/nodes/topology` plus its CSV export (`api.py`, `server.py`)
+are all removed. LLDP/CDP neighbour collection and the device pane's
+NEIGHBOURS subtab are unaffected — the underlying table just lost its one
+fleet-wide picture. The Upstream suggestions button moved out of the
+deleted page into the Nodes top strip (new id `nd-upstream-suggestions`,
+`nodes.js`), unchanged otherwise; a separate module will replace the graph
+itself.
+
+**IPAM → DHCP scrolls again, and its availability sort is now by
+percentage.** `#ipam-dhcp-body` needed its own `display: flex;
+flex-direction: column; min-height: 0; flex: 1` (`app.css`) — as a plain block
+wrapper it broke the flex chain between `.subpage` and `.cols`, so the scope
+list and lease table grew to full content height and clipped at the page
+edge. "Sort: Least/Most available" (`ipam.js`) now ranks scopes by fraction
+of their range still free rather than the raw count, so a 900-address scope
+at 90% used no longer outranks a fully exhausted 10-address one; an
+unparseable range still sorts last either way.
+
+**A new Nodes setting, `snmp_fail_alert_after` (default 3), controls how
+many consecutive missed SNMP polls open "SNMP failing".** Labelled "SNMP
+polls missed before 'SNMP failing' alert" beside "Consecutive failures
+before down" (`nodes.js`), it replaces the old behaviour of recording an
+`snmp_error` event on the very first qualifying failure: `nodepoll.py` now
+counts consecutive failures (ping OK, not an auth failure, not
+unsupported) per device in memory and only starts recording once the
+threshold is reached, so one missed poll no longer opens
+`snmp_failing_ping_ok` on its own.
+
+**The device dialog gained a HARDWARE SENSORS section and a device-wide DOM
+/ SFP SENSORS table.** `nodepoll.read_hardware` returns the device's latest
+polled CPU/memory/temperature metrics, a live whole-device
+ENTITY-SENSOR-MIB walk, and CISCO-ENVMON-MIB supply/fan/temperature state
+on Cisco gear; `read_dom_all` is the device-wide counterpart of the
+existing per-interface `read_dom`, built from the same walk. Two new routes
+back them, `GET /api/nodes/devices/<id>/hardware` and `.../dom` (`api.py`,
+`server.py`), and `nodes.js` renders both as their own tables in the device
+dialog. The per-interface dialog's own DOM section is unchanged.
+
+**Every hand-built table in the product is now sortable.** A shared
+`App.sortableTable` helper (`app.js`) decorates any plain `<table>`'s
+header the way `App.grid` already decorates its own, with document-level
+delegated click and keyboard listeners doing the sorting — numeric, IPv4,
+date and text columns sniffed from their own rendered values, blank cells
+always last, and a pinned (colspan) row left in place. The sort is
+remembered on the `<table>` element itself and re-applied by a
+`MutationObserver` after a renderer rebuilds the table's `innerHTML`, since
+a plain table has no memory of its own across a redraw. Tables already
+built through `App.grid` are unaffected — they were sortable already.
+
+**Nodes → Devices' WEB control is now a button, not a link**, placed
+between SSH and the `?` help, matching SSH's own styling; it still opens
+`http://<ip>/` in a new tab with no permission gate of its own
+(`index.html`, `nodes.js`).
+
+**From the release review.** The Nodes overview histogram bucketed every
+`device_events` row, so each outage counted three times once the lane
+events existed — `get_nodes_overview` and the device dialog's EVENT LOG now
+exclude `nodesdb.TIMELINE_ONLY_EVENT_KINDS` inside the query
+(`device_events(exclude_kinds=)`), and `alertengine.py` imports that one
+constant instead of keeping its own copy. `device_status_segments` keeps
+its pre-refactor fallback for a deleted device's final segment. An install
+upgraded from before the lanes existed would have drawn one lane empty
+until the other method flapped: `nodepoll` now asks
+`nodesdb.has_method_events` once per device per process and seeds both
+lanes from the state it already holds. And "consecutive" SNMP failures are
+now literally consecutive — a poll that does not qualify (SNMP answered,
+ping also down, an auth failure) resets the count rather than pausing it.
+
+Four new test suites: `tests/test_configrx_ubiquiti.py` (the Ubiquiti
+ConfigRX vendor, through a fake airOS shell), `tests/test_hardware_dom_sensors.py`
+(`read_hardware`/`read_dom_all` and their routes), `tests/test_status_timeline_methods.py`
+(the split SNMP/ping timeline end to end — poller, `nodesdb`, `api.py`) and
+`tests/test_vendor_enterprise_identify_ubiquiti.py` (arc 10002 and the
+sysDescr hints resolving to `ubiquiti`).
 
 ### 4.52.0 — One base class, in place of ten copies
 

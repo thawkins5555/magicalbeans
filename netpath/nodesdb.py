@@ -287,7 +287,13 @@ CREATE TABLE IF NOT EXISTS device_events (
     id              INTEGER PRIMARY KEY,
     device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     ts              REAL NOT NULL,
-    kind            TEXT NOT NULL,   -- down|up|rebooted|auth_fail|poll_overrun|unsupported
+    -- down|up|rebooted|auth_fail|auth_ok|poll_overrun|unsupported|snmp_error|
+    -- snmp_up|snmp_down|ping_up|ping_down. The last four are per-method
+    -- transitions (see nodepoll._poll_device) that back the split SNMP/ping
+    -- status timeline lanes — separate from up/down, which stay the
+    -- overall-reachability events every other reader (alerts, reports)
+    -- already depends on.
+    kind            TEXT NOT NULL,
     detail          TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_device_events_device_ts ON device_events(device_id, ts);
@@ -396,6 +402,12 @@ DEFAULTS = {
     "default_snmp_timeout_s": 3.0,
     "default_snmp_retries": 2,
     "down_after_failures": 3,        # consecutive poll failures before status -> down
+    # Consecutive failing SNMP polls (with ping OK — the "reachable but
+    # broken" case) before the snmp_error device event fires, so a single
+    # blip does not open the snmp_failing_ping_ok alert. Tracked in memory
+    # by the poller (NodePoller._snmp_failing_count), reset the moment SNMP
+    # succeeds again.
+    "snmp_fail_alert_after": 3,
     # A device is DOWN only when ping AND SNMP both fail. Defaults to True
     # since 4.25: a switch answering ICMP with a broken community string is
     # reachable and misconfigured, not down, and calling it down buries the
@@ -624,9 +636,8 @@ def _upstream_confidence(match_kind: str, present: bool) -> tuple[str, int]:
 def _group_upstream_candidates(rows) -> dict[int, dict]:
     """Raw `_UPSTREAM_CANDIDATE_SQL` rows, one per observing device's own
     matched neighbour row, folded into one entry per device with its
-    distinct matched devices deduplicated — the same shape api.py's own
-    _topology_dedup_key gives the fleet-wide graph, but keyed by matched
-    device alone (a suggestion is "which device", not "which two ports").
+    distinct matched devices deduplicated, keyed by matched device alone
+    (a suggestion is "which device", not "which two ports").
 
     A device whose neighbour rows resolve to two or more DIFFERENT matched
     devices comes back `ambiguous`, with every candidate listed rather than
@@ -692,6 +703,18 @@ def _group_upstream_candidates(rows) -> dict[int, dict]:
         result[device_id] = {"device_id": device_id, "candidates": ordered,
                              "ambiguous": len(ordered) > 1}
     return result
+
+
+# device_events kinds that exist only to back the status timeline's split
+# SNMP/ping lanes (see NodesDatabase.device_method_segments) and mean
+# nothing on their own to any other reader — snmp_ok/ping_ok flipping is
+# already covered by `down`/`up`/`snmp_error`/`auth_fail`. One name for the
+# set, so the alert engine (which would otherwise turn each into an
+# Occurrence no rule matches) and the overview histogram (which would count
+# every outage three times: down + snmp_down + ping_down) skip the same four
+# kinds by construction rather than by two lists agreeing.
+TIMELINE_ONLY_EVENT_KINDS = frozenset(
+    {"snmp_up", "snmp_down", "ping_up", "ping_down"})
 
 
 class NodesDatabase(SqliteStore):
@@ -1983,8 +2006,8 @@ class NodesDatabase(SqliteStore):
         """Every LLDP/CDP neighbour row stored for this device's ports,
         present and stale alike, with the best-effort device match (see
         _NEIGHBOR_MATCH_SQL) joined in as matched_device_id/
-        matched_device_name — the accessor a device detail page's topology
-        panel reads."""
+        matched_device_name — the accessor the device detail page's
+        NEIGHBOURS subtab reads."""
         with self._lock:
             return self._conn.execute(
                 self._NEIGHBOR_MATCH_SQL + " WHERE n.device_id = ?"
@@ -2546,7 +2569,11 @@ class NodesDatabase(SqliteStore):
             self._conn.commit()
 
     def device_events(self, device_id: int | None = None, since_s: float | None = None,
-                      kinds: list[str] | None = None, limit: int = 300) -> list[sqlite3.Row]:
+                      kinds: list[str] | None = None, limit: int = 300,
+                      exclude_kinds=()) -> list[sqlite3.Row]:
+        """`exclude_kinds` is applied in the query, not by the caller over
+        the result: the LIMIT is what a reader relies on to bound the read,
+        and rows filtered out afterwards would still have spent it."""
         clauses, params = [], []
         if device_id is not None:
             clauses.append("device_id = ?")
@@ -2558,6 +2585,10 @@ class NodesDatabase(SqliteStore):
             marks = ",".join("?" * len(kinds))
             clauses.append(f"kind IN ({marks})")
             params.extend(kinds)
+        if exclude_kinds:
+            marks = ",".join("?" * len(exclude_kinds))
+            clauses.append(f"kind NOT IN ({marks})")
+            params.extend(exclude_kinds)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._lock:
             return self._conn.execute(
@@ -2589,13 +2620,87 @@ class NodesDatabase(SqliteStore):
     _SEGMENT_STATUS = {"up": "up", "down": "down", "unsupported": "unsupported",
                        "auth_fail": "auth"}
 
+    # The per-method counterparts device_method_segments walks — see
+    # nodepoll._poll_device for where snmp_up/snmp_down/ping_up/ping_down
+    # are recorded (transitions only, seeded on first observation).
+    _SNMP_SEGMENT_STATUS = {"snmp_up": "up", "snmp_down": "down"}
+    _PING_SEGMENT_STATUS = {"ping_up": "up", "ping_down": "down"}
+
     def device_status_segments(self, device_id: int, t0: float, t1: float) -> list[dict]:
         """Turns the device's sparse up/down/etc. transition log into
         [ts_start, ts_end) status segments covering [t0, t1] — one row per
         real status change, not one row per poll the way NetPath's own
         traces-based timeline is built from, since Nodes has no per-poll
         sample log to bucket."""
-        kinds = tuple(self._SEGMENT_STATUS)
+        with self._lock:
+            current = self._conn.execute(
+                "SELECT status FROM devices WHERE id = ?", (device_id,)).fetchone()
+        end_status = current["status"] if current else None
+        return self._event_segments(device_id, t0, t1, self._SEGMENT_STATUS, end_status)
+
+    def has_method_events(self, device_id: int) -> bool:
+        """Whether this device has ever recorded a per-method lane event
+        (TIMELINE_ONLY_EVENT_KINDS). The poller asks once per device per
+        process so an install upgraded from before the split can seed its
+        first snmp_*/ping_* events from the state it already knows, rather
+        than waiting for the next flap to populate one lane and leaving the
+        other reading "no history" for a device pinged for months."""
+        marks = ",".join("?" * len(TIMELINE_ONLY_EVENT_KINDS))
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT 1 FROM device_events WHERE device_id = ? AND kind IN ({marks}) LIMIT 1",
+                (device_id, *TIMELINE_ONLY_EVENT_KINDS)).fetchone()
+        return row is not None
+
+    def device_method_segments(self, device_id: int, t0: float, t1: float) -> dict:
+        """The SNMP/ping counterpart to device_status_segments, for a device
+        polled by both: the overall status column follows whichever the
+        poller's unreachable_ping_only rule picks (ping, by default), which
+        hides a dead SNMP agent behind a healthy ping. Walks the same
+        sparse-transition-log logic (see _event_segments) over the
+        snmp_up/snmp_down and ping_up/ping_down events nodepoll records,
+        once per method.
+
+        Returns {"snmp": [segments], "ping": [segments]}, with None in
+        place of a method's list when it has never once recorded a
+        transition event in or before the window — a device never polled
+        by that method, or history predating this split (upgraded from a
+        version that only ever wrote up/down) — so the UI can fall back to
+        the single combined lane instead of drawing an empty one."""
+        with self._lock:
+            current = self._conn.execute(
+                "SELECT snmp_ok, ping_ok FROM devices WHERE id = ?",
+                (device_id,)).fetchone()
+        result = {}
+        for method, status_map, ok_col in (
+                ("snmp", self._SNMP_SEGMENT_STATUS, "snmp_ok"),
+                ("ping", self._PING_SEGMENT_STATUS, "ping_ok")):
+            kinds = tuple(status_map)
+            marks = ",".join("?" * len(kinds))
+            with self._lock:
+                seen = self._conn.execute(
+                    f"SELECT 1 FROM device_events WHERE device_id = ? AND ts <= ?"
+                    f" AND kind IN ({marks}) LIMIT 1",
+                    (device_id, t1, *kinds)).fetchone()
+            if seen is None:
+                result[method] = None
+                continue
+            ok = current[ok_col] if current else None
+            end_status = "unknown" if ok is None else ("up" if ok else "down")
+            result[method] = self._event_segments(device_id, t0, t1, status_map, end_status)
+        return result
+
+    def _event_segments(self, device_id: int, t0: float, t1: float,
+                        status_map: dict, end_status: str | None) -> list[dict]:
+        """The sparse-transition-log walk shared by device_status_segments
+        (the overall up/down/etc. log) and device_method_segments (the
+        per-method snmp/ping logs): `status_map` picks which event kinds
+        count and what status each one means, `end_status` is what the
+        final segment (from the last event to t1) reports — the device's
+        (or method's) CURRENT state, since that is fresher evidence than
+        whatever the last event in the window said. None (no device row to
+        read a current state from) keeps whatever the last event said."""
+        kinds = tuple(status_map)
         marks = ",".join("?" * len(kinds))
         with self._lock:
             prior = self._conn.execute(
@@ -2606,19 +2711,18 @@ class NodesDatabase(SqliteStore):
                 f"SELECT kind, ts FROM device_events WHERE device_id = ?"
                 f" AND ts >= ? AND ts <= ? AND kind IN ({marks}) ORDER BY ts ASC",
                 (device_id, t0, t1, *kinds)).fetchall()
-            current = self._conn.execute(
-                "SELECT status FROM devices WHERE id = ?", (device_id,)).fetchone()
 
-        status = self._SEGMENT_STATUS.get(prior["kind"], "unknown") if prior else "unknown"
+        status = status_map.get(prior["kind"], "unknown") if prior else "unknown"
         segments = []
         cursor = t0
         for row in rows:
             ts = max(t0, min(row["ts"], t1))
             if ts > cursor:
                 segments.append({"ts_start": cursor, "ts_end": ts, "status": status})
-            status = self._SEGMENT_STATUS.get(row["kind"], status)
+            status = status_map.get(row["kind"], status)
             cursor = ts
-        end_status = current["status"] if current else status
+        if end_status is None:
+            end_status = status
         if cursor < t1:
             segments.append({"ts_start": cursor, "ts_end": t1, "status": end_status})
         return segments

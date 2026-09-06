@@ -43,14 +43,25 @@ from .worker import Worker
 # ConfigRX, by construction -- nothing here accepts arbitrary text and no
 # code path builds a command from anything other than these fixed strings.
 #
-# A vendor whose privileged EXEC mode is not the login mode (Cisco ASA) also
-# carries `enable_command` -- always the literal `enable`, never anything
-# else. The only other thing that can cross the wire because of it is the
-# device's OWN stored enable secret, sent back verbatim as the answer to
-# that device's own password prompt (`enable_password_re` only recognises
-# that prompt in the device's output, never builds a command). No vendor
-# entry accepts a secret from anywhere other than the encrypted per-device
-# credential this backup already holds.
+# A vendor whose account may land somewhere other than privileged EXEC --
+# Cisco IOS/IOS-XE, NX-OS, IOS-XR, the SG/CBS line, ASA, and Rockwell's
+# Cisco-IOS-based Stratix switches -- also carries `enable_command` -- always
+# the literal `enable`, never anything else. `_pull_config` only ever sends
+# it when the learned login prompt ends '>' (see its own docstring), so a
+# privilege-15 login is unaffected: the escalation step is skipped entirely,
+# not sent and ignored. The only other thing that can cross the wire because
+# of it is the device's OWN stored enable secret, sent back verbatim as the
+# answer to that device's own password prompt (`enable_password_re` only
+# recognises that prompt in the device's output, never builds a command). No
+# vendor entry accepts a secret from anywhere other than the encrypted
+# per-device credential this backup already holds.
+#
+# Cisco WLC (AireOS) is deliberately NOT in that list: its "(Cisco
+# Controller) >" prompt ends '>' too, but that is just AireOS's normal
+# prompt character, not a separate unprivileged EXEC mode -- there is no
+# `enable` step on this platform, and demo/fake_ssh.py's "cisco-wlc" persona
+# encodes exactly that (no enable_command, and _pull_config never attempts
+# one there).
 #
 # That guarantee is about backups. The interactive SSH terminal (sshterm.py)
 # is a separate feature with a separate boundary -- a real shell, driven by a
@@ -84,13 +95,27 @@ class Vendor:
 
 VENDORS = {
     # --- Hardware-verified: exercised against real devices of these platforms. ---
-    "cisco": Vendor("Cisco IOS/IOS-XE", ("terminal length 0",), "show running-config"),
-    "cisco-nxos": Vendor("Cisco NX-OS", ("terminal length 0",), "show running-config"),
-    "cisco-iosxr": Vendor("Cisco IOS-XR", ("terminal length 0",), "show running-config"),
+    # enable_command="enable" on these five: an account that lands in user
+    # EXEC (prompt ends '>' -- a common result of a TACACS+/RADIUS profile
+    # that does not grant privilege 15 by default) otherwise gets
+    # "% Invalid input detected at '^' marker." back from show running-config,
+    # which _capture_problem could only ever report as "too short to be a
+    # config". A privilege-15 login's prompt already ends '#', so
+    # _pull_config's enable check never fires for it -- see this module's
+    # top-of-file comment and _pull_config's own docstring.
+    "cisco": Vendor("Cisco IOS/IOS-XE", ("terminal length 0",), "show running-config",
+                    enable_command="enable"),
+    "cisco-nxos": Vendor("Cisco NX-OS", ("terminal length 0",), "show running-config",
+                        enable_command="enable"),
+    "cisco-iosxr": Vendor("Cisco IOS-XR", ("terminal length 0",), "show running-config",
+                         enable_command="enable"),
     "cisco-sb": Vendor("Cisco Small Business SG/CBS",
-                       ("terminal datadump",), "show running-config"),
+                       ("terminal datadump",), "show running-config",
+                       enable_command="enable"),
     "cisco-asa": Vendor("Cisco ASA", ("terminal pager 0",), "show running-config",
                        enable_command="enable"),
+    # No enable_command here -- see the top-of-file comment: AireOS's '>' is
+    # just its normal prompt, not a separate unprivileged EXEC mode.
     "cisco-wlc": Vendor("Cisco WLC AireOS", ("config paging disable",), "show run-config"),
     "fortinet": Vendor("Fortinet FortiOS",
                        ("config system console", "set output standard", "end"),
@@ -122,7 +147,16 @@ VENDORS = {
     # be lowercase to match resolve()'s lowercasing of vendor_for()'s
     # canonical "rockwellAutomation" (enterprises.py, arc 95).
     "rockwellautomation": Vendor("Rockwell Stratix (Cisco IOS/IOS-XE)",
-                                 ("terminal length 0",), "show running-config"),
+                                 ("terminal length 0",), "show running-config",
+                                 enable_command="enable"),
+    #
+    # Ubiquiti airOS (airMAX/airFiber M-series/AC radios: NanoBeam, NanoStation,
+    # LiteBeam, PowerBeam, airFiber). A busybox shell, not a router CLI -- no
+    # pager, and the running config is a plain key=value text file rather than
+    # the output of a "show" command. Prompt looks like "XM.v8.7.11#" or
+    # "WA.v8.7.x#": still ends '#', which is all _learn_prompt/_read_until_prompt
+    # require, so the dots and digits in it need no special handling.
+    "ubiquiti": Vendor("Ubiquiti airOS", (), "cat /tmp/system.cfg"),
 }
 
 

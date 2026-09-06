@@ -746,6 +746,16 @@ class NodePoller(Worker):
         # see _poll_device for why the device row cannot answer that. In
         # memory and process-lifetime only, like _credentials above.
         self._auth_failing: set[int] = set()
+        # Devices whose per-method lane events have been confirmed to exist
+        # (or seeded) since this process started — see the events block in
+        # _poll_device and nodesdb.has_method_events. One query per device
+        # per process, then never again.
+        self._method_seeded: set[int] = set()
+        # device_id -> consecutive qualifying SNMP-failing polls (ping OK,
+        # not an auth failure, not unsupported), gating the `snmp_error`
+        # device event behind `snmp_fail_alert_after` — see _poll_device.
+        # In memory and process-lifetime only, like _auth_failing above.
+        self._snmp_failing_count: dict[int, int] = {}
         # (device_id, expires_ts, interval_s): the device currently selected
         # in a browser polls at interval_s until expires_ts. Renewed by the
         # frontend every refresh tick while selected, so it self-expires
@@ -1508,6 +1518,46 @@ class NodePoller(Worker):
         elif status == "unsupported" and was_status != "unsupported":
             self.db.record_device_event(device_id, "unsupported", snmp_error)
 
+        # Per-method transitions (snmp_up/snmp_down, ping_up/ping_down): the
+        # status timeline's split SNMP/ping lanes are built from these, not
+        # from the up/down events above, which follow `status` — effectively
+        # ping alone once unreachable_ping_only lets a dead SNMP agent hide
+        # behind a healthy ping. Compared against `previous` (the device row
+        # from before THIS poll's own record_poll update) rather than
+        # recorded on every poll, so the event log grows on a real change,
+        # not once per device per interval forever. A previous value of None
+        # (never observed, or the method was off) seeds the first event too,
+        # the same way the very first up/down does further down — a segment
+        # needs a start. `snmp_ok`/`ping_ok` of None here means this poll
+        # didn't touch that method (disabled, or not this poll's turn to
+        # ping — see ping_interval_s above, which carries the old value
+        # forward rather than going None), so it never manufactures an event
+        # out of a probe that didn't run.
+        prev_snmp_ok = previous["snmp_ok"]
+        prev_snmp_ok = None if prev_snmp_ok is None else bool(prev_snmp_ok)
+        prev_ping_ok = previous["ping_ok"]
+        prev_ping_ok = None if prev_ping_ok is None else bool(prev_ping_ok)
+        # An install upgraded from before the lanes existed has device rows
+        # with snmp_ok/ping_ok already populated, so the comparison above
+        # would never fire until the next flap — and then only for the
+        # method that flapped, leaving the other lane empty. Once per device
+        # per process: if no lane event was ever recorded, forget the
+        # previous values so this poll seeds both methods it observed.
+        with self._lock:
+            unseeded = device_id not in self._method_seeded
+        if unseeded:
+            if not self.db.has_method_events(device_id):
+                prev_snmp_ok = prev_ping_ok = None
+            with self._lock:
+                self._method_seeded.add(device_id)
+        if snmp_ok is not None and snmp_ok != prev_snmp_ok:
+            self.db.record_device_event(
+                device_id, "snmp_up" if snmp_ok else "snmp_down",
+                "" if snmp_ok else snmp_error)
+        if ping_ok is not None and ping_ok != prev_ping_ok:
+            self.db.record_device_event(
+                device_id, "ping_up" if ping_ok else "ping_down", "")
+
         # TRANSITIONS, like the up/down events above: an alert an operator
         # resolved by hand must not re-open because the next poll repeated
         # what the last one said. The transition is held here, in
@@ -1536,13 +1586,34 @@ class NodePoller(Worker):
         # reachable and broken; `unreachable_ping_only` keeps it out of
         # device_down, so this is the event `snmp_failing_ping_ok` watches.
         #
-        # Recorded on EVERY failing poll, not as a transition: the rule
+        # Gated on `snmp_fail_alert_after` CONSECUTIVE qualifying failures,
+        # not the first one — a single missed poll is not "SNMP failing",
+        # and alerting on it would open snmp_failing_ping_ok on any blip.
+        # Counted in memory, per device, the same shape as _auth_failing
+        # above, and reset the moment SNMP succeeds again. Once the
+        # threshold is reached the event keeps recording on EVERY qualifying
+        # poll after that, not just the one that crossed it — the rule
         # carries `auto_resolve_after_s`, measured from the alert's last
-        # occurrence, so the repeats keep it open while the agent is dead and
-        # their stopping closes it. A transition would freeze `last_ts` and
-        # announce a false all-clear an hour later.
-        if (not auth_failing and snmp_ok is False and ping_ok
-                and not snmp_unsupported):
+        # occurrence, so the repeats are what keep it open while the agent
+        # stays dead and their stopping is what lets it clear. A transition
+        # would freeze `last_ts` and announce a false all-clear an hour
+        # later.
+        snmp_failing_now = (not auth_failing and snmp_ok is False and ping_ok
+                            and not snmp_unsupported)
+        with self._lock:
+            if snmp_failing_now:
+                fail_count = self._snmp_failing_count.get(device_id, 0) + 1
+                self._snmp_failing_count[device_id] = fail_count
+            else:
+                # Consecutive means consecutive: any poll that does not
+                # qualify — SNMP answered, ping also down (that is a device
+                # outage, not a dead agent), an auth failure — starts the
+                # count over rather than pausing it.
+                fail_count = 0
+                self._snmp_failing_count.pop(device_id, None)
+        snmp_fail_alert_after = max(
+            1, int(settings.get("snmp_fail_alert_after", 3) or 1))
+        if snmp_failing_now and fail_count >= snmp_fail_alert_after:
             self.db.record_device_event(
                 device_id, "snmp_error",
                 f"SNMP is not answering but the device replies to ping: "
@@ -2998,6 +3069,13 @@ class NodePoller(Worker):
     # by read_dom() to find a port's transceiver sensors.
     _ENT_PHYSICAL_DESCR = "1.3.6.1.2.1.47.1.1.1.1.2"
     _ENT_PHYSICAL_CONTAINED_IN = "1.3.6.1.2.1.47.1.1.1.1.4"
+    # entPhysicalName: RFC 6933 makes it optional, so read_dom's own decode
+    # (shared with _poll_environment, both pre-dating this column's use
+    # here) never depended on it -- but where an agent populates it, it is
+    # a nicer name than entPhysicalDescr for a whole-device sensor list,
+    # which is naming dozens of rows at once rather than the one a port
+    # dialog already knows the context of. See _read_entity_sensors.
+    _ENT_PHYSICAL_NAME = "1.3.6.1.2.1.47.1.1.1.1.7"
     _ENT_ALIAS_MAPPING = "1.3.6.1.2.1.47.1.3.2.1.2"
     _ENT_SENSOR_TYPE = "1.3.6.1.2.1.99.1.1.1.1"
     _ENT_SENSOR_SCALE = "1.3.6.1.2.1.99.1.1.1.2"
@@ -3011,6 +3089,14 @@ class NodePoller(Worker):
                           8: "°C", 9: "%RH", 10: "RPM", 11: "m³/min",
                           12: ""}
     _SENSOR_STATUS = {1: "ok", 2: "unavailable", 3: "nonoperational"}
+    # entPhySensorType -> a human label, for read_hardware's whole-device
+    # sensor list (a port dialog's DOM table already gives its rows
+    # context; a device-wide list naming dozens of unrelated probes needs
+    # to say what kind each one is).
+    _SENSOR_TYPE_NAMES = {1: "other", 2: "unknown", 3: "voltage",
+                          4: "voltage", 5: "current", 6: "power",
+                          7: "frequency", 8: "temperature", 9: "humidity",
+                          10: "fan speed", 11: "airflow", 12: "other"}
 
     # entPhySensorType values this app turns into a device-level metric —
     # see _poll_environment. The rest of _SENSOR_TYPE_UNITS' arcs (voltage,
@@ -3131,6 +3217,258 @@ class NodePoller(Worker):
                 sensors.append(reading)
         sensors.sort(key=lambda s: s["entity"])
         return sensors
+
+    def _entity_port_map(self, device, config: dict) -> dict[int, int]:
+        """entPhysicalIndex -> ifIndex, resolved through the containment
+        chain, for every entity that maps to a port at all.
+
+        read_dom() answers "does entity X belong to THIS ifIndex" with an
+        inline walk-up over the same two tables; this generalises that to
+        "which ifIndex, if any, does entity X belong to", for every entity
+        on the device at once -- what read_hardware's whole-device sensor
+        list and read_dom_all need instead. Kept as its own read rather
+        than reshaping _walk_port_mapped_entities to also return it: that
+        helper is _poll_environment's, and a second return value it never
+        asked for is exactly the kind of change that quietly breaks a poll
+        path a review of this diff would not think to re-check.
+        """
+        alias = self._walk_column(device, config, self._ENT_ALIAS_MAPPING)
+        prefix = self._IF_INDEX_COLUMN + "."
+        direct: dict[int, int] = {}
+        for suffix, value in alias.items():
+            target = str(value)
+            if not target.startswith(prefix):
+                continue
+            try:
+                entity = int(suffix.split(".")[0])
+                if_index = int(target.rsplit(".", 1)[-1])
+            except ValueError:
+                continue
+            direct[entity] = if_index
+        contained_in: dict[int, int] = {}
+        for suffix, value in self._walk_column(
+                device, config, self._ENT_PHYSICAL_CONTAINED_IN).items():
+            try:
+                contained_in[int(suffix)] = int(value)
+            except (TypeError, ValueError):
+                continue
+
+        resolved: dict[int, int] = {}
+
+        def resolve(entity: int):
+            seen = 0
+            chain = entity
+            while chain and seen < 16:   # a real containment tree is shallow
+                if chain in direct:
+                    resolved[entity] = direct[chain]
+                    return
+                chain = contained_in.get(chain, 0)
+                seen += 1
+
+        for entity in set(direct) | set(contained_in):
+            resolve(entity)
+        return resolved
+
+    def _read_entity_sensors(self, device, config: dict) -> list[dict]:
+        """Every ENTITY-SENSOR-MIB row this device answers, whatever it
+        does or does not map to -- the whole-device counterpart of
+        read_dom()'s single-port filter, and read_hardware's "sensors"
+        list. Shares _decode_entity_sensor with read_dom and
+        _poll_environment, so the value/unit/status of a given reading can
+        never disagree between them.
+
+        Each row adds `type` (a human label for entPhySensorType) and
+        `if_index`/`if_name` (via _entity_port_map and the stored
+        interfaces table) on top of _decode_entity_sensor's own shape, and
+        prefers entPhysicalName over entPhysicalDescr for `label` where an
+        agent populates it -- see _ENT_PHYSICAL_NAME.
+        """
+        sensor_values = self._walk_column(device, config, self._ENT_SENSOR_VALUE)
+        if not sensor_values:
+            return []
+        types = self._walk_column(device, config, self._ENT_SENSOR_TYPE)
+        scales = self._walk_column(device, config, self._ENT_SENSOR_SCALE)
+        precisions = self._walk_column(device, config, self._ENT_SENSOR_PRECISION)
+        statuses = self._walk_column(device, config, self._ENT_SENSOR_STATUS)
+        units = self._walk_column(device, config, self._ENT_SENSOR_UNITS)
+        descrs = self._walk_column(device, config, self._ENT_PHYSICAL_DESCR)
+        names = self._walk_column(device, config, self._ENT_PHYSICAL_NAME)
+        port_map = self._entity_port_map(device, config)
+        if_names = {row["if_index"]: (row["descr"] or row["alias"] or "")
+                   for row in self.db.interfaces(device["id"])}
+
+        sensors = []
+        for suffix, raw in sensor_values.items():
+            reading = self._decode_entity_sensor(
+                suffix, raw, types, scales, precisions, statuses, units, descrs)
+            if reading is None:
+                continue
+            entity = reading["entity"]
+            name = str(names.get(suffix) or "").strip()
+            if_index = port_map.get(entity)
+            if_name = if_names.get(if_index) if if_index is not None else None
+            sensors.append({
+                **reading,
+                "label": name or reading["label"],
+                "type": self._SENSOR_TYPE_NAMES.get(
+                    int(types.get(suffix) or 0), "other"),
+                "if_index": if_index,
+                "if_name": if_name or None,
+            })
+        sensors.sort(key=lambda s: s["entity"])
+        return sensors
+
+    # entPhySensorType -> device-metric keys and prefixes read_hardware's
+    # "metrics" section shows: the polled figures _poll_vendor_health and
+    # _poll_environment already keep current, not anything walked here.
+    _HARDWARE_METRIC_KEYS = {"cpu_pct", "mem_pct", "humidity_pct"}
+    _HARDWARE_METRIC_PREFIXES = ("temp_", "fan_", "psu_")
+
+    def _hardware_metrics(self, device_id: int) -> list[dict]:
+        """The stored metrics that are a hardware reading rather than a
+        traffic counter, a ping figure or a UPS-MIB one -- cpu_pct,
+        mem_pct, every temp_* key (optic/ambient/chassis), humidity_pct,
+        and any fan_*/psu_* key a future vendor table adds.
+
+        Read straight off metrics.last_value/last_ts: _poll_vendor_health
+        and _poll_environment already keep these current on their own
+        poll-cycle cadence, so read_hardware only needs to show the latest
+        stored sample, never walk anything itself for this section.
+        """
+        rows = []
+        for row in self.db.metrics(device_id):
+            key = row["key"]
+            if key not in self._HARDWARE_METRIC_KEYS and \
+               not key.startswith(self._HARDWARE_METRIC_PREFIXES):
+                continue
+            if row["last_value"] is None:
+                continue
+            rows.append({"key": key, "label": row["label"],
+                        "value": row["last_value"], "unit": row["unit"],
+                        "status": "", "ts": row["last_ts"]})
+        order = {"cpu_pct": 0, "mem_pct": 1}
+        rows.sort(key=lambda r: (order.get(r["key"], 2), r["key"]))
+        return rows
+
+    # CISCO-ENVMON-MIB (the classic pre-ENTITY-SENSOR-MIB Cisco health
+    # tables) columns used by _read_cisco_envmon. ciscoEnvMonSupplyState /
+    # ciscoEnvMonFanState / ciscoEnvMonTemperatureState share one enum.
+    _ENVMON_SUPPLY_DESCR = "1.3.6.1.4.1.9.9.13.1.5.1.2"
+    _ENVMON_SUPPLY_STATE = "1.3.6.1.4.1.9.9.13.1.5.1.3"
+    _ENVMON_FAN_DESCR = "1.3.6.1.4.1.9.9.13.1.4.1.2"
+    _ENVMON_FAN_STATE = "1.3.6.1.4.1.9.9.13.1.4.1.3"
+    _ENVMON_TEMP_DESCR = "1.3.6.1.4.1.9.9.13.1.3.1.2"
+    _ENVMON_TEMP_VALUE = "1.3.6.1.4.1.9.9.13.1.3.1.3"
+    _ENVMON_TEMP_THRESHOLD = "1.3.6.1.4.1.9.9.13.1.3.1.4"
+    _ENVMON_TEMP_STATE = "1.3.6.1.4.1.9.9.13.1.3.1.6"
+    _ENVMON_STATE = {1: "normal", 2: "warning", 3: "critical",
+                     4: "shutdown", 5: "notPresent", 6: "notFunctioning"}
+
+    def _read_cisco_envmon(self, device, config: dict) -> list[dict]:
+        """CISCO-ENVMON-MIB power-supply, fan and temperature status --
+        read_hardware's Cisco-only extra section, for gear old or simple
+        enough to answer this rather than (or as well as) ENTITY-SENSOR-MIB.
+        Only ever called once detected_vendor is "cisco": walking an OID
+        subtree the agent has never heard of just times out, and every
+        non-Cisco device in the fleet would otherwise pay for a wasted walk
+        on every dialog open.
+        """
+        rows = []
+        descrs = self._walk_column(device, config, self._ENVMON_SUPPLY_DESCR)
+        states = self._walk_column(device, config, self._ENVMON_SUPPLY_STATE)
+        for suffix, descr in descrs.items():
+            rows.append({
+                "kind": "supply", "label": str(descr) or f"supply {suffix}",
+                "value": None, "unit": "",
+                "status": self._ENVMON_STATE.get(
+                    int(states.get(suffix) or 0), "unknown")})
+        descrs = self._walk_column(device, config, self._ENVMON_FAN_DESCR)
+        states = self._walk_column(device, config, self._ENVMON_FAN_STATE)
+        for suffix, descr in descrs.items():
+            rows.append({
+                "kind": "fan", "label": str(descr) or f"fan {suffix}",
+                "value": None, "unit": "",
+                "status": self._ENVMON_STATE.get(
+                    int(states.get(suffix) or 0), "unknown")})
+        descrs = self._walk_column(device, config, self._ENVMON_TEMP_DESCR)
+        values = self._walk_column(device, config, self._ENVMON_TEMP_VALUE)
+        thresholds = self._walk_column(device, config, self._ENVMON_TEMP_THRESHOLD)
+        states = self._walk_column(device, config, self._ENVMON_TEMP_STATE)
+        for suffix, descr in descrs.items():
+            value = values.get(suffix)
+            numeric = isinstance(value, (int, float))
+            rows.append({
+                "kind": "temperature",
+                "label": str(descr) or f"temperature {suffix}",
+                "value": value if numeric else None,
+                "unit": "°C" if numeric else "",
+                "threshold": thresholds.get(suffix),
+                "status": self._ENVMON_STATE.get(
+                    int(states.get(suffix) or 0), "unknown")})
+        return rows
+
+    def read_hardware(self, device_id: int) -> dict:
+        """On-demand snapshot of a device's own hardware health for the
+        device dialog's HARDWARE SENSORS section: the polled CPU/memory/
+        temperature metrics already stored, every ENTITY-SENSOR-MIB row
+        the device answers (not filtered to one port the way read_dom is),
+        and CISCO-ENVMON-MIB's supply/fan/temperature status on Cisco gear.
+
+        Walked only while a human has the device dialog open, never on the
+        poll cycle -- the same reasoning read_dom's docstring gives. A
+        device that answers nothing for a section leaves it an empty list
+        rather than raising: this backs a dialog, and "no data" is a fact
+        it can show, an exception is not.
+        """
+        device = self.db.device(device_id)
+        if device is None:
+            return {"metrics": [], "sensors": [], "envmon": []}
+        metrics = self._hardware_metrics(device_id)
+        config = self.working_config(device)
+        if not config.get("snmp_enabled", True):
+            return {"metrics": metrics, "sensors": [], "envmon": []}
+        sensors = self._read_entity_sensors(device, config)
+        envmon = self._read_cisco_envmon(device, config) \
+            if detected_vendor(device).lower() == "cisco" else []
+        return {"metrics": metrics, "sensors": sensors, "envmon": envmon}
+
+    def read_dom_all(self, device_id: int) -> list[dict]:
+        """Every port's DOM/SFP (ENTITY-SENSOR-MIB) reading across the
+        whole device, in the one set of table walks _read_entity_sensors
+        already does -- the device-wide counterpart of read_dom(), the
+        same relationship read_device_mac_table already has to
+        read_mac_table, so opening the device dialog costs one walk rather
+        than one read_dom() per interface.
+
+        Built from the exact same decode and the exact same containment
+        resolution read_dom() uses, so the two can never disagree about
+        which sensor belongs to which port -- only about how many ports
+        they answer for in one call. Rows with no port mapping (a chassis
+        or environmental-monitor probe, already visible in read_hardware's
+        "sensors" list) are left out: this is the DOM/SFP table, one row
+        per port, not the whole-device sensor list again.
+        """
+        device = self.db.device(device_id)
+        if device is None:
+            return []
+        config = self.working_config(device)
+        if not config.get("snmp_enabled", True):
+            return []
+        if_names = {row["if_index"]: (row["descr"] or row["alias"]
+                                      or f"port {row['if_index']}")
+                   for row in self.db.interfaces(device_id)}
+        rows = []
+        for sensor in self._read_entity_sensors(device, config):
+            if_index = sensor.get("if_index")
+            if if_index is None:
+                continue
+            rows.append({
+                "if_index": if_index,
+                "if_name": if_names.get(if_index, f"port {if_index}"),
+                "label": sensor["label"], "value": sensor["value"],
+                "unit": sensor["unit"], "status": sensor["status"]})
+        rows.sort(key=lambda r: (r["if_index"], r["label"]))
+        return rows
 
     # How often _poll_environment's whole-device ENTITY-SENSOR-MIB walk runs
     # per device. Six column walks cost what the LLDP/MAC walks do, so it

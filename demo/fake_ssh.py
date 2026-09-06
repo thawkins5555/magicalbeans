@@ -173,6 +173,27 @@ ACC_DEFAULT_SNMP_CONFIG = "\n".join(
     + [f"interface GigabitEthernet1/0/{i}\n switchport mode access\n switchport access vlan {100 + i % 5}\n switchport port-security\n spanning-tree portfast"
        for i in range(1, 25)]
     + ["!", "line vty 0 4", " transport input ssh", "!", "end"])
+# Ubiquiti airOS (NanoBeam/NanoStation/LiteBeam/PowerBeam/airFiber): a
+# busybox shell, not a router CLI, so its "running config" is the plain
+# key=value system.cfg text `cat`, not the output of a "show" verb — see the
+# "ubiquiti" entry in configrx.py for sourcing. Shape (section prefixes,
+# radio/wireless/network keys) follows publicly documented airOS system.cfg
+# layouts; the specific values here are plant-plausible fakes, not a
+# transcribed capture from real hardware.
+UBIQUITI_CONFIG = "\n".join(
+    ["resolv.host.1.status=enabled", "resolv.host.1.name=nanobeam-01",
+     "resolv.host.status=enabled", "users.1.name=ubnt", "users.status=enabled",
+     "netmode=bridge", "network.1.type=bridge", "network.1.status=enabled",
+     "bridge.1.status=enabled", "route.1.status=disabled"]
+    + [f"wireless.1.{key}={value}" for key, value in [
+        ("status", "enabled"), ("ssid", "PtP-Link-01"), ("mode", "sta"),
+        ("countrycode", "840"), ("channel", "36")]]
+    + [f"radio.1.{key}={value}" for key, value in [
+        ("chanbw", "20"), ("txpower", "23"), ("ieee_mode", "11acvht40")]]
+    + [f"snmp.1.{key}={value}" for key, value in [
+        ("status", "enabled"), ("community", "PlantRO2026"), ("contact", "noc@example.com")]]
+    + ["aaa.1.status=disabled", "ntpclient.1.server=10.40.0.1",
+       "gui.status=enabled", "httpd.status=enabled"])
 
 PERSONAS = {
     "cisco":         {"banner": "acc-sw-001 line 2\n\nacc-sw-001#", "prompt": "acc-sw-001#",
@@ -256,6 +277,26 @@ PERSONAS = {
     "rockwell-stratix": {"banner": "Plant1-Stratix5700-07#", "prompt": "Plant1-Stratix5700-07#",
                       "pager_off": ["terminal length 0"], "show": "show running-config",
                       "config": STRATIX_CONFIG, "mode": "normal"},
+    # Appended below — same "don't intersperse" reasoning as the industrial
+    # vendors above.
+    #
+    # An account that lands in user EXEC ('>') on a platform that now
+    # carries enable_command (plain "cisco" — see configrx.py's VENDORS
+    # table): "enable" + the right secret escalates to privileged EXEC
+    # ('#'), only after which pager-off/show are accepted. Same shape as
+    # "cisco-asa" above, proving the escalation is not special-cased to ASA.
+    "cisco-unpriv-enable": {
+        "banner": "acc-sw-005>", "prompt": "acc-sw-005>", "unpriv_prompt": "acc-sw-005>",
+        "priv_prompt": "acc-sw-005#", "enable_command": "enable",
+        "enable_password_prompt": "Password: ", "enable_secret": "demo",
+        "pager_off": ["terminal length 0"], "show": "show running-config",
+        "show_requires_priv": True, "config": CISCO_CONFIG, "mode": "normal"},
+    # Ubiquiti airOS: a busybox shell (no pager, `cat` instead of a "show"
+    # verb) — see the "ubiquiti" entry in configrx.py. Prompt is the
+    # firmware-version string airOS actually shows, dots/digits and all.
+    "ubiquiti-airos": {"banner": "XM.v8.7.11#", "prompt": "XM.v8.7.11#",
+                      "pager_off": [], "show": "cat /tmp/system.cfg",
+                      "config": UBIQUITI_CONFIG, "mode": "normal"},
 }
 
 DEFAULT_HOST_KEY_PATH = pathlib.Path(__file__).with_name("fake_ssh_host_key")

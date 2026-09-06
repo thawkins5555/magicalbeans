@@ -284,11 +284,6 @@ body.tiny .brand span { display: none; }
 }
 .tab:hover { color: var(--text); }
 .tab.active { color: var(--text); border-bottom-color: var(--accent); }
-/* A tab whose real name is mixed-case (ConfigRX) rather than an acronym:
-   mirrors .brand's size and tracking instead of shouting in caps like every
-   other tab. Never set font-weight here — weight is what marks the active
-   tab, and this rule must not compete with it. */
-.tab--proper { font-size: var(--fs-sm); line-height: var(--fs-xs); letter-spacing: 0.02em; text-transform: none; }
 /* 44px of padding per tab across twelve tabs is 528px on its own. Below
    1500px there is no longer room to spend that freely. */
 @media (max-width: 1500px) {
@@ -832,6 +827,13 @@ body.tiny .terms { display: none; }
    rather than the single flex row every other .subnet-detail uses — this
    only overrides display, so the panel styling above still applies. */
 .subnet-detail.scope-detail-stacked { display: block; }
+/* Same fix as #nd-detail above: the DHCP-unavailable notice needed a plain
+   sibling to swap with, so #ipam-dhcp-body sits between .subpage and .cols
+   where every other IPAM subpage puts .cols directly. Without its own
+   flex chain here, .cols's flex: 1 has nothing to flex against, so the
+   scope list and lease table grow to full content height and clip at the
+   page edge instead of scrolling. */
+#ipam-dhcp-body { display: flex; flex-direction: column; min-height: 0; flex: 1; }
 /* Same shape as .target-list's own fix: a short subnet list's .table-wrap
    (flex: 1) stretched to the sidebar's full height regardless of how many
    rows it actually had. Capped rather than flex: 1; a long subnet list
@@ -906,7 +908,6 @@ body.compact .canvas.small, body.tiny .canvas.small { min-height: 120px; }
 .gap-t { margin-top: 10px; }
 .gap-t-sm { margin-top: var(--space-sm); }
 .gap-t-xs { margin-top: 6px; }
-.canvas-tall { height: 65vh; }
 .dot-inline { vertical-align: -1px; }
 .table-wrap.short { max-height: 220px; }
 .table-wrap.tall { max-height: 420px; }
@@ -997,6 +998,12 @@ table.grid td {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Unscoped to table.grid on purpose: app.js's document-level hand-table
+   hook (App.sortableTable, and the delegated listeners beside it) marks a
+   plain <table>'s own header cells with these same classes so a dialog's
+   hand-built table or the Debug page's worker tables look and behave
+   exactly like a grid header, with no second set of rules to keep in step
+   with this one. */
 th.sortable { cursor: pointer; }
 th.sortable:hover { color: var(--text); }
 /* The caret is a real element rather than a positioned ::after: absolutely

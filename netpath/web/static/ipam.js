@@ -718,12 +718,24 @@
       ((parts[2] || 0) * 2 ** 8) + (parts[3] || 0);
   }
 
+  /* Fraction of the scope's range still free, for both available-sorts below.
+     Sorting by raw count instead would put a 900-address scope at 90% used
+     ahead of a 10-address scope that's completely exhausted -- backwards for
+     "which one is closest to running out". A scope with no total (unparsed
+     range) or a total of 0 has no meaningful percentage, so callers get null
+     and push it to the end regardless of sort direction. */
+  function availablePct(scope) {
+    const u = scope.usage || {};
+    if (!u.total || u.available == null) return null;
+    return u.available / u.total;
+  }
+
   function sortedScopes() {
     const scopes = view.dhcpScopes.slice();
     if (view.scopeSort === 'most') {
       // A scope whose range couldn't be parsed sorts last rather than
       // masquerading as the roomiest one.
-      scopes.sort((a, b) => (b.usage?.available ?? -1) - (a.usage?.available ?? -1));
+      scopes.sort((a, b) => (availablePct(b) ?? -1) - (availablePct(a) ?? -1));
     } else if (view.scopeSort === 'name') {
       scopes.sort((a, b) =>
         (a.name || a.scope_id).localeCompare(b.name || b.scope_id, undefined,
@@ -731,10 +743,11 @@
     } else if (view.scopeSort === 'ip') {
       scopes.sort((a, b) => ipToNumber(a.scope_id) - ipToNumber(b.scope_id));
     } else {
-      // Default: least available first, so the scope closest to running out
-      // is the first thing you see. An unparseable range sorts last here
-      // too, rather than masquerading as the most urgent one.
-      scopes.sort((a, b) => (a.usage?.available ?? Infinity) - (b.usage?.available ?? Infinity));
+      // Default: least available (by % of the range) first, so the scope
+      // closest to running out is the first thing you see, regardless of how
+      // big its range is. An unparseable range sorts last here too, rather
+      // than masquerading as the most urgent one.
+      scopes.sort((a, b) => (availablePct(a) ?? Infinity) - (availablePct(b) ?? Infinity));
     }
     return scopes;
   }

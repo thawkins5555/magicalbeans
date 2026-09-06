@@ -26,9 +26,22 @@ from .alertrules import CLEARS, ROLLED_UP_BY, ROLLS_UP, ROLLUP_ENTITY_KINDS, \
     UNMANAGED_ONLY_RULES, Occurrence, dedup_key, device_id_for, \
     evaluate_flapping, evaluate_threshold, match_device, syslog_signature
 from .eventlog import ALERTS, ERROR, NODES, NullLog
+from .nodesdb import TIMELINE_ONLY_EVENT_KINDS
 from .worker import Worker, ago
 
 TICK_S = 5.0
+
+# device_events kinds that exist only to back the status timeline's split
+# SNMP/ping lanes (see nodesdb.device_method_segments) and carry no alert
+# meaning of their own — snmp_ok/ping_ok flipping is already covered by
+# `down`/`up`/`snmp_error`/`auth_fail`. _drain_device_events below turns
+# EVERY device_events row into an Occurrence (it matches on the whole
+# table, not a kind whitelist), so these are skipped explicitly rather than
+# silently doubling the engine's per-tick event volume with occurrences no
+# rule will ever match. The set itself is nodesdb's, shared with the
+# overview histogram, so a fifth timeline-only kind cannot be added to one
+# reader's list and missed by the other's.
+_TIMELINE_ONLY_EVENT_KINDS = TIMELINE_ONLY_EVENT_KINDS
 
 # How far back operator_resolved_since looks for a hand resolve. Long enough
 # that an alert resolved Friday evening still stays closed Monday morning;
@@ -702,6 +715,8 @@ class AlertEngine(Worker):
                                       self.nodes_db.device_events_since, cursor,
                                       self.nodes_db.max_device_event_id):
             max_id = max(max_id, row["id"])
+            if row["kind"] in _TIMELINE_ONLY_EVENT_KINDS:
+                continue
             device = self.nodes_db.device(row["device_id"])
             if device is None:
                 continue

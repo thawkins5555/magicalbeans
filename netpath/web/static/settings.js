@@ -322,6 +322,17 @@
     el.style.color = colour || 'var(--muted)';
   }
 
+  // The detailed status() line above sits at the far left of the footer
+  // bar, off screen past the table on a narrow window — nothing next to
+  // the button itself ever said whether the click did anything. This is
+  // that missing feedback: right beside Apply, and short enough to never
+  // wrap.
+  function applyStatus(message, colour) {
+    const el = App.el('set-apply-status');
+    el.textContent = message;
+    el.style.color = colour || 'var(--muted)';
+  }
+
   async function apply() {
     if (!checkRanges()) return;
     const values = {};
@@ -330,14 +341,25 @@
       values[key] = kind === 'bool' ? el.checked
         : kind === 'num' ? Number(el.value) : el.value.trim();
     }
-    await App.post('/api/settings', { scope: 'global', values });
-    await App.loadState();
-    saved = { ...App.state.settings };
-    dirty = false;
-    // The list used to name seven of the eleven refresh rates (IPAM had a
-    // field and was left out; three had no field at all).
-    status(`Applied · reverse DNS ${values.dns_enabled ? 'on' : 'off'} · ` +
-           `eleven refresh rates · idle timeout ${values.session_idle_minutes} min`, 'var(--ok)');
+    const button = App.el('set-apply');
+    button.disabled = true;
+    applyStatus('Applying…', 'var(--muted)');
+    try {
+      await App.post('/api/settings', { scope: 'global', values });
+      await App.loadState();
+      saved = { ...App.state.settings };
+      dirty = false;
+      // The list used to name seven of the eleven refresh rates (IPAM had a
+      // field and was left out; three had no field at all).
+      status(`Applied · reverse DNS ${values.dns_enabled ? 'on' : 'off'} · ` +
+             `eleven refresh rates · idle timeout ${values.session_idle_minutes} min`, 'var(--ok)');
+      applyStatus('Applied', 'var(--ok)');
+    } catch (error) {
+      applyStatus(error.message, 'var(--fail)');
+      App.toast(`Could not apply settings: ${error.message}`, 'fail');
+    } finally {
+      button.disabled = false;
+    }
   }
 
   /* What each maintenance action actually destroys. Several of these are

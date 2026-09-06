@@ -482,7 +482,7 @@ mechanism built for this.
 
 **Automation should not be holding a human's password.** A script that
 polls the API, triggers a bulk import, or pulls a CSV export on a schedule
-should authenticate with an **API token** (Settings → Tokens & directory,
+should authenticate with an **API token** (Settings → Sign-in → Tokens,
 from 4.47.0) scoped to a dedicated account's own grants, not with an
 admin's session cookie or a password sitting in a cron job's environment. A
 token has no idle timeout and is revocable on its own without touching
