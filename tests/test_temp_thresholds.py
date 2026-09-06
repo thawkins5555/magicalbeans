@@ -92,6 +92,10 @@ check("temp_chassis_critical sits above temp_chassis_high (85/78 vs 75/65)",
 check("temp_chassis_critical's severity is this scale's actual 'critical' (2), "
       "not temp_chassis_high's 'warning' (4) again",
       critical is not None and critical["severity"] == 2, critical["severity"] if critical else None)
+check("a FRESH install ships both rules enabled and notifying, as designed",
+      critical is not None and critical["enabled"] == 1 and critical["notify"] == 1
+      and high is not None and high["enabled"] == 1 and high["notify"] == 1,
+      (dict(high) if high else None, dict(critical) if critical else None))
 
 # An operator tunes the existing rule, then the database re-opens — the
 # upgrade case: _seed_rules (INSERT OR IGNORE) and _run_named_migrations run
@@ -107,6 +111,120 @@ check("re-opening does not reset an operator's edited temp_chassis_high threshol
 check("re-opening does not duplicate temp_chassis_critical",
       len(matches) == 1, matches)
 reopened.close()
+
+
+# ============================================= dampen_new_builtin_siblings_1
+print("\ndampen_new_builtin_siblings_1: Critical must not arrive louder than "
+      "a temp_chassis_high an operator already tuned")
+
+# Every case below simulates a REAL upgrade from a 4.53.0-shaped alerts.db,
+# which never had a temp_chassis_critical row at all: open once (so the rest
+# of _seed_rules/_seed_templates has run), edit temp_chassis_high the way an
+# operator would have, delete the temp_chassis_critical row _seed_rules just
+# created, and drop this migration's own marker -- exactly the technique
+# test_ups_environment.py's retirement-migration section uses for the same
+# reason: a pre-fix install would never have recorded a marker for a
+# migration that did not exist yet either.
+
+
+def simulate_pre_critical_upgrade(name: str, high_edits: dict | None = None):
+    """A fresh alerts.db, optionally with temp_chassis_high edited, put back
+    into the shape a 4.53.0 upgrade would have: no temp_chassis_critical row,
+    and this migration never having run. Returns (path, high_id)."""
+    made, made_path = new_alerts_db(name)
+    high_row = made.rule_by_key("temp_chassis_high")
+    if high_edits:
+        made.update_rule(high_row["id"], **high_edits)
+    made._conn.execute("DELETE FROM rules WHERE key = 'temp_chassis_critical'")
+    made._conn.execute(
+        "DELETE FROM schema_migrations WHERE name = 'dampen_new_builtin_siblings_1'")
+    made._conn.commit()
+    made.close()
+    return made_path, high_row["id"]
+
+
+# --- case 1: the reported scenario, end to end -- disabled, muted, retuned.
+path1, _ = simulate_pre_critical_upgrade(
+    "upgrade_disabled_muted_retuned",
+    {"enabled": 0, "notify": 0, "threshold": 95.0, "clear_threshold": 85.0})
+reopened1 = AlertsDatabase(path1)
+critical1 = reopened1.rule_by_key("temp_chassis_critical")
+check("an alerts.db with temp_chassis_high disabled/muted/retuned does not "
+      "come up with a live, notifying Critical",
+      critical1 is not None and critical1["enabled"] == 0 and critical1["notify"] == 0,
+      dict(critical1) if critical1 else None)
+check("...and Critical's own threshold/clear_threshold moved by the same "
+      "+20/+20 the sibling was retuned by, keeping it above the sibling",
+      critical1["threshold"] == 105.0 and critical1["clear_threshold"] == 98.0,
+      dict(critical1))
+reopened1.close()
+
+# --- case 2: a FRESH install still gets both rules enabled and notifying.
+# (Covered above too; repeated here against THIS migration by name, so a
+# regression that only breaks fresh installs is caught in this section.)
+fresh_db, _ = new_alerts_db("dampen_fresh")
+fresh_high = fresh_db.rule_by_key("temp_chassis_high")
+fresh_critical = fresh_db.rule_by_key("temp_chassis_critical")
+check("a fresh install's Critical is untouched by the migration -- enabled, "
+      "notifying, at its own shipped 85/78",
+      fresh_critical["enabled"] == 1 and fresh_critical["notify"] == 1
+      and fresh_critical["threshold"] == 85.0 and fresh_critical["clear_threshold"] == 78.0,
+      dict(fresh_critical))
+fresh_db.close()
+
+# --- case 3: an operator who has since enabled Critical by hand keeps it
+# enabled across the next open.
+path3, _ = simulate_pre_critical_upgrade("upgrade_then_reenable", {"enabled": 0, "notify": 0})
+reopened3a = AlertsDatabase(path3)
+critical3a = reopened3a.rule_by_key("temp_chassis_critical")
+check("migration brings Critical down to match the disabled sibling",
+      critical3a["enabled"] == 0 and critical3a["notify"] == 0, dict(critical3a))
+reopened3a.update_rule(critical3a["id"], enabled=1, notify=1)
+reopened3a.close()
+
+reopened3b = AlertsDatabase(path3)
+critical3b = reopened3b.rule_by_key("temp_chassis_critical")
+check("an operator who enabled Critical by hand keeps it enabled across the "
+      "next open (the migration already ran once and does not run again)",
+      critical3b["enabled"] == 1 and critical3b["notify"] == 1, dict(critical3b))
+reopened3b.close()
+
+# --- case 4: the migration is idempotent, and its marker behaves like every
+# other named migration's.
+path4, _ = simulate_pre_critical_upgrade(
+    "upgrade_idempotent", {"enabled": 0, "notify": 0, "threshold": 95.0, "clear_threshold": 85.0})
+reopened4 = AlertsDatabase(path4)
+marker_count = reopened4._conn.execute(
+    "SELECT COUNT(*) AS n FROM schema_migrations"
+    " WHERE name = 'dampen_new_builtin_siblings_1'").fetchone()["n"]
+check("the migration leaves exactly one marker row, like the other named migrations",
+      marker_count == 1, marker_count)
+critical4 = reopened4.rule_by_key("temp_chassis_critical")
+
+reopened4._dampen_new_builtin_siblings()   # calling it again directly
+critical4_again = reopened4.rule_by_key("temp_chassis_critical")
+check("calling the migration a second time directly changes nothing further",
+      dict(critical4_again) == dict(critical4), dict(critical4_again))
+
+reopened4.update_rule(critical4["id"], enabled=1, notify=1)
+reopened4._dampen_new_builtin_siblings()   # a stray extra run, e.g. a dropped marker
+critical4_reenabled = reopened4.rule_by_key("temp_chassis_critical")
+check("...nor does a stray extra run undo an operator's own re-enable",
+      critical4_reenabled["enabled"] == 1 and critical4_reenabled["notify"] == 1,
+      dict(critical4_reenabled))
+reopened4.close()
+
+# --- case 5: an operator who left temp_chassis_high completely untouched
+# gets Critical exactly as designed.
+path5, _ = simulate_pre_critical_upgrade("upgrade_untouched_sibling")
+reopened5 = AlertsDatabase(path5)
+critical5 = reopened5.rule_by_key("temp_chassis_critical")
+check("an operator who left temp_chassis_high completely untouched gets "
+      "Critical enabled and notifying at its own shipped 85/78",
+      critical5 is not None and critical5["enabled"] == 1 and critical5["notify"] == 1
+      and critical5["threshold"] == 85.0 and critical5["clear_threshold"] == 78.0,
+      dict(critical5) if critical5 else None)
+reopened5.close()
 
 
 # ==================================================================== accessors

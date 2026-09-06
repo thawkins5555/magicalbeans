@@ -208,7 +208,8 @@ print("locations", len(rows), "present", rows[0]["present"] if rows else None)
 # marker doing it — so the accounts an upgrade owes access to would get
 # none, ever. backfill_permissions() is the call that runs after the
 # accounts are final, and this is the path it exists for.
-from netpath.appdb import AppDatabase, migrate_from      # noqa: E402
+from netpath.appdb import (ADMIN_BACKFILL_MARKER, AppDatabase,   # noqa: E402
+                          POST_SSH_MODULES, SSH_BACKFILL_MARKER, migrate_from)
 from netpath import permissions as perms                 # noqa: E402
 
 mig = os.path.join(work, "migrate")
@@ -258,6 +259,89 @@ check("...nor does the next start",
       "ssh" not in restarted.permissions_for("olduser"),
       restarted.permissions_for("olduser"))
 restarted.close()
+
+# ------------------- part 4: a module added to an install that ALREADY has
+# permissions. Part 3 covers the install that predates user_permissions
+# entirely, where _backfill_full_permissions hands out every module in
+# MODULES and so covers a new one for free. The far commoner upgrade is the
+# one it does NOT cover: an install whose accounts already have rows, where
+# only the named per-module backfills run. 4.54 shipped `mapper` with no
+# such backfill, so every account on every upgraded install had no row for
+# it — and app.js hides a tab the account cannot read, so the new module was
+# invisible, to the administrator included, with nothing saying why. This is
+# that path.
+existing = os.path.join(work, "existing")
+os.makedirs(existing, exist_ok=True)
+existing_db = os.path.join(existing, "app.db")
+# Opened and closed once first, deliberately: _needs_full_backfill is decided
+# in _before_schema by whether user_permissions existed BEFORE this open, so
+# a brand-new file always says "yes" and _backfill_full_permissions would
+# hand every account write on every module -- including mapper, masking the
+# very gap this part exists to test. The second open sees the table the first
+# one created and takes the per-module path a real upgraded install takes.
+AppDatabase(existing_db).close()
+have_perms = AppDatabase(existing_db)
+# An install that already went through the earlier permission backfills:
+# mark them spent, the way a real 4.53 app.db would have them.
+have_perms.set_meta(SSH_BACKFILL_MARKER, "1")
+have_perms.set_meta(ADMIN_BACKFILL_MARKER, "1")
+for name in ("noc", "viewer", "billing"):
+    have_perms.add_user(name, "not-a-real-hash")
+have_perms.set_permissions("noc", {"nodes": "write", "alerts": "write"})
+have_perms.set_permissions("viewer", {"nodes": "read"})
+have_perms.set_permissions("billing", {"settings": "write"})
+check("no account has a mapper row before the backfill",
+      all("mapper" not in have_perms.permissions_for(n)
+          for n in ("noc", "viewer", "billing")),
+      [have_perms.permissions_for(n) for n in ("noc", "viewer", "billing")])
+
+have_perms.backfill_permissions()
+check("an account with nodes:write gets mapper:write",
+      have_perms.permissions_for("noc").get("mapper") == "write",
+      have_perms.permissions_for("noc"))
+check("...an account with nodes:read gets mapper:read, not write",
+      have_perms.permissions_for("viewer").get("mapper") == "read",
+      have_perms.permissions_for("viewer"))
+check("...and an account with no Nodes access gets no mapper row at all",
+      "mapper" not in have_perms.permissions_for("billing"),
+      have_perms.permissions_for("billing"))
+
+# Same one-time contract the other two backfills keep.
+have_perms.set_permissions("noc", {"nodes": "write", "alerts": "write"})
+have_perms.backfill_permissions()
+check("revoking mapper sticks across a second backfill",
+      "mapper" not in have_perms.permissions_for("noc"),
+      have_perms.permissions_for("noc"))
+have_perms.close()
+
+# ------------------- part 5: adding a module must not break the ssh backfill
+# _backfill_ssh_permission grants ssh to whoever "holds write on everything
+# else". Every module appended after ssh has to be excluded from that test,
+# because no pre-existing account has a row for it — include one and the
+# test is true of nobody, and the backfill silently grants ssh to no one on
+# the very upgrade it exists for. `admin` was excluded by hand in 4.37;
+# `mapper` was NOT when it was added in 4.54, which is the regression this
+# pins. POST_SSH_MODULES is the single list both the code and this check
+# read, so the next module added is a one-line change in one place.
+check("every module appended after ssh is excluded from its backfill test",
+      all(module in POST_SSH_MODULES for module in ("ssh", "admin", "mapper")),
+      POST_SSH_MODULES)
+
+fresh_ssh = os.path.join(work, "sshgrant")
+os.makedirs(fresh_ssh, exist_ok=True)
+ssh_path = os.path.join(fresh_ssh, "app.db")
+AppDatabase(ssh_path).close()          # same reason as part 4's first open
+ssh_db = AppDatabase(ssh_path)
+ssh_db.add_user("sysadmin", "not-a-real-hash")
+# Write on every module that predates ssh — and, as on any real upgraded
+# install, no row at all for ssh, admin or mapper.
+ssh_db.set_permissions("sysadmin", {module: "write" for module in perms.MODULES
+                                    if module not in POST_SSH_MODULES})
+ssh_db.backfill_permissions()
+check("an account holding write on every older module still earns ssh",
+      ssh_db.permissions_for("sysadmin").get("ssh") == "write",
+      ssh_db.permissions_for("sysadmin"))
+ssh_db.close()
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")

@@ -156,6 +156,19 @@ MIGRATION_MARKER = "migrated_from_netpath_db"
 SSH_BACKFILL_MARKER = "ssh_permission_backfilled"
 # The same, for the `admin` capability split out of `settings` in 4.37.
 ADMIN_BACKFILL_MARKER = "admin_permission_backfilled"
+# The same, for the `mapper` module added in 4.54.
+MAPPER_BACKFILL_MARKER = "mapper_permission_backfilled"
+
+# Modules that did not exist when `ssh` was added, and so can never be part
+# of _backfill_ssh_permission's "holds write on everything else" test: no
+# account predating them has a row for any of them, so including one makes
+# that test true of nobody and silently grants `ssh` to no one on the exact
+# upgrade path the backfill exists for. `admin` was already excluded by hand
+# for this reason; 4.54's `mapper` walked into the same trap unnoticed,
+# which is why the rule now lives in one named place instead of a literal
+# tuple inside the function. EVERY module appended from here on belongs
+# here too.
+POST_SSH_MODULES = ("ssh", "admin", "mapper")
 
 HOSTNAME_TTL_S = 7 * 86400
 ASN_TTL_S = 30 * 86400
@@ -307,7 +320,63 @@ class AppDatabase(SqliteStore):
                 self._needs_full_backfill = False
             self._backfill_ssh_permission()
             self._backfill_admin_permission(log)
+            self._backfill_mapper_permission(log)
             self._conn.commit()
+
+    def _backfill_mapper_permission(self, log=None) -> None:
+        """`mapper` is new in 4.54, and without this every account on an
+        upgraded install has no row for it — so `applyPermissions` hides the
+        MAPPER tab (app.js: `tab.hidden = !canRead(module)`) and the whole
+        feature is invisible, to the administrator included, with nothing on
+        screen explaining the absence. That is how it actually shipped, and
+        it is what this exists to stop.
+
+        The grant matches each account's own `nodes` level rather than being
+        handed to administrators alone, because MAPPER shows nothing that
+        `nodes: read` does not already show: device names, addresses,
+        status, and the LLDP/CDP neighbours and VLANs the device pane lists
+        in a table. A map is a second way to look at data the account can
+        already read. Write is the same argument in reverse — placing a box
+        on a map and naming it is strictly less than `nodes: write`'s power
+        to add and delete the device itself — so the level carries across
+        unchanged rather than being capped at read.
+
+        An account with no `nodes` grant at all gets no `mapper` grant: it
+        cannot see the devices, so a map of them would be empty at best and
+        a disclosure at worst.
+
+        Exactly once, marker written whether or not anything was granted, so
+        an administrator who takes the permission away is not handed it back
+        on the next restart — the same contract `_backfill_ssh_permission`
+        and `_backfill_admin_permission` keep. A fresh install has no users
+        at this point (the default admin is seeded later, in
+        `Service.__init__`, with every module including this one), so it is
+        a no-op there.
+        """
+        if self._conn.execute("SELECT 1 FROM meta WHERE key = ?",
+                              (MAPPER_BACKFILL_MARKER,)).fetchone():
+            return
+        self._conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)",
+            (MAPPER_BACKFILL_MARKER, str(time.time())))
+        granted = self._conn.execute(
+            "SELECT username, level FROM user_permissions WHERE module = 'nodes'"
+            " ORDER BY username COLLATE NOCASE").fetchall()
+        for row in granted:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO user_permissions(username, module, level)"
+                " VALUES (?,?,?)", (row["username"], "mapper", row["level"]))
+        if granted:
+            names = ", ".join(row["username"] for row in granted)
+            message = ("MAPPER is a new module with its own permission. "
+                       + names + " hold Nodes access, and a map shows what "
+                       "Nodes already shows, so each keeps the same level on "
+                       "MAPPER; an account with no Nodes access starts "
+                       "without it.")
+            log_module.info("mapper backfill granted: %s", names)
+            if log is not None:
+                from .eventlog import SYSTEM
+                log.add(SYSTEM, message)
 
     def _backfill_admin_permission(self, log=None) -> None:
         """`admin` is new in 4.37: it is the half of `settings` that was
@@ -403,13 +472,11 @@ class AppDatabase(SqliteStore):
         self._conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES (?,?)",
             (SSH_BACKFILL_MARKER, str(time.time())))
-        # Every module that predates BOTH capabilities. `admin` has to be
-        # excluded as well as `ssh`: it was appended in 4.37, so no existing
-        # account has a row for it, and comparing against it would mean
-        # "holds write on everything" was true of nobody and this backfill
-        # silently granted ssh to no one on the upgrade path it exists for.
+        # Every module that predates this capability — see POST_SSH_MODULES
+        # for why the newer ones have to be excluded rather than compared
+        # against, and why that list is the one place to add the next one.
         others = [module for module in permissions.MODULES
-                  if module not in ("ssh", "admin")]
+                  if module not in POST_SSH_MODULES]
         for row in self._conn.execute("SELECT username FROM users").fetchall():
             username = row["username"]
             grants = {grant["module"]: grant["level"] for grant in

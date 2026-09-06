@@ -443,8 +443,9 @@ local variable immediately before `paramiko.SSHClient.connect()`, and a
 `finally` block reassigns that variable to `None` the instant the
 connection attempt finishes — success or failure — before the function
 does anything else. There is no caching of a decrypted password anywhere
-in this module; every scheduled pull and every manual **Back up now**
-decrypts fresh from `configrx.db` and discards it again.
+in this module; every scheduled pull and every operator-requested
+**Back up selected** decrypts fresh from `configrx.db` and discards it
+again.
 
 **No free-form command execution exists anywhere in this module, and
 that boundary is load-bearing, not incidental.** (The interactive SSH

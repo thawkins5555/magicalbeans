@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [4.54.1 — The tab nobody could see](#4541--the-tab-nobody-could-see)
 - [4.54.0 — A map of your own](#4540--a-map-of-your-own)
 - [4.53.0 — Two lanes on the timeline, and the sensors under the hood](#4530--two-lanes-on-the-timeline-and-the-sensors-under-the-hood)
 - [4.52.0 — One base class, in place of ten copies](#4520--one-base-class-in-place-of-ten-copies)
@@ -121,6 +122,149 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 4.54.1 — The tab nobody could see
+
+**MAPPER was invisible on every upgraded install, including to the
+administrator.** `app.js`'s `applyPermissions` hides a tab the account
+cannot read (`tab.hidden = !canRead(module)`), and 4.54.0 added the `mapper`
+module to `permissions.MODULES` without a matching backfill — so no existing
+account had a row for it and the release's headline feature simply was not
+there, with nothing on screen saying why. Both of the release's code reviews
+saw the missing backfill and classified it as a documentation gap; it was
+not. `appdb._backfill_mapper_permission` now grants `mapper` at each
+account's own `nodes` level, behind the `mapper_permission_backfilled`
+marker so revoking it afterwards sticks, exactly as
+`_backfill_ssh_permission` and `_backfill_admin_permission` already do.
+
+The level matches Nodes rather than going to administrators alone because a
+map shows nothing `nodes: read` does not already show — device names,
+addresses, status, and the LLDP/CDP neighbours and VLANs the device pane
+lists in a table. A map is a second way to look at data the account can
+already read, and placing a box on one is strictly less than `nodes: write`'s
+power to add or delete the device itself. An account with no Nodes grant gets
+no MAPPER grant: it cannot see the devices, so a map of them would be empty
+at best.
+
+**Adding a module had also quietly broken the `ssh` backfill.**
+`_backfill_ssh_permission` grants `ssh` to whoever "holds write on everything
+else", and every module appended after `ssh` has to be excluded from that
+test — no pre-existing account has a row for one, so including it makes the
+test true of nobody and the backfill grants `ssh` to no one on the exact
+upgrade it exists for. `admin` was excluded by hand in 4.37 with a comment
+explaining precisely this trap; `mapper` walked into it in 4.54.0 unnoticed.
+The rule now lives in one named place, `appdb.POST_SSH_MODULES`, that both
+the code and `tests/test_upgrade_from_previous.py` read, so the next module
+is a one-line change rather than a silent regression. An install that had
+already run the `ssh` backfill was never affected; one upgrading from before
+4.36 straight to 4.54.0 would have been.
+
+`tests/test_upgrade_from_previous.py` gained the upgrade path that had no
+coverage at all: an install whose accounts ALREADY have permission rows, so
+only the per-module backfills run. Its existing part 3 covers the install
+that predates `user_permissions` entirely, where `_backfill_full_permissions`
+hands out every module in `MODULES` and therefore covers a new one for free —
+which is why a module with no backfill of its own looked tested and was not.
+
+**A third review, this time of the upgrade rather than the code, found
+three more.** Both of 4.54.0's review passes read source; neither considered
+the install as a running system somebody upgrades into, which is where all
+three of these live.
+
+**A Cisco trunk left at `switchport trunk allowed vlan all` filled the map
+with 512 VLANs that do not exist and dropped the ones that do.**
+`nodepoll.read_device_vlans` treated `vlanTrunkPortVlansEnabled*` — the
+trunk's configured ALLOW list — as the VLANs crossing the trunk. IOS answers
+all four bitmaps fully set for a default trunk, so `_MAX_VLANS` kept the
+lowest 512 ids and a real VLAN 1030 was discarded for VLAN 7 that was never
+configured. Every Cisco-to-Cisco uplink drew as an identical maximum-width
+"512 VLANs" line and the VLAN pane listed five hundred unnamed numbers, which
+is the exact opposite of what per-VLAN strands are for. The allow-list is now
+intersected against the VLANs the device itself says exist (`vtpVlanName`,
+`dot1qVlanStaticName`, and the egress/untagged bitmap suffixes), holding one
+invariant: **a VLAN never appears on a link unless the device says that VLAN
+exists.** `_MAX_VLANS` stays as a backstop but now prefers ids with a real
+port membership rather than the numerically lowest, so if it ever binds it no
+longer silently drops the highest-numbered VLANs; VLANs 1002-1005, the legacy
+FDDI/token-ring defaults every IOS switch names, are excluded here the way
+`_cisco_vlan_fdb` already excluded them. Secondary effect worth naming: those
+phantom rows were roughly two million `port_vlans` entries on a 2000-device
+fleet, counted against `max_nodes_db_mb`, whose trimmer deletes metric
+samples — so they were evicting real history.
+
+**VTP VLAN names were never read on real hardware.** `vtpVlanEntry` is
+indexed `{managementDomainIndex, vtpVlanIndex}`, so an agent answers a suffix
+like `1.10`; the walk did `int(suffix)`, which raises, and every row was
+silently skipped — while the column still counted as answered, so the device
+looked fully walked. Every VLAN was unnamed on any Cisco switch not also
+exposing Q-BRIDGE's `dot1qVlanStaticName`. Now `suffix.split(".")[-1]`, the
+pattern `_cisco_vlan_fdb` already used. Both of these passed the test suite
+because `tests/stubs/stub_agent_vlan.py` had been written from the same
+reading of the MIB as the code — it indexed the VTP table `.10` and modelled
+a default trunk as "VLAN 1, standing in for the real default". The stub now
+answers what an agent answers, and a `cisco_default_trunk` persona covers the
+case that actually matters.
+
+**A new built-in alert rule could arrive louder than the sibling an operator
+had already silenced.** `temp_chassis_critical` reads the same
+`temp_chassis_c` metric as `temp_chassis_high`, and `_seed_rules` seeded it
+`enabled=1, notify=1` at its shipped 85/78 regardless of what the operator
+had done to the rule beside it. An install that had disabled chassis-
+temperature alerting, or raised it to 95 because that closet runs hot, got a
+Critical alert and an email on upgrade from a rule they had never seen, about
+a metric they had deliberately muted. A new named migration,
+`dampen_new_builtin_siblings_1`, states the general case rather than the
+temperature one: a new built-in that shares a `source_kind` with an existing
+rule the operator has edited away from its shipped defaults inherits that
+rule's `enabled`/`notify`, and its thresholds shift by the same amount the
+sibling's were, preserving the deliberate gap between Warning and Critical. A
+fresh install is untouched — both rules ship on, as designed — and
+`_NEW_SIBLING_OF` is the one-line place the next such pair is declared.
+
+**The per-port VLAN walk now follows the LLDP walk rather than starting on
+every device unasked.** `vlan_interval_s` defaulted to an hour for everything,
+so upgrading started a thirteen-column hourly walk across the whole fleet with
+no operator action. It now defaults to 0 wherever `lldp_interval_s` is 0: VLAN
+membership exists to colour the strands on a link, a link comes from a
+neighbour row, and a profile that turned neighbour discovery off gains nothing
+from the walk. An explicit `vlan_interval_s` still wins, so a site that wants
+VLAN data without neighbour discovery can say so. Keyed on `lldp_interval_s`
+and deliberately not on `mac_table_interval_s`, where 0 is the shipped value
+and would have meant reading intent into a default nobody chose.
+
+**The Dashboard's storage tile was missing `mapper.db`.** `api.py` carries two
+hand-written lists of the databases to size — one for `/api/state`'s storage
+figures, one for the Dashboard's headroom tile. 4.54.0 added `mapper.db` to
+the first and missed the second, so the two disagreed about the same
+question. Both list it now.
+
+**ConfigRX's backups pane loses its own Back up now button.** The device
+list's **Back up selected** already does the same job from the tick box, on
+a device the operator has necessarily already selected in order to be
+looking at that pane at all — two routes to one action, each with its own
+progress states, its own refusal handling and its own reason for being
+disabled, kept in step by hand. `#cx-backup-now` is gone from `index.html`,
+along with `configrx.js`'s `App.watchJob` wiring for it and the
+`drawBackups` block that showed, hid and disabled it. `bulkBackupNow`
+(`#cx-bulk-backup`) is the one route now, and it takes a single ticked
+device as readily as twenty.
+
+`POST /api/configrx/devices/<id>/backup` is deliberately left in place. No
+screen calls it any more, but it is a documented single-device endpoint that
+`post_configrx_devices_bulk_backup` is a batch of, and removing a working
+API because the button in front of it moved would break anyone scripting
+against it for no gain here.
+
+**The reason a device could not be backed up survived the button that used
+to give it.** The deleted button carried "Backups are switched off for this
+device — turn them on in Device settings." in its own disabled title, and
+the surviving route reported only a count ("1 not enabled") on a button
+label that settles back after four seconds — an outcome, with no way to act
+on it. `bulkBackupNow` now raises a toast naming the count and where to turn
+backups on. `FEATURES.md` follows the button: the two sentences that
+described "Back up now" carrying the queued/backing-up states and being
+refused while the worker is stopped now name **Back up selected** and the
+refusal itself, both of which are unchanged in behaviour.
 
 ### 4.54.0 — A map of your own
 
@@ -393,7 +537,12 @@ MAPPER on upgrade** — the same as `wireless` and `configrx` when they
 shipped: `ssh` and `admin` are the only modules ever backfilled onto
 existing accounts, because both carved a capability out of a module
 people already held, where MAPPER is a genuinely new one. An administrator
-has to grant it before anyone sees the tab. And **every device begins an
+has to grant it before anyone sees the tab. *(4.54.1 reversed this: the
+reasoning above is sound about precedent and wrong about consequence — with
+no grant the tab is hidden outright, so the release's headline feature was
+invisible on every upgraded install, administrator included, and nothing on
+screen explained the absence. MAPPER is now backfilled at each account's own
+Nodes level.)* And **every device begins an
 hourly per-port VLAN walk the moment this release starts**, the same way
 every device already began an hourly LLDP walk when that shipped — it is
 retunable per device and per group, and 0 turns it off, but nothing about

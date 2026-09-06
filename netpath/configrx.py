@@ -805,7 +805,7 @@ class ConfigRxWorker(Worker):
         not an error.
 
         Raises NotRunning when the worker is stopped. It used to return
-        silently, so pressing "Back up now" with the worker off reported
+        silently, so asking for a backup with the worker off reported
         success and did nothing at all: the operator was told the backup had
         been queued and then watched no backup ever appear.
         """

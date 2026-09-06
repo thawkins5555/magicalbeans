@@ -263,6 +263,58 @@ try:
 finally:
     stub.kill()
 
+# ------------------ 6c. the fleet case: two default-allowed trunks + one
+# access port on a real Cisco switch (the phantom-VLAN fix, this release):
+# vlanTrunkPortVlansEnabled* left at IOS's default answers all four bitmaps
+# fully set -- the trunk's *allow-list*, not its membership -- so the map
+# must show only the VLANs this device actually names (1, 10, 20, 1030),
+# not the low-numbered phantoms a literal bitmap read would produce, and
+# must not drop 1030 (above 1023) to make room for them. The legacy
+# 1002-1005 range, which a real IOS switch names by default on every
+# device, must not appear either. The access port's own VLAN (20) must
+# survive untouched by either trunk's allow-list.
+stub, port = spawn_stub("stub_agent_vlan.py", "cisco_default_trunk")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_db("cisco_default_trunk")
+    did = device_against(db, port, vendor="cisco", name="fleet-sw")
+    poller = NodePoller(db)
+    result = poller.read_device_vlans(did)
+    check("a Cisco switch with two default-allowed trunks and an access "
+         "port returns a result", result is not None, result)
+    if result:
+        vlans = {v["vlan"]: v["name"] for v in result["vlans"]}
+        check("...the map sees only the VLANs this device actually names -- "
+             "1, 10, 20, 1030 -- not a bitmap's worth of phantoms and not "
+             "the legacy 1002-1005 range",
+              vlans == {1: "default", 10: "data", 20: "voice", 1030: "video"},
+              vlans)
+        memberships = {(m["if_index"], m["vlan"]): m["tagged"]
+                       for m in result["memberships"]}
+        for trunk_if in (1, 3):
+            check(f"...trunk ifIndex {trunk_if} carries exactly the real "
+                 "VLANs: 1 untagged (native), 10/20/1030 tagged",
+                  {v for (i, v) in memberships if i == trunk_if} == {1, 10, 20, 1030}
+                  and memberships.get((trunk_if, 1)) is False
+                  and memberships.get((trunk_if, 10)) is True
+                  and memberships.get((trunk_if, 20)) is True,
+                  memberships)
+            check(f"...the high-numbered VLAN (1030) survives on trunk "
+                 f"ifIndex {trunk_if}, not dropped to make room for phantoms",
+                  memberships.get((trunk_if, 1030)) is True, memberships)
+        ports = {p["if_index"]: p for p in result["ports"]}
+        check("...both trunks are recorded as mode 'trunk'",
+              ports[1]["mode"] == "trunk" and ports[3]["mode"] == "trunk", ports)
+        check("...the access port (ifIndex 2) keeps its own single VLAN "
+             "(20 untagged/native), untouched by either trunk's allow-list",
+              {v for (i, v) in memberships if i == 2} == {20}
+              and memberships.get((2, 20)) is False
+              and ports[2]["mode"] == "access" and ports[2]["native_vlan"] == 20,
+              memberships)
+    db.close()
+finally:
+    stub.kill()
+
 # --------------------------------------------------- 7. neither table -> None
 stub, port = spawn_stub("stub_agent_vlan.py", "no_vlan")
 nodepoll_mod.DEFAULT_SNMP_PORT = port
@@ -396,6 +448,26 @@ did_default = db2.add_device("10.0.0.102", name="default-sw",
 config_default = db2.effective_config(db2.device(did_default))
 check("the shipped default is 3600s, mirroring lldp_interval_s",
       config_default.get("vlan_interval_s") == 3600, config_default)
+
+# ...but it follows lldp_interval_s rather than defaulting on unconditionally.
+# VLAN membership only colours the strands on a link, and a link comes from an
+# LLDP/CDP neighbour row — so a profile that turned neighbour discovery off
+# gains nothing from thirteen more columns walked hourly, and must not have
+# one started for it silently on upgrade.
+gid2 = db2.ensure_default_group()
+db2.update_group(gid2, lldp_interval_s=0)
+did_no_lldp = db2.add_device("10.0.0.103", name="no-lldp-sw", group_id=gid2)
+config_no_lldp = db2.effective_config(db2.device(did_no_lldp))
+check("...but with the LLDP walk off, the VLAN walk defaults off too",
+      config_no_lldp.get("vlan_interval_s") == 0, config_no_lldp)
+
+# An explicit choice still wins in that state: a site that wants VLAN data
+# without neighbour discovery can say so, and is not overridden by the above.
+did_explicit = db2.add_device("10.0.0.104", name="vlan-only-sw", group_id=gid2,
+                              vlan_interval_s=600)
+config_explicit = db2.effective_config(db2.device(did_explicit))
+check("...and an explicit vlan_interval_s still wins over that inference",
+      config_explicit.get("vlan_interval_s") == 600, config_explicit)
 db2.close()
 db.close()
 

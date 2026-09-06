@@ -7792,8 +7792,12 @@ def get_dashboard(service, params, body) -> dict:
         settings = service.settings or {}
         stores = []
         # Only the seven databases that actually have a cap on the Settings
-        # tab; app.db, wireless.db and configrx.db have none, so they are
-        # reported as size without a fraction rather than as 0% used.
+        # tab; app.db, wireless.db, configrx.db and mapper.db have none, so
+        # they are reported as size without a fraction rather than as 0% used.
+        # This list is hand-written rather than derived from _storage's, and
+        # mapper.db was added to that one and missed here — two figures for
+        # the same question that disagreed. Anything opened as a database
+        # belongs in both.
         for label, db, cap_key in (
                 ("NetPath", service.db, "max_trace_db_mb"),
                 ("NetFlow", service.flow_db, "max_flow_db_mb"),
@@ -7804,6 +7808,7 @@ def get_dashboard(service, params, body) -> dict:
                 ("Alerts", service.alerts_db, "max_alerts_db_mb"),
                 ("Wireless", service.wireless_db, None),
                 ("ConfigRX", service.configrx_db, None),
+                ("Mapper", service.mapper_db, None),
                 ("Application", service.app_db, None)):
             try:
                 used = int(db.size_bytes())

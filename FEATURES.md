@@ -978,8 +978,12 @@ From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
   — which VLANs it names, which of its ports are trunk or access, and
   which VLANs actually cross which port — over Q-BRIDGE-MIB and, on Cisco
   gear, CISCO-VTP-MIB, on its own schedule (**Learn VLAN membership every N
-  seconds**, `vlan_interval_s`, inherited like MAC learning and LLDP and
-  defaulting to the same hour). This is what lets MAPPER draw a trunk's
+  seconds**, `vlan_interval_s`, inherited like MAC learning and LLDP).
+  It defaults to the same hour, except where the LLDP/CDP walk is switched
+  off — VLAN membership only colours the strands on a link, and a link comes
+  from a neighbour row, so a profile that has turned neighbour discovery off
+  gets no VLAN walk either unless it asks for one outright. This is what
+  lets MAPPER draw a trunk's
   VLANs as individual coloured strands rather than one anonymous line;
   there is no page of its own for it in Nodes, the same way the MAC table
   and the neighbour table feed MAPPER and the device pane rather than a
@@ -2321,7 +2325,7 @@ to a manual name in Nodes.
   device changed.
 - **A backup in progress is visible.** The device row reports *queued…* and
   *backing up…* rather than sitting on the last completed attempt for the
-  whole run, and the Back up now button follows the same states through to the
+  whole run, and **Back up selected** follows the same states through to the
   outcome instead of saying "Queued…" and going silent.
 - **The Vendor column shows the vendor the backup will actually use**, and a
   dropdown filters on it. A per-device vendor override steers which
@@ -2373,8 +2377,8 @@ to a manual name in Nodes.
   on a save leaves a stored secret alone; **Clear credential** clears the
   enable secret along with the password rather than leaving it behind,
   unreachable, for the device.
-- **Backing up with the worker stopped says so.** "Back up now" used to
-  report success and do nothing: the queue it went into was never being
+- **Backing up with the worker stopped says so.** Asking for a backup used
+  to report success and do nothing: the queue it went into was never being
   drained. It is now refused with a message naming the reason, and the
   Start worker button is the fix it points at.
 - **SSH needs the `paramiko` package**, the one third-party dependency in
@@ -2438,7 +2442,11 @@ than a diagram that lays itself out and redraws under you every time
 something changes. It replaces what the Nodes → TOPOLOGY graph used to
 offer automatically, deliberately traded for something an operator builds
 and owns — new in 4.54.0, gated by its own `mapper` permission alongside
-every other tab.
+every other tab. On upgrade, every account that already has Nodes access is
+given MAPPER at the same level, because a map shows nothing the Nodes device
+list and its NEIGHBOURS table do not already show; an account with no Nodes
+access gets none, and an administrator can grant or revoke it from Settings
+like any other module.
 
 - **A map starts blank, and stays whatever you put on it.** There can be
   several, named and switched between from the **Map** dropdown — one per

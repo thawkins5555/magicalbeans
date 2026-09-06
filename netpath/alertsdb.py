@@ -767,6 +767,36 @@ _EVENT_NOTICE_REBIND = {
 # MIB uploads — and mailing them is not.
 _BUILTIN_NOTIFY_OFF = ("mib_missing",)
 
+
+def _builtin_rule_defaults() -> dict:
+    """key -> the shipped {notify, threshold, clear_threshold} _seed_rules
+    writes for a brand new row of that key. Derived from _BUILTIN_RULES and
+    _BUILTIN_NOTIFY_OFF rather than duplicated by hand, so this can never
+    drift out of step with what a fresh install actually gets — see
+    AlertsDatabase._dampen_new_builtin_siblings, the one place that compares
+    a live row against it."""
+    return {
+        key: {
+            "notify": 0 if key in _BUILTIN_NOTIFY_OFF else 1,
+            "threshold": threshold,
+            "clear_threshold": clear_threshold,
+        }
+        for (key, _name, _kind, _source_kind, _severity, _template_key,
+             threshold, clear_threshold, _for_polls) in _BUILTIN_RULES
+    }
+
+
+# General statement of "a new built-in sharing a source_kind with an
+# existing one": new rule's key -> the already-shipped rule it reads the
+# same source_kind as. temp_chassis_critical (4.54.0) is the first entry —
+# see AlertsDatabase._dampen_new_builtin_siblings for what this drives. The
+# next such pair (a new rule added beside one that already reads a metric or
+# event an operator may have tuned) is a one-line addition here, not another
+# migration.
+_NEW_SIBLING_OF = {
+    "temp_chassis_critical": "temp_chassis_high",
+}
+
 # Template text as shipped by previous releases, verbatim, for every built-in
 # whose wording has since changed. _seed_templates inserts OR IGNORE, so an
 # existing install keeps its templates for ever — right for one an operator
@@ -912,6 +942,7 @@ class AlertsDatabase(SqliteStore):
             ("seed_auto_resolve_1", self._seed_auto_resolve),
             ("rebind_event_notice_1", self._rebind_event_notice),
             ("retire_temp_high_1", self._retire_temp_high),
+            ("dampen_new_builtin_siblings_1", self._dampen_new_builtin_siblings),
         )
 
     def _run_named_migrations(self) -> None:
@@ -1031,6 +1062,84 @@ class AlertsDatabase(SqliteStore):
                 " name = 'Temperature high (retired -- see"
                 " temp_ambient_high / temp_chassis_high / temp_optic_high)'"
                 " WHERE id = ?", (rule_id,))
+            self._conn.commit()
+
+    def _dampen_new_builtin_siblings(self) -> None:
+        """A NEW built-in rule must not arrive louder than an EXISTING one
+        the operator already tuned, when both read the same source_kind.
+
+        _seed_rules runs before every named migration and is an INSERT OR
+        IGNORE, so on an upgrade it seeds temp_chassis_critical (and any
+        future rule in _NEW_SIBLING_OF) as enabled=1, notify=1 at its shipped
+        numbers before this ever runs — right for a fresh install, where
+        both rules are meant to ship on. It is wrong for an install where
+        the operator already turned the EXISTING sibling off, muted it, or
+        raised its thresholds because their own site runs hot: they would
+        get a brand new Critical alert, emailing them, about a metric they
+        deliberately silenced, from a rule they have never seen and never
+        agreed to.
+
+        For each (new_key, sibling_key) in _NEW_SIBLING_OF: if the sibling
+        is_builtin and still reads exactly as shipped (enabled, notify,
+        threshold, clear_threshold all match _builtin_rule_defaults), there
+        is nothing to inherit — a fresh install, or an operator who left the
+        sibling alone — and the new rule is left exactly as _seed_rules put
+        it, on by design. Otherwise the new rule's enabled/notify are set to
+        match the sibling's, and its own threshold/clear_threshold are
+        shifted by the same absolute amount the sibling's were (0 if the
+        sibling's numbers were not touched), so a rule shipped deliberately
+        ABOVE its sibling (see _BUILTIN_RULES' comment on
+        temp_chassis_critical) stays above it after the same retune.
+
+        Only while the new rule still looks exactly like what _seed_rules
+        just gave it — the same "an operator's edit is not ours to touch"
+        guard _retire_temp_high applies to its own rule. That makes this
+        idempotent by construction: once it has acted (or an operator has
+        edited the new rule by hand, including re-enabling it), the new
+        rule no longer matches its own shipped defaults and every future
+        call, including a second run of this same migration, is a no-op —
+        the same one-time contract every other named migration keeps.
+        """
+        defaults = _builtin_rule_defaults()
+        with self._lock:
+            rows = {row["key"]: row for row in self._conn.execute(
+                "SELECT id, key, enabled, notify, threshold, clear_threshold"
+                " FROM rules WHERE is_builtin = 1").fetchall()}
+            for new_key, sibling_key in _NEW_SIBLING_OF.items():
+                new_row = rows.get(new_key)
+                sibling_row = rows.get(sibling_key)
+                new_default = defaults.get(new_key)
+                sibling_default = defaults.get(sibling_key)
+                if (new_row is None or sibling_row is None
+                        or new_default is None or sibling_default is None):
+                    continue
+                if (new_row["enabled"], new_row["notify"],
+                    new_row["threshold"], new_row["clear_threshold"]) != (
+                        1, new_default["notify"], new_default["threshold"],
+                        new_default["clear_threshold"]):
+                    continue   # already touched -- by an operator, or by us
+                if (sibling_row["enabled"], sibling_row["notify"],
+                    sibling_row["threshold"], sibling_row["clear_threshold"]) == (
+                        1, sibling_default["notify"], sibling_default["threshold"],
+                        sibling_default["clear_threshold"]):
+                    continue   # sibling untouched -- fresh install, or left alone
+                threshold_shift = 0.0
+                clear_shift = 0.0
+                if (sibling_row["threshold"] is not None
+                        and sibling_default["threshold"] is not None):
+                    threshold_shift = sibling_row["threshold"] - sibling_default["threshold"]
+                if (sibling_row["clear_threshold"] is not None
+                        and sibling_default["clear_threshold"] is not None):
+                    clear_shift = sibling_row["clear_threshold"] - sibling_default["clear_threshold"]
+                new_threshold = (new_default["threshold"] + threshold_shift
+                                if new_default["threshold"] is not None else None)
+                new_clear = (new_default["clear_threshold"] + clear_shift
+                            if new_default["clear_threshold"] is not None else None)
+                self._conn.execute(
+                    "UPDATE rules SET enabled = ?, notify = ?, threshold = ?,"
+                    " clear_threshold = ? WHERE id = ?",
+                    (sibling_row["enabled"], sibling_row["notify"],
+                     new_threshold, new_clear, new_row["id"]))
             self._conn.commit()
 
     def _rekey_trap_syslog_alerts(self) -> None:

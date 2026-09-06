@@ -436,6 +436,15 @@
     if (busy) parts.push(`${busy} already queued`);
     if (off) parts.push(`${off} not enabled`);
     settle(parts.length ? parts.join(', ') : 'Nothing to back up');
+    // "N not enabled" says what happened but not what to do about it. The
+    // per-device Back up now button used to carry that sentence in its own
+    // disabled title; with that button gone this is the only place left to
+    // say it, and a count on a button that settles back in four seconds is
+    // not somewhere an operator can read an instruction.
+    if (off) {
+      App.toast(`${off} of the selected device(s) have backups switched off — `
+        + 'turn them on in Device settings.', 'warn');
+    }
     await App.refreshNow('configrx');
   }
 
@@ -499,23 +508,6 @@
     const device = view.devices.find((d) => d.id === view.selectedDeviceId);
     App.el('cx-backup-header').textContent = device
       ? `BACKUPS \u2014 ${device.name}` : 'BACKUPS';
-    const backupNowBtn = App.el('cx-backup-now');
-    backupNowBtn.hidden = !device;
-    // Visible-but-disabled rather than hidden when backups are off, so an
-    // operator who came here to back up a device sees why the button will
-    // not do it instead of wondering whether it exists at all. Skipped
-    // while applyWriteGate already owns the button (data-requires-write on
-    // this element is what disabled it) — its own reason takes precedence,
-    // and it is the one thing on the page allowed to re-enable a control it
-    // did not itself disable.
-    if (device && !backupNowBtn.dataset.writeDenied) {
-      const offReason = !device.backup_enabled
-        ? 'Backups are switched off for this device — turn them on in Device settings.'
-        : '';
-      backupNowBtn.disabled = !!offReason;
-      if (offReason) backupNowBtn.title = offReason;
-      else backupNowBtn.removeAttribute('title');
-    }
     App.el('cx-device-settings').hidden = !device;
     // "Diff with previous" only makes sense once a backup is selected AND
     // an older one exists to diff it against — the oldest stored backup
@@ -1660,40 +1652,13 @@
     App.el('cx-bulk-backup').onclick = bulkBackupNow;
     App.el('cx-settings').onclick = settingsDialog;
     App.el('cx-device-settings').onclick = deviceSettingsModal;
-    /* Backing up with the worker stopped used to report success and do
-       nothing — the queue it went into was never being drained. The server
-       now refuses it, so say why rather than swallowing the rejection. */
-    App.el('cx-backup-now').onclick = () => {
-      const deviceId = view.selectedDeviceId;
-      if (!deviceId) return;
-      App.watchJob(App.el('cx-backup-now'), {
-        post: `/api/configrx/devices/${deviceId}/backup`,
-        poll: `/api/configrx/devices/${deviceId}`,
-        tsKey: 'last_backup_ts',
-        before: (view.devices.find((d) => d.id === deviceId) || {}).last_backup_ts || 0,
-        busyKey: 'backing_up',
-        alive: () => view.selectedDeviceId === deviceId && App.state.tab === 'configrx',
-        deadlineMs: 180000,
-        labels: { resting: 'Back up now', queueing: 'Queueing…', queued: 'Queued…',
-          busy: 'Backing up…', already: 'Already queued…' },
-        done: async (device, settle) => {
-          const failed = device.last_backup_status === 'error';
-          settle(failed ? 'Failed' : (device.last_backup_status || 'Done'));
-          // The button label flicking to "Failed" said THAT it failed and
-          // nothing else — the reason lived only in the Last backup
-          // column's title, which nobody is hovering right after a click.
-          if (failed) {
-            App.toast(`Backup of ${device.name || device.ip || 'this device'} `
-              + `failed: ${device.last_backup_error || 'unknown error'}`, 'fail');
-          }
-          await selectDevice(deviceId);
-          App.refreshNow('configrx');
-        },
-        onError: (error) => App.modal('Cannot back up now',
-          `<p>${escape(error.message)}</p>`,
-          [{ label: 'Close', primary: true, onClick: App.closeModal }]),
-      });
-    };
+    // No per-device "Back up now" here any more: the backups pane's own
+    // button duplicated what the device list's "Back up selected" already
+    // does from the tick box, on a device the operator has necessarily
+    // already selected to be looking at this pane at all. One route to a
+    // backup, not two that had to be kept in step. bulkBackupNow
+    // (cx-bulk-backup) is that route, and it takes one selected device as
+    // readily as twenty.
     App.wireToggle('cx-toggle', 'configrx', '/api/configrx/worker',
       () => App.refreshNow('configrx'));
 

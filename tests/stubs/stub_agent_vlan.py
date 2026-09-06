@@ -50,6 +50,25 @@ Modes:
                      VLAN-related MIB whatsoever still speaks plain
                      bridging, so read_device_vlans must still return None
                      rather than mistake this answer for VLAN evidence.
+  cisco_default_trunk  The fleet-representative case: one Cisco switch
+                     with a handful of real VLANs (1 "default", 10 "data",
+                     20 "voice", 1030 "video" -- above 1023, so only the
+                     2k column carries it) plus the legacy 1002-1005
+                     FDDI/token-ring VLANs every IOS switch names whether
+                     configured or not, TWO trunks (ifIndex 1 and 3) left
+                     at IOS's default `switchport trunk allowed vlan all`
+                     -- all four vlanTrunkPortVlansEnabled* bitmaps FULLY
+                     SET, not a hand-picked few bits -- and one access port
+                     (ifIndex 2, VTP status notTrunking, dot1q VLAN 20
+                     untagged/native). Exercises the phantom-VLAN fix:
+                     before it, each trunk's ~4094-bit allow-list becomes
+                     membership directly, so _MAX_VLANS caps the write at
+                     512 low-numbered phantoms and VLAN 1030 -- the one
+                     VLAN here that actually matters -- is dropped
+                     entirely; after it, only the VLANs this device names
+                     cross either trunk, 1030 survives, 1002-1005 appear
+                     nowhere, and the access port keeps its own single
+                     VLAN untouched by either trunk's allow-list.
 
 Two control datagrams, on the same socket as SNMP itself (see
 stub_agent_l2.py, which established this convention):
@@ -122,10 +141,13 @@ DOT1Q_NO_BASEPORT = {**DOT1Q_NAMES, **DOT1Q_EGRESS, **DOT1Q_UNTAGGED, **DOT1Q_PV
 
 # ----------------------------------------------------------- CISCO-VTP-MIB
 VTP_NAMES = {
-    # vtpVlanName.<vlan>: 1030 is an extended-range VLAN (above 1023), so
-    # only the vlanTrunkPortVlansEnabled2k column (base 1024) can carry it.
-    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.10": ("str", "data"),
-    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1030": ("str", "voice-ext"),
+    # vtpVlanName.<managementDomainIndex>.<vtpVlanIndex>: vtpVlanEntry is
+    # indexed by BOTH, not the VLAN id alone -- a real agent's suffix looks
+    # like "1.10" (domain 1, VLAN 10), never bare "10". 1030 is an
+    # extended-range VLAN (above 1023), so only the
+    # vlanTrunkPortVlansEnabled2k column (base 1024) can carry it.
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1.10": ("str", "data"),
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1.1030": ("str", "voice-ext"),
 }
 VTP_TRUNK_STATUS = {
     # vlanTrunkPortDynamicStatus.<ifIndex>: 1 = trunking
@@ -166,8 +188,9 @@ BOTH_DOT1Q_UNTAGGED = {
 }
 BOTH_DOT1Q_PVID = {"1.3.6.1.2.1.17.7.1.4.5.1.1.5": ("int", 10)}
 BOTH_VTP_NAMES = {
-    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.10": ("str", "data"),
-    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.20": ("str", "voice"),
+    # domain.vlan suffixes -- see VTP_NAMES above.
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1.10": ("str", "data"),
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1.20": ("str", "voice"),
 }
 BOTH_TRUNK_STATUS = {"1.3.6.1.4.1.9.9.46.1.6.1.1.14.5": ("int", 1)}
 BOTH_TRUNK_NATIVE = {"1.3.6.1.4.1.9.9.46.1.6.1.1.5.5": ("int", 20)}
@@ -183,11 +206,12 @@ BOTH_TRUNK_ENABLED = {
 # (ifIndex 2) -- the scenario Finding 3 (4.54.0 review) covers: on real IOS,
 # vlanTrunkPortDynamicStatus carries a row for EVERY switchport, and an
 # access port still answers vlanTrunkPortVlansEnabled with its configured
-# allow-list (modelled here as VLAN 1 -- standing in for the real default of
-# "every VLAN") and vlanTrunkPortNativeVlan with IOS's default of 1. Neither
-# is meaningful for a port that is not trunking, so read_device_vlans must
-# ignore both for ifIndex 2 and keep its standards-path answer instead: VLAN
-# 30 untagged/native, from dot1qPvid and the Q-BRIDGE egress/untagged
+# allow-list (a real IOS access port left at defaults answers this with
+# every bit set -- "allow every VLAN" -- exactly like an unconfigured
+# trunk's default) and vlanTrunkPortNativeVlan with IOS's default of 1.
+# Neither is meaningful for a port that is not trunking, so read_device_vlans
+# must ignore both for ifIndex 2 and keep its standards-path answer instead:
+# VLAN 30 untagged/native, from dot1qPvid and the Q-BRIDGE egress/untagged
 # bitmaps, exactly as if this were an ordinary dot1q-only access port.
 CISCO_MIXED_BASEPORT = {
     "1.3.6.1.2.1.17.1.4.1.2.1": ("int", 1),
@@ -203,8 +227,9 @@ CISCO_MIXED_DOT1Q_UNTAGGED = {
 }
 CISCO_MIXED_DOT1Q_PVID = {"1.3.6.1.2.1.17.7.1.4.5.1.1.2": ("int", 30)}
 CISCO_MIXED_VTP_NAMES = {
-    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.10": ("str", "data"),
-    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.20": ("str", "voice"),
+    # domain.vlan suffixes -- see VTP_NAMES above.
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1.10": ("str", "data"),
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1.20": ("str", "voice"),
 }
 CISCO_MIXED_TRUNK_STATUS = {
     "1.3.6.1.4.1.9.9.46.1.6.1.1.14.1": ("int", 1),   # ifIndex 1: trunking
@@ -221,9 +246,76 @@ CISCO_MIXED_TRUNK_ENABLED = {
     # (0x08).
     "1.3.6.1.4.1.9.9.46.1.6.1.1.4.1": ("bytes", bytes([0x00, 0x20, 0x08])),
     # ifIndex 2 (access): IOS still answers the configured allow-list here
-    # too -- modelled as VLAN 1 (byte 0 bit 1 -> 0x40) standing in for the
-    # real "allow every VLAN" default -- must be ignored.
-    "1.3.6.1.4.1.9.9.46.1.6.1.1.4.2": ("bytes", bytes([0x40])),
+    # too -- a real device answers every bit set (the default "allow every
+    # VLAN"), same as an unconfigured trunk's own default -- and it must be
+    # ignored entirely, since this port isn't trunking.
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.4.2": ("bytes", bytes([0xFF] * 128)),
+}
+
+# ---------------------------------- cisco_default_trunk: the fleet case
+#
+# See the module docstring's `cisco_default_trunk` entry. Two trunks
+# (ifIndex 1, 3) at IOS's real default allow-list -- every bit of all four
+# vlanTrunkPortVlansEnabled* columns set, not a hand-picked subset -- plus
+# one access port (ifIndex 2) with its own real VLAN.
+FULL_ALLOWED_VLAN_BITMAP = bytes([0xFF] * 128)
+DEFAULT_TRUNK_BASEPORT = {
+    "1.3.6.1.2.1.17.1.4.1.2.1": ("int", 1),
+    "1.3.6.1.2.1.17.1.4.1.2.2": ("int", 2),
+    "1.3.6.1.2.1.17.1.4.1.2.3": ("int", 3),
+}
+DEFAULT_TRUNK_VTP_NAMES = {
+    # domain.vlan suffixes -- see VTP_NAMES above. 1002-1005 are the
+    # legacy FDDI/token-ring VLANs a real IOS switch names by default,
+    # whether or not anything is configured on them.
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1.1": ("str", "default"),
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1.10": ("str", "data"),
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1.20": ("str", "voice"),
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1.1030": ("str", "video"),
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1.1002": ("str", "fddi-default"),
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1.1003": ("str", "token-ring-default"),
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1.1004": ("str", "fddinet-default"),
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.4.1.1005": ("str", "trnet-default"),
+}
+# ifIndex 2 (access): VLAN 20, untagged/native, from the standards path --
+# the same real VLAN one of the trunks also carries, so the access port's
+# membership is checked to be exactly this and nothing an allow-list added.
+DEFAULT_TRUNK_DOT1Q_EGRESS = {
+    "1.3.6.1.2.1.17.7.1.4.3.1.2.20": ("bytes", bytes([0x40])),  # bridge port 2
+}
+DEFAULT_TRUNK_DOT1Q_UNTAGGED = {
+    "1.3.6.1.2.1.17.7.1.4.3.1.4.20": ("bytes", bytes([0x40])),
+}
+DEFAULT_TRUNK_DOT1Q_PVID = {"1.3.6.1.2.1.17.7.1.4.5.1.1.2": ("int", 20)}
+DEFAULT_TRUNK_STATUS = {
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.14.1": ("int", 1),   # ifIndex 1: trunking
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.14.2": ("int", 2),   # ifIndex 2: notTrunking
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.14.3": ("int", 1),   # ifIndex 3: trunking
+}
+DEFAULT_TRUNK_NATIVE = {
+    # IOS's default native VLAN (1) on all three rows -- including the
+    # access port, which still answers this column and must be ignored.
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.5.1": ("int", 1),
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.5.2": ("int", 1),
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.5.3": ("int", 1),
+}
+DEFAULT_TRUNK_ENABLED = {
+    # `switchport trunk allowed vlan all` -- IOS's default -- answers all
+    # four bitmap columns fully set, on every row this table has (the
+    # access port included; real IOS does not omit it just because the
+    # port isn't trunking).
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.4.1": ("bytes", FULL_ALLOWED_VLAN_BITMAP),
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.17.1": ("bytes", FULL_ALLOWED_VLAN_BITMAP),
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.18.1": ("bytes", FULL_ALLOWED_VLAN_BITMAP),
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.19.1": ("bytes", FULL_ALLOWED_VLAN_BITMAP),
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.4.2": ("bytes", FULL_ALLOWED_VLAN_BITMAP),
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.17.2": ("bytes", FULL_ALLOWED_VLAN_BITMAP),
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.18.2": ("bytes", FULL_ALLOWED_VLAN_BITMAP),
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.19.2": ("bytes", FULL_ALLOWED_VLAN_BITMAP),
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.4.3": ("bytes", FULL_ALLOWED_VLAN_BITMAP),
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.17.3": ("bytes", FULL_ALLOWED_VLAN_BITMAP),
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.18.3": ("bytes", FULL_ALLOWED_VLAN_BITMAP),
+    "1.3.6.1.4.1.9.9.46.1.6.1.1.19.3": ("bytes", FULL_ALLOWED_VLAN_BITMAP),
 }
 
 MODE = "dot1q"
@@ -253,6 +345,12 @@ def table_for():
         return dict(GENERIC_SCALARS)
     if MODE == "baseport_only":
         return {**GENERIC_SCALARS, **BASE_PORT_IFINDEX}
+    if MODE == "cisco_default_trunk":
+        return {**CISCO_SCALARS, **DEFAULT_TRUNK_BASEPORT,
+                **DEFAULT_TRUNK_DOT1Q_EGRESS, **DEFAULT_TRUNK_DOT1Q_UNTAGGED,
+                **DEFAULT_TRUNK_DOT1Q_PVID, **DEFAULT_TRUNK_VTP_NAMES,
+                **DEFAULT_TRUNK_STATUS, **DEFAULT_TRUNK_NATIVE,
+                **DEFAULT_TRUNK_ENABLED}
     return dict(GENERIC_SCALARS)
 
 

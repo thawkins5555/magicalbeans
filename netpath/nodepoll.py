@@ -4670,14 +4670,42 @@ class NodePoller(Worker):
 
         # (c) Cisco path — supersedes (b) per port
         if detected_vendor(device).lower() == "cisco":
+            # vtpVlanEntry is indexed {managementDomainIndex, vtpVlanIndex},
+            # not vtpVlanIndex alone -- a real agent answers a suffix like
+            # "1.10", and int() on that raises. Same fix as _cisco_vlan_fdb's
+            # suffix.split(".")[-1] below, applied to the name column that
+            # copy of the logic doesn't touch.
             for suffix, value in walk(nodeoids.VTP_VLAN_NAME).items():
-                try:
-                    vlan_names[int(suffix)] = str(value or "")
-                except (TypeError, ValueError):
+                vlan_id = suffix.split(".")[-1]
+                if not vlan_id.isdigit():
                     continue
+                vlan = int(vlan_id)
+                # VLAN 1002-1005 are the legacy FDDI/token-ring defaults
+                # every IOS switch names whether or not anything is
+                # actually configured on them (see _cisco_vlan_fdb's
+                # identical exclusion for the FDB walk). Leaving them out
+                # of vlan_names keeps them out of existing_vlans below too,
+                # so a default trunk doesn't grow four boilerplate VLANs on
+                # top of whatever the operator actually configured.
+                if 1002 <= vlan <= 1005:
+                    continue
+                vlan_names[vlan] = str(value or "")
 
             trunk_status = _int_keyed(walk(nodeoids.VTP_TRUNK_DYNAMIC_STATUS))
             trunk_native = _int_keyed(walk(nodeoids.VTP_TRUNK_NATIVE_VLAN))
+
+            # vlanTrunkPortVlansEnabled* is the trunk's configured ALLOW
+            # LIST, not the VLANs actually crossing it -- a trunk left at
+            # IOS's default `switchport trunk allowed vlan all` answers all
+            # four bitmaps fully set (every VLAN 0-4094 "allowed"), which is
+            # not evidence any of those VLANs exist. The invariant this
+            # walk must hold: a VLAN never appears on a link unless the
+            # device itself says that VLAN exists -- vlan_names (vtpVlanName
+            # above, dot1qVlanStaticName from the standards path) plus the
+            # Q-BRIDGE egress/untagged bitmaps' own suffixes are that
+            # evidence, so the allow-list is intersected against them below
+            # rather than materialised as membership directly.
+            existing_vlans = set(vlan_names) | set(egress_ports) | set(untagged_ports)
 
             cisco_vlans_by_port: dict = {}
             for oid, base in (
@@ -4727,12 +4755,15 @@ class NodePoller(Worker):
                 native = trunk_native.get(if_index)
                 if native is not None:
                     port_native[if_index] = native
-                vlans = cisco_vlans_by_port.get(if_index, set())
+                # Allow-list ∩ VLANs that exist -- see existing_vlans above.
+                # A default `allowed vlan all` trunk's ~4094-bit allow-list
+                # collapses down to the handful the device actually has.
+                vlans = cisco_vlans_by_port.get(if_index, set()) & existing_vlans
                 if vlans:
                     for vlan in vlans:
                         memberships[(if_index, vlan)] = not (
                             native is not None and vlan == native)
-                elif native is not None:
+                elif native is not None and native in existing_vlans:
                     memberships[(if_index, native)] = False
 
         if not answered:
@@ -4749,11 +4780,24 @@ class NodePoller(Worker):
                 continue
             memberships.setdefault((if_index, int(vlan_text)), True)
 
-        # Bound the write: keep the lowest _MAX_VLANS ids seen, the same
-        # "cap rather than fail" idiom _cisco_vlan_fdb's _MAX_VLAN_CONTEXTS
-        # slice uses.
+        # Bound the write: the same "cap rather than fail" idiom
+        # _cisco_vlan_fdb's _MAX_VLAN_CONTEXTS slice uses. Now that a Cisco
+        # trunk's allow-list is intersected against VLANs the device says
+        # exist (above) rather than materialised wholesale, a real device's
+        # VLAN count is bounded by what it actually has configured -- a few
+        # hundred at most -- so this should not bind in practice. If it
+        # ever does, keep VLANs with a real port membership (actual
+        # configuration/traffic) ahead of merely-named-but-unused ones, and
+        # break remaining ties by id rather than truncating to the lowest
+        # ids: a deployment's important VLANs are exactly as likely to be
+        # numbered 1000+ as under 512, and silently dropping the
+        # highest-numbered ones is the same bug this fix exists for.
         all_vlan_ids = set(vlan_names) | {vlan for _, vlan in memberships}
-        kept_vlans = set(sorted(all_vlan_ids)[:_MAX_VLANS])
+        vlans_with_membership = {vlan for _, vlan in memberships}
+        kept_vlans = set(sorted(
+            all_vlan_ids,
+            key=lambda vlan: (0 if vlan in vlans_with_membership else 1, vlan),
+        )[:_MAX_VLANS])
 
         vlans_out = [{"vlan": vlan, "name": vlan_names.get(vlan, "")}
                     for vlan in sorted(kept_vlans)]

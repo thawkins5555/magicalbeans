@@ -1688,11 +1688,23 @@ class NodesDatabase(SqliteStore):
         # that choice on every upgrade.
         if config.get("lldp_interval_s") is None:
             config["lldp_interval_s"] = 3600
-        # VLAN membership: same fallback, same reasoning, as lldp_interval_s
-        # immediately above — its own hour-wide cadence, off the poll cycle,
-        # with 0 staying an explicit opt-out on every upgrade.
+        # VLAN membership: an hour like the two above, EXCEPT on a device or
+        # group that has turned the LLDP/CDP walk off. Per-port VLAN data
+        # exists to colour the strands on a MAPPER link, and a link is drawn
+        # from an LLDP or CDP neighbour row — so with that walk off there are
+        # no links to colour, and walking up to thirteen more columns hourly
+        # would buy an operator who already said "do not table-walk this
+        # profile" precisely nothing. Following lldp_interval_s makes the
+        # existing opt-out carry to the new setting instead of every device
+        # in the fleet quietly starting an hourly walk the moment 4.54
+        # starts; an explicit non-zero vlan_interval_s still wins, so a site
+        # that genuinely wants VLAN data without neighbour discovery can say
+        # so. Deliberately keyed on lldp_interval_s and not on
+        # mac_table_interval_s: 0 is the SHIPPED value there, so most
+        # profiles carry it without anyone having decided anything, and
+        # reading intent into it would be a guess.
         if config.get("vlan_interval_s") is None:
-            config["vlan_interval_s"] = 3600
+            config["vlan_interval_s"] = 3600 if config["lldp_interval_s"] else 0
         # PoE and STP ride the poll cycle rather than a walk of their own
         # (see the devices.poe_capable/stp_capable migration comment), so
         # there is no cost to default them on — a device that does not
