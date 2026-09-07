@@ -627,8 +627,13 @@ class WebRelaySession:
         with self._counter_lock:
             to_device, from_device = self.bytes_to_device, self.bytes_from_device
             total = self.connections_total
+        # The counts go in the headline, not only in the log detail: the
+        # device's own event list is where an operator looks to see what this
+        # tunnel did, and how much crossed is the only thing there is to say
+        # about it — the bytes themselves were never read.
         self._audit(
             f"Web tunnel on port {self.port} closed after {spell}"
-            + (f" ({reason})" if reason else ""),
-            f"{total} connection(s), {to_device} bytes to the device and "
-            f"{from_device} back, for {self.app_user} from {self.client_ip}.")
+            + (f" ({reason})" if reason else "")
+            + f"; {total} connection(s), {to_device} bytes to the device and "
+              f"{from_device} back",
+            f"Opened by {self.app_user} from {self.client_ip}.")
