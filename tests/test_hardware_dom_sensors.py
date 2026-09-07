@@ -296,6 +296,85 @@ try:
 finally:
     stub.kill()
 
+# ============ § 5 per-port DOM metrics, interfaces.media and the API (5.1.0)
+
+# The same walk that has always produced temp_optic_c now also writes one
+# metric per reading per port, and marks the ports a sensor mapped to as
+# carrying an optic -- the only signal this app has for the SFP badge,
+# since IF-MIB has no media column.
+stub, port = spawn_stub("stub_agent_ups_env.py", "hardware")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_nodes_db("per_port")
+    did = device_against(db, "hw-4")
+    db.replace_interfaces(did, [{"if_index": 1, "descr": "Gi0/1"},
+                                {"if_index": 2, "descr": "Gi0/2"}])
+    # Port 2 is stale: it was an optic on some earlier walk and no longer
+    # is. This walk has to clear it, or a badge outlives the transceiver.
+    db.update_interface_media(did, [{"if_index": 2, "media": "optic"}])
+    poller = NodePoller(db)
+    device = db.device(did)
+    poller._poll_environment(did, device, db.effective_config(device), set(),
+                             time.time())
+    metrics = {m["key"]: m["last_value"] for m in db.metrics(did)}
+
+    check("the port-mapped transceiver temperature is written per port as "
+          "sfp_temp_c.<ifIndex>",
+          metrics.get("sfp_temp_c.1") == 45.1, sorted(metrics))
+    check("...and still feeds the device-wide temp_optic_c unchanged",
+          metrics.get("temp_optic_c") == 45.1, sorted(metrics))
+    check("the amperes reading reached only through entPhysicalContainedIn "
+          "becomes sfp_bias_ma.1 in milliamps: 35 A -> 35000 mA",
+          metrics.get("sfp_bias_ma.1") == 35000.0, metrics.get("sfp_bias_ma.1"))
+    check("this device answers no voltage or optical-power sensor, so none "
+          "of those keys is invented for it",
+          not [k for k in metrics
+               if k.startswith(("sfp_volt", "sfp_rx_dbm", "sfp_tx_dbm"))],
+          sorted(metrics))
+    check("the label names the port, so an alert on this key can say which "
+          "one it is",
+          {m["key"]: m["label"] for m in db.metrics(did)}.get("sfp_temp_c.1")
+          == "Gi0/1 optic temperature",
+          {m["key"]: m["label"] for m in db.metrics(did)})
+
+    media = {r["if_index"]: r["media"] for r in db.interfaces(did)}
+    check("the port the sensors mapped to is marked 'optic'",
+          media.get(1) == "optic", media)
+    check("...and the port that mapped nothing this walk is cleared, not "
+          "left showing a badge for an optic that has gone",
+          media.get(2) is None, media)
+
+    ifaces = api.get_nodes_device_interfaces(
+        FakeService(db, poller), {}, {}, did)["interfaces"]
+    by_index = {i["if_index"]: i for i in ifaces}
+    check("the interface route carries media, which is what the SFP badge "
+          "in the interface list reads",
+          by_index[1]["media"] == "optic" and by_index[2]["media"] is None,
+          ifaces)
+    db.close()
+finally:
+    stub.kill()
+
+# --- a walk that answered nothing must never strip the badge --------------
+stub, port = spawn_stub("stub_agent_ups_env.py", "no_ups")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_nodes_db("media_keep")
+    did = device_against(db, "hw-5")
+    db.replace_interfaces(did, [{"if_index": 1, "descr": "Gi0/1"}])
+    db.update_interface_media(did, [{"if_index": 1, "media": "optic"}])
+    poller = NodePoller(db)
+    device = db.device(did)
+    poller._poll_environment(did, device, db.effective_config(device), set(),
+                             time.time())
+    check("a device that answers no sensor table at all keeps the media it "
+          "already had -- a timeout is not evidence the optic was pulled",
+          db.interfaces(did)[0]["media"] == "optic",
+          db.interfaces(did)[0]["media"])
+    db.close()
+finally:
+    stub.kill()
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 raise SystemExit(1 if FAILS else 0)

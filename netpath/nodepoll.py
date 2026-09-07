@@ -107,6 +107,47 @@ _DEVICE_MAX_KEYS = {
 }
 
 
+# Per-port optic (DOM) metric roots: root key -> (label suffix, unit). The
+# full key is "<root>.<ifIndex>" and the label "<ifDescr> <suffix>", the
+# shape the per-interface if_* keys already use, so a rule written against
+# one of these names the port it fired on.
+_SFP_METRICS = {
+    "sfp_rx_dbm": ("Rx power", "dBm"),
+    "sfp_tx_dbm": ("Tx power", "dBm"),
+    "sfp_bias_ma": ("bias current", "mA"),
+    "sfp_volt": ("supply voltage", "V"),
+    "sfp_temp_c": ("optic temperature", "°C"),
+}
+
+# dBm(14) says a sensor reads optical power but not which way the light is
+# going, so the direction comes out of the sensor's own name -- the words
+# every vendor's entPhysicalName/entPhysicalDescr for the two actually uses.
+_OPTIC_RX = re.compile(r"\b(rx|receive[d]?|input)\b", re.I)
+_OPTIC_TX = re.compile(r"\b(tx|transmit(ted)?|output|laser)\b", re.I)
+
+
+def _optical_direction(label: str, descr: str) -> str | None:
+    """'rx', 'tx', or None for an optical-power reading whose name says
+    neither. entPhysicalName is asked first because it is the column a
+    Cisco agent puts "Te1/1/1 Receive Power" in; entPhysicalDescr is the
+    fallback for agents that leave the name empty. Rx wins a name that
+    somehow claims both, since a receive-power alarm is the one that
+    catches a dying link. None is not written as a metric at all -- a
+    reading this app cannot name is still shown in the port dialog, which
+    reads the device live and needs no key."""
+    for text in (label, descr):
+        text = str(text or "")
+        if not text:
+            continue
+        rx = bool(_OPTIC_RX.search(text))
+        tx = bool(_OPTIC_TX.search(text))
+        if rx:
+            return "rx"
+        if tx:
+            return "tx"
+    return None
+
+
 def report_reason(response) -> tuple[str, str]:
     """(usmStats name, plain explanation) for a Report-PDU, or ("", "")
     when it names nothing this table knows."""
@@ -3428,13 +3469,23 @@ class NodePoller(Worker):
                           13: "state", 14: "optical power"}
 
     # entPhySensorType values this app turns into a device-level metric —
-    # see _poll_environment. The rest of _SENSOR_TYPE_UNITS' arcs (voltage,
-    # current, power, frequency, fan speed, airflow) are real DOM readings
-    # on a transceiver, which read_dom already surfaces, but none of them
-    # is something a *device* has one true value for the way temperature
-    # and humidity are, so none of them is promoted to a metric here.
+    # see _poll_environment. The rest of _SENSOR_TYPE_UNITS' arcs (power,
+    # frequency, fan speed, airflow) are real DOM readings on a
+    # transceiver, which read_dom already surfaces, but none of them is
+    # something a *device* has one true value for the way temperature and
+    # humidity are, so none of them is promoted to a device metric here.
     _SENSOR_TYPE_TEMPERATURE = 8
     _SENSOR_TYPE_HUMIDITY = 9
+
+    # entPhySensorType -> the per-port optic metric root it becomes when the
+    # reading maps to an interface. Optical power (14) is absent because its
+    # key depends on the direction the sensor's name gives, not on the type.
+    _SFP_TYPE_ROOTS = {8: "sfp_temp_c", 3: "sfp_volt", 4: "sfp_volt",
+                       5: "sfp_bias_ma"}
+    _SENSOR_TYPE_OPTICAL = 14
+    # ENTITY-SENSOR-MIB reports current in amperes; a transceiver's bias is
+    # quoted in milliamps everywhere an operator would read it.
+    _BIAS_A_TO_MA = 1000.0
 
     def _decode_entity_sensor(self, suffix: str, raw, types: dict, scales: dict,
                               precisions: dict, statuses: dict, units: dict,
@@ -3910,8 +3961,9 @@ class NodePoller(Worker):
 
     def _poll_environment(self, device_id: int, device, config: dict,
                           already: set, now: float) -> None:
-        """Device-level temperature/humidity from ENTITY-SENSOR-MIB (RFC
-        3433) — an environmental monitor, or any device exposing its own
+        """Device-level temperature/humidity and per-port optic (DOM)
+        readings from ENTITY-SENSOR-MIB (RFC 3433) — an environmental
+        monitor, a switch's transceivers, or any device exposing its own
         chassis sensors through the standard MIB.
 
         A sensor is read whether or not it maps to a port; the mapping only
@@ -3929,6 +3981,17 @@ class NodePoller(Worker):
           environmental monitor must not have its own warmth read as a room
           getting hot. Same key jnxOperatingTable uses, so a device
           answering both never reports two disagreeing temperatures.
+
+        A port-mapped reading additionally becomes a per-port metric —
+        `sfp_rx_dbm.<ifIndex>` and its four siblings (_SFP_METRICS) — so an
+        alert rule can fire on the port that is actually failing rather
+        than on a device-wide worst-of. There is deliberately no
+        device-level `sfp_*` key: a chassis has no one true Rx power, and
+        the device-wide `temp_optic_c` above already covers the only optic
+        reading a device does have a defensible single value for. The same
+        mapping writes interfaces.media, which is the only signal this app
+        has that a port carries an optic at all; it is rewritten only when
+        the walk answered, so a timeout never strips the badge.
 
         Best-effort, gated twice: nothing runs inside the cadence window
         (_SENSOR_REFRESH_S normally, _SENSOR_REPROBE_S — a cheap hourly
@@ -3969,12 +4032,13 @@ class NodePoller(Worker):
         statuses = cols["statuses"]
         units = cols["units"]
         descrs = self._walk_column(device, config, self._ENT_PHYSICAL_DESCR)
+        interfaces = list(self.db.interfaces(device_id))
         # The name fallback exists for Cisco gear with no alias rows; nothing
         # else should pay a whole entPhysicalName walk every cadence for it.
         names = if_by_name = None
         if self._cisco_sensor_table_plausible(device):
             names = self._walk_column(device, config, self._ENT_PHYSICAL_NAME)
-            if_by_name = self._if_index_by_name(self.db.interfaces(device_id))
+            if_by_name = self._if_index_by_name(interfaces)
         port_map, _alias_rows = self._entity_port_map(
             device, config, names, if_by_name)
 
@@ -3985,10 +4049,27 @@ class NodePoller(Worker):
         ambient_temps: list[float] = []
         chassis_temps: list[float] = []
         humidities: list[float] = []
+        # (ifIndex, metric root) -> every reading this walk saw for it. A
+        # multi-lane optic reports one row per lane, so a port can have
+        # several of the same root.
+        per_port: dict[tuple[int, str], list[float]] = {}
+        optic_ports: set[int] = set()
         for suffix, raw in sensor_values.items():
             sensor_type = int(types.get(suffix) or 0)
+            try:
+                entity = int(suffix)
+            except ValueError:
+                continue
+            if_index = port_map.get(entity)
+            if if_index is not None:
+                # Any sensor resolving to a port is proof of a transceiver
+                # there, whatever it reads and whatever its status: a
+                # failed optic is still an optic.
+                optic_ports.add(if_index)
+            root = self._SFP_TYPE_ROOTS.get(sensor_type)
             if sensor_type not in (self._SENSOR_TYPE_TEMPERATURE,
-                                   self._SENSOR_TYPE_HUMIDITY):
+                                   self._SENSOR_TYPE_HUMIDITY,
+                                   self._SENSOR_TYPE_OPTICAL) and root is None:
                 continue
             reading = self._decode_entity_sensor(
                 suffix, raw, types, scales, precisions, statuses, units, descrs)
@@ -3998,19 +4079,29 @@ class NodePoller(Worker):
             # nothing if it can silently be sourced from a dead probe.
             if reading is None or reading["status"] != "ok":
                 continue
+            value = reading["value"]
             if sensor_type == self._SENSOR_TYPE_HUMIDITY:
-                humidities.append(reading["value"])
+                humidities.append(value)
                 continue
-            try:
-                entity = int(suffix)
-            except ValueError:
+            if sensor_type == self._SENSOR_TYPE_TEMPERATURE:
+                if if_index is not None:
+                    optic_temps.append(value)
+                elif has_humidity:
+                    ambient_temps.append(value)
+                else:
+                    chassis_temps.append(value)
+            if if_index is None:
                 continue
-            if entity in port_map:
-                optic_temps.append(reading["value"])
-            elif has_humidity:
-                ambient_temps.append(reading["value"])
-            else:
-                chassis_temps.append(reading["value"])
+            if sensor_type == self._SENSOR_TYPE_OPTICAL:
+                direction = _optical_direction(
+                    str(names.get(suffix) or "") if names else "",
+                    str(descrs.get(suffix) or ""))
+                if direction is None:
+                    continue
+                root = f"sfp_{direction}_dbm"
+            elif root == "sfp_bias_ma":
+                value *= self._BIAS_A_TO_MA
+            per_port.setdefault((if_index, root), []).append(value)
 
         # Worst (hottest/most humid) sensor of each kind wins — "the hot
         # spot is what matters", the same reasoning VENDOR_HEALTH's
@@ -4034,8 +4125,29 @@ class NodePoller(Worker):
         if humidities:
             samples.append(("humidity_pct", "Humidity", "%RH", "gauge", now,
                             max(humidities)))
+        # Light levels take the LOWEST lane and everything else the highest:
+        # on a multi-lane optic the failing lane is the dim one, while the
+        # worst temperature, voltage or bias is the extreme one, which is
+        # the same "hot spot wins" rule the device keys above use.
+        if_descrs = {row["if_index"]: row["descr"] for row in interfaces}
+        for (if_index, root), values in sorted(per_port.items()):
+            reading_name, unit = _SFP_METRICS[root]
+            worst = min(values) if root.endswith("_dbm") else max(values)
+            port = if_descrs.get(if_index) or f"if{if_index}"
+            samples.append((f"{root}.{if_index}", f"{port} {reading_name}",
+                            unit, "gauge", now, worst))
         if samples:
             self.db.record_metric_samples(device_id, samples)
+        # Only reached on a walk that answered, so a timeout leaves the
+        # badge alone; a port that has genuinely lost its optic is cleared
+        # on the next walk that does answer.
+        media_rows = [{"if_index": if_index, "media": "optic"}
+                      for if_index in sorted(optic_ports)]
+        media_rows += [{"if_index": row["if_index"], "media": None}
+                       for row in interfaces
+                       if row["if_index"] not in optic_ports
+                       and ("media" in row.keys() and row["media"] == "optic")]
+        self.db.update_interface_media(device_id, media_rows)
 
     # BRIDGE-MIB (RFC 4188) columns used by read_mac_table() to map the
     # forwarding-database entries learned on a switch port back to the

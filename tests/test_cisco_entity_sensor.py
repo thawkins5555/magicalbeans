@@ -267,6 +267,44 @@ try:
           "temp_chassis_c" in metrics
           and metrics["temp_chassis_c"]["last_value"] == 41.0
           and "temp_ambient_c" not in metrics, sorted(metrics))
+
+    # --- the per-port DOM keys (5.1.0) ------------------------------------
+    # One key per reading per port, so a rule can fire on the port that is
+    # actually failing. The two dBm rows are told apart by their sensor
+    # names alone -- dBm(14) says "optical power", never which direction.
+    def value(key):
+        row = metrics.get(key)
+        return row["last_value"] if row else None
+
+    check("Transmit Power becomes sfp_tx_dbm on this port, from the "
+          "sensor's own name",
+          value("sfp_tx_dbm.1") == -2.4, sorted(metrics))
+    check("Receive Power becomes sfp_rx_dbm on the same port",
+          value("sfp_rx_dbm.1") == -5.5, sorted(metrics))
+    check("bias current is converted out of ENTITY-SENSOR-MIB's amperes "
+          "into the milliamps an optic is quoted in: 0.0062 A -> 6.2 mA",
+          value("sfp_bias_ma.1") == 6.2, value("sfp_bias_ma.1"))
+    check("voltsDC becomes sfp_volt in volts, unconverted",
+          value("sfp_volt.1") == 3.299, value("sfp_volt.1"))
+    check("the port-mapped temperature is BOTH the per-port sfp_temp_c "
+          "and the device-wide temp_optic_c it has always been",
+          value("sfp_temp_c.1") == 33.0
+          and metrics["temp_optic_c"]["last_value"] == 33.0, sorted(metrics))
+    check("every sfp_* key names port 1 -- the chassis inlet probe maps to "
+          "no port, so it produces none of them, and there is no "
+          "device-level sfp_* key either",
+          [k for k in metrics if k.startswith("sfp_")
+           and not k.endswith(".1")] == [], sorted(metrics))
+    check("each key carries the port's ifDescr and the unit an operator "
+          "reads it in",
+          metrics["sfp_rx_dbm.1"]["label"] == f"{PORT_DESCR} Rx power"
+          and metrics["sfp_rx_dbm.1"]["unit"] == "dBm"
+          and metrics["sfp_bias_ma.1"]["unit"] == "mA",
+          (metrics["sfp_rx_dbm.1"]["label"], metrics["sfp_bias_ma.1"]["unit"]))
+    check("the port the sensors mapped to is marked as carrying an optic, "
+          "which is what the SFP badge in the interface list reads",
+          db.interfaces(did)[0]["media"] == "optic",
+          db.interfaces(did)[0]["media"])
     db.close()
 finally:
     stub.kill()

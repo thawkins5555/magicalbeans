@@ -4200,7 +4200,7 @@ def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
     _require(service.nodes_db.device(device_id), "device")
     rows = service.nodes_db.interfaces(device_id)
     keys = rows[0].keys() if rows else ()
-    # poe_admin/poe_detect_status/poe_power_mw/stp_state are read
+    # poe_admin/poe_detect_status/poe_power_mw/stp_state/media are read
     # defensively like every other column a migration added: a row fetched
     # before the ALTER TABLE has run on this database will not have them.
     return {"interfaces": [
@@ -4215,7 +4215,8 @@ def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
          "poe_admin": (r["poe_admin"] if "poe_admin" in keys else None),
          "poe_detect_status": (r["poe_detect_status"] if "poe_detect_status" in keys else None),
          "poe_power_mw": (r["poe_power_mw"] if "poe_power_mw" in keys else None),
-         "stp_state": (r["stp_state"] if "stp_state" in keys else None)}
+         "stp_state": (r["stp_state"] if "stp_state" in keys else None),
+         "media": (r["media"] if "media" in keys else None)}
         for r in rows]}
 
 
@@ -4228,7 +4229,8 @@ def get_nodes_device_interfaces_export(service, params, body, device_id) -> dict
     header = ["if_index", "descr", "alias", "phys_addr", "speed_bps",
              "admin_status", "oper_status", "in_bps", "out_bps",
              "in_error_rate", "out_error_rate", "last_in_errors", "last_out_errors",
-             "last_seen_ts", "poe_admin", "poe_detect_status", "poe_power_mw", "stp_state"]
+             "last_seen_ts", "poe_admin", "poe_detect_status", "poe_power_mw",
+             "stp_state", "media"]
     csv_rows = [[i.get(key) for key in header] for i in interfaces]
     return _csv_response("interfaces", header, csv_rows)
 

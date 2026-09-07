@@ -931,9 +931,14 @@ class NodesDatabase(SqliteStore):
         })
         # Per-port PoE and STP state, the same kind of fact as oper_status
         # and refreshed by the same poll cycle rather than a table of its own.
+        # media: 'optic' once a port-mapped ENTITY-SENSOR row proves this
+        # port carries a transceiver, NULL otherwise. Written by
+        # _poll_environment, the only pass that already knows the
+        # entity->ifIndex mapping; IF-MIB has no media column of its own.
         self.ensure_columns("interfaces", {
             "poe_admin": "TEXT", "poe_detect_status": "TEXT",
             "stp_state": "TEXT", "poe_power_mw": "INTEGER",
+            "media": "TEXT",
         })
 
         # A sweep's reached addresses (JSON) and, if folded into another
@@ -2800,6 +2805,24 @@ class NodesDatabase(SqliteStore):
                 self._conn.executemany(
                     "UPDATE interfaces SET poe_admin=?, poe_detect_status=?,"
                     " poe_power_mw=? WHERE device_id=? AND if_index=?", params)
+                self._conn.commit()
+            except sqlite3.DatabaseError:
+                self._conn.rollback()
+                raise
+
+    def update_interface_media(self, device_id: int, rows: list[dict]) -> None:
+        """Per-port media kind ('optic' or None), batched the way
+        update_interface_poe batches its own poll. A row for a port this
+        device no longer has updates nothing, same as there."""
+        if not rows:
+            return
+        params = [(row.get("media"), device_id, row["if_index"])
+                  for row in rows]
+        with self._lock:
+            try:
+                self._conn.executemany(
+                    "UPDATE interfaces SET media=?"
+                    " WHERE device_id=? AND if_index=?", params)
                 self._conn.commit()
             except sqlite3.DatabaseError:
                 self._conn.rollback()
