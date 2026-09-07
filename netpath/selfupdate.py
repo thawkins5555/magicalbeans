@@ -573,8 +573,11 @@ def start_job(app_db, before_quiesce=None, on_result=None) -> dict:
             target=_run_job, args=(app_db, before_quiesce, on_result),
             name="sappiwhere-update", daemon=False)
         _job_thread = thread
+        # Snapshot before the thread runs: a job that fails at once (no
+        # network) would otherwise answer "failed" to the press that started it.
+        started = dict(_job)
     thread.start()
-    return status()
+    return started
 
 
 def _run_job(app_db, before_quiesce, on_result) -> None:
