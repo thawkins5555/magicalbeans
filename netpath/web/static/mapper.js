@@ -96,12 +96,10 @@
     selectedVlan: null,      // vlan id highlighted from the VLAN table
     detailShowAllVlans: false,   // the open link's VLAN list, past VLAN_DETAIL_CAP
 
-    // userZoom records that the operator moved the view themselves (wheel,
-    // pan, zoom buttons, arrow keys); needsFit is what draw() reads — a map
-    // is fitted once, when it is opened or when Fit is pressed, never again
-    // under an operator who has since arranged it.
-    zoom: 1, userZoom: false, needsFit: true, pan: { x: 0, y: 0 }, frame: null,
-    panDrag: null, dragMoved: false, spaceHeld: false,
+    // needsFit: a map is fitted once, when opened or when Fit is pressed,
+    // never again under an operator who has since arranged it.
+    zoom: 1, needsFit: true, pan: { x: 0, y: 0 }, frame: null,
+    panDrag: null, spaceHeld: false,
     nodeDrag: null,          // {ids, from:Map(id->{x,y}), dx, dy, moved}
     rubber: null,            // {x0,y0,x1,y1, additive}
 
@@ -352,7 +350,6 @@
     const select = App.el('mp-map');
     if (select.value !== String(id ?? '')) select.value = String(id ?? '');
     if (!opts.keepView) {
-      view.userZoom = false;
       view.needsFit = true;
       view.pan = { x: 0, y: 0 };
       view.selection.clear();
@@ -476,11 +473,8 @@
     view.peersByKey = new Map((payload.peers || []).map((p) => [p.peer_key, p]));
     view.vlans = payload.vlans || [];
     rebuildLookups();
-    // refresh() is guarded against loading mid-drag, so this only catches an
-    // explicit reload (a settings save, a colour change) that landed during
-    // one: the drag holds ids and positions from the payload being replaced,
-    // so it ends here rather than dropping nodes at stale coordinates. The
-    // listeners come off on the release that follows, which still fires.
+    // A reload landing mid-drag (a settings save) ends the drag: the payload
+    // replaces the ids and positions it holds.
     if (view.nodeDrag) view.nodeDrag = null;
     if (payload.settings) view.settings = payload.settings;
     // A selection or a highlighted link that no longer exists on the fresh
@@ -1062,7 +1056,6 @@
       view.zoom = 1; view.pan = { x: 0, y: 0 };
       view.frame = { width, height, cx: 0, cy: 0 };
     }
-    view.userZoom = false;
     view.needsFit = false;
   }
 
@@ -1139,6 +1132,8 @@
     const svg = App.el('mp-svg');
     const canvas = App.el('mp-canvas');
     canvas.dataset.mapStyle = currentMapStyle();
+    // Replacing the <g> a drag captured means its release never arrives.
+    view.nodeDrag = null;
     svg.innerHTML = '';
     view.sceneGroup = null;
     view.rubberEl = null;
@@ -1160,6 +1155,7 @@
     // it was aimed at. Measured after showCanvas, since a canvas coming back
     // from the empty state is display:none until then.
     const box = svg.getBoundingClientRect();
+    const measured = box.width > 0 && box.height > 0;
     const width = Math.max(box.width, 200), height = Math.max(box.height, 200);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
 
@@ -1168,8 +1164,11 @@
     // Fit itself re-fits — a refresh, a resize or a badge change must not
     // throw away where they put things.
     const bounds = contentBounds();
-    if (!view.frame || view.needsFit) fitView(bounds, width, height);
-    else { view.frame.width = width; view.frame.height = height; }
+    if (!view.frame || view.needsFit) {
+      fitView(bounds, width, height);
+      // A fit into the 200x200 fallback is not the fit the operator gets to keep.
+      if (!measured) view.needsFit = true;
+    } else { view.frame.width = width; view.frame.height = height; }
     const group = App.svgNode('g');
     const gridLayer = App.svgNode('g');
     const linkLayer = App.svgNode('g');
@@ -1518,10 +1517,8 @@
     target.setPointerCapture(event.pointerId);
     const from = new Map();
     for (const id of view.selection) { const n = nodeById(id); if (n) from.set(id, { x: n.x, y: n.y }); }
-    // The frame is frozen for the whole gesture: scene units per screen pixel
-    // are read once, at the press. A re-fit, a pane resize or a zoom arriving
-    // between press and release would otherwise scale the tail of the drag
-    // differently from its head and jump the node out from under the pointer.
+    // Scene units per screen pixel, read once at the press: a wheel zoom
+    // mid-drag is the one thing the drag then does not follow.
     const rect = App.el('mp-svg').getBoundingClientRect();
     const perPixelX = (view.frame.width / Math.max(rect.width, 1)) / view.zoom;
     const perPixelY = (view.frame.height / Math.max(rect.height, 1)) / view.zoom;
@@ -1560,15 +1557,11 @@
           }
         }
       } finally {
-        // Whatever the body did, the gesture is over: the listeners come off
-        // and the drag state clears, or the next hover inherits both.
         detach();
         view.nodeDrag = null;
+        requestDraw();
+        drawDetail();
       }
-      // A full redraw once, at the end: the dropped positions are the ones
-      // every link, label and bound is now measured from.
-      requestDraw();
-      drawDetail();
     };
     const cancel = () => { detach(); view.nodeDrag = null; requestDraw(); };
     target.addEventListener('pointermove', move);
@@ -1618,7 +1611,6 @@
       focusCanvas();
       event.currentTarget.setPointerCapture(event.pointerId);
       view.panDrag = { x: event.clientX, y: event.clientY, pan: { ...view.pan } };
-      view.dragMoved = false;
       App.el('mp-svg').classList.add('dragging');
       return;
     }
@@ -1645,7 +1637,6 @@
       const scaleX = view.frame.width / Math.max(rect.width, 1), scaleY = view.frame.height / Math.max(rect.height, 1);
       const dx = (event.clientX - view.panDrag.x) * scaleX, dy = (event.clientY - view.panDrag.y) * scaleY;
       App.hideTooltip();
-      if (Math.abs(dx) + Math.abs(dy) > 3) { view.dragMoved = true; view.userZoom = true; }
       view.pan = { x: view.panDrag.pan.x + dx, y: view.panDrag.pan.y + dy };
       applyTransform();
       return;
@@ -1691,13 +1682,11 @@
     view.pan.x = px - sceneX * to - (f.width / 2 - f.cx * to);
     view.pan.y = py - sceneY * to - (f.height / 2 - f.cy * to);
     view.zoom = to;
-    view.userZoom = true;
     applyTransform();
   }
 
   function zoomBy(factor) {
     view.zoom = Math.min(Math.max(view.zoom * factor, 0.1), 5);
-    view.userZoom = true;
     applyTransform();
   }
 
@@ -1705,7 +1694,7 @@
     if (event.target !== App.el('mp-canvas')) return;   // a node/link handles its own Enter/Space
     const panStep = 40 / view.zoom;
     const pan = (dx, dy) => {
-      view.pan.x += dx; view.pan.y += dy; view.userZoom = true;
+      view.pan.x += dx; view.pan.y += dy;
       event.preventDefault();
       applyTransform();
     };
@@ -1723,7 +1712,7 @@
   // Fit threw away the pan just made, Remove re-opened its confirm dialog.
   // Space belongs to whatever has focus; it pans only when nothing that Space
   // would press does.
-  const SPACE_ACTIVATES = 'button, a[href], summary, [role="button"], [contenteditable]';
+  const SPACE_ACTIVATES = 'button, summary, [role="button"], [contenteditable]';
 
   // Space held down pans on a left-button drag, the same modifier a paint
   // program uses — scoped to when MAPPER is the visible tab and no dialog,
@@ -2132,6 +2121,16 @@
       requestDraw();
     };
 
+    // A release the page never sees (Alt-Tab mid-pan) would otherwise leave
+    // a gesture flag set and refresh skipped for good.
+    window.addEventListener('blur', () => {
+      if (!gestureActive() && !view.spaceHeld) return;
+      view.nodeDrag = null; view.panDrag = null; view.rubber = null; view.spaceHeld = false;
+      const svg = App.el('mp-svg');
+      if (svg) svg.classList.remove('dragging');
+      drawRubber();
+      requestDraw();
+    });
     for (const eventName of ['resize', 'panes-resized']) {
       window.addEventListener(eventName, () => {
         if (App.state.tab === 'mapper' && !gestureActive()) requestDraw();

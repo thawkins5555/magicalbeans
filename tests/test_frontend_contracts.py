@@ -989,7 +989,7 @@ check("const perPixelX" in _NODE_DRAG and "const perPixelY" in _NODE_DRAG,
 #      appearing threw away an arrangement they had just made. A map is
 #      fitted when it is opened and when Fit is pressed, and not otherwise.
 _DRAW = MAPPER[MAPPER.index("  function draw()"):MAPPER.index("  function emptyCanvas(")]
-check("if (!view.frame || view.needsFit) fitView(" in _DRAW,
+check("if (!view.frame || view.needsFit) {" in _DRAW and "fitView(bounds, width, height);" in _DRAW,
       "draw() fits only a scene with no frame yet or one flagged for a fit, not "
       "every draw the operator has not yet zoomed away from")
 check("view.needsFit = false;" in MAPPER[MAPPER.index("  function fitView("):
@@ -1107,6 +1107,36 @@ check("closest(SPACE_ACTIVATES)" in _SPACE,
 check("'INPUT'" in _SPACE and "'TEXTAREA'" in _SPACE and "'SELECT'" in _SPACE,
       "and it still stands aside for a text field, which is the case it already "
       "handled")
+
+
+# ---------------------------------------------------------------------------
+# 36. MAPPER (5.0.1): the follow-up review of the drag fixes.
+_MAPPER2 = read("mapper.js")
+_NODE_DRAG2 = _MAPPER2[_MAPPER2.index("  function onNodePointerDown("):
+                       _MAPPER2.index("  function queuePositionWrite(")]
+_DRAW2 = _MAPPER2[_MAPPER2.index("  function draw() {"):
+                  _MAPPER2.index("  function draw() {") + 400]
+check(_NODE_DRAG2.index("focusCanvas();") < _NODE_DRAG2.index("drawDetail();"),
+      "a node press focuses the canvas BEFORE the pane is rebuilt, or the "
+      "restore in drawDetail would carry one node's typed name into another's")
+check("cdx * perPixelX" in _NODE_DRAG2 and "cdy * perPixelY" in _NODE_DRAG2,
+      "the drag delta is the client delta times the per-pixel scale frozen at "
+      "the press")
+check(_DRAW2.index("view.nodeDrag = null;") < _DRAW2.index("svg.innerHTML = '';"),
+      "draw() ends any drag before it replaces the <g> the drag captured, so "
+      "the release that can never arrive does not strand the gesture")
+check("if (!measured) view.needsFit = true;" in _MAPPER2,
+      "a fit into the 200x200 fallback keeps needsFit set, so the first real "
+      "layout fits again")
+check("window.addEventListener('blur'" in _MAPPER2 and
+      "view.panDrag = null; view.rubber = null; view.spaceHeld = false;" in _MAPPER2,
+      "a window blur ends every gesture flag, or a release the page never "
+      "saw skips refresh for good")
+check("a[href]" not in _MAPPER2[_MAPPER2.index("const SPACE_ACTIVATES"):
+                                _MAPPER2.index("const SPACE_ACTIVATES") + 120],
+      "Space never activates a link, so a focused link must not block the pan")
+check("userZoom" not in _MAPPER2 and "dragMoved" not in _MAPPER2,
+      "the write-only view flags are gone")
 
 
 print()
