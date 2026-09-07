@@ -5292,6 +5292,11 @@
           chart goes. Raw samples are also capped at
           ${(s.sample_row_cap_per_metric || 5000).toLocaleString()} per metric,
           which at the default interval is roughly a week.</p>
+        <p class="hint">Both settings are ceilings, not guarantees: the metric
+          history file also has a size cap on Settings → Data &amp; Retention,
+          and when it is over that cap the oldest raw samples go first and then
+          the oldest hourly rollups. Settings shows how far back the file still
+          reaches.</p>
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
