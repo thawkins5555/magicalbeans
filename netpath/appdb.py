@@ -206,6 +206,13 @@ GLOBAL_DEFAULTS = {
     "web_port": 8443,
     "web_cert": "",
     "web_key": "",
+    # The ports the WEB button's device relays may bind, "low-high" (or "0"
+    # for any free port). A named range rather than the ephemeral default
+    # because a firewall rule has to name something: on Windows the first
+    # bind of an unopened port prompts, and one thousand-port rule is better
+    # than a prompt a week. Administrator-only alongside the web_* keys
+    # above — it decides which ports this host will listen on.
+    "web_relay_port_range": "40000-40999",
     # Idle timeout: no activity for this long signs the session out. Short by
     # default, because this is graded on presence, not on the tab being open
     # — see SessionStore.touch() in auth.py. Absolute: signed out this long

@@ -1290,6 +1290,19 @@
     </fieldset>
 
     <fieldset data-requires-write="admin">
+      <legend>DEVICE WEB TUNNELS</legend>
+      <label>Relay port range <input id="set-web-relay-range" placeholder="40000-40999" size="16"></label>
+      <p class="hint">The WEB button on a Nodes device opens a short-lived tunnel from this
+        machine to that device's own web interface, on a port from this range. Write it as
+        <code>low-high</code>, or <code>0</code> to let the operating system pick any free port.
+        The range needs an inbound TCP rule in this host's firewall for browsers on other
+        machines to reach it — on Windows the first bind of an unopened port raises the usual
+        allow/deny prompt, which is why a named range beats an ephemeral one. A tunnel admits
+        only the address the operator's browser connected from, closes after 15 minutes with no
+        traffic, and needs the account's <b>web</b> permission.</p>
+    </fieldset>
+
+    <fieldset data-requires-write="admin">
       <legend>DIRECTORY (LDAP)</legend>
       <p class="hint">Lets accounts created below with "Sign in via LDAP directory" verify their
         password against a directory server instead of a locally stored one. Local accounts are

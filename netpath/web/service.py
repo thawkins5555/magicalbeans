@@ -37,6 +37,7 @@ from ..snmptrapdb import SnmpTrapDatabase
 from ..sshterm import SshSessionRegistry
 from ..syslogd import SyslogCollector
 from ..syslogdb import SyslogDatabase
+from ..webrelay import WebRelayRegistry
 from ..wirelessdb import WirelessDatabase
 
 MAINTENANCE_INTERVAL_S = 900
@@ -250,6 +251,11 @@ class Service:
         # configrx_db (it is where the device's SSH credential and host key
         # live). Holds no thread of its own until a session opens.
         self.ssh_sessions = SshSessionRegistry(self)
+        # The WEB button's TCP relays, for the same reasons in the same order:
+        # after sessions (a tunnel belongs to a signed-in user) and after
+        # nodes_db (the target comes from the device row). Binds nothing and
+        # holds no thread until a relay is opened.
+        self.web_relays = WebRelayRegistry(self)
         self._ensure_default_user()
 
         self._stop = threading.Event()
@@ -488,6 +494,10 @@ class Service:
             # person is watching, and each one writes a closing device event,
             # so they must end while the databases are still open.
             self.ssh_sessions.shutdown()
+            # And the relays, for the same reason and with the same budget:
+            # each writes a closing device event with its byte counts, so it
+            # has to end while the databases are still open.
+            self.web_relays.shutdown()
             self.monitor.shutdown()   # waits briefly for running traces to land
             self.hop_prober.shutdown()
             self.resolver.shutdown()

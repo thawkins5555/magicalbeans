@@ -39,7 +39,7 @@ from .. import nodeoids
 from .. import configrx
 from .. import configrx_compliance
 from .. import configrx_redact
-from .. import sshterm
+from .. import sshterm, webrelay
 from .. import enterprises, mibcatalog, vendorid
 from .. import mapper
 from .. import nodediscover
@@ -341,6 +341,7 @@ _STATE_MODULE_KEYS = {
 # subprocesses are pointed at, and the directory's address, bind DN template
 # (which names the plant's LDAP tree structure) and cleartext opt-out.
 SETTINGS_ONLY_KEYS = ("web_host", "web_port", "web_cert", "web_key",
+                      "web_relay_port_range",
                       "session_idle_minutes", "session_max_hours",
                       "dns_server", "asn_server",
                       "ldap_url", "ldap_bind_dn_template",
@@ -1433,7 +1434,10 @@ ADMIN_ONLY_SETTINGS = ("updates_enabled", "ldap_enabled", "ldap_url",
                       "ldap_bind_dn_template", "ldap_allow_cleartext",
                       "ldap_timeout_s",
                       "session_idle_minutes", "session_max_hours",
-                      "web_host", "web_port", "web_cert", "web_key")
+                      "web_host", "web_port", "web_cert", "web_key",
+                      # Which ports this host may open for a device relay is
+                      # the same kind of decision as where the listener binds.
+                      "web_relay_port_range")
 
 
 def _is_admin(service, params) -> bool:
@@ -1641,6 +1645,11 @@ def post_settings(service, params, body) -> dict:
     # int() until the database was edited by hand.
     values = coerce_settings(_scope_defaults(scope), values, strict=True)
     _check_settings_ranges(values)
+    if "web_relay_port_range" in values:
+        # Typed here rather than at the next relay: a range nobody can parse
+        # would otherwise be stored happily and only surface as a failed WEB
+        # click, on some other day, to somebody else.
+        webrelay.parse_port_range(values["web_relay_port_range"])
     if scope == "mapper":
         _check_mapper_settings(service, values)
     if scope == "configrx":
@@ -2673,22 +2682,12 @@ def _device_json(row, reveal: bool = False) -> dict:
     }
 
 
-# The scheme a device's web interface is reached over. NULL means http, the
-# same answer the old WEB button gave when it built "http://<ip>/" and asked
-# nobody.
-WEB_SCHEMES = ("http", "https")
-_WEB_DEFAULT_PORTS = {"http": 80, "https": 443}
-
-
 def _web_port_effective(row) -> int:
-    """The port the relay dials for this device: the stored one, else the
-    default for its scheme."""
-    keys = row.keys()
-    port = row["web_port"] if "web_port" in keys else None
-    if port:
-        return int(port)
-    scheme = (row["web_scheme"] if "web_scheme" in keys else None) or "http"
-    return _WEB_DEFAULT_PORTS.get(scheme, 80)
+    """The port the relay dials for this device. Resolved by webrelay, the
+    module that actually dials it, so the form's placeholder and the relay's
+    destination cannot disagree — NULL means http on 80, which is the answer
+    the old WEB button gave when it built "http://<ip>/" and asked nobody."""
+    return webrelay.device_web_target(row)[2]
 
 
 def _clean_web_fields(fields: dict) -> None:
@@ -2700,7 +2699,7 @@ def _clean_web_fields(fields: dict) -> None:
     """
     if "web_scheme" in fields:
         scheme = str(fields["web_scheme"] or "").strip().lower()
-        if scheme and scheme not in WEB_SCHEMES:
+        if scheme and scheme not in webrelay.WEB_SCHEMES:
             raise ValueError("The web scheme must be http or https.")
         fields["web_scheme"] = scheme or None
     if "web_port" in fields:

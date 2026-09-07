@@ -36,6 +36,7 @@
     ['max_alerts_db_mb', 'set-alerts-cap', 'num'],
     ['session_idle_minutes', 'set-idle-minutes', 'num'],
     ['session_max_hours', 'set-session-hours', 'num'],
+    ['web_relay_port_range', 'set-web-relay-range', 'str'],
   ];
   const APPLY_FIELD_IDS = new Set(APPLY_FIELDS.map(([, id]) => id));
 
@@ -82,6 +83,10 @@
     App.el('set-alerts-cap').value = s.max_alerts_db_mb;
     App.el('set-idle-minutes').value = s.session_idle_minutes;
     App.el('set-session-hours').value = s.session_max_hours;
+    // Administrator-only like the LDAP fields below, so it is absent from `s`
+    // for an account without Settings read — hence the `|| ''` rather than a
+    // bare assignment that would paint "undefined" into the box.
+    App.el('set-web-relay-range').value = s.web_relay_port_range || '';
 
     // The four text/number fields below are ADMIN_ONLY_SETTINGS and so are
     // absent from `s` entirely for anyone without Settings read (see
