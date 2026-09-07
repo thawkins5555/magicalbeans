@@ -674,6 +674,41 @@ stored:
   was renamed from `temp_c` to this same key, so a device answering both
   never reports two disagreeing chassis figures.
 
+**5.1.0 kept the port-mapped readings instead of discarding them.** The walk
+already resolved every sensor to its `ifIndex` and then used that only to
+pick a temperature key; everything else a transceiver reports was thrown
+away every 300 s. It now also writes one metric per reading per port, keyed
+`<root>.<ifIndex>` and labelled `"<ifDescr> Rx power"` — the same shape the
+`if_*` interface keys use, so `alertengine`'s per-port evaluation names the
+port in the alert. `_SFP_METRICS` holds the five roots and their units:
+`sfp_rx_dbm`, `sfp_tx_dbm` (dBm), `sfp_bias_ma` (mA — `entPhySensorType` 5
+reports amperes, converted here because no operator reads a bias current in
+amps), `sfp_volt` (V, from types 3 and 4) and `sfp_temp_c` (°C, from type 8,
+which still feeds `temp_optic_c` as well). `dBm(14)` says a sensor reads
+optical power but not which way the light goes, so `_optical_direction`
+takes it from `entPhysicalName` first and `entPhysicalDescr` second, Rx
+winning a name that claims both; a name that says neither gets no key at all
+rather than a guessed one, and is still visible in the port dialog, which
+reads the device live. Where a port answers several rows of one root (a
+multi-lane optic) light levels take the `min` and everything else the `max`
+— the failing lane is the dim one, but the worst temperature or bias is the
+extreme one, which is the rule the device-level keys already use. There is
+deliberately no device-level `sfp_*` tier: a chassis has no one true Rx
+power, and `_HARDWARE_METRIC_PREFIXES` is left alone so forty-eight ports of
+these do not drown the dialog's HARDWARE list.
+
+The same pass writes `interfaces.media` (`update_interface_media`, batched
+like `update_interface_poe`): `'optic'` for every port a sensor resolved to
+— whatever it read and whatever its status, since a failed optic is still an
+optic — and `NULL` for every other row of that device that currently says
+`'optic'`. It is reached only after the walk answered, so a timeout never
+strips the badge; the early return for an empty `cols` covers that. This is
+the only media signal the app has, because IF-MIB has none, and it is what
+`nodes.js`'s `sfpBadge` renders. The device dialog additionally patches the
+rows it fetched with the `if_index` set from its own `/dom` read, in the
+dialog's own closure, so whichever of the two fetches lands second paints
+the badge on a device the poller has not yet walked.
+
 **5.0.1 gave the walk a second table and the latch an expiry.** The value
 column `_poll_environment` asks for now comes from `_walk_sensor_columns`
 (below), so a Cisco switch that answers only CISCO-ENTITY-SENSOR-MIB counts

@@ -389,6 +389,24 @@ own subtabs.
   overheating room. Three built-in rules replace the one this briefly
   shipped as, each tuned to its own kind of reading, plus a humidity-high
   rule for the one metric that never needed splitting.
+- **Every optic's own readings are kept per port, not just the device's
+  worst one.** The same five-minute walk records `sfp_rx_dbm`,
+  `sfp_tx_dbm`, `sfp_bias_ma`, `sfp_volt` and `sfp_temp_c` for each port a
+  sensor maps to, keyed and labelled by that port — so a threshold alert
+  on a dying transceiver names the port it is on instead of reporting a
+  device-wide worst-of that could be any of forty-eight. Receive and
+  transmit power are told apart by the sensor's own name, because the MIB
+  says "optical power" without saying which direction; a reading whose
+  name says neither is still shown in the port's dialog, it just gets no
+  metric key. A multi-lane optic reports the dimmest lane for light levels
+  and the most extreme reading for the rest. The device-wide
+  `temp_optic_c` is unchanged.
+- **A port with an optic in it says so.** Any port a sensor maps to is
+  marked as optical and shows an **SFP** badge beside its name in the
+  interface list — the only reliable signal there is, since IF-MIB has no
+  media column. The badge is cleared by the first walk that answers and
+  maps nothing to that port; a walk that times out leaves it alone rather
+  than blinking the whole fleet's optics out of existence.
 - **A device inherits its settings from a "polling profile"** (a group) —
   credentials, poll interval, timeout, retries, which of ping/SNMP are
   enabled, how many ping probes to send and how long to wait for them,
@@ -860,7 +878,10 @@ interface opens that port's own graph (below), which is where a traffic
 question actually gets answered.
 
 The interface list sorts by any column — Descr, Admin, Oper, Speed,
-In, Out — the same way every other table in the app does. Which SNMP identity
+In, Out — the same way every other table in the app does. A port carrying a
+transceiver shows an **SFP** badge beside its description; opening a device's
+dialog adds the badge to any port its live DOM read finds, even one the
+poller has not yet walked. Which SNMP identity
 fields the header shows (sysDescr, sysName, sysObjectID, contact,
 location, vendor, SNMP version) is chosen in Nodes → Settings; the IP,
 status and any SNMP error always show.
