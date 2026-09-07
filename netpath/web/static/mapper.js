@@ -1256,12 +1256,9 @@
     drawDetail();
   }
 
-  /* This pane is rebuilt from innerHTML on every draw, and MAPPER's own
-     auto-refresh redraws it on its own clock: an operator part-way through
-     typing a new node name had the box emptied under them mid-word, and Save
-     then wrote whatever the fresh markup carried instead of what they typed.
-     A field they are actually in is put back exactly as they left it — their
-     text, their caret, and the focus — around the rebuild. */
+  /* The pane is rebuilt from innerHTML on every draw, and auto-refresh
+     draws on its own clock: a field the operator is typing in is put back
+     (text, caret, focus) around the rebuild, or a tick empties it mid-word. */
   function drawDetail() {
     const detail = App.el('mp-detail');
     const active = document.activeElement;
@@ -1488,13 +1485,9 @@
     return { x: (px - tx) / view.zoom, y: (py - ty) / view.zoom };
   }
 
-  /* Every press on the map calls this because every one of them calls
-     preventDefault (the drag, the pan and the rubber band all need it), and
-     preventDefault on a pointerdown suppresses the focus the browser would
-     otherwise have moved here. Without it a click on the map left focus on
-     whatever was last Tabbed to or clicked — usually a toolbar button — so
-     the arrow-key pan and the +/- zoom #mp-canvas's own aria-label advertises
-     did nothing at all until the operator Tabbed back to the canvas. */
+  /* Every press on the map calls preventDefault, which also suppresses the
+     focus the browser would have moved here; without this the arrow-key pan
+     and +/- zoom the canvas advertises do nothing after a click. */
   function focusCanvas() {
     const canvas = App.el('mp-canvas');
     // preventScroll: the canvas is already the thing under the pointer, and
@@ -1507,13 +1500,8 @@
     event.preventDefault();
     event.stopPropagation();
     focusCanvas();
-    // Captured ONCE, into the closures below. `event.currentTarget` is null
-    // the moment dispatch of this pointerdown finishes (the DOM spec sets it
-    // per dispatch), so the listeners this function leaves behind — which run
-    // on later events — used to throw a TypeError on the release: `up` never
-    // reached its removeEventListener calls, the pointermove listener stayed
-    // attached and view.nodeDrag stayed set, so every subsequent hover over
-    // the map dragged the node the operator had merely clicked.
+    // Captured once: currentTarget is null once this dispatch ends, and the
+    // closures below run on later events.
     const target = event.currentTarget;
     if (event.shiftKey) {
       const next = new Set(view.selection);

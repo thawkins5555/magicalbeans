@@ -1671,9 +1671,7 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
    setPointerCapture, never mousedown/mouseup, and a browser left free to
    scroll or pinch-zoom the page out from under a captured pointer defeats
    that capture as surely as never taking it. Pinned by name in
-   tests/test_layout_contracts.py (5.0.1), which also runs mapper.js through that
-   test's DRAG_FILES checks — exactly the footing #route-svg/.brush svg's own
-   touch-action has always had. */
+   tests/test_layout_contracts.py. */
 #mp-canvas {
   display: flex;
   flex-direction: column;
