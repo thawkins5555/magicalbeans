@@ -41,6 +41,7 @@ from .. import configrx_redact
 from .. import sshterm
 from .. import enterprises, mibcatalog, vendorid
 from .. import mapper
+from .. import nodediscover
 from .. import nodesdb
 from .. import db as netpathdb
 from .. import report as reportmod
@@ -4640,18 +4641,25 @@ def post_nodes_discovery(service, params, body) -> dict:
         "discovery_communities": communities,
         "never_scan_cidrs": service.settings.get("never_scan_cidrs", ""),
     }
-    # Per-scan timing overrides from the Start-discovery dialog — they
-    # live only in this job's settings, never in stored settings.
-    for body_key, override_key, cast in (
-            ("snmp_timeout_s", "discovery_snmp_timeout_s", float),
-            ("ping_timeout_s", "discovery_ping_timeout_s", float),
-            ("snmp_retries", "discovery_snmp_retries", int),
-            ("ping_retries", "discovery_ping_retries", int)):
+    # Per-scan timing and concurrency overrides from the Start-discovery
+    # dialog — they live only in this job's settings, never in stored
+    # settings. `high` is None where the value has no ceiling worth
+    # inventing; the worker count has one, since it is a thread count.
+    for body_key, override_key, cast, low, high in (
+            ("snmp_timeout_s", "discovery_snmp_timeout_s", float, 0, None),
+            ("ping_timeout_s", "discovery_ping_timeout_s", float, 0, None),
+            ("snmp_retries", "discovery_snmp_retries", int, 0, None),
+            ("ping_retries", "discovery_ping_retries", int, 0, None),
+            ("workers", "discovery_workers", int,
+             1, nodediscover.MAX_DISCOVERY_WORKERS)):
         value = body.get(body_key)
         if value is not None and str(value) != "":
             value = cast(value)
-            if value < 0:
-                raise ValueError(f"{body_key} cannot be negative")
+            if value < low:
+                raise ValueError(f"{body_key} cannot be less than {low}"
+                                 if low else f"{body_key} cannot be negative")
+            if high is not None and value > high:
+                raise ValueError(f"{body_key} cannot be more than {high}")
             overrides[override_key] = value
     job_id = service.node_poller.start_discovery(
         kind, target, overrides=overrides, allow_ping_only=allow_ping_only)

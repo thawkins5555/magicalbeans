@@ -4664,7 +4664,11 @@
       ${number('disc-o-pingto', 'Ping timeout', timeout, 'min=0.2 step=0.1')} s
       ${number('disc-o-pingretry', 'Ping retries', 0, 'min=0 max=5')}
       ${number('disc-o-snmpto', 'SNMP timeout', timeout, 'min=0.2 step=0.1')} s
-      ${number('disc-o-snmpretry', 'SNMP retries (per credential)', 0, 'min=0 max=5')}`, [
+      ${number('disc-o-snmpretry', 'SNMP retries (per credential)', 0, 'min=0 max=5')}
+      ${number('disc-o-workers', 'Addresses probed at once',
+               s.discovery_workers || 32, 'min=1 max=256')}
+      <p class="hint">Parallelism, not packet rate: probes are still released
+        at the configured probes per second.</p>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Start scan', primary: true, onClick: async (box) => {
         const { num } = App.form.readers(box);
@@ -4676,6 +4680,7 @@
             ping_retries: num('#disc-o-pingretry'),
             snmp_timeout_s: num('#disc-o-snmpto'),
             snmp_retries: num('#disc-o-snmpretry'),
+            workers: num('#disc-o-workers'),
           });
         } catch (error) {
           App.closeModal();
@@ -5215,6 +5220,14 @@
         <p class="hint">One bounded read of the device's own address table, so a
           router reached on two of its addresses is offered once instead of
           twice. Off, a sweep lists one row per address that answered.</p>
+        ${number('np-discworkers', 'Addresses probed at once',
+                 s.discovery_workers, 'min=1 max=256')}
+        <p class="hint">How many addresses a sweep identifies in parallel. It
+          does not raise the packet rate — probes are still released at the
+          configured probes per second; the workers only overlap the waiting,
+          which is what a sweep of a large subnet spends nearly all its time
+          doing. The Start-discovery dialog can set a different figure for one
+          scan.</p>
       </fieldset>
       <fieldset><legend>DEVICE DETAILS</legend>
         <p class="hint">Identity fields shown in a device's detail header.
@@ -5271,6 +5284,7 @@
           discovery_arc_hop: on('#np-dischop'),
           max_scan_addresses: num('#np-maxscan'),
           discovery_addresses: on('#np-discaddr'),
+          discovery_workers: num('#np-discworkers'),
           detail_fields: DETAIL_FIELDS.map(([key]) => key)
             .filter((key) => on(`#np-df-${key}`)).join(','),
           table_columns: App.readColumnPicker(

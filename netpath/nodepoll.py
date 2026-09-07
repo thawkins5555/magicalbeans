@@ -971,10 +971,12 @@ class NodePoller(Worker):
 
     def _running_discovery_jobs(self) -> list:
         """stop() already calls job.cancel() on each of these; a running
-        job's own per-address loop notices _stop and lands within about
-        one address's worth of work (see _discovery_budget_s) rather than
-        finishing its whole sweep, which can be a subnet's worth of
-        addresses and far too long to wait out here."""
+        job stops submitting addresses and drains the probes already in
+        flight, so it lands within about one address's worth of work (see
+        _discovery_budget_s) rather than finishing its whole sweep, which
+        can be a subnet's worth of addresses and far too long to wait out
+        here. The in-flight probes run in parallel, so draining them costs
+        one address's time, not one per worker."""
         return [job for job in list(self._discovery_jobs.values()) if job.running]
 
     def drain(self, timeout_s: float) -> bool:
@@ -991,7 +993,10 @@ class NodePoller(Worker):
     def _discovery_budget_s(self, job) -> float:
         """One address's worst case for a running discovery job, from its
         own settings dict -- not a model of the whole sweep (see
-        _running_discovery_jobs). Two SNMP versions tried, a handful of
+        _running_discovery_jobs), and still per-address rather than
+        per-worker now that the sweep probes several addresses at once:
+        the pool's drain waits for all of them together, so the slowest
+        single address is what bounds it. Two SNMP versions tried, a handful of
         community guesses each, plus the vendor arc hop
         (hop_enterprise_arcs: "typically three to eight" GETNEXTs, no
         retry of its own) are approximated as ten SNMP round trips rather

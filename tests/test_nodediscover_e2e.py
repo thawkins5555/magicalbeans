@@ -145,23 +145,37 @@ def main():
     # **kwargs: the real sweep() also takes probes_per_second and
     # never_scan, and this stand-in must not care which of them the caller
     # passes.
+    # A /24 paced at 100 probes/s takes about 2.5 s just to hand its
+    # addresses to the pool, so a cancel half a second in lands with most of
+    # them never submitted: the job must stop there rather than run the
+    # sweep out. Two workers, a one-second timeout — only 127.0.0.1 has a
+    # (now dark) listener, so that one address is the only slow probe and
+    # the drain is one timeout, not one per remaining address.
     nodediscover_mod.sweep = lambda addresses, timeout_ms=800, workers=64, **kw: {
         ip: True for ip in addresses}
     agent.alive = False  # every SNMP attempt now times out
-    job_id4 = poller.start_discovery("subnet", "127.0.0.0/28",
-                                     overrides={"default_snmp_timeout_s": 2.0,
+    job_id4 = poller.start_discovery("subnet", "127.0.0.0/24",
+                                     overrides={"default_snmp_timeout_s": 1.0,
                                                "max_scan_addresses": 1024,
+                                               "discovery_workers": 2,
+                                               "discovery_probes_per_second": 100,
                                                "discovery_communities": "public"})
-    time.sleep(0.05)
+    cancel_started = time.monotonic()
+    time.sleep(0.5)
     poller.cancel_discovery(job_id4)
-    for _ in range(100):
+    for _ in range(200):
         job = db.discovery_job(job_id4)
         if job["state"] != "running":
             break
         time.sleep(0.1)
+    elapsed = time.monotonic() - cancel_started
     job = db.discovery_job(job_id4)
     assert job["state"] == "cancelled", job["state"]
-    print("mid-sweep cancellation honoured OK")
+    assert job["total"] == 254, job["total"]
+    assert job["probed"] < job["total"], (job["probed"], job["total"])
+    assert elapsed < 8.0, elapsed
+    print(f"mid-sweep cancellation honoured OK (probed {job['probed']}/"
+          f"{job['total']} in {elapsed:.2f}s)")
 
     poller.shutdown()
     agent.stop()

@@ -1,9 +1,11 @@
 """Per-device and per-subnet discovery: a ping sweep (reused from
 ipam_scan.py) followed by best-effort SNMP v1/v2c identification.
 DiscoveryJob runs one daemon thread per active job (a one-shot bounded
-task, unlike Monitor's recurring pool); NodePoller owns the active-job
-dict. SNMPv3 is out of scope — it needs a known username a blind sweep
-does not have.
+task, unlike Monitor's recurring pool), and that thread drives a small
+thread pool over the addresses for the SNMP half — discovery_workers of
+them in flight at once, still paced at the sweep's own probe rate.
+NodePoller owns the active-job dict. SNMPv3 is out of scope — it needs a
+known username a blind sweep does not have.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import sqlite3
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 
 from . import mibcatalog, nodeoids, nodesdb, vendorid
 from .eventlog import ERROR, NODES, NullLog
@@ -24,6 +27,12 @@ from .nodeoids import DEFAULT_SNMP_PORT
 from .nodesdb import NodesDatabase
 from .snmppoll import PDU_GET, PDU_GETNEXT, SnmpError, V2C, build_request
 
+
+# How many addresses are probed at once. This is a thread count, not a
+# packet rate: discovery_probes_per_second still paces every submission, so
+# a larger pool overlaps the waiting rather than making a bigger burst.
+DEFAULT_DISCOVERY_WORKERS = 32
+MAX_DISCOVERY_WORKERS = 256
 
 
 def _candidate_communities(text: str | None) -> list[str]:
@@ -135,6 +144,15 @@ class DiscoveryJob:
         self.settings = settings
         self.log = log or NullLog()
         self._stop = threading.Event()
+        # Everything a worker thread touches lives behind this one lock:
+        # the counters, the fold map, and the two database writes that must
+        # agree with them. Never held across an SNMP probe.
+        self._lock = threading.Lock()
+        self._probed = self._responded = self._identified = 0
+        # Address -> the result id that reached it first, this sweep only —
+        # folds a router probed on two of its own addresses into one offer.
+        self._owners: dict[str, int] = {}
+        self._progress_ts = 0.0
         self._thread = threading.Thread(target=self._run_safe,
                                         name=f"discovery-{job_id}", daemon=True)
 
@@ -210,6 +228,9 @@ class DiscoveryJob:
             self.settings.get("discovery_ping_timeout_s") or default_timeout)
         snmp_retries = max(0, int(self.settings.get("discovery_snmp_retries") or 0))
         ping_retries = max(0, int(self.settings.get("discovery_ping_retries") or 0))
+        workers = max(1, min(MAX_DISCOVERY_WORKERS,
+                             int(self.settings.get("discovery_workers")
+                                 or DEFAULT_DISCOVERY_WORKERS)))
         groups = self.db.groups()
 
         # One bulk ping pass first, then SNMP per address — mirrors
@@ -258,66 +279,120 @@ class DiscoveryJob:
         # exactly the device most likely to fall over on the probes.
         snmp_interval = (1.0 / probes_per_second
                          if probes_per_second > 0 else 0.0)
-        next_probe = time.monotonic()
 
-        probed = responded = identified = 0
-        # Address -> the result id that reached it first, this sweep only —
-        # folds a router probed on two of its own addresses into one offer.
-        owners: dict[str, int] = {}
-        for ip in addresses:
-            if self._stop.is_set():
-                self.db.update_discovery_job(self.job_id, state="cancelled",
-                                             finished_ts=time.time())
-                return
-            probed += 1
-            ping_ok = bool(alive.get(ip, False))
-            if ping_ok:
-                responded += 1
+        # The pool overlaps the waiting, not the sending: this thread still
+        # releases at most one probe per snmp_interval, on an absolute
+        # schedule so a slow submit cannot let the rate drift upward
+        # afterwards to catch up. Addresses that never get a packet — the
+        # never-scan list, a subnet sweep's silent addresses — take neither
+        # a slot nor a delay.
+        started = time.monotonic()
+        slot = 0
+        futures = []
+        pool = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix=f"discovery-{self.job_id}-w")
+        try:
+            for ip in addresses:
+                if self._stop.is_set():
+                    break
+                ping_ok = bool(alive.get(ip, False))
+                # A device worth discovering might be SNMP-only with ICMP
+                # filtered, so a single-device job always tries SNMP even on
+                # a failed ping; a subnet sweep only bothers with addresses
+                # that answered, or a /24 sweep would spend most of its time
+                # probing SNMP against hundreds of genuinely dead addresses.
+                # An address on the never-scan list is still reported, so a
+                # bounded sweep accounts for every address it was asked
+                # about; it simply never had a packet sent to it. The one log
+                # line above says how many those were.
+                will_probe = (not is_never_scanned(ip, never_scan)
+                              and (ping_ok or self.kind == "device"))
+                if will_probe and snmp_interval:
+                    due = started + slot * snmp_interval
+                    slot += 1
+                    # wait(), not sleep(): a cancel lands inside a slow
+                    # sweep's pacing gap as promptly as anywhere else.
+                    self._stop.wait(max(0.0, due - time.monotonic()))
+                    if self._stop.is_set():
+                        break
+                futures.append(pool.submit(
+                    self._probe_one, ip, ping_ok, will_probe, communities,
+                    snmp_timeout_s, snmp_retries, groups))
+        finally:
+            # Queued-but-unstarted work is dropped only on a cancel; a normal
+            # sweep waits for every address it submitted. Either way this
+            # returns with no worker still running, so the terminal write
+            # below is the last word on the job's counters.
+            pool.shutdown(wait=True, cancel_futures=self._stop.is_set())
+        for future in futures:
+            if not future.cancelled():
+                future.result()   # a worker's crash re-raises into _run_safe
 
-            # A device worth discovering might be SNMP-only with ICMP
-            # filtered, so a single-device job always tries SNMP even on a
-            # failed ping; a subnet sweep only bothers with addresses that
-            # answered, or a /24 sweep would spend most of its time
-            # probing SNMP against hundreds of genuinely dead addresses.
-            result = {"ip": ip, "ping_ok": 1 if ping_ok else 0, "snmp_ok": 0}
-            # An address on the never-scan list is still reported, so a
-            # bounded sweep accounts for every address it was asked about;
-            # it simply never had a packet sent to it. The one log line
-            # above says how many those were.
-            if is_never_scanned(ip, never_scan):
-                pass
-            elif ping_ok or self.kind == "device":
-                if snmp_interval:
-                    delay = next_probe - time.monotonic()
-                    if delay > 0:
-                        time.sleep(delay)
-                    next_probe = time.monotonic() + snmp_interval
-                identity = self._try_snmp(ip, communities, snmp_timeout_s,
-                                          snmp_retries)
-                if identity is not None:
-                    result.update(identity)
-                    result["snmp_ok"] = 1
-                    result["suggested_group_id"] = nodeoids.suggest_group(
-                        identity.get("sys_descr", ""), identity.get("sys_object_id", ""),
-                        groups)
+        # A cancel that lands while the final (or only) address is being
+        # probed drains normally — the submit loop never sees it — so the
+        # flag decides the terminal state, not the loop.
+        state = "cancelled" if self._stop.is_set() else "done"
+        with self._lock:
+            self.db.update_discovery_job(
+                self.job_id, state=state, finished_ts=time.time(),
+                probed=self._probed, responded=self._responded,
+                identified=self._identified)
+
+    def _probe_one(self, ip: str, ping_ok: bool, will_probe: bool,
+                   communities: list[str], timeout_s: float, retries: int,
+                   groups) -> None:
+        """One address on a pool thread: everything that talks to the
+        network, and nothing that touches shared state (that is _record)."""
+        # A cancel that lands after this was queued but before it started
+        # leaves no row at all — the address genuinely was not probed, and
+        # a cancelled sweep claiming it was would be worse than a short
+        # result list. One already in flight still records what it found.
+        if self._stop.is_set():
+            return
+        result = {"ip": ip, "ping_ok": 1 if ping_ok else 0, "snmp_ok": 0}
+        if will_probe:
+            identity = self._try_snmp(ip, communities, timeout_s, retries)
+            if identity is not None:
+                result.update(identity)
+                result["snmp_ok"] = 1
+                result["suggested_group_id"] = nodeoids.suggest_group(
+                    identity.get("sys_descr", ""),
+                    identity.get("sys_object_id", ""), groups)
+        self._record(ip, result)
+
+    def _record(self, ip: str, result: dict) -> None:
+        """A worker's whole share of the job state, under one lock: the fold
+        decision and the row it depends on have to be one step, or two
+        addresses of the same router landing together would each find the
+        other unclaimed and the box would be offered twice."""
+        with self._lock:
+            self._probed += 1
+            if result["ping_ok"]:
+                self._responded += 1
             mine = self._result_addresses(ip, result)
-            folded = fold_target(mine, owners)
+            folded = fold_target(mine, self._owners)
             if folded is not None:
                 result["folded_into_result_id"] = folded
             elif result["snmp_ok"]:
-                identified += 1   # a folded row would count the same device twice
+                self._identified += 1  # a folded row is the same device again
             result_id = self.db.add_discovery_result(self.job_id, **result)
             if folded is None:
-                register_addresses(owners, result_id, mine)
-            self.db.update_discovery_job(self.job_id, probed=probed,
-                                         responded=responded, identified=identified)
+                register_addresses(self._owners, result_id, mine)
+            self._write_progress()
 
-        # A cancel that lands while the final (or only) address is being
-        # probed exits the loop normally — the top-of-loop check never
-        # sees it — so the flag decides the terminal state, not the loop.
-        state = "cancelled" if self._stop.is_set() else "done"
-        self.db.update_discovery_job(self.job_id, state=state,
-                                     finished_ts=time.time())
+    _PROGRESS_INTERVAL_S = 0.25
+
+    def _write_progress(self) -> None:
+        """Progress exists for the browser's poll, so it is coalesced —
+        without this, 256 workers finishing at once means 256 UPDATEs. The
+        terminal write in _run carries the exact final counters regardless."""
+        now = time.monotonic()
+        if now - self._progress_ts < self._PROGRESS_INTERVAL_S:
+            return
+        self._progress_ts = now
+        self.db.update_discovery_job(self.job_id, probed=self._probed,
+                                     responded=self._responded,
+                                     identified=self._identified)
 
     def _try_snmp(self, ip: str, communities: list[str], timeout_s: float,
                   retries: int = 0):

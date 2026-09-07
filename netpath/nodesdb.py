@@ -534,6 +534,9 @@ DEFAULTS = {
     # Folds a router reached on two L3 addresses into one offer; off makes
     # a sweep exactly 4.54's (one row per address, nothing folded).
     "discovery_addresses": True,
+    # How many addresses a sweep has in flight at once. Not a packet rate:
+    # discovery_probes_per_second still paces every probe.
+    "discovery_workers": 32,
 }
 
 _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
