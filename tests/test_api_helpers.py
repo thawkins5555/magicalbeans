@@ -362,6 +362,40 @@ try:
     check("a negative discovery limit is clamped, not read as 'no limit'",
           status == 200 and negative == 1, f"{status} {negative}")
 
+    # ---------------------------------------------------------------------
+    # 9. Dashboard offenders resolve a device's Nodes display name
+    #
+    # A device added by IP starts with devices.name == its IP; only
+    # namelookup.device_name (the polled sysName, or a manual rename) gives
+    # it a real one. The offenders tile used to show the raw `name` column,
+    # so a never-renamed device's IP appeared twice on that tile — once as
+    # "name" and again as "ip". Both the event-count path
+    # (count_events_by_device) and the metric-ranking path (top_metric) are
+    # covered here.
+    dash_ip = "198.51.100.77"
+    dash_device_id = service.nodes_db.add_device(dash_ip)
+    check("a device added by IP starts with its raw name equal to its IP "
+          "(the bug's starting point)",
+          service.nodes_db.device(dash_device_id)["name"] == dash_ip)
+    service.nodes_db.seed_identity(dash_device_id, sys_name="dash-offender-sw")
+    service.nodes_db.record_device_event(dash_device_id, "device_down", "test")
+    service.nodes_db.record_metric_samples(
+        dash_device_id, [("cpu_pct", "CPU", "%", "gauge", time.time(), 99.0)])
+
+    status, payload = call("GET", "/api/dashboard/offenders", token=admin)
+    check("dashboard offenders: 200", status == 200, (status, payload))
+    lists_by_key = {l["key"]: l for l in payload.get("lists", [])} if status == 200 else {}
+    events_row = next((r for r in lists_by_key.get("events", {}).get("rows", [])
+                       if r["device_id"] == dash_device_id), None)
+    check("the events offenders list shows the resolved sysName, not the IP",
+          events_row is not None and events_row["name"] == "dash-offender-sw",
+          events_row)
+    cpu_row = next((r for r in lists_by_key.get("cpu", {}).get("rows", [])
+                    if r["device_id"] == dash_device_id), None)
+    check("the CPU offenders list (top_metric) also shows the resolved sysName",
+          cpu_row is not None and cpu_row["name"] == "dash-offender-sw",
+          cpu_row)
+
 finally:
     server.stop()
     service.shutdown()

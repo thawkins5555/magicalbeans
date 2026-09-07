@@ -360,6 +360,13 @@ this one, `remove_device`/`bulk_remove_devices` follow through to
 `report.top_metric_ranking` aggregates in `nodes_series.db` and resolves
 names with one bounded `devices_by_ids`. Cross-file ids are plain integers,
 already the convention (`configrx.device_config`, `mapper.map_nodes`).
+Since 5.1.0, `top_metric`'s own `name` field is `namelookup.device_name(device)
+or device["ip"]` rather than the raw `devices.name` column — `name` equals
+`ip` for a device nobody has renamed, which is what the Dashboard's "Worst
+ten" tile showed before this; `count_events_by_device` carries
+`sys_name`/`display_name_source` alongside `name` for the same reason, so
+`api.get_dashboard_offenders`'s `_rows` helper can resolve the events and
+interface-events lists' names the identical way.
 
 **Why the migration rebuilds two tables.** `devices.mib_file_id` and
 `groups.mib_file_id` were added by `ensure_columns` with `REFERENCES

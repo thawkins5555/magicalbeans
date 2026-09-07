@@ -3170,9 +3170,13 @@ class NodesDatabase(SqliteStore):
 
     def count_events_by_device(self, since: float,
                                kinds: list[str] | None = None) -> list[sqlite3.Row]:
-        """(device_id, name, ip, n) for the devices with the most events
-        since a wall-clock timestamp, busiest first — the "top offenders"
-        question a dashboard asks once, rather than one query per device."""
+        """(device_id, name, ip, sys_name, display_name_source, n) for the
+        devices with the most events since a wall-clock timestamp, busiest
+        first — the "top offenders" question a dashboard asks once, rather
+        than one query per device. sys_name/display_name_source ride along
+        so a caller can resolve the same display name Nodes itself shows
+        (namelookup.device_name) instead of the raw `name` column, which
+        equals the IP for a device nobody has renamed."""
         clauses = ["e.ts >= ?"]
         params: list = [float(since)]
         if kinds:
@@ -3183,6 +3187,7 @@ class NodesDatabase(SqliteStore):
         with self._lock:
             return self._conn.execute(
                 f"SELECT e.device_id AS device_id, d.name AS name, d.ip AS ip,"
+                f" d.sys_name AS sys_name, d.display_name_source AS display_name_source,"
                 f" COUNT(*) AS n FROM device_events e"
                 f" JOIN devices d ON d.id = e.device_id"
                 f" WHERE {where} GROUP BY e.device_id"
@@ -3652,7 +3657,12 @@ class NodesDatabase(SqliteStore):
         """The n enabled devices with the highest (or lowest) current value
         of one metric key — "worst packet loss", "slowest to answer". The
         ranking is the series store's, the names and the enabled filter are
-        this file's, so the two are joined here."""
+        this file's, so the two are joined here. `name` is the resolved
+        display name (namelookup.device_name, falling back to the IP) so a
+        discovered device nobody has renamed shows its sysName here too,
+        rather than the raw `name` column, which equals the IP for one."""
+        from . import namelookup
+
         rows = self.series_db.top_metric_rows(key, ascending=ascending)
         if not rows:
             return []
@@ -3667,7 +3677,8 @@ class NodesDatabase(SqliteStore):
             device = named.get(row["device_id"])
             if device is None:
                 continue
-            out.append({"device_id": row["device_id"], "name": device["name"],
+            out.append({"device_id": row["device_id"],
+                        "name": namelookup.device_name(device) or device["ip"],
                         "ip": device["ip"], "metric_id": row["metric_id"],
                         "key": row["key"], "label": row["label"],
                         "unit": row["unit"], "last_value": row["last_value"],

@@ -324,6 +324,14 @@ what the account has no grant for rather than showing a number that would
 be a lie. The six 24-hour lists are refreshed on a slower cadence than the
 tiles, since they are history rather than live state.
 
+**The Worst ten lists name a device the way Nodes itself does.** A device
+discovered by IP has a raw `name` equal to its IP until someone renames it,
+and the offenders tile used to show that raw value — so an unrenamed
+device's own IP address appeared twice in the same row, once as the name
+and again as the IP column. It now resolves the same display name Nodes,
+Syslog and Alerts already agree on (the polled sysName, or a manual rename
+when the device is pinned to one).
+
 ## Nodes — SNMP poller and device inventory
 
 A filterable device table with at-a-glance status, and a per-device

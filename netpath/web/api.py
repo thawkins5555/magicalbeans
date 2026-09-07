@@ -8156,8 +8156,17 @@ def get_dashboard_offenders(service, params, body) -> dict:
     def _rows(rows, value_key, unit):
         out = []
         for row in rows[:n]:
+            # namelookup.device_name mirrors Nodes' own display precedence
+            # (manual name when pinned, else the polled sysName, else the
+            # manual name) — row["name"] alone equals the IP for a device
+            # nobody has renamed, which is the bug this fixes. top_metric's
+            # rows already carry the resolved name; a row without sys_name
+            # in its keys (the events/interface_events path predates this)
+            # falls straight back to the raw name.
+            keys = row.keys()
+            name = (namelookup.device_name(row) if "sys_name" in keys else row["name"])
             out.append({"device_id": row["device_id"],
-                        "name": row["name"] or row["ip"],
+                        "name": name or row["ip"],
                         "ip": row["ip"],
                         "value": row[value_key],
                         "unit": unit})
