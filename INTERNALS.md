@@ -1425,9 +1425,11 @@ nonsensical with nothing to have recovered from.
 discovery sweep is a one-shot bounded task rather than a recurring
 per-target schedule. It reuses `ipam_scan.sweep()`/`usable_addresses()`
 for the ping half rather than reimplementing it, then attempts an
-unauthenticated v1/v2c SNMP identity GET (its own minimal single-shot UDP
-helper, not `nodepoll._Session`, to keep this module free of a
-module-level dependency on the poller and avoid a real import cycle)
+unauthenticated v1/v2c SNMP identity GET (`_snmp_identify`, one shot over
+`nodepoll._Session`, so a reply is accepted only from the address asked
+and only with the request id sent; the import of `_Session` is
+function-local, which is what keeps the cycle away — `nodepoll` imports
+this module at module level)
 against whichever addresses answered, trying every v1/v2c community drawn
 from a caller-chosen polling profile (`api.py`'s `post_nodes_discovery`
 resolves the profile's primary credential plus its `group_credentials`
@@ -1444,6 +1446,55 @@ owns the dict of active jobs and exposes
 already-promoted result as a no-op rather than a duplicate-IP error, so a
 partially-overlapping re-selection is always safe to retry.
 
+The SNMP half is a thread pool (5.0.1). The ping half was always parallel
+— `ipam_scan.sweep()` — but identification was one address at a time, and
+since almost all of that time is a socket waiting for a device that will
+never answer, a /24 of mostly-dead addresses took as long as the sum of
+its timeouts. The job thread now submits each address to a
+`ThreadPoolExecutor` of `discovery_workers` threads (default 32, ceiling
+`MAX_DISCOVERY_WORKERS` = 256, per-scan override `workers` on
+`POST /api/nodes/discovery`), and:
+
+- **Pacing is unchanged and still belongs to the submitting thread.** The
+  probe rate is a promise about packets per second, not about
+  parallelism, so the submit loop still releases at most one probe per
+  `1/discovery_probes_per_second`, on an absolute schedule (`started +
+  slot * interval`) so a slow submit cannot make the rate drift upward to
+  catch up afterwards. It waits on the stop event rather than sleeping,
+  so a cancel lands inside a pacing gap as promptly as anywhere else.
+  Addresses that never get a packet — the never-scan list, a subnet
+  sweep's silent addresses — consume neither a slot nor a delay. What the
+  pool buys is overlap of the *waiting*, which is where the time goes.
+- **One lock, and nothing SNMP under it.** `_probe_one` runs on a pool
+  thread and does only network work; `_record` takes the job's single
+  lock and does all of the shared-state work in one step: the counters,
+  `_result_addresses` → `fold_target` → `add_discovery_result` →
+  `register_addresses`, and the coalesced progress write. The fold
+  decision and the row it depends on cannot be separated, or two
+  addresses of the same router finishing together would each find the
+  other unclaimed and the box would be offered twice. Lock order is job
+  lock → nodesdb lock, never the reverse.
+- **Progress writes are coalesced** to one `update_discovery_job` per 250
+  ms, since 256 workers finishing at once otherwise means 256 UPDATEs for
+  a figure only the browser's poll reads. The single terminal write
+  carries the exact final counters.
+- **The job thread drains the pool itself**:
+  `shutdown(wait=True, cancel_futures=self._stop.is_set())`, then
+  `.result()` on every non-cancelled future so a worker's crash re-raises
+  into `_run_safe` instead of vanishing, and only then the one terminal
+  `update_discovery_job(state=…)`. A cancelled job's still-queued
+  addresses are dropped, and `_probe_one` returns without recording
+  anything if the stop flag is already set when it starts — a cancelled
+  sweep should not claim to have probed addresses it never sent a packet
+  to. One already in flight still records what it found.
+
+One consequence worth knowing: the primary row of a multi-address device
+is now whichever of its addresses answered *first*, not its lowest
+address. Nothing downstream depends on which one it is — `discovery_results`
+is `ORDER BY ip` and the browser's `drawDiscResultsTable` sorts client-side
+— but a folded pair can come back the other way round from one sweep to the
+next.
+
 The `device`/`subnet` kind still exists internally (it decides "try SNMP
 even without a ping reply") but is derived server-side by
 `api.py`'s `_discovery_kind_for()` from the target string alone — a bare
@@ -1454,11 +1505,12 @@ profile) now simply means the sweep runs ping-only, a combination
 `post_nodes_discovery` refuses up front unless the job was started with
 `allow_ping_only`.
 
-Per-scan timing: the Start-discovery dialog's ping/SNMP timeout and
-retry values travel as `discovery_*` keys in the job's own settings
+Per-scan timing: the Start-discovery dialog's ping/SNMP timeout, retry
+and worker values travel as `discovery_*` keys in the job's own settings
 dict (the same override channel the profile's community list already
 uses) — they exist only for that job and never touch stored settings.
-Ping retries re-sweep only the not-yet-answered addresses;
+`post_nodes_discovery` range-checks each one before it becomes an
+override. Ping retries re-sweep only the not-yet-answered addresses;
 `_try_snmp`'s default stays one shot per version/community combination
 (a retry per guess makes a subnet sweep crawl) with extra attempts only
 when this scan asked for them.
@@ -1468,9 +1520,8 @@ Cancel/remove: DELETE on a discovery job cancels it while it is running
 results cascading via the FK — once it is not, which is also what the
 jobs list's Remove button and the cancelled-scan dialog's "Discard scan"
 button call. The job's terminal state is decided by the stop flag after
-the address loop, not only by the top-of-loop check: a cancel landing
-while the final (or only) address was mid-probe used to fall through to
-`done`.
+the pool has drained, not by the submit loop: a cancel landing while the
+final (or only) address was mid-probe used to fall through to `done`.
 
 Approval flow: `discovery_jobs` carries `allow_ping_only` (a start-time
 choice, not a promote-time one) and `reviewed`. The browser pops the
@@ -1497,13 +1548,17 @@ land in `discovery_results.ip_addresses` as JSON, filtered through
 one of them. `discovery_addresses` (default on) turns the whole thing
 off, which makes a sweep exactly 4.54's.
 
-Within one sweep, `owners` maps each address to the first result that
-reached it; `fold_target(mine, owners)` and
+Within one sweep, `owners` (`DiscoveryJob._owners`) maps each address to
+the first result that reached it; `fold_target(mine, owners)` and
 `register_addresses(owners, id, mine)` are pure so the rule is testable
 without a socket. A later result that shares an address gets
 `folded_into_result_id` and does not count towards the job's
 `identified` figure — that figure is how many devices the sweep found,
-not how many addresses answered.
+not how many addresses answered. Since 5.0.1 "first" means first to
+*finish*, not lowest address, and both calls happen inside `_record`'s
+lock together with the INSERT whose id `register_addresses` stores —
+`test_nodediscover_workers.py` runs two addresses of one device into
+`_record` off a barrier to pin exactly that.
 
 ### Device identity, addresses and merge (`nodesdb.py`, `nodepoll.py`, `web/api.py`) — 5.0.0
 

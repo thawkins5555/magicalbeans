@@ -525,10 +525,17 @@ own subtabs.
   limit** before sending a single packet, the same guard IPAM's own
   subnet scan uses.
 - **Each scan sets its own timing.** Starting a scan opens a small dialog
-  for ping/SNMP timeouts and retries, pre-filled from the module
-  defaults — the values apply to that one sweep only. Extra ping passes
-  revisit only the addresses that haven't answered; SNMP retries re-attempt
-  each credential.
+  for ping/SNMP timeouts, retries and how many addresses to probe at once,
+  pre-filled from the module defaults — the values apply to that one sweep
+  only. Extra ping passes revisit only the addresses that haven't answered;
+  SNMP retries re-attempt each credential.
+- **A sweep identifies many addresses at once.** The ping pass was always
+  parallel; the SNMP identification behind it now runs a poolful of
+  addresses together — 32 by default, settable per scan and in Nodes
+  settings up to 256 — so a subnet of mostly-silent addresses no longer
+  costs the sum of its timeouts. It is parallelism, not a louder scan: the
+  probe rate still releases packets at the configured probes per second,
+  and the never-scan list is still never touched.
 - **A finished scan opens an approve/deny dialog once**, and only for the
   browser that started it — every discovered device listed with a
   checkbox, SNMP-identified ones pre-checked, and nothing added until
