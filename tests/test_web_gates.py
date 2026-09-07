@@ -429,6 +429,12 @@ try:
                            "active mute row, matched only on its mute_ "
                            "prefix; prune() clears expired rows, not this "
                            "read path",
+        "put_account_theme": "a real write, to the caller's OWN users row only "
+                             "(the username comes from the session, never the "
+                             "body), behind the session check every /api route "
+                             "outside PUBLIC_API has; the same self-service "
+                             "shape as post_password's own-account half, "
+                             "ungated deliberately (5.0.0)",
     }
 
     missing_handlers = [(m, p, h) for m, p, h, r in ROUTES_PARSED if h not in API_FUNCS]
@@ -502,10 +508,11 @@ try:
           server_mod.PUBLIC_API == PUBLIC_API_EXPECTED,
           server_mod.PUBLIC_API ^ PUBLIC_API_EXPECTED)
 
-    # The 8 routes with no gate at all, each justified in server.py's own
+    # The 9 routes with no gate at all, each justified in server.py's own
     # comments (pre-auth, a property of the host, or — state/config/dashboard
     # — filtered per-module inside the handler, which the /api/state and
-    # /api/config checks earlier in this suite already exercise). A ninth
+    # /api/config checks earlier in this suite already exercise; the theme
+    # PUT writes the caller's own account, see KNOWN_NOT_WRITES). A tenth
     # route reaching this set is a deliberate act with this test to update,
     # not an omission nobody notices.
     UNGATED_EXPECTED = {
@@ -513,6 +520,7 @@ try:
         ("POST", r"^/api/heartbeat$"), ("GET", r"^/api/session$"),
         ("GET", r"^/api/state$"), ("GET", r"^/api/config$"),
         ("GET", r"^/api/platform$"), ("GET", r"^/api/dashboard$"),
+        ("PUT", r"^/api/account/theme$"),
     }
     ungated_actual = {(m, p) for m, p, h, r in ROUTES_PARSED if r is None}
     check("the ungated route set is exactly what it was when this was audited",
