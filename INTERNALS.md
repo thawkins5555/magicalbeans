@@ -2865,7 +2865,7 @@ occurrence increments one alert instead of opening a duplicate" behavior
 lives in the database's own conflict resolution, not in application code
 that could race between a read and a write.
 
-44 built-in rules and 6 built-in templates are seeded via `INSERT OR
+47 built-in rules and 6 built-in templates are seeded via `INSERT OR
 IGNORE` keyed on each row's unique `key`, run on every open — idempotent,
 so a re-open never duplicates, and an admin's edit to a built-in rule's
 severity or a template's wording survives a restart because the seed

@@ -403,6 +403,15 @@ ROLLED_UP_BY = {
     # (ROLLS_UP, built from this map) is what retroactively resolves a
     # Warning that opened moments before Critical did in the same tick.
     "temp_chassis_high": "temp_chassis_critical",
+    # The per-port optic rules, back to being an outage rollup like every
+    # entry above the temperature pair: DOM is read by polling the device,
+    # so a switch that has stopped answering reports no optic readings at
+    # all and any alert about one is an artefact of the outage. Their
+    # alerts are interface-kind, which ROLLUP_ENTITY_KINDS now admits and
+    # _rollup_parent projects to the switch the port is on.
+    "sfp_rx_power_low": "device_down",
+    "sfp_tx_power_low": "device_down",
+    "sfp_temp_high": "device_down",
 }
 
 # The rules that roll up under a given parent, the other way round — built

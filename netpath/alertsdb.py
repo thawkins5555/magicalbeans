@@ -527,7 +527,7 @@ _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "auto_resolve_after_s", "notify")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 44 built-in rules: 8 device_event + 3 interface_event + 20 threshold +
+# 47 built-in rules: 8 device_event + 3 interface_event + 23 threshold +
 # 3 trap + 1 syslog + 1 ipam + 2 wireless_event + 1 dhcp_threshold +
 # 3 netpath_threshold + 2 system. Each `template` name is a
 # templates.key —
@@ -637,6 +637,34 @@ _BUILTIN_RULES = [
     # with SFF-8472's own typical vendor-set high-warning/high-alarm
     # thresholds for a commercial-temperature transceiver.
     ("temp_optic_high", "Optic temperature high", "threshold", "temp_optic_c", 4, "threshold_breach", 80.0, 70.0, 2),
+    # The three per-port optic rules, reading the DOM keys nodepoll writes
+    # per interface (sfp_rx_dbm.<if>, and so on), so each alerts on the port
+    # rather than on the device. Deliberately conservative: DOM numbers vary
+    # by transceiver type and by link budget, and an optic alert that fires
+    # on a healthy 10 km single-mode link on day one is an optic alert
+    # somebody turns off on day two.
+    #
+    # Receive power is the one that predicts a failure: a link degrades for
+    # weeks as a connector gets dirty or a splice ages, and the received
+    # level falls long before the interface itself goes down. -22 dBm is at
+    # or below the receive sensitivity of essentially every 1G/10G optic in
+    # service (commonly -20 to -23), so a port below it is running on
+    # margin that is not there; it clears at -20, back inside every one of
+    # those budgets.
+    ("sfp_rx_power_low", "Optic receive power low", "threshold", "sfp_rx_dbm", 4, "threshold_breach", -22.0, -20.0, 2),
+    # Transmit power is about the optic itself rather than the fibre: a
+    # laser whose output has fallen away is dying. -12 dBm is below the
+    # minimum launch power of the common short- and long-reach types
+    # (typically -9.5 to -3), far enough below to leave a low-power
+    # transceiver alone.
+    ("sfp_tx_power_low", "Optic transmit power low", "threshold", "sfp_tx_dbm", 4, "threshold_breach", -12.0, -10.0, 2),
+    # Per-port optic temperature, distinct from temp_optic_high above,
+    # which stays: that rule reads the DEVICE-wide temp_optic_c (the
+    # hottest optic in the chassis) and is what an operator already has
+    # tuned, so it is untouched. This one reads sfp_temp_c.<if> and names
+    # the port. 70 C is inside SFF-8472's typical commercial high-warning
+    # range and above the 40-55 C a healthy optic runs at.
+    ("sfp_temp_high", "Optic temperature high (per port)", "threshold", "sfp_temp_c", 4, "threshold_breach", 70.0, 65.0, 2),
     # RH above ~80% starts to risk condensation on anything metal in the
     # room — unambiguous on its own: nothing but a dedicated environmental
     # monitor answers a humidity sensor at all, so this one metric key

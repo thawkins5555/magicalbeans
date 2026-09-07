@@ -1287,11 +1287,11 @@ alerts and optionally emailing about them.
 
 ### Rules
 
-- **44 built-in rules** ship enabled: a device not responding, a device
+- **47 built-in rules** ship enabled: a device not responding, a device
   recovering, a device rebooting, SNMP authentication failing, a device
   needing unsupported SNMPv3 privacy, a poll running longer than its own
   interval, a device whose vendor MIB is missing, an interface going
-  down/up/flapping, twenty CPU/memory/interface-utilization/
+  down/up/flapping, twenty-three CPU/memory/interface-utilization/
   error-and-discard-rate/disk/ping-latency/packet-loss/UPS/
   environmental thresholds, a critical or cold-start SNMP trap, a
   linkDown trap from a device Nodes is not itself polling, a critical
