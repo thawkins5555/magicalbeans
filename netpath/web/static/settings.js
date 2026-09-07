@@ -392,6 +392,22 @@
         `<span class="meter"><i style="width:${share * 100}%"></i></span>` +
         `${App.bytes(bytes || 0)} used${cap ? ` · ${pct}%` : ''}`;
     }
+    /* How far back each file still reaches. Bytes alone never said what a
+       cap had cost; this does, in the same row as the path it belongs to. */
+    for (const [id, key] of [
+      ['age-app', 'app_oldest_ts'], ['age-trace', 'trace_oldest_ts'],
+      ['age-flow', 'flow_oldest_ts'], ['age-snmp', 'snmp_oldest_ts'],
+      ['age-syslog', 'syslog_oldest_ts'], ['age-ipam', 'ipam_oldest_ts'],
+      ['age-nodes', 'nodes_oldest_ts'],
+      ['age-nodes-series', 'nodes_series_oldest_ts'],
+      ['age-nodes-mibs', 'nodes_mibs_oldest_ts'],
+      ['age-alerts', 'alerts_oldest_ts'],
+    ]) {
+      const el = App.el(id);
+      if (!el) continue;
+      const ts = storage[key];
+      el.textContent = ts ? `oldest record ${App.ago(ts)}` : 'no history';
+    }
     // Summed from whatever _storage actually reported rather than from a
     // hand-written list of eight: wireless.db and configrx.db were already
     // in the payload and already missing from that list, so "on disk in

@@ -105,6 +105,7 @@ class WirelessDatabase(SqliteStore):
     SCHEMA = SCHEMA
     DEFAULTS = DEFAULTS
     LABEL = "wireless.db"
+    OLDEST_TS_SQL = "SELECT MIN(ts) FROM ap_events"
 
     def _migrate(self) -> None:
         self.ensure_columns("access_points", {

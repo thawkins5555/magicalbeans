@@ -317,8 +317,9 @@ class ConsoleWindow(QMainWindow):
         self.storage_label = QLabel("")
         self.storage_label.setObjectName("stat")
         outer.addWidget(self.storage_label)
-        hint = QLabel("Sizes include each file's write-ahead log. Caps are set "
-                      "on the Settings tab in the browser.")
+        hint = QLabel("Sizes include each file's write-ahead log, and each "
+                      "line says how far back that file still reaches. Caps "
+                      "are set on the Settings tab in the browser.")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         outer.addWidget(hint)
@@ -344,8 +345,13 @@ class ConsoleWindow(QMainWindow):
             used = database.size_bytes()
             cap = int(cap_mb) * 1024 * 1024
             share = f"{used / cap * 100:5.1f}% of {int(cap_mb)} MB" if cap else "no cap"
+            oldest = database.oldest_ts()
+            # What the cap beside it has actually cost, in history rather
+            # than in bytes.
+            age = (f"oldest {_duration(time.time() - oldest)}" if oldest
+                   else "no history")
             lines.append(f"{label:8s} {_size(used):>10s}   {share:>22s}   "
-                         f"{database.path}")
+                         f"{age:>16s}   {database.path}")
         self.storage_label.setText("\n".join(lines))
 
     def _load_fields(self) -> None:

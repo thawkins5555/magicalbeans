@@ -130,6 +130,7 @@ class FlowDatabase(SqliteStore):
     DEFAULTS = DEFAULTS
     LABEL = "flows.db"
     TRIM_TABLE = "flows"
+    OLDEST_TS_SQL = "SELECT MIN(ts_start) FROM flows"
     TRIM_FLOOR = 1000
 
     def _migrate(self) -> None:

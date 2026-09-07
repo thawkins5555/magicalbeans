@@ -752,6 +752,10 @@ class NodesDatabase(SqliteStore):
     SCHEMA = SCHEMA
     DEFAULTS = DEFAULTS
     LABEL = "nodes"
+    # The two event logs; the device rows themselves are inventory.
+    OLDEST_TS_SQL = ("SELECT MIN(ts) FROM (SELECT MIN(ts) AS ts FROM"
+                     " device_events UNION ALL SELECT MIN(ts) FROM"
+                     " interface_events)")
 
     # Marker for the 5.0.0 split, a private setting in nodes.db: absent =
     # never split or created fresh at 5.0, "rollups" = phase 1 done and the

@@ -116,6 +116,7 @@ class SnmpTrapDatabase(SqliteStore):
     DEFAULTS = DEFAULTS
     LABEL = "snmptraps.db"
     TRIM_TABLE = "traps"
+    OLDEST_TS_SQL = "SELECT MIN(ts) FROM traps"
     TRIM_FLOOR = 5000
 
     def __init__(self, path: str):

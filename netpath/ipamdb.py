@@ -204,6 +204,7 @@ class IpamDatabase(SqliteStore):
     # hosts and open conflicts are all bounded by what is on the network.
     TRIM_TABLE = "scans"
     TRIM_FLOOR = 200
+    OLDEST_TS_SQL = "SELECT MIN(started_ts) FROM scans"
 
     def _migrate(self) -> None:
         self.ensure_columns("dhcp_servers",

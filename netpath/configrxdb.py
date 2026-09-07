@@ -224,6 +224,7 @@ class ConfigRxDatabase(SqliteStore):
     SCHEMA = SCHEMA
     DEFAULTS = DEFAULTS
     LABEL = "configrx.db"
+    OLDEST_TS_SQL = "SELECT MIN(ts) FROM backups"
 
     def __init__(self, path: str):
         self.search_fts = False

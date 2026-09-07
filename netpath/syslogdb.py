@@ -95,6 +95,7 @@ class SyslogDatabase(SqliteStore):
     DEFAULTS = DEFAULTS
     LABEL = "syslog.db"
     TRIM_TABLE = "logs"
+    OLDEST_TS_SQL = "SELECT MIN(ts) FROM logs"
     TRIM_FLOOR = 5000
 
     BACKFILL_CHUNK = 20_000

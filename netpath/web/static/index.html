@@ -1223,17 +1223,27 @@
     <fieldset>
       <legend>DATA FILES</legend>
       <label>Application <input id="set-app-path" readonly>
-        <span class="usage" id="use-app"></span></label>
-      <label>Traces <input id="set-trace-path" readonly></label>
-      <label>Flows <input id="set-flow-path" readonly></label>
-      <label>SNMP traps <input id="set-snmp-path" readonly></label>
-      <label>Syslog <input id="set-syslog-path" readonly></label>
-      <label>IPAM <input id="set-ipam-path" readonly></label>
-      <label>Nodes <input id="set-nodes-path" readonly></label>
-      <label>Nodes metric history <input id="set-nodes-series-path" readonly></label>
+        <span class="usage" id="use-app"></span>
+        <span class="hint" id="age-app"></span></label>
+      <label>Traces <input id="set-trace-path" readonly>
+        <span class="hint" id="age-trace"></span></label>
+      <label>Flows <input id="set-flow-path" readonly>
+        <span class="hint" id="age-flow"></span></label>
+      <label>SNMP traps <input id="set-snmp-path" readonly>
+        <span class="hint" id="age-snmp"></span></label>
+      <label>Syslog <input id="set-syslog-path" readonly>
+        <span class="hint" id="age-syslog"></span></label>
+      <label>IPAM <input id="set-ipam-path" readonly>
+        <span class="hint" id="age-ipam"></span></label>
+      <label>Nodes <input id="set-nodes-path" readonly>
+        <span class="hint" id="age-nodes"></span></label>
+      <label>Nodes metric history <input id="set-nodes-series-path" readonly>
+        <span class="hint" id="age-nodes-series"></span></label>
       <label>Nodes MIBs <input id="set-nodes-mibs-path" readonly>
-        <span class="usage" id="use-nodes-mibs"></span></label>
-      <label>Alerts <input id="set-alerts-path" readonly></label>
+        <span class="usage" id="use-nodes-mibs"></span>
+        <span class="hint" id="age-nodes-mibs"></span></label>
+      <label>Alerts <input id="set-alerts-path" readonly>
+        <span class="hint" id="age-alerts"></span></label>
       <label>Trace database cap <input type="number" id="set-trace-cap" min="16" step="64"> MB
         <span class="usage" id="use-trace"></span></label>
       <label>Flow database cap <input type="number" id="set-flow-cap" min="16" step="256"> MB

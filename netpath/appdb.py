@@ -289,6 +289,7 @@ class AppDatabase(SqliteStore):
     SCHEMA = SCHEMA
     DEFAULTS = GLOBAL_DEFAULTS
     LABEL = "app.db"
+    OLDEST_TS_SQL = "SELECT MIN(ts) FROM audit"
 
     def _before_schema(self) -> None:
         # Neither backfill runs at open. On an install that predates app.db

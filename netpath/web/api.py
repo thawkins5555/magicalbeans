@@ -538,6 +538,10 @@ def _storage(service) -> dict:
               ("configrx", service.configrx_db), ("mapper", service.mapper_db))
     result = {f"{name}_path": db.path for name, db in stores}
     result.update({f"{name}_bytes": db.size_bytes() for name, db in stores})
+    # How far back each file still reaches, so a cap that has been trimming
+    # reads as lost history rather than only as a number of bytes. None for
+    # the two that keep no history (MIBs, maps) and for an empty store.
+    result.update({f"{name}_oldest_ts": db.oldest_ts() for name, db in stores})
     return result
 
 

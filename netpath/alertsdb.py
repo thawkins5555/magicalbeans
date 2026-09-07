@@ -876,6 +876,7 @@ class AlertsDatabase(SqliteStore):
     SCHEMA = SCHEMA + PENDING_SCHEMA
     DEFAULTS = DEFAULTS
     LABEL = "alerts"
+    OLDEST_TS_SQL = "SELECT MIN(opened_ts) FROM alerts"
 
     def _after_open(self) -> None:
         self._seed_templates()

@@ -83,6 +83,10 @@ class NodesSeriesDatabase(SqliteStore):
     SCHEMA = SCHEMA
     DEFAULTS: dict = {}
     LABEL = "nodes_series"
+    # The rollups reach furthest back; raw samples answer for the
+    # first hour of a fresh install, before any hour is summarised.
+    OLDEST_TS_SQL = ("SELECT MIN(ts) FROM (SELECT MIN(hour) AS ts FROM"
+                     " samples_hourly UNION ALL SELECT MIN(ts) FROM samples)")
 
     _CAP_MIN_SQLITE = (3, 25, 0)   # window functions
 
