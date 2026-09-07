@@ -30,6 +30,10 @@
     // LLDP/CDP neighbours for the selected device's own ports (Tier 1 #5's
     // UI half), fetched alongside the rest of loadDetail.
     neighbors: [],
+    // Every WEB tunnel this account has open, across all devices — a tunnel
+    // outlives the page that opened it, so the button's status line is drawn
+    // from what the server says is up, not from what this page did.
+    webRelays: [],
     discJobs: [],
     discSelected: null,
     discResults: [],
@@ -685,6 +689,13 @@
     view.ifaces = ifaces.interfaces;
     view.events = events;
     view.neighbors = neighbors.neighbors;
+    // On selection, not on every refresh tick: a tunnel changes when someone
+    // opens or closes one, not twice a second, and this is a whole extra
+    // round trip per device pane.
+    if (webRelaysFor !== view.selected) {
+      webRelaysFor = view.selected;
+      loadWebRelays();
+    }
     App.el('nd-detail-empty').hidden = true;
     App.el('nd-detail').hidden = false;
     drawDetailHeader();
@@ -702,18 +713,65 @@
     drawWebLink(view.detail);
   }
 
-  /* P1-4: the WEB button beside SSH, a plain link to the device's own web
-     UI rather than anything this app opens a socket for — IPv6 needs its
-     host bracketed in a URL, IPv4 does not. The URL is stashed on the
-     button (it's a <button>, not an <a>, so it matches SSH's styling) and
-     opened on click by the one-time wiring below. */
+  /* The WEB button beside SSH. Until 5.1 it stashed `http://<ip>/` on the
+     button and opened that, which only works from a machine with a route to
+     the management plane; it now opens a tunnel on this server (webDevice()
+     below), so there is no URL to stash — the button carries nothing but a
+     device selection, and the address it ends up at comes from the POST. */
   function drawWebLink(d) {
-    const link = App.el('nd-web-device');
-    if (!link) return;
-    const ip = d && d.ip;
-    if (!ip) { link.hidden = true; return; }
-    link.dataset.url = `http://${ip.includes(':') ? `[${ip}]` : ip}/`;
-    link.hidden = false;
+    const button = App.el('nd-web-device');
+    if (!button) return;
+    button.hidden = !(d && d.ip);
+    drawWebStatus();
+  }
+
+  /* "Tunnel: port N to 10.2.0.7:443 · Close" beside the button while one is
+     open for the selected device. Redrawn from `view.webRelays`, which
+     loadDetail refreshes on every device selection — a tunnel outlives the
+     page that opened it, so a reload has to find one that is already up. */
+  function drawWebStatus() {
+    const status = App.el('nd-web-status');
+    if (!status) return;
+    const relay = (view.webRelays || []).find((r) => r.device_id === view.selected);
+    status.innerHTML = '';
+    if (!relay) return;
+    const minutes = Math.max(1, Math.round((relay.expires_s || 900) / 60));
+    status.append(`Tunnel: port ${relay.port} → ${relay.device_ip}:${relay.device_port} · `);
+    const open = document.createElement('a');
+    open.href = relay.url;
+    open.target = `web-${relay.device_id}`;
+    open.textContent = 'reopen';
+    open.title = `Closes after ${minutes} minute(s) with no traffic`;
+    status.append(open, ' · ');
+    const close = document.createElement('button');
+    close.className = 'linkish';
+    close.textContent = 'Close';
+    close.onclick = () => closeWebRelay(relay.session_id);
+    status.append(close);
+  }
+
+  /* Which device `view.webRelays` was last fetched for, so the list is one
+     round trip per selection rather than one per refresh tick. */
+  let webRelaysFor = null;
+
+  async function loadWebRelays() {
+    if (!App.canWrite('web')) { view.webRelays = []; return; }
+    try {
+      view.webRelays = (await App.get('/api/web/relays')).relays || [];
+    } catch (error) {
+      view.webRelays = [];
+    }
+    drawWebStatus();
+  }
+
+  async function closeWebRelay(sessionId) {
+    try {
+      await App.del(`/api/web/relays/${sessionId}`, {});
+      App.toast('Tunnel closed', 'ok');
+    } catch (error) {
+      App.toast(`Could not close the tunnel: ${error.message}`, 'fail');
+    }
+    loadWebRelays();
   }
 
   /* Links from the device pane out to what the other modules know about
@@ -2900,6 +2958,22 @@
         switch, its site router. When the upstream goes down, alerts for
         everything behind it are folded into the upstream's own alert instead
         of arriving as a storm. Blank means nothing is in front of it.</p>
+      <!-- Its own fieldset, above OVERRIDES and outside it on purpose: these
+           two are never inherited from a polling profile, because where a
+           box's management page lives is a fact about that box. -->
+      <fieldset><legend>WEB INTERFACE</legend>
+        <label>Scheme <select id="nd-f-webscheme">
+          <option value="" ${!d.web_scheme ? 'selected' : ''}>http (default)</option>
+          <option value="http" ${d.web_scheme === 'http' ? 'selected' : ''}>http</option>
+          <option value="https" ${d.web_scheme === 'https' ? 'selected' : ''}>https</option>
+        </select></label>
+        <label>Port <input type="number" id="nd-f-webport" min="1" max="65535"
+          placeholder="80 for http, 443 for https"
+          value="${d.web_port == null ? '' : escape(String(d.web_port))}"></label>
+        <p class="hint">Where the WEB button's tunnel goes. Blank uses the
+          default port for the scheme. This is the only thing that decides the
+          destination — nothing the browser sends can change it.</p>
+      </fieldset>
       <fieldset><legend>OVERRIDES</legend>
         <p class="hint">Blank means inherit. Each field says what it would
           inherit from the polling profile above (and, for the ping fields,
@@ -3105,6 +3179,14 @@
     const upstream = box.querySelector('#nd-f-upstream');
     if (upstream) overrides.upstream_id = upstream.value === '' ? null
       : Number(upstream.value);
+    // Not overrides at all — per-device columns that inherit from nothing —
+    // but carried here because this is what both Add and Edit send, and a
+    // field only Edit could set would be a field Add silently dropped.
+    // Always sent, so blanking either one really does clear it.
+    const scheme = box.querySelector('#nd-f-webscheme');
+    if (scheme) overrides.web_scheme = scheme.value || null;
+    const webPort = box.querySelector('#nd-f-webport');
+    if (webPort) overrides.web_port = blankToNull(webPort.value);
     Object.assign(overrides, identityOidValues(box));
     return overrides;
   }
@@ -3897,6 +3979,37 @@
     }
   }
 
+  /* WEB: ask the server for a tunnel to this device's own web interface and
+     point a window at it.
+
+     The window is opened BEFORE the POST and its location set afterwards.
+     A `window.open` that runs after an `await` is no longer inside the click
+     that caused it, and every browser's popup blocker eats it — so the empty
+     window is claimed synchronously here and filled in when the answer
+     arrives, or closed again if the answer is a refusal. Named per device
+     like the SSH window, so a second click raises the tab that is already
+     open rather than opening a rival. */
+  async function webDevice() {
+    if (!view.detail || !App.canWrite('web')) return;
+    const d = view.detail;
+    const w = window.open('', `web-${d.id}`, 'width=1200,height=800');
+    if (w) w.opener = null;
+    try {
+      const relay = await App.post(`/api/web/devices/${d.id}/relay`, {});
+      if (w) {
+        w.location = relay.url;
+        w.focus();
+      }
+      const minutes = Math.max(1, Math.round((relay.expires_s || 900) / 60));
+      App.toast(`Tunnel open on port ${relay.port} for ${minutes} minute(s) `
+                + 'of idle time', 'ok');
+      loadWebRelays();
+    } catch (error) {
+      if (w) w.close();
+      App.toast(`Could not open a tunnel: ${error.message}`, 'fail');
+    }
+  }
+
   /* ------------------------------------------------------------ profiles */
 
   function drawProfilesTable() {
@@ -4259,6 +4372,42 @@
         back this device up", which is a much narrower thing than a shell,
         so it is not enough on its own — an administrator grants SSH write
         under Settings, per account.</p>`,
+    },
+    'nodes.device.web': {
+      title: 'WEB',
+      html: `
+        <p><b>WEB</b> opens the selected device's own web interface in a new
+        window. Until 5.1 it pointed the browser straight at the device,
+        which only works from a machine with a route to the management
+        plane. It now opens a short-lived <b>tunnel</b> on this server
+        instead: your browser talks to this machine, and this machine talks
+        to the device — the same reach the poller already has.</p>
+        <p><b>Where it goes.</b> The address, scheme and port come from the
+        device's own record — the <b>WEB INTERFACE</b> fields on Edit — and
+        from nowhere else. Blank means <code>http</code> on port 80. Nothing
+        the browser sends can change the destination.</p>
+        <p><b>How long it lasts.</b> The tunnel's port accepts connections
+        only from the address you are browsing from. It closes after 15
+        minutes with no traffic (or sooner, if your sign-in's idle timeout is
+        shorter), after a minute if nothing ever connects, when you sign out,
+        and the moment your <b>web</b> permission is taken away. <b>Close</b>
+        beside the button ends it at once.</p>
+        <p><b>What is recorded.</b> The device's event log gets one line when
+        a tunnel opens and one when it closes, with how many bytes crossed in
+        each direction — never what they were. The bytes are copied without
+        being read, which is also why a device on https keeps its own
+        certificate: your browser will name the device in the warning, not
+        this server.</p>
+        <p><b>Two things to expect.</b> A device page whose links are
+        absolute (<code>http://10.2.0.7/status</code>) will step outside the
+        tunnel when you follow one, because that address is the device's, not
+        this machine's. And the tunnel is on this host, so it shares the
+        browser's cookie jar with this application's own port — sign out of
+        the device's UI when you are done with it.</p>
+        <p><b>Who can use it.</b> Its own <b>web</b> permission, granted to
+        nobody by default and to no account on upgrade: opening a listening
+        port on this server into the management plane is not something the
+        old button could do, so nobody inherits it.</p>`,
     },
   });
 
@@ -5672,12 +5821,10 @@
     };
     App.el('nd-edit-device').onclick = editDevice;
     App.el('nd-ssh-device').onclick = sshDevice;
-    App.el('nd-web-device').onclick = (ev) => {
-      const url = ev.currentTarget.dataset.url;
-      if (url) window.open(url, '_blank', 'noopener');
-    };
+    App.el('nd-web-device').onclick = webDevice;
     // The "?" beside it, from the one helper that renders every help link.
     App.el('nd-ssh-help').innerHTML = App.helpLink('nodes.device.ssh');
+    App.el('nd-web-help').innerHTML = App.helpLink('nodes.device.web');
     App.el('nd-browse-oids').onclick = oidBrowser;
     /* A poll is handed to a worker thread, so the POST returning means
        "queued", not "done" — which is why this button used to look inert for

@@ -190,11 +190,16 @@
                  write means "may back this device up", far narrower than an
                  interactive shell. -->
             <button id="nd-ssh-device" data-requires-write="ssh">SSH</button>
-            <!-- Opens the device's own web UI in a new tab, set by nodes.js
-                 from the selected device's IP. No write gate: unlike SSH it
-                 opens nothing on this server. -->
-            <button id="nd-web-device" hidden>WEB</button>
+            <!-- Opens a short-lived tunnel from this host to the device's own
+                 web interface and points a new window at it. Its own `web`
+                 permission since 5.1: it opens a listening port here, which
+                 the plain link it replaced never did. -->
+            <button id="nd-web-device" data-requires-write="web" hidden>WEB</button>
             <span id="nd-ssh-help" data-requires-write="ssh"></span>
+            <span id="nd-web-help" data-requires-write="web"></span>
+            <!-- "Tunnel: port N … [Close]" while one is open for this device.
+                 Empty and out of the way otherwise. -->
+            <span id="nd-web-status" class="hint"></span>
           </div>
           <div id="nd-d-summary" class="nd-summary"></div>
           <!-- The status timeline has its own range picker: "how long has

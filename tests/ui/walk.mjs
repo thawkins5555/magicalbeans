@@ -719,22 +719,31 @@ async function checkDialog(page, dir, tag) {
 
   await closeAnything(page);
 
-  await check('the WEB button on a selected device points at http://<ip>/', async () => {
+  await check('the WEB button on a selected device is shown and gated on web', async () => {
     await selectTab(page, 'nodes');
     await settle(page, 900);
     await page.waitForSelector('#nodes-table tbody tr', { timeout: 20000 });
     await page.click('#nodes-table tbody tr:first-child');
     await sleep(500);
     const web = await page.evaluate(() => {
-      // A <button>, not an <a>: the target URL is stashed in a data
-      // attribute and opened on click (nodes.js drawWebLink/wiring), so it
-      // matches SSH's styling instead of looking like a link.
+      // No target URL to assert any more: since 5.1 the button opens a
+      // tunnel on the server (nodes.js webDevice) and learns where to point
+      // the window from the POST's answer, so the only thing the markup
+      // carries is which permission it needs.
       const el = document.getElementById('nd-web-device');
-      return { hidden: el ? el.hidden : true, url: el ? el.dataset.url : null };
+      return {
+        present: !!el,
+        hidden: el ? el.hidden : true,
+        requires: el ? el.getAttribute('data-requires-write') : null,
+        stale: el ? el.dataset.url || null : null,
+      };
     });
+    assert(web.present, 'the WEB button is gone from the device pane');
     assert(!web.hidden, 'the WEB button stayed hidden with a device selected');
-    assert(web.url && web.url.startsWith('http://'), `url was ${web.url}`);
-    return web.url;
+    assert(web.requires === 'web',
+      `WEB is gated on ${web.requires}, not the web permission`);
+    assert(web.stale === null, `the button still carries a stale url: ${web.stale}`);
+    return 'WEB shown, gated on web, no stashed URL';
   });
 
   await check('a discovery result for an already-added IP is not checkable', async () => {

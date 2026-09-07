@@ -427,9 +427,10 @@ body.tiny .brand span { display: none; }
 .badge-sfp { background: var(--muted); color: var(--bg); letter-spacing: 0.04em; }
 .conn { color: var(--dim); font: var(--fs-xs) var(--mono); padding-right: var(--space-xs); }
 .conn.user { color: var(--muted); }
-/* WEB, beside SSH on the device pane, is a real link — it opens the device's
-   own web interface in a tab — so it is an <a>, and this rule has to reach it
-   or it renders as browser-default blue underline beside a button. */
+/* Some of these are real links and some are buttons — the device pane's open
+   tunnel offers a "reopen" <a> and a "Close" <button> side by side — so the
+   rule has to reach both, or the anchor renders as browser-default blue
+   underline next to the button. */
 button.linkish, a.linkish {
   background: none;
   border: none;

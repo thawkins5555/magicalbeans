@@ -1247,6 +1247,45 @@ check("EMAIL SERVER" in _MINSEV_HELP,
       "and the ingest filter's own help points at the floor, so nobody sets "
       "the wrong one")
 
+
+# 40. The WEB relay (5.1.0). The button opens a tunnel on the server now, so
+#     the three things that used to be true of it are the three that must not
+#     come back: a URL stashed in the markup, no permission gate, and a
+#     window.open sitting after an await where a popup blocker eats it.
+_WEB_CLICK = NODES[NODES.index("  async function webDevice()"):
+                   NODES.index("  /* ------------------------------------------------------------ profiles */")]
+check("dataset.url" not in NODES,
+      "no device URL is stashed in the markup any more -- the destination "
+      "comes from the device row, server-side, and the button carries a "
+      "device selection and nothing else")
+check(_WEB_CLICK.index("window.open(") < _WEB_CLICK.index("await App.post("),
+      "the tunnel window is opened synchronously inside the click and its "
+      "location set once the POST answers; a window.open after an await is "
+      "no longer user-initiated and every popup blocker eats it")
+check("w.opener = null" in _WEB_CLICK,
+      "and its opener is cleared, since `noopener` in the feature string "
+      "would discard the per-device window name")
+check("if (w) w.close();" in _WEB_CLICK,
+      "a refused tunnel closes the window it claimed rather than leaving a "
+      "blank one on screen")
+check('data-requires-write="web"' in INDEX,
+      "the WEB button is gated on the web permission in the markup")
+check("canWrite('web')" in NODES,
+      "and in the handler, so a page that missed applyPermissions still "
+      "cannot POST a relay open")
+check("'#nd-f-webscheme'" in NODES and "'#nd-f-webport'" in NODES,
+      "deviceOverrides carries the two WEB INTERFACE fields, so Add sets "
+      "them as well as Edit")
+check("web: 'Web'" in APP,
+      "MODULE_NAMES names the web module, or a write refusal on it reads as "
+      "'Your account can read web but not change it'")
+check("'admin', 'ssh', 'web'" in SETTINGS,
+      "the viewer role preset grants no web, which has no read tier to give")
+check("set-web-relay-range" in INDEX and "web_relay_port_range" in SETTINGS,
+      "the relay port range is an administrator-only Settings field, saved "
+      "the way every other Apply field is")
+
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))
