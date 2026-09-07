@@ -268,16 +268,46 @@ forever. `db.py`'s `Database` overrides `_trim_size` to `live_size_bytes()`
 still inside the retention window) and `_trim_delete` to remove a trace's
 hops before the trace row itself; `syslogdb.py` routes `_trim_delete`
 through its own FTS-aware `_delete_logs()` so the search index and the
-message rows never disagree; `nodesdb.py` and `alertsdb.py` keep their own
+message rows never disagree; `nodesdb.py`, `nodesseriesdb.py` and `alertsdb.py` keep their own
 `trim_to_size()` entirely, since each spans several tables rather than one
-dominant one. `Service.run_maintenance()` (`web/service.py`) calls
+dominant one. `nodesseriesdb.trim_to_size` runs in two stages: raw
+`samples` oldest-first down to a 5,000-row floor, then — only once that
+floor is reached and the file is still over cap — `samples_hourly`
+oldest-first by `hour` down to a day of rollups per metric, one `reclaim()`
+per outer pass and a `shrank` flag that ends the loop when neither table
+will give anything up. Deleting by `hour` ascending is what keeps stage two
+clear of the two-hour redo window `compact_rollup` rewrites. Before 5.1.0
+there was no stage two, so a file whose bulk was rollups sat over its cap
+for good. `Service.run_maintenance()` (`web/service.py`) calls
 `Service._trim_db()` for each of the eight databases that has a
 `max_*_db_mb` setting (netpath, flow, syslog, snmp, ipam, nodes,
 nodes_series, alerts — not `app.db`, `wireless.db`, `configrx.db`,
 `mapper.db` or `nodes_mibs.db`, none of which has a size cap), plus the
 day-based retention prunes for each module,
 `AppDatabase.prune_hostnames()` for the reverse-DNS cache and
-`AppDatabase.prune_asn_cache()` for the ASN/owner cache. `nodes.db`'s own
+`AppDatabase.prune_asn_cache()` for the ASN/owner cache.
+
+Every pass runs on one thread, `netpath-maintenance`. The periodic tick
+waits on `_maintenance_request` (not on a bare sleep) for 60 s at a time
+and runs the sweep at most every `MAINTENANCE_INTERVAL_S`;
+`Service.request_maintenance()` sets that event, so a caller wanting a
+forced pass wakes the thread and returns. `apply_global_settings` is that
+caller: until 5.1.0 it ran the whole thirteen-store sweep inline on the
+HTTP thread, which is what made Apply on Settings take as long as the sweep
+did. A forced pass still gets the shorter `FORCED_PRUNE_BUDGET_S` for
+`netpath.db`, so a burst of saves cannot keep the thread on one backlog.
+`shutdown()` sets `_stop` **and** `_maintenance_request` (or the join would
+wait out the tick), `_run_maintenance_body` checks `_stopping()` between
+stages, and the close sequence then runs under `_maintenance_lock`, so no
+store is closed under a sweep still using it.
+
+`SqliteStore.oldest_ts()` runs one `OLDEST_TS_SQL` per store — `traces`,
+`flows`, `logs`, `traps`, `scans`, both node event logs, the metric history
+(rollups, falling back to raw samples), `alerts`, `ap_events`, `backups`,
+`audit` — and is None for `nodes_mibs.db` and `mapper.db`, which hold state
+rather than history. `api._storage` carries it as `{name}_oldest_ts` beside
+`{name}_path` and `{name}_bytes` on the same 10-second cached poll, so
+Settings and the console can say how far back a capped file still reaches. `nodes.db`'s own
 retention prune now covers `vlans`/`vlan_ports`/`port_vlans` too
 (`prune_vlans`/`prune_vlan_ports`/`prune_port_vlans`, called from
 `run_maintenance` on the same `mac_table_retention_days` clock as
@@ -380,7 +410,8 @@ after.
 `nodes.db` itself is now almost static, so its `trim_to_size` trims the
 oldest 15% of `device_events`/`interface_events` (floor 5,000 each) — the
 only unbounded tables it has left — while `max_nodes_series_db_mb` (default
-1024) caps the metric history. `nodes_mibs.db` is deliberately uncapped: a
+1024) caps the metric history, raw samples first and then the oldest hourly
+rollups. `nodes_mibs.db` is deliberately uncapped: a
 MIB is not history, and trimming it would silently stop traps decoding.
 
 ---

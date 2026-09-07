@@ -2756,7 +2756,24 @@ trims those; the day-based retention settings on the IPAM Settings
 dialog are. Nodes and Alerts follow the identical split: devices,
 polling profiles, interfaces and MIB objects describe the network as it
 is configured now and are never trimmed by a cap, only samples/events
-(Nodes) and resolved alerts/notifications (Alerts) are.
+(Nodes) and resolved alerts/notifications (Alerts) are. For the Nodes
+metric history the cap takes the raw samples first and then, once those are
+at their floor, the oldest hourly rollups — so a cap set low enough
+shortens how far back a wide chart reaches, whatever the rollup retention
+setting says.
+
+Each data file also says **how far back it still reaches** — "oldest record
+14.0d ago", or "no history" for a file nothing has written to yet — beside
+its path, which is what tells you whether a cap has been costing you
+history rather than merely sitting there. The MIB and map files hold
+current state rather than a log and so report no age at all. The same
+figure appears on the desktop console's Databases card.
+
+**Apply** on this tab saves and returns immediately. The retention sweep it
+asks for — pruning and trimming thirteen databases — runs on the
+maintenance thread afterwards rather than while the browser waits, which is
+why the status line says the sweep is running in the background. Nothing is
+skipped: the same forced pass runs, just not on the request.
 
 Nothing needs a restart: both thread pools resize live and the collector
 rebinds its socket.
