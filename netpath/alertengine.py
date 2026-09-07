@@ -1353,7 +1353,17 @@ class AlertEngine(Worker):
                         # against.
                         "threshold": str(threshold),
                     }
-                    if entity_kind == "interface":
+                    if result == "breach" and sample_ts is not None and sample_ts == previous_ts:
+                        # Nothing new and already open: no label, no read.
+                        if open_keys is None:
+                            open_keys = self.db.open_dedup_keys()
+                        probe = Occurrence(
+                            kind="threshold", source_kind=rule["source_kind"],
+                            entity_kind=entity_kind, entity_id=entity_id,
+                            entity_label="", ts=0.0, message="")
+                        if dedup_key(rule, probe) in open_keys:
+                            continue
+                    if entity_kind == "interface" and result == "breach":
                         if interfaces is None:
                             # One read per device per tick, and only for a
                             # device with a per-port target that has something

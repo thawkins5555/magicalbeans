@@ -4147,7 +4147,10 @@ class NodePoller(Worker):
                        for row in interfaces
                        if row["if_index"] not in optic_ports
                        and ("media" in row.keys() and row["media"] == "optic")]
-        self.db.update_interface_media(device_id, media_rows)
+        # An empty port map is a timed-out ENTITY-MIB walk, not a chassis
+        # with no ports; keep the badges until a walk answers.
+        if port_map:
+            self.db.update_interface_media(device_id, media_rows)
 
     # BRIDGE-MIB (RFC 4188) columns used by read_mac_table() to map the
     # forwarding-database entries learned on a switch port back to the

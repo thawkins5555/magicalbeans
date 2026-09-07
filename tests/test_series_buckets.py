@@ -443,6 +443,40 @@ print(f"PASS: an unreachable cap stops at the rollup floor ({floor_left} rows le
 
 stage2_db.close()
 
+# Stage two waits for stage one: while raw samples are still above their
+# floor, a cap that raw alone can satisfy must not cost an hour of history.
+mixed_db = NodesDatabase(os.path.join(TMPDIR, "mixed.db"))
+mixed = mixed_db.series_db
+mixed_device = mixed_db.add_device("127.0.0.7", name="mixed",
+                                   group_id=mixed_db.ensure_default_group())
+for j in range(METRICS):
+    mixed_db.record_metric_samples(
+        mixed_device,
+        [(f"mix.{j}", "mix", "u", "gauge", float(top_hour - t * 60), float(t))
+         for t in range(1500)])
+with mixed._lock:
+    ids = [row["id"] for row in mixed._conn.execute("SELECT id FROM metrics")]
+    mixed._conn.executemany(
+        "INSERT INTO samples_hourly(metric_id, hour, n, vmin, vavg, vmax)"
+        " VALUES (?,?,60,0.0,1.0,2.0)",
+        [(i, top_hour - h * 3600) for i in ids for h in range(400)])
+    mixed._conn.commit()
+    mixed._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    mixed_hourly = mixed._conn.execute(
+        "SELECT COUNT(*) AS n FROM samples_hourly").fetchone()["n"]
+    mixed_raw = mixed._conn.execute("SELECT COUNT(*) AS n FROM samples").fetchone()["n"]
+assert mixed_raw > 5000, mixed_raw
+mixed_bytes = mixed.size_bytes()
+mixed.trim_to_size(int(mixed_bytes * 0.9))
+with mixed._lock:
+    hourly_kept = mixed._conn.execute(
+        "SELECT COUNT(*) AS n FROM samples_hourly").fetchone()["n"]
+    raw_kept = mixed._conn.execute("SELECT COUNT(*) AS n FROM samples").fetchone()["n"]
+assert raw_kept < mixed_raw, (mixed_raw, raw_kept)
+assert hourly_kept == mixed_hourly, (mixed_hourly, hourly_kept)
+print("PASS: with raw samples above the floor, a modest cap costs no rollups")
+mixed_db.close()
+
 nodes_db.close()
 # --- starting the application must not wait for a whole-file rewrite
 # 4.39 moved every database to incremental auto-vacuum. Converting an

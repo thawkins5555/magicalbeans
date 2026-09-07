@@ -48,7 +48,7 @@ VOLATILE: dict[str, tuple[re.Pattern, ...]] = {
         re.compile(r"^## Last changed:"),
     ),
     "mikrotik": (
-        re.compile(r"^# \w{3}/\d\d/\d{4} \d\d:\d\d:\d\d by RouterOS"),
+        re.compile(r"^# (?:\w{3}/\d\d/\d{4}|\d{4}-\d\d-\d\d) \d\d:\d\d:\d\d by RouterOS"),
     ),
     "hp": (
         re.compile(r"^; Last configuration change"),

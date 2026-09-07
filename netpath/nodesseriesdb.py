@@ -529,6 +529,8 @@ class NodesSeriesDatabase(SqliteStore):
                     removed += cursor.rowcount or 0
                     shrank = shrank or bool(cursor.rowcount)
                     self._conn.commit()
+                if shrank:
+                    break   # the rollups give only once the raw floor is reached
             reclaim(self._conn, self._lock, label=self.LABEL)
             # Neither table can give anything up, so another pass would only
             # measure the file again and reclaim what is already reclaimed.

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import secrets
 import socket
 import sys
@@ -130,6 +131,9 @@ def relay_bind_host(web_host: str) -> str:
     return "0.0.0.0" if host in ("", "*") else host
 
 
+_HOST_CHARS = re.compile(r"^[A-Za-z0-9.\-\[\]:]+$")
+
+
 def url_host(host_header: str, fallback: str) -> str:
     """The host part of a `Host:` header, without its port.
 
@@ -139,7 +143,7 @@ def url_host(host_header: str, fallback: str) -> str:
     what a URL wants.
     """
     host = str(host_header or "").strip()
-    if not host:
+    if not host or not _HOST_CHARS.match(host):
         return fallback
     if host.startswith("["):
         end = host.find("]")
@@ -156,6 +160,13 @@ def device_web_target(row) -> tuple[str, str, int]:
         scheme = "http"
     port = row["web_port"] if "web_port" in keys else None
     return row["ip"], scheme, int(port) if port else DEFAULT_WEB_PORTS[scheme]
+
+
+def _close_quietly(sock: socket.socket) -> None:
+    try:
+        sock.close()
+    except OSError:
+        pass
 
 
 def _listen(host: str, port: int) -> socket.socket:
@@ -471,6 +482,8 @@ class WebRelaySession:
             up.start()
             self._pump(device, client, False)
             up.join(timeout=CONNECT_TIMEOUT_S)
+            client.close()   # bounded either way: the up-pump's recv ends here
+            up.join(timeout=CONNECT_TIMEOUT_S)
         except OSError:
             # A device that will not answer is reported by the browser as a
             # failed page load, which is what it is; nothing here can render
@@ -509,6 +522,10 @@ class WebRelaySession:
             dst.shutdown(socket.SHUT_WR)
         except OSError:
             pass
+        if to_device:
+            # The browser hung up; a device that ignores half-close would
+            # otherwise hold this connection's slot until the idle timeout.
+            threading.Timer(CONNECT_TIMEOUT_S, lambda: _close_quietly(dst)).start()
 
     def _note_traffic(self, count: int, to_device: bool) -> None:
         now = time.time()

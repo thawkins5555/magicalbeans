@@ -386,8 +386,11 @@ class SqliteStore:
         number of bytes."""
         if not self.OLDEST_TS_SQL:
             return None
-        with self._lock:
-            row = self._conn.execute(self.OLDEST_TS_SQL).fetchone()
+        try:
+            with self._lock:
+                row = self._conn.execute(self.OLDEST_TS_SQL).fetchone()
+        except sqlite3.ProgrammingError:
+            return None
         value = row[0] if row else None
         return None if value is None else float(value)
 

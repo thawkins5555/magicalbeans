@@ -172,7 +172,7 @@ class Database(SqliteStore):
     DEFAULTS = APP_DEFAULTS
     LABEL = "netpath.db"
     TRIM_TABLE = "traces"
-    OLDEST_TS_SQL = "SELECT MIN(started_ts) FROM traces"
+    OLDEST_TS_SQL = "SELECT started_ts FROM traces ORDER BY id LIMIT 1"
     TRIM_FLOOR = 200
 
     def __init__(self, path: str):

@@ -908,7 +908,7 @@ class Service:
                 import traceback
                 traceback.print_exc()
             finally:
-                if requested:
+                if requested and not self._maintenance_request.is_set():
                     self._maintenance_done.set()
 
     def request_maintenance(self) -> None:
