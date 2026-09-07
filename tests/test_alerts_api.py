@@ -220,6 +220,58 @@ try:
           devices.get(switch, {}).get("muted_until") is None,
           devices.get(switch, {}).get("muted_until"))
 
+    # ---------------------------- 4b. a per-port threshold alert on the wire
+
+    port_alert = raise_alert(
+        "if_in_util_high", "interface", f"{switch}:7",
+        "Access Switch / GigabitEthernet0/7 (uplink)",
+        "Access Switch / GigabitEthernet0/7 (uplink): Interface inbound "
+        "utilization high (97.0 %)")
+    rows = alerts_by_id(admin)
+    check("a per-port threshold alert names the port in its label and "
+          "resolves to the switch",
+          rows[port_alert]["entity_kind"] == "interface"
+          and rows[port_alert]["device_id"] == switch
+          and "GigabitEthernet0/7 (uplink)" in rows[port_alert]["entity_label"],
+          rows.get(port_alert))
+
+    # ------------------------------------------- 4c. the comparison direction
+
+    status, payload = call("GET", "/api/alerts/rules", token=admin)
+    by_key = {r["key"]: r for r in payload.get("rules", [])} if status == 200 else {}
+    check("every rule reports a comparison, defaulting to 'above'",
+          by_key.get("cpu_high", {}).get("comparison") == "above",
+          by_key.get("cpu_high"))
+    check("...and the shipped optic power rules report 'below'",
+          by_key.get("sfp_rx_power_low", {}).get("comparison") == "below",
+          by_key.get("sfp_rx_power_low"))
+
+    cpu_id = by_key["cpu_high"]["id"]
+    status, payload = call("PUT", f"/api/alerts/rules/{cpu_id}",
+                           {"comparison": "below", "threshold": 10.0,
+                            "clear_threshold": 20.0}, token=admin)
+    check("a rule can be flipped to 'below' with its numbers the right way "
+          "round", status == 200, (status, payload))
+    status, payload = call("GET", "/api/alerts/rules", token=admin)
+    flipped = {r["key"]: r for r in payload.get("rules", [])}["cpu_high"]
+    check("...and it round-trips",
+          (flipped["comparison"], flipped["threshold"],
+           flipped["clear_threshold"]) == ("below", 10.0, 20.0), flipped)
+
+    status, payload = call("PUT", f"/api/alerts/rules/{cpu_id}",
+                           {"comparison": "below", "threshold": 20.0,
+                            "clear_threshold": 10.0}, token=admin)
+    check("a clear on the wrong side of a 'below' threshold is a 400",
+          status == 400, (status, payload))
+
+    status, payload = call("PUT", f"/api/alerts/rules/{cpu_id}",
+                           {"comparison": "sideways"}, token=admin)
+    check("an unrecognised comparison is a 400", status == 400, (status, payload))
+
+    call("PUT", f"/api/alerts/rules/{cpu_id}",
+         {"comparison": "above", "threshold": 90.0, "clear_threshold": 80.0},
+         token=admin)
+
     # ------------------------------- 5. a device that is gone is not muteable
 
     ghost = service.nodes_db.add_device("192.0.2.21", name="Removed Switch",

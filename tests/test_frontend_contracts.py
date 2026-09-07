@@ -1220,6 +1220,33 @@ check("ntp clock-period" in _CX_SETTINGS,
       "redundant pattern")
 
 
+
+# ---------------------------------------------------------------------------
+# 39. ALERTS (5.1.0): the rule comparison direction and the email severity
+#     floor. Both are settings whose whole value is that they reach the
+#     server: a select the save map never reads is a control that silently
+#     does nothing, which is the failure this file exists to catch.
+_ALERTS_JS = read("alerts.js")
+check("id=\"ar-comparison\"" in _ALERTS_JS,
+      "the rule editor offers the comparison direction, or a 'below' rule "
+      "can only be made by hand in the database")
+check("values.comparison = box.querySelector('#ar-comparison').value;" in _ALERTS_JS,
+      "and the Save handler actually sends it")
+check("id=\"as-notify-minsev\"" in _ALERTS_JS,
+      "the alerts settings dialog offers the email severity floor")
+check("notify_min_severity: Number(box.querySelector('#as-notify-minsev').value)"
+      in _ALERTS_JS,
+      "and it is saved under the key the engine reads, not beside it")
+check("'alerts.settings.notifyminsev'" in _ALERTS_JS
+      and "App.helpLink('alerts.settings.notifyminsev')" in _ALERTS_JS,
+      "the floor's help entry is both registered and linked -- the ingest "
+      "filter and the email floor are one word apart and read as each other")
+_MINSEV_HELP = _ALERTS_JS[_ALERTS_JS.index("'alerts.settings.minsev'"):
+                          _ALERTS_JS.index("'alerts.settings.notifyminsev'")]
+check("EMAIL SERVER" in _MINSEV_HELP,
+      "and the ingest filter's own help points at the floor, so nobody sets "
+      "the wrong one")
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))
