@@ -1034,6 +1034,81 @@ check("if (view.nodeDrag) view.nodeDrag = null;" in _LOAD_MAP_DATA,
       "a payload that does land mid-drag (an explicit reload) ends the drag "
       "rather than dropping nodes at coordinates from the payload it replaced")
 
+# ---------------------------------------------------------------------------
+# 35. MAPPER (5.0.1): what the browser walk of the module turned up after the
+#     click-moves-node fix landed. Four separate defects, each one a control
+#     that did nothing or did something else.
+#
+# 35a. Export PNG could only ever fail. It serialises the live <svg>, wraps
+#      it in a Blob and loads that through an Image() before drawing it to a
+#      canvas — and the page's own Content-Security-Policy had no img-src, so
+#      `default-src 'self'` refused the blob: URL, img.onerror fired and the
+#      button's whole visible effect was the toast "Could not render the map
+#      to PNG". This is a Python file rather than a shipped static one, but
+#      the rule is about the front end: the header is what makes an export
+#      the operator can actually run.
+_SERVER = os.path.join(REPO_ROOT, "netpath", "web", "server.py")
+with open(_SERVER, encoding="utf-8") as _handle:
+    SERVER_PY = _handle.read()
+check("img-src 'self' blob:" in SERVER_PY,
+      "the CSP allows the blob: image MAPPER's Export PNG loads; without an "
+      "img-src of its own, default-src 'self' refused it and the button could "
+      "only toast a failure")
+MAPPER_JS = read("mapper.js")
+check("const img = new Image();" in MAPPER_JS and "URL.createObjectURL(svgBlob)" in MAPPER_JS,
+      "and Export PNG is still the blob-through-an-Image render that header is "
+      "there for")
+
+# 35b. The SELECTION pane is rebuilt from innerHTML on every draw, and the
+#      module's own auto-refresh redraws it on its own clock — so a tick
+#      landing while the operator was typing a new node name emptied the box
+#      mid-word, and Save then wrote the markup's value instead of theirs.
+_DETAIL = MAPPER_JS[MAPPER_JS.index("  function drawDetail()"):
+                    MAPPER_JS.index("  function renderDetail()")]
+check("document.activeElement" in _DETAIL and "detail.contains(active)" in _DETAIL,
+      "drawDetail notices when the field being rebuilt is the one the operator "
+      "is in")
+check("again.value = editing.value" in _DETAIL
+      and "again.setSelectionRange(" in _DETAIL
+      and "again.focus(" in _DETAIL,
+      "and puts their text, their caret and the focus back after the rebuild")
+check("  function renderDetail()" in MAPPER_JS
+      and "renderDetail();" in _DETAIL,
+      "the rebuild itself is renderDetail, called once through that wrapper, so "
+      "no caller can skip the restore")
+
+# 35c. Every press on the map calls preventDefault (the drag, the pan and the
+#      rubber band all need it), which suppresses the focus the browser would
+#      have moved to the canvas. Focus therefore stayed on whatever was last
+#      clicked, and the arrow-key pan and +/- zoom that #mp-canvas's own
+#      aria-label advertises did nothing at all after a click on the map.
+check("function focusCanvas()" in MAPPER_JS,
+      "a press on the map moves focus to #mp-canvas itself")
+check(MAPPER_JS.count("focusCanvas();") == 3,
+      "all three presses that preventDefault — a node, a pan and a rubber band "
+      "— focus the canvas, so the keyboard controls its aria-label promises are "
+      "live straight after a click")
+check("canvas.focus({ preventScroll: true })" in MAPPER_JS,
+      "and it does not scroll the page to the canvas that is already under the "
+      "pointer")
+
+# 35d. Space is the pan modifier, but it is also how a keyboard activates a
+#      focused button — and the browser fires that activation on the key UP,
+#      after a whole pan gesture has been drawn. Panning with a toolbar button
+#      still focused pressed it again on release: Fit threw away the pan just
+#      made, Remove re-opened its destructive confirm.
+check("const SPACE_ACTIVATES" in MAPPER_JS,
+      "the controls Space activates are named in one place")
+_SPACE = MAPPER_JS[MAPPER_JS.index("  function wireSpaceModifier()"):
+                   MAPPER_JS.index("  /* --------------------------------------------------------- align tools */")]
+check("closest(SPACE_ACTIVATES)" in _SPACE,
+      "the pan modifier stands aside when the focus is on something Space would "
+      "press, so Space either pans or presses — never both")
+check("'INPUT'" in _SPACE and "'TEXTAREA'" in _SPACE and "'SELECT'" in _SPACE,
+      "and it still stands aside for a text field, which is the case it already "
+      "handled")
+
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

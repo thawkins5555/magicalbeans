@@ -1256,12 +1256,34 @@
     drawDetail();
   }
 
+  /* This pane is rebuilt from innerHTML on every draw, and MAPPER's own
+     auto-refresh redraws it on its own clock: an operator part-way through
+     typing a new node name had the box emptied under them mid-word, and Save
+     then wrote whatever the fresh markup carried instead of what they typed.
+     A field they are actually in is put back exactly as they left it — their
+     text, their caret, and the focus — around the rebuild. */
   function drawDetail() {
+    const detail = App.el('mp-detail');
+    const active = document.activeElement;
+    const editing = active && active.id && detail.contains(active)
+      && typeof active.selectionStart === 'number'
+      ? { id: active.id, value: active.value, start: active.selectionStart, end: active.selectionEnd }
+      : null;
+    renderDetail();
+    if (!editing) return;
+    const again = detail.querySelector(`#${CSS.escape(editing.id)}`);
+    if (!again || again.disabled) return;
+    again.value = editing.value;
+    again.focus({ preventScroll: true });
+    again.setSelectionRange(editing.start, editing.end);
+  }
+
+  function renderDetail() {
     const nameEl = App.el('mp-detail-name');
     const detail = App.el('mp-detail');
     if (view.selectedLinkId) {
       const link = linkById(view.selectedLinkId);
-      if (!link) { view.selectedLinkId = null; return drawDetail(); }
+      if (!link) { view.selectedLinkId = null; return renderDetail(); }
       nameEl.textContent = 'LINK';
       detail.innerHTML = linkDetailHtml(link);
       const showAll = detail.querySelector('[data-show-all-vlans]');
@@ -1270,7 +1292,7 @@
     }
     if (view.selection.size === 1) {
       const node = nodeById([...view.selection][0]);
-      if (!node) { view.selection.clear(); return drawDetail(); }
+      if (!node) { view.selection.clear(); return renderDetail(); }
       nameEl.textContent = 'DEVICE';
       detail.innerHTML = nodeDetailHtml(node);
       const removeBtn = detail.querySelector('[data-remove-node]');
@@ -1324,7 +1346,7 @@
   // The "manual override" half of role auto-detection: whatever the
   // server sent (auto-detected or previously overridden), an operator can
   // always pick a different role from the same fixed list mapperdb.ROLES
-  // enforces server side. Wired in drawDetail(), which is the one place
+  // enforces server side. Wired in renderDetail(), which is the one place
   // that owns this pane's innerHTML and so the one place that can safely
   // attach a listener to whatever it just wrote.
   function roleSelectHtml(node) {
@@ -1348,7 +1370,7 @@
   // .../nodes accepts it, get_mapper_map resolves it into `name`, the CSV
   // export reads that same `name`) since renaming shipped, but nothing in
   // this file ever let an operator type one in — the only way to rename a
-  // node was a direct API call. Wired in drawDetail() alongside the role
+  // node was a direct API call. Wired in renderDetail() alongside the role
   // select, the one place that owns this pane's innerHTML. A blank box
   // clears the override and falls back to `resolved_name` (its placeholder,
   // so the box shows what it will read as even while empty) — server-side
@@ -1466,10 +1488,25 @@
     return { x: (px - tx) / view.zoom, y: (py - ty) / view.zoom };
   }
 
+  /* Every press on the map calls this because every one of them calls
+     preventDefault (the drag, the pan and the rubber band all need it), and
+     preventDefault on a pointerdown suppresses the focus the browser would
+     otherwise have moved here. Without it a click on the map left focus on
+     whatever was last Tabbed to or clicked — usually a toolbar button — so
+     the arrow-key pan and the +/- zoom #mp-canvas's own aria-label advertises
+     did nothing at all until the operator Tabbed back to the canvas. */
+  function focusCanvas() {
+    const canvas = App.el('mp-canvas');
+    // preventScroll: the canvas is already the thing under the pointer, and
+    // scrolling the page to it would move the map out from under the gesture.
+    if (canvas && document.activeElement !== canvas) canvas.focus({ preventScroll: true });
+  }
+
   function onNodePointerDown(event, node) {
     if (event.button !== 0 || !event.isPrimary || view.spaceHeld) return;
     event.preventDefault();
     event.stopPropagation();
+    focusCanvas();
     // Captured ONCE, into the closures below. `event.currentTarget` is null
     // the moment dispatch of this pointerdown finishes (the DOM spec sets it
     // per dispatch), so the listeners this function leaves behind — which run
@@ -1590,6 +1627,7 @@
     if (event.button === 1 || (event.button === 0 && view.spaceHeld)) {
       // Pan: middle button, or left button with space held.
       event.preventDefault();
+      focusCanvas();
       event.currentTarget.setPointerCapture(event.pointerId);
       view.panDrag = { x: event.clientX, y: event.clientY, pan: { ...view.pan } };
       view.dragMoved = false;
@@ -1606,6 +1644,7 @@
     const p = scenePoint(event);
     if (!p) return;
     event.preventDefault();
+    focusCanvas();
     event.currentTarget.setPointerCapture(event.pointerId);
     view.rubber = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, additive: event.shiftKey };
   }
@@ -1690,15 +1729,26 @@
     else if (event.key === '-') { event.preventDefault(); zoomBy(1 / 1.2); }
   }
 
+  // What Space activates when one of these has focus. A browser fires that
+  // activation on the key UP — after a whole pan gesture has been drawn — so
+  // panning with a toolbar button still focused pressed it again on release:
+  // Fit threw away the pan just made, Remove re-opened its confirm dialog.
+  // Space belongs to whatever has focus; it pans only when nothing that Space
+  // would press does.
+  const SPACE_ACTIVATES = 'button, a[href], summary, [role="button"], [contenteditable]';
+
   // Space held down pans on a left-button drag, the same modifier a paint
-  // program uses — scoped to when MAPPER is the visible tab and no dialog
-  // and no text field has the keyboard, so it never eats a space typed
-  // into a search box on another page or inside this one's own dialogs.
+  // program uses — scoped to when MAPPER is the visible tab and no dialog,
+  // no text field and nothing Space would press has the keyboard, so it never
+  // eats a space typed into a search box on another page or inside this one's
+  // own dialogs, nor a keyboard user's press of the button they focused.
   function wireSpaceModifier() {
     window.addEventListener('keydown', (event) => {
       if (event.code !== 'Space' || App.state.tab !== 'mapper') return;
-      const tag = (event.target && event.target.tagName) || '';
+      const target = event.target;
+      const tag = (target && target.tagName) || '';
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (target && target.closest && target.closest(SPACE_ACTIVATES)) return;
       if (!App.el('modal').hidden) return;
       view.spaceHeld = true;
     });

@@ -783,9 +783,17 @@ class Handler(BaseHTTPRequestHandler):
         # markup posting an operator's typing off-site, and `base-uri 'none'`
         # stops an injected <base> repointing every relative URL. Inline
         # styles stay allowed for the terminal emulator's own <style>.
+        # `img-src 'self' blob:` is what MAPPER's Export PNG needs: it renders
+        # the map by serialising the live <svg>, wrapping it in a Blob and
+        # loading that through an Image() before drawing it to a canvas. A
+        # blob: URL is not 'self', so under the bare default-src the browser
+        # refused the image, img.onerror fired and the button could only ever
+        # toast "Could not render the map to PNG". Nothing widens beyond it:
+        # a blob: URL can only be minted by same-origin script in this page.
         self.send_header("Content-Security-Policy",
                          "default-src 'self'; style-src 'self' 'unsafe-inline';"
-                         " connect-src 'self'; frame-ancestors 'none';"
+                         " img-src 'self' blob:; connect-src 'self';"
+                         " frame-ancestors 'none';"
                          " base-uri 'none'; form-action 'self'")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
