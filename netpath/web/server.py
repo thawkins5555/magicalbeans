@@ -218,6 +218,7 @@ ROUTES = [
     ("DELETE", r"^/api/users$", api.delete_user, ("admin", W)),
     ("POST", r"^/api/users/permissions$", api.post_user_permissions, ("admin", W)),
     ("POST", r"^/api/password$", api.post_password, _password_requirement),
+    ("PUT", r"^/api/account/theme$", api.put_account_theme, None),
     # An API token is a service-account credential, not a person's:
     # issuing or revoking one is as administrative an act as creating or
     # deleting the account it authenticates as, so it sits behind the same

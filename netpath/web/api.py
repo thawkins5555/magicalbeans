@@ -430,6 +430,7 @@ def get_state(service, params, body) -> dict:
                 max(0, round(idle_remaining)) if idle_remaining is not None else None,
             "max_seconds_remaining":
                 max(0, round(max_remaining)) if max_remaining is not None else None,
+            "theme": account["theme"] if account and account["theme"] in THEMES else "",
         },
         "uptime_s": time.time() - service.started_at,
         "collector": {
@@ -7271,6 +7272,12 @@ def _first_run(service) -> bool:
     return bool(row is not None and row["must_change"] and row["last_login"] is None)
 
 
+# Mirrors app.js's own THEMES list (and boot.js's copy of it) exactly: a
+# theme this tuple rejects would be stored by neither end and silently
+# revert to dark, so the three must agree or a saved theme stops applying.
+THEMES = ("dark", "light", "contrast", "midnight", "nord", "solarized", "slate")
+
+
 def get_session(service, params, body) -> dict:
     # The version goes to the sign-in page as well as to a signed-in one:
     # it is the first thing asked for when someone reports a problem. Not a
@@ -7290,6 +7297,7 @@ def get_session(service, params, body) -> dict:
         "must_change": bool(row["must_change"]) if row else False,
         "idle_timeout_minutes": service.sessions.idle_seconds // 60,
         "idle_seconds_remaining": max(0, round(idle_remaining)),
+        "theme": (row["theme"] or "") if row and row["theme"] in THEMES else "",
     }
 
 
@@ -7490,6 +7498,20 @@ def post_password(service, params, body) -> dict:
     _audit(service, params, "password.reset" if resetting else "password.change",
            target=target, detail=f"{ended} session(s) ended")
     return {"username": target, "sessions_ended": ended, "reset": resetting}
+
+
+def put_account_theme(service, params, body) -> dict:
+    """Save the caller's own theme choice to their account, so it follows
+    them to any browser that signs in as them (get_session/get_state hand
+    it back on the next load). Own account only, no module grant — same
+    reasoning as post_password's self-service half."""
+    me = params.get("_username", "")
+    theme = str(body.get("theme", ""))
+    if theme not in THEMES:
+        raise ValueError(f"Unknown theme: {theme}")
+    service.app_db.set_user_theme(me, theme)
+    _audit(service, params, "account.theme", target=me, detail=f"theme: {theme}")
+    return {"theme": theme}
 
 
 # ------------------------------------------------------------- API tokens

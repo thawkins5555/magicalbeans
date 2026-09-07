@@ -26,6 +26,11 @@ def read(name):
         return handle.read()
 
 
+def read_server():
+    with open(os.path.join(REPO_ROOT, "netpath", "web", "server.py"), encoding="utf-8") as handle:
+        return handle.read()
+
+
 css = read("app.css")
 app = read("app.js")
 
@@ -108,6 +113,9 @@ check("THEME_KEY = 'sappiwhere.theme'" in app and "function setTheme(" in app,
 # and Settings leaves a plain pointer button where the fieldset was.
 check('id="am-theme"' in app and "am-theme" in app,
       "Appearance moved to the Account dialog and app.js wires it")
+check("/api/account/theme" in app, "the Account dialog saves the theme to the server")
+check('r"^/api/account/theme$", api.put_account_theme' in read_server(),
+      "server.py routes the theme save")
 check('id="open-account-appearance"' in index and "open-account-appearance" in read("settings.js"),
       "Settings leaves a pointer to Appearance where the fieldset used to be")
 check("App.tile" in read("dashboard.js") and "function tile(" in app and "function figures(" in app,

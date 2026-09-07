@@ -182,11 +182,12 @@ rather than records to work through.
 
 Seven, chosen in the **Account** dialog under **Appearance · this
 browser**: Dark (the default), Light, High contrast, and, new in 4.54.0,
-Midnight, Nord, Solarized and Slate. The choice is stored in the browser,
-not on the server — it belongs to the screen and the eyes in front of it, so
-a shared NOC workstation keeps it across sign-ins and every account on that
-machine sees it. It applies at once, needs no Apply, and the sign-in page
-follows it. Light is the route canvas's palette applied to the whole
+Midnight, Nord, Solarized and Slate. Picking one previews it at once, needs
+no Apply; **Save theme**, new in 5.0.0, is what keeps it — to the browser,
+so a shared NOC workstation keeps it across sign-ins, and to the account, so
+the same choice follows that operator to any other browser they sign into.
+Cancel or closing the dialog without saving puts the preview back. Light is
+the route canvas's palette applied to the whole
 interface; High contrast keeps the same hues and pushes them apart to at
 least 7:1. Charts follow the theme because every colour in the product is a
 token.

@@ -300,6 +300,10 @@ class AppDatabase(SqliteStore):
         # Every existing account defaults to 'local', which is what it was.
         self.ensure_columns(
             "users", {"auth_source": "TEXT NOT NULL DEFAULT 'local'"})
+        # Empty means "never saved" — the client leaves its own browser
+        # choice alone rather than forcing dark on every account at once.
+        self.ensure_columns(
+            "users", {"theme": "TEXT NOT NULL DEFAULT ''"})
 
     def backfill_permissions(self, log=None) -> None:
         """Grants the permissions an upgrade owes existing accounts. Call it
@@ -546,6 +550,13 @@ class AppDatabase(SqliteStore):
                 "UPDATE users SET password = ?, updated_ts = ?, must_change = ?"
                 " WHERE username = ? COLLATE NOCASE",
                 (password_hash, time.time(), 1 if must_change else 0, username))
+            self._conn.commit()
+
+    def set_user_theme(self, username: str, theme: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET theme = ? WHERE username = ? COLLATE NOCASE",
+                (theme, username))
             self._conn.commit()
 
     def touch_login(self, username: str) -> None:

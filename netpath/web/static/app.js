@@ -84,6 +84,9 @@ const App = (() => {
     const sessionLine = maxRemainingMs != null
       ? `Session ends in ${duration(Math.max(0, maxRemainingMs) / 1000)}.` : '';
     const version = (state.config || {}).version;
+    // The theme the dialog opened with, so Cancel/Escape/backdrop can put
+    // back whatever preview the operator leaves without pressing Save.
+    let themeAtOpen = currentTheme();
     // Appearance (theme, and the wall-display launcher) is a per-browser
     // choice, not a server setting, so it lives here rather than on the
     // Settings page every OTHER account on this install also sees — and is
@@ -102,8 +105,7 @@ const App = (() => {
           <option value="solarized">Solarized</option>
           <option value="slate">Slate</option>
         </select></label>
-        <p class="hint">Stored in this browser, not on the server: it applies at once,
-          to every account that signs in on this machine.</p>
+        <p class="hint" id="am-theme-status">Saved to your account and kept in this browser.</p>
         <p class="hint">A wall display opens this view full-screen with the tab strip
           hidden; <code>1</code>-<code>9</code> jump to a view once it is open, and a
           rotation, chosen below, cycles through more than one on its own.</p>
@@ -135,7 +137,17 @@ const App = (() => {
               try { await post('/api/logout', {}); } catch (error) { /* going anyway */ }
               window.location.href = '/login';
             } }]
-          : [{ label: 'Cancel', onClick: closeModal }]),
+          : [{ label: 'Cancel', onClick: closeModal },
+             { label: 'Save theme', onClick: async () => {
+                 const select = document.getElementById('am-theme');
+                 const theme = select ? select.value : currentTheme();
+                 await put('/api/account/theme', { theme });
+                 setTheme(theme);
+                 themeAtOpen = theme;
+                 const status = document.getElementById('am-theme-status');
+                 if (status) { status.textContent = 'Saved'; status.style.color = 'var(--ok)'; }
+                 announce('Theme saved');
+               } }]),
         // Its own failures go through showModalError like every other
         // dialog now does; #am-status stays put for the success/hint text,
         // which is not a failure and has nowhere else to say it.
@@ -164,12 +176,21 @@ const App = (() => {
     if (!forced) {
       const themeSelect = box.querySelector('#am-theme');
       if (themeSelect) {
-        themeSelect.value = currentTheme();
+        themeSelect.value = themeAtOpen;
         themeSelect.onchange = () => {
-          setTheme(themeSelect.value);
+          setTheme(themeSelect.value, { preview: true });
           announce(`Theme: ${themeSelect.options[themeSelect.selectedIndex].text}`);
         };
       }
+      // Escape and a backdrop click both route through closeModal, same as
+      // Cancel — so this one listener catches every way out that is not
+      // Save. Nothing to revert if the select was never touched, or if Save
+      // already moved themeAtOpen to match it.
+      window.addEventListener('modal-closed', () => {
+        if (themeSelect && themeSelect.value !== themeAtOpen) {
+          setTheme(themeAtOpen, { silent: true });
+        }
+      }, { once: true });
       const kioskTabs = box.querySelector('#am-kiosk-tabs');
       if (kioskTabs) {
         kioskTabs.innerHTML = visibleTabs()
@@ -4449,7 +4470,10 @@ const App = (() => {
     // chosen has nothing stored and nothing to migrate.
     if (theme === 'dark') delete document.documentElement.dataset.theme;
     else document.documentElement.dataset.theme = theme;
-    if (!options.silent) {
+    // preview: the Account dialog trying a theme on before Save commits it —
+    // applies and announces like any other change, but leaves the browser's
+    // stored choice (and every other open tab) alone.
+    if (!options.silent && !options.preview) {
       try { localStorage.setItem(THEME_KEY, theme); } catch (error) { /* private browsing: applies until reload */ }
     }
     // #am-theme: the Account dialog's own select, when it happens to be
@@ -4882,6 +4906,12 @@ const App = (() => {
       applySessionIdle(payload.session);
       const who = document.getElementById('whoami');
       if (who) who.textContent = payload.session.username;
+      // Carries a theme saved from another browser to this one: harmless
+      // once the two agree, since the check below then does nothing.
+      const sessionTheme = payload.session.theme;
+      if (sessionTheme && THEMES.includes(sessionTheme) && sessionTheme !== currentTheme()) {
+        setTheme(sessionTheme);
+      }
       // Forced, this dialog is the one thing standing between a fresh
       // install's default admin/admin and every other control in the
       // application, so it must not depend on anything lazy loading can
