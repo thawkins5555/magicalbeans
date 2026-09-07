@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.0.1 — Six asks, five taken](#501--six-asks-five-taken)
 - [5.0.0 — Nine asks, and the nodes database in three files](#500--nine-asks-and-the-nodes-database-in-three-files)
 - [4.54.1 — The tab nobody could see](#4541--the-tab-nobody-could-see)
 - [4.54.0 — A map of your own](#4540--a-map-of-your-own)
@@ -123,6 +124,26 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.0.1 — Six asks, five taken
+
+Short notes, one per request, in the order they were given.
+
+**The service console shows what it costs to run.** The Recent requests and Console output panels are gone from the desktop window; the status card now reads `RAM 182.4 MB · CPU 3.1%` for the service process, refreshed each second from the Win32 process counters (or `/proc` elsewhere) with no new dependency (`netpath/procstats.py`). The Show terminal window box moved up to the status card and works as before. Under `pythonw.exe` the stdout tee stays installed so a stray `print()` cannot raise; what it prints goes to the terminal when that is shown, or to whatever captures `--headless`. README, RUNBOOK and FEATURES no longer point at the removed pane.
+
+**Discovery probes addresses in parallel.** The SNMP half of a discovery sweep used to walk one address at a time; a /24 with three community guesses and a three-second timeout took most of an hour. It now runs on a bounded thread pool — `discovery_workers`, default 32, a new field under Nodes → Settings → Discovery and a per-scan override in the Start discovery dialog — while the probe rate cap still paces every packet, so a bigger pool overlaps the waiting rather than making a bigger burst. Results, counters and the address fold are written under one lock; a cancel drops what was queued and waits for what was in flight before it reports.
+
+**MAPPER: a click stops moving the node.** The release handler of a node drag read `event.currentTarget` from an event whose dispatch had already finished, which the DOM defines as null; it threw on every release, the move listener never came off, and every later hover over the map dragged whatever had last been clicked. The element is now captured once and the teardown runs in `finally`. Alongside: the frame is frozen for the whole gesture so a re-fit or resize cannot jump the node; the drag threshold is three screen pixels rather than two scene units; auto-refresh and resize skip a tick while a drag, rubber band or pan is in progress (the promise FEATURES.md already made); a map is fitted once, when it is opened or when Fit is pressed, instead of on every redraw; and the scene is measured from the SVG itself, the element every pointer handler measures. A browser walk of the module then followed — see below.
+
+**DOM / SFP sensors on Cisco switches.** IOS, IOS-XE and NX-OS leave the standard ENTITY-SENSOR-MIB table empty and put transceiver readings in CISCO-ENTITY-SENSOR-MIB instead, which nothing walked, so both sensor sections of the device dialog were empty on exactly the gear most likely to carry a DOM optic. The standard table is still asked first; when it answers nothing and the device is Cisco (by identified vendor or sysObjectID) the Cisco table is walked with the same decoder. `dBm` and `specialEnum` are now known sensor types, so Tx/Rx power reads as `-2.4 dBm` rather than a bare number. Sensors on gear that populates no `entAliasMappingIdentifier` rows are matched to ports by name instead — "Te1/1/1 Transmit Power" to `TenGigabitEthernet1/1/1`, via the containment chain and a short abbreviation table. A device once marked sensorless is re-probed hourly, and at once on Re-identify or Poll now, instead of never. When a walk finds nothing, or finds rows that map to no port, the Nodes event log now says which tables were tried and why — one glance instead of a vendor call.
+
+**Settings → Module Settings opens the dialog.** Since every module but Dashboard became lazy-loaded (4.49.0), the Modules pane selected the tab and then clicked a settings button whose handler had not been wired yet, so the operator just landed on the module. The pane now waits for the module to load before clicking, lists only modules the account can read, and disables an entry with the same reason text as the module's own button when the account cannot write there.
+
+**SNMP Trap timeline.** Withdrawn during planning at the user's request; nothing in the trap module changed.
+
+**MAPPER browser walk.** With the drag fixed, an agent drove the module in Chromium against a simulated fleet: 42 checks, from create map through add, click, drag, multi-select, rubber band, zoom, pan, Fit, Snap, Align, rename, style, export, refresh interval, remove and reload, with no page error. Four defects it found are fixed: Export PNG could only ever fail, because the Content-Security-Policy had no `img-src` and refused the `blob:` image the export draws from (now `img-src 'self' blob:`); an auto-refresh tick emptied the rename field mid-word (the field, caret and focus are restored around the rebuild); a click on the map never focused it, so the arrow-key pan and +/- zoom the canvas advertises did nothing until the operator tabbed to it; and holding Space to pan re-pressed whichever toolbar button last had focus on release. Left as design questions rather than changed: a device added off-screen needs Fit; links between boxes that overlap are hidden under the boxes; rubber-band selection tests node centres; Align can stack boxes.
+
+**Release review.** A Fable review of the combined diff found and fixed: the environment poll walked `entPhysicalName` on every vendor, every cadence, for a name fallback only Cisco needs (now gated on the same Cisco test as the table walk); the "none mapped to an interface" event fired for a UPS or room monitor that maps nothing to a port by design (now only for Cisco gear or an unmapped optic); clearing the new worker field in the Start discovery dialog posted 0 and refused the scan (an empty field now means the default, and the settings pane never stores 0); and the macOS memory readout was 1024 times too large, since `ru_maxrss` is already bytes there. Comments across the release were trimmed to the why.
 
 ### 5.0.0 — Nine asks, and the nodes database in three files
 
