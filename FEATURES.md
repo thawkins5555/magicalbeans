@@ -129,8 +129,8 @@ python -m netpath --headless           # no window, for a service manager
 ```
 
 The console is not the interface — it shows whether the server is up, who is
-connected and what they requested, and lets you change the port, restart, or
-open a browser. Closing it stops the service.
+connected, and the RAM and CPU the service process is using, and lets you
+change the port, restart, or open a browser. Closing it stops the service.
 
 Signing in is required. A fresh install starts with **admin / admin** — the
 sign-in page says so until someone has signed in — and insists on a new

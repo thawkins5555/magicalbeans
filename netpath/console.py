@@ -10,10 +10,8 @@ import ctypes
 import heapq
 import os
 import sys
-import threading
 import time
 import webbrowser
-from collections import deque
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QTimer
@@ -29,69 +27,44 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QSpinBox,
-    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from . import theme
+from . import procstats, theme
 from .eventlog import SYSTEM
 
 
 class OutputCapture:
-    """Tee stdout and stderr into the console window.
+    """Tee stdout and stderr so `print()` cannot raise under pythonw.exe.
 
-    Under pythonw.exe there is no terminal at all and both streams are None,
-    so anything printed — a traceback from a worker, say — would otherwise be
-    lost entirely. This keeps it where someone can read it.
+    Under pythonw.exe there is no terminal at all and both streams are None;
+    without this, the first `print()` anywhere — a traceback from a worker,
+    say — would raise `AttributeError` instead of just being lost. There is
+    no in-app view onto this any more: show the terminal window, or run
+    `--headless` under a service manager and read its log, to see it.
     """
 
-    def __init__(self, capacity: int = 2000):
-        self.lines: deque = deque(maxlen=capacity)
-        self._lock = threading.Lock()
-        self._partial = ""
+    def __init__(self):
         self._originals: dict = {}
 
     def install(self) -> None:
         for name in ("stdout", "stderr"):
             self._originals[name] = getattr(sys, name)
-            setattr(sys, name, _Tee(self._originals[name], self, name))
+            setattr(sys, name, _Tee(self._originals[name]))
 
     def restore(self) -> None:
         for name, stream in self._originals.items():
             setattr(sys, name, stream)
 
-    def add(self, text: str, source: str) -> None:
-        with self._lock:
-            self._partial += text
-            while "\n" in self._partial:
-                line, self._partial = self._partial.split("\n", 1)
-                stamp = datetime.now().strftime("%H:%M:%S")
-                self.lines.append((stamp, source, line.rstrip()))
-
-    def drain_text(self) -> str:
-        with self._lock:
-            return "\n".join(f"{stamp}  {line}" for stamp, _, line in self.lines)
-
-    def count(self) -> int:
-        with self._lock:
-            return len(self.lines)
-
-    def clear(self) -> None:
-        with self._lock:
-            self.lines.clear()
-
 
 class _Tee:
-    def __init__(self, original, capture: OutputCapture, name: str):
+    def __init__(self, original):
         self._original = original
-        self._capture = capture
-        self._name = name
 
     def write(self, text):
         if self._original is not None:
@@ -99,7 +72,6 @@ class _Tee:
                 self._original.write(text)
             except Exception:
                 pass
-        self._capture.add(text, self._name)
         return len(text)
 
     def flush(self):
@@ -124,7 +96,6 @@ CLIENT_COLUMNS = ["Client", "Requests", "Errors", "First seen", "Last seen", "Ag
 # The most recent 200 is what anyone reads; the header says how many there
 # are in total.
 CLIENT_ROWS = 200
-REQUEST_COLUMNS = ["Time", "Client", "Method", "Path", "Status", "Took"]
 
 
 def section(text: str) -> QLabel:
@@ -185,8 +156,8 @@ class ConsoleWindow(QMainWindow):
         self.service = service
         self.server = server
         self.capture = capture
-        self._output_seen = -1
         self._clients_seen: tuple = ()
+        self._proc_sample: dict = {}
 
         from . import __version__
 
@@ -212,8 +183,6 @@ class ConsoleWindow(QMainWindow):
         layout.addWidget(self._listener_card())
         layout.addWidget(self._storage_card())
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
-
         clients = QWidget()
         clients_layout = QVBoxLayout(clients)
         clients_layout.setContentsMargins(0, 0, 0, 0)
@@ -221,60 +190,7 @@ class ConsoleWindow(QMainWindow):
         clients_layout.addWidget(self.clients_heading)
         self.client_table = self._table(CLIENT_COLUMNS)
         clients_layout.addWidget(self.client_table)
-        splitter.addWidget(clients)
-
-        requests = QWidget()
-        requests_layout = QVBoxLayout(requests)
-        requests_layout.setContentsMargins(0, 0, 0, 0)
-        header = QHBoxLayout()
-        header.addWidget(section("Recent requests"))
-        hint = QLabel("static files are counted but not listed")
-        hint.setObjectName("hint")
-        header.addWidget(hint)
-        header.addStretch(1)
-        clear = QPushButton("Clear")
-        clear.clicked.connect(self._clear_access)
-        header.addWidget(clear)
-        requests_layout.addLayout(header)
-        self.request_table = self._table(REQUEST_COLUMNS)
-        requests_layout.addWidget(self.request_table)
-        splitter.addWidget(requests)
-
-        output = QWidget()
-        output_layout = QVBoxLayout(output)
-        output_layout.setContentsMargins(0, 0, 0, 0)
-        output_header = QHBoxLayout()
-        output_header.addWidget(section("Console output"))
-        self.output_hint = QLabel("")
-        self.output_hint.setObjectName("hint")
-        output_header.addWidget(self.output_hint)
-        output_header.addStretch(1)
-
-        self.terminal_check = QCheckBox("Show terminal window")
-        self.terminal_check.setToolTip(
-            "The black window this was launched from. Hiding it does not stop "
-            "the service; anything it would have printed appears below.")
-        self.terminal_check.toggled.connect(self._toggle_terminal)
-        if self._console_handle():
-            self.terminal_check.setChecked(True)
-            output_header.addWidget(self.terminal_check)
-
-        clear_output = QPushButton("Clear")
-        clear_output.clicked.connect(self._clear_output)
-        output_header.addWidget(clear_output)
-        output_layout.addLayout(output_header)
-
-        self.output_view = QPlainTextEdit()
-        self.output_view.setReadOnly(True)
-        self.output_view.setFont(theme.mono(9))
-        self.output_view.setPlaceholderText(
-            "Nothing printed yet. Errors from the collectors and the web "
-            "server appear here.")
-        output_layout.addWidget(self.output_view)
-        splitter.addWidget(output)
-
-        splitter.setSizes([220, 260, 180])
-        layout.addWidget(splitter, 1)
+        layout.addWidget(clients, 1)
 
         note = QLabel(
             "The interface itself is in the browser. Closing this window stops "
@@ -315,8 +231,22 @@ class ConsoleWindow(QMainWindow):
         self.url_label.setObjectName("hint")
         self.url_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.process_label = QLabel("")
+        self.process_label.setObjectName("hint")
+        self.process_label.setFont(theme.mono(9))
         column.addWidget(self.state_label)
         column.addWidget(self.url_label)
+        column.addWidget(self.process_label)
+
+        self.terminal_check = QCheckBox("Show terminal window")
+        self.terminal_check.setToolTip(
+            "The black window this was launched from. Hiding it does not "
+            "stop the service.")
+        self.terminal_check.toggled.connect(self._toggle_terminal)
+        if self._console_handle():
+            self.terminal_check.setChecked(True)
+            column.addWidget(self.terminal_check)
+
         row.addLayout(column)
         row.addStretch(1)
 
@@ -480,10 +410,6 @@ class ConsoleWindow(QMainWindow):
         except Exception:
             QDesktopServices.openUrl(self.server.url)
 
-    def _clear_access(self) -> None:
-        self.server.access.clear()
-        self._refresh()
-
     @staticmethod
     def _console_handle() -> int:
         """The terminal this was launched from, if there is one.
@@ -505,12 +431,6 @@ class ConsoleWindow(QMainWindow):
             ctypes.windll.user32.ShowWindow(handle, 5 if visible else 0)
         except Exception:
             pass
-
-    def _clear_output(self) -> None:
-        if self.capture:
-            self.capture.clear()
-        self.output_view.clear()
-        self._output_seen = -1
 
     # -------------------------------------------------------------- refresh
 
@@ -548,31 +468,20 @@ class ConsoleWindow(QMainWindow):
             + (f"  Last error: {self.server.error}" if self.server.error else ""))
 
         self._refresh_storage()
+        self._refresh_process()
         self._fill_clients(snapshot)
-        self._fill_requests(snapshot)
-        self._refresh_output()
 
-    def _refresh_output(self) -> None:
-        if not self.capture:
-            return
-        count = self.capture.count()
-        if count == self._output_seen:
-            return
-        self._output_seen = count
-        # Only repaint when something new arrived; the scroll position is
-        # kept unless the view was already at the bottom.
-        bar = self.output_view.verticalScrollBar()
-        at_bottom = bar.value() >= bar.maximum() - 4
-        self.output_view.setPlainText(self.capture.drain_text())
-        if at_bottom:
-            self.output_view.verticalScrollBar().setValue(
-                self.output_view.verticalScrollBar().maximum())
-        self.output_hint.setText(f"{count} line(s)")
+    def _refresh_process(self) -> None:
+        sample = procstats.read_self()
+        pct = procstats.cpu_percent(self._proc_sample, sample)
+        self._proc_sample = sample
+        ram = _size(sample["rss_bytes"]) if "rss_bytes" in sample else "—"
+        cpu = f"{pct:.1f}%" if pct is not None else "—"
+        self.process_label.setText(f"RAM {ram} · CPU {cpu}")
 
     def _fill_clients(self, snapshot: dict) -> None:
         """The CLIENT_ROWS most recently seen clients, redrawn only when
-        something about them changed -- the same guard _refresh_output()
-        already uses for the log view, because this runs once a second on
+        something about them changed, because this runs once a second on
         the GUI thread."""
         total, rows = client_rows(snapshot["clients"])
         if (total, rows) == self._clients_seen:
@@ -590,21 +499,6 @@ class ConsoleWindow(QMainWindow):
                 if column == 2 and entry[6]:
                     item.setForeground(QColor(theme.WARN))
                 self.client_table.setItem(row, column, item)
-
-    def _fill_requests(self, snapshot: dict) -> None:
-        recent = snapshot["recent"][:200]
-        self.request_table.setRowCount(len(recent))
-        for row, entry in enumerate(recent):
-            values = [
-                datetime.fromtimestamp(entry["ts"]).strftime("%H:%M:%S"),
-                entry["client"], entry["method"], entry["path"],
-                str(entry["status"]), f"{entry['ms']:.1f} ms",
-            ]
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column == 4 and entry["status"] >= 400:
-                    item.setForeground(QColor(theme.FAIL))
-                self.request_table.setItem(row, column, item)
 
     def closeEvent(self, event) -> None:
         self.timer.stop()

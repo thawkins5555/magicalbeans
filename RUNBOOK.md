@@ -50,8 +50,10 @@ show the message.
    `journalctl -u sappiwhere --since "1 hour ago"`. On Windows running
    headless under NSSM, it is whichever file `nssm set SappiWhere AppStdout`
    points at (`nssm dump SappiWhere` shows the current settings if you did
-   not set them yourself); running from the service console instead, it is
-   the console's own Console output pane, on either platform.
+   not set them yourself); running from the service console instead, show
+   its terminal window (**Show terminal window** on the status card) and
+   read the output there, on either platform — the console itself has no
+   in-app log view.
 4. **Act on the error.**
    - *"database is locked" or "disk I/O error"* — the disk, or a network share
      under the data directory. Check free space, check the mount. SQLite over

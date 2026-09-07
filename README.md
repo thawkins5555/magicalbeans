@@ -204,11 +204,12 @@ repository and there never was; the reference has been removed rather than
 left to send you looking. On a server you almost certainly want a real service
 instead — see [Running as a service](#running-as-a-service).)
 
-Nothing is lost by hiding the terminal. Everything that would have been printed
-to it — collector errors, tracebacks from a worker — is captured and shown in
-the console's own **Console output** pane, which is the more useful place for it
-anyway. If the console was started from a terminal, a **Show terminal window**
-box appears to hide or restore it without stopping the service.
+The console itself has no view onto stdout/stderr any more. Anything the
+service would print — collector errors, tracebacks from a worker — still
+goes to the terminal when it is shown, or to whatever a service manager
+captures under `--headless`; nothing is captured in-app. If the console was
+started from a terminal, a **Show terminal window** box on its status card
+hides or restores that terminal without stopping the service.
 
 ## The service console
 
@@ -219,11 +220,9 @@ questions you would otherwise need a browser for:
   connections.
 - Who is connected — one row per client address, with request and error counts,
   first and last seen, and user agent.
-- What was recently requested, with status and timing.
+- RAM and CPU used by the service process.
 - The listener settings, with **Apply and restart**.
 - A summary of the NetPath, NetFlow, Syslog and DNS collectors.
-- **Console output** — anything printed by the service, captured so it survives
-  running with no terminal.
 
 Closing the console stops the service. For unattended running use `--headless`
 under NSSM or a scheduled task on Windows, or a systemd unit on Linux.

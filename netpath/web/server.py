@@ -26,7 +26,7 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from collections import OrderedDict, deque
+from collections import OrderedDict
 
 from . import api
 from . import wsock
@@ -614,19 +614,14 @@ MAX_TRACKED_CLIENTS = 1000
 
 
 class AccessLog:
-    """Recent requests and per-client totals, for the service console.
+    """Per-client totals, for the service console.
 
-    Bounded in both directions: this is a live view, not an audit trail —
-    that is what appdb's `audit` table is for, and unlike this it is never
-    trimmed. Static files are counted but kept out of the recent list,
-    which would otherwise be nothing but the five scripts every page load
-    fetches.
+    Bounded: this is a live view, not an audit trail — that is what appdb's
+    `audit` table is for, and unlike this it is never trimmed.
     """
 
-    def __init__(self, capacity: int = 400,
-                 max_clients: int = MAX_TRACKED_CLIENTS):
+    def __init__(self, max_clients: int = MAX_TRACKED_CLIENTS):
         self._lock = threading.Lock()
-        self.recent: deque = deque(maxlen=capacity)
         # Ordered by least-recently-seen, so eviction drops the address
         # that has been quiet longest rather than an arbitrary one.
         self.clients: "OrderedDict[str, dict]" = OrderedDict()
@@ -643,13 +638,6 @@ class AccessLog:
             self.total += 1
             if status >= 400:
                 self.errors += 1
-            entry = {"ts": time.time(), "client": client, "method": method,
-                     "path": path, "status": status, "ms": ms}
-            if not path.startswith(("/app.", "/netpath.js", "/netflow.js",
-                                    "/events.js", "/debug.js",
-                                    "/settings.js", "/ssh.js", "/ssh.css",
-                                    "/vendor/")):
-                self.recent.appendleft(entry)
             info = self.clients.setdefault(client, {
                 "requests": 0, "first_seen": time.time(), "last_seen": 0.0,
                 "agent": agent, "errors": 0})
@@ -677,15 +665,8 @@ class AccessLog:
             return {
                 "total": self.total, "errors": self.errors,
                 "active": self.active, "peak_active": self.peak_active,
-                "recent": list(self.recent),
                 "clients": {name: dict(info) for name, info in self.clients.items()},
             }
-
-    def clear(self) -> None:
-        with self._lock:
-            self.recent.clear()
-            self.clients.clear()
-            self.total = self.errors = 0
 
 
 class Handler(BaseHTTPRequestHandler):
