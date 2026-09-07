@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.1.0 — Ten asks](#510--ten-asks)
 - [5.0.1 — Six asks, five taken](#501--six-asks-five-taken)
 - [5.0.0 — Nine asks, and the nodes database in three files](#500--nine-asks-and-the-nodes-database-in-three-files)
 - [4.54.1 — The tab nobody could see](#4541--the-tab-nobody-could-see)
@@ -124,6 +125,32 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.1.0 — Ten asks
+
+Short notes, one per request, in the order they were given.
+
+**An SFP badge on the interface list.** A port the environment walk finds DOM sensors on is marked `optic` in the interfaces table every five minutes (`interfaces.media`) and wears a small SFP pill beside its name in the device pane and the device dialog; the dialog also marks ports the live sensor read reports, so the badge appears on first open. Nothing but a port-mapped ENTITY-SENSOR row is treated as proof of an optic, so a copper port never earns the pill.
+
+**Alerts on DOM / SFP readings.** The same walk now records per-port metrics for every optic: `sfp_rx_dbm`, `sfp_tx_dbm`, `sfp_bias_ma`, `sfp_volt` and `sfp_temp_c`, each keyed by ifIndex. Rules gained a comparison (`above`, the old and only behaviour, or `below`), so a low-side rule can be expressed, and three built-ins ship enabled with conservative thresholds: receive power below −22 dBm, transmit power below −12 dBm, optic temperature above 70 °C, all warnings, all editable and overridable per device. `temp_optic_high` stays as the device-wide rule.
+
+**ConfigRX ignores volatile lines.** `ntp clock-period` changed on every Cisco save and made every capture a new version. Lines that carry no configuration — that one, `! Last configuration change`, `Current configuration : N bytes`, NX-OS's `!Running configuration last done at`, Junos's `## Last commit`, MikroTik's dated header and the like — are dropped at capture for every vendor ConfigRX knows, and ConfigRX settings gained an Ignore lines matching box for a site's own patterns. Stripped lines never reach the stored copy, the hash or the diff. The first capture after upgrading stores one new version.
+
+**WEB opens a tunnel, not a tab to the device.** The button used to open `http://<address>/` straight from the operator's browser, which only works when that browser can already reach the device. It now asks the application to open a relay: the server binds a port from a configurable range (default 40000-40999, Settings → Sign-in → Device web tunnels), pipes bytes between it and the device's own web port, and the browser opens the device's pages through it byte for byte, so vendor pages, scripts and logins work unchanged and an https device shows its own certificate. Only the operator's own address is admitted, the port closes if nothing connects within a minute, after fifteen minutes idle, on sign-out, on loss of the grant, and at shutdown; at most sixteen tunnels, four per account. The relay is gated by a new `web` permission granted to nobody until an administrator hands it out, exactly as the SSH terminal is, and every open and close is audited with byte counts, never content. Each device gained a web scheme and port in its Edit dialog (http on 80 unless told otherwise). Behind a NAT or reverse proxy the admitted address is the proxy's, which the requirements document now says plainly; the range needs an inbound firewall rule.
+
+**Email only above a severity floor.** Alerts settings gained "Email alerts of severity … and worse" (default: everything). An alert below the floor is still raised, listed and sent to the webhook; it is simply never mailed, and is stamped so the roll-up sweep does not keep asking about it. The per-rule email toggle is unchanged, and the older Evaluate severity setting still gates syslog only, which its help now says.
+
+**Interface alerts name the port.** A threshold rule on an interface metric used to fire on the device-wide worst-port value, so the alert could name the switch but not the port. A rule now names a metric family: where a device reports per-port readings, each port is evaluated on its own, as an interface alert titled with the port's name and alias ("core-sw-a / GigabitEthernet1/0/7 (uplink to core)"); two bad ports are two alerts that clear independently; a device that reports no per-port readings is evaluated as before. Link up/down alerts carry the alias too, and email templates gained `interface_name`, `interface_alias` and `if_index` tokens. Per-port alerts roll up under a device-down alert as their device-wide predecessors did; on upgrade, an open device-wide interface alert is resolved with a note, and a port still breaching re-opens as its own alert on the next pass.
+
+**How old the oldest record is.** Settings → Data & Retention shows, beside each data file, when its oldest record dates from ("oldest record 14 d ago"), from a new `oldest_ts()` every store answers; the console's storage card shows the same. Files with no history (MIBs, maps) say so.
+
+**Apply no longer waits for the storage sweep.** The slowness was real work in the wrong place: saving the global scope ran the whole prune-and-trim sweep over thirteen databases inside the request, with budgets of up to thirty seconds per file and a wait on the maintenance lock if the timed sweep was already running. Only that scope did it; every module's own Apply was already fast. The save now returns at once and wakes the maintenance thread, which runs the same forced sweep in the background; the status line says so, and a shutdown landing mid-sweep no longer waits for the rest of it.
+
+**Names on the Dashboard.** The top-offenders tile showed a device's raw stored name, which for anything discovered by address is the address itself. It now resolves names the way every other page does, through the shared display-name precedence (manual name, then sysName, then the address).
+
+**The cap on the metrics file means what it says.** The size trim on `nodes_series.db` deleted raw samples down to a floor and then stopped, while the hourly rollups, the table that actually holds a year of history, were never trimmed by size. A second stage now ages out the oldest rollup hours, oldest first, down to a day per metric, so a file over its cap comes back under it; the event log names what went. Lowering `rollup_retention_days` remains the way to choose the plateau on purpose.
+
+**Release review.** REVIEW_PLACEHOLDER
 
 ### 5.0.1 — Six asks, five taken
 
