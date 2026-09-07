@@ -22,6 +22,7 @@ from email.message import EmailMessage
 from email.utils import formataddr
 from urllib.parse import urlparse
 
+from .alertrules import SEVERITY_NAMES
 from .worker import Worker
 
 # Every subject leads with {{severity_tag}}: whether an alert is critical
@@ -127,9 +128,6 @@ BUILTIN_TEMPLATES = {
 }
 
 _TOKEN = re.compile(r"\{\{(\w+)\}\}")
-
-SEVERITY_NAMES = ["emergency", "alert", "critical", "error", "warning",
-                  "notice", "informational", "debug"]
 
 
 def render(text: str, context: dict) -> str:

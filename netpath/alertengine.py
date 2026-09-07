@@ -2456,6 +2456,20 @@ class AlertEngine(Worker):
         self._webhook_notify(alert_row, rule_row, occurrence, settings,
                              notify_kind or ("renotify" if renotify else "alert"),
                              template_override)
+        # The email severity floor, deliberately BELOW the webhook dispatch
+        # above: "do not mail me about warnings" is a statement about an
+        # inbox, and a chat room or ticket queue that has its own enabled
+        # flag and its own budget must keep getting everything.
+        #
+        # mark_notified, not a bare return: alerts_due_first_notify reads
+        # last_notified_ts IS NULL as "still due", so a floored alert left
+        # unstamped would come back through _sweep_notify_rollup on every
+        # tick for ever. It is also what makes the renotify clock right --
+        # this alert has been decided about, it is not waiting.
+        floor = int(settings.get("notify_min_severity", 7) or 0)
+        if alert_row["severity"] > floor:
+            self.db.mark_notified(alert_row["id"])
+            return
         now = time.time()
         hour_ago = now - 3600
         self._sent_this_hour = [ts for ts in self._sent_this_hour if ts >= hour_ago]
@@ -2774,6 +2788,7 @@ class AlertEngine(Worker):
         if not due:
             return
         rollup = bool(settings.get("rollup_enabled", True))
+        floor = int(settings.get("notify_min_severity", 7) or 0)
         sendable = []
         for alert_row in due:
             rule_row = self.db.rule(alert_row["rule_id"])
@@ -2782,6 +2797,13 @@ class AlertEngine(Worker):
                 continue
             if rule_row["kind"] == "system" or (
                     "notify" in rule_row.keys() and not rule_row["notify"]):
+                self.db.mark_notified(alert_row["id"])
+                continue
+            if alert_row["severity"] > floor:
+                # Below the email floor. Asked here as well as in _notify
+                # because this sweep is the one path that can hand an alert
+                # to _send_digest instead, and because a "due" alert nothing
+                # will ever mail must stop being due.
                 self.db.mark_notified(alert_row["id"])
                 continue
             if alert_row["state"] == "resolved":
@@ -2853,6 +2875,17 @@ class AlertEngine(Worker):
         # The webhook channel's own digest, entirely independent of email's
         # below it — same reasoning as _notify's own webhook call.
         self._webhook_digest(sendable, settings, delay_s)
+        # Defensive: _sweep_notify_rollup is the only caller and already
+        # applied the floor, but a digest is the one place a batch of alerts
+        # reaches the relay without passing through _notify's own guards.
+        floor = int(settings.get("notify_min_severity", 7) or 0)
+        for alert_row, _rule_row, _occurrence in sendable:
+            if alert_row["severity"] > floor:
+                self.db.mark_notified(alert_row["id"])
+        sendable = [entry for entry in sendable
+                    if entry[0]["severity"] <= floor]
+        if not sendable:
+            return
         now = time.time()
         hour_ago = now - 3600
         self._sent_this_hour = [ts for ts in self._sent_this_hour if ts >= hour_ago]

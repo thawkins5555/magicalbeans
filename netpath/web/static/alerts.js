@@ -1396,7 +1396,23 @@
       or interface event is evaluated at whatever severity it arrives with
       regardless of this setting — lowering it does not make traps or
       thresholds quieter, and a syslog rule set to fire on notices (severity
-      5) will never fire if this is set below 5.</p>` },
+      5) will never fire if this is set below 5.</p>
+      <p>It is not the email floor either — that is <b>Email alerts of
+      severity … and worse</b> under EMAIL SERVER, which decides what
+      reaches a mailbox rather than what the engine evaluates.</p>` },
+    'alerts.settings.notifyminsev': { title: 'Email alerts of severity and worse', html: `
+      <p>An alert worse (numerically higher) than this is still raised, still
+      listed, and still counted on the badge — it simply never sends email.
+      The default, 7, mails everything, which is what every install did
+      before this setting existed.</p>
+      <p>Set it to 4 and warnings and below stop arriving in the inbox while
+      errors, criticals and alerts still do. It applies to first notices,
+      re-notifications and clears alike, and to the digest a mass outage
+      coalesces into.</p>
+      <p>It does <b>not</b> gate the webhook: a chat room or a ticket queue
+      is not somebody's inbox, and it has its own on/off switch and its own
+      hourly budget. Nor is it the per-rule <b>Send email for this rule</b>
+      checkbox, which silences one rule at every severity.</p>` },
   });
 
   function normalizeRecipients(raw) {
@@ -1426,6 +1442,8 @@
       </fieldset>
       <fieldset><legend>EMAIL SERVER</legend>
         ${check('as-email', 'Send email notifications', s.email_enabled)}
+        <label>Email alerts of severity <select id="as-notify-minsev"></select>
+          and worse</label>${App.helpLink('alerts.settings.notifyminsev')}
         ${App.form.text('as-host', 'SMTP host', escape(s.smtp_host || ''))}
         ${number('as-port', 'Port', s.smtp_port, 'min=1 max=65535')}
         <label>Security <select id="as-security">
@@ -1563,6 +1581,7 @@
         await App.post('/api/settings', { scope: 'alerts', values: {
           enabled: on('#as-enabled'), min_severity: Number(box.querySelector('#as-minsev').value),
           retention_days: num('#as-retention'), email_enabled: on('#as-email'),
+          notify_min_severity: Number(box.querySelector('#as-notify-minsev').value),
           smtp_host: text('#as-host'), smtp_port: num('#as-port'),
           smtp_security: box.querySelector('#as-security').value,
           smtp_verify_cert: on('#as-verify'), smtp_username: text('#as-user'),
@@ -1587,14 +1606,17 @@
         })()) },
     ], { buttonsTop: true });
     App.wireColumnPickers(box);
-    const select = box.querySelector('#as-minsev');
-    (App.state.severities || []).forEach((name, index) => {
-      const option = document.createElement('option');
-      option.value = String(index);
-      option.textContent = name;
-      select.appendChild(option);
-    });
-    select.value = String(s.min_severity ?? 7);
+    for (const [id, value] of [['#as-minsev', s.min_severity ?? 7],
+                               ['#as-notify-minsev', s.notify_min_severity ?? 7]]) {
+      const select = box.querySelector(id);
+      (App.state.severities || []).forEach((name, index) => {
+        const option = document.createElement('option');
+        option.value = String(index);
+        option.textContent = name;
+        select.appendChild(option);
+      });
+      select.value = String(value);
+    }
 
     function renderRecipients() {
       box.querySelector('#as-to-list').innerHTML = recipientsListHtml(recipients);

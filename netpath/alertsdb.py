@@ -205,6 +205,14 @@ DEFAULTS = {
     "smtp_to_default": [],          # fallback recipients
     "smtp_timeout_s": 15.0,
     # volume control
+    # The severity floor on NOTIFICATION, distinct from min_severity above
+    # (which is a filter on syslog INGEST). An alert worse -- numerically
+    # higher -- than this still opens, still lists, still counts on the
+    # badge; only the mailbox is spared. 7 is every severity, which is what
+    # every install had before this setting existed. The webhook channel is
+    # deliberately not gated by it: a chat room or a ticket queue is not a
+    # person's inbox, and it has its own enabled flag and its own budget.
+    "notify_min_severity": 7,
     "renotify_minutes": 0,          # 0 = notify once per open alert, never again while open
     "notify_on_clear": True,
     "max_emails_per_hour": 60,
