@@ -19,6 +19,7 @@ import threading
 import time
 
 from ..alertrules import device_id_for
+from .. import alertsdb
 from ..alertsdb import is_window_active
 from ..analysis import availability, build_timeline, build_topology, clamp_window
 from .. import namelookup
@@ -5053,6 +5054,10 @@ def _rule_json(row) -> dict:
         "flap_window_s": row["flap_window_s"],
         "flap_min_transitions": row["flap_min_transitions"],
         "clear_threshold": row["clear_threshold"], "for_polls": row["for_polls"],
+        # Keyed defensively like the rest; 'above' is what every rule
+        # shipped before the column existed means.
+        "comparison": (row["comparison"] if "comparison" in row.keys()
+                       else "above") or "above",
         # Keyed defensively for the same reason as rollup_note above.
         "for_seconds": (row["for_seconds"] if "for_seconds" in row.keys() else None),
         "template_id": row["template_id"], "created_ts": row["created_ts"],
@@ -5437,7 +5442,7 @@ def get_alerts_rules(service, params, body) -> dict:
 _THRESHOLD_RULE_KINDS = ("threshold", "dhcp_threshold", "netpath_threshold")
 
 
-def _validated_threshold_fields(kind: str, row, fields: dict) -> dict:
+def _validated_threshold_fields(kind: str, row, fields: dict, key: str = "") -> dict:
     """Refuse a threshold rule that can never raise, and refuse a threshold
     or clear threshold that is not a finite number.
 
@@ -5508,6 +5513,28 @@ def _validated_threshold_fields(kind: str, row, fields: dict) -> dict:
         if not math.isfinite(number):
             raise ValueError(f"{name.replace('_', ' ')} must be a finite number")
         fields[name] = number
+    stored_comparison = (row["comparison"] if row is not None
+                         and "comparison" in row.keys() else "above") or "above"
+    comparison = str(fields.get("comparison", stored_comparison) or "above")
+    if comparison not in ("above", "below"):
+        raise ValueError("comparison must be 'above' or 'below'")
+    if "comparison" in fields:
+        fields["comparison"] = comparison
+    # A clear threshold on the wrong side of the threshold is not a tuning
+    # choice, it is an alert that can never close -- and which side is
+    # "wrong" is exactly what `comparison` decides, so a rule flipped to
+    # 'below' without its numbers being swapped has to be refused here
+    # rather than discovered as a stuck alert weeks later. allow_equal
+    # because several shipped rules set the two equal on purpose for a
+    # quantised metric; see _check_threshold_direction's own docstring.
+    reference = {
+        "key": (row["key"] if row is not None else key),
+        "threshold": (row["threshold"] if row is not None else None),
+        "clear_threshold": (row["clear_threshold"] if row is not None else None),
+    }
+    alertsdb._check_threshold_direction(
+        reference, fields.get("threshold"), fields.get("clear_threshold"),
+        comparison=comparison, allow_equal=True)
     return fields
 
 
@@ -5525,9 +5552,10 @@ def post_alerts_rule(service, params, body) -> dict:
     if service.alerts_db.rule_by_key(key):
         raise ValueError(f"A rule with key '{key}' already exists")
     fields = _pick(body, ("severity", "enabled", "device_filter", "threshold",
-                          "clear_threshold", "for_polls", "for_seconds",
-                          "template_id", "auto_resolve_after_s", "notify"))
-    fields = _validated_threshold_fields(kind, None, fields)
+                          "clear_threshold", "comparison", "for_polls",
+                          "for_seconds", "template_id", "auto_resolve_after_s",
+                          "notify"))
+    fields = _validated_threshold_fields(kind, None, fields, key=key)
     rule_id = service.alerts_db.add_rule(key, name, kind, source_kind, **fields)
     service.log.add(ALERTS_CATEGORY, f"Added alert rule {name}")
     _audit(service, params, "alert_rule.create", target=key,
@@ -5545,8 +5573,8 @@ _ALERT_RULE_AUDIT_PRIORITY = ("threshold", "clear_threshold", "enabled")
 def put_alerts_rule(service, params, body, rule_id) -> dict:
     row = _require(service.alerts_db.rule(rule_id), "rule")
     allowed_keys = ("name", "severity", "enabled", "device_filter", "threshold",
-                    "clear_threshold", "for_polls", "for_seconds", "template_id",
-                    "flap_window_s", "flap_min_transitions",
+                    "clear_threshold", "comparison", "for_polls", "for_seconds",
+                    "template_id", "flap_window_s", "flap_min_transitions",
                     "auto_resolve_after_s", "notify")
     if not row["is_builtin"]:
         allowed_keys = allowed_keys + ("kind", "source_kind")

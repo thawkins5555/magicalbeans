@@ -13,6 +13,7 @@ import sqlite3
 import time
 from urllib.parse import urlparse
 
+from . import alertrules
 from .sqlitebase import SqliteStore, reclaim
 
 SCHEMA = """
@@ -34,6 +35,13 @@ CREATE TABLE IF NOT EXISTS rules (
     notify          INTEGER NOT NULL DEFAULT 1,
     threshold       REAL,
     clear_threshold REAL,
+    -- Which side of `threshold` is the fault: 'above' (the only direction
+    -- this evaluator had before 5.1.0, and every rule shipped before it) or
+    -- 'below', for a metric where a FALLING value is the fault -- an optic's
+    -- receive power. See alertrules.breaches/evaluate_threshold; the
+    -- hysteresis band is the same band either way, so a 'below' rule's
+    -- clear_threshold sits ABOVE its threshold.
+    comparison      TEXT NOT NULL DEFAULT 'above',
     for_polls       INTEGER NOT NULL DEFAULT 1,
     -- Flapping rules only. NULL means "use the shipped defaults" so an
     -- upgraded install behaves exactly as before until someone changes it;
@@ -452,27 +460,32 @@ def validate_webhook_url(url: str) -> None:
             " a private (RFC1918) address")
 
 
-def _check_threshold_direction(rule: sqlite3.Row, threshold, clear_threshold) -> None:
+def _check_threshold_direction(rule, threshold, clear_threshold, *,
+                               comparison: str | None = None,
+                               allow_equal: bool = False) -> None:
     """Raise ValueError if `threshold`/`clear_threshold` (either may be None,
-    meaning "inherit `rule`'s own value") would leave a device override with
-    no real hysteresis gap to clear through.
+    meaning "inherit `rule`'s own value") would leave nothing to clear
+    through.
 
-    evaluate_threshold (alertrules.py) has exactly one direction wired in:
-    a value AT OR ABOVE threshold breaches, a value BELOW clear_threshold
-    clears — there is no "low is bad, clears on rising" mode to invert to.
-    Checked here, not assumed: every threshold-kind row in
-    alertsdb._BUILTIN_RULES was read for this feature, and all nineteen (now
-    twenty) already have clear_threshold <= threshold, several of them
-    intentionally equal for a quantised metric with no gap to leave (UPS
-    battery status, NetPath's 100%-loss unreachable rule). So "high threshold
-    rule, clear_threshold strictly below threshold" is not a hard-coded
-    special case, it is the only direction this evaluator has ever supported
-    — the branch a future low-water metric would need is simply absent
-    because nothing in this codebase has needed it yet.
+    Which side is which is `comparison`'s to say -- the rule's own column
+    when the caller does not override it. An 'above' rule breaches at or
+    over threshold and clears below clear_threshold, so its clear sits
+    below; a 'below' rule (an optic's receive power falling) is the mirror
+    image, so its clear sits above. A clear on the wrong side is not a
+    tuning choice, it is an alert that can never close.
+
+    `allow_equal` is the difference between the two callers. A device
+    OVERRIDE demands a real gap: an operator retuning one device's numbers
+    by hand has no reason to collapse the band, and refusing it catches the
+    inverted pair that produced a permanently open alert. The RULE editor
+    does not, because several shipped rules set the two equal on purpose
+    for a quantised metric with no gap to leave (ups_on_battery,
+    ups_battery_low/replace, netpath_unreachable) and saving one of those
+    back unchanged has to keep working.
 
     Only checked when the CALLER is actually setting one of the two numbers.
     A call that only touches `enabled` (both None, pure inherit) has nothing
-    numeric to validate — rejecting it would refuse a plain "turn this rule
+    numeric to validate -- rejecting it would refuse a plain "turn this rule
     off for one device" on the three rules above whose OWN shipped threshold
     equals its own clear_threshold, over a comparison that call never asked
     for.
@@ -483,17 +496,27 @@ def _check_threshold_direction(rule: sqlite3.Row, threshold, clear_threshold) ->
     effective_clear = rule["clear_threshold"] if clear_threshold is None else clear_threshold
     if effective_threshold is None or effective_clear is None:
         return
-    if not (effective_clear < effective_threshold):
+    if comparison is None:
+        comparison = alertrules.comparison_of(rule)
+    if comparison == "below":
+        ok = (effective_clear >= effective_threshold if allow_equal
+              else effective_clear > effective_threshold)
+        side = "above"
+    else:
+        ok = (effective_clear <= effective_threshold if allow_equal
+              else effective_clear < effective_threshold)
+        side = "below"
+    if not ok:
         raise ValueError(
-            f"clear_threshold ({effective_clear}) must be below threshold"
+            f"clear_threshold ({effective_clear}) must be {side} threshold"
             f" ({effective_threshold}) for rule '{rule['key']}', or the"
             " alert could never clear")
 
 
 _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
-                  "clear_threshold", "for_polls", "for_seconds", "template_id",
-                  "flap_window_s", "flap_min_transitions", "auto_resolve_after_s",
-                  "notify")
+                  "clear_threshold", "comparison", "for_polls", "for_seconds",
+                  "template_id", "flap_window_s", "flap_min_transitions",
+                  "auto_resolve_after_s", "notify")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
 # 44 built-in rules: 8 device_event + 3 interface_event + 20 threshold +
@@ -683,6 +706,16 @@ _BUILTIN_RULES = [
     # because "why did nothing alert" deserves an answer on the Alerts page.
     ("poll_pool_saturated", "Polling pool saturated — polls are being skipped", "system", "poll_pool_saturated", 3, "event_notice", None, None, 1),
 ]
+
+# Shipped `comparison`, kept apart from _BUILTIN_RULES for the same reason
+# as _BUILTIN_FOR_SECONDS below. Absent means 'above', which is the column
+# default and what every rule shipped before 5.1.0 means. Only the two optic
+# POWER rules are low-water: a transceiver whose received light has fallen
+# away is the fault, and there is no upper bound worth alerting on.
+_BUILTIN_COMPARISON = {
+    "sfp_rx_power_low": "below",
+    "sfp_tx_power_low": "below",
+}
 
 # Shipped for_seconds, kept apart from _BUILTIN_RULES rather than widening
 # all 32 rows with a column only one of them uses. Absent means NULL, which
@@ -890,6 +923,7 @@ class AlertsDatabase(SqliteStore):
             "for_seconds": "INTEGER",
             "auto_resolve_after_s": "INTEGER",
             "notify": "INTEGER NOT NULL DEFAULT 1",
+            "comparison": "TEXT NOT NULL DEFAULT 'above'",
         })
         if "notify" in added:
             self._conn.execute(
@@ -1270,12 +1304,13 @@ class AlertsDatabase(SqliteStore):
                 self._conn.execute(
                     "INSERT OR IGNORE INTO rules(key, name, kind, source_kind,"
                     " severity, enabled, is_builtin, device_filter, notify,"
-                    " threshold, clear_threshold, for_polls, for_seconds,"
-                    " auto_resolve_after_s, template_id,"
-                    " created_ts) VALUES (?,?,?,?,?,1,1,'',?,?,?,?,?,?,?,?)",
+                    " threshold, clear_threshold, comparison, for_polls,"
+                    " for_seconds, auto_resolve_after_s, template_id,"
+                    " created_ts) VALUES (?,?,?,?,?,1,1,'',?,?,?,?,?,?,?,?,?)",
                     (key, name, kind, source_kind, severity,
                      0 if key in _BUILTIN_NOTIFY_OFF else 1, threshold,
-                     clear_threshold, for_polls, _BUILTIN_FOR_SECONDS.get(key),
+                     clear_threshold, _BUILTIN_COMPARISON.get(key, "above"),
+                     for_polls, _BUILTIN_FOR_SECONDS.get(key),
                      _BUILTIN_AUTO_RESOLVE_S.get(key),
                      template_ids.get(template_key), now))
             self._conn.commit()

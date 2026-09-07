@@ -833,7 +833,8 @@
       const tr = document.createElement('tr');
       tr.className = 'clickable' + (view.rulesSelected === r.id ? ' selected' : '');
       tr.innerHTML = `<td>${escape(r.name)}${r.is_builtin ? '' : ' <span class="hint">(custom)</span>'}</td>` +
-        `<td>${escape(r.kind)}${r.source_kind ? `: ${escape(r.source_kind)}` : ''}</td>` +
+        `<td>${escape(r.kind)}${r.source_kind ? `: ${escape(r.source_kind)}` : ''}${
+          r.comparison === 'below' ? ' <span class="hint">(below)</span>' : ''}</td>` +
         `<td><span class="sev sev-${r.severity}">${
           escape(App.state.severities?.[r.severity] || r.severity)}</span></td>` +
         `<td>${r.enabled ? 'yes' : 'no'}</td>` +
@@ -1065,6 +1066,14 @@
         and the badge but never reach a mailbox — for the noisy ones nobody
         wants paged about, which used to mean disabling the rule outright.</p>
       ${isThreshold ? `
+      <label>Fault is when the value is <select id="ar-comparison">
+        <option value="above" ${r.comparison === 'below' ? '' : 'selected'}>at or above the threshold</option>
+        <option value="below" ${r.comparison === 'below' ? 'selected' : ''}>at or below the threshold</option>
+      </select></label>
+      <p class="hint">Below is for a metric where a <b>falling</b> value is the
+        fault — an optic's receive power. The clear threshold then sits above
+        the threshold rather than below it, and the alert clears once the value
+        rises past it.</p>
       <label>Threshold <input id="ar-threshold" type="number" step="0.1" value="${r.threshold ?? ''}"></label>
       <label>Clear threshold <input id="ar-clear" type="number" step="0.1" value="${r.clear_threshold ?? ''}"></label>
       <label>Consecutive ${pollNoun} before firing <input id="ar-forpolls" type="number" min="1" value="${r.for_polls || 1}"></label>
@@ -1138,6 +1147,7 @@
           const clearText = box.querySelector('#ar-clear').value.trim();
           values.threshold = thresholdText === '' ? null : Number(thresholdText);
           values.clear_threshold = clearText === '' ? null : Number(clearText);
+          values.comparison = box.querySelector('#ar-comparison').value;
           values.for_polls = Number(box.querySelector('#ar-forpolls').value);
           const seconds = box.querySelector('#ar-forseconds');
           if (seconds) {
@@ -1184,6 +1194,12 @@
       <label>Template <select id="ar-template">${templateOptionsHtml(null)}</select></label>
       <label>Threshold (threshold rules only) <input id="ar-threshold" type="number" step="0.1"></label>
       <label>Clear threshold (threshold rules only) <input id="ar-clear" type="number" step="0.1"></label>
+      <label>Fault is when the value is <select id="ar-comparison">
+        <option value="above" selected>at or above the threshold</option>
+        <option value="below">at or below the threshold</option>
+      </select></label>
+      <p class="hint">Below is for a metric where a falling value is the fault.
+        Its clear threshold sits above its threshold.</p>
       <label>Auto-resolve after <input id="ar-autoresolve" type="number" min="1"
         placeholder="never"> minutes (blank = never)</label>
       <label class="check"><input type="checkbox" id="ar-notify" checked>
@@ -1206,6 +1222,7 @@
         const c = box.querySelector('#ar-clear').value;
         if (t) values.threshold = Number(t);
         if (c) values.clear_threshold = Number(c);
+        values.comparison = box.querySelector('#ar-comparison').value;
         const autoText = box.querySelector('#ar-autoresolve').value.trim();
         if (autoText && Number(autoText) > 0) {
           values.auto_resolve_after_s = Number(autoText) * 60;

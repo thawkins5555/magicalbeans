@@ -23,7 +23,7 @@ from dataclasses import asdict
 from . import alertmail
 from . import namelookup
 from .alertrules import CLEARS, ROLLED_UP_BY, ROLLS_UP, ROLLUP_ENTITY_KINDS, \
-    UNMANAGED_ONLY_RULES, Occurrence, dedup_key, device_id_for, \
+    UNMANAGED_ONLY_RULES, Occurrence, breaches, dedup_key, device_id_for, \
     evaluate_flapping, evaluate_threshold, match_device, syslog_signature
 from .eventlog import ALERTS, ERROR, NODES, NullLog
 from .nodesdb import TIMELINE_ONLY_EVENT_KINDS
@@ -1240,8 +1240,10 @@ class AlertEngine(Worker):
                     # for_seconds instantly on resume, and _operator_resolved
                     # would still see the old run's first_breach_ts.
                     first_breach_ts = None
-                over = (value is not None and threshold is not None
-                        and value >= threshold)
+                # The same predicate evaluate_threshold itself uses, so a
+                # 'below' rule's streak counts the samples that rule calls a
+                # breach rather than the ones an 'above' rule would.
+                over = breaches(eval_rule, value)
                 if not over:
                     streak = 0
                 elif sample_ts != previous_ts:

@@ -168,15 +168,70 @@ def evaluate_flapping(recent_interface_events: list, window_s: float = 600,
     return len(within_window) >= min_transitions
 
 
+def comparison_of(rule) -> str:
+    """A threshold rule's direction: 'below' for a low-water rule, 'above'
+    for every other. Read through here rather than off the row directly
+    because the column arrived in 5.1.0 — an engine handed a row from an
+    older database (or a plain dict built by a test) has no such key, and
+    must behave exactly as it always did."""
+    try:
+        keys = rule.keys()
+    except AttributeError:
+        keys = rule
+    if "comparison" not in keys:
+        return "above"
+    return "below" if str(rule["comparison"] or "above") == "below" else "above"
+
+
+def breaches(rule, value) -> bool:
+    """Whether `value` is on the wrong side of `rule`'s threshold.
+
+    The one place the direction lives: 'above' breaches at or over the
+    threshold, 'below' at or under it. _evaluate_thresholds counts its
+    streak with this same predicate, so the streak and the verdict can
+    never disagree about what a breach is."""
+    if value is None:
+        return False
+    threshold = rule["threshold"]
+    if threshold is None:
+        return False
+    if comparison_of(rule) == "below":
+        return value <= threshold
+    return value >= threshold
+
+
+def _clears(rule, value) -> bool:
+    """Whether `value` has recovered past `rule`'s clear threshold — the
+    far side of the hysteresis band from breaches() above, which for a
+    'below' rule means ABOVE the clear threshold."""
+    if value is None:
+        return False
+    clear_threshold = rule["clear_threshold"]
+    if clear_threshold is None:
+        return False
+    if comparison_of(rule) == "below":
+        return value > clear_threshold
+    return value < clear_threshold
+
+
 def evaluate_threshold(rule, current_value: float | None, streak: int,
                        breach_seconds: float = 0.0) -> str:
-    """Returns 'breach' once current_value is over rule.threshold and the
-    breach has been sustained long enough; 'clear' once a value drops below
-    rule.clear_threshold; '' otherwise (either not sustained yet, or in the
-    hysteresis gap between clear_threshold and threshold). The
-    threshold/clear_threshold gap is hysteresis — without it a value
-    oscillating exactly at the threshold reopens and recloses the alert
-    every single poll.
+    """Returns 'breach' once current_value is on the wrong side of
+    rule.threshold and the breach has been sustained long enough; 'clear'
+    once a value has recovered past rule.clear_threshold; '' otherwise
+    (either not sustained yet, or in the hysteresis gap between
+    clear_threshold and threshold). The threshold/clear_threshold gap is
+    hysteresis — without it a value oscillating exactly at the threshold
+    reopens and recloses the alert every single poll.
+
+    "Wrong side" is rule.comparison's to decide, through breaches() and
+    _clears() above: 'above' (every rule shipped before 5.1.0, and the
+    default for a row without the column) breaches at or over the
+    threshold and clears below the clear threshold; 'below' — an optic
+    whose receive power has fallen — breaches at or under it and clears
+    above. The hysteresis band is the same band either way, just entered
+    from the other end, so clear_threshold sits ABOVE threshold on a
+    'below' rule.
 
     "Long enough" is measured one of two ways, and only ever one:
 
@@ -193,17 +248,15 @@ def evaluate_threshold(rule, current_value: float | None, streak: int,
     a genuinely new sample arrives; see alertengine._evaluate_thresholds."""
     if current_value is None:
         return ""
-    threshold = rule["threshold"]
-    clear_threshold = rule["clear_threshold"]
-    if threshold is None:
+    if rule["threshold"] is None:
         return ""
-    if current_value >= threshold:
+    if breaches(rule, current_value):
         for_seconds = rule["for_seconds"] if "for_seconds" in rule.keys() else None
         if for_seconds:
             return "breach" if breach_seconds >= float(for_seconds) else ""
         for_polls = max(1, int(rule["for_polls"] or 1))
         return "breach" if streak >= for_polls else ""
-    if clear_threshold is not None and current_value < clear_threshold:
+    if _clears(rule, current_value):
         return "clear"
     return ""
 
