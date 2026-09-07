@@ -439,6 +439,41 @@ def _int_keyed(column: dict) -> dict:
     return out
 
 
+# The short interface-name forms IOS/NX-OS write in entPhysicalName, mapped
+# to the long form the same box writes in ifDescr — "Te1/1/1 Transmit Power"
+# against "TenGigabitEthernet1/1/1". See _canonical_if_name, which is the
+# only reason this table exists: a Cisco sensor is very often reachable only
+# by this name match, because CISCO-ENTITY-SENSOR-MIB gear routinely leaves
+# entAliasMappingIdentifier empty.
+_IF_NAME_ABBREVIATIONS = {
+    "fa": "fastethernet", "gi": "gigabitethernet",
+    "te": "tengigabitethernet", "twe": "twentyfivegige",
+    "fo": "fortygigabitethernet", "hu": "hundredgige",
+    "eth": "ethernet", "tw": "twogigabitethernet",
+    "fi": "fivegigabitethernet", "po": "port-channel",
+}
+
+
+def _canonical_if_name(name: str) -> str:
+    """An interface name reduced to a form two spellings of the same port
+    compare equal on: lowercased, whitespace removed, and a leading
+    abbreviation expanded to its long form.
+
+    The expansion applies only when the WHOLE leading run of letters is an
+    abbreviation, so "TenGigabitEthernet1/1/1" is never re-read as "Te" +
+    "nGigabitEthernet1/1/1" and mangled into something that matches
+    nothing.
+    """
+    text = "".join(str(name or "").split()).lower()
+    head = ""
+    for char in text:
+        if not char.isalpha():
+            break
+        head += char
+    expanded = _IF_NAME_ABBREVIATIONS.get(head) if head else None
+    return expanded + text[len(head):] if expanded else text
+
+
 # trapdecode._octets_text's own two non-literal branches, and only those:
 # its six-byte MAC-address special case always joins with ':' and always
 # lowercase hex (`f"{b:02x}"`); its general fallback always joins with ' '
@@ -860,6 +895,9 @@ class NodePoller(Worker):
         # walk that answers something that does not change between one
         # poll and the next.
         self._sensor_read: dict[int, float] = {}
+        # device_id -> when a sensor-diagnostic event was last written for
+        # it. See _log_sensor_diag.
+        self._sensor_diag_ts: dict[int, float] = {}
         # device_id -> the GETBULK repetition count that last worked for it.
         # A device that answers "tooBig" is retried at half as many rows, and
         # remembering that means the next walk starts where the last one
@@ -1102,6 +1140,11 @@ class NodePoller(Worker):
         or running — a click during an in-flight poll cannot start a second
         one, and reporting "Polled" off the first one's completion claimed
         credit for work the click did not cause."""
+        # Poll now is also the operator's way of saying "try the sensor
+        # walk again": dropping the cadence stamp skips both the
+        # _SENSOR_REFRESH_S window and the hourly re-probe window a device
+        # latched sensor_capable=0 would otherwise wait out.
+        self._sensor_read.pop(device_id, None)
         return self._submit(device_id)
 
     def set_focus(self, device_id: int, ttl_s: float, interval_s: float) -> None:
@@ -1412,7 +1455,7 @@ class NodePoller(Worker):
                       self._next_lldp_walk, self._next_vlan_walk,
                       self._credentials, self._credential_probe_failed,
                       self._addresses_read, self._bulk_repetitions,
-                      self._sensor_read):
+                      self._sensor_read, self._sensor_diag_ts):
             for device_id in [k for k in cache if k not in keep]:
                 cache.pop(device_id, None)
         with self._lock:
@@ -2920,6 +2963,11 @@ class NodePoller(Worker):
             job = _VendorIdJob(self, device_id, trigger)
             self._vendor_ids[device_id] = job
         self.db.clear_identification(device_id)
+        # Sensor support is decided partly by what vendor the device is
+        # (see _cisco_sensor_table_plausible), so a re-identification
+        # invalidates a "no sensors here" verdict reached before it.
+        self.db.set_sensor_capable(device_id, None)
+        self._sensor_read.pop(device_id, None)
         job.start()
         return job.status()
 
@@ -3358,9 +3406,22 @@ class NodePoller(Worker):
     _ENT_SENSOR_UNITS = "1.3.6.1.2.1.99.1.1.1.6"
     _IF_INDEX_COLUMN = "1.3.6.1.2.1.2.2.1.1"
 
+    # CISCO-ENTITY-SENSOR-MIB entSensorValueTable — what Cisco switches
+    # populate INSTEAD of RFC 3433's entPhySensorTable, which is why an
+    # all-Cisco fleet saw both sensor sections empty. Same index
+    # (entPhysicalIndex) and the same type/scale/precision/status enums,
+    # extended with specialEnum(13) and dBm(14); there is no
+    # units-display column, so unit text comes from the type enum alone.
+    _CISCO_SENSOR_TYPE = "1.3.6.1.4.1.9.9.91.1.1.1.1.1"
+    _CISCO_SENSOR_SCALE = "1.3.6.1.4.1.9.9.91.1.1.1.1.2"
+    _CISCO_SENSOR_PRECISION = "1.3.6.1.4.1.9.9.91.1.1.1.1.3"
+    _CISCO_SENSOR_VALUE = "1.3.6.1.4.1.9.9.91.1.1.1.1.4"
+    _CISCO_SENSOR_STATUS = "1.3.6.1.4.1.9.9.91.1.1.1.1.5"
+    _CISCO_ENTERPRISE_PREFIX = "1.3.6.1.4.1.9."
+
     _SENSOR_TYPE_UNITS = {3: "V AC", 4: "V DC", 5: "A", 6: "W", 7: "Hz",
                           8: "°C", 9: "%RH", 10: "RPM", 11: "m³/min",
-                          12: ""}
+                          12: "", 13: "", 14: "dBm"}
     _SENSOR_STATUS = {1: "ok", 2: "unavailable", 3: "nonoperational"}
     # entPhySensorType -> a human label, for read_hardware's whole-device
     # sensor list (a port dialog's DOM table already gives its rows
@@ -3369,7 +3430,8 @@ class NodePoller(Worker):
     _SENSOR_TYPE_NAMES = {1: "other", 2: "unknown", 3: "voltage",
                           4: "voltage", 5: "current", 6: "power",
                           7: "frequency", 8: "temperature", 9: "humidity",
-                          10: "fan speed", 11: "airflow", 12: "other"}
+                          10: "fan speed", 11: "airflow", 12: "other",
+                          13: "state", 14: "optical power"}
 
     # entPhySensorType values this app turns into a device-level metric —
     # see _poll_environment. The rest of _SENSOR_TYPE_UNITS' arcs (voltage,
@@ -3417,93 +3479,116 @@ class NodePoller(Worker):
                 int(statuses.get(suffix) or 0), "unknown"),
         }
 
-    def read_dom(self, device_id: int, if_index: int) -> list[dict]:
-        """Live on-demand read of ENTITY-SENSOR-MIB sensors belonging to one
-        interface — DOM/DDM data on an SFP port (light levels, bias
-        current, supply voltage, temperature) on devices that expose it
-        the standard way. Walked only while a human has the interface
-        dialog open, never on the poll cycle: several table walks per
-        call is fine once in a while and wasteful every interval.
+    def _cisco_sensor_table_plausible(self, device) -> bool:
+        """Whether CISCO-ENTITY-SENSOR-MIB could answer on this device.
 
-        Returns [] when the device lacks ENTITY-MIB/sensor support or maps
-        no physical entity to this ifIndex — the dialog says so."""
+        The fallback walk below is gated on this so nothing but Cisco gear
+        ever pays for a second table walk that could only time out: on a
+        fleet of a few hundred devices an ungated fallback would be one
+        wasted walk per device per sensor read, forever.
+        """
+        if detected_vendor(device).lower() == "cisco":
+            return True
+        keys = device.keys() if hasattr(device, "keys") else device
+        raw = (device["sys_object_id"] if "sys_object_id" in keys else "") or ""
+        return str(raw).startswith(self._CISCO_ENTERPRISE_PREFIX)
+
+    def _walk_sensor_columns(self, device, config: dict) -> tuple[str, dict, list]:
+        """(source, columns, tables tried) — whichever sensor table this
+        device actually populates, walked once for every caller.
+
+        ENTITY-SENSOR-MIB is asked first; only when its value column comes
+        back empty AND _cisco_sensor_table_plausible() does the
+        CISCO-ENTITY-SENSOR-MIB value column get walked. The two are never
+        merged: gear that answers both answers the same readings twice,
+        and there is no way to tell duplicates apart afterwards.
+
+        `columns` holds values/types/scales/precisions/statuses/units keyed
+        by index suffix, always the siblings of whichever value column
+        answered. `units` is empty for the Cisco table, which has no
+        units-display column — _decode_entity_sensor then names the unit
+        from the type enum, which is where dBm comes from. `tried` names
+        the tables for the diagnostics event log.
+        """
+        tried = ["ENTITY-SENSOR-MIB"]
+        source = "ENTITY-SENSOR-MIB"
+        values = self._walk_column(device, config, self._ENT_SENSOR_VALUE)
+        siblings = (self._ENT_SENSOR_TYPE, self._ENT_SENSOR_SCALE,
+                    self._ENT_SENSOR_PRECISION, self._ENT_SENSOR_STATUS,
+                    self._ENT_SENSOR_UNITS)
+        if not values and self._cisco_sensor_table_plausible(device):
+            tried.append("CISCO-ENTITY-SENSOR-MIB")
+            source = "CISCO-ENTITY-SENSOR-MIB"
+            values = self._walk_column(device, config, self._CISCO_SENSOR_VALUE)
+            siblings = (self._CISCO_SENSOR_TYPE, self._CISCO_SENSOR_SCALE,
+                        self._CISCO_SENSOR_PRECISION, self._CISCO_SENSOR_STATUS,
+                        None)
+        if not values:
+            return "", {}, tried
+        type_oid, scale_oid, precision_oid, status_oid, units_oid = siblings
+        cols = {
+            "values": values,
+            "types": self._walk_column(device, config, type_oid),
+            "scales": self._walk_column(device, config, scale_oid),
+            "precisions": self._walk_column(device, config, precision_oid),
+            "statuses": self._walk_column(device, config, status_oid),
+            "units": self._walk_column(device, config, units_oid)
+                     if units_oid else {},
+        }
+        return source, cols, tried
+
+    def read_dom(self, device_id: int, if_index: int) -> list[dict]:
+        """Live on-demand read of one interface's sensors — DOM/DDM data on
+        an SFP port (light levels, bias current, supply voltage,
+        temperature). Walked only while a human has the interface dialog
+        open, never on the poll cycle: several table walks per call is fine
+        once in a while and wasteful every interval.
+
+        _read_entity_sensors filtered to one ifIndex, so this can never
+        disagree with the device dialog's own DOM table about which sensor
+        rides on which port, or about which MIB the readings came from.
+        `label` stays entPhysicalDescr here (the whole-device list prefers
+        entPhysicalName): a port dialog already supplies the context a
+        device-wide list has to spell out.
+
+        Returns [] when the device answers no sensor table or maps no
+        physical entity to this ifIndex — the dialog says so."""
         device = self.db.device(device_id)
         if device is None:
             return []
         config = self.working_config(device)
         if not config.get("snmp_enabled", True):
             return []
-
-        # entAliasMappingIdentifier maps entPhysicalIndex -> the ifIndex
-        # arc it corresponds to; keep the entities mapped to this port.
-        alias = self._walk_column(device, config, self._ENT_ALIAS_MAPPING)
-        port_entities = set()
-        for suffix, value in alias.items():
-            target = str(value)
-            if target.startswith(self._IF_INDEX_COLUMN + ".") and \
-               target.rsplit(".", 1)[-1] == str(if_index):
-                try:
-                    port_entities.add(int(suffix.split(".")[0]))
-                except ValueError:
-                    continue
-        if not port_entities:
-            return []
-
-        contained_in = {}
-        for suffix, value in self._walk_column(
-                device, config, self._ENT_PHYSICAL_CONTAINED_IN).items():
-            try:
-                contained_in[int(suffix)] = int(value)
-            except (TypeError, ValueError):
-                continue
-
-        def belongs_to_port(entity: int) -> bool:
-            seen = 0
-            while entity and seen < 16:   # a real containment tree is shallow
-                if entity in port_entities:
-                    return True
-                entity = contained_in.get(entity, 0)
-                seen += 1
-            return False
-
-        sensor_values = self._walk_column(device, config, self._ENT_SENSOR_VALUE)
-        if not sensor_values:
-            return []
-        types = self._walk_column(device, config, self._ENT_SENSOR_TYPE)
-        scales = self._walk_column(device, config, self._ENT_SENSOR_SCALE)
-        precisions = self._walk_column(device, config, self._ENT_SENSOR_PRECISION)
-        statuses = self._walk_column(device, config, self._ENT_SENSOR_STATUS)
-        units = self._walk_column(device, config, self._ENT_SENSOR_UNITS)
-        descrs = self._walk_column(device, config, self._ENT_PHYSICAL_DESCR)
-
         sensors = []
-        for suffix, raw in sensor_values.items():
-            try:
-                entity = int(suffix)
-            except ValueError:
+        for sensor in self._read_entity_sensors(device, config):
+            if sensor.get("if_index") != if_index:
                 continue
-            if not belongs_to_port(entity):
-                continue
-            reading = self._decode_entity_sensor(
-                suffix, raw, types, scales, precisions, statuses, units, descrs)
-            if reading is not None:
-                sensors.append(reading)
+            sensors.append({
+                "entity": sensor["entity"],
+                "label": sensor.get("descr") or sensor["label"],
+                "value": sensor["value"], "unit": sensor["unit"],
+                "status": sensor["status"], "source": sensor.get("source", "")})
         sensors.sort(key=lambda s: s["entity"])
         return sensors
 
-    def _entity_port_map(self, device, config: dict) -> dict[int, int]:
-        """entPhysicalIndex -> ifIndex, resolved through the containment
-        chain, for every entity that maps to a port at all.
+    def _entity_port_map(self, device, config: dict, names: dict | None = None,
+                         if_by_name: dict | None = None) -> tuple[dict[int, int], int]:
+        """(entPhysicalIndex -> ifIndex, how many entAliasMappingIdentifier
+        rows the device answered), for every entity that maps to a port at
+        all. The row count is only ever used to say, in the Nodes event
+        log, why a device's sensors mapped to nothing.
 
-        read_dom() answers "does entity X belong to THIS ifIndex" with an
-        inline walk-up over the same two tables; this generalises that to
-        "which ifIndex, if any, does entity X belong to", for every entity
-        on the device at once -- what read_hardware's whole-device sensor
-        list and read_dom_all need instead. Kept as its own read rather
-        than reshaping _walk_port_mapped_entities to also return it: that
-        helper is _poll_environment's, and a second return value it never
-        asked for is exactly the kind of change that quietly breaks a poll
-        path a review of this diff would not think to re-check.
+        Two passes. The first is entAliasMappingIdentifier resolved through
+        entPhysicalContainedIn — the standard mapping, and the only one
+        with authority. The second exists because Cisco gear routinely
+        populates no alias rows whatsoever: for an entity the first pass
+        left unmapped, climb its containment chain and take either a hop
+        already resolved or a hop whose entPhysicalName matches a stored
+        ifDescr (`if_by_name`, canonicalised by _canonical_if_name), the
+        whole name or its first word — Cisco names an optic sensor
+        "Te1/1/1 Transmit Power" and its parent module
+        "TenGigabitEthernet1/1/1". Matched against ifDescr only, never
+        ifAlias: an operator-typed description is not evidence of anything.
         """
         alias = self._walk_column(device, config, self._ENT_ALIAS_MAPPING)
         prefix = self._IF_INDEX_COLUMN + "."
@@ -3540,7 +3625,39 @@ class NodePoller(Worker):
 
         for entity in set(direct) | set(contained_in):
             resolve(entity)
-        return resolved
+        if not names or not if_by_name:
+            return resolved, len(alias)
+
+        named = _int_keyed(names)
+        for entity in sorted(set(named) | set(contained_in)):
+            if entity in resolved:
+                continue
+            hop, seen = entity, 0
+            while hop and seen < 16:
+                if hop in resolved:
+                    resolved[entity] = resolved[hop]
+                    break
+                hit = self._if_index_for_name(named.get(hop), if_by_name)
+                if hit is not None:
+                    resolved[entity] = hit
+                    break
+                hop = contained_in.get(hop, 0)
+                seen += 1
+        return resolved, len(alias)
+
+    @staticmethod
+    def _if_index_for_name(name, if_by_name: dict) -> int | None:
+        """The ifIndex whose canonicalised ifDescr this entPhysicalName
+        names, if any: the whole name first, then its first whitespace
+        token, which is the part a Cisco sensor name puts the port in."""
+        raw = str(name or "").strip()
+        if not raw:
+            return None
+        for candidate in (raw, raw.split()[0]):
+            hit = if_by_name.get(_canonical_if_name(candidate))
+            if hit is not None:
+                return hit
+        return None
 
     def _read_entity_sensors(self, device, config: dict) -> list[dict]:
         """Every ENTITY-SENSOR-MIB row this device answers, whatever it
@@ -3550,30 +3667,34 @@ class NodePoller(Worker):
         _poll_environment, so the value/unit/status of a given reading can
         never disagree between them.
 
-        Each row adds `type` (a human label for entPhySensorType) and
+        Each row adds `type` (a human label for entPhySensorType),
         `if_index`/`if_name` (via _entity_port_map and the stored
-        interfaces table) on top of _decode_entity_sensor's own shape, and
-        prefers entPhysicalName over entPhysicalDescr for `label` where an
-        agent populates it -- see _ENT_PHYSICAL_NAME.
+        interfaces table), `descr` (raw entPhysicalDescr, which read_dom
+        labels its rows from) and `source` (the MIB the reading came out
+        of) on top of _decode_entity_sensor's own shape, and prefers
+        entPhysicalName over entPhysicalDescr for `label` where an agent
+        populates it -- see _ENT_PHYSICAL_NAME.
         """
-        sensor_values = self._walk_column(device, config, self._ENT_SENSOR_VALUE)
-        if not sensor_values:
+        source, cols, tried = self._walk_sensor_columns(device, config)
+        if not cols:
+            self._log_sensor_diag(
+                device, f"No sensor rows from {device['ip']}: "
+                        f"{' and '.join(tried)} answered nothing")
             return []
-        types = self._walk_column(device, config, self._ENT_SENSOR_TYPE)
-        scales = self._walk_column(device, config, self._ENT_SENSOR_SCALE)
-        precisions = self._walk_column(device, config, self._ENT_SENSOR_PRECISION)
-        statuses = self._walk_column(device, config, self._ENT_SENSOR_STATUS)
-        units = self._walk_column(device, config, self._ENT_SENSOR_UNITS)
+        types = cols["types"]
         descrs = self._walk_column(device, config, self._ENT_PHYSICAL_DESCR)
         names = self._walk_column(device, config, self._ENT_PHYSICAL_NAME)
-        port_map = self._entity_port_map(device, config)
+        interfaces = list(self.db.interfaces(device["id"]))
         if_names = {row["if_index"]: (row["descr"] or row["alias"] or "")
-                   for row in self.db.interfaces(device["id"])}
+                   for row in interfaces}
+        port_map, alias_rows = self._entity_port_map(
+            device, config, names, self._if_index_by_name(interfaces))
 
         sensors = []
-        for suffix, raw in sensor_values.items():
+        for suffix, raw in cols["values"].items():
             reading = self._decode_entity_sensor(
-                suffix, raw, types, scales, precisions, statuses, units, descrs)
+                suffix, raw, types, cols["scales"], cols["precisions"],
+                cols["statuses"], cols["units"], descrs)
             if reading is None:
                 continue
             entity = reading["entity"]
@@ -3583,13 +3704,46 @@ class NodePoller(Worker):
             sensors.append({
                 **reading,
                 "label": name or reading["label"],
+                "descr": str(descrs.get(suffix) or "").strip(),
+                "source": source,
                 "type": self._SENSOR_TYPE_NAMES.get(
                     int(types.get(suffix) or 0), "other"),
                 "if_index": if_index,
                 "if_name": if_name or None,
             })
         sensors.sort(key=lambda s: s["entity"])
+        if sensors and not any(s["if_index"] is not None for s in sensors):
+            self._log_sensor_diag(
+                device, f"Read {len(sensors)} sensor row(s) from {device['ip']} "
+                        f"via {source}, none mapped to an interface: "
+                        f"entAliasMappingIdentifier had {alias_rows} row(s), "
+                        f"entPhysicalName matched no stored ifDescr")
         return sensors
+
+    @staticmethod
+    def _if_index_by_name(interfaces) -> dict[str, int]:
+        """Canonicalised ifDescr -> ifIndex, for _entity_port_map's name
+        fallback. ifDescr only: ifAlias is whatever an operator typed."""
+        by_name: dict[str, int] = {}
+        for row in interfaces:
+            key = _canonical_if_name(row["descr"] or "")
+            if key:
+                by_name.setdefault(key, row["if_index"])
+        return by_name
+
+    # One sensor-diagnostic event per device per minute. The device dialog
+    # re-reads on every open, and a device that answers nothing must not
+    # turn that into an event-log flood.
+    _SENSOR_DIAG_INTERVAL_S = 60.0
+
+    def _log_sensor_diag(self, device, message: str) -> None:
+        now = time.time()
+        device_id = device["id"]
+        if now - self._sensor_diag_ts.get(device_id, 0.0) < \
+                self._SENSOR_DIAG_INTERVAL_S:
+            return
+        self._sensor_diag_ts[device_id] = now
+        self.log.add(NODES, message, target=device["ip"])
 
     # entPhySensorType -> device-metric keys and prefixes read_hardware's
     # "metrics" section shows: the polled figures _poll_vendor_health and
@@ -3755,37 +3909,14 @@ class NodePoller(Worker):
     # of "no data".
     _SENSOR_REFRESH_S = 300.0
 
-    def _walk_port_mapped_entities(self, device, config: dict) -> tuple[set, dict]:
-        """(port_entities, contained_in) — the same two ENTITY-MIB tables
-        read_dom() walks to answer "does this entity belong to THIS
-        ifIndex", generalised here to build the full set of entities that
-        belong to ANY port at all, once per device rather than once per
-        candidate sensor.
-
-        port_entities is every entPhysicalIndex entAliasMappingIdentifier
-        names as riding on some interface — unfiltered by which one, unlike
-        read_dom()'s own, which keeps only the rows naming the one ifIndex a
-        human opened a dialog for. contained_in is entPhysicalContainedIn
-        verbatim. Kept separate from read_dom's inline equivalent so
-        read_dom's behaviour is not this method's to risk."""
-        alias = self._walk_column(device, config, self._ENT_ALIAS_MAPPING)
-        prefix = self._IF_INDEX_COLUMN + "."
-        port_entities = set()
-        for suffix, value in alias.items():
-            if not str(value).startswith(prefix):
-                continue
-            try:
-                port_entities.add(int(suffix.split(".")[0]))
-            except ValueError:
-                continue
-        contained_in = {}
-        for suffix, value in self._walk_column(
-                device, config, self._ENT_PHYSICAL_CONTAINED_IN).items():
-            try:
-                contained_in[int(suffix)] = int(value)
-            except (TypeError, ValueError):
-                continue
-        return port_entities, contained_in
+    # How long a device that answered no sensor table waits before being
+    # asked again. sensor_capable used to latch 0 forever, which was right
+    # while ENTITY-SENSOR-MIB was the only table asked for and wrong the
+    # moment a second one existed: a Cisco switch latched incapable before
+    # it had ever been identified as Cisco would never have been offered
+    # the Cisco table at all. An hour is cheap (one walk per incapable
+    # device per hour) and bounds how long that mistake can last.
+    _SENSOR_REPROBE_S = 3600.0
 
     def _poll_environment(self, device_id: int, device, config: dict,
                           already: set, now: float) -> None:
@@ -3798,8 +3929,8 @@ class NodePoller(Worker):
         a chassis, ordinary on an SFP, and a warning in a comms closet. One
         "temp_c" key under one threshold rule alerts on all three:
 
-        - temp_optic_c: the sensor maps to a port (the containment walk
-          read_dom uses, generalised by _walk_port_mapped_entities).
+        - temp_optic_c: the sensor maps to a port (_entity_port_map, the
+          same resolution the two dialog reads use).
         - temp_ambient_c: unmapped, AND this device also answers a humidity
           sensor. A chassis essentially never does and a room monitor always
           does, on any vendor's arc — so this generalises past one vendor.
@@ -3809,24 +3940,26 @@ class NodePoller(Worker):
           getting hot. Same key jnxOperatingTable uses, so a device
           answering both never reports two disagreeing temperatures.
 
-        Best-effort, gated twice: nothing runs inside the _SENSOR_REFRESH_S
-        window, and devices.sensor_capable is the probe-once-remember memory
-        _poll_poe/_poll_stp/_poll_ups_health also use, so a device with no
-        support is skipped rather than re-walked forever. Recorded only on
-        the FIRST probe: a device already confirmed capable that times out
-        once must not be relabelled incapable.
+        Best-effort, gated twice: nothing runs inside the cadence window,
+        and devices.sensor_capable is the probe-once-remember memory
+        _poll_poe/_poll_stp/_poll_ups_health also use. The window is
+        _SENSOR_REFRESH_S normally and _SENSOR_REPROBE_S for a device that
+        has answered nothing, so "no sensors here" is a cheap hourly
+        question rather than a permanent verdict. Capability is otherwise
+        recorded only on a probe that learned something new: a device
+        already confirmed capable that times out once must not be
+        relabelled incapable.
         """
         capable = device["sensor_capable"]
-        if capable == 0:
-            return
-        if now - self._sensor_read.get(device_id, 0.0) < self._SENSOR_REFRESH_S:
+        window = self._SENSOR_REPROBE_S if capable == 0 else self._SENSOR_REFRESH_S
+        if now - self._sensor_read.get(device_id, 0.0) < window:
             return
         self._sensor_read[device_id] = now
         try:
-            sensor_values = self._walk_column(device, config, self._ENT_SENSOR_VALUE)
+            _source, cols, _tried = self._walk_sensor_columns(device, config)
         except SnmpError:
-            sensor_values = {}
-        if not sensor_values:
+            cols = {}
+        if not cols:
             # No answer at all and an outright SnmpError are folded
             # together on purpose here, same as _poll_poe/_poll_stp do for
             # their own tables: either way this poll learned nothing from
@@ -3835,24 +3968,22 @@ class NodePoller(Worker):
             if capable is None:
                 self.db.set_sensor_capable(device_id, False)
             return
-        if capable is None:
+        if not capable:
+            # None (never probed) and 0 (probed, answered nothing) both
+            # flip to 1 here — the latch has to be able to open again now
+            # that a second table can be the one that answers.
             self.db.set_sensor_capable(device_id, True)
-        types = self._walk_column(device, config, self._ENT_SENSOR_TYPE)
-        scales = self._walk_column(device, config, self._ENT_SENSOR_SCALE)
-        precisions = self._walk_column(device, config, self._ENT_SENSOR_PRECISION)
-        statuses = self._walk_column(device, config, self._ENT_SENSOR_STATUS)
-        units = self._walk_column(device, config, self._ENT_SENSOR_UNITS)
+        sensor_values = cols["values"]
+        types = cols["types"]
+        scales = cols["scales"]
+        precisions = cols["precisions"]
+        statuses = cols["statuses"]
+        units = cols["units"]
         descrs = self._walk_column(device, config, self._ENT_PHYSICAL_DESCR)
-        port_entities, contained_in = self._walk_port_mapped_entities(device, config)
-
-        def on_a_port(entity: int) -> bool:
-            seen = 0
-            while entity and seen < 16:   # a real containment tree is shallow
-                if entity in port_entities:
-                    return True
-                entity = contained_in.get(entity, 0)
-                seen += 1
-            return False
+        names = self._walk_column(device, config, self._ENT_PHYSICAL_NAME)
+        port_map, _alias_rows = self._entity_port_map(
+            device, config, names,
+            self._if_index_by_name(self.db.interfaces(device_id)))
 
         has_humidity = any(int(types.get(suffix) or 0) == self._SENSOR_TYPE_HUMIDITY
                            for suffix in sensor_values)
@@ -3881,7 +4012,7 @@ class NodePoller(Worker):
                 entity = int(suffix)
             except ValueError:
                 continue
-            if on_a_port(entity):
+            if entity in port_map:
                 optic_temps.append(reading["value"])
             elif has_humidity:
                 ambient_temps.append(reading["value"])
