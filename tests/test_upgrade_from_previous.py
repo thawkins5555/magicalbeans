@@ -358,7 +358,7 @@ have_perms.close()
 # pins. POST_SSH_MODULES is the single list both the code and this check
 # read, so the next module added is a one-line change in one place.
 check("every module appended after ssh is excluded from its backfill test",
-      all(module in POST_SSH_MODULES for module in ("ssh", "admin", "mapper")),
+      all(module in POST_SSH_MODULES for module in ("ssh", "admin", "mapper", "web")),
       POST_SSH_MODULES)
 
 fresh_ssh = os.path.join(work, "sshgrant")
@@ -375,7 +375,33 @@ ssh_db.backfill_permissions()
 check("an account holding write on every older module still earns ssh",
       ssh_db.permissions_for("sysadmin").get("ssh") == "write",
       ssh_db.permissions_for("sysadmin"))
+# 5.1's `web` has no backfill of its own, on purpose: it opens a listening
+# port on this host that carries bytes to a device's management page, which
+# nobody could do before, so nobody inherits it — not even the account that
+# just earned `ssh` here for holding write on everything older. A missing
+# row already means no access, which is what makes "no backfill" a complete
+# implementation rather than an omission.
+check("no account is granted web on upgrade, not even a full-write one",
+      "web" not in ssh_db.permissions_for("sysadmin"),
+      ssh_db.permissions_for("sysadmin"))
 ssh_db.close()
+
+# A fresh install is the other half of that claim: Service._ensure_default_user
+# grants the seeded admin `{m: WRITE for m in permissions.MODULES}`, so `web`
+# being in that tuple is exactly what makes the relay reachable out of the box
+# on a new install while an upgraded one starts with nobody holding it. Both
+# facts are checked here rather than one, because either alone would be
+# consistent with the feature shipping unreachable.
+check("web is in MODULES, so the fresh-install grant covers it",
+      "web" in perms.MODULES, perms.MODULES)
+fresh_web = os.path.join(work, "webgrant")
+os.makedirs(fresh_web, exist_ok=True)
+web_db = AppDatabase(os.path.join(fresh_web, "app.db"))
+web_db.backfill_permissions()          # no users at all: nothing to grant
+check("a backfill on an empty database grants nobody web",
+      web_db.usernames_with("web", "write") == [],
+      web_db.usernames_with("web", "write"))
+web_db.close()
 
 # ------------------- part 6: 5.0.0's nodes.db index changes on a 4.54 file
 # The neighbour match's two case-insensitive joins were LOWER() on both

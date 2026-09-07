@@ -227,6 +227,7 @@ const App = (() => {
     nodes: 'Nodes', alerts: 'Alerts', netpath: 'Routes', netflow: 'NetFlow',
     snmp: 'SNMP traps', syslog: 'Syslog', ipam: 'IPAM', wireless: 'FortiWireless',
     configrx: 'ConfigRX', mapper: 'Mapper', settings: 'Settings', ssh: 'SSH',
+    web: 'Web',
   };
 
   function writeDeniedReason(module) {

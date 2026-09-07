@@ -1167,8 +1167,11 @@
      click; picking any individual radio afterwards is still just a radio —
      it quietly reverts the select to Custom rather than fighting it. */
   const ROLE_PRESETS = {
+    // `web` joins admin and ssh in the viewer's exclusions: it has no read
+    // tier to hand out — the relay is a write, and a viewer reaching a
+    // device's management page through this server is not "viewing".
     viewer: (mods) => Object.fromEntries(
-      mods.filter((m) => m !== 'admin' && m !== 'ssh').map((m) => [m, 'read'])),
+      mods.filter((m) => !['admin', 'ssh', 'web'].includes(m)).map((m) => [m, 'read'])),
     operator: (mods) => Object.fromEntries(
       mods.filter((m) => !['admin', 'settings', 'debug'].includes(m))
         .map((m) => [m, 'write'])),

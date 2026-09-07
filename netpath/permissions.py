@@ -26,6 +26,17 @@ MODULES = (
     # This placement keeps that true.
     "mapper",
     "settings", "debug",
+    # Not a tab either: the WEB button on a Nodes device, which since 5.1
+    # opens a TCP relay on this host to the device's own web interface
+    # instead of pointing the browser straight at it. That relay listens on
+    # this machine and carries bytes to a device, so it is a power of its
+    # own — nodes:read means "may see this device", not "may reach its
+    # management page through this server". Slotted before "ssh" rather
+    # than appended so MODULES[-2:] == ("ssh", "admin") still holds (see
+    # the mapper note above and test_web_security.py); the tuple's order is
+    # the only thing that moves, since user_permissions is keyed
+    # (username, module) and no account's grant follows a position.
+    "web",
     # Not a tab: the interactive SSH terminal opened from a Nodes device.
     # Its own module because ConfigRX write means "may back up configs", a
     # boundary of exactly two fixed read-only commands, and an interactive

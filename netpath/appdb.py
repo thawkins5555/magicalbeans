@@ -166,9 +166,10 @@ MAPPER_BACKFILL_MARKER = "mapper_permission_backfilled"
 # upgrade path the backfill exists for. `admin` was already excluded by hand
 # for this reason; 4.54's `mapper` walked into the same trap unnoticed,
 # which is why the rule now lives in one named place instead of a literal
-# tuple inside the function. EVERY module appended from here on belongs
-# here too.
-POST_SSH_MODULES = ("ssh", "admin", "mapper")
+# tuple inside the function. EVERY module added from here on belongs here
+# too — 5.1's `web` sits before "ssh" in permissions.MODULES for an
+# unrelated reason (MODULES[-2:]), and is still newer than the backfill.
+POST_SSH_MODULES = ("ssh", "admin", "mapper", "web")
 
 HOSTNAME_TTL_S = 7 * 86400
 ASN_TTL_S = 30 * 86400
@@ -322,6 +323,17 @@ class AppDatabase(SqliteStore):
         `log` is the application's event log when the caller has one, so an
         operator sees which accounts were granted what; the module logger
         gets the same line either way.
+
+        Not every new module earns a backfill here. 5.1's `web` deliberately
+        has none: a missing row already means no access (`permissions_for`
+        returns a dict, `permissions.allows(None, ...)` is False), and the
+        relay it gates opens a listening port on this host to a device's
+        management page — a power nobody held before, so nobody inherits it.
+        The WEB button that existed before 5.1 opened the device's URL in the
+        browser and touched this server not at all, which is why replacing it
+        is not a capability being taken away. An administrator grants `web`
+        per account; a fresh install's seeded admin gets it from
+        `_ensure_default_user`, which grants every module.
         """
         with self._lock:
             if self._needs_full_backfill:

@@ -488,11 +488,15 @@ try:
               "that could once rewrite the LDAP config and the self-update "
               "toggle by going through this fall-through",
               server_mod._settings_requirement({}, {"scope": scope}) == ("settings", "write"))
-    check("SETTINGS_SCOPES covers every module except settings/debug/ssh/admin "
+    # `web` joins them in 5.1: the relay's only setting is a global one
+    # (web_relay_port_range, administrator-only), so there is no per-module
+    # settings scope for it to own.
+    _NO_SETTINGS_SCOPE = {"settings", "debug", "ssh", "admin", "web"}
+    check("SETTINGS_SCOPES covers every module except settings/debug/ssh/admin/web "
           "-- a module added to permissions.MODULES with no entry here would "
           "silently fall through to the global Settings writer",
-          set(api_mod.SETTINGS_SCOPES) == set(permissions_mod.MODULES) - {"settings", "debug", "ssh", "admin"},
-          sorted(set(permissions_mod.MODULES) - {"settings", "debug", "ssh", "admin"}
+          set(api_mod.SETTINGS_SCOPES) == set(permissions_mod.MODULES) - _NO_SETTINGS_SCOPE,
+          sorted(set(permissions_mod.MODULES) - _NO_SETTINGS_SCOPE
                 ^ set(api_mod.SETTINGS_SCOPES)))
 
     # Reachable with no session at all. A data route landing in either set
@@ -540,7 +544,16 @@ try:
           ("ssh", "read") not in counts, dict(counts))
     check("ssh still has a write tier (the terminal and its socket)",
           counts[("ssh", "write")] >= 1, counts[("ssh", "write")])
-    for module in sorted(set(permissions_mod.MODULES) - {"ssh", "settings"}):
+    # The relay is the same shape as the terminal: there is no read-only half
+    # of "reach that device's management page through this server", so all
+    # three of its routes — open one, list what is open, close one — want
+    # write. A read tier appearing here would be a weaker way to the same
+    # power.
+    check("web has no read tier",
+          ("web", "read") not in counts, dict(counts))
+    check("web still has a write tier (the relay routes)",
+          counts[("web", "write")] >= 1, counts[("web", "write")])
+    for module in sorted(set(permissions_mod.MODULES) - {"ssh", "web", "settings"}):
         check(f"{module} still has both a read and a write tier",
               counts[(module, "read")] >= 1 and counts[(module, "write")] >= 1,
               (module, counts[(module, "read")], counts[(module, "write")]))

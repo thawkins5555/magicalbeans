@@ -798,6 +798,12 @@ def main() -> int:
     check("D8 admin is appended after ssh in MODULES",
           permissions.MODULES[-2:] == ("ssh", "admin"),
           str(permissions.MODULES))
+    # 5.1's `web` is newer than both and still has to sit before them: this
+    # pair of checks is what stops the next module being appended past
+    # "admin" and quietly breaking the line above.
+    check("D8 web precedes ssh in MODULES",
+          permissions.MODULES.index("web") < permissions.MODULES.index("ssh"),
+          str(permissions.MODULES))
     check("D8 the seeded account holds it",
           SERVICE.app_db.permissions_for("admin").get("admin") == "write")
 
