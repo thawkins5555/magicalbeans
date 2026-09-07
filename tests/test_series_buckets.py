@@ -449,11 +449,11 @@ mixed_db = NodesDatabase(os.path.join(TMPDIR, "mixed.db"))
 mixed = mixed_db.series_db
 mixed_device = mixed_db.add_device("127.0.0.7", name="mixed",
                                    group_id=mixed_db.ensure_default_group())
-for j in range(METRICS):
+for t in range(400):
     mixed_db.record_metric_samples(
         mixed_device,
         [(f"mix.{j}", "mix", "u", "gauge", float(top_hour - t * 60), float(t))
-         for t in range(1500)])
+         for j in range(METRICS)])
 with mixed._lock:
     ids = [row["id"] for row in mixed._conn.execute("SELECT id FROM metrics")]
     mixed._conn.executemany(
