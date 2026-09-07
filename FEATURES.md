@@ -2464,6 +2464,20 @@ to a manual name in Nodes.
   rather than `changed`, with its own count in the backups summary,
   because storing it as an ordinary change would make the next diff read
   as though the entire configuration had been deleted.
+- **Volatile lines never turn into a false "changed."** A capture is
+  compared against the device's last stored backup to decide whether
+  anything worth keeping actually changed, but some lines rewrite
+  themselves on every poll regardless — Cisco's `ntp clock-period` and its
+  "Last configuration change" banner, NX-OS/IOS-XR's save-time comments,
+  Junos' "Last commit"/"Last changed", MikroTik's export banner, HP/Aruba's
+  change banner, FortiOS' `#conf_file_ver=`. A built-in, per-vendor list of
+  these is stripped before a capture is hashed, so a device whose real
+  config never changes stays at one stored backup instead of a new version
+  every cycle. **Change detection** in ConfigRX → Settings adds a
+  site-specific list on top of the built-ins, one regex per line, checked
+  with the same bounded-regex guard search and compliance rules use — a
+  pattern that could run away on a real capture is refused when you save
+  it, not discovered against one.
 - **The SSH password is encrypted at rest** (see `CREDENTIAL-SECURITY.md`)
   and is never returned by any API response — only whether one is stored.
   It is decrypted only in memory, immediately before connecting, and

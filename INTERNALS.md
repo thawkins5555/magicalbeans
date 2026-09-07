@@ -5418,6 +5418,35 @@ sequences and pager prompts (`--More--` and similar) a device's shell
 may have echoed back even with paging disabled — best-effort display/
 storage hygiene, not a parser, so it never raises.
 
+**Volatile lines** (5.1.0) are stripped inside that same `_clean_output()`
+call, before the SHA-256 above ever sees the text —
+`configrx_volatile.strip_volatile(cleaned, vendor_key, extra_patterns)`,
+`vendor_key` the same resolved key `_backup_device` already computed for
+`resolve()`. `configrx_volatile.VOLATILE` is a hardcoded, per-vendor-key
+dict of compiled patterns (Cisco's `ntp clock-period \d+` and "Last
+configuration change"/"NVRAM config last updated"/"Building
+configuration" family shared by cisco/cisco-sb/cisco-asa/cisco-wlc,
+separate short lists for cisco-nxos, cisco-iosxr, juniper, mikrotik,
+hp/aruba and fortinet); a vendor with nothing documented here (moxa,
+siemens, rockwellautomation, ubiquiti, or an unrecognized key) simply has
+no built-in patterns and every line passes through. `extra_patterns` is
+`configrxdb.DEFAULTS["ignore_line_patterns"]` (one regex per line,
+operator-editable in ConfigRX → Settings → CHANGE DETECTION) compiled
+through `configrx._compile_extra_patterns`, which reuses
+`configrx_compliance.compile_bounded` — the same ReDoS-bounding compiler
+search and compliance rules use — and silently drops any line that still
+fails to compile, rather than raising, since `_clean_output` promises
+never to; `api._check_configrx_settings` (called from `post_settings` for
+scope `"configrx"`) runs the same `compile_bounded` check at save time, so
+a bad pattern is refused with a 400 naming the line before it is ever
+stored. Because these lines are gone before the hash is taken, a device
+whose real configuration is unchanged stays at one stored backup across
+however many polls its own volatile counters would otherwise have forced
+a "new version" on — this is the one place a first capture after
+upgrading to 5.1.0 legitimately stores a new version even with nothing
+else changed, since the previous stored text still carried the lines this
+release now strips.
+
 **A capture much smaller than the last one is stored, but flagged, not
 treated as an ordinary change.** `_backup_device` reads
 `latest_backup_size()` — the byte size of the device's own most recent

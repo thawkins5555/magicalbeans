@@ -1197,6 +1197,29 @@ for _id in ("age-app", "age-trace", "age-flow", "age-snmp", "age-syslog",
     check('id="%s"' % _id in INDEX and "'%s'" % _id in _USAGE41,
           "the %s span exists in the page and is filled in by showUsage" % _id)
 
+
+# 42. ConfigRX (5.1.0): the settings dialog's CHANGE DETECTION fieldset for
+#     ignore_line_patterns, the operator-editable companion to
+#     configrx_volatile.VOLATILE's built-in per-vendor exclusions.
+_CX_SETTINGS = CONFIGRX[CONFIGRX.index("function settingsDialog()"):
+                        CONFIGRX.index("  /* ------------------------------------------------------------- search")]
+check("CHANGE DETECTION" in _CX_SETTINGS,
+      "the settings dialog has a fieldset for the volatile-line ignore list, "
+      "not just SCHEDULE/RETENTION/SSH")
+check('id="cxs-ignore"' in _CX_SETTINGS,
+      "the ignore-patterns textarea has the id the save handler reads")
+check("s.ignore_line_patterns" in _CX_SETTINGS,
+      "the textarea is seeded from the settings the dialog was opened with, "
+      "not left blank on every reopen")
+check("ignore_line_patterns: m.querySelector('#cxs-ignore').value," in _CX_SETTINGS,
+      "Save posts the textarea's own value under the exact key "
+      "configrxdb.DEFAULTS and api.post_settings expect")
+check("ntp clock-period" in _CX_SETTINGS,
+      "the hint names at least one built-in exclusion, so an operator can "
+      "tell a site-specific line from one already handled before adding a "
+      "redundant pattern")
+
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

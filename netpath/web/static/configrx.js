@@ -1007,6 +1007,21 @@
           paramiko still implements those algorithms: paramiko 5 removed them
           outright, which is why this app pins paramiko below 5.</p>
       </fieldset>
+      <fieldset><legend>CHANGE DETECTION</legend>
+        <label>Extra lines to ignore (one regex per line) <textarea id="cxs-ignore"
+          rows="4">${escape(s.ignore_line_patterns || '')}</textarea></label>
+        <p class="hint">A capture is compared against the device's last stored
+          backup to decide whether anything actually changed. Built-in
+          exclusions already drop lines every poll rewrites regardless of a
+          real config change — Cisco's <code>ntp clock-period</code> and
+          "Last configuration change" banners, NX-OS/IOS-XR's save-time
+          comments, Junos' "Last commit"/"Last changed", MikroTik's export
+          banner, HP/Aruba's change banner, FortiOS' <code>#conf_file_ver=</code>.
+          Add a pattern here for anything site-specific still causing a new
+          version every poll; each line is checked the same way a search or
+          compliance pattern is, so an unsafe or invalid one is refused when
+          you save.</p>
+      </fieldset>
       ${App.columnPickerFieldset('DEVICE LIST COLUMNS', 'cxdevices', COLUMNS,
                                  s.table_columns)}
       ${App.columnPickerFieldset('BACKUP LIST COLUMNS', 'cxbackups', BACKUP_COLUMNS,
@@ -1021,6 +1036,7 @@
           retention_days: Number(m.querySelector('#cxs-days').value),
           retention_count_per_device: Number(m.querySelector('#cxs-count').value),
           allow_legacy_ssh: m.querySelector('#cxs-legacy').checked,
+          ignore_line_patterns: m.querySelector('#cxs-ignore').value,
           table_columns: App.readColumnPicker(
             m.querySelector('#cols-cxdevices'), COLUMNS),
           table_columns_backups: App.readColumnPicker(

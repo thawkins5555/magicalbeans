@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 
 from . import configrx_compliance
 from . import configrx_redact
+from . import configrx_volatile
 from .configrxdb import ConfigRxDatabase
 from .hostkeys import HostKeyChanged, HostKeyStore
 from .nodesdb import detected_vendor
@@ -433,10 +434,16 @@ def _offered_algorithms_detail() -> str:
     return "\n".join(lines)
 
 
-def _clean_output(raw: str) -> str:
+def _clean_output(raw: str, vendor: str = "",
+                  extra_patterns: tuple[re.Pattern, ...] = ()) -> str:
     """Strips ANSI escape sequences and pager prompts a device's shell may
-    have echoed back even with paging disabled. Best-effort — this is
-    display/storage hygiene, not a parser, so it never raises.
+    have echoed back even with paging disabled, then drops whole lines that
+    are volatile rather than configuration — a counter or timestamp a
+    device rewrites on every poll regardless of whether the config itself
+    changed (configrx_volatile.strip_volatile), so those lines never reach
+    the sha256 that decides whether a capture is a new stored version.
+    Best-effort — this is display/storage hygiene, not a parser, so it
+    never raises.
 
     Two passes over pager markers, because they arrive two ways: on a line of
     their own (paging left on, the device drew "--More--" and a newline), and
@@ -446,7 +453,28 @@ def _clean_output(raw: str) -> str:
     """
     text = _ANSI_RE.sub("", raw).replace("\r", "")
     lines = [line for line in text.split("\n") if not _PAGER_RE.match(line)]
-    return _PAGER_INLINE_RE.sub("", "\n".join(lines)).strip() + "\n"
+    cleaned = _PAGER_INLINE_RE.sub("", "\n".join(lines))
+    cleaned = configrx_volatile.strip_volatile(cleaned, vendor, extra_patterns)
+    return cleaned.strip() + "\n"
+
+
+def _compile_extra_patterns(raw: str) -> tuple[re.Pattern, ...]:
+    """The `ignore_line_patterns` setting (one regex per line) compiled with
+    the same bounded-regex guard configrx_compliance uses for search and
+    compliance rules. api.post_settings already refuses a bad line at save
+    time; a line that still fails here (a row saved before that check
+    existed) is skipped rather than raising, matching _clean_output's own
+    never-raises contract."""
+    patterns = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            patterns.append(configrx_compliance.compile_bounded(line))
+        except configrx_compliance.UnsafeRegex:
+            continue
+    return tuple(patterns)
 
 
 def _learn_prompt(banner: str) -> str:
@@ -1016,8 +1044,9 @@ class ConfigRxWorker(Worker):
         # last_seen_ts is the only thing that says a remembered key is still
         # in use rather than left over from a device that has since gone.
         store.record_seen(host, port)
+        settings = self.db.settings()
         try:
-            capture_max_s = float(self.db.settings().get("capture_timeout_s", 180))
+            capture_max_s = float(settings.get("capture_timeout_s", 180))
         except (TypeError, ValueError):
             capture_max_s = 180.0
         try:
@@ -1030,7 +1059,9 @@ class ConfigRxWorker(Worker):
             client.close()
             enable_secret = None
 
-        cleaned = _clean_output(raw)
+        cleaned = _clean_output(
+            raw, vendor_key,
+            _compile_extra_patterns(settings.get("ignore_line_patterns", "")))
         # A truncated capture must never be stored. Storing one is worse than
         # storing nothing: it overwrites nothing, but it becomes the newest
         # "good" version, so the next real backup reads as a huge change and

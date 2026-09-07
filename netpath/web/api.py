@@ -1594,6 +1594,26 @@ def _check_mapper_settings(service, values: dict) -> None:
         raise ValueError(f"Unknown map_style: {values['map_style']!r}")
 
 
+def _check_configrx_settings(values: dict) -> None:
+    """`ignore_line_patterns` is one regex per line, applied to every
+    device's capture before it is hashed for change detection — validated
+    with the same bounded-regex compiler search and compliance rules use,
+    so a pattern that could run away on a real capture is refused here
+    rather than merely producing bad diffs later."""
+    from .. import configrx_compliance
+
+    if "ignore_line_patterns" not in values:
+        return
+    for line in str(values["ignore_line_patterns"]).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            configrx_compliance.compile_bounded(line)
+        except configrx_compliance.UnsafeRegex as exc:
+            raise ValueError(f"Line ignore pattern {line!r} is invalid: {exc}") from exc
+
+
 def post_settings(service, params, body) -> dict:
     from ..sqlitebase import coerce_settings
 
@@ -1622,6 +1642,8 @@ def post_settings(service, params, body) -> dict:
     _check_settings_ranges(values)
     if scope == "mapper":
         _check_mapper_settings(service, values)
+    if scope == "configrx":
+        _check_configrx_settings(values)
     # The keys, never the values: a settings value can be a credential-
     # adjacent path or a hostname, and an audit trail is a record of what
     # was touched, not a second copy of the configuration.
