@@ -1304,8 +1304,6 @@
         <select id="ndd-loss-range" aria-label="Packet-loss range"></select></div>
       <div id="ndd-loss-chart" class="canvas chart" style="height:150px">
         <svg id="ndd-loss-chart-svg"></svg></div>
-      <p class="section">VENDOR IDENTIFICATION</p>
-      <div id="ndd-vendor" class="hint">Loading\u2026</div>
       <p class="section">HARDWARE SENSORS</p>
       <div id="ndd-hardware"><p class="hint">Reading sensors\u2026</p></div>
       <p class="section">TEMPERATURE ALERTS</p>
@@ -1315,7 +1313,9 @@
       <p class="section">INTERFACES</p>
       <div class="table-wrap scrollbox large"><table id="ndd-if-table"></table></div>
       <p class="section">EVENT LOG</p>
-      <div class="table-wrap scrollbox small"><table id="ndd-ev-table"></table></div>`, [
+      <div class="table-wrap scrollbox small"><table id="ndd-ev-table"></table></div>
+      <p class="section">VENDOR IDENTIFICATION</p>
+      <div id="ndd-vendor" class="hint">Loading\u2026</div>`, [
       { label: 'Close', onClick: App.closeModal },
     ], { buttonsTop: true, trigger });
     // Stamped by App.modal above; every paint below checks it first.
