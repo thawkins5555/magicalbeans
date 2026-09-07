@@ -986,6 +986,7 @@ class AlertsDatabase(SqliteStore):
             ("rebind_event_notice_1", self._rebind_event_notice),
             ("retire_temp_high_1", self._retire_temp_high),
             ("dampen_new_builtin_siblings_1", self._dampen_new_builtin_siblings),
+            ("per_port_threshold_alerts_1", self._resolve_device_if_alerts),
         )
 
     def _run_named_migrations(self) -> None:
@@ -1105,6 +1106,43 @@ class AlertsDatabase(SqliteStore):
                 " name = 'Temperature high (retired -- see"
                 " temp_ambient_high / temp_chassis_high / temp_optic_high)'"
                 " WHERE id = ?", (rule_id,))
+            self._conn.commit()
+
+    def _resolve_device_if_alerts(self) -> None:
+        """Resolve the open device-scoped alerts of the interface threshold
+        rules, once, on upgrade to 5.1.0.
+
+        Those rules used to read the device-level worst-port metric key
+        (if_in_util_pct, the busiest port's utilization), so every alert
+        they ever raised is entity_kind='device' and names no port. The
+        evaluator now skips that key on any device that also reports
+        per-port children and alerts on the ports themselves, which means
+        nothing will ever clear the old rows: they would sit open for ever,
+        naming a device and a number with no way to act on either.
+
+        Scoped by rule, not by dedup key: `kind = 'threshold'` and a
+        source_kind beginning "if_" is exactly the set that moved, and it
+        picks up a custom rule an operator wrote against one of those keys
+        as well as the six built-ins. Acked rows go too -- an
+        acknowledgement is "I have this", and this one is finished.
+        Resolved with a note rather than deleted, the same choice
+        _retire_temp_high makes: the history is the point.
+        """
+        now = time.time()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT a.id FROM alerts a JOIN rules r ON r.id = a.rule_id"
+                " WHERE a.state IN ('open','acked') AND a.entity_kind = 'device'"
+                r" AND r.kind = 'threshold' AND r.source_kind LIKE 'if\_%' ESCAPE '\'"
+            ).fetchall()
+            for row in rows:
+                self._conn.execute(
+                    "UPDATE alerts SET state='resolved', resolved_ts=?,"
+                    " resolved_by='' WHERE id=?", (now, row["id"]))
+                self._note(row["id"],
+                          "Resolved on upgrade: interface thresholds now alert "
+                          "per port, naming the interface, so this device-wide "
+                          "alert had nothing left to clear it")
             self._conn.commit()
 
     def _dampen_new_builtin_siblings(self) -> None:
@@ -2285,6 +2323,48 @@ class AlertsDatabase(SqliteStore):
             self._conn.commit()
             return self._conn.execute(
                 "SELECT * FROM alerts WHERE id = ?", (row["id"],)).fetchone()
+
+    def resolve_by_dedup_prefix(self, prefix: str, by: str = "",
+                                rolled_up_into: int | None = None
+                                ) -> list[sqlite3.Row]:
+        """resolve_by_dedup for a whole family of keys at once, oldest
+        first.
+
+        A per-port threshold rule keys its alerts
+        "<rule>:interface:<device_id>:<if_index>", so one device's set is
+        one prefix and resolve_by_dedup -- which names exactly one key --
+        cannot reach it. A rollup absorbing a switch's outage has to close
+        every port's alert on that switch, and a per-device override being
+        switched off has to close every port's alert for that rule.
+
+        Bounds rather than LIKE: the prefix's last character is bumped by
+        one to get an exclusive upper bound, which is a range scan of
+        ux_alerts_active_dedup (whose WHERE state IN ('open','acked')
+        matches this query's own filter exactly). LIKE would have to escape
+        the underscores every rule key contains, and an escaped LIKE cannot
+        use an index at all.
+        """
+        if not prefix:
+            return []
+        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id FROM alerts WHERE dedup_key >= ? AND dedup_key < ?"
+                " AND state IN ('open','acked') ORDER BY opened_ts",
+                (prefix, upper)).fetchall()
+            if not rows:
+                return []
+            now = time.time()
+            for row in rows:
+                self._conn.execute(
+                    "UPDATE alerts SET state='resolved', resolved_ts=?,"
+                    " resolved_by=?, rolled_up_into=? WHERE id=?",
+                    (now, by, rolled_up_into, row["id"]))
+            self._conn.commit()
+            marks = ",".join("?" * len(rows))
+            return self._conn.execute(
+                f"SELECT * FROM alerts WHERE id IN ({marks}) ORDER BY opened_ts",
+                [row["id"] for row in rows]).fetchall()
 
     def alerts_rolled_up_into(self, parent_id: int) -> list[sqlite3.Row]:
         """Every alert absorbed DIRECTLY into `parent_id`'s rollup, oldest

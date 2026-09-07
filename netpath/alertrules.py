@@ -145,6 +145,40 @@ def device_id_for(entity_kind: str, entity_id) -> int | None:
     return None
 
 
+def _field(row, name: str) -> str:
+    try:
+        value = row[name]
+    except (TypeError, KeyError, IndexError):
+        return ""
+    return str(value or "").strip()
+
+
+def interface_label(row, if_index=None) -> str:
+    """A port as an operator names it: "GigabitEthernet1/0/7 (uplink to
+    core)".
+
+    The alias is the half a human wrote and the half that says what the
+    port is FOR, so an alert that names only the ifDescr makes the reader
+    go and look it up. It is appended only when it adds something -- a
+    device that copies ifDescr into ifAlias, or has no alias at all, would
+    otherwise produce "Gi1/0/7 (Gi1/0/7)".
+
+    `if<n>` is the last resort, for a metric whose interface row has since
+    been replaced by a re-walk. One function, in the module the engine and
+    the API already share, because both the interface_event drains and the
+    per-port threshold evaluator have to name the same port the same way.
+    """
+    descr = _field(row, "descr")
+    alias = _field(row, "alias")
+    if if_index is None:
+        if_index = _field(row, "if_index") or None
+    name = descr or alias or (f"if{if_index}" if if_index is not None
+                              else "interface")
+    if alias and alias.lower() != name.lower():
+        return f"{name} ({alias})"
+    return name
+
+
 def match_device(rule, occurrence: Occurrence) -> bool:
     """Empty device_filter matches everything. Otherwise a case-insensitive
     substring match against device_name or device_ip."""
@@ -294,7 +328,16 @@ CLEARS = {
 # "this alert is implied by that one about the SAME thing", so it is only
 # meaningful where an entity can have both; listing the kinds explicitly stops
 # a future entity kind inheriting the device pairings by accident.
-ROLLUP_ENTITY_KINDS = frozenset({"device", "netpath_target"})
+#
+# `interface` joined in 5.1.0, when interface threshold rules started
+# alerting per port: a dead switch's ports report nothing, so a per-port
+# utilization or error-rate alert is as much an artefact of the outage as
+# the device-level one it replaced. It does NOT admit interface_down or
+# interface_flapping to rollup -- this set is a necessary condition, not a
+# sufficient one, and ROLLED_UP_BY below is the gate: a rule with no entry
+# there has no parent and is never suppressed, whatever its entity kind.
+# See that map's own comment for why those two must stay un-rolled.
+ROLLUP_ENTITY_KINDS = frozenset({"device", "interface", "netpath_target"})
 
 
 # ROLLED_UP_BY: rule key -> the rule key whose open alert makes it redundant.

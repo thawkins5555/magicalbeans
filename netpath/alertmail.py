@@ -219,6 +219,10 @@ def build_context(alert_row, rule_row, extra: dict | None = None) -> dict:
         "rule_name": rule_row["name"] if rule_row else "",
         "previous_uptime": "", "current_uptime": "",
         "metric_label": "", "value": "", "threshold": "",
+        # Set by _evaluate_thresholds for a per-port breach, and defaulted
+        # here so a template that names one renders empty rather than
+        # leaving the literal token in a device-scoped email.
+        "if_index": "", "interface_name": "", "interface_alias": "",
         "trap_name": "", "trap_oid": "", "varbinds": "",
         "down_since": "", "recovered_time": "", "downtime": "",
         "downtime_line": "",
@@ -273,6 +277,9 @@ def token_reference() -> list[dict]:
         {"token": "metric_label", "description": "The metric name (threshold rules only)"},
         {"token": "value", "description": "The metric's current value (threshold rules only)"},
         {"token": "threshold", "description": "The configured threshold (threshold rules only)"},
+        {"token": "if_index", "description": "The port's ifIndex (per-port threshold and interface rules only)"},
+        {"token": "interface_name", "description": "The port's ifDescr, e.g. 'GigabitEthernet1/0/7' (per-port rules only)"},
+        {"token": "interface_alias", "description": "The port's description as configured on the device (per-port rules only)"},
         {"token": "down_since", "description": "When the problem started (resolution notifications only)"},
         {"token": "recovered_time", "description": "When it recovered (resolution notifications only)"},
         {"token": "downtime", "description": "How long it was down, e.g. '2 h 14 m' (resolution notifications only)"},

@@ -185,6 +185,39 @@ class NodesSeriesDatabase(SqliteStore):
                 "SELECT device_id, key, label, last_value, last_ts"
                 f" FROM metrics WHERE key IN ({marks})", keys).fetchall()
 
+    def metrics_for_families(self, keys) -> list[sqlite3.Row]:
+        """The newest value of each named metric key AND of every per-port
+        child of one, fleet-wide -- "cpu_pct" alone, but "sfp_rx_dbm" and
+        every "sfp_rx_dbm.<if_index>" with it.
+
+        A child is written as the parent key, a dot, and the interface
+        index, so a family is one exact match plus one contiguous range:
+        '.' is 0x2E and '/' is 0x2F, so `key >= 'k.' AND key < 'k/'` is
+        every key beginning 'k.' and nothing else. Written as bounds rather
+        than as LIKE 'k.%' on purpose -- SQLite can drive ix_metrics_key
+        from a range unconditionally, while the LIKE optimisation depends
+        on the connection's case_sensitive_like pragma and quietly becomes
+        a full scan of the largest table in this file when it does not
+        apply. The bounds also exclude the sibling keys a prefix match
+        would drag in: 'if_in_error_rate_x' sorts after 'if_in_error_rate/'
+        because '_' is 0x5F.
+
+        `unit` is selected too -- the threshold evaluator names the unit in
+        an alert's message, and a per-port alert that says "-24.1" without
+        saying dBm is not readable.
+        """
+        roots = [str(k) for k in keys if k]
+        if not roots:
+            return []
+        clauses, args = [], []
+        for root in roots:
+            clauses.append("(key = ? OR (key >= ? AND key < ?))")
+            args += [root, root + ".", root + "/"]
+        with self._lock:
+            return self._conn.execute(
+                "SELECT device_id, key, label, unit, last_value, last_ts"
+                f" FROM metrics WHERE {' OR '.join(clauses)}", args).fetchall()
+
     _IDS_PER_QUERY = 500
 
     def metrics_for_devices(self, device_ids, keys) -> list[sqlite3.Row]:

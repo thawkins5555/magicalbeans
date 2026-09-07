@@ -1401,6 +1401,19 @@ class NodesDatabase(SqliteStore):
             return rows
         return [row for row in rows if row["device_id"] not in disabled]
 
+    def metrics_for_families(self, keys) -> list[sqlite3.Row]:
+        """metrics_for_keys widened to the per-port children of each key --
+        see NodesSeriesDatabase.metrics_for_families. Same disabled-device
+        filter, for the same reason: `enabled` and the metric live in
+        different files."""
+        rows = self.series_db.metrics_for_families(keys)
+        if not rows:
+            return rows
+        disabled = self.disabled_device_ids()
+        if not disabled:
+            return rows
+        return [row for row in rows if row["device_id"] not in disabled]
+
     # ------------------------------------------------- bounded fleet reads
     #
     # For a caller that already knows which handful of devices it wants
