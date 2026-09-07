@@ -736,6 +736,18 @@ check(not mapper_ungated,
       "every write control in mapper.js's own markup carries "
       "data-requires-write=\"mapper\" (missing: %s)" % (", ".join(mapper_ungated) or "none"))
 
+# ---------------------------------------------------------------------------
+# 29. The device dialog's RESOURCES section (CPU, memory, chassis
+#     temperature) shares the packet-loss chart's one /metrics fetch and
+#     range control rather than running a chart loop of its own.
+check('id="ndd-resources"' in NODES and 'id="ndd-res-head"' in NODES,
+      "the RESOURCES holder and heading exist")
+check("async function loadCharts(" in NODES and "function loadLoss(" not in NODES,
+      "loadLoss became loadCharts rather than gaining a sibling")
+for _key in ("cpu_pct", "mem_pct", "temp_chassis_c"):
+    check("'%s'" % _key in NODES, "RESOURCES reads the %s metric" % _key)
+check(".nd-resources {" in APP_CSS, "app.css lays out the RESOURCES grid")
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

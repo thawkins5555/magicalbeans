@@ -1038,6 +1038,29 @@
     return geo;
   }
 
+  // The device dialog's RESOURCES section: one small chart per metric that
+  // is actually present on this device, in this order. `peak` pins the axis
+  // the way the loss chart's 100 does; null leaves it auto-scaled, since a
+  // chassis has no fixed temperature ceiling to pin against.
+  const RESOURCE_METRICS = [
+    ['cpu_pct', 'var(--accent)', 100],
+    ['mem_pct', 'var(--ok)', 100],
+    ['temp_chassis_c', 'var(--warn)', null],
+  ];
+
+  function resourceHolder(container, metric) {
+    let wrap = container.querySelector(`[data-res-metric="${metric.key}"]`);
+    if (wrap) return wrap;
+    wrap = document.createElement('div');
+    wrap.className = 'canvas chart';
+    wrap.style.height = '110px';
+    wrap.dataset.resMetric = metric.key;
+    wrap.innerHTML = `<div class="bar"><span class="section">${escape(metric.label || metric.key)}</span>
+      <span class="nd-v"></span></div><svg></svg>`;
+    container.appendChild(wrap);
+    return wrap;
+  }
+
   /* One lane's worth of coloured segments — extracted from
      drawStatusTimeline so the split SNMP/ping view and the single combined
      view (below) share the exact same per-segment drawing (colour,
@@ -1301,9 +1324,11 @@
     const box = App.modal(escape(displayName(listed || {})) || 'Device', `
       <div id="ndd-summary" class="nd-summary">Loading\u2026</div>
       <div class="bar"><span class="section">PACKET LOSS</span>
-        <select id="ndd-loss-range" aria-label="Packet-loss range"></select></div>
+        <select id="ndd-loss-range" aria-label="Chart range"></select></div>
       <div id="ndd-loss-chart" class="canvas chart" style="height:150px">
         <svg id="ndd-loss-chart-svg"></svg></div>
+      <p class="section" id="ndd-res-head" hidden>RESOURCES</p>
+      <div id="ndd-resources" class="nd-resources" hidden></div>
       <p class="section">HARDWARE SENSORS</p>
       <div id="ndd-hardware"><p class="hint">Reading sensors\u2026</p></div>
       <p class="section">TEMPERATURE ALERTS</p>
@@ -1360,50 +1385,81 @@
       });
     }
 
-    /* Packet loss over the loss chart's own window. The samples are
-       already there: the poller records ping_loss_pct on every poll that
-       pings, so this is two reads of endpoints that already exist rather
-       than anything new being stored. The metric row only exists once a
-       device has actually been pinged, which is a real state to render
-       rather than an error — a device polled over SNMP with pinging off
-       has no loss to show and should say so. */
-    async function loadLoss() {
+    /* Packet loss and the RESOURCES charts share this one window and one
+       /metrics fetch — the samples are already there: the poller records
+       ping_loss_pct, cpu_pct, mem_pct and temp_chassis_c on every poll that
+       gathers them, so this reads endpoints that already exist rather than
+       storing anything new. A metric row only exists once a device has
+       actually reported it, which is a real state to render (not probed,
+       no chassis sensor, ...) rather than an error. */
+    async function loadCharts() {
       if (!current()) { stopLoss(); return; }
       const requestId = (lossRequestId += 1);
       const t1 = Date.now() / 1000;
       const t0 = t1 - lossRange;
-      const metrics = await App.get(`/api/nodes/devices/${deviceId}/metrics`);
-      if (!current() || requestId !== lossRequestId) return;
-      const metric = (metrics.metrics || []).find((m) => m.key === 'ping_loss_pct');
-      if (!metric) {
-        drawLoss({ t0, t1, unit: '%', series: [], notProbed: true });
-        return;
-      }
       // Bucketed only once the window is wide enough that raw points would
       // otherwise be thousands of them — a 3-day window at 300 buckets is
-      // one every ~14 minutes, still far finer than the fault this chart
-      // is meant to catch.
+      // one every ~14 minutes, still far finer than the fault these charts
+      // are meant to catch.
       const bucketS = (t1 - t0) > 21600 ? (t1 - t0) / 300 : 0;
-      const result = await App.get(`/api/nodes/devices/${deviceId}/series`,
-        { metric_id: metric.id, t0, t1, bucket_s: bucketS });
-      // Same ticket discipline as the timeline, and for a second reason
-      // here: a metric id read before the range or the dialog moved on
-      // belongs to a window this chart is no longer showing.
+      const metricsResult = await App.get(`/api/nodes/devices/${deviceId}/metrics`);
       if (!current() || requestId !== lossRequestId) return;
-      drawLoss({ t0: result.t0, t1: result.t1, unit: '%',
-        series: [{ label: metric.label || 'Packet loss',
-                   color: 'var(--warn)', points: result.points || [] }] });
+      const metrics = metricsResult.metrics || [];
+      const lossMetric = metrics.find((m) => m.key === 'ping_loss_pct');
+      const present = RESOURCE_METRICS
+        .map(([key, color, peak]) => [metrics.find((m) => m.key === key), color, peak])
+        .filter(([metric]) => metric);
+
+      const series = (metric) => App.get(`/api/nodes/devices/${deviceId}/series`,
+        { metric_id: metric.id, t0, t1, bucket_s: bucketS });
+      const [lossSeries, ...resSeries] = await Promise.all([
+        lossMetric ? series(lossMetric) : null,
+        ...present.map(([metric]) => series(metric)),
+      ]);
+      // Same ticket discipline as the timeline, and for a second reason
+      // here: a fetch that lands after the range or the dialog moved on
+      // belongs to a window these charts are no longer showing.
+      if (!current() || requestId !== lossRequestId) return;
+
+      if (!lossMetric) {
+        drawLoss({ t0, t1, unit: '%', series: [], notProbed: true });
+      } else {
+        drawLoss({ t0: lossSeries.t0, t1: lossSeries.t1, unit: '%',
+          series: [{ label: lossMetric.label || 'Packet loss',
+                     color: 'var(--warn)', points: lossSeries.points || [] }] });
+      }
+
+      const container = box.querySelector('#ndd-resources');
+      const head = box.querySelector('#ndd-res-head');
+      if (!container || !head) return;
+      present.forEach(([metric, color, peak], i) => {
+        const result = resSeries[i];
+        const points = result.points || [];
+        const last = points.length ? points[points.length - 1] : null;
+        const lastValue = last ? (last.avg !== undefined ? last.avg : last.value) : null;
+        const wrap = resourceHolder(container, metric);
+        const valueEl = wrap.querySelector('.nd-v');
+        if (valueEl) valueEl.textContent = lastValue == null ? '' : formatMetricValue(metric.unit, lastValue);
+        drawSeriesChart(wrap.querySelector('svg'), wrap, { t0: result.t0, t1: result.t1,
+          unit: metric.unit, series: [{ label: metric.label, color, points }] }, {
+          peak: peak == null ? undefined : peak,
+          ariaLabel: `${metric.label} chart` + (lastValue == null ? ', no samples in this window'
+            : `, ${formatMetricValue(metric.unit, lastValue)} most recently`),
+        });
+      });
+      container.hidden = present.length === 0;
+      head.hidden = present.length === 0;
     }
 
     box.querySelector('#ndd-loss-range').onchange = (e) => {
       lossRange = Number(e.target.value);
-      loadLoss().catch(() => {});
+      loadCharts().catch(() => {});
     };
 
-    // Fast-poll focus (see the interface dialog) keeps new loss samples
-    // landing every few seconds while this dialog is open.
-    const lossTimer = setInterval(() => { loadLoss().catch(() => {}); }, 15000);
-    loadLoss().catch(() => {});
+    // Fast-poll focus (see the interface dialog) keeps new samples landing
+    // every few seconds while this dialog is open.
+    const lossTimer = setInterval(() => { loadCharts().catch(() => {}); }, 15000);
+    loadCharts().catch(() => {});
 
     Promise.all([
       App.get(`/api/nodes/devices/${deviceId}`),

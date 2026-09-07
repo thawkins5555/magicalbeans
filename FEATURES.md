@@ -783,6 +783,14 @@ table that nothing populates — a 7-day option would be permanently empty. The
 status timeline keeps every range, since it is built from the event log rather
 than from samples.
 
+**From 5.0.0, a RESOURCES section under PACKET LOSS charts CPU, memory and
+chassis temperature** over that same range, sharing its dropdown and its
+fifteen-second refresh rather than running a fetch loop of its own. CPU and
+memory are pinned to 0–100 % like the loss chart; chassis temperature scales
+to what the device actually reports, since it has no fixed ceiling to pin
+against. A metric this device has never reported — no chassis sensor, say —
+just leaves its chart out rather than showing an empty one.
+
 **From 4.53.0, the device dialog also has a HARDWARE SENSORS section and a
 device-wide DOM / SFP SENSORS table.** HARDWARE SENSORS shows the latest
 polled CPU/memory/temperature figures, a live whole-device

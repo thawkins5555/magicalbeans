@@ -384,6 +384,10 @@ body.tiny .brand span { display: none; }
 .nd-summary .nd-v { color: var(--text); overflow-wrap: anywhere; }
 .nd-summary .nd-err { color: var(--fail); }
 .nd-summary .warn-text { color: var(--warn); }
+/* One small chart per resource metric this device actually has, wrapping
+   rather than a fixed column count so one, two or three charts each get a
+   sensible width. */
+.nd-resources { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: var(--space-sm); }
 /* The device dialog's two chassis-temperature rule blocks (TEMPERATURE
    ALERTS, 4.54.0): a plain top border between them, the same divider
    .scope-trend already uses, rather than a full <fieldset> box each — this
