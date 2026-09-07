@@ -477,6 +477,8 @@ On Windows the collector binds with `SO_EXCLUSIVEADDRUSE` rather than `SO_REUSEA
 
 Point exporters at this machine on UDP 2055 (or whatever port you set). On Cisco IOS the shape is `ip flow-export version 9` plus `ip flow-export destination <this-host> 2055`, with `ip flow ingress` on the interfaces you care about; other vendors differ but need the same three things. Windows Firewall will need an inbound UDP rule for the port, and the collector must be running for flows to be stored — it does not backfill.
 
+The same applies to the WEB button on a Nodes device, which opens a tunnel from this machine to that device's own web interface on a port from the range set under **Settings → Sign-in** (40000-40999 by default): the range needs an inbound TCP rule for browsers on other machines to reach it. Windows Firewall prompts per executable on the first bind of an unopened port, which is why the default is a named range rather than an ephemeral port — one rule instead of a prompt a week.
+
 ## IPAM
 
 Subnet discovery, IP conflict detection, and read-only visibility into a

@@ -677,6 +677,78 @@ key: deleting a device from Nodes (a Nodes write) leaves it in place, so a
 lower permission cannot reset the trust anchor by removing and re-adding
 the device.
 
+## 7a. The device WEB tunnel (Nodes → WEB)
+
+The WEB button on a device opens a short-lived TCP relay on this host to
+that device's own web interface (`netpath/webrelay.py`). It carries no
+credential of its own — the device's login page asks for whatever it asks
+for, and this application never sees the answer — so what this section is
+about is the *reachability* it grants, which is a power in its own right.
+Until 5.1.0 the button was a link straight to `http://<ip>/` and touched
+this server not at all.
+
+**Its own permission, granted to nobody by default and to nobody on
+upgrade.** `nodes: read` means "may see this device"; it has never meant
+"may open a port on the monitoring server into the management plane", and
+this does not widen it. A separate **web** module in the per-account
+permission grid gates the button, all three routes and the tunnel itself.
+Unlike `ssh`, there is no upgrade backfill at all: a missing permission row
+already means no access, and the capability is new, so no existing account
+inherits it. A fresh install's seeded administrator has it because that
+account is created with every module.
+
+**The destination comes from the device row and cannot be asked for.** The
+POST that opens a tunnel carries a device id and nothing else; the address,
+scheme and port are read from that device's own record. A body naming a host
+and port would have turned this into a general outbound proxy from this
+server's address — every device it can reach, on every port — rather than
+the one device an operator selected.
+
+**The port is gated on an address, because the bytes are never inspected.**
+A tunnel admits connections only from the address this server saw the
+operator's browser arrive from, compared through the same normalisation
+every other allow list here uses. Nothing else can be checked: the relay
+copies bytes without reading them, so there is no session cookie and no
+request line for it to look at. A refused source is closed before a byte
+crosses and written to the device's event log once per tunnel, not once per
+attempt. This is also why a reverse proxy in front of the web interface
+defeats the gate — see `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
+
+**Every other bound therefore matters as much as that one.** A tunnel closes
+after a minute if nothing ever connects to it; after fifteen minutes with no
+traffic, or the sign-in's own idle limit if that is shorter; when the
+sign-in behind it ends, by sign-out, idle or a removed account; and within
+five seconds of the `web` permission being taken away, which the tunnel
+re-reads while it runs rather than settling at the click. At most sixteen
+tunnels are open at once, four per account, thirty-two connections through
+each. Shutting the application down closes them all.
+
+**A sibling port cannot drive this API.** The tunnel listens on its own port
+on this host, so a page served through it is a different origin from the
+application's own: the session cookie is `SameSite=Strict` and
+origin-checked on every state-changing request, and the
+Content-Security-Policy on this application's pages is `default-src 'self'`.
+What a sibling port *does* share is the browser's cookie jar for the
+device's own UI — sign out of a device's management page when finished with
+it, the same as you would in any other tab.
+
+**The audit trail is byte counts and never content.** The device's event log
+gets one line when a tunnel opens, naming the account, the address it will
+admit and where it points, and one when it closes, with how many connections
+crossed it and how many bytes went each way. There is no line anywhere
+carrying what those bytes were, because nothing in the path ever read them.
+The application's own audit log gets `web.relay.open` and `web.relay.close`
+beside them.
+
+**The device keeps its own certificate.** A device on `https` has its TLS
+carried through untouched, so the browser validates the device's
+certificate, not this server's — which means the warning names the device,
+which is correct, and means this application is not in a position to read
+the session even if it wanted to be. The corollary is that a device page
+whose links are absolute (`http://10.2.0.7/status`) leaves the tunnel the
+moment one is followed, and then only works from a machine with its own
+route to the device.
+
 ## 8. What this application deliberately never does
 
 - Never stores a password in a form that can be turned back into the

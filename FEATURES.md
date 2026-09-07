@@ -791,12 +791,28 @@ from — never the password. **Remove** now lives in the device's Edit dialog, b
 credential, so the pane's buttons are the things you do *to* a device
 rather than the one thing you do to get rid of it.
 
-**A WEB button sits beside SSH**, styled to match it and, from 4.53.0, a
-button rather than a link, opening the device's own web interface
-(`http://<ip>/`, IPv6 bracketed) in a new tab. Unlike
-SSH it carries no permission of its own — it opens nothing on this
-server, only a tab in the browser — so it shows for anyone who can see the
-device at all, once the device has an address to link to.
+**A WEB button sits beside SSH**, styled to match it, opening the device's
+own web interface in a new window. Until 5.1.0 it pointed the browser
+straight at `http://<ip>/`, which only works from a machine with a route to
+the management plane; it now opens a short-lived **tunnel** on this server
+instead, so the browser talks to this machine and this machine talks to the
+device — the same reach the poller already has. Where the tunnel goes comes
+from the device's own record (the **WEB INTERFACE** fields on Edit: scheme
+and port, blank meaning `http` on 80) and from nowhere else. The tunnel's
+port accepts connections only from the address you are browsing from, closes
+after fifteen minutes with no traffic — or sooner, if your sign-in's idle
+timeout is shorter — closes after a minute if nothing ever connects, closes
+when you sign out, and closes the moment the permission is taken away;
+**Close** beside the button ends it at once. Because it opens a listening
+port on this server it has its own **web** permission, granted to nobody by
+default and to no account on upgrade. The bytes are copied without being
+read, so a device on `https` presents its own certificate (your browser will
+name the device in the warning, not this server), a page whose links are
+absolute steps outside the tunnel when you follow one, and the device's
+event log records how many bytes crossed in each direction and never what
+they were. The port range the tunnels bind is set under **Settings →
+Sign-in**; it needs an inbound TCP rule in this host's firewall for browsers
+on other machines to reach it.
 
 **The status timeline is the device pane's headline** — a thin colored
 bar of up/down/unsupported/auth-failed segments across the selected time

@@ -6902,6 +6902,20 @@ so an administrator who deliberately takes the permission away is not
 handed it back on the next restart. The Settings permission grid renders
 from `permissions.MODULES`, so the new column appears on its own.
 
+**The `web` permission and its deliberate lack of one.** 5.1.0's `web`
+module (the device WEB relay, above) is the second entry with no tab. It
+sits between `debug` and `ssh` in `permissions.MODULES` rather than being
+appended, so `MODULES[-2:] == ("ssh", "admin")` — pinned by
+`test_web_security.py` — still holds; the tuple's position is the only
+thing that moves, since `user_permissions` is keyed `(username, module)`.
+It joins `appdb.POST_SSH_MODULES`, which is what keeps it out of
+`_backfill_ssh_permission`'s "holds write on everything else" test — the
+trap 4.54's `mapper` walked into. It has no backfill of its own, and
+`backfill_permissions`'s docstring says why: a missing row already means no
+access, and opening a listening port on this host into the management plane
+is a capability nobody held before, so nobody inherits it. A fresh install's
+seeded admin gets it from `_ensure_default_user`'s "every module" grant.
+
 ### SSH host keys (`hostkeys.py`, `configrxdb.ssh_host_keys`)
 
 `netpath/hostkeys.py` owns one table, `ssh_host_keys` in configrx.db, keyed
@@ -7015,6 +7029,69 @@ it nowhere else) and the host-key warning, which shows both fingerprints
 and when the stored key was first seen behind **Trust the new key** and
 **Cancel**. `beforeunload` closes the socket, which is the whole client-side
 cleanup: the server tears the session down when the socket goes.
+
+### The device WEB relay (`webrelay.py`)
+
+`WebRelayRegistry` holds every live `WebRelaySession`; a session is one
+listening TCP socket on this host that carries bytes, unread, to one
+device's own web interface. Three routes drive it — `POST
+/api/web/devices/<id>/relay`, `GET /api/web/relays`, `DELETE
+/api/web/relays/<id>` — all gated `("web", write)`, since there is no
+read-only half of "reach that device's management page through this
+server". Session ids start with `"r"` because `server.py`'s `_route`
+converts an all-digit path group to an `int` before the handler sees it, and
+a random token can be all digits.
+
+**The destination.** `device_web_target(row)` is the only place a target is
+decided: the device's `ip`, its `web_scheme` and `web_port` columns
+(`nodesdb._DEVICE_ONLY_COLUMNS` — settable per device, never inherited from
+a polling profile), defaulting to `http` on 80. The POST body is ignored
+entirely. `api._web_port_effective` calls the same function, so the form's
+placeholder and the relay's destination cannot drift.
+
+**Binding.** Under the registry lock, so two clicks cannot pass a cap only
+one fits or pick the same free port. Ports come from
+`web_relay_port_range` (default `40000-40999`, `"0"` for an ephemeral
+port), tried in a random order, with an exhausted range raising `ValueError`
+→ 400. `relay_bind_host` follows the UI's own `web_host`, so a listener
+pinned to loopback does not get relays on every interface.
+`SO_EXCLUSIVEADDRUSE` on Windows and no `SO_REUSEADDR` anywhere: sharing a
+relay port is the one thing that must not happen.
+
+**Threads.** One accept thread and one watchdog per session, plus two per
+connection (a handler that dials the device and runs one direction inline,
+and a pump thread for the other). Blocking threads rather than one selector
+on purpose: Windows' `select()` takes a fixed 512-entry `FD_SET` and there
+is no portable `poll` in the standard library, so sixteen relays of
+thirty-two connections would be past it. The listener carries a half-second
+timeout so closing it is not the only thing that can end the accept loop.
+
+**What closes one.** `_watch_tick`, once a second: the first-connect window
+(60 s) while nothing has connected, then the idle timeout — `min(900,
+sessions.idle_seconds)`, the same cap `sshterm` applies — then the web
+session going away, then the `web` permission, re-read every five ticks.
+`stop()` closes the listener, then every live connection socket, so a pump
+parked in `recv()` fails at once rather than outliving the tunnel;
+`shutdown()` stops every session concurrently under one 3-second budget and
+runs before the databases close, because a closing relay writes a device
+event.
+
+**The URL.** `params["_host"]` is added in `server.py`'s `_route` — handlers
+otherwise cannot see the `Host` header — and `url_host` strips its port. The
+URL therefore names whatever address the browser used to reach the interface
+(a hostname, a NAT address, `localhost`), which is the only address it is
+known to be able to reach; deriving it from the listener would hand a
+machine on the plant network a URL naming `0.0.0.0`. The scheme is the
+device's, not this server's, since the relay is a raw TCP copy and a device
+on `https` carries its own TLS through.
+
+**The client.** `nodes.js`'s `webDevice()` opens the window *before* the
+POST and sets its `location` afterwards: a `window.open` that runs after an
+`await` is no longer inside the click that caused it and every popup blocker
+eats it. The window is named per device, like the SSH one, so a second click
+raises the tab that is already open; `noopener` cannot be in the feature
+string for that reason, so `opener` is cleared on the handle instead. A
+refused POST closes the window it claimed.
 
 ### Vendored frontend libraries (`static/vendor/`)
 

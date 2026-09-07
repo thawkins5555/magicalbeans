@@ -4,7 +4,9 @@ Everything the application needs on the network and everything it writes to
 disk, in one place.
 
 Nothing outside this document is opened, contacted or written: there is no
-telemetry, no update check, no outbound connection and no file created anywhere
+telemetry, no update check, no outbound connection to anywhere but the plant
+(the poller's own targets, and — from 5.1.0 — a device's own web interface
+when an operator opens a WEB tunnel to it), and no file created anywhere
 other than the locations below. How the credentials that do exist — a web
 login password, an optional stored DHCP credential, an optional stored
 SNMPv3, SMTP, Wireless SNMP or ConfigRX SSH credential — are protected is
@@ -19,6 +21,7 @@ covered in full in `CREDENTIAL-SECURITY.md`, not repeated here.
 | Purpose | Protocol | Port | Required? |
 | --- | --- | --- | --- |
 | Web interface | TCP | 8443 (configurable) | Only when running with `--headless` |
+| Device WEB tunnels | TCP | 40000-40999 (configurable, one port per open tunnel) | Only if the WEB button on a Nodes device is used |
 | NetFlow / IPFIX collector | UDP | 2055 (configurable) | Only if the NetFlow module is used |
 | SNMP trap receiver | UDP | 162 (configurable) | Only if the SNMP Trap module is used |
 | Syslog collector | UDP | 514 (configurable) | Only if the Syslog module is used |
@@ -176,6 +179,24 @@ config" command per connection — plus, for a vendor without a privileged
 login shell (currently just Cisco ASA), the fixed `enable` command,
 answered with that device's own stored enable secret — never anything
 that could change a device's configuration.
+
+A **device WEB tunnel** is the other outbound TCP connection this
+application makes, and only while an operator has one open: a connection to
+one device's own web interface, on the scheme and port that device's record
+names (`http` on 80 when it names neither). The bytes are copied in both
+directions without being read, so the device's own TLS — and its own
+certificate — passes through untouched. The listening half is in the inbound
+table above.
+
+**Behind NAT or a reverse proxy.** A tunnel admits exactly one address: the
+one this server sees the operator's browser connecting from. Put a reverse
+proxy or a NAT gateway in front of the web interface and that address is the
+proxy's, so the tunnel then admits anything that can reach the proxy — which
+is not what the gate is for. Run the web interface without one, or accept
+that the tunnel's address gate is only as narrow as the set of clients that
+reach the proxy. The URL the button opens names whatever host the browser
+used to reach the interface, so a proxied deployment also has to forward the
+tunnel's port range for the window to open at all.
 
 ### Local
 
