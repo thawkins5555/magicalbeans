@@ -580,6 +580,11 @@ DEFAULTS = {
     "vendor_walk_budget_s": 20.0,
     "vendor_walk_parallel": 4,
     "discovery_arc_hop": True,
+    # A bounded ipAdEntAddr walk per identified address, so a sweep that
+    # reaches one router on two of its L3 addresses can tell it is one
+    # router rather than offering it twice. Off makes a sweep exactly
+    # 4.54's: one row per address, nothing folded.
+    "discovery_addresses": True,
 }
 
 # How wide a chart window still reads raw samples. Wider than this reads
@@ -637,6 +642,22 @@ _ID_CHUNK = 500
 def _id_chunks(ids: list[int], size: int = _ID_CHUNK):
     for start in range(0, len(ids), size):
         yield ids[start:start + size]
+
+
+_CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+
+def alias_candidate(ip) -> str:
+    """The address as it would be stored in device_addresses, or "" for one
+    that must never be: every device reports 127.0.0.1 in its ipAddrTable,
+    and storing that would make one arbitrary device the owner of
+    everything sent from localhost. Shared by record_device_addresses and
+    by discovery, so identity folding and alias storage can never disagree
+    about which addresses count."""
+    text = str(ip or "").strip()
+    if not text or text.startswith("127.") or text in ("0.0.0.0", "::1", "::"):
+        return ""
+    return text
 
 
 def normalize_mac(text) -> str:
@@ -962,6 +983,18 @@ class NodesDatabase(SqliteStore):
             "stp_state": "TEXT", "poe_power_mw": "INTEGER",
         })
 
+        # Every L3 address a sweep reached one device on, as JSON, and the
+        # result this one was folded into when two probed addresses turned
+        # out to be the same box.
+        self.ensure_columns("discovery_results", {
+            "ip_addresses": "TEXT", "folded_into_result_id": "INTEGER",
+        })
+        # What the hourly ipAddrTable walk reads beside the address itself,
+        # so an alias can be shown as the interface and subnet it belongs to
+        # rather than a bare address.
+        self.ensure_columns("device_addresses", {
+            "if_index": "INTEGER", "netmask": "TEXT",
+        })
         # _NEIGHBOR_MATCH_SQL's two case-insensitive joins, which every
         # neighbour read and every map GET runs. Declared NOCASE because a
         # collated comparison can only use an index of the SAME collation:
@@ -1925,7 +1958,8 @@ class NodesDatabase(SqliteStore):
 
     # ------------------------------------------------------- device addresses
 
-    def record_device_addresses(self, device_id: int, ips, source: str) -> int:
+    def record_device_addresses(self, device_id: int, ips, source: str,
+                                details: dict | None = None) -> int:
         """Remember the addresses a device answers on besides its primary
         `ip`, so a trap or syslog message from its loopback or its
         management VRF correlates to the device that sent it.
@@ -1935,18 +1969,24 @@ class NodesDatabase(SqliteStore):
         seen for it, and dropping it would silently un-correlate whatever
         is still sending from there. Rows for the device's own primary
         address are skipped — that one lives in `devices.ip` and
-        device_id_for_address already falls back to it. Loopback and
-        unspecified addresses are skipped too: every device reports
-        127.0.0.1 in its ipAddrTable, and storing that would make one
-        arbitrary device the owner of everything sent from localhost.
+        device_id_for_address already falls back to it. Which addresses
+        may be stored at all is alias_candidate's decision.
+
+        `details` is {ip: {"if_index": int, "netmask": str}} where the
+        walk read them. COALESCEd rather than overwritten, so a source
+        that knows only the address (a trap, or a discovery fold) never
+        erases what the poller's fuller walk already learned.
         """
         now = time.time()
+        details = details or {}
         rows = []
         for ip in ips or ():
-            text = str(ip or "").strip()
-            if not text or text.startswith("127.") or text in ("0.0.0.0", "::1", "::"):
+            text = alias_candidate(ip)
+            if not text:
                 continue
-            rows.append((device_id, text, source or "", now))
+            extra = details.get(text) or {}
+            rows.append((device_id, text, source or "", now,
+                         extra.get("if_index"), extra.get("netmask")))
         if not rows:
             return 0
         with self._lock:
@@ -1960,9 +2000,12 @@ class NodesDatabase(SqliteStore):
             if not rows:
                 return 0
             self._conn.executemany(
-                "INSERT INTO device_addresses(device_id, ip, source, seen_ts)"
-                " VALUES (?,?,?,?) ON CONFLICT(device_id, ip) DO UPDATE SET"
-                " source=excluded.source, seen_ts=excluded.seen_ts", rows)
+                "INSERT INTO device_addresses(device_id, ip, source, seen_ts,"
+                " if_index, netmask) VALUES (?,?,?,?,?,?)"
+                " ON CONFLICT(device_id, ip) DO UPDATE SET"
+                " source=excluded.source, seen_ts=excluded.seen_ts,"
+                " if_index=COALESCE(excluded.if_index, device_addresses.if_index),"
+                " netmask=COALESCE(excluded.netmask, device_addresses.netmask)", rows)
             self._conn.commit()
         return len(rows)
 
@@ -1989,6 +2032,217 @@ class NodesDatabase(SqliteStore):
             return self._conn.execute(
                 "SELECT * FROM device_addresses WHERE device_id = ? ORDER BY ip",
                 (device_id,)).fetchall()
+
+    # ------------------------------------------- identity, duplicates, merge
+
+    def address_owners(self) -> dict[str, int]:
+        """Every alias address in the fleet -> the device that answers on
+        it. One read rather than a device_id_for_address() per candidate:
+        discovery asks this once per sweep and then tests every address it
+        walked against the answer."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ip, device_id FROM device_addresses"
+                " ORDER BY seen_ts").fetchall()
+        return {row["ip"]: row["device_id"] for row in rows}
+
+    def devices_by_identity(self) -> dict[tuple, sqlite3.Row]:
+        """(sys_name lowercased, sysObjectID) -> the lowest-id device that
+        answers with both. Only ever a hint — two switches out of the same
+        box with the same default hostname share this key honestly — which
+        is why nothing folds on it without an address to agree."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM devices WHERE sys_name <> '' AND"
+                " sys_object_id IS NOT NULL AND sys_object_id <> ''"
+                " ORDER BY id").fetchall()
+        index: dict[tuple, sqlite3.Row] = {}
+        for row in rows:
+            index.setdefault(
+                ((row["sys_name"] or "").lower(), row["sys_object_id"] or ""), row)
+        return index
+
+    # A MAC every member of an HSRP/VRRP group answers with. Two routers
+    # sharing one of these are a working redundant pair, which is the
+    # opposite of the same device twice, so a match on one is no evidence
+    # at all rather than weak evidence.
+    _VIRTUAL_MAC_PREFIXES = ("00005e0001", "00005e0002", "00000c07ac")
+
+    def duplicate_candidates(self, limit: int = 200) -> list[dict]:
+        """Pairs of devices that look like one device entered twice, newest
+        evidence first. Never acts: every pair here is something an
+        operator is asked about, because the three sources below are each
+        wrong in a way only a human can see — a NAT'd management address, a
+        chassis MAC reused across a stack, a hostname a template set on
+        forty switches.
+
+        Confidence is what the evidence can carry on its own: an address
+        two devices both claim is one device answering twice (high); a
+        shared chassis MAC is high with a second MAC or a matching hostname
+        behind it and medium alone; hostname plus sysObjectID is medium;
+        hostname alone is low.
+        """
+        pairs: dict[tuple, dict] = {}
+
+        def entry(a_id: int, b_id: int) -> dict:
+            lo, hi = (a_id, b_id) if a_id < b_id else (b_id, a_id)
+            return pairs.setdefault((lo, hi), {
+                "a_id": lo, "b_id": hi, "reasons": [], "shared_macs": 0,
+                "suggested_winner_id": lo, "confidence": "low",
+            })
+
+        with self._lock:
+            alias_primary = self._conn.execute(
+                "SELECT da.device_id AS a_id, d.id AS b_id, da.ip AS ip"
+                " FROM device_addresses da JOIN devices d ON d.ip = da.ip"
+                " WHERE d.id <> da.device_id").fetchall()
+            alias_alias = self._conn.execute(
+                "SELECT a.device_id AS a_id, b.device_id AS b_id, a.ip AS ip"
+                " FROM device_addresses a JOIN device_addresses b"
+                " ON a.ip = b.ip AND a.device_id < b.device_id").fetchall()
+            macs = self._conn.execute(
+                "SELECT i1.device_id AS a_id, i2.device_id AS b_id,"
+                " i1.phys_addr AS mac FROM interfaces i1 JOIN interfaces i2"
+                " ON i1.phys_addr = i2.phys_addr COLLATE NOCASE"
+                " AND i1.device_id < i2.device_id"
+                " WHERE i1.phys_addr IS NOT NULL AND i1.phys_addr <> ''"
+                " AND i1.phys_addr <> '000000000000'"
+                " AND i1.phys_addr <> 'ffffffffffff'").fetchall()
+            names = self._conn.execute(
+                "SELECT d1.id AS a_id, d2.id AS b_id, d1.sys_name AS sys_name,"
+                " (d1.sys_object_id = d2.sys_object_id AND d1.sys_object_id <> '')"
+                " AS same_oid FROM devices d1 JOIN devices d2"
+                " ON d1.sys_name = d2.sys_name COLLATE NOCASE AND d1.id < d2.id"
+                " WHERE d1.sys_name <> ''").fetchall()
+
+        for row in list(alias_primary) + list(alias_alias):
+            item = entry(row["a_id"], row["b_id"])
+            reason = f"both answer on {row['ip']}"
+            if reason not in item["reasons"]:
+                item["reasons"].append(reason)
+            item["confidence"] = "high"
+
+        mac_pairs: dict[tuple, set] = {}
+        for row in macs:
+            mac = normalize_mac(row["mac"])
+            if not mac or any(mac.startswith(p) for p in self._VIRTUAL_MAC_PREFIXES):
+                continue
+            key = (row["a_id"], row["b_id"])
+            mac_pairs.setdefault(key, set()).add(mac)
+        name_pairs = {(row["a_id"], row["b_id"]): row for row in names}
+        for (a_id, b_id), shared in mac_pairs.items():
+            item = entry(a_id, b_id)
+            item["shared_macs"] = len(shared)
+            item["reasons"].append(
+                f"{len(shared)} shared interface MAC(s), including {sorted(shared)[0]}")
+            if item["confidence"] != "high":
+                item["confidence"] = "high" if (
+                    len(shared) >= 2 or (a_id, b_id) in name_pairs) else "medium"
+
+        for (a_id, b_id), row in name_pairs.items():
+            item = entry(a_id, b_id)
+            item["reasons"].append(
+                f"both call themselves {row['sys_name']}"
+                + (" with the same sysObjectID" if row["same_oid"] else ""))
+            if item["confidence"] == "low":
+                item["confidence"] = "medium" if row["same_oid"] else "low"
+
+        ordered = sorted(pairs.values(),
+                         key=lambda item: (_CONFIDENCE_ORDER.get(item["confidence"], 3),
+                                           item["a_id"], item["b_id"]))
+        return ordered[:max(1, int(limit))]
+
+    _MERGE_COUNT_QUERIES = (
+        ("addresses", "SELECT COUNT(*) FROM device_addresses WHERE device_id = ?"),
+        ("interfaces", "SELECT COUNT(*) FROM interfaces WHERE device_id = ?"),
+        ("events", "SELECT COUNT(*) FROM device_events WHERE device_id = ?"),
+        ("metrics", "SELECT COUNT(*) FROM metrics WHERE device_id = ?"),
+        ("neighbours", "SELECT COUNT(*) FROM neighbors WHERE device_id = ?"),
+        ("mac_entries", "SELECT COUNT(*) FROM mac_entries WHERE device_id = ?"),
+        ("vlans", "SELECT COUNT(*) FROM vlans WHERE device_id = ?"),
+        ("port_vlans", "SELECT COUNT(*) FROM port_vlans WHERE device_id = ?"),
+        ("upstream_children", "SELECT COUNT(*) FROM devices WHERE upstream_id = ?"),
+    )
+
+    def merge_plan(self, loser_id: int, winner_id: int) -> dict:
+        """What merging would move and what it would discard, counted
+        without writing anything — the dialog shows this before the
+        operator presses Merge, because a merge cannot be undone."""
+        loser = self.device(loser_id)
+        winner = self.device(winner_id)
+        if loser is None or winner is None:
+            raise ValueError("Both devices must exist")
+        if loser_id == winner_id:
+            raise ValueError("A device cannot be merged into itself")
+        counts = {}
+        with self._lock:
+            for name, query in self._MERGE_COUNT_QUERIES:
+                counts[name] = int(
+                    self._conn.execute(query, (loser_id,)).fetchone()[0])
+        return {"loser_id": loser_id, "winner_id": winner_id, "counts": counts}
+
+    def merge_devices(self, loser_id: int, winner_id: int) -> dict:
+        """Fold the loser into the winner: one transaction, and the loser's
+        row is gone at the end of it.
+
+        What moves is what belongs to the box rather than to the row — its
+        addresses (its own primary among them, now an alias saying where it
+        used to be reachable), the events that are its history, and
+        anything pointing at it. What does NOT move is the polled state
+        both rows hold twice over: interfaces, metrics, MAC and neighbour
+        tables are the same physical ports read through a second address,
+        and the winner is already refreshing them. Those go with the loser
+        through the FK cascade, except vlans/vlan_ports/port_vlans, which
+        have no foreign key and are deleted here by hand.
+        """
+        plan = self.merge_plan(loser_id, winner_id)
+        now = time.time()
+        with self._lock:
+            loser = self._conn.execute(
+                "SELECT * FROM devices WHERE id = ?", (loser_id,)).fetchone()
+            winner = self._conn.execute(
+                "SELECT * FROM devices WHERE id = ?", (winner_id,)).fetchone()
+            try:
+                self._conn.execute(
+                    "UPDATE OR IGNORE device_addresses SET device_id = ?"
+                    " WHERE device_id = ?", (winner_id, loser_id))
+                # An alias whose address the winner already answers on
+                # primarily is not an alias at all any more.
+                self._conn.execute(
+                    "DELETE FROM device_addresses WHERE device_id = ? AND ip = ?",
+                    (winner_id, winner["ip"]))
+                if loser["ip"] and loser["ip"] != winner["ip"]:
+                    self._conn.execute(
+                        "INSERT INTO device_addresses(device_id, ip, source,"
+                        " seen_ts) VALUES (?,?,?,?)"
+                        " ON CONFLICT(device_id, ip) DO UPDATE SET"
+                        " source=excluded.source, seen_ts=excluded.seen_ts",
+                        (winner_id, loser["ip"], "merge", now))
+                self._conn.execute(
+                    "UPDATE devices SET upstream_id = ? WHERE upstream_id = ?"
+                    " AND id <> ?", (winner_id, loser_id, winner_id))
+                self._conn.execute(
+                    "UPDATE devices SET upstream_id = NULL WHERE id = ?"
+                    " AND upstream_id = ?", (winner_id, loser_id))
+                self._conn.execute(
+                    "UPDATE device_events SET device_id = ? WHERE device_id = ?",
+                    (winner_id, loser_id))
+                for table in ("vlans", "vlan_ports", "port_vlans"):
+                    self._conn.execute(
+                        f"DELETE FROM {table} WHERE device_id = ?", (loser_id,))
+                self._conn.execute(
+                    "UPDATE discovery_results SET promoted_device_id = ?"
+                    " WHERE promoted_device_id = ?", (winner_id, loser_id))
+                self._conn.execute(
+                    "UPDATE vendor_learned SET source_device_id = ?"
+                    " WHERE source_device_id = ?", (winner_id, loser_id))
+                self._conn.execute("DELETE FROM devices WHERE id = ?", (loser_id,))
+            except Exception:
+                self._conn.rollback()
+                raise
+            self._conn.commit()
+            self._config_generation += 1
+        return plan
 
     # ------------------------------------------------------------- interfaces
 

@@ -294,6 +294,41 @@ class MapperDatabase(SqliteStore):
             self._conn.commit()
         return changed
 
+    def reassign_device(self, old_device_id: int, new_device_id: int) -> int:
+        """Two device rows turned out to be one device: every placement of
+        the old id becomes a placement of the new one.
+
+        On a map where both were placed, the old node is deleted rather
+        than repointed — ux_map_nodes_device would refuse the update, and
+        two icons for one switch is exactly what the merge is undoing. The
+        winner's own position is the one kept: it is the node the operator
+        has been looking at.
+        """
+        moved = 0
+        now = time.time()
+        with self._lock:
+            touched = set()
+            rows = self._conn.execute(
+                "SELECT id, map_id FROM map_nodes WHERE device_id = ?",
+                (old_device_id,)).fetchall()
+            already = {row["map_id"] for row in self._conn.execute(
+                "SELECT map_id FROM map_nodes WHERE device_id = ?",
+                (new_device_id,)).fetchall()}
+            for row in rows:
+                if row["map_id"] in already:
+                    self._conn.execute(
+                        "DELETE FROM map_nodes WHERE id = ?", (row["id"],))
+                else:
+                    self._conn.execute(
+                        "UPDATE map_nodes SET device_id = ? WHERE id = ?",
+                        (new_device_id, row["id"]))
+                    moved += 1
+                touched.add(row["map_id"])
+            for map_id in touched:
+                self._touch_map(map_id, now)
+            self._conn.commit()
+        return moved
+
     def remove_node(self, map_id: int, node_id: int) -> bool:
         with self._lock:
             cur = self._conn.execute(

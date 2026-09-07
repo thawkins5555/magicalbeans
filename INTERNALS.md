@@ -1397,6 +1397,138 @@ as already answered instead of popping a dialog apiece on first open.
 poller's check is the rule — and creates an approved ping-only device
 with a `snmp_enabled = 0` override so it doesn't fail SNMP every poll.
 
+Address walk (5.0.0): a result that answered the identity GET is then
+asked for `ipAdEntAddr` alone — one column, through
+`_snmp_walk_column`, which is `_snmp_getnext_one` in a loop bounded by
+the subtree prefix, 32 rows, a non-advancing answer and the end of the
+MIB. It is not `nodepoll._walk_column`: that needs a polled device's
+merged config and a session this module has no business building. A
+mid-walk `SnmpError` returns what was already collected. The addresses
+land in `discovery_results.ip_addresses` as JSON, filtered through
+`nodesdb.alias_candidate` so the loopback every agent reports is never
+one of them. `discovery_addresses` (default on) turns the whole thing
+off, which makes a sweep exactly 4.54's.
+
+Within one sweep, `owners` maps each address to the first result that
+reached it; `fold_target(mine, owners)` and
+`register_addresses(owners, id, mine)` are pure so the rule is testable
+without a socket. A later result that shares an address gets
+`folded_into_result_id` and does not count towards the job's
+`identified` figure — that figure is how many devices the sweep found,
+not how many addresses answered.
+
+### Device identity, addresses and merge (`nodesdb.py`, `nodepoll.py`, `web/api.py`) — 5.0.0
+
+`devices.ip` is UNIQUE and, until 5.0, was the whole of a device's
+identity. A router reached on its loopback and again on a management
+address was two devices: two rows polling one box, two sets of alerts,
+two icons on a map, two link endpoints for one cable.
+
+`device_addresses` already held the extra addresses — the hourly
+`ipAddrTable` walk and `snmptrapd` both write it, so a trap from a
+loopback could be attributed — but nothing read it for identity. 5.0
+reads it in four places, and in none of them does anything merge by
+itself.
+
+**Where an address is decided.** `alias_candidate(ip)` is the one rule
+for which addresses count: not blank, not `127.*`, not `0.0.0.0`/`::`.
+`record_device_addresses` and discovery both go through it, so alias
+storage and identity folding cannot disagree. The device's own primary
+stays in `devices.ip` and is deliberately never mirrored into
+`device_addresses`; `device_id_for_address` checks the primary first and
+the aliases second, because the primary is the address an operator
+configured and an alias is only ever supporting evidence.
+`_migrate` adds `device_addresses.if_index`/`netmask` (COALESCEd on
+upsert, so a source that knows only the address — a trap, a discovery
+fold — never erases what the poller's fuller walk learned) and
+`discovery_results.ip_addresses`/`folded_into_result_id`.
+
+**Confidence, and what each level may do.** `_discovery_duplicate` in
+`api.py` grades every discovery result against `_device_index(service)`
+(one pass over the fleet per listing: primary IPs, aliases, and a
+`(sysName, sysObjectID)` map):
+
+- **high** — one of the addresses this box answered on is already a
+  device's. Nothing else honestly explains that, so `promote()` records
+  the addresses on the existing device and marks the result promoted to
+  it instead of adding a row beside it.
+- **medium** — sysName and sysObjectID both match a device the sweep
+  never reached on any shared address. Two switches out of the same
+  carton share that honestly, so it is a reason to look before ticking
+  and never a reason to fold. The approval dialog leaves such a row
+  unticked; ticking it adds the device.
+
+`promote(job_id, result_ids, force=False)` resolves a folded result to
+its primary first (ticking either row adds the one device), and `force`
+skips the fold for the operator who has looked at the pair and says they
+really are two boxes.
+
+**Manual add and bulk import.** `api.Conflict(ValueError)` carries a
+`payload`; `server.py`'s arm for it sits **before** the `ValueError` arm
+and answers 409 with that payload merged into the body. `POST
+/api/nodes/devices` raises it when the address belongs to a device
+already — naming that device, so the browser can offer "Add anyway"
+(`force: true`) rather than only printing a refusal. Bulk import puts the
+same case in its existing `duplicate` disposition with `device_id` and
+`device_name`, and a body-level `force: true` imports them.
+
+**Finding duplicates already on file.** `duplicate_candidates(limit)`
+runs three self-joins and merges them per pair:
+
+| Source | Confidence |
+|---|---|
+| An address two devices both claim (alias vs primary, alias vs alias) | high |
+| A shared interface MAC | high with two or more, or with a matching sysName; medium alone |
+| sysName plus sysObjectID | medium |
+| sysName alone | low |
+
+The MAC source excludes the all-zero and broadcast addresses and the
+HSRP/VRRP virtual prefixes (`00005e0001`, `00005e0002`, `00000c07ac`):
+two routers sharing one of those are a working redundant pair, which is
+the opposite of the same device twice. `ix_interfaces_phys_addr_nocase`
+and `ix_devices_sys_name_nocase` keep the two case-insensitive joins off
+a full scan.
+
+**Merging.** `merge_plan` counts without writing; the dialog shows that
+before the operator commits, because a merge cannot be undone.
+`post_nodes_device_merge` executes in the order `delete_nodes_device`
+already established for the same reason — ConfigRX, Alerts, Mapper, then
+Nodes last — so a crash between two of them leaves a nodes row that still
+owns whatever has not moved yet, rather than rows in three other files
+keyed on an id SQLite is about to reissue.
+
+`merge_devices` moves what belongs to the box rather than to the row: its
+addresses (its own primary among them, now an alias with source `merge`,
+saying where it used to be reachable), its `device_events`, the
+`upstream_id` children pointing at it, and the `discovery_results` /
+`vendor_learned` rows naming it. What it does **not** move is the polled
+state both rows hold twice over — interfaces, metrics, MAC and neighbour
+tables are the same physical ports read through a second address, and the
+winner is already refreshing them. Those go with the loser through the FK
+cascade, except `vlans`/`vlan_ports`/`port_vlans`, which have no foreign
+key on `devices` at all and are deleted explicitly.
+
+The other three stores each answer the same question their own way.
+`configrxdb.reassign_device` moves the whole record only when the winner
+has none of its own; otherwise the winner's settings, search index and
+compliance results stand and only the backups move, because a backup is a
+dated capture of one real switch and is never wrong about having
+happened. Either way the loser's `device_config` row is dropped, for the
+same reason `forget_device` gives: it holds an encrypted SSH password
+keyed on an id SQLite will reissue. `alertsdb.merge_device` copies
+thresholds only where the winner has none (the operator tuned theirs
+against the device they were looking at), moves a mute, the parked
+occurrences and any window naming the loser, and **resolves** the loser's
+open alerts rather than repointing them — their entity no longer exists,
+and an alert nobody can navigate to is worse than one closed with a
+reason. `mapperdb.reassign_device` is described under MAPPER.
+
+`device.merge` goes in the audit trail, and the Merge button carries
+`data-requires-write="nodes"` — stamped onto the element after `App.modal`
+renders it, since a button spec knows nothing about permissions, and then
+`applyPermissions()` is re-run so a revoked grant settles on the open
+dialog instead of leaving an irreversible control enabled.
+
 ### MIB parser (`mibparse.py`)
 
 Not a MIB compiler, the same framing `trapdecode.py`'s own OID name table
@@ -1826,6 +1958,17 @@ that same call already written into a transaction nothing there commits or
 rolls back, so the next unrelated commit on the connection would silently
 adopt half a drag. The whole batch is validated up front instead, so a bad
 item fails the call before anything is written.
+
+One device entered twice multiplies here rather than merely repeating:
+each row is placed separately, each draws its own neighbour links, and
+the same physical cable appears as two links between four icons. That is
+the visible cost of the duplicate problem "Device identity, addresses and
+merge" (Nodes, above) exists to stop, and it is why `reassign_device` —
+which repoints `map_nodes.device_id` and, on a map where both rows were
+already placed, **deletes** the loser's node rather than repointing it
+(`ux_map_nodes_device` would refuse the update, and two icons for one
+switch is exactly what the merge is undoing) — keeps the winner's own
+position: it is the node the operator has been looking at.
 
 ### Link assembly (`mapper.py`) — pure, no sqlite3/SNMP/HTTP
 

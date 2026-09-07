@@ -128,7 +128,8 @@ const SUBTABS = {
 
 // The device-detail pane's own nested subtabs (`#nd-d-subs`), separate from
 // the page-level ones above — walked by walkDialogs' sub:device-detail step.
-const DEVICE_DETAIL_SUBTABS = ['interfaces', 'neighbours', 'capabilities', 'events'];
+const DEVICE_DETAIL_SUBTABS = ['interfaces', 'neighbours', 'addresses',
+                               'capabilities', 'events'];
 
 // The per-module Settings buttons, which are `.module-settings` and live
 // inside their own (otherwise hidden) page, so the tab must be selected first.

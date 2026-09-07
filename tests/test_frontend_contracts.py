@@ -866,6 +866,34 @@ check("overflow-wrap" in _TOOLTIP_RULE and "max-height" in _TOOLTIP_RULE
       and "white-space: pre-wrap" in _TOOLTIP_RULE,
       ".tooltip wraps a long line and caps its own height, so a wide VLAN list "
       "cannot run off the side or past the bottom of a box nothing can scroll")
+# 32. One node per device (5.0.0). The ADDRESSES subtab is wired by the
+#     generic nested-subtab machinery, which finds its pane by id alone
+#     (App.selectSub with prefix 'nd-d-sub-'), so the button's data-subtab
+#     and the pane's id have to agree or the tab opens onto nothing. The
+#     Merge button is the one irreversible control in this work and is
+#     rendered by App.modal from a spec object, which knows nothing about
+#     permissions — the gate has to be stamped on afterwards or a read-only
+#     account gets a live Merge button.
+check('data-subtab="addresses"' in INDEX and 'id="nd-d-sub-addresses"' in INDEX,
+      "index.html has the ADDRESSES subtab button and the pane its prefix "
+      "resolves to")
+check('id="nd-addr-table"' in INDEX and "drawAddressesTable" in NODES,
+      "the addresses pane holds #nd-addr-table and nodes.js draws it")
+check('id="nd-duplicates"' in INDEX and "duplicatesDialog" in NODES,
+      "the Devices bar has the Duplicates button and nodes.js opens it")
+MERGE_BLOCK = NODES[NODES.index("async function mergeDialog("):
+                    NODES.index("/* ------------------------------------------------------- bridge & RF")]
+check("dataset.requiresWrite = 'nodes'" in MERGE_BLOCK
+      and "App.applyPermissions(" in MERGE_BLOCK,
+      "mergeDialog stamps data-requires-write=\"nodes\" on its Merge button and "
+      "re-runs applyPermissions, so a revoked write settles on the open dialog "
+      "instead of leaving an irreversible control enabled")
+check("error.status = response.status" in APP and "error.payload = payload" in APP,
+      "app.js attaches the status and the body to a failed request's error, which "
+      "is what lets the add-device dialog answer a 409 with \"Add anyway\" rather "
+      "than only printing it")
+check("duplicate_of_device_id" in NODES and "'/api/nodes/duplicates'" in NODES,
+      "nodes.js reads the discovery duplicate verdict and the duplicates route")
 
 print()
 if failures:

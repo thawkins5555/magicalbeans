@@ -292,6 +292,9 @@ ROUTES = [
     ("GET", r"^/api/nodes/devices/(\d+)$", api.get_nodes_device, ("nodes", R)),
     ("PUT", r"^/api/nodes/devices/(\d+)$", api.put_nodes_device, ("nodes", W)),
     ("DELETE", r"^/api/nodes/devices/(\d+)$", api.delete_nodes_device, ("nodes", W)),
+    ("GET", r"^/api/nodes/devices/(\d+)/addresses$", api.get_nodes_device_addresses, ("nodes", R)),
+    ("POST", r"^/api/nodes/devices/(\d+)/merge$", api.post_nodes_device_merge, ("nodes", W)),
+    ("GET", r"^/api/nodes/duplicates$", api.get_nodes_duplicates, ("nodes", R)),
     ("POST", r"^/api/nodes/devices/bulk-poll$", api.post_nodes_devices_bulk_poll, ("nodes", W)),
     ("POST", r"^/api/nodes/devices/bulk-identify$", api.post_nodes_devices_bulk_identify, ("nodes", W)),
     ("POST", r"^/api/nodes/devices/(\d+)/poll$", api.post_nodes_device_poll, ("nodes", W)),
@@ -1189,6 +1192,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": str(exc)}, 403)
             except PermissionError as exc:
                 self._json({"error": str(exc)}, 401)
+            except api.Conflict as exc:
+                # Before the ValueError arm below, which this subclasses:
+                # "that address already belongs to a device, here it is"
+                # is a different answer from "that is not an address", and
+                # the browser offers "add anyway" off the 409 alone.
+                self._json({"error": str(exc), **exc.payload}, 409)
             except ValueError as exc:
                 self._json({"error": str(exc)}, 400)
             except OverflowError:

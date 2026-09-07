@@ -609,7 +609,16 @@ const App = (() => {
       throw new Error('Signed out');
     }
     const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.error || response.statusText);
+    if (!response.ok) {
+      // The status and the body ride on the error so a caller can answer a
+      // refusal rather than only report it — a 409 from "add device" names
+      // the device the address already belongs to, and the dialog offers
+      // "add anyway" off exactly that.
+      const error = new Error(payload.error || response.statusText);
+      error.status = response.status;
+      error.payload = payload;
+      throw error;
+    }
     return payload;
   }
 

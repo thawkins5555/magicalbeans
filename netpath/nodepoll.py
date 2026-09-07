@@ -12,6 +12,7 @@ right shape, not IpamWorker's coarser "unseen = immediately due" one.
 
 from __future__ import annotations
 
+import json
 import random
 import re
 import socket
@@ -21,7 +22,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from . import mibcatalog, nodeoids, vendorid
+from . import mibcatalog, nodeoids, nodesdb, vendorid
 from .eventlog import ERROR, NODES, NullLog
 from .ipam_scan import ping_many
 from .nodediscover import DiscoveryJob
@@ -1136,7 +1137,26 @@ class NodePoller(Worker):
         job = self._discovery_jobs.get(job_id)
         return job is not None and job.running
 
-    def promote(self, job_id: int, result_ids: list[int]) -> list[int]:
+    @staticmethod
+    def _result_addresses(result) -> list[str]:
+        """Every address the sweep reached this result on, the probed one
+        first. Blank for a row written before 5.0 or by a sweep with
+        discovery_addresses off."""
+        addresses = [result["ip"]]
+        keys = result.keys()
+        if "ip_addresses" in keys and result["ip_addresses"]:
+            try:
+                walked = json.loads(result["ip_addresses"])
+            except (TypeError, ValueError):
+                walked = []
+            for address in walked if isinstance(walked, list) else []:
+                text = nodesdb.alias_candidate(address)
+                if text and text not in addresses:
+                    addresses.append(text)
+        return addresses
+
+    def promote(self, job_id: int, result_ids: list[int],
+                force: bool = False) -> list[int]:
         """Creates a devices row per discovery result, carrying the
         discovered community/version as a per-device override only when it
         matches none of the target group's own credentials — its primary
@@ -1148,22 +1168,51 @@ class NodePoller(Worker):
         second promote call with an overlapping selection is always safe
         to retry. A ping-only result (no SNMP answer) is skipped outright
         unless its job was started with the allow-ping-only option — the
-        checkbox state in the browser is a convenience, this is the rule."""
+        checkbox state in the browser is a convenience, this is the rule.
+
+        A result the sweep folded into another (the same box answered on a
+        second L3 address) is promoted as its primary instead, so ticking
+        either row adds the one device. And a result whose walked
+        addresses name a device already on file is recorded ON that device
+        rather than added beside it: one node per device is the point, and
+        an address is the only evidence strong enough to decide it without
+        asking. `force` skips that fold for the operator who has looked at
+        the pair and says they are genuinely two boxes.
+        """
         job = self.db.discovery_job(job_id)
         allow_ping_only = bool(job and job["allow_ping_only"])
         device_ids = []
-        for result_id in result_ids:
-            result = self.db.discovery_result(result_id)
+        seen_results = set()
+        for raw_id in result_ids:
+            result = self.db.discovery_result(raw_id)
+            if result is not None and result.keys().__contains__("folded_into_result_id") \
+                    and result["folded_into_result_id"]:
+                primary = self.db.discovery_result(result["folded_into_result_id"])
+                if primary is not None:
+                    result = primary
             if result is None or result["job_id"] != job_id:
                 continue
+            result_id = result["id"]
+            if result_id in seen_results:
+                continue
+            seen_results.add(result_id)
             if not result["snmp_ok"] and not allow_ping_only:
                 continue
             if result["promoted_device_id"]:
                 device_ids.append(result["promoted_device_id"])
                 continue
+            addresses = self._result_addresses(result)
             existing = self.db.device_by_ip(result["ip"])
+            if existing is None and not force:
+                for address in addresses:
+                    owner = self.db.device_id_for_address(address)
+                    if owner is not None:
+                        existing = self.db.device(owner)
+                        break
             if existing is not None:
-                self.db.mark_promoted(result_id, existing["id"])
+                self.db.record_device_addresses(
+                    existing["id"], addresses, "discovery")
+                self._mark_promoted_family(job_id, result_id, existing["id"])
                 device_ids.append(existing["id"])
                 continue
             group_id = result["suggested_group_id"]
@@ -1202,9 +1251,22 @@ class NodePoller(Worker):
                                        if "vendor_confidence" in keys else "") or "",
                     vendor_evidence=(result["vendor_evidence"]
                                      if "vendor_evidence" in keys else None))
-            self.db.mark_promoted(result_id, device_id)
+            self.db.record_device_addresses(device_id, addresses, "discovery")
+            self._mark_promoted_family(job_id, result_id, device_id)
             device_ids.append(device_id)
         return device_ids
+
+    def _mark_promoted_family(self, job_id: int, result_id: int,
+                              device_id: int) -> None:
+        """Mark the promoted row and every row this sweep folded into it,
+        so the results table shows all of that device's addresses as
+        already added rather than only the one that was ticked."""
+        self.db.mark_promoted(result_id, device_id)
+        for row in self.db.discovery_results(job_id):
+            if "folded_into_result_id" not in row.keys():
+                break
+            if row["folded_into_result_id"] == result_id and not row["promoted_device_id"]:
+                self.db.mark_promoted(row["id"], device_id)
 
     # ------------------------------------------------------------------ loop
 
@@ -2418,9 +2480,30 @@ class NodePoller(Worker):
             rows = self._walk_column(device, config, nodeoids.IP_ADDR_TABLE)
         except SnmpError:
             return
+        # The two extra columns are joined on the index suffix, which for
+        # ipAddrTable is the address itself. Each is its own best-effort
+        # walk: an agent that answers ipAdEntAddr and nothing else still
+        # gets its addresses recorded, just without the detail.
+        details = {}
+        for oid, key in ((nodeoids.IP_ADDR_IFINDEX, "if_index"),
+                         (nodeoids.IP_ADDR_NETMASK, "netmask")):
+            try:
+                extra = self._walk_column(device, config, oid)
+            except SnmpError:
+                continue
+            for suffix, value in extra.items():
+                if value is None or value == "":
+                    continue
+                address = str(rows.get(suffix) or suffix)
+                try:
+                    entry = int(value) if key == "if_index" else str(value)
+                except (TypeError, ValueError):
+                    continue
+                details.setdefault(address, {})[key] = entry
         addresses = [str(value) for value in rows.values() if value]
         if addresses:
-            self.db.record_device_addresses(device_id, addresses, "ipAddrTable")
+            self.db.record_device_addresses(device_id, addresses, "ipAddrTable",
+                                            details=details)
 
     def _poll_vendor_health(self, device, config: dict, identity: dict,
                             already=()) -> list[tuple]:

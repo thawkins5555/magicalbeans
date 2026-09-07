@@ -1901,6 +1901,77 @@ class AlertsDatabase(SqliteStore):
                     ids[device_id] = until_ts
         return ids
 
+    def merge_device(self, old_device_id: int, new_device_id: int,
+                     by: str = "") -> dict:
+        """Two device rows turned out to be one device: hand Alerts' half
+        over to the surviving id.
+
+        A per-device threshold the winner has set already stands — the
+        operator tuned it against the device they were looking at — so the
+        loser's are only copied where the winner has none. Open alerts
+        raised against the loser are resolved rather than repointed: their
+        entity no longer exists, and an alert nobody can navigate to is
+        worse than one closed with a reason. Everything else (a mute still
+        running, occurrences waiting out the new-device grace, a
+        maintenance window naming the id) simply moves.
+        """
+        old_key, new_key = str(old_device_id), str(new_device_id)
+        moved = {"thresholds": 0, "pending": 0, "windows": 0, "mute": False}
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO device_thresholds(device_id, rule_key,"
+                " threshold, clear_threshold, enabled, updated_ts)"
+                " SELECT ?, rule_key, threshold, clear_threshold, enabled,"
+                " updated_ts FROM device_thresholds WHERE device_id = ?",
+                (new_device_id, old_device_id))
+            moved["thresholds"] = cur.rowcount or 0
+            self._conn.execute("DELETE FROM device_thresholds WHERE device_id = ?",
+                               (old_device_id,))
+            winner_mute = self._conn.execute(
+                "SELECT 1 FROM alert_mutes WHERE entity_kind = 'device'"
+                " AND entity_id = ?", (new_key,)).fetchone()
+            if winner_mute is None:
+                cur = self._conn.execute(
+                    "UPDATE alert_mutes SET entity_id = ? WHERE entity_kind ="
+                    " 'device' AND entity_id = ?", (new_key, old_key))
+                moved["mute"] = bool(cur.rowcount)
+            else:
+                self._conn.execute(
+                    "DELETE FROM alert_mutes WHERE entity_kind = 'device'"
+                    " AND entity_id = ?", (old_key,))
+            cur = self._conn.execute(
+                "UPDATE pending_alerts SET device_id = ? WHERE device_id = ?",
+                (new_device_id, old_device_id))
+            moved["pending"] = cur.rowcount or 0
+            open_ids = [row["id"] for row in self._conn.execute(
+                "SELECT id FROM alerts WHERE entity_kind = 'device'"
+                " AND entity_id = ? AND state IN ('open','acked')",
+                (old_key,)).fetchall()]
+            windows = self._conn.execute(
+                "SELECT id, scope_device_ids FROM maintenance_windows"
+                " WHERE scope_kind = 'devices'").fetchall()
+            for row in windows:
+                try:
+                    ids = [int(i) for i in json.loads(row["scope_device_ids"] or "[]")]
+                except (TypeError, ValueError):
+                    continue
+                if old_device_id not in ids:
+                    continue
+                rewritten = []
+                for device_id in ids:
+                    device_id = new_device_id if device_id == old_device_id else device_id
+                    if device_id not in rewritten:
+                        rewritten.append(device_id)
+                self._conn.execute(
+                    "UPDATE maintenance_windows SET scope_device_ids = ? WHERE id = ?",
+                    (json.dumps(rewritten, separators=(",", ":")), row["id"]))
+                moved["windows"] += 1
+            self._conn.commit()
+        if open_ids:
+            self.resolve_many(open_ids, by=by or "merge")
+        moved["resolved"] = len(open_ids)
+        return moved
+
     def purge_expired_mutes(self, now: float | None = None) -> int:
         with self._lock:
             cur = self._conn.execute("DELETE FROM alert_mutes WHERE until_ts <= ?",

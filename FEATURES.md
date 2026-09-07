@@ -569,6 +569,19 @@ own subtabs.
   back to `Default`, and pre-fills the discovered identity so the new
   device shows its sysName immediately instead of waiting for the first
   poll.
+- **A device reached on two of its addresses is offered once.** Each
+  device that answers is asked which addresses it answers on (one short,
+  bounded read of its own address table), so a router probed on both its
+  loopback and its management address is one row in the results, its IP
+  cell marked `+1`, rather than two devices to add. The setting is in
+  Nodes → Settings → Discovery and can be switched off.
+- **A result that looks like a device you already have says which one.**
+  A new **Same as** column names it and how sure the scan is: *high* means
+  an address that device already answers on, and approving the result
+  records the new addresses on the existing device instead of adding a
+  second one; *medium* means a matching hostname and device type and
+  nothing more, which is a reason to look before ticking — it starts
+  unticked, and ticking it still adds the device.
 
 ### Vendor MIBs
 
@@ -913,7 +926,9 @@ already a device links to that device instead of creating a second one.
 **Add device** validates before it posts — a blank address is flagged on
 the field rather than the button silently doing nothing — and a refusal
 from the server, a duplicate address included, is shown in the dialog's own
-error line instead of vanishing into a rejected request nobody sees.
+error line instead of vanishing into a rejected request nobody sees. From
+5.0.0 that check covers every address a device answers on, not only the one
+in its address column — see **Addresses and duplicates** below.
 
 **Browse OIDs** opens a live view of what the device actually answers,
 decoded against every MIB the app knows. It opens on `system`,
@@ -1009,6 +1024,36 @@ From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
 - **From 4.49.0, the neighbours this walk collects can be reviewed and
   turned into an upstream device in one batch**, rather than one Edit
   dialog at a time — see **One outage, one alert**, under Alerts.
+
+### Addresses and duplicates
+
+One device answering on several addresses is one device. From 5.0.0 the
+application says so everywhere it can, and asks rather than assumes
+everywhere it cannot.
+
+- **The device pane has an ADDRESSES subtab** listing every address the
+  device answers on: the one you configured, marked as the primary, and
+  every other one its own address table has reported, with the interface
+  and netmask where it gave them and when each was last seen. This is why
+  a trap or a syslog line arriving from a loopback is attributed to the
+  right device.
+- **Adding an address another device already answers on is refused, and
+  says which device.** The message names it, links to it, and offers **Add
+  anyway** for the case where two boxes really do sit behind one address.
+  A bulk import lists the same rows in its `duplicate` column, naming the
+  device each belongs to, with one button to import them anyway.
+- **A Duplicates button in the Devices bar** lists pairs that look like
+  one device entered twice — the same address claimed by both, a shared
+  interface MAC, or the same hostname and device type — each with what the
+  evidence is and how strong it is. Nothing is fetched for it until it is
+  opened, and nothing is ever merged automatically.
+- **Merging is an operator's decision, previewed first.** Opening a pair
+  shows which row survives (swap it if the suggestion is wrong) and
+  exactly what the merge would move: addresses, event history, upstream
+  links, map placements, backups, thresholds, mutes and maintenance
+  windows. The surviving device keeps the lot; the other row's address
+  becomes one of its addresses. It cannot be undone, needs Nodes write,
+  and is recorded in the audit trail.
 
 ### Reporting — reachable through the API, no page yet
 

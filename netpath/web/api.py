@@ -93,6 +93,18 @@ def _csv_response(module: str, header: list[str], rows, *, truncated: bool = Fal
             "count": len(rows), "truncated": truncated, "cap": cap}
 
 
+class Conflict(ValueError):
+    """"That already exists, here is what it is" — a 400's refusal with the
+    evidence attached, so the browser can offer "add anyway" instead of
+    making the operator work out what collided. A ValueError subclass so
+    any handler that only knows about bad requests still reports it
+    sensibly; server.py's own arm turns it into a 409 with `payload`."""
+
+    def __init__(self, message: str, payload: dict | None = None):
+        super().__init__(message)
+        self.payload = payload or {}
+
+
 def _audit(service, params, action: str, target: str = "",
            detail: str = "") -> None:
     """One line in the on-disk audit trail (appdb.audit).
@@ -2714,16 +2726,81 @@ def _device_display_name(row) -> str:
             or row["sys_name"] or row["name"] or row["ip"])
 
 
-def _discovery_result_json(row, installed=None, devices_by_ip=None) -> dict:
+def _device_index(service) -> dict:
+    """One pass over the fleet, built once per discovery listing: the maps
+    every result row is tested against for "is this already a device".
+    `by_address` covers a device's primary IP and every alias learned for
+    it; `by_identity` is (sysName, sysObjectID), which is a hint and never
+    an answer — two switches out of the same carton share it honestly."""
+    devices = service.nodes_db.devices()
+    by_id = {row["id"]: row for row in devices}
+    by_address = {row["ip"]: row for row in devices}
+    for address, device_id in service.nodes_db.address_owners().items():
+        if address not in by_address and device_id in by_id:
+            by_address[address] = by_id[device_id]
+    return {"by_id": by_id, "by_ip": {row["ip"]: row for row in devices},
+            "by_address": by_address,
+            "by_identity": service.nodes_db.devices_by_identity()}
+
+
+def _result_addresses(row) -> list[str]:
+    keys = row.keys()
+    if "ip_addresses" not in keys or not row["ip_addresses"]:
+        return []
+    try:
+        walked = json.loads(row["ip_addresses"])
+    except (TypeError, ValueError):
+        return []
+    return [str(a) for a in walked if a] if isinstance(walked, list) else []
+
+
+def _discovery_duplicate(row, index, addresses) -> dict:
+    """Which device, if any, this result looks like — and how sure that is.
+
+    High means an address: one of the addresses this box answered on is
+    already a device's, which nothing else can honestly explain. Medium
+    means sysName and sysObjectID both match a device the sweep never
+    reached on any shared address, which is a reason to look rather than a
+    reason to fold. Only high ever changes what promote() does.
+    """
+    if not index:
+        return {}
+    for address in [row["ip"], *addresses]:
+        device = index["by_address"].get(address)
+        if device is not None:
+            return {"duplicate_of_device_id": device["id"],
+                    "duplicate_of_device_name": _device_display_name(device),
+                    "duplicate_confidence": "high",
+                    "duplicate_reason": f"already answers on {address}"}
+    key = ((row["sys_name"] or "").lower(), row["sys_object_id"] or "")
+    device = index["by_identity"].get(key) if all(key) else None
+    if device is not None:
+        return {"duplicate_of_device_id": device["id"],
+                "duplicate_of_device_name": _device_display_name(device),
+                "duplicate_confidence": "medium",
+                "duplicate_reason": "same sysName and sysObjectID"}
+    return {}
+
+
+def _discovery_result_json(row, installed=None, devices_by_ip=None,
+                           index=None, folded_ips=()) -> dict:
     """`installed` is the set of MIB filenames present, and `devices_by_ip`
     an ip -> device row map, each passed by the caller once per listing so
     neither the MIB hint nor the already-added check is a query per row.
     `promoted_device_id` alone missed an address added to Nodes some other
     way — by hand, or from an earlier scan — so `devices_by_ip` is checked
-    too; either source wins because promote() always reuses that same row."""
+    too; either source wins because promote() always reuses that same row.
+
+    `index` (from _device_index) adds the duplicate verdict, and
+    `folded_ips` the addresses of the sibling rows this one absorbed."""
     existing = devices_by_ip.get(row["ip"]) if devices_by_ip else None
     existing_id = existing["id"] if existing else row["promoted_device_id"]
     existing_name = _device_display_name(existing) if existing else None
+    keys = row.keys()
+    addresses = _result_addresses(row)
+    for address in folded_ips:
+        if address not in addresses:
+            addresses.append(address)
     return {"id": row["id"], "job_id": row["job_id"], "ip": row["ip"],
             "ping_ok": bool(row["ping_ok"]), "snmp_ok": bool(row["snmp_ok"]),
             "community_or_user": row["community_or_user"],
@@ -2733,6 +2810,10 @@ def _discovery_result_json(row, installed=None, devices_by_ip=None) -> dict:
             "promoted_device_id": row["promoted_device_id"],
             "existing_device_id": existing_id,
             "existing_device_name": existing_name,
+            "addresses": addresses,
+            "folded_into_result_id": (row["folded_into_result_id"]
+                                      if "folded_into_result_id" in keys else None),
+            **_discovery_duplicate(row, index, addresses),
             **_discovery_identification(row, installed)}
 
 
@@ -3181,8 +3262,33 @@ def post_nodes_upstream_suggestions_apply(service, params, body) -> dict:
     return {"ok": True, "updated": len(cleaned)}
 
 
+def _duplicate_conflict(service, ip: str) -> Conflict | None:
+    """The refusal for an address some device already answers on — its own
+    primary IP, or an alias learned from its ipAddrTable. The second case
+    is what makes this a 409 rather than the old flat 400: adding a
+    router's second address as a second device is the mistake this
+    release exists to stop, and it is also occasionally exactly what an
+    operator means, which is why the payload names the device and the
+    caller may say `force`."""
+    device = service.nodes_db.device_by_ip(ip)
+    reason = f"{ip} is already a device"
+    if device is None:
+        owner = service.nodes_db.device_id_for_address(ip)
+        device = service.nodes_db.device(owner) if owner else None
+        if device is None:
+            return None
+        reason = (f"{ip} is another address of "
+                  f"{_device_display_name(device)} ({device['ip']})")
+    return Conflict(reason, {"duplicate_of": {
+        "device_id": device["id"], "device_name": _device_display_name(device),
+        "device_ip": device["ip"], "reason": reason}})
+
+
 def post_nodes_device(service, params, body) -> dict:
     ip = _device_address(body)
+    conflict = _duplicate_conflict(service, ip)
+    if conflict is not None and not body.get("force"):
+        raise conflict
     if service.nodes_db.device_by_ip(ip):
         raise ValueError(f"{ip} is already a device")
     group_id = body.get("group_id")
@@ -3236,6 +3342,97 @@ def post_nodes_device(service, params, body) -> dict:
     return {"id": device_id}
 
 
+# ------------------------------------------- addresses, duplicates, merge
+
+
+def _address_json(row) -> dict:
+    keys = row.keys()
+    return {"ip": row["ip"], "source": row["source"], "seen_ts": row["seen_ts"],
+            "if_index": row["if_index"] if "if_index" in keys else None,
+            "netmask": row["netmask"] if "netmask" in keys else None}
+
+
+def _device_addresses_json(service, row) -> list[dict]:
+    """The device's own primary address first, then every alias it has
+    been seen answering on. The primary is listed here — it is not stored
+    in device_addresses, and a list of "the addresses of this device" that
+    silently omits the configured one is a list nobody can read."""
+    addresses = [{"ip": row["ip"], "source": "primary", "seen_ts": None,
+                  "if_index": None, "netmask": None, "primary": True}]
+    for alias in service.nodes_db.device_addresses(row["id"]):
+        addresses.append({**_address_json(alias), "primary": False})
+    return addresses
+
+
+def get_nodes_device_addresses(service, params, body, device_id) -> dict:
+    row = _require(service.nodes_db.device(device_id), "device")
+    return {"addresses": _device_addresses_json(service, row)}
+
+
+def get_nodes_duplicates(service, params, body) -> dict:
+    """Pairs that look like one device entered twice. Fetched on demand
+    from the Duplicates button, never on the Devices page's refresh tick:
+    it is three self-joins over the fleet, and nothing about it changes
+    between one poll and the next."""
+    limit = int(_num(params, "limit", 200))
+    pairs = []
+    for pair in service.nodes_db.duplicate_candidates(limit):
+        a = service.nodes_db.device(pair["a_id"])
+        b = service.nodes_db.device(pair["b_id"])
+        if a is None or b is None:
+            continue
+        pairs.append({
+            **pair,
+            "a_name": _device_display_name(a), "a_ip": a["ip"],
+            "b_name": _device_display_name(b), "b_ip": b["ip"],
+        })
+    return {"duplicates": pairs}
+
+
+def _merge_targets(service, body, device_id):
+    loser = _require(service.nodes_db.device(device_id), "device")
+    try:
+        winner_id = int(body.get("into") or 0)
+    except (TypeError, ValueError):
+        raise ValueError("into must be a device id") from None
+    if not winner_id:
+        raise ValueError("into is required")
+    winner = _require(service.nodes_db.device(winner_id), "device")
+    if winner["id"] == loser["id"]:
+        raise ValueError("A device cannot be merged into itself")
+    return loser, winner
+
+
+def post_nodes_device_merge(service, params, body, device_id) -> dict:
+    """Fold one device row into another, across all four databases.
+
+    `preview: true` counts what would move and writes nothing — the dialog
+    shows that before the operator commits, because a merge cannot be
+    undone. The execute order mirrors delete_nodes_device's: ConfigRX,
+    Alerts and Mapper first, Nodes last, so a crash between two of them
+    leaves a nodes row that still owns whatever has not moved yet rather
+    than orphaned rows keyed on an id nothing owns.
+    """
+    loser, winner = _merge_targets(service, body, device_id)
+    plan = service.nodes_db.merge_plan(loser["id"], winner["id"])
+    if body.get("preview"):
+        return {"preview": True, "plan": plan,
+                "loser": {"id": loser["id"], "name": _device_display_name(loser),
+                          "ip": loser["ip"]},
+                "winner": {"id": winner["id"], "name": _device_display_name(winner),
+                           "ip": winner["ip"]}}
+    service.configrx_db.reassign_device(loser["id"], winner["id"])
+    service.alerts_db.merge_device(loser["id"], winner["id"],
+                                   params.get("_username", ""))
+    service.mapper_db.reassign_device(loser["id"], winner["id"])
+    service.nodes_db.merge_devices(loser["id"], winner["id"])
+    service.log.add(NODES_CATEGORY,
+                    f"Merged {loser['ip']} into {_device_display_name(winner)}")
+    _audit(service, params, "device.merge", target=f"device:{winner['ip']}",
+          detail=f"merged device:{loser['ip']} (id {loser['id']}) into id {winner['id']}")
+    return {"ok": True, "device_id": winner["id"], "plan": plan}
+
+
 def get_nodes_device(service, params, body, device_id) -> dict:
     row = _require(service.nodes_db.device(device_id), "device")
     reveal = _may_read_secrets(service, params, "nodes")
@@ -3259,6 +3456,11 @@ def get_nodes_device(service, params, body, device_id) -> dict:
     device["muted_until"] = max(
         (v for v in (mute["until_ts"] if mute else None, window_until)
          if v is not None), default=None)
+    # Rides in the device JSON rather than behind its own fetch: the
+    # ADDRESSES subtab is one short list the detail pane already has a
+    # round trip for, and a second request per device selection to carry
+    # three rows is a request nobody needs.
+    device["addresses"] = _device_addresses_json(service, row)
     device.update(_identification_json(service, row))
     return {"device": device}
 
@@ -3567,7 +3769,14 @@ def post_nodes_devices_bulk_import(service, params, body) -> dict:
 
     groups = service.nodes_db.groups()
     device_groups = service.nodes_db.device_groups()
-    existing_ips = {d["ip"] for d in service.nodes_db.devices()}
+    devices_by_ip = {d["ip"]: d for d in service.nodes_db.devices()}
+    existing_ips = set(devices_by_ip)
+    # An address a device already answers on without it being that device's
+    # primary — a router's second L3 address in a spreadsheet exported from
+    # somewhere that lists interfaces, not devices. Reported in the same
+    # `duplicate` disposition the primary-IP case already uses, naming the
+    # device, and imported anyway when the body says `force`.
+    alias_owners = {} if body.get("force") else service.nodes_db.address_owners()
     seen_in_batch = set()
 
     created, duplicate, invalid = [], [], []
@@ -3579,7 +3788,19 @@ def post_nodes_devices_bulk_import(service, params, body) -> dict:
             invalid.append({"row": i, "ip": str(raw.get("ip", "")), "reason": str(exc)})
             continue
         if ip in existing_ips or ip in seen_in_batch:
-            duplicate.append({"row": i, "ip": ip, "reason": f"{ip} is already a device"})
+            duplicate.append({"row": i, "ip": ip, "reason": f"{ip} is already a device",
+                              "device_id": (devices_by_ip[ip]["id"]
+                                            if ip in devices_by_ip else None),
+                              "device_name": (_device_display_name(devices_by_ip[ip])
+                                              if ip in devices_by_ip else None)})
+            continue
+        owner = service.nodes_db.device(alias_owners[ip]) if ip in alias_owners else None
+        if owner is not None:
+            duplicate.append({
+                "row": i, "ip": ip, "device_id": owner["id"],
+                "device_name": _device_display_name(owner),
+                "reason": f"{ip} is another address of "
+                          f"{_device_display_name(owner)} ({owner['ip']})"})
             continue
         try:
             group_id = _resolve_bulk_named_id(raw.get("group_id"), groups)
@@ -4469,10 +4690,23 @@ def get_nodes_discovery_job(service, params, body, job_id) -> dict:
     installed = {mib["filename"] for mib in service.nodes_db.mib_files()}
     # One pass over the fleet rather than a device_by_ip() per row — a scan
     # of a /22 can carry over a thousand results.
-    devices_by_ip = {d["ip"]: d for d in service.nodes_db.devices()}
+    index = _device_index(service)
+    devices_by_ip = index["by_ip"]
+    # A folded row is the same device the sweep already listed, reached on
+    # a second address: its address rides on its primary's row rather than
+    # appearing as a second offer to add the same box.
+    folded: dict[int, list[str]] = {}
+    primaries = []
+    for row in results:
+        into = row["folded_into_result_id"] if "folded_into_result_id" in row.keys() else None
+        if into:
+            folded.setdefault(into, []).append(row["ip"])
+        else:
+            primaries.append(row)
     return {"job": _discovery_job_json(job),
-            "results": [_discovery_result_json(r, installed, devices_by_ip)
-                        for r in results]}
+            "results": [_discovery_result_json(r, installed, devices_by_ip, index,
+                                               folded.get(r["id"], ()))
+                        for r in primaries]}
 
 
 def delete_nodes_discovery_job(service, params, body, job_id) -> dict:
@@ -4492,7 +4726,8 @@ def post_nodes_discovery_promote(service, params, body, job_id) -> dict:
     result_ids = body.get("result_ids") or []
     if not result_ids:
         raise ValueError("result_ids is required")
-    device_ids = service.node_poller.promote(job_id, [int(r) for r in result_ids])
+    device_ids = service.node_poller.promote(
+        job_id, [int(r) for r in result_ids], force=bool(body.get("force")))
     service.log.add(NODES_CATEGORY,
                     f"Promoted {len(device_ids)} device(s) from discovery job #{job_id}")
     return {"device_ids": device_ids}

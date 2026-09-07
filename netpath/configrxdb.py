@@ -362,6 +362,48 @@ class ConfigRxDatabase(SqliteStore):
             self._conn.execute("DELETE FROM compliance_results WHERE device_id = ?", (device_id,))
             self._conn.commit()
 
+    def reassign_device(self, old_device_id: int, new_device_id: int,
+                        move_config: bool = True) -> bool:
+        """Two device rows turned out to be one device: hand ConfigRX's
+        half over to the surviving id.
+
+        The whole record moves only when the winner has nothing of its
+        own; otherwise its settings, its search index and its compliance
+        results stand and only the backups move, because those are dated
+        captures of one real switch and a capture is never wrong about
+        having happened. The loser's config row (which holds an encrypted
+        SSH password keyed on an id about to be reissued by SQLite) is
+        dropped either way — see forget_device for why that id must not
+        be left owning a credential.
+        """
+        with self._lock:
+            winner = self._conn.execute(
+                "SELECT 1 FROM device_config WHERE device_id = ?",
+                (new_device_id,)).fetchone()
+            whole = move_config and winner is None
+            if whole:
+                self._conn.execute(
+                    "UPDATE device_config SET device_id = ? WHERE device_id = ?",
+                    (new_device_id, old_device_id))
+                self._conn.execute(
+                    "UPDATE config_lines SET device_id = ? WHERE device_id = ?",
+                    (new_device_id, old_device_id))
+                self._conn.execute(
+                    "UPDATE OR REPLACE compliance_results SET device_id = ?"
+                    " WHERE device_id = ?", (new_device_id, old_device_id))
+            else:
+                self._conn.execute(
+                    "DELETE FROM device_config WHERE device_id = ?", (old_device_id,))
+                self._delete_search_lines(old_device_id)
+                self._conn.execute(
+                    "DELETE FROM compliance_results WHERE device_id = ?",
+                    (old_device_id,))
+            self._conn.execute(
+                "UPDATE backups SET device_id = ? WHERE device_id = ?",
+                (new_device_id, old_device_id))
+            self._conn.commit()
+        return whole
+
     def devices_due(self, interval_hours: float) -> list[sqlite3.Row]:
         cutoff = time.time() - max(1, interval_hours) * 3600
         with self._lock:

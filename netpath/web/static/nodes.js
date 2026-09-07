@@ -691,6 +691,7 @@
     await loadStatusTimeline();
     drawIfaceTable();
     drawNeighborsTable();
+    drawAddressesTable();
     drawCapabilitiesTab();
     drawEventTable();
   }
@@ -2539,6 +2540,137 @@
     }
   }
 
+  /* ---------------------------------------------------------- addresses
+
+     Every L3 address this device answers on. The configured one is listed
+     first and marked, because a list of "this device's addresses" that
+     silently leaves out the address the operator typed is a list nobody
+     can read. The rest come from the hourly ipAddrTable walk, from a
+     discovery sweep that reached the same box twice, or from a merge. */
+  function drawAddressesTable() {
+    const table = App.el('nd-addr-table');
+    if (!table) return;
+    const rows = (view.detail && view.detail.addresses) || [];
+    table.innerHTML = '<caption class="sr-only">Addresses this device answers on</caption>' +
+      '<thead><tr><th scope="col">Address</th><th scope="col">Interface</th>' +
+      '<th scope="col">Netmask</th><th scope="col">Source</th>' +
+      `<th scope="col" title="${App.timeZoneTitle()}">Last seen</th></tr></thead>`;
+    const body = document.createElement('tbody');
+    for (const r of rows) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${escape(r.ip)}${r.primary
+          ? ' <span class="hint">(primary)</span>' : ''}</td>` +
+        `<td>${r.if_index == null ? '\u2014' : escape(String(r.if_index))}</td>` +
+        `<td>${escape(r.netmask || '\u2014')}</td>` +
+        `<td>${escape(r.source || '\u2014')}</td>` +
+        `<td>${r.seen_ts ? App.agoCell(r.seen_ts) : '\u2014'}</td>`;
+      body.appendChild(tr);
+    }
+    if (!rows.length) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td colspan="5" class="hint">No addresses recorded yet.</td>';
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+    App.wireRowKeyboard(body);
+  }
+
+  /* ---------------------------------------------------------- duplicates
+
+     Two device rows that are one device — a router added once per L3
+     address, a switch imported twice under two hostnames. Nothing here
+     ever merges on its own: the listing is evidence, the merge dialog is
+     a preview, and the operator presses the button. Fetched only when the
+     dialog is opened, never on the refresh tick — it is three self-joins
+     over the whole fleet and nothing about it moves between polls. */
+  async function duplicatesDialog() {
+    const { duplicates } = await App.get('/api/nodes/duplicates');
+    const rowsHtml = duplicates.map((d) => `<tr>` +
+      `<td>${confidenceBadgeHtml(d)}</td>` +
+      `<td>${escape(d.a_name)} <span class="hint">${escape(d.a_ip)}</span></td>` +
+      `<td>${escape(d.b_name)} <span class="hint">${escape(d.b_ip)}</span></td>` +
+      `<td>${escape((d.reasons || []).join('; '))}</td>` +
+      `<td><button class="linkish nd-dup-open" data-pair="${d.a_id}:${d.b_id}">Review</button></td>` +
+      `</tr>`).join('');
+    const box = App.modal('Possible duplicates', duplicates.length ? `
+      <p class="hint">Pairs that look like one device entered twice. Nothing is
+        merged until you say so — open one to see exactly what a merge would
+        move before it happens.</p>
+      <div class="table-wrap scrollbox large">
+        <table><caption class="sr-only">Possible duplicate devices</caption>
+        <thead><tr><th scope="col">Confidence</th><th scope="col">Device</th>
+        <th scope="col">Device</th><th scope="col">Why</th><th scope="col"></th></tr></thead>
+        <tbody>${rowsHtml}</tbody></table>
+      </div>` : '<p>No two devices here look like the same box.</p>',
+      [{ label: 'Close', onClick: App.closeModal }]);
+    for (const button of box.querySelectorAll('.nd-dup-open')) {
+      button.onclick = () => {
+        const [a, b] = button.dataset.pair.split(':').map(Number);
+        const pair = duplicates.find((d) => d.a_id === a && d.b_id === b);
+        if (pair) mergeDialog(pair).catch((error) =>
+          App.toast(`Could not open the merge: ${error.message}`, 'fail'));
+      };
+    }
+  }
+
+  /* One pair, with the preview the server computed for whichever winner is
+     selected. Swapping the radio re-previews rather than guessing: which
+     row survives decides what is discarded, and the counts change with it. */
+  async function mergeDialog(pair) {
+    let winnerId = pair.suggested_winner_id;
+    const sideHtml = (id, name, ip) => `<label class="check">
+      <input type="radio" name="nd-merge-winner" value="${id}"
+        ${id === winnerId ? 'checked' : ''}> Keep ${escape(name)}
+      <span class="hint">${escape(ip)}</span></label>`;
+    const box = App.modal(`Merge ${escape(pair.a_name)} and ${escape(pair.b_name)}`, `
+      <p class="hint">${escape((pair.reasons || []).join('; '))}</p>
+      ${sideHtml(pair.a_id, pair.a_name, pair.a_ip)}
+      ${sideHtml(pair.b_id, pair.b_name, pair.b_ip)}
+      <div id="nd-merge-preview" class="hint">Loading\u2026</div>
+      <p class="hint warn-text">A merge cannot be undone. The other device's row is
+        deleted; its addresses, its event history and anything pointing at it move
+        to the one you keep.</p>`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Merge', danger: true,
+        onClick: (box, button) => App.runJob(button,
+          { queued: 'Merging\u2026', done: 'Merged' }, (async () => {
+            const loser = winnerId === pair.a_id ? pair.b_id : pair.a_id;
+            const result = await App.post(`/api/nodes/devices/${loser}/merge`,
+              { into: winnerId });
+            App.closeModal();
+            selectDevice(winnerId);
+            App.refreshNow('nodes');
+            return result;
+          })()) },
+    ]);
+    // App.modal renders a button spec, so the gate has to be put on the
+    // element afterwards — the same shape every other danger button in this
+    // file that has to survive applyPermissions()'s re-check uses.
+    for (const button of box.querySelectorAll('.modal-buttons button')) {
+      if (button.textContent === 'Merge') button.dataset.requiresWrite = 'nodes';
+    }
+    App.applyPermissions(box);
+    const preview = async () => {
+      const loser = winnerId === pair.a_id ? pair.b_id : pair.a_id;
+      const result = await App.post(`/api/nodes/devices/${loser}/merge`,
+        { into: winnerId, preview: true });
+      const counts = result.plan.counts;
+      const named = Object.entries(counts).filter(([, n]) => n > 0)
+        .map(([key, n]) => `${n} ${key.replace(/_/g, ' ')}`);
+      box.querySelector('#nd-merge-preview').innerHTML =
+        `Merging <b>${escape(result.loser.name)}</b> (${escape(result.loser.ip)}) into ` +
+        `<b>${escape(result.winner.name)}</b> (${escape(result.winner.ip)}): ` +
+        (named.length ? escape(named.join(', ')) + '.' : 'nothing else to move.');
+    };
+    for (const radio of box.querySelectorAll('input[name="nd-merge-winner"]')) {
+      radio.onchange = () => {
+        winnerId = Number(radio.value);
+        preview().catch(() => {});
+      };
+    }
+    await preview();
+  }
+
   /* ------------------------------------------------------- bridge & RF
 
      STP bridge state, the PSE power budget/consumption pair, and PtP radio
@@ -3354,7 +3486,7 @@
       ? `${Math.max(0, lines.length - 1)} row(s) detected` : '';
   }
 
-  function renderImportResult(box, result) {
+  function renderImportResult(box, result, retryForced) {
     const el = box.querySelector('#nd-import-result');
     const summary = `${result.created.length} created, ${result.duplicate.length} ` +
       `duplicate, ${result.invalid.length} invalid — of ${result.total} row(s).`;
@@ -3371,7 +3503,19 @@
           `<td>${escape(p.kind)}: ${escape(p.reason || '')}</td></tr>`).join('') +
         '</tbody></table></div>';
     }
+    // A row refused because some device already answers on that address is
+    // the one refusal an operator can legitimately overrule: two boxes
+    // really can sit behind one NAT'd management address. Offered only
+    // when there is such a row, and never pre-pressed.
+    const owned = result.duplicate.filter((r) => r.device_id);
+    if (owned.length && retryForced) {
+      html += `<p><button type="button" id="nd-import-force">Import those ` +
+        `${owned.length} anyway</button> <span class="hint">Adds a second device ` +
+        `for an address another device already answers on.</span></p>`;
+    }
     el.innerHTML = html;
+    const forceButton = el.querySelector('#nd-import-force');
+    if (forceButton) forceButton.onclick = () => retryForced(forceButton);
   }
 
   function importDevicesDialog() {
@@ -3426,7 +3570,20 @@
           return;
         }
         button.disabled = false;
-        renderImportResult(box, result);
+        const retryForced = async (forceButton) => {
+          forceButton.disabled = true;
+          try {
+            const forced = await App.post('/api/nodes/devices/bulk-import',
+                                          { ...payload, force: true });
+            renderImportResult(box, forced, null);
+            if (forced.created.length) App.refreshNow('nodes');
+          } catch (error) {
+            forceButton.disabled = false;
+            errorEl.textContent = error.message;
+            errorEl.hidden = false;
+          }
+        };
+        renderImportResult(box, result, retryForced);
         if (result.created.length) App.refreshNow('nodes');
       } },
     ], { buttonsTop: true });
@@ -3443,12 +3600,34 @@
     box.querySelector('#nd-import-text').oninput = () => updateImportPreview(box);
   }
 
+  /* The 409 from POST /api/nodes/devices, in the dialog that caused it: the
+     device the address already belongs to, named and linked, plus the one
+     button that overrules it. Not a confirm — the operator has to have read
+     which device it collided with before "add anyway" means anything. */
+  function showDuplicateNotice(box, payload, onForce) {
+    const duplicate = (payload || {}).duplicate_of;
+    if (!duplicate) return;
+    box.querySelector('#nd-add-dup')?.remove();
+    const notice = document.createElement('p');
+    notice.id = 'nd-add-dup';
+    notice.className = 'hint warn-text';
+    notice.innerHTML = `${escape(duplicate.reason || 'That address is already known')}. ` +
+      `<a href="#/nodes/device/${duplicate.device_id}">Open ${
+        escape(duplicate.device_name || 'it')}</a> ` +
+      '<button type="button" id="nd-add-anyway">Add anyway</button>';
+    box.querySelector('form').insertAdjacentElement('afterbegin', notice);
+    notice.querySelector('#nd-add-anyway').onclick = onForce;
+  }
+
   /* `preset` prefills the form without making it read-only — unlike
      editDevice's, this id-less form never locks the IP field. Used both by
      the toolbar button (no preset) and by a #/nodes?add=<ip> route, the way
      Syslog and SNMP Trap turn "nobody has this address" into one click
      instead of a copy-paste across two tabs. */
   function addDevice(preset) {
+    // Set by "Add anyway" only, and only after the refusal above has been
+    // shown: the server refuses a second time otherwise.
+    let force = false;
     const box = App.modal('Add device', deviceForm(preset || {}), [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Test', onClick: () => testDevice(box, null) },
@@ -3472,8 +3651,21 @@
         const display_name_source = box.querySelector('#nd-f-namesource').value;
         return App.runJob(button, { queued: 'Adding…', done: `Added ${name || ip}` },
           (async () => {
-          const result = await App.post('/api/nodes/devices',
-            { ip, name, group_id, device_group_id, display_name_source, ...overrides });
+          let result;
+          try {
+            result = await App.post('/api/nodes/devices',
+              { ip, name, group_id, device_group_id, display_name_source,
+                ...overrides, ...(force ? { force: true } : {}) });
+          } catch (error) {
+            if (error.status === 409) {
+              showDuplicateNotice(box, error.payload, () => {
+                force = true;
+                box.querySelector('#nd-add-dup').remove();
+                button.click();
+              });
+            }
+            throw error;
+          }
           if (authPass && overrides.v3_user && overrides.v3_auth_proto) {
             await App.post(`/api/nodes/devices/${result.id}/credential`,
               { v3_user: overrides.v3_user, v3_auth_proto: overrides.v3_auth_proto,
@@ -4227,6 +4419,32 @@
     return !r.existing_device_id && !!(r.snmp_ok || (job && job.allow_ping_only));
   }
 
+  /* What the sweep thinks this row already is. `high` is an address one of
+     this application's devices already answers on, which promote() folds
+     onto that device rather than adding beside it; `medium` is a hostname
+     and sysObjectID that match and nothing else, which is a reason to look
+     before ticking, not a reason to skip. */
+  function discDuplicateCell(r) {
+    if (r.existing_device_id) {
+      return `<a href="#/nodes/device/${r.existing_device_id}">${
+        escape(r.existing_device_name || 'added')}</a>`;
+    }
+    if (!r.duplicate_of_device_id) return '\u2014';
+    const color = CONFIDENCE_COLOR[r.duplicate_confidence] || 'var(--muted)';
+    return `<span style="color:${color}" title="${escape(r.duplicate_reason || '')}">` +
+      `${escape(r.duplicate_of_device_name || String(r.duplicate_of_device_id))}` +
+      `</span> <span class="hint">(${escape(r.duplicate_confidence || '')})</span>`;
+  }
+
+  /* The IP cell says how many OTHER addresses the same box answered on, so
+     one row standing for a router with three L3 addresses does not read as
+     a sweep that missed the other two. */
+  function discIpCell(r) {
+    const extra = Math.max(0, (r.addresses || []).length - 1);
+    return `${escape(r.ip)}${extra ? ` <span class="hint" title="${
+      escape((r.addresses || []).join(', '))}">+${extra}</span>` : ''}`;
+  }
+
   /* The first cell of a discovery row: a box for a result that may be
      added, an em dash carrying the reason for one no credential
      identified, and a link to the device it already is for one that is
@@ -4242,7 +4460,11 @@
       return '<span class="hint" title="Only devices identified over SNMP can be ' +
         'added from this scan">\u2014</span>';
     }
-    return `<input type="checkbox" class="${cls}" data-result="${r.id}"` +
+    const warn = r.duplicate_of_device_id
+      ? ` title="Looks like ${escape(r.duplicate_of_device_name || 'a device already added')}`
+        + ` \u2014 ${escape(r.duplicate_reason || '')}"`
+      : '';
+    return `<input type="checkbox" class="${cls}" data-result="${r.id}"${warn}` +
       ` aria-label="Select ${escape(r.ip || 'result')}"` +
       `${checkedSet.has(r.id) ? ' checked' : ''}>`;
   }
@@ -4265,7 +4487,7 @@
       cell: (r) => discCheckCell(r, discSelectedJob(), view.discChecked, 'disc-check') },
     // Sorted as the dotted string it is: App.sortRows collates numerically,
     // which puts .9 before .100 where the server's ORDER BY ip does not.
-    { key: 'ip', label: 'IP', width: 130, on: true },
+    { key: 'ip', label: 'IP', width: 130, on: true, cell: discIpCell },
     // Sorted on the flag, not on the word — and deliberately not `numeric`,
     // which would right-align a column of yes/no as if it were a reading.
     { key: 'ping_ok', label: 'Ping', width: 64, on: true,
@@ -4277,6 +4499,8 @@
     { key: 'sys_name', label: 'Name', width: 160, on: true },
     { key: 'vendor', label: 'Vendor', width: 200, on: true,
       value: (r) => r.vendor || '', cell: discVendorCell },
+    { key: 'duplicate_of', label: 'Same as', width: 170, on: true, sortable: false,
+      value: (r) => r.duplicate_of_device_name || '', cell: discDuplicateCell },
   ];
 
   /* The approval dialog's own rows. A modal, not a grid: no sorting, no
@@ -4287,12 +4511,13 @@
     return results.map((r) => {
       const arcs = discArcsTitle(r);
       return `<tr><td>${discCheckCell(r, job, checkedSet, cls)}</td>` +
-        `<td>${escape(r.ip)}</td>` +
+        `<td>${discIpCell(r)}</td>` +
         `<td>${r.ping_ok ? 'yes' : 'no'}</td>` +
         `<td>${r.snmp_ok ? 'yes' : 'no'}</td>` +
         `<td>${escape(r.sys_name || '\u2014')}</td>` +
         `<td${arcs ? ` title="${escape(arcs)}"` : ''}>` +
-        `${discVendorCell(r)}</td></tr>`;
+        `${discVendorCell(r)}</td>` +
+        `<td>${discDuplicateCell(r)}</td></tr>`;
     }).join('');
   }
 
@@ -4360,7 +4585,8 @@
     const signature = [
       view.discSelected || '', view.discSort.key, view.discSort.descending ? 'd' : 'a',
       view.discResults.map((r) =>
-        `${r.id}:${r.snmp_ok ? 1 : 0}:${r.existing_device_id || ''}`).join(','),
+        `${r.id}:${r.snmp_ok ? 1 : 0}:${r.existing_device_id || ''}` +
+        `:${r.duplicate_of_device_id || ''}:${(r.addresses || []).length}`).join(','),
     ].join('|');
     if (!force && signature === discDrawnSignature) {
       App.refreshSelectAll(table, selectable.length, ticked());
@@ -4516,7 +4742,11 @@
     const r = await App.get(`/api/nodes/discovery/${job.id}`);
     const results = r.results;
     const found = results.filter((x) => x.ping_ok || x.snmp_ok);
-    const seed = new Set(results.filter((x) => x.snmp_ok && !x.existing_device_id)
+    // A row the sweep matched to a device already on file starts unticked
+    // whatever its confidence: pre-ticking a probable duplicate is how one
+    // gets added by an operator who trusted the dialog's own defaults.
+    const seed = new Set(results.filter(
+      (x) => x.snmp_ok && !x.existing_device_id && !x.duplicate_of_device_id)
       .map((x) => x.id));
     const finish = async () => {
       await App.post(`/api/nodes/discovery/${job.id}/reviewed`, {}).catch(() => {});
@@ -4593,7 +4823,7 @@
         ? 'Ping-only devices can be approved too, but start unchecked.'
         : 'Devices that only answered ping are listed but cannot be added — restart the scan with the ping-only option to include them.'}</p>
       <div class="table-wrap scrollbox large">
-        <table><caption class="sr-only">Discovered addresses</caption><thead><tr><th scope="col"></th><th scope="col">IP</th><th scope="col">Ping</th><th scope="col">SNMP</th><th scope="col">Name</th><th scope="col">Vendor</th></tr></thead>
+        <table><caption class="sr-only">Discovered addresses</caption><thead><tr><th scope="col"></th><th scope="col">IP</th><th scope="col">Ping</th><th scope="col">SNMP</th><th scope="col">Name</th><th scope="col">Vendor</th><th scope="col">Same as</th></tr></thead>
         <tbody>${discResultRowsHtml(found, job, 'disc-approve', checked)}</tbody></table>
       </div>`, buttons);
     // Escape or a backdrop click dismisses this dialog without any button's
@@ -5004,6 +5234,11 @@
           profile's own credentials — see the Profile picker on the
           Discovery subtab.</p>
         ${number('np-maxscan', 'Max addresses per subnet sweep', s.max_scan_addresses, 'min=1')}
+        ${check('np-discaddr', 'Ask each device it finds which addresses it answers on',
+                s.discovery_addresses !== false)}
+        <p class="hint">One bounded read of the device's own address table, so a
+          router reached on two of its addresses is offered once instead of
+          twice. Off, a sweep lists one row per address that answered.</p>
       </fieldset>
       <fieldset><legend>DEVICE DETAILS</legend>
         <p class="hint">Identity fields shown in a device's detail header.
@@ -5059,6 +5294,7 @@
           vendor_walk_parallel: num('#np-vendorparallel'),
           discovery_arc_hop: on('#np-dischop'),
           max_scan_addresses: num('#np-maxscan'),
+          discovery_addresses: on('#np-discaddr'),
           detail_fields: DETAIL_FIELDS.map(([key]) => key)
             .filter((key) => on(`#np-df-${key}`)).join(','),
           table_columns: App.readColumnPicker(
@@ -5379,6 +5615,8 @@
     }
     App.el('nd-add-device').onclick = addDevice;
     App.el('nd-import-devices').onclick = importDevicesDialog;
+    App.el('nd-duplicates').onclick = () => duplicatesDialog().catch((error) =>
+      App.toast(`Could not open duplicates: ${error.message}`, 'fail'));
     App.el('nd-export-csv').onclick = exportDevicesCsv;
     App.el('nd-if-export-csv').onclick = exportInterfacesCsv;
     // Injected rather than declared in index.html, the same reason alerts.js
