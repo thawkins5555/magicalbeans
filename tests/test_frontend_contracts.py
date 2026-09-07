@@ -895,6 +895,45 @@ check("error.status = response.status" in APP and "error.payload = payload" in A
 check("duplicate_of_device_id" in NODES and "'/api/nodes/duplicates'" in NODES,
       "nodes.js reads the discovery duplicate verdict and the duplicates route")
 
+# 33. Settings -> MODULE SETTINGS opens the module's own dialog (5.0.1).
+#     The list used to selectTab() and then synchronously click the
+#     module's #xx-settings button, but every module but Dashboard is lazy:
+#     on a first visit that button's onclick is not wired yet, the click
+#     reached nothing, and the operator was simply left on the module. The
+#     entries also have to carry the same write gate as the buttons they
+#     press, or a read-only account gets a live control that no-ops.
+check("function whenModuleReady(" in APP
+      and "selectTab, whenModuleReady," in APP,
+      "app.js exports whenModuleReady, so a caller can await a lazy module's "
+      "init() before pressing a button that module wires")
+_MODULES_PANE = SETTINGS[SETTINGS.index("  function buildModulesPane()"):
+                         SETTINGS.index("  /* --------------------------------------------------------- role presets")]
+check("await App.whenModuleReady(" in _MODULES_PANE
+      and _MODULES_PANE.index("await App.whenModuleReady(")
+      < _MODULES_PANE.index("target.click()"),
+      "buildModulesPane awaits the module before clicking its settings button, "
+      "rather than clicking a handler that is not wired on a first visit")
+check("App.state.tab !== tab" in _MODULES_PANE,
+      "and gives up if the operator moved to another tab while the module's "
+      "script was still loading")
+check("App.canRead(tab)" in _MODULES_PANE,
+      "the list is filtered on what the account can read, so it never offers a "
+      "tab that is hidden")
+check("dataset.requiresWrite = tab" in _MODULES_PANE
+      and "App.applyPermissions(" in _MODULES_PANE,
+      "each entry carries the module's write gate and is gated on the spot - it "
+      "is built long after start-up's applyPermissions() walked the page")
+_MODULE_DIALOGS = SETTINGS[SETTINGS.index("  const MODULE_DIALOGS = ["):
+                           SETTINGS.index("  function buildModulesPane()")]
+_pane_ids = re.findall(r"\['([a-z]+)', '[^']+', '([a-z-]+)'\]", _MODULE_DIALOGS)
+check(len(_pane_ids) == 10,
+      "all ten modules are still listed in MODULE_DIALOGS")
+for _tab, _button_id in _pane_ids:
+    check('id="%s" class="module-settings" data-requires-write="%s"'
+          % (_button_id, _tab) in INDEX,
+          "#%s is write-gated on '%s' in index.html, which is the gate the "
+          "Settings entry mirrors" % (_button_id, _tab))
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

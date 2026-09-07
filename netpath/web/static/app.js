@@ -461,6 +461,14 @@ const App = (() => {
     return promise;
   }
 
+  /* For a caller that needs a module's own controls, not just its tab:
+     selectTab is synchronous and returns before a lazy module's script has
+     even been fetched, so anything that wants to press a button the module
+     wires in its init() has to await this first. Rejects the same way
+     ensureModuleReady does, on a load or init failure it has already
+     reported and degraded. */
+  function whenModuleReady(name) { return ensureModuleReady(name); }
+
   /* The one place selectTab/applyRoute hand off to a module once it is
      ready: activate() (a route) or activate()+refreshNow (a plain tab
      switch). Guarded on state.tab still naming this module when the load
@@ -5312,7 +5320,7 @@ const App = (() => {
   /* What the modules (and tests/ui/walk.mjs) may call. A function used only
      inside this file is not listed here — it stays where it is, private. */
   const api = {
-    state, pages, selectTab, loadState, refreshNow,
+    state, pages, selectTab, whenModuleReady, loadState, refreshNow,
     buildRoute, setRoute, currentRoute: parseRoute,
     get, post, put, del, saveCsv, exportCsv, deviceIndex, deviceLink,
     clock, stamp, span, duration, ago, when, timeCell, agoCell, isoLocal,

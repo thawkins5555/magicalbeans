@@ -1116,19 +1116,33 @@
     if (!host) return;
     host.innerHTML = '';
     for (const [tab, label, buttonId] of MODULE_DIALOGS) {
+      // A module this account cannot even read has no tab to send them to.
+      if (!App.canRead(tab)) continue;
       const button = document.createElement('button');
       button.type = 'button';
       button.textContent = label;
-      button.onclick = () => {
+      // Every #xx-settings button in index.html is write-gated on its own
+      // module; these entries carry the same gate so a read-only account
+      // gets the same disabled control and the same reason here as there,
+      // rather than a live button that silently does nothing.
+      button.dataset.requiresWrite = tab;
+      button.onclick = async () => {
         App.selectTab(tab);
-        // The target button lives on a page that has just become visible;
-        // its own click handler is the module's, unchanged — this only
-        // reaches it from a page an operator did not have to already know.
+        /* Every module but Dashboard is lazy: on a first visit its script
+           has not been fetched and its init() has not wired #xx-settings,
+           so the synchronous click this used to do reached a button with no
+           handler and the operator just landed on the module. */
+        try { await App.whenModuleReady(tab); } catch (error) { return; }
+        // They may have moved on while the script was in flight.
+        if (App.state.tab !== tab) return;
         const target = App.el(buttonId);
         if (target && !target.disabled) target.click();
       };
       host.appendChild(button);
     }
+    // These buttons are built after start-up's applyPermissions() has
+    // already walked the page, so they have to be gated on the spot.
+    App.applyPermissions();
   }
 
   /* --------------------------------------------------------- role presets
@@ -1362,6 +1376,9 @@
     // by hand would trigger.
     activate: (opts) => {
       load();
+      // Rebuilt per visit, not just at init(): the list is filtered on what
+      // this account can read, and a grant can change mid-session.
+      buildModulesPane();
       loadUsers().catch(() => {});
       loadTokens().catch(() => {});
       const target = opts && opts.query && opts.query.target;
