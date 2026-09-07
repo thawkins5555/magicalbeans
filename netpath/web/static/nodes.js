@@ -4680,7 +4680,7 @@
             ping_retries: num('#disc-o-pingretry'),
             snmp_timeout_s: num('#disc-o-snmpto'),
             snmp_retries: num('#disc-o-snmpretry'),
-            workers: num('#disc-o-workers'),
+            workers: num('#disc-o-workers') || null,
           });
         } catch (error) {
           App.closeModal();
@@ -5284,7 +5284,7 @@
           discovery_arc_hop: on('#np-dischop'),
           max_scan_addresses: num('#np-maxscan'),
           discovery_addresses: on('#np-discaddr'),
-          discovery_workers: num('#np-discworkers'),
+          discovery_workers: Math.max(1, num('#np-discworkers') || 0),
           detail_fields: DETAIL_FIELDS.map(([key]) => key)
             .filter((key) => on(`#np-df-${key}`)).join(','),
           table_columns: App.readColumnPicker(

@@ -3698,7 +3698,13 @@ class NodePoller(Worker):
                 "if_name": if_name or None,
             })
         sensors.sort(key=lambda s: s["entity"])
-        if sensors and not any(s["if_index"] is not None for s in sensors):
+        # A UPS or a room monitor maps nothing to a port and is fine; an
+        # unmapped optic, or any unmapped row on Cisco gear, is the case
+        # this line was written for.
+        suspicious = (self._cisco_sensor_table_plausible(device)
+                      or any(s["type"] == "optical power" for s in sensors))
+        if sensors and suspicious and not any(
+                s["if_index"] is not None for s in sensors):
             self._log_sensor_diag(
                 device, f"Read {len(sensors)} sensor row(s) from {device['ip']} "
                         f"via {source}, none mapped to an interface: "
@@ -3963,10 +3969,14 @@ class NodePoller(Worker):
         statuses = cols["statuses"]
         units = cols["units"]
         descrs = self._walk_column(device, config, self._ENT_PHYSICAL_DESCR)
-        names = self._walk_column(device, config, self._ENT_PHYSICAL_NAME)
+        # The name fallback exists for Cisco gear with no alias rows; nothing
+        # else should pay a whole entPhysicalName walk every cadence for it.
+        names = if_by_name = None
+        if self._cisco_sensor_table_plausible(device):
+            names = self._walk_column(device, config, self._ENT_PHYSICAL_NAME)
+            if_by_name = self._if_index_by_name(self.db.interfaces(device_id))
         port_map, _alias_rows = self._entity_port_map(
-            device, config, names,
-            self._if_index_by_name(self.db.interfaces(device_id)))
+            device, config, names, if_by_name)
 
         has_humidity = any(int(types.get(suffix) or 0) == self._SENSOR_TYPE_HUMIDITY
                            for suffix in sensor_values)

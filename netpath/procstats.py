@@ -88,8 +88,9 @@ else:
         if "rss_bytes" not in out:
             try:
                 import resource
+                unit = 1 if sys.platform == "darwin" else 1024
                 out["rss_bytes"] = (
-                    resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024)
+                    resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * unit)
             except Exception:
                 pass
         out["wall"] = time.time()
