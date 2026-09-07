@@ -42,11 +42,8 @@ from .eventlog import SYSTEM
 class OutputCapture:
     """Tee stdout and stderr so `print()` cannot raise under pythonw.exe.
 
-    Under pythonw.exe there is no terminal at all and both streams are None;
-    without this, the first `print()` anywhere — a traceback from a worker,
-    say — would raise `AttributeError` instead of just being lost. There is
-    no in-app view onto this any more: show the terminal window, or run
-    `--headless` under a service manager and read its log, to see it.
+    Under pythonw.exe both streams are None; without this, the first
+    `print()` anywhere would raise `AttributeError` instead of being lost.
     """
 
     def __init__(self):

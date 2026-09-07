@@ -1008,13 +1008,12 @@ class NodePoller(Worker):
             return set(self._queued) | set(self._started)
 
     def _running_discovery_jobs(self) -> list:
-        """stop() already calls job.cancel() on each of these; a running
-        job stops submitting addresses and drains the probes already in
-        flight, so it lands within about one address's worth of work (see
+        """stop() already calls job.cancel() on each of these; a running job
+        stops submitting addresses and drains what's in flight in parallel,
+        landing within about one address's worth of work (see
         _discovery_budget_s) rather than finishing its whole sweep, which
         can be a subnet's worth of addresses and far too long to wait out
-        here. The in-flight probes run in parallel, so draining them costs
-        one address's time, not one per worker."""
+        here."""
         return [job for job in list(self._discovery_jobs.values()) if job.running]
 
     def drain(self, timeout_s: float) -> bool:
@@ -1031,10 +1030,9 @@ class NodePoller(Worker):
     def _discovery_budget_s(self, job) -> float:
         """One address's worst case for a running discovery job, from its
         own settings dict -- not a model of the whole sweep (see
-        _running_discovery_jobs), and still per-address rather than
-        per-worker now that the sweep probes several addresses at once:
-        the pool's drain waits for all of them together, so the slowest
-        single address is what bounds it. Two SNMP versions tried, a handful of
+        _running_discovery_jobs), and still per-address, not per-worker: the
+        pool's drain waits for all of them together, so the slowest single
+        address is what bounds it. Two SNMP versions tried, a handful of
         community guesses each, plus the vendor arc hop
         (hop_enterprise_arcs: "typically three to eight" GETNEXTs, no
         retry of its own) are approximated as ten SNMP round trips rather
@@ -1140,10 +1138,8 @@ class NodePoller(Worker):
         or running — a click during an in-flight poll cannot start a second
         one, and reporting "Polled" off the first one's completion claimed
         credit for work the click did not cause."""
-        # Poll now is also the operator's way of saying "try the sensor
-        # walk again": dropping the cadence stamp skips both the
-        # _SENSOR_REFRESH_S window and the hourly re-probe window a device
-        # latched sensor_capable=0 would otherwise wait out.
+        # Also doubles as "try the sensor walk again": dropping the cadence
+        # stamp skips both _SENSOR_REFRESH_S and the hourly reprobe window.
         self._sensor_read.pop(device_id, None)
         return self._submit(device_id)
 
@@ -2963,9 +2959,8 @@ class NodePoller(Worker):
             job = _VendorIdJob(self, device_id, trigger)
             self._vendor_ids[device_id] = job
         self.db.clear_identification(device_id)
-        # Sensor support is decided partly by what vendor the device is
-        # (see _cisco_sensor_table_plausible), so a re-identification
-        # invalidates a "no sensors here" verdict reached before it.
+        # Sensor plausibility depends on vendor (_cisco_sensor_table_plausible),
+        # so a re-identification invalidates an old "no sensors" verdict.
         self.db.set_sensor_capable(device_id, None)
         self._sensor_read.pop(device_id, None)
         job.start()
@@ -3408,10 +3403,9 @@ class NodePoller(Worker):
 
     # CISCO-ENTITY-SENSOR-MIB entSensorValueTable — what Cisco switches
     # populate INSTEAD of RFC 3433's entPhySensorTable, which is why an
-    # all-Cisco fleet saw both sensor sections empty. Same index
-    # (entPhysicalIndex) and the same type/scale/precision/status enums,
-    # extended with specialEnum(13) and dBm(14); there is no
-    # units-display column, so unit text comes from the type enum alone.
+    # all-Cisco fleet saw both sensor sections empty. Same index and
+    # type/scale/precision/status enums, extended with specialEnum(13) and
+    # dBm(14); no units-display column, so unit text comes from the type enum.
     _CISCO_SENSOR_TYPE = "1.3.6.1.4.1.9.9.91.1.1.1.1.1"
     _CISCO_SENSOR_SCALE = "1.3.6.1.4.1.9.9.91.1.1.1.1.2"
     _CISCO_SENSOR_PRECISION = "1.3.6.1.4.1.9.9.91.1.1.1.1.3"
@@ -3497,18 +3491,14 @@ class NodePoller(Worker):
         """(source, columns, tables tried) — whichever sensor table this
         device actually populates, walked once for every caller.
 
-        ENTITY-SENSOR-MIB is asked first; only when its value column comes
-        back empty AND _cisco_sensor_table_plausible() does the
-        CISCO-ENTITY-SENSOR-MIB value column get walked. The two are never
-        merged: gear that answers both answers the same readings twice,
-        and there is no way to tell duplicates apart afterwards.
+        Falls back to CISCO-ENTITY-SENSOR-MIB only when ENTITY-SENSOR-MIB's
+        value column comes back empty AND _cisco_sensor_table_plausible():
+        the two are never merged, since gear that answers both would show
+        every reading twice with no way to tell the duplicates apart.
 
         `columns` holds values/types/scales/precisions/statuses/units keyed
-        by index suffix, always the siblings of whichever value column
-        answered. `units` is empty for the Cisco table, which has no
-        units-display column — _decode_entity_sensor then names the unit
-        from the type enum, which is where dBm comes from. `tried` names
-        the tables for the diagnostics event log.
+        by index suffix; `tried` names the tables, for the diagnostics
+        event log.
         """
         tried = ["ENTITY-SENSOR-MIB"]
         source = "ENTITY-SENSOR-MIB"
@@ -3545,14 +3535,13 @@ class NodePoller(Worker):
         once in a while and wasteful every interval.
 
         _read_entity_sensors filtered to one ifIndex, so this can never
-        disagree with the device dialog's own DOM table about which sensor
-        rides on which port, or about which MIB the readings came from.
-        `label` stays entPhysicalDescr here (the whole-device list prefers
-        entPhysicalName): a port dialog already supplies the context a
-        device-wide list has to spell out.
+        disagree with the whole-device list about which sensor rides on
+        which port or which MIB it came from. `label` stays entPhysicalDescr
+        here since a port dialog already supplies context a device-wide
+        list has to spell out.
 
         Returns [] when the device answers no sensor table or maps no
-        physical entity to this ifIndex — the dialog says so."""
+        entity to this ifIndex."""
         device = self.db.device(device_id)
         if device is None:
             return []
@@ -3574,21 +3563,19 @@ class NodePoller(Worker):
     def _entity_port_map(self, device, config: dict, names: dict | None = None,
                          if_by_name: dict | None = None) -> tuple[dict[int, int], int]:
         """(entPhysicalIndex -> ifIndex, how many entAliasMappingIdentifier
-        rows the device answered), for every entity that maps to a port at
-        all. The row count is only ever used to say, in the Nodes event
-        log, why a device's sensors mapped to nothing.
+        rows the device answered) for every entity mapped to a port. The
+        row count is only used to explain, in the Nodes event log, why
+        sensors mapped to nothing.
 
-        Two passes. The first is entAliasMappingIdentifier resolved through
-        entPhysicalContainedIn — the standard mapping, and the only one
-        with authority. The second exists because Cisco gear routinely
-        populates no alias rows whatsoever: for an entity the first pass
-        left unmapped, climb its containment chain and take either a hop
-        already resolved or a hop whose entPhysicalName matches a stored
-        ifDescr (`if_by_name`, canonicalised by _canonical_if_name), the
-        whole name or its first word — Cisco names an optic sensor
-        "Te1/1/1 Transmit Power" and its parent module
-        "TenGigabitEthernet1/1/1". Matched against ifDescr only, never
-        ifAlias: an operator-typed description is not evidence of anything.
+        First pass: entAliasMappingIdentifier resolved through
+        entPhysicalContainedIn — the standard, authoritative mapping.
+        Second pass exists because Cisco gear often populates no alias rows
+        at all: for an unmapped entity, climb its containment chain and
+        match a hop's entPhysicalName (whole name or first word) against a
+        stored ifDescr (`if_by_name`, canonicalised by _canonical_if_name)
+        — e.g. "Te1/1/1 Transmit Power" against "TenGigabitEthernet1/1/1".
+        Matched against ifDescr only, never ifAlias, since an operator-typed
+        description proves nothing.
         """
         alias = self._walk_column(device, config, self._ENT_ALIAS_MAPPING)
         prefix = self._IF_INDEX_COLUMN + "."
@@ -3668,12 +3655,11 @@ class NodePoller(Worker):
         never disagree between them.
 
         Each row adds `type` (a human label for entPhySensorType),
-        `if_index`/`if_name` (via _entity_port_map and the stored
-        interfaces table), `descr` (raw entPhysicalDescr, which read_dom
-        labels its rows from) and `source` (the MIB the reading came out
-        of) on top of _decode_entity_sensor's own shape, and prefers
-        entPhysicalName over entPhysicalDescr for `label` where an agent
-        populates it -- see _ENT_PHYSICAL_NAME.
+        `if_index`/`if_name` (via _entity_port_map), `descr` (raw
+        entPhysicalDescr, which read_dom labels its rows from) and `source`
+        (the MIB the reading came from) on top of _decode_entity_sensor's
+        own shape, and prefers entPhysicalName over entPhysicalDescr for
+        `label` where an agent populates it -- see _ENT_PHYSICAL_NAME.
         """
         source, cols, tried = self._walk_sensor_columns(device, config)
         if not cols:
@@ -3910,12 +3896,10 @@ class NodePoller(Worker):
     _SENSOR_REFRESH_S = 300.0
 
     # How long a device that answered no sensor table waits before being
-    # asked again. sensor_capable used to latch 0 forever, which was right
-    # while ENTITY-SENSOR-MIB was the only table asked for and wrong the
-    # moment a second one existed: a Cisco switch latched incapable before
-    # it had ever been identified as Cisco would never have been offered
-    # the Cisco table at all. An hour is cheap (one walk per incapable
-    # device per hour) and bounds how long that mistake can last.
+    # asked again. sensor_capable used to latch 0 forever, which was wrong
+    # once a second table existed: a Cisco switch latched incapable before
+    # ever being identified as Cisco would never get offered the Cisco
+    # table at all. An hour bounds how long that mistake can last.
     _SENSOR_REPROBE_S = 3600.0
 
     def _poll_environment(self, device_id: int, device, config: dict,
@@ -3940,12 +3924,11 @@ class NodePoller(Worker):
           getting hot. Same key jnxOperatingTable uses, so a device
           answering both never reports two disagreeing temperatures.
 
-        Best-effort, gated twice: nothing runs inside the cadence window,
-        and devices.sensor_capable is the probe-once-remember memory
-        _poll_poe/_poll_stp/_poll_ups_health also use. The window is
-        _SENSOR_REFRESH_S normally and _SENSOR_REPROBE_S for a device that
-        has answered nothing, so "no sensors here" is a cheap hourly
-        question rather than a permanent verdict. Capability is otherwise
+        Best-effort, gated twice: nothing runs inside the cadence window
+        (_SENSOR_REFRESH_S normally, _SENSOR_REPROBE_S — a cheap hourly
+        recheck — for a device that answered nothing), and
+        devices.sensor_capable is the probe-once-remember memory
+        _poll_poe/_poll_stp/_poll_ups_health also use. Capability is
         recorded only on a probe that learned something new: a device
         already confirmed capable that times out once must not be
         relabelled incapable.

@@ -28,9 +28,8 @@ from .nodesdb import NodesDatabase
 from .snmppoll import PDU_GET, PDU_GETNEXT, SnmpError, V2C, build_request
 
 
-# How many addresses are probed at once. This is a thread count, not a
-# packet rate: discovery_probes_per_second still paces every submission, so
-# a larger pool overlaps the waiting rather than making a bigger burst.
+# A thread count, not a packet rate: discovery_probes_per_second still
+# paces each submission, so a larger pool only overlaps the waiting.
 DEFAULT_DISCOVERY_WORKERS = 32
 MAX_DISCOVERY_WORKERS = 256
 
@@ -144,9 +143,7 @@ class DiscoveryJob:
         self.settings = settings
         self.log = log or NullLog()
         self._stop = threading.Event()
-        # Everything a worker thread touches lives behind this one lock:
-        # the counters, the fold map, and the two database writes that must
-        # agree with them. Never held across an SNMP probe.
+        # Guards the counters and fold map; never held across an SNMP probe.
         self._lock = threading.Lock()
         self._probed = self._responded = self._identified = 0
         # Address -> the result id that reached it first, this sweep only —
@@ -280,12 +277,9 @@ class DiscoveryJob:
         snmp_interval = (1.0 / probes_per_second
                          if probes_per_second > 0 else 0.0)
 
-        # The pool overlaps the waiting, not the sending: this thread still
-        # releases at most one probe per snmp_interval, on an absolute
-        # schedule so a slow submit cannot let the rate drift upward
-        # afterwards to catch up. Addresses that never get a packet — the
-        # never-scan list, a subnet sweep's silent addresses — take neither
-        # a slot nor a delay.
+        # An absolute schedule, not sleep-per-iteration: a slow submit can't
+        # let the rate drift upward afterwards to catch up. Addresses that
+        # never get a packet take neither a slot nor a delay.
         started = time.monotonic()
         slot = 0
         futures = []
@@ -319,9 +313,7 @@ class DiscoveryJob:
                     self._probe_one, ip, ping_ok, will_probe, communities,
                     snmp_timeout_s, snmp_retries, groups))
         finally:
-            # Queued-but-unstarted work is dropped only on a cancel; a normal
-            # sweep waits for every address it submitted. Either way this
-            # returns with no worker still running, so the terminal write
+            # No worker is left running after this, so the terminal write
             # below is the last word on the job's counters.
             pool.shutdown(wait=True, cancel_futures=self._stop.is_set())
         for future in futures:
@@ -343,10 +335,9 @@ class DiscoveryJob:
                    groups) -> None:
         """One address on a pool thread: everything that talks to the
         network, and nothing that touches shared state (that is _record)."""
-        # A cancel that lands after this was queued but before it started
-        # leaves no row at all — the address genuinely was not probed, and
-        # a cancelled sweep claiming it was would be worse than a short
-        # result list. One already in flight still records what it found.
+        # A cancel that lands before this starts leaves no row at all —
+        # a cancelled sweep claiming an address it never probed would be
+        # worse than a short result list.
         if self._stop.is_set():
             return
         result = {"ip": ip, "ping_ok": 1 if ping_ok else 0, "snmp_ok": 0}
@@ -383,9 +374,8 @@ class DiscoveryJob:
     _PROGRESS_INTERVAL_S = 0.25
 
     def _write_progress(self) -> None:
-        """Progress exists for the browser's poll, so it is coalesced —
-        without this, 256 workers finishing at once means 256 UPDATEs. The
-        terminal write in _run carries the exact final counters regardless."""
+        """Coalesced for the browser's poll — without this, 256 workers
+        finishing at once means 256 UPDATEs."""
         now = time.monotonic()
         if now - self._progress_ts < self._PROGRESS_INTERVAL_S:
             return

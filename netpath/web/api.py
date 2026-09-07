@@ -4643,8 +4643,8 @@ def post_nodes_discovery(service, params, body) -> dict:
     }
     # Per-scan timing and concurrency overrides from the Start-discovery
     # dialog — they live only in this job's settings, never in stored
-    # settings. `high` is None where the value has no ceiling worth
-    # inventing; the worker count has one, since it is a thread count.
+    # settings. `high` is None except for the worker count, a thread count
+    # that needs a real ceiling.
     for body_key, override_key, cast, low, high in (
             ("snmp_timeout_s", "discovery_snmp_timeout_s", float, 0, None),
             ("ping_timeout_s", "discovery_ping_timeout_s", float, 0, None),

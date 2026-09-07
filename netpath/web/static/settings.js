@@ -1121,17 +1121,13 @@
       const button = document.createElement('button');
       button.type = 'button';
       button.textContent = label;
-      // Every #xx-settings button in index.html is write-gated on its own
-      // module; these entries carry the same gate so a read-only account
-      // gets the same disabled control and the same reason here as there,
-      // rather than a live button that silently does nothing.
+      // Mirrors the write gate #xx-settings already carries, so a
+      // read-only account gets the same disabled control here as there.
       button.dataset.requiresWrite = tab;
       button.onclick = async () => {
         App.selectTab(tab);
-        /* Every module but Dashboard is lazy: on a first visit its script
-           has not been fetched and its init() has not wired #xx-settings,
-           so the synchronous click this used to do reached a button with no
-           handler and the operator just landed on the module. */
+        // Lazy modules haven't wired #xx-settings until their script loads;
+        // without this, a fast click would hit a handler that isn't there.
         try { await App.whenModuleReady(tab); } catch (error) { return; }
         // They may have moved on while the script was in flight.
         if (App.state.tab !== tab) return;

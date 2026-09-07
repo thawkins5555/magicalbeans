@@ -462,11 +462,8 @@ const App = (() => {
   }
 
   /* For a caller that needs a module's own controls, not just its tab:
-     selectTab is synchronous and returns before a lazy module's script has
-     even been fetched, so anything that wants to press a button the module
-     wires in its init() has to await this first. Rejects the same way
-     ensureModuleReady does, on a load or init failure it has already
-     reported and degraded. */
+     selectTab returns before a lazy module's script is even fetched, so
+     pressing a button the module wires in its init() has to await this. */
   function whenModuleReady(name) { return ensureModuleReady(name); }
 
   /* The one place selectTab/applyRoute hand off to a module once it is

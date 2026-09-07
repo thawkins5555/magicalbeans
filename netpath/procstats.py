@@ -1,9 +1,8 @@
 """RAM and CPU used by this process, for the service console's status card.
 
-Windows has no /proc, so the same two numbers — resident memory and CPU time
-consumed — come from the Win32 API via ctypes instead of a new dependency
-(no psutil). `GetCurrentProcess()` returns a pseudo-handle that needs no
-`CloseHandle`, so this only ever reads the process it runs in.
+Uses ctypes against the Win32 API instead of psutil, to avoid a new
+dependency. `GetCurrentProcess()` returns a pseudo-handle that needs no
+`CloseHandle`.
 """
 
 from __future__ import annotations
@@ -42,7 +41,6 @@ if sys.platform == "win32":
         wintypes.HANDLE, ctypes.POINTER(_PROCESS_MEMORY_COUNTERS), wintypes.DWORD)
 
     def _filetime_units(ft) -> int:
-        """A FILETIME as a single 100-nanosecond count."""
         return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
 
     # FILETIME units are 100ns, so ticks/CLOCK_TICKS is seconds of CPU time.
@@ -69,7 +67,6 @@ else:
                    if hasattr(os, "sysconf") else 100.0)
 
     def _read_raw() -> dict:
-        """utime+stime ticks and RSS bytes for this process."""
         out = {}
         try:
             with open("/proc/self/stat", encoding="utf-8") as handle:
