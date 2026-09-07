@@ -1206,6 +1206,72 @@ def ws_ssh_device(websocket, service, params, device_id) -> None:
 ws_ssh_device.hijack = True
 
 
+# --------------------------------------------------------------- WEB relays
+#
+# The WEB button used to build "http://<ip>/" in the browser, which only
+# works from a machine with a route to the management plane. These three
+# routes open, list and close a short-lived TCP relay on this host instead.
+# All the reasoning about what that costs lives in netpath/webrelay.py; what
+# belongs here is that a caller never names the destination.
+
+
+def _web_device_target(service, device_id):
+    """(device row, address, scheme, port) for a relay, from the device row
+    and nothing else.
+
+    The one thing this route must never accept is a target. A body carrying
+    a host and port would turn an account holding `web` into a general
+    outbound proxy from this server's address — every device it can reach,
+    on every port, not the one device an operator selected. So the device id
+    is the whole request, and everything else is read from the row.
+    """
+    device = _require(service.nodes_db.device(device_id), "device")
+    address, scheme, port = webrelay.device_web_target(device)
+    return device, address, scheme, port
+
+
+def post_web_device_relay(service, params, body, device_id) -> dict:
+    """Open a relay to one device's web interface and hand back its URL."""
+    device, address, scheme, port = _web_device_target(service, device_id)
+    relay = service.web_relays.open(
+        device_id, params.get("_username", ""), params.get("_client", ""),
+        params.get("_token", ""), params.get("_host", ""))
+    _audit(service, params, "web.relay.open", target=f"device:{device['ip']}",
+           detail=f"port {relay['port']} -> {address}:{port} ({scheme}), "
+                  f"admitting {relay['client_ip']} only")
+    return relay
+
+
+def get_web_relays(service, params, body) -> dict:
+    """Every relay this account has open. An administrator sees all of them,
+    since they are the person who has to answer for a port being open on
+    this host; everyone else sees their own, which is what the device pane's
+    "Tunnel: port N" line is drawn from."""
+    mine = None if _is_admin(service, params) else params.get("_username", "")
+    return {"relays": service.web_relays.status(mine)}
+
+
+def delete_web_relay(service, params, body, session_id) -> dict:
+    """Close one relay. Its owner or an administrator — closing a port
+    somebody else opened on this host is an administrator's business, and
+    leaving one open that nobody can close is nobody's."""
+    relay = service.web_relays.get(session_id)
+    if relay is None:
+        raise ValueError("That tunnel is not open")
+    username = params.get("_username", "")
+    if relay.app_user != username and not _is_admin(service, params):
+        raise _permissions.Forbidden(
+            "That web tunnel belongs to another account.")
+    info = relay.info()
+    service.web_relays.close(session_id, f"closed by {username}")
+    _audit(service, params, "web.relay.close",
+           target=f"device:{info['device_ip']}",
+           detail=f"port {info['port']}, {info['connections']} connection(s), "
+                  f"{info['bytes_to_device']} bytes to the device and "
+                  f"{info['bytes_from_device']} back")
+    return {"ok": True, "closed": info["session_id"]}
+
+
 # -------------------------------------------------------------------- debug
 
 
