@@ -116,7 +116,7 @@ const SUBTABS = {
   // that view and has no subtabs of its own.
   nodes: ['devices', 'discovery', 'profiles', 'reports'],
   alerts: ['current', 'rules'],
-  ipam: ['subnets', 'conflicts', 'dhcp'],
+  ipam: ['dhcp', 'subnets', 'conflicts'],
   // ConfigRX (4.50.0) had no entry here at all — its own three subtabs
   // (devices/search/compliance) went completely unwalked, DEVICES (its
   // landing pane) included, since nothing in this loop ever clicked any of

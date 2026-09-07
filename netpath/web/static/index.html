@@ -721,12 +721,12 @@
   </div>
 
   <nav class="subtabs">
-    <button class="subtab active" data-subtab="subnets">SUBNETS &amp; HOSTS</button>
+    <button class="subtab" data-subtab="subnets">SUBNETS &amp; HOSTS</button>
     <button class="subtab" data-subtab="conflicts">CONFLICTS<span id="ipam-conflict-badge" class="badge" hidden></span></button>
-    <button class="subtab" data-subtab="dhcp">DHCP</button>
+    <button class="subtab active" data-subtab="dhcp">DHCP</button>
   </nav>
 
-  <div id="ipam-sub-subnets" class="subpage active">
+  <div id="ipam-sub-subnets" class="subpage">
    <div class="cols" data-splitter="ipam-subnets">
     <aside class="sidebar pane" data-grow="1">
       <div class="bar">
@@ -767,7 +767,7 @@
     <div class="table-wrap pad-x pad-b"><table id="ipam-conflicts-table"></table></div>
   </div>
 
-  <div id="ipam-sub-dhcp" class="subpage">
+  <div id="ipam-sub-dhcp" class="subpage active">
     <!-- Shown instead of the form on a host with no PowerShell, which
          reading a Windows DHCP server needs. ipam.js unhides one of these
          two on start-up from /api/platform. -->

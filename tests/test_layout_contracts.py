@@ -118,6 +118,8 @@ check('r"^/api/account/theme$", api.put_account_theme' in read_server(),
       "server.py routes the theme save")
 check('id="open-account-appearance"' in index and "open-account-appearance" in read("settings.js"),
       "Settings leaves a pointer to Appearance where the fieldset used to be")
+check('id="ipam-sub-dhcp" class="subpage active"' in index,
+      "IPAM opens on the DHCP subtab")
 check("App.tile" in read("dashboard.js") and "function tile(" in app and "function figures(" in app,
       "tiles and figures are one shared component")
 check(".dash-figure" not in css and ".dash-tile" not in css, "no dash-prefixed figure classes remain")
