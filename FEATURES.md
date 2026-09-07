@@ -2594,8 +2594,12 @@ like any other module.
 - **The map refreshes on the page's own cadence while it is the visible
   tab** (MAPPER's own **Refresh interval**, 30 seconds by default; 0 turns
   auto-refresh off and leaves the **Refresh** button as the only way),
-  and dragging a node never triggers one — a reload mid-drag would fight
-  the very thing an operator is doing.
+  and no gesture is ever interrupted by one — a drag, a rubber-band
+  selection or a pan holds the canvas until it is finished, since a reload
+  mid-gesture would fight the very thing an operator is doing. Where you
+  have put things stays put too: the map is framed to fit when you open it
+  and whenever you press **Fit**, and never re-framed underneath you by a
+  refresh, a resized pane or a badge appearing.
 - **Map style** — modern, classic, blueprint or minimal, in MAPPER's own
   Settings — is a second, independent choice from the seven app-wide
   colour themes under **Appearance** (above): a map's line weights and

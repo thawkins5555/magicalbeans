@@ -2443,6 +2443,59 @@ overlap guard covers a route or tab refresh too; `scenePoint()` returns
 `draw()` re-reads the frame's *size* every time while leaving the
 operator's own centre and zoom alone.
 
+### Pointer input and re-fitting (`mapper.js`) — 5.0.1
+
+**A click moved the node.** `event.currentTarget` is null the moment the
+event carrying it finishes dispatching, and `onNodePointerDown`'s `up` and
+`cancel` closures — which run on a *later* event — read it to take their
+listeners off again. So `up` threw a TypeError on every release before it
+removed anything: the `pointermove` listener stayed on the node's own `<g>`,
+`view.nodeDrag` stayed set, and from then on every hover over the map moved
+the node the operator had merely clicked, writing a new position each time.
+The element is captured once (`const target = event.currentTarget`) into all
+three listeners, and the teardown moved into a `finally` so a throw in the
+position-write path cannot leave the gesture half-live either; `cancel`
+detaches the same three listeners `up` does.
+
+- **The drag threshold is screen pixels** (`MOVE_THRESHOLD_PX`, 3), not the
+  2 *scene units* it was: at zoom 0.2 that was under half a pixel of pointer
+  travel, so a click counted as a drag; at zoom 5 it took a centimetre.
+- **The frame is frozen for the gesture.** Scene units per screen pixel
+  (`perPixelX/perPixelY`) are read once, at the press, and the drag is the
+  client delta scaled by them — a re-fit, a pane resize or a zoom arriving
+  mid-gesture can no longer scale the tail of a drag differently from its
+  head and jump the node out from under the pointer.
+- **A press with no frame selects and starts nothing**, rather than
+  recording a null origin that later moves would subtract from.
+
+**Re-fitting.** `draw()` fitted the scene on *every* draw until the operator
+happened to zoom or pan (`!view.userZoom`), so an auto-refresh, a pane
+resize or a badge appearing threw away an arrangement just made. A map is
+fitted when it is opened (`selectMap` sets `view.needsFit`) and when **Fit**
+is pressed (`fitView` clears the flag); otherwise a draw updates only
+`frame.width/height` and leaves centre and zoom alone. `view.userZoom` is
+still written by the wheel, the pan, the zoom buttons and the arrow keys as
+the record that the operator has moved the view themselves, but it no longer
+gates the fit — `needsFit` does. (netpath.js's own `userZoom` is unrelated
+and still gates its re-fit: that canvas is laid out fresh every poll,
+MAPPER's is a place.)
+
+**One measured element.** `draw()` sized the scene from `#mp-canvas` while
+`scenePoint`, the pan and the wheel zoom all measured `#mp-svg` — the
+canvas's own 1px border makes the two boxes differ in each axis, which is
+enough to land a press beside the point it was aimed at. Everything measures
+`#mp-svg` now, and `draw()` measures it *after* `showCanvas` (a canvas
+returning from the empty state is `display:none` until then, and would
+measure as zero).
+
+**Nothing redraws under a gesture.** `gestureActive()` (a node drag, a
+rubber band or a pan) gates `refresh()` and the `resize`/`panes-resized`
+handlers, which is the promise FEATURES.md makes for the auto-refresh;
+rebuilding the scene mid-drag also replaced the very `<g>` the pointer was
+captured on. An explicit reload that still lands mid-drag (a settings save,
+a VLAN colour change) ends the drag in `loadMapData` rather than dropping
+nodes at coordinates from the payload it just replaced.
+
 **A trunk with 200 VLANs.** `linkTooltip` listed all of them on one line,
 in a box that follows the pointer, cannot be scrolled and had
 `white-space: pre` — so the list ran off the side of the window and the
