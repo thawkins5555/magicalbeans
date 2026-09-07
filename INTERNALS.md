@@ -652,10 +652,8 @@ the app, because they map to no port at all. `_decode_entity_sensor` factors
 the actual RFC 3433 scaling arithmetic (`value × 10^(3×(scale-9)) /
 10^precision`) out of `read_dom` so both callers do it identically; the new
 `_poll_environment` calls it for every sensor entity a device answers, using
-`_walk_port_mapped_entities` (the same `entAliasMappingIdentifier` /
-`entPhysicalContainedIn` walk `read_dom` already does, generalised from "does
-this belong to ifIndex N" to "does this belong to any port at all") only to
-*classify* a temperature reading, never to gate whether it's read.
+`_entity_port_map` (entity → ifIndex, the resolution both dialog reads use)
+only to *classify* a temperature reading, never to gate whether it's read.
 
 A temperature reading becomes one of three metric keys before it is ever
 stored:
@@ -675,6 +673,19 @@ stored:
   fix. Juniper's own `jnxOperatingTable` temperature reading (`VENDOR_HEALTH`)
   was renamed from `temp_c` to this same key, so a device answering both
   never reports two disagreeing chassis figures.
+
+**5.0.1 gave the walk a second table and the latch an expiry.** The value
+column `_poll_environment` asks for now comes from `_walk_sensor_columns`
+(below), so a Cisco switch that answers only CISCO-ENTITY-SENSOR-MIB counts
+as sensor-capable and gets its readings classified like anyone else's. That
+made `devices.sensor_capable` latching 0 forever actively wrong — a switch
+probed before it had ever been identified as Cisco would have been written
+off before the Cisco table was ever on the table — so an incapable device is
+re-asked every `_SENSOR_REPROBE_S` (3600 s) instead of never, the success
+branch flips 0 → 1 as well as None → 1, `start_identify` resets the column
+to NULL, and `poll_now` drops the device's `_sensor_read` stamp so an
+operator never has to wait out either window. The ordinary cadence for a
+capable device is unchanged at `_SENSOR_REFRESH_S` (300 s).
 
 The gate that made this necessary: for about a day of this campaign,
 temperature shipped as a single `temp_c` key with a single `temp_high` rule,
@@ -1143,18 +1154,20 @@ stores raw counts in the new `interfaces.last_in_errors`/
 the existing bps ones — which is what the interface dialog's graph and
 stats read.
 
-**DOM/SFP sensors** (`NodePoller.read_dom`): a live, on-demand
-three-table GETNEXT walk (via `_walk_column`, the generalization
-`_walk_indexes` now wraps) run only when the interface dialog opens —
-never on the poll cycle, since several table walks per interval would
-be pure waste when nobody is looking. `entAliasMappingIdentifier` finds
-the physical entity mapped to the ifIndex, `entPhysicalContainedIn`
-gives the containment tree, and every `entPhySensorTable` row whose
-ancestor chain reaches the port's entity is reported with the RFC 3433
-scaling applied (value x 10^(3*(scale-9)), `precision` decimals) and
-the device's own `entPhySensorUnitsDisplay` string as the unit — no
-vendor unit tables. A device without ENTITY-MIB support returns `[]`,
-which the dialog reports as "no DOM/sensor data" rather than an error.
+**DOM/SFP sensors** (`NodePoller.read_dom`): a live, on-demand walk run
+only when the interface dialog opens — never on the poll cycle, since
+several table walks per interval would be pure waste when nobody is
+looking. From 5.0.1 it is `_read_entity_sensors` filtered to one
+ifIndex rather than a walk of its own, so the port dialog and the
+device dialog can never disagree about which sensor rides on which
+port or which MIB a reading came from; `label` still comes from
+`entPhysicalDescr` (the row's `descr` key), which is the contract the
+dialog has had since 4.x. Readings carry the RFC 3433 scaling (value x
+10^(3*(scale-9)), `precision` decimals) and the device's own
+`entPhySensorUnitsDisplay` string as the unit where there is one — no
+vendor unit tables. A device that answers no sensor table, or maps
+nothing to this port, returns `[]`, which the dialog reports as "no
+DOM/sensor data" rather than an error.
 
 **Whole-device hardware and DOM (`NodePoller.read_hardware`,
 `read_dom_all`) — 4.53.0.** `_read_entity_sensors` generalises the same
@@ -1172,6 +1185,48 @@ to rows that resolved to a port, the device-wide counterpart of
 `server.py`), read by the device dialog's HARDWARE SENSORS and DOM / SFP
 SENSORS sections (`nodes.js`); both walk only while that dialog is open,
 same reasoning as `read_dom`.
+
+**Cisco's own sensor table, and why both sections were empty on Cisco
+gear — 5.0.1.** Cisco switches populate CISCO-ENTITY-SENSOR-MIB
+(`entSensorValueTable`, `1.3.6.1.4.1.9.9.91.1.1.1.1`) *instead of* RFC
+3433's `entPhySensorTable`, and routinely answer no
+`entAliasMappingIdentifier` row at all — so on an all-Cisco fleet the
+sensor list and the DOM table were both empty for two independent
+reasons. `_walk_sensor_columns` is now the single reader every caller
+goes through: it walks the standard value column first and, **only when
+that came back empty and `_cisco_sensor_table_plausible(device)`**
+(`detected_vendor == "cisco"`, or a `sys_object_id` under
+`1.3.6.1.4.1.9.`), walks the Cisco one, then the sibling
+type/scale/precision/status columns of whichever answered. The two are
+never merged (gear answering both would report every reading twice), and
+a non-Cisco device pays exactly the one walk it always did. The Cisco
+table has no units-display column, so unit text comes from the type
+enum, which is where `dBm(14)` and `specialEnum(13)` join
+`_SENSOR_TYPE_UNITS`/`_SENSOR_TYPE_NAMES`. dBm needs **no special case**:
+IOS reports units(9)/precision 1/-24 and NX-OS milli(8)/precision 0/-5500,
+and the ordinary RFC 3433 arithmetic gives -2.4 dBm and -5.5 dBm
+respectively.
+
+`_entity_port_map` gained the second half of the fix: for an entity the
+`entAliasMappingIdentifier` pass left unmapped it climbs
+`entPhysicalContainedIn` (≤ 16 hops) and takes either a hop already
+resolved or a hop whose `entPhysicalName` matches a stored `ifDescr`.
+Names are compared through `_canonical_if_name` — lowercased, whitespace
+stripped, and a leading abbreviation expanded via
+`_IF_NAME_ABBREVIATIONS` (`fa`/`gi`/`te`/`twe`/`fo`/`hu`/`eth`/`tw`/`fi`/
+`po`), only when the whole leading alpha run is the abbreviation, so
+"TenGigabitEthernet1/1/1" is never re-read as "Te" + the rest — against
+the whole name and then its first whitespace token, because Cisco names
+an optic sensor "Te1/1/1 Transmit Power" and its parent module
+"TenGigabitEthernet1/1/1". Matched against `ifDescr` only, never
+`ifAlias`: an operator-typed description is not evidence.
+
+When a read still comes back empty, `_read_entity_sensors` writes one
+NODES event per device per minute (`_log_sensor_diag`,
+`_SENSOR_DIAG_INTERVAL_S`) saying either which tables answered nothing or
+how many rows were read, out of which MIB, and that neither
+`entAliasMappingIdentifier` nor `entPhysicalName` mapped any of them —
+the empty states in `nodes.js` point at that log.
 
 **MAC address table** (`NodePoller.read_mac_table`): same on-demand shape
 as `read_dom` above — walked only while the interface dialog is open.

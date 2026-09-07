@@ -822,7 +822,23 @@ port, so a transceiver problem is visible without opening every interface
 in turn; the per-interface dialog's own DOM section (below) is unchanged.
 Both walk only while the dialog is open, the same as the OID browser and
 MAC table, and a device that answers nothing for a section shows that
-plainly rather than an error.
+plainly rather than an error — pointing at the Nodes event log, which from
+5.0.1 records which sensor tables were asked for and what came back.
+
+**From 5.0.1 both sections also read Cisco's own sensor table.** Cisco
+switches publish their transceiver and chassis readings in
+CISCO-ENTITY-SENSOR-MIB rather than the standard ENTITY-SENSOR-MIB, which
+is why an all-Cisco fleet saw both of these sections empty; the standard
+table is still asked for first, and the Cisco one only when that answered
+nothing and the device is known or looks to be Cisco, so nothing else in
+the fleet pays for the extra walk. Optical power in dBm is read as such.
+Cisco gear also commonly maps none of its sensors to a port in the standard
+way, so a sensor whose name (or its parent module's) matches a port's own
+interface description — "Te1/1/1 Transmit Power" against
+"TenGigabitEthernet1/1/1" — is filed under that port. A device that once
+answered no sensors at all is asked again once an hour rather than written
+off for the life of the service, and **Re-identify** and **Poll now** both
+ask again immediately.
 
 **The per-port bandwidth chart holds still under live polling.** Selecting a
 device polls it every few seconds, and a chart drawn from every one of those
@@ -974,9 +990,11 @@ points), its statistics and
 error counters (cumulative and per-second), its link up/down event
 history, and DOM/SFP sensor readings — voltage, current, light levels,
 temperature — read live over SNMP from devices that expose them via the
-standard ENTITY-SENSOR-MIB (values, units and scaling exactly as the
-device reports them; devices without it simply show "no DOM/sensor
-data"), and the MAC addresses currently learned on that port, with the VLAN each
+standard ENTITY-SENSOR-MIB or, on Cisco gear, CISCO-ENTITY-SENSOR-MIB
+(values, units and scaling exactly as the device reports them, optical
+power in dBm; devices with neither simply show "no DOM/sensor data", and
+say that the Nodes event log names the tables that were tried), and the
+MAC addresses currently learned on that port, with the VLAN each
 was learned in where the switch reports one — read live over SNMP from
 three forwarding tables in turn: the VLAN-aware **Q-BRIDGE-MIB**
 (`dot1qTpFdbTable`, which is what most modern switches actually answer),

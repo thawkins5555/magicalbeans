@@ -1532,7 +1532,7 @@
         const rows = r.sensors || [];
         if (!rows.length) {
           holder.innerHTML = App.emptyState(
-            'No DOM/SFP sensor data available from this device');
+            'No DOM/SFP sensor data available from this device — the Nodes event log names the tables tried.');
           return;
         }
         holder.innerHTML = '<table><caption class="sr-only">DOM and SFP sensors by port</caption>' +
@@ -2421,7 +2421,7 @@
         const dom = box.querySelector('#ifd-dom');
         if (!dom || !current()) return;
         if (!r.sensors || !r.sensors.length) {
-          dom.innerHTML = App.emptyState('No DOM/sensor data available from this device for this port.');
+          dom.innerHTML = App.emptyState('No DOM/sensor data available from this device for this port — the Nodes event log names the tables tried.');
           return;
         }
         dom.innerHTML = '<table><caption class="sr-only">Optics and environment sensors</caption><tr><th scope="col">Sensor</th><th scope="col">Value</th><th scope="col">Status</th></tr>' +
