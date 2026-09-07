@@ -9,7 +9,6 @@ in case it was really a stopped poller rather than a quiet, healthy device.
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 from dataclasses import asdict, dataclass, field
 
@@ -384,49 +383,30 @@ def top_metric_ranking(nodesdb, key: str, t0: float, t1: float, *,
     t0, t1 = clamp_window(t0, t1)
     h0 = int(t0 // 3600) * 3600
     h1 = int(t1 // 3600) * 3600
-    conn: sqlite3.Connection = nodesdb._conn
-
-    key_clause = "m.key LIKE ?" if like else "m.key = ?"
-    params: list = [key]
-    device_clause = ""
-    if device_ids:
-        marks = ",".join("?" * len(device_ids))
-        device_clause = f" AND m.device_id IN ({marks})"
-        params.extend(device_ids)
-    params.extend([h0, h1])
 
     started = time.perf_counter()
-    agg_rows = conn.execute(
-        f"WITH candidates AS ("
-        f" SELECT m.id AS metric_id, m.device_id, m.key, m.label, m.unit,"
-        f" d.name AS device_name, d.ip AS device_ip"
-        f" FROM metrics m JOIN devices d ON d.id = m.device_id"
-        f" WHERE {key_clause}{device_clause})"
-        f" SELECT c.metric_id, c.device_id, c.key, c.label, c.unit,"
-        f" c.device_name, c.device_ip, MAX(sh.vmax) AS peak,"
-        f" SUM(sh.vavg * sh.n) AS sum_avg_n, SUM(sh.n) AS total_n,"
-        f" COUNT(*) AS n_hours"
-        # CROSS JOIN, deliberately: it disables SQLite's join reordering, forcing
-        # small `candidates` to drive the loop and huge `samples_hourly` to be
-        # probed by its own primary key per candidate — a plain JOIN let SQLite
-        # start from the hour index instead and scan every unrelated metric
-        # family's rows in range too.
-        f" FROM candidates c CROSS JOIN samples_hourly sh ON sh.metric_id = c.metric_id"
-        f" WHERE sh.hour >= ? AND sh.hour <= ? GROUP BY c.metric_id",
-        params).fetchall()
+    # The aggregate is a nodes_series.db query since 5.0.0; the device names
+    # it used to join to are a second, bounded read of nodes.db afterwards.
+    agg_rows = nodesdb.series_db.metric_window_aggregates(
+        key, h0, h1, like=like, device_ids=device_ids)
     query_ms = (time.perf_counter() - started) * 1000.0
     if not agg_rows:
         return TopMetricReport(key=key, like=like, t0=t0, t1=t1, rank_by=rank_by,
                                ascending=ascending, generated_ts=time.time(),
                                query_ms=query_ms, rows=[])
+    devices = {row["id"]: row for row in nodesdb.devices_by_ids(
+        sorted({arow["device_id"] for arow in agg_rows}))}
 
     rows: list[MetricRank] = []
     for arow in agg_rows:
         total_n = arow["total_n"] or 0
         mean = (arow["sum_avg_n"] / total_n) if total_n else None
+        device = devices.get(arow["device_id"])
+        device_ip = device["ip"] if device else ""
+        device_name = (device["name"] if device else "") or device_ip
         rows.append(MetricRank(
-            device_id=arow["device_id"], device_name=arow["device_name"] or arow["device_ip"],
-            device_ip=arow["device_ip"], metric_id=arow["metric_id"], key=arow["key"],
+            device_id=arow["device_id"], device_name=device_name,
+            device_ip=device_ip, metric_id=arow["metric_id"], key=arow["key"],
             label=arow["label"], unit=arow["unit"], if_index=_if_index(arow["key"]),
             peak=arow["peak"], mean=mean, n_hours=arow["n_hours"]))
 

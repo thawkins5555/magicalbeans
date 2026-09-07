@@ -195,4 +195,47 @@ reopened.close()
 ok("incremental auto-vacuum mode survives a reopen")
 
 
+# ========================================================= NodesSeriesDatabase
+print("\nnodes_series.db reclaims space after prune")
+
+folder = os.path.join(TMPDIR, "nodes")
+os.makedirs(folder, exist_ok=True)
+nodes_db = NodesDatabase(os.path.join(folder, "nodes.db"))
+series_db = nodes_db.series_db
+
+assert series_db._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+ok("a fresh nodes_series.db is in incremental auto-vacuum mode")
+assert series_db.path != nodes_db.path
+ok(f"...and is its own file beside nodes.db ({os.path.basename(series_db.path)})")
+
+gid = nodes_db.ensure_default_group()
+did = nodes_db.add_device("198.51.100.9", name="reclaim-sw", group_id=gid)
+old_time = time.time() - 100000
+for t in range(120):
+    nodes_db.record_metric_samples(
+        did, [(f"bulk.{j}", "bulk", "u", "gauge", old_time + t, float(t * j))
+              for j in range(120)])
+
+before = series_db.size_bytes()
+assert before > 300_000, before
+ok(f"samples grew nodes_series.db to {before // 1024} KiB")
+
+removed = nodes_db.prune(sample_days=1, rollup_days=400, event_days=999,
+                         discovery_days=999)
+assert removed > 0, removed
+ok(f"prune through the facade removed {removed} rows from the series file")
+
+after = series_db.size_bytes()
+assert after < before, (before, after)
+ok(f"file shrank from {before // 1024} KiB to {after // 1024} KiB without VACUUM")
+
+nodes_db.close()
+
+reopened = NodesDatabase(os.path.join(folder, "nodes.db"))
+assert reopened.series_db._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+assert reopened.mib_db._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+reopened.close()
+ok("incremental auto-vacuum mode survives a reopen on both sibling files")
+
+
 print(f"\nALL {len(PASSED)} DB-RECLAIM ASSERTIONS PASSED")

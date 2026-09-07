@@ -265,9 +265,35 @@ def coerce_settings(defaults: dict, values: dict, *, strict: bool) -> dict:
     return result
 
 
+# ------------------------------------------------------------------ id sets
+
+# One SQLite statement can bind at most SQLITE_MAX_VARIABLE_NUMBER
+# parameters, and the bulk routes bind one per id in a "WHERE id IN (?,?,…)".
+# That ceiling is 32766 on SQLite 3.32 and newer (3.45 here) but 999 on
+# anything older, and this application does not choose which SQLite its
+# Python was linked against — so the number is not knowable at the call
+# site, and a request that works on one operator's install would fail on
+# another's with "too many SQL variables", an OperationalError the route
+# would answer as a 500.
+#
+# Splitting the ids rather than capping them keeps the shipped workflow
+# whole: the Devices page offers a 1000-row page size and a select-all that
+# checks every row on it, so any cap below 1000 breaks bulk delete or bulk
+# poll for an operator doing the obvious thing. Every chunk runs inside the
+# caller's single `with self._lock:` and one commit, so the operation stays
+# atomic — the split is a statement-size detail, not a transaction boundary.
+_ID_CHUNK = 500
+
+
+def id_chunks(ids, size: int = _ID_CHUNK):
+    ids = list(ids)
+    for start in range(0, len(ids), size):
+        yield ids[start:start + size]
+
+
 # --------------------------------------------------------------------- trim
 
-TRIM_CHUNK = 2_000           # rows per lock acquisition, adapted below
+TRIM_CHUNK = 2_000         # rows per lock acquisition, adapted below
 TRIM_CHUNK_MIN = 500
 TRIM_CHUNK_MAX = 50_000
 TRIM_LOCK_TARGET_S = 0.15    # how long one batch may hold the write lock
@@ -376,6 +402,29 @@ class SqliteStore:
                     " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (key, json.dumps(value)),
                 )
+            self._conn.commit()
+
+    def _private_setting(self, key: str, default=None):
+        """A settings row a module keeps for itself. Not in DEFAULTS, so
+        settings() never returns it and save_settings() cannot be made to
+        overwrite it from the settings dialog — it is bookkeeping, not a
+        preference."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return default
+        try:
+            return json.loads(row["value"])
+        except (ValueError, TypeError):
+            return default
+
+    def _set_private_setting(self, key: str, value) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO settings(key, value) VALUES (?,?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, json.dumps(value)))
             self._conn.commit()
 
     # ------------------------------------------------------------------ trim

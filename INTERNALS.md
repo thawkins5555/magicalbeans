@@ -12,7 +12,7 @@ fixing, not just using.
 
 - [Layout](#layout) — the file map
 - [Process model](#process-model) — threads, who owns which loop
-- [Data layer](#data-layer) — the eleven databases, migrations, retention
+- [Data layer](#data-layer) — the thirteen databases, migrations, retention
 - [Nodes](#nodes) — the SNMP poller, the wire, the scheduler, the write path
 - [MAPPER](#mapper) — link assembly, the render plan, VLAN membership
 - [Alerts](#alerts) — occurrences, dedup keys, rollup, notification
@@ -64,8 +64,10 @@ netpath/
                    also the OID constants for FortiGate Wireless Controller
                    polling
   nodepoll.py      NodePoller: the per-device SNMP/ping scheduler
-  nodesdb.py       nodes.db: devices, profiles, interfaces, metrics/
-                   samples, state events, uploaded MIBs, discovery jobs
+  nodesdb.py       nodes.db: devices, profiles, interfaces, state
+                   events, discovery jobs; the facade over the two below
+  nodesseriesdb.py nodes_series.db: metrics, samples, samples_hourly
+  nodesmibdb.py    nodes_mibs.db: mib_files, mib_objects
   nodediscover.py  per-device/subnet discovery: ping sweep + best-effort
                    SNMP v1/v2c identification
   snmppoll.py      SNMP wire format for the Nodes poller: GET/GETNEXT/
@@ -133,7 +135,7 @@ tests/
 
 One process, several threads, no external dependencies beyond the standard
 library (PySide6 only for the console window). `netpath/__main__.py`'s
-`main()` builds a `Service` (`web/service.py`), which opens eleven SQLite
+`main()` builds a `Service` (`web/service.py`), which opens thirteen SQLite
 connections and starts every background worker, then either hands it to a
 `WebServer` alone (`--headless`) or to both a `WebServer` and a
 `ConsoleWindow` (default). Every module below is a thread or a pool of
@@ -205,7 +207,7 @@ trace scheduler this class was copied from.
 
 ## Data layer
 
-Eleven SQLite files, every `*Database` class subclassing `SqliteStore`
+Thirteen SQLite files, every `*Database` class subclassing `SqliteStore`
 (`netpath/sqlitebase.py`). `sqlitebase.connect()` opens the file at
 owner-only permissions (mode 0600, POSIX only) and sets `busy_timeout=5000`,
 `cache_size=-20000` and `mmap_size=268435456` once, here, so no module can
@@ -269,10 +271,11 @@ through its own FTS-aware `_delete_logs()` so the search index and the
 message rows never disagree; `nodesdb.py` and `alertsdb.py` keep their own
 `trim_to_size()` entirely, since each spans several tables rather than one
 dominant one. `Service.run_maintenance()` (`web/service.py`) calls
-`Service._trim_db()` for each of the seven databases that has a
-`max_*_db_mb` setting (netpath, flow, syslog, snmp, ipam, nodes, alerts —
-not `app.db`, `wireless.db`, `configrx.db` or `mapper.db`, none of which
-has a size cap), plus the day-based retention prunes for each module,
+`Service._trim_db()` for each of the eight databases that has a
+`max_*_db_mb` setting (netpath, flow, syslog, snmp, ipam, nodes,
+nodes_series, alerts — not `app.db`, `wireless.db`, `configrx.db`,
+`mapper.db` or `nodes_mibs.db`, none of which has a size cap), plus the
+day-based retention prunes for each module,
 `AppDatabase.prune_hostnames()` for the reverse-DNS cache and
 `AppDatabase.prune_asn_cache()` for the ASN/owner cache. `nodes.db`'s own
 retention prune now covers `vlans`/`vlan_ports`/`port_vlans` too
@@ -288,12 +291,97 @@ fourth setting).
 | `flows.db` | `FlowDatabase` (`flowdb.py`) | `flows`, `exporters`, `interfaces`, NetFlow's own settings |
 | `syslog.db` | `SyslogDatabase` (`syslogdb.py`) | `logs`, `log_counts` (hourly rollup), the FTS5 index, Syslog's own settings |
 | `ipam.db` | `IpamDatabase` (`ipamdb.py`) | `subnets`, `hosts`, `conflicts`, `scans`, `dhcp_servers`, `dhcp_scopes`, `dhcp_leases`, `dhcp_scope_history` (leased-IP trend), IPAM's own settings |
-| `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `device_groups` (organizational, unrelated to `groups`), `devices`, `interfaces`, `metrics`/`samples`/`samples_hourly`, `device_events`/`interface_events`, `mib_files`/`mib_objects`, `discovery_jobs`/`discovery_results`, `vlans`/`vlan_ports`/`port_vlans` (per-port VLAN membership, for MAPPER), Nodes' own settings |
+| `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `device_groups` (organizational, unrelated to `groups`), `devices`, `interfaces`, `device_events`/`interface_events`, `discovery_jobs`/`discovery_results`, `vlans`/`vlan_ports`/`port_vlans` (per-port VLAN membership, for MAPPER), `mac_entries`, `neighbors`, `device_addresses`, `vendor_learned`, Nodes' own settings. Also the facade over the two files below |
+| `nodes_series.db` | `NodesSeriesDatabase` (`nodesseriesdb.py`) | `metrics`, `samples`, `samples_hourly` — the Nodes tables that grow |
+| `nodes_mibs.db` | `NodesMibDatabase` (`nodesmibdb.py`) | `mib_files` (including each file's original text), `mib_objects` |
 | `alerts.db` | `AlertsDatabase` (`alertsdb.py`) | `rules`, `templates`, `alerts`, `notifications`, `meta` (per-source evaluation cursors), `smtp_credential`, `device_thresholds` (per-device threshold-rule overrides), Alerts' own settings |
 | `snmptraps.db` | `SnmpTrapDatabase` (`snmptrapdb.py`) | `traps` (received traps and informs, decoded), `trap_counts` (hourly rollup), SNMP Trap's own settings |
 | `wireless.db` | `WirelessDatabase` (`wirelessdb.py`) | `controllers` (each with its own SNMP credential columns), `access_points`, `radios`, Wireless' own settings |
 | `configrx.db` | `ConfigRxDatabase` (`configrxdb.py`) | `device_config` (per-device backup settings, SSH credential and optional enable secret, keyed by a Nodes device id with no real FK), `backups` (zlib-compressed, hash-deduped), ConfigRX's own settings |
 | `mapper.db` | `MapperDatabase` (`mapperdb.py`) | `maps`, `map_nodes` (devices/unmanaged peers placed on a map, and where), `vlan_colors` (a global VLAN colour override, not per-map), Mapper's own settings |
+
+---
+
+### Nodes split (5.0.0)
+
+Until 4.54 `nodes.db` held everything the module knows: the device
+inventory *and* every metric definition, every raw sample, every hourly
+rollup, and the full text of every uploaded MIB. Those last five tables are
+the only ones that grow — `samples` dominates the write rate,
+`samples_hourly` dominates the size, `metrics` is a large static table, and
+a vendor MIB bundle is a multi-megabyte lump sitting in the middle of the
+poller's hot write path. A size cap on that one file could not trim history
+without also being a cap on the inventory, and every metric write contended
+with every page read.
+
+5.0.0 splits them into `nodes_series.db` (`nodesseriesdb.py`) and
+`nodes_mibs.db` (`nodesmibdb.py`), opened as siblings of whatever path
+`--nodes-db` resolved to (`nodes.db` → `nodes_series.db`, derived from the
+stem so two stores in one directory never share a pair). There is no new
+constructor argument and no new CLI flag, the same precedent `mapper.db`
+set. `NodesDatabase` keeps every public name it had: the series and MIB
+methods forward to `self.series_db` / `self.mib_db` in one contiguous
+delegation block, and only the handful that genuinely need both sides are
+composed rather than forwarded — `metrics_for_keys` drops disabled devices
+in Python, `top_metric` ranks in the series file and names the devices from
+this one, `remove_device`/`bulk_remove_devices` follow through to
+`delete_metrics_for_devices`, `remove_mib_file` NULLs
+`devices.mib_file_id`/`groups.mib_file_id` itself, and
+`report.top_metric_ranking` aggregates in `nodes_series.db` and resolves
+names with one bounded `devices_by_ids`. Cross-file ids are plain integers,
+already the convention (`configrx.device_config`, `mapper.map_nodes`).
+
+**Why the migration rebuilds two tables.** `devices.mib_file_id` and
+`groups.mib_file_id` were added by `ensure_columns` with `REFERENCES
+mib_files(id) ON DELETE SET NULL`. After `DROP TABLE mib_files` every
+INSERT and DELETE on either table fails with "no such table", and a DROP
+with `foreign_keys=ON` fires SET NULL over every assignment on the way out.
+SQLite cannot alter a constraint, so phase 1 rebuilds both tables from
+their own stored `sqlite_master.sql` with the clause removed: commit,
+`PRAGMA foreign_keys=OFF` (a no-op inside a transaction, hence the commit
+first), create `__split_rebuild` from the edited DDL, copy, count-check,
+drop, rename, `PRAGMA foreign_key_check`, `foreign_keys=ON`.
+
+**The three phases**, marked by the private setting `split_state` in
+`nodes.db` (absent = fresh 5.0 or never split, `rollups` = phase 1 done,
+`done` = finished):
+
+1. Synchronous in `_before_schema()`, and re-runnable — nothing in
+   `nodes.db` changes until the rebuild at the end, so an interrupted run
+   leaves a file 4.x can still open and simply starts over. The series
+   store ATTACHes `nodes.db` and copies `metrics` with their ids intact,
+   counts are verified, the raw samples *since* `rollup_watermark_hour` are
+   summarised into the new `samples_hourly` (raw samples are not copied —
+   they expire in three days — so this is what bounds the loss to the
+   current partial hour), the MIB store imports `mib_files` and
+   `mib_objects`, and then the two tables are rebuilt.
+2. `Service.start()`'s `netpath-nodes-split` thread calls
+   `continue_split()`, which lifts `samples_hourly` across in rowid-cursor
+   batches of 20,000 with the cursor persisted in the same transaction as
+   the rows it covers, an adaptive batch size, and `INSERT OR IGNORE`
+   guarded by an `EXISTS` on `metrics`. It honours the service's stop
+   event; `shutdown()` joins the thread before any database closes.
+   Meanwhile `series()` merges the not-yet-copied legacy rollup rows into
+   any window wider than `RAW_WINDOW_S`, so a year-wide chart is complete
+   throughout.
+3. `_finish_split()` re-checks that no legacy rollup row is missing (one
+   retry, for a row a poll added behind the cursor), drops the five legacy
+   tables with `foreign_keys=OFF`, sets the marker to `done`, and reclaims
+   in incremental slices for up to 120 seconds. `finish_split_now()` is the
+   synchronous entry point for tests and the demo seeder.
+
+Every ATTACH is detached again, including on the way out of an exception:
+an ATTACH left open makes every later `VACUUM` fail, and `reclaim()` runs
+from the maintenance timer without knowing a migration ever happened.
+
+A 4.x binary can still open `nodes.db` until phase 3 completes, and not
+after.
+
+`nodes.db` itself is now almost static, so its `trim_to_size` trims the
+oldest 15% of `device_events`/`interface_events` (floor 5,000 each) — the
+only unbounded tables it has left — while `max_nodes_series_db_mb` (default
+1024) caps the metric history. `nodes_mibs.db` is deliberately uncapped: a
+MIB is not history, and trimming it would silently stop traps decoding.
 
 ---
 
@@ -1573,7 +1661,7 @@ the sorted list of still-unresolved parent names — this is the whole
 "upload order matters" story: uploading a dependent MIB before the one
 defining its parent branch leaves it (and anything depending on *it*)
 unresolved, and re-running `resolve()` after the parent is uploaded
-finishes the chain without re-parsing anything. `nodes.db`'s `mib_files`
+finishes the chain without re-parsing anything. `nodes_mibs.db`'s `mib_files`
 table keeps the original uploaded text (`content` column) specifically
 so a later Resolve can re-parse from scratch — `mib_objects` only ever
 stores the final `oid` or `NULL`, never the `parent`/`last_arc` an
@@ -6315,7 +6403,7 @@ almost all the time cannot starve the one with output to send. That wait is
 `poll()` where the platform has it and a `selectors` object (epoll or kqueue
 there, `select` on Windows) where it does not — deliberately *not*
 `select.select`, which cannot express a descriptor at or above `FD_SETSIZE`
-and, given this process holds eleven databases with their WAL companions, three
+and, given this process holds thirteen databases with their WAL companions, three
 UDP listeners, every poll worker's socket and one descriptor per open HTTP
 connection, was reached routinely: past 1,024 the call raised on every pass
 and the reader spun, burning a core for an idle terminal. The wait's answer

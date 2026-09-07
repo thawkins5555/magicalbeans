@@ -684,7 +684,7 @@ for offset in (0, 65):
     engine._tick()
 live = open_rows(alerts, "cpu_high", did)
 assert len(live) == 1, [dict(a) for a in live]
-conn = sqlite3.connect(nodes.path)
+conn = sqlite3.connect(nodes.series_db.path)
 conn.execute("UPDATE metrics SET last_ts = last_ts - 86400 WHERE device_id = ?",
              (did,))
 conn.commit(); conn.close()
@@ -708,11 +708,12 @@ for i in range(50):
         nodes.record_metric_sample(device_id, key, label, "%", "gauge", base, 5.0)
 
 statements = []
-nodes._conn.set_trace_callback(statements.append)   # the engine's own connection
+# The series file's connection since 5.0.0 — `metrics` lives there now.
+nodes.series_db._conn.set_trace_callback(statements.append)
 try:
     engine._tick()
 finally:
-    nodes._conn.set_trace_callback(None)
+    nodes.series_db._conn.set_trace_callback(None)
 from_metrics = [q for q in statements if "FROM metrics" in q]
 assert len(from_metrics) == 1, from_metrics
 ok(f"one FROM metrics statement per tick at 50 devices "

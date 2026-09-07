@@ -407,6 +407,9 @@ class ConsoleWindow(QMainWindow):
             ("Syslog", self.service.syslog_db, settings.get("max_syslog_db_mb", 0)),
             ("IPAM", self.service.ipam_db, 0),
             ("Nodes", self.service.nodes_db, settings.get("max_nodes_db_mb", 0)),
+            ("Metrics", self.service.nodes_db.series_db,
+             settings.get("max_nodes_series_db_mb", 0)),
+            ("MIBs", self.service.nodes_db.mib_db, 0),
             ("Alerts", self.service.alerts_db, settings.get("max_alerts_db_mb", 0)),
         ]
         lines = []

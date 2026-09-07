@@ -32,6 +32,7 @@
     ['max_syslog_db_mb', 'set-syslog-cap', 'num'],
     ['max_ipam_db_mb', 'set-ipam-cap', 'num'],
     ['max_nodes_db_mb', 'set-nodes-cap', 'num'],
+    ['max_nodes_series_db_mb', 'set-nodes-series-cap', 'num'],
     ['max_alerts_db_mb', 'set-alerts-cap', 'num'],
     ['session_idle_minutes', 'set-idle-minutes', 'num'],
     ['session_max_hours', 'set-session-hours', 'num'],
@@ -77,6 +78,7 @@
     App.el('set-syslog-cap').value = s.max_syslog_db_mb;
     App.el('set-ipam-cap').value = s.max_ipam_db_mb;
     App.el('set-nodes-cap').value = s.max_nodes_db_mb;
+    App.el('set-nodes-series-cap').value = s.max_nodes_series_db_mb;
     App.el('set-alerts-cap').value = s.max_alerts_db_mb;
     App.el('set-idle-minutes').value = s.session_idle_minutes;
     App.el('set-session-hours').value = s.session_max_hours;
@@ -99,6 +101,8 @@
     App.el('set-syslog-path').value = storage.syslog_path || '';
     App.el('set-ipam-path').value = storage.ipam_path || '';
     App.el('set-nodes-path').value = storage.nodes_path || '';
+    App.el('set-nodes-series-path').value = storage.nodes_series_path || '';
+    App.el('set-nodes-mibs-path').value = storage.nodes_mibs_path || '';
     App.el('set-alerts-path').value = storage.alerts_path || '';
     showUsage(storage);
     showUpdateInfo(server);
@@ -373,6 +377,10 @@
       ['use-syslog', storage.syslog_bytes, Number(App.el('set-syslog-cap').value)],
       ['use-ipam', storage.ipam_bytes, Number(App.el('set-ipam-cap').value)],
       ['use-nodes', storage.nodes_bytes, Number(App.el('set-nodes-cap').value)],
+      ['use-nodes-series', storage.nodes_series_bytes,
+       Number(App.el('set-nodes-series-cap').value)],
+      // Uncapped, like use-app above: bytes only, no bar.
+      ['use-nodes-mibs', storage.nodes_mibs_bytes, 0],
       ['use-alerts', storage.alerts_bytes, Number(App.el('set-alerts-cap').value)],
     ];
     for (const [id, bytes, capMb] of rows) {
@@ -1286,7 +1294,8 @@
     App.el('ldap-apply').onclick = applyLdapSettings;
     App.el('ldap-test').onclick = testLdap;
     for (const id of ['set-trace-cap', 'set-flow-cap', 'set-snmp-cap', 'set-syslog-cap',
-                     'set-ipam-cap', 'set-nodes-cap', 'set-alerts-cap']) {
+                     'set-ipam-cap', 'set-nodes-cap', 'set-nodes-series-cap',
+                     'set-alerts-cap']) {
       App.el(id).oninput = () =>
         showUsage((App.state.serverState || {}).storage || {});
     }

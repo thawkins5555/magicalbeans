@@ -662,7 +662,7 @@ Then confirm the version, as below. The databases are never touched by any of
 this — they live outside the application folder by default, in
 `%APPDATA%\netpath-monitor\`. Read [Backup and restore](#backup-and-restore)
 before an upgrade that crosses a schema change; the short version is that a
-copy of the eleven `.db` files taken while the service is stopped is a
+copy of the thirteen `.db` files taken while the service is stopped is a
 complete, restorable backup.
 
 On Linux the equivalent is `systemctl stop sappiwhere`, replace the directory,
@@ -832,10 +832,15 @@ netpath/
                    also OID constants for FortiGate Wireless Controller
                    polling
   nodepoll.py      NodePoller: the per-device SNMP/ping scheduler
-  nodesdb.py       nodes.db: devices, polling profiles, interfaces, polled
-                   metrics/samples, state events, uploaded MIBs, discovery,
-                   per-port VLAN membership (`vlans`/`vlan_ports`/
-                   `port_vlans`, for MAPPER)
+  nodesdb.py       nodes.db: devices, polling profiles, interfaces, state
+                   events, discovery, per-port VLAN membership (`vlans`/
+                   `vlan_ports`/`port_vlans`, for MAPPER); also the facade
+                   over the two files below, so every caller still sees one
+                   Nodes database
+  nodesseriesdb.py nodes_series.db: polled metrics, their raw samples and
+                   the hourly rollups — the tables that grow
+  nodesmibdb.py    nodes_mibs.db: uploaded MIB files and the objects parsed
+                   out of them
   nodediscover.py  per-device and per-subnet discovery: ping sweep plus
                    best-effort SNMP v1/v2c identification
   snmppoll.py      SNMP wire format for the Nodes poller: GET/GETNEXT/
@@ -1033,7 +1038,7 @@ gh release create "$TAG" SHA256SUMS --title "SappiWhere 4.53.0" --notes-file -
 
 ## Backup and restore
 
-Eleven SQLite databases, all in WAL mode, all written by one live process.
+Thirteen SQLite databases, all in WAL mode, all written by one live process.
 **Copying only the `.db` file while the service is writing gives a torn
 backup** — every database also has a `-wal` (committed transactions not yet
 folded into the main file) and usually a `-shm`. Do not use `cp`, `rsync` or
@@ -1043,7 +1048,7 @@ three files of every database at once.
 What to back up is everything in the data directory
 (`~/.local/share/netpath-monitor/` on Linux/macOS,
 `%APPDATA%\netpath-monitor\` on Windows, or wherever `--db`/`--nodes-db`/etc.
-point): the eleven `.db` files, and `secret.salt` — the per-install salt the
+point): the thirteen `.db` files, and `secret.salt` — the per-install salt the
 portable secret store (non-Windows hosts with a passphrase configured;
 `netpath/secretstore.py`, `CREDENTIAL-SECURITY.md`) derives its encryption
 key from. `NETWORK-AND-STORAGE-REQUIREMENTS.md` says what each database
@@ -1078,7 +1083,8 @@ portable secret store ever encrypted, permanently:
 set -eu
 SRC="$HOME/.local/share/netpath-monitor"; DST="/backup/sappiwhere/$(date +%F)"
 mkdir -p "$DST"
-for f in app nodes alerts netpath flows snmptraps syslog ipam wireless configrx mapper; do
+for f in app nodes nodes_series nodes_mibs alerts netpath flows snmptraps \
+         syslog ipam wireless configrx mapper; do
     [ -f "$SRC/$f.db" ] || continue
     sqlite3 "$SRC/$f.db" ".backup '$DST/$f.db'"
 done

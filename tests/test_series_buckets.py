@@ -209,8 +209,10 @@ for h in range(5 * 24):
             float(hour_start + step * 600), float(h))
 
 def raw_count(db, metric_id):
-    with db._lock:
-        return db._conn.execute(
+    # samples live in nodes_series.db since 5.0.0, so every direct read
+    # below goes through the sub-store rather than the facade.
+    with db.series_db._lock:
+        return db.series_db._conn.execute(
             "SELECT COUNT(*) AS n FROM samples WHERE metric_id = ?",
             (metric_id,)).fetchone()["n"]
 
@@ -224,7 +226,8 @@ watermark = None
 while passes < 10:
     written += roll_db.compact_rollup()
     passes += 1
-    moved = roll_db._private_setting(roll_db._ROLLUP_WATERMARK)
+    moved = roll_db.series_db._private_setting(
+        roll_db.series_db._ROLLUP_WATERMARK)
     if moved == watermark:
         break                 # caught up: the watermark stopped advancing
     watermark = moved
@@ -233,8 +236,8 @@ print(f"rollup wrote {written} metric-hour(s) over {passes} pass(es) from "
 assert passes > 1, "a 5-day backlog should take more than one bounded pass"
 assert written >= 5 * 24 - 1, written
 
-with roll_db._lock:
-    hourly = roll_db._conn.execute(
+with roll_db.series_db._lock:
+    hourly = roll_db.series_db._conn.execute(
         "SELECT hour, n, vmin, vavg, vmax FROM samples_hourly"
         " WHERE metric_id = ? ORDER BY hour", (roll_metric,)).fetchall()
 assert len(hourly) >= 5 * 24 - 1, len(hourly)
@@ -252,8 +255,8 @@ print("PASS: the rollup leaves the raw samples alone")
 # A second pass re-does only the two-hour overlap, and writes nothing new.
 before_rows = len(hourly)
 written_again = roll_db.compact_rollup()
-with roll_db._lock:
-    after_rows = roll_db._conn.execute(
+with roll_db.series_db._lock:
+    after_rows = roll_db.series_db._conn.execute(
         "SELECT COUNT(*) AS n FROM samples_hourly WHERE metric_id = ?",
         (roll_metric,)).fetchone()["n"]
 assert after_rows == before_rows, (before_rows, after_rows)
@@ -272,21 +275,21 @@ print("PASS: a 5-day window reads hourly rollups, a 1-day window reads raw")
 # prune acts on the right table: raw by sample_days, rollups by rollup_days.
 roll_db.prune(sample_days=2, rollup_days=400, event_days=999,
               discovery_days=999)
-with roll_db._lock:
-    oldest_left = roll_db._conn.execute(
+with roll_db.series_db._lock:
+    oldest_left = roll_db.series_db._conn.execute(
         "SELECT MIN(ts) AS t, COUNT(*) AS n FROM samples WHERE metric_id = ?",
         (roll_metric,)).fetchone()
 assert oldest_left["n"], "pruning raw samples must not empty the table"
 assert oldest_left["t"] >= _time.time() - 2 * 86400 - HOUR, dict(oldest_left)
-with roll_db._lock:
-    still_hourly = roll_db._conn.execute(
+with roll_db.series_db._lock:
+    still_hourly = roll_db.series_db._conn.execute(
         "SELECT COUNT(*) AS n FROM samples_hourly").fetchone()["n"]
 assert still_hourly == after_rows, (still_hourly, after_rows)
 print("PASS: pruning raw samples by age leaves the rollups untouched")
 
 roll_db.prune(sample_days=999, rollup_days=1, event_days=999, discovery_days=999)
-with roll_db._lock:
-    left = roll_db._conn.execute(
+with roll_db.series_db._lock:
+    left = roll_db.series_db._conn.execute(
         "SELECT COUNT(*) AS n FROM samples_hourly").fetchone()["n"]
 assert 0 < left < after_rows, (left, after_rows)
 print(f"PASS: rollup_days prunes samples_hourly ({after_rows} -> {left} rows)")
@@ -302,9 +305,16 @@ roll_db.close()
 
 trim_path = os.path.join(TMPDIR, "trim.db")
 trim_db = NodesDatabase(trim_path)
+# The samples the trim is about are in the series file since 5.0.0, so that
+# is the store whose cap is exercised and whose bytes are measured.
+series_db = trim_db.series_db
+series_path = series_db.path
 with trim_db._lock:
     mode = trim_db._conn.execute("PRAGMA auto_vacuum").fetchone()[0]
 assert mode == 2, f"a fresh nodes.db should be in incremental auto-vacuum, got {mode}"
+with series_db._lock:
+    series_mode = series_db._conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+assert series_mode == 2, f"nodes_series.db should be too, got {series_mode}"
 print("PASS: a fresh database opens in incremental auto-vacuum mode")
 
 trim_group = trim_db.ensure_default_group()
@@ -317,9 +327,9 @@ for t in range(60):
         trim_device,
         [(f"bulk.{j}", "bulk", "u", "gauge", float(t), float(t * j))
          for j in range(300)])
-with trim_db._lock:
-    trim_db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-before_bytes = os.path.getsize(trim_path)
+with series_db._lock:
+    series_db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+before_bytes = os.path.getsize(series_path)
 
 # Deliberately below the current size, so the trim loop actually runs.
 blocked = []
@@ -340,14 +350,14 @@ def poll_writer(db, stop):
 stop = threading.Event()
 writer_thread = threading.Thread(target=poll_writer, args=(trim_db, stop))
 writer_thread.start()
-trim_removed = trim_db.trim_to_size(before_bytes // 2)
+trim_removed = series_db.trim_to_size(before_bytes // 2)
 stop.set()
 writer_thread.join(timeout=10)
 assert not writer_thread.is_alive(), "the writer thread never finished"
 
-with trim_db._lock:
-    trim_db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-after_bytes = os.path.getsize(trim_path)
+with series_db._lock:
+    series_db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+after_bytes = os.path.getsize(series_path)
 print(f"trim removed {trim_removed} sample(s); file {before_bytes:,} -> "
       f"{after_bytes:,} bytes; {len(blocked)} writes, worst wait "
       f"{max(blocked or [0]):.3f}s")

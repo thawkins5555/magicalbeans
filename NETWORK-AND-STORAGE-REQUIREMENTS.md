@@ -201,7 +201,7 @@ configured SMTP server.
 
 ## Storage
 
-Eleven SQLite databases and nothing else. No registry keys, no temporary
+Thirteen SQLite databases and nothing else. No registry keys, no temporary
 files left behind, no writes to the application folder at runtime — the
 code directory can be read-only.
 
@@ -215,13 +215,15 @@ code directory can be read-only.
 | `snmptraps.db` | Traps, hourly rollup counts, SNMP Trap settings | Trap rate — normally light; a device stuck in a fault loop is the exception |
 | `syslog.db` | Messages, hourly rollup counts, the search index, Syslog settings | Message rate — the substring index is roughly the size of the messages again |
 | `ipam.db` | Subnets, discovered hosts, conflicts, DHCP scopes and leases, IPAM settings, an optional DHCP credential | Subnet sizes swept and DHCP scope sizes — bounded by the per-subnet address cap |
-| `nodes.db` | Devices, polling profiles, interfaces, metric samples, device/interface events, uploaded MIBs, discovery jobs, Nodes settings, optional SNMPv3 credentials | Device count × poll frequency × metrics per device |
+| `nodes.db` | Devices, polling profiles, interfaces, device/interface events, discovery jobs, MAC and LLDP/CDP tables, per-port VLAN membership, Nodes settings, optional SNMPv3 credentials | Device count, and the two event tables — the inventory itself is nearly static |
+| `nodes_series.db` | Polled metric definitions, their raw samples and the hourly rollups | Device count × poll frequency × metrics per device — the Nodes file that actually grows |
+| `nodes_mibs.db` | Uploaded MIB files (original text kept for re-parsing) and the objects parsed out of them | How many vendor MIB bundles you install — a few MB each, and static between uploads |
 | `alerts.db` | Rules, email templates, alerts, notification history, Alerts settings, an optional SMTP credential | Alert volume — normally light; a flapping device or a noisy threshold is the exception |
 | `wireless.db` | Controllers, access points, per-radio detail, Wireless settings, optional SNMP credentials | Controller count × AP count per controller — normally small, a handful of controllers rather than hundreds |
 | `configrx.db` | Per-device backup configuration, stored config backups (compressed, hash-deduped), ConfigRX settings, optional SSH and enable-mode credentials | Device count × how often a device's config actually changes — an unchanged config never adds a row |
 | `mapper.db` | Named maps, the devices and unmanaged peers placed on each and where, a VLAN colour override table, Mapper settings | Number of maps × devices placed on them — hand-placed bookkeeping, not per-poll samples, so it stays small regardless of fleet size |
 
-The split is deliberate. The ten record files each hold one module's data
+The split is deliberate. The twelve record files each hold one module's data
 and that module's own settings; nothing else goes in them. Configuration
 read by more than one module, and the accounts that guard all of it, are in
 `app.db`, which is not subject to any size cap and is never trimmed by
@@ -241,7 +243,7 @@ usability — DPAPI will not decrypt it there, and the credential needs
 re-entering on the new machine. Everything else in each file restores
 normally.
 
-All eleven sit in one folder, chosen at first run:
+All thirteen sit in one folder, chosen at first run:
 
 | Platform | Default location |
 | --- | --- |
@@ -274,6 +276,23 @@ gigabytes of flow records later.
 rather than something worth pointing at its own volume, so it always lives
 beside `configrx.db`, in whichever folder `--configrx-db` (or the default)
 resolves to.
+
+`nodes_series.db` and `nodes_mibs.db` have no flags either, for the opposite
+reason: they are two halves of the Nodes database and would make no sense on
+a different volume than the inventory they key against, so they are always
+siblings of whatever `--nodes-db` resolves to. Point `--nodes-db` at the
+volume with room for the metric history and all three land there.
+
+**Upgrading from 4.x.** The first start after upgrading moves the metric
+history and the MIB corpus out of `nodes.db` into those two files. The
+device inventory, polling and the web interface all stay available while it
+runs: the copy of the metric definitions and the MIBs is synchronous and
+takes a moment, and the hourly rollups — which are the bulk — follow on a
+background thread that resumes where it stopped if the service is restarted
+mid-move. Raw samples are not carried over; the last hour of them is
+summarised into the rollups first, so charts lose nothing wider than the
+current hour. Once the move finishes `nodes.db` reclaims the freed space,
+and from that point a 4.x binary can no longer open it.
 
 Each database is in WAL mode, so each has two companions beside it:
 

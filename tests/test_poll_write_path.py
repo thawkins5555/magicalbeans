@@ -36,17 +36,22 @@ class CommitCounter:
     because "one transaction holding 900 statements" is not the win either.
     """
 
-    def __init__(self, conn):
-        self.conn = conn
+    def __init__(self, *conns):
+        # Several connections since 5.0.0: a poll writes the inventory to
+        # nodes.db and its metrics to nodes_series.db, and the point of the
+        # count is the whole poll, not one file's share of it.
+        self.conns = conns
         self.commits = 0
         self.statements = 0
 
     def __enter__(self):
-        self.conn.set_trace_callback(self._trace)
+        for conn in self.conns:
+            conn.set_trace_callback(self._trace)
         return self
 
     def __exit__(self, *exc):
-        self.conn.set_trace_callback(None)
+        for conn in self.conns:
+            conn.set_trace_callback(None)
         return False
 
     def _trace(self, statement):
@@ -772,7 +777,7 @@ def main():
         # fleet actually spends its life doing, and the one to count.
         poll()
         time.sleep(1.05)
-        with CommitCounter(db._conn) as counter:
+        with CommitCounter(db._conn, db.series_db._conn) as counter:
             poll()
         print(f"      poll 2: {counter.commits} commit(s), "
               f"{counter.statements} statement(s) for 24 interfaces")

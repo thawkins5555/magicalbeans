@@ -174,12 +174,24 @@ else:
     paths = [os.path.join(dbdir, n) for n in DB_NAMES]
     seed = subprocess.run([sys.executable, "-c", f"""
 import sys; sys.path.insert(0, {old!r})
+import time
 from netpath.web import Service
 import netpath
 svc = Service(*{paths!r}); svc.start()
 gid = svc.nodes_db.ensure_default_group()
 d = svc.nodes_db.add_device("10.0.0.8", name="prev-sw", group_id=gid)
 svc.nodes_db.replace_mac_entries(d, [{{"if_index": 1, "mac": "aabbccddee08", "vlan": ""}}])
+# The tables 5.0.0 moves out of nodes.db, seeded here so the upgrade start
+# below has a real split to perform rather than an empty one.
+mid = svc.nodes_db.record_metric_sample(d, "cpu_pct", "CPU", "%", "gauge", time.time(), 12.0)
+fid = svc.nodes_db.add_mib_file("PREV.mib", "PREV-MIB", 1, [], "", "PREV DEFINITIONS")
+svc.nodes_db.replace_mib_objects(fid, [{{"name": "prevObj", "oid": "1.3.6.1.4.1.4242.1"}}])
+svc.nodes_db.update_device(d, mib_file_id=fid)
+hour = int(time.time() // 3600) * 3600
+svc.nodes_db._conn.executemany(
+    "INSERT INTO samples_hourly(metric_id, hour, n, vmin, vavg, vmax) VALUES (?,?,?,?,?,?)",
+    [(mid, hour - (i + 2) * 3600, 6, 1.0, 5.0, 9.0) for i in range(24)])
+svc.nodes_db._conn.commit()
 svc.shutdown()
 print(netpath.__version__)
 """], capture_output=True, text=True, timeout=120)
@@ -192,13 +204,35 @@ import sys; sys.path.insert(0, {REPO_ROOT!r})
 from netpath.web import Service
 svc = Service(*{paths!r}); svc.start()
 rows = svc.nodes_db.mac_locations("aabbcc")
+nodes = svc.nodes_db
+# The 5.0.0 split runs on its own thread; join it before reading, since
+# shutdown() would close the databases these figures come from.
+if svc._nodes_split_thread is not None:
+    svc._nodes_split_thread.join(timeout=60)
+report = (nodes._private_setting("split_state"),
+          len(nodes.series_db.metrics_for_keys(["cpu_pct"])),
+          nodes.series_db._conn.execute(
+              "SELECT COUNT(*) FROM samples_hourly").fetchone()[0],
+          any(r["filename"] == "PREV.mib" for r in nodes.mib_files()),
+          any(o["name"] == "prevObj" for o in nodes.mib_objects()))
 svc.shutdown()
 print("locations", len(rows), "present", rows[0]["present"] if rows else None)
+print("split", report[0])
+print("metrics", report[1])
+print("rollups", report[2])
+print("prevmib", report[3], report[4])
 """], capture_output=True, text=True, timeout=120)
         check("the current release starts on the previous release's databases",
               started.returncode == 0, started.stderr[-600:])
         check("...and the previous release's MAC rows survive as present",
               "locations 1 present 1" in started.stdout, started.stdout[-200:])
+        check("...and the 5.0.0 nodes split ran to completion on that start",
+              "split done" in started.stdout, started.stdout[-400:])
+        check("...carrying the metric and its 24 hourly rollups across",
+              "metrics 1" in started.stdout and "rollups 24" in started.stdout,
+              started.stdout[-400:])
+        check("...and the uploaded MIB file with its object",
+              "prevmib True True" in started.stdout, started.stdout[-400:])
 
 # ------------------------------- part 3: permissions after the migration
 # On an install that predates app.db the accounts are still in netpath.db

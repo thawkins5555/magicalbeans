@@ -213,7 +213,13 @@ GLOBAL_DEFAULTS = {
     "session_max_hours": 12,
     "max_trace_db_mb": 512,
     "max_flow_db_mb": 2048,
-    "max_nodes_db_mb": 1024,       # samples accumulate; closer to flows than traps
+    # nodes.db is the device inventory plus its two event tables since
+    # 5.0.0 — it barely grows. The metric history that used to fill it is
+    # nodes_series.db, which keeps the old figure. nodes_mibs.db is
+    # deliberately uncapped: a MIB file is not history, and trimming it
+    # would silently un-decode traps.
+    "max_nodes_db_mb": 1024,
+    "max_nodes_series_db_mb": 1024,  # samples accumulate; closer to flows than traps
     "max_alerts_db_mb": 128,       # alert/notification history, much lighter
     # Was 256: a 75-second burst on a 250-device review install wrote 98.6 MB
     # (38% of that cap) — a real storm reaches 256 MB in minutes and starts

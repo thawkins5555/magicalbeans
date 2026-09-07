@@ -26,7 +26,9 @@ def check(name, ok, detail=""):
 # ------------------------------------------------------------ correctness
 
 db = NodesDatabase(":memory:")
-conn = db._conn
+# metrics and samples_hourly are nodes_series.db's since 5.0.0; the devices
+# the report names them from stay on the facade's own connection.
+conn = db.series_db._conn
 
 d1 = db.add_device("10.0.2.1", "sw1")
 d2 = db.add_device("10.0.2.2", "sw2")
@@ -138,7 +140,9 @@ FAMILIES = ("if_in_util_pct", "if_out_util_pct", "if_in_bps", "if_out_bps",
            "if_in_err", "if_out_err")
 
 db = NodesDatabase(":memory:")
-conn = db._conn
+# metrics and samples_hourly are nodes_series.db's since 5.0.0; the devices
+# the report names them from stay on the facade's own connection.
+conn = db.series_db._conn
 device_ids = [db.add_device(f"10.{i // 250}.{i % 250}.1", f"sw{i}")
              for i in range(N_DEVICES)]
 metric_rows = [(did, f"{fam}.{p}", f"port{p} {fam}", "u", "gauge")

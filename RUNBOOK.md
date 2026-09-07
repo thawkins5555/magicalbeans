@@ -201,9 +201,10 @@ minutes, or a window wider than a few days is blank.
    that is about a week per metric. If you have lowered it, that is your
    window.
 3. **`rollup_retention_days`**, default 400, and whether `samples_hourly` has
-   rows: `sqlite3 nodes.db "SELECT COUNT(*) FROM samples_hourly;"` (no
+   rows. From 5.0.0 that table is in `nodes_series.db`, beside `nodes.db`:
+   `sqlite3 nodes_series.db "SELECT COUNT(*) FROM samples_hourly;"` (no
    `sqlite3` shell on Windows by default — `py -c "import sqlite3;
-   print(sqlite3.connect('nodes.db').execute('SELECT COUNT(*) FROM
+   print(sqlite3.connect('nodes_series.db').execute('SELECT COUNT(*) FROM
    samples_hourly').fetchone())"` reads the same thing without installing
    anything, same substitution as the password-recovery step below). It
    fills on the first maintenance pass after an hour has completed, so a
@@ -224,7 +225,10 @@ in the log.
 1. **Settings tab** shows each database's current size against its cap. The
    Dashboard's storage tile shows the same, worst first.
 2. **Identify the file.** It will almost always be `flows.db` (2 GB cap by
-   default) or `syslog.db` (1 GB). Syslog storage is about 455 bytes per
+   default), `syslog.db` (1 GB) or `nodes_series.db` (1 GB — the metric
+   history; from 5.0.0 `nodes.db` itself holds only the inventory and its
+   two event tables, and `nodes_mibs.db` holds the uploaded MIBs and is
+   deliberately uncapped, since trimming a MIB would stop traps decoding). Syslog storage is about 455 bytes per
    message — the decoded fields, the original line, and its entry in the
    full-text search index — so 10 messages a second is roughly 390 MB a day.
    `snmptraps.db` can burst hard during a real storm — a 250-device install

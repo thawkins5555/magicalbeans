@@ -27,12 +27,12 @@ def build(path: str, preload: int):
     if preload:
         metric_id = db.record_metric_sample(
             device_id, "preload", "Preload", "", "gauge", 0.0, 0.0)
-        with db._lock:
-            db._conn.executemany(
+        with db.series_db._lock:
+            db.series_db._conn.executemany(
                 "INSERT OR REPLACE INTO samples(metric_id, ts, value)"
                 " VALUES (?,?,?)",
                 [(metric_id, float(i + 1), float(i)) for i in range(preload)])
-            db._conn.commit()
+            db.series_db._conn.commit()
     return db, device_id
 
 
@@ -41,6 +41,9 @@ def record_one_at_a_time(db, device_id, key, label, unit, kind, ts, value):
     an UPDATE, the sample, and a commit — per sample. Reproduced here
     rather than kept in the module, so the shipped code has one write path.
     """
+    # The series file since 5.0.0 — the same connection the shipped
+    # record_metric_samples writes through.
+    db = db.series_db
     with db._lock:
         row = db._conn.execute(
             "SELECT id FROM metrics WHERE device_id=? AND key=?",

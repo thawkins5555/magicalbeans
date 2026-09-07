@@ -73,10 +73,10 @@ def seed_hourly_sample(db, device_id, key, label, unit, hour, n, vmin, vavg, vma
     with record_metric_samples, so a route test needs the same shortcut."""
     metric_id = db.record_metric_samples(
         device_id, [(key, label, unit, "gauge", time.time(), vavg)])[key]
-    db._conn.execute(
+    db.series_db._conn.execute(
         "INSERT INTO samples_hourly(metric_id, hour, n, vmin, vavg, vmax)"
         " VALUES (?,?,?,?,?,?)", (metric_id, hour, n, vmin, vavg, vmax))
-    db._conn.commit()
+    db.series_db._conn.commit()
     return metric_id
 
 

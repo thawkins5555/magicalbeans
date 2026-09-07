@@ -612,7 +612,7 @@ own subtabs.
   the distribution's own public repository rather than from a copy held
   here. A server with no outbound HTTPS gets a clear message saying so,
   and the same files can be downloaded by hand and uploaded instead.
-  Installing a large bundle grows `nodes.db` by roughly the size of the
+  Installing a large bundle grows `nodes_mibs.db` by roughly the size of the
   MIB text it holds. This is deliberately not "every MIB in existence":
   the Cisco MIB repository alone is 2,921 files and around 350MB, which
   would multiply this app's database size by two orders of magnitude to
@@ -2826,7 +2826,7 @@ nobody can reach the application at all.
 
 ## Data
 
-Eleven SQLite files, in WAL mode. One for the application, ten for records.
+Thirteen SQLite files, in WAL mode. One for the application, twelve for records.
 
 | File | Holds |
 | --- | --- |
@@ -2836,7 +2836,9 @@ Eleven SQLite files, in WAL mode. One for the application, ten for records.
 | `snmptraps.db` | Traps, an OID name table, SNMP Trap settings |
 | `syslog.db` | Messages, hourly rollup counts, search index, Syslog settings |
 | `ipam.db` | Subnets, discovered hosts, conflicts, DHCP scopes and leases, IPAM settings, an optional DHCP credential |
-| `nodes.db` | Devices, polling profiles, interfaces, metric samples, device/interface events, uploaded MIBs, discovery jobs, Nodes settings, optional SNMPv3 credentials |
+| `nodes.db` | Devices, polling profiles, interfaces, device/interface events, MAC and neighbour tables, per-port VLAN membership, discovery jobs, Nodes settings, optional SNMPv3 credentials |
+| `nodes_series.db` | Polled metric definitions, their raw samples and the hourly rollups — the Nodes tables that grow, so they carry their own size cap |
+| `nodes_mibs.db` | Uploaded MIB files (the original text is kept, so a re-resolve never needs the upload again) and the objects parsed out of them |
 | `alerts.db` | Rules, email templates, alerts, notification history, Alerts settings, an optional SMTP credential |
 | `wireless.db` | Wireless controllers, access points, per-radio detail, Wireless settings, optional SNMP credentials |
 | `configrx.db` | Per-device backup configuration (keyed by a Nodes device id, no real foreign key — see ConfigRX below), stored config backups, ConfigRX settings, optional SSH credentials |
@@ -2857,7 +2859,9 @@ Default location is `%APPDATA%\netpath-monitor\` on Windows and
 `--alerts-db`, `--wireless-db` and `--configrx-db`. `mapper.db` has no flag
 of its own — it is small, hand-placed bookkeeping rather than something
 worth pointing at its own volume, so it always sits beside `configrx.db`
-in whichever folder that resolves to. All eleven upgrade their schema
+in whichever folder that resolves to. `nodes_series.db` and `nodes_mibs.db`
+have none either: they are two halves of the Nodes database and always sit
+beside whatever `--nodes-db` names. All thirteen upgrade their schema
 automatically on launch, and an install that predates `app.db` moves its
 settings, accounts and name cache into it on the first start.
 

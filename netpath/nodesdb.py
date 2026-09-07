@@ -1,17 +1,28 @@
 """Storage for the Nodes module: devices, polling groups ("profiles"),
-interfaces, polled metrics and their samples, state events, vendor MIBs and
-discovery jobs. Only `samples` and the two event tables are unbounded and
-pruned by age or size; the rest describe the network as configured.
+interfaces, state events and discovery jobs — and the facade over the two
+sibling files the time series and the MIB corpus moved into in 5.0.0.
+
+Only the two event tables are unbounded here and pruned by age or size; the
+rest describe the network as configured. `nodes_series.db`
+(nodesseriesdb.py) holds metrics/samples/samples_hourly, `nodes_mibs.db`
+(nodesmibdb.py) holds mib_files/mib_objects, and every public method of
+both is still reachable on NodesDatabase — no caller outside this module
+knows there are three files.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import sqlite3
+import threading
 import time
 
-from .sqlitebase import SqliteStore, reclaim
+from .nodesmibdb import NodesMibDatabase
+from .nodesseriesdb import RAW_WINDOW_S, NodesSeriesDatabase
+from .sqlitebase import SqliteStore, id_chunks as _id_chunks, reclaim
 
 log = logging.getLogger(__name__)
 
@@ -305,40 +316,9 @@ CREATE TABLE IF NOT EXISTS port_vlans (
 -- block used to declare duplicated it exactly, and were three more B-trees
 -- to write on every VLAN walk for nothing. _migrate drops them.
 
-CREATE TABLE IF NOT EXISTS metrics (
-    id              INTEGER PRIMARY KEY,
-    device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-    key             TEXT NOT NULL,
-    label           TEXT NOT NULL,
-    unit            TEXT NOT NULL,
-    kind            TEXT NOT NULL,                  -- 'gauge'|'counter_rate'
-    last_value      REAL,
-    last_ts         REAL,
-    UNIQUE(device_id, key)
-);
-
-CREATE TABLE IF NOT EXISTS samples (
-    metric_id       INTEGER NOT NULL REFERENCES metrics(id) ON DELETE CASCADE,
-    ts              REAL NOT NULL,
-    value           REAL,
-    PRIMARY KEY (metric_id, ts)
-);
--- The primary key leads on metric_id, so the two queries that ask about
--- time across every metric — compact_rollup's per-hour aggregate and
--- prune's delete by age — scanned the whole table without this. On the
--- largest table in the database that was seconds of held lock per pass.
-CREATE INDEX IF NOT EXISTS ix_samples_ts ON samples(ts);
-CREATE TABLE IF NOT EXISTS samples_hourly (
-    metric_id       INTEGER NOT NULL REFERENCES metrics(id) ON DELETE CASCADE,
-    hour            INTEGER NOT NULL,
-    n               INTEGER NOT NULL,
-    vmin            REAL, vavg REAL, vmax REAL,
-    PRIMARY KEY (metric_id, hour)
-);
--- The primary key leads on metric_id, so "every rollup row older than N
--- days" — what prune() asks once per maintenance pass — would scan the
--- whole table without this.
-CREATE INDEX IF NOT EXISTS ix_samples_hourly_hour ON samples_hourly(hour);
+-- metrics, samples and samples_hourly live in nodes_series.db since 5.0.0
+-- (see nodesseriesdb.py); mib_files and mib_objects in nodes_mibs.db (see
+-- nodesmibdb.py). NodesDatabase still exposes every one of their methods.
 
 -- Every address a device is known to answer on, beside its primary `ip`.
 -- A switch sends its traps from a loopback and its syslog from a
@@ -390,33 +370,6 @@ CREATE INDEX IF NOT EXISTS ix_interface_events_ts ON interface_events(ts);
 -- one device's.
 CREATE INDEX IF NOT EXISTS ix_interface_events_iface_ts
     ON interface_events(interface_id, ts);
-
-CREATE TABLE IF NOT EXISTS mib_files (
-    id              INTEGER PRIMARY KEY,
-    filename        TEXT NOT NULL,
-    module          TEXT,
-    uploaded_ts     REAL NOT NULL,
-    object_count    INTEGER NOT NULL DEFAULT 0,
-    unresolved      TEXT NOT NULL DEFAULT '[]',
-    parse_notes     TEXT,
-    -- The original text, kept so "resolve again" can re-parse from
-    -- scratch: mib_objects only stores the final oid (or NULL), not the
-    -- parent/last_arc an unresolved object would need to retry against.
-    content         TEXT
-);
-CREATE TABLE IF NOT EXISTS mib_objects (
-    id              INTEGER PRIMARY KEY,
-    mib_file_id     INTEGER REFERENCES mib_files(id) ON DELETE CASCADE,
-    name            TEXT NOT NULL,
-    oid             TEXT,
-    description     TEXT,
-    syntax          TEXT,
-    enums           TEXT,
-    is_notification INTEGER NOT NULL DEFAULT 0,
-    edited          INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(mib_file_id, name)
-);
-CREATE INDEX IF NOT EXISTS ix_mib_objects_oid ON mib_objects(oid);
 
 CREATE TABLE IF NOT EXISTS discovery_jobs (
     id              INTEGER PRIMARY KEY,
@@ -587,12 +540,6 @@ DEFAULTS = {
     "discovery_addresses": True,
 }
 
-# How wide a chart window still reads raw samples. Wider than this reads
-# samples_hourly instead — which is why sample_retention_days defaults to
-# the same three days: raw points older than the widest raw window can
-# answer nothing a rollup does not.
-RAW_WINDOW_S = 3 * 86400
-
 _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
                      "v3_auth_pass_enc", "poll_interval_s", "snmp_timeout_s",
                      "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
@@ -621,27 +568,16 @@ _MAC_SEPARATORS = ":-. \t"
 _HEX = set("0123456789abcdefABCDEF")
 
 
-# One SQLite statement can bind at most SQLITE_MAX_VARIABLE_NUMBER
-# parameters, and the bulk device routes bind one per id in a
-# "WHERE id IN (?,?,…)". That ceiling is 32766 on SQLite 3.32 and newer
-# (3.45 here) but 999 on anything older, and this application does not
-# choose which SQLite its Python was linked against — so the number is not
-# knowable at the call site, and a request that works on one operator's
-# install would fail on another's with "too many SQL variables", an
-# OperationalError the route would answer as a 500.
-#
-# Splitting the ids rather than capping them keeps the shipped workflow
-# whole: the Devices page offers a 1000-row page size and a select-all that
-# checks every row on it, so any cap below 1000 breaks bulk delete or bulk
-# poll for an operator doing the obvious thing. Every chunk runs inside the
-# caller's single `with self._lock:` and one commit, so the operation stays
-# atomic — the split is a statement-size detail, not a transaction boundary.
-_ID_CHUNK = 500
+def _sibling(path: str, suffix: str) -> str:
+    """`.../nodes.db` -> `.../nodes_series.db`.
 
-
-def _id_chunks(ids: list[int], size: int = _ID_CHUNK):
-    for start in range(0, len(ids), size):
-        yield ids[start:start + size]
+    Derived from the file's own stem rather than hard-coded, so two
+    NodesDatabase instances in one directory (which the suites do routinely)
+    get their own pair rather than sharing one.
+    """
+    directory, base = os.path.split(os.path.abspath(path))
+    stem = os.path.splitext(base)[0] or "nodes"
+    return os.path.join(directory, f"{stem}_{suffix}.db")
 
 
 _CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}
@@ -818,16 +754,39 @@ class NodesDatabase(SqliteStore):
     DEFAULTS = DEFAULTS
     LABEL = "nodes"
 
-    def __init__(self, path: str):
+    # Marker for the 5.0.0 split, a private setting in nodes.db: absent =
+    # never split or created fresh at 5.0, "rollups" = phase 1 done and the
+    # legacy tables still readable, "done" = they are gone.
+    _SPLIT_STATE = "split_state"
+
+    def __init__(self, path: str, *, series_path: str | None = None,
+                 mibs_path: str | None = None):
         # Bumped by every write that could change what or how a device is
         # polled. The scheduler holds one merged config per device and
         # rebuilds it only when this moves — see config_generation().
         self._config_generation = 0
-        self._warned_no_window = False
+        # The two sibling files, opened before super().__init__ because
+        # _before_schema runs the migration into them. No constructor
+        # parameter and no CLI flag on the Service side, the same precedent
+        # mapper.db set: a derived sibling path, overridable here for tests.
+        memory = (not path) or path == ":memory:" or path.startswith("file:")
+        self.series_db = NodesSeriesDatabase(
+            ":memory:" if memory and not series_path
+            else (series_path or _sibling(path, "series")))
+        self.mib_db = NodesMibDatabase(
+            ":memory:" if memory and not mibs_path
+            else (mibs_path or _sibling(path, "mibs")))
+        self._split_state = ""
+        self._split_thread = None
         super().__init__(path)
 
     def _after_open(self) -> None:
         self._seed()
+
+    def close(self) -> None:
+        super().close()
+        self.series_db.close()
+        self.mib_db.close()
 
     def _migrate(self) -> None:
         # All nullable unless stated: NULL means "inherit the profile, then
@@ -836,7 +795,10 @@ class NodesDatabase(SqliteStore):
             "device_group_id":
                 "INTEGER REFERENCES device_groups(id) ON DELETE SET NULL",
             "display_name_source": "TEXT NOT NULL DEFAULT 'auto'",
-            "mib_file_id": "INTEGER REFERENCES mib_files(id) ON DELETE SET NULL",
+            # A plain integer since 5.0.0: mib_files lives in nodes_mibs.db
+            # now, so there is no table here to reference. remove_mib_file
+            # NULLs the assignments the dropped constraint used to.
+            "mib_file_id": "INTEGER",
             "ping_count": "INTEGER",
             "ping_timeout_ms": "INTEGER",
             "unreachable_ping_only": "INTEGER",
@@ -876,7 +838,7 @@ class NodesDatabase(SqliteStore):
             " ON devices(device_group_id)")
 
         self.ensure_columns("groups", {
-            "mib_file_id": "INTEGER REFERENCES mib_files(id) ON DELETE SET NULL",
+            "mib_file_id": "INTEGER",
             "ping_count": "INTEGER",
             "ping_timeout_ms": "INTEGER",
             "unreachable_ping_only": "INTEGER",
@@ -927,11 +889,6 @@ class NodesDatabase(SqliteStore):
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_mac_entries_mac_present"
             " ON mac_entries(mac, present, seen_ts)")
-        # The alert engine asks for one metric key across the whole fleet
-        # twelve times a minute (metrics_for_keys); the UNIQUE(device_id, key)
-        # index leads with device_id and cannot serve a key-first query.
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS ix_metrics_key ON metrics(key)")
         # The device this one sits behind. Operator-set, nullable and
         # self-referential without a foreign key on purpose: the alert engine
         # treats an id that no longer exists as no upstream at all, which is
@@ -1455,29 +1412,28 @@ class NodesDatabase(SqliteStore):
                 frontier = found
         return out
 
-    def metrics_for_keys(self, keys) -> list[sqlite3.Row]:
-        """The newest value of each named metric key, fleet-wide, in one query.
+    def disabled_device_ids(self) -> set[int]:
+        with self._lock:
+            return {row[0] for row in self._conn.execute(
+                "SELECT id FROM devices WHERE enabled = 0").fetchall()}
 
-        The alert engine used to read `SELECT * FROM metrics WHERE device_id
-        = ?` once per device per tick — at 2,000 devices and ~90 metrics
-        each, 400,000 full rows every five seconds through the same
-        connection and lock the poller writes with, to evaluate a handful of
-        threshold rules. It reads four columns for the keys that have a rule
-        instead.
+    def metrics_for_keys(self, keys) -> list[sqlite3.Row]:
+        """The newest value of each named metric key, fleet-wide.
 
         Disabled devices are excluded here rather than by the caller: a
         device somebody turned off is not being polled, so its last value is
-        by definition stale and must not hold an alert open.
+        by definition stale and must not hold an alert open. The filter is
+        done in Python because `enabled` and the metric now live in
+        different files, and a device nobody has disabled is the overwhelming
+        common case — the set is normally empty.
         """
-        keys = [str(k) for k in keys if k]
-        if not keys:
-            return []
-        marks = ",".join("?" * len(keys))
-        with self._lock:
-            return self._conn.execute(
-                "SELECT m.device_id, m.key, m.label, m.last_value, m.last_ts"
-                f" FROM metrics m JOIN devices d ON d.id = m.device_id"
-                f" WHERE d.enabled = 1 AND m.key IN ({marks})", keys).fetchall()
+        rows = self.series_db.metrics_for_keys(keys)
+        if not rows:
+            return rows
+        disabled = self.disabled_device_ids()
+        if not disabled:
+            return rows
+        return [row for row in rows if row["device_id"] not in disabled]
 
     # ------------------------------------------------- bounded fleet reads
     #
@@ -1497,23 +1453,15 @@ class NodesDatabase(SqliteStore):
 
         Disabled devices are excluded exactly as metrics_for_keys excludes
         them, and for the same reason: a device nobody is polling has no
-        current reading, whoever is asking."""
-        ids = list(dict.fromkeys(int(d) for d in device_ids))
-        keys = [str(k) for k in keys if k]
-        if not ids or not keys:
-            return []
-        key_marks = ",".join("?" * len(keys))
-        rows: list[sqlite3.Row] = []
-        with self._lock:
-            for start in range(0, len(ids), self._IDS_PER_QUERY):
-                chunk = ids[start:start + self._IDS_PER_QUERY]
-                marks = ",".join("?" * len(chunk))
-                rows += self._conn.execute(
-                    "SELECT m.device_id, m.key, m.label, m.last_value, m.last_ts"
-                    " FROM metrics m JOIN devices d ON d.id = m.device_id"
-                    f" WHERE d.enabled = 1 AND m.device_id IN ({marks})"
-                    f" AND m.key IN ({key_marks})", [*chunk, *keys]).fetchall()
-        return rows
+        current reading, whoever is asking. The chunked read is the series
+        store's; only the enabled filter needs this file."""
+        rows = self.series_db.metrics_for_devices(device_ids, keys)
+        if not rows:
+            return rows
+        disabled = self.disabled_device_ids()
+        if not disabled:
+            return rows
+        return [row for row in rows if row["device_id"] not in disabled]
 
     def interface_counts(self, device_ids) -> dict:
         """{device_id: how many interface rows it has}, for named devices.
@@ -1717,7 +1665,10 @@ class NodesDatabase(SqliteStore):
                 removed += cursor.rowcount or 0
             self._conn.commit()
             self._config_generation += 1
-            return removed
+        # The ON DELETE CASCADE that used to reach `metrics` now crosses a
+        # file boundary, so it is one more call rather than one more clause.
+        self.series_db.delete_metrics_for_devices(device_ids)
+        return removed
 
     def set_device_credential(self, device_id: int, user: str, auth_proto: str,
                               password_enc: bytes) -> None:
@@ -1740,6 +1691,7 @@ class NodesDatabase(SqliteStore):
             self._conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
             self._conn.commit()
             self._config_generation += 1
+        self.series_db.delete_metrics_for_devices([device_id])
 
     def config_generation(self) -> int:
         """A counter that moves whenever a settings, profile, credential or
@@ -2156,7 +2108,6 @@ class NodesDatabase(SqliteStore):
         ("addresses", "SELECT COUNT(*) FROM device_addresses WHERE device_id = ?"),
         ("interfaces", "SELECT COUNT(*) FROM interfaces WHERE device_id = ?"),
         ("events", "SELECT COUNT(*) FROM device_events WHERE device_id = ?"),
-        ("metrics", "SELECT COUNT(*) FROM metrics WHERE device_id = ?"),
         ("neighbours", "SELECT COUNT(*) FROM neighbors WHERE device_id = ?"),
         ("mac_entries", "SELECT COUNT(*) FROM mac_entries WHERE device_id = ?"),
         ("vlans", "SELECT COUNT(*) FROM vlans WHERE device_id = ?"),
@@ -2179,6 +2130,9 @@ class NodesDatabase(SqliteStore):
             for name, query in self._MERGE_COUNT_QUERIES:
                 counts[name] = int(
                     self._conn.execute(query, (loser_id,)).fetchone()[0])
+        # Its own read rather than another entry above: metrics are in
+        # nodes_series.db, and the dialog still has to show what goes.
+        counts["metrics"] = self.series_db.count_for_device(loser_id)
         return {"loser_id": loser_id, "winner_id": winner_id, "counts": counts}
 
     def merge_devices(self, loser_id: int, winner_id: int) -> dict:
@@ -2242,6 +2196,9 @@ class NodesDatabase(SqliteStore):
                 raise
             self._conn.commit()
             self._config_generation += 1
+        # The FK cascade that used to take the loser's metrics with it does
+        # not cross a file, so it is spelled out, exactly as in remove_device.
+        self.series_db.delete_metrics_for_devices([loser_id])
         return plan
 
     # ------------------------------------------------------------- interfaces
@@ -3075,224 +3032,6 @@ class NodesDatabase(SqliteStore):
                 self._conn.rollback()
                 raise
 
-    # ---------------------------------------------------------------- metrics
-
-    def record_metric_samples(self, device_id: int, rows: list) -> dict:
-        """Every metric one poll produced, in one transaction.
-
-        `rows` is a sequence of (key, label, unit, kind, ts, value). One
-        SELECT of the device's existing metric ids, one INSERT for keys never
-        seen before, one UPDATE of the current values, one INSERT for the
-        samples — a per-sample commit is ~2,000 fsyncs on a 500-port chassis.
-
-        `kind` is written only when the metric row is created. Changing a
-        metric's kind under a chart that has months of history in the other
-        unit is not something a poll should do silently, and the poller
-        never means to: the kind is a property of the OID, not of a
-        reading. A value of None updates last_ts and stores no sample —
-        "polled, no answer" is not a zero.
-
-        Returns {key: metric_id} for every row, so a caller that needs an
-        id (a chart link, a threshold) does not have to read them back.
-        """
-        latest: dict[str, tuple] = {}
-        for row in rows or ():
-            key, label, unit, kind, ts, value = row
-            latest[key] = (label, unit, kind, ts, value)
-        if not latest:
-            return {}
-        with self._lock:
-            try:
-                ids = {r["key"]: r["id"] for r in self._conn.execute(
-                    "SELECT id, key FROM metrics WHERE device_id = ?",
-                    (device_id,)).fetchall()}
-                missing = [(device_id, key, label, unit, kind)
-                           for key, (label, unit, kind, _ts, _value) in latest.items()
-                           if key not in ids]
-                if missing:
-                    self._conn.executemany(
-                        "INSERT OR IGNORE INTO metrics(device_id, key, label, unit,"
-                        " kind) VALUES (?,?,?,?,?)", missing)
-                    marks = ",".join("?" * len(missing))
-                    for r in self._conn.execute(
-                            f"SELECT id, key FROM metrics WHERE device_id = ?"
-                            f" AND key IN ({marks})",
-                            (device_id, *[m[1] for m in missing])).fetchall():
-                        ids[r["key"]] = r["id"]
-                self._conn.executemany(
-                    "UPDATE metrics SET last_value=?, last_ts=?, label=?, unit=?"
-                    " WHERE id=?",
-                    [(value, ts, label, unit, ids[key])
-                     for key, (label, unit, _kind, ts, value) in latest.items()
-                     if key in ids])
-                samples = [(ids[key], ts, value)
-                           for key, (_label, _unit, _kind, ts, value) in latest.items()
-                           if value is not None and key in ids]
-                if samples:
-                    self._conn.executemany(
-                        "INSERT OR REPLACE INTO samples(metric_id, ts, value)"
-                        " VALUES (?,?,?)", samples)
-                self._conn.commit()
-            except sqlite3.DatabaseError:
-                self._conn.rollback()
-                raise
-        return {key: ids[key] for key in latest if key in ids}
-
-    def record_metric_sample(self, device_id: int, key: str, label: str,
-                             unit: str, kind: str, ts: float,
-                             value: float | None) -> int:
-        """One metric sample — a one-row wrapper around
-        record_metric_samples, kept for the callers (tests, on-demand
-        reads) that genuinely have exactly one."""
-        ids = self.record_metric_samples(
-            device_id, [(key, label, unit, kind, ts, value)])
-        return ids[key]
-
-    def metrics(self, device_id: int) -> list[sqlite3.Row]:
-        with self._lock:
-            return self._conn.execute(
-                "SELECT * FROM metrics WHERE device_id = ? ORDER BY label",
-                (device_id,)).fetchall()
-
-    def metric(self, metric_id: int) -> sqlite3.Row | None:
-        with self._lock:
-            return self._conn.execute(
-                "SELECT * FROM metrics WHERE id = ?", (metric_id,)).fetchone()
-
-    def top_metric(self, key: str, n: int = 10, *,
-                   ascending: bool = False) -> list[sqlite3.Row]:
-        """The n enabled devices with the highest (or lowest) current value
-        of one metric key — "worst packet loss", "slowest to answer" — in
-        one query rather than a metrics() call per device. NULL last_value
-        rows are excluded: a metric that has never produced a sample is not
-        a zero, and sorting it as one puts silent devices at the top of a
-        "best" list and hides real ones."""
-        order = "ASC" if ascending else "DESC"
-        with self._lock:
-            return self._conn.execute(
-                f"SELECT m.device_id AS device_id, d.name AS name, d.ip AS ip,"
-                f" m.id AS metric_id, m.key AS key, m.label AS label,"
-                f" m.unit AS unit, m.last_value AS last_value, m.last_ts AS last_ts"
-                f" FROM metrics m JOIN devices d ON d.id = m.device_id"
-                f" WHERE m.key = ? AND m.last_value IS NOT NULL AND d.enabled = 1"
-                f" ORDER BY m.last_value {order} LIMIT ?",
-                (key, int(n))).fetchall()
-
-    def series(self, device_id: int, metric_id: int, t0: float, t1: float,
-               bucket_s: float = 0) -> list[dict]:
-        """Raw-vs-hourly selection: a wide window reads the rollup table
-        instead of scanning months of raw points.
-
-        `device_id` is enforced, not decorative. Metric ids are global, so
-        without the join a caller passing another device's metric id got that
-        device's data back under this device's name — which is exactly what a
-        stale dialog does when the selected device changes underneath it. A
-        mismatch now returns nothing, which reads as "no samples" rather than
-        as somebody else's traffic.
-
-        `bucket_s > 0` buckets raw samples server-side into fixed-width
-        windows aligned to epoch time (`floor(ts / bucket_s) * bucket_s`),
-        returning the same `{ts, avg, min, max}` shape the hourly rollup
-        uses so `drawSeriesChart` renders either one unchanged. Bucketing
-        only applies within the raw-sample window (<= 3 days); a wider
-        window already reads the hourly rollup and ignores `bucket_s`.
-        """
-        with self._lock:
-            if not self._conn.execute(
-                    "SELECT 1 FROM metrics WHERE id = ? AND device_id = ?",
-                    (metric_id, device_id)).fetchone():
-                return []
-            if (t1 - t0) <= RAW_WINDOW_S:
-                if bucket_s and bucket_s > 0:
-                    rows = self._conn.execute(
-                        "SELECT (CAST(ts / ? AS INTEGER)) * ? AS bucket_ts,"
-                        " AVG(value) AS avg, MIN(value) AS min, MAX(value) AS max,"
-                        " COUNT(*) AS n FROM samples WHERE metric_id = ?"
-                        " AND ts >= ? AND ts <= ? GROUP BY 1 ORDER BY 1",
-                        (bucket_s, bucket_s, metric_id, t0, t1)).fetchall()
-                    return [{"ts": row["bucket_ts"], "avg": row["avg"],
-                            "min": row["min"], "max": row["max"], "n": row["n"]}
-                            for row in rows]
-                rows = self._conn.execute(
-                    "SELECT ts, value FROM samples WHERE metric_id = ?"
-                    " AND ts >= ? AND ts <= ? ORDER BY ts",
-                    (metric_id, t0, t1)).fetchall()
-                return [{"ts": row["ts"], "value": row["value"]} for row in rows]
-            rows = self._conn.execute(
-                "SELECT hour, n, vmin, vavg, vmax FROM samples_hourly"
-                " WHERE metric_id = ? AND hour >= ? AND hour <= ? ORDER BY hour",
-                (metric_id, t0, t1)).fetchall()
-            return [{"ts": row["hour"], "min": row["vmin"], "avg": row["vavg"],
-                    "max": row["vmax"], "n": row["n"]} for row in rows]
-
-    _ROLLUP_WATERMARK = "rollup_watermark_hour"
-    # Hours already rolled up that are aggregated again on the next pass, so
-    # a sample that arrived after its hour was summarised is not lost. Two
-    # covers a poll that started before the hour ended and a clock that is a
-    # little behind.
-    _ROLLUP_REDO_HOURS = 2
-
-    def compact_rollup(self, max_hours: int = 48) -> int:
-        """Summarise complete hours of raw samples into samples_hourly.
-
-        Two things were wrong with the first version. It deleted every raw
-        sample older than an hour, so the raw window a chart reads (three
-        days) could never contain anything — and it was never called, which
-        is the only reason that did not destroy every short-window chart.
-        And it re-aggregated the whole history on each call.
-
-        Now: raw rows are left alone (prune and the per-metric cap own
-        their lifetime), work starts from a private watermark rather than
-        from the beginning of time, and each hour is its own transaction so
-        the lock is never held across more than one. `max_hours` bounds a
-        single pass; the watermark makes the next pass continue where this
-        one stopped, so a long backlog is worked off over several passes
-        instead of in one stall.
-
-        Returns the number of (metric, hour) rows written.
-        """
-        now = time.time()
-        # The last hour that has fully elapsed. The current hour is still
-        # collecting samples and would be summarised wrong.
-        latest_complete = int(now // 3600) * 3600 - 3600
-        watermark = self._private_setting(self._ROLLUP_WATERMARK)
-        if watermark is None:
-            with self._lock:
-                row = self._conn.execute(
-                    "SELECT MIN(ts) AS oldest FROM samples").fetchone()
-            oldest = row["oldest"] if row else None
-            if oldest is None:
-                self._set_private_setting(self._ROLLUP_WATERMARK,
-                                          latest_complete + 3600)
-                return 0
-            hour = int(float(oldest) // 3600) * 3600
-        else:
-            hour = int(watermark) - self._ROLLUP_REDO_HOURS * 3600
-        written = 0
-        processed = 0
-        while hour <= latest_complete and processed < max_hours:
-            with self._lock:
-                rows = self._conn.execute(
-                    "SELECT metric_id, COUNT(*) AS n, MIN(value) AS vmin,"
-                    " AVG(value) AS vavg, MAX(value) AS vmax FROM samples"
-                    " WHERE ts >= ? AND ts < ? AND value IS NOT NULL"
-                    " GROUP BY metric_id", (hour, hour + 3600)).fetchall()
-                if rows:
-                    self._conn.executemany(
-                        "INSERT INTO samples_hourly(metric_id, hour, n, vmin,"
-                        " vavg, vmax) VALUES (?,?,?,?,?,?)"
-                        " ON CONFLICT(metric_id, hour) DO UPDATE SET"
-                        " n=excluded.n, vmin=excluded.vmin, vavg=excluded.vavg,"
-                        " vmax=excluded.vmax",
-                        [(row["metric_id"], hour, row["n"], row["vmin"],
-                          row["vavg"], row["vmax"]) for row in rows])
-                    written += len(rows)
-                self._conn.commit()
-            hour += 3600
-            processed += 1
-        self._set_private_setting(self._ROLLUP_WATERMARK, hour)
-        return written
-
     # ----------------------------------------------------------------- events
 
     def record_device_event(self, device_id: int, kind: str, detail: str = "") -> None:
@@ -3597,191 +3336,12 @@ class NodesDatabase(SqliteStore):
 
     # ------------------------------------------------------------------- MIBs
 
-    def add_mib_file(self, filename: str, module: str, object_count: int,
-                     unresolved: list[str], parse_notes: str,
-                     content: str = "") -> int:
-        with self._lock:
-            cur = self._conn.execute(
-                "INSERT INTO mib_files(filename, module, uploaded_ts, object_count,"
-                " unresolved, parse_notes, content) VALUES (?,?,?,?,?,?,?)",
-                (filename, module, time.time(), object_count,
-                 json.dumps(unresolved), parse_notes, content))
-            self._conn.commit()
-            return cur.lastrowid
-
-    def update_mib_file(self, mib_file_id: int, **fields) -> None:
-        allowed = {k: v for k, v in fields.items()
-                  if k in ("module", "object_count", "unresolved", "parse_notes")}
-        if not allowed:
-            return
-        if "unresolved" in allowed:
-            allowed["unresolved"] = json.dumps(allowed["unresolved"])
-        clauses = ", ".join(f"{key} = ?" for key in allowed)
-        with self._lock:
-            self._conn.execute(
-                f"UPDATE mib_files SET {clauses} WHERE id = ?",
-                (*allowed.values(), mib_file_id))
-            self._conn.commit()
-
-    def replace_mib_objects(self, mib_file_id: int, objects: list[dict]) -> None:
-        """Deletes and re-inserts every non-edited object; rows with
-        edited=1 are left untouched so an admin's manual correction
-        survives a re-resolve."""
-        with self._lock:
-            self._conn.execute(
-                "DELETE FROM mib_objects WHERE mib_file_id = ? AND edited = 0",
-                (mib_file_id,))
-            for obj in objects:
-                self._conn.execute(
-                    "INSERT INTO mib_objects(mib_file_id, name, oid, description,"
-                    " syntax, enums, is_notification) VALUES (?,?,?,?,?,?,?)"
-                    " ON CONFLICT(mib_file_id, name) DO UPDATE SET"
-                    " oid=excluded.oid, description=excluded.description,"
-                    " syntax=excluded.syntax, enums=excluded.enums,"
-                    " is_notification=excluded.is_notification"
-                    " WHERE mib_objects.edited = 0",
-                    (mib_file_id, obj["name"], obj.get("oid"), obj.get("description"),
-                     obj.get("syntax"), json.dumps(obj["enums"]) if obj.get("enums") else None,
-                     1 if obj.get("is_notification") else 0))
-            self._conn.commit()
-
-    def mib_files(self) -> list[sqlite3.Row]:
-        with self._lock:
-            return self._conn.execute(
-                "SELECT * FROM mib_files ORDER BY uploaded_ts DESC").fetchall()
-
-    def mib_file(self, mib_file_id: int) -> sqlite3.Row | None:
-        with self._lock:
-            return self._conn.execute(
-                "SELECT * FROM mib_files WHERE id = ?", (mib_file_id,)).fetchone()
-
-    def mib_objects(self, mib_file_id: int | None = None,
-                    resolved_only: bool = False) -> list[sqlite3.Row]:
-        clauses, params = [], []
-        if mib_file_id is not None:
-            clauses.append("mib_file_id = ?")
-            params.append(mib_file_id)
-        if resolved_only:
-            clauses.append("oid IS NOT NULL")
-        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        with self._lock:
-            return self._conn.execute(
-                f"SELECT * FROM mib_objects{where} ORDER BY name", params).fetchall()
-
     def set_mib_covered(self, device_id: int, covered: bool | None) -> None:
         with self._lock:
             self._conn.execute(
                 "UPDATE devices SET mib_covered = ? WHERE id = ?",
                 (None if covered is None else (1 if covered else 0), device_id))
             self._conn.commit()
-
-    def has_mib_covering(self, sys_object_id: str) -> bool:
-        """Whether any uploaded MIB actually describes objects belonging to
-        this device's vendor, given its sysObjectID.
-
-        "Covering" deliberately means *deeper than the bare enterprise
-        arc*: this app ships enterprise-number roots for ~20 vendors, so a
-        plain prefix test would match every common vendor out of the box
-        and could never report anything as missing. A root-only entry
-        (1.3.6.1.4.1.9, six arcs) names the vendor; it decodes nothing. An
-        object below it (1.3.6.1.4.1.9.9.13.1.3.1.3, say) is a real
-        description, and that is what this looks for."""
-        from . import nodeoids
-        prefix = nodeoids.enterprise_root(sys_object_id)
-        if not prefix:
-            return False
-        # Strictly below the enterprise arc — an object AT the arc is the
-        # bundled root-only entry, which names the vendor but describes
-        # nothing, so it deliberately does not count as coverage.
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT 1 FROM mib_objects WHERE oid IS NOT NULL"
-                " AND oid LIKE ? LIMIT 1", (prefix + ".%",)).fetchone()
-        return row is not None
-
-    def mib_file_covering(self, sys_object_id: str) -> int | None:
-        """Which uploaded MIB describes this vendor's objects, for the
-        auto-assignment in nodepoll._check_vendor_mib.
-
-        has_mib_covering() answers "is there one"; this answers "which one",
-        and picks the file with the most resolved objects under the vendor's
-        arc when several qualify — a vendor bundle is usually several files,
-        of which one carries the bulk of the real objects and the rest are
-        type or registration modules that would poll nothing.
-        """
-        from . import nodeoids
-        prefix = nodeoids.enterprise_root(sys_object_id)
-        if not prefix:
-            return None
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT mib_file_id, COUNT(*) AS n FROM mib_objects"
-                " WHERE oid IS NOT NULL AND oid LIKE ?"
-                " GROUP BY mib_file_id ORDER BY n DESC LIMIT 1",
-                (prefix + ".%",)).fetchone()
-        return row["mib_file_id"] if row else None
-
-    def all_known_oids(self) -> dict[str, str]:
-        """Every resolved mib_objects name -> OID, across every uploaded
-        file — fed into mibparse.resolve()'s `known` dict so a later
-        upload can resolve against an earlier one's objects."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT name, oid FROM mib_objects WHERE oid IS NOT NULL").fetchall()
-        return {row["name"]: row["oid"] for row in rows}
-
-    def update_mib_object(self, object_id: int, **fields) -> None:
-        allowed = {k: v for k, v in fields.items()
-                  if k in ("name", "oid", "description", "syntax", "enums")}
-        if not allowed:
-            return
-        if "enums" in allowed and allowed["enums"] is not None:
-            allowed["enums"] = json.dumps(allowed["enums"])
-        allowed["edited"] = 1
-        clauses = ", ".join(f"{key} = ?" for key in allowed)
-        with self._lock:
-            self._conn.execute(
-                f"UPDATE mib_objects SET {clauses} WHERE id = ?",
-                (*allowed.values(), object_id))
-            self._conn.commit()
-
-    def remove_mib_file(self, mib_file_id: int) -> None:
-        with self._lock:
-            self._conn.execute("DELETE FROM mib_files WHERE id = ?", (mib_file_id,))
-            self._conn.commit()
-
-    def oid_name_lines(self) -> str:
-        """Every resolved mib_objects OID -> name pair, rendered as
-        'OID = name' lines — feeds Service._snmp_settings_with_mibs() and
-        Nodes' own OID name resolution."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT oid, name FROM mib_objects WHERE oid IS NOT NULL"
-            ).fetchall()
-        return "\n".join(f"{row['oid']} = {row['name']}" for row in rows)
-
-    def enterprise_objects(self) -> list[tuple[int, str]]:
-        """(mib_file_id, oid) for every resolved object under `enterprises`,
-        for vendorid.build_mib_index. A range predicate rather than LIKE:
-        SQLite's LIKE is case-insensitive by default and does not use
-        ix_mib_objects_oid, which is fine for has_mib_covering's single row
-        and not for the tens of thousands this returns."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT mib_file_id, oid FROM mib_objects"
-                " WHERE oid >= '1.3.6.1.4.1.' AND oid < '1.3.6.1.4.1/'").fetchall()
-        return [(row["mib_file_id"], row["oid"]) for row in rows]
-
-    def mib_generation(self) -> tuple:
-        """Changes whenever the MIB corpus does — an upload, a delete, a
-        catalog install or a resolve-all rewrite — so the poller can keep
-        one built index until it is actually stale."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT (SELECT MAX(id) FROM mib_objects) AS top,"
-                " (SELECT COUNT(*) FROM mib_objects) AS n_objects,"
-                " (SELECT COUNT(*) FROM mib_files) AS n_files").fetchone()
-        return (row["top"], row["n_objects"], row["n_files"])
 
     # ------------------------------------------------ vendor identification
 
@@ -4032,71 +3592,25 @@ class NodesDatabase(SqliteStore):
 
     # -------------------------------------------------------------- storage
 
-    _CAP_MIN_SQLITE = (3, 25, 0)   # window functions
-
-    def cap_samples_per_metric(self, n: int, chunk: int = 200) -> int:
-        """Keep at most the newest `n` raw samples of EACH metric.
-
-        Per metric with a window function, in chunks of `chunk` metrics,
-        taking the lock for each chunk and releasing it in between, so a poll
-        worker waits for one chunk at most. Window functions need SQLite
-        3.25; on anything older this does nothing and says so once.
-        """
-        if n <= 0:
-            return 0
-        if sqlite3.sqlite_version_info < self._CAP_MIN_SQLITE:
-            if not self._warned_no_window:
-                self._warned_no_window = True
-                log.warning(
-                    "nodes: SQLite %s cannot cap samples per metric (needs "
-                    "%s); raw samples are bounded by sample_retention_days "
-                    "alone", sqlite3.sqlite_version,
-                    ".".join(str(part) for part in self._CAP_MIN_SQLITE))
-            return 0
-        with self._lock:
-            metric_ids = [row["id"] for row in
-                          self._conn.execute("SELECT id FROM metrics").fetchall()]
-        removed = 0
-        for start in range(0, len(metric_ids), max(1, chunk)):
-            batch = metric_ids[start:start + max(1, chunk)]
-            marks = ",".join("?" * len(batch))
-            with self._lock:
-                cursor = self._conn.execute(
-                    f"DELETE FROM samples WHERE rowid IN ("
-                    f" SELECT rowid FROM ("
-                    f"  SELECT rowid, ROW_NUMBER() OVER ("
-                    f"   PARTITION BY metric_id ORDER BY ts DESC) AS rn"
-                    f"  FROM samples WHERE metric_id IN ({marks})"
-                    f" ) WHERE rn > ?)", (*batch, int(n)))
-                removed += cursor.rowcount or 0
-                self._conn.commit()
-        return removed
-
     def prune(self, *, sample_days: float = 3, rollup_days: float = 400,
              event_days: float = 180, poll_days: float = 0,
              discovery_days: float = 30,
              max_samples_per_metric: int = 0) -> int:
-        """Trims the unbounded tables only: samples, device/interface
-        events, discovery jobs. Devices, groups, interfaces and MIBs are
-        current-state tables, never pruned by age here.
+        """Trims the unbounded tables only: device/interface events and
+        discovery jobs here, samples and rollups in the series store.
+        Devices, groups, interfaces and MIBs are current-state tables, never
+        pruned by age.
 
-        The per-metric row cap runs after this method's own transaction,
-        in its own chunked pass — see cap_samples_per_metric."""
+        The orphan sweep at the end is what the ON DELETE CASCADE between
+        `devices` and `metrics` used to do for free — a device removed by a
+        4.x binary, or while the series file could not be opened, leaves
+        rows nothing else would ever find."""
         removed = 0
         now = time.time()
         with self._lock:
             # Unconditional: a caller that wants "delete everything now" (the
             # Settings page's maintenance button) passes 0, which computes a
             # cutoff of "now" and so matches every existing row.
-            cursor = self._conn.execute(
-                "DELETE FROM samples WHERE ts < ?", (now - sample_days * 86400,))
-            removed += cursor.rowcount or 0
-            # The hourly rollups are the long history now, so they are
-            # bounded by their own retention rather than kept forever.
-            cursor = self._conn.execute(
-                "DELETE FROM samples_hourly WHERE hour < ?",
-                (now - rollup_days * 86400,))
-            removed += cursor.rowcount or 0
             cursor = self._conn.execute(
                 "DELETE FROM device_events WHERE ts < ?", (now - event_days * 86400,))
             removed += cursor.rowcount or 0
@@ -4108,18 +3622,31 @@ class NodesDatabase(SqliteStore):
                 (now - discovery_days * 86400,))
             removed += cursor.rowcount or 0
             self._conn.commit()
-        removed += self.cap_samples_per_metric(max_samples_per_metric)
         if removed:
             # Freed pages go back in short steps with the lock released
             # between them, not through a whole-file VACUUM.
             reclaim(self._conn, self._lock, label="nodes")
+        removed += self.series_db.prune(
+            sample_days=sample_days, rollup_days=rollup_days,
+            max_samples_per_metric=max_samples_per_metric)
+        removed += self.series_db.prune_orphan_metrics(self.all_device_ids())
         return removed
 
-    def trim_to_size(self, max_bytes: int) -> int:
-        """Delete the oldest raw samples until the file is back under its cap.
+    def all_device_ids(self) -> list[int]:
+        with self._lock:
+            return [row[0] for row in
+                    self._conn.execute("SELECT id FROM devices").fetchall()]
 
-        Incremental reclaim rather than VACUUM: a whole-file rewrite under
-        the module lock stalls every poll worker and HTTP handler.
+    _TRIM_EVENT_FLOOR = 5_000
+
+    def trim_to_size(self, max_bytes: int) -> int:
+        """Delete the oldest device and interface events until the file is
+        back under its cap.
+
+        Since 5.0.0 those two are the only unbounded tables left here — the
+        samples went to nodes_series.db, which has its own cap. Incremental
+        reclaim rather than VACUUM: a whole-file rewrite under the module
+        lock stalls every poll worker and HTTP handler.
         """
         if max_bytes <= 0:
             return 0
@@ -4127,16 +3654,334 @@ class NodesDatabase(SqliteStore):
         for _ in range(6):
             if self.size_bytes() <= max_bytes:
                 break
-            with self._lock:
-                total = self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM samples").fetchone()["n"]
-                if total <= 5000:
-                    break
-                chunk = max(int(total * 0.15), 5000)
-                cursor = self._conn.execute(
-                    "DELETE FROM samples WHERE rowid IN (SELECT rowid FROM samples"
-                    " ORDER BY ts ASC LIMIT ?)", (chunk,))
-                removed += cursor.rowcount or 0
-                self._conn.commit()
+            shrank = False
+            for table in ("device_events", "interface_events"):
+                with self._lock:
+                    total = self._conn.execute(
+                        f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+                    if total <= self._TRIM_EVENT_FLOOR:
+                        continue
+                    chunk = min(total - self._TRIM_EVENT_FLOOR,
+                                max(int(total * 0.15), self._TRIM_EVENT_FLOOR))
+                    cursor = self._conn.execute(
+                        f"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM"
+                        f" {table} ORDER BY ts ASC LIMIT ?)", (chunk,))
+                    removed += cursor.rowcount or 0
+                    shrank = shrank or bool(cursor.rowcount)
+                    self._conn.commit()
             reclaim(self._conn, self._lock, label="nodes")
+            if not shrank:
+                break
         return removed
+
+    # ------------------------------------------------------ series delegation
+    #
+    # Everything from here to "end of delegation" is one forwarding method
+    # per public name that used to be implemented in this file. The two
+    # sub-stores hold no device rows, so anything needing both sides (a
+    # device's name beside its metric, an enabled flag) is composed here
+    # rather than delegated.
+
+    def record_metric_samples(self, device_id: int, rows: list) -> dict:
+        return self.series_db.record_metric_samples(device_id, rows)
+
+    def record_metric_sample(self, device_id: int, key: str, label: str,
+                             unit: str, kind: str, ts: float,
+                             value: float | None) -> int:
+        return self.series_db.record_metric_sample(
+            device_id, key, label, unit, kind, ts, value)
+
+    def metrics(self, device_id: int) -> list[sqlite3.Row]:
+        return self.series_db.metrics(device_id)
+
+    def metric(self, metric_id: int) -> sqlite3.Row | None:
+        return self.series_db.metric(metric_id)
+
+    def compact_rollup(self, max_hours: int = 48) -> int:
+        return self.series_db.compact_rollup(max_hours)
+
+    def cap_samples_per_metric(self, n: int, chunk: int = 200) -> int:
+        return self.series_db.cap_samples_per_metric(n, chunk)
+
+    def series(self, device_id: int, metric_id: int, t0: float, t1: float,
+               bucket_s: float = 0) -> list[dict]:
+        rows = self.series_db.series(device_id, metric_id, t0, t1, bucket_s)
+        if (self._split_state != "rollups" or (t1 - t0) <= RAW_WINDOW_S
+                or not self.series_db.owns_metric(device_id, metric_id)):
+            return rows
+        # Phase 2 is still lifting the old rollups across, so a year-wide
+        # chart drawn now would show only the part that has arrived. The
+        # legacy rows are read-only here and lose to the new ones.
+        merged = {row["ts"]: row for row in
+                  self.series_db.legacy_hourly_rows(self.path, metric_id, t0, t1)}
+        merged.update({row["ts"]: row for row in rows})
+        return [merged[ts] for ts in sorted(merged)]
+
+    def top_metric(self, key: str, n: int = 10, *,
+                   ascending: bool = False) -> list[dict]:
+        """The n enabled devices with the highest (or lowest) current value
+        of one metric key — "worst packet loss", "slowest to answer". The
+        ranking is the series store's, the names and the enabled filter are
+        this file's, so the two are joined here."""
+        rows = self.series_db.top_metric_rows(key, ascending=ascending)
+        if not rows:
+            return []
+        disabled = self.disabled_device_ids()
+        wanted = [row for row in rows if row["device_id"] not in disabled][:int(n)]
+        if not wanted:
+            return []
+        named = {row["id"]: row for row in
+                 self.devices_by_ids([row["device_id"] for row in wanted])}
+        out = []
+        for row in wanted:
+            device = named.get(row["device_id"])
+            if device is None:
+                continue
+            out.append({"device_id": row["device_id"], "name": device["name"],
+                        "ip": device["ip"], "metric_id": row["metric_id"],
+                        "key": row["key"], "label": row["label"],
+                        "unit": row["unit"], "last_value": row["last_value"],
+                        "last_ts": row["last_ts"]})
+        return out
+
+    # --------------------------------------------------------- MIB delegation
+
+    def add_mib_file(self, filename: str, module: str, object_count: int,
+                     unresolved: list[str], parse_notes: str,
+                     content: str = "") -> int:
+        return self.mib_db.add_mib_file(filename, module, object_count,
+                                        unresolved, parse_notes, content)
+
+    def update_mib_file(self, mib_file_id: int, **fields) -> None:
+        self.mib_db.update_mib_file(mib_file_id, **fields)
+
+    def replace_mib_objects(self, mib_file_id: int, objects: list[dict]) -> None:
+        self.mib_db.replace_mib_objects(mib_file_id, objects)
+
+    def mib_files(self) -> list[sqlite3.Row]:
+        return self.mib_db.mib_files()
+
+    def mib_file(self, mib_file_id: int) -> sqlite3.Row | None:
+        return self.mib_db.mib_file(mib_file_id)
+
+    def mib_objects(self, mib_file_id: int | None = None,
+                    resolved_only: bool = False) -> list[sqlite3.Row]:
+        return self.mib_db.mib_objects(mib_file_id, resolved_only)
+
+    def has_mib_covering(self, sys_object_id: str) -> bool:
+        return self.mib_db.has_mib_covering(sys_object_id)
+
+    def mib_file_covering(self, sys_object_id: str) -> int | None:
+        return self.mib_db.mib_file_covering(sys_object_id)
+
+    def all_known_oids(self) -> dict[str, str]:
+        return self.mib_db.all_known_oids()
+
+    def update_mib_object(self, object_id: int, **fields) -> None:
+        self.mib_db.update_mib_object(object_id, **fields)
+
+    def oid_name_lines(self) -> str:
+        return self.mib_db.oid_name_lines()
+
+    def enterprise_objects(self) -> list[tuple[int, str]]:
+        return self.mib_db.enterprise_objects()
+
+    def mib_generation(self) -> tuple:
+        return self.mib_db.mib_generation()
+
+    def remove_mib_file(self, mib_file_id: int) -> None:
+        """Delete the file and clear every assignment to it. The
+        REFERENCES ... ON DELETE SET NULL that used to do the second half
+        cannot cross a file, so it is spelled out."""
+        self.mib_db.remove_mib_file(mib_file_id)
+        with self._lock:
+            self._conn.execute(
+                "UPDATE devices SET mib_file_id = NULL WHERE mib_file_id = ?",
+                (mib_file_id,))
+            self._conn.execute(
+                "UPDATE groups SET mib_file_id = NULL WHERE mib_file_id = ?",
+                (mib_file_id,))
+            self._conn.commit()
+            self._config_generation += 1
+
+    # ------------------------------------------------------ end of delegation
+
+    # ------------------------------------------------------- the 5.0.0 split
+
+    _LEGACY_TABLES = ("samples", "samples_hourly", "metrics",
+                      "mib_objects", "mib_files")
+
+    def _table_exists(self, name: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (name,)).fetchone() is not None
+
+    def _before_schema(self) -> None:
+        """Phase 1 of the split, synchronous and re-runnable.
+
+        Nothing here changes nodes.db until its very last steps, so an
+        interrupted run leaves a 4.x-readable file and simply starts over.
+        The device inventory stays readable throughout: what is copied are
+        the metric definitions, the MIB corpus and the tail of raw samples
+        the rollups have not covered yet — the bulk of the old file, the
+        hourly rollups, is lifted by phase 2 in the background.
+        """
+        if not self._table_exists("settings"):
+            return                      # a brand-new file: nothing to migrate
+        self._split_state = self._private_setting(self._SPLIT_STATE, "") or ""
+        if self._split_state == "done" or not self._table_exists("metrics"):
+            return
+        started = time.monotonic()
+        here, there = self.series_db.import_legacy_metrics(self.path)
+        if here < there:
+            log.error("nodes: split copied %d of %d metric rows; leaving "
+                      "nodes.db as it was", here, there)
+            return
+        # The watermark the legacy compact_rollup stopped at: everything from
+        # there on exists only as raw samples, which are not copied, so it is
+        # summarised now rather than lost.
+        watermark = self._private_setting("rollup_watermark_hour")
+        from_hour = int(watermark) if watermark is not None else 0
+        rolled = self.series_db.rollup_legacy_samples(self.path, from_hour)
+        files_here, files_there, objs_here, objs_there = \
+            self.mib_db.import_legacy(self.path)
+        if files_here < files_there or objs_here < objs_there:
+            log.error("nodes: split copied %d/%d MIB files and %d/%d objects; "
+                      "leaving nodes.db as it was",
+                      files_here, files_there, objs_here, objs_there)
+            return
+        self._rebuild_without_mib_fk()
+        self._set_private_setting(self._SPLIT_STATE, "rollups")
+        self._split_state = "rollups"
+        log.info("nodes: split phase 1 done in %.1f s — %d metrics, %d MIB "
+                 "files, %d objects, %d rollup rows from the sample tail; the "
+                 "hourly history follows in the background",
+                 time.monotonic() - started, there, files_there, objs_there,
+                 rolled)
+
+    _MIB_FK = re.compile(
+        r"\s*REFERENCES\s+mib_files\s*\(\s*id\s*\)\s*ON\s+DELETE\s+SET\s+NULL",
+        re.IGNORECASE)
+
+    def _rebuild_without_mib_fk(self) -> None:
+        """Drop `REFERENCES mib_files(id) ON DELETE SET NULL` from
+        `devices.mib_file_id` and `groups.mib_file_id`.
+
+        Not cosmetic: once mib_files is gone from this file, every INSERT and
+        DELETE on either table fails with "no such table", and dropping
+        mib_files with foreign keys on would fire SET NULL over every
+        assignment on the way out. SQLite cannot alter a constraint, so each
+        table is rebuilt from its own stored DDL with the clause removed.
+        """
+        # PRAGMA foreign_keys is a no-op inside a transaction, and the schema
+        # work above left one open.
+        self._conn.commit()
+        self._conn.execute("PRAGMA foreign_keys=OFF")
+        self._conn.execute("PRAGMA legacy_alter_table=ON")
+        try:
+            for table in ("devices", "groups"):
+                row = self._conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,)).fetchone()
+                if row is None or not self._MIB_FK.search(row["sql"] or ""):
+                    continue
+                ddl = self._MIB_FK.sub("", row["sql"])
+                ddl = re.sub(
+                    r"(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)[\"'`\[]?"
+                    + table + r"[\"'`\]]?",
+                    r"\g<1>__split_rebuild", ddl, count=1, flags=re.IGNORECASE)
+                self._conn.execute("DROP TABLE IF EXISTS __split_rebuild")
+                self._conn.execute(ddl)
+                self._conn.execute(
+                    f"INSERT INTO __split_rebuild SELECT * FROM {table}")
+                before = self._conn.execute(
+                    f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                after = self._conn.execute(
+                    "SELECT COUNT(*) FROM __split_rebuild").fetchone()[0]
+                if before != after:
+                    self._conn.execute("DROP TABLE __split_rebuild")
+                    raise sqlite3.DatabaseError(
+                        f"{table}: copied {after} of {before} rows")
+                self._conn.execute(f"DROP TABLE {table}")
+                self._conn.execute(
+                    f"ALTER TABLE __split_rebuild RENAME TO {table}")
+            self._conn.commit()
+            bad = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+            if bad:
+                log.warning("nodes: %d foreign key violation(s) after the "
+                            "table rebuild", len(bad))
+        finally:
+            self._conn.execute("PRAGMA legacy_alter_table=OFF")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+
+    def split_pending(self) -> bool:
+        """Whether phases 2 and 3 still have work. False on a fresh install
+        and after the split has finished, which is every ordinary start."""
+        return self._split_state == "rollups"
+
+    def continue_split(self, stop=None, min_hour: float | None = None,
+                       log_add=None) -> None:
+        """Phase 2 and, once it completes, phase 3.
+
+        Runs on Service's `netpath-nodes-split` thread and stops cleanly when
+        `stop` is set — the cursor is persisted per batch, so the next start
+        resumes rather than repeating. `min_hour` skips rollups already older
+        than the retention setting would keep. `log_add` is the event log, so
+        an operator sees why the file is busy on the first start after
+        upgrading.
+        """
+        if not self.split_pending():
+            return
+        started = time.monotonic()
+        copied = self.series_db.import_legacy_rollups(
+            self.path, stop=stop, min_hour=min_hour)
+        if stop is not None and stop.is_set():
+            log.info("nodes: split paused after %d rollup rows; resumes on "
+                     "the next start", copied)
+            return
+        self._finish_split(min_hour)
+        if log_add is not None:
+            log_add(f"Nodes: moved {copied:,} hourly rollup rows into "
+                    f"nodes_series.db and reclaimed nodes.db "
+                    f"({time.monotonic() - started:.0f} s)")
+
+    def _finish_split(self, min_hour: float | None = None) -> None:
+        """Phase 3: verify, drop the legacy tables, reclaim."""
+        missing = self.series_db.legacy_rollups_missing(self.path, min_hour)
+        if missing:
+            # One retry: a device polled while phase 2 ran can add a rollup
+            # row behind the cursor.
+            self.series_db.import_legacy_rollups(self.path, min_hour=min_hour,
+                                                 restart=True)
+            missing = self.series_db.legacy_rollups_missing(self.path, min_hour)
+            if missing:
+                log.warning("nodes: %d legacy rollup rows still uncopied; "
+                            "leaving the old tables in place for now", missing)
+                return
+        with self._lock:
+            self._conn.commit()
+            # The legacy mib_files is about to go and devices/groups still
+            # carried its foreign key until the phase 1 rebuild; a DROP with
+            # foreign keys on would fire ON DELETE SET NULL over every
+            # assignment, and the drop order below would fail on the rest.
+            self._conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                for table in self._LEGACY_TABLES:
+                    self._conn.execute(f"DROP TABLE IF EXISTS {table}")
+                self._conn.commit()
+            finally:
+                self._conn.execute("PRAGMA foreign_keys=ON")
+        self._set_private_setting(self._SPLIT_STATE, "done")
+        self._split_state = "done"
+        deadline = time.monotonic() + 120.0
+        while time.monotonic() < deadline:
+            if not reclaim(self._conn, self._lock, pages=2000, budget_s=2.0,
+                           label="nodes"):
+                break
+        log.info("nodes: split finished; nodes.db now holds the inventory only")
+
+    def finish_split_now(self, min_hour: float | None = None) -> None:
+        """The whole of phases 2 and 3, synchronously. For tests, the demo
+        seeder, and any caller that would rather wait than have the old
+        tables linger."""
+        self.continue_split(min_hour=min_hour)

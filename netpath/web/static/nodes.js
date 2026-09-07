@@ -5000,7 +5000,7 @@
       <p class="hint">Every MIB here is fetched from the vendor's or the
         distribution's own public repository when you press Install — nothing is
         mirrored by this app, and nothing is downloaded until you ask. Installing
-        a large bundle grows nodes.db by roughly the size of the MIB text.
+        a large bundle grows nodes_mibs.db by roughly the size of the MIB text.
         A server with no outbound HTTPS will say so rather than hang; on a closed
         network, download the files yourself and use Upload MIB, which accepts a
         zip.</p>

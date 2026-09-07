@@ -534,6 +534,8 @@ def _storage(service) -> dict:
     stores = (("app", service.app_db), ("trace", service.db), ("flow", service.flow_db),
               ("syslog", service.syslog_db), ("snmp", service.snmp_db),
               ("ipam", service.ipam_db), ("nodes", service.nodes_db),
+              ("nodes_series", service.nodes_db.series_db),
+              ("nodes_mibs", service.nodes_db.mib_db),
               ("alerts", service.alerts_db), ("wireless", service.wireless_db),
               ("configrx", service.configrx_db), ("mapper", service.mapper_db))
     result = {f"{name}_path": db.path for name, db in stores}
@@ -1473,6 +1475,7 @@ _GLOBAL_SETTINGS_RANGES = {
     "max_syslog_db_mb": (16, None),
     "max_ipam_db_mb": (16, None),
     "max_nodes_db_mb": (16, None),
+    "max_nodes_series_db_mb": (16, None),
     "max_alerts_db_mb": (16, None),
     "session_idle_minutes": (1, 1440),
     "session_max_hours": (1, 168),
@@ -8096,9 +8099,10 @@ def get_dashboard(service, params, body) -> dict:
         # the question, and it is answered worst-first.
         settings = service.settings or {}
         stores = []
-        # Only the seven databases that actually have a cap on the Settings
-        # tab; app.db, wireless.db, configrx.db and mapper.db have none, so
-        # they are reported as size without a fraction rather than as 0% used.
+        # Only the databases that actually have a cap on the Settings tab;
+        # app.db, wireless.db, configrx.db, mapper.db and nodes_mibs.db have
+        # none, so they are reported as size without a fraction rather than
+        # as 0% used.
         # This list is hand-written rather than derived from _storage's, and
         # mapper.db was added to that one and missed here — two figures for
         # the same question that disagreed. Anything opened as a database
@@ -8110,6 +8114,9 @@ def get_dashboard(service, params, body) -> dict:
                 ("Traps", service.snmp_db, "max_snmp_db_mb"),
                 ("IPAM", service.ipam_db, "max_ipam_db_mb"),
                 ("Nodes", service.nodes_db, "max_nodes_db_mb"),
+                ("Nodes metrics", service.nodes_db.series_db,
+                 "max_nodes_series_db_mb"),
+                ("Nodes MIBs", service.nodes_db.mib_db, None),
                 ("Alerts", service.alerts_db, "max_alerts_db_mb"),
                 ("Wireless", service.wireless_db, None),
                 ("ConfigRX", service.configrx_db, None),

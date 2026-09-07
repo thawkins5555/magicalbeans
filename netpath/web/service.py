@@ -254,6 +254,7 @@ class Service:
 
         self._stop = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
+        self._nodes_split_thread: threading.Thread | None = None
         # Held for the body of run_maintenance: a forced call (a settings
         # save, on an HTTP thread) and the periodic timer thread can both be
         # pruning at once, and shutdown() below must not close a database
@@ -434,10 +435,45 @@ class Service:
         self._maintenance_thread = threading.Thread(
             target=self._maintenance_loop, name="netpath-maintenance", daemon=True)
         self._maintenance_thread.start()
+        self._start_nodes_split()
         self.log.add(SYSTEM, "Service started")
+
+    def _start_nodes_split(self) -> None:
+        """Phase 2 of the 5.0.0 nodes.db split, on its own thread.
+
+        Only ever true on the first start after upgrading (and on the next
+        one if that start was interrupted): the hourly rollups can be
+        hundreds of megabytes and nothing should wait on them, least of all
+        the web server coming up.
+        """
+        if not self.nodes_db.split_pending():
+            return
+        self.log.add(SYSTEM, "Nodes: moving the metric history into "
+                             "nodes_series.db in the background. Charts and "
+                             "polling work throughout.")
+        min_hour = time.time() - float(
+            self.nodes_settings.get("rollup_retention_days", 400)) * 86400
+        self._nodes_split_thread = threading.Thread(
+            target=self._run_nodes_split, args=(min_hour,),
+            name="netpath-nodes-split", daemon=True)
+        self._nodes_split_thread.start()
+
+    def _run_nodes_split(self, min_hour: float) -> None:
+        try:
+            self.nodes_db.continue_split(
+                self._stop, min_hour,
+                lambda text: self.log.add(SYSTEM, text))
+        except Exception as exc:                              # noqa: BLE001
+            self.log.add(SYSTEM, f"Nodes: the background history move failed "
+                                 f"({exc}); it retries on the next start.")
 
     def shutdown(self) -> None:
         self._stop.set()
+        # Before the databases close: this thread holds an ATTACH on nodes.db
+        # and writes to nodes_series.db.
+        if self._nodes_split_thread is not None:
+            self._nodes_split_thread.join(timeout=10.0)
+            self._nodes_split_thread = None
         # run_maintenance also runs on an HTTP thread (apply_global_settings
         # forces one on a settings save), so either it or the timer thread
         # could still be pruning when the databases close below — join the
@@ -975,7 +1011,11 @@ class Service:
         self.nodes_db.prune_port_vlans(
             float(self.nodes_settings.get("mac_table_retention_days", 7)) * 86400)
         self._trim_db("max_nodes_db_mb", self.nodes_db, "Nodes database",
-                      "oldest samples")
+                      "oldest events")
+        # Its own cap since 5.0.0: the metric history is where the growth
+        # is, and trimming it must not be gated on the inventory file's size.
+        self._trim_db("max_nodes_series_db_mb", self.nodes_db.series_db,
+                      "Nodes metric history", "oldest samples")
 
         self.alerts_db.prune(
             float(self.alerts_settings.get("retention_days", 180)))

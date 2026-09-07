@@ -1230,6 +1230,9 @@
       <label>Syslog <input id="set-syslog-path" readonly></label>
       <label>IPAM <input id="set-ipam-path" readonly></label>
       <label>Nodes <input id="set-nodes-path" readonly></label>
+      <label>Nodes metric history <input id="set-nodes-series-path" readonly></label>
+      <label>Nodes MIBs <input id="set-nodes-mibs-path" readonly>
+        <span class="usage" id="use-nodes-mibs"></span></label>
       <label>Alerts <input id="set-alerts-path" readonly></label>
       <label>Trace database cap <input type="number" id="set-trace-cap" min="16" step="64"> MB
         <span class="usage" id="use-trace"></span></label>
@@ -1243,6 +1246,8 @@
         <span class="usage" id="use-ipam"></span></label>
       <label>Nodes database cap <input type="number" id="set-nodes-cap" min="16" step="64"> MB
         <span class="usage" id="use-nodes"></span></label>
+      <label>Nodes metric history cap <input type="number" id="set-nodes-series-cap" min="16" step="64"> MB
+        <span class="usage" id="use-nodes-series"></span></label>
       <label>Alerts database cap <input type="number" id="set-alerts-cap" min="16" step="16"> MB
         <span class="usage" id="use-alerts"></span></label>
       <p class="hint" id="set-sizes"></p>
@@ -1250,6 +1255,9 @@
         deleted until it fits, so the cap wins over the retention setting. For IPAM that means the
         oldest scan history first — subnets, discovered hosts and open conflicts describe the
         network as it is now, not a log, so they aren't what a size cap trims.</p>
+      <p class="hint">Nodes is three files: the device inventory and its event log, the metric
+        history (samples and hourly rollups — the one that grows), and the uploaded MIBs. The
+        MIB file has no cap: a MIB is not history, and trimming it would stop traps decoding.</p>
       <p class="hint">The application file has no cap because it is the one file worth
         backing up.<button type="button" class="help-link" data-help="settings.data.appfile"
         title="What does this control?" aria-label="Help">?</button></p>
