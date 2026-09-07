@@ -370,6 +370,79 @@ print("PASS: a writer is never blocked for more than a step of the reclaim")
 
 trim_db.close()
 
+# ------------------------------------------- stage two: the hourly rollups
+#
+# 5.1.0: stage one stops at the 5,000-row raw floor, and before this the
+# trim then gave up -- samples_hourly was the table actually holding the
+# file open and no size cap ever touched it. Stage two takes the oldest
+# hours, so the far end of the history goes and the recent hours
+# compact_rollup rewrites in its two-hour redo window are never touched.
+
+stage2_db = NodesDatabase(os.path.join(TMPDIR, "stage2.db"))
+stage2 = stage2_db.series_db
+stage2_group = stage2_db.ensure_default_group()
+stage2_device = stage2_db.add_device("127.0.0.6", name="stage2", group_id=stage2_group)
+
+HOURS, METRICS = 1500, 20
+top_hour = int(_time.time() // 3600) * 3600
+# One raw sample per metric only: stage one has nothing to give up (the
+# floor is 5,000 rows), which is exactly the state the old trim gave up in.
+stage2_db.record_metric_samples(
+    stage2_device,
+    [(f"roll.{j}", "roll", "u", "gauge", float(top_hour), float(j))
+     for j in range(METRICS)])
+with stage2._lock:
+    metric_ids = [row["id"] for row in
+                  stage2._conn.execute("SELECT id FROM metrics").fetchall()]
+    stage2._conn.executemany(
+        "INSERT INTO samples_hourly(metric_id, hour, n, vmin, vavg, vmax)"
+        " VALUES (?,?,60,0.0,1.0,2.0)",
+        [(metric_id, top_hour - h * 3600)
+         for metric_id in metric_ids for h in range(HOURS)])
+    stage2._conn.commit()
+    stage2._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    hourly_before, oldest_before = stage2._conn.execute(
+        "SELECT COUNT(*) AS n, MIN(hour) AS h FROM samples_hourly").fetchone()
+    raw_before = stage2._conn.execute(
+        "SELECT COUNT(*) AS n FROM samples").fetchone()["n"]
+bytes_before = stage2.size_bytes()
+assert hourly_before == HOURS * METRICS, hourly_before
+assert raw_before < 5000, raw_before
+
+stage2_removed = stage2.trim_to_size(bytes_before // 2)
+
+with stage2._lock:
+    hourly_after, oldest_after = stage2._conn.execute(
+        "SELECT COUNT(*) AS n, MIN(hour) AS h FROM samples_hourly").fetchone()
+    raw_after = stage2._conn.execute(
+        "SELECT COUNT(*) AS n FROM samples").fetchone()["n"]
+    newest_left = stage2._conn.execute(
+        "SELECT MAX(hour) AS h FROM samples_hourly").fetchone()["h"]
+print(f"stage two removed {stage2_removed} row(s); hourly {hourly_before} -> "
+      f"{hourly_after}; file {bytes_before:,} -> {stage2.size_bytes():,} bytes")
+assert stage2.size_bytes() <= bytes_before // 2, (stage2.size_bytes(), bytes_before)
+print("PASS: the size cap now brings a rollup-heavy file under its cap")
+assert hourly_after < hourly_before, (hourly_before, hourly_after)
+assert oldest_after > oldest_before, (oldest_before, oldest_after)
+print(f"PASS: the oldest hours went first ({(oldest_after - oldest_before) / 3600:.0f} "
+      f"hours of history dropped)")
+assert newest_left == top_hour, (newest_left, top_hour)
+print("PASS: the most recent hour -- inside compact_rollup's redo window -- "
+      "is still there")
+assert raw_after == raw_before, (raw_before, raw_after)
+print("PASS: raw samples below the floor are left alone")
+
+# A floor, not a target: a second trim against an impossible cap must stop
+# rather than empty the table.
+stage2.trim_to_size(1)
+with stage2._lock:
+    floor_left = stage2._conn.execute(
+        "SELECT COUNT(*) AS n FROM samples_hourly").fetchone()["n"]
+assert floor_left >= 5000, floor_left
+print(f"PASS: an unreachable cap stops at the rollup floor ({floor_left} rows left)")
+
+stage2_db.close()
+
 nodes_db.close()
 # --- starting the application must not wait for a whole-file rewrite
 # 4.39 moved every database to incremental auto-vacuum. Converting an

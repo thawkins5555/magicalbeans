@@ -1176,6 +1176,27 @@ check("view.ifaces =" not in _DEV_DIALOG,
       "describes the selected device, not the one this dialog opened")
 
 
+# 41. STORAGE (5.1.0): "oldest record N ago" beside each data file. The
+#     figure comes from /api/state's storage block, one {name}_oldest_ts per
+#     store, and is rendered where the byte counts already are — so a cap
+#     that has been trimming reads as lost history and not only as bytes.
+_SETTINGS41 = read("settings.js")
+_USAGE41 = _SETTINGS41[_SETTINGS41.index("  function showUsage(storage) {"):
+                       _SETTINGS41.index("  function status(message, colour) {")]
+check("`oldest record ${App.ago(ts)}`" in _USAGE41,
+      "the age is rendered through App.ago, the one place that turns an epoch "
+      "into a relative figure")
+check("'no history'" in _USAGE41,
+      "...and a store that has never been written to says so, rather than "
+      "showing an epoch of 0 as 1970")
+check("_oldest_ts'" in _USAGE41,
+      "the keys read are the {name}_oldest_ts the storage block carries")
+for _id in ("age-app", "age-trace", "age-flow", "age-snmp", "age-syslog",
+            "age-ipam", "age-nodes", "age-nodes-series", "age-nodes-mibs",
+            "age-alerts"):
+    check('id="%s"' % _id in INDEX and "'%s'" % _id in _USAGE41,
+          "the %s span exists in the page and is filled in by showUsage" % _id)
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))
