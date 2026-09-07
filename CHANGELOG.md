@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.0.0 — Nine asks, and the nodes database in three files](#500--nine-asks-and-the-nodes-database-in-three-files)
 - [4.54.1 — The tab nobody could see](#4541--the-tab-nobody-could-see)
 - [4.54.0 — A map of your own](#4540--a-map-of-your-own)
 - [4.53.0 — Two lanes on the timeline, and the sensors under the hood](#4530--two-lanes-on-the-timeline-and-the-sensors-under-the-hood)
@@ -122,6 +123,28 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.0.0 — Nine asks, and the nodes database in three files
+
+Short notes, one per request, in the order they were given. The database split is why this is 5.0.0: an install that has finished the split can no longer be opened by a 4.x release.
+
+**Theme has a Save button.** Picking a theme in the Account dialog previews it at once; Save stores it on your account and in this browser, Cancel or closing the dialog puts the old theme back. Signing in on another browser now brings your theme with you. (`PUT /api/account/theme`, `users.theme`.)
+
+**IPAM opens on DHCP.** DHCP is the default sub-view. Every browser lands on it once after this upgrade, after which the last sub-view you used is remembered as before. A host that cannot read DHCP still opens on Subnets & hosts.
+
+**One node per device, however many addresses it answers on.** Discovery now walks each SNMP host's own address table, folds two addresses of one box into one result, and marks a result that is really an existing device ("Same as …") so ticking it records the address instead of adding a twin. Adding a device by hand on an address another device already owns is refused with an Add anyway; bulk import reports those rows and can be re-run with force. The device pane gained an ADDRESSES subtab. A Duplicates button on the Devices bar lists likely twins already in the fleet with the evidence, and Merge shows exactly what moves before it does anything. Nothing merges on its own.
+
+**Vendor Identification sits below the Event Log** in the device dialog.
+
+**CPU, memory and chassis temperature are charted** in the device dialog, in a RESOURCES row under Packet Loss that follows the same range selector. CPU and memory are pinned to 0–100%; a metric the device never reported is simply not drawn.
+
+**The nodes database is now three files.** `nodes_series.db` holds `metrics`, `samples` and `samples_hourly` (the bulk of the write rate and of the size); `nodes_mibs.db` holds MIB text and parsed objects; `nodes.db` keeps devices, interfaces, MAC tables, VLANs, neighbours, events and discovery. On first start after upgrading, metrics, hourly rollups and MIBs are copied across (raw samples are not: they are three days of history and are rebuilt by the next polls), the old tables are dropped and the space reclaimed, all while Nodes stays readable. `nodes_series.db` has its own size cap, `max_nodes_series_db_mb`. Both new files sit beside `nodes.db`; back up all three.
+
+**The update button tells the truth.** It used to give up after 30 seconds while the server was still downloading, then report failure while the update went on to succeed. The update now runs as a background job; the dialog polls its progress (checking, downloading, extracting, installing, restarting), an install that is already current says so, and the installed-commit marker is written before the service stops rather than after its database was closed. The restart thread survives shutdown and logs every step on both platforms.
+
+**Refreshing the mapper no longer breaks it.** On a direct load the auto-refresh clock was never started, so a second fetch two seconds later cancelled the first and the canvas stayed blank. Fixed, along with a throw on clicking an empty canvas and a jump after resizing while zoomed.
+
+**A faster map, and a VLAN list that stays on screen.** The neighbour match used `LOWER()` on both sides with no matching index, scanning every interface row per neighbour; it now uses case-insensitive indexes. Per-map badge and port reads are bounded to the devices on the map. The client redraws once per animation frame, pans and zooms by transform alone, redraws only the dragged node's links, computes tooltips on hover, and draws the grid as one pattern. A link's tooltip lists at most ten VLANs then "+N more"; the link pane shows ten with a Show all.
 
 ### 4.54.1 — The tab nobody could see
 
