@@ -298,13 +298,12 @@ CREATE TABLE IF NOT EXISTS port_vlans (
 -- vlan_ports_for_devices/port_vlans_for_devices (MAPPER's own bounded shape,
 -- devices_by_ids' "many known ids, one indexed read" applied to each table)
 -- and the single-device vlans_for/port_vlans_for all filter by device_id,
--- one id or a handful via IN(...) — never nothing — so this index is what
--- keeps every one of them off a full table scan (port_vlans_for's optional
--- if_index narrows a primary-key prefix already, so no separate index earns
--- its keep there) — same reasoning as ix_neighbors_device.
-CREATE INDEX IF NOT EXISTS ix_vlans_device ON vlans(device_id);
-CREATE INDEX IF NOT EXISTS ix_vlan_ports_device ON vlan_ports(device_id);
-CREATE INDEX IF NOT EXISTS ix_port_vlans_device ON port_vlans(device_id);
+-- one id or a handful via IN(...) — never nothing. Each of the three PRIMARY
+-- KEYs above already LEADS with device_id, and SQLite implements a
+-- non-INTEGER primary key as an index, so that lookup is served already: the
+-- separate ix_vlans_device/ix_vlan_ports_device/ix_port_vlans_device this
+-- block used to declare duplicated it exactly, and were three more B-trees
+-- to write on every VLAN walk for nothing. _migrate drops them.
 
 CREATE TABLE IF NOT EXISTS metrics (
     id              INTEGER PRIMARY KEY,
@@ -963,6 +962,27 @@ class NodesDatabase(SqliteStore):
             "stp_state": "TEXT", "poe_power_mw": "INTEGER",
         })
 
+        # _NEIGHBOR_MATCH_SQL's two case-insensitive joins, which every
+        # neighbour read and every map GET runs. Declared NOCASE because a
+        # collated comparison can only use an index of the SAME collation:
+        # devices(name COLLATE NOCASE, ip) already existed for the sysName
+        # join's first half, these two are the other half and the chassis-MAC
+        # join. In _migrate rather than SCHEMA only so the three DROPs below
+        # sit with them; on a fresh file both are created on the first open
+        # exactly as a SCHEMA line would have been.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_devices_sys_name_nocase"
+            " ON devices(sys_name COLLATE NOCASE)")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_interfaces_phys_addr_nocase"
+            " ON interfaces(phys_addr COLLATE NOCASE)")
+        # Duplicates of the three PRIMARY KEYs they sat beside (each leads
+        # with device_id), so they answered nothing the table's own index did
+        # not and cost a write per VLAN row walked. Dropped rather than left
+        # in place: an upgraded database keeps them until this runs.
+        for name in ("ix_vlans_device", "ix_vlan_ports_device", "ix_port_vlans_device"):
+            self._conn.execute(f"DROP INDEX IF EXISTS {name}")
+
     def _seed(self) -> None:
         """Creates a `Default` polling profile if none exists yet. Idempotent
         on every open — a device with no group falls back to this one, and
@@ -1425,6 +1445,102 @@ class NodesDatabase(SqliteStore):
                 "SELECT m.device_id, m.key, m.label, m.last_value, m.last_ts"
                 f" FROM metrics m JOIN devices d ON d.id = m.device_id"
                 f" WHERE d.enabled = 1 AND m.key IN ({marks})", keys).fetchall()
+
+    # ------------------------------------------------- bounded fleet reads
+    #
+    # metrics_for_keys above is the RIGHT read for the alert engine, which
+    # genuinely evaluates every device. It is the wrong one for a caller
+    # that already knows which handful of devices it is drawing — MAPPER's
+    # map GET reads two metric keys and a port count for the devices one
+    # map places, and used to pull the whole fleet's rows for the first and
+    # run one interfaces() query per node for the second. These four are
+    # the "many known ids, one indexed read" shape devices_by_ids
+    # established, applied to the four things that route asks for. Each
+    # chunks by _IDS_PER_QUERY for the same bind-parameter reason, and each
+    # returns an empty result for empty input without touching the database.
+
+    def metrics_for_devices(self, device_ids, keys) -> list[sqlite3.Row]:
+        """The newest value of each named metric key, for named devices only.
+
+        Disabled devices are excluded exactly as metrics_for_keys excludes
+        them, and for the same reason: a device nobody is polling has no
+        current reading, whoever is asking."""
+        ids = list(dict.fromkeys(int(d) for d in device_ids))
+        keys = [str(k) for k in keys if k]
+        if not ids or not keys:
+            return []
+        key_marks = ",".join("?" * len(keys))
+        rows: list[sqlite3.Row] = []
+        with self._lock:
+            for start in range(0, len(ids), self._IDS_PER_QUERY):
+                chunk = ids[start:start + self._IDS_PER_QUERY]
+                marks = ",".join("?" * len(chunk))
+                rows += self._conn.execute(
+                    "SELECT m.device_id, m.key, m.label, m.last_value, m.last_ts"
+                    " FROM metrics m JOIN devices d ON d.id = m.device_id"
+                    f" WHERE d.enabled = 1 AND m.device_id IN ({marks})"
+                    f" AND m.key IN ({key_marks})", [*chunk, *keys]).fetchall()
+        return rows
+
+    def interface_counts(self, device_ids) -> dict:
+        """{device_id: how many interface rows it has}, for named devices.
+
+        A device with no interface rows at all is absent from the result
+        rather than present with 0 — "never polled" and "polled, has no
+        ports" are different facts, and only the caller knows which of the
+        two it wants to draw."""
+        ids = list(dict.fromkeys(int(d) for d in device_ids))
+        if not ids:
+            return {}
+        counts: dict = {}
+        with self._lock:
+            for start in range(0, len(ids), self._IDS_PER_QUERY):
+                chunk = ids[start:start + self._IDS_PER_QUERY]
+                marks = ",".join("?" * len(chunk))
+                for row in self._conn.execute(
+                        "SELECT device_id, COUNT(*) AS n FROM interfaces"
+                        f" WHERE device_id IN ({marks}) GROUP BY device_id",
+                        chunk).fetchall():
+                    counts[row["device_id"]] = row["n"]
+        return counts
+
+    def interface_port_labels_for_devices(self, device_ids) -> list[sqlite3.Row]:
+        """(device_id, if_index, descr, alias) for named devices — the four
+        columns a port LABEL needs, not the whole interface row. What
+        api._neighbor_local_port_labeler prefills its cache from, so a map
+        GET asks once for every device it places instead of once per
+        device as each first neighbour row reaches the closure."""
+        ids = list(dict.fromkeys(int(d) for d in device_ids))
+        if not ids:
+            return []
+        rows: list[sqlite3.Row] = []
+        with self._lock:
+            for start in range(0, len(ids), self._IDS_PER_QUERY):
+                chunk = ids[start:start + self._IDS_PER_QUERY]
+                marks = ",".join("?" * len(chunk))
+                rows += self._conn.execute(
+                    "SELECT device_id, if_index, descr, alias FROM interfaces"
+                    f" WHERE device_id IN ({marks}) ORDER BY device_id, if_index",
+                    chunk).fetchall()
+        return rows
+
+    def interface_port_labels(self, device_id: int) -> list[sqlite3.Row]:
+        """interface_port_labels_for_devices for one device."""
+        return self.interface_port_labels_for_devices([device_id])
+
+    def device_summaries(self) -> list[sqlite3.Row]:
+        """Every device, but only the seven columns a picker needs: id, ip,
+        status, vendor, and the three namelookup.device_name reads
+        (name, sys_name, display_name_source).
+
+        devices() returns SELECT * — around forty columns including
+        sysDescr and the vendor-evidence text — which is what MAPPER's
+        "Add device" list was paying for a name, an address and a vendor
+        per row."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT id, name, ip, status, vendor, sys_name, display_name_source"
+                " FROM devices ORDER BY name COLLATE NOCASE, ip").fetchall()
 
     def device_count(self) -> int:
         with self._lock:
@@ -2089,13 +2205,22 @@ class NodesDatabase(SqliteStore):
         " byname.id AS matched_by_name_id,"
         " bymac.id AS matched_by_mac_id"
         " FROM neighbors n"
+        # COLLATE NOCASE, not LOWER() on both sides: the two mean the same
+        # thing to SQLite (NOCASE folds the same ASCII range LOWER does),
+        # but LOWER(column) is an expression, so every one of these three
+        # joins had to read and fold every row of the table it joins —
+        # devices twice and interfaces once, per neighbour row. As a plain
+        # collated comparison they are index lookups instead
+        # (ix_devices_name_ip, ix_devices_sys_name_nocase,
+        # ix_interfaces_phys_addr_nocase, all declared NOCASE so the
+        # planner may use them for exactly this comparison).
         " LEFT JOIN devices byname"
         "   ON byname.enabled = 1 AND n.sys_name != ''"
-        "   AND (LOWER(byname.name) = LOWER(n.sys_name)"
-        "        OR LOWER(byname.sys_name) = LOWER(n.sys_name))"
+        "   AND (byname.name = n.sys_name COLLATE NOCASE"
+        "        OR byname.sys_name = n.sys_name COLLATE NOCASE)"
         " LEFT JOIN interfaces iface"
         "   ON n.chassis_id_subtype = 4 AND n.chassis_id != ''"
-        "   AND LOWER(iface.phys_addr) = LOWER(n.chassis_id)"
+        "   AND iface.phys_addr = n.chassis_id COLLATE NOCASE"
         " LEFT JOIN devices bymac ON bymac.id = iface.device_id AND bymac.enabled = 1")
 
     def neighbours_of(self, device_id: int) -> list[sqlite3.Row]:

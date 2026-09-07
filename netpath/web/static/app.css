@@ -1316,7 +1316,16 @@ body.resizing-h, body.resizing-h * { cursor: col-resize !important; user-select:
   font-family: var(--mono);
   font-size: var(--fs-xs);
   line-height: 1.45;
-  white-space: pre;
+  /* pre-wrap, not pre: a MAPPER trunk's VLAN list is one long line, and
+     `pre` let it run past max-width and off the side of the window. The
+     height cap is the same problem vertically — a tooltip follows the
+     pointer and cannot be scrolled, so one taller than the viewport hides
+     its own last lines with no way to reach them. Whatever is capped away
+     is always available somewhere that can scroll: the detail pane. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 60vh;
+  overflow: hidden;
   box-shadow: var(--shadow-float);
   max-width: 460px;
 }
@@ -1721,8 +1730,14 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
 
 /* The grid: drawn only when snap-to-grid is on or the style calls for it
    (mapper.js's shouldDrawGrid decides which); the per-style strength of
-   it, once drawn, is a CSS-only choice kept here. */
+   it, once drawn, is a CSS-only choice kept here. .mp-grid-line names the
+   one <path> inside the <pattern> that tiles the whole grid, so these
+   rules read the same as when it named 600 individual <line>s.
+   .mp-grid is the single rect that pattern fills — it covers the whole
+   drawing, so it must never take a pointer event away from a node or a
+   link underneath it. */
 .mp-grid-line { stroke: var(--canvas-grid); }
+.mp-grid { pointer-events: none; }
 
 /* Rubber-band multi-select, dragged from empty canvas. */
 .mp-rubber { fill: var(--canvas-accent); fill-opacity: 0.12; stroke: var(--canvas-accent); stroke-dasharray: 3 2; }

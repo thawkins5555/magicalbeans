@@ -2086,6 +2086,142 @@ open left a control that still looked enabled until the operator closed
 and reopened it. All now carry `data-requires-write="mapper"`, exactly
 like every other write control `applyPermissions` walks.
 
+### A map GET's cost, part two — 5.0.0
+
+4.54.0 (above) bounded the map GET to the devices a map places. What it
+did not touch was the SQL those bounded reads run, or the four reads a
+badge and a port label still made outside them.
+
+**`_NEIGHBOR_MATCH_SQL` compared with `LOWER()` on both sides.** Its two
+case-insensitive joins — a neighbour's `sys_name` against
+`devices.name`/`devices.sys_name`, and its chassis MAC against
+`interfaces.phys_addr` — were written `LOWER(col) = LOWER(n.col)`.
+`LOWER(col)` is an expression, so no index on `col` can serve it: SQLite
+read and folded every row of `devices` (twice) and `interfaces` (once)
+for every neighbour row, on every neighbours read and every map GET.
+They are plain collated comparisons now (`col = n.col COLLATE NOCASE`),
+which mean exactly the same thing — SQLite's NOCASE folds the same ASCII
+range `LOWER` does — and can use an index of the same collation.
+`_migrate` creates the two that were missing,
+`ix_devices_sys_name_nocase` and `ix_interfaces_phys_addr_nocase`
+(`devices(name COLLATE NOCASE, ip)` already existed for the other half of
+the sysName join), and `EXPLAIN QUERY PLAN` now reports a MULTI-INDEX OR
+across both device indexes plus a search on the interfaces one, where it
+used to report three scans. Measured on a synthetic 2,000-device,
+24,000-interface fleet with 800 neighbour rows: **3.81 s → 0.005 s** for
+the fleet-wide form. `_UPSTREAM_CANDIDATE_SQL`, `neighbours_of`,
+`all_neighbours` and `neighbours_for_devices` all inherit it.
+
+**Three indexes dropped.** `ix_vlans_device`, `ix_vlan_ports_device` and
+`ix_port_vlans_device` each indexed `device_id` on a table whose PRIMARY
+KEY already *leads* with `device_id` — and a non-INTEGER primary key is
+an index in SQLite. They answered nothing the table's own index did not,
+and cost a B-tree write per row on every VLAN walk. They are gone from
+`SCHEMA` and dropped in `_migrate`; the lookups they were added for read
+exactly as they did.
+
+**Four bounded accessors** replace the reads the route still made outside
+its own device list — `metrics_for_devices(ids, keys)` (the badge values;
+`metrics_for_keys` reads the whole fleet, which is right for the alert
+engine and wrong here), `interface_counts(ids)` (one grouped COUNT, not
+one `interfaces()` row read per placed device), `interface_port_labels_
+for_devices(ids)` / `interface_port_labels(id)` (four columns, and
+`_neighbor_local_port_labeler(service, prefetch_ids=…)` fills its whole
+cache from one call instead of a `SELECT *` per device as each first
+neighbour row arrives) and `device_summaries()` (seven columns for the
+"Add device" list, where `devices()` returned `SELECT *` — around forty
+columns including `sys_descr` and the vendor-evidence text — for the
+whole fleet; 23.6 ms → 3.3 ms per call at 2,000 devices). Each chunks by
+`_IDS_PER_QUERY` and returns an empty result for empty input without
+touching the database, exactly as `devices_by_ids` does.
+
+**No per-map memo, deliberately.** The obvious next step — cache a map's
+assembled payload against `maps.updated_ts` — would be wrong: a node's
+`status`, its badges and a link's `seen_ts` all change without anything
+touching `maps.updated_ts`, so a memo keyed on it would serve a map whose
+devices had since gone down. With the indexes above the GET is indexed
+lookups over a handful of devices; there is nothing left worth the risk
+of showing a stale map.
+
+### Rendering (`mapper.js`) — 5.0.0
+
+Every gesture used to call `draw()`, which rebuilt the entire scene —
+grid, every link, every strand, every node, every listener — synchronously
+inside the event. A pointermove fires faster than a frame.
+
+- **`requestDraw()`** coalesces to one full redraw per animation frame.
+  Everything that used to call `draw()` calls it; `loadMapData` keeps one
+  synchronous `draw()` so a fresh payload is on screen before the function
+  returns.
+- **`applyTransform()`** is the whole of a pan, a wheel zoom, the zoom
+  buttons, the arrow keys and Fit: they change where the scene sits, not
+  what it contains, so they set one `transform` on `view.sceneGroup`. It
+  falls back to `requestDraw()` when there is no scene yet.
+- **`redrawDragged()`** moves the dragged `<g>`s and re-runs `drawLink`
+  for `view.linksByNode`'s entries only — each link is drawn into its own
+  `<g>` so exactly those can be emptied and refilled. One full redraw at
+  drag end, where the dropped positions are what everything else is
+  measured from.
+- **The rubber band** is one rect created with the scene and moved in
+  place, rather than appended by a full redraw per pointermove.
+- **`applySelectionClasses()`** toggles `.selected` on elements that
+  already exist. A drag begins by capturing the pointer on a node's own
+  `<g>`; rebuilding the scene there would replace that element out from
+  under the capture, which is why the start of a drag repaints the
+  selection rather than redrawing.
+- **Tooltips are built on first hover or focus**, not while drawing: a
+  30-strand link built 30 strings — each resolving both endpoint names and
+  joining every VLAN id — for text nobody may ever read. `aria-label`
+  stays eager, because a screen reader needs it in the tree.
+- **The grid is one `<pattern>` and one `<rect class="mp-grid">`** instead
+  of one `<line>` per grid step (600 hit-testable elements on a map
+  spanning 6,000 units at the default 20-unit grid). `.mp-grid-line` still
+  names the stroke, so the per-style CSS is unchanged, and `.mp-grid` is
+  `pointer-events: none` because the rect covers the whole drawing.
+  `exportPng`'s `inlineComputedColors` gained one guard for it: a
+  computed `fill` of `url(#mp-grid-pattern)` comes back absolutised
+  against the page's own URL, which resolves to nothing inside the
+  detached copy the PNG is rendered from, so a `url(…)` value is left
+  alone and the clone's own same-document attribute carries it.
+- **Lookups are Maps**, rebuilt once per payload in `rebuildLookups()`:
+  `nodeMap`, `linkMap`, `vlanNameById` and `linksByNode`. Each was an
+  `Array.find()` inside a loop over nodes, links or strands.
+- **`contentBounds()` runs once per draw**, passed to `fitView(bounds,
+  width, height)` and to `nextPlacement(index, bounds)` (which re-walked
+  the map once per device being added).
+- **`fastTick` no longer redraws the legend.** The legend changes when the
+  map's data does, so `loadMapData()` and `activate()` draw it.
+
+**Reloading `#/mapper/<id>`** left the canvas blank. `deliverRoute` awaits
+`refreshNow('mapper')` and only then calls `activate()`, but `refresh()`
+picked the *remembered* map — so the routed one arrived as a second load —
+and it stamped `view.lastAutoTs` only after that first `await`, so the
+poll tick landing meanwhile started a third. Two of the three raced
+through `loadMapData`'s generation guard. `refresh()` now prefers the id
+the address bar names (`App.currentRoute()`, `parseRoute` exported) and
+stamps `lastAutoTs` before it awaits anything; `app.js`'s `refreshNow()`
+marks the page `refreshing` for the whole call, so `master()`'s existing
+overlap guard covers a route or tab refresh too; `scenePoint()` returns
+`null` rather than reading a frame the first paint has not built; and
+`draw()` re-reads the frame's *size* every time while leaving the
+operator's own centre and zoom alone.
+
+**A trunk with 200 VLANs.** `linkTooltip` listed all of them on one line,
+in a box that follows the pointer, cannot be scrolled and had
+`white-space: pre` — so the list ran off the side of the window and the
+native-VLAN mismatch under it ran off the bottom. `VLAN_TOOLTIP_CAP`
+(10) names the first ten and says how many more there are;
+`.tooltip` wraps (`pre-wrap`, `overflow-wrap: anywhere`) and caps its own
+height. `linkDetailHtml` caps at `VLAN_DETAIL_CAP` too, but behind a
+`data-show-all-vlans` button `drawDetail` wires — the full list is still
+one click away, in the one place that can scroll. `selectLink` resets
+that choice, since it is a decision about the link being read.
+
+**And a dialog bug the same pass found:** `openAddNeighbours` called
+`App.grid` once, outside `redrawNeighbourRows`, so re-sorting the table
+appended a second `<tbody>` and every neighbour appeared twice. It calls
+`App.grid` per redraw now, exactly as `drawVlanTable` always has.
+
 ### Nodes' per-port VLAN membership (`nodesdb.py`, `nodeoids.py`, `nodepoll.py`)
 
 Three new `nodesdb.py` tables rather than one, because they answer three

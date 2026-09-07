@@ -72,12 +72,31 @@
     links: [],
     peersByKey: new Map(),
     vlans: [],
+    // Rebuilt with the payload in loadMapData. Everything below used to be
+    // an Array.find() per lookup, and every one of them sits inside a loop
+    // over nodes, links or strands: nodeById in the drag path, vlanDisplay
+    // once per strand per draw, linksByNode's answer computed by scanning
+    // every link. A 60-node map with 200 links made that quadratic for no
+    // reason a Map does not fix.
+    nodeMap: new Map(),        // map_nodes id -> row
+    linkMap: new Map(),        // link id -> link
+    vlanNameById: new Map(),   // vlan id -> its name on this map ('' when unnamed)
+    linksByNode: new Map(),    // map_nodes id -> the links touching it
+
+    // The drawn SVG, kept so a pan, a zoom or a drag can move what is
+    // already there instead of rebuilding the whole scene (applyTransform,
+    // redrawDragged, drawRubber).
+    sceneGroup: null,
+    rubberEl: null,
+    nodeEls: new Map(),        // map_nodes id -> its <g>
+    linkEls: new Map(),        // link id -> the <g> holding that link's own elements
     settings: {},        // mapperdb.DEFAULTS shape, refreshed with every maps/settings fetch
     candidates: { devices: [], neighbours: [] },
 
     selection: new Set(),    // selected node ids
     selectedLinkId: null,
     selectedVlan: null,      // vlan id highlighted from the VLAN table
+    detailShowAllVlans: false,   // the open link's VLAN list, past VLAN_DETAIL_CAP
 
     zoom: 1, userZoom: false, pan: { x: 0, y: 0 }, frame: null,
     panDrag: null, dragMoved: false, spaceHeld: false,
@@ -169,8 +188,8 @@
   /* -------------------------------------------------------------- helpers */
 
   function currentMap() { return view.maps.find((m) => m.id === view.mapId) || null; }
-  function nodeById(id) { return view.nodes.find((n) => n.id === id) || null; }
-  function linkById(id) { return view.links.find((l) => l.id === id) || null; }
+  function nodeById(id) { return view.nodeMap.get(id) || null; }
+  function linkById(id) { return view.linkMap.get(id) || null; }
 
   /* A link (netpath/mapper.py's assemble_links) names its endpoints by
      DEVICE identity — a_device_id always (the reporting device), and
@@ -408,10 +427,37 @@
 
   /* ------------------------------------------------------------ map data */
 
+  // Every by-id lookup this file does, built once per payload instead of
+  // scanned per call. linksByNode is the one that is not merely a
+  // convenience: redrawDragged needs "which links touch this node" for
+  // each dragged node on every pointermove.
+  function rebuildLookups() {
+    view.nodeByDevice = new Map();
+    view.nodeByPeer = new Map();
+    view.nodeMap = new Map();
+    for (const n of view.nodes) {
+      view.nodeMap.set(n.id, n);
+      if (n.device_id !== null && n.device_id !== undefined) view.nodeByDevice.set(n.device_id, n);
+      else if (n.peer_key) view.nodeByPeer.set(n.peer_key, n);
+    }
+    view.linkMap = new Map(view.links.map((l) => [l.id, l]));
+    view.vlanNameById = new Map(view.vlans.map((v) => [v.vlan, v.name || '']));
+    view.linksByNode = new Map();
+    for (const link of view.links) {
+      const a = linkNodeA(link), b = linkNodeB(link);
+      for (const node of (a && b && a.id === b.id) ? [a] : [a, b]) {
+        if (!node) continue;
+        const list = view.linksByNode.get(node.id);
+        if (list) list.push(link); else view.linksByNode.set(node.id, [link]);
+      }
+    }
+  }
+
   async function loadMapData() {
     const generation = ++view.loadGen;
     if (view.mapId === null) {
       view.map = null; view.nodes = []; view.links = []; view.peersByKey = new Map(); view.vlans = [];
+      rebuildLookups();
       drawStatus(); draw(); drawDetail(); drawVlanTable(); drawLegend();
       return;
     }
@@ -419,15 +465,10 @@
     if (view.loadGen !== generation) return;   // a newer selectMap/refresh already superseded this
     view.map = payload.map;
     view.nodes = payload.nodes || [];
-    view.nodeByDevice = new Map();
-    view.nodeByPeer = new Map();
-    for (const n of view.nodes) {
-      if (n.device_id !== null && n.device_id !== undefined) view.nodeByDevice.set(n.device_id, n);
-      else if (n.peer_key) view.nodeByPeer.set(n.peer_key, n);
-    }
     view.links = payload.links || [];
     view.peersByKey = new Map((payload.peers || []).map((p) => [p.peer_key, p]));
     view.vlans = payload.vlans || [];
+    rebuildLookups();
     if (payload.settings) view.settings = payload.settings;
     // A selection or a highlighted link that no longer exists on the fresh
     // payload (removed elsewhere) is dropped rather than left pointing at
@@ -468,8 +509,10 @@
   // right edge instead, so a batch add lands as N distinct, already-visible
   // boxes an operator can then arrange, not a pile they have to pull apart
   // one at a time first.
-  function nextPlacement(index) {
-    const bounds = contentBounds();
+  // `bounds` is measured once by the caller, before its loop: every node
+  // it is about to add would otherwise re-walk the whole map to place the
+  // next one, and none of them are on the map yet anyway.
+  function nextPlacement(index, bounds) {
     const baseX = bounds ? bounds.x + bounds.width + 100 : 0;
     const baseY = bounds ? bounds.y : 0;
     const step = NODE_W + 20;
@@ -485,8 +528,9 @@
       { label: 'Add', primary: true, onClick: async (b) => {
         const ids = [...b.querySelectorAll('.mp-pick:checked')].map((el) => Number(el.dataset.id));
         if (!ids.length) { App.closeModal(); return; }
+        const bounds = contentBounds();
         for (let i = 0; i < ids.length; i += 1) {
-          const pos = nextPlacement(i);
+          const pos = nextPlacement(i, bounds);
           await App.post(`/api/mapper/maps/${view.mapId}/nodes`, { device_id: ids[i], x: pos.x, y: pos.y });
         }
         App.closeModal();
@@ -552,10 +596,11 @@
       { label: 'Add', primary: true, onClick: async (b) => {
         const keys = [...b.querySelectorAll('.mp-pick:checked')].map((el) => el.dataset.key);
         if (!keys.length) { App.closeModal(); return; }
+        const bounds = contentBounds();
         for (let i = 0; i < keys.length; i += 1) {
           const row = rows.find((r) => r.key === keys[i]);
           if (!row) continue;
-          const pos = nextPlacement(i);
+          const pos = nextPlacement(i, bounds);
           if (row.kind === 'device') {
             await App.post(`/api/mapper/maps/${view.mapId}/nodes`,
               { device_id: row.device_id, x: pos.x, y: pos.y });
@@ -569,12 +614,16 @@
       } },
     ]);
     let sort = { key: 'name', descending: false };
-    const table = App.grid(box.querySelector('#mpan-table'), {
-      name: 'mapper-add-neighbours', caption: 'Neighbours not yet on this map',
-      columns: NEIGHBOUR_PICK_COLUMNS, sort, onSort: (key, descending) => { sort = { key, descending };
-        redrawNeighbourRows(); },
-    });
+    // App.grid is re-run per redraw, exactly as drawVlanTable does it: it
+    // is what replaces the table's contents. Called once outside, as this
+    // used to be, re-sorting appended a second <tbody> to the same table
+    // and the dialog showed every row twice.
     function redrawNeighbourRows() {
+      const table = App.grid(box.querySelector('#mpan-table'), {
+        name: 'mapper-add-neighbours', caption: 'Neighbours not yet on this map',
+        columns: NEIGHBOUR_PICK_COLUMNS, sort, onSort: (key, descending) => {
+          sort = { key, descending }; redrawNeighbourRows(); },
+      });
       const body = document.createElement('tbody');
       App.drawRows(body, App.sortRows(rows, sort.key, sort.descending, NEIGHBOUR_PICK_COLUMNS),
         NEIGHBOUR_PICK_COLUMNS, null,
@@ -626,18 +675,34 @@
     return MAP_STYLES.includes(view.settings.map_style) ? view.settings.map_style : 'modern';
   }
 
+  // One <pattern> and one <rect>, not one <line> per grid step: a map
+  // spanning 6,000 units at the default 20-unit grid drew 600 line
+  // elements, every one of them a hit-testable node the browser laid out
+  // and re-laid-out on every redraw. The pattern tiles the same lines in
+  // the renderer, off the DOM entirely; .mp-grid-line still names the
+  // stroke, so the per-style rules in app.css are unchanged.
+  const GRID_PATTERN_ID = 'mp-grid-pattern';
+
   function drawGrid(layer, bounds) {
     const size = Math.max(Number(view.settings.grid_size) || 20, 4);
     const x0 = Math.floor((bounds.x - size) / size) * size;
     const y0 = Math.floor((bounds.y - size) / size) * size;
-    const x1 = bounds.x + bounds.width + size;
-    const y1 = bounds.y + bounds.height + size;
-    for (let x = x0; x <= x1; x += size) {
-      layer.appendChild(App.svgNode('line', { class: 'mp-grid-line', x1: x, y1: y0, x2: x, y2: y1 }));
-    }
-    for (let y = y0; y <= y1; y += size) {
-      layer.appendChild(App.svgNode('line', { class: 'mp-grid-line', x1: x0, y1: y, x2: x1, y2: y }));
-    }
+    const x1 = Math.ceil((bounds.x + bounds.width + size) / size) * size;
+    const y1 = Math.ceil((bounds.y + bounds.height + size) / size) * size;
+    const defs = App.svgNode('defs');
+    const pattern = App.svgNode('pattern', {
+      id: GRID_PATTERN_ID, x: x0, y: y0, width: size, height: size,
+      patternUnits: 'userSpaceOnUse',
+    });
+    pattern.appendChild(App.svgNode('path', {
+      class: 'mp-grid-line', fill: 'none', d: `M ${size} 0 L 0 0 L 0 ${size}`,
+    }));
+    defs.appendChild(pattern);
+    layer.appendChild(defs);
+    layer.appendChild(App.svgNode('rect', {
+      class: 'mp-grid', x: x0, y: y0, width: x1 - x0, height: y1 - y0,
+      fill: `url(#${GRID_PATTERN_ID})`,
+    }));
   }
 
   // A VLAN id, named: "20 (Engineering)" when this map's own VLAN summary
@@ -646,8 +711,8 @@
   // already listed the bare ids) and the per-strand text below (which did
   // not exist before: see the strands-mode comment in drawLink).
   function vlanDisplay(vlanId) {
-    const summary = view.vlans.find((v) => v.vlan === vlanId);
-    return summary && summary.name ? `${vlanId} (${summary.name})` : `${vlanId}`;
+    const name = view.vlanNameById.get(vlanId);
+    return name ? `${vlanId} (${name})` : `${vlanId}`;
   }
 
   function drawLink(layer, link) {
@@ -669,7 +734,18 @@
     // order — see that branch's own comment for why.
     const wireOne = (path, extraClass, opts = {}) => {
       const focusable = opts.focusable !== false;
-      const tooltipText = opts.tooltip || linkTooltip(link);
+      // The text is built on the first hover or focus, not while drawing:
+      // a 30-strand link built 30 tooltip strings — each of them resolving
+      // both endpoint names and joining every VLAN id — for text nobody
+      // may ever look at. aria-label stays eager; a screen reader needs it
+      // present in the tree, not on an event.
+      let tooltipText = null;
+      const tipText = () => {
+        if (tooltipText === null) {
+          tooltipText = opts.tooltip ? opts.tooltip() : linkTooltip(link);
+        }
+        return tooltipText;
+      };
       path.classList.add('mp-link');
       if (extraClass) path.classList.add(extraClass);
       if (selected) path.classList.add('selected');
@@ -683,7 +759,7 @@
       path.setAttribute('role', focusable ? 'button' : 'img');
       path.setAttribute('aria-label', opts.ariaLabel || linkAriaLabel(link));
       path.addEventListener('click', () => selectLink(link.id));
-      path.addEventListener('mousemove', (event) => App.tooltip(tooltipText, event));
+      path.addEventListener('mousemove', (event) => App.tooltip(tipText(), event));
       path.addEventListener('mouseleave', App.hideTooltip);
       if (focusable) {
         path.tabIndex = 0;
@@ -694,7 +770,7 @@
         });
         path.addEventListener('focus', () => {
           const box = path.getBoundingClientRect();
-          App.tooltip(tooltipText, { clientX: box.left + box.width / 2, clientY: box.top });
+          App.tooltip(tipText(), { clientX: box.left + box.width / 2, clientY: box.top });
         });
         path.addEventListener('blur', App.hideTooltip);
       }
@@ -731,11 +807,11 @@
           stroke: `var(--canvas-vlan-${strand.color_index + 1})`, 'stroke-width': plan.width,
         });
         wireOne(path, null, i === 0
-          ? { focusable: true, ariaLabel: linkAriaLabel(link), tooltip: linkTooltip(link) }
+          ? { focusable: true, ariaLabel: linkAriaLabel(link), tooltip: () => linkTooltip(link) }
           : {
             focusable: false,
             ariaLabel: `VLAN ${vlanDisplay(strand.vlan)} strand on the link.`,
-            tooltip: strandTooltip(link, strand),
+            tooltip: () => strandTooltip(link, strand),
           });
         if (view.settings.show_vlan_labels) {
           layer.appendChild(App.svgNode('text', {
@@ -819,6 +895,12 @@
     return mode === 'trunk' || mode === 'access' ? ` · ${mode}` : '';
   }
 
+  // How many VLANs a hover, and the detail pane's first screen, name before
+  // saying how many more there are. Ten is about what fits either without
+  // pushing what follows it out of reach.
+  const VLAN_TOOLTIP_CAP = 10;
+  const VLAN_DETAIL_CAP = 10;
+
   function linkTooltip(link) {
     const a = resolveNode(linkNodeA(link)).name;
     const b = resolveNode(linkNodeB(link)).name;
@@ -826,8 +908,21 @@
     const lines = [`${a} (${link.a_port || '—'})${portMode(link.a_port_mode)}`,
       `↕ ${(link.protocols || []).join(', ').toUpperCase()}`,
       `${b} (${link.b_port || '—'})${portMode(link.b_port_mode)}`, ''];
-    if (plan.known === false) lines.push('No VLAN data known for this link.');
-    else lines.push(`VLANs (${(plan.vlans || []).length}): ${(plan.vlans || []).map(vlanDisplay).join(', ')}`);
+    if (plan.known === false) {
+      lines.push('No VLAN data known for this link.');
+    } else {
+      // A 200-VLAN trunk listed every id here, and the tooltip is a fixed
+      // box following the pointer: it grew past the top and bottom of the
+      // window with no way to scroll it, so the lines under the VLAN list
+      // (the native-VLAN mismatch, the one thing on a trunk worth seeing
+      // at a glance) were off-screen. The detail pane, one click away, has
+      // always had the whole list and now says so.
+      const vlans = plan.vlans || [];
+      const shown = vlans.slice(0, VLAN_TOOLTIP_CAP).map(vlanDisplay).join(', ');
+      lines.push(`VLANs (${vlans.length}): ${shown}`
+        + (vlans.length > VLAN_TOOLTIP_CAP
+          ? `, +${vlans.length - VLAN_TOOLTIP_CAP} more (open the link for the full list)` : ''));
+    }
     // Each end's own native VLAN, as the device itself reported it
     // (vlan_ports.native_vlan), falling back on the a side to the value
     // inferred from which VLAN crosses the port untagged. The two ends can
@@ -922,6 +1017,7 @@
     });
     g.addEventListener('pointerdown', (event) => onNodePointerDown(event, node));
     layer.appendChild(g);
+    return g;
   }
 
   // A minimal stand-in for App.statusMark inside SVG: statusMark's own
@@ -976,11 +1072,87 @@
     return { tx: f.width / 2 - f.cx * scale + view.pan.x, ty: f.height / 2 - f.cy * scale + view.pan.y };
   }
 
+  /* One full redraw per animation frame, however many times the handlers
+     below ask for one. A pointermove fires far faster than 60 Hz on a
+     trackpad, and each of those used to rebuild every node, link, strand
+     and grid line from scratch — synchronously, inside the event. Nothing
+     here changes WHAT is drawn, only how often. */
+  let drawPending = 0;
+
+  function requestDraw() {
+    if (drawPending) return;
+    drawPending = window.requestAnimationFrame(() => { drawPending = 0; draw(); });
+  }
+
+  /* Pan, zoom and Fit change nothing about the scene's contents — only
+     where it sits in the frame — so they move the one group everything is
+     inside rather than rebuilding it. Falls back to a full draw when there
+     is no scene yet (an empty map, or before the first paint). */
+  function applyTransform() {
+    if (!view.sceneGroup || !view.frame) { requestDraw(); return; }
+    const { tx, ty } = translation(view.zoom);
+    view.sceneGroup.setAttribute('transform', `translate(${tx},${ty}) scale(${view.zoom})`);
+  }
+
+  /* A drag moves the boxes being dragged and the links that touch them.
+     Everything else on the map is unaffected, so a full redraw per
+     pointermove was rebuilding a whole scene to move one node. */
+  function redrawDragged() {
+    if (!view.nodeDrag || !view.nodeEls.size) { requestDraw(); return; }
+    const touched = new Set();
+    for (const id of view.nodeDrag.ids) {
+      const node = nodeById(id);
+      const el = view.nodeEls.get(id);
+      if (!node || !el) { requestDraw(); return; }
+      const pos = livePos(node);
+      el.setAttribute('transform', `translate(${pos.x - NODE_W / 2},${pos.y - NODE_H / 2})`);
+      for (const link of view.linksByNode.get(id) || []) touched.add(link);
+    }
+    for (const link of touched) {
+      const holder = view.linkEls.get(link.id);
+      if (!holder) continue;
+      holder.textContent = '';
+      drawLink(holder, link);
+    }
+  }
+
+  /* Selection is a class on elements that already exist. Toggling it in
+     place matters most at the start of a drag: a full redraw there would
+     replace the very <g> the pointer is captured on. */
+  function applySelectionClasses() {
+    if (!view.nodeEls.size) { requestDraw(); return; }
+    for (const [id, el] of view.nodeEls) el.classList.toggle('selected', view.selection.has(id));
+    for (const [id, holder] of view.linkEls) {
+      for (const path of holder.querySelectorAll('.mp-link')) {
+        path.classList.toggle('selected', view.selectedLinkId === id);
+      }
+    }
+  }
+
+  /* The rubber band is one rect that lives for as long as the scene does,
+     moved in place — it used to be appended by draw(), so dragging a
+     selection box rebuilt the entire map on every pointermove. */
+  function drawRubber() {
+    const el = view.rubberEl;
+    if (!el) { requestDraw(); return; }
+    if (!view.rubber) { el.style.display = 'none'; return; }
+    const { x0, y0, x1, y1 } = view.rubber;
+    el.setAttribute('x', Math.min(x0, x1));
+    el.setAttribute('y', Math.min(y0, y1));
+    el.setAttribute('width', Math.abs(x1 - x0));
+    el.setAttribute('height', Math.abs(y1 - y0));
+    el.style.display = '';
+  }
+
   function draw() {
     const svg = App.el('mp-svg');
     const canvas = App.el('mp-canvas');
     canvas.dataset.mapStyle = currentMapStyle();
     svg.innerHTML = '';
+    view.sceneGroup = null;
+    view.rubberEl = null;
+    view.nodeEls = new Map();
+    view.linkEls = new Map();
     const box = canvas.getBoundingClientRect();
     const width = Math.max(box.width, 200), height = Math.max(box.height, 200);
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
@@ -1008,17 +1180,21 @@
     group.append(gridLayer, linkLayer, nodeLayer);
     svg.appendChild(group);
     if (shouldDrawGrid() && bounds) drawGrid(gridLayer, bounds);
-    for (const link of view.links) drawLink(linkLayer, link);
-    for (const node of view.nodes) drawNode(nodeLayer, node);
-
-    if (view.rubber) {
-      const x = Math.min(view.rubber.x0, view.rubber.x1), y = Math.min(view.rubber.y0, view.rubber.y1);
-      const w = Math.abs(view.rubber.x1 - view.rubber.x0), h = Math.abs(view.rubber.y1 - view.rubber.y0);
-      group.appendChild(App.svgNode('rect', { class: 'mp-rubber', x, y, width: w, height: h }));
+    // Each link into its own <g>: redrawDragged empties and refills just
+    // the groups whose endpoints moved.
+    for (const link of view.links) {
+      const holder = App.svgNode('g');
+      linkLayer.appendChild(holder);
+      view.linkEls.set(link.id, holder);
+      drawLink(holder, link);
     }
+    for (const node of view.nodes) view.nodeEls.set(node.id, drawNode(nodeLayer, node));
 
-    const { tx, ty } = translation(view.zoom);
-    group.setAttribute('transform', `translate(${tx},${ty}) scale(${view.zoom})`);
+    view.rubberEl = App.svgNode('rect', { class: 'mp-rubber' });
+    group.appendChild(view.rubberEl);
+    view.sceneGroup = group;
+    drawRubber();
+    applyTransform();
     canvas.tabIndex = 0;
     // 'img', not 'application': the same role netpath.js's own route canvas
     // carries, for the same reason — 'application' turns off the screen
@@ -1070,14 +1246,17 @@
   function setSelection(ids) {
     view.selection = ids;
     view.selectedLinkId = null;
-    draw();
+    requestDraw();
     drawDetail();
   }
 
   function selectLink(id) {
     view.selectedLinkId = id;
     view.selection.clear();
-    draw();
+    // Each link opens on its capped VLAN list; "Show all" is a decision
+    // about the link being read, not a mode the pane stays in.
+    view.detailShowAllVlans = false;
+    requestDraw();
     drawDetail();
   }
 
@@ -1089,6 +1268,8 @@
       if (!link) { view.selectedLinkId = null; return drawDetail(); }
       nameEl.textContent = 'LINK';
       detail.innerHTML = linkDetailHtml(link);
+      const showAll = detail.querySelector('[data-show-all-vlans]');
+      if (showAll) showAll.onclick = () => { view.detailShowAllVlans = true; drawDetail(); };
       return;
     }
     if (view.selection.size === 1) {
@@ -1110,7 +1291,7 @@
           // the next full loadMapData().
           node.label = label;
           node.name = label || node.resolved_name;
-          draw();
+          requestDraw();
           drawDetail();
         } catch (error) {
           App.toast(`Could not rename: ${error.message}`, 'fail');
@@ -1126,7 +1307,7 @@
         try {
           await App.put(`/api/mapper/maps/${view.mapId}/nodes`, { updates: [{ id: node.id, role }] });
           node.role = role;
-          draw();
+          requestDraw();
         } catch (error) {
           App.toast(`Could not change role: ${error.message}`, 'fail');
           roleSelect.value = node.role || '';
@@ -1257,11 +1438,19 @@
     if (plan.known === false) {
       lines.push('No VLAN data known for this link — neither end answered a VLAN MIB.');
     } else {
-      lines.push(`VLANs (${(plan.vlans || []).length})`, '-'.repeat(30));
-      for (const vlan of plan.vlans || []) {
-        const summary = view.vlans.find((v) => v.vlan === vlan);
-        lines.push(`${vlan}${summary && summary.name ? `  ${escape(summary.name)}` : ''}` +
+      const vlans = plan.vlans || [];
+      const all = view.detailShowAllVlans || vlans.length <= VLAN_DETAIL_CAP;
+      lines.push(`VLANs (${vlans.length})`, '-'.repeat(30));
+      for (const vlan of all ? vlans : vlans.slice(0, VLAN_DETAIL_CAP)) {
+        const name = view.vlanNameById.get(vlan);
+        lines.push(`${vlan}${name ? `  ${escape(name)}` : ''}` +
           `${link.native_vlan === vlan ? '  (native)' : ''}`);
+      }
+      if (!all) {
+        // The list is behind a button rather than truncated outright: a
+        // 200-VLAN trunk pushed Last seen — and every link below it — off
+        // the bottom of a pane the operator cannot resize.
+        lines.push(`<button data-show-all-vlans>Show all ${vlans.length}</button>`);
       }
     }
     lines.push('', `Last seen   ${escape(App.ago(link.seen_ts))}`);
@@ -1304,10 +1493,11 @@
     const move = (moveEvent) => {
       if (!view.nodeDrag) return;
       const now = scenePoint(moveEvent);
+      if (!now) return;
       view.nodeDrag.dx = now.x - view.nodeDrag.start.x;
       view.nodeDrag.dy = now.y - view.nodeDrag.start.y;
       if (Math.hypot(view.nodeDrag.dx, view.nodeDrag.dy) > 2) view.nodeDrag.moved = true;
-      draw();
+      redrawDragged();
     };
     const up = () => {
       event.currentTarget.removeEventListener('pointermove', move);
@@ -1324,14 +1514,16 @@
         }
       }
       view.nodeDrag = null;
-      draw();
+      // A full redraw once, at the end: the dropped positions are the ones
+      // every link, label and bound is now measured from.
+      requestDraw();
       drawDetail();
     };
-    const cancel = () => { view.nodeDrag = null; draw(); };
+    const cancel = () => { view.nodeDrag = null; requestDraw(); };
     event.currentTarget.addEventListener('pointermove', move);
     event.currentTarget.addEventListener('pointerup', up);
     event.currentTarget.addEventListener('pointercancel', cancel);
-    draw();
+    applySelectionClasses();
     drawDetail();
   }
 
@@ -1402,14 +1594,14 @@
       App.hideTooltip();
       if (Math.abs(dx) + Math.abs(dy) > 3) { view.dragMoved = true; view.userZoom = true; }
       view.pan = { x: view.panDrag.pan.x + dx, y: view.panDrag.pan.y + dy };
-      draw();
+      applyTransform();
       return;
     }
     if (view.rubber) {
       const p = scenePoint(event);
       if (!p) return;
       view.rubber.x1 = p.x; view.rubber.y1 = p.y;
-      draw();
+      drawRubber();
     }
   }
 
@@ -1427,7 +1619,7 @@
         const next = additive ? new Set(view.selection) : new Set();
         for (const id of hit) next.add(id);
         setSelection(next);
-      } else draw();
+      } else drawRubber();
     }
   }
 
@@ -1447,22 +1639,27 @@
     view.pan.y = py - sceneY * to - (f.height / 2 - f.cy * to);
     view.zoom = to;
     view.userZoom = true;
-    draw();
+    applyTransform();
   }
 
   function zoomBy(factor) {
     view.zoom = Math.min(Math.max(view.zoom * factor, 0.1), 5);
     view.userZoom = true;
-    draw();
+    applyTransform();
   }
 
   function onCanvasKeyDown(event) {
     if (event.target !== App.el('mp-canvas')) return;   // a node/link handles its own Enter/Space
     const panStep = 40 / view.zoom;
-    if (event.key === 'ArrowLeft') { view.pan.x += panStep; view.userZoom = true; event.preventDefault(); draw(); }
-    else if (event.key === 'ArrowRight') { view.pan.x -= panStep; view.userZoom = true; event.preventDefault(); draw(); }
-    else if (event.key === 'ArrowUp') { view.pan.y += panStep; view.userZoom = true; event.preventDefault(); draw(); }
-    else if (event.key === 'ArrowDown') { view.pan.y -= panStep; view.userZoom = true; event.preventDefault(); draw(); }
+    const pan = (dx, dy) => {
+      view.pan.x += dx; view.pan.y += dy; view.userZoom = true;
+      event.preventDefault();
+      applyTransform();
+    };
+    if (event.key === 'ArrowLeft') pan(panStep, 0);
+    else if (event.key === 'ArrowRight') pan(-panStep, 0);
+    else if (event.key === 'ArrowUp') pan(0, panStep);
+    else if (event.key === 'ArrowDown') pan(0, -panStep);
     else if (event.key === '+' || event.key === '=') { event.preventDefault(); zoomBy(1.2); }
     else if (event.key === '-') { event.preventDefault(); zoomBy(1 / 1.2); }
   }
@@ -1530,7 +1727,7 @@
     for (const [n, x, y] of updates) { n.x = x; n.y = y; queuePositionWrite(n.id, { x, y }); }
     if (view.writeTimer) clearTimeout(view.writeTimer);
     flushPositionWrites();
-    draw();
+    requestDraw();
   }
 
   /* --------------------------------------------------------- toolbar state */
@@ -1583,7 +1780,7 @@
       tr.onclick = (event) => {
         if (event.target.closest('[data-vlan-swatch]')) return;
         view.selectedVlan = view.selectedVlan === row.vlan ? null : row.vlan;
-        draw();
+        requestDraw();
         drawVlanTable();
       };
     }, 'No VLAN data has been seen on this map yet.');
@@ -1726,7 +1923,15 @@
       const computed = getComputedStyle(liveEls[i]);
       for (const prop of props) {
         const value = computed.getPropertyValue(prop);
-        if (value) cloneEls[i].style.setProperty(prop, value);
+        // A paint SERVER reference (the grid's fill="url(#mp-grid-pattern)")
+        // is the one computed value that must not be copied: the browser
+        // reports it absolutised against this page's URL, which resolves to
+        // nothing inside a detached copy loaded as an image. The clone's own
+        // attribute already carries the same-document "#id" form, and the
+        // pattern itself is in the serialised tree, so leaving it alone is
+        // what keeps the grid in the PNG.
+        if (!value || value.startsWith('url(')) continue;
+        cloneEls[i].style.setProperty(prop, value);
       }
     }
   }
@@ -1850,7 +2055,13 @@
     App.el('mp-add-neighbours').onclick = openAddNeighbours;
     App.el('mp-remove-node').onclick = removeSelected;
     App.el('mp-align').onclick = alignDialog;
-    App.el('mp-fit').onclick = () => { view.userZoom = false; draw(); };
+    // Fit recomputes the frame from what is on screen now, then moves the
+    // scene into it: nothing about the drawing itself changes.
+    App.el('mp-fit').onclick = () => {
+      const box = App.el('mp-canvas').getBoundingClientRect();
+      fitView(contentBounds(), Math.max(box.width, 200), Math.max(box.height, 200));
+      applyTransform();
+    };
     App.el('mp-zoom-in').onclick = () => zoomBy(1.25);
     App.el('mp-zoom-out').onclick = () => zoomBy(1 / 1.25);
     App.el('mp-export-png').onclick = exportPng;
@@ -1858,11 +2069,11 @@
     App.el('mp-snap').onchange = async (event) => {
       await App.post('/api/settings', { scope: 'mapper', values: { snap_to_grid: event.target.checked } });
       view.settings.snap_to_grid = event.target.checked;
-      draw();
+      requestDraw();
     };
 
     for (const eventName of ['resize', 'panes-resized']) {
-      window.addEventListener(eventName, () => { if (App.state.tab === 'mapper') draw(); });
+      window.addEventListener(eventName, () => { if (App.state.tab === 'mapper') requestDraw(); });
     }
   }
 
@@ -1884,7 +2095,9 @@
   }
 
   App.pages.mapper = {
-    init, refresh, activate,
-    fastTick: () => { fastTick(); drawLegend(); },
+    // fastTick runs every beat and drawLegend rewrote the same sentence
+    // into the DOM each time. The legend only changes when the map's data
+    // does, so loadMapData() and activate() are the two places that draw it.
+    init, refresh, activate, fastTick,
   };
 })();

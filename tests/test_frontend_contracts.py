@@ -669,7 +669,8 @@ MAPPER = read("mapper.js")
 DRAW_LINK = MAPPER[MAPPER.index("function drawLink("):MAPPER.index("function drawPortLabels(")]
 check("i === 0" in DRAW_LINK,
       "drawLink's strands branch still singles out the first strand as the one Tab stop")
-check("ariaLabel: linkAriaLabel(link)" in DRAW_LINK and "tooltip: linkTooltip(link)" in DRAW_LINK,
+check("ariaLabel: linkAriaLabel(link)" in DRAW_LINK
+      and "tooltip: () => linkTooltip(link)" in DRAW_LINK,
       "the focusable strand (i === 0) is wired to the WHOLE-LINK label/tooltip, "
       "not a per-strand one — a keyboard user's one Tab stop must say every VLAN "
       "and both ends, the same as a collapsed link's single stop already does")
@@ -809,6 +810,62 @@ check("page.refreshing = true" in _REFRESH_NOW and "page.refreshing = false" in 
 #      view.frame.width there was a TypeError on every pointermove.
 check("if (!view.frame) return null;" in MAPPER,
       "scenePoint() returns null rather than reading a frame that does not exist yet")
+
+# 29d. Every gesture used to rebuild the whole scene synchronously inside
+#      its own event — a pointermove fires faster than a frame, so a drag
+#      on a 60-node map redrew it a few hundred times a second. Draws are
+#      rAF-coalesced now, and the gestures that change only WHERE the scene
+#      sits move one <g> instead of rebuilding it.
+check("requestAnimationFrame" in MAPPER,
+      "mapper.js coalesces its redraws through requestAnimationFrame")
+check("function applyTransform()" in MAPPER and "function redrawDragged()" in MAPPER
+      and "function drawRubber()" in MAPPER,
+      "pan/zoom, a node drag and the rubber band each have their own partial "
+      "redraw rather than going through the full draw()")
+_ON_WHEEL = MAPPER[MAPPER.index("  function onSvgWheel("):MAPPER.index("  function zoomBy(")]
+check("applyTransform();" in _ON_WHEEL and "draw();" not in _ON_WHEEL,
+      "a wheel zoom moves the scene group and does not rebuild the scene")
+_DRAW_GRID = MAPPER[MAPPER.index("  function drawGrid("):MAPPER.index("  function vlanDisplay(")]
+check("patternUnits: 'userSpaceOnUse'" in _DRAW_GRID and "'line'" not in _DRAW_GRID,
+      "the grid is one tiled <pattern> and one rect, not one <line> per grid step")
+check(".mp-grid { pointer-events: none; }" in APP_CSS,
+      "the grid rect covers the whole drawing, so it must not take pointer events "
+      "from the nodes and links underneath it")
+_INLINE = MAPPER[MAPPER.index("function inlineComputedColors("):
+                 MAPPER.index("function exportPng(")]
+check("value.startsWith('url(')" in _INLINE,
+      "exportPng leaves a url(#pattern) paint reference alone — the browser reports "
+      "it absolutised against this page, which resolves to nothing in the detached "
+      "copy the PNG is rendered from, so inlining it would drop the grid")
+_PAGES = MAPPER[MAPPER.index("    init, refresh, activate"):]
+check("drawLegend" not in _PAGES,
+      "the mapper page registration no longer redraws the legend on every fast tick")
+_NEIGHBOUR_ROWS = MAPPER[MAPPER.index("    function redrawNeighbourRows()"):
+                         MAPPER.index("    redrawNeighbourRows();")]
+check("App.grid(" in _NEIGHBOUR_ROWS,
+      "redrawNeighbourRows calls App.grid the way drawVlanTable does, so re-sorting "
+      "the Add-neighbours dialog replaces its rows instead of appending a second copy")
+
+# 29e. A 200-VLAN trunk listed all 200 in a tooltip that follows the
+#      pointer and cannot be scrolled, and all 200 in the detail pane
+#      above Last seen. Both are capped, and the pane says how to see the
+#      rest.
+check("VLAN_TOOLTIP_CAP" in MAPPER and "VLAN_DETAIL_CAP" in MAPPER,
+      "the hover text and the detail pane each cap how many VLANs they name")
+_LINK_DETAIL = MAPPER[MAPPER.index("  function linkDetailHtml("):
+                      MAPPER.index("  /* -------------------------------------------------------- pointer input */")]
+check("data-show-all-vlans" in _LINK_DETAIL,
+      "linkDetailHtml offers the rest of a capped VLAN list behind a button")
+_DRAW_DETAIL = MAPPER[MAPPER.index("  function drawDetail()"):
+                      MAPPER.index("  function roleSelectHtml(")]
+check("data-show-all-vlans" in _DRAW_DETAIL,
+      "drawDetail wires that button — the pane owns its own innerHTML, so it is the "
+      "only place that can")
+_TOOLTIP_RULE = APP_CSS[APP_CSS.index(".tooltip {"):APP_CSS.index(".tooltip {") + 900]
+check("overflow-wrap" in _TOOLTIP_RULE and "max-height" in _TOOLTIP_RULE
+      and "white-space: pre-wrap" in _TOOLTIP_RULE,
+      ".tooltip wraps a long line and caps its own height, so a wide VLAN list "
+      "cannot run off the side or past the bottom of a box nothing can scroll")
 
 print()
 if failures:

@@ -2927,14 +2927,28 @@ def get_nodes_mac_search(service, params, body) -> dict:
                 service.nodes_settings.get("mac_table_retention_days", 7))}
 
 
-def _neighbor_local_port_labeler(service):
+def _neighbor_local_port_labeler(service, prefetch_ids=None):
     """A (device_id, if_index) -> label closure for LLDP/CDP rows, backed by
     one interfaces() read per device it is actually asked about rather than
     the whole fleet's — a neighbours read only ever touches the handful of
     devices that reported a neighbour, not the thousands that did not.
     Falls back to "if <N>" for a port whose interface row has not been
-    polled yet (or was deleted since), which is still a legible label."""
+    polled yet (or was deleted since), which is still a legible label.
+
+    `prefetch_ids` is for a caller that already knows the whole set — a
+    map GET knows every device it places before it draws one — so the
+    cache fills in one bounded, four-column read instead of one SELECT *
+    per device as each first neighbour row arrives."""
     cache: dict[int, dict[int, str]] = {}
+    if prefetch_ids:
+        # Seeded empty first: a prefetched device with no interface rows at
+        # all must read as "asked and answered nothing", or the closure
+        # would fall through and query it again, once per neighbour row.
+        for device_id in prefetch_ids:
+            cache.setdefault(int(device_id), {})
+        for row in service.nodes_db.interface_port_labels_for_devices(prefetch_ids):
+            cache.setdefault(row["device_id"], {})[row["if_index"]] = (
+                row["descr"] or row["alias"] or "")
 
     def label(device_id, if_index):
         if if_index is None:
@@ -2942,7 +2956,7 @@ def _neighbor_local_port_labeler(service):
         ports = cache.get(device_id)
         if ports is None:
             ports = {i["if_index"]: (i["descr"] or i["alias"] or "")
-                     for i in service.nodes_db.interfaces(device_id)}
+                     for i in service.nodes_db.interface_port_labels(device_id)}
             cache[device_id] = ports
         return ports.get(if_index) or f"if {if_index}"
     return label
@@ -6786,27 +6800,28 @@ def get_mapper_map(service, params, body, map_id) -> dict:
     badge_cpu = bool(settings.get("badge_cpu"))
     badge_ports = bool(settings.get("badge_ports"))
 
-    # One fleet-wide query per badge kind actually switched on (mirrors the
-    # alert engine's own metrics_for_keys use for the same reason: a
-    # per-device metrics() read here would be one query per node on the map
-    # instead of at most two for the whole map), keyed by device_id so
-    # building each node below is a dict lookup, not a query.
+    # One query for every badge kind switched on, bounded to the devices
+    # this map places -- metrics_for_devices, not the fleet-wide
+    # metrics_for_keys the alert engine (which really does evaluate every
+    # device) reads. Keyed by device_id so building each node below is a
+    # dict lookup, not a query.
     temp_by_device: dict = {}
     cpu_by_device: dict = {}
     metric_keys = [key for key, on in
                    (("temp_chassis_c", badge_temp), ("cpu_pct", badge_cpu)) if on]
     if metric_keys:
-        for row in service.nodes_db.metrics_for_keys(metric_keys):
+        for row in service.nodes_db.metrics_for_devices(device_ids, metric_keys):
             target = temp_by_device if row["key"] == "temp_chassis_c" else cpu_by_device
             target[row["device_id"]] = row["last_value"]
-    # Ports has no fleet-wide accessor to mirror metrics_for_keys with (see
-    # this route's report for why), so it costs one interfaces() call per
-    # device actually on the map -- never per link, never per the fleet --
-    # and only when the badge is switched on at all.
+    # One grouped COUNT for the whole map rather than an interfaces() row
+    # read per placed device, and only when the badge is switched on at all.
+    # Defaulted to 0 rather than left absent: a placed device with no
+    # interface rows drew "0p" before this change and still does.
     port_count_by_device: dict = {}
     if badge_ports:
-        for device_id in device_ids:
-            port_count_by_device[device_id] = len(service.nodes_db.interfaces(device_id))
+        counted = service.nodes_db.interface_counts(device_ids)
+        port_count_by_device = {device_id: counted.get(device_id, 0)
+                                for device_id in device_ids}
 
     now = time.time()
     stale_hours = float(settings.get("stale_link_hours", 24.0))
@@ -6815,7 +6830,10 @@ def get_mapper_map(service, params, body, map_id) -> dict:
         service, device_ids, now=now, stale_after_s=stale_after_s)
     vlan_ports = _mapper_vlan_ports(
         service, device_ids, now=now, stale_after_s=stale_after_s)
-    port_label = _neighbor_local_port_labeler(service)
+    # Prefetched: every port label this map can possibly need belongs to a
+    # device it places, and they are known here, so one read serves them
+    # all instead of one per device as assemble_links walks the rows.
+    port_label = _neighbor_local_port_labeler(service, prefetch_ids=device_ids)
     placed_device_ids = set(device_ids)
     placed_peer_keys = {row["peer_key"] for row in node_rows if row["peer_key"]}
 
@@ -6996,12 +7014,19 @@ def get_mapper_map_candidates(service, params, body, map_id) -> dict:
     placed_device_ids = {row["device_id"] for row in node_rows if row["device_id"] is not None}
     placed_peer_keys = {row["peer_key"] for row in node_rows if row["peer_key"]}
 
+    # device_summaries(), not devices(): this list is a name, an address, a
+    # status and a vendor per row, and devices() is SELECT * -- forty
+    # columns including sysDescr and the vendor-evidence text -- for every
+    # device in the fleet.
     devices = [
         {"id": d["id"], "name": namelookup.device_name(d), "ip": d["ip"],
          "status": d["status"], "vendor": d["vendor"]}
-        for d in service.nodes_db.devices() if d["id"] not in placed_device_ids]
+        for d in service.nodes_db.device_summaries() if d["id"] not in placed_device_ids]
 
-    port_label = _neighbor_local_port_labeler(service)
+    # Only a PLACED device's own ports are ever labelled below (the loop
+    # skips every row whose device_id is not placed), so the prefetch set
+    # is exactly right.
+    port_label = _neighbor_local_port_labeler(service, prefetch_ids=placed_device_ids)
     seen_devices: set = set()
     seen_peers: set = set()
     neighbours = []

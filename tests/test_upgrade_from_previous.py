@@ -343,6 +343,60 @@ check("an account holding write on every older module still earns ssh",
       ssh_db.permissions_for("sysadmin"))
 ssh_db.close()
 
+# ------------------- part 6: 5.0.0's nodes.db index changes on a 4.54 file
+# The neighbour match's two case-insensitive joins were LOWER() on both
+# sides, which is an expression and so cannot use any index: every map GET
+# and every neighbours read folded every row of `devices` (twice) and
+# `interfaces` (once) per neighbour row. They are collated comparisons now,
+# against two NOCASE indexes _migrate creates -- and _migrate drops three
+# older indexes that only ever duplicated the leading column of their own
+# table's PRIMARY KEY. A 4.54 file is where both have to be proved: a fresh
+# one never had the duplicates, and gets the new indexes from the same
+# _migrate on its first open.
+indexes = os.path.join(work, "indexes")
+os.makedirs(indexes, exist_ok=True)
+idx_path = os.path.join(indexes, "nodes.db")
+NodesDatabase(idx_path).close()
+conn = sqlite3.connect(idx_path)
+conn.executescript("""
+    DROP INDEX IF EXISTS ix_devices_sys_name_nocase;
+    DROP INDEX IF EXISTS ix_interfaces_phys_addr_nocase;
+    CREATE INDEX IF NOT EXISTS ix_vlans_device ON vlans(device_id);
+    CREATE INDEX IF NOT EXISTS ix_vlan_ports_device ON vlan_ports(device_id);
+    CREATE INDEX IF NOT EXISTS ix_port_vlans_device ON port_vlans(device_id);
+""")
+conn.commit()
+before = {r[0] for r in conn.execute(
+    "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'ix_%'")}
+conn.close()
+check("the fixture really is the 4.54 index shape",
+      "ix_vlans_device" in before and "ix_devices_sys_name_nocase" not in before, before)
+
+idx_db = NodesDatabase(idx_path)
+after = {r["name"] for r in idx_db._conn.execute(
+    "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'ix_%'").fetchall()}
+check("...and the migration adds the two NOCASE indexes the neighbour match needs",
+      {"ix_devices_sys_name_nocase", "ix_interfaces_phys_addr_nocase"} <= after, after)
+check("...and drops the three that duplicated a PRIMARY KEY's leading column",
+      not ({"ix_vlans_device", "ix_vlan_ports_device", "ix_port_vlans_device"} & after),
+      after)
+# The SQL comes from the class, not a copy: a copy would go on passing
+# after the real one changed, which is the one thing this exists to catch.
+plan = " ".join(str(r[-1]) for r in idx_db._conn.execute(
+    "EXPLAIN QUERY PLAN " + NodesDatabase._NEIGHBOR_MATCH_SQL).fetchall())
+check("...and the neighbour match is served by them, not by a scan per row",
+      "ix_devices_sys_name_nocase" in plan and "ix_interfaces_phys_addr_nocase" in plan,
+      plan)
+check("...and the sysName join's other half still uses the index it always had",
+      "ix_devices_name_ip" in plan, plan)
+idx_db.close()
+
+reopened = NodesDatabase(idx_path)
+again = {r["name"] for r in reopened._conn.execute(
+    "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'ix_%'").fetchall()}
+check("reopening an already-migrated database changes nothing", again == after, again)
+reopened.close()
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 sys.exit(1 if FAILS else 0)

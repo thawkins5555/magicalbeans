@@ -516,6 +516,59 @@ try:
     check("vlan_ports_for_devices([]) returns [] without touching the database",
           service.nodes_db.vlan_ports_for_devices([]) == [])
 
+    # 5.0.0's four: the map GET's badges and port labels were the last
+    # fleet-wide (or per-device-per-query) reads left in the route.
+    # metrics_for_keys reads every enabled device in the fleet, which is
+    # right for the alert engine and wrong here; interfaces() was called
+    # once per placed device just to count its ports; the port labeler
+    # pulled SELECT * per device as each first neighbour row reached it;
+    # and the candidates list called devices() -- SELECT * for the whole
+    # fleet -- for four columns per row.
+    _metric_now = time.time()
+    service.nodes_db.record_metric_samples(
+        dev_c, [("cpu_pct", "CPU", "%", "gauge", _metric_now, 42.0)])
+    service.nodes_db.record_metric_samples(
+        dev_a, [("cpu_pct", "CPU", "%", "gauge", _metric_now, 7.0)])
+    bounded_metrics = service.nodes_db.metrics_for_devices([dev_a, dev_b], ["cpu_pct"])
+    check("metrics_for_devices for two devices excludes a third device's own rows",
+          bool(bounded_metrics)
+          and all(r["device_id"] != dev_c for r in bounded_metrics), bounded_metrics)
+    check("...but does include it once that third device is actually asked for",
+          any(r["device_id"] == dev_c for r in
+              service.nodes_db.metrics_for_devices([dev_a, dev_b, dev_c], ["cpu_pct"])))
+    check("...and asks for nothing it was not given a key for",
+          service.nodes_db.metrics_for_devices([dev_a], ["temp_chassis_c"]) == [])
+    check("metrics_for_devices([], keys) and (ids, []) both return [] "
+          "without touching the database",
+          service.nodes_db.metrics_for_devices([], ["cpu_pct"]) == []
+          and service.nodes_db.metrics_for_devices([dev_a], []) == [])
+
+    counts = service.nodes_db.interface_counts([dev_a, dev_b])
+    check("interface_counts is one grouped read for the devices asked about",
+          dev_c not in counts
+          and counts.get(dev_a) == len(service.nodes_db.interfaces(dev_a)), counts)
+    check("interface_counts([]) returns {} without touching the database",
+          service.nodes_db.interface_counts([]) == {})
+
+    labels = service.nodes_db.interface_port_labels_for_devices([dev_a, dev_b])
+    check("interface_port_labels_for_devices returns the four label columns, bounded",
+          bool(labels) and all(r["device_id"] != dev_c for r in labels)
+          and set(labels[0].keys()) == {"device_id", "if_index", "descr", "alias"},
+          [dict(r) for r in labels[:2]])
+    check("...and its single-device form agrees with it",
+          [dict(r) for r in service.nodes_db.interface_port_labels(dev_a)]
+          == [dict(r) for r in labels if r["device_id"] == dev_a])
+    check("interface_port_labels_for_devices([]) returns [] without touching the database",
+          service.nodes_db.interface_port_labels_for_devices([]) == [])
+
+    summaries = service.nodes_db.device_summaries()
+    check("device_summaries returns every device, but only the seven columns "
+          "a picker needs",
+          len(summaries) == len(service.nodes_db.devices())
+          and set(summaries[0].keys()) == {"id", "name", "ip", "status", "vendor",
+                                           "sys_name", "display_name_source"},
+          [dict(r) for r in summaries[:1]])
+
     # Second, through the route: disable EVERY fleet-wide nodesdb accessor
     # (every "all_*" method -- the naming convention this codebase's
     # fleet-wide readers all share, see nodesdb.all_neighbours/
@@ -526,6 +579,19 @@ try:
     # _mapper_vlans_json) go uncaught last round.
     all_fleet_wide = [name for name in dir(service.nodes_db)
                       if name.startswith("all_") and callable(getattr(service.nodes_db, name))]
+    # The four named alongside them are not all_*-shaped but are just as
+    # unbounded from a map's point of view: devices() and
+    # metrics_for_keys() read the whole fleet, and interfaces()/metrics()
+    # are per-device reads a route must not make once per placed node.
+    # Both badges are switched ON for this, since a badge is what used to
+    # reach for the first two.
+    status, _ = call("POST", "/api/settings",
+                     {"scope": "mapper",
+                      "values": {"badge_temp": True, "badge_cpu": True, "badge_ports": True}},
+                     token=admin)
+    check("the three badges can be switched on for the bounded-read check",
+          status == 200, status)
+    all_fleet_wide += ["devices", "metrics_for_keys", "interfaces", "metrics"]
     check("at least one fleet-wide accessor exists to guard against",
           len(all_fleet_wide) >= 1, all_fleet_wide)
 
@@ -536,14 +602,25 @@ try:
         setattr(service.nodes_db, name, _boom)
     try:
         status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
-        check("a map GET never calls any fleet-wide (all_*) nodesdb accessor",
+        check("a map GET never calls any fleet-wide (all_*) nodesdb accessor, nor "
+              "devices()/metrics_for_keys()/interfaces()/metrics()",
               status == 200, (status, payload))
+        check("...and it still draws the badges those reads used to fetch",
+              status == 200 and any(n.get("cpu_pct") is not None
+                                    for n in payload.get("nodes", [])), payload)
         status, payload = call("GET", f"/api/mapper/maps/{map_id}/candidates", token=admin)
         check("...and neither does its candidates route",
               status == 200, (status, payload))
+        check("...which still lists the devices not on this map",
+              status == 200 and any(d["id"] == dev_c for d in payload.get("devices", [])),
+              payload)
     finally:
         for name, orig in originals.items():
             setattr(service.nodes_db, name, orig)
+    call("POST", "/api/settings",
+         {"scope": "mapper",
+          "values": {"badge_temp": False, "badge_cpu": False, "badge_ports": False}},
+         token=admin)
 
     # -------------------------------------------- 14b. VLAN naming + vlan_ports (Finding 4)
     #
