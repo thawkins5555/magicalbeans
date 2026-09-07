@@ -405,13 +405,20 @@ def _restore_meta(db_path: str, previous: dict) -> None:
     from .appdb import write_meta
 
     for key, value in previous.items():
-        for attempt in range(3):
+        for attempt in range(10):
             try:
                 write_meta(db_path, key, value or "")
                 break
             except Exception as exc:
                 _log_restart(f"restoring {key!r} (try {attempt + 1}): {exc}")
-                time.sleep(0.2)
+                time.sleep(0.5)
+        else:
+            _log_restart(
+                f"GAVE UP restoring {key!r} after 10 tries. app.db still "
+                f"names the version that failed to install, so Update will "
+                f"report 'Already up to date' while the previous code is "
+                f"what is actually running. Press Update again after a "
+                f"restart, or fix the marker by hand.")
 
 
 def apply(app_db, report=None, before_quiesce=None) -> dict:

@@ -4915,12 +4915,17 @@ const App = (() => {
       applySessionIdle(payload.session);
       const who = document.getElementById('whoami');
       if (who) who.textContent = payload.session.username;
-      // Carries a theme saved from another browser to this one: harmless
-      // once the two agree, since the check below then does nothing.
+      // Carries a theme saved from another browser to this one. Only on the
+      // first sight of a given value, and never while the Account dialog is
+      // open: loadState() runs every 2 s, and re-applying the saved theme on
+      // every poll snapped a live preview back within two seconds.
       const sessionTheme = payload.session.theme;
-      if (sessionTheme && THEMES.includes(sessionTheme) && sessionTheme !== currentTheme()) {
-        setTheme(sessionTheme);
+      if (sessionTheme && THEMES.includes(sessionTheme)
+          && sessionTheme !== state.sessionTheme
+          && !document.getElementById('am-theme')) {
+        if (sessionTheme !== currentTheme()) setTheme(sessionTheme);
       }
+      state.sessionTheme = sessionTheme;
       // Forced, this dialog is the one thing standing between a fresh
       // install's default admin/admin and every other control in the
       // application, so it must not depend on anything lazy loading can

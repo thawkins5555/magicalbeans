@@ -3266,22 +3266,26 @@ def post_nodes_upstream_suggestions_apply(service, params, body) -> dict:
 
 
 def _duplicate_conflict(service, ip: str) -> Conflict | None:
-    """The refusal for an address some device already answers on — its own
-    primary IP, or an alias learned from its ipAddrTable. The second case
-    is what makes this a 409 rather than the old flat 400: adding a
-    router's second address as a second device is the mistake this
-    release exists to stop, and it is also occasionally exactly what an
-    operator means, which is why the payload names the device and the
-    caller may say `force`."""
-    device = service.nodes_db.device_by_ip(ip)
-    reason = f"{ip} is already a device"
+    """The refusal for an address some device already answers on as an alias
+    learned from its ipAddrTable. That is what makes this a 409 rather than
+    a flat 400: adding a router's second address as a second device is the
+    mistake this release exists to stop, and it is also occasionally exactly
+    what an operator means, which is why the payload names the device and
+    the caller may say `force`.
+
+    A collision with a device's own primary IP is not offered as "Add
+    anyway": the insert has a UNIQUE index behind it and would fail however
+    hard the operator pressed, so it raises a plain 400 here instead of a
+    409 whose only outcome was a second, blunter refusal.
+    """
+    if service.nodes_db.device_by_ip(ip):
+        raise ValueError(f"{ip} is already a device")
+    owner = service.nodes_db.device_id_for_address(ip)
+    device = service.nodes_db.device(owner) if owner else None
     if device is None:
-        owner = service.nodes_db.device_id_for_address(ip)
-        device = service.nodes_db.device(owner) if owner else None
-        if device is None:
-            return None
-        reason = (f"{ip} is another address of "
-                  f"{_device_display_name(device)} ({device['ip']})")
+        return None
+    reason = (f"{ip} is another address of "
+              f"{_device_display_name(device)} ({device['ip']})")
     return Conflict(reason, {"duplicate_of": {
         "device_id": device["id"], "device_name": _device_display_name(device),
         "device_ip": device["ip"], "reason": reason}})
@@ -3292,8 +3296,6 @@ def post_nodes_device(service, params, body) -> dict:
     conflict = _duplicate_conflict(service, ip)
     if conflict is not None and not body.get("force"):
         raise conflict
-    if service.nodes_db.device_by_ip(ip):
-        raise ValueError(f"{ip} is already a device")
     group_id = body.get("group_id")
     device_group_id = body.get("device_group_id")
     _check_display_name_source(body)

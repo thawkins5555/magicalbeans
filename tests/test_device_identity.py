@@ -220,6 +220,13 @@ try:
                          {"ip": "10.8.8.8", "force": True}, token=admin)
     check("force still cannot create two devices on one primary address",
           status == 400, (status, again))
+    # A primary-IP collision is never "Add anyway": the UNIQUE index behind
+    # the insert refuses it either way, so a 409 only bought a second, less
+    # informative refusal one click later.
+    status, plain = call("POST", "/api/nodes/devices",
+                         {"ip": "10.8.8.8"}, token=admin)
+    check("...and without force it is the same plain 400, not a 409",
+          status == 400 and "duplicate_of" not in plain, (status, plain))
 
     # --------------------------------------------------- 7. bulk import
     print("7. bulk import puts an alias-owned row in its duplicate disposition")

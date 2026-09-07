@@ -1181,6 +1181,7 @@ class NodePoller(Worker):
         """
         job = self.db.discovery_job(job_id)
         allow_ping_only = bool(job and job["allow_ping_only"])
+        family = self._folded_family(job_id)
         device_ids = []
         seen_results = set()
         for raw_id in result_ids:
@@ -1212,7 +1213,7 @@ class NodePoller(Worker):
             if existing is not None:
                 self.db.record_device_addresses(
                     existing["id"], addresses, "discovery")
-                self._mark_promoted_family(job_id, result_id, existing["id"])
+                self._mark_promoted_family(result_id, existing["id"], family)
                 device_ids.append(existing["id"])
                 continue
             group_id = result["suggested_group_id"]
@@ -1252,21 +1253,31 @@ class NodePoller(Worker):
                     vendor_evidence=(result["vendor_evidence"]
                                      if "vendor_evidence" in keys else None))
             self.db.record_device_addresses(device_id, addresses, "discovery")
-            self._mark_promoted_family(job_id, result_id, device_id)
+            self._mark_promoted_family(result_id, device_id, family)
             device_ids.append(device_id)
         return device_ids
 
-    def _mark_promoted_family(self, job_id: int, result_id: int,
-                              device_id: int) -> None:
+    def _folded_family(self, job_id: int) -> dict[int, list[int]]:
+        """`{primary result id: [ids folded into it]}` for one sweep, read
+        once per promote() rather than once per promoted row — a promote-all
+        over a large job used to re-read the whole results table per tick."""
+        family: dict[int, list[int]] = {}
+        for row in self.db.discovery_results(job_id):
+            if "folded_into_result_id" not in row.keys():
+                break
+            primary = row["folded_into_result_id"]
+            if primary and not row["promoted_device_id"]:
+                family.setdefault(primary, []).append(row["id"])
+        return family
+
+    def _mark_promoted_family(self, result_id: int, device_id: int,
+                              family: dict[int, list[int]]) -> None:
         """Mark the promoted row and every row this sweep folded into it,
         so the results table shows all of that device's addresses as
         already added rather than only the one that was ticked."""
         self.db.mark_promoted(result_id, device_id)
-        for row in self.db.discovery_results(job_id):
-            if "folded_into_result_id" not in row.keys():
-                break
-            if row["folded_into_result_id"] == result_id and not row["promoted_device_id"]:
-                self.db.mark_promoted(row["id"], device_id)
+        for folded_id in family.get(result_id, ()):
+            self.db.mark_promoted(folded_id, device_id)
 
     # ------------------------------------------------------------------ loop
 
@@ -2494,7 +2505,11 @@ class NodePoller(Worker):
             for suffix, value in extra.items():
                 if value is None or value == "":
                     continue
-                address = str(rows.get(suffix) or suffix)
+                # record_device_addresses looks the details up by the folded
+                # form, so the key has to be folded here too.
+                address = nodesdb.alias_candidate(rows.get(suffix) or suffix)
+                if not address:
+                    continue
                 try:
                     entry = int(value) if key == "if_index" else str(value)
                 except (TypeError, ValueError):

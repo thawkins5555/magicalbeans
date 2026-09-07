@@ -1003,29 +1003,6 @@ class NodesDatabase(SqliteStore):
 
     # --------------------------------------------------------------- settings
 
-    def _private_setting(self, key: str, default=None):
-        """A settings row this module keeps for itself. Not in DEFAULTS, so
-        settings() never returns it and save_settings() cannot be made to
-        overwrite it from the settings dialog — it is bookkeeping, not a
-        preference."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-        if row is None:
-            return default
-        try:
-            return json.loads(row["value"])
-        except (ValueError, TypeError):
-            return default
-
-    def _set_private_setting(self, key: str, value) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO settings(key, value) VALUES (?,?)"
-                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, json.dumps(value)))
-            self._conn.commit()
-
     def save_settings(self, values: dict) -> None:
         super().save_settings(values)
         with self._lock:
@@ -1597,7 +1574,6 @@ class NodesDatabase(SqliteStore):
             self._config_generation += 1
 
     def bulk_update_devices(self, device_ids: list[int], **fields) -> None:
-        # (see _id_chunks below for why the id list is split)
         """The same field allow-list as update_device, applied to many rows
         in one statement/transaction rather than one round trip per
         device — the shape post_nodes_discovery_promote's device_ids list
@@ -3829,7 +3805,11 @@ class NodesDatabase(SqliteStore):
         if not self._table_exists("settings"):
             return                      # a brand-new file: nothing to migrate
         self._split_state = self._private_setting(self._SPLIT_STATE, "") or ""
-        if self._split_state == "done" or not self._table_exists("metrics"):
+        # "rollups" means phase 1 is already behind us: re-running it would
+        # resurrect MIB files deleted since and overwrite the split-hour
+        # rollup with a summary of samples that are no longer the truth.
+        if self._split_state in ("rollups", "done") \
+                or not self._table_exists("metrics"):
             return
         started = time.monotonic()
         here, there = self.series_db.import_legacy_metrics(self.path)
@@ -3939,13 +3919,13 @@ class NodesDatabase(SqliteStore):
             log.info("nodes: split paused after %d rollup rows; resumes on "
                      "the next start", copied)
             return
-        self._finish_split(min_hour)
+        self._finish_split(min_hour, stop=stop)
         if log_add is not None:
             log_add(f"Nodes: moved {copied:,} hourly rollup rows into "
                     f"nodes_series.db and reclaimed nodes.db "
                     f"({time.monotonic() - started:.0f} s)")
 
-    def _finish_split(self, min_hour: float | None = None) -> None:
+    def _finish_split(self, min_hour: float | None = None, *, stop=None) -> None:
         """Phase 3: verify, drop the legacy tables, reclaim."""
         missing = self.series_db.legacy_rollups_missing(self.path, min_hour)
         if missing:
@@ -3975,6 +3955,11 @@ class NodesDatabase(SqliteStore):
         self._split_state = "done"
         deadline = time.monotonic() + 120.0
         while time.monotonic() < deadline:
+            # Shutdown joins this thread for 10 s and then closes the
+            # database under it; the reclaim is resumable, so stopping here
+            # costs nothing but the pages not yet given back.
+            if stop is not None and stop.is_set():
+                break
             if not reclaim(self._conn, self._lock, pages=2000, budget_s=2.0,
                            label="nodes"):
                 break

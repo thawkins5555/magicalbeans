@@ -114,6 +114,11 @@ check("THEME_KEY = 'sappiwhere.theme'" in app and "function setTheme(" in app,
 check('id="am-theme"' in app and "am-theme" in app,
       "Appearance moved to the Account dialog and app.js wires it")
 check("/api/account/theme" in app, "the Account dialog saves the theme to the server")
+# loadState() runs every 2 s; without both guards the saved session theme was
+# re-applied on every poll and snapped a live preview back mid-choice.
+check("sessionTheme !== state.sessionTheme" in app
+      and "!document.getElementById('am-theme')" in app,
+      "the session theme is applied on change only, never over an open preview")
 check('r"^/api/account/theme$", api.put_account_theme' in read_server(),
       "server.py routes the theme save")
 check('id="open-account-appearance"' in index and "open-account-appearance" in read("settings.js"),

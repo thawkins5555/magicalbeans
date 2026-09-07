@@ -296,6 +296,7 @@
      flight. Silent for an account that may not read the status. */
   async function resumeUpdateIfRunning() {
     if (updatePolling) return;
+    if (!App.canRead('admin')) return;   // the status endpoint is admin-only
     let job;
     try {
       job = await App.get('/api/update/status');

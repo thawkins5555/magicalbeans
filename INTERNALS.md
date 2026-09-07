@@ -1549,16 +1549,22 @@ fold — never erases what the poller's fuller walk learned) and
 `promote(job_id, result_ids, force=False)` resolves a folded result to
 its primary first (ticking either row adds the one device), and `force`
 skips the fold for the operator who has looked at the pair and says they
-really are two boxes.
+really are two boxes. The approval dialog never passes `force` — folding
+is the whole point of the review it presents; "Add anyway" is offered by
+**Add device** alone, where the operator typed the address themselves.
 
 **Manual add and bulk import.** `api.Conflict(ValueError)` carries a
 `payload`; `server.py`'s arm for it sits **before** the `ValueError` arm
 and answers 409 with that payload merged into the body. `POST
-/api/nodes/devices` raises it when the address belongs to a device
-already — naming that device, so the browser can offer "Add anyway"
-(`force: true`) rather than only printing a refusal. Bulk import puts the
-same case in its existing `duplicate` disposition with `device_id` and
-`device_name`, and a body-level `force: true` imports them.
+/api/nodes/devices` raises it when the address is another device's
+learned **alias** — naming that device, so the browser can offer "Add
+anyway" (`force: true`) rather than only printing a refusal. A collision
+with a device's own primary IP is a plain 400 with or without `force`:
+the UNIQUE index behind the insert would refuse it however hard the
+button was pressed, so offering "Add anyway" only bought a second
+refusal. Bulk import puts the same case in its existing `duplicate`
+disposition with `device_id` and `device_name`, and a body-level
+`force: true` imports them.
 
 **Finding duplicates already on file.** `duplicate_candidates(limit)`
 runs three self-joins and merges them per pair:

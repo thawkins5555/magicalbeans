@@ -627,8 +627,8 @@ class NodesSeriesDatabase(SqliteStore):
         copied = 0
         floor = 0.0 if min_hour is None else float(min_hour)
         size = LEGACY_BATCH if batch is None else int(batch)
-        with self._lock, self._attached(legacy_path) as conn:
-            if end is None:
+        if end is None:
+            with self._lock, self._attached(legacy_path) as conn:
                 row = conn.execute(
                     "SELECT MAX(rowid) FROM old.samples_hourly").fetchone()
                 end = int(row[0] or 0)
@@ -637,11 +637,15 @@ class NodesSeriesDatabase(SqliteStore):
                     " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (_LEGACY_END, json.dumps(end)))
                 conn.commit()
-            while low < end:
-                if stop is not None and stop.is_set():
-                    break
-                upper = min(low + size, end)
-                started = time.monotonic()
+        while low < end:
+            if stop is not None and stop.is_set():
+                break
+            upper = min(low + size, end)
+            started = time.monotonic()
+            # The lock and the ATTACH are per batch, not around the whole
+            # loop: phase 2 runs for minutes on a large file, and polling,
+            # charts and alerting all want this same connection meanwhile.
+            with self._lock, self._attached(legacy_path) as conn:
                 cursor = conn.execute(
                     "INSERT OR IGNORE INTO main.samples_hourly"
                     "(metric_id, hour, n, vmin, vavg, vmax)"
@@ -657,14 +661,14 @@ class NodesSeriesDatabase(SqliteStore):
                     " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (_LEGACY_ROWID, json.dumps(upper)))
                 conn.commit()
-                held = time.monotonic() - started
-                low = upper
-                # Same adaptive shape as SqliteStore._delete_batches: keep one
-                # batch's lock hold near the target however wide the rows are.
-                if held > LEGACY_LOCK_TARGET_S:
-                    size = max(LEGACY_BATCH_MIN, size // 2)
-                elif held < LEGACY_LOCK_TARGET_S / 4:
-                    size = min(LEGACY_BATCH_MAX, size * 2)
+            held = time.monotonic() - started
+            low = upper
+            # Same adaptive shape as SqliteStore._delete_batches: keep one
+            # batch's lock hold near the target however wide the rows are.
+            if held > LEGACY_LOCK_TARGET_S:
+                size = max(LEGACY_BATCH_MIN, size // 2)
+            elif held < LEGACY_LOCK_TARGET_S / 4:
+                size = min(LEGACY_BATCH_MAX, size * 2)
         return copied
 
     def legacy_rollups_missing(self, legacy_path: str,

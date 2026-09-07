@@ -9,6 +9,7 @@ reclaims the file.
 """
 import os
 import sqlite3
+import threading
 import time
 
 from _paths import tmpdir
@@ -328,6 +329,80 @@ check("phase 3's retry copies what the cursor skipped",
       and db.series_db._conn.execute(
           "SELECT COUNT(*) FROM samples_hourly").fetchone()[0] == 147,
       db.series_db._conn.execute("SELECT COUNT(*) FROM samples_hourly").fetchone()[0])
+db.close()
+
+# ------------------------------------ phase 2 lets the rest of the app in
+lock_dir = tmpdir("nodes_split_lock_")
+lock_path = os.path.join(lock_dir, "nodes.db")
+_, probe_device, _ = build_legacy(lock_path)
+db = NodesDatabase(lock_path)
+series = db.series_db
+probe_free = []
+probe_latency = []
+
+
+def probe_series_lock():
+    got = series._lock.acquire(timeout=2.0)
+    if got:
+        series._lock.release()
+    probe_free.append(got)
+    started = time.monotonic()
+    series.metrics(probe_device)
+    probe_latency.append(time.monotonic() - started)
+
+
+class ProbeBetweenBatches:
+    """`stop` is consulted once per batch, which makes it the hook for
+    asking — from another thread, mid-import — whether phase 2 is sitting on
+    the store lock. It used to hold it for the whole import, which stalled
+    polling, charts and alerting until the last row landed."""
+
+    def __init__(self):
+        self.batches = 0
+
+    def is_set(self):
+        self.batches += 1
+        if self.batches <= 3:
+            thread = threading.Thread(target=probe_series_lock)
+            thread.start()
+            thread.join(timeout=5.0)
+        return False
+
+
+series._set_private_setting("legacy_rollup_rowid", 0)
+series._set_private_setting("legacy_rollup_end", None)
+copied = series.import_legacy_rollups(lock_path, batch=20,
+                                      stop=ProbeBetweenBatches())
+check("phase 2 releases the store lock between batches",
+      len(probe_free) >= 3 and all(probe_free), probe_free)
+check("...so a concurrent chart read answers promptly throughout",
+      bool(probe_latency) and max(probe_latency) < 1.0, probe_latency)
+check("...and the import still copied every row", copied == 144, copied)
+db.close()
+
+# ------------------------------- a restart mid-phase-2 does not redo phase 1
+rerun_dir = tmpdir("nodes_split_rerun_")
+rerun_path = os.path.join(rerun_dir, "nodes.db")
+build_legacy(rerun_path)
+db = NodesDatabase(rerun_path)
+check("the rerun fixture is parked at 'rollups'",
+      db._private_setting("split_state") == "rollups")
+db.remove_mib_file(5)
+split_hour = NOW_HOUR - HOUR
+db.series_db._conn.execute(
+    "DELETE FROM samples_hourly WHERE hour = ? AND metric_id = 103",
+    (split_hour,))
+db.series_db._conn.commit()
+db.close()
+
+db = NodesDatabase(rerun_path)
+check("a MIB deleted during phase 2 is not resurrected by a restart",
+      db.mib_file(5) is None)
+split_rows = db.series_db._conn.execute(
+    "SELECT COUNT(*) FROM samples_hourly WHERE hour = ?",
+    (split_hour,)).fetchone()[0]
+check("...and the split-hour rollup is left as the new store has it",
+      split_rows == 2, split_rows)
 db.close()
 
 print()
