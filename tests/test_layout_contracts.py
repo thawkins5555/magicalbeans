@@ -51,7 +51,7 @@ check("innerWidth < 900" in app and "'narrow'" in app,
 
 # --------------------------------------------------------------------------
 # 2. Pointer events, captured. No drag starts on mousedown anywhere.
-DRAG_FILES = ["app.js", "netpath.js", "netflow.js"]
+DRAG_FILES = ["app.js", "netpath.js", "netflow.js", "mapper.js"]
 for name in DRAG_FILES:
     body = read(name)
     starts = [line for line in body.splitlines()
@@ -66,7 +66,9 @@ check(app.count("setPointerCapture") >= 2, "app.js captures the pointer for divi
 check(read("netpath.js").count("setPointerCapture") >= 2,
       "netpath.js captures the pointer for the route pan and the timeline brush")
 check(read("netflow.js").count("setPointerCapture") >= 1, "netflow.js captures the pointer for its brush")
-for selector in (".divider {", "th .grip {"):
+check(read("mapper.js").count("setPointerCapture") >= 3,
+      "mapper.js captures the pointer for a node drag, the pan and the rubber band")
+for selector in (".divider {", "th .grip {", "#mp-canvas {"):
     block = css.split(selector)[1].split("}")[0]
     check("touch-action: none" in block, "%s touch-action: none" % selector.strip(" {"))
 check("#route-svg, .brush svg { touch-action: none; }" in css,

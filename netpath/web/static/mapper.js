@@ -34,6 +34,9 @@
   const WRITE_DEBOUNCE_MS = 500;
   // A failed write is retried rather than dropped — see flushPositionWrites.
   const WRITE_RETRY_MS = 5000;
+  // How far the pointer travels, in SCREEN pixels, before a press on a node
+  // counts as a drag rather than a click.
+  const MOVE_THRESHOLD_PX = 3;
 
   // mapperdb.MAP_STYLES, mirrored so the settings dialog's <select> and the
   // canvas's data-map-style attribute never drift from the server's own list.
@@ -93,9 +96,13 @@
     selectedVlan: null,      // vlan id highlighted from the VLAN table
     detailShowAllVlans: false,   // the open link's VLAN list, past VLAN_DETAIL_CAP
 
-    zoom: 1, userZoom: false, pan: { x: 0, y: 0 }, frame: null,
+    // userZoom records that the operator moved the view themselves (wheel,
+    // pan, zoom buttons, arrow keys); needsFit is what draw() reads — a map
+    // is fitted once, when it is opened or when Fit is pressed, never again
+    // under an operator who has since arranged it.
+    zoom: 1, userZoom: false, needsFit: true, pan: { x: 0, y: 0 }, frame: null,
     panDrag: null, dragMoved: false, spaceHeld: false,
-    nodeDrag: null,          // {ids, start:{x,y}, from:Map(id->{x,y}), moved}
+    nodeDrag: null,          // {ids, from:Map(id->{x,y}), dx, dy, moved}
     rubber: null,            // {x0,y0,x1,y1, additive}
 
     pendingPositions: new Map(),   // node id -> {x,y}, awaiting the debounced PUT
@@ -212,6 +219,14 @@
     const pending = view.pendingPositions.get(node.id);
     if (pending) return { x: pending.x, y: pending.y };
     return { x: node.x, y: node.y };
+  }
+
+  // A node drag, a rubber band or a pan is a gesture the operator is in the
+  // middle of; anything that would redraw the scene under it (a refresh, a
+  // pane resize) waits, which is the promise FEATURES.md makes for MAPPER's
+  // auto-refresh.
+  function gestureActive() {
+    return !!(view.nodeDrag || view.rubber || view.panDrag);
   }
 
   function snapValue(v) {
@@ -338,6 +353,7 @@
     if (select.value !== String(id ?? '')) select.value = String(id ?? '');
     if (!opts.keepView) {
       view.userZoom = false;
+      view.needsFit = true;
       view.pan = { x: 0, y: 0 };
       view.selection.clear();
       view.selectedLinkId = null;
@@ -460,6 +476,12 @@
     view.peersByKey = new Map((payload.peers || []).map((p) => [p.peer_key, p]));
     view.vlans = payload.vlans || [];
     rebuildLookups();
+    // refresh() is guarded against loading mid-drag, so this only catches an
+    // explicit reload (a settings save, a colour change) that landed during
+    // one: the drag holds ids and positions from the payload being replaced,
+    // so it ends here rather than dropping nodes at stale coordinates. The
+    // listeners come off on the release that follows, which still fires.
+    if (view.nodeDrag) view.nodeDrag = null;
     if (payload.settings) view.settings = payload.settings;
     // A selection or a highlighted link that no longer exists on the fresh
     // payload (removed elsewhere) is dropped rather than left pointing at
@@ -1041,6 +1063,7 @@
       view.frame = { width, height, cx: 0, cy: 0 };
     }
     view.userZoom = false;
+    view.needsFit = false;
   }
 
   function translation(scale) {
@@ -1121,9 +1144,6 @@
     view.rubberEl = null;
     view.nodeEls = new Map();
     view.linkEls = new Map();
-    const box = canvas.getBoundingClientRect();
-    const width = Math.max(box.width, 200), height = Math.max(box.height, 200);
-    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
 
     if (!view.mapId) {
       return emptyCanvas(svg, canvas, 'No map selected. Use Maps to create or pick one.');
@@ -1134,10 +1154,21 @@
     }
     showCanvas(svg, canvas);
 
-    // Size is re-read every draw (the pane is resizable); centre/zoom are
-    // the operator's own view once set, so only a first draw or Fit resets them.
+    // The SVG, not its wrapper: scenePoint, the pan and the wheel zoom all
+    // measure #mp-svg, and #mp-canvas's own border made the two boxes differ
+    // by a pixel in each axis — enough for a press to land beside the point
+    // it was aimed at. Measured after showCanvas, since a canvas coming back
+    // from the empty state is display:none until then.
+    const box = svg.getBoundingClientRect();
+    const width = Math.max(box.width, 200), height = Math.max(box.height, 200);
+    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+
+    // Size is re-read every draw (the pane is resizable); centre and zoom are
+    // the operator's own arrangement, so only opening a map (selectMap) or
+    // Fit itself re-fits — a refresh, a resize or a badge change must not
+    // throw away where they put things.
     const bounds = contentBounds();
-    if (!view.frame || !view.userZoom) fitView(bounds, width, height);
+    if (!view.frame || view.needsFit) fitView(bounds, width, height);
     else { view.frame.width = width; view.frame.height = height; }
     const group = App.svgNode('g');
     const gridLayer = App.svgNode('g');
@@ -1439,7 +1470,14 @@
     if (event.button !== 0 || !event.isPrimary || view.spaceHeld) return;
     event.preventDefault();
     event.stopPropagation();
-    event.currentTarget.setPointerCapture(event.pointerId);
+    // Captured ONCE, into the closures below. `event.currentTarget` is null
+    // the moment dispatch of this pointerdown finishes (the DOM spec sets it
+    // per dispatch), so the listeners this function leaves behind — which run
+    // on later events — used to throw a TypeError on the release: `up` never
+    // reached its removeEventListener calls, the pointermove listener stayed
+    // attached and view.nodeDrag stayed set, so every subsequent hover over
+    // the map dragged the node the operator had merely clicked.
+    const target = event.currentTarget;
     if (event.shiftKey) {
       const next = new Set(view.selection);
       if (next.has(node.id)) next.delete(node.id); else next.add(node.id);
@@ -1449,43 +1487,68 @@
       view.selection = new Set([node.id]);
     }
     view.selectedLinkId = null;
+    // No frame yet (a press landing before the first paint) means no scene to
+    // move within: this press selects and starts nothing.
+    if (!scenePoint(event)) { applySelectionClasses(); drawDetail(); return; }
+    target.setPointerCapture(event.pointerId);
     const from = new Map();
     for (const id of view.selection) { const n = nodeById(id); if (n) from.set(id, { x: n.x, y: n.y }); }
-    view.nodeDrag = { ids: [...view.selection], from, dx: 0, dy: 0, start: scenePoint(event), moved: false };
+    // The frame is frozen for the whole gesture: scene units per screen pixel
+    // are read once, at the press. A re-fit, a pane resize or a zoom arriving
+    // between press and release would otherwise scale the tail of the drag
+    // differently from its head and jump the node out from under the pointer.
+    const rect = App.el('mp-svg').getBoundingClientRect();
+    const perPixelX = (view.frame.width / Math.max(rect.width, 1)) / view.zoom;
+    const perPixelY = (view.frame.height / Math.max(rect.height, 1)) / view.zoom;
+    const startClient = { x: event.clientX, y: event.clientY };
+    view.nodeDrag = { ids: [...view.selection], from, dx: 0, dy: 0, moved: false };
     App.hideTooltip();
     const move = (moveEvent) => {
       if (!view.nodeDrag) return;
-      const now = scenePoint(moveEvent);
-      if (!now) return;
-      view.nodeDrag.dx = now.x - view.nodeDrag.start.x;
-      view.nodeDrag.dy = now.y - view.nodeDrag.start.y;
-      if (Math.hypot(view.nodeDrag.dx, view.nodeDrag.dy) > 2) view.nodeDrag.moved = true;
+      const cdx = moveEvent.clientX - startClient.x, cdy = moveEvent.clientY - startClient.y;
+      // Screen pixels, not scene units: MOVE_THRESHOLD_PX of pointer travel
+      // means the same thing to a hand at every zoom, where a scene-unit
+      // threshold was a third of a pixel zoomed out and a centimetre zoomed in.
+      if (!view.nodeDrag.moved) {
+        if (Math.hypot(cdx, cdy) <= MOVE_THRESHOLD_PX) return;
+        view.nodeDrag.moved = true;
+      }
+      view.nodeDrag.dx = cdx * perPixelX;
+      view.nodeDrag.dy = cdy * perPixelY;
       redrawDragged();
     };
+    const detach = () => {
+      target.removeEventListener('pointermove', move);
+      target.removeEventListener('pointerup', up);
+      target.removeEventListener('pointercancel', cancel);
+    };
     const up = () => {
-      event.currentTarget.removeEventListener('pointermove', move);
-      event.currentTarget.removeEventListener('pointerup', up);
-      event.currentTarget.removeEventListener('pointercancel', cancel);
-      if (view.nodeDrag && view.nodeDrag.moved) {
-        const snap = !!view.settings.snap_to_grid;
-        for (const [id, base] of view.nodeDrag.from) {
-          let x = base.x + view.nodeDrag.dx, y = base.y + view.nodeDrag.dy;
-          if (snap) { x = snapValue(x); y = snapValue(y); }
-          const n = nodeById(id);
-          if (n) { n.x = x; n.y = y; }
-          queuePositionWrite(id, { x, y });
+      try {
+        if (view.nodeDrag && view.nodeDrag.moved) {
+          const snap = !!view.settings.snap_to_grid;
+          for (const [id, base] of view.nodeDrag.from) {
+            let x = base.x + view.nodeDrag.dx, y = base.y + view.nodeDrag.dy;
+            if (snap) { x = snapValue(x); y = snapValue(y); }
+            const n = nodeById(id);
+            if (n) { n.x = x; n.y = y; }
+            queuePositionWrite(id, { x, y });
+          }
         }
+      } finally {
+        // Whatever the body did, the gesture is over: the listeners come off
+        // and the drag state clears, or the next hover inherits both.
+        detach();
+        view.nodeDrag = null;
       }
-      view.nodeDrag = null;
       // A full redraw once, at the end: the dropped positions are the ones
       // every link, label and bound is now measured from.
       requestDraw();
       drawDetail();
     };
-    const cancel = () => { view.nodeDrag = null; requestDraw(); };
-    event.currentTarget.addEventListener('pointermove', move);
-    event.currentTarget.addEventListener('pointerup', up);
-    event.currentTarget.addEventListener('pointercancel', cancel);
+    const cancel = () => { detach(); view.nodeDrag = null; requestDraw(); };
+    target.addEventListener('pointermove', move);
+    target.addEventListener('pointerup', up);
+    target.addEventListener('pointercancel', cancel);
     applySelectionClasses();
     drawDetail();
   }
@@ -1937,6 +2000,7 @@
 
   async function refresh() {
     if (App.state.tab !== 'mapper') return;
+    if (gestureActive()) return;
     if (!view.maps.length) await loadMapsList();
     if (view.mapId === null) {
       // First time this browser has opened MAPPER (or nothing remembered
@@ -2016,7 +2080,7 @@
     // Recomputes the frame from what's on screen, then moves the scene —
     // nothing about the drawing itself changes.
     App.el('mp-fit').onclick = () => {
-      const box = App.el('mp-canvas').getBoundingClientRect();
+      const box = App.el('mp-svg').getBoundingClientRect();
       fitView(contentBounds(), Math.max(box.width, 200), Math.max(box.height, 200));
       applyTransform();
     };
@@ -2031,7 +2095,9 @@
     };
 
     for (const eventName of ['resize', 'panes-resized']) {
-      window.addEventListener(eventName, () => { if (App.state.tab === 'mapper') requestDraw(); });
+      window.addEventListener(eventName, () => {
+        if (App.state.tab === 'mapper' && !gestureActive()) requestDraw();
+      });
     }
   }
 

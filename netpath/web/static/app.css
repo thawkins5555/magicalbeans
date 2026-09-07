@@ -1670,11 +1670,10 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
    drag here — a node, the rubber-band, a pan — is Pointer Events with
    setPointerCapture, never mousedown/mouseup, and a browser left free to
    scroll or pinch-zoom the page out from under a captured pointer defeats
-   that capture as surely as never taking it. Not enforced by
-   tests/test_layout_contracts.py the way #route-svg/.brush svg's touch-action is (that
-   test's Pointer Events checks cover mapper.js's drag code generically, not this
-   selector by name) — this comment is what pins the requirement here, so removing the
-   rule below would not be caught by that test the way it would be for the route canvas. */
+   that capture as surely as never taking it. Pinned by name in
+   tests/test_layout_contracts.py (5.0.1), which also runs mapper.js through that
+   test's DRAG_FILES checks — exactly the footing #route-svg/.brush svg's own
+   touch-action has always had. */
 #mp-canvas {
   display: flex;
   flex-direction: column;

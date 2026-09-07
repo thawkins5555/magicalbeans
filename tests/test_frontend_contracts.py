@@ -934,6 +934,106 @@ for _tab, _button_id in _pane_ids:
           "#%s is write-gated on '%s' in index.html, which is the gate the "
           "Settings entry mirrors" % (_button_id, _tab))
 
+
+# ---------------------------------------------------------------------------
+# 34. MAPPER (5.0.1): a click on a node stops moving it, and nothing redraws
+#     the canvas out from under a gesture.
+#
+# 34a. `event.currentTarget` is null once the event that carried it has
+#      finished dispatching. onNodePointerDown's `up`/`cancel` closures read
+#      it on the release — a TypeError every single time — so `up` never
+#      reached its removeEventListener calls: the pointermove listener stayed
+#      attached to the node's own <g> and view.nodeDrag was never cleared, and
+#      from then on every hover over the map dragged the node the operator had
+#      only clicked. The element is captured once, at the press, and the
+#      teardown runs in a `finally` so a throw in the write path cannot leave
+#      the listeners or the drag state behind either.
+_NODE_DRAG = MAPPER[MAPPER.index("  function onNodePointerDown("):
+                    MAPPER.index("  function queuePositionWrite(")]
+check("const target = event.currentTarget" in _NODE_DRAG,
+      "onNodePointerDown captures the node's element once, into the closures it "
+      "leaves behind, instead of reading event.currentTarget after dispatch")
+check("event.currentTarget.removeEventListener" not in _NODE_DRAG
+      and "event.currentTarget.addEventListener" not in _NODE_DRAG,
+      "no listener is added to or removed from event.currentTarget, which is null "
+      "by the time the drag's own pointermove/pointerup/pointercancel run")
+check(_NODE_DRAG.count("target.removeEventListener") == 3
+      and _NODE_DRAG.count("target.addEventListener") == 3,
+      "all three listeners the press adds are removed again — by the release and "
+      "by a cancel alike (a pointercancel that left them on is the same leak)")
+check("} finally {" in _NODE_DRAG
+      and _NODE_DRAG.index("} finally {") < _NODE_DRAG.index("view.nodeDrag = null"),
+      "the release detaches and clears view.nodeDrag in a finally, so a failed "
+      "position write cannot leave the map dragging a node nobody is holding")
+check("if (!scenePoint(event)) {" in _NODE_DRAG,
+      "a press with no scene to move within (no frame yet) selects and starts no "
+      "drag, rather than recording a null origin it would subtract from later")
+
+# 34b. The move threshold was 2 SCENE units: at zoom 0.2 that is under half a
+#      pixel of pointer travel, so a click registered as a drag and wrote a
+#      new position; at zoom 5 it took a centimetre to start one. It is
+#      screen pixels now, and the scene units per pixel are read once at the
+#      press so a re-fit or a resize mid-gesture cannot rescale the drag
+#      under the pointer.
+check("const MOVE_THRESHOLD_PX" in MAPPER,
+      "the drag threshold is named in screen pixels")
+check("MOVE_THRESHOLD_PX" in _NODE_DRAG and "moveEvent.clientX - startClient.x" in _NODE_DRAG,
+      "the threshold is measured on the client (screen) delta, not on a delta "
+      "already scaled into scene units")
+check("const perPixelX" in _NODE_DRAG and "const perPixelY" in _NODE_DRAG,
+      "the frame is frozen for the gesture: scene units per screen pixel are "
+      "captured at the press")
+
+# 34c. draw() re-fitted on EVERY draw until the operator happened to zoom or
+#      pan (`!view.userZoom`), so an auto-refresh, a pane resize or a badge
+#      appearing threw away an arrangement they had just made. A map is
+#      fitted when it is opened and when Fit is pressed, and not otherwise.
+_DRAW = MAPPER[MAPPER.index("  function draw()"):MAPPER.index("  function emptyCanvas(")]
+check("if (!view.frame || view.needsFit) fitView(" in _DRAW,
+      "draw() fits only a scene with no frame yet or one flagged for a fit, not "
+      "every draw the operator has not yet zoomed away from")
+check("view.needsFit = false;" in MAPPER[MAPPER.index("  function fitView("):
+                                         MAPPER.index("  function translation(")],
+      "fitView clears the flag, so one request means one fit")
+check("view.needsFit = true;" in MAPPER[MAPPER.index("  async function selectMap("):
+                                        MAPPER.index("  function mapForm(")],
+      "opening a map (first load, or a switch from the Map dropdown) is what asks "
+      "for a fit")
+check("App.el('mp-fit').onclick" in MAPPER and "fitView(contentBounds()" in MAPPER,
+      "the Fit button still exists and still re-fits on demand")
+
+# 34d. draw() sized the scene from #mp-canvas while every pointer handler
+#      measured #mp-svg — the canvas's own 1px border made the two boxes
+#      differ in each axis, which lands a press beside the point it was
+#      aimed at. One element answers the question everywhere.
+check("App.el('mp-canvas').getBoundingClientRect()" not in MAPPER,
+      "nothing measures the #mp-canvas wrapper; the scene and every pointer "
+      "handler measure #mp-svg, the element the scene is actually drawn in")
+check(_DRAW.index("showCanvas(svg, canvas);") < _DRAW.index("svg.getBoundingClientRect()"),
+      "draw() measures the SVG after showing it — a canvas coming back from the "
+      "empty state is display:none until showCanvas, and would measure as zero")
+
+# 34e. FEATURES.md promises that dragging a node never triggers a refresh.
+#      refresh() and the resize handlers redrew regardless, which rebuilt the
+#      scene (and the very <g> the pointer was captured on) mid-gesture.
+check("function gestureActive()" in MAPPER,
+      "one predicate answers whether a gesture is in flight (node drag, rubber "
+      "band or pan)")
+_MP_REFRESH = MAPPER[MAPPER.index("  async function refresh()"):
+                     MAPPER.index("  function forceRefresh()")]
+check("gestureActive()" in _MP_REFRESH,
+      "refresh() leaves the canvas alone while the operator is mid-gesture")
+check("view.nodeDrag" in _MP_REFRESH or "gestureActive" in _MP_REFRESH,
+      "refresh()'s guard names the drag state it is protecting")
+_INIT = MAPPER[MAPPER.index("  function init()"):]
+check("'resize', 'panes-resized'" in _INIT and "!gestureActive()" in _INIT,
+      "a window resize or a pane drag redraws only when no gesture is in flight")
+_LOAD_MAP_DATA = MAPPER[MAPPER.index("  async function loadMapData()"):
+                        MAPPER.index("  /* ---------------------------------------------------------- candidates */")]
+check("if (view.nodeDrag) view.nodeDrag = null;" in _LOAD_MAP_DATA,
+      "a payload that does land mid-drag (an explicit reload) ends the drag "
+      "rather than dropping nodes at coordinates from the payload it replaced")
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))
