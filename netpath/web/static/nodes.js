@@ -1202,12 +1202,24 @@
     }, App.stamp(t1, span)));
   }
 
+  /* The one signal this app has that a port carries a transceiver:
+     interfaces.media, written by the environment poll from the same
+     entity->ifIndex mapping the DOM dialog reads (nodepoll
+     _poll_environment). Prepended to the descr cell rather than given a
+     column of its own so it is visible in the default column set. */
+  function sfpBadge(r) {
+    return r.media === 'optic'
+      ? '<span class="badge badge-sfp" title="SFP / optical transceiver ' +
+        '(DOM sensors present)">SFP</span> '
+      : '';
+  }
+
   const IFACE_COLUMNS = [
     { key: 'if_index', label: '#', width: 55, numeric: true, on: true,
       cell: (r) => r.if_index },
     { key: 'descr', label: 'Descr', width: 170, on: true,
       value: (r) => (r.descr || r.alias || '').toLowerCase(),
-      cell: (r) => escape(r.descr || r.alias || '') },
+      cell: (r) => sfpBadge(r) + escape(r.descr || r.alias || '') },
     { key: 'admin_status', label: 'Admin', width: 80, on: true,
       cell: (r) => escape(r.admin_status || '\u2014') },
     { key: 'oper_status', label: 'Oper', width: 80, on: true,
@@ -1457,6 +1469,30 @@
     const lossTimer = setInterval(() => { loadCharts().catch(() => {}); }, 15000);
     loadCharts().catch(() => {});
 
+    /* The interface list and the DOM read below are two independent
+       fetches, and the DOM one names ports whose stored media column the
+       poll may not have written yet (a device polled before this version,
+       or one inside its sensor cadence window). So whichever lands second
+       paints: the optic set patches the fetched rows in this dialog's own
+       closure — never view.ifaces, which belongs to the selected device. */
+    let dialogIfaces = null;
+    let dialogOptics = null;
+    let dialogSnmpError = '';
+
+    function paintDialogIfaces() {
+      if (!dialogIfaces || !current()) return;
+      if (dialogOptics) {
+        dialogIfaces.forEach((r) => {
+          if (dialogOptics.has(r.if_index)) r.media = 'optic';
+        });
+      }
+      // Opening a port from here replaces this dialog — there is only one
+      // #modal-box — so the port dialog gets a way back to this one.
+      drawIfaceTable(box.querySelector('#ndd-if-table'), dialogIfaces, deviceId,
+        (row) => interfaceDialog(row, deviceId, () => deviceDialog(deviceId)),
+        dialogSnmpError);
+    }
+
     Promise.all([
       App.get(`/api/nodes/devices/${deviceId}`),
       App.get(`/api/nodes/devices/${deviceId}/interfaces`),
@@ -1467,12 +1503,9 @@
       box.querySelector('h2').textContent = displayName(device);
       box.querySelector('#ndd-summary').innerHTML = deviceSummaryHtml(device);
       renderVendorSection(box, device, deviceId, current);
-      // Opening a port from here replaces this dialog — there is only one
-      // #modal-box — so the port dialog gets a way back to this one.
-      drawIfaceTable(box.querySelector('#ndd-if-table'),
-        ifaces.interfaces || [], deviceId,
-        (row) => interfaceDialog(row, deviceId, () => deviceDialog(deviceId)),
-        device.snmp_error);
+      dialogIfaces = ifaces.interfaces || [];
+      dialogSnmpError = device.snmp_error;
+      paintDialogIfaces();
       drawEventTable(box.querySelector('#ndd-ev-table'), events);
     }).catch(() => {
       if (!current()) return;
@@ -1542,6 +1575,8 @@
             `<tr><td>${escape(s.if_name || `port ${s.if_index}`)}</td>` +
             `<td>${escape(s.label)}</td><td>${s.value} ${escape(s.unit)}</td>` +
             `<td>${escape(s.status)}</td></tr>`).join('') + '</tbody></table>';
+        dialogOptics = new Set(rows.map((s) => s.if_index));
+        paintDialogIfaces();
       })
       .catch(() => {
         const holder = box.querySelector('#ndd-dom');

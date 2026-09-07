@@ -1151,6 +1151,31 @@ check("caret.textContent !== glyph" in _APP_SORT,
       "MutationObserver that re-applies a plain table's sort loops on it")
 
 
+# ---------------------------------------------------------------------------
+# 38. NODES (5.1.0): the SFP badge in the interface list. interfaces.media is
+#     the stored signal; the device dialog's own /dom read is the live one,
+#     and it lands independently of the interface fetch, so whichever
+#     arrives second has to paint.
+check("badge badge-sfp" in NODES and "r.media === 'optic'" in NODES,
+      "the SFP badge is driven by the stored media column, not by guessing "
+      "from the port name")
+check(".badge-sfp" in APP_CSS,
+      "app.css styles the SFP badge, or it inherits the amber warning fill "
+      "every other badge uses")
+check("sfpBadge(r) + escape(r.descr" in NODES,
+      "the badge is prepended to the descr cell, so it is visible in the "
+      "default column set rather than behind the column picker")
+_DEV_DIALOG = NODES[NODES.index("  function deviceDialog("):
+                    NODES.index("  /* ------------------------------------------- temperature alert overrides")]
+check("dialogOptics = new Set(" in _DEV_DIALOG
+      and _DEV_DIALOG.count("paintDialogIfaces()") >= 2,
+      "the device dialog's /dom response patches the fetched interface rows "
+      "and repaints, so the badge shows whichever fetch lands second")
+check("view.ifaces =" not in _DEV_DIALOG,
+      "and that patch stays in the dialog's own closure — view.ifaces "
+      "describes the selected device, not the one this dialog opened")
+
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))
