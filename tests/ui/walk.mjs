@@ -913,6 +913,31 @@ async function checkRouting(page, base, dir, tag) {
     return `${forward} -> ${back.hash}`;
   });
 
+  // 5.0.0: a reload of #/mapper/<id> used to leave the canvas empty — the
+  // routed map and the remembered one were loaded against each other.
+  await check('a cold navigation to a map route draws that map', async () => {
+    await selectTab(page, 'mapper');
+    await settle(page, 1500);
+    const mapId = await page.evaluate(
+      () => (document.getElementById('mp-map') || {}).value || '');
+    if (!/^\d+$/.test(mapId)) return 'no map exists on this fleet — nothing to route to';
+    const routed = `#/mapper/${mapId}`;
+    await page.goto(`${base}/${routed}`, { waitUntil: 'domcontentloaded' });
+    await ready(page);
+    await sleep(4000);
+    const state = await page.evaluate(() => ({
+      hash: window.location.hash,
+      tab: App.state.tab,
+      drawn: document.querySelectorAll('#mp-svg g').length,
+      empty: !!document.querySelector('#mp-canvas > .empty'),
+    }));
+    assert(state.tab === 'mapper', `landed on the ${state.tab} tab`);
+    assert(state.hash === routed, `hash became "${state.hash}", was "${routed}"`);
+    assert(state.drawn > 0 || state.empty,
+           'the canvas is neither drawn nor showing its empty state');
+    return `${state.hash} -> ${state.drawn} group(s)`;
+  });
+
   await shoot(page, dir, `route-${tag}`);
 }
 

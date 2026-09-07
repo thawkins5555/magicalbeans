@@ -773,6 +773,42 @@ _STEPS = ["checking", "downloading", "extracting", "installing", "restarting"]
 check(all(("    %s:" % _s) in SETTINGS for _s in _STEPS),
       "every step the job can report has a line of its own for the operator "
       "to read (%s)" % ", ".join(_STEPS))
+# 31. MAPPER (5.0.0): reloading #/mapper/<id> loads that map once, and a
+#     page's refresh() cannot be run twice concurrently.
+#
+# 29a. On a reload, deliverRoute awaits App.refreshNow('mapper') and only
+#      then calls activate(). refresh() picked the REMEMBERED map, so the
+#      routed one arrived as a second load; and because it stamped
+#      view.lastAutoTs only after that first await, the poll tick landing
+#      meanwhile started a third. Two of the three raced each other through
+#      loadMapData's generation guard and the canvas drew whichever lost.
+_REFRESH = MAPPER[MAPPER.index("  async function refresh()"):
+                  MAPPER.index("  function forceRefresh()")]
+check("App.currentRoute()" in MAPPER,
+      "mapper.js reads the route (App.currentRoute) so a reload of "
+      "#/mapper/<id> loads the map the URL names, not the remembered one")
+check("view.lastAutoTs = " in _REFRESH
+      and _REFRESH.index("view.lastAutoTs = ") < _REFRESH.index("selectMap(initial"),
+      "refresh() stamps view.lastAutoTs BEFORE awaiting its first selectMap, so "
+      "the poll tick that lands mid-load does not start a second one")
+check("currentRoute" in APP[APP.index("  const api = {"):],
+      "App exports currentRoute, the accessor mapper.js's refresh() reads")
+
+# 29b. master() has refused to overlap a page's refresh() with itself since
+#      4.49, but it only set the flag on the refreshes it started itself —
+#      a route or tab refresh goes through refreshNow() and was invisible
+#      to that guard.
+_REFRESH_NOW = APP[APP.index("  function refreshNow(name)"):
+                   APP.index("  async function start()")]
+check("page.refreshing = true" in _REFRESH_NOW and "page.refreshing = false" in _REFRESH_NOW,
+      "refreshNow() marks the page as refreshing for the whole call, so master()'s "
+      "own overlap guard covers a route or tab refresh too")
+
+# 29c. A canvas with no frame yet (an empty map, or a pointer reaching the
+#      SVG before the first paint) has no scene coordinates at all; reading
+#      view.frame.width there was a TypeError on every pointermove.
+check("if (!view.frame) return null;" in MAPPER,
+      "scenePoint() returns null rather than reading a frame that does not exist yet")
 
 print()
 if failures:

@@ -5067,18 +5067,31 @@ const App = (() => {
     const page = pages[name || state.tab];
     if (!page || !page.refresh) return Promise.resolve();
     page.lastFetch = Date.now();
+    // master() already refuses to start a second refresh() while one is
+    // running, but only ever set this flag on the refreshes IT started —
+    // so a route or tab refresh (this function) raced the very next poll
+    // tick for the same page. MAPPER reloading on #/mapper/<id> is where
+    // that showed: two overlapping loads for two different maps, the
+    // slower one painting over the newer one.
+    page.refreshing = true;
+    let started;
+    try {
+      started = Promise.resolve(page.refresh());
+    } catch (error) {
+      started = Promise.reject(error);
+    }
     // selectTab and the visibility handler call this without awaiting it, so
     // a refresh that fails during an outage used to surface as an unhandled
     // rejection in the console rather than as the offline banner. The
     // promise still resolves for callers that do await it (the UI walk).
-    return Promise.resolve(page.refresh()).then(
+    return started.then(
       (value) => { connected(true); return value; },
       (error) => {
         if (!(error && error.superseded)) {
           connected(false, String((error && error.message) || error));
         }
         return undefined;
-      });
+      }).then((value) => { page.refreshing = false; return value; });
   }
 
   async function start() {
@@ -5296,7 +5309,7 @@ const App = (() => {
      inside this file is not listed here — it stays where it is, private. */
   const api = {
     state, pages, selectTab, loadState, refreshNow,
-    buildRoute, setRoute,
+    buildRoute, setRoute, currentRoute: parseRoute,
     get, post, put, del, saveCsv, exportCsv, deviceIndex, deviceLink,
     clock, stamp, span, duration, ago, when, timeCell, agoCell, isoLocal,
     emptyText, stackedHistogram, plottedRange, filterBar, filterValues,

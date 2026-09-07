@@ -290,6 +290,17 @@
     App.rememberControl('mapper', 'mp-map', id === null ? '' : String(id));
   }
 
+  // The map id the address bar itself names, or null. refresh() prefers it
+  // over the remembered one so a reload of #/mapper/<id> loads that map
+  // once, instead of loading the remembered map first and having
+  // activate() immediately replace it with a second fetch.
+  function routedMapId() {
+    const route = App.currentRoute();
+    if (!route || route.tab !== 'mapper') return null;
+    const id = Number(route.parts[0]);
+    return Number.isFinite(id) ? id : null;
+  }
+
   function drawStatus() {
     const map = currentMap();
     App.el('mp-status').textContent = map ? map.name : 'No map selected';
@@ -945,11 +956,10 @@
     return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
   }
 
-  function fitView() {
-    const canvas = App.el('mp-canvas');
-    const box = canvas.getBoundingClientRect();
-    const width = Math.max(box.width, 200), height = Math.max(box.height, 200);
-    const bounds = contentBounds();
+  // `bounds` and the frame size come from the caller (draw), which has
+  // already measured both — a second contentBounds()/getBoundingClientRect()
+  // here would walk every node and force a layout for answers it holds.
+  function fitView(bounds, width, height) {
     if (bounds && bounds.width) {
       view.zoom = Math.min(width / (bounds.width + 120), height / (bounds.height + 120), 2);
       view.pan = { x: 0, y: 0 };
@@ -984,8 +994,13 @@
     }
     showCanvas(svg, canvas);
 
-    if (!view.frame || !view.userZoom) fitView();
+    // The frame's SIZE is re-read every draw (the pane is resizable, and a
+    // frame measured before the first paint is 200x200), but its centre and
+    // zoom are the operator's own view once they have panned or zoomed, so
+    // only a first draw or an explicit Fit recomputes those.
     const bounds = contentBounds();
+    if (!view.frame || !view.userZoom) fitView(bounds, width, height);
+    else { view.frame.width = width; view.frame.height = height; }
     const group = App.svgNode('g');
     const gridLayer = App.svgNode('g');
     const linkLayer = App.svgNode('g');
@@ -1255,7 +1270,11 @@
 
   /* -------------------------------------------------------- pointer input */
 
+  // null until draw() has established a frame — an empty map, or a pointer
+  // that reached the canvas before the first paint, has no scene to point at
+  // and reading view.frame.width there is a TypeError, not a coordinate.
   function scenePoint(event) {
+    if (!view.frame) return null;
     const svg = App.el('mp-svg');
     const rect = svg.getBoundingClientRect();
     const px = (event.clientX - rect.left) * (view.frame.width / Math.max(rect.width, 1));
@@ -1366,13 +1385,15 @@
     // before release would start a rubber-band from under a click.
     if (event.target.closest('.mp-node') || event.target.closest('.mp-link')) return;
     // Empty canvas: start a rubber-band multi-select.
+    const p = scenePoint(event);
+    if (!p) return;
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
-    const p = scenePoint(event);
     view.rubber = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, additive: event.shiftKey };
   }
 
   function onSvgPointerMove(event) {
+    if (!view.frame) return;
     if (view.panDrag) {
       const svg = App.el('mp-svg');
       const rect = svg.getBoundingClientRect();
@@ -1386,6 +1407,7 @@
     }
     if (view.rubber) {
       const p = scenePoint(event);
+      if (!p) return;
       view.rubber.x1 = p.x; view.rubber.y1 = p.y;
       draw();
     }
@@ -1764,10 +1786,20 @@
       // one path guaranteed to run before any data is needed either way,
       // and activate() (below) only ever has to act on an id a route
       // actually named.
+      const routed = routedMapId();
       const recalled = recallMapId();
-      const initial = view.maps.find((m) => m.id === recalled) ? recalled
-        : (view.maps.length ? view.maps[0].id : null);
-      if (initial !== null) { await selectMap(initial, { noRoute: true }); return; }
+      const known = (id) => id !== null && view.maps.some((m) => m.id === id);
+      const initial = known(routed) ? routed
+        : (known(recalled) ? recalled : (view.maps.length ? view.maps[0].id : null));
+      if (initial !== null) {
+        // Stamped BEFORE the await, not after it: the poll tick that lands
+        // while this first load is still in flight would otherwise see no
+        // stamp at all, decide a refresh is due, and start a second load of
+        // the same map against the first.
+        view.lastAutoTs = Date.now();
+        await selectMap(initial, { noRoute: true });
+        return;
+      }
     }
     // No key exists for 'mapper' in app.js's rateFor() map (it has no
     // global <module>_refresh_s setting the way every other tab does —
