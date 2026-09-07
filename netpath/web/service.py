@@ -255,10 +255,14 @@ class Service:
         self._stop = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
         self._nodes_split_thread: threading.Thread | None = None
-        # Held for the body of run_maintenance: a forced call (a settings
-        # save, on an HTTP thread) and the periodic timer thread can both be
-        # pruning at once, and shutdown() below must not close a database
-        # out from under either of them.
+        # request_maintenance() sets the first, which is also what the
+        # maintenance thread waits on between ticks, so a request wakes it
+        # at once instead of up to a minute later; the second says the
+        # requested pass has finished.
+        self._maintenance_request = threading.Event()
+        self._maintenance_done = threading.Event()
+        # Held for the body of run_maintenance: shutdown() below must not
+        # close a database out from under a sweep in flight.
         self._maintenance_lock = threading.Lock()
         self.started_at = time.time()
         # Bumped by every write to something /api/config carries. The
@@ -465,15 +469,17 @@ class Service:
 
     def shutdown(self) -> None:
         self._stop.set()
+        # The maintenance thread waits on this, not on _stop, so it has to
+        # be set too or the join below waits out the whole tick.
+        self._maintenance_request.set()
         # Before the databases close: holds an ATTACH on nodes.db.
         if self._nodes_split_thread is not None:
             self._nodes_split_thread.join(timeout=10.0)
             self._nodes_split_thread = None
-        # run_maintenance also runs on an HTTP thread (apply_global_settings
-        # forces one on a settings save), so either it or the timer thread
-        # could still be pruning when the databases close below — join the
-        # timer, then hold the lock run_maintenance holds for the whole
-        # close sequence.
+        # A sweep could still be running when the databases close below —
+        # join the maintenance thread (its body checks _stop between stages
+        # and returns), then hold the lock run_maintenance holds for the
+        # whole close sequence.
         if self._maintenance_thread is not None:
             self._maintenance_thread.join(timeout=10.0)
             self._maintenance_thread = None
@@ -557,7 +563,9 @@ class Service:
         else:
             self.asn_resolver.stop()
         self.log.add(SYSTEM, "Global settings applied")
-        self.run_maintenance(force=True)
+        # Asked for, not run here: this is an HTTP thread, and the sweep it
+        # wants is the whole 13-store prune and trim.
+        self.request_maintenance()
         self.bump_config()
         return self.settings
 
@@ -880,14 +888,30 @@ class Service:
 
     def _maintenance_loop(self) -> None:
         while not self._stop.is_set():
-            self._stop.wait(60)
+            requested = self._maintenance_request.wait(60)
+            self._maintenance_request.clear()
             if self._stop.is_set():
                 break
             try:
-                self.run_maintenance()
+                self.run_maintenance(force=requested)
             except Exception:
                 import traceback
                 traceback.print_exc()
+            finally:
+                if requested:
+                    self._maintenance_done.set()
+
+    def request_maintenance(self) -> None:
+        """Ask for a forced sweep and return.
+
+        A settings save used to call run_maintenance(force=True) inline, so
+        Apply took as long as the whole prune-and-trim sweep of thirteen
+        stores did — up to a minute on a large install, on the HTTP thread.
+        The sweep is real work and still runs; it just runs on the
+        maintenance thread, which this wakes.
+        """
+        self._maintenance_done.clear()
+        self._maintenance_request.set()
 
     _last_maintenance = 0.0
 
@@ -910,14 +934,19 @@ class Service:
         finally:
             self._maintenance_lock.release()
 
+    def _stopping(self) -> bool:
+        """Shutdown is waiting on the lock this sweep holds. The rest of the
+        pass runs at the next start rather than making the stop wait for
+        it."""
+        return self._stop.is_set()
+
     def _run_maintenance_body(self, force: bool = False) -> None:
-        # A forced pass runs on the HTTP thread that asked for it
-        # (apply_global_settings, on every settings save), so netpath.db --
+        # A forced pass is the one a settings save asks for. netpath.db --
         # the only store here with per-hop rows at fleet volume -- gets a
-        # short budget rather than stalling that request while it works down
-        # a backlog. The periodic timer call keeps the full budget; a forced
-        # one still does some retention work, so a burst of settings saves
-        # cannot outrun what retention enforces.
+        # short budget so a burst of saves cannot keep the maintenance
+        # thread working down one backlog. The periodic tick keeps the full
+        # budget; a forced pass still does some retention work, so those
+        # saves cannot outrun what retention enforces either.
         prune_budget = FORCED_PRUNE_BUDGET_S if force else TRIM_BUDGET_S
         self.db.prune(float(self.settings.get("trace_retention_days", 90)),
                       budget_s=prune_budget)
@@ -954,6 +983,9 @@ class Service:
         self._trim_db("max_snmp_db_mb", self.snmp_db, "SNMP trap database",
                       "oldest traps")
 
+        if self._stopping():
+            return
+
         self.wireless_db.prune_ap_events()
 
         removed = self.configrx_db.prune(
@@ -965,6 +997,9 @@ class Service:
 
         self._trim_db("max_ipam_db_mb", self.ipam_db, "IPAM database",
                       "oldest scan records")
+
+        if self._stopping():
+            return
 
         # Before the prune, not after: compact_rollup summarises complete
         # hours of raw samples into samples_hourly, and pruning first would
@@ -1013,6 +1048,9 @@ class Service:
         self._trim_db("max_nodes_series_db_mb", self.nodes_db.series_db,
                       "Nodes metric history",
                       "oldest samples and hourly rollups")
+
+        if self._stopping():
+            return
 
         self.alerts_db.prune(
             float(self.alerts_settings.get("retention_days", 180)))

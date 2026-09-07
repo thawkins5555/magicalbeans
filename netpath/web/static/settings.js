@@ -441,9 +441,13 @@
       saved = { ...App.state.settings };
       dirty = false;
       // The list used to name seven of the eleven refresh rates (IPAM had a
-      // field and was left out; three had no field at all).
+      // field and was left out; three had no field at all). The sweep note
+      // is why this returns at once: the save asks for the retention sweep
+      // and the maintenance thread runs it, rather than the browser waiting
+      // for thirteen databases to be pruned and trimmed.
       status(`Applied · reverse DNS ${values.dns_enabled ? 'on' : 'off'} · ` +
-             `eleven refresh rates · idle timeout ${values.session_idle_minutes} min`, 'var(--ok)');
+             `eleven refresh rates · idle timeout ${values.session_idle_minutes} min` +
+             ' · storage sweep running in the background', 'var(--ok)');
       applyStatus('Applied', 'var(--ok)');
     } catch (error) {
       applyStatus(error.message, 'var(--fail)');

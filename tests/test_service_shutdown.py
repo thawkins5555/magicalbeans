@@ -1,6 +1,6 @@
 """`Service.shutdown()` must not close the databases while a maintenance
-sweep is still running: `run_maintenance` runs on the timer thread every
-minute and, forced, on whatever HTTP thread called `apply_global_settings`.
+sweep is still running: `run_maintenance` runs on the maintenance thread
+every minute and, forced, when a settings save asks for one.
 `shutdown()` joins the timer thread and holds a lock around the
 stop/close sequence so a sweep in flight cannot touch a closed database.
 This suite drives both from plain threads, without starting the timer."""

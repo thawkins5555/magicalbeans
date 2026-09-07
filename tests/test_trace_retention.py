@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
 
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
@@ -314,13 +315,15 @@ check("every in-retention row survives the trim",
 db5.close()
 
 
-# --------------------- 6. the forced/synchronous maintenance path (a
-# settings save, on the HTTP thread) must not run netpath.db's prune/trim
-# at the full periodic-timer budget -- unbounded there measured as a ~30s
-# stall per save with a backlog. Checked at two levels: the mechanism
-# (prune() actually stops at whatever budget_s it is given, rather than
-# running until the backlog is exhausted) and the wiring (the forced path
-# actually asks for the short budget instead of the long default).
+# --------------------- 6. the forced maintenance path (a settings save)
+# must not run netpath.db's prune/trim at the full periodic-timer budget --
+# unbounded there measured as a ~30s stall per save with a backlog. Since
+# 5.1.0 the save does not wait for the sweep at all: it calls
+# request_maintenance(), which wakes the maintenance thread. Checked at
+# three levels: the mechanism (prune() actually stops at whatever budget_s
+# it is given, rather than running until the backlog is exhausted), the
+# wiring (the forced path asks for the short budget, not the long default),
+# and where the pass runs (the maintenance thread, not the caller's).
 
 db6 = Database(os.path.join(TMPDIR, "t6-netpath.db"))
 target6 = db6.add_target("10.0.0.1")
@@ -352,8 +355,12 @@ service6.settings["max_trace_db_mb"] = 500   # so trim_to_size runs too
 calls = []
 real_prune, real_trim = service6.db.prune, service6.db.trim_to_size
 
+ran_on = []
+
+
 def capturing_prune(days, budget_s=db_mod.TRIM_BUDGET_S):
     calls.append(("prune", budget_s))
+    ran_on.append(threading.current_thread().name)
     return real_prune(days, budget_s=0.0)   # keep the test itself fast
 
 def capturing_trim(max_bytes, budget_s=db_mod.TRIM_BUDGET_S):
@@ -362,7 +369,19 @@ def capturing_trim(max_bytes, budget_s=db_mod.TRIM_BUDGET_S):
 
 service6.db.prune, service6.db.trim_to_size = capturing_prune, capturing_trim
 
-service6.run_maintenance(force=True)
+# The loop the real service runs, started here without start()'s collectors:
+# request_maintenance() is the entry point a settings save uses now, and it
+# is only an entry point if something is waiting on the event it sets.
+service6._maintenance_thread = threading.Thread(
+    target=service6._maintenance_loop, name="test-maintenance", daemon=True)
+service6._maintenance_thread.start()
+service6.request_maintenance()
+check("request_maintenance() -- what a settings save calls now -- gets a "
+     "forced pass run and finished",
+     service6._maintenance_done.wait(30), "the sweep never completed")
+check("...on the maintenance thread, not the caller's, so the save returns "
+     "without waiting for the sweep",
+     ran_on == ["test-maintenance"], ran_on)
 forced = [budget for name, budget in calls if name == "prune"]
 check("a forced maintenance pass (settings save) asks netpath.db's prune "
      "for a short budget, not the full periodic-timer one",
