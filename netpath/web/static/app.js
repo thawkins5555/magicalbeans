@@ -3893,7 +3893,11 @@ const App = (() => {
       if (i === colIndex) {
         th.classList.add(descending ? 'sort-desc' : 'sort-asc');
         th.setAttribute('aria-sort', descending ? 'descending' : 'ascending');
-        if (caret) caret.textContent = descending ? '▼' : '▲';
+        // Written only on change: textContent always replaces the text node,
+        // a childList mutation the observer below would answer with this
+        // very sort, forever.
+        const glyph = descending ? '▼' : '▲';
+        if (caret && caret.textContent !== glyph) caret.textContent = glyph;
       } else if (th.classList.contains('sortable')) {
         th.setAttribute('aria-sort', 'none');
       }

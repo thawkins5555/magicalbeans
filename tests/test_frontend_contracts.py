@@ -1139,6 +1139,18 @@ check("userZoom" not in _MAPPER2 and "dragMoved" not in _MAPPER2,
       "the write-only view flags are gone")
 
 
+# ---------------------------------------------------------------------------
+# 37. Sorting a hand-built table hung the page (5.0.1). sortPlainTable wrote
+#     the caret's textContent on every pass; that replaces the text node, a
+#     childList mutation the plain-table observer answers by re-applying the
+#     sort, which writes the caret again, forever. The glyph is written only
+#     when it differs.
+_APP_SORT = APP[APP.index("  function sortPlainTable("):APP.index("  function visibleHeaderText(")]
+check("caret.textContent !== glyph" in _APP_SORT,
+      "the sort caret is rewritten only when its glyph changes, or the "
+      "MutationObserver that re-applies a plain table's sort loops on it")
+
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))
