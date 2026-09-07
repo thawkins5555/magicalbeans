@@ -345,6 +345,10 @@ def main() -> int:
 
     selfupdate._swap_in = fake_swap
     selfupdate.schedule_restart = lambda delay=1.5: None
+    # The grace only exists so one poll of /api/update/status can see
+    # "restarting" before the listener goes; nothing here is polling.
+    real_grace = selfupdate.RESTART_GRACE_S
+    selfupdate.RESTART_GRACE_S = 0
     quiesced = []
     selfupdate.set_before_restart_hook(lambda: quiesced.append(True))
     try:
@@ -462,6 +466,7 @@ def main() -> int:
     finally:
         selfupdate._fetch_json, selfupdate._fetch_bytes = real_json, real_bytes
         selfupdate._swap_in, selfupdate.schedule_restart = real_swap, real_restart
+        selfupdate.RESTART_GRACE_S = real_grace
         selfupdate.set_before_restart_hook(real_hook)
         os.chmod = real_chmod
         SERVICE.app_db.save_settings({"updates_enabled": False})
@@ -804,7 +809,10 @@ def main() -> int:
                                    {"username": "settingswrite",
                                     "grants": {"admin": "write"}}),
                                   ("POST", "/api/maintenance", {"action": "redns"}),
-                                  ("POST", "/api/update", {})):
+                                  ("POST", "/api/update", {}),
+                                  # Where the update job got to is as much an
+                                  # administrator's business as starting it.
+                                  ("GET", "/api/update/status", None)):
         status, _h, body_out = req(method, path, payload, cookie=settings_cookie)
         check(f"D8 settings:write is refused {method} {path}",
               status == 403, f"{status} {body_out}")
@@ -905,7 +913,20 @@ def main() -> int:
     selfupdate._fetch_json = lambda url, timeout=10.0: (_ for _ in ()).throw(
         urllib_error.URLError("no network in this test"))
     try:
-        req("POST", "/api/update", {}, cookie=admin_cookie)
+        status, _h, payload = req("POST", "/api/update", {}, cookie=admin_cookie)
+        # 202: the job was started, not finished. The install runs long past
+        # any deadline a browser holds a request open for, and one that
+        # answered only at the end reported a timeout for an update that had
+        # worked. The outcome is read from the job instead -- and the audit
+        # row cannot be looked for until the job has produced one.
+        check("D9 POST /api/update starts a job and says so",
+              status == 202 and payload.get("state") == "running",
+              f"{status} {payload}")
+        check("D9 the job finishes", selfupdate.wait_for_job(10), "")
+        job = selfupdate.status()
+        check("D9 ...and it failed honestly, naming what went wrong",
+              job.get("step") == "failed" and "no network" in job.get("error", ""),
+              str(job))
     finally:
         selfupdate._fetch_json = broken
         SERVICE.app_db.save_settings({"updates_enabled": False})

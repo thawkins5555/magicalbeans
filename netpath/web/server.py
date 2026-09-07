@@ -543,6 +543,9 @@ ROUTES = [
     # this host's own code: both are administrator acts, not settings.
     ("POST", r"^/api/maintenance$", api.post_maintenance, ("admin", W)),
     ("POST", r"^/api/update$", api.post_update, ("admin", W)),
+    # The update runs as a background job; this is how the dialog
+    # (and a browser that reloaded mid-update) finds out how it went.
+    ("GET", r"^/api/update/status$", api.get_update_status, ("admin", R)),
     # Front-end additions, appended so they never share
     # a hunk with the module routes above. `/api/alerts/total` cannot
     # collide with `/api/alerts/(\d+)`, which only matches digits.
@@ -1167,7 +1170,10 @@ class Handler(BaseHTTPRequestHandler):
                     headers = self._set_session_cookie(result.pop("token"))
                 elif path == "/api/logout":
                     headers = self._set_session_cookie("", clear=True)
-                self._json(result, extra_headers=headers)
+                # 200 unless the handler's own result says otherwise
+                # (api.Accepted answers 202 for work merely started).
+                self._json(result, getattr(result, "http_status", 200),
+                           extra_headers=headers)
             except LengthRequired as exc:
                 self._json({"error": str(exc)}, 411)
             except auth.LockedOut as exc:

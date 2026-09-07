@@ -1,7 +1,8 @@
 """Service start/stop/self-update lifecycle: Monitor._loop's exception guard
 around its tick body, run_headless's SIGTERM handling for a clean shutdown,
-selfupdate.apply()'s recovery when _swap_in() or write_meta() fails after
-workers are already stopped, and ipam_worker.stop()'s cancel_futures.
+selfupdate.apply()'s recovery when _swap_in() fails after the workers are
+already stopped, its refusal when the install markers cannot be written,
+and ipam_worker.stop()'s cancel_futures.
 Drives the real code with only the network boundary and the actual restart
 mocked out -- following test_web_security.py's own pattern for that.
 """
@@ -265,7 +266,8 @@ check("2. the wait loop waits on the stop event now, not a fixed time.sleep(1)",
 
 
 # =====================================================================
-# 3 & 4. selfupdate.apply(): a post-teardown failure still restarts
+# 3 & 4. selfupdate.apply(): a post-teardown failure still restarts,
+#        and a pre-teardown one changes nothing at all
 # =====================================================================
 # Reuses test_web_security.py's own pattern for driving apply() offline:
 # _fetch_json/_fetch_bytes stand in for the network boundary, and a real
@@ -327,6 +329,10 @@ real_write_meta = appdb_mod.write_meta
 
 selfupdate._fetch_json = fake_json
 selfupdate._fetch_bytes = fake_bytes
+real_grace = selfupdate.RESTART_GRACE_S
+# The grace exists so one poll of /api/update/status sees "restarting"
+# before the listener goes away; nothing here is watching for it.
+selfupdate.RESTART_GRACE_S = 0
 
 try:
     # ---- 3. _swap_in raising OSError after teardown still restarts -----
@@ -348,30 +354,40 @@ try:
          len(restart_calls3) == 1, restart_calls3)
     app_db3.close()
 
-    # ---- 4. write_meta failing does not skip schedule_restart() --------
+    # ---- 4. markers that cannot be written stop the update outright ----
+    # They are written first now, through the still-open connection, exactly
+    # so this is the cheap failure: nothing on disk has changed, nothing has
+    # been torn down, and the operator gets one refusal instead of a host
+    # running code its own app.db has no record of.
     app_db4, dir4 = new_apply_fixture("t4")
-    restart_calls4 = []
+    restart_calls4, swapped4, quiesced4 = [], [], []
     selfupdate.schedule_restart = lambda delay=1.5: restart_calls4.append(delay)
-    selfupdate._swap_in = lambda new_netpath: None   # swap "succeeds"
+    selfupdate._swap_in = lambda new_netpath: swapped4.append(new_netpath)
+    selfupdate.set_before_restart_hook(lambda: quiesced4.append(True))
 
-    def raising_write_meta(path, key, value):
+    def raising_set_meta(key, value):
         raise sqlite3.OperationalError("database is locked")
 
-    appdb_mod.write_meta = raising_write_meta
+    app_db4.set_meta = raising_set_meta
     result4 = selfupdate.apply(app_db4)
-    check("4. apply() still returns ok even though every write_meta() call failed",
-         result4.get("ok") is True, result4)
-    check("4. ...and does not raise out of apply() (docstring: never raises)",
-         True)  # reaching this line at all proves it, given the try/except above
-    check("4. ...and still schedules the restart: the markers are "
-         "bookkeeping, the restart is not optional",
-         len(restart_calls4) == 1, restart_calls4)
+    check("4. apply() reports the refusal rather than raising "
+         "(its docstring promises it never does)",
+         result4.get("ok") is False and "app.db" in result4.get("error", ""),
+         result4)
+    check("4. ...and the job's last step says so",
+         selfupdate.status().get("step") == "failed", selfupdate.status())
+    check("4. ...nothing was torn down and nothing was swapped: the markers "
+         "come first precisely so a failure here costs nothing",
+         not quiesced4 and not swapped4, f"{quiesced4} {swapped4}")
+    check("4. ...and no restart is scheduled, because nothing changed",
+         not restart_calls4, restart_calls4)
     app_db4.close()
 finally:
     selfupdate._fetch_json = real_fetch_json
     selfupdate._fetch_bytes = real_fetch_bytes
     selfupdate._swap_in = real_swap_in
     selfupdate.schedule_restart = real_schedule_restart
+    selfupdate.RESTART_GRACE_S = real_grace
     appdb_mod.write_meta = real_write_meta
     selfupdate._before_restart_hook = None
     selfupdate._before_restart_done = False

@@ -747,6 +747,32 @@ check("async function loadCharts(" in NODES and "function loadLoss(" not in NODE
 for _key in ("cpu_pct", "mem_pct", "temp_chassis_c"):
     check("'%s'" % _key in NODES, "RESOURCES reads the %s metric" % _key)
 check(".nd-resources {" in APP_CSS, "app.css lays out the RESOURCES grid")
+# 30. The update dialog reads the outcome from the job, not from the POST.
+#
+# The install runs for far longer than App.post's 30 s deadline -- the
+# before-restart hook alone was measured at 37-63 seconds against a real
+# fleet -- so a dialog that waited on the single response reported a timeout
+# for an update that was quietly succeeding behind it. POST /api/update now
+# answers 202 as soon as the job starts, and what actually happened is
+# polled from GET /api/update/status.
+check("'/api/update/status'" in SETTINGS,
+      "settings.js reads the update job's progress from /api/update/status "
+      "rather than from the POST that started it")
+_CHECK_FOR_UPDATE = SETTINGS[SETTINGS.index("async function checkForUpdate"):
+                             SETTINGS.index("async function pollUpdateStatus")]
+check("pollUpdateStatus()" in _CHECK_FOR_UPDATE
+      and "payload.up_to_date" not in _CHECK_FOR_UPDATE,
+      "checkForUpdate hands over to pollUpdateStatus instead of reading an "
+      "outcome out of a response that no longer carries one")
+check("resumeUpdateIfRunning()" in SETTINGS
+      and SETTINGS.count("function resumeUpdateIfRunning") == 1,
+      "a browser that reloaded mid-update picks the running job back up "
+      "(load() calls resumeUpdateIfRunning) rather than showing an idle "
+      "button over an install in flight")
+_STEPS = ["checking", "downloading", "extracting", "installing", "restarting"]
+check(all(("    %s:" % _s) in SETTINGS for _s in _STEPS),
+      "every step the job can report has a line of its own for the operator "
+      "to read (%s)" % ", ".join(_STEPS))
 
 print()
 if failures:

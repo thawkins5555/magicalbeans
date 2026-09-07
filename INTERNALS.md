@@ -4177,46 +4177,105 @@ self-explanatory in the UI instead of a recurring support question.
 
 ## Self-update (`selfupdate.py`)
 
-One entry point, `apply(app_db)`, called from `POST /api/update`
-(`web/api.py`'s `post_update`). Never raises — every failure comes back
-as `{"ok": False, "error": ...}` so the Settings page can show it rather
-than crash the request.
+`POST /api/update` (`web/api.py`'s `post_update`) starts a **job** and
+answers `202` with its status straight away; `GET /api/update/status`
+(administrator read) is what the Settings dialog polls once a second for
+what actually happened. It used to be one synchronous call, and all three
+of the things that made the update button lie came from that shape — see
+"What the job fixed" below. `apply(app_db, report=None,
+before_quiesce=None)` is still the entry point and still never raises:
+every failure comes back as `{"ok": False, "error": ...}`.
 
-1. **Check**: `latest_commit()` asks GitHub's REST API
+The job is module state in `selfupdate.py` — `_job` guarded by `_job_lock`,
+read by `status()` — deliberately not something the caller holds, so a
+browser that reloaded mid-update can still ask where the update got to.
+`start_job()` runs `apply()` on a non-daemon thread named
+`sappiwhere-update` and refuses a second concurrent job with
+`already_running` rather than queueing one behind the first;
+`wait_for_job()` joins it. `STEPS` is the whole vocabulary:
+
+1. **`checking`**: `latest_commit()` asks GitHub's REST API
    (`api.github.com/repos/thawkins5555/magicalbeans/commits/main`) for the
-   branch tip's SHA, message and date. Compared against
+   branch tip's SHA and message. Compared against
    `app_db.meta("update_installed_commit")` (a generic key/value marker
-   table in `app.db`, unrelated to any setting); an exact match returns
-   `{"ok": True, "up_to_date": True, ...}` immediately, no download.
-2. **Download**: the tarball for that exact commit (not just the branch
-   name, to avoid a race if something else pushes between the check and
-   the download) comes from `codeload.github.com/.../tar.gz/<sha>` via
+   table in `app.db`, unrelated to any setting).
+2. **`up_to_date`**: an exact match. A terminal step of its own, not a
+   flavour of failure and not something the dialog has to infer from a
+   field on a response — the button reporting "update failed" for a host
+   that was already current is one of the complaints the job answers.
+3. **`downloading`**: the tarball for that exact commit (not just the
+   branch name, to avoid a race if something else pushes between the check
+   and the download) comes from `codeload.github.com/.../tar.gz/<sha>` via
    plain `urllib.request` — no external HTTP library. TLS verification
    uses the system's trust store *and* a vendored copy of Mozilla's CA
-   bundle (`netpath/cacert.pem`, the same one `pip`/`certifi` ship,
-   loaded in addition to — not instead of — the system store by
-   `_ssl_context()`), because a locked-down Windows server can be
-   missing a root certificate with no route to fetch it on demand, and a
-   headless install has no pip-installed `certifi` to lean on.
-3. **Extract**: `_safe_extract()` only ever extracts ordinary files and
-   directories, never symlinks or device nodes, and verifies every
+   bundle (`netpath/cacert.pem`, the same one `pip`/`certifi` ship, loaded
+   in addition to — not instead of — the system store by
+   `_ssl_context()`), because a locked-down Windows server can be missing
+   a root certificate with no route to fetch it on demand, and a headless
+   install has no pip-installed `certifi` to lean on.
+4. **`extracting`**: `_safe_extract()` only ever extracts ordinary files
+   and directories, never symlinks or device nodes, and verifies every
    member's resolved path stays inside the destination directory before
-   extracting anything — defense in depth against a corrupted or
-   tampered archive, not something the real repository needs but cheap
-   to have.
-4. **Validate**: the extracted tree must contain `netpath/__init__.py`
-   and `netpath/web/__init__.py`, or the whole thing is refused before
+   extracting anything — defense in depth against a corrupted or tampered
+   archive, not something the real repository needs but cheap to have. The
+   extracted tree must then contain `netpath/__init__.py` and
+   `netpath/web/__init__.py`, or the whole thing is refused before
    touching anything already installed.
-5. **Swap** (`_swap_in()`): any existing `netpath.bak-*` directory is
-   removed first (so exactly one backup ever exists), the currently
-   running `netpath/` package directory is renamed to
-   `netpath.bak-<timestamp>`, and the newly extracted one is moved into
-   its place. If the move fails partway, the backup is renamed straight
-   back — the app is never left with no `netpath/` package directory at
-   all.
-6. **Restart** (`schedule_restart()`): a delayed background thread (1.5s,
-   so the HTTP response for the triggering request has time to reach the
-   browser) that calls a platform-specific restart function.
+5. **`installing`**: the three install markers (`update_installed_commit`,
+   `..._at`, and `..._tag` cleared, since a branch pull cannot honestly
+   claim a tag) are written **through the open `AppDatabase` connection,
+   before anything is torn down** — `set_meta()` under the same lock the
+   rest of the application uses. Nothing on disk has changed at this
+   point, so a write that fails costs nothing: the job stops on `failed`,
+   the hook never runs and the package is never swapped. Then
+   `before_quiesce(sha, message)` — the caller's last moment with app.db
+   open, which `post_update` uses for the event-log line and the
+   `update.installed` audit row.
+6. **`restarting`**: `RESTART_GRACE_S` (2 s) first, which exists only so
+   one poll of `/api/update/status` sees this step arrive before the
+   listener goes away — without it the dialog's next request fails against
+   a service that is deliberately going down, and cannot tell that from a
+   fault. Then `_run_before_restart()` (stop the server, shut down the
+   service), then `_swap_in()`: any existing `netpath.bak-*` directory is
+   removed first (so exactly one backup ever exists), the running
+   `netpath/` package directory is renamed to `netpath.bak-<timestamp>`,
+   and the newly extracted one is moved into its place. If the move fails
+   partway the backup is renamed straight back, `_restore_meta()` puts the
+   markers back through short-lived connections (the version that boots
+   must not read as the one that never installed), the job ends `failed` —
+   and `schedule_restart()` still runs, because the service is already
+   torn down and a restart on the previous version beats staying down.
+   Finally the documentation files are copied alongside (cosmetic; a
+   failure here is ignored) and `schedule_restart()` is called.
+7. **`failed`**: the other terminal step, carrying the reason in `error`.
+
+### What the job fixed
+
+Three failures, all visible in `update_restart.log` from a production
+Windows host, all of which made a working update report itself as broken:
+
+- **The browser gave up before the update did.** `app.js`'s request
+  deadline is 30 s; the before-restart hook alone — `Monitor.drain()`
+  finishing in-flight traces, every worker stopping — was measured at
+  37-63 s. The operator saw "No answer within 30 seconds" while the
+  install went on succeeding behind it. The 202-plus-polling shape is the
+  fix: nothing waits on a response that outlives its own deadline.
+- **The markers could not be written after the teardown.** They used to be
+  written last, from a fresh connection via `appdb.write_meta()`, against
+  an `app.db` the shutdown had not finished releasing: 201 consecutive
+  `database is locked` lines, and every next check therefore saw no
+  installed commit and offered the same update again. Writing them first,
+  through the connection that is still open, removes the race rather than
+  retrying it.
+- **The restart thread was a daemon.** `schedule_restart()` spawned it with
+  `daemon=True`, and by the time it was sleeping the hook had already
+  stopped everything that was keeping the interpreter busy — so the
+  process could reach the point where it kills its daemon threads before
+  this one woke. In 146 recorded attempts it never reached its first
+  statement. It is `daemon=False` now, logs `restart thread started pid=`
+  before it does anything else (so "never ran" is distinguishable from
+  "ran and died"), and wraps its whole body in a `try`/`except` that logs
+  a traceback.
 
 ### The restart itself
 
@@ -4280,6 +4339,18 @@ endpoint with a plain `fetch()` (not `App.get`, which would redirect to
 `/login` on the first 401 rather than waiting for the server to actually
 come back) until it answers again, then sends the browser to sign back
 in.
+
+`settings.js`'s `pollUpdateStatus()` runs ahead of that: a one-second loop
+on `/api/update/status` that paints a sentence per step, ends green on
+`up_to_date`, red with the reason on `failed`, and hands over to the
+restart modal on `restarting`. A request that fails *after* `installing`
+means the service is going down on purpose and is treated as the restart,
+not as an error; before that, five consecutive failures give up and
+re-enable the button. And because the job outlives the page that started
+it, `load()` calls `resumeUpdateIfRunning()`: a browser reloaded
+mid-update finds `state == "running"`, disables the button and rejoins the
+same poll instead of showing an idle Settings page over an install in
+flight.
 
 ---
 

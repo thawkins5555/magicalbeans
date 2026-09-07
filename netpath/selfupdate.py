@@ -24,6 +24,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 
@@ -63,6 +64,50 @@ _CACERT_PATH = os.path.join(_NETPATH_DIR, "cacert.pem")
 _COPY_ALONGSIDE = ("requirements.txt", "README.md", "CHANGELOG.md", "FEATURES.md",
                    "INTERNALS.md", "CREDENTIAL-SECURITY.md",
                    "NETWORK-AND-STORAGE-REQUIREMENTS.md")
+
+
+# --------------------------------------------------------------- the job
+
+# The before-restart hook alone measures 37-63 s against a real fleet, and
+# app.js gives a request 30. So the update is a job: the POST answers at
+# once and the dialog reads the outcome from status().
+
+STEPS = ("idle", "checking", "up_to_date", "downloading", "extracting",
+         "installing", "restarting", "failed")
+
+_TERMINAL = {"up_to_date": "done", "failed": "failed"}
+
+# Long enough for one poll of /api/update/status to see "restarting" before
+# the listener goes away. Tests set it to 0.
+RESTART_GRACE_S = 2.0
+
+_job_lock = threading.Lock()
+_job_thread = None
+_job = {"state": "idle", "step": "idle", "message": "", "error": "",
+        "commit": "", "started_ts": 0.0, "finished_ts": 0.0}
+
+
+def _set(step: str, *, message=None, error=None, commit=None) -> None:
+    with _job_lock:
+        _job["step"] = step
+        _job["state"] = _TERMINAL.get(step, "running")
+        if message is not None:
+            _job["message"] = message
+        if error is not None:
+            _job["error"] = error
+        if commit is not None:
+            _job["commit"] = commit
+        if step in _TERMINAL:
+            _job["finished_ts"] = time.time()
+
+
+def status() -> dict:
+    """Where the current (or last) update got to. Answered from module state
+    rather than from anything the caller holds, so a browser that reloaded
+    mid-update picks the running job back up instead of showing an idle
+    button over an install in flight."""
+    with _job_lock:
+        return dict(_job)
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -241,6 +286,7 @@ def _restart_posix() -> None:
     """`execve` replaces this process image in place: same PID, no gap
     where nothing is listening."""
     args = _relaunch_args()
+    _log_restart(f"exec pid={os.getpid()} args={args}")
     os.execv(args[0], args)
 
 
@@ -306,23 +352,36 @@ def _run_before_restart() -> None:
         return
     _before_restart_done = True
     _log_restart("running before-restart hook (stop server, shut down service)")
+    started = time.time()
     try:
         _before_restart_hook()
     except Exception as exc:
         _log_restart(f"before-restart hook failed: {exc}")
+    _log_restart(f"before-restart hook finished in {time.time() - started:.1f}s")
 
 
 def schedule_restart(delay: float = 1.5) -> None:
     """Restart after `delay` seconds, so the response reaches the browser
     first. The replacement is spawned only after the port and databases are
     released — spawning first raced the old process for the same port/files
-    and lost."""
+    and lost.
+
+    Not a daemon thread: the hook that runs before this one has already
+    stopped the server and the service, so the interpreter can reach the
+    point where it exits every remaining thread while this one is still
+    sleeping — and a daemon thread dies there without a line in the log. In
+    146 recorded attempts this thread never reached its first statement.
+    """
     def _go():
-        time.sleep(delay)
-        _run_before_restart()          # a no-op when apply() already did it
-        _restart_windows() if os.name == "nt" else _restart_posix()
+        _log_restart(f"restart thread started pid={os.getpid()} delay={delay}")
+        try:
+            time.sleep(delay)
+            _run_before_restart()      # a no-op when apply() already did it
+            _restart_windows() if os.name == "nt" else _restart_posix()
+        except BaseException:
+            _log_restart("restart thread failed:\n" + traceback.format_exc())
     threading.Thread(target=_go, name="sappiwhere-update-restart",
-                     daemon=True).start()
+                     daemon=False).start()
 
 
 def updates_enabled(app_db) -> bool:
@@ -335,73 +394,147 @@ def updates_enabled(app_db) -> bool:
         return False
 
 
-def apply(app_db) -> dict:
+_INSTALL_MARKERS = (INSTALLED_COMMIT_KEY, INSTALLED_AT_KEY, INSTALLED_TAG_KEY)
+
+
+def _restore_meta(db_path: str, previous: dict) -> None:
+    """Put the install markers back after a swap that did not happen. app.db
+    is closed by then, so this goes through connections of its own; the
+    retries are for the moment just after teardown, where the file can still
+    be held briefly by a connection that is on its way out."""
+    from .appdb import write_meta
+
+    for key, value in previous.items():
+        for attempt in range(3):
+            try:
+                write_meta(db_path, key, value or "")
+                break
+            except Exception as exc:
+                _log_restart(f"restoring {key!r} (try {attempt + 1}): {exc}")
+                time.sleep(0.2)
+
+
+def apply(app_db, report=None, before_quiesce=None) -> dict:
     """Check, and if there is anything new, download it, install it and
     restart. Returns a JSON-able result; never raises — failures come back
-    as `{"ok": False, "error": ...}` so the Settings page can show them."""
+    as `{"ok": False, "error": ...}` so the Settings page can show them.
+
+    `report(step, message)`, when given, is called on every step change.
+    `before_quiesce(sha, message)` is called once the markers are written
+    and before anything is torn down — the last moment at which a caller
+    can still write to app.db.
+    """
+    def step(name, *, message=None, error=None, commit=None):
+        _set(name, message=message, error=error, commit=commit)
+        if report:
+            report(name, error or message or "")
+
     if not updates_enabled(app_db):
+        step("failed", error=UPDATES_DISABLED_MESSAGE)
         return {"ok": False, "disabled": True, "error": UPDATES_DISABLED_MESSAGE}
 
+    step("checking", message="", error="", commit="")
     try:
         head = latest_commit()
     except (urllib.error.URLError, TimeoutError) as exc:
-        return {"ok": False, "error": f"Could not reach GitHub: {exc}"}
+        error = f"Could not reach GitHub: {exc}"
+        step("failed", error=error)
+        return {"ok": False, "error": error}
     except (ValueError, KeyError) as exc:
         # GitHub answered; what it said is the problem. Reporting "could not
         # reach GitHub" for an answer that arrived intact sent the operator
         # to look at firewalls and proxies for a condition no amount of
         # connectivity would change.
+        step("failed", error=str(exc))
         return {"ok": False, "error": str(exc)}
 
     sha = head["sha"]
     message = head["message"] or sha[:10]
     if app_db.meta(INSTALLED_COMMIT_KEY) == sha:
+        # Its own step: "update failed" for a host that was already
+        # current is the complaint this job exists to answer.
+        step("up_to_date", message=message, commit=sha[:10])
         return {"ok": True, "up_to_date": True, "commit": sha[:10],
                 "message": message}
 
     tmp_dir = tempfile.mkdtemp(prefix="sappiwhere-update-")
     try:
+        step("downloading", message=message, commit=sha[:10])
         archive_path = os.path.join(tmp_dir, "update.tar.gz")
         try:
             # Nothing checks this digest: the branch pull has no published
             # digest to check it against. See the SECURITY NOTE at the top.
             _download_tarball(sha, archive_path)
         except (urllib.error.URLError, ValueError, OSError) as exc:
+            step("failed", error=f"Download failed: {exc}")
             return {"ok": False, "error": f"Download failed: {exc}"}
 
+        step("extracting")
         extract_dir = os.path.join(tmp_dir, "extracted")
         os.makedirs(extract_dir, exist_ok=True)
         try:
             with tarfile.open(archive_path, "r:gz") as tar:
                 _safe_extract(tar, extract_dir)
         except (tarfile.TarError, ValueError, OSError) as exc:
+            step("failed", error=f"Could not unpack the update: {exc}")
             return {"ok": False, "error": f"Could not unpack the update: {exc}"}
 
         entries = os.listdir(extract_dir)
         if len(entries) != 1:
+            step("failed", error="Unexpected archive layout from GitHub")
             return {"ok": False, "error": "Unexpected archive layout from GitHub"}
         new_root = os.path.join(extract_dir, entries[0])
         new_netpath = os.path.join(new_root, "netpath")
         if not (os.path.isfile(os.path.join(new_netpath, "__init__.py"))
                 and os.path.isfile(os.path.join(new_netpath, "web", "__init__.py"))):
-            return {"ok": False, "error": "Downloaded archive doesn't look like "
-                                          "SappiWhere — refusing to install it"}
+            error = ("Downloaded archive doesn't look like SappiWhere — "
+                     "refusing to install it")
+            step("failed", error=error)
+            return {"ok": False, "error": error}
+
+        step("installing")
+        db_path = getattr(app_db, "path", "")
+        previous = {key: app_db.meta(key) for key in _INSTALL_MARKERS}
+        # Through the still-open connection, before anything is torn down:
+        # written afterwards from a fresh connection they hit "database is
+        # locked" 201 times, and nothing on disk has changed yet, so a write
+        # that fails here costs nothing.
+        try:
+            app_db.set_meta(INSTALLED_COMMIT_KEY, sha)
+            app_db.set_meta(INSTALLED_AT_KEY, str(time.time()))
+            # A branch pull cannot honestly claim a tag, and a stale one
+            # would read as what is installed.
+            app_db.set_meta(INSTALLED_TAG_KEY, "")
+        except Exception as exc:
+            error = f"Could not record the update in app.db: {exc}"
+            step("failed", error=error)
+            return {"ok": False, "error": error}
+
+        if before_quiesce:
+            try:
+                before_quiesce(sha, message)
+            except Exception as exc:
+                _log_restart(f"before-quiesce callback failed: {exc}")
+
+        step("restarting")
+        time.sleep(RESTART_GRACE_S)
 
         # Nothing of ours runs while the files change: the listener is down
         # and every worker has stopped.
-        db_path = getattr(app_db, "path", "")
         _run_before_restart()
         try:
             _swap_in(new_netpath)
         except OSError as exc:
-            # _swap_in already restored the previous netpath/ on failure, so
-            # restarting here comes back up on the same install it booted from
-            # rather than leaving the process alive with nothing running.
+            # _swap_in already restored the previous netpath/, so the
+            # restart comes back up on the install this booted from — and
+            # the markers have to come back with it.
+            _restore_meta(db_path, previous)
+            error = (f"Update downloaded but could not be installed: {exc}. "
+                     f"Restarting on the previous version rather than staying "
+                     f"down.")
+            step("failed", error=error)
             schedule_restart()
-            return {"ok": False, "error": f"Update downloaded but could not be "
-                                          f"installed: {exc}. Restarting on the "
-                                          f"previous version rather than staying "
-                                          f"down."}
+            return {"ok": False, "error": error, "quiesced": True}
 
         for name in _COPY_ALONGSIDE:
             src = os.path.join(new_root, name)
@@ -410,28 +543,63 @@ def apply(app_db) -> dict:
                     shutil.copy2(src, os.path.join(_APP_ROOT, name))
                 except OSError:
                     pass  # cosmetic only — the package swap is what matters
-
-        # app.db is already closed, so these go through a short-lived connection
-        # of their own; a write failure must not skip schedule_restart() below.
-        from .appdb import write_meta
-        try:
-            write_meta(db_path, INSTALLED_COMMIT_KEY, sha)
-        except Exception as exc:
-            _log_restart(f"write_meta({INSTALLED_COMMIT_KEY!r}) failed: {exc}")
-        try:
-            write_meta(db_path, INSTALLED_AT_KEY, str(time.time()))
-        except Exception as exc:
-            _log_restart(f"write_meta({INSTALLED_AT_KEY!r}) failed: {exc}")
-        # The tag marker is what the verified path records, and a branch
-        # pull cannot honestly claim one. Cleared rather than left behind,
-        # so a stale tag never reads as "this is what is installed".
-        try:
-            write_meta(db_path, INSTALLED_TAG_KEY, "")
-        except Exception as exc:
-            _log_restart(f"write_meta({INSTALLED_TAG_KEY!r}) failed: {exc}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     schedule_restart()
     return {"ok": True, "up_to_date": False, "commit": sha[:10],
-            "message": message, "restarting": True}
+            "message": message, "restarting": True, "quiesced": True}
+
+
+def start_job(app_db, before_quiesce=None, on_result=None) -> dict:
+    """Run apply() on a thread of its own and return the job's status now.
+
+    One at a time: a second press while an install is in flight would race
+    the first for the package directory, so it is refused with
+    `already_running` rather than queued. Not a daemon thread — the update
+    outlives the request that asked for it, and the restart it schedules is
+    the only thing that brings the service back.
+    """
+    global _job_thread
+
+    with _job_lock:
+        if _job_thread is not None and _job_thread.is_alive():
+            running = dict(_job)
+            running["already_running"] = True
+            return running
+        _job.update(state="running", step="checking", message="", error="",
+                    commit="", started_ts=time.time(), finished_ts=0.0)
+        thread = threading.Thread(
+            target=_run_job, args=(app_db, before_quiesce, on_result),
+            name="sappiwhere-update", daemon=False)
+        _job_thread = thread
+    thread.start()
+    return status()
+
+
+def _run_job(app_db, before_quiesce, on_result) -> None:
+    try:
+        result = apply(app_db, before_quiesce=before_quiesce)
+    except BaseException as exc:
+        _log_restart("update job failed:\n" + traceback.format_exc())
+        _set("failed", error=f"The update stopped unexpectedly: {exc}")
+        result = {"ok": False, "error": str(exc)}
+    with _job_lock:
+        _job["finished_ts"] = time.time()
+        if _job["state"] == "running":
+            _job["state"] = "done" if result.get("ok") else "failed"
+    if on_result:
+        try:
+            on_result(result)
+        except Exception as exc:
+            _log_restart(f"update result callback failed: {exc}")
+
+
+def wait_for_job(timeout: float = 10.0) -> bool:
+    """Whether the job thread finished within `timeout`. For tests, and for
+    a shutdown that would otherwise close app.db under a running install."""
+    thread = _job_thread
+    if thread is None:
+        return True
+    thread.join(timeout)
+    return not thread.is_alive()

@@ -109,6 +109,7 @@
     paint(saved, App.state.serverState || {});
     dirty = false;
     status('Showing saved settings', 'var(--muted)');
+    resumeUpdateIfRunning();
   }
 
   // Repaints from the snapshot taken at load()/apply(), not from
@@ -198,33 +199,108 @@
     el.style.color = colour || 'var(--muted)';
   }
 
+  const UPDATE_STEP_TEXT = {
+    checking: 'Checking github.com for the latest commit…',
+    downloading: 'Downloading the update from github.com…',
+    extracting: 'Unpacking and checking the download…',
+    installing: 'Installing it…',
+    restarting: 'Installed — restarting the service…',
+  };
+
+  const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /* The POST only starts the job now and answers 202 straight away: the
+     install runs for longer than App.post's 30 s deadline, so waiting on
+     one response reported a timeout for an update that was busy succeeding.
+     What actually happened comes from /api/update/status. */
   async function checkForUpdate() {
     const button = App.el('update-now');
     button.disabled = true;
-    updateStatus('Checking github.com for the latest commit…', 'var(--muted)');
-    let payload;
+    updateStatus(UPDATE_STEP_TEXT.checking, 'var(--muted)');
     try {
-      payload = await App.post('/api/update', {});
+      await App.post('/api/update', {});
     } catch (error) {
       updateStatus(error.message, 'var(--fail)');
       button.disabled = false;
       return;
     }
-    if (!payload.ok) {
-      updateStatus(payload.error || 'Update failed', 'var(--fail)');
-      button.disabled = false;
+    pollUpdateStatus();
+  }
+
+  let updatePolling = false;
+
+  async function pollUpdateStatus() {
+    if (updatePolling) return;
+    updatePolling = true;
+    const button = App.el('update-now');
+    let last = { commit: '', message: '' };
+    let step = '';
+    let misses = 0;
+    try {
+      for (;;) {
+        let job;
+        try {
+          job = await App.get('/api/update/status');
+          misses = 0;
+        } catch (error) {
+          // Past the swap the service is going down on purpose, so a
+          // request that does not answer is the restart, not a fault.
+          if (step === 'installing' || step === 'restarting') {
+            showRestartModal(last);
+            waitForRestart();
+            return;
+          }
+          misses += 1;
+          if (misses >= 5) {
+            updateStatus(error.message, 'var(--fail)');
+            button.disabled = false;
+            return;
+          }
+          await pause(1000);
+          continue;
+        }
+        step = job.step || '';
+        last = { commit: job.commit || '', message: job.message || '' };
+        if (step === 'up_to_date') {
+          updateStatus(`Already up to date — ${job.commit} “${job.message}”.`,
+                       'var(--ok)');
+          button.disabled = false;
+          return;
+        }
+        if (step === 'failed') {
+          updateStatus(job.error || 'Update failed', 'var(--fail)');
+          button.disabled = false;
+          return;
+        }
+        if (step === 'restarting') {
+          updateStatus(`Installed ${job.commit} “${job.message}” — restarting…`,
+                       'var(--ok)');
+          showRestartModal(job);
+          waitForRestart();
+          return;
+        }
+        updateStatus(UPDATE_STEP_TEXT[step] || 'Working…', 'var(--muted)');
+        await pause(1000);
+      }
+    } finally {
+      updatePolling = false;
+    }
+  }
+
+  /* The job outlives the page that started it, so a reload mid-update picks
+     it back up rather than showing an idle button over an install in
+     flight. Silent for an account that may not read the status. */
+  async function resumeUpdateIfRunning() {
+    if (updatePolling) return;
+    let job;
+    try {
+      job = await App.get('/api/update/status');
+    } catch (error) {
       return;
     }
-    if (payload.up_to_date) {
-      updateStatus(`Already up to date — ${payload.commit} “${payload.message}”.`,
-                   'var(--ok)');
-      button.disabled = false;
-      return;
-    }
-    updateStatus(`Installed ${payload.commit} “${payload.message}” — restarting…`,
-                 'var(--ok)');
-    showRestartModal(payload);
-    waitForRestart();
+    if (!job || job.state !== 'running') return;
+    App.el('update-now').disabled = true;
+    pollUpdateStatus();
   }
 
   /* Blocks the whole screen while the restart is in flight: there is nothing
@@ -233,8 +309,11 @@
      off in Settings is easy to miss if you've wandered to another tab. */
   function showRestartModal(payload) {
     App.state.modalLocked = true;
+    const what = payload.commit
+      ? `<p>Installed <b>${escape(payload.commit)}</b> — “${escape(payload.message)}”.</p>`
+      : '<p>The update was installed.</p>';
     App.modal('Updating SappiWhere', `
-      <p>Installed <b>${escape(payload.commit)}</b> — “${escape(payload.message)}”.</p>
+      ${what}
       <p>Restarting the service to load it. This signs everyone out, this
       session included — you'll land back on the sign-in page automatically
       once it's back.</p>

@@ -169,6 +169,14 @@ def _require(row, what: str):
     return row
 
 
+class Accepted(dict):
+    """A result body server.py answers 202 for: the work was started, not
+    finished. An ordinary dict everywhere else, so a handler returning one
+    needs nothing special of the caller — only the status code differs."""
+
+    http_status = 202
+
+
 def _pick(body: dict, allowed) -> dict:
     """Only the keys of `body` an update route is allowed to write. The
     allow-list is the boundary: anything not named here never reaches a
@@ -1624,23 +1632,38 @@ def post_update(service, params, body) -> dict:
         raise _permissions.Forbidden(selfupdate.UPDATES_DISABLED_MESSAGE)
     _audit(service, params, "update.requested")
     db_path = getattr(service.app_db, "path", "")
-    result = selfupdate.apply(service.app_db)
-    if result.get("ok") and not result.get("up_to_date"):
-        service.log.add(SYSTEM_CATEGORY,
-                        f"Updated to {result.get('tag') or result['commit']}; "
-                        f"restarting")
-        # Through a connection of its own, not the service's: a successful
-        # apply() has already stopped everything and closed app.db, so the
-        # ordinary audit path can only fail here — and the record of who
-        # replaced this host's code is the one that must survive.
-        from ..appdb import write_audit
-        write_audit(db_path, str(params.get("_username", "")),
-                    str(params.get("_client", "")), "update.installed",
-                    target=str(result.get("tag") or result.get("commit") or ""))
-    elif not result.get("ok"):
-        _audit(service, params, "update.refused",
-               detail=str(result.get("error", "")))
-    return result
+    username = str(params.get("_username", ""))
+    client = str(params.get("_client", ""))
+
+    def before_quiesce(sha, message):
+        # The last moment app.db is open: the record of who replaced this
+        # host's code used to be written after the teardown, and lost.
+        service.log.add(SYSTEM_CATEGORY, f"Updated to {sha[:10]}; restarting")
+        service.app_db.audit(username, client, "update.installed",
+                             target=sha[:10])
+
+    def on_result(result):
+        if result.get("ok"):
+            return
+        if result.get("quiesced"):
+            from ..appdb import write_audit
+            write_audit(db_path, username, client, "update.refused",
+                        detail=str(result.get("error", "")))
+        else:
+            service.app_db.audit(username, client, "update.refused",
+                                 detail=str(result.get("error", "")))
+
+    # The status, not the outcome: the install outlives any request deadline.
+    return Accepted(selfupdate.start_job(service.app_db, before_quiesce,
+                                         on_result))
+
+
+def get_update_status(service, params, body) -> dict:
+    """Where the update job got to. Polled by the Settings dialog once a
+    second, and read again by a browser that reloaded mid-update."""
+    from .. import selfupdate
+
+    return selfupdate.status()
 
 
 # Maintenance actions that delete everything rather than applying a
