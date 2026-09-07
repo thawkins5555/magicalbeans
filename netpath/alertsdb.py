@@ -1903,17 +1903,13 @@ class AlertsDatabase(SqliteStore):
 
     def merge_device(self, old_device_id: int, new_device_id: int,
                      by: str = "") -> dict:
-        """Two device rows turned out to be one device: hand Alerts' half
-        over to the surviving id.
-
-        A per-device threshold the winner has set already stands — the
-        operator tuned it against the device they were looking at — so the
-        loser's are only copied where the winner has none. Open alerts
-        raised against the loser are resolved rather than repointed: their
-        entity no longer exists, and an alert nobody can navigate to is
-        worse than one closed with a reason. Everything else (a mute still
-        running, occurrences waiting out the new-device grace, a
-        maintenance window naming the id) simply moves.
+        """Two device rows turned out to be one: hand Alerts' half over to
+        the surviving id. The winner's own threshold stands; the loser's
+        copies over only where the winner has none. Open alerts against
+        the loser are resolved, not repointed — their entity is gone, and
+        an alert nobody can navigate to is worse than one closed with a
+        reason. Everything else (a mute, pending occurrences, a
+        maintenance window) simply moves.
         """
         old_key, new_key = str(old_device_id), str(new_device_id)
         moved = {"thresholds": 0, "pending": 0, "windows": 0, "mute": False}

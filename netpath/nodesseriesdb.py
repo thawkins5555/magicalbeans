@@ -1,17 +1,13 @@
 """The Nodes module's time series: metric definitions, raw samples and the
 hourly rollups they are summarised into.
 
-Its own file rather than a section of nodes.db because these three tables
-are the ones that grow: `samples` dominates the write rate, `samples_hourly`
-dominates the size, and `metrics` is a large static table beside them.
-Keeping them here means a size cap that trims history never has to consider
-the device inventory, and the poller's hot write path no longer contends for
-the same file the web page reads devices from.
-
-`metrics.device_id` is a plain integer, not a foreign key: the devices it
-names live in nodes.db. That is already the convention across this
-application's stores (configrx.device_config, mapper.map_nodes), and
-NodesDatabase.remove_device is what keeps the two sides in step.
+Its own file, not a section of nodes.db, because these three tables are the
+ones that grow, so a size cap here never has to consider the device
+inventory and the poller's hot write path stops contending for the same
+file the web page reads devices from. `metrics.device_id` is a plain
+integer rather than a foreign key for the same reason every other store
+does this (configrx.device_config, mapper.map_nodes): the devices it names
+live in nodes.db, and NodesDatabase.remove_device keeps the two in step.
 """
 
 from __future__ import annotations
@@ -25,10 +21,8 @@ from .sqlitebase import SqliteStore, id_chunks, reclaim
 
 log = logging.getLogger(__name__)
 
-# How wide a chart window still reads raw samples. Wider than this reads
-# samples_hourly instead — which is why sample_retention_days defaults to
-# the same three days: raw points older than the widest raw window can
-# answer nothing a rollup does not.
+# How wide a chart window still reads raw samples before falling back to
+# samples_hourly; sample_retention_days defaults to the same three days.
 RAW_WINDOW_S = 3 * 86400
 
 SCHEMA = """
@@ -43,10 +37,8 @@ CREATE TABLE IF NOT EXISTS metrics (
     last_ts         REAL,
     UNIQUE(device_id, key)
 );
--- The alert engine asks for one metric key across the whole fleet twelve
--- times a minute (metrics_for_keys); the UNIQUE(device_id, key) index leads
--- with device_id and cannot serve a key-first query. In SCHEMA rather than a
--- migration because this table is created here for the first time.
+-- metrics_for_keys asks by key, not device_id, which UNIQUE(device_id, key)
+-- can't serve; in SCHEMA since this table is created fresh here.
 CREATE INDEX IF NOT EXISTS ix_metrics_key ON metrics(key);
 
 CREATE TABLE IF NOT EXISTS samples (
@@ -55,10 +47,8 @@ CREATE TABLE IF NOT EXISTS samples (
     value           REAL,
     PRIMARY KEY (metric_id, ts)
 );
--- The primary key leads on metric_id, so the two queries that ask about
--- time across every metric — compact_rollup's per-hour aggregate and
--- prune's delete by age — scanned the whole table without this. On the
--- largest table in the database that was seconds of held lock per pass.
+-- The PK leads on metric_id; without this, compact_rollup's per-hour
+-- aggregate and prune's delete-by-age scanned the whole (largest) table.
 CREATE INDEX IF NOT EXISTS ix_samples_ts ON samples(ts);
 
 CREATE TABLE IF NOT EXISTS samples_hourly (
@@ -68,9 +58,7 @@ CREATE TABLE IF NOT EXISTS samples_hourly (
     vmin            REAL, vavg REAL, vmax REAL,
     PRIMARY KEY (metric_id, hour)
 );
--- The primary key leads on metric_id, so "every rollup row older than N
--- days" — what prune() asks once per maintenance pass — would scan the
--- whole table without this.
+-- The PK leads on metric_id; prune()'s "older than N days" needs this too.
 CREATE INDEX IF NOT EXISTS ix_samples_hourly_hour ON samples_hourly(hour);
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -105,22 +93,13 @@ class NodesSeriesDatabase(SqliteStore):
     # ---------------------------------------------------------------- writes
 
     def record_metric_samples(self, device_id: int, rows: list) -> dict:
-        """Every metric one poll produced, in one transaction.
-
-        `rows` is a sequence of (key, label, unit, kind, ts, value). One
-        SELECT of the device's existing metric ids, one INSERT for keys never
-        seen before, one UPDATE of the current values, one INSERT for the
-        samples — a per-sample commit is ~2,000 fsyncs on a 500-port chassis.
-
-        `kind` is written only when the metric row is created. Changing a
-        metric's kind under a chart that has months of history in the other
-        unit is not something a poll should do silently, and the poller
-        never means to: the kind is a property of the OID, not of a
-        reading. A value of None updates last_ts and stores no sample —
-        "polled, no answer" is not a zero.
-
-        Returns {key: metric_id} for every row, so a caller that needs an
-        id (a chart link, a threshold) does not have to read them back.
+        """Every metric one poll produced, in one transaction rather than a
+        per-sample commit (~2,000 fsyncs on a 500-port chassis). `kind` is
+        written only at creation — a poll must never silently change a
+        metric's unit under months of chart history. A value of None
+        updates last_ts and stores no sample: "polled, no answer" isn't a
+        zero. Returns {key: metric_id} so a caller needing an id doesn't
+        have to read it back.
         """
         latest: dict[str, tuple] = {}
         for row in rows or ():
@@ -168,9 +147,8 @@ class NodesSeriesDatabase(SqliteStore):
     def record_metric_sample(self, device_id: int, key: str, label: str,
                              unit: str, kind: str, ts: float,
                              value: float | None) -> int:
-        """One metric sample — a one-row wrapper around
-        record_metric_samples, kept for the callers (tests, on-demand
-        reads) that genuinely have exactly one."""
+        """One-row wrapper around record_metric_samples, for callers that
+        genuinely have exactly one."""
         ids = self.record_metric_samples(
             device_id, [(key, label, unit, kind, ts, value)])
         return ids[key]
@@ -189,16 +167,11 @@ class NodesSeriesDatabase(SqliteStore):
                 "SELECT * FROM metrics WHERE id = ?", (metric_id,)).fetchone()
 
     def metrics_for_keys(self, keys) -> list[sqlite3.Row]:
-        """The newest value of each named metric key, fleet-wide, in one query.
-
-        The alert engine used to read `SELECT * FROM metrics WHERE device_id
-        = ?` once per device per tick — at 2,000 devices and ~90 metrics
-        each, 400,000 full rows every five seconds through the same
-        connection and lock the poller writes with, to evaluate a handful of
-        threshold rules. It reads four columns for the keys that have a rule
-        instead. Whose devices are disabled is nodes.db's fact, so the
-        facade filters those out of this result.
-        """
+        """The newest value of each named metric key, fleet-wide, in one
+        query — replaces a per-device `SELECT *` that read 400,000 full
+        rows every five seconds at 2,000 devices to evaluate a handful of
+        threshold rules. Disabled devices are the facade's filter, not
+        this one's — that's nodes.db's fact."""
         keys = [str(k) for k in keys if k]
         if not keys:
             return []
@@ -211,11 +184,9 @@ class NodesSeriesDatabase(SqliteStore):
     _IDS_PER_QUERY = 500
 
     def metrics_for_devices(self, device_ids, keys) -> list[sqlite3.Row]:
-        """The newest value of each named metric key, for named devices only.
-
-        Chunked by _IDS_PER_QUERY for the bind-parameter reason id_chunks
-        exists for, and empty input touches the database not at all. The
-        facade drops disabled devices from the result."""
+        """The newest value of each named metric key, for named devices
+        only. Chunked by _IDS_PER_QUERY; the facade drops disabled devices
+        from the result."""
         ids = list(dict.fromkeys(int(d) for d in device_ids))
         keys = [str(k) for k in keys if k]
         if not ids or not keys:
@@ -239,13 +210,10 @@ class NodesSeriesDatabase(SqliteStore):
 
     def top_metric_rows(self, key: str, *, ascending: bool = False
                         ) -> list[sqlite3.Row]:
-        """Every device's current value of one metric key, best first.
-
-        NULL last_value rows are excluded: a metric that has never produced
-        a sample is not a zero, and sorting it as one puts silent devices at
-        the top of a "best" list and hides real ones. The facade trims this
-        to enabled devices and to `n`, which it can only do with nodes.db's
-        device rows in hand.
+        """Every device's current value of one metric key, best first. NULL
+        last_value rows are excluded — a metric with no sample yet isn't a
+        zero, and sorting it as one puts silent devices at the top. The
+        facade trims to enabled devices and to `n`.
         """
         order = "ASC" if ascending else "DESC"
         with self._lock:
@@ -259,10 +227,8 @@ class NodesSeriesDatabase(SqliteStore):
                                  like: bool = False,
                                  device_ids: list[int] | None = None
                                  ) -> list[sqlite3.Row]:
-        """Peak and mean of every matching metric series over [h0, h1], read
-        from samples_hourly (never samples — a raw scan would not finish at
-        fleet scale). report.top_metric_ranking names the devices afterwards.
-        """
+        """Peak and mean of every matching metric series over [h0, h1], from
+        samples_hourly — a raw scan wouldn't finish at fleet scale."""
         key_clause = "m.key LIKE ?" if like else "m.key = ?"
         params: list = [key]
         device_clause = ""
@@ -279,11 +245,9 @@ class NodesSeriesDatabase(SqliteStore):
                 f" SELECT c.metric_id, c.device_id, c.key, c.label, c.unit,"
                 f" MAX(sh.vmax) AS peak, SUM(sh.vavg * sh.n) AS sum_avg_n,"
                 f" SUM(sh.n) AS total_n, COUNT(*) AS n_hours"
-                # CROSS JOIN, deliberately: it disables SQLite's join reordering,
-                # forcing small `candidates` to drive the loop and huge
-                # `samples_hourly` to be probed by its own primary key per
-                # candidate — a plain JOIN let SQLite start from the hour index
-                # instead and scan every unrelated metric family's rows in range.
+                # CROSS JOIN disables join reordering: forces small `candidates`
+                # to drive the loop instead of SQLite scanning samples_hourly
+                # from the hour index across unrelated metrics.
                 f" FROM candidates c CROSS JOIN samples_hourly sh"
                 f" ON sh.metric_id = c.metric_id"
                 f" WHERE sh.hour >= ? AND sh.hour <= ? GROUP BY c.metric_id",
@@ -291,22 +255,14 @@ class NodesSeriesDatabase(SqliteStore):
 
     def series(self, device_id: int, metric_id: int, t0: float, t1: float,
                bucket_s: float = 0) -> list[dict]:
-        """Raw-vs-hourly selection: a wide window reads the rollup table
-        instead of scanning months of raw points.
-
-        `device_id` is enforced, not decorative. Metric ids are global, so
-        without the check a caller passing another device's metric id got that
-        device's data back under this device's name — which is exactly what a
-        stale dialog does when the selected device changes underneath it. A
-        mismatch now returns nothing, which reads as "no samples" rather than
-        as somebody else's traffic.
-
-        `bucket_s > 0` buckets raw samples server-side into fixed-width
-        windows aligned to epoch time (`floor(ts / bucket_s) * bucket_s`),
-        returning the same `{ts, avg, min, max}` shape the hourly rollup
-        uses so `drawSeriesChart` renders either one unchanged. Bucketing
-        only applies within the raw-sample window (<= 3 days); a wider
-        window already reads the hourly rollup and ignores `bucket_s`.
+        """Raw-vs-hourly selection: a wide window reads samples_hourly
+        instead of scanning months of raw points. `device_id` is enforced
+        since metric ids are global — a stale dialog passing a mismatched
+        id gets nothing back rather than another device's data under this
+        one's name. `bucket_s > 0` buckets raw samples server-side into the
+        same `{ts, avg, min, max}` shape the hourly rollup uses, so
+        `drawSeriesChart` renders either unchanged; ignored once a window
+        is wide enough to read the rollup instead.
         """
         with self._lock:
             if not self._conn.execute(
@@ -350,28 +306,20 @@ class NodesSeriesDatabase(SqliteStore):
     # ---------------------------------------------------------------- rollup
 
     _ROLLUP_WATERMARK = "rollup_watermark_hour"
-    # Hours already rolled up that are aggregated again on the next pass, so
-    # a sample that arrived after its hour was summarised is not lost. Two
-    # covers a poll that started before the hour ended and a clock that is a
-    # little behind.
+    # Re-aggregates the last 2 hours so a late-arriving sample (a slow poll,
+    # a lagging clock) isn't lost once its hour is summarised.
     _ROLLUP_REDO_HOURS = 2
 
     def compact_rollup(self, max_hours: int = 48) -> int:
-        """Summarise complete hours of raw samples into samples_hourly.
-
-        Raw rows are left alone (prune and the per-metric cap own their
-        lifetime), work starts from a private watermark rather than from the
-        beginning of time, and each hour is its own transaction so the lock
-        is never held across more than one. `max_hours` bounds a single
-        pass; the watermark makes the next pass continue where this one
-        stopped, so a long backlog is worked off over several passes instead
-        of in one stall.
+        """Summarise complete hours of raw samples into samples_hourly, from
+        a private watermark, one transaction per hour so the lock is never
+        held across more than one. `max_hours` bounds a single pass; the
+        watermark lets a long backlog work off over several passes.
 
         Returns the number of (metric, hour) rows written.
         """
         now = time.time()
-        # The last hour that has fully elapsed. The current hour is still
-        # collecting samples and would be summarised wrong.
+        # The current hour is still collecting samples and would summarise wrong.
         latest_complete = int(now // 3600) * 3600 - 3600
         watermark = self._private_setting(self._ROLLUP_WATERMARK)
         if watermark is None:
@@ -414,8 +362,8 @@ class NodesSeriesDatabase(SqliteStore):
     # -------------------------------------------------------------- deletion
 
     def delete_metrics_for_devices(self, device_ids) -> int:
-        """Drop every metric (and, by cascade, every sample and rollup row)
-        belonging to devices that no longer exist in nodes.db."""
+        """Drop every metric (and, by cascade, sample/rollup row) for
+        devices no longer in nodes.db."""
         ids = [int(i) for i in device_ids or ()]
         if not ids:
             return 0
@@ -430,21 +378,17 @@ class NodesSeriesDatabase(SqliteStore):
         return removed
 
     def prune_orphan_metrics(self, live_ids) -> int:
-        """Metrics whose device is gone from nodes.db — the cross-file
-        counterpart of the ON DELETE CASCADE the two tables used to share.
-        A device removed while this store was unreachable, or by a 4.x
-        binary, leaves rows only this can find."""
+        """Metrics whose device is gone from nodes.db — catches what the
+        cross-file split's ON DELETE CASCADE no longer does."""
         live = {int(i) for i in live_ids or ()}
         orphans = [i for i in self.device_ids_with_metrics() if i not in live]
         return self.delete_metrics_for_devices(orphans)
 
     def cap_samples_per_metric(self, n: int, chunk: int = 200) -> int:
-        """Keep at most the newest `n` raw samples of EACH metric.
-
-        Per metric with a window function, in chunks of `chunk` metrics,
-        taking the lock for each chunk and releasing it in between, so a poll
-        worker waits for one chunk at most. Window functions need SQLite
-        3.25; on anything older this does nothing and says so once.
+        """Keep at most the newest `n` raw samples of EACH metric, in
+        chunks of `chunk` so a poll worker waits for at most one chunk's
+        lock. Needs SQLite 3.25's window functions; older, does nothing
+        and says so once.
         """
         if n <= 0:
             return 0
@@ -478,10 +422,8 @@ class NodesSeriesDatabase(SqliteStore):
 
     def prune(self, *, sample_days: float = 3, rollup_days: float = 400,
               max_samples_per_metric: int = 0) -> int:
-        """Age out raw samples and hourly rollups. A caller that wants
-        "delete everything now" (the Settings page's maintenance button)
-        passes 0, which computes a cutoff of "now" and so matches every
-        existing row."""
+        """Age out raw samples and hourly rollups. Passing 0 (the Settings
+        page's maintenance button) matches every existing row."""
         removed = 0
         now = time.time()
         with self._lock:
@@ -503,11 +445,9 @@ class NodesSeriesDatabase(SqliteStore):
         return removed
 
     def trim_to_size(self, max_bytes: int) -> int:
-        """Delete the oldest raw samples until the file is back under its cap.
-
-        Incremental reclaim rather than VACUUM: a whole-file rewrite under
-        the module lock stalls every poll worker and HTTP handler.
-        """
+        """Delete the oldest raw samples until under the size cap.
+        Incremental reclaim, not VACUUM: a whole-file rewrite under the
+        module lock stalls every poll worker and HTTP handler."""
         if max_bytes <= 0:
             return 0
         removed = 0
@@ -531,18 +471,13 @@ class NodesSeriesDatabase(SqliteStore):
     # ------------------------------------------------------------- migration
 
     def _attached(self, legacy_path: str):
-        """ATTACH `legacy_path` as `old` for the duration of the block.
-
-        Always detached again, including on the way out of an exception:
-        an ATTACH left open makes every later VACUUM fail, and `reclaim`
-        runs from the maintenance timer without knowing a migration happened.
-        """
+        """ATTACH `legacy_path` as `old`, always detached again (even on
+        exception) — an ATTACH left open makes every later VACUUM fail."""
         store = self
 
         class _Attach:
             def __enter__(self):
-                # ATTACH is refused inside a transaction, and the shared
-                # connection may still be holding one open from a read.
+                # ATTACH is refused mid-transaction; a read may hold one open.
                 store._conn.commit()
                 store._conn.execute("ATTACH DATABASE ? AS old", (legacy_path,))
                 return store._conn
@@ -557,13 +492,10 @@ class NodesSeriesDatabase(SqliteStore):
         return _Attach()
 
     def import_legacy_metrics(self, legacy_path: str) -> tuple[int, int]:
-        """Copy every metric row across with its id intact.
-
-        The ids are what every other store already holds (an alert
-        threshold, a chart link), so they are carried, not regenerated.
-        Returns (copied here, present in the legacy file) so the caller can
-        refuse to go further if the two disagree.
-        """
+        """Copy every metric row across with its id intact — other stores
+        already hold that id (an alert threshold, a chart link). Returns
+        (copied here, present in the legacy file) so the caller can refuse
+        to go further if they disagree."""
         with self._lock, self._attached(legacy_path) as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO main.metrics(id, device_id, key, label,"
@@ -576,15 +508,10 @@ class NodesSeriesDatabase(SqliteStore):
         return here, there
 
     def rollup_legacy_samples(self, legacy_path: str, from_hour: int) -> int:
-        """Summarise the legacy raw samples from `from_hour` onwards into the
-        new rollups.
-
-        Raw samples are deliberately not copied — they are the bulk of the
-        old file and expire in three days anyway — but the partial hours
-        since the last rollup watermark would otherwise be lost outright,
-        leaving a hole at the right-hand edge of every wide chart. This is
-        the same aggregate compact_rollup does, run once over the tail.
-        """
+        """compact_rollup's aggregate, run once over the legacy tail from
+        `from_hour`: raw samples aren't copied (bulk of the old file, expire
+        in 3 days anyway), but skipping this would hole the edge of every
+        wide chart until they did."""
         latest_complete = int(time.time() // 3600) * 3600
         with self._lock, self._attached(legacy_path) as conn:
             cursor = conn.execute(
@@ -610,15 +537,11 @@ class NodesSeriesDatabase(SqliteStore):
                               min_hour: float | None = None,
                               restart: bool = False) -> int:
         """Lift `samples_hourly` out of the legacy file in rowid-cursor
-        batches, resumable across restarts.
-
-        The cursor is written in the same transaction as the rows it covers,
-        so an interrupted run resumes exactly where it stopped rather than
-        redoing work or skipping it. `INSERT OR IGNORE` guarded by an EXISTS
-        on `metrics` drops rows whose metric never made it across (a device
-        deleted mid-migration), which would otherwise violate the foreign
-        key. `restart` rewinds the cursor, for the one retry phase 3 makes
-        when a row arrived behind it. Returns the rows copied by this call.
+        batches, resumable across restarts — the cursor commits with the
+        rows it covers. The EXISTS guard on `metrics` drops rows whose
+        metric never made it across (a device deleted mid-migration).
+        `restart` rewinds the cursor for phase 3's one retry. Returns the
+        rows copied by this call.
         """
         if restart:
             self._set_private_setting(_LEGACY_ROWID, 0)
@@ -642,9 +565,8 @@ class NodesSeriesDatabase(SqliteStore):
                 break
             upper = min(low + size, end)
             started = time.monotonic()
-            # The lock and the ATTACH are per batch, not around the whole
-            # loop: phase 2 runs for minutes on a large file, and polling,
-            # charts and alerting all want this same connection meanwhile.
+            # Per batch, not around the whole loop: phase 2 runs for minutes,
+            # and polling/charts/alerting all want this connection meanwhile.
             with self._lock, self._attached(legacy_path) as conn:
                 cursor = conn.execute(
                     "INSERT OR IGNORE INTO main.samples_hourly"
@@ -663,8 +585,7 @@ class NodesSeriesDatabase(SqliteStore):
                 conn.commit()
             held = time.monotonic() - started
             low = upper
-            # Same adaptive shape as SqliteStore._delete_batches: keep one
-            # batch's lock hold near the target however wide the rows are.
+            # Same adaptive shape as SqliteStore._delete_batches.
             if held > LEGACY_LOCK_TARGET_S:
                 size = max(LEGACY_BATCH_MIN, size // 2)
             elif held < LEGACY_LOCK_TARGET_S / 4:
@@ -673,9 +594,9 @@ class NodesSeriesDatabase(SqliteStore):
 
     def legacy_rollups_missing(self, legacy_path: str,
                                min_hour: float | None = None) -> int:
-        """How many legacy rollup rows this store still does not hold, of
-        those whose metric exists here. What phase 3 checks before dropping
-        the legacy tables."""
+        """How many legacy rollup rows (of those whose metric exists here)
+        this store still lacks. What phase 3 checks before dropping the
+        legacy tables."""
         floor = 0.0 if min_hour is None else float(min_hour)
         with self._lock, self._attached(legacy_path) as conn:
             row = conn.execute(

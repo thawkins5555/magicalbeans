@@ -164,10 +164,8 @@ HR_STORAGE_FIXED_DISK = "1.3.6.1.2.1.25.2.1.4"
 # device chose, which is how a message from a loopback ends up belonging to
 # nobody. Walked rarely (see nodepoll._ADDRESS_REFRESH_S), not every poll.
 IP_ADDR_TABLE = "1.3.6.1.2.1.4.20.1.1"
-# ipAdEntIfIndex and ipAdEntNetMask, joined back onto the addresses above by
-# their shared index suffix. Best-effort extras: they say which interface an
-# alias belongs to and how wide its subnet is, which is what turns a bare
-# second address in the ADDRESSES tab into something an operator recognises.
+# Best-effort extras, joined back by shared index suffix: which interface an
+# alias belongs to and how wide its subnet is.
 IP_ADDR_IFINDEX = "1.3.6.1.2.1.4.20.1.2"
 IP_ADDR_NETMASK = "1.3.6.1.2.1.4.20.1.3"
 

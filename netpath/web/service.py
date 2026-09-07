@@ -439,13 +439,9 @@ class Service:
         self.log.add(SYSTEM, "Service started")
 
     def _start_nodes_split(self) -> None:
-        """Phase 2 of the 5.0.0 nodes.db split, on its own thread.
-
-        Only ever true on the first start after upgrading (and on the next
-        one if that start was interrupted): the hourly rollups can be
-        hundreds of megabytes and nothing should wait on them, least of all
-        the web server coming up.
-        """
+        """Phase 2 of the 5.0.0 nodes.db split, on its own thread: the
+        hourly rollups can be hundreds of megabytes and nothing, least of
+        all the web server, should wait on them."""
         if not self.nodes_db.split_pending():
             return
         self.log.add(SYSTEM, "Nodes: moving the metric history into "
@@ -469,8 +465,7 @@ class Service:
 
     def shutdown(self) -> None:
         self._stop.set()
-        # Before the databases close: this thread holds an ATTACH on nodes.db
-        # and writes to nodes_series.db.
+        # Before the databases close: holds an ATTACH on nodes.db.
         if self._nodes_split_thread is not None:
             self._nodes_split_thread.join(timeout=10.0)
             self._nodes_split_thread = None
@@ -1012,8 +1007,7 @@ class Service:
             float(self.nodes_settings.get("mac_table_retention_days", 7)) * 86400)
         self._trim_db("max_nodes_db_mb", self.nodes_db, "Nodes database",
                       "oldest events")
-        # Its own cap since 5.0.0: the metric history is where the growth
-        # is, and trimming it must not be gated on the inventory file's size.
+        # Own cap since 5.0.0: growth lives here, not in the inventory file.
         self._trim_db("max_nodes_series_db_mb", self.nodes_db.series_db,
                       "Nodes metric history", "oldest samples")
 

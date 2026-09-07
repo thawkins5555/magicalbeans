@@ -72,20 +72,15 @@
     links: [],
     peersByKey: new Map(),
     vlans: [],
-    // Rebuilt with the payload in loadMapData. Everything below used to be
-    // an Array.find() per lookup, and every one of them sits inside a loop
-    // over nodes, links or strands: nodeById in the drag path, vlanDisplay
-    // once per strand per draw, linksByNode's answer computed by scanning
-    // every link. A 60-node map with 200 links made that quadratic for no
-    // reason a Map does not fix.
+    // Rebuilt with the payload in loadMapData; replaces an Array.find()
+    // per lookup that made a 60-node/200-link map quadratic.
     nodeMap: new Map(),        // map_nodes id -> row
     linkMap: new Map(),        // link id -> link
     vlanNameById: new Map(),   // vlan id -> its name on this map ('' when unnamed)
     linksByNode: new Map(),    // map_nodes id -> the links touching it
 
-    // The drawn SVG, kept so a pan, a zoom or a drag can move what is
-    // already there instead of rebuilding the whole scene (applyTransform,
-    // redrawDragged, drawRubber).
+    // The drawn SVG, kept so pan/zoom/drag can move it instead of
+    // rebuilding (applyTransform, redrawDragged, drawRubber).
     sceneGroup: null,
     rubberEl: null,
     nodeEls: new Map(),        // map_nodes id -> its <g>
@@ -309,10 +304,8 @@
     App.rememberControl('mapper', 'mp-map', id === null ? '' : String(id));
   }
 
-  // The map id the address bar itself names, or null. refresh() prefers it
-  // over the remembered one so a reload of #/mapper/<id> loads that map
-  // once, instead of loading the remembered map first and having
-  // activate() immediately replace it with a second fetch.
+  // The map id the address bar names, or null; refresh() prefers it over
+  // the remembered one so #/mapper/<id> loads that map once, not twice.
   function routedMapId() {
     const route = App.currentRoute();
     if (!route || route.tab !== 'mapper') return null;
@@ -427,10 +420,8 @@
 
   /* ------------------------------------------------------------ map data */
 
-  // Every by-id lookup this file does, built once per payload instead of
-  // scanned per call. linksByNode is the one that is not merely a
-  // convenience: redrawDragged needs "which links touch this node" for
-  // each dragged node on every pointermove.
+  // Every by-id lookup, built once per payload instead of scanned per
+  // call; linksByNode also feeds redrawDragged's per-pointermove lookup.
   function rebuildLookups() {
     view.nodeByDevice = new Map();
     view.nodeByPeer = new Map();
@@ -509,9 +500,8 @@
   // right edge instead, so a batch add lands as N distinct, already-visible
   // boxes an operator can then arrange, not a pile they have to pull apart
   // one at a time first.
-  // `bounds` is measured once by the caller, before its loop: every node
-  // it is about to add would otherwise re-walk the whole map to place the
-  // next one, and none of them are on the map yet anyway.
+  // `bounds` is measured once by the caller before its loop, not re-walked
+  // per node added.
   function nextPlacement(index, bounds) {
     const baseX = bounds ? bounds.x + bounds.width + 100 : 0;
     const baseY = bounds ? bounds.y : 0;
@@ -614,10 +604,8 @@
       } },
     ]);
     let sort = { key: 'name', descending: false };
-    // App.grid is re-run per redraw, exactly as drawVlanTable does it: it
-    // is what replaces the table's contents. Called once outside, as this
-    // used to be, re-sorting appended a second <tbody> to the same table
-    // and the dialog showed every row twice.
+    // App.grid re-run per redraw (as drawVlanTable does): called once
+    // outside, re-sorting appended a second <tbody> and doubled every row.
     function redrawNeighbourRows() {
       const table = App.grid(box.querySelector('#mpan-table'), {
         name: 'mapper-add-neighbours', caption: 'Neighbours not yet on this map',
@@ -675,12 +663,9 @@
     return MAP_STYLES.includes(view.settings.map_style) ? view.settings.map_style : 'modern';
   }
 
-  // One <pattern> and one <rect>, not one <line> per grid step: a map
-  // spanning 6,000 units at the default 20-unit grid drew 600 line
-  // elements, every one of them a hit-testable node the browser laid out
-  // and re-laid-out on every redraw. The pattern tiles the same lines in
-  // the renderer, off the DOM entirely; .mp-grid-line still names the
-  // stroke, so the per-style rules in app.css are unchanged.
+  // One <pattern>+<rect>, not one <line> per step: a 6,000-unit map at the
+  // default 20-unit grid drew 600 hit-testable line elements, re-laid-out
+  // every redraw. .mp-grid-line still names the stroke for app.css.
   const GRID_PATTERN_ID = 'mp-grid-pattern';
 
   function drawGrid(layer, bounds) {
@@ -734,11 +719,8 @@
     // order — see that branch's own comment for why.
     const wireOne = (path, extraClass, opts = {}) => {
       const focusable = opts.focusable !== false;
-      // The text is built on the first hover or focus, not while drawing:
-      // a 30-strand link built 30 tooltip strings — each of them resolving
-      // both endpoint names and joining every VLAN id — for text nobody
-      // may ever look at. aria-label stays eager; a screen reader needs it
-      // present in the tree, not on an event.
+      // Built lazily on first hover/focus, not while drawing: a 30-strand
+      // link built 30 tooltip strings nobody may ever look at.
       let tooltipText = null;
       const tipText = () => {
         if (tooltipText === null) {
@@ -895,9 +877,7 @@
     return mode === 'trunk' || mode === 'access' ? ` · ${mode}` : '';
   }
 
-  // How many VLANs a hover, and the detail pane's first screen, name before
-  // saying how many more there are. Ten is about what fits either without
-  // pushing what follows it out of reach.
+  // How many VLANs a hover/detail-pane screen names before "N more".
   const VLAN_TOOLTIP_CAP = 10;
   const VLAN_DETAIL_CAP = 10;
 
@@ -911,12 +891,9 @@
     if (plan.known === false) {
       lines.push('No VLAN data known for this link.');
     } else {
-      // A 200-VLAN trunk listed every id here, and the tooltip is a fixed
-      // box following the pointer: it grew past the top and bottom of the
-      // window with no way to scroll it, so the lines under the VLAN list
-      // (the native-VLAN mismatch, the one thing on a trunk worth seeing
-      // at a glance) were off-screen. The detail pane, one click away, has
-      // always had the whole list and now says so.
+      // A 200-VLAN trunk listing every id grew the tooltip past the window
+      // with no scroll, hiding the native-VLAN line below it. Cap it and
+      // point to the detail pane for the rest.
       const vlans = plan.vlans || [];
       const shown = vlans.slice(0, VLAN_TOOLTIP_CAP).map(vlanDisplay).join(', ');
       lines.push(`VLANs (${vlans.length}): ${shown}`
@@ -1052,9 +1029,8 @@
     return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
   }
 
-  // `bounds` and the frame size come from the caller (draw), which has
-  // already measured both — a second contentBounds()/getBoundingClientRect()
-  // here would walk every node and force a layout for answers it holds.
+  // `bounds`/size come from draw(), which already measured both — redoing
+  // it here would force a second layout for answers it already holds.
   function fitView(bounds, width, height) {
     if (bounds && bounds.width) {
       view.zoom = Math.min(width / (bounds.width + 120), height / (bounds.height + 120), 2);
@@ -1072,11 +1048,9 @@
     return { tx: f.width / 2 - f.cx * scale + view.pan.x, ty: f.height / 2 - f.cy * scale + view.pan.y };
   }
 
-  /* One full redraw per animation frame, however many times the handlers
-     below ask for one. A pointermove fires far faster than 60 Hz on a
-     trackpad, and each of those used to rebuild every node, link, strand
-     and grid line from scratch — synchronously, inside the event. Nothing
-     here changes WHAT is drawn, only how often. */
+  // One full redraw per animation frame, however many times below ask for
+  // one — a pointermove fires faster than 60Hz and used to rebuild the
+  // whole scene synchronously, inside the event.
   let drawPending = 0;
 
   function requestDraw() {
@@ -1084,19 +1058,15 @@
     drawPending = window.requestAnimationFrame(() => { drawPending = 0; draw(); });
   }
 
-  /* Pan, zoom and Fit change nothing about the scene's contents — only
-     where it sits in the frame — so they move the one group everything is
-     inside rather than rebuilding it. Falls back to a full draw when there
-     is no scene yet (an empty map, or before the first paint). */
+  // Pan/zoom/Fit only move the scene, so they transform the one group
+  // instead of rebuilding it; falls back to a full draw with no scene yet.
   function applyTransform() {
     if (!view.sceneGroup || !view.frame) { requestDraw(); return; }
     const { tx, ty } = translation(view.zoom);
     view.sceneGroup.setAttribute('transform', `translate(${tx},${ty}) scale(${view.zoom})`);
   }
 
-  /* A drag moves the boxes being dragged and the links that touch them.
-     Everything else on the map is unaffected, so a full redraw per
-     pointermove was rebuilding a whole scene to move one node. */
+  // Redraws only the dragged nodes and the links touching them.
   function redrawDragged() {
     if (!view.nodeDrag || !view.nodeEls.size) { requestDraw(); return; }
     const touched = new Set();
@@ -1116,9 +1086,8 @@
     }
   }
 
-  /* Selection is a class on elements that already exist. Toggling it in
-     place matters most at the start of a drag: a full redraw there would
-     replace the very <g> the pointer is captured on. */
+  // Toggles a class in place: a full redraw at drag-start would replace
+  // the very <g> the pointer is captured on.
   function applySelectionClasses() {
     if (!view.nodeEls.size) { requestDraw(); return; }
     for (const [id, el] of view.nodeEls) el.classList.toggle('selected', view.selection.has(id));
@@ -1129,9 +1098,8 @@
     }
   }
 
-  /* The rubber band is one rect that lives for as long as the scene does,
-     moved in place — it used to be appended by draw(), so dragging a
-     selection box rebuilt the entire map on every pointermove. */
+  // One persistent rect moved in place, not re-appended by draw() per
+  // pointermove.
   function drawRubber() {
     const el = view.rubberEl;
     if (!el) { requestDraw(); return; }
@@ -1166,10 +1134,8 @@
     }
     showCanvas(svg, canvas);
 
-    // The frame's SIZE is re-read every draw (the pane is resizable, and a
-    // frame measured before the first paint is 200x200), but its centre and
-    // zoom are the operator's own view once they have panned or zoomed, so
-    // only a first draw or an explicit Fit recomputes those.
+    // Size is re-read every draw (the pane is resizable); centre/zoom are
+    // the operator's own view once set, so only a first draw or Fit resets them.
     const bounds = contentBounds();
     if (!view.frame || !view.userZoom) fitView(bounds, width, height);
     else { view.frame.width = width; view.frame.height = height; }
@@ -1180,8 +1146,7 @@
     group.append(gridLayer, linkLayer, nodeLayer);
     svg.appendChild(group);
     if (shouldDrawGrid() && bounds) drawGrid(gridLayer, bounds);
-    // Each link into its own <g>: redrawDragged empties and refills just
-    // the groups whose endpoints moved.
+    // Own <g> per link: redrawDragged refills just the ones that moved.
     for (const link of view.links) {
       const holder = App.svgNode('g');
       linkLayer.appendChild(holder);
@@ -1447,9 +1412,8 @@
           `${link.native_vlan === vlan ? '  (native)' : ''}`);
       }
       if (!all) {
-        // The list is behind a button rather than truncated outright: a
-        // 200-VLAN trunk pushed Last seen — and every link below it — off
-        // the bottom of a pane the operator cannot resize.
+        // Behind a button, not truncated outright: a 200-VLAN trunk pushed
+        // Last seen off the bottom of a pane the operator can't resize.
         lines.push(`<button data-show-all-vlans>Show all ${vlans.length}</button>`);
       }
     }
@@ -1459,9 +1423,8 @@
 
   /* -------------------------------------------------------- pointer input */
 
-  // null until draw() has established a frame — an empty map, or a pointer
-  // that reached the canvas before the first paint, has no scene to point at
-  // and reading view.frame.width there is a TypeError, not a coordinate.
+  // null until draw() sets a frame — an empty map or a pre-paint pointer
+  // event has no scene to point at.
   function scenePoint(event) {
     if (!view.frame) return null;
     const svg = App.el('mp-svg');
@@ -1923,13 +1886,10 @@
       const computed = getComputedStyle(liveEls[i]);
       for (const prop of props) {
         const value = computed.getPropertyValue(prop);
-        // A paint SERVER reference (the grid's fill="url(#mp-grid-pattern)")
-        // is the one computed value that must not be copied: the browser
-        // reports it absolutised against this page's URL, which resolves to
-        // nothing inside a detached copy loaded as an image. The clone's own
-        // attribute already carries the same-document "#id" form, and the
-        // pattern itself is in the serialised tree, so leaving it alone is
-        // what keeps the grid in the PNG.
+        // Skip a paint-server url(...) (the grid's fill): the browser
+        // reports it absolutised against this page, which resolves to
+        // nothing in a detached clone. The clone's own "#id" form already
+        // works since the pattern is in the serialised tree.
         if (!value || value.startsWith('url(')) continue;
         cloneEls[i].style.setProperty(prop, value);
       }
@@ -1997,10 +1957,8 @@
       const initial = known(routed) ? routed
         : (known(recalled) ? recalled : (view.maps.length ? view.maps[0].id : null));
       if (initial !== null) {
-        // Stamped BEFORE the await, not after it: the poll tick that lands
-        // while this first load is still in flight would otherwise see no
-        // stamp at all, decide a refresh is due, and start a second load of
-        // the same map against the first.
+        // Stamped before the await: a poll tick during this load would
+        // otherwise see no stamp, decide a refresh is due, and double-load.
         view.lastAutoTs = Date.now();
         await selectMap(initial, { noRoute: true });
         return;
@@ -2055,8 +2013,8 @@
     App.el('mp-add-neighbours').onclick = openAddNeighbours;
     App.el('mp-remove-node').onclick = removeSelected;
     App.el('mp-align').onclick = alignDialog;
-    // Fit recomputes the frame from what is on screen now, then moves the
-    // scene into it: nothing about the drawing itself changes.
+    // Recomputes the frame from what's on screen, then moves the scene —
+    // nothing about the drawing itself changes.
     App.el('mp-fit').onclick = () => {
       const box = App.el('mp-canvas').getBoundingClientRect();
       fitView(contentBounds(), Math.max(box.width, 200), Math.max(box.height, 200));
@@ -2095,9 +2053,8 @@
   }
 
   App.pages.mapper = {
-    // fastTick runs every beat and drawLegend rewrote the same sentence
-    // into the DOM each time. The legend only changes when the map's data
-    // does, so loadMapData() and activate() are the two places that draw it.
+    // The legend only changes with the map's data, so loadMapData()/
+    // activate() draw it, not fastTick (which ran every beat before).
     init, refresh, activate, fastTick,
   };
 })();

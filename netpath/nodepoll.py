@@ -1170,14 +1170,11 @@ class NodePoller(Worker):
         unless its job was started with the allow-ping-only option — the
         checkbox state in the browser is a convenience, this is the rule.
 
-        A result the sweep folded into another (the same box answered on a
-        second L3 address) is promoted as its primary instead, so ticking
-        either row adds the one device. And a result whose walked
-        addresses name a device already on file is recorded ON that device
-        rather than added beside it: one node per device is the point, and
-        an address is the only evidence strong enough to decide it without
-        asking. `force` skips that fold for the operator who has looked at
-        the pair and says they are genuinely two boxes.
+        A result folded into another (same box, second L3 address) is
+        promoted as its primary, so ticking either row adds one device;
+        a result whose walked addresses match a device already on file is
+        recorded on that device rather than added beside it. `force` skips
+        that fold for an operator who says they're genuinely two boxes.
         """
         job = self.db.discovery_job(job_id)
         allow_ping_only = bool(job and job["allow_ping_only"])
@@ -1258,9 +1255,8 @@ class NodePoller(Worker):
         return device_ids
 
     def _folded_family(self, job_id: int) -> dict[int, list[int]]:
-        """`{primary result id: [ids folded into it]}` for one sweep, read
-        once per promote() rather than once per promoted row — a promote-all
-        over a large job used to re-read the whole results table per tick."""
+        """`{primary result id: [ids folded into it]}`, read once per
+        promote() rather than once per row (promote-all on a large job)."""
         family: dict[int, list[int]] = {}
         for row in self.db.discovery_results(job_id):
             if "folded_into_result_id" not in row.keys():
@@ -1272,9 +1268,8 @@ class NodePoller(Worker):
 
     def _mark_promoted_family(self, result_id: int, device_id: int,
                               family: dict[int, list[int]]) -> None:
-        """Mark the promoted row and every row this sweep folded into it,
-        so the results table shows all of that device's addresses as
-        already added rather than only the one that was ticked."""
+        """Mark the promoted row and every row folded into it, so all of
+        that device's addresses show as added, not only the one ticked."""
         self.db.mark_promoted(result_id, device_id)
         for folded_id in family.get(result_id, ()):
             self.db.mark_promoted(folded_id, device_id)
@@ -2491,10 +2486,8 @@ class NodePoller(Worker):
             rows = self._walk_column(device, config, nodeoids.IP_ADDR_TABLE)
         except SnmpError:
             return
-        # The two extra columns are joined on the index suffix, which for
-        # ipAddrTable is the address itself. Each is its own best-effort
-        # walk: an agent that answers ipAdEntAddr and nothing else still
-        # gets its addresses recorded, just without the detail.
+        # Joined on the index suffix (the address, for ipAddrTable); each
+        # is its own best-effort walk so a partial answer still records.
         details = {}
         for oid, key in ((nodeoids.IP_ADDR_IFINDEX, "if_index"),
                          (nodeoids.IP_ADDR_NETMASK, "netmask")):
@@ -2505,8 +2498,7 @@ class NodePoller(Worker):
             for suffix, value in extra.items():
                 if value is None or value == "":
                     continue
-                # record_device_addresses looks the details up by the folded
-                # form, so the key has to be folded here too.
+                # Must match record_device_addresses' folded lookup key.
                 address = nodesdb.alias_candidate(rows.get(suffix) or suffix)
                 if not address:
                     continue

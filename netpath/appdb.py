@@ -213,11 +213,9 @@ GLOBAL_DEFAULTS = {
     "session_max_hours": 12,
     "max_trace_db_mb": 512,
     "max_flow_db_mb": 2048,
-    # nodes.db is the device inventory plus its two event tables since
-    # 5.0.0 — it barely grows. The metric history that used to fill it is
-    # nodes_series.db, which keeps the old figure. nodes_mibs.db is
-    # deliberately uncapped: a MIB file is not history, and trimming it
-    # would silently un-decode traps.
+    # nodes.db is just the inventory since 5.0.0 and barely grows; the
+    # metric history moved to nodes_series.db below. nodes_mibs.db is
+    # uncapped on purpose: trimming a MIB file would silently un-decode traps.
     "max_nodes_db_mb": 1024,
     "max_nodes_series_db_mb": 1024,  # samples accumulate; closer to flows than traps
     "max_alerts_db_mb": 128,       # alert/notification history, much lighter

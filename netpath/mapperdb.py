@@ -295,15 +295,10 @@ class MapperDatabase(SqliteStore):
         return changed
 
     def reassign_device(self, old_device_id: int, new_device_id: int) -> int:
-        """Two device rows turned out to be one device: every placement of
-        the old id becomes a placement of the new one.
-
-        On a map where both were placed, the old node is deleted rather
-        than repointed — ux_map_nodes_device would refuse the update, and
-        two icons for one switch is exactly what the merge is undoing. The
-        winner's own position is the one kept: it is the node the operator
-        has been looking at.
-        """
+        """Two device rows turned out to be one: every placement of the old
+        id becomes a placement of the new one. Where a map has both
+        placed, the old node is deleted, not repointed — the unique index
+        would refuse it, and the winner's own position is the one kept."""
         moved = 0
         now = time.time()
         with self._lock:

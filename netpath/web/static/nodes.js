@@ -1039,10 +1039,8 @@
     return geo;
   }
 
-  // The device dialog's RESOURCES section: one small chart per metric that
-  // is actually present on this device, in this order. `peak` pins the axis
-  // the way the loss chart's 100 does; null leaves it auto-scaled, since a
-  // chassis has no fixed temperature ceiling to pin against.
+  // Device dialog RESOURCES: one chart per metric present, in this order.
+  // `peak` pins the axis (like the loss chart's 100); null auto-scales.
   const RESOURCE_METRICS = [
     ['cpu_pct', 'var(--accent)', 100],
     ['mem_pct', 'var(--ok)', 100],
@@ -1386,13 +1384,10 @@
       });
     }
 
-    /* Packet loss and the RESOURCES charts share this one window and one
-       /metrics fetch — the samples are already there: the poller records
-       ping_loss_pct, cpu_pct, mem_pct and temp_chassis_c on every poll that
-       gathers them, so this reads endpoints that already exist rather than
-       storing anything new. A metric row only exists once a device has
-       actually reported it, which is a real state to render (not probed,
-       no chassis sensor, ...) rather than an error. */
+    /* Packet loss and the RESOURCES charts share one window and one
+       /metrics fetch. A metric row only exists once a device has actually
+       reported it, which is a real state to render (not probed, no
+       chassis sensor, ...), not an error. */
     async function loadCharts() {
       if (!current()) { stopLoss(); return; }
       const requestId = (lossRequestId += 1);
@@ -2540,13 +2535,9 @@
     }
   }
 
-  /* ---------------------------------------------------------- addresses
-
-     Every L3 address this device answers on. The configured one is listed
-     first and marked, because a list of "this device's addresses" that
-     silently leaves out the address the operator typed is a list nobody
-     can read. The rest come from the hourly ipAddrTable walk, from a
-     discovery sweep that reached the same box twice, or from a merge. */
+  // Every L3 address this device answers on; the configured one is listed
+  // first and marked. The rest come from the ipAddrTable walk, a sweep
+  // that reached the same box twice, or a merge.
   function drawAddressesTable() {
     const table = App.el('nd-addr-table');
     if (!table) return;
@@ -2575,14 +2566,9 @@
     App.wireRowKeyboard(body);
   }
 
-  /* ---------------------------------------------------------- duplicates
-
-     Two device rows that are one device — a router added once per L3
-     address, a switch imported twice under two hostnames. Nothing here
-     ever merges on its own: the listing is evidence, the merge dialog is
-     a preview, and the operator presses the button. Fetched only when the
-     dialog is opened, never on the refresh tick — it is three self-joins
-     over the whole fleet and nothing about it moves between polls. */
+  // Two device rows that are one device. Nothing here merges on its own —
+  // the listing is evidence, the operator presses the button. Fetched only
+  // on open, not the refresh tick: it's three self-joins over the fleet.
   async function duplicatesDialog() {
     const { duplicates } = await App.get('/api/nodes/duplicates');
     const rowsHtml = duplicates.map((d) => `<tr>` +
@@ -2613,9 +2599,8 @@
     }
   }
 
-  /* One pair, with the preview the server computed for whichever winner is
-     selected. Swapping the radio re-previews rather than guessing: which
-     row survives decides what is discarded, and the counts change with it. */
+  // One pair, with the server-computed preview for whichever winner is
+  // selected; swapping the radio re-previews rather than guessing.
   async function mergeDialog(pair) {
     let winnerId = pair.suggested_winner_id;
     const sideHtml = (id, name, ip) => `<label class="check">
@@ -2643,9 +2628,8 @@
             return result;
           })()) },
     ]);
-    // App.modal renders a button spec, so the gate has to be put on the
-    // element afterwards — the same shape every other danger button in this
-    // file that has to survive applyPermissions()'s re-check uses.
+    // Gate goes on the element after render, like every other danger
+    // button here that must survive applyPermissions()'s re-check.
     for (const button of box.querySelectorAll('.modal-buttons button')) {
       if (button.textContent === 'Merge') button.dataset.requiresWrite = 'nodes';
     }
@@ -3503,10 +3487,8 @@
           `<td>${escape(p.kind)}: ${escape(p.reason || '')}</td></tr>`).join('') +
         '</tbody></table></div>';
     }
-    // A row refused because some device already answers on that address is
-    // the one refusal an operator can legitimately overrule: two boxes
-    // really can sit behind one NAT'd management address. Offered only
-    // when there is such a row, and never pre-pressed.
+    // The one refusal an operator can legitimately overrule: two boxes can
+    // sit behind one NAT'd management address.
     const owned = result.duplicate.filter((r) => r.device_id);
     if (owned.length && retryForced) {
       html += `<p><button type="button" id="nd-import-force">Import those ` +
@@ -3600,10 +3582,8 @@
     box.querySelector('#nd-import-text').oninput = () => updateImportPreview(box);
   }
 
-  /* The 409 from POST /api/nodes/devices, in the dialog that caused it: the
-     device the address already belongs to, named and linked, plus the one
-     button that overrules it. Not a confirm — the operator has to have read
-     which device it collided with before "add anyway" means anything. */
+  // The 409's conflicting device, named and linked, plus the button that
+  // overrules it — not a confirm, so the operator has to read it first.
   function showDuplicateNotice(box, payload, onForce) {
     const duplicate = (payload || {}).duplicate_of;
     if (!duplicate) return;
@@ -3625,8 +3605,7 @@
      Syslog and SNMP Trap turn "nobody has this address" into one click
      instead of a copy-paste across two tabs. */
   function addDevice(preset) {
-    // Set by "Add anyway" only, and only after the refusal above has been
-    // shown: the server refuses a second time otherwise.
+    // Set only by "Add anyway", after the refusal has been shown.
     let force = false;
     const box = App.modal('Add device', deviceForm(preset || {}), [
       { label: 'Cancel', onClick: App.closeModal },
@@ -4419,11 +4398,9 @@
     return !r.existing_device_id && !!(r.snmp_ok || (job && job.allow_ping_only));
   }
 
-  /* What the sweep thinks this row already is. `high` is an address one of
-     this application's devices already answers on, which promote() folds
-     onto that device rather than adding beside it; `medium` is a hostname
-     and sysObjectID that match and nothing else, which is a reason to look
-     before ticking, not a reason to skip. */
+  // What the sweep thinks this row already is: `high` (a known address,
+  // folded by promote()) or `medium` (name+sysObjectID match only — look
+  // before ticking, don't skip).
   function discDuplicateCell(r) {
     if (r.existing_device_id) {
       return `<a href="#/nodes/device/${r.existing_device_id}">${
@@ -4436,9 +4413,8 @@
       `</span> <span class="hint">(${escape(r.duplicate_confidence || '')})</span>`;
   }
 
-  /* The IP cell says how many OTHER addresses the same box answered on, so
-     one row standing for a router with three L3 addresses does not read as
-     a sweep that missed the other two. */
+  // Shows how many OTHER addresses this box answered on, so one row for a
+  // 3-address router doesn't read as a sweep that missed the other two.
   function discIpCell(r) {
     const extra = Math.max(0, (r.addresses || []).length - 1);
     return `${escape(r.ip)}${extra ? ` <span class="hint" title="${
@@ -4742,9 +4718,9 @@
     const r = await App.get(`/api/nodes/discovery/${job.id}`);
     const results = r.results;
     const found = results.filter((x) => x.ping_ok || x.snmp_ok);
-    // A row the sweep matched to a device already on file starts unticked
-    // whatever its confidence: pre-ticking a probable duplicate is how one
-    // gets added by an operator who trusted the dialog's own defaults.
+    // A row matched to a device already on file starts unticked regardless
+    // of confidence — pre-ticking a probable duplicate is how one gets
+    // added on trust in the dialog's defaults.
     const seed = new Set(results.filter(
       (x) => x.snmp_ok && !x.existing_device_id && !x.duplicate_of_device_id)
       .map((x) => x.id));

@@ -309,12 +309,10 @@ CREATE TABLE IF NOT EXISTS port_vlans (
 -- vlan_ports_for_devices/port_vlans_for_devices (MAPPER's own bounded shape,
 -- devices_by_ids' "many known ids, one indexed read" applied to each table)
 -- and the single-device vlans_for/port_vlans_for all filter by device_id,
--- one id or a handful via IN(...) — never nothing. Each of the three PRIMARY
--- KEYs above already LEADS with device_id, and SQLite implements a
--- non-INTEGER primary key as an index, so that lookup is served already: the
--- separate ix_vlans_device/ix_vlan_ports_device/ix_port_vlans_device this
--- block used to declare duplicated it exactly, and were three more B-trees
--- to write on every VLAN walk for nothing. _migrate drops them.
+-- one id or a handful via IN(...) — never nothing. Each PRIMARY KEY above
+-- already leads with device_id, so the separate ix_*_device indexes this
+-- block used to declare were redundant B-trees on every VLAN walk.
+-- _migrate drops them.
 
 -- metrics, samples and samples_hourly live in nodes_series.db since 5.0.0
 -- (see nodesseriesdb.py); mib_files and mib_objects in nodes_mibs.db (see
@@ -533,10 +531,8 @@ DEFAULTS = {
     "vendor_walk_budget_s": 20.0,
     "vendor_walk_parallel": 4,
     "discovery_arc_hop": True,
-    # A bounded ipAdEntAddr walk per identified address, so a sweep that
-    # reaches one router on two of its L3 addresses can tell it is one
-    # router rather than offering it twice. Off makes a sweep exactly
-    # 4.54's: one row per address, nothing folded.
+    # Folds a router reached on two L3 addresses into one offer; off makes
+    # a sweep exactly 4.54's (one row per address, nothing folded).
     "discovery_addresses": True,
 }
 
@@ -765,10 +761,8 @@ class NodesDatabase(SqliteStore):
         # polled. The scheduler holds one merged config per device and
         # rebuilds it only when this moves — see config_generation().
         self._config_generation = 0
-        # The two sibling files, opened before super().__init__ because
-        # _before_schema runs the migration into them. No constructor
-        # parameter and no CLI flag on the Service side, the same precedent
-        # mapper.db set: a derived sibling path, overridable here for tests.
+        # Opened before super().__init__: _before_schema migrates into them.
+        # Derived sibling paths, overridable here for tests, same as mapper.db.
         memory = (not path) or path == ":memory:" or path.startswith("file:")
         self.series_db = NodesSeriesDatabase(
             ":memory:" if memory and not series_path
@@ -795,9 +789,8 @@ class NodesDatabase(SqliteStore):
             "device_group_id":
                 "INTEGER REFERENCES device_groups(id) ON DELETE SET NULL",
             "display_name_source": "TEXT NOT NULL DEFAULT 'auto'",
-            # A plain integer since 5.0.0: mib_files lives in nodes_mibs.db
-            # now, so there is no table here to reference. remove_mib_file
-            # NULLs the assignments the dropped constraint used to.
+            # Plain integer since 5.0.0: mib_files moved to nodes_mibs.db, so
+            # there's no local table to reference; remove_mib_file NULLs it.
             "mib_file_id": "INTEGER",
             "ping_count": "INTEGER",
             "ping_timeout_ms": "INTEGER",
@@ -940,36 +933,26 @@ class NodesDatabase(SqliteStore):
             "stp_state": "TEXT", "poe_power_mw": "INTEGER",
         })
 
-        # Every L3 address a sweep reached one device on, as JSON, and the
-        # result this one was folded into when two probed addresses turned
-        # out to be the same box.
+        # A sweep's reached addresses (JSON) and, if folded into another
+        # result as the same box, that result's id.
         self.ensure_columns("discovery_results", {
             "ip_addresses": "TEXT", "folded_into_result_id": "INTEGER",
         })
-        # What the hourly ipAddrTable walk reads beside the address itself,
-        # so an alias can be shown as the interface and subnet it belongs to
-        # rather than a bare address.
+        # Lets an alias show as the interface/subnet it belongs to.
         self.ensure_columns("device_addresses", {
             "if_index": "INTEGER", "netmask": "TEXT",
         })
-        # _NEIGHBOR_MATCH_SQL's two case-insensitive joins, which every
-        # neighbour read and every map GET runs. Declared NOCASE because a
-        # collated comparison can only use an index of the SAME collation:
-        # devices(name COLLATE NOCASE, ip) already existed for the sysName
-        # join's first half, these two are the other half and the chassis-MAC
-        # join. In _migrate rather than SCHEMA only so the three DROPs below
-        # sit with them; on a fresh file both are created on the first open
-        # exactly as a SCHEMA line would have been.
+        # NOCASE, for _NEIGHBOR_MATCH_SQL's case-insensitive joins: a
+        # collated comparison can only use an index of the same collation.
+        # Here rather than SCHEMA so the DROPs below sit with them.
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_devices_sys_name_nocase"
             " ON devices(sys_name COLLATE NOCASE)")
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_interfaces_phys_addr_nocase"
             " ON interfaces(phys_addr COLLATE NOCASE)")
-        # Duplicates of the three PRIMARY KEYs they sat beside (each leads
-        # with device_id), so they answered nothing the table's own index did
-        # not and cost a write per VLAN row walked. Dropped rather than left
-        # in place: an upgraded database keeps them until this runs.
+        # Duplicates of the PRIMARY KEYs they sat beside; upgraded databases
+        # keep them until this runs.
         for name in ("ix_vlans_device", "ix_vlan_ports_device", "ix_port_vlans_device"):
             self._conn.execute(f"DROP INDEX IF EXISTS {name}")
 
@@ -1395,15 +1378,9 @@ class NodesDatabase(SqliteStore):
                 "SELECT id FROM devices WHERE enabled = 0").fetchall()}
 
     def metrics_for_keys(self, keys) -> list[sqlite3.Row]:
-        """The newest value of each named metric key, fleet-wide.
-
-        Disabled devices are excluded here rather than by the caller: a
-        device somebody turned off is not being polled, so its last value is
-        by definition stale and must not hold an alert open. The filter is
-        done in Python because `enabled` and the metric now live in
-        different files, and a device nobody has disabled is the overwhelming
-        common case — the set is normally empty.
-        """
+        """The newest value of each named metric key, fleet-wide; excludes
+        disabled devices in Python since `enabled` and the metric now live
+        in different files."""
         rows = self.series_db.metrics_for_keys(keys)
         if not rows:
             return rows
@@ -1414,24 +1391,14 @@ class NodesDatabase(SqliteStore):
 
     # ------------------------------------------------- bounded fleet reads
     #
-    # metrics_for_keys above is the RIGHT read for the alert engine, which
-    # genuinely evaluates every device. It is the wrong one for a caller
-    # that already knows which handful of devices it is drawing — MAPPER's
-    # map GET reads two metric keys and a port count for the devices one
-    # map places, and used to pull the whole fleet's rows for the first and
-    # run one interfaces() query per node for the second. These four are
-    # the "many known ids, one indexed read" shape devices_by_ids
-    # established, applied to the four things that route asks for. Each
-    # chunks by _IDS_PER_QUERY for the same bind-parameter reason, and each
-    # returns an empty result for empty input without touching the database.
+    # For a caller that already knows which handful of devices it wants
+    # (MAPPER's map GET, e.g.) rather than the whole-fleet reads above.
+    # Each chunks by _IDS_PER_QUERY and returns empty for empty input
+    # without touching the database.
 
     def metrics_for_devices(self, device_ids, keys) -> list[sqlite3.Row]:
         """The newest value of each named metric key, for named devices only.
-
-        Disabled devices are excluded exactly as metrics_for_keys excludes
-        them, and for the same reason: a device nobody is polling has no
-        current reading, whoever is asking. The chunked read is the series
-        store's; only the enabled filter needs this file."""
+        Excludes disabled devices, same as metrics_for_keys."""
         rows = self.series_db.metrics_for_devices(device_ids, keys)
         if not rows:
             return rows
@@ -1442,11 +1409,8 @@ class NodesDatabase(SqliteStore):
 
     def interface_counts(self, device_ids) -> dict:
         """{device_id: how many interface rows it has}, for named devices.
-
-        A device with no interface rows at all is absent from the result
-        rather than present with 0 — "never polled" and "polled, has no
-        ports" are different facts, and only the caller knows which of the
-        two it wants to draw."""
+        A device with no rows is absent, not 0 — "never polled" vs. "polled,
+        no ports" are different facts."""
         ids = list(dict.fromkeys(int(d) for d in device_ids))
         if not ids:
             return {}
@@ -1464,10 +1428,8 @@ class NodesDatabase(SqliteStore):
 
     def interface_port_labels_for_devices(self, device_ids) -> list[sqlite3.Row]:
         """(device_id, if_index, descr, alias) for named devices — the four
-        columns a port LABEL needs, not the whole interface row. What
-        api._neighbor_local_port_labeler prefills its cache from, so a map
-        GET asks once for every device it places instead of once per
-        device as each first neighbour row reaches the closure."""
+        columns a port LABEL needs. Prefills api._neighbor_local_port_labeler's
+        cache in one query instead of one per device."""
         ids = list(dict.fromkeys(int(d) for d in device_ids))
         if not ids:
             return []
@@ -1487,14 +1449,8 @@ class NodesDatabase(SqliteStore):
         return self.interface_port_labels_for_devices([device_id])
 
     def device_summaries(self) -> list[sqlite3.Row]:
-        """Every device, but only the seven columns a picker needs: id, ip,
-        status, vendor, and the three namelookup.device_name reads
-        (name, sys_name, display_name_source).
-
-        devices() returns SELECT * — around forty columns including
-        sysDescr and the vendor-evidence text — which is what MAPPER's
-        "Add device" list was paying for a name, an address and a vendor
-        per row."""
+        """The seven columns a device picker needs, not devices()'s
+        forty-odd (SELECT * including sysDescr and vendor-evidence text)."""
         with self._lock:
             return self._conn.execute(
                 "SELECT id, name, ip, status, vendor, sys_name, display_name_source"
@@ -1900,10 +1856,9 @@ class NodesDatabase(SqliteStore):
         device_id_for_address already falls back to it. Which addresses
         may be stored at all is alias_candidate's decision.
 
-        `details` is {ip: {"if_index": int, "netmask": str}} where the
-        walk read them. COALESCEd rather than overwritten, so a source
-        that knows only the address (a trap, or a discovery fold) never
-        erases what the poller's fuller walk already learned.
+        `details` is {ip: {if_index, netmask}}; COALESCEd rather than
+        overwritten so a source that only knows the address never erases
+        what a fuller walk already learned.
         """
         now = time.time()
         details = details or {}
@@ -1964,10 +1919,8 @@ class NodesDatabase(SqliteStore):
     # ------------------------------------------- identity, duplicates, merge
 
     def address_owners(self) -> dict[str, int]:
-        """Every alias address in the fleet -> the device that answers on
-        it. One read rather than a device_id_for_address() per candidate:
-        discovery asks this once per sweep and then tests every address it
-        walked against the answer."""
+        """Every alias address -> the device that answers on it. One read
+        for discovery to test a whole sweep against, not one per address."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT ip, device_id FROM device_addresses"
@@ -1976,9 +1929,9 @@ class NodesDatabase(SqliteStore):
 
     def devices_by_identity(self) -> dict[tuple, sqlite3.Row]:
         """(sys_name lowercased, sysObjectID) -> the lowest-id device that
-        answers with both. Only ever a hint — two switches out of the same
-        box with the same default hostname share this key honestly — which
-        is why nothing folds on it without an address to agree."""
+        answers with both. A hint only — two switches with the same
+        default hostname share this key honestly — so nothing folds on
+        it without an address to agree."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM devices WHERE sys_name <> '' AND"
@@ -1990,26 +1943,17 @@ class NodesDatabase(SqliteStore):
                 ((row["sys_name"] or "").lower(), row["sys_object_id"] or ""), row)
         return index
 
-    # A MAC every member of an HSRP/VRRP group answers with. Two routers
-    # sharing one of these are a working redundant pair, which is the
-    # opposite of the same device twice, so a match on one is no evidence
-    # at all rather than weak evidence.
+    # HSRP/VRRP MACs every group member answers with — a shared one means a
+    # working redundant pair, not a duplicate device, so it's no evidence.
     _VIRTUAL_MAC_PREFIXES = ("00005e0001", "00005e0002", "00000c07ac")
 
     def duplicate_candidates(self, limit: int = 200) -> list[dict]:
         """Pairs of devices that look like one device entered twice, newest
-        evidence first. Never acts: every pair here is something an
-        operator is asked about, because the three sources below are each
-        wrong in a way only a human can see — a NAT'd management address, a
-        chassis MAC reused across a stack, a hostname a template set on
-        forty switches.
-
-        Confidence is what the evidence can carry on its own: an address
-        two devices both claim is one device answering twice (high); a
-        shared chassis MAC is high with a second MAC or a matching hostname
-        behind it and medium alone; hostname plus sysObjectID is medium;
-        hostname alone is low.
-        """
+        evidence first. Never acts — each of the three sources below can be
+        wrong in a way only a human can see (a NAT'd address, a chassis MAC
+        reused across a stack, a templated hostname), so confidence reflects
+        how much the evidence alone can carry, from a shared address (high)
+        down to a shared hostname alone (low)."""
         pairs: dict[tuple, dict] = {}
 
         def entry(a_id: int, b_id: int) -> dict:
@@ -2112,19 +2056,12 @@ class NodesDatabase(SqliteStore):
         return {"loser_id": loser_id, "winner_id": winner_id, "counts": counts}
 
     def merge_devices(self, loser_id: int, winner_id: int) -> dict:
-        """Fold the loser into the winner: one transaction, and the loser's
-        row is gone at the end of it.
-
-        What moves is what belongs to the box rather than to the row — its
-        addresses (its own primary among them, now an alias saying where it
-        used to be reachable), the events that are its history, and
-        anything pointing at it. What does NOT move is the polled state
-        both rows hold twice over: interfaces, metrics, MAC and neighbour
-        tables are the same physical ports read through a second address,
-        and the winner is already refreshing them. Those go with the loser
-        through the FK cascade, except vlans/vlan_ports/port_vlans, which
-        have no foreign key and are deleted here by hand.
-        """
+        """Fold the loser into the winner in one transaction. Moves what
+        belongs to the box (addresses, event history, anything pointing at
+        it); leaves the polled state both rows hold twice over (interfaces,
+        metrics, MAC/neighbour tables) to the FK cascade and the winner's
+        own refresh, except vlans/vlan_ports/port_vlans, which have no FK
+        and are deleted here by hand."""
         plan = self.merge_plan(loser_id, winner_id)
         now = time.time()
         with self._lock:
@@ -2392,15 +2329,10 @@ class NodesDatabase(SqliteStore):
         " byname.id AS matched_by_name_id,"
         " bymac.id AS matched_by_mac_id"
         " FROM neighbors n"
-        # COLLATE NOCASE, not LOWER() on both sides: the two mean the same
-        # thing to SQLite (NOCASE folds the same ASCII range LOWER does),
-        # but LOWER(column) is an expression, so every one of these three
-        # joins had to read and fold every row of the table it joins —
-        # devices twice and interfaces once, per neighbour row. As a plain
-        # collated comparison they are index lookups instead
-        # (ix_devices_name_ip, ix_devices_sys_name_nocase,
-        # ix_interfaces_phys_addr_nocase, all declared NOCASE so the
-        # planner may use them for exactly this comparison).
+        # COLLATE NOCASE, not LOWER() on both sides: LOWER(column) is an
+        # expression, so it forced a full scan per neighbour row instead of
+        # the NOCASE indexes (ix_devices_name_ip, ix_devices_sys_name_nocase,
+        # ix_interfaces_phys_addr_nocase) being usable as index lookups.
         " LEFT JOIN devices byname"
         "   ON byname.enabled = 1 AND n.sys_name != ''"
         "   AND (byname.name = n.sys_name COLLATE NOCASE"
@@ -3572,15 +3504,10 @@ class NodesDatabase(SqliteStore):
              event_days: float = 180, poll_days: float = 0,
              discovery_days: float = 30,
              max_samples_per_metric: int = 0) -> int:
-        """Trims the unbounded tables only: device/interface events and
-        discovery jobs here, samples and rollups in the series store.
-        Devices, groups, interfaces and MIBs are current-state tables, never
-        pruned by age.
-
-        The orphan sweep at the end is what the ON DELETE CASCADE between
-        `devices` and `metrics` used to do for free — a device removed by a
-        4.x binary, or while the series file could not be opened, leaves
-        rows nothing else would ever find."""
+        """Trims the unbounded tables: events and discovery jobs here,
+        samples/rollups in the series store. The orphan sweep at the end
+        replaces the ON DELETE CASCADE that used to link devices to
+        metrics before the 5.0.0 split."""
         removed = 0
         now = time.time()
         with self._lock:
@@ -3652,11 +3579,9 @@ class NodesDatabase(SqliteStore):
 
     # ------------------------------------------------------ series delegation
     #
-    # Everything from here to "end of delegation" is one forwarding method
-    # per public name that used to be implemented in this file. The two
-    # sub-stores hold no device rows, so anything needing both sides (a
-    # device's name beside its metric, an enabled flag) is composed here
-    # rather than delegated.
+    # Forwarding methods to the sub-stores below, which hold no device rows;
+    # anything needing both sides (a device's name beside its metric, an
+    # enabled flag) is composed here instead of delegated.
 
     def record_metric_samples(self, device_id: int, rows: list) -> dict:
         return self.series_db.record_metric_samples(device_id, rows)
@@ -3685,9 +3610,8 @@ class NodesDatabase(SqliteStore):
         if (self._split_state != "rollups" or (t1 - t0) <= RAW_WINDOW_S
                 or not self.series_db.owns_metric(device_id, metric_id)):
             return rows
-        # Phase 2 is still lifting the old rollups across, so a year-wide
-        # chart drawn now would show only the part that has arrived. The
-        # legacy rows are read-only here and lose to the new ones.
+        # Phase 2 is still lifting old rollups across; merge them in so a
+        # year-wide chart isn't missing what hasn't arrived yet.
         merged = {row["ts"]: row for row in
                   self.series_db.legacy_hourly_rows(self.path, metric_id, t0, t1)}
         merged.update({row["ts"]: row for row in rows})
@@ -3793,21 +3717,17 @@ class NodesDatabase(SqliteStore):
             (name,)).fetchone() is not None
 
     def _before_schema(self) -> None:
-        """Phase 1 of the split, synchronous and re-runnable.
-
-        Nothing here changes nodes.db until its very last steps, so an
-        interrupted run leaves a 4.x-readable file and simply starts over.
-        The device inventory stays readable throughout: what is copied are
-        the metric definitions, the MIB corpus and the tail of raw samples
-        the rollups have not covered yet — the bulk of the old file, the
-        hourly rollups, is lifted by phase 2 in the background.
+        """Phase 1 of the split, synchronous and re-runnable: nothing here
+        changes nodes.db until its last steps, so an interrupted run leaves
+        a 4.x-readable file and starts over. Copies metric definitions, the
+        MIB corpus and the raw-sample tail; the bulk (hourly rollups) is
+        phase 2, in the background.
         """
         if not self._table_exists("settings"):
             return                      # a brand-new file: nothing to migrate
         self._split_state = self._private_setting(self._SPLIT_STATE, "") or ""
-        # "rollups" means phase 1 is already behind us: re-running it would
-        # resurrect MIB files deleted since and overwrite the split-hour
-        # rollup with a summary of samples that are no longer the truth.
+        # "rollups" means phase 1 already ran: re-running would resurrect
+        # deleted MIB files and overwrite the rollup with stale samples.
         if self._split_state in ("rollups", "done") \
                 or not self._table_exists("metrics"):
             return
@@ -3817,9 +3737,8 @@ class NodesDatabase(SqliteStore):
             log.error("nodes: split copied %d of %d metric rows; leaving "
                       "nodes.db as it was", here, there)
             return
-        # The watermark the legacy compact_rollup stopped at: everything from
-        # there on exists only as raw samples, which are not copied, so it is
-        # summarised now rather than lost.
+        # Everything past this watermark exists only as raw samples (not
+        # copied), so summarise it now rather than lose it.
         watermark = self._private_setting("rollup_watermark_hour")
         from_hour = int(watermark) if watermark is not None else 0
         rolled = self.series_db.rollup_legacy_samples(self.path, from_hour)
@@ -3845,16 +3764,13 @@ class NodesDatabase(SqliteStore):
 
     def _rebuild_without_mib_fk(self) -> None:
         """Drop `REFERENCES mib_files(id) ON DELETE SET NULL` from
-        `devices.mib_file_id` and `groups.mib_file_id`.
-
-        Not cosmetic: once mib_files is gone from this file, every INSERT and
-        DELETE on either table fails with "no such table", and dropping
-        mib_files with foreign keys on would fire SET NULL over every
-        assignment on the way out. SQLite cannot alter a constraint, so each
-        table is rebuilt from its own stored DDL with the clause removed.
+        `devices.mib_file_id` and `groups.mib_file_id`. Not cosmetic: once
+        mib_files is gone, every INSERT/DELETE on either table would fail
+        with "no such table". SQLite can't alter a constraint, so each
+        table is rebuilt from its own DDL with the clause removed.
         """
-        # PRAGMA foreign_keys is a no-op inside a transaction, and the schema
-        # work above left one open.
+        # foreign_keys is a no-op mid-transaction, and the schema work above
+        # left one open.
         self._conn.commit()
         self._conn.execute("PRAGMA foreign_keys=OFF")
         self._conn.execute("PRAGMA legacy_alter_table=ON")
@@ -3901,15 +3817,10 @@ class NodesDatabase(SqliteStore):
 
     def continue_split(self, stop=None, min_hour: float | None = None,
                        log_add=None) -> None:
-        """Phase 2 and, once it completes, phase 3.
-
-        Runs on Service's `netpath-nodes-split` thread and stops cleanly when
-        `stop` is set — the cursor is persisted per batch, so the next start
-        resumes rather than repeating. `min_hour` skips rollups already older
-        than the retention setting would keep. `log_add` is the event log, so
-        an operator sees why the file is busy on the first start after
-        upgrading.
-        """
+        """Phase 2 and, once it completes, phase 3. Stops cleanly on `stop`
+        with the cursor persisted per batch, so the next start resumes
+        rather than repeats; `log_add` tells the operator why the file is
+        busy after an upgrade."""
         if not self.split_pending():
             return
         started = time.monotonic()
@@ -3940,10 +3851,8 @@ class NodesDatabase(SqliteStore):
                 return
         with self._lock:
             self._conn.commit()
-            # The legacy mib_files is about to go and devices/groups still
-            # carried its foreign key until the phase 1 rebuild; a DROP with
-            # foreign keys on would fire ON DELETE SET NULL over every
-            # assignment, and the drop order below would fail on the rest.
+            # mib_files is about to be dropped; foreign keys on would fire
+            # ON DELETE SET NULL and break the drop order below.
             self._conn.execute("PRAGMA foreign_keys=OFF")
             try:
                 for table in self._LEGACY_TABLES:
@@ -3955,9 +3864,8 @@ class NodesDatabase(SqliteStore):
         self._split_state = "done"
         deadline = time.monotonic() + 120.0
         while time.monotonic() < deadline:
-            # Shutdown joins this thread for 10 s and then closes the
-            # database under it; the reclaim is resumable, so stopping here
-            # costs nothing but the pages not yet given back.
+            # Shutdown joins this thread for 10s then closes the database
+            # under it; reclaim is resumable, so stopping costs nothing.
             if stop is not None and stop.is_set():
                 break
             if not reclaim(self._conn, self._lock, pages=2000, budget_s=2.0,

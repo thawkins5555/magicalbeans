@@ -83,16 +83,11 @@ def _snmp_getnext_one(ip: str, version: int, community: str, timeout_s: float,
 
 def _snmp_walk_column(ip: str, version: int, community: str, timeout_s: float,
                       retries: int, base_oid: str, max_rows: int = 32) -> list:
-    """One table column, walked with the same single GETNEXT the arc hop
-    uses — not nodepoll's GETBULK walker, which needs a polled device's
-    merged config and a session this sweep has no business building.
-
-    Bounded four ways so a sweep can never be held by one agent: the
-    subtree prefix, `max_rows`, an answer that does not advance
-    lexicographically, and the end of the MIB. A mid-walk SnmpError
-    returns what was collected rather than losing it — an agent that
-    answered three addresses and then stopped has still told us three.
-    """
+    """One table column, walked with the arc hop's own single GETNEXT, not
+    nodepoll's GETBULK walker (needs a polled device's merged config).
+    Bounded by the subtree prefix, `max_rows`, non-advancing answers and
+    the end of the MIB; a mid-walk SnmpError returns what was collected
+    rather than losing it."""
     values = []
     current = base_oid
     prefix = base_oid + "."
@@ -266,10 +261,8 @@ class DiscoveryJob:
         next_probe = time.monotonic()
 
         probed = responded = identified = 0
-        # Address -> the result id that reached it first, within this sweep
-        # only. A router probed on two of its own addresses answers the
-        # second probe with the same ipAddrTable, and this is what turns
-        # that into one offered device instead of two.
+        # Address -> the result id that reached it first, this sweep only —
+        # folds a router probed on two of its own addresses into one offer.
         owners: dict[str, int] = {}
         for ip in addresses:
             if self._stop.is_set():
@@ -312,9 +305,7 @@ class DiscoveryJob:
             if folded is not None:
                 result["folded_into_result_id"] = folded
             elif result["snmp_ok"]:
-                # A folded row is the same device counted twice; the job's
-                # `identified` figure is how many devices the sweep found.
-                identified += 1
+                identified += 1   # a folded row would count the same device twice
             result_id = self.db.add_discovery_result(self.job_id, **result)
             if folded is None:
                 register_addresses(owners, result_id, mine)
@@ -389,14 +380,10 @@ class DiscoveryJob:
 
     def _walk_addresses(self, ip: str, version: int, community: str,
                         timeout_s: float, retries: int) -> list[str]:
-        """Every L3 address this box answers on, from ipAdEntAddr alone —
-        one column, so the whole thing is at most 33 GETNEXTs against a
-        device that has already proved it answers.
-
-        This is what lets a router reached on two of its addresses be
-        offered once instead of twice. Off (discovery_addresses) makes the
-        sweep exactly 4.54's, one row per address and nothing folded.
-        """
+        """Every L3 address this box answers on (ipAdEntAddr alone, so at
+        most 33 GETNEXTs) — lets a router reached on two addresses be
+        offered once. Off (discovery_addresses) makes the sweep exactly
+        4.54's: one row per address, nothing folded."""
         if not self.settings.get("discovery_addresses", True):
             return []
         rows = _snmp_walk_column(ip, version, community, timeout_s, retries,

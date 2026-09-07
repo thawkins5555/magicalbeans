@@ -94,11 +94,9 @@ def _csv_response(module: str, header: list[str], rows, *, truncated: bool = Fal
 
 
 class Conflict(ValueError):
-    """"That already exists, here is what it is" — a 400's refusal with the
-    evidence attached, so the browser can offer "add anyway" instead of
-    making the operator work out what collided. A ValueError subclass so
-    any handler that only knows about bad requests still reports it
-    sensibly; server.py's own arm turns it into a 409 with `payload`."""
+    """A 400's refusal with the evidence attached, so the browser can offer
+    "add anyway" — a ValueError subclass so a generic handler still reports
+    it sensibly; server.py turns it into a 409 with `payload`."""
 
     def __init__(self, message: str, payload: dict | None = None):
         super().__init__(message)
@@ -182,9 +180,8 @@ def _require(row, what: str):
 
 
 class Accepted(dict):
-    """A result body server.py answers 202 for: the work was started, not
-    finished. An ordinary dict everywhere else, so a handler returning one
-    needs nothing special of the caller — only the status code differs."""
+    """A dict server.py answers 202 for instead of 200 — work started, not
+    finished; ordinary otherwise, so callers need nothing special."""
 
     http_status = 202
 
@@ -2730,11 +2727,10 @@ def _device_display_name(row) -> str:
 
 
 def _device_index(service) -> dict:
-    """One pass over the fleet, built once per discovery listing: the maps
-    every result row is tested against for "is this already a device".
-    `by_address` covers a device's primary IP and every alias learned for
-    it; `by_identity` is (sysName, sysObjectID), which is a hint and never
-    an answer — two switches out of the same carton share it honestly."""
+    """One pass over the fleet, built once per discovery listing, that
+    every result row is tested against. `by_address` covers a device's
+    primary IP plus every learned alias; `by_identity` is a hint only, not
+    an answer — two switches from the same carton share it honestly."""
     devices = service.nodes_db.devices()
     by_id = {row["id"]: row for row in devices}
     by_address = {row["ip"]: row for row in devices}
@@ -2758,14 +2754,10 @@ def _result_addresses(row) -> list[str]:
 
 
 def _discovery_duplicate(row, index, addresses) -> dict:
-    """Which device, if any, this result looks like — and how sure that is.
-
-    High means an address: one of the addresses this box answered on is
-    already a device's, which nothing else can honestly explain. Medium
-    means sysName and sysObjectID both match a device the sweep never
-    reached on any shared address, which is a reason to look rather than a
-    reason to fold. Only high ever changes what promote() does.
-    """
+    """Which device, if any, this result looks like, and how sure. High
+    means a shared address, which nothing else can honestly explain;
+    medium means only sysName+sysObjectID match — a reason to look, not
+    to fold. Only high changes what promote() does."""
     if not index:
         return {}
     for address in [row["ip"], *addresses]:
@@ -2794,8 +2786,8 @@ def _discovery_result_json(row, installed=None, devices_by_ip=None,
     way — by hand, or from an earlier scan — so `devices_by_ip` is checked
     too; either source wins because promote() always reuses that same row.
 
-    `index` (from _device_index) adds the duplicate verdict, and
-    `folded_ips` the addresses of the sibling rows this one absorbed."""
+    `index` adds the duplicate verdict; `folded_ips` are absorbed siblings'
+    addresses."""
     existing = devices_by_ip.get(row["ip"]) if devices_by_ip else None
     existing_id = existing["id"] if existing else row["promoted_device_id"]
     existing_name = _device_display_name(existing) if existing else None
@@ -3019,15 +3011,12 @@ def _neighbor_local_port_labeler(service, prefetch_ids=None):
     Falls back to "if <N>" for a port whose interface row has not been
     polled yet (or was deleted since), which is still a legible label.
 
-    `prefetch_ids` is for a caller that already knows the whole set — a
-    map GET knows every device it places before it draws one — so the
-    cache fills in one bounded, four-column read instead of one SELECT *
-    per device as each first neighbour row arrives."""
+    `prefetch_ids` lets a caller that already knows the whole set (a map
+    GET) fill the cache in one bounded read instead of one per device."""
     cache: dict[int, dict[int, str]] = {}
     if prefetch_ids:
-        # Seeded empty first: a prefetched device with no interface rows at
-        # all must read as "asked and answered nothing", or the closure
-        # would fall through and query it again, once per neighbour row.
+        # Seeded empty: a device with no interfaces must read as "answered
+        # nothing", not fall through and get queried again per neighbour row.
         for device_id in prefetch_ids:
             cache.setdefault(int(device_id), {})
         for row in service.nodes_db.interface_port_labels_for_devices(prefetch_ids):
@@ -3266,17 +3255,12 @@ def post_nodes_upstream_suggestions_apply(service, params, body) -> dict:
 
 
 def _duplicate_conflict(service, ip: str) -> Conflict | None:
-    """The refusal for an address some device already answers on as an alias
-    learned from its ipAddrTable. That is what makes this a 409 rather than
-    a flat 400: adding a router's second address as a second device is the
-    mistake this release exists to stop, and it is also occasionally exactly
-    what an operator means, which is why the payload names the device and
-    the caller may say `force`.
-
-    A collision with a device's own primary IP is not offered as "Add
-    anyway": the insert has a UNIQUE index behind it and would fail however
-    hard the operator pressed, so it raises a plain 400 here instead of a
-    409 whose only outcome was a second, blunter refusal.
+    """A 409, not a 400, for an address that's already a known alias:
+    adding a router's second address as a second device is the mistake
+    this release exists to stop, but it's occasionally what an operator
+    means, so the payload names the device and the caller may say `force`.
+    A collision with a device's own primary IP stays a plain 400 — the
+    UNIQUE index would refuse it regardless of `force`.
     """
     if service.nodes_db.device_by_ip(ip):
         raise ValueError(f"{ip} is already a device")
@@ -3358,10 +3342,8 @@ def _address_json(row) -> dict:
 
 
 def _device_addresses_json(service, row) -> list[dict]:
-    """The device's own primary address first, then every alias it has
-    been seen answering on. The primary is listed here — it is not stored
-    in device_addresses, and a list of "the addresses of this device" that
-    silently omits the configured one is a list nobody can read."""
+    """The device's primary address first, then every learned alias — the
+    primary isn't stored in device_addresses, so it's added here."""
     addresses = [{"ip": row["ip"], "source": "primary", "seen_ts": None,
                   "if_index": None, "netmask": None, "primary": True}]
     for alias in service.nodes_db.device_addresses(row["id"]):
@@ -3376,9 +3358,8 @@ def get_nodes_device_addresses(service, params, body, device_id) -> dict:
 
 def get_nodes_duplicates(service, params, body) -> dict:
     """Pairs that look like one device entered twice. Fetched on demand
-    from the Duplicates button, never on the Devices page's refresh tick:
-    it is three self-joins over the fleet, and nothing about it changes
-    between one poll and the next."""
+    from the Duplicates button, not the Devices page's refresh tick — it's
+    three self-joins over the fleet."""
     limit = int(_num(params, "limit", 200))
     pairs = []
     for pair in service.nodes_db.duplicate_candidates(limit):
@@ -3410,14 +3391,10 @@ def _merge_targets(service, body, device_id):
 
 def post_nodes_device_merge(service, params, body, device_id) -> dict:
     """Fold one device row into another, across all four databases.
-
-    `preview: true` counts what would move and writes nothing — the dialog
-    shows that before the operator commits, because a merge cannot be
-    undone. The execute order mirrors delete_nodes_device's: ConfigRX,
-    Alerts and Mapper first, Nodes last, so a crash between two of them
-    leaves a nodes row that still owns whatever has not moved yet rather
-    than orphaned rows keyed on an id nothing owns.
-    """
+    `preview: true` counts what would move and writes nothing, since a
+    merge can't be undone. Execute order mirrors delete_nodes_device's
+    (ConfigRX/Alerts/Mapper, then Nodes) so a crash mid-way leaves a nodes
+    row still owning what hasn't moved, not orphaned rows."""
     loser, winner = _merge_targets(service, body, device_id)
     plan = service.nodes_db.merge_plan(loser["id"], winner["id"])
     if body.get("preview"):
@@ -3776,11 +3753,9 @@ def post_nodes_devices_bulk_import(service, params, body) -> dict:
     device_groups = service.nodes_db.device_groups()
     devices_by_ip = {d["ip"]: d for d in service.nodes_db.devices()}
     existing_ips = set(devices_by_ip)
-    # An address a device already answers on without it being that device's
-    # primary — a router's second L3 address in a spreadsheet exported from
-    # somewhere that lists interfaces, not devices. Reported in the same
-    # `duplicate` disposition the primary-IP case already uses, naming the
-    # device, and imported anyway when the body says `force`.
+    # A router's second L3 address, from a spreadsheet listing interfaces
+    # not devices — reported as `duplicate` like the primary-IP case, and
+    # imported anyway when `force`.
     alias_owners = {} if body.get("force") else service.nodes_db.address_owners()
     seen_in_batch = set()
 
@@ -4697,9 +4672,8 @@ def get_nodes_discovery_job(service, params, body, job_id) -> dict:
     # of a /22 can carry over a thousand results.
     index = _device_index(service)
     devices_by_ip = index["by_ip"]
-    # A folded row is the same device the sweep already listed, reached on
-    # a second address: its address rides on its primary's row rather than
-    # appearing as a second offer to add the same box.
+    # A folded row is a second address for a device already listed; its
+    # address rides on the primary row instead of offering the box twice.
     folded: dict[int, list[str]] = {}
     primaries = []
     for row in results:
@@ -7040,11 +7014,8 @@ def get_mapper_map(service, params, body, map_id) -> dict:
     badge_cpu = bool(settings.get("badge_cpu"))
     badge_ports = bool(settings.get("badge_ports"))
 
-    # One query for every badge kind switched on, bounded to the devices
-    # this map places -- metrics_for_devices, not the fleet-wide
-    # metrics_for_keys the alert engine (which really does evaluate every
-    # device) reads. Keyed by device_id so building each node below is a
-    # dict lookup, not a query.
+    # metrics_for_devices, not metrics_for_keys (the alert engine's
+    # fleet-wide read) -- bounded to devices this map places.
     temp_by_device: dict = {}
     cpu_by_device: dict = {}
     metric_keys = [key for key, on in
@@ -7053,10 +7024,8 @@ def get_mapper_map(service, params, body, map_id) -> dict:
         for row in service.nodes_db.metrics_for_devices(device_ids, metric_keys):
             target = temp_by_device if row["key"] == "temp_chassis_c" else cpu_by_device
             target[row["device_id"]] = row["last_value"]
-    # One grouped COUNT for the whole map rather than an interfaces() row
-    # read per placed device, and only when the badge is switched on at all.
-    # Defaulted to 0 rather than left absent: a placed device with no
-    # interface rows drew "0p" before this change and still does.
+    # One grouped COUNT for the map, not an interfaces() read per device.
+    # Defaulted to 0, not absent: a device with no interfaces drew "0p".
     port_count_by_device: dict = {}
     if badge_ports:
         counted = service.nodes_db.interface_counts(device_ids)
@@ -7070,9 +7039,8 @@ def get_mapper_map(service, params, body, map_id) -> dict:
         service, device_ids, now=now, stale_after_s=stale_after_s)
     vlan_ports = _mapper_vlan_ports(
         service, device_ids, now=now, stale_after_s=stale_after_s)
-    # Prefetched: every port label this map can possibly need belongs to a
-    # device it places, and they are known here, so one read serves them
-    # all instead of one per device as assemble_links walks the rows.
+    # Prefetched: every label this map needs belongs to a device it
+    # places, already known here, so one read serves them all.
     port_label = _neighbor_local_port_labeler(service, prefetch_ids=device_ids)
     placed_device_ids = set(device_ids)
     placed_peer_keys = {row["peer_key"] for row in node_rows if row["peer_key"]}
@@ -7254,18 +7222,15 @@ def get_mapper_map_candidates(service, params, body, map_id) -> dict:
     placed_device_ids = {row["device_id"] for row in node_rows if row["device_id"] is not None}
     placed_peer_keys = {row["peer_key"] for row in node_rows if row["peer_key"]}
 
-    # device_summaries(), not devices(): this list is a name, an address, a
-    # status and a vendor per row, and devices() is SELECT * -- forty
-    # columns including sysDescr and the vendor-evidence text -- for every
-    # device in the fleet.
+    # device_summaries(), not devices()'s SELECT * (forty-odd columns) for
+    # every device in the fleet.
     devices = [
         {"id": d["id"], "name": namelookup.device_name(d), "ip": d["ip"],
          "status": d["status"], "vendor": d["vendor"]}
         for d in service.nodes_db.device_summaries() if d["id"] not in placed_device_ids]
 
-    # Only a PLACED device's own ports are ever labelled below (the loop
-    # skips every row whose device_id is not placed), so the prefetch set
-    # is exactly right.
+    # Only placed devices' ports are ever labelled below, so this prefetch
+    # set is exactly right.
     port_label = _neighbor_local_port_labeler(service, prefetch_ids=placed_device_ids)
     seen_devices: set = set()
     seen_peers: set = set()
@@ -7560,9 +7525,8 @@ def _first_run(service) -> bool:
     return bool(row is not None and row["must_change"] and row["last_login"] is None)
 
 
-# Mirrors app.js's own THEMES list (and boot.js's copy of it) exactly: a
-# theme this tuple rejects would be stored by neither end and silently
-# revert to dark, so the three must agree or a saved theme stops applying.
+# Must mirror app.js's THEMES (and boot.js's copy) exactly, or a theme
+# rejected here silently reverts to dark instead of saving.
 THEMES = ("dark", "light", "contrast", "midnight", "nord", "solarized", "slate")
 
 
@@ -7789,10 +7753,9 @@ def post_password(service, params, body) -> dict:
 
 
 def put_account_theme(service, params, body) -> dict:
-    """Save the caller's own theme choice to their account, so it follows
-    them to any browser that signs in as them (get_session/get_state hand
-    it back on the next load). Own account only, no module grant — same
-    reasoning as post_password's self-service half."""
+    """Save the caller's theme to their account so it follows them to any
+    browser they sign into. Own account only, like post_password's
+    self-service half."""
     me = params.get("_username", "")
     theme = str(body.get("theme", ""))
     if theme not in THEMES:
@@ -8101,10 +8064,9 @@ def get_dashboard(service, params, body) -> dict:
         # the question, and it is answered worst-first.
         settings = service.settings or {}
         stores = []
-        # Only the databases that actually have a cap on the Settings tab;
-        # app.db, wireless.db, configrx.db, mapper.db and nodes_mibs.db have
-        # none, so they are reported as size without a fraction rather than
-        # as 0% used.
+        # Only databases with a cap on the Settings tab; app.db, wireless.db,
+        # configrx.db, mapper.db and nodes_mibs.db report size with no
+        # fraction rather than 0% used.
         # This list is hand-written rather than derived from _storage's, and
         # mapper.db was added to that one and missed here — two figures for
         # the same question that disagreed. Anything opened as a database

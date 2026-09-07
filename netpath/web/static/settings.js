@@ -213,10 +213,8 @@
 
   const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  /* The POST only starts the job now and answers 202 straight away: the
-     install runs for longer than App.post's 30 s deadline, so waiting on
-     one response reported a timeout for an update that was busy succeeding.
-     What actually happened comes from /api/update/status. */
+  // POST only starts the job (202): the install outruns App.post's 30s
+  // deadline, so the outcome comes from polling /api/update/status instead.
   async function checkForUpdate() {
     const button = App.el('update-now');
     button.disabled = true;
@@ -291,9 +289,8 @@
     }
   }
 
-  /* The job outlives the page that started it, so a reload mid-update picks
-     it back up rather than showing an idle button over an install in
-     flight. Silent for an account that may not read the status. */
+  // The job outlives the page, so a reload mid-update picks it back up
+  // instead of showing idle over an install in flight.
   async function resumeUpdateIfRunning() {
     if (updatePolling) return;
     if (!App.canRead('admin')) return;   // the status endpoint is admin-only

@@ -509,11 +509,8 @@
           + 'Everything else in IPAM — subnets, scans, hosts and conflicts — '
           + 'works here. Subnet scanning finds the same addresses; it just '
           + 'cannot read the server\u2019s own lease records.';
-      // Never leave the page parked on a subtab it just disabled — but this
-      // redirect is not a choice the operator made, so it must not overwrite
-      // the remembered one: the startup guard below already keeps a
-      // DHCP-remembering browser off this subtab on a host where it cannot
-      // work.
+      // Never leave the page parked on a subtab it just disabled — but not
+      // a choice to remember; the startup guard below handles that case.
       if (view.sub === 'dhcp') selectSub('subnets');
     }
     return usable;
@@ -1276,9 +1273,8 @@
     // as well as on the control, so the two have to start out agreeing.
     App.restoreControls('ipam', CONTROLS);
     view.scopeSort = App.el('ipam-scope-sort').value || view.scopeSort;
-    // A browser that already remembers a sub-view from before DHCP became
-    // the default gets to see it once anyway — the flag, once set, hands
-    // every later load back to the ordinary remembered choice below.
+    // A browser with a pre-DHCP-default remembered choice sees it once;
+    // the flag then hands every later load back to that choice normally.
     let startSub;
     let sawDhcpDefault = true;
     try {

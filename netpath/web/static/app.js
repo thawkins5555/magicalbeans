@@ -84,8 +84,7 @@ const App = (() => {
     const sessionLine = maxRemainingMs != null
       ? `Session ends in ${duration(Math.max(0, maxRemainingMs) / 1000)}.` : '';
     const version = (state.config || {}).version;
-    // The theme the dialog opened with, so Cancel/Escape/backdrop can put
-    // back whatever preview the operator leaves without pressing Save.
+    // Lets Cancel/Escape/backdrop revert an unsaved preview.
     let themeAtOpen = currentTheme();
     // Appearance (theme, and the wall-display launcher) is a per-browser
     // choice, not a server setting, so it lives here rather than on the
@@ -182,10 +181,8 @@ const App = (() => {
           announce(`Theme: ${themeSelect.options[themeSelect.selectedIndex].text}`);
         };
       }
-      // Escape and a backdrop click both route through closeModal, same as
-      // Cancel — so this one listener catches every way out that is not
-      // Save. Nothing to revert if the select was never touched, or if Save
-      // already moved themeAtOpen to match it.
+      // Escape/backdrop route through closeModal like Cancel, so this one
+      // listener catches every way out that isn't Save.
       window.addEventListener('modal-closed', () => {
         if (themeSelect && themeSelect.value !== themeAtOpen) {
           setTheme(themeAtOpen, { silent: true });
@@ -610,10 +607,8 @@ const App = (() => {
     }
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
-      // The status and the body ride on the error so a caller can answer a
-      // refusal rather than only report it — a 409 from "add device" names
-      // the device the address already belongs to, and the dialog offers
-      // "add anyway" off exactly that.
+      // Status and body ride on the error so a caller can act on a refusal,
+      // not just report it — a 409's payload names the conflicting device.
       const error = new Error(payload.error || response.statusText);
       error.status = response.status;
       error.payload = payload;
@@ -4479,9 +4474,8 @@ const App = (() => {
     // chosen has nothing stored and nothing to migrate.
     if (theme === 'dark') delete document.documentElement.dataset.theme;
     else document.documentElement.dataset.theme = theme;
-    // preview: the Account dialog trying a theme on before Save commits it —
-    // applies and announces like any other change, but leaves the browser's
-    // stored choice (and every other open tab) alone.
+    // preview: applies/announces like any change, but leaves the stored
+    // choice (and every other open tab) alone until Save.
     if (!options.silent && !options.preview) {
       try { localStorage.setItem(THEME_KEY, theme); } catch (error) { /* private browsing: applies until reload */ }
     }
@@ -4915,10 +4909,9 @@ const App = (() => {
       applySessionIdle(payload.session);
       const who = document.getElementById('whoami');
       if (who) who.textContent = payload.session.username;
-      // Carries a theme saved from another browser to this one. Only on the
-      // first sight of a given value, and never while the Account dialog is
-      // open: loadState() runs every 2 s, and re-applying the saved theme on
-      // every poll snapped a live preview back within two seconds.
+      // Carries a theme saved elsewhere to this browser, only on first
+      // sight of a value and never with the Account dialog open (loadState
+      // polls every 2s and would snap a live preview back).
       const sessionTheme = payload.session.theme;
       if (sessionTheme && THEMES.includes(sessionTheme)
           && sessionTheme !== state.sessionTheme
@@ -5081,12 +5074,9 @@ const App = (() => {
     const page = pages[name || state.tab];
     if (!page || !page.refresh) return Promise.resolve();
     page.lastFetch = Date.now();
-    // master() already refuses to start a second refresh() while one is
-    // running, but only ever set this flag on the refreshes IT started —
-    // so a route or tab refresh (this function) raced the very next poll
-    // tick for the same page. MAPPER reloading on #/mapper/<id> is where
-    // that showed: two overlapping loads for two different maps, the
-    // slower one painting over the newer one.
+    // master() only sets this flag on refreshes IT started, so a route/tab
+    // refresh (this function) could race the next poll tick for the same
+    // page — two overlapping map loads, the slower one painting over the newer.
     page.refreshing = true;
     let started;
     try {

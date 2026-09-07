@@ -1,15 +1,11 @@
 """The Nodes module's MIB corpus: uploaded files and the objects parsed out
 of them.
 
-Its own file because a MIB file's `content` column keeps the original text
-for a later re-resolve, and a vendor bundle is a multi-megabyte lump sitting
-in the middle of the poller's hot write path. Nothing else in nodes.db is
-read or written at anything like that size, and nothing here changes between
-uploads — so the two belong on different pages.
-
-`devices.mib_file_id` and `groups.mib_file_id` live in nodes.db and name a
-row here as a plain integer. NodesDatabase.remove_mib_file is what NULLs
-those assignments when a file goes.
+Its own file because a vendor bundle's `content` column is a multi-megabyte
+lump that would otherwise sit in the middle of the poller's hot write path,
+and nothing here changes between uploads. `devices.mib_file_id` and
+`groups.mib_file_id` live in nodes.db as plain integers; NodesDatabase.
+remove_mib_file NULLs those when a file goes.
 """
 
 from __future__ import annotations
@@ -32,9 +28,8 @@ CREATE TABLE IF NOT EXISTS mib_files (
     object_count    INTEGER NOT NULL DEFAULT 0,
     unresolved      TEXT NOT NULL DEFAULT '[]',
     parse_notes     TEXT,
-    -- The original text, kept so "resolve again" can re-parse from
-    -- scratch: mib_objects only stores the final oid (or NULL), not the
-    -- parent/last_arc an unresolved object would need to retry against.
+    -- Kept for "resolve again": mib_objects stores only the final oid, not
+    -- what an unresolved object would need to retry against.
     content         TEXT
 );
 CREATE TABLE IF NOT EXISTS mib_objects (
@@ -163,16 +158,11 @@ class NodesMibDatabase(SqliteStore):
     # -------------------------------------------------------------- coverage
 
     def has_mib_covering(self, sys_object_id: str) -> bool:
-        """Whether any uploaded MIB actually describes objects belonging to
-        this device's vendor, given its sysObjectID.
-
-        "Covering" deliberately means *deeper than the bare enterprise
-        arc*: this app ships enterprise-number roots for ~20 vendors, so a
-        plain prefix test would match every common vendor out of the box
-        and could never report anything as missing. A root-only entry
-        (1.3.6.1.4.1.9, six arcs) names the vendor; it decodes nothing. An
-        object below it (1.3.6.1.4.1.9.9.13.1.3.1.3, say) is a real
-        description, and that is what this looks for."""
+        """Whether an uploaded MIB describes objects under this device's
+        vendor arc. "Covering" means deeper than the bare enterprise root
+        (e.g. 1.3.6.1.4.1.9 alone names the vendor but decodes nothing) —
+        this app ships ~20 vendor roots, so a plain prefix test would
+        never report anything missing."""
         from . import nodeoids
         prefix = nodeoids.enterprise_root(sys_object_id)
         if not prefix:
@@ -184,15 +174,10 @@ class NodesMibDatabase(SqliteStore):
         return row is not None
 
     def mib_file_covering(self, sys_object_id: str) -> int | None:
-        """Which uploaded MIB describes this vendor's objects, for the
-        auto-assignment in nodepoll._check_vendor_mib.
-
-        has_mib_covering() answers "is there one"; this answers "which one",
-        and picks the file with the most resolved objects under the vendor's
-        arc when several qualify — a vendor bundle is usually several files,
-        of which one carries the bulk of the real objects and the rest are
-        type or registration modules that would poll nothing.
-        """
+        """Which uploaded MIB describes this vendor's objects, for
+        nodepoll._check_vendor_mib's auto-assignment — the one with the
+        most resolved objects under the vendor arc, since a bundle is
+        usually several files and only one carries the bulk of them."""
         from . import nodeoids
         prefix = nodeoids.enterprise_root(sys_object_id)
         if not prefix:
@@ -226,10 +211,9 @@ class NodesMibDatabase(SqliteStore):
 
     def enterprise_objects(self) -> list[tuple[int, str]]:
         """(mib_file_id, oid) for every resolved object under `enterprises`,
-        for vendorid.build_mib_index. A range predicate rather than LIKE:
-        SQLite's LIKE is case-insensitive by default and does not use
-        ix_mib_objects_oid, which is fine for has_mib_covering's single row
-        and not for the tens of thousands this returns."""
+        for vendorid.build_mib_index. A range predicate, not LIKE, since
+        LIKE can't use ix_mib_objects_oid — fine for one row, not for the
+        tens of thousands this returns."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT mib_file_id, oid FROM mib_objects"
@@ -250,11 +234,10 @@ class NodesMibDatabase(SqliteStore):
     # ------------------------------------------------------------- migration
 
     def import_legacy(self, legacy_path: str) -> tuple[int, int, int, int]:
-        """Copy mib_files and mib_objects out of a pre-5.0 nodes.db, ids
-        intact — devices.mib_file_id and groups.mib_file_id already point at
-        them. Returns (files here, files there, objects here, objects there)
-        so the caller can refuse to drop the originals on a mismatch.
-        """
+        """Copy mib_files/mib_objects out of a pre-5.0 nodes.db, ids intact
+        (devices/groups.mib_file_id already point at them). Returns (files
+        here, files there, objects here, objects there) so the caller can
+        refuse to drop the originals on a mismatch."""
         with self._lock:
             self._conn.commit()
             self._conn.execute("ATTACH DATABASE ? AS old", (legacy_path,))

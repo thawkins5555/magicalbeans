@@ -364,18 +364,12 @@ class ConfigRxDatabase(SqliteStore):
 
     def reassign_device(self, old_device_id: int, new_device_id: int,
                         move_config: bool = True) -> bool:
-        """Two device rows turned out to be one device: hand ConfigRX's
-        half over to the surviving id.
-
-        The whole record moves only when the winner has nothing of its
-        own; otherwise its settings, its search index and its compliance
-        results stand and only the backups move, because those are dated
-        captures of one real switch and a capture is never wrong about
-        having happened. The loser's config row (which holds an encrypted
-        SSH password keyed on an id about to be reissued by SQLite) is
-        dropped either way — see forget_device for why that id must not
-        be left owning a credential.
-        """
+        """Two device rows turned out to be one: hand ConfigRX's half to
+        the surviving id. The whole record moves only if the winner has
+        none of its own; otherwise its settings/index/compliance stand and
+        only the backups move (dated captures, never wrong about having
+        happened). The loser's config row is dropped either way — see
+        forget_device for why that id can't keep owning a credential."""
         with self._lock:
             winner = self._conn.execute(
                 "SELECT 1 FROM device_config WHERE device_id = ?",

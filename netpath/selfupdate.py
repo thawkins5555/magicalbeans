@@ -68,9 +68,8 @@ _COPY_ALONGSIDE = ("requirements.txt", "README.md", "CHANGELOG.md", "FEATURES.md
 
 # --------------------------------------------------------------- the job
 
-# The before-restart hook alone measures 37-63 s against a real fleet, and
-# app.js gives a request 30. So the update is a job: the POST answers at
-# once and the dialog reads the outcome from status().
+# The before-restart hook alone measures 37-63s against a real fleet, vs.
+# app.js's 30s request timeout — so this runs as a job, not inline.
 
 STEPS = ("idle", "checking", "up_to_date", "downloading", "extracting",
          "installing", "restarting", "failed")
@@ -102,10 +101,9 @@ def _set(step: str, *, message=None, error=None, commit=None) -> None:
 
 
 def status() -> dict:
-    """Where the current (or last) update got to. Answered from module state
-    rather than from anything the caller holds, so a browser that reloaded
-    mid-update picks the running job back up instead of showing an idle
-    button over an install in flight."""
+    """Where the current (or last) update got to, from module state so a
+    reloaded browser picks the running job back up instead of showing idle
+    over an install in flight."""
     with _job_lock:
         return dict(_job)
 
@@ -366,11 +364,10 @@ def schedule_restart(delay: float = 1.5) -> None:
     released — spawning first raced the old process for the same port/files
     and lost.
 
-    Not a daemon thread: the hook that runs before this one has already
-    stopped the server and the service, so the interpreter can reach the
-    point where it exits every remaining thread while this one is still
-    sleeping — and a daemon thread dies there without a line in the log. In
-    146 recorded attempts this thread never reached its first statement.
+    Not a daemon thread: with the server and service already stopped, the
+    interpreter can exit every remaining thread while this one still
+    sleeps, killing a daemon thread with no line in the log — in 146
+    recorded attempts, before its first statement.
     """
     def _go():
         _log_restart(f"restart thread started pid={os.getpid()} delay={delay}")
@@ -502,10 +499,9 @@ def apply(app_db, report=None, before_quiesce=None) -> dict:
         step("installing")
         db_path = getattr(app_db, "path", "")
         previous = {key: app_db.meta(key) for key in _INSTALL_MARKERS}
-        # Through the still-open connection, before anything is torn down:
-        # written afterwards from a fresh connection they hit "database is
-        # locked" 201 times, and nothing on disk has changed yet, so a write
-        # that fails here costs nothing.
+        # Through the still-open connection: a fresh one hit "database is
+        # locked" 201 times. Nothing on disk has changed yet, so failing
+        # here costs nothing.
         try:
             app_db.set_meta(INSTALLED_COMMIT_KEY, sha)
             app_db.set_meta(INSTALLED_AT_KEY, str(time.time()))
@@ -560,13 +556,10 @@ def apply(app_db, report=None, before_quiesce=None) -> dict:
 
 def start_job(app_db, before_quiesce=None, on_result=None) -> dict:
     """Run apply() on a thread of its own and return the job's status now.
-
     One at a time: a second press while an install is in flight would race
-    the first for the package directory, so it is refused with
-    `already_running` rather than queued. Not a daemon thread — the update
-    outlives the request that asked for it, and the restart it schedules is
-    the only thing that brings the service back.
-    """
+    for the package directory, so it's refused with `already_running`
+    rather than queued. Not a daemon thread — the update outlives the
+    request, and its restart is what brings the service back."""
     global _job_thread
 
     with _job_lock:
