@@ -54,6 +54,18 @@ Modes:
              read_hardware would pass were it driven by sysObjectID alone
              (tests still set vendor_detected directly; a full identify
              walk is not this stub's job).
+  cisco_dom  A Cisco switch as one really answers: no ENTITY-SENSOR-MIB
+             (1.3.6.1.2.1.99) rows and no entAliasMappingIdentifier rows at
+             all, with the readings in CISCO-ENTITY-SENSOR-MIB
+             (1.3.6.1.4.1.9.9.91) instead -- five optic sensors under one
+             port module (entity 1000, entPhysicalName
+             "TenGigabitEthernet1/1/1") and one chassis inlet probe. Only
+             the temperature sensor names its own port ("Te1/1/1 Module
+             Temperature Sensor"); the rest reach it by climbing
+             entPhysicalContainedIn to entity 1000. Two dBm rows in the two
+             shapes real gear uses -- units/precision 1 (IOS) and
+             milli/precision 0 (NX-OS) -- both decoding through the plain
+             RFC 3433 arithmetic.
 
 Two control datagrams, on the same socket as SNMP itself (see
 stub_agent_fdb.py, which established this convention):
@@ -204,6 +216,86 @@ CISCO_ENVMON_TABLE = {
     "1.3.6.1.4.1.9.9.13.1.3.1.6.1": ("int", 3),        # critical
 }
 
+# ------------------------------------------- CISCO-ENTITY-SENSOR-MIB
+# A Cisco switch as it actually answers: NOTHING under 1.3.6.1.2.1.99 and
+# NOT ONE entAliasMappingIdentifier row, so both the standard sensor table
+# and the standard entity->ifIndex mapping come back empty and the only way
+# to reach these sensors is the Cisco table plus the entPhysicalName match.
+#
+# Entity 1000 is the port module, named the long way ifDescr names it.
+# Sensors 1010-1014 hang off it by entPhysicalContainedIn; only 1010 carries
+# the port in its own name, so the other four can only resolve by climbing
+# to 1000. Entity 2000 is a chassis inlet probe belonging to no port.
+CISCO_DOM_TABLE = {
+    "1.3.6.1.2.1.47.1.1.1.1.2.1000": ("str", "TenGigabitEthernet1/1/1"),
+    "1.3.6.1.2.1.47.1.1.1.1.7.1000": ("str", "TenGigabitEthernet1/1/1"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.1000": ("int", 1),
+
+    "1.3.6.1.2.1.47.1.1.1.1.2.1010": ("str", "Te1/1/1 Module Temperature Sensor"),
+    "1.3.6.1.2.1.47.1.1.1.1.7.1010": ("str", "Te1/1/1 Module Temperature Sensor"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.1010": ("int", 1000),
+    "1.3.6.1.2.1.47.1.1.1.1.2.1011": ("str", "Supply Voltage"),
+    "1.3.6.1.2.1.47.1.1.1.1.7.1011": ("str", "Supply Voltage"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.1011": ("int", 1000),
+    "1.3.6.1.2.1.47.1.1.1.1.2.1012": ("str", "Bias Current"),
+    "1.3.6.1.2.1.47.1.1.1.1.7.1012": ("str", "Bias Current"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.1012": ("int", 1000),
+    "1.3.6.1.2.1.47.1.1.1.1.2.1013": ("str", "Transmit Power"),
+    "1.3.6.1.2.1.47.1.1.1.1.7.1013": ("str", "Transmit Power"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.1013": ("int", 1000),
+    "1.3.6.1.2.1.47.1.1.1.1.2.1014": ("str", "Receive Power"),
+    "1.3.6.1.2.1.47.1.1.1.1.7.1014": ("str", "Receive Power"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.1014": ("int", 1000),
+
+    "1.3.6.1.2.1.47.1.1.1.1.2.2000": ("str", "Switch 1 - Inlet Temp Sensor"),
+    "1.3.6.1.2.1.47.1.1.1.1.7.2000": ("str", "Switch 1 - Inlet Temp Sensor"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.2000": ("int", 1),
+
+    # entSensorType: celsius(8), voltsDC(4), amperes(5), dBm(14) x2, celsius(8)
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.1.1010": ("int", 8),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.1.1011": ("int", 4),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.1.1012": ("int", 5),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.1.1013": ("int", 14),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.1.1014": ("int", 14),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.1.2000": ("int", 8),
+
+    # entSensorScale: units(9) or milli(8)
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.2.1010": ("int", 9),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.2.1011": ("int", 8),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.2.1012": ("int", 8),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.2.1013": ("int", 9),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.2.1014": ("int", 8),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.2.2000": ("int", 9),
+
+    # entSensorPrecision
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.3.1010": ("int", 0),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.3.1011": ("int", 0),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.3.1012": ("int", 1),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.3.1013": ("int", 1),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.3.1014": ("int", 0),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.3.2000": ("int", 0),
+
+    # entSensorValue. The two dBm rows are the two shapes real Cisco gear
+    # reports optical power in, and BOTH decode through the ordinary RFC
+    # 3433 arithmetic with no dBm special case: IOS writes units(9)/
+    # precision 1/-24 for -2.4 dBm, NX-OS writes milli(8)/precision 0/
+    # -5500 for -5.5 dBm.
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.4.1010": ("int", 33),      # 33 C
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.4.1011": ("int", 3299),    # 3.299 V DC
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.4.1012": ("int", 62),      # 0.0062 A
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.4.1013": ("int", -24),     # -2.4 dBm
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.4.1014": ("int", -5500),   # -5.5 dBm
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.4.2000": ("int", 41),      # 41 C
+
+    # entSensorStatus: ok(1) throughout
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.5.1010": ("int", 1),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.5.1011": ("int", 1),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.5.1012": ("int", 1),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.5.1013": ("int", 1),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.5.1014": ("int", 1),
+    "1.3.6.1.4.1.9.9.91.1.1.1.1.5.2000": ("int", 1),
+}
+
 MODE = "ups"
 
 
@@ -220,6 +312,8 @@ def table_for():
         return {**GENERIC_SCALARS, **SENSOR_TABLE_NO_HUMIDITY}
     if MODE == "hardware":
         return {**CISCO_SCALARS, **HARDWARE_TABLE, **CISCO_ENVMON_TABLE}
+    if MODE == "cisco_dom":
+        return {**CISCO_SCALARS, **CISCO_DOM_TABLE}
     return dict(GENERIC_SCALARS)
 
 
