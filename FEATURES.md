@@ -1308,7 +1308,43 @@ alerts and optionally emailing about them.
   ambient/chassis/optic temperature high plus humidity high — three
   separate temperature rules rather than one, because a comms room, a
   switch chassis and an SFP's DOM reading have different normal ranges
-  entirely (see Nodes → Devices and polling).
+  entirely (see Nodes → Devices and polling). Three more, new in 5.1.0,
+  read the per-port optic DOM readings: **Optic receive power low**
+  (−22 dBm, clears at −20), **Optic transmit power low** (−12 dBm, clears
+  at −10) and **Optic temperature high (per port)** (70 °C, clears at 65).
+  Receive power is the one that predicts a failure rather than reporting
+  one: a link degrades for weeks as a connector gets dirty, and the
+  received level falls long before the port goes down. The older
+  device-wide **Optic temperature high** stays exactly as it is — it reads
+  the hottest optic in the chassis, and an operator who has tuned it keeps
+  their number.
+- **An interface threshold names the port, from 5.1.0.** The six
+  interface rules (inbound/outbound utilization, error rate, discard
+  rate) used to read the device-level *busiest port* value, so the alert
+  said "Access Switch — Interface inbound utilization high (97 %)" and
+  left somebody to go and find which of 48 ports it meant; two bad ports
+  were one alert that cleared when either recovered. Each port is now
+  evaluated on its own and the alert reads "Access Switch /
+  GigabitEthernet1/0/7 (uplink to core)", with the port's ifIndex, ifDescr
+  and description available to email templates as `{{if_index}}`,
+  `{{interface_name}}` and `{{interface_alias}}`. Two bad ports are two
+  alerts that clear independently, a per-device override still applies to
+  every port on that device (a threshold is about the switch, not about
+  each of its ports), and an outage absorbs a switch's port alerts along
+  with the rest — but never an interface *down* or *flapping* alert, which
+  reports something the device itself observed and stays worth knowing
+  about. On upgrade, the device-wide interface alerts left open by the
+  previous behaviour are resolved with a note, since nothing would ever
+  have cleared them.
+- **A threshold rule can alert on a value falling, from 5.1.0.** Every
+  rule before it meant "at or above the threshold is the fault", which is
+  right for temperature, utilization and loss and wrong for an optic's
+  receive power, where there is no upper bound worth alerting on. The rule
+  dialog now offers **Fault is when the value is** — at or above, or at or
+  below — and a "below" rule's clear threshold sits *above* its threshold,
+  entering the same hysteresis band from the other end. A clear on the
+  wrong side is refused when the rule is saved rather than discovered as
+  an alert that never closes.
 - **From 4.54.0, chassis temperature has a Warning/Critical pair.** The
   existing "Chassis temperature high" (75 °C, clears at 65 °C) is joined by
   a second, hotter rule, "Chassis temperature critical" (85 °C, clears at
@@ -1529,6 +1565,18 @@ hard to trip — a path monitor that cries wolf gets turned off.
 
 ### Notifications
 
+- **An email severity floor, from 5.1.0.** **Alerts → Settings → EMAIL
+  SERVER → Email alerts of severity … and worse**
+  (`notify_min_severity`, default 7, which mails everything and is what
+  every install did before). An alert worse — numerically higher — than
+  the floor still opens, still appears in the list, and still counts on
+  the badge; only the mailbox is spared. It applies to first notices,
+  re-notifications, clears and the roll-up digest alike. It is *not* the
+  ENGINE section's **Evaluate severity and worse**, which drops syslog
+  lines before the engine reads them, and it does not gate the webhook: a
+  chat room or a ticket queue is not somebody's inbox and has its own
+  switch and its own budget. The per-rule **Send email for this rule**
+  checkbox is still there and still silences one rule at every severity.
 - **Email over the standard library's `smtplib`** — none, STARTTLS or
   SSL/TLS, with or without certificate verification (turning verification
   off is a deliberate, explicit opt-out, never a silent downgrade). A

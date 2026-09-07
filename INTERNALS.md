@@ -3030,7 +3030,11 @@ and went on satisfying it indefinitely — the value had stopped changing
 but nothing compared `last_value` against `last_ts`.
 
 `_breach_streaks` now holds `(last sample ts, streak, first breach ts)`
-per `(rule_id, device_id)` and advances only when `metric["last_ts"]`
+per `(rule_id, entity_id)` — the entity id as a **string**, `"7"` for a
+device and `"7:12"` for one of its ports, so the two halves of that
+contract (`_evaluate_thresholds` writing it and `_child_first_breach_ts`
+reading it on behalf of a hand-resolved rollup parent) cannot drift apart
+on the key's type — and advances only when `metric["last_ts"]`
 moves, exactly as `_dhcp_streaks` already did. The third element is what
 makes a duration expressible at all: `breach_seconds` is
 `sample_ts - first_breach_ts`, measured **between the samples themselves**
@@ -3063,11 +3067,18 @@ value" — the same convention `rules.flap_window_s` already uses — so an
 override that only wants `enabled = 0` (turn the rule off for one device,
 distinct from setting the threshold sky-high: it also has no
 `clear_threshold` to speak of) does not have to restate the rule's own
-numbers. `_check_threshold_direction` (`alertsdb.py`) rejects an override
-whose effective `clear_threshold` would not sit below its effective
-`threshold`: `evaluate_threshold` has exactly one direction wired in
-(breach at or above threshold, clear below `clear_threshold`), checked
-against all twenty threshold-kind `_BUILTIN_RULES` rather than assumed.
+numbers. `_check_threshold_direction` (`alertsdb.py`) rejects an override whose
+effective `clear_threshold` would sit on the wrong side of its effective
+`threshold`. Which side is wrong is `rules.comparison`'s to say (5.1.0):
+an `above` rule breaches at or over the threshold and clears below the
+clear threshold, a `below` rule is the mirror image, and both are decided
+in one place, `alertrules.breaches()`/`_clears()`, which
+`_evaluate_thresholds` also counts its streak with so the streak and the
+verdict cannot disagree about what a breach is. The same check runs on
+rule create and update through `api._validated_threshold_fields`, with
+`allow_equal` — an override wants a real gap, while several shipped rules
+(`ups_on_battery`, `netpath_unreachable`) set the two equal on purpose for
+a quantised metric and have to keep saving.
 
 `AlertEngine._evaluate_thresholds` reads every rule's override map once
 per rule per tick (`device_threshold_map(rule_key)` → `{device_id: row}`),
@@ -3484,6 +3495,56 @@ Three different shapes of condition, handled three different ways, because
   inside the window simply reappears on the first tick after it. Parking them
   as well would open the same alert twice.
 
+### Per-port threshold evaluation (`nodesseriesdb.py`, `alertengine.py`) — 5.1.0
+
+A threshold rule's `source_kind` names a metric **family**, not one key.
+`nodesseriesdb.metrics_for_families(keys)` reads, per root, `key = ? OR
+(key >= ? AND key < ?)` with bounds `'k.'` and `'k/'`: `.` is 0x2E and `/`
+is 0x2F, so the range is every `k.<something>` and nothing else. Bounds
+rather than `LIKE 'k.%'` because SQLite drives `ix_metrics_key` from a
+range unconditionally, while the LIKE optimisation depends on
+`case_sensitive_like` and silently becomes a full scan of the largest
+table in that file when it does not apply — a test asserts `SCAN metrics`
+never appears in the query plan. The bounds also exclude the sibling keys
+a prefix match would drag in (`if_in_error_rate_x` sorts after
+`if_in_error_rate/`, since `_` is 0x5F), and the select carries `unit`,
+which the alert message names.
+
+A **child** is a key whose whole tail after the first `.` is an integer;
+`if_in_error_rate.7.2` is not one. Where a device reports children for a
+rule, the parent key is skipped entirely and each child is a target of its
+own: `entity_kind` `interface`, `entity_id` `"<device_id>:<if_index>"`, and
+so `dedup_key` `"<rule>:interface:<device_id>:<if_index>"` — the same
+`rule:entity_kind:entity_id` shape every other alert has. Where it reports
+none, the parent key is the single `device` target, exactly as before.
+Streaks, staleness, the operator-resolve gate and the clear path are all
+per target; the per-device override is not, because a threshold an operator
+tuned is about the switch and repeating it per port would be unusable.
+
+The label comes from `alertrules.interface_label(row, if_index)` —
+`"GigabitEthernet1/0/7 (uplink to core)"`, the alias appended only when it
+adds something, `if<n>` as the last resort — which `_drain_interface_events`
+also uses, so a link-down alert and a utilization alert name the same port
+the same way.
+
+Two things had to change around it. `ROLLUP_ENTITY_KINDS` admits
+`interface`, and `_rollup_parent`/`_parent_operator_resolved` project an
+interface occurrence to its device (`_device_probe`) before asking about a
+parent, since every parent a port can have is a fact about the switch;
+`ROLLED_UP_BY` is still the gate, so `interface_down` and
+`interface_flapping` have no parent and are never suppressed. And
+`AlertsDatabase.resolve_by_dedup_prefix` closes a whole family of keys at
+once (bumped-bound range over `ux_alerts_active_dedup`, not an escaped
+LIKE, which cannot use an index), which is how an outage absorbs a
+switch's port alerts and how switching a rule off for one device closes
+them.
+
+The named migration `per_port_threshold_alerts_1` resolves, with a note,
+every open device-scoped alert of a `kind = 'threshold'` rule whose
+`source_kind` begins `if_`. Those rows were opened against the
+device-level worst-port key, which the evaluator no longer reads on a
+device with children, so nothing would ever have cleared them.
+
 ### Alert rollup (`alertrules.py`, `alertengine.py`, `alertsdb.py`)
 
 `alertrules.ROLLED_UP_BY` maps a rule key to the rule key whose open alert
@@ -3494,6 +3555,14 @@ import so a parent's children are a lookup rather than a scan per tick. It is
 this app measures, not a per-site preference; the `rollup_enabled` setting
 (`alertsdb.DEFAULTS`, default on) is the on/off switch, not a way to rewrite
 the map.
+
+`ROLLUP_ENTITY_KINDS` is a *necessary* condition, never a sufficient one.
+It gained `interface` in 5.1.0 so a per-port threshold alert can roll up
+under its switch's outage, and that must not drag `interface_down` or
+`interface_flapping` in with it: those have no entry in `ROLLED_UP_BY`, so
+they have no parent and fall straight through unsuppressed. The map admits
+a rule to rollup; the kind set only says which entities the question can be
+asked about at all.
 
 Membership is drawn on one line: everything in it can only be measured *by
 polling the device* — the two ping rules, and the SNMP-metric thresholds for
@@ -3679,6 +3748,18 @@ might use as one superset dict; an unknown token renders as an empty
 string rather than leaving a literal `{{token}}` in a sent email, a
 last-resort safety net since the template editor's own token palette is
 meant to prevent that ever mattering in practice.
+
+`notify_min_severity` (5.1.0, default 7) is applied in `_notify()`
+**below** the webhook dispatch and above the hourly email budget: "do not
+mail me about warnings" is a statement about an inbox, and the webhook has
+its own enabled flag and its own budget. A floored alert is
+`mark_notified`, never a bare `return` — `alerts_due_first_notify` reads
+`last_notified_ts IS NULL` as "still due", so an unstamped one would come
+back through `_sweep_notify_rollup` on every tick for ever. The same floor
+is asked in `_sweep_notify_rollup` (the one path that can hand a batch to
+`_send_digest` instead of to `_notify`) and defensively in `_send_digest`
+itself. It is unrelated to `min_severity`, which is a filter on syslog
+ingest.
 
 `_notify()` computes `{{device_ip}}` by looking up the device fresh at
 send time (`_device_ip_for()`, parsing `alerts.entity_id` back into a
