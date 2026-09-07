@@ -2662,7 +2662,60 @@ def _device_json(row, reveal: bool = False) -> dict:
         "last_uptime_ts": row["last_uptime_ts"], "created_ts": row["created_ts"],
         "status_since_ts": _status_since(row),
         "sys_uptime_s": _sys_uptime_s(row),
+        # Where this device's own web interface lives, for the WEB relay.
+        # Keyed defensively for a row from before the migration that added
+        # them. `web_port_effective` is what the relay will actually dial —
+        # resolved once here so the form can show it as a placeholder and
+        # nothing on the client has to repeat the 80/443 rule.
+        "web_scheme": (row["web_scheme"] if "web_scheme" in row.keys() else None),
+        "web_port": (row["web_port"] if "web_port" in row.keys() else None),
+        "web_port_effective": _web_port_effective(row),
     }
+
+
+# The scheme a device's web interface is reached over. NULL means http, the
+# same answer the old WEB button gave when it built "http://<ip>/" and asked
+# nobody.
+WEB_SCHEMES = ("http", "https")
+_WEB_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _web_port_effective(row) -> int:
+    """The port the relay dials for this device: the stored one, else the
+    default for its scheme."""
+    keys = row.keys()
+    port = row["web_port"] if "web_port" in keys else None
+    if port:
+        return int(port)
+    scheme = (row["web_scheme"] if "web_scheme" in keys else None) or "http"
+    return _WEB_DEFAULT_PORTS.get(scheme, 80)
+
+
+def _clean_web_fields(fields: dict) -> None:
+    """Validates `web_scheme`/`web_port` in place, if present.
+
+    Blank clears either one, which is what puts a device back on the
+    "http, port 80" default — a form that could set them but never unset
+    them would strand a device pointed at a port that has since moved.
+    """
+    if "web_scheme" in fields:
+        scheme = str(fields["web_scheme"] or "").strip().lower()
+        if scheme and scheme not in WEB_SCHEMES:
+            raise ValueError("The web scheme must be http or https.")
+        fields["web_scheme"] = scheme or None
+    if "web_port" in fields:
+        value = fields["web_port"]
+        if value in (None, "", 0, "0"):
+            fields["web_port"] = None
+        else:
+            try:
+                port = int(value)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "The web port must be a number from 1 to 65535.") from None
+            if not 1 <= port <= 65535:
+                raise ValueError("The web port must be a number from 1 to 65535.")
+            fields["web_port"] = port
 
 
 def _status_since(row):
@@ -2873,7 +2926,11 @@ _DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id",
                          "snmp_enabled", "oid_set", "mib_file_id",
                          "ping_count", "ping_timeout_ms", "unreachable_ping_only",
                          "vendor_oid", "location_oid", "mac_table_interval_s",
-                         "vlan_interval_s", "vendor_override", "upstream_id")
+                         "vlan_interval_s", "vendor_override", "upstream_id",
+                         # Per-device, never inherited from a polling profile
+                         # (nodesdb._DEVICE_ONLY_COLUMNS), so they are absent
+                         # from _GROUP_EDITABLE_BODY below on purpose.
+                         "web_scheme", "web_port")
 _GROUP_EDITABLE_BODY = ("name", "snmp_version", "community", "v3_user",
                         "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
                         "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
@@ -3324,6 +3381,9 @@ def post_nodes_device(service, params, body) -> dict:
                 and k not in ("name", "group_id", "device_group_id",
                               "display_name_source", "enabled",
                               "vendor_override", "upstream_id")}
+    # Validated before the insert, like upstream_id above and for the same
+    # reason: a refused value must not leave a half-configured device behind.
+    _clean_web_fields(overrides)
     try:
         device_id = service.nodes_db.add_device(
             ip, name=body.get("name") or None,
@@ -3575,6 +3635,7 @@ def put_nodes_device(service, params, body, device_id) -> dict:
     before = _require(service.nodes_db.device(device_id), "device")
     _check_display_name_source(body)
     fields = _pick(body, _DEVICE_EDITABLE_BODY)
+    _clean_web_fields(fields)
     if "upstream_id" in fields:
         fields["upstream_id"] = _clean_upstream_id(
             service, device_id, fields["upstream_id"])
@@ -3692,7 +3753,8 @@ def post_nodes_devices_bulk_delete(service, params, body) -> dict:
 # profile, by name or numeric id), device_group (or device_group_id — by
 # name or numeric id), snmp_version, community, v3_user, v3_auth_proto,
 # poll_interval_s, snmp_timeout_s, snmp_retries, ping_enabled,
-# snmp_enabled, vendor_override, display_name_source. An unrecognised
+# snmp_enabled, vendor_override, display_name_source, web_scheme,
+# web_port. An unrecognised
 # column is ignored rather than refused, so a spreadsheet carrying extra
 # inventory columns (asset tag, site, rack) still imports. upstream_id is
 # deliberately not accepted here: a bulk paste has no reliable way to name
@@ -3833,6 +3895,10 @@ def post_nodes_devices_bulk_import(service, params, body) -> dict:
                 elif key in _BULK_IMPORT_BOOL_FIELDS:
                     value = _bulk_import_bool(value)
                 overrides[key] = value
+            # After the loop, not inside it: the refusal has to be the same
+            # sentence the single-device form gives, and a spreadsheet
+            # column of ports is exactly where a stray "8O80" turns up.
+            _clean_web_fields(overrides)
         except ValueError as exc:
             invalid.append({"row": i, "ip": ip, "reason": str(exc)})
             continue

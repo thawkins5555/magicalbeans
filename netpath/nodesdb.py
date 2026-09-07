@@ -555,10 +555,17 @@ _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
                    "mac_table_interval_s", "lldp_interval_s", "poe_enabled",
                    "stp_enabled", "vlan_interval_s")
 
-# vendor_override is deliberately NOT an _OVERRIDE_COLUMNS entry: a vendor is a
-# fact about one box, not something a polling profile should hand down.
-_DEVICE_EDITABLE = ("name", "group_id", "device_group_id", "display_name_source",
-                    "enabled", "vendor_override", "upstream_id") + _OVERRIDE_COLUMNS
+# Per-device columns that are settable but never inherited, for the same
+# reason vendor_override is deliberately absent from _OVERRIDE_COLUMNS: where
+# a box's own management page lives is a fact about that box, and a polling
+# profile handing "https on 8443" to a fleet would point the relay at the
+# wrong port on most of it. add_device copies these alongside the override
+# columns so Add and Edit set the same fields.
+_DEVICE_ONLY_COLUMNS = ("web_scheme", "web_port")
+
+_DEVICE_EDITABLE = (("name", "group_id", "device_group_id", "display_name_source",
+                     "enabled", "vendor_override", "upstream_id")
+                    + _OVERRIDE_COLUMNS + _DEVICE_ONLY_COLUMNS)
 
 
 # The separators a MAC address is written with in the wild. '.' covers the
@@ -928,6 +935,15 @@ class NodesDatabase(SqliteStore):
             "stp_root_cost": "INTEGER",
             "stp_root_port": "INTEGER",
             "stp_time_since_change_s": "REAL",
+        })
+        self.ensure_columns("devices", {
+            # Where this device's own web interface lives, for the WEB
+            # relay (5.1): "http"/"https" and a port, both NULL meaning
+            # "http on 80" — see _DEVICE_ONLY_COLUMNS. Deliberately not a
+            # polling-profile override: a management page is a fact about
+            # one box, not a credential or cadence handed down to a fleet.
+            "web_scheme": "TEXT",
+            "web_port": "INTEGER",
         })
         self.ensure_columns("groups", {
             "lldp_interval_s": "INTEGER", "poe_enabled": "INTEGER",
@@ -1502,7 +1518,7 @@ class NodesDatabase(SqliteStore):
                    **overrides) -> int:
         cols = ["ip", "name", "group_id", "device_group_id", "created_ts"]
         vals = [ip, name or ip, group_id, device_group_id, time.time()]
-        for key in _OVERRIDE_COLUMNS:
+        for key in _OVERRIDE_COLUMNS + _DEVICE_ONLY_COLUMNS:
             if key in overrides:
                 cols.append(key)
                 vals.append(overrides[key])
@@ -1595,7 +1611,7 @@ class NodesDatabase(SqliteStore):
                     cols = ["ip", "name", "group_id", "device_group_id", "created_ts"]
                     vals = [row["ip"], row.get("name") or row["ip"],
                            row.get("group_id"), row.get("device_group_id"), time.time()]
-                    for key in _OVERRIDE_COLUMNS:
+                    for key in _OVERRIDE_COLUMNS + _DEVICE_ONLY_COLUMNS:
                         if key in (row.get("overrides") or {}):
                             cols.append(key)
                             vals.append(row["overrides"][key])
