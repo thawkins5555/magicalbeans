@@ -205,13 +205,9 @@ DEFAULTS = {
     # and survives Reset layout, which clears per-browser column widths
     # but must not eat a settings choice.
     "table_columns_backups": "",
-    # One regex per line, applied on top of configrx_volatile.VOLATILE's
-    # per-vendor built-ins to strip whole lines from a capture before it is
-    # hashed for change detection — a site-local banner line the built-in
-    # list has no way to know about. Each line is validated with
-    # configrx_compliance's bounded-regex compiler at save time
-    # (api.post_settings), so a bad pattern is refused before it ever runs
-    # against a real capture.
+    # Site-local lines to strip on top of configrx_volatile.VOLATILE's
+    # built-ins; validated at save time (api.post_settings) so a bad
+    # pattern is refused before it ever runs against a real capture.
     "ignore_line_patterns": "",
 }
 

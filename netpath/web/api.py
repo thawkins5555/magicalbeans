@@ -540,9 +540,9 @@ def _storage(service) -> dict:
               ("configrx", service.configrx_db), ("mapper", service.mapper_db))
     result = {f"{name}_path": db.path for name, db in stores}
     result.update({f"{name}_bytes": db.size_bytes() for name, db in stores})
-    # How far back each file still reaches, so a cap that has been trimming
-    # reads as lost history rather than only as a number of bytes. None for
-    # the two that keep no history (MIBs, maps) and for an empty store.
+    # How far back each file still reaches, so trimming reads as lost
+    # history, not just bytes. None for the two with no history and for an
+    # empty store.
     result.update({f"{name}_oldest_ts": db.oldest_ts() for name, db in stores})
     return result
 
@@ -1208,22 +1208,15 @@ ws_ssh_device.hijack = True
 
 # --------------------------------------------------------------- WEB relays
 #
-# The WEB button used to build "http://<ip>/" in the browser, which only
-# works from a machine with a route to the management plane. These three
-# routes open, list and close a short-lived TCP relay on this host instead.
-# All the reasoning about what that costs lives in netpath/webrelay.py; what
-# belongs here is that a caller never names the destination.
+# These three routes open, list and close a short-lived TCP relay on this
+# host to a device's web interface. Reasoning lives in netpath/webrelay.py;
+# what matters here is that a caller never names the destination.
 
 
 def _web_device_target(service, device_id):
     """(device row, address, scheme, port) for a relay, from the device row
-    and nothing else.
-
-    The one thing this route must never accept is a target. A body carrying
-    a host and port would turn an account holding `web` into a general
-    outbound proxy from this server's address — every device it can reach,
-    on every port, not the one device an operator selected. So the device id
-    is the whole request, and everything else is read from the row.
+    and nothing else — a body carrying a host and port would turn an
+    account holding `web` into a general outbound proxy from this server.
     """
     device = _require(service.nodes_db.device(device_id), "device")
     address, scheme, port = webrelay.device_web_target(device)
@@ -1243,10 +1236,9 @@ def post_web_device_relay(service, params, body, device_id) -> dict:
 
 
 def get_web_relays(service, params, body) -> dict:
-    """Every relay this account has open. An administrator sees all of them,
-    since they are the person who has to answer for a port being open on
-    this host; everyone else sees their own, which is what the device pane's
-    "Tunnel: port N" line is drawn from."""
+    """Every relay this account has open. An administrator sees all of
+    them, since they answer for a port being open on this host; everyone
+    else sees only their own."""
     mine = None if _is_admin(service, params) else params.get("_username", "")
     return {"relays": service.web_relays.status(mine)}
 
@@ -1501,8 +1493,7 @@ ADMIN_ONLY_SETTINGS = ("updates_enabled", "ldap_enabled", "ldap_url",
                       "ldap_timeout_s",
                       "session_idle_minutes", "session_max_hours",
                       "web_host", "web_port", "web_cert", "web_key",
-                      # Which ports this host may open for a device relay is
-                      # the same kind of decision as where the listener binds.
+                      # Same kind of decision as where the listener binds.
                       "web_relay_port_range")
 
 
@@ -1666,11 +1657,10 @@ def _check_mapper_settings(service, values: dict) -> None:
 
 
 def _check_configrx_settings(values: dict) -> None:
-    """`ignore_line_patterns` is one regex per line, applied to every
-    device's capture before it is hashed for change detection — validated
-    with the same bounded-regex compiler search and compliance rules use,
-    so a pattern that could run away on a real capture is refused here
-    rather than merely producing bad diffs later."""
+    """`ignore_line_patterns` is one regex per line, validated with the
+    same bounded-regex compiler compliance rules use, so a pattern that
+    could run away on a real capture is refused here rather than producing
+    bad diffs later."""
     from .. import configrx_compliance
 
     if "ignore_line_patterns" not in values:
@@ -1712,9 +1702,8 @@ def post_settings(service, params, body) -> dict:
     values = coerce_settings(_scope_defaults(scope), values, strict=True)
     _check_settings_ranges(values)
     if "web_relay_port_range" in values:
-        # Typed here rather than at the next relay: a range nobody can parse
-        # would otherwise be stored happily and only surface as a failed WEB
-        # click, on some other day, to somebody else.
+        # Typed here, not at the next relay: an unparseable range would
+        # otherwise store happily and surface as a failed WEB click later.
         webrelay.parse_port_range(values["web_relay_port_range"])
     if scope == "mapper":
         _check_mapper_settings(service, values)
@@ -2737,11 +2726,9 @@ def _device_json(row, reveal: bool = False) -> dict:
         "last_uptime_ts": row["last_uptime_ts"], "created_ts": row["created_ts"],
         "status_since_ts": _status_since(row),
         "sys_uptime_s": _sys_uptime_s(row),
-        # Where this device's own web interface lives, for the WEB relay.
-        # Keyed defensively for a row from before the migration that added
-        # them. `web_port_effective` is what the relay will actually dial —
-        # resolved once here so the form can show it as a placeholder and
-        # nothing on the client has to repeat the 80/443 rule.
+        # Web-interface fields for the WEB relay, keyed defensively for a
+        # pre-migration row. `web_port_effective` is resolved here so the
+        # form can show a placeholder without repeating the 80/443 rule.
         "web_scheme": (row["web_scheme"] if "web_scheme" in row.keys() else None),
         "web_port": (row["web_port"] if "web_port" in row.keys() else None),
         "web_port_effective": _web_port_effective(row),
@@ -2750,18 +2737,15 @@ def _device_json(row, reveal: bool = False) -> dict:
 
 def _web_port_effective(row) -> int:
     """The port the relay dials for this device. Resolved by webrelay, the
-    module that actually dials it, so the form's placeholder and the relay's
-    destination cannot disagree — NULL means http on 80, which is the answer
-    the old WEB button gave when it built "http://<ip>/" and asked nobody."""
+    module that actually dials it, so the form's placeholder and the
+    relay's destination cannot disagree."""
     return webrelay.device_web_target(row)[2]
 
 
 def _clean_web_fields(fields: dict) -> None:
-    """Validates `web_scheme`/`web_port` in place, if present.
-
-    Blank clears either one, which is what puts a device back on the
-    "http, port 80" default — a form that could set them but never unset
-    them would strand a device pointed at a port that has since moved.
+    """Validates `web_scheme`/`web_port` in place, if present. Blank clears
+    either one, since a form that could set but never unset them would
+    strand a device on a port that has since moved.
     """
     if "web_scheme" in fields:
         scheme = str(fields["web_scheme"] or "").strip().lower()
@@ -2992,9 +2976,8 @@ _DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id",
                          "ping_count", "ping_timeout_ms", "unreachable_ping_only",
                          "vendor_oid", "location_oid", "mac_table_interval_s",
                          "vlan_interval_s", "vendor_override", "upstream_id",
-                         # Per-device, never inherited from a polling profile
-                         # (nodesdb._DEVICE_ONLY_COLUMNS), so they are absent
-                         # from _GROUP_EDITABLE_BODY below on purpose.
+                         # Per-device, never inherited (nodesdb._DEVICE_ONLY_COLUMNS)
+                         # — absent from _GROUP_EDITABLE_BODY below on purpose.
                          "web_scheme", "web_port")
 _GROUP_EDITABLE_BODY = ("name", "snmp_version", "community", "v3_user",
                         "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
@@ -3960,9 +3943,8 @@ def post_nodes_devices_bulk_import(service, params, body) -> dict:
                 elif key in _BULK_IMPORT_BOOL_FIELDS:
                     value = _bulk_import_bool(value)
                 overrides[key] = value
-            # After the loop, not inside it: the refusal has to be the same
-            # sentence the single-device form gives, and a spreadsheet
-            # column of ports is exactly where a stray "8O80" turns up.
+            # After the loop, not inside it: the refusal must be the same
+            # sentence the single-device form gives.
             _clean_web_fields(overrides)
         except ValueError as exc:
             invalid.append({"row": i, "ip": ip, "reason": str(exc)})
@@ -5185,8 +5167,8 @@ def _rule_json(row) -> dict:
         "flap_window_s": row["flap_window_s"],
         "flap_min_transitions": row["flap_min_transitions"],
         "clear_threshold": row["clear_threshold"], "for_polls": row["for_polls"],
-        # Keyed defensively like the rest; 'above' is what every rule
-        # shipped before the column existed means.
+        # Keyed defensively like the rest; 'above' is the implied default
+        # when absent.
         "comparison": (row["comparison"] if "comparison" in row.keys()
                        else "above") or "above",
         # Keyed defensively for the same reason as rollup_note above.
@@ -5651,13 +5633,11 @@ def _validated_threshold_fields(kind: str, row, fields: dict, key: str = "") -> 
         raise ValueError("comparison must be 'above' or 'below'")
     if "comparison" in fields:
         fields["comparison"] = comparison
-    # A clear threshold on the wrong side of the threshold is not a tuning
-    # choice, it is an alert that can never close -- and which side is
-    # "wrong" is exactly what `comparison` decides, so a rule flipped to
-    # 'below' without its numbers being swapped has to be refused here
-    # rather than discovered as a stuck alert weeks later. allow_equal
-    # because several shipped rules set the two equal on purpose for a
-    # quantised metric; see _check_threshold_direction's own docstring.
+    # A clear threshold on the wrong side is an alert that can never close,
+    # and `comparison` decides which side is wrong, so a flipped rule is
+    # refused here rather than discovered as a stuck alert later.
+    # allow_equal because several shipped rules set the two equal on
+    # purpose; see _check_threshold_direction's docstring.
     reference = {
         "key": (row["key"] if row is not None else key),
         "threshold": (row["threshold"] if row is not None else None),
@@ -8315,13 +8295,10 @@ def get_dashboard_offenders(service, params, body) -> dict:
     def _rows(rows, value_key, unit):
         out = []
         for row in rows[:n]:
-            # namelookup.device_name mirrors Nodes' own display precedence
-            # (manual name when pinned, else the polled sysName, else the
-            # manual name) — row["name"] alone equals the IP for a device
-            # nobody has renamed, which is the bug this fixes. top_metric's
-            # rows already carry the resolved name; a row without sys_name
-            # in its keys (the events/interface_events path predates this)
-            # falls straight back to the raw name.
+            # namelookup.device_name mirrors Nodes' own display precedence;
+            # row["name"] alone equals the IP for a device nobody has
+            # renamed. A row without sys_name in its keys falls back to
+            # the raw name.
             keys = row.keys()
             name = (namelookup.device_name(row) if "sys_name" in keys else row["name"])
             out.append({"device_id": row["device_id"],

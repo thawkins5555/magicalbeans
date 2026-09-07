@@ -167,8 +167,7 @@ MAPPER_BACKFILL_MARKER = "mapper_permission_backfilled"
 # for this reason; 4.54's `mapper` walked into the same trap unnoticed,
 # which is why the rule now lives in one named place instead of a literal
 # tuple inside the function. EVERY module added from here on belongs here
-# too — 5.1's `web` sits before "ssh" in permissions.MODULES for an
-# unrelated reason (MODULES[-2:]), and is still newer than the backfill.
+# too, regardless of its position in permissions.MODULES.
 POST_SSH_MODULES = ("ssh", "admin", "mapper", "web")
 
 HOSTNAME_TTL_S = 7 * 86400
@@ -206,12 +205,8 @@ GLOBAL_DEFAULTS = {
     "web_port": 8443,
     "web_cert": "",
     "web_key": "",
-    # The ports the WEB button's device relays may bind, "low-high" (or "0"
-    # for any free port). A named range rather than the ephemeral default
-    # because a firewall rule has to name something: on Windows the first
-    # bind of an unopened port prompts, and one thousand-port rule is better
-    # than a prompt a week. Administrator-only alongside the web_* keys
-    # above — it decides which ports this host will listen on.
+    # A named range rather than "any free port": on Windows the first bind
+    # of an unopened port prompts, and one firewall rule beats a prompt a week.
     "web_relay_port_range": "40000-40999",
     # Idle timeout: no activity for this long signs the session out. Short by
     # default, because this is graded on presence, not on the tab being open
@@ -331,16 +326,9 @@ class AppDatabase(SqliteStore):
         operator sees which accounts were granted what; the module logger
         gets the same line either way.
 
-        Not every new module earns a backfill here. 5.1's `web` deliberately
-        has none: a missing row already means no access (`permissions_for`
-        returns a dict, `permissions.allows(None, ...)` is False), and the
-        relay it gates opens a listening port on this host to a device's
-        management page — a power nobody held before, so nobody inherits it.
-        The WEB button that existed before 5.1 opened the device's URL in the
-        browser and touched this server not at all, which is why replacing it
-        is not a capability being taken away. An administrator grants `web`
-        per account; a fresh install's seeded admin gets it from
-        `_ensure_default_user`, which grants every module.
+        5.1's `web` deliberately gets no backfill: a missing row already
+        means no access, and the relay it gates is a power nobody held
+        before, so nobody inherits it.
         """
         with self._lock:
             if self._needs_full_backfill:

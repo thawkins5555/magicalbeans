@@ -35,12 +35,10 @@ CREATE TABLE IF NOT EXISTS rules (
     notify          INTEGER NOT NULL DEFAULT 1,
     threshold       REAL,
     clear_threshold REAL,
-    -- Which side of `threshold` is the fault: 'above' (the only direction
-    -- this evaluator had before 5.1.0, and every rule shipped before it) or
-    -- 'below', for a metric where a FALLING value is the fault -- an optic's
-    -- receive power. See alertrules.breaches/evaluate_threshold; the
-    -- hysteresis band is the same band either way, so a 'below' rule's
-    -- clear_threshold sits ABOVE its threshold.
+    -- Which side of `threshold` is the fault: 'above' (default), or
+    -- 'below' for a falling-is-bad metric (an optic's receive power),
+    -- whose clear_threshold then sits ABOVE its threshold. See
+    -- alertrules.breaches/evaluate_threshold.
     comparison      TEXT NOT NULL DEFAULT 'above',
     for_polls       INTEGER NOT NULL DEFAULT 1,
     -- Flapping rules only. NULL means "use the shipped defaults" so an
@@ -205,13 +203,9 @@ DEFAULTS = {
     "smtp_to_default": [],          # fallback recipients
     "smtp_timeout_s": 15.0,
     # volume control
-    # The severity floor on NOTIFICATION, distinct from min_severity above
-    # (which is a filter on syslog INGEST). An alert worse -- numerically
-    # higher -- than this still opens, still lists, still counts on the
-    # badge; only the mailbox is spared. 7 is every severity, which is what
-    # every install had before this setting existed. The webhook channel is
-    # deliberately not gated by it: a chat room or a ticket queue is not a
-    # person's inbox, and it has its own enabled flag and its own budget.
+    # Distinct from min_severity above (a filter on syslog INGEST): a
+    # numerically-higher alert still opens and lists, only the mailbox is
+    # spared. Not applied to the webhook channel, which has its own gate.
     "notify_min_severity": 7,
     "renotify_minutes": 0,          # 0 = notify once per open alert, never again while open
     "notify_on_clear": True,
@@ -475,21 +469,13 @@ def _check_threshold_direction(rule, threshold, clear_threshold, *,
     meaning "inherit `rule`'s own value") would leave nothing to clear
     through.
 
-    Which side is which is `comparison`'s to say -- the rule's own column
-    when the caller does not override it. An 'above' rule breaches at or
-    over threshold and clears below clear_threshold, so its clear sits
-    below; a 'below' rule (an optic's receive power falling) is the mirror
-    image, so its clear sits above. A clear on the wrong side is not a
-    tuning choice, it is an alert that can never close.
+    Which side is which is `comparison`'s to say. A clear on the wrong side
+    of threshold is not a tuning choice, it is an alert that can never close.
 
-    `allow_equal` is the difference between the two callers. A device
-    OVERRIDE demands a real gap: an operator retuning one device's numbers
-    by hand has no reason to collapse the band, and refusing it catches the
-    inverted pair that produced a permanently open alert. The RULE editor
-    does not, because several shipped rules set the two equal on purpose
-    for a quantised metric with no gap to leave (ups_on_battery,
-    ups_battery_low/replace, netpath_unreachable) and saving one of those
-    back unchanged has to keep working.
+    `allow_equal` is the difference between the two callers: a device
+    OVERRIDE demands a real gap, while the RULE editor allows equal
+    thresholds, since several shipped rules use them on purpose for a
+    quantised metric with no gap to leave.
 
     Only checked when the CALLER is actually setting one of the two numbers.
     A call that only touches `enabled` (both None, pure inherit) has nothing
@@ -637,33 +623,17 @@ _BUILTIN_RULES = [
     # with SFF-8472's own typical vendor-set high-warning/high-alarm
     # thresholds for a commercial-temperature transceiver.
     ("temp_optic_high", "Optic temperature high", "threshold", "temp_optic_c", 4, "threshold_breach", 80.0, 70.0, 2),
-    # The three per-port optic rules, reading the DOM keys nodepoll writes
-    # per interface (sfp_rx_dbm.<if>, and so on), so each alerts on the port
-    # rather than on the device. Deliberately conservative: DOM numbers vary
-    # by transceiver type and by link budget, and an optic alert that fires
-    # on a healthy 10 km single-mode link on day one is an optic alert
-    # somebody turns off on day two.
+    # DOM keys nodepoll writes per interface (sfp_rx_dbm.<if>, etc.), so
+    # each alerts on the port rather than the device.
     #
-    # Receive power is the one that predicts a failure: a link degrades for
-    # weeks as a connector gets dirty or a splice ages, and the received
-    # level falls long before the interface itself goes down. -22 dBm is at
-    # or below the receive sensitivity of essentially every 1G/10G optic in
-    # service (commonly -20 to -23), so a port below it is running on
-    # margin that is not there; it clears at -20, back inside every one of
-    # those budgets.
+    # -22 dBm is at or below the receive sensitivity of essentially every
+    # 1G/10G optic (commonly -20 to -23); clears at -20.
     ("sfp_rx_power_low", "Optic receive power low", "threshold", "sfp_rx_dbm", 4, "threshold_breach", -22.0, -20.0, 2),
-    # Transmit power is about the optic itself rather than the fibre: a
-    # laser whose output has fallen away is dying. -12 dBm is below the
-    # minimum launch power of the common short- and long-reach types
-    # (typically -9.5 to -3), far enough below to leave a low-power
-    # transceiver alone.
+    # -12 dBm is below the minimum launch power of common short/long-reach
+    # types (typically -9.5 to -3).
     ("sfp_tx_power_low", "Optic transmit power low", "threshold", "sfp_tx_dbm", 4, "threshold_breach", -12.0, -10.0, 2),
-    # Per-port optic temperature, distinct from temp_optic_high above,
-    # which stays: that rule reads the DEVICE-wide temp_optic_c (the
-    # hottest optic in the chassis) and is what an operator already has
-    # tuned, so it is untouched. This one reads sfp_temp_c.<if> and names
-    # the port. 70 C is inside SFF-8472's typical commercial high-warning
-    # range and above the 40-55 C a healthy optic runs at.
+    # Reads sfp_temp_c.<if>, distinct from temp_optic_high's device-wide
+    # temp_optic_c. 70 C is inside SFF-8472's typical high-warning range.
     ("sfp_temp_high", "Optic temperature high (per port)", "threshold", "sfp_temp_c", 4, "threshold_breach", 70.0, 65.0, 2),
     # RH above ~80% starts to risk condensation on anything metal in the
     # room — unambiguous on its own: nothing but a dedicated environmental
@@ -743,11 +713,8 @@ _BUILTIN_RULES = [
     ("poll_pool_saturated", "Polling pool saturated — polls are being skipped", "system", "poll_pool_saturated", 3, "event_notice", None, None, 1),
 ]
 
-# Shipped `comparison`, kept apart from _BUILTIN_RULES for the same reason
-# as _BUILTIN_FOR_SECONDS below. Absent means 'above', which is the column
-# default and what every rule shipped before 5.1.0 means. Only the two optic
-# POWER rules are low-water: a transceiver whose received light has fallen
-# away is the fault, and there is no upper bound worth alerting on.
+# Kept apart from _BUILTIN_RULES, like _BUILTIN_FOR_SECONDS below. Absent
+# means 'above'. Only the two optic POWER rules are low-water.
 _BUILTIN_COMPARISON = {
     "sfp_rx_power_low": "below",
     "sfp_tx_power_low": "below",
@@ -1138,23 +1105,15 @@ class AlertsDatabase(SqliteStore):
 
     def _resolve_device_if_alerts(self) -> None:
         """Resolve the open device-scoped alerts of the interface threshold
-        rules, once, on upgrade to 5.1.0.
+        rules, once, on upgrade to 5.1.0: those rules used to read a
+        device-level worst-port key, so old open alerts name no port and
+        the evaluator no longer writes that key, meaning nothing will ever
+        clear them.
 
-        Those rules used to read the device-level worst-port metric key
-        (if_in_util_pct, the busiest port's utilization), so every alert
-        they ever raised is entity_kind='device' and names no port. The
-        evaluator now skips that key on any device that also reports
-        per-port children and alerts on the ports themselves, which means
-        nothing will ever clear the old rows: they would sit open for ever,
-        naming a device and a number with no way to act on either.
-
-        Scoped by rule, not by dedup key: `kind = 'threshold'` and a
-        source_kind beginning "if_" is exactly the set that moved, and it
-        picks up a custom rule an operator wrote against one of those keys
-        as well as the six built-ins. Acked rows go too -- an
-        acknowledgement is "I have this", and this one is finished.
-        Resolved with a note rather than deleted, the same choice
-        _retire_temp_high makes: the history is the point.
+        Scoped by `kind = 'threshold'` and source_kind LIKE 'if_%' rather
+        than by dedup key, so it also catches a custom rule against one of
+        those keys. Acked rows go too; resolved with a note rather than
+        deleted, like _retire_temp_high.
         """
         now = time.time()
         with self._lock:
@@ -2355,22 +2314,14 @@ class AlertsDatabase(SqliteStore):
     def resolve_by_dedup_prefix(self, prefix: str, by: str = "",
                                 rolled_up_into: int | None = None
                                 ) -> list[sqlite3.Row]:
-        """resolve_by_dedup for a whole family of keys at once, oldest
-        first.
-
-        A per-port threshold rule keys its alerts
-        "<rule>:interface:<device_id>:<if_index>", so one device's set is
-        one prefix and resolve_by_dedup -- which names exactly one key --
-        cannot reach it. A rollup absorbing a switch's outage has to close
-        every port's alert on that switch, and a per-device override being
-        switched off has to close every port's alert for that rule.
+        """resolve_by_dedup for a whole family of keys at once (a per-port
+        rule's alerts share one "<rule>:interface:<device_id>:" prefix),
+        oldest first.
 
         Bounds rather than LIKE: the prefix's last character is bumped by
-        one to get an exclusive upper bound, which is a range scan of
-        ux_alerts_active_dedup (whose WHERE state IN ('open','acked')
-        matches this query's own filter exactly). LIKE would have to escape
-        the underscores every rule key contains, and an escaped LIKE cannot
-        use an index at all.
+        one for an exclusive upper bound, a range scan on
+        ux_alerts_active_dedup -- an escaped LIKE (underscores in the key)
+        couldn't use the index at all.
         """
         if not prefix:
             return []

@@ -251,20 +251,18 @@ class Service:
         # configrx_db (it is where the device's SSH credential and host key
         # live). Holds no thread of its own until a session opens.
         self.ssh_sessions = SshSessionRegistry(self)
-        # The WEB button's TCP relays, for the same reasons in the same order:
-        # after sessions (a tunnel belongs to a signed-in user) and after
-        # nodes_db (the target comes from the device row). Binds nothing and
-        # holds no thread until a relay is opened.
+        # The WEB button's TCP relays, ordered the same way: after sessions
+        # (a tunnel belongs to a signed-in user) and after nodes_db (the
+        # target comes from the device row).
         self.web_relays = WebRelayRegistry(self)
         self._ensure_default_user()
 
         self._stop = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
         self._nodes_split_thread: threading.Thread | None = None
-        # request_maintenance() sets the first, which is also what the
-        # maintenance thread waits on between ticks, so a request wakes it
-        # at once instead of up to a minute later; the second says the
-        # requested pass has finished.
+        # The maintenance thread waits on the first between ticks, so
+        # request_maintenance() wakes it at once; the second marks that
+        # pass done.
         self._maintenance_request = threading.Event()
         self._maintenance_done = threading.Event()
         # Held for the body of run_maintenance: shutdown() below must not
@@ -483,9 +481,8 @@ class Service:
             self._nodes_split_thread.join(timeout=10.0)
             self._nodes_split_thread = None
         # A sweep could still be running when the databases close below —
-        # join the maintenance thread (its body checks _stop between stages
-        # and returns), then hold the lock run_maintenance holds for the
-        # whole close sequence.
+        # join the maintenance thread, then hold the lock run_maintenance
+        # holds for the whole close sequence.
         if self._maintenance_thread is not None:
             self._maintenance_thread.join(timeout=10.0)
             self._maintenance_thread = None
@@ -494,9 +491,8 @@ class Service:
             # person is watching, and each one writes a closing device event,
             # so they must end while the databases are still open.
             self.ssh_sessions.shutdown()
-            # And the relays, for the same reason and with the same budget:
-            # each writes a closing device event with its byte counts, so it
-            # has to end while the databases are still open.
+            # And the relays, same reason: each writes a closing device
+            # event, so they must end while the databases are still open.
             self.web_relays.shutdown()
             self.monitor.shutdown()   # waits briefly for running traces to land
             self.hop_prober.shutdown()
@@ -912,14 +908,9 @@ class Service:
                     self._maintenance_done.set()
 
     def request_maintenance(self) -> None:
-        """Ask for a forced sweep and return.
-
-        A settings save used to call run_maintenance(force=True) inline, so
-        Apply took as long as the whole prune-and-trim sweep of thirteen
-        stores did — up to a minute on a large install, on the HTTP thread.
-        The sweep is real work and still runs; it just runs on the
-        maintenance thread, which this wakes.
-        """
+        """Ask for a forced sweep and return; the sweep runs on the
+        maintenance thread, which this wakes, rather than blocking the HTTP
+        thread for up to a minute on a large install."""
         self._maintenance_done.clear()
         self._maintenance_request.set()
 
@@ -951,12 +942,10 @@ class Service:
         return self._stop.is_set()
 
     def _run_maintenance_body(self, force: bool = False) -> None:
-        # A forced pass is the one a settings save asks for. netpath.db --
-        # the only store here with per-hop rows at fleet volume -- gets a
-        # short budget so a burst of saves cannot keep the maintenance
-        # thread working down one backlog. The periodic tick keeps the full
-        # budget; a forced pass still does some retention work, so those
-        # saves cannot outrun what retention enforces either.
+        # A forced pass gets a short budget on netpath.db (the only store
+        # here with per-hop rows at fleet volume) so a burst of settings
+        # saves can't stall on a backlog; it still does enough retention
+        # work that saves can't outrun what retention enforces.
         prune_budget = FORCED_PRUNE_BUDGET_S if force else TRIM_BUDGET_S
         self.db.prune(float(self.settings.get("trace_retention_days", 90)),
                       budget_s=prune_budget)
@@ -1053,8 +1042,8 @@ class Service:
         self._trim_db("max_nodes_db_mb", self.nodes_db, "Nodes database",
                       "oldest events")
         # Own cap since 5.0.0: growth lives here, not in the inventory file.
-        # Two stages since 5.1.0, so the noun names both: the raw samples go
-        # first and the oldest hourly rollups only once raw is at its floor.
+        # Two stages, so the noun names both: raw samples go first, hourly
+        # rollups only once raw is at its floor.
         self._trim_db("max_nodes_series_db_mb", self.nodes_db.series_db,
                       "Nodes metric history",
                       "oldest samples and hourly rollups")

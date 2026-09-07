@@ -1152,10 +1152,8 @@ check("caret.textContent !== glyph" in _APP_SORT,
 
 
 # ---------------------------------------------------------------------------
-# 38. NODES (5.1.0): the SFP badge in the interface list. interfaces.media is
-#     the stored signal; the device dialog's own /dom read is the live one,
-#     and it lands independently of the interface fetch, so whichever
-#     arrives second has to paint.
+# 38. NODES (5.1.0): the SFP badge. interfaces.media is the stored signal;
+#     the dialog's own /dom read is live and may land second, so either paints.
 check("badge badge-sfp" in NODES and "r.media === 'optic'" in NODES,
       "the SFP badge is driven by the stored media column, not by guessing "
       "from the port name")
@@ -1176,10 +1174,8 @@ check("view.ifaces =" not in _DEV_DIALOG,
       "describes the selected device, not the one this dialog opened")
 
 
-# 41. STORAGE (5.1.0): "oldest record N ago" beside each data file. The
-#     figure comes from /api/state's storage block, one {name}_oldest_ts per
-#     store, and is rendered where the byte counts already are — so a cap
-#     that has been trimming reads as lost history and not only as bytes.
+# 41. STORAGE (5.1.0): "oldest record N ago" beside each data file, from
+#     /api/state's {name}_oldest_ts, rendered where the byte counts already are.
 _SETTINGS41 = read("settings.js")
 _USAGE41 = _SETTINGS41[_SETTINGS41.index("  function showUsage(storage) {"):
                        _SETTINGS41.index("  function status(message, colour) {")]
@@ -1198,9 +1194,8 @@ for _id in ("age-app", "age-trace", "age-flow", "age-snmp", "age-syslog",
           "the %s span exists in the page and is filled in by showUsage" % _id)
 
 
-# 42. ConfigRX (5.1.0): the settings dialog's CHANGE DETECTION fieldset for
-#     ignore_line_patterns, the operator-editable companion to
-#     configrx_volatile.VOLATILE's built-in per-vendor exclusions.
+# 42. ConfigRX (5.1.0): the CHANGE DETECTION fieldset for ignore_line_patterns,
+#     the operator-editable companion to configrx_volatile.VOLATILE.
 _CX_SETTINGS = CONFIGRX[CONFIGRX.index("function settingsDialog()"):
                         CONFIGRX.index("  /* ------------------------------------------------------------- search")]
 check("CHANGE DETECTION" in _CX_SETTINGS,
@@ -1223,9 +1218,7 @@ check("ntp clock-period" in _CX_SETTINGS,
 
 # ---------------------------------------------------------------------------
 # 39. ALERTS (5.1.0): the rule comparison direction and the email severity
-#     floor. Both are settings whose whole value is that they reach the
-#     server: a select the save map never reads is a control that silently
-#     does nothing, which is the failure this file exists to catch.
+#     floor — a select the save map never reads is a control that does nothing.
 _ALERTS_JS = read("alerts.js")
 check("id=\"ar-comparison\"" in _ALERTS_JS,
       "the rule editor offers the comparison direction, or a 'below' rule "
@@ -1248,10 +1241,8 @@ check("EMAIL SERVER" in _MINSEV_HELP,
       "the wrong one")
 
 
-# 40. The WEB relay (5.1.0). The button opens a tunnel on the server now, so
-#     the three things that used to be true of it are the three that must not
-#     come back: a URL stashed in the markup, no permission gate, and a
-#     window.open sitting after an await where a popup blocker eats it.
+# 40. The WEB relay (5.1.0): must not regress — a URL in the markup, a
+#     missing permission gate, or a window.open placed after an await.
 _WEB_CLICK = NODES[NODES.index("  async function webDevice()"):
                    NODES.index("  /* ------------------------------------------------------------ profiles */")]
 check("dataset.url" not in NODES,

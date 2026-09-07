@@ -1,19 +1,5 @@
 """The WEB button's TCP relay: a short-lived listener on this host that
 carries bytes, unread, to one device's own web interface.
-
-Before 5.1 the button pointed the browser straight at `http://<ip>/`, which
-only works from a machine with a route to the management plane. This opens a
-port here instead, so the operator's browser talks to this server and this
-server talks to the device — the same reachability the poller already has.
-
-What that costs is what shapes this module. The listener is a door into the
-management plane, so: the target comes from the device row and never from the
-caller; only the operator's own client address is admitted; the door closes on
-idle, on nobody arriving, on sign-out, on the permission going away and on
-shutdown; and there are caps so one account cannot open doors until the
-process runs out of ports. Bytes are copied and never inspected — a device on
-https carries its own TLS through this untouched, which is also why the audit
-trail can only ever say how many bytes went each way.
 """
 
 from __future__ import annotations
@@ -34,71 +20,52 @@ log = logging.getLogger(__name__)
 
 # --------------------------------------------------------------- the limits
 #
-# How long the relay waits for the device's web server to answer a TCP
-# connect. The same ten seconds sshterm uses, for the same reason: a device
-# that has not completed a handshake in that long is not reachable, and the
-# browser tab wants to be told rather than left spinning.
+# The same ten seconds sshterm uses: a device that hasn't handshaked by then
+# isn't reachable, and the tab should be told rather than left spinning.
 CONNECT_TIMEOUT_S = 10
-# No bytes either way for this long ends the relay. Presence, not "the tab is
-# open" — the same rule auth.py's SessionStore.touch applies, and the same
-# figure the SSH terminal uses. _watch_tick takes whichever of this and the
-# live session_idle_minutes is smaller, so a relay never advertises a longer
-# window than the sign-in containing it.
+# Presence, not "the tab is open" — mirrors auth.py's SessionStore.touch and
+# the SSH terminal's idle figure.
 IDLE_TIMEOUT_S = 900
-# How long a relay that nobody ever connects to may hold its port. The click
-# handler opens the window and sets its location the moment the POST answers,
-# so this is measured in round trips; what it bounds is the other case — a
-# popup blocker that ate the window, a POST whose answer never arrived, or a
-# caller driving the API directly who opened a door and walked away. Without
-# it such a relay holds a port and a slot for the full idle timeout.
+# Bounds a relay nobody ever connects to (popup blocker ate the window, the
+# POST's answer never arrived, or a caller opened a door and walked away) —
+# without it such a relay holds a port for the full idle timeout.
 FIRST_CONNECT_WINDOW_S = 60
 # Relays across the whole application. Each is a listening socket, two
 # threads, and up to MAX_CONNECTIONS_PER_SESSION more while a page loads.
 MAX_SESSIONS = 16
-# And per signed-in account, so one account cannot spend the application-wide
-# cap on its own and lock every other operator out.
+# Per signed-in account, so one account cannot spend the whole cap itself and
+# lock every other operator out.
 MAX_SESSIONS_PER_USER = 4
-# Concurrent connections through one relay. A browser opens several sockets
-# per page (six per origin is the usual limit) and a device's UI may hold a
-# couple more for long-polling, so this is generous on purpose: what it stops
-# is a page — or a script behind one — spending the process's file handles.
+# Generous on purpose (a browser opens several sockets per page, a device's
+# UI may hold more for long-polling) — what it stops is a page spending the
+# process's file handles.
 MAX_CONNECTIONS_PER_SESSION = 32
-# How often traffic refreshes the *web* session. Somebody driving a device's
-# management page is present by the same rule a POST is, but a touch per
-# chunk would be a write per 64 KB.
+# Somebody driving a device's page is present by the same rule a POST is, but
+# a touch per chunk would be a write per 64 KB.
 TOUCH_INTERVAL_S = 30
-# How often the watchdog re-reads the permission (it re-reads the web session
-# every tick, which is a dictionary lookup; the permission is a database
-# read). Five seconds from revoked to closed.
+# The web session is re-read every tick (a dict lookup); the permission is a
+# database read, so it gets its own slower cadence.
 PERMISSION_EVERY_TICKS = 5
-# How long `WebRelayRegistry.shutdown()` may take in total, for every session
-# rather than for each — sessions are stopped concurrently inside it.
+# Total budget for every session, not each — sessions stop concurrently.
 SHUTDOWN_BUDGET_S = 3.0
-# The copy buffer. Large enough that a page of images is a handful of reads
-# per socket, small enough that one relay cannot pin megabytes per connection.
+# Large enough that a page of images is a handful of reads per socket, small
+# enough that one relay cannot pin megabytes per connection.
 CHUNK_BYTES = 64 * 1024
-# The ports a relay may bind, as an operator writes it in Settings. A named
-# range rather than "any free port" by default because a firewall rule has to
-# name something: on Windows the first bind of an unopened port prompts, and
-# a fixed thousand-port window is one rule instead of a prompt a week.
+# A named range rather than "any free port": on Windows the first bind of an
+# unopened port prompts, and a fixed window is one firewall rule, not one a week.
 DEFAULT_PORT_RANGE = "40000-40999"
 
-# The schemes a device's web interface may be reached over, and the port each
-# implies when the device row does not name one.
 WEB_SCHEMES = ("http", "https")
 DEFAULT_WEB_PORTS = {"http": 80, "https": 443}
 
 # Session ids start with a letter because server.py's _route turns an
-# all-digit path group into an int before it reaches the handler; a token that
-# happened to be all digits would arrive as a number and match nothing.
+# all-digit path group into an int before it reaches the handler.
 _SESSION_PREFIX = "r"
 
 
 def parse_port_range(text: str) -> tuple[int, int]:
-    """`"40000-40999"` -> (40000, 40999). `"0"` means "any free port the
-    operating system offers" — the escape hatch for a host where the range is
-    already spoken for. Raises ValueError with the sentence an operator
-    should read."""
+    """`"40000-40999"` -> (40000, 40999). `"0"` means any free port the OS
+    offers — the escape hatch for a host where the range is already spoken for."""
     raw = str(text or "").strip() or DEFAULT_PORT_RANGE
     if raw == "0":
         return (0, 0)
@@ -120,12 +87,9 @@ def parse_port_range(text: str) -> tuple[int, int]:
 def relay_bind_host(web_host: str) -> str:
     """Where a relay listens, given where the UI listens.
 
-    The relay has to be reachable by the same browser that reached the UI, so
-    it follows it exactly: every address when the UI is on every address,
-    and the same single address when the UI is pinned to one. Binding
-    everything while the UI is pinned to loopback would put a door into the
-    management plane on an interface the operator deliberately kept the
-    application off.
+    Follows the UI exactly: binding everything while the UI is pinned to
+    loopback would put a door into the management plane on an interface the
+    operator deliberately kept the application off.
     """
     host = str(web_host or "").strip()
     return "0.0.0.0" if host in ("", "*") else host
@@ -137,10 +101,8 @@ _HOST_CHARS = re.compile(r"^[A-Za-z0-9.\-\[\]:]+$")
 def url_host(host_header: str, fallback: str) -> str:
     """The host part of a `Host:` header, without its port.
 
-    The URL handed back has to name whatever the browser typed — a hostname,
-    a NAT address, `localhost` — because that is the only address it is known
-    to be able to reach. An IPv6 literal keeps its brackets, since that is
-    what a URL wants.
+    Has to name whatever the browser typed — hostname, NAT address,
+    localhost — since that's the only address it's known to reach.
     """
     host = str(host_header or "").strip()
     if not host or not _HOST_CHARS.match(host):
@@ -170,11 +132,9 @@ def _close_quietly(sock: socket.socket) -> None:
 
 
 def _listen(host: str, port: int) -> socket.socket:
-    """One bind attempt. No SO_REUSEADDR: on Linux it would let this bind a
-    port in TIME_WAIT that another relay just gave up, and on Windows it is
-    worse than that — it lets an unrelated process bind the same port and
-    steal connections. SO_EXCLUSIVEADDRUSE is the Windows way to say the
-    opposite: nobody else gets this port while it is held."""
+    """No SO_REUSEADDR: on Windows it would let an unrelated process bind the
+    same port and steal connections. SO_EXCLUSIVEADDRUSE is the Windows way
+    to keep the port exclusive while held."""
     sock = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET,
                          socket.SOCK_STREAM)
     if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
@@ -185,9 +145,8 @@ def _listen(host: str, port: int) -> socket.socket:
     except OSError:
         sock.close()
         raise
-    # Half a second, so closing the listener is not the only thing that can
-    # end the accept loop: a platform where close() does not unblock accept()
-    # would otherwise leave the thread parked for the life of the process.
+    # So closing the listener isn't the only thing that can end the accept
+    # loop, on a platform where close() doesn't unblock accept().
     sock.settimeout(0.5)
     return sock
 
@@ -230,9 +189,8 @@ class WebRelayRegistry:
             self.service.settings.get("web_relay_port_range", DEFAULT_PORT_RANGE))
         bind_host = relay_bind_host(self.service.settings.get("web_host", "0.0.0.0"))
 
-        # The whole admission decision under one lock: two clicks arriving
-        # together must not both pass a cap that only one of them fits, and
-        # must not both pick the same free port and have the second bind fail.
+        # Whole admission decision under one lock: two clicks arriving
+        # together must not both pass a cap that only one of them fits.
         with self._lock:
             if self._stopping:
                 raise ValueError("The server is shutting down.")
@@ -313,9 +271,8 @@ class WebRelayRegistry:
 
     def shutdown(self) -> None:
         """End every relay before the databases close (a closing relay writes
-        a device event). Concurrent, under one shared budget: a session's stop
-        waits on its own pump threads, and sixteen of those in a row would be
-        an operator's Ctrl+C apparently doing nothing."""
+        a device event). Concurrent, under one shared budget — sixteen
+        sequential stops would be an operator's Ctrl+C apparently hanging."""
         with self._lock:
             self._stopping = True
             live = list(self._sessions.values())
@@ -337,11 +294,10 @@ class WebRelaySession:
     """One open door: a listening socket, an accept thread, a watchdog, and
     a pair of threads per connection carrying bytes in each direction.
 
-    Blocking threads rather than one selector over every socket, deliberately.
-    Windows' `select()` takes a fixed-size FD_SET (512 by default) and, unlike
-    poll/epoll, there is no portable alternative in the standard library —
-    sixteen relays of thirty-two connections is 1,024 sockets, which is past
-    it before the application's own listener is counted.
+    Blocking threads rather than one selector, deliberately: Windows'
+    select() takes a fixed-size FD_SET (512 by default) with no portable
+    poll/epoll alternative in the standard library, and sixteen relays of
+    thirty-two connections is 1,024 sockets.
     """
 
     def __init__(self, registry: WebRelayRegistry, listener: socket.socket,
@@ -358,13 +314,11 @@ class WebRelaySession:
         self.target_port = target_port
         self.scheme = scheme
         self.app_user = username
-        # The one address this relay will speak to, normalised the way every
-        # other allow list in this application is (a dual-stack listener
-        # reports an IPv4 peer as "::ffff:10.0.0.1").
+        # Normalised the way every other allow list here is (a dual-stack
+        # listener reports an IPv4 peer as "::ffff:10.0.0.1").
         self.client_ip = client_ip
-        # The web session this relay hangs off. A tunnel outlives the request
-        # that opened it, so this is what the watchdog re-reads: sign out,
-        # expiry or a deleted account must take the tunnel with it.
+        # A tunnel outlives the request that opened it, so this is what the
+        # watchdog re-reads: sign out, expiry or a deleted account takes it.
         self.token = token
         self.url = f"{scheme}://{host}:{port}/"
         self.opened_ts = time.time()
@@ -377,13 +331,12 @@ class WebRelaySession:
         self.bytes_from_device = 0
         self.connections_total = 0
         self._live_connections = 0
-        # Every socket a live connection is using. A pump parked in recv()
-        # only notices `_stopped` between chunks, so closing these is what
-        # actually ends a relay that a browser is still holding open — and
-        # it is why shutdown() can promise a budget at all.
+        # A pump parked in recv() only notices `_stopped` between chunks, so
+        # closing these is what actually ends a relay a browser still holds
+        # open — and why shutdown() can promise a budget at all.
         self._live_sockets: set[socket.socket] = set()
-        # Whether a refused source has already been audited: a scanner or a
-        # second operator's browser should leave one line, not one per packet.
+        # A scanner or a second operator's browser should leave one audit
+        # line, not one per packet.
         self._audited_refusal = False
         self._watch_failed = False
         self._threads: list[threading.Thread] = []
@@ -424,10 +377,7 @@ class WebRelaySession:
         """Whether a connection to this relay is the operator's own browser.
 
         The only gate on the port, and it is an address, not a credential:
-        the bytes are never read, so there is nothing in them to check. That
-        is why every other bound on this relay — the window before the first
-        connection, the idle close, the permission re-check — matters as much
-        as this does.
+        the bytes are never read, so there is nothing in them to check.
         """
         return udpsock.normalise_source(str(addr[0])) == self.client_ip
 
@@ -486,8 +436,7 @@ class WebRelaySession:
             up.join(timeout=CONNECT_TIMEOUT_S)
         except OSError:
             # A device that will not answer is reported by the browser as a
-            # failed page load, which is what it is; nothing here can render
-            # an error into a connection whose protocol it does not read.
+            # failed page load, which is what it is.
             pass
         finally:
             with self._counter_lock:
@@ -502,10 +451,8 @@ class WebRelaySession:
                     pass
 
     def _pump(self, src: socket.socket, dst: socket.socket, to_device: bool) -> None:
-        """Copy one direction. The bytes are counted and never looked at:
-        this carries whatever the device's web server speaks, TLS included,
-        so there is nothing here that could inspect a request even if it
-        wanted to."""
+        """Copy one direction. Bytes are counted and never looked at: this
+        carries whatever the device's web server speaks, TLS included."""
         try:
             while not self._stopped.is_set():
                 data = src.recv(CHUNK_BYTES)
@@ -516,8 +463,7 @@ class WebRelaySession:
         except OSError:
             pass
         # Half-close rather than close: the other direction may still have a
-        # response to deliver, which is exactly how a browser sending a
-        # request body and then waiting behaves.
+        # response to deliver.
         try:
             dst.shutdown(socket.SHUT_WR)
         except OSError:
@@ -562,9 +508,9 @@ class WebRelaySession:
                 if self._watch_tick(ticks):
                     return
             except Exception:
-                # This one loop enforces the idle timeout, the first-connect
-                # window, sign-out and the permission check; a failed tick
-                # must not silently disable all four.
+                # This one loop enforces idle timeout, first-connect window,
+                # sign-out and the permission check; it must not silently
+                # disable all four on one failed tick.
                 if not self._watch_failed:
                     self._watch_failed = True
                     log.exception("The web relay watchdog for device %s failed "
@@ -605,8 +551,7 @@ class WebRelaySession:
             if self._stopped.is_set():
                 return
             self._stopped.set()
-        # The listener first: it is what the accept thread is parked on, and
-        # closing it is what stops another connection arriving mid-teardown.
+        # The listener first: it's what the accept thread is parked on.
         try:
             self.listener.close()
         except OSError:
@@ -626,16 +571,14 @@ class WebRelaySession:
 
     def _audit(self, headline: str, detail: str) -> None:
         """One line in both places a relay is recorded: the device's own
-        event list and the NODES log. Byte counts, never content — there is
-        no content here to record, which is the point."""
+        event list and the NODES log."""
         try:
             self.service.nodes_db.record_device_event(self.device_id, "web",
                                                       headline)
             self.service.log.add(NODES, headline, target=self.target_ip,
                                  detail=detail)
         except Exception:
-            # Shutdown races the databases closing; an audit line lost on the
-            # way out is not worth a traceback in the console.
+            # Shutdown races the databases closing.
             pass
 
     def _audit_close(self, reason: str) -> None:
@@ -644,10 +587,8 @@ class WebRelaySession:
         with self._counter_lock:
             to_device, from_device = self.bytes_to_device, self.bytes_from_device
             total = self.connections_total
-        # The counts go in the headline, not only in the log detail: the
-        # device's own event list is where an operator looks to see what this
-        # tunnel did, and how much crossed is the only thing there is to say
-        # about it — the bytes themselves were never read.
+        # Counts go in the headline, not just the log detail: how much
+        # crossed is the only thing there is to say — the bytes were never read.
         self._audit(
             f"Web tunnel on port {self.port} closed after {spell}"
             + (f" ({reason})" if reason else "")

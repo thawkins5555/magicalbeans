@@ -555,12 +555,9 @@ _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
                    "mac_table_interval_s", "lldp_interval_s", "poe_enabled",
                    "stp_enabled", "vlan_interval_s")
 
-# Per-device columns that are settable but never inherited, for the same
-# reason vendor_override is deliberately absent from _OVERRIDE_COLUMNS: where
-# a box's own management page lives is a fact about that box, and a polling
-# profile handing "https on 8443" to a fleet would point the relay at the
-# wrong port on most of it. add_device copies these alongside the override
-# columns so Add and Edit set the same fields.
+# Settable but never inherited, like vendor_override: a management page's
+# scheme/port is a fact about one box, and a polling profile handing it to a
+# fleet would misdirect most of it.
 _DEVICE_ONLY_COLUMNS = ("web_scheme", "web_port")
 
 _DEVICE_EDITABLE = (("name", "group_id", "device_group_id", "display_name_source",
@@ -937,11 +934,8 @@ class NodesDatabase(SqliteStore):
             "stp_time_since_change_s": "REAL",
         })
         self.ensure_columns("devices", {
-            # Where this device's own web interface lives, for the WEB
-            # relay (5.1): "http"/"https" and a port, both NULL meaning
-            # "http on 80" — see _DEVICE_ONLY_COLUMNS. Deliberately not a
-            # polling-profile override: a management page is a fact about
-            # one box, not a credential or cadence handed down to a fleet.
+            # Web-interface scheme/port for the WEB relay; both NULL means
+            # "http on 80" — see _DEVICE_ONLY_COLUMNS.
             "web_scheme": "TEXT",
             "web_port": "INTEGER",
         })
@@ -951,10 +945,9 @@ class NodesDatabase(SqliteStore):
         })
         # Per-port PoE and STP state, the same kind of fact as oper_status
         # and refreshed by the same poll cycle rather than a table of its own.
-        # media: 'optic' once a port-mapped ENTITY-SENSOR row proves this
-        # port carries a transceiver, NULL otherwise. Written by
-        # _poll_environment, the only pass that already knows the
-        # entity->ifIndex mapping; IF-MIB has no media column of its own.
+        # media: 'optic' once a port-mapped ENTITY-SENSOR row proves a
+        # transceiver, else NULL. Written by _poll_environment — IF-MIB has
+        # no media column of its own.
         self.ensure_columns("interfaces", {
             "poe_admin": "TEXT", "poe_detect_status": "TEXT",
             "stp_state": "TEXT", "poe_power_mw": "INTEGER",
@@ -1420,8 +1413,7 @@ class NodesDatabase(SqliteStore):
     def metrics_for_families(self, keys) -> list[sqlite3.Row]:
         """metrics_for_keys widened to the per-port children of each key --
         see NodesSeriesDatabase.metrics_for_families. Same disabled-device
-        filter, for the same reason: `enabled` and the metric live in
-        different files."""
+        filter: `enabled` and the metric live in different files."""
         rows = self.series_db.metrics_for_families(keys)
         if not rows:
             return rows
@@ -3201,11 +3193,10 @@ class NodesDatabase(SqliteStore):
                                kinds: list[str] | None = None) -> list[sqlite3.Row]:
         """(device_id, name, ip, sys_name, display_name_source, n) for the
         devices with the most events since a wall-clock timestamp, busiest
-        first — the "top offenders" question a dashboard asks once, rather
-        than one query per device. sys_name/display_name_source ride along
-        so a caller can resolve the same display name Nodes itself shows
-        (namelookup.device_name) instead of the raw `name` column, which
-        equals the IP for a device nobody has renamed."""
+        first — the "top offenders" question a dashboard asks once.
+        sys_name/display_name_source ride along so a caller can resolve the
+        same display name Nodes itself shows, since `name` equals the IP for
+        a device nobody has renamed."""
         clauses = ["e.ts >= ?"]
         params: list = [float(since)]
         if kinds:
@@ -3687,9 +3678,8 @@ class NodesDatabase(SqliteStore):
         of one metric key — "worst packet loss", "slowest to answer". The
         ranking is the series store's, the names and the enabled filter are
         this file's, so the two are joined here. `name` is the resolved
-        display name (namelookup.device_name, falling back to the IP) so a
-        discovered device nobody has renamed shows its sysName here too,
-        rather than the raw `name` column, which equals the IP for one."""
+        display name, falling back to the IP, so a device nobody has renamed
+        shows its sysName here too."""
         from . import namelookup
 
         rows = self.series_db.top_metric_rows(key, ascending=ascending)

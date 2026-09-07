@@ -30,9 +30,8 @@
     // LLDP/CDP neighbours for the selected device's own ports (Tier 1 #5's
     // UI half), fetched alongside the rest of loadDetail.
     neighbors: [],
-    // Every WEB tunnel this account has open, across all devices — a tunnel
-    // outlives the page that opened it, so the button's status line is drawn
-    // from what the server says is up, not from what this page did.
+    // A tunnel outlives the page that opened it, so this is drawn from what
+    // the server says is up, not from what this page did.
     webRelays: [],
     discJobs: [],
     discSelected: null,
@@ -689,9 +688,8 @@
     view.ifaces = ifaces.interfaces;
     view.events = events;
     view.neighbors = neighbors.neighbors;
-    // On selection, not on every refresh tick: a tunnel changes when someone
-    // opens or closes one, not twice a second, and this is a whole extra
-    // round trip per device pane.
+    // Fetched on selection, not on every refresh tick — an extra round trip
+    // per device pane is not worth polling twice a second for.
     if (webRelaysFor !== view.selected) {
       webRelaysFor = view.selected;
       loadWebRelays();
@@ -713,11 +711,9 @@
     drawWebLink(view.detail);
   }
 
-  /* The WEB button beside SSH. Until 5.1 it stashed `http://<ip>/` on the
-     button and opened that, which only works from a machine with a route to
-     the management plane; it now opens a tunnel on this server (webDevice()
-     below), so there is no URL to stash — the button carries nothing but a
-     device selection, and the address it ends up at comes from the POST. */
+  /* The WEB button beside SSH opens a tunnel on this server (webDevice()
+     below), so the button carries no URL — the address it ends up at comes
+     from the POST. */
   function drawWebLink(d) {
     const button = App.el('nd-web-device');
     if (!button) return;
@@ -725,10 +721,8 @@
     drawWebStatus();
   }
 
-  /* "Tunnel: port N to 10.2.0.7:443 · Close" beside the button while one is
-     open for the selected device. Redrawn from `view.webRelays`, which
-     loadDetail refreshes on every device selection — a tunnel outlives the
-     page that opened it, so a reload has to find one that is already up. */
+  /* A tunnel outlives the page that opened it, so a reload has to find one
+     that is already up rather than assume none is open. */
   function drawWebStatus() {
     const status = App.el('nd-web-status');
     if (!status) return;
@@ -750,8 +744,6 @@
     status.append(close);
   }
 
-  /* Which device `view.webRelays` was last fetched for, so the list is one
-     round trip per selection rather than one per refresh tick. */
   let webRelaysFor = null;
 
   async function loadWebRelays() {
@@ -1260,11 +1252,9 @@
     }, App.stamp(t1, span)));
   }
 
-  /* The one signal this app has that a port carries a transceiver:
-     interfaces.media, written by the environment poll from the same
-     entity->ifIndex mapping the DOM dialog reads (nodepoll
-     _poll_environment). Prepended to the descr cell rather than given a
-     column of its own so it is visible in the default column set. */
+  // r.media is written by nodepoll's environment poll. Prepended to the
+  // descr cell rather than given a column of its own so it is visible in
+  // the default column set.
   function sfpBadge(r) {
     return r.media === 'optic'
       ? '<span class="badge badge-sfp" title="SFP / optical transceiver ' +
@@ -1527,12 +1517,9 @@
     const lossTimer = setInterval(() => { loadCharts().catch(() => {}); }, 15000);
     loadCharts().catch(() => {});
 
-    /* The interface list and the DOM read below are two independent
-       fetches, and the DOM one names ports whose stored media column the
-       poll may not have written yet (a device polled before this version,
-       or one inside its sensor cadence window). So whichever lands second
-       paints: the optic set patches the fetched rows in this dialog's own
-       closure — never view.ifaces, which belongs to the selected device. */
+    // Two independent fetches racing to paint; the optic set patches this
+    // dialog's own closure, never view.ifaces, which belongs to the
+    // selected device.
     let dialogIfaces = null;
     let dialogOptics = null;
     let dialogSnmpError = '';
@@ -2958,9 +2945,8 @@
         switch, its site router. When the upstream goes down, alerts for
         everything behind it are folded into the upstream's own alert instead
         of arriving as a storm. Blank means nothing is in front of it.</p>
-      <!-- Its own fieldset, above OVERRIDES and outside it on purpose: these
-           two are never inherited from a polling profile, because where a
-           box's management page lives is a fact about that box. -->
+      <!-- Outside OVERRIDES: never inherited from a polling profile, since
+           where a box's management page lives is a fact about that box. -->
       <fieldset><legend>WEB INTERFACE</legend>
         <label>Scheme <select id="nd-f-webscheme">
           <option value="" ${!d.web_scheme ? 'selected' : ''}>http (default)</option>
@@ -3179,10 +3165,8 @@
     const upstream = box.querySelector('#nd-f-upstream');
     if (upstream) overrides.upstream_id = upstream.value === '' ? null
       : Number(upstream.value);
-    // Not overrides at all — per-device columns that inherit from nothing —
-    // but carried here because this is what both Add and Edit send, and a
-    // field only Edit could set would be a field Add silently dropped.
-    // Always sent, so blanking either one really does clear it.
+    // Not overrides — per-device columns with no inheritance — but carried
+    // here since a field only Edit sent would be one Add silently dropped.
     const scheme = box.querySelector('#nd-f-webscheme');
     if (scheme) overrides.web_scheme = scheme.value || null;
     const webPort = box.querySelector('#nd-f-webport');
@@ -3979,16 +3963,9 @@
     }
   }
 
-  /* WEB: ask the server for a tunnel to this device's own web interface and
-     point a window at it.
-
-     The window is opened BEFORE the POST and its location set afterwards.
-     A `window.open` that runs after an `await` is no longer inside the click
-     that caused it, and every browser's popup blocker eats it — so the empty
-     window is claimed synchronously here and filled in when the answer
-     arrives, or closed again if the answer is a refusal. Named per device
-     like the SSH window, so a second click raises the tab that is already
-     open rather than opening a rival. */
+  /* The window is opened BEFORE the POST and its location set afterwards:
+     a `window.open` after an `await` is no longer inside the click that
+     caused it, and every browser's popup blocker eats it. */
   async function webDevice() {
     if (!view.detail || !App.canWrite('web')) return;
     const d = view.detail;

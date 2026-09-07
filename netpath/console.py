@@ -346,8 +346,7 @@ class ConsoleWindow(QMainWindow):
             cap = int(cap_mb) * 1024 * 1024
             share = f"{used / cap * 100:5.1f}% of {int(cap_mb)} MB" if cap else "no cap"
             oldest = database.oldest_ts()
-            # What the cap beside it has actually cost, in history rather
-            # than in bytes.
+            # What the cap beside it has actually cost, in history, not bytes.
             age = (f"oldest {_duration(time.time() - oldest)}" if oldest
                    else "no history")
             lines.append(f"{label:8s} {_size(used):>10s}   {share:>22s}   "

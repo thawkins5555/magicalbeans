@@ -536,12 +536,10 @@ ROUTES = [
     # the socket is the one hijacking route in the table (see _route).
     ("GET", r"^/api/ssh/devices/(\d+)$", api.get_ssh_device, ("ssh", W)),
     ("GET", r"^/api/ssh/devices/(\d+)/socket$", api.ws_ssh_device, ("ssh", W)),
-    # The WEB button's device relays. Write for all three, for the terminal's
-    # reason: there is no read-only half of "reach that device's management
-    # page through this server", and the list is what the close button acts
-    # on. The session id is matched as a string beginning with "r" because
-    # _route turns an all-digit path group into an int, and a random token
-    # can be all digits.
+    # The WEB button's device relays. Write for all three -- there is no
+    # read-only half of "reach a device's management page through this
+    # server" -- and session ids start "r" because _route would otherwise
+    # turn an all-digit token into an int.
     ("POST", r"^/api/web/devices/(\d+)/relay$", api.post_web_device_relay, ("web", W)),
     ("GET", r"^/api/web/relays$", api.get_web_relays, ("web", W)),
     ("DELETE", r"^/api/web/relays/(r[A-Za-z0-9_-]+)$", api.delete_web_relay, ("web", W)),
@@ -1030,13 +1028,9 @@ class Handler(BaseHTTPRequestHandler):
         session = self.service.sessions.get(token) if token else None
         params["_client"] = self.client_address[0]
         params["_agent"] = self.headers.get("User-Agent", "")
-        # The address the browser typed to get here, which is not something a
-        # handler can otherwise see. The WEB relay hands back a URL the
-        # browser has to be able to open, and the only address it is known to
-        # reach this server on is the one it just used — a hostname, a NAT
-        # address, `localhost`, whatever `--host` binds. Guessing from the
-        # listener instead would hand a machine on the plant network a URL
-        # naming 0.0.0.0.
+        # The WEB relay hands back a URL the browser must be able to open --
+        # the only address it's known to reach this server on is the one it
+        # just used. Guessing from the listener could hand back "0.0.0.0".
         params["_host"] = self.headers.get("Host", "")
         authenticated = False
         if session:

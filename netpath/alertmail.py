@@ -219,9 +219,8 @@ def build_context(alert_row, rule_row, extra: dict | None = None) -> dict:
         "rule_name": rule_row["name"] if rule_row else "",
         "previous_uptime": "", "current_uptime": "",
         "metric_label": "", "value": "", "threshold": "",
-        # Set by _evaluate_thresholds for a per-port breach, and defaulted
-        # here so a template that names one renders empty rather than
-        # leaving the literal token in a device-scoped email.
+        # Set by _evaluate_thresholds for a per-port breach; defaulted here
+        # so a device-scoped email renders empty rather than the literal token.
         "if_index": "", "interface_name": "", "interface_alias": "",
         "trap_name": "", "trap_oid": "", "varbinds": "",
         "down_since": "", "recovered_time": "", "downtime": "",

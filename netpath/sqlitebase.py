@@ -314,9 +314,8 @@ class SqliteStore:
     PRAGMAS = ("journal_mode=WAL", "synchronous=NORMAL", "foreign_keys=ON")
     TRIM_TABLE = ""
     TRIM_FLOOR = 200
-    # One query returning the epoch seconds of this store's oldest record,
-    # or None for a store that keeps no history at all (the MIB and mapper
-    # files hold current state, not a log).
+    # None for a store with no history (the MIB and mapper files hold
+    # current state, not a log).
     OLDEST_TS_SQL: str | None = None
 
     def __init__(self, path: str):
@@ -381,9 +380,7 @@ class SqliteStore:
 
     def oldest_ts(self) -> float | None:
         """When this store's history starts, in epoch seconds, or None when
-        it holds none — so a size cap that has been trimming can be read as
-        "this is how far back you can still look" rather than only as a
-        number of bytes."""
+        it holds none."""
         if not self.OLDEST_TS_SQL:
             return None
         try:

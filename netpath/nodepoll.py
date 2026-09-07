@@ -107,10 +107,8 @@ _DEVICE_MAX_KEYS = {
 }
 
 
-# Per-port optic (DOM) metric roots: root key -> (label suffix, unit). The
-# full key is "<root>.<ifIndex>" and the label "<ifDescr> <suffix>", the
-# shape the per-interface if_* keys already use, so a rule written against
-# one of these names the port it fired on.
+# root key -> (label suffix, unit); full key is "<root>.<ifIndex>", the
+# shape the per-interface if_* keys already use.
 _SFP_METRICS = {
     "sfp_rx_dbm": ("Rx power", "dBm"),
     "sfp_tx_dbm": ("Tx power", "dBm"),
@@ -120,21 +118,17 @@ _SFP_METRICS = {
 }
 
 # dBm(14) says a sensor reads optical power but not which way the light is
-# going, so the direction comes out of the sensor's own name -- the words
-# every vendor's entPhysicalName/entPhysicalDescr for the two actually uses.
+# going, so the direction comes out of the sensor's own name.
 _OPTIC_RX = re.compile(r"\b(rx|receive[d]?|input)\b", re.I)
 _OPTIC_TX = re.compile(r"\b(tx|transmit(ted)?|output|laser)\b", re.I)
 
 
 def _optical_direction(label: str, descr: str) -> str | None:
     """'rx', 'tx', or None for an optical-power reading whose name says
-    neither. entPhysicalName is asked first because it is the column a
-    Cisco agent puts "Te1/1/1 Receive Power" in; entPhysicalDescr is the
-    fallback for agents that leave the name empty. Rx wins a name that
-    somehow claims both, since a receive-power alarm is the one that
-    catches a dying link. None is not written as a metric at all -- a
-    reading this app cannot name is still shown in the port dialog, which
-    reads the device live and needs no key."""
+    neither. entPhysicalName is asked first (the column a Cisco agent puts
+    "Te1/1/1 Receive Power" in); entPhysicalDescr is the fallback for agents
+    that leave the name empty. Rx wins a name claiming both, since a
+    receive-power alarm is the one that catches a dying link."""
     for text in (label, descr):
         text = str(text or "")
         if not text:
@@ -3469,22 +3463,19 @@ class NodePoller(Worker):
                           13: "state", 14: "optical power"}
 
     # entPhySensorType values this app turns into a device-level metric —
-    # see _poll_environment. The rest of _SENSOR_TYPE_UNITS' arcs (power,
-    # frequency, fan speed, airflow) are real DOM readings on a
-    # transceiver, which read_dom already surfaces, but none of them is
-    # something a *device* has one true value for the way temperature and
-    # humidity are, so none of them is promoted to a device metric here.
+    # see _poll_environment; the rest of _SENSOR_TYPE_UNITS' arcs are real
+    # DOM readings a transceiver has, not something a device has one true
+    # value for, so they aren't promoted to a device metric here.
     _SENSOR_TYPE_TEMPERATURE = 8
     _SENSOR_TYPE_HUMIDITY = 9
 
-    # entPhySensorType -> the per-port optic metric root it becomes when the
-    # reading maps to an interface. Optical power (14) is absent because its
-    # key depends on the direction the sensor's name gives, not on the type.
+    # entPhySensorType -> the per-port optic metric root. Optical power (14)
+    # is absent: its key depends on the sensor's name, not its type.
     _SFP_TYPE_ROOTS = {8: "sfp_temp_c", 3: "sfp_volt", 4: "sfp_volt",
                        5: "sfp_bias_ma"}
     _SENSOR_TYPE_OPTICAL = 14
-    # ENTITY-SENSOR-MIB reports current in amperes; a transceiver's bias is
-    # quoted in milliamps everywhere an operator would read it.
+    # ENTITY-SENSOR-MIB reports current in amperes; bias is quoted in
+    # milliamps everywhere an operator would read it.
     _BIAS_A_TO_MA = 1000.0
 
     def _decode_entity_sensor(self, suffix: str, raw, types: dict, scales: dict,
@@ -3984,14 +3975,11 @@ class NodePoller(Worker):
 
         A port-mapped reading additionally becomes a per-port metric —
         `sfp_rx_dbm.<ifIndex>` and its four siblings (_SFP_METRICS) — so an
-        alert rule can fire on the port that is actually failing rather
-        than on a device-wide worst-of. There is deliberately no
-        device-level `sfp_*` key: a chassis has no one true Rx power, and
-        the device-wide `temp_optic_c` above already covers the only optic
-        reading a device does have a defensible single value for. The same
-        mapping writes interfaces.media, which is the only signal this app
-        has that a port carries an optic at all; it is rewritten only when
-        the walk answered, so a timeout never strips the badge.
+        alert rule can fire on the failing port rather than a device-wide
+        worst-of; there is deliberately no device-level `sfp_*` key, since a
+        chassis has no one true Rx power. The same mapping writes
+        interfaces.media, rewritten only when the walk answered, so a
+        timeout never strips the badge.
 
         Best-effort, gated twice: nothing runs inside the cadence window
         (_SENSOR_REFRESH_S normally, _SENSOR_REPROBE_S — a cheap hourly
@@ -4049,9 +4037,8 @@ class NodePoller(Worker):
         ambient_temps: list[float] = []
         chassis_temps: list[float] = []
         humidities: list[float] = []
-        # (ifIndex, metric root) -> every reading this walk saw for it. A
-        # multi-lane optic reports one row per lane, so a port can have
-        # several of the same root.
+        # (ifIndex, metric root) -> readings seen. A multi-lane optic reports
+        # one row per lane, so a port can have several of the same root.
         per_port: dict[tuple[int, str], list[float]] = {}
         optic_ports: set[int] = set()
         for suffix, raw in sensor_values.items():
@@ -4062,9 +4049,8 @@ class NodePoller(Worker):
                 continue
             if_index = port_map.get(entity)
             if if_index is not None:
-                # Any sensor resolving to a port is proof of a transceiver
-                # there, whatever it reads and whatever its status: a
-                # failed optic is still an optic.
+                # A failed optic is still an optic: any sensor resolving to
+                # a port is proof one is there, whatever it reads.
                 optic_ports.add(if_index)
             root = self._SFP_TYPE_ROOTS.get(sensor_type)
             if sensor_type not in (self._SENSOR_TYPE_TEMPERATURE,
@@ -4125,10 +4111,9 @@ class NodePoller(Worker):
         if humidities:
             samples.append(("humidity_pct", "Humidity", "%RH", "gauge", now,
                             max(humidities)))
-        # Light levels take the LOWEST lane and everything else the highest:
-        # on a multi-lane optic the failing lane is the dim one, while the
-        # worst temperature, voltage or bias is the extreme one, which is
-        # the same "hot spot wins" rule the device keys above use.
+        # Light levels take the LOWEST lane (the failing one on a multi-lane
+        # optic is the dim one); everything else takes the highest, the same
+        # "hot spot wins" rule the device keys above use.
         if_descrs = {row["if_index"]: row["descr"] for row in interfaces}
         for (if_index, root), values in sorted(per_port.items()):
             reading_name, unit = _SFP_METRICS[root]
@@ -4139,8 +4124,7 @@ class NodePoller(Worker):
         if samples:
             self.db.record_metric_samples(device_id, samples)
         # Only reached on a walk that answered, so a timeout leaves the
-        # badge alone; a port that has genuinely lost its optic is cleared
-        # on the next walk that does answer.
+        # badge alone.
         media_rows = [{"if_index": if_index, "media": "optic"}
                       for if_index in sorted(optic_ports)]
         media_rows += [{"if_index": row["if_index"], "media": None}

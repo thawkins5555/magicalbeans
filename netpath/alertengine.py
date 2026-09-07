@@ -103,19 +103,12 @@ class AlertEngine(Worker):
         self.log = log or NullLog()
         self._stop = threading.Event()
         # (rule_id, entity_id) -> (last sample ts, streak, first breach ts,
-        # effective threshold, effective clear). entity_id is a STRING for
-        # both target shapes a threshold rule has -- "7" for a device and
-        # "7:12" for one of its ports -- so the type of the key never depends
-        # on which one this rule produced. The sample ts is what makes the
-        # streak count polls rather than ticks; the first breach ts is what
-        # lets for_seconds measure a duration; the trailing pair is the
-        # threshold/clear this streak was counted under, so a changed device
-        # override can be detected and the streak reset without widening the
-        # key itself. See _evaluate_thresholds and _child_first_breach_ts --
-        # the latter looks a streak up by (rule_id, entity_id) alone, on
-        # behalf of a rollup parent resolved by hand, so the key has to stay
-        # a plain two-tuple no matter what else changes about how a streak is
-        # counted.
+        # effective threshold, effective clear). entity_id is always a
+        # STRING ("7" for a device, "7:12" for a port) so the key's type
+        # never depends on which shape the rule produced; the trailing
+        # threshold/clear pair lets a changed device override reset the
+        # streak without widening the key itself. See _evaluate_thresholds
+        # and _child_first_breach_ts.
         self._breach_streaks: dict[tuple, tuple[float | None, int, float | None,
                                                 float | None, float | None]] = {}
         # DHCP scopes keep (last polled_ts, streak, first breach ts) rather
@@ -1069,37 +1062,26 @@ class AlertEngine(Worker):
         device reports per port.
 
         A rule names a metric FAMILY, not one key: `if_in_util_pct` is both
-        the device-wide busiest-port value and one `if_in_util_pct.<if>` per
-        interface, and `sfp_rx_dbm` is only ever per interface. Where a
-        device reports children the parent key is skipped and each port is
-        evaluated on its own, as an `interface` entity whose id is
-        "<device_id>:<if_index>" -- so the alert names the port, and two bad
-        ports are two alerts that clear independently. Where it reports no
-        children (cpu_pct, a UPS, a room's temperature) the parent key is
-        the single `device` target, exactly as before.
+        a device-wide value and one `if_in_util_pct.<if>` per interface,
+        while `sfp_rx_dbm` is only ever per interface. Where a device
+        reports children, the parent key is skipped and each port is
+        evaluated as its own `interface` entity ("<device_id>:<if_index>"),
+        so two bad ports are two alerts that clear independently.
 
-        The streak advances on a NEW SAMPLE, not on an engine tick: this
-        engine ticks every five seconds against a sixty-second default poll,
-        so counting ticks would make `for_polls = 2` mean ten seconds and
-        would keep counting a value that had stopped changing.
-        metric["last_ts"] tells the two apart, as
-        _evaluate_dhcp_thresholds gates on polled_ts. The same state carries
-        first_breach_ts, so for_seconds measures in sample time. Streaks are
-        per TARGET, so one hot port cannot count toward another's for_polls.
+        The streak advances on a NEW SAMPLE, not an engine tick (ticks run
+        every five seconds against a sixty-second default poll), and is
+        kept per TARGET so one hot port cannot count toward another's
+        for_polls. first_breach_ts rides along so for_seconds measures in
+        sample time.
 
-        It also settles whether an operator resolved THIS breach run: a hand
-        resolve in _operator_resolves at or after first_breach_ts keeps the
-        run closed rather than reopening as a new row, which
-        open_or_increment (open/acked rows only) is blind to. A clear
-        observation resets first_breach_ts, so the next breach is a new run.
+        Also settles whether an operator resolved THIS breach run: a hand
+        resolve at or after first_breach_ts keeps it closed rather than
+        reopening as a new row; a clear observation resets first_breach_ts
+        so the next breach starts a new run. Keyed on the alert's OWN dedup
+        key -- resolving a rollup PARENT never touches a child's key, which
+        is why children stay free to re-open (see _parent_operator_resolved).
 
-        That gate is keyed on the alert's OWN dedup key: resolving a rollup
-        PARENT never touched the children's keys, and children are absorbed
-        with resolved_by '' precisely so they stay free to re-open. Covering
-        those is _parent_operator_resolved's job, in _apply.
-
-        In-memory state, so a restart rebuilds every streak from scratch and
-        a still-breaching alert an operator resolved re-opens once more.
+        In-memory state, so a restart rebuilds every streak from scratch.
         Deliberately not persisted -- see INTERNALS.md.
         """
         occurrences = []
@@ -1107,19 +1089,14 @@ class AlertEngine(Worker):
         if not rules:
             return occurrences
         # Per-device overrides, read once per RULE per tick rather than once
-        # per DEVICE: the same regression the metrics_for_families batching
-        # right below already exists to avoid, on a table that is usually
-        # empty or a handful of rows. See AlertsDatabase.device_threshold_map.
-        # Keyed by device even for an interface target -- a threshold an
-        # operator tuned for a hot closet is about the switch, and asking
-        # them to repeat it per port would be unusable.
+        # per DEVICE, for the same reason metrics_for_families is batched
+        # below. Keyed by device even for an interface target: an override
+        # tuned for a hot closet is about the switch, not one port.
         overrides_by_rule = {r["id"]: self.db.device_threshold_map(r["key"])
                              for r in rules}
-        # One query for the families the enabled rules actually name, instead
-        # of a full `SELECT *` per device: at 2,000 devices with ~90 metrics
-        # each that was 400,000 rows every five seconds to evaluate four live
-        # rules, ~88% of it rows no rule reads, all of it through the
-        # connection and lock the poller writes with.
+        # One query for the families the enabled rules actually name, not a
+        # full `SELECT *` per device -- at 2,000 devices with ~90 metrics
+        # each that was 400,000 rows every five seconds for four live rules.
         wanted = sorted({r["source_kind"] for r in rules if r["source_kind"]})
         metric_rows = self.nodes_db.metrics_for_families(wanted)
         roots = set(wanted)
@@ -1132,30 +1109,22 @@ class AlertEngine(Worker):
                 metrics_by_device_key[(metric["device_id"], key)] = metric
                 continue
             root, _, suffix = key.partition(".")
-            # A child is a key whose whole tail after the FIRST dot is an
-            # interface index. That excludes a dotted tail, and the SQL
-            # bounds already excluded a sibling key like if_in_error_rate_x
-            # -- both checked, because a key that is not a port must never be
-            # alerted on as one.
+            # A child's whole tail after the first dot must be an interface
+            # index -- excludes a sibling key like if_in_error_rate_x.
             if root in roots and suffix.isdigit():
                 children.setdefault((metric["device_id"], root), []).append(
                     (int(suffix), metric))
         device_ids = sorted({m["device_id"] for m in metric_rows})
         devices = {d["id"]: d for d in self.nodes_db.devices_by_ids(device_ids)}
-        # A sample this old is treated as absent. evaluate_threshold has no
-        # notion of sample age, so once a streak was satisfied every later
-        # tick re-raised the occurrence from last_value even if the device
-        # had stopped answering weeks ago -- an alert opened from a 45-day-old
-        # sample, refreshed to last_ts = now on every tick, sorting itself to
-        # the top of a list ordered by last_ts. Absent means the streak
-        # resets; it does NOT resolve the alert, because a device that went
-        # quiet is a fault for device_down or the rollup to report, not
-        # something to quietly declare recovered.
+        # A sample this old is treated as absent, so a streak already
+        # satisfied doesn't keep re-raising forever from a stale last_value.
+        # Resets the streak but does NOT resolve the alert -- a device gone
+        # quiet is device_down's or the rollup's fault to report, not a
+        # recovery.
         stale_after = float(settings.get("threshold_stale_s", 900) or 0)
         now = time.time()
-        # Streak state is per (rule, entity) and lived forever, so a fleet
-        # with add/remove churn leaked an entry per deleted device. Only the
-        # targets this tick actually saw are carried forward.
+        # Per (rule, entity) state lived forever otherwise, leaking an entry
+        # per deleted device; only targets this tick actually saw carry over.
         live_streaks: dict[tuple, tuple] = {}
         # Loaded on first use and only when a breach has no new sample behind
         # it, so a tick with nothing breaching costs nothing extra.
@@ -1182,33 +1151,16 @@ class AlertEngine(Worker):
                 # is simply never fetched, let alone acted on.
                 override = overrides_by_rule.get(rule["id"], {}).get(device_id)
                 if override is not None and not override["enabled"]:
-                    # enabled=0 means this rule never fires for THIS device --
-                    # and must not simply freeze whatever is already open.
-                    # This is not the same case as a rule disabled globally
-                    # or a device removed entirely: both of those make the
-                    # WHOLE rule (or the whole device) go away at once, a
-                    # rarer, bigger action after which an operator expects to
-                    # find things on the Alerts page rather than have them
-                    # vanish. A per-device override is the small, routine
-                    # kind of change _sweep_netpath_alerts already describes
-                    # for a destination taken out of rotation -- "disabling
-                    # ... is a normal thing to do while working on" the
-                    # thing it measures -- and it carries the same fix: there
-                    # is nothing left to evaluate for this (rule, device)
-                    # pair, so resolve whatever is open now rather than
-                    # leave it stuck at whatever value it last saw. by=''
-                    # so this reads as an automatic close, not a hand
-                    # resolve -- re-enabling the rule for this device and
-                    # breaching again must open a fresh alert, not find
-                    # itself permanently suppressed. No clear email either,
-                    # same precedent: nobody needs telling that a rule they
-                    # just turned off for this device has stopped being
-                    # evaluated.
-                    #
-                    # Both entity shapes, not just this tick's targets: the
-                    # device may have been alerting per port yesterday and
-                    # device-wide before that, and either way the operator
-                    # has just said this rule does not apply here.
+                    # enabled=0 means this rule never fires for THIS device,
+                    # so whatever is open must be resolved now rather than
+                    # frozen at its last value -- unlike a rule disabled
+                    # globally or a device removed entirely, both bigger,
+                    # rarer actions. by='' so it reads as automatic, not a
+                    # hand resolve: re-enabling and breaching again must open
+                    # a fresh alert, not find itself permanently suppressed.
+                    # Both entity shapes are resolved, not just this tick's
+                    # targets -- the device may have alerted per port
+                    # yesterday and device-wide before that.
                     resolved = self.db.resolve_by_dedup(
                         f"{rule['key']}:device:{device_id}", by="")
                     if resolved:
@@ -1253,55 +1205,30 @@ class AlertEngine(Worker):
                     if stale:
                         value, sample_ts = None, None
                     # Keyed on (rule, entity id) alone -- NOT the effective
-                    # threshold/clear pair. _child_first_breach_ts has to find
-                    # this same streak again given only a rule and an
-                    # occurrence (it is asked on behalf of a rollup PARENT
-                    # resolved by hand, long after the breach occurrence
-                    # itself is gone), so the key has to stay a plain
-                    # two-tuple. The entity id is a STRING for both shapes --
-                    # "7" and "7:12" -- so the two agree on the key's type
-                    # whatever the target is. The effective pair is carried
-                    # INSIDE the entry instead, and compared below: a changed
-                    # device override must still start a fresh streak rather
-                    # than resume one counted under the OLD numbers, but now
-                    # that is enforced by resetting the entry rather than by
-                    # abandoning its key.
+                    # threshold/clear pair -- because _child_first_breach_ts
+                    # has to find this same streak given only a rule and an
+                    # occurrence, on behalf of a rollup PARENT resolved by
+                    # hand. The effective pair rides inside the entry instead
+                    # and is compared below, so a changed override still
+                    # starts a fresh streak without widening the key.
                     streak_key = (rule["id"], entity_id)
                     previous_ts, streak, first_breach_ts, prev_threshold, prev_clear = (
                         self._breach_streaks.get(streak_key, (None, 0, None, None, None)))
                     if prev_threshold != threshold or prev_clear != clear_threshold:
-                        # The EFFECTIVE pair moved since the streak was last
-                        # counted -- either the override changed (set, cleared,
-                        # or edited) or, with no override in play, the RULE's
-                        # own threshold/clear_threshold was edited. Both are
-                        # treated exactly like a target this tick has never
-                        # seen before: no prior sample to compare against, no
-                        # streak, no open run. This is a deliberate behaviour
-                        # change from before 4.54.0, when a rule edit left
-                        # every device's streak (and first_breach_ts)
-                        # untouched: a streak counted against numbers that no
-                        # longer apply is not evidence of anything, so it must
-                        # not count toward for_polls under the new ones, and
-                        # first_breach_ts resetting means _operator_resolved
-                        # no longer recognizes the run as the one an operator
-                        # resolved by hand -- a hand-resolved but
-                        # still-breaching alert re-opens as a new run the next
-                        # time this rule's numbers are edited. That is
-                        # intended: it is the same "changed override"
-                        # reasoning above, just as true when the change comes
-                        # from the rule's own row instead of a device's
-                        # override of it.
+                        # The effective pair moved (override or the rule's own
+                        # threshold/clear_threshold edited) -- treated like a
+                        # target never seen before: a streak counted against
+                        # numbers that no longer apply is not evidence, so it
+                        # must not count toward for_polls under the new ones,
+                        # and a hand-resolved but still-breaching alert
+                        # re-opens as a new run.
                         previous_ts, streak, first_breach_ts = None, 0, None
                     if stale:
-                        # Absent means the run resets too: otherwise
-                        # breach_seconds would span the silent gap and fire
-                        # for_seconds instantly on resume, and
-                        # _operator_resolved would still see the old run's
-                        # first_breach_ts.
+                        # Otherwise breach_seconds would span the silent gap
+                        # and fire for_seconds instantly on resume.
                         first_breach_ts = None
                     # The same predicate evaluate_threshold itself uses, so a
-                    # 'below' rule's streak counts the samples that rule calls
-                    # a breach rather than the ones an 'above' rule would.
+                    # 'below' rule's streak counts what that rule calls breach.
                     over = breaches(eval_rule, value)
                     if not over:
                         streak = 0
@@ -1315,23 +1242,14 @@ class AlertEngine(Worker):
                                       else max(0.0, sample_ts - first_breach_ts))
                     result = evaluate_threshold(eval_rule, value, streak, breach_seconds)
                     if result == "clear":
-                        # The run ends on an OBSERVED CLEAR, not on the first
-                        # sample back inside the threshold. Between
-                        # clear_threshold and threshold is the hysteresis band,
-                        # which exists precisely because a value wobbling
-                        # around the limit has not recovered -- resetting the
-                        # run there let a CPU that dipped from 92 % to 85 % and
-                        # back re-open an alert an operator had resolved by
-                        # hand, as a brand new run. The streak still resets
-                        # above on any sample that is not a breach: for_polls
-                        # means consecutive polls in breach.
+                        # Ends on an OBSERVED CLEAR, not the first sample back
+                        # inside threshold -- resetting inside the hysteresis
+                        # band let a value wobbling near the limit re-open an
+                        # alert an operator had resolved by hand.
                         first_breach_ts = None
-                    # Into the per-tick dict, which replaces the stored one at
-                    # the end of the pass: state kept per (rule, entity)
-                    # forever leaked an entry for every deleted device. The
-                    # effective pair rides along so the NEXT tick can tell a
-                    # real override change from business as usual (see the
-                    # comparison above).
+                    # Replaces the stored dict at the end of the pass; the
+                    # effective pair rides along so the next tick can tell a
+                    # real override change from business as usual.
                     live_streaks[streak_key] = (
                         sample_ts, streak, first_breach_ts, threshold, clear_threshold)
                     if result == "":
@@ -1393,29 +1311,19 @@ class AlertEngine(Worker):
                             extra=extra,
                             # Pins this occurrence to THIS rule so _apply
                             # cannot cross-match it onto another rule sharing
-                            # the same source_kind -- see Occurrence.rule_key's
-                            # own comment.
+                            # the same source_kind.
                             rule_key=rule["key"] or "")
                         if self._operator_resolved(rule, occurrence, first_breach_ts):
-                            # An operator resolved this exact breach run by
-                            # hand; it stays closed until a clear observation
-                            # (which resets first_breach_ts above) is followed
-                            # by a new breach -- see
-                            # AlertsDatabase.operator_resolved_since.
+                            # Stays closed until a clear observation is
+                            # followed by a new breach.
                             continue
                         if sample_ts is not None and sample_ts == previous_ts:
-                            # Nothing has been polled since the last tick, so
-                            # there is no new occurrence to report -- only the
-                            # same one, still true. Raising it anyway bumped
-                            # `count` every five seconds, so a CPU alert open
-                            # overnight told the operator it had "occurred 8640
-                            # time(s)" when the metric had been sampled 480
-                            # times: the number meant engine ticks.
-                            #
-                            # Still raised when nothing is open for this key:
-                            # that is how a threshold re-derives itself after a
-                            # rollup parent clears, or after a resolve while
-                            # the breach continues.
+                            # No new sample, so no new occurrence -- raising it
+                            # anyway bumped `count` every tick regardless of
+                            # how often the metric was actually sampled.
+                            # Still raised when nothing is open for this key,
+                            # which is how a threshold re-derives after a
+                            # rollup parent clears or a resolve while ongoing.
                             if open_keys is None:
                                 open_keys = self.db.open_dedup_keys()
                             if dedup_key(rule, occurrence) in open_keys:
@@ -1855,11 +1763,10 @@ class AlertEngine(Worker):
         lookups, or None when it is about no device at all.
 
         Every rollup parent a per-port alert can have is a fact about the
-        switch the port is on: device_down is recorded against the device,
-        so an interface child asking `open_by_dedup(device_down:interface:
-        7:12)` would find nothing and never be suppressed. Only `interface`
-        is projected -- a netpath_target's parent (netpath_unreachable) is
-        about that target and must be asked about unchanged.
+        switch, recorded against the device -- an interface child asking
+        unprojected would find nothing and never be suppressed. Only
+        `interface` is projected; a netpath_target's parent is about that
+        target and must be asked about unchanged.
         """
         if occurrence.entity_kind != "interface":
             return occurrence
@@ -1901,10 +1808,8 @@ class AlertEngine(Worker):
         """
         if occurrence.entity_kind not in ROLLUP_ENTITY_KINDS:
             return None
-        # ROLLED_UP_BY, not the entity kind, is what admits a rule to rollup:
-        # interface_down and interface_flapping are interface-kind and have
-        # no entry here, so they fall straight through and are never
-        # suppressed. See that map's own comment for why.
+        # ROLLED_UP_BY, not the entity kind, is what admits a rule: e.g.
+        # interface_down has no entry there, so it falls straight through.
         parent_key = ROLLED_UP_BY.get(rule["key"] or "")
         if parent_key:
             # The per-tick snapshot _tick builds from the rules it has
@@ -2129,15 +2034,11 @@ class AlertEngine(Worker):
         the streak state its evaluator already keeps, or None for an
         occurrence that is an event rather than a run.
 
-        Looked up by (rule, entity id) alone, which is all a rollup parent's
-        resolve gives us here -- there is no occurrence carrying a threshold/
-        clear pair to widen this key with. This is exactly
-        _evaluate_thresholds's own streak key, by design: see the comment on
-        self._breach_streaks and on streak_key there. The entity id is used
-        as the string it already is, never int()-ed: a per-port threshold's
-        is "7:12", and coercing it was how the two halves of this contract
-        could silently stop agreeing on the key. entry[2] is first_breach_ts
-        regardless of whatever else the tuple carries.
+        Looked up by (rule, entity id) alone -- _evaluate_thresholds's own
+        streak key -- since that's all a rollup parent's resolve gives us
+        here. The entity id is used as the string it already is, never
+        int()-ed: a per-port threshold's is "7:12", and coercing it would
+        make the two halves of this contract silently stop agreeing.
         """
         if occurrence.kind == "threshold":
             entry = self._breach_streaks.get(
@@ -2266,14 +2167,12 @@ class AlertEngine(Worker):
                     parent_id: int | None) -> list:
         """Every open alert of `child_rule` that `occurrence`'s outage
         absorbs: the entity's own, plus -- for a device -- each of its
-        ports', since a threshold rule that alerts per port keys its alerts
-        "<rule>:interface:<device_id>:<if_index>" and a dead switch's ports
-        report nothing exactly because the switch does not.
+        ports', since a dead switch's ports report nothing exactly because
+        the switch does not.
 
-        Two lookups rather than one range over both, because the device's
-        own key is an exact match on the same index and a range wide enough
-        to cover it would also cover a device id that merely starts with the
-        same digits.
+        Two lookups, not one range over both: the device's own key is an
+        exact match, and a range wide enough to cover it would also cover a
+        device id that merely starts with the same digits.
         """
         rows = []
         resolved = self.db.resolve_by_dedup(
@@ -2607,16 +2506,13 @@ class AlertEngine(Worker):
         self._webhook_notify(alert_row, rule_row, occurrence, settings,
                              notify_kind or ("renotify" if renotify else "alert"),
                              template_override)
-        # The email severity floor, deliberately BELOW the webhook dispatch
-        # above: "do not mail me about warnings" is a statement about an
-        # inbox, and a chat room or ticket queue that has its own enabled
-        # flag and its own budget must keep getting everything.
+        # The email severity floor, deliberately below the webhook dispatch
+        # above: a chat room or ticket queue has its own enabled flag and
+        # budget and must keep getting everything.
         #
-        # mark_notified, not a bare return: alerts_due_first_notify reads
-        # last_notified_ts IS NULL as "still due", so a floored alert left
-        # unstamped would come back through _sweep_notify_rollup on every
-        # tick for ever. It is also what makes the renotify clock right --
-        # this alert has been decided about, it is not waiting.
+        # mark_notified, not a bare return: alerts_due_first_notify reads a
+        # NULL last_notified_ts as "still due", so a floored alert left
+        # unstamped would come back through _sweep_notify_rollup forever.
         floor = int(settings.get("notify_min_severity", 7) or 0)
         if alert_row["severity"] > floor:
             self.db.mark_notified(alert_row["id"])

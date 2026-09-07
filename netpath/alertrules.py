@@ -157,16 +157,10 @@ def interface_label(row, if_index=None) -> str:
     """A port as an operator names it: "GigabitEthernet1/0/7 (uplink to
     core)".
 
-    The alias is the half a human wrote and the half that says what the
-    port is FOR, so an alert that names only the ifDescr makes the reader
-    go and look it up. It is appended only when it adds something -- a
-    device that copies ifDescr into ifAlias, or has no alias at all, would
-    otherwise produce "Gi1/0/7 (Gi1/0/7)".
-
+    The alias is appended only when it adds something -- a device that
+    copies ifDescr into ifAlias would otherwise produce "Gi1/0/7 (Gi1/0/7)".
     `if<n>` is the last resort, for a metric whose interface row has since
-    been replaced by a re-walk. One function, in the module the engine and
-    the API already share, because both the interface_event drains and the
-    per-port threshold evaluator have to name the same port the same way.
+    been replaced by a re-walk.
     """
     descr = _field(row, "descr")
     alias = _field(row, "alias")
@@ -204,10 +198,9 @@ def evaluate_flapping(recent_interface_events: list, window_s: float = 600,
 
 def comparison_of(rule) -> str:
     """A threshold rule's direction: 'below' for a low-water rule, 'above'
-    for every other. Read through here rather than off the row directly
-    because the column arrived in 5.1.0 — an engine handed a row from an
-    older database (or a plain dict built by a test) has no such key, and
-    must behave exactly as it always did."""
+    for every other. Read through here, not off the row directly, because
+    an older database row (or a plain dict built by a test) has no such
+    column."""
     try:
         keys = rule.keys()
     except AttributeError:
@@ -218,12 +211,9 @@ def comparison_of(rule) -> str:
 
 
 def breaches(rule, value) -> bool:
-    """Whether `value` is on the wrong side of `rule`'s threshold.
-
-    The one place the direction lives: 'above' breaches at or over the
-    threshold, 'below' at or under it. _evaluate_thresholds counts its
-    streak with this same predicate, so the streak and the verdict can
-    never disagree about what a breach is."""
+    """Whether `value` is on the wrong side of `rule`'s threshold. The one
+    place the direction lives -- _evaluate_thresholds counts its streak
+    with this same predicate, so streak and verdict never disagree."""
     if value is None:
         return False
     threshold = rule["threshold"]
@@ -235,9 +225,9 @@ def breaches(rule, value) -> bool:
 
 
 def _clears(rule, value) -> bool:
-    """Whether `value` has recovered past `rule`'s clear threshold — the
-    far side of the hysteresis band from breaches() above, which for a
-    'below' rule means ABOVE the clear threshold."""
+    """Whether `value` has recovered past `rule`'s clear threshold -- for a
+    'below' rule this means ABOVE the clear threshold, the far side of the
+    hysteresis band from breaches() above."""
     if value is None:
         return False
     clear_threshold = rule["clear_threshold"]
@@ -258,14 +248,9 @@ def evaluate_threshold(rule, current_value: float | None, streak: int,
     hysteresis — without it a value oscillating exactly at the threshold
     reopens and recloses the alert every single poll.
 
-    "Wrong side" is rule.comparison's to decide, through breaches() and
-    _clears() above: 'above' (every rule shipped before 5.1.0, and the
-    default for a row without the column) breaches at or over the
-    threshold and clears below the clear threshold; 'below' — an optic
-    whose receive power has fallen — breaches at or under it and clears
-    above. The hysteresis band is the same band either way, just entered
-    from the other end, so clear_threshold sits ABOVE threshold on a
-    'below' rule.
+    Direction is rule.comparison's call, via breaches()/_clears() above:
+    for a 'below' rule (an optic whose receive power has fallen) the band
+    is entered from the other end, so clear_threshold sits ABOVE threshold.
 
     "Long enough" is measured one of two ways, and only ever one:
 
@@ -329,14 +314,10 @@ CLEARS = {
 # meaningful where an entity can have both; listing the kinds explicitly stops
 # a future entity kind inheriting the device pairings by accident.
 #
-# `interface` joined in 5.1.0, when interface threshold rules started
-# alerting per port: a dead switch's ports report nothing, so a per-port
-# utilization or error-rate alert is as much an artefact of the outage as
-# the device-level one it replaced. It does NOT admit interface_down or
-# interface_flapping to rollup -- this set is a necessary condition, not a
-# sufficient one, and ROLLED_UP_BY below is the gate: a rule with no entry
-# there has no parent and is never suppressed, whatever its entity kind.
-# See that map's own comment for why those two must stay un-rolled.
+# `interface` joined in 5.1.0: a dead switch's ports report nothing, so a
+# per-port utilization/error-rate alert is as much an outage artefact as
+# the device-level one it replaced. This set is necessary but not
+# sufficient -- ROLLED_UP_BY below is the actual gate.
 ROLLUP_ENTITY_KINDS = frozenset({"device", "interface", "netpath_target"})
 
 
@@ -403,12 +384,9 @@ ROLLED_UP_BY = {
     # (ROLLS_UP, built from this map) is what retroactively resolves a
     # Warning that opened moments before Critical did in the same tick.
     "temp_chassis_high": "temp_chassis_critical",
-    # The per-port optic rules, back to being an outage rollup like every
-    # entry above the temperature pair: DOM is read by polling the device,
-    # so a switch that has stopped answering reports no optic readings at
-    # all and any alert about one is an artefact of the outage. Their
-    # alerts are interface-kind, which ROLLUP_ENTITY_KINDS now admits and
-    # _rollup_parent projects to the switch the port is on.
+    # DOM is read by polling the device, so a switch that stopped
+    # answering reports no optic readings -- an outage artefact, like the
+    # temperature pair above.
     "sfp_rx_power_low": "device_down",
     "sfp_tx_power_low": "device_down",
     "sfp_temp_high": "device_down",

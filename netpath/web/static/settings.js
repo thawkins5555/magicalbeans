@@ -83,9 +83,8 @@
     App.el('set-alerts-cap').value = s.max_alerts_db_mb;
     App.el('set-idle-minutes').value = s.session_idle_minutes;
     App.el('set-session-hours').value = s.session_max_hours;
-    // Administrator-only like the LDAP fields below, so it is absent from `s`
-    // for an account without Settings read — hence the `|| ''` rather than a
-    // bare assignment that would paint "undefined" into the box.
+    // Absent from `s` for an account without Settings read — hence `|| ''`
+    // rather than a bare assignment that would paint "undefined" into the box.
     App.el('set-web-relay-range').value = s.web_relay_port_range || '';
 
     // The four text/number fields below are ADMIN_ONLY_SETTINGS and so are
@@ -397,8 +396,8 @@
         `<span class="meter"><i style="width:${share * 100}%"></i></span>` +
         `${App.bytes(bytes || 0)} used${cap ? ` · ${pct}%` : ''}`;
     }
-    /* How far back each file still reaches. Bytes alone never said what a
-       cap had cost; this does, in the same row as the path it belongs to. */
+    // How far back each file still reaches — bytes alone never said what a
+    // cap had cost.
     for (const [id, key] of [
       ['age-app', 'app_oldest_ts'], ['age-trace', 'trace_oldest_ts'],
       ['age-flow', 'flow_oldest_ts'], ['age-snmp', 'snmp_oldest_ts'],
@@ -462,10 +461,9 @@
       saved = { ...App.state.settings };
       dirty = false;
       // The list used to name seven of the eleven refresh rates (IPAM had a
-      // field and was left out; three had no field at all). The sweep note
-      // is why this returns at once: the save asks for the retention sweep
-      // and the maintenance thread runs it, rather than the browser waiting
-      // for thirteen databases to be pruned and trimmed.
+      // field and was left out; three had no field at all). This returns at
+      // once: the save asks for the retention sweep, the maintenance thread
+      // runs it.
       status(`Applied · reverse DNS ${values.dns_enabled ? 'on' : 'off'} · ` +
              `eleven refresh rates · idle timeout ${values.session_idle_minutes} min` +
              ' · storage sweep running in the background', 'var(--ok)');
@@ -1172,9 +1170,7 @@
      click; picking any individual radio afterwards is still just a radio —
      it quietly reverts the select to Custom rather than fighting it. */
   const ROLE_PRESETS = {
-    // `web` joins admin and ssh in the viewer's exclusions: it has no read
-    // tier to hand out — the relay is a write, and a viewer reaching a
-    // device's management page through this server is not "viewing".
+    // `web` has no read tier to hand out — the relay is a write.
     viewer: (mods) => Object.fromEntries(
       mods.filter((m) => !['admin', 'ssh', 'web'].includes(m)).map((m) => [m, 'read'])),
     operator: (mods) => Object.fromEntries(

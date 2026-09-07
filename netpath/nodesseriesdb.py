@@ -83,8 +83,8 @@ class NodesSeriesDatabase(SqliteStore):
     SCHEMA = SCHEMA
     DEFAULTS: dict = {}
     LABEL = "nodes_series"
-    # The rollups reach furthest back; raw samples answer for the
-    # first hour of a fresh install, before any hour is summarised.
+    # Rollups reach furthest back; raw samples cover the first hour,
+    # before any hour is summarised.
     OLDEST_TS_SQL = ("SELECT MIN(ts) FROM (SELECT MIN(hour) AS ts FROM"
                      " samples_hourly UNION ALL SELECT MIN(ts) FROM samples)")
 
@@ -190,21 +190,11 @@ class NodesSeriesDatabase(SqliteStore):
         child of one, fleet-wide -- "cpu_pct" alone, but "sfp_rx_dbm" and
         every "sfp_rx_dbm.<if_index>" with it.
 
-        A child is written as the parent key, a dot, and the interface
-        index, so a family is one exact match plus one contiguous range:
-        '.' is 0x2E and '/' is 0x2F, so `key >= 'k.' AND key < 'k/'` is
-        every key beginning 'k.' and nothing else. Written as bounds rather
-        than as LIKE 'k.%' on purpose -- SQLite can drive ix_metrics_key
-        from a range unconditionally, while the LIKE optimisation depends
-        on the connection's case_sensitive_like pragma and quietly becomes
-        a full scan of the largest table in this file when it does not
-        apply. The bounds also exclude the sibling keys a prefix match
-        would drag in: 'if_in_error_rate_x' sorts after 'if_in_error_rate/'
-        because '_' is 0x5F.
-
-        `unit` is selected too -- the threshold evaluator names the unit in
-        an alert's message, and a per-port alert that says "-24.1" without
-        saying dBm is not readable.
+        Matched as `key = root OR (key >= 'root.' AND key < 'root/')` rather
+        than LIKE, since SQLite can drive ix_metrics_key from that range
+        unconditionally, while the LIKE optimisation depends on a pragma and
+        can silently fall back to a full scan. `unit` is selected too, since
+        a per-port alert needs to say dBm, not just "-24.1".
         """
         roots = [str(k) for k in keys if k]
         if not roots:
@@ -484,10 +474,9 @@ class NodesSeriesDatabase(SqliteStore):
     _TRIM_SAMPLE_FLOOR = 5_000
 
     def _hourly_floor(self) -> int:
-        """How far down the rollups may be trimmed: a day of hours for every
-        metric, or the raw floor, whichever is larger. Below that a wide
-        chart has nothing left to draw, and the raw samples it would
-        otherwise fall back to are long gone."""
+        """How far down the rollups may be trimmed: a day of hours per
+        metric, or the raw floor, whichever is larger -- below that a wide
+        chart has nothing left to draw and the raw fallback is long gone."""
         with self._lock:
             metrics = self._conn.execute(
                 "SELECT COUNT(*) AS n FROM metrics").fetchone()["n"]
@@ -495,13 +484,12 @@ class NodesSeriesDatabase(SqliteStore):
 
     def trim_to_size(self, max_bytes: int, budget_s: float | None = None) -> int:
         """Delete the oldest metric history until under the size cap: raw
-        samples first, then the hourly rollups, which before 5.1.0 no size
-        cap ever touched.
+        samples first, then the hourly rollups.
 
         Incremental reclaim, not VACUUM: a whole-file rewrite under the
         module lock stalls every poll worker and HTTP handler. Stage two
-        deletes by `hour` ascending, so it takes the far end of the history
-        and never the recent hours compact_rollup's redo window rewrites.
+        deletes by `hour` ascending, so it never touches the recent hours
+        compact_rollup's redo window rewrites.
         """
         if max_bytes <= 0:
             return 0
@@ -532,8 +520,8 @@ class NodesSeriesDatabase(SqliteStore):
                 if shrank:
                     break   # the rollups give only once the raw floor is reached
             reclaim(self._conn, self._lock, label=self.LABEL)
-            # Neither table can give anything up, so another pass would only
-            # measure the file again and reclaim what is already reclaimed.
+            # Neither table can give anything up; another pass would only
+            # re-measure and reclaim what's already reclaimed.
             if not shrank:
                 break
         return removed

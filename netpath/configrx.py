@@ -437,13 +437,10 @@ def _offered_algorithms_detail() -> str:
 def _clean_output(raw: str, vendor: str = "",
                   extra_patterns: tuple[re.Pattern, ...] = ()) -> str:
     """Strips ANSI escape sequences and pager prompts a device's shell may
-    have echoed back even with paging disabled, then drops whole lines that
-    are volatile rather than configuration — a counter or timestamp a
-    device rewrites on every poll regardless of whether the config itself
-    changed (configrx_volatile.strip_volatile), so those lines never reach
-    the sha256 that decides whether a capture is a new stored version.
-    Best-effort — this is display/storage hygiene, not a parser, so it
-    never raises.
+    have echoed back even with paging disabled, then drops volatile lines
+    (configrx_volatile.strip_volatile) before the sha256 that decides
+    whether a capture is a new stored version. Best-effort — this is
+    display/storage hygiene, not a parser, so it never raises.
 
     Two passes over pager markers, because they arrive two ways: on a line of
     their own (paging left on, the device drew "--More--" and a newline), and
@@ -460,11 +457,9 @@ def _clean_output(raw: str, vendor: str = "",
 
 def _compile_extra_patterns(raw: str) -> tuple[re.Pattern, ...]:
     """The `ignore_line_patterns` setting (one regex per line) compiled with
-    the same bounded-regex guard configrx_compliance uses for search and
-    compliance rules. api.post_settings already refuses a bad line at save
-    time; a line that still fails here (a row saved before that check
-    existed) is skipped rather than raising, matching _clean_output's own
-    never-raises contract."""
+    the same bounded-regex guard configrx_compliance uses. A line that fails
+    (e.g. a row saved before api.post_settings validated it) is skipped
+    rather than raising, matching _clean_output's never-raises contract."""
     patterns = []
     for line in (raw or "").splitlines():
         line = line.strip()
