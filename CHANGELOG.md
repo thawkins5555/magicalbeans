@@ -146,6 +146,8 @@ Short notes, one per request, in the order they were given. The database split i
 
 **A faster map, and a VLAN list that stays on screen.** The neighbour match used `LOWER()` on both sides with no matching index, scanning every interface row per neighbour; it now uses case-insensitive indexes. Per-map badge and port reads are bounded to the devices on the map. The client redraws once per animation frame, pans and zooms by transform alone, redraws only the dragged node's links, computes tooltips on hover, and draws the grid as one pattern. A link's tooltip lists at most ten VLANs then "+N more"; the link pane shows ten with a Show all.
 
+**Release review.** A Fable review of the combined diff found and fixed: the phase-2 history copy held the series lock for its whole run (now one batch at a time); a restart before the split finished re-ran phase 1 and resurrected deleted MIBs; the two-second state poll snapped a theme preview back; "Add anyway" was offered for a primary-address collision that cannot succeed; non-admin accounts polled the update status for a guaranteed 403; the split's reclaim loop ignored shutdown; the update's marker restore gave up too soon; promote-all was quadratic in results. Code comments across the release were trimmed to the why.
+
 ### 4.54.1 — The tab nobody could see
 
 **MAPPER was invisible on every upgraded install, including to the
