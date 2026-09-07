@@ -444,28 +444,59 @@ class NodesSeriesDatabase(SqliteStore):
             reclaim(self._conn, self._lock, label=self.LABEL)
         return removed
 
-    def trim_to_size(self, max_bytes: int) -> int:
-        """Delete the oldest raw samples until under the size cap.
+    _TRIM_SAMPLE_FLOOR = 5_000
+
+    def _hourly_floor(self) -> int:
+        """How far down the rollups may be trimmed: a day of hours for every
+        metric, or the raw floor, whichever is larger. Below that a wide
+        chart has nothing left to draw, and the raw samples it would
+        otherwise fall back to are long gone."""
+        with self._lock:
+            metrics = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM metrics").fetchone()["n"]
+        return max(24 * metrics, self._TRIM_SAMPLE_FLOOR)
+
+    def trim_to_size(self, max_bytes: int, budget_s: float | None = None) -> int:
+        """Delete the oldest metric history until under the size cap: raw
+        samples first, then the hourly rollups, which before 5.1.0 no size
+        cap ever touched.
+
         Incremental reclaim, not VACUUM: a whole-file rewrite under the
-        module lock stalls every poll worker and HTTP handler."""
+        module lock stalls every poll worker and HTTP handler. Stage two
+        deletes by `hour` ascending, so it takes the far end of the history
+        and never the recent hours compact_rollup's redo window rewrites.
+        """
         if max_bytes <= 0:
             return 0
+        deadline = None if budget_s is None else time.monotonic() + max(0.0, budget_s)
+        hourly_floor = self._hourly_floor()
         removed = 0
         for _ in range(6):
             if self.size_bytes() <= max_bytes:
                 break
-            with self._lock:
-                total = self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM samples").fetchone()["n"]
-                if total <= 5000:
-                    break
-                chunk = max(int(total * 0.15), 5000)
-                cursor = self._conn.execute(
-                    "DELETE FROM samples WHERE rowid IN (SELECT rowid FROM samples"
-                    " ORDER BY ts ASC LIMIT ?)", (chunk,))
-                removed += cursor.rowcount or 0
-                self._conn.commit()
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            shrank = False
+            for table, column, floor in (
+                    ("samples", "ts", self._TRIM_SAMPLE_FLOOR),
+                    ("samples_hourly", "hour", hourly_floor)):
+                with self._lock:
+                    total = self._conn.execute(
+                        f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+                    if total <= floor:
+                        continue
+                    chunk = min(total - floor, max(int(total * 0.15), floor))
+                    cursor = self._conn.execute(
+                        f"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM"
+                        f" {table} ORDER BY {column} ASC LIMIT ?)", (chunk,))
+                    removed += cursor.rowcount or 0
+                    shrank = shrank or bool(cursor.rowcount)
+                    self._conn.commit()
             reclaim(self._conn, self._lock, label=self.LABEL)
+            # Neither table can give anything up, so another pass would only
+            # measure the file again and reclaim what is already reclaimed.
+            if not shrank:
+                break
         return removed
 
     # ------------------------------------------------------------- migration

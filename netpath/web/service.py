@@ -1008,8 +1008,11 @@ class Service:
         self._trim_db("max_nodes_db_mb", self.nodes_db, "Nodes database",
                       "oldest events")
         # Own cap since 5.0.0: growth lives here, not in the inventory file.
+        # Two stages since 5.1.0, so the noun names both: the raw samples go
+        # first and the oldest hourly rollups only once raw is at its floor.
         self._trim_db("max_nodes_series_db_mb", self.nodes_db.series_db,
-                      "Nodes metric history", "oldest samples")
+                      "Nodes metric history",
+                      "oldest samples and hourly rollups")
 
         self.alerts_db.prune(
             float(self.alerts_settings.get("retention_days", 180)))
