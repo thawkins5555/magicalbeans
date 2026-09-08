@@ -601,6 +601,16 @@ own subtabs.
   entirely. Any scan that is no longer running can be removed from the
   jobs list with its Remove button. Running scans are visible on the
   Debug page (DISCOVERY SCANS RUNNING) with live progress.
+- **A finished scan can be run again with one click.** Its **Re-discover**
+  button starts a fresh sweep of the same target on the same polling
+  profile and the same per-scan timing, without retyping either. It is
+  always a new scan, never the old one re-run in place: the run being
+  repeated keeps its own results and its place in the list, so what
+  changed since is readable rather than overwritten. A second sweep of a
+  target already being scanned is refused, and a device the earlier scan
+  already added comes back as "Already added" rather than a duplicate. A
+  scan started before 5.2.0 has no profile stored on it; Re-discover opens
+  the Start dialog on its target instead of guessing one.
 - **Results are a sortable table.** Click a heading to sort — IP addresses
   in numeric order, so .9 comes before .100 — drag the column edges, and
   use the header box to select every result the scan is allowed to add.
@@ -1527,9 +1537,10 @@ real, unrelated fault because of a guess is the one failure this feature must
 never have, so the neighbour table alone never sets `upstream_id`.
 
 **From 4.49.0, reviewing that guess no longer means one Edit dialog per
-device.** An **Upstream suggestions** button in the Nodes top strip
-(moved there in 4.53.0, when the TOPOLOGY subtab it used to sit on was
-retired) opens a dialog listing every
+device.** An **Upstream suggestions** button in the MAPPER top strip
+(it began on the Nodes TOPOLOGY subtab, moved to the Nodes strip in 4.53.0
+when that subtab was retired, and reached MAPPER — the page reviewing L2
+parentage belongs on — in 5.2.0) opens a dialog listing every
 device with no `upstream_id` set whose own collected neighbours matched
 another monitored device, ranked by evidence — a MAC-address match rated
 above a name match, a neighbour nothing has confirmed on the last walk rated

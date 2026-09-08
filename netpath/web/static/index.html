@@ -1057,6 +1057,12 @@
     <span id="mp-counters" class="hint"></span>
     <span class="grow"></span>
     <button id="mp-refresh">Refresh</button>
+    <!-- No data-requires-write: opening this is a READ, and of Nodes
+         rather than of Mapper, so neither module's write gate is the
+         question — the dialog hides its own Apply for an account that
+         cannot use it. Not in the action bar below either: that whole bar
+         is gated on a selected map, and this list is fleet-wide. -->
+    <button id="mp-upstream-suggestions">Upstream suggestions</button>
     <button id="mp-maps" data-requires-write="mapper">Maps</button>
     <button id="mp-settings" class="module-settings" data-requires-write="mapper">Settings</button>
   </div>

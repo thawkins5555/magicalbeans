@@ -1205,12 +1205,19 @@ class NodePoller(Worker):
 
     def start_discovery(self, kind: str, target: str,
                         overrides: dict | None = None,
-                        allow_ping_only: bool = False) -> int:
+                        allow_ping_only: bool = False,
+                        group_id: int | None = None,
+                        scan_overrides: dict | None = None) -> int:
+        """`overrides` is what THIS run's settings are built from; `group_id`
+        and `scan_overrides` are what the row keeps so Re-discover can build
+        the same settings again from the profile as it stands then."""
         settings = dict(self.db.settings())
         if overrides:
             settings.update(overrides)
         job_id = self.db.add_discovery_job(kind, target,
-                                           allow_ping_only=allow_ping_only)
+                                           allow_ping_only=allow_ping_only,
+                                           group_id=group_id,
+                                           scan_overrides=scan_overrides)
         job = DiscoveryJob(self.db, job_id, kind, target, settings, log=self.log)
         self._discovery_jobs[job_id] = job
         job.start()

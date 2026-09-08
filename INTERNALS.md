@@ -1733,6 +1733,30 @@ as already answered instead of popping a dialog apiece on first open.
 poller's check is the rule — and creates an approved ping-only device
 with a `snmp_enabled = 0` override so it doesn't fail SNMP every poll.
 
+Re-discover (5.2.0): `POST /api/nodes/discovery/<id>/rescan` starts a
+**new** job with the finished one's target, profile and per-scan timing.
+Re-running the old job in place was considered and rejected three times
+over: a `DiscoveryJob`'s `threading.Thread` is built in `__init__` and
+cannot be restarted; `discovery_results` has no delete-by-job path short
+of the FK cascade on job delete, so a second sweep writing into the same
+row would double-list every address and break both `folded_into_result_id`
+and `drawDiscResultsTable`'s signature dedupe; and the run being repeated
+is the audit trail the repeat exists to be compared against. Replaying it
+needs inputs the row never kept, so `_migrate()` adds `group_id` and
+`overrides_json` to `discovery_jobs` and `add_discovery_job` stores both
+from the start path too. `overrides_json` holds the five Start-dialog
+timing values *as the dialog sends them*, not the settings they become:
+the derived `discovery_communities` string is deliberately not stored, so
+a job row never holds a credential — it is re-derived from the profile on
+every start, which also means a rescan picks up a community added to that
+profile since. `api._start_discovery_job` is the whole of a start past
+reading the request, so the two routes cannot drift; the rescan route adds
+only its three refusals (the job itself still running, another *live*
+sweep of the same target — `state = 'running'` **and** the poller agreeing,
+so a row stranded by a killed process cannot wedge the button, and a
+missing or deleted profile, which answers `needs_profile` so the browser
+opens the Start dialog on that target rather than the server guessing one).
+
 Address walk (5.0.0): a result that answered the identity GET is then
 asked for `ipAdEntAddr` alone — one column, through
 `_snmp_walk_column`, which is `_snmp_getnext_one` in a loop bounded by
@@ -3757,6 +3781,24 @@ rather than silently applying whatever assignments aren't part of it.
 `NodesDatabase.set_upstream_ids()` is the one write behind an accepted batch
 — `executemany`, since (unlike a bulk edit broadcasting one value to many
 devices) every device here gets its own value.
+
+The dialog behind both routes moved to MAPPER in 5.2.0 (`mapper.js`,
+`#mp-upstream-suggestions` in that page's top strip) — the last piece of
+the 4.53.0 migration off the retired Nodes TOPOLOGY subtab, finished on
+the page that reviews L2 parentage rather than the one the subtab happened
+to live under. Nothing server-side moved with it: both routes stay
+`("nodes", R)`/`("nodes", W)`, because what Apply writes is
+`devices.upstream_id`, and mapper-gated aliases would hand a mapper-only
+account a Nodes write. The dialog therefore offers Apply against
+`App.canWrite('nodes')`, not against its own page's module, and the button
+is in the top strip rather than the action bar: `drawToolbarState` gates
+that bar on a selected map, and this list is fleet-wide. Two things were
+copied rather than moved with it, both because the Nodes page still has
+its own consumers: `CONFIDENCE_COLOR` and `confidenceBadgeHtml`, which the
+Discovery grid's "Same as" column and `duplicatesDialog` score into the
+same three tiers. `mapper.js` in turn carries its own copy of
+`displayName`'s precedence, for the same reason its device-status
+vocabulary is copied: neither lazy module may reach into the other.
 
 ### Interface flapping thresholds (`alertsdb.py`, `alertengine.py`)
 
