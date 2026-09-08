@@ -695,6 +695,79 @@ check("...while a rule that is NOT published-threshold still needs one",
       raised is not None and "needs a threshold" in str(raised), str(raised))
 nodes.close()
 
+# --- a limit that goes away must still resolve what it opened
+nodes, alerts, engine = build("unpublished_resolve")
+engine._tick()
+did = add_device(nodes, "10.1.0.7", "stopped-publishing-sw")
+optic_ports(nodes, did)
+base = time.time()
+publish(nodes, engine, did, 7, low_warn=-22.0)
+for i in range(2):
+    sample(nodes, did, 7, base + i, -30.0)
+    engine._tick()
+check("(an alert is open on a published limit, to take the limit away from)",
+      len(open_rows(alerts, "sfp_rx_power_low")) == 1,
+      [dict(r) for r in open_rows(alerts, "sfp_rx_power_low")])
+nodes.replace_interface_thresholds(did, CISCO_SOURCE, [])
+engine._published_cache = (0.0, None, None)
+sample(nodes, did, 7, base + 2, -30.0)
+engine._tick()
+check("a port whose published limit goes away -- swapped optic, a band that "
+      "no longer passes the sanity gate, a switch that stopped answering -- "
+      "has its open alert RESOLVED on the next tick: the evaluator never "
+      "reaches that rule for that port again, so nothing else could ever "
+      "clear it",
+      open_rows(alerts, "sfp_rx_power_low") == [],
+      [dict(r) for r in open_rows(alerts, "sfp_rx_power_low")])
+resolved = alerts._conn.execute(
+    "SELECT resolved_by FROM alerts WHERE dedup_key = ?",
+    (f"sfp_rx_power_low:interface:{did}:7",)).fetchone()
+check("...resolved_by='' like every other automatic resolve, so a port that "
+      "starts publishing again and is still dark opens a fresh alert rather "
+      "than finding itself permanently suppressed",
+      resolved is not None and resolved["resolved_by"] == "",
+      dict(resolved) if resolved else None)
+nodes.close()
+
+# --- and the branch that does it stays cheap on the path it dominates
+nodes, alerts, engine = build("unpublished_cost")
+engine._tick()
+did = add_device(nodes, "10.1.0.8", "no-limits-sw")
+optic_ports(nodes, did, (7, 8, 9, 10))
+base = time.time()
+resolve_calls = []
+open_key_reads = []
+real_resolve = alerts.resolve_by_dedup
+real_open_keys = alerts.open_dedup_keys
+
+
+def spy_resolve(dedup, *args, **kwargs):
+    resolve_calls.append(dedup)
+    return real_resolve(dedup, *args, **kwargs)
+
+
+def spy_open_keys():
+    open_key_reads.append(1)
+    return real_open_keys()
+
+
+alerts.resolve_by_dedup = spy_resolve
+alerts.open_dedup_keys = spy_open_keys
+for i in range(3):
+    for if_index in (7, 8, 9, 10):
+        sample(nodes, did, if_index, base + i, -30.0)
+    engine._tick()
+alerts.resolve_by_dedup = real_resolve
+alerts.open_dedup_keys = real_open_keys
+check("four unpublished ports over three ticks issue NO resolve query for "
+      "the optic power rules -- with nothing open there is nothing to "
+      "resolve, and this branch runs for most ports on most ticks",
+      [k for k in resolve_calls if k.startswith("sfp_")] == [], resolve_calls)
+check("...and the open dedup keys are read at most once per tick, not once "
+      "per port per tick",
+      len(open_key_reads) <= 3, len(open_key_reads))
+nodes.close()
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILED: {', '.join(FAILS)}")

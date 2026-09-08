@@ -3442,8 +3442,17 @@ rule's effective threshold is per port. For a mapped rule the row's column
 is looked up and a missing row or NULL column `continue`s **before the
 streak is touched** and is never written into `live_streaks`, so a port
 that starts publishing tomorrow starts a fresh streak rather than resuming
-one counted against a number that was never applied. That `continue` is the
-dominant path on a real fleet and costs one dict lookup. The `dict(rule)`
+one counted against a number that was never applied. It does **not** skip
+the resolve: an alert already open for that target — raised while the port
+still published a limit, or by 5.2's global number — is resolved on the way
+past with `by=''`, exactly as the `enabled = 0` branch resolves what a rule
+that has stopped applying left behind. Nothing else could, which is the
+point: threshold rules carry no auto-resolve, and the dark-optic clear
+needs a threshold to compare against. That `continue` is the dominant path
+on a real fleet and stays one dict lookup plus a set membership test —
+`open_dedup_keys()` is the same lazily loaded, at-most-once-a-tick set the
+breach paths below already share, and `resolve_by_dedup` runs only for a
+key actually in it, never once per port per tick. The `dict(rule)`
 copies are cached per rule and per `(threshold, clear)` pair for the tick:
 without that, 2,000 devices at 48 optics each built three quarters of a
 million throwaway dicts per tick and the change would have been a
@@ -3487,7 +3496,7 @@ loses the `device_down` rollup the old rules had — the same trade
 `temp_chassis_high` already made behind `temp_chassis_critical`. A
 transitive chain walk is a follow-up, not this change.
 
-**The upgrade is two named migrations, in this order.**
+**The upgrade is three named migrations, in this order.**
 `dampen_optic_power_siblings_1` is a SECOND named entry for the existing
 `_dampen_new_builtin_siblings`, and it has to be: `dampen_new_builtin_siblings_1`
 is already recorded on every install upgraded since 4.54 and will never run
@@ -3508,8 +3517,16 @@ these rules, so a number left there cannot change what alerts — but it can
 sit on the Rules page reading as the live threshold when it is not, and an
 operator investigating a dark port would tune it, watch nothing happen and
 conclude the feature is broken. `sfp_temp_high` is not touched: only
-optical power moved. Open alerts are left alone; the next tick re-derives
-or clears them.
+optical power moved. `resolve_unpublished_optic_power_alerts_1` is the
+third and last: it resolves every open **and acked** alert of
+`sfp_rx_power_low`/`sfp_tx_power_low`, with a note saying the rule now
+reads the optic's own limits and this port publishes none. Without it a 5.2
+install carrying such an alert on any non-Cisco DOM switch — the standard
+ENTITY-SENSOR-MIB publishes no thresholds at all, so Juniper, Arista and HP
+are all one — would keep it open for ever. It reads only the alerts table,
+so its position among the three cannot change the outcome; it runs last
+because it is the consequence of the other two. A port that *does* publish
+a limit and is still under it simply re-opens on the next tick.
 
 **Both writers refuse a number rather than ignoring one.**
 `_check_published_threshold` runs in `set_device_threshold` and in

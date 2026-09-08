@@ -1093,6 +1093,14 @@ class AlertsDatabase(SqliteStore):
             # and dampen nothing.
             ("dampen_optic_power_siblings_1", self._dampen_new_builtin_siblings),
             ("clear_optic_power_thresholds_1", self._clear_optic_power_thresholds),
+            # Last, because it is the CONSEQUENCE of the two above: they put
+            # the rules into their 5.3.0 shape, this clears up the alerts
+            # that shape orphaned. It reads only the alerts table, so its
+            # position relative to the other two cannot change the outcome —
+            # it is placed here because the sequence then reads in the order
+            # the operator experiences it.
+            ("resolve_unpublished_optic_power_alerts_1",
+             self._resolve_unpublished_optic_power_alerts),
         )
 
     def _run_named_migrations(self) -> None:
@@ -1341,14 +1349,55 @@ class AlertsDatabase(SqliteStore):
         time this runs — see _named_migrations.
 
         sfp_temp_high is NOT touched: only optical POWER moved to published
-        limits. Open alerts are left alone too; the next tick re-derives
-        them against the published limit or clears them.
+        limits. Open alerts are not this method's business either: an alert
+        on a port that publishes a limit re-derives or clears on the next
+        tick, and one on a port that publishes none is resolved by
+        _resolve_unpublished_optic_power_alerts, which nothing else would.
         """
         with self._lock:
             self._conn.execute(
                 "UPDATE rules SET threshold = NULL, clear_threshold = NULL"
                 " WHERE is_builtin = 1 AND key IN"
                 " ('sfp_rx_power_low', 'sfp_tx_power_low')")
+            self._conn.commit()
+
+    def _resolve_unpublished_optic_power_alerts(self) -> None:
+        """Resolve the open optic POWER alerts an earlier release raised
+        against its global number, once, on upgrade to 5.3.0.
+
+        From 5.3.0 those two rules are judged against the levels the port's
+        own transceiver publishes and nothing else, so a port that publishes
+        none is never evaluated for them again — and an alert already
+        standing on such a port has nothing left to clear it: threshold
+        rules carry no auto-resolve, and the dark-optic clear path needs a
+        threshold to compare against. That is not a rare corner: only
+        Cisco's entSensorThresholdTable carries the bands at all, so every
+        Juniper, Arista and HP port answering the standard
+        ENTITY-SENSOR-MIB is one, as is any Cisco port whose optic publishes
+        no warning level or whose band fails _optic_band_sane.
+
+        Both keys, every open row, acked ones too — an operator who ticked
+        one off can no more clear it than one who did not. Resolved with a
+        note rather than deleted, like _resolve_device_if_alerts, and
+        resolved_by='' so none of it reads as a hand resolve. A port that
+        DOES publish a limit and is still under it simply re-opens on the
+        next tick.
+        """
+        now = time.time()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT a.id FROM alerts a JOIN rules r ON r.id = a.rule_id"
+                " WHERE a.state IN ('open','acked')"
+                " AND r.key IN ('sfp_rx_power_low', 'sfp_tx_power_low')"
+            ).fetchall()
+            for row in rows:
+                self._conn.execute(
+                    "UPDATE alerts SET state='resolved', resolved_ts=?,"
+                    " resolved_by='' WHERE id=?", (now, row["id"]))
+                self._note(row["id"],
+                          "Resolved on upgrade: optic power now alerts on the "
+                          "levels the port's own transceiver publishes, and "
+                          "this port publishes none")
             self._conn.commit()
 
     def _rekey_trap_syslog_alerts(self) -> None:

@@ -482,8 +482,33 @@ conn.executescript("""
         WHERE key = 'sfp_tx_power_low';
     -- an unrelated rule the operator also tuned, which nothing here may touch
     UPDATE rules SET threshold = 95.0, clear_threshold = 85.0 WHERE key = 'cpu_high';
+    -- Two optic power alerts the 5.2 engine raised off its global number, on
+    -- a switch that publishes no bands of its own. From 5.3.0 the evaluator
+    -- never reaches those ports again, so nothing left to itself would ever
+    -- clear these; the acked one goes too.
+    INSERT INTO alerts (rule_id, dedup_key, entity_kind, entity_id,
+                        entity_label, severity, message, state,
+                        opened_ts, last_ts)
+        SELECT id, 'sfp_rx_power_low:interface:9:7', 'interface', '9:7',
+               'ex-4300 / ge-0/0/7', 4, 'low light', 'open', 1000.0, 1000.0
+          FROM rules WHERE key = 'sfp_rx_power_low';
+    INSERT INTO alerts (rule_id, dedup_key, entity_kind, entity_id,
+                        entity_label, severity, message, state, acked_by,
+                        opened_ts, last_ts)
+        SELECT id, 'sfp_tx_power_low:interface:9:8', 'interface', '9:8',
+               'ex-4300 / ge-0/0/8', 4, 'low light', 'acked', 'jo',
+               1000.0, 1000.0
+          FROM rules WHERE key = 'sfp_tx_power_low';
+    -- ...and one that has nothing to do with optics, which must stay open
+    INSERT INTO alerts (rule_id, dedup_key, entity_kind, entity_id,
+                        entity_label, severity, message, state,
+                        opened_ts, last_ts)
+        SELECT id, 'cpu_high:device:9', 'device', '9', 'ex-4300', 3,
+               'cpu hot', 'open', 1000.0, 1000.0
+          FROM rules WHERE key = 'cpu_high';
     DELETE FROM schema_migrations WHERE name IN (
-        'dampen_optic_power_siblings_1', 'clear_optic_power_thresholds_1');
+        'dampen_optic_power_siblings_1', 'clear_optic_power_thresholds_1',
+        'resolve_unpublished_optic_power_alerts_1');
 """)
 conn.commit()
 before = {r[0] for r in conn.execute("SELECT name FROM schema_migrations")}
@@ -529,6 +554,32 @@ check("the comparisons land right way round on the new rules",
 cpu = optic_db.rule_by_key("cpu_high")
 check("an unrelated rule the operator tuned is untouched",
       (cpu["threshold"], cpu["clear_threshold"]) == (95.0, 85.0), dict(cpu))
+
+
+def alert_row(db, dedup):
+    return db._conn.execute(
+        "SELECT state, resolved_by, rollup_note FROM alerts WHERE dedup_key = ?",
+        (dedup,)).fetchone()
+
+
+rx_alert = alert_row(optic_db, "sfp_rx_power_low:interface:9:7")
+tx_alert = alert_row(optic_db, "sfp_tx_power_low:interface:9:8")
+check("an optic power alert standing open from 5.2 is resolved by the "
+      "upgrade: the rule now reads the optic's own limits, this port "
+      "publishes none, and no tick will ever reach it again",
+      rx_alert is not None and rx_alert["state"] == "resolved"
+      and rx_alert["resolved_by"] == "", dict(rx_alert) if rx_alert else None)
+check("...the ACKED one too -- an operator who ticked it off is no more "
+      "able to clear it than one who did not",
+      tx_alert is not None and tx_alert["state"] == "resolved",
+      dict(tx_alert) if tx_alert else None)
+check("...each carrying a note saying why, rather than vanishing",
+      rx_alert is not None and "publishes none" in (rx_alert["rollup_note"] or ""),
+      rx_alert["rollup_note"] if rx_alert else None)
+cpu_alert = alert_row(optic_db, "cpu_high:device:9")
+check("an open alert of an unrelated rule is left alone",
+      cpu_alert is not None and cpu_alert["state"] == "open",
+      dict(cpu_alert) if cpu_alert else None)
 temp = optic_db.rule_by_key("sfp_temp_high")
 check("sfp_temp_high keeps its own threshold: only optical POWER moved to "
       "published limits",
