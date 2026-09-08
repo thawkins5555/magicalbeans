@@ -1371,9 +1371,20 @@ check("new AbortController()" in _NF_REFRESH and "signal: abort.signal" in _NF_R
       "it finally answers")
 check("if (token !== view.request) return;" in _NF_REFRESH,
       "...with the repaint guard still checked after both")
-check("view.abort.abort()" in _NETFLOW[_NETFLOW.index("  function dropInFlight() {"):],
+_NF_FETCH = _NETFLOW[_NETFLOW.index("  function dropInFlight() {"):
+                     _NETFLOW.index("  function applyWindow(")]
+check("view.abort.abort()" in _NF_FETCH,
       "and a change of view aborts what is already in flight rather than "
       "waiting for it to answer something nobody will read")
+check("setTimeout" in _NF_FETCH and "REFETCH_MS" in _NF_FETCH,
+      "...and collapses the burst it arrived in into one fetch")
+check("function setWindow(t0, t1, follow) {" in _NETFLOW,
+      "...in the window-change path itself: the old opt-in `defer` argument "
+      "was passed by the wheel handler and by none of the dozen other "
+      "callers that change the window")
+check("if (view.windowTimer) return;" in _NF_REFRESH,
+      "...and the poll tick stands off while one is pending, rather than "
+      "fetching the half-way window it can see mid-burst")
 
 
 print()

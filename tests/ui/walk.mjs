@@ -1345,6 +1345,57 @@ async function checkMisc(page, watcher) {
              `expected exactly one of denied/shown, got denied=${state.denied} bodyShown=${state.bodyShown}`);
       return state.denied ? 'denied (no admin read)' : `shown: "${state.status}"`;
     });
+
+  /* 5.3.0: stepping the NetFlow range dropdown from 15m to 30d used to fire
+     one overview + records pair per step — a dozen ever-widening queries
+     queued on the flow database, with the window the operator actually chose
+     waiting behind all of them. Only the last window may reach the server. */
+  await check('restepping the NetFlow range fetches only the window it lands on',
+    async () => {
+      await selectTab(page, 'netflow');
+      await settle(page, 1200);
+      const before = watcher.pageErrors.length + watcher.consoleErrors.length;
+      const result = await page.evaluate(async () => {
+        // The window each overview request asks for, recorded as its span in
+        // seconds: that is what the range dropdown chooses, and what a fetch
+        // for an abandoned step would show up as.
+        const spans = [];
+        const real = window.fetch;
+        window.fetch = (input, init) => {
+          const url = String(typeof input === 'string' ? input : (input || {}).url || '');
+          if (url.includes('/api/netflow/overview')) {
+            const query = new URLSearchParams(url.split('?')[1] || '');
+            spans.push(Math.round(Number(query.get('t1')) - Number(query.get('t0'))));
+          }
+          return real(input, init);
+        };
+        const range = document.getElementById('nf-range');
+        const values = [...range.options].map((option) => option.value);
+        for (const value of values) {
+          range.value = value;
+          range.dispatchEvent(new Event('change'));
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        const wanted = Math.round(Number(range.value));
+        // Long enough for the collapsed fetch AND a poll tick after it, so
+        // the count below is not just "nothing had started yet".
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        window.fetch = real;
+        return { spans, wanted, steps: values.length };
+      });
+      const after = watcher.pageErrors.length + watcher.consoleErrors.length;
+      assert(after === before,
+             `${after - before} error(s) while restepping the range: ` +
+             JSON.stringify([...watcher.pageErrors, ...watcher.consoleErrors]
+               .slice(before).map((e) => e.message || e.text)));
+      assert(result.spans.length > 0,
+             'no /api/netflow/overview request was issued at all');
+      const stale = result.spans.filter((span) => span !== result.wanted);
+      assert(stale.length === 0,
+             `${result.steps} range steps fetched ${stale.length} abandoned ` +
+             `window(s) (spans ${stale.join(', ')}); only ${result.wanted}s may be asked for`);
+      return `${result.steps} steps -> ${result.spans.length} fetch(es), all ${result.wanted}s`;
+    });
 }
 
 async function checkReadOnly(browser, base, creds, dir, tag) {

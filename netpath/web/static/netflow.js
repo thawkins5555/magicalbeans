@@ -86,6 +86,11 @@
       `${App.stamp(view.t0, span)} – ${App.stamp(view.t1, span)}`;
   }
 
+  /* Long enough to swallow a gesture, short enough that one click on Reset
+     still reads as an immediate answer — the busy line app.css draws at
+     400 ms carries the rest of the wait. */
+  const REFETCH_MS = 250;
+
   /* The window an operator has just left is not worth finishing. Its two
      queries hold the same flow-database lock the collector writes flows
      through, and the token check in refresh() only hides a stale answer in
@@ -98,12 +103,26 @@
     view.windowTimer = null;
   }
 
-  /* `defer` collapses a burst of window changes into one fetch. The wheel
-     fires several events per zoom gesture, and each one used to launch a full
-     overview + records pair over an ever wider window, so zooming out queued
-     work up faster than the server could finish it. The window itself still
-     moves on every event, so the label tracks the gesture live. */
-  function setWindow(t0, t1, follow, defer) {
+  /* Every change of view is collapsed into one fetch a quarter-second after
+     the last of them — not just the wheel's, which was the only caller that
+     ever asked. The wheel fires several events per zoom gesture, but so does
+     stepping the range dropdown from 15m to 30d, and holding a zoom or pan
+     button: each step used to launch a full overview + records pair over an
+     ever wider window, so the dozen nobody wanted queued on the flow
+     database ahead of the one they did. The window itself still moves on
+     every event, so the label tracks the gesture live. */
+  function requestFetch() {
+    dropInFlight();
+    view.windowTimer = setTimeout(() => {
+      view.windowTimer = null;
+      App.refreshNow('netflow');
+    }, REFETCH_MS);
+  }
+
+  // The window, with no opinion about fetching it: init() sizes the first
+  // window this way because activating the tab issues its first fetch a
+  // moment later anyway, and asking here as well painted every open twice.
+  function applyWindow(t0, t1, follow) {
     if (t1 - t0 < 60) t1 = t0 + 60;
     view.t0 = t0; view.t1 = t1;
     if (follow !== undefined) {
@@ -111,17 +130,11 @@
       App.el('nf-follow').checked = follow;
     }
     showWindow();
-    dropInFlight();
-    if (!defer) {
-      // A window change is a direct request, so fetch now rather than waiting
-      // out the refresh interval.
-      App.refreshNow('netflow');
-      return;
-    }
-    view.windowTimer = setTimeout(() => {
-      view.windowTimer = null;
-      App.refreshNow('netflow');
-    }, 250);
+  }
+
+  function setWindow(t0, t1, follow) {
+    applyWindow(t0, t1, follow);
+    requestFetch();
   }
 
   function zoom(factor) {
@@ -138,10 +151,16 @@
     setWindow(view.t0 + shift, view.t1 + shift, false);
   }
 
-  function resetWindow() {
+  // The span nf-range names, ending now.
+  function rangeWindow() {
     const seconds = Number(App.el('nf-range').value) || 3600;
     const now = Date.now() / 1000;
-    setWindow(now - seconds, now, true);
+    return [now - seconds, now];
+  }
+
+  function resetWindow() {
+    const [t0, t1] = rangeWindow();
+    setWindow(t0, t1, true);
   }
 
   function filters() {
@@ -383,7 +402,7 @@
       const fraction = Math.min(Math.max((x - plot.x) / plot.w, 0), 1);
       const anchor = view.t0 + fraction * (view.t1 - view.t0);
       const [start, end] = App.wheelWindow(event, view.t0, view.t1, anchor);
-      setWindow(start, end, false, true);
+      setWindow(start, end, false);
     };
     showFocusTip(container);
   }
@@ -845,6 +864,11 @@
   async function refresh() {
     if (App.state.tab !== 'netflow') return;
     drawStatus();
+    /* A window change is still settling. The poll tick can see the window
+       half way through the burst — the dropdown is on 6h on its way to 30d —
+       and fetching that one is exactly the waste requestFetch() exists to
+       remove; the fetch it has already scheduled is the one worth making. */
+    if (view.windowTimer) return;
 
     if (view.follow) {
       const span = view.t1 - view.t0;
@@ -1000,7 +1024,9 @@
         packets: `Top ${RECORD_LIMIT} by packets`,
         time: `Most recent ${RECORD_LIMIT}` }[option.value] || option.textContent;
     }
-    App.el('nf-order').onchange = () => App.refreshNow('netflow');
+    // Through the same collapse as a window change: re-ordering asks for
+    // different records, and the burst it can arrive in is the same one.
+    App.el('nf-order').onchange = () => requestFetch();
     // nf-range is deliberately NOT in this list: its change handler is
     // resetWindow (above), which re-sizes the window before refreshing; a
     // plain refresh here would have overwritten it and left the chart on
@@ -1023,12 +1049,11 @@
     App.wireToggle('nf-toggle', 'collector', '/api/netflow/collector', refresh);
     App.onRelayout('netflow', drawChart);
 
-    // Restored before resetWindow(), which reads the range straight off
-    // nf-range to size the first window — after it, the window would be
-    // built from the markup default and only correct itself on the next
-    // change.
+    // Restored before the window is sized, which reads the range straight
+    // off nf-range — after it, the window would be built from the markup
+    // default and only correct itself on the next change.
     App.restoreControls('netflow', CONTROLS);
-    resetWindow();
+    applyWindow(...rangeWindow(), true);
   }
 
   App.pages.netflow = { init, refresh, fastTick: drawStatus };
