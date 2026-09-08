@@ -4464,16 +4464,27 @@
         beside the button ends it at once.</p>
         <p><b>What is recorded.</b> The device's event log gets one line when
         a tunnel opens and one when it closes, with how many bytes crossed in
-        each direction — never what they were. The bytes are copied without
-        being read, which is also why a device on https keeps its own
-        certificate: your browser will name the device in the warning, not
-        this server.</p>
-        <p><b>Two things to expect.</b> A device page whose links are
-        absolute (<code>http://10.2.0.7/status</code>) will step outside the
-        tunnel when you follow one, because that address is the device's, not
-        this machine's. And the tunnel is on this host, so it shares the
-        browser's cookie jar with this application's own port — sign out of
-        the device's UI when you are done with it.</p>
+        each direction — never what they were. Nothing a page contains is
+        read or kept.</p>
+        <p><b>Following its links.</b> For a device on <code>http</code>, the
+        tunnel reads the headers each side sends. The device is asked for its
+        own address, so it builds its pages against itself; and every address
+        it names on the way back — a redirect, a refresh, a cookie's domain —
+        is put back onto the tunnel. A link written out in full
+        (<code>http://10.2.0.7/status</code>) therefore stays inside the
+        tunnel, which it did not before 5.4.</p>
+        <p><b>A device on https is different.</b> Its traffic is carried
+        without being read, so its certificate is its own — your browser will
+        name the device in the warning, not this server — but nothing in it
+        can be adjusted either. A link or redirect written out in full will
+        step outside the tunnel and try to reach the device directly, which
+        only works from a machine that already has a route to it. The same
+        is true of anything on <code>http</code> the tunnel cannot make
+        sense of, such as a page that upgrades to a WebSocket: from that
+        point the connection is carried unread as well.</p>
+        <p><b>One thing to remember.</b> The tunnel is on this host, so it
+        shares the browser's cookie jar with this application's own port —
+        sign out of the device's UI when you are done with it.</p>
         <p><b>Who can use it.</b> Its own <b>web</b> permission, granted to
         nobody by default and to no account on upgrade: opening a listening
         port on this server into the management plane is not something the
