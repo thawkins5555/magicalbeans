@@ -789,12 +789,13 @@ and says nothing about the ones it does not.
 **5.2.0 widened `media` past the ports that answer sensors.** A DOM walk
 cannot see an SFP slot that reports no DOM — a transceiver without the
 sensors, or an empty cage — and until now those were indistinguishable from
-copper. `_sfp_slot_media` reads three more ENTITY-MIB columns
-(`entPhysicalClass`, `entPhysicalVendorType`, `entPhysicalModelName`)
-alongside the `entPhysicalDescr` and `entPhysicalContainedIn` the walk
-already had, and resolves each cage through the containment tree
-`_entity_port_map` walks — which is now walked once by `_poll_environment`
-and passed to both, rather than twice. An entity whose own text names a
+copper. `_sfp_slot_media` reads two more ENTITY-MIB columns
+(`entPhysicalClass`, `entPhysicalModelName`) alongside the
+`entPhysicalDescr` and `entPhysicalContainedIn` the walk already had, and
+resolves each cage through the containment tree `_entity_port_map` walks —
+extracted to `_entity_contained_in` and walked once by `_poll_environment`
+for both, so the cage scan adds no second walk of that column (it was
+already walked once, not twice). An entity whose own text names a
 transceiver (`_TRANSCEIVER_TEXT`) and that resolves to an `ifIndex` is
 `'sfp'`; a `container(5)` that says it is a transceiver cage and holds
 nothing that does is `'sfp_empty'`, taking its `ifIndex` from the `port(10)`
@@ -804,25 +805,55 @@ container naming nothing is deliberately left alone — some platforms give
 every copper port one too, and a copper port must never wear an SFP badge,
 which is also why `_TRANSCEIVER_TEXT` matches an optical media suffix
 (`base-SX`, `10Gbase-LR`) or a form factor but never a bare `1000BaseT`.
-The three columns are only walked when the entity table mapped something to
-a port, so a device that answers none of this pays nothing for them.
+The cost is real and worth stating plainly: for every device the entity
+table mapped to a port, this is two more full column walks of `entPhysical`
+— class and model name — every `_SENSOR_REFRESH_S` (300 s), on top of the
+descr, containment and alias walks the sensor pass already made. A device
+that maps nothing to a port pays nothing for them, which is the only thing
+that bounds it. `entPhysicalVendorType` was a third and is not walked:
+`SYNTAX AutonomousType` makes it an OBJECT IDENTIFIER, so a conforming
+agent answers a dotted number no text test can read, and the registered
+names those numbers stand for (`cevSFP10GLR` and its kin) run the words
+together, so they would not match `_TRANSCEIVER_TEXT` even spelled out.
+
+Both go through `_walk_column_status`, and a walk that did not reach
+the end of its table makes the whole verdict advisory: `_poll_environment`
+then leaves every stored `'sfp'` / `'sfp_empty'` badge where it is, and only
+a port this poll's own sensors proved is an `'optic'` may overwrite one.
+Without that a device that answers the alias walk and then times out on
+`entPhysicalClass` produced an empty cage scan, which the clear pass read as
+"no cages here" and wrote `media = NULL` over every badge on the device —
+back the next cadence, so the list flickered every five minutes. A partial
+`entPhysicalModelName` walk did the milder version of the same thing,
+downgrading an occupied cage to `'sfp_empty'`. The `'optic'` path has had
+this protection since 5.1.0 (`if port_map:`); this is the same guarantee for
+the two states the entity table alone can see.
 
 **A −40 dBm optic is dark, not dying.** A transceiver with its port powered
 down or no fiber in it clamps at the bottom of its scale, and
 `_decode_entity_sensor`'s arithmetic reports that faithfully as `-40.0`;
 `entPhySensorStatus` still says `ok(1)`, so the status filter never catches
 it. `alertrules.is_dark_optic` names the condition once for both ends —
-`DARK_OPTIC_DBM` with half a dB of tolerance, plus the zero-light sentinels
-(an exact `0`, a non-finite value) — and `breaches()` returns `False` for
-one on the two optic power families (`rules.source_kind` of `sfp_rx_dbm` or
-`sfp_tx_dbm`), keyed off the family so no other `'below'` rule can inherit
-it. The guard has to live there rather than at the metric write:
-`threshold_stale_s` defaults to 900 s, so a `-40` already recorded would go
-on re-evaluating for fifteen minutes, and one written by an older build
-would never expire at all. `_poll_environment` also drops dark lanes before
-the per-port `min()`, so one dark lane of a multi-lane optic no longer beats
-three healthy ones; a port dark on every lane still records the floor, which
-keeps its chart continuous and its history true.
+`DARK_OPTIC_DBM` with half a dB of tolerance, plus a non-finite value, which
+is an agent with no reading to give (one quoting watts of nothing lands here
+through the scale arithmetic). A bare `0` is deliberately not on that list:
+0 dBm is 1 mW, a nominal transmit level for an ER/ZR/DWDM part, and what an
+agent quoting 0.1 dBm units rounds `-0.04` to. `breaches()` returns `False`
+for one on the two optic power families (`rules.source_kind` of `sfp_rx_dbm`
+or `sfp_tx_dbm`), keyed off the family so no other `'below'` rule can inherit
+it. `evaluate_threshold` answers `'clear'` for the same reading on the same
+families, because refusing to RAISE says nothing about an alert already
+open: the floor is a fresh sample every poll, so `threshold_stale_s` can
+never expire it, and a lit optic that went dark — or any of the alerts a 5.1
+build raised on every dark port, all of them open at upgrade time — would
+have stayed open until a human resolved it by hand. A dark port is
+`interface_down`'s to report. The guard has to live there rather than at the
+metric write: `threshold_stale_s` defaults to 900 s, so a `-40` already
+recorded would go on re-evaluating for fifteen minutes, and one written by
+an older build would never expire at all. `_poll_environment` also drops
+dark lanes before the per-port `min()`, so one dark lane of a multi-lane
+optic no longer beats three healthy ones; a port dark on every lane still
+records the floor, which keeps its chart continuous and its history true.
 
 **5.0.1 gave the walk a second table and the latch an expiry.** The value
 column `_poll_environment` asks for now comes from `_walk_sensor_columns`

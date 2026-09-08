@@ -227,9 +227,12 @@ def _metric_root_of(rule) -> str:
 # An optic with no fiber in it, or a port powered down, reports the bottom
 # of its own scale rather than a fault: -40 dBm is where the common vendors
 # clamp, and nothing that is actually working ever reads there (receive
-# sensitivity bottoms out around -23 dBm on the worst 1G/10G part). A 0 is
-# the same statement from an agent quoting milliwatts of nothing, and a
-# non-finite value is an agent with no reading at all to give.
+# sensitivity bottoms out around -23 dBm on the worst 1G/10G part). A
+# non-finite value is an agent with no reading at all to give -- including
+# one quoting watts, whose zero raw value comes out non-finite through the
+# scale arithmetic. A bare 0 is NOT one of these: 0 dBm is 1 mW, a nominal
+# transmit level for an ER/ZR/DWDM part, and what an agent quoting 0.1 dBm
+# units rounds -0.04 to.
 DARK_OPTIC_DBM = -40.0
 _DARK_OPTIC_TOLERANCE_DB = 0.5
 # The two metric families (rules.source_kind) a dark reading may silence.
@@ -249,7 +252,7 @@ def is_dark_optic(metric_root: str, value) -> bool:
         return False
     if not math.isfinite(value):
         return True
-    return value == 0.0 or value <= DARK_OPTIC_DBM + _DARK_OPTIC_TOLERANCE_DB
+    return value <= DARK_OPTIC_DBM + _DARK_OPTIC_TOLERANCE_DB
 
 
 def breaches(rule, value) -> bool:
@@ -290,11 +293,12 @@ def evaluate_threshold(rule, current_value: float | None, streak: int,
                        breach_seconds: float = 0.0) -> str:
     """Returns 'breach' once current_value is on the wrong side of
     rule.threshold and the breach has been sustained long enough; 'clear'
-    once a value has recovered past rule.clear_threshold; '' otherwise
-    (either not sustained yet, or in the hysteresis gap between
-    clear_threshold and threshold). The threshold/clear_threshold gap is
-    hysteresis — without it a value oscillating exactly at the threshold
-    reopens and recloses the alert every single poll.
+    once a value has recovered past rule.clear_threshold, or once a 'below'
+    optic-power rule reads dark; '' otherwise (either not sustained yet, or
+    in the hysteresis gap between clear_threshold and threshold). The
+    threshold/clear_threshold gap is hysteresis — without it a value
+    oscillating exactly at the threshold reopens and recloses the alert
+    every single poll.
 
     Direction is rule.comparison's call, via breaches()/_clears() above:
     for a 'below' rule (an optic whose receive power has fallen) the band
@@ -323,6 +327,15 @@ def evaluate_threshold(rule, current_value: float | None, streak: int,
             return "breach" if breach_seconds >= float(for_seconds) else ""
         for_polls = max(1, int(rule["for_polls"] or 1))
         return "breach" if streak >= for_polls else ""
+    if (comparison_of(rule) == "below"
+            and is_dark_optic(_metric_root_of(rule), current_value)):
+        # breaches() refusing to open an alert says nothing about one
+        # already open, and it never will: the floor is a fresh sample
+        # every poll, so threshold_stale_s cannot expire it either. A dark
+        # port is interface_down's to report, so this closes what is open
+        # — including every alert a 5.1 build raised on a dark optic, which
+        # is open at upgrade time and would otherwise be permanent.
+        return "clear"
     if _clears(rule, current_value):
         return "clear"
     return ""

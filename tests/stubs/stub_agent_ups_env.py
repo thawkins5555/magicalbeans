@@ -66,16 +66,25 @@ Modes:
              shapes real gear uses -- units/precision 1 (IOS) and
              milli/precision 0 (NX-OS) -- both decoding through the plain
              RFC 3433 arithmetic.
-  sfp_media  Six ports covering every media verdict and the dark optic: a
+  sfp_media  Seven ports covering every media verdict and the dark optic: a
              working optic, an occupied cage with no DOM, an empty cage, a
              copper port an agent models as container+port too (which must
-             stay unbadged), a two-lane optic with one lane dark, and one
-             dark on both lanes. See SFP_MEDIA_TABLE.
+             stay unbadged), a two-lane optic with one lane dark, one dark on
+             both lanes, and one transmitting at exactly 0 dBm. See
+             SFP_MEDIA_TABLE.
+  sfp_media_no_class
+             `sfp_media`, except that every request into the
+             entPhysicalClass column goes unanswered -- the flaky device
+             that answers the alias and containment walks and then stops,
+             so that walk times out rather than coming back empty. The
+             difference matters to a caller that deletes rows its walk did
+             not produce. See DEAD_COLUMNS.
 
-Two control datagrams, on the same socket as SNMP itself (see
+Three control datagrams, on the same socket as SNMP itself (see
 stub_agent_fdb.py, which established this convention):
   STATS       -> the request count so far, as decimal text
-  RESET       -> zeroes it
+  COLUMNS     -> the entPhysicalEntry columns asked for, space-separated
+  RESET       -> zeroes both
 """
 import os
 import socket
@@ -302,10 +311,10 @@ CISCO_DOM_TABLE = {
 }
 
 # ------------------------------------------- SFP media and the dark optic
-# Six ports, one row of ENTITY-MIB reality each. Ports 1/5/6 carry standard
-# ENTITY-SENSOR-MIB optical-power rows (dBm(14), scale units(9), precision 1)
-# and are aliased to their ifIndex; ports 2/3/4 have no sensor of any kind,
-# which is exactly why entPhysicalClass has to answer for them:
+# Seven ports, one row of ENTITY-MIB reality each. Ports 1/5/6/7 carry
+# standard ENTITY-SENSOR-MIB optical-power rows (dBm(14), scale units(9),
+# precision 1) and are aliased to their ifIndex; ports 2/3/4 have no sensor
+# of any kind, which is exactly why entPhysicalClass has to answer for them:
 #
 #   if 1  a working optic, -5.5 dBm                     -> media 'optic'
 #   if 2  a cage holding a transceiver that reports no DOM  -> media 'sfp'
@@ -314,6 +323,9 @@ CISCO_DOM_TABLE = {
 #         transceiver anywhere -> media NULL, never a badge
 #   if 5  a two-lane optic, one lane dark at -40 and one healthy at -6
 #   if 6  a two-lane optic dark on both lanes
+#   if 7  a single-lane optic transmitting at exactly 0.0 dBm -- 1 mW, a
+#         nominal level for an ER/ZR part, and what an agent quoting 0.1 dBm
+#         units rounds -0.04 to
 SFP_MEDIA_TABLE = {
     # --- if 1: an ordinary DOM optic
     "1.3.6.1.2.1.47.1.1.1.1.2.101": ("str", "GigabitEthernet1/0/1"),
@@ -392,9 +404,43 @@ SFP_MEDIA_TABLE = {
     "1.3.6.1.2.1.99.1.1.1.3.162": ("int", 1),
     "1.3.6.1.2.1.99.1.1.1.4.162": ("int", -400),
     "1.3.6.1.2.1.99.1.1.1.5.162": ("int", 1),
+
+    # --- if 7: transmitting at exactly 0.0 dBm
+    "1.3.6.1.2.1.47.1.1.1.1.2.107": ("str", "GigabitEthernet1/0/7"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.107": ("int", 10),
+    "1.3.6.1.2.1.47.1.3.2.1.2.107.1": ("str", "1.3.6.1.2.1.2.2.1.1.7"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.171": ("str", "Gi1/0/7 Transmit Power"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.171": ("int", 107),
+    "1.3.6.1.2.1.99.1.1.1.1.171": ("int", 14),
+    "1.3.6.1.2.1.99.1.1.1.2.171": ("int", 9),
+    "1.3.6.1.2.1.99.1.1.1.3.171": ("int", 1),
+    "1.3.6.1.2.1.99.1.1.1.4.171": ("int", 0),                  # 0.0 dBm
+    "1.3.6.1.2.1.99.1.1.1.5.171": ("int", 1),
 }
 
+# A mode may refuse a whole column outright, which is not the same as
+# answering it empty: a real agent that goes quiet part-way through a big
+# entPhysical walk leaves its caller with a timeout, and a caller that
+# deletes rows its walk did not produce has to be able to tell the two
+# apart. Keyed by mode, the column's base OID.
+DEAD_COLUMNS = {
+    "sfp_media_no_class": ("1.3.6.1.2.1.47.1.1.1.1.5",),
+}
+
+# Which entPhysicalEntry columns a run was asked for at all. A walk asks for
+# its column's base OID and then resumes from the last row it accepted, so
+# every request it makes carries that column -- which is what makes "was
+# this column ever walked?" a question a test can put, and each column is a
+# whole table walk of cost.
+ENT_PHYSICAL_ENTRY = "1.3.6.1.2.1.47.1.1.1.1."
+COLUMNS_SEEN: set = set()
+
 MODE = "ups"
+
+
+def refuses(oid):
+    return any(oid == base or oid.startswith(base + ".")
+               for base in DEAD_COLUMNS.get(MODE, ()))
 
 
 def table_for():
@@ -412,7 +458,7 @@ def table_for():
         return {**CISCO_SCALARS, **HARDWARE_TABLE, **CISCO_ENVMON_TABLE}
     if MODE == "cisco_dom":
         return {**CISCO_SCALARS, **CISCO_DOM_TABLE}
-    if MODE == "sfp_media":
+    if MODE in ("sfp_media", "sfp_media_no_class"):
         return {**GENERIC_SCALARS, **SFP_MEDIA_TABLE}
     return dict(GENERIC_SCALARS)
 
@@ -446,8 +492,12 @@ def main():
         if data == b"STATS":
             sock.sendto(str(count).encode(), addr)
             continue
+        if data == b"COLUMNS":
+            sock.sendto(" ".join(sorted(COLUMNS_SEEN)).encode(), addr)
+            continue
         if data == b"RESET":
             count = 0
+            COLUMNS_SEEN.clear()
             sock.sendto(b"0", addr)
             continue
         try:
@@ -460,6 +510,10 @@ def main():
         table = table_for()
         keys = sorted(table, key=oid_key)
         oids = [vb["oid"] for vb in request.varbinds]
+        if oids[0].startswith(ENT_PHYSICAL_ENTRY):
+            COLUMNS_SEEN.add(".".join(oids[0].split(".")[:12]))
+        if refuses(oids[0]):
+            continue
         if request.pdu_tag == PDU_GET:
             body = b""
             for oid in oids:

@@ -412,7 +412,9 @@ own subtabs.
 - **An optic with no light in it is not an optic in trouble.** A
   transceiver whose port is powered down, or that has no fiber in it,
   reports the bottom of its own scale — −40 dBm — and no low-power alert
-  is raised on that reading, on either receive or transmit. A genuinely
+  is raised on that reading, on either receive or transmit — and a
+  low-power alert already open on a port that goes dark is resolved
+  rather than left showing the reading that raised it. A genuinely
   dying optic (−25 dBm, say) alerts exactly as before. On a multi-lane
   optic a dark lane no longer drags the port's reported light level down
   past three healthy ones, and a port dark on every lane still records
