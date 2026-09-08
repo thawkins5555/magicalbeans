@@ -404,13 +404,24 @@ def detect_reboot(uptime_ticks: int, uptime_ts: float, previous_ticks: int | Non
     near_wrap = previous_ticks > wrap_modulus - (elapsed_s * 100 + grace_ticks) * 2
     if near_wrap:
         return False, ""
-    return True, (f"uptime dropped from {format_ticks(previous_ticks)} to "
-                  f"{format_ticks(uptime_ticks)} after "
-                  f"{duration_text(elapsed_s)} without a reading")
+    # duration_text refuses a sub-second gap, and "after  without a reading"
+    # would be the result of pasting its "" in unguarded.
+    gap = duration_text(elapsed_s)
+    sentence = (f"uptime dropped from {format_ticks(previous_ticks)} to "
+                f"{format_ticks(uptime_ticks)}")
+    if gap:
+        sentence += f" after {gap} without a reading"
+    return True, sentence
 
 
 # The inverse of the sentence above, kept beside it so the two cannot drift.
-_REBOOT_UPTIMES = re.compile(r"uptime dropped from (.+?) to (.+?) after ")
+# Both groups are pinned to the two shapes trapdecode.format_ticks can emit,
+# not to `(.+?)`: the pre-5.3 sentence ("uptime dropped from 1036800000 to
+# 15000 hundredths of a second after 300s") is still readable out of a row the
+# 5.2 poller wrote, and a loose group matched it and handed the raw tick counts
+# to the reboot email as uptimes -- the very mistake 5.3 removed.
+_UPTIME_TEXT = r"(\d+d \d\d:\d\d:\d\d|\d\d:\d\d:\d\d\.\d\d)"
+_REBOOT_UPTIMES = re.compile(f"uptime dropped from {_UPTIME_TEXT} to {_UPTIME_TEXT}")
 
 
 def reboot_uptimes(detail: str) -> tuple[str, str]:
