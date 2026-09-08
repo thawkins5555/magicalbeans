@@ -250,15 +250,13 @@ class FlowDatabase(SqliteStore):
     TRIM_TABLE = "flows"
     # The rollups reach further back than the raw rows they were built from,
     # so asking flows alone under-reports how much history this store holds.
-    # Three index probes, none of them a scan: /api/state polls this every
-    # ten seconds, on the collector's write lock, for every open tab.
-    # MIN(ts_start) has no index (ix_flows_ts is on ts_end) and walked the
-    # table; MIN(bucket) FROM flow_rollup walked ix_flow_rollup_bucket in
-    # full, the index leading on tier defeating the MIN optimisation. The
-    # oldest id is the oldest arrival, and flow_rollup_span holds a row for
-    # every bucket flow_rollup does, so neither detour is needed.
-    # One arm per tier, because the primary key leads on tier: a MIN over
-    # the whole table would have to walk it.
+    # Index probes, never a scan: /api/state polls this every ten seconds,
+    # on the collector's write lock, for every open tab. MIN(ts_start) has no
+    # index (ix_flows_ts is on ts_end) and walked the table; MIN(bucket) FROM
+    # flow_rollup walked ix_flow_rollup_bucket in full, that index leading on
+    # tier defeating the MIN optimisation. The oldest id is the oldest
+    # arrival, and flow_rollup_span holds a row for every bucket flow_rollup
+    # does — one arm per tier, since its primary key leads on tier too.
     OLDEST_TS_SQL = (
         "SELECT MIN(ts) FROM ("
         "SELECT ts FROM (SELECT ts_start AS ts FROM flows ORDER BY id LIMIT 1)"
@@ -763,16 +761,17 @@ class FlowDatabase(SqliteStore):
             self._reclaim_until(time.monotonic() + PRUNE_RECLAIM_BUDGET_S)
         return removed
 
-    def trim_to_size(self, max_bytes: int, budget_s: float | None = None) -> int:
-        """Delete the oldest flow history until the store fits under the cap:
-        raw flows first, then the rollups.
+    def _trim_more(self, max_bytes: int, budget_s: float | None = None) -> int:
+        """Stage two of the size cap: the oldest rollup buckets, once the raw
+        flows have reached TRIM_FLOOR.
 
-        Without stage two the base implementation would delete raw down to
-        TRIM_FLOOR and then warn about the cap forever while the rollups held
-        the space. Stage two deletes by oldest bucket, so it never touches
-        the recent ones compact_rollup's redo window rewrites.
+        Without it the base implementation would delete raw down to that
+        floor and then warn about the cap forever while the rollups held the
+        space. Deletes by oldest bucket, so it never touches the recent ones
+        a compaction pass rewrites. A hook rather than an override, so the
+        base emits its over-cap warning after this rather than before it.
         """
-        removed = super().trim_to_size(max_bytes, budget_s)
+        removed = 0
         if max_bytes <= 0 or self._trim_size() <= max_bytes:
             return removed
         deadline = time.monotonic() + (TRIM_BUDGET_S if budget_s is None else budget_s)

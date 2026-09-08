@@ -7,6 +7,7 @@ it removed AND for how long any one batch held the lock.
 
 Plain script, no pytest: run it, read the PASS lines, non-zero exit on failure.
 """
+import logging
 import os
 import shutil
 import sys
@@ -56,6 +57,21 @@ def counts(db: FlowDatabase) -> tuple[int, int, int]:
             " (SELECT COUNT(*) FROM flow_rollup_span)").fetchone())
 
 
+class collected_warnings:
+    """Everything sqlitebase logs at WARNING while this is attached."""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+        self.logger = logging.getLogger("netpath.sqlitebase")
+        self.handler = logging.Handler()
+        self.handler.emit = lambda record: self.messages.append(
+            record.getMessage())
+        self.logger.addHandler(self.handler)
+
+    def detach(self) -> None:
+        self.logger.removeHandler(self.handler)
+
+
 def timed_batches(db: FlowDatabase) -> list[float]:
     """Wrap _delete_batches' inner delete so every batch is timed."""
     held: list[float] = []
@@ -101,8 +117,8 @@ def test_1_age_and_row_cap() -> None:
           f"({left} rows, {removed} removed, {stale} past the cutoff)")
     check(db._conn.execute(
         "SELECT COUNT(*) AS n FROM flows WHERE id = 5").fetchone()["n"] == 1,
-        "the clock-skewed row inside the deleted id range survives: the ids "
-        "only chunk the sweep, each batch still filters on ts_end")
+        "the clock-skewed row among the oldest ids survives: the sweep is "
+        "driven by ts_end, never by where a row sits in the table")
     check(not db.last_prune_incomplete, "and the sweep reports itself finished")
 
     db.prune(1, 500, minute_days=90, rollup_days=90)
@@ -260,7 +276,11 @@ def test_6_the_size_cap_takes_raw_first() -> None:
     # A cap the raw table alone cannot meet: without the second stage the
     # base implementation would stop at TRIM_FLOOR and warn about the cap
     # for ever while the rollups held the space.
-    db.trim_to_size(int(before * 0.1), budget_s=60.0)
+    warnings = collected_warnings()
+    try:
+        db.trim_to_size(int(before * 0.1), budget_s=60.0)
+    finally:
+        warnings.detach()
     raw_after, _rollup_after, spans_after = counts(db)
     check(raw_after < raw_before and raw_after <= db.TRIM_FLOOR,
           f"stage one took the raw flows down to their floor "
@@ -277,6 +297,13 @@ def test_6_the_size_cap_takes_raw_first() -> None:
     check(floor is not None and floor > start,
           "the minute floor moved up with the buckets that went, so routing "
           "stops claiming history the trim deleted")
+    # The warning belongs to the whole trim, not to the base stage in the
+    # middle of it: a store whose rollups hold the space met its cap here,
+    # and an operator told otherwise on every sweep learns to ignore it.
+    over_cap = [text for text in warnings.messages if "above the" in text]
+    check(db.size_bytes() <= int(before * 0.1) and not over_cap,
+          f"the trim met the cap and said nothing about missing it "
+          f"({over_cap[:1]})")
     db.close()
 
 

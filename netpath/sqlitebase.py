@@ -502,6 +502,18 @@ class SqliteStore:
                            label=self.LABEL):
                 break
 
+    def _trim_more(self, max_bytes: int, budget_s: float | None) -> int:
+        """Whatever a subclass trims after the rows in TRIM_TABLE, returning
+        how many it removed.
+
+        A hook rather than an override of trim_to_size, so the over-cap
+        warning below is emitted once the whole job is done: flowdb's second
+        stage gives up rollup buckets after the raw flows have reached their
+        floor, and a store whose summaries hold the space used to be warned
+        about on every sweep from the middle of a trim that then succeeded.
+        """
+        return 0
+
     def trim_to_size(self, max_bytes: int, budget_s: float | None = None) -> int:
         """Delete the oldest rows until the store fits under the cap.
 
@@ -536,6 +548,7 @@ class SqliteStore:
             self._reclaim_until(deadline)
             if not deletable or time.monotonic() >= deadline:
                 break
+        removed += self._trim_more(max_bytes, budget_s)
         if self._trim_size() > max_bytes:
             log.warning("%s: %d bytes after removing %d rows, still above the "
                         "%d byte cap; continuing at the next maintenance pass",
