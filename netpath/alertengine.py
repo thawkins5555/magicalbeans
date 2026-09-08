@@ -1206,6 +1206,8 @@ class AlertEngine(Worker):
                 # numbers. The override's `enabled` flag above still applies
                 # -- see alertrules.PUBLISHED_THRESHOLD_RULES.
                 published_for = PUBLISHED_THRESHOLD_RULES.get(rule["key"] or "")
+                published_below = (published_for is not None
+                                   and comparison_of(rule) == "below")
                 for entity_kind, entity_id, if_index, metric in targets:
                     threshold, clear_threshold = base_threshold, base_clear
                     if published_for is not None:
@@ -1226,8 +1228,7 @@ class AlertEngine(Worker):
                         # A transceiver publishes a level, not a band; this
                         # app supplies the gap. See PUBLISHED_HYSTERESIS.
                         gap = PUBLISHED_HYSTERESIS.get(root, 0.0)
-                        clear_threshold = (threshold + gap
-                                           if comparison_of(rule) == "below"
+                        clear_threshold = (threshold + gap if published_below
                                            else threshold - gap)
                     eval_rule = rule
                     if (threshold != rule["threshold"]

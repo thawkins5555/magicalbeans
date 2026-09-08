@@ -18,6 +18,7 @@ import secrets
 import threading
 import time
 
+from .. import alertrules
 from ..alertrules import device_id_for
 from .. import alertsdb
 from ..alertsdb import is_window_active
@@ -5745,6 +5746,24 @@ def _validated_threshold_fields(kind: str, row, fields: dict, key: str = "") -> 
     continuous one does."""
     if kind not in _THRESHOLD_RULE_KINDS:
         return fields
+    rule_key = key or (row["key"] if row is not None and "key" in row.keys() else "")
+    if rule_key in alertrules.PUBLISHED_THRESHOLD_RULES:
+        # An optic power rule is judged against the levels the PORT publishes,
+        # so neither column means anything on it. Handled here rather than
+        # only in alertsdb so the "a threshold rule needs a threshold" refusal
+        # below never fires on a rule that is supposed to have none, and so
+        # the 400 an operator sees says which rule and why. alertsdb refuses
+        # a number again on its own account — this is the message, not the
+        # guard.
+        if fields.get("threshold") is not None \
+                or fields.get("clear_threshold") is not None:
+            raise ValueError(
+                f"'{rule_key}' is judged against the limits each port's own "
+                "optic publishes, so a threshold set here would be ignored. "
+                "There is nothing to set: a port alerts where its switch "
+                "publishes limits and nowhere else.")
+        fields.pop("threshold", None)
+        fields.pop("clear_threshold", None)
     # Only what this request is actually setting. A rule already stored is
     # not this request's to validate: reading a key the body never mentioned
     # back and refusing on it would make an unrelated edit — disabling a

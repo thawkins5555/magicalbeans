@@ -32,6 +32,7 @@ from netpath.nodepoll import NodePoller
 from netpath.nodesdb import NodesDatabase
 from netpath.snmptrapdb import SnmpTrapDatabase
 from netpath.syslogdb import SyslogDatabase
+from netpath.web import api
 
 TMPDIR = _paths.tmpdir("optic_published_thresholds_")
 
@@ -665,6 +666,33 @@ except ValueError as exc:
 check("...while a NUMBER on the same override is refused out loud rather "
       "than stored and silently ignored",
       raised is not None and "publishes" in str(raised), str(raised))
+
+# The rules route refuses it too, and -- the reason it has its own check
+# rather than leaning on alertsdb's -- a NULL threshold on one of these keys
+# must NOT trip the generic "a threshold rule needs a threshold" guard, which
+# every other threshold rule is right to have.
+rule = alerts.rule_by_key("sfp_rx_power_high")
+raised = None
+try:
+    api._validated_threshold_fields("threshold", rule, {"threshold": 1.0})
+except ValueError as exc:
+    raised = exc
+check("the rules route refuses a number on a published-threshold key, "
+      "naming the rule and why",
+      raised is not None and "sfp_rx_power_high" in str(raised), str(raised))
+check("...and an ordinary edit of the same rule passes straight through, "
+      "rather than being refused for having no threshold",
+      api._validated_threshold_fields(
+          "threshold", rule, {"notify": False, "threshold": None})
+      == {"notify": False})
+raised = None
+try:
+    api._validated_threshold_fields("threshold", alerts.rule_by_key("cpu_high"),
+                                    {"threshold": None})
+except ValueError as exc:
+    raised = exc
+check("...while a rule that is NOT published-threshold still needs one",
+      raised is not None and "needs a threshold" in str(raised), str(raised))
 nodes.close()
 
 print()
