@@ -44,6 +44,16 @@
   // rendering its header over an empty tbody with no word said at all).
   const NO_FLOWS_TEXT = 'No flows match this window and filters. Widen the ' +
     'time window or clear a filter.';
+  // The same word App.loading() puts in every other pane still waiting on a
+  // fetch; here it also has to reach the chart, which is an SVG.
+  const LOADING_TEXT = 'Loading…';
+  // A fetch that never answered is not an empty window, so NO_FLOWS_TEXT here
+  // would put words in a server's mouth: a 400 from a filter it refuses would
+  // read as "the window is quiet". What broke is the connection status's
+  // sentence to tell; all these three panes owe an operator is to stop saying
+  // "Loading…" for a load that has already stopped.
+  const FAILED_TEXT = 'Could not load flows for this window. The next refresh '
+    + 'will try again.';
 
   const view = {
     t0: Date.now() / 1000 - 3600,
@@ -55,7 +65,17 @@
     drag: null,
     windowTimer: null,
     request: 0,
+    abort: null,
+    loading: false,
+    // Only ever set out of a blanked (loading) pane, so a failure never has
+    // to decide whether the data underneath it is still worth showing --
+    // showLoading has already taken that decision.
+    failed: false,
   };
+
+  // Which of the three sentences a pane with nothing to draw is telling.
+  const emptyMessage = () =>
+    (view.loading ? LOADING_TEXT : view.failed ? FAILED_TEXT : NO_FLOWS_TEXT);
 
   const escape = App.escapeHtml;
 
@@ -85,12 +105,47 @@
       `${App.stamp(view.t0, span)} – ${App.stamp(view.t1, span)}`;
   }
 
-  /* `defer` collapses a burst of window changes into one fetch. The wheel
-     fires several events per zoom gesture, and each one used to launch a full
-     overview + records pair over an ever wider window, so zooming out queued
-     work up faster than the server could finish it. The window itself still
-     moves on every event, so the label tracks the gesture live. */
-  function setWindow(t0, t1, follow, defer) {
+  /* Long enough to swallow a gesture, short enough that one click on Reset
+     still reads as an immediate answer — the busy line app.css draws at
+     400 ms, and the Loading state below, carry the rest of the wait. */
+  const REFETCH_MS = 250;
+
+  /* The window an operator has just left is not worth finishing. Its two
+     queries hold the same flow-database lock the collector writes flows
+     through, and the token check in refresh() only hides a stale answer in
+     the browser — the server had already computed it. The token is bumped
+     here as well as aborted, for the pair that answered a moment before. */
+  function dropInFlight() {
+    view.request += 1;
+    if (view.abort) { view.abort.abort(); view.abort = null; }
+    if (view.windowTimer) clearTimeout(view.windowTimer);
+    view.windowTimer = null;
+  }
+
+  /* Every change of view is collapsed into one fetch a quarter-second after
+     the last of them — not just the wheel's, which was the only caller that
+     ever asked. The wheel fires several events per zoom gesture, but so does
+     stepping the range dropdown from 15m to 30d, and holding a zoom or pan
+     button: each step used to launch a full overview + records pair over an
+     ever wider window, so the dozen nobody wanted queued on the flow
+     database ahead of the one they did. The window itself still moves on
+     every event, so the label tracks the gesture live. */
+  function requestFetch(windowChanged) {
+    dropInFlight();
+    view.windowTimer = setTimeout(() => {
+      view.windowTimer = null;
+      // Only once the burst has settled and this fetch is really going:
+      // blanking the chart on every wheel event would take away the picture
+      // the gesture is aiming with.
+      if (windowChanged) showLoading();
+      App.refreshNow('netflow');
+    }, REFETCH_MS);
+  }
+
+  // The window, with no opinion about fetching it: init() sizes the first
+  // window this way because activating the tab issues its first fetch a
+  // moment later anyway, and asking here as well painted every open twice.
+  function applyWindow(t0, t1, follow) {
     if (t1 - t0 < 60) t1 = t0 + 60;
     view.t0 = t0; view.t1 = t1;
     if (follow !== undefined) {
@@ -98,18 +153,11 @@
       App.el('nf-follow').checked = follow;
     }
     showWindow();
-    if (view.windowTimer) clearTimeout(view.windowTimer);
-    view.windowTimer = null;
-    if (!defer) {
-      // A window change is a direct request, so fetch now rather than waiting
-      // out the refresh interval.
-      App.refreshNow('netflow');
-      return;
-    }
-    view.windowTimer = setTimeout(() => {
-      view.windowTimer = null;
-      App.refreshNow('netflow');
-    }, 250);
+  }
+
+  function setWindow(t0, t1, follow) {
+    applyWindow(t0, t1, follow);
+    requestFetch(true);
   }
 
   function zoom(factor) {
@@ -126,10 +174,56 @@
     setWindow(view.t0 + shift, view.t1 + shift, false);
   }
 
-  function resetWindow() {
+  // The span nf-range names, ending now.
+  function rangeWindow() {
     const seconds = Number(App.el('nf-range').value) || 3600;
     const now = Date.now() / 1000;
-    setWindow(now - seconds, now, true);
+    return [now - seconds, now];
+  }
+
+  function resetWindow() {
+    const [t0, t1] = rangeWindow();
+    setWindow(t0, t1, true);
+  }
+
+  /* A window change asks a different question, so the answer to the previous
+     one stops being shown while the new one is fetched: a chart and a record
+     table of the minutes an operator has just left read as the answer, and
+     carry nothing that says otherwise. Scoped to the three views that are
+     actually changing rather than modalling the page, and deliberately NOT
+     the poll tick — re-reading the same window every two seconds must not
+     blank the page it is refreshing. */
+  function showLoading() {
+    view.loading = true;
+    view.failed = false;
+    App.el('nf-totals').textContent = LOADING_TEXT;
+    drawChart();
+    drawBars();
+    drawTable(view.records);
+  }
+
+  /* showLoading() puts "Loading…" in the three panes and only a refresh that
+     COMPLETED ever took it back out, so a fetch that rejected -- a 400 from a
+     filter the server refuses, an outage -- left the page reading "Loading…"
+     for as long as the operator stayed on it. The error still leaves here:
+     the connection status and the console report are runRefresh's job, and
+     swallowing it would trade a stuck pane for a silent failure.
+
+     A superseded abort is not a failure. The newer fetch it was abandoned
+     for is still loading, and its answer is the one to show.
+
+     Only the loading claim is retracted, never data. A poll tick that failed
+     under a window already on screen leaves that window alone: it is still
+     the answer to the question being asked, and blanking a working display
+     over one missed poll is worse than the bug this fixes. */
+  function loadFailed(error) {
+    if ((error && error.superseded) || !view.loading) return;
+    view.loading = false;
+    view.failed = true;
+    App.el('nf-totals').textContent = FAILED_TEXT;
+    drawChart();
+    drawBars();
+    drawTable(view.records);
   }
 
   function filters() {
@@ -214,7 +308,8 @@
     // every refresh and on every frame of a divider drag, tearing the SVG
     // down and rebuilding one hit rectangle with three listeners per
     // bucket each time, whether or not anything was different.
-    const signature = `${width}x${height}:${JSON.stringify(view.data)}`;
+    const signature = `${width}x${height}:`
+      + (view.loading || view.failed ? emptyMessage() : JSON.stringify(view.data));
     if (svg.dataset.signature === signature) return;
     svg.dataset.signature = signature;
     svg.innerHTML = '';
@@ -227,8 +322,9 @@
       h: Math.max(height - PAD.top - PAD.bottom - legendH, 10),
     };
 
-    if (!data || !data.times.length || !data.series.length) {
-      App.emptyText(svg, width, height, NO_FLOWS_TEXT);
+    if (view.loading || view.failed || !data || !data.times.length
+        || !data.series.length) {
+      App.emptyText(svg, width, height, emptyMessage());
       showFocusTip(container);
       return;
     }
@@ -371,7 +467,7 @@
       const fraction = Math.min(Math.max((x - plot.x) / plot.w, 0), 1);
       const anchor = view.t0 + fraction * (view.t1 - view.t0);
       const [start, end] = App.wheelWindow(event, view.t0, view.t1, anchor);
-      setWindow(start, end, false, true);
+      setWindow(start, end, false);
     };
     showFocusTip(container);
   }
@@ -415,9 +511,10 @@
   function drawBars() {
     const wrap = App.el('nf-bars');
     wrap.innerHTML = '';
-    const rows = view.data ? view.data.top : [];
+    if (view.loading) { wrap.innerHTML = App.loading(); return; }
+    const rows = view.data && !view.failed ? view.data.top : [];
     if (!rows.length) {
-      wrap.innerHTML = `<p class="empty">${NO_FLOWS_TEXT}</p>`;
+      wrap.innerHTML = `<p class="empty">${emptyMessage()}</p>`;
       return;
     }
     const dimension = App.el('nf-dimension').value;
@@ -574,13 +671,16 @@
     COLUMNS, (App.state.flowSettings || {}).table_columns);
 
   function drawTable(records) {
-    view.records = records;
+    // While loading these records belong to the window being left, so they
+    // are neither shown nor remembered as the answer to the one being asked.
+    if (!view.loading && !view.failed) view.records = records;
     const columns = recordColumns();
     const table = App.grid(App.el('nf-table'),
                            { name: 'nf-records', caption: 'NetFlow records',
                              columns, sort, onSort });
     const body = document.createElement('tbody');
-    const rows = App.sortRows(records, sort.key, sort.descending, columns);
+    const rows = view.loading || view.failed
+      ? [] : App.sortRows(records, sort.key, sort.descending, columns);
     App.drawRows(body, rows, columns, (tr, record) => {
       const dst = record.dst_name || record.dst_ip || '';
       // Flow-to-path correlation: jump straight to the NetPath route that
@@ -638,7 +738,7 @@
         App.tooltip(text, { clientX: box.left + box.width / 2, clientY: box.bottom });
       });
       tr.addEventListener('blur', App.hideTooltip);
-    }, NO_FLOWS_TEXT);
+    }, emptyMessage());
     table.appendChild(body);
     App.wireRowKeyboard(body);
   }
@@ -833,6 +933,11 @@
   async function refresh() {
     if (App.state.tab !== 'netflow') return;
     drawStatus();
+    /* A window change is still settling. The poll tick can see the window
+       half way through the burst — the dropdown is on 6h on its way to 30d —
+       and fetching that one is exactly the waste requestFetch() exists to
+       remove; the fetch it has already scheduled is the one worth making. */
+    if (view.windowTimer) return;
 
     if (view.follow) {
       const span = view.t1 - view.t0;
@@ -844,15 +949,38 @@
     // A wide window answers slower than the narrow one that replaced it, so
     // without this guard a stale response repaints over the newer view.
     const token = (view.request += 1);
-    const data = await App.get('/api/netflow/overview', {
-      t0: view.t0, t1: view.t1, dimension: f.dimension, src: f.src, dst: f.dst,
-      port: f.port, protocol: f.protocol, exporter: f.exporter,
-    });
-    const records = await App.get('/api/netflow/records', {
-      t0: view.t0, t1: view.t1, src: f.src, dst: f.dst, port: f.port,
-      protocol: f.protocol, exporter: f.exporter, order: App.el('nf-order').value,
-    });
+    // One controller for the whole generation, so the pair can be abandoned
+    // together: call()'s own in-flight map is keyed on the full URL, and a
+    // window that has changed is by definition a different URL, so it only
+    // ever helps a page polling the same address.
+    if (view.abort) view.abort.abort();
+    const abort = new AbortController();
+    view.abort = abort;
+    const options = { signal: abort.signal };
+    // Independent questions, so asked together: in series every window
+    // change cost the sum of the two round trips, in parallel the slower.
+    let data;
+    let records;
+    try {
+      [data, records] = await Promise.all([
+        App.get('/api/netflow/overview', {
+          t0: view.t0, t1: view.t1, dimension: f.dimension, src: f.src, dst: f.dst,
+          port: f.port, protocol: f.protocol, exporter: f.exporter,
+        }, options),
+        App.get('/api/netflow/records', {
+          t0: view.t0, t1: view.t1, src: f.src, dst: f.dst, port: f.port,
+          protocol: f.protocol, exporter: f.exporter, order: App.el('nf-order').value,
+        }, options),
+      ]);
+    } catch (error) {
+      // Same stale guard as the token check below: an older generation's
+      // failure must not repaint over the newer one now in flight.
+      if (token === view.request) loadFailed(error);
+      throw error;
+    }
     if (token !== view.request) return;
+    view.loading = false;
+    view.failed = false;
     view.data = data;
 
     const totals = view.data.totals;
@@ -976,7 +1104,10 @@
         packets: `Top ${RECORD_LIMIT} by packets`,
         time: `Most recent ${RECORD_LIMIT}` }[option.value] || option.textContent;
     }
-    App.el('nf-order').onchange = () => App.refreshNow('netflow');
+    // Through the same collapse as a window change, minus its Loading state:
+    // re-ordering asks for different records, not for a different window, so
+    // the chart above them is still the answer to the question on screen.
+    App.el('nf-order').onchange = () => requestFetch(false);
     // nf-range is deliberately NOT in this list: its change handler is
     // resetWindow (above), which re-sizes the window before refreshing; a
     // plain refresh here would have overwritten it and left the chart on
@@ -999,12 +1130,11 @@
     App.wireToggle('nf-toggle', 'collector', '/api/netflow/collector', refresh);
     App.onRelayout('netflow', drawChart);
 
-    // Restored before resetWindow(), which reads the range straight off
-    // nf-range to size the first window — after it, the window would be
-    // built from the markup default and only correct itself on the next
-    // change.
+    // Restored before the window is sized, which reads the range straight
+    // off nf-range — after it, the window would be built from the markup
+    // default and only correct itself on the next change.
     App.restoreControls('netflow', CONTROLS);
-    resetWindow();
+    applyWindow(...rangeWindow(), true);
   }
 
   App.pages.netflow = { init, refresh, fastTick: drawStatus };

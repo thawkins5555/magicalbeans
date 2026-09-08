@@ -74,8 +74,24 @@
     const stopped = fleet.running ? ''
       : '<p class="warn-text">The poller is stopped — none of these figures '
         + 'is being updated.</p>';
+    // "14 down" is the number a shift acts on, so the tile names them rather
+    // than making the operator open Nodes to find out which fourteen. Capped
+    // server-side; the remainder is a link to the full filtered list.
+    const down = fleet.down || [];
+    const downRows = down.length
+      ? '<p class="hint">Down now:</p><div class="dash-sev-list">'
+        + down.map((row) =>
+            `<a class="dash-row" href="#/nodes/device/${encodeURIComponent(row.device_id)}">
+               <span class="dash-row-name">${escape(row.name || row.ip || '—')}</span>
+               <span class="dash-row-value">${escape(row.ip || '')}</span></a>`).join('')
+        + '</div>'
+        + (fleet.down_more
+           ? `<p class="hint"><a href="#/nodes?status=down">and ${
+                Number(fleet.down_more).toLocaleString()} more</a></p>`
+           : '')
+      : '';
     return tile(`Fleet · ${total.toLocaleString()} device(s)`,
-                `<div class="figures">${figures}</div>${stopped}${poolLine}`,
+                `<div class="figures">${figures}</div>${downRows}${stopped}${poolLine}`,
                 { wide: true });
   }
 

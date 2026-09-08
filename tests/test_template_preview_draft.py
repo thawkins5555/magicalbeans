@@ -8,6 +8,7 @@ of the three fields the caller does not send a draft for.
 import http.client
 import json
 import os
+import re
 
 import _paths  # noqa: F401
 
@@ -92,8 +93,14 @@ try:
     check("the draft subject rendered, not the stored one",
           "DRAFT SUBJECT" in draft_payload["subject"]
           and draft_payload["subject"] != payload["subject"], draft_payload)
+    # Compared with the sample's timestamp masked: the two previews are
+    # rendered by two requests, and the sample alert is stamped with the
+    # clock at render time, so a pair that straddles a second boundary
+    # differed by one digit and failed a test that is not about the clock.
+    _STAMP = re.compile(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [-+]\d{4}")
     check("body unaffected — still the stored template's rendering",
-          draft_payload["body"] == payload["body"], (draft_payload, payload))
+          _STAMP.sub("", draft_payload["body"]) == _STAMP.sub("", payload["body"]),
+          (draft_payload, payload))
 
     print("full draft override: subject, body and is_html all come from the request")
     status, payload = call(

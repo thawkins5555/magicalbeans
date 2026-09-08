@@ -308,7 +308,7 @@ the application already had, refreshed on the interval in
 
 | Tile | Shows |
 | --- | --- |
-| Fleet | Total devices, and how many are up, down, unknown or failing authentication, with the poll pool's busy and queued worker counts beneath |
+| Fleet | Total devices, and how many are up, down, unknown or failing authentication; underneath, the down devices themselves by name (up to ten, with "and N more" linking to the rest) and the poll pool's busy and queued worker counts |
 | Open alerts | The count by severity, coloured by the worst severity open rather than by the total, so one severity-1 outage is never hidden behind forty notices |
 | Workers | Every background process, by the noun its own tab uses — the Nodes poller, the alert engine, the NetFlow collector, the SNMP trap receiver, the Syslog collector, the IPAM worker, the Wireless poller, the ConfigRX worker: running or not, how much each has taken in, and every one of its counters that is not zero — dropped, dropped by the kernel, throttled, failed or unverified authentication, over the varbind limit, TCP connections refused, errors |
 | Storage headroom | Each database against its own size cap |
@@ -409,6 +409,20 @@ own subtabs.
   metric key. A multi-lane optic reports the dimmest lane that is lit for
   light levels and the most extreme reading for the rest. The device-wide
   `temp_optic_c` is unchanged.
+- **A Cisco switch's own published optic limits are learned too, from
+  5.3.0.** Alongside the readings, the poller reads the alarm and warning
+  levels each transceiver publishes about itself — a low and high alarm
+  and a low and high warning for each DOM reading — once an hour rather
+  than every five minutes, because those levels change only when somebody
+  changes the optic. They are stored per port and per reading, they are
+  shown in the DOM tables' **Limits** column, and they are what the
+  optical power alert rules fire on (see Alerts). Only switches that
+  actually have port-mapped optics are asked, and a walk that is cut short
+  keeps whatever was already learned rather than reading as "this device
+  publishes nothing" — which would switch optical power alerting off for
+  every port on it. A level that contradicts itself, or a dBm figure
+  outside the range every real transceiver lives in, is discarded for that
+  reading with a line in the Nodes event log.
 - **An optic with no light in it is not an optic in trouble.** A
   transceiver whose port is powered down, or that has no fiber in it,
   reports the bottom of its own scale — −40 dBm — and no low-power alert
@@ -533,7 +547,10 @@ own subtabs.
 - **A reboot is detected** by comparing a device's reported `sysUpTime`
   against what wall-clock time elapsed since the last poll would predict
   — well outside a clock-skew grace band, and not explained by the
-  TimeTicks counter's own ~497-day wraparound.
+  TimeTicks counter's own ~497-day wraparound. Both uptimes are stated in
+  hours and days, not in the raw hundredths of a second SNMP reports them
+  in, and the reboot email fills in its own "previous/current reported
+  uptime" lines from them.
 - **Test** checks ping and SNMP against whatever is currently typed in
   the add/edit form, before it is saved, the same idiom IPAM's DHCP
   server test already uses.
@@ -886,7 +903,12 @@ worth), and — on Cisco gear — CISCO-ENVMON-MIB's own power-supply, fan and
 temperature status for hardware old enough to predate ENTITY-SENSOR-MIB.
 DOM / SFP SENSORS is the same device-wide walk's optic readings, grouped by
 port, so a transceiver problem is visible without opening every interface
-in turn; the per-interface dialog's own DOM section (below) is unchanged.
+in turn; the per-interface dialog's own DOM section (below) shows the same
+rows for one port. From 5.3.0 both carry a **Limits** column — the low
+alarm, low warning, high warning and high alarm this port's own transceiver
+publishes, with an em-dash for each band it does not — and say underneath
+when a light-level reading has no published band at all, because that is
+exactly when optical power alerting is off for that port.
 Both walk only while the dialog is open, the same as the OID browser and
 MAC table, and a device that answers nothing for a section shows that
 plainly rather than an error — pointing at the Nodes event log, which from
@@ -1064,7 +1086,8 @@ temperature — read live over SNMP from devices that expose them via the
 standard ENTITY-SENSOR-MIB or, on Cisco gear, CISCO-ENTITY-SENSOR-MIB
 (values, units and scaling exactly as the device reports them, optical
 power in dBm; devices with neither simply show "no DOM/sensor data", and
-say that the Nodes event log names the tables that were tried), and the
+say that the Nodes event log names the tables that were tried), each
+alongside the alarm and warning levels this optic publishes for it, and the
 MAC addresses currently learned on that port, with the VLAN each
 was learned in where the switch reports one — read live over SNMP from
 three forwarding tables in turn: the VLAN-aware **Q-BRIDGE-MIB**
@@ -1180,6 +1203,17 @@ alerts and optionally emailing about them.
 
 ### Working the alert list
 
+- **Severity 1 and 2 rows are highlighted, and flash until somebody picks
+  them up.** Severity is the syslog scale and counts down, so this covers
+  severity 0 (emergency) as well — anything at or below 2, the same floor
+  the desktop notification uses. The row carries the colour rather than
+  just its Sev cell, so it is findable across a room on a wall display.
+  The flashing is a slow breathe, about one cycle every three seconds, far
+  under the three-per-second guideline for photosensitive seizures; it
+  stops the moment the alert is **acknowledged**, which leaves the
+  highlight in place but still. Motion therefore means "nobody has picked
+  this up yet" rather than constant noise. A viewer whose system asks for
+  reduced motion gets the highlight without the movement.
 - **Alerts can be acknowledged or resolved individually or in bulk.**
   Every row carries a **checkbox** in its first column: tick the rows you
   want, or use **Select all**. A plain click still opens the detail pane,
@@ -1350,16 +1384,54 @@ alerts and optionally emailing about them.
   ambient/chassis/optic temperature high plus humidity high — three
   separate temperature rules rather than one, because a comms room, a
   switch chassis and an SFP's DOM reading have different normal ranges
-  entirely (see Nodes → Devices and polling). Three more, new in 5.1.0,
-  read the per-port optic DOM readings: **Optic receive power low**
-  (−22 dBm, clears at −20), **Optic transmit power low** (−12 dBm, clears
-  at −10) and **Optic temperature high (per port)** (70 °C, clears at 65).
-  Receive power is the one that predicts a failure rather than reporting
-  one: a link degrades for weeks as a connector gets dirty, and the
-  received level falls long before the port goes down. The older
+  entirely (see Nodes → Devices and polling). Nine more read the per-port
+  optic DOM readings: **Optic temperature high (per port)** (70 °C, clears
+  at 65) and, from 5.3.0, eight optical power rules that carry no
+  threshold at all — see *Optical power alerts come from the optic itself*
+  below. Receive power is the one that predicts a failure rather than
+  reporting one: a link degrades for weeks as a connector gets dirty, and
+  the received level falls long before the port goes down. The older
   device-wide **Optic temperature high** stays exactly as it is — it reads
   the hottest optic in the chassis, and an operator who has tuned it keeps
   their number.
+- **Optical power alerts come from the optic itself, from 5.3.0.** The two
+  optic power rules used to carry one configurable number each for the
+  whole fleet — −22 dBm receive, −12 dBm transmit — and that number was
+  wrong for most of the transceivers it judged: −22 dBm is comfortably
+  inside a long-reach part's working range and already a dead link for a
+  short-reach one. A light level that means "failing" is a property of the
+  part, not of the site. The poller now reads the alarm and warning levels
+  each transceiver publishes about itself (Cisco's
+  `entSensorThresholdTable`, once an hour per switch that has optics) and
+  each port is judged against its own. There are eight rules — receive and
+  transmit, low and high, warning and alarm — because the transceiver
+  publishes four levels for each direction; the alarm half is severity
+  *critical* and the warning half severity *warning*, and a port past both
+  raises one alert, not two.
+
+  What this costs, and it was chosen knowing it: **a port whose switch
+  publishes no levels raises no optical power alert at all.** There is no
+  global fallback, and a per-device threshold override is not consulted
+  for these eight rules either — a wrong optic threshold is either an
+  alert storm or a dead link nobody was told about, and neither is better
+  than silence you can see. This release reads Cisco's table only, so ports
+  on other vendors raise no optical power alerts. The DOM tables in the
+  device and interface dialogs show each port's published limits in a
+  **Limits** column, and say in words underneath when a light-level
+  reading has none — that is where an operator finds out, per port. The
+  rule editor shows "Threshold — from the optic" in place of the number
+  boxes, and both the editor and the per-device override refuse a number
+  on these keys rather than storing one the engine would ignore. Turning a
+  rule off for one switch still works: that is a statement about the
+  switch, not about physics.
+
+  Two limits worth knowing. A multi-lane optic (QSFP) records the dimmest
+  lit lane, so the four *high* rules under-report a single hot lane on
+  one; the low side, which is the half that predicts failure, is
+  unaffected. And a warning rule spends its one rollup slot on its own
+  alarm, so it is not additionally suppressed by an outage the way the
+  alarm half is — the same trade **Chassis temperature high** already
+  makes behind **Chassis temperature critical**.
 - **An interface threshold names the port, from 5.1.0.** The six
   interface rules (inbound/outbound utilization, error rate, discard
   rate) used to read the device-level *busiest port* value, so the alert

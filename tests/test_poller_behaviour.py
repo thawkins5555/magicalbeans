@@ -15,14 +15,14 @@ from _paths import tmpdir
 
 from netpath import nodeoids
 from netpath.nodesdb import NodesDatabase
-from netpath.nodepoll import NodePoller, counter_rate
+from netpath.nodepoll import NodePoller, counter_rate, detect_reboot
 import netpath.nodepoll as nodepoll_mod
 from netpath.snmppoll import decode_response
 from netpath.trapdecode import (
     T_SEQUENCE, T_TIMETICKS, T_COUNTER32, T_COUNTER64, T_GAUGE32,
     T_NO_SUCH_OBJECT, T_NO_SUCH_INSTANCE, T_END_OF_MIB_VIEW,
     PDU_GET, PDU_GETNEXT, PDU_GETBULK, PDU_RESPONSE,
-    enc_int, enc_octets, enc_unsigned, enc_varbind, _tlv,
+    enc_int, enc_octets, enc_unsigned, enc_varbind, format_ticks, _tlv,
 )
 from netpath.wirelessdb import WirelessDatabase
 from netpath.fortipoll import WirelessPoller
@@ -618,8 +618,91 @@ def test_fortipoll_walk_terminates_on_stuck_oid():
     db.close()
 
 
+def test_format_ticks_divides_by_a_hundred():
+    """The sibling every other uptime consumer already goes through, and now
+    the reboot note's too. Pinned directly because "hundredths of a second"
+    is exactly the step this product got wrong once: 15000 TimeTicks is two
+    and a half minutes, not four hours."""
+    for ticks, expected in ((15_000, "00:02:30.00"), (100, "00:00:01.00"),
+                            (8_640_000, "1d 00:00:00"), (0, "00:00:00.00")):
+        check(format_ticks(ticks) == expected,
+              f"format_ticks({ticks}) is {expected} (got {format_ticks(ticks)})")
+
+
+def test_reboot_note_is_human_units():
+    """detect_reboot's note becomes the alert's message verbatim
+    (alertengine._drain_device_events), and it used to print sysUpTime raw:
+    a device up two and a half minutes reads 15000, so the alert said
+    "...to 15000 hundredths of a second after 300s". Every other uptime
+    consumer in the product divides by 100 first; this one now does too,
+    and reboot_uptimes reads the same two figures back out for the
+    device_rebooted template."""
+    previous_ticks, current_ticks = 1_036_800_000, 15_000    # 120 days, 2.5 min
+    rebooted, note = detect_reboot(current_ticks, 1300.0, previous_ticks, 1000.0)
+    check(rebooted, "the reset is still detected")
+    check(str(current_ticks) not in note and str(previous_ticks) not in note,
+          f"neither raw tick count is printed at a human ({note!r})")
+    check("hundredths" not in note, f"the note no longer says 'hundredths' ({note!r})")
+    check(format_ticks(previous_ticks) in note and format_ticks(current_ticks) in note,
+          f"both uptimes render through trapdecode.format_ticks ({note!r})")
+    check("5 m 00 s" in note,
+          f"the gap between readings is a duration, not a bare '300s' ({note!r})")
+
+    previous, current = nodepoll_mod.reboot_uptimes(note)
+    check(previous == format_ticks(previous_ticks)
+          and current == format_ticks(current_ticks),
+          f"the note round-trips back to its two uptimes ({previous!r}, {current!r})")
+    check(nodepoll_mod.reboot_uptimes("something else entirely") == ("", ""),
+          "a detail this did not write yields nothing rather than a wrong claim")
+
+
+def test_reboot_uptimes_refuses_the_legacy_sentence():
+    """The 5.2 poller wrote the raw-tick sentence, and its rows are still
+    drained by the 5.3 engine after a restart (the source cursor survives one).
+    A loose `(.+?)` matched that sentence too and put "1036800000" in the
+    reboot email's "Previous reported uptime" line -- the raw tick count this
+    release exists to stop printing. Only what format_ticks can emit parses."""
+    legacy = ("uptime dropped from 1036800000 to 15000 hundredths of a second "
+              "after 300s without a reading")
+    check(nodepoll_mod.reboot_uptimes(legacy) == ("", ""),
+          f"the pre-5.3 sentence yields nothing, not its raw tick counts "
+          f"({nodepoll_mod.reboot_uptimes(legacy)})")
+
+    # Every shape format_ticks can emit, both sides: the sub-day HH:MM:SS.cc
+    # form and the day form, the latter with a day count past one digit.
+    for previous_ticks, current_ticks in ((1_036_800_000, 15_000),
+                                          (4_294_000_000, 8_640_000),
+                                          (360_000, 100),
+                                          (8_640_000, 359_999)):
+        rebooted, note = detect_reboot(current_ticks, 1300.0,
+                                       previous_ticks, 1000.0)
+        check(rebooted, f"the reset from {previous_ticks} is detected")
+        check(nodepoll_mod.reboot_uptimes(note)
+              == (format_ticks(previous_ticks), format_ticks(current_ticks)),
+              f"{note!r} round-trips to its two uptimes "
+              f"(got {nodepoll_mod.reboot_uptimes(note)})")
+
+
+def test_reboot_note_has_no_empty_duration():
+    """duration_text renders a sub-second gap as "", which pasted into the
+    sentence unguarded read "after  without a reading" -- a double space and
+    a claim with nothing in it."""
+    rebooted, note = detect_reboot(100, 1000.4, 1_036_800_000, 1000.0)
+    check(rebooted, "a reset across a sub-second gap is still detected")
+    check("  " not in note and "after  without" not in note,
+          f"no empty duration is pasted into the note ({note!r})")
+    check(nodepoll_mod.reboot_uptimes(note)
+          == (format_ticks(1_036_800_000), format_ticks(100)),
+          f"the shortened note still round-trips "
+          f"({nodepoll_mod.reboot_uptimes(note)})")
+
+
 def main():
     test_counter_rate_width_matters()
+    test_format_ticks_divides_by_a_hundred()
+    test_reboot_note_is_human_units()
+    test_reboot_uptimes_refuses_the_legacy_sentence()
+    test_reboot_note_has_no_empty_duration()
     test_independent_octet_widths()
     test_utilization_clamped_at_sentinel()
     test_link_down_recorded_after_reboot_when_identity_unchanged()

@@ -1298,6 +1298,55 @@
   function domRowAttrs(s) {
     return darkOptic(s) ? ` title="${escape(`${s.value} ${s.unit}`)}"` : '';
   }
+  // A transceiver publishes bands for its temperature, bias and voltage too,
+  // and the Limits column shows every one of them — but only the two dBm
+  // rules read what a port publishes (alertrules.PUBLISHED_THRESHOLD_RULES).
+  // sfp_temp_high still alerts at the figure on the Alerts rules page, so a
+  // published "70 / 75" beside a temperature row is a fact about the optic
+  // and not the number that would raise an alert on it.
+  function alertedOnItsOwnBand(s) { return s.unit === 'dBm'; }
+  // 5.3.0: the alarm/warning band this port's own transceiver publishes. For
+  // a light level that IS what the rule alerts against — there is no
+  // configurable number behind those two any more, so this is the only place
+  // an operator can see what a port is judged by; for every other reading the
+  // title says it is reference only. An em-dash per band the device does not
+  // publish; the whole cell is one when it publishes none.
+  function domLimitsCell(s) {
+    const l = s.limits;
+    if (!l) return '<td>\u2014</td>';
+    const band = (v) => (typeof v === 'number' ? `${v}` : '\u2014');
+    const source = `published by ${s.limits_source || 'the optic'}`;
+    return `<td title="${escape(alertedOnItsOwnBand(s) ? source
+      : `${source} — reference only, not what this reading is alerted on`)}">` +
+      `${band(l.low_alarm)} / ${band(l.low_warn)} / ` +
+      `${band(l.high_warn)} / ${band(l.high_alarm)}</td>`;
+  }
+  // The sentences under a DOM table: one when a light-level row has no
+  // published band, because silence there would read as "nothing is wrong
+  // with this port"; one when a row that is NOT alerted on its own band shows
+  // one anyway, because a figure under a Limits heading reads as the figure
+  // that row is judged by unless the page says otherwise.
+  function domLimitsHint(rows) {
+    const all = rows || [];
+    const unpublished = all.filter((s) => alertedOnItsOwnBand(s) && !s.limits);
+    const reference = all.filter((s) => !alertedOnItsOwnBand(s) && s.limits);
+    let hint = '';
+    if (unpublished.length) {
+      hint += '<p class="hint">This device publishes no optical power ' +
+        'thresholds for ' + (unpublished.length === 1 ? 'this optic'
+          : `${unpublished.length} of these readings`) +
+        ', so optical power alerts are off for it — SappiWhere alerts on the ' +
+        'levels a transceiver publishes about itself and never on a global ' +
+        'figure, which would be wrong for most parts.</p>';
+    }
+    if (reference.length) {
+      hint += '<p class="hint">Only the optical power rows are alerted on ' +
+        'the limits shown here. The temperature, bias and voltage bands a ' +
+        'transceiver publishes are listed for reference; those readings are ' +
+        'alerted on the thresholds set under Alerts → Rules.</p>';
+    }
+    return hint;
+  }
 
   const IFACE_COLUMNS = [
     { key: 'if_index', label: '#', width: 55, numeric: true, on: true,
@@ -1656,11 +1705,13 @@
         }
         holder.innerHTML = '<table><caption class="sr-only">DOM and SFP sensors by port</caption>' +
           '<thead><tr><th scope="col">Port</th><th scope="col">Sensor</th>' +
-          '<th scope="col">Value</th><th scope="col">Status</th></tr></thead><tbody>' +
+          '<th scope="col">Value</th><th scope="col">Limits</th>' +
+          '<th scope="col">Status</th></tr></thead><tbody>' +
           rows.map((s) =>
             `<tr${domRowAttrs(s)}><td>${escape(s.if_name || `port ${s.if_index}`)}</td>` +
-            `<td>${escape(s.label)}</td>${domValueCell(s)}` +
-            `<td>${escape(s.status)}</td></tr>`).join('') + '</tbody></table>';
+            `<td>${escape(s.label)}</td>${domValueCell(s)}${domLimitsCell(s)}` +
+            `<td>${escape(s.status)}</td></tr>`).join('') + '</tbody></table>' +
+          domLimitsHint(rows);
         dialogOptics = new Set(rows.map((s) => s.if_index));
         paintDialogIfaces();
       })
@@ -2545,10 +2596,11 @@
           dom.innerHTML = App.emptyState('No DOM/sensor data available from this device for this port — the Nodes event log names the tables tried.');
           return;
         }
-        dom.innerHTML = '<table><caption class="sr-only">Optics and environment sensors</caption><tr><th scope="col">Sensor</th><th scope="col">Value</th><th scope="col">Status</th></tr>' +
+        dom.innerHTML = '<table><caption class="sr-only">Optics and environment sensors</caption><tr><th scope="col">Sensor</th><th scope="col">Value</th><th scope="col">Limits</th><th scope="col">Status</th></tr>' +
           r.sensors.map((s) =>
             `<tr${domRowAttrs(s)}><td>${escape(s.label)}</td>${domValueCell(s)}` +
-            `<td>${escape(s.status)}</td></tr>`).join('') + '</table>';
+            `${domLimitsCell(s)}<td>${escape(s.status)}</td></tr>`).join('') + '</table>' +
+          domLimitsHint(r.sensors);
       })
       .catch(() => {
         const dom = box.querySelector('#ifd-dom');

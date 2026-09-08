@@ -335,6 +335,12 @@ def evaluate_threshold(rule, current_value: float | None, streak: int,
         # port is interface_down's to report, so this closes what is open
         # — including every alert a 5.1 build raised on a dark optic, which
         # is open at upgrade time and would otherwise be permanent.
+        #
+        # Deliberately still 'below'-only after 5.3.0 added four HIGH optic
+        # power rules. -40 dBm is the bottom of the scale: it cannot be at
+        # or above any published high threshold, so breaches() never opened
+        # a high alert on it and there is never one here to close. Widening
+        # the condition would add a branch that can only ever be dead.
         return "clear"
     if _clears(rule, current_value):
         return "clear"
@@ -448,9 +454,94 @@ ROLLED_UP_BY = {
     # DOM is read by polling the device, so a switch that stopped
     # answering reports no optic readings -- an outage artefact, like the
     # temperature pair above.
-    "sfp_rx_power_low": "device_down",
-    "sfp_tx_power_low": "device_down",
     "sfp_temp_high": "device_down",
+    # The optic power pairs, the same same-metric shape as the temperature
+    # pair: an open "critically low" already says what "low" is about to
+    # say, on the same port and the same reading. The alarm half keeps the
+    # device_down rollup the low rules used to have; the warning half spends
+    # its one slot on its alarm instead, exactly as temp_chassis_high did
+    # (this map is 1:1, so a rule has one parent and no more) -- see
+    # FEATURES.md for the narrow exposure that leaves.
+    #
+    # NOTE these are the first per-PORT pairs in this map: both halves are
+    # about one interface, not about the switch. alertengine._device_probe
+    # projects a per-port occurrence onto its device before every parent
+    # lookup, which is right for every device_down parent above and wrong
+    # here -- see same_metric_pair below, which is what stops these pairings
+    # silently never firing.
+    "sfp_rx_power_low": "sfp_rx_power_low_alarm",
+    "sfp_rx_power_low_alarm": "device_down",
+    "sfp_rx_power_high": "sfp_rx_power_high_alarm",
+    "sfp_rx_power_high_alarm": "device_down",
+    "sfp_tx_power_low": "sfp_tx_power_low_alarm",
+    "sfp_tx_power_low_alarm": "device_down",
+    "sfp_tx_power_high": "sfp_tx_power_high_alarm",
+    "sfp_tx_power_high_alarm": "device_down",
+}
+
+
+def same_metric_pair(child_rule, parent_rule) -> bool:
+    """Whether a child and its ROLLED_UP_BY parent are two rules over the
+    SAME metric, rather than a fault and the outage that implies it.
+
+    The distinction decides which entity the parent is looked up against.
+    Every original entry in that map has an outage or a path failure for a
+    parent — a fact about the DEVICE — so alertengine._device_probe projects
+    a per-port child onto its switch before asking. A same-metric pair is
+    the opposite: both halves are about the very same port, and asking about
+    the switch would find nothing and suppress nothing, so the pairing would
+    silently never fire.
+
+    Derived from the rules themselves rather than from a second list beside
+    ROLLED_UP_BY, which would be one more thing to remember to update. Read
+    defensively through .keys() so a plain dict from a test satisfies it the
+    same way a sqlite3.Row does.
+    """
+    for rule in (child_rule, parent_rule):
+        if rule is None:
+            return False
+        keys = rule.keys() if hasattr(rule, "keys") else ()
+        if "kind" not in keys or "source_kind" not in keys:
+            return False
+        if rule["kind"] != "threshold":
+            return False
+    source = child_rule["source_kind"]
+    return bool(source) and source == parent_rule["source_kind"]
+
+
+# The hysteresis this app applies to a threshold a DEVICE published. A
+# transceiver publishes a level, not a band: nothing in the MIB says how far
+# back a reading has to recover before the fault is over, and without a gap
+# a value sitting exactly on its published limit opens and closes an alert
+# every poll.
+#
+# Deliberately NOT "the warning level is the alarm's clear": that is
+# undefined whenever a device publishes an alarm and no warning, which is
+# common on older IOS, and it would leave an alarm that can never close. One
+# dB is comfortably outside the sample-to-sample wobble of a DOM reading and
+# comfortably inside the gap between a healthy optic and its own limit.
+PUBLISHED_HYSTERESIS = {"sfp_rx_dbm": 1.0, "sfp_tx_dbm": 1.0}
+
+# The rules whose threshold comes from the port's own transceiver, and
+# nowhere else: rule key -> (metric root, the interface_thresholds column).
+#
+# A rule listed here reads that column and nothing else — not
+# rules.threshold, not a device_thresholds override — so a port on a switch
+# that publishes no limits raises none of these alerts at all. That is the
+# operator's decision, made knowing what it costs: a global fallback is a
+# number that is wrong for most of the optics it would judge, and a wrong
+# optic threshold is either an alert storm or a dead link nobody was told
+# about. An override row's `enabled` flag IS still honoured — turning a rule
+# off for one switch is a statement about that switch, not about physics.
+PUBLISHED_THRESHOLD_RULES = {
+    "sfp_rx_power_low": ("sfp_rx_dbm", "low_warn"),
+    "sfp_rx_power_low_alarm": ("sfp_rx_dbm", "low_alarm"),
+    "sfp_rx_power_high": ("sfp_rx_dbm", "high_warn"),
+    "sfp_rx_power_high_alarm": ("sfp_rx_dbm", "high_alarm"),
+    "sfp_tx_power_low": ("sfp_tx_dbm", "low_warn"),
+    "sfp_tx_power_low_alarm": ("sfp_tx_dbm", "low_alarm"),
+    "sfp_tx_power_high": ("sfp_tx_dbm", "high_warn"),
+    "sfp_tx_power_high_alarm": ("sfp_tx_dbm", "high_alarm"),
 }
 
 # The rules that roll up under a given parent, the other way round — built

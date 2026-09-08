@@ -22,11 +22,13 @@ from dataclasses import asdict
 
 from . import alertmail
 from . import namelookup
-from .alertrules import CLEARS, ROLLED_UP_BY, ROLLS_UP, ROLLUP_ENTITY_KINDS, \
+from .alertrules import CLEARS, PUBLISHED_HYSTERESIS, \
+    PUBLISHED_THRESHOLD_RULES, ROLLED_UP_BY, ROLLS_UP, ROLLUP_ENTITY_KINDS, \
     UNMANAGED_ONLY_RULES, Occurrence, breaches, dedup_key, device_id_for, \
-    evaluate_flapping, evaluate_threshold, interface_label, match_device, \
-    syslog_signature
+    comparison_of, evaluate_flapping, evaluate_threshold, interface_label, \
+    match_device, same_metric_pair, syslog_signature
 from .eventlog import ALERTS, ERROR, NODES, NullLog
+from .nodepoll import reboot_uptimes
 from .nodesdb import TIMELINE_ONLY_EVENT_KINDS
 from .worker import Worker, ago
 
@@ -118,6 +120,12 @@ class AlertEngine(Worker):
         # the next, so a scope alert an operator resolved by hand stays
         # resolved while the scope stays full.
         self._dhcp_streaks: dict[tuple, tuple[float | None, int, float | None]] = {}
+        # (read at, the roots asked for, the rows) for the fleet-wide read of
+        # the limits transceivers publish about themselves. The poller
+        # rewrites those once an hour per device, so re-reading them every
+        # five-second tick would be a whole-table scan for an answer that
+        # cannot have changed. See _published_thresholds.
+        self._published_cache: tuple = (0.0, None, None)
         # And again for NetPath destinations, keyed on the trace's own
         # started_ts: a destination is traced every five minutes by default
         # while this engine ticks every five seconds, so a streak that
@@ -742,6 +750,13 @@ class AlertEngine(Worker):
             detail, extra = "", {}
             if row["kind"] == "up":
                 message, detail, extra = self._recovery_text(device, row, resolved)
+            elif row["kind"] == "rebooted":
+                # device_rebooted's two uptime lines had no writer anywhere:
+                # the template editor's preview filled them from its own
+                # sample, so they looked right, while every real reboot email
+                # rendered them blank.
+                previous, current = reboot_uptimes(row["detail"] or "")
+                extra = {"previous_uptime": previous, "current_uptime": current}
             occurrence = Occurrence(
                 kind="device_event", source_kind=row["kind"], entity_kind="device",
                 entity_id=str(device["id"]), entity_label=label, ts=row["ts"],
@@ -1123,6 +1138,17 @@ class AlertEngine(Worker):
         # recovery.
         stale_after = float(settings.get("threshold_stale_s", 900) or 0)
         now = time.time()
+        # One indexed fleet-wide read for the whole pass, cached across
+        # ticks: the rules in PUBLISHED_THRESHOLD_RULES are judged against
+        # the port's own transceiver and nothing else.
+        published = self._published_thresholds(rules, now)
+        # dict(rule) is not free, and a per-port rule needs a copy for every
+        # port whose published limit differs. Without these two caches a
+        # 2,000-device fleet at 48 optics a switch built three quarters of a
+        # million throwaway dicts per tick. Keyed on the effective pair,
+        # since that is the only thing the copy changes.
+        rule_dicts: dict[int, dict] = {}
+        eval_cache: dict[tuple, dict] = {}
         # Per (rule, entity) state lived forever otherwise, leaking an entry
         # per deleted device; only targets this tick actually saw carry over.
         live_streaks: dict[tuple, tuple] = {}
@@ -1173,17 +1199,67 @@ class AlertEngine(Worker):
                     # later starts a fresh streak rather than resuming
                     # whatever was counted before it was switched off.
                     continue
-                threshold = rule["threshold"]
-                clear_threshold = rule["clear_threshold"]
-                eval_rule = rule
+                base_threshold = rule["threshold"]
+                base_clear = rule["clear_threshold"]
                 if override is not None:
                     # NULL on the override row means "inherit the rule's own
                     # value" (see the device_thresholds schema comment in
                     # alertsdb.py), so only a non-NULL column overrides it.
                     if override["threshold"] is not None:
-                        threshold = override["threshold"]
+                        base_threshold = override["threshold"]
                     if override["clear_threshold"] is not None:
-                        clear_threshold = override["clear_threshold"]
+                        base_clear = override["clear_threshold"]
+                # A rule whose limit the PORT publishes reads that and
+                # nothing else: not rule.threshold, not the override's
+                # numbers. The override's `enabled` flag above still applies
+                # -- see alertrules.PUBLISHED_THRESHOLD_RULES.
+                published_for = PUBLISHED_THRESHOLD_RULES.get(rule["key"] or "")
+                published_below = (published_for is not None
+                                   and comparison_of(rule) == "below")
+                for entity_kind, entity_id, if_index, metric in targets:
+                    threshold, clear_threshold = base_threshold, base_clear
+                    if published_for is not None:
+                        root, column = published_for
+                        limits = published.get((device_id, root, if_index))
+                        limit = limits[column] if limits is not None else None
+                        if limit is None:
+                            # The dominant path on a real fleet, and one dict
+                            # lookup: this port's switch publishes no limit
+                            # for this band, so there is nothing to judge it
+                            # against. Skipped BEFORE the streak is touched
+                            # and never written into live_streaks, so an
+                            # optic that starts publishing tomorrow starts a
+                            # fresh streak rather than resuming one counted
+                            # against a number that was never applied.
+                            #
+                            # Anything already open for this target has to be
+                            # resolved on the way past, the same way the
+                            # override-disabled branch above does when a rule
+                            # stops applying: this evaluator never reaches
+                            # this target again, threshold rules carry no
+                            # auto-resolve, and the dark-optic clear needs a
+                            # threshold of its own -- so an alert left here
+                            # stays open for ever. by='' so a port that
+                            # starts publishing again can re-open it.
+                            # open_dedup_keys is read lazily and at most once
+                            # a tick (the same set the breach paths below
+                            # share), and resolve_by_dedup only runs for a
+                            # key actually in it: this branch is most ports
+                            # on most ticks and must cost no query.
+                            if open_keys is None:
+                                open_keys = self.db.open_dedup_keys()
+                            key = f"{rule['key']}:{entity_kind}:{entity_id}"
+                            if key in open_keys:
+                                if self.db.resolve_by_dedup(key, by=""):
+                                    self.counters["resolved"] += 1
+                            continue
+                        threshold = limit
+                        # A transceiver publishes a level, not a band; this
+                        # app supplies the gap. See PUBLISHED_HYSTERESIS.
+                        gap = PUBLISHED_HYSTERESIS.get(root, 0.0)
+                        clear_threshold = (threshold + gap if published_below
+                                           else threshold - gap)
+                    eval_rule = rule
                     if (threshold != rule["threshold"]
                             or clear_threshold != rule["clear_threshold"]):
                         # evaluate_threshold's own signature stays untouched --
@@ -1194,10 +1270,15 @@ class AlertEngine(Worker):
                         # protocol (.keys() + __getitem__) a plain dict does,
                         # so a dict copy with just those two fields swapped is
                         # indistinguishable to it from a real rule row.
-                        eval_rule = dict(rule)
-                        eval_rule["threshold"] = threshold
-                        eval_rule["clear_threshold"] = clear_threshold
-                for entity_kind, entity_id, if_index, metric in targets:
+                        cache_key = (rule["id"], threshold, clear_threshold)
+                        eval_rule = eval_cache.get(cache_key)
+                        if eval_rule is None:
+                            if rule["id"] not in rule_dicts:
+                                rule_dicts[rule["id"]] = dict(rule)
+                            eval_rule = dict(rule_dicts[rule["id"]])
+                            eval_rule["threshold"] = threshold
+                            eval_rule["clear_threshold"] = clear_threshold
+                            eval_cache[cache_key] = eval_rule
                     value = metric["last_value"] if metric else None
                     sample_ts = metric["last_ts"] if metric else None
                     stale = (stale_after > 0 and sample_ts is not None
@@ -1270,6 +1351,14 @@ class AlertEngine(Worker):
                         # as the number this device was actually judged
                         # against.
                         "threshold": str(threshold),
+                        # Says WHERE that number came from, because for the
+                        # optic power rules it is not on the Rules page at
+                        # all: an operator reading "Threshold: -14.4" for one
+                        # port and "-8.2" for the next needs to know why they
+                        # differ before they go looking for the setting.
+                        "threshold_source": (" (published by the optic)"
+                                             if published_for is not None
+                                             else ""),
                     }
                     if result == "breach" and sample_ts is not None and sample_ts == previous_ts:
                         # Nothing new and already open: no label, no read.
@@ -1340,6 +1429,36 @@ class AlertEngine(Worker):
                             self._notify_clear(resolved, rule, settings)
         self._breach_streaks = live_streaks
         return occurrences
+
+    # How long the published-threshold snapshot is reused, against the
+    # poller's 3600 s write cadence. Short enough that an optic swapped this
+    # minute is judged against its new limits within one, long enough that
+    # 719 of every 720 ticks cost nothing.
+    _PUBLISHED_CACHE_S = 60.0
+
+    def _published_thresholds(self, rules, now: float) -> dict:
+        """(device_id, metric root, ifIndex) -> the limits that port's own
+        transceiver publishes, for the roots the ENABLED rules actually
+        name — see alertrules.PUBLISHED_THRESHOLD_RULES.
+
+        {} immediately when no such rule is enabled, so a site that has
+        turned optic power alerting off pays nothing at all for it.
+        """
+        roots = sorted({PUBLISHED_THRESHOLD_RULES[key][0] for key in
+                        ((r["key"] or "") for r in rules)
+                        if key in PUBLISHED_THRESHOLD_RULES})
+        if not roots:
+            return {}
+        reader = getattr(self.nodes_db, "interface_thresholds_for_roots", None)
+        if reader is None:
+            return {}
+        stamp, cached_roots, cached = self._published_cache
+        if cached is not None and cached_roots == roots \
+                and now - stamp < self._PUBLISHED_CACHE_S:
+            return cached
+        rows = reader(roots)
+        self._published_cache = (now, roots, rows)
+        return rows
 
     def _evaluate_dhcp_thresholds(self, settings) -> list[Occurrence]:
         """DHCP scope utilization, evaluated the same way as a device
@@ -1762,11 +1881,18 @@ class AlertEngine(Worker):
         """`occurrence` as a question about its DEVICE, for the rollup
         lookups, or None when it is about no device at all.
 
-        Every rollup parent a per-port alert can have is a fact about the
-        switch, recorded against the device -- an interface child asking
-        unprojected would find nothing and never be suppressed. Only
-        `interface` is projected; a netpath_target's parent is about that
-        target and must be asked about unchanged.
+        For an OUTAGE parent -- every entry in ROLLED_UP_BY whose parent is
+        device_down -- the parent is a fact about the switch, recorded
+        against the device, so an interface child asking unprojected would
+        find nothing and never be suppressed. Only `interface` is projected;
+        a netpath_target's parent is about that target and must be asked
+        about unchanged.
+
+        NOT for a same-metric pair (alertrules.same_metric_pair): both halves
+        of the optic power pairs are about ONE PORT, so projecting the child
+        onto its switch would ask about an alert that is never keyed that
+        way, and the pairing would silently never fire. Both callers below
+        make that choice before calling; this function has no way to see it.
         """
         if occurrence.entity_kind != "interface":
             return occurrence
@@ -1822,7 +1948,10 @@ class AlertEngine(Worker):
             parent_rule = self._rules_by_key.get(parent_key)
             if parent_rule is None:
                 return None
-            probe = self._device_probe(occurrence)
+            # A same-metric pair is about the same port; anything else is
+            # about the switch. See _device_probe.
+            probe = (occurrence if same_metric_pair(rule, parent_rule)
+                     else self._device_probe(occurrence))
             if probe is None:
                 return None
             parent = self.db.open_by_dedup(dedup_key(parent_rule, probe))
@@ -1990,9 +2119,11 @@ class AlertEngine(Worker):
             # what _rollup_parent's own enabled test means: a rule that is
             # not running cannot be suppressing anything.
             return False
-        # The parent is a fact about the device, so a per-port child asks
-        # about its switch -- see _device_probe.
-        probe = self._device_probe(occurrence)
+        # An outage parent is a fact about the device, so a per-port child
+        # asks about its switch; a same-metric pair is about the port itself
+        # -- see _device_probe.
+        probe = (occurrence if same_metric_pair(rule, parent_rule)
+                 else self._device_probe(occurrence))
         if probe is None:
             return False
         parent_dedup = dedup_key(parent_rule, probe)

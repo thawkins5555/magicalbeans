@@ -798,12 +798,32 @@ check("currentRoute" in APP[APP.index("  const api = {"):],
 # 29b. master() has refused to overlap a page's refresh() with itself since
 #      4.49, but it only set the flag on the refreshes it started itself —
 #      a route or tab refresh goes through refreshNow() and was invisible
-#      to that guard.
+#      to that guard. Since 5.3.0 both go through one runner, so the flag,
+#      the busy line and the connected() bookkeeping cannot drift apart.
+_MASTER = APP[APP.index("  async function master()"):
+              APP.index("  function restartTimer()")]
+_RUN_REFRESH = APP[APP.index("  function runRefresh(name, page)"):
+                   APP.index("  /* Called when a page needs its data now")]
 _REFRESH_NOW = APP[APP.index("  function refreshNow(name)"):
                    APP.index("  async function start()")]
-check("page.refreshing = true" in _REFRESH_NOW and "page.refreshing = false" in _REFRESH_NOW,
-      "refreshNow() marks the page as refreshing for the whole call, so master()'s "
-      "own overlap guard covers a route or tab refresh too")
+check("page.refreshing = true" in _RUN_REFRESH and "page.refreshing = false" in _RUN_REFRESH,
+      "the refresh runner marks the page as refreshing for the whole call, so "
+      "master()'s own overlap guard covers a route or tab refresh too")
+check("runRefresh(" in _REFRESH_NOW and "await runRefresh(" in _MASTER,
+      "...and both the poll tick and a direct request go through that one "
+      "runner rather than each keeping its own copy of it")
+check("section.setAttribute('aria-busy', 'true')" in _RUN_REFRESH,
+      "a direct refresh raises the busy line too, not only the poll tick — "
+      "every NetFlow window change goes through refreshNow(), which showed "
+      "nothing at all while it worked")
+_SETTLED = _RUN_REFRESH[_RUN_REFRESH.index("}).then((value) => {"):]
+check("section.removeAttribute('aria-busy')" in _SETTLED
+      and "page.refreshing = false" in _SETTLED,
+      "...and clears it where it clears `refreshing`, after the rejection "
+      "handler, so a failed refresh cannot leave the page stuck busy")
+check("page.trailing" in _REFRESH_NOW,
+      "a request arriving while one is in flight queues a single trailing "
+      "refresh, so N window changes are not N concurrent refresh() calls")
 
 # 29c. A canvas with no frame yet (an empty map, or a pointer reaching the
 #      SVG before the first paint) has no scene coordinates at all; reading
@@ -1328,7 +1348,145 @@ check("scan_bounded" in _NETFLOW,
       "it ordered every record in the window")
 
 
+# 44. NetFlow (5.3.0): switching windows was slow in the browser, not on the
+#     server — the two queries ran one after the other for no reason, and
+#     nothing cancelled the window that had just been left.
+_GET = APP[APP.index("  const get = (path, params"):APP.index("  const post = (path")]
+check("call(path + query, options)" in _GET,
+      "App.get passes a caller's own options through to call(), which is the "
+      "only way to cancel a request whose URL has changed — call()'s in-flight "
+      "map is keyed on the full URL and so only helps a page polling one address")
+check("options.signal && options.signal.aborted" in APP,
+      "a caller's own abort is flagged superseded like call()'s own, so "
+      "abandoning a window is silent rather than an outage banner")
+_NF_REFRESH = _NETFLOW[_NETFLOW.index("  async function refresh() {"):
+                       _NETFLOW.index("  function init() {")]
+check("Promise.all" in _NF_REFRESH and "await App.get(" not in _NF_REFRESH,
+      "the overview and the record list are asked for together: they are "
+      "independent, and in series every window change cost the sum of both "
+      "round trips rather than the slower of them")
+check("new AbortController()" in _NF_REFRESH and "signal: abort.signal" in _NF_REFRESH,
+      "...under one signal for the whole generation, so a superseded window "
+      "stops holding the flow database instead of only being discarded once "
+      "it finally answers")
+check("if (token !== view.request) return;" in _NF_REFRESH,
+      "...with the repaint guard still checked after both")
+_NF_FETCH = _NETFLOW[_NETFLOW.index("  function dropInFlight() {"):
+                     _NETFLOW.index("  function applyWindow(")]
+check("view.abort.abort()" in _NF_FETCH,
+      "and a change of view aborts what is already in flight rather than "
+      "waiting for it to answer something nobody will read")
+check("setTimeout" in _NF_FETCH and "REFETCH_MS" in _NF_FETCH,
+      "...and collapses the burst it arrived in into one fetch")
+check("function setWindow(t0, t1, follow) {" in _NETFLOW,
+      "...in the window-change path itself: the old opt-in `defer` argument "
+      "was passed by the wheel handler and by none of the dozen other "
+      "callers that change the window")
+check("if (view.windowTimer) return;" in _NF_REFRESH,
+      "...and the poll tick stands off while one is pending, rather than "
+      "fetching the half-way window it can see mid-burst")
+check("if (windowChanged) showLoading();" in _NF_FETCH,
+      "the Loading state is for a window change, not for every refresh — the "
+      "two-second poll must not blank the page it is refreshing")
+
+_NF_LOADING = _NETFLOW[_NETFLOW.index("  function showLoading() {"):
+                       _NETFLOW.index("  function filters() {")]
+for _target in ("drawChart();", "drawBars();", "drawTable("):
+    check(_target in _NF_LOADING,
+          "a window change says so over the chart, the top-N bars and the "
+          "record table (%s), so the window just left is not left on screen "
+          "looking like the answer" % _target.rstrip("(;"))
+check("LOADING_TEXT = 'Loading…'" in _NETFLOW and "App.loading()" in _NETFLOW,
+      "...in the house vocabulary App.loading() already uses everywhere else, "
+      "not a modal over a read and not a second word for the same wait")
+
+# ---------------------------------------------------------------------------
+# 45. NetFlow (5.3.0): the state above had no way out but success. showLoading
+#     writes "Loading…" into the chart, the top-N bars and the record table,
+#     and only a refresh that COMPLETED ever wrote over it — so a 400 from a
+#     filter the server refuses, or an outage under a window change, left all
+#     three panes reading "Loading…" for as long as the operator stayed there,
+#     next to a connection status already saying the fetch had failed.
+check("view.loading ? LOADING_TEXT : NO_FLOWS_TEXT" not in _NETFLOW,
+      "a pane with nothing to draw picks its sentence in one place instead of "
+      "each re-deriving it from view.loading — a two-state ternary that had no "
+      "answer at all for a fetch that failed")
+check("const emptyMessage = () =>" in _NETFLOW,
+      "...and that one place knows all three states a pane can be in: still "
+      "loading, failed, and genuinely empty")
+check("FAILED_TEXT = 'Could not load" in _NETFLOW,
+      "the failure sentence is its own rather than NO_FLOWS_TEXT: a server "
+      "that never answered has not said this window is quiet, and reporting a "
+      "refused filter as 'no flows match' is a claim nobody made")
+_FAILED_AT = "  function loadFailed(error) {"
+check(_FAILED_AT in _NETFLOW,
+      "the loading state has a way out other than success at all — this is "
+      "the function that did not exist, and every check below reads it")
+_NF_FAILED = (_NETFLOW[_NETFLOW.index(_FAILED_AT):
+                       _NETFLOW.index("  function filters() {")]
+              if _FAILED_AT in _NETFLOW else "")
+check("error.superseded" in _NF_FAILED,
+      "a superseded abort is not a failure — the newer fetch it was abandoned "
+      "for is still loading, and its answer is the one worth waiting for")
+check("view.loading = false;" in _NF_FAILED and "view.failed = true;" in _NF_FAILED,
+      "a real failure stops the page claiming to be loading")
+for _target in ("drawChart();", "drawBars();", "drawTable("):
+    check(_target in _NF_FAILED,
+          "...across the same three panes showLoading wrote to (%s), so none "
+          "is left mid-sentence" % _target.rstrip("(;"))
+check("!view.loading) return;" in _NF_FAILED,
+      "...and only where a loading claim was actually made: a poll tick that "
+      "failed under a window already on screen leaves that window on screen, "
+      "rather than blanking a working display over one missed poll")
+check("if (token === view.request) loadFailed(error);" in _NF_REFRESH,
+      "refresh() routes a rejected fetch through it, behind the same stale "
+      "guard as the repaint below — an older generation's failure must not "
+      "paint over the newer one now in flight")
+check("throw error;" in _NF_REFRESH,
+      "...and RE-THROWS it: the connection status and the console report are "
+      "runRefresh's to make, and swallowing the error here would trade a "
+      "stuck pane for a silent failure")
+check("view.failed = false;" in _NF_REFRESH and "view.failed = false;" in _NF_LOADING,
+      "and the flag clears both ways — on the answer that supersedes it, and "
+      "on the next window change, which is a new question either way")
+
+
 print()
+# ---------------------------------------------------------------------------
+# 46. NODES/ALERTS (5.3.0): the optic power rules alert against the levels the
+#     PORT publishes, so the only place an operator can see what a port is
+#     judged by is the DOM table — and the only honest thing to say about a
+#     port that publishes nothing is that its optic power alerts are off.
+check(NODES.count('<th scope="col">Limits</th>') == 2
+      and NODES.count("${domLimitsCell(s)}") == 2,
+      "both DOM tables (the interface dialog's one-port read and the device "
+      "dialog's whole-device one) carry the published Limits column")
+check("domLimitsHint(" in NODES and "publishes no optical power" in NODES,
+      "a DOM table with a light-level row that has no published band says so "
+      "beneath itself — silence there reads as 'nothing is wrong with this port'")
+check("s.limits_source" in NODES,
+      "the Limits cell names the MIB that published the band, so an operator "
+      "can tell a learned limit from an invented one")
+check("alertedOnItsOwnBand(" in NODES
+      and "Only the optical power rows are alerted on" in NODES,
+      "the Limits column carries the temperature, bias and voltage bands the "
+      "optic publishes too, but only the two dBm rules read them -- so the "
+      "table says which rows are actually alerted on what it shows, rather "
+      "than letting a published 70 / 75 beside a temperature row read as the "
+      "number sfp_temp_high fires at")
+check("reference only, not what this reading is alerted on" in NODES,
+      "...and the cell's own title says so per row, for the reader who hovers "
+      "one band rather than reading the sentence under the table")
+_ALERTS46 = read("alerts.js")
+check("PUBLISHED_THRESHOLD_KEYS" in _ALERTS46
+      and "Threshold — from the optic" in _ALERTS46,
+      "the rule editor replaces the two threshold inputs with a sentence for "
+      "the eight optic power keys, rather than leaving a box the server "
+      "refuses — which is the silent-ignore this release exists to remove")
+check("if (!isPublished) {" in _ALERTS46,
+      "and the save handler does not read inputs it did not render")
+
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

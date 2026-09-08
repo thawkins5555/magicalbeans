@@ -998,6 +998,46 @@ tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
    Nodes, Alerts and ConfigRX, which all use the same class. */
 tr.bulk-checked td { background: var(--checked); }
 tr.bulk-checked.selected td { background: var(--checked-strong); }
+/* Severity 1 and 2 are the alerts somebody is meant to walk over to, so
+   they colour the whole row rather than one 62px badge. Severity is the
+   syslog scale and counts DOWN — 0 (emergency) is worse than 1 — so the
+   test alerts.js makes is `<= 2`, which is the floor app.js's
+   NOTIFY_SEVERITY already uses for the desktop popup.
+
+   On the td, since that is where a row's background lives here, and
+   specific enough to outrank tr.selected and tr.bulk-checked above:
+   clicking a row, or ticking it for a bulk action, must not take away the
+   one signal saying how bad it is. Selection is still visible — its accent
+   bar on the first cell is a separate declaration, which is half of why
+   that bar exists. The severity word goes back to --text inside such a
+   row: .sev-0/1/2 is --fail, and red on red is under AA on this tint in 5
+   of the 7 theme blocks statically (4.00, 4.32, 3.64, 3.85, 4.14) and in
+   all 7 at the pulse peak below. (It read "two of the six", which was
+   wrong in both halves.) .sev is the only tinted text a row here carries:
+   every other cell inherits td's --text, which clears 4.5 on both tints
+   everywhere. The --muted and --accent that would not are in the detail
+   pane's hints and links, outside the table — nothing to fix here, but the
+   reason to check again before putting either one in a cell. */
+table.grid tr.alert-severe td { background: color-mix(in srgb, var(--fail) 22%, var(--panel)); }
+table.grid tr.alert-severe td .sev { color: var(--text); }
+
+/* The motion means "nobody has picked this up yet": an acknowledged alert
+   keeps the highlight and stops moving, so a wall display is not flashing
+   about work already in hand. One breath every 2.8 s — far under the three
+   flashes per second the photosensitive-seizure guideline draws the line
+   at, and slow enough to read across. Written opt-in on no-preference like
+   the transition block above, so the ANIMATION is all a viewer who asked
+   for stillness loses; the static highlight sits outside every media query
+   and everyone gets it. */
+@keyframes alert-severe-pulse {
+  from { background-color: color-mix(in srgb, var(--fail) 14%, var(--panel)); }
+  to { background-color: color-mix(in srgb, var(--fail) 34%, var(--panel)); }
+}
+@media (prefers-reduced-motion: no-preference) {
+  table.grid tr.alert-severe-unacked td {
+    animation: alert-severe-pulse 1.4s ease-in-out infinite alternate;
+  }
+}
 td.num { text-align: right; }
 /* The select-all box sits in the header cell above the row checkboxes.
    Vertically centred against the header text of its neighbours, and never

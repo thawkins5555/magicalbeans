@@ -176,9 +176,24 @@ try:
     did = add_device(nodes, "10.20.2.1", "access-sw")
     nodes.replace_interfaces(did, PORTS)
     rule = alerts.rule_by_key("sfp_rx_power_low")
-    check("sfp_rx_power_low ships comparison 'below' at -22/-20",
+    check("sfp_rx_power_low ships comparison 'below' and NO threshold of "
+          "its own -- 5.3.0 reads each port's published low_warn instead",
           (rule["comparison"], rule["threshold"], rule["clear_threshold"])
-          == ("below", -22.0, -20.0), dict(rule))
+          == ("below", None, None), dict(rule))
+    # Every port in this section publishes the same -22 dBm low warning, so
+    # the direction and dark-optic behaviour below reads exactly as it did
+    # when -22 was a global rule threshold. Only low_warn: publishing
+    # low_alarm too would open the alarm rule and roll this one up, which
+    # is P14's subject, not this one's.
+    nodes.replace_interface_thresholds(did, "CISCO-ENTITY-SENSOR-MIB", [
+        {"if_index": if_index, "metric_root": "sfp_rx_dbm",
+         "low_alarm": None, "low_warn": -22.0, "high_warn": None,
+         "high_alarm": None, "updated_ts": time.time()}
+        for if_index in (7, 8, 9, 10)])
+    # The engine holds its fleet-wide read of these for _PUBLISHED_CACHE_S
+    # against the poller's hourly write cadence, and the tick above already
+    # cached the empty answer.
+    engine._published_cache = (0.0, None, None)
     base = time.time()
     for i in range(2):
         nodes.record_metric_sample(did, "sfp_rx_dbm.7", "Gi1/0/7 Rx power",
@@ -194,6 +209,8 @@ try:
     nodes.record_metric_sample(did, "sfp_rx_dbm.7", "Gi1/0/7 Rx power", "dBm",
                                "gauge", base + 5, -21.0)
     engine._tick()
+    # PUBLISHED_HYSTERESIS puts the clear 1 dB above the published limit,
+    # since a transceiver publishes a level and no band of its own.
     check("-21 dBm holds it open (inside the hysteresis band)",
           len(open_rows(alerts, "sfp_rx_power_low")) == 1)
 
@@ -260,13 +277,18 @@ print("\nP4 - a clear threshold on the wrong side of a 'below' rule is refused")
 nodes, alerts, snmp, syslog, ipam, engine = build()
 try:
     from netpath import alertsdb as alertsdb_mod
-    low = alerts.rule_by_key("sfp_rx_power_low")
+    # A custom rule, because from 5.3.0 every SHIPPED 'below' rule reads a
+    # published limit and refuses a number outright (P15) -- which would
+    # mask the direction check this section is about.
+    alerts.add_rule("custom_dbm_low", "Custom low-water rule", "threshold",
+                    "custom_dbm", comparison="below", threshold=-22.0,
+                    clear_threshold=-20.0, for_polls=2)
     raised = None
     try:
         # A clear BELOW the threshold on a 'below' rule: the value would have
         # to fall further to clear than it did to breach, so the alert could
         # never close.
-        alerts.set_device_threshold(1, "sfp_rx_power_low", threshold=-22.0,
+        alerts.set_device_threshold(1, "custom_dbm_low", threshold=-22.0,
                                     clear_threshold=-30.0)
     except ValueError as exc:
         raised = exc
@@ -274,7 +296,7 @@ try:
           "raises", raised is not None and "must be above" in str(raised),
           str(raised))
     # And the right way round is accepted.
-    alerts.set_device_threshold(1, "sfp_rx_power_low", threshold=-24.0,
+    alerts.set_device_threshold(1, "custom_dbm_low", threshold=-24.0,
                                 clear_threshold=-21.0)
     rows = alerts.device_thresholds(1)
     check("...and the correct direction is accepted",
@@ -702,6 +724,121 @@ try:
           [dict(r) for r in alerts.alerts_due_first_notify(time.time())])
 finally:
     alertmail.send = real_send
+    engine.stop()
+    close_all(nodes, alerts, snmp, syslog, ipam)
+
+
+# =================================================================== P14
+print("\nP14 - a same-metric pair rolls up PER PORT, not per device")
+
+# The hazard: every ROLLED_UP_BY entry before 5.3.0 had an outage for a
+# parent, so _device_probe projects a per-port child onto its switch before
+# looking the parent up. The optic power pairs are the first whose parent is
+# ALSO about one port -- projected, the lookup asks about an alert that is
+# never keyed that way, finds nothing, and the pairing silently never fires.
+nodes, alerts, snmp, syslog, ipam, engine = build(rollup_enabled=True)
+try:
+    engine._tick()
+    did = add_device(nodes, "10.20.9.1", "pair-sw")
+    nodes.replace_interfaces(did, PORTS)
+    nodes.replace_interface_thresholds(did, "CISCO-ENTITY-SENSOR-MIB", [
+        {"if_index": if_index, "metric_root": "sfp_rx_dbm",
+         "low_alarm": -24.0, "low_warn": -22.0, "high_warn": None,
+         "high_alarm": None, "updated_ts": time.time()}
+        for if_index in (7, 8)])
+    engine._published_cache = (0.0, None, None)
+    base = time.time()
+    for i in range(2):
+        for if_index in (7, 8):
+            nodes.record_metric_sample(did, f"sfp_rx_dbm.{if_index}",
+                                       f"Gi1/0/{if_index} Rx power", "dBm",
+                                       "gauge", base + i, -30.0)
+        engine._tick()
+
+    alarms = open_rows(alerts, "sfp_rx_power_low_alarm")
+    warnings = open_rows(alerts, "sfp_rx_power_low")
+    check("two ports past both published levels open two independent "
+          "alarms, one per port",
+          sorted(r["entity_id"] for r in alarms) == [f"{did}:7", f"{did}:8"],
+          [dict(r) for r in alarms])
+    check("...and the warning half is absorbed under its OWN port's alarm, "
+          "so the pair is one alert per port and not two",
+          warnings == [], [dict(r) for r in warnings])
+
+    # One port recovers past the alarm's clear but stays past the warning's:
+    # the warning has to come back on that port and nowhere else.
+    nodes.record_metric_sample(did, "sfp_rx_dbm.7", "Gi1/0/7 Rx power", "dBm",
+                               "gauge", base + 10, -22.5)
+    engine._tick()
+    nodes.record_metric_sample(did, "sfp_rx_dbm.7", "Gi1/0/7 Rx power", "dBm",
+                               "gauge", base + 11, -22.5)
+    engine._tick()
+    check("a port back inside its alarm band but still under its warning "
+          "one re-derives the warning on that port alone",
+          [r["entity_id"] for r in open_rows(alerts, "sfp_rx_power_low")]
+          == [f"{did}:7"],
+          [dict(r) for r in open_rows(alerts, "sfp_rx_power_low")])
+    check("...while the other port's alarm is untouched",
+          [r["entity_id"] for r in open_rows(alerts, "sfp_rx_power_low_alarm")]
+          == [f"{did}:8"],
+          [dict(r) for r in open_rows(alerts, "sfp_rx_power_low_alarm")])
+
+    # The regression guard: an OUTAGE parent must still be asked about the
+    # DEVICE, which is the projection same_metric_pair had to leave alone.
+    go_down(nodes, did)
+    for i in range(3):
+        nodes.record_metric_sample(did, "if_in_util_pct.7", "Gi1/0/7 in",
+                                   "%", "gauge", base + 20 + i, 99.0)
+        engine._tick()
+    check("if_in_util_high on a port still rolls up under its SWITCH's "
+          "device_down -- the device projection is unchanged for every "
+          "outage parent",
+          open_rows(alerts, "if_in_util_high") == [],
+          [dict(r) for r in open_rows(alerts, "if_in_util_high")])
+    check("(and the outage itself is open, so there was something to roll "
+          "up under)", len(open_rows(alerts, "device_down")) == 1,
+          [dict(r) for r in open_rows(alerts, "device_down")])
+finally:
+    engine.stop()
+    close_all(nodes, alerts, snmp, syslog, ipam)
+
+
+# =================================================================== P15
+print("\nP15 - a number on a published-threshold rule is refused, not ignored")
+
+nodes, alerts, snmp, syslog, ipam, engine = build()
+try:
+    raised = None
+    try:
+        alerts.set_device_threshold(1, "sfp_rx_power_low", threshold=-24.0,
+                                    clear_threshold=-21.0)
+    except ValueError as exc:
+        raised = exc
+    check("a per-device override with a number on an optic power rule is "
+          "refused rather than stored and then ignored",
+          raised is not None and "publishes" in str(raised), str(raised))
+    alerts.set_device_threshold(1, "sfp_rx_power_low", threshold=None,
+                                clear_threshold=None, enabled=False)
+    check("...but turning that rule off for one switch is still allowed -- "
+          "that is a statement about the switch, not about physics",
+          [dict(r) for r in alerts.device_thresholds(1)][0]["enabled"] == 0,
+          [dict(r) for r in alerts.device_thresholds(1)])
+
+    rule = alerts.rule_by_key("sfp_tx_power_high_alarm")
+    raised = None
+    try:
+        alerts.update_rule(rule["id"], threshold=2.0)
+    except ValueError as exc:
+        raised = exc
+    check("the rule editor refuses the same number the same way, and stores "
+          "nothing",
+          raised is not None
+          and alerts.rule_by_key("sfp_tx_power_high_alarm")["threshold"] is None,
+          (str(raised), dict(alerts.rule_by_key("sfp_tx_power_high_alarm"))))
+    alerts.update_rule(rule["id"], notify=0)
+    check("...while an edit that touches neither number goes through",
+          alerts.rule_by_key("sfp_tx_power_high_alarm")["notify"] == 0)
+finally:
     engine.stop()
     close_all(nodes, alerts, snmp, syslog, ipam)
 
