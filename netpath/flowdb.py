@@ -875,9 +875,13 @@ class FlowDatabase(SqliteStore):
             return None
         for tier in sorted(ROLLUP_TIERS, reverse=True):
             if bucket_s is None:
-                # Nothing to slot, so the finest tier is enough and the
-                # window start moves by at most a minute.
-                if tier != min(ROLLUP_TIERS):
+                # One slot, so the coarsest tier that reaches t0 is the
+                # cheapest answer, not the finest — the loop is already in
+                # that order. It has to start on t0 as well: the rollup arm
+                # reads whole buckets from t0 up and the raw arm starts at
+                # the seal, so a bucket straddling the start of the window
+                # would fall between them and be counted by neither.
+                if t0 != _align_down(t0, tier):
                     continue
             elif tier > bucket_s or bucket_s % tier:
                 # A bucket lands wholly inside one slot only when every slot

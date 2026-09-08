@@ -531,6 +531,47 @@ def test_12_a_rewrite_reaches_both_tiers() -> None:
     db.close()
 
 
+# ------------------------------------------------------------------------ 13
+
+def test_13_one_slot_takes_the_coarsest_tier() -> None:
+    print("13: top() and totals() take the coarsest tier that reaches them")
+    db = store("single_slot.db")
+    end = flowdb._align_down(time.time() - 300, 3600)
+    start = end - 4 * 3600
+    db.insert_flows([flow(i, start + i * 8.0) for i in range(1500)])
+    cover(db)
+
+    plan = db._rollup_plan(start, end, "Source", NO_FILTERS, None)
+    check(plan is not None and plan[0] == 3600,
+          f"with one slot to fill and both tiers reaching the window, the "
+          f"hourly tier answers — sixty times fewer rows for the same number "
+          f"({plan})")
+
+    # The rule that makes that safe: a tier whose buckets do not start on t0
+    # would leave the first partial bucket out of both arms, so a window
+    # starting inside an hour drops to the tier that does divide it.
+    plan = db._rollup_plan(float(start + 600), end, "Source", NO_FILTERS, None)
+    check(plan is not None and plan[0] == 60,
+          f"a window starting inside an hour falls to the minute tier, not "
+          f"to the hourly one it does not line up with ({plan})")
+
+    # What rollup_minute_days does to a window older than a couple of days:
+    # the minute tier no longer reaches it, the hourly tier still does. That
+    # used to fall all the way to raw.
+    db._set_private_setting(flowdb._FLOOR % 60, int(end))
+    plan = db._rollup_plan(start, end, "Source", NO_FILTERS, None)
+    check(plan is not None and plan[0] == 3600,
+          f"and with only the hourly floor left below the window it still "
+          f"answers, rather than scanning every flow in it ({plan})")
+    check(db.totals(start, end, NO_FILTERS)
+          == raw(db, "totals", start, end, NO_FILTERS),
+          "totals() over that window is exact")
+    check(db.top(start, end, "Source", NO_FILTERS, 10)
+          == raw(db, "top", start, end, "Source", NO_FILTERS, 10),
+          "and so is top()")
+    db.close()
+
+
 TESTS = [
     test_1_rollup_and_raw_agree,
     test_2_totals_survive_truncation,
@@ -544,6 +585,7 @@ TESTS = [
     test_10_a_late_exporter_still_reaches_the_rollups,
     test_11_the_residual_never_stacks_downwards,
     test_12_a_rewrite_reaches_both_tiers,
+    test_13_one_slot_takes_the_coarsest_tier,
 ]
 
 

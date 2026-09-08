@@ -4419,7 +4419,10 @@ Query routing (`_rollup_plan`) refuses the rollups outright when any
 filter is set (the rollup has one row per key, not per flow, and the
 filters select on columns that are not in it), when no tier divides the
 bucket size, and when the tier's floor does not reach the start of the
-window. That last rule is what makes the backfill safe to run at any
+window. Where there is no bucket size to divide — `top()` and `totals()`,
+which put the whole window in one slot — the coarsest tier that both
+reaches `t0` and starts on it wins, since with one slot to fill the finer
+tier only means reading sixty times the rows for the same number. That last rule is what makes the backfill safe to run at any
 pace: as the cursor walks back, progressively wider windows move off raw,
 and none is ever slower than it was before. The chosen tier serves
 `[t0, seal_ts)` and raw serves `[seal_ts, t1]`, where `seal_ts` is
