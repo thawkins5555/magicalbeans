@@ -798,12 +798,32 @@ check("currentRoute" in APP[APP.index("  const api = {"):],
 # 29b. master() has refused to overlap a page's refresh() with itself since
 #      4.49, but it only set the flag on the refreshes it started itself —
 #      a route or tab refresh goes through refreshNow() and was invisible
-#      to that guard.
+#      to that guard. Since 5.3.0 both go through one runner, so the flag,
+#      the busy line and the connected() bookkeeping cannot drift apart.
+_MASTER = APP[APP.index("  async function master()"):
+              APP.index("  function restartTimer()")]
+_RUN_REFRESH = APP[APP.index("  function runRefresh(name, page)"):
+                   APP.index("  /* Called when a page needs its data now")]
 _REFRESH_NOW = APP[APP.index("  function refreshNow(name)"):
                    APP.index("  async function start()")]
-check("page.refreshing = true" in _REFRESH_NOW and "page.refreshing = false" in _REFRESH_NOW,
-      "refreshNow() marks the page as refreshing for the whole call, so master()'s "
-      "own overlap guard covers a route or tab refresh too")
+check("page.refreshing = true" in _RUN_REFRESH and "page.refreshing = false" in _RUN_REFRESH,
+      "the refresh runner marks the page as refreshing for the whole call, so "
+      "master()'s own overlap guard covers a route or tab refresh too")
+check("runRefresh(" in _REFRESH_NOW and "await runRefresh(" in _MASTER,
+      "...and both the poll tick and a direct request go through that one "
+      "runner rather than each keeping its own copy of it")
+check("section.setAttribute('aria-busy', 'true')" in _RUN_REFRESH,
+      "a direct refresh raises the busy line too, not only the poll tick — "
+      "every NetFlow window change goes through refreshNow(), which showed "
+      "nothing at all while it worked")
+_SETTLED = _RUN_REFRESH[_RUN_REFRESH.index("}).then((value) => {"):]
+check("section.removeAttribute('aria-busy')" in _SETTLED
+      and "page.refreshing = false" in _SETTLED,
+      "...and clears it where it clears `refreshing`, after the rejection "
+      "handler, so a failed refresh cannot leave the page stuck busy")
+check("page.trailing" in _REFRESH_NOW,
+      "a request arriving while one is in flight queues a single trailing "
+      "refresh, so N window changes are not N concurrent refresh() calls")
 
 # 29c. A canvas with no frame yet (an empty map, or a pointer reaching the
 #      SVG before the first paint) has no scene coordinates at all; reading
@@ -1326,6 +1346,59 @@ check("summaries, not from the records" in _NF_STORAGE,
 check("scan_bounded" in _NETFLOW,
       "the record list reads the server's scan bound rather than implying "
       "it ordered every record in the window")
+
+
+# 44. NetFlow (5.3.0): switching windows was slow in the browser, not on the
+#     server — the two queries ran one after the other for no reason, and
+#     nothing cancelled the window that had just been left.
+_GET = APP[APP.index("  const get = (path, params"):APP.index("  const post = (path")]
+check("call(path + query, options)" in _GET,
+      "App.get passes a caller's own options through to call(), which is the "
+      "only way to cancel a request whose URL has changed — call()'s in-flight "
+      "map is keyed on the full URL and so only helps a page polling one address")
+check("options.signal && options.signal.aborted" in APP,
+      "a caller's own abort is flagged superseded like call()'s own, so "
+      "abandoning a window is silent rather than an outage banner")
+_NF_REFRESH = _NETFLOW[_NETFLOW.index("  async function refresh() {"):
+                       _NETFLOW.index("  function init() {")]
+check("Promise.all" in _NF_REFRESH and "await App.get(" not in _NF_REFRESH,
+      "the overview and the record list are asked for together: they are "
+      "independent, and in series every window change cost the sum of both "
+      "round trips rather than the slower of them")
+check("new AbortController()" in _NF_REFRESH and "signal: abort.signal" in _NF_REFRESH,
+      "...under one signal for the whole generation, so a superseded window "
+      "stops holding the flow database instead of only being discarded once "
+      "it finally answers")
+check("if (token !== view.request) return;" in _NF_REFRESH,
+      "...with the repaint guard still checked after both")
+_NF_FETCH = _NETFLOW[_NETFLOW.index("  function dropInFlight() {"):
+                     _NETFLOW.index("  function applyWindow(")]
+check("view.abort.abort()" in _NF_FETCH,
+      "and a change of view aborts what is already in flight rather than "
+      "waiting for it to answer something nobody will read")
+check("setTimeout" in _NF_FETCH and "REFETCH_MS" in _NF_FETCH,
+      "...and collapses the burst it arrived in into one fetch")
+check("function setWindow(t0, t1, follow) {" in _NETFLOW,
+      "...in the window-change path itself: the old opt-in `defer` argument "
+      "was passed by the wheel handler and by none of the dozen other "
+      "callers that change the window")
+check("if (view.windowTimer) return;" in _NF_REFRESH,
+      "...and the poll tick stands off while one is pending, rather than "
+      "fetching the half-way window it can see mid-burst")
+check("if (windowChanged) showLoading();" in _NF_FETCH,
+      "the Loading state is for a window change, not for every refresh — the "
+      "two-second poll must not blank the page it is refreshing")
+
+_NF_LOADING = _NETFLOW[_NETFLOW.index("  function showLoading() {"):
+                       _NETFLOW.index("  function filters() {")]
+for _target in ("drawChart();", "drawBars();", "drawTable("):
+    check(_target in _NF_LOADING,
+          "a window change says so over the chart, the top-N bars and the "
+          "record table (%s), so the window just left is not left on screen "
+          "looking like the answer" % _target.rstrip("(;"))
+check("LOADING_TEXT = 'Loading…'" in _NETFLOW and "App.loading()" in _NETFLOW,
+      "...in the house vocabulary App.loading() already uses everywhere else, "
+      "not a modal over a read and not a second word for the same wait")
 
 
 print()
