@@ -131,6 +131,11 @@ check("...naming the file, its size, its cap and the setting that governs "
       and "max_trace_db_mb" in near[0]["message"]
       and "86%" in near[0]["message"],
       near[0] if near else None)
+check("...and promising only what the trim actually does: at 86% no pass is "
+      "deleting anything yet, and the message must not say one is",
+      near and "deleted once it reaches that cap" in near[0]["message"]
+      and "Every maintenance pass" not in near[0]["message"],
+      near[0]["message"] if near else None)
 check("...and the stores still in room are cleared in the same pass",
       "trace" not in [entity for rule, entity in warned.cleared
                       if rule == "db_near_cap"]
@@ -140,7 +145,7 @@ check("...and the stores still in room are cleared in the same pass",
 
 set_size(trace, 0.97)
 high = [row for row in sweep().raised if row["rule"] == "db_near_cap"]
-check("past 95% it escalates rather than reading the same as 86%",
+check("past 95% the occurrence carries the higher severity",
       len(high) == 1 and high[0]["severity"] == 2, high)
 
 # 0.82 is between the raise band and the clear band: a store held just under
@@ -283,6 +288,23 @@ check("but the hold band raises nothing where no alert is open -- the raise "
       "band is still 85%",
       not open_rows("db_near_cap", "trace"),
       [dict(r) for r in open_rows("db_near_cap", "trace")])
+set_size(trace, 0.10)
+engine_sweep()
+
+# What the occurrence's severity does and does not do. AlertEngine._apply
+# opens the row at the RULE's severity, so 97% is not a redder row than 86%
+# and nothing that says otherwise is true -- what separates them is the
+# wording, which is why the percentage is in the message.
+set_size(trace, 0.97)
+engine_sweep()
+worst = open_rows("db_near_cap", "trace")
+rule_severity = service.alerts_db.rule_by_key("db_near_cap")["severity"]
+check("a store past 95% opens at the rule's severity, not the occurrence's",
+      len(worst) == 1 and worst[0]["severity"] == rule_severity,
+      [dict(r) for r in worst])
+check("...and says which band it is in in the message instead",
+      worst and "97%" in worst[0]["message"],
+      worst[0]["message"] if worst else None)
 set_size(trace, 0.10)
 engine_sweep()
 
