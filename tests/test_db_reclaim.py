@@ -17,6 +17,7 @@ from netpath.appdb import AppDatabase
 from netpath.wirelessdb import WirelessDatabase
 from netpath.configrxdb import ConfigRxDatabase
 from netpath.nodesdb import NodesDatabase
+from netpath.flowdb import FlowDatabase
 
 # The checkmark below is not ASCII: under cp1252 (Windows' default for both a
 # console and a piped stdout, absent PYTHONUTF8) print() raises
@@ -236,6 +237,55 @@ assert reopened.series_db._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
 assert reopened.mib_db._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
 reopened.close()
 ok("incremental auto-vacuum mode survives a reopen on both sibling files")
+
+
+# =============================================================== FlowDatabase
+print("\nFlowDatabase reclaims space after prune, rollups included")
+
+folder = os.path.join(TMPDIR, "flows")
+os.makedirs(folder, exist_ok=True)
+flow_db = FlowDatabase(os.path.join(folder, "flows.db"))
+
+assert flow_db._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+ok("a fresh flows.db is in incremental auto-vacuum mode")
+
+# The last two hours, so the backfill below reaches all of it: it walks
+# backwards a bucket at a time from where compaction seeded the floor.
+old_time = time.time() - 2 * 3600
+flow_db._conn.executemany(
+    "INSERT INTO flows(exporter, version, ts_start, ts_end, src_ip, dst_ip,"
+    " src_port, dst_port, protocol, packets, bytes, sampling)"
+    " VALUES (?,?,?,?,?,?,?,?,?,?,?,1)",
+    [("10.0.0.1", 9, old_time + i * 0.18, old_time + i * 0.18,
+      f"192.168.{i // 256 % 256}.{i % 256}", "8.8.8.8",
+      1024 + i % 900, 443, 6, 5, 1000 + i) for i in range(40_000)])
+flow_db._conn.commit()
+# Both tiers, so the reclaim below has rollup pages to free as well as raw.
+for tier in (60, 3600):
+    flow_db.compact_rollup(tier, max_buckets=500, budget_s=60)
+    flow_db.backfill_rollup(tier, max_buckets=500, budget_s=60)
+
+before = flow_db.size_bytes()
+assert before > 300_000, before
+rollup_rows = flow_db._conn.execute(
+    "SELECT COUNT(*) AS n FROM flow_rollup").fetchone()["n"]
+assert rollup_rows > 0, rollup_rows
+ok(f"flows and {rollup_rows} rollup rows grew flows.db to {before // 1024} KiB")
+
+removed = flow_db.prune(0, 0, minute_days=0, rollup_days=0)
+assert removed > 0, removed
+ok(f"prune removed {removed} row(s) across the raw table and both rollups")
+
+after = flow_db.size_bytes()
+assert after < before, (before, after)
+ok(f"file shrank from {before // 1024} KiB to {after // 1024} KiB without VACUUM")
+
+flow_db.close()
+
+reopened = FlowDatabase(os.path.join(folder, "flows.db"))
+assert reopened._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+reopened.close()
+ok("incremental auto-vacuum mode survives a reopen")
 
 
 print(f"\nALL {len(PASSED)} DB-RECLAIM ASSERTIONS PASSED")

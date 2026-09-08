@@ -1277,6 +1277,31 @@ check("set-web-relay-range" in INDEX and "web_relay_port_range" in SETTINGS,
       "the way every other Apply field is")
 
 
+# 43. NetFlow (5.2.0): the rollup retentions are settings like any other, so
+#     the STORAGE fieldset carries them and Save posts them under the keys
+#     flowdb.DEFAULTS names.
+_NETFLOW = read("netflow.js")
+_NF_SETTINGS = _NETFLOW[_NETFLOW.index("  function settingsDialog() {"):
+                        _NETFLOW.index("  async function sendTestPacket() {")]
+_NF_STORAGE = _NF_SETTINGS[_NF_SETTINGS.index("STORAGE AND DISPLAY"):
+                           _NF_SETTINGS.index("columnPickerFieldset")]
+for _id, _key in (("n-rollup-min", "rollup_minute_days"),
+                  ("n-rollup-days", "rollup_retention_days")):
+    check("'%s'" % _id in _NF_STORAGE,
+          "the %s field sits in the STORAGE fieldset beside the flow "
+          "retention it outlives" % _id)
+    check("s.%s" % _key in _NF_STORAGE,
+          "...seeded from the settings the dialog was opened with")
+    check("%s: num('#%s')" % (_key, _id) in _NF_SETTINGS,
+          "...and posted to /api/settings under %s" % _key)
+check("summaries, not from the records" in _NF_STORAGE,
+      "the hint says what a chart older than the flow retention is drawn "
+      "from, which is the only reason the two fields exist")
+check("scan_bounded" in _NETFLOW,
+      "the record list reads the server's scan bound rather than implying "
+      "it ordered every record in the window")
+
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

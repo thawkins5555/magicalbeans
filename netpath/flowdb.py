@@ -488,9 +488,13 @@ class FlowDatabase(SqliteStore):
         sealed = _align_down(now - _ROLLUP_LAG_S, tier)
         floor, watermark = self.rollup_bounds(tier)
         if watermark is None:
-            start = _align_down(now, tier)
-            self._set_private_setting(_WATERMARK % tier, start)
-            self._set_private_setting(_FLOOR % tier, start)
+            # At the first unsealed bucket, not at the current one: the
+            # watermark is a claim that everything below it is built, and
+            # backfill starts one bucket below it. Seeding at `now` would
+            # have it build the bucket still collecting flows and then never
+            # revisit it, because compaction only ever moves forward.
+            self._set_private_setting(_WATERMARK % tier, sealed)
+            self._set_private_setting(_FLOOR % tier, sealed)
             return 0
         bucket = watermark - _ROLLUP_REDO[tier] * tier
         # A rewritten sampling factor changes rows a sealed bucket has
