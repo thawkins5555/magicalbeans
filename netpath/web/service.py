@@ -54,6 +54,11 @@ DB_CAP_WARN_SHARE = 0.85
 DB_CAP_HIGH_SHARE = 0.95
 DB_CAP_CLEAR_SHARE = 0.80
 
+# How far free space has to recover above disk_free_warn_pct before the
+# volume alert clears. A WAL grows between prunes and shrinks after them, so
+# a volume sitting on the threshold would flap the alert every sweep.
+DISK_FREE_CLEAR_MARGIN_PCT = 2.0
+
 
 @dataclass(frozen=True)
 class Store:
@@ -1210,6 +1215,13 @@ class Service:
         clear_it = getattr(engine, "clear_system_occurrence", None)
         if raise_it is None or clear_it is None:
             return
+
+        def still_open(rule_key: str, entity_id: str) -> bool:
+            # alertrules.dedup_key's key for the occurrence system_occurrence
+            # builds, which is the one clear_system_occurrence resolves.
+            return self.alerts_db.open_by_dedup(
+                f"{rule_key}:system:{entity_id}") is not None
+
         for store in STORES:
             if not store.cap_key:
                 continue
@@ -1225,7 +1237,13 @@ class Service:
             if share < DB_CAP_CLEAR_SHARE:
                 clear_it("db_near_cap", store.name)
                 continue
-            if share < DB_CAP_WARN_SHARE:
+            # An alert already open is re-raised in the hold band rather than
+            # left alone: the rule's auto-resolve measures from last_ts and
+            # only a raise moves it, so a store trimmed from 90% to 83% would
+            # be closed by that backstop half an hour later and the effective
+            # clear would be "below 85% for two sweeps", not below 80%.
+            if (share < DB_CAP_WARN_SHARE
+                    and not still_open("db_near_cap", store.name)):
                 continue
             # The percentage is in the message as well as in `severity`
             # because AlertEngine._apply opens the row at the RULE's
@@ -1252,8 +1270,12 @@ class Service:
         warn = float(self.settings.get("disk_free_warn_pct", 10) or 0)
         critical = float(self.settings.get("disk_free_critical_pct", 5) or 0)
         folder = str(Path(self.app_db.path).parent)
-        if not warn or free_pct >= warn:
+        if not warn or free_pct >= warn + DISK_FREE_CLEAR_MARGIN_PCT:
             clear_it("disk_space_low", "data")
+            return
+        # The databases' hold band, on the volume: raised below `warn`,
+        # cleared only once free space is a margin above it again.
+        if free_pct >= warn and not still_open("disk_space_low", "data"):
             return
         raise_it(
             "disk_space_low", "data", folder,

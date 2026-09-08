@@ -1694,6 +1694,27 @@ def _check_configrx_settings(values: dict) -> None:
             raise ValueError(f"Line ignore pattern {line!r} is invalid: {exc}") from exc
 
 
+def _check_disk_free_settings(service, values: dict) -> None:
+    """The critical free-space floor has to sit below the warning one.
+
+    Posted the other way round, every volume alert opens at critical the
+    moment it opens at all, and the warning band it is meant to escalate
+    from can never be reached. Either key can arrive on its own, so the one
+    that is not in the body is read from what is stored, the way
+    _check_mapper_settings pairs its two.
+    """
+    if not ({"disk_free_warn_pct", "disk_free_critical_pct"} & set(values)):
+        return
+    warn = float(values.get("disk_free_warn_pct",
+                            service.settings.get("disk_free_warn_pct", 10)))
+    critical = float(values.get("disk_free_critical_pct",
+                                service.settings.get("disk_free_critical_pct", 5)))
+    if critical >= warn:
+        raise ValueError(
+            f"disk_free_critical_pct ({critical:g}) must be below "
+            f"disk_free_warn_pct ({warn:g})")
+
+
 def post_settings(service, params, body) -> dict:
     from ..sqlitebase import coerce_settings
 
@@ -1720,6 +1741,7 @@ def post_settings(service, params, body) -> dict:
     # int() until the database was edited by hand.
     values = coerce_settings(_scope_defaults(scope), values, strict=True)
     _check_settings_ranges(values)
+    _check_disk_free_settings(service, values)
     if "web_relay_port_range" in values:
         # Typed here, not at the next relay: an unparseable range would
         # otherwise store happily and surface as a failed WEB click later.
