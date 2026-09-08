@@ -320,6 +320,8 @@ DOT1Q_FDB_PORT = "1.3.6.1.2.1.17.7.1.2.2.1.2"
 VTP_VLAN_STATE = "1.3.6.1.4.1.9.9.46.1.3.1.1.2.1"
 ENT_DESCR = "1.3.6.1.2.1.47.1.1.1.1.2"
 ENT_CONTAINED_IN = "1.3.6.1.2.1.47.1.1.1.1.4"
+ENT_CLASS = "1.3.6.1.2.1.47.1.1.1.1.5"
+ENT_MODEL_NAME = "1.3.6.1.2.1.47.1.1.1.1.13"
 ENT_ALIAS_MAPPING = "1.3.6.1.2.1.47.1.3.2.1.2"
 ENT_SENSOR = "1.3.6.1.2.1.99.1.1.1"
 UCD_CPU_IDLE = "1.3.6.1.4.1.2021.11.11.0"
@@ -765,6 +767,39 @@ def entity_sensors(port_sensors: dict, parent_label: str | None = None,
     return entries
 
 
+def sfp_cages(populated: dict | None = None, empty: dict | None = None) -> dict:
+    """ENTITY-MIB rows for transceiver cages with no DOM sensors at all —
+    the half of the estate entity_sensors() above cannot represent, since a
+    cage reporting nothing has no entPhySensor row to be found by.
+
+    populated/empty: {if_index: that port's ifDescr}. Each cage is a
+    container(5) holding a port(10) that carries the
+    entAliasMappingIdentifier row (the real Cisco shape: the cage itself is
+    aliased to nothing, the port in it is aliased to the ifIndex). A
+    populated cage additionally holds a module(9) naming the transceiver
+    plugged into it; an empty one holds nothing, which is the only thing
+    that tells the two apart.
+    """
+    populated, empty = populated or {}, empty or {}
+    entries: dict = {}
+    for if_index, descr in {**populated, **empty}.items():
+        cage, port, module = 2000 + if_index, 2500 + if_index, 3000 + if_index
+        entries[f"{ENT_DESCR}.{cage}"] = (T_OCTET_STRING, f"{descr} Container SFP+")
+        entries[f"{ENT_CLASS}.{cage}"] = (T_INTEGER, 5)          # container
+        entries[f"{ENT_CONTAINED_IN}.{cage}"] = (T_INTEGER, 1)
+        entries[f"{ENT_DESCR}.{port}"] = (T_OCTET_STRING, descr)
+        entries[f"{ENT_CLASS}.{port}"] = (T_INTEGER, 10)         # port
+        entries[f"{ENT_CONTAINED_IN}.{port}"] = (T_INTEGER, cage)
+        entries[f"{ENT_ALIAS_MAPPING}.{port}.0"] = (
+            T_OID, f"1.3.6.1.2.1.2.2.1.1.{if_index}")
+        if if_index in populated:
+            entries[f"{ENT_DESCR}.{module}"] = (T_OCTET_STRING, "10Gbase-LR SFP+")
+            entries[f"{ENT_CLASS}.{module}"] = (T_INTEGER, 9)    # module
+            entries[f"{ENT_CONTAINED_IN}.{module}"] = (T_INTEGER, cage)
+            entries[f"{ENT_MODEL_NAME}.{module}"] = (T_OCTET_STRING, "SFP-10G-LR")
+    return entries
+
+
 def arc_objects(arc: int, extra_scalars: dict | None = None) -> dict:
     """A couple of objects under the vendor's own enterprise arc, so
     vendorid.hop_enterprise_arcs() finds something when it hops from
@@ -981,12 +1016,24 @@ CISCO_CORE_DESCR = (
     "Cisco IOS Software [Amsterdam], Catalyst L3 Switch Software "
     "(CAT9K_IOSXE), Version 17.3.5, RELEASE SOFTWARE (fc1)")
 
+# The two light-level rows are dBm(14), the type a real optic reports them
+# as: type 1 (other) made the whole optical path — direction from the
+# sensor's own name, the sfp_rx_dbm/sfp_tx_dbm keys, the low-power rules —
+# unreachable from this fleet.
 DOM_SENSORS = [
     ("Transceiver temperature", 8, "C", 41.0, 3.5),
     ("Transceiver supply voltage", 4, "V", 3.28, 0.04),
     ("Transceiver bias current", 5, "mA", 0.0072, 0.0004),
-    ("Transceiver tx power", 1, "dBm", -2.4, 0.5),
-    ("Transceiver rx power", 1, "dBm", -5.8, 1.4),
+    ("Transceiver tx power", 14, "dBm", -2.4, 0.5),
+    ("Transceiver rx power", 14, "dBm", -5.8, 1.4),
+]
+# An optic in a port that is powered down, or has no fiber in it: both light
+# levels pinned at the -40 dBm floor every vendor clamps to. Nothing may
+# alert on this device — which is the whole point of having it in the fleet.
+DOM_SENSORS_DARK = [
+    (label, stype, unit, -40.0 if unit == "dBm" else base,
+     0.0 if unit == "dBm" else swing)
+    for label, stype, unit, base, swing in DOM_SENSORS
 ]
 
 # The plant's VTP domain: one VLAN database every Cisco switch answers the
@@ -1073,8 +1120,10 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     # comment) — proving nodepoll ignores it in favour of dot1qPvid above,
     # not merely never triggering the bug that decoy used to cause.
     entries.update(vtp_access_decoy([1, 2]))
+    # Uplink 2's optic is dark: the port is administratively up with nothing
+    # lit on the other end, the case a -40 dBm reading must never alert on.
     entries.update(entity_sensors({access + 1: DOM_SENSORS,
-                                   access + 2: DOM_SENSORS}))
+                                   access + 2: DOM_SENSORS_DARK}))
     entries.update(host_resources(1, [("Physical memory", 1024, 524288, 0.61)]))
     entries.update(arc_objects(9, {
         # CISCO-PROCESS-MIB cpmCPUTotal5minRev, one of the two objects an
@@ -1149,7 +1198,13 @@ def _build_cisco_core(wrap32: bool, ports: int, vlan: str | None) -> dict:
     # own downlinks currently carry.
     entries.update(vtp_vlan_names(PLANT_VLAN_NAMES))
     entries.update(entity_sensors({access + i: DOM_SENSORS
-                                   for i in range(1, uplinks + 1)}))
+                                   for i in range(1, uplinks - 1)}))
+    # The last two uplinks are the estate a DOM walk cannot see at all: one
+    # transceiver that reports no sensors, one cage with nothing in it.
+    # names[i - 1] is ifIndex i's own ifDescr (if_table's own contract).
+    entries.update(sfp_cages(
+        populated={access + uplinks - 1: names[access + uplinks - 2]},
+        empty={access + uplinks: names[access + uplinks - 1]}))
     entries.update(host_resources(2, [("Physical memory", 1024, 2097152, 0.48)]))
     entries.update(arc_objects(9, {
         "1.3.6.1.4.1.9.9.109.1.1.1.1.8.1": (

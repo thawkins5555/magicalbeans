@@ -14,6 +14,7 @@ threshold (a live value against hysteresis, not an event at all).
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from dataclasses import dataclass, field
 
@@ -210,6 +211,47 @@ def comparison_of(rule) -> str:
     return "below" if str(rule["comparison"] or "above") == "below" else "above"
 
 
+def _metric_root_of(rule) -> str:
+    """A threshold rule's metric family (rules.source_kind), read the same
+    defensive way comparison_of reads its own column: a plain dict built by
+    a test need not carry one."""
+    try:
+        keys = rule.keys()
+    except AttributeError:
+        keys = rule
+    if "source_kind" not in keys:
+        return ""
+    return str(rule["source_kind"] or "")
+
+
+# An optic with no fiber in it, or a port powered down, reports the bottom
+# of its own scale rather than a fault: -40 dBm is where the common vendors
+# clamp, and nothing that is actually working ever reads there (receive
+# sensitivity bottoms out around -23 dBm on the worst 1G/10G part). A 0 is
+# the same statement from an agent quoting milliwatts of nothing, and a
+# non-finite value is an agent with no reading at all to give.
+DARK_OPTIC_DBM = -40.0
+_DARK_OPTIC_TOLERANCE_DB = 0.5
+# The two metric families (rules.source_kind) a dark reading may silence.
+# Keyed off the family, not off the value alone, so no other 'below' rule
+# can ever inherit this.
+OPTIC_POWER_METRICS = frozenset({"sfp_rx_dbm", "sfp_tx_dbm"})
+
+
+def is_dark_optic(metric_root: str, value) -> bool:
+    """Whether an optical-power reading means "no light" rather than "too
+    little light". Lives here rather than in the poller because both ends
+    have to agree on it: nodepoll keeps dark lanes out of a multi-lane
+    optic's worst-of, and breaches() below refuses to alert on one."""
+    if metric_root not in OPTIC_POWER_METRICS:
+        return False
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    if not math.isfinite(value):
+        return True
+    return value == 0.0 or value <= DARK_OPTIC_DBM + _DARK_OPTIC_TOLERANCE_DB
+
+
 def breaches(rule, value) -> bool:
     """Whether `value` is on the wrong side of `rule`'s threshold. The one
     place the direction lives -- _evaluate_thresholds counts its streak
@@ -218,6 +260,12 @@ def breaches(rule, value) -> bool:
         return False
     threshold = rule["threshold"]
     if threshold is None:
+        return False
+    # Guarded here rather than where the metric is written: threshold_stale_s
+    # is 900 s, so a -40 already recorded would go on re-evaluating for
+    # fifteen minutes, and one written by an older build would never expire
+    # at all.
+    if is_dark_optic(_metric_root_of(rule), value):
         return False
     if comparison_of(rule) == "below":
         return value <= threshold

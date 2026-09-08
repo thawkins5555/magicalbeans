@@ -738,14 +738,54 @@ these do not drown the dialog's HARDWARE list.
 The same pass writes `interfaces.media` (`update_interface_media`, batched
 like `update_interface_poe`): `'optic'` for every port a sensor resolved to
 — whatever it read and whatever its status, since a failed optic is still an
-optic — and `NULL` for every other row of that device that currently says
-`'optic'`. It is reached only after the walk answered, so a timeout never
+optic — and `NULL` for every other row of that device that currently names a
+medium. It is reached only after the walk answered, so a timeout never
 strips the badge; the early return for an empty `cols` covers that. This is
 the only media signal the app has, because IF-MIB has none, and it is what
 `nodes.js`'s `sfpBadge` renders. The device dialog additionally patches the
 rows it fetched with the `if_index` set from its own `/dom` read, in the
 dialog's own closure, so whichever of the two fetches lands second paints
-the badge on a device the poller has not yet walked.
+the badge on a device the poller has not yet walked. That patch only ever
+UPGRADES a row to `'optic'`: the live read proves DOM on the ports it names
+and says nothing about the ones it does not.
+
+**5.2.0 widened `media` past the ports that answer sensors.** A DOM walk
+cannot see an SFP slot that reports no DOM — a transceiver without the
+sensors, or an empty cage — and until now those were indistinguishable from
+copper. `_sfp_slot_media` reads three more ENTITY-MIB columns
+(`entPhysicalClass`, `entPhysicalVendorType`, `entPhysicalModelName`)
+alongside the `entPhysicalDescr` and `entPhysicalContainedIn` the walk
+already had, and resolves each cage through the containment tree
+`_entity_port_map` walks — which is now walked once by `_poll_environment`
+and passed to both, rather than twice. An entity whose own text names a
+transceiver (`_TRANSCEIVER_TEXT`) and that resolves to an `ifIndex` is
+`'sfp'`; a `container(5)` that says it is a transceiver cage and holds
+nothing that does is `'sfp_empty'`, taking its `ifIndex` from the `port(10)`
+sitting in it, since the cage itself rarely carries the alias row. DOM
+always wins: a port with sensors is `'optic'` whatever its cage says. A
+container naming nothing is deliberately left alone — some platforms give
+every copper port one too, and a copper port must never wear an SFP badge,
+which is also why `_TRANSCEIVER_TEXT` matches an optical media suffix
+(`base-SX`, `10Gbase-LR`) or a form factor but never a bare `1000BaseT`.
+The three columns are only walked when the entity table mapped something to
+a port, so a device that answers none of this pays nothing for them.
+
+**A −40 dBm optic is dark, not dying.** A transceiver with its port powered
+down or no fiber in it clamps at the bottom of its scale, and
+`_decode_entity_sensor`'s arithmetic reports that faithfully as `-40.0`;
+`entPhySensorStatus` still says `ok(1)`, so the status filter never catches
+it. `alertrules.is_dark_optic` names the condition once for both ends —
+`DARK_OPTIC_DBM` with half a dB of tolerance, plus the zero-light sentinels
+(an exact `0`, a non-finite value) — and `breaches()` returns `False` for
+one on the two optic power families (`rules.source_kind` of `sfp_rx_dbm` or
+`sfp_tx_dbm`), keyed off the family so no other `'below'` rule can inherit
+it. The guard has to live there rather than at the metric write:
+`threshold_stale_s` defaults to 900 s, so a `-40` already recorded would go
+on re-evaluating for fifteen minutes, and one written by an older build
+would never expire at all. `_poll_environment` also drops dark lanes before
+the per-port `min()`, so one dark lane of a multi-lane optic no longer beats
+three healthy ones; a port dark on every lane still records the floor, which
+keeps its chart continuous and its history true.
 
 **5.0.1 gave the walk a second table and the latch an expiry.** The value
 column `_poll_environment` asks for now comes from `_walk_sensor_columns`
