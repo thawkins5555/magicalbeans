@@ -62,8 +62,11 @@ CREATE TABLE IF NOT EXISTS flows (
     domain    INTEGER DEFAULT 0,
     sampler_id INTEGER DEFAULT 0
 );
+-- The only index on flows: every other filter (src_ip LIKE, port, protocol)
+-- is a residual tested against a window ix_flows_ts already narrowed, and an
+-- index the writer pays for on every insert has to earn more than that.
+-- drop_legacy_indexes() removes the ix_flows_exporter an older store has.
 CREATE INDEX IF NOT EXISTS ix_flows_ts ON flows(ts_end);
-CREATE INDEX IF NOT EXISTS ix_flows_exporter ON flows(exporter, ts_end);
 
 CREATE TABLE IF NOT EXISTS exporters (
     address    TEXT PRIMARY KEY,
@@ -339,6 +342,14 @@ class FlowDatabase(SqliteStore):
                     (rate, exporter, domain, sampler_id, rate, since_ts))
                 corrected += cursor.rowcount or 0
             self._conn.commit()
+        if corrected:
+            # Rows a sealed rollup bucket was built from have just changed
+            # value. Recording how far back lets compact_rollup follow the
+            # rewrite rather than quietly disagreeing with the raw rows,
+            # whatever the caller's bound turns out to be.
+            floor = self._private_setting(_RESAMPLE_FLOOR)
+            if floor is None or since_ts < float(floor):
+                self._set_private_setting(_RESAMPLE_FLOOR, since_ts)
         return corrected
 
     def samplers(self) -> list[sqlite3.Row]:
@@ -539,6 +550,26 @@ class FlowDatabase(SqliteStore):
         return written, done
 
     # ------------------------------------------------------------- maintenance
+
+    _DROPPED_EXPORTER_IX = "dropped_ix_flows_exporter"
+
+    def drop_legacy_indexes(self) -> bool:
+        """Drop the ix_flows_exporter an older store still carries.
+
+        Off the open path on purpose: dropping the index of a table with
+        tens of millions of rows walks and frees every one of its pages,
+        which is the class of work that made startup take half a minute
+        before (sqlitebase.CONVERT_AT_OPEN_PAGES exists for the same
+        reason). A pause on the maintenance timer is expected; a pause at
+        startup is a bug. Returns whether it did anything.
+        """
+        if self._private_setting(self._DROPPED_EXPORTER_IX):
+            return False
+        with self._lock:
+            self._conn.execute("DROP INDEX IF EXISTS ix_flows_exporter")
+            self._conn.commit()
+        self._set_private_setting(self._DROPPED_EXPORTER_IX, True)
+        return True
 
     def _delete_rollup(self, tier: int, low: int, upper: int) -> int:
         """Both rollup tables for buckets in [low, upper). Lock held, no
