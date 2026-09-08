@@ -215,6 +215,66 @@ for theme_name in sorted(THEMES):
           "[%s] text > muted > dim > line against the page" % theme_name)
 
 # --------------------------------------------------------------------------
+# 1b. The alert-severity row tint, which is not a token but a colour-mix of
+#     two, so section 1's token-vs-token pairs never reach it. app.css's own
+#     comment states how many theme blocks --fail falls under AA in on that
+#     tint, and that claim is recomputed here for the same reason every ratio
+#     in tokens.css is. It earned the check: the comment read "two of the six"
+#     for a figure that is five of seven statically and seven of seven at the
+#     pulse peak. Both the percentages and the claim are read out of app.css
+#     rather than restated, so a retuned tint or a renewed --fail moves this
+#     test with it instead of leaving it asserting last year's palette.
+APP_CSS = read(STATIC, "app.css")
+
+
+def mix(front, back, fraction):
+    # color-mix(in srgb, ...) interpolates the gamma-encoded components, and
+    # the browser serializes the result to 8-bit channels — the rounding is
+    # part of the colour the operator is actually looking at.
+    front, back = front.lstrip("#"), back.lstrip("#")
+    return "#%02X%02X%02X" % tuple(
+        round(int(front[i:i + 2], 16) * fraction + int(back[i:i + 2], 16) * (1 - fraction))
+        for i in (0, 2, 4))
+
+
+SEVERE_CSS = APP_CSS[APP_CSS.index("tr.alert-severe td {"):APP_CSS.index("td.num {")]
+TINTS = [int(pct) / 100 for pct in re.findall(
+    r"color-mix\(in srgb, var\(--fail\) (\d+)%, var\(--panel\)\)", SEVERE_CSS)]
+check(len(TINTS) == 3, "app.css mixes three alert-severe tints — the static one plus "
+                       "the two pulse keyframe ends (found %s)" % TINTS)
+CLAIM = re.search(r"under AA on this tint in (\d+)\s+of the (\d+) theme blocks\s+"
+                  r"statically \(([0-9.,\s]+)\)", APP_CSS)
+check(CLAIM is not None, "app.css still states the alert-severe tint's AA count")
+if CLAIM and len(TINTS) == 3:
+    static_tint, peak_tint = TINTS[0], max(TINTS)
+    check(int(CLAIM.group(2)) == len(THEMES), "the comment counts every theme block "
+          "(says %s, there are %d)" % (CLAIM.group(2), len(THEMES)))
+    measured = []
+    for theme_name in sorted(THEMES):
+        ratio = contrast(tok("--fail", theme_name),
+                         mix(tok("--fail", theme_name), tok("--panel", theme_name), static_tint))
+        if ratio < 4.5:
+            measured.append(round(ratio, 2))
+    claimed = sorted(float(value) for value in CLAIM.group(3).split(","))
+    check(int(CLAIM.group(1)) == len(measured),
+          "--fail on the %d%% tint is under AA in %d of %d blocks; the comment says %s"
+          % (static_tint * 100, len(measured), len(THEMES), CLAIM.group(1)))
+    check(sorted(measured) == claimed, "the comment's ratios are the computed ones "
+          "(comment %s, measured %s)" % (claimed, sorted(measured)))
+    # The pulse peak is the worst ground a row ever shows, and the whole
+    # reason .sev is pinned to --text: that fix is only sufficient if --text
+    # itself clears AA there in every theme, which is what makes it the one
+    # tone a cell in such a row may use.
+    for theme_name in sorted(THEMES):
+        peak = mix(tok("--fail", theme_name), tok("--panel", theme_name), peak_tint)
+        severity_word = contrast(tok("--fail", theme_name), peak)
+        check(severity_word < 4.5, "[%s] --fail on the %d%% pulse peak is %.2f:1, under AA "
+              "— .sev still needs --text" % (theme_name, peak_tint * 100, severity_word))
+        ratio = contrast(tok("--text", theme_name), peak)
+        check(ratio >= 4.5, "[%s] --text on the %d%% pulse peak = %.2f:1 (floor 4.5)"
+              % (theme_name, peak_tint * 100, ratio))
+
+# --------------------------------------------------------------------------
 # 2. The VLAN palette: one strand per VLAN on a MAPPER trunk. Unlike the
 #    fixed-role pairs above, these sixteen also have to stay apart from EACH
 #    OTHER — a MAPPER trunk lays them down as 1.5px lines side by side, and a
