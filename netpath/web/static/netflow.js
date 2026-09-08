@@ -174,7 +174,7 @@
   /* A window change asks a different question, so the answer to the previous
      one stops being shown while the new one is fetched: a chart and a record
      table of the minutes an operator has just left read as the answer, and
-     carry nothing that says otherwise. Scoped to the two views that are
+     carry nothing that says otherwise. Scoped to the three views that are
      actually changing rather than modalling the page, and deliberately NOT
      the poll tick — re-reading the same window every two seconds must not
      blank the page it is refreshing. */

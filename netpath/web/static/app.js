@@ -5028,9 +5028,10 @@ const App = (() => {
     // fully concurrent refresh() for the same tab, racing the first against
     // an already-struggling server. lastFetch alone cannot catch that: it
     // only spaces out ticks that each start on time, and says nothing about
-    // one still running when the next is due. This flag does, and is reset
-    // in a finally so a refresh() that throws — the superseded case included
-    // — still lets the next attempt through rather than jamming the tab.
+    // one still running when the next is due. This flag does, and runRefresh
+    // clears it however the refresh ends — the superseded case included — so
+    // one that throws still lets the next attempt through rather than
+    // jamming the tab.
     if (page.refreshing) return;
     if (now - (page.lastFetch || 0) < rateFor(state.tab)) return;
     await runRefresh(state.tab, page);
