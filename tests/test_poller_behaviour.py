@@ -656,10 +656,53 @@ def test_reboot_note_is_human_units():
           "a detail this did not write yields nothing rather than a wrong claim")
 
 
+def test_reboot_uptimes_refuses_the_legacy_sentence():
+    """The 5.2 poller wrote the raw-tick sentence, and its rows are still
+    drained by the 5.3 engine after a restart (the source cursor survives one).
+    A loose `(.+?)` matched that sentence too and put "1036800000" in the
+    reboot email's "Previous reported uptime" line -- the raw tick count this
+    release exists to stop printing. Only what format_ticks can emit parses."""
+    legacy = ("uptime dropped from 1036800000 to 15000 hundredths of a second "
+              "after 300s without a reading")
+    check(nodepoll_mod.reboot_uptimes(legacy) == ("", ""),
+          f"the pre-5.3 sentence yields nothing, not its raw tick counts "
+          f"({nodepoll_mod.reboot_uptimes(legacy)})")
+
+    # Every shape format_ticks can emit, both sides: the sub-day HH:MM:SS.cc
+    # form and the day form, the latter with a day count past one digit.
+    for previous_ticks, current_ticks in ((1_036_800_000, 15_000),
+                                          (4_294_000_000, 8_640_000),
+                                          (360_000, 100),
+                                          (8_640_000, 359_999)):
+        rebooted, note = detect_reboot(current_ticks, 1300.0,
+                                       previous_ticks, 1000.0)
+        check(rebooted, f"the reset from {previous_ticks} is detected")
+        check(nodepoll_mod.reboot_uptimes(note)
+              == (format_ticks(previous_ticks), format_ticks(current_ticks)),
+              f"{note!r} round-trips to its two uptimes "
+              f"(got {nodepoll_mod.reboot_uptimes(note)})")
+
+
+def test_reboot_note_has_no_empty_duration():
+    """duration_text renders a sub-second gap as "", which pasted into the
+    sentence unguarded read "after  without a reading" -- a double space and
+    a claim with nothing in it."""
+    rebooted, note = detect_reboot(100, 1000.4, 1_036_800_000, 1000.0)
+    check(rebooted, "a reset across a sub-second gap is still detected")
+    check("  " not in note and "after  without" not in note,
+          f"no empty duration is pasted into the note ({note!r})")
+    check(nodepoll_mod.reboot_uptimes(note)
+          == (format_ticks(1_036_800_000), format_ticks(100)),
+          f"the shortened note still round-trips "
+          f"({nodepoll_mod.reboot_uptimes(note)})")
+
+
 def main():
     test_counter_rate_width_matters()
     test_format_ticks_divides_by_a_hundred()
     test_reboot_note_is_human_units()
+    test_reboot_uptimes_refuses_the_legacy_sentence()
+    test_reboot_note_has_no_empty_duration()
     test_independent_octet_widths()
     test_utilization_clamped_at_sentinel()
     test_link_down_recorded_after_reboot_when_identity_unchanged()
