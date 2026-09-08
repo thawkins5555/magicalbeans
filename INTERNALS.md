@@ -4386,7 +4386,11 @@ is algebraically the same "everything not in the top series" the raw path
 computes by adding up the keys it left out, so `overview()` uses the one
 formulation on both paths and `— other —` absorbs sub-cap keys and, on
 the rollup path, NULL-keyed traffic (`flow_rollup`'s primary key forbids
-NULL, so the compaction `SELECT` carries `IS NOT NULL`).
+NULL, so the compaction `SELECT` carries `IS NOT NULL`). It is clamped at
+zero on read: a dimension and its bucket's span row are written in
+separate transactions, so a dimension rebuilt after late flows arrived can
+be read against a span built before them, and a series that stacks
+downwards is not something traffic does.
 
 Two tiers, matched to `api._flow_bucket`'s ladder: 60 serves the 60/300/900
 buckets, 3600 serves 3600 and 21600, and the 10-second bucket of the
@@ -4487,10 +4491,11 @@ summarise rather than growing by a bucket a minute for ever. That is what
 building new buckets *before* the redo window buys: a pass whose redo
 alone outran its budget used to leave the watermark exactly where it
 started and repeat the same work on the next pass. The maintenance sweep
-additionally compacts, backfills and drops the legacy index *before*
-pruning — the same
+backfills and drops the legacy index *before* pruning — the same
 ordering, and the same reason, as the `nodes_db.compact_rollup()` /
-`nodes_db.prune()` pair beside it.
+`nodes_db.prune()` pair beside it. It does not compact: the timer has
+already built those buckets, and `Service._rollup_lock` keeps the sweep's
+backfill and the timer's compaction from rebuilding one at the same time.
 
 ### Zoom debounce and the stale-response guard (`netflow.js`)
 

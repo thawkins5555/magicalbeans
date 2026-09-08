@@ -453,6 +453,35 @@ def test_10_a_late_exporter_still_reaches_the_rollups() -> None:
     db.close()
 
 
+# ------------------------------------------------------------------------ 11
+
+def test_11_the_residual_never_stacks_downwards() -> None:
+    print("11: a bucket read mid-rebuild does not draw a negative 'other'")
+    db = store("residual.db")
+    now = time.time()
+    start = flowdb._align_down(now - 3600, 60)
+    db.insert_flows([flow(i, start + i * 3.0) for i in range(600)])
+    cover(db, hours=False)
+
+    # A dimension's rows and its bucket's span row are written in separate
+    # transactions, so a dimension rebuilt after late flows arrived can be
+    # read against a span built before them. Reproduced here by shrinking
+    # the spans: the stored keys then outweigh the total they are measured
+    # against, which is what the residual is computed from.
+    with db._lock:
+        db._conn.execute(
+            "UPDATE flow_rollup_span SET bytes = bytes / 3 WHERE tier = 60")
+        db._conn.commit()
+
+    _times, series, _b, _top, _totals = db.overview(
+        start, now, "Source", NO_FILTERS, 60)
+    negative = [(key, value) for key, values in series.items()
+                for value in values if value < 0]
+    check(not negative,
+          f"no series the chart stacks is negative ({negative[:3]})")
+    db.close()
+
+
 TESTS = [
     test_1_rollup_and_raw_agree,
     test_2_totals_survive_truncation,
@@ -464,6 +493,7 @@ TESTS = [
     test_8_a_window_below_the_floor_falls_back,
     test_9_the_watermark_advances_under_a_tight_budget,
     test_10_a_late_exporter_still_reaches_the_rollups,
+    test_11_the_residual_never_stacks_downwards,
 ]
 
 

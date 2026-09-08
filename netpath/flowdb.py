@@ -1074,6 +1074,13 @@ class FlowDatabase(SqliteStore):
         for values in series.values():
             for index, value in enumerate(values):
                 other[index] -= value
+        # Clamped, because the two halves of a bucket are written in
+        # separate transactions: a dimension rebuilt after late flows
+        # arrived can be read against a span row built before them, and the
+        # keys then briefly outweigh the total they are measured against.
+        # A bucket or two behind is what that is; a series stacking
+        # downwards is not something traffic does.
+        other = [max(0.0, value) for value in other]
         if any(other):
             series["\u2014 other \u2014"] = other
 

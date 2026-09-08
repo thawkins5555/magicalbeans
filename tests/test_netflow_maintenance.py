@@ -79,6 +79,10 @@ service.flow_db.insert_flows(
     [flow(i, OLDEST + i * (SPAN / TOTAL)) for i in range(TOTAL)])
 quiet_flow_settings(service)
 
+# What the 60-second rollup timer does; the sweep no longer repeats it, so
+# the tiers are seeded here the way a running service would have them.
+service.compact_flow_rollups()
+
 before_bytes = service.flow_db.size_bytes()
 before_rows = raw_count(service)
 # Well under the file, well over what the rollups themselves need: the trim
@@ -115,6 +119,38 @@ check("...with buckets actually stored below the oldest surviving raw row, "
 
 service.shutdown()
 shutil.rmtree(os.path.join(TMPDIR, "t1"), ignore_errors=True)
+
+
+# ------------------- 2. the sweep does not compact behind the rollup timer
+
+# compact_flow_rollups() is the 60-second thread's job. The sweep calling it
+# too doubled a sweep's rollup load for buckets already built, and let two
+# threads rebuild the same bucket at once -- which is how a dimension's rows
+# came to be paired with a span row built from a different set of flows, and
+# the chart briefly stacked a negative "other".
+service2 = new_service("t2")
+quiet_flow_settings(service2)
+service2.settings["max_flow_db_mb"] = 0
+service2.flow_db.insert_flows(
+    [flow(i, NOW - 3600 + i * 0.5) for i in range(4000)])
+service2.compact_flow_rollups()
+
+compactions = []
+service2.compact_flow_rollups = lambda: compactions.append(1)
+service2.run_maintenance(force=True)
+
+check("a maintenance sweep leaves forward compaction to the timer that owns "
+      "it, and only backfills",
+      not compactions, f"{len(compactions)} call(s)")
+check("...and the backfill still ran, so the sweep did not simply stop "
+      "summarising",
+      service2.flow_db.rollup_bounds(3600)[0] is not None
+      and service2.flow_db._conn.execute(
+          "SELECT COUNT(*) FROM flow_rollup_span").fetchone()[0] > 0,
+      service2.flow_db.rollup_bounds(3600))
+
+service2.shutdown()
+shutil.rmtree(os.path.join(TMPDIR, "t2"), ignore_errors=True)
 
 shutil.rmtree(TMPDIR, ignore_errors=True)
 
