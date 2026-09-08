@@ -1881,6 +1881,12 @@ their real value rather than the label, so `HTTPS (443)` lands between 80 and
 1024 rather than under H, and `4.0 MB` sorts above `900 B`. Cells with nothing
 in them sort to the bottom whichever way the column points.
 
+Ordering by volume reads the most recent couple of million records of the
+window rather than every one of them, because the sort key is bytes times a
+sampling rate that can be rewritten after the fact and so cannot be indexed.
+Where that bound is reached the selector's tooltip says so; *most recent*
+never reaches it.
+
 Filters for source, destination, port, protocol and exporter apply to all three
 at once. Clicking a bar filters to it.
 
@@ -1965,6 +1971,29 @@ window you have already zoomed away from is discarded rather than drawn.
 
 Flows live in their own database so a busy exporter does not contend with the
 trace scheduler. Retention, a row cap and a file size cap all apply.
+
+Beside the individual records the collector keeps **summaries**: every minute
+and every hour, the heaviest keys of each Group by dimension, plus that
+period's grand total. The charts and the top-talkers bars are drawn from
+those wherever they cover the window asked for, which is what makes a 7- or
+30-day view answer in the same time a one-hour view does however many flows
+are behind it. The 15-minute view, and any filtered view, reads the records
+themselves.
+
+The summaries have their own retentions — *Keep minute summaries for* and
+*Keep hourly summaries for* — and they are deliberately longer than the flow
+retention. A store keeping a fortnight of individual flows and 90 days of
+hourly summaries still draws a 30-day chart; what it cannot do is show the
+records behind it. Deleting all flow records from **Settings → Maintenance**
+deletes the summaries with them, so the charts empty too.
+
+Two things about the summarised figures are worth knowing. Totals — the
+bytes, packets and flow count under the chart — are exact whichever source
+answered. A named series is exact for any key heavy enough to be among the
+heaviest in every period it appears in; a key that drops below that line in
+some periods is short by what it lost there, and that traffic appears in
+*— other —* rather than going missing. Filtered views are read from the
+records and are exact throughout.
 
 ---
 

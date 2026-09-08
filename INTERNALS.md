@@ -318,7 +318,7 @@ fourth setting).
 | --- | --- | --- |
 | `app.db` | `AppDatabase` (`appdb.py`) | global settings, `users`, `user_permissions` (per-account per-module read/write grants), `hostnames` (the shared reverse-DNS cache), `asn_cache` (ASN/owner per address, long TTL), a `meta` table for one-off markers like the update-installed commit |
 | `netpath.db` | `Database` (`db.py`) | `targets`, `traces`, `hops`, `hop_stats` (cumulative continuous-probe counters per target/hop), NetPath's own settings |
-| `flows.db` | `FlowDatabase` (`flowdb.py`) | `flows`, `exporters`, `interfaces`, NetFlow's own settings |
+| `flows.db` | `FlowDatabase` (`flowdb.py`) | `flows`, `flow_rollup` (top-K per dimension per bucket, two tiers), `flow_rollup_span` (each bucket's grand total), `exporters`, `interfaces`, `samplers`, NetFlow's own settings |
 | `syslog.db` | `SyslogDatabase` (`syslogdb.py`) | `logs`, `log_counts` (hourly rollup), the FTS5 index, Syslog's own settings |
 | `ipam.db` | `IpamDatabase` (`ipamdb.py`) | `subnets`, `hosts`, `conflicts`, `scans`, `dhcp_servers`, `dhcp_scopes`, `dhcp_leases`, `dhcp_scope_history` (leased-IP trend), IPAM's own settings |
 | `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `device_groups` (organizational, unrelated to `groups`), `devices`, `interfaces`, `device_events`/`interface_events`, `discovery_jobs`/`discovery_results`, `vlans`/`vlan_ports`/`port_vlans` (per-port VLAN membership, for MAPPER), `mac_entries`, `neighbors`, `device_addresses`, `vendor_learned`, Nodes' own settings. Also the facade over the two files below |
@@ -4250,15 +4250,119 @@ third — each walking the same rows. Widening the window multiplies the
 rows every one of them reads, which is why zooming out felt like the app
 had hung. `overview()` does the single `GROUP BY key, slot` pass those
 three shared and derives all of it from the result: summed per key it is
-`top`, summed overall it is `totals`, and bucketed it is the stacked
-series. Ties are broken by name rather than left to SQL's arbitrary
-`ORDER BY` order, so two equal-volume keys keep the same position — and
-therefore the same colour — between refreshes. `series()`, `top()` and
-`totals()` remain for their other callers.
+`top`, bucketed it is the stacked series. Ties are broken by name rather
+than left to SQL's arbitrary `ORDER BY` order, so two equal-volume keys
+keep the same position — and therefore the same colour — between
+refreshes. `series()`, `top()` and `totals()` are now thin wrappers over
+the same `_agg_rows()` helper, so there is one copy of the SQL and one
+routing decision rather than four that can drift apart.
 
-The record list's `ORDER BY bytes * sampling DESC` over the whole window
-is the remaining unindexed cost, left alone deliberately: changing it
-would change what "top 250 by volume" means.
+**The rollups, and why the cap is the point.** One scan is still a scan:
+at a hundred million rows the single pass is the whole cost. `flow_rollup`
+holds, per (tier, dimension, bucket), the heaviest `ROLLUP_KEYS[tier]`
+keys with `sampling` already multiplied into the stored sums — the factor
+is per row, so it cannot be reapplied to an aggregate afterwards. Because
+the row count per bucket is capped, a query costs
+`O(window / bucket × K)` **whatever the traffic volume is**; the
+alternatives considered (one row per flow tuple; one uncapped row per
+(dimension, bucket, key)) both scale with traffic and so move the cliff
+rather than removing it.
+
+The cap would make totals wrong, so `flow_rollup_span` keeps each
+bucket's grand total once — dimension-independent, since every dimension
+sums the same flows — and the residual is `span − Σ(stored keys)`. That
+is algebraically the same "everything not in the top series" the raw path
+computes by adding up the keys it left out, so `overview()` uses the one
+formulation on both paths and `— other —` absorbs sub-cap keys and, on
+the rollup path, NULL-keyed traffic (`flow_rollup`'s primary key forbids
+NULL, so the compaction `SELECT` carries `IS NOT NULL`).
+
+Two tiers, matched to `api._flow_bucket`'s ladder: 60 serves the 60/300/900
+buckets, 3600 serves 3600 and 21600, and the 10-second bucket of the
+15-minute view stays on raw, where a quarter of an hour of rows is cheap.
+
+**Building them** (`compact_rollup`, `backfill_rollup`) follows
+`nodesseriesdb.compact_rollup`'s shape with three deliberate differences.
+The watermark seeds at the current *sealed* bucket rather than at the
+oldest row, so an existing store produces useful buckets on its first pass
+instead of grinding through a fortnight of history first; history is paged
+in separately by `backfill_rollup`, walking a floor cursor backwards a
+bucket at a time and committing it as it goes. A bucket is rebuilt with
+DELETE-then-INSERT rather than an upsert, because which keys make the
+top-K changes when it is recomputed and a stale row would otherwise
+survive its key dropping out. And the hourly tier reads the minute tier
+for any hour the minute tier fully covers — sixty rows instead of an
+hour's worth of raw flows.
+
+Query routing (`_rollup_plan`) refuses the rollups outright when any
+filter is set (the rollup has one row per key, not per flow, and the
+filters select on columns that are not in it), when no tier divides the
+bucket size, and when the tier's floor does not reach the start of the
+window. That last rule is what makes the backfill safe to run at any
+pace: as the cursor walks back, progressively wider windows move off raw,
+and none is ever slower than it was before. The chosen tier serves
+`[t0, seal_ts)` and raw serves `[seal_ts, t1]`, where `seal_ts` is
+tier-aligned — so the two ranges are exactly complementary, with nothing
+counted twice and nothing falling between them. `t0` is snapped down to a
+bucket boundary on **both** paths, because a rollup bucket lands wholly
+inside one chart slot only if the slots start on a bucket boundary, and
+snapping only where a rollup happened to be used would shift the window
+under the operator whenever a filter was toggled.
+
+**Ingest.** `flows.db` is the one store that does not pin
+`synchronous=FULL` (`db.py`, `appdb.py` and `ipamdb.py` all do): NetFlow
+is UDP, an fsync per commit halves throughput, and a stalled writer is
+lost data with nothing to retransmit it. The writer drains the queue
+greedily rather than taking one datagram per loop, so a burst costs one
+commit instead of hundreds and `queue.Full` is reached far later.
+`collector.RESAMPLE_MAX_AGE_S` bounds `record_sampling_rates`' rewrite to
+the last fifteen minutes — unbounded it had no index it could use and
+grew into a scan of the whole retention window, on the writer thread,
+under the write lock, after every flush. When a rewrite does correct rows
+it records how far back it reached, and the next compaction follows it
+back, so widening that bound later cannot make the rollups quietly
+disagree with the rows they were built from.
+
+`ix_flows_exporter` was dropped: every insert paid for a random-position
+B-tree insert (`exporter` is not monotone, unlike `ts_end`) to serve one
+optional filter, and a filtered query is a range scan of `ix_flows_ts`
+with the rest tested as residuals either way. It is dropped lazily from
+maintenance (`drop_legacy_indexes`), never at open — freeing every page
+of a five-million-row index is exactly the class of work that made
+startup take half a minute before, which is what `CONVERT_AT_OPEN_PAGES`
+exists for.
+
+**Retention.** `prune()` is built on `SqliteStore._delete_batches`, the
+same shape `db.prune()` uses: age, then row cap, then each rollup tier,
+sharing one deadline, each stage chunked so the write lock is released
+between batches. Ids only chunk the sweep — every batch still filters on
+`ts_end`, so an exporter with a wrong clock cannot make it drop the wrong
+rows — and the row-cap stage derives its cut from `MIN(id)`/`MAX(id)`
+probes rather than the `COUNT(*)` full scan it used to run on every pass.
+The rollup stage walks bucket timestamps instead of ids (the helper only
+needs a monotonic coordinate) and raises the tier's floor as it goes, so
+routing stops trusting history that is no longer there.
+`retention_days` and `max_flows` now bound the raw table alone, which is
+the point: `rollup_minute_days` and `rollup_retention_days` outlive them,
+so a 30-day chart survives a fortnight's raw retention.
+
+The record list's `ORDER BY bytes * sampling DESC` cannot be index-served
+— the sort key is a product, and `sampling` is retroactively mutable — so
+the scan is bounded instead: `flows()` starts at `MAX(id) − FLOW_SCAN_CAP`
+(`MAX(rowid)` is one probe) and returns whether the bound bit, which
+`api._flow_records_rows` passes through as `scan_bounded` and `netflow.js`
+says out loud. Changing the sort would change what "top 250 by volume"
+means; bounding the scan does not.
+
+**The rollup loop** lives in `web/service.py`, on its own 60-second timer
+beside the maintenance thread rather than inside the quarter-hourly sweep:
+at `MAINTENANCE_INTERVAL_S` cadence the unsummarised tail would be a
+quarter of an hour of raw flows, which at extreme volume is the very scan
+the rollups exist to avoid. With that cadence and `_ROLLUP_LAG_S` the tail
+is never more than about three minutes. The maintenance sweep additionally
+compacts, backfills and drops the legacy index *before* pruning — the same
+ordering, and the same reason, as the `nodes_db.compact_rollup()` /
+`nodes_db.prune()` pair beside it.
 
 ### Zoom debounce and the stale-response guard (`netflow.js`)
 
