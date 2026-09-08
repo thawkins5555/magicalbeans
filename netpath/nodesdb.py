@@ -946,8 +946,10 @@ class NodesDatabase(SqliteStore):
         # Per-port PoE and STP state, the same kind of fact as oper_status
         # and refreshed by the same poll cycle rather than a table of its own.
         # media: 'optic' once a port-mapped ENTITY-SENSOR row proves a
-        # transceiver, else NULL. Written by _poll_environment — IF-MIB has
-        # no media column of its own.
+        # transceiver with DOM, 'sfp' for a transceiver the ENTITY-MIB names
+        # but that reports no DOM, 'sfp_empty' for a cage with nothing in it,
+        # else NULL. Written by _poll_environment — IF-MIB has no media
+        # column of its own.
         self.ensure_columns("interfaces", {
             "poe_admin": "TEXT", "poe_detect_status": "TEXT",
             "stp_state": "TEXT", "poe_power_mw": "INTEGER",
@@ -2836,9 +2838,9 @@ class NodesDatabase(SqliteStore):
                 raise
 
     def update_interface_media(self, device_id: int, rows: list[dict]) -> None:
-        """Per-port media kind ('optic' or None), batched the way
-        update_interface_poe batches its own poll. A row for a port this
-        device no longer has updates nothing, same as there."""
+        """Per-port media kind ('optic', 'sfp', 'sfp_empty' or None), batched
+        the way update_interface_poe batches its own poll. A row for a port
+        this device no longer has updates nothing, same as there."""
         if not rows:
             return
         params = [(row.get("media"), device_id, row["if_index"])

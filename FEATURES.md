@@ -406,15 +406,28 @@ own subtabs.
   transmit power are told apart by the sensor's own name, because the MIB
   says "optical power" without saying which direction; a reading whose
   name says neither is still shown in the port's dialog, it just gets no
-  metric key. A multi-lane optic reports the dimmest lane for light levels
-  and the most extreme reading for the rest. The device-wide
+  metric key. A multi-lane optic reports the dimmest lane that is lit for
+  light levels and the most extreme reading for the rest. The device-wide
   `temp_optic_c` is unchanged.
-- **A port with an optic in it says so.** Any port a sensor maps to is
-  marked as optical and shows an **SFP** badge beside its name in the
-  interface list — the only reliable signal there is, since IF-MIB has no
-  media column. The badge is cleared by the first walk that answers and
-  maps nothing to that port; a walk that times out leaves it alone rather
-  than blinking the whole fleet's optics out of existence.
+- **An optic with no light in it is not an optic in trouble.** A
+  transceiver whose port is powered down, or that has no fiber in it,
+  reports the bottom of its own scale — −40 dBm — and no low-power alert
+  is raised on that reading, on either receive or transmit. A genuinely
+  dying optic (−25 dBm, say) alerts exactly as before. On a multi-lane
+  optic a dark lane no longer drags the port's reported light level down
+  past three healthy ones, and a port dark on every lane still records
+  the floor so its chart keeps its history. In the DOM tables the reading
+  itself shows as **No signal**, with the raw figure on the row.
+- **A port with an optic in it says so, and so does an empty SFP slot.**
+  A port whose transceiver reports DOM readings shows a **DOM** badge
+  beside its name in the interface list; an SFP slot the device describes
+  but that reports no DOM at all — a transceiver without the sensors, or
+  a cage with nothing plugged into it — shows an **SFP** badge instead,
+  whose tooltip says which of the two it is. This is the only reliable
+  media signal there is, since IF-MIB has no media column. A badge is
+  cleared by the first walk that answers and finds nothing there; a walk
+  that times out leaves it alone rather than blinking the whole fleet's
+  optics out of existence.
 - **A device inherits its settings from a "polling profile"** (a group) —
   credentials, poll interval, timeout, retries, which of ping/SNMP are
   enabled, how many ping probes to send and how long to wait for them,
@@ -903,9 +916,10 @@ question actually gets answered.
 
 The interface list sorts by any column — Descr, Admin, Oper, Speed,
 In, Out — the same way every other table in the app does. A port carrying a
-transceiver shows an **SFP** badge beside its description; opening a device's
-dialog adds the badge to any port its live DOM read finds, even one the
-poller has not yet walked. Which SNMP identity
+transceiver that reports DOM shows a **DOM** badge beside its description
+and an SFP slot without one shows **SFP**; opening a device's dialog
+upgrades a port to **DOM** if its live read finds sensors there, even one
+the poller has not yet walked. Which SNMP identity
 fields the header shows (sysDescr, sysName, sysObjectID, contact,
 location, vendor, SNMP version) is chosen in Nodes → Settings; the IP,
 status and any SNMP error always show.

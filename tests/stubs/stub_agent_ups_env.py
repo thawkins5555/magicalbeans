@@ -66,6 +66,11 @@ Modes:
              shapes real gear uses -- units/precision 1 (IOS) and
              milli/precision 0 (NX-OS) -- both decoding through the plain
              RFC 3433 arithmetic.
+  sfp_media  Six ports covering every media verdict and the dark optic: a
+             working optic, an occupied cage with no DOM, an empty cage, a
+             copper port an agent models as container+port too (which must
+             stay unbadged), a two-lane optic with one lane dark, and one
+             dark on both lanes. See SFP_MEDIA_TABLE.
 
 Two control datagrams, on the same socket as SNMP itself (see
 stub_agent_fdb.py, which established this convention):
@@ -296,6 +301,99 @@ CISCO_DOM_TABLE = {
     "1.3.6.1.4.1.9.9.91.1.1.1.1.5.2000": ("int", 1),
 }
 
+# ------------------------------------------- SFP media and the dark optic
+# Six ports, one row of ENTITY-MIB reality each. Ports 1/5/6 carry standard
+# ENTITY-SENSOR-MIB optical-power rows (dBm(14), scale units(9), precision 1)
+# and are aliased to their ifIndex; ports 2/3/4 have no sensor of any kind,
+# which is exactly why entPhysicalClass has to answer for them:
+#
+#   if 1  a working optic, -5.5 dBm                     -> media 'optic'
+#   if 2  a cage holding a transceiver that reports no DOM  -> media 'sfp'
+#   if 3  a cage with nothing in it                     -> media 'sfp_empty'
+#   if 4  a copper port an agent ALSO models as container+port, naming no
+#         transceiver anywhere -> media NULL, never a badge
+#   if 5  a two-lane optic, one lane dark at -40 and one healthy at -6
+#   if 6  a two-lane optic dark on both lanes
+SFP_MEDIA_TABLE = {
+    # --- if 1: an ordinary DOM optic
+    "1.3.6.1.2.1.47.1.1.1.1.2.101": ("str", "GigabitEthernet1/0/1"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.101": ("int", 10),               # port
+    "1.3.6.1.2.1.47.1.3.2.1.2.101.1": ("str", "1.3.6.1.2.1.2.2.1.1.1"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.111": ("str", "Gi1/0/1 Receive Power"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.111": ("int", 101),
+    "1.3.6.1.2.1.99.1.1.1.1.111": ("int", 14),
+    "1.3.6.1.2.1.99.1.1.1.2.111": ("int", 9),
+    "1.3.6.1.2.1.99.1.1.1.3.111": ("int", 1),
+    "1.3.6.1.2.1.99.1.1.1.4.111": ("int", -55),                # -5.5 dBm
+    "1.3.6.1.2.1.99.1.1.1.5.111": ("int", 1),
+
+    # --- if 2: an occupied cage, no sensors at all
+    "1.3.6.1.2.1.47.1.1.1.1.2.202": ("str", "SFP+ container"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.202": ("int", 5),                # container
+    "1.3.6.1.2.1.47.1.1.1.1.2.252": ("str", "GigabitEthernet1/0/2"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.252": ("int", 10),
+    "1.3.6.1.2.1.47.1.1.1.1.4.252": ("int", 202),
+    "1.3.6.1.2.1.47.1.3.2.1.2.252.1": ("str", "1.3.6.1.2.1.2.2.1.1.2"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.302": ("str", "10Gbase-LR SFP+"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.302": ("int", 9),                # module
+    "1.3.6.1.2.1.47.1.1.1.1.4.302": ("int", 202),
+    "1.3.6.1.2.1.47.1.1.1.1.13.302": ("str", "SFP-10G-LR"),
+
+    # --- if 3: the same cage with nothing in it
+    "1.3.6.1.2.1.47.1.1.1.1.2.203": ("str", "SFP+ container"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.203": ("int", 5),
+    "1.3.6.1.2.1.47.1.1.1.1.2.253": ("str", "GigabitEthernet1/0/3"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.253": ("int", 10),
+    "1.3.6.1.2.1.47.1.1.1.1.4.253": ("int", 203),
+    "1.3.6.1.2.1.47.1.3.2.1.2.253.1": ("str", "1.3.6.1.2.1.2.2.1.1.3"),
+
+    # --- if 4: a copper port modelled the same way, naming no transceiver
+    "1.3.6.1.2.1.47.1.1.1.1.2.204": ("str", "GigabitEthernet1/0/4 Container"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.204": ("int", 5),
+    "1.3.6.1.2.1.47.1.1.1.1.2.254": ("str", "GigabitEthernet1/0/4"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.254": ("int", 10),
+    "1.3.6.1.2.1.47.1.1.1.1.4.254": ("int", 204),
+    "1.3.6.1.2.1.47.1.3.2.1.2.254.1": ("str", "1.3.6.1.2.1.2.2.1.1.4"),
+
+    # --- if 5: one dark lane, one healthy lane
+    "1.3.6.1.2.1.47.1.1.1.1.2.105": ("str", "GigabitEthernet1/0/5"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.105": ("int", 10),
+    "1.3.6.1.2.1.47.1.3.2.1.2.105.1": ("str", "1.3.6.1.2.1.2.2.1.1.5"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.151": ("str", "Gi1/0/5 Lane 1 Receive Power"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.151": ("int", 105),
+    "1.3.6.1.2.1.99.1.1.1.1.151": ("int", 14),
+    "1.3.6.1.2.1.99.1.1.1.2.151": ("int", 9),
+    "1.3.6.1.2.1.99.1.1.1.3.151": ("int", 1),
+    "1.3.6.1.2.1.99.1.1.1.4.151": ("int", -400),               # -40.0 dBm
+    "1.3.6.1.2.1.99.1.1.1.5.151": ("int", 1),                  # and ok(1)
+    "1.3.6.1.2.1.47.1.1.1.1.2.152": ("str", "Gi1/0/5 Lane 2 Receive Power"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.152": ("int", 105),
+    "1.3.6.1.2.1.99.1.1.1.1.152": ("int", 14),
+    "1.3.6.1.2.1.99.1.1.1.2.152": ("int", 9),
+    "1.3.6.1.2.1.99.1.1.1.3.152": ("int", 1),
+    "1.3.6.1.2.1.99.1.1.1.4.152": ("int", -60),                # -6.0 dBm
+    "1.3.6.1.2.1.99.1.1.1.5.152": ("int", 1),
+
+    # --- if 6: dark on both lanes
+    "1.3.6.1.2.1.47.1.1.1.1.2.106": ("str", "GigabitEthernet1/0/6"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.106": ("int", 10),
+    "1.3.6.1.2.1.47.1.3.2.1.2.106.1": ("str", "1.3.6.1.2.1.2.2.1.1.6"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.161": ("str", "Gi1/0/6 Lane 1 Receive Power"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.161": ("int", 106),
+    "1.3.6.1.2.1.99.1.1.1.1.161": ("int", 14),
+    "1.3.6.1.2.1.99.1.1.1.2.161": ("int", 9),
+    "1.3.6.1.2.1.99.1.1.1.3.161": ("int", 1),
+    "1.3.6.1.2.1.99.1.1.1.4.161": ("int", -400),
+    "1.3.6.1.2.1.99.1.1.1.5.161": ("int", 1),
+    "1.3.6.1.2.1.47.1.1.1.1.2.162": ("str", "Gi1/0/6 Lane 2 Receive Power"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.162": ("int", 106),
+    "1.3.6.1.2.1.99.1.1.1.1.162": ("int", 14),
+    "1.3.6.1.2.1.99.1.1.1.2.162": ("int", 9),
+    "1.3.6.1.2.1.99.1.1.1.3.162": ("int", 1),
+    "1.3.6.1.2.1.99.1.1.1.4.162": ("int", -400),
+    "1.3.6.1.2.1.99.1.1.1.5.162": ("int", 1),
+}
+
 MODE = "ups"
 
 
@@ -314,6 +412,8 @@ def table_for():
         return {**CISCO_SCALARS, **HARDWARE_TABLE, **CISCO_ENVMON_TABLE}
     if MODE == "cisco_dom":
         return {**CISCO_SCALARS, **CISCO_DOM_TABLE}
+    if MODE == "sfp_media":
+        return {**GENERIC_SCALARS, **SFP_MEDIA_TABLE}
     return dict(GENERIC_SCALARS)
 
 

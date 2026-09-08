@@ -1254,12 +1254,38 @@
 
   // r.media is written by nodepoll's environment poll. Prepended to the
   // descr cell rather than given a column of its own so it is visible in
-  // the default column set.
+  // the default column set. DOM and SFP are told apart because they answer
+  // different questions: DOM says this port's light levels can be alerted
+  // on, SFP only says there is a cage there.
   function sfpBadge(r) {
-    return r.media === 'optic'
-      ? '<span class="badge badge-sfp" title="SFP / optical transceiver ' +
-        '(DOM sensors present)">SFP</span> '
-      : '';
+    if (r.media === 'optic') {
+      return '<span class="badge badge-dom" title="Optical transceiver ' +
+        'reporting DOM sensors (light levels, temperature)">DOM</span> ';
+    }
+    if (r.media === 'sfp' || r.media === 'sfp_empty') {
+      return '<span class="badge badge-sfp" title="' + (r.media === 'sfp_empty'
+        ? 'SFP cage, nothing plugged into it'
+        : 'SFP transceiver, reporting no DOM sensors') + '">SFP</span> ';
+    }
+    return '';
+  }
+
+  // -40 dBm is where an optic clamps when it is unlit or its port is powered
+  // down, and a 0 is an agent saying the same thing in milliwatts; printing
+  // either as a number reads as a dying link, which is the one thing it is
+  // not. Presentational only — read_dom/read_dom_all still return the figure,
+  // and it stays on the row's title.
+  const DARK_OPTIC_MAX_DBM = -39.5;   // the -40 floor, with the tolerance alertrules allows
+  function darkOptic(s) {
+    return s.unit === 'dBm' && typeof s.value === 'number'
+      && (s.value === 0 || s.value <= DARK_OPTIC_MAX_DBM);
+  }
+  function domValueCell(s) {
+    return darkOptic(s) ? '<td>No signal</td>'
+      : `<td>${s.value} ${escape(s.unit)}</td>`;
+  }
+  function domRowAttrs(s) {
+    return darkOptic(s) ? ` title="${escape(`${s.value} ${s.unit}`)}"` : '';
   }
 
   const IFACE_COLUMNS = [
@@ -1527,6 +1553,10 @@
     function paintDialogIfaces() {
       if (!dialogIfaces || !current()) return;
       if (dialogOptics) {
+        // Only ever an upgrade: the live read proves DOM on the ports it
+        // names, and says nothing about the ports it does not — a stored
+        // 'sfp' cage must not be downgraded by a read that never looked
+        // for one.
         dialogIfaces.forEach((r) => {
           if (dialogOptics.has(r.if_index)) r.media = 'optic';
         });
@@ -1617,8 +1647,8 @@
           '<thead><tr><th scope="col">Port</th><th scope="col">Sensor</th>' +
           '<th scope="col">Value</th><th scope="col">Status</th></tr></thead><tbody>' +
           rows.map((s) =>
-            `<tr><td>${escape(s.if_name || `port ${s.if_index}`)}</td>` +
-            `<td>${escape(s.label)}</td><td>${s.value} ${escape(s.unit)}</td>` +
+            `<tr${domRowAttrs(s)}><td>${escape(s.if_name || `port ${s.if_index}`)}</td>` +
+            `<td>${escape(s.label)}</td>${domValueCell(s)}` +
             `<td>${escape(s.status)}</td></tr>`).join('') + '</tbody></table>';
         dialogOptics = new Set(rows.map((s) => s.if_index));
         paintDialogIfaces();
@@ -2506,7 +2536,7 @@
         }
         dom.innerHTML = '<table><caption class="sr-only">Optics and environment sensors</caption><tr><th scope="col">Sensor</th><th scope="col">Value</th><th scope="col">Status</th></tr>' +
           r.sensors.map((s) =>
-            `<tr><td>${escape(s.label)}</td><td>${s.value} ${escape(s.unit)}</td>` +
+            `<tr${domRowAttrs(s)}><td>${escape(s.label)}</td>${domValueCell(s)}` +
             `<td>${escape(s.status)}</td></tr>`).join('') + '</table>';
       })
       .catch(() => {

@@ -1160,6 +1160,17 @@ check("badge badge-sfp" in NODES and "r.media === 'optic'" in NODES,
 check(".badge-sfp" in APP_CSS,
       "app.css styles the SFP badge, or it inherits the amber warning fill "
       "every other badge uses")
+# 5.2.0: a cage with no DOM is still an SFP slot, so the badge says which
+# of the two a port is rather than only appearing for the measurable half.
+check("badge badge-dom" in NODES and "r.media === 'sfp_empty'" in NODES,
+      "an optic with DOM reads DOM and a cage without it still reads SFP, "
+      "empty or not")
+check(".badge-dom" in APP_CSS,
+      "app.css styles the DOM badge as well, or it inherits the amber "
+      "warning fill")
+check("No signal" in NODES and "darkOptic(s)" in NODES,
+      "a dark optic's dBm reading is rendered as words in the DOM tables, "
+      "not as a number that reads like a dying link")
 check("sfpBadge(r) + escape(r.descr" in NODES,
       "the badge is prepended to the descr cell, so it is visible in the "
       "default column set rather than behind the column picker")

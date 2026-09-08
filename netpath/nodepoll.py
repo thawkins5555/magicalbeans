@@ -23,6 +23,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 from . import mibcatalog, nodeoids, nodesdb, vendorid
+from .alertrules import DARK_OPTIC_DBM, is_dark_optic
 from .eventlog import ERROR, NODES, NullLog
 from .ipam_scan import ping_many
 from .nodediscover import DiscoveryJob
@@ -116,6 +117,14 @@ _SFP_METRICS = {
     "sfp_volt": ("supply voltage", "V"),
     "sfp_temp_c": ("optic temperature", "°C"),
 }
+
+# A cage, and what is in it: entPhysicalDescr/ModelName/VendorType text that
+# names a transceiver. Deliberately not "1000BaseT" and friends on their own
+# -- a fixed copper port describes itself that way and is not an SFP slot --
+# so only an optical media suffix or a form factor counts.
+_TRANSCEIVER_TEXT = re.compile(
+    r"\b(?:[cq]?sfp\d*|xfp|x2|gbic|xcvr|transceiver)\b|\bglc-|\bsfp-"
+    r"|base-?(?:sx|lx|lh|zx|sr|lr|er|zr|bx)\b", re.I)
 
 # dBm(14) says a sensor reads optical power but not which way the light is
 # going, so the direction comes out of the sensor's own name.
@@ -3420,6 +3429,12 @@ class NodePoller(Worker):
     # by read_dom() to find a port's transceiver sensors.
     _ENT_PHYSICAL_DESCR = "1.3.6.1.2.1.47.1.1.1.1.2"
     _ENT_PHYSICAL_CONTAINED_IN = "1.3.6.1.2.1.47.1.1.1.1.4"
+    # entPhysicalClass/VendorType/ModelName: what an entity IS, which is the
+    # only way to see an SFP slot that reports no DOM at all -- a cage with
+    # nothing in it has no sensor to be found by.
+    _ENT_PHYSICAL_CLASS = "1.3.6.1.2.1.47.1.1.1.1.5"
+    _ENT_PHYSICAL_VENDOR_TYPE = "1.3.6.1.2.1.47.1.1.1.1.3"
+    _ENT_PHYSICAL_MODEL_NAME = "1.3.6.1.2.1.47.1.1.1.1.13"
     # entPhysicalName: RFC 6933 makes it optional, so read_dom's own decode
     # (shared with _poll_environment, both pre-dating this column's use
     # here) never depended on it -- but where an agent populates it, it is
@@ -3474,6 +3489,11 @@ class NodePoller(Worker):
     _SFP_TYPE_ROOTS = {8: "sfp_temp_c", 3: "sfp_volt", 4: "sfp_volt",
                        5: "sfp_bias_ma"}
     _SENSOR_TYPE_OPTICAL = 14
+    # The one entPhysicalClass value this app has to tell apart: a
+    # transceiver cage is a container(5). What is IN one is a module(9) on
+    # some agents and a port(10) on others, so the contents are identified
+    # by their text rather than by a class enum — see _sfp_slot_media.
+    _ENT_CLASS_CONTAINER = 5
     # ENTITY-SENSOR-MIB reports current in amperes; bias is quoted in
     # milliamps everywhere an operator would read it.
     _BIAS_A_TO_MA = 1000.0
@@ -3603,7 +3623,9 @@ class NodePoller(Worker):
         return sensors
 
     def _entity_port_map(self, device, config: dict, names: dict | None = None,
-                         if_by_name: dict | None = None) -> tuple[dict[int, int], int]:
+                         if_by_name: dict | None = None,
+                         contained_in: dict[int, int] | None = None
+                         ) -> tuple[dict[int, int], int]:
         """(entPhysicalIndex -> ifIndex, how many entAliasMappingIdentifier
         rows the device answered) for every entity mapped to a port. The
         row count is only used to explain, in the Nodes event log, why
@@ -3618,6 +3640,10 @@ class NodePoller(Worker):
         — e.g. "Te1/1/1 Transmit Power" against "TenGigabitEthernet1/1/1".
         Matched against ifDescr only, never ifAlias, since an operator-typed
         description proves nothing.
+
+        `contained_in` is walked here when the caller has no use for it
+        itself; _poll_environment passes its own so the SFP-slot scan and
+        this share one walk of the column.
         """
         alias = self._walk_column(device, config, self._ENT_ALIAS_MAPPING)
         prefix = self._IF_INDEX_COLUMN + "."
@@ -3632,13 +3658,8 @@ class NodePoller(Worker):
             except ValueError:
                 continue
             direct[entity] = if_index
-        contained_in: dict[int, int] = {}
-        for suffix, value in self._walk_column(
-                device, config, self._ENT_PHYSICAL_CONTAINED_IN).items():
-            try:
-                contained_in[int(suffix)] = int(value)
-            except (TypeError, ValueError):
-                continue
+        if contained_in is None:
+            contained_in = self._entity_contained_in(device, config)
 
         resolved: dict[int, int] = {}
 
@@ -3673,6 +3694,87 @@ class NodePoller(Worker):
                 hop = contained_in.get(hop, 0)
                 seen += 1
         return resolved, len(alias)
+
+    def _entity_contained_in(self, device, config: dict) -> dict[int, int]:
+        """entPhysicalIndex -> the entity holding it, both ends parsed to
+        int. Its own method because two passes over one device need the
+        containment tree and neither may pay for a second walk of it."""
+        parents: dict[int, int] = {}
+        for suffix, value in _int_keyed(self._walk_column(
+                device, config, self._ENT_PHYSICAL_CONTAINED_IN)).items():
+            try:
+                parents[suffix] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return parents
+
+    def _sfp_slot_media(self, device, config: dict, port_map: dict[int, int],
+                        contained_in: dict[int, int], descrs: dict) -> dict[int, str]:
+        """{ifIndex: 'sfp' | 'sfp_empty'} for the transceiver cages this
+        device describes. The DOM scan cannot see these: a cage with nothing
+        in it, or holding a transceiver that reports no sensors, has no
+        sensor row to be found by, and until 5.2.0 an SFP slot like that was
+        indistinguishable from a copper port.
+
+        'sfp' is an entity whose own entPhysical text names a transceiver
+        (the module plugged into a cage, or a port an agent puts that text
+        on directly); 'sfp_empty' is a container(5) that says it is a
+        transceiver cage and holds nothing that does. A container that names
+        nothing is left alone rather than guessed at: some platforms give
+        every copper port one too, and a copper port must never wear an SFP
+        badge.
+        """
+        classes = _int_keyed(self._walk_column(
+            device, config, self._ENT_PHYSICAL_CLASS))
+        if not classes:
+            return {}
+        models = _int_keyed(self._walk_column(
+            device, config, self._ENT_PHYSICAL_MODEL_NAME))
+        vendor_types = _int_keyed(self._walk_column(
+            device, config, self._ENT_PHYSICAL_VENDOR_TYPE))
+        by_descr = _int_keyed(descrs)
+        children: dict[int, list[int]] = {}
+        for entity, parent in contained_in.items():
+            children.setdefault(parent, []).append(entity)
+
+        def names_transceiver(entity: int) -> bool:
+            return any(_TRANSCEIVER_TEXT.search(str(column.get(entity) or ""))
+                       for column in (by_descr, models, vendor_types))
+
+        def descendants(root: int) -> list[int]:
+            found: list[int] = []
+            queue, depth = list(children.get(root, ())), 0
+            while queue and depth < 4:      # a cage's contents are shallow
+                found.extend(queue)
+                queue = [c for parent in queue for c in children.get(parent, ())]
+                depth += 1
+            return found
+
+        media: dict[int, str] = {}
+        for entity, klass in sorted(classes.items()):
+            try:
+                klass = int(klass)
+            except (TypeError, ValueError):
+                continue
+            if klass != self._ENT_CLASS_CONTAINER:
+                # The cage's own text names it either way, so only something
+                # OTHER than the container proves one is occupied.
+                if names_transceiver(entity) and entity in port_map:
+                    media[port_map[entity]] = "sfp"
+                continue
+            if not names_transceiver(entity):
+                continue
+            # A cage rarely carries the alias row itself; the port sitting
+            # in it does, which is the ifIndex the badge belongs to.
+            if_index = next((port_map[e] for e in [entity] + children.get(entity, [])
+                             if e in port_map), None)
+            if if_index is None:
+                continue
+            if any(names_transceiver(child) for child in descendants(entity)):
+                media[if_index] = "sfp"
+            else:
+                media.setdefault(if_index, "sfp_empty")
+        return media
 
     @staticmethod
     def _if_index_for_name(name, if_by_name: dict) -> int | None:
@@ -4027,8 +4129,15 @@ class NodePoller(Worker):
         if self._cisco_sensor_table_plausible(device):
             names = self._walk_column(device, config, self._ENT_PHYSICAL_NAME)
             if_by_name = self._if_index_by_name(interfaces)
+        contained_in = self._entity_contained_in(device, config)
         port_map, _alias_rows = self._entity_port_map(
-            device, config, names, if_by_name)
+            device, config, names, if_by_name, contained_in)
+        # Nothing mapped to a port means a walk that answered nothing useful;
+        # the three ENTITY-MIB columns the cage scan needs would be three
+        # more dead walks.
+        sfp_slots = (self._sfp_slot_media(device, config, port_map,
+                                          contained_in, descrs)
+                     if port_map else {})
 
         has_humidity = any(int(types.get(suffix) or 0) == self._SENSOR_TYPE_HUMIDITY
                            for suffix in sensor_values)
@@ -4117,7 +4226,17 @@ class NodePoller(Worker):
         if_descrs = {row["if_index"]: row["descr"] for row in interfaces}
         for (if_index, root), values in sorted(per_port.items()):
             reading_name, unit = _SFP_METRICS[root]
-            worst = min(values) if root.endswith("_dbm") else max(values)
+            if root.endswith("_dbm"):
+                # A dark lane is one with the light off, not a dim one, so it
+                # must not win min() away from three healthy lanes on the same
+                # optic. An optic dark on every lane still records the floor:
+                # the port's chart stays continuous and its history stays
+                # true, and refusing to ALERT on that reading is
+                # alertrules.breaches' job, not this one's.
+                lit = [v for v in values if not is_dark_optic(root, v)]
+                worst = min(lit) if lit else DARK_OPTIC_DBM
+            else:
+                worst = max(values)
             port = if_descrs.get(if_index) or f"if{if_index}"
             samples.append((f"{root}.{if_index}", f"{port} {reading_name}",
                             unit, "gauge", now, worst))
@@ -4125,12 +4244,16 @@ class NodePoller(Worker):
             self.db.record_metric_samples(device_id, samples)
         # Only reached on a walk that answered, so a timeout leaves the
         # badge alone.
-        media_rows = [{"if_index": if_index, "media": "optic"}
-                      for if_index in sorted(optic_ports)]
+        # DOM sensors win over anything the entity table says about the cage:
+        # a port with readings is an optic whatever it is plugged into.
+        media_by_if = dict(sfp_slots)
+        media_by_if.update({if_index: "optic" for if_index in optic_ports})
+        media_rows = [{"if_index": if_index, "media": media}
+                      for if_index, media in sorted(media_by_if.items())]
         media_rows += [{"if_index": row["if_index"], "media": None}
                        for row in interfaces
-                       if row["if_index"] not in optic_ports
-                       and ("media" in row.keys() and row["media"] == "optic")]
+                       if row["if_index"] not in media_by_if
+                       and ("media" in row.keys() and row["media"])]
         # An empty port map is a timed-out ENTITY-MIB walk, not a chassis
         # with no ports; keep the badges until a walk answers.
         if port_map:

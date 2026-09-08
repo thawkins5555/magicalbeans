@@ -197,6 +197,18 @@ try:
                                "gauge", base + 6, -19.0)
     engine._tick()
     check("-19 dBm clears it", open_rows(alerts, "sfp_rx_power_low") == [])
+
+    # -40 dBm is the floor a transceiver clamps to with no fiber in it or
+    # its port powered down: further past the threshold than the -25 that
+    # opened the alert above, and the one reading that must open nothing.
+    for i in range(4):
+        nodes.record_metric_sample(did, "sfp_rx_dbm.8", "Gi1/0/8 Rx power",
+                                   "dBm", "gauge", base + 10 + i, -40.0)
+        engine._tick()
+    check("-40 dBm on another port opens nothing at all -- a dark optic is "
+          "not a dim one, however many polls it stays that way",
+          open_rows(alerts, "sfp_rx_power_low") == [],
+          [dict(r) for r in open_rows(alerts, "sfp_rx_power_low")])
 finally:
     engine.stop()
     close_all(nodes, alerts, snmp, syslog, ipam)
