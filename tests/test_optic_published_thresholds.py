@@ -15,6 +15,7 @@ the two silent-ignore refusals.
 House style: a plain script, FAILS collects failed check() names, exit 1 if
 anything failed.
 """
+import json
 import os
 import socket
 import time
@@ -22,6 +23,8 @@ import time
 import _paths  # noqa: F401  (puts the repo root and tests/ on sys.path)
 
 import netpath.nodepoll as nodepoll_mod
+from netpath.alertrules import (PUBLISHED_HYSTERESIS, PUBLISHED_THRESHOLD_RULES,
+                                ROLLED_UP_BY, breaches, same_metric_pair)
 from netpath.alertsdb import AlertsDatabase
 from netpath.alertengine import AlertEngine
 from netpath.ipamdb import IpamDatabase
@@ -340,6 +343,329 @@ try:
     nodes.close()
 finally:
     stub.kill()
+
+# ================================================ § 3 the eight built-ins
+print()
+print("the eight rules")
+
+nodes, alerts, engine = build("rules")
+EIGHT = ("sfp_rx_power_low", "sfp_rx_power_low_alarm",
+         "sfp_rx_power_high", "sfp_rx_power_high_alarm",
+         "sfp_tx_power_low", "sfp_tx_power_low_alarm",
+         "sfp_tx_power_high", "sfp_tx_power_high_alarm")
+rules = {key: alerts.rule_by_key(key) for key in EIGHT}
+check("all eight optic power rules are seeded",
+      all(rules[key] is not None for key in EIGHT),
+      [key for key in EIGHT if rules[key] is None])
+check("none of them carries a threshold of its own -- there is no global "
+      "number left to be wrong for most of the fleet's optics",
+      all(rules[key]["threshold"] is None
+          and rules[key]["clear_threshold"] is None for key in EIGHT),
+      {key: (rules[key]["threshold"], rules[key]["clear_threshold"])
+       for key in EIGHT})
+check("each reads the DOM metric root of its own direction",
+      all(rules[key]["source_kind"] == ("sfp_rx_dbm" if "_rx_" in key
+                                        else "sfp_tx_dbm") for key in EIGHT),
+      {key: rules[key]["source_kind"] for key in EIGHT})
+check("the alarm halves are severity 2 (this scale's 'critical') and the "
+      "warning halves severity 4",
+      all(rules[key]["severity"] == (2 if key.endswith("_alarm") else 4)
+          for key in EIGHT),
+      {key: rules[key]["severity"] for key in EIGHT})
+check("the four low keys compare 'below' and the four high keys 'above' -- "
+      "too much light is a real fault, and the optic publishes a ceiling "
+      "for it",
+      all(rules[key]["comparison"] == ("below" if "_low" in key else "above")
+          for key in EIGHT),
+      {key: rules[key]["comparison"] for key in EIGHT})
+check("the two keys that already existed keep their name, severity and "
+      "for_polls, so an upgraded install's tuning of those survives",
+      rules["sfp_rx_power_low"]["name"] == "Optic receive power low"
+      and rules["sfp_tx_power_low"]["name"] == "Optic transmit power low"
+      and rules["sfp_rx_power_low"]["for_polls"] == 2,
+      dict(rules["sfp_rx_power_low"]))
+check("each warning rolls up under its own alarm, and each alarm under "
+      "device_down",
+      all(ROLLED_UP_BY.get(key) == (f"{key}_alarm" if not key.endswith("_alarm")
+                                    else "device_down") for key in EIGHT),
+      {key: ROLLED_UP_BY.get(key) for key in EIGHT})
+check("sfp_temp_high is untouched: only optical POWER moved to published "
+      "limits",
+      alerts.rule_by_key("sfp_temp_high")["threshold"] == 70.0
+      and ROLLED_UP_BY["sfp_temp_high"] == "device_down",
+      dict(alerts.rule_by_key("sfp_temp_high")))
+check("every one of the eight is mapped to a (root, column) pair, and "
+      "nothing else is",
+      set(PUBLISHED_THRESHOLD_RULES) == set(EIGHT),
+      sorted(PUBLISHED_THRESHOLD_RULES))
+check("same_metric_pair recognises the new pairs and refuses an outage "
+      "parent",
+      same_metric_pair(rules["sfp_rx_power_low"],
+                       rules["sfp_rx_power_low_alarm"])
+      and not same_metric_pair(rules["sfp_rx_power_low_alarm"],
+                               alerts.rule_by_key("device_down"))
+      and not same_metric_pair(rules["sfp_rx_power_low"],
+                               rules["sfp_tx_power_low_alarm"]))
+check("...and reads a plain dict the same way a database row does",
+      same_metric_pair({"kind": "threshold", "source_kind": "sfp_rx_dbm"},
+                       {"kind": "threshold", "source_kind": "sfp_rx_dbm"})
+      and not same_metric_pair({"kind": "threshold", "source_kind": ""},
+                               {"kind": "threshold", "source_kind": ""}))
+
+# --- the other six threshold rules must be exactly as they were
+SIX = ("cpu_high", "mem_high", "if_in_util_high", "temp_chassis_high",
+       "humidity_high", "packet_loss_high")
+check("the threshold rules that are NOT optic power keep their own numbers "
+      "and take exactly the path they always did",
+      all(alerts.rule_by_key(key)["threshold"] is not None
+          and key not in PUBLISHED_THRESHOLD_RULES for key in SIX),
+      {key: alerts.rule_by_key(key)["threshold"] for key in SIX})
+nodes.close()
+
+
+# ================================= § 4 the engine reads published limits only
+print()
+print("the engine: published limits, and nothing else")
+
+
+def optic_ports(nodes, did, if_indexes=(7,)):
+    nodes.replace_interfaces(did, [
+        {"if_index": i, "descr": f"GigabitEthernet1/0/{i}", "alias": "",
+         "admin_status": "up", "oper_status": "up"} for i in if_indexes])
+
+
+def publish(nodes, engine, did, if_index, root="sfp_rx_dbm", **bands):
+    rows = [{"if_index": if_index, "metric_root": root,
+             "low_alarm": bands.get("low_alarm"),
+             "low_warn": bands.get("low_warn"),
+             "high_warn": bands.get("high_warn"),
+             "high_alarm": bands.get("high_alarm"),
+             "updated_ts": time.time()}]
+    nodes.replace_interface_thresholds(did, CISCO_SOURCE, rows)
+    # The engine caches its fleet-wide read for _PUBLISHED_CACHE_S against
+    # the poller's hourly write cadence; a test writes them mid-run.
+    engine._published_cache = (0.0, None, None)
+
+
+def sample(nodes, did, if_index, ts, value, root="sfp_rx_dbm"):
+    nodes.record_metric_sample(did, f"{root}.{if_index}",
+                               f"Gi1/0/{if_index} Rx power", "dBm", "gauge",
+                               ts, value)
+
+
+def open_rows(alerts, rule_key):
+    rule = alerts.rule_by_key(rule_key)
+    return alerts.alerts(state="unresolved", rule_id=rule["id"])
+
+
+# --- no published limits means no alert, even with a number hand-set
+nodes, alerts, engine = build("no_fallback")
+engine._tick()
+did = add_device(nodes, "10.1.0.1", "unpublished-sw")
+optic_ports(nodes, did)
+alerts._conn.execute(
+    "UPDATE rules SET threshold = -22.0, clear_threshold = -20.0"
+    " WHERE key = 'sfp_rx_power_low'")
+alerts._conn.commit()
+base = time.time()
+for i in range(4):
+    sample(nodes, did, 7, base + i, -30.0)
+    engine._tick()
+check("a port whose switch publishes NO limits raises no optic power alert, "
+      "even with a threshold hand-written onto the rule row -- there is no "
+      "global fallback left, which is the whole point",
+      open_rows(alerts, "sfp_rx_power_low") == [],
+      [dict(r) for r in open_rows(alerts, "sfp_rx_power_low")])
+check("...and no streak was counted for it either, so a port that starts "
+      "publishing tomorrow starts a fresh one",
+      not [k for k in engine._breach_streaks
+           if k[0] == alerts.rule_by_key("sfp_rx_power_low")["id"]],
+      list(engine._breach_streaks))
+nodes.close()
+
+# --- each band fires, with the right dedup key and extras
+nodes, alerts, engine = build("bands")
+engine._tick()
+did = add_device(nodes, "10.1.0.2", "publishing-sw")
+optic_ports(nodes, did, (7, 8, 9, 10))
+base = time.time()
+for if_index in (7, 8, 9, 10):
+    nodes.replace_interface_thresholds(did, CISCO_SOURCE, [
+        {"if_index": i, "metric_root": "sfp_rx_dbm", "low_alarm": -24.0,
+         "low_warn": -22.0, "high_warn": -1.0, "high_alarm": 1.0,
+         "updated_ts": base} for i in (7, 8, 9, 10)])
+engine._published_cache = (0.0, None, None)
+
+for i in range(2):
+    sample(nodes, did, 7, base + i, -22.5)      # warning band only
+    sample(nodes, did, 8, base + i, -30.0)      # past the low alarm
+    sample(nodes, did, 9, base + i, -0.5)       # high warning band only
+    sample(nodes, did, 10, base + i, 5.0)       # past the high alarm
+    engine._tick()
+
+low_warn = open_rows(alerts, "sfp_rx_power_low")
+check("a port under its published low WARNING opens the warning rule alone",
+      [r["entity_id"] for r in low_warn] == [f"{did}:7"],
+      [dict(r) for r in low_warn])
+check("...keyed per port, so the dedup key names the interface",
+      low_warn and low_warn[0]["dedup_key"]
+      == f"sfp_rx_power_low:interface:{did}:7", dict(low_warn[0]))
+extra = json.loads(low_warn[0]["extra_json"])
+check("the alert's Threshold extra is the number THIS PORT was judged "
+      "against, and says where it came from",
+      extra["threshold"] == "-22.0"
+      and extra["threshold_source"] == " (published by the optic)", extra)
+check("a port past its published low ALARM opens the alarm rule",
+      [r["entity_id"] for r in open_rows(alerts, "sfp_rx_power_low_alarm")]
+      == [f"{did}:8"],
+      [dict(r) for r in open_rows(alerts, "sfp_rx_power_low_alarm")])
+check("a port over its published high WARNING opens the high warning rule",
+      [r["entity_id"] for r in open_rows(alerts, "sfp_rx_power_high")]
+      == [f"{did}:9"],
+      [dict(r) for r in open_rows(alerts, "sfp_rx_power_high")])
+check("a port over its published high ALARM opens the high alarm rule",
+      [r["entity_id"] for r in open_rows(alerts, "sfp_rx_power_high_alarm")]
+      == [f"{did}:10"],
+      [dict(r) for r in open_rows(alerts, "sfp_rx_power_high_alarm")])
+check("the clear sits one dB back from the published level, since a "
+      "transceiver publishes a level and no band (PUBLISHED_HYSTERESIS)",
+      PUBLISHED_HYSTERESIS["sfp_rx_dbm"] == 1.0
+      and PUBLISHED_HYSTERESIS["sfp_tx_dbm"] == 1.0, PUBLISHED_HYSTERESIS)
+sample(nodes, did, 7, base + 10, -21.5)
+engine._tick()
+check("...so a reading back inside the published limit but not yet a whole "
+      "dB past it holds the alert open",
+      len(open_rows(alerts, "sfp_rx_power_low")) == 1,
+      [dict(r) for r in open_rows(alerts, "sfp_rx_power_low")])
+sample(nodes, did, 7, base + 11, -20.5)
+engine._tick()
+check("...and a dB clear of it closes the alert",
+      open_rows(alerts, "sfp_rx_power_low") == [],
+      [dict(r) for r in open_rows(alerts, "sfp_rx_power_low")])
+nodes.close()
+
+# --- partial publication
+nodes, alerts, engine = build("partial")
+engine._tick()
+did = add_device(nodes, "10.1.0.3", "partial-sw")
+optic_ports(nodes, did)
+base = time.time()
+publish(nodes, engine, did, 7, low_alarm=-24.0)
+for i in range(2):
+    sample(nodes, did, 7, base + i, -30.0)
+    engine._tick()
+check("a device publishing only the alarm level alerts on it and stays "
+      "silent on the warning it never published -- partial publication is "
+      "normal on older IOS and needs no special handling",
+      len(open_rows(alerts, "sfp_rx_power_low_alarm")) == 1
+      and open_rows(alerts, "sfp_rx_power_low") == [],
+      ([dict(r) for r in open_rows(alerts, "sfp_rx_power_low_alarm")],
+       [dict(r) for r in open_rows(alerts, "sfp_rx_power_low")]))
+nodes.close()
+
+# --- the dark optic, and the asymmetry that must stay
+nodes, alerts, engine = build("dark")
+engine._tick()
+did = add_device(nodes, "10.1.0.4", "dark-sw")
+optic_ports(nodes, did, (7, 8))
+base = time.time()
+nodes.replace_interface_thresholds(did, CISCO_SOURCE, [
+    {"if_index": i, "metric_root": "sfp_rx_dbm", "low_alarm": -24.0,
+     "low_warn": -22.0, "high_warn": -1.0, "high_alarm": 1.0,
+     "updated_ts": base} for i in (7, 8)])
+engine._published_cache = (0.0, None, None)
+for i in range(4):
+    sample(nodes, did, 7, base + i, -40.0)
+    engine._tick()
+check("a dark optic at -40 dBm opens NEITHER low rule, however many polls "
+      "it stays dark -- a port with no light is interface_down's to report",
+      open_rows(alerts, "sfp_rx_power_low") == []
+      and open_rows(alerts, "sfp_rx_power_low_alarm") == [],
+      ([dict(r) for r in open_rows(alerts, "sfp_rx_power_low")],
+       [dict(r) for r in open_rows(alerts, "sfp_rx_power_low_alarm")]))
+for i in range(2):
+    sample(nodes, did, 8, base + 10 + i, -30.0)
+    engine._tick()
+check("(an alarm is open on port 8 to go dark on)",
+      len(open_rows(alerts, "sfp_rx_power_low_alarm")) == 1)
+sample(nodes, did, 8, base + 20, -40.0)
+engine._tick()
+check("a lit port going dark resolves the open alarm rather than leaving "
+      "it on a stale reading",
+      open_rows(alerts, "sfp_rx_power_low_alarm") == [],
+      [dict(r) for r in open_rows(alerts, "sfp_rx_power_low_alarm")])
+# The asymmetry is deliberate and must not be "fixed": evaluate_threshold's
+# dark -> clear branch is 'below'-only because -40 dBm is the bottom of the
+# scale. It cannot be at or above any published high threshold, so breaches()
+# never opened a high alert on it and there is never one there to close.
+HIGH_KEYS = ("sfp_rx_power_high", "sfp_rx_power_high_alarm",
+             "sfp_tx_power_high", "sfp_tx_power_high_alarm")
+check("the four high keys compare 'above', and a -40 dBm reading breaches "
+      "none of them at any published ceiling -- which is why the dark->clear "
+      "branch is 'below'-only and widening it would add a dead branch",
+      all(alerts.rule_by_key(key)["comparison"] == "above" for key in HIGH_KEYS)
+      and not any(breaches({"threshold": ceiling, "comparison": "above",
+                            "source_kind": "sfp_rx_dbm", "key": key},
+                           -40.0)
+                  for key in HIGH_KEYS for ceiling in (-30.0, -1.0, 1.0)),
+      {key: alerts.rule_by_key(key)["comparison"] for key in HIGH_KEYS})
+check("...and both high rules stayed shut on the dark port throughout",
+      open_rows(alerts, "sfp_rx_power_high") == []
+      and open_rows(alerts, "sfp_rx_power_high_alarm") == [])
+nodes.close()
+
+# --- an optic swap under a live streak
+nodes, alerts, engine = build("swap")
+engine._tick()
+did = add_device(nodes, "10.1.0.5", "swap-sw")
+optic_ports(nodes, did)
+base = time.time()
+publish(nodes, engine, did, 7, low_warn=-22.0)
+sample(nodes, did, 7, base, -30.0)
+engine._tick()
+rule_id = alerts.rule_by_key("sfp_rx_power_low")["id"]
+streak_key = (rule_id, f"{did}:7")
+check("(one poll of breach is counted, one short of for_polls)",
+      engine._breach_streaks[streak_key][1] == 1,
+      engine._breach_streaks.get(streak_key))
+publish(nodes, engine, did, 7, low_warn=-35.0)     # a longer-reach optic
+sample(nodes, did, 7, base + 1, -30.0)
+engine._tick()
+check("swapping the optic moves the published limit, which resets the "
+      "streak exactly as an override edit does -- a streak counted against "
+      "a number that no longer applies is not evidence",
+      engine._breach_streaks[streak_key][1] == 0
+      and open_rows(alerts, "sfp_rx_power_low") == [],
+      (engine._breach_streaks.get(streak_key),
+       [dict(r) for r in open_rows(alerts, "sfp_rx_power_low")]))
+nodes.close()
+
+# --- the override's enabled flag is still honoured
+nodes, alerts, engine = build("override_off")
+engine._tick()
+did = add_device(nodes, "10.1.0.6", "muted-sw")
+optic_ports(nodes, did)
+base = time.time()
+publish(nodes, engine, did, 7, low_warn=-22.0)
+alerts.set_device_threshold(did, "sfp_rx_power_low", threshold=None,
+                            clear_threshold=None, enabled=False)
+for i in range(4):
+    sample(nodes, did, 7, base + i, -30.0)
+    engine._tick()
+check("an override that turns the rule off for ONE switch still silences "
+      "it -- that is a statement about the switch, not about physics",
+      open_rows(alerts, "sfp_rx_power_low") == [],
+      [dict(r) for r in open_rows(alerts, "sfp_rx_power_low")])
+raised = None
+try:
+    alerts.set_device_threshold(did, "sfp_rx_power_low", threshold=-24.0,
+                                clear_threshold=-21.0)
+except ValueError as exc:
+    raised = exc
+check("...while a NUMBER on the same override is refused out loud rather "
+      "than stored and silently ignored",
+      raised is not None and "publishes" in str(raised), str(raised))
+nodes.close()
 
 print()
 if FAILS:
