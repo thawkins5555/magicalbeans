@@ -1057,6 +1057,12 @@
     <span id="mp-counters" class="hint"></span>
     <span class="grow"></span>
     <button id="mp-refresh">Refresh</button>
+    <!-- No data-requires-write: opening this is a READ, and of Nodes
+         rather than of Mapper, so neither module's write gate is the
+         question — the dialog hides its own Apply for an account that
+         cannot use it. Not in the action bar below either: that whole bar
+         is gated on a selected map, and this list is fleet-wide. -->
+    <button id="mp-upstream-suggestions">Upstream suggestions</button>
     <button id="mp-maps" data-requires-write="mapper">Maps</button>
     <button id="mp-settings" class="module-settings" data-requires-write="mapper">Settings</button>
   </div>
@@ -1224,27 +1230,44 @@
     <fieldset>
       <legend>DATA FILES</legend>
       <label>Application <input id="set-app-path" readonly>
-        <span class="usage" id="use-app"></span>
+        <span class="usage" id="size-app"></span>
         <span class="hint" id="age-app"></span></label>
       <label>Traces <input id="set-trace-path" readonly>
+        <span class="usage" id="size-trace"></span>
         <span class="hint" id="age-trace"></span></label>
       <label>Flows <input id="set-flow-path" readonly>
+        <span class="usage" id="size-flow"></span>
         <span class="hint" id="age-flow"></span></label>
       <label>SNMP traps <input id="set-snmp-path" readonly>
+        <span class="usage" id="size-snmp"></span>
         <span class="hint" id="age-snmp"></span></label>
       <label>Syslog <input id="set-syslog-path" readonly>
+        <span class="usage" id="size-syslog"></span>
         <span class="hint" id="age-syslog"></span></label>
       <label>IPAM <input id="set-ipam-path" readonly>
+        <span class="usage" id="size-ipam"></span>
         <span class="hint" id="age-ipam"></span></label>
       <label>Nodes <input id="set-nodes-path" readonly>
+        <span class="usage" id="size-nodes"></span>
         <span class="hint" id="age-nodes"></span></label>
       <label>Nodes metric history <input id="set-nodes-series-path" readonly>
+        <span class="usage" id="size-nodes-series"></span>
         <span class="hint" id="age-nodes-series"></span></label>
       <label>Nodes MIBs <input id="set-nodes-mibs-path" readonly>
-        <span class="usage" id="use-nodes-mibs"></span>
+        <span class="usage" id="size-nodes-mibs"></span>
         <span class="hint" id="age-nodes-mibs"></span></label>
       <label>Alerts <input id="set-alerts-path" readonly>
+        <span class="usage" id="size-alerts"></span>
         <span class="hint" id="age-alerts"></span></label>
+      <label>Wireless <input id="set-wireless-path" readonly>
+        <span class="usage" id="size-wireless"></span>
+        <span class="hint" id="age-wireless"></span></label>
+      <label>ConfigRX <input id="set-configrx-path" readonly>
+        <span class="usage" id="size-configrx"></span>
+        <span class="hint" id="age-configrx"></span></label>
+      <label>Mapper <input id="set-mapper-path" readonly>
+        <span class="usage" id="size-mapper"></span>
+        <span class="hint" id="age-mapper"></span></label>
       <label>Trace database cap <input type="number" id="set-trace-cap" min="16" step="64"> MB
         <span class="usage" id="use-trace"></span></label>
       <label>Flow database cap <input type="number" id="set-flow-cap" min="16" step="256"> MB
@@ -1275,6 +1298,20 @@
       <p class="hint">The application file has no cap because it is the one file worth
         backing up.<button type="button" class="help-link" data-help="settings.data.appfile"
         title="What does this control?" aria-label="Help">?</button></p>
+      <p class="hint">Wireless, ConfigRX and Mapper have no cap either: an access-point event
+        log, a device's configuration backups and a drawn map are each small enough that a cap
+        would only ever cost history nobody was short of space for.</p>
+    </fieldset>
+
+    <fieldset>
+      <legend>DISK SPACE</legend>
+      <label>Warn below <input type="number" id="set-disk-warn" min="1" max="90" step="1"> %
+        <span class="usage" id="use-disk"></span></label>
+      <label>Critical below <input type="number" id="set-disk-critical" min="1" max="90" step="1"> %</label>
+      <p class="hint">Free space on the volume holding the data files above, as a percentage of
+        that volume. Crossing either raises "The volume holding the databases is low on free
+        space" on the Alerts page, checked on the same 15-minute pass as the caps. A cap only
+        governs one file; this is what notices the disk filling up for any other reason.</p>
     </fieldset>
     </div>
 

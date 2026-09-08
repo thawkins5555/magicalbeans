@@ -287,6 +287,43 @@ day-based retention prunes for each module,
 `AppDatabase.prune_hostnames()` for the reverse-DNS cache and
 `AppDatabase.prune_asn_cache()` for the ASN/owner cache.
 
+`web/service.py`'s module-level **`STORES`** is the one list of what those
+databases are: per store a `name` (the prefix its keys carry in the storage
+block, and the `entity_id` of any alert about it), a `label`, an `attr`
+naming where it hangs off the `Service`, and the `max_*_db_mb` `cap_key`
+that trims it or `None`. `db_for(service, store)` walks the `attr`, and
+answers `None` for a store this service has not opened rather than raising.
+`api._storage`, the Dashboard's storage-headroom tile and the maintenance
+sweep's size alerts all read it, which is what stopped them disagreeing:
+each was hand-written, and `mapper.db` went into one and was missed in the
+other — the Dashboard's own comment recorded it.
+
+The sweep ends in **`Service._sample_storage_alerts()`**, after the trims
+rather than on a clock of its own, so the size it reads is what is left once
+retention has done everything it can. Per capped store it raises the
+`db_near_cap` system rule at 85% of cap (`DB_CAP_WARN_SHARE`), escalates the
+occurrence's severity at 95% (`DB_CAP_HIGH_SHARE`) and clears below 80%
+(`DB_CAP_CLEAR_SHARE`) — a clear band under the raise band because trimming
+holds a busy store just under its cap for ever, and one threshold would
+open and close the alert on alternate sweeps. Inside that band an alert
+already open is re-raised rather than left alone: the rule's
+`auto_resolve_after_s` is measured from `last_ts` and only a raise moves it,
+so the backstop would close a store trimmed into the band half an hour later
+and the effective clear would be 85%, not 80%. The store name is the
+`entity_id`, so each database has an alert of its own rather than one that
+flaps between them. `disk_space(service)` then reports the volume the
+application file sits on through `shutil.disk_usage`, and `disk_space_low`
+covers what no cap can: a full volume stops every database writing at once.
+Its two thresholds are `disk_free_warn_pct` and `disk_free_critical_pct` in
+`appdb.DEFAULTS`, editable on Settings → Data & retention, and refused
+unless the critical one is below the warning one. It has the databases'
+band as well: raised below the warning threshold, cleared only
+`DISK_FREE_CLEAR_MARGIN_PCT` above it, so a WAL growing between prunes and
+shrinking after them cannot flap the alert every sweep. Both go through
+`AlertEngine.system_occurrence` / `clear_system_occurrence` reached with
+`getattr`, the convention `nodepoll._note_saturation` already uses, so a
+`Service` built without an engine still runs the sweep.
+
 Every pass runs on one thread, `netpath-maintenance`. The periodic tick
 waits on `_maintenance_request` (not on a bare sleep) for 60 s at a time
 and runs the sweep at most every `MAINTENANCE_INTERVAL_S`;
@@ -318,7 +355,7 @@ fourth setting).
 | --- | --- | --- |
 | `app.db` | `AppDatabase` (`appdb.py`) | global settings, `users`, `user_permissions` (per-account per-module read/write grants), `hostnames` (the shared reverse-DNS cache), `asn_cache` (ASN/owner per address, long TTL), a `meta` table for one-off markers like the update-installed commit |
 | `netpath.db` | `Database` (`db.py`) | `targets`, `traces`, `hops`, `hop_stats` (cumulative continuous-probe counters per target/hop), NetPath's own settings |
-| `flows.db` | `FlowDatabase` (`flowdb.py`) | `flows`, `exporters`, `interfaces`, NetFlow's own settings |
+| `flows.db` | `FlowDatabase` (`flowdb.py`) | `flows`, `flow_rollup` (top-K per dimension per bucket, two tiers), `flow_rollup_span` (each bucket's grand total), `exporters`, `interfaces`, `samplers`, NetFlow's own settings |
 | `syslog.db` | `SyslogDatabase` (`syslogdb.py`) | `logs`, `log_counts` (hourly rollup), the FTS5 index, Syslog's own settings |
 | `ipam.db` | `IpamDatabase` (`ipamdb.py`) | `subnets`, `hosts`, `conflicts`, `scans`, `dhcp_servers`, `dhcp_scopes`, `dhcp_leases`, `dhcp_scope_history` (leased-IP trend), IPAM's own settings |
 | `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `device_groups` (organizational, unrelated to `groups`), `devices`, `interfaces`, `device_events`/`interface_events`, `discovery_jobs`/`discovery_results`, `vlans`/`vlan_ports`/`port_vlans` (per-port VLAN membership, for MAPPER), `mac_entries`, `neighbors`, `device_addresses`, `vendor_learned`, Nodes' own settings. Also the facade over the two files below |
@@ -738,14 +775,85 @@ these do not drown the dialog's HARDWARE list.
 The same pass writes `interfaces.media` (`update_interface_media`, batched
 like `update_interface_poe`): `'optic'` for every port a sensor resolved to
 — whatever it read and whatever its status, since a failed optic is still an
-optic — and `NULL` for every other row of that device that currently says
-`'optic'`. It is reached only after the walk answered, so a timeout never
+optic — and `NULL` for every other row of that device that currently names a
+medium. It is reached only after the walk answered, so a timeout never
 strips the badge; the early return for an empty `cols` covers that. This is
 the only media signal the app has, because IF-MIB has none, and it is what
 `nodes.js`'s `sfpBadge` renders. The device dialog additionally patches the
 rows it fetched with the `if_index` set from its own `/dom` read, in the
 dialog's own closure, so whichever of the two fetches lands second paints
-the badge on a device the poller has not yet walked.
+the badge on a device the poller has not yet walked. That patch only ever
+UPGRADES a row to `'optic'`: the live read proves DOM on the ports it names
+and says nothing about the ones it does not.
+
+**5.2.0 widened `media` past the ports that answer sensors.** A DOM walk
+cannot see an SFP slot that reports no DOM — a transceiver without the
+sensors, or an empty cage — and until now those were indistinguishable from
+copper. `_sfp_slot_media` reads two more ENTITY-MIB columns
+(`entPhysicalClass`, `entPhysicalModelName`) alongside the
+`entPhysicalDescr` and `entPhysicalContainedIn` the walk already had, and
+resolves each cage through the containment tree `_entity_port_map` walks —
+extracted to `_entity_contained_in` and walked once by `_poll_environment`
+for both, so the cage scan adds no second walk of that column (it was
+already walked once, not twice). An entity whose own text names a
+transceiver (`_TRANSCEIVER_TEXT`) and that resolves to an `ifIndex` is
+`'sfp'`; a `container(5)` that says it is a transceiver cage and holds
+nothing that does is `'sfp_empty'`, taking its `ifIndex` from the `port(10)`
+sitting in it, since the cage itself rarely carries the alias row. DOM
+always wins: a port with sensors is `'optic'` whatever its cage says. A
+container naming nothing is deliberately left alone — some platforms give
+every copper port one too, and a copper port must never wear an SFP badge,
+which is also why `_TRANSCEIVER_TEXT` matches an optical media suffix
+(`base-SX`, `10Gbase-LR`) or a form factor but never a bare `1000BaseT`.
+The cost is real and worth stating plainly: for every device the entity
+table mapped to a port, this is two more full column walks of `entPhysical`
+— class and model name — every `_SENSOR_REFRESH_S` (300 s), on top of the
+descr, containment and alias walks the sensor pass already made. A device
+that maps nothing to a port pays nothing for them, which is the only thing
+that bounds it. `entPhysicalVendorType` was a third and is not walked:
+`SYNTAX AutonomousType` makes it an OBJECT IDENTIFIER, so a conforming
+agent answers a dotted number no text test can read, and the registered
+names those numbers stand for (`cevSFP10GLR` and its kin) run the words
+together, so they would not match `_TRANSCEIVER_TEXT` even spelled out.
+
+Both go through `_walk_column_status`, and a walk that did not reach
+the end of its table makes the whole verdict advisory: `_poll_environment`
+then leaves every stored `'sfp'` / `'sfp_empty'` badge where it is, and only
+a port this poll's own sensors proved is an `'optic'` may overwrite one.
+Without that a device that answers the alias walk and then times out on
+`entPhysicalClass` produced an empty cage scan, which the clear pass read as
+"no cages here" and wrote `media = NULL` over every badge on the device —
+back the next cadence, so the list flickered every five minutes. A partial
+`entPhysicalModelName` walk did the milder version of the same thing,
+downgrading an occupied cage to `'sfp_empty'`. The `'optic'` path has had
+this protection since 5.1.0 (`if port_map:`); this is the same guarantee for
+the two states the entity table alone can see.
+
+**A −40 dBm optic is dark, not dying.** A transceiver with its port powered
+down or no fiber in it clamps at the bottom of its scale, and
+`_decode_entity_sensor`'s arithmetic reports that faithfully as `-40.0`;
+`entPhySensorStatus` still says `ok(1)`, so the status filter never catches
+it. `alertrules.is_dark_optic` names the condition once for both ends —
+`DARK_OPTIC_DBM` with half a dB of tolerance, plus a non-finite value, which
+is an agent with no reading to give (one quoting watts of nothing lands here
+through the scale arithmetic). A bare `0` is deliberately not on that list:
+0 dBm is 1 mW, a nominal transmit level for an ER/ZR/DWDM part, and what an
+agent quoting 0.1 dBm units rounds `-0.04` to. `breaches()` returns `False`
+for one on the two optic power families (`rules.source_kind` of `sfp_rx_dbm`
+or `sfp_tx_dbm`), keyed off the family so no other `'below'` rule can inherit
+it. `evaluate_threshold` answers `'clear'` for the same reading on the same
+families, because refusing to RAISE says nothing about an alert already
+open: the floor is a fresh sample every poll, so `threshold_stale_s` can
+never expire it, and a lit optic that went dark — or any of the alerts a 5.1
+build raised on every dark port, all of them open at upgrade time — would
+have stayed open until a human resolved it by hand. A dark port is
+`interface_down`'s to report. The guard has to live there rather than at the
+metric write: `threshold_stale_s` defaults to 900 s, so a `-40` already
+recorded would go on re-evaluating for fifteen minutes, and one written by
+an older build would never expire at all. `_poll_environment` also drops
+dark lanes before the per-port `min()`, so one dark lane of a multi-lane
+optic no longer beats three healthy ones; a port dark on every lane still
+records the floor, which keeps its chart continuous and its history true.
 
 **5.0.1 gave the walk a second table and the latch an expiry.** The value
 column `_poll_environment` asks for now comes from `_walk_sensor_columns`
@@ -1663,6 +1771,30 @@ as already answered instead of popping a dialog apiece on first open.
 `allow_ping_only` — the dialog's checkbox rules are a convenience, the
 poller's check is the rule — and creates an approved ping-only device
 with a `snmp_enabled = 0` override so it doesn't fail SNMP every poll.
+
+Re-discover (5.2.0): `POST /api/nodes/discovery/<id>/rescan` starts a
+**new** job with the finished one's target, profile and per-scan timing.
+Re-running the old job in place was considered and rejected three times
+over: a `DiscoveryJob`'s `threading.Thread` is built in `__init__` and
+cannot be restarted; `discovery_results` has no delete-by-job path short
+of the FK cascade on job delete, so a second sweep writing into the same
+row would double-list every address and break both `folded_into_result_id`
+and `drawDiscResultsTable`'s signature dedupe; and the run being repeated
+is the audit trail the repeat exists to be compared against. Replaying it
+needs inputs the row never kept, so `_migrate()` adds `group_id` and
+`overrides_json` to `discovery_jobs` and `add_discovery_job` stores both
+from the start path too. `overrides_json` holds the five Start-dialog
+timing values *as the dialog sends them*, not the settings they become:
+the derived `discovery_communities` string is deliberately not stored, so
+a job row never holds a credential — it is re-derived from the profile on
+every start, which also means a rescan picks up a community added to that
+profile since. `api._start_discovery_job` is the whole of a start past
+reading the request, so the two routes cannot drift; the rescan route adds
+only its three refusals (the job itself still running, another *live*
+sweep of the same target — `state = 'running'` **and** the poller agreeing,
+so a row stranded by a killed process cannot wedge the button, and a
+missing or deleted profile, which answers `needs_profile` so the browser
+opens the Start dialog on that target rather than the server guessing one).
 
 Address walk (5.0.0): a result that answered the identity GET is then
 asked for `ipAdEntAddr` alone — one column, through
@@ -2865,7 +2997,7 @@ occurrence increments one alert instead of opening a duplicate" behavior
 lives in the database's own conflict resolution, not in application code
 that could race between a read and a write.
 
-47 built-in rules and 6 built-in templates are seeded via `INSERT OR
+49 built-in rules and 6 built-in templates are seeded via `INSERT OR
 IGNORE` keyed on each row's unique `key`, run on every open — idempotent,
 so a re-open never duplicates, and an admin's edit to a built-in rule's
 severity or a template's wording survives a restart because the seed
@@ -3689,6 +3821,24 @@ rather than silently applying whatever assignments aren't part of it.
 — `executemany`, since (unlike a bulk edit broadcasting one value to many
 devices) every device here gets its own value.
 
+The dialog behind both routes moved to MAPPER in 5.2.0 (`mapper.js`,
+`#mp-upstream-suggestions` in that page's top strip) — the last piece of
+the 4.53.0 migration off the retired Nodes TOPOLOGY subtab, finished on
+the page that reviews L2 parentage rather than the one the subtab happened
+to live under. Nothing server-side moved with it: both routes stay
+`("nodes", R)`/`("nodes", W)`, because what Apply writes is
+`devices.upstream_id`, and mapper-gated aliases would hand a mapper-only
+account a Nodes write. The dialog therefore offers Apply against
+`App.canWrite('nodes')`, not against its own page's module, and the button
+is in the top strip rather than the action bar: `drawToolbarState` gates
+that bar on a selected map, and this list is fleet-wide. Two things were
+copied rather than moved with it, both because the Nodes page still has
+its own consumers: `CONFIDENCE_COLOR` and `confidenceBadgeHtml`, which the
+Discovery grid's "Same as" column and `duplicatesDialog` score into the
+same three tiers. `mapper.js` in turn carries its own copy of
+`displayName`'s precedence, for the same reason its device-status
+vocabulary is copied: neither lazy module may reach into the other.
+
 ### Interface flapping thresholds (`alertsdb.py`, `alertengine.py`)
 
 `alertrules.evaluate_flapping()` always took `window_s` and
@@ -4250,15 +4400,151 @@ third — each walking the same rows. Widening the window multiplies the
 rows every one of them reads, which is why zooming out felt like the app
 had hung. `overview()` does the single `GROUP BY key, slot` pass those
 three shared and derives all of it from the result: summed per key it is
-`top`, summed overall it is `totals`, and bucketed it is the stacked
-series. Ties are broken by name rather than left to SQL's arbitrary
-`ORDER BY` order, so two equal-volume keys keep the same position — and
-therefore the same colour — between refreshes. `series()`, `top()` and
-`totals()` remain for their other callers.
+`top`, bucketed it is the stacked series. Ties are broken by name rather
+than left to SQL's arbitrary `ORDER BY` order, so two equal-volume keys
+keep the same position — and therefore the same colour — between
+refreshes. `series()`, `top()` and `totals()` are now thin wrappers over
+the same `_agg_rows()` helper, so there is one copy of the SQL and one
+routing decision rather than four that can drift apart.
 
-The record list's `ORDER BY bytes * sampling DESC` over the whole window
-is the remaining unindexed cost, left alone deliberately: changing it
-would change what "top 250 by volume" means.
+**The rollups, and why the cap is the point.** One scan is still a scan:
+at a hundred million rows the single pass is the whole cost. `flow_rollup`
+holds, per (tier, dimension, bucket), the heaviest `ROLLUP_KEYS[tier]`
+keys with `sampling` already multiplied into the stored sums — the factor
+is per row, so it cannot be reapplied to an aggregate afterwards. Because
+the row count per bucket is capped, a query costs
+`O(window / bucket × K)` **whatever the traffic volume is**; the
+alternatives considered (one row per flow tuple; one uncapped row per
+(dimension, bucket, key)) both scale with traffic and so move the cliff
+rather than removing it.
+
+The cap would make totals wrong, so `flow_rollup_span` keeps each
+bucket's grand total once — dimension-independent, since every dimension
+sums the same flows — and the residual is `span − Σ(stored keys)`. That
+is algebraically the same "everything not in the top series" the raw path
+computes by adding up the keys it left out, so `overview()` uses the one
+formulation on both paths and `— other —` absorbs sub-cap keys and, on
+the rollup path, NULL-keyed traffic (`flow_rollup`'s primary key forbids
+NULL, so the compaction `SELECT` carries `IS NOT NULL`). It is clamped at
+zero on read: a dimension and its bucket's span row are written in
+separate transactions, so a dimension rebuilt after late flows arrived can
+be read against a span built before them, and a series that stacks
+downwards is not something traffic does.
+
+Two tiers, matched to `api._flow_bucket`'s ladder: 60 serves the 60/300/900
+buckets, 3600 serves 3600 and 21600, and the 10-second bucket of the
+15-minute view stays on raw, where a quarter of an hour of rows is cheap.
+
+**Building them** (`compact_rollup`, `backfill_rollup`) follows
+`nodesseriesdb.compact_rollup`'s shape with three deliberate differences.
+The watermark seeds at the current *sealed* bucket rather than at the
+oldest row, so an existing store produces useful buckets on its first pass
+instead of grinding through a fortnight of history first; history is paged
+in separately by `backfill_rollup`, walking a floor cursor backwards a
+bucket at a time and committing it as it goes. Behind the watermark, a
+pass rebuilds the buckets its writers marked dirty (`_DIRTY`, the oldest
+`ts_end` anything has written or rewritten since that tier last
+compacted) rather than a fixed window: a window wide enough for the
+slowest exporter is write amplification on every other pass, and any
+fixed width is still too narrow for an exporter further behind than
+that. A bucket is rebuilt with
+DELETE-then-INSERT rather than an upsert, because which keys make the
+top-K changes when it is recomputed and a stale row would otherwise
+survive its key dropping out. And the hourly tier reads the minute tier
+for any hour the minute tier fully covers — sixty rows instead of an
+hour's worth of raw flows.
+
+Query routing (`_rollup_plan`) refuses the rollups outright when any
+filter is set (the rollup has one row per key, not per flow, and the
+filters select on columns that are not in it), when no tier divides the
+bucket size, and when the tier's floor does not reach the start of the
+window. Where there is no bucket size to divide — `top()` and `totals()`,
+which put the whole window in one slot — the coarsest tier that both
+reaches `t0` and starts on it wins, since with one slot to fill the finer
+tier only means reading sixty times the rows for the same number. That last rule is what makes the backfill safe to run at any
+pace: as the cursor walks back, progressively wider windows move off raw,
+and none is ever slower than it was before. The chosen tier serves
+`[t0, seal_ts)` and raw serves `[seal_ts, t1]`, where `seal_ts` is
+tier-aligned — so the two ranges are exactly complementary, with nothing
+counted twice and nothing falling between them. `t0` is snapped down to a
+bucket boundary on **both** paths, because a rollup bucket lands wholly
+inside one chart slot only if the slots start on a bucket boundary, and
+snapping only where a rollup happened to be used would shift the window
+under the operator whenever a filter was toggled.
+
+**Ingest.** `flows.db` is the one store that does not pin
+`synchronous=FULL` (`db.py`, `appdb.py` and `ipamdb.py` all do): NetFlow
+is UDP, an fsync per commit halves throughput, and a stalled writer is
+lost data with nothing to retransmit it. The writer drains the queue
+greedily rather than taking one datagram per loop, so a burst costs one
+commit instead of hundreds and `queue.Full` is reached far later.
+`collector.RESAMPLE_MAX_AGE_S` bounds `record_sampling_rates`' rewrite to
+the last fifteen minutes — unbounded it had no index it could use and
+grew into a scan of the whole retention window, on the writer thread,
+under the write lock, after every flush. When a rewrite does correct rows
+it marks every tier dirty from how far back it reached, exactly as a
+flush does, so widening that bound later cannot make the rollups quietly
+disagree with the rows they were built from. Per tier and not one shared
+marker: the minute tier compacts first, and a single marker was cleared
+by that pass before the hourly tier had ever seen it.
+
+`ix_flows_exporter` was dropped: every insert paid for a random-position
+B-tree insert (`exporter` is not monotone, unlike `ts_end`) to serve one
+optional filter, and a filtered query is a range scan of `ix_flows_ts`
+with the rest tested as residuals either way. It is dropped lazily from
+maintenance (`drop_legacy_indexes`), never at open — freeing every page
+of a five-million-row index is exactly the class of work that made
+startup take half a minute before, which is what `CONVERT_AT_OPEN_PAGES`
+exists for.
+
+**Retention.** `prune()` is built on `SqliteStore._delete_batches`, the
+same shape `db.prune()` uses: age, then row cap, then each rollup tier,
+sharing one deadline, each stage chunked so the write lock is released
+between batches. The age stage deletes off `ix_flows_ts`, oldest first,
+with the helper's coordinate counting rows removed rather than ids
+walked: bounding it by `MIN(id)`/`MAX(id)` over the aged rows meant one
+flow arriving now from an exporter whose clock was years out put the top
+of the range at the newest id in the table, and every sweep chunk-walked
+all of it — correctly filtered, but O(table) every fifteen minutes. The
+row-cap stage does chunk by id, which is arrival order, and derives its
+cut from `MIN(id)`/`MAX(id)` probes rather than the `COUNT(*)` full scan
+it used to run on every pass.
+The rollup stage walks bucket timestamps instead of ids (the helper only
+needs a monotonic coordinate) and raises the tier's floor as it goes, so
+routing stops trusting history that is no longer there.
+`retention_days` and `max_flows` now bound the raw table alone, which is
+the point: `rollup_minute_days` and `rollup_retention_days` outlive them,
+so a 30-day chart survives a fortnight's raw retention.
+
+The record list's `ORDER BY bytes * sampling DESC` cannot be index-served
+— the sort key is a product, and `sampling` is retroactively mutable — so
+the scan is bounded instead: `flows()` starts at `MAX(id) − FLOW_SCAN_CAP`
+(`MAX(rowid)` is one probe) and returns whether the bound bit, which
+`api._flow_records_rows` passes through as `scan_bounded` and `netflow.js`
+says out loud. Changing the sort would change what "top 250 by volume"
+means; bounding the scan does not. The bound belongs to those two
+orderings alone — `order == "time"` is `ix_flows_ts` end to end — and a
+window lying wholly below it is answered unbounded, since a window with
+nothing above the bound has no ordering left to cut short and an empty
+list is not what "the heaviest of the most recent" means.
+
+**The rollup loop** lives in `web/service.py`, on its own 60-second timer
+beside the maintenance thread rather than inside the quarter-hourly sweep:
+at `MAINTENANCE_INTERVAL_S` cadence the unsummarised tail would be a
+quarter of an hour of raw flows, which at extreme volume is the very scan
+the rollups exist to avoid. With that cadence and `_ROLLUP_LAG_S` the tail
+is about three minutes wherever a pass can build every bucket that sealed
+since the last one; where it cannot, the watermark still advances as far
+as the pass reached, so the tail is bounded by how fast the store can
+summarise rather than growing by a bucket a minute for ever. That is what
+building new buckets *before* the redo window buys: a pass whose redo
+alone outran its budget used to leave the watermark exactly where it
+started and repeat the same work on the next pass. The maintenance sweep
+backfills and drops the legacy index *before* pruning — the same
+ordering, and the same reason, as the `nodes_db.compact_rollup()` /
+`nodes_db.prune()` pair beside it. It does not compact: the timer has
+already built those buckets, and `Service._rollup_lock` keeps the sweep's
+backfill and the timer's compaction from rebuilding one at the same time.
 
 ### Zoom debounce and the stale-response guard (`netflow.js`)
 

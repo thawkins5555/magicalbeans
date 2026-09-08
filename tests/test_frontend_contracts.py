@@ -894,6 +894,17 @@ check("error.status = response.status" in APP and "error.payload = payload" in A
       "than only printing it")
 check("duplicate_of_device_id" in NODES and "'/api/nodes/duplicates'" in NODES,
       "nodes.js reads the discovery duplicate verdict and the duplicates route")
+# Re-discover starts a subnet sweep and the row it sits on is not redrawn
+# until the POST answers, so a live button is two sweeps for two clicks. The
+# server refuses the second one, but a button that stays clickable while it
+# works is the defect the refusal exists to survive, not a design.
+_REDISCOVER = NODES[NODES.index("  async function rediscover("):
+                    NODES.index("  function discStatus(")]
+check("button.disabled = true" in _REDISCOVER
+      and "rediscover(job, e.target)" in NODES,
+      "the Re-discover button is handed to rediscover() and disabled for the "
+      "duration of its POST, the way every other button here that starts "
+      "something is")
 
 # 33. Settings -> MODULE SETTINGS opens the module's own dialog (5.0.1).
 #     The list used to selectTab() and then synchronously click the
@@ -1160,6 +1171,21 @@ check("badge badge-sfp" in NODES and "r.media === 'optic'" in NODES,
 check(".badge-sfp" in APP_CSS,
       "app.css styles the SFP badge, or it inherits the amber warning fill "
       "every other badge uses")
+# 5.2.0: a cage with no DOM is still an SFP slot, so the badge says which
+# of the two a port is rather than only appearing for the measurable half.
+check("badge badge-dom" in NODES and "r.media === 'sfp_empty'" in NODES,
+      "an optic with DOM reads DOM and a cage without it still reads SFP, "
+      "empty or not")
+check(".badge-dom" in APP_CSS,
+      "app.css styles the DOM badge as well, or it inherits the amber "
+      "warning fill")
+check("No signal" in NODES and "darkOptic(s)" in NODES,
+      "a dark optic's dBm reading is rendered as words in the DOM tables, "
+      "not as a number that reads like a dying link")
+check("s.value === 0" not in NODES,
+      "0 dBm is 1 mW -- a nominal ER/ZR transmit level, and what an agent "
+      "quoting 0.1 dBm units rounds -0.04 to -- so it must read as the "
+      "figure it is, never as 'No signal'")
 check("sfpBadge(r) + escape(r.descr" in NODES,
       "the badge is prepended to the descr cell, so it is visible in the "
       "default column set rather than behind the column picker")
@@ -1275,6 +1301,31 @@ check("'admin', 'ssh', 'web'" in SETTINGS,
 check("set-web-relay-range" in INDEX and "web_relay_port_range" in SETTINGS,
       "the relay port range is an administrator-only Settings field, saved "
       "the way every other Apply field is")
+
+
+# 43. NetFlow (5.2.0): the rollup retentions are settings like any other, so
+#     the STORAGE fieldset carries them and Save posts them under the keys
+#     flowdb.DEFAULTS names.
+_NETFLOW = read("netflow.js")
+_NF_SETTINGS = _NETFLOW[_NETFLOW.index("  function settingsDialog() {"):
+                        _NETFLOW.index("  async function sendTestPacket() {")]
+_NF_STORAGE = _NF_SETTINGS[_NF_SETTINGS.index("STORAGE AND DISPLAY"):
+                           _NF_SETTINGS.index("columnPickerFieldset")]
+for _id, _key in (("n-rollup-min", "rollup_minute_days"),
+                  ("n-rollup-days", "rollup_retention_days")):
+    check("'%s'" % _id in _NF_STORAGE,
+          "the %s field sits in the STORAGE fieldset beside the flow "
+          "retention it outlives" % _id)
+    check("s.%s" % _key in _NF_STORAGE,
+          "...seeded from the settings the dialog was opened with")
+    check("%s: num('#%s')" % (_key, _id) in _NF_SETTINGS,
+          "...and posted to /api/settings under %s" % _key)
+check("summaries, not from the records" in _NF_STORAGE,
+      "the hint says what a chart older than the flow retention is drawn "
+      "from, which is the only reason the two fields exist")
+check("scan_bounded" in _NETFLOW,
+      "the record list reads the server's scan bound rather than implying "
+      "it ordered every record in the window")
 
 
 print()

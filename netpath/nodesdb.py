@@ -380,6 +380,12 @@ CREATE TABLE IF NOT EXISTS discovery_jobs (
     identified      INTEGER NOT NULL DEFAULT 0,
     allow_ping_only INTEGER NOT NULL DEFAULT 0, -- ping-only results may be approved
     reviewed        INTEGER NOT NULL DEFAULT 0, -- the approve/deny dialog was answered
+    -- What Re-discover replays: the polling profile the sweep ran under
+    -- and the per-scan timing from the Start dialog. Not a foreign key,
+    -- so a deleted profile leaves the row's history intact; the rescan
+    -- route re-checks the profile still exists before replaying it.
+    group_id        INTEGER,
+    overrides_json  TEXT,
     started_ts      REAL NOT NULL,
     finished_ts     REAL,
     error           TEXT
@@ -869,6 +875,11 @@ class NodesDatabase(SqliteStore):
             # Pre-upgrade jobs count as already reviewed, or every old
             # finished job would pop an approval dialog on first open.
             "reviewed": "INTEGER NOT NULL DEFAULT 1",
+            # What Re-discover replays. Both stay NULL on a job started
+            # before this column existed, and the route treats that as
+            # "ask the operator" rather than guessing a profile.
+            "group_id": "INTEGER",
+            "overrides_json": "TEXT",
         })
         # What the sweep's arc hop found, carried into the device on
         # promotion so its first poll starts from the same evidence.
@@ -946,8 +957,10 @@ class NodesDatabase(SqliteStore):
         # Per-port PoE and STP state, the same kind of fact as oper_status
         # and refreshed by the same poll cycle rather than a table of its own.
         # media: 'optic' once a port-mapped ENTITY-SENSOR row proves a
-        # transceiver, else NULL. Written by _poll_environment — IF-MIB has
-        # no media column of its own.
+        # transceiver with DOM, 'sfp' for a transceiver the ENTITY-MIB names
+        # but that reports no DOM, 'sfp_empty' for a cage with nothing in it,
+        # else NULL. Written by _poll_environment — IF-MIB has no media
+        # column of its own.
         self.ensure_columns("interfaces", {
             "poe_admin": "TEXT", "poe_detect_status": "TEXT",
             "stp_state": "TEXT", "poe_power_mw": "INTEGER",
@@ -1252,19 +1265,33 @@ class NodesDatabase(SqliteStore):
             # learned filters the list down to the switches that see it.
             # Only from four hex digits: fewer would match half the estate
             # and turn a search into a shuffle.
+            #
+            # The alias addresses are searched the same way, so a device
+            # that answers on several is found by any of them — including
+            # the address a merged-away row was entered under, which
+            # merge_devices keeps as an alias of the surviving device. The
+            # subquery is a second scan, over a table holding a handful of
+            # rows per device: on the same 2000-device shape (one alias
+            # each) it costs about half as much again as the seven-column
+            # LIKE above, which leaves it just as far under anything an
+            # operator would notice. A leading-% LIKE cannot use
+            # ix_device_addresses_ip, at this scale or any other.
             text_cols = ("ip", "name", "sys_name", "sys_location",
                          "sys_descr", "sys_contact", "vendor")
             text_sql = " OR ".join(f"{col} LIKE ?" for col in text_cols)
+            text_sql += (" OR id IN (SELECT device_id FROM device_addresses"
+                         "           WHERE ip LIKE ?)")
+            like = [f"%{text}%"] * (len(text_cols) + 1)
             mac = looks_like_mac_search(text)
             if len(mac) >= 4:
                 clauses.append(
                     f"({text_sql}"
                     " OR id IN (SELECT device_id FROM mac_entries"
                     "           WHERE mac LIKE ?))")
-                params.extend([f"%{text}%"] * len(text_cols) + [f"{mac}%"])
+                params.extend([*like, f"{mac}%"])
             else:
                 clauses.append(f"({text_sql})")
-                params.extend([f"%{text}%"] * len(text_cols))
+                params.extend(like)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         return where, params
 
@@ -1948,6 +1975,26 @@ class NodesDatabase(SqliteStore):
             return self._conn.execute(
                 "SELECT * FROM device_addresses WHERE device_id = ? ORDER BY ip",
                 (device_id,)).fetchall()
+
+    def addresses_for_devices(self, device_ids) -> dict[int, list[sqlite3.Row]]:
+        """device_addresses() for many devices at once, in as few queries as
+        the bind-parameter limit allows — one page of the device list costs
+        one read rather than one per row. Devices with no alias are absent
+        from the result, so callers ask with .get()."""
+        ids = list(dict.fromkeys(device_ids))
+        if not ids:
+            return {}
+        found: dict[int, list[sqlite3.Row]] = {}
+        with self._lock:
+            for start in range(0, len(ids), self._IDS_PER_QUERY):
+                chunk = ids[start:start + self._IDS_PER_QUERY]
+                marks = ",".join("?" * len(chunk))
+                rows = self._conn.execute(
+                    f"SELECT * FROM device_addresses WHERE device_id IN ({marks})"
+                    " ORDER BY ip", chunk).fetchall()
+                for row in rows:
+                    found.setdefault(row["device_id"], []).append(row)
+        return found
 
     # ------------------------------------------- identity, duplicates, merge
 
@@ -2836,9 +2883,9 @@ class NodesDatabase(SqliteStore):
                 raise
 
     def update_interface_media(self, device_id: int, rows: list[dict]) -> None:
-        """Per-port media kind ('optic' or None), batched the way
-        update_interface_poe batches its own poll. A row for a port this
-        device no longer has updates nothing, same as there."""
+        """Per-port media kind ('optic', 'sfp', 'sfp_empty' or None), batched
+        the way update_interface_poe batches its own poll. A row for a port
+        this device no longer has updates nothing, same as there."""
         if not rows:
             return
         params = [(row.get("media"), device_id, row["if_index"])
@@ -3477,12 +3524,20 @@ class NodesDatabase(SqliteStore):
     # ------------------------------------------------------------- discovery
 
     def add_discovery_job(self, kind: str, target: str,
-                          allow_ping_only: bool = False) -> int:
+                          allow_ping_only: bool = False,
+                          group_id: int | None = None,
+                          scan_overrides: dict | None = None) -> int:
+        """`group_id` and `scan_overrides` are what Re-discover replays. The
+        communities the sweep actually tried are deliberately NOT among
+        them: they are derived from the profile on every start, so a job
+        row never holds a credential of its own."""
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO discovery_jobs(kind, target, allow_ping_only,"
-                " started_ts) VALUES (?,?,?,?)",
-                (kind, target, 1 if allow_ping_only else 0, time.time()))
+                " group_id, overrides_json, started_ts) VALUES (?,?,?,?,?,?)",
+                (kind, target, 1 if allow_ping_only else 0, group_id,
+                 json.dumps(scan_overrides) if scan_overrides else None,
+                 time.time()))
             self._conn.commit()
             return cur.lastrowid
 

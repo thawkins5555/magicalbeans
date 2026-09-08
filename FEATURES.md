@@ -406,15 +406,30 @@ own subtabs.
   transmit power are told apart by the sensor's own name, because the MIB
   says "optical power" without saying which direction; a reading whose
   name says neither is still shown in the port's dialog, it just gets no
-  metric key. A multi-lane optic reports the dimmest lane for light levels
-  and the most extreme reading for the rest. The device-wide
+  metric key. A multi-lane optic reports the dimmest lane that is lit for
+  light levels and the most extreme reading for the rest. The device-wide
   `temp_optic_c` is unchanged.
-- **A port with an optic in it says so.** Any port a sensor maps to is
-  marked as optical and shows an **SFP** badge beside its name in the
-  interface list — the only reliable signal there is, since IF-MIB has no
-  media column. The badge is cleared by the first walk that answers and
-  maps nothing to that port; a walk that times out leaves it alone rather
-  than blinking the whole fleet's optics out of existence.
+- **An optic with no light in it is not an optic in trouble.** A
+  transceiver whose port is powered down, or that has no fiber in it,
+  reports the bottom of its own scale — −40 dBm — and no low-power alert
+  is raised on that reading, on either receive or transmit — and a
+  low-power alert already open on a port that goes dark is resolved
+  rather than left showing the reading that raised it. A genuinely
+  dying optic (−25 dBm, say) alerts exactly as before. On a multi-lane
+  optic a dark lane no longer drags the port's reported light level down
+  past three healthy ones, and a port dark on every lane still records
+  the floor so its chart keeps its history. In the DOM tables the reading
+  itself shows as **No signal**, with the raw figure on the row.
+- **A port with an optic in it says so, and so does an empty SFP slot.**
+  A port whose transceiver reports DOM readings shows a **DOM** badge
+  beside its name in the interface list; an SFP slot the device describes
+  but that reports no DOM at all — a transceiver without the sensors, or
+  a cage with nothing plugged into it — shows an **SFP** badge instead,
+  whose tooltip says which of the two it is. This is the only reliable
+  media signal there is, since IF-MIB has no media column. A badge is
+  cleared by the first walk that answers and finds nothing there; a walk
+  that times out leaves it alone rather than blinking the whole fleet's
+  optics out of existence.
 - **A device inherits its settings from a "polling profile"** (a group) —
   credentials, poll interval, timeout, retries, which of ping/SNMP are
   enabled, how many ping probes to send and how long to wait for them,
@@ -588,6 +603,16 @@ own subtabs.
   entirely. Any scan that is no longer running can be removed from the
   jobs list with its Remove button. Running scans are visible on the
   Debug page (DISCOVERY SCANS RUNNING) with live progress.
+- **A finished scan can be run again with one click.** Its **Re-discover**
+  button starts a fresh sweep of the same target on the same polling
+  profile and the same per-scan timing, without retyping either. It is
+  always a new scan, never the old one re-run in place: the run being
+  repeated keeps its own results and its place in the list, so what
+  changed since is readable rather than overwritten. A second sweep of a
+  target already being scanned is refused, and a device the earlier scan
+  already added comes back as "Already added" rather than a duplicate. A
+  scan started before 5.2.0 has no profile stored on it; Re-discover opens
+  the Start dialog on its target instead of guessing one.
 - **Results are a sortable table.** Click a heading to sort — IP addresses
   in numeric order, so .9 comes before .100 — drag the column edges, and
   use the header box to select every result the scan is allowed to add.
@@ -903,9 +928,10 @@ question actually gets answered.
 
 The interface list sorts by any column — Descr, Admin, Oper, Speed,
 In, Out — the same way every other table in the app does. A port carrying a
-transceiver shows an **SFP** badge beside its description; opening a device's
-dialog adds the badge to any port its live DOM read finds, even one the
-poller has not yet walked. Which SNMP identity
+transceiver that reports DOM shows a **DOM** badge beside its description
+and an SFP slot without one shows **SFP**; opening a device's dialog
+upgrades a port to **DOM** if its live read finds sensors there, even one
+the poller has not yet walked. Which SNMP identity
 fields the header shows (sysDescr, sysName, sysObjectID, contact,
 location, vendor, SNMP version) is chosen in Nodes → Settings; the IP,
 status and any SNMP error always show.
@@ -1303,7 +1329,7 @@ alerts and optionally emailing about them.
 
 ### Rules
 
-- **47 built-in rules** ship enabled: a device not responding, a device
+- **49 built-in rules** ship enabled: a device not responding, a device
   recovering, a device rebooting, SNMP authentication failing, a device
   needing unsupported SNMPv3 privacy, a poll running longer than its own
   interval, a device whose vendor MIB is missing, an interface going
@@ -1407,6 +1433,22 @@ alerts and optionally emailing about them.
   one device failing. `smtp_failing` fires when the mail path itself stops
   working, and is the one rule whose notification cannot be delivered by
   the mechanism it is about — it exists so the alert list says so.
+- **Two more report on storage, new in 5.2.0**, because nothing in the
+  product alerted on a database running out of room before them.
+  `db_near_cap` opens once a database is at 85% of its size cap and the
+  maintenance sweep has already trimmed everything it could — once the file
+  reaches that cap every pass deletes history to keep it there, which is a
+  decision about how much the site keeps rather than a log line. Its message
+  says which band the file is in past 95%, and it closes on its own once the
+  file is back under 80%,
+  and each database raises its own alert rather than one that flaps between
+  them. The alert names the file, its path, its size, its cap and the
+  retention setting that governs it, so it can be acted on from the alert.
+  `disk_space_low` covers what no cap can: the volume under all thirteen
+  files running out, which stops every one of them writing whatever their
+  caps say. Its two thresholds are on Settings → Data & retention. Like
+  every other `system` rule neither ever sends email — a full disk is
+  exactly when the mail spool is least trustworthy.
 - **A rule carries three attributes that the rule dialog now edits.**
   Beyond severity, enablement, device filter and thresholds: an
   auto-resolve interval (`auto_resolve_after_s`, blank meaning never), an
@@ -1498,9 +1540,10 @@ real, unrelated fault because of a guess is the one failure this feature must
 never have, so the neighbour table alone never sets `upstream_id`.
 
 **From 4.49.0, reviewing that guess no longer means one Edit dialog per
-device.** An **Upstream suggestions** button in the Nodes top strip
-(moved there in 4.53.0, when the TOPOLOGY subtab it used to sit on was
-retired) opens a dialog listing every
+device.** An **Upstream suggestions** button in the MAPPER top strip
+(it began on the Nodes TOPOLOGY subtab, moved to the Nodes strip in 4.53.0
+when that subtab was retired, and reached MAPPER — the page reviewing L2
+parentage belongs on — in 5.2.0) opens a dialog listing every
 device with no `upstream_id` set whose own collected neighbours matched
 another monitored device, ranked by evidence — a MAC-address match rated
 above a name match, a neighbour nothing has confirmed on the last walk rated
@@ -1881,6 +1924,12 @@ their real value rather than the label, so `HTTPS (443)` lands between 80 and
 1024 rather than under H, and `4.0 MB` sorts above `900 B`. Cells with nothing
 in them sort to the bottom whichever way the column points.
 
+Ordering by volume reads the most recent couple of million records of the
+window rather than every one of them, because the sort key is bytes times a
+sampling rate that can be rewritten after the fact and so cannot be indexed.
+Where that bound is reached the selector's tooltip says so; *most recent*
+never reaches it.
+
 Filters for source, destination, port, protocol and exporter apply to all three
 at once. Clicking a bar filters to it.
 
@@ -1965,6 +2014,29 @@ window you have already zoomed away from is discarded rather than drawn.
 
 Flows live in their own database so a busy exporter does not contend with the
 trace scheduler. Retention, a row cap and a file size cap all apply.
+
+Beside the individual records the collector keeps **summaries**: every minute
+and every hour, the heaviest keys of each Group by dimension, plus that
+period's grand total. The charts and the top-talkers bars are drawn from
+those wherever they cover the window asked for, which is what makes a 7- or
+30-day view answer in the same time a one-hour view does however many flows
+are behind it. The 15-minute view, and any filtered view, reads the records
+themselves.
+
+The summaries have their own retentions — *Keep minute summaries for* and
+*Keep hourly summaries for* — and they are deliberately longer than the flow
+retention. A store keeping a fortnight of individual flows and 90 days of
+hourly summaries still draws a 30-day chart; what it cannot do is show the
+records behind it. Deleting all flow records from **Settings → Maintenance**
+deletes the summaries with them, so the charts empty too.
+
+Two things about the summarised figures are worth knowing. Totals — the
+bytes, packets and flow count under the chart — are exact whichever source
+answered. A named series is exact for any key heavy enough to be among the
+heaviest in every period it appears in; a key that drops below that line in
+some periods is short by what it lost there, and that traffic appears in
+*— other —* rather than going missing. Filtered views are read from the
+records and are exact throughout.
 
 ---
 
@@ -2852,8 +2924,24 @@ Each data file also says **how far back it still reaches** — "oldest record
 14.0d ago", or "no history" for a file nothing has written to yet — beside
 its path, which is what tells you whether a cap has been costing you
 history rather than merely sitting there. The MIB and map files hold
-current state rather than a log and so report no age at all. The same
-figure appears on the desktop console's Databases card.
+current state rather than a log and so say nothing at all about their age.
+The same figure appears on the desktop console's Databases card.
+
+**All thirteen data files are listed**, each on one row: its path, its
+size, and how far back it reaches. Wireless, ConfigRX and Mapper were
+counted in the "on disk in total" figure at the foot of the list but had no
+row of their own, so the total exceeded what was on screen with nothing
+accounting for the difference. The eight files with a size cap have the cap
+and a **% used** meter on a row of their own below; the five without a cap
+show their size and no meter, the way the Dashboard's storage-headroom tile
+already reported them. A file over its cap reads its true share — 112%, not
+100% — which is what the Dashboard has always shown, and the meter itself
+stops at the end of its track.
+
+**Free space on the volume** is on the same subtab, with the two thresholds
+that decide when a low disk raises an alert (warn below 10% of the volume,
+critical below 5%, both editable). A size cap governs one file; nothing
+else in the product notices the disk under all of them filling up.
 
 **Apply** on this tab saves and returns immediately. The retention sweep it
 asks for — pruning and trimming thirteen databases — runs on the

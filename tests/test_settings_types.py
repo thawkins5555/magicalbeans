@@ -414,6 +414,90 @@ def main() -> int:
                                    cookie=admin_cookie)
         check("HTTP dns_timeout_s at its ceiling (30) -> 200",
               status == 200, f"{status} {payload}")
+
+        # The two disk thresholds are in range individually and still
+        # incoherent together: a critical floor at or above the warning one
+        # means every volume alert opens at critical and the warning band is
+        # unreachable. Both orders of arrival, since either key can be posted
+        # on its own against the stored value of the other.
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"disk_free_warn_pct": 10,
+                                               "disk_free_critical_pct": 20}},
+                                   cookie=admin_cookie)
+        check("HTTP disk_free_critical_pct above disk_free_warn_pct -> 400",
+              status == 400, f"{status} {payload}")
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"disk_free_warn_pct": 10,
+                                               "disk_free_critical_pct": 10}},
+                                   cookie=admin_cookie)
+        check("HTTP disk_free_critical_pct equal to disk_free_warn_pct -> 400",
+              status == 400, f"{status} {payload}")
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"disk_free_warn_pct": 10,
+                                               "disk_free_critical_pct": 5}},
+                                   cookie=admin_cookie)
+        check("HTTP a critical floor below the warning one -> 200",
+              status == 200, f"{status} {payload}")
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "global",
+                                    "values": {"disk_free_critical_pct": 15}},
+                                   cookie=admin_cookie)
+        check("HTTP a critical floor alone is checked against the stored "
+              "warning one -> 400",
+              status == 400, f"{status} {payload}")
+        check("HTTP the refused pair left both settings as they were",
+              service.settings.get("disk_free_warn_pct") == 10
+              and service.settings.get("disk_free_critical_pct") == 5,
+              str([service.settings.get("disk_free_warn_pct"),
+                   service.settings.get("disk_free_critical_pct")]))
+
+        # The two flow rollup retentions: netflow-scope keys in the same flat
+        # range table. A negative one used to be stored, and put
+        # _prune_rollup's cutoff in the future -- every rollup row deleted on
+        # every sweep and the tier's floor left ahead of now, so the tier was
+        # out of service while compaction went on writing to it.
+        for key in ("rollup_minute_days", "rollup_retention_days"):
+            status, _h, payload = req(port, "POST", "/api/settings",
+                                       {"scope": "netflow",
+                                        "values": {key: -1}},
+                                       cookie=admin_cookie)
+            check(f"HTTP {key} below its floor (-1) -> 400",
+                  status == 400, f"{status} {payload}")
+            status, _h, payload = req(port, "POST", "/api/settings",
+                                       {"scope": "netflow",
+                                        "values": {key: 3651}},
+                                       cookie=admin_cookie)
+            check(f"HTTP {key} above its ceiling (3651) -> 400",
+                  status == 400, f"{status} {payload}")
+            # 0 is a real choice on this field -- keep no summaries at this
+            # tier -- which is why the floor is 0 rather than 1.
+            status, _h, payload = req(port, "POST", "/api/settings",
+                                       {"scope": "netflow",
+                                        "values": {key: 0}},
+                                       cookie=admin_cookie)
+            check(f"HTTP {key} at its floor (0) -> 200",
+                  status == 200, f"{status} {payload}")
+
+        # Same key name, two scopes, two floors. nodesseriesdb.prune reads
+        # rollup_days=0 as "matches every existing row", so 0 in the nodes
+        # scope would delete samples_hourly outright -- the long metric
+        # history -- where 0 in the netflow scope only means "keep no
+        # summaries at this tier".
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "nodes",
+                                    "values": {"rollup_retention_days": 0}},
+                                   cookie=admin_cookie)
+        check("HTTP nodes rollup_retention_days at 0 -> 400", status == 400,
+              f"{status} {payload}")
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "nodes",
+                                    "values": {"rollup_retention_days": 1}},
+                                   cookie=admin_cookie)
+        check("HTTP nodes rollup_retention_days at its floor (1) -> 200",
+              status == 200, f"{status} {payload}")
     finally:
         try:
             server.stop()

@@ -34,6 +34,8 @@
     ['max_nodes_db_mb', 'set-nodes-cap', 'num'],
     ['max_nodes_series_db_mb', 'set-nodes-series-cap', 'num'],
     ['max_alerts_db_mb', 'set-alerts-cap', 'num'],
+    ['disk_free_warn_pct', 'set-disk-warn', 'num'],
+    ['disk_free_critical_pct', 'set-disk-critical', 'num'],
     ['session_idle_minutes', 'set-idle-minutes', 'num'],
     ['session_max_hours', 'set-session-hours', 'num'],
     ['web_relay_port_range', 'set-web-relay-range', 'str'],
@@ -81,6 +83,8 @@
     App.el('set-nodes-cap').value = s.max_nodes_db_mb;
     App.el('set-nodes-series-cap').value = s.max_nodes_series_db_mb;
     App.el('set-alerts-cap').value = s.max_alerts_db_mb;
+    App.el('set-disk-warn').value = s.disk_free_warn_pct;
+    App.el('set-disk-critical').value = s.disk_free_critical_pct;
     App.el('set-idle-minutes').value = s.session_idle_minutes;
     App.el('set-session-hours').value = s.session_max_hours;
     // Absent from `s` for an account without Settings read — hence `|| ''`
@@ -108,6 +112,9 @@
     App.el('set-nodes-series-path').value = storage.nodes_series_path || '';
     App.el('set-nodes-mibs-path').value = storage.nodes_mibs_path || '';
     App.el('set-alerts-path').value = storage.alerts_path || '';
+    App.el('set-wireless-path').value = storage.wireless_path || '';
+    App.el('set-configrx-path').value = storage.configrx_path || '';
+    App.el('set-mapper-path').value = storage.mapper_path || '';
     showUsage(storage);
     showUpdateInfo(server);
   }
@@ -367,64 +374,77 @@
   /* What each database is using now, against the cap set beside it. The cap
      is only meaningful next to the number it is capping. */
   function showUsage(storage) {
-    const rows = [
-      // No cap field backs this one — it's deliberately uncapped (see the
-      // DATA FILES hint) — so it always renders with an empty bar and just
-      // the byte count, the same way the loop below already renders any
-      // row whose cap comes back 0.
-      ['use-app', storage.app_bytes, 0],
-      ['use-trace', storage.trace_bytes, Number(App.el('set-trace-cap').value)],
-      ['use-flow', storage.flow_bytes, Number(App.el('set-flow-cap').value)],
-      ['use-snmp', storage.snmp_bytes, Number(App.el('set-snmp-cap').value)],
-      ['use-syslog', storage.syslog_bytes, Number(App.el('set-syslog-cap').value)],
-      ['use-ipam', storage.ipam_bytes, Number(App.el('set-ipam-cap').value)],
-      ['use-nodes', storage.nodes_bytes, Number(App.el('set-nodes-cap').value)],
-      ['use-nodes-series', storage.nodes_series_bytes,
-       Number(App.el('set-nodes-series-cap').value)],
-      // Uncapped, like use-app above: bytes only, no bar.
-      ['use-nodes-mibs', storage.nodes_mibs_bytes, 0],
-      ['use-alerts', storage.alerts_bytes, Number(App.el('set-alerts-cap').value)],
+    // Per store: the size span on its DATA FILES row, the age span beside
+    // it, the meter span on its cap row and the cap input that meter reads,
+    // and whether the store keeps any history at all. A store with no cap
+    // has no meter — a full grey track with a zero-width fill reads as a
+    // broken bar, so an uncapped store shows its size and nothing else, the
+    // way the Dashboard's headroom tile already reports it. A store with no
+    // history table has nothing to say about its age, so it says nothing
+    // rather than "no history" for ever.
+    const stores = [
+      ['app', 'size-app', 'age-app', null, null, true],
+      ['trace', 'size-trace', 'age-trace', 'use-trace', 'set-trace-cap', true],
+      ['flow', 'size-flow', 'age-flow', 'use-flow', 'set-flow-cap', true],
+      ['snmp', 'size-snmp', 'age-snmp', 'use-snmp', 'set-snmp-cap', true],
+      ['syslog', 'size-syslog', 'age-syslog', 'use-syslog', 'set-syslog-cap', true],
+      ['ipam', 'size-ipam', 'age-ipam', 'use-ipam', 'set-ipam-cap', true],
+      ['nodes', 'size-nodes', 'age-nodes', 'use-nodes', 'set-nodes-cap', true],
+      ['nodes_series', 'size-nodes-series', 'age-nodes-series',
+       'use-nodes-series', 'set-nodes-series-cap', true],
+      ['nodes_mibs', 'size-nodes-mibs', 'age-nodes-mibs', null, null, false],
+      ['alerts', 'size-alerts', 'age-alerts', 'use-alerts', 'set-alerts-cap', true],
+      ['wireless', 'size-wireless', 'age-wireless', null, null, true],
+      ['configrx', 'size-configrx', 'age-configrx', null, null, true],
+      ['mapper', 'size-mapper', 'age-mapper', null, null, false],
     ];
-    for (const [id, bytes, capMb] of rows) {
-      const el = App.el(id);
-      if (!el) continue;
-      const cap = (capMb || 0) * 1024 * 1024;
-      const share = cap ? Math.min(bytes / cap, 1) : 0;
-      const pct = cap ? Math.round(share * 100) : 0;
-      el.className = 'usage' + (share >= 0.9 ? ' full' : share >= 0.75 ? ' warn' : '');
-      el.innerHTML =
-        `<span class="meter"><i style="width:${share * 100}%"></i></span>` +
-        `${App.bytes(bytes || 0)} used${cap ? ` · ${pct}%` : ''}`;
+    // An account without Settings read gets no storage block at all
+    // (_drop_unreadable in api.py) while the cap inputs beside it are still
+    // filled in, so every figure here would be an absent size divided by a
+    // real cap — which is where "0 B used · NaN%" came from. Nothing is
+    // known about the files, so nothing is claimed about them.
+    const known = Object.keys(storage).length > 0;
+    for (const [name, sizeId, ageId, meterId, capId, keepsHistory] of stores) {
+      const bytes = storage[`${name}_bytes`];
+      const size = App.el(sizeId);
+      if (size) size.textContent = known && bytes != null ? App.bytes(bytes) : '';
+      const meter = meterId ? App.el(meterId) : null;
+      if (meter) {
+        const cap = Number(App.el(capId).value || 0) * 1024 * 1024;
+        const share = known && cap ? (bytes || 0) / cap : null;
+        meter.className = 'usage'
+          + (share === null ? '' : share >= 0.9 ? ' full' : share >= 0.75 ? ' warn' : '');
+        // The BAR is clamped, the percentage is not: Math.min before the
+        // percentage made a database at 150% of its cap read 100%, exactly
+        // like one sitting on it, while the Dashboard's headroom tile
+        // printed the true figure for the same store.
+        meter.innerHTML = share === null ? ''
+          : `<span class="meter"><i style="width:${Math.min(share, 1) * 100}%"></i></span>`
+            + `${Math.round(share * 100)}% of cap`;
+      }
+      const age = App.el(ageId);
+      // How far back each file still reaches — bytes alone never said what
+      // a cap had cost.
+      if (age) {
+        const ts = storage[name + '_oldest_ts'];
+        age.textContent = !known || !keepsHistory ? ''
+          : ts ? `oldest record ${App.ago(ts)}` : 'no history';
+      }
     }
-    // How far back each file still reaches — bytes alone never said what a
-    // cap had cost.
-    for (const [id, key] of [
-      ['age-app', 'app_oldest_ts'], ['age-trace', 'trace_oldest_ts'],
-      ['age-flow', 'flow_oldest_ts'], ['age-snmp', 'snmp_oldest_ts'],
-      ['age-syslog', 'syslog_oldest_ts'], ['age-ipam', 'ipam_oldest_ts'],
-      ['age-nodes', 'nodes_oldest_ts'],
-      ['age-nodes-series', 'nodes_series_oldest_ts'],
-      ['age-nodes-mibs', 'nodes_mibs_oldest_ts'],
-      ['age-alerts', 'alerts_oldest_ts'],
-    ]) {
-      const el = App.el(id);
-      if (!el) continue;
-      const ts = storage[key];
-      el.textContent = ts ? `oldest record ${App.ago(ts)}` : 'no history';
-    }
+    const disk = App.el('use-disk');
+    disk.textContent = known && storage.disk_total
+      ? `${App.bytes(storage.disk_free)} free of ${App.bytes(storage.disk_total)}`
+      : '';
     // Summed from whatever _storage actually reported rather than from a
-    // hand-written list of eight: wireless.db and configrx.db were already
-    // in the payload and already missing from that list, so "on disk in
-    // total" had been understating the real figure by two whole files, and
-    // mapper.db (4.54.0) would have made it three. Every *_bytes key the
-    // server sends counts, so the next database to arrive is counted the
-    // day it ships instead of the day somebody notices.
+    // hand-written list: every *_bytes key the server sends counts, so the
+    // next database to arrive is counted the day it ships instead of the
+    // day somebody notices the total not adding up.
     const total = Object.keys(storage)
       .filter((key) => key.endsWith('_bytes'))
       .reduce((sum, key) => sum + (storage[key] || 0), 0);
-    App.el('set-sizes').textContent =
-      `${App.bytes(total)} on disk in total. Sizes include each file's `
-      + 'write-ahead log, which is why they can grow between prunes and shrink after one.';
+    App.el('set-sizes').textContent = !known ? ''
+      : `${App.bytes(total)} on disk in total. Sizes include each file's `
+        + 'write-ahead log, which is why they can grow between prunes and shrink after one.';
   }
 
   function status(message, colour) {

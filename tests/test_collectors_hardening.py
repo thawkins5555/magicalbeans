@@ -1650,6 +1650,58 @@ def test_c11_bgp_oids_and_visible_truncation() -> None:
         trap_db.close()
 
 
+def test_c12_greedy_drain_and_the_dropped_exporter_index() -> None:
+    """The writer took one datagram per loop iteration, so a burst cost a
+    commit per packet and left the queue deep enough that queue.Full started
+    dropping flows early. Separately, every insert paid for an index on
+    (exporter, ts_end) that only an exporter-filtered query ever read — and
+    that query is a window scan with or without it."""
+    print("C12: the greedy queue drain, and the index the writer stopped paying for")
+
+    flow_db = FlowDatabase(db_path("c12-flows.db"))
+    collector = Collector(flow_db)
+    port = free_udp_port()
+    assert collector.start({"port": port, "bind_address": "127.0.0.1"})
+    burst = 400
+    try:
+        for _index in range(burst):
+            collector._handle_datagram(v5_packet(3), ("10.4.4.5", 40000))
+            collector._handle_datagram(v9_flow_packet(), ("10.4.4.9", 40000))
+        wanted = burst * 3 + burst          # three v5 records, one v9
+        check(wait_for(lambda: collector.counters["flows"] >= wanted, 20.0),
+              f"every flow of an {burst * 2}-datagram burst is written "
+              f"({collector.counters['flows']} of {wanted})")
+        check(collector.counters["dropped"] == 0,
+              f"with none dropped ({collector.counters['dropped']})")
+        versions = {row["address"]: row["version"] for row in flow_db.exporters()}
+        check(versions.get("10.4.4.5") == 5 and versions.get("10.4.4.9") == 9,
+              f"and each exporter keeps its own version through a coalesced "
+              f"batch ({versions})")
+    finally:
+        collector.stop()
+
+    # An older store still carries the index; a fresh one is created without it.
+    with flow_db._lock:
+        flow_db._conn.execute("CREATE INDEX IF NOT EXISTS ix_flows_exporter"
+                              " ON flows(exporter, ts_end)")
+        flow_db._conn.commit()
+    check(flow_db.drop_legacy_indexes(), "maintenance drops ix_flows_exporter")
+    indexes = {row["name"] for row in flow_db._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index'")}
+    check("ix_flows_exporter" not in indexes and "ix_flows_ts" in indexes,
+          f"...leaving the timestamp index every window scan drives from "
+          f"({sorted(indexes)})")
+    check(not flow_db.drop_legacy_indexes(),
+          "and a later pass does not walk the table again to find nothing")
+    rows, _bounded = flow_db.flows(0, time.time() + 60,
+                                   {"exporter": "10.4.4.9"}, limit=5000)
+    check(len(rows) == burst
+          and all(row["exporter"] == "10.4.4.9" for row in rows),
+          f"an exporter-filtered query still returns exactly that exporter's "
+          f"rows without it ({len(rows)} of {burst})")
+    flow_db.close()
+
+
 TESTS = [
     test_c1_receive_threads_survive_bad_input,
     test_c2_template_guards_and_bounded_caches,
@@ -1663,6 +1715,7 @@ TESTS = [
     test_c9_netpath_probing_tracing_and_v6_listeners,
     test_c10_exporter_versions_and_per_sampler_rates,
     test_c11_bgp_oids_and_visible_truncation,
+    test_c12_greedy_drain_and_the_dropped_exporter_index,
 ]
 
 

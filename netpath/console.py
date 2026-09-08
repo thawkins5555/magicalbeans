@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 
 from . import procstats, theme
 from .eventlog import SYSTEM
+from .web.service import STORES, db_for
 
 
 class OutputCapture:
@@ -326,20 +327,17 @@ class ConsoleWindow(QMainWindow):
         return card
 
     def _refresh_storage(self) -> None:
+        # Driven from service.STORES rather than a list of its own: this card
+        # used to name ten of the thirteen stores and read IPAM's cap as 0,
+        # so the console called a capped file uncapped.
         settings = self.service.settings
-        rows = [
-            ("App", self.service.app_db, 0),
-            ("Traces", self.service.db, settings.get("max_trace_db_mb", 0)),
-            ("Flows", self.service.flow_db, settings.get("max_flow_db_mb", 0)),
-            ("SNMP traps", self.service.snmp_db, settings.get("max_snmp_db_mb", 0)),
-            ("Syslog", self.service.syslog_db, settings.get("max_syslog_db_mb", 0)),
-            ("IPAM", self.service.ipam_db, 0),
-            ("Nodes", self.service.nodes_db, settings.get("max_nodes_db_mb", 0)),
-            ("Metrics", self.service.nodes_db.series_db,
-             settings.get("max_nodes_series_db_mb", 0)),
-            ("MIBs", self.service.nodes_db.mib_db, 0),
-            ("Alerts", self.service.alerts_db, settings.get("max_alerts_db_mb", 0)),
-        ]
+        rows = []
+        for store in STORES:
+            database = db_for(self.service, store)
+            if database is None:
+                continue
+            cap_mb = settings.get(store.cap_key, 0) if store.cap_key else 0
+            rows.append((store.label, database, cap_mb))
         lines = []
         for label, database, cap_mb in rows:
             used = database.size_bytes()
@@ -349,7 +347,7 @@ class ConsoleWindow(QMainWindow):
             # What the cap beside it has actually cost, in history, not bytes.
             age = (f"oldest {_duration(time.time() - oldest)}" if oldest
                    else "no history")
-            lines.append(f"{label:8s} {_size(used):>10s}   {share:>22s}   "
+            lines.append(f"{label:13s} {_size(used):>10s}   {share:>22s}   "
                          f"{age:>16s}   {database.path}")
         self.storage_label.setText("\n".join(lines))
 

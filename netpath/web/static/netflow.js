@@ -68,6 +68,17 @@
   // lives in one place instead of four copies of "250" in the markup.
   const RECORD_LIMIT = 250;
 
+  /* The server orders by volume over the most recent slice of the table
+     rather than all of it (flowdb.FLOW_SCAN_CAP), because the sort key is
+     bytes times a sampling rate that is rewritten after the fact and so
+     cannot be indexed. Said out loud when the bound actually bit, rather
+     than letting the list imply it searched every record in the window. */
+  const ORDER_TITLE =
+    `Which ${RECORD_LIMIT} records the server returns. Click a column heading to arrange them.`;
+  const SCAN_BOUNDED_NOTE =
+    ' These are the heaviest records from the most recent flows in this window,'
+    + ' not from every one of them.';
+
   function showWindow() {
     const span = view.t1 - view.t0;
     App.el('nf-window').textContent =
@@ -692,10 +703,15 @@
       <fieldset><legend>STORAGE AND DISPLAY</legend>
         ${number('n-retention', 'Keep flows for (days)', s.retention_days, 'min=1')}
         ${number('n-max', 'Row cap', s.max_flows, 'min=10000 step=100000')}
+        ${number('n-rollup-min', 'Keep minute summaries for (days)', s.rollup_minute_days, 'min=0')}
+        ${number('n-rollup-days', 'Keep hourly summaries for (days)', s.rollup_retention_days, 'min=0')}
         ${number('n-topn', 'Top N', s.top_n, 'min=3 max=25')}
         ${number('n-bucket', 'Chart interval (s, 0 = auto)', s.bucket_seconds, 'min=0')}
         ${check('n-ports', 'Show service names for well-known ports', s.resolve_ports)}
         ${check('n-addr', 'Reverse-resolve addresses in the flow table', s.resolve_addresses)}
+        <p class="hint">A chart older than the flow retention above is drawn from the
+          summaries, not from the records — they are what a 30-day view still has to
+          show once the individual flows behind it have aged out.</p>
         <p class="hint">Reverse DNS threads, timeout and cache lifetime are shared with
           NetPath and live on the Settings tab.</p>
       </fieldset>
@@ -714,7 +730,10 @@
           interface_names: text('#n-ifaces'),
           custom_ports: text('#n-ports-custom'),
           retention_days: num('#n-retention'),
-          max_flows: num('#n-max'), top_n: num('#n-topn'),
+          max_flows: num('#n-max'),
+          rollup_minute_days: num('#n-rollup-min'),
+          rollup_retention_days: num('#n-rollup-days'),
+          top_n: num('#n-topn'),
           bucket_seconds: num('#n-bucket'), resolve_ports: on('#n-ports'),
           resolve_addresses: on('#n-addr'),
           table_columns: App.readColumnPicker(
@@ -866,6 +885,9 @@
       }
     }
 
+    App.el('nf-order').title =
+      ORDER_TITLE + (records.scan_bounded ? SCAN_BOUNDED_NOTE : '');
+
     view.fetchedAt = Date.now();
     drawChart();
     drawBars();
@@ -948,7 +970,7 @@
       }
     };
     const order = App.el('nf-order');
-    order.title = `Which ${RECORD_LIMIT} records the server returns. Click a column heading to arrange them.`;
+    order.title = ORDER_TITLE;
     for (const option of order.options) {
       option.textContent = { bytes: `Top ${RECORD_LIMIT} by volume`,
         packets: `Top ${RECORD_LIMIT} by packets`,

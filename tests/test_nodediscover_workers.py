@@ -160,8 +160,12 @@ try:
 
     class FakePoller:
         def start_discovery(self, kind, target, overrides=None,
-                            allow_ping_only=False):
+                            allow_ping_only=False, group_id=None,
+                            scan_overrides=None,
+                            refuse_if_target_running=False):
             captured["overrides"] = overrides
+            captured["scan_overrides"] = scan_overrides
+            captured["refuse_if_target_running"] = refuse_if_target_running
             return 7
 
     class FakeLog:
@@ -187,6 +191,10 @@ try:
     check("a per-scan worker count arrives as a job override",
           captured["overrides"].get("discovery_workers") == 4,
           captured["overrides"])
+    check("...and is also kept on the row, keyed as the dialog sent it, so "
+          "Re-discover can replay it",
+          captured["scan_overrides"] == {"workers": 4},
+          captured["scan_overrides"])
     post()
     check("...and a scan that does not ask for one sets no override",
           "discovery_workers" not in captured["overrides"], captured["overrides"])

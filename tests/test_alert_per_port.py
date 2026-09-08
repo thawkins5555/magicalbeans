@@ -97,6 +97,10 @@ PORTS = [
      "admin_status": "up", "oper_status": "up"},
     {"if_index": 8, "descr": "GigabitEthernet1/0/8", "alias": "",
      "admin_status": "up", "oper_status": "up"},
+    {"if_index": 9, "descr": "GigabitEthernet1/0/9", "alias": "",
+     "admin_status": "up", "oper_status": "up"},
+    {"if_index": 10, "descr": "GigabitEthernet1/0/10", "alias": "",
+     "admin_status": "up", "oper_status": "up"},
 ]
 
 
@@ -197,6 +201,54 @@ try:
                                "gauge", base + 6, -19.0)
     engine._tick()
     check("-19 dBm clears it", open_rows(alerts, "sfp_rx_power_low") == [])
+
+    # -40 dBm is the floor a transceiver clamps to with no fiber in it or
+    # its port powered down: further past the threshold than the -25 that
+    # opened the alert above, and the one reading that must open nothing.
+    for i in range(4):
+        nodes.record_metric_sample(did, "sfp_rx_dbm.8", "Gi1/0/8 Rx power",
+                                   "dBm", "gauge", base + 10 + i, -40.0)
+        engine._tick()
+    check("-40 dBm on another port opens nothing at all -- a dark optic is "
+          "not a dim one, however many polls it stays that way",
+          open_rows(alerts, "sfp_rx_power_low") == [],
+          [dict(r) for r in open_rows(alerts, "sfp_rx_power_low")])
+
+    # A lit optic that goes dark -- fiber pulled, port shut down. Refusing to
+    # RAISE on the floor says nothing about the alert already open: the -40
+    # is a fresh sample every poll, so threshold_stale_s never expires it
+    # either, and the row sat there showing its stale -25 dBm for ever.
+    for i in range(2):
+        nodes.record_metric_sample(did, "sfp_rx_dbm.9", "Gi1/0/9 Rx power",
+                                   "dBm", "gauge", base + 20 + i, -25.0)
+        engine._tick()
+    check("(-25 dBm opens an alert on port 9 to go dark on)",
+          len(open_rows(alerts, "sfp_rx_power_low")) == 1)
+    nodes.record_metric_sample(did, "sfp_rx_dbm.9", "Gi1/0/9 Rx power", "dBm",
+                               "gauge", base + 30, -40.0)
+    engine._tick()
+    check("the port going dark resolves the open low-power alert rather "
+          "than leaving it open on a stale reading",
+          open_rows(alerts, "sfp_rx_power_low") == [],
+          [dict(r) for r in open_rows(alerts, "sfp_rx_power_low")])
+
+    # Upgrade. Under 5.1 every dark port raised this warning, so those rows
+    # are open when 5.2.0 starts -- and streaks are in-memory, so the new
+    # build begins with none. The first tick has to close them.
+    for i in range(2):
+        nodes.record_metric_sample(did, "sfp_rx_dbm.10", "Gi1/0/10 Rx power",
+                                   "dBm", "gauge", base + 40 + i, -25.0)
+        engine._tick()
+    check("(a 5.1-shaped alert is open on port 10 across the upgrade)",
+          len(open_rows(alerts, "sfp_rx_power_low")) == 1)
+    engine._breach_streaks = {}
+    nodes.record_metric_sample(did, "sfp_rx_dbm.10", "Gi1/0/10 Rx power",
+                               "dBm", "gauge", base + 50, -40.0)
+    engine._tick()
+    check("an alert 5.1 left open on a dark port is resolved on the first "
+          "tick after the upgrade, not made permanent by it",
+          open_rows(alerts, "sfp_rx_power_low") == [],
+          [dict(r) for r in open_rows(alerts, "sfp_rx_power_low")])
 finally:
     engine.stop()
     close_all(nodes, alerts, snmp, syslog, ipam)

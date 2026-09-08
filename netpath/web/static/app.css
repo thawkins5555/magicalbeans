@@ -421,8 +421,11 @@ body.tiny .brand span { display: none; }
 .badge.sev-warn { background: var(--warn); color: var(--bg); }
 .badge.sev-info { background: var(--accent); color: var(--bg); }
 /* Not a severity, so --muted rather than one of the three state tones — it
-   sits on every optical port at once and must not read as an alarm. */
+   sits on every optical port at once and must not read as an alarm. Both
+   media badges share the fill: DOM against SFP is a difference in what the
+   port can tell you, not in how urgent it is. */
 .badge-sfp { background: var(--muted); color: var(--bg); letter-spacing: 0.04em; }
+.badge-dom { background: var(--muted); color: var(--bg); letter-spacing: 0.04em; }
 .conn { color: var(--dim); font: var(--fs-xs) var(--mono); padding-right: var(--space-xs); }
 .conn.user { color: var(--muted); }
 /* Reaches both <a> and <button>, or an anchor renders as browser-default
@@ -1171,7 +1174,6 @@ fieldset .hint { margin: var(--space-sm) 0 0; }
   font-family: var(--mono);
   font-size: var(--fs-xs);
   color: var(--muted);
-  margin-left: 10px;
   white-space: nowrap;
 }
 /* `.meter`, not `.bar`: this used to be `.usage .bar`, which inherited the
@@ -1193,13 +1195,37 @@ fieldset .hint { margin: var(--space-sm) 0 0; }
      track's own edge read against --panel, since --raised barely does. */
   background: var(--raised);
   border: 1px solid var(--line);
-  margin: 0 6px;
+  margin: 0 6px 0 0;
   vertical-align: middle;
   overflow: hidden;
 }
 .usage .meter i { display: block; height: 100%; background: var(--accent); }
 .usage.warn .meter i { background: var(--warn); }
 .usage.full .meter i { background: var(--fail); }
+
+/* Data & Retention rows are label + control + unit/size + readout, and the
+   `fieldset label` grid above resolves its tracks per label: column 2 is
+   1fr, so a 420px path box handed the rest of the fieldset's width to
+   whatever followed it and pushed the readout to the right edge — at a
+   different x on every row, because each label measured its own label text
+   too. Here the FIELDSET is the grid and a label only contributes its
+   children to it, so every row shares one set of columns: labels in one
+   column, controls in the next, and each readout immediately after its own
+   control instead of across the page from it. */
+#settings-sub-retention fieldset {
+  display: grid;
+  grid-template-columns: max-content max-content max-content minmax(0, 1fr);
+  column-gap: var(--space-sm);
+  row-gap: var(--space-sm);
+  align-items: center;
+}
+#settings-sub-retention fieldset > legend,
+#settings-sub-retention fieldset > p { grid-column: 1 / -1; }
+#settings-sub-retention fieldset > label { display: contents; }
+/* `fieldset .hint`'s top margin is for the paragraph under a fieldset, and
+   these readouts are spans on a row: it would drop each one below the
+   control it belongs beside. */
+#settings-sub-retention fieldset > label > .hint { margin: 0; }
 
 /* A visible scrollbar: this page scrolls and a thin auto-hiding bar gives no
    hint that there is more below. */

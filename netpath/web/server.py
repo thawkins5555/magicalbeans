@@ -369,6 +369,9 @@ ROUTES = [
     ("GET", r"^/api/nodes/discovery$", api.get_nodes_discovery, ("nodes", R)),
     ("GET", r"^/api/nodes/discovery/(\d+)$", api.get_nodes_discovery_job, ("nodes", R)),
     ("DELETE", r"^/api/nodes/discovery/(\d+)$", api.delete_nodes_discovery_job, ("nodes", W)),
+    # Re-runs a finished sweep as a new job, replaying the profile and
+    # timing stored on the old one — never in place; see the handler.
+    ("POST", r"^/api/nodes/discovery/(\d+)/rescan$", api.post_nodes_discovery_rescan, ("nodes", W)),
     ("POST", r"^/api/nodes/discovery/(\d+)/promote$", api.post_nodes_discovery_promote, ("nodes", W)),
     ("POST", r"^/api/nodes/discovery/(\d+)/reviewed$", api.post_nodes_discovery_reviewed, ("nodes", W)),
     ("POST", r"^/api/nodes/collector$", api.post_nodes_collector, ("nodes", W)),

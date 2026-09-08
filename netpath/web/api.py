@@ -43,11 +43,13 @@ from .. import sshterm, webrelay
 from .. import enterprises, mibcatalog, vendorid
 from .. import mapper
 from .. import nodediscover
+from .. import nodepoll
 from .. import nodesdb
 from .. import db as netpathdb
 from .. import report as reportmod
 from .. import permissions as _permissions
 from .. import appdb as _appdb
+from .service import STORES, db_for, disk_space
 
 MIN_BLOCK_PX = 3
 
@@ -531,19 +533,23 @@ def get_state(service, params, body) -> dict:
 
 
 def _storage(service) -> dict:
-    stores = (("app", service.app_db), ("trace", service.db), ("flow", service.flow_db),
-              ("syslog", service.syslog_db), ("snmp", service.snmp_db),
-              ("ipam", service.ipam_db), ("nodes", service.nodes_db),
-              ("nodes_series", service.nodes_db.series_db),
-              ("nodes_mibs", service.nodes_db.mib_db),
-              ("alerts", service.alerts_db), ("wireless", service.wireless_db),
-              ("configrx", service.configrx_db), ("mapper", service.mapper_db))
+    stores = [(store.name, db_for(service, store)) for store in STORES]
+    stores = [(name, db) for name, db in stores if db is not None]
     result = {f"{name}_path": db.path for name, db in stores}
     result.update({f"{name}_bytes": db.size_bytes() for name, db in stores})
     # How far back each file still reaches, so trimming reads as lost
     # history, not just bytes. None for the two with no history and for an
     # empty store.
     result.update({f"{name}_oldest_ts": db.oldest_ts() for name, db in stores})
+    # The volume itself, beside the files on it: a cap governs one database,
+    # and nothing on this page ever said how much room the disk had left for
+    # all of them. Named without the _bytes suffix on purpose — the total
+    # on the Settings page is the sum of every *_bytes key, and free space
+    # is not one of the files.
+    free, total = disk_space(service)
+    if total:
+        result["disk_free"] = free
+        result["disk_total"] = total
     return result
 
 
@@ -999,8 +1005,12 @@ def get_flow_overview(service, params, body) -> dict:
     names = _address_names(service, dimension,
                            list(series) + [row["key"] for row in top_rows])
 
+    # times[0], not the t0 asked for: flowdb snaps the window start down to a
+    # bucket boundary so a rollup bucket lands wholly inside one slot, and the
+    # chart's own axis has to agree with the values drawn on it.
     return {
-        "t0": t0, "t1": t1, "bucket_s": bucket_s, "dimension": dimension,
+        "t0": times[0] if times else t0,
+        "t1": t1, "bucket_s": bucket_s, "dimension": dimension,
         "times": times,
         "series": [{"name": _flow_label(service, dimension, key, names),
                     "values": values}
@@ -1034,15 +1044,19 @@ FLOW_SCREEN_LIMIT = 250
 FLOW_EXPORT_CAP = 20000
 
 
-def _flow_records_rows(service, params, limit: int) -> tuple[list[dict], bool]:
+def _flow_records_rows(service, params, limit: int) -> tuple[list[dict], bool, bool]:
     """The row-producing half of get_flow_records, factored out so the
     export handler below can ask for FLOW_EXPORT_CAP rows through the
     identical filter/window/order path the screen uses for its 250 —
-    same params, same permission gate, just a taller limit."""
+    same params, same permission gate, just a taller limit.
+
+    The third result is flowdb's scan bound: whether the window reaches
+    further back than the ordering looked."""
     t0, t1 = _window(params)
     filters = _flow_filters(params)
     order = params.get("order", "bytes")
-    rows = service.flow_db.flows(t0, t1, filters, limit=limit + 1, order=order)
+    rows, bounded = service.flow_db.flows(t0, t1, filters, limit=limit + 1,
+                                          order=order)
     truncated = len(rows) > limit
     rows = rows[:limit]
 
@@ -1099,16 +1113,18 @@ def _flow_records_rows(service, params, limit: int) -> tuple[list[dict], bool]:
             # both, and the exporter filter keys off the address.
             "exporter_name": exporter_names.get(row["exporter"]),
         })
-    return records, truncated
+    return records, truncated, bounded
 
 
 def get_flow_records(service, params, body) -> dict:
-    records, _truncated = _flow_records_rows(service, params, FLOW_SCREEN_LIMIT)
-    return {"records": records}
+    records, _truncated, bounded = _flow_records_rows(
+        service, params, FLOW_SCREEN_LIMIT)
+    return {"records": records, "scan_bounded": bounded}
 
 
 def get_flow_records_export(service, params, body) -> dict:
-    records, truncated = _flow_records_rows(service, params, FLOW_EXPORT_CAP)
+    records, truncated, _bounded = _flow_records_rows(
+        service, params, FLOW_EXPORT_CAP)
     header = ["ts", "src_ip", "src_name", "src_port", "dst_ip", "dst_name",
              "dst_port", "protocol", "bytes", "packets", "in_if", "out_if",
              "exporter", "exporter_name"]
@@ -1534,6 +1550,14 @@ _GLOBAL_SETTINGS_RANGES = {
     # input says min="1", but a client can skip the browser) would compute a
     # cutoff of "now" and silently delete every trace, over and over.
     "trace_retention_days": (1, 3650),
+    # The two rollup retentions, netflow-scope, mirroring netflow.js's own
+    # min=0 on them. 0 is a real choice there — keep no summaries at this
+    # tier — but a negative puts _prune_rollup's cutoff in the future, which
+    # deletes every rollup row on every sweep and leaves the tier's floor
+    # ahead of now, silently taking it out of service while compaction goes
+    # on writing to it.
+    "rollup_minute_days": (0, 3650),
+    "rollup_retention_days": (0, 3650),
     "max_flow_db_mb": (16, None),
     "max_snmp_db_mb": (16, None),
     "max_syslog_db_mb": (16, None),
@@ -1541,6 +1565,10 @@ _GLOBAL_SETTINGS_RANGES = {
     "max_nodes_db_mb": (16, None),
     "max_nodes_series_db_mb": (16, None),
     "max_alerts_db_mb": (16, None),
+    # Bounded well below 100: a free-space floor at or near the whole volume
+    # is an alert that can never clear.
+    "disk_free_warn_pct": (1, 90),
+    "disk_free_critical_pct": (1, 90),
     "session_idle_minutes": (1, 1440),
     "session_max_hours": (1, 168),
     # These five are netpath-scope, not global, but land in the same flat
@@ -1557,8 +1585,20 @@ _GLOBAL_SETTINGS_RANGES = {
 }
 
 
-def _check_settings_ranges(values: dict) -> None:
-    for key, (low, high) in _GLOBAL_SETTINGS_RANGES.items():
+# The one key two scopes disagree about. 0 is a real choice for a flow
+# rollup tier ("keep no summaries here"), but nodes' rollup_retention_days
+# bounds samples_hourly, where nodesseriesdb.prune reads 0 as "matches every
+# existing row" -- a year of metric history gone on the next sweep. The
+# browser has always sent min=1 for it; this is the same floor for a client
+# that skips the browser.
+_SCOPE_SETTINGS_RANGES = {
+    "nodes": {"rollup_retention_days": (1, 3650)},
+}
+
+
+def _check_settings_ranges(values: dict, scope: str = "") -> None:
+    overrides = _SCOPE_SETTINGS_RANGES.get(scope, {})
+    for key, (low, high) in {**_GLOBAL_SETTINGS_RANGES, **overrides}.items():
         if key not in values:
             continue
         value = values[key]
@@ -1675,6 +1715,27 @@ def _check_configrx_settings(values: dict) -> None:
             raise ValueError(f"Line ignore pattern {line!r} is invalid: {exc}") from exc
 
 
+def _check_disk_free_settings(service, values: dict) -> None:
+    """The critical free-space floor has to sit below the warning one.
+
+    Posted the other way round, every volume alert opens at critical the
+    moment it opens at all, and the warning band it is meant to escalate
+    from can never be reached. Either key can arrive on its own, so the one
+    that is not in the body is read from what is stored, the way
+    _check_mapper_settings pairs its two.
+    """
+    if not ({"disk_free_warn_pct", "disk_free_critical_pct"} & set(values)):
+        return
+    warn = float(values.get("disk_free_warn_pct",
+                            service.settings.get("disk_free_warn_pct", 10)))
+    critical = float(values.get("disk_free_critical_pct",
+                                service.settings.get("disk_free_critical_pct", 5)))
+    if critical >= warn:
+        raise ValueError(
+            f"disk_free_critical_pct ({critical:g}) must be below "
+            f"disk_free_warn_pct ({warn:g})")
+
+
 def post_settings(service, params, body) -> dict:
     from ..sqlitebase import coerce_settings
 
@@ -1700,7 +1761,8 @@ def post_settings(service, params, body) -> dict:
     # numeric key would persist and then raise from every subsequent start's
     # int() until the database was edited by hand.
     values = coerce_settings(_scope_defaults(scope), values, strict=True)
-    _check_settings_ranges(values)
+    _check_settings_ranges(values, scope)
+    _check_disk_free_settings(service, values)
     if "web_relay_port_range" in values:
         # Typed here, not at the next relay: an unparseable range would
         # otherwise store happily and surface as a failed WEB click later.
@@ -1804,7 +1866,9 @@ def post_maintenance(service, params, body) -> dict:
         return done(f"Deleted {removed} traces older than {days:.0f} days",
                     removed)
     if action == "prune_flows":
-        removed = service.flow_db.prune(0, 0)
+        # The rollups too: "delete all flow records" that left the charts
+        # full of data would not be what the button says.
+        removed = service.flow_db.prune(0, 0, minute_days=0, rollup_days=0)
         return done(f"Deleted {removed} flow records", removed)
     if action == "prune_syslog":
         removed = service.syslog_db.prune(0, 0)
@@ -3050,12 +3114,19 @@ def _device_rows_json(service, params, rows) -> list[dict]:
     window_covered = service.alerts_db.window_covered_device_ids(
         ((row["id"], row["device_group_id"]) for row in rows))
     muted = service.alerts_db.muted_entity_ids("device", window_covered=window_covered)
+    # A device merged into another keeps the address it was entered under as
+    # an alias, and the list is where an operator looks for that address —
+    # so the whole set rides along, in one read for the page rather than one
+    # per row.
+    aliases = service.nodes_db.addresses_for_devices(row["id"] for row in rows)
     reveal = _may_read_secrets(service, params, "nodes")
     devices = []
     for row in rows:
         device = _device_json(row, reveal)
         device["polling"] = row["id"] in worker_state
         device["muted_until"] = muted.get(str(row["id"]))
+        device["addresses"] = _device_addresses_json(
+            row, aliases.get(row["id"], ()))
         devices.append(device)
     return devices
 
@@ -3090,11 +3161,12 @@ def get_nodes_devices_export(service, params, body) -> dict:
     devices = _device_rows_json(service, params, rows)
     header = ["id", "name", "ip", "status", "group_id", "device_group_id",
              "vendor", "sys_descr", "sys_name", "polling", "muted_until",
-             "poll_interval_s", "last_poll_ts"]
+             "poll_interval_s", "last_poll_ts", "addresses"]
     csv_rows = [[d.get("id"), d.get("name"), d.get("ip"), d.get("status"),
                 d.get("group_id"), d.get("device_group_id"), d.get("vendor"),
                 d.get("sys_descr"), d.get("sys_name"), d.get("polling"),
-                d.get("muted_until"), d.get("poll_interval_s"), d.get("last_poll_ts")]
+                d.get("muted_until"), d.get("poll_interval_s"), d.get("last_poll_ts"),
+                ", ".join(a["ip"] for a in d.get("addresses") or ())]
                for d in devices]
     return _csv_response("devices", header, csv_rows)
 
@@ -3477,19 +3549,22 @@ def _address_json(row) -> dict:
             "netmask": row["netmask"] if "netmask" in keys else None}
 
 
-def _device_addresses_json(service, row) -> list[dict]:
+def _device_addresses_json(row, aliases) -> list[dict]:
     """The device's primary address first, then every learned alias — the
-    primary isn't stored in device_addresses, so it's added here."""
+    primary isn't stored in device_addresses, so it's added here. The alias
+    rows are passed in rather than read here, so a whole page of devices can
+    be answered from one nodes_db.addresses_for_devices() read."""
     addresses = [{"ip": row["ip"], "source": "primary", "seen_ts": None,
                   "if_index": None, "netmask": None, "primary": True}]
-    for alias in service.nodes_db.device_addresses(row["id"]):
+    for alias in aliases:
         addresses.append({**_address_json(alias), "primary": False})
     return addresses
 
 
 def get_nodes_device_addresses(service, params, body, device_id) -> dict:
     row = _require(service.nodes_db.device(device_id), "device")
-    return {"addresses": _device_addresses_json(service, row)}
+    return {"addresses": _device_addresses_json(
+        row, service.nodes_db.device_addresses(device_id))}
 
 
 def get_nodes_duplicates(service, params, body) -> dict:
@@ -3578,7 +3653,8 @@ def get_nodes_device(service, params, body, device_id) -> dict:
     # ADDRESSES subtab is one short list the detail pane already has a
     # round trip for, and a second request per device selection to carry
     # three rows is a request nobody needs.
-    device["addresses"] = _device_addresses_json(service, row)
+    device["addresses"] = _device_addresses_json(
+        row, service.nodes_db.device_addresses(device_id))
     device.update(_identification_json(service, row))
     return {"device": device}
 
@@ -4760,16 +4836,46 @@ def _discovery_kind_for(target: str) -> tuple[str, str]:
             f"'{target}' is not an IP address or CIDR subnet") from exc
 
 
-def post_nodes_discovery(service, params, body) -> dict:
-    target = str(body.get("target", "")).strip()
-    if not target:
-        raise ValueError("A target is required")
-    kind, target = _discovery_kind_for(target)
-    group_id = body.get("group_id")
-    if not group_id:
-        raise ValueError("A polling profile is required")
+# Per-scan timing and concurrency overrides from the Start-discovery
+# dialog — they live only in the job's own settings, never in stored
+# settings. `high` is None except for the worker count, a thread count that
+# needs a real ceiling.
+_DISCOVERY_SCAN_OVERRIDES = (
+    ("snmp_timeout_s", "discovery_snmp_timeout_s", float, 0, None),
+    ("ping_timeout_s", "discovery_ping_timeout_s", float, 0, None),
+    ("snmp_retries", "discovery_snmp_retries", int, 0, None),
+    ("ping_retries", "discovery_ping_retries", int, 0, None),
+    ("workers", "discovery_workers", int, 1, nodediscover.MAX_DISCOVERY_WORKERS),
+)
+
+
+def _discovery_scan_overrides(body) -> dict:
+    """The five timing values, validated and keyed as the dialog sends them
+    — the shape stored on the job, so a rescan replays them through the
+    same validation a fresh start goes through."""
+    scan = {}
+    for body_key, _override_key, cast, low, high in _DISCOVERY_SCAN_OVERRIDES:
+        value = body.get(body_key)
+        if value is not None and str(value) != "":
+            value = cast(value)
+            if value < low:
+                raise ValueError(f"{body_key} cannot be less than {low}"
+                                 if low else f"{body_key} cannot be negative")
+            if high is not None and value > high:
+                raise ValueError(f"{body_key} cannot be more than {high}")
+            scan[body_key] = value
+    return scan
+
+
+def _start_discovery_job(service, kind, target, group_id,
+                         allow_ping_only, scan,
+                         refuse_if_target_running: bool = False) -> int:
+    """Everything a discovery start is past reading the request: the profile
+    turned into the communities the sweep may try, the global settings a job
+    cannot see on its own, and the row that remembers both inputs. Shared
+    with the rescan route so a replayed sweep can never drift from a fresh
+    one — the rescan carries no logic of its own."""
     _require(service.nodes_db.group(group_id), "polling profile")
-    allow_ping_only = bool(body.get("allow_ping_only"))
     communities = _discovery_communities_for_group(service, group_id)
     if not communities and not allow_ping_only:
         raise ValueError(
@@ -4783,30 +4889,76 @@ def post_nodes_discovery(service, params, body) -> dict:
         "discovery_communities": communities,
         "never_scan_cidrs": service.settings.get("never_scan_cidrs", ""),
     }
-    # Per-scan timing and concurrency overrides from the Start-discovery
-    # dialog — they live only in this job's settings, never in stored
-    # settings. `high` is None except for the worker count, a thread count
-    # that needs a real ceiling.
-    for body_key, override_key, cast, low, high in (
-            ("snmp_timeout_s", "discovery_snmp_timeout_s", float, 0, None),
-            ("ping_timeout_s", "discovery_ping_timeout_s", float, 0, None),
-            ("snmp_retries", "discovery_snmp_retries", int, 0, None),
-            ("ping_retries", "discovery_ping_retries", int, 0, None),
-            ("workers", "discovery_workers", int,
-             1, nodediscover.MAX_DISCOVERY_WORKERS)):
-        value = body.get(body_key)
-        if value is not None and str(value) != "":
-            value = cast(value)
-            if value < low:
-                raise ValueError(f"{body_key} cannot be less than {low}"
-                                 if low else f"{body_key} cannot be negative")
-            if high is not None and value > high:
-                raise ValueError(f"{body_key} cannot be more than {high}")
-            overrides[override_key] = value
+    for body_key, override_key, _cast, _low, _high in _DISCOVERY_SCAN_OVERRIDES:
+        if body_key in scan:
+            overrides[override_key] = scan[body_key]
     job_id = service.node_poller.start_discovery(
-        kind, target, overrides=overrides, allow_ping_only=allow_ping_only)
+        kind, target, overrides=overrides, allow_ping_only=allow_ping_only,
+        group_id=group_id, scan_overrides=scan,
+        refuse_if_target_running=refuse_if_target_running)
     service.log.add(NODES_CATEGORY, f"Started {kind} discovery of {target}")
+    return job_id
+
+
+def post_nodes_discovery(service, params, body) -> dict:
+    target = str(body.get("target", "")).strip()
+    if not target:
+        raise ValueError("A target is required")
+    kind, target = _discovery_kind_for(target)
+    group_id = body.get("group_id")
+    if not group_id:
+        raise ValueError("A polling profile is required")
+    job_id = _start_discovery_job(
+        service, kind, target, group_id,
+        bool(body.get("allow_ping_only")), _discovery_scan_overrides(body))
     return {"id": job_id}
+
+
+def post_nodes_discovery_rescan(service, params, body, job_id) -> dict:
+    """Re-runs a finished sweep as a NEW job carrying the profile and timing
+    the original ran with. Never in place: a DiscoveryJob's thread cannot be
+    restarted, a second sweep writing into the same row would double-list
+    every address the first one found, and the run being repeated is the
+    audit trail the repeat is being compared against.
+
+    A row started before the profile was stored on it cannot be replayed at
+    all. Rather than guess one, the answer says so and the browser opens the
+    Start dialog with the target filled in."""
+    job = _require(service.nodes_db.discovery_job(job_id), "discovery job")
+    if service.node_poller.discovery_running(job_id):
+        raise ValueError(
+            "This scan is still running — wait for it to finish, or cancel "
+            "it, before running it again.")
+    target = job["target"]
+    keys = job.keys()
+    group_id = job["group_id"] if "group_id" in keys else None
+    if not group_id or service.nodes_db.group(group_id) is None:
+        return {"needs_profile": True, "target": target,
+                "allow_ping_only": bool(job["allow_ping_only"])}
+    raw = job["overrides_json"] if "overrides_json" in keys else None
+    try:
+        stored = json.loads(raw) if raw else {}
+    except ValueError:
+        stored = {}
+    if not isinstance(stored, dict):
+        stored = {}   # only reachable from a hand-edited row; run at the defaults
+    # A double-click on Re-discover, or a second operator on the same row,
+    # would otherwise put two sweeps of the same /24 on the wire at once. The
+    # poller answers it and starts the sweep under one lock, because asking
+    # here and starting afterwards is a window two requests fit through. A
+    # row left 'running' by a process that died is not a sweep anybody is
+    # waiting for and does not wedge the button: what is refused is a job
+    # this poller is actually running.
+    try:
+        new_id = _start_discovery_job(
+            service, job["kind"], target, group_id,
+            bool(job["allow_ping_only"]), _discovery_scan_overrides(stored),
+            refuse_if_target_running=True)
+    except nodepoll.DiscoveryBusy:
+        raise ValueError(
+            f"A scan of {target} is already running — wait for it to "
+            "finish before starting another.") from None
+    return {"id": new_id, "rescan_of": job_id}
 
 
 def get_nodes_discovery(service, params, body) -> dict:
@@ -8239,36 +8391,23 @@ def get_dashboard(service, params, body) -> dict:
         # the question, and it is answered worst-first.
         settings = service.settings or {}
         stores = []
-        # Only databases with a cap on the Settings tab; app.db, wireless.db,
-        # configrx.db, mapper.db and nodes_mibs.db report size with no
-        # fraction rather than 0% used.
-        # This list is hand-written rather than derived from _storage's, and
-        # mapper.db was added to that one and missed here — two figures for
-        # the same question that disagreed. Anything opened as a database
-        # belongs in both.
-        for label, db, cap_key in (
-                ("NetPath", service.db, "max_trace_db_mb"),
-                ("NetFlow", service.flow_db, "max_flow_db_mb"),
-                ("Syslog", service.syslog_db, "max_syslog_db_mb"),
-                ("Traps", service.snmp_db, "max_snmp_db_mb"),
-                ("IPAM", service.ipam_db, "max_ipam_db_mb"),
-                ("Nodes", service.nodes_db, "max_nodes_db_mb"),
-                ("Nodes metrics", service.nodes_db.series_db,
-                 "max_nodes_series_db_mb"),
-                ("Nodes MIBs", service.nodes_db.mib_db, None),
-                ("Alerts", service.alerts_db, "max_alerts_db_mb"),
-                ("Wireless", service.wireless_db, None),
-                ("ConfigRX", service.configrx_db, None),
-                ("Mapper", service.mapper_db, None),
-                ("Application", service.app_db, None)):
+        # STORES, not a list of its own: this one was hand-written beside
+        # _storage's and mapper.db went into that one and not this one, so
+        # two views of the same question disagreed about how many databases
+        # exist. A store with no cap reports its size with no fraction
+        # rather than 0% used.
+        for store in STORES:
+            db = db_for(service, store)
+            if db is None:
+                continue
             try:
                 used = int(db.size_bytes())
             except Exception:                                 # noqa: BLE001
                 continue
-            cap_mb = settings.get(cap_key) if cap_key else None
+            cap_mb = settings.get(store.cap_key) if store.cap_key else None
             cap = int(cap_mb) * 1024 * 1024 if cap_mb else None
             stores.append({
-                "label": label, "bytes": used, "cap_bytes": cap,
+                "label": store.label, "bytes": used, "cap_bytes": cap,
                 "used_fraction": (used / cap) if cap else None,
             })
         stores.sort(key=lambda s: (s["used_fraction"] is None,

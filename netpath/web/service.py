@@ -7,8 +7,10 @@ over this.
 
 from __future__ import annotations
 
+import shutil
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..alertengine import AlertEngine
@@ -21,7 +23,7 @@ from ..configrx import ConfigRxWorker
 from ..configrxdb import ConfigRxDatabase
 from ..db import Database, FORCED_PRUNE_BUDGET_S, TRIM_BUDGET_S
 from ..eventlog import NODES, SYSTEM, EventLog
-from ..flowdb import FlowDatabase
+from ..flowdb import ROLLUP_TIERS, FlowDatabase
 from ..fortipoll import WirelessPoller
 from .. import ipam_scan
 from ..ipamdb import IpamDatabase
@@ -32,6 +34,7 @@ from ..monitor import AsnResolver, HopProber, Monitor, Resolver
 from ..nodepoll import NodePoller
 from .. import permissions
 from ..nodesdb import NodesDatabase
+from ..services import format_bytes
 from ..snmptrapd import TrapCollector
 from ..snmptrapdb import SnmpTrapDatabase
 from ..sshterm import SshSessionRegistry
@@ -41,6 +44,106 @@ from ..webrelay import WebRelayRegistry
 from ..wirelessdb import WirelessDatabase
 
 MAINTENANCE_INTERVAL_S = 900
+
+# When a capped database is close enough to its cap to be worth an alert,
+# and when that stops being true. Trimming keeps a busy store just under its
+# cap for ever, so the clear band sits below the raise band: without it the
+# alert would open and close on alternate sweeps for a store doing exactly
+# what the cap tells it to.
+DB_CAP_WARN_SHARE = 0.85
+DB_CAP_HIGH_SHARE = 0.95
+DB_CAP_CLEAR_SHARE = 0.80
+
+# How far free space has to recover above disk_free_warn_pct before the
+# volume alert clears. A WAL grows between prunes and shrinks after them, so
+# a volume sitting on the threshold would flap the alert every sweep.
+DISK_FREE_CLEAR_MARGIN_PCT = 2.0
+
+
+@dataclass(frozen=True)
+class Store:
+    """One database this application opens.
+
+    `name` is the prefix its keys carry in /api/state's storage block and
+    the entity_id its size alert uses, so each file gets an alert of its
+    own. `attr` is where it hangs off the Service. `cap_key` is the
+    max_*_db_mb setting that trims it, or None for a store that is
+    deliberately uncapped.
+    """
+
+    name: str
+    label: str
+    attr: str
+    cap_key: str | None
+
+
+# Every database, in the order the Settings page lists them. One table
+# because there were two hand-written ones — the storage block's and the
+# Dashboard headroom tile's — and mapper.db was added to one and missed in
+# the other, so two views of the same question disagreed about how many
+# databases exist. The maintenance sweep's size alerts read it too, so all
+# three can only be wrong together.
+STORES = (
+    Store("app", "Application", "app_db", None),
+    Store("trace", "NetPath", "db", "max_trace_db_mb"),
+    Store("flow", "NetFlow", "flow_db", "max_flow_db_mb"),
+    Store("snmp", "Traps", "snmp_db", "max_snmp_db_mb"),
+    Store("syslog", "Syslog", "syslog_db", "max_syslog_db_mb"),
+    Store("ipam", "IPAM", "ipam_db", "max_ipam_db_mb"),
+    Store("nodes", "Nodes", "nodes_db", "max_nodes_db_mb"),
+    Store("nodes_series", "Nodes metrics", "nodes_db.series_db",
+          "max_nodes_series_db_mb"),
+    Store("nodes_mibs", "Nodes MIBs", "nodes_db.mib_db", None),
+    Store("alerts", "Alerts", "alerts_db", "max_alerts_db_mb"),
+    Store("wireless", "Wireless", "wireless_db", None),
+    Store("configrx", "ConfigRX", "configrx_db", None),
+    Store("mapper", "Mapper", "mapper_db", None),
+)
+
+
+def db_for(service, store: Store):
+    """The database object `store` names, or None where this service has not
+    opened it — a partially built service still answers rather than raising,
+    the same way the Dashboard's collector list treats a worker that is not
+    there."""
+    obj = service
+    for part in store.attr.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
+
+
+def disk_space(service) -> tuple[int, int]:
+    """Free and total bytes on the volume the data files sit on, (0, 0) when
+    that cannot be read.
+
+    Asked of the application file's own directory: every store is opened
+    beside it in every shipped layout, and a cap only ever governs one file
+    — nothing else in the product notices the disk under them filling up.
+    """
+    db = db_for(service, STORES[0])
+    if db is None:
+        return 0, 0
+    try:
+        usage = shutil.disk_usage(Path(db.path).parent)
+    except OSError:
+        return 0, 0
+    return usage.free, usage.total
+
+
+# The flow rollups get their own timer rather than riding the maintenance
+# sweep: at a quarter-hour cadence the unsummarised tail of raw flows would be
+# a quarter of an hour of them, which at a busy exporter's volume is the very
+# scan the rollups exist to avoid. With this and flowdb's seal lag the tail is
+# about three minutes wherever a pass can build every bucket that has sealed
+# since the last one. Where it cannot, the watermark still advances as far as
+# the pass got, so the tail is bounded by how fast the store can summarise
+# rather than growing by a bucket a minute for ever.
+ROLLUP_INTERVAL_S = 60
+
+# What each tier is called where an operator reads about it.
+ROLLUP_TIER_NAMES = {60: "minute", 3600: "hourly"}
 
 
 def _restart(worker, settings, enabled_default) -> None:
@@ -259,6 +362,7 @@ class Service:
 
         self._stop = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
+        self._rollup_thread: threading.Thread | None = None
         self._nodes_split_thread: threading.Thread | None = None
         # The maintenance thread waits on the first between ticks, so
         # request_maintenance() wakes it at once; the second marks that
@@ -268,6 +372,11 @@ class Service:
         # Held for the body of run_maintenance: shutdown() below must not
         # close a database out from under a sweep in flight.
         self._maintenance_lock = threading.Lock()
+        # One thread rebuilds rollup buckets at a time. The 60-second timer
+        # and the maintenance sweep's backfill both do, and two of them
+        # rebuilding the same bucket at once is how a dimension's rows came
+        # to be paired with a span row built from a different set of flows.
+        self._rollup_lock = threading.Lock()
         self.started_at = time.time()
         # Bumped by every write to something /api/config carries. The
         # browser refetches /api/config only when this number moves.
@@ -443,6 +552,9 @@ class Service:
         self._maintenance_thread = threading.Thread(
             target=self._maintenance_loop, name="netpath-maintenance", daemon=True)
         self._maintenance_thread.start()
+        self._rollup_thread = threading.Thread(
+            target=self._rollup_loop, name="netpath-flow-rollup", daemon=True)
+        self._rollup_thread.start()
         self._start_nodes_split()
         self.log.add(SYSTEM, "Service started")
 
@@ -486,6 +598,9 @@ class Service:
         if self._maintenance_thread is not None:
             self._maintenance_thread.join(timeout=10.0)
             self._maintenance_thread = None
+        if self._rollup_thread is not None:
+            self._rollup_thread.join(timeout=10.0)
+            self._rollup_thread = None
         with self._maintenance_lock:
             # Interactive SSH sessions first: they are the only thing here a
             # person is watching, and each one writes a closing device event,
@@ -907,6 +1022,28 @@ class Service:
                 if requested and not self._maintenance_request.is_set():
                     self._maintenance_done.set()
 
+    def compact_flow_rollups(self) -> int:
+        """Summarise sealed flow buckets into both tiers.
+
+        The minute tier first: the hourly one is built from it wherever it
+        covers a whole hour.
+        """
+        written = 0
+        with self._rollup_lock:
+            for tier in ROLLUP_TIERS:
+                written += self.flow_db.compact_rollup(tier)
+        return written
+
+    def _rollup_loop(self) -> None:
+        while not self._stop.is_set():
+            if self._stop.wait(ROLLUP_INTERVAL_S):
+                break
+            try:
+                self.compact_flow_rollups()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+
     def request_maintenance(self) -> None:
         """Ask for a forced sweep and return; the sweep runs on the
         maintenance thread, which this wakes, rather than blocking the HTTP
@@ -951,11 +1088,34 @@ class Service:
                       budget_s=prune_budget)
         self._trim_db("max_trace_db_mb", self.db, "Trace database",
                       "oldest traces", budget_s=prune_budget)
+        # Before the prune, not after: the backfill summarises raw flows, and
+        # pruning first would delete a bucket before it had been summarised.
+        # A chart wider than a quarter of an hour reads the rollups rather
+        # than the raw rows. Forward compaction is not repeated here — the
+        # 60-second timer has already done it, and a second pass over the
+        # same buckets doubles a sweep's rollup load for nothing.
+        with self._rollup_lock:
+            for tier in ROLLUP_TIERS:
+                written, done = self.flow_db.backfill_rollup(tier)
+                if done:
+                    self.log.add(SYSTEM,
+                                 f"NetFlow: summarised the stored history "
+                                 f"into the {ROLLUP_TIER_NAMES[tier]} rollups "
+                                 f"({written} row(s) on this pass)")
+        self.flow_db.drop_legacy_indexes()
+        self.flow_db.prune(
+            float(self.flow_settings.get("retention_days", 14)),
+            int(self.flow_settings.get("max_flows", 5_000_000)),
+            minute_days=float(self.flow_settings.get("rollup_minute_days", 2)),
+            rollup_days=float(self.flow_settings.get("rollup_retention_days", 90)))
+        # Last of the flow stages, for the reason compaction runs before the
+        # prune: the size cap deletes the same oldest raw rows the backfill
+        # is still summarising, and running it first meant a store already at
+        # its cap gave them up on every sweep while the backfill advanced one
+        # bucket. The promise that a 30-day chart outlives a fortnight of raw
+        # retention only holds if the rows are summarised before they go.
         self._trim_db("max_flow_db_mb", self.flow_db, "Flow database",
                       "oldest flow records")
-
-        self.flow_db.prune(float(self.flow_settings.get("retention_days", 14)),
-                           int(self.flow_settings.get("max_flows", 5_000_000)))
 
         self.syslog_db.prune(
             float(self.syslog_settings.get("retention_days", 30)),
@@ -1055,3 +1215,98 @@ class Service:
             float(self.alerts_settings.get("retention_days", 180)))
         self._trim_db("max_alerts_db_mb", self.alerts_db, "Alerts database",
                       "oldest resolved alerts")
+
+        self._sample_storage_alerts()
+
+    def _sample_storage_alerts(self) -> None:
+        """Alert on a database close to its cap, and on the volume under
+        them all running low.
+
+        At the end of the sweep rather than on a clock of its own, because
+        the trims above have just run: the size read here is what is left
+        after retention did everything it could, which is the only figure
+        worth waking anyone for. Driven from STORES so it cannot disagree
+        with the Settings page or the Dashboard about which databases exist
+        or what caps them, and the store name is the entity_id so each
+        database opens an alert of its own instead of one that flaps between
+        them.
+        """
+        engine = getattr(self, "alert_engine", None)
+        raise_it = getattr(engine, "system_occurrence", None)
+        clear_it = getattr(engine, "clear_system_occurrence", None)
+        if raise_it is None or clear_it is None:
+            return
+
+        def still_open(rule_key: str, entity_id: str) -> bool:
+            # alertrules.dedup_key's key for the occurrence system_occurrence
+            # builds, which is the one clear_system_occurrence resolves.
+            return self.alerts_db.open_by_dedup(
+                f"{rule_key}:system:{entity_id}") is not None
+
+        for store in STORES:
+            if not store.cap_key:
+                continue
+            db = db_for(self, store)
+            cap = int(self.settings.get(store.cap_key, 0) or 0) * 1024 * 1024
+            if db is None or not cap:
+                continue
+            try:
+                used = int(db.size_bytes())
+            except Exception:                                 # noqa: BLE001
+                continue
+            share = used / cap
+            if share < DB_CAP_CLEAR_SHARE:
+                clear_it("db_near_cap", store.name)
+                continue
+            # An alert already open is re-raised in the hold band rather than
+            # left alone: the rule's auto-resolve measures from last_ts and
+            # only a raise moves it, so a store trimmed from 90% to 83% would
+            # be closed by that backstop half an hour later and the effective
+            # clear would be "below 85% for two sweeps", not below 80%.
+            if (share < DB_CAP_WARN_SHARE
+                    and not still_open("db_near_cap", store.name)):
+                continue
+            # The percentage is in the message as well as in `severity`
+            # because AlertEngine._apply opens the row at the RULE's
+            # severity: what separates a store at 97% of its cap from one at
+            # 86% on the Alerts page is the wording, not the colour.
+            raise_it(
+                "db_near_cap", store.name, f"{store.label} database",
+                severity=2 if share >= DB_CAP_HIGH_SHARE else 3,
+                extra={"store": store.name, "path": db.path,
+                       "bytes": used, "cap_bytes": cap,
+                       "used_pct": round(share * 100, 1),
+                       "setting": store.cap_key},
+                message=(f"{store.label} is at {share * 100:.0f}% of its "
+                         f"{cap // 1048576} MB cap "
+                         f"({format_bytes(used)} in {db.path}). Its oldest "
+                         f"records are deleted once it reaches that cap. "
+                         f"Raise {store.cap_key} in Settings → Data & "
+                         f"Retention to keep more history."))
+
+        free, total = disk_space(self)
+        if not total:
+            return
+        free_pct = free / total * 100.0
+        warn = float(self.settings.get("disk_free_warn_pct", 10) or 0)
+        critical = float(self.settings.get("disk_free_critical_pct", 5) or 0)
+        folder = str(Path(self.app_db.path).parent)
+        if not warn or free_pct >= warn + DISK_FREE_CLEAR_MARGIN_PCT:
+            clear_it("disk_space_low", "data")
+            return
+        # The databases' hold band, on the volume: raised below `warn`,
+        # cleared only once free space is a margin above it again.
+        if free_pct >= warn and not still_open("disk_space_low", "data"):
+            return
+        raise_it(
+            "disk_space_low", "data", folder,
+            severity=2 if free_pct < critical else 3,
+            extra={"path": folder, "free_bytes": free, "total_bytes": total,
+                   "free_pct": round(free_pct, 1),
+                   "setting": "disk_free_warn_pct"},
+            message=(f"{folder} has {format_bytes(free)} free of "
+                     f"{format_bytes(total)} ({free_pct:.0f}%). Every "
+                     f"database in it stops being written the moment the "
+                     f"volume fills, whatever the size caps say. Warns below "
+                     f"{warn:.0f}% (disk_free_warn_pct in Settings → Data & "
+                     f"Retention)."))
