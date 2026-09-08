@@ -76,7 +76,8 @@
   const ORDER_TITLE =
     `Which ${RECORD_LIMIT} records the server returns. Click a column heading to arrange them.`;
   const SCAN_BOUNDED_NOTE =
-    ` These are the heaviest records from the most recent flows in this window, not from every one of them.`;
+    ' These are the heaviest records from the most recent flows in this window,'
+    + ' not from every one of them.';
 
   function showWindow() {
     const span = view.t1 - view.t0;
