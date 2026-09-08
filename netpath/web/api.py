@@ -43,6 +43,7 @@ from .. import sshterm, webrelay
 from .. import enterprises, mibcatalog, vendorid
 from .. import mapper
 from .. import nodediscover
+from .. import nodepoll
 from .. import nodesdb
 from .. import db as netpathdb
 from .. import report as reportmod
@@ -4847,7 +4848,8 @@ def _discovery_scan_overrides(body) -> dict:
 
 
 def _start_discovery_job(service, kind, target, group_id,
-                         allow_ping_only, scan) -> int:
+                         allow_ping_only, scan,
+                         refuse_if_target_running: bool = False) -> int:
     """Everything a discovery start is past reading the request: the profile
     turned into the communities the sweep may try, the global settings a job
     cannot see on its own, and the row that remembers both inputs. Shared
@@ -4872,7 +4874,8 @@ def _start_discovery_job(service, kind, target, group_id,
             overrides[override_key] = scan[body_key]
     job_id = service.node_poller.start_discovery(
         kind, target, overrides=overrides, allow_ping_only=allow_ping_only,
-        group_id=group_id, scan_overrides=scan)
+        group_id=group_id, scan_overrides=scan,
+        refuse_if_target_running=refuse_if_target_running)
     service.log.add(NODES_CATEGORY, f"Started {kind} discovery of {target}")
     return job_id
 
@@ -4907,17 +4910,6 @@ def post_nodes_discovery_rescan(service, params, body, job_id) -> dict:
             "This scan is still running — wait for it to finish, or cancel "
             "it, before running it again.")
     target = job["target"]
-    # A double-click on Re-discover, or a second operator on the same row,
-    # would otherwise put two sweeps of the same /24 on the wire at once.
-    # Both halves matter: a row left 'running' by a process that died is not
-    # a sweep anybody is waiting for, and must not wedge the button.
-    for other in service.nodes_db.discovery_jobs(200):
-        if (other["id"] != job_id and other["target"] == target
-                and other["state"] == "running"
-                and service.node_poller.discovery_running(other["id"])):
-            raise ValueError(
-                f"A scan of {target} is already running — wait for it to "
-                "finish before starting another.")
     keys = job.keys()
     group_id = job["group_id"] if "group_id" in keys else None
     if not group_id or service.nodes_db.group(group_id) is None:
@@ -4930,9 +4922,22 @@ def post_nodes_discovery_rescan(service, params, body, job_id) -> dict:
         stored = {}
     if not isinstance(stored, dict):
         stored = {}   # only reachable from a hand-edited row; run at the defaults
-    new_id = _start_discovery_job(
-        service, job["kind"], target, group_id,
-        bool(job["allow_ping_only"]), _discovery_scan_overrides(stored))
+    # A double-click on Re-discover, or a second operator on the same row,
+    # would otherwise put two sweeps of the same /24 on the wire at once. The
+    # poller answers it and starts the sweep under one lock, because asking
+    # here and starting afterwards is a window two requests fit through. A
+    # row left 'running' by a process that died is not a sweep anybody is
+    # waiting for and does not wedge the button: what is refused is a job
+    # this poller is actually running.
+    try:
+        new_id = _start_discovery_job(
+            service, job["kind"], target, group_id,
+            bool(job["allow_ping_only"]), _discovery_scan_overrides(stored),
+            refuse_if_target_running=True)
+    except nodepoll.DiscoveryBusy:
+        raise ValueError(
+            f"A scan of {target} is already running — wait for it to "
+            "finish before starting another.") from None
     return {"id": new_id, "rescan_of": job_id}
 
 

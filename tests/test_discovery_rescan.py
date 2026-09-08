@@ -13,10 +13,12 @@ should depend on.
 import http.client
 import json
 import os
+import threading
 import time
 
 import _paths  # noqa: F401
 
+from netpath import nodepoll as nodepoll_mod
 from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER, hash_password
 from netpath.web import Service, WebServer
 
@@ -89,6 +91,9 @@ class StubJob:
     without a sweep that finishes on its own schedule."""
 
     running = True
+
+    def __init__(self, target="127.0.0.1"):
+        self.target = target
 
     def cancel(self):
         self.running = False
@@ -214,6 +219,95 @@ try:
     status, payload = call("POST", f"/api/nodes/discovery/{first_id}/rescan",
                            {}, token=reader)
     check("a nodes:read account may not re-run a scan", status == 403, (status, payload))
+
+    # ------------------------------------------- two clicks, one sweep
+    # The refusal used to be three steps in the route -- ask whether this
+    # job is running, scan the job rows for another live sweep of the same
+    # target, then start one -- with nothing held across them, on a
+    # threading web server, behind a button that stayed live during its own
+    # POST. Both requests passed all three checks and both swept the subnet.
+    #
+    # The interleaving is pinned rather than raced for: every request is held
+    # at the point it has just asked whether a sweep is running, and only
+    # released once the other has asked too. What is left is the question the
+    # fix answers -- can two callers that have both been told "nothing is
+    # running" both start one.
+    class HeldJob:
+        """A sweep that stays on the wire until the test lets it go, so the
+        second request meets a genuinely running one rather than racing a
+        real sweep to its finish line."""
+
+        started = []
+        release = threading.Event()
+
+        def __init__(self, db, job_id, kind, target, settings, log=None):
+            self.job_id = job_id
+            self.target = target
+            self._started = False
+
+        def start(self):
+            self._started = True
+            HeldJob.started.append(self.job_id)
+
+        def cancel(self):
+            HeldJob.release.set()
+
+        @property
+        def running(self):
+            return self._started and not HeldJob.release.is_set()
+
+    gate = threading.Barrier(2, timeout=30)
+    real_running = service.node_poller.discovery_running
+    held_at_check = threading.local()
+
+    def gated_running(job_id):
+        answer = real_running(job_id)
+        if not getattr(held_at_check, "waited", False):
+            held_at_check.waited = True
+            gate.wait()
+        return answer
+
+    real_job_class = nodepoll_mod.DiscoveryJob
+    nodepoll_mod.DiscoveryJob = HeldJob
+    service.node_poller.discovery_running = gated_running
+    try:
+        race_target = "10.96.0.0/24"
+        seeds = []
+        for _ in range(2):
+            seed = db.add_discovery_job("subnet", race_target, group_id=gid,
+                                        scan_overrides=stored)
+            db.update_discovery_job(seed, state="done", finished_ts=time.time())
+            seeds.append(seed)
+        answers = {}
+
+        def rescan(seed_id):
+            answers[seed_id] = call(
+                "POST", f"/api/nodes/discovery/{seed_id}/rescan", {}, token=admin)
+
+        threads = [threading.Thread(target=rescan, args=(seed,)) for seed in seeds]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
+    finally:
+        HeldJob.release.set()
+        nodepoll_mod.DiscoveryJob = real_job_class
+        service.node_poller.discovery_running = real_running
+
+    statuses = sorted(status for status, _payload in answers.values())
+    check("two concurrent rescans of one target: one is accepted",
+          statuses == [200, 400], answers)
+    check("...the other is refused in the same words a serial one is",
+          any("already running" in str(payload.get("error", ""))
+              for status, payload in answers.values() if status == 400),
+          answers)
+    check("...and exactly one sweep was started, not two",
+          len(HeldJob.started) == 1, HeldJob.started)
+    check("...leaving one new job row for the target, not two",
+          len([row for row in db.discovery_jobs(200)
+               if row["target"] == race_target]) == len(seeds) + 1,
+          [row["id"] for row in db.discovery_jobs(200)
+           if row["target"] == race_target])
 
     print()
     print("FAILURES:", FAILS if FAILS else "none")
