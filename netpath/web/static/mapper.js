@@ -2234,15 +2234,23 @@
     return new Error(message.slice(0, at + marker.length) + names.join(' -> '));
   }
 
+  /* Both suggestion shapes name two devices, and both are in Nodes. The
+     plain escaped form stays alongside the link because the checkbox's
+     aria-label reads it, and an <a> in an attribute is markup, not a link. */
+  const suggestionName = (s) => s.device_name || s.device_ip || `device ${s.device_id}`;
+  const candidateLink = (c) => (c.matched_device_name
+    ? App.deviceNameLink(c.matched_device_name, { id: c.matched_device_id })
+    : '—');
+
   function confidentSuggestionRowHtml(s, writable) {
     const c = s.candidates[0];
-    const label = escape(s.device_name || s.device_ip || `device ${s.device_id}`);
+    const label = escape(suggestionName(s));
     return `<tr data-device-id="${s.device_id}">
       <td><input type="checkbox" class="us-confident-check" data-device-id="${s.device_id}"
         data-upstream-id="${c.matched_device_id}" data-confidence="${escape(c.confidence)}"
         aria-label="Set upstream for ${label}"${writable ? '' : ' disabled'}></td>
-      <td>${label}</td>
-      <td>${escape(c.matched_device_name || '—')}</td>
+      <td>${App.deviceNameLink(suggestionName(s), { id: s.device_id })}</td>
+      <td>${candidateLink(c)}</td>
       <td>${candidateEvidenceHtml(c)}</td>
       <td>${confidenceBadgeHtml(c)}</td>
     </tr>`;
@@ -2254,12 +2262,12 @@
      what a device starts on and what leaving it alone means, said outright
      rather than left as an absence nothing here would otherwise explain. */
   function ambiguousSuggestionBlockHtml(s, writable) {
-    const label = escape(s.device_name || s.device_ip || `device ${s.device_id}`);
+    const label = App.deviceNameLink(suggestionName(s), { id: s.device_id });
     const name = `us-amb-${s.device_id}`;
     const options = s.candidates.map((c) => `
       <label class="check"><input type="radio" name="${name}" class="us-amb-pick"
         data-device-id="${s.device_id}" value="${c.matched_device_id}"${writable ? '' : ' disabled'}>
-        ${escape(c.matched_device_name || '—')} — ${candidateEvidenceHtml(c)} ${confidenceBadgeHtml(c)}</label>`
+        ${candidateLink(c)} — ${candidateEvidenceHtml(c)} ${confidenceBadgeHtml(c)}</label>`
     ).join('');
     return `<div class="us-amb-block">
       <p><b>${label}</b> — ${s.candidates.length} possible upstream(s), pick one</p>

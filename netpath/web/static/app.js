@@ -730,6 +730,32 @@ const App = (() => {
       : escapeHtml(ip);
   }
 
+  /* The other direction, and the common one: a device NAME shown anywhere
+     outside Nodes is a way into Nodes — its own pane with an `opts.id`, the
+     search box pre-filled otherwise. Synchronous, unlike deviceLink above:
+     every caller already holds the text it is drawing.
+
+     One helper for eleven columns, because the two rules it carries are not
+     obvious in any of them. An account without Nodes read gets escaped
+     plain text, never an anchor into a tab that would refuse it. And
+     `?name=`, not `?q=` — q also runs a MAC search (nodes.js's activate),
+     and a device called `beef01` is not a MAC.
+
+     `opts.search: false` is for alerts.js alone, whose entity_label is a
+     device name only while device_id says so: a DHCP scope searched for in
+     Nodes answers with the wrong device or none. */
+  function deviceNameLink(name, opts = {}) {
+    const text = String(name ?? '');
+    if (!text || !canRead('nodes')) return escapeHtml(text);
+    const id = opts.id;
+    const known = !(id === null || id === undefined || id === '');
+    if (!known && opts.search === false) return escapeHtml(text);
+    const href = known
+      ? buildRoute('nodes', ['device', id])
+      : buildRoute('nodes', [], { name: text });
+    return `<a class="linkish inline" href="${href}">${escapeHtml(text)}</a>`;
+  }
+
   /* The dangerous failure this replaces: a wall display that has lost its
      server looked exactly like a healthy fleet, distinguished only by the
      raw Chromium string "Failed to fetch" in low-contrast grey while two
@@ -5372,6 +5398,7 @@ const App = (() => {
     state, pages, selectTab, whenModuleReady, loadState, refreshNow,
     buildRoute, setRoute, currentRoute: parseRoute,
     get, post, put, del, saveCsv, exportCsv, deviceIndex, deviceLink,
+    deviceNameLink,
     clock, stamp, span, duration, ago, when, timeCell, agoCell, isoLocal,
     emptyText, stackedHistogram, plottedRange, filterBar, filterValues,
     timeZoneLabel, timeZoneTitle, countLabel,

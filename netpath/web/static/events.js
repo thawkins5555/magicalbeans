@@ -87,11 +87,15 @@
       severity: { key: 'severity', label: 'Severity', width: 90, numeric: true, on: true,
         align: 'left',
         cell: (r) => `<span class="sev sev-${r.severity}">${escape(r.severity_name)}</span>` },
+      // No device id on the row, so the search route. linkSourceIp above
+      // keeps the detail pane's richer two-state form, which needs a lookup
+      // a cell cannot wait for.
       source: { key: 'source', label: 'Source', width: 160, on: true,
         value: (r) => (view.showHostname && r.source_name) || r.source || '',
-        cell: (r) => escape((view.showHostname && r.source_name) || r.source) },
+        cell: (r) => App.deviceNameLink((view.showHostname && r.source_name)
+                                        || r.source) },
       sourceName: { key: 'source_name', label: 'Source name', width: 160,
-        cell: (r) => escape(r.source_name || '—') },
+        cell: (r) => App.deviceNameLink(r.source_name) || '—' },
     };
     const COLUMNS = spec.columns(SHARED_COLUMNS, view);
 

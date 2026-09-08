@@ -337,7 +337,8 @@
       cell: (r) => App.statusMark(r.alive ? 'ok' : (r.last_up ? 'fail' : 'none'),
                                   r.alive ? 'up' : (r.last_up ? 'down' : 'never')) },
     { key: 'hostname', label: 'Hostname', width: 220, on: true,
-      value: (r) => r.hostname || '', cell: (r) => escape(r.hostname || '') },
+      value: (r) => r.hostname || '',
+      cell: (r) => App.deviceNameLink(r.hostname) },
     { key: 'last_up', label: 'Last reply', width: 110, numeric: true, on: true,
       align: 'left', descendingFirst: true, value: (r) => r.last_up,
       cell: (r) => App.agoCell(r.last_up) },
@@ -997,7 +998,7 @@
       cell: (r) => escape(r.mac || '') },
     { key: 'hostname', label: 'Hostname', width: 200, on: true,
       value: (r) => r.hostname || r.description || '',
-      cell: (r) => escape(r.hostname || r.description || '') },
+      cell: (r) => App.deviceNameLink(r.hostname || r.description) },
     { key: 'state', label: 'State', width: 140, on: true,
       value: (r) => r.address_state || '',
       cell: (r) => (r.is_reservation
@@ -1209,7 +1210,7 @@
         + 'resolved a name for matches that.</p>';
     }
     const rows = results.map((r) => `<tr>` +
-      `<td>${escape(r.hostname || '—')}</td>` +
+      `<td>${App.deviceNameLink(r.hostname) || '—'}</td>` +
       `<td style="white-space:nowrap">${escape(r.ip)}</td>` +
       `<td style="white-space:nowrap">${escape(r.mac || '—')}</td>` +
       `<td>${r.alive == null ? '<span class="hint">not a discovered host</span>'
