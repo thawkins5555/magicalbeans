@@ -781,13 +781,13 @@ and says nothing about the ones it does not.
 **5.2.0 widened `media` past the ports that answer sensors.** A DOM walk
 cannot see an SFP slot that reports no DOM — a transceiver without the
 sensors, or an empty cage — and until now those were indistinguishable from
-copper. `_sfp_slot_media` reads three more ENTITY-MIB columns
-(`entPhysicalClass`, `entPhysicalVendorType`, `entPhysicalModelName`)
-alongside the `entPhysicalDescr` and `entPhysicalContainedIn` the walk
-already had, and resolves each cage through the containment tree
-`_entity_port_map` walks — extracted to `_entity_contained_in` and walked
-once by `_poll_environment` for both, so the cage scan adds no second walk
-of that column (it was already walked once, not twice). An entity whose own text names a
+copper. `_sfp_slot_media` reads two more ENTITY-MIB columns
+(`entPhysicalClass`, `entPhysicalModelName`) alongside the
+`entPhysicalDescr` and `entPhysicalContainedIn` the walk already had, and
+resolves each cage through the containment tree `_entity_port_map` walks —
+extracted to `_entity_contained_in` and walked once by `_poll_environment`
+for both, so the cage scan adds no second walk of that column (it was
+already walked once, not twice). An entity whose own text names a
 transceiver (`_TRANSCEIVER_TEXT`) and that resolves to an `ifIndex` is
 `'sfp'`; a `container(5)` that says it is a transceiver cage and holds
 nothing that does is `'sfp_empty'`, taking its `ifIndex` from the `port(10)`
@@ -798,13 +798,17 @@ every copper port one too, and a copper port must never wear an SFP badge,
 which is also why `_TRANSCEIVER_TEXT` matches an optical media suffix
 (`base-SX`, `10Gbase-LR`) or a form factor but never a bare `1000BaseT`.
 The cost is real and worth stating plainly: for every device the entity
-table mapped to a port, this is three more full column walks of
-`entPhysical` — class, vendor type and model name — every
-`_SENSOR_REFRESH_S` (300 s), on top of the descr, containment and alias
-walks the sensor pass already made. A device that maps nothing to a port
-pays nothing for them, which is the only thing that bounds it.
+table mapped to a port, this is two more full column walks of `entPhysical`
+— class and model name — every `_SENSOR_REFRESH_S` (300 s), on top of the
+descr, containment and alias walks the sensor pass already made. A device
+that maps nothing to a port pays nothing for them, which is the only thing
+that bounds it. `entPhysicalVendorType` was a third and is not walked:
+`SYNTAX AutonomousType` makes it an OBJECT IDENTIFIER, so a conforming
+agent answers a dotted number no text test can read, and the registered
+names those numbers stand for (`cevSFP10GLR` and its kin) run the words
+together, so they would not match `_TRANSCEIVER_TEXT` even spelled out.
 
-All three go through `_walk_column_status`, and a walk that did not reach
+Both go through `_walk_column_status`, and a walk that did not reach
 the end of its table makes the whole verdict advisory: `_poll_environment`
 then leaves every stored `'sfp'` / `'sfp_empty'` badge where it is, and only
 a port this poll's own sensors proved is an `'optic'` may overwrite one.

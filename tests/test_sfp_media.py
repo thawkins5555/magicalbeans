@@ -11,6 +11,7 @@ port's chart keeps its continuity; alertrules.breaches refusing to alert on
 that floor for the two optic power rules and nothing else; and
 evaluate_threshold closing an alert already open on a port that goes dark.
 """
+import socket
 import time
 
 from _paths import spawn_stub, tmpdir
@@ -22,6 +23,10 @@ from netpath.nodesdb import NodesDatabase
 from netpath.nodepoll import NodePoller
 
 TMP = tmpdir("sfp_media_")
+
+ENT_VENDOR_TYPE = "1.3.6.1.2.1.47.1.1.1.1.3"
+ENT_CLASS = "1.3.6.1.2.1.47.1.1.1.1.5"
+ENT_MODEL_NAME = "1.3.6.1.2.1.47.1.1.1.1.13"
 
 FAILS = []
 
@@ -38,6 +43,21 @@ def check(name, ok, detail=""):
     print(("PASS  " if ok else "FAIL  ") + name + (f"   {detail}" if detail and not ok else ""))
     if not ok:
         FAILS.append(name)
+
+
+def stub_columns(port: int) -> set:
+    """The entPhysicalEntry columns the stub was asked for, over its own
+    control datagram -- the stub_agent_fdb.py convention every stub here
+    follows. A column is a whole table walk of cost every cadence, so which
+    ones are asked for is part of the contract, not an implementation
+    detail."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(2.0)
+    sock.sendto(b"COLUMNS", ("127.0.0.1", port))
+    try:
+        return set(sock.recv(4096).decode("utf-8", "replace").split())
+    finally:
+        sock.close()
 
 
 def new_nodes_db(name: str) -> NodesDatabase:
@@ -85,6 +105,17 @@ try:
     check("a copper port the agent also models as container+port names no "
           "transceiver anywhere and stays unbadged",
           media.get(4) is None, media)
+
+    # Every column here is a full walk of entPhysical, every
+    # _SENSOR_REFRESH_S, for every port-mapped device, so which ones are
+    # asked for is part of the contract.
+    columns = stub_columns(port)
+    check("the cage scan reads entPhysicalClass and entPhysicalModelName",
+          {ENT_CLASS, ENT_MODEL_NAME} <= columns, sorted(columns))
+    check("...and never entPhysicalVendorType: it is an OBJECT IDENTIFIER "
+          "column, so what comes back is a dotted number, and no vendor's "
+          "own name for a part reads as transceiver text either",
+          ENT_VENDOR_TYPE not in columns, sorted(columns))
     db.close()
 finally:
     stub.kill()

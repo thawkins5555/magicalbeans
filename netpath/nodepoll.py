@@ -3436,11 +3436,16 @@ class NodePoller(Worker):
     # by read_dom() to find a port's transceiver sensors.
     _ENT_PHYSICAL_DESCR = "1.3.6.1.2.1.47.1.1.1.1.2"
     _ENT_PHYSICAL_CONTAINED_IN = "1.3.6.1.2.1.47.1.1.1.1.4"
-    # entPhysicalClass/VendorType/ModelName: what an entity IS, which is the
-    # only way to see an SFP slot that reports no DOM at all -- a cage with
-    # nothing in it has no sensor to be found by.
+    # entPhysicalClass/ModelName: what an entity IS, which is the only way
+    # to see an SFP slot that reports no DOM at all -- a cage with nothing
+    # in it has no sensor to be found by. entPhysicalVendorType would be the
+    # obvious third, and is deliberately not walked: it is an OBJECT
+    # IDENTIFIER, so a conforming agent answers a dotted number that no text
+    # test can read, and the registered names behind those numbers
+    # (`cevSFP10GLR` and its kin) run the words together, so they would not
+    # match _TRANSCEIVER_TEXT even spelled out. Descr and model name carry
+    # the whole job, for one fewer full walk of entPhysical per cadence.
     _ENT_PHYSICAL_CLASS = "1.3.6.1.2.1.47.1.1.1.1.5"
-    _ENT_PHYSICAL_VENDOR_TYPE = "1.3.6.1.2.1.47.1.1.1.1.3"
     _ENT_PHYSICAL_MODEL_NAME = "1.3.6.1.2.1.47.1.1.1.1.13"
     # entPhysicalName: RFC 6933 makes it optional, so read_dom's own decode
     # (shared with _poll_environment, both pre-dating this column's use
@@ -3744,11 +3749,8 @@ class NodePoller(Worker):
             return {}, complete
         models, models_done = self._walk_column_status(
             device, config, self._ENT_PHYSICAL_MODEL_NAME)
-        vendor_types, vendors_done = self._walk_column_status(
-            device, config, self._ENT_PHYSICAL_VENDOR_TYPE)
-        complete = complete and models_done and vendors_done
+        complete = complete and models_done
         models = _int_keyed(models)
-        vendor_types = _int_keyed(vendor_types)
         by_descr = _int_keyed(descrs)
         children: dict[int, list[int]] = {}
         for entity, parent in contained_in.items():
@@ -3756,7 +3758,7 @@ class NodePoller(Worker):
 
         def names_transceiver(entity: int) -> bool:
             return any(_TRANSCEIVER_TEXT.search(str(column.get(entity) or ""))
-                       for column in (by_descr, models, vendor_types))
+                       for column in (by_descr, models))
 
         def descendants(root: int) -> list[int]:
             found: list[int] = []
@@ -4151,8 +4153,8 @@ class NodePoller(Worker):
         port_map, _alias_rows = self._entity_port_map(
             device, config, names, if_by_name, contained_in)
         # Nothing mapped to a port means a walk that answered nothing useful;
-        # the three ENTITY-MIB columns the cage scan needs would be three
-        # more dead walks.
+        # the two ENTITY-MIB columns the cage scan needs would be two more
+        # dead walks.
         sfp_slots, slots_complete = (
             self._sfp_slot_media(device, config, port_map, contained_in, descrs)
             if port_map else ({}, True))

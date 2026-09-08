@@ -80,10 +80,11 @@ Modes:
              difference matters to a caller that deletes rows its walk did
              not produce. See DEAD_COLUMNS.
 
-Two control datagrams, on the same socket as SNMP itself (see
+Three control datagrams, on the same socket as SNMP itself (see
 stub_agent_fdb.py, which established this convention):
   STATS       -> the request count so far, as decimal text
-  RESET       -> zeroes it
+  COLUMNS     -> the entPhysicalEntry columns asked for, space-separated
+  RESET       -> zeroes both
 """
 import os
 import socket
@@ -426,6 +427,14 @@ DEAD_COLUMNS = {
     "sfp_media_no_class": ("1.3.6.1.2.1.47.1.1.1.1.5",),
 }
 
+# Which entPhysicalEntry columns a run was asked for at all. A walk asks for
+# its column's base OID and then resumes from the last row it accepted, so
+# every request it makes carries that column -- which is what makes "was
+# this column ever walked?" a question a test can put, and each column is a
+# whole table walk of cost.
+ENT_PHYSICAL_ENTRY = "1.3.6.1.2.1.47.1.1.1.1."
+COLUMNS_SEEN: set = set()
+
 MODE = "ups"
 
 
@@ -483,8 +492,12 @@ def main():
         if data == b"STATS":
             sock.sendto(str(count).encode(), addr)
             continue
+        if data == b"COLUMNS":
+            sock.sendto(" ".join(sorted(COLUMNS_SEEN)).encode(), addr)
+            continue
         if data == b"RESET":
             count = 0
+            COLUMNS_SEEN.clear()
             sock.sendto(b"0", addr)
             continue
         try:
@@ -497,6 +510,8 @@ def main():
         table = table_for()
         keys = sorted(table, key=oid_key)
         oids = [vb["oid"] for vb in request.varbinds]
+        if oids[0].startswith(ENT_PHYSICAL_ENTRY):
+            COLUMNS_SEEN.add(".".join(oids[0].split(".")[:12]))
         if refuses(oids[0]):
             continue
         if request.pdu_tag == PDU_GET:
