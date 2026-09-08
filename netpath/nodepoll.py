@@ -969,6 +969,12 @@ class NodePoller(Worker):
         # walk that answers something that does not change between one
         # poll and the next.
         self._sensor_read: dict[int, float] = {}
+        # device_id -> when its entSensorThresholdTable was last walked. A
+        # separate stamp from _sensor_read above because it runs an order of
+        # magnitude less often: a DOM reading moves every poll, but the
+        # limits a transceiver publishes change only when somebody pulls the
+        # optic out. See _SENSOR_THRESHOLD_REFRESH_S.
+        self._sensor_threshold_read: dict[int, float] = {}
         # device_id -> when a sensor-diagnostic event was last written for
         # it. See _log_sensor_diag.
         self._sensor_diag_ts: dict[int, float] = {}
@@ -1215,6 +1221,7 @@ class NodePoller(Worker):
         # Also doubles as "try the sensor walk again": dropping the cadence
         # stamp skips both _SENSOR_REFRESH_S and the hourly reprobe window.
         self._sensor_read.pop(device_id, None)
+        self._sensor_threshold_read.pop(device_id, None)
         return self._submit(device_id)
 
     def set_focus(self, device_id: int, ttl_s: float, interval_s: float) -> None:
@@ -1558,7 +1565,8 @@ class NodePoller(Worker):
                       self._next_lldp_walk, self._next_vlan_walk,
                       self._credentials, self._credential_probe_failed,
                       self._addresses_read, self._bulk_repetitions,
-                      self._sensor_read, self._sensor_diag_ts):
+                      self._sensor_read, self._sensor_threshold_read,
+                      self._sensor_diag_ts):
             for device_id in [k for k in cache if k not in keep]:
                 cache.pop(device_id, None)
         with self._lock:
@@ -3070,6 +3078,7 @@ class NodePoller(Worker):
         # so a re-identification invalidates an old "no sensors" verdict.
         self.db.set_sensor_capable(device_id, None)
         self._sensor_read.pop(device_id, None)
+        self._sensor_threshold_read.pop(device_id, None)
         job.start()
         return job.status()
 
@@ -3531,6 +3540,39 @@ class NodePoller(Worker):
     _CISCO_SENSOR_STATUS = "1.3.6.1.4.1.9.9.91.1.1.1.1.5"
     _CISCO_ENTERPRISE_PREFIX = "1.3.6.1.4.1.9."
 
+    # CISCO-ENTITY-SENSOR-MIB entSensorThresholdTable — the alarm and
+    # warning levels a transceiver publishes about ITSELF, indexed
+    # <entPhysicalIndex>.<threshold index>. This is what makes an optic
+    # power alert mean anything: an SR part's floor is not a ZR part's.
+    #
+    # .5 entSensorThresholdEvaluation is deliberately NOT read. It is the
+    # device's own instantaneous verdict, and taking it would bypass this
+    # app's hysteresis, its breach streak and for_polls all at once — the
+    # three things that stop a value hovering at its limit mailing somebody
+    # every poll. .6 entSensorThresholdNotificationEnable is about the
+    # device's own traps, not about us.
+    _CISCO_THRESHOLD_SEVERITY = "1.3.6.1.4.1.9.9.91.1.2.1.1.2"
+    _CISCO_THRESHOLD_RELATION = "1.3.6.1.4.1.9.9.91.1.2.1.1.3"
+    _CISCO_THRESHOLD_VALUE = "1.3.6.1.4.1.9.9.91.1.2.1.1.4"
+
+    # entSensorThresholdSeverity -> which of this app's two bands the level
+    # belongs in. other(1) is dropped: it names no band, so there is no
+    # column to put it in. major(20) and critical(30) both land in the alarm
+    # band -- an optic that publishes both gets the tighter of the two by the
+    # duplicate rule below, which is the one that alerts first.
+    _CISCO_THRESHOLD_BAND = {10: "warn", 20: "alarm", 30: "alarm"}
+    # entSensorThresholdRelation -> which SIDE of the reading the level is.
+    # lessThan(1)/lessOrEqual(2) are a floor, greaterThan(3)/greaterOrEqual(4)
+    # a ceiling; equalTo(5) and notEqualTo(6) describe neither and are
+    # dropped, since this app's evaluator only ever asks "at or past".
+    _CISCO_THRESHOLD_SIDE = {1: "low", 2: "low", 3: "high", 4: "high"}
+    # Every real transceiver's published dBm levels sit well inside this
+    # band, and nothing a scale misread produces does -- a threshold decoded
+    # a factor of a thousand out lands at -14400 or -0.0144, both outside.
+    # It is the only check that can catch that failure, which is otherwise
+    # invisible: -14.4 and -14400 are both "a number".
+    _DBM_LIMIT_RANGE = (-60.0, 30.0)
+
     _SENSOR_TYPE_UNITS = {3: "V AC", 4: "V DC", 5: "A", 6: "W", 7: "Hz",
                           8: "°C", 9: "%RH", 10: "RPM", 11: "m³/min",
                           12: "", 13: "", 14: "dBm"}
@@ -3566,6 +3608,21 @@ class NodePoller(Worker):
     # milliamps everywhere an operator would read it.
     _BIAS_A_TO_MA = 1000.0
 
+    @staticmethod
+    def _scaled_sensor_value(raw, scale, precision) -> float:
+        """RFC 3433's arithmetic, alone: the reading is
+        raw x 10^(3*(scale-9)) with `precision` decimal places already
+        folded into the integer.
+
+        Its own function because entSensorThresholdValue is quoted in the
+        SAME scale and precision as the entity's reading, and a second copy
+        of three lines of exponent arithmetic is how the two would drift a
+        factor of a thousand apart without anything looking wrong.
+        """
+        scale = int(scale or 9)             # 9 = units (10^0)
+        precision = int(precision or 0)
+        return raw * (10 ** (3 * (scale - 9))) / (10 ** precision)
+
     def _decode_entity_sensor(self, suffix: str, raw, types: dict, scales: dict,
                               precisions: dict, statuses: dict, units: dict,
                               descrs: dict) -> dict | None:
@@ -3587,11 +3644,9 @@ class NodePoller(Worker):
         except ValueError:
             return None
         sensor_type = int(types.get(suffix) or 0)
-        scale = int(scales.get(suffix) or 9)       # 9 = units (10^0)
         precision = int(precisions.get(suffix) or 0)
-        # RFC 3433: the reading is value x 10^(3*(scale-9)) with
-        # `precision` decimal places already folded into the integer.
-        value = raw * (10 ** (3 * (scale - 9))) / (10 ** precision)
+        value = self._scaled_sensor_value(
+            raw, scales.get(suffix), precisions.get(suffix))
         unit = str(units.get(suffix) or "").strip() or \
             self._SENSOR_TYPE_UNITS.get(sensor_type, "")
         return {
@@ -3670,6 +3725,14 @@ class NodePoller(Worker):
         here since a port dialog already supplies context a device-wide
         list has to spell out.
 
+        Each row also carries `limits` — the four-band dict this port's own
+        transceiver published for that reading, or None — and
+        `limits_source`, the MIB it came out of. They are on the row rather
+        than left to the caller because a reading and the level it is judged
+        against are one fact: from 5.3.0 an optical power row with no limits
+        raises no alert at all, and that is only honest if the dialog says
+        so. One stored read per call, no extra walk.
+
         Returns [] when the device answers no sensor table or maps no
         entity to this ifIndex."""
         device = self.db.device(device_id)
@@ -3678,6 +3741,7 @@ class NodePoller(Worker):
         config = self.working_config(device)
         if not config.get("snmp_enabled", True):
             return []
+        limits = self.db.interface_thresholds(device_id)
         sensors = []
         for sensor in self._read_entity_sensors(device, config):
             if sensor.get("if_index") != if_index:
@@ -3686,9 +3750,24 @@ class NodePoller(Worker):
                 "entity": sensor["entity"],
                 "label": sensor.get("descr") or sensor["label"],
                 "value": sensor["value"], "unit": sensor["unit"],
-                "status": sensor["status"], "source": sensor.get("source", "")})
+                "status": sensor["status"], "source": sensor.get("source", ""),
+                **self._sensor_limits(limits, if_index, sensor)})
         sensors.sort(key=lambda s: s["entity"])
         return sensors
+
+    @staticmethod
+    def _sensor_limits(limits: dict, if_index, sensor: dict) -> dict:
+        """{"limits": the four published bands or None, "limits_source": the
+        MIB that published them} for one DOM row — the shape read_dom and
+        read_dom_all both put on their rows."""
+        row = limits.get((if_index, sensor.get("metric_root")))
+        if row is None:
+            return {"limits": None, "limits_source": ""}
+        return {
+            "limits": {band: row[band] for band in
+                       ("low_alarm", "low_warn", "high_warn", "high_alarm")},
+            "limits_source": row["source"],
+        }
 
     def _entity_port_map(self, device, config: dict, names: dict | None = None,
                          if_by_name: dict | None = None,
@@ -3913,6 +3992,11 @@ class NodePoller(Worker):
                 "source": source,
                 "type": self._SENSOR_TYPE_NAMES.get(
                     int(types.get(suffix) or 0), "other"),
+                # The per-port metric key this reading feeds, so the two DOM
+                # reads can find the limits the port published for it without
+                # re-deriving the direction from the sensor's name.
+                "metric_root": self._sfp_root_for(
+                    int(types.get(suffix) or 0), suffix, names, descrs),
                 "if_index": if_index,
                 "if_name": if_name or None,
             })
@@ -4095,6 +4179,7 @@ class NodePoller(Worker):
         if_names = {row["if_index"]: (row["descr"] or row["alias"]
                                       or f"port {row['if_index']}")
                    for row in self.db.interfaces(device_id)}
+        limits = self.db.interface_thresholds(device_id)
         rows = []
         for sensor in self._read_entity_sensors(device, config):
             if_index = sensor.get("if_index")
@@ -4104,7 +4189,8 @@ class NodePoller(Worker):
                 "if_index": if_index,
                 "if_name": if_names.get(if_index, f"port {if_index}"),
                 "label": sensor["label"], "value": sensor["value"],
-                "unit": sensor["unit"], "status": sensor["status"]})
+                "unit": sensor["unit"], "status": sensor["status"],
+                **self._sensor_limits(limits, if_index, sensor)})
         rows.sort(key=lambda r: (r["if_index"], r["label"]))
         return rows
 
@@ -4126,6 +4212,156 @@ class NodePoller(Worker):
     # ever being identified as Cisco would never get offered the Cisco
     # table at all. An hour bounds how long that mistake can last.
     _SENSOR_REPROBE_S = 3600.0
+
+    # How often the published-threshold walk runs, against _SENSOR_REFRESH_S's
+    # 300: a DOM reading changes every poll, but the levels a transceiver
+    # publishes change only when somebody pulls the optic out of the cage.
+    # Three extra column walks an hour on the switches that have optics is
+    # the whole cost of per-port optic alerting.
+    _SENSOR_THRESHOLD_REFRESH_S = 3600.0
+
+    # The MIB these limits came out of, stored on every row so a second
+    # vendor's walk one day replaces only its own. See
+    # nodesdb.replace_interface_thresholds.
+    _CISCO_THRESHOLD_SOURCE = "CISCO-ENTITY-SENSOR-MIB"
+
+    def _sfp_root_for(self, sensor_type: int, suffix: str, names, descrs
+                      ) -> str | None:
+        """The per-port DOM metric root (_SFP_METRICS) this sensor writes,
+        or None for a row that is not one.
+
+        dBm(14) says a reading is optical power but not which way the light
+        is going, so its root comes from the sensor's own name; every other
+        type answers from its type alone (_SFP_TYPE_ROOTS). Its own function
+        because the threshold walk has to reach the same verdict for a
+        sensor the reading loop went on to discard.
+        """
+        if sensor_type == self._SENSOR_TYPE_OPTICAL:
+            direction = _optical_direction(
+                str(names.get(suffix) or "") if names else "",
+                str(descrs.get(suffix) or ""))
+            return f"sfp_{direction}_dbm" if direction else None
+        return self._SFP_TYPE_ROOTS.get(sensor_type)
+
+    def _poll_optic_thresholds(self, device_id: int, device, config: dict,
+                               threshold_roots: dict, scales: dict,
+                               precisions: dict, now: float) -> None:
+        """The alarm/warning levels this device's own transceivers publish,
+        into nodes.db's interface_thresholds — see that table's schema
+        comment, and alertrules.PUBLISHED_THRESHOLD_RULES for what reads
+        them.
+
+        `threshold_roots` maps a sensor's index suffix to the
+        (ifIndex, metric root) it belongs to; the caller builds it from the
+        walk it has already done, so this costs three column walks and no
+        re-walk of anything.
+
+        Gated on _cisco_sensor_table_plausible rather than on which value
+        table answered: a Nexus answers the STANDARD sensor table and
+        publishes Cisco thresholds beside it, so gating on the value table's
+        source would miss the whole NX-OS fleet. Gated again on this device
+        having at least one port-mapped optic sensor this pass, so routers,
+        PDUs and copper-only switches never pay three dead walks an hour for
+        ever.
+        """
+        if not threshold_roots or not self._cisco_sensor_table_plausible(device):
+            return
+        if now - self._sensor_threshold_read.get(device_id, 0.0) < \
+                self._SENSOR_THRESHOLD_REFRESH_S:
+            return
+        self._sensor_threshold_read[device_id] = now
+        try:
+            values, complete = self._walk_column_status(
+                device, config, self._CISCO_THRESHOLD_VALUE)
+            severities, sev_done = self._walk_column_status(
+                device, config, self._CISCO_THRESHOLD_SEVERITY)
+            relations, rel_done = self._walk_column_status(
+                device, config, self._CISCO_THRESHOLD_RELATION)
+        except SnmpError:
+            return
+        if not (complete and sev_done and rel_done):
+            # Same doctrine as _sfp_slot_media's slots_complete, and it
+            # matters more here: an empty answer means "this device publishes
+            # nothing", which switches optic power alerting OFF for every
+            # port on it. A slow device must not be able to say that. All
+            # three columns, because a severity row the walk never reached
+            # loses its band and drops a level just as silently.
+            return
+
+        # (ifIndex, root) -> {column: value}. Several entities can land on
+        # one key -- a multi-lane optic reports a lane per entity -- and one
+        # entity can quote the same band twice; both collapse the same way,
+        # keeping whichever level alerts EARLIER.
+        bands: dict[tuple, dict] = {}
+        for suffix, raw in values.items():
+            entity, _, _index = suffix.partition(".")
+            target = threshold_roots.get(entity)
+            if target is None or not isinstance(raw, (int, float)):
+                continue
+            side = self._CISCO_THRESHOLD_SIDE.get(
+                int(relations.get(suffix) or 0) or 0)
+            band = self._CISCO_THRESHOLD_BAND.get(
+                int(severities.get(suffix) or 0) or 0)
+            if side is None or band is None:
+                continue
+            # The threshold is quoted in the scale and precision of ITS OWN
+            # entity's reading, never the threshold row's index -- decoding
+            # one against another entity's scale is wrong by a factor of a
+            # thousand and still looks like a plausible dBm figure.
+            value = self._scaled_sensor_value(
+                raw, scales.get(entity), precisions.get(entity))
+            if target[1] == "sfp_bias_ma":
+                # The reading loop above quotes bias in milliamps; a limit
+                # left in the MIB's amperes would be a thousand times the
+                # metric it governs.
+                value *= self._BIAS_A_TO_MA
+            column = f"{side}_{band}"
+            existing = bands.setdefault(target, {}).get(column)
+            if existing is not None:
+                value = max(existing, value) if side == "low" \
+                    else min(existing, value)
+            bands[target][column] = value
+
+        rows = []
+        for (if_index, root), columns in sorted(bands.items()):
+            if not self._optic_band_sane(root, columns):
+                self._log_sensor_diag(
+                    device, f"{device['ip']} publishes optic limits for "
+                            f"{root} on ifIndex {if_index} that do not make "
+                            f"sense together; they are ignored, so that port "
+                            f"raises no optical power alerts")
+                continue
+            rows.append({"if_index": if_index, "metric_root": root,
+                         "low_alarm": columns.get("low_alarm"),
+                         "low_warn": columns.get("low_warn"),
+                         "high_warn": columns.get("high_warn"),
+                         "high_alarm": columns.get("high_alarm"),
+                         "updated_ts": now})
+        self.db.replace_interface_thresholds(
+            device_id, self._CISCO_THRESHOLD_SOURCE, rows)
+
+    def _optic_band_sane(self, root: str, columns: dict) -> bool:
+        """Whether a published band is coherent enough to alert on.
+
+        A partly-published band is fine and common (older IOS quotes an
+        alarm and no warning); a band that contradicts itself is not, and
+        the only honest thing to do with it is to alert on none of it. The
+        dBm range check is the one gate that can catch a scale misread,
+        which is otherwise invisible: -14.4 and -14400 are both numbers.
+        """
+        lows = [columns[c] for c in ("low_alarm", "low_warn") if c in columns]
+        highs = [columns[c] for c in ("high_warn", "high_alarm") if c in columns]
+        if root.endswith("_dbm"):
+            floor, ceiling = self._DBM_LIMIT_RANGE
+            if any(not floor <= v <= ceiling for v in lows + highs):
+                return False
+        if "low_alarm" in columns and "low_warn" in columns \
+                and columns["low_alarm"] > columns["low_warn"]:
+            return False
+        if "high_alarm" in columns and "high_warn" in columns \
+                and columns["high_alarm"] < columns["high_warn"]:
+            return False
+        return not any(low >= high for low in lows for high in highs)
 
     def _poll_environment(self, device_id: int, device, config: dict,
                           already: set, now: float) -> None:
@@ -4227,6 +4463,9 @@ class NodePoller(Worker):
         # one row per lane, so a port can have several of the same root.
         per_port: dict[tuple[int, str], list[float]] = {}
         optic_ports: set[int] = set()
+        # Sensor index suffix -> the (ifIndex, root) its published limits
+        # belong to. See _poll_optic_thresholds.
+        threshold_roots: dict[str, tuple] = {}
         for suffix, raw in sensor_values.items():
             sensor_type = int(types.get(suffix) or 0)
             try:
@@ -4238,7 +4477,13 @@ class NodePoller(Worker):
                 # A failed optic is still an optic: any sensor resolving to
                 # a port is proof one is there, whatever it reads.
                 optic_ports.add(if_index)
-            root = self._SFP_TYPE_ROOTS.get(sensor_type)
+            root = self._sfp_root_for(sensor_type, suffix, names, descrs)
+            if if_index is not None and root is not None:
+                # Recorded BEFORE the status filter below: a transceiver
+                # reading nonoperational for one cadence still publishes the
+                # same limits, and dropping them would switch that port's
+                # optic alerting off and on again with it.
+                threshold_roots[suffix] = (if_index, root)
             if sensor_type not in (self._SENSOR_TYPE_TEMPERATURE,
                                    self._SENSOR_TYPE_HUMIDITY,
                                    self._SENSOR_TYPE_OPTICAL) and root is None:
@@ -4262,18 +4507,14 @@ class NodePoller(Worker):
                     ambient_temps.append(value)
                 else:
                     chassis_temps.append(value)
-            if if_index is None:
+            if if_index is None or root is None:
                 continue
-            if sensor_type == self._SENSOR_TYPE_OPTICAL:
-                direction = _optical_direction(
-                    str(names.get(suffix) or "") if names else "",
-                    str(descrs.get(suffix) or ""))
-                if direction is None:
-                    continue
-                root = f"sfp_{direction}_dbm"
-            elif root == "sfp_bias_ma":
+            if root == "sfp_bias_ma":
                 value *= self._BIAS_A_TO_MA
             per_port.setdefault((if_index, root), []).append(value)
+
+        self._poll_optic_thresholds(device_id, device, config, threshold_roots,
+                                    scales, precisions, now)
 
         # Worst (hottest/most humid) sensor of each kind wins — "the hot
         # spot is what matters", the same reasoning VENDOR_HEALTH's

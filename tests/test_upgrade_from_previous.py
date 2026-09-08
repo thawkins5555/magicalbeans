@@ -457,6 +457,95 @@ again = {r["name"] for r in reopened._conn.execute(
 check("reopening an already-migrated database changes nothing", again == after, again)
 reopened.close()
 
+# ------------------- part 7: 5.3.0's optic power rules on a 5.2 alerts.db
+# The two migrations that carry an existing install across the change, in
+# the order they must run. The fixture is a 5.2-shaped alerts.db built by
+# hand: the six new rules absent, the two old ones still carrying their
+# global numbers (one of them tuned AND muted by the operator), and
+# dampen_new_builtin_siblings_1 already recorded -- which is exactly why
+# 5.3.0 needs a SECOND named entry for that same method. Without it the six
+# new rules arrive enabled and emailing on an install whose operator
+# deliberately silenced the one rule they read the same metric as.
+optic = os.path.join(work, "optic")
+os.makedirs(optic, exist_ok=True)
+optic_path = os.path.join(optic, "alerts.db")
+AlertsDatabase(optic_path).close()
+conn = sqlite3.connect(optic_path)
+conn.executescript("""
+    DELETE FROM rules WHERE key IN (
+        'sfp_rx_power_low_alarm', 'sfp_rx_power_high', 'sfp_rx_power_high_alarm',
+        'sfp_tx_power_low_alarm', 'sfp_tx_power_high', 'sfp_tx_power_high_alarm');
+    UPDATE rules SET threshold = -22.0, clear_threshold = -20.0
+        WHERE key = 'sfp_rx_power_low';
+    -- tuned AND muted: this site's optics run near the old global floor
+    UPDATE rules SET threshold = -15.0, clear_threshold = -13.0, notify = 0
+        WHERE key = 'sfp_tx_power_low';
+    -- an unrelated rule the operator also tuned, which nothing here may touch
+    UPDATE rules SET threshold = 95.0, clear_threshold = 85.0 WHERE key = 'cpu_high';
+    DELETE FROM schema_migrations WHERE name IN (
+        'dampen_optic_power_siblings_1', 'clear_optic_power_thresholds_1');
+""")
+conn.commit()
+before = {r[0] for r in conn.execute("SELECT name FROM schema_migrations")}
+keys = {r[0] for r in conn.execute("SELECT key FROM rules")}
+conn.close()
+check("the fixture really is the 5.2 shape: six new rules absent, the "
+      "older dampen migration already recorded",
+      "sfp_rx_power_low_alarm" not in keys
+      and "dampen_new_builtin_siblings_1" in before
+      and "dampen_optic_power_siblings_1" not in before, (sorted(before), sorted(keys)))
+
+optic_db = AlertsDatabase(optic_path)
+EIGHT = ("sfp_rx_power_low", "sfp_rx_power_low_alarm", "sfp_rx_power_high",
+         "sfp_rx_power_high_alarm", "sfp_tx_power_low", "sfp_tx_power_low_alarm",
+         "sfp_tx_power_high", "sfp_tx_power_high_alarm")
+rows = {key: optic_db.rule_by_key(key) for key in EIGHT}
+check("all eight optic power rules exist after the upgrade",
+      all(rows[key] is not None for key in EIGHT),
+      [key for key in EIGHT if rows[key] is None])
+check("every one of them has a NULL threshold and clear_threshold -- "
+      "including the two that carried an operator's own numbers, which the "
+      "engine no longer reads and which would otherwise sit on the Rules "
+      "page reading as the live limit",
+      all(rows[key]["threshold"] is None and rows[key]["clear_threshold"] is None
+          for key in EIGHT),
+      {key: (rows[key]["threshold"], rows[key]["clear_threshold"]) for key in EIGHT})
+check("the three new siblings of the MUTED tx rule inherit notify = 0: an "
+      "operator who silenced one rule over a metric does not get three new "
+      "ones emailing them about the same reading",
+      all(rows[key]["notify"] == 0 for key in
+          ("sfp_tx_power_low_alarm", "sfp_tx_power_high",
+           "sfp_tx_power_high_alarm")),
+      {key: rows[key]["notify"] for key in EIGHT})
+check("...and the rx siblings, whose own sibling was never muted, stay on",
+      all(rows[key]["notify"] == 1 and rows[key]["enabled"] == 1 for key in
+          ("sfp_rx_power_low_alarm", "sfp_rx_power_high",
+           "sfp_rx_power_high_alarm")),
+      {key: (rows[key]["enabled"], rows[key]["notify"]) for key in EIGHT})
+check("the comparisons land right way round on the new rules",
+      all(rows[key]["comparison"] == ("below" if "_low" in key else "above")
+          for key in EIGHT),
+      {key: rows[key]["comparison"] for key in EIGHT})
+cpu = optic_db.rule_by_key("cpu_high")
+check("an unrelated rule the operator tuned is untouched",
+      (cpu["threshold"], cpu["clear_threshold"]) == (95.0, 85.0), dict(cpu))
+temp = optic_db.rule_by_key("sfp_temp_high")
+check("sfp_temp_high keeps its own threshold: only optical POWER moved to "
+      "published limits",
+      temp["threshold"] == 70.0, dict(temp))
+optic_db.close()
+
+reopened = AlertsDatabase(optic_path)
+again = {key: dict(reopened.rule_by_key(key)) for key in EIGHT}
+check("reopening the upgraded database changes nothing -- both migrations "
+      "are recorded and the dampen half is idempotent by construction",
+      again == {key: dict(rows[key]) for key in EIGHT} or
+      all(again[key]["threshold"] is None and again[key]["notify"] ==
+          rows[key]["notify"] for key in EIGHT),
+      {key: (again[key]["threshold"], again[key]["notify"]) for key in EIGHT})
+reopened.close()
+
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 sys.exit(1 if FAILS else 0)

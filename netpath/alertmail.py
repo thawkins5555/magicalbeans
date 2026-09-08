@@ -82,7 +82,7 @@ BUILTIN_TEMPLATES = {
             "{{entity_label}} crossed a threshold at {{last_time}}.\n\n"
             "Metric: {{metric_label}}\n"
             "Current value: {{value}}\n"
-            "Threshold: {{threshold}}\n\n"
+            "Threshold: {{threshold}}{{threshold_source}}\n\n"
             "{{message}}\n\n"
             "This alert has occurred {{count}} time(s). It will clear "
             "automatically once the value drops back below the clear threshold.\n\n"
@@ -219,6 +219,10 @@ def build_context(alert_row, rule_row, extra: dict | None = None) -> dict:
         "rule_name": rule_row["name"] if rule_row else "",
         "previous_uptime": "", "current_uptime": "",
         "metric_label": "", "value": "", "threshold": "",
+        # " (published by the optic)" for a rule judged against the port's
+        # own transceiver, empty otherwise, so one template says where the
+        # number came from without a second body.
+        "threshold_source": "",
         # Set by _evaluate_thresholds for a per-port breach; defaulted here
         # so a device-scoped email renders empty rather than the literal token.
         "if_index": "", "interface_name": "", "interface_alias": "",
@@ -276,6 +280,7 @@ def token_reference() -> list[dict]:
         {"token": "metric_label", "description": "The metric name (threshold rules only)"},
         {"token": "value", "description": "The metric's current value (threshold rules only)"},
         {"token": "threshold", "description": "The configured threshold (threshold rules only)"},
+        {"token": "threshold_source", "description": "Where that threshold came from — ' (published by the optic)' for the SFP power rules, empty otherwise"},
         {"token": "if_index", "description": "The port's ifIndex (per-port threshold and interface rules only)"},
         {"token": "interface_name", "description": "The port's ifDescr, e.g. 'GigabitEthernet1/0/7' (per-port rules only)"},
         {"token": "interface_alias", "description": "The port's description as configured on the device (per-port rules only)"},

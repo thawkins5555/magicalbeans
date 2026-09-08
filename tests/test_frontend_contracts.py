@@ -1402,6 +1402,31 @@ check("LOADING_TEXT = 'Loading…'" in _NETFLOW and "App.loading()" in _NETFLOW,
 
 
 print()
+# ---------------------------------------------------------------------------
+# 46. NODES/ALERTS (5.3.0): the optic power rules alert against the levels the
+#     PORT publishes, so the only place an operator can see what a port is
+#     judged by is the DOM table — and the only honest thing to say about a
+#     port that publishes nothing is that its optic power alerts are off.
+check(NODES.count('<th scope="col">Limits</th>') == 2
+      and NODES.count("${domLimitsCell(s)}") == 2,
+      "both DOM tables (the interface dialog's one-port read and the device "
+      "dialog's whole-device one) carry the published Limits column")
+check("domLimitsHint(" in NODES and "publishes no optical power" in NODES,
+      "a DOM table with a light-level row that has no published band says so "
+      "beneath itself — silence there reads as 'nothing is wrong with this port'")
+check("s.limits_source" in NODES,
+      "the Limits cell names the MIB that published the band, so an operator "
+      "can tell a learned limit from an invented one")
+_ALERTS46 = read("alerts.js")
+check("PUBLISHED_THRESHOLD_KEYS" in _ALERTS46
+      and "Threshold — from the optic" in _ALERTS46,
+      "the rule editor replaces the two threshold inputs with a sentence for "
+      "the eight optic power keys, rather than leaving a box the server "
+      "refuses — which is the silent-ignore this release exists to remove")
+check("if (!isPublished) {" in _ALERTS46,
+      "and the save handler does not read inputs it did not render")
+
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

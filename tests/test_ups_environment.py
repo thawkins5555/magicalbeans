@@ -338,12 +338,17 @@ def open_rows(alerts, rule_key, device_id):
 
 
 # rule key, metric key, label, unit, a value that breaches, a value that clears.
-# The three sfp_* rules are here on their ROOT key: with no per-port children
-# recorded they evaluate as a device target, which is what this section is
-# about (that each shipped rule opens and clears against its own metric).
-# tests/test_alert_per_port.py covers the per-port path they normally take,
-# and the two power rules are `comparison = 'below'`, so their "breaches" value
-# is under the threshold and their "clears" value is above the clear threshold.
+# sfp_temp_high is here on its ROOT key: with no per-port children recorded it
+# evaluates as a device target, which is what this section is about (that each
+# shipped rule opens and clears against its own metric).
+# tests/test_alert_per_port.py covers the per-port path it normally takes.
+#
+# The eight optic POWER rules are deliberately NOT here and cannot be: from
+# 5.3.0 their threshold is the one the port's own transceiver publishes
+# (alertrules.PUBLISHED_THRESHOLD_RULES), which is keyed by ifIndex, so a
+# device-level sfp_rx_dbm reading has no limit to be judged against and
+# raises nothing at all. tests/test_optic_published_thresholds.py is where
+# they are covered.
 CASES = [
     ("ups_on_battery", "ups_on_battery_s", "Seconds on battery", "s", 45.0, 0.0),
     ("ups_battery_low", "ups_battery_status", "Battery status", "", 3.0, 2.0),
@@ -353,8 +358,6 @@ CASES = [
     ("temp_chassis_high", "temp_chassis_c", "Chassis temperature", "°C", 90.0, 60.0),
     ("temp_optic_high", "temp_optic_c", "Optic temperature", "°C", 95.0, 60.0),
     ("humidity_high", "humidity_pct", "Humidity", "%RH", 90.0, 50.0),
-    ("sfp_rx_power_low", "sfp_rx_dbm", "Rx power", "dBm", -25.0, -19.0),
-    ("sfp_tx_power_low", "sfp_tx_dbm", "Tx power", "dBm", -15.0, -9.0),
     ("sfp_temp_high", "sfp_temp_c", "Optic temperature", "°C", 85.0, 50.0),
 ]
 

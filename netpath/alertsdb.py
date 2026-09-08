@@ -462,6 +462,31 @@ def validate_webhook_url(url: str) -> None:
             " a private (RFC1918) address")
 
 
+def _check_published_threshold(rule_key: str, threshold, clear_threshold) -> None:
+    """Raise ValueError if a number is being set on a rule whose threshold
+    the PORT publishes (alertrules.PUBLISHED_THRESHOLD_RULES).
+
+    Both writers — the rule editor and the per-device override — would
+    otherwise accept the number, validate it, store it, and then have the
+    engine ignore it for ever. The first operator to investigate a dark
+    port would type a figure, watch nothing happen and conclude the feature
+    is broken. Refusing out loud is the only honest answer.
+
+    Only the NUMBERS are refused. Turning a rule off for one switch
+    (enabled=False, both numbers None) is a statement about that switch and
+    stays allowed.
+    """
+    if rule_key not in alertrules.PUBLISHED_THRESHOLD_RULES:
+        return
+    if threshold is None and clear_threshold is None:
+        return
+    raise ValueError(
+        f"'{rule_key}' is judged against the limits each port's own optic "
+        "publishes, so a threshold set here would be ignored. Nothing to "
+        "set: a port alerts where its switch publishes limits and nowhere "
+        "else.")
+
+
 def _check_threshold_direction(rule, threshold, clear_threshold, *,
                                comparison: str | None = None,
                                allow_equal: bool = False) -> None:
@@ -513,9 +538,9 @@ _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "auto_resolve_after_s", "notify")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 47 built-in rules: 8 device_event + 3 interface_event + 23 threshold +
+# 55 built-in rules: 8 device_event + 3 interface_event + 29 threshold +
 # 3 trap + 1 syslog + 1 ipam + 2 wireless_event + 1 dhcp_threshold +
-# 3 netpath_threshold + 2 system. Each `template` name is a
+# 3 netpath_threshold + 4 system. Each `template` name is a
 # templates.key —
 # most non-primary rules reuse a generic template rather than a bespoke
 # one, since only 6 ship; an admin can point any rule at any template.
@@ -626,12 +651,37 @@ _BUILTIN_RULES = [
     # DOM keys nodepoll writes per interface (sfp_rx_dbm.<if>, etc.), so
     # each alerts on the port rather than the device.
     #
-    # -22 dBm is at or below the receive sensitivity of essentially every
-    # 1G/10G optic (commonly -20 to -23); clears at -20.
-    ("sfp_rx_power_low", "Optic receive power low", "threshold", "sfp_rx_dbm", 4, "threshold_breach", -22.0, -20.0, 2),
-    # -12 dBm is below the minimum launch power of common short/long-reach
-    # types (typically -9.5 to -3).
-    ("sfp_tx_power_low", "Optic transmit power low", "threshold", "sfp_tx_dbm", 4, "threshold_breach", -12.0, -10.0, 2),
+    # All eight ship with NO threshold at all, and that is the whole point
+    # of the 5.3.0 change. A light level that means "failing" is a property
+    # of the PART, not of the fleet: -22 dBm is comfortably inside a ZR
+    # part's working range and already dead for an SR one, so the single
+    # configurable number these two rules used to carry was wrong for most
+    # of the optics it judged. Each port is now judged against the levels
+    # its own transceiver publishes, learned by the poller into nodes.db's
+    # interface_thresholds and read through
+    # alertrules.PUBLISHED_THRESHOLD_RULES -- so a port whose switch
+    # publishes nothing raises no optical power alert at all, which is the
+    # honest answer and the one the operator chose over a global fallback.
+    #
+    # Four bands x two directions, because the transceiver publishes four:
+    # the warning half is "look at this", the alarm half is "this is
+    # failing now", and ROLLED_UP_BY pairs each warning under its alarm so
+    # a port past both is one alert rather than two saying the same thing
+    # at different volumes -- the temp_chassis_high/critical shape. Severity
+    # 2 is this scale's actual "critical" (alertrules.SEVERITY_NAMES[2]).
+    #
+    # sfp_rx_power_low and sfp_tx_power_low keep their key, name, severity,
+    # template and for_polls exactly as shipped, so an upgraded install's
+    # tuning of any of those survives; only their threshold columns are
+    # retired (see _clear_optic_power_thresholds).
+    ("sfp_rx_power_low", "Optic receive power low", "threshold", "sfp_rx_dbm", 4, "threshold_breach", None, None, 2),
+    ("sfp_rx_power_low_alarm", "Optic receive power critically low", "threshold", "sfp_rx_dbm", 2, "threshold_breach", None, None, 2),
+    ("sfp_rx_power_high", "Optic receive power high", "threshold", "sfp_rx_dbm", 4, "threshold_breach", None, None, 2),
+    ("sfp_rx_power_high_alarm", "Optic receive power critically high", "threshold", "sfp_rx_dbm", 2, "threshold_breach", None, None, 2),
+    ("sfp_tx_power_low", "Optic transmit power low", "threshold", "sfp_tx_dbm", 4, "threshold_breach", None, None, 2),
+    ("sfp_tx_power_low_alarm", "Optic transmit power critically low", "threshold", "sfp_tx_dbm", 2, "threshold_breach", None, None, 2),
+    ("sfp_tx_power_high", "Optic transmit power high", "threshold", "sfp_tx_dbm", 4, "threshold_breach", None, None, 2),
+    ("sfp_tx_power_high_alarm", "Optic transmit power critically high", "threshold", "sfp_tx_dbm", 2, "threshold_breach", None, None, 2),
     # Reads sfp_temp_c.<if>, distinct from temp_optic_high's device-wide
     # temp_optic_c. 70 C is inside SFF-8472's typical high-warning range.
     ("sfp_temp_high", "Optic temperature high (per port)", "threshold", "sfp_temp_c", 4, "threshold_breach", 70.0, 65.0, 2),
@@ -723,10 +773,15 @@ _BUILTIN_RULES = [
 ]
 
 # Kept apart from _BUILTIN_RULES, like _BUILTIN_FOR_SECONDS below. Absent
-# means 'above'. Only the two optic POWER rules are low-water.
+# means 'above'. Only the optic POWER rules are low-water, and only their
+# low halves: too much light is a real fault too (an optic looped back short,
+# or a ZR part into a short run), and the transceiver publishes a ceiling for
+# it, so the four high keys read the ordinary way round.
 _BUILTIN_COMPARISON = {
     "sfp_rx_power_low": "below",
+    "sfp_rx_power_low_alarm": "below",
     "sfp_tx_power_low": "below",
+    "sfp_tx_power_low_alarm": "below",
 }
 
 # Shipped for_seconds, kept apart from _BUILTIN_RULES rather than widening
@@ -849,6 +904,17 @@ def _builtin_rule_defaults() -> dict:
 # migration.
 _NEW_SIBLING_OF = {
     "temp_chassis_critical": "temp_chassis_high",
+    # 5.3.0's six new optic power rules, each beside the one shipped rule
+    # over its own metric. An operator who muted or turned off "Optic
+    # receive power low" because their fleet's optics sit near the old
+    # global -22 dBm must not be handed three brand new rules over the very
+    # same reading, emailing them, that they have never seen.
+    "sfp_rx_power_low_alarm": "sfp_rx_power_low",
+    "sfp_rx_power_high": "sfp_rx_power_low",
+    "sfp_rx_power_high_alarm": "sfp_rx_power_low",
+    "sfp_tx_power_low_alarm": "sfp_tx_power_low",
+    "sfp_tx_power_high": "sfp_tx_power_low",
+    "sfp_tx_power_high_alarm": "sfp_tx_power_low",
 }
 
 # Template text as shipped by previous releases, verbatim, for every built-in
@@ -901,6 +967,15 @@ _PREVIOUS_BUILTIN_TEMPLATES = {
                      "This alert has occurred {{count}} time(s). It will clear "
                      "automatically once the value drops back below the clear "
                      "threshold.\n\n-- SappiWhere, {{severity_name}}"),
+        },
+        {   # as shipped through 5.2.0, before {{threshold_source}} was added
+            "subject": "{{severity_tag}} SappiWhere: {{entity_label}} — {{metric_label}} is {{value}}",
+            "body": ("{{entity_label}} crossed a threshold at {{last_time}}.\n\n"
+                     "Metric: {{metric_label}}\nCurrent value: {{value}}\n"
+                     "Threshold: {{threshold}}\n\n{{message}}\n\n"
+                     "This alert has occurred {{count}} time(s). It will clear "
+                     "automatically once the value drops back below the clear "
+                     "threshold.\n\n-- SappiWhere"),
         },
     ],
     "event_notice": [
@@ -1000,6 +1075,24 @@ class AlertsDatabase(SqliteStore):
             ("retire_temp_high_1", self._retire_temp_high),
             ("dampen_new_builtin_siblings_1", self._dampen_new_builtin_siblings),
             ("per_port_threshold_alerts_1", self._resolve_device_if_alerts),
+            # A SECOND named entry for a method that already has one, and
+            # deliberately so: dampen_new_builtin_siblings_1 is recorded on
+            # every install upgraded since 4.54 and will never run again, so
+            # 5.3.0's six new optic power rules would arrive un-dampened —
+            # an operator who muted sfp_rx_power_low would get three new
+            # rules emailing them about the very same reading. The method is
+            # idempotent by construction (see its docstring), so running it
+            # again costs nothing on an install with nothing left to inherit.
+            #
+            # BEFORE the clear below, and the order is load-bearing: dampen
+            # decides "did the operator touch the sibling" by comparing the
+            # row against _builtin_rule_defaults(), which now reads NULL for
+            # these keys. Run first it sees the real -22.0 (or the operator's
+            # own retune) still on the row and reads it as touched; run after
+            # the clear it would read a carefully retuned rule as pristine
+            # and dampen nothing.
+            ("dampen_optic_power_siblings_1", self._dampen_new_builtin_siblings),
+            ("clear_optic_power_thresholds_1", self._clear_optic_power_thresholds),
         )
 
     def _run_named_migrations(self) -> None:
@@ -1228,6 +1321,36 @@ class AlertsDatabase(SqliteStore):
                      new_threshold, new_clear, new_row["id"]))
             self._conn.commit()
 
+    def _clear_optic_power_thresholds(self) -> None:
+        """Retire the stored threshold/clear_threshold of the two optic
+        POWER rules an earlier release shipped a global number on.
+
+        From 5.3.0 the engine judges those rules against the levels the
+        port's own transceiver publishes and never reads these columns again
+        (alertrules.PUBLISHED_THRESHOLD_RULES), so a number left here cannot
+        change what alerts — but it CAN sit on the Rules page reading as the
+        live threshold when it is not, which is the worse wrong. An operator
+        investigating a dark port would tune it, watch nothing happen, and
+        conclude the feature is broken.
+
+        Unconditional, unlike _retire_temp_high's "only if it still looks
+        exactly as shipped" test. That guard exists to leave an operator's
+        tuning alone; here their tuning is precisely what has stopped
+        meaning anything, and leaving it on display is not respect for it.
+        _dampen_new_builtin_siblings has already read those numbers by the
+        time this runs — see _named_migrations.
+
+        sfp_temp_high is NOT touched: only optical POWER moved to published
+        limits. Open alerts are left alone too; the next tick re-derives
+        them against the published limit or clears them.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE rules SET threshold = NULL, clear_threshold = NULL"
+                " WHERE is_builtin = 1 AND key IN"
+                " ('sfp_rx_power_low', 'sfp_tx_power_low')")
+            self._conn.commit()
+
     def _rekey_trap_syslog_alerts(self) -> None:
         """Bring open trap and syslog alerts onto the 4.37 dedup keys.
 
@@ -1445,6 +1568,15 @@ class AlertsDatabase(SqliteStore):
         allowed = {k: v for k, v in fields.items() if k in allowed_keys}
         if not allowed:
             return
+        # The same refusal set_device_threshold makes, on the other writer:
+        # a number typed into the rule editor for one of these keys would be
+        # stored and then ignored for ever. Only what this call is actually
+        # setting is checked — an edit that touches neither column (renaming
+        # the rule, turning it off) is none of this function's business.
+        if "threshold" in allowed or "clear_threshold" in allowed:
+            _check_published_threshold(
+                row["key"] or "", allowed.get("threshold"),
+                allowed.get("clear_threshold"))
         clauses = ", ".join(f"{key} = ?" for key in allowed)
         with self._lock:
             self._conn.execute(
@@ -1532,6 +1664,7 @@ class AlertsDatabase(SqliteStore):
         if rule is None or rule["kind"] != "threshold":
             raise ValueError(
                 f"'{rule_key}' does not name an existing threshold rule")
+        _check_published_threshold(rule_key, threshold, clear_threshold)
         _check_threshold_direction(rule, threshold, clear_threshold)
         now = time.time() if now is None else now
         with self._lock:

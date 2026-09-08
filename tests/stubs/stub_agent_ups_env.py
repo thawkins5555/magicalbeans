@@ -66,6 +66,13 @@ Modes:
              shapes real gear uses -- units/precision 1 (IOS) and
              milli/precision 0 (NX-OS) -- both decoding through the plain
              RFC 3433 arithmetic.
+  cisco_dom_thresholds
+             `cisco_dom` plus CISCO-ENTITY-SENSOR-MIB's
+             entSensorThresholdTable -- the levels each transceiver
+             publishes about itself, each quoted in ITS OWN entity's scale
+             and precision, plus a partly-published band, two rows naming
+             no band at all, a duplicated level and a chassis probe mapped
+             to no port. See CISCO_DOM_THRESHOLD_TABLE.
   sfp_media  Seven ports covering every media verdict and the dark optic: a
              working optic, an occupied cage with no DOM, an empty cage, a
              copper port an agent models as container+port too (which must
@@ -310,6 +317,83 @@ CISCO_DOM_TABLE = {
     "1.3.6.1.4.1.9.9.91.1.1.1.1.5.2000": ("int", 1),
 }
 
+# --------------------------------- entSensorThresholdTable (CISCO, 5.3.0)
+# The levels a transceiver publishes about itself, indexed
+# <entPhysicalIndex>.<threshold index>. Its own dict, merged only into the
+# `cisco_dom_thresholds` mode, so `cisco_dom` stays byte-identical for the
+# suites that assert request counts against it.
+#
+# The whole point of this fixture is that each entity quotes its thresholds
+# in ITS OWN scale and precision -- the same two that CISCO_DOM_TABLE gives
+# its reading:
+#
+#   1013 Tx, scale units(9)/precision 1: -82 -> -8.2 dBm
+#   1014 Rx, scale milli(8)/precision 0: -14400 -> -14.4 dBm
+#
+# A threshold decoded against the wrong entity's scale is out by a factor of
+# a thousand and still looks like a plausible dBm figure, so only a fixture
+# with two different scales can catch it.
+#
+# Deliberately also here: 1010 publishes ONE level (partial publication);
+# 1011 publishes an equalTo(5) relation and an other(1) severity, both of
+# which name no band and must be dropped; 1012 quotes low_warn twice, and
+# the tighter (earlier-alerting) one must win; 2000, the chassis inlet, is
+# mapped to no port and must produce no row at all.
+CISCO_DOM_THRESHOLD_TABLE = {
+    # --- 1010 optic temperature: a major/greaterOrEqual level and nothing else
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.2.1010.1": ("int", 20),      # major
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.3.1010.1": ("int", 4),       # greaterOrEqual
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.4.1010.1": ("int", 75),      # 75 C
+
+    # --- 1011 supply voltage: an equalTo relation and an other severity
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.2.1011.1": ("int", 10),      # minor
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.3.1011.1": ("int", 5),       # equalTo
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.4.1011.1": ("int", 3000),
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.2.1011.2": ("int", 1),       # other
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.3.1011.2": ("int", 1),       # lessThan
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.4.1011.2": ("int", 2900),
+
+    # --- 1012 bias current: low_warn quoted twice, tighter must win
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.2.1012.1": ("int", 10),      # minor
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.3.1012.1": ("int", 1),       # lessThan
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.4.1012.1": ("int", 20),      # 0.002 A
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.2.1012.2": ("int", 10),      # minor
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.3.1012.2": ("int", 1),       # lessThan
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.4.1012.2": ("int", 30),      # 0.003 A
+
+    # --- 1013 Tx power, scale units(9) / precision 1
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.2.1013.1": ("int", 30),      # critical
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.3.1013.1": ("int", 1),       # lessThan
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.4.1013.1": ("int", -82),     # -8.2 dBm
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.2.1013.2": ("int", 10),      # minor
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.3.1013.2": ("int", 1),       # lessThan
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.4.1013.2": ("int", -73),     # -7.3 dBm
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.2.1013.3": ("int", 10),      # minor
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.3.1013.3": ("int", 3),       # greaterThan
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.4.1013.3": ("int", 15),      # 1.5 dBm
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.2.1013.4": ("int", 30),      # critical
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.3.1013.4": ("int", 3),       # greaterThan
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.4.1013.4": ("int", 20),      # 2.0 dBm
+
+    # --- 1014 Rx power, scale milli(8) / precision 0
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.2.1014.1": ("int", 30),      # critical
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.3.1014.1": ("int", 1),       # lessThan
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.4.1014.1": ("int", -14400),  # -14.4 dBm
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.2.1014.2": ("int", 10),      # minor
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.3.1014.2": ("int", 1),       # lessThan
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.4.1014.2": ("int", -11400),  # -11.4 dBm
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.2.1014.3": ("int", 10),      # minor
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.3.1014.3": ("int", 3),       # greaterThan
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.4.1014.3": ("int", 500),     # 0.5 dBm
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.2.1014.4": ("int", 30),      # critical
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.3.1014.4": ("int", 3),       # greaterThan
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.4.1014.4": ("int", 1000),    # 1.0 dBm
+
+    # --- 2000 the chassis inlet: mapped to no port, so no row may result
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.2.2000.1": ("int", 20),
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.3.2000.1": ("int", 3),
+    "1.3.6.1.4.1.9.9.91.1.2.1.1.4.2000.1": ("int", 55),
+}
 # ------------------------------------------- SFP media and the dark optic
 # Seven ports, one row of ENTITY-MIB reality each. Ports 1/5/6/7 carry
 # standard ENTITY-SENSOR-MIB optical-power rows (dBm(14), scale units(9),
@@ -458,6 +542,9 @@ def table_for():
         return {**CISCO_SCALARS, **HARDWARE_TABLE, **CISCO_ENVMON_TABLE}
     if MODE == "cisco_dom":
         return {**CISCO_SCALARS, **CISCO_DOM_TABLE}
+    if MODE == "cisco_dom_thresholds":
+        return {**CISCO_SCALARS, **CISCO_DOM_TABLE,
+                **CISCO_DOM_THRESHOLD_TABLE}
     if MODE in ("sfp_media", "sfp_media_no_class"):
         return {**GENERIC_SCALARS, **SFP_MEDIA_TABLE}
     return dict(GENERIC_SCALARS)
