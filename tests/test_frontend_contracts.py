@@ -798,12 +798,32 @@ check("currentRoute" in APP[APP.index("  const api = {"):],
 # 29b. master() has refused to overlap a page's refresh() with itself since
 #      4.49, but it only set the flag on the refreshes it started itself —
 #      a route or tab refresh goes through refreshNow() and was invisible
-#      to that guard.
+#      to that guard. Since 5.3.0 both go through one runner, so the flag,
+#      the busy line and the connected() bookkeeping cannot drift apart.
+_MASTER = APP[APP.index("  async function master()"):
+              APP.index("  function restartTimer()")]
+_RUN_REFRESH = APP[APP.index("  function runRefresh(name, page)"):
+                   APP.index("  /* Called when a page needs its data now")]
 _REFRESH_NOW = APP[APP.index("  function refreshNow(name)"):
                    APP.index("  async function start()")]
-check("page.refreshing = true" in _REFRESH_NOW and "page.refreshing = false" in _REFRESH_NOW,
-      "refreshNow() marks the page as refreshing for the whole call, so master()'s "
-      "own overlap guard covers a route or tab refresh too")
+check("page.refreshing = true" in _RUN_REFRESH and "page.refreshing = false" in _RUN_REFRESH,
+      "the refresh runner marks the page as refreshing for the whole call, so "
+      "master()'s own overlap guard covers a route or tab refresh too")
+check("runRefresh(" in _REFRESH_NOW and "await runRefresh(" in _MASTER,
+      "...and both the poll tick and a direct request go through that one "
+      "runner rather than each keeping its own copy of it")
+check("section.setAttribute('aria-busy', 'true')" in _RUN_REFRESH,
+      "a direct refresh raises the busy line too, not only the poll tick — "
+      "every NetFlow window change goes through refreshNow(), which showed "
+      "nothing at all while it worked")
+_SETTLED = _RUN_REFRESH[_RUN_REFRESH.index("}).then((value) => {"):]
+check("section.removeAttribute('aria-busy')" in _SETTLED
+      and "page.refreshing = false" in _SETTLED,
+      "...and clears it where it clears `refreshing`, after the rejection "
+      "handler, so a failed refresh cannot leave the page stuck busy")
+check("page.trailing" in _REFRESH_NOW,
+      "a request arriving while one is in flight queues a single trailing "
+      "refresh, so N window changes are not N concurrent refresh() calls")
 
 # 29c. A canvas with no frame yet (an empty map, or a pointer reaching the
 #      SVG before the first paint) has no scene coordinates at all; reading

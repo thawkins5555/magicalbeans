@@ -5024,25 +5024,7 @@ const App = (() => {
     // — still lets the next attempt through rather than jamming the tab.
     if (page.refreshing) return;
     if (now - (page.lastFetch || 0) < rateFor(state.tab)) return;
-    page.lastFetch = now;
-    page.refreshing = true;
-    try {
-      // The page in view says a refresh is in flight (app.css draws a line
-      // after 400 ms, so the ordinary two-second poll never flickers).
-      const section = document.getElementById(`page-${state.tab}`);
-      if (section) section.setAttribute('aria-busy', 'true');
-      try {
-        await page.refresh();
-      } finally {
-        if (section) section.removeAttribute('aria-busy');
-      }
-      connected(true);
-    } catch (error) {
-      if (error && error.superseded) return;
-      connected(false, String(error.message || error));
-    } finally {
-      page.refreshing = false;
-    }
+    await runRefresh(state.tab, page);
   }
 
   function restartTimer() {
@@ -5079,33 +5061,71 @@ const App = (() => {
     refreshNow(state.tab);
   }
 
-  /* Called when a page needs its data now rather than at its next slot. */
-  function refreshNow(name) {
-    const page = pages[name || state.tab];
-    if (!page || !page.refresh) return Promise.resolve();
+  /* One runner behind both the poll tick and a direct request, so the two
+     cannot drift apart on the three things they each have to get right:
+     `refreshing` marks the page busy (master() only set it on refreshes IT
+     started, so a route or tab refresh could race the next tick — two
+     overlapping map loads, the slower one painting over the newer); the page
+     in view says a fetch is in flight (app.css draws a line after 400 ms, so
+     the ordinary two-second poll never flickers); and both are cleared
+     however the refresh ends, so a failure cannot leave a tab jammed or
+     stuck showing the busy line. A direct refresh had neither the line nor
+     its own overlap guard, which is every window change on the NetFlow page:
+     it genuinely showed nothing at all while it worked.
+
+     Never rejects: selectTab and the visibility handler call this without
+     awaiting it, so a refresh that failed during an outage used to surface
+     as an unhandled rejection in the console rather than as the offline
+     banner. The promise still resolves for callers that do await it. */
+  function runRefresh(name, page) {
     page.lastFetch = Date.now();
-    // master() only sets this flag on refreshes IT started, so a route/tab
-    // refresh (this function) could race the next poll tick for the same
-    // page — two overlapping map loads, the slower one painting over the newer.
     page.refreshing = true;
+    const section = document.getElementById(`page-${name}`);
+    if (section) section.setAttribute('aria-busy', 'true');
     let started;
     try {
       started = Promise.resolve(page.refresh());
     } catch (error) {
       started = Promise.reject(error);
     }
-    // selectTab and the visibility handler call this without awaiting it, so
-    // a refresh that fails during an outage used to surface as an unhandled
-    // rejection in the console rather than as the offline banner. The
-    // promise still resolves for callers that do await it (the UI walk).
-    return started.then(
+    const done = started.then(
       (value) => { connected(true); return value; },
       (error) => {
         if (!(error && error.superseded)) {
           connected(false, String((error && error.message) || error));
         }
         return undefined;
-      }).then((value) => { page.refreshing = false; return value; });
+      }).then((value) => {
+        if (section) section.removeAttribute('aria-busy');
+        page.refreshing = false;
+        return value;
+      });
+    page.running = done;
+    return done;
+  }
+
+  /* Called when a page needs its data now rather than at its next slot. */
+  function refreshNow(name) {
+    const tab = name || state.tab;
+    const page = pages[tab];
+    if (!page || !page.refresh) return Promise.resolve();
+    /* Something is already fetching for this page. The newest request still
+       has to be answered — it is the window or the filter an operator just
+       chose — but not by a second refresh() racing the first: N window
+       changes meant N concurrent fetch pairs queued on one database, and the
+       answer wanted arrived behind all the ones that were not. One trailing
+       run answers every call that arrives while a refresh is in flight, and
+       they all await it. */
+    if (page.refreshing || page.trailing) {
+      if (!page.trailing) {
+        page.trailing = Promise.resolve(page.running).then(() => {
+          page.trailing = null;
+          return runRefresh(tab, page);
+        });
+      }
+      return page.trailing;
+    }
+    return runRefresh(tab, page);
   }
 
   async function start() {
