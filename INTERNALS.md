@@ -4461,10 +4461,15 @@ exists for.
 **Retention.** `prune()` is built on `SqliteStore._delete_batches`, the
 same shape `db.prune()` uses: age, then row cap, then each rollup tier,
 sharing one deadline, each stage chunked so the write lock is released
-between batches. Ids only chunk the sweep — every batch still filters on
-`ts_end`, so an exporter with a wrong clock cannot make it drop the wrong
-rows — and the row-cap stage derives its cut from `MIN(id)`/`MAX(id)`
-probes rather than the `COUNT(*)` full scan it used to run on every pass.
+between batches. The age stage deletes off `ix_flows_ts`, oldest first,
+with the helper's coordinate counting rows removed rather than ids
+walked: bounding it by `MIN(id)`/`MAX(id)` over the aged rows meant one
+flow arriving now from an exporter whose clock was years out put the top
+of the range at the newest id in the table, and every sweep chunk-walked
+all of it — correctly filtered, but O(table) every fifteen minutes. The
+row-cap stage does chunk by id, which is arrival order, and derives its
+cut from `MIN(id)`/`MAX(id)` probes rather than the `COUNT(*)` full scan
+it used to run on every pass.
 The rollup stage walks bucket timestamps instead of ids (the helper only
 needs a monotonic coordinate) and raises the tier's floor as it goes, so
 routing stops trusting history that is no longer there.

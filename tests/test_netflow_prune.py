@@ -280,6 +280,72 @@ def test_6_the_size_cap_takes_raw_first() -> None:
     db.close()
 
 
+# ------------------------------------------------------------------------- 7
+
+def vm_steps(db: FlowDatabase, call) -> tuple[object, int]:
+    """SQLite VM steps one call costs. What changed here is the plan, and a
+    stopwatch is a flaky way of asserting one."""
+    counted = [0]
+
+    def tick():
+        counted[0] += 1
+        return 0
+
+    db._conn.set_progress_handler(tick, 1000)
+    try:
+        return call(), counted[0]
+    finally:
+        db._conn.set_progress_handler(None, 0)
+
+
+def aged_store(name: str, now: float, skewed: bool) -> FlowDatabase:
+    """31 days of flows -- so a 30-day retention ages out about a
+    thirtieth of them -- optionally with one row arriving now from an
+    exporter whose clock is 400 days out."""
+    db = store(name)
+    db.insert_flows([flow(i, now - 31 * 86400 + i * (31 * 86400 / 40_000))
+                     for i in range(40_000)])
+    if skewed:
+        db.insert_flows([flow(1, now - 400 * 86400)])
+    return db
+
+
+def test_7_a_wrong_clock_does_not_widen_the_sweep() -> None:
+    print("7: one exporter's ancient clock does not make the sweep walk the "
+          "whole table")
+    now = time.time()
+    reclaim_budget = flowdb.PRUNE_RECLAIM_BUDGET_S
+    # The reclaim pass is time-budgeted and would swamp the measurement.
+    flowdb.PRUNE_RECLAIM_BUDGET_S = 0.0
+    try:
+        plain = aged_store("skew_none.db", now, skewed=False)
+        _r, plain_steps = vm_steps(
+            plain, lambda: plain.prune(30, 0, minute_days=90, rollup_days=90,
+                                       budget_s=60.0))
+        skewed = aged_store("skew_one.db", now, skewed=True)
+        removed, skewed_steps = vm_steps(
+            skewed, lambda: skewed.prune(30, 0, minute_days=90, rollup_days=90,
+                                         budget_s=60.0))
+    finally:
+        flowdb.PRUNE_RECLAIM_BUDGET_S = reclaim_budget
+
+    left = skewed._conn.execute(
+        "SELECT COUNT(*) AS n FROM flows WHERE ts_end < ?",
+        (now - 30 * 86400,)).fetchone()["n"]
+    check(left == 0 and removed > 1000,
+          f"the skewed row and every other aged row are gone ({removed} "
+          f"removed, {left} past the cutoff)")
+    check(not skewed.last_prune_incomplete,
+          "and the sweep finished rather than warning that it ran out of "
+          "budget")
+    check(skewed_steps <= plain_steps * 2,
+          f"the sweep costs what it deletes, not the size of the id span the "
+          f"one bad row spreads it across ({skewed_steps * 1000} VM steps "
+          f"against {plain_steps * 1000} without it)")
+    plain.close()
+    skewed.close()
+
+
 TESTS = [
     test_1_age_and_row_cap,
     test_2_rollups_outlive_the_raw_flows,
@@ -287,6 +353,7 @@ TESTS = [
     test_4_no_batch_holds_the_lock,
     test_5_delete_everything_clears_the_charts,
     test_6_the_size_cap_takes_raw_first,
+    test_7_a_wrong_clock_does_not_widen_the_sweep,
 ]
 
 

@@ -689,9 +689,9 @@ class FlowDatabase(SqliteStore):
         Batched in adaptive, lock-bounded chunks rather than one DELETE per
         stage: the write lock is the one the collector's writer needs, and
         NetFlow is UDP, so a writer stalled behind a month-wide delete is
-        lost data. The id range only chunks the sweep — each batch still
-        filters on ts_end, so an exporter with a wrong clock cannot make
-        prune() drop the wrong rows.
+        lost data. Every batch of the age stage filters on ts_end, so an
+        exporter with a wrong clock cannot make prune() drop the wrong rows;
+        the row-cap stage chunks by id, which is arrival order.
 
         `retention_days` and `max_flows` bound the raw table alone. Passing
         0 for each of the four (the Settings page's maintenance button)
@@ -703,23 +703,33 @@ class FlowDatabase(SqliteStore):
         removed = 0
         incomplete = False
 
+        # Counted, not bounded by MIN(id)/MAX(id) over the aged rows: one
+        # flow arriving now from an exporter whose clock is years out takes
+        # the newest id, which put MAX(id) at the end of the table and had
+        # every sweep chunk-walk all five million rows of it — correctly
+        # filtered, but O(table) every fifteen minutes, and slow enough to
+        # trip the incomplete warning below. The count is the same
+        # covering-index scan of ix_flows_ts the bounds query was.
         with self._lock:
-            bounds = self._conn.execute(
-                "SELECT MIN(id) AS lo, MAX(id) AS hi FROM flows"
-                " WHERE ts_end < ?", (cutoff,)).fetchone()
-        low, high = bounds["lo"], bounds["hi"]
-        if low is not None:
+            aged = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM flows WHERE ts_end < ?",
+                (cutoff,)).fetchone()["n"]
+        if aged:
             def by_age(lo: int, up: int) -> int:
+                # Driven off ix_flows_ts, oldest first: the coordinate
+                # _delete_batches walks is how many rows have gone, so the
+                # sweep costs what it deletes and nothing for what it keeps.
                 cursor = self._conn.execute(
-                    "DELETE FROM flows WHERE id >= ? AND id < ? AND ts_end < ?",
-                    (lo, up, cutoff))
+                    "DELETE FROM flows WHERE id IN (SELECT id FROM flows"
+                    " WHERE ts_end < ? ORDER BY ts_end LIMIT ?)",
+                    (cutoff, up - lo))
                 return cursor.rowcount or 0
 
-            aged, reached = self._delete_batches(
-                low, high + 1, deadline, by_age, chunk=TRIM_CHUNK,
+            gone, reached = self._delete_batches(
+                0, aged, deadline, by_age, chunk=TRIM_CHUNK,
                 chunk_min=TRIM_CHUNK_MIN, chunk_max=TRIM_CHUNK_MAX)
-            removed += aged
-            incomplete = incomplete or reached < high + 1
+            removed += gone
+            incomplete = incomplete or reached < aged
 
         if max_flows:
             # Two index probes rather than the COUNT(*) full scan this used
