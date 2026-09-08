@@ -305,13 +305,21 @@ retention has done everything it can. Per capped store it raises the
 occurrence's severity at 95% (`DB_CAP_HIGH_SHARE`) and clears below 80%
 (`DB_CAP_CLEAR_SHARE`) — a clear band under the raise band because trimming
 holds a busy store just under its cap for ever, and one threshold would
-open and close the alert on alternate sweeps. The store name is the
+open and close the alert on alternate sweeps. Inside that band an alert
+already open is re-raised rather than left alone: the rule's
+`auto_resolve_after_s` is measured from `last_ts` and only a raise moves it,
+so the backstop would close a store trimmed into the band half an hour later
+and the effective clear would be 85%, not 80%. The store name is the
 `entity_id`, so each database has an alert of its own rather than one that
 flaps between them. `disk_space(service)` then reports the volume the
 application file sits on through `shutil.disk_usage`, and `disk_space_low`
 covers what no cap can: a full volume stops every database writing at once.
 Its two thresholds are `disk_free_warn_pct` and `disk_free_critical_pct` in
-`appdb.DEFAULTS`, editable on Settings → Data & retention. Both go through
+`appdb.DEFAULTS`, editable on Settings → Data & retention, and refused
+unless the critical one is below the warning one. It has the databases'
+band as well: raised below the warning threshold, cleared only
+`DISK_FREE_CLEAR_MARGIN_PCT` above it, so a WAL growing between prunes and
+shrinking after them cannot flap the alert every sweep. Both go through
 `AlertEngine.system_occurrence` / `clear_system_occurrence` reached with
 `getattr`, the convention `nodepoll._note_saturation` already uses, so a
 `Service` built without an engine still runs the sweep.
