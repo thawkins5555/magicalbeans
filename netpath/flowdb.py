@@ -745,7 +745,7 @@ class FlowDatabase(SqliteStore):
                 rows = self._conn.execute(
                     "SELECT key AS ip, SUM(bytes) AS bytes FROM flow_rollup"
                     " WHERE tier = 60 AND dim IN (?,?) AND bucket >= ?"
-                    " AND bucket < ? AND ip != ''"
+                    " AND bucket < ? AND key != ''"
                     " GROUP BY ip ORDER BY bytes DESC LIMIT ?",
                     (DIMENSION_IDS["Source"], DIMENSION_IDS["Destination"],
                      _align_down(cutoff, 60), watermark, limit)).fetchall()
