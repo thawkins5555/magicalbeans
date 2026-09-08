@@ -1349,15 +1349,31 @@ check("scan_bounded" in _NETFLOW,
 
 
 # 44. NetFlow (5.3.0): switching windows was slow in the browser, not on the
-#     server — the two queries ran one after the other for no reason.
+#     server — the two queries ran one after the other for no reason, and
+#     nothing cancelled the window that had just been left.
+_GET = APP[APP.index("  const get = (path, params"):APP.index("  const post = (path")]
+check("call(path + query, options)" in _GET,
+      "App.get passes a caller's own options through to call(), which is the "
+      "only way to cancel a request whose URL has changed — call()'s in-flight "
+      "map is keyed on the full URL and so only helps a page polling one address")
+check("options.signal && options.signal.aborted" in APP,
+      "a caller's own abort is flagged superseded like call()'s own, so "
+      "abandoning a window is silent rather than an outage banner")
 _NF_REFRESH = _NETFLOW[_NETFLOW.index("  async function refresh() {"):
                        _NETFLOW.index("  function init() {")]
 check("Promise.all" in _NF_REFRESH and "await App.get(" not in _NF_REFRESH,
       "the overview and the record list are asked for together: they are "
       "independent, and in series every window change cost the sum of both "
       "round trips rather than the slower of them")
+check("new AbortController()" in _NF_REFRESH and "signal: abort.signal" in _NF_REFRESH,
+      "...under one signal for the whole generation, so a superseded window "
+      "stops holding the flow database instead of only being discarded once "
+      "it finally answers")
 check("if (token !== view.request) return;" in _NF_REFRESH,
       "...with the repaint guard still checked after both")
+check("view.abort.abort()" in _NETFLOW[_NETFLOW.index("  function dropInFlight() {"):],
+      "and a change of view aborts what is already in flight rather than "
+      "waiting for it to answer something nobody will read")
 
 
 print()

@@ -55,6 +55,7 @@
     drag: null,
     windowTimer: null,
     request: 0,
+    abort: null,
   };
 
   const escape = App.escapeHtml;
@@ -85,6 +86,18 @@
       `${App.stamp(view.t0, span)} – ${App.stamp(view.t1, span)}`;
   }
 
+  /* The window an operator has just left is not worth finishing. Its two
+     queries hold the same flow-database lock the collector writes flows
+     through, and the token check in refresh() only hides a stale answer in
+     the browser — the server had already computed it. The token is bumped
+     here as well as aborted, for the pair that answered a moment before. */
+  function dropInFlight() {
+    view.request += 1;
+    if (view.abort) { view.abort.abort(); view.abort = null; }
+    if (view.windowTimer) clearTimeout(view.windowTimer);
+    view.windowTimer = null;
+  }
+
   /* `defer` collapses a burst of window changes into one fetch. The wheel
      fires several events per zoom gesture, and each one used to launch a full
      overview + records pair over an ever wider window, so zooming out queued
@@ -98,8 +111,7 @@
       App.el('nf-follow').checked = follow;
     }
     showWindow();
-    if (view.windowTimer) clearTimeout(view.windowTimer);
-    view.windowTimer = null;
+    dropInFlight();
     if (!defer) {
       // A window change is a direct request, so fetch now rather than waiting
       // out the refresh interval.
@@ -844,17 +856,25 @@
     // A wide window answers slower than the narrow one that replaced it, so
     // without this guard a stale response repaints over the newer view.
     const token = (view.request += 1);
+    // One controller for the whole generation, so the pair can be abandoned
+    // together: call()'s own in-flight map is keyed on the full URL, and a
+    // window that has changed is by definition a different URL, so it only
+    // ever helps a page polling the same address.
+    if (view.abort) view.abort.abort();
+    const abort = new AbortController();
+    view.abort = abort;
+    const options = { signal: abort.signal };
     // Independent questions, so asked together: in series every window
     // change cost the sum of the two round trips, in parallel the slower.
     const [data, records] = await Promise.all([
       App.get('/api/netflow/overview', {
         t0: view.t0, t1: view.t1, dimension: f.dimension, src: f.src, dst: f.dst,
         port: f.port, protocol: f.protocol, exporter: f.exporter,
-      }),
+      }, options),
       App.get('/api/netflow/records', {
         t0: view.t0, t1: view.t1, src: f.src, dst: f.dst, port: f.port,
         protocol: f.protocol, exporter: f.exporter, order: App.el('nf-order').value,
-      }),
+      }, options),
     ]);
     if (token !== view.request) return;
     view.data = data;

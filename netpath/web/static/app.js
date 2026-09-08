@@ -592,11 +592,15 @@ const App = (() => {
         throw new Error(`No answer within ${Math.round(
           (options.timeoutMs || REQUEST_TIMEOUT_MS) / 1000)} seconds`);
       }
-      // We cancelled this one ourselves because a newer request for the
-      // same URL started. That is not an outage and must never be reported
-      // as one, so it is flagged and swallowed by the refresh plumbing.
-      if (error && error.name === 'AbortError' && controller
-          && controller.signal.aborted) {
+      // We cancelled this one ourselves — either because a newer request for
+      // the same URL started, or because the caller's own signal fired (a
+      // NetFlow window change abandoning the window before it, whose URL
+      // differs and so never matches the map above). Neither is an outage,
+      // and neither must ever be reported as one, so it is flagged and
+      // swallowed by the refresh plumbing.
+      if (error && error.name === 'AbortError'
+          && ((controller && controller.signal.aborted)
+              || (options.signal && options.signal.aborted))) {
         const superseded = new Error('Superseded by a newer request');
         superseded.superseded = true;
         throw superseded;
@@ -623,12 +627,17 @@ const App = (() => {
     return payload;
   }
 
-  const get = (path, params) => {
+  /* `options` reaches call() untouched, which is how a caller cancels its own
+     GETs: call's in-flight map is keyed on the full URL, so it can only ever
+     abort a page polling the SAME address, and a query whose window just
+     changed is a different key. A caller that owns a generation of requests
+     passes one signal for the whole generation instead. */
+  const get = (path, params, options) => {
     const query = params
       ? '?' + new URLSearchParams(
           Object.entries(params).filter(([, v]) => v !== null && v !== undefined && v !== ''))
       : '';
-    return call(path + query);
+    return call(path + query, options);
   };
   const post = (path, body) => call(path, { method: 'POST', body });
   const put = (path, body) => call(path, { method: 'PUT', body });
