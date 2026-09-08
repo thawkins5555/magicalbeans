@@ -239,12 +239,54 @@ def test_5_delete_everything_clears_the_charts() -> None:
     db.close()
 
 
+# ------------------------------------------------------------------------- 6
+
+def test_6_the_size_cap_takes_raw_first() -> None:
+    print("6: the file size cap empties the raw table before the summaries")
+    db = store("trim.db")
+    now = time.time()
+    start = flowdb._align_down(now - 6 * 3600, 3600)
+    db.insert_flows([flow(i, start + i * 0.5) for i in range(40_000)])
+    for tier in flowdb.ROLLUP_TIERS:
+        db.compact_rollup(tier, max_buckets=10_000, budget_s=120)
+        while True:
+            written, done = db.backfill_rollup(tier, max_buckets=10_000,
+                                               budget_s=120)
+            if done or not written:
+                break
+    before = db.size_bytes()
+    raw_before, _rollup_before, spans_before = counts(db)
+
+    # A cap the raw table alone cannot meet: without the second stage the
+    # base implementation would stop at TRIM_FLOOR and warn about the cap
+    # for ever while the rollups held the space.
+    db.trim_to_size(int(before * 0.1), budget_s=60.0)
+    raw_after, _rollup_after, spans_after = counts(db)
+    check(raw_after < raw_before and raw_after <= db.TRIM_FLOOR,
+          f"stage one took the raw flows down to their floor "
+          f"({raw_before} -> {raw_after})")
+    check(spans_after < spans_before,
+          f"stage two then gave up the oldest rollup buckets "
+          f"({spans_before} -> {spans_after})")
+    check(db.size_bytes() < before,
+          f"and the file shrank ({before // 1024} KiB -> "
+          f"{db.size_bytes() // 1024} KiB)")
+    # The minute tier gives first: it is the one holding the space, and the
+    # hourly tier is what a wide chart has left to read.
+    floor, _watermark = db.rollup_bounds(60)
+    check(floor is not None and floor > start,
+          "the minute floor moved up with the buckets that went, so routing "
+          "stops claiming history the trim deleted")
+    db.close()
+
+
 TESTS = [
     test_1_age_and_row_cap,
     test_2_rollups_outlive_the_raw_flows,
     test_3_a_budget_bounded_sweep_resumes,
     test_4_no_batch_holds_the_lock,
     test_5_delete_everything_clears_the_charts,
+    test_6_the_size_cap_takes_raw_first,
 ]
 
 

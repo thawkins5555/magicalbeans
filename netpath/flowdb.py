@@ -255,8 +255,9 @@ class FlowDatabase(SqliteStore):
                      " UNION ALL SELECT MIN(bucket) FROM flow_rollup"
                      " UNION ALL SELECT MIN(bucket) FROM flow_rollup_span)")
     TRIM_FLOOR = 1000
-    # How far the rollups may be trimmed before the wide charts they are the
-    # only source for have nothing left to draw.
+    # Rollup rows a tier keeps whatever the size cap says: below this the wide
+    # charts it is the only source for have nothing left to draw, and the raw
+    # rows they would fall back to are long gone.
     TRIM_ROLLUP_FLOOR = 5_000
 
     def __init__(self, path: str):
@@ -707,10 +708,12 @@ class FlowDatabase(SqliteStore):
                 break
             with self._lock:
                 bounds = self._conn.execute(
-                    "SELECT MIN(bucket) AS lo, MAX(bucket) AS hi,"
-                    " COUNT(*) AS n FROM flow_rollup_span WHERE tier = ?",
-                    (tier,)).fetchone()
-            if bounds["lo"] is None or bounds["n"] <= self.TRIM_ROLLUP_FLOOR:
+                    "SELECT MIN(bucket) AS lo, MAX(bucket) AS hi"
+                    " FROM flow_rollup_span WHERE tier = ?", (tier,)).fetchone()
+                held = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM flow_rollup WHERE tier = ?",
+                    (tier,)).fetchone()["n"]
+            if bounds["lo"] is None or held <= self.TRIM_ROLLUP_FLOOR:
                 continue
             size = self._trim_size()
             span = bounds["hi"] - bounds["lo"] + tier
