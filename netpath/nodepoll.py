@@ -879,6 +879,12 @@ class _VendorIdJob:
             poller._bump("identifications")
 
 
+class DiscoveryBusy(RuntimeError):
+    """A sweep of this target is already on the wire. Raised by
+    start_discovery(refuse_if_target_running=True) rather than answered as a
+    return value, so a caller cannot mistake a refusal for a job id."""
+
+
 class NodePoller(Worker):
     STOPPED_TEXT = "Poller stopped"
     THREAD_NAME = "node-poller"
@@ -914,6 +920,11 @@ class NodePoller(Worker):
         self._vlan_running: set[int] = set()
         self._engines = EngineCache()
         self._discovery_jobs: dict[int, DiscoveryJob] = {}
+        # Held across a whole discovery start — the "is one already running"
+        # question, the job row, and the thread — so two HTTP threads asking
+        # it at once cannot both be told no one is scanning this target.
+        # Reentrant because the answer is also read on its own below.
+        self._discovery_lock = threading.RLock()
         # device_id -> the whole-device OID walk running or last finished for
         # it. In memory and one-at-a-time per device, the same shape as
         # _discovery_jobs above: a walk result is transient, downloaded once
@@ -1207,21 +1218,42 @@ class NodePoller(Worker):
                         overrides: dict | None = None,
                         allow_ping_only: bool = False,
                         group_id: int | None = None,
-                        scan_overrides: dict | None = None) -> int:
+                        scan_overrides: dict | None = None,
+                        refuse_if_target_running: bool = False) -> int:
         """`overrides` is what THIS run's settings are built from; `group_id`
         and `scan_overrides` are what the row keeps so Re-discover can build
-        the same settings again from the profile as it stands then."""
+        the same settings again from the profile as it stands then.
+
+        `refuse_if_target_running` raises DiscoveryBusy instead of putting a
+        second sweep of one target on the wire. The check is here, under the
+        lock the start holds, and not in the caller: asked first and acted on
+        afterwards it is two steps with a window between them, and the web
+        server is threaded, so a double-click on Re-discover fits two
+        requests through it.
+        """
         settings = dict(self.db.settings())
         if overrides:
             settings.update(overrides)
-        job_id = self.db.add_discovery_job(kind, target,
-                                           allow_ping_only=allow_ping_only,
-                                           group_id=group_id,
-                                           scan_overrides=scan_overrides)
-        job = DiscoveryJob(self.db, job_id, kind, target, settings, log=self.log)
-        self._discovery_jobs[job_id] = job
-        job.start()
+        with self._discovery_lock:
+            if refuse_if_target_running and self._target_running(target):
+                raise DiscoveryBusy(target)
+            job_id = self.db.add_discovery_job(kind, target,
+                                               allow_ping_only=allow_ping_only,
+                                               group_id=group_id,
+                                               scan_overrides=scan_overrides)
+            job = DiscoveryJob(self.db, job_id, kind, target, settings,
+                               log=self.log)
+            self._discovery_jobs[job_id] = job
+            job.start()
         return job_id
+
+    def _target_running(self, target: str) -> bool:
+        """Whether a sweep of this target is on the wire. Callers hold
+        _discovery_lock, which is also what keeps a job whose row exists but
+        whose thread has not been started yet from reading as stranded."""
+        with self._discovery_lock:
+            return any(job.target == target and job.running
+                       for job in list(self._discovery_jobs.values()))
 
     def cancel_discovery(self, job_id: int) -> None:
         job = self._discovery_jobs.get(job_id)
@@ -1229,8 +1261,13 @@ class NodePoller(Worker):
             job.cancel()
 
     def discovery_running(self, job_id: int) -> bool:
-        job = self._discovery_jobs.get(job_id)
-        return job is not None and job.running
+        # Under the start's own lock: between the job row being written and
+        # its thread being started there is nothing to read is_alive() on,
+        # and a row read then would answer "stranded" for a sweep that is
+        # about to run.
+        with self._discovery_lock:
+            job = self._discovery_jobs.get(job_id)
+            return job is not None and job.running
 
     @staticmethod
     def _result_addresses(result) -> list[str]:

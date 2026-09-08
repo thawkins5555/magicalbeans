@@ -782,11 +782,13 @@ _BUILTIN_AUTO_RESOLVE_S = {
     # matches how quickly a poll pool recovers once the backlog clears.
     "snmp_failing_ping_ok": 3600,
     "poll_pool_saturated": 900,
-    # The same shape, on the maintenance sweep's clock: while a store is
-    # still near its cap the sweep keeps re-raising it every fifteen
-    # minutes, and when it stops the sweep's own clear closes it — this is
-    # only the backstop for a service stopped mid-condition, so it is a
-    # comfortable two sweeps rather than one.
+    # The same shape, on the maintenance sweep's clock: the sweep re-raises
+    # an open one every fifteen minutes for as long as the condition holds —
+    # the hold band between the clear and the raise threshold included, or
+    # this would close the alert that band exists to hold open — and when the
+    # condition ends the sweep's own clear closes it. Two sweeps rather than
+    # one, because this is only the backstop for a service that stopped
+    # mid-condition and will never clear it itself.
     "db_near_cap": 1800,
     "disk_space_low": 1800,
 }

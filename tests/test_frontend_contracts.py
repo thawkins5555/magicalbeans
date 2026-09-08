@@ -894,6 +894,17 @@ check("error.status = response.status" in APP and "error.payload = payload" in A
       "than only printing it")
 check("duplicate_of_device_id" in NODES and "'/api/nodes/duplicates'" in NODES,
       "nodes.js reads the discovery duplicate verdict and the duplicates route")
+# Re-discover starts a subnet sweep and the row it sits on is not redrawn
+# until the POST answers, so a live button is two sweeps for two clicks. The
+# server refuses the second one, but a button that stays clickable while it
+# works is the defect the refusal exists to survive, not a design.
+_REDISCOVER = NODES[NODES.index("  async function rediscover("):
+                    NODES.index("  function discStatus(")]
+check("button.disabled = true" in _REDISCOVER
+      and "rediscover(job, e.target)" in NODES,
+      "the Re-discover button is handed to rediscover() and disabled for the "
+      "duration of its POST, the way every other button here that starts "
+      "something is")
 
 # 33. Settings -> MODULE SETTINGS opens the module's own dialog (5.0.1).
 #     The list used to selectTab() and then synchronously click the

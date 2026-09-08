@@ -1434,10 +1434,11 @@ alerts and optionally emailing about them.
 - **Two more report on storage, new in 5.2.0**, because nothing in the
   product alerted on a database running out of room before them.
   `db_near_cap` opens once a database is at 85% of its size cap and the
-  maintenance sweep has already trimmed everything it could — from there on
-  every pass deletes history to keep the file under the cap, which is a
-  decision about how much the site keeps rather than a log line. It
-  escalates past 95% and closes on its own once the file is back under 80%,
+  maintenance sweep has already trimmed everything it could — once the file
+  reaches that cap every pass deletes history to keep it there, which is a
+  decision about how much the site keeps rather than a log line. Its message
+  says which band the file is in past 95%, and it closes on its own once the
+  file is back under 80%,
   and each database raises its own alert rather than one that flaps between
   them. The alert names the file, its path, its size, its cap and the
   retention setting that governs it, so it can be acted on from the alert.

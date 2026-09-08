@@ -15,6 +15,7 @@ the clear has to close.
 import os
 import shutil
 import sys
+import time
 
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 
@@ -130,6 +131,11 @@ check("...naming the file, its size, its cap and the setting that governs "
       and "max_trace_db_mb" in near[0]["message"]
       and "86%" in near[0]["message"],
       near[0] if near else None)
+check("...and promising only what the trim actually does: at 86% no pass is "
+      "deleting anything yet, and the message must not say one is",
+      near and "deleted once it reaches that cap" in near[0]["message"]
+      and "Every maintenance pass" not in near[0]["message"],
+      near[0]["message"] if near else None)
 check("...and the stores still in room are cleared in the same pass",
       "trace" not in [entity for rule, entity in warned.cleared
                       if rule == "db_near_cap"]
@@ -139,7 +145,7 @@ check("...and the stores still in room are cleared in the same pass",
 
 set_size(trace, 0.97)
 high = [row for row in sweep().raised if row["rule"] == "db_near_cap"]
-check("past 95% it escalates rather than reading the same as 86%",
+check("past 95% the occurrence carries the higher severity",
       len(high) == 1 and high[0]["severity"] == 2, high)
 
 # 0.82 is between the raise band and the clear band: a store held just under
@@ -235,6 +241,97 @@ service.alert_engine._tick()
 check("and the sweep that finds it back in room resolves that row",
       not open_rows("db_near_cap", "trace"),
       [dict(row) for row in open_rows("db_near_cap", "trace")])
+
+
+# ------------------------------- 5. the hold bands, against the auto-resolve
+
+# The rule carries an auto_resolve_after_s measured from last_ts, and only a
+# raise moves last_ts. A store trimmed from 90% into the hold band therefore
+# used to be closed by that backstop half an hour later, which made the real
+# clear "below the raise band for two sweeps" rather than below the clear
+# band -- the band did not do what it says.
+def backdate(alert_id, seconds):
+    with service.alerts_db._lock:
+        service.alerts_db._conn.execute(
+            "UPDATE alerts SET last_ts = last_ts - ? WHERE id = ?",
+            (seconds, alert_id))
+        service.alerts_db._conn.commit()
+
+
+def engine_sweep():
+    service._sample_storage_alerts()
+    service.alert_engine._tick()
+
+
+set_size(trace, 0.90)
+engine_sweep()
+opened = open_rows("db_near_cap", "trace")
+check("a store over its raise band opens a row", len(opened) == 1, opened)
+alert_id = opened[0]["id"] if opened else 0
+window = service.alerts_db.rule_by_key("db_near_cap")["auto_resolve_after_s"]
+backdate(alert_id, window + 60)
+set_size(trace, 0.83)
+engine_sweep()
+held = open_rows("db_near_cap", "trace")
+check("a store trimmed into the hold band keeps its alert open past the "
+      "auto-resolve window, so the band clears at 80% and not at 85%",
+      len(held) == 1 and held[0]["id"] == alert_id, [dict(r) for r in held])
+check("...by re-raising it, which is what moves last_ts",
+      held and held[0]["last_ts"] >= time.time() - 60,
+      [dict(r) for r in held])
+
+set_size(trace, 0.10)
+engine_sweep()
+set_size(trace, 0.83)
+engine_sweep()
+check("but the hold band raises nothing where no alert is open -- the raise "
+      "band is still 85%",
+      not open_rows("db_near_cap", "trace"),
+      [dict(r) for r in open_rows("db_near_cap", "trace")])
+set_size(trace, 0.10)
+engine_sweep()
+
+# What the occurrence's severity does and does not do. AlertEngine._apply
+# opens the row at the RULE's severity, so 97% is not a redder row than 86%
+# and nothing that says otherwise is true -- what separates them is the
+# wording, which is why the percentage is in the message.
+set_size(trace, 0.97)
+engine_sweep()
+worst = open_rows("db_near_cap", "trace")
+rule_severity = service.alerts_db.rule_by_key("db_near_cap")["severity"]
+check("a store past 95% opens at the rule's severity, not the occurrence's",
+      len(worst) == 1 and worst[0]["severity"] == rule_severity,
+      [dict(r) for r in worst])
+check("...and says which band it is in in the message instead",
+      worst and "97%" in worst[0]["message"],
+      worst[0]["message"] if worst else None)
+set_size(trace, 0.10)
+engine_sweep()
+
+# The volume had no band at all: it raised below warn and cleared at warn, so
+# a WAL growing between prunes and shrinking after them flapped the alert
+# every fifteen minutes.
+PCT = (100 * 1024 * MB) / 100.0
+DISK[0] = int(9 * PCT)                         # 9% free, warn at 10
+engine_sweep()
+low_rows = open_rows("disk_space_low", "data")
+check("a volume under the warning threshold opens a row",
+      len(low_rows) == 1, [dict(r) for r in low_rows])
+disk_id = low_rows[0]["id"] if low_rows else 0
+for free_pct in (11, 9, 11, 9):                # either side of warn, twice
+    DISK[0] = int(free_pct * PCT)
+    engine_sweep()
+same = open_rows("disk_space_low", "data")
+check("a volume oscillating around the warning threshold does not flap: one "
+      "row throughout, never resolved and re-opened",
+      len(same) == 1 and same[0]["id"] == disk_id, [dict(r) for r in same])
+
+DISK[0] = int(13 * PCT)                        # clear of warn by the margin
+engine_sweep()
+check("and once free space is a margin clear of the threshold it resolves",
+      not open_rows("disk_space_low", "data"),
+      [dict(r) for r in open_rows("disk_space_low", "data")])
+
 
 service_mod.disk_space = real_disk_space
 service.shutdown()

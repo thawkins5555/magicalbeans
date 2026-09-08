@@ -4507,7 +4507,7 @@
         `<td>${action}</td>`;
       tr.onclick = (e) => {
         if (e.target.classList.contains('redisc')) {
-          rediscover(job);
+          rediscover(job, e.target);
           return;
         }
         if (e.target.classList.contains('cancel-disc')) {
@@ -4933,18 +4933,28 @@
      profile was stored on the row cannot be replayed at all; the server
      says so rather than guessing one, and the Start dialog opens on the
      same target instead. */
-  async function rediscover(job) {
+  async function rediscover(job, button) {
+    // Disabled for the duration of the POST, like every other button here
+    // that starts something: two clicks are two sweeps of the same subnet,
+    // and the server refusing the second one is the backstop, not the plan.
+    if (button) {
+      if (button.disabled) return;
+      button.disabled = true;
+    }
+    const release = () => { if (button) button.disabled = false; };
     let result;
     try {
       result = await App.post(`/api/nodes/discovery/${job.id}/rescan`, {});
     } catch (error) {
       discStatus(error.message, true);
+      release();
       return;
     }
     if (result.needs_profile) {
       App.el('disc-target').value = result.target;
       App.el('disc-pingonly').checked = result.allow_ping_only;
       discStatus('This scan predates the stored profile — pick one to run it again.');
+      release();
       startDiscovery();
       return;
     }

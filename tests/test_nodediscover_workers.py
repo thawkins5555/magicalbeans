@@ -161,9 +161,11 @@ try:
     class FakePoller:
         def start_discovery(self, kind, target, overrides=None,
                             allow_ping_only=False, group_id=None,
-                            scan_overrides=None):
+                            scan_overrides=None,
+                            refuse_if_target_running=False):
             captured["overrides"] = overrides
             captured["scan_overrides"] = scan_overrides
+            captured["refuse_if_target_running"] = refuse_if_target_running
             return 7
 
     class FakeLog:
