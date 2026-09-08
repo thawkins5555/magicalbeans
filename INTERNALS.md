@@ -4469,7 +4469,11 @@ the scan is bounded instead: `flows()` starts at `MAX(id) − FLOW_SCAN_CAP`
 (`MAX(rowid)` is one probe) and returns whether the bound bit, which
 `api._flow_records_rows` passes through as `scan_bounded` and `netflow.js`
 says out loud. Changing the sort would change what "top 250 by volume"
-means; bounding the scan does not.
+means; bounding the scan does not. The bound belongs to those two
+orderings alone — `order == "time"` is `ix_flows_ts` end to end — and a
+window lying wholly below it is answered unbounded, since a window with
+nothing above the bound has no ordering left to cut short and an empty
+list is not what "the heaviest of the most recent" means.
 
 **The rollup loop** lives in `web/service.py`, on its own 60-second timer
 beside the maintenance thread rather than inside the quarter-hourly sweep:

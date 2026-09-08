@@ -1076,29 +1076,43 @@ class FlowDatabase(SqliteStore):
 
         Returns (rows, whether the FLOW_SCAN_CAP bound cut the window short),
         so the page can say the ordering is over the most recent flows rather
-        than imply it searched every one of them. `order == "time"` is served
-        end to end by ix_flows_ts and the bound never bites there.
+        than imply it searched every one of them.
+
+        The bound is for the two volume orderings alone: they sort on a
+        product no index can serve, while `order == "time"` is ix_flows_ts
+        end to end and has nothing to bound. And a window lying wholly below
+        the bound is answered unbounded rather than empty — there is no
+        ordering left to cut short there, and an empty list is not what "the
+        heaviest of the most recent" means.
         """
         where, params = self._where(t0, t1, filters)
         column = {"bytes": "bytes * sampling", "packets": "packets * sampling",
                   "time": "ts_end"}.get(order, "bytes * sampling")
         with self._lock:
-            highest = self._conn.execute(
-                "SELECT MAX(id) AS hi FROM flows").fetchone()["hi"] or 0
-            floor_id = highest - FLOW_SCAN_CAP
+            if order in ("bytes", "packets"):
+                highest = self._conn.execute(
+                    "SELECT MAX(id) AS hi FROM flows").fetchone()["hi"] or 0
+                floor_id = highest - FLOW_SCAN_CAP
+                if floor_id > 0:
+                    rows = self._conn.execute(
+                        f"SELECT * FROM flows WHERE id > ? AND {where}"
+                        f" ORDER BY {column} DESC LIMIT ?",
+                        (floor_id, *params, limit)).fetchall()
+                    # One primary-key probe rather than a count of what was
+                    # left out: ids are handed out in arrival order, so
+                    # whether the row at the bound is still inside the window
+                    # is the same question.
+                    edge = self._conn.execute(
+                        "SELECT ts_end FROM flows WHERE id <= ? ORDER BY id"
+                        " DESC LIMIT 1", (floor_id,)).fetchone()
+                    bounded = bool(edge is not None and edge["ts_end"] >= t0)
+                    if rows or not bounded:
+                        return rows, bounded
             rows = self._conn.execute(
-                f"SELECT * FROM flows WHERE id > ? AND {where}"
+                f"SELECT * FROM flows WHERE {where}"
                 f" ORDER BY {column} DESC LIMIT ?",
-                (floor_id, *params, limit)).fetchall()
-            # One primary-key probe rather than a count of what was left out:
-            # ids are handed out in arrival order, so whether the row at the
-            # bound is still inside the window is the same question.
-            edge = None
-            if floor_id > 0:
-                edge = self._conn.execute(
-                    "SELECT ts_end FROM flows WHERE id <= ? ORDER BY id DESC"
-                    " LIMIT 1", (floor_id,)).fetchone()
-        return rows, bool(edge is not None and edge["ts_end"] >= t0)
+                (*params, limit)).fetchall()
+        return rows, False
 
     def totals(self, t0: float, t1: float, filters: dict) -> dict:
         """Exact on both paths: a rollup's span row is the whole bucket, not
