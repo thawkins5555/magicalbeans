@@ -216,13 +216,10 @@ ROLLUP_DAYS_SETTING = {60: "rollup_minute_days", 3600: "rollup_retention_days"}
 
 # A bucket is summarised only once its end is this old: an exporter with an
 # active timeout or a skewed clock keeps sending flows for a window that has
-# already closed.
+# already closed. Flows that land later still than that are not lost either:
+# every writer records how far back it reached (_DIRTY) and the next pass
+# rebuilds exactly those buckets, however far behind the watermark they are.
 _ROLLUP_LAG_S = 120
-# How many sealed buckets each pass recomputes behind the watermark, so those
-# late flows are not lost. The minute window is deliberately wider than
-# collector.RESAMPLE_MAX_AGE_S, the age at which a sampling rate announced
-# after the fact can still rewrite a raw row.
-_ROLLUP_REDO = {60: 20, 3600: 2}
 _ROLLUP_MAX_BUCKETS = {60: 240, 3600: 48}
 _ROLLUP_BUDGET_S = 5.0
 
@@ -235,6 +232,9 @@ FLOW_SCAN_CAP = 2_000_000
 
 _WATERMARK = "flow_rollup_watermark_%d"     # forward edge: built below this
 _FLOOR = "flow_rollup_floor_%d"             # backward edge backfill has reached
+# The oldest ts_end a writer has touched since this tier last compacted: what
+# the next pass has to rebuild behind its watermark, and nothing more.
+_DIRTY = "flow_rollup_dirty_ts_%d"
 # The oldest ts_end a sampling rewrite has touched since the last compaction.
 _RESAMPLE_FLOOR = "flow_resample_floor_ts"
 
@@ -293,6 +293,11 @@ class FlowDatabase(SqliteStore):
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rows,
             )
+            # Which buckets this flush landed in is the exporter's clock's
+            # answer, not the wall clock's, so the compaction that has to
+            # rebuild them is told rather than left to guess a window. In the
+            # same transaction as the rows it describes.
+            self._mark_dirty(min(row[3] for row in rows))
             self._conn.commit()
         return len(rows)
 
@@ -396,6 +401,21 @@ class FlowDatabase(SqliteStore):
         return (None if floor is None else int(floor),
                 None if watermark is None else int(watermark))
 
+    def _mark_dirty(self, ts: float, tiers=ROLLUP_TIERS) -> None:
+        """Lower each tier's redo floor to `ts`.
+
+        Called by whatever changed the rows, so a pass rebuilds exactly the
+        buckets that moved rather than a fixed window behind the watermark:
+        a window wide enough for the slowest exporter is write amplification
+        for every other pass, and any fixed width is still too narrow for an
+        exporter further behind than that.
+        """
+        for tier in tiers:
+            key = _DIRTY % tier
+            current = self._private_setting(key)
+            if current is None or float(ts) < float(current):
+                self._set_private_setting(key, float(ts))
+
     def _from_minute_tier(self, tier: int, bucket: int) -> bool:
         """Whether the minute tier already covers this whole bucket. Sixty
         minute rows in place of an hour of raw flows is the same answer
@@ -484,6 +504,13 @@ class FlowDatabase(SqliteStore):
         is looking at. backfill_rollup pages the history in from the other
         end.
 
+        New buckets first, redo second. Spending the budget on the redo
+        window first leaves the watermark where it was whenever that window
+        alone costs more than the budget, so the next pass repeats identical
+        work while real time adds a bucket a minute and the unsummarised
+        tail grows without bound. This order makes the watermark advance on
+        every pass, whatever the redo costs.
+
         Returns the number of rollup rows written.
         """
         now = time.time()
@@ -498,28 +525,55 @@ class FlowDatabase(SqliteStore):
             self._set_private_setting(_WATERMARK % tier, sealed)
             self._set_private_setting(_FLOOR % tier, sealed)
             return 0
-        bucket = watermark - _ROLLUP_REDO[tier] * tier
-        # A rewritten sampling factor changes rows a sealed bucket has
-        # already been built from, so follow the rewrite back rather than
-        # leaving the rollup quietly disagreeing with the raw rows.
-        resampled = self._private_setting(_RESAMPLE_FLOOR)
-        if resampled is not None:
-            bucket = min(bucket, _align_down(float(resampled), tier))
-        if floor is not None:
-            bucket = max(bucket, floor)
         limit = _ROLLUP_MAX_BUCKETS[tier] if max_buckets is None else max_buckets
         deadline = time.monotonic() + budget_s
         written = 0
         processed = 0
+        bucket = watermark
         while (bucket + tier <= sealed and processed < limit
                and time.monotonic() < deadline):
             written += self._compact_bucket(tier, bucket)
             bucket += tier
             processed += 1
-        # max(): a pass that ran out of budget inside the redo window must
-        # not wind the watermark back to where it started.
-        self._set_private_setting(_WATERMARK % tier, max(bucket, watermark))
-        self._set_private_setting(_RESAMPLE_FLOOR, None)
+        if bucket != watermark:
+            self._set_private_setting(_WATERMARK % tier, bucket)
+        return written + self._redo_dirty(tier, watermark, floor,
+                                          limit - processed, deadline)
+
+    def _redo_dirty(self, tier: int, upto: int, floor: int | None,
+                    limit: int, deadline: float) -> int:
+        """Rebuild the buckets a writer has touched behind `upto`.
+
+        Taken and cleared under one lock, so a flush landing mid-pass marks
+        the tier dirty again rather than having its mark thrown away at the
+        end. Oldest first, and whatever the budget did not reach is marked
+        dirty again, so the walk resumes there instead of starting over.
+        """
+        with self._lock:
+            dirty = self._private_setting(_DIRTY % tier)
+            # A rewritten sampling factor changes rows a sealed bucket has
+            # already been built from, and so is the same kind of dirt.
+            resampled = self._private_setting(_RESAMPLE_FLOOR)
+            self._set_private_setting(_DIRTY % tier, None)
+            self._set_private_setting(_RESAMPLE_FLOOR, None)
+        marks = [float(mark) for mark in (dirty, resampled) if mark is not None]
+        if not marks:
+            return 0
+        bucket = _align_down(min(marks), tier)
+        if floor is not None:
+            bucket = max(bucket, floor)
+        written = 0
+        processed = 0
+        while (bucket < upto and processed < limit
+               and time.monotonic() < deadline):
+            written += self._compact_bucket(tier, bucket)
+            bucket += tier
+            processed += 1
+        if bucket < upto:
+            # The coarser tiers are built from this one where it covers them,
+            # so what is still dirty here is still dirty there.
+            self._mark_dirty(float(bucket),
+                             [wider for wider in ROLLUP_TIERS if wider >= tier])
         return written
 
     def backfill_rollup(self, tier: int, max_buckets: int | None = None,

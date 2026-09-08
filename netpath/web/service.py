@@ -131,7 +131,10 @@ def disk_space(service) -> tuple[int, int]:
 # sweep: at a quarter-hour cadence the unsummarised tail of raw flows would be
 # a quarter of an hour of them, which at a busy exporter's volume is the very
 # scan the rollups exist to avoid. With this and flowdb's seal lag the tail is
-# never more than about three minutes.
+# about three minutes wherever a pass can build every bucket that has sealed
+# since the last one. Where it cannot, the watermark still advances as far as
+# the pass got, so the tail is bounded by how fast the store can summarise
+# rather than growing by a bucket a minute for ever.
 ROLLUP_INTERVAL_S = 60
 
 # What each tier is called where an operator reads about it.

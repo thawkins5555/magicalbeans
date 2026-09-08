@@ -4398,7 +4398,13 @@ The watermark seeds at the current *sealed* bucket rather than at the
 oldest row, so an existing store produces useful buckets on its first pass
 instead of grinding through a fortnight of history first; history is paged
 in separately by `backfill_rollup`, walking a floor cursor backwards a
-bucket at a time and committing it as it goes. A bucket is rebuilt with
+bucket at a time and committing it as it goes. Behind the watermark, a
+pass rebuilds the buckets its writers marked dirty (`_DIRTY`, the oldest
+`ts_end` anything has written or rewritten since that tier last
+compacted) rather than a fixed window: a window wide enough for the
+slowest exporter is write amplification on every other pass, and any
+fixed width is still too narrow for an exporter further behind than
+that. A bucket is rebuilt with
 DELETE-then-INSERT rather than an upsert, because which keys make the
 top-K changes when it is recomputed and a stale row would otherwise
 survive its key dropping out. And the hourly tier reads the minute tier
@@ -4470,8 +4476,15 @@ beside the maintenance thread rather than inside the quarter-hourly sweep:
 at `MAINTENANCE_INTERVAL_S` cadence the unsummarised tail would be a
 quarter of an hour of raw flows, which at extreme volume is the very scan
 the rollups exist to avoid. With that cadence and `_ROLLUP_LAG_S` the tail
-is never more than about three minutes. The maintenance sweep additionally
-compacts, backfills and drops the legacy index *before* pruning — the same
+is about three minutes wherever a pass can build every bucket that sealed
+since the last one; where it cannot, the watermark still advances as far
+as the pass reached, so the tail is bounded by how fast the store can
+summarise rather than growing by a bucket a minute for ever. That is what
+building new buckets *before* the redo window buys: a pass whose redo
+alone outran its budget used to leave the watermark exactly where it
+started and repeat the same work on the next pass. The maintenance sweep
+additionally compacts, backfills and drops the legacy index *before*
+pruning — the same
 ordering, and the same reason, as the `nodes_db.compact_rollup()` /
 `nodes_db.prune()` pair beside it.
 

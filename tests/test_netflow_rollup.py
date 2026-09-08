@@ -365,6 +365,57 @@ def test_8_a_window_below_the_floor_falls_back() -> None:
     db.close()
 
 
+# ------------------------------------------------------------------------- 9
+
+def slow_buckets(seconds: float):
+    """Make one bucket cost real time, the way 60k flows/minute across eleven
+    dimensions does. A budget is wall clock, so nothing else reproduces a
+    pass that runs out of it. Returns the undo."""
+    real = FlowDatabase._compact_bucket
+
+    def slower(self, tier, bucket):
+        time.sleep(seconds)
+        return real(self, tier, bucket)
+
+    FlowDatabase._compact_bucket = slower
+    return lambda: setattr(FlowDatabase, "_compact_bucket", real)
+
+
+def test_9_the_watermark_advances_under_a_tight_budget() -> None:
+    print("9: a pass with no budget for the redo window still builds forward")
+    db = store("progress.db")
+    now = time.time()
+    start = flowdb._align_down(now - 3600, 60)
+    db.insert_flows([flow(i, start + i * 2.0) for i in range(1800)])
+    db.compact_rollup(60, max_buckets=10_000, budget_s=120)
+
+    # A store whose collector has outrun compaction: sealed buckets nobody
+    # has built yet, and a redo window far wider than one pass can afford.
+    sealed = flowdb._align_down(time.time() - flowdb._ROLLUP_LAG_S, 60)
+    db._set_private_setting(flowdb._FLOOR % 60, sealed - 40 * 60)
+    db._set_private_setting(flowdb._WATERMARK % 60, sealed - 10 * 60)
+    db._mark_dirty(float(sealed - 40 * 60), [60])
+
+    undo = slow_buckets(0.02)
+    try:
+        marks = []
+        for _ in range(8):
+            db.compact_rollup(60, budget_s=0.05)
+            marks.append(db.rollup_bounds(60)[1])
+    finally:
+        undo()
+    check(marks[0] > sealed - 10 * 60,
+          f"the very first pass moves the watermark forward "
+          f"({marks[0] - (sealed - 10 * 60)} s of it)")
+    check(marks == sorted(marks) and marks[-1] >= sealed,
+          f"and eight of them reach the newest sealed bucket rather than "
+          f"redoing the same window for ever ({marks[-1] - sealed} s past it)")
+    check(db._private_setting(flowdb._DIRTY % 60) is not None,
+          "what the budget never reached is still marked dirty, so the redo "
+          "resumes there instead of being lost")
+    db.close()
+
+
 TESTS = [
     test_1_rollup_and_raw_agree,
     test_2_totals_survive_truncation,
@@ -374,6 +425,7 @@ TESTS = [
     test_6_off_grid_buckets_stay_on_raw,
     test_7_compaction_is_idempotent,
     test_8_a_window_below_the_floor_falls_back,
+    test_9_the_watermark_advances_under_a_tight_budget,
 ]
 
 
