@@ -250,10 +250,20 @@ class FlowDatabase(SqliteStore):
     TRIM_TABLE = "flows"
     # The rollups reach further back than the raw rows they were built from,
     # so asking flows alone under-reports how much history this store holds.
-    OLDEST_TS_SQL = ("SELECT MIN(ts) FROM ("
-                     "SELECT MIN(ts_start) AS ts FROM flows"
-                     " UNION ALL SELECT MIN(bucket) FROM flow_rollup"
-                     " UNION ALL SELECT MIN(bucket) FROM flow_rollup_span)")
+    # Three index probes, none of them a scan: /api/state polls this every
+    # ten seconds, on the collector's write lock, for every open tab.
+    # MIN(ts_start) has no index (ix_flows_ts is on ts_end) and walked the
+    # table; MIN(bucket) FROM flow_rollup walked ix_flow_rollup_bucket in
+    # full, the index leading on tier defeating the MIN optimisation. The
+    # oldest id is the oldest arrival, and flow_rollup_span holds a row for
+    # every bucket flow_rollup does, so neither detour is needed.
+    # One arm per tier, because the primary key leads on tier: a MIN over
+    # the whole table would have to walk it.
+    OLDEST_TS_SQL = (
+        "SELECT MIN(ts) FROM ("
+        "SELECT ts FROM (SELECT ts_start AS ts FROM flows ORDER BY id LIMIT 1)"
+        + "".join(f" UNION ALL SELECT MIN(bucket) FROM flow_rollup_span"
+                  f" WHERE tier = {tier}" for tier in ROLLUP_TIERS) + ")")
     TRIM_FLOOR = 1000
     # Rollup rows a tier keeps whatever the size cap says: below this the wide
     # charts it is the only source for have nothing left to draw, and the raw
