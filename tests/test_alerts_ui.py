@@ -31,6 +31,7 @@ import tempfile
 
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 
+from netpath import alertrules
 from netpath.alertsdb import _BUILTIN_RULES
 
 STATIC = os.path.join(_paths.REPO_ROOT, "netpath", "web", "static")
@@ -86,8 +87,20 @@ check("interface_flapping is still an interface_event rule whose source_kind "
       FLAPPING[2] == "interface_event" and FLAPPING[3] == "flapping",
       (FLAPPING[2], FLAPPING[3]))
 
-EDITOR = ALERTS[ALERTS.index("  function templateOptionsHtml("):
+# From the const editRule() reads, not from templateOptionsHtml: 5.3.0 gave
+# the editor PUBLISHED_THRESHOLD_KEYS, and a slice that started below it ran
+# the real editor against a name node could not resolve.
+EDITOR = ALERTS[ALERTS.index("  const PUBLISHED_THRESHOLD_KEYS = ["):
                 ALERTS.index("  function addRule() {")]
+
+# The editor's copy of the published-threshold keys is a second list of the
+# same eight rules alertrules holds, so it can drift silently -- the editor
+# would offer a threshold box for a rule whose number the engine ignores.
+_JS_PUBLISHED = set(re.findall(r"'(sfp_[a-z_]+)'",
+                               EDITOR[:EDITOR.index("function templateOptionsHtml(")]))
+check("the editor's published-threshold keys are alertrules' eight, exactly",
+      _JS_PUBLISHED == set(alertrules.PUBLISHED_THRESHOLD_RULES),
+      sorted(_JS_PUBLISHED ^ set(alertrules.PUBLISHED_THRESHOLD_RULES)))
 
 HARNESS = """
 'use strict';
