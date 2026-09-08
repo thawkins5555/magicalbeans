@@ -30,7 +30,8 @@ PORTS = [{"if_index": 1, "descr": "GigabitEthernet1/0/1"},
          {"if_index": 3, "descr": "GigabitEthernet1/0/3"},
          {"if_index": 4, "descr": "GigabitEthernet1/0/4"},
          {"if_index": 5, "descr": "GigabitEthernet1/0/5"},
-         {"if_index": 6, "descr": "GigabitEthernet1/0/6"}]
+         {"if_index": 6, "descr": "GigabitEthernet1/0/6"},
+         {"if_index": 7, "descr": "GigabitEthernet1/0/7"}]
 
 
 def check(name, ok, detail=""):
@@ -132,6 +133,10 @@ try:
           "port's chart keeps its continuity and its history stays true",
           metrics.get("sfp_rx_dbm.6") == DARK_OPTIC_DBM,
           metrics.get("sfp_rx_dbm.6"))
+    check("a transmit reading of exactly 0.0 dBm is recorded as 0.0: 1 mW is "
+          "a nominal ER/ZR level, and writing the -40 floor over it dropped "
+          "the port's chart to the bottom of the scale for that poll",
+          metrics.get("sfp_tx_dbm.7") == 0.0, metrics.get("sfp_tx_dbm.7"))
     db.close()
 finally:
     stub.kill()
@@ -151,9 +156,17 @@ check("...and the transmit rule is guarded the same way",
 check("a reading just above the floor is still refused -- vendors do not "
       "all clamp to exactly -40.00",
       not breaches(rx_low, -39.8))
-check("a 0 is an agent saying 'no light' in milliwatts, not a strong "
-      "signal, and is refused too",
-      not breaches(rx_low, 0.0))
+# 0 dBm is 1 mW, which an ER/ZR/DWDM part really transmits at, and an agent
+# quoting 0.1 dBm units rounds -0.04 to exactly it. An agent reporting watts
+# with a zero raw value yields a non-finite dBm through the scale arithmetic
+# instead, which is what the floor test's isfinite clause is for.
+check("0 dBm is a reading like any other, not a sentinel for 'no light'",
+      not is_dark_optic("sfp_rx_dbm", 0.0)
+      and not is_dark_optic("sfp_tx_dbm", 0.0))
+tx_high = rule("sfp_tx_dbm", -1.0, -3.0, "above")
+check("an operator's own above-rule on transmit power fires at exactly "
+      "0.0 dBm, where it used to be silenced as darkness",
+      breaches(tx_high, 0.0))
 
 # The guard is keyed off the rule's metric family, so nothing else can
 # inherit it -- a 'below' rule on any other metric is untouched.

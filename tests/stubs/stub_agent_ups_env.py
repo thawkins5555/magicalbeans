@@ -66,11 +66,12 @@ Modes:
              shapes real gear uses -- units/precision 1 (IOS) and
              milli/precision 0 (NX-OS) -- both decoding through the plain
              RFC 3433 arithmetic.
-  sfp_media  Six ports covering every media verdict and the dark optic: a
+  sfp_media  Seven ports covering every media verdict and the dark optic: a
              working optic, an occupied cage with no DOM, an empty cage, a
              copper port an agent models as container+port too (which must
-             stay unbadged), a two-lane optic with one lane dark, and one
-             dark on both lanes. See SFP_MEDIA_TABLE.
+             stay unbadged), a two-lane optic with one lane dark, one dark on
+             both lanes, and one transmitting at exactly 0 dBm. See
+             SFP_MEDIA_TABLE.
 
 Two control datagrams, on the same socket as SNMP itself (see
 stub_agent_fdb.py, which established this convention):
@@ -302,10 +303,10 @@ CISCO_DOM_TABLE = {
 }
 
 # ------------------------------------------- SFP media and the dark optic
-# Six ports, one row of ENTITY-MIB reality each. Ports 1/5/6 carry standard
-# ENTITY-SENSOR-MIB optical-power rows (dBm(14), scale units(9), precision 1)
-# and are aliased to their ifIndex; ports 2/3/4 have no sensor of any kind,
-# which is exactly why entPhysicalClass has to answer for them:
+# Seven ports, one row of ENTITY-MIB reality each. Ports 1/5/6/7 carry
+# standard ENTITY-SENSOR-MIB optical-power rows (dBm(14), scale units(9),
+# precision 1) and are aliased to their ifIndex; ports 2/3/4 have no sensor
+# of any kind, which is exactly why entPhysicalClass has to answer for them:
 #
 #   if 1  a working optic, -5.5 dBm                     -> media 'optic'
 #   if 2  a cage holding a transceiver that reports no DOM  -> media 'sfp'
@@ -314,6 +315,9 @@ CISCO_DOM_TABLE = {
 #         transceiver anywhere -> media NULL, never a badge
 #   if 5  a two-lane optic, one lane dark at -40 and one healthy at -6
 #   if 6  a two-lane optic dark on both lanes
+#   if 7  a single-lane optic transmitting at exactly 0.0 dBm -- 1 mW, a
+#         nominal level for an ER/ZR part, and what an agent quoting 0.1 dBm
+#         units rounds -0.04 to
 SFP_MEDIA_TABLE = {
     # --- if 1: an ordinary DOM optic
     "1.3.6.1.2.1.47.1.1.1.1.2.101": ("str", "GigabitEthernet1/0/1"),
@@ -392,6 +396,18 @@ SFP_MEDIA_TABLE = {
     "1.3.6.1.2.1.99.1.1.1.3.162": ("int", 1),
     "1.3.6.1.2.1.99.1.1.1.4.162": ("int", -400),
     "1.3.6.1.2.1.99.1.1.1.5.162": ("int", 1),
+
+    # --- if 7: transmitting at exactly 0.0 dBm
+    "1.3.6.1.2.1.47.1.1.1.1.2.107": ("str", "GigabitEthernet1/0/7"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.107": ("int", 10),
+    "1.3.6.1.2.1.47.1.3.2.1.2.107.1": ("str", "1.3.6.1.2.1.2.2.1.1.7"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.171": ("str", "Gi1/0/7 Transmit Power"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.171": ("int", 107),
+    "1.3.6.1.2.1.99.1.1.1.1.171": ("int", 14),
+    "1.3.6.1.2.1.99.1.1.1.2.171": ("int", 9),
+    "1.3.6.1.2.1.99.1.1.1.3.171": ("int", 1),
+    "1.3.6.1.2.1.99.1.1.1.4.171": ("int", 0),                  # 0.0 dBm
+    "1.3.6.1.2.1.99.1.1.1.5.171": ("int", 1),
 }
 
 MODE = "ups"

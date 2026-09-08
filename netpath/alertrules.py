@@ -227,9 +227,12 @@ def _metric_root_of(rule) -> str:
 # An optic with no fiber in it, or a port powered down, reports the bottom
 # of its own scale rather than a fault: -40 dBm is where the common vendors
 # clamp, and nothing that is actually working ever reads there (receive
-# sensitivity bottoms out around -23 dBm on the worst 1G/10G part). A 0 is
-# the same statement from an agent quoting milliwatts of nothing, and a
-# non-finite value is an agent with no reading at all to give.
+# sensitivity bottoms out around -23 dBm on the worst 1G/10G part). A
+# non-finite value is an agent with no reading at all to give -- including
+# one quoting watts, whose zero raw value comes out non-finite through the
+# scale arithmetic. A bare 0 is NOT one of these: 0 dBm is 1 mW, a nominal
+# transmit level for an ER/ZR/DWDM part, and what an agent quoting 0.1 dBm
+# units rounds -0.04 to.
 DARK_OPTIC_DBM = -40.0
 _DARK_OPTIC_TOLERANCE_DB = 0.5
 # The two metric families (rules.source_kind) a dark reading may silence.
@@ -249,7 +252,7 @@ def is_dark_optic(metric_root: str, value) -> bool:
         return False
     if not math.isfinite(value):
         return True
-    return value == 0.0 or value <= DARK_OPTIC_DBM + _DARK_OPTIC_TOLERANCE_DB
+    return value <= DARK_OPTIC_DBM + _DARK_OPTIC_TOLERANCE_DB
 
 
 def breaches(rule, value) -> bool:

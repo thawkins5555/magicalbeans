@@ -804,10 +804,13 @@ down or no fiber in it clamps at the bottom of its scale, and
 `_decode_entity_sensor`'s arithmetic reports that faithfully as `-40.0`;
 `entPhySensorStatus` still says `ok(1)`, so the status filter never catches
 it. `alertrules.is_dark_optic` names the condition once for both ends —
-`DARK_OPTIC_DBM` with half a dB of tolerance, plus the zero-light sentinels
-(an exact `0`, a non-finite value) — and `breaches()` returns `False` for
-one on the two optic power families (`rules.source_kind` of `sfp_rx_dbm` or
-`sfp_tx_dbm`), keyed off the family so no other `'below'` rule can inherit
+`DARK_OPTIC_DBM` with half a dB of tolerance, plus a non-finite value, which
+is an agent with no reading to give (one quoting watts of nothing lands here
+through the scale arithmetic). A bare `0` is deliberately not on that list:
+0 dBm is 1 mW, a nominal transmit level for an ER/ZR/DWDM part, and what an
+agent quoting 0.1 dBm units rounds `-0.04` to. `breaches()` returns `False`
+for one on the two optic power families (`rules.source_kind` of `sfp_rx_dbm`
+or `sfp_tx_dbm`), keyed off the family so no other `'below'` rule can inherit
 it. `evaluate_threshold` answers `'clear'` for the same reading on the same
 families, because refusing to RAISE says nothing about an alert already
 open: the floor is a fresh sample every poll, so `threshold_stale_s` can

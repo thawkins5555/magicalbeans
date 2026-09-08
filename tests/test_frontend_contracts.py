@@ -1171,6 +1171,10 @@ check(".badge-dom" in APP_CSS,
 check("No signal" in NODES and "darkOptic(s)" in NODES,
       "a dark optic's dBm reading is rendered as words in the DOM tables, "
       "not as a number that reads like a dying link")
+check("s.value === 0" not in NODES,
+      "0 dBm is 1 mW -- a nominal ER/ZR transmit level, and what an agent "
+      "quoting 0.1 dBm units rounds -0.04 to -- so it must read as the "
+      "figure it is, never as 'No signal'")
 check("sfpBadge(r) + escape(r.descr" in NODES,
       "the badge is prepended to the descr cell, so it is visible in the "
       "default column set rather than behind the column picker")

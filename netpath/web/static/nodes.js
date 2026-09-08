@@ -1282,14 +1282,14 @@
   }
 
   // -40 dBm is where an optic clamps when it is unlit or its port is powered
-  // down, and a 0 is an agent saying the same thing in milliwatts; printing
-  // either as a number reads as a dying link, which is the one thing it is
-  // not. Presentational only — read_dom/read_dom_all still return the figure,
-  // and it stays on the row's title.
+  // down; printing that as a number reads as a dying link, which is the one
+  // thing it is not. A bare 0 stays a reading — 0 dBm is 1 mW, what an ER/ZR
+  // part transmits at. Presentational only — read_dom/read_dom_all still
+  // return the figure, and it stays on the row's title.
   const DARK_OPTIC_MAX_DBM = -39.5;   // the -40 floor, with the tolerance alertrules allows
   function darkOptic(s) {
     return s.unit === 'dBm' && typeof s.value === 'number'
-      && (s.value === 0 || s.value <= DARK_OPTIC_MAX_DBM);
+      && s.value <= DARK_OPTIC_MAX_DBM;
   }
   function domValueCell(s) {
     return darkOptic(s) ? '<td>No signal</td>'
