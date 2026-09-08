@@ -847,12 +847,28 @@ timeout is shorter — closes after a minute if nothing ever connects, closes
 when you sign out, and closes the moment the permission is taken away;
 **Close** beside the button ends it at once. Because it opens a listening
 port on this server it has its own **web** permission, granted to nobody by
-default and to no account on upgrade. The bytes are copied without being
-read, so a device on `https` presents its own certificate (your browser will
-name the device in the warning, not this server), a page whose links are
-absolute steps outside the tunnel when you follow one, and the device's
-event log records how many bytes crossed in each direction and never what
-they were. The port range the tunnels bind is set under **Settings →
+default and to no account on upgrade. The device's event log records how
+many bytes crossed in each direction and never what they were.
+
+**A tunnel to an `http` device now reads the headers it carries**, which is
+what stops a device rebuilding its own address out of the name and port it
+was reached on. Before 5.4.0 the tunnel copied bytes without looking at
+them, so a device that built its redirect from the `Host:` header it was
+sent — this server's name, the tunnel's port dropped — answered `Location:
+https://<this server>/home.asp` and the browser followed it to the
+management interface's own port. The tunnel now asks the device for its own
+address and port, so it builds its pages against itself, and maps every
+address the answer names — `Location`, `Content-Location`, `Refresh` and a
+cookie's `Domain=` — back onto the tunnel's own origin, whether the device
+named this server or itself. A page whose links are written out in full
+therefore stays inside the tunnel, which it did not before. Bodies are
+streamed through untouched and never held, so a firmware image crosses byte
+for byte. A device on `https` is still carried unread — its certificate is
+its own, and your browser names the device in the warning rather than this
+server — and so its absolute links still step outside the tunnel; so is any
+`http` connection the framing cannot account for (a WebSocket upgrade, a
+`CONNECT`, a start line that is not one, a body of undeclared length), which
+falls back to the old byte copy for the rest of that connection. The port range the tunnels bind is set under **Settings →
 Sign-in**; it needs an inbound TCP rule in this host's firewall for browsers
 on other machines to reach it.
 

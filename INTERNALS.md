@@ -7584,6 +7584,51 @@ pinned to loopback does not get relays on every interface.
 `SO_EXCLUSIVEADDRUSE` on Windows and no `SO_REUSEADDR` anywhere: sharing a
 relay port is the one thing that must not happen.
 
+**Framing (`http` only).** `_serve` gives an `http` connection an
+`_HttpConnection` and both its pumps run `_frame` instead of `_copy`: a head
+is read whole (capped at `MAX_HEAD_BYTES`), rewritten, and the body streamed
+after it — `Content-Length` bytes, or chunk by chunk with the chunk framing
+passed through verbatim, so a body is never buffered whole and crosses byte
+for byte. Keep-alive is the normal case; the loop just goes round again.
+Outbound, `Host:` becomes `device_authority` (`<ip>:<port>`), which is what
+stops a device rebuilding its URLs out of this server's name — the reported
+`Location: https://<server>/home.asp`. Inbound, `Location`,
+`Content-Location`, `Refresh` and `Set-Cookie`'s `Domain=` go through
+`map_url` / `map_refresh` / `map_cookie`: an absolute URL naming either
+`relay_names` member (the host the browser reached this server on, and the
+device's own address) is moved onto `origin`, and a `Domain=` naming either
+is dropped so the cookie is host-only and the browser keeps it on the relay.
+Nothing else is touched, bodies included.
+
+**Falling back.** `frame_request` / `frame_response` return `None` for
+anything not fully understood — a `101` upgrade, a `CONNECT`, an
+unparseable request or status line, obsolete line folding, a
+`Transfer-Encoding` that is not plainly `chunked`, a `Content-Length` that
+is not one number, an over-long head. `_blindly` then sets
+`_HttpConnection.blind` and copies the rest with `_copy`, the head it could
+not read pushed back on the front of the buffer first, so not a byte is
+dropped or repeated. The switch is one-way and shared: `_read_head` checks
+it after every `recv`, and a direction that gave up sets it *before*
+forwarding the message that made it give up, so the peer direction cannot
+frame anything that arrives afterwards (a browser sends WebSocket frames
+only after it has seen the `101`). The pump is the floor — no device that
+worked before 5.4.0 can be broken by the parser. A response's method comes
+from `_HttpConnection.take()`, pushed by the request direction before the
+request is forwarded and popped only for a final (non-1xx) response, since a
+`HEAD` answer carries no body however its head is framed. `Referer` and
+`Origin` are deliberately left naming the relay, and an `https` session
+never frames at all.
+
+**A known limitation, not fixed.** On a TLS install `server.py` sends
+`Strict-Transport-Security` for its own hostname. HSTS is host-scoped and
+port-agnostic, so a browser that has loaded the UI over TLS will rewrite the
+`http://<server>:<relay port>/` URL the relay hands back into `https://` and
+present a TLS handshake to a plaintext relay, which fails. It bites the
+`http` device on a TLS install; the relay cannot fix it from its own side
+(the rewrite happens in the browser before the connection is made), and the
+fix is either a certificate on the relay port or an HSTS policy that is not
+whole-host. Nothing here should be read as it being handled.
+
 **Threads.** One accept thread and one watchdog per session, plus two per
 connection (a handler that dials the device and runs one direction inline,
 and a pump thread for the other). Blocking threads rather than one selector
@@ -7608,8 +7653,9 @@ URL therefore names whatever address the browser used to reach the interface
 (a hostname, a NAT address, `localhost`), which is the only address it is
 known to be able to reach; deriving it from the listener would hand a
 machine on the plant network a URL naming `0.0.0.0`. The scheme is the
-device's, not this server's, since the relay is a raw TCP copy and a device
-on `https` carries its own TLS through.
+device's, not this server's, since an `https` device carries its own TLS
+through an unread tunnel. `origin` is that URL without its trailing slash,
+and it is what the inbound rewriting maps addresses onto.
 
 **The client.** `nodes.js`'s `webDevice()` opens the window *before* the
 POST and sets its `location` afterwards: a `window.open` that runs after an
