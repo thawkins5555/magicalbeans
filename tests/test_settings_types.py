@@ -480,6 +480,24 @@ def main() -> int:
                                        cookie=admin_cookie)
             check(f"HTTP {key} at its floor (0) -> 200",
                   status == 200, f"{status} {payload}")
+
+        # Same key name, two scopes, two floors. nodesseriesdb.prune reads
+        # rollup_days=0 as "matches every existing row", so 0 in the nodes
+        # scope would delete samples_hourly outright -- the long metric
+        # history -- where 0 in the netflow scope only means "keep no
+        # summaries at this tier".
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "nodes",
+                                    "values": {"rollup_retention_days": 0}},
+                                   cookie=admin_cookie)
+        check("HTTP nodes rollup_retention_days at 0 -> 400", status == 400,
+              f"{status} {payload}")
+        status, _h, payload = req(port, "POST", "/api/settings",
+                                   {"scope": "nodes",
+                                    "values": {"rollup_retention_days": 1}},
+                                   cookie=admin_cookie)
+        check("HTTP nodes rollup_retention_days at its floor (1) -> 200",
+              status == 200, f"{status} {payload}")
     finally:
         try:
             server.stop()

@@ -1585,8 +1585,20 @@ _GLOBAL_SETTINGS_RANGES = {
 }
 
 
-def _check_settings_ranges(values: dict) -> None:
-    for key, (low, high) in _GLOBAL_SETTINGS_RANGES.items():
+# The one key two scopes disagree about. 0 is a real choice for a flow
+# rollup tier ("keep no summaries here"), but nodes' rollup_retention_days
+# bounds samples_hourly, where nodesseriesdb.prune reads 0 as "matches every
+# existing row" -- a year of metric history gone on the next sweep. The
+# browser has always sent min=1 for it; this is the same floor for a client
+# that skips the browser.
+_SCOPE_SETTINGS_RANGES = {
+    "nodes": {"rollup_retention_days": (1, 3650)},
+}
+
+
+def _check_settings_ranges(values: dict, scope: str = "") -> None:
+    overrides = _SCOPE_SETTINGS_RANGES.get(scope, {})
+    for key, (low, high) in {**_GLOBAL_SETTINGS_RANGES, **overrides}.items():
         if key not in values:
             continue
         value = values[key]
@@ -1749,7 +1761,7 @@ def post_settings(service, params, body) -> dict:
     # numeric key would persist and then raise from every subsequent start's
     # int() until the database was edited by hand.
     values = coerce_settings(_scope_defaults(scope), values, strict=True)
-    _check_settings_ranges(values)
+    _check_settings_ranges(values, scope)
     _check_disk_free_settings(service, values)
     if "web_relay_port_range" in values:
         # Typed here, not at the next relay: an unparseable range would
