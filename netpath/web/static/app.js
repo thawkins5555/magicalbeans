@@ -1704,11 +1704,28 @@ const App = (() => {
       `<label>${label} <input id="${id}" type="number" ${attrs} value="${value}"></label>`,
     text: (id, label, value, attrs = '') =>
       `<label>${label} <input id="${id}"${attrs ? ` ${attrs}` : ''} value="${value}"></label>`,
-    readers: (box) => ({
-      on: (id) => box.querySelector(id).checked,
-      num: (id) => Number(box.querySelector(id).value),
-      text: (id) => box.querySelector(id).value.trim(),
-    }),
+    /* A field the dialog did not render is a defect in the dialog, not an
+       empty answer, so it is named rather than guessed at: unguarded these
+       three read `.checked`/`.value` off null and the operator gets
+       "Cannot read properties of null" with nothing saying which of forty
+       fields it meant (alerts.js's flapping rule, 5.3.0). A sentinel would
+       be worse than the crash — `on` would post false and `num` NaN for a
+       setting nobody touched, and the wrong value would be saved silently.
+       A field that is genuinely optional is read directly, the way
+       alerts.js reads the SMTP password an install without a secret store
+       never renders. */
+    readers: (box) => {
+      const field = (id) => {
+        const node = box.querySelector(id);
+        if (!node) throw new Error(`This dialog has no field ${id}`);
+        return node;
+      };
+      return {
+        on: (id) => field(id).checked,
+        num: (id) => Number(field(id).value),
+        text: (id) => field(id).value.trim(),
+      };
+    },
   };
 
   function runModalAction(spec, box, button) {
