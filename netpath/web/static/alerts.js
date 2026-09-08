@@ -209,7 +209,14 @@
       cell: (r) => `<span class="sev sev-${r.severity}">${
         escape(App.state.severities?.[r.severity] || r.severity)}</span>` },
     { key: 'state', label: 'State', width: 80, on: true },
-    { key: 'entity_label', label: 'Object', width: 170, on: true },
+    // The link the detail pane has always carried, now on every row.
+    // search:false because device_id is null exactly when the label is not
+    // a device: gone from Nodes, or a DHCP scope. No `value:` — sortRows
+    // falls back to row[key], which is the text this renders.
+    { key: 'entity_label', label: 'Object', width: 170, on: true,
+      cell: (r) => App.deviceNameLink(r.entity_label,
+                                      { id: r.device_id, search: false })
+        || '\u2014' },
     { key: 'rule_name', label: 'Rule', width: 150, on: true },
     { key: 'message', label: 'Message', width: 260, on: true,
       cell: (r) => `<span class="msg">${escape(r.message)}</span>` },

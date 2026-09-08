@@ -624,7 +624,8 @@
   }
 
   /* A route into this tab: #/nodes, #/nodes?status=down, #/nodes?q=<mac>,
-     #/nodes?add=<ip>, #/nodes/device/<id>, #/nodes/device/<id>/port/<ifIndex>.
+     #/nodes?name=<name>, #/nodes?add=<ip>, #/nodes/device/<id>,
+     #/nodes/device/<id>/port/<ifIndex>.
      Called after refresh() has run, so view.devices is populated and the
      "select the first device if none is selected" rule below has already
      happened — which is exactly why the selection is applied here and not
@@ -635,7 +636,8 @@
     const query = opts.query || {};
     let filtered = false;
     for (const [id, key] of [['nd-filter-status', 'status'],
-                             ['nd-q', 'q']]) {
+                             ['nd-q', 'q'],
+                             ['nd-q', 'name']]) {
       if (query[key] === undefined) continue;
       const field = App.el(id);
       if (!field) continue;
@@ -644,6 +646,9 @@
       // A link that names a MAC address (IPAM's conflicts, for one) means
       // the same thing pressing Enter in this field does: run the MAC
       // search once the filtered device list is in, not just narrow it.
+      // `name` fills the same box and deliberately does not: a device
+      // called `beef01` is 4-12 hex characters, and a name link to it would
+      // otherwise land under "looks like an attempt at a MAC address".
       if (key === 'q') view.macSearchPending = true;
     }
     if (query.offline !== undefined) {
@@ -3410,7 +3415,8 @@
   const AVAIL_COLUMNS = [
     { key: 'name', label: 'Device', width: 200,
       value: (r) => r.name || r.ip || `#${r.device_id}`,
-      cell: (r) => `${escape(r.name || r.ip || `#${r.device_id}`)}` +
+      cell: (r) => App.deviceNameLink(r.name || r.ip || `#${r.device_id}`,
+                                      { id: r.device_id }) +
         (r.name && r.ip ? `<div class="ip-line">${escape(r.ip)}</div>` : '') },
     { key: 'devgroup', label: 'Group', width: 120,
       value: (r) => r._devGroupName || '',
@@ -3533,7 +3539,8 @@
   const TOPN_COLUMNS = [
     { key: 'device_name', label: 'Device', width: 180,
       value: (r) => r.device_name || r.device_ip || '',
-      cell: (r) => `${escape(r.device_name || r.device_ip || `#${r.device_id}`)}` +
+      cell: (r) => App.deviceNameLink(r.device_name || r.device_ip || `#${r.device_id}`,
+                                      { id: r.device_id }) +
         (r.device_name && r.device_ip ? `<div class="ip-line">${escape(r.device_ip)}</div>` : '') },
     { key: 'label', label: 'Metric', width: 170,
       value: (r) => r.label || r.key || '',

@@ -1486,6 +1486,65 @@ check("PUBLISHED_THRESHOLD_KEYS" in _ALERTS46
 check("if (!isPublished) {" in _ALERTS46,
       "and the save handler does not read inputs it did not render")
 
+# ---------------------------------------------------------------------------
+# 47. ALL TABS (5.4.0): a device name shown anywhere is a way into Nodes, and
+#     exactly one function decides what that way is.
+#
+# Eleven columns across seven modules printed a device's name as dead text
+# while the pane beside them linked the same name. The rule they now share is
+# not obvious from any one of them — link to the device's own pane where an
+# id is known, to the Nodes search where only a name is, and to neither for
+# an account without Nodes read — so it lives in App.deviceNameLink and the
+# call sites do not get to restate it.
+check("function deviceNameLink(" in APP and "deviceNameLink," in APP,
+      "App.deviceNameLink exists and is exported")
+check("canRead('nodes')" in APP.split("function deviceNameLink(")[-1][:600],
+      "...and it is the helper, not each caller, that refuses to hand a link "
+      "into Nodes to an account that cannot open Nodes")
+_NAME_ROUTE_BUILDERS = [name for name in MODULES
+                        if re.search(r"buildRoute\('nodes', \[\], \{ name:", read(name))]
+check(_NAME_ROUTE_BUILDERS == ["app.js"],
+      "the #/nodes?name= route is built in app.js alone; a module that built "
+      "it itself would be a second copy of the permission rule (found in: %s)"
+      % (", ".join(_NAME_ROUTE_BUILDERS) or "nothing"))
+
+# The call sites, by the cell each one is. NetFlow is deliberately absent:
+# its rows name flow endpoints by address, not fleet devices by name.
+NAME_LINK_SITES = {
+    "alerts.js": ["{ key: 'entity_label', label: 'Object'"],
+    "nodes.js": ["{ key: 'name', label: 'Device'",
+                 "{ key: 'device_name', label: 'Device'"],
+    "configrx.js": ["{ key: 'device', label: 'Device'"],
+    "mapper.js": ["suggestionName(s)", "candidateLink"],
+    "events.js": ["{ key: 'source', label: 'Source'",
+                  "{ key: 'source_name', label: 'Source name'"],
+    "wireless.js": ["{ key: 'name', label: 'Name'",
+                    "{ key: 'controller_id', label: 'Controller'"],
+    "ipam.js": ["{ key: 'hostname', label: 'Hostname', width: 220",
+                "{ key: 'hostname', label: 'Hostname', width: 200"],
+}
+for _name, _anchors in sorted(NAME_LINK_SITES.items()):
+    _body = read(_name)
+    for _anchor in _anchors:
+        _at = _body.find(_anchor)
+        check(_at != -1 and "App.deviceNameLink(" in _body[_at:_at + 500],
+              "%s builds its device name through App.deviceNameLink (%s)"
+              % (_name, _anchor))
+check("App.deviceNameLink(" in read("ipam.js").split("function resultsTable(")[-1][:900],
+      "ipam.js's global-search results table links its hostnames too")
+check("App.deviceNameLink(" not in read("netflow.js"),
+      "NetFlow is deliberately left out: a flow endpoint is an address seen "
+      "on the wire, not a device on the fleet")
+
+# The two routes are not interchangeable, and the one that runs a MAC search
+# must stay the one IPAM's conflicts link.
+check("['nd-q', 'name']" in NODES and "#/nodes?name=<name>" in NODES,
+      "nodes.js's route parser reads ?name= into the search box")
+check(re.search(r"if \(key === 'q'\) view\.macSearchPending = true;", NODES)
+      is not None,
+      "...and arms the MAC search for ?q= only, so a device whose name is "
+      "hex does not get told it typed a bad MAC address")
+
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

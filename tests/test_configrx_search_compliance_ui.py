@@ -161,9 +161,13 @@ check("addRuleDialog validates Pattern and Description through App.requireFields
 # 6. Escaping: nothing server-supplied (a device name, a rule description, a
 #    config line, a group name) is interpolated into a cell's HTML unescaped
 #    — configrx.js's own `escape` alias (App.escapeHtml) is what every other
-#    table on this page already uses.
+#    table on this page already uses. The Device column is the exception, and
+#    only in where it escapes: since 5.4.0 it is a link into Nodes, and
+#    App.deviceNameLink escapes the name it wraps (tests/test_alerts_ui.py
+#    runs that helper against a name full of quotes and angle brackets).
 for label, snippet in [
-    ("a search result's device name/ip", r"escape\(r\.device_name"),
+    ("a search result's device name/ip",
+     r"(?:escape|App\.deviceNameLink)\(r\.device_name"),
     ("a search result's config line", r"escape\(r\.line\)"),
     ("a rule set's name in its own row", r"escape\(r\.name\)"),
     ("a rule's pattern", r"escape\(r\.pattern\)"),

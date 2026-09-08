@@ -1061,7 +1061,8 @@
 
   const SEARCH_COLUMNS = [
     { key: 'device', label: 'Device',
-      cell: (r) => `${escape(r.device_name || r.device_ip || `#${r.device_id}`)}` +
+      cell: (r) => App.deviceNameLink(r.device_name || r.device_ip || `#${r.device_id}`,
+                                      { id: r.device_id }) +
         (r.device_name && r.device_ip ? `<div class="hint">${escape(r.device_ip)}</div>` : '') },
     { key: 'line_no', label: 'Line', numeric: true,
       cell: (r) => escape(String(r.line_no)) },

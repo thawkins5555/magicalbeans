@@ -222,6 +222,27 @@ mouse. A pane splitter can be moved from the keyboard: Tab to it, arrow keys
 move it 5 % (1 % with Shift), Home and End park it, Enter resets it, exactly
 as a double-click does. A column header resizes with Alt+Left/Right.
 
+### A device name is a way to that device
+
+Wherever a device is named outside Nodes, the name is a link. Where the page
+already knows which device it is — an alert's **Object**, the Device column
+of the availability and Top-N reports, ConfigRX's search results, MAPPER's
+upstream suggestions — the link opens that device's own pane in **Nodes**.
+Where only a name is on the row — a Syslog or SNMP-trap **Source** and
+**Source name**, an access point and its **Controller** in FORTI-AP, a
+**Hostname** in IPAM's hosts, DHCP leases and Find results — it opens Nodes
+with the search box already filled in and the first match selected, which is
+what typing the name there by hand would have done.
+
+Two things it deliberately does not do. It is never a MAC address search, so
+a device named in hex (`beef01`) is looked up as the name it is rather than
+answered with "that looks like an attempt at a MAC address" — IPAM's
+conflicts still link a MAC to the MAC search, which is a different link. And
+an account with no **Nodes** read sees the same names as plain text: no link
+is offered into a tab that would refuse to open. NetFlow is left out on
+purpose; the addresses in a flow record are endpoints seen on the wire, not
+devices on the fleet.
+
 ### Accessibility
 
 Keyboard and screen-reader support are built into the shell, not layered
@@ -1214,6 +1235,13 @@ alerts and optionally emailing about them.
   highlight in place but still. Motion therefore means "nobody has picked
   this up yet" rather than constant noise. A viewer whose system asks for
   reduced motion gets the highlight without the movement.
+- **The Object column opens the device in Nodes.** The same link the detail
+  pane beside it has always carried, now on every row, so triaging a list
+  does not mean reading a name off one table and typing it into another. An
+  alert whose device has been removed from Nodes, or that was never about a
+  device — a DHCP scope, an access point — keeps its label as plain text
+  rather than offering a link to nowhere, and sorting on the column still
+  sorts by the name.
 - **Alerts can be acknowledged or resolved individually or in bulk.**
   Every row carries a **checkbox** in its first column: tick the rows you
   want, or use **Select all**. A plain click still opens the detail pane,

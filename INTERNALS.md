@@ -6624,6 +6624,41 @@ persist to `localStorage`, keyed by page/table name, independent of
 anything server-side — a layout tuned for one screen survives a reload
 without needing a server round trip or a per-user setting.
 
+### Cross-tab device links (`App.deviceNameLink`, `app.js`) — 5.4.0
+
+`App.deviceLink(ip)` was the IP-address form: `App.deviceIndex()` resolves
+an address to a device and the caller awaits it, which is why it enhances a
+placeholder already on screen rather than rendering a cell. Names are the
+other, far more common direction, and they need none of that — the caller
+already holds the text it is drawing — so `App.deviceNameLink(name, opts)`
+is synchronous and returns the finished markup:
+
+* `opts.id` given → `#/nodes/device/<id>`, the device's own pane.
+* no id → `#/nodes?name=<name>`, which fills the Nodes search box.
+* `opts.search: false` and no id → escaped plain text. One caller
+  (`alerts.js`'s Object column) needs this: an alert's `entity_label` is a
+  device name only while `device_id` says so, and searching Nodes for a
+  DHCP scope's label would answer with the wrong device or with nothing.
+* no Nodes read, or an empty name → escaped plain text.
+
+Two things are in the helper rather than at the eleven call sites because
+each one would otherwise restate them. The first is that permission check:
+`App.canRead('nodes')`, the browser-side twin of `api.py`'s `_dash_can`,
+so an account that cannot open Nodes is never handed a link into it. The
+second is escaping — the helper is the one place the product builds an
+anchor out of a name somebody else chose, and both the label and the query
+string go through `escapeHtml`/`URLSearchParams`. In `App.drawRows` a
+column may only emit markup through `cell:` (the default path escapes), so
+every one of these sites is a `cell:`.
+
+`#/nodes?name=` is a second query key rather than a flag on `?q=` because
+`nodes.js`'s `activate()` arms `view.macSearchPending` for **any** `?q=`
+— that is what makes IPAM's conflict rows (`{ q: mac }`) run a MAC search
+on arrival. A device named `beef01` is 4–12 hex characters, so routing
+name links through `?q=` would have raised "…looks like an attempt at a MAC
+address" under a search that had just worked. Both keys write into the same
+`nd-q` field; only `q` sets the flag.
+
 ### Lazy module loading (`app.js`, `index.html`) — 4.49.0
 
 Before this release, `index.html` carried thirteen `<script defer>` tags —
