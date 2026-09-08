@@ -132,6 +132,10 @@ try:
           "entPhySensorValue walk it always did, with no second walk of a "
           "vendor table that could only time out",
           plain_requests == 1, plain_requests)
+    # This number is also the regression guard for 5.3.0's published-optic-
+    # threshold walk (nodepoll._poll_optic_thresholds): that walk hangs off
+    # the SAME _cisco_sensor_table_plausible gate, so a non-Cisco device's
+    # request count must not move when it is added.
     check("read_dom_all agrees for the same device, still empty",
           poller.read_dom_all(plain) == [], poller.read_dom_all(plain))
     plain_db.close()
@@ -305,6 +309,28 @@ try:
           "which is what the SFP badge in the interface list reads",
           db.interfaces(did)[0]["media"] == "optic",
           db.interfaces(did)[0]["media"])
+
+    # --- what the published-threshold walk costs a Cisco switch with optics
+    # (5.3.0). This stub mode answers no entSensorThresholdTable, which is
+    # the point: the three walks are attempted, cost one request each, and
+    # store nothing.
+    poller._sensor_read.clear()
+    poller._sensor_threshold_read[did] = time.time()
+    reset_count(port)
+    poller._poll_environment(did, db.device(did), config, set(), time.time())
+    without = request_count(port)
+    poller._sensor_read.clear()
+    poller._sensor_threshold_read.clear()
+    reset_count(port)
+    poller._poll_environment(did, db.device(did), config, set(), time.time())
+    check("a Cisco switch with a port-mapped optic pays exactly THREE more "
+          "requests once an hour -- entSensorThresholdSeverity, Relation "
+          "and Value, and nothing else",
+          request_count(port) - without == 3,
+          (without, request_count(port)))
+    check("a device that answers no threshold table stores no limits, so "
+          "its optic power rules simply never fire",
+          db.interface_thresholds(did) == {}, db.interface_thresholds(did))
     db.close()
 finally:
     stub.kill()
