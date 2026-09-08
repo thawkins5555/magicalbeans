@@ -154,6 +154,34 @@ CREATE TABLE IF NOT EXISTS interfaces (
 );
 CREATE INDEX IF NOT EXISTS ix_interfaces_device ON interfaces(device_id);
 
+-- The alarm/warning limits a transceiver publishes about ITSELF, learned by
+-- polling (nodepoll._poll_environment) rather than configured: an optic's
+-- safe receive range is a property of the part, so one global "-22 dBm"
+-- across a fleet of mixed SR/LR/ZR parts is wrong for most of them.
+--
+-- Its own table rather than columns on `interfaces` because four bands x
+-- five DOM roots is a matrix only optic ports have any value in, and because
+-- keeping it off `interfaces` leaves alertengine's breach-gated interfaces()
+-- read lazy. Keyed by (device_id, if_index) rather than interfaces.id so a
+-- port that is reindexed by a line-card change keeps its optic's limits.
+--
+-- `metric_root` is the rules.source_kind the limit governs ('sfp_rx_dbm'),
+-- so a rule finds its row with no translation and temperature/voltage/bias
+-- generalise later with no schema change. `source` names the MIB that
+-- published it, so a second vendor's walk replaces only its own rows. A NULL
+-- band is one this device does not publish, which alerts on nothing.
+CREATE TABLE IF NOT EXISTS interface_thresholds (
+    device_id    INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    if_index     INTEGER NOT NULL,
+    metric_root  TEXT    NOT NULL,
+    low_alarm    REAL, low_warn REAL, high_warn REAL, high_alarm REAL,
+    source       TEXT    NOT NULL,
+    updated_ts   REAL    NOT NULL,
+    PRIMARY KEY (device_id, if_index, metric_root)
+);
+CREATE INDEX IF NOT EXISTS ix_interface_thresholds_root
+    ON interface_thresholds(metric_root);
+
 -- Forwarding-database entries: which MAC addresses each switch port has
 -- learned. Stored so "find the port this MAC is on" is a query rather than
 -- a live walk of every switch in the estate — the same address can sit on
@@ -2899,6 +2927,69 @@ class NodesDatabase(SqliteStore):
             except sqlite3.DatabaseError:
                 self._conn.rollback()
                 raise
+
+    def replace_interface_thresholds(self, device_id: int, source: str,
+                                     rows: list[dict]) -> None:
+        """Wholesale replace of the limits ONE publisher answered for this
+        device — see the interface_thresholds schema comment.
+
+        Scoped to `source` so a device answering two vendors' tables keeps
+        both, and so a walk that came back empty for its own MIB retires that
+        MIB's stale rows rather than everybody's. The caller decides whether
+        an empty `rows` means "publishes nothing" or "the walk was cut
+        short"; a cut-short walk must not reach here at all.
+        """
+        params = [(device_id, row["if_index"], row["metric_root"],
+                   row.get("low_alarm"), row.get("low_warn"),
+                   row.get("high_warn"), row.get("high_alarm"),
+                   source, row["updated_ts"]) for row in rows]
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "DELETE FROM interface_thresholds WHERE device_id = ?"
+                    " AND source = ?", (device_id, source))
+                if params:
+                    self._conn.executemany(
+                        "INSERT INTO interface_thresholds(device_id, if_index,"
+                        " metric_root, low_alarm, low_warn, high_warn,"
+                        " high_alarm, source, updated_ts)"
+                        " VALUES (?,?,?,?,?,?,?,?,?)", params)
+                self._conn.commit()
+            except sqlite3.DatabaseError:
+                self._conn.rollback()
+                raise
+
+    def interface_thresholds(self, device_id: int) -> dict[tuple, sqlite3.Row]:
+        """(if_index, metric_root) -> the published limits row, for one
+        device — the shape the DOM dialog reads."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM interface_thresholds WHERE device_id = ?",
+                (device_id,)).fetchall()
+        return {(row["if_index"], row["metric_root"]): row for row in rows}
+
+    def interface_thresholds_for_roots(self, roots) -> dict[tuple, sqlite3.Row]:
+        """(device_id, metric_root, if_index) -> limits, fleet-wide for the
+        named roots — one indexed read per engine pass rather than one per
+        device, the same batching metrics_for_families exists for.
+
+        Disabled devices are filtered in Python for the reason
+        metrics_for_families gives: `enabled` is a devices column this query
+        would otherwise have to join to on every tick.
+        """
+        roots = sorted({str(root) for root in roots if root})
+        if not roots:
+            return {}
+        marks = ",".join("?" * len(roots))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM interface_thresholds"
+                f" WHERE metric_root IN ({marks})", roots).fetchall()
+        if not rows:
+            return {}
+        disabled = self.disabled_device_ids()
+        return {(row["device_id"], row["metric_root"], row["if_index"]): row
+                for row in rows if row["device_id"] not in disabled}
 
     def update_interface_stp(self, device_id: int, rows: list[dict]) -> None:
         """update_interface_poe's own counterpart for per-port STP state."""
