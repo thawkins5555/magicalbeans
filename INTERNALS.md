@@ -358,7 +358,7 @@ fourth setting).
 | `flows.db` | `FlowDatabase` (`flowdb.py`) | `flows`, `flow_rollup` (top-K per dimension per bucket, two tiers), `flow_rollup_span` (each bucket's grand total), `exporters`, `interfaces`, `samplers`, NetFlow's own settings |
 | `syslog.db` | `SyslogDatabase` (`syslogdb.py`) | `logs`, `log_counts` (hourly rollup), the FTS5 index, Syslog's own settings |
 | `ipam.db` | `IpamDatabase` (`ipamdb.py`) | `subnets`, `hosts`, `conflicts`, `scans`, `dhcp_servers`, `dhcp_scopes`, `dhcp_leases`, `dhcp_scope_history` (leased-IP trend), IPAM's own settings |
-| `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `device_groups` (organizational, unrelated to `groups`), `devices`, `interfaces`, `device_events`/`interface_events`, `discovery_jobs`/`discovery_results`, `vlans`/`vlan_ports`/`port_vlans` (per-port VLAN membership, for MAPPER), `mac_entries`, `neighbors`, `device_addresses`, `vendor_learned`, Nodes' own settings. Also the facade over the two files below |
+| `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `device_groups` (organizational, unrelated to `groups`), `devices`, `interfaces`, `device_events`/`interface_events`, `discovery_jobs`/`discovery_results`, `vlans`/`vlan_ports`/`port_vlans` (per-port VLAN membership, for MAPPER), `mac_entries`, `neighbors`, `device_addresses`, `vendor_learned`, `interface_thresholds` (the alarm/warning levels a port's own transceiver publishes), Nodes' own settings. Also the facade over the two files below |
 | `nodes_series.db` | `NodesSeriesDatabase` (`nodesseriesdb.py`) | `metrics`, `samples`, `samples_hourly` — the Nodes tables that grow |
 | `nodes_mibs.db` | `NodesMibDatabase` (`nodesmibdb.py`) | `mib_files` (including each file's original text), `mib_objects` |
 | `alerts.db` | `AlertsDatabase` (`alertsdb.py`) | `rules`, `templates`, `alerts`, `notifications`, `meta` (per-source evaluation cursors), `smtp_credential`, `device_thresholds` (per-device threshold-rule overrides), Alerts' own settings |
@@ -724,9 +724,19 @@ was `read_dom`, the on-demand SFP/DDM dialog, gated on
 human opened a dialog for — a gate that made every dedicated environmental
 monitor's chassis temperature and humidity sensors invisible everywhere in
 the app, because they map to no port at all. `_decode_entity_sensor` factors
-the actual RFC 3433 scaling arithmetic (`value × 10^(3×(scale-9)) /
-10^precision`) out of `read_dom` so both callers do it identically; the new
-`_poll_environment` calls it for every sensor entity a device answers, using
+the actual RFC 3433 scaling arithmetic out of `read_dom` so both callers do
+it identically — and from 5.3.0 that arithmetic itself lives one level
+further down, in `_scaled_sensor_value(raw, scale, precision)` (`value ×
+10^(3×(scale-9)) / 10^precision`), because the published-threshold walk has
+to apply it too. **A threshold is quoted in the scale and precision of the
+entity whose reading it governs**, never the threshold row's own index, so
+that walk decodes each level with `scales.get(entity)`/
+`precisions.get(entity)` keyed on the *entity* part of the
+`<entity>.<threshold index>` suffix. Getting that wrong is out by a factor
+of a thousand and still looks like a plausible dBm figure — which is why
+the stub fixture quotes its two optics in two different scales and the
+suite asserts `-8.2` and `-14.4` exactly. `_poll_environment` calls
+`_decode_entity_sensor` for every sensor entity a device answers, using
 `_entity_port_map` (entity → ifIndex, the resolution both dialog reads use)
 only to *classify* a temperature reading, never to gate whether it's read.
 
@@ -771,6 +781,65 @@ extreme one, which is the rule the device-level keys already use. There is
 deliberately no device-level `sfp_*` tier: a chassis has no one true Rx
 power, and `_HARDWARE_METRIC_PREFIXES` is left alone so forty-eight ports of
 these do not drown the dialog's HARDWARE list.
+
+**5.3.0 also learns what each optic says its own limits are.**
+`_poll_optic_thresholds` walks three columns of Cisco's
+`entSensorThresholdTable` — `entSensorThresholdSeverity` (`.2`),
+`Relation` (`.3`) and `Value` (`.4`) — and writes one
+`nodes.db:interface_thresholds` row per `(ifIndex, metric root)`, four
+nullable bands wide. It is called from inside `_poll_environment` after the
+per-sensor loop, so `scales`, `precisions`, `port_map`, `names` and `descrs`
+are all already in hand and it costs three walks and no re-walk.
+`threshold_roots` (suffix → `(ifIndex, root)`) is built *before* the
+`status != "ok"` filter, via the factored `_sfp_root_for`: a transceiver
+reading nonoperational for one cadence still publishes the same limits, and
+dropping them would switch that port's alerting off and on again with it.
+Every root in `_SFP_METRICS` is stored, not just the two dBm ones — same
+walk, free, and widening the rule set later needs no poller change.
+
+Four things it deliberately does *not* do. It never reads `.5`
+`entSensorThresholdEvaluation`: that is the device's instantaneous verdict,
+and taking it would bypass this app's hysteresis, breach streak and
+`for_polls` all at once (`.6` is about the device's own traps). It is gated
+on `_cisco_sensor_table_plausible`, **not** on which value table answered —
+a Nexus answers the standard table and publishes Cisco thresholds beside it,
+so gating on the source would miss the whole NX-OS fleet — and gated again
+on at least one port-mapped optic sensor this pass, so routers, PDUs and
+copper-only switches never pay three dead walks an hour for ever. It runs on
+its own `_SENSOR_THRESHOLD_REFRESH_S` (3600 s) stamp against the readings'
+300, since a published level changes only when somebody changes the optic;
+`poll_now` and `start_identify` drop that stamp alongside `_sensor_read`. And
+if any of the three walks comes back incomplete it writes **nothing**: the
+same doctrine as `_sfp_slot_media`'s `slots_complete`, and it matters more
+here, because an empty answer reads as "this device publishes nothing",
+which switches optical power alerting off for every port on it.
+
+Decoding is `severity → band` (`minor(10)` → warn, `major(20)`/
+`critical(30)` → alarm, `other(1)` dropped) crossed with `relation → side`
+(`lessThan`/`lessOrEqual` → low, `greaterThan`/`greaterOrEqual` → high,
+`equalTo`/`notEqualTo` dropped, since this app's evaluator only ever asks
+"at or past"). Several entities can land on one `(ifIndex, root)` — a
+multi-lane optic reports a lane per entity — and one entity can quote the
+same band twice; both collapse the same way, keeping whichever level alerts
+*earlier* (`max` for a low column, `min` for a high). Partial publication
+needs no handling at all: a NULL column is a band nothing is judged against.
+A band that contradicts itself (`low_alarm > low_warn`, `high_alarm <
+high_warn`, any low at or above any high) or a dBm figure outside
+`_DBM_LIMIT_RANGE` (−60…+30, which contains every real transceiver and
+nothing a scale misread lands in) discards that whole `(ifIndex, root)` row,
+with one rate-limited event-log line naming it.
+
+`interface_thresholds` is its own table rather than twenty columns on
+`interfaces`: four bands × five roots is a matrix only optic ports have any
+use for, this is poller-learned physical fact rather than operator config,
+and keeping it off `interfaces` leaves `alertengine`'s breach-gated
+`interfaces()` read lazy. It is keyed `(device_id, if_index, metric_root)`,
+not `interfaces.id`, so a port reindexed by a line-card change keeps its
+optic's limits — `replace_interfaces`' DELETE branch is the real hazard
+there, not its UPDATE branch, which touches only counters and status.
+`source` names the publisher so a second vendor's walk one day replaces only
+its own rows. `CREATE TABLE IF NOT EXISTS` in `nodesdb.SCHEMA` *is* the
+migration: `SCHEMA` is `executescript`ed on every open.
 
 The same pass writes `interfaces.media` (`update_interface_media`, batched
 like `update_interface_poe`): `'optic'` for every port a sensor resolved to
@@ -847,7 +916,12 @@ open: the floor is a fresh sample every poll, so `threshold_stale_s` can
 never expire it, and a lit optic that went dark — or any of the alerts a 5.1
 build raised on every dark port, all of them open at upgrade time — would
 have stayed open until a human resolved it by hand. A dark port is
-`interface_down`'s to report. The guard has to live there rather than at the
+`interface_down`'s to report. That `'clear'` branch is `'below'`-only and
+stays that way after 5.3.0 added four *high* optic power rules: −40 dBm is
+the bottom of the scale, so it cannot be at or above any published high
+threshold, `breaches()` never opened a high alert on it, and there is never
+one there to close — widening the condition would add a branch that can only
+ever be dead. The guard has to live there rather than at the
 metric write: `threshold_stale_s` defaults to 900 s, so a `-40` already
 recorded would go on re-evaluating for fifteen minutes, and one written by
 an older build would never expire at all. `_poll_environment` also drops
@@ -1348,7 +1422,16 @@ dialog has had since 4.x. Readings carry the RFC 3433 scaling (value x
 `entPhySensorUnitsDisplay` string as the unit where there is one — no
 vendor unit tables. A device that answers no sensor table, or maps
 nothing to this port, returns `[]`, which the dialog reports as "no
-DOM/sensor data" rather than an error.
+DOM/sensor data" rather than an error. From 5.3.0 every row also carries
+`limits` (the four published bands for that reading, or `None`) and
+`limits_source`, from one `nodesdb.interface_thresholds(device_id)` read per
+call and no extra walk — `_read_entity_sensors` puts `metric_root` on each
+row so both DOM reads find the right band without re-deriving the optical
+direction. They are on the row rather than left to the caller because a
+reading and the level it is judged against are one fact: an optical power
+row with no limits raises no alert at all, and `nodes.js`'s **Limits**
+column and its hint underneath are the only place an operator finds that
+out.
 
 **Whole-device hardware and DOM (`NodePoller.read_hardware`,
 `read_dom_all`) — 4.53.0.** `_read_entity_sensors` generalises the same
@@ -1361,7 +1444,7 @@ and, on Cisco gear (`detected_vendor(device) == "cisco"`),
 CISCO-ENVMON-MIB power-supply/fan/temperature state
 (`_read_cisco_envmon`); `read_dom_all` is the same entity list filtered
 to rows that resolved to a port, the device-wide counterpart of
-`read_dom` above. Two routes back them, `GET
+`read_dom` above, carrying the same `limits`/`limits_source` pair. Two routes back them, `GET
 /api/nodes/devices/<id>/hardware` and `.../dom` (`api.py`,
 `server.py`), read by the device dialog's HARDWARE SENSORS and DOM / SFP
 SENSORS sections (`nodes.js`); both walk only while that dialog is open,
@@ -3312,6 +3395,111 @@ open parent alert — is entity-kind generic and doesn't care), it just
 reuses the existing map to express "an open Critical already says what
 Warning is about to say" for a same-metric pair instead of an
 unreachable-device implication.
+
+### Optic power thresholds come from the port (`alertrules.py`, `alertengine.py`, `alertsdb.py`) — 5.3.0
+
+`alertrules.PUBLISHED_THRESHOLD_RULES` maps each of the eight optic power
+rule keys to `(metric root, interface_thresholds column)`. **A rule listed
+there reads that column and nothing else** — not `rules.threshold`, not a
+`device_thresholds` override — because a light level that means "failing"
+is a property of the transceiver, not of the site: one number across a
+fleet of mixed SR/LR/ZR parts is wrong for most of the optics it judges.
+The consequence is deliberate and was chosen by the operator over a global
+fallback: a port whose switch publishes no limits raises **no** optical
+power alert. The override row's `enabled` flag is still honoured — turning
+a rule off for one switch is a statement about that switch, not about
+physics.
+
+`_evaluate_thresholds` reads them once per pass, before the device loop, as
+`_published_thresholds(rules, now)` → `{(device_id, root, ifIndex): row}`,
+`{}` immediately when no such rule is enabled, cached `_PUBLISHED_CACHE_S`
+(60 s) against the poller's 3600 s write cadence. The `enabled = 0` branch
+and the override derivation above it are untouched — they are the base pair
+for every rule *not* in the map, so the six other threshold rules take
+exactly the path they always did. What moved is the `eval_rule`
+construction, which is now inside the per-target loop, because a per-port
+rule's effective threshold is per port. For a mapped rule the row's column
+is looked up and a missing row or NULL column `continue`s **before the
+streak is touched** and is never written into `live_streaks`, so a port
+that starts publishing tomorrow starts a fresh streak rather than resuming
+one counted against a number that was never applied. That `continue` is the
+dominant path on a real fleet and costs one dict lookup. The `dict(rule)`
+copies are cached per rule and per `(threshold, clear)` pair for the tick:
+without that, 2,000 devices at 48 optics each built three quarters of a
+million throwaway dicts per tick and the change would have been a
+performance regression. `streak_key` and the threshold-change reset need no
+change at all — the effective pair already rides inside the entry, so an
+optic swap resets the streak exactly as an override edit does.
+
+A device publishes a *level*, not a band, so this app supplies the
+hysteresis: `PUBLISHED_HYSTERESIS` (1.0 dB for both dBm roots), added for a
+`below` rule and subtracted for an `above` one. Deliberately **not** "the
+warning level is the alarm's clear", which is undefined whenever a device
+publishes an alarm and no warning — common on older IOS — and would leave
+an alarm that can never close. `extra["threshold"]` was already the
+effective number and is now per port with no edit; `extra["threshold_source"]`
+(`" (published by the optic)"`) is new, threaded through `alertmail`'s
+defaults, `token_reference` and the `threshold_breach` body, with the
+pre-5.3.0 wording added to `_PREVIOUS_BUILTIN_TEMPLATES` so `_migrate_templates`
+rewrites an unedited copy and leaves an edited one alone.
+
+**`_device_probe` was the highest-risk part of this change.** Every
+`ROLLED_UP_BY` entry before 5.3.0 had an outage (or `netpath_unreachable`)
+for a parent — a fact about the DEVICE — so both rollup lookups project a
+per-port occurrence onto its switch first, and `_device_probe`'s docstring
+asserted that as a general truth. It stopped being one the moment two
+per-port rules paired up: the optic power warnings roll up under their own
+alarms, both halves are about one interface, and projected onto the device
+the lookup asks about a dedup key that is never written — the pairing would
+have silently never fired, with no error anywhere.
+`alertrules.same_metric_pair(child_rule, parent_rule)` answers "both are
+`kind == 'threshold'` and share a non-empty `source_kind`", derived from the
+rules rather than kept as a second list beside `ROLLED_UP_BY`, and read
+defensively through `.keys()` so a plain dict satisfies it. Both
+`_rollup_parent` and `_parent_operator_resolved` now choose
+`occurrence if same_metric_pair(...) else self._device_probe(occurrence)`.
+`_absorb_one` already resolves both the entity's own key and a device's
+ports' prefix, so the retroactive resolve works unchanged once the parent
+occurrence is per-port.
+
+`ROLLED_UP_BY` is 1:1, so a warning spends its one slot on its alarm and
+loses the `device_down` rollup the old rules had — the same trade
+`temp_chassis_high` already made behind `temp_chassis_critical`. A
+transitive chain walk is a follow-up, not this change.
+
+**The upgrade is two named migrations, in this order.**
+`dampen_optic_power_siblings_1` is a SECOND named entry for the existing
+`_dampen_new_builtin_siblings`, and it has to be: `dampen_new_builtin_siblings_1`
+is already recorded on every install upgraded since 4.54 and will never run
+again, so without a new name an operator who muted `sfp_rx_power_low` would
+get three brand new rules over the same metric, emailing them, that they
+never agreed to. `_NEW_SIBLING_OF` gains the six new keys → their existing
+sibling; the method is idempotent by construction, so a second run on an
+install with nothing to inherit is a no-op. It must run **before**
+`clear_optic_power_thresholds_1`, which sets `threshold`/`clear_threshold`
+NULL on the two pre-existing keys: dampen decides "did the operator touch
+the sibling" by comparing the row against `_builtin_rule_defaults()`, which
+now reads NULL for these keys — run first it sees the operator's real
+number still on the row and reads it as touched, run after the clear it
+would read a carefully retuned rule as pristine and dampen nothing. The
+clear is **unconditional**, unlike `_retire_temp_high`'s "only if it still
+looks as shipped" guard: from now the engine never reads that column for
+these rules, so a number left there cannot change what alerts — but it can
+sit on the Rules page reading as the live threshold when it is not, and an
+operator investigating a dark port would tune it, watch nothing happen and
+conclude the feature is broken. `sfp_temp_high` is not touched: only
+optical power moved. Open alerts are left alone; the next tick re-derives
+or clears them.
+
+**Both writers refuse a number rather than ignoring one.**
+`_check_published_threshold` runs in `set_device_threshold` and in
+`update_rule` (only when the call actually sets one of the two columns), so
+a figure typed into either is rejected out loud. `enabled = False` with both
+numbers NULL is still allowed. `alerts.js` matches on the front end,
+replacing the two inputs with "Threshold — from the optic" for those eight
+keys rather than leaving a box the server refuses — a box an operator can
+type into and not save is exactly the silent ignore this release exists to
+remove.
 
 ### Alert mutes (`alertsdb.py`, `alertengine._muted`)
 
