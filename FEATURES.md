@@ -533,7 +533,10 @@ own subtabs.
 - **A reboot is detected** by comparing a device's reported `sysUpTime`
   against what wall-clock time elapsed since the last poll would predict
   — well outside a clock-skew grace band, and not explained by the
-  TimeTicks counter's own ~497-day wraparound.
+  TimeTicks counter's own ~497-day wraparound. Both uptimes are stated in
+  hours and days, not in the raw hundredths of a second SNMP reports them
+  in, and the reboot email fills in its own "previous/current reported
+  uptime" lines from them.
 - **Test** checks ping and SNMP against whatever is currently typed in
   the add/edit form, before it is saved, the same idiom IPAM's DHCP
   server test already uses.

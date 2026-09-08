@@ -15,14 +15,14 @@ from _paths import tmpdir
 
 from netpath import nodeoids
 from netpath.nodesdb import NodesDatabase
-from netpath.nodepoll import NodePoller, counter_rate
+from netpath.nodepoll import NodePoller, counter_rate, detect_reboot
 import netpath.nodepoll as nodepoll_mod
 from netpath.snmppoll import decode_response
 from netpath.trapdecode import (
     T_SEQUENCE, T_TIMETICKS, T_COUNTER32, T_COUNTER64, T_GAUGE32,
     T_NO_SUCH_OBJECT, T_NO_SUCH_INSTANCE, T_END_OF_MIB_VIEW,
     PDU_GET, PDU_GETNEXT, PDU_GETBULK, PDU_RESPONSE,
-    enc_int, enc_octets, enc_unsigned, enc_varbind, _tlv,
+    enc_int, enc_octets, enc_unsigned, enc_varbind, format_ticks, _tlv,
 )
 from netpath.wirelessdb import WirelessDatabase
 from netpath.fortipoll import WirelessPoller
@@ -618,8 +618,48 @@ def test_fortipoll_walk_terminates_on_stuck_oid():
     db.close()
 
 
+def test_format_ticks_divides_by_a_hundred():
+    """The sibling every other uptime consumer already goes through, and now
+    the reboot note's too. Pinned directly because "hundredths of a second"
+    is exactly the step this product got wrong once: 15000 TimeTicks is two
+    and a half minutes, not four hours."""
+    for ticks, expected in ((15_000, "00:02:30.00"), (100, "00:00:01.00"),
+                            (8_640_000, "1d 00:00:00"), (0, "00:00:00.00")):
+        check(format_ticks(ticks) == expected,
+              f"format_ticks({ticks}) is {expected} (got {format_ticks(ticks)})")
+
+
+def test_reboot_note_is_human_units():
+    """detect_reboot's note becomes the alert's message verbatim
+    (alertengine._drain_device_events), and it used to print sysUpTime raw:
+    a device up two and a half minutes reads 15000, so the alert said
+    "...to 15000 hundredths of a second after 300s". Every other uptime
+    consumer in the product divides by 100 first; this one now does too,
+    and reboot_uptimes reads the same two figures back out for the
+    device_rebooted template."""
+    previous_ticks, current_ticks = 1_036_800_000, 15_000    # 120 days, 2.5 min
+    rebooted, note = detect_reboot(current_ticks, 1300.0, previous_ticks, 1000.0)
+    check(rebooted, "the reset is still detected")
+    check(str(current_ticks) not in note and str(previous_ticks) not in note,
+          f"neither raw tick count is printed at a human ({note!r})")
+    check("hundredths" not in note, f"the note no longer says 'hundredths' ({note!r})")
+    check(format_ticks(previous_ticks) in note and format_ticks(current_ticks) in note,
+          f"both uptimes render through trapdecode.format_ticks ({note!r})")
+    check("5 m 00 s" in note,
+          f"the gap between readings is a duration, not a bare '300s' ({note!r})")
+
+    previous, current = nodepoll_mod.reboot_uptimes(note)
+    check(previous == format_ticks(previous_ticks)
+          and current == format_ticks(current_ticks),
+          f"the note round-trips back to its two uptimes ({previous!r}, {current!r})")
+    check(nodepoll_mod.reboot_uptimes("something else entirely") == ("", ""),
+          "a detail this did not write yields nothing rather than a wrong claim")
+
+
 def main():
     test_counter_rate_width_matters()
+    test_format_ticks_divides_by_a_hundred()
+    test_reboot_note_is_human_units()
     test_independent_octet_widths()
     test_utilization_clamped_at_sentinel()
     test_link_down_recorded_after_reboot_when_identity_unchanged()

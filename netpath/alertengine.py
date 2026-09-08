@@ -27,6 +27,7 @@ from .alertrules import CLEARS, ROLLED_UP_BY, ROLLS_UP, ROLLUP_ENTITY_KINDS, \
     evaluate_flapping, evaluate_threshold, interface_label, match_device, \
     syslog_signature
 from .eventlog import ALERTS, ERROR, NODES, NullLog
+from .nodepoll import reboot_uptimes
 from .nodesdb import TIMELINE_ONLY_EVENT_KINDS
 from .worker import Worker, ago
 
@@ -742,6 +743,13 @@ class AlertEngine(Worker):
             detail, extra = "", {}
             if row["kind"] == "up":
                 message, detail, extra = self._recovery_text(device, row, resolved)
+            elif row["kind"] == "rebooted":
+                # device_rebooted's two uptime lines had no writer anywhere:
+                # the template editor's preview filled them from its own
+                # sample, so they looked right, while every real reboot email
+                # rendered them blank.
+                previous, current = reboot_uptimes(row["detail"] or "")
+                extra = {"previous_uptime": previous, "current_uptime": current}
             occurrence = Occurrence(
                 kind="device_event", source_kind=row["kind"], entity_kind="device",
                 entity_id=str(device["id"]), entity_label=label, ts=row["ts"],
