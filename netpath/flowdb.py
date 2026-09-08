@@ -134,8 +134,13 @@ DEFAULTS = {
     "trust_exporter_sampling": True,
     "auto_accept_exporters": True,
     "allowed_exporters": "",
+    # retention_days and max_flows bound the raw flows alone; the rollups
+    # outlive them, which is what lets a 30-day chart still be drawn from a
+    # fortnight's raw retention.
     "retention_days": 14,
     "max_flows": 5_000_000,
+    "rollup_minute_days": 2,
+    "rollup_retention_days": 90,
     "resolve_addresses": False,
     "resolve_ports": True,
     "top_n": 10,
@@ -332,6 +337,177 @@ class FlowDatabase(SqliteStore):
         with self._lock:
             rows = self._conn.execute("SELECT * FROM interfaces").fetchall()
         return {f"{row['exporter']}:{row['if_index']}": row["name"] for row in rows}
+
+    # ----------------------------------------------------------------- rollup
+
+    def rollup_bounds(self, tier: int) -> tuple[int | None, int | None]:
+        """(floor, watermark): the oldest bucket this tier covers and the
+        first one it does not. Either is None before the tier is seeded."""
+        floor = self._private_setting(_FLOOR % tier)
+        watermark = self._private_setting(_WATERMARK % tier)
+        return (None if floor is None else int(floor),
+                None if watermark is None else int(watermark))
+
+    def _from_minute_tier(self, tier: int, bucket: int) -> bool:
+        """Whether the minute tier already covers this whole bucket. Sixty
+        minute rows in place of an hour of raw flows is the same answer
+        read sixty times more cheaply."""
+        if tier == 60:
+            return False
+        floor, watermark = self.rollup_bounds(60)
+        return (floor is not None and watermark is not None
+                and bucket >= floor and bucket + tier <= watermark)
+
+    def _compact_bucket(self, tier: int, bucket: int) -> int:
+        """Rebuild one bucket of every dimension, and its span row.
+
+        Delete and insert rather than upsert: which keys make the top-K
+        changes when a bucket is recomputed, so a key that has dropped out
+        of the cap has to be cleared rather than left behind at its old
+        value. One transaction per dimension, so the write lock is never
+        held across more than one.
+        """
+        limit = ROLLUP_KEYS[tier]
+        from_minutes = self._from_minute_tier(tier, bucket)
+        written = 0
+        for name, expr in DIMENSIONS.items():
+            dim = DIMENSION_IDS[name]
+            with self._lock:
+                self._conn.execute(
+                    "DELETE FROM flow_rollup WHERE tier = ? AND dim = ?"
+                    " AND bucket = ?", (tier, dim, bucket))
+                if from_minutes:
+                    cursor = self._conn.execute(
+                        "INSERT INTO flow_rollup(tier, dim, bucket, key, bytes,"
+                        " packets, flows) SELECT ?, ?, ?, key, bytes, packets,"
+                        " flows FROM (SELECT key, SUM(bytes) AS bytes,"
+                        " SUM(packets) AS packets, SUM(flows) AS flows"
+                        " FROM flow_rollup WHERE tier = 60 AND dim = ?"
+                        " AND bucket >= ? AND bucket < ?"
+                        " GROUP BY key ORDER BY bytes DESC LIMIT ?)",
+                        (tier, dim, bucket, dim, bucket, bucket + tier, limit))
+                else:
+                    cursor = self._conn.execute(
+                        f"INSERT INTO flow_rollup(tier, dim, bucket, key, bytes,"
+                        f" packets, flows) SELECT ?, ?, ?, key, bytes, packets,"
+                        f" flows FROM (SELECT {expr} AS key,"
+                        f" COALESCE(SUM(bytes * sampling), 0) AS bytes,"
+                        f" COALESCE(SUM(packets * sampling), 0) AS packets,"
+                        f" COUNT(*) AS flows FROM flows"
+                        f" WHERE ts_end >= ? AND ts_end < ?"
+                        f" AND ({expr}) IS NOT NULL"
+                        f" GROUP BY key ORDER BY bytes DESC LIMIT ?)",
+                        (tier, dim, bucket, bucket, bucket + tier, limit))
+                written += cursor.rowcount or 0
+                self._conn.commit()
+            # The collector's writer is waiting on this lock and a Python lock
+            # is not fair, the same reason sqlitebase.reclaim yields between
+            # its steps.
+            time.sleep(0)
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM flow_rollup_span WHERE tier = ? AND bucket = ?",
+                (tier, bucket))
+            if from_minutes:
+                self._conn.execute(
+                    "INSERT INTO flow_rollup_span(tier, bucket, bytes, packets,"
+                    " flows) SELECT ?, ?, SUM(bytes), SUM(packets), SUM(flows)"
+                    " FROM flow_rollup_span WHERE tier = 60 AND bucket >= ?"
+                    " AND bucket < ? HAVING COUNT(*) > 0",
+                    (tier, bucket, bucket, bucket + tier))
+            else:
+                self._conn.execute(
+                    "INSERT INTO flow_rollup_span(tier, bucket, bytes, packets,"
+                    " flows) SELECT ?, ?,"
+                    " COALESCE(SUM(bytes * sampling), 0),"
+                    " COALESCE(SUM(packets * sampling), 0), COUNT(*) FROM flows"
+                    " WHERE ts_end >= ? AND ts_end < ? HAVING COUNT(*) > 0",
+                    (tier, bucket, bucket, bucket + tier))
+            self._conn.commit()
+        return written
+
+    def compact_rollup(self, tier: int, max_buckets: int | None = None,
+                       budget_s: float = _ROLLUP_BUDGET_S) -> int:
+        """Summarise sealed buckets into `tier`, from a private watermark.
+
+        Seeded at the current bucket rather than at the oldest stored flow:
+        a store that has been collecting for a fortnight would otherwise
+        grind through all of it before producing a bucket anyone is looking
+        at. backfill_rollup pages the history in from the other end.
+
+        Returns the number of rollup rows written.
+        """
+        now = time.time()
+        sealed = _align_down(now - _ROLLUP_LAG_S, tier)
+        floor, watermark = self.rollup_bounds(tier)
+        if watermark is None:
+            start = _align_down(now, tier)
+            self._set_private_setting(_WATERMARK % tier, start)
+            self._set_private_setting(_FLOOR % tier, start)
+            return 0
+        bucket = watermark - _ROLLUP_REDO[tier] * tier
+        # A rewritten sampling factor changes rows a sealed bucket has
+        # already been built from, so follow the rewrite back rather than
+        # leaving the rollup quietly disagreeing with the raw rows.
+        resampled = self._private_setting(_RESAMPLE_FLOOR)
+        if resampled is not None:
+            bucket = min(bucket, _align_down(float(resampled), tier))
+        if floor is not None:
+            bucket = max(bucket, floor)
+        limit = _ROLLUP_MAX_BUCKETS[tier] if max_buckets is None else max_buckets
+        deadline = time.monotonic() + budget_s
+        written = 0
+        processed = 0
+        while (bucket + tier <= sealed and processed < limit
+               and time.monotonic() < deadline):
+            written += self._compact_bucket(tier, bucket)
+            bucket += tier
+            processed += 1
+        # max(): a pass that ran out of budget inside the redo window must
+        # not wind the watermark back to where it started.
+        self._set_private_setting(_WATERMARK % tier, max(bucket, watermark))
+        self._set_private_setting(_RESAMPLE_FLOOR, None)
+        return written
+
+    def backfill_rollup(self, tier: int, max_buckets: int | None = None,
+                        budget_s: float = _ROLLUP_BUDGET_S) -> tuple[int, bool]:
+        """Walk the floor backwards through history one bucket at a time,
+        committing the cursor as it goes so it resumes across restarts.
+
+        Newest first, because _rollup_plan refuses a tier whose floor does
+        not reach the start of the window asked for: as the cursor walks
+        back, progressively wider windows move off raw, and none is ever
+        slower than it was before.
+
+        Returns (rows written, whether this pass reached the end of the
+        walk) — the flag only once, so a caller can log it as an event.
+        """
+        floor, _watermark = self.rollup_bounds(tier)
+        if floor is None:
+            return 0, False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MIN(ts_end) AS oldest FROM flows").fetchone()
+        oldest = row["oldest"] if row else None
+        setting = ROLLUP_DAYS_SETTING[tier]
+        days = float(self.settings().get(setting, DEFAULTS[setting]))
+        # No point summarising what retention will delete on this same sweep.
+        stop = _align_down(time.time() - days * 86400, tier)
+        if oldest is not None:
+            stop = max(stop, _align_down(float(oldest), tier))
+        limit = _ROLLUP_MAX_BUCKETS[tier] if max_buckets is None else max_buckets
+        deadline = time.monotonic() + budget_s
+        written = 0
+        processed = 0
+        bucket = floor - tier
+        while (bucket >= stop and processed < limit
+               and time.monotonic() < deadline):
+            written += self._compact_bucket(tier, bucket)
+            self._set_private_setting(_FLOOR % tier, bucket)
+            bucket -= tier
+            processed += 1
+        done = bucket < stop and processed > 0
+        return written, done
 
     # ------------------------------------------------------------- maintenance
 
