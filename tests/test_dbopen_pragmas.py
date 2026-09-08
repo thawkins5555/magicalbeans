@@ -85,6 +85,27 @@ try:
 finally:
     mem.close()
 
+# ------------------------------------------ 4. the flow store's durability
+#
+# flows.db deliberately does NOT pin synchronous=FULL the way netpath.db,
+# app.db and ipam.db do: at a busy exporter's volume an fsync per commit
+# halves ingest, and NetFlow is UDP, so a stalled writer is lost data. This
+# is already true and was untested, which is how a later edit to
+# SqliteStore.PRAGMAS could silently take it away.
+
+from netpath.flowdb import FlowDatabase
+
+flow_db = FlowDatabase(os.path.join(TMP, "flows.db"))
+try:
+    check("the flow store runs at synchronous=NORMAL, not FULL",
+          pragma(flow_db._conn, "synchronous") == 1,
+          pragma(flow_db._conn, "synchronous"))
+    check("...in WAL, which is what makes NORMAL safe against a process crash",
+          str(pragma(flow_db._conn, "journal_mode")).lower() == "wal",
+          pragma(flow_db._conn, "journal_mode"))
+finally:
+    flow_db.close()
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 raise SystemExit(1 if FAILS else 0)

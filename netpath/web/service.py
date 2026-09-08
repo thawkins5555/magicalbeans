@@ -23,7 +23,7 @@ from ..configrx import ConfigRxWorker
 from ..configrxdb import ConfigRxDatabase
 from ..db import Database, FORCED_PRUNE_BUDGET_S, TRIM_BUDGET_S
 from ..eventlog import NODES, SYSTEM, EventLog
-from ..flowdb import FlowDatabase
+from ..flowdb import ROLLUP_TIERS, FlowDatabase
 from ..fortipoll import WirelessPoller
 from .. import ipam_scan
 from ..ipamdb import IpamDatabase
@@ -125,6 +125,17 @@ def disk_space(service) -> tuple[int, int]:
     except OSError:
         return 0, 0
     return usage.free, usage.total
+
+
+# The flow rollups get their own timer rather than riding the maintenance
+# sweep: at a quarter-hour cadence the unsummarised tail of raw flows would be
+# a quarter of an hour of them, which at a busy exporter's volume is the very
+# scan the rollups exist to avoid. With this and flowdb's seal lag the tail is
+# never more than about three minutes.
+ROLLUP_INTERVAL_S = 60
+
+# What each tier is called where an operator reads about it.
+ROLLUP_TIER_NAMES = {60: "minute", 3600: "hourly"}
 
 
 def _restart(worker, settings, enabled_default) -> None:
@@ -343,6 +354,7 @@ class Service:
 
         self._stop = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
+        self._rollup_thread: threading.Thread | None = None
         self._nodes_split_thread: threading.Thread | None = None
         # The maintenance thread waits on the first between ticks, so
         # request_maintenance() wakes it at once; the second marks that
@@ -527,6 +539,9 @@ class Service:
         self._maintenance_thread = threading.Thread(
             target=self._maintenance_loop, name="netpath-maintenance", daemon=True)
         self._maintenance_thread.start()
+        self._rollup_thread = threading.Thread(
+            target=self._rollup_loop, name="netpath-flow-rollup", daemon=True)
+        self._rollup_thread.start()
         self._start_nodes_split()
         self.log.add(SYSTEM, "Service started")
 
@@ -570,6 +585,9 @@ class Service:
         if self._maintenance_thread is not None:
             self._maintenance_thread.join(timeout=10.0)
             self._maintenance_thread = None
+        if self._rollup_thread is not None:
+            self._rollup_thread.join(timeout=10.0)
+            self._rollup_thread = None
         with self._maintenance_lock:
             # Interactive SSH sessions first: they are the only thing here a
             # person is watching, and each one writes a closing device event,
@@ -991,6 +1009,23 @@ class Service:
                 if requested and not self._maintenance_request.is_set():
                     self._maintenance_done.set()
 
+    def compact_flow_rollups(self) -> int:
+        """Summarise sealed flow buckets into both tiers."""
+        written = 0
+        for tier in ROLLUP_TIERS:
+            written += self.flow_db.compact_rollup(tier)
+        return written
+
+    def _rollup_loop(self) -> None:
+        while not self._stop.is_set():
+            if self._stop.wait(ROLLUP_INTERVAL_S):
+                break
+            try:
+                self.compact_flow_rollups()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+
     def request_maintenance(self) -> None:
         """Ask for a forced sweep and return; the sweep runs on the
         maintenance thread, which this wakes, rather than blocking the HTTP
@@ -1038,8 +1073,23 @@ class Service:
         self._trim_db("max_flow_db_mb", self.flow_db, "Flow database",
                       "oldest flow records")
 
-        self.flow_db.prune(float(self.flow_settings.get("retention_days", 14)),
-                           int(self.flow_settings.get("max_flows", 5_000_000)))
+        # Before the prune, not after: compaction summarises sealed buckets
+        # of raw flows, and pruning first would delete a bucket before it had
+        # been summarised. A chart wider than a quarter of an hour reads the
+        # rollups rather than the raw rows.
+        self.compact_flow_rollups()
+        for tier in ROLLUP_TIERS:
+            written, done = self.flow_db.backfill_rollup(tier)
+            if done:
+                self.log.add(SYSTEM, f"NetFlow: summarised the stored history "
+                                     f"into the {ROLLUP_TIER_NAMES[tier]} "
+                                     f"rollups ({written} row(s) on this pass)")
+        self.flow_db.drop_legacy_indexes()
+        self.flow_db.prune(
+            float(self.flow_settings.get("retention_days", 14)),
+            int(self.flow_settings.get("max_flows", 5_000_000)),
+            minute_days=float(self.flow_settings.get("rollup_minute_days", 2)),
+            rollup_days=float(self.flow_settings.get("rollup_retention_days", 90)))
 
         self.syslog_db.prune(
             float(self.syslog_settings.get("retention_days", 30)),

@@ -20,12 +20,24 @@ from .flowdb import FlowDatabase
 from .nfdecode import IPFIX, V5, V9, Decoder
 from .worker import ago
 
+# How far back a sampling rate announced after the fact rewrites the flows it
+# applies to. Unbounded, that UPDATE has no index it can use and grows into a
+# scan of the whole retention window -- run on the writer thread, under the
+# write lock, after every flush. The rollups redo a wider window than this, so
+# a rate that lands late still reaches the buckets already built from it.
+RESAMPLE_MAX_AGE_S = 900
+
+# Rows buffered before a flush goes early rather than waiting out the second.
+FLUSH_ROWS = 5000
+
 
 class Collector(udpsock.UdpReceiver):
     NOUN = "Collector"
     DROPS_PORT_NOUN = "NetFlow"
     LOG_CATEGORY = NETFLOW
     STOP_LOG = True
+    # Datagrams, not flows: one v9 packet carries up to about thirty, so this
+    # is a ceiling of roughly 600,000 buffered flows.
     QUEUE_SIZE = 20000
     COUNTERS = {"packets": 0, "flows": 0, "dropped": 0, "rejected": 0,
                 "errors": 0, "resampled": 0, "last_packet": 0.0,
@@ -157,25 +169,36 @@ class Collector(udpsock.UdpReceiver):
         per_exporter: dict[str, list[int]] = {}
         last_flush = time.time()
 
+        def take(exporter: str, flows: list) -> None:
+            pending.extend(flows)
+            entry = per_exporter.setdefault(exporter, [0, 0, 1, 0])
+            entry[0] += 1
+            entry[1] += len(flows)
+            entry[2] = flows[0].sampling
+            # Each exporter's own version, not whichever flow happened to
+            # be first in the whole batch: with v5 and v9 exporters in one
+            # flush window the Exporters table named the wrong protocol
+            # for every one of them.
+            entry[3] = flows[0].version
+
         while not self._stop.is_set():
             try:
-                exporter, flows = self._queue.get(timeout=0.4)
-                pending.extend(flows)
-                entry = per_exporter.setdefault(exporter, [0, 0, 1, 0])
-                entry[0] += 1
-                entry[1] += len(flows)
-                entry[2] = flows[0].sampling
-                # Each exporter's own version, not whichever flow happened to
-                # be first in the whole batch: with v5 and v9 exporters in one
-                # flush window the Exporters table named the wrong protocol
-                # for every one of them.
-                entry[3] = flows[0].version
+                take(*self._queue.get(timeout=0.4))
             except queue.Empty:
                 pass
+            # Drain what else is already waiting rather than taking one
+            # datagram per loop: a burst then costs one commit instead of
+            # hundreds, and the queue stays shallow, so the point at which
+            # queue.Full starts dropping flows comes far later.
+            while len(pending) < FLUSH_ROWS:
+                try:
+                    take(*self._queue.get_nowait())
+                except queue.Empty:
+                    break
 
             self._poll_kernel_drops()
             due = time.time() - last_flush >= 1.0
-            if pending and (due or len(pending) >= 500):
+            if pending and (due or len(pending) >= FLUSH_ROWS):
                 # A batch that fails to write must not end this thread: one
                 # crafted options record can push Flow.sampling past SQLite's
                 # int64 bind range (see nfdecode._set_sampling's clamp).
@@ -208,7 +231,8 @@ class Collector(udpsock.UdpReceiver):
         if not rates:
             return
         try:
-            corrected = self.db.record_sampling_rates(rates, self.started_at)
+            corrected = self.db.record_sampling_rates(
+                rates, max(self.started_at, time.time() - RESAMPLE_MAX_AGE_S))
         except Exception as exc:
             self._note_error(exc)
             return

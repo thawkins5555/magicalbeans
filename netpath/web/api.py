@@ -1004,8 +1004,12 @@ def get_flow_overview(service, params, body) -> dict:
     names = _address_names(service, dimension,
                            list(series) + [row["key"] for row in top_rows])
 
+    # times[0], not the t0 asked for: flowdb snaps the window start down to a
+    # bucket boundary so a rollup bucket lands wholly inside one slot, and the
+    # chart's own axis has to agree with the values drawn on it.
     return {
-        "t0": t0, "t1": t1, "bucket_s": bucket_s, "dimension": dimension,
+        "t0": times[0] if times else t0,
+        "t1": t1, "bucket_s": bucket_s, "dimension": dimension,
         "times": times,
         "series": [{"name": _flow_label(service, dimension, key, names),
                     "values": values}
@@ -1039,15 +1043,19 @@ FLOW_SCREEN_LIMIT = 250
 FLOW_EXPORT_CAP = 20000
 
 
-def _flow_records_rows(service, params, limit: int) -> tuple[list[dict], bool]:
+def _flow_records_rows(service, params, limit: int) -> tuple[list[dict], bool, bool]:
     """The row-producing half of get_flow_records, factored out so the
     export handler below can ask for FLOW_EXPORT_CAP rows through the
     identical filter/window/order path the screen uses for its 250 —
-    same params, same permission gate, just a taller limit."""
+    same params, same permission gate, just a taller limit.
+
+    The third result is flowdb's scan bound: whether the window reaches
+    further back than the ordering looked."""
     t0, t1 = _window(params)
     filters = _flow_filters(params)
     order = params.get("order", "bytes")
-    rows = service.flow_db.flows(t0, t1, filters, limit=limit + 1, order=order)
+    rows, bounded = service.flow_db.flows(t0, t1, filters, limit=limit + 1,
+                                          order=order)
     truncated = len(rows) > limit
     rows = rows[:limit]
 
@@ -1104,16 +1112,18 @@ def _flow_records_rows(service, params, limit: int) -> tuple[list[dict], bool]:
             # both, and the exporter filter keys off the address.
             "exporter_name": exporter_names.get(row["exporter"]),
         })
-    return records, truncated
+    return records, truncated, bounded
 
 
 def get_flow_records(service, params, body) -> dict:
-    records, _truncated = _flow_records_rows(service, params, FLOW_SCREEN_LIMIT)
-    return {"records": records}
+    records, _truncated, bounded = _flow_records_rows(
+        service, params, FLOW_SCREEN_LIMIT)
+    return {"records": records, "scan_bounded": bounded}
 
 
 def get_flow_records_export(service, params, body) -> dict:
-    records, truncated = _flow_records_rows(service, params, FLOW_EXPORT_CAP)
+    records, truncated, _bounded = _flow_records_rows(
+        service, params, FLOW_EXPORT_CAP)
     header = ["ts", "src_ip", "src_name", "src_port", "dst_ip", "dst_name",
              "dst_port", "protocol", "bytes", "packets", "in_if", "out_if",
              "exporter", "exporter_name"]
@@ -1813,7 +1823,9 @@ def post_maintenance(service, params, body) -> dict:
         return done(f"Deleted {removed} traces older than {days:.0f} days",
                     removed)
     if action == "prune_flows":
-        removed = service.flow_db.prune(0, 0)
+        # The rollups too: "delete all flow records" that left the charts
+        # full of data would not be what the button says.
+        removed = service.flow_db.prune(0, 0, minute_days=0, rollup_days=0)
         return done(f"Deleted {removed} flow records", removed)
     if action == "prune_syslog":
         removed = service.syslog_db.prune(0, 0)
