@@ -920,8 +920,8 @@ class NodePoller(Worker):
         self._vlan_running: set[int] = set()
         self._engines = EngineCache()
         self._discovery_jobs: dict[int, DiscoveryJob] = {}
-        # Held across a whole discovery start -- the "is one already running"
-        # question, the job row, and the thread -- so two HTTP threads asking
+        # Held across a whole discovery start — the "is one already running"
+        # question, the job row, and the thread — so two HTTP threads asking
         # it at once cannot both be told no one is scanning this target.
         # Reentrant because the answer is also read on its own below.
         self._discovery_lock = threading.RLock()
