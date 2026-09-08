@@ -1317,7 +1317,7 @@ alerts and optionally emailing about them.
 
 ### Rules
 
-- **47 built-in rules** ship enabled: a device not responding, a device
+- **49 built-in rules** ship enabled: a device not responding, a device
   recovering, a device rebooting, SNMP authentication failing, a device
   needing unsupported SNMPv3 privacy, a poll running longer than its own
   interval, a device whose vendor MIB is missing, an interface going
@@ -1421,6 +1421,21 @@ alerts and optionally emailing about them.
   one device failing. `smtp_failing` fires when the mail path itself stops
   working, and is the one rule whose notification cannot be delivered by
   the mechanism it is about — it exists so the alert list says so.
+- **Two more report on storage, new in 5.2.0**, because nothing in the
+  product alerted on a database running out of room before them.
+  `db_near_cap` opens once a database is at 85% of its size cap and the
+  maintenance sweep has already trimmed everything it could — from there on
+  every pass deletes history to keep the file under the cap, which is a
+  decision about how much the site keeps rather than a log line. It
+  escalates past 95% and closes on its own once the file is back under 80%,
+  and each database raises its own alert rather than one that flaps between
+  them. The alert names the file, its path, its size, its cap and the
+  retention setting that governs it, so it can be acted on from the alert.
+  `disk_space_low` covers what no cap can: the volume under all thirteen
+  files running out, which stops every one of them writing whatever their
+  caps say. Its two thresholds are on Settings → Data & retention. Like
+  every other `system` rule neither ever sends email — a full disk is
+  exactly when the mail spool is least trustworthy.
 - **A rule carries three attributes that the rule dialog now edits.**
   Beyond severity, enablement, device filter and thresholds: an
   auto-resolve interval (`auto_resolve_after_s`, blank meaning never), an
@@ -2866,8 +2881,24 @@ Each data file also says **how far back it still reaches** — "oldest record
 14.0d ago", or "no history" for a file nothing has written to yet — beside
 its path, which is what tells you whether a cap has been costing you
 history rather than merely sitting there. The MIB and map files hold
-current state rather than a log and so report no age at all. The same
-figure appears on the desktop console's Databases card.
+current state rather than a log and so say nothing at all about their age.
+The same figure appears on the desktop console's Databases card.
+
+**All thirteen data files are listed**, each on one row: its path, its
+size, and how far back it reaches. Wireless, ConfigRX and Mapper were
+counted in the "on disk in total" figure at the foot of the list but had no
+row of their own, so the total exceeded what was on screen with nothing
+accounting for the difference. The eight files with a size cap have the cap
+and a **% used** meter on a row of their own below; the five without a cap
+show their size and no meter, the way the Dashboard's storage-headroom tile
+already reported them. A file over its cap reads its true share — 112%, not
+100% — which is what the Dashboard has always shown, and the meter itself
+stops at the end of its track.
+
+**Free space on the volume** is on the same subtab, with the two thresholds
+that decide when a low disk raises an alert (warn below 10% of the volume,
+critical below 5%, both editable). A size cap governs one file; nothing
+else in the product notices the disk under all of them filling up.
 
 **Apply** on this tab saves and returns immediately. The retention sweep it
 asks for — pruning and trimming thirteen databases — runs on the

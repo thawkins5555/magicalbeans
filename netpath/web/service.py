@@ -7,8 +7,10 @@ over this.
 
 from __future__ import annotations
 
+import shutil
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..alertengine import AlertEngine
@@ -32,6 +34,7 @@ from ..monitor import AsnResolver, HopProber, Monitor, Resolver
 from ..nodepoll import NodePoller
 from .. import permissions
 from ..nodesdb import NodesDatabase
+from ..services import format_bytes
 from ..snmptrapd import TrapCollector
 from ..snmptrapdb import SnmpTrapDatabase
 from ..sshterm import SshSessionRegistry
@@ -41,6 +44,87 @@ from ..webrelay import WebRelayRegistry
 from ..wirelessdb import WirelessDatabase
 
 MAINTENANCE_INTERVAL_S = 900
+
+# When a capped database is close enough to its cap to be worth an alert,
+# and when that stops being true. Trimming keeps a busy store just under its
+# cap for ever, so the clear band sits below the raise band: without it the
+# alert would open and close on alternate sweeps for a store doing exactly
+# what the cap tells it to.
+DB_CAP_WARN_SHARE = 0.85
+DB_CAP_HIGH_SHARE = 0.95
+DB_CAP_CLEAR_SHARE = 0.80
+
+
+@dataclass(frozen=True)
+class Store:
+    """One database this application opens.
+
+    `name` is the prefix its keys carry in /api/state's storage block and
+    the entity_id its size alert uses, so each file gets an alert of its
+    own. `attr` is where it hangs off the Service. `cap_key` is the
+    max_*_db_mb setting that trims it, or None for a store that is
+    deliberately uncapped.
+    """
+
+    name: str
+    label: str
+    attr: str
+    cap_key: str | None
+
+
+# Every database, in the order the Settings page lists them. One table
+# because there were two hand-written ones — the storage block's and the
+# Dashboard headroom tile's — and mapper.db was added to one and missed in
+# the other, so two views of the same question disagreed about how many
+# databases exist. The maintenance sweep's size alerts read it too, so all
+# three can only be wrong together.
+STORES = (
+    Store("app", "Application", "app_db", None),
+    Store("trace", "NetPath", "db", "max_trace_db_mb"),
+    Store("flow", "NetFlow", "flow_db", "max_flow_db_mb"),
+    Store("snmp", "Traps", "snmp_db", "max_snmp_db_mb"),
+    Store("syslog", "Syslog", "syslog_db", "max_syslog_db_mb"),
+    Store("ipam", "IPAM", "ipam_db", "max_ipam_db_mb"),
+    Store("nodes", "Nodes", "nodes_db", "max_nodes_db_mb"),
+    Store("nodes_series", "Nodes metrics", "nodes_db.series_db",
+          "max_nodes_series_db_mb"),
+    Store("nodes_mibs", "Nodes MIBs", "nodes_db.mib_db", None),
+    Store("alerts", "Alerts", "alerts_db", "max_alerts_db_mb"),
+    Store("wireless", "Wireless", "wireless_db", None),
+    Store("configrx", "ConfigRX", "configrx_db", None),
+    Store("mapper", "Mapper", "mapper_db", None),
+)
+
+
+def db_for(service, store: Store):
+    """The database object `store` names, or None where this service has not
+    opened it — a partially built service still answers rather than raising,
+    the same way the Dashboard's collector list treats a worker that is not
+    there."""
+    obj = service
+    for part in store.attr.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
+
+
+def disk_space(service) -> tuple[int, int]:
+    """Free and total bytes on the volume the data files sit on, (0, 0) when
+    that cannot be read.
+
+    Asked of the application file's own directory: every store is opened
+    beside it in every shipped layout, and a cap only ever governs one file
+    — nothing else in the product notices the disk under them filling up.
+    """
+    db = db_for(service, STORES[0])
+    if db is None:
+        return 0, 0
+    try:
+        usage = shutil.disk_usage(Path(db.path).parent)
+    except OSError:
+        return 0, 0
+    return usage.free, usage.total
 
 
 def _restart(worker, settings, enabled_default) -> None:
@@ -1055,3 +1139,81 @@ class Service:
             float(self.alerts_settings.get("retention_days", 180)))
         self._trim_db("max_alerts_db_mb", self.alerts_db, "Alerts database",
                       "oldest resolved alerts")
+
+        self._sample_storage_alerts()
+
+    def _sample_storage_alerts(self) -> None:
+        """Alert on a database close to its cap, and on the volume under
+        them all running low.
+
+        At the end of the sweep rather than on a clock of its own, because
+        the trims above have just run: the size read here is what is left
+        after retention did everything it could, which is the only figure
+        worth waking anyone for. Driven from STORES so it cannot disagree
+        with the Settings page or the Dashboard about which databases exist
+        or what caps them, and the store name is the entity_id so each
+        database opens an alert of its own instead of one that flaps between
+        them.
+        """
+        engine = getattr(self, "alert_engine", None)
+        raise_it = getattr(engine, "system_occurrence", None)
+        clear_it = getattr(engine, "clear_system_occurrence", None)
+        if raise_it is None or clear_it is None:
+            return
+        for store in STORES:
+            if not store.cap_key:
+                continue
+            db = db_for(self, store)
+            cap = int(self.settings.get(store.cap_key, 0) or 0) * 1024 * 1024
+            if db is None or not cap:
+                continue
+            try:
+                used = int(db.size_bytes())
+            except Exception:                                 # noqa: BLE001
+                continue
+            share = used / cap
+            if share < DB_CAP_CLEAR_SHARE:
+                clear_it("db_near_cap", store.name)
+                continue
+            if share < DB_CAP_WARN_SHARE:
+                continue
+            # The percentage is in the message as well as in `severity`
+            # because AlertEngine._apply opens the row at the RULE's
+            # severity: what separates a store at 97% of its cap from one at
+            # 86% on the Alerts page is the wording, not the colour.
+            raise_it(
+                "db_near_cap", store.name, f"{store.label} database",
+                severity=2 if share >= DB_CAP_HIGH_SHARE else 3,
+                extra={"store": store.name, "path": db.path,
+                       "bytes": used, "cap_bytes": cap,
+                       "used_pct": round(share * 100, 1),
+                       "setting": store.cap_key},
+                message=(f"{store.label} is at {share * 100:.0f}% of its "
+                         f"{cap // 1048576} MB cap "
+                         f"({format_bytes(used)} in {db.path}). Every "
+                         f"maintenance pass now deletes its oldest records to "
+                         f"keep it under that cap. Raise {store.cap_key} in "
+                         f"Settings → Data & Retention to keep more history."))
+
+        free, total = disk_space(self)
+        if not total:
+            return
+        free_pct = free / total * 100.0
+        warn = float(self.settings.get("disk_free_warn_pct", 10) or 0)
+        critical = float(self.settings.get("disk_free_critical_pct", 5) or 0)
+        folder = str(Path(self.app_db.path).parent)
+        if not warn or free_pct >= warn:
+            clear_it("disk_space_low", "data")
+            return
+        raise_it(
+            "disk_space_low", "data", folder,
+            severity=2 if free_pct < critical else 3,
+            extra={"path": folder, "free_bytes": free, "total_bytes": total,
+                   "free_pct": round(free_pct, 1),
+                   "setting": "disk_free_warn_pct"},
+            message=(f"{folder} has {format_bytes(free)} free of "
+                     f"{format_bytes(total)} ({free_pct:.0f}%). Every "
+                     f"database in it stops being written the moment the "
+                     f"volume fills, whatever the size caps say. Warns below "
+                     f"{warn:.0f}% (disk_free_warn_pct in Settings → Data & "
+                     f"Retention)."))

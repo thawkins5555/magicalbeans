@@ -48,6 +48,7 @@ from .. import db as netpathdb
 from .. import report as reportmod
 from .. import permissions as _permissions
 from .. import appdb as _appdb
+from .service import STORES, db_for, disk_space
 
 MIN_BLOCK_PX = 3
 
@@ -531,19 +532,23 @@ def get_state(service, params, body) -> dict:
 
 
 def _storage(service) -> dict:
-    stores = (("app", service.app_db), ("trace", service.db), ("flow", service.flow_db),
-              ("syslog", service.syslog_db), ("snmp", service.snmp_db),
-              ("ipam", service.ipam_db), ("nodes", service.nodes_db),
-              ("nodes_series", service.nodes_db.series_db),
-              ("nodes_mibs", service.nodes_db.mib_db),
-              ("alerts", service.alerts_db), ("wireless", service.wireless_db),
-              ("configrx", service.configrx_db), ("mapper", service.mapper_db))
+    stores = [(store.name, db_for(service, store)) for store in STORES]
+    stores = [(name, db) for name, db in stores if db is not None]
     result = {f"{name}_path": db.path for name, db in stores}
     result.update({f"{name}_bytes": db.size_bytes() for name, db in stores})
     # How far back each file still reaches, so trimming reads as lost
     # history, not just bytes. None for the two with no history and for an
     # empty store.
     result.update({f"{name}_oldest_ts": db.oldest_ts() for name, db in stores})
+    # The volume itself, beside the files on it: a cap governs one database,
+    # and nothing on this page ever said how much room the disk had left for
+    # all of them. Named without the _bytes suffix on purpose — the total
+    # on the Settings page is the sum of every *_bytes key, and free space
+    # is not one of the files.
+    free, total = disk_space(service)
+    if total:
+        result["disk_free"] = free
+        result["disk_total"] = total
     return result
 
 
@@ -1541,6 +1546,10 @@ _GLOBAL_SETTINGS_RANGES = {
     "max_nodes_db_mb": (16, None),
     "max_nodes_series_db_mb": (16, None),
     "max_alerts_db_mb": (16, None),
+    # Bounded well below 100: a free-space floor at or near the whole volume
+    # is an alert that can never clear.
+    "disk_free_warn_pct": (1, 90),
+    "disk_free_critical_pct": (1, 90),
     "session_idle_minutes": (1, 1440),
     "session_max_hours": (1, 168),
     # These five are netpath-scope, not global, but land in the same flat
@@ -8251,36 +8260,23 @@ def get_dashboard(service, params, body) -> dict:
         # the question, and it is answered worst-first.
         settings = service.settings or {}
         stores = []
-        # Only databases with a cap on the Settings tab; app.db, wireless.db,
-        # configrx.db, mapper.db and nodes_mibs.db report size with no
-        # fraction rather than 0% used.
-        # This list is hand-written rather than derived from _storage's, and
-        # mapper.db was added to that one and missed here — two figures for
-        # the same question that disagreed. Anything opened as a database
-        # belongs in both.
-        for label, db, cap_key in (
-                ("NetPath", service.db, "max_trace_db_mb"),
-                ("NetFlow", service.flow_db, "max_flow_db_mb"),
-                ("Syslog", service.syslog_db, "max_syslog_db_mb"),
-                ("Traps", service.snmp_db, "max_snmp_db_mb"),
-                ("IPAM", service.ipam_db, "max_ipam_db_mb"),
-                ("Nodes", service.nodes_db, "max_nodes_db_mb"),
-                ("Nodes metrics", service.nodes_db.series_db,
-                 "max_nodes_series_db_mb"),
-                ("Nodes MIBs", service.nodes_db.mib_db, None),
-                ("Alerts", service.alerts_db, "max_alerts_db_mb"),
-                ("Wireless", service.wireless_db, None),
-                ("ConfigRX", service.configrx_db, None),
-                ("Mapper", service.mapper_db, None),
-                ("Application", service.app_db, None)):
+        # STORES, not a list of its own: this one was hand-written beside
+        # _storage's and mapper.db went into that one and not this one, so
+        # two views of the same question disagreed about how many databases
+        # exist. A store with no cap reports its size with no fraction
+        # rather than 0% used.
+        for store in STORES:
+            db = db_for(service, store)
+            if db is None:
+                continue
             try:
                 used = int(db.size_bytes())
             except Exception:                                 # noqa: BLE001
                 continue
-            cap_mb = settings.get(cap_key) if cap_key else None
+            cap_mb = settings.get(store.cap_key) if store.cap_key else None
             cap = int(cap_mb) * 1024 * 1024 if cap_mb else None
             stores.append({
-                "label": label, "bytes": used, "cap_bytes": cap,
+                "label": store.label, "bytes": used, "cap_bytes": cap,
                 "used_fraction": (used / cap) if cap else None,
             })
         stores.sort(key=lambda s: (s["used_fraction"] is None,

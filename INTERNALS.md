@@ -287,6 +287,35 @@ day-based retention prunes for each module,
 `AppDatabase.prune_hostnames()` for the reverse-DNS cache and
 `AppDatabase.prune_asn_cache()` for the ASN/owner cache.
 
+`web/service.py`'s module-level **`STORES`** is the one list of what those
+databases are: per store a `name` (the prefix its keys carry in the storage
+block, and the `entity_id` of any alert about it), a `label`, an `attr`
+naming where it hangs off the `Service`, and the `max_*_db_mb` `cap_key`
+that trims it or `None`. `db_for(service, store)` walks the `attr`, and
+answers `None` for a store this service has not opened rather than raising.
+`api._storage`, the Dashboard's storage-headroom tile and the maintenance
+sweep's size alerts all read it, which is what stopped them disagreeing:
+each was hand-written, and `mapper.db` went into one and was missed in the
+other — the Dashboard's own comment recorded it.
+
+The sweep ends in **`Service._sample_storage_alerts()`**, after the trims
+rather than on a clock of its own, so the size it reads is what is left once
+retention has done everything it can. Per capped store it raises the
+`db_near_cap` system rule at 85% of cap (`DB_CAP_WARN_SHARE`), escalates the
+occurrence's severity at 95% (`DB_CAP_HIGH_SHARE`) and clears below 80%
+(`DB_CAP_CLEAR_SHARE`) — a clear band under the raise band because trimming
+holds a busy store just under its cap for ever, and one threshold would
+open and close the alert on alternate sweeps. The store name is the
+`entity_id`, so each database has an alert of its own rather than one that
+flaps between them. `disk_space(service)` then reports the volume the
+application file sits on through `shutil.disk_usage`, and `disk_space_low`
+covers what no cap can: a full volume stops every database writing at once.
+Its two thresholds are `disk_free_warn_pct` and `disk_free_critical_pct` in
+`appdb.DEFAULTS`, editable on Settings → Data & retention. Both go through
+`AlertEngine.system_occurrence` / `clear_system_occurrence` reached with
+`getattr`, the convention `nodepoll._note_saturation` already uses, so a
+`Service` built without an engine still runs the sweep.
+
 Every pass runs on one thread, `netpath-maintenance`. The periodic tick
 waits on `_maintenance_request` (not on a bare sleep) for 60 s at a time
 and runs the sweep at most every `MAINTENANCE_INTERVAL_S`;
@@ -2905,7 +2934,7 @@ occurrence increments one alert instead of opening a duplicate" behavior
 lives in the database's own conflict resolution, not in application code
 that could race between a read and a write.
 
-47 built-in rules and 6 built-in templates are seeded via `INSERT OR
+49 built-in rules and 6 built-in templates are seeded via `INSERT OR
 IGNORE` keyed on each row's unique `key`, run on every open — idempotent,
 so a re-open never duplicates, and an admin's edit to a built-in rule's
 severity or a template's wording survives a restart because the seed
