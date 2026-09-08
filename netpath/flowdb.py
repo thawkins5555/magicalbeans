@@ -227,8 +227,8 @@ _ROLLUP_MAX_BUCKETS = {60: 240, 3600: 48}
 _ROLLUP_BUDGET_S = 5.0
 
 # How far back down the table the flow-record list sorts. Ordering by
-# bytes * sampling cannot be index-served -- the sort key is a product, and
-# sampling is rewritten after the fact -- so the scan is bounded by id
+# bytes * sampling cannot be index-served — the sort key is a product, and
+# sampling is rewritten after the fact — so the scan is bounded by id
 # instead, ids being handed out in arrival order. Not a setting: it is what
 # the sort costs, not a retention choice.
 FLOW_SCAN_CAP = 2_000_000
@@ -631,7 +631,7 @@ class FlowDatabase(SqliteStore):
         Batched in adaptive, lock-bounded chunks rather than one DELETE per
         stage: the write lock is the one the collector's writer needs, and
         NetFlow is UDP, so a writer stalled behind a month-wide delete is
-        lost data. The id range only chunks the sweep -- each batch still
+        lost data. The id range only chunks the sweep — each batch still
         filters on ts_end, so an exporter with a wrong clock cannot make
         prune() drop the wrong rows.
 
@@ -804,7 +804,7 @@ class FlowDatabase(SqliteStore):
 
         Returns (tier, dim, seal_ts): buckets in [t0, seal_ts) come from the
         rollup and flows from seal_ts to t1 from the raw table. seal_ts is a
-        multiple of the tier, so the two ranges are exactly complementary --
+        multiple of the tier, so the two ranges are exactly complementary —
         nothing is counted twice and nothing falls between them. `dim` is
         None when only the spans are wanted.
 
@@ -843,7 +843,7 @@ class FlowDatabase(SqliteStore):
 
         `rows` are (key, slot, bytes, packets, flows) per grouping key;
         `spans` maps a slot to that slot's grand [bytes, packets, flows],
-        which the rows do not add up to on their own -- a rollup keeps only
+        which the rows do not add up to on their own — a rollup keeps only
         the heaviest keys of each bucket, and the span is what the residual
         is measured against. `dimension` of None asks for the spans alone,
         `bucket_s` of None puts the whole window in one slot.
@@ -982,7 +982,7 @@ class FlowDatabase(SqliteStore):
             totals["flows"] += values[2]
 
         # The name breaks a tie, so two equal-volume keys keep the same order
-        # -- and so the same colour -- from one refresh to the next. SQL's
+        # — and so the same colour — from one refresh to the next. SQL's
         # ORDER BY left that order arbitrary.
         ordered = sorted(per_key.items(),
                          key=lambda kv: (-kv[1]["bytes"], str(kv[0])))
@@ -1018,7 +1018,7 @@ class FlowDatabase(SqliteStore):
 
     def flows(self, t0: float, t1: float, filters: dict, limit: int = 200,
               order: str = "bytes") -> tuple[list[sqlite3.Row], bool]:
-        """The window's heaviest -- or most recent -- individual records.
+        """The window's heaviest — or most recent — individual records.
 
         Returns (rows, whether the FLOW_SCAN_CAP bound cut the window short),
         so the page can say the ordering is over the most recent flows rather
