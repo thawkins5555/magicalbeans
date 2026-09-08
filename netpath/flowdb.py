@@ -12,6 +12,12 @@ millions, a week of hourly rollup is a few thousand. A key expression that
 evaluates to NULL cannot be stored (the rollup's primary key forbids it) and
 so lands in the residual the grand total leaves behind, where the raw path
 would have shown it as its own "unknown" series.
+
+What that costs in accuracy: totals are exact whichever path answers, since
+the grand total is not capped. A key that is above the cap in every bucket
+it appears in is exact too. A key that dips below the cap in some buckets is
+short by what it lost there, and that traffic is in "— other —" rather than
+missing. Filtered queries are never rollup-served and are exact throughout.
 """
 
 from __future__ import annotations
@@ -576,91 +582,191 @@ class FlowDatabase(SqliteStore):
             params.append(filters["exporter"])
         return " AND ".join(clauses), params
 
-    def top(self, t0: float, t1: float, dimension: str, filters: dict,
-            limit: int = 10) -> list[sqlite3.Row]:
-        key = DIMENSIONS.get(dimension, DIMENSIONS["Application"])
-        where, params = self._where(t0, t1, filters)
+    def _rollup_plan(self, t0: float, t1: float, dimension: str | None,
+                     filters: dict, bucket_s: float | None):
+        """Which rollup tier can answer this window, or None for raw.
+
+        Returns (tier, dim, seal_ts): buckets in [t0, seal_ts) come from the
+        rollup and flows from seal_ts to t1 from the raw table. seal_ts is a
+        multiple of the tier, so the two ranges are exactly complementary --
+        nothing is counted twice and nothing falls between them. `dim` is
+        None when only the spans are wanted.
+
+        A filtered query is never rollup-served: the rollup holds one row
+        per key, and the columns the filters select on are not in it.
+        """
+        if filters and any(filters.values()):
+            return None
+        if dimension is not None and dimension not in DIMENSION_IDS:
+            return None
+        for tier in sorted(ROLLUP_TIERS, reverse=True):
+            if bucket_s is None:
+                # Nothing to slot, so the finest tier is enough and the
+                # window start moves by at most a minute.
+                if tier != min(ROLLUP_TIERS):
+                    continue
+            elif tier > bucket_s or bucket_s % tier:
+                # A bucket lands wholly inside one slot only when every slot
+                # boundary is a multiple of the tier.
+                continue
+            floor, watermark = self.rollup_bounds(tier)
+            if floor is None or watermark is None or t0 < floor:
+                continue
+            # Never past t1: a bucket straddling the end of the window holds
+            # flows the raw path would not have counted.
+            seal = min(watermark, _align_down(t1, tier))
+            if seal <= t0:
+                continue
+            dim = None if dimension is None else DIMENSION_IDS[dimension]
+            return tier, dim, seal
+        return None
+
+    def _agg_rows(self, t0: float, t1: float, dimension: str | None,
+                  filters: dict, bucket_s: float | None):
+        """One window's aggregate: (t0, bucket_s, n_buckets, rows, spans).
+
+        `rows` are (key, slot, bytes, packets, flows) per grouping key;
+        `spans` maps a slot to that slot's grand [bytes, packets, flows],
+        which the rows do not add up to on their own -- a rollup keeps only
+        the heaviest keys of each bucket, and the span is what the residual
+        is measured against. `dimension` of None asks for the spans alone,
+        `bucket_s` of None puts the whole window in one slot.
+
+        The returned `t0` is the aligned one, on the raw path as much as the
+        rollup one: a bucket lands wholly inside one slot only when the
+        slots start on a bucket boundary, and aligning only where a rollup
+        happened to be used would shift the window under the operator every
+        time a filter was toggled.
+        """
+        if bucket_s is None:
+            align, n_buckets = float(min(ROLLUP_TIERS)), 1
+        else:
+            bucket_s = max(float(bucket_s), 1.0)
+            # Under a minute nothing is rollup-served anyway.
+            align = bucket_s if bucket_s % 60 == 0 else 0.0
+        if align:
+            t0 = float(_align_down(t0, align))
+        if bucket_s is not None:
+            n_buckets = max(1, int((t1 - t0) / bucket_s) + 1)
+        plan = self._rollup_plan(t0, t1, dimension, filters, bucket_s)
+
+        def slot(column: str) -> tuple[str, list]:
+            if bucket_s is None:
+                return "0", []
+            return f"CAST(({column} - ?) / ? AS INTEGER)", [t0, bucket_s]
+
+        key_sql: list[str] = []
+        key_params: list = []
+        span_sql: list[str] = []
+        span_params: list = []
+        raw_from = t0
+        if plan is not None:
+            tier, dim, raw_from = plan
+            expr, expr_params = slot("bucket")
+            if dim is not None:
+                key_sql.append(
+                    f"SELECT key, {expr} AS slot, bytes, packets, flows"
+                    f" FROM flow_rollup WHERE tier = ? AND dim = ?"
+                    f" AND bucket >= ? AND bucket < ?")
+                key_params.extend([*expr_params, tier, dim, t0, raw_from])
+            span_sql.append(
+                f"SELECT {expr} AS slot, bytes, packets, flows"
+                f" FROM flow_rollup_span WHERE tier = ? AND bucket >= ?"
+                f" AND bucket < ?")
+            span_params.extend([*expr_params, tier, t0, raw_from])
+
+        where, where_params = self._where(raw_from, t1, filters)
+        expr, expr_params = slot("ts_end")
+        if dimension is not None:
+            key = DIMENSIONS.get(dimension, DIMENSIONS["Application"])
+            # Where a rollup covers part of the window the raw tail drops its
+            # NULL keys too, so traffic a rollup cannot store does not appear
+            # as its own series for three minutes of an hour-wide chart.
+            unstorable = f" AND ({key}) IS NOT NULL" if plan is not None else ""
+            key_sql.append(
+                f"SELECT {key} AS key, {expr} AS slot,"
+                f" bytes * sampling AS bytes, packets * sampling AS packets,"
+                f" 1 AS flows FROM flows WHERE {where}{unstorable}")
+            key_params.extend([*expr_params, *where_params])
+        if plan is not None or dimension is None:
+            span_sql.append(
+                f"SELECT {expr} AS slot, bytes * sampling AS bytes,"
+                f" packets * sampling AS packets, 1 AS flows"
+                f" FROM flows WHERE {where}")
+            span_params.extend([*expr_params, *where_params])
+
+        rows: list = []
+        spans: dict[int, list] = {}
         with self._lock:
-            return self._conn.execute(
-                f"SELECT {key} AS key, SUM(bytes * sampling) AS bytes,"
-                f" SUM(packets * sampling) AS packets, COUNT(*) AS flows"
-                f" FROM flows WHERE {where} GROUP BY key"
-                f" ORDER BY bytes DESC LIMIT ?",
-                (*params, limit),
-            ).fetchall()
+            if key_sql:
+                rows = self._conn.execute(
+                    "SELECT key, slot, SUM(bytes) AS bytes,"
+                    " SUM(packets) AS packets, SUM(flows) AS flows FROM ("
+                    + " UNION ALL ".join(key_sql) +
+                    ") GROUP BY key, slot", key_params).fetchall()
+            if span_sql:
+                for row in self._conn.execute(
+                        "SELECT slot, SUM(bytes) AS bytes,"
+                        " SUM(packets) AS packets, SUM(flows) AS flows FROM ("
+                        + " UNION ALL ".join(span_sql) +
+                        ") GROUP BY slot", span_params).fetchall():
+                    spans[row["slot"]] = [row["bytes"] or 0, row["packets"] or 0,
+                                          row["flows"] or 0]
+        if not span_sql:
+            # The raw path already read every key there is, so adding them up
+            # is the same number a second scan of the window would return.
+            for row in rows:
+                entry = spans.setdefault(row["slot"], [0, 0, 0])
+                entry[0] += row["bytes"] or 0
+                entry[1] += row["packets"] or 0
+                entry[2] += row["flows"] or 0
+        if bucket_s is None:
+            bucket_s = max(float(t1) - t0, 1.0)
+        return t0, bucket_s, n_buckets, rows, spans
+
+    def top(self, t0: float, t1: float, dimension: str, filters: dict,
+            limit: int = 10) -> list[dict]:
+        _times, _series, _bucket_s, top_rows, _totals = self.overview(
+            t0, t1, dimension, filters, None, series_limit=0, top_limit=limit)
+        return top_rows
 
     def series(self, t0: float, t1: float, dimension: str, filters: dict,
                bucket_s: float, limit: int = 8):
         """Stacked series for the top keys, with everything else as 'other'."""
-        key = DIMENSIONS.get(dimension, DIMENSIONS["Application"])
-        where, params = self._where(t0, t1, filters)
-        bucket_s = max(float(bucket_s), 1.0)
-        n_buckets = max(1, int((t1 - t0) / bucket_s) + 1)
-
-        top_rows = self.top(t0, t1, dimension, filters, limit)
-        top_keys = [row["key"] for row in top_rows]
-
-        with self._lock:
-            rows = self._conn.execute(
-                f"SELECT {key} AS key, CAST((ts_end - ?) / ? AS INTEGER) AS slot,"
-                f" SUM(bytes * sampling) AS bytes FROM flows WHERE {where}"
-                f" GROUP BY key, slot",
-                (t0, bucket_s, *params),
-            ).fetchall()
-
-        series: dict[object, list[float]] = {k: [0.0] * n_buckets for k in top_keys}
-        other = [0.0] * n_buckets
-        for row in rows:
-            slot = row["slot"]
-            if slot is None or slot < 0 or slot >= n_buckets:
-                continue
-            target = series.get(row["key"])
-            if target is None:
-                other[slot] += row["bytes"] or 0
-            else:
-                target[slot] += row["bytes"] or 0
-        if any(other):
-            series["\u2014 other \u2014"] = other
-
-        times = [t0 + i * bucket_s for i in range(n_buckets)]
+        times, series, bucket_s, _top_rows, _totals = self.overview(
+            t0, t1, dimension, filters, bucket_s, series_limit=limit,
+            top_limit=limit)
         return times, series, bucket_s
 
     def overview(self, t0: float, t1: float, dimension: str, filters: dict,
                  bucket_s: float, series_limit: int = 8, top_limit: int = 10):
         """Everything the NetFlow overview needs, from one pass over the window.
 
-        The `GROUP BY key, slot` scan holds all three answers: per key it is
-        top(), over everything it is totals(), by slot it is the series.
+        The `GROUP BY key, slot` scan holds two of the three answers: per key
+        it is top(), by slot it is the series. The totals come from the
+        per-slot grand totals instead, so they stay exact over a rollup that
+        stored only the heaviest keys of each bucket.
         Returns (times, series, bucket_s, top_rows, totals).
         """
-        key = DIMENSIONS.get(dimension, DIMENSIONS["Application"])
-        where, params = self._where(t0, t1, filters)
-        bucket_s = max(float(bucket_s), 1.0)
-        n_buckets = max(1, int((t1 - t0) / bucket_s) + 1)
-
-        with self._lock:
-            rows = self._conn.execute(
-                f"SELECT {key} AS key, CAST((ts_end - ?) / ? AS INTEGER) AS slot,"
-                f" SUM(bytes * sampling) AS bytes,"
-                f" SUM(packets * sampling) AS packets, COUNT(*) AS flows"
-                f" FROM flows WHERE {where} GROUP BY key, slot",
-                (t0, bucket_s, *params),
-            ).fetchall()
+        t0, bucket_s, n_buckets, rows, spans = self._agg_rows(
+            t0, t1, dimension, filters, bucket_s)
 
         per_key: dict[object, dict] = {}
-        totals = {"bytes": 0, "packets": 0, "flows": 0}
         for row in rows:
             entry = per_key.setdefault(
                 row["key"], {"bytes": 0, "packets": 0, "flows": 0})
             entry["bytes"] += row["bytes"] or 0
             entry["packets"] += row["packets"] or 0
             entry["flows"] += row["flows"] or 0
-            totals["bytes"] += row["bytes"] or 0
-            totals["packets"] += row["packets"] or 0
-            totals["flows"] += row["flows"] or 0
+
+        totals = {"bytes": 0, "packets": 0, "flows": 0}
+        for values in spans.values():
+            totals["bytes"] += values[0]
+            totals["packets"] += values[1]
+            totals["flows"] += values[2]
 
         # The name breaks a tie, so two equal-volume keys keep the same order
-        # — and so the same colour — from one refresh to the next. SQL's
+        # -- and so the same colour -- from one refresh to the next. SQL's
         # ORDER BY left that order arbitrary.
         ordered = sorted(per_key.items(),
                          key=lambda kv: (-kv[1]["bytes"], str(kv[0])))
@@ -668,7 +774,6 @@ class FlowDatabase(SqliteStore):
         top_keys = [k for k, _ in ordered[:series_limit]]
 
         series: dict[object, list[float]] = {k: [0.0] * n_buckets for k in top_keys}
-        other = [0.0] * n_buckets
         wanted = set(top_keys)
         for row in rows:
             slot = row["slot"]
@@ -676,8 +781,19 @@ class FlowDatabase(SqliteStore):
                 continue
             if row["key"] in wanted:
                 series[row["key"]][slot] += row["bytes"] or 0
-            else:
-                other[slot] += row["bytes"] or 0
+
+        # What the named series leave over, taken from the slot's own total
+        # rather than by adding up the keys that were left out: on the rollup
+        # path not all of them are stored, and on the raw path this is the
+        # same number either way.
+        other = [0.0] * n_buckets
+        for slot, values in spans.items():
+            if slot is None or slot < 0 or slot >= n_buckets:
+                continue
+            other[slot] += values[0]
+        for values in series.values():
+            for index, value in enumerate(values):
+                other[index] -= value
         if any(other):
             series["\u2014 other \u2014"] = other
 
@@ -696,12 +812,13 @@ class FlowDatabase(SqliteStore):
             ).fetchall()
 
     def totals(self, t0: float, t1: float, filters: dict) -> dict:
-        where, params = self._where(t0, t1, filters)
-        with self._lock:
-            row = self._conn.execute(
-                f"SELECT COUNT(*) AS flows, SUM(bytes * sampling) AS bytes,"
-                f" SUM(packets * sampling) AS packets FROM flows WHERE {where}",
-                params,
-            ).fetchone()
-        return {"flows": row["flows"] or 0, "bytes": row["bytes"] or 0,
-                "packets": row["packets"] or 0}
+        """Exact on both paths: a rollup's span row is the whole bucket, not
+        the keys that fitted under the cap."""
+        _t0, _bucket_s, _n, _rows, spans = self._agg_rows(
+            t0, t1, None, filters, None)
+        out = {"flows": 0, "bytes": 0, "packets": 0}
+        for values in spans.values():
+            out["bytes"] += values[0]
+            out["packets"] += values[1]
+            out["flows"] += values[2]
+        return out
