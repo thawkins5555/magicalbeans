@@ -1385,6 +1385,20 @@ check("function setWindow(t0, t1, follow) {" in _NETFLOW,
 check("if (view.windowTimer) return;" in _NF_REFRESH,
       "...and the poll tick stands off while one is pending, rather than "
       "fetching the half-way window it can see mid-burst")
+check("if (windowChanged) showLoading();" in _NF_FETCH,
+      "the Loading state is for a window change, not for every refresh — the "
+      "two-second poll must not blank the page it is refreshing")
+
+_NF_LOADING = _NETFLOW[_NETFLOW.index("  function showLoading() {"):
+                       _NETFLOW.index("  function filters() {")]
+for _target in ("drawChart();", "drawBars();", "drawTable("):
+    check(_target in _NF_LOADING,
+          "a window change says so over the chart, the top-N bars and the "
+          "record table (%s), so the window just left is not left on screen "
+          "looking like the answer" % _target.rstrip("(;"))
+check("LOADING_TEXT = 'Loading…'" in _NETFLOW and "App.loading()" in _NETFLOW,
+      "...in the house vocabulary App.loading() already uses everywhere else, "
+      "not a modal over a read and not a second word for the same wait")
 
 
 print()

@@ -44,6 +44,9 @@
   // rendering its header over an empty tbody with no word said at all).
   const NO_FLOWS_TEXT = 'No flows match this window and filters. Widen the ' +
     'time window or clear a filter.';
+  // The same word App.loading() puts in every other pane still waiting on a
+  // fetch; here it also has to reach the chart, which is an SVG.
+  const LOADING_TEXT = 'Loading…';
 
   const view = {
     t0: Date.now() / 1000 - 3600,
@@ -56,6 +59,7 @@
     windowTimer: null,
     request: 0,
     abort: null,
+    loading: false,
   };
 
   const escape = App.escapeHtml;
@@ -88,7 +92,7 @@
 
   /* Long enough to swallow a gesture, short enough that one click on Reset
      still reads as an immediate answer — the busy line app.css draws at
-     400 ms carries the rest of the wait. */
+     400 ms, and the Loading state below, carry the rest of the wait. */
   const REFETCH_MS = 250;
 
   /* The window an operator has just left is not worth finishing. Its two
@@ -111,10 +115,14 @@
      ever wider window, so the dozen nobody wanted queued on the flow
      database ahead of the one they did. The window itself still moves on
      every event, so the label tracks the gesture live. */
-  function requestFetch() {
+  function requestFetch(windowChanged) {
     dropInFlight();
     view.windowTimer = setTimeout(() => {
       view.windowTimer = null;
+      // Only once the burst has settled and this fetch is really going:
+      // blanking the chart on every wheel event would take away the picture
+      // the gesture is aiming with.
+      if (windowChanged) showLoading();
       App.refreshNow('netflow');
     }, REFETCH_MS);
   }
@@ -134,7 +142,7 @@
 
   function setWindow(t0, t1, follow) {
     applyWindow(t0, t1, follow);
-    requestFetch();
+    requestFetch(true);
   }
 
   function zoom(factor) {
@@ -161,6 +169,21 @@
   function resetWindow() {
     const [t0, t1] = rangeWindow();
     setWindow(t0, t1, true);
+  }
+
+  /* A window change asks a different question, so the answer to the previous
+     one stops being shown while the new one is fetched: a chart and a record
+     table of the minutes an operator has just left read as the answer, and
+     carry nothing that says otherwise. Scoped to the two views that are
+     actually changing rather than modalling the page, and deliberately NOT
+     the poll tick — re-reading the same window every two seconds must not
+     blank the page it is refreshing. */
+  function showLoading() {
+    view.loading = true;
+    App.el('nf-totals').textContent = LOADING_TEXT;
+    drawChart();
+    drawBars();
+    drawTable(view.records);
   }
 
   function filters() {
@@ -245,7 +268,8 @@
     // every refresh and on every frame of a divider drag, tearing the SVG
     // down and rebuilding one hit rectangle with three listeners per
     // bucket each time, whether or not anything was different.
-    const signature = `${width}x${height}:${JSON.stringify(view.data)}`;
+    const signature = `${width}x${height}:`
+      + (view.loading ? LOADING_TEXT : JSON.stringify(view.data));
     if (svg.dataset.signature === signature) return;
     svg.dataset.signature = signature;
     svg.innerHTML = '';
@@ -258,8 +282,8 @@
       h: Math.max(height - PAD.top - PAD.bottom - legendH, 10),
     };
 
-    if (!data || !data.times.length || !data.series.length) {
-      App.emptyText(svg, width, height, NO_FLOWS_TEXT);
+    if (view.loading || !data || !data.times.length || !data.series.length) {
+      App.emptyText(svg, width, height, view.loading ? LOADING_TEXT : NO_FLOWS_TEXT);
       showFocusTip(container);
       return;
     }
@@ -446,6 +470,7 @@
   function drawBars() {
     const wrap = App.el('nf-bars');
     wrap.innerHTML = '';
+    if (view.loading) { wrap.innerHTML = App.loading(); return; }
     const rows = view.data ? view.data.top : [];
     if (!rows.length) {
       wrap.innerHTML = `<p class="empty">${NO_FLOWS_TEXT}</p>`;
@@ -605,13 +630,16 @@
     COLUMNS, (App.state.flowSettings || {}).table_columns);
 
   function drawTable(records) {
-    view.records = records;
+    // While loading these records belong to the window being left, so they
+    // are neither shown nor remembered as the answer to the one being asked.
+    if (!view.loading) view.records = records;
     const columns = recordColumns();
     const table = App.grid(App.el('nf-table'),
                            { name: 'nf-records', caption: 'NetFlow records',
                              columns, sort, onSort });
     const body = document.createElement('tbody');
-    const rows = App.sortRows(records, sort.key, sort.descending, columns);
+    const rows = view.loading
+      ? [] : App.sortRows(records, sort.key, sort.descending, columns);
     App.drawRows(body, rows, columns, (tr, record) => {
       const dst = record.dst_name || record.dst_ip || '';
       // Flow-to-path correlation: jump straight to the NetPath route that
@@ -669,7 +697,7 @@
         App.tooltip(text, { clientX: box.left + box.width / 2, clientY: box.bottom });
       });
       tr.addEventListener('blur', App.hideTooltip);
-    }, NO_FLOWS_TEXT);
+    }, view.loading ? LOADING_TEXT : NO_FLOWS_TEXT);
     table.appendChild(body);
     App.wireRowKeyboard(body);
   }
@@ -901,6 +929,7 @@
       }, options),
     ]);
     if (token !== view.request) return;
+    view.loading = false;
     view.data = data;
 
     const totals = view.data.totals;
@@ -1024,9 +1053,10 @@
         packets: `Top ${RECORD_LIMIT} by packets`,
         time: `Most recent ${RECORD_LIMIT}` }[option.value] || option.textContent;
     }
-    // Through the same collapse as a window change: re-ordering asks for
-    // different records, and the burst it can arrive in is the same one.
-    App.el('nf-order').onchange = () => requestFetch();
+    // Through the same collapse as a window change, minus its Loading state:
+    // re-ordering asks for different records, not for a different window, so
+    // the chart above them is still the answer to the question on screen.
+    App.el('nf-order').onchange = () => requestFetch(false);
     // nf-range is deliberately NOT in this list: its change handler is
     // resetWindow (above), which re-sizes the window before refreshing; a
     // plain refresh here would have overwritten it and left the chart on
