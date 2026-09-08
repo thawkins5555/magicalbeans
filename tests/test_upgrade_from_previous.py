@@ -596,6 +596,50 @@ check("reopening the upgraded database changes nothing -- both migrations "
       {key: (again[key]["threshold"], again[key]["notify"]) for key in EIGHT})
 reopened.close()
 
+# ------- part 8: the second dampen pass must not reach the temperature pair
+# dampen_optic_power_siblings_1 exists for 5.3.0's six optic keys, but the
+# method it re-runs walks the whole of _NEW_SIBLING_OF -- including the
+# temperature pair dampen_new_builtin_siblings_1 already settled in 4.54.
+# The state below is the one that gets hurt: nothing was inherited then
+# (both rules pristine), the operator has since muted temp_chassis_high and
+# deliberately left temp_chassis_critical enabled at its shipped numbers.
+# A second pass over that pair reads the sibling as touched and the new row
+# as untouched, and silently reverts their choice.
+temps = os.path.join(work, "temps")
+os.makedirs(temps, exist_ok=True)
+temps_path = os.path.join(temps, "alerts.db")
+AlertsDatabase(temps_path).close()
+conn = sqlite3.connect(temps_path)
+conn.executescript("""
+    UPDATE rules SET notify = 0 WHERE key = 'temp_chassis_high';
+    DELETE FROM schema_migrations WHERE name IN (
+        'dampen_optic_power_siblings_1', 'clear_optic_power_thresholds_1',
+        'resolve_unpublished_optic_power_alerts_1');
+""")
+conn.commit()
+critical_before = conn.execute(
+    "SELECT enabled, notify, threshold FROM rules"
+    " WHERE key = 'temp_chassis_critical'").fetchone()
+conn.close()
+check("the fixture really is the state that gets hurt: the sibling muted, "
+      "Critical enabled and still on its shipped numbers",
+      critical_before == (1, 1, 85.0), critical_before)
+
+temps_db = AlertsDatabase(temps_path)
+critical = temps_db.rule_by_key("temp_chassis_critical")
+check("an operator who muted Chassis temperature high and deliberately left "
+      "Chassis temperature critical on keeps it: 5.3.0's optic dampen pass "
+      "is about the optic keys and must not re-decide a temperature pair "
+      "4.54 already settled",
+      critical["enabled"] == 1 and critical["notify"] == 1, dict(critical))
+check("...at its own shipped numbers, unshifted",
+      (critical["threshold"], critical["clear_threshold"]) == (85.0, 78.0),
+      dict(critical))
+high = temps_db.rule_by_key("temp_chassis_high")
+check("...and the muted sibling is left exactly as the operator set it",
+      high["notify"] == 0 and high["enabled"] == 1, dict(high))
+temps_db.close()
+
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")

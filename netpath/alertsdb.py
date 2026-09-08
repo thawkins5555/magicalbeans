@@ -917,6 +917,12 @@ _NEW_SIBLING_OF = {
     "sfp_tx_power_high_alarm": "sfp_tx_power_low",
 }
 
+# The subset of _NEW_SIBLING_OF that 5.3.0 introduced, and all its second
+# dampen pass is allowed to touch — see _named_migrations.
+_OPTIC_POWER_SIBLINGS = ("sfp_rx_power_low_alarm", "sfp_rx_power_high",
+                         "sfp_rx_power_high_alarm", "sfp_tx_power_low_alarm",
+                         "sfp_tx_power_high", "sfp_tx_power_high_alarm")
+
 # Template text as shipped by previous releases, verbatim, for every built-in
 # whose wording has since changed. _seed_templates inserts OR IGNORE, so an
 # existing install keeps its templates for ever — right for one an operator
@@ -1080,9 +1086,12 @@ class AlertsDatabase(SqliteStore):
             # every install upgraded since 4.54 and will never run again, so
             # 5.3.0's six new optic power rules would arrive un-dampened —
             # an operator who muted sfp_rx_power_low would get three new
-            # rules emailing them about the very same reading. The method is
-            # idempotent by construction (see its docstring), so running it
-            # again costs nothing on an install with nothing left to inherit.
+            # rules emailing them about the very same reading. It passes the
+            # six new keys and only those: the temperature pair is
+            # dampen_new_builtin_siblings_1's decision, made in 4.54, and a
+            # second pass over it would re-decide it against a sibling the
+            # operator has muted since — reverting a Critical they
+            # deliberately left on.
             #
             # BEFORE the clear below, and the order is load-bearing: dampen
             # decides "did the operator touch the sibling" by comparing the
@@ -1091,7 +1100,9 @@ class AlertsDatabase(SqliteStore):
             # own retune) still on the row and reads it as touched; run after
             # the clear it would read a carefully retuned rule as pristine
             # and dampen nothing.
-            ("dampen_optic_power_siblings_1", self._dampen_new_builtin_siblings),
+            ("dampen_optic_power_siblings_1",
+             lambda: self._dampen_new_builtin_siblings(
+                 keys=_OPTIC_POWER_SIBLINGS)),
             ("clear_optic_power_thresholds_1", self._clear_optic_power_thresholds),
             # Last, because it is the CONSEQUENCE of the two above: they put
             # the rules into their 5.3.0 shape, this clears up the alerts
@@ -1251,9 +1262,16 @@ class AlertsDatabase(SqliteStore):
                           "alert had nothing left to clear it")
             self._conn.commit()
 
-    def _dampen_new_builtin_siblings(self) -> None:
+    def _dampen_new_builtin_siblings(self, keys=None) -> None:
         """A NEW built-in rule must not arrive louder than an EXISTING one
         the operator already tuned, when both read the same source_kind.
+
+        `keys` limits it to those new-rule keys, and a release that adds a
+        SECOND named migration over this same method has to pass it: the
+        pairs an earlier one already settled are settled, and re-deciding
+        one against a sibling the operator has muted since would revert a
+        choice they made deliberately (see _named_migrations). None means
+        every pair, which is what the first such migration wants.
 
         _seed_rules runs before every named migration and is an INSERT OR
         IGNORE, so on an upgrade it seeds temp_chassis_critical (and any
@@ -1293,6 +1311,8 @@ class AlertsDatabase(SqliteStore):
                 "SELECT id, key, enabled, notify, threshold, clear_threshold"
                 " FROM rules WHERE is_builtin = 1").fetchall()}
             for new_key, sibling_key in _NEW_SIBLING_OF.items():
+                if keys is not None and new_key not in keys:
+                    continue
                 new_row = rows.get(new_key)
                 sibling_row = rows.get(sibling_key)
                 new_default = defaults.get(new_key)

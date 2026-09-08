@@ -3503,8 +3503,12 @@ is already recorded on every install upgraded since 4.54 and will never run
 again, so without a new name an operator who muted `sfp_rx_power_low` would
 get three brand new rules over the same metric, emailing them, that they
 never agreed to. `_NEW_SIBLING_OF` gains the six new keys → their existing
-sibling; the method is idempotent by construction, so a second run on an
-install with nothing to inherit is a no-op. It must run **before**
+sibling, and the second registration passes `keys=_OPTIC_POWER_SIBLINGS` so
+that is all it walks: the temperature pair was decided by
+`dampen_new_builtin_siblings_1` in 4.54, and a second pass over it would
+re-decide it against a sibling the operator has muted *since*, reverting a
+`temp_chassis_critical` they deliberately left enabled. It must run
+**before**
 `clear_optic_power_thresholds_1`, which sets `threshold`/`clear_threshold`
 NULL on the two pre-existing keys: dampen decides "did the operator touch
 the sibling" by comparing the row against `_builtin_rule_defaults()`, which
