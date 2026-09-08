@@ -2,13 +2,16 @@
 and WebServer. Covers: a start stores the profile and the per-scan timing on
 the job row; a rescan starts a NEW job carrying both and leaves the original
 alone; it refuses while that scan is still running, and while any other live
-scan has the same target; a row with no stored profile (or one whose profile
-has since been deleted) answers `needs_profile` instead of guessing.
+scan has the same target; two rescans of one target arriving at once start
+exactly one sweep between them; a row with no stored profile (or one whose
+profile has since been deleted) answers `needs_profile` instead of guessing.
 
-The two refusals are driven through the poller's own job registry rather than
-by racing a real sweep to the finish line: what the route asks is
+The refusals are driven through the poller's own job registry rather than by
+racing a real sweep to the finish line: what the route asks is
 `discovery_running(id)`, and a sweep's finishing time is a race no assertion
-should depend on.
+should depend on. The concurrent pair is the same discipline applied to the
+interleaving itself -- both requests are held at the point they have just
+asked that question, so what is tested is the answer, not the timing.
 """
 import http.client
 import json
