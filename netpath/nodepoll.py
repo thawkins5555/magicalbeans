@@ -3706,6 +3706,14 @@ class NodePoller(Worker):
         here since a port dialog already supplies context a device-wide
         list has to spell out.
 
+        Each row also carries `limits` — the four-band dict this port's own
+        transceiver published for that reading, or None — and
+        `limits_source`, the MIB it came out of. They are on the row rather
+        than left to the caller because a reading and the level it is judged
+        against are one fact: from 5.3.0 an optical power row with no limits
+        raises no alert at all, and that is only honest if the dialog says
+        so. One stored read per call, no extra walk.
+
         Returns [] when the device answers no sensor table or maps no
         entity to this ifIndex."""
         device = self.db.device(device_id)
@@ -3714,6 +3722,7 @@ class NodePoller(Worker):
         config = self.working_config(device)
         if not config.get("snmp_enabled", True):
             return []
+        limits = self.db.interface_thresholds(device_id)
         sensors = []
         for sensor in self._read_entity_sensors(device, config):
             if sensor.get("if_index") != if_index:
@@ -3722,9 +3731,24 @@ class NodePoller(Worker):
                 "entity": sensor["entity"],
                 "label": sensor.get("descr") or sensor["label"],
                 "value": sensor["value"], "unit": sensor["unit"],
-                "status": sensor["status"], "source": sensor.get("source", "")})
+                "status": sensor["status"], "source": sensor.get("source", ""),
+                **self._sensor_limits(limits, if_index, sensor)})
         sensors.sort(key=lambda s: s["entity"])
         return sensors
+
+    @staticmethod
+    def _sensor_limits(limits: dict, if_index, sensor: dict) -> dict:
+        """{"limits": the four published bands or None, "limits_source": the
+        MIB that published them} for one DOM row — the shape read_dom and
+        read_dom_all both put on their rows."""
+        row = limits.get((if_index, sensor.get("metric_root")))
+        if row is None:
+            return {"limits": None, "limits_source": ""}
+        return {
+            "limits": {band: row[band] for band in
+                       ("low_alarm", "low_warn", "high_warn", "high_alarm")},
+            "limits_source": row["source"],
+        }
 
     def _entity_port_map(self, device, config: dict, names: dict | None = None,
                          if_by_name: dict | None = None,
@@ -3949,6 +3973,11 @@ class NodePoller(Worker):
                 "source": source,
                 "type": self._SENSOR_TYPE_NAMES.get(
                     int(types.get(suffix) or 0), "other"),
+                # The per-port metric key this reading feeds, so the two DOM
+                # reads can find the limits the port published for it without
+                # re-deriving the direction from the sensor's name.
+                "metric_root": self._sfp_root_for(
+                    int(types.get(suffix) or 0), suffix, names, descrs),
                 "if_index": if_index,
                 "if_name": if_name or None,
             })
@@ -4131,6 +4160,7 @@ class NodePoller(Worker):
         if_names = {row["if_index"]: (row["descr"] or row["alias"]
                                       or f"port {row['if_index']}")
                    for row in self.db.interfaces(device_id)}
+        limits = self.db.interface_thresholds(device_id)
         rows = []
         for sensor in self._read_entity_sensors(device, config):
             if_index = sensor.get("if_index")
@@ -4140,7 +4170,8 @@ class NodePoller(Worker):
                 "if_index": if_index,
                 "if_name": if_names.get(if_index, f"port {if_index}"),
                 "label": sensor["label"], "value": sensor["value"],
-                "unit": sensor["unit"], "status": sensor["status"]})
+                "unit": sensor["unit"], "status": sensor["status"],
+                **self._sensor_limits(limits, if_index, sensor)})
         rows.sort(key=lambda r: (r["if_index"], r["label"]))
         return rows
 

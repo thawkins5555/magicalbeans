@@ -209,6 +209,37 @@ try:
           dom_by_value[45.1]["label"] == "Xcvr temp", dom_by_value[45.1])
     check("read_dom_all's row for the same entity prefers entPhysicalName",
           all_by_value[45.1]["label"] == "Gi0/1 SFP module", all_by_value[45.1])
+
+    # 5.3.0: both reads carry the limits this port's own transceiver
+    # published, because from now that band IS the alert threshold -- a row
+    # with none raises no optical power alert, and the dialog has to say so.
+    check("both reads carry limits/limits_source on every row, empty until "
+          "a threshold walk has learned any",
+          all(r["limits"] is None and r["limits_source"] == ""
+              for r in rows + dom_rows),
+          [(r["label"], r["limits"], r["limits_source"]) for r in rows])
+    db.replace_interface_thresholds(did, "CISCO-ENTITY-SENSOR-MIB", [
+        {"if_index": 1, "metric_root": "sfp_temp_c", "low_alarm": None,
+         "low_warn": None, "high_warn": 70.0, "high_alarm": 75.0,
+         "updated_ts": time.time()}])
+    learned = {r["label"]: r for r in poller.read_dom_all(did)}
+    band = learned["Gi0/1 SFP module"]
+    check("once the device publishes a band it arrives on the row it "
+          "governs, one key per band, with NULL for the two it does not "
+          "publish",
+          band["limits"] == {"low_alarm": None, "low_warn": None,
+                             "high_warn": 70.0, "high_alarm": 75.0},
+          band["limits"])
+    check("...naming the MIB it came out of",
+          band["limits_source"] == "CISCO-ENTITY-SENSOR-MIB", band)
+    check("...and a reading of another kind on the same port is unaffected",
+          all(r["limits"] is None for r in learned.values()
+              if r is not band),
+          [(k, v["limits"]) for k, v in learned.items()])
+    check("read_dom sees exactly the same band for the same reading",
+          {r["value"]: r["limits"] for r in poller.read_dom(did, 1)}[45.1]
+          == band["limits"],
+          [(r["value"], r["limits"]) for r in poller.read_dom(did, 1)])
     db.close()
 finally:
     stub.kill()
