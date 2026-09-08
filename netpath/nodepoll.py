@@ -4238,8 +4238,9 @@ class NodePoller(Worker):
                 # must not win min() away from three healthy lanes on the same
                 # optic. An optic dark on every lane still records the floor:
                 # the port's chart stays continuous and its history stays
-                # true, and refusing to ALERT on that reading is
-                # alertrules.breaches' job, not this one's.
+                # true. What that reading means for an ALERT is alertrules'
+                # job, not this one's -- breaches() will not open one on it
+                # and evaluate_threshold closes one already open.
                 lit = [v for v in values if not is_dark_optic(root, v)]
                 worst = min(lit) if lit else DARK_OPTIC_DBM
             else:

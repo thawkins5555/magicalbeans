@@ -808,13 +808,19 @@ it. `alertrules.is_dark_optic` names the condition once for both ends —
 (an exact `0`, a non-finite value) — and `breaches()` returns `False` for
 one on the two optic power families (`rules.source_kind` of `sfp_rx_dbm` or
 `sfp_tx_dbm`), keyed off the family so no other `'below'` rule can inherit
-it. The guard has to live there rather than at the metric write:
-`threshold_stale_s` defaults to 900 s, so a `-40` already recorded would go
-on re-evaluating for fifteen minutes, and one written by an older build
-would never expire at all. `_poll_environment` also drops dark lanes before
-the per-port `min()`, so one dark lane of a multi-lane optic no longer beats
-three healthy ones; a port dark on every lane still records the floor, which
-keeps its chart continuous and its history true.
+it. `evaluate_threshold` answers `'clear'` for the same reading on the same
+families, because refusing to RAISE says nothing about an alert already
+open: the floor is a fresh sample every poll, so `threshold_stale_s` can
+never expire it, and a lit optic that went dark — or any of the alerts a 5.1
+build raised on every dark port, all of them open at upgrade time — would
+have stayed open until a human resolved it by hand. A dark port is
+`interface_down`'s to report. The guard has to live there rather than at the
+metric write: `threshold_stale_s` defaults to 900 s, so a `-40` already
+recorded would go on re-evaluating for fifteen minutes, and one written by
+an older build would never expire at all. `_poll_environment` also drops
+dark lanes before the per-port `min()`, so one dark lane of a multi-lane
+optic no longer beats three healthy ones; a port dark on every lane still
+records the floor, which keeps its chart continuous and its history true.
 
 **5.0.1 gave the walk a second table and the latch an expiry.** The value
 column `_poll_environment` asks for now comes from `_walk_sensor_columns`

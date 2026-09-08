@@ -7,15 +7,17 @@ and 'sfp_empty' (a cage with nothing in it) from entPhysicalClass, and
 leaving a copper port an agent happens to model as container+port unbadged;
 a multi-lane optic whose dark lane must not win the worst-of away from its
 healthy one; an optic dark on every lane still recording the floor so the
-port's chart keeps its continuity; and alertrules.breaches refusing to
-alert on that floor for the two optic power rules and nothing else.
+port's chart keeps its continuity; alertrules.breaches refusing to alert on
+that floor for the two optic power rules and nothing else; and
+evaluate_threshold closing an alert already open on a port that goes dark.
 """
 import time
 
 from _paths import spawn_stub, tmpdir
 
 import netpath.nodepoll as nodepoll_mod
-from netpath.alertrules import DARK_OPTIC_DBM, breaches, is_dark_optic
+from netpath.alertrules import (DARK_OPTIC_DBM, breaches, evaluate_threshold,
+                               is_dark_optic)
 from netpath.nodesdb import NodesDatabase
 from netpath.nodepoll import NodePoller
 
@@ -49,10 +51,11 @@ def device_against(db: NodesDatabase, name: str) -> int:
 
 
 def rule(source_kind, threshold, clear_threshold, comparison):
-    """The columns breaches() reads off a rule row, as the plain dict
-    alertrules' own contract says a caller may pass."""
+    """The columns breaches() and evaluate_threshold() read off a rule row,
+    as the plain dict alertrules' own contract says a caller may pass."""
     return {"source_kind": source_kind, "threshold": threshold,
-            "clear_threshold": clear_threshold, "comparison": comparison}
+            "clear_threshold": clear_threshold, "comparison": comparison,
+            "for_polls": 1}
 
 
 # ================================================ § 1 media from the walk
@@ -170,6 +173,29 @@ check("a non-finite reading is dark: an agent with no answer to give must "
       "not become an alert either",
       is_dark_optic("sfp_rx_dbm", float("-inf"))
       and is_dark_optic("sfp_rx_dbm", float("nan")))
+
+# ==================================== § 4 what the floor has to close down
+
+# breaches() refusing to open an alert says nothing about one already open:
+# the sample is fresh every poll, so threshold_stale_s never expires it, and
+# without a verdict of its own the row sits there for ever showing the -25
+# that raised it.
+check("-25 dBm opens the alert, as it did before",
+      evaluate_threshold(rx_low, -25.0, 1) == "breach")
+check("the optic going dark closes it: a port with no light is "
+      "interface_down's business, not a low-light state",
+      evaluate_threshold(rx_low, -40.0, 0) == "clear")
+check("...and the transmit rule closes the same way",
+      evaluate_threshold(tx_low, -40.0, 0) == "clear")
+check("a reading just above the floor closes it too, on the same tolerance "
+      "breaches() refuses to open on",
+      evaluate_threshold(rx_low, -39.8, 0) == "clear")
+check("a genuinely dim optic is untouched: -25 is still a breach, and the "
+      "hysteresis gap still says nothing",
+      evaluate_threshold(rx_low, -21.0, 3) == "")
+check("another 'below' rule reading -40 is unaffected -- it breaches, and "
+      "the dark verdict is keyed to the optic power families",
+      evaluate_threshold(other_low, -40.0, 1) == "breach")
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")

@@ -290,11 +290,12 @@ def evaluate_threshold(rule, current_value: float | None, streak: int,
                        breach_seconds: float = 0.0) -> str:
     """Returns 'breach' once current_value is on the wrong side of
     rule.threshold and the breach has been sustained long enough; 'clear'
-    once a value has recovered past rule.clear_threshold; '' otherwise
-    (either not sustained yet, or in the hysteresis gap between
-    clear_threshold and threshold). The threshold/clear_threshold gap is
-    hysteresis — without it a value oscillating exactly at the threshold
-    reopens and recloses the alert every single poll.
+    once a value has recovered past rule.clear_threshold, or once a 'below'
+    optic-power rule reads dark; '' otherwise (either not sustained yet, or
+    in the hysteresis gap between clear_threshold and threshold). The
+    threshold/clear_threshold gap is hysteresis — without it a value
+    oscillating exactly at the threshold reopens and recloses the alert
+    every single poll.
 
     Direction is rule.comparison's call, via breaches()/_clears() above:
     for a 'below' rule (an optic whose receive power has fallen) the band
@@ -323,6 +324,15 @@ def evaluate_threshold(rule, current_value: float | None, streak: int,
             return "breach" if breach_seconds >= float(for_seconds) else ""
         for_polls = max(1, int(rule["for_polls"] or 1))
         return "breach" if streak >= for_polls else ""
+    if (comparison_of(rule) == "below"
+            and is_dark_optic(_metric_root_of(rule), current_value)):
+        # breaches() refusing to open an alert says nothing about one
+        # already open, and it never will: the floor is a fresh sample
+        # every poll, so threshold_stale_s cannot expire it either. A dark
+        # port is interface_down's to report, so this closes what is open
+        # — including every alert a 5.1 build raised on a dark optic, which
+        # is open at upgrade time and would otherwise be permanent.
+        return "clear"
     if _clears(rule, current_value):
         return "clear"
     return ""
