@@ -414,6 +414,33 @@ def main() -> int:
                                    cookie=admin_cookie)
         check("HTTP dns_timeout_s at its ceiling (30) -> 200",
               status == 200, f"{status} {payload}")
+
+        # The two flow rollup retentions: netflow-scope keys in the same flat
+        # range table. A negative one used to be stored, and put
+        # _prune_rollup's cutoff in the future -- every rollup row deleted on
+        # every sweep and the tier's floor left ahead of now, so the tier was
+        # out of service while compaction went on writing to it.
+        for key in ("rollup_minute_days", "rollup_retention_days"):
+            status, _h, payload = req(port, "POST", "/api/settings",
+                                       {"scope": "netflow",
+                                        "values": {key: -1}},
+                                       cookie=admin_cookie)
+            check(f"HTTP {key} below its floor (-1) -> 400",
+                  status == 400, f"{status} {payload}")
+            status, _h, payload = req(port, "POST", "/api/settings",
+                                       {"scope": "netflow",
+                                        "values": {key: 3651}},
+                                       cookie=admin_cookie)
+            check(f"HTTP {key} above its ceiling (3651) -> 400",
+                  status == 400, f"{status} {payload}")
+            # 0 is a real choice on this field -- keep no summaries at this
+            # tier -- which is why the floor is 0 rather than 1.
+            status, _h, payload = req(port, "POST", "/api/settings",
+                                       {"scope": "netflow",
+                                        "values": {key: 0}},
+                                       cookie=admin_cookie)
+            check(f"HTTP {key} at its floor (0) -> 200",
+                  status == 200, f"{status} {payload}")
     finally:
         try:
             server.stop()

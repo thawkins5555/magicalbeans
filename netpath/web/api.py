@@ -1549,6 +1549,14 @@ _GLOBAL_SETTINGS_RANGES = {
     # input says min="1", but a client can skip the browser) would compute a
     # cutoff of "now" and silently delete every trace, over and over.
     "trace_retention_days": (1, 3650),
+    # The two rollup retentions, netflow-scope, mirroring netflow.js's own
+    # min=0 on them. 0 is a real choice there — keep no summaries at this
+    # tier — but a negative puts _prune_rollup's cutoff in the future, which
+    # deletes every rollup row on every sweep and leaves the tier's floor
+    # ahead of now, silently taking it out of service while compaction goes
+    # on writing to it.
+    "rollup_minute_days": (0, 3650),
+    "rollup_retention_days": (0, 3650),
     "max_flow_db_mb": (16, None),
     "max_snmp_db_mb": (16, None),
     "max_syslog_db_mb": (16, None),
