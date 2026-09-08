@@ -1434,7 +1434,13 @@ direction. They are on the row rather than left to the caller because a
 reading and the level it is judged against are one fact: an optical power
 row with no limits raises no alert at all, and `nodes.js`'s **Limits**
 column and its hint underneath are the only place an operator finds that
-out.
+out. The column shows every published band, temperature/bias/voltage
+included, but only the two dBm rules read one — so `alertedOnItsOwnBand`
+splits them: a non-dBm cell's title says "reference only", and a second
+hint sentence says those readings alert on the thresholds under
+Alerts → Rules. Without it a published `70 / 75` beside a temperature row
+reads as the number `sfp_temp_high` fires at, which is still the global
+70 °C.
 
 **Whole-device hardware and DOM (`NodePoller.read_hardware`,
 `read_dom_all`) — 4.53.0.** `_read_entity_sensors` generalises the same
@@ -3507,14 +3513,16 @@ sibling, and the second registration passes `keys=_OPTIC_POWER_SIBLINGS` so
 that is all it walks: the temperature pair was decided by
 `dampen_new_builtin_siblings_1` in 4.54, and a second pass over it would
 re-decide it against a sibling the operator has muted *since*, reverting a
-`temp_chassis_critical` they deliberately left enabled. It must run
-**before**
+`temp_chassis_critical` they deliberately left enabled. It runs **before**
 `clear_optic_power_thresholds_1`, which sets `threshold`/`clear_threshold`
-NULL on the two pre-existing keys: dampen decides "did the operator touch
-the sibling" by comparing the row against `_builtin_rule_defaults()`, which
-now reads NULL for these keys — run first it sees the operator's real
-number still on the row and reads it as touched, run after the clear it
-would read a carefully retuned rule as pristine and dampen nothing. The
+NULL on the two pre-existing keys — because dampen reading the numbers
+while they are still on the row is the order the change reads in, **not**
+because the order decides anything. It does not: all dampen inherits is
+`enabled`/`notify`, which the clear never touches, and the six new rules
+ship with NULL thresholds, so the sibling's own retune has nothing to shift
+onto them. Reversed, a threshold-only retune reads as pristine and the pair
+is skipped — landing on the same rows. `test_upgrade_from_previous.py`
+part 9 runs it both ways and compares. The
 clear is **unconditional**, unlike `_retire_temp_high`'s "only if it still
 looks as shipped" guard: from now the engine never reads that column for
 these rules, so a number left there cannot change what alerts — but it can

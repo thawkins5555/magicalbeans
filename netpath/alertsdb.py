@@ -1093,13 +1093,14 @@ class AlertsDatabase(SqliteStore):
             # operator has muted since — reverting a Critical they
             # deliberately left on.
             #
-            # BEFORE the clear below, and the order is load-bearing: dampen
-            # decides "did the operator touch the sibling" by comparing the
-            # row against _builtin_rule_defaults(), which now reads NULL for
-            # these keys. Run first it sees the real -22.0 (or the operator's
-            # own retune) still on the row and reads it as touched; run after
-            # the clear it would read a carefully retuned rule as pristine
-            # and dampen nothing.
+            # BEFORE the clear below, which reads naturally — dampen looks at
+            # the numbers while they are still there — but is NOT load-
+            # bearing, and nothing here should be written as if it were. All
+            # dampen inherits is enabled/notify, which the clear does not
+            # touch, and the six new rules ship with NULL thresholds, so the
+            # sibling's own retune has nothing to shift onto them. Run after
+            # the clear it would read a threshold-only retune as pristine and
+            # skip the pair — reaching the same rows either way.
             ("dampen_optic_power_siblings_1",
              lambda: self._dampen_new_builtin_siblings(
                  keys=_OPTIC_POWER_SIBLINGS)),
@@ -1298,12 +1299,16 @@ class AlertsDatabase(SqliteStore):
 
         Only while the new rule still looks exactly like what _seed_rules
         just gave it — the same "an operator's edit is not ours to touch"
-        guard _retire_temp_high applies to its own rule. That makes this
-        idempotent by construction: once it has acted (or an operator has
-        edited the new rule by hand, including re-enabling it), the new
-        rule no longer matches its own shipped defaults and every future
-        call, including a second run of this same migration, is a no-op —
-        the same one-time contract every other named migration keeps.
+        guard _retire_temp_high applies to its own rule. Usually that also
+        ends it: once it has acted (or an operator has edited the new rule
+        by hand, including re-enabling it) the new rule no longer matches
+        its own shipped defaults, and the guard turns every later call into
+        a no-op. Not always, though — a sibling tuned in THRESHOLD alone
+        leaves the new rule sitting exactly on its defaults, so the guard
+        does not stop a second call. That is harmless rather than
+        short-circuited: the write is the same write, so a re-run reaches
+        the same state. Idempotent in effect; do not read the guard as a
+        proof that it cannot run twice.
         """
         defaults = _builtin_rule_defaults()
         with self._lock:

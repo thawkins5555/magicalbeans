@@ -1298,31 +1298,54 @@
   function domRowAttrs(s) {
     return darkOptic(s) ? ` title="${escape(`${s.value} ${s.unit}`)}"` : '';
   }
-  // 5.3.0: the alarm/warning band this port's own transceiver publishes, which
-  // is what the optic power rules alert against — there is no configurable
-  // number behind them any more, so the only place an operator can see what a
-  // port is judged by is here. An em-dash per band the device does not
+  // A transceiver publishes bands for its temperature, bias and voltage too,
+  // and the Limits column shows every one of them — but only the two dBm
+  // rules read what a port publishes (alertrules.PUBLISHED_THRESHOLD_RULES).
+  // sfp_temp_high still alerts at the figure on the Alerts rules page, so a
+  // published "70 / 75" beside a temperature row is a fact about the optic
+  // and not the number that would raise an alert on it.
+  function alertedOnItsOwnBand(s) { return s.unit === 'dBm'; }
+  // 5.3.0: the alarm/warning band this port's own transceiver publishes. For
+  // a light level that IS what the rule alerts against — there is no
+  // configurable number behind those two any more, so this is the only place
+  // an operator can see what a port is judged by; for every other reading the
+  // title says it is reference only. An em-dash per band the device does not
   // publish; the whole cell is one when it publishes none.
   function domLimitsCell(s) {
     const l = s.limits;
     if (!l) return '<td>\u2014</td>';
     const band = (v) => (typeof v === 'number' ? `${v}` : '\u2014');
-    return `<td title="${escape(`published by ${s.limits_source || 'the optic'}`)}">` +
+    const source = `published by ${s.limits_source || 'the optic'}`;
+    return `<td title="${escape(alertedOnItsOwnBand(s) ? source
+      : `${source} — reference only, not what this reading is alerted on`)}">` +
       `${band(l.low_alarm)} / ${band(l.low_warn)} / ` +
       `${band(l.high_warn)} / ${band(l.high_alarm)}</td>`;
   }
-  // The sentence under a DOM table when a light-level row has no published
-  // band: silence here would read as "nothing is wrong with this port".
+  // The sentences under a DOM table: one when a light-level row has no
+  // published band, because silence there would read as "nothing is wrong
+  // with this port"; one when a row that is NOT alerted on its own band shows
+  // one anyway, because a figure under a Limits heading reads as the figure
+  // that row is judged by unless the page says otherwise.
   function domLimitsHint(rows) {
-    const unpublished = (rows || []).filter(
-      (s) => s.unit === 'dBm' && !s.limits);
-    if (!unpublished.length) return '';
-    return '<p class="hint">This device publishes no optical power ' +
-      'thresholds for ' + (unpublished.length === 1 ? 'this optic'
-        : `${unpublished.length} of these readings`) +
-      ', so optical power alerts are off for it — SappiWhere alerts on the ' +
-      'levels a transceiver publishes about itself and never on a global ' +
-      'figure, which would be wrong for most parts.</p>';
+    const all = rows || [];
+    const unpublished = all.filter((s) => alertedOnItsOwnBand(s) && !s.limits);
+    const reference = all.filter((s) => !alertedOnItsOwnBand(s) && s.limits);
+    let hint = '';
+    if (unpublished.length) {
+      hint += '<p class="hint">This device publishes no optical power ' +
+        'thresholds for ' + (unpublished.length === 1 ? 'this optic'
+          : `${unpublished.length} of these readings`) +
+        ', so optical power alerts are off for it — SappiWhere alerts on the ' +
+        'levels a transceiver publishes about itself and never on a global ' +
+        'figure, which would be wrong for most parts.</p>';
+    }
+    if (reference.length) {
+      hint += '<p class="hint">Only the optical power rows are alerted on ' +
+        'the limits shown here. The temperature, bias and voltage bands a ' +
+        'transceiver publishes are listed for reference; those readings are ' +
+        'alerted on the thresholds set under Alerts → Rules.</p>';
+    }
+    return hint;
   }
 
   const IFACE_COLUMNS = [
