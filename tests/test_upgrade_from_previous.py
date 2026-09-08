@@ -210,6 +210,13 @@ nodes = svc.nodes_db
 # shutdown() would close the databases these figures come from.
 if svc._nodes_split_thread is not None:
     svc._nodes_split_thread.join(timeout=60)
+# device_maintenance is a NEW table, so it must arrive through SCHEMA's
+# CREATE TABLE IF NOT EXISTS on this very open, with no migration entry --
+# this is the claim that made a migration unnecessary, asked of a real
+# previous-release alerts.db rather than of a fresh one.
+maint = svc.alerts_db._conn.execute(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='device_maintenance'"
+).fetchone()
 report = (nodes._private_setting("split_state"),
           len(nodes.series_db.metrics_for_keys(["cpu_pct"])),
           nodes.series_db._conn.execute(
@@ -222,6 +229,7 @@ print("split", report[0])
 print("metrics", report[1])
 print("rollups", report[2])
 print("prevmib", report[3], report[4])
+print("maint_table", bool(maint))
 """], capture_output=True, text=True, timeout=120)
         check("the current release starts on the previous release's databases",
               started.returncode == 0, started.stderr[-600:])
@@ -234,6 +242,10 @@ print("prevmib", report[3], report[4])
               started.stdout[-400:])
         check("...and the uploaded MIB file with its object",
               "prevmib True True" in started.stdout, started.stdout[-400:])
+        check("...and device_maintenance exists on the previous release's "
+              "alerts.db with no migration entry, purely from SCHEMA's own "
+              "CREATE TABLE IF NOT EXISTS",
+              "maint_table True" in started.stdout, started.stdout[-400:])
 
 # ------------------------------- part 3: permissions after the migration
 # On an install that predates app.db the accounts are still in netpath.db

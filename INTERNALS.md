@@ -3590,6 +3590,102 @@ housekeeping pass so the table does not grow a row per mute ever set.
 `MAX_MUTE_HOURS` caps what the API will store, so a hand-made call cannot
 silence a device until next year.
 
+### Device maintenance mode (`alertsdb.py`, `report.py`)
+
+The third silencing mechanism. `device_maintenance(device_id, started_ts,
+ended_ts, started_by, ended_by, reason)` is a NEW table, so like
+`alert_mutes` it lives in `PENDING_SCHEMA`'s `CREATE TABLE IF NOT EXISTS`
+block and needs no `_migrate` entry — `SCHEMA` is `executescript`ed on
+every open, and `_migrate` only ever ALTERs tables that already exist.
+`tests/test_upgrade_from_previous.py` asks the previous release's own
+alerts.db whether the table arrived, which is what makes that claim more
+than an assertion.
+
+**A row is a period, not a flag.** `ended_ts IS NULL` means "in maintenance
+now"; a closed row stays on file, and re-entering after a clear writes a
+SECOND row rather than reopening the first. That is not bookkeeping for its
+own sake: the availability report REPLAYS past periods to subtract them
+from downtime, which is precisely what a mute cannot support — a mute is
+deleted the moment it lapses, and `report.MUTE_HISTORY_CAVEAT` is the
+apology for it. `MAINTENANCE_MODE_HISTORY_CAVEAT` beside it says the
+weaker thing that is true here: a CLOSED period ages out of `prune()` on
+the alert retention, an OPEN one never does at any age.
+
+**Not a row shape in `alert_mutes`.** `ux_mute_entity` is UNIQUE on
+`(entity_kind, entity_id)`, so a device could not be both muted and in
+maintenance; `mute()`'s upsert would silently end somebody's maintenance in
+an hour; and `prune` deletes lapsed rows. The suite's own decisive
+assertion is a device that is both at once with the mute's `until_ts`
+untouched. `ux_device_maintenance_open` — UNIQUE on `device_id` WHERE
+`ended_ts IS NULL` — is what keeps at most one open period per device, so
+`set_maintenance` is idempotent by construction rather than by every writer
+remembering to look first; its INSERT carries its own `WHERE NOT EXISTS`
+inside the lock so two concurrent presses cannot race past the index.
+
+**The fold point is a sibling, not a widening.** `muted_entity_ids()`
+answers `{entity_id: until_ts}` and every reader of it prints "muted until
+&lt;a date&gt;". Maintenance mode has no such date, and a sentinel would
+show an operator a moment that never arrives — so `quiet_device_ids()` sits
+beside it and answers the only question the engine's gates actually ask:
+membership. `_tick`'s per-occurrence gate and `_muted` read that set;
+`_muted_alert` grew one `open_maintenance` call ahead of its mute check,
+and that single call is what buys both the clear-mail gate in
+`_notify_clear` and the notification gates in the sweeps.
+
+**Two defects fixed alongside it, both required for the feature to hold.**
+`_sweep_renotify` had NO suppression check at all, so a muted device's open
+alert mailed a reminder every `renotify_minutes` — flatly against what the
+mute has always promised. It now skips on `_muted_alert`, and nothing is
+stranded: `alerts_due_renotify` reads `COALESCE(last_notified_ts,
+opened_ts)`, so the alert is still due the moment the silence lifts.
+And `api.delete_nodes_device`/`post_nodes_devices_bulk_delete` touched
+nothing in alerts.db, while `devices.id` is INTEGER PRIMARY KEY without
+AUTOINCREMENT — SQLite reissues the freed rowid, so the next device added
+would have inherited the deleted one's maintenance and mute. Both handlers
+now call `AlertsDatabase.forget_device` FIRST, ahead of ConfigRX, on
+exactly the credential-inheritance reasoning `delete_nodes_device`'s own
+comment already spelled out.
+
+**The held first notice is DECIDED, not left pending.** In
+`_sweep_notify_rollup` a mute (or a window) leaves the notice pending on
+purpose: both end, and a device released before anyone sees it should still
+get the notice. Maintenance mode has no such moment, so a held notice would
+sit with `last_notified_ts` NULL for ever — reading as a bare "None sent."
+with no reason, and blocked by `_sweep_renotify`'s own NULL guard from ever
+going out. It is therefore decided the way every other permanently
+undeliverable case in that loop is: `_skip_held_open_notify(..., "not sent:
+the device is in maintenance mode")`. The mute branch beside it is
+unchanged.
+
+**The report keeps three buckets, not two.** `maintenance_mode_excluded_s`
+sits beside `maintenance_excluded_s` and `mute_excluded_s` and is merged
+into neither: the CSV is read to answer WHICH mechanism took a device out
+of service, and merging is unrecoverable. All three interval lists go into
+one `_merge_intervals` union before being subtracted, so seconds two
+mechanisms both cover are subtracted once while each bucket still reports
+its own coverage in full. An OPEN period is clamped to `now`, never to
+`t1` — `clamp_window` can hand back a `t1` in the future, and excluding
+time that has not happened would inflate uptime.
+
+**Merge order matters.** `merge_device` settles the maintenance periods
+BEFORE any blanket move: if the winner already has an open period the
+loser's is closed, otherwise it is repointed, because a straight
+`UPDATE ... SET device_id` would hit the partial unique index and a merge
+must never fail on a constraint. Closed periods move wholesale — they are
+the loser's availability history, now reported under the surviving id.
+
+**Devices only, and no `entity_kind` parameter.** Unlike `alert_mutes`,
+whose column is deliberately general so a future per-interface mute needs
+no migration, this table stores an INTEGER `device_id` and the API takes no
+kind at all: advertising a kind the handler then refuses is worse than not
+offering one. The `maintenance_only=1` device filter is resolved
+SERVER-side — `maintenance_device_ids()` read in `api`, passed into
+`nodesdb._device_filter_clause` as an `only_ids` clause chunked through
+`sqlitebase.id_chunks` — because the list is paged at 500 and a page
+filtered after the fact would hand back fewer rows than it asked for and a
+`total` that did not describe them. An empty set is short-circuited in the
+handler: `IN ()` is not valid SQL.
+
 **The page is told which device an alert is about.** Since 4.37.0 every
 alert row the API returns carries `device_id` — and, since 4.37.1, only
 that: `device_name` went with it for a release and the page never once read

@@ -282,6 +282,160 @@ try:
     rows = alerts_by_id(admin)
     check("an alert whose device has been removed resolves to no device",
           rows[ghost_alert]["device_id"] is None, rows.get(ghost_alert))
+
+    # ------------------------------- 6. indefinite maintenance mode
+
+    audit_mark = service.app_db.audit_last_id()
+
+    def audit_since_mark():
+        return [dict(r) for r in service.app_db.audit_events(audit_mark, 500)]
+
+    group = service.nodes_db.add_device_group("Cutover")
+    spare = service.nodes_db.add_device("192.0.2.30", name="Spare Switch",
+                                        group_id=group_id,
+                                        device_group_id=group)
+    service.nodes_db.update_device(switch, device_group_id=group)
+
+    status, payload = call("POST", "/api/alerts/maintenance",
+                           {"device_id": switch, "reason": "rack rewire"},
+                           token=viewer)
+    check("a read-only account cannot put a device into maintenance",
+          status == 403, (status, payload))
+
+    status, payload = call("POST", "/api/alerts/maintenance",
+                           {"device_id": switch, "reason": "rack rewire"},
+                           token=admin)
+    check("an administrator can, and gets the period back",
+          status == 200 and payload["maintenance"]["device_id"] == switch
+          and payload["maintenance"]["ended_ts"] is None
+          and payload["maintenance"]["reason"] == "rack rewire",
+          (status, payload))
+    started_ts = payload["maintenance"]["started_ts"] if status == 200 else 0
+
+    status, payload = call("POST", "/api/alerts/maintenance",
+                           {"device_id": switch, "reason": "something else"},
+                           token=admin)
+    check("a second POST is idempotent: the SAME period, untouched",
+          status == 200 and payload["already"] is True
+          and payload["maintenance"]["started_ts"] == started_ts
+          and payload["maintenance"]["reason"] == "rack rewire",
+          (status, payload))
+
+    status, payload = call("POST", "/api/alerts/maintenance",
+                           {"device_id": switch, "hours": 4}, token=admin)
+    check("a body carrying `hours` is REFUSED, not silently obeyed with the "
+          "hours dropped — that is how an operator believes in a 4-hour "
+          "maintenance that does not exist",
+          status == 400 and "mute" in str(payload).lower(), (status, payload))
+    status, payload = call("POST", "/api/alerts/maintenance",
+                           {"device_id": switch, "until_ts": time.time() + 60},
+                           token=admin)
+    check("...and `until_ts` likewise, naming maintenance windows instead",
+          status == 400 and "window" in str(payload).lower(), (status, payload))
+
+    status, payload = call("POST", "/api/alerts/maintenance",
+                           {"device_id": 999999}, token=admin)
+    check("a device Nodes does not have is refused, the same 'No such device' "
+          "a mute answers with", status == 400 and "device" in str(payload),
+          (status, payload))
+
+    # The devices endpoint carries it, and leaves muted_until alone.
+    status, listed = call("GET", "/api/nodes/devices", token=admin)
+    devices = {d["id"]: d for d in listed.get("devices", [])} if status == 200 else {}
+    check("the Nodes row carries a `maintenance` object",
+          (devices.get(switch) or {}).get("maintenance", {}).get("device_id") == switch,
+          (devices.get(switch) or {}).get("maintenance"))
+    check("...and muted_until stays NULL for a maintenance-only device — "
+          "anything rendering it would print a date that never arrives",
+          (devices.get(switch) or {}).get("muted_until") is None,
+          (devices.get(switch) or {}).get("muted_until"))
+    check("...while a device in neither carries maintenance: null",
+          (devices.get(spare) or {}).get("maintenance") is None,
+          (devices.get(spare) or {}).get("maintenance"))
+
+    status, payload = call("GET", "/api/alerts/maintenance", token=viewer)
+    check("a read-only account may SEE what is in maintenance",
+          status == 200 and any(m["device_id"] == switch
+                                for m in payload.get("maintenance", [])),
+          (status, payload))
+
+    # maintenance_only, filtered server-side and paged.
+    call("POST", "/api/alerts/maintenance", {"device_id": spare}, token=admin)
+    totals, seen = set(), []
+    for offset in (0, 1):
+        status, payload = call(
+            "GET", f"/api/nodes/devices?maintenance_only=1&limit=1&offset={offset}",
+            token=admin)
+        if status == 200:
+            totals.add(payload["total"])
+            seen += [d["id"] for d in payload["devices"]]
+    check("maintenance_only=1 returns exactly the devices in maintenance, "
+          "one per page, with a total that agrees across both pages",
+          totals == {2} and sorted(seen) == sorted([switch, spare]),
+          (totals, seen))
+
+    status, payload = call("DELETE", "/api/alerts/maintenance",
+                           {"device_id": spare}, token=viewer)
+    check("a read-only account cannot end a maintenance either", status == 403,
+          (status, payload))
+    status, payload = call("DELETE", "/api/alerts/maintenance",
+                           {"device_id": spare}, token=admin)
+    check("DELETE reports the period it ended", status == 200
+          and payload["cleared"] is True, (status, payload))
+    status, payload = call("DELETE", "/api/alerts/maintenance",
+                           {"device_id": spare}, token=admin)
+    check("...and reports false the second time, having nothing to end",
+          status == 200 and payload["cleared"] is False, (status, payload))
+
+    status, payload = call("GET", "/api/nodes/devices?maintenance_only=1",
+                           token=admin)
+    check("the filter follows it out again",
+          status == 200 and [d["id"] for d in payload["devices"]] == [switch],
+          (status, payload))
+
+    # Bulk, by group, both directions.
+    status, payload = call("POST", "/api/alerts/bulk-maintenance",
+                           {"group_id": group, "reason": "site cutover"},
+                           token=admin)
+    check("bulk maintenance by group_id covers the group's whole membership",
+          status == 200 and payload["devices"] == 2, (status, payload))
+    check("...and only the device not already in it counts as changed",
+          status == 200 and payload["changed"] == 1, (status, payload))
+    check("...so both devices are now in maintenance",
+          service.alerts_db.open_maintenance(switch) is not None
+          and service.alerts_db.open_maintenance(spare) is not None)
+
+    status, payload = call("POST", "/api/alerts/bulk-maintenance",
+                           {"group_id": group, "clear": True}, token=admin)
+    check("`clear` takes the same group back out again",
+          status == 200 and payload["cleared"] is True
+          and payload["changed"] == 2, (status, payload))
+    check("...and nothing in the group is in maintenance any more",
+          service.alerts_db.open_maintenance(switch) is None
+          and service.alerts_db.open_maintenance(spare) is None)
+
+    status, payload = call("POST", "/api/alerts/bulk-maintenance",
+                           {"group_id": group, "hours": 2}, token=admin)
+    check("a bulk body carrying `hours` is refused too", status == 400,
+          (status, payload))
+
+    # Deleting a device must take its maintenance with it: devices.id is
+    # reissued, so a leftover period would silence whoever inherits it.
+    call("POST", "/api/alerts/maintenance", {"device_id": spare}, token=admin)
+    call("DELETE", f"/api/nodes/devices/{spare}", token=admin)
+    check("deleting a device leaves no maintenance period behind for the "
+          "next device to inherit its rowid",
+          service.alerts_db.open_maintenance(spare) is None)
+
+    actions = [row["action"] for row in audit_since_mark()]
+    check("the audit trail records maintenance being turned on",
+          "alert.maintenance_on" in actions, actions)
+    check("...off", "alert.maintenance_off" in actions, actions)
+    check("...and in bulk", "alert.maintenance_bulk" in actions, actions)
+    check("and NOT under any of the mute action names — a maintenance is not "
+          "a mute, and an audit reader must be able to tell them apart",
+          not any(a.startswith("alert.mute") or a == "alert.unmute"
+                  for a in actions), actions)
 finally:
     server.stop()
     service.shutdown()

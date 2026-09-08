@@ -752,10 +752,12 @@
   }
 
   /* `target` follows "<kind>:<value>" for credential.store/clear and
-     alert.mute/unmute (device:<ip>, profile:<name>, configrx:<ip>,
-     controller:<ip>) but is a bare id, username or name for most other
-     actions (user.*, token.*, alert.ack/resolve/window_*) — there is
-     nothing to link a bare value to. Of the kinds that do carry an
+     alert.mute/unmute and alert.maintenance_on/off (device:<ip>,
+     profile:<name>, configrx:<ip>, controller:<ip>) but is a bare id,
+     username or name for most other actions (user.*, token.*,
+     alert.ack/resolve/window_*, and the "<n> devices" of
+     alert.mute_bulk/alert.maintenance_bulk) — there is nothing to link a
+     bare value to. Of the kinds that do carry an
      identifier, only device: and configrx: name something this
      application already has a page for; profile: and controller: do
      not, so they stay plain text until one exists. This is the first

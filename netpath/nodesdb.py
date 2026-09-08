@@ -1260,8 +1260,26 @@ class NodesDatabase(SqliteStore):
 
     def _device_filter_clause(self, group_id: int | None, status: str | None,
                               text: str | None, device_group_id: int | None,
-                              exclude_up: bool) -> tuple[str, list]:
+                              exclude_up: bool, only_ids=None) -> tuple[str, list]:
         clauses, params = [], []
+        if only_ids is not None:
+            # A set of ids decided OUTSIDE this database — today, the devices
+            # alerts.db says are in maintenance mode. Filtered here rather
+            # than over the answer, because the device list is paged: a
+            # page-500 read filtered afterwards would return fewer than 500
+            # rows and a `total` that disagreed with them. Chunked, so a
+            # fleet-sized id list cannot exceed SQLITE_MAX_VARIABLE_NUMBER.
+            # An EMPTY set is the caller's job to short-circuit — "IN ()" is
+            # not valid SQL — so it is refused here rather than silently
+            # matching everything.
+            ids = [int(i) for i in only_ids]
+            if not ids:
+                raise ValueError("only_ids must name at least one device")
+            ors = []
+            for chunk in _id_chunks(ids):
+                ors.append(f"id IN ({','.join('?' * len(chunk))})")
+                params.extend(chunk)
+            clauses.append(f"({' OR '.join(ors)})")
         if group_id is not None:
             clauses.append("group_id = ?")
             params.append(group_id)
@@ -1325,12 +1343,12 @@ class NodesDatabase(SqliteStore):
 
     def devices(self, group_id: int | None = None, status: str | None = None,
                text: str | None = None, device_group_id: int | None = None,
-               exclude_up: bool = False, limit: int | None = None,
+               exclude_up: bool = False, only_ids=None, limit: int | None = None,
                offset: int = 0) -> list[sqlite3.Row]:
         # `limit=None` runs no LIMIT clause at all, so an unpaged caller
         # gets the whole matching set back.
         where, params = self._device_filter_clause(
-            group_id, status, text, device_group_id, exclude_up)
+            group_id, status, text, device_group_id, exclude_up, only_ids)
         query = f"SELECT * FROM devices{where} ORDER BY name COLLATE NOCASE, ip"
         if limit is not None:
             query += " LIMIT ? OFFSET ?"
@@ -1340,13 +1358,13 @@ class NodesDatabase(SqliteStore):
 
     def devices_count(self, group_id: int | None = None, status: str | None = None,
                       text: str | None = None, device_group_id: int | None = None,
-                      exclude_up: bool = False) -> int:
+                      exclude_up: bool = False, only_ids=None) -> int:
         """How many devices match, ignoring `limit`/`offset` — the same
         shape alertsdb.count_alerts already established for "how many
         pages is this", asked with the identical filter clause devices()
         itself builds so the two can never disagree about what matched."""
         where, params = self._device_filter_clause(
-            group_id, status, text, device_group_id, exclude_up)
+            group_id, status, text, device_group_id, exclude_up, only_ids)
         with self._lock:
             return int(self._conn.execute(
                 f"SELECT COUNT(*) FROM devices{where}", params).fetchone()[0])

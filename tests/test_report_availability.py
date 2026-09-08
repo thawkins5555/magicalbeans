@@ -196,8 +196,14 @@ check("muted device: from when it was muted onward is excluded instead",
 check("plain device: nothing excluded, the full outage counts",
      by_id[plain_id].down_s == outage_raw_s
      and by_id[plain_id].maintenance_excluded_s == 0
-     and by_id[plain_id].mute_excluded_s == 0,
+     and by_id[plain_id].mute_excluded_s == 0
+     and by_id[plain_id].maintenance_mode_excluded_s == 0,
      str(by_id[plain_id].down_s))
+check("neither the window nor the mute leaks into the maintenance-MODE bucket",
+     by_id[maint_id].maintenance_mode_excluded_s == 0
+     and by_id[mute_id].maintenance_mode_excluded_s == 0,
+     (by_id[maint_id].maintenance_mode_excluded_s,
+      by_id[mute_id].maintenance_mode_excluded_s))
 check("all three: recovered before the window ended, none still down",
      not any(by_id[i].still_down for i in (maint_id, mute_id, plain_id)))
 check("global caveat names the mute-history limitation",
@@ -216,6 +222,101 @@ event_at(nodesdb, did, "up", t0 - 1800, "responding again")
 rep = device_availability_report(nodesdb, [did], t0, t1, alertsdb=None)
 check("no alertsdb: a caveat says exclusion was skipped, not silently applied",
      any("skipped" in c for c in rep.global_caveats), str(rep.global_caveats))
+
+
+# ------------------------- 6. indefinite maintenance MODE, its own bucket
+#
+# Unlike a mute, a closed maintenance-mode period stays on file, so a
+# report run today is exactly as accurate about it as one run on the day —
+# which is the whole reason a period is a row rather than a flag.
+
+nodesdb, alertsdb = new_dbs()
+now = time.time()
+t0, t1 = now - 10 * 3600, now
+
+closed_id = nodesdb.add_device("10.0.2.10", "closed-period")
+open_id = nodesdb.add_device("10.0.2.11", "open-period")
+both_id = nodesdb.add_device("10.0.2.12", "window-and-mode")
+
+down_start = t0 + 2 * 3600
+up_ts = down_start + 4 * 3600
+outage_raw_s = up_ts - down_start
+for did in (closed_id, both_id):
+    set_created(nodesdb, did, t0 - 3600)
+    set_status(nodesdb, did, "up")
+    event_at(nodesdb, did, "up", t0 - 1800, "responding again")
+    event_at(nodesdb, did, "down", down_start, "not responding")
+    event_at(nodesdb, did, "up", up_ts, "responding again")
+
+
+def period(device_id, started_ts, ended_ts=None):
+    row = alertsdb.set_maintenance(device_id, by="op", reason="fixture")
+    alertsdb._conn.execute(
+        "UPDATE device_maintenance SET started_ts = ?, ended_ts = ? WHERE id = ?",
+        (started_ts, ended_ts, row["id"]))
+    alertsdb._conn.commit()
+
+
+# A closed period covering the middle two hours of the outage.
+mid_lo, mid_hi = down_start + 3600, down_start + 3 * 3600
+period(closed_id, mid_lo, mid_hi)
+
+# An open period on a device that is STILL down, with t1 pushed into the
+# future: the clamp has to be `now`, not t1, or the report would exclude
+# time that has not happened yet and read back as more uptime than the
+# device actually had.
+set_created(nodesdb, open_id, t0 - 3600)
+set_status(nodesdb, open_id, "down")
+event_at(nodesdb, open_id, "up", t0 - 1800, "responding again")
+open_started = t0 + 3600
+event_at(nodesdb, open_id, "down", t0 + 1800, "not responding")
+period(open_id, open_started)
+
+# A window AND an open maintenance period over the SAME seconds.
+both_lo, both_hi = down_start + 1800, down_start + 2 * 3600
+alertsdb.add_window("cutover", "devices", both_lo, both_hi,
+                    scope_device_ids=[both_id])
+period(both_id, both_lo, both_hi)
+
+rep = device_availability_report(
+    nodesdb, [closed_id, open_id, both_id], t0, t1 + 4 * 3600,
+    alertsdb=alertsdb, now=now)
+by_id = {d.device_id: d for d in rep.devices}
+
+check("a CLOSED period covering part of an outage is subtracted from down_s",
+     by_id[closed_id].down_s == outage_raw_s - (mid_hi - mid_lo)
+     and by_id[closed_id].maintenance_mode_excluded_s == mid_hi - mid_lo,
+     f"down={by_id[closed_id].down_s} excl="
+     f"{by_id[closed_id].maintenance_mode_excluded_s}")
+check("...in its OWN bucket, leaving the window and mute buckets at zero",
+     by_id[closed_id].maintenance_excluded_s == 0
+     and by_id[closed_id].mute_excluded_s == 0,
+     (by_id[closed_id].maintenance_excluded_s, by_id[closed_id].mute_excluded_s))
+
+# t1 was pushed 4 hours past `now`; an open period must contribute only up
+# to now, so the exclusion is exactly now - open_started and not a second
+# of the future beyond it.
+check("an OPEN period is clamped to NOW, not to a t1 in the future",
+     abs(by_id[open_id].maintenance_mode_excluded_s - (now - open_started)) < 1.0,
+     f"{by_id[open_id].maintenance_mode_excluded_s} vs {now - open_started}")
+
+overlap = both_hi - both_lo
+check("a window and a maintenance period over the same seconds subtract ONCE",
+     abs(by_id[both_id].down_s - (outage_raw_s - overlap)) < 1.0,
+     f"down={by_id[both_id].down_s} raw={outage_raw_s} overlap={overlap}")
+check("...while each bucket still reports its own coverage in full",
+     abs(by_id[both_id].maintenance_excluded_s - overlap) < 1.0
+     and abs(by_id[both_id].maintenance_mode_excluded_s - overlap) < 1.0,
+     (by_id[both_id].maintenance_excluded_s,
+      by_id[both_id].maintenance_mode_excluded_s))
+check("a caveat names the maintenance-mode retention limit too",
+     any("maintenance-mode" in c or "maintenance mode" in c
+         for c in rep.global_caveats), str(rep.global_caveats))
+
+rep_none = device_availability_report(nodesdb, [closed_id], t0, t1, alertsdb=None)
+check("no alertsdb: the skipped-exclusion caveat names all THREE mechanisms",
+     any("maintenance-mode" in c and "mute" in c and "window" in c
+         for c in rep_none.global_caveats), str(rep_none.global_caveats))
 
 
 print()

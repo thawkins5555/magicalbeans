@@ -417,6 +417,20 @@ ROUTES = [
     ("POST", r"^/api/alerts/mute$", api.post_alerts_mute, ("alerts", W)),
     ("DELETE", r"^/api/alerts/mute$", api.delete_alerts_mute, ("alerts", W)),
     ("POST", r"^/api/alerts/bulk-mute$", api.post_alerts_bulk_mute, ("alerts", W)),
+    # ("alerts", W), not ("nodes", W): maintenance mode silences alerts, so
+    # the account that may set it is the one that may mute — the same rule a
+    # mute has carried since 4.37.0, and a Nodes-write operator without
+    # Alerts write must not be able to silence the fleet from the Nodes page.
+    # The read is R, matching /api/alerts/mutes: a read-only account may see
+    # what is silenced and by which mechanism, it just cannot change it. The
+    # Alerts detail pane fetches this on every refresh, viewer accounts
+    # included, so a W gate here would 403 the whole page rather than one
+    # button.
+    ("GET", r"^/api/alerts/maintenance$", api.get_alerts_maintenance, ("alerts", R)),
+    ("POST", r"^/api/alerts/maintenance$", api.post_alerts_maintenance, ("alerts", W)),
+    ("DELETE", r"^/api/alerts/maintenance$", api.delete_alerts_maintenance, ("alerts", W)),
+    ("POST", r"^/api/alerts/bulk-maintenance$", api.post_alerts_bulk_maintenance,
+     ("alerts", W)),
     ("GET", r"^/api/alerts/windows$", api.get_alerts_windows, ("alerts", R)),
     ("POST", r"^/api/alerts/windows$", api.post_alerts_window, ("alerts", W)),
     ("PUT", r"^/api/alerts/windows/(\d+)$", api.put_alerts_window, ("alerts", W)),

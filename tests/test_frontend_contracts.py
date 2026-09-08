@@ -1487,6 +1487,62 @@ check("if (!isPublished) {" in _ALERTS46,
       "and the save handler does not read inputs it did not render")
 
 
+# ------------------------------------------- 5.4 indefinite maintenance mode
+#
+# Five surfaces, four of which fail silently if they regress: a tag that is
+# never called renders nothing, a signature that omits the state never
+# rebuilds the pane, a button without its gate is offered to an account the
+# server will 403, and a CSV column dropped from one of the two lists shifts
+# every value after it by one.
+_NODES54 = read("nodes.js")
+_ALERTS54 = read("alerts.js")
+
+check("function maintenanceTag(" in _NODES54,
+      "nodes.js defines maintenanceTag, the device list's own answer to "
+      "'why is this one quiet' for maintenance mode")
+check("mutedTag(" in _NODES54 and "${maintenanceTag(r)}${mutedTag(r)}" in _NODES54,
+      "the name column calls BOTH tags -- mutedTag was left untouched, and a "
+      "device that is muted AND in maintenance shows both")
+check("nd-filter-maintenance" in _NODES54
+      and "maintenance_only" in _NODES54,
+      "the Only-in-maintenance checkbox sends maintenance_only by presence, "
+      "the same convention offline_only already uses")
+_FILTER_SIG = re.search(r"const filterSig = JSON\.stringify\(\[(.*?)\]\);",
+                        _NODES54, re.S)
+check(bool(_FILTER_SIG) and "maintenance_only" in _FILTER_SIG.group(1),
+      "...and it is part of the filter signature, so ticking it resets the "
+      "list to page one instead of holding an offset into a different set")
+
+check("maint ? maint.started_ts : ''" in _ALERTS54,
+      "alerts.js puts the maintenance state in view.detailSignature -- the "
+      "pane is only rebuilt when that string changes, so a state left out "
+      "of it would show the previous answer until something else moved")
+check("App.get('/api/alerts/maintenance')" in _ALERTS54,
+      "...and the maintenance fetch rides in the same Promise.all as the "
+      "mutes, so the two can never disagree for a tick")
+check("alerts-d-end-maintenance" in _ALERTS54
+      and "alerts-d-unmute" in _ALERTS54,
+      "the Alerts detail pane offers End maintenance, and the mute block "
+      "beside it is untouched")
+
+for element in ("nd-maintenance", "nd-bulk-maintenance", "nd-bulk-maintenance-off"):
+    pattern = re.compile(r'id="%s"[^>]*data-requires-write="alerts"' % element)
+    check(bool(pattern.search(INDEX)),
+          f"index.html carries #{element} gated data-requires-write=\"alerts\" "
+          "-- maintenance silences alerts, so it is the Alerts writer's to set, "
+          "not the Nodes writer's")
+
+_AVAIL_CSV = re.search(r"const header = \[\'device_id\'.*?\];", _NODES54, re.S)
+_AVAIL_CSV = _AVAIL_CSV.group(0) if _AVAIL_CSV else ""
+for column in ("maintenance_excluded_s", "maintenance_mode_excluded_s",
+               "mute_excluded_s"):
+    check(column in _AVAIL_CSV,
+          f"the availability CSV header carries {column} -- the three "
+          "suppression buckets stay separate, because the export is read to "
+          "answer WHICH mechanism took a device out of service")
+
+
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

@@ -1,9 +1,10 @@
 """Availability and top-N-saturation reports, computed read-only from
 history nodesdb.py/alertsdb.py already keep (device_events, samples_hourly,
-maintenance_windows, mutes). A history gap is not necessarily downtime: it
-is clipped to the device's created_ts, excluded where a maintenance window
-or a still-active mute covers it, and flagged (not hidden) past GAP_FLAG_S
-in case it was really a stopped poller rather than a quiet, healthy device.
+maintenance_windows, mutes, device_maintenance). A history gap is not
+necessarily downtime: it is clipped to the device's created_ts, excluded
+where a maintenance window, a maintenance-mode period or a still-active
+mute covers it, and flagged (not hidden) past GAP_FLAG_S in case it was
+really a stopped poller rather than a quiet, healthy device.
 """
 
 from __future__ import annotations
@@ -25,6 +26,17 @@ MUTE_HISTORY_CAVEAT = (
     "ad-hoc device mutes are deleted once they expire, so only a mute "
     "still active when this report ran could be excluded; a mute that "
     "had already lapsed reads as ordinary down time"
+)
+
+# Maintenance MODE, unlike a mute, keeps its closed periods on file — which
+# is what lets a past period be subtracted at all. They are not kept
+# forever: prune() ages a CLOSED period out on the alert retention, so a
+# report reaching further back than that reads those seconds as ordinary
+# down time. An OPEN period is never pruned at any age.
+MAINTENANCE_MODE_HISTORY_CAVEAT = (
+    "closed maintenance-mode periods age out on the alert retention, so a "
+    "period that ended longer ago than that reads as ordinary down time; a "
+    "period still open is always excluded"
 )
 
 _WEEK_S = 7 * 86400.0
@@ -138,6 +150,10 @@ class DeviceAvailability:
     auth_s: float = 0.0
     unknown_s: float = 0.0
     maintenance_excluded_s: float = 0.0
+    # Its own bucket, merged into neither of its neighbours: the CSV is read
+    # to answer who took a device out of service and by which mechanism, and
+    # folding two of them together is unrecoverable.
+    maintenance_mode_excluded_s: float = 0.0
     mute_excluded_s: float = 0.0
     availability_pct: float | None = None
     outage_count: int = 0
@@ -177,12 +193,13 @@ def device_availability_report(nodesdb, device_ids: list[int], t0: float, t1: fl
     pretending it ran and found nothing to exclude."""
     t0, t1 = clamp_window(t0, t1)
     now = time.time() if now is None else now
-    global_caveats = [MUTE_HISTORY_CAVEAT]
+    global_caveats = [MUTE_HISTORY_CAVEAT, MAINTENANCE_MODE_HISTORY_CAVEAT]
     if alertsdb is None:
         global_caveats.append(
-            "no alerts database was supplied: maintenance-window and mute "
-            "exclusion were both skipped, so down_s includes any time a "
-            "maintenance window or a still-active mute would otherwise "
+            "no alerts database was supplied: maintenance-window, "
+            "maintenance-mode and mute exclusion were all three skipped, so "
+            "down_s includes any time a maintenance window, an indefinite "
+            "maintenance-mode period or a still-active mute would otherwise "
             "have excluded")
 
     # Loaded once, outside the per-device loop: a real deployment has a
@@ -194,6 +211,8 @@ def device_availability_report(nodesdb, device_ids: list[int], t0: float, t1: fl
     windows = alertsdb.windows() if alertsdb is not None else []
     mute_by_entity = ({row["entity_id"]: row for row in alertsdb.mutes("device")}
                       if alertsdb is not None else {})
+    maintenance_by_device = (alertsdb.maintenance_periods(t0, t1)
+                             if alertsdb is not None else {})
 
     results: list[DeviceAvailability] = []
     for device_id in device_ids:
@@ -232,6 +251,7 @@ def device_availability_report(nodesdb, device_ids: list[int], t0: float, t1: fl
             continue
 
         mute_row = mute_by_entity.get(str(device_id))
+        maint_mode_periods = maintenance_by_device.get(str(device_id), ())
         applicable_windows = [w for w in windows
                               if _window_scope_matches(w, str(device_id),
                                                         row["device_group_id"])]
@@ -266,11 +286,29 @@ def device_availability_report(nodesdb, device_ids: list[int], t0: float, t1: fl
                 if hi > lo:
                     mute_intervals.append((lo, hi))
 
+            mode_intervals: list[tuple[float, float]] = []
+            for period in maint_mode_periods:
+                # An OPEN period is clamped to `now`, NOT to the segment's
+                # end: clamp_window can hand this report a t1 in the future,
+                # and excluding time that has not happened yet would subtract
+                # it from downtime and inflate uptime.
+                end = period["ended_ts"] if period["ended_ts"] is not None else now
+                lo = max(seg_start, period["started_ts"])
+                hi = min(seg_end, end)
+                if hi > lo:
+                    mode_intervals.append((lo, hi))
+
             maint_merged = _merge_intervals(maint_intervals)
             mute_merged = _merge_intervals(mute_intervals)
+            mode_merged = _merge_intervals(mode_intervals)
             report.maintenance_excluded_s += _interval_total(maint_merged)
             report.mute_excluded_s += _interval_total(mute_merged)
-            excluded_intervals = _merge_intervals(maint_intervals + mute_intervals)
+            report.maintenance_mode_excluded_s += _interval_total(mode_merged)
+            # One union across all three, so seconds two mechanisms both
+            # cover are subtracted from downtime once while each bucket
+            # still reports its own coverage in full.
+            excluded_intervals = _merge_intervals(
+                maint_intervals + mute_intervals + mode_intervals)
             excluded_s = min(duration, _interval_total(excluded_intervals))
             net = duration - excluded_s
 
