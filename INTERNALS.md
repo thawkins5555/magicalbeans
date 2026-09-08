@@ -4425,7 +4425,11 @@ is algebraically the same "everything not in the top series" the raw path
 computes by adding up the keys it left out, so `overview()` uses the one
 formulation on both paths and `— other —` absorbs sub-cap keys and, on
 the rollup path, NULL-keyed traffic (`flow_rollup`'s primary key forbids
-NULL, so the compaction `SELECT` carries `IS NOT NULL`).
+NULL, so the compaction `SELECT` carries `IS NOT NULL`). It is clamped at
+zero on read: a dimension and its bucket's span row are written in
+separate transactions, so a dimension rebuilt after late flows arrived can
+be read against a span built before them, and a series that stacks
+downwards is not something traffic does.
 
 Two tiers, matched to `api._flow_bucket`'s ladder: 60 serves the 60/300/900
 buckets, 3600 serves 3600 and 21600, and the 10-second bucket of the
@@ -4437,7 +4441,13 @@ The watermark seeds at the current *sealed* bucket rather than at the
 oldest row, so an existing store produces useful buckets on its first pass
 instead of grinding through a fortnight of history first; history is paged
 in separately by `backfill_rollup`, walking a floor cursor backwards a
-bucket at a time and committing it as it goes. A bucket is rebuilt with
+bucket at a time and committing it as it goes. Behind the watermark, a
+pass rebuilds the buckets its writers marked dirty (`_DIRTY`, the oldest
+`ts_end` anything has written or rewritten since that tier last
+compacted) rather than a fixed window: a window wide enough for the
+slowest exporter is write amplification on every other pass, and any
+fixed width is still too narrow for an exporter further behind than
+that. A bucket is rebuilt with
 DELETE-then-INSERT rather than an upsert, because which keys make the
 top-K changes when it is recomputed and a stale row would otherwise
 survive its key dropping out. And the hourly tier reads the minute tier
@@ -4448,7 +4458,10 @@ Query routing (`_rollup_plan`) refuses the rollups outright when any
 filter is set (the rollup has one row per key, not per flow, and the
 filters select on columns that are not in it), when no tier divides the
 bucket size, and when the tier's floor does not reach the start of the
-window. That last rule is what makes the backfill safe to run at any
+window. Where there is no bucket size to divide — `top()` and `totals()`,
+which put the whole window in one slot — the coarsest tier that both
+reaches `t0` and starts on it wins, since with one slot to fill the finer
+tier only means reading sixty times the rows for the same number. That last rule is what makes the backfill safe to run at any
 pace: as the cursor walks back, progressively wider windows move off raw,
 and none is ever slower than it was before. The chosen tier serves
 `[t0, seal_ts)` and raw serves `[seal_ts, t1]`, where `seal_ts` is
@@ -4469,9 +4482,11 @@ commit instead of hundreds and `queue.Full` is reached far later.
 the last fifteen minutes — unbounded it had no index it could use and
 grew into a scan of the whole retention window, on the writer thread,
 under the write lock, after every flush. When a rewrite does correct rows
-it records how far back it reached, and the next compaction follows it
-back, so widening that bound later cannot make the rollups quietly
-disagree with the rows they were built from.
+it marks every tier dirty from how far back it reached, exactly as a
+flush does, so widening that bound later cannot make the rollups quietly
+disagree with the rows they were built from. Per tier and not one shared
+marker: the minute tier compacts first, and a single marker was cleared
+by that pass before the hourly tier had ever seen it.
 
 `ix_flows_exporter` was dropped: every insert paid for a random-position
 B-tree insert (`exporter` is not monotone, unlike `ts_end`) to serve one
@@ -4485,10 +4500,15 @@ exists for.
 **Retention.** `prune()` is built on `SqliteStore._delete_batches`, the
 same shape `db.prune()` uses: age, then row cap, then each rollup tier,
 sharing one deadline, each stage chunked so the write lock is released
-between batches. Ids only chunk the sweep — every batch still filters on
-`ts_end`, so an exporter with a wrong clock cannot make it drop the wrong
-rows — and the row-cap stage derives its cut from `MIN(id)`/`MAX(id)`
-probes rather than the `COUNT(*)` full scan it used to run on every pass.
+between batches. The age stage deletes off `ix_flows_ts`, oldest first,
+with the helper's coordinate counting rows removed rather than ids
+walked: bounding it by `MIN(id)`/`MAX(id)` over the aged rows meant one
+flow arriving now from an exporter whose clock was years out put the top
+of the range at the newest id in the table, and every sweep chunk-walked
+all of it — correctly filtered, but O(table) every fifteen minutes. The
+row-cap stage does chunk by id, which is arrival order, and derives its
+cut from `MIN(id)`/`MAX(id)` probes rather than the `COUNT(*)` full scan
+it used to run on every pass.
 The rollup stage walks bucket timestamps instead of ids (the helper only
 needs a monotonic coordinate) and raises the tier's floor as it goes, so
 routing stops trusting history that is no longer there.
@@ -4502,17 +4522,29 @@ the scan is bounded instead: `flows()` starts at `MAX(id) − FLOW_SCAN_CAP`
 (`MAX(rowid)` is one probe) and returns whether the bound bit, which
 `api._flow_records_rows` passes through as `scan_bounded` and `netflow.js`
 says out loud. Changing the sort would change what "top 250 by volume"
-means; bounding the scan does not.
+means; bounding the scan does not. The bound belongs to those two
+orderings alone — `order == "time"` is `ix_flows_ts` end to end — and a
+window lying wholly below it is answered unbounded, since a window with
+nothing above the bound has no ordering left to cut short and an empty
+list is not what "the heaviest of the most recent" means.
 
 **The rollup loop** lives in `web/service.py`, on its own 60-second timer
 beside the maintenance thread rather than inside the quarter-hourly sweep:
 at `MAINTENANCE_INTERVAL_S` cadence the unsummarised tail would be a
 quarter of an hour of raw flows, which at extreme volume is the very scan
 the rollups exist to avoid. With that cadence and `_ROLLUP_LAG_S` the tail
-is never more than about three minutes. The maintenance sweep additionally
-compacts, backfills and drops the legacy index *before* pruning — the same
+is about three minutes wherever a pass can build every bucket that sealed
+since the last one; where it cannot, the watermark still advances as far
+as the pass reached, so the tail is bounded by how fast the store can
+summarise rather than growing by a bucket a minute for ever. That is what
+building new buckets *before* the redo window buys: a pass whose redo
+alone outran its budget used to leave the watermark exactly where it
+started and repeat the same work on the next pass. The maintenance sweep
+backfills and drops the legacy index *before* pruning — the same
 ordering, and the same reason, as the `nodes_db.compact_rollup()` /
-`nodes_db.prune()` pair beside it.
+`nodes_db.prune()` pair beside it. It does not compact: the timer has
+already built those buckets, and `Service._rollup_lock` keeps the sweep's
+backfill and the timer's compaction from rebuilding one at the same time.
 
 ### Zoom debounce and the stale-response guard (`netflow.js`)
 

@@ -136,7 +136,10 @@ def disk_space(service) -> tuple[int, int]:
 # sweep: at a quarter-hour cadence the unsummarised tail of raw flows would be
 # a quarter of an hour of them, which at a busy exporter's volume is the very
 # scan the rollups exist to avoid. With this and flowdb's seal lag the tail is
-# never more than about three minutes.
+# about three minutes wherever a pass can build every bucket that has sealed
+# since the last one. Where it cannot, the watermark still advances as far as
+# the pass got, so the tail is bounded by how fast the store can summarise
+# rather than growing by a bucket a minute for ever.
 ROLLUP_INTERVAL_S = 60
 
 # What each tier is called where an operator reads about it.
@@ -369,6 +372,11 @@ class Service:
         # Held for the body of run_maintenance: shutdown() below must not
         # close a database out from under a sweep in flight.
         self._maintenance_lock = threading.Lock()
+        # One thread rebuilds rollup buckets at a time. The 60-second timer
+        # and the maintenance sweep's backfill both do, and two of them
+        # rebuilding the same bucket at once is how a dimension's rows came
+        # to be paired with a span row built from a different set of flows.
+        self._rollup_lock = threading.Lock()
         self.started_at = time.time()
         # Bumped by every write to something /api/config carries. The
         # browser refetches /api/config only when this number moves.
@@ -1015,10 +1023,15 @@ class Service:
                     self._maintenance_done.set()
 
     def compact_flow_rollups(self) -> int:
-        """Summarise sealed flow buckets into both tiers."""
+        """Summarise sealed flow buckets into both tiers.
+
+        The minute tier first: the hourly one is built from it wherever it
+        covers a whole hour.
+        """
         written = 0
-        for tier in ROLLUP_TIERS:
-            written += self.flow_db.compact_rollup(tier)
+        with self._rollup_lock:
+            for tier in ROLLUP_TIERS:
+                written += self.flow_db.compact_rollup(tier)
         return written
 
     def _rollup_loop(self) -> None:
@@ -1075,26 +1088,34 @@ class Service:
                       budget_s=prune_budget)
         self._trim_db("max_trace_db_mb", self.db, "Trace database",
                       "oldest traces", budget_s=prune_budget)
-        self._trim_db("max_flow_db_mb", self.flow_db, "Flow database",
-                      "oldest flow records")
-
-        # Before the prune, not after: compaction summarises sealed buckets
-        # of raw flows, and pruning first would delete a bucket before it had
-        # been summarised. A chart wider than a quarter of an hour reads the
-        # rollups rather than the raw rows.
-        self.compact_flow_rollups()
-        for tier in ROLLUP_TIERS:
-            written, done = self.flow_db.backfill_rollup(tier)
-            if done:
-                self.log.add(SYSTEM, f"NetFlow: summarised the stored history "
-                                     f"into the {ROLLUP_TIER_NAMES[tier]} "
-                                     f"rollups ({written} row(s) on this pass)")
+        # Before the prune, not after: the backfill summarises raw flows, and
+        # pruning first would delete a bucket before it had been summarised.
+        # A chart wider than a quarter of an hour reads the rollups rather
+        # than the raw rows. Forward compaction is not repeated here — the
+        # 60-second timer has already done it, and a second pass over the
+        # same buckets doubles a sweep's rollup load for nothing.
+        with self._rollup_lock:
+            for tier in ROLLUP_TIERS:
+                written, done = self.flow_db.backfill_rollup(tier)
+                if done:
+                    self.log.add(SYSTEM,
+                                 f"NetFlow: summarised the stored history "
+                                 f"into the {ROLLUP_TIER_NAMES[tier]} rollups "
+                                 f"({written} row(s) on this pass)")
         self.flow_db.drop_legacy_indexes()
         self.flow_db.prune(
             float(self.flow_settings.get("retention_days", 14)),
             int(self.flow_settings.get("max_flows", 5_000_000)),
             minute_days=float(self.flow_settings.get("rollup_minute_days", 2)),
             rollup_days=float(self.flow_settings.get("rollup_retention_days", 90)))
+        # Last of the flow stages, for the reason compaction runs before the
+        # prune: the size cap deletes the same oldest raw rows the backfill
+        # is still summarising, and running it first meant a store already at
+        # its cap gave them up on every sweep while the backfill advanced one
+        # bucket. The promise that a 30-day chart outlives a fortnight of raw
+        # retention only holds if the rows are summarised before they go.
+        self._trim_db("max_flow_db_mb", self.flow_db, "Flow database",
+                      "oldest flow records")
 
         self.syslog_db.prune(
             float(self.syslog_settings.get("retention_days", 30)),

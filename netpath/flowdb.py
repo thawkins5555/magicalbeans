@@ -216,13 +216,10 @@ ROLLUP_DAYS_SETTING = {60: "rollup_minute_days", 3600: "rollup_retention_days"}
 
 # A bucket is summarised only once its end is this old: an exporter with an
 # active timeout or a skewed clock keeps sending flows for a window that has
-# already closed.
+# already closed. Flows that land later still than that are not lost either:
+# every writer records how far back it reached (_DIRTY) and the next pass
+# rebuilds exactly those buckets, however far behind the watermark they are.
 _ROLLUP_LAG_S = 120
-# How many sealed buckets each pass recomputes behind the watermark, so those
-# late flows are not lost. The minute window is deliberately wider than
-# collector.RESAMPLE_MAX_AGE_S, the age at which a sampling rate announced
-# after the fact can still rewrite a raw row.
-_ROLLUP_REDO = {60: 20, 3600: 2}
 _ROLLUP_MAX_BUCKETS = {60: 240, 3600: 48}
 _ROLLUP_BUDGET_S = 5.0
 
@@ -235,8 +232,11 @@ FLOW_SCAN_CAP = 2_000_000
 
 _WATERMARK = "flow_rollup_watermark_%d"     # forward edge: built below this
 _FLOOR = "flow_rollup_floor_%d"             # backward edge backfill has reached
-# The oldest ts_end a sampling rewrite has touched since the last compaction.
-_RESAMPLE_FLOOR = "flow_resample_floor_ts"
+# The oldest ts_end a writer has touched since this tier last compacted: what
+# the next pass has to rebuild behind its watermark, and nothing more. Per
+# tier, because each consumes it at its own pace — one shared mark was
+# cleared by whichever tier compacted first, and the other never saw it.
+_DIRTY = "flow_rollup_dirty_ts_%d"
 
 
 def _align_down(ts: float, width: float) -> int:
@@ -250,10 +250,18 @@ class FlowDatabase(SqliteStore):
     TRIM_TABLE = "flows"
     # The rollups reach further back than the raw rows they were built from,
     # so asking flows alone under-reports how much history this store holds.
-    OLDEST_TS_SQL = ("SELECT MIN(ts) FROM ("
-                     "SELECT MIN(ts_start) AS ts FROM flows"
-                     " UNION ALL SELECT MIN(bucket) FROM flow_rollup"
-                     " UNION ALL SELECT MIN(bucket) FROM flow_rollup_span)")
+    # Index probes, never a scan: /api/state polls this every ten seconds,
+    # on the collector's write lock, for every open tab. MIN(ts_start) has no
+    # index (ix_flows_ts is on ts_end) and walked the table; MIN(bucket) FROM
+    # flow_rollup walked ix_flow_rollup_bucket in full, that index leading on
+    # tier defeating the MIN optimisation. The oldest id is the oldest
+    # arrival, and flow_rollup_span holds a row for every bucket flow_rollup
+    # does — one arm per tier, since its primary key leads on tier too.
+    OLDEST_TS_SQL = (
+        "SELECT MIN(ts) FROM ("
+        "SELECT ts FROM (SELECT ts_start AS ts FROM flows ORDER BY id LIMIT 1)"
+        + "".join(f" UNION ALL SELECT MIN(bucket) FROM flow_rollup_span"
+                  f" WHERE tier = {tier}" for tier in ROLLUP_TIERS) + ")")
     TRIM_FLOOR = 1000
     # Rollup rows a tier keeps whatever the size cap says: below this the wide
     # charts it is the only source for have nothing left to draw, and the raw
@@ -293,6 +301,11 @@ class FlowDatabase(SqliteStore):
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rows,
             )
+            # Which buckets this flush landed in is the exporter's clock's
+            # answer, not the wall clock's, so the compaction that has to
+            # rebuild them is told rather than left to guess a window. In the
+            # same transaction as the rows it describes.
+            self._mark_dirty(min(row[3] for row in rows))
             self._conn.commit()
         return len(rows)
 
@@ -352,12 +365,11 @@ class FlowDatabase(SqliteStore):
             self._conn.commit()
         if corrected:
             # Rows a sealed rollup bucket was built from have just changed
-            # value. Recording how far back lets compact_rollup follow the
-            # rewrite rather than quietly disagreeing with the raw rows,
-            # whatever the caller's bound turns out to be.
-            floor = self._private_setting(_RESAMPLE_FLOOR)
-            if floor is None or since_ts < float(floor):
-                self._set_private_setting(_RESAMPLE_FLOOR, since_ts)
+            # value, which is the same kind of dirt a late flush leaves:
+            # each tier rebuilds from here, and each clears its own mark once
+            # it has, so whichever compacts first cannot consume it for the
+            # other. Whatever the caller's bound turns out to be.
+            self._mark_dirty(since_ts)
         return corrected
 
     def samplers(self) -> list[sqlite3.Row]:
@@ -395,6 +407,21 @@ class FlowDatabase(SqliteStore):
         watermark = self._private_setting(_WATERMARK % tier)
         return (None if floor is None else int(floor),
                 None if watermark is None else int(watermark))
+
+    def _mark_dirty(self, ts: float, tiers=ROLLUP_TIERS) -> None:
+        """Lower each tier's redo floor to `ts`.
+
+        Called by whatever changed the rows, so a pass rebuilds exactly the
+        buckets that moved rather than a fixed window behind the watermark:
+        a window wide enough for the slowest exporter is write amplification
+        for every other pass, and any fixed width is still too narrow for an
+        exporter further behind than that.
+        """
+        for tier in tiers:
+            key = _DIRTY % tier
+            current = self._private_setting(key)
+            if current is None or float(ts) < float(current):
+                self._set_private_setting(key, float(ts))
 
     def _from_minute_tier(self, tier: int, bucket: int) -> bool:
         """Whether the minute tier already covers this whole bucket. Sixty
@@ -484,6 +511,13 @@ class FlowDatabase(SqliteStore):
         is looking at. backfill_rollup pages the history in from the other
         end.
 
+        New buckets first, redo second. Spending the budget on the redo
+        window first leaves the watermark where it was whenever that window
+        alone costs more than the budget, so the next pass repeats identical
+        work while real time adds a bucket a minute and the unsummarised
+        tail grows without bound. This order makes the watermark advance on
+        every pass, whatever the redo costs.
+
         Returns the number of rollup rows written.
         """
         now = time.time()
@@ -498,28 +532,50 @@ class FlowDatabase(SqliteStore):
             self._set_private_setting(_WATERMARK % tier, sealed)
             self._set_private_setting(_FLOOR % tier, sealed)
             return 0
-        bucket = watermark - _ROLLUP_REDO[tier] * tier
-        # A rewritten sampling factor changes rows a sealed bucket has
-        # already been built from, so follow the rewrite back rather than
-        # leaving the rollup quietly disagreeing with the raw rows.
-        resampled = self._private_setting(_RESAMPLE_FLOOR)
-        if resampled is not None:
-            bucket = min(bucket, _align_down(float(resampled), tier))
-        if floor is not None:
-            bucket = max(bucket, floor)
         limit = _ROLLUP_MAX_BUCKETS[tier] if max_buckets is None else max_buckets
         deadline = time.monotonic() + budget_s
         written = 0
         processed = 0
+        bucket = watermark
         while (bucket + tier <= sealed and processed < limit
                and time.monotonic() < deadline):
             written += self._compact_bucket(tier, bucket)
             bucket += tier
             processed += 1
-        # max(): a pass that ran out of budget inside the redo window must
-        # not wind the watermark back to where it started.
-        self._set_private_setting(_WATERMARK % tier, max(bucket, watermark))
-        self._set_private_setting(_RESAMPLE_FLOOR, None)
+        if bucket != watermark:
+            self._set_private_setting(_WATERMARK % tier, bucket)
+        return written + self._redo_dirty(tier, watermark, floor,
+                                          limit - processed, deadline)
+
+    def _redo_dirty(self, tier: int, upto: int, floor: int | None,
+                    limit: int, deadline: float) -> int:
+        """Rebuild the buckets a writer has touched behind `upto`.
+
+        Taken and cleared under one lock, so a flush landing mid-pass marks
+        the tier dirty again rather than having its mark thrown away at the
+        end. Oldest first, and whatever the budget did not reach is marked
+        dirty again, so the walk resumes there instead of starting over.
+        """
+        with self._lock:
+            dirty = self._private_setting(_DIRTY % tier)
+            self._set_private_setting(_DIRTY % tier, None)
+        if dirty is None:
+            return 0
+        bucket = _align_down(float(dirty), tier)
+        if floor is not None:
+            bucket = max(bucket, floor)
+        written = 0
+        processed = 0
+        while (bucket < upto and processed < limit
+               and time.monotonic() < deadline):
+            written += self._compact_bucket(tier, bucket)
+            bucket += tier
+            processed += 1
+        if bucket < upto:
+            # The coarser tiers are built from this one where it covers them,
+            # so what is still dirty here is still dirty there.
+            self._mark_dirty(float(bucket),
+                             [wider for wider in ROLLUP_TIERS if wider >= tier])
         return written
 
     def backfill_rollup(self, tier: int, max_buckets: int | None = None,
@@ -631,9 +687,9 @@ class FlowDatabase(SqliteStore):
         Batched in adaptive, lock-bounded chunks rather than one DELETE per
         stage: the write lock is the one the collector's writer needs, and
         NetFlow is UDP, so a writer stalled behind a month-wide delete is
-        lost data. The id range only chunks the sweep — each batch still
-        filters on ts_end, so an exporter with a wrong clock cannot make
-        prune() drop the wrong rows.
+        lost data. Every batch of the age stage filters on ts_end, so an
+        exporter with a wrong clock cannot make prune() drop the wrong rows;
+        the row-cap stage chunks by id, which is arrival order.
 
         `retention_days` and `max_flows` bound the raw table alone. Passing
         0 for each of the four (the Settings page's maintenance button)
@@ -645,23 +701,33 @@ class FlowDatabase(SqliteStore):
         removed = 0
         incomplete = False
 
+        # Counted, not bounded by MIN(id)/MAX(id) over the aged rows: one
+        # flow arriving now from an exporter whose clock is years out takes
+        # the newest id, which put MAX(id) at the end of the table and had
+        # every sweep chunk-walk all five million rows of it — correctly
+        # filtered, but O(table) every fifteen minutes, and slow enough to
+        # trip the incomplete warning below. The count is the same
+        # covering-index scan of ix_flows_ts the bounds query was.
         with self._lock:
-            bounds = self._conn.execute(
-                "SELECT MIN(id) AS lo, MAX(id) AS hi FROM flows"
-                " WHERE ts_end < ?", (cutoff,)).fetchone()
-        low, high = bounds["lo"], bounds["hi"]
-        if low is not None:
+            aged = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM flows WHERE ts_end < ?",
+                (cutoff,)).fetchone()["n"]
+        if aged:
             def by_age(lo: int, up: int) -> int:
+                # Driven off ix_flows_ts, oldest first: the coordinate
+                # _delete_batches walks is how many rows have gone, so the
+                # sweep costs what it deletes and nothing for what it keeps.
                 cursor = self._conn.execute(
-                    "DELETE FROM flows WHERE id >= ? AND id < ? AND ts_end < ?",
-                    (lo, up, cutoff))
+                    "DELETE FROM flows WHERE id IN (SELECT id FROM flows"
+                    " WHERE ts_end < ? ORDER BY ts_end LIMIT ?)",
+                    (cutoff, up - lo))
                 return cursor.rowcount or 0
 
-            aged, reached = self._delete_batches(
-                low, high + 1, deadline, by_age, chunk=TRIM_CHUNK,
+            gone, reached = self._delete_batches(
+                0, aged, deadline, by_age, chunk=TRIM_CHUNK,
                 chunk_min=TRIM_CHUNK_MIN, chunk_max=TRIM_CHUNK_MAX)
-            removed += aged
-            incomplete = incomplete or reached < high + 1
+            removed += gone
+            incomplete = incomplete or reached < aged
 
         if max_flows:
             # Two index probes rather than the COUNT(*) full scan this used
@@ -695,16 +761,17 @@ class FlowDatabase(SqliteStore):
             self._reclaim_until(time.monotonic() + PRUNE_RECLAIM_BUDGET_S)
         return removed
 
-    def trim_to_size(self, max_bytes: int, budget_s: float | None = None) -> int:
-        """Delete the oldest flow history until the store fits under the cap:
-        raw flows first, then the rollups.
+    def _trim_more(self, max_bytes: int, budget_s: float | None = None) -> int:
+        """Stage two of the size cap: the oldest rollup buckets, once the raw
+        flows have reached TRIM_FLOOR.
 
-        Without stage two the base implementation would delete raw down to
-        TRIM_FLOOR and then warn about the cap forever while the rollups held
-        the space. Stage two deletes by oldest bucket, so it never touches
-        the recent ones compact_rollup's redo window rewrites.
+        Without it the base implementation would delete raw down to that
+        floor and then warn about the cap forever while the rollups held the
+        space. Deletes by oldest bucket, so it never touches the recent ones
+        a compaction pass rewrites. A hook rather than an override, so the
+        base emits its over-cap warning after this rather than before it.
         """
-        removed = super().trim_to_size(max_bytes, budget_s)
+        removed = 0
         if max_bytes <= 0 or self._trim_size() <= max_bytes:
             return removed
         deadline = time.monotonic() + (TRIM_BUDGET_S if budget_s is None else budget_s)
@@ -817,9 +884,13 @@ class FlowDatabase(SqliteStore):
             return None
         for tier in sorted(ROLLUP_TIERS, reverse=True):
             if bucket_s is None:
-                # Nothing to slot, so the finest tier is enough and the
-                # window start moves by at most a minute.
-                if tier != min(ROLLUP_TIERS):
+                # One slot, so the coarsest tier that reaches t0 is the
+                # cheapest answer, not the finest — the loop is already in
+                # that order. It has to start on t0 as well: the rollup arm
+                # reads whole buckets from t0 up and the raw arm starts at
+                # the seal, so a bucket straddling the start of the window
+                # would fall between them and be counted by neither.
+                if t0 != _align_down(t0, tier):
                     continue
             elif tier > bucket_s or bucket_s % tier:
                 # A bucket lands wholly inside one slot only when every slot
@@ -1010,6 +1081,13 @@ class FlowDatabase(SqliteStore):
         for values in series.values():
             for index, value in enumerate(values):
                 other[index] -= value
+        # Clamped, because the two halves of a bucket are written in
+        # separate transactions: a dimension rebuilt after late flows
+        # arrived can be read against a span row built before them, and the
+        # keys then briefly outweigh the total they are measured against.
+        # A bucket or two behind is what that is; a series stacking
+        # downwards is not something traffic does.
+        other = [max(0.0, value) for value in other]
         if any(other):
             series["\u2014 other \u2014"] = other
 
@@ -1022,29 +1100,43 @@ class FlowDatabase(SqliteStore):
 
         Returns (rows, whether the FLOW_SCAN_CAP bound cut the window short),
         so the page can say the ordering is over the most recent flows rather
-        than imply it searched every one of them. `order == "time"` is served
-        end to end by ix_flows_ts and the bound never bites there.
+        than imply it searched every one of them.
+
+        The bound is for the two volume orderings alone: they sort on a
+        product no index can serve, while `order == "time"` is ix_flows_ts
+        end to end and has nothing to bound. And a window lying wholly below
+        the bound is answered unbounded rather than empty — there is no
+        ordering left to cut short there, and an empty list is not what "the
+        heaviest of the most recent" means.
         """
         where, params = self._where(t0, t1, filters)
         column = {"bytes": "bytes * sampling", "packets": "packets * sampling",
                   "time": "ts_end"}.get(order, "bytes * sampling")
         with self._lock:
-            highest = self._conn.execute(
-                "SELECT MAX(id) AS hi FROM flows").fetchone()["hi"] or 0
-            floor_id = highest - FLOW_SCAN_CAP
+            if order in ("bytes", "packets"):
+                highest = self._conn.execute(
+                    "SELECT MAX(id) AS hi FROM flows").fetchone()["hi"] or 0
+                floor_id = highest - FLOW_SCAN_CAP
+                if floor_id > 0:
+                    rows = self._conn.execute(
+                        f"SELECT * FROM flows WHERE id > ? AND {where}"
+                        f" ORDER BY {column} DESC LIMIT ?",
+                        (floor_id, *params, limit)).fetchall()
+                    # One primary-key probe rather than a count of what was
+                    # left out: ids are handed out in arrival order, so
+                    # whether the row at the bound is still inside the window
+                    # is the same question.
+                    edge = self._conn.execute(
+                        "SELECT ts_end FROM flows WHERE id <= ? ORDER BY id"
+                        " DESC LIMIT 1", (floor_id,)).fetchone()
+                    bounded = bool(edge is not None and edge["ts_end"] >= t0)
+                    if rows or not bounded:
+                        return rows, bounded
             rows = self._conn.execute(
-                f"SELECT * FROM flows WHERE id > ? AND {where}"
+                f"SELECT * FROM flows WHERE {where}"
                 f" ORDER BY {column} DESC LIMIT ?",
-                (floor_id, *params, limit)).fetchall()
-            # One primary-key probe rather than a count of what was left out:
-            # ids are handed out in arrival order, so whether the row at the
-            # bound is still inside the window is the same question.
-            edge = None
-            if floor_id > 0:
-                edge = self._conn.execute(
-                    "SELECT ts_end FROM flows WHERE id <= ? ORDER BY id DESC"
-                    " LIMIT 1", (floor_id,)).fetchone()
-        return rows, bool(edge is not None and edge["ts_end"] >= t0)
+                (*params, limit)).fetchall()
+        return rows, False
 
     def totals(self, t0: float, t1: float, filters: dict) -> dict:
         """Exact on both paths: a rollup's span row is the whole bucket, not

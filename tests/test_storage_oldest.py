@@ -221,6 +221,64 @@ check("...and the stores that keep no history still report None there",
 
 service.shutdown()
 
+
+# ------------------------- 4. the flow store's age costs index probes, not a scan
+
+# /api/state polls this every ten seconds, on the collector's write lock, for
+# every open tab, and the desktop console has a timer of its own. What it
+# costs is therefore part of what it means. Counted in SQLite VM steps rather
+# than wall clock: the query plan is what has to stay right, and a stopwatch
+# is a flaky way of asserting one.
+def vm_steps(db, call):
+    counted = [0]
+
+    def tick():
+        counted[0] += 1
+        return 0
+
+    db._conn.set_progress_handler(tick, 1000)
+    try:
+        return call(), counted[0]
+    finally:
+        db._conn.set_progress_handler(None, 0)
+
+
+cost_db = FlowDatabase(path("flows_cost"))
+BULK = 60_000
+BULK_SPAN = 4 * 3600.0
+with cost_db._lock:
+    cost_db._conn.executemany(
+        "INSERT INTO flows(exporter, version, ts_start, ts_end, bytes, packets,"
+        " sampling) VALUES ('10.0.0.1',9,?,?,100,1,1)",
+        [(NOW - BULK_SPAN + i * (BULK_SPAN / BULK),
+          NOW - BULK_SPAN + i * (BULK_SPAN / BULK) + 1.0) for i in range(BULK)])
+    cost_db._conn.commit()
+for tier in (60, 3600):
+    cost_db.compact_rollup(tier, max_buckets=10_000, budget_s=120)
+    while True:
+        rows_written, walked = cost_db.backfill_rollup(tier, max_buckets=10_000,
+                                                       budget_s=120)
+        if walked or not rows_written:
+            break
+
+value, steps = vm_steps(cost_db, cost_db.oldest_ts)
+raw_oldest = cost_db._conn.execute("SELECT MIN(ts_start) FROM flows").fetchone()[0]
+check("flows.db still reports the oldest of its raw rows and its rollup "
+      "buckets", value is not None and abs(value - raw_oldest) < 3600,
+      (value, raw_oldest))
+check(f"...and finds it in index probes rather than walking {BULK} rows and "
+      f"every rollup bucket beside them ({steps * 1000} VM steps)",
+      steps < 20, steps)
+
+held = cost_db._conn.execute(
+    "EXPLAIN QUERY PLAN " + FlowDatabase.OLDEST_TS_SQL).fetchall()
+check("the plan never touches flow_rollup, whose index leads on tier and so "
+      "cannot serve a MIN over buckets",
+      not any("flow_rollup " in " ".join(str(c) for c in row) + " "
+              for row in held),
+      [tuple(row) for row in held])
+cost_db.close()
+
 shutil.rmtree(TMPDIR, ignore_errors=True)
 
 print()

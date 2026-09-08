@@ -23,8 +23,9 @@ from .worker import ago
 # How far back a sampling rate announced after the fact rewrites the flows it
 # applies to. Unbounded, that UPDATE has no index it can use and grows into a
 # scan of the whole retention window -- run on the writer thread, under the
-# write lock, after every flush. The rollups redo a wider window than this, so
-# a rate that lands late still reaches the buckets already built from it.
+# write lock, after every flush. Whatever this is set to, the rewrite marks
+# every rollup tier dirty from where it reached, so the buckets already built
+# from those rows are rebuilt rather than left disagreeing with them.
 RESAMPLE_MAX_AGE_S = 900
 
 # Rows buffered before a flush goes early rather than waiting out the second.

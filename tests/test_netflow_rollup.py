@@ -207,13 +207,15 @@ def test_4_sampling_in_both_orders() -> None:
     check(db.overview(start, now, "Exporter", NO_FILTERS, 60)
           == raw(db, "overview", start, now, "Exporter", NO_FILTERS, 60),
           "a rate applied before compaction is in the rollup")
-    check(db._private_setting(flowdb._RESAMPLE_FLOOR) is None,
+    check(db._private_setting(flowdb._DIRTY % 60) is None,
           "and a pass that has followed a rewrite clears its marker")
 
     # (b) announced after the buckets were built.
     db.record_sampling_rates([("10.0.0.1", 0, 0, 40)], since_ts=0.0)
-    check(db._private_setting(flowdb._RESAMPLE_FLOOR) == 0.0,
-          "a rewrite that corrected rows records how far back it reached")
+    check(db._private_setting(flowdb._DIRTY % 60) == 0.0
+          and db._private_setting(flowdb._DIRTY % 3600) == 0.0,
+          "a rewrite that corrected rows marks every tier from how far "
+          "back it reached")
     check(db.overview(start, now, "Exporter", NO_FILTERS, 60)
           != raw(db, "overview", start, now, "Exporter", NO_FILTERS, 60),
           "...and until the next pass the rollup does disagree, so the check "
@@ -223,8 +225,10 @@ def test_4_sampling_in_both_orders() -> None:
           == raw(db, "overview", start, now, "Exporter", NO_FILTERS, 60),
           "one compaction later the rollup follows the rewrite back and "
           "agrees again")
-    check(db._private_setting(flowdb._RESAMPLE_FLOOR) is None,
-          "and the marker is cleared once it has been followed")
+    check(db._private_setting(flowdb._DIRTY % 60) is None
+          and db._private_setting(flowdb._DIRTY % 3600) == 0.0,
+          "the minute tier clears its own marker once it has followed "
+          "it, and leaves the hourly tier's alone")
 
     # (c) the rewrite itself is bounded, which is what makes (b) sound.
     db.insert_flows([flow(0, now - 3 * RESAMPLE_MAX_AGE_S, exporter="10.0.0.9",
@@ -365,6 +369,209 @@ def test_8_a_window_below_the_floor_falls_back() -> None:
     db.close()
 
 
+# ------------------------------------------------------------------------- 9
+
+def slow_buckets(seconds: float):
+    """Make one bucket cost real time, the way 60k flows/minute across eleven
+    dimensions does. A budget is wall clock, so nothing else reproduces a
+    pass that runs out of it. Returns the undo."""
+    real = FlowDatabase._compact_bucket
+
+    def slower(self, tier, bucket):
+        time.sleep(seconds)
+        return real(self, tier, bucket)
+
+    FlowDatabase._compact_bucket = slower
+    return lambda: setattr(FlowDatabase, "_compact_bucket", real)
+
+
+def test_9_the_watermark_advances_under_a_tight_budget() -> None:
+    print("9: a pass with no budget for the redo window still builds forward")
+    db = store("progress.db")
+    now = time.time()
+    start = flowdb._align_down(now - 3600, 60)
+    db.insert_flows([flow(i, start + i * 2.0) for i in range(1800)])
+    db.compact_rollup(60, max_buckets=10_000, budget_s=120)
+
+    # A store whose collector has outrun compaction: sealed buckets nobody
+    # has built yet, and a redo window far wider than one pass can afford.
+    sealed = flowdb._align_down(time.time() - flowdb._ROLLUP_LAG_S, 60)
+    db._set_private_setting(flowdb._FLOOR % 60, sealed - 40 * 60)
+    db._set_private_setting(flowdb._WATERMARK % 60, sealed - 10 * 60)
+    db._mark_dirty(float(sealed - 40 * 60), [60])
+
+    undo = slow_buckets(0.02)
+    try:
+        marks = []
+        for _ in range(8):
+            db.compact_rollup(60, budget_s=0.05)
+            marks.append(db.rollup_bounds(60)[1])
+    finally:
+        undo()
+    check(marks[0] > sealed - 10 * 60,
+          f"the very first pass moves the watermark forward "
+          f"({marks[0] - (sealed - 10 * 60)} s of it)")
+    check(marks == sorted(marks) and marks[-1] >= sealed,
+          f"and eight of them reach the newest sealed bucket rather than "
+          f"redoing the same window for ever ({marks[-1] - sealed} s past it)")
+    check(db._private_setting(flowdb._DIRTY % 60) is not None,
+          "what the budget never reached is still marked dirty, so the redo "
+          "resumes there instead of being lost")
+    db.close()
+
+
+# ------------------------------------------------------------------------ 10
+
+def test_10_a_late_exporter_still_reaches_the_rollups() -> None:
+    print("10: a flow landing far behind the watermark is summarised too")
+    db = store("late.db")
+    now = time.time()
+    start = flowdb._align_down(now - 7200, 3600)
+    db.insert_flows([flow(i, start + i * 4.0) for i in range(1500)])
+    cover(db)
+
+    # Forty minutes behind the watermark: ts_end comes from the exporter's
+    # clock (nfdecode accepts anything within 30 days of now), so a device
+    # with an active timeout or a skewed clock lands here routinely. Such a
+    # flow used to exist in raw alone -- on the 15-minute view, gone from
+    # the 1-hour one.
+    _floor, watermark = db.rollup_bounds(60)
+    late = float(watermark - 40 * 60)
+    db.insert_flows([flow(9000, late, src_ip="10.9.9.9", bytes=999_000,
+                          sampling=1)])
+    check(db.overview(start, now, "Source", NO_FILTERS, 60)
+          != raw(db, "overview", start, now, "Source", NO_FILTERS, 60),
+          "before the next pass the rollup is behind the raw rows, so the "
+          "check below is not passing by accident")
+
+    for tier in flowdb.ROLLUP_TIERS:
+        db.compact_rollup(tier, max_buckets=10_000, budget_s=120)
+    for bucket in (60, 3600):
+        got = db.overview(start, now, "Source", NO_FILTERS, bucket)
+        want = raw(db, "overview", start, now, "Source", NO_FILTERS, bucket)
+        check(got == want,
+              f"one compaction later the {bucket}s view agrees with raw again "
+              f"({got[4]} vs {want[4]})")
+        check(any(row["key"] == "10.9.9.9" for row in got[3]),
+              f"...and the late flow is one of the {bucket}s view's own rows")
+    db.close()
+
+
+# ------------------------------------------------------------------------ 11
+
+def test_11_the_residual_never_stacks_downwards() -> None:
+    print("11: a bucket read mid-rebuild does not draw a negative 'other'")
+    db = store("residual.db")
+    now = time.time()
+    start = flowdb._align_down(now - 3600, 60)
+    db.insert_flows([flow(i, start + i * 3.0) for i in range(600)])
+    cover(db, hours=False)
+
+    # A dimension's rows and its bucket's span row are written in separate
+    # transactions, so a dimension rebuilt after late flows arrived can be
+    # read against a span built before them. Reproduced here by shrinking
+    # the spans: the stored keys then outweigh the total they are measured
+    # against, which is what the residual is computed from.
+    with db._lock:
+        db._conn.execute(
+            "UPDATE flow_rollup_span SET bytes = bytes / 3 WHERE tier = 60")
+        db._conn.commit()
+
+    _times, series, _b, _top, _totals = db.overview(
+        start, now, "Source", NO_FILTERS, 60)
+    negative = [(key, value) for key, values in series.items()
+                for value in values if value < 0]
+    check(not negative,
+          f"no series the chart stacks is negative ({negative[:3]})")
+    db.close()
+
+
+# ------------------------------------------------------------------------ 12
+
+def test_12_a_rewrite_reaches_both_tiers() -> None:
+    print("12: a sampling rewrite is not consumed by whichever tier is first")
+    db = store("resample_tiers.db")
+    now = time.time()
+    start = flowdb._align_down(now - 4 * 3600, 3600)
+    db.insert_flows([flow(i, start + i * 8.0, sampling=1) for i in range(1500)])
+    cover(db)
+    # A store that has been running a while rather than one still seeding:
+    # both tiers have consumed everything the initial load marked, so the
+    # rewrite below is the only dirt there is.
+    for tier in flowdb.ROLLUP_TIERS:
+        db.compact_rollup(tier, max_buckets=10_000, budget_s=120)
+
+    db.record_sampling_rates([("10.0.0.1", 0, 0, 40)], since_ts=0.0)
+    # The order the service compacts in: the minute tier, then the hourly one
+    # built from it. One shared marker meant the minute pass cleared it and
+    # the hourly tier never learned the rows had changed.
+    for tier in flowdb.ROLLUP_TIERS:
+        db.compact_rollup(tier, max_buckets=10_000, budget_s=120)
+    for bucket in (60, 3600):
+        got = db.overview(start, now, "Exporter", NO_FILTERS, bucket)
+        want = raw(db, "overview", start, now, "Exporter", NO_FILTERS, bucket)
+        check(got == want,
+              f"the {bucket}s view follows the rewrite back and agrees with "
+              f"raw ({got[4]} vs {want[4]})")
+
+    # And a pass that runs out of budget leaves the mark for the next one,
+    # rather than clearing it on the way past.
+    db.record_sampling_rates([("10.0.0.2", 0, 0, 25)], since_ts=0.0)
+    undo = slow_buckets(0.02)
+    try:
+        db.compact_rollup(60, budget_s=0.03)
+    finally:
+        undo()
+    check(db._private_setting(flowdb._DIRTY % 60) is not None,
+          "a pass too short to finish the rewrite keeps the mark")
+    db.compact_rollup(60, max_buckets=10_000, budget_s=120)
+    check(db.overview(start, now, "Exporter", NO_FILTERS, 60)
+          == raw(db, "overview", start, now, "Exporter", NO_FILTERS, 60),
+          "...and the pass after it finishes the job")
+    db.close()
+
+
+# ------------------------------------------------------------------------ 13
+
+def test_13_one_slot_takes_the_coarsest_tier() -> None:
+    print("13: top() and totals() take the coarsest tier that reaches them")
+    db = store("single_slot.db")
+    end = flowdb._align_down(time.time() - 300, 3600)
+    start = end - 4 * 3600
+    db.insert_flows([flow(i, start + i * 8.0) for i in range(1500)])
+    cover(db)
+
+    plan = db._rollup_plan(start, end, "Source", NO_FILTERS, None)
+    check(plan is not None and plan[0] == 3600,
+          f"with one slot to fill and both tiers reaching the window, the "
+          f"hourly tier answers — sixty times fewer rows for the same number "
+          f"({plan})")
+
+    # The rule that makes that safe: a tier whose buckets do not start on t0
+    # would leave the first partial bucket out of both arms, so a window
+    # starting inside an hour drops to the tier that does divide it.
+    plan = db._rollup_plan(float(start + 600), end, "Source", NO_FILTERS, None)
+    check(plan is not None and plan[0] == 60,
+          f"a window starting inside an hour falls to the minute tier, not "
+          f"to the hourly one it does not line up with ({plan})")
+
+    # What rollup_minute_days does to a window older than a couple of days:
+    # the minute tier no longer reaches it, the hourly tier still does. That
+    # used to fall all the way to raw.
+    db._set_private_setting(flowdb._FLOOR % 60, int(end))
+    plan = db._rollup_plan(start, end, "Source", NO_FILTERS, None)
+    check(plan is not None and plan[0] == 3600,
+          f"and with only the hourly floor left below the window it still "
+          f"answers, rather than scanning every flow in it ({plan})")
+    check(db.totals(start, end, NO_FILTERS)
+          == raw(db, "totals", start, end, NO_FILTERS),
+          "totals() over that window is exact")
+    check(db.top(start, end, "Source", NO_FILTERS, 10)
+          == raw(db, "top", start, end, "Source", NO_FILTERS, 10),
+          "and so is top()")
+    db.close()
+
+
 TESTS = [
     test_1_rollup_and_raw_agree,
     test_2_totals_survive_truncation,
@@ -374,6 +581,11 @@ TESTS = [
     test_6_off_grid_buckets_stay_on_raw,
     test_7_compaction_is_idempotent,
     test_8_a_window_below_the_floor_falls_back,
+    test_9_the_watermark_advances_under_a_tight_budget,
+    test_10_a_late_exporter_still_reaches_the_rollups,
+    test_11_the_residual_never_stacks_downwards,
+    test_12_a_rewrite_reaches_both_tiers,
+    test_13_one_slot_takes_the_coarsest_tier,
 ]
 
 
