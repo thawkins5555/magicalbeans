@@ -207,13 +207,15 @@ def test_4_sampling_in_both_orders() -> None:
     check(db.overview(start, now, "Exporter", NO_FILTERS, 60)
           == raw(db, "overview", start, now, "Exporter", NO_FILTERS, 60),
           "a rate applied before compaction is in the rollup")
-    check(db._private_setting(flowdb._RESAMPLE_FLOOR) is None,
+    check(db._private_setting(flowdb._DIRTY % 60) is None,
           "and a pass that has followed a rewrite clears its marker")
 
     # (b) announced after the buckets were built.
     db.record_sampling_rates([("10.0.0.1", 0, 0, 40)], since_ts=0.0)
-    check(db._private_setting(flowdb._RESAMPLE_FLOOR) == 0.0,
-          "a rewrite that corrected rows records how far back it reached")
+    check(db._private_setting(flowdb._DIRTY % 60) == 0.0
+          and db._private_setting(flowdb._DIRTY % 3600) == 0.0,
+          "a rewrite that corrected rows marks every tier from how far "
+          "back it reached")
     check(db.overview(start, now, "Exporter", NO_FILTERS, 60)
           != raw(db, "overview", start, now, "Exporter", NO_FILTERS, 60),
           "...and until the next pass the rollup does disagree, so the check "
@@ -223,8 +225,10 @@ def test_4_sampling_in_both_orders() -> None:
           == raw(db, "overview", start, now, "Exporter", NO_FILTERS, 60),
           "one compaction later the rollup follows the rewrite back and "
           "agrees again")
-    check(db._private_setting(flowdb._RESAMPLE_FLOOR) is None,
-          "and the marker is cleared once it has been followed")
+    check(db._private_setting(flowdb._DIRTY % 60) is None
+          and db._private_setting(flowdb._DIRTY % 3600) == 0.0,
+          "the minute tier clears its own marker once it has followed "
+          "it, and leaves the hourly tier's alone")
 
     # (c) the rewrite itself is bounded, which is what makes (b) sound.
     db.insert_flows([flow(0, now - 3 * RESAMPLE_MAX_AGE_S, exporter="10.0.0.9",
@@ -482,6 +486,51 @@ def test_11_the_residual_never_stacks_downwards() -> None:
     db.close()
 
 
+# ------------------------------------------------------------------------ 12
+
+def test_12_a_rewrite_reaches_both_tiers() -> None:
+    print("12: a sampling rewrite is not consumed by whichever tier is first")
+    db = store("resample_tiers.db")
+    now = time.time()
+    start = flowdb._align_down(now - 4 * 3600, 3600)
+    db.insert_flows([flow(i, start + i * 8.0, sampling=1) for i in range(1500)])
+    cover(db)
+    # A store that has been running a while rather than one still seeding:
+    # both tiers have consumed everything the initial load marked, so the
+    # rewrite below is the only dirt there is.
+    for tier in flowdb.ROLLUP_TIERS:
+        db.compact_rollup(tier, max_buckets=10_000, budget_s=120)
+
+    db.record_sampling_rates([("10.0.0.1", 0, 0, 40)], since_ts=0.0)
+    # The order the service compacts in: the minute tier, then the hourly one
+    # built from it. One shared marker meant the minute pass cleared it and
+    # the hourly tier never learned the rows had changed.
+    for tier in flowdb.ROLLUP_TIERS:
+        db.compact_rollup(tier, max_buckets=10_000, budget_s=120)
+    for bucket in (60, 3600):
+        got = db.overview(start, now, "Exporter", NO_FILTERS, bucket)
+        want = raw(db, "overview", start, now, "Exporter", NO_FILTERS, bucket)
+        check(got == want,
+              f"the {bucket}s view follows the rewrite back and agrees with "
+              f"raw ({got[4]} vs {want[4]})")
+
+    # And a pass that runs out of budget leaves the mark for the next one,
+    # rather than clearing it on the way past.
+    db.record_sampling_rates([("10.0.0.2", 0, 0, 25)], since_ts=0.0)
+    undo = slow_buckets(0.02)
+    try:
+        db.compact_rollup(60, budget_s=0.03)
+    finally:
+        undo()
+    check(db._private_setting(flowdb._DIRTY % 60) is not None,
+          "a pass too short to finish the rewrite keeps the mark")
+    db.compact_rollup(60, max_buckets=10_000, budget_s=120)
+    check(db.overview(start, now, "Exporter", NO_FILTERS, 60)
+          == raw(db, "overview", start, now, "Exporter", NO_FILTERS, 60),
+          "...and the pass after it finishes the job")
+    db.close()
+
+
 TESTS = [
     test_1_rollup_and_raw_agree,
     test_2_totals_survive_truncation,
@@ -494,6 +543,7 @@ TESTS = [
     test_9_the_watermark_advances_under_a_tight_budget,
     test_10_a_late_exporter_still_reaches_the_rollups,
     test_11_the_residual_never_stacks_downwards,
+    test_12_a_rewrite_reaches_both_tiers,
 ]
 
 

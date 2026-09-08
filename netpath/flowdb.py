@@ -233,10 +233,10 @@ FLOW_SCAN_CAP = 2_000_000
 _WATERMARK = "flow_rollup_watermark_%d"     # forward edge: built below this
 _FLOOR = "flow_rollup_floor_%d"             # backward edge backfill has reached
 # The oldest ts_end a writer has touched since this tier last compacted: what
-# the next pass has to rebuild behind its watermark, and nothing more.
+# the next pass has to rebuild behind its watermark, and nothing more. Per
+# tier, because each consumes it at its own pace — one shared mark was
+# cleared by whichever tier compacted first, and the other never saw it.
 _DIRTY = "flow_rollup_dirty_ts_%d"
-# The oldest ts_end a sampling rewrite has touched since the last compaction.
-_RESAMPLE_FLOOR = "flow_resample_floor_ts"
 
 
 def _align_down(ts: float, width: float) -> int:
@@ -367,12 +367,11 @@ class FlowDatabase(SqliteStore):
             self._conn.commit()
         if corrected:
             # Rows a sealed rollup bucket was built from have just changed
-            # value. Recording how far back lets compact_rollup follow the
-            # rewrite rather than quietly disagreeing with the raw rows,
-            # whatever the caller's bound turns out to be.
-            floor = self._private_setting(_RESAMPLE_FLOOR)
-            if floor is None or since_ts < float(floor):
-                self._set_private_setting(_RESAMPLE_FLOOR, since_ts)
+            # value, which is the same kind of dirt a late flush leaves:
+            # each tier rebuilds from here, and each clears its own mark once
+            # it has, so whichever compacts first cannot consume it for the
+            # other. Whatever the caller's bound turns out to be.
+            self._mark_dirty(since_ts)
         return corrected
 
     def samplers(self) -> list[sqlite3.Row]:
@@ -561,15 +560,10 @@ class FlowDatabase(SqliteStore):
         """
         with self._lock:
             dirty = self._private_setting(_DIRTY % tier)
-            # A rewritten sampling factor changes rows a sealed bucket has
-            # already been built from, and so is the same kind of dirt.
-            resampled = self._private_setting(_RESAMPLE_FLOOR)
             self._set_private_setting(_DIRTY % tier, None)
-            self._set_private_setting(_RESAMPLE_FLOOR, None)
-        marks = [float(mark) for mark in (dirty, resampled) if mark is not None]
-        if not marks:
+        if dirty is None:
             return 0
-        bucket = _align_down(min(marks), tier)
+        bucket = _align_down(float(dirty), tier)
         if floor is not None:
             bucket = max(bucket, floor)
         written = 0

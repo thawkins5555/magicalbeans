@@ -4440,9 +4440,11 @@ commit instead of hundreds and `queue.Full` is reached far later.
 the last fifteen minutes — unbounded it had no index it could use and
 grew into a scan of the whole retention window, on the writer thread,
 under the write lock, after every flush. When a rewrite does correct rows
-it records how far back it reached, and the next compaction follows it
-back, so widening that bound later cannot make the rollups quietly
-disagree with the rows they were built from.
+it marks every tier dirty from how far back it reached, exactly as a
+flush does, so widening that bound later cannot make the rollups quietly
+disagree with the rows they were built from. Per tier and not one shared
+marker: the minute tier compacts first, and a single marker was cleared
+by that pass before the hourly tier had ever seen it.
 
 `ix_flows_exporter` was dropped: every insert paid for a random-position
 B-tree insert (`exporter` is not monotone, unlike `ts_end`) to serve one
