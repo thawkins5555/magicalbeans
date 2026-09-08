@@ -244,6 +244,25 @@
     return 'No alerts match these filters. Widen the time window or clear a filter.';
   }
 
+  /* Severity 1 and 2 highlighted on the list, and flashing until somebody
+     picks them up.
+
+     Severity is the syslog scale and counts DOWN — 0 is emergency, worse
+     than 1 — so this is `<= HIGHLIGHT_SEVERITY`, not `=== 1 || === 2`,
+     which would drop the worst alerts the product can raise. The floor is
+     app.js's own NOTIFY_SEVERITY, mirrored rather than imported because it
+     is a module-local const there: the desktop notification and this
+     highlight both mean "1 and 2 only", and they must not drift apart. */
+  const HIGHLIGHT_SEVERITY = 2;
+
+  function severityClasses(row) {
+    if (Number(row.severity) > HIGHLIGHT_SEVERITY) return '';
+    // Motion says "nobody has picked this up yet". An acknowledged (or
+    // resolved) alert keeps the highlight and stops moving, so a wall
+    // display is not flashing about work already in hand.
+    return ' alert-severe' + (row.state === 'open' ? ' alert-severe-unacked' : '');
+  }
+
   function drawTable() {
     const columns = alertColumns();
     const checked = view.checked;
@@ -271,7 +290,8 @@
     App.drawRows(body, rows, columns, (tr, row) => {
       tr.className = 'clickable'
         + (view.selected === row.id ? ' selected' : '')
-        + (view.checked.has(row.id) ? ' bulk-checked' : '');
+        + (view.checked.has(row.id) ? ' bulk-checked' : '')
+        + severityClasses(row);
       // The checkbox owns selection; the rest of the row owns the detail
       // pane. stopPropagation keeps ticking a box from also moving the
       // highlight, which would make one click mean two different things.

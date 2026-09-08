@@ -1180,6 +1180,17 @@ alerts and optionally emailing about them.
 
 ### Working the alert list
 
+- **Severity 1 and 2 rows are highlighted, and flash until somebody picks
+  them up.** Severity is the syslog scale and counts down, so this covers
+  severity 0 (emergency) as well — anything at or below 2, the same floor
+  the desktop notification uses. The row carries the colour rather than
+  just its Sev cell, so it is findable across a room on a wall display.
+  The flashing is a slow breathe, about one cycle every three seconds, far
+  under the three-per-second guideline for photosensitive seizures; it
+  stops the moment the alert is **acknowledged**, which leaves the
+  highlight in place but still. Motion therefore means "nobody has picked
+  this up yet" rather than constant noise. A viewer whose system asks for
+  reduced motion gets the highlight without the movement.
 - **Alerts can be acknowledged or resolved individually or in bulk.**
   Every row carries a **checkbox** in its first column: tick the rows you
   want, or use **Select all**. A plain click still opens the detail pane,

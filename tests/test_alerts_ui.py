@@ -10,6 +10,16 @@ node against a DOM stub: the dialog is rendered, its boxes are typed into,
 Save is pressed, and what would have reached PUT /api/alerts/rules/<id> is
 asserted. Node is the one thing a machine here may not have; those checks
 say so and are skipped, the way the SSH suites treat paramiko.
+
+The severity highlight on the alert list gets the same treatment for the
+same reason: which rows are marked, and which of them move, is a decision
+made in code and worth running. The CSS around it cannot be run, so what
+is asserted there is the small number of things that make the rule work at
+all -- that it lands on the `td` where this app's row backgrounds live,
+that it outranks the selected and bulk-checked tints it would otherwise
+lose to the moment somebody clicked the row, that the colour comes from
+--fail rather than a hex, and that the motion (and only the motion) is
+inside prefers-reduced-motion: no-preference.
 """
 import json
 import os
@@ -41,6 +51,7 @@ def read(name):
 
 ALERTS = read("alerts.js")
 APP = read("app.js")
+CSS = read("app.css")
 
 NODE = shutil.which("node") or shutil.which("nodejs")
 
@@ -235,6 +246,166 @@ check("App.form.readers names the field it could not find rather than "
 check("...and it throws rather than answering with a sentinel: a false or a "
       "NaN posted for a field nobody rendered is saved silently",
       "throw new Error(`This dialog has no field" in APP)
+
+
+# ===========================================================================
+# 2. The severity highlight on the alert list (ITEM 2).
+# ===========================================================================
+
+ROWCLASS = ALERTS[ALERTS.index("  const HIGHLIGHT_SEVERITY = 2;"):
+                  ALERTS.index("  function drawTable() {")]
+
+ROW_HARNESS = """
+'use strict';
+%s
+const out = {};
+for (const severity of [0, 1, 2, 3, 4, 7]) {
+  for (const state of ['open', 'acked', 'resolved']) {
+    out[`${severity}/${state}`] = severityClasses({ severity, state }).trim();
+  }
+}
+console.log(JSON.stringify(out));
+"""
+
+if NODE is None:
+    print("SKIP  node is not on this machine, so the row classes were not run")
+else:
+    classes = run_js(ROW_HARNESS % ROWCLASS)
+    check("severity 0, 1 and 2 are all highlighted -- the syslog scale counts "
+          "down, so 0 (emergency) is worse than 1 and must not be dropped by "
+          "a test written as 1-or-2",
+          all("alert-severe" in classes["%d/open" % sev] for sev in (0, 1, 2)),
+          {k: v for k, v in classes.items() if k.endswith("/open")})
+    check("...and severity 3 and worse-than-nothing are not, so the highlight "
+          "still means something on a busy list",
+          all(classes["%d/open" % sev] == "" for sev in (3, 4, 7)),
+          {k: v for k, v in classes.items() if k.endswith("/open")})
+    check("an OPEN severity 1 alert also carries the animated class: nobody "
+          "has picked it up yet",
+          classes["1/open"].split() == ["alert-severe", "alert-severe-unacked"],
+          classes["1/open"])
+    check("...and an ACKNOWLEDGED one keeps the highlight and stops moving, "
+          "which is the whole point of the motion",
+          classes["1/acked"].split() == ["alert-severe"],
+          classes["1/acked"])
+    check("...as does a resolved one",
+          classes["2/resolved"].split() == ["alert-severe"],
+          classes["2/resolved"])
+
+check("the floor is the same 2 app.js's desktop notification uses, so the "
+      "wall display and the popup cannot come to mean different things",
+      "const HIGHLIGHT_SEVERITY = 2;" in ALERTS
+      and "const NOTIFY_SEVERITY = 2;" in APP
+      and "NOTIFY_SEVERITY" in ALERTS)
+check("the class is appended to the className drawRows already reassigns, "
+      "not added with classList -- onRow runs again on a reused <tr> and has "
+      "to be idempotent",
+      "+ severityClasses(row);" in ALERTS
+      and "classList.add('alert-severe" not in ALERTS)
+
+
+# ------------------------------------------------------- 2b. the stylesheet
+
+def strip_at_rules(css, prefix):
+    """`css` with every top-level `prefix...{ ... }` block removed."""
+    out, i = [], 0
+    while True:
+        start = css.find(prefix, i)
+        if start == -1:
+            out.append(css[i:])
+            return "".join(out)
+        out.append(css[i:start])
+        depth, j = 0, css.index("{", start)
+        while True:
+            if css[j] == "{":
+                depth += 1
+            elif css[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        i = j + 1
+
+
+NO_MEDIA = strip_at_rules(CSS, "@media")
+
+check("the highlight is set on the td -- row backgrounds in this app are "
+      "td backgrounds (tr.selected td, tr.bulk-checked td), and a rule on "
+      "the tr would simply not show",
+      re.search(r"tr\.alert-severe td \{[^}]*background:", CSS) is not None)
+check("...from --fail, never a literal: the tone is redefined in all six "
+      "theme blocks in tokens.css",
+      "var(--fail)" in CSS[CSS.index("tr.alert-severe td {"):
+                           CSS.index("@keyframes alert-severe-pulse")]
+      and not re.search(r"#[0-9A-Fa-f]{6}",
+                        CSS[CSS.index("tr.alert-severe td {"):
+                            CSS.index("@media (prefers-reduced-motion: no-preference) {\n  table.grid tr.alert-severe-unacked")]))
+
+
+def specificity(selector):
+    """(ids, classes, types) for one simple compound selector chain."""
+    ids = len(re.findall(r"#[\w-]+", selector))
+    classes = len(re.findall(r"\.[\w-]+", selector))
+    types = len(re.findall(r"(?:^|[\s>+~])([a-z]+)(?![\w-]*[({])", selector))
+    return (ids, classes, types)
+
+
+HIGHLIGHT_SELECTOR = "table.grid tr.alert-severe td"
+check("...and it outranks both tints it has to sit above, or an operator "
+      "loses the highlight the moment they click the row or tick its box",
+      specificity(HIGHLIGHT_SELECTOR) > specificity("tr.selected td")
+      and specificity(HIGHLIGHT_SELECTOR) > specificity("tr.bulk-checked.selected td"),
+      (specificity(HIGHLIGHT_SELECTOR), specificity("tr.bulk-checked.selected td")))
+check("...and it is not !important: the td transition above is allowed to "
+      "smear the entry and exit, which is a smaller price than a rule "
+      "nothing downstream can override",
+      "!important" not in CSS[CSS.index("tr.alert-severe td {"):
+                              CSS.index("@keyframes alert-severe-pulse")])
+
+check("the static highlight sits OUTSIDE every media query, so a viewer who "
+      "asked for reduced motion still gets it",
+      "tr.alert-severe td {" in NO_MEDIA)
+check("...and the animation sits INSIDE prefers-reduced-motion: "
+      "no-preference, the same opt-in shape the transitions block uses",
+      "alert-severe-unacked" not in NO_MEDIA
+      and re.search(r"@media \(prefers-reduced-motion: no-preference\) \{[^@]*"
+                    r"tr\.alert-severe-unacked td \{\s*animation:", CSS, re.S) is not None)
+check("only the unacknowledged rows are animated",
+      re.search(r"animation: alert-severe-pulse", CSS) is not None
+      and CSS.count("animation:") == 1)
+
+PULSE = re.search(r"animation: alert-severe-pulse ([\d.]+)s", CSS)
+check("the pulse is a slow breathe, not a strobe: well under the three "
+      "flashes per second the photosensitive-seizure guideline draws the "
+      "line at",
+      PULSE is not None and float(PULSE.group(1)) >= 0.7,
+      PULSE.group(1) if PULSE else "no duration")
+check("...and it alternates rather than snapping back, so there is no step "
+      "change in brightness at the end of each cycle",
+      "infinite alternate" in CSS)
+KEYFRAMES = CSS[CSS.index("@keyframes alert-severe-pulse {"):
+                CSS.index("@media (prefers-reduced-motion: no-preference) {\n"
+                          "  table.grid tr.alert-severe-unacked")]
+check("the keyframes move nothing but background-color -- the codebase's "
+      "first, and no animation here may cost a layout",
+      set(re.findall(r"([a-z-]+):", KEYFRAMES)) == {"background-color"},
+      set(re.findall(r"([a-z-]+):", KEYFRAMES)))
+
+
+# --------------------------------------------------------------- 2c. docs
+with open(os.path.join(_paths.REPO_ROOT, "FEATURES.md"), encoding="utf-8") as _f:
+    FEATURES = _f.read()
+ALERT_LIST = FEATURES[FEATURES.index("### Working the alert list"):
+                      FEATURES.index("### Rules")]
+check("FEATURES.md's alert list section says the highlight exists, and that "
+      "the flashing stops on acknowledge -- an operator who was told it "
+      "flashes for ever would read the stillness as a broken page",
+      "highlighted" in ALERT_LIST and "acknowledged" in ALERT_LIST
+      and "flash" in ALERT_LIST)
+check("...and that it reaches severity 0 too, since the scale counts down",
+      "severity 0" in ALERT_LIST)
+check("...and that reduced motion is honoured",
+      "reduced motion" in ALERT_LIST)
 
 
 print()
