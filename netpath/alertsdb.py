@@ -1404,9 +1404,13 @@ class AlertsDatabase(SqliteStore):
         Both keys, every open row, acked ones too — an operator who ticked
         one off can no more clear it than one who did not. Resolved with a
         note rather than deleted, like _resolve_device_if_alerts, and
-        resolved_by='' so none of it reads as a hand resolve. A port that
-        DOES publish a limit and is still under it simply re-opens on the
-        next tick.
+        resolved_by='' so none of it reads as a hand resolve.
+
+        Unconditional, because this database cannot see which ports publish
+        anything — that table lives in nodes.db. A port that DOES publish a
+        limit and is still under it re-opens on the next tick as a fresh
+        alert, which is why the note it leaves behind says that rather than
+        asserting the port publishes nothing.
         """
         now = time.time()
         with self._lock:
@@ -1421,8 +1425,9 @@ class AlertsDatabase(SqliteStore):
                     " resolved_by='' WHERE id=?", (now, row["id"]))
                 self._note(row["id"],
                           "Resolved on upgrade: optic power now alerts on the "
-                          "levels the port's own transceiver publishes, and "
-                          "this port publishes none")
+                          "levels the port's own transceiver publishes. A port "
+                          "that publishes none can never clear this alert; one "
+                          "that does re-opens on the next tick")
             self._conn.commit()
 
     def _rekey_trap_syslog_alerts(self) -> None:

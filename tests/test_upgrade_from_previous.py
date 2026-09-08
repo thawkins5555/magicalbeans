@@ -574,8 +574,12 @@ check("...the ACKED one too -- an operator who ticked it off is no more "
       "able to clear it than one who did not",
       tx_alert is not None and tx_alert["state"] == "resolved",
       dict(tx_alert) if tx_alert else None)
-check("...each carrying a note saying why, rather than vanishing",
-      rx_alert is not None and "publishes none" in (rx_alert["rollup_note"] or ""),
+check("...each carrying a note saying why, rather than vanishing -- and one "
+      "that is true of every row it lands on, since this database cannot "
+      "see which ports publish anything and a port that does re-opens",
+      rx_alert is not None
+      and "re-opens on the next tick" in (rx_alert["rollup_note"] or "")
+      and "publishes" in (rx_alert["rollup_note"] or ""),
       rx_alert["rollup_note"] if rx_alert else None)
 cpu_alert = alert_row(optic_db, "cpu_high:device:9")
 check("an open alert of an unrelated rule is left alone",

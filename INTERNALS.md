@@ -3532,7 +3532,10 @@ conclude the feature is broken. `sfp_temp_high` is not touched: only
 optical power moved. `resolve_unpublished_optic_power_alerts_1` is the
 third and last: it resolves every open **and acked** alert of
 `sfp_rx_power_low`/`sfp_tx_power_low`, with a note saying the rule now
-reads the optic's own limits and this port publishes none. Without it a 5.2
+reads the optic's own limits. It is unconditional because alerts.db cannot
+see which ports publish anything — that table is in nodes.db — so the note
+says a port that *does* publish re-opens on the next tick rather than
+asserting the port publishes nothing. Without it a 5.2
 install carrying such an alert on any non-Cisco DOM switch — the standard
 ENTITY-SENSOR-MIB publishes no thresholds at all, so Juniper, Arista and HP
 are all one — would keep it open for ever. It reads only the alerts table,
