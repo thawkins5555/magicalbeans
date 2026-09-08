@@ -3716,12 +3716,13 @@ class NodePoller(Worker):
         return parents
 
     def _sfp_slot_media(self, device, config: dict, port_map: dict[int, int],
-                        contained_in: dict[int, int], descrs: dict) -> dict[int, str]:
-        """{ifIndex: 'sfp' | 'sfp_empty'} for the transceiver cages this
-        device describes. The DOM scan cannot see these: a cage with nothing
-        in it, or holding a transceiver that reports no sensors, has no
-        sensor row to be found by, and until 5.2.0 an SFP slot like that was
-        indistinguishable from a copper port.
+                        contained_in: dict[int, int], descrs: dict) -> tuple:
+        """({ifIndex: 'sfp' | 'sfp_empty'}, whether every walk it made
+        finished) for the transceiver cages this device describes. The DOM
+        scan cannot see these: a cage with nothing in it, or holding a
+        transceiver that reports no sensors, has no sensor row to be found
+        by, and until 5.2.0 an SFP slot like that was indistinguishable from
+        a copper port.
 
         'sfp' is an entity whose own entPhysical text names a transceiver
         (the module plugged into a cage, or a port an agent puts that text
@@ -3730,15 +3731,24 @@ class NodePoller(Worker):
         nothing is left alone rather than guessed at: some platforms give
         every copper port one too, and a copper port must never wear an SFP
         badge.
+
+        The completeness flag is the caller's to act on, and it must: a walk
+        cut short answers with what it had reached, which reads as a cage
+        that is not there or a module that is not in one. See
+        _poll_environment, which will not overwrite a stored badge on one.
         """
-        classes = _int_keyed(self._walk_column(
-            device, config, self._ENT_PHYSICAL_CLASS))
+        raw_classes, complete = self._walk_column_status(
+            device, config, self._ENT_PHYSICAL_CLASS)
+        classes = _int_keyed(raw_classes)
         if not classes:
-            return {}
-        models = _int_keyed(self._walk_column(
-            device, config, self._ENT_PHYSICAL_MODEL_NAME))
-        vendor_types = _int_keyed(self._walk_column(
-            device, config, self._ENT_PHYSICAL_VENDOR_TYPE))
+            return {}, complete
+        models, models_done = self._walk_column_status(
+            device, config, self._ENT_PHYSICAL_MODEL_NAME)
+        vendor_types, vendors_done = self._walk_column_status(
+            device, config, self._ENT_PHYSICAL_VENDOR_TYPE)
+        complete = complete and models_done and vendors_done
+        models = _int_keyed(models)
+        vendor_types = _int_keyed(vendor_types)
         by_descr = _int_keyed(descrs)
         children: dict[int, list[int]] = {}
         for entity, parent in contained_in.items():
@@ -3781,7 +3791,7 @@ class NodePoller(Worker):
                 media[if_index] = "sfp"
             else:
                 media.setdefault(if_index, "sfp_empty")
-        return media
+        return media, complete
 
     @staticmethod
     def _if_index_for_name(name, if_by_name: dict) -> int | None:
@@ -4128,7 +4138,8 @@ class NodePoller(Worker):
         precisions = cols["precisions"]
         statuses = cols["statuses"]
         units = cols["units"]
-        descrs = self._walk_column(device, config, self._ENT_PHYSICAL_DESCR)
+        descrs, descrs_done = self._walk_column_status(
+            device, config, self._ENT_PHYSICAL_DESCR)
         interfaces = list(self.db.interfaces(device_id))
         # The name fallback exists for Cisco gear with no alias rows; nothing
         # else should pay a whole entPhysicalName walk every cadence for it.
@@ -4142,9 +4153,10 @@ class NodePoller(Worker):
         # Nothing mapped to a port means a walk that answered nothing useful;
         # the three ENTITY-MIB columns the cage scan needs would be three
         # more dead walks.
-        sfp_slots = (self._sfp_slot_media(device, config, port_map,
-                                          contained_in, descrs)
-                     if port_map else {})
+        sfp_slots, slots_complete = (
+            self._sfp_slot_media(device, config, port_map, contained_in, descrs)
+            if port_map else ({}, True))
+        slots_complete = slots_complete and descrs_done
 
         has_humidity = any(int(types.get(suffix) or 0) == self._SENSOR_TYPE_HUMIDITY
                            for suffix in sensor_values)
@@ -4250,12 +4262,23 @@ class NodePoller(Worker):
                             unit, "gauge", now, worst))
         if samples:
             self.db.record_metric_samples(device_id, samples)
-        # Only reached on a walk that answered, so a timeout leaves the
-        # badge alone.
         # DOM sensors win over anything the entity table says about the cage:
         # a port with readings is an optic whatever it is plugged into.
         media_by_if = dict(sfp_slots)
         media_by_if.update({if_index: "optic" for if_index in optic_ports})
+        if not slots_complete:
+            # A walk cut short is not evidence of anything: a cage it never
+            # reached reads as absent, and a module it never reached reads
+            # as an empty cage, so the pass would strip or downgrade every
+            # SFP badge on a device that is merely slow -- and restore them
+            # next cadence, flickering the list every five minutes. Only a
+            # port this poll's own sensors proved is an optic may overwrite
+            # what is stored.
+            for row in interfaces:
+                stored = row["media"] if "media" in row.keys() else None
+                if (stored in ("sfp", "sfp_empty")
+                        and media_by_if.get(row["if_index"]) != "optic"):
+                    media_by_if[row["if_index"]] = stored
         media_rows = [{"if_index": if_index, "media": media}
                       for if_index, media in sorted(media_by_if.items())]
         media_rows += [{"if_index": row["if_index"], "media": None}

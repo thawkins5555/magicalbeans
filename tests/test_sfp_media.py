@@ -110,6 +110,34 @@ try:
 finally:
     stub.kill()
 
+# --- nor must one the device answered only part of -----------------------
+# The flaky case, and the one an empty walk does not cover: alias and
+# containment answer, entPhysicalClass times out. The clear pass runs on the
+# strength of the alias walk, and everything the cage scan never reached
+# looks exactly like a cage that is gone.
+stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media_no_class")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_nodes_db("media_partial")
+    did = device_against(db, "flaky-sw")
+    db.replace_interfaces(did, PORTS)
+    db.update_interface_media(did, [{"if_index": 2, "media": "sfp"},
+                                    {"if_index": 3, "media": "sfp_empty"}])
+    poller = NodePoller(db)
+    device = db.device(did)
+    poller._poll_environment(did, device, db.effective_config(device), set(),
+                             time.time())
+    media = {r["if_index"]: r["media"] for r in db.interfaces(did)}
+    check("a device whose entPhysicalClass walk times out keeps its SFP "
+          "badges rather than flickering them off for one cadence",
+          (media.get(2), media.get(3)) == ("sfp", "sfp_empty"), media)
+    check("...while the ports this poll's sensors did answer for are badged "
+          "from it as usual: a cut-short walk stops nothing else",
+          media.get(1) == "optic", media)
+    db.close()
+finally:
+    stub.kill()
+
 # ============================================== § 2 the dark optic's value
 
 stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media")

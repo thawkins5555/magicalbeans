@@ -72,6 +72,13 @@ Modes:
              stay unbadged), a two-lane optic with one lane dark, one dark on
              both lanes, and one transmitting at exactly 0 dBm. See
              SFP_MEDIA_TABLE.
+  sfp_media_no_class
+             `sfp_media`, except that every request into the
+             entPhysicalClass column goes unanswered -- the flaky device
+             that answers the alias and containment walks and then stops,
+             so that walk times out rather than coming back empty. The
+             difference matters to a caller that deletes rows its walk did
+             not produce. See DEAD_COLUMNS.
 
 Two control datagrams, on the same socket as SNMP itself (see
 stub_agent_fdb.py, which established this convention):
@@ -410,7 +417,21 @@ SFP_MEDIA_TABLE = {
     "1.3.6.1.2.1.99.1.1.1.5.171": ("int", 1),
 }
 
+# A mode may refuse a whole column outright, which is not the same as
+# answering it empty: a real agent that goes quiet part-way through a big
+# entPhysical walk leaves its caller with a timeout, and a caller that
+# deletes rows its walk did not produce has to be able to tell the two
+# apart. Keyed by mode, the column's base OID.
+DEAD_COLUMNS = {
+    "sfp_media_no_class": ("1.3.6.1.2.1.47.1.1.1.1.5",),
+}
+
 MODE = "ups"
+
+
+def refuses(oid):
+    return any(oid == base or oid.startswith(base + ".")
+               for base in DEAD_COLUMNS.get(MODE, ()))
 
 
 def table_for():
@@ -428,7 +449,7 @@ def table_for():
         return {**CISCO_SCALARS, **HARDWARE_TABLE, **CISCO_ENVMON_TABLE}
     if MODE == "cisco_dom":
         return {**CISCO_SCALARS, **CISCO_DOM_TABLE}
-    if MODE == "sfp_media":
+    if MODE in ("sfp_media", "sfp_media_no_class"):
         return {**GENERIC_SCALARS, **SFP_MEDIA_TABLE}
     return dict(GENERIC_SCALARS)
 
@@ -476,6 +497,8 @@ def main():
         table = table_for()
         keys = sorted(table, key=oid_key)
         oids = [vb["oid"] for vb in request.varbinds]
+        if refuses(oids[0]):
+            continue
         if request.pdu_tag == PDU_GET:
             body = b""
             for oid in oids:

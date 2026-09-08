@@ -785,8 +785,9 @@ copper. `_sfp_slot_media` reads three more ENTITY-MIB columns
 (`entPhysicalClass`, `entPhysicalVendorType`, `entPhysicalModelName`)
 alongside the `entPhysicalDescr` and `entPhysicalContainedIn` the walk
 already had, and resolves each cage through the containment tree
-`_entity_port_map` walks — which is now walked once by `_poll_environment`
-and passed to both, rather than twice. An entity whose own text names a
+`_entity_port_map` walks — extracted to `_entity_contained_in` and walked
+once by `_poll_environment` for both, so the cage scan adds no second walk
+of that column (it was already walked once, not twice). An entity whose own text names a
 transceiver (`_TRANSCEIVER_TEXT`) and that resolves to an `ifIndex` is
 `'sfp'`; a `container(5)` that says it is a transceiver cage and holds
 nothing that does is `'sfp_empty'`, taking its `ifIndex` from the `port(10)`
@@ -796,8 +797,25 @@ container naming nothing is deliberately left alone — some platforms give
 every copper port one too, and a copper port must never wear an SFP badge,
 which is also why `_TRANSCEIVER_TEXT` matches an optical media suffix
 (`base-SX`, `10Gbase-LR`) or a form factor but never a bare `1000BaseT`.
-The three columns are only walked when the entity table mapped something to
-a port, so a device that answers none of this pays nothing for them.
+The cost is real and worth stating plainly: for every device the entity
+table mapped to a port, this is three more full column walks of
+`entPhysical` — class, vendor type and model name — every
+`_SENSOR_REFRESH_S` (300 s), on top of the descr, containment and alias
+walks the sensor pass already made. A device that maps nothing to a port
+pays nothing for them, which is the only thing that bounds it.
+
+All three go through `_walk_column_status`, and a walk that did not reach
+the end of its table makes the whole verdict advisory: `_poll_environment`
+then leaves every stored `'sfp'` / `'sfp_empty'` badge where it is, and only
+a port this poll's own sensors proved is an `'optic'` may overwrite one.
+Without that a device that answers the alias walk and then times out on
+`entPhysicalClass` produced an empty cage scan, which the clear pass read as
+"no cages here" and wrote `media = NULL` over every badge on the device —
+back the next cadence, so the list flickered every five minutes. A partial
+`entPhysicalModelName` walk did the milder version of the same thing,
+downgrading an occupied cage to `'sfp_empty'`. The `'optic'` path has had
+this protection since 5.1.0 (`if port_map:`); this is the same guarantee for
+the two states the entity table alone can see.
 
 **A −40 dBm optic is dark, not dying.** A transceiver with its port powered
 down or no fiber in it clamps at the bottom of its scale, and
