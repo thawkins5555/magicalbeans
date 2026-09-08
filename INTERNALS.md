@@ -1434,7 +1434,13 @@ direction. They are on the row rather than left to the caller because a
 reading and the level it is judged against are one fact: an optical power
 row with no limits raises no alert at all, and `nodes.js`'s **Limits**
 column and its hint underneath are the only place an operator finds that
-out.
+out. The column shows every published band, temperature/bias/voltage
+included, but only the two dBm rules read one — so `alertedOnItsOwnBand`
+splits them: a non-dBm cell's title says "reference only", and a second
+hint sentence says those readings alert on the thresholds under
+Alerts → Rules. Without it a published `70 / 75` beside a temperature row
+reads as the number `sfp_temp_high` fires at, which is still the global
+70 °C.
 
 **Whole-device hardware and DOM (`NodePoller.read_hardware`,
 `read_dom_all`) — 4.53.0.** `_read_entity_sensors` generalises the same
@@ -3442,8 +3448,17 @@ rule's effective threshold is per port. For a mapped rule the row's column
 is looked up and a missing row or NULL column `continue`s **before the
 streak is touched** and is never written into `live_streaks`, so a port
 that starts publishing tomorrow starts a fresh streak rather than resuming
-one counted against a number that was never applied. That `continue` is the
-dominant path on a real fleet and costs one dict lookup. The `dict(rule)`
+one counted against a number that was never applied. It does **not** skip
+the resolve: an alert already open for that target — raised while the port
+still published a limit, or by 5.2's global number — is resolved on the way
+past with `by=''`, exactly as the `enabled = 0` branch resolves what a rule
+that has stopped applying left behind. Nothing else could, which is the
+point: threshold rules carry no auto-resolve, and the dark-optic clear
+needs a threshold to compare against. That `continue` is the dominant path
+on a real fleet and stays one dict lookup plus a set membership test —
+`open_dedup_keys()` is the same lazily loaded, at-most-once-a-tick set the
+breach paths below already share, and `resolve_by_dedup` runs only for a
+key actually in it, never once per port per tick. The `dict(rule)`
 copies are cached per rule and per `(threshold, clear)` pair for the tick:
 without that, 2,000 devices at 48 optics each built three quarters of a
 million throwaway dicts per tick and the change would have been a
@@ -3487,29 +3502,46 @@ loses the `device_down` rollup the old rules had — the same trade
 `temp_chassis_high` already made behind `temp_chassis_critical`. A
 transitive chain walk is a follow-up, not this change.
 
-**The upgrade is two named migrations, in this order.**
+**The upgrade is three named migrations, in this order.**
 `dampen_optic_power_siblings_1` is a SECOND named entry for the existing
 `_dampen_new_builtin_siblings`, and it has to be: `dampen_new_builtin_siblings_1`
 is already recorded on every install upgraded since 4.54 and will never run
 again, so without a new name an operator who muted `sfp_rx_power_low` would
 get three brand new rules over the same metric, emailing them, that they
 never agreed to. `_NEW_SIBLING_OF` gains the six new keys → their existing
-sibling; the method is idempotent by construction, so a second run on an
-install with nothing to inherit is a no-op. It must run **before**
+sibling, and the second registration passes `keys=_OPTIC_POWER_SIBLINGS` so
+that is all it walks: the temperature pair was decided by
+`dampen_new_builtin_siblings_1` in 4.54, and a second pass over it would
+re-decide it against a sibling the operator has muted *since*, reverting a
+`temp_chassis_critical` they deliberately left enabled. It runs **before**
 `clear_optic_power_thresholds_1`, which sets `threshold`/`clear_threshold`
-NULL on the two pre-existing keys: dampen decides "did the operator touch
-the sibling" by comparing the row against `_builtin_rule_defaults()`, which
-now reads NULL for these keys — run first it sees the operator's real
-number still on the row and reads it as touched, run after the clear it
-would read a carefully retuned rule as pristine and dampen nothing. The
+NULL on the two pre-existing keys — because dampen reading the numbers
+while they are still on the row is the order the change reads in, **not**
+because the order decides anything. It does not: all dampen inherits is
+`enabled`/`notify`, which the clear never touches, and the six new rules
+ship with NULL thresholds, so the sibling's own retune has nothing to shift
+onto them. Reversed, a threshold-only retune reads as pristine and the pair
+is skipped — landing on the same rows. `test_upgrade_from_previous.py`
+part 9 runs it both ways and compares. The
 clear is **unconditional**, unlike `_retire_temp_high`'s "only if it still
 looks as shipped" guard: from now the engine never reads that column for
 these rules, so a number left there cannot change what alerts — but it can
 sit on the Rules page reading as the live threshold when it is not, and an
 operator investigating a dark port would tune it, watch nothing happen and
 conclude the feature is broken. `sfp_temp_high` is not touched: only
-optical power moved. Open alerts are left alone; the next tick re-derives
-or clears them.
+optical power moved. `resolve_unpublished_optic_power_alerts_1` is the
+third and last: it resolves every open **and acked** alert of
+`sfp_rx_power_low`/`sfp_tx_power_low`, with a note saying the rule now
+reads the optic's own limits. It is unconditional because alerts.db cannot
+see which ports publish anything — that table is in nodes.db — so the note
+says a port that *does* publish re-opens on the next tick rather than
+asserting the port publishes nothing. Without it a 5.2
+install carrying such an alert on any non-Cisco DOM switch — the standard
+ENTITY-SENSOR-MIB publishes no thresholds at all, so Juniper, Arista and HP
+are all one — would keep it open for ever. It reads only the alerts table,
+so its position among the three cannot change the outcome; it runs last
+because it is the consequence of the other two. A port that *does* publish
+a limit and is still under it simply re-opens on the next tick.
 
 **Both writers refuse a number rather than ignoring one.**
 `_check_published_threshold` runs in `set_device_threshold` and in

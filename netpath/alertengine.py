@@ -1231,6 +1231,27 @@ class AlertEngine(Worker):
                             # optic that starts publishing tomorrow starts a
                             # fresh streak rather than resuming one counted
                             # against a number that was never applied.
+                            #
+                            # Anything already open for this target has to be
+                            # resolved on the way past, the same way the
+                            # override-disabled branch above does when a rule
+                            # stops applying: this evaluator never reaches
+                            # this target again, threshold rules carry no
+                            # auto-resolve, and the dark-optic clear needs a
+                            # threshold of its own -- so an alert left here
+                            # stays open for ever. by='' so a port that
+                            # starts publishing again can re-open it.
+                            # open_dedup_keys is read lazily and at most once
+                            # a tick (the same set the breach paths below
+                            # share), and resolve_by_dedup only runs for a
+                            # key actually in it: this branch is most ports
+                            # on most ticks and must cost no query.
+                            if open_keys is None:
+                                open_keys = self.db.open_dedup_keys()
+                            key = f"{rule['key']}:{entity_kind}:{entity_id}"
+                            if key in open_keys:
+                                if self.db.resolve_by_dedup(key, by=""):
+                                    self.counters["resolved"] += 1
                             continue
                         threshold = limit
                         # A transceiver publishes a level, not a band; this

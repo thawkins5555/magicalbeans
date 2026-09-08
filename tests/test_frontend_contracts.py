@@ -1467,6 +1467,16 @@ check("domLimitsHint(" in NODES and "publishes no optical power" in NODES,
 check("s.limits_source" in NODES,
       "the Limits cell names the MIB that published the band, so an operator "
       "can tell a learned limit from an invented one")
+check("alertedOnItsOwnBand(" in NODES
+      and "Only the optical power rows are alerted on" in NODES,
+      "the Limits column carries the temperature, bias and voltage bands the "
+      "optic publishes too, but only the two dBm rules read them -- so the "
+      "table says which rows are actually alerted on what it shows, rather "
+      "than letting a published 70 / 75 beside a temperature row read as the "
+      "number sfp_temp_high fires at")
+check("reference only, not what this reading is alerted on" in NODES,
+      "...and the cell's own title says so per row, for the reader who hovers "
+      "one band rather than reading the sentence under the table")
 _ALERTS46 = read("alerts.js")
 check("PUBLISHED_THRESHOLD_KEYS" in _ALERTS46
       and "Threshold — from the optic" in _ALERTS46,
