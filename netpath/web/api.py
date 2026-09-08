@@ -8335,10 +8335,24 @@ def get_dashboard(service, params, body) -> dict:
         # pool_state() separates busy from queued; the old gauge added them
         # together against the pool size and read "48 of 32 busy".
         pool = poller.pool_state() if hasattr(poller, "pool_state") else {}
+        # Named here rather than in the browser: nodes.js's displayName is
+        # private to that module, so the tile would otherwise print the raw
+        # `name` column — which is the IP again for a device nobody renamed.
+        # Capped like the offender lists, with the remainder carried so the
+        # tile can say how many it is not showing rather than imply there are
+        # only ten.
+        down_total = service.nodes_db.devices_count(status="down")
+        down = [{"device_id": row["id"],
+                 "name": namelookup.device_name(row) or row["ip"],
+                 "ip": row["ip"]}
+                for row in service.nodes_db.devices(status="down",
+                                                    limit=DASHBOARD_OFFENDER_N)]
         result["fleet"] = {
             "counts": service.nodes_db.device_counts(),
             "running": poller.running,
             "pool": pool,
+            "down": down,
+            "down_more": max(0, down_total - len(down)),
         }
 
     if _dash_can(service, params, "alerts"):

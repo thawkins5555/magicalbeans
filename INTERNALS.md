@@ -403,7 +403,10 @@ or device["ip"]` rather than the raw `devices.name` column — `name` equals
 ten" tile showed before this; `count_events_by_device` carries
 `sys_name`/`display_name_source` alongside `name` for the same reason, so
 `api.get_dashboard_offenders`'s `_rows` helper can resolve the events and
-interface-events lists' names the identical way.
+interface-events lists' names the identical way. Since 5.3.0 the Fleet
+tile's own down list is named through `namelookup.device_name` server-side
+for the same reason: `nodes.js`'s `displayName` is private to that module,
+so a dashboard row has nothing else to ask.
 
 **Why the migration rebuilds two tables.** `devices.mib_file_id` and
 `groups.mib_file_id` were added by `ensure_columns` with `REFERENCES
