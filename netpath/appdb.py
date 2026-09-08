@@ -230,6 +230,16 @@ GLOBAL_DEFAULTS = {
     "max_snmp_db_mb": 1024,
     "max_syslog_db_mb": 1024,
     "max_ipam_db_mb": 256,
+    # The volume under all of the above. A cap governs one file; nothing
+    # else in the product notices the disk itself filling up, and every
+    # database stops being written the moment it does — whatever their caps
+    # say. A percentage rather than a fixed figure because the volume an
+    # operator gave this is whatever they gave it, and 5 GB is comfortable
+    # on one site's disk and already an outage on another's. Both are
+    # settings, not constants: the plant that runs its volumes at 92% full
+    # by policy would otherwise have a permanent alert it learns to ignore.
+    "disk_free_warn_pct": 10,
+    "disk_free_critical_pct": 5,
     # Whether this host may replace its own code with what GitHub offers
     # (selfupdate.py). Off, because on a change-controlled network nobody
     # would choose "install whatever the internet offers, when anyone

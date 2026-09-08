@@ -711,6 +711,15 @@ _BUILTIN_RULES = [
     # quietly evaluating stale data. Its own rule rather than a log line,
     # because "why did nothing alert" deserves an answer on the Alerts page.
     ("poll_pool_saturated", "Polling pool saturated — polls are being skipped", "system", "poll_pool_saturated", 3, "event_notice", None, None, 1),
+    # Raised by the maintenance sweep once it has trimmed everything it can
+    # and a database is still close to its cap: from here on every pass
+    # deletes history to stay under it, which is a decision about how much
+    # the site keeps and belongs with an operator rather than in a log line.
+    # One alert per database — the store name is the entity_id.
+    ("db_near_cap", "A database is close to its size cap", "system", "db_near_cap", 3, "event_notice", None, None, 1),
+    # And the case no cap can help with. A cap governs one file; a volume
+    # with nothing left stops every one of them writing at once.
+    ("disk_space_low", "The volume holding the databases is low on free space", "system", "disk_space_low", 3, "event_notice", None, None, 1),
 ]
 
 # Kept apart from _BUILTIN_RULES, like _BUILTIN_FOR_SECONDS below. Absent
@@ -773,6 +782,13 @@ _BUILTIN_AUTO_RESOLVE_S = {
     # matches how quickly a poll pool recovers once the backlog clears.
     "snmp_failing_ping_ok": 3600,
     "poll_pool_saturated": 900,
+    # The same shape, on the maintenance sweep's clock: while a store is
+    # still near its cap the sweep keeps re-raising it every fifteen
+    # minutes, and when it stops the sweep's own clear closes it — this is
+    # only the backstop for a service stopped mid-condition, so it is a
+    # comfortable two sweeps rather than one.
+    "db_near_cap": 1800,
+    "disk_space_low": 1800,
 }
 
 _BUILTIN_TEMPLATE_KEYS = ("device_down", "device_up", "device_rebooted",
