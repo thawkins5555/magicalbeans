@@ -226,6 +226,13 @@ _ROLLUP_REDO = {60: 20, 3600: 2}
 _ROLLUP_MAX_BUCKETS = {60: 240, 3600: 48}
 _ROLLUP_BUDGET_S = 5.0
 
+# How far back down the table the flow-record list sorts. Ordering by
+# bytes * sampling cannot be index-served -- the sort key is a product, and
+# sampling is rewritten after the fact -- so the scan is bounded by id
+# instead, ids being handed out in arrival order. Not a setting: it is what
+# the sort costs, not a retention choice.
+FLOW_SCAN_CAP = 2_000_000
+
 _WATERMARK = "flow_rollup_watermark_%d"     # forward edge: built below this
 _FLOOR = "flow_rollup_floor_%d"             # backward edge backfill has reached
 # The oldest ts_end a sampling rewrite has touched since the last compaction.
@@ -718,10 +725,24 @@ class FlowDatabase(SqliteStore):
     def recent_endpoints(self, limit: int = 300, since_s: float = 3600) -> list[str]:
         """Busiest source and destination addresses seen recently.
 
-        Bounded on purpose: a busy exporter sees tens of thousands of distinct
-        addresses and only the heaviest ones reach the views.
+        Answered from the minute tier where it covers the window: a few
+        thousand rollup rows in place of two full scans of every flow in the
+        last hour, joined. Bounded on purpose either way: a busy exporter
+        sees tens of thousands of distinct addresses and only the heaviest
+        ones reach the views.
         """
         cutoff = time.time() - since_s
+        floor, watermark = self.rollup_bounds(60)
+        if floor is not None and watermark is not None and cutoff >= floor:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT key AS ip, SUM(bytes) AS bytes FROM flow_rollup"
+                    " WHERE tier = 60 AND dim IN (?,?) AND bucket >= ?"
+                    " AND bucket < ? AND ip != ''"
+                    " GROUP BY ip ORDER BY bytes DESC LIMIT ?",
+                    (DIMENSION_IDS["Source"], DIMENSION_IDS["Destination"],
+                     _align_down(cutoff, 60), watermark, limit)).fetchall()
+            return [row["ip"] for row in rows]
         with self._lock:
             rows = self._conn.execute(
                 "SELECT ip, SUM(b) AS bytes FROM ("
@@ -984,15 +1005,34 @@ class FlowDatabase(SqliteStore):
         return times, series, bucket_s, top_rows, totals
 
     def flows(self, t0: float, t1: float, filters: dict, limit: int = 200,
-              order: str = "bytes") -> list[sqlite3.Row]:
+              order: str = "bytes") -> tuple[list[sqlite3.Row], bool]:
+        """The window's heaviest -- or most recent -- individual records.
+
+        Returns (rows, whether the FLOW_SCAN_CAP bound cut the window short),
+        so the page can say the ordering is over the most recent flows rather
+        than imply it searched every one of them. `order == "time"` is served
+        end to end by ix_flows_ts and the bound never bites there.
+        """
         where, params = self._where(t0, t1, filters)
         column = {"bytes": "bytes * sampling", "packets": "packets * sampling",
                   "time": "ts_end"}.get(order, "bytes * sampling")
         with self._lock:
-            return self._conn.execute(
-                f"SELECT * FROM flows WHERE {where} ORDER BY {column} DESC LIMIT ?",
-                (*params, limit),
-            ).fetchall()
+            highest = self._conn.execute(
+                "SELECT MAX(id) AS hi FROM flows").fetchone()["hi"] or 0
+            floor_id = highest - FLOW_SCAN_CAP
+            rows = self._conn.execute(
+                f"SELECT * FROM flows WHERE id > ? AND {where}"
+                f" ORDER BY {column} DESC LIMIT ?",
+                (floor_id, *params, limit)).fetchall()
+            # One primary-key probe rather than a count of what was left out:
+            # ids are handed out in arrival order, so whether the row at the
+            # bound is still inside the window is the same question.
+            edge = None
+            if floor_id > 0:
+                edge = self._conn.execute(
+                    "SELECT ts_end FROM flows WHERE id <= ? ORDER BY id DESC"
+                    " LIMIT 1", (floor_id,)).fetchone()
+        return rows, bool(edge is not None and edge["ts_end"] >= t0)
 
     def totals(self, t0: float, t1: float, filters: dict) -> dict:
         """Exact on both paths: a rollup's span row is the whole bucket, not
