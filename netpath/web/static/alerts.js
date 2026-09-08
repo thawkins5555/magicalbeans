@@ -244,6 +244,25 @@
     return 'No alerts match these filters. Widen the time window or clear a filter.';
   }
 
+  /* Severity 1 and 2 highlighted on the list, and flashing until somebody
+     picks them up.
+
+     Severity is the syslog scale and counts DOWN — 0 is emergency, worse
+     than 1 — so this is `<= HIGHLIGHT_SEVERITY`, not `=== 1 || === 2`,
+     which would drop the worst alerts the product can raise. The floor is
+     app.js's own NOTIFY_SEVERITY, mirrored rather than imported because it
+     is a module-local const there: the desktop notification and this
+     highlight both mean "1 and 2 only", and they must not drift apart. */
+  const HIGHLIGHT_SEVERITY = 2;
+
+  function severityClasses(row) {
+    if (Number(row.severity) > HIGHLIGHT_SEVERITY) return '';
+    // Motion says "nobody has picked this up yet". An acknowledged (or
+    // resolved) alert keeps the highlight and stops moving, so a wall
+    // display is not flashing about work already in hand.
+    return ' alert-severe' + (row.state === 'open' ? ' alert-severe-unacked' : '');
+  }
+
   function drawTable() {
     const columns = alertColumns();
     const checked = view.checked;
@@ -271,7 +290,8 @@
     App.drawRows(body, rows, columns, (tr, row) => {
       tr.className = 'clickable'
         + (view.selected === row.id ? ' selected' : '')
-        + (view.checked.has(row.id) ? ' bulk-checked' : '');
+        + (view.checked.has(row.id) ? ' bulk-checked' : '')
+        + severityClasses(row);
       // The checkbox owns selection; the rest of the row owns the detail
       // pane. stopPropagation keeps ticking a box from also moving the
       // highlight, which would make one click mean two different things.
@@ -1040,7 +1060,9 @@
                        netpath_threshold: 'traces' }[r.kind] || 'polls';
     // The flapping rule counts link transitions in a time window rather than
     // comparing a value to a threshold, so it gets its own two fields
-    // instead of the threshold ones.
+    // instead of the threshold ones. Its kind is interface_event, not
+    // threshold, so its block below sits OUTSIDE the isThreshold branch —
+    // nested inside it the fields never rendered and Save read them anyway.
     const isFlapping = r.source_kind === 'flapping';
     // auto_resolve_after_s and notify are not in the rules payload's own
     // serializer; refresh() fetches them alongside and stashes them here.
@@ -1089,14 +1111,6 @@
         poll</b>: at the default of 3 the only measurable values are 0, 33, 67
         and 100&nbsp;%, so any threshold from 1 to 33 means "one probe of three
         lost". Raise the probe count for a finer threshold.</p>` : ''}` : ''}
-      ${isFlapping ? `
-      <label>Flaps before firing <input id="ar-flapcount" type="number" min="2"
-        placeholder="3" value="${r.flap_min_transitions ?? ''}"></label>
-      <label>Within <input id="ar-flapwindow" type="number" min="1"
-        placeholder="10" value="${r.flap_window_s ? Math.round(r.flap_window_s / 60) : ''}"> minutes</label>
-      <p class="hint">Fires when an interface records this many link up/down
-        transitions inside the window. Blank uses the shipped defaults, 3
-        transitions within 10 minutes.</p>` : ''}
       ${r.kind === 'dhcp_threshold' ? `<p class="hint">Percentage of a scope's
         address range that is leased or reserved. Counted the same way the DHCP
         page counts it, and evaluated once per DHCP poll rather than once per
@@ -1118,6 +1132,14 @@
           ' reached the destination.',
       }[r.source_kind] || 'Evaluated once per completed trace to this' +
         ' destination, so "consecutive traces" means what it says.'}</p>` : ''}` : ''}
+      ${isFlapping ? `
+      <label>Flaps before firing <input id="ar-flapcount" type="number" min="2"
+        placeholder="3" value="${r.flap_min_transitions ?? ''}"></label>
+      <label>Within <input id="ar-flapwindow" type="number" min="1"
+        placeholder="10" value="${r.flap_window_s ? Math.round(r.flap_window_s / 60) : ''}"> minutes</label>
+      <p class="hint">Fires when an interface records this many link up/down
+        transitions inside the window. Blank uses the shipped defaults, 3
+        transitions within 10 minutes.</p>` : ''}
       `, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (box) => {
