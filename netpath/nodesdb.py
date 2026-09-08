@@ -380,6 +380,12 @@ CREATE TABLE IF NOT EXISTS discovery_jobs (
     identified      INTEGER NOT NULL DEFAULT 0,
     allow_ping_only INTEGER NOT NULL DEFAULT 0, -- ping-only results may be approved
     reviewed        INTEGER NOT NULL DEFAULT 0, -- the approve/deny dialog was answered
+    -- What Re-discover replays: the polling profile the sweep ran under
+    -- and the per-scan timing from the Start dialog. Not a foreign key,
+    -- so a deleted profile leaves the row's history intact; the rescan
+    -- route re-checks the profile still exists before replaying it.
+    group_id        INTEGER,
+    overrides_json  TEXT,
     started_ts      REAL NOT NULL,
     finished_ts     REAL,
     error           TEXT
@@ -869,6 +875,11 @@ class NodesDatabase(SqliteStore):
             # Pre-upgrade jobs count as already reviewed, or every old
             # finished job would pop an approval dialog on first open.
             "reviewed": "INTEGER NOT NULL DEFAULT 1",
+            # What Re-discover replays. Both stay NULL on a job started
+            # before this column existed, and the route treats that as
+            # "ask the operator" rather than guessing a profile.
+            "group_id": "INTEGER",
+            "overrides_json": "TEXT",
         })
         # What the sweep's arc hop found, carried into the device on
         # promotion so its first poll starts from the same evidence.
@@ -3477,12 +3488,20 @@ class NodesDatabase(SqliteStore):
     # ------------------------------------------------------------- discovery
 
     def add_discovery_job(self, kind: str, target: str,
-                          allow_ping_only: bool = False) -> int:
+                          allow_ping_only: bool = False,
+                          group_id: int | None = None,
+                          scan_overrides: dict | None = None) -> int:
+        """`group_id` and `scan_overrides` are what Re-discover replays. The
+        communities the sweep actually tried are deliberately NOT among
+        them: they are derived from the profile on every start, so a job
+        row never holds a credential of its own."""
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO discovery_jobs(kind, target, allow_ping_only,"
-                " started_ts) VALUES (?,?,?,?)",
-                (kind, target, 1 if allow_ping_only else 0, time.time()))
+                " group_id, overrides_json, started_ts) VALUES (?,?,?,?,?,?)",
+                (kind, target, 1 if allow_ping_only else 0, group_id,
+                 json.dumps(scan_overrides) if scan_overrides else None,
+                 time.time()))
             self._conn.commit()
             return cur.lastrowid
 

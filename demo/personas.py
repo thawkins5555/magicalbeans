@@ -781,13 +781,13 @@ def arc_objects(arc: int, extra_scalars: dict | None = None) -> dict:
 
 # ---------------------------------------------------------- L2 topology
 #
-# LLDP/CDP neighbours, PoE and STP need real fleet data for the Topology
-# tab, the device pane's Neighbours/Bridge&RF subtabs and the upstream-
-# suggestion feature to have anything to draw. What follows makes a
+# LLDP/CDP neighbours, PoE and STP need real fleet data for MAPPER, the
+# device pane's Neighbours/Bridge&RF subtabs and MAPPER's upstream-
+# suggestion dialog to have anything to draw. What follows makes a
 # specific, deliberate SUBSET of the fleet answer all four, shaped to
 # match the site plan fleet_plan() already describes rather than wired so
-# every device claims to neighbour every other one (which would light up
-# the Topology tab and prove nothing).
+# every device claims to neighbour every other one (which would fill
+# MAPPER's Add neighbours list and prove nothing).
 #
 # The anchor is core-sw-01 — index 0, the one name fleet_plan() NEVER
 # varies regardless of --count — so every claim below can be a real,

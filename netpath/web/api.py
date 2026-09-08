@@ -4760,16 +4760,45 @@ def _discovery_kind_for(target: str) -> tuple[str, str]:
             f"'{target}' is not an IP address or CIDR subnet") from exc
 
 
-def post_nodes_discovery(service, params, body) -> dict:
-    target = str(body.get("target", "")).strip()
-    if not target:
-        raise ValueError("A target is required")
-    kind, target = _discovery_kind_for(target)
-    group_id = body.get("group_id")
-    if not group_id:
-        raise ValueError("A polling profile is required")
+# Per-scan timing and concurrency overrides from the Start-discovery
+# dialog — they live only in the job's own settings, never in stored
+# settings. `high` is None except for the worker count, a thread count that
+# needs a real ceiling.
+_DISCOVERY_SCAN_OVERRIDES = (
+    ("snmp_timeout_s", "discovery_snmp_timeout_s", float, 0, None),
+    ("ping_timeout_s", "discovery_ping_timeout_s", float, 0, None),
+    ("snmp_retries", "discovery_snmp_retries", int, 0, None),
+    ("ping_retries", "discovery_ping_retries", int, 0, None),
+    ("workers", "discovery_workers", int, 1, nodediscover.MAX_DISCOVERY_WORKERS),
+)
+
+
+def _discovery_scan_overrides(body) -> dict:
+    """The five timing values, validated and keyed as the dialog sends them
+    — the shape stored on the job, so a rescan replays them through the
+    same validation a fresh start goes through."""
+    scan = {}
+    for body_key, _override_key, cast, low, high in _DISCOVERY_SCAN_OVERRIDES:
+        value = body.get(body_key)
+        if value is not None and str(value) != "":
+            value = cast(value)
+            if value < low:
+                raise ValueError(f"{body_key} cannot be less than {low}"
+                                 if low else f"{body_key} cannot be negative")
+            if high is not None and value > high:
+                raise ValueError(f"{body_key} cannot be more than {high}")
+            scan[body_key] = value
+    return scan
+
+
+def _start_discovery_job(service, kind, target, group_id,
+                         allow_ping_only, scan) -> int:
+    """Everything a discovery start is past reading the request: the profile
+    turned into the communities the sweep may try, the global settings a job
+    cannot see on its own, and the row that remembers both inputs. Shared
+    with the rescan route so a replayed sweep can never drift from a fresh
+    one — the rescan carries no logic of its own."""
     _require(service.nodes_db.group(group_id), "polling profile")
-    allow_ping_only = bool(body.get("allow_ping_only"))
     communities = _discovery_communities_for_group(service, group_id)
     if not communities and not allow_ping_only:
         raise ValueError(
@@ -4783,30 +4812,73 @@ def post_nodes_discovery(service, params, body) -> dict:
         "discovery_communities": communities,
         "never_scan_cidrs": service.settings.get("never_scan_cidrs", ""),
     }
-    # Per-scan timing and concurrency overrides from the Start-discovery
-    # dialog — they live only in this job's settings, never in stored
-    # settings. `high` is None except for the worker count, a thread count
-    # that needs a real ceiling.
-    for body_key, override_key, cast, low, high in (
-            ("snmp_timeout_s", "discovery_snmp_timeout_s", float, 0, None),
-            ("ping_timeout_s", "discovery_ping_timeout_s", float, 0, None),
-            ("snmp_retries", "discovery_snmp_retries", int, 0, None),
-            ("ping_retries", "discovery_ping_retries", int, 0, None),
-            ("workers", "discovery_workers", int,
-             1, nodediscover.MAX_DISCOVERY_WORKERS)):
-        value = body.get(body_key)
-        if value is not None and str(value) != "":
-            value = cast(value)
-            if value < low:
-                raise ValueError(f"{body_key} cannot be less than {low}"
-                                 if low else f"{body_key} cannot be negative")
-            if high is not None and value > high:
-                raise ValueError(f"{body_key} cannot be more than {high}")
-            overrides[override_key] = value
+    for body_key, override_key, _cast, _low, _high in _DISCOVERY_SCAN_OVERRIDES:
+        if body_key in scan:
+            overrides[override_key] = scan[body_key]
     job_id = service.node_poller.start_discovery(
-        kind, target, overrides=overrides, allow_ping_only=allow_ping_only)
+        kind, target, overrides=overrides, allow_ping_only=allow_ping_only,
+        group_id=group_id, scan_overrides=scan)
     service.log.add(NODES_CATEGORY, f"Started {kind} discovery of {target}")
+    return job_id
+
+
+def post_nodes_discovery(service, params, body) -> dict:
+    target = str(body.get("target", "")).strip()
+    if not target:
+        raise ValueError("A target is required")
+    kind, target = _discovery_kind_for(target)
+    group_id = body.get("group_id")
+    if not group_id:
+        raise ValueError("A polling profile is required")
+    job_id = _start_discovery_job(
+        service, kind, target, group_id,
+        bool(body.get("allow_ping_only")), _discovery_scan_overrides(body))
     return {"id": job_id}
+
+
+def post_nodes_discovery_rescan(service, params, body, job_id) -> dict:
+    """Re-runs a finished sweep as a NEW job carrying the profile and timing
+    the original ran with. Never in place: a DiscoveryJob's thread cannot be
+    restarted, a second sweep writing into the same row would double-list
+    every address the first one found, and the run being repeated is the
+    audit trail the repeat is being compared against.
+
+    A row started before the profile was stored on it cannot be replayed at
+    all. Rather than guess one, the answer says so and the browser opens the
+    Start dialog with the target filled in."""
+    job = _require(service.nodes_db.discovery_job(job_id), "discovery job")
+    if service.node_poller.discovery_running(job_id):
+        raise ValueError(
+            "This scan is still running — wait for it to finish, or cancel "
+            "it, before running it again.")
+    target = job["target"]
+    # A double-click on Re-discover, or a second operator on the same row,
+    # would otherwise put two sweeps of the same /24 on the wire at once.
+    # Both halves matter: a row left 'running' by a process that died is not
+    # a sweep anybody is waiting for, and must not wedge the button.
+    for other in service.nodes_db.discovery_jobs(200):
+        if (other["id"] != job_id and other["target"] == target
+                and other["state"] == "running"
+                and service.node_poller.discovery_running(other["id"])):
+            raise ValueError(
+                f"A scan of {target} is already running — wait for it to "
+                "finish before starting another.")
+    keys = job.keys()
+    group_id = job["group_id"] if "group_id" in keys else None
+    if not group_id or service.nodes_db.group(group_id) is None:
+        return {"needs_profile": True, "target": target,
+                "allow_ping_only": bool(job["allow_ping_only"])}
+    raw = job["overrides_json"] if "overrides_json" in keys else None
+    try:
+        stored = json.loads(raw) if raw else {}
+    except ValueError:
+        stored = {}
+    if not isinstance(stored, dict):
+        stored = {}   # only reachable from a hand-edited row; run at the defaults
+    new_id = _start_discovery_job(
+        service, job["kind"], target, group_id,
+        bool(job["allow_ping_only"]), _discovery_scan_overrides(stored))
+    return {"id": new_id, "rescan_of": job_id}
 
 
 def get_nodes_discovery(service, params, body) -> dict:

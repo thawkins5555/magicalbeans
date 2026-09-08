@@ -592,19 +592,19 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
   // 4.53.0 deleted the Nodes TOPOLOGY subtab and moved this button into the
   // Nodes top strip, renaming it nd-upstream-suggestions; this step kept
   // selecting the dead subtab and looking for the old id, so it recorded
-  // "absent" on every run instead of driving the dialog. nodes.js injects
-  // the button after #nd-manage-devgroups rather than declaring it in
-  // index.html, so it exists only once the module has initialised — hence
-  // the settle before the gate check rather than a bare query.
+  // "absent" on every run instead of driving the dialog. 5.2.0 finished
+  // that migration by moving the button to MAPPER's own top strip
+  // (#mp-upstream-suggestions), where reviewing L2 parentage belongs — the
+  // settle stays, since the strip is only wired once the lazy module has
+  // initialised.
   await guarded(recorder, step('dlg:upstream-suggestions'), async () => {
-    await selectTab(page, 'nodes');
-    await page.click('#page-nodes .subtab[data-subtab="devices"]').catch(() => {});
+    await selectTab(page, 'mapper');
     await settle(page, 600);
-    const gate = await gateState(page, '#nd-upstream-suggestions');
+    const gate = await gateState(page, '#mp-upstream-suggestions');
     if (!gate.present || !gate.visible) {
-      return 'absent — #nd-upstream-suggestions not visible';
+      return 'absent — #mp-upstream-suggestions not visible';
     }
-    await page.click('#nd-upstream-suggestions', { timeout: 5000 });
+    await page.click('#mp-upstream-suggestions', { timeout: 5000 });
     await page.waitForSelector('#modal:not([hidden])', { timeout: 10000 });
     await settle(page, 500);
     await shoot(page, dir, shot('dlg', 'upstream-suggestions'));
@@ -617,6 +617,9 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
   // needs the same row-selected state sub:device-detail already leaves
   // behind. Proves the form renders without ever submitting a change.
   await guarded(recorder, step('dlg:edit-device'), async () => {
+    // The step above now leaves the walk on MAPPER, so this one has to come
+    // back rather than clicking a subtab on a hidden page.
+    await selectTab(page, 'nodes');
     await page.click('#page-nodes .subtab[data-subtab="devices"]').catch(() => {});
     const rows = await page.locator('#nodes-table tbody tr').count();
     if (!rows) return 'absent — no devices seeded';
