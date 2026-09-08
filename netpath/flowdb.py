@@ -3,6 +3,15 @@
 Flows live in their own SQLite file: a busy exporter writes orders of
 magnitude more rows than the path monitor does, and SQLite allows one writer
 at a time.
+
+Beside the raw rows sit two tiers of rollup, 60-second and hourly buckets,
+each holding the heaviest ROLLUP_KEYS keys of every dimension plus a
+separate per-bucket grand total. That cap is what makes a chart cost
+O(window / bucket) rather than O(flows): a week of raw rows is hundreds of
+millions, a week of hourly rollup is a few thousand. A key expression that
+evaluates to NULL cannot be stored (the rollup's primary key forbids it) and
+so lands in the residual the grand total leaves behind, where the raw path
+would have shown it as its own "unknown" series.
 """
 
 from __future__ import annotations
@@ -77,6 +86,41 @@ CREATE TABLE IF NOT EXISTS samplers (
     updated_ts REAL,
     PRIMARY KEY (exporter, domain, sampler_id)
 );
+
+-- The heaviest keys of one dimension in one bucket, with the sampling factor
+-- already multiplied in: it is per row, so it cannot be reapplied to a stored
+-- sum. BLOB affinity stores each key as whatever the raw GROUP BY produced —
+-- an integer port comes back an integer, an address comes back text — so the
+-- two query paths hand api._flow_label the same thing. WITHOUT ROWID makes
+-- the table its own clustered index in (tier, dim, bucket) order, which is
+-- the order every read scans it in.
+CREATE TABLE IF NOT EXISTS flow_rollup (
+    tier    INTEGER NOT NULL,   -- bucket width in seconds: 60 or 3600
+    dim     INTEGER NOT NULL,   -- flowdb.DIMENSION_IDS, append-only
+    bucket  INTEGER NOT NULL,   -- epoch seconds, always a multiple of tier
+    key     BLOB    NOT NULL,
+    bytes   INTEGER NOT NULL,
+    packets INTEGER NOT NULL,
+    flows   INTEGER NOT NULL,
+    PRIMARY KEY (tier, dim, bucket, key)
+) WITHOUT ROWID;
+
+-- Retention deletes by age across every dimension at once, which the
+-- dimension-leading primary key cannot serve.
+CREATE INDEX IF NOT EXISTS ix_flow_rollup_bucket ON flow_rollup(tier, bucket);
+
+-- What every dimension sums to, kept once rather than eleven times: the same
+-- flows are counted whichever way they are grouped. This is what keeps the
+-- totals exact under the top-K cap — the residual is this minus the keys
+-- that were stored.
+CREATE TABLE IF NOT EXISTS flow_rollup_span (
+    tier    INTEGER NOT NULL,
+    bucket  INTEGER NOT NULL,
+    bytes   INTEGER NOT NULL,
+    packets INTEGER NOT NULL,
+    flows   INTEGER NOT NULL,
+    PRIMARY KEY (tier, bucket)
+) WITHOUT ROWID;
 """
 
 DEFAULTS = {
@@ -123,6 +167,51 @@ DIMENSIONS = {
     "Destination AS": "dst_as",
     "ToS": "tos",
 }
+
+# The number each dimension is stored under in flow_rollup. Written out rather
+# than derived from DIMENSIONS' order, because that order is published to the
+# browser (api._config's "dimensions") and reordering the list for the UI's
+# sake must not silently reinterpret every stored row. Append only.
+DIMENSION_IDS = {"Application": 1, "Protocol": 2, "Source": 3, "Destination": 4,
+                 "Conversation": 5, "Exporter": 6, "Ingress interface": 7,
+                 "Egress interface": 8, "Source AS": 9, "Destination AS": 10,
+                 "ToS": 11}
+
+# Bucket widths, matched to api._flow_bucket's ladder: 60 serves the 60/300/900
+# buckets, 3600 serves 3600 and 21600. The 10-second bucket the 15-minute view
+# asks for stays on raw, where a quarter of an hour of rows is cheap.
+ROLLUP_TIERS = (60, 3600)
+
+# Keys kept per (tier, dimension, bucket). Chosen against the UI rather than
+# the data: netflow.js offers a Top N up to 25, so the cap has to sit well
+# above that for every bar the page draws to be exact.
+ROLLUP_KEYS = {60: 48, 3600: 64}
+
+# Which setting bounds each tier's history. The minute tier is the expensive
+# one (~42 MB a day against ~0.9 MB for the hourly tier), and only the windows
+# narrow enough to use it need it.
+ROLLUP_DAYS_SETTING = {60: "rollup_minute_days", 3600: "rollup_retention_days"}
+
+# A bucket is summarised only once its end is this old: an exporter with an
+# active timeout or a skewed clock keeps sending flows for a window that has
+# already closed.
+_ROLLUP_LAG_S = 120
+# How many sealed buckets each pass recomputes behind the watermark, so those
+# late flows are not lost. The minute window is deliberately wider than
+# collector.RESAMPLE_MAX_AGE_S, the age at which a sampling rate announced
+# after the fact can still rewrite a raw row.
+_ROLLUP_REDO = {60: 20, 3600: 2}
+_ROLLUP_MAX_BUCKETS = {60: 240, 3600: 48}
+_ROLLUP_BUDGET_S = 5.0
+
+_WATERMARK = "flow_rollup_watermark_%d"     # forward edge: built below this
+_FLOOR = "flow_rollup_floor_%d"             # backward edge backfill has reached
+# The oldest ts_end a sampling rewrite has touched since the last compaction.
+_RESAMPLE_FLOOR = "flow_resample_floor_ts"
+
+
+def _align_down(ts: float, width: float) -> int:
+    return int(float(ts) // width) * int(width)
 
 
 class FlowDatabase(SqliteStore):
