@@ -416,6 +416,43 @@ def test_9_the_watermark_advances_under_a_tight_budget() -> None:
     db.close()
 
 
+# ------------------------------------------------------------------------ 10
+
+def test_10_a_late_exporter_still_reaches_the_rollups() -> None:
+    print("10: a flow landing far behind the watermark is summarised too")
+    db = store("late.db")
+    now = time.time()
+    start = flowdb._align_down(now - 7200, 3600)
+    db.insert_flows([flow(i, start + i * 4.0) for i in range(1500)])
+    cover(db)
+
+    # Forty minutes behind the watermark: ts_end comes from the exporter's
+    # clock (nfdecode accepts anything within 30 days of now), so a device
+    # with an active timeout or a skewed clock lands here routinely. Such a
+    # flow used to exist in raw alone -- on the 15-minute view, gone from
+    # the 1-hour one.
+    _floor, watermark = db.rollup_bounds(60)
+    late = float(watermark - 40 * 60)
+    db.insert_flows([flow(9000, late, src_ip="10.9.9.9", bytes=999_000,
+                          sampling=1)])
+    check(db.overview(start, now, "Source", NO_FILTERS, 60)
+          != raw(db, "overview", start, now, "Source", NO_FILTERS, 60),
+          "before the next pass the rollup is behind the raw rows, so the "
+          "check below is not passing by accident")
+
+    for tier in flowdb.ROLLUP_TIERS:
+        db.compact_rollup(tier, max_buckets=10_000, budget_s=120)
+    for bucket in (60, 3600):
+        got = db.overview(start, now, "Source", NO_FILTERS, bucket)
+        want = raw(db, "overview", start, now, "Source", NO_FILTERS, bucket)
+        check(got == want,
+              f"one compaction later the {bucket}s view agrees with raw again "
+              f"({got[4]} vs {want[4]})")
+        check(any(row["key"] == "10.9.9.9" for row in got[3]),
+              f"...and the late flow is one of the {bucket}s view's own rows")
+    db.close()
+
+
 TESTS = [
     test_1_rollup_and_raw_agree,
     test_2_totals_survive_truncation,
@@ -426,6 +463,7 @@ TESTS = [
     test_7_compaction_is_idempotent,
     test_8_a_window_below_the_floor_falls_back,
     test_9_the_watermark_advances_under_a_tight_budget,
+    test_10_a_late_exporter_still_reaches_the_rollups,
 ]
 
 
