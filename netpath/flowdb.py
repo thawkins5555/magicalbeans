@@ -478,10 +478,11 @@ class FlowDatabase(SqliteStore):
                        budget_s: float = _ROLLUP_BUDGET_S) -> int:
         """Summarise sealed buckets into `tier`, from a private watermark.
 
-        Seeded at the current bucket rather than at the oldest stored flow:
-        a store that has been collecting for a fortnight would otherwise
-        grind through all of it before producing a bucket anyone is looking
-        at. backfill_rollup pages the history in from the other end.
+        Seeded at the newest sealed bucket rather than at the oldest stored
+        flow: a store that has been collecting for a fortnight would
+        otherwise grind through all of it before producing a bucket anyone
+        is looking at. backfill_rollup pages the history in from the other
+        end.
 
         Returns the number of rollup rows written.
         """
@@ -541,12 +542,16 @@ class FlowDatabase(SqliteStore):
             row = self._conn.execute(
                 "SELECT MIN(ts_end) AS oldest FROM flows").fetchone()
         oldest = row["oldest"] if row else None
+        if oldest is None:
+            # Nothing to summarise from. Walking on would build empty buckets
+            # every sweep until the retention floor caught up with the cursor.
+            return 0, False
         setting = ROLLUP_DAYS_SETTING[tier]
         days = float(self.settings().get(setting, DEFAULTS[setting]))
-        # No point summarising what retention will delete on this same sweep.
-        stop = _align_down(time.time() - days * 86400, tier)
-        if oldest is not None:
-            stop = max(stop, _align_down(float(oldest), tier))
+        # Neither below the raw rows the summaries are built from, nor below
+        # what retention will delete on this same sweep.
+        stop = max(_align_down(time.time() - days * 86400, tier),
+                   _align_down(float(oldest), tier))
         limit = _ROLLUP_MAX_BUCKETS[tier] if max_buckets is None else max_buckets
         deadline = time.monotonic() + budget_s
         written = 0
