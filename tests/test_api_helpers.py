@@ -396,6 +396,50 @@ try:
           cpu_row is not None and cpu_row["name"] == "dash-offender-sw",
           cpu_row)
 
+    # ---------------------------------------------------------------------
+    # 10. The Fleet tile names the down devices
+    #
+    # The tile used to carry counts and nothing else, so "14 down" could only
+    # be turned into fourteen names by leaving the Dashboard. Twelve are put
+    # down here to pin both halves of the contract: the list is capped at
+    # DASHBOARD_OFFENDER_N, and the remainder is counted from the true total
+    # rather than from the capped page.
+    down_ids = []
+    for n in range(12):
+        device_id = service.nodes_db.add_device(f"203.0.113.{n + 20}")
+        down_ids.append(device_id)
+        service.nodes_db.record_poll(
+            device_id, ping_ok=False, ping_rtt_ms=None, snmp_ok=False,
+            snmp_error="", identity=None, uptime_ticks=None,
+            status="down", reachable=False)
+    # The lowest address of the twelve, so it lands inside the capped page:
+    # naming is what is under test, and a row off the end proves nothing.
+    service.nodes_db.seed_identity(down_ids[0], sys_name="down-edge-sw")
+
+    status, payload = call("GET", "/api/dashboard", token=admin)
+    fleet = payload.get("dashboard", {}).get("fleet", {}) if status == 200 else {}
+    rows = fleet.get("down", [])
+    check("the fleet block carries the down devices, capped at ten",
+          status == 200 and len(rows) == 10, (status, len(rows)))
+    check("every down row carries the device id the tile links to",
+          bool(rows) and all(isinstance(r.get("device_id"), int) for r in rows),
+          rows[:2])
+    check("a down row is named through namelookup, not the raw name column",
+          any(r["name"] == "down-edge-sw" for r in rows),
+          [r["name"] for r in rows])
+    check("a never-renamed down device falls back to its IP rather than "
+          "showing an empty name",
+          all(r["name"] for r in rows), [r["name"] for r in rows])
+    check("the remainder counts every down device, not just the capped page",
+          fleet.get("down_more") == fleet.get("counts", {}).get("down", 0) - 10,
+          (fleet.get("down_more"), fleet.get("counts", {}).get("down")))
+
+    status, payload = call("GET", "/api/dashboard", token=settings_only)
+    check("an account without Nodes read gets no fleet block at all — absent, "
+          "not an empty list",
+          status == 200 and "fleet" not in payload.get("dashboard", {}),
+          payload.get("dashboard", {}).keys())
+
 finally:
     server.stop()
     service.shutdown()

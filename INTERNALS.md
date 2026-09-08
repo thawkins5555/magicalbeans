@@ -403,7 +403,10 @@ or device["ip"]` rather than the raw `devices.name` column — `name` equals
 ten" tile showed before this; `count_events_by_device` carries
 `sys_name`/`display_name_source` alongside `name` for the same reason, so
 `api.get_dashboard_offenders`'s `_rows` helper can resolve the events and
-interface-events lists' names the identical way.
+interface-events lists' names the identical way. Since 5.3.0 the Fleet
+tile's own down list is named through `namelookup.device_name` server-side
+for the same reason: `nodes.js`'s `displayName` is private to that module,
+so a dashboard row has nothing else to ask.
 
 **Why the migration rebuilds two tables.** `devices.mib_file_id` and
 `groups.mib_file_id` were added by `ensure_columns` with `REFERENCES
@@ -1626,6 +1629,23 @@ wall-clock-expected `sysUpTime` with a 30-second grace band, and
 explicitly excludes the case where the previous reading was already near
 `2**32` hundredths (TimeTicks' own ~497-day wraparound) so a genuine wrap
 is never misreported as a restart.
+
+Its note is the reboot alert's message verbatim — `alertengine.
+_drain_device_events` uses `device_events.detail` as the message and gives
+`rebooted` no substitute — so since 5.3.0 it renders both uptimes through
+`trapdecode.format_ticks` and the gap between readings through
+`alertmail.duration_text`, rather than printing TimeTicks raw: a device up
+two and a half minutes reported "15000 hundredths of a second", which is
+where "uptime in hundreds of seconds" came from. The same note is the only
+surviving record of the two figures, since the poll that detects the reboot
+has already overwritten `devices.last_uptime_ticks` with the post-reboot
+reading, so `nodepoll.reboot_uptimes()` — the inverse of that sentence, kept
+beside it — reads them back out of the stored event for the
+`device_rebooted` template's `{{previous_uptime}}`/`{{current_uptime}}`.
+Those two tokens had no writer anywhere before that: `alertmail.
+build_context` defaulted both to `""` and only the template editor's preview
+sample ever filled them, so the preview looked right while every real reboot
+email rendered two blank lines.
 
 `_poll_device()`'s status transitions use an explicit `reachable` flag
 threaded through to `nodesdb.record_poll()`, separate from the *display*

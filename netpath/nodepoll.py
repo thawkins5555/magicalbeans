@@ -34,7 +34,8 @@ from .snmppoll import (
     SnmpError, SnmpTimeout, SnmpUnsupported, build_request, build_v3_request,
     decode_response, discovery_probe,
 )
-from .trapdecode import localized_key
+from .alertmail import duration_text
+from .trapdecode import format_ticks, localized_key
 from .worker import Worker, ago
 
 MAX_UDP = 65535
@@ -403,8 +404,26 @@ def detect_reboot(uptime_ticks: int, uptime_ts: float, previous_ticks: int | Non
     near_wrap = previous_ticks > wrap_modulus - (elapsed_s * 100 + grace_ticks) * 2
     if near_wrap:
         return False, ""
-    return True, (f"uptime dropped from {previous_ticks} to {uptime_ticks} "
-                  f"hundredths of a second after {elapsed_s:.0f}s")
+    return True, (f"uptime dropped from {format_ticks(previous_ticks)} to "
+                  f"{format_ticks(uptime_ticks)} after "
+                  f"{duration_text(elapsed_s)} without a reading")
+
+
+# The inverse of the sentence above, kept beside it so the two cannot drift.
+_REBOOT_UPTIMES = re.compile(r"uptime dropped from (.+?) to (.+?) after ")
+
+
+def reboot_uptimes(detail: str) -> tuple[str, str]:
+    """The before/after uptimes out of a `rebooted` device_event's detail.
+
+    Read back out of the event row rather than off the device, because the
+    device row no longer has them: `devices.last_uptime_ticks` was overwritten
+    with the post-reboot reading by the poll that detected the reboot, and the
+    pre-reboot figure is gone for good by the time the alert engine drains the
+    event. ("", "") for a detail this did not write.
+    """
+    match = _REBOOT_UPTIMES.search(detail or "")
+    return (match.group(1), match.group(2)) if match else ("", "")
 
 
 def _interface_reassigned(prior: "sqlite3.Row | dict", row: dict) -> bool:

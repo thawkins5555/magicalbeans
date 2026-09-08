@@ -17,6 +17,7 @@ from netpath import alertmail
 from netpath.alertsdb import AlertsDatabase
 from netpath.alertengine import AlertEngine
 from netpath.alertrules import Occurrence
+from netpath.nodepoll import detect_reboot
 from netpath.ipamdb import IpamDatabase
 from netpath.nodesdb import NodesDatabase
 from netpath.snmptrapdb import SnmpTrapDatabase
@@ -1332,6 +1333,64 @@ assert open_rows(alerts, "cpu_high", did_b11) == [], \
      "must not span the silent gap and fire for_seconds instantly")
 ok("a stale sample resets first_breach_ts, so resuming does not fire "
    "for_seconds instantly off the silent gap")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ==================================================================== B12
+print("\nB12 — a reboot email says the uptimes, in units a human reads")
+
+# device_rebooted's body has printed "Previous reported uptime: {{...}}" since
+# it shipped, and nothing anywhere ever wrote either token — the only place
+# they carried values was the template editor's preview sample, so the preview
+# looked perfect while every real email rendered two blank lines followed by
+# detect_reboot's raw tick count.
+
+
+class _BodyMail:
+    """FakeMail, but keeps the rendered body — this is what is under test."""
+
+    def __init__(self):
+        self.messages = []
+
+    def __call__(self, settings, password, to_addrs, subject, body, is_html):
+        self.messages.append((subject, body))
+
+
+nodes, alerts, snmp, syslog, ipam, engine = build(**MAIL_SETTINGS)
+sent = _BodyMail()
+alertmail.send = sent
+try:
+    engine._tick()
+    did = add_device(nodes, "10.12.0.1", "core-sw-a")
+    # The event detail the poller itself would write: 120 days of uptime, then
+    # 2m30s, five minutes later.
+    rebooted, note = detect_reboot(15_000, 1300.0, 1_036_800_000, 1000.0)
+    assert rebooted, note
+    nodes.record_device_event(did, "rebooted", note)
+    engine._tick()
+    assert engine._mail.wait_idle(10.0), "mail queue never went idle"
+
+    rows = open_rows(alerts, "device_rebooted", did)
+    assert len(rows) == 1, [dict(r) for r in rows]
+    assert "15000" not in rows[0]["message"], rows[0]["message"]
+    assert "00:02:30" in rows[0]["message"], rows[0]["message"]
+    ok("the alert's own message states the uptime as a clock, not as a "
+       "five-digit tick count")
+
+    extra = json.loads(rows[0]["extra_json"] or "{}")
+    assert extra.get("previous_uptime") == "120d 00:00:00", extra
+    assert extra.get("current_uptime") == "00:02:30.00", extra
+    ok("both uptimes are stored on the alert, so a renotify renders them too")
+
+    bodies = [body for _subject, body in sent.messages if "rebooted" in _subject]
+    assert len(bodies) == 1, sent.messages
+    assert "Previous reported uptime: 120d 00:00:00" in bodies[0], bodies[0]
+    assert "Current reported uptime: 00:02:30.00" in bodies[0], bodies[0]
+    ok("the rendered device_rebooted email fills both uptime lines instead of "
+       "leaving them blank")
+finally:
+    alertmail.send = real_send
 
 nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
 
