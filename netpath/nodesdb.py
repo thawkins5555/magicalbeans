@@ -1252,19 +1252,33 @@ class NodesDatabase(SqliteStore):
             # learned filters the list down to the switches that see it.
             # Only from four hex digits: fewer would match half the estate
             # and turn a search into a shuffle.
+            #
+            # The alias addresses are searched the same way, so a device
+            # that answers on several is found by any of them — including
+            # the address a merged-away row was entered under, which
+            # merge_devices keeps as an alias of the surviving device. The
+            # subquery is a second scan, over a table holding a handful of
+            # rows per device: on the same 2000-device shape (one alias
+            # each) it costs about half as much again as the seven-column
+            # LIKE above, which leaves it just as far under anything an
+            # operator would notice. A leading-% LIKE cannot use
+            # ix_device_addresses_ip, at this scale or any other.
             text_cols = ("ip", "name", "sys_name", "sys_location",
                          "sys_descr", "sys_contact", "vendor")
             text_sql = " OR ".join(f"{col} LIKE ?" for col in text_cols)
+            text_sql += (" OR id IN (SELECT device_id FROM device_addresses"
+                         "           WHERE ip LIKE ?)")
+            like = [f"%{text}%"] * (len(text_cols) + 1)
             mac = looks_like_mac_search(text)
             if len(mac) >= 4:
                 clauses.append(
                     f"({text_sql}"
                     " OR id IN (SELECT device_id FROM mac_entries"
                     "           WHERE mac LIKE ?))")
-                params.extend([f"%{text}%"] * len(text_cols) + [f"{mac}%"])
+                params.extend([*like, f"{mac}%"])
             else:
                 clauses.append(f"({text_sql})")
-                params.extend([f"%{text}%"] * len(text_cols))
+                params.extend(like)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         return where, params
 
@@ -1948,6 +1962,26 @@ class NodesDatabase(SqliteStore):
             return self._conn.execute(
                 "SELECT * FROM device_addresses WHERE device_id = ? ORDER BY ip",
                 (device_id,)).fetchall()
+
+    def addresses_for_devices(self, device_ids) -> dict[int, list[sqlite3.Row]]:
+        """device_addresses() for many devices at once, in as few queries as
+        the bind-parameter limit allows — one page of the device list costs
+        one read rather than one per row. Devices with no alias are absent
+        from the result, so callers ask with .get()."""
+        ids = list(dict.fromkeys(device_ids))
+        if not ids:
+            return {}
+        found: dict[int, list[sqlite3.Row]] = {}
+        with self._lock:
+            for start in range(0, len(ids), self._IDS_PER_QUERY):
+                chunk = ids[start:start + self._IDS_PER_QUERY]
+                marks = ",".join("?" * len(chunk))
+                rows = self._conn.execute(
+                    f"SELECT * FROM device_addresses WHERE device_id IN ({marks})"
+                    " ORDER BY ip", chunk).fetchall()
+                for row in rows:
+                    found.setdefault(row["device_id"], []).append(row)
+        return found
 
     # ------------------------------------------- identity, duplicates, merge
 

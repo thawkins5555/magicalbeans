@@ -211,7 +211,7 @@
       // The mute lives in Alerts but is shown here on purpose: an operator
       // who silenced a device an hour ago and later wonders why it has gone
       // quiet should not have to go looking for the reason.
-      cell: (r) => `${escape(displayName(r))}<div class="ip-line">${escape(r.ip)}` +
+      cell: (r) => `${escape(displayName(r))}<div class="ip-line">${deviceIpCell(r)}` +
         `${mutedTag(r)}</div>` },
     { key: 'group', label: 'Profile', width: 130, on: true,
       value: (r) => r._groupName || '',
@@ -245,11 +245,22 @@
     { key: 'sys_contact', label: 'Contact', width: 150,
       value: (r) => r.sys_contact || '',
       cell: (r) => escape(r.sys_contact || '\u2014') },
-    { key: 'ip', label: 'IP', width: 120, cell: (r) => escape(r.ip) },
+    { key: 'ip', label: 'IP', width: 120, cell: (r) => deviceIpCell(r) },
     { key: 'sys_object_id', label: 'sysObjectID', width: 180,
       value: (r) => r.sys_object_id || '',
       cell: (r) => escape(r.sys_object_id || '\u2014') },
   ];
+
+  // A device can answer on more addresses than the one it was entered
+  // under — a merge folds the other row's address in here — so the column
+  // says how many others there are and names them, the same way the
+  // discovery table's discIpCell does for a box a sweep reached twice.
+  function deviceIpCell(r) {
+    const all = (r.addresses || []).map((a) => a.ip);
+    const extra = Math.max(0, all.length - 1);
+    return `${escape(r.ip)}${extra ? ` <span class="hint" title="${
+      escape(all.join(', '))}">+${extra}</span>` : ''}`;
+  }
 
   // The default colgroup (check+status+name+group+devgroup+vendor+response+
   // last_poll_ts) asks 884px, which the 3/2 pane split still falls short of

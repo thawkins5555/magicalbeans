@@ -3050,12 +3050,19 @@ def _device_rows_json(service, params, rows) -> list[dict]:
     window_covered = service.alerts_db.window_covered_device_ids(
         ((row["id"], row["device_group_id"]) for row in rows))
     muted = service.alerts_db.muted_entity_ids("device", window_covered=window_covered)
+    # A device merged into another keeps the address it was entered under as
+    # an alias, and the list is where an operator looks for that address —
+    # so the whole set rides along, in one read for the page rather than one
+    # per row.
+    aliases = service.nodes_db.addresses_for_devices(row["id"] for row in rows)
     reveal = _may_read_secrets(service, params, "nodes")
     devices = []
     for row in rows:
         device = _device_json(row, reveal)
         device["polling"] = row["id"] in worker_state
         device["muted_until"] = muted.get(str(row["id"]))
+        device["addresses"] = _device_addresses_json(
+            row, aliases.get(row["id"], ()))
         devices.append(device)
     return devices
 
@@ -3090,11 +3097,12 @@ def get_nodes_devices_export(service, params, body) -> dict:
     devices = _device_rows_json(service, params, rows)
     header = ["id", "name", "ip", "status", "group_id", "device_group_id",
              "vendor", "sys_descr", "sys_name", "polling", "muted_until",
-             "poll_interval_s", "last_poll_ts"]
+             "poll_interval_s", "last_poll_ts", "addresses"]
     csv_rows = [[d.get("id"), d.get("name"), d.get("ip"), d.get("status"),
                 d.get("group_id"), d.get("device_group_id"), d.get("vendor"),
                 d.get("sys_descr"), d.get("sys_name"), d.get("polling"),
-                d.get("muted_until"), d.get("poll_interval_s"), d.get("last_poll_ts")]
+                d.get("muted_until"), d.get("poll_interval_s"), d.get("last_poll_ts"),
+                ", ".join(a["ip"] for a in d.get("addresses") or ())]
                for d in devices]
     return _csv_response("devices", header, csv_rows)
 
@@ -3477,19 +3485,22 @@ def _address_json(row) -> dict:
             "netmask": row["netmask"] if "netmask" in keys else None}
 
 
-def _device_addresses_json(service, row) -> list[dict]:
+def _device_addresses_json(row, aliases) -> list[dict]:
     """The device's primary address first, then every learned alias — the
-    primary isn't stored in device_addresses, so it's added here."""
+    primary isn't stored in device_addresses, so it's added here. The alias
+    rows are passed in rather than read here, so a whole page of devices can
+    be answered from one nodes_db.addresses_for_devices() read."""
     addresses = [{"ip": row["ip"], "source": "primary", "seen_ts": None,
                   "if_index": None, "netmask": None, "primary": True}]
-    for alias in service.nodes_db.device_addresses(row["id"]):
+    for alias in aliases:
         addresses.append({**_address_json(alias), "primary": False})
     return addresses
 
 
 def get_nodes_device_addresses(service, params, body, device_id) -> dict:
     row = _require(service.nodes_db.device(device_id), "device")
-    return {"addresses": _device_addresses_json(service, row)}
+    return {"addresses": _device_addresses_json(
+        row, service.nodes_db.device_addresses(device_id))}
 
 
 def get_nodes_duplicates(service, params, body) -> dict:
@@ -3578,7 +3589,8 @@ def get_nodes_device(service, params, body, device_id) -> dict:
     # ADDRESSES subtab is one short list the detail pane already has a
     # round trip for, and a second request per device selection to carry
     # three rows is a request nobody needs.
-    device["addresses"] = _device_addresses_json(service, row)
+    device["addresses"] = _device_addresses_json(
+        row, service.nodes_db.device_addresses(device_id))
     device.update(_identification_json(service, row))
     return {"device": device}
 
