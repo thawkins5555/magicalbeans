@@ -1400,6 +1400,56 @@ check("LOADING_TEXT = 'Loading…'" in _NETFLOW and "App.loading()" in _NETFLOW,
       "...in the house vocabulary App.loading() already uses everywhere else, "
       "not a modal over a read and not a second word for the same wait")
 
+# ---------------------------------------------------------------------------
+# 45. NetFlow (5.3.0): the state above had no way out but success. showLoading
+#     writes "Loading…" into the chart, the top-N bars and the record table,
+#     and only a refresh that COMPLETED ever wrote over it — so a 400 from a
+#     filter the server refuses, or an outage under a window change, left all
+#     three panes reading "Loading…" for as long as the operator stayed there,
+#     next to a connection status already saying the fetch had failed.
+check("view.loading ? LOADING_TEXT : NO_FLOWS_TEXT" not in _NETFLOW,
+      "a pane with nothing to draw picks its sentence in one place instead of "
+      "each re-deriving it from view.loading — a two-state ternary that had no "
+      "answer at all for a fetch that failed")
+check("const emptyMessage = () =>" in _NETFLOW,
+      "...and that one place knows all three states a pane can be in: still "
+      "loading, failed, and genuinely empty")
+check("FAILED_TEXT = 'Could not load" in _NETFLOW,
+      "the failure sentence is its own rather than NO_FLOWS_TEXT: a server "
+      "that never answered has not said this window is quiet, and reporting a "
+      "refused filter as 'no flows match' is a claim nobody made")
+_FAILED_AT = "  function loadFailed(error) {"
+check(_FAILED_AT in _NETFLOW,
+      "the loading state has a way out other than success at all — this is "
+      "the function that did not exist, and every check below reads it")
+_NF_FAILED = (_NETFLOW[_NETFLOW.index(_FAILED_AT):
+                       _NETFLOW.index("  function filters() {")]
+              if _FAILED_AT in _NETFLOW else "")
+check("error.superseded" in _NF_FAILED,
+      "a superseded abort is not a failure — the newer fetch it was abandoned "
+      "for is still loading, and its answer is the one worth waiting for")
+check("view.loading = false;" in _NF_FAILED and "view.failed = true;" in _NF_FAILED,
+      "a real failure stops the page claiming to be loading")
+for _target in ("drawChart();", "drawBars();", "drawTable("):
+    check(_target in _NF_FAILED,
+          "...across the same three panes showLoading wrote to (%s), so none "
+          "is left mid-sentence" % _target.rstrip("(;"))
+check("!view.loading) return;" in _NF_FAILED,
+      "...and only where a loading claim was actually made: a poll tick that "
+      "failed under a window already on screen leaves that window on screen, "
+      "rather than blanking a working display over one missed poll")
+check("if (token === view.request) loadFailed(error);" in _NF_REFRESH,
+      "refresh() routes a rejected fetch through it, behind the same stale "
+      "guard as the repaint below — an older generation's failure must not "
+      "paint over the newer one now in flight")
+check("throw error;" in _NF_REFRESH,
+      "...and RE-THROWS it: the connection status and the console report are "
+      "runRefresh's to make, and swallowing the error here would trade a "
+      "stuck pane for a silent failure")
+check("view.failed = false;" in _NF_REFRESH and "view.failed = false;" in _NF_LOADING,
+      "and the flag clears both ways — on the answer that supersedes it, and "
+      "on the next window change, which is a new question either way")
+
 
 print()
 # ---------------------------------------------------------------------------

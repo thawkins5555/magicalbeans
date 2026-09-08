@@ -47,6 +47,13 @@
   // The same word App.loading() puts in every other pane still waiting on a
   // fetch; here it also has to reach the chart, which is an SVG.
   const LOADING_TEXT = 'Loading…';
+  // A fetch that never answered is not an empty window, so NO_FLOWS_TEXT here
+  // would put words in a server's mouth: a 400 from a filter it refuses would
+  // read as "the window is quiet". What broke is the connection status's
+  // sentence to tell; all these three panes owe an operator is to stop saying
+  // "Loading…" for a load that has already stopped.
+  const FAILED_TEXT = 'Could not load flows for this window. The next refresh '
+    + 'will try again.';
 
   const view = {
     t0: Date.now() / 1000 - 3600,
@@ -60,7 +67,15 @@
     request: 0,
     abort: null,
     loading: false,
+    // Only ever set out of a blanked (loading) pane, so a failure never has
+    // to decide whether the data underneath it is still worth showing --
+    // showLoading has already taken that decision.
+    failed: false,
   };
+
+  // Which of the three sentences a pane with nothing to draw is telling.
+  const emptyMessage = () =>
+    (view.loading ? LOADING_TEXT : view.failed ? FAILED_TEXT : NO_FLOWS_TEXT);
 
   const escape = App.escapeHtml;
 
@@ -180,7 +195,32 @@
      blank the page it is refreshing. */
   function showLoading() {
     view.loading = true;
+    view.failed = false;
     App.el('nf-totals').textContent = LOADING_TEXT;
+    drawChart();
+    drawBars();
+    drawTable(view.records);
+  }
+
+  /* showLoading() puts "Loading…" in the three panes and only a refresh that
+     COMPLETED ever took it back out, so a fetch that rejected -- a 400 from a
+     filter the server refuses, an outage -- left the page reading "Loading…"
+     for as long as the operator stayed on it. The error still leaves here:
+     the connection status and the console report are runRefresh's job, and
+     swallowing it would trade a stuck pane for a silent failure.
+
+     A superseded abort is not a failure. The newer fetch it was abandoned
+     for is still loading, and its answer is the one to show.
+
+     Only the loading claim is retracted, never data. A poll tick that failed
+     under a window already on screen leaves that window alone: it is still
+     the answer to the question being asked, and blanking a working display
+     over one missed poll is worse than the bug this fixes. */
+  function loadFailed(error) {
+    if ((error && error.superseded) || !view.loading) return;
+    view.loading = false;
+    view.failed = true;
+    App.el('nf-totals').textContent = FAILED_TEXT;
     drawChart();
     drawBars();
     drawTable(view.records);
@@ -269,7 +309,7 @@
     // down and rebuilding one hit rectangle with three listeners per
     // bucket each time, whether or not anything was different.
     const signature = `${width}x${height}:`
-      + (view.loading ? LOADING_TEXT : JSON.stringify(view.data));
+      + (view.loading || view.failed ? emptyMessage() : JSON.stringify(view.data));
     if (svg.dataset.signature === signature) return;
     svg.dataset.signature = signature;
     svg.innerHTML = '';
@@ -282,8 +322,9 @@
       h: Math.max(height - PAD.top - PAD.bottom - legendH, 10),
     };
 
-    if (view.loading || !data || !data.times.length || !data.series.length) {
-      App.emptyText(svg, width, height, view.loading ? LOADING_TEXT : NO_FLOWS_TEXT);
+    if (view.loading || view.failed || !data || !data.times.length
+        || !data.series.length) {
+      App.emptyText(svg, width, height, emptyMessage());
       showFocusTip(container);
       return;
     }
@@ -471,9 +512,9 @@
     const wrap = App.el('nf-bars');
     wrap.innerHTML = '';
     if (view.loading) { wrap.innerHTML = App.loading(); return; }
-    const rows = view.data ? view.data.top : [];
+    const rows = view.data && !view.failed ? view.data.top : [];
     if (!rows.length) {
-      wrap.innerHTML = `<p class="empty">${NO_FLOWS_TEXT}</p>`;
+      wrap.innerHTML = `<p class="empty">${emptyMessage()}</p>`;
       return;
     }
     const dimension = App.el('nf-dimension').value;
@@ -632,13 +673,13 @@
   function drawTable(records) {
     // While loading these records belong to the window being left, so they
     // are neither shown nor remembered as the answer to the one being asked.
-    if (!view.loading) view.records = records;
+    if (!view.loading && !view.failed) view.records = records;
     const columns = recordColumns();
     const table = App.grid(App.el('nf-table'),
                            { name: 'nf-records', caption: 'NetFlow records',
                              columns, sort, onSort });
     const body = document.createElement('tbody');
-    const rows = view.loading
+    const rows = view.loading || view.failed
       ? [] : App.sortRows(records, sort.key, sort.descending, columns);
     App.drawRows(body, rows, columns, (tr, record) => {
       const dst = record.dst_name || record.dst_ip || '';
@@ -697,7 +738,7 @@
         App.tooltip(text, { clientX: box.left + box.width / 2, clientY: box.bottom });
       });
       tr.addEventListener('blur', App.hideTooltip);
-    }, view.loading ? LOADING_TEXT : NO_FLOWS_TEXT);
+    }, emptyMessage());
     table.appendChild(body);
     App.wireRowKeyboard(body);
   }
@@ -918,18 +959,28 @@
     const options = { signal: abort.signal };
     // Independent questions, so asked together: in series every window
     // change cost the sum of the two round trips, in parallel the slower.
-    const [data, records] = await Promise.all([
-      App.get('/api/netflow/overview', {
-        t0: view.t0, t1: view.t1, dimension: f.dimension, src: f.src, dst: f.dst,
-        port: f.port, protocol: f.protocol, exporter: f.exporter,
-      }, options),
-      App.get('/api/netflow/records', {
-        t0: view.t0, t1: view.t1, src: f.src, dst: f.dst, port: f.port,
-        protocol: f.protocol, exporter: f.exporter, order: App.el('nf-order').value,
-      }, options),
-    ]);
+    let data;
+    let records;
+    try {
+      [data, records] = await Promise.all([
+        App.get('/api/netflow/overview', {
+          t0: view.t0, t1: view.t1, dimension: f.dimension, src: f.src, dst: f.dst,
+          port: f.port, protocol: f.protocol, exporter: f.exporter,
+        }, options),
+        App.get('/api/netflow/records', {
+          t0: view.t0, t1: view.t1, src: f.src, dst: f.dst, port: f.port,
+          protocol: f.protocol, exporter: f.exporter, order: App.el('nf-order').value,
+        }, options),
+      ]);
+    } catch (error) {
+      // Same stale guard as the token check below: an older generation's
+      // failure must not repaint over the newer one now in flight.
+      if (token === view.request) loadFailed(error);
+      throw error;
+    }
     if (token !== view.request) return;
     view.loading = false;
+    view.failed = false;
     view.data = data;
 
     const totals = view.data.totals;
