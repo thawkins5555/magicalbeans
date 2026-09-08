@@ -22,10 +22,18 @@ missing. Filtered queries are never rollup-served and are exact throughout.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 
-from .sqlitebase import SqliteStore
+from .sqlitebase import (  # re-exported: tests adjust netpath.flowdb.TRIM_CHUNK
+    TRIM_BUDGET_S, TRIM_CHUNK, TRIM_CHUNK_MAX, TRIM_CHUNK_MIN, SqliteStore)
+
+log = logging.getLogger(__name__)
+
+# prune()'s reclaim pass gets its own time rather than sharing the delete
+# deadline, the same split netpath.db.prune makes.
+PRUNE_RECLAIM_BUDGET_S = 5.0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS flows (
@@ -230,8 +238,23 @@ class FlowDatabase(SqliteStore):
     DEFAULTS = DEFAULTS
     LABEL = "flows.db"
     TRIM_TABLE = "flows"
-    OLDEST_TS_SQL = "SELECT ts_start FROM flows ORDER BY id LIMIT 1"
+    # The rollups reach further back than the raw rows they were built from,
+    # so asking flows alone under-reports how much history this store holds.
+    OLDEST_TS_SQL = ("SELECT MIN(ts) FROM ("
+                     "SELECT MIN(ts_start) AS ts FROM flows"
+                     " UNION ALL SELECT MIN(bucket) FROM flow_rollup"
+                     " UNION ALL SELECT MIN(bucket) FROM flow_rollup_span)")
     TRIM_FLOOR = 1000
+    # How far the rollups may be trimmed before the wide charts they are the
+    # only source for have nothing left to draw.
+    TRIM_ROLLUP_FLOOR = 5_000
+
+    def __init__(self, path: str):
+        # Set by prune(): whether its last call finished the whole sweep
+        # inside budget, so a caller can tell a partial sweep from a
+        # complete one.
+        self.last_prune_incomplete = False
+        super().__init__(path)
 
     def _migrate(self) -> None:
         # Existing rows keep the sampling factor baked into them at decode time.
@@ -517,19 +540,148 @@ class FlowDatabase(SqliteStore):
 
     # ------------------------------------------------------------- maintenance
 
-    def prune(self, retention_days: float, max_flows: int) -> int:
-        removed = 0
-        cutoff = time.time() - retention_days * 86400
+    def _delete_rollup(self, tier: int, low: int, upper: int) -> int:
+        """Both rollup tables for buckets in [low, upper). Lock held, no
+        commit: _delete_batches owns each."""
+        cursor = self._conn.execute(
+            "DELETE FROM flow_rollup WHERE tier = ? AND bucket >= ?"
+            " AND bucket < ?", (tier, low, upper))
+        removed = cursor.rowcount or 0
+        cursor = self._conn.execute(
+            "DELETE FROM flow_rollup_span WHERE tier = ? AND bucket >= ?"
+            " AND bucket < ?", (tier, low, upper))
+        return removed + (cursor.rowcount or 0)
+
+    def _prune_rollup(self, tier: int, days: float, deadline: float) -> int:
+        """Age out one tier, walking bucket timestamps the way the raw
+        stages walk ids: _delete_batches only needs a monotonic coordinate,
+        and it sizes its own batches from how long each one held the lock."""
+        cutoff = _align_down(time.time() - days * 86400, tier)
         with self._lock:
-            cur = self._conn.execute("DELETE FROM flows WHERE ts_end < ?", (cutoff,))
-            removed += cur.rowcount or 0
-            total = self._conn.execute("SELECT COUNT(*) AS n FROM flows").fetchone()["n"]
-            if max_flows and total > max_flows:
-                cur = self._conn.execute(
-                    "DELETE FROM flows WHERE id IN (SELECT id FROM flows"
-                    " ORDER BY ts_end ASC LIMIT ?)", (total - max_flows,))
-                removed += cur.rowcount or 0
-            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT MIN(bucket) AS lo FROM flow_rollup_span WHERE tier = ?"
+                " AND bucket < ?", (tier, cutoff)).fetchone()
+        oldest = row["lo"] if row else None
+        if oldest is None:
+            return 0
+        removed, reached = self._delete_batches(
+            int(oldest), cutoff, deadline,
+            delete=lambda lo, up: self._delete_rollup(tier, lo, up),
+            chunk=3600, chunk_min=60, chunk_max=7 * 86400)
+        # Routing must stop trusting history that is no longer there, even
+        # where the sweep only reached part of it.
+        floor, _watermark = self.rollup_bounds(tier)
+        if floor is not None and reached > floor:
+            self._set_private_setting(_FLOOR % tier, reached)
+        return removed
+
+    def prune(self, retention_days: float, max_flows: int, *,
+              minute_days: float | None = None, rollup_days: float | None = None,
+              budget_s: float = TRIM_BUDGET_S) -> int:
+        """Age out raw flows, cap their row count, and age out the rollups.
+
+        Batched in adaptive, lock-bounded chunks rather than one DELETE per
+        stage: the write lock is the one the collector's writer needs, and
+        NetFlow is UDP, so a writer stalled behind a month-wide delete is
+        lost data. The id range only chunks the sweep -- each batch still
+        filters on ts_end, so an exporter with a wrong clock cannot make
+        prune() drop the wrong rows.
+
+        `retention_days` and `max_flows` bound the raw table alone. Passing
+        0 for each of the four (the Settings page's maintenance button)
+        matches every existing row.
+        """
+        now = time.time()
+        cutoff = now - retention_days * 86400
+        deadline = time.monotonic() + budget_s
+        removed = 0
+        incomplete = False
+
+        with self._lock:
+            bounds = self._conn.execute(
+                "SELECT MIN(id) AS lo, MAX(id) AS hi FROM flows"
+                " WHERE ts_end < ?", (cutoff,)).fetchone()
+        low, high = bounds["lo"], bounds["hi"]
+        if low is not None:
+            def by_age(lo: int, up: int) -> int:
+                cursor = self._conn.execute(
+                    "DELETE FROM flows WHERE id >= ? AND id < ? AND ts_end < ?",
+                    (lo, up, cutoff))
+                return cursor.rowcount or 0
+
+            aged, reached = self._delete_batches(
+                low, high + 1, deadline, by_age, chunk=TRIM_CHUNK,
+                chunk_min=TRIM_CHUNK_MIN, chunk_max=TRIM_CHUNK_MAX)
+            removed += aged
+            incomplete = incomplete or reached < high + 1
+
+        if max_flows:
+            # Two index probes rather than the COUNT(*) full scan this used
+            # to pay on every maintenance pass: ids are handed out in arrival
+            # order, so the span is both the right definition of "oldest" and
+            # a good enough proxy for the row count.
+            with self._lock:
+                bounds = self._conn.execute(
+                    "SELECT MIN(id) AS lo, MAX(id) AS hi FROM flows").fetchone()
+            low, high = bounds["lo"], bounds["hi"]
+            over = 0 if low is None else (high - low + 1) - max_flows
+            if over > 0:
+                capped, reached = self._delete_batches(
+                    low, low + over, deadline, chunk=TRIM_CHUNK,
+                    chunk_min=TRIM_CHUNK_MIN, chunk_max=TRIM_CHUNK_MAX)
+                removed += capped
+                incomplete = incomplete or reached < low + over
+
+        for tier, days in ((60, minute_days), (3600, rollup_days)):
+            if days is None:
+                setting = ROLLUP_DAYS_SETTING[tier]
+                days = float(self.settings().get(setting, DEFAULTS[setting]))
+            removed += self._prune_rollup(tier, float(days), deadline)
+
+        self.last_prune_incomplete = incomplete
+        if incomplete:
+            log.warning("netpath.flowdb: prune of flows older than %.1f days did "
+                        "not finish within its budget; continuing at the next "
+                        "maintenance pass", retention_days)
+        if removed:
+            self._reclaim_until(time.monotonic() + PRUNE_RECLAIM_BUDGET_S)
+        return removed
+
+    def trim_to_size(self, max_bytes: int, budget_s: float | None = None) -> int:
+        """Delete the oldest flow history until the store fits under the cap:
+        raw flows first, then the rollups.
+
+        Without stage two the base implementation would delete raw down to
+        TRIM_FLOOR and then warn about the cap forever while the rollups held
+        the space. Stage two deletes by oldest bucket, so it never touches
+        the recent ones compact_rollup's redo window rewrites.
+        """
+        removed = super().trim_to_size(max_bytes, budget_s)
+        if max_bytes <= 0 or self._trim_size() <= max_bytes:
+            return removed
+        deadline = time.monotonic() + (TRIM_BUDGET_S if budget_s is None else budget_s)
+        for tier in ROLLUP_TIERS:
+            if self._trim_size() <= max_bytes or time.monotonic() >= deadline:
+                break
+            with self._lock:
+                bounds = self._conn.execute(
+                    "SELECT MIN(bucket) AS lo, MAX(bucket) AS hi,"
+                    " COUNT(*) AS n FROM flow_rollup_span WHERE tier = ?",
+                    (tier,)).fetchone()
+            if bounds["lo"] is None or bounds["n"] <= self.TRIM_ROLLUP_FLOOR:
+                continue
+            size = self._trim_size()
+            span = bounds["hi"] - bounds["lo"] + tier
+            want = max(tier, int(span * (1.0 - max_bytes / float(size)) * 1.1))
+            batch_removed, reached = self._delete_batches(
+                int(bounds["lo"]), int(bounds["lo"]) + want, deadline,
+                delete=lambda lo, up, t=tier: self._delete_rollup(t, lo, up),
+                chunk=3600, chunk_min=60, chunk_max=7 * 86400)
+            removed += batch_removed
+            floor, _watermark = self.rollup_bounds(tier)
+            if floor is not None and reached > floor:
+                self._set_private_setting(_FLOOR % tier, reached)
+            self._reclaim_until(deadline)
         return removed
 
     def recent_endpoints(self, limit: int = 300, since_s: float = 3600) -> list[str]:
