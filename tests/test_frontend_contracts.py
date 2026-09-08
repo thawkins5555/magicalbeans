@@ -1348,6 +1348,18 @@ check("scan_bounded" in _NETFLOW,
       "it ordered every record in the window")
 
 
+# 44. NetFlow (5.3.0): switching windows was slow in the browser, not on the
+#     server — the two queries ran one after the other for no reason.
+_NF_REFRESH = _NETFLOW[_NETFLOW.index("  async function refresh() {"):
+                       _NETFLOW.index("  function init() {")]
+check("Promise.all" in _NF_REFRESH and "await App.get(" not in _NF_REFRESH,
+      "the overview and the record list are asked for together: they are "
+      "independent, and in series every window change cost the sum of both "
+      "round trips rather than the slower of them")
+check("if (token !== view.request) return;" in _NF_REFRESH,
+      "...with the repaint guard still checked after both")
+
+
 print()
 if failures:
     print("FAILED %d contract(s):" % len(failures))

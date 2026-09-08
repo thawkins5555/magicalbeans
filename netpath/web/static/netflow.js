@@ -844,14 +844,18 @@
     // A wide window answers slower than the narrow one that replaced it, so
     // without this guard a stale response repaints over the newer view.
     const token = (view.request += 1);
-    const data = await App.get('/api/netflow/overview', {
-      t0: view.t0, t1: view.t1, dimension: f.dimension, src: f.src, dst: f.dst,
-      port: f.port, protocol: f.protocol, exporter: f.exporter,
-    });
-    const records = await App.get('/api/netflow/records', {
-      t0: view.t0, t1: view.t1, src: f.src, dst: f.dst, port: f.port,
-      protocol: f.protocol, exporter: f.exporter, order: App.el('nf-order').value,
-    });
+    // Independent questions, so asked together: in series every window
+    // change cost the sum of the two round trips, in parallel the slower.
+    const [data, records] = await Promise.all([
+      App.get('/api/netflow/overview', {
+        t0: view.t0, t1: view.t1, dimension: f.dimension, src: f.src, dst: f.dst,
+        port: f.port, protocol: f.protocol, exporter: f.exporter,
+      }),
+      App.get('/api/netflow/records', {
+        t0: view.t0, t1: view.t1, src: f.src, dst: f.dst, port: f.port,
+        protocol: f.protocol, exporter: f.exporter, order: App.el('nf-order').value,
+      }),
+    ]);
     if (token !== view.request) return;
     view.data = data;
 
