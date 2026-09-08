@@ -558,7 +558,6 @@
       <fieldset><legend>SERVER</legend>
         <label>Hostname or address <input id="dh-address" placeholder="dhcp01.corp.local" value="${escape(s.address ?? '')}"></label>
         <label>Label <input id="dh-label" value="${escape(s.label ?? '')}"></label>
-        <p class="hint">Read-only: scopes and leases only, never a write.</p>
       </fieldset>
       <fieldset><legend>AUTHENTICATION</legend>
         <label>Username <input id="dh-username" placeholder="CORP\\svc-sappiwhere-ro" value="${escape(s.username ?? '')}"></label>

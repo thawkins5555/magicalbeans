@@ -82,8 +82,6 @@
 <section id="page-dashboard" class="page">
   <div class="dash-scroll pad-x pad-b pad-t">
     <h2>Dashboard</h2>
-    <p class="hint">Everything below is drawn from what your account can
-      read. Every count links through to the tab that can act on it.</p>
     <div id="dash-grid" class="dash-grid"></div>
   </div>
 </section>
@@ -796,9 +794,6 @@
       <button id="ipam-edit-dhcp" data-requires-write="ipam">Edit</button>
       <button id="ipam-add-dhcp" class="primary" data-requires-write="ipam">Add</button>
     </div>
-    <p class="hint pad-x">Read-only: scopes and leases only, never a write. Authenticates as
-      whichever Windows account runs SappiWhere, or a matching Windows Credential Manager entry
-      for that server's name — nothing is stored here.</p>
    <div class="cols" data-splitter="ipam-dhcp">
     <aside class="sidebar pane" data-grow="1">
       <div class="bar">
