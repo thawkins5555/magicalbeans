@@ -1073,9 +1073,6 @@ class Service:
                       budget_s=prune_budget)
         self._trim_db("max_trace_db_mb", self.db, "Trace database",
                       "oldest traces", budget_s=prune_budget)
-        self._trim_db("max_flow_db_mb", self.flow_db, "Flow database",
-                      "oldest flow records")
-
         # Before the prune, not after: compaction summarises sealed buckets
         # of raw flows, and pruning first would delete a bucket before it had
         # been summarised. A chart wider than a quarter of an hour reads the
@@ -1093,6 +1090,14 @@ class Service:
             int(self.flow_settings.get("max_flows", 5_000_000)),
             minute_days=float(self.flow_settings.get("rollup_minute_days", 2)),
             rollup_days=float(self.flow_settings.get("rollup_retention_days", 90)))
+        # Last of the flow stages, for the reason compaction runs before the
+        # prune: the size cap deletes the same oldest raw rows the backfill
+        # is still summarising, and running it first meant a store already at
+        # its cap gave them up on every sweep while the backfill advanced one
+        # bucket. The promise that a 30-day chart outlives a fortnight of raw
+        # retention only holds if the rows are summarised before they go.
+        self._trim_db("max_flow_db_mb", self.flow_db, "Flow database",
+                      "oldest flow records")
 
         self.syslog_db.prune(
             float(self.syslog_settings.get("retention_days", 30)),
