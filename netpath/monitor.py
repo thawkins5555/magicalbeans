@@ -88,7 +88,8 @@ class Monitor(Worker):
         self.log.add(SYSTEM, f"Scheduler started with {self.workers} worker threads")
 
     def stop(self, wait: bool = False) -> None:
-        if self.running:
+        # Not when already asked: Service.shutdown() signals twice.
+        if self.running and not self._stop.is_set():
             self.log.add(SYSTEM, "Scheduler stopped")
         self._stop.set()
         if wait:
@@ -113,7 +114,7 @@ class Monitor(Worker):
         # least as long as whichever in-flight target is slowest, not a
         # fixed guess. _run_one's own guard below is the backstop for
         # anything that still overruns this.
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self.begin_stop()
         self.drain(max(drain_s, self._inflight_budget_s()))
 
     def begin_stop(self) -> None:
@@ -468,9 +469,8 @@ class Resolver(Worker):
         # matters, and gethostbyaddr can block past any timeout we set.
         self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def begin_stop(self) -> None:
-        self.stop()
-        self._executor.shutdown(wait=False, cancel_futures=True)
+    # shutdown() is already non-blocking here, so it is begin_stop as it stands.
+    begin_stop = shutdown
 
     # finish_stop is Worker's: the loop thread only, for the reason shutdown()
     # gives above — an in-flight lookup is never worth waiting for.
@@ -597,9 +597,8 @@ class AsnResolver(Worker):
         self.stop()
         self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def begin_stop(self) -> None:
-        self.stop()
-        self._executor.shutdown(wait=False, cancel_futures=True)
+    # shutdown() is already non-blocking here, so it is begin_stop as it stands.
+    begin_stop = shutdown
 
     def inflight(self) -> set[str]:
         with self._lock:
@@ -742,9 +741,8 @@ class HopProber(Worker):
         self.stop()
         self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def begin_stop(self) -> None:
-        self.stop()
-        self._executor.shutdown(wait=False, cancel_futures=True)
+    # shutdown() is already non-blocking here, so it is begin_stop as it stands.
+    begin_stop = shutdown
 
     def _loop(self) -> None:
         while not self._stop.is_set():

@@ -375,6 +375,12 @@ def _run_before_restart() -> None:
 # databases. Cleared by start_job so a job that ends up_to_date (which never
 # quiesces) leaves nothing armed behind it.
 _restart_scheduled = False
+# The thread schedule_restart() started, so wait_for_job() can wait for it:
+# the job thread ending is NOT the update being over — the restart thread
+# still has its delay to sleep through before it spawns the replacement,
+# and a process that os._exit()s inside that window installs the update
+# and leaves nothing running.
+_restart_thread = None
 
 
 def schedule_restart(delay: float = 1.5) -> None:
@@ -388,7 +394,7 @@ def schedule_restart(delay: float = 1.5) -> None:
     sleeps, killing a daemon thread with no line in the log — in 146
     recorded attempts, before its first statement.
     """
-    global _restart_scheduled
+    global _restart_scheduled, _restart_thread
     if _restart_scheduled:
         _log_restart("a restart is already scheduled; not scheduling a second")
         return
@@ -402,8 +408,9 @@ def schedule_restart(delay: float = 1.5) -> None:
             _restart_windows() if os.name == "nt" else _restart_posix()
         except BaseException:
             _log_restart("restart thread failed:\n" + traceback.format_exc())
-    threading.Thread(target=_go, name="sappiwhere-update-restart",
-                     daemon=False).start()
+    _restart_thread = threading.Thread(target=_go, name="sappiwhere-update-restart",
+                                       daemon=False)
+    _restart_thread.start()
 
 
 def updates_enabled(app_db) -> bool:
@@ -613,7 +620,7 @@ def start_job(app_db, before_quiesce=None, on_result=None) -> dict:
     for the package directory, so it's refused with `already_running`
     rather than queued. Not a daemon thread — the update outlives the
     request, and its restart is what brings the service back."""
-    global _job_thread, _restart_scheduled
+    global _job_thread, _restart_scheduled, _restart_thread
 
     with _job_lock:
         if _job_thread is not None and _job_thread.is_alive():
@@ -623,6 +630,7 @@ def start_job(app_db, before_quiesce=None, on_result=None) -> dict:
         _job.update(state="running", step="checking", message="", error="",
                     commit="", started_ts=time.time(), finished_ts=0.0)
         _restart_scheduled = False
+        _restart_thread = None
         thread = threading.Thread(
             target=_run_job, args=(app_db, before_quiesce, on_result),
             name="sappiwhere-update", daemon=False)
@@ -666,10 +674,19 @@ def _run_job(app_db, before_quiesce, on_result) -> None:
 
 
 def wait_for_job(timeout: float = 10.0) -> bool:
-    """Whether the job thread finished within `timeout`. For tests, and for
-    a shutdown that would otherwise close app.db under a running install."""
-    thread = _job_thread
-    if thread is None:
-        return True
-    thread.join(timeout)
-    return not thread.is_alive()
+    """Whether the update — the job thread AND any restart it scheduled —
+    finished within `timeout`. For tests, and for a shutdown that would
+    otherwise close app.db under a running install or, worse, exit the
+    process while the restart thread is still sleeping out its delay.
+
+    A caller that joins a live restart thread never sees it end on Windows
+    or POSIX: that thread ends in os._exit or execv, which is the right
+    outcome for a process that was about to exit anyway.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    for thread in (_job_thread, _restart_thread):
+        if thread is not None and thread.is_alive():
+            thread.join(max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                return False
+    return True

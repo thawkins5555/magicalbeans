@@ -481,6 +481,11 @@ check("6. main() ends the process the same way once its caller has closed "
      "every store, so a service manager's stop is not held open by a poll "
      "still in flight",
      "os._exit(code)" in MAIN_SRC.split("def main(")[1])
+# ...but never underneath a self-update's restart thread, which is not a
+# daemon precisely so that the old return-into-interpreter-shutdown path
+# waited for it. os._exit does not, so main() has to wait on it explicitly.
+check("6. ...and waits for a scheduled update restart before doing so",
+     "wait_for_job(" in MAIN_SRC.split("def main(")[1].split("os._exit(code)")[0])
 
 try:
     from netpath.console import run_teardown

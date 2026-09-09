@@ -227,8 +227,11 @@ class AlertEngine(Worker):
 
     def finish_stop(self, deadline: float) -> None:
         self._join(timeout=max(0.0, deadline - time.monotonic()))
-        self._mail.stop()
-        self._webhook.stop()
+        # finish_stop, not stop(): each stop() joins 2s unconditionally, and
+        # a sender inside a slow SMTP or webhook call would overrun the
+        # shared deadline by up to 4s between them.
+        self._mail.finish_stop(deadline)
+        self._webhook.finish_stop(deadline)
 
     def shutdown(self) -> None:
         self.stop()

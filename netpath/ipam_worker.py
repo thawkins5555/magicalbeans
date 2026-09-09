@@ -102,7 +102,7 @@ class IpamWorker(Worker):
         self.log.add(SYSTEM, "IPAM worker started")
 
     def stop(self) -> None:
-        if self.running:
+        if self.running and not self._stop.is_set():   # shutdown signals twice
             self.log.add(SYSTEM, "IPAM worker stopped")
         self._stop.set()
         with self._lock:

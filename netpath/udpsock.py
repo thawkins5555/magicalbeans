@@ -331,7 +331,8 @@ class UdpReceiver:
         turn. Closing the sockets here is what actually wakes the receive
         threads: they are parked in recv(), not watching the flag.
         """
-        if self.STOP_LOG and self.LOG_CATEGORY and self.running:
+        if (self.STOP_LOG and self.LOG_CATEGORY and self.running
+                and not self._stop.is_set()):        # shutdown signals twice
             self.log.add(self.LOG_CATEGORY, f"{self.NOUN} stopped")
         self._stop.set()
         for sock in (self._udp, self._tcp):

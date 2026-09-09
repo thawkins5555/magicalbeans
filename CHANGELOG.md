@@ -241,6 +241,13 @@ cannot be put back after a failed swap, the UI says so as well: `app.db` is
 then naming a version that is not installed, and until now only
 `update_restart.log` knew.
 
+**And the exit waits for a restart it has scheduled.** The restart runs on a
+thread of its own that sleeps a moment before spawning the replacement, and
+the job thread ending is not the update being over. Both the console's exit
+and `main()`'s now wait on that thread too — it ends in `os._exit`/`execv`
+itself, which is the right ending — rather than exiting inside its window
+with the update installed and nothing running.
+
 **Smaller things in the same area.** `update_restart.log` is rotated at 512 KB
 instead of growing forever inside the install directory. `selfupdate.wait_for_job`
 existed and was documented as being "for a shutdown that would otherwise close

@@ -313,6 +313,15 @@ def main(argv=None) -> int:
     # return, so there is nothing left to flush but the streams. It is at
     # this layer rather than inside run_headless/run_console so both stay
     # drivable from a test.
+    #
+    # Except underneath a self-update: its restart thread is deliberately
+    # not a daemon and sleeps a moment before spawning the replacement, and
+    # exiting inside that window would install the update and leave nothing
+    # running. That thread ends in os._exit/execv itself, so waiting on it
+    # is waiting for the right exit.
+    from . import selfupdate
+    if not selfupdate.wait_for_job(300.0):
+        selfupdate._log_restart("main() exiting with an update still in flight")
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(code)

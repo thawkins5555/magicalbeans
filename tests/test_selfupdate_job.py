@@ -384,6 +384,21 @@ try:
     state["gate"] = None
     db9.close()
 
+    # The job thread ending is not the update being over: schedule_restart()
+    # hands the restart to a thread of its own that sleeps out its delay
+    # first. A caller that took "job finished" as "safe to exit" would
+    # os._exit inside that window — update installed, nothing running.
+    _pending = threading.Event()
+    _restart_stub = threading.Thread(target=_pending.wait, daemon=True)
+    _restart_stub.start()
+    selfupdate._restart_thread = _restart_stub
+    check("9. …and False while a scheduled restart has not yet run, even "
+          "with the job thread gone", not selfupdate.wait_for_job(0.2))
+    _pending.set()
+    check("9. …then True once the restart thread ends",
+          selfupdate.wait_for_job(5.0))
+    selfupdate._restart_thread = None
+
     # =================================================================
     # 10. The restart log cannot grow without bound
     # =================================================================
