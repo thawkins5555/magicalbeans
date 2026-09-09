@@ -14,9 +14,16 @@
     deviceGroups: [],       // organizational folders, unrelated to polling profiles
     selected: null,        // selected device id
     detail: null,           // full device detail payload
-    // Still fetched: the per-port dialog's own bandwidth chart looks up
-    // its metric ids here. The device pane itself no longer charts them —
-    // bandwidth is a per-port question, asked by clicking a port.
+    // Which of the five nested sub-panes is on screen, and the device the
+    // four fetched ones below hold data for. Only the pane on screen is
+    // fetched per tick, so the other four go stale on purpose — see
+    // DETAIL_SUBS and loadDetail.
+    detailSub: 'interfaces',
+    detailSubFor: null,
+    // Read only by the Bridge & RF sub-pane: the STP topology-change count,
+    // the PSE watts and every RF series it charts. The per-port dialog's
+    // own bandwidth chart looks its metric ids up in a fetch of its own,
+    // for the device that dialog is about rather than the selected one.
     metrics: [],
     timeline: null,
     // The status timeline's window, set by the range dropdown above it.
@@ -28,7 +35,7 @@
     ifaceSort: App.recallSort('nodes-ifaces', { key: 'if_index', descending: false }),
     events: null,
     // LLDP/CDP neighbours for the selected device's own ports (Tier 1 #5's
-    // UI half), fetched alongside the rest of loadDetail.
+    // UI half), fetched by loadDetail while the Neighbours sub-pane is up.
     neighbors: [],
     // A tunnel outlives the page that opened it, so this is drawn from what
     // the server says is up, not from what this page did.
@@ -667,11 +674,33 @@
       await loadDetail().catch(() => { /* a link to a deleted device */ });
     }
     if (parts[2] === 'port' && parts[3] !== undefined) {
-      const ifIndex = Number(parts[3]);
-      const row = (view.ifaces || []).find((r) => r.if_index === ifIndex);
-      if (row) interfaceDialog(row, deviceId);
+      // openPort fetches the interface row by id rather than reading
+      // view.ifaces, which holds a list only while Interfaces is the
+      // sub-pane on screen (see loadDetail) — a link to a port lands on
+      // whichever sub-pane the operator left the page on.
+      await openPort(deviceId, Number(parts[3])).catch(() => {});
     }
   }
+
+  /* What each nested sub-pane of the detail needs fetched for it, keyed by
+     the button's own data-subtab. Addresses is absent because it draws from
+     the device row loadDetail fetches anyway. `path` is spelt out rather
+     than derived from the key: the Neighbours pane is labelled the way an
+     operator here writes it and its route the way the API does. */
+  const DETAIL_SUBS = {
+    interfaces: { path: 'interfaces',
+                  store: (r) => { view.ifaces = r.interfaces; view.ifaceNote = r.note || ''; },
+                  draw: () => drawIfaceTable() },
+    neighbours: { path: 'neighbors',
+                  store: (r) => { view.neighbors = r.neighbors; },
+                  draw: () => drawNeighborsTable() },
+    capabilities: { path: 'metrics',
+                    store: (r) => { view.metrics = r.metrics; },
+                    draw: () => drawCapabilitiesTab() },
+    events: { path: 'events',
+              store: (r) => { view.events = r; },
+              draw: () => drawEventTable() },
+  };
 
   async function loadDetail() {
     if (!view.selected) {
@@ -687,18 +716,34 @@
     if (App.canWrite('nodes')) {
       App.post(`/api/nodes/devices/${view.selected}/focus`, {}).catch(() => {});
     }
-    const [detail, metrics, ifaces, events, neighbors] = await Promise.all([
-      App.get(`/api/nodes/devices/${view.selected}`),
-      App.get(`/api/nodes/devices/${view.selected}/metrics`),
-      App.get(`/api/nodes/devices/${view.selected}/interfaces`),
-      App.get(`/api/nodes/devices/${view.selected}/events`),
-      App.get(`/api/nodes/devices/${view.selected}/neighbors`),
+    // Only the sub-pane on screen is fetched. The other four sit behind
+    // nested subtabs, and asking for all five every tick was four requests
+    // per tick answering for panes nobody was looking at. A subtab switch
+    // fills the pane it reveals itself (selectDetailSub below), so the cost
+    // of leaving one behind is a round trip on the switch and nothing on
+    // the tick.
+    const deviceId = view.selected;
+    const subName = view.detailSub;
+    const sub = DETAIL_SUBS[subName];
+    const [detail, subPayload] = await Promise.all([
+      App.get(`/api/nodes/devices/${deviceId}`),
+      sub ? App.get(`/api/nodes/devices/${deviceId}/${sub.path}`) : null,
     ]);
     view.detail = detail.device;
-    view.metrics = metrics.metrics;
-    view.ifaces = ifaces.interfaces;
-    view.events = events;
-    view.neighbors = neighbors.neighbors;
+    // A new selection leaves the four hidden panes holding the PREVIOUS
+    // device's rows, and a switch to one would show them under this
+    // device's name until its own fetch landed. Dropped here — before the
+    // draws below repaint every pane — so a revealed pane is empty rather
+    // than wrong.
+    if (view.detailSubFor !== deviceId) {
+      view.detailSubFor = deviceId;
+      view.ifaces = [];
+      view.ifaceNote = '';
+      view.metrics = [];
+      view.events = null;
+      view.neighbors = [];
+    }
+    if (sub) sub.store(subPayload);
     // Fetched on selection, not on every refresh tick — an extra round trip
     // per device pane is not worth polling twice a second for.
     if (webRelaysFor !== view.selected) {
@@ -714,6 +759,32 @@
     drawAddressesTable();
     drawCapabilitiesTab();
     drawEventTable();
+    // The operator can switch subtab while these fetches are in the air, in
+    // which case this tick fetched the pane they left and the wipe above
+    // may have blanked the one they are on. Fill it now rather than leave
+    // it empty until the next tick.
+    if (view.detailSub !== subName) loadDetailSub(view.detailSub).catch(() => {});
+  }
+
+  /* One sub-pane fetched and redrawn on its own, for the switch that has
+     just revealed it: loadDetail keeps only the visible pane current, so
+     without this a switch would show an empty pane until the next tick,
+     ten seconds away.
+
+     The ticket is the interface dialog's idiom. A switch can start a fetch
+     while a tick's is still in the air — and where both want the same URL,
+     app.js aborts the older of the two — so the answer is only painted if
+     it is still the answer to the question on screen. */
+  async function loadDetailSub(name) {
+    const sub = DETAIL_SUBS[name];
+    const deviceId = view.selected;
+    if (!sub || !deviceId) return;
+    const ticket = (view.detailSubGen = (view.detailSubGen || 0) + 1);
+    const payload = await App.get(`/api/nodes/devices/${deviceId}/${sub.path}`);
+    if (ticket !== view.detailSubGen || view.selected !== deviceId
+        || view.detailSub !== name || view.detailSubFor !== deviceId) return;
+    sub.store(payload);
+    sub.draw();
   }
 
   function drawDetailHeader() {
@@ -2082,8 +2153,11 @@
     ].join('')}</dl>`;
   }
 
+  /* `payload` is always this dialog's own /events fetch, never the pane's
+     view.events: the pane holds an event payload only while Events is the
+     sub-pane on screen, and this dialog is opened from Interfaces. */
   function ifaceEventsHtml(ifIndex, payload) {
-    const events = (((payload || view.events || {}).interface_events) || [])
+    const events = (((payload || {}).interface_events) || [])
       .filter((e) => e.if_index === ifIndex).sort((a, b) => b.ts - a.ts).slice(0, 20);
     if (!events.length) return App.emptyState('No events recorded for this port.');
     return `<div class="table-wrap scrollbox small"><table><caption class="sr-only">Recent events on this port</caption>` +
@@ -2450,7 +2524,7 @@
       <p class="section">STATISTICS &amp; ERRORS</p>
       <div id="ifd-stats">${ifaceStatsHtml(iface)}</div>
       <p class="section">EVENTS</p>
-      <div id="ifd-events">${ifaceEventsHtml(ifIndex)}</div>
+      <div id="ifd-events"><p class="hint">Reading events…</p></div>
       <p class="section">RUNNING CONFIGURATION</p>
       <p class="hint">Stored configurations live in
         <button type="button" class="linkish inline" id="ifd-configrx">ConfigRX</button>,
@@ -6113,7 +6187,13 @@
   }
 
   function selectDetailSub(name) {
+    view.detailSub = name;
     App.selectSub('nodes', name, { host: 'nd-d-subs', prefix: 'nd-d-sub-' });
+    // The pane this has just revealed holds nothing of its own — loadDetail
+    // fetches only the sub-pane that was on screen — so it asks for its own
+    // data here. A rejection is either a fetch app.js superseded with a
+    // newer one for the same URL, or no selected device yet at page load.
+    loadDetailSub(name).catch(() => {});
   }
 
   App.pages.nodes = { init, refresh, activate, fastTick: drawStatus };
