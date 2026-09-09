@@ -1028,6 +1028,19 @@ fields the header shows (sysDescr, sysName, sysObjectID, contact,
 location, vendor, SNMP version) is chosen in Nodes → Settings; the IP,
 status and any SNMP error always show.
 
+**A port's speed is sanity-checked against what Ethernet can actually be.**
+Speed is read from ifHighSpeed (megabits per second) in preference to
+ifSpeed, because ifSpeed cannot express anything above about 4.29 Gb/s at
+all. Some agents answer ifHighSpeed in kilobits instead — seen on a
+linecard or two rather than a whole device, which is why only a few ports
+were ever wrong — and a 10 Gb/s port then read as **10.0 Tbps**, with its
+utilisation correspondingly stuck near 0 %. A reading that would put the
+port above 1.6 Tb/s, or that disagrees with an unsaturated ifSpeed by
+orders of magnitude, is no longer taken at face value: the device's own
+exact ifSpeed wins where it can answer, and where it cannot the reading is
+interpreted in the units it was evidently given. A genuine 400G or 800G
+port is unaffected and reads at its real speed.
+
 **Poll now shows that it is running.** A poll is handed to a worker
 thread, so the button reports *Queued* or *Polling* until the device's own
 last-poll time actually moves, then settles to *Polled* — it used to look
@@ -2910,6 +2923,18 @@ like any other module.
   a managed device that doesn't answer Q-BRIDGE-MIB or CISCO-VTP-MIB
   contributes nothing there either, though the link itself still draws as
   long as a neighbour report exists.
+- **A cable both protocols report is one line, not two.** A Cisco switch
+  answers CDP and LLDP for the same neighbour on the same port, and the
+  two reports do not look alike — LLDP identifies the far end by chassis
+  MAC, CDP by device name — so the map used to draw one cable as two lines
+  on identical coordinates, each painting its own VLAN count and its own
+  port labels on top of the other's. The two reports now fold into one
+  link listing both protocols, one VLAN set and one port label at each
+  end, and the status bar's link count, the VLAN table's per-VLAN count
+  and the CSV export all count the cable once. The same fold covers a
+  chassis MAC that a device repeats across several of its own interfaces
+  (a stack's base MAC, an SVI beside its port-channel), which produced the
+  same doubled line by a different route.
 - **A link's tooltip names each end's own trunk/access mode, and calls out
   a native-VLAN mismatch by name.** Alongside every VLAN the link
   carries, hovering or clicking shows the mode each device itself reports

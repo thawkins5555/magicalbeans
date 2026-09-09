@@ -2477,7 +2477,17 @@ class NodesDatabase(SqliteStore):
         "SELECT n.*,"
         " COALESCE(byname.id, bymac.id) AS matched_device_id,"
         " COALESCE(byname.name, bymac.name) AS matched_device_name,"
-        " iface.if_index AS matched_if_index,"
+        # Exactly one if_index, always one belonging to the device COALESCE
+        # picked: byname wins whenever it fires, so the two joins can resolve
+        # to DIFFERENT devices, and pairing one device's id with another's
+        # port index is an endpoint that does not exist — mapper.link_identity
+        # keys on exactly that pair. Lowest if_index, so a MAC repeated across
+        # a stack resolves the same way on every read.
+        " (SELECT i3.if_index FROM interfaces i3"
+        "   WHERE n.chassis_id_subtype = 4 AND n.chassis_id != ''"
+        "     AND i3.phys_addr = n.chassis_id COLLATE NOCASE"
+        "     AND i3.device_id = COALESCE(byname.id, bymac.id)"
+        "   ORDER BY i3.if_index LIMIT 1) AS matched_if_index,"
         " byname.id AS matched_by_name_id,"
         " bymac.id AS matched_by_mac_id"
         " FROM neighbors n"
@@ -2489,9 +2499,18 @@ class NodesDatabase(SqliteStore):
         "   ON byname.enabled = 1 AND n.sys_name != ''"
         "   AND (byname.name = n.sys_name COLLATE NOCASE"
         "        OR byname.sys_name = n.sys_name COLLATE NOCASE)"
+        # At most ONE interface per neighbour row: `interfaces` is unique only
+        # on (device_id, if_index) and one chassis MAC routinely sits on
+        # several of them (a stack's base MAC per member, an SVI alongside its
+        # port-channel), so a plain join on phys_addr fanned one neighbour row
+        # out into several — one cable drawn as several links stacked on each
+        # other. This join now only names the MAC's device for `bymac`.
         " LEFT JOIN interfaces iface"
-        "   ON n.chassis_id_subtype = 4 AND n.chassis_id != ''"
-        "   AND iface.phys_addr = n.chassis_id COLLATE NOCASE"
+        "   ON iface.rowid = ("
+        "        SELECT i2.rowid FROM interfaces i2"
+        "         WHERE n.chassis_id_subtype = 4 AND n.chassis_id != ''"
+        "           AND i2.phys_addr = n.chassis_id COLLATE NOCASE"
+        "         ORDER BY i2.device_id, i2.if_index LIMIT 1)"
         " LEFT JOIN devices bymac ON bymac.id = iface.device_id AND bymac.enabled = 1")
 
     def neighbours_of(self, device_id: int) -> list[sqlite3.Row]:

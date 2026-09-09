@@ -400,6 +400,48 @@ def counter_rate(previous: int | None, previous_ts: float, current: int | None,
     return rate
 
 
+IF_SPEED_SENTINEL = 4_294_967_295
+# 1.6 TbE, the next rate the standard defines: a full doubling above 800GbE,
+# the fastest Ethernet port actually shipping, and still three orders below
+# what a kbit/s-for-Mbit/s ifHighSpeed makes of a 10G port.
+MAX_PLAUSIBLE_SPEED_BPS = 1.6e12
+
+
+def interface_speed_bps(speed, high_speed) -> float | None:
+    """One interface's line rate in bits/sec from ifSpeed (bit/s, Gauge32,
+    saturating at IF_SPEED_SENTINEL) and ifHighSpeed (Mbit/s), refusing an
+    ifHighSpeed that cannot be what the MIB says it is — the same shape of
+    refusal counter_rate makes when a derived rate outruns the link.
+
+    ifHighSpeed is preferred as it always was; it is the only one of the two
+    that can express a modern link. But agents exist (per-linecard, which is
+    why only a few ports on a device are wrong) that answer it in kbit/s, and
+    x 1e6 then reports a 10 Gb/s port as 10 Tb/s — the right digits, three
+    orders out, and a utilization consequently near 0%. So: a value above the
+    ceiling is not a link that exists, and a value 100x or more above a
+    NON-saturated ifSpeed is contradicted by the device itself, since an
+    unsaturated ifSpeed is exact. A rejected reading falls to ifSpeed where
+    ifSpeed can answer; it cannot above ~4.29 Gb/s, which is exactly where the
+    quirk shows, so there the reading is retried as kbit/s and kept only if
+    THAT lands inside the ceiling. A genuine 400G or 800G port passes every
+    check untouched and is never rescaled."""
+    high_bps = (float(high_speed) * 1_000_000
+                if isinstance(high_speed, (int, float)) and high_speed else None)
+    speed_bps = float(speed) if isinstance(speed, (int, float)) else None
+    if high_bps is None:
+        return speed_bps
+    contradicted = (speed_bps is not None and 0 < speed_bps < IF_SPEED_SENTINEL
+                    and high_bps >= speed_bps * 100)
+    if high_bps <= MAX_PLAUSIBLE_SPEED_BPS and not contradicted:
+        return high_bps
+    if speed_bps is not None and 0 < speed_bps < IF_SPEED_SENTINEL:
+        return speed_bps
+    rescaled = high_bps / 1000
+    if rescaled <= MAX_PLAUSIBLE_SPEED_BPS:
+        return rescaled
+    return speed_bps
+
+
 def detect_reboot(uptime_ticks: int, uptime_ts: float, previous_ticks: int | None,
                   previous_ts: float) -> tuple[bool, str]:
     """sysUpTime is a TimeTicks (hundredths of a second) since the agent's
@@ -3378,8 +3420,7 @@ class NodePoller(Worker):
             # denominator rather than treated as "unknown": in_util/out_util
             # are clamped to [0, 100], so a row stuck with it still reports a
             # bounded number instead of losing the metric.
-            speed_bps = (float(high_speed) * 1_000_000 if isinstance(high_speed, (int, float)) and high_speed
-                        else (float(speed) if isinstance(speed, (int, float)) else None))
+            speed_bps = interface_speed_bps(speed, high_speed)
             hc_in = _val(nodeoids.IFX_TABLE, "if_hc_in_octets")
             hc_out = _val(nodeoids.IFX_TABLE, "if_hc_out_octets")
             in_octets = hc_in if isinstance(hc_in, (int, float)) else _val(nodeoids.IF_TABLE, "if_in_octets")
@@ -6040,6 +6081,14 @@ if __name__ == "__main__":
     assert counter_rate(100, 5.0, 200, 5.0, 32) is None               # dt == 0
     assert counter_rate(None, 0.0, 200, 10.0, 32) is None             # first poll
     print("counter_rate OK")
+
+    assert interface_speed_bps(1_000_000_000, 1000) == 1e9             # ordinary 1G port
+    assert interface_speed_bps(IF_SPEED_SENTINEL, 400_000) == 4e11     # a real 400G port
+    assert interface_speed_bps(IF_SPEED_SENTINEL, 10_000_000) == 1e10  # kbit/s quirk, 10G port
+    assert interface_speed_bps(1_000_000_000, 1_000_000) == 1e9        # ifSpeed contradicts it
+    assert interface_speed_bps(IF_SPEED_SENTINEL, None) == float(IF_SPEED_SENTINEL)
+    assert interface_speed_bps(None, None) is None
+    print("interface_speed_bps OK")
 
     ok, note = detect_reboot(100, 1010.0, 500_000, 1000.0)
     assert ok, "a real restart must be detected"
