@@ -13,7 +13,6 @@ off (the default) and install by hand.
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import http.client
 import json
@@ -29,6 +28,8 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+
+from . import temppath
 
 OWNER = "thawkins5555"
 REPO = "magicalbeans"
@@ -254,6 +255,91 @@ def _safe_extract(tar: tarfile.TarFile, dest: str) -> None:
     except TypeError:
         # Python without the extraction filters (before 3.11.4).
         tar.extractall(dest, members=members)
+
+
+# The update is unpacked into a directory named with this prefix, inside
+# _APP_ROOT. The prefix is deliberately disjoint from both "netpath" (the
+# package) and "netpath.bak-" (a _swap_in backup): a staging directory can
+# never be mistaken for the package Python imports, and _swap_in's sweep of
+# "netpath.bak-*" and _sweep_staging_dirs() below can never reach into each
+# other's directories. `.gitignore` also excludes it, alongside "netpath.bak-".
+_STAGING_PREFIX = "netpath.staging-"
+
+
+def _sweep_staging_dirs() -> None:
+    """Remove staging directories left in _APP_ROOT by an earlier run.
+
+    apply() deletes its own staging directory in a `finally`, so one only
+    survives when the process was killed between creating it and that
+    `finally` — an operator ending the task from Task Manager mid-update, a
+    host that lost power. Clear those leftovers at the start of a new run,
+    exactly the way _swap_in sweeps stale "netpath.bak-*" backups. The two
+    prefixes are disjoint (see _STAGING_PREFIX), so neither sweep can ever
+    delete the other's work, and neither can touch the live package."""
+    for name in os.listdir(_APP_ROOT):
+        if name.startswith(_STAGING_PREFIX):
+            shutil.rmtree(os.path.join(_APP_ROOT, name), ignore_errors=True)
+
+
+def _make_staging_dir() -> str:
+    """A fresh, empty directory to download and unpack the update into,
+    removed by apply()'s `finally` exactly as the old `%TEMP%` one was.
+
+    Preferred location: _APP_ROOT, beside the install — NOT `%TEMP%`. Three
+    reasons, in the order they matter:
+
+      * _APP_ROOT must already be writable for any update to succeed at all —
+        _swap_in renames `netpath/` and moves the new tree into its place —
+        so staging here asks for no permission the update did not already
+        need;
+      * it makes _swap_in's `shutil.move(new_netpath, _NETPATH_DIR)` a
+        same-volume rename rather than a cross-volume copy. With the install
+        on one drive and `%TEMP%` on another (the common Windows case), that
+        copy runs while the service is fully quiesced — the listener down,
+        every worker stopped — which is the slowest possible moment to be
+        walking a source tree file by file;
+      * it does not depend on `%TEMP%` naming a directory that still exists,
+        which is the fault this routing exists for: a service that inherited
+        a per-session temp folder from a Remote Desktop session that has since
+        ended is pointed at a directory Windows has already deleted, and
+        `mkdtemp` there raises `FileNotFoundError` (WinError 3) before the
+        update can even begin.
+
+    Only if staging beside the install is impossible does it fall back to the
+    shared resolver in `temppath` (the same one the DHCP poller uses), and
+    then unpack under whatever writable temp directory that finds. A source
+    tree is a poor fit for a temp folder — hence it is the fallback, not the
+    default — but a working update from a temp folder beats no update at all.
+
+    Raises `RuntimeError` naming every location tried and why each failed when
+    nothing works; apply() turns that into a `failed` step rather than letting
+    it escape to _run_job and be reported as "stopped unexpectedly"."""
+    tried = []
+
+    # 1. Beside the install. mkdtemp both names the directory uniquely and
+    #    creates it, so a second run — or a leftover the sweep just missed —
+    #    can never collide with this one.
+    try:
+        _sweep_staging_dirs()
+        return tempfile.mkdtemp(prefix=_STAGING_PREFIX, dir=_APP_ROOT)
+    except OSError as exc:
+        tried.append(f"beside the install ({_APP_ROOT}): {exc}")
+
+    # 2. Wherever the shared resolver can find writable space. It re-creates a
+    #    vanished system temp folder and proves writability, and raises with
+    #    the per-session-temp explanation when it too comes up empty.
+    try:
+        base = temppath.writable_tempdir()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Could not create a working directory to stage the update. Tried "
+            + "; ".join(tried) + ". " + str(exc))
+    try:
+        return tempfile.mkdtemp(prefix="sappiwhere-update-", dir=base)
+    except OSError as exc:
+        raise RuntimeError(
+            "Could not create a working directory to stage the update. Tried "
+            + "; ".join(tried) + f"; and the shared temp folder {base}: {exc}")
 
 
 def _swap_in(new_netpath: str) -> None:
@@ -504,7 +590,17 @@ def apply(app_db, report=None, before_quiesce=None) -> dict:
         return {"ok": True, "up_to_date": True, "commit": sha[:10],
                 "message": message}
 
-    tmp_dir = tempfile.mkdtemp(prefix="sappiwhere-update-")
+    # Outside no try until now, this line is what escaped as "The update
+    # stopped unexpectedly": mkdtemp against a per-session %TEMP% that Windows
+    # had deleted raised FileNotFoundError straight past apply() into
+    # _run_job's catch-all, naming no cause and offering no remedy. Staging
+    # now goes beside the install first, and any failure comes back as a
+    # `failed` step with a message that names every location tried.
+    try:
+        tmp_dir = _make_staging_dir()
+    except Exception as exc:
+        step("failed", error=str(exc))
+        return {"ok": False, "error": str(exc)}
     try:
         step("downloading", message=message, commit=sha[:10])
         archive_path = os.path.join(tmp_dir, "update.tar.gz")
