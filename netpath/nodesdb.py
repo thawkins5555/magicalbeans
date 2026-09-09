@@ -268,6 +268,11 @@ CREATE INDEX IF NOT EXISTS ix_neighbors_device ON neighbors(device_id);
 -- fleet-wide topology read.
 CREATE INDEX IF NOT EXISTS ix_neighbors_sys_name ON neighbors(sys_name);
 CREATE INDEX IF NOT EXISTS ix_neighbors_chassis_id ON neighbors(chassis_id);
+-- prune_neighbors deletes by age alone, and the PRIMARY KEY leads with
+-- device_id, so without this the delete full-scans the table while holding
+-- the store's one write lock — ix_mac_entries_seen above, for the by-age
+-- prune this one copies.
+CREATE INDEX IF NOT EXISTS ix_neighbors_seen ON neighbors(seen_ts);
 
 -- Per-port VLAN membership, for MAPPER's per-VLAN trunk strands (a link
 -- carrying N VLANs draws as N coloured strands below the configured
@@ -297,6 +302,9 @@ CREATE TABLE IF NOT EXISTS vlans (
     present       INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (device_id, vlan)
 );
+-- prune_vlans' by-age DELETE, the same case as ix_neighbors_seen: the
+-- PRIMARY KEY leads with device_id and so cannot serve a seen_ts range.
+CREATE INDEX IF NOT EXISTS ix_vlans_seen ON vlans(seen_ts);
 -- vlan_ports: one row per port this device reports as VLAN-aware at all
 -- (mode 'trunk'/'access'/'' — '' meaning "seen in a membership below but
 -- neither table said which"), keyed by (device_id, if_index) since a port
@@ -315,6 +323,8 @@ CREATE TABLE IF NOT EXISTS vlan_ports (
     present       INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (device_id, if_index)
 );
+-- prune_vlan_ports, same reasoning as ix_vlans_seen.
+CREATE INDEX IF NOT EXISTS ix_vlan_ports_seen ON vlan_ports(seen_ts);
 -- port_vlans: the actual membership — this VLAN crosses this port, tagged
 -- or not. Keyed by all three of (device_id, if_index, vlan) because that
 -- triple is the fact being recorded; `tagged` is not part of the key
@@ -333,6 +343,8 @@ CREATE TABLE IF NOT EXISTS port_vlans (
     present       INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (device_id, if_index, vlan)
 );
+-- prune_port_vlans, same reasoning as ix_vlans_seen.
+CREATE INDEX IF NOT EXISTS ix_port_vlans_seen ON port_vlans(seen_ts);
 -- The map reads none of these three tables fleet-wide: vlans_for_devices/
 -- vlan_ports_for_devices/port_vlans_for_devices (MAPPER's own bounded shape,
 -- devices_by_ids' "many known ids, one indexed read" applied to each table)
@@ -418,6 +430,10 @@ CREATE TABLE IF NOT EXISTS discovery_jobs (
     finished_ts     REAL,
     error           TEXT
 );
+-- prune()'s "DELETE ... WHERE started_ts < ? AND state != 'running'": age is
+-- the selective half, state a residual tested on the few rows it leaves.
+CREATE INDEX IF NOT EXISTS ix_discovery_jobs_started ON discovery_jobs(started_ts);
+
 CREATE TABLE IF NOT EXISTS discovery_results (
     id              INTEGER PRIMARY KEY,
     job_id          INTEGER NOT NULL REFERENCES discovery_jobs(id) ON DELETE CASCADE,

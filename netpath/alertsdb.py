@@ -299,6 +299,9 @@ CREATE TABLE IF NOT EXISTS alert_mutes (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_mute_entity
     ON alert_mutes(entity_kind, entity_id);
+-- prune()'s sweep of lapsed mutes ranges on until_ts, which ux_mute_entity
+-- does not lead with.
+CREATE INDEX IF NOT EXISTS ix_alert_mutes_until ON alert_mutes(until_ts);
 
 -- A planned period during which alerts for a scope of devices behave as
 -- though every one of them were muted: a weekend cutover, a maintenance

@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS hosts (
 );
 CREATE INDEX IF NOT EXISTS ix_hosts_subnet ON hosts(subnet_id);
 CREATE INDEX IF NOT EXISTS ix_hosts_mac ON hosts(mac);
+-- prune_hosts deletes "last_seen < ? AND alive = 0". Equality column first,
+-- so the range on last_seen runs inside the alive=0 group rather than over
+-- the whole table; neither index above can serve it at all.
+CREATE INDEX IF NOT EXISTS ix_hosts_alive_seen ON hosts(alive, last_seen);
 
 -- Two different addresses answering as the same IP, caught one of two ways:
 -- the sweep itself saw two MACs for one IP across scans ('scan'), or the
@@ -70,6 +74,9 @@ CREATE TABLE IF NOT EXISTS conflicts (
     resolved_ts  REAL
 );
 CREATE INDEX IF NOT EXISTS ix_conflicts_open ON conflicts(ip, resolved_ts);
+-- prune_conflicts ranges on resolved_ts alone, which ix_conflicts_open
+-- cannot answer: that one leads with ip, and the prune constrains no ip.
+CREATE INDEX IF NOT EXISTS ix_conflicts_resolved ON conflicts(resolved_ts);
 
 CREATE TABLE IF NOT EXISTS scans (
     id          INTEGER PRIMARY KEY,
