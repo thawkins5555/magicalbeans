@@ -241,8 +241,11 @@ class Client:
 # Leaf names that would carry a statement count, and ones that would carry
 # time spent waiting on a store lock. Matched against the last path segment
 # only, so a section called "sql" does not make every number under it one.
-SQL_LEAF = re.compile(r"(^|_)(sql|queries|query_count|statements)s?$", re.I)
-LOCK_LEAF = re.compile(r"lock", re.I)
+# Matched against the WHOLE flattened key path, not just its last segment:
+# the counters hang under a section named for what they are
+# (store_locks/<store>/wait_s), so the leaf alone says nothing.
+SQL_LEAF = re.compile(r"(sql|queries|query_count|statements|acquisitions)", re.I)
+LOCK_LEAF = re.compile(r"lock.*(wait|hold)", re.I)
 
 
 def _flatten(obj, prefix="", out=None, depth=0):
@@ -280,7 +283,7 @@ def _sum_for(delta, leaf_re, route_path, to_ms=False):
     this server. Returns None when neither exists, which is what prints `-`.
     """
     matched = {key: value for key, value in delta.items()
-               if leaf_re.search(key.rsplit("/", 1)[-1])}
+               if leaf_re.search(key)}
     if not matched:
         return None
     scoped = {key: value for key, value in matched.items()
@@ -315,8 +318,7 @@ class DebugProbe:
             self.self_cost = _diff(first, second)
             self.ok = True
             self.instrumented = any(
-                SQL_LEAF.search(key.rsplit("/", 1)[-1])
-                or LOCK_LEAF.search(key.rsplit("/", 1)[-1]) for key in second)
+                SQL_LEAF.search(key) or LOCK_LEAF.search(key) for key in second)
 
     def snapshot(self):
         status, _ms, _n, _w, payload = self.client.send("GET", "/api/debug")
@@ -454,7 +456,10 @@ def measure(client, probe, method, path, body, iterations):
     if sql is not None:
         sql /= iterations
     if lock_ms is not None:
-        lock_ms /= iterations
+        # Never below zero: subtracting the snapshot's own cost from a window
+        # quieter than the snapshot was leaves a negative, which reads as a
+        # broken measurement rather than as the "no contention" it means.
+        lock_ms = max(0.0, lock_ms) / iterations
     return {
         "status": status,
         "p50": percentile(samples, 0.50),
@@ -472,8 +477,8 @@ def number(value, digits=1):
 
 
 HEADER = ("%-34s %9s %9s %9s %10s %9s %7s %9s"
-          % ("route", "p50 ms", "p95 ms", "max ms", "bytes", "gzip", "sql",
-             "lock ms"))
+          % ("route", "p50 ms", "p95 ms", "max ms", "bytes", "gzip", "locks",
+             "wait ms"))
 
 
 def row(label, result):
@@ -485,7 +490,7 @@ def row(label, result):
 
 COMPOSITE_HEADER = ("%-34s %9s %10s %9s %8s %7s %9s"
                     % ("composite", "total ms", "bytes", "gzip", "requests",
-                       "sql", "lock ms"))
+                       "locks", "wait ms"))
 
 
 def composite_row(label, total_ms, plain, wire, count, sql, lock_ms):
@@ -543,7 +548,7 @@ def composites(client, probe, device_id, tabs, iterations):
     sql_per_s = (None if state["sql"] is None
                  else tabs * state["sql"] / POLL_INTERVAL_S)
     lines.append("%d tabs polling /api/state every %gs: %.0f server ms/s, "
-                 "%s sql/s (p50 %.2f ms and %s statements each)"
+                 "%s store-lock acquisitions/s (p50 %.2f ms and %s each)"
                  % (tabs, POLL_INTERVAL_S, server_ms_per_s, number(sql_per_s, 1),
                     state["p50"], number(state["sql"], 1)))
     return lines
@@ -581,7 +586,7 @@ def run(folder, devices, tabs, iterations):
         print("  %d iterations per route, one keep-alive connection, "
               "Accept-Encoding: gzip" % iterations)
         if not probe.instrumented:
-            print("  /api/debug carries no sql/lock counters on this build, "
+            print("  /api/debug carries no lock counters on this build, "
                   "so those two columns read `-`")
         print("  " + HEADER)
         for label, method, path, body in ROUTES:
