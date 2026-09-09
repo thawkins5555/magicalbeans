@@ -253,6 +253,49 @@ CREATE INDEX IF NOT EXISTS ix_mac_entries_seen ON mac_entries(seen_ts);
 -- NOT here: this script runs before the migration, and on a database from
 -- before 4.34 the `present` column does not exist yet when it runs.
 
+-- ARP (IP-to-MAC) cache entries: which IP each router or L3 switch has
+-- resolved to which MAC, on which interface. mac_entries answers "which
+-- port is this MAC on"; this answers "which IP is this MAC" (and the
+-- reverse), and the two join on `mac` — which is why `mac` is stored in
+-- exactly normalize_mac's form here too, so that join and a future DHCP
+-- lease lookup need no per-query munging.
+--
+-- Its own schedule (arp_table_interval_s, 0 = off; shipped OFF — see
+-- _merge_config for why this one, unlike the MAC walk, must not default
+-- on), never the poll cycle: a core router's ARP cache is thousands of
+-- rows. present/seen_ts/first_seen_ts are mac_entries' ageing scheme
+-- exactly, and prune_arp_entries reclaims a row nothing has refreshed for
+-- mac_table_retention_days (shared, not a knob of its own — same
+-- "device stopped being walked" question).
+--
+-- The key is (device_id, if_index, ip) and deliberately NOT the MAC: an ARP
+-- entry says who holds this IP on this interface, and there is exactly one
+-- current answer, so when the MAC behind an IP changes (a host replaced,
+-- a VRRP failover) the row is UPDATED in place and keeps its first_seen_ts
+-- rather than a second row appearing. That is the opposite of mac_entries,
+-- whose key includes the MAC because one MAC in two VLANs is two true facts
+-- at once. entry_type is the MIB's own word for the row (dynamic/static/
+-- other/local); invalid rows never reach here.
+CREATE TABLE IF NOT EXISTS arp_entries (
+    device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    if_index        INTEGER NOT NULL,
+    ip              TEXT NOT NULL,
+    mac             TEXT NOT NULL,
+    entry_type      TEXT NOT NULL DEFAULT '',
+    seen_ts         REAL NOT NULL,
+    first_seen_ts   REAL,
+    present         INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (device_id, if_index, ip)
+);
+-- arp_locations searches by either column with a prefix LIKE, ordered by
+-- present then seen_ts — the same (mac, present, seen_ts) shape
+-- ix_mac_entries_mac_present serves, once per searchable column.
+CREATE INDEX IF NOT EXISTS ix_arp_entries_mac ON arp_entries(mac, present, seen_ts);
+CREATE INDEX IF NOT EXISTS ix_arp_entries_ip ON arp_entries(ip, present, seen_ts);
+-- prune_arp_entries deletes by age alone, and the PRIMARY KEY leads with
+-- device_id — ix_mac_entries_seen's own reasoning.
+CREATE INDEX IF NOT EXISTS ix_arp_entries_seen ON arp_entries(seen_ts);
+
 -- LLDP/CDP neighbour table: what is plugged into what. Its own walk
 -- schedule (lldp_interval_s, 0 = off; shipped default 3600s, mirroring
 -- mac_table_interval_s exactly — see _merge_config), never the poll cycle,
@@ -646,7 +689,7 @@ _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
                      "mib_file_id", "ping_count", "ping_timeout_ms",
                      "unreachable_ping_only", "vendor_oid", "location_oid",
                      "mac_table_interval_s", "lldp_interval_s", "poe_enabled",
-                     "stp_enabled", "vlan_interval_s")
+                     "stp_enabled", "vlan_interval_s", "arp_table_interval_s")
 
 _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
                    "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
@@ -654,7 +697,7 @@ _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
                    "mib_file_id", "ping_count", "ping_timeout_ms",
                    "unreachable_ping_only", "vendor_oid", "location_oid",
                    "mac_table_interval_s", "lldp_interval_s", "poe_enabled",
-                   "stp_enabled", "vlan_interval_s")
+                   "stp_enabled", "vlan_interval_s", "arp_table_interval_s")
 
 # Settable but never inherited, like vendor_override: a management page's
 # scheme/port is a fact about one box, and a polling profile handing it to a
@@ -1096,6 +1139,12 @@ class NodesDatabase(SqliteStore):
             "lldp_interval_s": "INTEGER", "poe_enabled": "INTEGER",
             "stp_enabled": "INTEGER", "vlan_interval_s": "INTEGER",
         })
+        # ARP-cache walk interval, inheritable like the three above and
+        # nullable for the same reason: NULL is "inherit", and here the end
+        # of the inherit chain is 0 (_merge_config), so an upgraded install
+        # walks nothing until an operator sets a number somewhere.
+        self.ensure_columns("devices", {"arp_table_interval_s": "INTEGER"})
+        self.ensure_columns("groups", {"arp_table_interval_s": "INTEGER"})
         # Per-port PoE and STP state, the same kind of fact as oper_status
         # and refreshed by the same poll cycle rather than a table of its own.
         # media: 'optic' once a port-mapped ENTITY-SENSOR row proves a
@@ -2058,6 +2107,18 @@ class NodesDatabase(SqliteStore):
         # reading intent into it would be a guess.
         if config.get("vlan_interval_s") is None:
             config["vlan_interval_s"] = 3600 if config["lldp_interval_s"] else 0
+        # ARP cache: 0, not an hour, and not following any of the three
+        # above. This is the one table walk whose subject is routinely
+        # LARGER than anything else this poller reads — a core router's
+        # cache runs to tens of thousands of rows and can meet
+        # snmp_walk_max_rows, where the MAC/LLDP/VLAN walks never do — so
+        # the reasoning that made the MAC walk default on (a walk cheap
+        # enough to run unasked) does not carry. An upgrade must add no
+        # SNMP load and no database growth anywhere until an operator asks
+        # for it on a specific profile or device; arp_walk_enabled_count's
+        # COALESCE(..., 0) mirrors this fallback exactly.
+        if config.get("arp_table_interval_s") is None:
+            config["arp_table_interval_s"] = 0
         # PoE and STP ride the poll cycle rather than a walk of their own
         # (see the devices.poe_capable/stp_capable migration comment), so
         # there is no cost to default them on — a device that does not
@@ -2378,6 +2439,7 @@ class NodesDatabase(SqliteStore):
         ("events", "SELECT COUNT(*) FROM device_events WHERE device_id = ?"),
         ("neighbours", "SELECT COUNT(*) FROM neighbors WHERE device_id = ?"),
         ("mac_entries", "SELECT COUNT(*) FROM mac_entries WHERE device_id = ?"),
+        ("arp_entries", "SELECT COUNT(*) FROM arp_entries WHERE device_id = ?"),
         ("vlans", "SELECT COUNT(*) FROM vlans WHERE device_id = ?"),
         ("port_vlans", "SELECT COUNT(*) FROM port_vlans WHERE device_id = ?"),
         ("upstream_children", "SELECT COUNT(*) FROM devices WHERE upstream_id = ?"),
@@ -2566,19 +2628,20 @@ class NodesDatabase(SqliteStore):
 
     def _prune_seen_ts(self, table: str, older_than_s: float,
                        budget_s: float | None = None) -> int:
-        """The by-age DELETE the five walk-result tables share, batched.
+        """The by-age DELETE the six walk-result tables share, batched.
 
-        `mac_entries`, `neighbors`, `vlans`, `vlan_ports` and `port_vlans` all
-        answer the same question - "nothing has refreshed this row for the
-        retention window" - against a `seen_ts` column Wave 1 indexed, so one
-        body serves all five and each keeps its own name and rule.
+        `mac_entries`, `arp_entries`, `neighbors`, `vlans`, `vlan_ports` and
+        `port_vlans` all answer the same question - "nothing has refreshed
+        this row for the retention window" - against a `seen_ts` column
+        Wave 1 indexed, so one body serves all six and each keeps its own
+        name and rule.
 
         Batched in adaptive, lock-bounded chunks: every read on nodes.db takes
         the same single lock the delete takes, so an unbatched sweep of a
         fleet's forwarding tables froze every page that resolves a MAC or
         draws the map for as long as the whole DELETE ran.
 
-        Chunked by rowid, because none of these five has an `id` of its own -
+        Chunked by rowid, because none of these six has an `id` of its own -
         they are keyed on the fact being recorded - and every batch still
         carries the `seen_ts` test, so the range decides only how the sweep is
         cut up and never which rows go. The range is wide: a rowid is handed
@@ -2632,6 +2695,141 @@ class NodesDatabase(SqliteStore):
         of service) and nothing is refreshing it any more; either way, the
         rule is the same DELETE by age, not a present/absent branch."""
         return self._prune_seen_ts("mac_entries", older_than_s)
+
+    # ------------------------------------------------------------ ARP tables
+
+    def replace_arp_entries(self, device_id: int, entries: list[dict],
+                            now: float | None = None) -> int:
+        """Merge one ARP walk's rows into the device's history —
+        replace_mac_entries' present-flag ageing, applied to `arp_entries`:
+        every row already stored for this device is marked present=0
+        first, then each of this walk's rows is upserted with present=1
+        and a fresh seen_ts, first_seen_ts carried forward on an existing
+        (device, interface, ip) key and stamped only the first time that
+        key is stored. An entry the cache has since expired keeps its row,
+        its last seen_ts and present=0 until prune_arp_entries drops it.
+
+        The one deliberate departure from the MAC merge: `mac` and
+        `entry_type` are DATA here, refreshed by the UPSERT, not part of
+        the key. An IP has exactly one current holder on an interface, so
+        a MAC change is the same row updated in place (keeping its
+        first_seen_ts — "this IP has been on this interface since", which
+        is still true) rather than a second row beside a stale first. See
+        the CREATE TABLE comment for why mac_entries keys differently.
+
+        `entries` is a list of dicts: if_index, ip, mac, and optionally
+        entry_type. A row whose MAC does not normalise to six octets, or
+        whose ip is blank, is dropped rather than stored as a guess. An
+        empty `entries` is a genuine "this cache is empty right now" and
+        marks every row absent; a failed or cut-short walk must never
+        reach here (`entries is None`) — the caller leaves storage alone."""
+        now = now if now is not None else time.time()
+        rows = []
+        for entry in entries:
+            mac = normalize_mac(entry.get("mac"))
+            ip = str(entry.get("ip") or "").strip()
+            if len(mac) != 12 or not ip:
+                continue
+            try:
+                if_index = int(entry["if_index"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            rows.append((device_id, if_index, ip, mac,
+                         str(entry.get("entry_type") or ""), now, now))
+        with self._lock:
+            self._conn.execute(
+                "UPDATE arp_entries SET present = 0 WHERE device_id = ?",
+                (device_id,))
+            self._conn.executemany(
+                "INSERT INTO arp_entries(device_id, if_index, ip, mac,"
+                " entry_type, seen_ts, first_seen_ts, present)"
+                " VALUES (?,?,?,?,?,?,?,1)"
+                " ON CONFLICT(device_id, if_index, ip) DO UPDATE SET"
+                " mac = excluded.mac, entry_type = excluded.entry_type,"
+                " seen_ts = excluded.seen_ts, present = 1", rows)
+            self._conn.commit()
+        return len(rows)
+
+    def arp_walk_enabled_count(self) -> int:
+        """How many enabled devices are configured to walk their ARP cache
+        — mac_walk_enabled_count's own one-query shape, for the same
+        reason (asked per search, must not cost effective_config() per
+        device). COALESCE(device, profile, 0) is _merge_config's ARP
+        fallback exactly, and here the 0 really is the shipped value."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM devices d"
+                " LEFT JOIN groups g ON g.id = d.group_id"
+                " WHERE d.enabled = 1"
+                "   AND COALESCE(d.arp_table_interval_s,"
+                "                g.arp_table_interval_s, 0) > 0").fetchone()
+        return row["n"] if row else 0
+
+    def arp_locations(self, needle: str, limit: int = 200) -> list[sqlite3.Row]:
+        """Every (device, interface) ARP row whose MAC or IP starts with
+        `needle` — an operator pastes whichever they have, so this decides
+        which it is rather than asking. Present rows first, then stale
+        newest-seen first, each carrying present/seen_ts/first_seen_ts,
+        and joined to the interface description the way mac_locations is.
+
+        The MAC-vs-IP decision is looks_like_mac_search's, not a second
+        one: digits-and-dots is an IPv4 prefix and never a MAC, anything
+        that normalises to hex is a MAC prefix. The one shape that rule
+        cannot settle is a colon-separated hex prefix — "fe80::" is an
+        IPv6 prefix, "aabb:cc" is a MAC written the Cisco way, and both
+        normalise to valid hex — so a needle carrying ':' is matched
+        against BOTH columns and the union returned, rather than
+        guessing one and answering "not found" for the other. A full
+        IPv6 address is longer than twelve hex digits, so it falls out of
+        normalize_mac on its own and is searched as an address only."""
+        raw = str(needle or "").strip()
+        mac_prefix = looks_like_mac_search(raw)
+        if len(mac_prefix) < 4:
+            mac_prefix = ""
+        # An address prefix is dotted decimal or colon-hex; anything else
+        # (a hostname, a stray word) matches no ip and is not worth a query.
+        address_like = bool(raw) and all(
+            c.isdigit() or c in ".:" or c in "abcdefABCDEF" for c in raw)
+        ip_prefix = raw.lower() if address_like and (not mac_prefix or ":" in raw) else ""
+        clauses, params = [], []
+        if mac_prefix:
+            clauses.append("a.mac LIKE ?")
+            params.append(f"{mac_prefix}%")
+        if ip_prefix:
+            clauses.append("a.ip LIKE ?")
+            params.append(f"{ip_prefix}%")
+        if not clauses:
+            return []
+        with self._lock:
+            return self._conn.execute(
+                "SELECT a.*, i.descr AS if_descr FROM arp_entries a"
+                " LEFT JOIN interfaces i ON i.device_id = a.device_id"
+                "   AND i.if_index = a.if_index"
+                f" WHERE {' OR '.join(clauses)}"
+                " ORDER BY a.present DESC, a.seen_ts DESC, a.device_id,"
+                " a.if_index, a.ip LIMIT ?",
+                (*params, int(limit))).fetchall()
+
+    def arp_entries_for(self, device_id: int,
+                        if_index: int | None = None) -> list[sqlite3.Row]:
+        """Every ARP row stored for this device (optionally one interface),
+        present and stale alike — mac_entries_for's own shape."""
+        sql = "SELECT * FROM arp_entries WHERE device_id = ?"
+        args: list = [device_id]
+        if if_index is not None:
+            sql += " AND if_index = ?"
+            args.append(if_index)
+        with self._lock:
+            return self._conn.execute(sql + " ORDER BY if_index, ip", args).fetchall()
+
+    def prune_arp_entries(self, older_than_s: float) -> int:
+        """Drop ARP rows nothing has refreshed for this long, present or
+        stale alike — prune_mac_entries' own by-age rule, applied to
+        `arp_entries`. Belongs in the same maintenance sweep that calls
+        prune_mac_entries (Service.run_maintenance), on the same
+        mac_table_retention_days clock; a table that only grows is a
+        defect, not a feature."""
+        return self._prune_seen_ts("arp_entries", older_than_s)
 
     # ------------------------------------------------------ LLDP/CDP neighbours
 

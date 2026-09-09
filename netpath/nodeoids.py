@@ -172,6 +172,42 @@ IP_ADDR_TABLE = "1.3.6.1.2.1.4.20.1.1"
 IP_ADDR_IFINDEX = "1.3.6.1.2.1.4.20.1.2"
 IP_ADDR_NETMASK = "1.3.6.1.2.1.4.20.1.3"
 
+# ------------------------------------------------------------ ARP tables
+#
+# The device's own IP-to-MAC cache, walked on its own schedule
+# (arp_table_interval_s, 0 = off and shipped off — see nodesdb._merge_config)
+# the way the forwarding table is, and stored beside it in nodesdb's
+# arp_entries so "which IP holds this MAC" and "which MAC holds this IP"
+# are queries rather than a live walk of every router. Not the same fact as
+# the FDB: a switch's forwarding table says which PORT a MAC was heard on,
+# a router's ARP cache says which IP it was answering for, and joining the
+# two on the MAC is what turns an address into a port.
+#
+# ipNetToMediaTable (RFC 1213, deprecated by IP-MIB but still what nearly
+# every agent actually populates) is walked FIRST, and the IPv6-capable
+# successor ipNetToPhysicalTable only when it produced no rows — a fallback,
+# not a merge, because a modern agent answers both with the same IPv4
+# mappings and merging them would double-count every one. See
+# nodepoll.read_device_arp_table for the whole rule, including why
+# "produced no rows" and not "the walk failed" is the gate.
+#
+# Both tables carry the IP in the row's own index, so the phys-address
+# column alone recovers ifIndex, IP and MAC in one walk (the way the FDB
+# walk recovers a MAC from dot1dTpFdbTable's suffix) and the net-address
+# column is deliberately not walked. ipNetToMediaTable's index is
+# ifIndex.a.b.c.d; ipNetToPhysicalTable's is ifIndex.addrType.addrLen.
+# <addrLen arcs>, with addrType 1 = ipv4 (4 arcs) and 2 = ipv6 (16 arcs).
+IP_NET_TO_MEDIA_PHYS_ADDRESS = "1.3.6.1.2.1.4.22.1.2"   # the MAC, 6 octets
+IP_NET_TO_MEDIA_TYPE         = "1.3.6.1.2.1.4.22.1.4"   # other/invalid/dynamic/static
+IP_NET_TO_PHYSICAL_PHYS_ADDRESS = "1.3.6.1.2.1.4.35.1.4"
+IP_NET_TO_PHYSICAL_TYPE         = "1.3.6.1.2.1.4.35.1.6"
+# Shared by both tables' type column. invalid(2) is the MIB's own "this row
+# is being removed" marker and is dropped at parse time rather than stored.
+IP_NET_TO_MEDIA_TYPE_ENUM = {1: "other", 2: "invalid", 3: "dynamic", 4: "static",
+                             # ipNetToPhysicalType adds local(5): the
+                             # device's own address on that interface.
+                             5: "local"}
+
 # -------------------------------------------------------------- L2 topology
 #
 # LLDP-MIB (IEEE 802.1AB-2005) lldpRemTable — "what is plugged into what".
