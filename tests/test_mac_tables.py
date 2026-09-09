@@ -286,6 +286,41 @@ check("mac_walk_enabled_count counts a device walking by the inherited default",
       and db.effective_config(db.device(did))["mac_table_interval_s"] == 3600,
       (db.mac_walk_enabled_count(), dict(db.effective_config(db.device(did)))))
 check("...and the search payload says so", payload.get("enabled_devices") == 1, payload)
+
+
+# The device behind each hit used to be a device() per row on top of the
+# search's own query; the ARP search, the same loop, did that for up to
+# two hundred rows on one keystroke. One batched read for however many hits.
+class CountingDb:
+    def __init__(self, real):
+        self._real = real
+        self.calls = {"device": 0, "devices_by_ids": 0}
+
+    def __getattr__(self, name):
+        attr = getattr(self._real, name)
+        if name in self.calls:
+            def counted(*args, **kwargs):
+                self.calls[name] += 1
+                return attr(*args, **kwargs)
+            return counted
+        return attr
+
+
+class CountingSvc(Svc):
+    nodes_db = CountingDb(db)
+
+
+did2 = db.add_device("10.0.0.10", name="api-sw-2", group_id=db.ensure_default_group())
+db.replace_mac_entries(did2, [{"if_index": 4, "mac": "aa:bb:cc:dd:ee:01", "vlan": "20"}],
+                       now=seen2)
+spanning = api.get_nodes_mac_search(CountingSvc, {"q": "aabb.ccdd.ee"}, None)
+check("a prefix hitting two devices names each hit's own device",
+      {(l["mac"], l["device_name"]) for l in spanning["locations"]}
+      == {("aabbccddeeff", "api-sw"), ("aabbccddee01", "api-sw-2")}, spanning)
+check("...from one batched device read, not one query per row",
+      CountingSvc.nodes_db.calls == {"device": 0, "devices_by_ids": 1},
+      CountingSvc.nodes_db.calls)
+db.remove_device(did2)
 db.update_device(did, mac_table_interval_s=0)
 check("...while a device's explicit 0 still opts it out of the count",
       db.mac_walk_enabled_count() == 0
