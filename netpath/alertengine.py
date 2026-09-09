@@ -288,7 +288,10 @@ class AlertEngine(Worker):
             window_covered = self.db.window_covered_device_ids(
                 ((row["id"], row["device_group_id"]) for row in self.nodes_db.devices()),
                 windows=active_windows)
-        muted = self.db.muted_entity_ids("device", window_covered=window_covered)
+        # quiet_device_ids, not muted_entity_ids: a device in indefinite
+        # maintenance mode is quiet here too, and it has no until_ts to fold
+        # into a dict keyed on one. Membership is all this gate reads.
+        muted = self.db.quiet_device_ids(window_covered=window_covered)
         for occurrence in occurrences:
             self.counters["evaluated"] += 1
             # Per occurrence, not per tick. The apply path is not
@@ -525,8 +528,10 @@ class AlertEngine(Worker):
             self.nodes_db if device is not None else None, self.app_db,
             source, device=device) or source
 
-    def _muted(self, occurrence: Occurrence, muted: dict) -> bool:
-        """True when this occurrence is about a device an operator silenced.
+    def _muted(self, occurrence: Occurrence, muted: set) -> bool:
+        """True when this occurrence is about a device an operator silenced —
+        by a mute, an active maintenance window, or indefinite maintenance
+        mode (quiet_device_ids folds all three into the one set).
 
         Per device rather than per rule, so it sits here beside
         _hold_for_new_device rather than inside _apply: muting a switch means
@@ -546,13 +551,19 @@ class AlertEngine(Worker):
         return True
 
     def _muted_alert(self, alert_row) -> bool:
-        """Whether an existing alert's device is muted OR covered by an
-        active maintenance window.
+        """Whether an existing alert's device is in maintenance mode, muted,
+        OR covered by an active maintenance window.
+
+        One call answers for all three, which is what buys the clear-mail
+        gate and the first-notify gate their maintenance behaviour without
+        either of them growing a second lookup.
 
         Its own lookup rather than the per-tick dict, because the clear path
         runs inside the drains — before _tick reads that dict — and a clear
         is rare enough that one query costs nothing.
         """
+        if self._maintenance_alert(alert_row):
+            return True
         device_id = device_id_for(alert_row["entity_kind"], alert_row["entity_id"])
         if device_id is None:
             return False
@@ -561,6 +572,19 @@ class AlertEngine(Worker):
         device = self.nodes_db.device(device_id)
         device_group_id = device["device_group_id"] if device is not None else None
         return self.db.window_covers_device(device_id, device_group_id) is not None
+
+    def _maintenance_alert(self, alert_row) -> bool:
+        """Whether this alert's device is in indefinite maintenance mode.
+
+        Asked apart from _muted_alert by the one caller that has to tell the
+        two apart: a mute and a window both end at a time an operator can
+        read, so a held notice waits for them; maintenance mode has no such
+        moment, and a notice waiting for it would wait forever.
+        """
+        device_id = device_id_for(alert_row["entity_kind"], alert_row["entity_id"])
+        if device_id is None:
+            return False
+        return self.db.open_maintenance(device_id) is not None
 
     # ------------------------------------------- newly added device hold
 
@@ -2604,6 +2628,15 @@ class AlertEngine(Worker):
             rule = self.db.rule(row["rule_id"])
             if rule is None or not rule["enabled"]:
                 continue
+            # Silenced devices get no reminders either. Without this a muted
+            # or in-maintenance device's open alert mailed a reminder every
+            # renotify_minutes — the one path a mute never covered, and flatly
+            # against what the mute promises. Nothing is stranded by skipping:
+            # alerts_due_renotify reads COALESCE(last_notified_ts, opened_ts),
+            # so the alert is still due the moment the silence lifts and one
+            # reminder goes out then.
+            if self._muted_alert(row):
+                continue
             occurrence = self._occurrence_from_alert_row(row, rule)
             self._notify(row, rule, occurrence, settings, renotify=True)
 
@@ -2949,10 +2982,13 @@ class AlertEngine(Worker):
         2. Still covered by a rollup parent RIGHT NOW, asked with the exact
            predicate _apply asks before opening a fresh occurrence
            (_rollup_parent, then _parent_operator_resolved).
-        3. Muted. Left pending rather than decided — a mute is temporary,
-           and a device unmuted before anyone sees this should still get the
-           notice. Mirrors _notify_clear's own mute check.
-        4. Otherwise sendable, one at a time or as a digest — see
+        3. In maintenance mode. Decided, with a reason: that suppression has
+           no end date, so there is no moment left to wait for.
+        4. Muted, or inside a maintenance window. Left pending rather than
+           decided — both are temporary, and a device released before anyone
+           sees this should still get the notice. Mirrors _notify_clear's own
+           mute check.
+        5. Otherwise sendable, one at a time or as a digest — see
            DIGEST_THRESHOLD.
 
         The system-rule and notify-column guards _notify opens with are
@@ -3005,6 +3041,17 @@ class AlertEngine(Worker):
                     self._skip_held_open_notify(
                         alert_row, settings, self._ROLLUP_NO_ROW_REASON)
                     continue
+            if self._maintenance_alert(alert_row):
+                # Decided, not left pending. Every other wait in this loop
+                # ends at a moment somebody can name; maintenance mode has no
+                # deadline, so a held notice would sit with last_notified_ts
+                # NULL forever — reading as a bare "None sent." with no
+                # reason, and blocked by _sweep_renotify's own NULL guard
+                # from ever going out at all.
+                self._skip_held_open_notify(
+                    alert_row, settings,
+                    "not sent: the device is in maintenance mode")
+                continue
             if self._muted_alert(alert_row):
                 continue
             sendable.append((alert_row, rule_row, occurrence))

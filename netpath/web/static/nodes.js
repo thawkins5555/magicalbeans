@@ -196,6 +196,19 @@
       `device are suppressed until ${escape(until)}">alerts muted</span>`;
   }
 
+  /* " · maintenance" when this device is in indefinite maintenance mode.
+     Its own tag beside mutedTag rather than folded into it: the two are
+     different mechanisms with different ends, and a device can be in both
+     at once. */
+  function maintenanceTag(row) {
+    if (!row.maintenance) return '';
+    const since = App.when(row.maintenance.started_ts);
+    const who = row.maintenance.started_by;
+    return ` · <span class="warn-text maintenance-tag" title="In maintenance ` +
+      `mode since ${escape(since)}${who ? ` (${escape(who)})` : ''} — no new ` +
+      `alerts and no mail until someone ends it; polling continues">maintenance</span>`;
+  }
+
   const COLUMNS = [
     { key: 'check', label: '', sortable: false, fixed: true, width: 34,
       // Named, because a column of identical unlabelled checkboxes is
@@ -212,7 +225,7 @@
       // who silenced a device an hour ago and later wonders why it has gone
       // quiet should not have to go looking for the reason.
       cell: (r) => `${escape(displayName(r))}<div class="ip-line">${deviceIpCell(r)}` +
-        `${mutedTag(r)}</div>` },
+        `${maintenanceTag(r)}${mutedTag(r)}</div>` },
     { key: 'group', label: 'Profile', width: 130, on: true,
       value: (r) => r._groupName || '',
       cell: (r) => escape(r._groupName || '\u2014') },
@@ -572,6 +585,18 @@
     bulkUpdate({ device_group_id: null });
   }
 
+  /* Two entry points, one call: `clear` picks the direction. A mixed
+     selection has no state to toggle from, which is why the bar carries two
+     buttons rather than one that changes its mind. */
+  async function bulkMaintenance(clear) {
+    const ids = [...view.devicesChecked];
+    if (!ids.length) return;
+    await App.post('/api/alerts/bulk-maintenance', { device_ids: ids, clear });
+    if (view.selected && ids.includes(view.selected)) await loadDetail();
+    view.devicesChecked.clear();
+    App.refreshNow('nodes');
+  }
+
   function bulkDeleteDevices() {
     const ids = [...view.devicesChecked];
     if (!ids.length) return;
@@ -725,6 +750,49 @@
     App.el('nd-d-name').textContent = displayName(view.detail);
     App.el('nd-d-summary').innerHTML = deviceSummaryHtml(view.detail);
     drawWebLink(view.detail);
+    drawMaintenanceButton(view.detail);
+  }
+
+  /* The button's label says what pressing it will DO, so it reads as an
+     action rather than as a status the summary line already gives. */
+  function drawMaintenanceButton(d) {
+    const button = App.el('nd-maintenance');
+    if (!button) return;
+    const on = Boolean(d && d.maintenance);
+    button.textContent = on ? 'End maintenance' : 'Maintenance';
+    button.title = on
+      ? `In maintenance since ${App.when(d.maintenance.started_ts)} — press to end it`
+      : 'Silence new alerts and all mail for this device until someone ends it';
+  }
+
+  /* Turning it ON asks for a reason and says what maintenance does and does
+     not stop, because "indefinite" and "polling continues" are exactly the
+     two things an operator otherwise has to guess at. Turning it OFF is one
+     press, like lifting a mute — there is nothing to ask. */
+  async function toggleMaintenance() {
+    const d = view.detail;
+    if (!d || !App.canWrite('alerts')) return;
+    if (d.maintenance) {
+      await App.del('/api/alerts/maintenance', { device_id: d.id });
+      await loadDetail();
+      App.refreshNow('nodes');
+      return;
+    }
+    App.modal(`Maintenance mode — ${displayName(d)}`, `
+      <p class="hint">No new alerts and no mail of any kind for this device —
+      the recovery message included — until somebody ends it. There is no
+      expiry. Polling continues, so status, metrics and graphs stay live, and
+      alerts already open stay open and on the list.</p>
+      <label>Reason (optional) <input id="nd-maint-reason" type="text" maxlength="200"></label>`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Start maintenance', primary: true, onClick: async (box) => {
+        const reason = box.querySelector('#nd-maint-reason').value.trim();
+        App.closeModal();
+        await App.post('/api/alerts/maintenance', { device_id: d.id, reason });
+        await loadDetail();
+        App.refreshNow('nodes');
+      } },
+    ]);
   }
 
   /* The WEB button beside SSH opens a tunnel on this server (webDevice()
@@ -875,8 +943,16 @@
       field('IP', d.ip),
       field('status', d.status ? `${d.status}${sinceText}` : ''),
       d.sys_uptime_s != null ? field('uptime', App.duration(d.sys_uptime_s)) : '',
-      // Sits right after the status, because it changes what the status
-      // means to the person reading it: quiet here is a choice, not health.
+      // Both sit right after the status, because they change what the
+      // status means to the person reading it: quiet here is a choice, not
+      // health. Maintenance goes first and does not replace the mute line —
+      // both can be true at once, and this one has no end date to print.
+      d.maintenance
+        ? field('maintenance', `since ${App.when(d.maintenance.started_ts)}` +
+                `${d.maintenance.started_by ? ` by ${d.maintenance.started_by}` : ''}` +
+                `${d.maintenance.reason ? ` — ${d.maintenance.reason}` : ''}`,
+                'nd-v warn-text')
+        : '',
       d.muted_until
         ? field('alerts', `muted until ${App.when(d.muted_until)}`,
                 'nd-v warn-text')
@@ -3281,11 +3357,12 @@
     const device_group_id = App.controlOrSaved('nodes', 'nd-filter-devgroup');
     const status = App.el('nd-filter-status').value;
     const offline_only = App.el('nd-filter-offline').checked ? '1' : undefined;
+    const maintenance_only = App.el('nd-filter-maintenance').checked ? '1' : undefined;
     // The export route ignores paging entirely — it always answers with
     // every device the current filter matches, not just the page on
     // screen, which is the whole point of an export over a table read.
     App.exportCsv('/api/nodes/devices/export.csv',
-      { q, group_id, device_group_id, status, offline_only });
+      { q, group_id, device_group_id, status, offline_only, maintenance_only });
   }
 
   function exportInterfacesCsv() {
@@ -3526,11 +3603,13 @@
     }
     const header = ['device_id', 'name', 'ip', 'group', 'availability_pct', 'up_s', 'down_s',
       'outage_count', 'longest_outage_s', 'mttr_s', 'still_down', 'currently_disabled',
-      'excluded_before_created_s', 'maintenance_excluded_s', 'mute_excluded_s', 'caveats'];
+      'excluded_before_created_s', 'maintenance_excluded_s',
+      'maintenance_mode_excluded_s', 'mute_excluded_s', 'caveats'];
     const rows = report.devices.map((r) => [r.device_id, r.name, r.ip, r._devGroupName || '',
       r.availability_pct, r.up_s, r.down_s, r.outage_count, r.longest_outage_s, r.mttr_s,
       r.still_down ? 1 : 0, r.currently_disabled ? 1 : 0, r.excluded_before_created_s,
-      r.maintenance_excluded_s, r.mute_excluded_s, (r.caveats || []).join('; ')]);
+      r.maintenance_excluded_s, r.maintenance_mode_excluded_s, r.mute_excluded_s,
+      (r.caveats || []).join('; ')]);
     const from = App.isoLocal(report.requested_start).slice(0, 10);
     const to = App.isoLocal(report.requested_end).slice(0, 10);
     saveReportCsv(`availability-${from}-to-${to}.csv`, header, rows);
@@ -5681,16 +5760,22 @@
     // Omitted entirely when unchecked, not sent as "false": App.get only
     // drops params equal to '', so the API reads presence, not value.
     const offline_only = App.el('nd-filter-offline').checked ? '1' : undefined;
+    // Same presence-not-value convention as offline_only above; filtered
+    // server-side, because the list is paged and a page filtered after the
+    // fact would disagree with its own total.
+    const maintenance_only = App.el('nd-filter-maintenance').checked ? '1' : undefined;
     // A changed filter always lands back on page one — the offset a
     // previous filter's page 4 pointed to is meaningless once the
     // matching set is different, and could be past the end of it.
-    const filterSig = JSON.stringify([q, group_id, device_group_id, status, offline_only]);
+    const filterSig = JSON.stringify([q, group_id, device_group_id, status, offline_only,
+                                      maintenance_only]);
     if (view.pageFilterSig !== null && view.pageFilterSig !== filterSig) view.pageOffset = 0;
     view.pageFilterSig = filterSig;
     view.pageLimit = Number(App.el('nd-page-size').value) || view.pageLimit;
     const generation = ++view.refreshGen;
     const [devices, groups, deviceGroups, mibs] = await Promise.all([
       App.get('/api/nodes/devices', { q, group_id, device_group_id, status, offline_only,
+                                      maintenance_only,
                                       limit: view.pageLimit, offset: view.pageOffset }),
       App.get('/api/nodes/groups'),
       App.get('/api/nodes/device-groups'),
@@ -5938,7 +6023,8 @@
        needs have been built; it assigns values from script, which fires no
        event, so these listeners do not fight it. */
     const CONTROLS = ['nd-q', 'nd-filter-group', 'nd-filter-devgroup',
-      'nd-filter-status', 'nd-filter-offline', 'disc-target', 'disc-pingonly'];
+      'nd-filter-status', 'nd-filter-offline', 'nd-filter-maintenance',
+      'disc-target', 'disc-pingonly'];
     App.rememberControls('nodes', CONTROLS);
     for (const btn of document.querySelectorAll('#page-nodes > .subtabs > .subtab')) {
       btn.onclick = () => {
@@ -5969,6 +6055,7 @@
       App.refreshNow('nodes');
     };
     App.el('nd-edit-device').onclick = editDevice;
+    App.el('nd-maintenance').onclick = toggleMaintenance;
     App.el('nd-ssh-device').onclick = sshDevice;
     App.el('nd-web-device').onclick = webDevice;
     // The "?" beside it, from the one helper that renders every help link.
@@ -6008,7 +6095,8 @@
     };
     App.filterBar('nodes', {
       text: ['nd-q'],
-      selects: ['nd-filter-group', 'nd-filter-devgroup', 'nd-filter-status', 'nd-filter-offline'],
+      selects: ['nd-filter-group', 'nd-filter-devgroup', 'nd-filter-status',
+                'nd-filter-offline', 'nd-filter-maintenance'],
       apply: 'nd-apply', clear: 'nd-clear',
       // A MAC lookup runs on a deliberate search, never on the five-second
       // refresh: it can open a dialog, and a dialog that reopens itself
@@ -6021,6 +6109,8 @@
     App.el('nd-bulk-profile').onclick = bulkSetProfile;
     App.el('nd-bulk-group').onclick = bulkSetGroup;
     App.el('nd-bulk-ungroup').onclick = bulkRemoveFromGroup;
+    App.el('nd-bulk-maintenance').onclick = () => bulkMaintenance(false);
+    App.el('nd-bulk-maintenance-off').onclick = () => bulkMaintenance(true);
     App.el('nd-bulk-delete').onclick = bulkDeleteDevices;
     App.el('nd-bulk-clear').onclick = bulkClearSelection;
     App.el('nd-d-range').onchange = (e) => {

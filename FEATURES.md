@@ -1266,10 +1266,11 @@ window — with outage count, longest outage and mean time to recovery, and
 **a top-N ranking** of any metric the poller records by peak or mean over
 the same kind of window, which is how "which twenty links came closest to
 saturation" gets answered. Availability is built on the same status-segment
-history the device pane's own timeline reads, with four different ways a
+history the device pane's own timeline reads, with five different ways a
 gap in it is deliberately *not* counted as downtime — the device not having
-existed yet, a maintenance window, a mute still on file, the poller itself
-having gone quiet — each accounted for explicitly rather than silently
+existed yet, a maintenance window, an indefinite maintenance-mode period,
+a mute still on file, the poller itself having gone quiet — each accounted
+for explicitly rather than silently
 assumed. A whole-fleet top-N ranking over more than a week is refused
 outright rather than left to answer slowly; a shorter window or a narrower
 device list gets an answer. No tab or dialog reads either report yet — both
@@ -1435,6 +1436,35 @@ alerts and optionally emailing about them.
   list shows the coverage the same way it shows a mute, so a planned
   cutover never looks like an unexplained gap in monitoring. Alerts →
   **Maintenance** is where they are created and ended.
+- **Maintenance mode takes a device out of service indefinitely.** The
+  third silencing mechanism, beside the 24-hour mute and the scheduled
+  maintenance window, for the box that is off the network until somebody
+  says otherwise: a decommissioning, a chassis away for RMA, a site being
+  rebuilt. It has **no expiry and no cap** — it stays on until a person
+  ends it, which is the whole point, and a request that tries to give it
+  `hours` or an end time is refused with a message naming the mute and the
+  maintenance window instead, rather than quietly dropping the number and
+  leaving somebody believing in a four-hour maintenance that does not
+  exist. While it is on, no new alert is raised for the device and **no
+  notification of any kind** goes out — the recovery mail and the
+  every-N-minutes reminder included. Alerts already open stay open and on
+  the list, and still resolve normally, exactly as a mute leaves them.
+  **Polling continues**: status, metrics, graphs and the event history stay
+  live, because "stop telling me about it" is not "stop watching it". Who
+  turned it on, when, and an optional reason are recorded, and so is who
+  turned it off — and the record is kept after it ends, which is what lets
+  the Availability report subtract that time from downtime later, in its
+  own column, the way it already does for a scheduled window. It is set
+  from the **Maintenance** button in the Nodes device pane (single) or the
+  bulk bar (a whole selection or group, on or off), ended from either of
+  those or from the Alerts detail pane, and shown as a tag in the device
+  list, in the device summary, in the alert detail and in the devices CSV.
+  Nodes has an **Only in maintenance** filter for finding what has been
+  left in it. Setting it needs **Alerts** write, not Nodes write — it
+  silences alerts, so it is gated the way the mute is — and a read-only
+  account can see it without being able to change it. The 24-hour mute and
+  the maintenance windows are both unchanged and still there; a device can
+  be under any combination of the three at once.
 - **Un-acknowledge, single and bulk**, undoes an Acknowledge the same way
   Resolve is undone by the alert simply re-opening — the button and its
   gate sit beside Acknowledge in the detail pane and the bulk actions bar.

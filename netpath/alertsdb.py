@@ -341,6 +341,41 @@ CREATE TABLE IF NOT EXISTS maintenance_windows (
     reason            TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ix_maint_windows_start ON maintenance_windows(start_ts);
+
+-- A device an operator has taken out of service INDEFINITELY: no new
+-- alerts, no notification of any kind (the recovery mail included), until
+-- a person turns it off again. The third suppression mechanism, beside
+-- the 24-hour mute and the time-bounded window, and deliberately not a
+-- shape of either — a mute has a cap and an expiry an operator can read,
+-- a window has a planned span, and this has neither by design.
+--
+-- Polling is untouched: metrics, status and graphs stay live, because
+-- "stop telling me about it" is not "stop watching it".
+--
+-- A row is a PERIOD, not a flag. ended_ts IS NULL means "in maintenance
+-- right now"; a closed row STAYS on file, because the availability report
+-- replays past periods to subtract them from downtime. A mute cannot do
+-- that — it is deleted the moment it lapses, which is exactly what
+-- report.MUTE_HISTORY_CAVEAT apologises for. Re-entering maintenance
+-- after clearing writes a SECOND row rather than reopening the first, so
+-- the history says who did what and when, twice.
+--
+-- The partial unique index is what makes set_maintenance idempotent
+-- safely: at most one open period per device, enforced by the store
+-- rather than by every writer remembering to check first.
+CREATE TABLE IF NOT EXISTS device_maintenance (
+    id          INTEGER PRIMARY KEY,
+    device_id   INTEGER NOT NULL,
+    started_ts  REAL NOT NULL,
+    ended_ts    REAL,                    -- NULL while in maintenance
+    started_by  TEXT NOT NULL DEFAULT '',
+    ended_by    TEXT NOT NULL DEFAULT '',
+    reason      TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_device_maintenance_open
+    ON device_maintenance(device_id) WHERE ended_ts IS NULL;
+CREATE INDEX IF NOT EXISTS ix_device_maintenance_device
+    ON device_maintenance(device_id, started_ts);
 """
 
 # How long a mute may last. The dropdown offers 1/6/12/24 hours; the cap is
@@ -2200,6 +2235,22 @@ class AlertsDatabase(SqliteStore):
                     ids[device_id] = until_ts
         return ids
 
+    def quiet_device_ids(self, window_covered: dict[str, float] | None = None
+                         ) -> set[str]:
+        """Every device that must raise no new alert right now, whichever of
+        the three mechanisms says so — a mute, an active window, or an open
+        maintenance period.
+
+        A SIBLING of muted_entity_ids rather than a widening of it, on
+        purpose. That one answers `{entity_id: until_ts}` and everything
+        rendering it prints "muted until <a date>"; maintenance has no such
+        date, and a sentinel one would show the operator a moment that never
+        arrives. Membership is the only question the engine's gates actually
+        ask, so this answers exactly that and nothing more.
+        """
+        return (set(self.muted_entity_ids("device", window_covered=window_covered))
+                | set(self.maintenance_device_ids()))
+
     def merge_device(self, old_device_id: int, new_device_id: int,
                      by: str = "") -> dict:
         """Two device rows turned out to be one: hand Alerts' half over to
@@ -2208,10 +2259,12 @@ class AlertsDatabase(SqliteStore):
         the loser are resolved, not repointed — their entity is gone, and
         an alert nobody can navigate to is worse than one closed with a
         reason. Everything else (a mute, pending occurrences, a
-        maintenance window) simply moves.
+        maintenance window) simply moves; maintenance periods move too, but
+        the open one is settled first — see the comment on it below.
         """
         old_key, new_key = str(old_device_id), str(new_device_id)
-        moved = {"thresholds": 0, "pending": 0, "windows": 0, "mute": False}
+        moved = {"thresholds": 0, "pending": 0, "windows": 0, "mute": False,
+                 "maintenance": 0}
         with self._lock:
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO device_thresholds(device_id, rule_key,"
@@ -2238,6 +2291,27 @@ class AlertsDatabase(SqliteStore):
                 "UPDATE pending_alerts SET device_id = ? WHERE device_id = ?",
                 (new_device_id, old_device_id))
             moved["pending"] = cur.rowcount or 0
+            # Maintenance periods, open one FIRST. The partial unique
+            # index allows one open period per device, so a blanket repoint
+            # would raise IntegrityError whenever both rows were in
+            # maintenance — and a merge must never fail on a constraint.
+            # The winner's own period stands (it is the surviving device's
+            # record of who took it out of service); the loser's is closed
+            # where it would collide, repointed where it would not. Closed
+            # periods move wholesale: they are the loser's availability
+            # history, and the surviving id is where that history is now
+            # reported.
+            if self._conn.execute(
+                    "SELECT 1 FROM device_maintenance WHERE device_id = ?"
+                    " AND ended_ts IS NULL", (new_device_id,)).fetchone():
+                self._conn.execute(
+                    "UPDATE device_maintenance SET ended_ts = ?,"
+                    " ended_by = ? WHERE device_id = ? AND ended_ts IS NULL",
+                    (time.time(), by or "merge", old_device_id))
+            cur = self._conn.execute(
+                "UPDATE device_maintenance SET device_id = ? WHERE device_id = ?",
+                (new_device_id, old_device_id))
+            moved["maintenance"] = cur.rowcount or 0
             open_ids = [row["id"] for row in self._conn.execute(
                 "SELECT id FROM alerts WHERE entity_kind = 'device'"
                 " AND entity_id = ? AND state IN ('open','acked')",
@@ -2273,6 +2347,97 @@ class AlertsDatabase(SqliteStore):
                                      (now if now is not None else time.time(),))
             self._conn.commit()
         return cur.rowcount or 0
+
+    # ------------------------------------------------ device maintenance
+
+    def set_maintenance(self, device_id: int, by: str = "",
+                        reason: str = "") -> sqlite3.Row:
+        """Put a device into indefinite maintenance, or leave the period it
+        is already in exactly as it was.
+
+        Idempotent rather than an upsert: pressing the button twice must not
+        restart the clock or rewrite who set it, because "since when, and by
+        whom" is the whole record. The INSERT is guarded by its own NOT
+        EXISTS inside the lock, so two concurrent calls cannot race past the
+        partial unique index and turn a second press into an IntegrityError.
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO device_maintenance(device_id, started_ts,"
+                " started_by, reason) SELECT ?,?,?,? WHERE NOT EXISTS"
+                " (SELECT 1 FROM device_maintenance WHERE device_id = ?"
+                "  AND ended_ts IS NULL)",
+                (int(device_id), time.time(), by, reason, int(device_id)))
+            self._conn.commit()
+        return self.open_maintenance(device_id)
+
+    def clear_maintenance(self, device_id: int, by: str = "") -> bool:
+        """End the open period, keeping the row: a closed period is the
+        availability report's evidence that those seconds were planned."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE device_maintenance SET ended_ts = ?, ended_by = ?"
+                " WHERE device_id = ? AND ended_ts IS NULL",
+                (time.time(), by, int(device_id)))
+            self._conn.commit()
+        return bool(cur.rowcount)
+
+    def open_maintenance(self, device_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM device_maintenance WHERE device_id = ?"
+                " AND ended_ts IS NULL", (int(device_id),)).fetchone()
+
+    def maintenance_device_ids(self) -> dict[str, sqlite3.Row]:
+        """str(device_id) -> the open period, for every device in
+        maintenance right now. Keyed as a string to match muted_entity_ids,
+        whose entity_id column is TEXT, so the two fold together without a
+        conversion at every call site."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM device_maintenance WHERE ended_ts IS NULL"
+            ).fetchall()
+        return {str(row["device_id"]): row for row in rows}
+
+    def maintenance_periods(self, t0: float, t1: float
+                            ) -> dict[str, list[sqlite3.Row]]:
+        """Every period overlapping [t0, t1), open ones included, grouped by
+        device. The availability report's read: an OPEN period has no end to
+        compare against, so it qualifies on started_ts alone and the caller
+        clamps it to `now` itself."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM device_maintenance WHERE started_ts < ?"
+                " AND (ended_ts IS NULL OR ended_ts > ?)"
+                " ORDER BY started_ts", (t1, t0)).fetchall()
+        grouped: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            grouped.setdefault(str(row["device_id"]), []).append(row)
+        return grouped
+
+    def forget_device(self, device_id: int) -> None:
+        """Every trace of a device this store still holds keyed on its id,
+        dropped when Nodes deletes it.
+
+        devices.id is INTEGER PRIMARY KEY without AUTOINCREMENT, so SQLite
+        reissues a freed rowid: without this the NEXT device added would
+        silently inherit the deleted one's maintenance mode and its mute —
+        the same inheritance api.delete_nodes_device's delete ORDER already
+        exists to prevent for ConfigRX's stored credentials.
+        """
+        key = str(int(device_id))
+        with self._lock:
+            # Every period, open or closed, in one statement: there is no
+            # availability history worth keeping for a device that is no
+            # longer in Nodes, and a closed row left behind would be
+            # replayed against whatever device inherits the rowid next.
+            self._conn.execute(
+                "DELETE FROM device_maintenance WHERE device_id = ?",
+                (int(device_id),))
+            self._conn.execute(
+                "DELETE FROM alert_mutes WHERE entity_kind = 'device'"
+                " AND entity_id = ?", (key,))
+            self._conn.commit()
 
     # ------------------------------------------------- maintenance windows
 
@@ -2813,6 +2978,15 @@ class AlertsDatabase(SqliteStore):
             # this only stops the table growing a row per mute ever set.
             self._conn.execute("DELETE FROM alert_mutes WHERE until_ts <= ?",
                                (time.time(),))
+            # A CLOSED maintenance period is history the availability
+            # report replays, so it ages out on the same retention as the
+            # alerts it explains rather than on a clock of its own. An OPEN
+            # one is never pruned at any age: the device is still out of
+            # service, and deleting the row would silently put it back into
+            # alerting.
+            self._conn.execute(
+                "DELETE FROM device_maintenance WHERE ended_ts IS NOT NULL"
+                " AND ended_ts < ?", (cutoff,))
             self._conn.commit()
         return removed
 

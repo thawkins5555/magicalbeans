@@ -3102,6 +3102,21 @@ def _device_filters(params) -> dict:
     }
 
 
+def _maintenance_only_ids(service, params):
+    """The device ids to restrict the list to when `maintenance_only` is
+    present, or None when it is not.
+
+    Server-side, because the list is paged at DEVICE_LIST_DEFAULT_LIMIT: a
+    page filtered after the fact would hand back fewer rows than it asked
+    for and a `total` that did not describe them. The ids come from
+    alerts.db, which nodesdb cannot join against — two files — so they are
+    read here and passed down as an id clause.
+    """
+    if params.get("maintenance_only") is None:
+        return None
+    return [int(i) for i in service.alerts_db.maintenance_device_ids()]
+
+
 def _device_rows_json(service, params, rows) -> list[dict]:
     worker_state = service.node_poller.worker_state()
     # A mute lives in the Alerts module but has to be visible here: an
@@ -3115,6 +3130,10 @@ def _device_rows_json(service, params, rows) -> list[dict]:
     window_covered = service.alerts_db.window_covered_device_ids(
         ((row["id"], row["device_group_id"]) for row in rows))
     muted = service.alerts_db.muted_entity_ids("device", window_covered=window_covered)
+    # Its OWN field, never folded into muted_until: maintenance mode has no
+    # until_ts, and anything rendering muted_until prints "muted until <a
+    # date>" — an operator handed a date that never arrives waits for it.
+    maintenance = service.alerts_db.maintenance_device_ids()
     # A device merged into another keeps the address it was entered under as
     # an alias, and the list is where an operator looks for that address —
     # so the whole set rides along, in one read for the page rather than one
@@ -3126,6 +3145,8 @@ def _device_rows_json(service, params, rows) -> list[dict]:
         device = _device_json(row, reveal)
         device["polling"] = row["id"] in worker_state
         device["muted_until"] = muted.get(str(row["id"]))
+        maint_row = maintenance.get(str(row["id"]))
+        device["maintenance"] = _maintenance_json(maint_row) if maint_row else None
         device["addresses"] = _device_addresses_json(
             row, aliases.get(row["id"], ()))
         devices.append(device)
@@ -3143,6 +3164,13 @@ DEVICE_LIST_MAX_LIMIT = 2000
 
 def get_nodes_devices(service, params, body) -> dict:
     filters = _device_filters(params)
+    only_ids = _maintenance_only_ids(service, params)
+    if only_ids is not None:
+        # Nothing is in maintenance mode: answered here rather than by
+        # nodesdb, whose id clause has no valid SQL for an empty set.
+        if not only_ids:
+            return {"devices": [], "total": 0}
+        filters["only_ids"] = only_ids
     total = service.nodes_db.devices_count(**filters)
     if params.get("limit") is None and params.get("offset") is None:
         rows = service.nodes_db.devices(**filters)
@@ -3153,20 +3181,31 @@ def get_nodes_devices(service, params, body) -> dict:
             "total": total, "limit": limit, "offset": offset}
 
 
+_DEVICE_CSV_HEADER = ["id", "name", "ip", "status", "group_id", "device_group_id",
+                     "vendor", "sys_descr", "sys_name", "polling", "muted_until",
+                     "maintenance_since", "poll_interval_s", "last_poll_ts",
+                     "addresses"]
+
+
 def get_nodes_devices_export(service, params, body) -> dict:
     """The Devices table's current filter, unpaged and uncapped: a CSV
     export exists to leave with everything that matched, not one page of
     it, and nodes_db.devices() already has no limit of its own to lift."""
     filters = _device_filters(params)
+    only_ids = _maintenance_only_ids(service, params)
+    if only_ids is not None:
+        if not only_ids:
+            return _csv_response("devices", _DEVICE_CSV_HEADER, [])
+        filters["only_ids"] = only_ids
     rows = service.nodes_db.devices(**filters)
     devices = _device_rows_json(service, params, rows)
-    header = ["id", "name", "ip", "status", "group_id", "device_group_id",
-             "vendor", "sys_descr", "sys_name", "polling", "muted_until",
-             "poll_interval_s", "last_poll_ts", "addresses"]
+    header = _DEVICE_CSV_HEADER
     csv_rows = [[d.get("id"), d.get("name"), d.get("ip"), d.get("status"),
                 d.get("group_id"), d.get("device_group_id"), d.get("vendor"),
                 d.get("sys_descr"), d.get("sys_name"), d.get("polling"),
-                d.get("muted_until"), d.get("poll_interval_s"), d.get("last_poll_ts"),
+                d.get("muted_until"),
+                (d.get("maintenance") or {}).get("started_ts"),
+                d.get("poll_interval_s"), d.get("last_poll_ts"),
                 ", ".join(a["ip"] for a in d.get("addresses") or ())]
                for d in devices]
     return _csv_response("devices", header, csv_rows)
@@ -3650,6 +3689,10 @@ def get_nodes_device(service, params, body, device_id) -> dict:
     device["muted_until"] = max(
         (v for v in (mute["until_ts"] if mute else None, window_until)
          if v is not None), default=None)
+    # Beside muted_until, never inside it — see _device_rows_json. A device
+    # can be muted AND in maintenance at once, and both lines render.
+    maint_row = service.alerts_db.open_maintenance(device_id)
+    device["maintenance"] = _maintenance_json(maint_row) if maint_row else None
     # Rides in the device JSON rather than behind its own fetch: the
     # ADDRESSES subtab is one short list the detail pane already has a
     # round trip for, and a second request per device selection to carry
@@ -3789,14 +3832,19 @@ def put_nodes_device(service, params, body, device_id) -> dict:
 
 def delete_nodes_device(service, params, body, device_id) -> dict:
     row = _require(service.nodes_db.device(device_id), "device")
-    # ConfigRX first, Nodes second. Two databases, so this cannot be one
-    # transaction and one order has to be wrong on a crash; the question is
-    # which residue is survivable. Nodes-first would leave configrx.db
+    # Alerts first, ConfigRX second, Nodes last. Three databases, so this
+    # cannot be one transaction and one order has to be wrong on a crash;
+    # the question is which residue is survivable. Nodes-first would leave configrx.db
     # holding this device_id's ssh_password_enc and enable_secret_enc keyed
     # on an id nothing owns — and devices.id is INTEGER PRIMARY KEY without
     # AUTOINCREMENT, so SQLite reissues the freed rowid and the next device
     # added would silently inherit those credentials. This order fails the
     # other way: a nodes row outliving its ConfigRX config, deletable again.
+    # Alerts goes ahead of both on exactly that reasoning: an open
+    # maintenance period or a mute keyed on this id would be inherited whole
+    # by whichever device SQLite next hands the freed rowid to, which would
+    # then arrive silenced with nothing on screen saying why.
+    service.alerts_db.forget_device(device_id)
     service.configrx_db.forget_device(device_id)
     service.nodes_db.remove_device(device_id)
     service.log.add(NODES_CATEGORY, f"Removed device {row['ip']}")
@@ -3853,9 +3901,10 @@ def post_nodes_devices_bulk_update(service, params, body) -> dict:
 
 def post_nodes_devices_bulk_delete(service, params, body) -> dict:
     device_ids = _bulk_device_ids(body)
-    # ConfigRX first, for the credential-inheritance reason spelled out in
+    # Alerts then ConfigRX, for the inheritance reasons spelled out in
     # delete_nodes_device.
     for device_id in device_ids:
+        service.alerts_db.forget_device(device_id)
         service.configrx_db.forget_device(device_id)
     removed = service.nodes_db.bulk_remove_devices(device_ids)
     service.log.add(NODES_CATEGORY, f"Bulk-removed {removed} device(s)")
@@ -5479,6 +5528,10 @@ def get_alerts_overview(service, params, body) -> dict:
         "t0": t0, "t1": t1, "bucket_s": bucket,
         "buckets": service.alerts_db.histogram(t0, t1, bucket),
         "summary": service.alerts_db.open_summary(),
+        # Beside the open counts, because maintenance mode never expires: a
+        # device left in it and forgotten is invisible everywhere alert
+        # counts are read unless this says so.
+        "maintenance_count": len(service.alerts_db.maintenance_device_ids()),
         "engine": {
             "running": service.alert_engine.running,
             "status": service.alert_engine.status_text(),
@@ -5637,11 +5690,12 @@ def delete_alerts_mute(service, params, body) -> dict:
     return {"lifted": lifted}
 
 
-def _bulk_mute_device_ids(service, body) -> list[str]:
-    """Every device id a bulk-mute request names — an explicit list, a
+def _bulk_silence_device_ids(service, body) -> list[str]:
+    """Every device id a bulk silencing request names — an explicit list, a
     device group's whole current membership, or both together, refusing
     (like _mute_entity above) a request that would end up silencing
-    nothing."""
+    nothing. Shared by bulk mute and bulk maintenance mode: the two take the
+    same scope, and only differ in what they then do with it."""
     ids = {str(i) for i in (body.get("device_ids") or [])}
     group_id = body.get("group_id")
     if group_id:
@@ -5667,7 +5721,7 @@ def post_alerts_bulk_mute(service, params, body) -> dict:
     """One call, many devices — the planned-cutover case the ad-hoc mute
     route makes hundreds of calls. Same ad-hoc cap (MAX_MUTE_HOURS) as a
     single mute; a longer silence is what a maintenance WINDOW is for."""
-    entity_ids = _bulk_mute_device_ids(service, body)
+    entity_ids = _bulk_silence_device_ids(service, body)
     try:
         hours = float(body.get("hours", 1))
     except (TypeError, ValueError):
@@ -5681,6 +5735,110 @@ def post_alerts_bulk_mute(service, params, body) -> dict:
     _audit(service, params, "alert.mute_bulk",
           detail=f"{len(rows)} device(s), {hours:g}h: {reason}")
     return {"muted": len(rows), "mutes": [_mute_json(r) for r in rows]}
+
+
+# ------------------------------------------------ device maintenance mode
+#
+# The third silencing mechanism, and the only indefinite one. Devices only,
+# with no entity_kind parameter at all: advertising a kind the handler then
+# refuses is worse than not offering one, and unlike alert_mutes this table
+# has no column pretending otherwise.
+
+
+def _maintenance_json(row) -> dict:
+    return {"device_id": row["device_id"], "started_ts": row["started_ts"],
+            "ended_ts": row["ended_ts"], "started_by": row["started_by"],
+            "ended_by": row["ended_by"], "reason": row["reason"]}
+
+
+def _maintenance_device(service, body):
+    """The device row a maintenance request names, refused unless Nodes
+    actually has it — the same reasoning _mute_entity gives: a suppression that
+    silences nothing is worse than an error, because the operator walks away
+    believing it worked.
+
+    A body carrying `hours` or `until_ts` is refused rather than ignored.
+    Silently dropping either is how somebody ends up believing they set a
+    four-hour maintenance, so the message names the mechanism that does what
+    they asked for instead.
+    """
+    if "hours" in body:
+        raise ValueError("Maintenance mode has no duration — it stays on "
+                         "until someone turns it off. Use a mute for a "
+                         "1-24 hour silence.")
+    if "until_ts" in body:
+        raise ValueError("Maintenance mode has no end time — it stays on "
+                         "until someone turns it off. Use a maintenance "
+                         "window for a planned span.")
+    raw = str(body.get("device_id", "")).strip()
+    if not raw:
+        raise ValueError("A device is required")
+    try:
+        device_id = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("device_id must be a device id")
+    return _require(service.nodes_db.device(device_id), "device")
+
+
+def get_alerts_maintenance(service, params, body) -> dict:
+    return {"maintenance": [_maintenance_json(row) for row in
+                            service.alerts_db.maintenance_device_ids().values()]}
+
+
+def post_alerts_maintenance(service, params, body) -> dict:
+    """Put a device into indefinite maintenance mode. Idempotent: a device
+    already in it comes back with the period it is already in, untouched,
+    rather than a restarted clock and a rewritten owner."""
+    device = _maintenance_device(service, body)
+    reason = str(body.get("reason", ""))
+    already = service.alerts_db.open_maintenance(device["id"]) is not None
+    row = service.alerts_db.set_maintenance(
+        device["id"], by=params.get("_username", ""), reason=reason)
+    if not already:
+        _audit(service, params, "alert.maintenance_on",
+              target=f"device:{device['ip']}", detail=reason)
+    return {"maintenance": _maintenance_json(row), "already": already}
+
+
+def delete_alerts_maintenance(service, params, body) -> dict:
+    """Body-on-DELETE, matching delete_alerts_mute — the device is the
+    request, and this route has no id of its own to put in the path."""
+    device = _maintenance_device(service, body)
+    cleared = service.alerts_db.clear_maintenance(
+        device["id"], by=params.get("_username", ""))
+    if cleared:
+        _audit(service, params, "alert.maintenance_off",
+              target=f"device:{device['ip']}")
+    return {"cleared": cleared}
+
+
+def post_alerts_bulk_maintenance(service, params, body) -> dict:
+    """One call, many devices, in or out — `clear` picks which. Two
+    directions on one route rather than two, because the scope resolution
+    (_bulk_silence_device_ids) is the whole of the work and a bulk selection
+    is turned on and off from the same bar."""
+    if "hours" in body or "until_ts" in body:
+        raise ValueError("Maintenance mode has no duration or end time — it "
+                         "stays on until someone turns it off. Use a mute or "
+                         "a maintenance window for a bounded silence.")
+    device_ids = _bulk_silence_device_ids(service, body)
+    clear = bool(body.get("clear"))
+    reason = str(body.get("reason", ""))
+    username = params.get("_username", "")
+    changed = 0
+    for device_id in device_ids:
+        if clear:
+            changed += bool(service.alerts_db.clear_maintenance(
+                int(device_id), by=username))
+        else:
+            was_open = service.alerts_db.open_maintenance(int(device_id)) is not None
+            service.alerts_db.set_maintenance(int(device_id), by=username,
+                                              reason=reason)
+            changed += 0 if was_open else 1
+    _audit(service, params, "alert.maintenance_bulk",
+          target=f"{len(device_ids)} devices",
+          detail=f"{'off' if clear else 'on'}, {changed} changed: {reason}")
+    return {"devices": len(device_ids), "changed": changed, "cleared": clear}
 
 
 # --------------------------------------------------- maintenance windows
