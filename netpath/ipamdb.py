@@ -12,7 +12,62 @@ import ipaddress
 import sqlite3
 import time
 
+from .ipam_scan import mac_colon
 from .sqlitebase import SqliteStore
+
+
+_MAC_SEPARATORS = ":-. \t"
+_HEX = set("0123456789abcdefABCDEF")
+
+
+def mac_search_digits(text) -> str:
+    """What an operator typed, as bare lower-case hex if it could be a MAC
+    or the start of one, else "".
+
+    The search box gets a MAC in whatever spelling was nearest to hand —
+    pasted from a switch (`aabb.ccdd.eeff`), from Windows (`AA-BB-CC-...`),
+    from a label on the device (the last four digits, bare) — and the
+    stored column has one spelling, so the comparison has to happen on a
+    form both sides can be reduced to. This is that form; _mac_digits_sql
+    is the column side of the same reduction.
+
+    Not nodesdb.normalize_mac, which does the same reduction for the Nodes
+    stack: the two are kept apart on purpose, so that IPAM's store does not
+    import the Nodes store for a five-line string function. Not
+    ipam_scan.mac_colon either — that produces the *stored* shape and
+    refuses a prefix, where a prefix is exactly what an OUI search is.
+
+    Digits-and-dots only is refused: "10.0.0.5" reduces to "10005", which is
+    valid hex and would quietly turn an address search into a MAC-prefix
+    search. A genuinely all-numeric MAC typed with dots is rare enough to be
+    worth losing next to searching by IP, which people do constantly.
+    """
+    raw = str(text or "").strip()
+    if not raw or all(c.isdigit() or c == "." for c in raw):
+        return ""
+    cleaned = "".join(c for c in raw if c not in _MAC_SEPARATORS)
+    if not cleaned or len(cleaned) > 12 or any(c not in _HEX for c in cleaned):
+        return ""
+    return cleaned.lower()
+
+
+# Fewer hex digits than this and a MAC clause is noise: "ab" is in most
+# addresses, and a two-letter hostname fragment would light up half the
+# lease table. The same floor nodesdb's device filter uses for its
+# mac_entries clause.
+MAC_SEARCH_MIN_DIGITS = 4
+
+
+def _mac_digits_sql(column: str) -> str:
+    """`column` reduced to bare lower-case hex in SQL — the stored side of
+    mac_search_digits. The column is colon-separated lower case for every
+    row written since the DHCP ingest started normalising and for every
+    row _migrate rewrote, so the REPLACEs are mostly a no-op; they stay
+    so a row that somehow kept an older spelling is still found rather
+    than silently absent, which is indistinguishable from "not leased".
+    Unindexable, like every other clause in the searches that use it —
+    those are all leading-% LIKEs and already scan."""
+    return f"REPLACE(REPLACE(REPLACE(LOWER({column}),'-',''),':',''),'.','')"
 
 
 def scope_size(start_ip: str, end_ip: str) -> int | None:
@@ -128,7 +183,12 @@ CREATE TABLE IF NOT EXISTS dhcp_scopes (
 -- Dynamic leases and static reservations both land here — the DhcpServer
 -- module reports a reservation as a lease with an AddressState that says so
 -- — with `is_reservation` set from the separate reservation list so the UI
--- can tell them apart without parsing that string.
+-- can tell them apart without parsing that string. `mac` is stored the way
+-- hosts.mac is (ipam_scan.mac_colon: lower case, colons) rather than the
+-- way the server spells it (AA-BB-CC-DD-EE-FF), so the two tables compare
+-- equal for the same card and dhcp_leases_for_mac can look one up through
+-- ix_dhcp_leases_mac instead of scanning; ipam_dhcp._stored_mac converts
+-- at ingest and _migrate below rewrote whatever was stored before it did.
 CREATE TABLE IF NOT EXISTS dhcp_leases (
     id               INTEGER PRIMARY KEY,
     server_id        INTEGER NOT NULL REFERENCES dhcp_servers(id) ON DELETE CASCADE,
@@ -144,6 +204,10 @@ CREATE TABLE IF NOT EXISTS dhcp_leases (
     UNIQUE(server_id, ip)
 );
 CREATE INDEX IF NOT EXISTS ix_dhcp_leases_scope ON dhcp_leases(server_id, scope_id);
+-- Serves dhcp_leases_for_mac's equality lookup. The substring search in
+-- search_dhcp cannot use it (leading-% LIKE over a REPLACE expression) and
+-- never could, so before the exact lookup existed this index cost every
+-- poll's wholesale re-insert something and answered nothing.
 CREATE INDEX IF NOT EXISTS ix_dhcp_leases_mac ON dhcp_leases(mac);
 
 -- One usage snapshot per scope per poll, so the DHCP page can chart the
@@ -241,6 +305,35 @@ class IpamDatabase(SqliteStore):
         self.ensure_columns("dhcp_servers",
                             {"username": "TEXT", "password_enc": "BLOB"})
         self.ensure_columns("dhcp_scopes", {"router": "TEXT"})
+        self._normalise_lease_macs()
+
+    def _normalise_lease_macs(self) -> None:
+        """Rewrite dhcp_leases.mac rows stored in the server's own spelling
+        (`AA-BB-CC-DD-EE-FF`) into the colon form ipam_dhcp now writes at
+        ingest, so an upgraded install searches and cross-checks correctly
+        from its first open rather than one poll interval later.
+
+        Every poll replaces a server's leases wholesale, so ingest alone
+        would self-heal within an interval; this makes the upgrade correct
+        immediately and, more to the point, leaves nothing for a reader to
+        special-case. It runs the same mac_colon the ingest path runs, on
+        purpose — a SQL rewrite would be a second spelling of the rule, and
+        the two would drift. Idempotent: an already-colon row converts to
+        itself and is skipped; a ClientId that is not a MAC at all is left
+        exactly as stored, the same choice ipam_dhcp._stored_mac makes. The
+        caller holds the lock and commits, like the rest of _migrate.
+        """
+        rows = self._conn.execute(
+            "SELECT id, mac FROM dhcp_leases WHERE mac IS NOT NULL AND mac <> ''"
+        ).fetchall()
+        changed = []
+        for row in rows:
+            canonical = mac_colon(row["mac"]) or row["mac"]
+            if canonical != row["mac"]:
+                changed.append((canonical, row["id"]))
+        if changed:
+            self._conn.executemany(
+                "UPDATE dhcp_leases SET mac=? WHERE id=?", changed)
 
     # --------------------------------------------------------------- subnets
 
@@ -646,36 +739,90 @@ class IpamDatabase(SqliteStore):
                 "SELECT * FROM dhcp_leases WHERE ip=? ORDER BY polled_ts DESC LIMIT 1",
                 (ip,)).fetchone()
 
+    @staticmethod
+    def _mac_clause(column: str, query: str) -> tuple[str, list]:
+        """The MAC half of a search WHERE, or nothing: `(" OR <expr> LIKE ?",
+        [needle])` when `query` reads as at least MAC_SEARCH_MIN_DIGITS of
+        hex, `("", [])` otherwise. Substring rather than prefix, matching
+        what the raw `mac LIKE '%q%'` it replaces did for the one spelling
+        it happened to catch: an OUI is a prefix, but the four digits on a
+        device's label are the tail, and people search by both.
+
+        A plain `mac LIKE '%query%'` looked like it did this and did not:
+        the column held the server's `AA-BB-CC-DD-EE-FF` and the box held
+        whatever the operator had to hand, and zero results looks exactly
+        like "this address is not leased". Both sides are reduced to bare
+        hex so the spelling on either cannot matter.
+        """
+        digits = mac_search_digits(query)
+        if len(digits) < MAC_SEARCH_MIN_DIGITS:
+            return "", []
+        return f" OR {_mac_digits_sql(column)} LIKE ?", [f"%{digits}%"]
+
     def search_hosts(self, query: str, limit: int = 50) -> list[sqlite3.Row]:
-        """Discovered hosts whose address or MAC contains `query`. Bare IP
-        and MAC lookups belong here rather than in the DHCP or reverse-DNS
-        searches: a host SappiWhere's own sweep found can be alive with
-        neither a lease nor a PTR record to its name."""
+        """Discovered hosts whose address or MAC contains `query`, the MAC
+        in any spelling an operator might type. Bare IP and MAC lookups
+        belong here rather than in the DHCP or reverse-DNS searches: a host
+        SappiWhere's own sweep found can be alive with neither a lease nor
+        a PTR record to its name."""
         like = f"%{query}%"
+        mac_sql, mac_params = self._mac_clause("h.mac", query)
         with self._lock:
             return self._conn.execute(
                 "SELECT h.*, s.cidr AS subnet_cidr FROM hosts h"
                 " LEFT JOIN subnets s ON s.id = h.subnet_id"
-                " WHERE h.ip LIKE ? OR h.mac LIKE ?"
+                f" WHERE h.ip LIKE ?{mac_sql}"
                 " ORDER BY h.ip LIMIT ?",
-                (like, like, limit)).fetchall()
+                (like, *mac_params, limit)).fetchall()
 
     def search_dhcp(self, query: str, limit: int = 50) -> list[sqlite3.Row]:
-        """Leases and reservations whose IP, MAC, client-reported hostname or
-        description contains `query`. Hostname is the forward half of IPAM's
-        name lookup — what a device called itself when it got the address,
-        rather than what reverse DNS says now — but IP and MAC belong here
-        too: a lease is often the only record of a device that never
-        answered SappiWhere's own ping sweep (asleep, off-segment, or behind
-        a firewall that drops ICMP but still asked the DHCP server for an
-        address)."""
+        """Leases and reservations whose IP, client-reported hostname or
+        description contains `query`, or whose MAC does in any spelling.
+        Hostname is the forward half of IPAM's name lookup — what a device
+        called itself when it got the address, rather than what reverse DNS
+        says now — but IP and MAC belong here too: a lease is often the only
+        record of a device that never answered SappiWhere's own ping sweep
+        (asleep, off-segment, or behind a firewall that drops ICMP but still
+        asked the DHCP server for an address)."""
         like = f"%{query}%"
+        mac_sql, mac_params = self._mac_clause("l.mac", query)
         with self._lock:
             return self._conn.execute(
                 "SELECT l.*, s.label AS server_label FROM dhcp_leases l"
                 " JOIN dhcp_servers s ON s.id = l.server_id"
-                " WHERE l.ip LIKE ? OR l.mac LIKE ? OR l.hostname LIKE ?"
-                "    OR l.description LIKE ?"
+                " WHERE l.ip LIKE ? OR l.hostname LIKE ?"
+                f"    OR l.description LIKE ?{mac_sql}"
                 " ORDER BY (l.hostname LIKE ?) DESC, l.ip"
                 " LIMIT ?",
-                (like, like, like, like, f"{query}%", limit)).fetchall()
+                (like, like, like, *mac_params, f"{query}%", limit)).fetchall()
+
+    def dhcp_leases_for_mac(self, mac: str, limit: int = 50) -> list[sqlite3.Row]:
+        """Every lease and reservation held by one MAC, across every server,
+        freshest poll first — for "where is this card" rather than "what
+        matches this text": the answer is the address(es) it holds now,
+        what it called itself, when the lease runs out, and whether it was
+        reserved for it. `mac` is accepted in any spelling and must be a
+        whole address; a prefix is a search, and search_dhcp does that.
+
+        An equality on the stored colon form, so ix_dhcp_leases_mac answers
+        it — the reason the column is normalised at ingest rather than only
+        reduced at query time. `server_label` and `scope_name` come along
+        because the caller is about to show the row to a person, and two
+        servers can each hold a lease for the same card (a laptop that
+        moved sites) that are told apart only by which server said so.
+        """
+        digits = mac_search_digits(mac)
+        if len(digits) != 12:
+            return []
+        stored = mac_colon(":".join(digits[i:i + 2] for i in range(0, 12, 2)))
+        with self._lock:
+            return self._conn.execute(
+                "SELECT l.*, s.label AS server_label, c.name AS scope_name"
+                " FROM dhcp_leases l"
+                " JOIN dhcp_servers s ON s.id = l.server_id"
+                " LEFT JOIN dhcp_scopes c ON c.server_id = l.server_id"
+                "                        AND c.scope_id = l.scope_id"
+                " WHERE l.mac = ?"
+                " ORDER BY l.polled_ts DESC, l.lease_expires_ts DESC, l.ip"
+                " LIMIT ?",
+                (stored, limit)).fetchall()
