@@ -391,6 +391,7 @@ bookmarked, and pasted into a ticket. Back and Forward work.
 | `#/nodes` | a tab, by name — the same for `#/alerts`, `#/netpath`, `#/netflow`, `#/snmp`, `#/syslog`, `#/ipam`, `#/wireless`, `#/configrx`, `#/mapper`, `#/debug`, `#/settings` |
 | `#/nodes/device/1234` | that device selected, detail pane open |
 | `#/nodes/device/1234/port/7` | that device with interface index 7 open |
+| `#/nodes/device/1234/arp` | that device's ARP tab open |
 | `#/alerts/998` | that alert |
 | `#/netpath/12` | that destination's route graph and timeline |
 | `#/configrx/device/1234/backup/57` | one stored backup |

@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.7.0 — Five reports](#570--five-reports)
 - [5.6.0 — Closing the window closes the application](#560--closing-the-window-closes-the-application)
 - [5.5.0 — Measured first, then made faster](#550--measured-first-then-made-faster)
 - [5.4.0 — Eight asks](#540--eight-asks)
@@ -130,6 +131,108 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.7.0 — Five reports
+
+Five operator reports, answered one at a time below, and a closing note on
+what came up while fixing them.
+
+**1. "The MAPPER is still double drawing information about the
+connections — number of vlans, Port name twice. I thought the CDP/LLDP
+double info issue was resolved?"** It was, in 5.4.0, but only half of it.
+That fix folds a cable's two rows onto one link when the far end resolved
+by chassis MAC; a row that resolved only by sysName has no far-end
+interface to key on, so it falls back to a link of its own, and the fold
+could only merge such a row onto a MAC-matched link that already existed.
+When *neither* end of a cable resolved by MAC, both rows survived, drawn
+on the same two nodes with the VLAN count and both port labels painted
+twice over — and since the CDP walker never records what kind of
+identifier it holds, two classic Cisco switches joined by one cable and
+speaking only CDP always land there. A new pass now folds those two rows
+as well, but only when a device pair reports exactly one such link from
+each side — one cable, one port named at each end, so the pairing is
+forced rather than guessed. Two or more from either side is a LAG or a
+pair cross-connected twice, and is deliberately left drawn as separate
+lines. The fold also fills in the far end's own interface and its real
+port label in place of the raw string CDP sent.
+
+**2. "Netflow graphs are not showing all data from the timeline window
+selected."** Five separate defects, all in the traffic chart. The newest
+bucket of any window is almost always partial, but every value was
+divided by a *whole* bucket's width regardless — so the most recent data
+drew as a cliff at a fraction of its true rate, confirmed by a hover that
+read the same wrong number, and the axis stopped one bucket short of the
+right edge entirely. Both are fixed: each slot is now rated over the time
+it actually covers, and the axis spans the real window. Separately, a
+rollup bucket only ever stores its heaviest keys, so a series being
+watched could read as zero in a bucket where it briefly fell below that
+cap — the total stayed exact because the shortfall went to "other," but
+the band in question had holes in it. Buckets the cap cut short are now
+flagged as they are written and repaired from the individual records on
+read, wherever those records still reach back far enough. And two smaller
+ones: a drag-selection narrower than the chart's current bucket did
+nothing at all, silently — fixed, down to a few seconds; and the legend
+dropped an entry that didn't fit the row rather than wrapping it, so a
+band could be drawn with nothing naming it — it wraps now, and a
+top-talkers bar past the eighth (past what the chart has a colour left
+for) takes the neutral "other" swatch and says so, instead of reusing an
+early colour and claiming a band that doesn't exist.
+
+**3. "The Global search function should be able to locate MAC addresses
+on Node switch ports."** This already worked and didn't say so plainly:
+the result group was titled "MAC address / interface," a name that reads
+as a database column rather than an answer. It is now "MAC address on a
+switch port," and the second line names the VLAN, whether the entry is
+current or aged out, and when it was last seen — all of which used to be
+folded into one thin sentence.
+
+**4. "Global search should identify DHCP Server leases for the MAC
+address searched for."** A lease arrives from Windows as
+`AA-BB-CC-DD-EE-FF` and was stored exactly that way, while every other
+MAC in this application — the subnet sweep's own host records included —
+is compared in lower-case colon form. Any notation other than the
+server's own returned nothing, and nothing here looks any different from
+"this address holds no lease." Leases are now normalised to that same
+form on the way in, an existing database is rewritten to match on its
+next open, and a search reduces both the stored column and whatever was
+typed to bare hex before comparing — so any spelling matches, including a
+vendor OUI prefix on its own. DHCP leases are now their own group in
+global search, naming the scope, server, address and whether the entry is
+a reservation, rather than only surfacing as part of a merged host
+record. None of this had a test behind it before.
+
+**5. "Need to be able to search ARP table of switches."** Nothing polled
+a switch or router's own ARP cache at all — the only ARP-aware code in
+the application read the collector host's own kernel cache, which cannot
+see past its own broadcast domain. A device's `ipNetToMediaTable` is now
+walked the way the MAC and LLDP tables already are, falling back to the
+IPv6-capable `ipNetToPhysicalTable` only when the first table answers no
+rows at all (never merged — a modern agent answers both with the same
+IPv4 mappings, and merging would double-count every one). A walk cut
+short by the row cap, a timeout, or a misbehaving agent stores nothing
+rather than a partial table, because the router most likely to hit that
+cap is exactly the one a partial answer would be most damaging for. The
+device detail pane gains an **ARP** subtab showing one device's whole
+cache, whose MAC cells run the existing MAC search so an address leads
+straight to the switch port it is learned on, plus a new global-search
+group and a CSV export. Governed by a new **Read the ARP cache every**
+setting, per polling profile and per device, and **off by default** —
+unlike MAC learning, a distribution router's ARP cache is routinely an
+order of magnitude larger than one access switch's forwarding table, so
+turning it on for every device on every upgraded fleet would be a real
+change in poll load and database size that nobody asked for. Entries age
+out on the same retention clock the MAC table already uses.
+
+**One thing found along the way is worth a note.** The "N devices are
+learning MAC addresses" sentence under the Nodes Find box has
+under-reported since 4.47.0, when the shipped default for **Learn MAC
+addresses every** changed from 0 to 3600 seconds — every device relying
+on that inherited default (the common case on a fleet that upgraded
+rather than being reconfigured by hand) was invisible to the count behind
+that sentence, because its own fallback was never updated to match and
+still read 0. It now reads 3600, the same fallback the polling config
+itself uses. The new ARP-cache count needed no equivalent fix, since 0
+really is the shipped default there.
 
 ### 5.6.0 — Closing the window closes the application
 
