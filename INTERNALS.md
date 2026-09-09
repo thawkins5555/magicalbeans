@@ -1713,7 +1713,22 @@ prefers ifXTable's high-capacity/high-speed columns whenever present. A
 ~1.3× the interface's own reported speed) catches the case a 32-bit
 counter's single-wrap assumption cannot: a link fast enough to wrap more
 than once between two polls is treated as a reset rather than a
-fabricated multi-wrap number. `detect_reboot()` compares actual vs.
+fabricated multi-wrap number. `interface_speed_bps(speed, high_speed)` is
+the third pure function in that group and applies the same kind of refusal
+to the line rate itself: ifHighSpeed is preferred as it always was (ifSpeed
+saturates at `IF_SPEED_SENTINEL`, 4294967295, and cannot express a modern
+link), but a value above `MAX_PLAUSIBLE_SPEED_BPS` — 1.6 Tb/s, the next
+Ethernet rate the standard defines, a full doubling above the fastest
+shipping 800G port — or one 100× or more above a *non-saturated* ifSpeed is
+refused, because an unsaturated ifSpeed is exact and orders of magnitude of
+disagreement mean ifHighSpeed is wrong. A refused reading falls to ifSpeed
+where ifSpeed can answer; where it cannot (any link over ~4.29 Gb/s, which
+is exactly where the quirk shows up) it is retried as kilobits and kept
+only if that lands inside the ceiling. The quirk is real and per-linecard:
+an agent answering `ifHighSpeed = 10,000,000` for a 10 Gb/s port produced
+1e13, which `App.rate` correctly rendered as "10.0 Tbps", and drove that
+port's utilisation — `100 * in_bps * 8 / speed_bps` — to near zero.
+`detect_reboot()` compares actual vs.
 wall-clock-expected `sysUpTime` with a 30-second grace band, and
 explicitly excludes the case where the previous reading was already near
 `2**32` hundredths (TimeTicks' own ~497-day wraparound) so a genuine wrap
@@ -2521,6 +2536,46 @@ poller in the loop.
   row against the *wrong* port on a multi-homed device. It gets its own
   per-row key (`("name-match", device_id, if_index)`) instead — drawn as a
   second, one-directional line rather than a wrong guess.
+- **`_fold_name_matched(links_by_key)`** is the second pass that keeps that
+  per-row key from drawing one cable twice. The LLDP walker records a MAC
+  chassis id *with* `chassis_id_subtype = 4`, which is what nodesdb's
+  `_NEIGHBOR_MATCH_SQL` join requires, so an LLDP row resolves a
+  `matched_if_index` and keys on the pair; the CDP walker sets no subtype at
+  all and puts a device *name* in `chassis_id`, so only the sysName half of
+  the match fires and the row falls to the per-row key. Same cable, two
+  keys, two links on identical coordinates — and `drawLink` has no
+  parallel-edge offset, so each painted its own VLAN count and port labels
+  over the other's. The fold rests on one fact: **one local port carries one
+  cable.** A name-matched link folds onto a link that already has this row's
+  own `(device_id, if_index)` as an endpoint *and* whose far end is the
+  device this row matched, so it can never merge two genuine links. It runs
+  over the finished dict rather than per row, because the two rows arrive in
+  either order; where several links share the endpoint the lowest link id
+  wins, so the result does not follow row order either. Protocols and VLANs
+  union the way two rows sharing a key already did, and the far-end label
+  moves across only when the surviving link has none (that link resolved its
+  far end through `port_label`; a name-matched row carries only the raw
+  `port_id`/`port_descr` the neighbour advertised). The **reciprocal
+  name-only** case — two rows, two local ports, no `matched_if_index` on
+  either — is deliberately left as two links, for `link_identity`'s own
+  reason: nothing there says the two ports face each other.
+- **`_NEIGHBOR_MATCH_SQL`'s chassis-MAC join resolves at most one
+  interface, deterministically.** `interfaces` is unique only on
+  `(device_id, if_index)` and one chassis MAC routinely sits on several of
+  them (a stack's base MAC repeated per member, an SVI alongside its
+  port-channel), so a plain join on `phys_addr` fanned one neighbour row out
+  into several rows with different `matched_if_index` values — one cable,
+  several links, the same visible doubling by a different cause. The join
+  now selects a single `interfaces.rowid` through a correlated subquery
+  ordered by `(device_id, if_index)`, so the same estate always resolves the
+  same way; that join exists only to name the MAC's device for `bymac`.
+  `matched_if_index` is chosen separately, by a scalar subquery constrained
+  to `COALESCE(byname.id, bymac.id)` and ordered by `if_index` — the two
+  joins can resolve to *different* devices (byname wins whenever it fires),
+  and pairing one device's id with another device's port index is an
+  endpoint that does not exist. Both subqueries stay on an index
+  (`ix_interfaces_phys_addr_nocase` and the `(device_id, if_index)`
+  autoindex respectively).
 - **VLANs on a link are the union of what each end's own port reports,
   never the intersection.** A trunk is only really usable for a VLAN both
   ends allow, so intersection looks like the "more correct" answer — but
