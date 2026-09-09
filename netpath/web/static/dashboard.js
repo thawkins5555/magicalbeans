@@ -63,12 +63,21 @@
              { className: (c.auth || 0) > 0 ? 'warn' : '' }),
       figure(c.unsupported || 0, 'unsupported', '#/nodes?status=unsupported'),
     ].join('');
+    // With auto-sizing on, the pool size is a reading rather than a setting,
+    // so the tile says what it is allowed to be as well as what it is —
+    // otherwise a number that moves on its own looks like a fault.
+    const poolRange = pool.auto
+      ? ` — sizing itself between ${pool.floor} and ${pool.ceiling}`
+      : '';
     const poolLine = pool.workers
       ? `<p class="hint">Poll pool: ${pool.busy} busy, ${pool.queued} queued of ` +
-        `${pool.workers} worker(s)` +
+        `${pool.workers} worker(s)${poolRange}` +
         (pool.saturated
-          ? ' — <span class="warn-text">saturated</span>, every worker is in '
-            + 'use and work is waiting'
+          ? (pool.auto
+             ? ' — <span class="warn-text">at its ceiling</span>, every worker '
+               + 'it is allowed is in use and work is waiting'
+             : ' — <span class="warn-text">saturated</span>, every worker is in '
+               + 'use and work is waiting')
           : '') + '</p>'
       : '';
     const stopped = fleet.running ? ''
