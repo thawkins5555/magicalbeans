@@ -1374,6 +1374,23 @@ class Service:
                       "oldest resolved alerts")
 
         self._sample_storage_alerts()
+        self._optimize_stores()
+
+    def _optimize_stores(self) -> None:
+        """Refresh every store's query-planner statistics.
+
+        Last in the sweep, after the prunes and trims have changed the table
+        sizes the planner is about to be told about, and cheap enough at this
+        cadence that it needs no budget of its own -- PRAGMA optimize does
+        nothing at all for a table whose statistics are still current.
+        """
+        for store in STORES:
+            if self._stopping():
+                return
+            db = db_for(self, store)
+            optimize = getattr(db, "optimize", None)
+            if callable(optimize):
+                optimize()
 
     def _sample_storage_alerts(self) -> None:
         """Alert on a database close to its cap, and on the volume under

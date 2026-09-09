@@ -56,6 +56,12 @@ def connect(path: str, **kwargs) -> sqlite3.Connection:
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA cache_size=-20000")
         conn.execute("PRAGMA mmap_size=268435456")
+        # Sorts and grouping that no index can serve stay in memory rather
+        # than spilling to a temp file. Most of the reads that cost anything
+        # here are of that shape -- an ORDER BY over an expression, or over a
+        # column the filter already had to scan -- so this is the cheapest
+        # line in the file. Bounded by SQLite's own temp allocations.
+        conn.execute("PRAGMA temp_store=MEMORY")
     except sqlite3.DatabaseError:
         pass
     if path and path != ":memory:" and not path.startswith("file:"):
@@ -420,6 +426,25 @@ class SqliteStore:
         self._after_open()
 
     # ------------------------------------------------------------- lifecycle
+
+    def optimize(self) -> None:
+        """Let SQLite update the statistics its planner reads.
+
+        Neither this nor ANALYZE had ever been run anywhere in this
+        application, so every query with more than one usable index has been
+        planned on stock guesses since it was written. Called from the
+        maintenance sweep rather than at open: on a cold large file it can
+        take a while, and startup time is already a sore point (see
+        enable_incremental_vacuum's note about half a minute).
+
+        Best-effort. A planner hint that cannot be refreshed is not a reason
+        to fail a maintenance pass.
+        """
+        try:
+            with self._lock:
+                self._conn.execute("PRAGMA optimize")
+        except sqlite3.DatabaseError as exc:
+            log.debug("%s: PRAGMA optimize failed: %s", self.LABEL, exc)
 
     def lock_stats(self) -> dict:
         """How much time this store's single lock has cost, cumulatively.

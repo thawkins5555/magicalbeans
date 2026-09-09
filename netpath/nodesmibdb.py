@@ -113,18 +113,21 @@ class NodesMibDatabase(SqliteStore):
             self._conn.execute(
                 "DELETE FROM mib_objects WHERE mib_file_id = ? AND edited = 0",
                 (mib_file_id,))
-            for obj in objects:
-                self._conn.execute(
-                    "INSERT INTO mib_objects(mib_file_id, name, oid, description,"
-                    " syntax, enums, is_notification) VALUES (?,?,?,?,?,?,?)"
-                    " ON CONFLICT(mib_file_id, name) DO UPDATE SET"
-                    " oid=excluded.oid, description=excluded.description,"
-                    " syntax=excluded.syntax, enums=excluded.enums,"
-                    " is_notification=excluded.is_notification"
-                    " WHERE mib_objects.edited = 0",
-                    (mib_file_id, obj["name"], obj.get("oid"), obj.get("description"),
-                     obj.get("syntax"), json.dumps(obj["enums"]) if obj.get("enums") else None,
-                     1 if obj.get("is_notification") else 0))
+            # executemany, not a loop: a bundle install is tens of thousands
+            # of objects and this is a save the operator sits and waits on.
+            self._conn.executemany(
+                "INSERT INTO mib_objects(mib_file_id, name, oid, description,"
+                " syntax, enums, is_notification) VALUES (?,?,?,?,?,?,?)"
+                " ON CONFLICT(mib_file_id, name) DO UPDATE SET"
+                " oid=excluded.oid, description=excluded.description,"
+                " syntax=excluded.syntax, enums=excluded.enums,"
+                " is_notification=excluded.is_notification"
+                " WHERE mib_objects.edited = 0",
+                [(mib_file_id, obj["name"], obj.get("oid"), obj.get("description"),
+                  obj.get("syntax"),
+                  json.dumps(obj["enums"]) if obj.get("enums") else None,
+                  1 if obj.get("is_notification") else 0)
+                 for obj in objects])
             self._conn.commit()
 
     def mib_objects(self, mib_file_id: int | None = None,

@@ -385,12 +385,11 @@ class FlowDatabase(SqliteStore):
 
     def set_interface_names(self, mapping: dict[tuple[str, int], str]) -> None:
         with self._lock:
-            for (exporter, index), name in mapping.items():
-                self._conn.execute(
-                    "INSERT INTO interfaces(exporter, if_index, name) VALUES (?,?,?)"
-                    " ON CONFLICT(exporter, if_index) DO UPDATE SET name=excluded.name",
-                    (exporter, index, name),
-                )
+            self._conn.executemany(
+                "INSERT INTO interfaces(exporter, if_index, name) VALUES (?,?,?)"
+                " ON CONFLICT(exporter, if_index) DO UPDATE SET name=excluded.name",
+                [(exporter, index, name)
+                 for (exporter, index), name in mapping.items()])
             self._conn.commit()
 
     def interface_names(self) -> dict[str, str]:

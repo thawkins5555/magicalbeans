@@ -2134,7 +2134,8 @@ def get_syslog_overview(service, params, body) -> dict:
     filters = _syslog_filters(params)
 
     buckets = service.syslog_db.histogram(t0, t1, bucket, filters)
-    stats = service.syslog_db.stats()
+    stats = service.cached_poll("syslog_stats", 10.0,
+                                service.syslog_db.stats)
     return {
         "t0": t0, "t1": t1, "bucket_s": bucket,
         "buckets": buckets,
@@ -2307,7 +2308,8 @@ def get_snmp_overview(service, params, body) -> dict:
     filters = _snmp_filters(params)
 
     buckets = service.snmp_db.histogram(t0, t1, bucket, filters)
-    stats = service.snmp_db.stats()
+    stats = service.cached_poll("trap_stats", 10.0,
+                                service.snmp_db.stats)
     return {
         "t0": t0, "t1": t1, "bucket_s": bucket,
         "buckets": buckets,
