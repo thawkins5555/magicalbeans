@@ -64,7 +64,9 @@ first render are ready.
 interfaces, alerts and NetPath destinations, and — from 4.49.0 — IPAM hosts
 and subnets, syslog messages and wireless access points, at once, and opens
 whatever is picked at that record's own URL — the same link a colleague
-could be sent instead. It stands down whenever a field, a dialog or the help
+could be sent instead. A MAC reads the same way in every group and on the
+Nodes ARP tab — lower case, colon-separated — however the module that
+found it happens to store one. It stands down whenever a field, a dialog or the help
 panel already has the keyboard, and the **Search** button beside Account and
 Sign out opens it for a mouse. Each group of results is its own independent
 lookup with its own failure handling: one group's endpoint being slow or
@@ -2202,9 +2204,18 @@ still filling in, or simply the odd-sized remainder at the end of the
 range — and it used to be divided by a whole bucket's width regardless,
 so the most recent data on every chart drew as a cliff down to a fraction
 of its true value and the hover over it agreed with the wrong number. Each
-slot is now rated over the time it actually covers, and the axis draws the
-final slot spanning the real window instead of stopping one interval short
-of the right edge. The legend wraps onto a second row rather than
+slot is now rated over the time it actually covers — down to a quarter of
+a bucket, and no further: NetFlow credits a record's whole volume to the
+second it ended, so a few seconds' sliver holding the end of one long
+flow is not carrying that flow's bytes at that pace, and rating it as if
+it were drew a spike at the right-hand edge that flickered on every
+refresh of a live window. Rated over at least a quarter bucket, the most
+the newest slot can be over-read is four times, whatever the interval,
+and the hover says when that floor was used ("3s of 60s so far, rated
+over 15s"). The axis draws the final slot spanning the real window
+instead of stopping one interval short of the right edge, and a window
+whose end falls exactly on a bucket boundary no longer draws an empty
+extra slot past it. The legend wraps onto a second row rather than
 dropping an entry that doesn't fit a single line, so a band is never drawn
 with nothing naming it, and a top-talkers bar past the eighth — past
 what the chart has a hue left for — takes the same neutral swatch the
@@ -3106,12 +3117,16 @@ like any other module.
   drew twice — the VLAN count and both port labels painted over each
   other exactly as before, on a pair of switches that had done nothing
   wrong. It now folds those two rows as well, but only where the pairing
-  is forced rather than guessed: when a device pair has exactly one such
-  link reported from each side, meaning one cable with one port named at
-  each end. Two or more reported from either side — a LAG, or a pair of
-  switches cross-connected twice — still draws as separate lines, because
-  nothing says which port faces which and guessing would risk pairing the
-  wrong two.
+  is forced by the rows present rather than guessed: when a device pair
+  has exactly one such link reported from each side, meaning one cable
+  with one port named at each end. Two or more reported from either side
+  — a LAG, or a pair of switches cross-connected twice — still draws as
+  separate lines, because nothing says which port faces which and
+  guessing would risk pairing the wrong two. "Present" is the honest
+  limit: the fold sees only the rows this walk returned, so two cables
+  between one pair that each lose a row on opposite sides in the same
+  cycle would fold into one line that is not a cable — a crossed double
+  loss the one-versus-two check cannot tell from one cable.
 - **A link's tooltip names each end's own trunk/access mode, and calls out
   a native-VLAN mismatch by name.** Alongside every VLAN the link
   carries, hovering or clicking shows the mode each device itself reports

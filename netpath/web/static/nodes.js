@@ -6088,10 +6088,10 @@
     }
   }
 
-  /* aabbccddeeff -> aa:bb:cc:dd:ee:ff, and a prefix stays a prefix. */
-  function formatMac(mac) {
-    return (String(mac || '').match(/.{1,2}/g) || []).join(':');
-  }
+  // aabbccddeeff -> aa:bb:cc:dd:ee:ff, and a prefix stays a prefix. App's,
+  // not a copy: global search shows the same addresses, and one spelling
+  // on every screen is the whole point of formatting them at all.
+  const formatMac = App.formatMac;
 
   /* Enough of nodesdb.py's normalize_mac/looks_like_mac_search, mirrored
      client-side, to tell resolveMacSearch's silent "just a name search" case

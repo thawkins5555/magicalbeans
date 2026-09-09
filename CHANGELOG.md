@@ -151,9 +151,12 @@ identifier it holds, two classic Cisco switches joined by one cable and
 speaking only CDP always land there. A new pass now folds those two rows
 as well, but only when a device pair reports exactly one such link from
 each side — one cable, one port named at each end, so the pairing is
-forced rather than guessed. Two or more from either side is a LAG or a
-pair cross-connected twice, and is deliberately left drawn as separate
-lines. The fold also fills in the far end's own interface and its real
+forced by the rows present rather than guessed. Two or more from either
+side is a LAG or a pair cross-connected twice, and is deliberately left
+drawn as separate lines. "Present" is the limit of the promise: the fold
+sees only the rows this walk returned, so two cables between one pair
+that each lose a row on opposite sides in the same cycle would fold into
+a line that is not a cable. The fold also fills in the far end's own interface and its real
 port label in place of the raw string CDP sent.
 
 **2. "Netflow graphs are not showing all data from the timeline window
@@ -163,7 +166,12 @@ divided by a *whole* bucket's width regardless — so the most recent data
 drew as a cliff at a fraction of its true rate, confirmed by a hover that
 read the same wrong number, and the axis stopped one bucket short of the
 right edge entirely. Both are fixed: each slot is now rated over the time
-it actually covers, and the axis spans the real window. Separately, a
+it actually covers — floored at a quarter of a bucket, since NetFlow
+credits a record's whole volume to the second it ended and a sliver
+holding one long flow's end is not carrying its bytes at that pace; the
+most the newest slot can be over-read is four times, whatever the
+interval, and the hover says when the floor was used — and the axis
+spans the real window. Separately, a
 rollup bucket only ever stores its heaviest keys, so a series being
 watched could read as zero in a bucket where it briefly fell below that
 cap — the total stayed exact because the shortfall went to "other," but
@@ -182,9 +190,9 @@ early colour and claiming a band that doesn't exist.
 on Node switch ports."** This already worked and didn't say so plainly:
 the result group was titled "MAC address / interface," a name that reads
 as a database column rather than an answer. It is now "MAC address on a
-switch port," and the second line names the VLAN, whether the entry is
-current or aged out, and when it was last seen — all of which used to be
-folded into one thin sentence.
+switch port," and the second line names the VLAN and when it was last
+seen, which used to be folded into one thin sentence, and — new in this
+release — whether the entry is current or aged out.
 
 **4. "Global search should identify DHCP Server leases for the MAC
 address searched for."** A lease arrives from Windows as
@@ -233,6 +241,33 @@ that sentence, because its own fallback was never updated to match and
 still read 0. It now reads 3600, the same fallback the polling config
 itself uses. The new ARP-cache count needed no equivalent fix, since 0
 really is the shipped default there.
+
+**Release review.** A Fable review of the combined diff found, in the
+frontend and the documents: the chart's fix for the last-slot cliff had
+floored the final slot at five *seconds*, and since NetFlow credits a
+record's whole volume to the second it ended, a five-second sliver
+holding the end of a minute-long 100 MB flow drew 160 Mbps where the flow
+ran at 13 — a spike in place of the cliff, scaling with the bucket (720x
+at an hour) and flickering on every refresh of a live window, under a
+comment that claimed a sliver was not rated at all. The floor is now a
+quarter of the bucket, so the worst over-read is four times whatever the
+interval, the tooltip says when the floor was used, and a window ending
+exactly on a bucket boundary no longer draws an empty extra slot past the
+right-hand edge. Found on the way: the drag brush was never drawn,
+because the redraw that skips an unchanged frame did not count a drag as
+a change. One MAC read three ways down one global-search list — bare hex
+from the switch-port and ARP groups, colons from the lease group — and is
+now formatted once, at the display layer, with nothing stored changed.
+The frontend contract suite pinned all of this as text; it now also runs
+the sliced chart under node and reads back the vertices, the crosshair,
+the tooltip and the brush, and each of those checks fails against the
+five-second floor, against a slot lookup off by one, and against the
+brush that never drew. Four documents claimed things the code did not do
+— a Find-box ARP lookup that does not exist, a lease-MAC migration that
+ran "once" but scanned on every open (it now carries a done-marker), an
+indexed lease lookup that had no caller (the lease search now routes a
+whole MAC to it), and a fold "forced" by the rows that were walked, not
+by the world — and each now says what is there.
 
 ### 5.6.0 — Closing the window closes the application
 

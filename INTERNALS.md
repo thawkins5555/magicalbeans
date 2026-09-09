@@ -2912,8 +2912,10 @@ and its profile's value separately and cannot resolve the inheritance).
 Each row's MAC cell runs the existing MAC search rather than duplicate
 it — the join an ARP cache exists to make: ARP gives the MAC, the
 forwarding table gives the port. `nodesdb.arp_locations(needle)` backs
-the global-search group and the Find box's own ARP lookup, matching
-either column: `looks_like_mac_search` decides a bare hex needle is a MAC
+the global-search group only — the Nodes Find box has no ARP lookup of
+its own and never calls `/api/nodes/arp-search`; it still answers a MAC
+with the switch ports that learned it, which is the question that box
+exists for — matching either column: `looks_like_mac_search` decides a bare hex needle is a MAC
 prefix the way it already does for `mac_locations`, a digits-and-dots
 needle is an IPv4 prefix, and a colon-hex needle (an IPv6 prefix, or a
 Cisco-notation MAC — both normalise to valid hex) is matched against
@@ -3083,11 +3085,17 @@ poller in the loop.
   the LLDP/CDP-on-one-port half of this same doubling. Not a corner case:
   every classic Cisco pair speaking CDP alone lands here.
 
-  It folds only where the pairing is forced. Surviving name-only links are
-  grouped by the unordered device pair they sit between; where a pair has
-  exactly one such link reported from *each* side, there is one cable with
-  one port at each end and both ends have named it, so nothing is being
-  guessed. Two or more reported from either side is the LAG /
+  It folds only where the pairing is forced by the rows present. Surviving
+  name-only links are grouped by the unordered device pair they sit
+  between; where a pair has exactly one such link reported from *each*
+  side, there is one cable with one port at each end and both ends have
+  named it, so nothing is being guessed — given the rows this cycle
+  walked. That qualifier is real: two cables between one pair, CDP only,
+  with one row missing from *each* side in the same cycle (a stale row, a
+  `present=0` row, a port that did not answer) leave one row a side, and
+  the fold pairs the two survivors into a cable that does not exist. The
+  one-versus-two asymmetry check catches a single loss, not a crossed
+  double one. Two or more reported from either side is the LAG /
   cross-connected case `link_identity` already refuses to guess at — "A
   has two ports facing B" says nothing about which faces which — and a
   pair heard from only one side has no reciprocal row to fold with at
@@ -5572,13 +5580,31 @@ less than a full bucket (whatever is left between its own start and the
 window's `t1`) — and dividing that short span by the full width drew the
 newest data at a fraction of its real rate, a cliff at the right edge of
 every chart, confirmed rather than caught by the hover tooltip reading
-the identical wrong number. `slotSeconds(data, slot)` now returns the
-true coverage for the last slot (`windowEnd(data) - data.times[last]`,
-floored at a few seconds to keep the division sane on a live window's
-sliver of a final bucket) and the nominal `bucket_s` for every other slot;
-`drawChart`'s running stack and `slotTip`'s per-series and total rates
-both divide by it, so the chart and its own tooltip cannot read
-differently for the same bucket.
+the identical wrong number. `slotCovered(data, slot)` is the time a slot
+actually spans — `bucket_s` for every slot but the last, and for the last
+`windowEnd(data) - data.times[last]` clamped to `[0, bucket_s]` — and
+`slotSeconds(data, slot)` is what its bytes are divided by: that
+coverage, floored at `SLOT_MIN_FRACTION` (a quarter) of the bucket. The
+floor is a fraction rather than a number of seconds because NetFlow
+credits a record's whole byte count to its `ts_end`: a five-second sliver
+holding the end of a minute-long 100 MB flow is not carrying 160 Mbps,
+and the release's first cut, floored at `SLOT_MIN_S = 5`, drew exactly
+that — an over-read that scaled with the bucket (720x at an hour, 4320x
+at six) and flickered on every refresh of a live window. With a
+quarter-bucket floor the worst case is 4x whatever the bucket, and any
+slot at least a quarter covered reads at its true rate. `drawChart`'s
+running stack and `slotTip`'s per-series and total rates both divide by
+it, so the chart and its own tooltip cannot read differently for the same
+bucket, and when the floor applied the tooltip's heading says so ("3s of
+60s so far, rated over 15s") rather than let the number imply a division
+that was not done.
+
+`slotCount(data)` is the slots that cover any of the window. When `t1`
+lands exactly on a bucket boundary, flowdb's `+ 1` puts a final slot *at*
+`t1` covering nothing (its value is zero unless a record ended on that
+very second); that slot is neither drawn nor ticked, and `slotAt` never
+resolves to it, where before its vertex landed past the right-hand
+edge.
 
 The x-axis had a matching, independent bug: slots were spread evenly
 across the plot width with the last one landing exactly on the right
@@ -5587,12 +5613,20 @@ held actually sat. `xOf`/`timeAt`/`slotAt` now map the true `[t0, t1)`
 window onto the plot — `t1` is the response's own `windowEnd`, not
 `view.t1`, which a pending fetch may already have moved past — with each
 slot's vertex at the centre of the time it covers (for the partial final
-slot, the centre of what it covers *so far*) and the filled area running
-flat from the first vertex to the left edge and the last to the right, so
-no part of the requested window is ever left undrawn. The crosshair, the
-drag brush and the tooltip all resolve a screen x through the same three
-functions, so the slot named under the cursor is always the slot the
-cursor is actually over.
+slot, the centre of what it covers *so far*: `slotCovered`, never the
+floored `slotSeconds`, which would push the vertex past the window) and
+the filled area running flat from the first vertex to the left edge and
+the last to the right, so no part of the requested window is ever left
+undrawn. `axisOf(data, plot)` builds the three functions once per draw,
+and the crosshair, the drag brush and the tooltip all resolve a screen x
+through them, so the slot named under the cursor is always the slot the
+cursor is actually over. The redraw signature that skips an unchanged
+frame includes the drag in progress: without it, the redraw each
+pointermove asked for during a drag was skipped as "nothing changed" and
+the brush never appeared. `tests/test_frontend_contracts.py` §45b runs
+the sliced chart under node against a DOM stub and reads all of this
+back — the polygon's vertices, and the crosshair, tooltip and brush for a
+given x — rather than trusting the text checks in §45a alone.
 
 **The legend wraps instead of dropping an entry, and a Top-N row past the
 palette takes the neutral swatch instead of wrapping the colour index.**
@@ -6234,13 +6268,21 @@ happened to type, so a query that was not itself dash-separated upper
 case matched neither table's MAC column, and zero rows looked exactly
 like "this card holds no lease."
 
-`ipam_dhcp._stored_mac()` runs every incoming lease and reservation
+`ipam_dhcp.stored_mac()` runs every incoming lease and reservation
 `ClientId` through `mac_colon()` at ingest, so a fresh poll writes the
 same spelling `hosts.mac` already used; `IpamDatabase._normalise_lease_macs()`
 (called from `_migrate()`, alongside the rest of `_migrate`'s work)
-rewrites whatever an older build already stored, once, so an upgraded
-install is correct from its first open rather than one poll interval
-later. A `ClientId` that is not a MAC at all — a DHCPv6 DUID, a
+rewrites whatever an older build already stored, so an upgraded install
+is correct from its first open rather than one poll interval later. It
+calls the same `stored_mac()` the ingest path calls per row rather than
+restating the rule in SQL, so the two cannot drift. It runs once, not on
+every open: the scan is the whole lease table, the one IPAM table that
+can be large, so a private settings row (`_LEASE_MACS_NORMALISED`,
+`normalised_lease_macs` — the same done-marker shape
+`flowdb.drop_legacy_indexes` keeps) is written last in the same
+transaction as the rewrites, and a store that carries it is not scanned
+again; a crash before the commit rolls both back and the next open
+starts over. A `ClientId` that is not a MAC at all — a DHCPv6 DUID, a
 hardware-type-prefixed id on a BOOTP reservation — is left exactly as
 reported rather than blanked, since an empty cell would read as "no
 client id" and that is not what happened.
@@ -6261,14 +6303,15 @@ substring match, not a prefix one, deliberately: an OUI is a prefix, but
 the four digits printed on a device's own label are its tail, and an
 operator searches by either.
 
-`IpamDatabase.dhcp_leases_for_mac(mac)` is the exact-match counterpart
-behind the new lease group in global search (below): it reduces `mac` the
-same way, rebuilds the canonical colon form directly from the twelve hex
-digits, and does a plain `WHERE l.mac = ?` — served by
-`ix_dhcp_leases_mac` rather than a scan, which the substring search can
-never use since its clause is a `LIKE` over a `REPLACE()` expression. A
-prefix short of a full address is refused (`len(digits) != 12`) since a
-prefix is what `search_dhcp()` is for.
+`IpamDatabase.dhcp_leases_for_mac(mac)` is the exact-match counterpart:
+it reduces `mac` the same way, rebuilds the canonical colon form directly
+from the twelve hex digits, and does a plain `WHERE l.mac = ?` — served
+by `ix_dhcp_leases_mac` rather than a scan, which the substring search
+can never use since its clause is a `LIKE` over a `REPLACE()` expression.
+A prefix short of a full address is refused (`len(digits) != 12`) since a
+prefix is what `search_dhcp()` is for. Its one caller is the lease-search
+route below, which sends a needle that reduces to a whole MAC here and
+everything else to `search_dhcp()`.
 
 ### DHCP leases as their own global-search group (`api.get_ipam_dhcp_lease_search`) — 5.7.0
 
@@ -6278,12 +6321,18 @@ dropping exactly the fields that make a *lease* hit worth reading: which
 scope, which server, when it expires, whether it was reserved. Two DHCP
 servers each holding a lease for the same card — a laptop that moved
 between sites — collapse to one merged host there and stay two separate
-answers here. `GET /api/ipam/dhcp/lease-search` wraps `search_dhcp()`
-directly (the same two-character floor as the merged search) and returns
-lease rows verbatim; `app.js`'s global search calls it as a third,
-independently-failing IPAM lookup alongside the merged-host and subnet
-groups already there, landing on `#/ipam` since DHCP registers no
-per-lease page of its own to route to.
+answers here. `GET /api/ipam/dhcp/lease-search` (the same two-character
+floor as the merged search) stands two queries behind one payload: a
+needle that `mac_search_digits()` reduces to twelve hex digits is "where
+is this card" and goes to `dhcp_leases_for_mac()`, the indexed equality;
+anything else — a prefix, a label's last four digits, a hostname, an
+address — goes to `search_dhcp()`. `_dhcp_lease_search_json()` shapes
+both branches' rows identically (the scope's name, which only the
+equality's join carries, is left out of both rather than sent on one),
+so the browser cannot tell which ran. `app.js`'s global search calls it
+as a third, independently-failing IPAM lookup alongside the merged-host
+and subnet groups already there, landing on `#/ipam` since DHCP registers
+no per-lease page of its own to route to.
 
 ---
 
@@ -7695,6 +7744,18 @@ happened to hit a slow or erroring dependency looked identical to a search
 that returned nothing at all, which is the point of the fix — a group with
 nothing to add (no permission, no match) and a group that failed are both
 simply absent from the results, indistinguishable to the operator either way.
+
+Every MAC those groups show goes through `App.formatMac()` — lower-case
+pairs, colon-joined — because the stores disagree on purpose and the
+display layer is where that ends: `arp_entries.mac` and
+`mac_entries.mac` are bare hex (what `nodesdb`'s prefix search runs
+over), `dhcp_leases.mac` is colon form, and before 5.7.0's review the
+same card read `aabbccddeeff` in the switch-port and ARP groups and
+`aa:bb:cc:dd:ee:ff` in the lease group, one list apart. `nodes.js`'s ARP
+table uses the same helper rather than a copy. It accepts every notation
+a server or a person produces, a prefix stays a prefix, and a client id
+that is not hex once the separators are gone (a DHCPv6 DUID) is shown as
+it came rather than chopped into pairs.
 
 ### Shared components (`app.js`, `app.css`) — 4.45.0
 

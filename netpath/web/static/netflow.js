@@ -294,23 +294,6 @@
     return `${Math.round(bits)} Tbps`;
   }
 
-  /* How many seconds one slot of a response actually covers. Every slot
-     but the last is a whole bucket; the last runs from its own start to
-     the window's end and is almost always partial — flowdb sizes the
-     window as int(span / bucket) + 1 slots, so the final slot starts on
-     the last boundary before t1 and covers only what is left after it.
-     Dividing that by the nominal width drew a bucket a fifth full at a
-     fifth of its true rate: a cliff at the right-hand edge of every chart,
-     on exactly the newest data, and the hover confirmed the number.
-
-     Floored at a few seconds rather than at zero: that guards the division
-     and stops a sliver holding one or two flow records being read as a
-     rate at all. Not padded out to a whole bucket either, which would
-     invent empty future time and draw the same cliff on a live window.
-     drawChart and slotTip both divide by this, so the chart and its
-     tooltip cannot drift apart. */
-  const SLOT_MIN_S = 5;
-
   // The end of the window the values were read over: the response's own
   // t1, not view.t1, which may already have moved on under a pending fetch.
   function windowEnd(data) {
@@ -319,12 +302,86 @@
       ? data.t1 : times[times.length - 1] + data.bucket_s;
   }
 
-  function slotSeconds(data, slot) {
+  /* How many seconds of the window one slot of a response actually covers.
+     Every slot but the last is a whole bucket; the last runs from its own
+     start to the window's end and is almost always partial — flowdb sizes
+     the window as int(span / bucket) + 1 slots, so the final slot starts
+     on the last boundary before t1 and covers only what is left after it,
+     which is nothing at all when t1 falls exactly on a boundary. Clamped
+     to [0, bucket]: a slot cannot cover more than one bucket, and the
+     zero is what slotCount reads to leave the empty slot undrawn. */
+  function slotCovered(data, slot) {
     const last = data.times.length - 1;
     if (slot < last) return data.bucket_s;
     const covered = windowEnd(data) - data.times[last];
-    return Math.max(Math.min(covered, data.bucket_s),
-                    Math.min(SLOT_MIN_S, data.bucket_s));
+    return Math.min(Math.max(covered, 0), data.bucket_s);
+  }
+
+  /* The seconds a slot's bytes are divided by to make a rate.
+
+     Dividing the final slot by the nominal bucket width drew a bucket a
+     fifth full at a fifth of its true rate: a cliff at the right-hand edge
+     of every chart, on exactly the newest data, and the hover confirmed
+     the number. So the final slot is rated over the time it covers — but
+     not all the way down to a sliver, because NetFlow credits a record's
+     whole byte count to the second it ended: a five-second sliver holding
+     the end of a minute-long 100 MB flow is not carrying 160 Mbps, and
+     rating it over its five seconds would have said it was, in a spike
+     that flickered on every refresh of a live window. The floor is a
+     quarter of the bucket, whatever the bucket: any slot at least a
+     quarter covered reads at its true rate, and the worst a slot can be
+     over-read is 4x (flow ends credited to a sliver, rated over a quarter
+     bucket), the same at ten seconds as at six hours. A floor in seconds
+     could not promise that — the amplification would scale with the
+     bucket, to 720x at an hour.
+
+     Not padded out to a whole bucket either, which would invent empty
+     future time and draw the same cliff on a live window. drawChart and
+     slotTip both divide by this, so the chart and its tooltip cannot
+     drift apart. */
+  const SLOT_MIN_FRACTION = 0.25;
+
+  function slotSeconds(data, slot) {
+    return Math.max(slotCovered(data, slot), data.bucket_s * SLOT_MIN_FRACTION);
+  }
+
+  /* How many slots hold any of the window: all of them, unless t1 landed
+     exactly on a bucket boundary, when flowdb's +1 puts a final slot AT
+     the end of the window covering none of it. That slot is not drawn —
+     its vertex would sit past the right-hand edge, and its value is zero
+     unless a record ended on that very second — and the cursor never
+     resolves to it. Never fewer than one: a zero-span window is one slot
+     with nothing after it. */
+  function slotCount(data) {
+    const count = data.times.length;
+    return count > 1 && slotCovered(data, count - 1) <= 0 ? count - 1 : count;
+  }
+
+  /* The chart's time axis: the window the server read, t0 to t1, mapped
+     onto the plot's width. The slots used to be spread so that the last
+     one sat on the right-hand edge with no width, which put every bucket
+     one interval left of the time it held and left the newest one
+     invisible; now t1 is the response's own windowEnd and the axis spans
+     all of it. Built once per draw and handed to everything that turns a
+     screen x into a time or a slot — the crosshair, the tooltip and the
+     drag brush all go through the same three functions, so the slot named
+     under the cursor is the slot whose time the cursor is over. Each
+     slot's vertex sits at the centre of the time it covers — for the
+     final, partial slot the centre of what it covers so far, which is
+     slotCovered and never slotSeconds: the rate floor must not push the
+     vertex past the window's end. */
+  function axisOf(data, plot) {
+    const t0 = data.times[0];
+    const t1 = windowEnd(data);
+    const count = slotCount(data);
+    const axisSpan = Math.max(t1 - t0, 1e-6);
+    const xOf = (ts) => plot.x + (ts - t0) / axisSpan * plot.w;
+    const timeAt = (x) =>
+      t0 + Math.min(Math.max((x - plot.x) / plot.w, 0), 1) * axisSpan;
+    const slotAt = (ts) =>
+      Math.min(Math.max(Math.floor((ts - t0) / data.bucket_s), 0), count - 1);
+    const middleOf = (slot) => data.times[slot] + slotCovered(data, slot) / 2;
+    return { t0, t1, count, xOf, timeAt, slotAt, middleOf };
   }
 
   /* The chart carries too many time buckets for one tab stop each (a wide
@@ -369,8 +426,13 @@
     // every refresh and on every frame of a divider drag, tearing the SVG
     // down and rebuilding one hit rectangle with three listeners per
     // bucket each time, whether or not anything was different.
+    // The brush is drawn from view.drag, so a drag in progress is part of
+    // the signature too: without it, the redraw each pointermove asks for
+    // during a drag was skipped as "nothing changed" and the brush never
+    // appeared at all.
     const signature = `${width}x${height}:`
-      + (view.loading || view.failed ? emptyMessage() : JSON.stringify(view.data));
+      + (view.loading || view.failed ? emptyMessage() : JSON.stringify(view.data))
+      + (view.drag ? `:drag=${view.drag.from}-${view.drag.to}` : '');
     if (svg.dataset.signature === signature) return;
     svg.dataset.signature = signature;
     svg.innerHTML = '';
@@ -413,7 +475,6 @@
     plot.h = Math.max(height - PAD.top - PAD.bottom - legendH, 10);
 
     const count = data.times.length;
-    const bucket = data.bucket_s;
     const cumulative = [];
     let running = new Array(count).fill(0);
     for (const series of data.series) {
@@ -436,25 +497,10 @@
       }, rateLabel(axisMax * fraction)));
     }
 
-    /* The x axis is the window the server read, t0 to t1, so the drawn
-       area spans it all: the slots used to be spread so that the last one
-       sat on the right-hand edge with no width, which put every bucket one
-       interval left of the time it held and left the newest one invisible.
-       Each slot's vertex sits at the centre of the time it covers — for
-       the final, partial slot the centre of what it covers so far — and
-       the area runs flat from the first vertex to the left edge and from
-       the last to the right, so no part of the window is undrawn. The
-       crosshair, the drag brush and the tooltip all read the same three
-       functions, so the slot under the cursor is the slot whose time the
-       cursor is over. */
-    const t0 = data.times[0];
-    const t1 = windowEnd(data);
-    const axisSpan = Math.max(t1 - t0, 1e-6);
-    const xOf = (ts) => plot.x + (ts - t0) / axisSpan * plot.w;
-    const timeAt = (x) =>
-      t0 + Math.min(Math.max((x - plot.x) / plot.w, 0), 1) * axisSpan;
-    const slotAt = (ts) =>
-      Math.min(Math.max(Math.floor((ts - t0) / bucket), 0), count - 1);
+    // `drawn` is the slots that cover some of the window: an empty,
+    // boundary-aligned final slot is neither drawn nor ticked (slotCount
+    // says why), though it still sits in `count` and `cumulative` above.
+    const { t0, t1, xOf, timeAt, slotAt, middleOf, count: drawn } = axisOf(data, plot);
     const yOf = (top) => plot.y + plot.h - plot.h * Math.min(top / axisMax, 1);
     const baseline = plot.y + plot.h;
     /* Painted from the top of the stack down: every band is filled to the
@@ -463,11 +509,10 @@
     for (let index = data.series.length - 1; index >= 0; index -= 1) {
       const tops = cumulative[index];
       const points = [`${xOf(t0)},${baseline}`, `${xOf(t0)},${yOf(tops[0])}`];
-      for (let slot = 0; slot < count; slot += 1) {
-        const middle = data.times[slot] + slotSeconds(data, slot) / 2;
-        points.push(`${xOf(middle)},${yOf(tops[slot])}`);
+      for (let slot = 0; slot < drawn; slot += 1) {
+        points.push(`${xOf(middleOf(slot))},${yOf(tops[slot])}`);
       }
-      points.push(`${xOf(t1)},${yOf(tops[count - 1])}`, `${xOf(t1)},${baseline}`);
+      points.push(`${xOf(t1)},${yOf(tops[drawn - 1])}`, `${xOf(t1)},${baseline}`);
       const name = data.series[index].name;
       svg.appendChild(App.svgNode('polygon', {
         points: points.join(' '),
@@ -477,8 +522,8 @@
     }
 
     const span = view.t1 - view.t0;
-    const tickEvery = Math.max(1, Math.floor(count / 7));
-    for (let slot = 0; slot < count; slot += tickEvery) {
+    const tickEvery = Math.max(1, Math.floor(drawn / 7));
+    for (let slot = 0; slot < drawn; slot += tickEvery) {
       // Each tick marks the start of the slot it labels.
       const x = xOf(data.times[slot]);
       svg.appendChild(App.svgNode('text', {
@@ -574,14 +619,17 @@
 
   function slotTip(data, slot) {
     const seconds = slotSeconds(data, slot);
-    const last = data.times.length - 1;
+    const covered = slotCovered(data, slot);
     const span = windowEnd(data) - data.times[0];
     let heading = App.stamp(data.times[slot], span);
-    if (slot === last && seconds < data.bucket_s) {
+    if (covered < data.bucket_s) {
       // Said rather than deduced: the newest slot is a rate over what it
-      // covers so far, not over a whole interval like the rest.
-      heading += ` \u00b7 ${App.span(windowEnd(data) - data.times[slot])}`
-        + ` of ${App.span(data.bucket_s)} so far`;
+      // covers so far, not over a whole interval like the rest — and when
+      // that is less than the quarter-bucket floor, over the floor, which
+      // the heading says too rather than let the number imply a division
+      // that was not done.
+      heading += ` \u00b7 ${App.span(covered)} of ${App.span(data.bucket_s)} so far`;
+      if (covered < seconds) heading += `, rated over ${App.span(seconds)}`;
     }
     const rows = [{ text: heading }];
     // The index has to survive the sort: it is what maps a series to the

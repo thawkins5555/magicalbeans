@@ -1287,6 +1287,25 @@ const App = (() => {
     return `${n} TB`;
   }
 
+  /* One spelling for a MAC wherever a person reads one: lower-case pairs,
+     colon-joined, the form IPAM stores and the Nodes Find box echoes. The
+     stores themselves are left alone on purpose — Nodes keeps bare hex,
+     which is what its prefix search runs over; IPAM keeps colons — so this
+     is the display layer's job, and without it global search showed one
+     card three ways down one list (bare on a switch port and in an ARP
+     cache, colons in its DHCP lease). Accepts every notation a server or
+     a person produces (bare, colon, dash, Cisco dotted), and a prefix
+     stays a prefix. Anything that is not hex once the separators are gone
+     — a DHCPv6 DUID, a hardware-typed BOOTP client id — comes back as it
+     came rather than chopped into pairs: it is not a MAC, and the cell is
+     still right to show it. */
+  function formatMac(mac) {
+    const text = String(mac ?? '').trim();
+    const digits = text.replace(/[:\-.\s]/g, '');
+    if (!digits || !/^[0-9a-fA-F]+$/.test(digits)) return text;
+    return (digits.toLowerCase().match(/.{1,2}/g) || []).join(':');
+  }
+
   function rate(bytesTotal, seconds) {
     if (!seconds) return '0 bps';
     let bits = (Number(bytesTotal) || 0) * 8 / seconds;
@@ -2168,7 +2187,7 @@ const App = (() => {
           // opening the port. The route is the port dialog because this
           // one really is a port; the ARP group below deliberately is not.
           groups.push({ title: 'MAC address on a switch port', hits: mac.locations.slice(0, 8).map((loc) => ({
-            name: loc.mac,
+            name: formatMac(loc.mac),
             meta: [`${loc.device_name} · ${loc.if_descr}`,
                    loc.vlan ? `VLAN ${loc.vlan}` : '',
                    loc.present ? 'present' : 'aged out',
@@ -2189,7 +2208,7 @@ const App = (() => {
           // VLAN or SVI, not the physical port the operator is looking for
           // — the group above answers that, once they have the MAC.
           groups.push({ title: 'ARP cache (IP to MAC)', hits: arp.locations.slice(0, 8).map((loc) => ({
-            name: `${loc.ip} \u2194 ${loc.mac}`,
+            name: `${loc.ip} \u2194 ${formatMac(loc.mac)}`,
             meta: [`${loc.device_name} · ${loc.if_descr}`,
                    loc.entry_type || '',
                    loc.present ? 'present' : 'aged out',
@@ -2254,7 +2273,7 @@ const App = (() => {
         if (found.results && found.results.length) {
           groups.push({ title: 'IPAM hosts', hits: found.results.slice(0, 8).map((r) => ({
             name: r.hostname || r.ip,
-            meta: [r.ip, r.mac, r.subnet].filter(Boolean).join(' · '),
+            meta: [r.ip, formatMac(r.mac), r.subnet].filter(Boolean).join(' · '),
             // No per-host route exists in IPAM (its own Find is a modal,
             // not a page of its own) — the tab is the honest destination.
             route: '#/ipam',
@@ -2279,7 +2298,7 @@ const App = (() => {
         if (found.leases && found.leases.length) {
           groups.push({ title: 'DHCP leases', hits: found.leases.slice(0, 8).map((l) => ({
             name: l.hostname || l.ip,
-            meta: [l.ip, l.mac,
+            meta: [l.ip, formatMac(l.mac),
                    l.scope_id ? `scope ${l.scope_id}` : '',
                    l.server_label || '',
                    l.is_reservation ? 'reservation' : (l.address_state || '')]
@@ -5457,7 +5476,7 @@ const App = (() => {
     clock, stamp, span, duration, ago, when, timeCell, agoCell, isoLocal,
     emptyText, stackedHistogram, plottedRange, filterBar, filterValues,
     timeZoneLabel, timeZoneTitle, countLabel,
-    bytes, rate, fillRanges, wheelWindow,
+    bytes, rate, formatMac, fillRanges, wheelWindow,
     modal, modalToken, modalIsCurrent,
     closeModal, requestCloseModal, confirmDestructive, el, svgNode,
     setText, setHtml, setBg, setHidden, strip, wireToggle,

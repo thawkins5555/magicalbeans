@@ -11,9 +11,13 @@ It reads the shipped files as text and asserts the small number of things
 that must be true of them.
 """
 
+import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC = os.path.join(REPO_ROOT, "netpath", "web", "static")
@@ -1493,8 +1497,13 @@ print()
 # 45a. NetFlow: "graphs are not showing all data from the timeline window".
 #      Four of the five defects behind that report were in netflow.js, and
 #      each is a fact about the text that a refactor could undo invisibly.
+#      These are the cheap grep half; 45b below RUNS the chart, because a
+#      slotSeconds() that returned bucket_s unconditionally, or a slotAt()
+#      off by one, passes every line here.
 _NF_CHART = _NETFLOW[_NETFLOW.index("  function drawChart() {"):
                      _NETFLOW.index("  /* -------------------------------------------------------------- bars */")]
+_NF_AXIS = _NETFLOW[_NETFLOW.index("  function axisOf(data, plot) {"):
+                    _NETFLOW.index("  /* The chart carries too many time buckets for one tab stop each")]
 _NF_BARS = _NETFLOW[_NETFLOW.index("  function drawBars() {"):
                     _NETFLOW.index("  function filterByBar(row) {")]
 check("* 8 / slotSeconds(data, i)" in _NF_CHART
@@ -1512,7 +1521,7 @@ check("Number.isFinite(data.t1)" in _NETFLOW and "view.t1" not in _NETFLOW[
           _NETFLOW.index("  function slotSeconds(data, slot) {")],
       "the window's end is the response's own t1, which is what the values "
       "were read over, not view.t1")
-check("stepX" not in _NF_CHART and "const xOf = (ts) =>" in _NF_CHART
+check("stepX" not in _NF_CHART and "const xOf = (ts) =>" in _NF_AXIS
       and "xOf(t1)" in _NF_CHART,
       "the x axis spans the window the server read, t0 to t1, rather than "
       "spreading the slots so the last one sits on the right edge with no "
@@ -1520,6 +1529,29 @@ check("stepX" not in _NF_CHART and "const xOf = (ts) =>" in _NF_CHART
 check("slotAt(timeAt(x))" in _NF_CHART,
       "...and the crosshair finds its slot from the time under the cursor on "
       "that same axis")
+# The 5.7.0 review: the first fix for the cliff floored the final slot at
+# five SECONDS, so a sliver holding the end of one long flow -- NetFlow
+# credits every byte to the record's ts_end -- drew that flow's whole
+# volume over five seconds: 720x over-read under an hour bucket, and a
+# right-hand edge that flickered on every refresh of a live window.
+check("SLOT_MIN_S" not in _NETFLOW and "const SLOT_MIN_FRACTION = 0.25;" in _NETFLOW
+      and "data.bucket_s * SLOT_MIN_FRACTION" in _NETFLOW,
+      "the final slot's rate floor is a fraction of the bucket, never a number "
+      "of seconds, so the worst-case over-read is the same small factor "
+      "whatever the bucket")
+check("over-read is 4x" in _NETFLOW,
+      "...and the comment on it says what that worst case is")
+check("slotCovered(data, slot) / 2" in _NF_AXIS and "slotSeconds(data, slot) / 2" not in _NETFLOW,
+      "a slot's vertex sits at the centre of the time it COVERS, never of the "
+      "floored seconds it is rated over, which would push it past the window")
+check("function slotCount(data)" in _NETFLOW and "count: drawn" in _NF_CHART
+      and "slot < drawn" in _NF_CHART,
+      "an exactly bucket-aligned t1 leaves a final slot that covers nothing; "
+      "it is neither drawn nor ticked rather than landing past the right edge")
+check(":drag=" in _NF_CHART,
+      "a drag in progress is part of the redraw signature: without it the "
+      "redraw each pointermove asks for was skipped as unchanged and the "
+      "brush never appeared")
 check("Math.abs(to - from) > bucket" not in _NF_CHART
       and "Math.abs(to - from) >= DRAG_MIN_S" in _NF_CHART
       and "DRAG_MIN_PX" in _NF_CHART,
@@ -1541,6 +1573,313 @@ check("if (folded) tip.push({ text: FOLDED_TEXT });" in _NF_BARS
       and "folded ? `${valueId} ${foldId}` : valueId" in _NF_BARS
       and 'class="sr-only"' in _NF_BARS,
       "...and says so, in its tooltip and in its accessible description")
+
+
+# 45b. NetFlow, run rather than read. The chart's helpers and drawChart
+#      itself are sliced out of netflow.js and run by node against a DOM
+#      stub, the way tests/test_alerts_ui.py runs the rule editor: the
+#      response shapes flowdb actually produces are drawn, the polygon's
+#      vertices are read back, and the pointer is moved over the SVG so the
+#      crosshair, the tooltip and the drag brush answer for themselves.
+#      Node is the one thing a machine here may not have; if it is missing
+#      the checks say so and are skipped, and 45a's text checks are then
+#      the only thing standing behind this code -- which is why this
+#      section exists, and why that is printed rather than passed over.
+NODE = shutil.which("node") or shutil.which("nodejs")
+
+_NF_HELPERS = _NETFLOW[_NETFLOW.index("  /* ------------------------------------------------------------- chart */"):
+                       _NETFLOW.index("  /* -------------------------------------------------------------- bars */")]
+_NF_CONSTS = "".join(re.search(pat, _NETFLOW).group(0) for pat in (
+    r"  const PAD = \{[^\n]*\n", r"  const DRAG_MIN_S = [^\n]*\n", r"  const DRAG_MIN_PX = [^\n]*\n"))
+
+
+def _app_function(name):
+    """One top-level helper of app.js, verbatim, so the numbers the tooltip
+    prints are the numbers the browser prints."""
+    start = APP.index("  function %s(" % name)
+    return APP[start:APP.index("\n  }\n", start) + 5]
+
+
+_NF_HARNESS = """
+'use strict';
+const DATA = %(data)s;
+const PROBES = %(probes)s;
+const DRAG_PX = 40;
+%(consts)s
+%(rate)s
+%(span)s
+const tips = [];
+const windows = [];
+/* The least that behaves like the chart's SVG: what was appended since the
+   last innerHTML = '' and the handlers drawChart hangs on it. */
+const svgEl = {
+  attrs: {}, dataset: {}, children: [], clientWidth: 1000,
+  set innerHTML(v) { this.children = []; }, get innerHTML() { return ''; },
+  setAttribute(k, v) { this.attrs[k] = v; },
+  appendChild(n) { this.children.push(n); },
+  setPointerCapture() {},
+};
+const ELEMENTS = {
+  'nf-chart': { dataset: {}, tabIndex: -1, setAttribute() {}, addEventListener() {},
+    getBoundingClientRect: () => ({ width: 1000, height: 300, left: 0, top: 0 }) },
+  'nf-chart-svg': svgEl,
+  'nf-totals': { textContent: 'totals' },
+};
+const App = {
+  rate, span,
+  stamp: (ts) => `stamp:${ts}`,
+  el: (id) => ELEMENTS[id],
+  svgNode: (tag, attrs, text) => ({ tag, attrs: { ...attrs }, text,
+    setAttribute(k, v) { this.attrs[k] = v; } }),
+  emptyText: (svg, w, h, text) => svg.appendChild({ tag: 'empty', attrs: {}, text }),
+  tooltip: (rows, event) => tips.push({ rows, x: event.clientX }),
+  hideTooltip: () => tips.push(null),
+};
+const document = { activeElement: null };
+const view = { t0: DATA.times[0], t1: Number.isFinite(DATA.t1) ? DATA.t1 : 0,
+               data: DATA, loading: false, failed: false, drag: null };
+const seriesColor = (name, index) => `c${index}`;
+const emptyMessage = () => 'empty';
+const NO_FLOWS_TEXT = 'none';
+const setWindow = (a, b) => windows.push([a, b]);
+
+%(helpers)s
+
+drawChart();
+const plot = { x: PAD.left, w: 1000 - PAD.left - PAD.right };
+const axis = axisOf(DATA, plot);
+const nodesOf = (tag) => svgEl.children.filter((n) => n.tag === tag);
+const polygon = nodesOf('polygon')[0];
+const vertices = polygon
+  ? polygon.attrs.points.split(' ').map((p) => p.split(',').map(Number)) : [];
+const probes = PROBES.map((x) => {
+  tips.length = 0;
+  svgEl.onpointermove({ offsetX: x, clientX: x, clientY: 0 });
+  const crosshair = nodesOf('line').find((n) => 'stroke-dasharray' in n.attrs);
+  const tip = tips[tips.length - 1];
+  svgEl.onpointerdown({ button: 0, isPrimary: true, pointerId: 1, offsetX: x,
+                        preventDefault() {} });
+  const dragFrom = view.drag.from;
+  svgEl.onpointermove({ offsetX: x + DRAG_PX, clientX: x + DRAG_PX, clientY: 0 });
+  const dragTo = view.drag.to;
+  const brush = nodesOf('rect').find((n) => n.attrs.stroke === 'var(--accent)');
+  const before = windows.length;
+  svgEl.onpointerup();
+  return {
+    x, crosshairX: crosshair.attrs.x1, crosshairVisible: crosshair.attrs.visibility,
+    tipHeading: tip ? tip.rows[0].text : null,
+    tipTotal: tip ? tip.rows[tip.rows.length - 1].text : null,
+    timeAt: axis.timeAt(x), slot: axis.slotAt(axis.timeAt(x)),
+    xBack: axis.xOf(axis.timeAt(x)),
+    dragFrom, dragTo,
+    brush: brush ? [Number(brush.attrs.x), Number(brush.attrs.width)] : null,
+    window: windows.length > before ? windows[windows.length - 1] : null,
+  };
+});
+console.log(JSON.stringify({
+  plot, windowEnd: windowEnd(DATA), slotCount: slotCount(DATA),
+  covered: DATA.times.map((_, i) => slotCovered(DATA, i)),
+  seconds: DATA.times.map((_, i) => slotSeconds(DATA, i)),
+  vertices,
+  ticks: nodesOf('text').filter((n) => String(n.text).startsWith('stamp:'))
+    .map((n) => Number(n.attrs.x)),
+  probes,
+}));
+"""
+
+
+def _draw(data, probes):
+    """drawChart() on `data`, then the pointer at each x in `probes`: hover,
+    press, drag DRAG_PX right, release. What came back, or {"error": ...}
+    so a harness that threw reads as failed checks rather than a dead run."""
+    script = _NF_HARNESS % {
+        "data": json.dumps(data), "probes": json.dumps(probes),
+        "consts": _NF_CONSTS, "rate": _app_function("rate"),
+        "span": _app_function("span"), "helpers": _NF_HELPERS}
+    folder = tempfile.mkdtemp(prefix="nf_chart_")
+    try:
+        path = os.path.join(folder, "run.mjs")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(script)
+        out = subprocess.run([NODE, path], capture_output=True, text=True,
+                             encoding="utf-8", timeout=60)
+        if out.returncode != 0:
+            return {"error": out.stderr.strip()[:600]}
+        return json.loads(out.stdout)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+_T0 = 1700000000
+_B = 60
+
+
+def _response(last_covered, last_values, bucket=_B, slots=10, t1=True):
+    """A flowdb overview: `slots` times one bucket apart, and a t1 that
+    leaves the final slot covering `last_covered` seconds of the window.
+    Two series rated at 8 and 4 Mbps in every whole bucket."""
+    times = [_T0 + i * bucket for i in range(slots)]
+    data = {"times": times, "bucket_s": bucket, "series": [
+        {"name": "a", "values": [bucket * 1e6] * (slots - 1) + [last_values[0]]},
+        {"name": "b", "values": [bucket * 0.5e6] * (slots - 1) + [last_values[1]]},
+    ]}
+    if t1:
+        data["t1"] = times[-1] + last_covered
+    return data
+
+
+def _near(a, b, tolerance=1e-6):
+    return a is not None and b is not None and abs(a - b) <= tolerance
+
+
+if NODE is None:
+    print("SKIP 45b: node is not on this machine, so the NetFlow chart was not "
+          "run -- 45a's text checks are the only thing behind it here")
+else:
+    # -- a substantially covered final slot reads at its true rate ----------
+    # 45 of 60 seconds, holding three quarters of a whole bucket's bytes: the
+    # same 8 + 4 Mbps as every other slot, so the stack's top edge must be
+    # flat all the way to the right edge. The 5.6 code drew it at 9 Mbps.
+    r = _draw(_response(45, [45e6, 22.5e6]), [])
+    check("error" not in r, "the sliced chart runs under node"
+          + (" (%s)" % r["error"] if "error" in r else ""))
+    plot_x, plot_w = (r.get("plot") or {}).get("x", 0), (r.get("plot") or {}).get("w", 0)
+    probes = [plot_x + 5, plot_x + plot_w * 0.5, plot_x + plot_w * 0.95]
+    r = _draw(_response(45, [45e6, 22.5e6]), probes)
+    check(r.get("windowEnd") == _T0 + 9 * _B + 45 and r.get("slotCount") == 10,
+          "windowEnd is the response's t1 and every slot covers some of the window")
+    check((r.get("seconds") or [None])[-1] == 45 and (r.get("covered") or [None])[-1] == 45
+          and all(x == _B for x in (r.get("seconds") or [])[:-1]),
+          "a final slot three quarters covered is rated over exactly its 45 s, "
+          "and every whole slot over the bucket")
+    vertices = r.get("vertices", [])
+    ys = [y for _, y in vertices[1:-1]]
+    check(len(vertices) == 14 and ys and max(ys) - min(ys) < 1e-6,
+          "drawn, the stack's top edge is flat through the partial slot to the "
+          "right-hand edge -- no cliff (vertices=%d, y spread=%s)"
+          % (len(vertices), (max(ys) - min(ys)) if ys else None))
+    check(len(vertices) == 14
+          and _near(vertices[-3][0], plot_x + plot_w * (9 * _B + 22.5) / (9 * _B + 45))
+          and _near(vertices[-1][0], plot_x + plot_w),
+          "the final slot's vertex sits at the centre of what it covers and the "
+          "area runs on to the right-hand edge")
+    for probe in r.get("probes", []):
+        t = probe["timeAt"]
+        expected_slot = min(int((t - _T0) // _B), 9)
+        check(probe["slot"] == expected_slot
+              and _near(probe["xBack"], probe["x"]),
+              "x=%.1f: slotAt(timeAt(x)) is the slot whose time is under the "
+              "cursor (%d), and xOf(timeAt(x)) comes back to x"
+              % (probe["x"], expected_slot))
+        check(probe["crosshairVisible"] == "visible" and _near(probe["crosshairX"], probe["x"])
+              and (probe["tipHeading"] or "").startswith("stamp:%d" % (_T0 + expected_slot * _B)),
+              "x=%.1f: the crosshair stands at x and the tooltip names slot %d's "
+              "time (%r)" % (probe["x"], expected_slot, probe["tipHeading"]))
+        check(probe["tipTotal"] == "total: 12.0 Mbps",
+              "x=%.1f: the tooltip's total is the rate the chart drew, 12 Mbps, "
+              "in the partial slot as in the whole ones (%r)"
+              % (probe["x"], probe["tipTotal"]))
+        check(_near(probe["dragFrom"], t) and probe["brush"] is not None
+              and _near(probe["brush"][0], probe["x"]) and _near(probe["brush"][1], 40),
+              "x=%.1f: a drag starts from the same time the tooltip resolved, and "
+              "the brush is drawn from x, 40 px wide (%r)" % (probe["x"], probe["brush"]))
+        check(probe["window"] is not None and _near(probe["window"][0], t)
+              and _near(probe["window"][1], probe["dragTo"]),
+              "x=%.1f: releasing asks for exactly the window dragged over"
+              % probe["x"])
+    last = (r.get("probes") or [{}])[-1]
+    check(last.get("tipHeading") == "stamp:%d · 45s of 60s so far" % (_T0 + 9 * _B),
+          "the partial slot's tooltip says what it covers so far and, rated over "
+          "its own coverage, nothing more (%r)" % last.get("tipHeading"))
+
+    # -- a sliver is rated over the quarter-bucket floor ---------------------
+    # Three seconds of a 60 s bucket holding 100 MB (a minute-long flow that
+    # ended in it). Over its own 3 s that is 267 Mbps; over the floor it is
+    # 53 Mbps, 4x the 13 Mbps the flow really ran at, and never more.
+    r = _draw(_response(3, [100e6, 0]), [plot_x + plot_w - 2])
+    check((r.get("covered") or [None])[-1] == 3 and (r.get("seconds") or [None])[-1] == 15,
+          "a 3 s final slot is rated over a quarter of its 60 s bucket, not over "
+          "3 s and not over 60 (%r)" % r.get("seconds"))
+    probe = (r.get("probes") or [{}])[-1]
+    check(probe.get("slot") == 9 and probe.get("tipTotal") == "total: 53.3 Mbps",
+          "...and the tooltip over it prints that floored rate, 53.3 Mbps -- 4x "
+          "the flow's true 13.3, not the 266.7 a 5 s floor would print (%r)"
+          % probe.get("tipTotal"))
+    check(probe.get("tipHeading") == "stamp:%d · 3s of 60s so far, rated over 15s" % (_T0 + 9 * _B),
+          "...and says it was rated over the floor (%r)" % probe.get("tipHeading"))
+    vertices = r.get("vertices", [])
+    check(len(vertices) == 14 and _near(vertices[-3][0], plot_x + plot_w * (9 * _B + 1.5) / (9 * _B + 3))
+          and vertices[-3][0] <= plot_x + plot_w,
+          "its vertex is at the centre of the 3 s it covers, inside the window, "
+          "not at the centre of the 15 s it is rated over")
+
+    # The cap holds whatever the bucket: 5 s of an hour bucket used to be a
+    # 720x over-read; it is now 4x, and a slot one second past the quarter
+    # mark is rated over its own coverage again.
+    r = _draw(_response(5, [100e6, 0], bucket=3600, slots=2), [])
+    check((r.get("seconds") or [None])[-1] == 900,
+          "5 s of a 3600 s bucket is rated over 900 s (worst case 4x), not 5 s "
+          "(720x) (%r)" % r.get("seconds"))
+    r = _draw(_response(901, [100e6, 0], bucket=3600, slots=2), [])
+    check((r.get("seconds") or [None])[-1] == 901,
+          "901 s of a 3600 s bucket is rated over its own 901 s (%r)" % r.get("seconds"))
+
+    # -- covered == 0: t1 exactly on a bucket boundary -------------------------
+    # flowdb's int(span / bucket) + 1 then puts a tenth slot AT t1, covering
+    # nothing. Its vertex used to land past the right edge at zero.
+    r = _draw(_response(0, [0, 0]), [plot_x + plot_w])
+    vertices = r.get("vertices", [])
+    check((r.get("covered") or [None])[-1] == 0 and r.get("slotCount") == 9,
+          "an exactly aligned t1 leaves the final slot covering nothing, and it "
+          "is not counted among the drawn slots (%r)" % r.get("slotCount"))
+    check(len(vertices) == 13 and all(x <= plot_x + plot_w + 1e-9 for x, _ in vertices)
+          and _near(vertices[-3][0], plot_x + plot_w * (8 * _B + 30) / (9 * _B)),
+          "...so nine slots are drawn, no vertex lands past the right-hand edge, "
+          "and the last vertex is the ninth slot's centre (vertices=%d, max x=%s)"
+          % (len(vertices), max((x for x, _ in vertices), default=None)))
+    check(len(r.get("ticks", [])) == 9,
+          "...and the empty slot gets no tick of its own (%r)" % len(r.get("ticks", [])))
+    probe = (r.get("probes") or [{}])[-1]
+    check(probe.get("slot") == 8 and (probe.get("tipHeading") or "") == "stamp:%d" % (_T0 + 8 * _B),
+          "the cursor on the right-hand edge resolves to the ninth slot, a whole "
+          "one, not to the empty tenth (%r)" % probe.get("tipHeading"))
+
+    # -- data.t1 absent -------------------------------------------------------
+    r = _draw(_response(0, [60e6, 30e6], t1=False), [])
+    check(r.get("windowEnd") == _T0 + 9 * _B + _B and (r.get("covered") or [None])[-1] == _B
+          and (r.get("seconds") or [None])[-1] == _B and r.get("slotCount") == 10,
+          "without a t1 the window ends a whole bucket after the last slot's "
+          "start, which is then whole and drawn (%r)" % r.get("windowEnd"))
+
+    # -- a single-slot window -------------------------------------------------
+    # bucket_s None on the server puts the whole window in one slot whose
+    # bucket_s IS the span; every x must resolve to slot 0 and nothing else.
+    single = {"times": [_T0], "bucket_s": 100, "t1": _T0 + 100,
+              "series": [{"name": "a", "values": [50e6]}]}
+    r = _draw(single, [plot_x, plot_x + plot_w * 0.5, plot_x + plot_w - 1])
+    vertices = r.get("vertices", [])
+    check(r.get("seconds") == [100] and r.get("slotCount") == 1 and len(vertices) == 5
+          and _near(vertices[2][0], plot_x + plot_w * 0.5),
+          "a one-slot window is rated over its whole span and drawn as one "
+          "vertex at the centre of the plot (%r)" % vertices)
+    probes = r.get("probes", [])
+    check(len(probes) == 3 and all(p["slot"] == 0 for p in probes)
+          and _near(probes[0]["timeAt"], _T0)
+          and all(p["tipTotal"] == "total: 4.0 Mbps" for p in probes)
+          and all(p["window"] is not None for p in probes[:2]),
+          "every x on it resolves to slot 0, the left edge is t0, the tooltip "
+          "reads the one rate, and a drag from the left or the middle still "
+          "selects a window")
+    # From one pixel inside the right edge a 40 px drag clamps to t1 and
+    # spans a tenth of a second: under DRAG_MIN_S, so it is refused as a
+    # wobble -- and the brush is still drawn, clamped to the edge at its
+    # 2 px minimum, so the refusal is visible rather than silent.
+    edge = probes[-1] if probes else {}
+    check(edge.get("window") is None and _near(edge.get("dragTo"), _T0 + 100)
+          and edge.get("brush") is not None and _near(edge["brush"][1], 2),
+          "a drag that clamps at the right edge to under DRAG_MIN_S is refused, "
+          "with the brush drawn to the edge at its minimum width (window=%r, "
+          "brush=%r)" % (edge.get("window"), edge.get("brush")))
 
 
 # 46. NODES/ALERTS (5.3.0): the optic power rules alert against the levels the
