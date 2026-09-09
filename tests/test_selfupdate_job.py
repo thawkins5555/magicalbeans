@@ -19,6 +19,7 @@ import shutil
 import ssl
 import sys
 import tarfile
+import tempfile
 import threading
 import urllib.error
 
@@ -418,6 +419,97 @@ try:
           os.path.isfile(selfupdate.RESTART_LOG + ".1"))
     selfupdate.RESTART_LOG = _real_log
     selfupdate.RESTART_LOG_MAX_BYTES = _real_cap
+
+    # =================================================================
+    # 11. The reported Windows fault, routed around
+    # =================================================================
+    # `apply()` used to call `tempfile.mkdtemp()` on a line outside every
+    # try, so a %TEMP% that named a per-session folder Windows had deleted
+    # raised FileNotFoundError straight into _run_job's catch-all and read as
+    # "The update stopped unexpectedly". Staging now goes beside the install
+    # first, so a broken system temp no longer stops the update at all.
+    db11 = new_db("t11")
+    selfupdate._restart_scheduled = False
+    staged = []
+    selfupdate._swap_in = lambda path: staged.append(path)
+    _saved_tempdir = tempfile.tempdir
+    tempfile.tempdir = os.path.join(TMPDIR, "gone-session-temp")  # never created
+    try:
+        result11 = selfupdate.apply(db11)
+    finally:
+        tempfile.tempdir = _saved_tempdir
+        selfupdate._swap_in = lambda path: None
+    db11.close()
+    check("11. a vanished system temp folder no longer stops the update",
+          result11.get("ok") and not result11.get("up_to_date"), str(result11))
+    check("11. …and the update was staged beside the install, not in %TEMP%",
+          len(staged) == 1
+          and os.path.realpath(staged[0]).startswith(
+              os.path.realpath(selfupdate._APP_ROOT) + os.sep)
+          and selfupdate._STAGING_PREFIX in staged[0],
+          str(staged))
+
+    # =================================================================
+    # 12. Every candidate failing is a failure with a cause on it, not a
+    #     "stopped unexpectedly" escaping to _run_job's catch-all
+    # =================================================================
+    # Point every location the staging helper can try at a path under a
+    # regular file, so none can be created — install root, system temp, and
+    # temppath's own last-resort root. The failure must come back through
+    # step("failed") with the explanatory message, never the generic one.
+    _blocker = os.path.join(TMPDIR, "blocker-file")
+    with open(_blocker, "w", encoding="utf-8") as _h:
+        _h.write("not a directory\n")
+    db12 = new_db("t12")
+    selfupdate._restart_scheduled = False
+    selfupdate._before_restart_hook = None
+    selfupdate._before_restart_done = False
+    _saved_app_root = selfupdate._APP_ROOT
+    _saved_tp_root = selfupdate.temppath._APP_ROOT
+    _saved_tempdir = tempfile.tempdir
+    selfupdate._APP_ROOT = os.path.join(_blocker, "sub")            # uncreatable
+    selfupdate.temppath._APP_ROOT = os.path.join(_blocker, "root")  # uncreatable
+    tempfile.tempdir = os.path.join(_blocker, "systemp")            # uncreatable
+    try:
+        selfupdate._run_job(db12, None, None)
+        st12 = selfupdate.status()
+    finally:
+        selfupdate._APP_ROOT = _saved_app_root
+        selfupdate.temppath._APP_ROOT = _saved_tp_root
+        tempfile.tempdir = _saved_tempdir
+    db12.close()
+    check("12. every location failing ends on the failed step, not a raise",
+          st12["state"] == "failed" and st12["step"] == "failed", str(st12))
+    check("12. …the operator-visible text is the explanatory one, naming the "
+          "per-session temp folder as the cause",
+          "per-session" in st12["error"] and "Remote Desktop" in st12["error"],
+          str(st12["error"]))
+    check("12. …and it is NOT reported as 'stopped unexpectedly'",
+          "stopped unexpectedly" not in st12["error"], str(st12["error"]))
+    check("12. …and it names the locations it tried, so an operator knows "
+          "where to look",
+          "beside the install" in st12["error"], str(st12["error"]))
+
+    # =================================================================
+    # 13. Stale staging directories are swept; a netpath.bak- backup is not
+    # =================================================================
+    _work = os.path.join(TMPDIR, "sweeptest")
+    os.makedirs(_work, exist_ok=True)
+    _stale_stage = os.path.join(_work, selfupdate._STAGING_PREFIX + "leftover")
+    _bak = os.path.join(_work, "netpath.bak-123")
+    os.makedirs(_stale_stage, exist_ok=True)
+    os.makedirs(_bak, exist_ok=True)
+    _saved_app_root = selfupdate._APP_ROOT
+    selfupdate._APP_ROOT = _work
+    try:
+        selfupdate._sweep_staging_dirs()
+    finally:
+        selfupdate._APP_ROOT = _saved_app_root
+    check("13. a stale staging directory from a killed run is swept",
+          not os.path.exists(_stale_stage), _stale_stage)
+    check("13. …and a netpath.bak- backup is left untouched by that sweep — "
+          "the two prefixes are disjoint",
+          os.path.isdir(_bak), _bak)
 finally:
     selfupdate._fetch_json = real["json"]
     selfupdate._fetch_bytes = real["bytes"]

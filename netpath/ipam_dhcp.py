@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from .ipam_scan import mac_colon
+from .temppath import writable_tempdir
 from .worker import hidden
 
 IS_WINDOWS = os.name == "nt"
@@ -148,7 +149,8 @@ try {
 
 class DhcpUnavailable(Exception):
     """PowerShell, the DhcpServer module, or the target server did not
-    answer — no PowerShell/RSAT tools, or the remote call itself failed."""
+    answer — no PowerShell/RSAT tools, nowhere to stage the script, or the
+    remote call itself failed."""
 
 
 def _powershell_binary() -> str:
@@ -235,6 +237,44 @@ def _raw_output_message(returncode: int, stdout: str, stderr: str) -> str:
     return "\n\n".join(parts)
 
 
+def _staging_error(detail: str) -> str:
+    """The message for "could not write the script file", with the cause an
+    operator can actually act on appended, in the manner of _friendly_error.
+
+    This is the failure a real install reported on every poll:
+
+        DHCP poll of CLQWSRTM1 failed: [Errno 2] No such file or directory:
+        'C:\\Users\\ADMNA-~1\\AppData\\Local\\Temp\\2\\sappi-dhcp-z3_6xg__.ps1'
+
+    Nothing in that line says which machine, which folder, or why a folder
+    Python was told to use is not there — and the `\\Temp\\2` is the tell: a
+    per-session temp folder, which Windows removes when the Remote Desktop
+    session that owned it ends. A service launched from that session keeps
+    the dead path in its environment for as long as it runs, so the poll
+    fails every cycle, not intermittently. temppath.writable_tempdir() now
+    routes around the missing folder; this message is for when even that
+    finds nowhere, or the folder it found vanished before we could use it."""
+    return (
+        f"Could not write the PowerShell script this poll runs: {detail}\n\n"
+        f"This is on the machine running SappiWhere, not the DHCP server. "
+        f"Every poll writes its script to a temporary .ps1 file and hands "
+        f"that file to PowerShell, so with no writable temporary folder no "
+        f"DHCP server can be polled at all — expect every server here to "
+        f"show this same error until it is fixed. The usual cause is that the "
+        f"temporary folder the service was told to use no longer exists: a "
+        f"service started from a Remote Desktop session inherits that "
+        f"session's per-session temp folder (...\\AppData\\Local\\Temp\\<n>), "
+        f"which Windows deletes when the session ends. Point the service at a "
+        f"folder that outlives any logon session — for a service installed "
+        f"with NSSM as the README describes:\n"
+        f"  nssm set SappiWhere AppEnvironmentExtra TEMP=C:\\Windows\\Temp TMP=C:\\Windows\\Temp\n"
+        f"  nssm restart SappiWhere\n"
+        f"or set TEMP and TMP as system-wide (not per-user) environment "
+        f"variables and restart the service. If the folder does exist, the "
+        f"detail above says what else was wrong with it — full disk, or an "
+        f"account with no write permission there.")
+
+
 def _run(script: str, server: str, timeout_s: float,
         username: str | None = None, password: str | None = None) -> dict:
     server = _validate_address(server)
@@ -257,10 +297,33 @@ def _run(script: str, server: str, timeout_s: float,
     # PowerShell 5.1 — which, unlike pwsh, guesses a script's encoding from
     # its byte order mark and otherwise assumes the system codepage — reads
     # it correctly regardless of what that codepage is.
-    fd, script_path = tempfile.mkstemp(suffix=".ps1", prefix="sappi-dhcp-")
+    #
+    # Where that file goes is decided on every call, never at import: the
+    # directory `%TEMP%` names can stop existing while this process runs (a
+    # per-session temp folder deleted under a service — see _staging_error),
+    # and tempfile's own cached answer would keep pointing at it for the life
+    # of the process. writable_tempdir() re-creates a vanished folder, or
+    # finds another, and proves it is writable before handing it over.
+    #
+    # `script_path` is bound before the try so the cleanup below cannot
+    # itself raise UnboundLocalError when staging fails — that would replace
+    # the real error with a meaningless one — and the whole of staging sits
+    # inside the try so the password scrub in `finally` runs no matter where
+    # the failure happens.
+    script_path = None
     try:
-        with os.fdopen(fd, "w", encoding="utf-8-sig") as handle:
-            handle.write(script)
+        try:
+            fd, script_path = tempfile.mkstemp(
+                suffix=".ps1", prefix="sappi-dhcp-", dir=writable_tempdir())
+            with os.fdopen(fd, "w", encoding="utf-8-sig") as handle:
+                handle.write(script)
+        except (RuntimeError, OSError) as exc:
+            # RuntimeError is the resolver saying it found nowhere at all;
+            # OSError is the folder it found failing us anyway — deleted in
+            # the moment between its probe and our write, or a full disk.
+            # Either way a bare OSError in the log names a path and nothing
+            # else, which is the report this fix started from.
+            raise DhcpUnavailable(_staging_error(str(exc)))
         try:
             completed = subprocess.run(
                 [binary, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
@@ -271,16 +334,22 @@ def _run(script: str, server: str, timeout_s: float,
             raise DhcpUnavailable(
                 f"{server} did not respond within {timeout_s:.0f}s")
         except OSError as exc:
-            raise DhcpUnavailable(str(exc))
+            # The binary shutil.which found a moment ago could not be
+            # started — removed, or denied to this account. Name it: the
+            # OSError alone says "[WinError 2]" and leaves the operator to
+            # guess which of several files it means.
+            raise DhcpUnavailable(f"Could not start PowerShell ({binary}): {exc}")
     finally:
         # The password lived in this dict only as long as the call took;
         # drop the reference rather than let it linger in a local variable
-        # for the rest of whatever calls _run().
+        # for the rest of whatever calls _run(). This runs on every exit
+        # path above, including a failure to stage the script at all.
         env["SAPPI_DHCP_PASSWORD"] = ""
-        try:
-            os.remove(script_path)
-        except OSError:
-            pass
+        if script_path is not None:
+            try:
+                os.remove(script_path)
+            except OSError:
+                pass
 
     output = (completed.stdout or "").strip()
     stderr = (completed.stderr or "").strip()
