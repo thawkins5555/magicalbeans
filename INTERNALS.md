@@ -6350,6 +6350,35 @@ trims (trace, flow, syslog, snmp, ipam, nodes, alerts) each go through
 `Service._trim_db(key, db, label, noun, **kwargs)` in place of a repeated
 "is the cap set; if so, trim and log" block.
 
+**Settings restarts run off the request thread.** `apply_settings` merges,
+persists, writes the event-log line and bumps `config_version` on the HTTP
+thread — so a 200 is still truthful about what was *stored* — and then, for
+the five scopes in `_DEFERRED_SCOPES` (`netflow`, `syslog`, `snmp`,
+`wireless`, `configrx`), hands the reconfigure function to a single-threaded
+serial executor `Service` owns and returns. Those five are exactly the ones
+that end in `_restart()`, whose `stop()` joins each worker thread for up to
+two seconds and, for syslog, every connected TCP client for two seconds more:
+a syslog save with a couple of devices holding TCP sessions open used to hold
+the response open for over four seconds. The other four scopes stay inline
+because none of them joins anything — `nodes` hot-swaps the poller's pool,
+`alerts` and `ipam` only start/stop, and `mapper` has no worker at all.
+
+One thread, so restarts stay in the order they were asked for and two saves
+can never overlap one worker's stop and start. The queued function is handed
+the module's *live* settings dict rather than a snapshot, so a restart that
+waited behind another brings the worker up on what is stored now — two quick
+saves converge on the second one instead of the first resurrecting a
+collector the second had just disabled. A restart that raises is caught and
+logged to the event log (`ERROR`, "…settings were saved, but applying them
+failed"), because there is only one executor thread and every later save
+queues behind it. `Service.await_restarts(timeout)` blocks until nothing is
+queued or running and returns whether it went quiet; `shutdown()` calls it
+through `_drain_restarts()` before the databases close, so a restart cannot
+outlive the service or bring a collector back up after shutdown stopped it.
+The UI needed no change: `/api/state` already reports each worker's `running`
+flag and `status_text()`, so the poll every page makes shows the collector
+going down and coming back.
+
 ### Backup deletion and in-flight state (`configrxdb.py`, `configrx.py`)
 
 `delete_backup` / `delete_backups` sit beside `prune`, which was previously

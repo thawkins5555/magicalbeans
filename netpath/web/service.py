@@ -10,6 +10,8 @@ from __future__ import annotations
 import shutil
 import threading
 import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,7 +24,7 @@ from ..collector import Collector
 from ..configrx import ConfigRxWorker
 from ..configrxdb import ConfigRxDatabase
 from ..db import Database, FORCED_PRUNE_BUDGET_S, TRIM_BUDGET_S
-from ..eventlog import NODES, SYSTEM, EventLog
+from ..eventlog import ERROR, NODES, SYSTEM, EventLog
 from ..flowdb import ROLLUP_TIERS, FlowDatabase
 from ..fortipoll import WirelessPoller
 from .. import ipam_scan
@@ -231,6 +233,30 @@ _MODULE_SCOPES = {
     "mapper": ("mapper_settings", "mapper_db", "Mapper settings applied", _apply_mapper),
 }
 
+# The scopes whose effect is run off the request thread, by the serial
+# executor Service owns. Exactly the five that bounce a worker: every one of
+# them ends in _restart(), whose stop() joins each of the worker's threads for
+# up to two seconds, and syslogd.stop() joins every connected TCP client on
+# top of that. A syslog save with a couple of devices holding TCP sessions
+# open therefore held the HTTP response open for more than four seconds while
+# the browser sat on a spinner, for work the operator had already been told
+# was saved.
+#
+# The other four are deliberately not here, because none of them joins
+# anything: nodes hot-swaps the poller's pool (nodepoll.reconfigure), alerts
+# only start/stops, ipam start/stops a worker that re-reads its own settings
+# each cycle, and mapper has no worker at all. Running those inline keeps
+# them synchronous with the response — /api/state and the IPAM start/stop
+# control read them back immediately — and costs nothing.
+_DEFERRED_SCOPES = frozenset({"netflow", "syslog", "snmp", "wireless", "configrx"})
+
+# How long shutdown() waits for a queued restart to finish before closing the
+# databases underneath it. A restart is bounded by its joins — a couple of
+# seconds per worker thread, plus one per connected syslog TCP client, of
+# which there can be up to max_tcp_clients — so this is generous rather than
+# tight: the point is that the wait ends at all if a worker thread wedges.
+RESTART_DRAIN_TIMEOUT_S = 30.0
+
 
 class LdapUnavailable(Exception):
     """The directory could not be used at all — unreachable, timed out, or
@@ -298,6 +324,23 @@ class Service:
         self.wireless_settings = self.wireless_db.settings()
         self.configrx_settings = self.configrx_db.settings()
         self.mapper_settings = self.mapper_db.settings()
+
+        # Where a settings save's worker restart actually runs (see
+        # _DEFERRED_SCOPES and apply_settings). One thread, so restarts stay
+        # in the order they were asked for and two saves can never overlap
+        # one worker's stop and start — that pair is not re-entrant, and a
+        # second stop() landing between the first one's stop and its start
+        # would leave the collector down with its stored settings claiming
+        # it is up. The thread is created on the first save, not here: an
+        # install nobody opens Settings on never grows one.
+        self._restart_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="settings-restart")
+        # Counts what is queued *and* what is running, so await_restarts can
+        # tell "the queue is empty" from "the queue is empty because the one
+        # restart is still inside worker.stop()".
+        self._restarts_idle = threading.Condition()
+        self._restarts_pending = 0
+        self._restarts_closed = False
 
         self.hop_prober = HopProber(self.db, log=self.log)
         self.monitor = Monitor(
@@ -601,6 +644,13 @@ class Service:
         if self._rollup_thread is not None:
             self._rollup_thread.join(timeout=10.0)
             self._rollup_thread = None
+        # Before the databases close: a deferred restart starts a collector
+        # that writes to them, so one still in flight here would find its
+        # store closed underneath it. Draining first means the stop/start
+        # this method does below is also the last word on every worker,
+        # rather than racing a queued start that would bring one back up
+        # after shutdown had stopped it.
+        self._drain_restarts()
         with self._maintenance_lock:
             # Interactive SSH sessions first: they are the only thing here a
             # person is watching, and each one writes a closing device event,
@@ -708,15 +758,122 @@ class Service:
         """One module's settings saved and applied: merge, persist, restart
         or reconfigure whatever the scope owns, log it, and bump /api/config.
         Returns the scope's live settings dict. KeyError for a scope that is
-        not a module — `global` and `netpath` have their own methods."""
+        not a module — `global` and `netpath` have their own methods.
+
+        Everything the HTTP response answers for happens here, on the request
+        thread: the merge, the write to the module's database, the event-log
+        line and the config bump. So a 200 still means "this is stored", and
+        a reader that comes back on the strength of it sees the new values.
+
+        What does *not* happen here, for the five scopes in _DEFERRED_SCOPES,
+        is the worker restart — that is handed to the serial executor and the
+        response goes out immediately. The transition is not hidden from the
+        operator: /api/state reports each worker's `running` flag and its
+        status_text() on the poll the Settings and Dashboard pages already
+        make, so the collector is seen going down and coming back with no
+        frontend change at all.
+        """
         settings_attr, db_attr, label, apply_fn = _MODULE_SCOPES[scope]
         settings = getattr(self, settings_attr)
         settings.update(values)
         getattr(self, db_attr).save_settings(settings)
-        apply_fn(self, settings)
+        if scope in _DEFERRED_SCOPES:
+            self._queue_restart(scope, apply_fn, settings)
+        else:
+            apply_fn(self, settings)
         self.log.add(SYSTEM, label)
         self.bump_config()
         return settings
+
+    # -------------------------------------------------- deferred restarts
+
+    def _queue_restart(self, scope: str, apply_fn, settings: dict) -> None:
+        """Hand one scope's effect to the restart executor.
+
+        `settings` is the module's live dict, not a copy, and deliberately:
+        a restart that has been waiting behind another one should bring the
+        worker up on what is stored now, not on what was stored when it was
+        queued. Two saves in quick succession therefore converge on the
+        second one's settings instead of the first restart resurrecting a
+        collector the second save had just disabled.
+        """
+        with self._restarts_idle:
+            if not self._restarts_closed:
+                self._restarts_pending += 1
+                # Submitted under the same lock that shutdown() sets the
+                # closed flag with, so the pool cannot be shut down between
+                # the check and the submit.
+                self._restart_pool.submit(self._run_restart, scope, apply_fn,
+                                          settings)
+                return
+        # Only after shutdown() has drained and closed the executor. Dropping
+        # the effect would silently ignore a save, so it runs inline — what
+        # this did before the executor existed. The latency that costs does
+        # not matter to a service that is already going away.
+        self._apply_restart(scope, apply_fn, settings)
+
+    def _run_restart(self, scope: str, apply_fn, settings: dict) -> None:
+        """The executor thread's whole job: one effect, then the bookkeeping
+        await_restarts waits on. The decrement is in a finally so that a
+        failure no exception guard anticipated still leaves the count honest
+        rather than wedging every later await_restarts on a restart that is
+        not running."""
+        try:
+            self._apply_restart(scope, apply_fn, settings)
+        finally:
+            with self._restarts_idle:
+                self._restarts_pending -= 1
+                if self._restarts_pending == 0:
+                    self._restarts_idle.notify_all()
+
+    def _apply_restart(self, scope: str, apply_fn, settings: dict) -> None:
+        """One scope's effect with its failure caught and logged.
+
+        A restart that raises — a port that will not bind now that another
+        process holds it, a driver that throws on start — must not end the
+        executor thread. There is only one, and every later settings save
+        queues behind it, so losing it would mean no module's settings ever
+        took effect again until the service was restarted.
+        """
+        try:
+            apply_fn(self, settings)
+        except Exception as exc:
+            self.log.add(ERROR, f"{scope} settings were saved, but applying "
+                                f"them failed: {exc}", target=scope,
+                         detail=traceback.format_exc())
+
+    def await_restarts(self, timeout: float = 10.0) -> bool:
+        """Block until no deferred restart is queued or running.
+
+        True when it went quiet, False when `timeout` ran out first — the
+        caller decides what that means. shutdown() uses it so a restart
+        cannot outlive the service; a test uses it instead of sleeping, so
+        it asserts on a worker that has actually been brought back up rather
+        than on whether a chosen interval was long enough.
+        """
+        with self._restarts_idle:
+            return self._restarts_idle.wait_for(
+                lambda: self._restarts_pending == 0, timeout)
+
+    def _drain_restarts(self) -> None:
+        """Stop accepting restarts and wait for the queued ones, on the way
+        down. Idempotent, because shutdown() is: a second call finds the
+        executor already closed and nothing pending."""
+        with self._restarts_idle:
+            self._restarts_closed = True
+        if not self.await_restarts(RESTART_DRAIN_TIMEOUT_S):
+            # Said rather than swallowed: a restart still running past this
+            # point is about to meet a closed database, and the traceback
+            # that produces is much harder to read than this line.
+            self.log.add(ERROR, f"A settings restart was still running after "
+                                f"{RESTART_DRAIN_TIMEOUT_S:.0f}s; shutting "
+                                f"down without waiting for it")
+        # wait=False because the drain above is the wait, with a bound on it:
+        # a worker thread wedged past the timeout must not hang the shutdown
+        # here too. cancel_futures is belt and braces — nothing can have been
+        # queued since the flag went up, since _queue_restart sets the count
+        # and submits under the same lock the flag is set under.
+        self._restart_pool.shutdown(wait=False, cancel_futures=True)
 
     def _trim_db(self, key: str, db, label: str, noun: str, **kwargs) -> None:
         """Trim one database to its `max_*_db_mb` setting, if that setting is
