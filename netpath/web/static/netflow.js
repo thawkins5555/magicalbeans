@@ -28,15 +28,43 @@
   // that means "nothing of its own" in the donuts too, not a ninth hue.
   const OTHER = 'var(--data-neutral)';
 
-  /* One place decides a series' colour. The stacked bands, the legend and
-     the tooltip all read it from here, so a swatch always names the band
-     the cursor is actually over. `index` is the series' position in
-     data.series — never its position after any sorting the caller does. */
+  /* One place decides a series' colour. The stacked bands, the legend, the
+     tooltip and the top-N bars all read it from here, so a swatch always
+     names the band the cursor is actually over. `index` is the series'
+     position in data.series — never its position after any sorting the
+     caller does. Past the palette it is OTHER, never a wrap back round to
+     the first hue: a ninth entry painted --cat-1 claims a match with the
+     first band that does not exist. */
+  const isOther = (name) => String(name).startsWith('\u2014');
   const seriesColor = (name, index) =>
-    (String(name).startsWith('\u2014') ? OTHER : SERIES[index % SERIES.length]);
+    (isOther(name) || index >= SERIES.length ? OTHER : SERIES[index]);
+
+  /* How many bands the chart drew with a hue of their own — the response's
+     series less "— other —". Read off the response rather than written
+     down here as 8, so a top-N row past this count is swatched neutral
+     whatever the server's limit is set to. */
+  const namedBands = (data) =>
+    ((data && data.series) || []).filter((series) => !isOther(series.name)).length;
+
+  /* What a top-N row past that count says for itself, in its tooltip and
+     in its accessible description: the chart put it inside "— other —",
+     and a neutral swatch alone leaves that to be deduced. */
+  const FOLDED_TEXT = 'Folded into \u2014 other \u2014 in the chart above';
   const PROTOCOLS = [['Any protocol', ''], ['TCP', 6], ['UDP', 17], ['ICMP', 1],
                      ['GRE', 47], ['ESP', 50], ['OSPF', 89]];
   const PAD = { left: 62, right: 12, top: 14, bottom: 26 };
+
+  /* The narrowest drag-selection the chart accepts, in seconds and on
+     screen. It used to be one bucket of the response on screen, and that
+     bucket is the PREVIOUS window's, chosen for that window's span — six
+     hours each on a 30-day chart — so any selection narrower than it did
+     nothing at all, with no word said. A few seconds is what the server's
+     own ladder (api._flow_bucket) can answer with a finer bucket, which is
+     what the ladder exists for; the pixel floor is what tells a click with
+     a wobble in it from a drag, since on a wide chart one pixel is already
+     many minutes. applyWindow widens anything under a minute. */
+  const DRAG_MIN_S = 3;
+  const DRAG_MIN_PX = 4;
 
   // One sentence for "nothing matched the window/filters" — the chart, the
   // top-talker bars and the record table used to each say this their own
@@ -266,6 +294,39 @@
     return `${Math.round(bits)} Tbps`;
   }
 
+  /* How many seconds one slot of a response actually covers. Every slot
+     but the last is a whole bucket; the last runs from its own start to
+     the window's end and is almost always partial — flowdb sizes the
+     window as int(span / bucket) + 1 slots, so the final slot starts on
+     the last boundary before t1 and covers only what is left after it.
+     Dividing that by the nominal width drew a bucket a fifth full at a
+     fifth of its true rate: a cliff at the right-hand edge of every chart,
+     on exactly the newest data, and the hover confirmed the number.
+
+     Floored at a few seconds rather than at zero: that guards the division
+     and stops a sliver holding one or two flow records being read as a
+     rate at all. Not padded out to a whole bucket either, which would
+     invent empty future time and draw the same cliff on a live window.
+     drawChart and slotTip both divide by this, so the chart and its
+     tooltip cannot drift apart. */
+  const SLOT_MIN_S = 5;
+
+  // The end of the window the values were read over: the response's own
+  // t1, not view.t1, which may already have moved on under a pending fetch.
+  function windowEnd(data) {
+    const times = data.times;
+    return Number.isFinite(data.t1)
+      ? data.t1 : times[times.length - 1] + data.bucket_s;
+  }
+
+  function slotSeconds(data, slot) {
+    const last = data.times.length - 1;
+    if (slot < last) return data.bucket_s;
+    const covered = windowEnd(data) - data.times[last];
+    return Math.max(Math.min(covered, data.bucket_s),
+                    Math.min(SLOT_MIN_S, data.bucket_s));
+  }
+
   /* The chart carries too many time buckets for one tab stop each (a wide
      window is hundreds of them), so the container is the one stop and the
      same keys the pan/zoom/reset buttons already run answer to it directly
@@ -315,11 +376,10 @@
     svg.innerHTML = '';
 
     const data = view.data;
-    const legendH = 22;
     const plot = {
       x: PAD.left, y: PAD.top,
       w: Math.max(width - PAD.left - PAD.right, 10),
-      h: Math.max(height - PAD.top - PAD.bottom - legendH, 10),
+      h: 0,
     };
 
     if (view.loading || view.failed || !data || !data.times.length
@@ -329,12 +389,36 @@
       return;
     }
 
+    /* The legend is laid out before the plot is sized, because it is what
+       decides how tall the plot can be: an entry that no longer fits its
+       row goes on to the next one rather than being dropped, since a band
+       drawn with nothing naming it is a colour the operator has to guess
+       at. Bounded: nine entries at most (eight named plus "— other —"),
+       and an entry wider than the whole row still gets a row of its own. */
+    const LEGEND_ROW_H = 16;
+    const legend = [];
+    let legendX = plot.x;
+    let legendRow = 0;
+    data.series.forEach((series, index) => {
+      const label = series.name;
+      const width_ = label.length * 6.5 + 24;
+      if (legendX > plot.x && legendX + width_ > plot.x + plot.w) {
+        legendRow += 1;
+        legendX = plot.x;
+      }
+      legend.push({ label, index, x: legendX, row: legendRow });
+      legendX += width_;
+    });
+    const legendH = 6 + LEGEND_ROW_H * (legendRow + 1);
+    plot.h = Math.max(height - PAD.top - PAD.bottom - legendH, 10);
+
     const count = data.times.length;
     const bucket = data.bucket_s;
     const cumulative = [];
     let running = new Array(count).fill(0);
     for (const series of data.series) {
-      running = running.map((value, i) => value + (series.values[i] || 0) * 8 / bucket);
+      running = running.map((value, i) =>
+        value + (series.values[i] || 0) * 8 / slotSeconds(data, i));
       cumulative.push([...running]);
     }
     const peak = Math.max(...running, 0);
@@ -352,19 +436,38 @@
       }, rateLabel(axisMax * fraction)));
     }
 
-    const stepX = plot.w / Math.max(count - 1, 1);
+    /* The x axis is the window the server read, t0 to t1, so the drawn
+       area spans it all: the slots used to be spread so that the last one
+       sat on the right-hand edge with no width, which put every bucket one
+       interval left of the time it held and left the newest one invisible.
+       Each slot's vertex sits at the centre of the time it covers — for
+       the final, partial slot the centre of what it covers so far — and
+       the area runs flat from the first vertex to the left edge and from
+       the last to the right, so no part of the window is undrawn. The
+       crosshair, the drag brush and the tooltip all read the same three
+       functions, so the slot under the cursor is the slot whose time the
+       cursor is over. */
+    const t0 = data.times[0];
+    const t1 = windowEnd(data);
+    const axisSpan = Math.max(t1 - t0, 1e-6);
+    const xOf = (ts) => plot.x + (ts - t0) / axisSpan * plot.w;
+    const timeAt = (x) =>
+      t0 + Math.min(Math.max((x - plot.x) / plot.w, 0), 1) * axisSpan;
+    const slotAt = (ts) =>
+      Math.min(Math.max(Math.floor((ts - t0) / bucket), 0), count - 1);
+    const yOf = (top) => plot.y + plot.h - plot.h * Math.min(top / axisMax, 1);
+    const baseline = plot.y + plot.h;
     /* Painted from the top of the stack down: every band is filled to the
        baseline, so drawing in series order would leave the last one covering
        all the others. */
     for (let index = data.series.length - 1; index >= 0; index -= 1) {
       const tops = cumulative[index];
-      const points = [`${plot.x},${plot.y + plot.h}`];
+      const points = [`${xOf(t0)},${baseline}`, `${xOf(t0)},${yOf(tops[0])}`];
       for (let slot = 0; slot < count; slot += 1) {
-        const x = plot.x + slot * stepX;
-        const y = plot.y + plot.h - plot.h * Math.min(tops[slot] / axisMax, 1);
-        points.push(`${x},${y}`);
+        const middle = data.times[slot] + slotSeconds(data, slot) / 2;
+        points.push(`${xOf(middle)},${yOf(tops[slot])}`);
       }
-      points.push(`${plot.x + (count - 1) * stepX},${plot.y + plot.h}`);
+      points.push(`${xOf(t1)},${yOf(tops[count - 1])}`, `${xOf(t1)},${baseline}`);
       const name = data.series[index].name;
       svg.appendChild(App.svgNode('polygon', {
         points: points.join(' '),
@@ -376,44 +479,35 @@
     const span = view.t1 - view.t0;
     const tickEvery = Math.max(1, Math.floor(count / 7));
     for (let slot = 0; slot < count; slot += tickEvery) {
-      const x = plot.x + slot * stepX;
+      // Each tick marks the start of the slot it labels.
+      const x = xOf(data.times[slot]);
       svg.appendChild(App.svgNode('text', {
         x, y: plot.y + plot.h + 15, 'text-anchor': 'middle', fill: 'var(--dim)',
         'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
       }, App.stamp(data.times[slot], span)));
     }
 
-    let legendX = plot.x;
-    data.series.forEach((series, index) => {
-      const label = series.name;
-      const width_ = label.length * 6.5 + 24;
-      if (legendX + width_ > plot.x + plot.w) return;
+    for (const entry of legend) {
+      const y = height - legendH + 6 + entry.row * LEGEND_ROW_H;
       svg.appendChild(App.svgNode('rect', {
-        x: legendX, y: height - legendH + 6, width: 9, height: 9, rx: 2,
-        fill: seriesColor(label, index),
+        x: entry.x, y, width: 9, height: 9, rx: 2,
+        fill: seriesColor(entry.label, entry.index),
       }));
       svg.appendChild(App.svgNode('text', {
-        x: legendX + 14, y: height - legendH + 14, fill: 'var(--muted)',
+        x: entry.x + 14, y: y + 8, fill: 'var(--muted)',
         'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
-      }, label));
-      legendX += width_;
-    });
+      }, entry.label));
+    }
 
     if (view.drag) {
-      const xFor = (ts) => plot.x + (ts - data.times[0])
-        / Math.max(data.times[count - 1] - data.times[0], 1e-6) * plot.w;
-      const a = xFor(Math.min(view.drag.from, view.drag.to));
-      const b = xFor(Math.max(view.drag.from, view.drag.to));
+      const a = xOf(Math.min(view.drag.from, view.drag.to));
+      const b = xOf(Math.max(view.drag.from, view.drag.to));
       svg.appendChild(App.svgNode('rect', {
         x: a, y: plot.y, width: Math.max(b - a, 2), height: plot.h,
         fill: 'var(--accent)', 'fill-opacity': 0.18, stroke: 'var(--accent)',
       }));
     }
 
-    const timeAt = (x) => {
-      const fraction = Math.min(Math.max((x - plot.x) / plot.w, 0), 1);
-      return data.times[0] + fraction * (data.times[count - 1] - data.times[0]);
-    };
     const crosshair = App.svgNode('line', {
       y1: plot.y, y2: plot.y + plot.h,
       stroke: 'var(--muted)', 'stroke-dasharray': '2 3', visibility: 'hidden',
@@ -443,8 +537,7 @@
       crosshair.setAttribute('x1', x);
       crosshair.setAttribute('x2', x);
       crosshair.setAttribute('visibility', 'visible');
-      const slot = Math.min(Math.round((x - plot.x) / stepX), count - 1);
-      App.tooltip(slotTip(data, slot), event);
+      App.tooltip(slotTip(data, slotAt(timeAt(x))), event);
     };
     svg.onpointerleave = () => {
       crosshair.setAttribute('visibility', 'hidden');
@@ -454,7 +547,12 @@
       if (!view.drag) return;
       const { from, to, moved } = view.drag;
       view.drag = null;
-      if (moved && Math.abs(to - from) > bucket) {
+      // A click (`moved` false) redraws and nothing more, as it always has;
+      // a drag is accepted down to DRAG_MIN_S and DRAG_MIN_PX, not down to
+      // the previous response's bucket. The server picks the bucket for
+      // the narrower window from its own ladder.
+      if (moved && Math.abs(to - from) >= DRAG_MIN_S
+          && Math.abs(xOf(to) - xOf(from)) >= DRAG_MIN_PX) {
         setWindow(Math.min(from, to), Math.max(from, to), false);
       } else drawChart();
     };
@@ -462,8 +560,10 @@
     svg.onwheel = (event) => {
       event.preventDefault();
       const x = event.offsetX * (width / svg.clientWidth);
-      // Anchor on the window's own time axis rather than the plotted buckets,
-      // which stop short of the right edge by one interval.
+      // Anchor on the window's own time axis: it is what setWindow moves,
+      // and the plotted axis spans the same window now (it used to stop
+      // short of the right edge by one interval), differing only by the
+      // server's snapping of t0 to a bucket boundary.
       const fraction = Math.min(Math.max((x - plot.x) / plot.w, 0), 1);
       const anchor = view.t0 + fraction * (view.t1 - view.t0);
       const [start, end] = App.wheelWindow(event, view.t0, view.t1, anchor);
@@ -473,9 +573,17 @@
   }
 
   function slotTip(data, slot) {
-    const bucket = data.bucket_s;
-    const rows = [{ text: App.stamp(data.times[slot],
-      data.times[data.times.length - 1] - data.times[0]) }];
+    const seconds = slotSeconds(data, slot);
+    const last = data.times.length - 1;
+    const span = windowEnd(data) - data.times[0];
+    let heading = App.stamp(data.times[slot], span);
+    if (slot === last && seconds < data.bucket_s) {
+      // Said rather than deduced: the newest slot is a rate over what it
+      // covers so far, not over a whole interval like the rest.
+      heading += ` \u00b7 ${App.span(windowEnd(data) - data.times[slot])}`
+        + ` of ${App.span(data.bucket_s)} so far`;
+    }
+    const rows = [{ text: heading }];
     // The index has to survive the sort: it is what maps a series to the
     // colour of its band, and sorting by volume reorders the rows.
     const pairs = data.series
@@ -486,12 +594,12 @@
       .sort((a, b) => b.value - a.value);
     for (const entry of pairs.slice(0, 8)) {
       rows.push({
-        text: `${entry.name}: ${App.rate(entry.value, bucket)}`,
+        text: `${entry.name}: ${App.rate(entry.value, seconds)}`,
         color: seriesColor(entry.name, entry.index),
       });
     }
     const total = data.series.reduce((sum, s) => sum + (s.values[slot] || 0), 0);
-    rows.push({ text: `total: ${App.rate(total, bucket)}` });
+    rows.push({ text: `total: ${App.rate(total, seconds)}` });
     return rows;
   }
 
@@ -519,8 +627,14 @@
     }
     const dimension = App.el('nf-dimension').value;
     const peak = Math.max(...rows.map((r) => r.bytes), 1);
+    // The rows and the chart's series come off one sorted list on the
+    // server, so row i IS band i for as long as there are bands; the rows
+    // after that are inside "— other —" up there, and get its neutral.
+    const drawn = namedBands(view.data);
     const bars = [];
     rows.forEach((row, index) => {
+      const folded = index >= drawn;
+      const color = folded ? OTHER : seriesColor(row.label, index);
       const div = document.createElement('div');
       div.className = 'bar-row';
       // id carries the row's real identity (row.key: a port, an address, an
@@ -528,14 +642,18 @@
       // itself reorders across refreshes. The value span gets its own id so
       // the traffic figures — the part that DOES change every refresh — can
       // still reach assistive tech, through aria-describedby below, without
-      // being the thing the row's accessible NAME is built from.
+      // being the thing the row's accessible NAME is built from. A folded
+      // row's sentence gets a (visually hidden) span of its own for the
+      // same reason, rather than being written into the visible figures.
       div.id = barRowId(dimension, row.key);
       const valueId = `${div.id}-value`;
+      const foldId = `${div.id}-fold`;
       div.innerHTML =
         `<div class="bar-fill" style="width:${(row.bytes / peak) * 100}%;` +
-        `background:${SERIES[index % SERIES.length]}"></div>` +
+        `background:${color}"></div>` +
         `<span class="bar-label">${escape(row.label)}</span>` +
-        `<span class="bar-value" id="${valueId}">${row.bytes_text} · ${row.rate_text}</span>`;
+        `<span class="bar-value" id="${valueId}">${row.bytes_text} · ${row.rate_text}</span>` +
+        (folded ? `<span class="sr-only" id="${foldId}">${FOLDED_TEXT}</span>` : '');
       div.onclick = () => {
         // A bar picked with the mouse becomes the one the keyboard returns
         // to, same as a table row's own click already does.
@@ -543,13 +661,17 @@
         filterByBar(row);
       };
       div.style.cursor = 'pointer';
-      // Swatched to match its own bar, and to match the band of the same
-      // name in the chart above it.
+      // Swatched to match its own bar: for the first `drawn` rows that is
+      // the band of the same name in the chart above, and for the rest it
+      // is the neutral the chart draws "— other —" in, because that is
+      // where the chart put them. Said in words as well, so a grey swatch
+      // reads as a fact and not as a colour that ran out.
       const tip = [
-        { text: row.label, color: seriesColor(row.label, index) },
+        { text: row.label, color },
         { text: `${row.bytes_text} · ${row.rate_text}` },
         { text: `${row.flows} flow records` },
       ];
+      if (folded) tip.push({ text: FOLDED_TEXT });
       div.setAttribute('role', 'button');
       // The accessible NAME is what the row IS — this port, this address,
       // this exporter — and nothing else, precisely because that is the one
@@ -559,7 +681,7 @@
       // aria-describedby, just not folded into the name a repeat visitor or
       // a future automated check would use to find this exact row again.
       div.setAttribute('aria-label', row.label);
-      div.setAttribute('aria-describedby', valueId);
+      div.setAttribute('aria-describedby', folded ? `${valueId} ${foldId}` : valueId);
       div.addEventListener('mousemove', (event) => App.tooltip(tip, event));
       div.addEventListener('mouseleave', App.hideTooltip);
       div.addEventListener('focus', () => {

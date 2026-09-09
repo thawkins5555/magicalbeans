@@ -682,9 +682,11 @@ def test_14_a_named_series_is_whole_in_every_bucket() -> None:
         start, end, "Conversation", NO_FILTERS, 60, series_limit=8)
     spans = db._agg_rows(start, end, None, NO_FILTERS, 60)[4]
     early, late = flooded[0], flooded[2]
-    check(all(series[key][early] == 0 for key in regulars[:8])
-          and all(series[key][late] == 1_000 + k
-                  for k, key in enumerate(regulars[:8])),
+    # The eight heaviest regulars are the named bands (bytes = 100_000 + k).
+    named = {key: 1_000 + k for k, key in enumerate(regulars)}
+    named = dict(sorted(named.items(), key=lambda kv: -kv[1])[:8])
+    check(all(series[key][early] == 0 for key in named)
+          and all(series[key][late] == lull for key, lull in named.items()),
           "a flagged bucket the raw rows no longer reach is served capped, "
           "one they still reach is served whole")
     check(sum(values[early] for values in series.values())

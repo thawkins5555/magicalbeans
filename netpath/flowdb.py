@@ -231,15 +231,25 @@ ROLLUP_TIERS = (60, 3600)
 # above that for every bar the page draws to be exact.
 ROLLUP_KEYS = {60: 48, 3600: 64}
 
-# How many flagged buckets one read will repair from the raw rows before it
-# gives up and serves the capped rollup as stored. Each contiguous run of
-# flagged buckets is one arm of the UNION ALL that _agg_rows builds, so the
-# worst case (no two adjacent) is this many arms — kept well under SQLite's
-# default compound-select ceiling of 500, and under the 999 bound variables
-# an older SQLite allows. Past it a chart is a day of minute buckets or a
-# fortnight of hourly ones, where the raw rows would cost what the rollups
-# exist to avoid: the holes stay, exactly as they did before the flag.
+# How much one read will repair from the raw rows before it gives up and
+# serves the capped rollup as stored — two bounds, for two different costs.
+#
+# _REPAIR_MAX_BUCKETS bounds the statement: each contiguous run of flagged
+# buckets is one arm of the UNION ALL _agg_rows builds, so the worst case (no
+# two adjacent) is this many arms, kept well under SQLite's default
+# compound-select ceiling of 500 and the 999 bound variables an older SQLite
+# allows. Past it a chart is a day of minute buckets or a fortnight of hourly
+# ones, and the holes stay exactly as they did before the flag existed.
+#
+# _REPAIR_MAX_FLOWS bounds the work: the raw rows the repair arms will scan,
+# known in advance from the span rows' own flow counts. The overview holds
+# the collector's write lock for the whole query and NetFlow is UDP, so a
+# repair that took seconds would cost flows at the socket to redraw a chart;
+# a hundred thousand rows is a few hundred milliseconds. A quiet store never
+# reaches it; a store busy enough to does not get its holes repaired, which
+# is where it stood before.
 _REPAIR_MAX_BUCKETS = 200
+_REPAIR_MAX_FLOWS = 100_000
 
 # Which setting bounds each tier's history. The minute tier is the expensive
 # one (~42 MB a day against ~0.9 MB for the hourly tier), and only the windows
@@ -977,21 +987,25 @@ class FlowDatabase(SqliteStore):
                        seal: float) -> list[list[int]]:
         """Which buckets of [t0, seal) the raw rows answer for instead of
         the rollup: the ones _compact_bucket flagged as cut short by the
-        cap, where the raw rows still reach.
+        cap, where the raw rows still hold everything the bucket was built
+        from.
 
         Returned as [low, upper) runs rather than buckets, adjacent flags
-        merged: in the common case — a busy exporter over the cap in every
+        merged: in the common case — an exporter over the cap in every
         minute — that is one run, and so one extra arm in the query. An
         empty list means "serve the rollup as stored", which is also the
-        answer past _REPAIR_MAX_BUCKETS: repairing a day of minute buckets
-        is the raw scan the rollup exists to avoid, and a query with a
-        thousand arms is not one SQLite will run anyway.
+        answer past either _REPAIR_MAX bound.
 
-        "Still reach" is MIN(ts_end) FROM flows, an ix_flows_ts probe:
-        prune() ages the raw rows out oldest ts_end first, so everything
-        above that mark is intact and everything below it is gone. A bucket
-        the mark falls inside is served from the rollup — the raw rows would
-        answer for part of a minute and call it the whole.
+        "Still hold everything" is checked, not assumed: a run is repaired
+        only if the raw rows in it number at least what its span rows
+        counted when the buckets were built. Retention ages the raw rows
+        out oldest first, but the row cap deletes by id — arrival order,
+        which an exporter with a skewed clock does not keep — and a rule
+        read off MIN(ts_end) mistook the first bucket of a store's history
+        for a pruned one. Late flows only ever push the raw count above the
+        span's, and a raw answer that is fresher than the rollup is the
+        better one. The count is an ix_flows_ts range walk, bounded by the
+        same _REPAIR_MAX_FLOWS the scan it precedes is.
         """
         with self._lock:
             rows = self._conn.execute(
@@ -1000,20 +1014,29 @@ class FlowDatabase(SqliteStore):
                 (tier, dim, t0, seal, _REPAIR_MAX_BUCKETS + 1)).fetchall()
             if not rows or len(rows) > _REPAIR_MAX_BUCKETS:
                 return []
-            oldest = self._conn.execute(
-                "SELECT MIN(ts_end) AS lo FROM flows").fetchone()["lo"]
-        if oldest is None:
-            return []
-        ranges: list[list[int]] = []
-        for row in rows:
-            bucket = int(row["bucket"])
-            if bucket < oldest:
-                continue
-            if ranges and ranges[-1][1] == bucket:
-                ranges[-1][1] = bucket + tier
-            else:
-                ranges.append([bucket, bucket + tier])
-        return ranges
+            runs: list[list[int]] = []
+            for row in rows:
+                bucket = int(row["bucket"])
+                if runs and runs[-1][1] == bucket:
+                    runs[-1][1] = bucket + tier
+                else:
+                    runs.append([bucket, bucket + tier])
+            expected = []
+            for low, upper in runs:
+                expected.append(self._conn.execute(
+                    "SELECT COALESCE(SUM(flows), 0) AS n FROM flow_rollup_span"
+                    " WHERE tier = ? AND bucket >= ? AND bucket < ?",
+                    (tier, low, upper)).fetchone()["n"])
+            if sum(expected) > _REPAIR_MAX_FLOWS:
+                return []
+            kept = []
+            for (low, upper), wanted in zip(runs, expected):
+                held = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM flows WHERE ts_end >= ?"
+                    " AND ts_end < ?", (low, upper)).fetchone()["n"]
+                if held >= wanted:
+                    kept.append([low, upper])
+        return kept
 
     def _agg_rows(self, t0: float, t1: float, dimension: str | None,
                   filters: dict, bucket_s: float | None):
