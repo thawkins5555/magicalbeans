@@ -4,8 +4,9 @@ row here is a hand-built dict standing in for a sqlite3.Row from
 nodesdb.all_neighbours(), so this whole suite runs with nothing but the
 stdlib.
 
-Covers: link folding (both-ends-walked cables collapse; sysName-only
-matches do not), unmanaged-peer identity and multiplicity, the on_map
+Covers: link folding (both-ends-walked cables collapse, whether MAC-matched
+or the lone reciprocal sysName-only pair), unmanaged-peer identity and
+multiplicity, the on_map
 placement gate, present/staleness filtering, protocol/VLAN merging,
 render_plan's three modes, vlan_color_index's collision behaviour, and the
 CSV export shape.
@@ -88,16 +89,27 @@ if links:
 check("no peers from a fully-matched cable", peers == [], peers)
 
 # A sysName-only match: nodesdb resolved a device but has no matched
-# if_index for either direction, so the two rows must NOT fold -- pairing
-# them would be a guess at which port on the far end this cable lands on.
+# if_index for either direction. Neither row can say which far-end port it
+# lands on, but these are the ONLY two rows between devices 1 and 2 -- one
+# port on each side, each naming the other -- so the pairing is forced, not
+# guessed, and the cable folds to one link. Once folded, each end's label is
+# what that end's OWN port_label said, not the raw string the neighbour
+# sent, and the far-end if_index (NULL in both rows) is now known.
 rows_name_only = [
     row(1, 11, sys_name="core-sw", matched_device_id=2, matched_if_index=None),
     row(2, 21, sys_name="edge-sw", matched_device_id=1, matched_if_index=None),
 ]
 links_nm, _ = assemble_links(rows_name_only, port_vlans={}, port_label=label_of,
                              on_map=all_on_map, now=NOW)
-check("a sysName-only match (no matched_if_index) does NOT fold -- two links",
-      len(links_nm) == 2, links_nm)
+check("a reciprocal sysName-only match (one row each side) folds to ONE link",
+      len(links_nm) == 1, links_nm)
+if len(links_nm) == 1:
+    check("...with both ports resolved through port_label",
+          {links_nm[0]["a_port"], links_nm[0]["b_port"]} == {"dev1/if11", "dev2/if21"},
+          links_nm[0])
+    check("...and the far-end if_index filled in from the other row",
+          {links_nm[0]["a_if_index"], links_nm[0]["b_if_index"]} == {11, 21},
+          links_nm[0])
 
 # ------------------------------------------------------------- unmanaged peers
 

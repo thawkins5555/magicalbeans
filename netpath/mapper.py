@@ -285,11 +285,18 @@ def link_identity(device_id, if_index, matched_id, matched_if_index) -> object:
     which draws as a second, one-directional line rather than a wrong
     guess at which port to fold it onto.
 
-    That per-row key is not the last word: `_fold_name_matched` runs after
-    every row is keyed and folds a name-matched row onto a MAC-matched link
-    that already owns this row's own local port and faces the matched
-    device — the CDP/LLDP pair for one cable, where the evidence for pairing
-    comes from the local port rather than from a guess about the far end."""
+    That per-row key is not the last word. Two later passes fold it where
+    something OTHER than a guess pairs the ports: `_fold_name_matched` folds
+    a name-matched row onto a MAC-matched link that already owns this row's
+    own local port and faces the matched device — the CDP/LLDP pair for one
+    cable, where the evidence comes from the local port; and
+    `_fold_reciprocal_name_matched` folds the two name-only rows of a cable
+    walked from both ends when they are the ONLY rows between that pair of
+    devices — one port each side, so the pairing is forced. What stays as
+    separate lines is the ambiguous remainder: two or more name-only rows on
+    either side of the same device pair (a LAG, or a pair of switches
+    cross-connected twice), where any pairing would still be the guess this
+    key exists to avoid."""
     if matched_if_index is not None:
         return frozenset({(device_id, if_index), (matched_id, matched_if_index)})
     return ("name-match", device_id, if_index)
@@ -349,9 +356,10 @@ def _fold_name_matched(links_by_key: dict) -> None:
     because the two rows arrive in either order; where several links share the
     endpoint (one port facing more than one matched neighbour, through a hub)
     the lowest link id wins, so the answer does not follow row order either.
-    The reciprocal name-ONLY case is deliberately left as two links, for
-    `link_identity`'s own reason: nothing says those two ports face each
-    other."""
+    The reciprocal name-ONLY case — no MAC-matched link on either side to
+    fold onto — is not this pass's business: `_fold_reciprocal_name_matched`
+    runs next and takes the unambiguous one-port-each-side shape, leaving
+    the multi-cable shape alone for `link_identity`'s own reason."""
     by_endpoint: dict = {}
     for key, link in links_by_key.items():
         if not isinstance(key, frozenset):
@@ -384,6 +392,65 @@ def _fold_name_matched(links_by_key: dict) -> None:
         del links_by_key[key]
 
 
+def _fold_reciprocal_name_matched(links_by_key: dict) -> None:
+    """Fold the two name-only rows of ONE cable walked from BOTH ends.
+
+    The common shape, not a corner: two classic Cisco switches joined by one
+    cable and speaking only CDP to each other. `_walk_cdp` never writes a
+    chassis_id_subtype, so neither side's row can resolve a matched_if_index
+    through the chassis-MAC join, and `_fold_name_matched` finds no
+    MAC-matched link on either side to fold onto. Both rows survive as
+    ("name-match", A, ifA) and ("name-match", B, ifB) — two records that
+    mapper.js resolves to the same two nodes and draws on the same
+    coordinates, port labels and VLAN count painted twice over.
+
+    Folds ONLY when the pairing is forced. Group the surviving name-only
+    links by the unordered device pair they sit between; where that pair has
+    exactly ONE link reported from each side, there is one cable with one
+    port at each end and both ends have named it, so nothing is being
+    guessed. Two or more from either side is the LAG / cross-connected case
+    `link_identity` refuses to guess at — the rows say "A has two ports
+    facing B" and nothing says which faces which — and a pair heard from
+    only one side has no reciprocal row to fold with at all; both are left
+    exactly as they are. Runs AFTER `_fold_name_matched` so a name-only row
+    that pass already folded onto a MAC-matched link does not count against
+    the pair here.
+
+    The survivor is the link whose (a_device_id, a_if_index) sorts lower,
+    so the answer never follows row order. It takes from the other row what
+    only that row knew: its far-end if_index (None until now) and its
+    far-end port label — the other switch's OWN port_label(), replacing the
+    raw string CDP sent across the cable — plus the union of protocols and
+    VLANs, a native VLAN if the survivor had none, and the later seen_ts."""
+    by_pair: dict = {}
+    for key, link in links_by_key.items():
+        if not (isinstance(key, tuple) and key and key[0] == "name-match"):
+            continue
+        if link["b_device_id"] is None or link["a_device_id"] == link["b_device_id"]:
+            continue
+        pair = frozenset({link["a_device_id"], link["b_device_id"]})
+        by_pair.setdefault(pair, {}).setdefault(link["a_device_id"], []).append(key)
+
+    for pair, by_side in by_pair.items():
+        if len(by_side) != 2 or any(len(keys) != 1 for keys in by_side.values()):
+            continue
+        (key_lo, key_hi) = sorted(
+            (keys[0] for keys in by_side.values()),
+            key=lambda one: (links_by_key[one]["a_device_id"],
+                             links_by_key[one]["a_if_index"]))
+        survivor = links_by_key[key_lo]
+        other = links_by_key[key_hi]
+        survivor["b_device_id"] = other["a_device_id"]
+        survivor["b_if_index"] = other["a_if_index"]
+        survivor["b_port"] = other["a_port"]
+        survivor["protocols"] |= other["protocols"]
+        survivor["vlans"] |= other["vlans"]
+        if survivor["native_vlan"] is None:
+            survivor["native_vlan"] = other["native_vlan"]
+        survivor["seen_ts"] = max(survivor["seen_ts"], other["seen_ts"])
+        del links_by_key[key_hi]
+
+
 def assemble_links(neighbour_rows, *, port_vlans, port_label, on_map, now,
                    stale_after_s=None) -> tuple[list[dict], list[dict]]:
     """Turn raw LLDP/CDP neighbour rows into the links and peers one map
@@ -408,8 +475,11 @@ def assemble_links(neighbour_rows, *, port_vlans, port_label, on_map, now,
          or a not-yet-placed peer would never be offered at all.
       6. once every row has been read, `_fold_name_matched` collapses a
          name-matched link onto the MAC-matched link for the same cable —
-         the CDP-plus-LLDP double. A second pass, not a per-row step,
-         because the two rows arrive in either order.
+         the CDP-plus-LLDP double — and then `_fold_reciprocal_name_matched`
+         collapses the two name-only rows of a cable walked from both ends
+         where they are the only rows between that device pair. Second
+         passes, not per-row steps, because the rows arrive in either order
+         and the second needs to know how many rows a pair has in total.
 
     `on_map` is called with TWO different argument types, and must answer
     for both: an `int` device id (every call at step 2, and step 5 for a
@@ -532,6 +602,7 @@ def assemble_links(neighbour_rows, *, port_vlans, port_label, on_map, now,
         link["seen_ts"] = max(link["seen_ts"], seen_ts)
 
     _fold_name_matched(links_by_key)
+    _fold_reciprocal_name_matched(links_by_key)
 
     links = []
     for link in links_by_key.values():

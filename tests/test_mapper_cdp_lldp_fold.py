@@ -9,6 +9,13 @@ puts the cdpCacheDeviceId NAME in chassis_id, so nodesdb's chassis-MAC join
 (which requires subtype 4) cannot fire and only the sysName join does — no
 matched_if_index, a per-row key, a second link straight on top of the first.
 
+The same doubling from the other direction: two switches speaking only CDP
+to each other put a name-only row on EACH side and no MAC-matched link on
+either, so nothing in the first fold can pair them. Where they are the only
+two rows between that pair of devices the pairing is forced and they fold;
+where either side reports more than one port (a LAG) they deliberately stay
+apart, because nothing says which port faces which.
+
 Also covers the other route to the same symptom: a chassis MAC that matches
 several interfaces (a stack base MAC, an SVI beside its port-channel) used to
 fan one neighbour row out into several links through nodesdb's join.
@@ -150,17 +157,96 @@ links_other, _ = assemble_links(rows_other_far_end, port_vlans={},
 check("a name-matched row facing a DIFFERENT device is not folded in",
       len(links_other) == 2, links_other)
 
-# The reciprocal name-only case stays two links, exactly as
-# test_mapper_links.py pins it: two rows, two local ports, and nothing saying
-# they face each other.
+# ------------------------------------------- the reciprocal CDP-only double
+
+# Two Cisco switches, one cable, CDP only: neither side writes a chassis
+# subtype, so neither row resolves a matched_if_index and there is no
+# MAC-matched link for either to fold onto. Both rows survive on per-row keys
+# and draw on the same coordinates -- the doubling again, from the other
+# direction. But these are the ONLY two rows between devices 1 and 2, one port
+# each side, so the pairing is forced and the cable folds to one link. The
+# fold also hands each end the OTHER switch's own port_label, in place of the
+# raw cdpCachePortId string the cable carried across.
 rows_name_only = [
-    cdp_row(1, 11, device_id_text="core-sw", matched_device_id=2, rem_index="11.1"),
-    cdp_row(2, 21, device_id_text="edge-sw", matched_device_id=1, rem_index="21.1"),
+    cdp_row(1, 11, device_id_text="core-sw", matched_device_id=2,
+            port_id="GigabitEthernet0/21", rem_index="11.1"),
+    cdp_row(2, 21, device_id_text="edge-sw", matched_device_id=1,
+            port_id="GigabitEthernet0/11", rem_index="21.1"),
 ]
 links_nm, _ = assemble_links(rows_name_only, port_vlans={}, port_label=label_of,
                              on_map=all_on_map, now=NOW)
-check("the reciprocal name-only case still draws two links",
-      len(links_nm) == 2, links_nm)
+check("the reciprocal CDP-only case (one row each side) draws ONE link",
+      len(links_nm) == 1, links_nm)
+if len(links_nm) == 1:
+    check("...with both ends labelled from their own port_label, not the raw CDP string",
+          (links_nm[0]["a_port"], links_nm[0]["b_port"]) == ("dev1/if11", "dev2/if21"),
+          links_nm[0])
+    check("...and the far-end if_index now known",
+          (links_nm[0]["a_if_index"], links_nm[0]["b_if_index"]) == (11, 21),
+          links_nm[0])
+    check("...still carrying the protocol", links_nm[0]["protocols"] == ["cdp"], links_nm[0])
+
+# Determinism: the same two rows in the other order must produce the SAME
+# link -- same id, same a/b ends -- or the id would flip every time device 2
+# happened to be walked before device 1, which the UI would read as the link
+# itself having changed.
+links_nm_rev, _ = assemble_links(list(reversed(rows_name_only)), port_vlans={},
+                                 port_label=label_of, on_map=all_on_map, now=NOW)
+check("...and folds to the same link whichever row arrives first",
+      len(links_nm_rev) == 1 and len(links_nm) == 1
+      and (links_nm_rev[0]["id"], links_nm_rev[0]["a_device_id"], links_nm_rev[0]["a_if_index"],
+           links_nm_rev[0]["b_device_id"], links_nm_rev[0]["b_if_index"],
+           links_nm_rev[0]["a_port"], links_nm_rev[0]["b_port"])
+      == (links_nm[0]["id"], links_nm[0]["a_device_id"], links_nm[0]["a_if_index"],
+          links_nm[0]["b_device_id"], links_nm[0]["b_if_index"],
+          links_nm[0]["a_port"], links_nm[0]["b_port"]),
+      (links_nm, links_nm_rev))
+
+# The LAG case: two parallel cables between the same pair of switches, each
+# side reporting two ports facing the other. Nothing in the rows says which
+# of device 1's ports faces which of device 2's, so a fold would be the guess
+# link_identity refuses to make -- and would collapse a real port-channel of
+# two cables into one line. All four rows must stay exactly as they are.
+rows_lag = [
+    cdp_row(1, 11, device_id_text="core-sw", matched_device_id=2, rem_index="11.1"),
+    cdp_row(1, 12, device_id_text="core-sw", matched_device_id=2, rem_index="12.1"),
+    cdp_row(2, 21, device_id_text="edge-sw", matched_device_id=1, rem_index="21.1"),
+    cdp_row(2, 22, device_id_text="edge-sw", matched_device_id=1, rem_index="22.1"),
+]
+links_lag, _ = assemble_links(rows_lag, port_vlans={}, port_label=label_of,
+                              on_map=all_on_map, now=NOW)
+check("two parallel cables between one pair (a LAG) do NOT fold -- four links stand",
+      len(links_lag) == 4, links_lag)
+if len(links_lag) == 4:
+    check("...none of them given a guessed far-end if_index",
+          all(one["b_if_index"] is None for one in links_lag), links_lag)
+
+# Asymmetric: device 1 reports two ports facing device 2, device 2 reports
+# one facing device 1 (the second cable's row not yet walked, or a port that
+# went quiet). One-vs-two is still ambiguous -- which of device 1's two ports
+# is the one device 2 named? -- so nothing folds.
+rows_asym = [
+    cdp_row(1, 11, device_id_text="core-sw", matched_device_id=2, rem_index="11.1"),
+    cdp_row(1, 12, device_id_text="core-sw", matched_device_id=2, rem_index="12.1"),
+    cdp_row(2, 21, device_id_text="edge-sw", matched_device_id=1, rem_index="21.1"),
+]
+links_asym, _ = assemble_links(rows_asym, port_vlans={}, port_label=label_of,
+                               on_map=all_on_map, now=NOW)
+check("a 1-vs-2 asymmetric pair does NOT fold either -- three links stand",
+      len(links_asym) == 3, links_asym)
+
+# Two name-only rows facing DIFFERENT devices are two cables, not a
+# reciprocal pair: device 1 names device 2 and device 2 names device 3. The
+# name-only twin of the frozenset case above -- nothing groups them, so
+# nothing folds.
+rows_nm_other = [
+    cdp_row(1, 11, device_id_text="core-sw", matched_device_id=2, rem_index="11.1"),
+    cdp_row(2, 21, device_id_text="dist-sw", matched_device_id=3, rem_index="21.1"),
+]
+links_nm_other, _ = assemble_links(rows_nm_other, port_vlans={}, port_label=label_of,
+                                   on_map=all_on_map, now=NOW)
+check("two name-only rows facing different devices are not folded together",
+      len(links_nm_other) == 2, links_nm_other)
 
 
 # ------------------------------------------- one chassis MAC, many interfaces
