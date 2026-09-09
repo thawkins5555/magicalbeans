@@ -1125,27 +1125,20 @@ class NodePoller(Worker):
         # reported. See _note_saturation.
         self._saturated_since: float | None = None
         self._saturation_reported = False
-        # device_id -> an exponentially weighted mean of how long its polls
-        # actually take, in seconds, and the fleet-wide mean of the same.
-        # _run_one already stamps a start time and a finish time; this keeps
-        # the difference instead of formatting it into a log line and
-        # dropping it. It is what lets the pool size itself: see _autoscale.
+        # device_id -> an EWMA of how long its polls actually take. _run_one
+        # already had both ends of that; this keeps the difference.
         # device_id -> how many consecutive cycles have skipped this
         # device's SNMP phase while it is down. See _snmp_backoff_due.
         self._snmp_backoff: dict[int, int] = {}
         self._poll_cost: dict[int, float] = {}
         self._poll_cost_mean: float = _DEFAULT_POLL_COST
-        # The autoscaler's own state, all in memory. Floor, ceiling and
-        # headroom are cached here at start()/reconfigure() time rather than
-        # read per pass, because tests/test_scheduler.py pins a steady
-        # scheduling pass at five SQL statements and asserts it never reads
-        # the settings table.
+        # Cached at start()/reconfigure() rather than read per pass:
+        # test_scheduler pins a steady pass at five SQL statements and
+        # asserts it never reads the settings table.
         self._autoscale = {"auto": False, "min": 1, "max": 1, "headroom": 1.5}
         self._manual_workers = 16
-        # None means "no ceiling has ever been computed", which is what
-        # _note_saturation reads to keep behaving exactly as it did before
-        # autoscaling existed -- including for a poller whose start() has
-        # not run, which is how test_poll_write_path drives it.
+        # None = no ceiling computed yet, which is what _note_saturation
+        # reads to behave exactly as it did before autoscaling existed.
         self._autoscale_ceiling: int | None = None
         self._autoscale_at: float = 0.0
         self._autoscale_resized_at: float = 0.0
@@ -1429,13 +1422,9 @@ class NodePoller(Worker):
     def _record_poll_cost(self, device_id: int, elapsed: float) -> None:
         """Fold one poll's wall time into this device's mean, and the fleet's.
 
-        Exponentially weighted rather than a plain average, because what the
-        pool has to be sized for is what polls cost NOW: a device that has
-        just gone down costs thirty times what it did an hour ago, and an
-        average over its whole history would take that long to notice.
-
-        Cheap on purpose -- two multiplies on a dict entry, on a path that
-        has just spent seconds talking to a device.
+        Weighted rather than averaged because the pool has to be sized for
+        what polls cost NOW: a device that just went down costs thirty times
+        what it did an hour ago, and an average would take an hour to say so.
         """
         if elapsed < 0 or elapsed > _POLL_COST_CEILING_S:
             # A clock step, or a poll that outlived a shutdown drain. Either
@@ -2230,31 +2219,17 @@ class NodePoller(Worker):
         interfaces_note = None
         metrics: list[tuple] = []   # (key, label, unit, kind, value)
 
-        # A device already known to be down is the most expensive thing this
-        # poller does -- the ping timeouts plus the full SNMP timeout times
-        # its retries, about thirty times what a healthy device costs -- and
-        # a site outage is exactly when the pool can least afford it. So a
-        # device that is down skips the SNMP half of most cycles.
-        #
-        # Ping is NOT backed off, and that is what makes this safe: ping is
-        # what detects both the outage and the recovery, _next_run is
-        # untouched, and so the scheduled cadence, the status timeline, the
-        # outage duration and the up/down event stream are all exactly what
-        # they were. The cycle still runs; it just stops being expensive.
-        #
-        # Decided on THIS cycle's ping rather than on device["status"],
-        # which _run_one read before the poll and so describes the previous
-        # one. Gating on the stale row would skip SNMP on the very cycle
-        # whose ping came back -- the one cycle that most wants to run it.
-        # ping_enabled, and ping_ok is False rather than merely falsy, are
-        # both load-bearing. Ping being unbacked-off is the entire reason
-        # this is safe -- it is what still detects the recovery -- so where
-        # a profile has ping switched off there is no such safety and SNMP
-        # must not be skipped at all: SNMP is then the only evidence the
-        # device exists, and backing it off would mean a device that came
-        # back was never seen to. `is False` says the same thing about a
-        # cycle that carried a previous result forward instead of probing:
-        # None is "no ping evidence", and no evidence is not a failure.
+        # A device already down costs about thirty times one that is up, so
+        # it skips the SNMP half of most cycles. Ping is NOT backed off,
+        # which is what makes that safe: ping detects both the outage and the
+        # recovery and _next_run is untouched, so the cadence, the timeline
+        # and the up/down events are unchanged. Decided on THIS cycle's ping,
+        # not device["status"], which _run_one read before the poll and so
+        # describes the previous one. See INTERNALS.md.
+        # ping_enabled and `is False` are both load-bearing: with ping off,
+        # SNMP is the only evidence the device exists and skipping it means a
+        # recovered device is never seen to recover; None is "no ping
+        # evidence", and no evidence is not a failure.
         backed_off = (device["status"] == "down"
                       and config.get("ping_enabled")
                       and ping_ok is False
