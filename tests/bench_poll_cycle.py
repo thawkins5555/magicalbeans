@@ -7,6 +7,7 @@ up test_*.py).
     python3 tests/bench_poll_cycle.py [devices ...] [--workers 8,16,32]
                                       [--interval 15] [--seconds 20]
                                       [--down-fraction 0.05] [--seed 7]
+                                      [--auto]
     python3 tests/bench_poll_cycle.py --stub [--interfaces 8,48,240]
 
 Each `devices` figure is one fleet, run once against each pool size.
@@ -149,7 +150,7 @@ class Sampler(threading.Thread):
 
 
 def run_combo(db, devices: int, workers: int, interval: int, seconds: float,
-              costs: list[float]) -> dict:
+              costs: list[float], auto: bool = False) -> dict:
     """One (device count x pool size) run of the real scheduler.
 
     _submit is wrapped rather than _schedule_pass: the scheduler sets
@@ -184,7 +185,14 @@ def run_combo(db, devices: int, workers: int, interval: int, seconds: float,
             lateness.append(time.time() - expected)
         time.sleep(by_id.get(device_id, 0.3))
 
+    # poll_workers_auto is set EXPLICITLY, never left to DEFAULTS. With it
+    # on, `workers` is only where the pool starts and the number that matters
+    # is where it ends up, so the two cases have to be told apart or the
+    # workers column silently stops meaning what the header says.
     db.save_settings({"enabled": True, "poll_workers": workers,
+                      "poll_workers_auto": auto,
+                      "poll_workers_min": 1 if auto else workers,
+                      "poll_workers_max": 512 if auto else workers,
                       "default_interval_s": interval,
                       "focus_poll_interval_s": 0})
     NodePoller._submit = submit
@@ -200,6 +208,7 @@ def run_combo(db, devices: int, workers: int, interval: int, seconds: float,
         sampler.stop()
         polls = poller.counters.get("polls", 0)
         overruns = poller.counters.get("overruns", 0)
+        ended = getattr(poller._executor, "_max_workers", workers)
     finally:
         poller.stop()
         NodePoller._submit = real_submit
@@ -207,6 +216,7 @@ def run_combo(db, devices: int, workers: int, interval: int, seconds: float,
 
     samples = max(1, len(sampler.busy))
     return {"devices": devices, "interval": interval, "workers": workers,
+            "ended": ended,
             "polls_min": polls * 60.0 / max(elapsed, 1e-9),
             "p50": pct(lateness, 0.50), "p95": pct(lateness, 0.95),
             "max": max(lateness) if lateness else 0.0,
@@ -217,21 +227,24 @@ def run_combo(db, devices: int, workers: int, interval: int, seconds: float,
             "saturated_pct": 100.0 * sampler.saturated / samples}
 
 
-HEADER = (f"  {'devices':>7} {'interval':>8} {'workers':>7} {'polls/min':>9} "
+HEADER = (f"  {'devices':>7} {'interval':>8} {'workers':>7} {'ended':>6} "
+          f"{'polls/min':>9} "
           f"{'late p50':>9} {'late p95':>9} {'late max':>9} {'overruns':>8} "
           f"{'busy mean':>9} {'busy p95':>8} {'queue p95':>9} {'sat %':>6}")
 
 
 def row(result: dict) -> str:
     return (f"  {result['devices']:>7} {result['interval']:>8} "
-            f"{result['workers']:>7} {result['polls_min']:>9.0f} "
+            f"{result['workers']:>7} {result['ended']:>6} "
+            f"{result['polls_min']:>9.0f} "
             f"{result['p50']:>9.2f} {result['p95']:>9.2f} "
             f"{result['max']:>9.2f} {result['overruns']:>8} "
             f"{result['busy_mean']:>9.1f} {result['busy_p95']:>8} "
             f"{result['queue_p95']:>9} {result['saturated_pct']:>5.0f}%")
 
 
-def synthetic(argv_sizes, workers, interval, seconds, down_fraction, seed) -> int:
+def synthetic(argv_sizes, workers, interval, seconds, down_fraction, seed,
+              auto=False) -> int:
     folder = tmpdir("bench_poll_cycle_")
     print(f"scratch: {folder}")
     shares = list(DISTRIBUTION)
@@ -252,11 +265,14 @@ def synthetic(argv_sizes, workers, interval, seconds, down_fraction, seed) -> in
         print(f"\n{devices:,} devices on a {interval} s interval "
               f"(seeded in {time.perf_counter() - started:.1f} s; "
               f"{need:.1f} workers' worth of work per cycle), "
-              f"{seconds:.0f} s per pool size")
+              f"{seconds:.0f} s per pool size"
+              + ("  [auto-sizing ON: workers is the START size, ended is where "
+                 "it got to]" if auto else ""))
         print(HEADER)
         try:
             for count in workers:
-                print(row(run_combo(db, devices, count, interval, seconds, costs)))
+                print(row(run_combo(db, devices, count, interval, seconds,
+                                    costs, auto)))
         finally:
             db.close()
     return 0
@@ -338,6 +354,7 @@ def main(argv) -> int:
     down_fraction = None
     seed = 7
     mode = "synthetic"
+    auto = False
     interface_counts = [8, 48, 240]
     polls = 10
     index = 0
@@ -345,6 +362,8 @@ def main(argv) -> int:
         item = argv[index]
         if item == "--stub":
             mode = "stub"
+        elif item == "--auto":
+            auto = True
         elif item == "--synthetic":
             mode = "synthetic"
         elif item in ("--workers", "--interval", "--seconds", "--down-fraction",
@@ -371,7 +390,7 @@ def main(argv) -> int:
     if mode == "stub":
         return stub(interface_counts, polls)
     return synthetic(sizes or [300], workers, interval, seconds,
-                     down_fraction, seed)
+                     down_fraction, seed, auto)
 
 
 if __name__ == "__main__":
