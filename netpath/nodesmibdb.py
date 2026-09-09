@@ -58,6 +58,11 @@ class NodesMibDatabase(SqliteStore):
 
     SCHEMA = SCHEMA
     DEFAULTS: dict = {}
+
+    # Bumped by every write below and read by mib_generation. In memory
+    # rather than a table: it only has to distinguish two reads within one
+    # process, which is what the caches keyed on it are asking.
+    _writes = 0
     LABEL = "nodes_mibs"
 
     # ----------------------------------------------------------------- files
@@ -66,6 +71,7 @@ class NodesMibDatabase(SqliteStore):
                      unresolved: list[str], parse_notes: str,
                      content: str = "") -> int:
         with self._lock:
+            self._writes += 1
             cur = self._conn.execute(
                 "INSERT INTO mib_files(filename, module, uploaded_ts, object_count,"
                 " unresolved, parse_notes, content) VALUES (?,?,?,?,?,?,?)",
@@ -100,6 +106,7 @@ class NodesMibDatabase(SqliteStore):
 
     def remove_mib_file(self, mib_file_id: int) -> None:
         with self._lock:
+            self._writes += 1
             self._conn.execute("DELETE FROM mib_files WHERE id = ?", (mib_file_id,))
             self._conn.commit()
 
@@ -110,6 +117,7 @@ class NodesMibDatabase(SqliteStore):
         edited=1 are left untouched so an admin's manual correction
         survives a re-resolve."""
         with self._lock:
+            self._writes += 1
             self._conn.execute(
                 "DELETE FROM mib_objects WHERE mib_file_id = ? AND edited = 0",
                 (mib_file_id,))
@@ -153,6 +161,7 @@ class NodesMibDatabase(SqliteStore):
         allowed["edited"] = 1
         clauses = ", ".join(f"{key} = ?" for key in allowed)
         with self._lock:
+            self._writes += 1
             self._conn.execute(
                 f"UPDATE mib_objects SET {clauses} WHERE id = ?",
                 (*allowed.values(), object_id))
@@ -259,6 +268,7 @@ class NodesMibDatabase(SqliteStore):
         here, files there, objects here, objects there) so the caller can
         refuse to drop the originals on a mismatch."""
         with self._lock:
+            self._writes += 1
             self._conn.commit()
             self._conn.execute("ATTACH DATABASE ? AS old", (legacy_path,))
             try:

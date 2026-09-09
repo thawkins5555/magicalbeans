@@ -411,6 +411,27 @@ try:
           getattr(service, "_api_device_index", None) is None)
     service.nodes_db.remove_device(canary_id)
 
+    # A re-resolve is the case the MIB generation used to miss entirely.
+    # mib_objects.id is INTEGER PRIMARY KEY without AUTOINCREMENT, so
+    # replacing a file's objects with the same NUMBER of objects reuses the
+    # ids just freed at the top of the table — leaving MAX(id), the object
+    # count and the file count all identical. A key built from those three
+    # alone went on serving the pre-resolve table: numeric OIDs for exactly
+    # the objects the Resolve button had just made known.
+    mib_db = service.nodes_db.mib_db
+    mib_id = mib_db.add_mib_file("REGRESS-MIB", "REGRESS", 2, [], "")
+    mib_db.replace_mib_objects(mib_id, [{"name": "ra", "oid": None},
+                                        {"name": "rb", "oid": None}])
+    before = service.nodes_db.mib_generation()
+    mib_db.replace_mib_objects(mib_id, [{"name": "ra", "oid": "1.3.6.1.4.1.99.1"},
+                                        {"name": "rb", "oid": "1.3.6.1.4.1.99.2"}])
+    after = service.nodes_db.mib_generation()
+    check("a re-resolve leaves max id, object count and file count identical",
+          before[:3] == after[:3], (before[:3], after[:3]))
+    check("…but the generation still moves, so the OID table is rebuilt",
+          before != after, (before, after))
+    mib_db.remove_mib_file(mib_id)
+
 finally:
     server.stop()
     service.shutdown()
