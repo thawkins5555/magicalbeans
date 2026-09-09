@@ -13,6 +13,7 @@ off (the default) and install by hand.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import http.client
 import json
