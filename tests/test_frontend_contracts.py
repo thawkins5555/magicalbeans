@@ -1453,6 +1453,59 @@ check("view.failed = false;" in _NF_REFRESH and "view.failed = false;" in _NF_LO
 
 print()
 # ---------------------------------------------------------------------------
+# 45a. NetFlow: "graphs are not showing all data from the timeline window".
+#      Four of the five defects behind that report were in netflow.js, and
+#      each is a fact about the text that a refactor could undo invisibly.
+_NF_CHART = _NETFLOW[_NETFLOW.index("  function drawChart() {"):
+                     _NETFLOW.index("  /* -------------------------------------------------------------- bars */")]
+_NF_BARS = _NETFLOW[_NETFLOW.index("  function drawBars() {"):
+                    _NETFLOW.index("  function filterByBar(row) {")]
+check("* 8 / slotSeconds(data, i)" in _NF_CHART
+      and "App.rate(entry.value, seconds)" in _NF_CHART
+      and "App.rate(total, seconds)" in _NF_CHART
+      and "const seconds = slotSeconds(data, slot);" in _NF_CHART,
+      "the chart and its tooltip both divide a slot by slotSeconds(), the "
+      "duration it actually covers, so the trailing partial bucket is not "
+      "drawn at a fraction of its rate and the hover cannot confirm a number "
+      "the chart did not draw")
+check("* 8 / bucket)" not in _NF_CHART and "App.rate(entry.value, bucket)" not in _NF_CHART,
+      "...and nowhere divides by the nominal bucket width any more")
+check("Number.isFinite(data.t1)" in _NETFLOW and "view.t1" not in _NETFLOW[
+          _NETFLOW.index("  function windowEnd(data) {"):
+          _NETFLOW.index("  function slotSeconds(data, slot) {")],
+      "the window's end is the response's own t1, which is what the values "
+      "were read over, not view.t1")
+check("stepX" not in _NF_CHART and "const xOf = (ts) =>" in _NF_CHART
+      and "xOf(t1)" in _NF_CHART,
+      "the x axis spans the window the server read, t0 to t1, rather than "
+      "spreading the slots so the last one sits on the right edge with no "
+      "width")
+check("slotAt(timeAt(x))" in _NF_CHART,
+      "...and the crosshair finds its slot from the time under the cursor on "
+      "that same axis")
+check("Math.abs(to - from) > bucket" not in _NF_CHART
+      and "Math.abs(to - from) >= DRAG_MIN_S" in _NF_CHART
+      and "DRAG_MIN_PX" in _NF_CHART,
+      "a drag-selection is accepted down to a few seconds and a few pixels, "
+      "not discarded when narrower than the previous response's bucket")
+check("legendRow += 1;" in _NF_CHART and "if (legendX + width_ > plot.x + plot.w) return;" not in _NF_CHART,
+      "legend entries that no longer fit wrap on to another row rather than "
+      "being dropped, so every drawn band is named")
+check("SERIES[index % SERIES.length]" not in _NETFLOW
+      and "index >= SERIES.length ? OTHER" in _NETFLOW,
+      "no swatch wraps round the palette: past the eighth hue is OTHER, never "
+      "--cat-1 again")
+check("const drawn = namedBands(view.data);" in _NF_BARS
+      and "folded ? OTHER : seriesColor(row.label, index)" in _NF_BARS,
+      "a top-N bar past the number of bands the chart drew — read off the "
+      "response, not written down as 8 — takes the neutral '— other —' is "
+      "drawn in")
+check("if (folded) tip.push({ text: FOLDED_TEXT });" in _NF_BARS
+      and "folded ? `${valueId} ${foldId}` : valueId" in _NF_BARS
+      and 'class="sr-only"' in _NF_BARS,
+      "...and says so, in its tooltip and in its accessible description")
+
+
 # 46. NODES/ALERTS (5.3.0): the optic power rules alert against the levels the
 #     PORT publishes, so the only place an operator can see what a port is
 #     judged by is the DOM table — and the only honest thing to say about a
