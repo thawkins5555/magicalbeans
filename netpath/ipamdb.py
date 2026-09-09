@@ -814,7 +814,10 @@ class IpamDatabase(SqliteStore):
         digits = mac_search_digits(mac)
         if len(digits) != 12:
             return []
-        stored = mac_colon(":".join(digits[i:i + 2] for i in range(0, 12, 2)))
+        # The shape mac_colon writes, built directly: lower-case pairs,
+        # colon-joined, which is what ingest and _migrate both leave in
+        # the column.
+        stored = ":".join(digits[i:i + 2] for i in range(0, 12, 2))
         with self._lock:
             return self._conn.execute(
                 "SELECT l.*, s.label AS server_label, c.name AS scope_name"
