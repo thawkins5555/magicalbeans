@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.7.1 — The temp folder that wasn't there](#571--the-temp-folder-that-wasnt-there)
 - [5.7.0 — Five reports](#570--five-reports)
 - [5.6.0 — Closing the window closes the application](#560--closing-the-window-closes-the-application)
 - [5.5.0 — Measured first, then made faster](#550--measured-first-then-made-faster)
