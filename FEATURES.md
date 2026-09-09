@@ -496,6 +496,30 @@ own subtabs.
   failing as down on its own, the setting is in Nodes settings and can be
   overridden per device and per profile. Either way, the "consecutive
   failures before down" grace window is unchanged.
+- **A slow or partial interface walk degrades the interface list, not the
+  device.** A chassis with several hundred ports can run out of the poll's
+  SNMP budget half way down its ifTable. That now leaves the device UP
+  with its SNMP state intact, its interface list marked incomplete (so the
+  ports the walk never reached keep their rows, their counters and their
+  link history rather than being deleted and re-created), and the reason
+  shown beside the device — "the table walk was cut short after N rows".
+  It used to fail the whole device's SNMP, which read as "L3 and community
+  confirmed, sysDescr populated, polling still failing". A walk that got
+  nothing at all is still a failure: the device stopped answering.
+- **A table walk the agent refuses now says so.** An agent that answers a
+  walk with `genErr`, `noSuchName` or any other error-status — what a
+  PAN-OS/net-snmp box does for a subtree it will not serve — used to end
+  the walk silently, leaving a device that read as perfectly healthy with
+  zero interfaces and no error at all. The status is now named on the
+  device row, in the event log, and in the empty interface table.
+- **An SNMP community is trimmed when saved, and cannot contain a comma.**
+  A pasted trailing space used to travel on the wire verbatim, and a
+  net-snmp agent (so PAN-OS) drops a datagram with the wrong community
+  without answering — so a stray space presented as an unreachable device.
+  A comma is refused with a message pointing at ADDITIONAL CREDENTIALS,
+  which is where several communities belong: discovery split a comma-
+  separated list and polling did not, so `public,pa-ro` in one field made
+  discovery succeed and every poll of the device time out.
 - **The displayed name prefers the SNMP hostname** (`sysName`), falling
   back to the manually entered name, then the IP — so a discovered device
   names itself. Each device's Edit form has a "Displayed name" choice
@@ -574,7 +598,16 @@ own subtabs.
   uptime" lines from them.
 - **Test** checks ping and SNMP against whatever is currently typed in
   the add/edit form, before it is saved, the same idiom IPAM's DHCP
-  server test already uses.
+  server test already uses. It runs the poll's own first table walk as
+  well as the system scalars, and reports each phase separately: how long
+  the scalars took, how long the ifIndex walk took, how many interfaces it
+  reached in how many requests, whether GETBULK was accepted and at what
+  repetition count, and any error-status the agent answered. A test made
+  of six scalars alone reported OK against every one of the faults above.
+  It also reports how many replies arrived and were thrown away (wrong
+  peer, undecodable, or answering a request we were not waiting on) — a
+  timeout with rejected datagrams is a different fault from a timeout
+  without one.
 - **A whole site can be imported in one call, from 4.47.0.** A JSON array
   or pasted CSV of up to 2,000 rows, the same fields the single-device
   form accepts, every row validated before any of them is written, with a

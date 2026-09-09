@@ -4011,8 +4011,19 @@
       const id = deviceId || 0;
       const r = id ? await App.post(`/api/nodes/devices/${id}/test`, body)
         : { ping: { ok: null }, snmp: { ok: null, error: 'Save the device first to test' } };
-      result.textContent = `ping: ${r.ping.ok === null ? 'n/a' : r.ping.ok ? `ok (${(r.ping.rtt_ms || 0).toFixed(0)} ms)` : 'no reply'}` +
-        `  ·  snmp: ${r.snmp.ok ? `ok (${r.snmp.sys_descr || ''})` : (r.snmp.error || 'n/a')}`;
+      /* The phases, the walk and the dropped count are what make a failing
+         poll self-explaining: a scalar GET alone reports ok against a
+         table walk that times out, an agent that refuses the ifTable, and
+         a community the agent drops without a word. */
+      const parts = [
+        `ping: ${r.ping.ok === null ? 'n/a' : r.ping.ok ? `ok (${(r.ping.rtt_ms || 0).toFixed(0)} ms)` : 'no reply'}`,
+        `snmp: ${r.snmp.ok ? `ok (${r.snmp.sys_descr || ''})` : (r.snmp.error || 'n/a')}`,
+      ];
+      (r.snmp.phases || []).forEach((p) => {
+        parts.push(`${p.name}: ${(p.ms || 0).toFixed(0)} ms${p.detail ? ` — ${p.detail}` : ''}`);
+      });
+      if (r.snmp.dropped) parts.push(`${r.snmp.dropped} datagram(s) rejected`);
+      result.textContent = parts.join('  ·  ');
     } catch (error) {
       result.textContent = `Error: ${error.message}`;
     }

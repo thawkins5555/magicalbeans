@@ -4316,6 +4316,96 @@ def _oid_walk_text(service, status, rows) -> str:
     return "\n".join(lines) + "\n"
 
 
+_TEST_WALK_MAX_ROWS = 512
+_TEST_WALK_BUDGET_S = 6.0
+
+
+def _test_ifindex_walk(service, exchange, version: int) -> dict:
+    """A real ifIndex walk for the Test button, reported rather than raised.
+
+    The same shape NodePoller._walk_column_detail walks with — GETBULK on
+    v2c/v3 at the configured repetition count, halved on tooBig and falling
+    back to GETNEXT, varbinds accepted until one leaves the subtree — but
+    bounded to a few seconds in front of a waiting human, and answering
+    "what happened" instead of a table. The three numbers that name the
+    fault a scalar GET cannot see: how many repetitions the agent actually
+    accepted, the error-status it answered (a PAN-OS agent says genErr or
+    noSuchName for a subtree it will not serve), and how far the walk got
+    before the clock ran out.
+    """
+    from ..nodeoids import IF_TABLE
+    from ..nodepoll import _oid_key
+    from ..snmppoll import ERROR_STATUS, PDU_GETBULK, PDU_GETNEXT, SnmpError
+
+    base = IF_TABLE["if_index"]
+    settings = service.nodes_db.settings()
+    configured = int(settings.get("snmp_bulk_max_repetitions", 40) or 0)
+    use_bulk = version != 0 and configured > 0
+    repetitions = configured if use_bulk else 0
+    started = time.time()
+    deadline = started + _TEST_WALK_BUDGET_S
+    current = base
+    rows = requests = 0
+    error_status = 0
+    stopped = "reached the end of the ifIndex column"
+    while True:
+        if rows >= _TEST_WALK_MAX_ROWS:
+            stopped = f"stopped at this test's {_TEST_WALK_MAX_ROWS}-row limit"
+            break
+        if time.time() > deadline:
+            stopped = f"still going after {_TEST_WALK_BUDGET_S:.0f}s"
+            break
+        try:
+            requests += 1
+            response = exchange(PDU_GETBULK if use_bulk else PDU_GETNEXT,
+                                [current], repetitions)
+        except SnmpError as exc:
+            stopped = f"{exc} after {rows} row(s)"
+            break
+        if use_bulk and response.error_status == 1:      # tooBig
+            if repetitions <= 1:
+                use_bulk = False
+                repetitions = 0
+            else:
+                repetitions = max(1, repetitions // 2)
+            continue
+        if response.error_status:
+            error_status = response.error_status
+            stopped = (f"the device answered "
+                       f"{ERROR_STATUS.get(error_status, 'an unknown error')}"
+                       f"({error_status})")
+            break
+        if not response.varbinds:
+            stopped = "the device returned nothing"
+            break
+        done = False
+        for vb in response.varbinds:
+            oid = vb["oid"]
+            if not oid or not oid.startswith(base + "."):
+                done = True
+                break
+            if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
+                done = True
+                break
+            if _oid_key(oid) <= _oid_key(current):
+                stopped = f"the device answered with a non-increasing OID ({oid})"
+                done = True
+                break
+            rows += 1
+            current = oid
+        if done:
+            break
+    return {"rows": rows, "requests": requests,
+            "max_repetitions": repetitions if use_bulk else 0,
+            "bulk": use_bulk, "error_status": error_status,
+            "error_status_name": ERROR_STATUS.get(error_status, "") if error_status else "",
+            "stopped": stopped,
+            "summary": (f"{rows} interface(s) in {requests} request(s), "
+                        + (f"GETBULK x{repetitions}" if use_bulk else "GETNEXT")
+                        + f" — {stopped}"),
+            "ms": (time.time() - started) * 1000.0}
+
+
 def post_nodes_device_test(service, params, body, device_id) -> dict:
     """Ping + SNMP against the in-progress-edit config carried in the
     body, falling back to the saved one for anything not overridden — the
@@ -4371,38 +4461,64 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
     if config.get("snmp_enabled"):
         version = int(config.get("snmp_version", 1))
         oids = list(nodeoids.SYSTEM_SCALARS.values())
+        # Per-phase timings, appended as each phase finishes. Six scalars in
+        # one GET is the one thing every device answers, so a test made of
+        # nothing else reported OK against every fault a real poll trips
+        # over: a table walk that times out part way, an agent that answers
+        # an error-status for the ifTable, one that refuses GETBULK, and a
+        # community that is dropped without a word. The walk below is the
+        # poll's own first walk, so the test now fails where the poll does.
+        phases = result["snmp"]["phases"] = []
+        session = None
         try:
             session = _Session(row["ip"], DEFAULT_SNMP_PORT, timeout_s,
                                int(config.get("snmp_retries", 2)))
-            try:
+            engine_reply = None
+            if version >= 3:
+                engine_reply = session.request(discovery_probe())
+
+            def exchange(pdu_tag, request_oids, max_repetitions=0):
+                """One round trip on the shared session, either framing."""
                 request_id = random.randint(1, 2 ** 16)
                 if version in (0, 1):
-                    packet = build_request(version, identity or "public", PDU_GET,
-                                           request_id, oids)
+                    packet = build_request(version, identity or "public", pdu_tag,
+                                           request_id, request_oids,
+                                           max_repetitions=max_repetitions)
                 else:
-                    engine_reply = session.request(discovery_probe())
-                    auth_key = (localized_key(auth_proto, password, engine_reply.engine_id)
-                               if auth_proto and password else None)
+                    auth_key = (localized_key(auth_proto, password,
+                                              engine_reply.engine_id)
+                                if auth_proto and password else None)
                     packet = build_v3_request(
                         random.randint(1, 2 ** 16), request_id,
-                        PDU_GET, oids, engine_id=engine_reply.engine_id,
+                        pdu_tag, request_oids, engine_id=engine_reply.engine_id,
                         engine_boots=engine_reply.engine_boots,
                         engine_time=engine_reply.engine_time, user=identity or "",
-                        auth_proto=auth_proto, auth_key=auth_key)
-                response = session.request(packet, expect_request_id=request_id)
-                if version >= 3 and response.pdu_tag == PDU_REPORT:
+                        auth_proto=auth_proto, auth_key=auth_key,
+                        max_repetitions=max_repetitions or 10)
+                reply = session.request(packet, expect_request_id=request_id)
+                if version >= 3 and reply.pdu_tag == PDU_REPORT:
                     raise SnmpError("engine resync required (Report-PDU) — check "
                                     "the SNMPv3 username and auth password")
+                return reply
+
+            started = time.time()
+            try:
+                response = exchange(PDU_GET, oids)
                 if response.error_status == 16:
                     raise SnmpError("authorization error")
             finally:
-                session.close()
+                phases.append({"name": "scalars",
+                               "ms": (time.time() - started) * 1000.0})
             values = {vb["oid"]: vb["value"] for vb in response.varbinds
                      if vb["type"] not in ("noSuchObject", "noSuchInstance")}
             result["snmp"]["ok"] = True
             result["snmp"]["sys_descr"] = values.get(nodeoids.SYSTEM_SCALARS["sys_descr"])
             result["snmp"]["sys_name"] = values.get(nodeoids.SYSTEM_SCALARS["sys_name"])
             result["snmp"]["sys_uptime"] = values.get(nodeoids.SYSTEM_SCALARS["sys_uptime"])
+            walk = _test_ifindex_walk(service, exchange, version)
+            result["snmp"]["walk"] = walk
+            phases.append({"name": "ifIndex walk", "ms": walk.pop("ms"),
+                           "detail": walk["summary"]})
         except (SnmpError, OSError) as exc:
             # OSError: _Session's socket() itself failed (descriptor
             # exhaustion); the same readable answer as a protocol failure.
@@ -4410,6 +4526,15 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
             result["snmp"]["error"] = str(exc)
         finally:
             password = None
+            if session is not None:
+                # Every datagram this test sent and threw away: from the
+                # wrong peer, undecodable, or answering a request id we
+                # were not waiting on. A timeout with drops is a different
+                # fault from a timeout without — the first is something
+                # answering that should not be, the second is nothing
+                # answering at all — and the count was read by nothing.
+                result["snmp"]["dropped"] = session.dropped
+                session.close()
     return result
 
 

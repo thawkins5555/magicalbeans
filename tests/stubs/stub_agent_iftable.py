@@ -30,6 +30,23 @@ Modes:
                    the first datagram off the socket stores the wrong
                    answer — which is what a late reply to a previous
                    attempt does on a real network.
+  palo_alto        answers as a PAN-OS box: a Palo Alto sysObjectID under
+                   1.3.6.1.4.1.25461, several hundred interfaces, and the
+                   three net-snmp behaviours a real firewall shows a
+                   poller. --reply-delay SECONDS holds every reply back, so
+                   a walk of that many interfaces runs out of the poll's
+                   budget part way down the table. --bulk-cap N returns
+                   FEWER varbinds than the GETBULK asked for once the
+                   response would exceed N of them, which is what net-snmp
+                   actually does: it truncates the reply rather than
+                   answering tooBig, so a walker that only handles tooBig
+                   never learns anything is wrong. --gen-err OID (repeatable,
+                   or comma-separated) answers any request inside that
+                   subtree with error-status genErr(5) and no varbinds;
+                   --no-such-name OID does the same with noSuchName(2).
+                   --refuse-bulk answers every GETBULK with tooBig whatever
+                   the repetition count, the agent that forces a GETNEXT
+                   fallback for good.
   fortigate        answers as a FortiGate: a Fortinet sysObjectID and the
                    FORTINET-FORTIGATE-MIB CPU, memory and session scalars,
                    plus an ipAddrTable naming a management address the
@@ -54,7 +71,15 @@ Modes:
 
 Options: --host ADDRESS (bind elsewhere than 127.0.0.1 — "::1" opens an
 AF_INET6 socket), --interfaces N, --reboot-after N, --dark-after N, --window SECONDS,
---bump-boots-at SECONDS, --stats PATH (a JSON counter file the test reads).
+--bump-boots-at SECONDS, --stats PATH (a JSON counter file the test reads),
+--reply-delay SECONDS, --bulk-cap N, --gen-err OID, --no-such-name OID,
+--refuse-bulk, --dark-after-rows N (answer N ifIndex rows and then stop
+answering walk requests at all, the mid-table timeout with rows already in
+hand), and --stale-id N (prepend a wrong-request-id copy to the
+first N replies — the datagram _Session.dropped counts). Answering from
+the wrong SOURCE PORT deliberately has no flag: _Session._is_peer compares
+the host only, because agents that reply from an ephemeral port are common
+and not forgery, so a wrong port is not a dropped datagram here.
 
 Prints one "listening" line after bind(), the banner tests/_paths.py's
 spawn_stub waits for.
@@ -88,9 +113,21 @@ class Agent:
     def __init__(self, port: int, mode: str = "ok", interfaces: int = 2,
                  reboot_after: int = 2, window: float = 1.0,
                  bump_boots_at: float = 0.0, stats_path: str = "",
-                 dark_after: int = 0, host: str = "127.0.0.1"):
+                 dark_after: int = 0, host: str = "127.0.0.1",
+                 reply_delay: float = 0.0, bulk_cap: int = 0,
+                 gen_err: tuple = (), no_such_name: tuple = (),
+                 refuse_bulk: bool = False, stale_id: int = 0,
+                 dark_after_rows: int = 0):
         self.mode = mode
         self.n_interfaces = interfaces
+        self.reply_delay = reply_delay
+        self.bulk_cap = bulk_cap
+        self.gen_err = tuple(gen_err)
+        self.no_such_name = tuple(no_such_name)
+        self.refuse_bulk = refuse_bulk
+        self.stale_id = stale_id
+        self.dark_after_rows = dark_after_rows
+        self.rows_served = 0
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
         self.sock = socket.socket(family, socket.SOCK_DGRAM)
         self.sock.bind((host, port))
@@ -115,7 +152,8 @@ class Agent:
         self.engine_boots = 3
         self.engine_epoch = time.monotonic()
         self.counts = {"requests": 0, "reports": 0, "discoveries": 0,
-                       "responses": 0}
+                       "responses": 0, "get": 0, "getnext": 0, "getbulk": 0,
+                       "bulk_refused": 0, "stale": 0}
 
     # ------------------------------------------------------------- SNMPv3
 
@@ -244,6 +282,8 @@ class Agent:
     _SYS_OBJECT_IDS = {
         "fortigate": "1.3.6.1.4.1.12356.101.1.1000",
         "cisco": "1.3.6.1.4.1.9.1.1208",
+        # panPA5220 — the enterprise arc a Palo Alto firewall identifies by.
+        "palo_alto": "1.3.6.1.4.1.25461.2.3.34",
     }
 
     def _vendor_objects(self) -> dict:
@@ -276,6 +316,8 @@ class Agent:
     def _scalar(self, oid: str):
         S = nodeoids.SYSTEM_SCALARS
         if oid == S["sys_descr"]:
+            if self.mode == "palo_alto":
+                return enc_octets("Palo Alto Networks PA-5220 series firewall")
             return enc_octets("ifTable stub agent")
         if oid == S["sys_object_id"]:
             return enc_octets(self._SYS_OBJECT_IDS.get(
@@ -426,6 +468,7 @@ class Agent:
         the ifIndex column, and whatever vendor table the mode adds."""
         base = nodeoids.IF_TABLE["if_index"]
         self.walked = True
+        self.rows_served += 1
         walkable = [(f"{base}.{suffix}", enc_int(position + 1))
                     for position, suffix in enumerate(self.indexes())]
         walkable += sorted(self.extra.items(), key=lambda item: self._key(item[0]))
@@ -438,6 +481,30 @@ class Agent:
         # is how an agent says the table ended.
         return "9.9.9.9", enc_octets("past-the-end")
 
+    def _refusal(self, req):
+        """The error-status this agent answers the requested subtree with,
+        or 0. A net-snmp agent (so PAN-OS) answers genErr for a subtree its
+        own handler failed on, and noSuchName for one a v1 view hides;
+        neither carries a usable varbind, which is exactly what a walker
+        testing only for tooBig reads as the end of the table."""
+        asked = req.varbinds[0]["oid"] if req.varbinds else ""
+        for prefix in self.no_such_name:
+            if asked == prefix or asked.startswith(prefix.rstrip(".") + "."):
+                return 2
+        for prefix in self.gen_err:
+            if asked == prefix or asked.startswith(prefix.rstrip(".") + "."):
+                return 5
+        return 0
+
+    def _stale_copy(self, reply_bytes, req):
+        """A duplicate of this reply carrying request-id + 1, sent first.
+        A receiver that takes the first datagram off the socket stores the
+        wrong answer; _Session drops it and counts it."""
+        if self.counts["stale"] >= self.stale_id:
+            return None
+        self.counts["stale"] += 1
+        return reply_bytes
+
     def handle(self, data: bytes) -> list:
         """Every datagram this agent wants to send back, in order. A list
         because a misbehaving agent sends more than one."""
@@ -446,9 +513,31 @@ class Agent:
             return self._v3_handle(req, self._msg_id(data))
         if req.pdu_tag == PDU_GET:
             self.gets += 1
+            self.counts["get"] += 1
+        elif req.pdu_tag == PDU_GETNEXT:
+            self.counts["getnext"] += 1
+        elif req.pdu_tag == PDU_GETBULK:
+            self.counts["getbulk"] += 1
+        refusal = self._refusal(req)
+        if refusal:
+            echo = b"".join(enc_varbind(vb["oid"], _tlv(T_NULL, b""))
+                            for vb in req.varbinds)
+            return [self._response(req.version, req.request_id, echo,
+                                   error_status=refusal, error_index=1)]
+        if self.refuse_bulk and req.pdu_tag == PDU_GETBULK:
+            self.counts["bulk_refused"] += 1
+            return [self._response(req.version, req.request_id, b"",
+                                   error_status=1)]
         if self.mode == "dark_after_walk" and self.walked and \
                 req.pdu_tag == PDU_GET and self.gets > self.dark_after:
             return []                        # answered its share, now silent
+        if self.dark_after_rows and self.rows_served >= self.dark_after_rows \
+                and req.pdu_tag in (PDU_GETNEXT, PDU_GETBULK):
+            # Answered part of the table and then stopped: a mid-walk
+            # timeout, with rows already in hand. GETs still answer, so
+            # this is the agent that is slow/overloaded on the table
+            # rather than the device that has gone away.
+            return []
         if req.pdu_tag == PDU_GET:
             if self.mode == "stale_id":
                 # The late answer to somebody else's attempt, first, with
@@ -457,21 +546,35 @@ class Agent:
                 stale = self._get_reply(req, request_id=req.request_id + 1)
                 self.sys_name = "iftable-stub"
                 return [stale, self._get_reply(req)]
-            return [self._get_reply(req)]
-        if req.pdu_tag == PDU_GETNEXT:
+            replies = [self._get_reply(req)]
+        elif req.pdu_tag == PDU_GETNEXT:
             oid, value = self._next_after(req.varbinds[0]["oid"])
-            return [self._response(req.version, req.request_id,
-                                   enc_varbind(oid, value))]
-        if req.pdu_tag == PDU_GETBULK:
+            replies = [self._response(req.version, req.request_id,
+                                      enc_varbind(oid, value))]
+        elif req.pdu_tag == PDU_GETBULK:
             cursor = req.varbinds[0]["oid"]
             body = b""
-            for _ in range(max(1, req.error_index or 1)):
+            wanted = max(1, req.error_index or 1)
+            # net-snmp does not answer tooBig when the reply would not fit:
+            # it sends the varbinds that DO fit and stops. A walker resumes
+            # from the last one and never learns it asked for too much,
+            # which is why the cap is silent truncation and not an error.
+            if self.bulk_cap:
+                wanted = min(wanted, self.bulk_cap)
+            for _ in range(wanted):
                 cursor, value = self._next_after(cursor)
                 body += enc_varbind(cursor, value)
                 if not cursor.startswith(nodeoids.IF_TABLE["if_index"] + "."):
                     break
-            return [self._response(req.version, req.request_id, body)]
-        return []
+            replies = [self._response(req.version, req.request_id, body)]
+        else:
+            return []
+        if self.stale_id:
+            stale = self._stale_copy(
+                self._response(req.version, req.request_id + 1, b""), req)
+            if stale is not None:
+                replies.insert(0, stale)
+        return replies
 
     def serve(self):
         print(f"listening on {self.host}:{self.port} ({self.mode})", flush=True)
@@ -482,6 +585,10 @@ class Agent:
             except Exception as exc:          # a stub must not die quietly
                 print(f"stub error: {exc}", flush=True)
                 continue
+            if self.reply_delay:
+                # After handle(), not before: the delay is the agent being
+                # slow to answer, and every reply of this request pays it.
+                time.sleep(self.reply_delay)
             for reply in replies or ():
                 self.sock.sendto(reply, addr)
             self.write_stats()
@@ -497,10 +604,31 @@ def main(argv):
     stats_path = ""
     dark_after = 0
     host = "127.0.0.1"
+    reply_delay = 0.0
+    bulk_cap = 0
+    gen_err = []
+    no_such_name = []
+    refuse_bulk = False
+    stale_id = 0
+    dark_after_rows = 0
     rest = list(argv[1:])
     while rest:
         item = rest.pop(0)
-        if item == "--interfaces":
+        if item == "--reply-delay":
+            reply_delay = float(rest.pop(0))
+        elif item == "--bulk-cap":
+            bulk_cap = int(rest.pop(0))
+        elif item == "--gen-err":
+            gen_err += [o for o in rest.pop(0).split(",") if o]
+        elif item == "--no-such-name":
+            no_such_name += [o for o in rest.pop(0).split(",") if o]
+        elif item == "--refuse-bulk":
+            refuse_bulk = True
+        elif item == "--stale-id":
+            stale_id = int(rest.pop(0))
+        elif item == "--dark-after-rows":
+            dark_after_rows = int(rest.pop(0))
+        elif item == "--interfaces":
             interfaces = int(rest.pop(0))
         elif item == "--reboot-after":
             reboot_after = int(rest.pop(0))
@@ -517,7 +645,8 @@ def main(argv):
         else:
             mode = item
     Agent(port, mode, interfaces, reboot_after, window, bump_boots_at,
-          stats_path, dark_after, host).serve()
+          stats_path, dark_after, host, reply_delay, bulk_cap, tuple(gen_err),
+          tuple(no_such_name), refuse_bulk, stale_id, dark_after_rows).serve()
 
 
 if __name__ == "__main__":

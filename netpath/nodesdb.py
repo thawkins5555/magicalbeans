@@ -617,6 +617,39 @@ def _sibling(path: str, suffix: str) -> str:
     return os.path.join(directory, f"{stem}_{suffix}.db")
 
 
+def clean_community(text):
+    """A v1/v2c community as it may be stored: stripped, and never a list.
+
+    Two separate faults, one field. A pasted community carries a trailing
+    space often enough that it is worth removing everywhere rather than in
+    one form, because a wrong community is not refused by an agent — a
+    net-snmp agent (so PAN-OS) drops the datagram without a word, and the
+    poller reports a timeout indistinguishable from an unreachable device.
+
+    And a comma is REFUSED rather than split. nodediscover.py splits the
+    comma-joined string api.py builds from a profile's credentials, which
+    made `public,pa-ro` in one field look like it worked: discovery
+    identified the device and every poll of it then timed out. Splitting
+    here too would be a second, weaker credential list beside the real one
+    — group_credentials already holds alternates, with their own SNMP
+    version, their own v3 material, and the poller's last-known-good
+    caching (credential_candidates, NodePoller._credentials) — so the
+    comma points at that instead. Every stored community therefore has no
+    comma in it, which is what makes discovery's split and the poller's
+    single value agree.
+    """
+    if text is None:
+        return None
+    text = str(text).strip()
+    if "," in text:
+        raise ValueError(
+            "An SNMP community cannot contain a comma — one device is polled "
+            "with one community. To try several, add them as credentials on "
+            "the polling profile (Nodes → Polling profiles → Credentials); "
+            "discovery and polling both use that list.")
+    return text
+
+
 _CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
@@ -1083,6 +1116,8 @@ class NodesDatabase(SqliteStore):
 
     def update_group(self, group_id: int, **fields) -> None:
         allowed = {k: v for k, v in fields.items() if k in _GROUP_EDITABLE}
+        if "community" in allowed:
+            allowed["community"] = clean_community(allowed["community"])
         if not allowed:
             return
         clauses = ", ".join(f"{key} = ?" for key in allowed)
@@ -1173,8 +1208,8 @@ class NodesDatabase(SqliteStore):
                 "INSERT INTO group_credentials(group_id, label, snmp_version,"
                 " community, v3_user, v3_auth_proto, created_ts)"
                 " VALUES (?,?,?,?,?,?,?)",
-                (group_id, label, snmp_version, community, v3_user, v3_auth_proto,
-                 time.time()))
+                (group_id, label, snmp_version, clean_community(community),
+                 v3_user, v3_auth_proto, time.time()))
             self._conn.commit()
             self._config_generation += 1
             return cur.lastrowid
@@ -1182,6 +1217,8 @@ class NodesDatabase(SqliteStore):
     def update_group_credential(self, credential_id: int, **fields) -> None:
         allowed = {k: v for k, v in fields.items() if k in
                   ("label", "snmp_version", "community", "v3_user", "v3_auth_proto")}
+        if "community" in allowed:
+            allowed["community"] = clean_community(allowed["community"])
         if not allowed:
             return
         clauses = ", ".join(f"{key} = ?" for key in allowed)
@@ -1568,7 +1605,8 @@ class NodesDatabase(SqliteStore):
         for key in _OVERRIDE_COLUMNS + _DEVICE_ONLY_COLUMNS:
             if key in overrides:
                 cols.append(key)
-                vals.append(overrides[key])
+                vals.append(clean_community(overrides[key])
+                            if key == "community" else overrides[key])
         marks = ",".join("?" * len(vals))
         with self._lock:
             cur = self._conn.execute(
@@ -1607,6 +1645,8 @@ class NodesDatabase(SqliteStore):
 
     def update_device(self, device_id: int, **fields) -> None:
         allowed = {k: v for k, v in fields.items() if k in _DEVICE_EDITABLE}
+        if "community" in allowed:
+            allowed["community"] = clean_community(allowed["community"])
         if not allowed:
             return
         clauses = ", ".join(f"{key} = ?" for key in allowed)
@@ -1623,6 +1663,8 @@ class NodesDatabase(SqliteStore):
         device — the shape post_nodes_discovery_promote's device_ids list
         already established for "operate on many ids from one request"."""
         allowed = {k: v for k, v in fields.items() if k in _DEVICE_EDITABLE}
+        if "community" in allowed:
+            allowed["community"] = clean_community(allowed["community"])
         if not allowed or not device_ids:
             return
         clauses = ", ".join(f"{key} = ?" for key in allowed)
@@ -1661,7 +1703,9 @@ class NodesDatabase(SqliteStore):
                     for key in _OVERRIDE_COLUMNS + _DEVICE_ONLY_COLUMNS:
                         if key in (row.get("overrides") or {}):
                             cols.append(key)
-                            vals.append(row["overrides"][key])
+                            value = row["overrides"][key]
+                            vals.append(clean_community(value)
+                                        if key == "community" else value)
                     marks = ",".join("?" * len(vals))
                     cur = self._conn.execute(
                         f"INSERT INTO devices({','.join(cols)}) VALUES ({marks})", vals)

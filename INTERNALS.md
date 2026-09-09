@@ -1654,13 +1654,89 @@ default behavior everywhere: every on-demand/best-effort caller (DOM
 reads, the MAC table, custom-MIB polling) still swallows a timeout the
 same as any other `SnmpError`, since a stale sensor reading is harmless.
 Only `_poll_interfaces`'s ifIndex-discovery walk — the one result that
-actually drives the device's own up/down status — opts in, so a genuine
-timeout there now raises and lands in `snmp_error` as "... table walk cut
-short after N row(s)" instead of vanishing. A timeout on one interface's
-own per-interface GET (not the ifIndex walk itself) is narrower still: it
-doesn't invalidate the whole poll — the device answered enough to
-enumerate interfaces — so it's counted (`skipped_timeouts`) and logged,
-not raised.
+actually drives the device's own up/down status — opts in. A timeout on
+one interface's own per-interface GET (not the ifIndex walk itself) is
+narrower still: it doesn't invalidate the whole poll — the device answered
+enough to enumerate interfaces — so it's counted (`skipped_timeouts`) and
+logged, not raised.
+
+`raise_on_timeout` raising on ANY mid-walk timeout went too far the other
+way. A chassis with several hundred interfaces behind the 3 s x 3 default
+budget (`nodesdb` `default_snmp_timeout_s` / `default_snmp_retries`) times
+out part way down its own ifTable routinely; the exception propagated
+through `_poll_device`'s single try and set `snmp_ok = False` for a device
+whose system scalars had already answered — "L3 confirmed, community
+confirmed, sysDescr populated, polling failing", which is exactly what a
+Palo Alto firewall reported. **The boundary is progress, not cause**: an
+ifIndex walk that collected at least one row degrades (`complete = False`,
+which already suppresses row deletion in `replace_interfaces`, plus a
+`reason` string), and one that collected NOTHING still raises. Nothing at
+all means the scalars answered and the very next request did not — a
+device that went away mid-poll, which must not read as healthy. The row
+count is the only thing that separates the two, so the test lives inside
+`_walk_column_detail` where the count is.
+
+`_walk_column_detail` is the walk itself and returns
+`(values, complete, reason)`; `_walk_column_status` is it truncated to two
+and `_walk_column` to one, the same wrapping idiom that already existed
+between those two. `_poll_interfaces` returns `(rows, complete, reason)`
+and `_poll_device` writes the reason into `snmp_error` while leaving
+`snmp_ok` true — a degraded read still has to say what degraded it, or an
+empty interface table beside a healthy device explains nothing
+(`nodes.js` `drawIfaceTable` already renders `snmp_error` as the empty
+state's explanation).
+
+**Walk error-statuses** (`_walk_column_detail`, `_walk_from`,
+`_error_status_reason`). The walk tested `error_status` for 1 (tooBig) and
+nothing else. A `genErr(5)` or `noSuchName(2)` — what a net-snmp agent, so
+PAN-OS, answers for a subtree its handler refuses — carries no usable
+varbind, so it fell through to the non-increasing-OID guard and ended the
+walk with no exception, no log line and nothing in `snmp_error`: a device
+reading healthy with zero interfaces. Any non-zero status now stops the
+walk with `ERROR_STATUS`'s name for it in the reason ("the device answered
+genErr(5) for 1.3.6.1.2.1.2.2.1.1"), which reaches `devices.snmp_error`
+through `record_poll` and the interface table's empty state from there.
+Named rather than numbered, because "error-status 5" told an operator
+nothing.
+
+**Diagnostics: the Test button's walk, and `_Session.dropped`**
+(`web/api.py post_nodes_device_test`, `_test_ifindex_walk`,
+`nodepoll._with_dropped`). The Test button issued a GET of six system
+scalars and nothing else, so it reported OK against every mechanism above:
+a walk that times out part way, an agent that answers `genErr` for the
+ifTable, one that refuses GETBULK, and a community dropped in silence
+(which the scalar GET does catch, but only as a bare timeout). It now runs
+a real ifIndex GETBULK walk after the scalars, on the same session, and
+reports `phases` (a name and a duration each) plus a `walk` block: rows,
+requests, the repetition count actually accepted, whether GETBULK survived
+at all, and the error-status the agent answered. Bounded to
+`_TEST_WALK_MAX_ROWS` / `_TEST_WALK_BUDGET_S`, because a human is waiting.
+Its existing output and permission behaviour are unchanged — the new keys
+are additions.
+
+`_Session.dropped` counted datagrams rejected for a wrong peer, a failed
+decode or a request-id mismatch, and was read by nothing. It is now
+appended to a walk's stop reason (`_with_dropped`, so it reaches
+`snmp_error`) and returned by the Test button. A non-zero count separates
+"no reply" from "replies that were rejected" — the first is a firewall or
+an ACL, the second is something answering that should not be, or a
+credential the agent is refusing per-datagram. Note that answering from
+the *wrong source port* is deliberately not a drop: `_Session._is_peer`
+compares the host only, because agents replying from an ephemeral port are
+common and not forgery.
+
+**The `palo_alto` stub mode** (`tests/stubs/stub_agent_iftable.py`). A
+PAN-OS-shaped agent for the above: a sysObjectID under
+`1.3.6.1.4.1.25461`, several hundred interfaces, `--reply-delay` (a slow
+agent), `--dark-after-rows N` (answers N ifIndex rows then stops answering
+walk requests at all — the mid-table timeout with rows already in hand),
+`--bulk-cap N` (returns FEWER varbinds than the GETBULK asked for, the way
+net-snmp actually truncates an oversized reply, rather than answering
+tooBig — which is why a walker that only handles tooBig never learns
+anything is wrong), `--gen-err`/`--no-such-name` (subtrees answered with
+an error-status), `--refuse-bulk`, and `--stale-id N` (a wrong-request-id
+copy prepended to the first N replies, the datagram `dropped` counts). The
+misbehaviour-flag shape is `stub_agent_fdb.py`'s `bulk-toobig` mode.
 
 **Missing vendor MIB detection** (`NodePoller._check_vendor_mib`,
 `NodesDatabase.has_mib_covering`): vendor autodetection already happened
@@ -1785,7 +1861,41 @@ credentials contribute nothing to the list, since discovery was already
 v1/v2c-only). `nodediscover.py` itself still knows nothing about
 profiles or credential storage — it only ever sees a plain community
 string via the pre-existing `discovery_communities` override key, the
-same one a hand-typed list used before profiles existed. `NodePoller`
+same one a hand-typed list used before profiles existed.
+
+**The comma, and why polling refuses it** (`nodesdb.clean_community`,
+`nodepoll.credential_for`). That comma-joined string is an *internal* join
+of a profile's credentials, but `_candidate_communities` splits any
+community it is handed, and the poller split nothing — it sent
+`config["community"]` on the wire verbatim. So `public,pa-ro` typed into
+one profile field made discovery identify the device and every poll of it
+time out, indistinguishable from unreachable, because a net-snmp agent
+(PAN-OS) drops a wrong-community datagram in silence rather than answering
+`authorizationError`. A pasted trailing space did the same thing.
+
+`clean_community` strips, and **refuses** a comma rather than splitting it.
+Refuse, not split: `group_credentials` already holds credential alternates
+properly — each with its own SNMP version, its own v3 material, the
+poller's last-known-good index caching (`_credentials`) and its negative
+probe cache — and a comma-separated field would be a second, weaker
+credential list beside it, one that could not carry a version and would
+make a community legitimately containing a comma unusable. The refusal's
+message points at that feature. It is applied in `nodesdb` rather than
+`api.py` so every write path gets it (`add_device`, `update_device`,
+`bulk_update_devices`, `add_devices_bulk`, `update_group`,
+`add_group_credential`, `update_group_credential`), and a `ValueError` from
+there already becomes a 400 in `web/server.py`. Because no stored community
+can contain a comma any more, discovery's split over a stored value is the
+identity, and the two paths agree.
+
+`credential_for` strips too, and raises `SnmpError` for a comma it finds
+anyway — a database written before the save-time check. Raising is what
+makes an upgraded install *say* the value is wrong instead of timing out
+against it; every caller of `credential_for` in the poll path is already
+inside `SnmpError` handling, and the Test button reports it as the SNMP
+error it is.
+
+`NodePoller`
 owns the dict of active jobs and exposes
 `start_discovery`/`cancel_discovery`/`promote`; `promote()` treats an
 already-promoted result as a no-op rather than a duplicate-IP error, so a
@@ -2401,7 +2511,23 @@ the base OID's subtree, answers `noSuchObject`/`noSuchInstance`/`endOfMibView`,
 or is not lexicographically after the last accepted OID (a looping agent),
 and the next request resumes from there. `error_status == 1` (tooBig) halves
 `max_repetitions` and retries, falling back to GETNEXT at one repetition
-rather than looping. The old hardcoded 512-row ceiling is now
+rather than looping — and **the fallback itself is remembered**, as a
+learned count of 0 in `_bulk_repetitions` (`_bulk_settings`,
+`_remember_repetitions(..., use_bulk=False)`). It used to remember only the
+repetition count that failed, so `_bulk_settings` returned `(True, 1)` on
+the next walk and an agent that refuses every GETBULK re-paid a wasted
+round trip on every column of every poll, for ever, against exactly the
+devices least able to afford one.
+
+`_bulk_repetitions` stays **process memory**, not a stored column, and that
+is deliberate. It is a fact about an agent, not about a device: a firewall
+replaced or upgraded at the same address would keep a stale "no GETBULK"
+verdict with nothing in the UI to clear it, and the cost of NOT persisting
+it is one wasted round trip per device per process start, re-learned
+automatically. Every other learned poll state is held the same way and for
+the same reason — `_credentials` (last-known-good credential index),
+`_addresses_read`, `_sensor_read`, `_bulk_repetitions` — and
+`_forget_devices` already drops them all as one list. The old hardcoded 512-row ceiling is now
 `settings["snmp_walk_max_rows"]` (default 16384), logged once when hit.
 `_walk_indexes` and so interface discovery share this walker and the same
 reduction.
