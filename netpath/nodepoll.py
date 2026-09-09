@@ -405,9 +405,16 @@ IF_SPEED_SENTINEL = 4_294_967_295
 # the fastest Ethernet port actually shipping, and still three orders below
 # what a kbit/s-for-Mbit/s ifHighSpeed makes of a 10G port.
 MAX_PLAUSIBLE_SPEED_BPS = 1.6e12
+# ...but that ceiling describes a PHYSICAL PORT, and an aggregate's rate is
+# the sum of its members: the bound for one of those is the largest bundle
+# that can exist, 802.3ad's 16 members at 800GbE.
+MAX_PLAUSIBLE_AGGREGATE_BPS = 16 * 800e9
+# ieee8023adLag and propVirtual: what a modern and an older platform
+# respectively call a Port-channel.
+AGGREGATE_IF_TYPES = frozenset({53, 161})
 
 
-def interface_speed_bps(speed, high_speed) -> float | None:
+def interface_speed_bps(speed, high_speed, if_type=None) -> float | None:
     """One interface's line rate in bits/sec from ifSpeed (bit/s, Gauge32,
     saturating at IF_SPEED_SENTINEL) and ifHighSpeed (Mbit/s), refusing an
     ifHighSpeed that cannot be what the MIB says it is — the same shape of
@@ -424,20 +431,35 @@ def interface_speed_bps(speed, high_speed) -> float | None:
     ifSpeed can answer; it cannot above ~4.29 Gb/s, which is exactly where the
     quirk shows, so there the reading is retried as kbit/s and kept only if
     THAT lands inside the ceiling. A genuine 400G or 800G port passes every
-    check untouched and is never rescaled."""
+    check untouched and is never rescaled.
+
+    Two readings that trip those rules legitimately, each exempted by
+    something checkable. An 8x400G port-channel answers 3,200,000 against a
+    saturated ifSpeed, and no arithmetic separates that from a quirky 3.2
+    Gb/s port — a 3.2 Tb/s bundle exists, a 3.2 Tb/s port does not — so
+    if_type decides, and only the ceiling moves. And an agent reporting
+    ifSpeed as speed mod 2^32 rather than saturated gives a 400G port
+    568,041,472 beside a correct ifHighSpeed: not a contradiction but the
+    same number truncated, recognised exactly rather than guessed at. The
+    1 Gb/s quirk cannot pass as one — 1e12 % 2**32 is 3,567,587,328, not the
+    1e9 its ifSpeed reports."""
     high_bps = (float(high_speed) * 1_000_000
                 if isinstance(high_speed, (int, float)) and high_speed else None)
     speed_bps = float(speed) if isinstance(speed, (int, float)) else None
     if high_bps is None:
         return speed_bps
+    aggregate = (isinstance(if_type, (int, float))
+                 and int(if_type) in AGGREGATE_IF_TYPES)
+    ceiling = MAX_PLAUSIBLE_AGGREGATE_BPS if aggregate else MAX_PLAUSIBLE_SPEED_BPS
+    wrapped = high_bps > IF_SPEED_SENTINEL and high_bps % 2 ** 32 == speed_bps
     contradicted = (speed_bps is not None and 0 < speed_bps < IF_SPEED_SENTINEL
-                    and high_bps >= speed_bps * 100)
-    if high_bps <= MAX_PLAUSIBLE_SPEED_BPS and not contradicted:
+                    and high_bps >= speed_bps * 100 and not wrapped)
+    if high_bps <= ceiling and not contradicted:
         return high_bps
     if speed_bps is not None and 0 < speed_bps < IF_SPEED_SENTINEL:
         return speed_bps
     rescaled = high_bps / 1000
-    if rescaled <= MAX_PLAUSIBLE_SPEED_BPS:
+    if rescaled <= ceiling:
         return rescaled
     return speed_bps
 
@@ -3414,13 +3436,14 @@ class NodePoller(Worker):
 
             speed = _val(nodeoids.IF_TABLE, "if_speed")
             high_speed = _val(nodeoids.IFX_TABLE, "if_high_speed")
+            if_type = _val(nodeoids.IF_TABLE, "if_type")
             # ifSpeed is a Gauge32 that RFC 2863 saturates at 4294967295 for
             # any link it cannot express in 32 bits of bits/sec, which is why
             # ifHighSpeed (Mbit/s) exists. The sentinel is left as a literal
             # denominator rather than treated as "unknown": in_util/out_util
             # are clamped to [0, 100], so a row stuck with it still reports a
             # bounded number instead of losing the metric.
-            speed_bps = interface_speed_bps(speed, high_speed)
+            speed_bps = interface_speed_bps(speed, high_speed, if_type)
             hc_in = _val(nodeoids.IFX_TABLE, "if_hc_in_octets")
             hc_out = _val(nodeoids.IFX_TABLE, "if_hc_out_octets")
             in_octets = hc_in if isinstance(hc_in, (int, float)) else _val(nodeoids.IF_TABLE, "if_in_octets")

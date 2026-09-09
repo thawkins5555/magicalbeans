@@ -2523,9 +2523,17 @@ class NodesDatabase(SqliteStore):
         # port-channel), so a plain join on phys_addr fanned one neighbour row
         # out into several — one cable drawn as several links stacked on each
         # other. This join now only names the MAC's device for `bymac`.
+        # It picks among ENABLED devices rather than filtering afterwards: a
+        # disabled duplicate of one box, or a virtual MAC (VRRP/HSRP) on a
+        # pair, puts an unmatchable device at the lowest device_id, and
+        # picking it and only then failing bymac.enabled = 1 lost the match
+        # altogether — where the fan-out this replaced still produced the
+        # enabled device's row. Still one interface, so no fan-out with it.
         " LEFT JOIN interfaces iface"
         "   ON iface.rowid = ("
         "        SELECT i2.rowid FROM interfaces i2"
+        "         JOIN devices macdev"
+        "           ON macdev.id = i2.device_id AND macdev.enabled = 1"
         "         WHERE n.chassis_id_subtype = 4 AND n.chassis_id != ''"
         "           AND i2.phys_addr = n.chassis_id COLLATE NOCASE"
         "         ORDER BY i2.device_id, i2.if_index LIMIT 1)"

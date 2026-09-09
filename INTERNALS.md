@@ -1789,9 +1789,9 @@ prefers ifXTable's high-capacity/high-speed columns whenever present. A
 ~1.3× the interface's own reported speed) catches the case a 32-bit
 counter's single-wrap assumption cannot: a link fast enough to wrap more
 than once between two polls is treated as a reset rather than a
-fabricated multi-wrap number. `interface_speed_bps(speed, high_speed)` is
-the third pure function in that group and applies the same kind of refusal
-to the line rate itself: ifHighSpeed is preferred as it always was (ifSpeed
+fabricated multi-wrap number. `interface_speed_bps(speed, high_speed,
+if_type)` is the third pure function in that group and applies the same kind
+of refusal to the line rate itself: ifHighSpeed is preferred as always (ifSpeed
 saturates at `IF_SPEED_SENTINEL`, 4294967295, and cannot express a modern
 link), but a value above `MAX_PLAUSIBLE_SPEED_BPS` — 1.6 Tb/s, the next
 Ethernet rate the standard defines, a full doubling above the fastest
@@ -1804,6 +1804,35 @@ only if that lands inside the ceiling. The quirk is real and per-linecard:
 an agent answering `ifHighSpeed = 10,000,000` for a 10 Gb/s port produced
 1e13, which `App.rate` correctly rendered as "10.0 Tbps", and drove that
 port's utilisation — `100 * in_bps * 8 / speed_bps` — to near zero.
+
+Two readings trip those rules legitimately, and each is exempted by
+something checkable rather than by loosening the rule:
+
+- **An aggregate is not a port.** An 8x400G port-channel answers a saturated
+  ifSpeed and `ifHighSpeed = 3,200,000`; that is over the ceiling, ifSpeed
+  cannot arbitrate, and the kilobits retry landed the bundle at 3.2 Gb/s —
+  utilisation pinned at 100 %, and the 1.3× check above discarding *every*
+  rate sample on it. No arithmetic separates that from the quirk (a 3.2 Tb/s
+  bundle exists; a 3.2 Tb/s port does not), so `ifType` (`IF_TABLE["if_type"]`)
+  is read for this one decision and `AGGREGATE_IF_TYPES` — ieee8023adLag and
+  propVirtual, what modern and older platforms call a Port-channel — is judged
+  against `MAX_PLAUSIBLE_AGGREGATE_BPS` (16 × 800GbE, 802.3ad's maximum
+  aggregation at the fastest shipping port). Only the ceiling moves: the same
+  reading is still refused on an ethernetCsmacd port and where ifType goes
+  unanswered, and a non-saturated ifSpeed still contradicts ifHighSpeed on an
+  aggregate as on a port. That is sound because the kilobits quirk is
+  per-*linecard*, so it does not reach an interface the supervisor answers for.
+- **A wrapped ifSpeed is not a contradiction.** RFC 2863 saturates ifSpeed, but
+  some agents report `speed mod 2**32`, so a 400G port answers 568,041,472
+  beside a perfectly correct `ifHighSpeed = 400,000` — ≥ 100× apart, so the
+  contradiction rule fired and stored the truncation. That is testable exactly
+  (`high_bps % 2**32 == speed_bps`, with `high_bps` past `IF_SPEED_SENTINEL` so
+  a wrap has actually happened) rather than guessed at, and it cannot re-admit
+  the case the rule exists for: a 1 Gb/s port's quirky 1e12 truncates to
+  3,567,587,328, nowhere near the 1e9 its ifSpeed reports. The ceiling is
+  untouched, so an agent with *both* quirks still has the kilobits reading
+  refused.
+
 `detect_reboot()` compares actual vs.
 wall-clock-expected `sysUpTime` with a 30-second grace band, and
 explicitly excludes the case where the previous reading was already near
@@ -2695,6 +2724,15 @@ poller in the loop.
   now selects a single `interfaces.rowid` through a correlated subquery
   ordered by `(device_id, if_index)`, so the same estate always resolves the
   same way; that join exists only to name the MAC's device for `bymac`.
+  That subquery joins `devices` and picks only among **enabled** ones. A
+  disabled duplicate of one physical box (kept rather than deleted, or a
+  merge part-done) or a virtual MAC (VRRP/HSRP) shared across a pair puts an
+  unmatchable device at the lowest `device_id`; picking it and only then
+  failing `bymac.enabled = 1` nulled `bymac`, `matched_if_index` and
+  `matched_by_mac_id` alike, leaving the neighbour unmatched and drawn as an
+  unmanaged peer — where the fan-out join this replaced still produced the
+  enabled device's row. Filtering inside the pick keeps it single-valued, so
+  the fan-out does not come back with it.
   `matched_if_index` is chosen separately, by a scalar subquery constrained
   to `COALESCE(byname.id, bymac.id)` and ordered by `if_index` — the two
   joins can resolve to *different* devices (byname wins whenever it fires),
