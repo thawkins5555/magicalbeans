@@ -269,6 +269,30 @@ indexed lease lookup that had no caller (the lease search now routes a
 whole MAC to it), and a fold "forced" by the rows that were walked, not
 by the world — and each now says what is there.
 
+**And in the collectors and the stores, one of them serious.** The repair
+that fills in a truncated rollup bucket builds one statement per run of
+flagged buckets, and the comment fixing its ceiling at two hundred
+claimed that stayed "well under" the 999 bound variables an older SQLite
+allows. The arithmetic was wrong — six variables a run, not one, so the
+worst case was about twelve hundred — and this application does not
+choose which SQLite its Python was linked against; on the 3.31 that
+Ubuntu 20.04 ships, a chart that previously merely had a gap in it would
+have failed to draw at all. The ceiling is a hundred and twenty now, the
+comment states the per-run cost so the next person can check it, and a
+test builds the worst case against a connection held to 999. Three
+smaller ones, all in this release's own new code: normalising lease MACs
+had quietly dropped the ability to search a client id that is *not* a
+MAC — a DHCPv6 DUID, a BOOTP hardware-type-prefixed id — by its own
+value, which is exactly the kind of identifier an operator pastes rather
+than types; the ARP search put a floor under a MAC needle but none under
+an address, so a single "1" scanned every 1.x, 10.x and 100.x row in the
+estate and then asked the database for the device behind each one, two
+hundred and one queries for one keystroke, now floored and answered with
+a single batched lookup; and the walker fell through from the legacy ARP
+table to its successor on a *timeout*, where its own docstring said it
+would not, which let a device answering both alternate between them
+across cycles and flap what it had just learned.
+
 ### 5.6.0 — Closing the window closes the application
 
 One report: "the update process is performing horribly — the desktop
