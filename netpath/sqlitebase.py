@@ -301,6 +301,91 @@ TRIM_PASSES = 40             # delete/reclaim rounds before giving up
 TRIM_BUDGET_S = 30.0         # wall clock for one full trim_to_size call
 
 
+class InstrumentedLock:
+    """An RLock that records how long callers wait for it and hold it.
+
+    Every read in this application takes its store's single write lock, not
+    just every write — so although all thirteen files are in WAL mode, and
+    WAL would let readers run alongside a writer, that concurrency is not
+    reachable through one connection behind one Python lock. Whether that
+    costs anything at a given fleet size is an empirical question, and this
+    is the measurement that answers it: `wait_s` per store per minute is the
+    time the web tier spent queued behind the poller and the collectors.
+
+    Measured cost is 0.8 us per acquisition on top of a plain RLock's 0.1 us
+    -- two perf_counter calls and a thread-local lookup. Stated as a share
+    rather than a ratio, because the ratio flatters and frightens by turns:
+    that is 0.25% of a scheduler pass and 7% of the cheapest single-row read
+    in the application, and at ten thousand acquisitions a second it is
+    eight milliseconds. It stays on in production at that price, rather than
+    sitting behind a flag nobody turns on until it is too late to be useful.
+
+    Re-entrancy is counted per thread and only the outermost acquisition is
+    recorded: several stores nest `with self._lock:` deliberately (syslogdb
+    documents its own at length), and counting the inner ones would report
+    hold time that overlaps itself.
+
+    Implements acquire()/release() as well as the context-manager protocol
+    because callers use both -- tests/test_nodes_split_upgrade.py probes a
+    store lock with acquire(timeout=...), and tests/test_collectors_hardening.py
+    wraps one in a spy that delegates both.
+    """
+
+    __slots__ = ("_lock", "_local", "_stats")
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._local = threading.local()
+        self._stats = {"acquisitions": 0, "wait_s": 0.0,
+                       "hold_s": 0.0, "max_hold_s": 0.0}
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        clock = time.perf_counter
+        started = clock()
+        if not self._lock.acquire(blocking, timeout):
+            return False
+        local = self._local
+        try:
+            depth = local.depth
+        except AttributeError:
+            depth = 0                   # first acquisition on this thread
+        local.depth = depth + 1
+        if not depth:
+            now = clock()
+            local.waited = now - started
+            local.held_at = now
+        return True
+
+    def release(self) -> None:
+        local = self._local
+        depth = local.depth - 1
+        local.depth = depth
+        if not depth:
+            # Recorded before the underlying release, so this runs while the
+            # lock is still held and the counters need no lock of their own.
+            held = time.perf_counter() - local.held_at
+            stats = self._stats
+            stats["acquisitions"] += 1
+            stats["wait_s"] += local.waited
+            stats["hold_s"] += held
+            if held > stats["max_hold_s"]:
+                stats["max_hold_s"] = held
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        self.release()
+        return False
+
+    def stats(self) -> dict:
+        """Cumulative since process start, like every other counter here.
+        A caller wanting a rate takes two snapshots and subtracts."""
+        return dict(self._stats)
+
+
 class SqliteStore:
     """One SQLite file: opened, migrated, settings-carrying, size-capped.
 
@@ -320,7 +405,7 @@ class SqliteStore:
 
     def __init__(self, path: str):
         self.path = path
-        self._lock = threading.RLock()
+        self._lock = InstrumentedLock()
         self._conn = connect(path)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
@@ -335,6 +420,19 @@ class SqliteStore:
         self._after_open()
 
     # ------------------------------------------------------------- lifecycle
+
+    def lock_stats(self) -> dict:
+        """How much time this store's single lock has cost, cumulatively.
+
+        `wait_s` is the interesting one: it is time threads spent queued for
+        a file that WAL would have let them read concurrently. A store whose
+        wait is negligible does not need a read connection; one whose wait
+        is a real share of request latency does.
+        """
+        stats = getattr(self._lock, "stats", None)
+        # A test may have swapped the lock for a plain one or a spy; report
+        # nothing rather than raising into whatever is asking.
+        return stats() if callable(stats) else {}
 
     def _before_schema(self) -> None:
         """Anything that must observe the file as it was before SCHEMA ran."""

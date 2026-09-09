@@ -623,6 +623,31 @@ class LengthRequired(ValueError):
 MAX_TRACKED_CLIENTS = 1000
 
 
+# Latency bucket ceilings in milliseconds; the last is "slower than that".
+# Fixed edges rather than a reservoir so a percentile costs no memory that
+# grows with traffic, and so two snapshots subtract cleanly into a rate.
+LATENCY_BUCKETS_MS = (1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, float("inf"))
+
+
+def _bucket_percentile(stats: dict, fraction: float) -> float:
+    """The bucket ceiling the given fraction of requests fall within.
+
+    Deliberately coarse: it answers "p95 is at or under 250 ms", which is
+    what a latency budget is written in, and not "p95 is 187.4 ms", which a
+    fixed-bucket histogram cannot honestly claim. Returns the last finite
+    edge when the tail is past every bucket, so a caller never has to render
+    an infinity.
+    """
+    target = stats["requests"] * fraction
+    seen = 0
+    for index, count in enumerate(stats["buckets"]):
+        seen += count
+        if seen >= target:
+            edge = LATENCY_BUCKETS_MS[index]
+            return float(LATENCY_BUCKETS_MS[-2]) if edge == float("inf") else float(edge)
+    return float(LATENCY_BUCKETS_MS[-2])
+
+
 class AccessLog:
     """Per-client totals, for the service console.
 
@@ -641,13 +666,35 @@ class AccessLog:
         self.active = 0
         self.peak_active = 0
         self.started_at = time.time()
+        # Per-route latency. Keyed by the route's PATTERN, not by the path:
+        # `/api/nodes/devices/(\d+)` is one key however many devices there
+        # are, so this is bounded by the size of the route table rather than
+        # by the fleet. The duration was already being measured for this
+        # call and then dropped on the floor, so the only new cost is the
+        # arithmetic below.
+        self.routes: dict[str, dict] = {}
 
     def record(self, client: str, method: str, path: str, status: int,
-               ms: float, agent: str) -> None:
+               ms: float, agent: str, route: str | None = None) -> None:
         with self._lock:
             self.total += 1
             if status >= 400:
                 self.errors += 1
+            stats = self.routes.get(route or path)
+            if stats is None:
+                stats = self.routes[route or path] = {
+                    "requests": 0, "total_ms": 0.0, "max_ms": 0.0,
+                    "buckets": [0] * len(LATENCY_BUCKETS_MS)}
+            stats["requests"] += 1
+            stats["total_ms"] += ms
+            if ms > stats["max_ms"]:
+                stats["max_ms"] = ms
+            for index, edge in enumerate(LATENCY_BUCKETS_MS):
+                if ms <= edge:
+                    stats["buckets"][index] += 1
+                    break
+            else:
+                stats["buckets"][-1] += 1
             info = self.clients.setdefault(client, {
                 "requests": 0, "first_seen": time.time(), "last_seen": 0.0,
                 "agent": agent, "errors": 0})
@@ -676,6 +723,10 @@ class AccessLog:
                 "total": self.total, "errors": self.errors,
                 "active": self.active, "peak_active": self.peak_active,
                 "clients": {name: dict(info) for name, info in self.clients.items()},
+                "routes": {name: {**stats,
+                                  "mean_ms": stats["total_ms"] / stats["requests"],
+                                  "p95_ms": _bucket_percentile(stats, 0.95)}
+                           for name, stats in self.routes.items()},
             }
 
 
@@ -958,6 +1009,10 @@ class Handler(BaseHTTPRequestHandler):
         # One Handler instance serves every request on a persistent
         # connection, so per-request state is reset here, not in __init__.
         self._body_consumed = False
+        # Set by _route when a pattern matches, so the latency below is
+        # filed under the route rather than under one of a fleet's worth of
+        # distinct paths. Stays None for a 404, which is its own useful key.
+        self._route_template = None
         started = time.perf_counter()
         try:
             self._route(method)
@@ -967,7 +1022,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.client_address[0], method, urlparse(self.path).path,
                     getattr(self, "_status", 0),
                     (time.perf_counter() - started) * 1000,
-                    self.headers.get("User-Agent", "")[:120])
+                    self.headers.get("User-Agent", "")[:120],
+                    route=(f"{method} {self._route_template}"
+                           if self._route_template else f"{method} <unrouted>"))
 
     def _origin_matches(self, origin: str) -> bool:
         """Whether `origin` is this server's own origin — scheme, host and
@@ -1109,6 +1166,7 @@ class Handler(BaseHTTPRequestHandler):
             match = pattern.match(path)
             if not match:
                 continue
+            self._route_template = pattern.pattern
             try:
                 body = (self._body(self._body_limit(path))
                         if method in ("POST", "PUT", "DELETE") else {})
@@ -1296,6 +1354,11 @@ class WebServer:
         self.httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self.access = AccessLog()
+        # The Debug page reads per-route latency through the service, which
+        # is the only handle api.get_debug is given. The log belongs to the
+        # server (it counts connections, which the service knows nothing
+        # about), so the server lends it rather than moving it.
+        service.access_log = self.access
         self.error: str | None = None
 
     @property

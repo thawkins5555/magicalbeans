@@ -1441,6 +1441,16 @@ def get_debug(service, params, body) -> dict:
         "events": events,
         "last_seq": service.log.last_seq,
         "targets": sorted({e["target"] for e in events if e["target"]}),
+        # Every read in this application takes its store's write lock, so
+        # `wait_s` here is time the web tier spent queued behind the poller
+        # and the collectors on a file WAL would have let it read anyway.
+        # Cumulative since start; a rate is two snapshots subtracted.
+        "store_locks": _store_locks(service),
+        # Per-route request latency, keyed by route pattern rather than by
+        # path. The server has always measured this and always thrown it
+        # away; it is kept now because it is the only number that says which
+        # endpoint is actually slow.
+        "routes": _route_latency(service),
         "summary": {
             "scheduler": service.monitor.running,
             "workers_busy": running,
@@ -1464,6 +1474,34 @@ def get_debug(service, params, body) -> dict:
             "ping_mode_env": ping_mode["mode_env"],
         },
     }
+
+
+def _store_locks(service) -> dict:
+    """Lock wait and hold per database file, worst waiter first."""
+    rows = {}
+    for store in STORES:
+        db = db_for(service, store)
+        stats = getattr(db, "lock_stats", None)
+        if db is None or not callable(stats):
+            continue
+        measured = stats()
+        if measured:
+            rows[store.name] = {"label": store.label, **measured}
+    return dict(sorted(rows.items(),
+                       key=lambda kv: kv[1].get("wait_s", 0.0), reverse=True))
+
+
+def _route_latency(service) -> dict:
+    r"""Per-route timing off the access log, slowest total first.
+
+    Bounded by the route table, not by the fleet: one key per pattern, so a
+    thousand devices are still one `/api/nodes/devices/(\d+)` row.
+    """
+    access = getattr(service, "access_log", None) or getattr(service, "access", None)
+    snapshot = access.snapshot() if access is not None else {}
+    routes = snapshot.get("routes") or {}
+    return dict(sorted(routes.items(),
+                       key=lambda kv: kv[1].get("total_ms", 0.0), reverse=True))
 
 
 def post_debug_clear(service, params, body) -> dict:
