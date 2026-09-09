@@ -34,7 +34,14 @@ def check(condition, message):
 def build(devices=300, interval=60, **settings):
     db = NodesDatabase(os.path.join(tmpdir("autoscale_"), "nodes.db"))
     group = db.ensure_default_group()
-    db.update_group(group, poll_interval_s=interval)
+    # The timeout has to be set on the GROUP, not through save_settings: the
+    # seeded default profile carries its own snmp_timeout_s of 3.0 and two
+    # retries, and a profile value wins over the global default. Without this
+    # the backoff checks below -- which call _poll_device for real against an
+    # address nothing answers on -- wait out three seconds three times per
+    # poll, which was 117 of this suite's 118 seconds.
+    db.update_group(group, poll_interval_s=interval,
+                    snmp_timeout_s=0.2, snmp_retries=0)
     ids = [db.add_device("10.0.%d.%d" % (i // 250, i % 250), "dev%d" % i,
                          group_id=group)
            for i in range(devices)]
@@ -50,11 +57,17 @@ def build(devices=300, interval=60, **settings):
 
 def drive(poller, ids, cost, interval, seconds, start):
     """`seconds` of scheduling passes at 1 Hz with every device costing
-    `cost`, and the pool size it settles at."""
+    `cost`, and the pool size it settles at.
+
+    The demand figure is computed once rather than per tick: every device
+    here has the same cost, so the sum _schedule_pass would accumulate is
+    constant, and re-adding three hundred identical terms a few thousand
+    times is the whole runtime of this suite rather than any of its meaning.
+    """
     for device_id in ids:
         poller._poll_cost[device_id] = cost
+    demand = sum(poller._poll_cost[i] / interval for i in ids)
     for tick in range(seconds):
-        demand = sum(poller._poll_cost[i] / interval for i in ids)
         poller._autoscale_pass(start + tick, demand)
     return poller._executor._max_workers
 
@@ -76,8 +89,8 @@ def controller():
     at += 1000
     for device_id in ids[:75]:
         poller._poll_cost[device_id] = 9.0
+    demand = sum(poller._poll_cost[i] / 60 for i in ids)
     for tick in range(600):
-        demand = sum(poller._poll_cost[i] / 60 for i in ids)
         poller._autoscale_pass(at + tick, demand)
     grown = poller._executor._max_workers
     check(grown >= 18, "a site outage grows the pool to cover it "
