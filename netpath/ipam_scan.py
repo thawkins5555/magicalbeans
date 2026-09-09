@@ -140,10 +140,22 @@ def _ping_command(ip: str, timeout_ms: int) -> list[str]:
 # build the echo request by hand (the checksum is the one part the kernel
 # will not do), send it, and select() for the matching reply.
 #
+# Windows has no unprivileged raw ICMP socket at all, so the probe below
+# gives up there — but it does have IcmpSendEcho in iphlpapi.dll, which
+# sends the same echo request from an ordinary account with no elevation.
+# That is the third implementation, and on Windows it is the whole ball
+# game: without it every probe forks a real ping.exe, measured at 15.6 ms
+# of process creation apiece, three per device per poll, which on a
+# 2,000-device fleet is more wall clock than the network work it wraps
+# (see RUNBOOK.md, "The poll pool is saturated").
+#
 # NETPATH_PING_MODE picks the implementation:
-#   unset / "auto"  — socket if one can be opened, else subprocess.
-#                     Detected once per process (see _icmp_socket_kind).
+#   unset / "auto"  — socket if one can be opened (iphlpapi on Windows),
+#                     else subprocess. Detected once per process (see
+#                     _icmp_socket_kind).
 #   "socket"        — demand the fast path; raise rather than fall back.
+#                     Covers the iphlpapi path too: what the mode names is
+#                     "do not fork a process", not a particular syscall.
 #   "subprocess"    — always fork/exec `ping`. This is what lets the demo
 #                     harness work: demo/bin/ping is a PATH stand-in that
 #                     makes a simulated device (a 127.0.0.x address) look
@@ -157,7 +169,7 @@ _ICMP_ECHO_REQUEST = 8
 _ICMP_ECHO_REPLY = 0
 
 _icmp_kind_lock = threading.Lock()
-_icmp_kind_cache = "unchecked"          # -> "dgram", "raw", or None
+_icmp_kind_cache = "unchecked"          # -> "dgram", "raw", "iphlpapi", or None
 
 
 def _icmp_checksum(data: bytes) -> int:
@@ -212,6 +224,148 @@ def _is_ipv4(ip: str) -> bool:
         return False
 
 
+# ------------------------------------------------------ Windows ICMP
+#
+# IcmpCreateFile/IcmpSendEcho/IcmpCloseHandle, the documented unprivileged
+# way to send an echo request on Windows. Loaded through ctypes the same
+# way dpapi.py reaches CryptProtectData, and lazily: ipam_scan is imported
+# on every platform and the poller depends on it, so nothing here may cost
+# anything or raise anything off Windows.
+#
+# Whole-millisecond IP_ECHO_REPLY.RoundTripTime is deliberately ignored in
+# favour of timing the call here, for the same reason _ping_many_socket
+# times its own send and receive rather than trusting `ping`'s "time="
+# output: a figure the probe computes for itself is not comparable with
+# what the other two paths report, and at loopback and LAN distances it
+# rounds to zero.
+_IPHLPAPI_PAYLOAD = b"netpath"
+_IP_SUCCESS = 0
+
+_iphlpapi_lock = threading.Lock()
+_iphlpapi_cache = "unchecked"           # -> a dict of entry points, or None
+
+
+def _load_iphlpapi():
+    """The three iphlpapi entry points plus the reply structure, or None
+    on any platform or host where they cannot be resolved.
+
+    Cached: resolving the symbols is cheap but this is consulted from every
+    poll worker, and a host without them must not re-probe forever.
+    """
+    global _iphlpapi_cache
+    with _iphlpapi_lock:
+        if _iphlpapi_cache != "unchecked":
+            return _iphlpapi_cache
+        _iphlpapi_cache = None
+        if not IS_WINDOWS:
+            return None
+        try:
+            import ctypes
+
+            class _IcmpEchoReply(ctypes.Structure):
+                # ICMP_ECHO_REPLY, with IP_OPTION_INFORMATION inlined rather
+                # than nested. Only Status is ever read, but every field has
+                # to be declared or ctypes computes the wrong size and the
+                # reply buffer handed to IcmpSendEcho is too small.
+                _fields_ = [
+                    ("Address", ctypes.c_uint32),
+                    ("Status", ctypes.c_uint32),
+                    ("RoundTripTime", ctypes.c_uint32),
+                    ("DataSize", ctypes.c_uint16),
+                    ("Reserved", ctypes.c_uint16),
+                    ("Data", ctypes.c_void_p),
+                    ("Ttl", ctypes.c_ubyte),
+                    ("Tos", ctypes.c_ubyte),
+                    ("Flags", ctypes.c_ubyte),
+                    ("OptionsSize", ctypes.c_ubyte),
+                    ("OptionsData", ctypes.c_void_p),
+                ]
+
+            dll = ctypes.WinDLL("iphlpapi.dll")
+            create = dll.IcmpCreateFile
+            create.restype = ctypes.c_void_p
+            create.argtypes = []
+            send = dll.IcmpSendEcho
+            send.restype = ctypes.c_uint32
+            send.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
+                             ctypes.c_uint16, ctypes.c_void_p, ctypes.c_void_p,
+                             ctypes.c_uint32, ctypes.c_uint32]
+            close = dll.IcmpCloseHandle
+            close.restype = ctypes.c_int
+            close.argtypes = [ctypes.c_void_p]
+            # INVALID_HANDLE_VALUE is (HANDLE)-1, which arrives here as an
+            # unsigned integer whose width follows the interpreter's, not
+            # the source's.
+            invalid = (1 << (8 * ctypes.sizeof(ctypes.c_void_p))) - 1
+            # Prove the driver actually opens before claiming the capability:
+            # resolving a symbol says the DLL exists, not that this account
+            # may send ICMP.
+            handle = create()
+            if not handle or handle == invalid:
+                return None
+            close(ctypes.c_void_p(handle))
+            _iphlpapi_cache = {"ctypes": ctypes, "reply": _IcmpEchoReply,
+                               "create": create, "send": send, "close": close,
+                               "invalid": invalid}
+        except (OSError, AttributeError, ImportError, ValueError):
+            # A Windows install without iphlpapi, a stripped container, or a
+            # policy that refuses the handle: fall back to the subprocess
+            # path, which is exactly where this platform was before.
+            _iphlpapi_cache = None
+        return _iphlpapi_cache
+
+
+def _ping_many_iphlpapi(ip: str, count: int,
+                        timeout_ms: int) -> tuple[int, int, float | None]:
+    """(sent, received, average RTT in ms) for `count` echo probes, via
+    iphlpapi rather than a ping.exe apiece.
+
+    One ICMP handle per call rather than one shared across every in-flight
+    probe, mirroring _ping_many_socket's socket-per-call reasoning: each
+    handle carries its own request and reply, so concurrent polls of other
+    devices cannot interleave on it, and opening one costs nothing like the
+    fork/exec it replaces.
+
+    Raises OSError only if the handle cannot be opened; a probe that is sent
+    and not answered is counted as not received, the same as a failed
+    subprocess ping.
+    """
+    api = _load_iphlpapi()
+    if api is None:
+        raise OSError("iphlpapi is not available on this host")
+    ctypes = api["ctypes"]
+    destination = struct.unpack("<I", socket.inet_aton(ip))[0]
+    payload = ctypes.create_string_buffer(_IPHLPAPI_PAYLOAD, len(_IPHLPAPI_PAYLOAD))
+    # The documented minimum is one reply structure plus the echoed payload,
+    # plus 8 bytes of room for an ICMP error message instead of a reply.
+    reply_size = ctypes.sizeof(api["reply"]) + len(_IPHLPAPI_PAYLOAD) + 8
+    reply = ctypes.create_string_buffer(reply_size)
+    handle = api["create"]()
+    if not handle or handle == api["invalid"]:
+        raise OSError("IcmpCreateFile failed")
+    sent = 0
+    received = 0
+    rtts: list[float] = []
+    try:
+        for _ in range(count):
+            sent += 1
+            started = time.monotonic()
+            replies = api["send"](ctypes.c_void_p(handle), destination,
+                                  payload, len(_IPHLPAPI_PAYLOAD), None,
+                                  reply, reply_size, timeout_ms)
+            elapsed = (time.monotonic() - started) * 1000
+            if not replies:
+                continue                # timed out, or unreachable
+            status = api["reply"].from_buffer(reply).Status
+            if status != _IP_SUCCESS:
+                continue                # a reply, but not an echo reply
+            received += 1
+            rtts.append(elapsed)
+    finally:
+        api["close"](ctypes.c_void_p(handle))
+    return sent, received, (sum(rtts) / len(rtts)) if rtts else None
+
+
 def _detect_icmp_socket_kind() -> str | None:
     """"dgram", "raw", or None — probed once, not once per call.
 
@@ -228,9 +382,15 @@ def _detect_icmp_socket_kind() -> str | None:
     be pinging the network), but it is still the documented fallback:
     a locked-down host with neither gets None and the subprocess path,
     unchanged.
+
+    Windows has neither and cannot be given either — there is no
+    unprivileged raw ICMP socket on the platform — so it takes iphlpapi
+    instead, which needs no elevation and no grant of any kind. A Windows
+    host that cannot load it falls back to the subprocess path exactly as
+    it did before, which is why this returns None rather than raising.
     """
     if IS_WINDOWS:
-        return None
+        return "iphlpapi" if _load_iphlpapi() is not None else None
     for sock_type, name in ((socket.SOCK_DGRAM, "dgram"), (socket.SOCK_RAW, "raw")):
         try:
             probe = socket.socket(socket.AF_INET, sock_type, socket.IPPROTO_ICMP)
@@ -254,6 +414,8 @@ def _icmp_socket_kind() -> str | None:
         kind = _icmp_kind_cache
     if kind is None and mode == "socket":
         raise OSError(
+            "NETPATH_PING_MODE=socket but iphlpapi could not be loaded here"
+            if IS_WINDOWS else
             "NETPATH_PING_MODE=socket but no ICMP socket could be opened here "
             "(see /proc/sys/net/ipv4/ping_group_range, or run with CAP_NET_RAW)")
     return kind
@@ -362,12 +524,23 @@ def _ping_many_socket(ip: str, count: int, timeout_ms: int,
     return sent, received, (sum(rtts) / len(rtts)) if rtts else None
 
 
+def _probe(ip: str, count: int, timeout_ms: int,
+           kind: str) -> tuple[int, int, float | None]:
+    """Whichever fork-free implementation `kind` names. IcmpSendEcho takes a
+    destination and a timeout and does its own framing, so it cannot be
+    folded into _ping_many_socket's hand-built echo request — but both
+    callers below want the same three numbers either way."""
+    if kind == "iphlpapi":
+        return _ping_many_iphlpapi(ip, count, timeout_ms)
+    return _ping_many_socket(ip, count, timeout_ms, kind)
+
+
 def ping_once(ip: str, timeout_ms: int = 800) -> bool:
     if _is_ipv4(ip):
         kind = _icmp_socket_kind()
         if kind is not None:
             try:
-                _sent, received, _rtt = _ping_many_socket(ip, 1, timeout_ms, kind)
+                _sent, received, _rtt = _probe(ip, 1, timeout_ms, kind)
                 return received > 0
             except (OSError, ValueError):
                 # ValueError alongside OSError: selectors.DefaultSelector
@@ -415,7 +588,7 @@ def ping_many(ip: str, count: int = 3,
         kind = _icmp_socket_kind()
         if kind is not None:
             try:
-                return _ping_many_socket(ip, count, timeout_ms, kind)
+                return _probe(ip, count, timeout_ms, kind)
             except (OSError, ValueError):
                 # See ping_once's matching except clause just above.
                 pass                    # socket path unavailable; fall through below

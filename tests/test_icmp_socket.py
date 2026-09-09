@@ -31,7 +31,21 @@ def reset_capability_cache():
     detection, so each one starts from "not yet checked" rather than
     inheriting whatever an earlier test (or module import) cached."""
     ipam_scan._icmp_kind_cache = "unchecked"
+    ipam_scan._iphlpapi_cache = "unchecked"
     os.environ.pop(ipam_scan._PING_MODE_ENV, None)
+
+
+def force_no_fast_path():
+    """Make BOTH fast paths unavailable, not just the socket one.
+
+    A test that patches socket.socket to refuse used to be enough to mean
+    "this host has no fork-free probe". It is not any more: Windows reaches
+    iphlpapi without opening a socket at all, so a socket patch alone leaves
+    the fast path in place and the test asserts the opposite of what it
+    means. None is the cache's own "probed, not available" value, so this
+    stops the probe rather than faking it."""
+    ipam_scan._icmp_kind_cache = "unchecked"
+    ipam_scan._iphlpapi_cache = None
 
 
 def checksum_and_framing():
@@ -93,6 +107,7 @@ def capability_detection_and_fallback():
         raise OSError("EPERM (simulated): Operation not permitted")
 
     socket.socket = always_refused
+    ipam_scan._iphlpapi_cache = None    # ...and no iphlpapi either, on Windows
     try:
         check(ipam_scan._detect_icmp_socket_kind() is None,
              "capability detection returns None when every socket() call is refused")
@@ -160,7 +175,7 @@ def mode_override():
     # NETPATH_PING_MODE=socket demands the fast path and raises rather
     # than silently returning None when it is not actually available —
     # useful for a deployment to confirm it landed.
-    reset_capability_cache()
+    force_no_fast_path()
     real_socket = socket.socket
     socket.socket = lambda *a, **k: (_ for _ in ()).throw(OSError("refused"))
     os.environ[ipam_scan._PING_MODE_ENV] = "socket"
@@ -195,7 +210,8 @@ def mode_override():
 def subprocess_path_still_works():
     """With the fast path switched off, ping_once/ping_many must still go
     through subprocess.run exactly as before — the fallback this whole
-    change depends on for Windows, IPv6, and any locked-down host."""
+    change depends on for IPv6 and any locked-down host. Windows used to be
+    on that list and no longer is: it reaches iphlpapi instead."""
     os.environ[ipam_scan._PING_MODE_ENV] = "subprocess"
     real_run = subprocess.run
     calls = []
@@ -296,6 +312,66 @@ def real_socket_probe_and_rate_limit():
          f"({unpaced:.2f}s), confirming the 0.55s above was the pacing, not the probe")
 
 
+def iphlpapi_path():
+    """The Windows fork-free probe: IcmpSendEcho through ctypes.
+
+    Skipped off Windows, where iphlpapi does not exist and the socket paths
+    above are what run instead. On Windows this is the path every poll of
+    every device now takes, so it is worth more than the sum of the socket
+    checks above."""
+    if not ipam_scan.IS_WINDOWS:
+        print("SKIP  iphlpapi_path: not Windows")
+        return
+    reset_capability_cache()
+
+    api = ipam_scan._load_iphlpapi()
+    check(api is not None, "iphlpapi loads and its ICMP handle opens")
+    if api is None:
+        return
+    check(ipam_scan._icmp_socket_kind() == "iphlpapi",
+         "capability detection picks iphlpapi on Windows rather than giving "
+         "up and forking a ping.exe per probe")
+    check(ipam_scan.ping_mode_summary()["path"] == "socket",
+         "...and the operator-facing summary reports a fork-free path")
+
+    # The reply structure's size is the one thing a wrong ctypes declaration
+    # gets silently wrong: too small and IcmpSendEcho writes past the buffer
+    # or refuses. Both pointer fields are pointer-width, the rest is fixed.
+    ct = api["ctypes"]
+    expected = 8 + 4 + 2 + 2 + 2 * ct.sizeof(ct.c_void_p) + 4
+    check(ct.sizeof(api["reply"]) >= expected,
+         f"the reply structure is at least its documented size "
+         f"({ct.sizeof(api['reply'])} >= {expected})")
+
+    sent, received, rtt = ipam_scan._ping_many_iphlpapi("127.0.0.4", 3, 500)
+    check((sent, received) == (3, 3) and rtt is not None,
+         f"a real iphlpapi probe of a loopback address succeeds: "
+         f"sent={sent} received={received} rtt={rtt}")
+
+    # A device that is down is the case this has to get right: no reply must
+    # read as loss, not as an exception and not as a false success.
+    started = time.monotonic()
+    sent, received, rtt = ipam_scan._ping_many_iphlpapi("192.0.2.77", 2, 250)
+    elapsed = time.monotonic() - started
+    check((sent, received) == (2, 0) and rtt is None,
+         f"...and an address nothing answers reports loss, not an error "
+         f"(sent={sent} received={received})")
+    check(elapsed < 2.0,
+         f"...within its own timeout rather than some larger one ({elapsed:.2f}s)")
+
+    # No subprocess may be spawned on this path — that is the entire point.
+    real_run = subprocess.run
+    spawned = []
+    subprocess.run = lambda argv, **kw: spawned.append(argv)
+    try:
+        ipam_scan.ping_many("127.0.0.5", count=3, timeout_ms=500)
+        check(not spawned,
+             f"ping_many spawns no subprocess at all on Windows now: {spawned}")
+    finally:
+        subprocess.run = real_run
+    reset_capability_cache()
+
+
 def selector_valueerror_falls_back():
     """select.select() raises ValueError, not OSError, for any file
     descriptor >= 1024 — a busy process (a 1,000-device fleet, many
@@ -309,9 +385,10 @@ def selector_valueerror_falls_back():
     real_socket_probe_and_rate_limit above."""
     reset_capability_cache()
     kind = ipam_scan._icmp_socket_kind()
-    if kind is None:
-        print("SKIP  selector_valueerror_falls_back: no ICMP socket access on this "
-             "host (checked both SOCK_DGRAM and SOCK_RAW)")
+    if kind not in ("dgram", "raw"):
+        print("SKIP  selector_valueerror_falls_back: this host does not reach "
+             f"_ping_many_socket's wait loop (kind={kind!r}); iphlpapi does its "
+             "own framing and waiting, so there is no selector here to explode")
         return
 
     class ExplodingSelector:
@@ -368,6 +445,7 @@ def main() -> int:
     mode_override()
     subprocess_path_still_works()
     real_socket_probe_and_rate_limit()
+    iphlpapi_path()
     selector_valueerror_falls_back()
 
     print()
