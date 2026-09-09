@@ -39,6 +39,10 @@
     hist: null,
     // device entity_id -> until_ts, refreshed with the rest of the page.
     mutes: new Map(),
+    // device id -> the open maintenance period. Separate from `mutes`
+    // because a device can be in both at once and neither answers for the
+    // other: a mute has an until_ts, maintenance mode has no end at all.
+    maintenance: new Map(),
     // What the detail pane was last rendered from, so a refresh that
     // changes nothing leaves the markup (and any open dropdown) alone.
     detailSignature: null,
@@ -209,7 +213,14 @@
       cell: (r) => `<span class="sev sev-${r.severity}">${
         escape(App.state.severities?.[r.severity] || r.severity)}</span>` },
     { key: 'state', label: 'State', width: 80, on: true },
-    { key: 'entity_label', label: 'Object', width: 170, on: true },
+    // The link the detail pane has always carried, now on every row.
+    // search:false because device_id is null exactly when the label is not
+    // a device: gone from Nodes, or a DHCP scope. No `value:` — sortRows
+    // falls back to row[key], which is the text this renders.
+    { key: 'entity_label', label: 'Object', width: 170, on: true,
+      cell: (r) => App.deviceNameLink(r.entity_label,
+                                      { id: r.device_id, search: false })
+        || '\u2014' },
     { key: 'rule_name', label: 'Rule', width: 150, on: true },
     { key: 'message', label: 'Message', width: 260, on: true,
       cell: (r) => `<span class="msg">${escape(r.message)}</span>` },
@@ -485,9 +496,15 @@
     // null. It is in the signature because the mute area is drawn from it.
     const deviceId = row.device_id ? String(row.device_id) : '';
     const mutedUntil = deviceId ? (view.mutes.get(deviceId) || null) : null;
+    // In the signature for the same reason mutedUntil is: the pane is only
+    // rebuilt when this string changes, so a maintenance state left out of
+    // it would leave the line and its button showing the previous answer
+    // until something else about the alert happened to move.
+    const maint = deviceId ? (view.maintenance.get(deviceId) || null) : null;
     const signature = [row.id, row.state, row.count, row.last_ts,
                        row.acked_by, row.resolved_ts, row.rollup_note,
-                       deviceId, mutedUntil || ''].join('|');
+                       deviceId, mutedUntil || '',
+                       maint ? maint.started_ts : ''].join('|');
     if (view.detailSignature === signature) return;
     view.detailSignature = signature;
     const rows = view.rules.length ? view.rules : [];
@@ -529,9 +546,22 @@
     // and invisible to anyone who does not think to hover it.
     const muteHint = muteable
       ? '' : `<p class="hint" id="alerts-d-mute-why">${escape(why)}</p>`;
+    // Shown, and endable, but never STARTABLE from here: an indefinite
+    // option offered beside a 24-hour dropdown is one an operator picks by
+    // accident. Nodes' device pane is where it is turned on, with the
+    // dialog that says what it does.
+    let maintHtml = '';
+    if (maint) {
+      const since = escape(App.when(maint.started_ts));
+      const who = maint.started_by ? ` by ${escape(maint.started_by)}` : '';
+      maintHtml = `<span class="hint warn-text" id="alerts-d-maintenance">` +
+        `In maintenance since ${since}${who}</span>` +
+        (writable ? `<button id="alerts-d-end-maintenance">End maintenance</button>` : '');
+    }
     el.innerHTML = `
       <div class="bar wrap"><span class="section sev sev-${row.severity}">${escape(row.severity_name)}</span>
         <span class="grow"></span>
+        ${maintHtml}
         ${muteHtml}
         ${writable && row.state !== 'resolved' ? '<button id="alerts-d-resolve">Resolve</button>' : ''}
         ${writable && row.state === 'open' ? '<button id="alerts-d-ack">Acknowledge</button>' : ''}
@@ -574,6 +604,9 @@
     const unmuteBtn = document.getElementById('alerts-d-unmute');
     if (unmuteBtn) unmuteBtn.onclick = () => detailAction('Lift mute', () =>
       App.del('/api/alerts/mute', { entity_kind: 'device', entity_id: deviceId }), unmuteBtn);
+    const endMaintBtn = document.getElementById('alerts-d-end-maintenance');
+    if (endMaintBtn) endMaintBtn.onclick = () => detailAction('End maintenance', () =>
+      App.del('/api/alerts/maintenance', { device_id: deviceId }), endMaintBtn);
     App.get(`/api/alerts/${row.id}`).then((full) => {
       const box = document.getElementById('alerts-d-notifications');
       if (!box) return;
@@ -687,7 +720,7 @@
         // (scope_kind/scope_group_id/scope_device_ids), because both
         // dialogs share the same picker. Bulk mute is the older of the two
         // routes and never grew that shape — it still wants device_ids
-        // and/or group_id (_bulk_mute_device_ids in api.py) — so every
+        // and/or group_id (_bulk_silence_device_ids in api.py) — so every
         // choice made in this dialog used to reach the server as fields it
         // does not read, and every mute failed with "device_ids and/or
         // group_id is required" regardless of what was picked. Translated
@@ -1739,7 +1772,8 @@
     if (view.pageFilterSig !== null && view.pageFilterSig !== filterSig) view.pageOffset = 0;
     view.pageFilterSig = filterSig;
     const generation = ++view.refreshGen;
-    const [overview, list, total, rules, ruleExtras, templates, mutes, deviceThresholds] =
+    const [overview, list, total, rules, ruleExtras, templates, mutes, maintenance,
+           deviceThresholds] =
       await Promise.all([
       App.get('/api/alerts/overview', { t0, t1, bucket }),
       App.get('/api/alerts', { ...f, limit: view.pageLimit, offset: view.pageOffset }),
@@ -1750,6 +1784,10 @@
       App.get('/api/alerts/rules/extras'),
       App.get('/api/alerts/templates'),
       App.get('/api/alerts/mutes'),
+      // In the same round trip as the mutes, for the same reason: the detail
+      // pane draws both, and a second poll for one of them would let the two
+      // disagree for a tick.
+      App.get('/api/alerts/maintenance'),
       // Fleet-wide (no device_id): the Rules table's own "N overrides" count
       // per threshold rule, the same one call the overrides dialog itself
       // would otherwise have to make a second time on every row.
@@ -1782,6 +1820,10 @@
     // only ever returns unexpired ones, so presence here means muted.
     view.mutes = new Map(mutes.mutes.filter((m) => m.entity_kind === 'device')
       .map((m) => [String(m.entity_id), m.until_ts]));
+    // The route only ever returns OPEN periods, so presence here means "in
+    // maintenance right now" — the same read `mutes` above gets.
+    view.maintenance = new Map((maintenance.maintenance || [])
+      .map((m) => [String(m.device_id), m]));
     view.checked = new Set([...view.checked].filter((id) =>
       view.alerts.some((a) => a.id === id)));
     const current = view.alerts.find((a) => a.id === view.selected);

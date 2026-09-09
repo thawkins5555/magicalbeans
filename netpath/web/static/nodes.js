@@ -32,6 +32,7 @@
     // device); its window and data are local to that dialog's own closure,
     // not pane-wide state — see deviceDialog.
     ifaces: [],
+    ifaceNote: '',
     ifaceSort: App.recallSort('nodes-ifaces', { key: 'if_index', descending: false }),
     events: null,
     // LLDP/CDP neighbours for the selected device's own ports (Tier 1 #5's
@@ -203,6 +204,19 @@
       `device are suppressed until ${escape(until)}">alerts muted</span>`;
   }
 
+  /* " · maintenance" when this device is in indefinite maintenance mode.
+     Its own tag beside mutedTag rather than folded into it: the two are
+     different mechanisms with different ends, and a device can be in both
+     at once. */
+  function maintenanceTag(row) {
+    if (!row.maintenance) return '';
+    const since = App.when(row.maintenance.started_ts);
+    const who = row.maintenance.started_by;
+    return ` · <span class="warn-text maintenance-tag" title="In maintenance ` +
+      `mode since ${escape(since)}${who ? ` (${escape(who)})` : ''} — no new ` +
+      `alerts and no mail until someone ends it; polling continues">maintenance</span>`;
+  }
+
   const COLUMNS = [
     { key: 'check', label: '', sortable: false, fixed: true, width: 34,
       // Named, because a column of identical unlabelled checkboxes is
@@ -219,7 +233,7 @@
       // who silenced a device an hour ago and later wonders why it has gone
       // quiet should not have to go looking for the reason.
       cell: (r) => `${escape(displayName(r))}<div class="ip-line">${deviceIpCell(r)}` +
-        `${mutedTag(r)}</div>` },
+        `${maintenanceTag(r)}${mutedTag(r)}</div>` },
     { key: 'group', label: 'Profile', width: 130, on: true,
       value: (r) => r._groupName || '',
       cell: (r) => escape(r._groupName || '\u2014') },
@@ -579,6 +593,18 @@
     bulkUpdate({ device_group_id: null });
   }
 
+  /* Two entry points, one call: `clear` picks the direction. A mixed
+     selection has no state to toggle from, which is why the bar carries two
+     buttons rather than one that changes its mind. */
+  async function bulkMaintenance(clear) {
+    const ids = [...view.devicesChecked];
+    if (!ids.length) return;
+    await App.post('/api/alerts/bulk-maintenance', { device_ids: ids, clear });
+    if (view.selected && ids.includes(view.selected)) await loadDetail();
+    view.devicesChecked.clear();
+    App.refreshNow('nodes');
+  }
+
   function bulkDeleteDevices() {
     const ids = [...view.devicesChecked];
     if (!ids.length) return;
@@ -631,7 +657,8 @@
   }
 
   /* A route into this tab: #/nodes, #/nodes?status=down, #/nodes?q=<mac>,
-     #/nodes?add=<ip>, #/nodes/device/<id>, #/nodes/device/<id>/port/<ifIndex>.
+     #/nodes?name=<name>, #/nodes?add=<ip>, #/nodes/device/<id>,
+     #/nodes/device/<id>/port/<ifIndex>.
      Called after refresh() has run, so view.devices is populated and the
      "select the first device if none is selected" rule below has already
      happened — which is exactly why the selection is applied here and not
@@ -642,7 +669,8 @@
     const query = opts.query || {};
     let filtered = false;
     for (const [id, key] of [['nd-filter-status', 'status'],
-                             ['nd-q', 'q']]) {
+                             ['nd-q', 'q'],
+                             ['nd-q', 'name']]) {
       if (query[key] === undefined) continue;
       const field = App.el(id);
       if (!field) continue;
@@ -651,6 +679,9 @@
       // A link that names a MAC address (IPAM's conflicts, for one) means
       // the same thing pressing Enter in this field does: run the MAC
       // search once the filtered device list is in, not just narrow it.
+      // `name` fills the same box and deliberately does not: a device
+      // called `beef01` is 4-12 hex characters, and a name link to it would
+      // otherwise land under "looks like an attempt at a MAC address".
       if (key === 'q') view.macSearchPending = true;
     }
     if (query.offline !== undefined) {
@@ -791,6 +822,49 @@
     App.el('nd-d-name').textContent = displayName(view.detail);
     App.el('nd-d-summary').innerHTML = deviceSummaryHtml(view.detail);
     drawWebLink(view.detail);
+    drawMaintenanceButton(view.detail);
+  }
+
+  /* The button's label says what pressing it will DO, so it reads as an
+     action rather than as a status the summary line already gives. */
+  function drawMaintenanceButton(d) {
+    const button = App.el('nd-maintenance');
+    if (!button) return;
+    const on = Boolean(d && d.maintenance);
+    button.textContent = on ? 'End maintenance' : 'Maintenance';
+    button.title = on
+      ? `In maintenance since ${App.when(d.maintenance.started_ts)} — press to end it`
+      : 'Silence new alerts and all mail for this device until someone ends it';
+  }
+
+  /* Turning it ON asks for a reason and says what maintenance does and does
+     not stop, because "indefinite" and "polling continues" are exactly the
+     two things an operator otherwise has to guess at. Turning it OFF is one
+     press, like lifting a mute — there is nothing to ask. */
+  async function toggleMaintenance() {
+    const d = view.detail;
+    if (!d || !App.canWrite('alerts')) return;
+    if (d.maintenance) {
+      await App.del('/api/alerts/maintenance', { device_id: d.id });
+      await loadDetail();
+      App.refreshNow('nodes');
+      return;
+    }
+    App.modal(`Maintenance mode — ${displayName(d)}`, `
+      <p class="hint">No new alerts and no mail of any kind for this device —
+      the recovery message included — until somebody ends it. There is no
+      expiry. Polling continues, so status, metrics and graphs stay live, and
+      alerts already open stay open and on the list.</p>
+      <label>Reason (optional) <input id="nd-maint-reason" type="text" maxlength="200"></label>`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Start maintenance', primary: true, onClick: async (box) => {
+        const reason = box.querySelector('#nd-maint-reason').value.trim();
+        App.closeModal();
+        await App.post('/api/alerts/maintenance', { device_id: d.id, reason });
+        await loadDetail();
+        App.refreshNow('nodes');
+      } },
+    ]);
   }
 
   /* The WEB button beside SSH opens a tunnel on this server (webDevice()
@@ -941,8 +1015,16 @@
       field('IP', d.ip),
       field('status', d.status ? `${d.status}${sinceText}` : ''),
       d.sys_uptime_s != null ? field('uptime', App.duration(d.sys_uptime_s)) : '',
-      // Sits right after the status, because it changes what the status
-      // means to the person reading it: quiet here is a choice, not health.
+      // Both sit right after the status, because they change what the
+      // status means to the person reading it: quiet here is a choice, not
+      // health. Maintenance goes first and does not replace the mute line —
+      // both can be true at once, and this one has no end date to print.
+      d.maintenance
+        ? field('maintenance', `since ${App.when(d.maintenance.started_ts)}` +
+                `${d.maintenance.started_by ? ` by ${d.maintenance.started_by}` : ''}` +
+                `${d.maintenance.reason ? ` — ${d.maintenance.reason}` : ''}`,
+                'nd-v warn-text')
+        : '',
       d.muted_until
         ? field('alerts', `muted until ${App.when(d.muted_until)}`,
                 'nd-v warn-text')
@@ -1484,13 +1566,19 @@
      drifts. `onOpen`, when given, replaces what clicking a row does.
      `snmpError` names why the list is empty when it is one: a device that
      has never answered SNMP shows headers over nothing exactly like one
-     with genuinely zero interfaces, and the two used to be indistinguishable. */
-  function drawIfaceTable(el, rows, deviceId, onOpen, snmpError) {
+     with genuinely zero interfaces, and the two used to be indistinguishable.
+     `note` names why the list is SHORT — the poller reads a capped number of
+     interfaces per poll — which is a different fact from an error and is
+     shown as one: the cap is a designed limit a big chassis sits over
+     permanently, and a red line that never clears is where the next real
+     error goes to hide. */
+  function drawIfaceTable(el, rows, deviceId, onOpen, snmpError, note) {
     const target = el || App.el('nd-if-table');
     const list = rows || view.ifaces;
     const id = deviceId != null ? deviceId : view.selected;
     const error = snmpError !== undefined ? snmpError
       : (view.detail || {}).snmp_error;
+    const shortNote = note !== undefined ? note : view.ifaceNote;
     const columns = ifaceColumns();
     // Only the pane's own table drives the shared sort state; sorting the
     // dialog's copy would silently reorder the pane behind it.
@@ -1509,6 +1597,30 @@
       : 'No interfaces on this device.');
     table.appendChild(body);
     App.wireRowKeyboard(body);
+    drawIfaceNote(target, shortNote);
+  }
+
+  /* The sentence under an interface table the poller's per-poll cap cut
+     short, added and removed in place beside the table it describes so both
+     copies of that table — the pane's and the dialog's — carry it without
+     either owning markup for it. */
+  function drawIfaceNote(table, note) {
+    const wrap = table.closest('.table-wrap') || table;
+    const parent = wrap.parentNode;
+    if (!parent) return;
+    let hint = parent.querySelector('.nd-if-note');
+    if (!note) {
+      if (hint) hint.remove();
+      return;
+    }
+    if (!hint) {
+      hint = document.createElement('p');
+      hint.className = 'hint nd-if-note';
+      parent.insertBefore(hint, wrap.nextSibling);
+    }
+    hint.textContent = `Not every interface is listed: ${note}. `
+      + 'The ones past the cap are left out rather than half-read, so their '
+      + 'counters and link events are not collected.';
   }
 
   /* ---------------------------------------------- device drill-down */
@@ -1680,6 +1792,7 @@
     let dialogIfaces = null;
     let dialogOptics = null;
     let dialogSnmpError = '';
+    let dialogIfaceNote = '';
 
     function paintDialogIfaces() {
       if (!dialogIfaces || !current()) return;
@@ -1696,7 +1809,7 @@
       // #modal-box — so the port dialog gets a way back to this one.
       drawIfaceTable(box.querySelector('#ndd-if-table'), dialogIfaces, deviceId,
         (row) => interfaceDialog(row, deviceId, () => deviceDialog(deviceId)),
-        dialogSnmpError);
+        dialogSnmpError, dialogIfaceNote);
     }
 
     Promise.all([
@@ -1711,6 +1824,7 @@
       renderVendorSection(box, device, deviceId, current);
       dialogIfaces = ifaces.interfaces || [];
       dialogSnmpError = device.snmp_error;
+      dialogIfaceNote = ifaces.note || '';
       paintDialogIfaces();
       drawEventTable(box.querySelector('#ndd-ev-table'), events);
     }).catch(() => {
@@ -3350,11 +3464,12 @@
     const device_group_id = App.controlOrSaved('nodes', 'nd-filter-devgroup');
     const status = App.el('nd-filter-status').value;
     const offline_only = App.el('nd-filter-offline').checked ? '1' : undefined;
+    const maintenance_only = App.el('nd-filter-maintenance').checked ? '1' : undefined;
     // The export route ignores paging entirely — it always answers with
     // every device the current filter matches, not just the page on
     // screen, which is the whole point of an export over a table read.
     App.exportCsv('/api/nodes/devices/export.csv',
-      { q, group_id, device_group_id, status, offline_only });
+      { q, group_id, device_group_id, status, offline_only, maintenance_only });
   }
 
   function exportInterfacesCsv() {
@@ -3484,7 +3599,8 @@
   const AVAIL_COLUMNS = [
     { key: 'name', label: 'Device', width: 200,
       value: (r) => r.name || r.ip || `#${r.device_id}`,
-      cell: (r) => `${escape(r.name || r.ip || `#${r.device_id}`)}` +
+      cell: (r) => App.deviceNameLink(r.name || r.ip || `#${r.device_id}`,
+                                      { id: r.device_id }) +
         (r.name && r.ip ? `<div class="ip-line">${escape(r.ip)}</div>` : '') },
     { key: 'devgroup', label: 'Group', width: 120,
       value: (r) => r._devGroupName || '',
@@ -3594,11 +3710,13 @@
     }
     const header = ['device_id', 'name', 'ip', 'group', 'availability_pct', 'up_s', 'down_s',
       'outage_count', 'longest_outage_s', 'mttr_s', 'still_down', 'currently_disabled',
-      'excluded_before_created_s', 'maintenance_excluded_s', 'mute_excluded_s', 'caveats'];
+      'excluded_before_created_s', 'maintenance_excluded_s',
+      'maintenance_mode_excluded_s', 'mute_excluded_s', 'caveats'];
     const rows = report.devices.map((r) => [r.device_id, r.name, r.ip, r._devGroupName || '',
       r.availability_pct, r.up_s, r.down_s, r.outage_count, r.longest_outage_s, r.mttr_s,
       r.still_down ? 1 : 0, r.currently_disabled ? 1 : 0, r.excluded_before_created_s,
-      r.maintenance_excluded_s, r.mute_excluded_s, (r.caveats || []).join('; ')]);
+      r.maintenance_excluded_s, r.maintenance_mode_excluded_s, r.mute_excluded_s,
+      (r.caveats || []).join('; ')]);
     const from = App.isoLocal(report.requested_start).slice(0, 10);
     const to = App.isoLocal(report.requested_end).slice(0, 10);
     saveReportCsv(`availability-${from}-to-${to}.csv`, header, rows);
@@ -3607,7 +3725,8 @@
   const TOPN_COLUMNS = [
     { key: 'device_name', label: 'Device', width: 180,
       value: (r) => r.device_name || r.device_ip || '',
-      cell: (r) => `${escape(r.device_name || r.device_ip || `#${r.device_id}`)}` +
+      cell: (r) => App.deviceNameLink(r.device_name || r.device_ip || `#${r.device_id}`,
+                                      { id: r.device_id }) +
         (r.device_name && r.device_ip ? `<div class="ip-line">${escape(r.device_ip)}</div>` : '') },
     { key: 'label', label: 'Metric', width: 170,
       value: (r) => r.label || r.key || '',
@@ -4078,8 +4197,19 @@
       const id = deviceId || 0;
       const r = id ? await App.post(`/api/nodes/devices/${id}/test`, body)
         : { ping: { ok: null }, snmp: { ok: null, error: 'Save the device first to test' } };
-      result.textContent = `ping: ${r.ping.ok === null ? 'n/a' : r.ping.ok ? `ok (${(r.ping.rtt_ms || 0).toFixed(0)} ms)` : 'no reply'}` +
-        `  ·  snmp: ${r.snmp.ok ? `ok (${r.snmp.sys_descr || ''})` : (r.snmp.error || 'n/a')}`;
+      /* The phases, the walk and the dropped count are what make a failing
+         poll self-explaining: a scalar GET alone reports ok against a
+         table walk that times out, an agent that refuses the ifTable, and
+         a community the agent drops without a word. */
+      const parts = [
+        `ping: ${r.ping.ok === null ? 'n/a' : r.ping.ok ? `ok (${(r.ping.rtt_ms || 0).toFixed(0)} ms)` : 'no reply'}`,
+        `snmp: ${r.snmp.ok ? `ok (${r.snmp.sys_descr || ''})` : (r.snmp.error || 'n/a')}`,
+      ];
+      (r.snmp.phases || []).forEach((p) => {
+        parts.push(`${p.name}: ${(p.ms || 0).toFixed(0)} ms${p.detail ? ` — ${p.detail}` : ''}`);
+      });
+      if (r.snmp.dropped) parts.push(`${r.snmp.dropped} datagram(s) rejected`);
+      result.textContent = parts.join('  ·  ');
     } catch (error) {
       result.textContent = `Error: ${error.message}`;
     }
@@ -4538,16 +4668,36 @@
         beside the button ends it at once.</p>
         <p><b>What is recorded.</b> The device's event log gets one line when
         a tunnel opens and one when it closes, with how many bytes crossed in
-        each direction — never what they were. The bytes are copied without
-        being read, which is also why a device on https keeps its own
-        certificate: your browser will name the device in the warning, not
-        this server.</p>
-        <p><b>Two things to expect.</b> A device page whose links are
-        absolute (<code>http://10.2.0.7/status</code>) will step outside the
-        tunnel when you follow one, because that address is the device's, not
-        this machine's. And the tunnel is on this host, so it shares the
-        browser's cookie jar with this application's own port — sign out of
-        the device's UI when you are done with it.</p>
+        each direction — never what they were. Nothing a page contains is
+        read or kept.</p>
+        <p><b>Following its links.</b> For a device on <code>http</code>, the
+        tunnel reads the headers each side sends. The device is asked for its
+        own address, so it builds its pages against itself, and the rest of
+        the request agrees — which is what lets a device that checks where a
+        form was posted from accept your login. Every address it names on the
+        way back — a redirect, a refresh, a cookie's domain — is put back onto
+        the tunnel, so a link written out in full
+        (<code>http://10.2.0.7/status</code>) stays inside it, which it did
+        not before 5.4.</p>
+        <p><b>Except a jump to https.</b> If a device on <code>http</code>
+        answers by sending you to <code>https://</code>, that address is left
+        as the device wrote it and your browser steps outside the tunnel to
+        follow it — which only works from a machine that already has a route
+        to the device. The device is telling you its interface is on HTTPS:
+        set the <b>WEB INTERFACE</b> scheme on Edit to <code>https</code> and
+        the tunnel will carry it.</p>
+        <p><b>A device on https is different.</b> Its traffic is carried
+        without being read, so its certificate is its own — your browser will
+        name the device in the warning, not this server — but nothing in it
+        can be adjusted either. A link or redirect written out in full will
+        step outside the tunnel and try to reach the device directly, which
+        only works from a machine that already has a route to it. The same
+        is true of anything on <code>http</code> the tunnel cannot make
+        sense of, such as a page that upgrades to a WebSocket: from that
+        point the connection is carried unread as well.</p>
+        <p><b>One thing to remember.</b> The tunnel is on this host, so it
+        shares the browser's cookie jar with this application's own port —
+        sign out of the device's UI when you are done with it.</p>
         <p><b>Who can use it.</b> Its own <b>web</b> permission, granted to
         nobody by default and to no account on upgrade: opening a listening
         port on this server into the management plane is not something the
@@ -5746,16 +5896,22 @@
     // Omitted entirely when unchecked, not sent as "false": App.get only
     // drops params equal to '', so the API reads presence, not value.
     const offline_only = App.el('nd-filter-offline').checked ? '1' : undefined;
+    // Same presence-not-value convention as offline_only above; filtered
+    // server-side, because the list is paged and a page filtered after the
+    // fact would disagree with its own total.
+    const maintenance_only = App.el('nd-filter-maintenance').checked ? '1' : undefined;
     // A changed filter always lands back on page one — the offset a
     // previous filter's page 4 pointed to is meaningless once the
     // matching set is different, and could be past the end of it.
-    const filterSig = JSON.stringify([q, group_id, device_group_id, status, offline_only]);
+    const filterSig = JSON.stringify([q, group_id, device_group_id, status, offline_only,
+                                      maintenance_only]);
     if (view.pageFilterSig !== null && view.pageFilterSig !== filterSig) view.pageOffset = 0;
     view.pageFilterSig = filterSig;
     view.pageLimit = Number(App.el('nd-page-size').value) || view.pageLimit;
     const generation = ++view.refreshGen;
     const [devices, groups, deviceGroups, mibs] = await Promise.all([
       App.get('/api/nodes/devices', { q, group_id, device_group_id, status, offline_only,
+                                      maintenance_only,
                                       limit: view.pageLimit, offset: view.pageOffset }),
       App.get('/api/nodes/groups'),
       App.get('/api/nodes/device-groups'),
@@ -6003,7 +6159,8 @@
        needs have been built; it assigns values from script, which fires no
        event, so these listeners do not fight it. */
     const CONTROLS = ['nd-q', 'nd-filter-group', 'nd-filter-devgroup',
-      'nd-filter-status', 'nd-filter-offline', 'disc-target', 'disc-pingonly'];
+      'nd-filter-status', 'nd-filter-offline', 'nd-filter-maintenance',
+      'disc-target', 'disc-pingonly'];
     App.rememberControls('nodes', CONTROLS);
     for (const btn of document.querySelectorAll('#page-nodes > .subtabs > .subtab')) {
       btn.onclick = () => {
@@ -6034,6 +6191,7 @@
       App.refreshNow('nodes');
     };
     App.el('nd-edit-device').onclick = editDevice;
+    App.el('nd-maintenance').onclick = toggleMaintenance;
     App.el('nd-ssh-device').onclick = sshDevice;
     App.el('nd-web-device').onclick = webDevice;
     // The "?" beside it, from the one helper that renders every help link.
@@ -6073,7 +6231,8 @@
     };
     App.filterBar('nodes', {
       text: ['nd-q'],
-      selects: ['nd-filter-group', 'nd-filter-devgroup', 'nd-filter-status', 'nd-filter-offline'],
+      selects: ['nd-filter-group', 'nd-filter-devgroup', 'nd-filter-status',
+                'nd-filter-offline', 'nd-filter-maintenance'],
       apply: 'nd-apply', clear: 'nd-clear',
       // A MAC lookup runs on a deliberate search, never on the five-second
       // refresh: it can open a dialog, and a dialog that reopens itself
@@ -6086,6 +6245,8 @@
     App.el('nd-bulk-profile').onclick = bulkSetProfile;
     App.el('nd-bulk-group').onclick = bulkSetGroup;
     App.el('nd-bulk-ungroup').onclick = bulkRemoveFromGroup;
+    App.el('nd-bulk-maintenance').onclick = () => bulkMaintenance(false);
+    App.el('nd-bulk-maintenance-off').onclick = () => bulkMaintenance(true);
     App.el('nd-bulk-delete').onclick = bulkDeleteDevices;
     App.el('nd-bulk-clear').onclick = bulkClearSelection;
     App.el('nd-d-range').onchange = (e) => {

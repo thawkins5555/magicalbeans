@@ -420,6 +420,199 @@ check("...and that it reaches severity 0 too, since the scale counts down",
 check("...and that reduced motion is honoured",
       "reduced motion" in ALERT_LIST)
 
+# ===========================================================================
+# 3. A device name is a way into Nodes (5.4.0).
+#
+# The Alerts list is the case this was reported against: the detail pane has
+# linked its Object since it was written, the list beside it printed the same
+# name as dead text, so triage meant reading a name off one table and typing
+# it into another. Run rather than read, for the same reason section 1 is:
+# what a `cell:` returns is a decision made in code -- an anchor, escaped
+# plain text, or (the thing this guards) an anchor built from a name that was
+# never escaped.
+# ===========================================================================
+
+NODES = read("nodes.js")
+
+
+def slice_between(text, start, end):
+    """`text` from `start` up to the next `end` -- "" when either is missing,
+    so a helper that does not exist yet arrives as a failed check rather than
+    as a ValueError at import time."""
+    try:
+        at = text.index(start)
+        return text[at:text.index(end, at)]
+    except ValueError:
+        return ""
+
+
+NAME_LINK = slice_between(APP, "  function deviceNameLink(",
+                          "  /* The dangerous failure this replaces:")
+ESCAPE_HTML = slice_between(APP, "  const escapeHtml = (s) =>",
+                            "  /* ------------------------------------------------- sortable")
+BUILD_ROUTE = slice_between(APP, "  function buildRoute(tab",
+                            "  /* Called by a module when its own selection changes.")
+CAN_READ = slice_between(APP, "  function canRead(module) {",
+                         "  function canWrite(module)")
+SORT_ROWS = slice_between(APP, "  const rowCollator = new Intl.Collator",
+                          "  /* Short screens get tighter chrome")
+COLUMNS = slice_between(ALERTS, "  const COLUMNS = [", "  const alertColumns = ")
+ACTIVATE = slice_between(NODES, "  async function activate(opts) {",
+                         "  async function loadDetail() {")
+
+check("App.deviceNameLink exists beside deviceLink: the rule about what a "
+      "device name links to, and who may be handed a link at all, lives in "
+      "one place rather than in each of eleven columns",
+      NAME_LINK != "")
+check("...and it is exported, so every module builds its cells through App "
+      "rather than hand-rolling the anchor again",
+      "deviceNameLink," in APP.split("  const api = {")[-1])
+
+LINK_HARNESS = """
+'use strict';
+const state = { permissions: %s };
+%s
+%s
+%s
+%s
+%s
+const escape = escapeHtml;
+const view = { checked: new Set() };
+const App = {
+  escapeHtml, buildRoute, canRead, deviceNameLink,
+  state: { severities: ['emergency', 'alert', 'critical', 'error',
+                        'warning', 'notice', 'info', 'debug'] },
+  agoCell: (ts) => String(ts === null || ts === undefined ? '' : ts),
+};
+%s
+const objectColumn = COLUMNS.find((c) => c.key === 'entity_label');
+const rows = [
+  { id: 1, entity_label: 'core-sw-1', device_id: 42, severity: 3, state: 'open' },
+  { id: 2, entity_label: 'DHCP scope <lab>', device_id: null, severity: 3, state: 'open' },
+  { id: 3, entity_label: 'beef01', device_id: null, severity: 3, state: 'open' },
+];
+console.log(JSON.stringify({
+  withId: objectColumn.cell ? objectColumn.cell(rows[0]) : '',
+  noId: objectColumn.cell ? objectColumn.cell(rows[1]) : '',
+  hasCell: Boolean(objectColumn.cell),
+  hasValue: Object.prototype.hasOwnProperty.call(objectColumn, 'value'),
+  sorted: sortRows(rows, 'entity_label', false, COLUMNS).map((r) => r.id),
+  nameOnly: deviceNameLink('beef01'),
+  nameQuoted: deviceNameLink('lab "sw" <1>'),
+  blank: deviceNameLink(''),
+}));
+"""
+
+ROUTE_HARNESS = """
+'use strict';
+const fields = {
+  'nd-q': { value: '' },
+  'nd-filter-status': { value: '' },
+  'nd-filter-offline': { checked: false },
+};
+const view = { selected: 7, macSearchPending: false, devices: [], ifaces: [] };
+const App = {
+  el: (id) => fields[id] || null,
+  canWrite: () => false,
+  refreshNow: async () => {},
+  toast: () => {},
+};
+function addDevice() {}
+function drawTable() {}
+async function loadDetail() {}
+function interfaceDialog() {}
+%s
+async function run(query) {
+  fields['nd-q'].value = '';
+  view.selected = 7;
+  view.macSearchPending = false;
+  await activate({ parts: [], query });
+  return { typed: fields['nd-q'].value, mac: view.macSearchPending };
+}
+console.log(JSON.stringify({
+  byName: await run({ name: 'beef01' }),
+  byQ: await run({ q: 'beef01' }),
+}));
+"""
+
+
+def link_results(permissions):
+    return run_js(LINK_HARNESS % (json.dumps(permissions), ESCAPE_HTML,
+                                  BUILD_ROUTE, CAN_READ, SORT_ROWS, NAME_LINK,
+                                  COLUMNS))
+
+
+RUNNABLE = all([NAME_LINK, ESCAPE_HTML, BUILD_ROUTE, CAN_READ, SORT_ROWS,
+                COLUMNS, ACTIVATE])
+if NODE is None:
+    print("SKIP  node is not on this machine, so the Object column was not run")
+elif not RUNNABLE:
+    check("the Alerts Object column and the Nodes name route can be run at "
+          "all -- App.deviceNameLink has to exist for either to be asserted",
+          False, "app.js has no deviceNameLink")
+else:
+    granted = link_results({"alerts": "read", "nodes": "read"})
+    check("the Object column renders an anchor to the device's own Nodes "
+          "pane when the alert resolves to one -- the list now goes where "
+          "the detail pane beside it has always gone",
+          granted["hasCell"]
+          and 'href="#/nodes/device/42"' in granted["withId"]
+          and granted["withId"].startswith("<a "),
+          granted["withId"])
+    check("...and plain escaped text when device_id is null: the device is "
+          "gone, or the alert was never about one, and searching Nodes for a "
+          "DHCP scope's label answers with the wrong device or none",
+          "<a " not in granted["noId"]
+          and "&lt;lab&gt;" in granted["noId"]
+          and "<lab>" not in granted["noId"],
+          granted["noId"])
+    check("the column declares no `value:` -- sortRows falls back to "
+          "row[key], the text the anchor wraps, so the list still sorts by "
+          "the name rather than by the markup around it",
+          granted["hasValue"] is False and granted["sorted"] == [3, 1, 2],
+          (granted["hasValue"], granted["sorted"]))
+
+    denied = link_results({"alerts": "read"})
+    check("an account without Nodes read is handed the same name as plain "
+          "text, not a link into a tab whose route would refuse it",
+          "<a " not in denied["withId"] and "core-sw-1" in denied["withId"],
+          denied["withId"])
+
+    check("a name with no id links to the Nodes search pre-filled with it",
+          granted["nameOnly"] == '<a class="linkish inline" '
+          'href="#/nodes?name=beef01">beef01</a>',
+          granted["nameOnly"])
+    check("...with the name escaped in the label and percent-encoded in the "
+          "href: this helper is the one place in the product that builds an "
+          "anchor out of a name somebody else chose",
+          "&quot;sw&quot;" in granted["nameQuoted"]
+          and "&lt;1&gt;" in granted["nameQuoted"]
+          and "%22sw%22" in granted["nameQuoted"],
+          granted["nameQuoted"])
+    check("...and an empty name is not an anchor to nowhere",
+          granted["blank"] == "", granted["blank"])
+
+    route = run_js(ROUTE_HARNESS % ACTIVATE)
+    check("#/nodes?name=<name> types the name into the search box exactly "
+          "as ?q= does", route["byName"]["typed"] == "beef01",
+          route["byName"])
+    check("...but does NOT arm the MAC search: a device called beef01 is "
+          "4-12 hex characters, so every name link to it would otherwise "
+          'land under "looks like an attempt at a MAC address"',
+          route["byName"]["mac"] is False, route["byName"])
+    check("...while ?q= still does, so IPAM's conflicts still run the MAC "
+          "search they link to",
+          route["byQ"]["typed"] == "beef01" and route["byQ"]["mac"] is True,
+          route["byQ"])
+
+check("the MAC note is still raised only behind macSearchPending, so the "
+      "flag checked above is the whole of what decides it",
+      "if (view.macSearchPending) {" in NODES
+      and NODES.count("resolveMacSearch(") == 2)
+check("IPAM's MAC link is untouched -- still the ?q= route, the one that "
+      "runs a MAC search",
+      "{ q: mac }" in read("ipam.js"))
+
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")

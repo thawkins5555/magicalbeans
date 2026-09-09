@@ -72,7 +72,7 @@ class _OneInterfaceAgent:
     since both scenarios here only ever need one row."""
 
     def __init__(self, *, if_speed: int, if_high_speed: int | None,
-                hc_out_answers: bool):
+                hc_out_answers: bool, if_type: int = 6):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("127.0.0.1", 0))
         self.port = self.sock.getsockname()[1]
@@ -82,6 +82,7 @@ class _OneInterfaceAgent:
         self.started_at = time.time()
         self.if_speed = if_speed
         self.if_high_speed = if_high_speed
+        self.if_type = if_type          # ethernetCsmacd unless a test says else
         self.hc_out_answers = hc_out_answers
         self.hc_in = 10_000_000
         self.hc_out = 10_000_000
@@ -167,6 +168,8 @@ class _OneInterfaceAgent:
             return enc_int(1)
         if oid == f"{IF['if_descr']}.1":
             return enc_octets("Gi0/1")
+        if oid == f"{IF['if_type']}.1":
+            return enc_int(self.if_type)
         if oid == f"{IF['if_admin_status']}.1":
             return enc_int(1)
         if oid == f"{IF['if_oper_status']}.1":
@@ -697,6 +700,98 @@ def test_reboot_note_has_no_empty_duration():
           f"({nodepoll_mod.reboot_uptimes(note)})")
 
 
+def test_interface_cap_is_a_note_not_an_error():
+    """A device over _MAX_INTERFACES is a known, designed limit, not a fault.
+
+    Reported as one it wrote snmp_error on the device row -- a red line in
+    the device pane beside "snmp ok" -- and a NODES log line every poll
+    interval for as long as the device stayed over the cap, which is where a
+    real error that arrives later goes unnoticed. The truncation still has to
+    reach the operator, so it travels as its own note: stored on the device
+    row, handed back with the interface list it explains, and logged once
+    when it starts rather than on every poll.
+    """
+    from netpath.web import api
+
+    reported = 900
+    folder = tmpdir("iface_cap_")
+    db = NodesDatabase(os.path.join(folder, "nodes.db"))
+    try:
+        group_id = db.ensure_default_group()
+        device_id = db.add_device("192.0.2.77", "core-chassis", group_id=group_id,
+                                  snmp_version=1, community="public",
+                                  ping_enabled=0, poll_interval_s=999,
+                                  snmp_timeout_s=1.0, snmp_retries=0)
+        poller = NodePoller(db)
+        lines = []
+        poller.log = types.SimpleNamespace(
+            add=lambda category, message, target="", detail="": lines.append(message))
+        # The two SNMP touchpoints inside _poll_interfaces, stubbed so the
+        # real one runs: a device that enumerates `reported` interfaces and
+        # answers every per-interface GET with nothing in particular.
+        poller._walk_indexes = lambda device, config, oid, raise_on_timeout=False: (
+            list(range(1, reported + 1)), True, "")
+        poller._interface_varbinds = lambda device, config, if_index, is_v1, want_ifx: (
+            {}, want_ifx)
+        poller._poll_snmp_scalars_with_credential = lambda device, config: (
+            config, {"sys_descr": "big chassis", "sys_name": "core-chassis"},
+            100_000, [])
+        for name in ("_poll_poe", "_poll_stp", "_poll_environment",
+                     "_check_vendor_mib", "_maybe_identify"):
+            setattr(poller, name, lambda *a, **k: None)
+
+        device = db.device(device_id)
+        # Unpacked by position so a build that has no note to give still
+        # reaches the assertions below and fails on what it actually got
+        # wrong, rather than on the arity.
+        read = poller._poll_interfaces(device, db.effective_config(device))
+        rows, complete, reason = read[0], read[1], read[2]
+        note = read[3] if len(read) > 3 else ""
+        check(len(rows) == 512,
+              f"the truncation itself is untouched: 512 interfaces read ({len(rows)})")
+        check(complete is False,
+              "...and the read is still marked incomplete, so the rows it "
+              "never reached are not deleted")
+        check(reason == "",
+              f"**the cap is NOT an SNMP error reason** (got {reason!r})")
+        check("900" in note and "512" in note,
+              f"...it is a note, naming both counts ({note!r})")
+
+        def poll():
+            row = db.device(device_id)
+            poller._poll_device(row, db.effective_config(row))
+
+        for _ in range(3):
+            poll()
+        row = db.device(device_id)
+        check(not row["snmp_error"],
+              f"**three polls leave snmp_error empty** ({row['snmp_error']!r})")
+        check(row["snmp_ok"] == 1, "...with SNMP itself still reported ok")
+        truncation_lines = [line for line in lines if "900" in line]
+        check(len(truncation_lines) == 1,
+              f"**the truncation is logged ONCE, not once per poll** "
+              f"({len(truncation_lines)} line(s) over three polls)")
+
+        payload = api.get_nodes_device_interfaces(
+            types.SimpleNamespace(nodes_db=db), {}, {}, device_id)
+        check("900" in (payload.get("note") or "") and "512" in payload["note"],
+              f"**the operator is still told the list is cut short**, beside "
+              f"the interface list itself ({payload.get('note')!r})")
+        check(len(payload["interfaces"]) == 512,
+              "...which is the table the note is about")
+
+        reported = 40
+        poll()
+        stored = db.device(device_id)
+        check(not ("interfaces_note" in stored.keys()
+                   and (stored["interfaces_note"] or "")),
+              "a device that drops back under the cap loses the note")
+        check(sum("no longer truncated" in line for line in lines) == 1,
+              "...and says so once")
+    finally:
+        db.close()
+
+
 def main():
     test_counter_rate_width_matters()
     test_format_ticks_divides_by_a_hundred()
@@ -709,6 +804,7 @@ def main():
     test_link_down_suppressed_after_reboot_when_identity_changed()
     test_link_down_recorded_without_reboot()
     test_fortipoll_walk_terminates_on_stuck_oid()
+    test_interface_cap_is_a_note_not_an_error()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} test(s) failed:")

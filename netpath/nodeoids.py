@@ -34,6 +34,9 @@ SYSTEM_SCALARS = {
 IF_TABLE = {
     "if_index":        "1.3.6.1.2.1.2.2.1.1",
     "if_descr":        "1.3.6.1.2.1.2.2.1.2",
+    # IANAifType, read for one decision only (interface_speed_bps): a
+    # port-channel's rate is a sum of members, so a port's ceiling misjudges it.
+    "if_type":         "1.3.6.1.2.1.2.2.1.3",
     "if_admin_status": "1.3.6.1.2.1.2.2.1.7",
     "if_oper_status":  "1.3.6.1.2.1.2.2.1.8",
     "if_phys_addr":    "1.3.6.1.2.1.2.2.1.6",

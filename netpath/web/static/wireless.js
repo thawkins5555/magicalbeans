@@ -92,7 +92,7 @@
         : dot(r.status, r.status)),
       value: (r) => (r.out_of_service ? 'out of service' : r.status) },
     { key: 'name', label: 'Name', width: 200, on: true,
-      cell: (r) => escape(r.name || r.wtp_id),
+      cell: (r) => App.deviceNameLink(r.name || r.wtp_id),
       value: (r) => (r.name || r.wtp_id || '').toLowerCase() },
     { key: 'station_count', label: 'Clients', width: 70, numeric: true, on: true },
     { key: 'model', label: 'Model', width: 120, on: true },
@@ -110,7 +110,10 @@
     { key: 'ip', label: 'IP', width: 130,
       cell: (r) => escape(r.ip || '—'), value: (r) => r.ip || '' },
     { key: 'controller_id', label: 'Controller', width: 140,
-      cell: (r) => escape(controllerName(r.controller_id)),
+      // linkController below reaches the controller's own pane because it
+      // can await the ip -> device lookup; a cell cannot, so it takes the
+      // name to the Nodes search instead.
+      cell: (r) => App.deviceNameLink(controllerName(r.controller_id)),
       value: (r) => controllerName(r.controller_id).toLowerCase() },
     { key: 'vdom', label: 'VDOM', width: 100 },
     { key: 'wtp_id', label: 'WTP id', width: 150 },

@@ -337,7 +337,8 @@
       cell: (r) => App.statusMark(r.alive ? 'ok' : (r.last_up ? 'fail' : 'none'),
                                   r.alive ? 'up' : (r.last_up ? 'down' : 'never')) },
     { key: 'hostname', label: 'Hostname', width: 220, on: true,
-      value: (r) => r.hostname || '', cell: (r) => escape(r.hostname || '') },
+      value: (r) => r.hostname || '',
+      cell: (r) => App.deviceNameLink(r.hostname) },
     { key: 'last_up', label: 'Last reply', width: 110, numeric: true, on: true,
       align: 'left', descendingFirst: true, value: (r) => r.last_up,
       cell: (r) => App.agoCell(r.last_up) },
@@ -558,7 +559,6 @@
       <fieldset><legend>SERVER</legend>
         <label>Hostname or address <input id="dh-address" placeholder="dhcp01.corp.local" value="${escape(s.address ?? '')}"></label>
         <label>Label <input id="dh-label" value="${escape(s.label ?? '')}"></label>
-        <p class="hint">Read-only: scopes and leases only, never a write.</p>
       </fieldset>
       <fieldset><legend>AUTHENTICATION</legend>
         <label>Username <input id="dh-username" placeholder="CORP\\svc-sappiwhere-ro" value="${escape(s.username ?? '')}"></label>
@@ -998,7 +998,7 @@
       cell: (r) => escape(r.mac || '') },
     { key: 'hostname', label: 'Hostname', width: 200, on: true,
       value: (r) => r.hostname || r.description || '',
-      cell: (r) => escape(r.hostname || r.description || '') },
+      cell: (r) => App.deviceNameLink(r.hostname || r.description) },
     { key: 'state', label: 'State', width: 140, on: true,
       value: (r) => r.address_state || '',
       cell: (r) => (r.is_reservation
@@ -1210,7 +1210,7 @@
         + 'resolved a name for matches that.</p>';
     }
     const rows = results.map((r) => `<tr>` +
-      `<td>${escape(r.hostname || '—')}</td>` +
+      `<td>${App.deviceNameLink(r.hostname) || '—'}</td>` +
       `<td style="white-space:nowrap">${escape(r.ip)}</td>` +
       `<td style="white-space:nowrap">${escape(r.mac || '—')}</td>` +
       `<td>${r.alive == null ? '<span class="hint">not a discovered host</span>'

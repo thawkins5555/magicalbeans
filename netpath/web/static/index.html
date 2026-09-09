@@ -82,8 +82,6 @@
 <section id="page-dashboard" class="page">
   <div class="dash-scroll pad-x pad-b pad-t">
     <h2>Dashboard</h2>
-    <p class="hint">Everything below is drawn from what your account can
-      read. Every count links through to the tab that can act on it.</p>
     <div id="dash-grid" class="dash-grid"></div>
   </div>
 </section>
@@ -131,6 +129,7 @@
         <option value="auth">auth failed</option><option value="unknown">unknown</option>
       </select></label>
       <label class="check"><input type="checkbox" id="nd-filter-offline"> Only offline</label>
+      <label class="check"><input type="checkbox" id="nd-filter-maintenance"> Only in maintenance</label>
       <button id="nd-apply">Search</button>
       <button id="nd-clear">Clear</button>
       <button id="nd-export-csv">Export CSV</button>
@@ -165,6 +164,12 @@
       <button id="nd-bulk-profile" data-requires-write="nodes">Set profile</button>
       <button id="nd-bulk-group" data-requires-write="nodes">Set group</button>
       <button id="nd-bulk-ungroup" data-requires-write="nodes">Remove from group</button>
+      <!-- Two buttons, not one toggle: a mixed selection has no state to
+           toggle from, and "Maintenance" that sometimes means off is worse
+           than two buttons that always mean what they say. `alerts`, not
+           `nodes` — this silences alerts. -->
+      <button id="nd-bulk-maintenance" data-requires-write="alerts">Maintenance on</button>
+      <button id="nd-bulk-maintenance-off" data-requires-write="alerts">Maintenance off</button>
       <button id="nd-bulk-delete" data-requires-write="nodes">Delete</button>
       <span class="grow"></span>
       <button id="nd-bulk-clear">Clear selection</button>
@@ -186,6 +191,10 @@
             <button id="nd-poll-now" data-requires-write="nodes">Poll now</button>
             <button id="nd-browse-oids">Browse OIDs</button>
             <button id="nd-edit-device" data-requires-write="nodes">Edit</button>
+            <!-- Maintenance mode lives in Alerts, so it carries the Alerts
+                 write gate even here: a Nodes-write operator without it
+                 must not be able to silence the fleet from this pane. -->
+            <button id="nd-maintenance" data-requires-write="alerts">Maintenance</button>
             <!-- Opens ssh.html on its own permission module: ConfigRX
                  write means "may back this device up", far narrower than an
                  interactive shell. -->
@@ -796,9 +805,6 @@
       <button id="ipam-edit-dhcp" data-requires-write="ipam">Edit</button>
       <button id="ipam-add-dhcp" class="primary" data-requires-write="ipam">Add</button>
     </div>
-    <p class="hint pad-x">Read-only: scopes and leases only, never a write. Authenticates as
-      whichever Windows account runs SappiWhere, or a matching Windows Credential Manager entry
-      for that server's name — nothing is stored here.</p>
    <div class="cols" data-splitter="ipam-dhcp">
     <aside class="sidebar pane" data-grow="1">
       <div class="bar">

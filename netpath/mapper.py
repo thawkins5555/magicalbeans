@@ -283,7 +283,13 @@ def link_identity(device_id, if_index, matched_id, matched_if_index) -> object:
     this cable, so guessing would risk pairing this row against the WRONG
     port on a multi-homed device. It gets its own per-row key instead,
     which draws as a second, one-directional line rather than a wrong
-    guess at which port to fold it onto."""
+    guess at which port to fold it onto.
+
+    That per-row key is not the last word: `_fold_name_matched` runs after
+    every row is keyed and folds a name-matched row onto a MAC-matched link
+    that already owns this row's own local port and faces the matched
+    device — the CDP/LLDP pair for one cable, where the evidence for pairing
+    comes from the local port rather than from a guess about the far end."""
     if matched_if_index is not None:
         return frozenset({(device_id, if_index), (matched_id, matched_if_index)})
     return ("name-match", device_id, if_index)
@@ -316,6 +322,68 @@ def _port_vlans(port_vlans: dict, device_id, if_index):
     return vlan_ids, native
 
 
+def _far_end(link, device_id, if_index):
+    """The (device_id, if_index) at the OTHER end of `link` from the given
+    endpoint — what a fold checks to know two rows face each other rather
+    than merely share one port."""
+    if (link["a_device_id"], link["a_if_index"]) == (device_id, if_index):
+        return link["b_device_id"], link["b_if_index"]
+    return link["a_device_id"], link["a_if_index"]
+
+
+def _fold_name_matched(links_by_key: dict) -> None:
+    """Fold a name-matched link onto the MAC-matched link for the same cable.
+
+    A Cisco switch answers BOTH tables for one cable and the two rows do not
+    look alike: the LLDP walker writes a MAC chassis id WITH its subtype, so
+    nodesdb's chassis-MAC join resolves the far end's own port and the row
+    keys on the endpoint PAIR; the CDP walker writes no subtype at all and a
+    device NAME as the chassis id, so only the sysName join fires and the row
+    falls to ("name-match", device_id, if_index). Two keys, two links, one
+    cable, drawn on identical coordinates — that is the doubling.
+
+    Safe on exactly one fact: ONE LOCAL PORT CARRIES ONE CABLE. A row folds
+    only onto a link that already has this row's own (device_id, if_index) as
+    an endpoint AND whose far end is the device this row matched, so it can
+    never merge two genuine links. A SECOND pass over the finished dict,
+    because the two rows arrive in either order; where several links share the
+    endpoint (one port facing more than one matched neighbour, through a hub)
+    the lowest link id wins, so the answer does not follow row order either.
+    The reciprocal name-ONLY case is deliberately left as two links, for
+    `link_identity`'s own reason: nothing says those two ports face each
+    other."""
+    by_endpoint: dict = {}
+    for key, link in links_by_key.items():
+        if not isinstance(key, frozenset):
+            continue
+        by_endpoint.setdefault((link["a_device_id"], link["a_if_index"]), []).append(link)
+        by_endpoint.setdefault((link["b_device_id"], link["b_if_index"]), []).append(link)
+
+    name_matched = [key for key in links_by_key
+                    if isinstance(key, tuple) and key and key[0] == "name-match"]
+    for key in name_matched:
+        link = links_by_key[key]
+        _, device_id, if_index = key
+        candidates = [other for other in by_endpoint.get((device_id, if_index), ())
+                      if _far_end(other, device_id, if_index)[0] == link["b_device_id"]]
+        if not candidates:
+            continue
+        target = min(candidates, key=lambda one: one["id"])
+        target["protocols"] |= link["protocols"]
+        target["vlans"] |= link["vlans"]
+        if target["native_vlan"] is None:
+            target["native_vlan"] = link["native_vlan"]
+        target["seen_ts"] = max(target["seen_ts"], link["seen_ts"])
+        # The far-end label moves across only when the surviving link has
+        # none: it resolved its far end through port_label, while a
+        # name-matched row carries only the raw string the neighbour sent.
+        far_side = "b" if (target["a_device_id"], target["a_if_index"]) \
+            == (device_id, if_index) else "a"
+        if not target[f"{far_side}_port"] and link["b_port"]:
+            target[f"{far_side}_port"] = link["b_port"]
+        del links_by_key[key]
+
+
 def assemble_links(neighbour_rows, *, port_vlans, port_label, on_map, now,
                    stale_after_s=None) -> tuple[list[dict], list[dict]]:
     """Turn raw LLDP/CDP neighbour rows into the links and peers one map
@@ -338,6 +406,10 @@ def assemble_links(neighbour_rows, *, port_vlans, port_label, on_map, now,
          (`on_map(b_device_id)` or `on_map(peer_key)`): a link draws only
          when BOTH ends are on the map, but that check must not gate step 4
          or a not-yet-placed peer would never be offered at all.
+      6. once every row has been read, `_fold_name_matched` collapses a
+         name-matched link onto the MAC-matched link for the same cable —
+         the CDP-plus-LLDP double. A second pass, not a per-row step,
+         because the two rows arrive in either order.
 
     `on_map` is called with TWO different argument types, and must answer
     for both: an `int` device id (every call at step 2, and step 5 for a
@@ -458,6 +530,8 @@ def assemble_links(neighbour_rows, *, port_vlans, port_label, on_map, now,
         if link["native_vlan"] is None and a_native is not None:
             link["native_vlan"] = a_native
         link["seen_ts"] = max(link["seen_ts"], seen_ts)
+
+    _fold_name_matched(links_by_key)
 
     links = []
     for link in links_by_key.values():

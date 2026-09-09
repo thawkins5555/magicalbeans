@@ -1486,6 +1486,121 @@ check("PUBLISHED_THRESHOLD_KEYS" in _ALERTS46
 check("if (!isPublished) {" in _ALERTS46,
       "and the save handler does not read inputs it did not render")
 
+# ---------------------------------------------------------------------------
+# 47. ALL TABS (5.4.0): a device name shown anywhere is a way into Nodes, and
+#     exactly one function decides what that way is.
+#
+# Eleven columns across seven modules printed a device's name as dead text
+# while the pane beside them linked the same name. The rule they now share is
+# not obvious from any one of them — link to the device's own pane where an
+# id is known, to the Nodes search where only a name is, and to neither for
+# an account without Nodes read — so it lives in App.deviceNameLink and the
+# call sites do not get to restate it.
+check("function deviceNameLink(" in APP and "deviceNameLink," in APP,
+      "App.deviceNameLink exists and is exported")
+check("canRead('nodes')" in APP.split("function deviceNameLink(")[-1][:600],
+      "...and it is the helper, not each caller, that refuses to hand a link "
+      "into Nodes to an account that cannot open Nodes")
+_NAME_ROUTE_BUILDERS = [name for name in MODULES
+                        if re.search(r"buildRoute\('nodes', \[\], \{ name:", read(name))]
+check(_NAME_ROUTE_BUILDERS == ["app.js"],
+      "the #/nodes?name= route is built in app.js alone; a module that built "
+      "it itself would be a second copy of the permission rule (found in: %s)"
+      % (", ".join(_NAME_ROUTE_BUILDERS) or "nothing"))
+
+# The call sites, by the cell each one is. NetFlow is deliberately absent:
+# its rows name flow endpoints by address, not fleet devices by name.
+NAME_LINK_SITES = {
+    "alerts.js": ["{ key: 'entity_label', label: 'Object'"],
+    "nodes.js": ["{ key: 'name', label: 'Device'",
+                 "{ key: 'device_name', label: 'Device'"],
+    "configrx.js": ["{ key: 'device', label: 'Device'"],
+    "mapper.js": ["suggestionName(s)", "candidateLink"],
+    "events.js": ["{ key: 'source', label: 'Source'",
+                  "{ key: 'source_name', label: 'Source name'"],
+    "wireless.js": ["{ key: 'name', label: 'Name'",
+                    "{ key: 'controller_id', label: 'Controller'"],
+    "ipam.js": ["{ key: 'hostname', label: 'Hostname', width: 220",
+                "{ key: 'hostname', label: 'Hostname', width: 200"],
+}
+for _name, _anchors in sorted(NAME_LINK_SITES.items()):
+    _body = read(_name)
+    for _anchor in _anchors:
+        _at = _body.find(_anchor)
+        check(_at != -1 and "App.deviceNameLink(" in _body[_at:_at + 500],
+              "%s builds its device name through App.deviceNameLink (%s)"
+              % (_name, _anchor))
+check("App.deviceNameLink(" in read("ipam.js").split("function resultsTable(")[-1][:900],
+      "ipam.js's global-search results table links its hostnames too")
+check("App.deviceNameLink(" not in read("netflow.js"),
+      "NetFlow is deliberately left out: a flow endpoint is an address seen "
+      "on the wire, not a device on the fleet")
+
+# The two routes are not interchangeable, and the one that runs a MAC search
+# must stay the one IPAM's conflicts link.
+check("['nd-q', 'name']" in NODES and "#/nodes?name=<name>" in NODES,
+      "nodes.js's route parser reads ?name= into the search box")
+check(re.search(r"if \(key === 'q'\) view\.macSearchPending = true;", NODES)
+      is not None,
+      "...and arms the MAC search for ?q= only, so a device whose name is "
+      "hex does not get told it typed a bad MAC address")
+
+
+# ------------------------------------------- 5.4 indefinite maintenance mode
+#
+# Five surfaces, four of which fail silently if they regress: a tag that is
+# never called renders nothing, a signature that omits the state never
+# rebuilds the pane, a button without its gate is offered to an account the
+# server will 403, and a CSV column dropped from one of the two lists shifts
+# every value after it by one.
+_NODES54 = read("nodes.js")
+_ALERTS54 = read("alerts.js")
+
+check("function maintenanceTag(" in _NODES54,
+      "nodes.js defines maintenanceTag, the device list's own answer to "
+      "'why is this one quiet' for maintenance mode")
+check("mutedTag(" in _NODES54 and "${maintenanceTag(r)}${mutedTag(r)}" in _NODES54,
+      "the name column calls BOTH tags -- mutedTag was left untouched, and a "
+      "device that is muted AND in maintenance shows both")
+check("nd-filter-maintenance" in _NODES54
+      and "maintenance_only" in _NODES54,
+      "the Only-in-maintenance checkbox sends maintenance_only by presence, "
+      "the same convention offline_only already uses")
+_FILTER_SIG = re.search(r"const filterSig = JSON\.stringify\(\[(.*?)\]\);",
+                        _NODES54, re.S)
+check(bool(_FILTER_SIG) and "maintenance_only" in _FILTER_SIG.group(1),
+      "...and it is part of the filter signature, so ticking it resets the "
+      "list to page one instead of holding an offset into a different set")
+
+check("maint ? maint.started_ts : ''" in _ALERTS54,
+      "alerts.js puts the maintenance state in view.detailSignature -- the "
+      "pane is only rebuilt when that string changes, so a state left out "
+      "of it would show the previous answer until something else moved")
+check("App.get('/api/alerts/maintenance')" in _ALERTS54,
+      "...and the maintenance fetch rides in the same Promise.all as the "
+      "mutes, so the two can never disagree for a tick")
+check("alerts-d-end-maintenance" in _ALERTS54
+      and "alerts-d-unmute" in _ALERTS54,
+      "the Alerts detail pane offers End maintenance, and the mute block "
+      "beside it is untouched")
+
+for element in ("nd-maintenance", "nd-bulk-maintenance", "nd-bulk-maintenance-off"):
+    pattern = re.compile(r'id="%s"[^>]*data-requires-write="alerts"' % element)
+    check(bool(pattern.search(INDEX)),
+          f"index.html carries #{element} gated data-requires-write=\"alerts\" "
+          "-- maintenance silences alerts, so it is the Alerts writer's to set, "
+          "not the Nodes writer's")
+
+_AVAIL_CSV = re.search(r"const header = \[\'device_id\'.*?\];", _NODES54, re.S)
+_AVAIL_CSV = _AVAIL_CSV.group(0) if _AVAIL_CSV else ""
+for column in ("maintenance_excluded_s", "maintenance_mode_excluded_s",
+               "mute_excluded_s"):
+    check(column in _AVAIL_CSV,
+          f"the availability CSV header carries {column} -- the three "
+          "suppression buckets stay separate, because the export is read to "
+          "answer WHICH mechanism took a device out of service")
+
+
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

@@ -222,6 +222,27 @@ mouse. A pane splitter can be moved from the keyboard: Tab to it, arrow keys
 move it 5 % (1 % with Shift), Home and End park it, Enter resets it, exactly
 as a double-click does. A column header resizes with Alt+Left/Right.
 
+### A device name is a way to that device
+
+Wherever a device is named outside Nodes, the name is a link. Where the page
+already knows which device it is — an alert's **Object**, the Device column
+of the availability and Top-N reports, ConfigRX's search results, MAPPER's
+upstream suggestions — the link opens that device's own pane in **Nodes**.
+Where only a name is on the row — a Syslog or SNMP-trap **Source** and
+**Source name**, an access point and its **Controller** in FORTI-AP, a
+**Hostname** in IPAM's hosts, DHCP leases and Find results — it opens Nodes
+with the search box already filled in and the first match selected, which is
+what typing the name there by hand would have done.
+
+Two things it deliberately does not do. It is never a MAC address search, so
+a device named in hex (`beef01`) is looked up as the name it is rather than
+answered with "that looks like an attempt at a MAC address" — IPAM's
+conflicts still link a MAC to the MAC search, which is a different link. And
+an account with no **Nodes** read sees the same names as plain text: no link
+is offered into a tab that would refuse to open. NetFlow is left out on
+purpose; the addresses in a flow record are endpoints seen on the wire, not
+devices on the fleet.
+
 ### Accessibility
 
 Keyboard and screen-reader support are built into the shell, not layered
@@ -475,6 +496,37 @@ own subtabs.
   failing as down on its own, the setting is in Nodes settings and can be
   overridden per device and per profile. Either way, the "consecutive
   failures before down" grace window is unchanged.
+- **A slow or partial interface walk degrades the interface list, not the
+  device.** A chassis with several hundred ports can run out of the poll's
+  SNMP budget half way down its ifTable. That now leaves the device UP
+  with its SNMP state intact, its interface list marked incomplete (so the
+  ports the walk never reached keep their rows, their counters and their
+  link history rather than being deleted and re-created), and the reason
+  shown beside the device — "the table walk was cut short after N rows".
+  It used to fail the whole device's SNMP, which read as "L3 and community
+  confirmed, sysDescr populated, polling still failing". A walk that got
+  nothing at all is still a failure: the device stopped answering.
+- **A device with more than 512 interfaces says so under its interface
+  table, not as an SNMP error.** One poll reads 512 interfaces; a core
+  chassis or a firewall with per-VLAN subinterfaces can report more. That
+  cap is a designed limit, not a fault, so it is a sentence under the
+  interface list naming both counts, and one log line when a device crosses
+  the cap rather than one on every poll — a permanent red error on the
+  device row is where the next real one would have gone unnoticed.
+- **A table walk the agent refuses now says so.** An agent that answers a
+  walk with `genErr`, `noSuchName` or any other error-status — what a
+  PAN-OS/net-snmp box does for a subtree it will not serve — used to end
+  the walk silently, leaving a device that read as perfectly healthy with
+  zero interfaces and no error at all. The status is now named on the
+  device row, in the event log, and in the empty interface table.
+- **An SNMP community is trimmed when saved, and cannot contain a comma.**
+  A pasted trailing space used to travel on the wire verbatim, and a
+  net-snmp agent (so PAN-OS) drops a datagram with the wrong community
+  without answering — so a stray space presented as an unreachable device.
+  A comma is refused with a message pointing at ADDITIONAL CREDENTIALS,
+  which is where several communities belong: discovery split a comma-
+  separated list and polling did not, so `public,pa-ro` in one field made
+  discovery succeed and every poll of the device time out.
 - **The displayed name prefers the SNMP hostname** (`sysName`), falling
   back to the manually entered name, then the IP — so a discovered device
   names itself. Each device's Edit form has a "Displayed name" choice
@@ -553,7 +605,16 @@ own subtabs.
   uptime" lines from them.
 - **Test** checks ping and SNMP against whatever is currently typed in
   the add/edit form, before it is saved, the same idiom IPAM's DHCP
-  server test already uses.
+  server test already uses. It runs the poll's own first table walk as
+  well as the system scalars, and reports each phase separately: how long
+  the scalars took, how long the ifIndex walk took, how many interfaces it
+  reached in how many requests, whether GETBULK was accepted and at what
+  repetition count, and any error-status the agent answered. A test made
+  of six scalars alone reported OK against every one of the faults above.
+  It also reports how many replies arrived and were thrown away (wrong
+  peer, undecodable, or answering a request we were not waiting on) — a
+  timeout with rejected datagrams is a different fault from a timeout
+  without one.
 - **A whole site can be imported in one call, from 4.47.0.** A JSON array
   or pasted CSV of up to 2,000 rows, the same fields the single-device
   form accepts, every row validated before any of them is written, with a
@@ -847,12 +908,34 @@ timeout is shorter — closes after a minute if nothing ever connects, closes
 when you sign out, and closes the moment the permission is taken away;
 **Close** beside the button ends it at once. Because it opens a listening
 port on this server it has its own **web** permission, granted to nobody by
-default and to no account on upgrade. The bytes are copied without being
-read, so a device on `https` presents its own certificate (your browser will
-name the device in the warning, not this server), a page whose links are
-absolute steps outside the tunnel when you follow one, and the device's
-event log records how many bytes crossed in each direction and never what
-they were. The port range the tunnels bind is set under **Settings →
+default and to no account on upgrade. The device's event log records how
+many bytes crossed in each direction and never what they were.
+
+**A tunnel to an `http` device now reads the headers it carries**, which is
+what stops a device rebuilding its own address out of the name and port it
+was reached on. Before 5.4.0 the tunnel copied bytes without looking at
+them, so a device that built its redirect from the `Host:` header it was
+sent — this server's name, the tunnel's port dropped — answered `Location:
+https://<this server>/home.asp` and the browser followed it to the
+management interface's own port. The tunnel now asks the device for its own
+address and port, so it builds its pages against itself — and the rest of the
+request says the same, so a device that checks where a form was posted from
+still sees one address rather than two. It maps every address the answer
+names — `Location`, `Content-Location`, `Refresh` and a cookie's `Domain=` —
+back onto the tunnel's own origin, whether the device named this server or
+itself. A page whose links are written out in full therefore stays inside the
+tunnel, which it did not before. An `http` device that sends the browser to
+`https://` is the exception, and deliberately so: that address is left alone,
+because the tunnel does not carry TLS and pretending otherwise would only
+send the browser round the same redirect until it gave up. Bodies are
+streamed through untouched and never held, so a firmware image crosses byte
+for byte. A device on `https` is still carried unread — its certificate is
+its own, and your browser names the device in the warning rather than this
+server — and so its absolute links still step outside the tunnel; so is any
+`http` connection the framing cannot account for (a WebSocket upgrade, a
+`CONNECT`, a start line that is not one, a body of undeclared length or of
+two declared at once), which
+falls back to the old byte copy for the rest of that connection. The port range the tunnels bind is set under **Settings →
 Sign-in**; it needs an inbound TCP rule in this host's firewall for browsers
 on other machines to reach it.
 
@@ -957,6 +1040,31 @@ the poller has not yet walked. Which SNMP identity
 fields the header shows (sysDescr, sysName, sysObjectID, contact,
 location, vendor, SNMP version) is chosen in Nodes → Settings; the IP,
 status and any SNMP error always show.
+
+**A port's speed is sanity-checked against what Ethernet can actually be.**
+Speed is read from ifHighSpeed (megabits per second) in preference to
+ifSpeed, because ifSpeed cannot express anything above about 4.29 Gb/s at
+all. Some agents answer ifHighSpeed in kilobits instead — seen on a
+linecard or two rather than a whole device, which is why only a few ports
+were ever wrong — and a 10 Gb/s port then read as **10.0 Tbps**, with its
+utilisation correspondingly stuck near 0 %. A reading that would put the
+port above 1.6 Tb/s, or that disagrees with an unsaturated ifSpeed by
+orders of magnitude, is no longer taken at face value: the device's own
+exact ifSpeed wins where it can answer, and where it cannot the reading is
+interpreted in the units it was evidently given. A genuine 400G or 800G
+port is unaffected and reads at its real speed.
+
+Two readings that look implausible but are not are recognised rather than
+rescaled. A **port-channel** is as fast as the ports in it, so an 8x400G
+bundle legitimately reports 3.2 Tb/s: the interface's type is read, and an
+aggregate is judged against the largest bundle that can exist (16x800G)
+instead of a single port's ceiling. And some agents report ifSpeed
+truncated to 32 bits rather than saturated, so a 400G port can answer a
+correct ifHighSpeed alongside an ifSpeed of 568 Mb/s — that is the same
+number with its top bits gone, not the device contradicting itself, and it
+is now recognised as such instead of dragging the port down to 568 Mb/s
+(where its utilisation pinned at 100 % and its throughput graph went
+blank).
 
 **Poll now shows that it is running.** A poll is handed to a worker
 thread, so the button reports *Queued* or *Polling* until the device's own
@@ -1183,10 +1291,11 @@ window — with outage count, longest outage and mean time to recovery, and
 **a top-N ranking** of any metric the poller records by peak or mean over
 the same kind of window, which is how "which twenty links came closest to
 saturation" gets answered. Availability is built on the same status-segment
-history the device pane's own timeline reads, with four different ways a
+history the device pane's own timeline reads, with five different ways a
 gap in it is deliberately *not* counted as downtime — the device not having
-existed yet, a maintenance window, a mute still on file, the poller itself
-having gone quiet — each accounted for explicitly rather than silently
+existed yet, a maintenance window, an indefinite maintenance-mode period,
+a mute still on file, the poller itself having gone quiet — each accounted
+for explicitly rather than silently
 assumed. A whole-fleet top-N ranking over more than a week is refused
 outright rather than left to answer slowly; a shorter window or a narrower
 device list gets an answer. No tab or dialog reads either report yet — both
@@ -1214,6 +1323,13 @@ alerts and optionally emailing about them.
   highlight in place but still. Motion therefore means "nobody has picked
   this up yet" rather than constant noise. A viewer whose system asks for
   reduced motion gets the highlight without the movement.
+- **The Object column opens the device in Nodes.** The same link the detail
+  pane beside it has always carried, now on every row, so triaging a list
+  does not mean reading a name off one table and typing it into another. An
+  alert whose device has been removed from Nodes, or that was never about a
+  device — a DHCP scope, an access point — keeps its label as plain text
+  rather than offering a link to nowhere, and sorting on the column still
+  sorts by the name.
 - **Alerts can be acknowledged or resolved individually or in bulk.**
   Every row carries a **checkbox** in its first column: tick the rows you
   want, or use **Select all**. A plain click still opens the detail pane,
@@ -1345,6 +1461,40 @@ alerts and optionally emailing about them.
   list shows the coverage the same way it shows a mute, so a planned
   cutover never looks like an unexplained gap in monitoring. Alerts →
   **Maintenance** is where they are created and ended.
+- **Maintenance mode takes a device out of service indefinitely.** The
+  third silencing mechanism, beside the 24-hour mute and the scheduled
+  maintenance window, for the box that is off the network until somebody
+  says otherwise: a decommissioning, a chassis away for RMA, a site being
+  rebuilt. It has **no expiry and no cap** — it stays on until a person
+  ends it, which is the whole point, and a request that tries to give it
+  `hours` or an end time is refused with a message naming the mute and the
+  maintenance window instead, rather than quietly dropping the number and
+  leaving somebody believing in a four-hour maintenance that does not
+  exist. While it is on, no new alert is raised for the device and **no
+  notification of any kind** goes out — the recovery mail and the
+  every-N-minutes reminder included. Alerts already open stay open and on
+  the list, and still resolve normally, exactly as a mute leaves them.
+  **Ending it hands back the notifications it swallowed**: an alert whose
+  first notice the maintenance took, still open and unacknowledged when the
+  maintenance ends, is notified then — once — so a two-minute cable move no
+  longer costs an alert its only notice. One that had already been notified
+  before the maintenance began is not repeated.
+  **Polling continues**: status, metrics, graphs and the event history stay
+  live, because "stop telling me about it" is not "stop watching it". Who
+  turned it on, when, and an optional reason are recorded, and so is who
+  turned it off — and the record is kept after it ends, which is what lets
+  the Availability report subtract that time from downtime later, in its
+  own column, the way it already does for a scheduled window. It is set
+  from the **Maintenance** button in the Nodes device pane (single) or the
+  bulk bar (a whole selection or group, on or off), ended from either of
+  those or from the Alerts detail pane, and shown as a tag in the device
+  list, in the device summary, in the alert detail and in the devices CSV.
+  Nodes has an **Only in maintenance** filter for finding what has been
+  left in it. Setting it needs **Alerts** write, not Nodes write — it
+  silences alerts, so it is gated the way the mute is — and a read-only
+  account can see it without being able to change it. The 24-hour mute and
+  the maintenance windows are both unchanged and still there; a device can
+  be under any combination of the three at once.
 - **Un-acknowledge, single and bulk**, undoes an Acknowledge the same way
   Resolve is undone by the alert simply re-opening — the button and its
   gate sit beside Acknowledge in the detail pane and the bulk actions bar.
@@ -2833,6 +2983,18 @@ like any other module.
   a managed device that doesn't answer Q-BRIDGE-MIB or CISCO-VTP-MIB
   contributes nothing there either, though the link itself still draws as
   long as a neighbour report exists.
+- **A cable both protocols report is one line, not two.** A Cisco switch
+  answers CDP and LLDP for the same neighbour on the same port, and the
+  two reports do not look alike — LLDP identifies the far end by chassis
+  MAC, CDP by device name — so the map used to draw one cable as two lines
+  on identical coordinates, each painting its own VLAN count and its own
+  port labels on top of the other's. The two reports now fold into one
+  link listing both protocols, one VLAN set and one port label at each
+  end, and the status bar's link count, the VLAN table's per-VLAN count
+  and the CSV export all count the cable once. The same fold covers a
+  chassis MAC that a device repeats across several of its own interfaces
+  (a stack's base MAC, an SVI beside its port-channel), which produced the
+  same doubled line by a different route.
 - **A link's tooltip names each end's own trunk/access mode, and calls out
   a native-VLAN mismatch by name.** Alongside every VLAN the link
   carries, hovering or clicking shows the mode each device itself reports

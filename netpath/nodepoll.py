@@ -31,7 +31,7 @@ from .nodediscover import DiscoveryJob
 from .nodeoids import DEFAULT_SNMP_PORT
 from .nodesdb import NodesDatabase, detected_vendor
 from .snmppoll import (
-    PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_REPORT, Response,
+    ERROR_STATUS, PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_REPORT, Response,
     SnmpError, SnmpTimeout, SnmpUnsupported, build_request, build_v3_request,
     decode_response, discovery_probe,
 )
@@ -355,11 +355,27 @@ def credential_for(config: dict) -> tuple[str | None, str | None, str | None]:
     returns (community_or_user, auth_proto, auth_password) with the DPAPI
     blob decrypted immediately before use and never cached. `config` is
     already the effective_config() merge of a device's own overrides over
-    its group's defaults."""
+    its group's defaults.
+
+    The identity is stripped, and a v1/v2c community carrying a comma is
+    refused rather than transmitted. Both because an agent that dislikes
+    the community it was sent does not say so — net-snmp (so PAN-OS)
+    drops the datagram — so a pasted trailing space, or the
+    comma-separated list that only nodediscover.py ever split, arrives as
+    a timeout indistinguishable from an unreachable device.
+    nodesdb.clean_community refuses the same comma at save time; this is
+    what a database written before it did still reads as."""
     if int(config.get("snmp_version", 1)) == 3:
         identity = config.get("v3_user")
     else:
         identity = config.get("community")
+        if identity and "," in identity:
+            raise SnmpError(
+                f"the community {identity!r} contains a comma — one device "
+                f"is polled with one community; put the alternates in the "
+                f"polling profile's credentials instead")
+    if isinstance(identity, str):
+        identity = identity.strip()
     auth_proto = config.get("v3_auth_proto")
     blob = config.get("v3_auth_pass_enc")
     password = None
@@ -399,6 +415,70 @@ def counter_rate(previous: int | None, previous_ts: float, current: int | None,
     if speed_bps and rate * 8 > speed_bps * 1.3:
         return None
     return rate
+
+
+IF_SPEED_SENTINEL = 4_294_967_295
+# 1.6 TbE, the next rate the standard defines: a full doubling above 800GbE,
+# the fastest Ethernet port actually shipping, and still three orders below
+# what a kbit/s-for-Mbit/s ifHighSpeed makes of a 10G port.
+MAX_PLAUSIBLE_SPEED_BPS = 1.6e12
+# ...but that ceiling describes a PHYSICAL PORT, and an aggregate's rate is
+# the sum of its members: the bound for one of those is the largest bundle
+# that can exist, 802.3ad's 16 members at 800GbE.
+MAX_PLAUSIBLE_AGGREGATE_BPS = 16 * 800e9
+# ieee8023adLag and propVirtual: what a modern and an older platform
+# respectively call a Port-channel.
+AGGREGATE_IF_TYPES = frozenset({53, 161})
+
+
+def interface_speed_bps(speed, high_speed, if_type=None) -> float | None:
+    """One interface's line rate in bits/sec from ifSpeed (bit/s, Gauge32,
+    saturating at IF_SPEED_SENTINEL) and ifHighSpeed (Mbit/s), refusing an
+    ifHighSpeed that cannot be what the MIB says it is — the same shape of
+    refusal counter_rate makes when a derived rate outruns the link.
+
+    ifHighSpeed is preferred as it always was; it is the only one of the two
+    that can express a modern link. But agents exist (per-linecard, which is
+    why only a few ports on a device are wrong) that answer it in kbit/s, and
+    x 1e6 then reports a 10 Gb/s port as 10 Tb/s — the right digits, three
+    orders out, and a utilization consequently near 0%. So: a value above the
+    ceiling is not a link that exists, and a value 100x or more above a
+    NON-saturated ifSpeed is contradicted by the device itself, since an
+    unsaturated ifSpeed is exact. A rejected reading falls to ifSpeed where
+    ifSpeed can answer; it cannot above ~4.29 Gb/s, which is exactly where the
+    quirk shows, so there the reading is retried as kbit/s and kept only if
+    THAT lands inside the ceiling. A genuine 400G or 800G port passes every
+    check untouched and is never rescaled.
+
+    Two readings that trip those rules legitimately, each exempted by
+    something checkable. An 8x400G port-channel answers 3,200,000 against a
+    saturated ifSpeed, and no arithmetic separates that from a quirky 3.2
+    Gb/s port — a 3.2 Tb/s bundle exists, a 3.2 Tb/s port does not — so
+    if_type decides, and only the ceiling moves. And an agent reporting
+    ifSpeed as speed mod 2^32 rather than saturated gives a 400G port
+    568,041,472 beside a correct ifHighSpeed: not a contradiction but the
+    same number truncated, recognised exactly rather than guessed at. The
+    1 Gb/s quirk cannot pass as one — 1e12 % 2**32 is 3,567,587,328, not the
+    1e9 its ifSpeed reports."""
+    high_bps = (float(high_speed) * 1_000_000
+                if isinstance(high_speed, (int, float)) and high_speed else None)
+    speed_bps = float(speed) if isinstance(speed, (int, float)) else None
+    if high_bps is None:
+        return speed_bps
+    aggregate = (isinstance(if_type, (int, float))
+                 and int(if_type) in AGGREGATE_IF_TYPES)
+    ceiling = MAX_PLAUSIBLE_AGGREGATE_BPS if aggregate else MAX_PLAUSIBLE_SPEED_BPS
+    wrapped = high_bps > IF_SPEED_SENTINEL and high_bps % 2 ** 32 == speed_bps
+    contradicted = (speed_bps is not None and 0 < speed_bps < IF_SPEED_SENTINEL
+                    and high_bps >= speed_bps * 100 and not wrapped)
+    if high_bps <= ceiling and not contradicted:
+        return high_bps
+    if speed_bps is not None and 0 < speed_bps < IF_SPEED_SENTINEL:
+        return speed_bps
+    rescaled = high_bps / 1000
+    if rescaled <= ceiling:
+        return rescaled
+    return speed_bps
 
 
 def detect_reboot(uptime_ticks: int, uptime_ts: float, previous_ticks: int | None,
@@ -486,6 +566,32 @@ def _credential_label(config: dict) -> str:
     name = {0: "v1", 1: "v2c"}.get(version, f"v{version}")
     return (f"the SNMP{name} community" if config.get("community")
             else f"SNMP{name} with no community set")
+
+
+def _error_status_reason(response: Response, base_oid: str) -> str:
+    """Why a walk stopped when the agent answered with an error-status.
+
+    The walk used to test only for tooBig(1); a genErr(5) or noSuchName(2)
+    — what PAN-OS answers for a subtree its agent will not serve — carried
+    no varbinds, so it fell through to the non-increasing-OID guard and
+    ended the walk with nothing logged, nothing raised and nothing in the
+    device's snmp_error. The status is named, not numbered, because
+    'error-status 5' told an operator nothing."""
+    name = ERROR_STATUS.get(response.error_status, "an unknown error")
+    return (f"the device answered {name}({response.error_status}) for "
+            f"{base_oid} — its SNMP agent refuses that subtree")
+
+
+def _with_dropped(reason: str, session: "_Session") -> str:
+    """`reason` with the session's rejected-datagram count appended when
+    there is one. A reply that arrived and was thrown away (wrong peer,
+    undecodable, wrong request id) is a different fault from no reply at
+    all — the first is a NAT/ACL or a duplicate responder, the second is a
+    firewall or a wrong community — and the count was read by nothing."""
+    if not session.dropped:
+        return reason
+    return (f"{reason}; {session.dropped} datagram(s) arrived and were "
+            f"rejected (wrong peer, bad decode or mismatched request id)")
 
 
 # Moved to nodeoids in 4.32 so vendorid can share it; kept under its old
@@ -2118,6 +2224,10 @@ class NodePoller(Worker):
         # Whether the interface read finished. A partial read must not
         # delete the interfaces it never reached (see replace_interfaces).
         interfaces_complete = True
+        # None until an interface read actually happens, so a poll that
+        # never got that far leaves the stored note alone rather than
+        # blanking a truncation the stored rows still show.
+        interfaces_note = None
         metrics: list[tuple] = []   # (key, label, unit, kind, value)
 
         # A device already known to be down is the most expensive thing this
@@ -2164,8 +2274,15 @@ class NodePoller(Worker):
             try:
                 cred_config, identity, uptime_ticks, metrics = \
                     self._poll_snmp_scalars_with_credential(device, config)
-                interfaces, interfaces_complete = self._poll_interfaces(
-                    device, cred_config)
+                interfaces, interfaces_complete, interfaces_reason, interfaces_note = \
+                    self._poll_interfaces(device, cred_config)
+                # SNMP itself worked — the scalars answered — so snmp_ok
+                # stays true and the interface read is what degraded. The
+                # reason still has to reach the device row: an empty
+                # interface table with no error beside it is the "healthy
+                # device, zero interfaces" reading that sent operators
+                # hunting the network instead of the agent.
+                snmp_error = interfaces_reason
                 if config.get("mib_file_id"):
                     metrics = metrics + self._poll_custom_mib(
                         device, cred_config, config["mib_file_id"])
@@ -2251,12 +2368,27 @@ class NodePoller(Worker):
             device_id, ping_ok=ping_ok, ping_rtt_ms=ping_rtt_ms,
             snmp_ok=stored_snmp_ok, snmp_error=stored_snmp_error,
             identity=identity, uptime_ticks=uptime_ticks,
-            status=status, reachable=reachable)
+            status=status, reachable=reachable, interfaces_note=interfaces_note)
         if previous is None:
             return
 
         if self.counters is not None and snmp_ok:
             self._bump("ok")
+
+        # Once, when it starts and when it stops — not every poll. A device
+        # over the interface cap stays over it, and a line repeated every
+        # poll interval is noise the next real one hides behind. The note
+        # itself lives on the device row for as long as it is true.
+        if interfaces_note is not None:
+            was = previous["interfaces_note"] if "interfaces_note" in previous.keys() else ""
+            if bool(interfaces_note) != bool(was):
+                self.log.add(
+                    NODES,
+                    (f"Interface table on {device['ip']}: {interfaces_note}."
+                     if interfaces_note else
+                     f"Interface table on {device['ip']} is no longer "
+                     f"truncated: every interface it reports is read."),
+                    target=device["ip"])
 
         # ---------------------------------------------------------- debug
         # A per-poll trace, the same shape monitor.py logs a trace with
@@ -2268,8 +2400,13 @@ class NodePoller(Worker):
             f"snmp       {'n/a' if snmp_ok is None else ('ok' if snmp_ok else 'failed')}",
         ]
         if snmp_ok:
-            detail_lines.append(f"interfaces {len(interfaces)}")
+            detail_lines.append(f"interfaces {len(interfaces)}"
+                                + ("" if interfaces_complete else " (incomplete)"))
+            if interfaces_note:
+                detail_lines.append(f"truncated  {interfaces_note}")
             detail_lines.append(f"metrics    {len(metrics)}")
+            if snmp_error:
+                detail_lines.append(f"degraded   {snmp_error}")
         elif snmp_error:
             detail_lines.append(f"error      {snmp_error}")
         detail_lines.append(f"elapsed    {time.time() - now:.2f}s")
@@ -3588,14 +3725,30 @@ class NodePoller(Worker):
         return values, True
 
     def _poll_interfaces(self, device, config: dict) -> tuple:
-        """(rows, complete) for a device's interfaces.
+        """(rows, complete, reason, note) for a device's interfaces.
+
+        `reason` is a fault the caller stores as snmp_error; `note` is the
+        designed per-poll cap, which is not one — see _MAX_INTERFACES below.
 
         Walks the ifIndex column to discover interfaces, then reads the
-        columns for each index. The ifIndex walk opts into
-        raise_on_timeout: its result feeds the device's own up/down
-        status, so a genuine mid-walk timeout must be reported as the
-        failure it is rather than silently returning however many
-        interfaces were found before the device stopped answering.
+        columns for each index.
+
+        A walk that stops part way DEGRADES the interface data — complete
+        is False, `reason` says what happened, and the device's own SNMP
+        state is untouched. It used to fail the whole device: the ifIndex
+        walk opted into raise_on_timeout, and the exception propagated out
+        of _poll_device's one try to set snmp_ok = False even though the
+        system scalars had already answered. On a chassis with several
+        hundred interfaces behind a 3 s x 3 budget that is the whole
+        reported fault — L3 confirmed, community confirmed, sysDescr
+        populated, polling "failing".
+
+        The boundary is progress, not cause: an ifIndex walk that got
+        NOTHING at all still raises (see _walk_column_detail), because the
+        scalars answering and then the very next request going unanswered
+        is a device that has gone away mid-poll, and a device that has
+        gone away must not read as healthy. One row is enough to say the
+        agent is there and the credential is right.
 
         `complete` is what lets the caller decide whether an interface the
         walk did not produce is really gone: a walk cut short is not
@@ -3605,16 +3758,30 @@ class NodePoller(Worker):
         interval = float(config.get("poll_interval_s") or 120)
         deadline = time.time() + max(self._INTERFACE_BUDGET_FLOOR_S,
                                      self._INTERFACE_BUDGET_FRACTION * interval)
-        indexes, complete = self._walk_indexes(
+        indexes, complete, reason = self._walk_indexes(
             device, config, nodeoids.IF_TABLE["if_index"], raise_on_timeout=True)
         if not indexes:
-            return [], complete
+            return [], complete, reason, ""
         configured_version = config.get("snmp_version")
         is_v1 = configured_version is not None and int(configured_version) == 0
         want_ifx = True
         wanted = indexes[:self._MAX_INTERFACES]
+        note = ""
         if len(indexes) > self._MAX_INTERFACES:
             complete = False
+            # A NOTE, deliberately not the `reason` the caller stores as
+            # snmp_error: this cap is a designed limit, the same on every
+            # poll, and a core switch or a firewall with per-VLAN
+            # subinterfaces sits over it permanently. Reported as an SNMP
+            # error it painted a red line in the device pane and wrote a
+            # NODES log line every poll interval for ever, which is how a
+            # real error that arrives later gets missed. It still has to
+            # reach the operator — a table that stops at 512 with nothing
+            # saying why is the "healthy device, no interfaces" reading
+            # again in miniature — so it travels to the device row and is
+            # rendered under the interface table it describes.
+            note = (f"the device reported {len(indexes)} interfaces; one poll "
+                    f"reads the first {self._MAX_INTERFACES}")
         rows = []
         skipped = 0
         consecutive_timeouts = 0
@@ -3658,14 +3825,14 @@ class NodePoller(Worker):
 
             speed = _val(nodeoids.IF_TABLE, "if_speed")
             high_speed = _val(nodeoids.IFX_TABLE, "if_high_speed")
+            if_type = _val(nodeoids.IF_TABLE, "if_type")
             # ifSpeed is a Gauge32 that RFC 2863 saturates at 4294967295 for
             # any link it cannot express in 32 bits of bits/sec, which is why
             # ifHighSpeed (Mbit/s) exists. The sentinel is left as a literal
             # denominator rather than treated as "unknown": in_util/out_util
             # are clamped to [0, 100], so a row stuck with it still reports a
             # bounded number instead of losing the metric.
-            speed_bps = (float(high_speed) * 1_000_000 if isinstance(high_speed, (int, float)) and high_speed
-                        else (float(speed) if isinstance(speed, (int, float)) else None))
+            speed_bps = interface_speed_bps(speed, high_speed, if_type)
             hc_in = _val(nodeoids.IFX_TABLE, "if_hc_in_octets")
             hc_out = _val(nodeoids.IFX_TABLE, "if_hc_out_octets")
             in_octets = hc_in if isinstance(hc_in, (int, float)) else _val(nodeoids.IF_TABLE, "if_in_octets")
@@ -3711,12 +3878,19 @@ class NodePoller(Worker):
             })
         if skipped or abandoned:
             complete = False
-            reason = abandoned or f"{skipped} did not answer"
+            per_interface = abandoned or f"{skipped} did not answer"
             self.log.add(NODES, f"Read {len(rows)} of {len(indexes)} interface(s) "
-                                f"on {device['ip']}: {reason}. Interfaces that "
-                                f"were not read keep their stored values.",
+                                f"on {device['ip']}: {per_interface}. Interfaces "
+                                f"that were not read keep their stored values.",
                         target=device["ip"])
-        return rows, complete
+            # Both halves, when both happened: the walk's own stop reason
+            # names why the table is short, the per-interface one why the
+            # rows it did enumerate are missing values.
+            reason = f"{reason}; {per_interface}" if reason else per_interface
+        if reason:
+            self.log.add(NODES, f"Interface read on {device['ip']} is "
+                                f"incomplete: {reason}", target=device["ip"])
+        return rows, complete, reason, note
 
     def _walk_column(self, device, config: dict, base_oid: str,
                      raise_on_timeout: bool = False,
@@ -3731,7 +3905,18 @@ class NodePoller(Worker):
     def _walk_column_status(self, device, config: dict, base_oid: str,
                             raise_on_timeout: bool = False,
                             deadline: float | None = None) -> tuple:
-        """(index suffix -> value, whether the walk reached the end).
+        """(index suffix -> value, whether the walk reached the end). See
+        _walk_column_detail, which this wraps for the callers that do not
+        need to know WHY a walk stopped."""
+        return self._walk_column_detail(device, config, base_oid,
+                                        raise_on_timeout=raise_on_timeout,
+                                        deadline=deadline)[:2]
+
+    def _walk_column_detail(self, device, config: dict, base_oid: str,
+                            raise_on_timeout: bool = False,
+                            deadline: float | None = None) -> tuple:
+        """(index suffix -> value, whether the walk reached the end, why it
+        stopped when it did not).
 
         `complete` is False whenever the walk stopped for a reason that is
         not "the table ended": a timeout, an SNMP error, the row cap, an
@@ -3749,14 +3934,24 @@ class NodePoller(Worker):
         echoing itself or going backwards); the next request resumes from the
         last accepted OID. A GETBULK answered `error_status == 1` (tooBig) is
         retried at half the repetitions, then falls back to GETNEXT rather
-        than looping. Stops at the subtree end or
-        `settings["snmp_walk_max_rows"]` (logged once, not per row).
+        than looping, and the fallback itself is remembered. Any OTHER
+        non-zero error-status — genErr(5) and noSuchName(2) are what a
+        PAN-OS agent answers a subtree it will not serve — ends the walk
+        with that status named in the reason. It used to fall through to
+        the non-increasing-OID guard and end the walk with nothing said at
+        all, which is a device reading healthy with zero interfaces. Stops
+        at the subtree end or `settings["snmp_walk_max_rows"]` (logged
+        once, not per row).
 
         A mid-walk SnmpTimeout means the device stopped answering, not that
         the table ended, so a caller whose result drives the device's own
         up/down status (_poll_interfaces, via _walk_indexes) passes
         raise_on_timeout=True rather than have it read as "no more rows".
         Best-effort callers leave it swallowed like any other SnmpError.
+        Either way the reason names the session's `dropped` count when it
+        is non-zero: replies that arrived and were rejected (wrong peer,
+        undecodable, wrong request id) are a different fault from no reply
+        at all, and only one of them is a firewall.
         """
         settings = self.db.settings()
         max_rows = int(settings.get("snmp_walk_max_rows", 16384) or 16384)
@@ -3773,12 +3968,14 @@ class NodePoller(Worker):
         current = base_oid
         hit_cap = False
         complete = True
+        reason = ""
         session = self._session_for(device, config)
         try:
             while True:
                 if len(values) >= max_rows:
                     hit_cap = True
                     complete = False
+                    reason = f"stopped at the {max_rows}-row cap"
                     break
                 if deadline is not None and time.time() > deadline:
                     # The caller's own wall-clock budget. Checked inside
@@ -3786,29 +3983,42 @@ class NodePoller(Worker):
                     # sweep that checked only between VLANs could run two
                     # unbounded walks past the budget it was given.
                     complete = False
+                    reason = "the walk's own time budget ran out"
                     break
                 try:
                     pdu_tag = PDU_GETBULK if use_bulk else PDU_GETNEXT
                     response = self._walk_request(
                         session, device, config, current, pdu_tag, max_repetitions)
                 except SnmpTimeout as exc:
-                    if raise_on_timeout:
-                        raise SnmpTimeout(
-                            f"{exc} (table walk cut short after {len(values)} row(s))") from exc
                     complete = False
+                    reason = (f"{exc} (table walk cut short after "
+                              f"{len(values)} row(s))")
+                    if raise_on_timeout and not values:
+                        # Nothing at all came back, so this is the device
+                        # having stopped answering rather than a table too
+                        # large to finish inside the budget. Only that
+                        # reads as an SNMP failure; see _poll_interfaces.
+                        raise SnmpTimeout(_with_dropped(reason, session)) from exc
                     break
-                except SnmpError:
+                except SnmpError as exc:
                     complete = False
+                    reason = f"SNMP error: {exc}"
                     break
                 if use_bulk and response.error_status == 1:   # tooBig
                     if max_repetitions <= 1:
                         use_bulk = False
+                        self._remember_repetitions(device, 0, use_bulk=False)
                     else:
                         max_repetitions = max(1, max_repetitions // 2)
-                    self._remember_repetitions(device, max_repetitions)
+                        self._remember_repetitions(device, max_repetitions)
                     continue
+                if response.error_status:
+                    complete = False
+                    reason = _error_status_reason(response, base_oid)
+                    break
                 if not response.varbinds:
                     complete = False
+                    reason = "the device returned nothing"
                     break
                 stop = False
                 for vb in response.varbinds:
@@ -3821,6 +4031,8 @@ class NodePoller(Worker):
                         break
                     if _oid_key(oid) <= _oid_key(current):
                         complete = False
+                        reason = (f"the device answered with a non-increasing "
+                                  f"OID ({oid}) — its SNMP agent is misbehaving")
                         stop = True
                         break
                     values[oid[len(base_oid) + 1:]] = vb["value"]
@@ -3828,22 +4040,25 @@ class NodePoller(Worker):
                     if len(values) >= max_rows:
                         hit_cap = True
                         complete = False
+                        reason = f"stopped at the {max_rows}-row cap"
                         stop = True
                         break
                 if stop:
                     break
+            if reason:
+                reason = _with_dropped(reason, session)
         finally:
             session.close()
         if hit_cap:
             self.log.add(NODES, f"Table walk of {base_oid} on {device['ip']} "
                                 f"stopped at the {max_rows}-row cap",
                          target=device["ip"])
-        return values, complete
+        return values, complete, reason
 
     def _walk_indexes(self, device, config: dict, base_oid: str,
                       raise_on_timeout: bool = False) -> tuple:
         """(the integer indexes the column reported, whether the walk
-        finished).
+        finished, why it stopped when it did not).
 
         A suffix that is not an integer is skipped, not treated as the end
         of the table: one malformed row used to truncate the list, and
@@ -3852,14 +4067,14 @@ class NodePoller(Worker):
         history with it.
         """
         indexes: list[int] = []
-        values, complete = self._walk_column_status(
+        values, complete, reason = self._walk_column_detail(
             device, config, base_oid, raise_on_timeout=raise_on_timeout)
         for suffix in values:
             try:
                 indexes.append(int(suffix))
             except ValueError:
                 continue
-        return indexes, complete
+        return indexes, complete, reason
 
     # ENTITY-MIB (RFC 6933) and ENTITY-SENSOR-MIB (RFC 3433) columns used
     # by read_dom() to find a port's transceiver sensors.
@@ -6026,6 +6241,13 @@ class NodePoller(Worker):
         answered "tooBig" once will answer it again, and re-learning the
         same limit at the start of every walk costs a wasted round trip
         each time.
+
+        The GETNEXT FALLBACK is remembered the same way, as a learned count
+        of 0. It was not: an agent that refuses GETBULK at any repetition
+        count was recorded as "1 repetition" and so re-asked with GETBULK
+        on the next column of the next poll, for ever, paying a wasted
+        round trip per walk against exactly the devices least able to
+        afford one.
         """
         settings = self.db.settings()
         configured = int(settings.get("snmp_bulk_max_repetitions", 40) or 0)
@@ -6034,10 +6256,14 @@ class NodePoller(Worker):
         if is_v1 or configured <= 0:
             return False, 0
         learned = self._bulk_repetitions.get(device["id"])
+        if learned == 0:
+            return False, 0
         return True, min(configured, learned) if learned else configured
 
-    def _remember_repetitions(self, device, repetitions: int) -> None:
-        self._bulk_repetitions[device["id"]] = max(1, int(repetitions))
+    def _remember_repetitions(self, device, repetitions: int, *,
+                              use_bulk: bool = True) -> None:
+        self._bulk_repetitions[device["id"]] = (
+            max(1, int(repetitions)) if use_bulk else 0)
 
     def _walk_from(self, device, config, base: str, max_rows: int,
                    budget_s: float, cancelled=None,
@@ -6091,10 +6317,14 @@ class NodePoller(Worker):
                 if use_bulk and response.error_status == 1:      # tooBig
                     if repetitions <= 1:
                         use_bulk = False
+                        self._remember_repetitions(device, 0, use_bulk=False)
                     else:
                         repetitions = max(1, repetitions // 2)
-                    self._remember_repetitions(device, repetitions)
+                        self._remember_repetitions(device, repetitions)
                     continue
+                if response.error_status:
+                    stopped = _error_status_reason(response, base)
+                    break
                 if not response.varbinds:
                     stopped = "the device returned nothing"
                     break
@@ -6263,6 +6493,14 @@ if __name__ == "__main__":
     assert counter_rate(100, 5.0, 200, 5.0, 32) is None               # dt == 0
     assert counter_rate(None, 0.0, 200, 10.0, 32) is None             # first poll
     print("counter_rate OK")
+
+    assert interface_speed_bps(1_000_000_000, 1000) == 1e9             # ordinary 1G port
+    assert interface_speed_bps(IF_SPEED_SENTINEL, 400_000) == 4e11     # a real 400G port
+    assert interface_speed_bps(IF_SPEED_SENTINEL, 10_000_000) == 1e10  # kbit/s quirk, 10G port
+    assert interface_speed_bps(1_000_000_000, 1_000_000) == 1e9        # ifSpeed contradicts it
+    assert interface_speed_bps(IF_SPEED_SENTINEL, None) == float(IF_SPEED_SENTINEL)
+    assert interface_speed_bps(None, None) is None
+    print("interface_speed_bps OK")
 
     ok, note = detect_reboot(100, 1010.0, 500_000, 1000.0)
     assert ok, "a real restart must be detected"

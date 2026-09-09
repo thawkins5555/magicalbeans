@@ -650,6 +650,39 @@ def _sibling(path: str, suffix: str) -> str:
     return os.path.join(directory, f"{stem}_{suffix}.db")
 
 
+def clean_community(text):
+    """A v1/v2c community as it may be stored: stripped, and never a list.
+
+    Two separate faults, one field. A pasted community carries a trailing
+    space often enough that it is worth removing everywhere rather than in
+    one form, because a wrong community is not refused by an agent — a
+    net-snmp agent (so PAN-OS) drops the datagram without a word, and the
+    poller reports a timeout indistinguishable from an unreachable device.
+
+    And a comma is REFUSED rather than split. nodediscover.py splits the
+    comma-joined string api.py builds from a profile's credentials, which
+    made `public,pa-ro` in one field look like it worked: discovery
+    identified the device and every poll of it then timed out. Splitting
+    here too would be a second, weaker credential list beside the real one
+    — group_credentials already holds alternates, with their own SNMP
+    version, their own v3 material, and the poller's last-known-good
+    caching (credential_candidates, NodePoller._credentials) — so the
+    comma points at that instead. Every stored community therefore has no
+    comma in it, which is what makes discovery's split and the poller's
+    single value agree.
+    """
+    if text is None:
+        return None
+    text = str(text).strip()
+    if "," in text:
+        raise ValueError(
+            "An SNMP community cannot contain a comma — one device is polled "
+            "with one community. To try several, add them as credentials on "
+            "the polling profile (Nodes → Polling profiles → Credentials); "
+            "discovery and polling both use that list.")
+    return text
+
+
 _CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
@@ -1010,6 +1043,12 @@ class NodesDatabase(SqliteStore):
             # "http on 80" — see _DEVICE_ONLY_COLUMNS.
             "web_scheme": "TEXT",
             "web_port": "INTEGER",
+            # Why this device's stored interface table is shorter than the
+            # device's own, when it is: the poller caps one read at
+            # nodepoll._MAX_INTERFACES. Kept apart from snmp_error because a
+            # designed limit is not a fault — see _poll_interfaces — and
+            # read back beside the interface list it explains.
+            "interfaces_note": "TEXT NOT NULL DEFAULT ''",
         })
         self.ensure_columns("groups", {
             "lldp_interval_s": "INTEGER", "poe_enabled": "INTEGER",
@@ -1186,6 +1225,8 @@ class NodesDatabase(SqliteStore):
 
     def update_group(self, group_id: int, **fields) -> None:
         allowed = {k: v for k, v in fields.items() if k in _GROUP_EDITABLE}
+        if "community" in allowed:
+            allowed["community"] = clean_community(allowed["community"])
         if not allowed:
             return
         clauses = ", ".join(f"{key} = ?" for key in allowed)
@@ -1276,8 +1317,8 @@ class NodesDatabase(SqliteStore):
                 "INSERT INTO group_credentials(group_id, label, snmp_version,"
                 " community, v3_user, v3_auth_proto, created_ts)"
                 " VALUES (?,?,?,?,?,?,?)",
-                (group_id, label, snmp_version, community, v3_user, v3_auth_proto,
-                 time.time()))
+                (group_id, label, snmp_version, clean_community(community),
+                 v3_user, v3_auth_proto, time.time()))
             self._conn.commit()
             self._config_generation += 1
             return cur.lastrowid
@@ -1285,6 +1326,8 @@ class NodesDatabase(SqliteStore):
     def update_group_credential(self, credential_id: int, **fields) -> None:
         allowed = {k: v for k, v in fields.items() if k in
                   ("label", "snmp_version", "community", "v3_user", "v3_auth_proto")}
+        if "community" in allowed:
+            allowed["community"] = clean_community(allowed["community"])
         if not allowed:
             return
         clauses = ", ".join(f"{key} = ?" for key in allowed)
@@ -1363,8 +1406,26 @@ class NodesDatabase(SqliteStore):
 
     def _device_filter_clause(self, group_id: int | None, status: str | None,
                               text: str | None, device_group_id: int | None,
-                              exclude_up: bool) -> tuple[str, list]:
+                              exclude_up: bool, only_ids=None) -> tuple[str, list]:
         clauses, params = [], []
+        if only_ids is not None:
+            # A set of ids decided OUTSIDE this database — today, the devices
+            # alerts.db says are in maintenance mode. Filtered here rather
+            # than over the answer, because the device list is paged: a
+            # page-500 read filtered afterwards would return fewer than 500
+            # rows and a `total` that disagreed with them. Chunked, so a
+            # fleet-sized id list cannot exceed SQLITE_MAX_VARIABLE_NUMBER.
+            # An EMPTY set is the caller's job to short-circuit — "IN ()" is
+            # not valid SQL — so it is refused here rather than silently
+            # matching everything.
+            ids = [int(i) for i in only_ids]
+            if not ids:
+                raise ValueError("only_ids must name at least one device")
+            ors = []
+            for chunk in _id_chunks(ids):
+                ors.append(f"id IN ({','.join('?' * len(chunk))})")
+                params.extend(chunk)
+            clauses.append(f"({' OR '.join(ors)})")
         if group_id is not None:
             clauses.append("group_id = ?")
             params.append(group_id)
@@ -1428,12 +1489,12 @@ class NodesDatabase(SqliteStore):
 
     def devices(self, group_id: int | None = None, status: str | None = None,
                text: str | None = None, device_group_id: int | None = None,
-               exclude_up: bool = False, limit: int | None = None,
+               exclude_up: bool = False, only_ids=None, limit: int | None = None,
                offset: int = 0) -> list[sqlite3.Row]:
         # `limit=None` runs no LIMIT clause at all, so an unpaged caller
         # gets the whole matching set back.
         where, params = self._device_filter_clause(
-            group_id, status, text, device_group_id, exclude_up)
+            group_id, status, text, device_group_id, exclude_up, only_ids)
         query = f"SELECT * FROM devices{where} ORDER BY name COLLATE NOCASE, ip"
         if limit is not None:
             query += " LIMIT ? OFFSET ?"
@@ -1443,13 +1504,13 @@ class NodesDatabase(SqliteStore):
 
     def devices_count(self, group_id: int | None = None, status: str | None = None,
                       text: str | None = None, device_group_id: int | None = None,
-                      exclude_up: bool = False) -> int:
+                      exclude_up: bool = False, only_ids=None) -> int:
         """How many devices match, ignoring `limit`/`offset` — the same
         shape alertsdb.count_alerts already established for "how many
         pages is this", asked with the identical filter clause devices()
         itself builds so the two can never disagree about what matched."""
         where, params = self._device_filter_clause(
-            group_id, status, text, device_group_id, exclude_up)
+            group_id, status, text, device_group_id, exclude_up, only_ids)
         with self._lock:
             return int(self._conn.execute(
                 f"SELECT COUNT(*) FROM devices{where}", params).fetchone()[0])
@@ -1671,7 +1732,8 @@ class NodesDatabase(SqliteStore):
         for key in _OVERRIDE_COLUMNS + _DEVICE_ONLY_COLUMNS:
             if key in overrides:
                 cols.append(key)
-                vals.append(overrides[key])
+                vals.append(clean_community(overrides[key])
+                            if key == "community" else overrides[key])
         marks = ",".join("?" * len(vals))
         with self._lock:
             cur = self._conn.execute(
@@ -1710,6 +1772,8 @@ class NodesDatabase(SqliteStore):
 
     def update_device(self, device_id: int, **fields) -> None:
         allowed = {k: v for k, v in fields.items() if k in _DEVICE_EDITABLE}
+        if "community" in allowed:
+            allowed["community"] = clean_community(allowed["community"])
         if not allowed:
             return
         clauses = ", ".join(f"{key} = ?" for key in allowed)
@@ -1726,6 +1790,8 @@ class NodesDatabase(SqliteStore):
         device — the shape post_nodes_discovery_promote's device_ids list
         already established for "operate on many ids from one request"."""
         allowed = {k: v for k, v in fields.items() if k in _DEVICE_EDITABLE}
+        if "community" in allowed:
+            allowed["community"] = clean_community(allowed["community"])
         if not allowed or not device_ids:
             return
         clauses = ", ".join(f"{key} = ?" for key in allowed)
@@ -1764,7 +1830,9 @@ class NodesDatabase(SqliteStore):
                     for key in _OVERRIDE_COLUMNS + _DEVICE_ONLY_COLUMNS:
                         if key in (row.get("overrides") or {}):
                             cols.append(key)
-                            vals.append(row["overrides"][key])
+                            value = row["overrides"][key]
+                            vals.append(clean_community(value)
+                                        if key == "community" else value)
                     marks = ",".join("?" * len(vals))
                     cur = self._conn.execute(
                         f"INSERT INTO devices({','.join(cols)}) VALUES ({marks})", vals)
@@ -1969,7 +2037,8 @@ class NodesDatabase(SqliteStore):
     def record_poll(self, device_id: int, *, ping_ok, ping_rtt_ms, snmp_ok,
                     snmp_error, identity: dict | None,
                     uptime_ticks: int | None, status: str,
-                    reachable: bool) -> sqlite3.Row | None:
+                    reachable: bool,
+                    interfaces_note: str | None = None) -> sqlite3.Row | None:
         """Updates the device row's live-state columns. Returns the previous
         row first so the poller can diff old vs. new status without a
         second read.
@@ -1982,7 +2051,12 @@ class NodesDatabase(SqliteStore):
         literal status string: tying it to status=="up" would let the
         grace window's own preserved "up" label reset the failure streak
         back to zero on every poll, and a failing device could never
-        actually reach "down"."""
+        actually reach "down".
+
+        `interfaces_note` is None when this poll never read the interface
+        table at all, which leaves whatever the last read said standing:
+        the stored rows are still the truncated ones, so the sentence
+        explaining them must not vanish with a single missed poll."""
         with self._lock:
             previous = self._conn.execute(
                 "SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
@@ -2015,6 +2089,8 @@ class NodesDatabase(SqliteStore):
                     "vendor_confidence": identity.get("vendor_confidence") or "",
                     "vendor_arc": identity.get("vendor_arc"),
                 })
+            if interfaces_note is not None:
+                fields["interfaces_note"] = interfaces_note
             if uptime_ticks is not None:
                 fields["last_uptime_ticks"] = uptime_ticks
                 fields["last_uptime_ts"] = now
@@ -2536,7 +2612,17 @@ class NodesDatabase(SqliteStore):
         "SELECT n.*,"
         " COALESCE(byname.id, bymac.id) AS matched_device_id,"
         " COALESCE(byname.name, bymac.name) AS matched_device_name,"
-        " iface.if_index AS matched_if_index,"
+        # Exactly one if_index, always one belonging to the device COALESCE
+        # picked: byname wins whenever it fires, so the two joins can resolve
+        # to DIFFERENT devices, and pairing one device's id with another's
+        # port index is an endpoint that does not exist — mapper.link_identity
+        # keys on exactly that pair. Lowest if_index, so a MAC repeated across
+        # a stack resolves the same way on every read.
+        " (SELECT i3.if_index FROM interfaces i3"
+        "   WHERE n.chassis_id_subtype = 4 AND n.chassis_id != ''"
+        "     AND i3.phys_addr = n.chassis_id COLLATE NOCASE"
+        "     AND i3.device_id = COALESCE(byname.id, bymac.id)"
+        "   ORDER BY i3.if_index LIMIT 1) AS matched_if_index,"
         " byname.id AS matched_by_name_id,"
         " bymac.id AS matched_by_mac_id"
         " FROM neighbors n"
@@ -2548,9 +2634,26 @@ class NodesDatabase(SqliteStore):
         "   ON byname.enabled = 1 AND n.sys_name != ''"
         "   AND (byname.name = n.sys_name COLLATE NOCASE"
         "        OR byname.sys_name = n.sys_name COLLATE NOCASE)"
+        # At most ONE interface per neighbour row: `interfaces` is unique only
+        # on (device_id, if_index) and one chassis MAC routinely sits on
+        # several of them (a stack's base MAC per member, an SVI alongside its
+        # port-channel), so a plain join on phys_addr fanned one neighbour row
+        # out into several — one cable drawn as several links stacked on each
+        # other. This join now only names the MAC's device for `bymac`.
+        # It picks among ENABLED devices rather than filtering afterwards: a
+        # disabled duplicate of one box, or a virtual MAC (VRRP/HSRP) on a
+        # pair, puts an unmatchable device at the lowest device_id, and
+        # picking it and only then failing bymac.enabled = 1 lost the match
+        # altogether — where the fan-out this replaced still produced the
+        # enabled device's row. Still one interface, so no fan-out with it.
         " LEFT JOIN interfaces iface"
-        "   ON n.chassis_id_subtype = 4 AND n.chassis_id != ''"
-        "   AND iface.phys_addr = n.chassis_id COLLATE NOCASE"
+        "   ON iface.rowid = ("
+        "        SELECT i2.rowid FROM interfaces i2"
+        "         JOIN devices macdev"
+        "           ON macdev.id = i2.device_id AND macdev.enabled = 1"
+        "         WHERE n.chassis_id_subtype = 4 AND n.chassis_id != ''"
+        "           AND i2.phys_addr = n.chassis_id COLLATE NOCASE"
+        "         ORDER BY i2.device_id, i2.if_index LIMIT 1)"
         " LEFT JOIN devices bymac ON bymac.id = iface.device_id AND bymac.enabled = 1")
 
     def neighbours_of(self, device_id: int) -> list[sqlite3.Row]:

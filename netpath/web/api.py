@@ -3140,6 +3140,21 @@ def _device_filters(params) -> dict:
     }
 
 
+def _maintenance_only_ids(service, params):
+    """The device ids to restrict the list to when `maintenance_only` is
+    present, or None when it is not.
+
+    Server-side, because the list is paged at DEVICE_LIST_DEFAULT_LIMIT: a
+    page filtered after the fact would hand back fewer rows than it asked
+    for and a `total` that did not describe them. The ids come from
+    alerts.db, which nodesdb cannot join against — two files — so they are
+    read here and passed down as an id clause.
+    """
+    if params.get("maintenance_only") is None:
+        return None
+    return [int(i) for i in service.alerts_db.maintenance_device_ids()]
+
+
 def _device_rows_json(service, params, rows) -> list[dict]:
     worker_state = service.node_poller.worker_state()
     # A mute lives in the Alerts module but has to be visible here: an
@@ -3153,6 +3168,10 @@ def _device_rows_json(service, params, rows) -> list[dict]:
     window_covered = service.alerts_db.window_covered_device_ids(
         ((row["id"], row["device_group_id"]) for row in rows))
     muted = service.alerts_db.muted_entity_ids("device", window_covered=window_covered)
+    # Its OWN field, never folded into muted_until: maintenance mode has no
+    # until_ts, and anything rendering muted_until prints "muted until <a
+    # date>" — an operator handed a date that never arrives waits for it.
+    maintenance = service.alerts_db.maintenance_device_ids()
     # A device merged into another keeps the address it was entered under as
     # an alias, and the list is where an operator looks for that address —
     # so the whole set rides along, in one read for the page rather than one
@@ -3164,6 +3183,8 @@ def _device_rows_json(service, params, rows) -> list[dict]:
         device = _device_json(row, reveal)
         device["polling"] = row["id"] in worker_state
         device["muted_until"] = muted.get(str(row["id"]))
+        maint_row = maintenance.get(str(row["id"]))
+        device["maintenance"] = _maintenance_json(maint_row) if maint_row else None
         device["addresses"] = _device_addresses_json(
             row, aliases.get(row["id"], ()))
         devices.append(device)
@@ -3181,6 +3202,13 @@ DEVICE_LIST_MAX_LIMIT = 2000
 
 def get_nodes_devices(service, params, body) -> dict:
     filters = _device_filters(params)
+    only_ids = _maintenance_only_ids(service, params)
+    if only_ids is not None:
+        # Nothing is in maintenance mode: answered here rather than by
+        # nodesdb, whose id clause has no valid SQL for an empty set.
+        if not only_ids:
+            return {"devices": [], "total": 0}
+        filters["only_ids"] = only_ids
     total = service.nodes_db.devices_count(**filters)
     if params.get("limit") is None and params.get("offset") is None:
         rows = service.nodes_db.devices(**filters)
@@ -3191,20 +3219,31 @@ def get_nodes_devices(service, params, body) -> dict:
             "total": total, "limit": limit, "offset": offset}
 
 
+_DEVICE_CSV_HEADER = ["id", "name", "ip", "status", "group_id", "device_group_id",
+                     "vendor", "sys_descr", "sys_name", "polling", "muted_until",
+                     "maintenance_since", "poll_interval_s", "last_poll_ts",
+                     "addresses"]
+
+
 def get_nodes_devices_export(service, params, body) -> dict:
     """The Devices table's current filter, unpaged and uncapped: a CSV
     export exists to leave with everything that matched, not one page of
     it, and nodes_db.devices() already has no limit of its own to lift."""
     filters = _device_filters(params)
+    only_ids = _maintenance_only_ids(service, params)
+    if only_ids is not None:
+        if not only_ids:
+            return _csv_response("devices", _DEVICE_CSV_HEADER, [])
+        filters["only_ids"] = only_ids
     rows = service.nodes_db.devices(**filters)
     devices = _device_rows_json(service, params, rows)
-    header = ["id", "name", "ip", "status", "group_id", "device_group_id",
-             "vendor", "sys_descr", "sys_name", "polling", "muted_until",
-             "poll_interval_s", "last_poll_ts", "addresses"]
+    header = _DEVICE_CSV_HEADER
     csv_rows = [[d.get("id"), d.get("name"), d.get("ip"), d.get("status"),
                 d.get("group_id"), d.get("device_group_id"), d.get("vendor"),
                 d.get("sys_descr"), d.get("sys_name"), d.get("polling"),
-                d.get("muted_until"), d.get("poll_interval_s"), d.get("last_poll_ts"),
+                d.get("muted_until"),
+                (d.get("maintenance") or {}).get("started_ts"),
+                d.get("poll_interval_s"), d.get("last_poll_ts"),
                 ", ".join(a["ip"] for a in d.get("addresses") or ())]
                for d in devices]
     return _csv_response("devices", header, csv_rows)
@@ -3688,6 +3727,10 @@ def get_nodes_device(service, params, body, device_id) -> dict:
     device["muted_until"] = max(
         (v for v in (mute["until_ts"] if mute else None, window_until)
          if v is not None), default=None)
+    # Beside muted_until, never inside it — see _device_rows_json. A device
+    # can be muted AND in maintenance at once, and both lines render.
+    maint_row = service.alerts_db.open_maintenance(device_id)
+    device["maintenance"] = _maintenance_json(maint_row) if maint_row else None
     # Rides in the device JSON rather than behind its own fetch: the
     # ADDRESSES subtab is one short list the detail pane already has a
     # round trip for, and a second request per device selection to carry
@@ -3827,14 +3870,19 @@ def put_nodes_device(service, params, body, device_id) -> dict:
 
 def delete_nodes_device(service, params, body, device_id) -> dict:
     row = _require(service.nodes_db.device(device_id), "device")
-    # ConfigRX first, Nodes second. Two databases, so this cannot be one
-    # transaction and one order has to be wrong on a crash; the question is
-    # which residue is survivable. Nodes-first would leave configrx.db
+    # Alerts first, ConfigRX second, Nodes last. Three databases, so this
+    # cannot be one transaction and one order has to be wrong on a crash;
+    # the question is which residue is survivable. Nodes-first would leave configrx.db
     # holding this device_id's ssh_password_enc and enable_secret_enc keyed
     # on an id nothing owns — and devices.id is INTEGER PRIMARY KEY without
     # AUTOINCREMENT, so SQLite reissues the freed rowid and the next device
     # added would silently inherit those credentials. This order fails the
     # other way: a nodes row outliving its ConfigRX config, deletable again.
+    # Alerts goes ahead of both on exactly that reasoning: an open
+    # maintenance period or a mute keyed on this id would be inherited whole
+    # by whichever device SQLite next hands the freed rowid to, which would
+    # then arrive silenced with nothing on screen saying why.
+    service.alerts_db.forget_device(device_id)
     service.configrx_db.forget_device(device_id)
     service.nodes_db.remove_device(device_id)
     service.log.add(NODES_CATEGORY, f"Removed device {row['ip']}")
@@ -3891,9 +3939,10 @@ def post_nodes_devices_bulk_update(service, params, body) -> dict:
 
 def post_nodes_devices_bulk_delete(service, params, body) -> dict:
     device_ids = _bulk_device_ids(body)
-    # ConfigRX first, for the credential-inheritance reason spelled out in
+    # Alerts then ConfigRX, for the inheritance reasons spelled out in
     # delete_nodes_device.
     for device_id in device_ids:
+        service.alerts_db.forget_device(device_id)
         service.configrx_db.forget_device(device_id)
     removed = service.nodes_db.bulk_remove_devices(device_ids)
     service.log.add(NODES_CATEGORY, f"Bulk-removed {removed} device(s)")
@@ -4354,6 +4403,96 @@ def _oid_walk_text(service, status, rows) -> str:
     return "\n".join(lines) + "\n"
 
 
+_TEST_WALK_MAX_ROWS = 512
+_TEST_WALK_BUDGET_S = 6.0
+
+
+def _test_ifindex_walk(service, exchange, version: int) -> dict:
+    """A real ifIndex walk for the Test button, reported rather than raised.
+
+    The same shape NodePoller._walk_column_detail walks with — GETBULK on
+    v2c/v3 at the configured repetition count, halved on tooBig and falling
+    back to GETNEXT, varbinds accepted until one leaves the subtree — but
+    bounded to a few seconds in front of a waiting human, and answering
+    "what happened" instead of a table. The three numbers that name the
+    fault a scalar GET cannot see: how many repetitions the agent actually
+    accepted, the error-status it answered (a PAN-OS agent says genErr or
+    noSuchName for a subtree it will not serve), and how far the walk got
+    before the clock ran out.
+    """
+    from ..nodeoids import IF_TABLE
+    from ..nodepoll import _oid_key
+    from ..snmppoll import ERROR_STATUS, PDU_GETBULK, PDU_GETNEXT, SnmpError
+
+    base = IF_TABLE["if_index"]
+    settings = service.nodes_db.settings()
+    configured = int(settings.get("snmp_bulk_max_repetitions", 40) or 0)
+    use_bulk = version != 0 and configured > 0
+    repetitions = configured if use_bulk else 0
+    started = time.time()
+    deadline = started + _TEST_WALK_BUDGET_S
+    current = base
+    rows = requests = 0
+    error_status = 0
+    stopped = "reached the end of the ifIndex column"
+    while True:
+        if rows >= _TEST_WALK_MAX_ROWS:
+            stopped = f"stopped at this test's {_TEST_WALK_MAX_ROWS}-row limit"
+            break
+        if time.time() > deadline:
+            stopped = f"still going after {_TEST_WALK_BUDGET_S:.0f}s"
+            break
+        try:
+            requests += 1
+            response = exchange(PDU_GETBULK if use_bulk else PDU_GETNEXT,
+                                [current], repetitions)
+        except SnmpError as exc:
+            stopped = f"{exc} after {rows} row(s)"
+            break
+        if use_bulk and response.error_status == 1:      # tooBig
+            if repetitions <= 1:
+                use_bulk = False
+                repetitions = 0
+            else:
+                repetitions = max(1, repetitions // 2)
+            continue
+        if response.error_status:
+            error_status = response.error_status
+            stopped = (f"the device answered "
+                       f"{ERROR_STATUS.get(error_status, 'an unknown error')}"
+                       f"({error_status})")
+            break
+        if not response.varbinds:
+            stopped = "the device returned nothing"
+            break
+        done = False
+        for vb in response.varbinds:
+            oid = vb["oid"]
+            if not oid or not oid.startswith(base + "."):
+                done = True
+                break
+            if vb["type"] in ("noSuchObject", "noSuchInstance", "endOfMibView"):
+                done = True
+                break
+            if _oid_key(oid) <= _oid_key(current):
+                stopped = f"the device answered with a non-increasing OID ({oid})"
+                done = True
+                break
+            rows += 1
+            current = oid
+        if done:
+            break
+    return {"rows": rows, "requests": requests,
+            "max_repetitions": repetitions if use_bulk else 0,
+            "bulk": use_bulk, "error_status": error_status,
+            "error_status_name": ERROR_STATUS.get(error_status, "") if error_status else "",
+            "stopped": stopped,
+            "summary": (f"{rows} interface(s) in {requests} request(s), "
+                        + (f"GETBULK x{repetitions}" if use_bulk else "GETNEXT")
+                        + f" — {stopped}"),
+            "ms": (time.time() - started) * 1000.0}
+
+
 def post_nodes_device_test(service, params, body, device_id) -> dict:
     """Ping + SNMP against the in-progress-edit config carried in the
     body, falling back to the saved one for anything not overridden — the
@@ -4391,7 +4530,18 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
     auth_proto = body.get("v3_auth_proto") or config.get("v3_auth_proto")
     password = body.get("v3_auth_pass")
     if identity is None or (password is None and "v3_auth_pass" not in body):
-        stored_identity, stored_proto, stored_password = credential_for(config)
+        try:
+            stored_identity, stored_proto, stored_password = credential_for(config)
+        except SnmpError as exc:
+            # The STORED credential is itself refused — a v1/v2c community
+            # carrying a comma, saved before nodesdb.clean_community existed
+            # to refuse it. Polling says so in words on the device row; the
+            # Test button is where an operator goes to find out why, and
+            # this call sits outside the try below, so without this arm it
+            # answered a bare 500 with the explanation in a traceback in the
+            # log. ValueError is the shape server.py turns into a 400
+            # carrying the message.
+            raise ValueError(str(exc))
         identity = identity if identity is not None else stored_identity
         auth_proto = auth_proto or stored_proto
         if password is None and "v3_auth_pass" not in body:
@@ -4409,38 +4559,64 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
     if config.get("snmp_enabled"):
         version = int(config.get("snmp_version", 1))
         oids = list(nodeoids.SYSTEM_SCALARS.values())
+        # Per-phase timings, appended as each phase finishes. Six scalars in
+        # one GET is the one thing every device answers, so a test made of
+        # nothing else reported OK against every fault a real poll trips
+        # over: a table walk that times out part way, an agent that answers
+        # an error-status for the ifTable, one that refuses GETBULK, and a
+        # community that is dropped without a word. The walk below is the
+        # poll's own first walk, so the test now fails where the poll does.
+        phases = result["snmp"]["phases"] = []
+        session = None
         try:
             session = _Session(row["ip"], DEFAULT_SNMP_PORT, timeout_s,
                                int(config.get("snmp_retries", 2)))
-            try:
+            engine_reply = None
+            if version >= 3:
+                engine_reply = session.request(discovery_probe())
+
+            def exchange(pdu_tag, request_oids, max_repetitions=0):
+                """One round trip on the shared session, either framing."""
                 request_id = random.randint(1, 2 ** 16)
                 if version in (0, 1):
-                    packet = build_request(version, identity or "public", PDU_GET,
-                                           request_id, oids)
+                    packet = build_request(version, identity or "public", pdu_tag,
+                                           request_id, request_oids,
+                                           max_repetitions=max_repetitions)
                 else:
-                    engine_reply = session.request(discovery_probe())
-                    auth_key = (localized_key(auth_proto, password, engine_reply.engine_id)
-                               if auth_proto and password else None)
+                    auth_key = (localized_key(auth_proto, password,
+                                              engine_reply.engine_id)
+                                if auth_proto and password else None)
                     packet = build_v3_request(
                         random.randint(1, 2 ** 16), request_id,
-                        PDU_GET, oids, engine_id=engine_reply.engine_id,
+                        pdu_tag, request_oids, engine_id=engine_reply.engine_id,
                         engine_boots=engine_reply.engine_boots,
                         engine_time=engine_reply.engine_time, user=identity or "",
-                        auth_proto=auth_proto, auth_key=auth_key)
-                response = session.request(packet, expect_request_id=request_id)
-                if version >= 3 and response.pdu_tag == PDU_REPORT:
+                        auth_proto=auth_proto, auth_key=auth_key,
+                        max_repetitions=max_repetitions or 10)
+                reply = session.request(packet, expect_request_id=request_id)
+                if version >= 3 and reply.pdu_tag == PDU_REPORT:
                     raise SnmpError("engine resync required (Report-PDU) — check "
                                     "the SNMPv3 username and auth password")
+                return reply
+
+            started = time.time()
+            try:
+                response = exchange(PDU_GET, oids)
                 if response.error_status == 16:
                     raise SnmpError("authorization error")
             finally:
-                session.close()
+                phases.append({"name": "scalars",
+                               "ms": (time.time() - started) * 1000.0})
             values = {vb["oid"]: vb["value"] for vb in response.varbinds
                      if vb["type"] not in ("noSuchObject", "noSuchInstance")}
             result["snmp"]["ok"] = True
             result["snmp"]["sys_descr"] = values.get(nodeoids.SYSTEM_SCALARS["sys_descr"])
             result["snmp"]["sys_name"] = values.get(nodeoids.SYSTEM_SCALARS["sys_name"])
             result["snmp"]["sys_uptime"] = values.get(nodeoids.SYSTEM_SCALARS["sys_uptime"])
+            walk = _test_ifindex_walk(service, exchange, version)
+            result["snmp"]["walk"] = walk
+            phases.append({"name": "ifIndex walk", "ms": walk.pop("ms"),
+                           "detail": walk["summary"]})
         except (SnmpError, OSError) as exc:
             # OSError: _Session's socket() itself failed (descriptor
             # exhaustion); the same readable answer as a protocol failure.
@@ -4448,17 +4624,33 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
             result["snmp"]["error"] = str(exc)
         finally:
             password = None
+            if session is not None:
+                # Every datagram this test sent and threw away: from the
+                # wrong peer, undecodable, or answering a request id we
+                # were not waiting on. A timeout with drops is a different
+                # fault from a timeout without — the first is something
+                # answering that should not be, the second is nothing
+                # answering at all — and the count was read by nothing.
+                result["snmp"]["dropped"] = session.dropped
+                session.close()
     return result
 
 
 def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
-    _require(service.nodes_db.device(device_id), "device")
+    device = _require(service.nodes_db.device(device_id), "device")
     rows = service.nodes_db.interfaces(device_id)
     keys = rows[0].keys() if rows else ()
+    # Why this list stops where it does, when the poller's per-poll cap is
+    # what stopped it. It rides with the interfaces rather than with the
+    # device's own JSON because it is a fact about this table, and the pane
+    # showing the table is the one place it answers a question somebody is
+    # asking.
+    note = (device["interfaces_note"] or ""
+            if "interfaces_note" in device.keys() else "")
     # poe_admin/poe_detect_status/poe_power_mw/stp_state/media are read
     # defensively like every other column a migration added: a row fetched
     # before the ALTER TABLE has run on this database will not have them.
-    return {"interfaces": [
+    return {"note": note, "interfaces": [
         {"id": r["id"], "if_index": r["if_index"], "descr": r["descr"],
          "alias": r["alias"], "phys_addr": r["phys_addr"], "speed_bps": r["speed_bps"],
          "admin_status": r["admin_status"], "oper_status": r["oper_status"],
@@ -5392,6 +5584,10 @@ def get_alerts_overview(service, params, body) -> dict:
         "t0": t0, "t1": t1, "bucket_s": bucket,
         "buckets": service.alerts_db.histogram(t0, t1, bucket),
         "summary": service.alerts_db.open_summary(),
+        # Beside the open counts, because maintenance mode never expires: a
+        # device left in it and forgotten is invisible everywhere alert
+        # counts are read unless this says so.
+        "maintenance_count": len(service.alerts_db.maintenance_device_ids()),
         "engine": {
             "running": service.alert_engine.running,
             "status": service.alert_engine.status_text(),
@@ -5550,11 +5746,12 @@ def delete_alerts_mute(service, params, body) -> dict:
     return {"lifted": lifted}
 
 
-def _bulk_mute_device_ids(service, body) -> list[str]:
-    """Every device id a bulk-mute request names — an explicit list, a
+def _bulk_silence_device_ids(service, body) -> list[str]:
+    """Every device id a bulk silencing request names — an explicit list, a
     device group's whole current membership, or both together, refusing
     (like _mute_entity above) a request that would end up silencing
-    nothing."""
+    nothing. Shared by bulk mute and bulk maintenance mode: the two take the
+    same scope, and only differ in what they then do with it."""
     ids = {str(i) for i in (body.get("device_ids") or [])}
     group_id = body.get("group_id")
     if group_id:
@@ -5580,7 +5777,7 @@ def post_alerts_bulk_mute(service, params, body) -> dict:
     """One call, many devices — the planned-cutover case the ad-hoc mute
     route makes hundreds of calls. Same ad-hoc cap (MAX_MUTE_HOURS) as a
     single mute; a longer silence is what a maintenance WINDOW is for."""
-    entity_ids = _bulk_mute_device_ids(service, body)
+    entity_ids = _bulk_silence_device_ids(service, body)
     try:
         hours = float(body.get("hours", 1))
     except (TypeError, ValueError):
@@ -5594,6 +5791,110 @@ def post_alerts_bulk_mute(service, params, body) -> dict:
     _audit(service, params, "alert.mute_bulk",
           detail=f"{len(rows)} device(s), {hours:g}h: {reason}")
     return {"muted": len(rows), "mutes": [_mute_json(r) for r in rows]}
+
+
+# ------------------------------------------------ device maintenance mode
+#
+# The third silencing mechanism, and the only indefinite one. Devices only,
+# with no entity_kind parameter at all: advertising a kind the handler then
+# refuses is worse than not offering one, and unlike alert_mutes this table
+# has no column pretending otherwise.
+
+
+def _maintenance_json(row) -> dict:
+    return {"device_id": row["device_id"], "started_ts": row["started_ts"],
+            "ended_ts": row["ended_ts"], "started_by": row["started_by"],
+            "ended_by": row["ended_by"], "reason": row["reason"]}
+
+
+def _maintenance_device(service, body):
+    """The device row a maintenance request names, refused unless Nodes
+    actually has it — the same reasoning _mute_entity gives: a suppression that
+    silences nothing is worse than an error, because the operator walks away
+    believing it worked.
+
+    A body carrying `hours` or `until_ts` is refused rather than ignored.
+    Silently dropping either is how somebody ends up believing they set a
+    four-hour maintenance, so the message names the mechanism that does what
+    they asked for instead.
+    """
+    if "hours" in body:
+        raise ValueError("Maintenance mode has no duration — it stays on "
+                         "until someone turns it off. Use a mute for a "
+                         "1-24 hour silence.")
+    if "until_ts" in body:
+        raise ValueError("Maintenance mode has no end time — it stays on "
+                         "until someone turns it off. Use a maintenance "
+                         "window for a planned span.")
+    raw = str(body.get("device_id", "")).strip()
+    if not raw:
+        raise ValueError("A device is required")
+    try:
+        device_id = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("device_id must be a device id")
+    return _require(service.nodes_db.device(device_id), "device")
+
+
+def get_alerts_maintenance(service, params, body) -> dict:
+    return {"maintenance": [_maintenance_json(row) for row in
+                            service.alerts_db.maintenance_device_ids().values()]}
+
+
+def post_alerts_maintenance(service, params, body) -> dict:
+    """Put a device into indefinite maintenance mode. Idempotent: a device
+    already in it comes back with the period it is already in, untouched,
+    rather than a restarted clock and a rewritten owner."""
+    device = _maintenance_device(service, body)
+    reason = str(body.get("reason", ""))
+    already = service.alerts_db.open_maintenance(device["id"]) is not None
+    row = service.alerts_db.set_maintenance(
+        device["id"], by=params.get("_username", ""), reason=reason)
+    if not already:
+        _audit(service, params, "alert.maintenance_on",
+              target=f"device:{device['ip']}", detail=reason)
+    return {"maintenance": _maintenance_json(row), "already": already}
+
+
+def delete_alerts_maintenance(service, params, body) -> dict:
+    """Body-on-DELETE, matching delete_alerts_mute — the device is the
+    request, and this route has no id of its own to put in the path."""
+    device = _maintenance_device(service, body)
+    cleared = service.alerts_db.clear_maintenance(
+        device["id"], by=params.get("_username", ""))
+    if cleared:
+        _audit(service, params, "alert.maintenance_off",
+              target=f"device:{device['ip']}")
+    return {"cleared": cleared}
+
+
+def post_alerts_bulk_maintenance(service, params, body) -> dict:
+    """One call, many devices, in or out — `clear` picks which. Two
+    directions on one route rather than two, because the scope resolution
+    (_bulk_silence_device_ids) is the whole of the work and a bulk selection
+    is turned on and off from the same bar."""
+    if "hours" in body or "until_ts" in body:
+        raise ValueError("Maintenance mode has no duration or end time — it "
+                         "stays on until someone turns it off. Use a mute or "
+                         "a maintenance window for a bounded silence.")
+    device_ids = _bulk_silence_device_ids(service, body)
+    clear = bool(body.get("clear"))
+    reason = str(body.get("reason", ""))
+    username = params.get("_username", "")
+    changed = 0
+    for device_id in device_ids:
+        if clear:
+            changed += bool(service.alerts_db.clear_maintenance(
+                int(device_id), by=username))
+        else:
+            was_open = service.alerts_db.open_maintenance(int(device_id)) is not None
+            service.alerts_db.set_maintenance(int(device_id), by=username,
+                                              reason=reason)
+            changed += 0 if was_open else 1
+    _audit(service, params, "alert.maintenance_bulk",
+          target=f"{len(device_ids)} devices",
+          detail=f"{'off' if clear else 'on'}, {changed} changed: {reason}")
+    return {"devices": len(device_ids), "changed": changed, "cleared": clear}
 
 
 # --------------------------------------------------- maintenance windows

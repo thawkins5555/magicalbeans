@@ -1654,13 +1654,105 @@ default behavior everywhere: every on-demand/best-effort caller (DOM
 reads, the MAC table, custom-MIB polling) still swallows a timeout the
 same as any other `SnmpError`, since a stale sensor reading is harmless.
 Only `_poll_interfaces`'s ifIndex-discovery walk — the one result that
-actually drives the device's own up/down status — opts in, so a genuine
-timeout there now raises and lands in `snmp_error` as "... table walk cut
-short after N row(s)" instead of vanishing. A timeout on one interface's
-own per-interface GET (not the ifIndex walk itself) is narrower still: it
-doesn't invalidate the whole poll — the device answered enough to
-enumerate interfaces — so it's counted (`skipped_timeouts`) and logged,
-not raised.
+actually drives the device's own up/down status — opts in. A timeout on
+one interface's own per-interface GET (not the ifIndex walk itself) is
+narrower still: it doesn't invalidate the whole poll — the device answered
+enough to enumerate interfaces — so it's counted (`skipped_timeouts`) and
+logged, not raised.
+
+`raise_on_timeout` raising on ANY mid-walk timeout went too far the other
+way. A chassis with several hundred interfaces behind the 3 s x 3 default
+budget (`nodesdb` `default_snmp_timeout_s` / `default_snmp_retries`) times
+out part way down its own ifTable routinely; the exception propagated
+through `_poll_device`'s single try and set `snmp_ok = False` for a device
+whose system scalars had already answered — "L3 confirmed, community
+confirmed, sysDescr populated, polling failing", which is exactly what a
+Palo Alto firewall reported. **The boundary is progress, not cause**: an
+ifIndex walk that collected at least one row degrades (`complete = False`,
+which already suppresses row deletion in `replace_interfaces`, plus a
+`reason` string), and one that collected NOTHING still raises. Nothing at
+all means the scalars answered and the very next request did not — a
+device that went away mid-poll, which must not read as healthy. The row
+count is the only thing that separates the two, so the test lives inside
+`_walk_column_detail` where the count is.
+
+`_walk_column_detail` is the walk itself and returns
+`(values, complete, reason)`; `_walk_column_status` is it truncated to two
+and `_walk_column` to one, the same wrapping idiom that already existed
+between those two. `_poll_interfaces` returns
+`(rows, complete, reason, note)` and `_poll_device` writes the reason into
+`snmp_error` while leaving `snmp_ok` true — a degraded read still has to
+say what degraded it, or an empty interface table beside a healthy device
+explains nothing (`nodes.js` `drawIfaceTable` already renders `snmp_error`
+as the empty state's explanation).
+
+`note` is the fourth value because ONE of those stop reasons is not a
+fault: `_MAX_INTERFACES` (512) is a designed per-poll cap, and a core
+switch or a firewall with per-VLAN subinterfaces sits over it permanently.
+Reported as a `reason` it painted a red `snmp_error` line beside "snmp ok"
+in the device pane and wrote a NODES line every poll interval for ever,
+which is how the next real error goes unnoticed. It travels instead as
+`devices.interfaces_note` (written by `record_poll`, which leaves the
+stored value alone when the caller passes `None` — a poll that never
+reached the interface table must not blank a note the stored rows still
+need), is returned beside the list it explains by
+`get_nodes_device_interfaces` as `note`, and is rendered under both copies
+of the table by `drawIfaceNote`. `_poll_device` logs it once when it
+starts and once when it stops, comparing against the `previous` row
+`record_poll` hands back; the per-poll trace still carries it as a
+`truncated` detail line.
+
+**Walk error-statuses** (`_walk_column_detail`, `_walk_from`,
+`_error_status_reason`). The walk tested `error_status` for 1 (tooBig) and
+nothing else. A `genErr(5)` or `noSuchName(2)` — what a net-snmp agent, so
+PAN-OS, answers for a subtree its handler refuses — carries no usable
+varbind, so it fell through to the non-increasing-OID guard and ended the
+walk with no exception, no log line and nothing in `snmp_error`: a device
+reading healthy with zero interfaces. Any non-zero status now stops the
+walk with `ERROR_STATUS`'s name for it in the reason ("the device answered
+genErr(5) for 1.3.6.1.2.1.2.2.1.1"), which reaches `devices.snmp_error`
+through `record_poll` and the interface table's empty state from there.
+Named rather than numbered, because "error-status 5" told an operator
+nothing.
+
+**Diagnostics: the Test button's walk, and `_Session.dropped`**
+(`web/api.py post_nodes_device_test`, `_test_ifindex_walk`,
+`nodepoll._with_dropped`). The Test button issued a GET of six system
+scalars and nothing else, so it reported OK against every mechanism above:
+a walk that times out part way, an agent that answers `genErr` for the
+ifTable, one that refuses GETBULK, and a community dropped in silence
+(which the scalar GET does catch, but only as a bare timeout). It now runs
+a real ifIndex GETBULK walk after the scalars, on the same session, and
+reports `phases` (a name and a duration each) plus a `walk` block: rows,
+requests, the repetition count actually accepted, whether GETBULK survived
+at all, and the error-status the agent answered. Bounded to
+`_TEST_WALK_MAX_ROWS` / `_TEST_WALK_BUDGET_S`, because a human is waiting.
+Its existing output and permission behaviour are unchanged — the new keys
+are additions.
+
+`_Session.dropped` counted datagrams rejected for a wrong peer, a failed
+decode or a request-id mismatch, and was read by nothing. It is now
+appended to a walk's stop reason (`_with_dropped`, so it reaches
+`snmp_error`) and returned by the Test button. A non-zero count separates
+"no reply" from "replies that were rejected" — the first is a firewall or
+an ACL, the second is something answering that should not be, or a
+credential the agent is refusing per-datagram. Note that answering from
+the *wrong source port* is deliberately not a drop: `_Session._is_peer`
+compares the host only, because agents replying from an ephemeral port are
+common and not forgery.
+
+**The `palo_alto` stub mode** (`tests/stubs/stub_agent_iftable.py`). A
+PAN-OS-shaped agent for the above: a sysObjectID under
+`1.3.6.1.4.1.25461`, several hundred interfaces, `--reply-delay` (a slow
+agent), `--dark-after-rows N` (answers N ifIndex rows then stops answering
+walk requests at all — the mid-table timeout with rows already in hand),
+`--bulk-cap N` (returns FEWER varbinds than the GETBULK asked for, the way
+net-snmp actually truncates an oversized reply, rather than answering
+tooBig — which is why a walker that only handles tooBig never learns
+anything is wrong), `--gen-err`/`--no-such-name` (subtrees answered with
+an error-status), `--refuse-bulk`, and `--stale-id N` (a wrong-request-id
+copy prepended to the first N replies, the datagram `dropped` counts). The
+misbehaviour-flag shape is `stub_agent_fdb.py`'s `bulk-toobig` mode.
 
 **Missing vendor MIB detection** (`NodePoller._check_vendor_mib`,
 `NodesDatabase.has_mib_covering`): vendor autodetection already happened
@@ -1713,7 +1805,51 @@ prefers ifXTable's high-capacity/high-speed columns whenever present. A
 ~1.3× the interface's own reported speed) catches the case a 32-bit
 counter's single-wrap assumption cannot: a link fast enough to wrap more
 than once between two polls is treated as a reset rather than a
-fabricated multi-wrap number. `detect_reboot()` compares actual vs.
+fabricated multi-wrap number. `interface_speed_bps(speed, high_speed,
+if_type)` is the third pure function in that group and applies the same kind
+of refusal to the line rate itself: ifHighSpeed is preferred as always (ifSpeed
+saturates at `IF_SPEED_SENTINEL`, 4294967295, and cannot express a modern
+link), but a value above `MAX_PLAUSIBLE_SPEED_BPS` — 1.6 Tb/s, the next
+Ethernet rate the standard defines, a full doubling above the fastest
+shipping 800G port — or one 100× or more above a *non-saturated* ifSpeed is
+refused, because an unsaturated ifSpeed is exact and orders of magnitude of
+disagreement mean ifHighSpeed is wrong. A refused reading falls to ifSpeed
+where ifSpeed can answer; where it cannot (any link over ~4.29 Gb/s, which
+is exactly where the quirk shows up) it is retried as kilobits and kept
+only if that lands inside the ceiling. The quirk is real and per-linecard:
+an agent answering `ifHighSpeed = 10,000,000` for a 10 Gb/s port produced
+1e13, which `App.rate` correctly rendered as "10.0 Tbps", and drove that
+port's utilisation — `100 * in_bps * 8 / speed_bps` — to near zero.
+
+Two readings trip those rules legitimately, and each is exempted by
+something checkable rather than by loosening the rule:
+
+- **An aggregate is not a port.** An 8x400G port-channel answers a saturated
+  ifSpeed and `ifHighSpeed = 3,200,000`; that is over the ceiling, ifSpeed
+  cannot arbitrate, and the kilobits retry landed the bundle at 3.2 Gb/s —
+  utilisation pinned at 100 %, and the 1.3× check above discarding *every*
+  rate sample on it. No arithmetic separates that from the quirk (a 3.2 Tb/s
+  bundle exists; a 3.2 Tb/s port does not), so `ifType` (`IF_TABLE["if_type"]`)
+  is read for this one decision and `AGGREGATE_IF_TYPES` — ieee8023adLag and
+  propVirtual, what modern and older platforms call a Port-channel — is judged
+  against `MAX_PLAUSIBLE_AGGREGATE_BPS` (16 × 800GbE, 802.3ad's maximum
+  aggregation at the fastest shipping port). Only the ceiling moves: the same
+  reading is still refused on an ethernetCsmacd port and where ifType goes
+  unanswered, and a non-saturated ifSpeed still contradicts ifHighSpeed on an
+  aggregate as on a port. That is sound because the kilobits quirk is
+  per-*linecard*, so it does not reach an interface the supervisor answers for.
+- **A wrapped ifSpeed is not a contradiction.** RFC 2863 saturates ifSpeed, but
+  some agents report `speed mod 2**32`, so a 400G port answers 568,041,472
+  beside a perfectly correct `ifHighSpeed = 400,000` — ≥ 100× apart, so the
+  contradiction rule fired and stored the truncation. That is testable exactly
+  (`high_bps % 2**32 == speed_bps`, with `high_bps` past `IF_SPEED_SENTINEL` so
+  a wrap has actually happened) rather than guessed at, and it cannot re-admit
+  the case the rule exists for: a 1 Gb/s port's quirky 1e12 truncates to
+  3,567,587,328, nowhere near the 1e9 its ifSpeed reports. The ceiling is
+  untouched, so an agent with *both* quirks still has the kilobits reading
+  refused.
+
+`detect_reboot()` compares actual vs.
 wall-clock-expected `sysUpTime` with a 30-second grace band, and
 explicitly excludes the case where the previous reading was already near
 `2**32` hundredths (TimeTicks' own ~497-day wraparound) so a genuine wrap
@@ -1785,7 +1921,41 @@ credentials contribute nothing to the list, since discovery was already
 v1/v2c-only). `nodediscover.py` itself still knows nothing about
 profiles or credential storage — it only ever sees a plain community
 string via the pre-existing `discovery_communities` override key, the
-same one a hand-typed list used before profiles existed. `NodePoller`
+same one a hand-typed list used before profiles existed.
+
+**The comma, and why polling refuses it** (`nodesdb.clean_community`,
+`nodepoll.credential_for`). That comma-joined string is an *internal* join
+of a profile's credentials, but `_candidate_communities` splits any
+community it is handed, and the poller split nothing — it sent
+`config["community"]` on the wire verbatim. So `public,pa-ro` typed into
+one profile field made discovery identify the device and every poll of it
+time out, indistinguishable from unreachable, because a net-snmp agent
+(PAN-OS) drops a wrong-community datagram in silence rather than answering
+`authorizationError`. A pasted trailing space did the same thing.
+
+`clean_community` strips, and **refuses** a comma rather than splitting it.
+Refuse, not split: `group_credentials` already holds credential alternates
+properly — each with its own SNMP version, its own v3 material, the
+poller's last-known-good index caching (`_credentials`) and its negative
+probe cache — and a comma-separated field would be a second, weaker
+credential list beside it, one that could not carry a version and would
+make a community legitimately containing a comma unusable. The refusal's
+message points at that feature. It is applied in `nodesdb` rather than
+`api.py` so every write path gets it (`add_device`, `update_device`,
+`bulk_update_devices`, `add_devices_bulk`, `update_group`,
+`add_group_credential`, `update_group_credential`), and a `ValueError` from
+there already becomes a 400 in `web/server.py`. Because no stored community
+can contain a comma any more, discovery's split over a stored value is the
+identity, and the two paths agree.
+
+`credential_for` strips too, and raises `SnmpError` for a comma it finds
+anyway — a database written before the save-time check. Raising is what
+makes an upgraded install *say* the value is wrong instead of timing out
+against it; every caller of `credential_for` in the poll path is already
+inside `SnmpError` handling, and the Test button reports it as the SNMP
+error it is.
+
+`NodePoller`
 owns the dict of active jobs and exposes
 `start_discovery`/`cancel_discovery`/`promote`; `promote()` treats an
 already-promoted result as a no-op rather than a duplicate-IP error, so a
@@ -2401,7 +2571,23 @@ the base OID's subtree, answers `noSuchObject`/`noSuchInstance`/`endOfMibView`,
 or is not lexicographically after the last accepted OID (a looping agent),
 and the next request resumes from there. `error_status == 1` (tooBig) halves
 `max_repetitions` and retries, falling back to GETNEXT at one repetition
-rather than looping. The old hardcoded 512-row ceiling is now
+rather than looping — and **the fallback itself is remembered**, as a
+learned count of 0 in `_bulk_repetitions` (`_bulk_settings`,
+`_remember_repetitions(..., use_bulk=False)`). It used to remember only the
+repetition count that failed, so `_bulk_settings` returned `(True, 1)` on
+the next walk and an agent that refuses every GETBULK re-paid a wasted
+round trip on every column of every poll, for ever, against exactly the
+devices least able to afford one.
+
+`_bulk_repetitions` stays **process memory**, not a stored column, and that
+is deliberate. It is a fact about an agent, not about a device: a firewall
+replaced or upgraded at the same address would keep a stale "no GETBULK"
+verdict with nothing in the UI to clear it, and the cost of NOT persisting
+it is one wasted round trip per device per process start, re-learned
+automatically. Every other learned poll state is held the same way and for
+the same reason — `_credentials` (last-known-good credential index),
+`_addresses_read`, `_sensor_read`, `_bulk_repetitions` — and
+`_forget_devices` already drops them all as one list. The old hardcoded 512-row ceiling is now
 `settings["snmp_walk_max_rows"]` (default 16384), logged once when hit.
 `_walk_indexes` and so interface discovery share this walker and the same
 reduction.
@@ -2521,6 +2707,55 @@ poller in the loop.
   row against the *wrong* port on a multi-homed device. It gets its own
   per-row key (`("name-match", device_id, if_index)`) instead — drawn as a
   second, one-directional line rather than a wrong guess.
+- **`_fold_name_matched(links_by_key)`** is the second pass that keeps that
+  per-row key from drawing one cable twice. The LLDP walker records a MAC
+  chassis id *with* `chassis_id_subtype = 4`, which is what nodesdb's
+  `_NEIGHBOR_MATCH_SQL` join requires, so an LLDP row resolves a
+  `matched_if_index` and keys on the pair; the CDP walker sets no subtype at
+  all and puts a device *name* in `chassis_id`, so only the sysName half of
+  the match fires and the row falls to the per-row key. Same cable, two
+  keys, two links on identical coordinates — and `drawLink` has no
+  parallel-edge offset, so each painted its own VLAN count and port labels
+  over the other's. The fold rests on one fact: **one local port carries one
+  cable.** A name-matched link folds onto a link that already has this row's
+  own `(device_id, if_index)` as an endpoint *and* whose far end is the
+  device this row matched, so it can never merge two genuine links. It runs
+  over the finished dict rather than per row, because the two rows arrive in
+  either order; where several links share the endpoint the lowest link id
+  wins, so the result does not follow row order either. Protocols and VLANs
+  union the way two rows sharing a key already did, and the far-end label
+  moves across only when the surviving link has none (that link resolved its
+  far end through `port_label`; a name-matched row carries only the raw
+  `port_id`/`port_descr` the neighbour advertised). The **reciprocal
+  name-only** case — two rows, two local ports, no `matched_if_index` on
+  either — is deliberately left as two links, for `link_identity`'s own
+  reason: nothing there says the two ports face each other.
+- **`_NEIGHBOR_MATCH_SQL`'s chassis-MAC join resolves at most one
+  interface, deterministically.** `interfaces` is unique only on
+  `(device_id, if_index)` and one chassis MAC routinely sits on several of
+  them (a stack's base MAC repeated per member, an SVI alongside its
+  port-channel), so a plain join on `phys_addr` fanned one neighbour row out
+  into several rows with different `matched_if_index` values — one cable,
+  several links, the same visible doubling by a different cause. The join
+  now selects a single `interfaces.rowid` through a correlated subquery
+  ordered by `(device_id, if_index)`, so the same estate always resolves the
+  same way; that join exists only to name the MAC's device for `bymac`.
+  That subquery joins `devices` and picks only among **enabled** ones. A
+  disabled duplicate of one physical box (kept rather than deleted, or a
+  merge part-done) or a virtual MAC (VRRP/HSRP) shared across a pair puts an
+  unmatchable device at the lowest `device_id`; picking it and only then
+  failing `bymac.enabled = 1` nulled `bymac`, `matched_if_index` and
+  `matched_by_mac_id` alike, leaving the neighbour unmatched and drawn as an
+  unmanaged peer — where the fan-out join this replaced still produced the
+  enabled device's row. Filtering inside the pick keeps it single-valued, so
+  the fan-out does not come back with it.
+  `matched_if_index` is chosen separately, by a scalar subquery constrained
+  to `COALESCE(byname.id, bymac.id)` and ordered by `if_index` — the two
+  joins can resolve to *different* devices (byname wins whenever it fires),
+  and pairing one device's id with another device's port index is an
+  endpoint that does not exist. Both subqueries stay on an index
+  (`ix_interfaces_phys_addr_nocase` and the `(device_id, if_index)`
+  autoindex respectively).
 - **VLANs on a link are the union of what each end's own port reports,
   never the intersection.** A trunk is only really usable for a VLAN both
   ends allow, so intersection looks like the "more correct" answer — but
@@ -3589,6 +3824,126 @@ recording events. Expired rows read as "not muted" from `until_ts` alone
 housekeeping pass so the table does not grow a row per mute ever set.
 `MAX_MUTE_HOURS` caps what the API will store, so a hand-made call cannot
 silence a device until next year.
+
+### Device maintenance mode (`alertsdb.py`, `report.py`)
+
+The third silencing mechanism. `device_maintenance(device_id, started_ts,
+ended_ts, started_by, ended_by, reason)` is a NEW table, so like
+`alert_mutes` it lives in `PENDING_SCHEMA`'s `CREATE TABLE IF NOT EXISTS`
+block and needs no `_migrate` entry — `SCHEMA` is `executescript`ed on
+every open, and `_migrate` only ever ALTERs tables that already exist.
+`tests/test_upgrade_from_previous.py` asks the previous release's own
+alerts.db whether the table arrived, which is what makes that claim more
+than an assertion.
+
+**A row is a period, not a flag.** `ended_ts IS NULL` means "in maintenance
+now"; a closed row stays on file, and re-entering after a clear writes a
+SECOND row rather than reopening the first. That is not bookkeeping for its
+own sake: the availability report REPLAYS past periods to subtract them
+from downtime, which is precisely what a mute cannot support — a mute is
+deleted the moment it lapses, and `report.MUTE_HISTORY_CAVEAT` is the
+apology for it. `MAINTENANCE_MODE_HISTORY_CAVEAT` beside it says the
+weaker thing that is true here: a CLOSED period ages out of `prune()` on
+the alert retention, an OPEN one never does at any age.
+
+**Not a row shape in `alert_mutes`.** `ux_mute_entity` is UNIQUE on
+`(entity_kind, entity_id)`, so a device could not be both muted and in
+maintenance; `mute()`'s upsert would silently end somebody's maintenance in
+an hour; and `prune` deletes lapsed rows. The suite's own decisive
+assertion is a device that is both at once with the mute's `until_ts`
+untouched. `ux_device_maintenance_open` — UNIQUE on `device_id` WHERE
+`ended_ts IS NULL` — is what keeps at most one open period per device, so
+`set_maintenance` is idempotent by construction rather than by every writer
+remembering to look first; its INSERT carries its own `WHERE NOT EXISTS`
+inside the lock so two concurrent presses cannot race past the index.
+
+**The fold point is a sibling, not a widening.** `muted_entity_ids()`
+answers `{entity_id: until_ts}` and every reader of it prints "muted until
+&lt;a date&gt;". Maintenance mode has no such date, and a sentinel would
+show an operator a moment that never arrives — so `quiet_device_ids()` sits
+beside it and answers the only question the engine's gates actually ask:
+membership. `_tick`'s per-occurrence gate and `_muted` read that set;
+`_muted_alert` grew one `open_maintenance` call ahead of its mute check,
+and that single call is what buys both the clear-mail gate in
+`_notify_clear` and the notification gates in the sweeps.
+
+**Two defects fixed alongside it, both required for the feature to hold.**
+`_sweep_renotify` had NO suppression check at all, so a muted device's open
+alert mailed a reminder every `renotify_minutes` — flatly against what the
+mute has always promised. It now skips on `_muted_alert`, and nothing is
+stranded: `alerts_due_renotify` reads `COALESCE(last_notified_ts,
+opened_ts)`, so the alert is still due the moment the silence lifts.
+And `api.delete_nodes_device`/`post_nodes_devices_bulk_delete` touched
+nothing in alerts.db, while `devices.id` is INTEGER PRIMARY KEY without
+AUTOINCREMENT — SQLite reissues the freed rowid, so the next device added
+would have inherited the deleted one's maintenance and mute. Both handlers
+now call `AlertsDatabase.forget_device` FIRST, ahead of ConfigRX, on
+exactly the credential-inheritance reasoning `delete_nodes_device`'s own
+comment already spelled out.
+
+**The held first notice is DECIDED, not left pending.** In
+`_sweep_notify_rollup` a mute (or a window) leaves the notice pending on
+purpose: both end, and a device released before anyone sees it should still
+get the notice. Maintenance mode has no such moment, so a held notice would
+sit with `last_notified_ts` NULL for ever — reading as a bare "None sent."
+with no reason, and blocked by `_sweep_renotify`'s own NULL guard from ever
+going out. It is therefore decided the way every other permanently
+undeliverable case in that loop is: `_skip_held_open_notify(..., "not sent:
+the device is in maintenance mode")`. The mute branch beside it is
+unchanged.
+
+**Decided is not final: ending the maintenance re-arms it.** Deciding alone
+lost the notice for good on the default settings — re-notify is off, so
+`_sweep_renotify` returns before it looks at anything, and the first-notify
+query only asks about `last_notified_ts IS NULL`. A two-minute cable move
+therefore swallowed an open alert's only notification. So the decision
+carries a mark: `mark_notified(..., maintenance_held=True)` stamps
+`alerts.maint_held_notify_ts` alongside `last_notified_ts`, and
+`clear_maintenance` calls `rearm_maintenance_held`, which NULLs
+`last_notified_ts` again for the device's still-open alerts carrying that
+mark. The mark is what makes it precise and idempotent: an alert whose
+notice genuinely went out before the maintenance began was never marked
+(`_skip_held_open_notify` refuses a row whose `last_notified_ts` is already
+set), and any real decision afterwards — a send, a rule that will never
+mail — writes `maintenance_held=False` and clears it, so a second toggle of
+the switch finds nothing left to re-arm. The mark also survives the re-arm
+itself, which is what exempts the row from `alerts_due_first_notify`'s
+`FIRST_NOTIFY_BACKLOG_GRACE_S` floor: that floor exists to fence off an
+upgrade's backlog of never-notified alerts, and a maintenance window
+routinely outlasts its hour. The re-arm lives in `clear_maintenance` rather
+than in a sweep because that is the one place maintenance mode can end, and
+the device match runs in Python through `alertrules.device_id_for` — an
+interface alert's `entity_id` is `"<device_id>:<if_index>"`, and that rule
+lives in one function on purpose.
+
+**The report keeps three buckets, not two.** `maintenance_mode_excluded_s`
+sits beside `maintenance_excluded_s` and `mute_excluded_s` and is merged
+into neither: the CSV is read to answer WHICH mechanism took a device out
+of service, and merging is unrecoverable. All three interval lists go into
+one `_merge_intervals` union before being subtracted, so seconds two
+mechanisms both cover are subtracted once while each bucket still reports
+its own coverage in full. An OPEN period is clamped to `now`, never to
+`t1` — `clamp_window` can hand back a `t1` in the future, and excluding
+time that has not happened would inflate uptime.
+
+**Merge order matters.** `merge_device` settles the maintenance periods
+BEFORE any blanket move: if the winner already has an open period the
+loser's is closed, otherwise it is repointed, because a straight
+`UPDATE ... SET device_id` would hit the partial unique index and a merge
+must never fail on a constraint. Closed periods move wholesale — they are
+the loser's availability history, now reported under the surviving id.
+
+**Devices only, and no `entity_kind` parameter.** Unlike `alert_mutes`,
+whose column is deliberately general so a future per-interface mute needs
+no migration, this table stores an INTEGER `device_id` and the API takes no
+kind at all: advertising a kind the handler then refuses is worse than not
+offering one. The `maintenance_only=1` device filter is resolved
+SERVER-side — `maintenance_device_ids()` read in `api`, passed into
+`nodesdb._device_filter_clause` as an `only_ids` clause chunked through
+`sqlitebase.id_chunks` — because the list is paged at 500 and a page
+filtered after the fact would hand back fewer rows than it asked for and a
+`total` that did not describe them. An empty set is short-circuited in the
+handler: `IN ()` is not valid SQL.
 
 **The page is told which device an alert is about.** Since 4.37.0 every
 alert row the API returns carries `device_id` — and, since 4.37.1, only
@@ -6653,6 +7008,41 @@ persist to `localStorage`, keyed by page/table name, independent of
 anything server-side — a layout tuned for one screen survives a reload
 without needing a server round trip or a per-user setting.
 
+### Cross-tab device links (`App.deviceNameLink`, `app.js`) — 5.4.0
+
+`App.deviceLink(ip)` was the IP-address form: `App.deviceIndex()` resolves
+an address to a device and the caller awaits it, which is why it enhances a
+placeholder already on screen rather than rendering a cell. Names are the
+other, far more common direction, and they need none of that — the caller
+already holds the text it is drawing — so `App.deviceNameLink(name, opts)`
+is synchronous and returns the finished markup:
+
+* `opts.id` given → `#/nodes/device/<id>`, the device's own pane.
+* no id → `#/nodes?name=<name>`, which fills the Nodes search box.
+* `opts.search: false` and no id → escaped plain text. One caller
+  (`alerts.js`'s Object column) needs this: an alert's `entity_label` is a
+  device name only while `device_id` says so, and searching Nodes for a
+  DHCP scope's label would answer with the wrong device or with nothing.
+* no Nodes read, or an empty name → escaped plain text.
+
+Two things are in the helper rather than at the eleven call sites because
+each one would otherwise restate them. The first is that permission check:
+`App.canRead('nodes')`, the browser-side twin of `api.py`'s `_dash_can`,
+so an account that cannot open Nodes is never handed a link into it. The
+second is escaping — the helper is the one place the product builds an
+anchor out of a name somebody else chose, and both the label and the query
+string go through `escapeHtml`/`URLSearchParams`. In `App.drawRows` a
+column may only emit markup through `cell:` (the default path escapes), so
+every one of these sites is a `cell:`.
+
+`#/nodes?name=` is a second query key rather than a flag on `?q=` because
+`nodes.js`'s `activate()` arms `view.macSearchPending` for **any** `?q=`
+— that is what makes IPAM's conflict rows (`{ q: mac }`) run a MAC search
+on arrival. A device named `beef01` is 4–12 hex characters, so routing
+name links through `?q=` would have raised "…looks like an attempt at a MAC
+address" under a search that had just worked. Both keys write into the same
+`nd-q` field; only `q` sets the flag.
+
 ### Lazy module loading (`app.js`, `index.html`) — 4.49.0
 
 Before this release, `index.html` carried thirteen `<script defer>` tags —
@@ -7613,6 +8003,69 @@ pinned to loopback does not get relays on every interface.
 `SO_EXCLUSIVEADDRUSE` on Windows and no `SO_REUSEADDR` anywhere: sharing a
 relay port is the one thing that must not happen.
 
+**Framing (`http` only).** `_serve` gives an `http` connection an
+`_HttpConnection` and both its pumps run `_frame` instead of `_copy`: a head
+is read whole (capped at `MAX_HEAD_BYTES`), rewritten, and the body streamed
+after it — `Content-Length` bytes, or chunk by chunk with the chunk framing
+passed through verbatim, so a body is never buffered whole and crosses byte
+for byte. Keep-alive is the normal case; the loop just goes round again.
+Outbound, `Host:` becomes `device_authority` (`<ip>:<port>`), which is what
+stops a device rebuilding its URLs out of this server's name — the reported
+`Location: https://<server>/home.asp`. Everything else in the request head
+that names the browser-facing authority moves with it, onto `device_origin`
+(`<scheme>://<ip>:<port>`): `Origin` through `map_origin`, `Referer` and a
+request target written in absolute form through `map_url`. Moving `Host`
+alone would leave the three disagreeing at the device, and an embedded UI
+that compares `Origin` or `Referer` against `Host` answers such a POST 403 —
+a login form that worked before 5.4.0, when all three named the relay and
+agreed, and a fault that presents as the device's since GET is unaffected.
+Inbound, `Location`, `Content-Location`, `Refresh` and `Set-Cookie`'s
+`Domain=` go through `map_url` / `map_refresh` / `map_cookie`: an absolute
+URL naming either `relay_names` member (the host the browser reached this
+server on, and the device's own address) **on the scheme this tunnel
+carries** is moved onto `origin`, and a `Domain=` naming either is dropped so
+the cookie is host-only and the browser keeps it on the relay. Nothing else
+is touched, bodies included.
+
+**The scheme is part of the match** (`_is_ours`). An `http` device answering
+`Location: https://<itself>/` is saying its UI is on TLS, which this tunnel
+does not carry; mapping that onto the relay's own `http://` origin would send
+the browser back into the same plaintext tunnel, to the same redirect, until
+it gave up around twenty hops in. Such a `Location` is left exactly as the
+device wrote it, so the browser leaves the tunnel and fails naming the
+device — what it did before 5.4.0, and the true thing to tell an operator.
+
+**Falling back.** `frame_request` / `frame_response` return `None` for
+anything not fully understood — a `101` upgrade, a `CONNECT`, an
+unparseable request or status line, obsolete line folding, a
+`Transfer-Encoding` that is not plainly `chunked`, a `Content-Length` that
+is not one number, a head carrying both of those (two framings that can
+disagree, and which one the device honours is its own business — the relay
+reads neither rather than forwarding both and picking one), an over-long
+head. `_blindly` then sets
+`_HttpConnection.blind` and copies the rest with `_copy`, the head it could
+not read pushed back on the front of the buffer first, so not a byte is
+dropped or repeated. The switch is one-way and shared: `_read_head` checks
+it after every `recv`, and a direction that gave up sets it *before*
+forwarding the message that made it give up, so the peer direction cannot
+frame anything that arrives afterwards (a browser sends WebSocket frames
+only after it has seen the `101`). The pump is the floor — no device that
+worked before 5.4.0 can be broken by the parser. A response's method comes
+from `_HttpConnection.take()`, pushed by the request direction before the
+request is forwarded and popped only for a final (non-1xx) response, since a
+`HEAD` answer carries no body however its head is framed. An `https`
+session never frames at all.
+
+**A known limitation, not fixed.** On a TLS install `server.py` sends
+`Strict-Transport-Security` for its own hostname. HSTS is host-scoped and
+port-agnostic, so a browser that has loaded the UI over TLS will rewrite the
+`http://<server>:<relay port>/` URL the relay hands back into `https://` and
+present a TLS handshake to a plaintext relay, which fails. It bites the
+`http` device on a TLS install; the relay cannot fix it from its own side
+(the rewrite happens in the browser before the connection is made), and the
+fix is either a certificate on the relay port or an HSTS policy that is not
+whole-host. Nothing here should be read as it being handled.
+
 **Threads.** One accept thread and one watchdog per session, plus two per
 connection (a handler that dials the device and runs one direction inline,
 and a pump thread for the other). Blocking threads rather than one selector
@@ -7637,8 +8090,9 @@ URL therefore names whatever address the browser used to reach the interface
 (a hostname, a NAT address, `localhost`), which is the only address it is
 known to be able to reach; deriving it from the listener would hand a
 machine on the plant network a URL naming `0.0.0.0`. The scheme is the
-device's, not this server's, since the relay is a raw TCP copy and a device
-on `https` carries its own TLS through.
+device's, not this server's, since an `https` device carries its own TLS
+through an unread tunnel. `origin` is that URL without its trailing slash,
+and it is what the inbound rewriting maps addresses onto.
 
 **The client.** `nodes.js`'s `webDevice()` opens the window *before* the
 POST and sets its `location` afterwards: a `window.open` that runs after an
