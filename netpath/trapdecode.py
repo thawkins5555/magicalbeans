@@ -368,6 +368,35 @@ def localized_key(proto: str, password: str, engine_id: bytes) -> bytes | None:
     return localized
 
 
+PRIV_KEY_LEN = 16     # AES-128 (usmAesCfb128Protocol, RFC 3826) — the only cipher spoken
+
+
+def privacy_key(auth_proto: str, priv_password: str, engine_id: bytes) -> bytes | None:
+    """The AES-128 privacy key for one user on one engine: RFC 3826 s1.2.
+
+    USM has no privacy hash of its own — the privacy password goes through
+    the AUTHENTICATION protocol's password-to-key and localisation (RFC
+    3414 A.2), which is why this takes `auth_proto` and not a privacy
+    protocol name. That yields a key of the digest's length: MD5 gives
+    exactly the 16 bytes AES-128 needs, SHA-1 gives 20, SHA-224/256/384/512
+    give 28/32/48/64 — and the cipher key is always the FIRST 16 of them
+    (RFC 3826 s1.2, RFC 3414 s2.6 for DES before it): never the last, never
+    a fold. The remainder is simply unused. AES-192/256 would need the
+    Reeder/Blumenthal key extension instead, which is exactly why they are
+    not offered (see snmpcrypt's docstring).
+
+    Reuses localized_key and its cache rather than deriving again, so the
+    1 MiB password hash is paid once per (protocol, password, engine)
+    rather than once per message. That cache is bounded and lives for the
+    process lifetime, and a Python bytes object cannot be wiped — both are
+    documented in CREDENTIAL-SECURITY.md rather than pretended otherwise.
+    """
+    full = localized_key(auth_proto, priv_password, engine_id)
+    if full is None:
+        return None
+    return full[:PRIV_KEY_LEN]
+
+
 class Decoder:
     def __init__(self, log=None):
         self.log = log
@@ -633,11 +662,15 @@ class Decoder:
             # and is worth storing: who sent it, from which engine, as which
             # user.
             #
-            # Not decrypted: DES-CBC (RFC 3414) and AES-CFB (RFC 3826)
-            # both need a block cipher the standard library does not
-            # provide, and this app takes no third-party dependencies. An
-            # authPriv trap is stored with everything the header carries in
-            # the clear and flagged in the UI.
+            # Not decrypted here — yet. The poller speaks AES-128-CFB (RFC
+            # 3826) since 5.8.0 through netpath/snmpcrypt.py, and that
+            # module was written as a leaf precisely so this decoder can
+            # use it without a cycle; wiring it in — a privacy password per
+            # v3 trap user, the key localised to the SENDER's engine id off
+            # the wire, and decryptionErrors accounting — is a deliberate
+            # follow-up. Until then an authPriv trap is stored with
+            # everything the header carries in the clear and flagged in
+            # the UI, as it always was.
             self.stats["v3_encrypted"] += 1
             trap.auth_state = "encrypted"
             trap.trap_oid = ""
