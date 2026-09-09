@@ -17,6 +17,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from .ipam_scan import mac_colon
 from .worker import hidden
 
 IS_WINDOWS = os.name == "nt"
@@ -320,6 +321,30 @@ def _parse_iso(text: str | None) -> float | None:
         return None
 
 
+def _stored_mac(client_id) -> str | None:
+    """A lease's ClientId as dhcp_leases.mac stores it.
+
+    The DhcpServer module reports a client as `AA-BB-CC-DD-EE-FF` — dashes,
+    upper case — where everything else in ipam.db holds a MAC the way
+    ipam_scan.mac_colon() writes it (`aa:bb:cc:dd:ee:ff`): the sweep's
+    hosts.mac comes straight out of that function. Leaving the DHCP form
+    as-is meant a lease and the sweep's sighting of the same card never
+    compared equal, and an operator typing the colon form into the search
+    box never found a lease at all. Converting here, at ingest, is what
+    lets an exact lookup use the index on the column instead of every
+    reader re-deriving the canonical spelling for itself.
+
+    A ClientId that is not a MAC — a DHCPv6 DUID, a hardware-type-prefixed
+    id on a BOOTP reservation — is kept as the server reported it rather
+    than blanked: the lease table shows the column, and an empty cell would
+    read as "the server has no client id", which is not what happened.
+    """
+    text = (client_id or "").strip() if isinstance(client_id, str) else client_id
+    if not text:
+        return None
+    return mac_colon(text) or text
+
+
 @dataclass
 class DhcpSnapshot:
     scopes: list[dict] = field(default_factory=list)
@@ -343,7 +368,7 @@ def poll(server: str, timeout_s: float = 30.0,
         leases.append({
             "scope_id": row.get("scope_id"),
             "ip": row.get("ip"),
-            "mac": row.get("mac"),
+            "mac": _stored_mac(row.get("mac")),
             "hostname": row.get("hostname"),
             "address_state": row.get("address_state"),
             "lease_expires_ts": _parse_iso(row.get("lease_expires")),
@@ -361,7 +386,8 @@ def poll(server: str, timeout_s: float = 30.0,
             # A reservation with no matching lease row — never claimed by a
             # client, so it would otherwise be invisible.
             leases.append({
-                "scope_id": res.get("scope_id"), "ip": ip, "mac": res.get("mac"),
+                "scope_id": res.get("scope_id"), "ip": ip,
+                "mac": _stored_mac(res.get("mac")),
                 "hostname": None, "address_state": "ReservedUnclaimed",
                 "lease_expires_ts": None, "is_reservation": True,
                 "description": res.get("name") or res.get("description"),
