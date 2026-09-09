@@ -362,6 +362,8 @@ class Agent:
             return enc_int(index)
         if key == "if_descr":
             return enc_octets(f"Gi0/{index}")
+        if key == "if_type":
+            return enc_int(6)                        # ethernetCsmacd
         if key == "if_admin_status":
             return enc_int(1)
         if key == "if_oper_status":

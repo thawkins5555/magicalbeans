@@ -72,7 +72,7 @@ class _OneInterfaceAgent:
     since both scenarios here only ever need one row."""
 
     def __init__(self, *, if_speed: int, if_high_speed: int | None,
-                hc_out_answers: bool):
+                hc_out_answers: bool, if_type: int = 6):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("127.0.0.1", 0))
         self.port = self.sock.getsockname()[1]
@@ -82,6 +82,7 @@ class _OneInterfaceAgent:
         self.started_at = time.time()
         self.if_speed = if_speed
         self.if_high_speed = if_high_speed
+        self.if_type = if_type          # ethernetCsmacd unless a test says else
         self.hc_out_answers = hc_out_answers
         self.hc_in = 10_000_000
         self.hc_out = 10_000_000
@@ -167,6 +168,8 @@ class _OneInterfaceAgent:
             return enc_int(1)
         if oid == f"{IF['if_descr']}.1":
             return enc_octets("Gi0/1")
+        if oid == f"{IF['if_type']}.1":
+            return enc_int(self.if_type)
         if oid == f"{IF['if_admin_status']}.1":
             return enc_int(1)
         if oid == f"{IF['if_oper_status']}.1":

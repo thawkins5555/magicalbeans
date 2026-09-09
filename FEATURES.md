@@ -1054,6 +1054,18 @@ exact ifSpeed wins where it can answer, and where it cannot the reading is
 interpreted in the units it was evidently given. A genuine 400G or 800G
 port is unaffected and reads at its real speed.
 
+Two readings that look implausible but are not are recognised rather than
+rescaled. A **port-channel** is as fast as the ports in it, so an 8x400G
+bundle legitimately reports 3.2 Tb/s: the interface's type is read, and an
+aggregate is judged against the largest bundle that can exist (16x800G)
+instead of a single port's ceiling. And some agents report ifSpeed
+truncated to 32 bits rather than saturated, so a 400G port can answer a
+correct ifHighSpeed alongside an ifSpeed of 568 Mb/s — that is the same
+number with its top bits gone, not the device contradicting itself, and it
+is now recognised as such instead of dragging the port down to 568 Mb/s
+(where its utilisation pinned at 100 % and its throughput graph went
+blank).
+
 **Poll now shows that it is running.** A poll is handed to a worker
 thread, so the button reports *Queued* or *Polling* until the device's own
 last-poll time actually moves, then settles to *Polled* — it used to look

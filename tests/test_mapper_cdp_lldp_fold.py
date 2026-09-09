@@ -242,6 +242,60 @@ check("...and no other device's port index rides along with it",
       [(row["matched_device_id"], row["matched_if_index"]) for row in disagreeing])
 
 
+# ------------------------------------ a DISABLED device shares the chassis MAC
+
+def _disabled_twin_rows():
+    """One physical box carrying two device rows: a disabled duplicate an
+    operator kept rather than deleted (the lower id), and the enabled row that
+    is actually polled. Both carry the box's chassis MAC on an interface.
+    Also the shape a shared virtual MAC has — VRRP/HSRP on a pair whose
+    lower-id router is disabled."""
+    tmp = tmpdir("mapper_disabled_twin_")
+    db = NodesDatabase(os.path.join(tmp, "nodes.db"))
+    try:
+        group_id = db.ensure_default_group()
+        observer = db.add_device("10.0.0.1", "edge-sw-1", group_id=group_id)
+        retired = db.add_device("10.0.0.9", "core-sw (old entry)", group_id=group_id)
+        live = db.add_device("10.0.0.2", "core-sw", group_id=group_id)
+        db.update_device(retired, enabled=0)
+        mac = "00:11:22:33:44:55"
+        for device_id in (retired, live):
+            db.replace_interfaces(device_id, [
+                {"if_index": 20, "descr": "Gi1/0/20", "alias": "",
+                 "phys_addr": mac, "speed_bps": 1e9,
+                 "admin_status": "up", "oper_status": "up"}])
+        db.replace_neighbors(observer, [{
+            "if_index": 10, "protocol": "lldp", "rem_index": "0.10.1",
+            "chassis_id": mac, "chassis_id_subtype": 4, "port_id": "Gi1/0/20",
+            "port_id_subtype": 5, "port_descr": "", "sys_name": "",
+            "sys_descr": "", "platform": "", "remote_address": "",
+        }])
+        return live, [dict(row) for row in db.all_neighbours()]
+    finally:
+        db.close()
+
+
+live_id, twin_rows = _disabled_twin_rows()
+check("a chassis MAC shared with a DISABLED device still matches the enabled one",
+      [row["matched_device_id"] for row in twin_rows] == [live_id],
+      [(row["matched_device_id"], row["matched_if_index"]) for row in twin_rows])
+check("...pointing at that device's own port",
+      [row["matched_if_index"] for row in twin_rows] == [20],
+      [row["matched_if_index"] for row in twin_rows])
+check("...and matched_by_mac_id agrees, so the suggestion keeps its confidence",
+      [row["matched_by_mac_id"] for row in twin_rows] == [live_id],
+      [row["matched_by_mac_id"] for row in twin_rows])
+links_twin, twin_peers = assemble_links(twin_rows, port_vlans={},
+                                        port_label=label_of, on_map=all_on_map,
+                                        now=NOW)
+check("...drawing a link BETWEEN the two devices, not one dead-ending in an "
+      "unmanaged peer",
+      len(links_twin) == 1 and links_twin[0]["b_device_id"] == live_id
+      and not links_twin[0]["unmanaged"], links_twin)
+check("...and no phantom peer standing in for the device it failed to match",
+      twin_peers == [], twin_peers)
+
+
 def main():
     print()
     if FAILS:
