@@ -911,17 +911,23 @@ them, so a device that built its redirect from the `Host:` header it was
 sent — this server's name, the tunnel's port dropped — answered `Location:
 https://<this server>/home.asp` and the browser followed it to the
 management interface's own port. The tunnel now asks the device for its own
-address and port, so it builds its pages against itself, and maps every
-address the answer names — `Location`, `Content-Location`, `Refresh` and a
-cookie's `Domain=` — back onto the tunnel's own origin, whether the device
-named this server or itself. A page whose links are written out in full
-therefore stays inside the tunnel, which it did not before. Bodies are
+address and port, so it builds its pages against itself — and the rest of the
+request says the same, so a device that checks where a form was posted from
+still sees one address rather than two. It maps every address the answer
+names — `Location`, `Content-Location`, `Refresh` and a cookie's `Domain=` —
+back onto the tunnel's own origin, whether the device named this server or
+itself. A page whose links are written out in full therefore stays inside the
+tunnel, which it did not before. An `http` device that sends the browser to
+`https://` is the exception, and deliberately so: that address is left alone,
+because the tunnel does not carry TLS and pretending otherwise would only
+send the browser round the same redirect until it gave up. Bodies are
 streamed through untouched and never held, so a firmware image crosses byte
 for byte. A device on `https` is still carried unread — its certificate is
 its own, and your browser names the device in the warning rather than this
 server — and so its absolute links still step outside the tunnel; so is any
 `http` connection the framing cannot account for (a WebSocket upgrade, a
-`CONNECT`, a start line that is not one, a body of undeclared length), which
+`CONNECT`, a start line that is not one, a body of undeclared length or of
+two declared at once), which
 falls back to the old byte copy for the rest of that connection. The port range the tunnels bind is set under **Settings →
 Sign-in**; it needs an inbound TCP rule in this host's firewall for browsers
 on other machines to reach it.

@@ -4565,11 +4565,20 @@
         read or kept.</p>
         <p><b>Following its links.</b> For a device on <code>http</code>, the
         tunnel reads the headers each side sends. The device is asked for its
-        own address, so it builds its pages against itself; and every address
-        it names on the way back — a redirect, a refresh, a cookie's domain —
-        is put back onto the tunnel. A link written out in full
-        (<code>http://10.2.0.7/status</code>) therefore stays inside the
-        tunnel, which it did not before 5.4.</p>
+        own address, so it builds its pages against itself, and the rest of
+        the request agrees — which is what lets a device that checks where a
+        form was posted from accept your login. Every address it names on the
+        way back — a redirect, a refresh, a cookie's domain — is put back onto
+        the tunnel, so a link written out in full
+        (<code>http://10.2.0.7/status</code>) stays inside it, which it did
+        not before 5.4.</p>
+        <p><b>Except a jump to https.</b> If a device on <code>http</code>
+        answers by sending you to <code>https://</code>, that address is left
+        as the device wrote it and your browser steps outside the tunnel to
+        follow it — which only works from a machine that already has a route
+        to the device. The device is telling you its interface is on HTTPS:
+        set the <b>WEB INTERFACE</b> scheme on Edit to <code>https</code> and
+        the tunnel will carry it.</p>
         <p><b>A device on https is different.</b> Its traffic is carried
         without being read, so its certificate is its own — your browser will
         name the device in the warning, not this server — but nothing in it

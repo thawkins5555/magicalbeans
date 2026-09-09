@@ -486,6 +486,140 @@ try:
           headers(heads[0], "X-Kept"))
     service.web_relays.close(relay["session_id"], "test teardown")
 
+    # The whole request head names the device, not the relay. Before 5.4 the
+    # browser's Host, Origin and Referer all named the relay and agreed there;
+    # moving Host alone left them disagreeing at the device, which is what an
+    # embedded UI checks before it accepts a login POST.
+    echoed = []
+
+    def echo_head(conn):
+        buf = bytearray()
+        while True:
+            head = read_head(conn, buf)
+            if not head:
+                return
+            length = headers(head, "Content-Length")
+            if length:
+                read_body(conn, buf, int(length[0]))
+            echoed.append(head)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+
+    echo_port = raw_device(echo_head)
+    relay = relay_to(echo_port)
+    device_origin = f"http://127.0.0.1:{echo_port}"
+    sock = socket.create_connection(("127.0.0.1", relay["port"]), timeout=15)
+    buf = bytearray()
+    sock.sendall(
+        f"POST /login.asp HTTP/1.1\r\nHost: {SERVER_NAME}:{relay['port']}\r\n"
+        f"Origin: http://{SERVER_NAME}:{relay['port']}\r\n"
+        f"Referer: http://{SERVER_NAME}:{relay['port']}/login.asp\r\n"
+        f"Content-Length: 3\r\n\r\nabc".encode("ascii"))
+    read_head(sock, buf)
+    sock.sendall(f"GET http://{SERVER_NAME}:{relay['port']}/abs HTTP/1.1\r\n"
+                 f"Host: {SERVER_NAME}:{relay['port']}\r\n\r\n".encode("ascii"))
+    read_head(sock, buf)
+    sock.close()
+    check("Origin is pointed at the device, and carries no path",
+          headers(echoed[0], "Origin") == [device_origin],
+          headers(echoed[0], "Origin"))
+    check("Referer is too, path and all",
+          headers(echoed[0], "Referer") == [f"{device_origin}/login.asp"],
+          headers(echoed[0], "Referer"))
+    check("so Host, Origin and Referer name one authority at the device",
+          headers(echoed[0], "Host") == [f"127.0.0.1:{echo_port}"]
+          and {value.split("//")[-1].split("/")[0]
+               for value in headers(echoed[0], "Origin")
+               + headers(echoed[0], "Referer")} == {f"127.0.0.1:{echo_port}"},
+          echoed[0])
+    check("and a request target written out in full moves with them",
+          echoed[1].split(b" ")[1] == f"{device_origin}/abs".encode("ascii"),
+          echoed[1].split(b"\r\n")[0])
+    service.web_relays.close(relay["session_id"], "test teardown")
+
+    # The device those three are for: it refuses a POST whose Origin is not
+    # its own Host.
+    def picky(conn):
+        buf = bytearray()
+        while True:
+            head = read_head(conn, buf)
+            if not head:
+                return
+            length = headers(head, "Content-Length")
+            if length:
+                read_body(conn, buf, int(length[0]))
+            agrees = ((headers(head, "Origin") or [""])[0]
+                      == "http://" + (headers(head, "Host") or [""])[0])
+            conn.sendall((b"HTTP/1.1 200 OK" if agrees
+                          else b"HTTP/1.1 403 Forbidden")
+                         + b"\r\nContent-Length: 0\r\n\r\n")
+
+    relay = relay_to(raw_device(picky))
+    sock = socket.create_connection(("127.0.0.1", relay["port"]), timeout=15)
+    buf = bytearray()
+    sock.sendall(
+        f"POST /login.asp HTTP/1.1\r\nHost: {SERVER_NAME}:{relay['port']}\r\n"
+        f"Origin: http://{SERVER_NAME}:{relay['port']}\r\n"
+        f"Content-Length: 3\r\n\r\nabc".encode("ascii"))
+    posted = read_head(sock, buf)
+    sock.close()
+    check("a device that compares Origin against Host accepts the login POST",
+          posted.startswith(b"HTTP/1.1 200"), posted.split(b"\r\n")[0])
+    service.web_relays.close(relay["session_id"], "test teardown")
+
+    # A device on plain HTTP sending the browser to https is saying its UI is
+    # somewhere this tunnel does not go. Rewriting that onto the relay's own
+    # http origin would only bring the browser back here, and round again.
+    https_box = {}
+
+    def to_https(conn):
+        buf = bytearray()
+        while True:
+            head = read_head(conn, buf)
+            if not head:
+                return
+            conn.sendall(
+                f"HTTP/1.1 302 Found\r\n"
+                f"Location: https://127.0.0.1:{https_box['port']}/\r\n"
+                f"Content-Length: 0\r\n\r\n".encode("latin-1"))
+
+    https_box["port"] = raw_device(to_https)
+    relay = relay_to(https_box["port"])
+    sock = socket.create_connection(("127.0.0.1", relay["port"]), timeout=15)
+    buf = bytearray()
+    sock.sendall(f"GET / HTTP/1.1\r\nHost: {SERVER_NAME}:{relay['port']}"
+                 f"\r\n\r\n".encode("ascii"))
+    bounced = read_head(sock, buf)
+    sock.close()
+    check("a Location on a scheme this tunnel does not carry is left naming "
+          "the device, not turned into a redirect back into the tunnel",
+          headers(bounced, "Location")
+          == [f"https://127.0.0.1:{https_box['port']}/"],
+          headers(bounced, "Location"))
+    service.web_relays.close(relay["session_id"], "test teardown")
+
+    # Content-Length and Transfer-Encoding together are two framings that can
+    # disagree; which one the device honours is its own business, so the head
+    # is not read and nothing in it is rewritten.
+    BOTH = (f"HTTP/1.1 200 OK\r\nLocation: http://{SERVER_NAME}/home.asp\r\n"
+            f"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"
+            f"hello").encode("latin-1")
+
+    def two_framings(conn):
+        buf = bytearray()
+        if read_head(conn, buf):
+            conn.sendall(BOTH)
+
+    relay = relay_to(raw_device(two_framings))
+    sock = socket.create_connection(("127.0.0.1", relay["port"]), timeout=15)
+    sock.sendall(f"GET / HTTP/1.1\r\nHost: {SERVER_NAME}:{relay['port']}\r\n"
+                 f"Connection: close\r\n\r\n".encode("ascii"))
+    both_answer = read_all(sock)
+    sock.close()
+    check("a head carrying both framings goes blind rather than picking one, "
+          "so it crosses exactly as the device wrote it",
+          both_answer == BOTH, both_answer[:160])
+    service.web_relays.close(relay["session_id"], "test teardown")
+
     # Bodies: streamed, never held whole, never altered.
     PAYLOAD = os.urandom(300 * 1024)
     DIGEST = hashlib.sha256(PAYLOAD).hexdigest()
