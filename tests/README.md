@@ -55,16 +55,21 @@ stub, no browser, no server.
 ## The benchmarks (`bench_*.py`)
 
 `run_all.py` globs `test_*.py`, so nothing named `bench_*` is ever collected —
-which is the point. A benchmark's answer depends on the disk, the CPU and the
-page cache under it, so these print numbers rather than asserting them, and
-are run by hand when a change is meant to move one:
+which is the point. What a benchmark measures depends on the disk, the core
+count and the operating system under it, and a threshold that passes on one
+machine is a false alarm on the next, so these print numbers rather than
+asserting them and are run by hand when a change is meant to move one:
 
 ```
-python3 tests/bench_flow_overview.py [rows ...]       # raw flows vs the rollups
+python3 tests/bench_flow_overview.py [rows ...]        # raw flows vs the rollups
 python3 tests/bench_record_samples.py [rows] [preload] # per-sample vs batched writes
 python3 tests/bench_web_requests.py [devices ...] [--tabs N] [--iterations N]
 python3 tests/bench_db_search.py [scale ...] [--repeats N]
+python3 tests/bench_prune.py [rows]                    # every prune, and what it freezes
+python3 tests/bench_poll_cycle.py [devices ...]        # poll lateness by fleet and pool size
+python3 tests/bench_ping.py                            # one ICMP probe, each path this host has
 ```
+
 
 `bench_web_requests.py` stands up a real `Service` over ten SQLite files and a
 `WebServer` on a free loopback port — the same fixture `test_web_security.py`
@@ -95,6 +100,30 @@ whether each read scans or seeks, which is the fact an index would have to
 change. Sizes are scale factors over a base profile (default `1 4 16`), chosen
 so `x4` puts the fleet at the 2,000 devices the comment at `nodesdb.py:1282`
 records its text-search measurement against.
+
+`bench_prune.py` is the one whose last column matters most. Every store here
+guards one sqlite connection with one RLock, and each shipped prune holds it
+for the whole DELETE, so a second thread reads the store every 5 ms while the
+prune runs and keeps the worst wait it saw: that is "the page froze for a
+moment", and no wall-clock total for the prune can show it. It also reports
+INSERT throughput into each store's hot table before and after its prune, so
+the cost of a retention index is recorded beside its benefit.
+
+`bench_poll_cycle.py` drives the real `NodePoller._loop`/`_schedule_pass`
+against a real `ThreadPoolExecutor`, monkeypatching only `_poll_device` to a
+sleep drawn from a fixed, seeded distribution — no SNMP, no sockets, same
+schedule every run. Its headline is lateness (`actual_poll_ts - due_ts`),
+which is how late an outage would be noticed; the overrun counter the product
+ships only starts moving a whole cycle later. `--stub` is the calibration
+pass: real `tests/stubs` agents through the real `_poll_device`, so the
+synthetic costs can be checked against the real parse-and-write path.
+
+`bench_ping.py` forces each `NETPATH_PING_MODE` in turn and times probes to
+127.0.0.1, which is what makes it runnable anywhere: the target answers
+instantly everywhere, so what is left is the cost of the mechanism. It asks
+`ipam_scan.ping_mode_summary()` and `_icmp_socket_kind()` what the paths are
+rather than knowing itself, so a new implementation added to `ipam_scan.py`
+appears as a new row without the bench changing.
 
 ## The browser checks (`tests/ui/`)
 
