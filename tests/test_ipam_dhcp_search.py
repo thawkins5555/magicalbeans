@@ -17,6 +17,7 @@ from _paths import tmpdir
 
 import netpath.ipam_dhcp as ipam_dhcp
 from netpath.ipamdb import IpamDatabase, mac_search_digits
+from netpath.web import api
 from netpath.web.service import Service
 
 TMP = tmpdir("ipam_dhcp_search_")
@@ -275,6 +276,32 @@ check("ipam_search labels a reservation as one",
 results = Service.ipam_search(Stub(), "10.20.3")
 check("ipam_search by address is unchanged",
       {r["ip"] for r in results} >= {"10.20.3.42", "10.20.3.99", "10.20.3.200"}, results)
+
+
+# --------------------------- 7b. the global search's own lease endpoint
+# ipam_search above folds both of the card's leases into ONE host record
+# and drops the scope, server, expiry and reservation flag on the way; the
+# lease-search handler returns them as the two leases they are.
+payload = api.get_ipam_dhcp_lease_search(Stub(), {"q": "AABB.CCDD.EEFF"}, None)
+leases = {l["ip"]: l for l in payload["leases"]}
+check("lease-search finds both leases for a MAC in a spelling nobody stored",
+      set(leases) == {"10.20.3.42", "10.30.0.77"}, payload)
+lease = leases.get("10.20.3.42", {})
+check("...each carrying ip, mac, hostname, scope, server, state, expiry, reservation flag",
+      lease.get("mac") == MAC and lease.get("hostname") == "printer-3rd-floor"
+      and lease.get("scope_id") == "10.20.3.0" and lease.get("server_label") == "Site A"
+      and lease.get("address_state") == "Active"
+      and isinstance(lease.get("lease_expires"), (int, float))
+      and lease.get("is_reservation") is False and "description" in lease, lease)
+check("...and the other lease names ITS server, which is the point of not merging them",
+      leases.get("10.30.0.77", {}).get("server_label") == "Site B", leases)
+reservation = api.get_ipam_dhcp_lease_search(Stub(), {"q": "coffee"}, None)["leases"]
+check("lease-search by description flags a reservation as one",
+      [(l["ip"], l["is_reservation"]) for l in reservation] == [("10.30.0.5", True)],
+      reservation)
+check("a needle under two characters answers an empty list, never the whole table",
+      api.get_ipam_dhcp_lease_search(Stub(), {"q": "1"}, None) == {"leases": []}
+      and api.get_ipam_dhcp_lease_search(Stub(), {}, None) == {"leases": []})
 db.close()
 
 

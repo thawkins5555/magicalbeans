@@ -15,6 +15,7 @@ TMP = tmpdir("arp_tables_")
 import netpath.nodepoll as nodepoll_mod
 from netpath.nodesdb import NodesDatabase
 from netpath.nodepoll import NodePoller
+from netpath.web import api
 
 
 def stub_stat(port: int, command: bytes) -> str:
@@ -411,6 +412,88 @@ db.remove_device(did_default)
 poller._forget_devices({did_off})
 check("_forget_devices drops the removed device's schedule",
       did_default not in poller._next_arp_walk, poller._next_arp_walk)
+db.close()
+
+# ------------------------------------------------- 8. the API payloads
+# The three read handlers, called directly against just enough of Service
+# — test_mac_tables.py's own idiom for get_nodes_mac_search.
+db = new_db("api")
+gid = db.ensure_default_group()
+did = db.add_device("10.0.0.80", name="api-rtr", group_id=gid)
+db.replace_interfaces(did, [
+    {"if_index": 7, "descr": "Vlan10", "phys_addr": "00:00:5e:00:01:0a"}])
+seen1 = time.time()
+db.replace_arp_entries(did, [
+    {"if_index": 7, "ip": "10.0.10.5", "mac": "aa:bb:cc:dd:ee:ff", "entry_type": "dynamic"},
+    {"if_index": 9, "ip": "10.0.20.5", "mac": "00:11:22:33:44:55", "entry_type": "static"},
+], now=seen1)
+seen2 = seen1 + 30.0
+db.replace_arp_entries(did, [
+    {"if_index": 9, "ip": "10.0.20.5", "mac": "00:11:22:33:44:55", "entry_type": "static"},
+], now=seen2)   # the first row aged out of the cache: marked absent, kept
+db.save_settings({**db.settings(), "mac_table_retention_days": 3.5})
+
+
+class Svc:
+    nodes_db = db
+    node_poller = None
+    nodes_settings = db.settings()
+
+
+payload = api.get_nodes_arp_search(Svc, {"q": "AA-BB-CC-DD-EE-FF"}, None)
+loc = payload["locations"][0] if payload["locations"] else {}
+check("arp-search by MAC: the payload carries device, interface, ip, mac and type",
+      len(payload["locations"]) == 1
+      and loc.get("device_id") == did and loc.get("device_name") == "api-rtr"
+      and loc.get("if_index") == 7 and loc.get("if_descr") == "Vlan10"
+      and loc.get("ip") == "10.0.10.5" and loc.get("mac") == "aabbccddeeff"
+      and loc.get("entry_type") == "dynamic", payload)
+check("...and present=False with the seen_ts of the walk that last saw it",
+      loc.get("present") is False and loc.get("seen_ts") == seen1
+      and loc.get("first_seen_ts") == seen1, loc)
+check("...and echoes the needle, retention_days and the enabled count",
+      payload.get("needle") == "AA-BB-CC-DD-EE-FF"
+      and payload.get("retention_days") == 3.5
+      and payload.get("enabled_devices") == 0, payload)
+by_ip = api.get_nodes_arp_search(Svc, {"q": "10.0.20"}, None)
+check("arp-search by IP prefix, with the 'Interface N' fallback for an unknown ifIndex",
+      [l["ip"] for l in by_ip["locations"]] == ["10.0.20.5"]
+      and by_ip["locations"][0]["if_descr"] == "Interface 9"
+      and by_ip["locations"][0]["present"] is True, by_ip)
+check("arp-search refuses what arp_locations refuses, with an empty list",
+      api.get_nodes_arp_search(Svc, {"q": "api-rtr"}, None)["locations"] == []
+      and api.get_nodes_arp_search(Svc, {}, None)["locations"] == [])
+
+table = api.get_nodes_device_arp(Svc, {}, None, did)
+check("device arp: enabled is False and interval_s 0 for a device nobody opted in",
+      table.get("enabled") is False and table.get("interval_s") == 0, table)
+check("...but the stored rows still come back, labelled by interface, if_index-ordered",
+      [(e["ip"], e["local_port"], e["present"]) for e in table["entries"]]
+      == [("10.0.10.5", "Vlan10", False), ("10.0.20.5", "if 9", True)], table)
+db.update_group(gid, arp_table_interval_s=900)
+Svc.nodes_settings = db.settings()
+table = api.get_nodes_device_arp(Svc, {}, None, did)
+check("device arp: enabled once the profile sets an interval (the device stays blank)",
+      table.get("enabled") is True and table.get("interval_s") == 900
+      and db.device(did)["arp_table_interval_s"] is None, table)
+check("arp-search's enabled count follows",
+      api.get_nodes_arp_search(Svc, {"q": "10.0"}, None)["enabled_devices"] == 1)
+
+export = api.get_nodes_device_arp_export(Svc, {}, None, did)
+# The BOM _csv_text leads with (for Excel) is not a column name.
+lines = export["csv"].lstrip("\ufeff").splitlines()
+check("device arp export: the header names the columns in order",
+      lines and lines[0] == "if_index,local_port,ip,mac,entry_type,present,seen_ts,first_seen_ts",
+      lines[:1])
+check("...and a row carries the same fields",
+      export["count"] == 2 and len(lines) == 3
+      and lines[1].startswith("7,Vlan10,10.0.10.5,aabbccddeeff,dynamic,False,")
+      and lines[2].startswith("9,if 9,10.0.20.5,001122334455,static,True,"), lines)
+try:
+    api.get_nodes_device_arp(Svc, {}, None, did + 1000)
+    check("device arp for a device that does not exist is refused", False)
+except Exception as error:   # api._require's own NotFound
+    check("device arp for a device that does not exist is refused", True, error)
 db.close()
 
 print()

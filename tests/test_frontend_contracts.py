@@ -294,8 +294,8 @@ if digit_range:
 # fixed count, since a group added later must keep the same shape.
 GSEARCH = APP[APP.index("async function gsearchRun("):APP.index("function gsearchRender(")]
 gsearch_tries = re.findall(r"try\s*\{[^}]*await get\(", GSEARCH, re.S)
-check(len(gsearch_tries) >= 8,
-      "gsearchRun wraps each lookup in its own try (found %d, want >= 8)"
+check(len(gsearch_tries) >= 10,
+      "gsearchRun wraps each lookup in its own try (found %d, want >= 10)"
       % len(gsearch_tries))
 check("catch (error) { /* a failed lookup just leaves that group out */ }" not in APP,
       "the old single try/catch's comment is gone (it never matched the code under it)")
@@ -303,6 +303,26 @@ check("get('/api/ipam/search'" in GSEARCH and "IPAM hosts" in GSEARCH,
       "global search reaches IPAM hosts")
 check("get('/api/ipam/subnets'" in GSEARCH and "IPAM subnets" in GSEARCH,
       "global search reaches IPAM subnets")
+# The MAC group names the switch PORT in its title (the report was that
+# global search should find a MAC on Node switch ports — it did, and the
+# title never said so) and keeps the port route; the ARP group beside it
+# routes to the device's ARP pane and never to /port/<if_index>, since an
+# ARP row's ifIndex is a routed VLAN, not a physical port. The lease group
+# has its own endpoint because /api/ipam/search folds leases into hosts.
+check("'MAC address on a switch port'" in GSEARCH
+      and "/port/${loc.if_index}" in GSEARCH,
+      "the MAC group's title names the switch port and it still routes to the port")
+check("get('/api/nodes/arp-search'" in GSEARCH and "'ARP cache (IP to MAC)'" in GSEARCH,
+      "global search reaches the ARP caches, titled as the IP-to-MAC mapping")
+ARP_GROUP = GSEARCH[GSEARCH.index("get('/api/nodes/arp-search'"):GSEARCH.index("if (canRead('alerts'))")]
+check("`#/nodes/device/${loc.device_id}/arp`" in ARP_GROUP
+      and "/port/${loc.if_index}" not in ARP_GROUP,
+      "an ARP hit routes to the device's ARP pane, not to a port dialog")
+check("get('/api/ipam/dhcp/lease-search'" in GSEARCH and "'DHCP leases'" in GSEARCH,
+      "global search reaches DHCP leases through their own endpoint")
+GSEARCH_EMPTY = APP[APP.index('class="gsearch-empty"'):APP.index("</p>'", APP.index('class="gsearch-empty"'))]
+check("ARP" in GSEARCH_EMPTY and "DHCP leases" in GSEARCH_EMPTY,
+      "the empty-state text names ARP and DHCP leases among what the box searches")
 check("/api/syslog/search" in GSEARCH and "'Syslog'" in GSEARCH,
       "global search reaches syslog messages")
 check("/api/wireless/aps" in GSEARCH and "Wireless access points" in GSEARCH,
@@ -899,6 +919,23 @@ check('data-subtab="addresses"' in INDEX and 'id="nd-d-sub-addresses"' in INDEX,
       "resolves to")
 check('id="nd-addr-table"' in INDEX and "drawAddressesTable" in NODES,
       "the addresses pane holds #nd-addr-table and nodes.js draws it")
+# The ARP subtab is wired by the same machinery, so the same pairing rule.
+check('data-subtab="arp"' in INDEX and 'id="nd-d-sub-arp"' in INDEX,
+      "index.html has the ARP subtab button and the pane its prefix resolves to")
+check('id="nd-arp-table"' in INDEX and "function drawArpTable(" in NODES
+      and "arp: { path: 'arp'" in NODES,
+      "the ARP pane holds #nd-arp-table, nodes.js draws it and DETAIL_SUBS fetches it")
+check("view.arpEnabled === false" in NODES and "Read the ARP cache every" in NODES,
+      "the ARP pane tells 'walk switched off' from 'nothing collected yet' and names the setting")
+ARP_DRAW = NODES[NODES.index("function drawArpTable("):NODES.index("function drawAddressesTable(")]
+check("nd-arp-mac" in ARP_DRAW and "view.macSearchPending = true" in ARP_DRAW
+      and "App.refreshNow('nodes')" in ARP_DRAW,
+      "an ARP row's MAC cell reuses the Find box's own MAC search (the Enter path) "
+      "rather than a copy of it")
+check("/arp/export.csv" in ARP_DRAW and "nd-arp-export-csv" in ARP_DRAW,
+      "the ARP pane has its own export, wired the way the neighbours pane's is")
+check("parts[2] === 'arp'" in NODES and "selectDetailSub('arp')" in NODES,
+      "#/nodes/device/<id>/arp opens the device and its ARP pane")
 check('id="nd-duplicates"' in INDEX and "duplicatesDialog" in NODES,
       "the Devices bar has the Duplicates button and nodes.js opens it")
 MERGE_BLOCK = NODES[NODES.index("async function mergeDialog("):

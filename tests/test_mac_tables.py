@@ -275,6 +275,22 @@ check("the payload carries first_seen_ts",
       "first_seen_ts" in loc and loc["first_seen_ts"] == seen1, loc)
 check("the payload carries retention_days from settings",
       payload.get("retention_days") == 3.5, payload)
+# The device above never set mac_table_interval_s and neither did its
+# profile, so _merge_config gives it the 3600 fallback and the poller walks
+# it. The count the search shows has to agree: it used to COALESCE to 0 and
+# leave every by-default walker out, so "N devices are learning MAC
+# addresses" under-reported on exactly the installs that never touched the
+# setting.
+check("mac_walk_enabled_count counts a device walking by the inherited default",
+      db.mac_walk_enabled_count() == 1
+      and db.effective_config(db.device(did))["mac_table_interval_s"] == 3600,
+      (db.mac_walk_enabled_count(), dict(db.effective_config(db.device(did)))))
+check("...and the search payload says so", payload.get("enabled_devices") == 1, payload)
+db.update_device(did, mac_table_interval_s=0)
+check("...while a device's explicit 0 still opts it out of the count",
+      db.mac_walk_enabled_count() == 0
+      and db.effective_config(db.device(did))["mac_table_interval_s"] == 0,
+      (db.mac_walk_enabled_count(), dict(db.effective_config(db.device(did)))))
 db.close()
 
 print()
