@@ -149,6 +149,17 @@ community, auth failure, slow responder, tooBig, 32-bit counter wrap, a
 and one that reboots periodically); everything after that is access switches,
 the first 500 of them in `Site-A` behind the core.
 
+`core-sw-01` is also the fleet's one router by SNMP: it answers an ARP cache
+(`ipNetToMediaTable`, 176 rows — two hosts behind each of its 88 downlinks)
+whose IPs are the fleet's own addresses (indices 1–176, spelled the way the
+roster spells them) and whose MACs are ones the same downlink's forwarding
+table already reports, so a MAC clicked in the Nodes ARP tab lands on the
+port it was learned on, and an ARP hit in the global search names a device
+that is actually in Nodes. Two rows (`wlc-01`, `configrx-ssh-01`) are
+`static(4)`, the rest `dynamic(3)`. `seed.py` turns the walk on for that one
+device only (`arp_table_interval_s`, per device, not per profile), so every
+other device's ARP tab shows the shipped "not read for this device" state.
+
 ---
 
 ## Running the pieces separately
@@ -204,7 +215,7 @@ IP already exists, and refreshes what it can. Every call is appended to
 
 ### Campaign settings vs shipped defaults
 
-By default `seed.py` tunes six things away from what the application ships, so
+By default `seed.py` tunes the settings below away from what the application ships, so
 that a 20-minute run on a loopback fleet reaches states that would otherwise
 take days. That is the right choice for a demonstration and the wrong one for a
 capacity figure, and it is why the campaign's numbers cannot be read as "what
@@ -219,6 +230,7 @@ like.
 | profile `poll_interval_s` | 120 s | 60 s | 120 s |
 | profile `snmp_timeout_s` / `snmp_retries` | 3.0 s / 2 | 2 s / 1 | 3.0 s / 2 |
 | profile `mac_table_interval_s` | 3600 s | 300 s | 3600 s |
+| device `arp_table_interval_s` (`core-sw-01` only) | 0 (off) | 300 s | 0 (off) |
 | `poll_workers` | 16 | 32 (`--workers`) | 16 |
 | `new_device_grace_s` | 300 s | 0 | 300 s |
 | `max_emails_per_hour` | 60 | 10,000 | 60 |

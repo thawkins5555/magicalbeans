@@ -359,11 +359,19 @@ PROFILES = [
                 "snmp_retries": 1, "mac_table_interval_s": 300}),
 ]
 
-# The three keys `--defaults` drops from every profile body. Left out, the
-# group row takes its schema defaults (120 s, 3.0 s, 2 retries — `nodesdb.py`
+# The keys `--defaults` drops from every profile body. Left out, the group
+# row takes its schema defaults (120 s, 3.0 s, 2 retries — `nodesdb.py`
 # `groups`), which is what the application ships. `mac_table_interval_s` goes
-# too: 0, meaning off, is the shipped value, and the demo only sets 300 so the
-# MAC-table walks are exercised.
+# too: an hour is the shipped value (`nodesdb._merge_config`), and the demo
+# only sets 300 so the MAC-table walks are exercised inside one run.
+#
+# `arp_table_interval_s` is deliberately NOT here: it ships OFF (0), and it
+# is seeded per DEVICE (step_settings, core-sw-01 only) rather than on a
+# profile, because `v2c-public` covers nearly the whole fleet and only the
+# core persona answers ipNetToMediaTable — a profile-wide 300 s would have
+# every printer, UPS and access switch walking and logging "answers neither
+# table" once each, and would leave no device showing the ARP tab's "not
+# read" state at all.
 _TUNED_PROFILE_KEYS = ("poll_interval_s", "snmp_timeout_s", "snmp_retries",
                        "mac_table_interval_s")
 
@@ -885,21 +893,72 @@ def step_configrx_compliance(client: Client, log: SeedLog) -> dict:
     return {"seeded": True, "rule_set_id": rule_set_id, "rules_stored": len(stored)}
 
 
+# The only device in the fleet whose persona answers an ARP table
+# (personas._build_cisco_core, the core-sw-01 block), so the only one the
+# walk is turned on for — see the comment above _TUNED_PROFILE_KEYS for why
+# this is a device override and not a profile setting. 300 s matches the
+# profiles' mac_table_interval_s: the two tables are joined on the MAC in
+# the ARP pane, so both should be fresh on the same cadence within a run.
+ARP_WALK_DEVICE = "core-sw-01"
+ARP_TABLE_INTERVAL_S = 300
+
+
+def _seed_core_arp_walk(client: Client, log: SeedLog, defaults: bool,
+                        device_ids: dict) -> dict:
+    """PUT arp_table_interval_s on the one device that answers, so the
+    Nodes ARP tab and the global search's ARP group have rows to show.
+    Every other device is left inheriting the shipped 0 — its ARP tab shows
+    the "not read for this device" state, which is worth seeing too."""
+    if defaults:
+        print("[8] --defaults: arp_table_interval_s left at the shipped 0 "
+              "(off) everywhere")
+        return {"device": ARP_WALK_DEVICE, "set": False, "reason": "defaults"}
+    device_id = device_ids.get(ARP_WALK_DEVICE)
+    if not device_id:
+        print("[8] no %s in this run's devices; arp_table_interval_s left "
+              "off everywhere" % ARP_WALK_DEVICE)
+        return {"device": ARP_WALK_DEVICE, "set": False, "reason": "no device"}
+    status, payload, _ = client.raw(
+        "PUT", "/api/nodes/devices/%d" % device_id,
+        {"arp_table_interval_s": ARP_TABLE_INTERVAL_S})
+    if status != 200:
+        log.refusal("8-settings", "/api/nodes/devices/%d" % device_id, status,
+                    error_text(payload))
+        print("[8] arp_table_interval_s on %s -> HTTP %d: %s"
+              % (ARP_WALK_DEVICE, status, error_text(payload)))
+        return {"device": ARP_WALK_DEVICE, "set": False,
+                "reason": "HTTP %d" % status}
+    print("[8] %s (id %d) reads its ARP cache every %d s; every other device "
+          "inherits the shipped 0 (off)"
+          % (ARP_WALK_DEVICE, device_id, ARP_TABLE_INTERVAL_S))
+    log.note("8-settings", "arp_table_interval_s set", device=ARP_WALK_DEVICE,
+             device_id=device_id, interval_s=ARP_TABLE_INTERVAL_S)
+    return {"device": ARP_WALK_DEVICE, "device_id": device_id, "set": True,
+            "interval_s": ARP_TABLE_INTERVAL_S}
+
+
 def step_settings(client: Client, log: SeedLog, workers: int,
-                  defaults: bool = False, ping_interval: int | None = None) -> dict:
-    """8. Alerts/syslog/nodes settings, the alert engine, and two lowered
-    thresholds so the fleet actually trips something.
+                  defaults: bool = False, ping_interval: int | None = None,
+                  device_ids: dict | None = None) -> dict:
+    """8. Alerts/syslog/nodes settings, the alert engine, two lowered
+    thresholds so the fleet actually trips something, and the core switch's
+    ARP walk.
 
     Under `defaults`, none of the tuning happens: the alert grace and the
     hourly email cap keep the values the application ships, `poll_workers` is
-    left alone, and the two thresholds are not touched. What still happens is
-    plumbing rather than tuning — pointing SMTP at the local sink so mail can
-    be counted, accepting syslog over TCP so both framings are exercised, and
-    starting the alert engine. None of those changes how hard the application
-    has to work; all three are needed for the run to measure anything.
+    left alone, the two thresholds are not touched, and the ARP walk stays
+    off (its shipped value). What still happens is plumbing rather than
+    tuning — pointing SMTP at the local sink so mail can be counted,
+    accepting syslog over TCP so both framings are exercised, and starting
+    the alert engine. None of those changes how hard the application has to
+    work; all three are needed for the run to measure anything.
+
+    `device_ids` is step_devices' ids_by_name; the ARP override needs the
+    core's id and is skipped (and says so) without it.
     """
     client.step = "8-settings"
     results = {"defaults": bool(defaults)}
+    results["arp"] = _seed_core_arp_walk(client, log, defaults, device_ids or {})
 
     alerts_values = {
         "email_enabled": True,
@@ -1200,8 +1259,9 @@ def main(argv=None) -> int:
         summary["configrx"] = step_configrx(
             client, log, summary["devices"]["ids_by_name"], args.ssh_base_port)
         summary["configrx_compliance"] = step_configrx_compliance(client, log)
-        summary["settings"] = step_settings(client, log, args.workers,
-                                            args.defaults, args.ping_interval)
+        summary["settings"] = step_settings(
+            client, log, args.workers, args.defaults, args.ping_interval,
+            device_ids=summary["devices"]["ids_by_name"])
         summary["users"] = step_users(client, log, args.base, creds_path)
         summary["verify"] = step_verify(client, log, args.count)
     finally:

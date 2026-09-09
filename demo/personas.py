@@ -40,7 +40,8 @@ from netpath.nodeoids import (                        # noqa: E402
     DOT1D_STP_ROOT_COST, DOT1D_STP_ROOT_PORT, DOT1D_STP_TIME_SINCE_CHANGE,
     DOT1D_STP_TOP_CHANGES, DOT1Q_PVID, DOT1Q_VLAN_CURRENT_EGRESS,
     DOT1Q_VLAN_CURRENT_UNTAGGED, DOT1Q_VLAN_STATIC_EGRESS,
-    DOT1Q_VLAN_STATIC_NAME, DOT1Q_VLAN_STATIC_UNTAGGED, LLDP_REM_CHASSIS_ID,
+    DOT1Q_VLAN_STATIC_NAME, DOT1Q_VLAN_STATIC_UNTAGGED,
+    IP_NET_TO_MEDIA_PHYS_ADDRESS, IP_NET_TO_MEDIA_TYPE, LLDP_REM_CHASSIS_ID,
     LLDP_REM_CHASSIS_ID_SUBTYPE, LLDP_REM_PORT_DESC, LLDP_REM_PORT_ID,
     LLDP_REM_PORT_ID_SUBTYPE, LLDP_REM_SYS_DESC, LLDP_REM_SYS_NAME,
     PETH_MAIN_PSE_CONSUMPTION, PETH_MAIN_PSE_OPER_STATUS, PETH_MAIN_PSE_POWER,
@@ -565,6 +566,46 @@ def dot1d_fdb(port_macs: dict) -> dict:
     return entries
 
 
+def _mac_arcs_to_bytes(arcs: str) -> bytes:
+    """The six octets behind a MAC in the dotted-arc form _mac_arcs
+    produces. The FDB tables carry a MAC in the row INDEX (arcs); the ARP
+    table carries it as the row's VALUE (a 6-octet PhysAddress), so the
+    same generated address has to be spelled both ways."""
+    return bytes(int(a) for a in arcs.split("."))
+
+
+def ip_net_to_media(if_hosts: dict, static=()) -> dict:
+    """ipNetToMediaTable — the device's own ARP cache, the table
+    nodepoll.read_device_arp_table walks first and, finding rows, never
+    falls through to ipNetToPhysicalTable (so that one is deliberately
+    not answered here: a persona answering both would prove nothing about
+    the fallback and a real agent answering both is the double-count case
+    the walker exists to avoid).
+
+    if_hosts: {ifIndex -> [(dotted IPv4, mac arcs)]}, the MAC in the same
+    dotted-arc form the FDB tables above are indexed by, so ONE generator
+    (_switch_fdb_ports) feeds both and every ARP row's MAC is a MAC some
+    FDB row on the same device already names — the join the ARP pane's
+    MAC buttons make. Both facts the walker recovers besides the MAC (the
+    interface and the IP) live in the row index, ifIndex.a.b.c.d, so only
+    the two columns it actually reads are answered: the phys address and
+    ipNetToMediaType, dynamic(3) unless the IP is in `static`, then
+    static(4) — a hand-pinned entry, so the pane's Type column has both
+    values to show. invalid(2) rows (the MIB's "being deleted" marker,
+    dropped at parse time) are not staged: they would be invisible.
+    """
+    static = set(static)
+    entries: dict = {}
+    for if_index, hosts in if_hosts.items():
+        for ip, mac in hosts:
+            suffix = f"{if_index}.{ip}"
+            entries[f"{IP_NET_TO_MEDIA_PHYS_ADDRESS}.{suffix}"] = (
+                T_OCTET_STRING, _mac_arcs_to_bytes(mac))
+            entries[f"{IP_NET_TO_MEDIA_TYPE}.{suffix}"] = (
+                T_INTEGER, 4 if ip in static else 3)
+    return entries
+
+
 def vtp_vlans(vlans) -> dict:
     """CISCO-VTP-MIB vtpVlanState — the VLAN list nodepoll walks before it
     tries each `community@vlan` context. 1002-1005 are the legacy VLANs
@@ -1008,6 +1049,45 @@ def _switch_fdb_ports(access_count: int, macs_per_port: int, seed_name: str,
     return port_macs, port_to_if
 
 
+# The fleet addresses the core's ARP cache pins by hand (ipNetToMediaType
+# static(4)): the wireless controller (index 1) and the ConfigRX SSH box
+# (index 13) — the two pieces of Site-A infrastructure an operator would
+# nail down so a poisoned cache cannot move them. Everything else the core
+# learned dynamically(3).
+CORE_ARP_STATIC_INDEXES = (1, 13)
+
+
+def _core_arp_hosts(port_macs: dict, port_to_if: dict, access: int) -> dict:
+    """{ifIndex -> [(ip, mac arcs)]} for the core switch's ARP cache: two
+    hosts behind each of its `access` downlinks, so the whole cache is
+    2 * access rows (176 for core-sw-01) — the size a real distribution
+    router's is, not a token handful.
+
+    Coherent with the rest of the estate rather than random, in two ways
+    that both matter to what the ARP pane can do:
+      - the IPs are the fleet's OWN addresses, fleet index 1 .. 2*access
+        spelled exactly as fleet_plan spells them (_fleet_ip — so index 13
+        is 127.0.0.1, the SPECIALS pin, not ip_for(13)), so an ARP hit in
+        the global search names a device that is actually in Nodes;
+      - the MAC behind each IP is one this same downlink's FDB slice already
+        reports (macs[1]/macs[2] of the port — _build_cisco_core's per-VLAN
+        dot1d_fdb slices start at macs[(vlan // 10) % 6], so macs[0] never
+        shows in any VLAN and would leave the join dangling), so clicking
+        the MAC in the ARP pane lands on the very port the core learned it
+        on. The ifIndex is that port's own, the same ifIndex bridge_ports()
+        maps the FDB row's bridge port to.
+    Host k sits behind downlink ((k - 1) % access) + 1 and takes the port's
+    second or third MAC depending on which lap of the downlinks it is on.
+    """
+    if_to_port = {if_index: port for port, if_index in port_to_if.items()}
+    hosts: dict = {}
+    for k in range(1, 2 * access + 1):
+        if_index = (k - 1) % access + 1
+        mac = port_macs[if_to_port[if_index]][1 + (k - 1) // access]
+        hosts.setdefault(if_index, []).append((_fleet_ip(k), mac))
+    return hosts
+
+
 CISCO_ACCESS_DESCR = (
     "Cisco IOS Software, C2960X Software (C2960X-UNIVERSALK9-M), "
     "Version 15.2(7)E3, RELEASE SOFTWARE (fc2), Copyright (c) 1986-2021 by "
@@ -1248,6 +1328,17 @@ def _build_cisco_core(wrap32: bool, ports: int, vlan: str | None) -> dict:
                 T_OCTET_STRING, encode_vlan_bitmap(_access_trunk_vlans(name), 0))
         entries.update(dot1d_stp(priority=4096, root_cost=0, root_port=0))
         entries.update(dot1d_stp_ports({port: 5 for port in port_to_if}))
+        # The ARP cache, gated the same way and for the same reason as the
+        # neighbour table above: core-sw-01 is the plant's one router, and
+        # two "core" devices both claiming to hold every fleet address
+        # would make the ARP search answer twice for every IP. It is also
+        # the only persona that answers ipNetToMediaTable at all — every
+        # other device is left off (seed.py turns the walk on for this one
+        # device only), so the "ARP cache is not read" empty state stays
+        # visible everywhere else, which is itself worth seeing.
+        entries.update(ip_net_to_media(
+            _core_arp_hosts(port_macs, port_to_if, access),
+            static={_fleet_ip(i) for i in CORE_ARP_STATIC_INDEXES}))
     return entries
 
 
@@ -2173,6 +2264,17 @@ def ip_for(index: int) -> str:
     return "127.0.%d.%d" % (index // 250, index % 250 + 2)
 
 
+def _fleet_ip(index: int) -> str:
+    """The address fleet_plan gives device `index`: ip_for's arithmetic
+    unless SPECIALS pins one (index 13, the ConfigRX SSH box on 127.0.0.1).
+    The one rule, so a persona that names another device's address (the
+    core's ARP cache) spells it the way the roster does."""
+    spec = SPECIALS.get(index)
+    if spec and "ip" in spec:
+        return spec["ip"]
+    return ip_for(index)
+
+
 def _site_for(index: int, persona: str, access_seen: int) -> str:
     if index <= _FIXED_INDEX_MAX:
         return "Site-A"
@@ -2273,11 +2375,9 @@ def fleet_plan(count: int) -> list[dict]:
                 and index % 37 == 0):
             knobs["flapping"] = [3 + (index % 40)]
 
-        ip = (SPECIALS[index]["ip"] if index in SPECIALS and "ip" in SPECIALS[index]
-              else ip_for(index))
         plan.append({
             "index": index,
-            "ip": ip,
+            "ip": _fleet_ip(index),
             "name": name,
             "persona": persona,
             "site": _site_for(index, persona, access_seen),
