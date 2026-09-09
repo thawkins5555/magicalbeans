@@ -52,6 +52,50 @@ running it, and pin the literal strings, shared helpers, CSS tokens and
 response headers that a refactor could otherwise change invisibly — no
 stub, no browser, no server.
 
+## The benchmarks (`bench_*.py`)
+
+`run_all.py` globs `test_*.py`, so nothing named `bench_*` is ever collected —
+which is the point. A benchmark's answer depends on the disk, the CPU and the
+page cache under it, so these print numbers rather than asserting them, and
+are run by hand when a change is meant to move one:
+
+```
+python3 tests/bench_flow_overview.py [rows ...]       # raw flows vs the rollups
+python3 tests/bench_record_samples.py [rows] [preload] # per-sample vs batched writes
+python3 tests/bench_web_requests.py [devices ...] [--tabs N] [--iterations N]
+python3 tests/bench_db_search.py [scale ...] [--repeats N]
+```
+
+`bench_web_requests.py` stands up a real `Service` over ten SQLite files and a
+`WebServer` on a free loopback port — the same fixture `test_web_security.py`
+builds — seeds a fleet of that many devices with interfaces, alerts, polling
+profiles and device groups **straight through the database objects**, and then
+drives `http.client` over one keep-alive connection. Seeding through the API
+would be timing the fixture builder with the thing being measured. It prints
+p50/p95/max, response bytes and gzipped bytes per route, then the three
+composites an operator would recognise: first paint (index.html plus the five
+files it names, `boot.js` included, each asked for as `?v=` the way the markup
+spells it), one Nodes tab refresh tick (the twelve requests `nodes.js`'s
+`refresh()` and `loadDetail()` actually fire), and what `--tabs` browsers all
+polling `/api/state` every two seconds cost the server per wall second.
+
+Its `sql` and `lock ms` columns read whatever per-store lock and per-route
+latency counters `/api/debug` happens to expose: a snapshot is taken either
+side of each route's batch and the numeric leaves whose names mention sql or a
+lock are diffed. Where `/api/debug` carries no such fields the columns print
+`-` and the bench says so on its header line, so it runs against a build with
+the instrumentation and one without.
+
+`bench_db_search.py` seeds every store to three sizes and times each hot or
+flagged read, printing rows, mean, p95 and the **first line of `EXPLAIN QUERY
+PLAN`** for the query that actually ran — captured with sqlite3's trace
+callback while the method executes, so the plan can never drift from the SQL
+the module builds. That column is the durable half of the baseline: it records
+whether each read scans or seeks, which is the fact an index would have to
+change. Sizes are scale factors over a base profile (default `1 4 16`), chosen
+so `x4` puts the fleet at the 2,000 devices the comment at `nodesdb.py:1282`
+records its text-search measurement against.
+
 ## The browser checks (`tests/ui/`)
 
 `tests/ui/walk.mjs` is the one part of this directory that is not a plain Python
