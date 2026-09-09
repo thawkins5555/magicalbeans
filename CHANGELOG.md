@@ -133,6 +133,92 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 5.7.1 — The temp folder that wasn't there
+
+This looked at first like a broken update button. It is not — it is a bug in
+how the whole application asks the operating system for a temporary directory,
+and the update button was only the first place it showed.
+
+**The two faces of one fault.** An operator pressed Update and got
+
+> The update stopped unexpectedly: [WinError 3] The system cannot find the
+> path specified:
+> 'C:\Users\ADMNA-~1\AppData\Local\Temp\2\sappiwhere-update-jyyd6pii'
+
+and, on the same host, this on every DHCP polling cycle:
+
+> DHCP poll of CLQWSRTM1 failed: [Errno 2] No such file or directory:
+> 'C:\Users\ADMNA-~1\AppData\Local\Temp\2\sappi-dhcp-z3_6xg__.ps1'
+
+Two subsystems, two different files, one missing directory —
+`…\AppData\Local\Temp\2`. Anyone chasing one of these will find the other by
+searching for it, which is why both are written out here.
+
+**Why the directory was gone, and why nobody guesses it.** The `\2` on the end
+is the tell. With per-session temporary folders enabled — the default on
+Remote Desktop and Terminal Services hosts — Windows gives each logon session
+its own `…\AppData\Local\Temp\<sessionId>` and *deletes it when that session
+ends*. The service had inherited its `TEMP` from the interactive session it
+was installed or first launched from; that session has since logged off, its
+numbered folder is gone, and `TEMP` now names a directory that no longer
+exists. `tempfile.mkdtemp()` and `tempfile.mkstemp()` generate a name inside
+it and then fail to create it, because the *parent* is missing —
+`FileNotFoundError`, `WinError 3`. And it persists across updates: the
+re-exec inherits the same dead environment, so a host in this state stays in
+it. Python's own `tempfile.gettempdir()` is no help — it caches its answer the
+first time it is asked and hands the stale path back unchanged for the life of
+the process, which is precisely how a folder that was there at startup and
+gone an hour later still gets used.
+
+**One resolver, re-checked every time.** A new leaf module, `netpath/temppath.py`,
+now answers the single question "where can I put a temp file *right now*?" It
+tries the system temp directory and, when that directory is missing —
+`os.makedirs(exist_ok=True)` — simply re-creates it, which is the entire fix
+for the reported case: a per-session folder Windows deleted is made again. On
+Windows it then falls back to `%LOCALAPPDATA%\Temp` and `%SystemRoot%\Temp`,
+both of which belong to the machine rather than a session and so do not vanish
+with a logoff, and finally to the install directory. It proves each candidate
+is writable by actually creating a file there rather than trusting that it
+can — a directory that exists but denies writes is a real case on a
+locked-down host — and it caches nothing, because the whole point is that the
+right answer changes underneath a running process. When every location is
+refused it says so in one sentence that names each place it tried, why each
+was rejected, and what a per-session temp folder is, so the operator knows
+whether to fix `TEMP`, free disk space, or grant write permission rather than
+reading "stopped unexpectedly" and hunting a bug that is not there. The DHCP
+poller now takes its script's directory from this resolver.
+
+**The updater stages beside the install now, not in `%TEMP%`.** For the
+update specifically, the temporary directory is a poor place to unpack a whole
+source tree, so `apply()` prefers a uniquely-named directory inside the
+install root and only falls back to the shared resolver if that is impossible.
+Three reasons, in order: the install root must already be writable for any
+update to succeed — the swap renames `netpath/` and moves the new tree into
+its place — so staging there asks for no permission the update did not already
+need; it turns the final `shutil.move` into a same-volume rename instead of a
+cross-volume copy that would otherwise run, byte by byte, at the one moment
+the service is fully quiesced and the slowest; and it does not depend on
+`%TEMP%` naming a directory that still exists. A run killed mid-update leaves
+its staging directory behind, so a new run sweeps stale ones first, exactly as
+the swap already sweeps old `netpath.bak-` backups — the two names are
+deliberately disjoint (`netpath.staging-` versus `netpath.bak-`, neither the
+package name) so the two sweeps can never reach into each other's work.
+
+**And the line that raised is inside the guard now.** The `mkdtemp()` call
+that started all this sat *outside* every `try` in `apply()`, so when it threw,
+the exception escaped the function entirely, landed in the update job's
+`except BaseException`, and reached the operator as the generic "The update
+stopped unexpectedly" — a message that names no cause and offers no remedy.
+Creating the staging directory is now wrapped like every other step: a failure
+comes back as a proper `failed` result carrying the explanation above.
+`tests/test_temppath.py` is new and drives the resolver through a working temp,
+a vanished one that it re-creates, a directory that exists but cannot be
+written to, and every candidate failing at once; `tests/test_selfupdate_job.py`
+gains the reported fault directly (a system temp pointed at nothing, and the
+update still staging beside the install) and the all-locations-fail case,
+asserting the operator sees the explanatory message and never "stopped
+unexpectedly".
+
 ### 5.7.0 — Five reports
 
 Five operator reports, answered one at a time below, and a closing note on

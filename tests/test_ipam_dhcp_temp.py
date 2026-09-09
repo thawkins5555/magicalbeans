@@ -82,7 +82,10 @@ def run_with(recorder, resolver=None, **kw):
     *class* of the failure rather than only on DhcpUnavailable."""
     real_run = subprocess.run
     real_binary = ipam_dhcp._powershell_binary
-    real_resolver = ipam_dhcp.writable_tempdir
+    # getattr, not attribute access: on a module that has lost the import
+    # this must still run, so the regression is reported as the failed
+    # checks below rather than as an AttributeError before any of them.
+    real_resolver = getattr(ipam_dhcp, "writable_tempdir", None)
     subprocess.run = recorder
     ipam_dhcp._powershell_binary = lambda: "/opt/fake/pwsh"
     if resolver is not None:
@@ -109,6 +112,11 @@ shutil.rmtree(MISSING, ignore_errors=True)
 
 real_tempdir_cache = tempfile.tempdir
 try:
+    # ------------------------------ 0. the directory comes from the resolver
+    check("0. ipam_dhcp takes its directory from temppath.writable_tempdir, "
+          "the one resolver the updater uses too",
+          getattr(ipam_dhcp, "writable_tempdir", None) is not None)
+
     # ------------------------------------------ 1. the reported fault, directly
     tempfile.tempdir = MISSING
     check("1a. tempfile now answers with a directory that does not exist "
@@ -158,7 +166,7 @@ try:
     # folder again between two polls and both must still succeed.
     shutil.rmtree(MISSING, ignore_errors=True)
     resolver_calls = []
-    real_resolver = ipam_dhcp.writable_tempdir
+    real_resolver = getattr(ipam_dhcp, "writable_tempdir", tempfile.gettempdir)
 
     def counting_resolver():
         resolver_calls.append(1)

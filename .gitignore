@@ -10,6 +10,7 @@ venv/
 *.egg-info/
 update_restart.log
 netpath.bak-*/
+netpath.staging-*/
 
 # Claude Code agent worktrees (tool state, never source)
 .claude/

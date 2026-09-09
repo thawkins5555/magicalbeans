@@ -6378,7 +6378,21 @@ browser that reloaded mid-update can still ask where the update got to.
    in addition to — not instead of — the system store by
    `_ssl_context()`), because a locked-down Windows server can be missing
    a root certificate with no route to fetch it on demand, and a headless
-   install has no pip-installed `certifi` to lean on.
+   install has no pip-installed `certifi` to lean on. The tarball is written
+   into a staging directory `_make_staging_dir()` creates beside the install
+   (`netpath.staging-*` in the install root), *not* in `%TEMP%`: the install
+   root is already writable for the swap, staging there makes the later
+   `shutil.move` a same-volume rename rather than a cross-volume copy at the
+   worst possible moment, and it does not depend on `%TEMP%` naming a
+   directory that still exists — the fault that reached an operator as "The
+   update stopped unexpectedly" when a service inherited a per-session temp
+   folder from a Remote Desktop session that had since ended (see 5.7.1 and
+   `netpath/temppath.py`). Only if the install root cannot be staged into
+   does it fall back to `temppath.writable_tempdir()`. A run killed
+   mid-update leaves its staging directory behind, so the next run sweeps
+   stale `netpath.staging-*` first, the way `_swap_in` sweeps old
+   `netpath.bak-*` — the two prefixes are disjoint, so neither sweep touches
+   the other's directories or the live package.
 4. **`extracting`**: `_safe_extract()` only ever extracts ordinary files
    and directories, never symlinks or device nodes, and verifies every
    member's resolved path stays inside the destination directory before
