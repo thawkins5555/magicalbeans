@@ -977,6 +977,11 @@
           ${s.enabled ? 'checked' : ''}> Run the backup worker</label>
         <label>Backup interval (hours) <input id="cxs-interval" type="number" min="1"
           value="${s.backup_interval_hours}"></label>
+        <label>Devices backed up at once <input id="cxs-workers" type="number" min="1"
+          max="16" value="${s.configrx_workers}"></label>
+        <p class="hint">Four by default, and deliberately small: what limits
+          this is the far end, where plenty of platforms allow only five SSH
+          sessions in total across every tool that talks to them.</p>
         <label>Capture timeout (seconds) <input id="cxs-capture" type="number" min="10"
           value="${s.capture_timeout_s}"></label>
         <p class="hint">A ceiling, not a wait: the capture ends the moment the
@@ -1032,6 +1037,7 @@
         await App.post('/api/settings', { scope: 'configrx', values: {
           enabled: m.querySelector('#cxs-enabled').checked,
           backup_interval_hours: Number(m.querySelector('#cxs-interval').value),
+          configrx_workers: Number(m.querySelector('#cxs-workers').value),
           capture_timeout_s: Number(m.querySelector('#cxs-capture').value),
           retention_days: Number(m.querySelector('#cxs-days').value),
           retention_count_per_device: Number(m.querySelector('#cxs-count').value),

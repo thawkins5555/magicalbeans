@@ -175,6 +175,11 @@ CREATE TABLE IF NOT EXISTS compliance_results (
 DEFAULTS = {
     "enabled": True,
     "backup_interval_hours": 24,
+    # How many devices are backed up at once. Small on purpose and not
+    # autoscaled: the binding constraint is at the far end, where plenty of
+    # platforms cap total vty sessions at five, and no signal available here
+    # can see that. A setting only because it was a bare constant before.
+    "configrx_workers": 4,
     "retention_days": 90,
     "retention_count_per_device": 30,
     # Ceiling on one "show config" read, in seconds. Only a ceiling — the read

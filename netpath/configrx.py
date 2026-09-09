@@ -789,7 +789,8 @@ class ConfigRxWorker(Worker):
             import paramiko
             _apply_legacy_algorithms(
                 paramiko, bool(self.settings.get("allow_legacy_ssh", False)))
-        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(1, min(16, int(self.settings.get("configrx_workers", 4) or 4))))
         self._spawn()
         # One-time catch-up for an install that already has a backup
         # history predating (or never yet reindexed under) the `unchanged`
