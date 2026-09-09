@@ -506,6 +506,13 @@ own subtabs.
   It used to fail the whole device's SNMP, which read as "L3 and community
   confirmed, sysDescr populated, polling still failing". A walk that got
   nothing at all is still a failure: the device stopped answering.
+- **A device with more than 512 interfaces says so under its interface
+  table, not as an SNMP error.** One poll reads 512 interfaces; a core
+  chassis or a firewall with per-VLAN subinterfaces can report more. That
+  cap is a designed limit, not a fault, so it is a sentence under the
+  interface list naming both counts, and one log line when a device crosses
+  the cap rather than one on every poll — a permanent red error on the
+  device row is where the next real one would have gone unnoticed.
 - **A table walk the agent refuses now says so.** An agent that answers a
   walk with `genErr`, `noSuchName` or any other error-status — what a
   PAN-OS/net-snmp box does for a subtree it will not serve — used to end
@@ -1449,6 +1456,11 @@ alerts and optionally emailing about them.
   notification of any kind** goes out — the recovery mail and the
   every-N-minutes reminder included. Alerts already open stay open and on
   the list, and still resolve normally, exactly as a mute leaves them.
+  **Ending it hands back the notifications it swallowed**: an alert whose
+  first notice the maintenance took, still open and unacknowledged when the
+  maintenance ends, is notified then — once — so a two-minute cable move no
+  longer costs an alert its only notice. One that had already been notified
+  before the maintenance began is not repeated.
   **Polling continues**: status, metrics, graphs and the event history stay
   live, because "stop telling me about it" is not "stop watching it". Who
   turned it on, when, and an optional reason are recorded, and so is who

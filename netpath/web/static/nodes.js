@@ -25,6 +25,7 @@
     // device); its window and data are local to that dialog's own closure,
     // not pane-wide state — see deviceDialog.
     ifaces: [],
+    ifaceNote: '',
     ifaceSort: App.recallSort('nodes-ifaces', { key: 'if_index', descending: false }),
     events: null,
     // LLDP/CDP neighbours for the selected device's own ports (Tier 1 #5's
@@ -727,6 +728,7 @@
     view.detail = detail.device;
     view.metrics = metrics.metrics;
     view.ifaces = ifaces.interfaces;
+    view.ifaceNote = ifaces.note || '';
     view.events = events;
     view.neighbors = neighbors.neighbors;
     // Fetched on selection, not on every refresh tick — an extra round trip
@@ -1494,13 +1496,19 @@
      drifts. `onOpen`, when given, replaces what clicking a row does.
      `snmpError` names why the list is empty when it is one: a device that
      has never answered SNMP shows headers over nothing exactly like one
-     with genuinely zero interfaces, and the two used to be indistinguishable. */
-  function drawIfaceTable(el, rows, deviceId, onOpen, snmpError) {
+     with genuinely zero interfaces, and the two used to be indistinguishable.
+     `note` names why the list is SHORT — the poller reads a capped number of
+     interfaces per poll — which is a different fact from an error and is
+     shown as one: the cap is a designed limit a big chassis sits over
+     permanently, and a red line that never clears is where the next real
+     error goes to hide. */
+  function drawIfaceTable(el, rows, deviceId, onOpen, snmpError, note) {
     const target = el || App.el('nd-if-table');
     const list = rows || view.ifaces;
     const id = deviceId != null ? deviceId : view.selected;
     const error = snmpError !== undefined ? snmpError
       : (view.detail || {}).snmp_error;
+    const shortNote = note !== undefined ? note : view.ifaceNote;
     const columns = ifaceColumns();
     // Only the pane's own table drives the shared sort state; sorting the
     // dialog's copy would silently reorder the pane behind it.
@@ -1519,6 +1527,30 @@
       : 'No interfaces on this device.');
     table.appendChild(body);
     App.wireRowKeyboard(body);
+    drawIfaceNote(target, shortNote);
+  }
+
+  /* The sentence under an interface table the poller's per-poll cap cut
+     short, added and removed in place beside the table it describes so both
+     copies of that table — the pane's and the dialog's — carry it without
+     either owning markup for it. */
+  function drawIfaceNote(table, note) {
+    const wrap = table.closest('.table-wrap') || table;
+    const parent = wrap.parentNode;
+    if (!parent) return;
+    let hint = parent.querySelector('.nd-if-note');
+    if (!note) {
+      if (hint) hint.remove();
+      return;
+    }
+    if (!hint) {
+      hint = document.createElement('p');
+      hint.className = 'hint nd-if-note';
+      parent.insertBefore(hint, wrap.nextSibling);
+    }
+    hint.textContent = `Not every interface is listed: ${note}. `
+      + 'The ones past the cap are left out rather than half-read, so their '
+      + 'counters and link events are not collected.';
   }
 
   /* ---------------------------------------------- device drill-down */
@@ -1690,6 +1722,7 @@
     let dialogIfaces = null;
     let dialogOptics = null;
     let dialogSnmpError = '';
+    let dialogIfaceNote = '';
 
     function paintDialogIfaces() {
       if (!dialogIfaces || !current()) return;
@@ -1706,7 +1739,7 @@
       // #modal-box — so the port dialog gets a way back to this one.
       drawIfaceTable(box.querySelector('#ndd-if-table'), dialogIfaces, deviceId,
         (row) => interfaceDialog(row, deviceId, () => deviceDialog(deviceId)),
-        dialogSnmpError);
+        dialogSnmpError, dialogIfaceNote);
     }
 
     Promise.all([
@@ -1721,6 +1754,7 @@
       renderVendorSection(box, device, deviceId, current);
       dialogIfaces = ifaces.interfaces || [];
       dialogSnmpError = device.snmp_error;
+      dialogIfaceNote = ifaces.note || '';
       paintDialogIfaces();
       drawEventTable(box.querySelector('#ndd-ev-table'), events);
     }).catch(() => {

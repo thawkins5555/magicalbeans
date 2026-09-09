@@ -22,6 +22,7 @@ Test button's real ifIndex walk, and _Session.dropped.
 import json
 import os
 import socket
+import sqlite3
 import time
 
 import _paths  # noqa: F401  (puts the repo root on sys.path)
@@ -355,6 +356,31 @@ try:
     db.close()
 finally:
     stub.kill()
+
+# --- a legacy comma community: explained, not a 500 -----------------------
+
+# No stub: credential_for is refused before a single datagram is sent, which
+# is the whole of the bug — the refusal happened OUTSIDE the handler's try,
+# so the one screen an operator uses to ask "why is this device not polling"
+# answered "Internal Server Error".
+db, device_id = new_db("test_button_comma")
+conn = sqlite3.connect(db.path)
+conn.execute("UPDATE devices SET community = ? WHERE id = ?",
+             ("public,pa-ro", device_id))       # an upgraded install's row
+conn.commit()
+conn.close()
+raised = ""
+try:
+    api.post_nodes_device_test(FakeService(db), {}, {}, device_id)
+except Exception as exc:
+    raised = f"{type(exc).__name__}: {exc}"
+check("the Test button explains a stored comma community the way the poller "
+      "does, instead of a bare 500 with the explanation in the log",
+      "comma" in raised and "polling profile" in raised, raised or "<no error>")
+check("...as a ValueError, which web.server answers 4xx with the message on "
+      "-- any other exception is what it turns into Internal Server Error",
+      raised.startswith("ValueError:"), raised or "<no error>")
+db.close()
 
 # ============================== § 6 the whole PA-shaped stub, end to end
 

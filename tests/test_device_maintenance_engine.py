@@ -280,6 +280,94 @@ check("[mute] ...and it is finally decided once the mute is lifted",
       alerts.alert(alert_id)["last_notified_ts"] is not None)
 
 
+# ======================================================================= M6
+print("\nM6 — clearing maintenance re-arms the notice it decided")
+
+HOLD = {"notify_rollup_delay_s": 1, "renotify_minutes": 0}
+
+
+def held_case(ip, name):
+    """One device with one open alert whose first notice is held, mail
+    stubbed. Re-notify is OFF — the default — which is the whole point:
+    _sweep_renotify returns before it looks at anything, so the first-notify
+    sweep is the only path that can ever send this notice."""
+    nodes, alerts, snmp, syslog, ipam, engine = build(**HOLD, **MAIL)
+    sent = FakeMail()
+    alertmail.send = sent
+    dev = add_device(nodes, ip, name)
+    engine._tick()
+    go_down(nodes, dev)
+    engine._tick()
+    alert_id = open_rows(alerts, "device_down", dev)[0]["id"]
+    return alerts, engine, dev, alert_id, sent
+
+
+real_send = alertmail.send
+try:
+    alerts, engine, dev, alert_id, sent = held_case("10.8.4.1", "core7")
+    alerts.set_maintenance(dev, by="tester")
+    time.sleep(1.2)
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    check("the held notice is decided while maintenance is on, and nothing"
+          " is mailed", alerts.alert(alert_id)["last_notified_ts"] is not None
+          and not sent.attempts, sent.attempts)
+
+    alerts.clear_maintenance(dev, by="tester")
+    check("**clearing maintenance re-arms it — a notice skipped for a"
+          " two-minute cable move is not lost for good**",
+          alerts.alert(alert_id)["last_notified_ts"] is None)
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    check("...and the next sweep sends it, EXACTLY once, with re-notify off",
+          len(sent.attempts) == 1, sent.attempts)
+
+    alerts.set_maintenance(dev, by="tester")
+    alerts.clear_maintenance(dev, by="tester")
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    check("...and a second maintenance toggle does not re-arm a notice that"
+          " has already gone out", len(sent.attempts) == 1, sent.attempts)
+
+    # Notified for real BEFORE maintenance: the clear must not repeat it.
+    alerts, engine, dev, alert_id, sent = held_case("10.8.4.2", "core8")
+    time.sleep(1.2)
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    stamp = alerts.alert(alert_id)["last_notified_ts"]
+    check("the notice went out before maintenance began",
+          len(sent.attempts) == 1 and stamp is not None, sent.attempts)
+    alerts.set_maintenance(dev, by="tester")
+    engine._tick()
+    alerts.clear_maintenance(dev, by="tester")
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    check("**an alert genuinely notified before maintenance is not notified"
+          " a second time when it clears**",
+          len(sent.attempts) == 1
+          and alerts.alert(alert_id)["last_notified_ts"] == stamp,
+          sent.attempts)
+
+    # The mute path, unchanged: still pending, and clearing a maintenance
+    # the device was never in touches nothing.
+    alerts, engine, dev, alert_id, sent = held_case("10.8.4.3", "core9")
+    alerts.mute("device", str(dev), 6.0, by="tester")
+    time.sleep(1.2)
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    check("[mute] the held notice is still PENDING, exactly as before",
+          alerts.alert(alert_id)["last_notified_ts"] is None and not sent.attempts,
+          sent.attempts)
+    check("[mute] clearing a maintenance the device was never in changes"
+          " nothing", alerts.clear_maintenance(dev, by="tester") is False)
+    alerts.unmute("device", str(dev))
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    check("[mute] ...and lifting the mute sends it once",
+          len(sent.attempts) == 1, sent.attempts)
+finally:
+    alertmail.send = real_send
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 sys.exit(1 if FAILS else 0)

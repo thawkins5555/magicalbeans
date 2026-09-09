@@ -4492,7 +4492,18 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
     auth_proto = body.get("v3_auth_proto") or config.get("v3_auth_proto")
     password = body.get("v3_auth_pass")
     if identity is None or (password is None and "v3_auth_pass" not in body):
-        stored_identity, stored_proto, stored_password = credential_for(config)
+        try:
+            stored_identity, stored_proto, stored_password = credential_for(config)
+        except SnmpError as exc:
+            # The STORED credential is itself refused — a v1/v2c community
+            # carrying a comma, saved before nodesdb.clean_community existed
+            # to refuse it. Polling says so in words on the device row; the
+            # Test button is where an operator goes to find out why, and
+            # this call sits outside the try below, so without this arm it
+            # answered a bare 500 with the explanation in a traceback in the
+            # log. ValueError is the shape server.py turns into a 400
+            # carrying the message.
+            raise ValueError(str(exc))
         identity = identity if identity is not None else stored_identity
         auth_proto = auth_proto or stored_proto
         if password is None and "v3_auth_pass" not in body:
@@ -4588,13 +4599,20 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
 
 
 def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
-    _require(service.nodes_db.device(device_id), "device")
+    device = _require(service.nodes_db.device(device_id), "device")
     rows = service.nodes_db.interfaces(device_id)
     keys = rows[0].keys() if rows else ()
+    # Why this list stops where it does, when the poller's per-poll cap is
+    # what stopped it. It rides with the interfaces rather than with the
+    # device's own JSON because it is a fact about this table, and the pane
+    # showing the table is the one place it answers a question somebody is
+    # asking.
+    note = (device["interfaces_note"] or ""
+            if "interfaces_note" in device.keys() else "")
     # poe_admin/poe_detect_status/poe_power_mw/stp_state/media are read
     # defensively like every other column a migration added: a row fetched
     # before the ALTER TABLE has run on this database will not have them.
-    return {"interfaces": [
+    return {"note": note, "interfaces": [
         {"id": r["id"], "if_index": r["if_index"], "descr": r["descr"],
          "alias": r["alias"], "phys_addr": r["phys_addr"], "speed_bps": r["speed_bps"],
          "admin_status": r["admin_status"], "oper_status": r["oper_status"],

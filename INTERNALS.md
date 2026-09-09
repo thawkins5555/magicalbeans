@@ -1679,12 +1679,28 @@ count is the only thing that separates the two, so the test lives inside
 `_walk_column_detail` is the walk itself and returns
 `(values, complete, reason)`; `_walk_column_status` is it truncated to two
 and `_walk_column` to one, the same wrapping idiom that already existed
-between those two. `_poll_interfaces` returns `(rows, complete, reason)`
-and `_poll_device` writes the reason into `snmp_error` while leaving
-`snmp_ok` true — a degraded read still has to say what degraded it, or an
-empty interface table beside a healthy device explains nothing
-(`nodes.js` `drawIfaceTable` already renders `snmp_error` as the empty
-state's explanation).
+between those two. `_poll_interfaces` returns
+`(rows, complete, reason, note)` and `_poll_device` writes the reason into
+`snmp_error` while leaving `snmp_ok` true — a degraded read still has to
+say what degraded it, or an empty interface table beside a healthy device
+explains nothing (`nodes.js` `drawIfaceTable` already renders `snmp_error`
+as the empty state's explanation).
+
+`note` is the fourth value because ONE of those stop reasons is not a
+fault: `_MAX_INTERFACES` (512) is a designed per-poll cap, and a core
+switch or a firewall with per-VLAN subinterfaces sits over it permanently.
+Reported as a `reason` it painted a red `snmp_error` line beside "snmp ok"
+in the device pane and wrote a NODES line every poll interval for ever,
+which is how the next real error goes unnoticed. It travels instead as
+`devices.interfaces_note` (written by `record_poll`, which leaves the
+stored value alone when the caller passes `None` — a poll that never
+reached the interface table must not blank a note the stored rows still
+need), is returned beside the list it explains by
+`get_nodes_device_interfaces` as `note`, and is rendered under both copies
+of the table by `drawIfaceNote`. `_poll_device` logs it once when it
+starts and once when it stops, comparing against the `previous` row
+`record_poll` hands back; the per-poll trace still carries it as a
+`truncated` detail line.
 
 **Walk error-statuses** (`_walk_column_detail`, `_walk_from`,
 `_error_status_reason`). The walk tested `error_status` for 1 (tooBig) and
@@ -3837,6 +3853,30 @@ going out. It is therefore decided the way every other permanently
 undeliverable case in that loop is: `_skip_held_open_notify(..., "not sent:
 the device is in maintenance mode")`. The mute branch beside it is
 unchanged.
+
+**Decided is not final: ending the maintenance re-arms it.** Deciding alone
+lost the notice for good on the default settings — re-notify is off, so
+`_sweep_renotify` returns before it looks at anything, and the first-notify
+query only asks about `last_notified_ts IS NULL`. A two-minute cable move
+therefore swallowed an open alert's only notification. So the decision
+carries a mark: `mark_notified(..., maintenance_held=True)` stamps
+`alerts.maint_held_notify_ts` alongside `last_notified_ts`, and
+`clear_maintenance` calls `rearm_maintenance_held`, which NULLs
+`last_notified_ts` again for the device's still-open alerts carrying that
+mark. The mark is what makes it precise and idempotent: an alert whose
+notice genuinely went out before the maintenance began was never marked
+(`_skip_held_open_notify` refuses a row whose `last_notified_ts` is already
+set), and any real decision afterwards — a send, a rule that will never
+mail — writes `maintenance_held=False` and clears it, so a second toggle of
+the switch finds nothing left to re-arm. The mark also survives the re-arm
+itself, which is what exempts the row from `alerts_due_first_notify`'s
+`FIRST_NOTIFY_BACKLOG_GRACE_S` floor: that floor exists to fence off an
+upgrade's backlog of never-notified alerts, and a maintenance window
+routinely outlasts its hour. The re-arm lives in `clear_maintenance` rather
+than in a sweep because that is the one place maintenance mode can end, and
+the device match runs in Python through `alertrules.device_id_for` — an
+interface alert's `entity_id` is `"<device_id>:<if_index>"`, and that rule
+lives in one function on purpose.
 
 **The report keeps three buckets, not two.** `maintenance_mode_excluded_s`
 sits beside `maintenance_excluded_s` and `mute_excluded_s` and is merged

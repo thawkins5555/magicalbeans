@@ -1087,6 +1087,14 @@ class AlertsDatabase(SqliteStore):
             # it absorbed with it.
             "rolled_up_into":
                 "INTEGER REFERENCES alerts(id) ON DELETE SET NULL",
+            # When this alert's held FIRST notice was closed out unsent
+            # because its device was in maintenance mode, or NULL once that
+            # notice has been decided any other way. Maintenance mode is the
+            # one suppression with no end date, so the notice cannot simply
+            # wait for it; this column is what lets clear_maintenance hand
+            # the notice back rather than leave it stamped and unsendable
+            # forever. See rearm_maintenance_held and mark_notified.
+            "maint_held_notify_ts": "REAL",
         })
         # Both indexes here rather than in SCHEMA: that script runs before
         # this method, so an index over a column added just above would fail
@@ -2006,18 +2014,29 @@ class AlertsDatabase(SqliteStore):
                 "SELECT * FROM alerts WHERE id = ?", (cur.lastrowid,)).fetchone()
             return row, True
 
-    def mark_notified(self, alert_id: int, ts: float | None = None) -> None:
+    def mark_notified(self, alert_id: int, ts: float | None = None, *,
+                      maintenance_held: bool = False) -> None:
         """Stamp when a notification was last submitted for this alert.
 
         Written at SUBMIT rather than on delivery: what renotify measures is
         "how long since we last told anyone", and a message sitting in the
         sender queue has already been told. Kept apart from last_ts, which
         every recurrence refreshes.
+
+        `maintenance_held` says this stamp is not a notification at all but
+        the first notice being closed out unsent because the device is in
+        maintenance mode — the one case a clear has to be able to undo.
+        Every other caller clears the flag by writing it False, so any real
+        decision (a send, a rule that will never mail, a mute lifting)
+        disarms the re-arm rather than leaving it primed for the next
+        maintenance toggle. See rearm_maintenance_held.
         """
         with self._lock:
             self._conn.execute(
-                "UPDATE alerts SET last_notified_ts = ? WHERE id = ?",
-                (time.time() if ts is None else ts, alert_id))
+                "UPDATE alerts SET last_notified_ts = ?,"
+                " maint_held_notify_ts = ? WHERE id = ?",
+                (time.time() if ts is None else ts,
+                 time.time() if maintenance_held else None, alert_id))
             self._conn.commit()
 
     def alerts_due_renotify(self, cutoff_ts: float) -> list[sqlite3.Row]:
@@ -2047,7 +2066,11 @@ class AlertsDatabase(SqliteStore):
         real engine outage, and a hard line under an upgrade's entire
         pre-existing backlog of alerts nobody was ever going to email about
         (see FIRST_NOTIFY_BACKLOG_GRACE_S's own comment for why that upgrade
-        case is the one this floor exists for).
+        case is the one this floor exists for). An alert re-armed by
+        clear_maintenance is exempt from that floor: it carries this
+        engine's own mark saying its notice is genuinely still owed, which
+        is exactly what the floor cannot tell about an upgrade's backlog,
+        and maintenance mode routinely outlasts an hour.
 
         Not filtered on state, unlike alerts_due_renotify: an alert that
         cleared or was absorbed into a rollup parent while its notice was
@@ -2065,7 +2088,8 @@ class AlertsDatabase(SqliteStore):
         with self._lock:
             return self._conn.execute(
                 "SELECT * FROM alerts WHERE last_notified_ts IS NULL"
-                " AND opened_ts <= ? AND opened_ts >= ?"
+                " AND opened_ts <= ?"
+                " AND (opened_ts >= ? OR maint_held_notify_ts IS NOT NULL)"
                 " ORDER BY severity, opened_ts",
                 (cutoff_ts, floor_ts)).fetchall()
 
@@ -2373,14 +2397,62 @@ class AlertsDatabase(SqliteStore):
 
     def clear_maintenance(self, device_id: int, by: str = "") -> bool:
         """End the open period, keeping the row: a closed period is the
-        availability report's evidence that those seconds were planned."""
+        availability report's evidence that those seconds were planned.
+
+        Ending it also hands back every first notice the period swallowed —
+        here, at the one place maintenance mode can end, rather than in a
+        sweep that would have to remember to look."""
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE device_maintenance SET ended_ts = ?, ended_by = ?"
                 " WHERE device_id = ? AND ended_ts IS NULL",
                 (time.time(), by, int(device_id)))
             self._conn.commit()
-        return bool(cur.rowcount)
+            cleared = bool(cur.rowcount)
+            if cleared:
+                self.rearm_maintenance_held(device_id)
+        return cleared
+
+    def rearm_maintenance_held(self, device_id: int) -> int:
+        """Make due again the first notices maintenance mode decided for
+        this device's still-open alerts. Returns how many.
+
+        Only alerts carrying maint_held_notify_ts qualify, which is what
+        keeps it precise: an alert whose notice genuinely went out before
+        maintenance began was never flagged (_skip_held_open_notify refuses
+        an alert whose last_notified_ts is already set), so a clear cannot
+        mail it twice. Acknowledged and resolved alerts are left alone —
+        an operator who has already taken one does not want it announced as
+        news half an hour later.
+
+        The flag deliberately survives the re-arm: with last_notified_ts
+        back to NULL it is also what exempts the alert from
+        alerts_due_first_notify's backlog floor, and the sweep's own
+        mark_notified clears it the moment the notice is finally decided.
+        That is also why re-arming twice is harmless — the second toggle of
+        a maintenance switch finds nothing left flagged once the notice has
+        actually gone out.
+
+        The device match is made in Python, through the one function that
+        knows how an alert entity maps to a Nodes device (an interface
+        alert's entity_id is "<device_id>:<if_index>"), rather than by
+        teaching this query a second copy of that rule. The candidate set
+        is every flagged open alert in the database — only ever the ones a
+        maintenance mode is holding a notice for right now.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, entity_kind, entity_id FROM alerts"
+                " WHERE maint_held_notify_ts IS NOT NULL AND state = 'open'"
+            ).fetchall()
+            ids = [(row["id"],) for row in rows
+                   if alertrules.device_id_for(row["entity_kind"],
+                                               row["entity_id"]) == int(device_id)]
+            if ids:
+                self._conn.executemany(
+                    "UPDATE alerts SET last_notified_ts = NULL WHERE id = ?", ids)
+                self._conn.commit()
+        return len(ids)
 
     def open_maintenance(self, device_id: int) -> sqlite3.Row | None:
         with self._lock:
