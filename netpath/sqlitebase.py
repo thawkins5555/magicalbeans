@@ -610,6 +610,16 @@ class SqliteStore:
             # the rows turn out to be — a trap with its raw frame stored costs
             # an order of magnitude more than a syslog line, and one fixed
             # batch size cannot suit both.
+            #
+            # The band is wide (target/4 to target), so a first batch landing
+            # inside it never moves again: the STARTING chunk is the operating
+            # point, not a seed it converges away from. TRIM_CHUNK is sized
+            # for netpath.db's per-hop rows, so a store whose rows are a
+            # different size should pass its own measured chunk/min/max rather
+            # than inherit these. Measured while batching the prunes: at the
+            # wrong chunk size, batching a delete cost sixteen times the
+            # unbatched total, because every commit rewrites the index leaf
+            # pages the next batch is about to dirty again.
             if held > TRIM_LOCK_TARGET_S:
                 batch = max(smallest, batch // 2)
             elif held < TRIM_LOCK_TARGET_S / 4:
