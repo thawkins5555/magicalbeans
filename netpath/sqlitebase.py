@@ -364,7 +364,16 @@ class InstrumentedLock:
 
     def release(self) -> None:
         local = self._local
-        depth = local.depth - 1
+        held = getattr(local, "depth", 0)
+        if held <= 0:
+            # Not held by this thread. Hand straight to the real lock so it
+            # raises its own "cannot release un-acquired lock" rather than an
+            # AttributeError off the counters, and leave the depth alone: a
+            # bogus release must not leave this thread's bookkeeping negative
+            # and its later, legitimate holds unrecorded.
+            self._lock.release()
+            return
+        depth = held - 1
         local.depth = depth
         if not depth:
             # Recorded before the underlying release, so this runs while the
