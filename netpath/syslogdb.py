@@ -8,12 +8,44 @@ to a LIKE scan otherwise and for queries under three characters.
 from __future__ import annotations
 
 import collections
+import logging
 import sqlite3
 import threading
 import time
 
 from .eventlog import ERROR, NullLog, SYSTEM
 from .sqlitebase import SqliteStore
+
+log = logging.getLogger(__name__)
+
+# One prune batch, in rows, and the band the adaptation may move it inside.
+#
+# Its own figure rather than sqlitebase's TRIM_CHUNK, which is sized for
+# netpath.db's per-hop rows. Every row removed here also costs an FTS5 index
+# delete, so a batch is expensive out of proportion to its size and the figure
+# has to come from a measurement. Back to back on a million messages, half of
+# them past the cutoff, with a reader taking the same lock every 5 ms
+# (tests/bench_prune.py's volume and its reader):
+#
+#     unbatched         6.4 s, one hold of 6,418 ms
+#      2,000 rows      13.1 s, 250 holds, worst 462 ms, reader stalled 701 ms
+#     10,000 rows       8.3 s,  50 holds, worst 339 ms, reader stalled 481 ms
+#
+# Committing in pieces costs something whatever the size - a batch's commit
+# rewrites the index pages it dirtied, and the next batch dirties more of the
+# same - so the largest batch that still keeps the hold near the target wins
+# on both counts here.
+#
+# The band matters as much as the figure. _delete_batches only DOUBLES a batch
+# that held the lock for under a quarter of TRIM_LOCK_TARGET_S, and only
+# halves one that held it for longer than the target, so a first batch landing
+# between the two pins the size for the whole sweep: the start is the
+# operating point, not a seed. A store whose batches come off the page cache
+# can otherwise double its way up until one of them holds the lock for a
+# second or more, which is what the maximum is for.
+PRUNE_CHUNK = 10_000
+PRUNE_CHUNK_MIN = 2_000
+PRUNE_CHUNK_MAX = 20_000
 
 # RETURNING (SQLite 3.35, March 2021) is what makes a targeted FTS delete
 # possible: an external-content FTS5 table cannot work out what a deleted row
@@ -97,6 +129,9 @@ class SyslogDatabase(SqliteStore):
     TRIM_TABLE = "logs"
     OLDEST_TS_SQL = "SELECT MIN(ts) FROM logs"
     TRIM_FLOOR = 5000
+    # Set by prune() when its budget ran out before the backlog did, the same
+    # flag netpath.db and netpath.flowdb raise for the same reason.
+    last_prune_incomplete = False
 
     BACKFILL_CHUNK = 20_000
     # How long close() waits for a chunk already in progress to notice the
@@ -768,23 +803,130 @@ class SyslogDatabase(SqliteStore):
         self._last_rebuild = now
         self._conn.execute("INSERT INTO logs_fts(logs_fts) VALUES('rebuild')")
 
-    def prune(self, retention_days: float, max_rows: int) -> int:
+    def _id_bounds(self, where: str, params) -> tuple[int | None, int]:
+        """(lowest id matching `where`, one past the highest), or (None, 0).
+
+        Two index probes rather than a COUNT, and the pair _delete_batches
+        walks. Cheap now that Wave 1 indexed the columns retention filters on.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT MIN(id) AS lo, MAX(id) AS hi FROM logs WHERE {where}",
+                params).fetchone()
+        return row["lo"], (row["hi"] or 0) + 1
+
+    def _batched_delete_logs(self, where: str, params, low: int, cut: int,
+                             deadline: float) -> tuple[int, int]:
+        """Delete the ids in [low, cut) matching `where`, a batch per lock
+        hold.
+
+        The id range only chunks the sweep - every batch still carries
+        `where`, so a device with a wrong clock cannot make a prune drop the
+        wrong rows. netpath.db.prune's shape, and measurably the right one
+        here: chunking by how many rows have gone instead, which re-runs an
+        `ORDER BY ts LIMIT` for every batch, cost half as much again in total
+        and five times the worst lock hold on a million messages.
+
+        A clock years behind does cost something even so - its row takes a
+        current id while sorting to the far past, which puts MAX(id) at the
+        end of the table and has the sweep chunk-walk ids it will not delete.
+        Those batches are empty index probes rather than work, which is the
+        cheap way to be wrong here.
+
+        Returns (rows removed, the id reached), so a caller can tell a
+        finished sweep from one a budget cut short. Each batch goes through
+        _delete_logs, so the FTS index is retired with the rows it belongs to
+        and is consistent at every point a reader can observe.
+        """
+        def delete(low_id: int, upper: int) -> int:
+            return self._delete_logs(f"id >= ? AND id < ? AND {where}",
+                                     (low_id, upper, *params))
+
+        return self._delete_batches(
+            low, cut, deadline, delete, chunk=PRUNE_CHUNK,
+            chunk_min=PRUNE_CHUNK_MIN, chunk_max=PRUNE_CHUNK_MAX)
+
+    def prune(self, retention_days: float, max_rows: int,
+              budget_s: float | None = None) -> int:
+        """Age out messages, drop future-dated ones, then cap the row count.
+
+        Batched in adaptive, lock-bounded chunks rather than one DELETE per
+        stage. Every read on this store takes the same single lock the delete
+        takes, so an unbatched sweep of a month of messages froze every page
+        touching syslog for as long as the whole DELETE ran - and this store
+        was by far the worst of them, because each removed row also costs an
+        FTS5 index delete.
+
+        Which rows go is unchanged: the stages, their order and their
+        predicates are what they were.
+
+        `budget_s` is None by default, and so by default there is no
+        deadline: this prune never had one, and cutting a retention sweep
+        short is a retention change, not the latency change this is. A caller
+        that must bound the sweep passes one, and last_prune_incomplete then
+        says the backlog is unfinished.
+        """
         removed = 0
         now = time.time()
         cutoff = now - retention_days * 86400
+        deadline = (float("inf") if budget_s is None
+                    else time.monotonic() + budget_s)
+        incomplete = False
+
+        low, cut = self._id_bounds("ts < ?", (cutoff,))
+        if low is not None:
+            gone, reached = self._batched_delete_logs(
+                "ts < ?", (cutoff,), low, cut, deadline)
+            removed += gone
+            incomplete = incomplete or reached < cut
+
+        # A device whose clock is set years ahead files rows that sort to
+        # the top of every newest-first search and that `ts < cutoff` can
+        # never reach. Arrival-time clamping stops new ones; this removes
+        # the ones already stored.
+        horizon = now + 86400
+        low, cut = self._id_bounds("ts > ?", (horizon,))
+        if low is not None:
+            gone, reached = self._batched_delete_logs(
+                "ts > ?", (horizon,), low, cut, deadline)
+            removed += gone
+            incomplete = incomplete or reached < cut
+
+        # log_counts is one row per hour per severity - a month of it is a few
+        # thousand rows, and it has no id to chunk on. Its own short lock hold
+        # rather than a share of the sweep's, which is all that force-fitting
+        # it into the id-range helper would have bought it.
         with self._lock:
-            removed += self._delete_logs("ts < ?", (cutoff,))
-            # A device whose clock is set years ahead files rows that sort to
-            # the top of every newest-first search and that `ts < cutoff` can
-            # never reach. Arrival-time clamping stops new ones; this removes
-            # the ones already stored.
-            removed += self._delete_logs("ts > ?", (now + 86400,))
             self._conn.execute("DELETE FROM log_counts WHERE hour < ?", (cutoff,))
-            total = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM logs").fetchone()["n"]
-            if max_rows and total > max_rows:
-                removed += self._delete_logs(
-                    "id IN (SELECT id FROM logs ORDER BY ts ASC LIMIT ?)",
-                    (total - max_rows,))
             self._conn.commit()
+
+        if max_rows:
+            with self._lock:
+                total = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM logs").fetchone()["n"]
+            over = total - max_rows
+            if over > 0:
+                # The one stage an id range cannot express: once a clock is
+                # wrong, "the oldest `over` rows BY ts" is not an id range.
+                # Chunked by how many have gone instead, re-selecting the
+                # oldest remaining each time, which is the same set the single
+                # DELETE picked - nothing arriving mid-sweep can join it,
+                # because a new row's ts is now and the set is the oldest end
+                # of the table.
+                def by_ts(low_n: int, upper: int) -> int:
+                    return self._delete_logs(
+                        "id IN (SELECT id FROM logs ORDER BY ts ASC LIMIT ?)",
+                        (upper - low_n,))
+
+                gone, reached = self._delete_batches(
+                    0, over, deadline, by_ts, chunk=PRUNE_CHUNK,
+                    chunk_min=PRUNE_CHUNK_MIN, chunk_max=PRUNE_CHUNK_MAX)
+                removed += gone
+                incomplete = incomplete or reached < over
+
+        self.last_prune_incomplete = incomplete
+        if incomplete:
+            log.warning("netpath.syslogdb: prune of messages older than %.1f "
+                        "days did not finish within its budget; continuing at "
+                        "the next maintenance pass", retention_days)
         return removed

@@ -8,10 +8,37 @@ of rows. Varbinds are one JSON column: read whole, once, never joined.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 
 from .sqlitebase import SqliteStore
+
+log = logging.getLogger(__name__)
+
+# One prune batch, in rows, and the band the adaptation may move it inside.
+#
+# Its own figure rather than sqlitebase's TRIM_CHUNK, for syslogdb's reason
+# and with the opposite answer: a trap's row is heavy (its varbinds travel
+# with it) and `traps` carries five secondary indexes, so a batch's commit is
+# dear enough that the sweep costs the same either way and the smaller batch
+# is simply kinder to whoever is reading. Back to back on 1,020,000 traps,
+# half past the cutoff, with bench_prune's reader:
+#
+#     unbatched         2.8 s, one hold of 2,791 ms
+#      2,000 rows       6.8 s, 255 holds, worst 242 ms, reader stalled 227 ms
+#     10,000 rows       6.6 s,  51 holds, worst 289 ms, reader stalled 404 ms
+#
+# The band matters as much as the figure. _delete_batches only DOUBLES a batch
+# that held the lock for under a quarter of TRIM_LOCK_TARGET_S, and only
+# halves one that held it for longer than the target, so a first batch landing
+# between the two pins the size for the whole sweep: the start is the
+# operating point, not a seed. A store whose batches come off the page cache
+# can otherwise double its way up until one of them holds the lock for a
+# second or more, which is what the maximum is for.
+PRUNE_CHUNK = 2_000
+PRUNE_CHUNK_MIN = 1_000
+PRUNE_CHUNK_MAX = 10_000
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS traps (
@@ -118,6 +145,9 @@ class SnmpTrapDatabase(SqliteStore):
     TRIM_TABLE = "traps"
     OLDEST_TS_SQL = "SELECT MIN(ts) FROM traps"
     TRIM_FLOOR = 5000
+    # Set by prune() when its budget ran out before the backlog did, the same
+    # flag netpath.db and netpath.flowdb raise for the same reason.
+    last_prune_incomplete = False
 
     def __init__(self, path: str):
         self.store_raw = False
@@ -320,19 +350,92 @@ class SnmpTrapDatabase(SqliteStore):
 
     # ------------------------------------------------------------ maintenance
 
-    def prune(self, retention_days: float, max_rows: int) -> int:
+    def _batched_delete_traps(self, where: str, params, low: int, cut: int,
+                              deadline: float) -> tuple[int, int]:
+        """Delete the ids in [low, cut) matching `where`, a batch per lock
+        hold.
+
+        The id range only chunks the sweep - every batch still carries
+        `where`, so an exporter with a wrong clock cannot make a prune drop
+        the wrong rows. syslogdb._batched_delete_logs' shape and its
+        measurements: chunking by rows-gone instead cost a third again in
+        total and three times the worst lock hold.
+        """
+        def delete(low_id: int, upper: int) -> int:
+            cursor = self._conn.execute(
+                f"DELETE FROM traps WHERE id >= ? AND id < ? AND {where}",
+                (low_id, upper, *params))
+            return cursor.rowcount or 0
+
+        return self._delete_batches(
+            low, cut, deadline, delete, chunk=PRUNE_CHUNK,
+            chunk_min=PRUNE_CHUNK_MIN, chunk_max=PRUNE_CHUNK_MAX)
+
+    def prune(self, retention_days: float, max_rows: int,
+              budget_s: float | None = None) -> int:
+        """Age out traps, then cap the row count.
+
+        Batched in adaptive, lock-bounded chunks rather than one DELETE per
+        stage: every read on this store takes the same single lock the delete
+        takes, so an unbatched sweep froze the trap pages - and the
+        receiver's own writer - for as long as the whole DELETE ran.
+
+        Which rows go is unchanged.
+
+        `budget_s` is None by default, and so by default there is no
+        deadline: this prune never had one, and cutting a retention sweep
+        short is a retention change, not the latency change this is. A caller
+        that must bound the sweep passes one, and last_prune_incomplete then
+        says the backlog is unfinished.
+        """
         removed = 0
         cutoff = time.time() - retention_days * 86400
+        deadline = (float("inf") if budget_s is None
+                    else time.monotonic() + budget_s)
+        incomplete = False
+
         with self._lock:
-            cursor = self._conn.execute("DELETE FROM traps WHERE ts < ?", (cutoff,))
-            removed += cursor.rowcount or 0
+            bounds = self._conn.execute(
+                "SELECT MIN(id) AS lo, MAX(id) AS hi FROM traps WHERE ts < ?",
+                (cutoff,)).fetchone()
+        low = bounds["lo"]
+        if low is not None:
+            cut = bounds["hi"] + 1
+            gone, reached = self._batched_delete_traps(
+                "ts < ?", (cutoff,), low, cut, deadline)
+            removed += gone
+            incomplete = incomplete or reached < cut
+
+        # trap_counts is one row per hour per severity and has no id to chunk
+        # on: a short lock hold of its own, not a share of the sweep's.
+        with self._lock:
             self._conn.execute("DELETE FROM trap_counts WHERE hour < ?", (cutoff,))
-            total = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM traps").fetchone()["n"]
-            if max_rows and total > max_rows:
-                cursor = self._conn.execute(
-                    "DELETE FROM traps WHERE id IN (SELECT id FROM traps"
-                    " ORDER BY ts ASC LIMIT ?)", (total - max_rows,))
-                removed += cursor.rowcount or 0
             self._conn.commit()
+
+        if max_rows:
+            with self._lock:
+                total = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM traps").fetchone()["n"]
+            over = total - max_rows
+            if over > 0:
+                # Not an id range: this stage picks by ts, and a trap carries
+                # the sender's clock. Chunked by how many have gone, which is
+                # the same set the single DELETE picked.
+                def by_ts(low_n: int, upper: int) -> int:
+                    cursor = self._conn.execute(
+                        "DELETE FROM traps WHERE id IN (SELECT id FROM traps"
+                        " ORDER BY ts ASC LIMIT ?)", (upper - low_n,))
+                    return cursor.rowcount or 0
+
+                gone, reached = self._delete_batches(
+                    0, over, deadline, by_ts, chunk=PRUNE_CHUNK,
+                    chunk_min=PRUNE_CHUNK_MIN, chunk_max=PRUNE_CHUNK_MAX)
+                removed += gone
+                incomplete = incomplete or reached < over
+
+        self.last_prune_incomplete = incomplete
+        if incomplete:
+            log.warning("netpath.snmptrapdb: prune of traps older than %.1f "
+                        "days did not finish within its budget; continuing at "
+                        "the next maintenance pass", retention_days)
         return removed

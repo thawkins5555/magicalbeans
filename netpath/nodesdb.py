@@ -22,9 +22,43 @@ import time
 
 from .nodesmibdb import NodesMibDatabase
 from .nodesseriesdb import RAW_WINDOW_S, NodesSeriesDatabase
-from .sqlitebase import SqliteStore, id_chunks as _id_chunks, reclaim
+from .sqlitebase import (SqliteStore, id_chunks as _id_chunks,
+                         reclaim)
 
 log = logging.getLogger(__name__)
+
+# One batch of _prune_seen_ts, in rows, and the band the adaptation may move
+# it inside.
+#
+# Its own figure rather than sqlitebase's TRIM_CHUNK, and by the widest margin
+# of any store. These five tables' rows are tiny and their indexes are not
+# laid out in the order the rows are deleted in - ix_mac_entries_mac above
+# all, where a batch of 2,000 random MAC addresses touches very nearly every
+# leaf page the index has and the commit ending the batch rewrites all of
+# them, so the next batch does it again. Back to back on a 500,000-row
+# forwarding table, half of it past the cutoff, with bench_prune's reader:
+#
+#     unbatched         0.9 s, one hold of 891 ms
+#      2,000 rows      13.4 s, 126 holds - sixteen times the whole sweep
+#     10,000 rows       2.2 s,  25 holds, worst  97 ms, reader stalled 244 ms
+#     20,000 rows       2.0 s,  13 holds, worst 202 ms, reader stalled 439 ms
+#
+# 20,000 for the total; the rowid range is wide here (see _prune_seen_ts),
+# so a batch of that many rowids deletes rather fewer rows than that.
+#
+# The minimum is high for the same reason the figure is: halving must never be
+# allowed to reach the sizes at the top of that list.
+#
+# The band matters as much as the figure. _delete_batches only DOUBLES a batch
+# that held the lock for under a quarter of TRIM_LOCK_TARGET_S, and only
+# halves one that held it for longer than the target, so a first batch landing
+# between the two pins the size for the whole sweep: the start is the
+# operating point, not a seed. A store whose batches come off the page cache
+# can otherwise double its way up until one of them holds the lock for a
+# second or more, which is what the maximum is for.
+WALK_PRUNE_CHUNK = 20_000
+WALK_PRUNE_CHUNK_MIN = 10_000
+WALK_PRUNE_CHUNK_MAX = 40_000
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS groups (               -- "polling profiles"
@@ -2503,6 +2537,62 @@ class NodesDatabase(SqliteStore):
         with self._lock:
             return self._conn.execute(sql + " ORDER BY mac, vlan", args).fetchall()
 
+    def _prune_seen_ts(self, table: str, older_than_s: float,
+                       budget_s: float | None = None) -> int:
+        """The by-age DELETE the five walk-result tables share, batched.
+
+        `mac_entries`, `neighbors`, `vlans`, `vlan_ports` and `port_vlans` all
+        answer the same question - "nothing has refreshed this row for the
+        retention window" - against a `seen_ts` column Wave 1 indexed, so one
+        body serves all five and each keeps its own name and rule.
+
+        Batched in adaptive, lock-bounded chunks: every read on nodes.db takes
+        the same single lock the delete takes, so an unbatched sweep of a
+        fleet's forwarding tables froze every page that resolves a MAC or
+        draws the map for as long as the whole DELETE ran.
+
+        Chunked by rowid, because none of these five has an `id` of its own -
+        they are keyed on the fact being recorded - and every batch still
+        carries the `seen_ts` test, so the range decides only how the sweep is
+        cut up and never which rows go. The range is wide: a rowid is handed
+        out when a row is first inserted, while `seen_ts` is rewritten by
+        every walk that still sees the row, so the two do not agree. Wide but
+        cheap, and much cheaper than the alternative - re-selecting the oldest
+        remaining by `seen_ts` for each batch cost two and a half times as
+        much in total and fourteen times the worst lock hold.
+        """
+        if older_than_s <= 0:
+            return 0
+        cutoff = time.time() - older_than_s
+        with self._lock:
+            bounds = self._conn.execute(
+                f"SELECT MIN(rowid) AS lo, MAX(rowid) AS hi FROM {table}"
+                f" WHERE seen_ts < ?", (cutoff,)).fetchone()
+        low = bounds["lo"]
+        if low is None:
+            return 0
+        cut = bounds["hi"] + 1
+
+        def delete(low_id: int, upper: int) -> int:
+            cursor = self._conn.execute(
+                f"DELETE FROM {table} WHERE rowid >= ? AND rowid < ?"
+                f" AND seen_ts < ?", (low_id, upper, cutoff))
+            return cursor.rowcount or 0
+
+        # No budget means no deadline: stopping a sweep early is a retention
+        # change, and this is a latency change.
+        deadline = (float("inf") if budget_s is None
+                    else time.monotonic() + budget_s)
+        removed, reached = self._delete_batches(
+            low, cut, deadline, delete, chunk=WALK_PRUNE_CHUNK,
+            chunk_min=WALK_PRUNE_CHUNK_MIN, chunk_max=WALK_PRUNE_CHUNK_MAX)
+        if reached < cut:
+            log.warning("netpath.nodesdb: prune of %s rows unrefreshed for "
+                        "%.1f day(s) did not finish within its budget; "
+                        "continuing at the next maintenance pass",
+                        table, older_than_s / 86400.0)
+        return removed
+
     def prune_mac_entries(self, older_than_s: float) -> int:
         """Drop entries nothing has refreshed for this long, present or
         stale alike. Now that replace_mac_entries keeps a stale row around
@@ -2514,13 +2604,7 @@ class NodesDatabase(SqliteStore):
         itself has stopped being walked (dropped from the schedule, or out
         of service) and nothing is refreshing it any more; either way, the
         rule is the same DELETE by age, not a present/absent branch."""
-        if older_than_s <= 0:
-            return 0
-        with self._lock:
-            cur = self._conn.execute("DELETE FROM mac_entries WHERE seen_ts < ?",
-                                     (time.time() - older_than_s,))
-            self._conn.commit()
-        return cur.rowcount or 0
+        return self._prune_seen_ts("mac_entries", older_than_s)
 
     # ------------------------------------------------------ LLDP/CDP neighbours
 
@@ -2797,13 +2881,7 @@ class NodesDatabase(SqliteStore):
         """Drop neighbour rows nothing has refreshed for this long, present
         or stale alike — prune_mac_entries' own by-age rule, applied to
         `neighbors`."""
-        if older_than_s <= 0:
-            return 0
-        with self._lock:
-            cur = self._conn.execute("DELETE FROM neighbors WHERE seen_ts < ?",
-                                     (time.time() - older_than_s,))
-            self._conn.commit()
-        return cur.rowcount or 0
+        return self._prune_seen_ts("neighbors", older_than_s)
 
     # ------------------------------------------------------- VLAN membership
 
@@ -3000,33 +3078,15 @@ class NodesDatabase(SqliteStore):
     def prune_vlans(self, older_than_s: float) -> int:
         """Drop VLAN rows nothing has refreshed for this long — prune_
         neighbors' own by-age rule, applied to `vlans`."""
-        if older_than_s <= 0:
-            return 0
-        with self._lock:
-            cur = self._conn.execute("DELETE FROM vlans WHERE seen_ts < ?",
-                                     (time.time() - older_than_s,))
-            self._conn.commit()
-        return cur.rowcount or 0
+        return self._prune_seen_ts("vlans", older_than_s)
 
     def prune_vlan_ports(self, older_than_s: float) -> int:
         """Drop vlan_ports rows nothing has refreshed for this long."""
-        if older_than_s <= 0:
-            return 0
-        with self._lock:
-            cur = self._conn.execute("DELETE FROM vlan_ports WHERE seen_ts < ?",
-                                     (time.time() - older_than_s,))
-            self._conn.commit()
-        return cur.rowcount or 0
+        return self._prune_seen_ts("vlan_ports", older_than_s)
 
     def prune_port_vlans(self, older_than_s: float) -> int:
         """Drop port_vlans rows nothing has refreshed for this long."""
-        if older_than_s <= 0:
-            return 0
-        with self._lock:
-            cur = self._conn.execute("DELETE FROM port_vlans WHERE seen_ts < ?",
-                                     (time.time() - older_than_s,))
-            self._conn.commit()
-        return cur.rowcount or 0
+        return self._prune_seen_ts("port_vlans", older_than_s)
 
     # --------------------------------------------------------- PoE / STP
 
