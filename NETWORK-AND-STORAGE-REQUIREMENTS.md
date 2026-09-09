@@ -417,20 +417,49 @@ meaningful decision, not a free one.
 ### How many devices
 
 The honest answer is that it depends on ports per device, poll interval and
-disk, and that this application is a single process with a single database
-connection, so every ceiling compounds in one place. Measured on one Linux
-container with a local disk, a 60-second interval and 48-port switches: a
-fleet of **250** is comfortable, at **1,000** the poll pool saturates and an
-outage takes several minutes to be seen, and at **2,000** an outage may not be
-detected at all because each device is only reached every few minutes. Doubling
-the interval to the shipped 120 seconds roughly doubles all three numbers.
+disk, and that this application is one process whose databases are one
+connection each, so several ceilings compound in one place.
 
-Those figures are from before the 4.39.0 write-path work (batched sample
-writes, cached scheduler configuration, one keyed query per alert tick, GETBULK
-for the interface columns) which raises the write ceiling by about seventy
-times on its own; re-measure on your own hardware rather than trusting either
-set of numbers. `FEATURES.md` says "hundreds of devices" in one place; read
-that as the size at which nothing needs thinking about, not as a limit.
+The figure that decides it is **lateness** — how long after a device was due
+it was actually polled, which is how late an outage is noticed. Measured on
+this hardware with `tests/bench_poll_cycle.py`, 300 devices on a 15-second
+interval:
+
+| workers | p50 lateness | p95 | queue depth | pool saturated |
+| --- | --- | --- | --- | --- |
+| 8 | 2.5 s | 9.0 s | 182 | 92% |
+| 16 | 0.3 s | 5.3 s | 101 | 69% |
+| 32 | 0.00 s | 0.30 s | 2 | 7% |
+
+The knee is sharp, which is the argument for not choosing the number by
+hand: a pool below roughly 1.6x the work a cycle actually contains is
+already deferring polls, and the same fleet needs a different number during
+a site outage than it does on a quiet afternoon, because a device that is
+not answering costs about thirty times one that is. From 5.5.0 the pool
+sizes itself between a floor and a ceiling for exactly that reason, so the
+question this section used to answer — "how many devices before I have to
+retune it" — is now mostly the ceiling's question rather than the operator's.
+
+**On Windows, check the ping path before anything else.** There is no
+unprivileged raw ICMP socket on the platform, so until 5.5.0 every probe
+forked a real `ping.exe`: measured here at **14.0 ms** apiece, three per
+device per poll, which for 2,000 devices on a 60-second interval is 84
+seconds of process creation inside a 60-second window — **140% of it, before
+SNMP costs anything**. The `IcmpSendEcho` path added in 5.5.0 costs 0.22 ms,
+the same work falling to about **2%** of the window. The Debug page names
+which path a running install is on.
+
+Retention is the other half, and it is not the volume that hurts but the
+pause: a prune holds its store's write lock, so every page waits behind it.
+Measured with `tests/bench_prune.py` at a million rows, before the batching
+work: syslog **8.7 s**, alerts 3.5 s, traps 2.1 s. The syslog figure is the
+one to know, because the shipped cap is twenty times the row count it was
+measured at.
+
+Re-measure on your own hardware rather than trusting any of these numbers —
+that is what those two benches are for. `FEATURES.md` says "hundreds of
+devices" in one place; read that as the size at which nothing needs thinking
+about, not as a limit.
 
 ### What keeps it bounded
 

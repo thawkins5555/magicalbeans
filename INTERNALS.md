@@ -1298,6 +1298,171 @@ through. `set_default_group()` is a two-statement transaction (clear the
 old default, set the new one) with no in-use check, since making a
 profile default moves no devices.
 
+### The poll pool sizes itself (`nodepoll.py`) — 5.5.0
+
+**Why it is a Little's Law sum and not a feedback loop.** How many workers a
+fleet needs is a quantity this codebase can compute rather than discover: the
+sum over enabled devices of *measured poll cost over poll interval*, which is
+by definition the number of workers busy in steady state. Both terms were
+already in hand once a second — the interval is in `_configs`, and `_run_one`
+already stamped a start and a finish and formatted the difference into a log
+line — so `_record_poll_cost` keeps it as a per-device EWMA and
+`_schedule_pass` accumulates the sum inside the loop that already reads every
+device. No extra query and no extra iteration: a steady pass at 300 devices is
+still one SQL statement, which is what `tests/test_scheduler.py` pins.
+
+**Why not queue depth.** It is bimodal here by construction. `_schedule_pass`
+submits every due device in one burst, so the queue spikes at the top of a
+cycle and drains; that is normal, not backlog. `_SATURATION_S = 300` exists
+because the raw signal is that noisy, and a controller reading it would chase
+the burst.
+
+**Why not the overrun counter, which is the trap.** `_record_overrun` returns
+early for a device that is down or failing — deliberately, and for a good
+reason of its own — so the counter goes quiet during exactly the site outage
+that makes a fleet expensive. Measured on 300 devices at half the workers they
+needed, it read **zero** while 182 devices sat queued and p95 lateness was
+already 8.95 s on a 15-second interval; it only reaches its first hundreds
+after 45 s, by which time the fleet is a cycle and a half behind. A signal
+that mutes itself under load cannot drive a controller. Saturation is kept,
+but only as a **ratchet that can push the number up** — it covers the first
+seconds of an outage, before any expensive poll has completed to move an EWMA.
+
+**Damping, and why the two cadences differ.** Demand is evaluated every 15 s
+(free: arithmetic over dicts) but the pool is resized at most every 60. That
+second number is not tidiness. `_apply_pool_size` calls `shutdown(wait=False)`
+on the pool it replaces, which does **not** cancel running futures, and
+`ThreadPoolExecutor` keeps a module-global entry per worker thread plus an
+atexit handler — so once a minute means at most one abandoned pool draining at
+a time, where seconds apart would accumulate them. Growth at most doubles a
+step because latency is the visible harm; shrinking needs four consecutive
+evaluations to agree and gives up a quarter at most, because shrinking buys
+nothing an operator can see and every shrink abandons a pool.
+
+**Where the settings live, and why not in the pass.** Floor, ceiling and
+headroom are cached on the poller by `_read_pool_settings` at
+`start()`/`reconfigure()` time. `reconfigure` runs on every Nodes settings
+save, so the cache cannot go stale — and reading them in `_schedule_pass`
+would break the five-statement pin and its companion assertion that a steady
+pass never reads the settings table.
+
+**`poll_workers` is not replaced.** It is still the size when auto is off, and
+`_migrate` seeds `poll_workers_min` from it on upgrade, so an install tuned to
+48 gets 48 as its floor and can only ever gain threads. It also gained the
+server-side clamp it never had: the browser said `max=256` while
+`nodesdb.save_settings` bounded nothing, so an API client could ask for a
+hundred thousand threads.
+
+**What the saturation alert now means.** `poll_pool_saturated` keeps its rule
+key but fires only at the ceiling. Below it, `_note_saturation` does not even
+start its clock: the controller corrects within fifteen seconds, and alerting
+on something the application is already fixing is how operators learn to stop
+reading alerts. `_autoscale_ceiling` is `None` until the autoscaler has run,
+which is both the auto-off case and the case of a poller whose `start()` never
+ran — which is how `tests/test_poll_write_path.py` drives `_note_saturation`,
+and why the gate reads poller state rather than the database.
+
+### A down device backs off SNMP, never ping (`nodepoll.py`) — 5.5.0
+
+A device that is not answering costs about thirty times one that is — every
+ping timeout plus every SNMP timeout times its retries — so a device already
+formally `down` skips the SNMP half of two cycles in three
+(`_SNMP_BACKOFF_SKIPS`, a skip *count* rather than a wall-clock stamp,
+deliberately not reusing `_last_ping`/`ping_interval_s`, which answers an
+unrelated operator question and would otherwise silently change this).
+
+**Ping is not backed off, and that is the entire safety argument.** Ping is
+what detects both the outage and the recovery; `_next_run` is untouched; so
+the scheduled cadence, the status timeline, the outage duration and the
+up/down event stream are exactly what they were. The cycle still runs — it
+simply stops being expensive.
+
+Three details make it correct, and each of them was a bug first:
+
+- **The predicate reads this cycle's ping, not `device["status"]`'s row.**
+  `_run_one` reads that row *before* the poll, so it describes the previous
+  cycle. Gating on it alone would skip SNMP on the one cycle whose ping had
+  just come back — the cycle that most wants to run it.
+- **It carries `None` into the logic and the PREVIOUS values into storage.**
+  `snmp_failing_now` is `snmp_ok is False and ping_ok`, so carrying `False`
+  through a skipped cycle would count a phantom failure toward
+  `snmp_fail_alert_after` the moment ping recovered. But `record_poll` maps
+  `None` to a blanked column, so passing `None` *there* would erase the
+  device's SNMP state and reset `prev_snmp_ok`, firing a duplicate
+  `snmp_down` for an outage already reported. The two uses are therefore
+  split. 5.4.0's `interfaces_note` solves the same problem the same way, and
+  needs no special handling here for exactly that reason.
+- **It requires `ping_enabled` and `ping_ok is False`, not merely falsy.** On
+  a profile with ping switched off, SNMP is the only evidence the device
+  exists and `ping_ok` is `None`; backing SNMP off there meant a recovered
+  device was never seen to recover. `test_nodepoll_e2e` caught it.
+
+`snmp_failing_ping_ok` cannot stall, because that device answers ping and the
+predicate requires that it does not.
+
+### Windows pings without forking a process (`ipam_scan.py`) — 5.5.0
+
+`_detect_icmp_socket_kind` returned `None` unconditionally on Windows, so
+`ping_many` — reached from `nodepoll._poll_device`, the IPAM sweep and
+discovery alike — fell through to one `ping.exe` per probe. At 14 ms of
+process creation apiece and three probes per device per poll, a 2,000-device
+fleet on a 60-second interval was 84 seconds of forking inside a 60-second
+window: more than the window, before SNMP cost anything.
+
+Windows has no unprivileged raw ICMP socket, which is why the socket probe
+gives up there, but it does have `IcmpSendEcho` in `iphlpapi.dll`, which needs
+no elevation. Reached through `ctypes` the way `dpapi.py` reaches DPAPI, and
+lazily, because `ipam_scan` is imported on every platform. Measured at 0.22 ms
+against the subprocess path's 14.03 ms.
+
+`IcmpSendEcho` does its own framing and waiting, so it cannot be folded into
+`_ping_many_socket`'s hand-built echo request; `_probe` dispatches between them
+so `ping_once` and `ping_many` stay identical. The reply structure's
+whole-millisecond `RoundTripTime` is ignored in favour of timing the call, for
+the same reason the socket path times its own send and receive rather than
+trusting what `ping` prints. All three `NETPATH_PING_MODE` values keep their
+meaning — `subprocess` still short-circuits before the probe, which the demo
+harness depends on, since `demo/bin/ping` is a PATH stand-in that makes a
+simulated `127.0.0.x` device look down and any real ICMP path would bypass
+PATH and get the kernel's own loopback reply.
+
+### What the server measures about itself (`server.py`, `sqlitebase.py`) — 5.5.0
+
+Two numbers the application computed and then discarded.
+
+**Per-request latency.** `_dispatch` has always timed every request with
+`perf_counter` and handed the result to `AccessLog.record`, which took the
+argument and never stored it — so "which endpoint is slow" had no answer
+anywhere in the product. It is now accumulated per route, keyed by the route's
+**pattern** rather than its path, so one device-detail route is one key
+whatever the fleet size and the table is bounded by the route count rather
+than by the estate. Count, mean, max and fixed-edge buckets, with p95 read off
+the buckets: deliberately coarse, because a latency budget is written as "p95
+under 250 ms" and a fixed-bucket histogram cannot honestly claim 187.4.
+
+**Lock wait and hold per store.** Every read takes its store's single write
+lock, not merely every write, so although all thirteen files are in WAL mode
+and WAL would let readers run alongside a writer, that concurrency is
+unreachable through one connection behind one Python lock. `SqliteStore`'s
+`RLock` is now an `InstrumentedLock` recording acquisitions, wait, hold and
+worst hold — one change at one site, which instruments all 139 lock sites in
+`nodesdb` alone. Re-entrancy is counted per thread with only the outermost
+acquisition recorded, since several stores nest their lock on purpose;
+`acquire()`/`release()` are implemented alongside the context manager because
+callers use both — `test_nodes_split_upgrade` probes a store lock with
+`acquire(timeout=...)` and `test_collectors_hardening` wraps one in a spy.
+
+Deliberately **not** `sqlite3.set_trace_callback`: it fires per statement, and
+`tests/test_scheduler.py` installs one itself to count statements — a
+permanent callback would collide with the suite that protects that number.
+
+Measured cost is 0.8 us an acquisition against a plain `RLock`'s 0.1: 0.25% of
+a scheduler pass, 7% of the cheapest single-row read, 8 ms a second at ten
+thousand acquisitions. It stays on at that price. Both surface on
+`/api/debug`, which the Debug tab already polls as a delta, so
+`demo/scenario.py`'s existing snapshot picks them up at tier scale with no
+change to the harness.
+
 ### Debug page node pollers
 
 `get_debug`'s `node_workers` list is built the same way its existing

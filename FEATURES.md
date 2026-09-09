@@ -483,9 +483,39 @@ own subtabs.
   profile. The results are recorded as ordinary metrics,
   `ping_loss_pct` and `ping_rtt_ms`, so they chart and so the built-in
   "Packet loss to device high" and "Ping response time high" alert rules
-  have something to read. Round-trip time comes from ping's own reported
-  figure, not from timing the subprocess, which counted process startup
-  as network latency.
+  have something to read. Round-trip time is timed around the probe itself
+  wherever a probe can be sent without a subprocess — every platform now,
+  Windows included — and read out of `ping`'s own output only on the
+  fallback path, where timing the subprocess would count process startup as
+  network latency.
+- **Pinging does not fork a process any more, on any platform.** Linux uses
+  an unprivileged ICMP socket where the host allows one; Windows, which has
+  no such socket at all, goes through `IcmpSendEcho` and needs no elevation
+  for it. It matters at fleet scale rather than per probe: three probes per
+  device per poll across 2,000 devices was 84 seconds of process creation
+  inside a 60-second window on Windows, and is now about a second and a
+  half. The Debug page names the path in use, and a host that can do neither
+  still falls back to a real `ping` exactly as before.
+- **The poll pool sizes itself.** Rather than an operator picking a worker
+  count once and it being wrong for most of the following year, the poller
+  adds up how long each device's polls actually take and how often each one
+  is due, and keeps enough threads for that plus a margin — between a floor
+  and a ceiling that are still the operator's to set (Nodes → Settings). It
+  grows quickly, shrinks slowly, and never moves more than once a minute. A
+  fleet that outgrows the ceiling still raises `poll_pool_saturated`, which
+  is the one case that needs a person. An upgrade takes the install's
+  existing **Poll worker threads** as the floor, so no fleet can end up with
+  fewer threads than it already had, and that setting still decides the size
+  outright for anyone who switches auto-sizing off.
+- **A device that is down stops costing the pool so much.** A device that is
+  not answering is about thirty times more expensive to poll than one that
+  is — every ping timeout plus every SNMP timeout times its retries — and a
+  site outage is when the pool can least afford it. A device already down
+  now skips the SNMP half of two cycles in three. It is still **pinged on
+  every cycle**, which is the point: ping is what notices the recovery, so
+  nothing about how quickly an outage or a recovery is seen has changed.
+  A device answering ping with a failing SNMP agent is not down and is never
+  backed off, so `snmp_failing_ping_ok` counts exactly as it did.
 - **A device is DOWN only when ping and SNMP have both failed.** A switch
   that still answers ICMP but whose community string is wrong is
   reachable and misconfigured, not down, and reporting it as an outage
@@ -1650,9 +1680,12 @@ alerts and optionally emailing about them.
   (Nodes → Settings, default 3, beside **Consecutive failures before
   "down"**) consecutive qualifying failures before it opens, rather than
   the first one, so a single missed poll no longer raises it on its own.
-  `poll_pool_saturated` fires when every poll worker has been busy for five
-  minutes, which is the fleet outgrowing its worker count rather than any
-  one device failing. `smtp_failing` fires when the mail path itself stops
+  `poll_pool_saturated` fires when the poll pool has been **at its ceiling**
+  with devices waiting for five minutes, which is the fleet outgrowing the
+  most workers it is allowed rather than any one device failing. It no longer
+  fires below the ceiling: from 5.5.0 the pool sizes itself, and saturation it
+  is about to correct within fifteen seconds is not news. With auto-sizing
+  switched off it reads exactly as it did before, naming `poll_workers`. `smtp_failing` fires when the mail path itself stops
   working, and is the one rule whose notification cannot be delivered by
   the mechanism it is about — it exists so the alert list says so.
 - **Two more report on storage, new in 5.2.0**, because nothing in the

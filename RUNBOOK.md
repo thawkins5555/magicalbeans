@@ -331,11 +331,39 @@ what you want.
 
 ---
 
+## The interface freezes for a few seconds, every so often
+
+**Symptom.** The whole UI stalls briefly and then carries on, with no error
+anywhere. Often close to a quarter past the hour, or fifteen minutes after a
+settings save.
+
+**Cause.** The retention sweep. Each store is one connection behind one lock,
+and a prune that deletes in a single statement holds that lock for its whole
+duration — so every page reading that database waits for it. Syslog is the
+worst by an order of magnitude, because its full-text index has to be fed
+every deleted row.
+
+**Checks.** `/api/debug` reports `store_locks` per database: `max_hold_s` is
+the longest any single acquisition has lasted, and the store with the largest
+one is the store to look at. `tests/bench_prune.py` reproduces it offline and
+prints the worst stall a reader saw beside each prune.
+
+**Fix.** Lower that store's retention or its size cap so each pass has less to
+do, and check the size caps on Settings → Data & retention are not so far
+above the real volume that a single pass ever deletes a fortnight at once.
+
+---
+
 ## The poll pool is saturated
 
-**Symptom.** `poll_overrun` events across the fleet, a `poll_pool_saturated`
-alert, or the Dashboard's poller tile showing queued work consistently above
-the pool size.
+**Symptom.** A `poll_pool_saturated` alert, or the Dashboard's poller tile
+showing queued work consistently above the pool size. `poll_overrun` events
+across the fleet say the same thing, but they say it late and should not be
+waited for: `_record_overrun` is suppressed for a device that is down or
+failing, so during the site outage that makes a fleet expensive the counter
+goes quiet. Measured on 300 devices at half the workers they needed, it read
+zero while 182 devices sat queued and polls were already 9 s late on a 15 s
+interval.
 
 **Read the gauge correctly.** The busy figure counts queued *plus* running
 work, so a number above the worker count is backlog depth, not impossible
@@ -353,25 +381,45 @@ concurrency: 48 against a pool of 16 means 16 polls in flight and 32 waiting.
    worker for over an hour; from 4.39.0 there is a wall-clock deadline of half
    the poll interval and it gives up after three consecutive timeouts, logging
    "read N of M". Look for that message.
-3. **Raise the interval before raising the workers.** Going from 60 to 120
+3. **Check whether the pool is sizing itself.** From 5.5.0 it does, unless
+   somebody turned that off: the Dashboard's poller tile and the status strip
+   read `auto <floor>-<ceiling>` when it is on. **With auto on, this alert
+   means the CEILING was not enough** — the pool has already grown as far as
+   it is allowed and is still behind. Below the ceiling the alert does not
+   fire at all, because the pool corrects itself within fifteen seconds and
+   an alert about that is noise.
+4. **Raise the interval before raising the ceiling.** Going from 60 to 120
    seconds halves the load exactly. More workers past a point buys nothing —
-   this is a single process with a single database connection and the write
-   path becomes the limit.
-4. **Then raise the workers**, in steps, watching CPU. Sixteen is the shipped
-   default.
-5. **If it is steady-state saturation at your fleet size**, you are at the
+   this is one process whose databases are one connection each, and the write
+   path becomes the limit. The alert carries the `demand` figure the poller
+   computed: if that is far above the ceiling, the interval is the honest fix.
+5. **Then raise the ceiling** (Nodes → Settings → *Most poll worker threads*),
+   in steps, watching CPU. 128 is the shipped ceiling and 16 the shipped
+   floor; an install upgraded from 5.4.0 or earlier has its own previous
+   `poll_workers` as the floor, so it can only ever have gained threads.
+   With auto off, *Poll worker threads* is still the number, exactly as
+   before.
+6. **If it is steady-state saturation at your fleet size**, you are at the
    capacity of one instance. `NETWORK-AND-STORAGE-REQUIREMENTS.md` has
    measured figures. There are no remote pollers in this release.
-6. **On Windows, check whether ping is the reason.** There is no
-   unprivileged raw ICMP socket on Windows, so every ping probe forks a real
-   `ping.exe` — measured at 15.6 ms per probe, so a 2,000-device fleet at the
-   shipped defaults (ping enabled, three probes, every 60-second poll) is
-   about 94 seconds of process-creation work the machine has to fit inside
-   every 60-second window, on top of whatever SNMP itself costs. If the pool
-   is saturated on Windows and devices are otherwise healthy, raise
-   `ping_interval_s` (ping does not need to run every poll) or disable ping
-   for profiles where SNMP failing already counts as down — both settings
-   are easy to miss because nothing on screen points at them.
+7. **On Windows, check which ping path this install is on.** There is no
+   unprivileged raw ICMP socket on Windows, so before 5.5.0 every probe
+   forked a real `ping.exe` — measured at 14 ms per probe, which for a
+   2,000-device fleet at the shipped defaults (ping enabled, three probes,
+   every 60-second poll) is about 84 seconds of process creation the machine
+   has to fit inside every 60-second window, before SNMP costs anything.
+   5.5.0 reaches `IcmpSendEcho` through `iphlpapi.dll` instead, needs no
+   elevation, and costs 0.22 ms — the same work falling to about 2% of the
+   window. **The Debug page names the path in use**; a `subprocess` reading
+   on Windows means the DLL could not be loaded and the old cost is back. If
+   an install really is stuck on the subprocess path, the old advice still
+   applies: raise `ping_interval_s` (ping does not need to run every poll) or
+   disable ping for profiles where SNMP failing already counts as down.
+
+   Note also that a device already **down** skips SNMP on two cycles in three
+   from 5.5.0, so a site outage costs the pool far less than it used to.
+   Ping is deliberately *not* backed off — it is what notices the recovery —
+   so nothing about outage or recovery timing changed.
 
 ---
 
