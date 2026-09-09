@@ -68,6 +68,7 @@ python3 tests/bench_db_search.py [scale ...] [--repeats N]
 python3 tests/bench_prune.py [rows]                    # every prune, and what it freezes
 python3 tests/bench_poll_cycle.py [devices ...]        # poll lateness by fleet and pool size
 python3 tests/bench_ping.py                            # one ICMP probe, each path this host has
+python3 tests/bench_lock_contention.py                 # does a read wait on the poller's writes
 ```
 
 
@@ -101,6 +102,17 @@ whether each read scans or seeks, which is the fact an index would have to
 change. Sizes are scale factors over a base profile (default `1 4 16`), chosen
 so `x4` puts the fleet at the 2,000 devices the comment at `nodesdb.py:1282`
 records its text-search measurement against.
+
+`bench_lock_contention.py` answers the one architectural question this
+release put to the numbers: each store is a single SQLite connection behind a
+single lock, so every read queues behind every write although WAL would have
+let them run together — does that cost anything at a real fleet size? It
+times web-shaped reads with a paced writer alongside, and **the pacing is the
+whole point**. Unpaced, a writer commits about eleven thousand transactions a
+second and reports a p95 two orders of magnitude worse than the truth; a
+2,000-device fleet on the shipped interval commits about 17. Deciding from
+the first would buy a risky change to fix a problem no install has. Run it
+before proposing read-only connections again.
 
 `bench_prune.py` is the one whose last column matters most. Every store here
 guards one sqlite connection with one RLock, and each shipped prune holds it
