@@ -69,6 +69,11 @@ CREATE TABLE IF NOT EXISTS groups (               -- "polling profiles"
     v3_user         TEXT,                          -- v3
     v3_auth_proto   TEXT,                           -- MD5/SHA/SHA224/256/384/512
     v3_auth_pass_enc BLOB,                          -- DPAPI-encrypted; NULL = none stored
+    -- The privacy pair (5.8.0): AES only, and the same encryption at rest as
+    -- the auth password. Both NULL is authNoPriv; the level is never stored,
+    -- it is derived from which pairs are present (nodepoll.security_level).
+    v3_priv_proto   TEXT,
+    v3_priv_pass_enc BLOB,
     poll_interval_s INTEGER NOT NULL DEFAULT 120,
     snmp_timeout_s  REAL NOT NULL DEFAULT 3.0,
     snmp_retries    INTEGER NOT NULL DEFAULT 2,
@@ -100,6 +105,8 @@ CREATE TABLE IF NOT EXISTS group_credentials (
     v3_user         TEXT,
     v3_auth_proto   TEXT,
     v3_auth_pass_enc BLOB,
+    v3_priv_proto   TEXT,
+    v3_priv_pass_enc BLOB,
     created_ts      REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_group_credentials_group ON group_credentials(group_id, id);
@@ -130,6 +137,8 @@ CREATE TABLE IF NOT EXISTS devices (
     v3_user         TEXT,
     v3_auth_proto   TEXT,
     v3_auth_pass_enc BLOB,
+    v3_priv_proto   TEXT,
+    v3_priv_pass_enc BLOB,
     poll_interval_s INTEGER,
     snmp_timeout_s  REAL,
     snmp_retries    INTEGER,
@@ -684,7 +693,8 @@ DEFAULTS = {
 }
 
 _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
-                     "v3_auth_pass_enc", "poll_interval_s", "snmp_timeout_s",
+                     "v3_auth_pass_enc", "v3_priv_proto", "v3_priv_pass_enc",
+                     "poll_interval_s", "snmp_timeout_s",
                      "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
                      "mib_file_id", "ping_count", "ping_timeout_ms",
                      "unreachable_ping_only", "vendor_oid", "location_oid",
@@ -692,7 +702,8 @@ _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
                      "stp_enabled", "vlan_interval_s", "arp_table_interval_s")
 
 _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
-                   "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
+                   "v3_auth_proto", "v3_priv_proto", "poll_interval_s",
+                   "snmp_timeout_s",
                    "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
                    "mib_file_id", "ping_count", "ping_timeout_ms",
                    "unreachable_ping_only", "vendor_oid", "location_oid",
@@ -707,6 +718,17 @@ _DEVICE_ONLY_COLUMNS = ("web_scheme", "web_port")
 _DEVICE_EDITABLE = (("name", "group_id", "device_group_id", "display_name_source",
                      "enabled", "vendor_override", "upstream_id")
                     + _OVERRIDE_COLUMNS + _DEVICE_ONLY_COLUMNS)
+
+
+def _drop_priv_with_proto(fields: dict) -> None:
+    """If an update sets v3_priv_proto to nothing, drop the privacy blob
+    with it. A privacy password with no protocol is inert (security_level
+    needs both) but it is still a stored secret nobody can use or see, and
+    "set the protocol to none" is the one gesture the form offers for
+    "stop using privacy" — it must actually stop keeping the secret."""
+    if "v3_priv_proto" in fields and not fields["v3_priv_proto"]:
+        fields["v3_priv_proto"] = None
+        fields["v3_priv_pass_enc"] = None
 
 
 # The separators a MAC address is written with in the wild. '.' covers the
@@ -1030,6 +1052,17 @@ class NodesDatabase(SqliteStore):
             "identified_ts": "REAL",
             "identified_sys_object_id": "TEXT",
         })
+        # The SNMPv3 privacy pair (5.8.0), on every table that carries the
+        # authentication pair. Nullable with no default on purpose: the
+        # ALTER is metadata-only, and a row with both NULL derives exactly
+        # the level it had before the columns existed — authNoPriv from an
+        # auth pair, noAuthNoPriv from none — so the upgrade changes no
+        # request any existing install sends. group_credentials had no
+        # _migrate entry before this; it needs one now for the same reason
+        # the other two do.
+        for table in ("devices", "groups", "group_credentials"):
+            self.ensure_columns(table, {"v3_priv_proto": "TEXT",
+                                        "v3_priv_pass_enc": "BLOB"})
         # Not in SCHEMA's own CREATE INDEX block: that script runs before this
         # method, so an index on a column added just above would fail on an
         # upgraded install the same way querying the column itself would.
@@ -1348,6 +1381,7 @@ class NodesDatabase(SqliteStore):
         allowed = {k: v for k, v in fields.items() if k in _GROUP_EDITABLE}
         if "community" in allowed:
             allowed["community"] = clean_community(allowed["community"])
+        _drop_priv_with_proto(allowed)
         if not allowed:
             return
         clauses = ", ".join(f"{key} = ?" for key in allowed)
@@ -1358,19 +1392,34 @@ class NodesDatabase(SqliteStore):
             self._conn.commit()
             self._config_generation += 1
 
+    # The privacy pair rides the same call as the auth pair, with one
+    # COALESCE semantics on purpose: a None protocol or None blob leaves
+    # what is stored. The edit form's privacy field says "stored — leave
+    # blank to keep", exactly like the auth password's, and an operator
+    # re-typing only the auth password must not lose the privacy one. To
+    # DROP privacy, set the protocol to none (update_group/update_device
+    # clear the blob with it — no protocol, no password) or clear the whole
+    # credential, which drops both blobs together.
+    _SET_CREDENTIAL_SQL = (
+        " SET v3_user=?, v3_auth_proto=?, v3_auth_pass_enc=?,"
+        " v3_priv_proto=COALESCE(?, v3_priv_proto),"
+        " v3_priv_pass_enc=COALESCE(?, v3_priv_pass_enc) WHERE id=?")
+
     def set_group_credential(self, group_id: int, user: str, auth_proto: str,
-                             password_enc: bytes) -> None:
+                             password_enc: bytes, priv_proto: str | None = None,
+                             priv_enc: bytes | None = None) -> None:
         with self._lock:
             self._conn.execute(
-                "UPDATE groups SET v3_user=?, v3_auth_proto=?, v3_auth_pass_enc=?"
-                " WHERE id=?", (user, auth_proto, password_enc, group_id))
+                "UPDATE groups" + self._SET_CREDENTIAL_SQL,
+                (user, auth_proto, password_enc, priv_proto, priv_enc, group_id))
             self._conn.commit()
             self._config_generation += 1
 
     def clear_group_credential(self, group_id: int) -> None:
         with self._lock:
             self._conn.execute(
-                "UPDATE groups SET v3_auth_pass_enc=NULL WHERE id=?", (group_id,))
+                "UPDATE groups SET v3_auth_pass_enc=NULL, v3_priv_pass_enc=NULL"
+                " WHERE id=?", (group_id,))
             self._conn.commit()
             self._config_generation += 1
 
@@ -1432,23 +1481,26 @@ class NodesDatabase(SqliteStore):
     def add_group_credential(self, group_id: int, *, label: str = "",
                              snmp_version: int = 1, community: str | None = None,
                              v3_user: str | None = None,
-                             v3_auth_proto: str | None = None) -> int:
+                             v3_auth_proto: str | None = None,
+                             v3_priv_proto: str | None = None) -> int:
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO group_credentials(group_id, label, snmp_version,"
-                " community, v3_user, v3_auth_proto, created_ts)"
-                " VALUES (?,?,?,?,?,?,?)",
+                " community, v3_user, v3_auth_proto, v3_priv_proto, created_ts)"
+                " VALUES (?,?,?,?,?,?,?,?)",
                 (group_id, label, snmp_version, clean_community(community),
-                 v3_user, v3_auth_proto, time.time()))
+                 v3_user, v3_auth_proto, v3_priv_proto or None, time.time()))
             self._conn.commit()
             self._config_generation += 1
             return cur.lastrowid
 
     def update_group_credential(self, credential_id: int, **fields) -> None:
         allowed = {k: v for k, v in fields.items() if k in
-                  ("label", "snmp_version", "community", "v3_user", "v3_auth_proto")}
+                  ("label", "snmp_version", "community", "v3_user", "v3_auth_proto",
+                   "v3_priv_proto")}
         if "community" in allowed:
             allowed["community"] = clean_community(allowed["community"])
+        _drop_priv_with_proto(allowed)
         if not allowed:
             return
         clauses = ", ".join(f"{key} = ?" for key in allowed)
@@ -1460,19 +1512,21 @@ class NodesDatabase(SqliteStore):
             self._config_generation += 1
 
     def set_group_credential_password(self, credential_id: int, user: str,
-                                      auth_proto: str, password_enc: bytes) -> None:
+                                      auth_proto: str, password_enc: bytes,
+                                      priv_proto: str | None = None,
+                                      priv_enc: bytes | None = None) -> None:
         with self._lock:
             self._conn.execute(
-                "UPDATE group_credentials SET v3_user=?, v3_auth_proto=?,"
-                " v3_auth_pass_enc=? WHERE id=?",
-                (user, auth_proto, password_enc, credential_id))
+                "UPDATE group_credentials" + self._SET_CREDENTIAL_SQL,
+                (user, auth_proto, password_enc, priv_proto, priv_enc, credential_id))
             self._conn.commit()
             self._config_generation += 1
 
     def clear_group_credential_password(self, credential_id: int) -> None:
         with self._lock:
             self._conn.execute(
-                "UPDATE group_credentials SET v3_auth_pass_enc=NULL WHERE id=?",
+                "UPDATE group_credentials SET v3_auth_pass_enc=NULL,"
+                " v3_priv_pass_enc=NULL WHERE id=?",
                 (credential_id,))
             self._conn.commit()
             self._config_generation += 1
@@ -1893,6 +1947,7 @@ class NodesDatabase(SqliteStore):
 
     def update_device(self, device_id: int, **fields) -> None:
         allowed = {k: v for k, v in fields.items() if k in _DEVICE_EDITABLE}
+        _drop_priv_with_proto(allowed)
         if "community" in allowed:
             allowed["community"] = clean_community(allowed["community"])
         if not allowed:
@@ -1983,18 +2038,20 @@ class NodesDatabase(SqliteStore):
         return removed
 
     def set_device_credential(self, device_id: int, user: str, auth_proto: str,
-                              password_enc: bytes) -> None:
+                              password_enc: bytes, priv_proto: str | None = None,
+                              priv_enc: bytes | None = None) -> None:
         with self._lock:
             self._conn.execute(
-                "UPDATE devices SET v3_user=?, v3_auth_proto=?, v3_auth_pass_enc=?"
-                " WHERE id=?", (user, auth_proto, password_enc, device_id))
+                "UPDATE devices" + self._SET_CREDENTIAL_SQL,
+                (user, auth_proto, password_enc, priv_proto, priv_enc, device_id))
             self._conn.commit()
             self._config_generation += 1
 
     def clear_device_credential(self, device_id: int) -> None:
         with self._lock:
             self._conn.execute(
-                "UPDATE devices SET v3_auth_pass_enc=NULL WHERE id=?", (device_id,))
+                "UPDATE devices SET v3_auth_pass_enc=NULL, v3_priv_pass_enc=NULL"
+                " WHERE id=?", (device_id,))
             self._conn.commit()
             self._config_generation += 1
 
@@ -2141,7 +2198,7 @@ class NodesDatabase(SqliteStore):
         return config
 
     _CREDENTIAL_KEYS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
-                       "v3_auth_pass_enc")
+                       "v3_auth_pass_enc", "v3_priv_proto", "v3_priv_pass_enc")
 
     def credential_candidates(self, device_row: sqlite3.Row) -> list[dict]:
         """The ordered list of SNMP credentials to try polling this device
@@ -2161,7 +2218,8 @@ class NodesDatabase(SqliteStore):
         group_row = self.group(device_row["group_id"]) if device_row["group_id"] else None
         if group_row is None:
             return [{"snmp_version": 1, "community": "public", "v3_user": None,
-                     "v3_auth_proto": None, "v3_auth_pass_enc": None}]
+                     "v3_auth_proto": None, "v3_auth_pass_enc": None,
+                     "v3_priv_proto": None, "v3_priv_pass_enc": None}]
         candidates = [{k: group_row[k] for k in keys}]
         candidates.extend({k: row[k] for k in keys}
                           for row in self.group_credentials(group_row["id"]))

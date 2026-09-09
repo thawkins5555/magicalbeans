@@ -23,6 +23,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from typing import NamedTuple
 
 from . import mibcatalog, nodeoids, nodesdb, vendorid
 from .alertrules import DARK_OPTIC_DBM, is_dark_optic
@@ -31,13 +32,14 @@ from .ipam_scan import ping_many
 from .nodediscover import DiscoveryJob
 from .nodeoids import DEFAULT_SNMP_PORT
 from .nodesdb import NodesDatabase, detected_vendor
+from . import snmpcrypt
 from .snmppoll import (
     ERROR_STATUS, PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_REPORT, Response,
-    SnmpAccessDenied, SnmpError, SnmpTimeout, SnmpUnsupported, build_request,
+    SnmpAccessDenied, SnmpAuthError, SnmpPrivError, SnmpError, SnmpTimeout, SnmpUnsupported, build_request,
     build_v3_request, decode_response, discovery_probe,
 )
 from .alertmail import duration_text
-from .trapdecode import format_ticks, localized_key
+from .trapdecode import format_ticks, localized_key, privacy_key
 from .worker import Worker, ago
 
 MAX_UDP = 65535
@@ -80,8 +82,11 @@ _VLAN_WALK_BUDGET_S = 20.0
 # was refused — three different problems with three different fixes.
 USM_STATS = {
     "1.3.6.1.6.3.15.1.1.1": ("unsupportedSecLevels",
-                             "the device refused this security level "
-                             "(authPriv is not supported by this poller)"),
+                             "the device refused this security level — its "
+                             "user is provisioned at a different one (an "
+                             "authPriv user needs a privacy password on this "
+                             "credential; an authNoPriv user must not be "
+                             "sent one)"),
     "1.3.6.1.6.3.15.1.1.2": ("notInTimeWindows",
                              "the device rejected the message's engine time"),
     "1.3.6.1.6.3.15.1.1.3": ("unknownUserNames",
@@ -91,7 +96,10 @@ USM_STATS = {
     "1.3.6.1.6.3.15.1.1.5": ("wrongDigests",
                              "the authentication password or protocol is wrong"),
     "1.3.6.1.6.3.15.1.1.6": ("decryptionErrors",
-                             "the device could not decrypt the message"),
+                             "the device could not decrypt the message — the "
+                             "privacy password or protocol is wrong (the "
+                             "authentication password is not the problem: "
+                             "the signature is checked first)"),
 }
 
 
@@ -292,8 +300,15 @@ class _Session:
             return False
         return packed == mine
 
-    def request(self, packet: bytes, expect_request_id: int | None = None) -> Response:
+    def request(self, packet: bytes, expect_request_id: int | None = None, *,
+                auth_proto: str | None = None, auth_key: bytes | None = None,
+                priv_proto: str | None = None, priv_key: bytes | None = None) -> Response:
         """Send, wait for OUR reply, decode it.
+
+        The keys are the ones `packet` was built with, handed to
+        decode_response so a signed reply's digest is verified and an
+        encrypted one decrypted; a reply that fails either is raised, not
+        dropped — see the except arm below.
 
         A UDP socket accepts whatever arrives, so taking the first datagram
         would let a late answer to attempt 1 be read as the answer to
@@ -332,8 +347,16 @@ class _Session:
                     self.dropped += 1
                     continue
                 try:
-                    response = decode_response(data)
-                except SnmpUnsupported:
+                    response = decode_response(
+                        data, auth_proto=auth_proto, auth_key=auth_key,
+                        priv_proto=priv_proto, priv_key=priv_key)
+                except (SnmpUnsupported, SnmpAuthError, SnmpPrivError):
+                    # Not garbage: a datagram from the right peer whose
+                    # signature does not verify, or that cannot be
+                    # decrypted, or that arrived below the level asked for.
+                    # Waiting on past it would report a wrong key as a
+                    # timeout, which is the misdiagnosis this exists to
+                    # prevent.
                     raise
                 except SnmpError as exc:
                     # Garbage from the right address is not an answer: keep
@@ -351,12 +374,56 @@ class _Session:
         raise last_error or SnmpTimeout(f"no reply from {self.ip}:{self.port}")
 
 
-def credential_for(config: dict) -> tuple[str | None, str | None, str | None]:
+class Credential(NamedTuple):
+    """What credential_for hands back: the identity, the authentication
+    pair and the privacy pair, decrypted just in time and never cached.
+    A NamedTuple rather than the bare 3-tuple it was so that `[0]` and
+    iteration keep working where only the identity is wanted, while the
+    old three-name unpack fails loudly rather than silently reading the
+    privacy protocol as a password."""
+    identity: str | None
+    auth_proto: str | None
+    auth_password: str | None
+    priv_proto: str | None = None
+    priv_password: str | None = None
+
+    @property
+    def security_level(self) -> str:
+        """The USM level a request built from this credential goes out at,
+        derived and not stored: an authentication pair makes it authNoPriv,
+        a privacy pair on top of that makes it authPriv, neither is
+        noAuthNoPriv. A privacy pair WITHOUT an authentication pair is not
+        a level USM has and is reported as noAuthNoPriv here — v3_exchange
+        refuses to send it rather than dropping the privacy silently."""
+        if self.auth_proto and self.auth_password:
+            if self.priv_proto and self.priv_password:
+                return "authPriv"
+            return "authNoPriv"
+        return "noAuthNoPriv"
+
+
+def _decrypt_secret(blob) -> str | None:
+    """One stored secret, decrypted immediately before use. Raises whatever
+    the store raises; the caller decides whether that is loud or silent."""
+    from . import dpapi
+    return dpapi.unprotect(bytes(blob)).decode("utf-8")
+
+
+def credential_for(config: dict) -> Credential:
     """Decrypt-just-in-time, the same shape as ipam_worker.credential_for_server:
-    returns (community_or_user, auth_proto, auth_password) with the DPAPI
-    blob decrypted immediately before use and never cached. `config` is
-    already the effective_config() merge of a device's own overrides over
-    its group's defaults.
+    returns a Credential — (community_or_user, auth_proto, auth_password,
+    priv_proto, priv_password) — with each stored blob decrypted
+    immediately before use and never cached. `config` is already the
+    effective_config() merge of a device's own overrides over its group's
+    defaults.
+
+    The two secrets are treated identically at rest and in flight, with
+    one deliberate asymmetry on failure. An authentication blob that will
+    not decrypt yields no password, as it always has. A PRIVACY blob that
+    will not decrypt raises: the alternative — carrying on at authNoPriv —
+    reintroduces from the inside the exact fault 5.7.2 was written to
+    explain, a request at the wrong level answered with
+    authorizationError(16) against a password that was never wrong.
 
     The identity is stripped, and a v1/v2c community carrying a comma is
     refused rather than transmitted. Both because an agent that dislikes
@@ -382,11 +449,24 @@ def credential_for(config: dict) -> tuple[str | None, str | None, str | None]:
     password = None
     if blob:
         try:
-            from . import dpapi
-            password = dpapi.unprotect(bytes(blob)).decode("utf-8")
+            password = _decrypt_secret(blob)
         except Exception:
             password = None
-    return identity, auth_proto, password
+    priv_proto = config.get("v3_priv_proto")
+    priv_blob = config.get("v3_priv_pass_enc")
+    priv_password = None
+    if priv_proto and priv_blob:
+        try:
+            priv_password = _decrypt_secret(priv_blob)
+        except Exception as exc:
+            password = None
+            raise SnmpError(
+                f"the stored SNMPv3 privacy password for {identity!r} could "
+                f"not be decrypted on this machine ({type(exc).__name__}) — "
+                f"refusing to poll at authNoPriv instead; re-enter the "
+                f"credential here, or see CREDENTIAL-SECURITY.md on moving a "
+                f"database between machines") from exc
+    return Credential(identity, auth_proto, password, priv_proto, priv_password)
 
 
 def discover_engine(session: _Session, ip: str) -> tuple[bytes, int, int]:
@@ -402,7 +482,8 @@ def v3_exchange(session: _Session, pdu_tag: int, oids: list[str], *,
                 identity: str | None, auth_proto: str | None,
                 password: str | None, engine: tuple | None = None,
                 max_repetitions: int = 0, ip: str = "",
-                learned=None) -> Response:
+                learned=None, priv_proto: str | None = None,
+                priv_password: str | None = None) -> Response:
     """One authenticated v3 round trip, with the engine resync RFC 3414
     §3.2 actually prescribes — the ONE copy of it.
 
@@ -414,14 +495,38 @@ def v3_exchange(session: _Session, pdu_tag: int, oids: list[str], *,
     so a caller with a cache can keep them), the request is retried once
     with them, and only a second Report is an error — named after the
     usmStats counter the agent pointed at, so a wrong password reads
-    differently from a wrong clock. A refused security level is raised as
-    SnmpUnsupported, which the poll path classifies as status 'unsupported'
-    rather than as an auth failure.
+    differently from a wrong clock, and a wrong PRIVACY password
+    (decryptionErrors) differently from either. A refused security level
+    is raised as SnmpUnsupported, which the poll path classifies as status
+    'unsupported' rather than as an auth failure.
 
     `engine` is (engine_id, boots, time) if the caller already knows it;
     None discovers first. A Report carrying no engine id (or discovery
     itself failing) leaves the caller's cache to be rebuilt on the next
-    call, exactly as before this was shared."""
+    call, exactly as before this was shared.
+
+    With `priv_proto`/`priv_password` the exchange is authPriv: the privacy
+    key is localised to the engine the request is built for (so a resync
+    that teaches a new engine id re-derives it), the ScopedPDU goes out
+    encrypted, and the reply must come back signed and encrypted or it is
+    refused. A privacy password with no authentication password is
+    refused up front — USM has no such level, and building authNoPriv
+    instead would be the silent downgrade that ends in
+    authorizationError(16). A reply whose signature does not verify, or
+    that cannot be decrypted, is an _AuthFailure: the credential is what
+    is wrong, and the engine cache is what the poller drops on one."""
+    encrypting = bool(priv_proto and priv_password)
+    if encrypting and not (auth_proto and password):
+        raise SnmpError(
+            f"{ip}: the credential for {identity!r} has a privacy password "
+            f"but no authentication password — USM has no privacy-without-"
+            f"authentication level, so the request was not sent")
+    if encrypting and not snmpcrypt.available():
+        raise SnmpUnsupported(
+            f"{ip}: authPriv needs the 'cryptography' package with a working "
+            f"AES backend on this machine ({snmpcrypt.unavailable_reason()}); "
+            f"install it and restart the worker, or poll this user at "
+            f"authNoPriv")
     last: Response | None = None
     for attempt in (0, 1):
         if engine is None:
@@ -431,13 +536,24 @@ def v3_exchange(session: _Session, pdu_tag: int, oids: list[str], *,
         engine_id, boots, engine_time = engine
         auth_key = localized_key(auth_proto, password, engine_id) \
             if auth_proto and password else None
+        priv_key = privacy_key(auth_proto, priv_password, engine_id) \
+            if encrypting else None
         request_id = session.next_request_id()
         packet = build_v3_request(
             session.next_request_id(), request_id, pdu_tag, oids,
             engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
             user=identity or "", auth_proto=auth_proto, auth_key=auth_key,
-            max_repetitions=max_repetitions)
-        response = session.request(packet, request_id)
+            max_repetitions=max_repetitions,
+            priv_proto=priv_proto if encrypting else None, priv_key=priv_key)
+        try:
+            response = session.request(
+                packet, request_id, auth_proto=auth_proto, auth_key=auth_key,
+                priv_proto=priv_proto if encrypting else None, priv_key=priv_key)
+        except SnmpAuthError as exc:
+            raise _AuthFailure(f"{ip}: SNMPv3 reply rejected — {exc}") from exc
+        except SnmpPrivError as exc:
+            raise _AuthFailure(f"{ip}: SNMPv3 reply rejected — {exc}",
+                               usm_name="decryptionErrors") from exc
         if response.pdu_tag != PDU_REPORT:
             return response
         last = response
@@ -641,7 +757,11 @@ def _credential_label(config: dict) -> str:
     version = int(config.get("snmp_version", 1))
     if version == 3:
         user = config.get("v3_user")
-        return f"SNMPv3 user {user!r}" if user else "SNMPv3 (no user set)"
+        # The level is named because "I could not see what level I was
+        # sending at" is what an authorizationError comes down to.
+        level = security_level(config)
+        return (f"SNMPv3 user {user!r} at {level}" if user
+                else f"SNMPv3 (no user set) at {level}")
     name = {0: "v1", 1: "v2c"}.get(version, f"v{version}")
     return (f"the SNMP{name} community" if config.get("community")
             else f"SNMP{name} with no community set")
@@ -663,15 +783,21 @@ def _error_status_reason(response: Response, base_oid: str) -> str:
 
 def security_level(config: dict) -> str:
     """The USM security level a request built from `config` goes out at:
-    'authNoPriv' when credential_for will sign it, 'noAuthNoPriv' when it
-    will not, '' for v1/v2c, which have no such thing. Mirrors
-    credential_for's own rule — a protocol AND a stored password — rather
-    than decrypting the password a second time to find out; and there is no
-    'authPriv' answer because this poller cannot build one (see
-    SnmpUnsupported)."""
+    'authPriv' when credential_for will sign AND encrypt it, 'authNoPriv'
+    when it will only sign, 'noAuthNoPriv' when it will do neither, '' for
+    v1/v2c, which have no such thing. Mirrors Credential.security_level's
+    rule — a protocol AND a stored password, for each pair — rather than
+    decrypting the passwords a second time to find out.
+
+    Derived, never stored. A level column would be a fourth state that can
+    contradict the four fields it summarises; the implicit rule is what
+    makes the 5.8.0 upgrade a provable no-op — two NULL columns cannot
+    change the answer for any existing row."""
     if int(config.get("snmp_version", 1)) != 3:
         return ""
     if config.get("v3_auth_proto") and config.get("v3_auth_pass_enc"):
+        if config.get("v3_priv_proto") and config.get("v3_priv_pass_enc"):
+            return "authPriv"
         return "authNoPriv"
     return "noAuthNoPriv"
 
@@ -723,11 +849,12 @@ def access_denied_advice(config: dict, level: str) -> str:
     context, security model, security LEVEL) — so an entry created for a
     user at authPriv matches nothing that arrives at authNoPriv, and the
     agent answers an ordinary Response-PDU with error-status 16. PAN-OS
-    provisions its v3 user as authPriv. This poller sends authNoPriv. The
-    result was 'Authorization Error' against a username and password that
-    were never wrong, and an operator who spent days re-checking them —
-    which is why the authenticated case says, in so many words, that the
-    password is not the problem.
+    provisions its v3 user as authPriv. Until 5.8.0 this poller could only
+    send authNoPriv. The result was 'Authorization Error' against a
+    username and password that were never wrong, and an operator who spent
+    days re-checking them — which is why the authenticated case says, in
+    so many words, that the password is not the problem, and now says what
+    the fix is: the privacy password field this credential has since 5.8.0.
 
     `level` is the security level the request actually went out at ('' for
     v1/v2c); it is a parameter, not read from `config`, because the Test
@@ -742,12 +869,10 @@ def access_denied_advice(config: dict, level: str) -> str:
             f"user is configured on the device with a privacy password as "
             f"well (authPriv — the way PAN-OS creates its SNMPv3 user), an "
             f"authNoPriv request matches no access entry at all and is "
-            f"refused exactly like this (RFC 3415). Either grant the user a "
-            f"view at authNoPriv on the device, or use a privacy password — "
-            f"which this poller cannot yet send (authPriv is not "
-            f"implemented, so there is no privacy password to set on this "
-            f"credential until it is); until then the authNoPriv view is "
-            f"the fix.")
+            f"refused exactly like this (RFC 3415). Either set the user's "
+            f"privacy protocol (AES) and privacy password on this credential "
+            f"so the request goes out at authPriv, or grant the user a view "
+            f"at authNoPriv on the device.")
     if level == "noAuthNoPriv":
         return (
             f"The request was unsigned (noAuthNoPriv) and the device "
@@ -759,8 +884,11 @@ def access_denied_advice(config: dict, level: str) -> str:
             f"and password on this credential so the request goes out at "
             f"authNoPriv.")
     if level == "authPriv":
-        return (f"The message authenticated and decrypted; the view for "
-                f"{who} does not include that object.")
+        return (f"The message authenticated and decrypted (authPriv, the "
+                f"highest level there is), so this is an access-control "
+                f"(VACM) refusal and neither password is the problem: the "
+                f"view for {who} does not include that object. Grant it on "
+                f"the device.")
     return (f"The device accepted {who} and refused the object under its "
             f"access control: the community's view does not include it.")
 
@@ -3137,15 +3265,15 @@ class NodePoller(Worker):
         return config
 
     def _snmp_get(self, device, config: dict, oids: list[str]) -> Response:
-        """One GET round trip against a device, handling v1/v2c/v3
-        (noAuthNoPriv/authNoPriv only) transparently."""
+        """One GET round trip against a device, handling v1/v2c/v3 (at
+        whichever USM level the credential implies) transparently."""
         version = int(config.get("snmp_version", 1))
         timeout_s = float(config.get("snmp_timeout_s", 3.0))
         retries = int(config.get("snmp_retries", 2))
         session = _Session(device["ip"], DEFAULT_SNMP_PORT, timeout_s, retries)
         try:
             if version in (0, 1):
-                identity, _proto, _pw = credential_for(config)
+                identity = credential_for(config).identity
                 request_id = session.next_request_id()
                 packet = build_request(version, identity or "public", PDU_GET,
                                        request_id, oids)
@@ -3171,7 +3299,7 @@ class NodePoller(Worker):
         here is feeding it the cached engine parameters, keeping the ones
         a Report teaches, and dropping the entry when even the retry was
         refused, so the next poll rediscovers from nothing."""
-        identity, auth_proto, password = credential_for(config)
+        credential = credential_for(config)
         device_id = device["id"]
 
         def learned(engine_id: bytes, boots: int, engine_time: int) -> None:
@@ -3179,12 +3307,17 @@ class NodePoller(Worker):
 
         try:
             return v3_exchange(
-                session, pdu_tag, oids, identity=identity, auth_proto=auth_proto,
-                password=password, engine=self._engines.current(device_id),
-                max_repetitions=max_repetitions, ip=device["ip"], learned=learned)
+                session, pdu_tag, oids, identity=credential.identity,
+                auth_proto=credential.auth_proto, password=credential.auth_password,
+                engine=self._engines.current(device_id),
+                max_repetitions=max_repetitions, ip=device["ip"], learned=learned,
+                priv_proto=credential.priv_proto,
+                priv_password=credential.priv_password)
         except _AuthFailure:
             self._engines.invalidate(device_id)
             raise
+        finally:
+            credential = None
 
     def _check_error_status(self, response: Response, config: dict,
                             oids: list[str]) -> None:
@@ -7029,7 +7162,7 @@ class NodePoller(Worker):
         session = _Session(device["ip"], DEFAULT_SNMP_PORT, timeout_s, retries)
         try:
             if version in (0, 1):
-                identity, _proto, _pw = credential_for(config)
+                identity = credential_for(config).identity
                 request_id = session.next_request_id()
                 packet = build_request(version, identity or "public", PDU_GETNEXT,
                                        request_id, [oid])
@@ -7057,7 +7190,7 @@ class NodePoller(Worker):
         for a non-GETBULK `pdu_tag`, so a v1 caller can pass it unused."""
         version = int(config.get("snmp_version", 1))
         if version in (0, 1):
-            identity, _proto, _pw = credential_for(config)
+            identity = credential_for(config).identity
             request_id = session.next_request_id()
             packet = build_request(version, identity or "public", pdu_tag,
                                    request_id, [oid],

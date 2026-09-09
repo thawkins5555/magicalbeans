@@ -3,8 +3,13 @@ its managed APs over SNMP.
 
 Reuses the Nodes poller's SNMP plumbing: `nodepoll._Session`,
 `nodepoll.EngineCache` (keyed here by controller id), `credential_for()`
-and `snmppoll`'s wire-format functions. Same v1/v2c/v3
-noAuthNoPriv/authNoPriv-only limitation as Nodes.
+and `snmppoll`'s wire-format functions. v1/v2c/v3 at noAuthNoPriv or
+authNoPriv: Nodes gained authPriv in 5.8.0 and this poller did not — the
+controller form has no privacy field, and the API refuses a privacy
+password for a controller in words rather than dropping it — because no
+FortiGate deployment has asked for it and a half-wired level is worse
+than an absent one. A signed reply's digest IS verified here since 5.8.0,
+the same way Nodes verifies it.
 
 Table walking here is repeated GETNEXT, not GETBULK: a handful of
 controllers is not an estate of switches, so the request-count problem
@@ -341,14 +346,16 @@ class WirelessPoller(Worker):
         session = _Session(controller["ip"], SNMP_PORT, 3.0, 2)
         try:
             if version in (0, 1):
-                identity, _proto, _pw = credential_for(config)
+                identity = credential_for(config).identity
                 request_id = random.randint(1, 2**16)
                 packet = build_request(version, identity or "public", PDU_GETNEXT,
                                        request_id, [oid])
                 # The id filter is what makes a late reply to the previous
                 # GETNEXT a dropped datagram rather than this one's answer.
                 return session.request(packet, expect_request_id=request_id)
-            identity, auth_proto, password = credential_for(config)
+            credential = credential_for(config)
+            identity, auth_proto, password = (
+                credential.identity, credential.auth_proto, credential.auth_password)
             engine = self._engines.get(controller["id"])
             if engine is None:
                 probe = discovery_probe()
@@ -366,7 +373,8 @@ class WirelessPoller(Worker):
                 random.randint(1, 2**16), request_id, PDU_GETNEXT, [oid],
                 engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
                 user=identity or "", auth_proto=auth_proto, auth_key=auth_key)
-            response = session.request(packet, expect_request_id=request_id)
+            response = session.request(packet, expect_request_id=request_id,
+                                       auth_proto=auth_proto, auth_key=auth_key)
             if response.pdu_tag == PDU_REPORT:
                 self._engines.invalidate(controller["id"])
                 raise _AuthFailure(f"{controller['ip']}: engine resync required")
