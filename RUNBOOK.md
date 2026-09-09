@@ -371,11 +371,14 @@ concurrency: 48 against a pool of 16 means 16 polls in flight and 32 waiting.
 
 **Checks, in order.**
 
-1. **Are devices down?** A device that is not answering costs far more worker
-   time than one that is — three ping timeouts plus three SNMP timeouts per
-   poll. A site outage saturates a pool that was comfortable five minutes
-   earlier, and the saturation is a symptom of the outage rather than a
-   separate problem.
+1. **Are devices down?** A device that is not answering still costs far more
+   worker time than one that is — three ping timeouts, plus three SNMP
+   timeouts on the cycles that attempt SNMP at all. A site outage saturates a
+   pool that was comfortable five minutes earlier, and the saturation is a
+   symptom of the outage rather than a separate problem. From 5.5.0 a device
+   already formally down attempts SNMP on one cycle in three, so an outage
+   costs roughly a third of what it used to; it is still pinged every cycle,
+   which is what keeps recovery detection unchanged.
 2. **Is one device eating a worker?** A device with hundreds of interfaces
    that stops answering part-way through its interface walk used to hold a
    worker for over an hour; from 4.39.0 there is a wall-clock deadline of half
