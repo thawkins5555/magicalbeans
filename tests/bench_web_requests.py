@@ -116,12 +116,18 @@ FIRST_PAINT = ["/"] + [
 def nodes_tick(device_id, can_write=True):
     """Exactly what nodes.js fires per refresh tick.
 
-    `refresh()` (nodes.js ~5641) awaits five calls in one Promise.all —
-    devices, groups, device-groups, mibs and loadDiscJobsIfNeeded() — and
-    then `loadDetail()` (nodes.js ~676), which posts the fast-poll focus
-    renewal and awaits five more, then awaits loadStatusTimeline() for a
-    twelfth. loadWebRelays() is not here: it runs on selection change, not
-    on every tick, which loadDetail says in as many words.
+    `refresh()` (nodes.js) awaits five calls in one Promise.all — devices,
+    groups, device-groups, mibs and loadDiscJobsIfNeeded() — and then
+    `loadDetail()`, which posts the fast-poll focus renewal, fetches the
+    device row, fetches ONE sub-pane (whichever nested subtab is on screen,
+    per DETAIL_SUBS) and awaits loadStatusTimeline(). Nine, not the twelve
+    it was before the detail panes stopped all being fetched while four of
+    the five were hidden; Addresses draws off the device row and so makes
+    eight. loadWebRelays() is not here: it runs on selection change, not on
+    every tick, which loadDetail says in as many words.
+
+    Interfaces is the sub-pane modelled below because it is the one the tab
+    opens on.
     """
     now = time.time()
     base = "/api/nodes/devices/%d" % device_id
@@ -136,10 +142,7 @@ def nodes_tick(device_id, can_write=True):
         calls.append(("POST", base + "/focus", {}))
     calls.extend([
         ("GET", base, None),
-        ("GET", base + "/metrics", None),
         ("GET", base + "/interfaces", None),
-        ("GET", base + "/events", None),
-        ("GET", base + "/neighbors", None),
         ("GET", base + "/timeline?t0=%d&t1=%d" % (now - 86400, now), None),
     ])
     return calls

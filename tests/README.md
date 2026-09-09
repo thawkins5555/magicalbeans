@@ -80,8 +80,9 @@ would be timing the fixture builder with the thing being measured. It prints
 p50/p95/max, response bytes and gzipped bytes per route, then the three
 composites an operator would recognise: first paint (index.html plus the five
 files it names, `boot.js` included, each asked for as `?v=` the way the markup
-spells it), one Nodes tab refresh tick (the twelve requests `nodes.js`'s
-`refresh()` and `loadDetail()` actually fire), and what `--tabs` browsers all
+spells it), one Nodes tab refresh tick (the nine requests `nodes.js`'s
+`refresh()` and `loadDetail()` actually fire, now that only the sub-pane on
+screen is fetched), and what `--tabs` browsers all
 polling `/api/state` every two seconds cost the server per wall second.
 
 Its `sql` and `lock ms` columns read whatever per-store lock and per-route
