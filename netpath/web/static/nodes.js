@@ -4323,7 +4323,11 @@
       /* The phases, the walk and the dropped count are what make a failing
          poll self-explaining: a scalar GET alone reports ok against a
          table walk that times out, an agent that refuses the ifTable, and
-         a community the agent drops without a word. */
+         a community the agent drops without a word. The SNMPv3 fields
+         after them — engine, security level, auth, the refused OID — are
+         what separates "the password is wrong" from "the password is
+         right and the device's view refuses this user at this level",
+         which one string called "Authorization Error" for both. */
       const parts = [
         `ping: ${r.ping.ok === null ? 'n/a' : r.ping.ok ? `ok (${(r.ping.rtt_ms || 0).toFixed(0)} ms)` : 'no reply'}`,
         `snmp: ${r.snmp.ok ? `ok (${r.snmp.sys_descr || ''})` : (r.snmp.error || 'n/a')}`,
@@ -4332,7 +4336,33 @@
         parts.push(`${p.name}: ${(p.ms || 0).toFixed(0)} ms${p.detail ? ` — ${p.detail}` : ''}`);
       });
       if (r.snmp.dropped) parts.push(`${r.snmp.dropped} datagram(s) rejected`);
-      result.textContent = parts.join('  ·  ');
+      const engine = r.snmp.engine;
+      if (engine) {
+        parts.push(engine.ok
+          ? `engine: ${engine.id || '?'} boots ${engine.boots} time ${engine.time}` +
+            (engine.resynced ? ' (resynced from a Report)' : '')
+          : 'engine: discovery failed');
+      }
+      if (r.snmp.security_level) parts.push(`level: ${r.snmp.security_level}`);
+      const auth = r.snmp.auth;
+      if (auth) {
+        parts.push(`auth: ${auth.ok === null ? 'not proven' : auth.ok ? 'ok' : 'FAILED'}` +
+          (auth.detail ? ` — ${auth.detail}` : ''));
+      }
+      if (r.snmp.report && r.snmp.report.name) {
+        parts.push(`report: usmStats${r.snmp.report.name} (${r.snmp.report.oid || '?'})`);
+      }
+      if (r.snmp.refused_oid) parts.push(`refused: ${r.snmp.refused_oid}`);
+      /* innerHTML, not textContent, so the hint can sit on a line of its
+         own under the one-line summary. Every value above came from the
+         device — its own OIDs, its own sysDescr, its own engine id — and a
+         device is not trusted input, so each part goes through escape()
+         (App.escapeHtml: & < > " ' `) as one string, and the only markup
+         that reaches the property is the <br> written here. A part built
+         with a template literal and THEN escaped cannot smuggle anything,
+         because escaping is the last thing that happens to it. */
+      result.innerHTML = parts.map((part) => escape(part)).join('  ·  ') +
+        (r.snmp.hint ? `<br>${escape(r.snmp.hint)}` : '');
     } catch (error) {
       result.textContent = `Error: ${error.message}`;
     }

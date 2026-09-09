@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.7.2 — The password that was never wrong](#572--the-password-that-was-never-wrong)
 - [5.7.1 — The temp folder that wasn't there](#571--the-temp-folder-that-wasnt-there)
 - [5.7.0 — Five reports](#570--five-reports)
 - [5.6.0 — Closing the window closes the application](#560--closing-the-window-closes-the-application)
@@ -132,6 +133,126 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.7.2 — The password that was never wrong
+
+An operator could not poll a Palo Alto firewall over SNMPv3. The device's
+Test button and its status both said
+
+> Authorization Error
+
+against a username and auth password they had confirmed, and a view they
+had configured correctly. They spent days re-checking credentials that were
+never wrong. This release does not add the thing the firewall wants — see
+the last note — but it makes the failure say what it is, which is worth
+having whether or not it ever does.
+
+**Two failures that look alike.** An SNMPv3 request can be refused in two
+different places, and from outside the two look the same. The first is
+USM, the security model: it checks the signature on the message, and a
+message it will not accept — a wrong password, an unknown user, a clock
+outside the time window — is answered with a Report-PDU naming a
+`usmStats` counter. That is the authentication failure, and "check the
+username and auth password" is the right advice for it. The second is
+VACM, the access control model, which only ever sees a message USM has
+already accepted. RFC 3415's `vacmAccessTable` is keyed on the group, the
+context, the security model *and the security level*, so an access entry
+created for a user at `authPriv` matches nothing that arrives at
+`authNoPriv`. PAN-OS provisions its SNMPv3 user as `authPriv`; this poller
+sends `authNoPriv`; the firewall verified the signature, found no access
+entry, and answered an ordinary Response-PDU with `error-status 16`,
+`authorizationError`. The poller turned that into the four words above,
+ignored the `error-index` that names the refused object, and raised it as
+an authentication failure — for a credential the device had just verified,
+which is the one thing it provably was not.
+
+**What the message says now.** `nodepoll.access_denied_reason` composes it,
+and the poll and the Test button both use it, so they can no longer
+disagree. It names the object from `error-index` — 1-based into the
+request's varbind list per RFC 3416 §4.2.1, read off the response's own
+varbinds first and the request's as the fallback; an index of 0, or one
+past the end, is reported as the agent naming nothing rather than guessed
+at — in the shape the walk's own error already has: *"the device answered
+authorizationError(16) for 1.3.6.1.2.1.1.1.0 — its SNMP agent refuses that
+object"*. Then, for a request that went out at `authNoPriv`, the sentence
+that would have saved the days: the message authenticated, this is an
+access-control refusal and not a bad password, and if the device's user is
+configured with a privacy password as well then an `authNoPriv` request
+matches no access entry at all and is refused exactly like this — grant the
+user a view at `authNoPriv`, or use a privacy password, which this poller
+cannot yet send. A v1/v2c refusal says the community's view does not
+include the object; a v3 request already at `authPriv` is told the user's
+view does not include it and nothing more, since there is no level left to
+blame. No message prints a community, a password or a key.
+
+**Filed under its own name.** `SnmpAccessDenied` is new in `snmppoll.py`,
+an `SnmpError` and deliberately not the poller's `_AuthFailure`: the
+credential loop rotates on `SnmpError`, and rotating is right here — a
+profile may hold an `authPriv` alternate after the `authNoPriv` one that
+genuinely will succeed. The poll counts it as `denied`, records an
+`access_denied` device event when it starts and `access_ok` when SNMP works
+again, and a new built-in rule, **SNMP access refused by the device**,
+raises on the first and is cleared by the second, the way `auth_fail` and
+`auth_ok` already pair. The device's status is not changed by it: the
+device is demonstrably reachable — its agent verified the message and
+answered — so status follows reachability exactly as it does for an
+authentication failure, rather than borrowing `unsupported` (a verdict
+about the poller, not the device) or adding a value to a vocabulary spread
+across the devices table, the timeline, the dashboard, the map and the
+availability report for the sake of a diagnostic.
+
+**A live defect on its own.** Whether a failing poll was an *authentication*
+failure was decided by the substring `"auth"` in its error message. The
+`unsupportedSecLevels` explanation contains "authPriv"; every message above
+contains "authenticated"; so the alert named *SNMP authentication failing*
+was being raised for the faults that proved the password correct. It is
+decided by exception type now — `_AuthFailure` and nothing else — the way
+`unsupported` already was.
+
+**The Test button.** Four faults. It reported every Report-PDU as "engine
+resync required — check the SNMPv3 username and auth password" whatever
+the agent had named, although the code that decodes the `usmStats` counter
+into words existed and was never consulted. It repeated the bare
+"authorization error". A timeout during engine discovery came back as a
+plain timeout with no hint that discovery was the phase that failed. And it
+did not perform the resync the poller does on a first Report, so a device
+with a skewed clock failed the Test while the poll shrugged it off. The
+resync loop is one module-level function now, `nodepoll.v3_exchange`, and
+both call it — the duplication was precisely why the two diverged. The
+Test's SNMP result carries `security_level`; an `engine` block (id, boots,
+time, and whether a Report re-taught them); `auth` — `ok` true once any
+non-Report reply answers a signed request, false for `wrongDigests` and
+`unknownUserNames`, and null for `notInTimeWindows`, which the poll resyncs
+and retries through and which is normally transient, so a Test must not
+call it a failure when the poll recovers from it silently; a `report` block
+naming the counter, its OID and the explanation; `error_status` and its
+name; `refused_oid`; `hint`; and `phases` with engine discovery as a phase
+of its own. The dialog shows each of them, with the hint on a line of its
+own — rendered with `innerHTML` so it can break the line, every value
+passed through the page's own `escape()`, because those values are a
+device's own OIDs and a device is not trusted input.
+
+**Reproducible, at last.** `tests/stubs/stub_agent_iftable.py`'s `v3` mode
+hardcoded `error-status 0`, so the fault in this report could not be
+simulated at all — which is why it shipped. It can now verify a digest
+(`--auth-pass`, answering `wrongDigests` to a wrong password and
+`unsupportedSecLevels` to an unsigned request) and, with `--require-priv`,
+accept the request and refuse the object with `error-status 16,
+error-index 1`, exactly as the firewall does. Every flag is off by default,
+so every existing suite sees the agent it always did.
+`tests/test_snmpv3_diagnostics.py` is the first SNMPv3 suite: the
+operator's case end to end, the event being `access_denied` and not
+`auth_fail`, a wrong password still being `auth_fail`, `error-index` 0 and
+out of range, the Test payload's fields and its wording matching the poll's
+word for word, and that no message ever contains the community or the
+password.
+
+**Not in this release.** `authPriv` itself. The poller still speaks
+`noAuthNoPriv` and `authNoPriv` only — there is no AES or DES in the
+standard library and this application takes no third-party dependency — so
+a PAN-OS user provisioned at `authPriv` will still be refused. The
+difference is that the refusal now says so, names the object, and points at
+the view and the level rather than at the password.
 
 ### 5.7.1 — The temp folder that wasn't there
 

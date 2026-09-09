@@ -356,6 +356,7 @@ def evaluate_threshold(rule, current_value: float | None, streak: int,
 CLEARS = {
     ("device_event", "up"): "device_down",
     ("device_event", "auth_ok"): "device_auth_fail",
+    ("device_event", "access_ok"): "device_access_denied",
     # mib_present is recorded when a device's vendor-MIB coverage flips
     # from missing to present (a MIB got uploaded), pairing with
     # mib_missing exactly the way up pairs with down.

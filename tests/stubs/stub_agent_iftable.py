@@ -68,6 +68,21 @@ Modes:
                    and a slow runner (Windows in CI) reached the deadline
                    while the FIRST poll was still in flight, restarting the
                    engine under the poll the test expected to succeed.
+                   --auth-pass PASSWORD (with --auth-proto NAME, default
+                   SHA) makes the stub a real authNoPriv agent: a signed
+                   request is verified with the localized key, a wrong
+                   digest is answered with a Report naming
+                   usmStatsWrongDigests, and an unsigned one with
+                   usmStatsUnsupportedSecLevels — what an agent says to a
+                   wrong password, and to no password. --require-priv is
+                   the PAN-OS symptom this stub could not reproduce before
+                   it: the request is ACCEPTED (its signature verified, if
+                   there is one) and then answered with an ordinary
+                   Response-PDU carrying error-status 16
+                   (authorizationError) and error-index 1, because the
+                   user's only access entry is at authPriv and an
+                   authNoPriv request matches no entry at all (RFC 3415).
+                   Every one of these is off by default.
 
 Options: --host ADDRESS (bind elsewhere than 127.0.0.1 — "::1" opens an
 AF_INET6 socket), --interfaces N, --reboot-after N, --dark-after N, --window SECONDS,
@@ -75,8 +90,9 @@ AF_INET6 socket), --interfaces N, --reboot-after N, --dark-after N, --window SEC
 --reply-delay SECONDS, --bulk-cap N, --gen-err OID, --no-such-name OID,
 --refuse-bulk, --dark-after-rows N (answer N ifIndex rows and then stop
 answering walk requests at all, the mid-table timeout with rows already in
-hand), and --stale-id N (prepend a wrong-request-id copy to the
-first N replies — the datagram _Session.dropped counts). Answering from
+hand), --stale-id N (prepend a wrong-request-id copy to the
+first N replies — the datagram _Session.dropped counts), and the v3
+--auth-pass/--auth-proto/--require-priv described above. Answering from
 the wrong SOURCE PORT deliberately has no flag: _Session._is_peer compares
 the host only, because agents that reply from an ephemeral port are common
 and not forgery, so a wrong port is not a dropped datagram here.
@@ -84,6 +100,7 @@ and not forgery, so a wrong port is not a dropped datagram here.
 Prints one "listening" line after bind(), the banner tests/_paths.py's
 spawn_stub waits for.
 """
+import hmac
 import json
 import os
 import socket
@@ -94,19 +111,24 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))  # the repo root, from tests/stubs/
 
 from netpath import nodeoids
-from netpath.snmppoll import decode_response
+from netpath.snmppoll import FLAG_AUTH, FLAG_PRIV, decode_response, find_auth_span
 from netpath.trapdecode import (
-    PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_REPORT, PDU_RESPONSE, T_COUNTER32,
-    T_COUNTER64, T_END_OF_MIB_VIEW, T_GAUGE32, T_NO_SUCH_OBJECT, T_NULL,
-    T_INTEGER, T_OCTET_STRING, T_SEQUENCE, T_TIMETICKS, V3, Reader, _signed,
-    _tlv, enc_int, enc_octets, enc_unsigned, enc_varbind,
+    AUTH_PROTOCOLS, PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_REPORT, PDU_RESPONSE,
+    T_COUNTER32, T_COUNTER64, T_END_OF_MIB_VIEW, T_GAUGE32, T_NO_SUCH_OBJECT,
+    T_NULL, T_INTEGER, T_OCTET_STRING, T_SEQUENCE, T_TIMETICKS, V3, Reader,
+    _signed, _tlv, enc_int, enc_octets, enc_unsigned, enc_varbind, localized_key,
 )
 
 COMMUNITY = "public"
 UPTIME_TICKS = 987_654
 ENGINE_ID = b"\x80\x00\x1f\x88\x80stub-engine"
+USM_UNSUPPORTED_SEC_LEVELS = "1.3.6.1.6.3.15.1.1.1.0"
 USM_NOT_IN_TIME_WINDOWS = "1.3.6.1.6.3.15.1.1.2.0"
 USM_UNKNOWN_ENGINE_IDS = "1.3.6.1.6.3.15.1.1.4.0"
+USM_WRONG_DIGESTS = "1.3.6.1.6.3.15.1.1.5.0"
+# RFC 3416's authorizationError: the agent accepted the message and
+# refused the object under its own access control.
+AUTHORIZATION_ERROR = 16
 
 
 class Agent:
@@ -117,9 +139,13 @@ class Agent:
                  reply_delay: float = 0.0, bulk_cap: int = 0,
                  gen_err: tuple = (), no_such_name: tuple = (),
                  refuse_bulk: bool = False, stale_id: int = 0,
-                 dark_after_rows: int = 0):
+                 dark_after_rows: int = 0, require_priv: bool = False,
+                 auth_pass: str = "", auth_proto: str = "SHA"):
         self.mode = mode
         self.n_interfaces = interfaces
+        self.require_priv = require_priv
+        self.auth_pass = auth_pass
+        self.auth_proto = auth_proto
         self.reply_delay = reply_delay
         self.bulk_cap = bulk_cap
         self.gen_err = tuple(gen_err)
@@ -153,14 +179,20 @@ class Agent:
         self.engine_epoch = time.monotonic()
         self.counts = {"requests": 0, "reports": 0, "discoveries": 0,
                        "responses": 0, "get": 0, "getnext": 0, "getbulk": 0,
-                       "bulk_refused": 0, "stale": 0}
+                       "bulk_refused": 0, "stale": 0,
+                       # v3 refusals, by kind: a wrong digest, and a
+                       # request accepted and then denied the object.
+                       "wrong_digests": 0, "denied": 0}
 
     # ------------------------------------------------------------- SNMPv3
 
     @staticmethod
-    def _msg_id(data: bytes) -> int:
-        """The request's msgID, echoed back the way a real agent does.
-        decode_response does not surface it, so it is read here."""
+    def _msg_header(data: bytes) -> tuple[int, int]:
+        """The request's (msgID, msgFlags). The id is echoed back the way
+        a real agent does; the flags say whether the request was signed
+        and whether it asked for privacy, which is what --auth-pass and
+        --require-priv decide on. decode_response surfaces neither, so
+        they are read here."""
         top = Reader(data)
         body_s, body_e = top.expect(T_SEQUENCE)
         msg = Reader(data, body_s, body_e)
@@ -168,7 +200,22 @@ class Agent:
         hs, he = msg.expect(T_SEQUENCE)            # msgGlobalData
         header = Reader(data, hs, he)
         s, e = header.expect(T_INTEGER)
-        return _signed(data, s, e)
+        msg_id = _signed(data, s, e)
+        header.expect(T_INTEGER)                   # msgMaxSize
+        fs, fe = header.expect(T_OCTET_STRING)      # msgFlags
+        return msg_id, (data[fs] if fe > fs else 0)
+
+    def _digest_ok(self, data: bytes) -> bool:
+        """Whether a signed request's digest is the one --auth-pass makes:
+        RFC 3414 §6.3.2 in reverse of build_v3_request — the auth field
+        blanked, the whole message HMACed with the key localized to THIS
+        engine, the leading digest-length bytes compared."""
+        ctor, length = AUTH_PROTOCOLS[self.auth_proto]
+        key = localized_key(self.auth_proto, self.auth_pass, ENGINE_ID)
+        start, end = find_auth_span(data)
+        blank = data[:start] + bytes(end - start) + data[end:]
+        expected = hmac.new(key, blank, ctor).digest()[:length]
+        return hmac.compare_digest(expected, data[start:end])
 
     def engine_time(self) -> int:
         return int(time.monotonic() - self.engine_epoch)
@@ -191,16 +238,21 @@ class Agent:
         return _tlv(T_SEQUENCE, enc_int(V3) + header + sec + scoped)
 
     @staticmethod
-    def _pdu(tag: int, request_id: int, varbinds: bytes) -> bytes:
-        return _tlv(tag, enc_int(request_id) + enc_int(0) + enc_int(0) +
-                    _tlv(T_SEQUENCE, varbinds))
+    def _pdu(tag: int, request_id: int, varbinds: bytes,
+             error_status: int = 0, error_index: int = 0) -> bytes:
+        """error-status/error-index were hardcoded to 0 here, which is why
+        a v3 agent that accepts the message and refuses the object could
+        not be simulated, and why that fault shipped."""
+        return _tlv(tag, enc_int(request_id) + enc_int(error_status) +
+                    enc_int(error_index) + _tlv(T_SEQUENCE, varbinds))
 
     def _report(self, msg_id: int, request_id: int, oid: str) -> bytes:
         self.counts["reports"] += 1
         body = enc_varbind(oid, enc_unsigned(T_COUNTER32, self.counts["reports"]))
         return self._v3_message(msg_id, self._pdu(PDU_REPORT, request_id, body))
 
-    def _v3_handle(self, req, msg_id: int) -> list:
+    def _v3_handle(self, req, msg_id: int, flags: int = 0,
+                   data: bytes = b"") -> list:
         self.counts["requests"] += 1
         now = time.monotonic()
         # The requests of one poll arrive within milliseconds of each other;
@@ -218,11 +270,40 @@ class Agent:
             self.counts["discoveries"] += 1
             return [self._report(msg_id, req.request_id,
                                  USM_UNKNOWN_ENGINE_IDS)]
-        if req.engine_id != ENGINE_ID or req.engine_boots != self.engine_boots \
+        if req.engine_id != ENGINE_ID:
+            return [self._report(msg_id, req.request_id,
+                                 USM_NOT_IN_TIME_WINDOWS)]
+        # RFC 3414 §3.2's order: the signature (step 6) is checked before
+        # the time window (step 7), so a wrong password reads as
+        # wrongDigests whatever the clock says. Off unless --auth-pass was
+        # given, so every existing suite sees the agent it always did.
+        if self.auth_pass:
+            if not flags & FLAG_AUTH:
+                return [self._report(msg_id, req.request_id,
+                                     USM_UNSUPPORTED_SEC_LEVELS)]
+            if not self._digest_ok(data):
+                self.counts["wrong_digests"] += 1
+                return [self._report(msg_id, req.request_id, USM_WRONG_DIGESTS)]
+        if req.engine_boots != self.engine_boots \
                 or abs(req.engine_time - self.engine_time()) > self.window:
             return [self._report(msg_id, req.request_id,
                                  USM_NOT_IN_TIME_WINDOWS)]
         self.counts["responses"] += 1
+        if self.require_priv and not flags & FLAG_PRIV and \
+                req.pdu_tag in (PDU_GET, PDU_GETNEXT, PDU_GETBULK):
+            # The message was accepted — USM is done with it — and VACM
+            # finds no access entry for this user at this level. PAN-OS
+            # provisions its user at authPriv; an authNoPriv request
+            # matches nothing, and the answer is an ordinary Response-PDU
+            # with error-status 16, error-index 1 and the request's own
+            # varbinds echoed as nulls, the way net-snmp answers it.
+            self.counts["denied"] += 1
+            echo = b"".join(enc_varbind(vb["oid"], _tlv(T_NULL, b""))
+                            for vb in req.varbinds)
+            return [self._v3_message(
+                msg_id, self._pdu(PDU_RESPONSE, req.request_id, echo,
+                                  error_status=AUTHORIZATION_ERROR,
+                                  error_index=1))]
         if req.pdu_tag == PDU_GET:
             body = b""
             for vb in req.varbinds:
@@ -512,7 +593,8 @@ class Agent:
         because a misbehaving agent sends more than one."""
         req = decode_response(data)
         if self.mode == "v3":
-            return self._v3_handle(req, self._msg_id(data))
+            msg_id, flags = self._msg_header(data)
+            return self._v3_handle(req, msg_id, flags, data)
         if req.pdu_tag == PDU_GET:
             self.gets += 1
             self.counts["get"] += 1
@@ -613,10 +695,19 @@ def main(argv):
     refuse_bulk = False
     stale_id = 0
     dark_after_rows = 0
+    require_priv = False
+    auth_pass = ""
+    auth_proto = "SHA"
     rest = list(argv[1:])
     while rest:
         item = rest.pop(0)
-        if item == "--reply-delay":
+        if item == "--require-priv":
+            require_priv = True
+        elif item == "--auth-pass":
+            auth_pass = rest.pop(0)
+        elif item == "--auth-proto":
+            auth_proto = rest.pop(0)
+        elif item == "--reply-delay":
             reply_delay = float(rest.pop(0))
         elif item == "--bulk-cap":
             bulk_cap = int(rest.pop(0))
@@ -648,7 +739,8 @@ def main(argv):
             mode = item
     Agent(port, mode, interfaces, reboot_after, window, bump_boots_at,
           stats_path, dark_after, host, reply_delay, bulk_cap, tuple(gen_err),
-          tuple(no_such_name), refuse_bulk, stale_id, dark_after_rows).serve()
+          tuple(no_such_name), refuse_bulk, stale_id, dark_after_rows,
+          require_priv, auth_pass, auth_proto).serve()
 
 
 if __name__ == "__main__":

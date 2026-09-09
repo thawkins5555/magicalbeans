@@ -33,8 +33,8 @@ from .nodeoids import DEFAULT_SNMP_PORT
 from .nodesdb import NodesDatabase, detected_vendor
 from .snmppoll import (
     ERROR_STATUS, PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_REPORT, Response,
-    SnmpError, SnmpTimeout, SnmpUnsupported, build_request, build_v3_request,
-    decode_response, discovery_probe,
+    SnmpAccessDenied, SnmpError, SnmpTimeout, SnmpUnsupported, build_request,
+    build_v3_request, decode_response, discovery_probe,
 )
 from .alertmail import duration_text
 from .trapdecode import format_ticks, localized_key
@@ -389,6 +389,84 @@ def credential_for(config: dict) -> tuple[str | None, str | None, str | None]:
     return identity, auth_proto, password
 
 
+def discover_engine(session: _Session, ip: str) -> tuple[bytes, int, int]:
+    """RFC 3414 §4's engine discovery: the empty, unauthenticated probe, and
+    the (engine_id, boots, time) the agent's Report-PDU answers with."""
+    response = session.request(discovery_probe())
+    if not response.engine_id:
+        raise SnmpError(f"{ip}: no engine id in discovery reply")
+    return response.engine_id, response.engine_boots, response.engine_time
+
+
+def v3_exchange(session: _Session, pdu_tag: int, oids: list[str], *,
+                identity: str | None, auth_proto: str | None,
+                password: str | None, engine: tuple | None = None,
+                max_repetitions: int = 0, ip: str = "",
+                learned=None) -> Response:
+    """One authenticated v3 round trip, with the engine resync RFC 3414
+    §3.2 actually prescribes — the ONE copy of it.
+
+    The poller had this loop and the Test button did not, so a device with
+    a skewed clock failed the Test while the poll shrugged it off, and an
+    operator was told two different things about one device. Both call
+    this now. A Report is what it is: the agent telling us its current
+    engine id, boots and time. Those are learned (and handed to `learned`,
+    so a caller with a cache can keep them), the request is retried once
+    with them, and only a second Report is an error — named after the
+    usmStats counter the agent pointed at, so a wrong password reads
+    differently from a wrong clock. A refused security level is raised as
+    SnmpUnsupported, which the poll path classifies as status 'unsupported'
+    rather than as an auth failure.
+
+    `engine` is (engine_id, boots, time) if the caller already knows it;
+    None discovers first. A Report carrying no engine id (or discovery
+    itself failing) leaves the caller's cache to be rebuilt on the next
+    call, exactly as before this was shared."""
+    last: Response | None = None
+    for attempt in (0, 1):
+        if engine is None:
+            engine = discover_engine(session, ip)
+            if learned is not None:
+                learned(*engine)
+        engine_id, boots, engine_time = engine
+        auth_key = localized_key(auth_proto, password, engine_id) \
+            if auth_proto and password else None
+        request_id = session.next_request_id()
+        packet = build_v3_request(
+            session.next_request_id(), request_id, pdu_tag, oids,
+            engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
+            user=identity or "", auth_proto=auth_proto, auth_key=auth_key,
+            max_repetitions=max_repetitions)
+        response = session.request(packet, request_id)
+        if response.pdu_tag != PDU_REPORT:
+            return response
+        last = response
+        name, explanation = report_reason(response)
+        if name == "unsupportedSecLevels":
+            raise SnmpUnsupported(f"{ip}: {explanation}")
+        if attempt == 0:
+            # The Report carries the agent's own authoritative engine id,
+            # boots and time — which is exactly what the retry needs. Learn
+            # them rather than throwing the answer away and rediscovering
+            # on the next poll.
+            engine = None
+            if response.engine_id:
+                engine = (response.engine_id, response.engine_boots,
+                          response.engine_time)
+                if learned is not None:
+                    learned(*engine)
+            continue
+        raise _AuthFailure(
+            f"{ip}: SNMPv3 request refused"
+            + (f" ({explanation})" if explanation
+               else " (the device answered with a Report-PDU)")
+            + (f" [usmStats{name[0].upper()}{name[1:]}]" if name else ""),
+            usm_name=name, report=response)
+    raise _AuthFailure(f"{ip}: SNMPv3 request refused"
+                       + (" (a Report-PDU, twice)" if last else ""),
+                       report=last)
+
+
 def counter_rate(previous: int | None, previous_ts: float, current: int | None,
                  current_ts: float, bit_width: int, *,
                  speed_bps: float | None = None) -> float | None:
@@ -581,6 +659,121 @@ def _error_status_reason(response: Response, base_oid: str) -> str:
     name = ERROR_STATUS.get(response.error_status, "an unknown error")
     return (f"the device answered {name}({response.error_status}) for "
             f"{base_oid} — its SNMP agent refuses that subtree")
+
+
+def security_level(config: dict) -> str:
+    """The USM security level a request built from `config` goes out at:
+    'authNoPriv' when credential_for will sign it, 'noAuthNoPriv' when it
+    will not, '' for v1/v2c, which have no such thing. Mirrors
+    credential_for's own rule — a protocol AND a stored password — rather
+    than decrypting the password a second time to find out; and there is no
+    'authPriv' answer because this poller cannot build one (see
+    SnmpUnsupported)."""
+    if int(config.get("snmp_version", 1)) != 3:
+        return ""
+    if config.get("v3_auth_proto") and config.get("v3_auth_pass_enc"):
+        return "authNoPriv"
+    return "noAuthNoPriv"
+
+
+def refused_oid(response: Response, request_oids) -> str:
+    """The object an error-index points at, or '' when the agent named none.
+
+    error-index is 1-based into the request's varbind list (RFC 3416
+    §4.2.1) and a Response echoes that list, so the response's own varbinds
+    are read first and the request's OIDs are the fallback for an agent
+    that answered an error with an empty list. Zero, or a value past the
+    end of both lists, means the agent named nothing — and that is what is
+    reported, rather than the first OID guessed at, because 'refuses
+    sysDescr' when the agent said no such thing is exactly the kind of
+    confident wrong answer this message exists to stop."""
+    index = int(getattr(response, "error_index", 0) or 0)
+    if index < 1:
+        return ""
+    for oids in (getattr(response, "varbinds", None) or (), request_oids or ()):
+        if index <= len(oids):
+            item = oids[index - 1]
+            return str(item.get("oid") if isinstance(item, dict) else item or "")
+    return ""
+
+
+def access_denied_headline(response: Response, request_oids) -> str:
+    """The one-line shape _error_status_reason already produces for a walk,
+    which operators have learned to read, applied to a GET the agent
+    refused under its own access control."""
+    name = ERROR_STATUS.get(response.error_status, "an unknown error")
+    oid = refused_oid(response, request_oids)
+    if oid:
+        return (f"the device answered {name}({response.error_status}) for "
+                f"{oid} — its SNMP agent refuses that object")
+    return (f"the device answered {name}({response.error_status}) without "
+            f"naming the object it refused (error-index "
+            f"{int(response.error_index or 0)}) — its SNMP agent refuses "
+            f"something in this request")
+
+
+def access_denied_advice(config: dict, level: str) -> str:
+    """What an authorizationError(16) means for THIS credential, and what to
+    do about it.
+
+    An SNMPv3 request fails in two places that look alike from outside. USM
+    checks the signature first; a message it will not accept is answered
+    with a Report-PDU, and that is the wrong-password case. A message it
+    accepts then goes to VACM, whose vacmAccessTable is keyed on (group,
+    context, security model, security LEVEL) — so an entry created for a
+    user at authPriv matches nothing that arrives at authNoPriv, and the
+    agent answers an ordinary Response-PDU with error-status 16. PAN-OS
+    provisions its v3 user as authPriv. This poller sends authNoPriv. The
+    result was 'Authorization Error' against a username and password that
+    were never wrong, and an operator who spent days re-checking them —
+    which is why the authenticated case says, in so many words, that the
+    password is not the problem.
+
+    `level` is the security level the request actually went out at ('' for
+    v1/v2c); it is a parameter, not read from `config`, because the Test
+    button signs with a password that was typed and never stored. Never
+    prints a community, a password or a key: _credential_label is the rule."""
+    who = _credential_label(config)
+    if level == "authNoPriv":
+        return (
+            f"The message authenticated: the device verified the signature "
+            f"for {who} and processed the request, so this is an "
+            f"access-control (VACM) refusal, not a bad password. If that "
+            f"user is configured on the device with a privacy password as "
+            f"well (authPriv — the way PAN-OS creates its SNMPv3 user), an "
+            f"authNoPriv request matches no access entry at all and is "
+            f"refused exactly like this (RFC 3415). Either grant the user a "
+            f"view at authNoPriv on the device, or use a privacy password — "
+            f"which this poller cannot yet send (authPriv is not "
+            f"implemented, so there is no privacy password to set on this "
+            f"credential until it is); until then the authNoPriv view is "
+            f"the fix.")
+    if level == "noAuthNoPriv":
+        return (
+            f"The request was unsigned (noAuthNoPriv) and the device "
+            f"processed it, so this is an access-control (VACM) refusal: "
+            f"the view for {who} at noAuthNoPriv does not include that "
+            f"object. A view granted to that user at authNoPriv or authPriv "
+            f"does not match an unsigned request (RFC 3415); either grant "
+            f"the view at noAuthNoPriv, or set an authentication protocol "
+            f"and password on this credential so the request goes out at "
+            f"authNoPriv.")
+    if level == "authPriv":
+        return (f"The message authenticated and decrypted; the view for "
+                f"{who} does not include that object.")
+    return (f"The device accepted {who} and refused the object under its "
+            f"access control: the community's view does not include it.")
+
+
+def access_denied_reason(config: dict, response: Response, request_oids,
+                         level: str) -> str:
+    """The whole message for an authorizationError(16): the headline that
+    names the refused object, then the advice for this credential. Module-
+    level so netpath/web/api.py composes the Test button's answer from the
+    same two pieces — the Test and the poll must never disagree about
+    wording, and a second copy is how they would start to."""
+    return (access_denied_headline(response, request_oids) + ". "
+            + access_denied_advice(config, level))
 
 
 def _with_dropped(reason: str, session: "_Session") -> str:
@@ -1179,6 +1372,12 @@ class NodePoller(Worker):
         # see _poll_device for why the device row cannot answer that. In
         # memory and process-lifetime only, like _credentials above.
         self._auth_failing: set[int] = set()
+        # The same shape for a device whose agent accepted the credential
+        # and refused the object (SnmpAccessDenied): entering records
+        # access_denied, leaving on a successful poll records access_ok.
+        # In memory for the same reason _auth_failing is — see the events
+        # block in _poll_device.
+        self._access_denied: set[int] = set()
         # Devices whose per-method lane events have been confirmed to exist
         # (or seeded) since this process started — see the events block in
         # _poll_device and nodesdb.has_method_events. One query per device
@@ -1195,7 +1394,12 @@ class NodePoller(Worker):
         # when the tab is left or the browser closes — no cleanup path.
         self._focus: tuple[int, float, float] | None = None
         self.counters = {"polls": 0, "ok": 0, "timeout": 0, "auth_fail": 0,
-                         "unsupported": 0, "errors": 0, "overruns": 0, "snmp_backoff": 0,
+                         # denied: the agent accepted the credential and
+                         # refused the object (authorizationError) — counted
+                         # apart from auth_fail because it is the opposite
+                         # finding about the password.
+                         "unsupported": 0, "denied": 0,
+                         "errors": 0, "overruns": 0, "snmp_backoff": 0,
                          "mac_walks": 0, "identifications": 0,
                          # lldp_walks counts completed LLDP/CDP walks;
                          # poe_polls/stp_polls/rf_polls count poll-cycle
@@ -2328,6 +2532,20 @@ class NodePoller(Worker):
         # Decided by exception type, never by a substring of the message:
         # no message this raises contains the word "unsupported".
         snmp_unsupported = False
+        # Whether the agent verified the credential and then refused the
+        # object under its own access control (authorizationError). Type-
+        # decided like the two beside it: every message this raises
+        # contains the word "auth", and so does every message that is NOT
+        # this — see auth_failing below.
+        snmp_denied = False
+        # Whether the agent would not accept the message at all (a wrong
+        # community or v3 password, an engine that will not resync).
+        # Decided by exception type, never by a substring of the message:
+        # the unsupportedSecLevels text contains "authPriv", and every
+        # access-denied message above contains "authenticated", so "auth"
+        # in the message was already raising auth_fail for faults that
+        # proved the password GOOD.
+        snmp_auth_failed = False
         identity = None
         uptime_ticks = None
         interfaces: list[dict] = []
@@ -2392,9 +2610,19 @@ class NodePoller(Worker):
                 snmp_ok = False
                 snmp_error = str(exc)
                 self._bump("timeout")
+            except SnmpAccessDenied as exc:
+                # Before SnmpError, which it is a subclass of: the credential
+                # loop has already rotated on it (an authPriv alternate may
+                # well have succeeded), so reaching here means every
+                # candidate was refused this way or worse.
+                snmp_ok = False
+                snmp_error = str(exc)
+                snmp_denied = True
+                self._bump("denied")
             except _AuthFailure as exc:
                 snmp_ok = False
                 snmp_error = str(exc)
+                snmp_auth_failed = True
                 self._bump("auth_fail")
             except SnmpError as exc:
                 snmp_ok = False
@@ -2423,6 +2651,17 @@ class NodePoller(Worker):
             ping_only_ok = bool(config.get("unreachable_ping_only", True))
             reachable = bool(snmp_ok) or (ping_only_ok and bool(ping_ok))
 
+        # snmp_denied deliberately has NO status of its own, and does not
+        # reuse "unsupported" either. "unsupported" is a verdict about the
+        # poller — it cannot speak what the device requires — and lives in
+        # the status vocabulary of the devices table, the timeline segments,
+        # the dashboard figures, the map and the availability report; a
+        # fifth value there is a vocabulary change in six files for a
+        # diagnostics fix. A refused object is a verdict about the
+        # device's configuration, and the device itself is demonstrably
+        # reachable (its agent verified the message and answered), so the
+        # status follows reachability exactly as it does for an auth
+        # failure, and the access_denied event below carries the finding.
         if snmp_unsupported:
             status = "unsupported"
         elif reachable:
@@ -2520,6 +2759,26 @@ class NodePoller(Worker):
         elif status == "unsupported" and was_status != "unsupported":
             self.db.record_device_event(device_id, "unsupported", snmp_error)
 
+        # access_denied: the agent accepted the credential and refused the
+        # object. Recorded beside `unsupported` because it is the same
+        # kind of finding — a configuration verdict, not an outage — but on
+        # a transition held in memory rather than in `status`, since it has
+        # no status of its own (see the status block above). Entering the
+        # set records access_denied with the full explanation; a successful
+        # poll afterwards records access_ok, the pair alertrules.CLEARS
+        # uses to close the alert, exactly as auth_fail/auth_ok do below.
+        with self._lock:
+            if snmp_denied and device_id not in self._access_denied:
+                self._access_denied.add(device_id)
+                access_event = ("access_denied", snmp_error)
+            elif snmp_ok and device_id in self._access_denied:
+                self._access_denied.discard(device_id)
+                access_event = ("access_ok", "")
+            else:
+                access_event = None
+        if access_event is not None:
+            self.db.record_device_event(device_id, access_event[0], access_event[1])
+
         # Per-method transitions (snmp_up/snmp_down, ping_up/ping_down): the
         # status timeline's split SNMP/ping lanes are built from these, not
         # from the up/down events above, which follow `status` — effectively
@@ -2570,8 +2829,16 @@ class NodePoller(Worker):
         # came last, so the recorded text alternates while nothing changed.
         # Entering the set records auth_fail, leaving it records auth_ok,
         # everything else records nothing.
-        auth_failing = bool(snmp_ok is False and isinstance(snmp_error, str)
-                            and "auth" in snmp_error.lower())
+        #
+        # Decided by exception type (snmp_auth_failed, set only in the
+        # _AuthFailure arm), never by a substring of the message. This used
+        # to test for "auth" in the text, and "auth" is in nearly every
+        # SNMPv3 message there is: the unsupportedSecLevels explanation says
+        # "authPriv", and an authorizationError explanation says "the
+        # message authenticated" — so an alert named "SNMP authentication
+        # failing" was raised for the one fault that proved the password
+        # correct.
+        auth_failing = bool(snmp_auth_failed and snmp_ok is False)
         with self._lock:
             if auth_failing and device_id not in self._auth_failing:
                 self._auth_failing.add(device_id)
@@ -2600,8 +2867,11 @@ class NodePoller(Worker):
         # stays dead and their stopping is what lets it clear. A transition
         # would freeze `last_ts` and announce a false all-clear an hour
         # later.
+        # A refused object is excluded the way unsupported is: "SNMP is not
+        # answering" is untrue of an agent that verified the message and
+        # answered it, and the access_denied event above is its report.
         snmp_failing_now = (not auth_failing and snmp_ok is False and ping_ok
-                            and not snmp_unsupported)
+                            and not snmp_unsupported and not snmp_denied)
         with self._lock:
             if snmp_failing_now:
                 fail_count = self._snmp_failing_count.get(device_id, 0) + 1
@@ -2880,86 +3150,56 @@ class NodePoller(Worker):
                 packet = build_request(version, identity or "public", PDU_GET,
                                        request_id, oids)
                 response = session.request(packet, request_id)
-                self._check_error_status(response)
+                self._check_error_status(response, config, oids)
                 return response
 
             response = self._v3_exchange(session, device, config, PDU_GET, oids)
-            self._check_error_status(response)
+            self._check_error_status(response, config, oids)
             return response
         finally:
             session.close()
 
     def _v3_exchange(self, session: _Session, device, config: dict, pdu_tag: int,
                      oids: list[str], max_repetitions: int = 0) -> Response:
-        """One authenticated v3 round trip, with the engine resync RFC 3414
-        §3.2 actually prescribes.
-
-        Every v3 caller went through its own copy of "build the message,
-        send it, and if a Report comes back give up" — so a device whose
-        engineBoots had incremented (a restart) failed every poll until
-        something else invalidated the cache, and the operator was told
-        only "engine resync required". Here a Report is what it is: the
-        agent telling us its current boots/time. Those are learned, the
-        request is retried once with them, and only a second Report is an
-        error — named after the usmStats counter the agent pointed at, so
-        a wrong password reads differently from a wrong clock. A refused
-        security level is raised as SnmpUnsupported, which the poll path
-        classifies as status 'unsupported' rather than as an auth failure.
-        """
+        """The poller's side of the module-level v3_exchange: the engine
+        cache. Every v3 caller once went through its own copy of "build
+        the message, send it, and if a Report comes back give up" — so a
+        device whose engineBoots had incremented (a restart) failed every
+        poll until something else invalidated the cache, and the operator
+        was told only "engine resync required". The resync loop itself now
+        lives in v3_exchange, shared with the Test button; what is left
+        here is feeding it the cached engine parameters, keeping the ones
+        a Report teaches, and dropping the entry when even the retry was
+        refused, so the next poll rediscovers from nothing."""
         identity, auth_proto, password = credential_for(config)
-        last: Response | None = None
-        for attempt in (0, 1):
-            engine = self._engines.current(device["id"])
-            if engine is None:
-                engine = self._discover_engine(session, device)
-            engine_id, boots, engine_time = engine
-            auth_key = localized_key(auth_proto, password, engine_id) \
-                if auth_proto and password else None
-            request_id = session.next_request_id()
-            packet = build_v3_request(
-                session.next_request_id(), request_id, pdu_tag, oids,
-                engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
-                user=identity or "", auth_proto=auth_proto, auth_key=auth_key,
-                max_repetitions=max_repetitions)
-            response = session.request(packet, request_id)
-            if response.pdu_tag != PDU_REPORT:
-                return response
-            last = response
-            name, explanation = report_reason(response)
-            if name == "unsupportedSecLevels":
-                raise SnmpUnsupported(f"{device['ip']}: {explanation}")
-            if attempt == 0:
-                # The Report carries the agent's own authoritative engine
-                # id, boots and time — which is exactly what the retry
-                # needs. Learn them rather than throwing the answer away
-                # and rediscovering on the next poll.
-                self._engines.invalidate(device["id"])
-                if response.engine_id:
-                    self._engines.set(device["id"], response.engine_id,
-                                      response.engine_boots, response.engine_time)
-                continue
-            self._engines.invalidate(device["id"])
-            raise _AuthFailure(
-                f"{device['ip']}: SNMPv3 request refused"
-                + (f" ({explanation})" if explanation
-                   else " (the device answered with a Report-PDU)")
-                + (f" [usmStats{name[0].upper()}{name[1:]}]" if name else ""))
-        raise _AuthFailure(f"{device['ip']}: SNMPv3 request refused"
-                           + (" (a Report-PDU, twice)" if last else ""))
+        device_id = device["id"]
 
-    def _discover_engine(self, session: _Session, device) -> tuple:
-        probe = discovery_probe()
-        response = session.request(probe)
-        if not response.engine_id:
-            raise SnmpError(f"{device['ip']}: no engine id in discovery reply")
-        self._engines.set(device["id"], response.engine_id, response.engine_boots,
-                          response.engine_time)
-        return self._engines.current(device["id"])
+        def learned(engine_id: bytes, boots: int, engine_time: int) -> None:
+            self._engines.set(device_id, engine_id, boots, engine_time)
 
-    @staticmethod
-    def _check_error_status(response: Response) -> None:
+        try:
+            return v3_exchange(
+                session, pdu_tag, oids, identity=identity, auth_proto=auth_proto,
+                password=password, engine=self._engines.current(device_id),
+                max_repetitions=max_repetitions, ip=device["ip"], learned=learned)
+        except _AuthFailure:
+            self._engines.invalidate(device_id)
+            raise
+
+    def _check_error_status(self, response: Response, config: dict,
+                            oids: list[str]) -> None:
+        """authorizationError(16) on a GET, raised with the object named and
+        the credential's own explanation (access_denied_reason). Every
+        other error-status is left in the Response for the caller to
+        interpret, as it always was — noSuchName on one OID in a batch does
+        not make the whole reply worthless. An instance method rather than
+        the staticmethod it was, because a useful message needs `config`
+        (which credential, at what level) and the request's OID list (what
+        error-index counts into), and both callers are in _snmp_get with
+        both in hand."""
         if response.error_status == 16:   # authorizationError
-            raise _AuthFailure("authorization error")
+            raise SnmpAccessDenied(access_denied_reason(
+                config, response, oids, security_level(config)))
 
     def _poll_snmp_scalars_with_credential(self, device, config: dict):
         """Resolves which SNMP credential actually works for this device
@@ -6828,8 +7068,20 @@ class NodePoller(Worker):
 
 
 class _AuthFailure(SnmpError):
-    """Internal: an authorization/engine-sync failure, reported to the
-    device as status 'auth' rather than a generic error or a timeout."""
+    """Internal: an authentication/engine-sync failure — the agent would not
+    accept the message — reported as the auth_fail device event rather than
+    a generic error or a timeout. NOT an authorizationError(16): that is a
+    message the agent accepted and an object it then refused, which is
+    SnmpAccessDenied. `usm_name` is the usmStats counter the final Report
+    named ('' when it named none) and `report` that Report itself, so a
+    reader such as the Test button can say which of the three v3 failures
+    this was without matching a substring of the message."""
+
+    def __init__(self, message: str = "", *, usm_name: str = "",
+                 report: Response | None = None):
+        super().__init__(message)
+        self.usm_name = usm_name
+        self.report = report
 
 
 if __name__ == "__main__":

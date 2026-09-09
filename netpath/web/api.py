@@ -4823,18 +4823,31 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
     """Ping + SNMP against the in-progress-edit config carried in the
     body, falling back to the saved one for anything not overridden — the
     same "test what's typed before saving" idiom as IPAM's DHCP test.
-    Builds the SNMP request directly with snmppoll rather than going
-    through NodePoller/credential_for(), so a typed-but-unsaved v3
-    password is used once, in memory, and never touches DPAPI — the same
-    "usable without ever being persisted on a non-Windows box" property
-    CREDENTIAL-SECURITY.md documents for every other credential form."""
+    Builds the SNMP request directly with snmppoll and nodepoll's module-
+    level v3_exchange rather than going through NodePoller/credential_for(),
+    so a typed-but-unsaved v3 password is used once, in memory, and never
+    touches DPAPI — the same "usable without ever being persisted on a
+    non-Windows box" property CREDENTIAL-SECURITY.md documents for every
+    other credential form.
+
+    The SNMPv3 half answers in fields, not one string, because one string
+    is what an operator spent days on: "engine resync required — check the
+    username and auth password" for every Report-PDU whatever it named, and
+    "authorization error" for a credential the device had just verified.
+    `engine` is what discovery learned (and whether a Report re-taught it),
+    `auth` whether the signature was accepted, `report` the usmStats counter
+    a refusing agent named, `refused_oid`/`hint` the object and the advice
+    for an authorizationError — the same words the poll writes to the
+    device row, from the same functions, so the two never disagree."""
     import random
     from .. import nodeoids
     from ..ipam_scan import ping_once
-    from ..nodepoll import DEFAULT_SNMP_PORT, _Session, credential_for
-    from ..snmppoll import (PDU_GET, PDU_REPORT, SnmpError, build_request,
-                            build_v3_request, discovery_probe)
-    from ..trapdecode import localized_key
+    from ..nodepoll import (
+        DEFAULT_SNMP_PORT, USM_STATS, _AuthFailure, _Session,
+        access_denied_advice, access_denied_headline, credential_for,
+        discover_engine, refused_oid, v3_exchange)
+    from ..snmppoll import (ERROR_STATUS, PDU_GET, SnmpAccessDenied, SnmpError,
+                            build_request)
 
     row = _require(service.nodes_db.device(device_id), "device")
     config = service.nodes_db.effective_config(row)
@@ -4892,62 +4905,164 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
         # an error-status for the ifTable, one that refuses GETBULK, and a
         # community that is dropped without a word. The walk below is the
         # poll's own first walk, so the test now fails where the poll does.
-        phases = result["snmp"]["phases"] = []
+        snmp = result["snmp"]
+        phases = snmp["phases"] = []
+        # Every diagnostic key is present from the start, None until the
+        # phase that answers it has run, so a reader never has to ask
+        # whether a missing key means "not v3" or "did not get that far".
+        # The level is derived the way the poller's security_level derives
+        # it — a protocol AND a password sign the request — from the
+        # typed-or-stored pair resolved above, since the typed password is
+        # exactly the one credential_for cannot see.
+        signed = bool(version >= 3 and auth_proto and password)
+        level = ("authNoPriv" if signed else "noAuthNoPriv") if version >= 3 else ""
+        snmp["security_level"] = level or None
+        for key in ("engine", "auth", "report", "error_status",
+                    "error_status_name", "refused_oid", "hint"):
+            snmp[key] = None
+        # What the message names the credential as, without ever printing
+        # it: the version and identity the test actually used, which may
+        # both be the form's rather than the saved row's.
+        label_config = dict(config, snmp_version=version)
+        label_config["v3_user" if version >= 3 else "community"] = identity
         session = None
+        # The (engine id, boots, time) the next signed request is built
+        # with. A one-element list because `learned` — how v3_exchange
+        # hands back what a Report re-taught it — has to replace it from
+        # inside a closure, and the payload reports the resync rather than
+        # hiding it, which is the whole difference from the copy this
+        # handler used to carry.
+        engine = [None]
+
+        def learned(engine_id: bytes, boots: int, engine_time: int) -> None:
+            resynced = engine[0] is not None
+            engine[0] = (engine_id, boots, engine_time)
+            snmp["engine"].update(id=engine_id.hex(), boots=boots,
+                                  time=engine_time, resynced=resynced)
+
         try:
             session = _Session(row["ip"], DEFAULT_SNMP_PORT, timeout_s,
                                int(config.get("snmp_retries", 2)))
-            engine_reply = None
             if version >= 3:
-                engine_reply = session.request(discovery_probe())
+                # Discovery is its own phase, because a timeout here is a
+                # different fault from a timeout on the signed request: no
+                # signed request was ever sent, so the username and the
+                # password were never tested at all.
+                started = time.time()
+                try:
+                    engine[0] = discover_engine(session, row["ip"])
+                except SnmpError as exc:
+                    snmp["engine"] = {"ok": False, "id": None, "boots": None,
+                                      "time": None, "resynced": False,
+                                      "ms": (time.time() - started) * 1000.0}
+                    raise SnmpError(
+                        f"SNMPv3 engine discovery failed: {exc} — the "
+                        f"unauthenticated discovery probe (RFC 3414 §4) got "
+                        f"no usable answer, so no signed request was sent "
+                        f"and the username and password were never tested")
+                finally:
+                    phases.append({"name": "engine discovery",
+                                   "ms": (time.time() - started) * 1000.0})
+                engine_id, boots, engine_time = engine[0]
+                snmp["engine"] = {"ok": True, "id": engine_id.hex(), "boots": boots,
+                                  "time": engine_time, "resynced": False,
+                                  "ms": phases[-1]["ms"]}
 
             def exchange(pdu_tag, request_oids, max_repetitions=0):
-                """One round trip on the shared session, either framing."""
-                request_id = random.randint(1, 2 ** 16)
+                """One round trip on the shared session, either framing.
+                The v3 framing is the poller's own v3_exchange — the resync
+                on a first Report included, so a device whose clock has
+                drifted passes the Test the same way it passes the poll."""
                 if version in (0, 1):
+                    request_id = random.randint(1, 2 ** 16)
                     packet = build_request(version, identity or "public", pdu_tag,
                                            request_id, request_oids,
                                            max_repetitions=max_repetitions)
-                else:
-                    auth_key = (localized_key(auth_proto, password,
-                                              engine_reply.engine_id)
-                                if auth_proto and password else None)
-                    packet = build_v3_request(
-                        random.randint(1, 2 ** 16), request_id,
-                        pdu_tag, request_oids, engine_id=engine_reply.engine_id,
-                        engine_boots=engine_reply.engine_boots,
-                        engine_time=engine_reply.engine_time, user=identity or "",
-                        auth_proto=auth_proto, auth_key=auth_key,
-                        max_repetitions=max_repetitions or 10)
-                reply = session.request(packet, expect_request_id=request_id)
-                if version >= 3 and reply.pdu_tag == PDU_REPORT:
-                    raise SnmpError("engine resync required (Report-PDU) — check "
-                                    "the SNMPv3 username and auth password")
-                return reply
+                    return session.request(packet, expect_request_id=request_id)
+                return v3_exchange(
+                    session, pdu_tag, request_oids, identity=identity,
+                    auth_proto=auth_proto, password=password, engine=engine[0],
+                    max_repetitions=max_repetitions or 10, ip=row["ip"],
+                    learned=learned)
 
             started = time.time()
             try:
                 response = exchange(PDU_GET, oids)
-                if response.error_status == 16:
-                    raise SnmpError("authorization error")
             finally:
                 phases.append({"name": "scalars",
                                "ms": (time.time() - started) * 1000.0})
+            if version >= 3:
+                # Any non-Report reply to a signed request is USM saying
+                # the signature verified; an unsigned request proves
+                # nothing about the password either way, and says so
+                # rather than claiming an authentication that never ran.
+                snmp["auth"] = (
+                    {"ok": True, "detail": "the device verified the signature "
+                                           "(authNoPriv) and answered"}
+                    if signed else
+                    {"ok": None, "detail": "the request was not signed "
+                                           "(noAuthNoPriv), so there was nothing "
+                                           "to authenticate"})
+            snmp["error_status"] = response.error_status
+            snmp["error_status_name"] = (
+                ERROR_STATUS.get(response.error_status, "") if response.error_status else "")
+            if response.error_status == 16:
+                # The message authenticated and the object was refused. The
+                # headline goes in `error` and the advice in `hint`; joined
+                # with ". " they are nodepoll.access_denied_reason verbatim,
+                # the text the poll writes to the device row — split only so
+                # the dialog can put the advice on a line of its own.
+                snmp["refused_oid"] = refused_oid(response, oids) or None
+                snmp["hint"] = access_denied_advice(label_config, level)
+                raise SnmpAccessDenied(access_denied_headline(response, oids))
             values = {vb["oid"]: vb["value"] for vb in response.varbinds
                      if vb["type"] not in ("noSuchObject", "noSuchInstance")}
-            result["snmp"]["ok"] = True
-            result["snmp"]["sys_descr"] = values.get(nodeoids.SYSTEM_SCALARS["sys_descr"])
-            result["snmp"]["sys_name"] = values.get(nodeoids.SYSTEM_SCALARS["sys_name"])
-            result["snmp"]["sys_uptime"] = values.get(nodeoids.SYSTEM_SCALARS["sys_uptime"])
+            snmp["ok"] = True
+            snmp["sys_descr"] = values.get(nodeoids.SYSTEM_SCALARS["sys_descr"])
+            snmp["sys_name"] = values.get(nodeoids.SYSTEM_SCALARS["sys_name"])
+            snmp["sys_uptime"] = values.get(nodeoids.SYSTEM_SCALARS["sys_uptime"])
             walk = _test_ifindex_walk(service, exchange, version)
-            result["snmp"]["walk"] = walk
+            snmp["walk"] = walk
             phases.append({"name": "ifIndex walk", "ms": walk.pop("ms"),
                            "detail": walk["summary"]})
+        except _AuthFailure as exc:
+            # Even the retry drew a Report: say WHICH usmStats counter the
+            # agent named, by its type-carried name rather than a substring
+            # of the message, and what that means for the password.
+            # wrongDigests and unknownUserNames are the credential being
+            # wrong; notInTimeWindows is the clock, which the poller resyncs
+            # and retries on every poll and which is normally transient — a
+            # Test must not call that a failure when the poll recovers from
+            # it silently, so `auth.ok` is null there, not false.
+            snmp["ok"] = False
+            snmp["error"] = str(exc)
+            name = exc.usm_name
+            oid = next((o for o, (n, _) in USM_STATS.items() if n == name), None)
+            explanation = USM_STATS[oid][1] if oid else ""
+            snmp["report"] = {
+                "name": name or None, "oid": oid,
+                "detail": explanation or ("the device answered with a "
+                                          "Report-PDU naming no usmStats "
+                                          "counter this poller knows")}
+            if name in ("wrongDigests", "unknownUserNames"):
+                snmp["auth"] = {"ok": False, "detail": explanation}
+            elif name == "notInTimeWindows":
+                snmp["auth"] = {"ok": None, "detail": (
+                    "the device rejected the engine time twice, so the "
+                    "password was never checked; the poller resyncs and "
+                    "retries on this and it is normally transient — run "
+                    "the test again")}
+            else:
+                snmp["auth"] = {"ok": None, "detail": "not proven either way: "
+                                + (explanation or "the device answered with "
+                                                  "a Report-PDU")}
         except (SnmpError, OSError) as exc:
-            # OSError: _Session's socket() itself failed (descriptor
-            # exhaustion); the same readable answer as a protocol failure.
-            result["snmp"]["ok"] = False
-            result["snmp"]["error"] = str(exc)
+            # SnmpAccessDenied lands here too, with the headline as the
+            # error and refused_oid/hint already filled in above. OSError:
+            # _Session's socket() itself failed (descriptor exhaustion);
+            # the same readable answer as a protocol failure.
+            snmp["ok"] = False
+            snmp["error"] = str(exc)
         finally:
             password = None
             if session is not None:

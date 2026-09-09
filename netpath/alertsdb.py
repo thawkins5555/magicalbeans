@@ -616,6 +616,13 @@ _BUILTIN_RULES = [
     ("device_rebooted", "Device rebooted", "device_event", "rebooted", 4, "device_rebooted", None, None, 1),
     ("device_auth_fail", "SNMP authentication failing", "device_event", "auth_fail", 3, "event_notice", None, None, 1),
     ("device_unsupported", "Device requires unsupported SNMP privacy", "device_event", "unsupported", 5, "event_notice", None, None, 1),
+    # The agent accepted the credential and refused the object under its
+    # own access control (authorizationError). Its own rule because it is
+    # the OPPOSITE finding from device_auth_fail — the password is proven
+    # good — and used to be raised under that rule's name by a substring
+    # match on "auth". Cleared by access_ok (alertrules.CLEARS), the same
+    # pair auth_fail/auth_ok make.
+    ("device_access_denied", "SNMP access refused by the device", "device_event", "access_denied", 3, "event_notice", None, None, 1),
     ("poll_overrun", "Poll taking longer than its interval", "device_event", "poll_overrun", 4, "event_notice", None, None, 1),
     ("mib_missing", "Vendor MIB not uploaded for this device", "device_event", "mib_missing", 6, "event_notice", None, None, 1),
     # A device that answers ping while SNMP fails is invisible to

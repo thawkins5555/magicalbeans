@@ -457,8 +457,8 @@ CREATE TABLE IF NOT EXISTS device_events (
     id              INTEGER PRIMARY KEY,
     device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     ts              REAL NOT NULL,
-    -- down|up|rebooted|auth_fail|auth_ok|poll_overrun|unsupported|snmp_error|
-    -- snmp_up|snmp_down|ping_up|ping_down. The last four are per-method
+    -- down|up|rebooted|auth_fail|auth_ok|access_denied|access_ok|poll_overrun|
+    -- unsupported|snmp_error|snmp_up|snmp_down|ping_up|ping_down. The last four are per-method
     -- transitions (see nodepoll._poll_device) that back the split SNMP/ping
     -- status timeline lanes — separate from up/down, which stay the
     -- overall-reachability events every other reader (alerts, reports)

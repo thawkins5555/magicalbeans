@@ -65,6 +65,19 @@ class SnmpUnsupported(SnmpError):
     """authPriv (privacy/encryption) requested — not implemented."""
 
 
+class SnmpAccessDenied(SnmpError):
+    """The agent processed and accepted the request, then refused the object
+    under its own access control (authorizationError(16)). The credential is
+    proven good; the view, or the security level, is not.
+
+    An SnmpError, deliberately, and not the poller's _AuthFailure: the
+    credential loop rotates on SnmpError, and rotating is right here — a
+    profile may hold an authPriv alternate after the authNoPriv one that
+    genuinely will succeed — while filing this as an authentication failure
+    is the misreport that sent an operator re-checking a password the device
+    had just verified."""
+
+
 # --------------------------------------------------------------------- build
 
 def _pdu_bytes(pdu_tag: int, request_id: int, oids, non_repeaters: int,

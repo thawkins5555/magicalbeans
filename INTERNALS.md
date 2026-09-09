@@ -695,7 +695,9 @@ reports the missing object per-varbind as `noSuchObject` and every other answer
 in the response is intact. SNMPv1 has no per-varbind exception — it answers a
 request containing one unimplemented object with `noSuchName` and the request's
 own varbind list echoed back as nulls, and `_check_error_status` raises only on
-`authorizationError` — so the response parses cleanly and `identity` comes out
+`authorizationError` (as `SnmpAccessDenied`, with the refused object named
+from `error-index` — see the 5.7.2 note below) — so the response parses
+cleanly and `identity` comes out
 with sysDescr, sysObjectID, sysName and sysLocation all blank. Silently. A
 device whose configured version is 0 therefore has its custom identity OIDs
 read by `_identity_extras()`, a best-effort GET of their own whose failure
@@ -1172,14 +1174,44 @@ of `engine_time`, which advances with the agent's clock and must be
 advanced with it here.
 
 A Report-PDU is still what says a resynchronisation is needed. All three v3
-send paths — `_snmp_get`, `_snmp_get_next` and `_walk_request` — now go
-through one `_v3_exchange()` helper that invalidates the cache entry,
-rediscovers and retries once; a second Report raises `_AuthFailure` with
-the `usmStats*` counter decoded into a real message, and
+send paths — `_snmp_get`, `_snmp_get_next` and `_walk_request` — go
+through `NodePoller._v3_exchange()`, which is now only the engine cache's
+side of the exchange: it hands the cached parameters to the module-level
+`nodepoll.v3_exchange()`, keeps whatever a Report re-teaches (the `learned`
+callback), and drops the entry when even the retry was refused. The loop
+itself — learn boots/time from a first Report, retry once, and only then
+fail — lives in `v3_exchange()` since 5.7.2 and is shared with the Test
+button, which had its own copy that did not resync and so failed a device
+with a skewed clock that the poll shrugged off. A second Report raises
+`_AuthFailure` with the `usmStats*` counter decoded into a real message
+and carried by attribute (`usm_name`, `report`), and
 `usmStatsUnsupportedSecLevels` raises `SnmpUnsupported` so the device is
 marked `unsupported` by exception type rather than by matching a substring
 of its own error string. Two of those three paths previously had no Report
 handling at all and decoded one as an ordinary reply with no varbinds.
+
+**A Report is not the only refusal (5.7.2).** A message USM accepts still
+goes to VACM, and RFC 3415's `vacmAccessTable` is keyed on the security
+*level*: an access entry for a user at `authPriv` matches nothing arriving
+at `authNoPriv` (which is all this poller sends), and the agent answers an
+ordinary Response-PDU with `error-status 16`, `authorizationError`. PAN-OS
+provisions its v3 user that way. `_check_error_status` raises that as
+`SnmpAccessDenied` (an `SnmpError`, so the credential loop still rotates
+onto an alternate; not `_AuthFailure`, because the credential has just been
+proven good) with `access_denied_reason()` as the message: the refused
+object named from `error-index` (`refused_oid()` — 1-based into the
+request's varbinds per RFC 3416 §4.2.1, the response's own list first, 0
+or out of range reported as "named nothing" rather than guessed), and the
+advice for the level the request went out at (`security_level()`).
+`_poll_device` files it as `snmp_denied` — counter `denied`, device events
+`access_denied`/`access_ok` on the in-memory transition `_access_denied`
+holds, the built-in rule `device_access_denied` cleared by `access_ok` —
+and leaves `status` to reachability, since the device demonstrably
+answered. Whether a failure is an *authentication* failure is decided by
+exception type (`snmp_auth_failed`, the `_AuthFailure` arm) and no longer
+by `"auth" in snmp_error`, which matched "authPriv" and "authenticated"
+and so raised the authentication alert for the faults that proved the
+password correct.
 
 **Multiple credentials per profile.** A polling profile's own `snmp_version`/
 `community`/`v3_*` columns are its "primary" credential, unconditionally
@@ -1956,7 +1988,20 @@ requests, the repetition count actually accepted, whether GETBULK survived
 at all, and the error-status the agent answered. Bounded to
 `_TEST_WALK_MAX_ROWS` / `_TEST_WALK_BUDGET_S`, because a human is waiting.
 Its existing output and permission behaviour are unchanged — the new keys
-are additions.
+are additions. Since 5.7.2 the SNMPv3 half answers in fields rather than
+one string: `security_level` (derived the way `nodepoll.security_level`
+derives it, from the typed-or-stored protocol and password), `engine`
+(discovery's id/boots/time, `ok`, `ms`, and `resynced` when a Report
+re-taught them), `auth` (`ok` true once any non-Report reply answers a
+signed request, false for `wrongDigests`/`unknownUserNames`, null for
+`notInTimeWindows` — transient, and the poll resyncs through it — or for
+an unsigned request), `report` (the `usmStats` name, OID and explanation,
+from `_AuthFailure.usm_name` rather than the message text),
+`error_status`/`error_status_name`, `refused_oid` and `hint`. `error`
+carries `access_denied_headline` and `hint` carries `access_denied_advice`;
+joined with `". "` they are `access_denied_reason` verbatim, the text the
+poll writes to the device row. Engine discovery is a phase of its own, so a
+timeout there says no signed request was ever sent.
 
 `_Session.dropped` counted datagrams rejected for a wrong peer, a failed
 decode or a request-id mismatch, and was read by nothing. It is now
