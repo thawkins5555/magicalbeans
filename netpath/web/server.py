@@ -1027,6 +1027,14 @@ class Handler(BaseHTTPRequestHandler):
         # filed under the route rather than under one of a fleet's worth of
         # distinct paths. Stays None for a 404, which is its own useful key.
         self._route_template = None
+        # Scratch space for one request, handed to the handler as
+        # params["_cache"]. api.request_user/request_permissions memoise the
+        # two app.db reads in here — the gate below and the handler ask for
+        # the same account, and one Handler serves every request on a
+        # persistent connection, so this being reset HERE is what keeps the
+        # memo from outliving the request that filled it. That in turn is
+        # what keeps a revoked grant refused on the very next request.
+        self._request_cache = {}
         started = time.perf_counter()
         try:
             self._route(method)
@@ -1100,6 +1108,7 @@ class Handler(BaseHTTPRequestHandler):
 
         token = self._cookie(SESSION_COOKIE)
         session = self.service.sessions.get(token) if token else None
+        params["_cache"] = self._request_cache
         params["_client"] = self.client_address[0]
         params["_agent"] = self.headers.get("User-Agent", "")
         # The WEB relay hands back a URL the browser must be able to open --
@@ -1157,7 +1166,7 @@ class Handler(BaseHTTPRequestHandler):
         # account that owes a password change is not fully trusted yet,
         # whichever door it came in by.
         if authenticated and path.startswith("/api/") and path not in MUST_CHANGE_API:
-            row = self.service.app_db.user(params.get("_username", ""))
+            row = api.request_user(self.service, params)
             if row is not None and row["must_change"]:
                 self._json({"error": "password change required"}, 403)
                 return
@@ -1187,8 +1196,8 @@ class Handler(BaseHTTPRequestHandler):
                 need = requirement(params, body) if callable(requirement) else requirement
                 if need is not None:
                     module, level = need
-                    granted = self.service.app_db.permissions_for(
-                        params.get("_username", "")).get(module)
+                    granted = api.request_permissions(
+                        self.service, params).get(module)
                     if not permissions.allows(granted, level):
                         self._json({"error": f"No {level} access to {module}"}, 403)
                         return

@@ -361,6 +361,76 @@ def _visible_settings(settings: dict, granted: dict) -> dict:
     return {k: v for k, v in settings.items() if k not in SETTINGS_ONLY_KEYS}
 
 
+# ------------------------------------------------ per-request memoisation
+#
+# `app_db.user()` is read by the must-change gate on every /api/* request,
+# `app_db.permissions_for()` by the dispatch gate whenever a route has a
+# requirement, and then AGAIN by the handler itself on most gated routes.
+# Two to four queries per request, each under app.db's single write lock,
+# for two answers that cannot change while the request is in flight.
+#
+# The scope is one request and nothing longer. functools.lru_cache — or any
+# other process-lifetime memo — is deliberately NOT used here: a permission
+# revoked or a password reset while a tab is open has to be refused on the
+# very next request, which is the guarantee the dispatch gate documents,
+# and a process-lifetime cache would keep the revoked grant working. Within
+# a single request the value genuinely cannot move: no route revokes its
+# own caller's grants (post_user_permissions refuses a self-edit outright)
+# and post_password reads the row it is about to overwrite, not after.
+
+
+def _request_cache(params) -> dict | None:
+    """The scratch dict `server.Handler._dispatch` resets for each request.
+
+    None when a handler runs outside the HTTP server — a test calling it
+    directly, a script — and every helper below then simply reads through
+    to app.db, which is exactly the behaviour this memo replaces.
+    """
+    cache = params.get("_cache")
+    return cache if isinstance(cache, dict) else None
+
+
+def request_permissions(service, params, username=None) -> dict:
+    """{module: level} for the account this request runs as.
+
+    Keyed on the username, so a route that also inspects some OTHER account
+    — the user grid, a grant edit — can never be handed this request's
+    answer for it. Returns a copy: the memo outlives the call and
+    get_config puts what it returns straight into a response body.
+    """
+    if username is None:
+        username = params.get("_username", "")
+    username = str(username or "")
+    cache = _request_cache(params)
+    if cache is None:
+        return service.app_db.permissions_for(username)
+    # NOCASE in the table, so the key is folded the same way.
+    key = ("permissions", username.lower())
+    if key not in cache:
+        cache[key] = service.app_db.permissions_for(username)
+    return dict(cache[key])
+
+
+def request_user(service, params, username=None):
+    """The `users` row for the account this request runs as, or None.
+
+    Same per-request scope, same keying and the same reason for both as
+    request_permissions. `not in` rather than a truthiness test, because a
+    username with no account caches a perfectly good None.
+    """
+    if username is None:
+        username = params.get("_username", "")
+    username = str(username or "")
+    cache = _request_cache(params)
+    if cache is None:
+        return service.app_db.user(username)
+    key = ("user", username.lower())
+    if key not in cache:
+        cache[key] = service.app_db.user(username)
+    # sqlite3.Row is read-only, so this one needs no defensive copy.
+    return cache[key]
+
+
 def _drop_unreadable(result: dict, granted: dict, module_keys: dict) -> None:
     for module, keys in module_keys.items():
         if not _permissions.allows(granted.get(module), _permissions.READ):
@@ -378,7 +448,7 @@ def get_config(service, params, body) -> dict:
     from .. import __version__
     from ..selfupdate import (INSTALLED_AT_KEY, INSTALLED_COMMIT_KEY,
                               INSTALLED_TAG_KEY, updates_enabled)
-    granted = service.app_db.permissions_for(params.get("_username", ""))
+    granted = request_permissions(service, params)
     result = {
         "config_version": service.config_version,
         "version": __version__,
@@ -422,6 +492,46 @@ def get_config(service, params, body) -> dict:
     return result
 
 
+# What app.js's state tick uses, so N tabs in one window cost one compute
+# instead of N. Deliberately not longer: a single tab must lose no
+# freshness at all, and at this TTL its own next poll always misses.
+STATE_COUNTS_TTL_S = 2.0
+
+
+def _state_counts(service) -> dict:
+    """The fleet-wide tallies behind /api/state's tab badges: seven queries
+    across four stores, each one taking that store's single write lock.
+
+    Split out so the whole set is one `cached_poll` entry rather than seven
+    unconditional round trips per tab per tick. Every value here is a
+    COUNT(*) over the whole fleet — nothing in it can be usefully fresher
+    than the poll cadence itself.
+
+    Returns plain scalars and flat dicts of scalars only, which is what
+    makes the caller's shallow copy of the two nested dicts a full one.
+    """
+    # One lookup, not two: open_worst and unresolved_count below both read
+    # off this same summary rather than each running their own query.
+    summary = service.alerts_db.open_summary()
+    return {
+        "open_conflicts": service.ipam_db.conflict_count(),
+        "device_count": service.nodes_db.device_count(),
+        "device_counts": service.nodes_db.device_counts(),
+        "open_count": service.alerts_db.open_count(),
+        # The badge on the tab is coloured by this. A count alone said
+        # "there are alerts" in the same amber whether the worst of them
+        # was a notice or a device being down.
+        "open_worst": summary["worst"],
+        # open_count above is state='open' only, but the Alerts list's own
+        # default State filter is "unresolved" — state IN ('open', 'acked')
+        # — so a tab badge built from open_count alone starts undercounting
+        # the moment anyone acknowledges anything.
+        "unresolved_count": summary["open"] + summary["acked"],
+        "ap_counts": service.wireless_db.ap_counts(),
+        "controller_count": service.wireless_db.controller_count(),
+    }
+
+
 def get_state(service, params, body) -> dict:
     """What changes on its own: every worker's running flag, status line
     and counters, the counts the tab badges show, the session clocks. Polled
@@ -437,12 +547,26 @@ def get_state(service, params, body) -> dict:
     # lie.
     max_remaining = (service.sessions.max_seconds - (time.time() - session["created"])
                      if session else None)
-    granted = service.app_db.permissions_for(params.get("_username", ""))
-    account = service.app_db.user(session["username"]) if session else None
+    granted = request_permissions(service, params)
+    # session["username"] is what _route put in params["_username"], so
+    # this is the same row the must-change gate already read.
+    account = request_user(service, params, session["username"]) if session else None
     names = service.cached_poll("hostname_stats", 10, service.hostname_stats)
-    # One lookup, not two: open_worst and unresolved_count below both read
-    # off this same summary rather than each running their own query.
-    alert_summary = service.alerts_db.open_summary()
+    # Every fleet-wide count below in one cached compute, shared by every
+    # tab polling in the same window.
+    #
+    # `cached_poll` hands the SAME object back to every caller inside the
+    # TTL, and `_drop_unreadable` at the end of this function MUTATES what
+    # it is given. That is safe here for one reason: it pops TOP-LEVEL keys
+    # off `result`, and `result` is a fresh dict literal on every request,
+    # so the cached object is never the thing passed to it. The two nested
+    # dicts are copied out below all the same, so that no shared structure
+    # reaches a response at all and a later pop one level down could not
+    # turn one account's redaction into everybody's.
+    # tests/test_state_cache.py polls this route as two accounts with
+    # different grants and asserts neither ever sees the other's.
+    counts = service.cached_poll("state_counts", STATE_COUNTS_TTL_S,
+                                 lambda: _state_counts(service))
     result = {
         "config_version": service.config_version,
         "session": {
@@ -487,36 +611,29 @@ def get_state(service, params, body) -> dict:
         "ipam": {
             "running": service.ipam.running,
             **service.ipam.state(),
-            "open_conflicts": service.ipam_db.conflict_count(),
+            "open_conflicts": counts["open_conflicts"],
         },
         "nodes": {
             "running": service.node_poller.running,
             "status": service.node_poller.status_text(),
             "counters": service.node_poller.counters,
-            "device_count": service.nodes_db.device_count(),
-            "device_counts": service.nodes_db.device_counts(),
+            "device_count": counts["device_count"],
+            "device_counts": dict(counts["device_counts"]),
         },
         "alerts": {
             "running": service.alert_engine.running,
             "status": service.alert_engine.status_text(),
             "counters": service.alert_engine.counters,
-            "open_count": service.alerts_db.open_count(),
-            # The badge on the tab is coloured by this. A count alone
-            # said "there are alerts" in the same amber whether the
-            # worst of them was a notice or a device being down.
-            "open_worst": alert_summary["worst"],
-            # open_count above is state='open' only, but the Alerts list's
-            # own default State filter is "unresolved" — state IN ('open',
-            # 'acked') — so a tab badge built from open_count alone starts
-            # undercounting the moment anyone acknowledges anything.
-            "unresolved_count": alert_summary["open"] + alert_summary["acked"],
+            "open_count": counts["open_count"],
+            "open_worst": counts["open_worst"],
+            "unresolved_count": counts["unresolved_count"],
         },
         "wireless": {
             "running": service.wireless.running,
             "status": service.wireless.status_text(),
             "counters": service.wireless.counters,
-            "ap_counts": service.wireless_db.ap_counts(),
-            "controller_count": service.wireless_db.controller_count(),
+            "ap_counts": dict(counts["ap_counts"]),
+            "controller_count": counts["controller_count"],
         },
         "configrx": {
             "running": service.configrx.running,
@@ -1348,7 +1465,7 @@ def get_debug(service, params, body) -> dict:
     # addresses, DHCP server labels, ConfigRX failure detail, sign-in
     # history — so `debug: read` alone must not read all of it. Each
     # category is filtered by the module it belongs to.
-    granted = service.app_db.permissions_for(params.get("_username", ""))
+    granted = request_permissions(service, params)
     visible = {category for category, module in _EVENT_CATEGORY_MODULE.items()
                if _permissions.allows(granted.get(module), _permissions.READ)}
     events = [
@@ -1553,7 +1670,7 @@ ADMIN_ONLY_SETTINGS = ("updates_enabled", "ldap_enabled", "ldap_url",
 
 
 def _is_admin(service, params) -> bool:
-    granted = service.app_db.permissions_for(params.get("_username", ""))
+    granted = request_permissions(service, params)
     return _permissions.allows(granted.get("admin"), _permissions.WRITE)
 
 
@@ -1782,7 +1899,7 @@ def post_settings(service, params, body) -> dict:
     values = body.get("values") or {}
     if not isinstance(values, dict):
         raise ValueError("values must be an object")
-    granted = service.app_db.permissions_for(params.get("_username", ""))
+    granted = request_permissions(service, params)
     # Only the keys this scope would actually write. A per-module scope
     # discards anything outside its own defaults below, so a netpath-scope
     # POST carrying web_cert never sets web_cert — and refusing the whole
@@ -2746,7 +2863,7 @@ def _community_fields(row, reveal: bool) -> dict:
 
 
 def _may_read_secrets(service, params, module: str) -> bool:
-    granted = service.app_db.permissions_for(params.get("_username", ""))
+    granted = request_permissions(service, params)
     return _permissions.allows(granted.get(module), _permissions.WRITE)
 
 
@@ -2963,7 +3080,25 @@ def _device_index(service) -> dict:
     """One pass over the fleet, built once per discovery listing, that
     every result row is tested against. `by_address` covers a device's
     primary IP plus every learned alias; `by_identity` is a hint only, not
-    an answer — two switches from the same carton share it honestly."""
+    an answer — two switches from the same carton share it honestly.
+
+    Deliberately NOT memoised against `nodes_db.config_generation()`, which
+    is the obvious thing to reach for and is wrong here. That counter moves
+    for writes a PERSON made — add, edit, promote, merge, delete — and
+    deliberately does not move for what the poller and the discovery sweep
+    learn on their own: `record_device_addresses` and `seed_identity` both
+    leave it alone, by design, because they are observations rather than
+    settings. Those two are precisely what `by_address` and `by_identity`
+    are built from, so a cache keyed on the generation serves a listing
+    that cannot see the alias or the hostname just learned — which is a
+    duplicate flagged as new, and a device added twice.
+    tests/test_device_identity.py's "sysName plus sysObjectID alone is only
+    a medium hint" is that failure, and it fails within milliseconds of the
+    write, so no TTL short enough to be safe would ever hit.
+
+    Caching this wants a generation counter that observations bump too,
+    which belongs in nodesdb rather than here.
+    """
     devices = service.nodes_db.devices()
     by_id = {row["id"]: row for row in devices}
     by_address = {row["ip"]: row for row in devices}
@@ -4220,16 +4355,52 @@ def get_nodes_device_mac_table(service, params, body, device_id, if_index) -> di
     return {"macs": macs, "supported": macs is not None}
 
 
+# Bumped by every handler below that edits the MIB corpus in a way
+# mib_generation() cannot see — an in-place rename moves neither the
+# highest object id nor either count. A plain module counter is enough:
+# it only has to be comparable within one process, exactly as
+# nodesdb.config_generation() argues for itself.
+_OID_NAMES_EPOCH = 0
+
+
+def _invalidate_oid_names() -> None:
+    """Call after editing a MIB object in place; see _oid_name_table."""
+    global _OID_NAMES_EPOCH
+    _OID_NAMES_EPOCH += 1
+
+
 def _oid_name_table(service) -> dict:
     """OID -> name, from every uploaded MIB plus the built-in well-known
     table the Trap page already decodes with. One table, so uploading a MIB
-    improves the OID browser the same moment it improves trap decoding."""
+    improves the OID browser the same moment it improves trap decoding.
+
+    Rebuilt only when the MIB corpus has actually moved. This inverts every
+    object of every installed MIB, and the shipped catalog's PowerNet-MIB
+    is ~2.7 MiB on its own — a cost the OID browser and the trap decoder
+    were each paying per request. `nodes_db.mib_generation()` is one
+    indexed query (highest object id, object count, file count) and is the
+    same signal nodepoll already keeps its own MIB index against; the local
+    epoch covers the one edit that tuple cannot see, a rename through
+    PUT .../mibs/<file>/objects/<id>. A catalog install lands on a
+    background thread and changes the counts, so it needs no bump of its
+    own.
+
+    Held on the Service rather than in a module global, so two Services in
+    one process — which is every test run — cannot be served each other's
+    MIBs.
+    """
+    key = (service.nodes_db.mib_generation(), _OID_NAMES_EPOCH)
+    cached = getattr(service, "_api_oid_names", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
     names = dict(trapdecode.WELL_KNOWN)
     # all_known_oids() is name -> OID (it feeds mibparse.resolve's `known`
     # dict); the browser needs the inverse.
     for name, oid in service.nodes_db.all_known_oids().items():
         if oid:
             names[oid] = name
+    # Read-only to every caller (_decode_oid only ever looks things up).
+    service._api_oid_names = (key, names)
     return names
 
 
@@ -5471,6 +5642,9 @@ def put_nodes_mib_object(service, params, body, mib_file_id, obj_id) -> dict:
         raise ValueError("No such MIB object")
     fields = _pick(body, ("name", "oid", "description", "syntax", "enums"))
     service.nodes_db.update_mib_object(obj_id, **fields)
+    # A rename or a re-pointed OID changes what the table says without
+    # changing any of the three numbers mib_generation() counts.
+    _invalidate_oid_names()
     service._snmp_settings_with_mibs()
     return {"ok": True}
 
@@ -8185,7 +8359,7 @@ def post_heartbeat(service, params, body) -> dict:
     kiosk = bool(isinstance(body, dict) and body.get("kiosk"))
     minutes = service.sessions.idle_seconds // 60
     if kiosk:
-        granted = service.app_db.permissions_for(params.get("_username", ""))
+        granted = request_permissions(service, params)
         if any(_permissions.allows(level, _permissions.WRITE) for level in granted.values()):
             return {"ok": False, "kiosk": False, "idle_timeout_minutes": minutes,
                     "reason": "Kiosk mode keeps only a read-only account signed in; "
@@ -8680,7 +8854,7 @@ DASHBOARD_OFFENDER_N = 10
 
 
 def _dash_can(service, params, module: str) -> bool:
-    granted = service.app_db.permissions_for(params.get("_username", ""))
+    granted = request_permissions(service, params)
     return _permissions.allows(granted.get(module), _permissions.READ)
 
 
