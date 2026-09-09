@@ -2582,7 +2582,11 @@ class NodesDatabase(SqliteStore):
         turns one keystroke into thousands of queries for a count used only
         to choose between two sentences. COALESCE mirrors that function's
         own merge exactly — the device's own value, then its profile's,
-        then 0.
+        then the 3600 _merge_config falls back to for NULL. The fallback
+        used to be 0 here, from before the shipped default changed, so
+        every device walking by inherited default was left out and the
+        "N devices are learning MAC addresses" sentence under-reported on
+        exactly the installs that had never touched the setting.
         """
         with self._lock:
             row = self._conn.execute(
@@ -2590,7 +2594,7 @@ class NodesDatabase(SqliteStore):
                 " LEFT JOIN groups g ON g.id = d.group_id"
                 " WHERE d.enabled = 1"
                 "   AND COALESCE(d.mac_table_interval_s,"
-                "                g.mac_table_interval_s, 0) > 0").fetchone()
+                "                g.mac_table_interval_s, 3600) > 0").fetchone()
         return row["n"] if row else 0
 
     def mac_locations(self, mac_prefix: str, limit: int = 200) -> list[sqlite3.Row]:

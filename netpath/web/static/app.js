@@ -2151,17 +2151,51 @@ const App = (() => {
     // lookup on its own; a plain name never is, so this never fires one
     // for every keystroke of an ordinary search.
     const hexOnly = q.replace(/[^0-9a-fA-F]/g, '');
+    // An address prefix — dotted decimal or colon-hex — is worth an ARP
+    // lookup on its own even when it is not hex enough to be a MAC
+    // ("10.20.3" is three hex digits and an obvious address). Same carve-out
+    // as nodesdb.arp_locations, which makes the final call.
+    const addressish = /^[0-9a-fA-F.:]+$/.test(q) && /[.:]/.test(q);
 
     if (hexOnly.length >= 4 && canRead('nodes')) {
       try {
         const mac = await get('/api/nodes/mac-search', { q });
         if (mac.locations && mac.locations.length) {
-          groups.push({ title: 'MAC address / interface', hits: mac.locations.slice(0, 8).map((loc) => ({
+          // The forwarding-table hit: this MAC was learned on this switch
+          // PORT, which is the physical answer "where is it plugged in".
+          // VLAN, whether the last walk still saw it and when it was last
+          // seen ride along in the meta, so the answer reads without
+          // opening the port. The route is the port dialog because this
+          // one really is a port; the ARP group below deliberately is not.
+          groups.push({ title: 'MAC address on a switch port', hits: mac.locations.slice(0, 8).map((loc) => ({
             name: loc.mac,
-            meta: `last seen on ${loc.device_name} · ${loc.if_descr}` +
-              (loc.vlan ? ` (VLAN ${loc.vlan})` : '') +
-              (loc.seen_ts ? ` at ${when(loc.seen_ts)} (${ago(loc.seen_ts)})` : ''),
+            meta: [`${loc.device_name} · ${loc.if_descr}`,
+                   loc.vlan ? `VLAN ${loc.vlan}` : '',
+                   loc.present ? 'present' : 'aged out',
+                   loc.seen_ts ? `last seen ${when(loc.seen_ts)} (${ago(loc.seen_ts)})` : '']
+              .filter(Boolean).join(' · '),
             route: `#/nodes/device/${loc.device_id}/port/${loc.if_index}`,
+          })) });
+        }
+      } catch (error) { /* this group's own failure, not every group after it */ }
+    }
+    if ((hexOnly.length >= 4 || addressish) && canRead('nodes')) {
+      try {
+        const arp = await get('/api/nodes/arp-search', { q });
+        if (arp.locations && arp.locations.length) {
+          // The ARP-cache hit: which IP this MAC holds, or which MAC this IP
+          // resolves to, on which router. Routed to the device's ARP pane
+          // and NOT to /port/<if_index>: an ARP row's ifIndex is a routed
+          // VLAN or SVI, not the physical port the operator is looking for
+          // — the group above answers that, once they have the MAC.
+          groups.push({ title: 'ARP cache (IP to MAC)', hits: arp.locations.slice(0, 8).map((loc) => ({
+            name: `${loc.ip} \u2194 ${loc.mac}`,
+            meta: [`${loc.device_name} · ${loc.if_descr}`,
+                   loc.entry_type || '',
+                   loc.present ? 'present' : 'aged out',
+                   loc.seen_ts ? `last seen ${when(loc.seen_ts)} (${ago(loc.seen_ts)})` : '']
+              .filter(Boolean).join(' · '),
+            route: `#/nodes/device/${loc.device_id}/arp`,
           })) });
         }
       } catch (error) { /* this group's own failure, not every group after it */ }
@@ -2206,12 +2240,15 @@ const App = (() => {
       } catch (error) { /* this group's own failure, not every group after it */ }
     }
     if (canRead('ipam')) {
-      // Two calls, two groups, two independent failures: hosts (the
+      // Three calls, three groups, three independent failures: hosts (the
       // product's own /api/ipam/search — everything IPAM's sweep, DHCP and
-      // reverse DNS know about an address) and subnets, which that
-      // endpoint does not cover at all. Subnets are few enough per site
-      // that filtering the same list ipam.js already polls, client-side,
-      // is the netpath-targets pattern above rather than a new endpoint.
+      // reverse DNS know about an address), subnets, which that endpoint
+      // does not cover at all, and DHCP leases as leases — the search
+      // endpoint folds a lease into a per-address host and drops the
+      // scope, server, expiry and reservation flag that make a lease hit
+      // worth reading. Subnets are few enough per site that filtering the
+      // same list ipam.js already polls, client-side, is the netpath-targets
+      // pattern above rather than a new endpoint.
       try {
         const found = await get('/api/ipam/search', { q });
         if (found.results && found.results.length) {
@@ -2233,6 +2270,23 @@ const App = (() => {
           groups.push({ title: 'IPAM subnets', hits: hits.map((s) => ({
             name: s.label || s.cidr,
             meta: s.label && s.label !== s.cidr ? s.cidr : '',
+            route: '#/ipam',
+          })) });
+        }
+      } catch (error) { /* this group's own failure, not every group after it */ }
+      try {
+        const found = await get('/api/ipam/dhcp/lease-search', { q });
+        if (found.leases && found.leases.length) {
+          groups.push({ title: 'DHCP leases', hits: found.leases.slice(0, 8).map((l) => ({
+            name: l.hostname || l.ip,
+            meta: [l.ip, l.mac,
+                   l.scope_id ? `scope ${l.scope_id}` : '',
+                   l.server_label || '',
+                   l.is_reservation ? 'reservation' : (l.address_state || '')]
+              .filter(Boolean).join(' · '),
+            // IPAM registers no activate() of its own, so there is no
+            // per-lease page to land on — the tab is the honest destination,
+            // as for hosts above.
             route: '#/ipam',
           })) });
         }
@@ -2277,7 +2331,8 @@ const App = (() => {
     gsearchActive = -1;
     if (!groups.length) {
       results.innerHTML = '<p class="gsearch-empty">Type to search devices, interfaces, '
-        + 'MACs, alerts, NetPath destinations, IPAM, syslog and wireless.</p>';
+        + 'MACs on switch ports, ARP caches, alerts, NetPath destinations, IPAM hosts, '
+        + 'DHCP leases, syslog and wireless.</p>';
       return;
     }
     results.innerHTML = groups.map((group) => `<div class="gsearch-group">

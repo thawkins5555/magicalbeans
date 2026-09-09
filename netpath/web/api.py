@@ -2484,6 +2484,34 @@ def get_ipam_search(service, params, body) -> dict:
     return {"results": service.ipam_search(query)}
 
 
+def get_ipam_dhcp_lease_search(service, params, body) -> dict:
+    """DHCP leases and reservations matching a needle — IP, hostname,
+    description, or a MAC in any spelling — as LEASE rows, for the global
+    search's own DHCP group.
+
+    /api/ipam/search cannot serve this: service.ipam_search merges every
+    source into one record per address, and in folding a lease into a host
+    it keeps the hostname and MAC and drops exactly the fields that make a
+    lease hit worth reading — which scope, which server, when it expires
+    and whether it was reserved. Two servers each holding a lease for one
+    card (a laptop that moved sites) are one host there and two leases
+    here, which is the difference the operator asked about.
+
+    The same two-character floor get_ipam_search applies: a one-character
+    LIKE matches most of the table and answers nothing."""
+    query = (params.get("q") or "").strip()
+    if len(query) < 2:
+        return {"leases": []}
+    return {"leases": [
+        {"id": r["id"], "server_id": r["server_id"], "server_label": r["server_label"],
+         "scope_id": r["scope_id"], "ip": r["ip"], "mac": r["mac"],
+         "hostname": r["hostname"], "address_state": r["address_state"],
+         "lease_expires": r["lease_expires_ts"],
+         "is_reservation": bool(r["is_reservation"]),
+         "description": r["description"], "polled": r["polled_ts"]}
+        for r in service.ipam_db.search_dhcp(query, limit=20)]}
+
+
 def _subnet_json(row) -> dict:
     return {"id": row["id"], "cidr": row["cidr"], "label": row["label"],
             "vlan": row["vlan"], "enabled": bool(row["enabled"]),
@@ -2896,6 +2924,10 @@ def _device_json(row, reveal: bool = False) -> dict:
         # keyed the same way lldp_interval_s immediately above is -- added in
         # the same migration, read the same way for a row from before it ran.
         "vlan_interval_s": (row["vlan_interval_s"] if "vlan_interval_s" in row.keys() else None),
+        # ARP-cache walk interval: the same inherit-via-NULL override as the
+        # three above, defensively keyed for the same reason, and the one
+        # whose _merge_config fallback is 0 rather than an hour (see there).
+        "arp_table_interval_s": (row["arp_table_interval_s"] if "arp_table_interval_s" in row.keys() else None),
         "poe_enabled": (_tri(row["poe_enabled"]) if "poe_enabled" in row.keys() else None),
         "stp_enabled": (_tri(row["stp_enabled"]) if "stp_enabled" in row.keys() else None),
         # The capability probe's verdict — True/False once probed, None
@@ -3037,6 +3069,9 @@ def _group_json(service, row, reveal: bool = False) -> dict:
         # needs it to show what "inherit" actually means, the same reason
         # mac_table_interval_s is already here.
         "vlan_interval_s": (row["vlan_interval_s"] if "vlan_interval_s" in row.keys() else None),
+        # ARP-cache walk interval, for the same "show what inherit means"
+        # reason as vlan_interval_s immediately above.
+        "arp_table_interval_s": (row["arp_table_interval_s"] if "arp_table_interval_s" in row.keys() else None),
         "vendor_oid": row["vendor_oid"] or "",
         "location_oid": row["location_oid"] or "",
         "is_default": bool(row["is_default"]),
@@ -3215,7 +3250,8 @@ _DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id",
                          "snmp_enabled", "oid_set", "mib_file_id",
                          "ping_count", "ping_timeout_ms", "unreachable_ping_only",
                          "vendor_oid", "location_oid", "mac_table_interval_s",
-                         "vlan_interval_s", "vendor_override", "upstream_id",
+                         "vlan_interval_s", "arp_table_interval_s",
+                         "vendor_override", "upstream_id",
                          # Per-device, never inherited (nodesdb._DEVICE_ONLY_COLUMNS)
                          # — absent from _GROUP_EDITABLE_BODY below on purpose.
                          "web_scheme", "web_port")
@@ -3224,7 +3260,8 @@ _GROUP_EDITABLE_BODY = ("name", "snmp_version", "community", "v3_user",
                         "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
                         "mib_file_id", "ping_count", "ping_timeout_ms",
                         "unreachable_ping_only", "vendor_oid", "location_oid",
-                        "mac_table_interval_s", "vlan_interval_s")
+                        "mac_table_interval_s", "vlan_interval_s",
+                        "arp_table_interval_s")
 
 
 def get_nodes_overview(service, params, body) -> dict:
@@ -3421,6 +3458,87 @@ def get_nodes_mac_search(service, params, body) -> dict:
             "enabled_devices": service.nodes_db.mac_walk_enabled_count(),
             "retention_days": float(
                 service.nodes_settings.get("mac_table_retention_days", 7))}
+
+
+def get_nodes_arp_search(service, params, body) -> dict:
+    """Where an IP or a MAC appears in the stored ARP caches — the other
+    half of the MAC search above. The forwarding table says which PORT a
+    MAC is on; the ARP cache says which IP that MAC holds (or which MAC
+    an IP resolves to), on which routed interface of which router. An
+    operator with only an address in hand joins the two here: ARP gives
+    the MAC, then the MAC search gives the port.
+
+    The needle is whatever was typed; nodesdb.arp_locations decides
+    whether it is a MAC prefix, an address prefix or both (a colon-hex
+    prefix is either), and answers [] for anything it refuses, so this
+    never has to second-guess it. Every (device, interface) hit comes
+    back rather than one picked here, for the reason the MAC search gives.
+    """
+    needle = (params.get("q") or "").strip()
+    locations = []
+    for row in service.nodes_db.arp_locations(needle):
+        device = service.nodes_db.device(row["device_id"])
+        if device is None:
+            continue
+        locations.append({
+            "device_id": row["device_id"],
+            "device_name": namelookup.device_name(device),
+            "if_index": row["if_index"],
+            "if_descr": row["if_descr"] or f"Interface {row['if_index']}",
+            "ip": row["ip"], "mac": row["mac"],
+            "entry_type": row["entry_type"],
+            "seen_ts": row["seen_ts"], "first_seen_ts": row["first_seen_ts"],
+            "present": bool(row["present"]),
+        })
+    # How many devices walk their ARP cache at all — off is the shipped
+    # default here, so "not found" and "nobody is collecting this" are
+    # different sentences far more often than for the MAC table. One
+    # query, for the reason mac_walk_enabled_count gives.
+    return {"needle": needle, "locations": locations,
+            "enabled_devices": service.nodes_db.arp_walk_enabled_count(),
+            "retention_days": float(
+                service.nodes_settings.get("mac_table_retention_days", 7))}
+
+
+def _arp_json(row, local_port: str = "") -> dict:
+    return {
+        "device_id": row["device_id"], "if_index": row["if_index"],
+        "local_port": local_port,
+        "ip": row["ip"], "mac": row["mac"], "entry_type": row["entry_type"],
+        "seen_ts": row["seen_ts"], "first_seen_ts": row["first_seen_ts"],
+        "present": bool(row["present"]),
+    }
+
+
+def get_nodes_device_arp(service, params, body, device_id) -> dict:
+    """One device's whole stored ARP cache, present and stale alike, for
+    the detail pane's ARP subtab — the neighbours read's shape, with the
+    same local-port labeller so a row names "Vlan10" rather than "if 7".
+
+    `enabled` and `interval_s` say whether this device walks its cache at
+    all, resolved through effective_config: the browser holds the device's
+    own override and its profile's value separately and cannot tell "blank
+    here, 900 on the profile" from "blank everywhere", so an empty table
+    would read the same whether the walk is off or simply has not run
+    yet. The server knows; it says."""
+    row = _require(service.nodes_db.device(device_id), "device")
+    interval = int(service.nodes_db.effective_config(row).get("arp_table_interval_s") or 0)
+    label = _neighbor_local_port_labeler(service)
+    return {"entries": [_arp_json(r, label(device_id, r["if_index"]))
+                        for r in service.nodes_db.arp_entries_for(device_id)],
+            "enabled": interval > 0, "interval_s": interval}
+
+
+def get_nodes_device_arp_export(service, params, body, device_id) -> dict:
+    """One device's ARP table, exported — bounded by that one cache, the
+    same way the neighbours export beside it is bounded by port count.
+    A core router's cache runs to tens of thousands of rows, which is
+    still one device's table and well inside what a CSV download is for."""
+    entries = get_nodes_device_arp(service, params, body, device_id)["entries"]
+    header = ["if_index", "local_port", "ip", "mac", "entry_type", "present",
+              "seen_ts", "first_seen_ts"]
+    csv_rows = [[e.get(key) for key in header] for e in entries]
+    return _csv_response("arp-table", header, csv_rows)
 
 
 def _neighbor_local_port_labeler(service, prefetch_ids=None):
@@ -4123,7 +4241,7 @@ _BULK_IMPORT_ALIASES = {
 # through as text exactly as typed, on both the CSV and JSON paths.
 _BULK_IMPORT_INT_FIELDS = ("snmp_version", "poll_interval_s", "snmp_timeout_s",
                           "snmp_retries", "ping_count", "ping_timeout_ms",
-                          "mac_table_interval_s")
+                          "mac_table_interval_s", "arp_table_interval_s")
 _BULK_IMPORT_BOOL_FIELDS = ("ping_enabled", "snmp_enabled", "unreachable_ping_only")
 
 

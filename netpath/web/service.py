@@ -1476,6 +1476,15 @@ class Service:
         # sending someone to a port the address left months ago.
         self.nodes_db.prune_mac_entries(
             float(self.nodes_settings.get("mac_table_retention_days", 7)) * 86400)
+        # ARP rows on the same clock. The question is the identical one the
+        # MAC table asks — "nothing has walked this device for the retention
+        # window" — so a seventh knob for it would be one more setting an
+        # operator has to know exists, answering nothing the sixth does not.
+        # Until this line ran, arp_entries only grew: replace_arp_entries
+        # marks an expired row present=0 and keeps it, on the promise that
+        # this sweep would eventually let go of it.
+        self.nodes_db.prune_arp_entries(
+            float(self.nodes_settings.get("mac_table_retention_days", 7)) * 86400)
         # LLDP/CDP neighbour rows nothing has refreshed in as long — the
         # same present=0-then-age-out shape mac_entries uses, so the same
         # retention setting governs both rather than adding a second knob for

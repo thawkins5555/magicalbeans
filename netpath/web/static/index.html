@@ -220,6 +220,7 @@
             <nav class="subtabs nested">
               <button class="subtab active" data-subtab="interfaces">INTERFACES</button>
               <button class="subtab" data-subtab="neighbours">NEIGHBOURS</button>
+              <button class="subtab" data-subtab="arp">ARP</button>
               <button class="subtab" data-subtab="addresses">ADDRESSES</button>
               <button class="subtab" data-subtab="capabilities">BRIDGE &amp; RF</button>
               <button class="subtab" data-subtab="events">EVENTS</button>
@@ -236,6 +237,19 @@
               <div class="bar"><span class="grow"></span>
                 <button id="nd-nb-export-csv">Export CSV</button></div>
               <div class="table-wrap"><table id="nd-nb-table"></table></div>
+            </div>
+            <!-- This device's stored ARP cache: which IP holds which MAC on
+                 which routed interface. A device-level table, not a
+                 per-port one like the MAC table in the interface dialog,
+                 because an ARP row's ifIndex is a VLAN or SVI, not a
+                 physical port. Off by default (arp_table_interval_s), so
+                 the note above the table says which of "off", "empty" and
+                 "not walked yet" an empty pane means. -->
+            <div id="nd-d-sub-arp" class="subpage">
+              <div class="bar"><span class="grow"></span>
+                <button id="nd-arp-export-csv">Export CSV</button></div>
+              <div id="nd-arp-note" hidden></div>
+              <div class="table-wrap"><table id="nd-arp-table"></table></div>
             </div>
             <!-- Every L3 address this device answers on: its configured
                  one, plus whatever its ipAddrTable reported. What makes a

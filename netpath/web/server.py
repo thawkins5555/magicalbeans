@@ -278,8 +278,15 @@ ROUTES = [
     ("GET", r"^/api/ipam/dhcp/leases/export\.csv$",
      api.get_ipam_dhcp_leases_export, ("ipam", R)),
     ("GET", r"^/api/ipam/dhcp/scope-history$", api.get_ipam_dhcp_scope_history, ("ipam", R)),
+    # Lease rows for the global search's DHCP group — /api/ipam/search
+    # folds a lease into a per-address host and loses the scope, server
+    # and expiry that make it worth showing (see the handler).
+    ("GET", r"^/api/ipam/dhcp/lease-search$", api.get_ipam_dhcp_lease_search, ("ipam", R)),
     ("GET", r"^/api/nodes/overview$", api.get_nodes_overview, ("nodes", R)),
     ("GET", r"^/api/nodes/mac-search$", api.get_nodes_mac_search, ("nodes", R)),
+    # The ARP-cache half of the same search: which IP a MAC holds, or which
+    # MAC an IP resolves to, on which router.
+    ("GET", r"^/api/nodes/arp-search$", api.get_nodes_arp_search, ("nodes", R)),
     ("GET", r"^/api/nodes/devices$", api.get_nodes_devices, ("nodes", R)),
     # Same filters as the list above, exported as CSV: matched before the
     # `(\d+)$` device route below on purpose, though \d+ would never match
@@ -329,6 +336,11 @@ ROUTES = [
     ("GET", r"^/api/nodes/devices/(\d+)/neighbors$", api.get_nodes_device_neighbors, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/neighbors/export\.csv$",
      api.get_nodes_device_neighbors_export, ("nodes", R)),
+    # The device detail pane's ARP section: one device's stored ARP cache,
+    # present and stale alike, plus whether the walk is on for it at all.
+    ("GET", r"^/api/nodes/devices/(\d+)/arp$", api.get_nodes_device_arp, ("nodes", R)),
+    ("GET", r"^/api/nodes/devices/(\d+)/arp/export\.csv$",
+     api.get_nodes_device_arp_export, ("nodes", R)),
     # The upstream-suggestions review flow: a candidate
     # devices.upstream_id per device, derived from the neighbour match above.
     # Reading the list is a plain "nodes" read; applying a batch needs write.

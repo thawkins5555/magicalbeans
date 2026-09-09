@@ -38,6 +38,14 @@
     // LLDP/CDP neighbours for the selected device's own ports (Tier 1 #5's
     // UI half), fetched by loadDetail while the Neighbours sub-pane is up.
     neighbors: [],
+    // The selected device's stored ARP cache, fetched by loadDetail while
+    // the ARP sub-pane is up. arpEnabled is the server's verdict on whether
+    // the walk is on for this device at all (null until the first fetch):
+    // the browser holds the device's own override and its profile's value
+    // separately and cannot resolve the inheritance, and "off" and "not
+    // collected yet" have to read as different sentences.
+    arp: [],
+    arpEnabled: null,
     // A tunnel outlives the page that opened it, so this is drawn from what
     // the server says is up, not from what this page did.
     webRelays: [],
@@ -658,7 +666,7 @@
 
   /* A route into this tab: #/nodes, #/nodes?status=down, #/nodes?q=<mac>,
      #/nodes?name=<name>, #/nodes?add=<ip>, #/nodes/device/<id>,
-     #/nodes/device/<id>/port/<ifIndex>.
+     #/nodes/device/<id>/port/<ifIndex>, #/nodes/device/<id>/arp.
      Called after refresh() has run, so view.devices is populated and the
      "select the first device if none is selected" rule below has already
      happened — which is exactly why the selection is applied here and not
@@ -711,6 +719,14 @@
       // whichever sub-pane the operator left the page on.
       await openPort(deviceId, Number(parts[3])).catch(() => {});
     }
+    if (parts[2] === 'arp') {
+      // An ARP hit in the global search lands on the device's ARP pane, not
+      // on a port dialog: the row's ifIndex is a routed VLAN or SVI, which
+      // is not the physical port the operator is looking for. Remembered
+      // the way a click on the subtab is, so the choice survives a refresh.
+      App.rememberSub('nodes.detail', 'arp');
+      selectDetailSub('arp');
+    }
   }
 
   /* What each nested sub-pane of the detail needs fetched for it, keyed by
@@ -725,6 +741,9 @@
     neighbours: { path: 'neighbors',
                   store: (r) => { view.neighbors = r.neighbors; },
                   draw: () => drawNeighborsTable() },
+    arp: { path: 'arp',
+           store: (r) => { view.arp = r.entries; view.arpEnabled = r.enabled; },
+           draw: () => drawArpTable() },
     capabilities: { path: 'metrics',
                     store: (r) => { view.metrics = r.metrics; },
                     draw: () => drawCapabilitiesTab() },
@@ -780,6 +799,8 @@
       view.metrics = [];
       view.events = null;
       view.neighbors = [];
+      view.arp = [];
+      view.arpEnabled = null;
     }
     if (sub) sub.store(subPayload);
     // Fetched on selection, not on every refresh tick — an extra round trip
@@ -794,6 +815,7 @@
     await loadStatusTimeline();
     drawIfaceTable();
     drawNeighborsTable();
+    drawArpTable();
     drawAddressesTable();
     drawCapabilitiesTab();
     drawEventTable();
@@ -2903,6 +2925,88 @@
     }
   }
 
+  /* ----------------------------------------------------------------- ARP
+
+     The device detail pane's ARP section: one device's stored ARP cache,
+     from /api/nodes/devices/<id>/arp. The forwarding table (the interface
+     dialog's MAC section) says which PORT a MAC is on; this says which IP
+     that MAC holds, on which routed interface — so the MAC cell is a link
+     into the existing MAC search rather than a copy of it. ARP gives the
+     MAC, the forwarding table gives the port; that join is the whole point.
+
+     Three states, not two, the way the interface dialog tells "answers
+     neither BRIDGE-MIB table" from "learned nothing on this port": the
+     walk is off for this device (the shipped default — name the setting,
+     since the pane is otherwise indistinguishable from a router with an
+     empty cache), on but nothing stored yet, or the table. Present and
+     stale rows both come back and a stale one is marked, as in the
+     neighbours table above. */
+  function drawArpTable() {
+    const table = App.el('nd-arp-table');
+    const note = App.el('nd-arp-note');
+    if (!table || !note) return;
+    const rows = view.arp || [];
+    const wrap = table.parentElement;
+    const say = (html) => {
+      note.hidden = false;
+      note.innerHTML = html;
+      if (wrap) wrap.hidden = true;
+      table.innerHTML = '';
+    };
+    if (view.arpEnabled === false) {
+      say('<p class="hint">The ARP cache is not read for this device — set ' +
+        '<b>Read the ARP cache every</b> on its polling profile, or on the device ' +
+        'itself, to collect it. Off is the default: a router\'s cache is far ' +
+        'larger than one switch\'s forwarding table.</p>');
+      return;
+    }
+    if (!rows.length) {
+      say(view.arpEnabled == null
+        ? '<p class="hint">Reading ARP table…</p>'
+        : App.emptyState('Nothing collected yet — the first walk runs within one ' +
+                         'interval of the setting taking effect.'));
+      return;
+    }
+    note.hidden = true;
+    note.innerHTML = '';
+    if (wrap) wrap.hidden = false;
+    table.innerHTML = '<caption class="sr-only">ARP cache</caption>' +
+      '<thead><tr><th scope="col">IP address</th><th scope="col">MAC address</th>' +
+      '<th scope="col">Interface</th><th scope="col">Type</th>' +
+      `<th scope="col" title="${App.timeZoneTitle()}">Last seen</th></tr></thead>`;
+    const body = document.createElement('tbody');
+    for (const r of rows) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${escape(r.ip)}</td>` +
+        `<td><button class="linkish nd-arp-mac" data-mac="${escape(r.mac)}" ` +
+        'title="Find the switch port this MAC address was learned on">' +
+        `${escape(formatMac(r.mac))}</button></td>` +
+        `<td>${escape(r.local_port || `if ${r.if_index}`)}</td>` +
+        `<td>${escape(r.entry_type || '—')}</td>` +
+        `<td>${App.agoCell(r.seen_ts)}${r.present ? '' : ' <span class="hint">(stale)</span>'}</td>`;
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+    App.wireRowKeyboard(body);
+    for (const button of table.querySelectorAll('.nd-arp-mac')) {
+      // Exactly what typing the MAC into the Find box and pressing Enter
+      // does (App.filterBar's onEnter, then refresh): the box shows what
+      // was searched for, and resolveMacSearch names the ports below it.
+      button.onclick = () => {
+        App.el('nd-q').value = formatMac(button.dataset.mac);
+        view.macSearchPending = true;
+        App.refreshNow('nodes');
+      };
+    }
+    if (App.el('nd-arp-export-csv')) {
+      App.el('nd-arp-export-csv').onclick = () => {
+        if (view.selected != null) {
+          App.exportCsv(`/api/nodes/devices/${view.selected}/arp/export.csv`, {});
+        }
+      };
+    }
+  }
+
   // Every L3 address this device answers on; the configured one is listed
   // first and marked. The rest come from the ipAddrTable walk, a sweep
   // that reached the same box twice, or a merge.
@@ -3151,6 +3255,7 @@
       unreachable_ping_only: pick('unreachable_ping_only'),
       mac_table_interval_s: pick('mac_table_interval_s'),
       vlan_interval_s: pick('vlan_interval_s'),
+      arp_table_interval_s: pick('arp_table_interval_s'),
       mib_file_id: profile.mib_file_id,
       vendor_oid: profile.vendor_oid, location_oid: profile.location_oid,
     };
@@ -3192,6 +3297,7 @@
     opt('#nd-f-pingonly', inheritOption(eff.unreachable_ping_only, yesNo));
     set('#nd-f-mactable', inheritText(eff.mac_table_interval_s, (v) => (Number(v) ? `${v} s` : 'off')));
     set('#nd-f-vlaninterval', inheritText(eff.vlan_interval_s, (v) => (Number(v) ? `${v} s` : 'off')));
+    set('#nd-f-arptable', inheritText(eff.arp_table_interval_s, (v) => (Number(v) ? `${v} s` : 'off')));
     const mib = (view.mibFiles || []).find((f) => f.id === eff.mib_file_id);
     opt('#nd-f-mib', inheritOption(mib ? (mib.module || mib.filename) : (eff.mib_file_id ? eff.mib_file_id : null)));
     set('#nd-f-vendoroid', inheritText(eff.vendor_oid));
@@ -3291,6 +3397,15 @@
           GETBULK walk costs only a few dozen requests per switch, so 300
           (five minutes) is a sensible starting point. 0 switches it off for
           this device whatever the profile says.</p>
+        <label>Read the ARP cache every <input id="nd-f-arptable" type="number"
+          min="0" step="60"
+          value="${d.arp_table_interval_s ?? ''}"> s</label>
+        <p class="hint">Walks this router's ARP cache (which IP holds which MAC,
+          on which routed interface) for the device's ARP tab and the Find box.
+          <b>Off by default</b>, unlike MAC learning: a distribution router's
+          cache is far larger than one access switch's forwarding table, so it
+          is walked only where someone asked. 0 switches it off for this device
+          whatever the profile says.</p>
         <label>Walk VLAN membership every <input id="nd-f-vlaninterval" type="number"
           min="0" step="60"
           value="${d.vlan_interval_s ?? ''}"> s</label>
@@ -3448,6 +3563,7 @@
     overrides.unreachable_ping_only = blankToNull(box.querySelector('#nd-f-pingonly').value);
     overrides.mac_table_interval_s = blankToNull(box.querySelector('#nd-f-mactable').value);
     overrides.vlan_interval_s = blankToNull(box.querySelector('#nd-f-vlaninterval').value);
+    overrides.arp_table_interval_s = blankToNull(box.querySelector('#nd-f-arptable').value);
     // Always sent, like the tri-states: "" is how the operator clears an
     // upstream, and the server accepts "", null and 0 as "none".
     const upstream = box.querySelector('#nd-f-upstream');
@@ -4489,6 +4605,16 @@
         walk uses GETBULK, so it now costs only a few dozen SNMP requests per
         switch rather than hundreds to thousands — <b>300 (five minutes)</b>
         is a sensible starting point.</p>
+      <label>Read the ARP cache every <input id="nd-p-arptable" type="number" min="0"
+        step="60" placeholder="inherit" value="${p.arp_table_interval_s ?? ''}"> s</label>
+      <p class="hint">Walks each router's ARP cache — which IP holds which MAC on
+        which routed interface — for the device's ARP tab and the Find box.
+        <b>Off by default</b>, and blank means off here rather than an hour: a
+        distribution router's cache runs to tens of thousands of rows where
+        an access switch's forwarding table runs to hundreds, so this is
+        switched on per profile for the routers that matter rather than
+        walked everywhere unasked. Entries age out on the same
+        <b>Forget a learned MAC after</b> clock as the MAC table.</p>
       <label>Walk VLAN membership every <input id="nd-p-vlaninterval" type="number" min="0"
         step="60" placeholder="inherit" value="${p.vlan_interval_s ?? ''}"> s</label>
       <p class="hint">Per-port VLAN membership (Q-BRIDGE/CISCO-VTP, falling back to VLANs
@@ -4528,6 +4654,7 @@
       // the shipped behaviour and a real choice, not the same as blank.
       mac_table_interval_s: blankToNull(box.querySelector('#nd-p-mactable').value),
       vlan_interval_s: blankToNull(box.querySelector('#nd-p-vlaninterval').value),
+      arp_table_interval_s: blankToNull(box.querySelector('#nd-p-arptable').value),
       mib_file_id: Number(box.querySelector('#nd-p-mib').value) || null,
       ...identityOidValues(box, true),
     };
@@ -5732,15 +5859,18 @@
           GETNEXT — GETBULK does not exist in that version of the
           protocol.</p>
       </fieldset>
-      <fieldset><legend>MAC ADDRESS TABLES</legend>
+      <fieldset><legend>MAC ADDRESS &amp; ARP TABLES</legend>
         ${number('np-macretention', 'Forget a learned MAC after',
                  s.mac_table_retention_days, 'min=0 step=1')} days
         <p class="hint">Which switches learn MAC addresses at all, and how
-          often, is set per polling profile (<b>Learn MAC addresses every</b>)
-          and is off by default. This is only how long an entry stays
-          searchable once no walk has refreshed it, so a switch dropped from
-          the schedule stops answering the Find box from a table nobody has
-          confirmed since.</p>
+          often, is set per polling profile (<b>Learn MAC addresses every</b>);
+          which routers have their ARP cache read is set the same way
+          (<b>Read the ARP cache every</b>) and is off by default. This is only
+          how long an entry stays searchable once no walk has refreshed it,
+          so a device dropped from the schedule stops answering the Find box
+          from a table nobody has confirmed since. ARP rows age out on this
+          same clock — it is the same "nothing has walked this device"
+          question, not a second one.</p>
       </fieldset>
       <fieldset><legend>FULL SNMP WALK</legend>
         ${number('np-walkrows', 'Stop a full walk after',
