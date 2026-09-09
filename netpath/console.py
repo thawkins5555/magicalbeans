@@ -10,11 +10,13 @@ import ctypes
 import heapq
 import os
 import sys
+import threading
 import time
+import traceback
 import webbrowser
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -27,6 +29,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QTableWidget,
@@ -148,7 +151,85 @@ def _duration(seconds: float) -> str:
     return f"{seconds / 86400:.1f}d"
 
 
+# How long the window waits for the teardown before ending the process
+# anyway. Service.shutdown() is bounded by its own SHUTDOWN_DEADLINE_S plus
+# the database grace, so this is that with room to spare rather than a guess.
+FORCE_QUIT_MS = 20_000
+
+# How long a teardown waits for a self-update already installing. Longer than
+# the shutdown budget on purpose: the install owns the teardown at that point
+# and the process is going to be replaced anyway.
+UPDATE_WAIT_S = 120.0
+
+
+def run_teardown(server, service, on_status, *, wait_for_job=None,
+                 job_wait_s: float = UPDATE_WAIT_S) -> str:
+    """Stop the server and the service. Returns what happened.
+
+    Qt-free and module-level so it can be driven straight from a test: it is
+    the policy, and closeEvent below is only the plumbing that runs it off the
+    GUI thread.
+
+    "update-owns-it" means a self-update is installing and has not finished.
+    Nothing is torn down in that case: the install runs the same stop/shutdown
+    sequence itself from its own thread and then restarts the process, so
+    closing app.db underneath it here would break the install this is trying
+    to get out of the way of.
+    """
+    if wait_for_job is None:
+        from . import selfupdate
+        wait_for_job = selfupdate.wait_for_job
+    if not wait_for_job(0.0):
+        # Only said when there is actually one to wait for.
+        on_status("An update is installing — waiting for it to finish…")
+        if not wait_for_job(job_wait_s):
+            return "update-owns-it"
+    on_status("Stopping the web server…")
+    server.stop()
+    # Strictly after the listener is down, the same order __main__.py uses on
+    # both paths: a request in flight against a closing store is the one thing
+    # this ordering exists to prevent.
+    on_status("Stopping collectors and closing databases…")
+    service.shutdown()
+    return "stopped"
+
+
+class _ShutdownNotice(QWidget):
+    """What replaces the console while the teardown runs. The window itself
+    is already closed by then; without this there is nothing on screen and
+    the process merely looks hung, which is the complaint this whole change
+    is about."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("SappiWhere — shutting down")
+        self.setFixedWidth(420)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+        heading = QLabel("Shutting down…")
+        heading.setObjectName("stat")
+        layout.addWidget(heading)
+        self.detail = QLabel("Stopping collectors and closing databases.")
+        self.detail.setObjectName("hint")
+        self.detail.setWordWrap(True)
+        layout.addWidget(self.detail)
+        bar = QProgressBar()
+        bar.setRange(0, 0)          # indeterminate: there is no honest per-cent
+        bar.setTextVisible(False)
+        layout.addWidget(bar)
+
+    def say(self, message: str) -> None:
+        self.detail.setText(message)
+
+
 class ConsoleWindow(QMainWindow):
+    # Emitted from the teardown thread; Qt delivers a cross-thread signal as
+    # a queued connection, so both handlers run on the GUI thread. Nothing on
+    # that thread may be touched from the teardown thread directly.
+    teardown_status = Signal(str)
+    teardown_done = Signal(str)
+
     def __init__(self, service, server, capture=None):
         super().__init__()
         self.service = service
@@ -156,6 +237,9 @@ class ConsoleWindow(QMainWindow):
         self.capture = capture
         self._clients_seen: tuple = ()
         self._proc_sample: dict = {}
+        self._teardown_started = False
+        self._notice = None
+        self._force_timer = None
 
         from . import __version__
 
@@ -501,9 +585,108 @@ class ConsoleWindow(QMainWindow):
                 self.client_table.setItem(row, column, item)
 
     def closeEvent(self, event) -> None:
+        """Accept the close at once and tear down on a thread of its own.
+
+        This used to run server.stop() and service.shutdown() inline. That is
+        the GUI thread, so for the whole teardown the window was frozen,
+        Windows ghosted it as "Not Responding", and operators ended the task —
+        which aborted the teardown partway through. The work is the same; only
+        the thread it happens on, and the fact that the click is honoured
+        immediately, have changed.
+        """
+        event.accept()
+        if self._teardown_started:
+            return
+        self._teardown_started = True
+
+        # Before anything closes: this fires once a second and reads the
+        # stores the teardown is about to close.
         self.timer.stop()
+        # sys.stdout is process-wide state; swap it back here, on the GUI
+        # thread, rather than from the teardown thread.
         if self.capture:
             self.capture.restore()
-        self.server.stop()
-        self.service.shutdown()
-        super().closeEvent(event)
+
+        self._notice = _ShutdownNotice()
+        self._notice.show()
+        self.teardown_status.connect(self._notice.say)
+        self.teardown_done.connect(self._on_teardown_done)
+
+        self._force_timer = QTimer(self)
+        self._force_timer.setSingleShot(True)
+        self._force_timer.timeout.connect(self._force_quit)
+        self._force_timer.start(FORCE_QUIT_MS)
+
+        threading.Thread(target=self._run_teardown,
+                         name="sappiwhere-console-shutdown",
+                         daemon=True).start()
+
+    def _run_teardown(self) -> None:
+        """The teardown thread. Touches no widget — it reports through the
+        signals only."""
+        outcome = "stopped"
+        try:
+            outcome = run_teardown(self.server, self.service,
+                                   self.teardown_status.emit)
+        except Exception:
+            traceback.print_exc()
+            outcome = "failed"
+        self.teardown_done.emit(outcome)
+
+    def _on_teardown_done(self, outcome: str) -> None:
+        self._force_timer.stop()
+        if outcome == "update-owns-it":
+            # The install is running the same teardown from its own thread and
+            # ends in spawning the replacement process; exiting here would
+            # leave the machine with nothing running. The notice stays up
+            # saying so — closing it would leave an empty desktop for however
+            # long the install takes, which is the impression this whole
+            # change exists to remove — and the timer is re-armed so that an
+            # install which somehow never finishes still ends up closing this
+            # process rather than leaving it forever.
+            if self._notice is not None:
+                self._notice.say("An update is installing. SappiWhere will "
+                                 "restart itself when it finishes.")
+            self._force_timer.start(FORCE_QUIT_MS)
+            return
+        if self._notice is not None:
+            self._notice.close()
+        self._exit()
+
+    def _force_quit(self) -> None:
+        """The teardown overran its budget. End the process rather than leave
+        an operator with nothing on screen and a live PID."""
+        from . import selfupdate
+
+        # Never out from under an install: it is about to spawn the
+        # replacement, and killing this process first leaves nothing running.
+        # A zero wait, because this runs on the GUI thread.
+        if not selfupdate.wait_for_job(0.0):
+            selfupdate._log_restart(
+                "console teardown overran, but an update is still installing; "
+                "waiting for it rather than ending its replacement")
+            self._force_timer.start(FORCE_QUIT_MS)
+            return
+        selfupdate._log_restart(
+            f"console teardown did not finish within "
+            f"{FORCE_QUIT_MS / 1000:.0f}s; ending the process")
+        self._exit()
+
+    @staticmethod
+    def _exit() -> None:
+        """os._exit, not app.quit().
+
+        app.exec() returning drops into interpreter shutdown, and two things
+        there are unbounded: concurrent.futures joins every ThreadPoolExecutor
+        thread with no timeout (they are not daemons, and cancel_futures only
+        drops work that had not started), and the self-updater's own threads
+        are deliberately not daemons either. That is the window-is-gone,
+        process-still-running state that has operators reaching for Task
+        Manager. Every store is closed by the time this runs, so there is
+        nothing left to flush but the streams.
+
+        Both callers have already established that no update is in flight.
+        """
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)

@@ -345,28 +345,76 @@
      App.get, which would redirect to /login on the first 401 rather than
      waiting for the server to actually come back — until it answers, then
      send the browser to sign back in. */
+  /* No deadline, deliberately. This used to give the restart 60 seconds and
+     then report a red failure — but by the time this runs the install is
+     already written to disk, so a slow restart is not a failed update and
+     saying it was is the complaint this whole path exists to answer. The
+     page cannot tell a slow restart from a dead one, so it never claims to:
+     it keeps waiting, says how long it has been, and after a couple of
+     minutes releases the modal so the operator can go and look for
+     themselves. */
   async function waitForRestart() {
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-    const deadline = Date.now() + 60000;
-    while (Date.now() < deadline) {
+    const started = Date.now();
+    const since = () => Math.round((Date.now() - started) / 1000);
+    const reachable = async () => {
       try {
         await fetch('/api/session', { cache: 'no-store' });
-        updateStatus('Back up — signing back in…', 'var(--ok)');
-        restartModalStatus('Back up — signing back in…');
-        App.state.modalLocked = false;
-        setTimeout(() => { window.location.href = '/login'; }, 500);
-        return;
+        return true;
       } catch (error) {
-        // still down — keep polling
+        return false;
       }
-      restartModalStatus('Waiting for the service to come back… '
-        + `(${Math.max(0, Math.round((deadline - Date.now()) / 1000))}s left)`);
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+    };
+
+    /* First wait for the OLD listener to go away. It is still bound through
+       RESTART_GRACE_S, the whole teardown and schedule_restart's own delay,
+       and a poll that succeeds against it would send the browser to /login
+       on the process that is about to exit. */
+    const downBy = Date.now() + 45000;
+    while (Date.now() < downBy) {
+      if (!(await reachable())) break;
+      restartModalStatus(`Stopping the service… (${since()}s)`);
+      await pause(500);
     }
-    updateStatus('Still not reachable after a minute — check the service directly.',
-                 'var(--fail)');
-    restartModalStatus('Still not reachable after a minute — check the '
-      + 'service directly. You can close this and try again.');
+
+    /* A ceiling far past any real restart, so the tab is not left polling
+       for ever if the service never comes back — the modal is already
+       released long before this, and reaching it is not a failed update
+       either: the install is on disk whatever happens here. */
+    const giveUpAt = Date.now() + 1800000;
+    let unlocked = false;
+    while (Date.now() < giveUpAt) {
+      if (await reachable()) {
+        /* Twice, a moment apart: a socket that accepts during the bind but
+           is not serving yet would otherwise bounce the browser to /login
+           before the new process can answer it. */
+        await pause(800);
+        if (await reachable()) {
+          updateStatus('Back up — signing back in…', 'var(--ok)');
+          restartModalStatus('Back up — signing back in…');
+          App.state.modalLocked = false;
+          setTimeout(() => { window.location.href = '/login'; }, 500);
+          return;
+        }
+      }
+      const seconds = since();
+      if (seconds < 30) {
+        restartModalStatus(`Restarting the service… (${seconds}s)`);
+      } else if (seconds < 120) {
+        restartModalStatus('Still restarting — a large fleet takes a minute '
+          + `or two… (${seconds}s)`);
+      } else {
+        if (!unlocked) {
+          unlocked = true;
+          App.state.modalLocked = false;
+        }
+        restartModalStatus('Taking longer than usual. The update is installed '
+          + 'and this is still watching for the service to come back; you can '
+          + `also check the service console directly. (${seconds}s)`);
+      }
+      await pause(1500);
+    }
+    restartModalStatus('The service has not come back. The update is '
+      + 'installed; start SappiWhere again to load it.');
     App.state.modalLocked = false;
     App.el('update-now').disabled = false;
   }

@@ -159,8 +159,9 @@ and `ipam_scan.py` — and `ago(ts)`, the one relative-time wording
 (reverse DNS) start first, then the NetFlow `Collector` and
 `SyslogCollector` if enabled, then the `IpamWorker`, then a syslog
 full-text index backfill kicks off in the background if needed. `Service.
-shutdown()` reverses it, draining in-flight traces (`Monitor.drain()`,
-up to 3 seconds) before closing any database, since a trace still running
+shutdown()` reverses it in two phases under one shared deadline — see
+**The teardown is signalled first and waited for once** below — draining
+in-flight traces before closing any database, since a trace still running
 when its database closes raises inside the worker thread and loses the
 measurement.
 
@@ -204,6 +205,65 @@ hang a restart indefinitely — and `shutdown(drain_s=0.0)` waits
 `max(drain_s, self._inflight_budget_s())` for it, mirroring
 `Monitor._inflight_budget_s`, the identical idea already in place for the
 trace scheduler this class was copied from.
+
+**The teardown is signalled first and waited for once — 5.6.0.** Every
+bound in the paragraphs above is defensible on its own, and that was the
+problem: `Service.shutdown()` asked each subsystem to stop and then waited
+for it, one after another, so all of them were paid in series. Three
+ten-second thread joins, a thirty-second restart drain, three separate
+thirty-second `_inflight_budget_s` ceilings, a two-second join per receiver
+thread, ten more for the syslog backfill, five for ConfigRX's. That is the
+37–63 seconds `selfupdate.py`'s module comment records against a real fleet,
+and `ConsoleWindow.closeEvent` ran it on the Qt GUI thread, so the desktop
+window was frozen for all of it and operators ended the task.
+
+It is now three phases against one `SHUTDOWN_DEADLINE_S` (8 s) plus
+`SHUTDOWN_DB_GRACE_S` (2 s) for the stores. Phase 0 stops accepting work.
+Phase 1 calls `begin_stop()` on every subsystem — `Worker.begin_stop` is
+`self._stop.set()`, overridden by anything that also owns a pool to cancel
+or a socket to close — and blocks on nothing, so ordering there is
+irrelevant by construction. Phase 2 calls `finish_stop(deadline)` in the
+order the waits must actually happen: the SSH and relay registries first
+(each session writes a closing device event), alerts before the Nodes poller
+(the reader must go quiet before the writer), then everything else. Because
+phase 1 signalled them all, each one has already been winding down for as
+long as the rest of the teardown took. Phase 3 closes the stores. Each
+worker's own `stop()`/`shutdown()` is unchanged and still does both halves —
+the settings hot-restart and the console's buttons want exactly that; only
+the service teardown drives the pair directly. `_inflight_budget_s` is now a
+`min` against the remaining budget rather than a `max` against a flat guess.
+
+Two waits in the old sequence had no bound at all, which is the part no
+timeout above was ever going to fix. `shutdown()` joined the maintenance
+thread with a ten-second timeout and then did `with self._maintenance_lock:`
+— an untimed acquire on the very lock the abandoned sweep still held, making
+the join cosmetic. And `SqliteStore.close()` took the store lock untimed,
+while `WebServer.stop()` deliberately leaves request threads running
+(`daemon_threads`), so a wide search started a moment before shutdown held
+its store open for as long as the query ran. Both are bounded now, and
+`close()` closes without the lock rather than waiting past its deadline: a
+worker mid-query gets `Cannot operate on a closed database`, which its own
+guard already handles and which costs one measurement, against a shutdown
+that never returns. Measured with every worker wedged, the maintenance lock
+held and a store lock held by a live query: **still going after 200 seconds**
+before, **8.0 seconds** after. `tests/test_service_shutdown.py` asserts that
+wall clock, which nothing did before — which is how it drifted that far.
+
+**And `main()` ends the process rather than returning into interpreter
+shutdown — 5.6.0.** Every worker calls
+`executor.shutdown(wait=False, cancel_futures=True)` and treats it as
+non-blocking. It is, at the call site. It is not at interpreter shutdown,
+where `concurrent.futures._python_exit` joins every pool thread **with no
+timeout**: the threads are not daemons, and `cancel_futures` only drops work
+that had not started. So a poll, traceroute or IPAM subnet sweep still in
+flight held the process open after the service had stopped and the window
+had gone — the state operators end from Task Manager, and a service
+manager's stop that never completes. `ipam_scan.sweep()` was the worst of
+them: it took no stop event at all, paced with a bare `time.sleep`, and
+nested a second pool it waited on, which is why `IpamWorker.stop()`'s own
+comment says a sweep in flight "can take minutes". It takes an `Event` now.
+Both entry points then end the process deliberately once every store is
+closed. A headless `SIGTERM` stops the service in **0.57 s**.
 
 ## Data layer
 
@@ -335,8 +395,10 @@ did. A forced pass still gets the shorter `FORCED_PRUNE_BUDGET_S` for
 `netpath.db`, so a burst of saves cannot keep the thread on one backlog.
 `shutdown()` sets `_stop` **and** `_maintenance_request` (or the join would
 wait out the tick), `_run_maintenance_body` checks `_stopping()` between
-stages, and the close sequence then runs under `_maintenance_lock`, so no
-store is closed under a sweep still using it.
+every stage, and the close sequence then runs under `_maintenance_lock`,
+acquired **with a timeout**, so no store is closed under a sweep still using
+it and no sweep can hold the teardown open indefinitely either — see the
+next section for why both halves of that sentence had to change.
 
 `SqliteStore.oldest_ts()` runs one `OLDEST_TS_SQL` per store — `traces`,
 `flows`, `logs`, `traps`, `scans`, both node event logs, the metric history

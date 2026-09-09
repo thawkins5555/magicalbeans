@@ -423,6 +423,106 @@ check("5d. ...and the now-unused import was removed with it",
      "from .ipam_dhcp import DhcpUnavailable" not in IPAM_SRC, "")
 
 
+# =====================================================================
+# 6. The console closes without freezing, and always ends the process
+# =====================================================================
+# ConsoleWindow.closeEvent used to run server.stop() and service.shutdown()
+# inline -- on the Qt GUI thread. The teardown was measured at 37-63s against
+# a real fleet, so for all of that the window was frozen, Windows ghosted it
+# as "Not Responding", and operators ended the task, which aborted the
+# teardown partway through.
+#
+# The policy is now run_teardown(), which is deliberately Qt-free and at
+# module level so it can be driven straight from here; closeEvent is only the
+# plumbing that runs it off the GUI thread. Importing netpath.console needs
+# PySide6, so the behavioural half is skipped where it is absent while the
+# source-level half (which is the actual regression guard) always runs.
+
+CONSOLE_SRC = open(os.path.join(_paths.REPO_ROOT, "netpath", "console.py"),
+                  encoding="utf-8").read()
+_CLOSE_EVENT = CONSOLE_SRC[CONSOLE_SRC.index("    def closeEvent"):
+                          CONSOLE_SRC.index("    def _run_teardown")]
+
+check("6. closeEvent does not tear the service down on the GUI thread",
+     "self.service.shutdown()" not in _CLOSE_EVENT
+     and "self.server.stop()" not in _CLOSE_EVENT, _CLOSE_EVENT)
+check("6. ...it accepts the close at once, so the window never sits frozen "
+     "waiting for the teardown",
+     "event.accept()" in _CLOSE_EVENT)
+check("6. ...stops the once-a-second refresh timer, which reads the stores "
+     "the teardown is about to close",
+     "self.timer.stop()" in _CLOSE_EVENT)
+check("6. ...and runs the teardown on a thread of its own",
+     "threading.Thread" in _CLOSE_EVENT and "run_teardown" in CONSOLE_SRC)
+check("6. a hard deadline ends the process even if the teardown overruns",
+     "FORCE_QUIT_MS" in _CLOSE_EVENT and "_force_quit" in CONSOLE_SRC)
+# os._exit, not app.quit(): app.exec() returning drops into interpreter
+# shutdown, where concurrent.futures joins every ThreadPoolExecutor thread
+# with no timeout (they are not daemons) and the self-updater's own threads
+# are deliberately not daemons either. That is the window-is-gone,
+# process-still-running state operators kill from Task Manager.
+check("6. the console ends the process outright rather than unwinding "
+     "through an interpreter shutdown that joins pool threads untimed",
+     "os._exit(0)" in CONSOLE_SRC.split("def _exit")[1])
+# The hard deadline must not fire out from under an install: it is about to
+# spawn the replacement process, and ending this one first leaves the machine
+# with nothing running at all.
+check("6. ...but the hard deadline never fires out from under an update that "
+     "is still installing",
+     "wait_for_job" in CONSOLE_SRC.split("def _force_quit")[1]
+     .split("def _exit")[0])
+
+MAIN_SRC = open(os.path.join(_paths.REPO_ROOT, "netpath", "__main__.py"),
+               encoding="utf-8").read()
+check("6. the last window closing does not end app.exec() while the "
+     "teardown thread is still running",
+     "setQuitOnLastWindowClosed(False)" in MAIN_SRC)
+check("6. main() ends the process the same way once its caller has closed "
+     "every store, so a service manager's stop is not held open by a poll "
+     "still in flight",
+     "os._exit(code)" in MAIN_SRC.split("def main(")[1])
+
+try:
+    from netpath.console import run_teardown
+except ImportError:
+    print("SKIP  6. run_teardown's behaviour (PySide6 is not installed)")
+else:
+    class _FakeServer:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def stop(self):
+            self.calls.append("server.stop")
+
+    class _FakeService:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def shutdown(self):
+            self.calls.append("service.shutdown")
+
+    calls6, said6 = [], []
+    outcome6 = run_teardown(_FakeServer(calls6), _FakeService(calls6),
+                           said6.append, wait_for_job=lambda _s: True)
+    check("6. a normal close stops the server and then the service",
+         outcome6 == "stopped" and calls6 == ["server.stop", "service.shutdown"],
+         f"{outcome6} {calls6}")
+    check("6. ...and says what it is doing, so the notice is not blank",
+         len(said6) >= 2 and all(said6), str(said6))
+
+    # An install in flight owns the teardown: it runs the same stop/shutdown
+    # sequence itself and then restarts the process. Closing app.db out from
+    # under it here is exactly what selfupdate.wait_for_job's docstring warns
+    # about, and until this change nothing called that function at all.
+    calls6b = []
+    outcome6b = run_teardown(_FakeServer(calls6b), _FakeService(calls6b),
+                            lambda _m: None, wait_for_job=lambda _s: False,
+                            job_wait_s=0.1)
+    check("6. an update still installing is left alone, not torn down under",
+         outcome6b == "update-owns-it" and calls6b == [],
+         f"{outcome6b} {calls6b}")
+
+
 shutil.rmtree(TMPDIR, ignore_errors=True)
 
 print()

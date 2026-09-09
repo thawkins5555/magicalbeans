@@ -1602,6 +1602,30 @@ for column in ("maintenance_excluded_s", "maintenance_mode_excluded_s",
 
 
 
+# 31. The restart wait never calls a slow restart a failed update.
+#
+# waitForRestart used to give the restart 60 seconds and then paint a red
+# "Still not reachable after a minute". By the time it runs the install is
+# already written to disk, so that message was reporting a failure over a
+# working update -- and 60 seconds was never enough anyway: the restart is
+# RESTART_GRACE_S plus the whole teardown plus schedule_restart's own delay
+# plus a cold start that opens twelve SQLite files and starts every worker.
+_WAIT_FOR_RESTART = SETTINGS[SETTINGS.index("async function waitForRestart"):]
+_WAIT_FOR_RESTART = _WAIT_FOR_RESTART[:_WAIT_FOR_RESTART.index("\n  }\n") + 5]
+check("60000" not in _WAIT_FOR_RESTART,
+      "waitForRestart no longer gives the restart a one-minute deadline")
+check("after a minute" not in SETTINGS,
+      "...and the 'still not reachable after a minute' failure message is "
+      "gone with it")
+check("var(--fail)" not in _WAIT_FOR_RESTART,
+      "waitForRestart never paints a failure: it cannot tell a slow restart "
+      "from a dead one, and the install is on disk either way")
+check(_WAIT_FOR_RESTART.count("reachable()") >= 3,
+      "waitForRestart waits for the OLD listener to go away first, and "
+      "requires two consecutive successes before redirecting -- one poll "
+      "answered by the process that is about to exit sent the browser to "
+      "/login on a service that was going down")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

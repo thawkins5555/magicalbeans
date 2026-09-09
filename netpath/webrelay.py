@@ -410,6 +410,8 @@ class WebRelayRegistry:
         self._lock = threading.Lock()
         self._sessions: dict[str, "WebRelaySession"] = {}
         self._stopping = False
+        # Handed from begin_stop() to finish_stop() — see SshSessionRegistry.
+        self._stoppers: list[threading.Thread] = []
 
     @property
     def count(self) -> int:
@@ -523,21 +525,30 @@ class WebRelayRegistry:
         """End every relay before the databases close (a closing relay writes
         a device event). Concurrent, under one shared budget — sixteen
         sequential stops would be an operator's Ctrl+C apparently hanging."""
+        self.begin_stop()
+        self.finish_stop(time.monotonic() + SHUTDOWN_BUDGET_S)
+
+    def begin_stop(self) -> None:
+        """Start closing every relay and return at once, and idempotently —
+        see SshSessionRegistry.begin_stop, which this mirrors, for why the
+        second call must not replace the first call's stopper threads."""
         with self._lock:
+            if self._stopping:
+                return
             self._stopping = True
             live = list(self._sessions.values())
-        if not live:
-            return
-        deadline = time.time() + SHUTDOWN_BUDGET_S
-        stoppers = []
-        for session in live:
-            thread = threading.Thread(
-                target=session.stop, args=("the server is shutting down",),
-                name=f"relay-stop-{session.device_id}", daemon=True)
+        self._stoppers = [
+            threading.Thread(target=session.stop,
+                             args=("the server is shutting down",),
+                             name=f"relay-stop-{session.device_id}", daemon=True)
+            for session in live]
+        for thread in self._stoppers:
             thread.start()
-            stoppers.append(thread)
+
+    def finish_stop(self, deadline: float) -> None:
+        stoppers, self._stoppers = self._stoppers, []
         for thread in stoppers:
-            thread.join(timeout=max(0.0, deadline - time.time()))
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 class WebRelaySession:

@@ -81,6 +81,26 @@ class Worker:
                 return
         self._thread = None
 
+    # ---------------------------------------------------- two-phase shutdown
+    #
+    # Service.shutdown() asks every worker to stop (begin_stop) before it
+    # waits for any of them (finish_stop), so the waits overlap instead of
+    # summing. Each worker's own stop()/shutdown() is unchanged and still
+    # does both halves, because a settings hot-restart and the console's
+    # buttons want exactly that; only the service teardown drives the pair
+    # directly. `deadline` is an absolute time.monotonic() value shared by
+    # every worker in the teardown, which is what bounds the whole thing.
+
+    def begin_stop(self) -> None:
+        """Ask the loop to end. Must not block. Overridden by workers that
+        also own a thread pool or sockets to cancel."""
+        self._stop.set()
+
+    def finish_stop(self, deadline: float) -> None:
+        """Wait for what begin_stop() asked to end, but no later than
+        `deadline`. Overridden by workers that also drain in-flight work."""
+        self._join(timeout=max(0.0, deadline - time.monotonic()))
+
     def _bump(self, key: str, by: int = 1) -> None:
         """counters[...] += 1 from a pool worker is a read-modify-write on a
         shared dict; under the lock the totals stay exact."""

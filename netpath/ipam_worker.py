@@ -121,6 +121,10 @@ class IpamWorker(Worker):
     def shutdown(self) -> None:
         self.stop()
 
+    # stop() is already non-blocking, so it is begin_stop() as it stands, and
+    # finish_stop is Worker's: the schedule thread only.
+    begin_stop = stop
+
     def state(self) -> dict:
         with self._lock:
             return {"scanning": sorted(self._scanning), "polling": sorted(self._polling),
@@ -274,7 +278,8 @@ class IpamWorker(Worker):
         try:
             alive_map = sweep(addresses, timeout_ms=int(settings.get("ping_timeout_ms", 800)),
                               workers=int(settings.get("ping_workers", 64)),
-                              never_scan=self._never_scan())
+                              never_scan=self._never_scan(),
+                              stop=self._stop)
             net = ipaddress.ip_network(subnet["cidr"], strict=False)
             arp = {ip: mac for ip, mac in read_arp_table().items()
                   if ipaddress.ip_address(ip) in net}

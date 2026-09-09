@@ -250,12 +250,26 @@ _MODULE_SCOPES = {
 # control read them back immediately — and costs nothing.
 _DEFERRED_SCOPES = frozenset({"netflow", "syslog", "snmp", "wireless", "configrx"})
 
-# How long shutdown() waits for a queued restart to finish before closing the
-# databases underneath it. A restart is bounded by its joins — a couple of
-# seconds per worker thread, plus one per connected syslog TCP client, of
-# which there can be up to max_tcp_clients — so this is generous rather than
-# tight: the point is that the wait ends at all if a worker thread wedges.
-RESTART_DRAIN_TIMEOUT_S = 30.0
+# The whole wall-clock budget shutdown() has to bring every worker down,
+# shared by all of them rather than granted to each.
+#
+# It used to be granted to each: about twenty independent timeouts, applied
+# one after another, which summed to the 37-63s the self-updater's own module
+# comment records against a real fleet and to well over two minutes at worst.
+# The console ran that on the GUI thread, so Windows ghosted the window as
+# "Not Responding" and operators ended the task. Everything is now signalled
+# first and waited for once, against this.
+#
+# In-flight work is dropped when the budget runs out rather than waited out:
+# a poll or trace that overruns writes through the guard its own _run_one
+# already has, and losing one measurement is a far better failure than a
+# shutdown that does not return.
+SHUTDOWN_DEADLINE_S = 8.0
+
+# What the database closes get on top of it. They come last and are the one
+# part that must not be skipped: each store's close() falls back to closing
+# without the lock rather than waiting on it (see SqliteBase.close).
+SHUTDOWN_DB_GRACE_S = 2.0
 
 
 class LdapUnavailable(Exception):
@@ -413,8 +427,11 @@ class Service:
         self._maintenance_request = threading.Event()
         self._maintenance_done = threading.Event()
         # Held for the body of run_maintenance: shutdown() below must not
-        # close a database out from under a sweep in flight.
+        # close a database out from under a sweep in flight. shutdown()
+        # acquires it with a timeout, so a wedged sweep delays the teardown
+        # rather than blocking it for as long as the sweep takes.
         self._maintenance_lock = threading.Lock()
+        self._shutdown_done = False
         # One thread rebuilds rollup buckets at a time. The 60-second timer
         # and the maintenance sweep's backfill both do, and two of them
         # rebuilding the same bucket at once is how a dimension's rows came
@@ -592,6 +609,10 @@ class Service:
                                  "is paid.")
 
         self._stop.clear()
+        # Paired with the flag shutdown() sets, so a Service that is started
+        # again can be shut down again rather than finding its teardown
+        # already marked done.
+        self._shutdown_done = False
         self._maintenance_thread = threading.Thread(
             target=self._maintenance_loop, name="netpath-maintenance", daemon=True)
         self._maintenance_thread.start()
@@ -626,67 +647,163 @@ class Service:
             self.log.add(SYSTEM, f"Nodes: the background history move failed "
                                  f"({exc}); it retries on the next start.")
 
-    def shutdown(self) -> None:
+    # Every subsystem shutdown() brings down, in the order its waits must
+    # happen. Signalling order does not matter — nothing in a begin_stop()
+    # blocks — but the waits do, so this list is the order and the comments
+    # are the reasons.
+    def _teardown_order(self) -> list:
+        return [
+            # Interactive SSH sessions first: they are the only thing here a
+            # person is watching, and each one writes a closing device event,
+            # so they must end while the databases are still open.
+            ("ssh sessions", self.ssh_sessions),
+            # And the relays, same reason: each writes a closing device
+            # event, so they must end while the databases are still open.
+            ("web relays", self.web_relays),
+            ("trace scheduler", self.monitor),
+            ("hop prober", self.hop_prober),
+            ("DNS resolver", self.resolver),
+            ("ASN resolver", self.asn_resolver),
+            ("flow collector", self.collector),
+            ("syslog collector", self.syslog),
+            ("SNMP trap collector", self.snmp),
+            ("IPAM worker", self.ipam),
+            # Alerts reads Nodes' own data, so the reader waits out before
+            # the writer.
+            ("alert engine", self.alert_engine),
+            ("Nodes poller", self.node_poller),
+            ("wireless poller", self.wireless),
+            ("ConfigRX worker", self.configrx),
+        ]
+
+    def _stores(self) -> list:
+        return [self.db, self.flow_db, self.syslog_db, self.snmp_db,
+                self.ipam_db, self.nodes_db, self.alerts_db, self.wireless_db,
+                self.configrx_db,
+                # No worker reads or writes this one (see _apply_mapper), but
+                # the connection itself still wants a clean close like every
+                # other store here — otherwise a temp-dir test teardown on
+                # Windows can find the file still held open.
+                self.mapper_db, self.app_db]
+
+    def shutdown(self, timeout_s: float = SHUTDOWN_DEADLINE_S) -> None:
+        """Bring everything down inside `timeout_s`, then close the stores.
+
+        Three phases, and the split between the first two is the whole point:
+        every subsystem is *asked* to stop before any of them is *waited* for,
+        so the waits overlap instead of summing. Asking blocks on nothing, so
+        by the time phase 2 waits, everything has already been winding down
+        for however long phase 1 and the restart drain took.
+
+        Idempotent: the self-update's before-restart hook and the console's
+        own teardown both call this.
+        """
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        deadline = time.monotonic() + max(0.0, timeout_s)
+
+        def remaining() -> float:
+            return max(0.0, deadline - time.monotonic())
+
+        # -- phase 0: stop accepting new work. Nothing here blocks. --------
         self._stop.set()
         # The maintenance thread waits on this, not on _stop, so it has to
         # be set too or the join below waits out the whole tick.
         self._maintenance_request.set()
-        # Before the databases close: holds an ATTACH on nodes.db.
-        if self._nodes_split_thread is not None:
-            self._nodes_split_thread.join(timeout=10.0)
-            self._nodes_split_thread = None
-        # A sweep could still be running when the databases close below —
-        # join the maintenance thread, then hold the lock run_maintenance
-        # holds for the whole close sequence.
-        if self._maintenance_thread is not None:
-            self._maintenance_thread.join(timeout=10.0)
-            self._maintenance_thread = None
-        if self._rollup_thread is not None:
-            self._rollup_thread.join(timeout=10.0)
-            self._rollup_thread = None
-        # Before the databases close: a deferred restart starts a collector
-        # that writes to them, so one still in flight here would find its
-        # store closed underneath it. Draining first means the stop/start
-        # this method does below is also the last word on every worker,
-        # rather than racing a queued start that would bring one back up
-        # after shutdown had stopped it.
-        self._drain_restarts()
-        with self._maintenance_lock:
-            # Interactive SSH sessions first: they are the only thing here a
-            # person is watching, and each one writes a closing device event,
-            # so they must end while the databases are still open.
-            self.ssh_sessions.shutdown()
-            # And the relays, same reason: each writes a closing device
-            # event, so they must end while the databases are still open.
-            self.web_relays.shutdown()
-            self.monitor.shutdown()   # waits briefly for running traces to land
-            self.hop_prober.shutdown()
-            self.resolver.shutdown()
-            self.asn_resolver.shutdown()
-            self.collector.stop()
-            self.syslog.stop()
-            self.snmp.stop()
-            self.ipam.shutdown()
-            # Alerts reads Nodes' own data, so stop the reader before the writer.
-            self.alert_engine.stop()
-            self.node_poller.shutdown()   # waits briefly for running polls to land
-            self.wireless.shutdown()      # waits briefly for a running poll to land
-            self.configrx.stop()
-            self.db.close()
-            self.flow_db.close()
-            self.syslog_db.close()
-            self.snmp_db.close()
-            self.ipam_db.close()
-            self.nodes_db.close()
-            self.alerts_db.close()
-            self.wireless_db.close()
-            self.configrx_db.close()
-            # No worker reads or writes this one (see _apply_mapper), but
-            # the connection itself still wants a clean close like every
-            # other store here — otherwise a temp-dir test teardown on
-            # Windows can find the file still held open.
-            self.mapper_db.close()
-            self.app_db.close()
+        self._close_restarts()
+
+        # -- phase 1: ask everything to stop, wait for nothing. ------------
+        self._signal_stop()
+        # The stores with backfill threads of their own get the same
+        # treatment: signalled here, joined in phase 3, so their windows run
+        # concurrently with the whole teardown instead of starting when it
+        # is nearly over.
+        for store in self._stores():
+            store.begin_close()
+
+        # -- phase 2: wait, in the order the waits must happen. ------------
+        # A deferred restart calls worker.start(), so one still in flight
+        # would bring a worker back up after phase 1 signalled it. Wait for
+        # the queue to drain and then re-signal: the second pass is free
+        # (every begin_stop is idempotent) and makes the stop the last word
+        # on every worker, which is what the serial version got by draining
+        # before it stopped anything.
+        if not self.await_restarts(remaining()):
+            # Said rather than swallowed: a restart still running past this
+            # point is about to meet a closed database, and the traceback
+            # that produces is much harder to read than this line.
+            self.log.add(ERROR, "A settings restart was still running when the "
+                                "service stopped; shutting down without "
+                                "waiting for it")
+        self._cancel_restarts()
+        self._signal_stop()
+
+        # The workers before the housekeeping threads: what is in flight here
+        # is a poll, a trace or a config backup that still wants to write its
+        # result, and it is what an operator loses if the budget runs out. A
+        # sweep or a rollup loses nothing — both resume where they left off.
+        busy = []
+        for label, worker in self._teardown_order():
+            try:
+                worker.finish_stop(deadline)
+            except Exception:
+                self.log.add(ERROR, f"Stopping the {label} failed",
+                             detail=traceback.format_exc())
+            if getattr(worker, "running", False):
+                busy.append(label)
+        if busy:
+            # Named rather than silent: the budget having run out is worth
+            # seeing in the log, and which subsystem overran is the diagnosis.
+            self.log.add(ERROR,
+                         f"Shut down without waiting for: {', '.join(busy)}",
+                         detail=f"They had {timeout_s:.0f}s between them. "
+                                f"Anything they had in flight is dropped.")
+
+        # These only have to be quiet before the stores close, not before the
+        # workers stop: the split holds an ATTACH on nodes.db and the sweep
+        # writes to every store.
+        for thread in (self._nodes_split_thread, self._maintenance_thread,
+                       self._rollup_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=remaining())
+        self._nodes_split_thread = None
+        self._maintenance_thread = None
+        self._rollup_thread = None
+
+        # With a timeout, unlike the `with` this replaces. A sweep holds this
+        # for its whole body, so an untimed acquire made the join above
+        # cosmetic: the shutdown waited out the entire pass however long it
+        # took, which is where the unbounded case came from. A sweep that has
+        # not landed by now is left to meet a closing store, which every store
+        # now closes defensively for.
+        held = self._maintenance_lock.acquire(timeout=remaining())
+        if not held:
+            self.log.add(ERROR, "A maintenance sweep was still running when "
+                                "the service stopped; closing the databases "
+                                "without waiting for it")
+        try:
+            # -- phase 3: the stores, last and always. ---------------------
+            db_deadline = deadline + SHUTDOWN_DB_GRACE_S
+            for store in self._stores():
+                try:
+                    store.close(max(0.0, db_deadline - time.monotonic()))
+                except Exception:
+                    self.log.add(ERROR, f"Closing {store.path} failed",
+                                 detail=traceback.format_exc())
+        finally:
+            if held:
+                self._maintenance_lock.release()
+
+    def _signal_stop(self) -> None:
+        """Ask every worker to stop. Blocks on nothing, so the order here is
+        irrelevant; idempotent, so phase 2 can repeat it."""
+        for label, worker in self._teardown_order():
+            try:
+                worker.begin_stop()
+            except Exception:
+                self.log.add(ERROR, f"Stopping the {label} failed",
+                             detail=traceback.format_exc())
 
     # ------------------------------------------------------------- settings
 
@@ -864,24 +981,22 @@ class Service:
             return self._restarts_idle.wait_for(
                 lambda: self._restarts_pending == 0, timeout)
 
-    def _drain_restarts(self) -> None:
-        """Stop accepting restarts and wait for the queued ones, on the way
-        down. Idempotent, because shutdown() is: a second call finds the
-        executor already closed and nothing pending."""
+    def _close_restarts(self) -> None:
+        """Stop accepting new restarts. Does not wait, and does not cancel
+        what is already queued — a restart that was accepted still runs, and
+        shutdown()'s phase 2 is what waits for it. Idempotent, because
+        shutdown() is."""
         with self._restarts_idle:
             self._restarts_closed = True
-        if not self.await_restarts(RESTART_DRAIN_TIMEOUT_S):
-            # Said rather than swallowed: a restart still running past this
-            # point is about to meet a closed database, and the traceback
-            # that produces is much harder to read than this line.
-            self.log.add(ERROR, f"A settings restart was still running after "
-                                f"{RESTART_DRAIN_TIMEOUT_S:.0f}s; shutting "
-                                f"down without waiting for it")
-        # wait=False because the drain above is the wait, with a bound on it:
-        # a worker thread wedged past the timeout must not hang the shutdown
-        # here too. cancel_futures is belt and braces — nothing can have been
-        # queued since the flag went up, since _queue_restart sets the count
-        # and submits under the same lock the flag is set under.
+
+    def _cancel_restarts(self) -> None:
+        """Close the pool, once the queue has been waited out.
+
+        wait=False because that wait has already happened, with a bound on
+        it: a worker thread wedged past the deadline must not hang the
+        teardown here too. cancel_futures only reaches anything if the wait
+        gave up, which is exactly when dropping it is right.
+        """
         self._restart_pool.shutdown(wait=False, cancel_futures=True)
 
     def _trim_db(self, key: str, db, label: str, noun: str, **kwargs) -> None:
@@ -1249,6 +1364,12 @@ class Service:
         # here with per-hop rows at fleet volume) so a burst of settings
         # saves can't stall on a backlog; it still does enough retention
         # work that saves can't outrun what retention enforces.
+        # Checked between every stage below, not just once two thirds of the
+        # way down as it used to be: each stage is budgeted at up to
+        # TRIM_BUDGET_S, so a sweep that could not see the flag until after
+        # five of them held the shutdown's maintenance lock for minutes.
+        if self._stopping():
+            return
         prune_budget = FORCED_PRUNE_BUDGET_S if force else TRIM_BUDGET_S
         self.db.prune(float(self.settings.get("trace_retention_days", 90)),
                       budget_s=prune_budget)
@@ -1268,6 +1389,8 @@ class Service:
                                  f"NetFlow: summarised the stored history "
                                  f"into the {ROLLUP_TIER_NAMES[tier]} rollups "
                                  f"({written} row(s) on this pass)")
+        if self._stopping():
+            return
         self.flow_db.drop_legacy_indexes()
         self.flow_db.prune(
             float(self.flow_settings.get("retention_days", 14)),
@@ -1283,6 +1406,8 @@ class Service:
         self._trim_db("max_flow_db_mb", self.flow_db, "Flow database",
                       "oldest flow records")
 
+        if self._stopping():
+            return
         self.syslog_db.prune(
             float(self.syslog_settings.get("retention_days", 30)),
             int(self.syslog_settings.get("max_rows", 20_000_000)))
@@ -1294,6 +1419,8 @@ class Service:
         self.app_db.prune_asn_cache(
             max(float(self.settings.get("asn_cache_days", 30)) * 4, 90))
 
+        if self._stopping():
+            return
         self.ipam_db.prune_hosts(
             float(self.ipam_settings.get("host_retention_days", 30)))
         self.ipam_db.prune_conflicts(
@@ -1303,6 +1430,8 @@ class Service:
         self.ipam_db.prune_scope_history(
             float(self.ipam_settings.get("dhcp_history_days", 35)))
 
+        if self._stopping():
+            return
         self._trim_db("max_syslog_db_mb", self.syslog_db, "Syslog database",
                       "oldest messages")
         self._trim_db("max_snmp_db_mb", self.snmp_db, "SNMP trap database",

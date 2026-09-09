@@ -14,6 +14,7 @@ off (the default) and install by hand.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -288,12 +289,23 @@ def _restart_posix() -> None:
     os.execv(args[0], args)
 
 
+# Beside the install rather than inside the package: _swap_in renames
+# _NETPATH_DIR, not _APP_ROOT, so this survives the swap it is describing.
 RESTART_LOG = os.path.join(_APP_ROOT, "update_restart.log")
+
+# One generation, rotated at this size. Appended to forever it was an
+# unbounded file in the install directory.
+RESTART_LOG_MAX_BYTES = 512 * 1024
 
 
 def _log_restart(line: str) -> None:
     """A plain file rather than the in-memory event log: that log dies with
     the process, which is exactly the moment this needs to survive."""
+    try:
+        if os.path.getsize(RESTART_LOG) > RESTART_LOG_MAX_BYTES:
+            os.replace(RESTART_LOG, RESTART_LOG + ".1")
+    except OSError:
+        pass          # no file yet, or nowhere to rotate it to; append anyway
     try:
         with open(RESTART_LOG, "a", encoding="utf-8") as handle:
             handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
@@ -358,6 +370,13 @@ def _run_before_restart() -> None:
     _log_restart(f"before-restart hook finished in {time.time() - started:.1f}s")
 
 
+# Whether this process has already committed to a restart. Exactly-once:
+# two calls would mean two replacement processes racing for the port and the
+# databases. Cleared by start_job so a job that ends up_to_date (which never
+# quiesces) leaves nothing armed behind it.
+_restart_scheduled = False
+
+
 def schedule_restart(delay: float = 1.5) -> None:
     """Restart after `delay` seconds, so the response reaches the browser
     first. The replacement is spawned only after the port and databases are
@@ -369,6 +388,12 @@ def schedule_restart(delay: float = 1.5) -> None:
     sleeps, killing a daemon thread with no line in the log — in 146
     recorded attempts, before its first statement.
     """
+    global _restart_scheduled
+    if _restart_scheduled:
+        _log_restart("a restart is already scheduled; not scheduling a second")
+        return
+    _restart_scheduled = True
+
     def _go():
         _log_restart(f"restart thread started pid={os.getpid()} delay={delay}")
         try:
@@ -394,13 +419,14 @@ def updates_enabled(app_db) -> bool:
 _INSTALL_MARKERS = (INSTALLED_COMMIT_KEY, INSTALLED_AT_KEY, INSTALLED_TAG_KEY)
 
 
-def _restore_meta(db_path: str, previous: dict) -> None:
+def _restore_meta(db_path: str, previous: dict) -> list[str]:
     """Put the install markers back after a swap that did not happen. app.db
     is closed by then, so this goes through connections of its own; the
     retries are for the moment just after teardown, where the file can still
     be held briefly by a connection that is on its way out."""
     from .appdb import write_meta
 
+    gave_up = []
     for key, value in previous.items():
         for attempt in range(10):
             try:
@@ -410,12 +436,14 @@ def _restore_meta(db_path: str, previous: dict) -> None:
                 _log_restart(f"restoring {key!r} (try {attempt + 1}): {exc}")
                 time.sleep(0.5)
         else:
+            gave_up.append(key)
             _log_restart(
                 f"GAVE UP restoring {key!r} after 10 tries. app.db still "
                 f"names the version that failed to install, so Update will "
                 f"report 'Already up to date' while the previous code is "
                 f"what is actually running. Press Update again after a "
                 f"restart, or fix the marker by hand.")
+    return gave_up
 
 
 def apply(app_db, report=None, before_quiesce=None) -> dict:
@@ -440,7 +468,14 @@ def apply(app_db, report=None, before_quiesce=None) -> dict:
     step("checking", message="", error="", commit="")
     try:
         head = latest_commit()
-    except (urllib.error.URLError, TimeoutError) as exc:
+    except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
+        # OSError rather than TimeoutError alone: socket.timeout, TimeoutError
+        # and ssl.SSLError are all OSError subclasses, and URLError is too, so
+        # this is the old arm plus every connection-level failure it missed.
+        # HTTPException is the one that is not an OSError at all —
+        # IncompleteRead and RemoteDisconnected, which a corporate proxy
+        # produces regularly and which used to escape to _run_job and report
+        # "The update stopped unexpectedly".
         error = f"Could not reach GitHub: {exc}"
         step("failed", error=error)
         return {"ok": False, "error": error}
@@ -469,7 +504,8 @@ def apply(app_db, report=None, before_quiesce=None) -> dict:
             # Nothing checks this digest: the branch pull has no published
             # digest to check it against. See the SECURITY NOTE at the top.
             _download_tarball(sha, archive_path)
-        except (urllib.error.URLError, ValueError, OSError) as exc:
+        except (urllib.error.URLError, http.client.HTTPException,
+                ValueError, OSError) as exc:
             step("failed", error=f"Download failed: {exc}")
             return {"ok": False, "error": f"Download failed: {exc}"}
 
@@ -527,14 +563,31 @@ def apply(app_db, report=None, before_quiesce=None) -> dict:
         _run_before_restart()
         try:
             _swap_in(new_netpath)
-        except OSError as exc:
-            # _swap_in already restored the previous netpath/, so the
-            # restart comes back up on the install this booted from — and
-            # the markers have to come back with it.
-            _restore_meta(db_path, previous)
+        except Exception as exc:
+            # Exception, not OSError: _swap_in renames the package directory
+            # this process is running out of, so anything below here can meet
+            # a half-swapped tree — including a lazy import inside the
+            # recovery itself. Whatever went wrong, the process is already
+            # quiesced and the only acceptable ending is a restart.
+            #
+            # _swap_in already restored the previous netpath/, so the restart
+            # comes back up on the install this booted from — and the markers
+            # have to come back with it.
             error = (f"Update downloaded but could not be installed: {exc}. "
                      f"Restarting on the previous version rather than staying "
                      f"down.")
+            try:
+                if _restore_meta(db_path, previous):
+                    # Said in the UI, not only in update_restart.log: with the
+                    # marker left naming a version that is not installed, the
+                    # next check reports "Already up to date" over the old
+                    # code, and nothing else would ever tell the operator.
+                    error += (" app.db could not be corrected and still names "
+                              "the version that failed to install, so Update "
+                              "will report 'Already up to date' until it is "
+                              "pressed again after this restart.")
+            except Exception as restore_exc:
+                _log_restart(f"restoring the install markers failed: {restore_exc}")
             step("failed", error=error)
             schedule_restart()
             return {"ok": False, "error": error, "quiesced": True}
@@ -544,7 +597,7 @@ def apply(app_db, report=None, before_quiesce=None) -> dict:
             if os.path.isfile(src):
                 try:
                     shutil.copy2(src, os.path.join(_APP_ROOT, name))
-                except OSError:
+                except Exception:
                     pass  # cosmetic only — the package swap is what matters
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -560,7 +613,7 @@ def start_job(app_db, before_quiesce=None, on_result=None) -> dict:
     for the package directory, so it's refused with `already_running`
     rather than queued. Not a daemon thread — the update outlives the
     request, and its restart is what brings the service back."""
-    global _job_thread
+    global _job_thread, _restart_scheduled
 
     with _job_lock:
         if _job_thread is not None and _job_thread.is_alive():
@@ -569,6 +622,7 @@ def start_job(app_db, before_quiesce=None, on_result=None) -> dict:
             return running
         _job.update(state="running", step="checking", message="", error="",
                     commit="", started_ts=time.time(), finished_ts=0.0)
+        _restart_scheduled = False
         thread = threading.Thread(
             target=_run_job, args=(app_db, before_quiesce, on_result),
             name="sappiwhere-update", daemon=False)
@@ -587,6 +641,19 @@ def _run_job(app_db, before_quiesce, on_result) -> None:
         _log_restart("update job failed:\n" + traceback.format_exc())
         _set("failed", error=f"The update stopped unexpectedly: {exc}")
         result = {"ok": False, "error": str(exc)}
+    finally:
+        # The guarantor. Past _run_before_restart() the listener is down and
+        # every worker has stopped, so a failure that returns without a
+        # restart leaves a process serving nothing — with, on the desktop, a
+        # console window still open over it. That is the state operators end
+        # from Task Manager. apply() schedules its own restart on the paths it
+        # knows about; this covers every path it does not, including anything
+        # raised out of the recovery arm itself. schedule_restart() is
+        # exactly-once, so this cannot double up with apply()'s own call.
+        if _before_restart_done and not _restart_scheduled:
+            _log_restart("the update quiesced this process but scheduled no "
+                         "restart; scheduling one rather than leaving it dead")
+            schedule_restart()
     with _job_lock:
         _job["finished_ts"] = time.time()
         if _job["state"] == "running":

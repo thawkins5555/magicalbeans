@@ -217,6 +217,19 @@ class AlertEngine(Worker):
         self._mail.stop()
         self._webhook.stop()
 
+    def begin_stop(self) -> None:
+        self._stop.set()
+        # Signalled here rather than in finish_stop so both senders drain
+        # their queues while the rest of the teardown runs; their stop()
+        # joins then land at once instead of costing 2s each.
+        self._mail.begin_stop()
+        self._webhook.begin_stop()
+
+    def finish_stop(self, deadline: float) -> None:
+        self._join(timeout=max(0.0, deadline - time.monotonic()))
+        self._mail.stop()
+        self._webhook.stop()
+
     def shutdown(self) -> None:
         self.stop()
 

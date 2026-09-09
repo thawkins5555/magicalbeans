@@ -395,12 +395,20 @@ class SyslogDatabase(SqliteStore):
         self.index_ready = True
         self.index_progress = (total, total)
 
-    def close(self) -> None:
+    def begin_close(self) -> None:
         self._backfill_stop.set()
+
+    def close(self, timeout_s: float | None = None) -> None:
+        self.begin_close()
+        budget = (self.BACKFILL_STOP_TIMEOUT_S if timeout_s is None
+                  else max(0.0, timeout_s))
+        deadline = time.monotonic() + budget
         thread = self._backfill_thread
         if thread is not None and thread.is_alive():
-            thread.join(timeout=self.BACKFILL_STOP_TIMEOUT_S)
-        super().close()
+            # The join and the close share the budget rather than taking one
+            # each: the caller's deadline is for this store as a whole.
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        super().close(max(0.0, deadline - time.monotonic()))
 
     # ------------------------------------------------------------------ write
 

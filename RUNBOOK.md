@@ -23,6 +23,7 @@ backup, `INTERNALS.md` is why any of this works the way it does.
 - [A flood of alerts nobody asked for](#a-flood-of-alerts-nobody-asked-for)
 - [Planned maintenance](#planned-maintenance)
 - [Nobody can sign in](#nobody-can-sign-in)
+- [The application is slow to close, or an update reports a failure](#the-application-is-slow-to-close-or-an-update-reports-a-failure)
 - [A database is corrupt](#a-database-is-corrupt)
 
 ---
@@ -549,6 +550,50 @@ admin's session cookie or a password sitting in a cron job's environment. A
 token has no idle timeout and is revocable on its own without touching
 anyone's sign-in — rotate it by issuing a new one and revoking the old,
 rather than changing a shared password every script depends on.
+
+---
+
+## The application is slow to close, or an update reports a failure
+
+**Symptom.** Closing the service console takes a long time, or the window
+stops responding and has to be ended from Task Manager. Or an update says
+"Still not reachable" while the new version is in fact installed.
+
+Both were the same defect and both were fixed in 5.6.0: the teardown was a
+chain of roughly twenty independent timeouts that added up (37–63 seconds
+against a real fleet, and unbounded if a maintenance sweep was running), and
+the console ran it on the GUI thread. If you are on 5.6.0 or later and still
+see either, work through this.
+
+1. **What to expect now.** The window closes on the click and shows a
+   "Shutting down…" notice; the process is gone within about ten seconds. A
+   headless service stops in well under a second. An update's restart takes
+   as long as a cold start on your fleet — the browser waits for it and says
+   how long it has been, and does not report a failure.
+
+2. **Which subsystem overran.** When the teardown's budget runs out it logs
+   one line naming what it did not wait for: *"Shut down without waiting
+   for: …"*. Anything named there had work in flight that was dropped. A
+   subsystem that appears every time is worth investigating — usually a
+   device whose SSH or SNMP session is wedged, or an IPAM sweep paced so
+   slowly it cannot finish.
+
+3. **The update's own log.** `update_restart.log`, beside the install (not
+   inside `netpath/`, so it survives the swap), records each restart, how
+   long the before-restart hook took, and anything that failed. Single-digit
+   seconds for the hook is normal. It is rotated at 512 KB, so check
+   `update_restart.log.1` as well if you are looking further back.
+
+4. **An update that says it installed but the version has not changed.**
+   Check the log for *"GAVE UP restoring"*. `app.db` is then naming a version
+   that is not installed, so Update reports "Already up to date" over the old
+   code. Press Update once more after a restart; the UI carries this message
+   too from 5.6.0.
+
+5. **Still stuck.** Stop it the way you run it (`nssm stop SappiWhere`, the
+   Services console, `systemctl stop sappiwhere`) rather than ending the
+   task — ending the task while databases are closing is what a corrupt
+   store usually starts as.
 
 ---
 

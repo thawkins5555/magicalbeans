@@ -498,6 +498,187 @@ syslog5d.close()
 
 shutil.rmtree(TMPDIR5, ignore_errors=True)
 
+# ---------------------------------------------- 6. shutdown is BOUNDED
+#
+# The regression this section exists for: Service.shutdown() used to ask each
+# subsystem to stop and then wait for it, one after another, so about twenty
+# independent timeouts summed. selfupdate.py's own module comment records the
+# result -- "the before-restart hook alone measures 37-63s against a real
+# fleet" -- and the console ran that on the Qt GUI thread, so Windows ghosted
+# the window and operators ended the task. Nothing asserted the wall clock,
+# which is why it could drift that far.
+#
+# Every wedge below is one that really happened: a maintenance sweep holding
+# the lock shutdown() acquires, workers that never finish stopping, and a
+# store lock held by a request thread that outlived WebServer.stop().
+
+from netpath.web.service import SHUTDOWN_DB_GRACE_S, SHUTDOWN_DEADLINE_S  # noqa: E402
+
+
+class Wedged:
+    """A worker that is asked to stop and then never finishes. Records when
+    each half was called, so the test can tell "signalled everything, then
+    waited once" from "signalled and waited, one at a time"."""
+
+    def __init__(self, name, phases):
+        self.name = name
+        self.phases = phases
+        self.running = True
+
+    def begin_stop(self):
+        self.phases.append((self.name, "begin", time.monotonic()))
+
+    def finish_stop(self, deadline):
+        self.phases.append((self.name, "finish", time.monotonic()))
+        # Burn the whole budget, the way a poll against unresponsive gear does.
+        while time.monotonic() < deadline:
+            time.sleep(0.02)
+
+
+service6 = new_service("t6")
+phases6 = []
+WEDGED = ("ssh_sessions", "web_relays", "monitor", "hop_prober", "resolver",
+         "asn_resolver", "collector", "syslog", "snmp", "ipam",
+         "alert_engine", "node_poller", "wireless", "configrx")
+for _name in WEDGED:
+    setattr(service6, _name, Wedged(_name, phases6))
+
+# A sweep in flight, holding the lock shutdown() has to take. Untimed, this
+# alone was an unbounded wait however long the sweep ran.
+service6._maintenance_lock.acquire()
+
+# A request thread still mid-query when the databases close. The web server's
+# handler threads are daemons and survive WebServer.stop(), so this is the
+# real shape, not a contrived one.
+_held = threading.Event()
+_release6 = threading.Event()
+
+
+def _hold_store_lock():
+    with service6.db._lock:
+        _held.set()
+        _release6.wait(60)
+
+
+threading.Thread(target=_hold_store_lock, daemon=True).start()
+_held.wait(5)
+
+_t0 = time.monotonic()
+service6.shutdown()
+_elapsed = time.monotonic() - _t0
+
+# Generous slack: this asserts "bounded", not "fast". The old code took
+# 37-63s on a real fleet and had no ceiling at all.
+_ceiling = SHUTDOWN_DEADLINE_S + SHUTDOWN_DB_GRACE_S + 5.0
+check("shutdown finishes inside its budget even with every worker wedged, "
+     "the maintenance lock held and a store lock held by a live query",
+     _elapsed < _ceiling, f"took {_elapsed:.1f}s, ceiling {_ceiling:.1f}s")
+
+# The property that makes the budget shared rather than summed. If a future
+# change puts a wait back inside the signalling loop, this is what catches it.
+_begins = [t for _n, phase, t in phases6 if phase == "begin"]
+_finishes = [t for _n, phase, t in phases6 if phase == "finish"]
+check("every worker was asked to stop before any of them was waited for",
+     _begins and _finishes and max(_begins) < min(_finishes),
+     f"last begin {max(_begins) - _t0:.2f}s, first finish "
+     f"{min(_finishes) - _t0:.2f}s" if _begins and _finishes else str(phases6))
+
+# The ordering the comments in shutdown() call out, as an ordering of waits.
+_order = [n for n, phase, _t in phases6 if phase == "finish"]
+check("alerts stops waiting before the Nodes poller does (it reads Nodes' "
+     "own data, so the reader must go quiet before the writer)",
+     _order.index("alert_engine") < _order.index("node_poller"), _order)
+check("the sessions and relays are waited out first, while the databases "
+     "they write their closing events to are still open",
+     _order.index("ssh_sessions") < 2 and _order.index("web_relays") < 2, _order)
+
+check("...and the databases closed anyway rather than waiting on the query",
+     service6.db._closed)
+_release6.set()
+
+# Idempotent: the self-update's before-restart hook and the console's own
+# teardown both call this, and on the update path both do.
+_t1 = time.monotonic()
+service6.shutdown()
+check("a second shutdown() is a fast no-op, not a second teardown",
+     time.monotonic() - _t1 < 0.5, f"{time.monotonic() - _t1:.2f}s")
+
+# And the healthy case is quick, not merely bounded: nothing is wedged here,
+# so nothing should be waited out.
+service6b = new_service("t6b")
+_t2 = time.monotonic()
+service6b.shutdown()
+_idle_elapsed = time.monotonic() - _t2
+check("an idle service shuts down promptly rather than sitting out its budget",
+     _idle_elapsed < 5.0, f"took {_idle_elapsed:.1f}s")
+
+
+# ------------- 6b. the second signal must not discard the first one's work
+#
+# shutdown() signals every subsystem, waits out any restart still queued, and
+# then signals again -- the second pass is what stops a deferred restart from
+# bringing a worker back up after the first. That makes begin_stop() have to
+# be idempotent, and the session registries are the two that are not
+# idempotent for free: each spawns a stopper thread per live session and hands
+# them to finish_stop(). A second pass that re-snapshotted the sessions would
+# replace those threads, and finish_stop() would then wait for nothing.
+
+from netpath.webrelay import WebRelayRegistry  # noqa: E402
+
+
+class _SlowSession:
+    device_id = 1
+
+    def __init__(self):
+        self.stopped = threading.Event()
+
+    def stop(self, reason=""):
+        time.sleep(0.6)
+        self.stopped.set()
+
+
+registry = WebRelayRegistry(None)   # nothing here reaches the service
+session = _SlowSession()
+registry._sessions["s1"] = session
+registry.begin_stop()
+registry.begin_stop()          # the second pass shutdown() always makes
+check("a repeated begin_stop keeps the stopper threads the first one started",
+     len(registry._stoppers) == 1, str(len(registry._stoppers)))
+registry.finish_stop(time.monotonic() + 5.0)
+check("...so finish_stop actually waits for the sessions to close",
+     session.stopped.is_set())
+
+
+# ------------------------------------- 7. a store lock cannot hang close()
+service7 = new_service("t7")
+_held7 = threading.Event()
+_release7 = threading.Event()
+
+
+def _hold7():
+    with service7.flow_db._lock:
+        _held7.set()
+        _release7.wait(30)
+
+
+threading.Thread(target=_hold7, daemon=True).start()
+_held7.wait(5)
+_t3 = time.monotonic()
+service7.flow_db.close(timeout_s=0.2)
+_close_elapsed = time.monotonic() - _t3
+check("close() gives up on the store lock rather than waiting for it",
+     _close_elapsed < 1.5, f"took {_close_elapsed:.2f}s")
+try:
+    service7.flow_db._conn.execute("SELECT 1")
+    _closed_for_real = False
+except sqlite3.ProgrammingError:
+    _closed_for_real = True
+check("...and the connection really is closed, not merely marked so",
+     _closed_for_real)
+_release7.set()
+service7.shutdown()
+
+
 shutil.rmtree(TMPDIR, ignore_errors=True)
 
 print()

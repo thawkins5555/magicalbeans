@@ -116,6 +116,18 @@ class Monitor(Worker):
         self._executor.shutdown(wait=False, cancel_futures=True)
         self.drain(max(drain_s, self._inflight_budget_s()))
 
+    def begin_stop(self) -> None:
+        self.stop()
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def finish_stop(self, deadline: float) -> None:
+        # min, not shutdown()'s max: the in-flight budget is a ceiling on what
+        # a trace could still legitimately need, not a promise to wait it out.
+        # Whichever of it and the shared teardown deadline is smaller wins.
+        self._join(timeout=max(0.0, deadline - time.monotonic()))
+        self.drain(min(max(0.0, deadline - time.monotonic()),
+                       self._inflight_budget_s()))
+
     def _inflight_budget_s(self, ceiling_s: float = 30.0) -> float:
         """The longest a currently in-flight trace could still legitimately
         run, per its own target's hop count/probes/timeout — the drain
@@ -456,6 +468,13 @@ class Resolver(Worker):
         # matters, and gethostbyaddr can block past any timeout we set.
         self._executor.shutdown(wait=False, cancel_futures=True)
 
+    def begin_stop(self) -> None:
+        self.stop()
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    # finish_stop is Worker's: the loop thread only, for the reason shutdown()
+    # gives above — an in-flight lookup is never worth waiting for.
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -575,6 +594,10 @@ class AsnResolver(Worker):
         self._stop.set()
 
     def shutdown(self) -> None:
+        self.stop()
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def begin_stop(self) -> None:
         self.stop()
         self._executor.shutdown(wait=False, cancel_futures=True)
 
@@ -716,6 +739,10 @@ class HopProber(Worker):
         self._stop.set()
 
     def shutdown(self) -> None:
+        self.stop()
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def begin_stop(self) -> None:
         self.stop()
         self._executor.shutdown(wait=False, cancel_futures=True)
 

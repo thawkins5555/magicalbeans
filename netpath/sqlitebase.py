@@ -421,6 +421,10 @@ class SqliteStore:
     def __init__(self, path: str):
         self.path = path
         self._lock = InstrumentedLock()
+        # close() is called twice on some paths (a self-update's before-restart
+        # hook, then the console's own teardown), and once through it the
+        # connection is gone; the flag makes the second call free.
+        self._closed = False
         self._conn = connect(path)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
@@ -496,9 +500,39 @@ class SqliteStore:
             added.add(name)
         return added
 
-    def close(self) -> None:
-        with self._lock:
+    # How long close() waits for whatever holds the store lock before closing
+    # anyway. The lock is held by ordinary queries, and the web server's
+    # request threads are daemons that survive WebServer.stop() (see
+    # ThreadingHTTPServer.daemon_threads), so a wide search started a moment
+    # before shutdown used to hold this connection open with no bound at all.
+    CLOSE_LOCK_WAIT_S = 2.0
+
+    def begin_close(self) -> None:
+        """Ask anything this store owns to wind down, without waiting.
+        A no-op here; the two stores with backfill threads override it so
+        their threads are already stopping by the time close() joins them."""
+
+    def close(self, timeout_s: float | None = None) -> None:
+        """Close the connection, waiting at most `timeout_s` for the store
+        lock first.
+
+        Closing without the lock is deliberate and is the better of the two
+        failures available: a worker still mid-query gets
+        `ProgrammingError: Cannot operate on a closed database`, which every
+        worker's guard already handles and which costs one measurement — where
+        waiting for the lock costs a shutdown that never returns.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        wait = self.CLOSE_LOCK_WAIT_S if timeout_s is None else max(0.0, timeout_s)
+        held = self._lock.acquire(timeout=wait) if wait else self._lock.acquire(
+            blocking=False)
+        try:
             self._conn.close()
+        finally:
+            if held:
+                self._lock.release()
 
     def size_bytes(self) -> int:
         """The file and its WAL/SHM companions on disk."""

@@ -258,6 +258,12 @@ def run_console(args) -> int:
     server.start(block=False)          # the console reports a failure to bind
 
     app = QApplication(sys.argv)
+    # The console accepts its close immediately and tears down on a thread of
+    # its own (see ConsoleWindow.closeEvent), so the last window closing must
+    # not end app.exec() — that would drop into interpreter shutdown while the
+    # teardown is still running. The teardown's own completion ends the
+    # process instead.
+    app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("SappiWhere")
     app.setStyleSheet(theme.STYLESHEET)
     app.setFont(theme.ui_font(10))
@@ -291,7 +297,25 @@ def _line_buffer_stdio() -> None:
 def main(argv=None) -> int:
     _line_buffer_stdio()
     args = build_parser().parse_args(argv)
-    return run_headless(args) if args.headless else run_console(args)
+    code = run_headless(args) if args.headless else run_console(args)
+    # os._exit, not a return into interpreter shutdown.
+    #
+    # Two things there are unbounded. concurrent.futures joins every
+    # ThreadPoolExecutor thread with no timeout — they are not daemons, and
+    # cancel_futures only drops work that had not started — so a poll,
+    # traceroute or subnet sweep still in flight held the process open long
+    # after the service had stopped and the window had gone. And the
+    # self-updater's own threads are deliberately not daemons either. That is
+    # the no-window-but-still-running state operators end from Task Manager,
+    # and a service manager's "stop" that never completes.
+    #
+    # Both callers above have already closed every store by the time they
+    # return, so there is nothing left to flush but the streams. It is at
+    # this layer rather than inside run_headless/run_console so both stay
+    # drivable from a test.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
 
 
 if __name__ == "__main__":

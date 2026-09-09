@@ -12,9 +12,11 @@ _fetch_bytes are the only network boundary, _swap_in and schedule_restart
 are always mocked so no real restart can happen here, and a real
 AppDatabase provides .meta()/.set_meta()/.settings()/.path.
 """
+import http.client
 import io
 import os
 import shutil
+import ssl
 import sys
 import tarfile
 import threading
@@ -265,6 +267,149 @@ check("6. …and any exception out of its body reaches the log with a traceback"
       "restart thread failed" in SRC and "traceback.format_exc()" in SRC, "")
 check("6. the POSIX path logs before execv replaces the process image",
       "_log_restart(f\"exec pid=" in SRC, "")
+
+selfupdate._fetch_json = fake_json
+selfupdate._fetch_bytes = fake_bytes
+selfupdate.RESTART_GRACE_S = 0
+selfupdate._swap_in = lambda path: None
+
+
+def fake_restart(delay=1.5):
+    """Stands in for schedule_restart, including its exactly-once contract —
+    the real one refuses a second call, and a stub that did not would let a
+    double-restart bug pass unnoticed here."""
+    if selfupdate._restart_scheduled:
+        return
+    selfupdate._restart_scheduled = True
+    RESTARTS.append(delay)
+
+
+RESTARTS = []
+selfupdate.schedule_restart = fake_restart
+
+try:
+    # =================================================================
+    # 7. Once it has quiesced, it ALWAYS restarts
+    # =================================================================
+    # Past _run_before_restart() the listener is down and every worker has
+    # stopped, so a failure that returns without scheduling a restart leaves
+    # a process serving nothing -- with, on the desktop, a console window
+    # still open over it. That is the state operators end from Task Manager.
+    #
+    # The escapes below are real ones, not invented: _swap_in renames the
+    # package directory this process is running out of, so _restore_meta's
+    # lazy `from .appdb import write_meta` can meet a half-swapped tree and
+    # raise ImportError -- not an OSError, so it used to walk straight past
+    # the recovery arm's own schedule_restart().
+
+    def quiesced_run(tag, sabotage):
+        """One apply() that gets past the teardown and then fails at
+        `sabotage`. Returns the restarts it scheduled."""
+        db = new_db(tag)
+        RESTARTS.clear()
+        selfupdate._restart_scheduled = False
+        selfupdate.set_before_restart_hook(lambda: None)
+        selfupdate._swap_in = sabotage
+        try:
+            selfupdate._run_job(db, None, None)
+        finally:
+            db.close()
+            selfupdate._swap_in = lambda path: None
+        return list(RESTARTS)
+
+    for _tag, _label, _boom in (
+            ("t7a", "a non-OSError out of the swap",
+             lambda path: (_ for _ in ()).throw(RuntimeError("swap exploded"))),
+            ("t7b", "an ImportError out of the swap, the shape a half-renamed "
+                    "package directory produces",
+             lambda path: (_ for _ in ()).throw(
+                 ModuleNotFoundError("No module named 'netpath.appdb'"))),
+            ("t7c", "a BaseException, which the old except clause never saw",
+             lambda path: (_ for _ in ()).throw(KeyboardInterrupt())),
+            ("t7d", "an ordinary OSError, which apply() handles itself",
+             lambda path: (_ for _ in ()).throw(OSError("no room"))),
+    ):
+        _restarts = quiesced_run(_tag, _boom)
+        check(f"7. {_label} still ends in a restart",
+              len(_restarts) == 1, f"{len(_restarts)} restart(s) scheduled")
+        check(f"7. …and the job is reported failed rather than quietly ok",
+              selfupdate.status()["state"] == "failed",
+              selfupdate.status()["state"])
+
+    # =================================================================
+    # 8. A network failure reads as a network failure
+    # =================================================================
+    # IncompleteRead and RemoteDisconnected are what a corporate proxy
+    # produces. Neither is a URLError, and IncompleteRead is not an OSError
+    # either, so both escaped to _run_job and came back as "The update
+    # stopped unexpectedly" -- which sends an operator hunting a bug rather
+    # than looking at their proxy.
+    for _tag, _label, _exc in (
+            ("t8a", "a truncated response", http.client.IncompleteRead(b"")),
+            ("t8b", "a proxy dropping the connection",
+             http.client.RemoteDisconnected("Remote end closed connection")),
+            ("t8c", "a TLS failure", ssl.SSLError("handshake failed")),
+    ):
+        db8 = new_db(_tag)
+        state["error"] = _exc
+        selfupdate._restart_scheduled = False
+        result8 = selfupdate.apply(db8)
+        state["error"] = None
+        db8.close()
+        check(f"8. {_label} is reported as a connectivity problem",
+              not result8.get("ok")
+              and "Could not reach GitHub" in str(result8.get("error", "")),
+              str(result8.get("error")))
+        check(f"8. …not as 'stopped unexpectedly'",
+              "stopped unexpectedly" not in str(result8.get("error", "")),
+              str(result8.get("error")))
+
+    # =================================================================
+    # 9. wait_for_job, which the console teardown now depends on
+    # =================================================================
+    # Nothing called it before this change, so nothing checked it either.
+    # ConsoleWindow.closeEvent uses it to avoid closing app.db underneath an
+    # install that is still running.
+    check("9. wait_for_job is True when no job is running",
+          selfupdate.wait_for_job(0.1))
+
+    db9 = new_db("t9")
+    state["gate"] = threading.Event()
+    selfupdate._restart_scheduled = False
+    selfupdate.start_job(db9)
+    check("9. …and False while one is in flight",
+          not selfupdate.wait_for_job(0.2))
+    state["gate"].set()
+    check("9. …and True again once it finishes", selfupdate.wait_for_job(30.0))
+    state["gate"] = None
+    db9.close()
+
+    # =================================================================
+    # 10. The restart log cannot grow without bound
+    # =================================================================
+    _log_dir = os.path.join(TMPDIR, "t10")
+    os.makedirs(_log_dir, exist_ok=True)
+    _real_log = selfupdate.RESTART_LOG
+    _real_cap = selfupdate.RESTART_LOG_MAX_BYTES
+    selfupdate.RESTART_LOG = os.path.join(_log_dir, "update_restart.log")
+    selfupdate.RESTART_LOG_MAX_BYTES = 2048
+    with open(selfupdate.RESTART_LOG, "w", encoding="utf-8") as _h:
+        _h.write("x" * 8192)
+    selfupdate._log_restart("after the rotation")
+    check("10. the restart log is rotated rather than appended to forever",
+          os.path.getsize(selfupdate.RESTART_LOG) < 2048,
+          str(os.path.getsize(selfupdate.RESTART_LOG)))
+    check("10. …and the previous generation is kept, not discarded",
+          os.path.isfile(selfupdate.RESTART_LOG + ".1"))
+    selfupdate.RESTART_LOG = _real_log
+    selfupdate.RESTART_LOG_MAX_BYTES = _real_cap
+finally:
+    selfupdate._fetch_json = real["json"]
+    selfupdate._fetch_bytes = real["bytes"]
+    selfupdate._swap_in = real["swap"]
+    selfupdate.schedule_restart = real["restart"]
+    selfupdate.RESTART_GRACE_S = real["grace"]
+    selfupdate._restart_scheduled = False
 
 shutil.rmtree(TMPDIR, ignore_errors=True)
 

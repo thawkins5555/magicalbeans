@@ -1295,6 +1295,10 @@ class NodePoller(Worker):
         this first) and for an operator disabling Nodes polling from
         Settings on an HTTP thread, neither of which should block on the
         network — shutdown() below is the version that waits."""
+        self.begin_stop()
+        self._join()
+
+    def begin_stop(self) -> None:
         self._stop.set()
         for job in list(self._discovery_jobs.values()):
             job.cancel()
@@ -1303,7 +1307,14 @@ class NodePoller(Worker):
         if self._mac_executor:
             self._mac_executor.shutdown(wait=False, cancel_futures=True)
             self._mac_executor = None
-        self._join()
+
+    def finish_stop(self, deadline: float) -> None:
+        # min, not shutdown()'s max, for the reason Monitor.finish_stop gives:
+        # the in-flight budget is a ceiling, and the shared teardown deadline
+        # wins when it is the smaller of the two.
+        self._join(timeout=max(0.0, deadline - time.monotonic()))
+        self.drain(min(max(0.0, deadline - time.monotonic()),
+                       self._inflight_budget_s()))
 
     def _inflight_ids(self) -> set[int]:
         with self._lock:

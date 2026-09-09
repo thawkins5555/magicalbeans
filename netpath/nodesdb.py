@@ -922,10 +922,18 @@ class NodesDatabase(SqliteStore):
     def _after_open(self) -> None:
         self._seed()
 
-    def close(self) -> None:
-        super().close()
-        self.series_db.close()
-        self.mib_db.close()
+    def close(self, timeout_s: float | None = None) -> None:
+        # One budget across all three files, not one each: this is a single
+        # store split over three connections, and the caller's deadline is
+        # for the store, not for each connection under it.
+        if timeout_s is None:
+            super().close()
+            self.series_db.close()
+            self.mib_db.close()
+            return
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        for store in (super(), self.series_db, self.mib_db):
+            store.close(max(0.0, deadline - time.monotonic()))
 
     def _migrate(self) -> None:
         # All nullable unless stated: NULL means "inherit the profile, then

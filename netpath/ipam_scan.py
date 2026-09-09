@@ -720,9 +720,18 @@ def is_never_scanned(ip: str, networks) -> bool:
 
 def sweep(addresses: list[str], timeout_ms: int = 800, workers: int = 64,
           probes_per_second: float = DEFAULT_PROBES_PER_SECOND,
-          never_scan=()) -> dict[str, bool]:
+          never_scan=(), stop=None) -> dict[str, bool]:
     """Ping every address, at most `probes_per_second` of them. Returns
     {ip: answered}.
+
+    `stop`, an Event, abandons the rest of the sweep when it is set: the
+    remaining addresses come back False and the pacing waits on it instead
+    of sleeping through it. Without one a sweep could not be cancelled at
+    all, and since its pool is a `with ThreadPoolExecutor(...)` — which is
+    shutdown(wait=True) — and pool threads are non-daemon and joined
+    untimed at interpreter exit, an in-flight sweep held the whole process
+    open long after its window had closed. A /16 at a gentled rate is many
+    minutes of that.
 
     Addresses inside `never_scan` are never probed at all and come back
     False — "did not answer" is exactly what they are to every caller, and
@@ -752,6 +761,8 @@ def sweep(addresses: list[str], timeout_ms: int = 800, workers: int = 64,
 
     def paced(index_ip):
         index, ip = index_ip
+        if stop is not None and stop.is_set():
+            return False
         if interval:
             # Absolute rather than a sleep per probe: a sleep between
             # submissions would add the probe's own latency to the gap and
@@ -759,7 +770,15 @@ def sweep(addresses: list[str], timeout_ms: int = 800, workers: int = 64,
             due = started + index * interval
             delay = due - time.monotonic()
             if delay > 0:
-                time.sleep(delay)
+                # wait(), not sleep(): a cancelled sweep must not sit out
+                # the pacing gap it was already committed to.
+                if stop is not None:
+                    if stop.wait(delay):
+                        return False
+                else:
+                    time.sleep(delay)
+        if stop is not None and stop.is_set():
+            return False
         return ping_once(ip, timeout_ms)
 
     started = time.monotonic()
@@ -772,7 +791,8 @@ def sweep(addresses: list[str], timeout_ms: int = 800, workers: int = 64,
 def scan_subnet(cidr: str, max_addresses: int, timeout_ms: int = 800,
                 workers: int = 64,
                 probes_per_second: float = DEFAULT_PROBES_PER_SECOND,
-                never_scan=()) -> tuple[dict[str, bool], dict[str, str]]:
+                never_scan=(),
+                stop=None) -> tuple[dict[str, bool], dict[str, str]]:
     """One full pass: ping every address, then read the ARP table once.
 
     Returns (alive, arp) — alive is every address probed, arp is whatever the
@@ -781,7 +801,8 @@ def scan_subnet(cidr: str, max_addresses: int, timeout_ms: int = 800,
     """
     addresses = usable_addresses(cidr, max_addresses)
     alive = sweep(addresses, timeout_ms=timeout_ms, workers=workers,
-                  probes_per_second=probes_per_second, never_scan=never_scan)
+                  probes_per_second=probes_per_second, never_scan=never_scan,
+                  stop=stop)
     arp = read_arp_table()
     net = ipaddress.ip_network(str(cidr).strip(), strict=False)
     in_subnet = {ip: mac for ip, mac in arp.items()

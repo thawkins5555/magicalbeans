@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.6.0 — Closing the window closes the application](#560--closing-the-window-closes-the-application)
 - [5.5.0 — Measured first, then made faster](#550--measured-first-then-made-faster)
 - [5.4.0 — Eight asks](#540--eight-asks)
 - [5.3.0 — Six asks](#530--six-asks)
@@ -129,6 +130,125 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.6.0 — Closing the window closes the application
+
+One report: "the update process is performing horribly — the desktop
+application takes an extremely long time to close, often needing the task to be
+ended manually; sometimes the update gives errors but appears to update
+anyway." Both halves turned out to be the same defect seen from two sides. The
+update's slowest step *is* the shutdown — `apply()` calls a before-restart hook
+that is `server.stop(); service.shutdown()`, the same sequence that runs when
+you close the window — and this codebase already carried the measurement, in a
+comment at the top of `selfupdate.py`: **37–63 seconds against a real fleet**.
+
+**The teardown was twenty timeouts added together.** `Service.shutdown()` asked
+each subsystem to stop and then waited for it, one after another, so every
+bound was paid in series: three ten-second thread joins, a thirty-second
+restart drain, three separate thirty-second drain ceilings for the trace,
+Nodes and wireless pollers, and so on down to the database closes. Each one is
+defensible on its own; added up they are minutes. It now signals every
+subsystem first and waits once, against a **single eight-second wall-clock
+budget** shared by all of them, and closes the databases inside a further two.
+Measured with every worker wedged, the maintenance lock held and a store lock
+held by a live query: the old code was **still going after 200 seconds**; the
+new one finishes in **8.0**. `tests/test_service_shutdown.py` asserts that
+number now, which nothing did before — that is how it drifted this far.
+
+**And one of those waits had no bound at all.** `shutdown()` joined the
+maintenance thread with a ten-second timeout and then, two lines later, did
+`with self._maintenance_lock:` — an untimed acquire on the very lock the
+abandoned sweep still held. The timeout was cosmetic: the shutdown waited out
+the whole sweep however long it took. Worse, the sweep could not see the stop
+flag until two thirds of the way through its body, after five retention passes
+each budgeted at up to thirty seconds. The lock is now taken with a timeout,
+and the sweep checks between every stage — it persists nothing that a dropped
+pass loses, which is why it was safe to interrupt all along.
+
+**Closing the window no longer freezes it.** All of that ran on the Qt GUI
+thread, in `ConsoleWindow.closeEvent`. Windows ghosts a window that stops
+answering for a few seconds as *Not Responding*, so operators ended the task —
+which aborted the teardown partway through, which is the worst of both. The
+close is now accepted immediately, a small "Shutting down…" notice appears, and
+the teardown runs on a thread of its own: `closeEvent` returns in about **five
+milliseconds** instead of blocking for the whole teardown, and the window stays
+responsive throughout. A twenty-second backstop ends the process even if the
+teardown overruns — but never out from under an update that is still
+installing, because that install is about to spawn the replacement.
+
+**The process now actually exits.** This is the part that explains "had to end
+the task" even after the window had gone. Every worker calls
+`executor.shutdown(wait=False, cancel_futures=True)` and treats it as
+non-blocking, and it is — at the call site. It is not at interpreter shutdown,
+where `concurrent.futures` joins every pool thread **with no timeout at all**;
+the threads are not daemons, and `cancel_futures` only drops work that had not
+started yet. So a poll, a traceroute or an IPAM subnet sweep still in flight
+held the process open with nothing on screen. Two fixes: the sweep is now
+cancellable at all — it took no stop event, paced with a bare `time.sleep`, and
+nested a second pool it waited on, which is why its own comment says "a sweep
+in flight can take minutes" — and both entry points end the process
+deliberately once every store is closed, rather than unwinding into a shutdown
+that joins those threads. A headless `SIGTERM` now stops the service in **0.6
+seconds**.
+
+**Syslog's TCP clients were 128 seconds of that budget.** Stopping the
+collector closed the listening socket but never the accepted connections, and
+each client thread sits in `recv()` behind a thirty-second timeout — so it
+could not see the stop flag, and its two-second join always expired. The joins
+were serial and the default cap is 64 connections. The accepted sockets are now
+closed when the collector is asked to stop, so the threads end at once, and the
+joins share one budget instead of taking one each.
+
+**A database close could wait forever.** `close()` took the store lock with no
+timeout. The web server's request threads are daemons that deliberately outlive
+`WebServer.stop()`, so a wide syslog or flow search started a moment before
+shutdown held that lock — and the close behind it — for as long as the query
+ran. It now waits a bounded time and then closes anyway: a worker mid-query
+gets `Cannot operate on a closed database`, which every worker already guards
+for and which costs one measurement, against a shutdown that never returns.
+
+**The update no longer reports a failure over a working update.** The browser
+gave the restart sixty seconds and then painted a red "Still not reachable
+after a minute" — but by the time that runs the new code is already on disk, so
+it was reporting a failure over an update that had succeeded, and sixty seconds
+was never enough anyway: two seconds of grace, plus the teardown above, plus
+the swap, plus the restart delay, plus a cold start that opens twelve SQLite
+files and starts every worker. There is no deadline now, because the page
+cannot tell a slow restart from a dead one and should not pretend to. It waits
+for the old listener to go away first (a poll answered by the process that is
+about to exit used to send the browser to the sign-in page of a service that
+was going down), then waits as long as it takes, saying how long it has been,
+and releases the modal after two minutes so the operator can go and look.
+
+**An update that had already stopped the service always restarts now.** Past
+the before-restart hook the listener is down and every worker has stopped, so a
+failure that returns without scheduling a restart leaves a process serving
+nothing — with, on the desktop, a window still open over it. That is a state
+that has to be killed. `_swap_in` renames the package directory this process is
+running out of, so anything after it can meet a half-swapped tree: the recovery
+path's own lazy `from .appdb import write_meta` raises `ImportError`, which is
+not an `OSError`, and walked straight past the `schedule_restart()` two lines
+below it. Rather than add another `except` clause, the update job now
+guarantees it structurally — if the process was quiesced and no restart was
+scheduled, one is scheduled, exactly once.
+
+**And a proxy failure reads as a proxy failure.** `IncompleteRead` and
+`RemoteDisconnected` — what a corporate proxy produces — are not `URLError`s,
+and the first is not an `OSError` either, so both escaped as "The update
+stopped unexpectedly", which sends an operator hunting a bug instead of looking
+at their proxy. Both now report as connectivity. When the install markers
+cannot be put back after a failed swap, the UI says so as well: `app.db` is
+then naming a version that is not installed, and until now only
+`update_restart.log` knew.
+
+**Smaller things in the same area.** `update_restart.log` is rotated at 512 KB
+instead of growing forever inside the install directory. `selfupdate.wait_for_job`
+existed and was documented as being "for a shutdown that would otherwise close
+app.db under a running install" — nothing called it; the console's teardown
+does now. The maintenance sweep, the two search backfills and the restart drain
+all take their timeout from the shared deadline rather than each having their
+own. `tests/test_console_shutdown.py` is new and drives a real console window
+offscreen; it is skipped where PySide6 is absent, which includes CI's suite job.
 
 ### 5.5.0 — Measured first, then made faster
 

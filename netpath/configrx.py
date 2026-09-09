@@ -802,10 +802,16 @@ class ConfigRxWorker(Worker):
         self.db.start_search_backfill()
 
     def stop(self) -> None:
+        self.begin_stop()
+        self._join()
+
+    def begin_stop(self) -> None:
         self._stop.set()
         if self._executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
-        self._join()
+
+    # finish_stop is Worker's: the loop thread only. A backup already running
+    # is on a cancelled pool and writes through its own guard.
 
     def status_text(self) -> str:
         # The paramiko check sits between error and running: a worker that

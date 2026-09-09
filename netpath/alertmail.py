@@ -448,6 +448,11 @@ class MailQueue(Worker):
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
 
+    def begin_stop(self) -> None:
+        """Ask the sender to wind down without waiting for it, so a service
+        teardown can signal every subsystem before it waits for any."""
+        self._stopping.set()
+
     # -------------------------------------------------------------- submit
 
     def submit(self, job: MailJob) -> bool:
@@ -721,6 +726,11 @@ class WebhookQueue(Worker):
         self._stopping.set()
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
+
+    def begin_stop(self) -> None:
+        """Ask the sender to wind down without waiting for it, so a service
+        teardown can signal every subsystem before it waits for any."""
+        self._stopping.set()
 
     def submit(self, job: WebhookJob) -> bool:
         if not self.running:

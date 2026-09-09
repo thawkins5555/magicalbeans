@@ -63,7 +63,11 @@ class SyslogCollector(udpsock.UdpReceiver):
         self._buckets: collections.OrderedDict = collections.OrderedDict()
         self._rate = 0.0
         self._max_tcp_clients = 64
-        self._clients: list[threading.Thread] = []
+        # (thread, socket) per accepted connection, not just the thread: a
+        # client thread is parked in recv() behind a 30s timeout, so closing
+        # its socket is the only thing that ends it promptly. Keeping only
+        # the thread meant stop() waited out that timeout per connection.
+        self._clients: list[tuple[threading.Thread, socket.socket]] = []
 
     # --------------------------------------------------------------- lifecycle
 
@@ -140,13 +144,29 @@ class SyslogCollector(udpsock.UdpReceiver):
         self.log.add(SYSTEM, f"Syslog listening on {address} ({where})")
         return True
 
-    def stop(self) -> None:
-        super().stop()
-        for thread in self._clients:
+    def begin_stop(self) -> None:
+        super().begin_stop()
+        # Close every accepted connection, not just the listener the base
+        # class closes. Each client thread is blocked in recv() behind
+        # client.settimeout(30) (see _read_stream), so without this it cannot
+        # see the stop flag for up to 30 seconds and the join below always
+        # expires: with the default 64 connections that was two minutes of
+        # shutdown for nothing.
+        for _thread, client in self._clients:
+            try:
+                client.close()
+            except OSError:
+                pass
+
+    def finish_stop(self, deadline: float) -> bool:
+        landed = super().finish_stop(deadline)
+        for thread, _client in self._clients:
             if thread.is_alive():
-                thread.join(timeout=2)
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        landed = landed and not any(t.is_alive() for t, _ in self._clients)
         self._clients = []
         self.counters["tcp_clients"] = 0
+        return landed
 
     # ------------------------------------------------------------------ errors
 
@@ -253,7 +273,7 @@ class SyslogCollector(udpsock.UdpReceiver):
             # exhausted threads and then memory. Dead ones are reaped on every
             # accept and the live ones are capped.
             address = (udpsock.normalise_source(address[0]),) + tuple(address[1:])
-            self._clients = [t for t in self._clients if t.is_alive()]
+            self._clients = [pair for pair in self._clients if pair[0].is_alive()]
             self.counters["tcp_clients"] = len(self._clients)
             if len(self._clients) >= self._max_tcp_clients:
                 self.counters["tcp_refused"] += 1
@@ -265,7 +285,7 @@ class SyslogCollector(udpsock.UdpReceiver):
             thread = threading.Thread(
                 target=lambda c=client, a=address[0]: self._read_stream(c, a),
                 name="syslog-tcp-client", daemon=True)
-            self._clients.append(thread)
+            self._clients.append((thread, client))
             self.counters["tcp_clients"] = len(self._clients)
             thread.start()
 

@@ -265,15 +265,22 @@ class ConfigRxDatabase(SqliteStore):
         except sqlite3.OperationalError:
             self.search_fts = False
 
-    def close(self) -> None:
+    def begin_close(self) -> None:
+        self._search_backfill_stop.set()
+
+    def close(self, timeout_s: float | None = None) -> None:
         # Signal first, then give the backfill thread a bounded window to land
         # on a chunk boundary; it persists its cursor, so one that misses the
         # window just resumes from there next start.
-        self._search_backfill_stop.set()
+        self.begin_close()
+        budget = (SEARCH_BACKFILL_STOP_TIMEOUT_S if timeout_s is None
+                  else max(0.0, timeout_s))
+        deadline = time.monotonic() + budget
         thread = self._search_backfill_thread
         if thread is not None and thread.is_alive():
-            thread.join(timeout=SEARCH_BACKFILL_STOP_TIMEOUT_S)
-        super().close()
+            # The join and the close share the budget, not one each.
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        super().close(max(0.0, deadline - time.monotonic()))
 
     # ----------------------------------------------------------- device_config
 

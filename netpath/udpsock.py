@@ -317,7 +317,20 @@ class UdpReceiver:
             if not self._stop.is_set():
                 self._crash = f"{name} ended unexpectedly"
 
-    def stop(self) -> None:
+    # The whole join budget, shared by every thread rather than granted to
+    # each one. Per-thread it was 2s x however many threads happened to be
+    # running, which is how a receiver with clients attached turned a "2
+    # second" stop into minutes of it (see SyslogCollector.begin_stop).
+    JOIN_BUDGET_S = 2.0
+
+    def begin_stop(self) -> None:
+        """Ask every thread to end, and return without waiting for any of them.
+
+        Split from stop() so a caller shutting several subsystems down can ask
+        all of them first and wait once, rather than paying each one's join in
+        turn. Closing the sockets here is what actually wakes the receive
+        threads: they are parked in recv(), not watching the flag.
+        """
         if self.STOP_LOG and self.LOG_CATEGORY and self.running:
             self.log.add(self.LOG_CATEGORY, f"{self.NOUN} stopped")
         self._stop.set()
@@ -328,12 +341,28 @@ class UdpReceiver:
                 except OSError:
                     pass
         self._udp = self._tcp = None
+        self.bound = None
+
+    def finish_stop(self, deadline: float) -> bool:
+        """Wait, until `deadline` (a time.monotonic() value), for the threads
+        begin_stop() asked to end. True if they all did. One deadline for the
+        set, not one per thread; anything still alive at the end is filed as
+        lingering and joined properly by the next start (_reset_for_start)."""
         for thread in self._threads:
             if thread.is_alive():
-                thread.join(timeout=2)
-        self._lingering += [t for t in self._threads if t.is_alive()]
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        stragglers = [t for t in self._threads if t.is_alive()]
+        self._lingering += stragglers
         self._threads = []
-        self.bound = None
+        return not stragglers
+
+    def stop(self) -> None:
+        """Signal and wait, for a caller with only this receiver to stop —
+        a settings change, or the console's start/stop button. Service
+        shutdown drives begin_stop/finish_stop directly instead, so its
+        budget is shared with every other subsystem rather than added to it."""
+        self.begin_stop()
+        self.finish_stop(time.monotonic() + self.JOIN_BUDGET_S)
 
     # ------------------------------------------------------------------ access
 

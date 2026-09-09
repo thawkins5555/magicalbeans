@@ -80,9 +80,7 @@ class WirelessPoller(Worker):
         this first) and for an operator disabling wireless polling from
         Settings on an HTTP thread — shutdown() below is the version that
         waits, the same split netpath/nodepoll.py's NodePoller makes."""
-        self._stop.set()
-        if self._executor:
-            self._executor.shutdown(wait=False, cancel_futures=True)
+        self.begin_stop()
         self._join()
 
     def _inflight_ids(self) -> set[int]:
@@ -117,6 +115,17 @@ class WirelessPoller(Worker):
         under a poll still writing its result."""
         self.stop()
         self.drain(max(drain_s, self._inflight_budget_s()))
+
+    def begin_stop(self) -> None:
+        self._stop.set()
+        if self._executor:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def finish_stop(self, deadline: float) -> None:
+        # min, not shutdown()'s max — see Monitor.finish_stop.
+        self._join(timeout=max(0.0, deadline - time.monotonic()))
+        self.drain(min(max(0.0, deadline - time.monotonic()),
+                       self._inflight_budget_s()))
 
     def poll_now(self, controller_id: int) -> None:
         with self._lock:

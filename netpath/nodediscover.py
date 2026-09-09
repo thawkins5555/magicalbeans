@@ -256,7 +256,7 @@ class DiscoveryJob:
 
         alive = sweep(addresses, timeout_ms=int(ping_timeout_s * 1000),
                       probes_per_second=probes_per_second,
-                      never_scan=never_scan)
+                      never_scan=never_scan, stop=self._stop)
         for _ in range(ping_retries):
             if self._stop.is_set():
                 break
@@ -266,7 +266,7 @@ class DiscoveryJob:
             alive.update({ip: ok for ip, ok in
                           sweep(silent, timeout_ms=int(ping_timeout_s * 1000),
                                 probes_per_second=probes_per_second,
-                                never_scan=never_scan).items()
+                                never_scan=never_scan, stop=self._stop).items()
                           if ok})
 
         # The SNMP half is paced too, and by the same figure. A sweep that

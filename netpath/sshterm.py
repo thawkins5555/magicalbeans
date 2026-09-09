@@ -135,6 +135,10 @@ class SshSessionRegistry:
         self._lock = threading.Lock()
         self._sessions: set = set()
         self._stopping = False
+        # Handed from begin_stop() to finish_stop(); empty at every other
+        # moment, so a teardown that never reaches finish_stop leaks nothing.
+        self._stoppers: list[threading.Thread] = []
+        self._closing: list = []
         # Refused logins, keyed by (app user, device id) rather than by
         # socket — see MAX_AUTH_ATTEMPTS. Each entry is the timestamps still
         # inside the window (at most the cap's worth is kept) and whether the
@@ -243,26 +247,47 @@ class SshSessionRegistry:
         serially, sixteen sessions each blocked on a stuck socket would be
         minutes; anything still live when the budget runs out is force-closed.
         """
+        self.begin_stop()
+        self.finish_stop(time.monotonic() + SHUTDOWN_BUDGET_S)
+
+    def begin_stop(self) -> None:
+        """Start closing every session and return at once. The stoppers run
+        on threads of their own, so by the time finish_stop() waits they have
+        already been closing for however long the rest of the teardown took.
+
+        Idempotent, and it has to be: Service.shutdown() signals every
+        subsystem, waits out any restart still queued, then signals again —
+        and a second pass that re-snapshotted the sessions would replace the
+        stopper threads the first pass launched, leaving finish_stop() with
+        nothing to wait for.
+        """
         with self._lock:
+            if self._stopping:
+                return
             self._stopping = True
             live = list(self._sessions)
-        if not live:
-            return
-        deadline = time.time() + SHUTDOWN_BUDGET_S
-        stoppers = []
-        for session in live:
-            thread = threading.Thread(
-                target=session.stop, args=("The server is shutting down",),
-                name=f"ssh-stop-{session.device_id}", daemon=True)
+        self._closing = live
+        self._stoppers = [
+            threading.Thread(target=session.stop,
+                             args=("The server is shutting down",),
+                             name=f"ssh-stop-{session.device_id}", daemon=True)
+            for session in live]
+        for thread in self._stoppers:
             thread.start()
-            stoppers.append(thread)
+
+    def finish_stop(self, deadline: float) -> None:
+        """Wait for the stoppers begin_stop() launched, until `deadline` (a
+        time.monotonic() value); anything still live past it is force-closed
+        with unblock() and given SHUTDOWN_GRACE_S to notice."""
+        stoppers, self._stoppers = self._stoppers, []
+        live, self._closing = self._closing, []
         for thread in stoppers:
-            thread.join(timeout=max(0.0, deadline - time.time()))
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if self.count:
             for session in live:
                 session.unblock()
             deadline += SHUTDOWN_GRACE_S
-        while time.time() < deadline and self.count:
+        while time.monotonic() < deadline and self.count:
             time.sleep(0.05)
 
 
