@@ -572,6 +572,133 @@ def test_13_one_slot_takes_the_coarsest_tier() -> None:
     db.close()
 
 
+# ------------------------------------------------------------------------ 14
+
+def test_14_a_named_series_is_whole_in_every_bucket() -> None:
+    """test_2 proves the TOTALS survive the cap. This is the check it left
+    out: that a key the operator is watching — one of the window's top keys,
+    so a named band on the chart — reads its true value in every bucket,
+    including the buckets where the cap threw it away."""
+    print("14: a named series has no holes where the cap bit")
+    db = store("holes.db")
+    end = flowdb._align_down(time.time() - 300, 3600)
+    start = end - 3600
+    cap = ROLLUP_KEYS[60]
+    regulars = [f"10.2.0.{k} → 10.9.9.9" for k in range(10)]
+    flooded = (7, 23, 24)
+    rows = []
+    for minute in range(60):
+        ts = start + minute * 60 + 30
+        lull = minute in flooded
+        for k in range(10):
+            # Ten conversations that own the hour, at a tenth of their usual
+            # volume in the flooded minutes: still the window's top ten by a
+            # mile, and still present in those minutes — just no longer in
+            # their top-48.
+            rows.append(flow(k, ts, src_ip=f"10.2.0.{k}", dst_ip="10.9.9.9",
+                             bytes=(1_000 if lull else 100_000) + k, sampling=1))
+        if lull:
+            # Three times the cap in one-off conversations, each heavier in
+            # that minute than any regular is.
+            rows.extend(flow(i, ts, src_ip=f"10.3.{i // 256}.{i % 256}",
+                             dst_ip="10.9.9.9", bytes=5_000 + i, sampling=1)
+                        for i in range(cap * 3))
+    db.insert_flows(rows)
+    cover(db)
+
+    # First the fact the check below rests on: in a flooded minute the rollup
+    # really did drop the regulars, so agreement is not for want of a cap.
+    kept = {row["key"] for row in db._conn.execute(
+        "SELECT key FROM flow_rollup WHERE tier = 60 AND dim = ? AND bucket = ?",
+        (flowdb.DIMENSION_IDS["Conversation"],
+         start + flooded[0] * 60)).fetchall()}
+    check(len(kept) == cap and not (kept & set(regulars)),
+          f"the flooded minute's rollup holds the cap's worth of keys and "
+          f"none of the ten regulars ({len(kept)} kept, "
+          f"{len(kept & set(regulars))} regulars among them)")
+
+    for bucket in (60, 300, 3600):
+        got = db.overview(start, end, "Conversation", NO_FILTERS, bucket,
+                          series_limit=8, top_limit=10)
+        want = raw(db, "overview", start, end, "Conversation", NO_FILTERS,
+                   bucket, series_limit=8, top_limit=10)
+        plan = db._rollup_plan(start, end, "Conversation", NO_FILTERS, bucket)
+        holes = [(key, slot) for key, values in want[1].items()
+                 for slot, value in enumerate(values)
+                 if got[1].get(key, [None] * len(values))[slot] != value]
+        check(plan is not None and not holes,
+              f"at {bucket}s (tier {plan and plan[0]}) every named series "
+              f"equals raw in every bucket ({len(holes)} slots differ: "
+              f"{holes[:3]})")
+        check(got == want,
+              f"...and so does the rest of the {bucket}s answer")
+    check(db.top(start, end, "Conversation", NO_FILTERS, 10)
+          == raw(db, "top", start, end, "Conversation", NO_FILTERS, 10),
+          "the top rows over the window are exact too, not just ranked right")
+
+    # The bookkeeping that makes that possible.
+    dim = flowdb.DIMENSION_IDS["Conversation"]
+    flagged = [row["bucket"] for row in db._conn.execute(
+        "SELECT bucket FROM flow_rollup_trunc WHERE tier = 60 AND dim = ?"
+        " ORDER BY bucket", (dim,)).fetchall()]
+    check(flagged == [start + m * 60 for m in flooded],
+          f"exactly the flooded minutes are flagged for the dimension "
+          f"({[(b - start) // 60 for b in flagged]})")
+    check(db._conn.execute(
+        "SELECT COUNT(*) AS n FROM flow_rollup_trunc WHERE tier = 3600"
+        " AND dim = ? AND bucket = ?", (dim, start)).fetchone()["n"] == 1,
+          "and the hour built from them is flagged as well, since its sums "
+          "are short by what those minutes lost")
+    check(db._conn.execute(
+        "SELECT COUNT(*) AS n FROM flow_rollup_trunc WHERE dim = ?",
+        (flowdb.DIMENSION_IDS["Protocol"],)).fetchone()["n"] == 0,
+          "a dimension the cap never bit (three protocols) is not flagged")
+
+    # Compacting the bucket again writes the same flag, not a second one, and
+    # a bucket that no longer overflows loses its flag with its rows.
+    db._compact_bucket(60, start + flooded[0] * 60)
+    with db._lock:
+        db._conn.execute("DELETE FROM flows WHERE src_ip LIKE '10.3.%'"
+                         " AND ts_end >= ? AND ts_end < ?",
+                         (start + flooded[1] * 60, start + flooded[1] * 60 + 60))
+        db._conn.commit()
+    db._compact_bucket(60, start + flooded[1] * 60)
+    flagged = [row["bucket"] for row in db._conn.execute(
+        "SELECT bucket FROM flow_rollup_trunc WHERE tier = 60 AND dim = ?"
+        " ORDER BY bucket", (dim,)).fetchall()]
+    check(flagged == [start + m * 60 for m in (flooded[0], flooded[2])],
+          f"a rebuilt bucket keeps one flag, and one rebuilt under the cap "
+          f"drops its flag ({[(b - start) // 60 for b in flagged]})")
+
+    # Once retention has eaten the raw rows behind a flagged bucket there is
+    # nothing to repair it from, and the capped rollup is the honest answer:
+    # the hole is back, but the bucket's total is not, and the other flagged
+    # bucket, whose raw rows survive, is still whole.
+    with db._lock:
+        db._conn.execute("DELETE FROM flows WHERE ts_end < ?",
+                         (start + (flooded[0] + 1) * 60,))
+        db._conn.commit()
+    _t, series, _b, _top, _totals = db.overview(
+        start, end, "Conversation", NO_FILTERS, 60, series_limit=8)
+    spans = db._agg_rows(start, end, None, NO_FILTERS, 60)[4]
+    early, late = flooded[0], flooded[2]
+    check(all(series[key][early] == 0 for key in regulars[:8])
+          and all(series[key][late] == 1_000 + k
+                  for k, key in enumerate(regulars[:8])),
+          "a flagged bucket the raw rows no longer reach is served capped, "
+          "one they still reach is served whole")
+    check(sum(values[early] for values in series.values())
+          == spans[early][0],
+          "and the capped bucket still adds up to its span, to the byte")
+
+    # The flags go out with the rows they describe.
+    db.prune(0, 0, minute_days=0, rollup_days=0)
+    check(db._conn.execute("SELECT COUNT(*) AS n FROM flow_rollup_trunc"
+                           ).fetchone()["n"] == 0,
+          "retention takes the flags with the rollup rows")
+    db.close()
+
+
 TESTS = [
     test_1_rollup_and_raw_agree,
     test_2_totals_survive_truncation,
@@ -586,6 +713,7 @@ TESTS = [
     test_11_the_residual_never_stacks_downwards,
     test_12_a_rewrite_reaches_both_tiers,
     test_13_one_slot_takes_the_coarsest_tier,
+    test_14_a_named_series_is_whole_in_every_bucket,
 ]
 
 

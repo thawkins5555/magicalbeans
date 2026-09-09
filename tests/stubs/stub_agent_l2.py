@@ -32,12 +32,38 @@ Modes:
   cambium       a Cambium sysObjectID and the four RF_METRICS[17713]
                 scalars, numbered exactly as demo/personas.py's
                 cambium_ptp persona answers them.
+  arp           the legacy ipNetToMediaTable only (RFC 1213's, what nearly
+                every agent actually populates): three good rows on two
+                interfaces, one invalid(2) row that must be dropped, one
+                whose PhysAddress is four octets (not a MAC) that must be
+                dropped, and one MAC whose six bytes are all printable
+                ASCII — the shape this app's OCTET STRING decoder hands
+                back as text rather than colon-hex, which
+                nodepoll._octets_from_value must still turn into the right
+                six bytes.
+  arp_physical  the IP-MIB successor ipNetToPhysicalTable only — what
+                newer gear populates instead: an IPv4 row, an IPv6
+                neighbour on the same MAC, a local(5) row, an invalid(2)
+                row to drop and a dns(16)-typed row to skip.
+  arp_both      both tables at once, with one row that is ONLY in the
+                successor table — a modern agent answering both. The
+                legacy table must win outright (no merge): the
+                successor-only row must not appear, and nothing may be
+                double-counted.
+  no_arp        generic scalars only, neither ARP table.
+  arp_big       120 ipNetToMediaTable rows across four interfaces — enough
+                to measure a GETBULK walk's request count against, and to
+                put a snmp_walk_max_rows cap below.
 
-Two control datagrams, on the same socket as SNMP itself (see
+Control datagrams, on the same socket as SNMP itself (see
 stub_agent_fdb.py, which established this convention):
   STATS       -> the request count so far, as decimal text
   RESET       -> zeroes it
   BUMP_TOPO   -> increments the STP topology-change counter (stp mode only)
+  HIDE <ip>   -> stops serving that IP's ARP row(s) in every arp mode, so a
+                 second walk sees the entry gone — for the "the entry aged
+                 out of the cache" history test. stub_agent_fdb.py's
+                 HIDE <mac>, keyed by address instead.
 """
 import os
 import socket
@@ -127,10 +153,126 @@ CAMBIUM_TABLE = {
     "1.3.6.1.4.1.17713.21.1.2.4.0": ("int", -31),
 }
 
+# ------------------------------------------------------------------- ARP
+# ipNetToMediaTable, index ifIndex.a.b.c.d. Columns: .1 ifIndex (INTEGER,
+# present so the walk of .2 has a neighbour before it), .2 PhysAddress,
+# .4 type (1 other, 2 invalid, 3 dynamic, 4 static). .3 (the address again,
+# as IpAddress) is deliberately absent: the walker never asks for it, and
+# the app's stub encoder has no IpAddress tag anyway.
+_MEDIA = "1.3.6.1.2.1.4.22.1"
+ARP_MEDIA_TABLE = {
+    f"{_MEDIA}.1.1.10.0.0.5":  ("int", 1),
+    f"{_MEDIA}.1.1.10.0.0.6":  ("int", 1),
+    f"{_MEDIA}.1.1.10.0.0.7":  ("int", 1),
+    f"{_MEDIA}.1.2.10.0.1.9":  ("int", 2),
+    f"{_MEDIA}.1.2.10.0.1.66": ("int", 2),
+    f"{_MEDIA}.2.1.10.0.0.5":  ("bytes", bytes([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])),
+    f"{_MEDIA}.2.1.10.0.0.6":  ("bytes", bytes([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])),
+    # Four octets: a PhysAddress that is not a MAC (a DLCI, say). Dropped.
+    f"{_MEDIA}.2.1.10.0.0.7":  ("bytes", bytes([0x0a, 0x00, 0x00, 0x07])),
+    # "ABCDEF" — six printable bytes, so the decoder hands back text.
+    f"{_MEDIA}.2.2.10.0.1.9":  ("bytes", b"ABCDEF"),
+    f"{_MEDIA}.2.2.10.0.1.66": ("bytes", bytes([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01])),
+    f"{_MEDIA}.4.1.10.0.0.5":  ("int", 3),   # dynamic
+    f"{_MEDIA}.4.1.10.0.0.6":  ("int", 4),   # static
+    f"{_MEDIA}.4.1.10.0.0.7":  ("int", 3),
+    f"{_MEDIA}.4.2.10.0.1.9":  ("int", 3),
+    f"{_MEDIA}.4.2.10.0.1.66": ("int", 2),   # invalid: being removed, drop it
+}
+# ipNetToPhysicalTable, index ifIndex.addrType.addrLen.<addrLen arcs>.
+# Columns: .4 PhysAddress, .6 type (adds local(5) to the enum above).
+_PHYS = "1.3.6.1.2.1.4.35.1"
+_FE80_1 = "2.16." + ".".join(str(b) for b in bytes.fromhex("fe800000000000000000000000000001"))
+ARP_PHYSICAL_TABLE = {
+    f"{_PHYS}.4.1.1.4.10.0.0.5":  ("bytes", bytes([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])),
+    # The same host's link-local IPv6 address, on the same MAC.
+    f"{_PHYS}.4.1.{_FE80_1}":     ("bytes", bytes([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])),
+    f"{_PHYS}.4.2.1.4.10.0.1.1":  ("bytes", bytes([0x00, 0x00, 0x5e, 0x00, 0x01, 0x01])),
+    f"{_PHYS}.4.2.1.4.10.0.1.9":  ("bytes", b"ABCDEF"),
+    f"{_PHYS}.4.2.1.4.10.0.1.66": ("bytes", bytes([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01])),
+    # dns(16)-typed address "host": legal in the MIB, not something this
+    # app can store as an IP. Skipped.
+    f"{_PHYS}.4.2.16.4.104.111.115.116": ("bytes", bytes([0, 0, 0, 0, 0, 0x99])),
+    f"{_PHYS}.6.1.1.4.10.0.0.5":  ("int", 3),   # dynamic
+    f"{_PHYS}.6.1.{_FE80_1}":     ("int", 3),
+    f"{_PHYS}.6.2.1.4.10.0.1.1":  ("int", 5),   # local: the router's own address
+    f"{_PHYS}.6.2.1.4.10.0.1.9":  ("int", 4),   # static
+    f"{_PHYS}.6.2.1.4.10.0.1.66": ("int", 2),   # invalid
+    f"{_PHYS}.6.2.16.4.104.111.115.116": ("int", 3),
+}
+# What a modern agent answering BOTH tables adds to the successor table
+# only — must never show up while the legacy table has anything to say.
+ARP_PHYSICAL_EXTRA = {
+    f"{_PHYS}.4.3.1.4.10.0.9.9": ("bytes", bytes([0x02, 0x00, 0x00, 0x00, 0x99, 0x99])),
+    f"{_PHYS}.6.3.1.4.10.0.9.9": ("int", 3),
+}
+
+
+def _big_arp_table():
+    """120 ipNetToMediaTable rows across four interfaces, each with a
+    distinct deterministic MAC — the shape "120-row ARP cache" refers to."""
+    table = {}
+    for if_index in range(1, 5):
+        for host in range(1, 31):
+            ip = f"10.{if_index}.0.{host}"
+            suffix = f"{if_index}.{ip}"
+            table[f"{_MEDIA}.2.{suffix}"] = (
+                "bytes", bytes([0x02, 0xaa, if_index, 0, 0, host]))
+            table[f"{_MEDIA}.4.{suffix}"] = ("int", 3)
+    return table
+
+
+ARP_BIG_TABLE = _big_arp_table()
+
+HIDDEN_IPS = set()   # addresses (see HIDE) currently withheld from the ARP tables
+
+
+def _ip_of_arp_oid(oid):
+    """The address an ARP-table row OID's index spells out, in the form
+    nodepoll stores it, or "" for an OID that is not an ARP row. Legacy
+    rows end in the four dotted-decimal arcs; successor rows carry
+    addrType.addrLen.<arcs> after the ifIndex."""
+    import ipaddress
+    parts = oid.split(".")
+    try:
+        if oid.startswith(_MEDIA + "."):
+            return str(ipaddress.ip_address(bytes(int(p) for p in parts[-4:])))
+        if oid.startswith(_PHYS + "."):
+            base_len = len(_PHYS.split(".")) + 1   # column arc
+            if_type_len = parts[base_len + 1:base_len + 3]
+            addr_len = int(if_type_len[1])
+            arcs = [int(p) for p in parts[base_len + 3:]]
+            if len(arcs) != addr_len or addr_len not in (4, 16):
+                return ""
+            return str(ipaddress.ip_address(bytes(arcs)))
+    except (ValueError, IndexError):
+        return ""
+    return ""
+
+
+def _without_hidden(table):
+    if not HIDDEN_IPS:
+        return table
+    return {oid: entry for oid, entry in table.items()
+            if _ip_of_arp_oid(oid) not in HIDDEN_IPS}
+
+
 MODE = "lldp"
 
 
 def table_for():
+    if MODE == "arp":
+        return {**GENERIC_SCALARS, **_without_hidden(ARP_MEDIA_TABLE)}
+    if MODE == "arp_physical":
+        return {**GENERIC_SCALARS, **_without_hidden(ARP_PHYSICAL_TABLE)}
+    if MODE == "arp_both":
+        return {**GENERIC_SCALARS,
+                **_without_hidden({**ARP_MEDIA_TABLE, **ARP_PHYSICAL_TABLE,
+                                   **ARP_PHYSICAL_EXTRA})}
+    if MODE == "no_arp":
+        return dict(GENERIC_SCALARS)
+    if MODE == "arp_big":
+        return {**GENERIC_SCALARS, **_without_hidden(ARP_BIG_TABLE)}
     if MODE == "lldp":
         return {**GENERIC_SCALARS, **LLDP_TABLE}
     if MODE == "cdp":
@@ -196,6 +338,12 @@ def main():
         if data == b"BUMP_TOPO":
             TOPO_CHANGES += 1
             sock.sendto(str(TOPO_CHANGES).encode(), addr)
+            continue
+        if data.startswith(b"HIDE "):
+            ip = data[5:].decode("utf-8", "replace").strip()
+            if ip:
+                HIDDEN_IPS.add(ip)
+            sock.sendto(b"ok", addr)
             continue
         try:
             request = decode_response(data)
