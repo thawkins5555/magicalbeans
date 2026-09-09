@@ -31,6 +31,7 @@ from netpath.alertsdb import AlertsDatabase
 from netpath.nodesdb import NodesDatabase
 from netpath.snmptrapdb import SnmpTrapDatabase
 from netpath.sqlitebase import TRIM_LOCK_TARGET_S
+from netpath import syslogdb
 from netpath.syslogdb import SyslogDatabase
 from netpath.syslogparse import LogEntry
 
@@ -245,7 +246,14 @@ def log_entries(stamps):
             for i, ts in enumerate(stamps)]
 
 
-SYSLOG_ROWS = 120_000
+# Sized FROM the shipped chunk rather than fixed, so this exercises whatever
+# syslogdb is actually tuned to. Half the rows are pruned, so twenty chunks'
+# worth of rows is ten batches of real work — enough for "no single hold is
+# most of the sweep" to be a claim about batching rather than about there
+# having been only two batches. A fixed row count silently stops testing
+# anything the day somebody retunes PRUNE_CHUNK, which is exactly what
+# happened when it moved from 10,000 to 50,000.
+SYSLOG_ROWS = max(120_000, syslogdb.PRUNE_CHUNK * 20)
 SYSLOG_DAYS = 30.0
 stamps = spread(SYSLOG_ROWS, SYSLOG_DAYS, now)
 for start in range(0, SYSLOG_ROWS, 10_000):

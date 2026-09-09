@@ -31,6 +31,25 @@ log = logging.getLogger(__name__)
 #      2,000 rows      13.1 s, 250 holds, worst 462 ms, reader stalled 701 ms
 #     10,000 rows       8.3 s,  50 holds, worst 339 ms, reader stalled 481 ms
 #
+# On the repetitive shape real syslog actually has - the bench holds only
+# 10,000 distinct messages in a million rows, so every FTS posting list is a
+# hundred entries long and the FTS delete dominates - the same sweep is much
+# more expensive, and the size that wins moves with it:
+#
+#      2,000 rows      31.9 s, reader stalled 2,856 ms
+#     10,000 rows      31.8 s, reader stalled 3,497 ms
+#     25,000 rows      16.9 s, reader stalled 3,183 ms
+#     50,000 rows       9.4 s, reader stalled 2,772 ms
+#    100,000 rows       9.2 s, reader stalled 2,877 ms
+#
+# 50,000 looks better on both of those columns and was tried; it is not.
+# Measured per LOCK HOLD rather than per sweep, a 50,000-row batch on this
+# store holds the store for a median of 578 ms - nearly four times the
+# 150 ms target, and a UI freeze of that length every batch. The shorter
+# total is bought by making each individual pause worse, which is the
+# opposite of what this is for: nothing waits on the sweep finishing, and
+# everything waits on a hold. 10,000 stays.
+#
 # Committing in pieces costs something whatever the size - a batch's commit
 # rewrites the index pages it dirtied, and the next batch dirties more of the
 # same - so the largest batch that still keeps the hold near the target wins
