@@ -1308,8 +1308,9 @@ already in hand once a second — the interval is in `_configs`, and `_run_one`
 already stamped a start and a finish and formatted the difference into a log
 line — so `_record_poll_cost` keeps it as a per-device EWMA and
 `_schedule_pass` accumulates the sum inside the loop that already reads every
-device. No extra query and no extra iteration: a steady pass at 300 devices is
-still one SQL statement, which is what `tests/test_scheduler.py` pins.
+device. No extra query and no extra iteration: `tests/test_scheduler.py` pins a
+steady pass at no more than five SQL statements whatever the fleet size, and it
+still measures one.
 
 **Why not queue depth.** It is bimodal here by construction. `_schedule_pass`
 submits every due device in one burst, so the queue spikes at the top of a
@@ -1357,8 +1358,8 @@ hundred thousand threads.
 key but fires only at the ceiling. Below it, `_note_saturation` does not even
 start its clock: the controller corrects within fifteen seconds, and alerting
 on something the application is already fixing is how operators learn to stop
-reading alerts. `_autoscale_ceiling` is `None` until the autoscaler has run,
-which is both the auto-off case and the case of a poller whose `start()` never
+reading alerts. `_autoscale_ceiling` is set by `_read_pool_settings` at `start()`/`reconfigure()`
+time and is `None` only when auto-sizing is off or `start()` never
 ran — which is how `tests/test_poll_write_path.py` drives `_note_saturation`,
 and why the gate reads poller state rather than the database.
 
@@ -1445,7 +1446,7 @@ lock, not merely every write, so although all thirteen files are in WAL mode
 and WAL would let readers run alongside a writer, that concurrency is
 unreachable through one connection behind one Python lock. `SqliteStore`'s
 `RLock` is now an `InstrumentedLock` recording acquisitions, wait, hold and
-worst hold — one change at one site, which instruments all 139 lock sites in
+worst hold — one change at one site, which instruments all 138 lock sites in
 `nodesdb` alone. Re-entrancy is counted per thread with only the outermost
 acquisition recorded, since several stores nest their lock on purpose;
 `acquire()`/`release()` are implemented alongside the context manager because

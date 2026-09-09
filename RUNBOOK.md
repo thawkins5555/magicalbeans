@@ -334,8 +334,10 @@ what you want.
 ## The interface freezes for a few seconds, every so often
 
 **Symptom.** The whole UI stalls briefly and then carries on, with no error
-anywhere. Often close to a quarter past the hour, or fifteen minutes after a
-settings save.
+anywhere. Every fifteen minutes or so — the sweep runs on a timer from when it
+last ran, not on the clock, so it will not be at a fixed minute past the hour —
+and immediately after a save on Settings, which asks for a pass rather than
+waiting for the timer.
 
 **Cause.** The retention sweep. Each store is one connection behind one lock,
 and a prune that deletes in a single statement holds that lock for its whole
@@ -385,8 +387,9 @@ concurrency: 48 against a pool of 16 means 16 polls in flight and 32 waiting.
    the poll interval and it gives up after three consecutive timeouts, logging
    "read N of M". Look for that message.
 3. **Check whether the pool is sizing itself.** From 5.5.0 it does, unless
-   somebody turned that off: the Dashboard's poller tile and the status strip
-   read `auto <floor>-<ceiling>` when it is on. **With auto on, this alert
+   somebody turned that off: the status strip reads `auto <floor>-<ceiling>`
+   when it is on, and the Dashboard's poller tile says it is sizing itself
+   between the two. **With auto on, this alert
    means the CEILING was not enough** — the pool has already grown as far as
    it is allowed and is still behind. Below the ceiling the alert does not
    fire at all, because the pool corrects itself within fifteen seconds and
@@ -400,7 +403,8 @@ concurrency: 48 against a pool of 16 means 16 polls in flight and 32 waiting.
    in steps, watching CPU. 128 is the shipped ceiling and 16 the shipped
    floor; an install upgraded from 5.4.0 or earlier has its own previous
    `poll_workers` as the floor, so it can only ever have gained threads.
-   With auto off, *Poll worker threads* is still the number, exactly as
+   With auto off, *Poll worker threads (when not automatic)* is still the
+   number, exactly as
    before.
 6. **If it is steady-state saturation at your fleet size**, you are at the
    capacity of one instance. `NETWORK-AND-STORAGE-REQUIREMENTS.md` has

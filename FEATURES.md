@@ -504,7 +504,7 @@ own subtabs.
   grows quickly, shrinks slowly, and never moves more than once a minute. A
   fleet that outgrows the ceiling still raises `poll_pool_saturated`, which
   is the one case that needs a person. An upgrade takes the install's
-  existing **Poll worker threads** as the floor, so no fleet can end up with
+  existing **Poll worker threads** setting as the floor, so no fleet can end up with
   fewer threads than it already had, and that setting still decides the size
   outright for anyone who switches auto-sizing off.
 - **A device that is down stops costing the pool so much.** A device that is

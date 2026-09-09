@@ -451,10 +451,12 @@ which path a running install is on.
 
 Retention is the other half, and it is not the volume that hurts but the
 pause: a prune holds its store's write lock, so every page waits behind it.
-Measured with `tests/bench_prune.py` at a million rows, before the batching
-work: syslog **8.7 s**, alerts 3.5 s, traps 2.1 s. The syslog figure is the
-one to know, because the shipped cap is twenty times the row count it was
-measured at.
+Measured with `tests/bench_prune.py` at a million rows, before and after the
+batching work — paired runs in one sitting, with two prunes that already
+released the lock measured alongside as controls: syslog **6.4 s to 2.1 s**,
+alerts 3.6 s to 0.19, traps 2.8 s to 0.42. The syslog figure is the one to
+know, both because it is the worst and because the shipped cap is twenty
+times the row count it was measured at.
 
 Re-measure on your own hardware rather than trusting any of these numbers —
 that is what those two benches are for. `FEATURES.md` says "hundreds of

@@ -226,13 +226,30 @@ class NodesMibDatabase(SqliteStore):
     def mib_generation(self) -> tuple:
         """Changes whenever the MIB corpus does — an upload, a delete, a
         catalog install or a resolve-all rewrite — so the poller can keep
-        one built index until it is actually stale."""
+        one built index until it is actually stale.
+
+        The counter is what makes that true, and the shape of the table is
+        why it has to be there. `mib_objects.id` is INTEGER PRIMARY KEY
+        without AUTOINCREMENT, so SQLite reuses ids freed at the top of the
+        table: re-resolving a file deletes its rows and re-inserts the same
+        NUMBER of rows into the same id range, leaving MAX(id), the object
+        count and the file count all identical. Anything keyed on those
+        three alone would go on serving the pre-resolve names — numeric OIDs
+        for the objects the Resolve button had just made known — until some
+        unrelated MIB happened to move one of them.
+
+        Bumped by every write here rather than by each caller, because the
+        callers are several and in other modules (the resolve-all loop is in
+        mibparse, the catalog install runs on its own thread) and one that
+        forgets is a silent wrong answer rather than a crash.
+        """
         with self._lock:
             row = self._conn.execute(
                 "SELECT (SELECT MAX(id) FROM mib_objects) AS top,"
                 " (SELECT COUNT(*) FROM mib_objects) AS n_objects,"
                 " (SELECT COUNT(*) FROM mib_files) AS n_files").fetchone()
-        return (row["top"], row["n_objects"], row["n_files"])
+            writes = self._writes
+        return (row["top"], row["n_objects"], row["n_files"], writes)
 
     # ------------------------------------------------------------- migration
 

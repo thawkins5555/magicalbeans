@@ -760,6 +760,13 @@
       App.get(`/api/nodes/devices/${deviceId}`),
       sub ? App.get(`/api/nodes/devices/${deviceId}/${sub.path}`) : null,
     ]);
+    // The selection can move while this is in flight — a big switch's
+    // interface read is slower than a small one's, so two ticks can land out
+    // of order. Without this, the slow reply would paint the previous
+    // device's rows under the current one's name AND claim detailSubFor for
+    // it, which then makes selectDetailSub discard the right device's fetch
+    // until the next tick corrects it. loadDetailSub guards the same way.
+    if (view.selected !== deviceId) return;
     view.detail = detail.device;
     // A new selection leaves the four hidden panes holding the PREVIOUS
     // device's rows, and a switch to one would show them under this

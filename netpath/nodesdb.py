@@ -1124,7 +1124,7 @@ class NodesDatabase(SqliteStore):
         for name in ("ix_vlans_device", "ix_vlan_ports_device", "ix_port_vlans_device"):
             self._conn.execute(f"DROP INDEX IF EXISTS {name}")
 
-        # The pool sizes itself from 5.4.0, and an upgrade must not be able
+        # The pool sizes itself from 5.5.0, and an upgrade must not be able
         # to take threads away from a fleet that was tuned by hand. An
         # install that has never seen poll_workers_min gets its own stored
         # poll_workers as the floor, so the number the operator chose becomes
@@ -1145,6 +1145,25 @@ class NodesDatabase(SqliteStore):
             self._conn.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES "
                 "('poll_workers_min', ?)", (json.dumps(floor),))
+            # ...and lift the ceiling to meet it if the operator was already
+            # above the shipped default. The old browser allowed 256, so an
+            # install at 200 would otherwise get floor 200 against ceiling
+            # 128. The poller resolves that pair floor-first and keeps 200,
+            # so nothing looks wrong -- until the first save of the Nodes
+            # dialog, where _clamp_pool_settings resolves it ceiling-first
+            # and quietly cuts the fleet to 128. Two resolvers with opposite
+            # tie-breaks is what would make that loss silent.
+            ceiling = self._conn.execute(
+                "SELECT value FROM settings WHERE key = 'poll_workers_max'"
+            ).fetchone()
+            try:
+                ceiling = int(json.loads(ceiling["value"])) if ceiling else 128
+            except (TypeError, ValueError, json.JSONDecodeError):
+                ceiling = 128
+            if ceiling < floor:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES "
+                    "('poll_workers_max', ?)", (json.dumps(floor),))
 
     def _seed(self) -> None:
         """Creates a `Default` polling profile if none exists yet. Idempotent

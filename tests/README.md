@@ -100,7 +100,7 @@ callback while the method executes, so the plan can never drift from the SQL
 the module builds. That column is the durable half of the baseline: it records
 whether each read scans or seeks, which is the fact an index would have to
 change. Sizes are scale factors over a base profile (default `1 4 16`), chosen
-so `x4` puts the fleet at the 2,000 devices the comment at `nodesdb.py:1282`
+so `x4` puts the fleet at the 2,000 devices the comment in `nodesdb.py`'s device search
 records its text-search measurement against.
 
 `bench_lock_contention.py` answers the one architectural question this

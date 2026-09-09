@@ -1200,8 +1200,7 @@ class NodePoller(Worker):
         self._read_pool_settings(settings)
         self._executor = ThreadPoolExecutor(max_workers=self._initial_pool_size())
         self._mac_executor = ThreadPoolExecutor(
-            max_workers=max(1, int(settings.get("mac_walk_workers",
-                                                self._MAC_WALK_WORKERS))),
+            max_workers=self._mac_walk_workers(settings),
             thread_name_prefix="mac-walk")
         self._spawn()
 
@@ -1214,9 +1213,15 @@ class NodePoller(Worker):
         table. reconfigure() runs on every Nodes settings save, so this
         cache cannot go stale.
         """
-        floor = max(1, int(settings.get("poll_workers_min",
-                                        settings.get("poll_workers", 16)) or 1))
-        ceiling = max(floor, int(settings.get("poll_workers_max", 128) or floor))
+        # Bounded here as well as in nodesdb.save_settings, because this is
+        # the point of USE and it is handed a dict rather than reading the
+        # file: a caller with an unclamped dict must not be able to size the
+        # pool past the ceiling the store would have enforced.
+        cap = NodesDatabase.MAX_POLL_WORKERS
+        floor = max(1, min(cap, int(settings.get(
+            "poll_workers_min", settings.get("poll_workers", 16)) or 1)))
+        ceiling = max(floor, min(cap, int(settings.get("poll_workers_max", 128)
+                                          or floor)))
         self._autoscale = {
             "auto": bool(settings.get("poll_workers_auto", True)),
             "min": floor,
@@ -1224,7 +1229,27 @@ class NodePoller(Worker):
             "headroom": max(1.0, float(settings.get("poll_pool_headroom", 1.5) or 1.5)),
         }
         self._autoscale_ceiling = ceiling if self._autoscale["auto"] else None
-        self._manual_workers = max(1, int(settings.get("poll_workers", 16) or 1))
+        self._manual_workers = max(1, min(cap, int(
+            settings.get("poll_workers", 16) or 1)))
+
+    def _mac_walk_workers(self, settings: dict) -> int:
+        return max(1, min(32, int(settings.get("mac_walk_workers",
+                                               self._MAC_WALK_WORKERS) or 1)))
+
+    def _apply_mac_pool_size(self, settings: dict) -> None:
+        """Resize the walk pool on a settings save as well as at start().
+
+        Read only in start() before this, so the new mac_walk_workers control
+        did nothing at all until the poller was disabled and re-enabled --
+        a setting that silently ignores you is worse than no setting.
+        """
+        want = self._mac_walk_workers(settings)
+        current = getattr(self._mac_executor, "_max_workers", None)
+        if self._mac_executor is None or current == want:
+            return
+        previous, self._mac_executor = self._mac_executor, ThreadPoolExecutor(
+            max_workers=want, thread_name_prefix="mac-walk")
+        previous.shutdown(wait=False)
 
     def _initial_pool_size(self) -> int:
         """Where the pool starts. With auto off that is poll_workers, exactly
@@ -1246,6 +1271,7 @@ class NodePoller(Worker):
                 self.start(settings)
                 return
             self._read_pool_settings(settings)
+            self._apply_mac_pool_size(settings)
             workers = self._initial_pool_size()
             if self._autoscale["auto"]:
                 # Auto keeps whatever size it has arrived at, only pulled
@@ -1810,11 +1836,31 @@ class NodePoller(Worker):
         that happens to fall between due times, and sizing off a trough is
         how a pool ends up too small a second later.
         """
-        if demand > self._autoscale_demand:
-            self._autoscale_demand = demand
         settings = self._autoscale
         if not settings["auto"] or self._executor is None:
+            # Nothing accumulates while auto is off, or the max since start
+            # would be waiting for whoever switches it on later.
+            self._autoscale_demand = 0.0
+            self._autoscale_sat_since = None
             return
+        if demand > self._autoscale_demand:
+            self._autoscale_demand = demand
+
+        # Saturation is sampled on EVERY pass, not at the evaluation instants
+        # below, and any unsaturated pass resets the clock. The scheduler
+        # submits every due device at once, so a fleet whose devices share a
+        # due-time phase is saturated in bursts by design; sampling only
+        # every 15 s can land inside burst after burst and read that as
+        # continuous, ratcheting the pool up against a model that was right.
+        # It would then shrink on the votes, re-lock, and ratchet again --
+        # an abandoned executor every couple of minutes, for ever.
+        pool = self.pool_state()
+        if pool["saturated"]:
+            if self._autoscale_sat_since is None:
+                self._autoscale_sat_since = now
+        else:
+            self._autoscale_sat_since = None
+
         if now - self._autoscale_at < self._AUTOSCALE_INTERVAL_S:
             return
         self._autoscale_at = now
@@ -1831,17 +1877,14 @@ class NodePoller(Worker):
         # fleet at half the workers it needed, the counter read zero while
         # 182 devices sat queued and p95 lateness was already 8.95 s on a
         # 15 s interval. Saturation is the signal that moves when it should.
-        pool = self.pool_state()
-        if pool["saturated"]:
-            if self._autoscale_sat_since is None:
-                self._autoscale_sat_since = now
-            elif (now - self._autoscale_sat_since >= self._AUTOSCALE_RATCHET_S
-                    and want <= current):
-                # The model is behind the truth: nothing has completed yet to
-                # tell it these polls have got expensive. Push up regardless.
-                want = current + max(1, current // 4)
-        else:
-            self._autoscale_sat_since = None
+        if (self._autoscale_sat_since is not None
+                and now - self._autoscale_sat_since >= self._AUTOSCALE_RATCHET_S
+                and want <= current):
+            # Saturated without a break for a full minute while the model
+            # still asks for no more: the cost estimates are behind the
+            # truth, which is the first seconds of an outage before any
+            # expensive poll has completed to move an EWMA. Push up anyway.
+            want = current + max(1, current // 4)
 
         want = max(floor, min(ceiling, want))
         self._autoscale_want = want
@@ -1948,8 +1991,8 @@ class NodePoller(Worker):
                 f"Every one of the {pool['workers']} poll workers has "
                 f"been busy with {pool['queued']} device(s) waiting for "
                 f"{minutes:.0f} minutes. Devices are being polled later "
-                f"than their interval. Raise Nodes → Settings → Poll "
-                f"workers, or lengthen the polling interval."))
+                f"than their interval. Raise Nodes → Settings → Poll worker "
+                f"threads, or lengthen the polling interval."))
 
     def _forget_devices(self, keep: set) -> None:
         """Drop the per-device state of devices that no longer exist.
@@ -1958,6 +2001,10 @@ class NodePoller(Worker):
         lifetime, so without this a long-running install accumulates an
         entry per device ever deleted.
         """
+        # list(cache) first: workers insert into _poll_cost and _snmp_backoff
+        # from _run_one and _poll_device while this runs, and iterating one
+        # live would raise "dictionary changed size during iteration" and
+        # cost a scheduling pass.
         for cache in (self._next_run, self._last_ping, self._next_mac_walk,
                       self._next_lldp_walk, self._next_vlan_walk,
                       self._credentials, self._credential_probe_failed,
@@ -1965,7 +2012,7 @@ class NodePoller(Worker):
                       self._sensor_read, self._sensor_threshold_read,
                       self._sensor_diag_ts, self._snmp_backoff,
                       self._poll_cost):
-            for device_id in [k for k in cache if k not in keep]:
+            for device_id in [k for k in list(cache) if k not in keep]:
                 cache.pop(device_id, None)
         with self._lock:
             for jobs in (self._oid_walks, self._vendor_ids):

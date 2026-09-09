@@ -135,7 +135,7 @@ Listed newest first. Version numbers are build order, not dates.
 One request — "investigate performance across page load, save, refresh and
 database search; and do pollers need to be statically set?" — answered by
 measuring before changing anything. Several things that looked slow were
-already fine and were left alone; the numbers below say which, and the five
+already fine and were left alone; the numbers below say which, and the six
 new `tests/bench_*.py` scripts reproduce all of them.
 
 **Pollers should not be statically set, and the answer to why not is a
@@ -152,8 +152,8 @@ config, and the poll's wall time was already being computed and then formatted
 into a log line and dropped. Measured on 300 devices needing 20.4 workers'
 worth of work: started at 8, settled at **31**, which is that 20.4 times the
 1.5 headroom — and the median poll went from 2.47 seconds late to on time.
-The same fleet held at a fixed 8 workers stayed 8.94 seconds late at the 95th
-percentile with 181 devices queued.
+The same fleet held at a fixed 8 workers stayed 8.95 seconds late at the 95th
+percentile with 182 devices queued.
 
 **Why it is not driven by the queue, and definitely not by overruns.** Queue
 depth is bimodal here by construction — the scheduler submits every due device
@@ -180,8 +180,9 @@ turns auto-sizing off. On upgrade it becomes the **floor**, so an install
 hand-tuned to 48 gets 48 as its minimum and can only ever gain threads. It also
 gained a bound it never had: the browser said `max=256` while nothing on the
 server checked at all, so an API client could have asked for a hundred thousand
-threads. Two more knobs that existed only as constants in the source — the
-table-walk pool and IPAM's concurrent-scan limit — now have settings.
+threads. Three more knobs that existed only as constants in the source now have
+settings: the table-walk pool, IPAM's concurrent-scan limit, and how many
+devices ConfigRX backs up at once.
 
 **Windows stopped forking a process for every ping, and this is the largest
 number in the release.** There is no unprivileged raw ICMP socket on Windows,
@@ -247,7 +248,7 @@ unchanged on every store.
 
 Syslog is the weak result and worth saying why: its full-text index has to be
 fed every deleted row, so the delete dominates and batches badly — three
-times better rather than the six to ten the others get. Two things were
+times better, where traps get six and alerts twenty. Two things were
 deliberately not done. The prunes were given no default deadline, because a
 budget that expires mid-sweep leaves rows past their retention, which is a
 retention change wearing a latency costume: with one applied, a syslog sweep
@@ -284,7 +285,7 @@ per route — by route pattern, so a thousand devices are still one row — and
 every database's lock is now instrumented for how long callers wait on it and
 hold it, which is the number that says whether the single-connection design is
 costing anything at a given fleet size. Both appear on the Debug page. The lock
-instrumentation is one change at one place and covers all 139 lock sites in the
+instrumentation is one change at one place and covers all 138 lock sites in the
 Nodes database alone; it costs 0.8 microseconds an acquisition, which is why it
 is always on rather than behind a flag nobody turns on until it is too late.
 

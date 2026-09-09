@@ -338,10 +338,14 @@ def iphlpapi_path():
     # gets silently wrong: too small and IcmpSendEcho writes past the buffer
     # or refuses. Both pointer fields are pointer-width, the rest is fixed.
     ct = api["ctypes"]
-    expected = 8 + 4 + 2 + 2 + 2 * ct.sizeof(ct.c_void_p) + 4
-    check(ct.sizeof(api["reply"]) >= expected,
-         f"the reply structure is at least its documented size "
-         f"({ct.sizeof(api['reply'])} >= {expected})")
+    # Exact, not a lower bound: padding absorbs a dropped field, so ">=" let
+    # a structure missing Reserved or DataSize pass. 16 fixed bytes plus
+    # three pointers (Data, OptionsData, and the alignment the compiler puts
+    # before them) -- 28 on 32-bit, 40 on 64.
+    expected = 16 + 3 * ct.sizeof(ct.c_void_p)
+    check(ct.sizeof(api["reply"]) == expected,
+         f"the reply structure is exactly its documented size "
+         f"({ct.sizeof(api['reply'])} == {expected})")
 
     sent, received, rtt = ipam_scan._ping_many_iphlpapi("127.0.0.4", 3, 500)
     check((sent, received) == (3, 3) and rtt is not None,

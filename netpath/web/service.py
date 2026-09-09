@@ -776,7 +776,16 @@ class Service:
         settings_attr, db_attr, label, apply_fn = _MODULE_SCOPES[scope]
         settings = getattr(self, settings_attr)
         settings.update(values)
-        getattr(self, db_attr).save_settings(settings)
+        db = getattr(self, db_attr)
+        db.save_settings(settings)
+        # Read the stored values back over the live dict. A store may bound
+        # what it accepts (nodesdb clamps the worker counts, db.py clamps
+        # trace_workers), and it clamps a copy — so without this the database
+        # holds the bounded number while this dict, which is what apply_fn
+        # hands the worker AND what /api/state serves the settings form,
+        # keeps whatever was posted. The clamp would then protect the file
+        # and nothing else.
+        settings.update(db.settings())
         if scope in _DEFERRED_SCOPES:
             self._queue_restart(scope, apply_fn, settings)
         else:

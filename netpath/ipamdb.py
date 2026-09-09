@@ -219,6 +219,24 @@ class IpamDatabase(SqliteStore):
     TRIM_FLOOR = 200
     OLDEST_TS_SQL = "SELECT MIN(started_ts) FROM scans"
 
+    # ping_workers x max_concurrent_scans is the real number of probes in
+    # flight, so neither may be unbounded from a settings form: the browser's
+    # max attribute is not a check, it is a hint to whoever is typing.
+    MAX_CONCURRENT_SCANS = 16
+    MAX_PING_WORKERS = 256
+
+    def save_settings(self, values: dict) -> None:
+        if "max_concurrent_scans" in values or "ping_workers" in values:
+            values = dict(values)
+            for key, ceiling in (("max_concurrent_scans", self.MAX_CONCURRENT_SCANS),
+                                 ("ping_workers", self.MAX_PING_WORKERS)):
+                if key in values:
+                    try:
+                        values[key] = max(1, min(ceiling, int(values[key])))
+                    except (TypeError, ValueError):
+                        values.pop(key)
+        super().save_settings(values)
+
     def _migrate(self) -> None:
         self.ensure_columns("dhcp_servers",
                             {"username": "TEXT", "password_enc": "BLOB"})

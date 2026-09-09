@@ -150,6 +150,50 @@ def bounds_and_damping():
     db2.close()
 
 
+def saturation_is_sampled_every_pass():
+    """Any unsaturated pass resets the ratchet's clock.
+
+    The scheduler submits every due device at once, so a fleet whose devices
+    share a due-time phase is saturated in bursts by design. Sampling only at
+    the 15 s evaluation instants can land inside burst after burst and read
+    that as saturation that never breaks, ratcheting the pool up against a
+    cost model that was right about it.
+
+    This pins the mechanism -- the clock resets on a pass that sees room --
+    rather than claiming to reproduce the oscillation itself: doing that
+    faithfully needs busy and queued to respond to the pool size, which is
+    the scheduler, not the controller.
+    """
+    db, poller, ids = build(devices=10)
+    at = time.time()
+    poller._autoscale_sat_since = None
+
+    def pass_at(offset, saturated):
+        poller._started = {i: at for i in range(200)} if saturated else {}
+        poller._queued = {i: at for i in range(50)} if saturated else {}
+        poller._autoscale_pass(at + offset, 1.0)
+
+    # Saturated for four passes running: the clock starts and keeps running.
+    for tick in range(4):
+        pass_at(tick, True)
+    first = poller._autoscale_sat_since
+    check(first is not None, "an unbroken run of saturated passes starts the clock")
+
+    # One pass with room in the pool, between two evaluation instants, and
+    # the clock must go back to zero even though no evaluation happened.
+    pass_at(4, False)
+    check(poller._autoscale_sat_since is None,
+          "a single unsaturated pass resets it, even between evaluations")
+
+    pass_at(5, True)
+    check(poller._autoscale_sat_since is not None
+          and poller._autoscale_sat_since > first,
+          "...and the next burst starts a fresh clock rather than resuming")
+    poller._started = {}
+    poller._queued = {}
+    db.close()
+
+
 def auto_off_is_unchanged():
     db, poller, _ids = build(poll_workers_auto=False, poll_workers=23)
     check(poller._initial_pool_size() == 23,
@@ -270,9 +314,14 @@ def backoff_never_touches_a_device_answering_ping():
     finally:
         nodepoll.ping_many = original
 
+    # Only the first cycle tests the status half: once ping answers, the
+    # device is reachable and record_poll moves it to "up", so the remaining
+    # five are the ordinary reachable-but-broken case. Both are the point --
+    # the first says a DOWN device answering ping is not backed off, the rest
+    # say it stays that way.
     check(skipped == 0,
-          "a device answering ping never has its SNMP backed off, whatever its "
-          "stored status says (skipped %d of 6 cycles)" % skipped)
+          "a device answering ping is never backed off -- not on the cycle it "
+          "is still stored as down, nor after (skipped %d of 6)" % skipped)
     check(poller._snmp_failing_count.get(device_id, 0) > 0,
           "...so snmp_fail_alert_after keeps counting toward "
           "snmp_failing_ping_ok (count %d)"
@@ -373,6 +422,7 @@ def main() -> int:
     print("The poll pool sizes itself")
     controller()
     bounds_and_damping()
+    saturation_is_sampled_every_pass()
     auto_off_is_unchanged()
     upgrade_keeps_the_operators_number()
     clamps()
