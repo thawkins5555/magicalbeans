@@ -226,21 +226,73 @@ def backoff_cadence():
 def backoff_never_touches_a_device_answering_ping():
     """snmp_failing_ping_ok is the alert that has to keep counting.
 
-    A device answering ping with a dead SNMP agent is not down, and it is
-    exactly what snmp_fail_alert_after counts toward. The predicate requires
-    `not ping_ok`, so such a device can never be backed off -- if it could,
-    that alert would never reach its threshold.
+    A device answering ping with a dead SNMP agent is NOT down, and it is
+    exactly what snmp_fail_alert_after counts toward. If such a device could
+    be backed off, that alert would never reach its threshold. Checked by
+    polling one rather than by reading the predicate, so it keeps meaning
+    something if the predicate is rewritten.
     """
-    here = os.path.dirname(os.path.abspath(__file__))
-    source = open(os.path.join(here, "..", "netpath", "nodepoll.py"),
-                  encoding="utf-8").read()
-    start = source.index("backed_off = (device[")
-    clause = source[start:source.index("\n\n", start)]
-    check("not ping_ok" in clause,
-          "the backoff predicate requires this cycle's ping to have failed")
-    check('"down"' in clause,
-          "...and that the device is already formally down, so detection has "
-          "already happened before anything is skipped")
+    db, poller, ids = build(devices=1, interval=10)
+    device_id = ids[0]
+    # Formally down first, so the status half of the predicate is satisfied
+    # and only the ping half is left to do the work.
+    for _ in range(4):
+        db.record_poll(device_id, ping_ok=False, ping_rtt_ms=None, snmp_ok=False,
+                       snmp_error="timeout", identity=None, uptime_ticks=None,
+                       status="down", reachable=False)
+    check(db.device(device_id)["status"] == "down", "the fixture device is down")
+
+    # Now ping starts answering while SNMP stays dead: the reachable-but-
+    # broken case. Every cycle must still attempt SNMP.
+    original = nodepoll.ping_many
+    nodepoll.ping_many = lambda ip, count=3, timeout_ms=1000: (count, count, 1.0)
+    try:
+        config = db.effective_config(db.device(device_id))
+        config["snmp_enabled"] = True
+        config["ping_enabled"] = True
+        before = poller.counters["snmp_backoff"]
+        for _ in range(6):
+            poller._poll_device(db.device(device_id), config)
+        skipped = poller.counters["snmp_backoff"] - before
+    finally:
+        nodepoll.ping_many = original
+
+    check(skipped == 0,
+          "a device answering ping never has its SNMP backed off, whatever its "
+          "stored status says (skipped %d of 6 cycles)" % skipped)
+    check(poller._snmp_failing_count.get(device_id, 0) > 0,
+          "...so snmp_fail_alert_after keeps counting toward "
+          "snmp_failing_ping_ok (count %d)"
+          % poller._snmp_failing_count.get(device_id, 0))
+    db.close()
+
+
+def backoff_needs_ping_to_be_running():
+    """With ping switched off, SNMP is the only evidence the device exists.
+
+    Ping being unbacked-off is the whole reason the backoff is safe: it is
+    what notices the recovery. A profile with ping disabled has no such
+    safety, so nothing may be skipped there -- caught for real by
+    test_nodepoll_e2e, where a ping-less device that came back was never
+    seen to come back.
+    """
+    db, poller, ids = build(devices=1, interval=10)
+    device_id = ids[0]
+    for _ in range(4):
+        db.record_poll(device_id, ping_ok=None, ping_rtt_ms=None, snmp_ok=False,
+                       snmp_error="timeout", identity=None, uptime_ticks=None,
+                       status="down", reachable=False)
+    config = db.effective_config(db.device(device_id))
+    config["snmp_enabled"] = True
+    config["ping_enabled"] = False
+    before = poller.counters["snmp_backoff"]
+    for _ in range(6):
+        poller._poll_device(db.device(device_id), config)
+    skipped = poller.counters["snmp_backoff"] - before
+    check(skipped == 0,
+          "a device with ping disabled never has its SNMP backed off "
+          "(skipped %d of 6 cycles)" % skipped)
+    db.close()
 
 
 def backoff_records_no_phantom_snmp_failure():
@@ -315,6 +367,7 @@ def main() -> int:
     print("A down device backs off SNMP, never ping")
     backoff_cadence()
     backoff_never_touches_a_device_answering_ping()
+    backoff_needs_ping_to_be_running()
     backoff_records_no_phantom_snmp_failure()
     print()
     if FAILURES:
