@@ -17,7 +17,12 @@ What that costs in accuracy: totals are exact whichever path answers, since
 the grand total is not capped. A key that is above the cap in every bucket
 it appears in is exact too. A key that dips below the cap in some buckets is
 short by what it lost there, and that traffic is in "— other —" rather than
-missing. Filtered queries are never rollup-served and are exact throughout.
+missing — and the chart cannot tell the two apart, so the band an operator
+is watching simply has holes in it. Every bucket where the cap bit is
+therefore recorded (flow_rollup_trunc), and a read repairs those buckets
+from the raw rows for as long as the raw rows still cover them; only a
+bucket older than the raw retention keeps the hole. Filtered queries are
+never rollup-served and are exact throughout.
 """
 
 from __future__ import annotations
@@ -138,6 +143,23 @@ CREATE TABLE IF NOT EXISTS flow_rollup_span (
     flows   INTEGER NOT NULL,
     PRIMARY KEY (tier, bucket)
 ) WITHOUT ROWID;
+
+-- Which (tier, dim, bucket) cells the ROLLUP_KEYS cap actually cut short:
+-- present when the bucket held at least as many distinct keys as the cap
+-- kept, absent otherwise. A read serves a flagged bucket from the raw rows
+-- instead of the capped ones while the raw rows still reach it, so a key
+-- that dipped below the cap for a minute is not drawn as zero for that
+-- minute. Written and cleared by _compact_bucket alongside the rows it
+-- describes, and aged out with them. CREATE IF NOT EXISTS is the whole
+-- migration: an older store starts with it empty, and nothing is repaired
+-- until a bucket is next compacted or backfilled — which is today's answer,
+-- not a worse one.
+CREATE TABLE IF NOT EXISTS flow_rollup_trunc (
+    tier   INTEGER NOT NULL,
+    dim    INTEGER NOT NULL,
+    bucket INTEGER NOT NULL,
+    PRIMARY KEY (tier, dim, bucket)
+) WITHOUT ROWID;
 """
 
 DEFAULTS = {
@@ -208,6 +230,16 @@ ROLLUP_TIERS = (60, 3600)
 # the data: netflow.js offers a Top N up to 25, so the cap has to sit well
 # above that for every bar the page draws to be exact.
 ROLLUP_KEYS = {60: 48, 3600: 64}
+
+# How many flagged buckets one read will repair from the raw rows before it
+# gives up and serves the capped rollup as stored. Each contiguous run of
+# flagged buckets is one arm of the UNION ALL that _agg_rows builds, so the
+# worst case (no two adjacent) is this many arms — kept well under SQLite's
+# default compound-select ceiling of 500, and under the 999 bound variables
+# an older SQLite allows. Past it a chart is a day of minute buckets or a
+# fortnight of hourly ones, where the raw rows would cost what the rollups
+# exist to avoid: the holes stay, exactly as they did before the flag.
+_REPAIR_MAX_BUCKETS = 200
 
 # Which setting bounds each tier's history. The minute tier is the expensive
 # one (~42 MB a day against ~0.9 MB for the hourly tier), and only the windows
@@ -450,6 +482,13 @@ class FlowDatabase(SqliteStore):
                 self._conn.execute(
                     "DELETE FROM flow_rollup WHERE tier = ? AND dim = ?"
                     " AND bucket = ?", (tier, dim, bucket))
+                # The flag goes with the rows it describes: a bucket rebuilt
+                # with fewer keys than the cap — late flows resampled away,
+                # say — stops being flagged rather than being repaired from
+                # raw for ever.
+                self._conn.execute(
+                    "DELETE FROM flow_rollup_trunc WHERE tier = ? AND dim = ?"
+                    " AND bucket = ?", (tier, dim, bucket))
                 if from_minutes:
                     cursor = self._conn.execute(
                         "INSERT INTO flow_rollup(tier, dim, bucket, key, bytes,"
@@ -472,7 +511,27 @@ class FlowDatabase(SqliteStore):
                         f" AND ({expr}) IS NOT NULL"
                         f" GROUP BY key ORDER BY bytes DESC LIMIT ?)",
                         (tier, dim, bucket, bucket, bucket + tier, limit))
-                written += cursor.rowcount or 0
+                stored = cursor.rowcount or 0
+                written += stored
+                # rowcount reaching the LIMIT is the only evidence there is
+                # that the cap bit — the query cannot say how many keys it
+                # did not keep without counting them, which is the scan the
+                # cap exists to avoid. A bucket holding exactly `limit` keys
+                # is flagged too: a false positive that costs one raw read
+                # and changes no number.
+                truncated = stored >= limit
+                if not truncated and from_minutes:
+                    # Built from minute rows that were themselves capped:
+                    # the hour's sums are short by whatever those minutes
+                    # lost, whether or not its own LIMIT was reached.
+                    truncated = self._conn.execute(
+                        "SELECT 1 FROM flow_rollup_trunc WHERE tier = 60"
+                        " AND dim = ? AND bucket >= ? AND bucket < ? LIMIT 1",
+                        (dim, bucket, bucket + tier)).fetchone() is not None
+                if truncated:
+                    self._conn.execute(
+                        "INSERT INTO flow_rollup_trunc(tier, dim, bucket)"
+                        " VALUES (?, ?, ?)", (tier, dim, bucket))
                 self._conn.commit()
             # The collector's writer is waiting on this lock and a Python lock
             # is not fair, the same reason sqlitebase.reclaim yields between
@@ -644,8 +703,8 @@ class FlowDatabase(SqliteStore):
         return True
 
     def _delete_rollup(self, tier: int, low: int, upper: int) -> int:
-        """Both rollup tables for buckets in [low, upper). Lock held, no
-        commit: _delete_batches owns each."""
+        """All three rollup tables for buckets in [low, upper). Lock held,
+        no commit: _delete_batches owns each."""
         cursor = self._conn.execute(
             "DELETE FROM flow_rollup WHERE tier = ? AND bucket >= ?"
             " AND bucket < ?", (tier, low, upper))
@@ -653,7 +712,14 @@ class FlowDatabase(SqliteStore):
         cursor = self._conn.execute(
             "DELETE FROM flow_rollup_span WHERE tier = ? AND bucket >= ?"
             " AND bucket < ?", (tier, low, upper))
-        return removed + (cursor.rowcount or 0)
+        removed += cursor.rowcount or 0
+        # The flags describe rows that are now gone, and a flag with no
+        # rollup behind it would otherwise outlive every retention there is.
+        # Not counted: they are bookkeeping, not history.
+        self._conn.execute(
+            "DELETE FROM flow_rollup_trunc WHERE tier = ? AND bucket >= ?"
+            " AND bucket < ?", (tier, low, upper))
+        return removed
 
     def _prune_rollup(self, tier: int, days: float, deadline: float) -> int:
         """Age out one tier, walking bucket timestamps the way the raw
@@ -907,6 +973,48 @@ class FlowDatabase(SqliteStore):
             return tier, dim, seal
         return None
 
+    def _repair_ranges(self, tier: int, dim: int, t0: float,
+                       seal: float) -> list[list[int]]:
+        """Which buckets of [t0, seal) the raw rows answer for instead of
+        the rollup: the ones _compact_bucket flagged as cut short by the
+        cap, where the raw rows still reach.
+
+        Returned as [low, upper) runs rather than buckets, adjacent flags
+        merged: in the common case — a busy exporter over the cap in every
+        minute — that is one run, and so one extra arm in the query. An
+        empty list means "serve the rollup as stored", which is also the
+        answer past _REPAIR_MAX_BUCKETS: repairing a day of minute buckets
+        is the raw scan the rollup exists to avoid, and a query with a
+        thousand arms is not one SQLite will run anyway.
+
+        "Still reach" is MIN(ts_end) FROM flows, an ix_flows_ts probe:
+        prune() ages the raw rows out oldest ts_end first, so everything
+        above that mark is intact and everything below it is gone. A bucket
+        the mark falls inside is served from the rollup — the raw rows would
+        answer for part of a minute and call it the whole.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT bucket FROM flow_rollup_trunc WHERE tier = ? AND dim = ?"
+                " AND bucket >= ? AND bucket < ? ORDER BY bucket LIMIT ?",
+                (tier, dim, t0, seal, _REPAIR_MAX_BUCKETS + 1)).fetchall()
+            if not rows or len(rows) > _REPAIR_MAX_BUCKETS:
+                return []
+            oldest = self._conn.execute(
+                "SELECT MIN(ts_end) AS lo FROM flows").fetchone()["lo"]
+        if oldest is None:
+            return []
+        ranges: list[list[int]] = []
+        for row in rows:
+            bucket = int(row["bucket"])
+            if bucket < oldest:
+                continue
+            if ranges and ranges[-1][1] == bucket:
+                ranges[-1][1] = bucket + tier
+            else:
+                ranges.append([bucket, bucket + tier])
+        return ranges
+
     def _agg_rows(self, t0: float, t1: float, dimension: str | None,
                   filters: dict, bucket_s: float | None):
         """One window's aggregate: (t0, bucket_s, n_buckets, rows, spans).
@@ -946,15 +1054,24 @@ class FlowDatabase(SqliteStore):
         span_sql: list[str] = []
         span_params: list = []
         raw_from = t0
+        repair: list[list[int]] = []
         if plan is not None:
             tier, dim, raw_from = plan
             expr, expr_params = slot("bucket")
             if dim is not None:
+                # The buckets the cap cut short leave the rollup arm here
+                # and join the raw arms below, so each is counted by exactly
+                # one of them. The spans are untouched either way: they were
+                # never capped, and the residual is measured against them.
+                repair = self._repair_ranges(tier, dim, t0, raw_from)
+                excluded = "".join(" AND NOT (bucket >= ? AND bucket < ?)"
+                                   for _ in repair)
                 key_sql.append(
                     f"SELECT key, {expr} AS slot, bytes, packets, flows"
                     f" FROM flow_rollup WHERE tier = ? AND dim = ?"
-                    f" AND bucket >= ? AND bucket < ?")
-                key_params.extend([*expr_params, tier, dim, t0, raw_from])
+                    f" AND bucket >= ? AND bucket < ?{excluded}")
+                key_params.extend([*expr_params, tier, dim, t0, raw_from,
+                                   *(edge for run in repair for edge in run)])
             span_sql.append(
                 f"SELECT {expr} AS slot, bytes, packets, flows"
                 f" FROM flow_rollup_span WHERE tier = ? AND bucket >= ?"
@@ -974,6 +1091,17 @@ class FlowDatabase(SqliteStore):
                 f" bytes * sampling AS bytes, packets * sampling AS packets,"
                 f" 1 AS flows FROM flows WHERE {where}{unstorable}")
             key_params.extend([*expr_params, *where_params])
+            # One arm per run of repaired buckets, each an ix_flows_ts range
+            # like the tail above — half-open, the way the rollup bucket it
+            # stands in for is. Filters are never in play here: a filtered
+            # query has no plan, and so nothing to repair.
+            for low, upper in repair:
+                key_sql.append(
+                    f"SELECT {key} AS key, {expr} AS slot,"
+                    f" bytes * sampling AS bytes, packets * sampling AS packets,"
+                    f" 1 AS flows FROM flows WHERE ts_end >= ? AND ts_end < ?"
+                    f"{unstorable}")
+                key_params.extend([*expr_params, low, upper])
         if plan is not None or dimension is None:
             span_sql.append(
                 f"SELECT {expr} AS slot, bytes * sampling AS bytes,"
