@@ -13,9 +13,10 @@ from _paths import spawn_stub, tmpdir
 TMP = tmpdir("arp_tables_")
 
 import netpath.nodepoll as nodepoll_mod
-from netpath.nodesdb import NodesDatabase
+from netpath import nodeoids
+from netpath.nodesdb import ADDRESS_SEARCH_MIN_CHARS, NodesDatabase
 from netpath.nodepoll import NodePoller
-from netpath.web import api
+from netpath.web import Service, api
 
 
 def stub_stat(port: int, command: bytes) -> str:
@@ -340,6 +341,17 @@ try:
           db.arp_locations("core-rtr") == [] and db.arp_locations("") == [])
     check("a MAC prefix shorter than four hex digits is not a search",
           db.arp_locations("00:1") == [])
+    # The address side had no floor: "1" ran `ip LIKE '1%'`, which on a
+    # real table is every 1.x, 10.x, 100.x and 1000:: row up to the limit.
+    check("an address prefix under the floor is not a search either",
+          ADDRESS_SEARCH_MIN_CHARS == 3
+          and db.arp_locations("1") == [] and db.arp_locations("10") == []
+          and db.arp_locations("fe") == [],
+          [dict(r) for r in db.arp_locations("1")])
+    check("...and the first prefix at the floor names a whole first octet",
+          {r["ip"] for r in db.arp_locations("10.")}
+          == {"10.0.0.5", "10.0.0.6", "10.0.1.9"},
+          [dict(r) for r in db.arp_locations("10.")])
     ordered = db.arp_locations("10.0.0")
     check("present rows sort before stale ones",
           [bool(r["present"]) for r in ordered] == [True, False],
@@ -463,6 +475,60 @@ check("arp-search by IP prefix, with the 'Interface N' fallback for an unknown i
 check("arp-search refuses what arp_locations refuses, with an empty list",
       api.get_nodes_arp_search(Svc, {"q": "api-rtr"}, None)["locations"] == []
       and api.get_nodes_arp_search(Svc, {}, None)["locations"] == [])
+check("...including a one-keystroke address prefix",
+      api.get_nodes_arp_search(Svc, {"q": "1"}, None)["locations"] == []
+      and api.get_nodes_arp_search(Svc, {"q": "10"}, None)["locations"] == [],
+      api.get_nodes_arp_search(Svc, {"q": "1"}, None))
+
+
+# One search used to be one query per hit on top of its own: device() for
+# every row, two hundred and one statements for a short prefix. A second
+# device's rows make the hits span devices, and the store is counted. It
+# opts out of the walk so the profile's enabled count, checked below,
+# stays what this section already says it is.
+did2 = db.add_device("10.0.0.81", name="api-rtr-2", group_id=gid,
+                     arp_table_interval_s=0)
+db.replace_arp_entries(did2, [
+    {"if_index": 3, "ip": "10.0.30.5", "mac": "00:11:22:33:44:66", "entry_type": "dynamic"},
+    {"if_index": 3, "ip": "10.0.30.6", "mac": "00:11:22:33:44:77", "entry_type": "dynamic"},
+], now=seen2)
+
+
+class CountingDb:
+    """nodes_db with the per-device and the batched read counted."""
+
+    def __init__(self, real):
+        self._real = real
+        self.calls = {"device": 0, "devices_by_ids": 0}
+
+    def __getattr__(self, name):
+        attr = getattr(self._real, name)
+        if name in self.calls:
+            def counted(*args, **kwargs):
+                self.calls[name] += 1
+                return attr(*args, **kwargs)
+            return counted
+        return attr
+
+
+class CountingSvc(Svc):
+    nodes_db = CountingDb(db)
+
+
+spanning = api.get_nodes_arp_search(CountingSvc, {"q": "10.0"}, None)
+check("arp-search across two devices names each hit's own device",
+      {(l["ip"], l["device_name"]) for l in spanning["locations"]}
+      == {("10.0.10.5", "api-rtr"), ("10.0.20.5", "api-rtr"),
+          ("10.0.30.5", "api-rtr-2"), ("10.0.30.6", "api-rtr-2")}, spanning)
+check("...from one batched device read, not one query per row",
+      CountingSvc.nodes_db.calls == {"device": 0, "devices_by_ids": 1},
+      CountingSvc.nodes_db.calls)
+CountingSvc.nodes_db.calls = {"device": 0, "devices_by_ids": 0}
+by_mac = api.get_nodes_mac_search(CountingSvc, {"q": "00:11:22:33:44"}, None)
+check("the MAC search, same loop, is batched the same way",
+      by_mac["locations"] == []   # no forwarding-table rows here, only ARP
+      and CountingSvc.nodes_db.calls == {"device": 0, "devices_by_ids": 1},
+      (by_mac, CountingSvc.nodes_db.calls))
 
 table = api.get_nodes_device_arp(Svc, {}, None, did)
 check("device arp: enabled is False and interval_s 0 for a device nobody opted in",
@@ -495,6 +561,171 @@ try:
 except Exception as error:   # api._require's own NotFound
     check("device arp for a device that does not exist is refused", True, error)
 db.close()
+
+# ------------------------------- 9. the fallback gate is "empty", not "failed"
+# read_device_arp_table promises that a walk stopped by a timeout or an
+# error returns None from EITHER table rather than falling through to the
+# successor table; the code checked "no rows" before "complete", so a
+# timeout on the first GETBULK (an empty result too) read as a clean empty
+# legacy table and walked ipNetToPhysicalTable instead. No stub can time
+# out on demand, so the column walk is replaced on the instance with one
+# that answers in _walk_column_detail's own shapes and records what it
+# was asked for.
+db = new_db("gate")
+did = device_against(db, 0, name="gate-rtr")
+log = CapturingLog()
+poller = NodePoller(db, log=log)
+LEGACY, MODERN = (nodeoids.IP_NET_TO_MEDIA_PHYS_ADDRESS,
+                  nodeoids.IP_NET_TO_PHYSICAL_PHYS_ADDRESS)
+MODERN_ROWS = {"1.1.4.10.0.0.5": bytes.fromhex("001122334455")}
+LEGACY_ROWS = {"1.10.0.0.6": bytes.fromhex("aabbccddeeff")}
+asked = []
+
+
+def scripted(answers):
+    """A _walk_column_detail answering each phys-address column from
+    `answers` — (rows, complete, reason) — and refusing any other OID."""
+    def walk(device, config, base_oid, **kwargs):
+        asked.append(base_oid)
+        return answers[base_oid]
+    return walk
+
+
+poller._walk_column = lambda device, config, base_oid, **kwargs: {}
+timeout = "timed out (table walk cut short after 0 row(s))"
+
+asked.clear()
+poller._walk_column_detail = scripted({LEGACY: ({}, False, timeout),
+                                       MODERN: (MODERN_ROWS, True, "")})
+entries, status, detail = poller._read_arp_table_detail(did)
+check("a timeout on the legacy table's first request is None, not a fallback",
+      entries is None and status == poller._ARP_INCOMPLETE
+      and detail.startswith("ipNetToMediaTable:") and "timed out" in detail,
+      (entries, status, detail))
+check("...and the successor table was never asked", asked == [LEGACY], asked)
+
+asked.clear()
+poller._walk_column_detail = scripted({LEGACY: ({}, False, "SNMP error: genErr"),
+                                       MODERN: (MODERN_ROWS, True, "")})
+entries, status, detail = poller._read_arp_table_detail(did)
+check("an SNMP error on it is None the same way",
+      entries is None and status == poller._ARP_INCOMPLETE and asked == [LEGACY],
+      (entries, status, detail, asked))
+
+asked.clear()
+poller._walk_column_detail = scripted({LEGACY: ({}, True, ""),
+                                       MODERN: (MODERN_ROWS, True, "")})
+entries, status, detail = poller._read_arp_table_detail(did)
+check("a genuinely complete, genuinely empty legacy walk is the fallback's case",
+      entries is not None and status == poller._ARP_OK
+      and [e["ip"] for e in entries] == ["10.0.0.5"] and asked == [LEGACY, MODERN],
+      (entries, status, detail, asked))
+
+asked.clear()
+poller._walk_column_detail = scripted({LEGACY: ({}, True, ""),
+                                       MODERN: ({}, False, timeout)})
+entries, status, detail = poller._read_arp_table_detail(did)
+check("a timeout on the successor table is None too, not 'answers neither'",
+      entries is None and status == poller._ARP_INCOMPLETE
+      and detail.startswith("ipNetToPhysicalTable:"), (entries, status, detail))
+
+asked.clear()
+poller._walk_column_detail = scripted({LEGACY: ({}, True, ""),
+                                       MODERN: ({}, True, "")})
+entries, status, detail = poller._read_arp_table_detail(did)
+check("both complete and empty is still 'answers neither table'",
+      entries is None and status == poller._ARP_UNANSWERED, (entries, status, detail))
+
+# Storage and the log, across the cycles a transient timeout produces: a
+# modern agent answering both tables must not alternate sources.
+poller._walk_column_detail = scripted({LEGACY: (LEGACY_ROWS, True, ""),
+                                       MODERN: (MODERN_ROWS, True, "")})
+poller._arp_running.add(did)
+poller._run_arp_table(did)
+first = {r["ip"]: dict(r) for r in db.arp_entries_for(did)}
+poller._walk_column_detail = scripted({LEGACY: ({}, False, timeout),
+                                       MODERN: (MODERN_ROWS, True, "")})
+poller._arp_running.add(did)
+poller._run_arp_table(did)
+second = {r["ip"]: dict(r) for r in db.arp_entries_for(did)}
+check("a cycle whose legacy walk times out leaves the stored table exactly alone",
+      set(first) == {"10.0.0.6"} and second == first, (first, second))
+said = [m for c, m in log.lines]
+check("...and the log says the walk was cut short, naming the timeout",
+      any("cut short" in m and "timed out" in m for m in said)
+      and not any("neither" in m for m in said), said)
+check("...without counting the failed walk", poller.counters["arp_walks"] == 1,
+      poller.counters)
+db.close()
+
+# ---------------------- 10. the sweep and the setting, through the real paths
+# Two wires the suites above never pulled. prune_arp_entries has a test
+# (section 6) and so does the column (section 7), and both would stay
+# green with the call dropped from Service.run_maintenance or the key
+# dropped from the routes' allow-lists — _pick discards an unknown key
+# without a word. So: the real maintenance sweep, and the real handlers,
+# on a real Service, the way test_lldp_topology.py drives prune_neighbors.
+DB_NAMES = ("netpath", "flows", "syslog", "app", "ipam", "snmptraps", "nodes",
+            "alerts", "wireless", "configrx")
+svc_dir = f"{TMP}/service"
+import os
+os.makedirs(svc_dir, exist_ok=True)
+service = Service(*[os.path.join(svc_dir, name + ".db") for name in DB_NAMES])
+try:
+    nodes = service.nodes_db
+    gid = nodes.ensure_default_group()
+    stale = nodes.add_device("10.0.0.90", name="stale-rtr", group_id=gid)
+    fresh = nodes.add_device("10.0.0.91", name="fresh-rtr", group_id=gid)
+    for did_ in (stale, fresh):
+        nodes.replace_arp_entries(did_, [
+            {"if_index": 1, "ip": "10.0.40.5", "mac": "00:11:22:33:44:88",
+             "entry_type": "dynamic"}], now=time.time())
+    retention_days = float(service.nodes_settings.get("mac_table_retention_days", 7))
+    conn = sqlite3.connect(nodes.path)
+    conn.execute("UPDATE arp_entries SET seen_ts = ? WHERE device_id = ?",
+                 (time.time() - (retention_days + 1) * 86400, stale))
+    conn.commit()
+    conn.close()
+    service.run_maintenance(force=True)
+    check("run_maintenance prunes a stale device's ARP rows",
+          nodes.arp_entries_for(stale) == [], [dict(r) for r in nodes.arp_entries_for(stale)])
+    check("...and leaves a freshly-walked device's rows alone",
+          len(nodes.arp_entries_for(fresh)) == 1, [dict(r) for r in nodes.arp_entries_for(fresh)])
+
+    # The setting, written and read back through the handlers only.
+    api.put_nodes_group(service, {}, {"arp_table_interval_s": 900}, gid)
+    groups = {g["id"]: g for g in api.get_nodes_groups(service, {}, None)["groups"]}
+    check("PUT profile sets arp_table_interval_s and GET profiles echoes it",
+          groups.get(gid, {}).get("arp_table_interval_s") == 900, groups.get(gid))
+    check("...and a device on the profile inherits it, as the ARP route reports",
+          api.get_nodes_device_arp(service, {}, None, fresh)["interval_s"] == 900
+          and api.get_nodes_device(service, {}, None, fresh)["device"]["arp_table_interval_s"] is None,
+          api.get_nodes_device_arp(service, {}, None, fresh))
+    api.put_nodes_device(service, {}, {"arp_table_interval_s": 300}, fresh)
+    device = api.get_nodes_device(service, {}, None, fresh)["device"]
+    check("PUT device sets its own arp_table_interval_s and GET device echoes it",
+          device.get("arp_table_interval_s") == 300
+          and device["effective_config"].get("arp_table_interval_s") == 300
+          and api.get_nodes_device_arp(service, {}, None, fresh)["interval_s"] == 300,
+          device)
+    api.put_nodes_device(service, {}, {"arp_table_interval_s": 0}, fresh)
+    check("...and an explicit 0 through PUT opts the device out of the profile's 900",
+          api.get_nodes_device_arp(service, {}, None, fresh) | {"entries": []}
+          == {"entries": [], "enabled": False, "interval_s": 0},
+          api.get_nodes_device_arp(service, {}, None, fresh))
+    posted = api.post_nodes_device(service, {}, {
+        "ip": "10.0.0.92", "name": "posted-rtr", "group_id": gid,
+        "arp_table_interval_s": 600})["id"]
+    check("POST device carries arp_table_interval_s onto the new row",
+          api.get_nodes_device(service, {}, None, posted)["device"]["arp_table_interval_s"] == 600,
+          api.get_nodes_device(service, {}, None, posted))
+    new_gid = api.post_nodes_group(service, {}, {"name": "posted-profile",
+                                                 "arp_table_interval_s": 1200})["id"]
+    groups = {g["id"]: g for g in api.get_nodes_groups(service, {}, None)["groups"]}
+    check("POST profile carries it too",
+          groups.get(new_gid, {}).get("arp_table_interval_s") == 1200, groups.get(new_gid))
+finally:
+    service.shutdown()
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")

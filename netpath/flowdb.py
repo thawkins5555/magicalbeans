@@ -234,12 +234,21 @@ ROLLUP_KEYS = {60: 48, 3600: 64}
 # How much one read will repair from the raw rows before it gives up and
 # serves the capped rollup as stored — two bounds, for two different costs.
 #
-# _REPAIR_MAX_BUCKETS bounds the statement: each contiguous run of flagged
-# buckets is one arm of the UNION ALL _agg_rows builds, so the worst case (no
-# two adjacent) is this many arms, kept well under SQLite's default
-# compound-select ceiling of 500 and the 999 bound variables an older SQLite
-# allows. Past it a chart is a day of minute buckets or a fortnight of hourly
-# ones, and the holes stay exactly as they did before the flag existed.
+# _REPAIR_MAX_BUCKETS bounds the statement. Each contiguous run of flagged
+# buckets costs the key statement _agg_rows builds SIX bound parameters: two
+# in the rollup arm's `AND NOT (bucket >= ? AND bucket < ?)` exclusion and
+# four in the run's own UNION ALL raw arm (two for the slot expression, two
+# for the ts_end range). The rest of the statement binds ten (six in the
+# rollup arm, four in the raw tail; a filtered query is never repaired, so
+# no filter terms). The worst case — no two flagged buckets adjacent — is
+# one run per bucket, so 120 buckets is 120 * 6 + 10 = 730 parameters
+# against the 999 an older SQLite allows (sqlitebase.id_chunks explains why
+# 999, not 32766, is the number to plan for), a quarter of the limit
+# spare; it is also 122 arms against the default compound-select ceiling
+# of 500. 200 was over: 200 * 6 + 10 is about 1,200, and the query raised
+# "too many SQL variables" on exactly the chart the bound was meant to keep
+# whole. Past it a chart's holes stay exactly as they did before the flag
+# existed, which is the answer the bound has always given.
 #
 # _REPAIR_MAX_FLOWS bounds the work: the raw rows the repair arms will scan,
 # known in advance from the span rows' own flow counts. The overview holds
@@ -248,7 +257,7 @@ ROLLUP_KEYS = {60: 48, 3600: 64}
 # a hundred thousand rows is a few hundred milliseconds. A quiet store never
 # reaches it; a store busy enough to does not get its holes repaired, which
 # is where it stood before.
-_REPAIR_MAX_BUCKETS = 200
+_REPAIR_MAX_BUCKETS = 120
 _REPAIR_MAX_FLOWS = 100_000
 
 # Which setting bounds each tier's history. The minute tier is the expensive

@@ -793,6 +793,17 @@ def normalize_mac(text) -> str:
     return cleaned.lower()
 
 
+# The shortest address prefix the ARP search will scan for. The MAC side
+# already refuses under four hex digits (mac_locations, arp_locations):
+# "ab" is in most addresses. The address side had no floor at all, and a
+# one-character "1" ran `ip LIKE '1%'` — every 1.x, 10.x, 100.x and 1000::
+# row up to the row limit, on the first keystroke. Three characters is the
+# shortest prefix that names a whole first octet ("10." or "192"), and
+# the two-character prefixes ("1", "10", "fe") each cover a large share of
+# any real table — the same reasoning as four hex digits on the MAC side.
+ADDRESS_SEARCH_MIN_CHARS = 3
+
+
 def looks_like_mac_search(text) -> str:
     """normalize_mac, but refusing text that is plainly an IP address.
 
@@ -2785,14 +2796,18 @@ class NodesDatabase(SqliteStore):
         against BOTH columns and the union returned, rather than
         guessing one and answering "not found" for the other. A full
         IPv6 address is longer than twelve hex digits, so it falls out of
-        normalize_mac on its own and is searched as an address only."""
+        normalize_mac on its own and is searched as an address only.
+
+        Both sides have a floor — four hex digits for a MAC,
+        ADDRESS_SEARCH_MIN_CHARS for an address — so a keystroke or two
+        never scans for most of the table."""
         raw = str(needle or "").strip()
         mac_prefix = looks_like_mac_search(raw)
         if len(mac_prefix) < 4:
             mac_prefix = ""
         # An address prefix is dotted decimal or colon-hex; anything else
         # (a hostname, a stray word) matches no ip and is not worth a query.
-        address_like = bool(raw) and all(
+        address_like = len(raw) >= ADDRESS_SEARCH_MIN_CHARS and all(
             c.isdigit() or c in ".:" or c in "abcdefABCDEF" for c in raw)
         ip_prefix = raw.lower() if address_like and (not mac_prefix or ":" in raw) else ""
         clauses, params = [], []

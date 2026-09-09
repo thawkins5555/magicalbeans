@@ -42,6 +42,8 @@ SPELLINGS = ("aa:bb:cc:dd:ee:ff", "AA:BB:CC:DD:EE:FF", "AA-BB-CC-DD-EE-FF",
              "aa-bb-cc-dd-ee-ff", "aabb.ccdd.eeff", "AABB.CCDD.EEFF",
              "aabbccddeeff", "AABBCCDDEEFF")
 OUI_SPELLINGS = ("aa:bb:cc", "AA-BB-CC", "aabbcc", "aabb.cc")
+# What the DhcpServer module prints for a DHCPv6 client: a DUID, not a MAC.
+DUID = "00-01-00-01-1A-2B-3C-4D-AA-11-22-33-44-09"
 
 
 # --------------------------------------------- 1. the needle reduction
@@ -126,6 +128,17 @@ db.replace_dhcp_leases(srv_b, [
      "hostname": "cafe-till", "address_state": "Active",
      "lease_expires_ts": time.time() + 3600, "is_reservation": True,
      "description": "Coffee bar point of sale"},
+    # A DHCPv6 lease: its ClientId is a DUID, fourteen octets that
+    # stored_mac keeps verbatim, the way the BOOTP id above survived poll().
+    {"scope_id": "10.30.0.0", "ip": "10.30.0.88", "mac": DUID,
+     "hostname": "v6-laptop", "address_state": "Active",
+     "lease_expires_ts": time.time() + 3600, "is_reservation": False,
+     "description": None},
+    # A MAC whose bare hex contains "aabb" only across an octet boundary.
+    {"scope_id": "10.30.0.0", "ip": "10.30.0.66", "mac": "0a:ab:bc:00:00:01",
+     "hostname": "straddler", "address_state": "Active",
+     "lease_expires_ts": time.time() + 3600, "is_reservation": False,
+     "description": None},
 ])
 
 for spelling in SPELLINGS:
@@ -173,6 +186,40 @@ check("a hostname prefix sorts first, as before",
       rows and rows[0]["hostname"] == "laptop-roaming", [dict(r) for r in rows])
 check("search_dhcp honours limit",
       len(db.search_dhcp("10.", limit=2)) == 2)
+
+# A ClientId that is not a MAC is shown in the lease table as the server
+# spelled it, so it has to be searchable by that spelling. The old
+# `mac LIKE '%q%'` found these; the reduced-hex clause alone refuses
+# anything over twelve digits and lost them.
+rows = db.search_dhcp("01-12-34-56-78-9A-BC")
+check("a BOOTP hardware-type-prefixed id is found by its own text",
+      [r["ip"] for r in rows] == ["10.20.3.43"], [dict(r) for r in rows])
+rows = db.search_dhcp(DUID)
+check("a DHCPv6 DUID is found by its own text",
+      [r["ip"] for r in rows] == ["10.30.0.88"], [dict(r) for r in rows])
+rows = db.search_dhcp(DUID.lower())
+check("...in either case, as every LIKE here is",
+      [r["ip"] for r in rows] == ["10.30.0.88"], [dict(r) for r in rows])
+rows = db.search_dhcp("aa-11-22-33-44-09")
+check("...and by its tail six octets reduced, which is a MAC-shaped needle",
+      [r["ip"] for r in rows] == ["10.30.0.88"], [dict(r) for r in rows])
+rows = db.search_dhcp("9A-BC")
+check("...and the BOOTP id by four digits of its tail, like any MAC",
+      [r["ip"] for r in rows] == ["10.20.3.43"], [dict(r) for r in rows])
+check("the verbatim fallback does not go around the four-digit floor",
+      db.search_dhcp("ab") == [] and db.search_dhcp("0a:a") == [],
+      [dict(r) for r in db.search_dhcp("ab")])
+# The documented price of reducing both sides to bare hex: the octet
+# boundaries go with the separators, so "aa:bb" is also inside
+# 0a:ab:bc:00:00:01. search_dhcp's docstring says so; this pins that the
+# behaviour is the documented one rather than an accident either way.
+rows = db.search_dhcp("aa:bb")
+check("a reduced needle also matches across an octet boundary (documented)",
+      {r["ip"] for r in rows} == {"10.20.3.42", "10.30.0.77", "10.30.0.66"},
+      [dict(r) for r in rows])
+check("...where the exact lookup does not",
+      db.dhcp_leases_for_mac("0a:ab:bc:00:00:01")
+      and [r["ip"] for r in db.dhcp_leases_for_mac(MAC)] != ["10.30.0.66"])
 check("a query nothing matches is empty, not an error",
       db.search_dhcp("no-such-thing") == [])
 
@@ -302,6 +349,56 @@ check("lease-search by description flags a reservation as one",
 check("a needle under two characters answers an empty list, never the whole table",
       api.get_ipam_dhcp_lease_search(Stub(), {"q": "1"}, None) == {"leases": []}
       and api.get_ipam_dhcp_lease_search(Stub(), {}, None) == {"leases": []})
+
+
+# The handler has two queries behind it: a whole MAC goes to the exact,
+# index-served dhcp_leases_for_mac, anything else to search_dhcp's scan.
+# Which one ran must be invisible in the payload.
+class CountingDb:
+    """ipam_db with the two search methods counted."""
+
+    def __init__(self, real):
+        self._real = real
+        self.calls = {"dhcp_leases_for_mac": 0, "search_dhcp": 0}
+
+    def __getattr__(self, name):
+        attr = getattr(self._real, name)
+        if name in self.calls:
+            def counted(*args, **kwargs):
+                self.calls[name] += 1
+                return attr(*args, **kwargs)
+            return counted
+        return attr
+
+
+class CountingStub(Stub):
+    ipam_db = CountingDb(db)
+
+
+whole = api.get_ipam_dhcp_lease_search(CountingStub(), {"q": "AA-BB-CC-DD-EE-FF"}, None)
+check("a whole MAC is answered by the exact lookup, not the scan",
+      CountingStub.ipam_db.calls == {"dhcp_leases_for_mac": 1, "search_dhcp": 0},
+      CountingStub.ipam_db.calls)
+prefix = api.get_ipam_dhcp_lease_search(CountingStub(), {"q": "aabb.ccdd.ee"}, None)
+check("a prefix is answered by the scan",
+      CountingStub.ipam_db.calls == {"dhcp_leases_for_mac": 1, "search_dhcp": 1},
+      CountingStub.ipam_db.calls)
+whole_by_ip = {l["ip"]: l for l in whole["leases"]}
+prefix_by_ip = {l["ip"]: l for l in prefix["leases"]}
+check("both branches find the card's two leases",
+      set(whole_by_ip) == set(prefix_by_ip) == {"10.20.3.42", "10.30.0.77"},
+      (whole, prefix))
+check("...and agree on every key and value of each, so the client cannot tell",
+      all(whole_by_ip[ip] == prefix_by_ip[ip] for ip in whole_by_ip)
+      and all(list(l) == list(whole["leases"][0]) for l in prefix["leases"]),
+      (whole, prefix))
+check("...with the scope named by scope_id on both, never scope_name",
+      "scope_name" not in whole["leases"][0] and "scope_name" not in prefix["leases"][0]
+      and whole_by_ip["10.20.3.42"]["scope_id"] == "10.20.3.0", whole)
+duid_hits = api.get_ipam_dhcp_lease_search(CountingStub(), {"q": DUID}, None)["leases"]
+check("a DUID is not a whole MAC: it goes to the scan and is found there",
+      [l["ip"] for l in duid_hits] == ["10.30.0.88"]
+      and CountingStub.ipam_db.calls["search_dhcp"] == 2, duid_hits)
 db.close()
 
 
@@ -330,11 +427,51 @@ conn.executemany(
     " VALUES (?,?,?,?,?,?,?,?,?,?)",
     [(legacy_srv, "10.9.0.0", ip, mac, host, "Active", None, 0, None, time.time())
      for ip, mac, host in legacy_rows])
+# The open above stamped the done-marker on an empty table; a store the
+# older code wrote carries no marker at all, which is what is being
+# simulated, so it goes.
+conn.execute("DELETE FROM settings WHERE key = ?",
+             (IpamDatabase._LEASE_MACS_NORMALISED,))
 conn.commit()
 stored = dict(conn.execute("SELECT ip, mac FROM dhcp_leases").fetchall())
 conn.close()
 check("the fixture really holds Windows' spelling",
       stored["10.9.0.10"] == "AA-BB-CC-DD-EE-FF", stored)
+
+# The rewrite interrupted part-way — here, at the last step, the marker's
+# own write — must leave the store as it found it: the UPDATEs and the
+# marker are one transaction, so the next open starts over rather than
+# finding a marker over rows it never rewrote, or rewritten rows it will
+# scan again on every open.
+real_set = IpamDatabase._set_private_setting
+crashed = []
+
+
+def interrupted(self, key, value):
+    crashed.append(self)
+    raise RuntimeError("simulated crash before the marker landed")
+
+
+IpamDatabase._set_private_setting = interrupted
+try:
+    IpamDatabase(legacy_path)
+    check("the interrupted open is seen to fail", False)
+except RuntimeError:
+    check("the interrupted open is seen to fail", True)
+finally:
+    IpamDatabase._set_private_setting = real_set
+    # What the OS does for a process that died mid-transaction: the
+    # connection goes, and with it the uncommitted UPDATEs. Done by hand
+    # because the exception's traceback keeps the half-built store alive.
+    for store in crashed:
+        store._conn.close()
+conn = sqlite3.connect(legacy_path)
+after_crash = dict(conn.execute("SELECT ip, mac FROM dhcp_leases").fetchall())
+marker_rows = conn.execute("SELECT COUNT(*) FROM settings WHERE key = ?",
+                           (IpamDatabase._LEASE_MACS_NORMALISED,)).fetchone()[0]
+conn.close()
+check("...and left every row in its old spelling, with no marker, for the next open",
+      after_crash == stored and marker_rows == 0, (after_crash, marker_rows))
 
 try:
     legacy = IpamDatabase(legacy_path)
@@ -360,11 +497,30 @@ if legacy is not None:
           [r["ip"] for r in rows] == ["10.9.0.10"], [dict(r) for r in rows])
     check("conflict detection's cross-check now compares equal without help",
           legacy.dhcp_lease_for_ip("10.9.0.10")["mac"] == MAC)
+    check("the open left the done-marker behind it",
+          legacy._private_setting(IpamDatabase._LEASE_MACS_NORMALISED) is True)
     legacy.close()
+    # A row written in the old spelling AFTER the marker is what a second
+    # open must not go looking for: the scan runs once, not on every open.
+    # Such a row is still found — section 6 above is the query-time half.
+    conn = sqlite3.connect(legacy_path)
+    conn.execute(
+        "INSERT INTO dhcp_leases(server_id, scope_id, ip, mac, hostname, address_state,"
+        " lease_expires_ts, is_reservation, description, polled_ts)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (legacy_srv, "10.9.0.0", "10.9.0.16", "0C-0D-0E-0F-10-12", "after-marker",
+         "Active", None, 0, None, time.time()))
+    conn.commit()
+    conn.close()
     legacy = IpamDatabase(legacy_path)      # a second open must be a no-op rewrite
     again = {r["ip"]: r["mac"] for r in legacy.dhcp_leases(legacy_srv)}
     check("reopening an already-migrated database changes nothing",
-          again == stored, (again, stored))
+          {ip: mac for ip, mac in again.items() if ip != "10.9.0.16"} == stored,
+          (again, stored))
+    check("...and does not scan again: a row past the marker is left as written",
+          again.get("10.9.0.16") == "0C-0D-0E-0F-10-12", again)
+    check("...though the search still finds it, reduced",
+          [r["ip"] for r in legacy.search_dhcp("0c:0d:0e:0f:10:12")] == ["10.9.0.16"])
     legacy.close()
 
 print()

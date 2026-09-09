@@ -321,8 +321,11 @@ def _parse_iso(text: str | None) -> float | None:
         return None
 
 
-def _stored_mac(client_id) -> str | None:
-    """A lease's ClientId as dhcp_leases.mac stores it.
+def stored_mac(client_id) -> str | None:
+    """A lease's ClientId as dhcp_leases.mac stores it — the one place the
+    rule lives: ingest calls it per row here, and IpamDatabase's open-time
+    rewrite of an older store calls the same function rather than restate
+    it, so the two cannot drift.
 
     The DhcpServer module reports a client as `AA-BB-CC-DD-EE-FF` — dashes,
     upper case — where everything else in ipam.db holds a MAC the way
@@ -368,7 +371,7 @@ def poll(server: str, timeout_s: float = 30.0,
         leases.append({
             "scope_id": row.get("scope_id"),
             "ip": row.get("ip"),
-            "mac": _stored_mac(row.get("mac")),
+            "mac": stored_mac(row.get("mac")),
             "hostname": row.get("hostname"),
             "address_state": row.get("address_state"),
             "lease_expires_ts": _parse_iso(row.get("lease_expires")),
@@ -387,7 +390,7 @@ def poll(server: str, timeout_s: float = 30.0,
             # client, so it would otherwise be invisible.
             leases.append({
                 "scope_id": res.get("scope_id"), "ip": ip,
-                "mac": _stored_mac(res.get("mac")),
+                "mac": stored_mac(res.get("mac")),
                 "hostname": None, "address_state": "ReservedUnclaimed",
                 "lease_expires_ts": None, "is_reservation": True,
                 "description": res.get("name") or res.get("description"),

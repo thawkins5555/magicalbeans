@@ -5906,10 +5906,20 @@ class NodePoller(Worker):
             phys, complete, reason = self._walk_column_detail(device, config, phys_oid)
         except SnmpError as exc:
             return None, False, f"SNMP error: {exc}"
+        # Complete first, then empty: a timeout or an error on the very
+        # first GETBULK is an empty `phys` too, and read as "this table
+        # produced no rows" it sent the caller on to the successor table —
+        # so a modern agent answering both would alternate sources across
+        # cycles whenever the legacy walk transiently timed out, flapping
+        # `present` on every IPv6-only row, and a device that merely timed
+        # out twice was logged as answering neither table. Only a walk that
+        # genuinely reached the end of its subtree and found nothing there
+        # is the fallback's case; every other way of stopping is None, as
+        # read_device_arp_table promises.
+        if not complete:
+            return None, bool(phys), reason
         if not phys:
             return [], False, reason
-        if not complete:
-            return None, True, reason
         try:
             types = self._walk_column(device, config, type_oid)
         except SnmpError:

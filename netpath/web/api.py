@@ -27,7 +27,7 @@ from .. import namelookup
 from ..services import format_bytes, format_packets, format_rate, port_name, protocol_name
 from ..tracer import expected_budget, unreachable_text
 from ..flowdb import DIMENSIONS
-from ..ipamdb import scope_size
+from ..ipamdb import mac_search_digits, scope_size
 from ..eventlog import (ALERTS as ALERTS_CATEGORY, CATEGORIES,
                         CONFIGRX as CONFIGRX_CATEGORY,
                         ERROR as ERROR_CATEGORY, IPAM as IPAM_CATEGORY,
@@ -2498,18 +2498,41 @@ def get_ipam_dhcp_lease_search(service, params, body) -> dict:
     here, which is the difference the operator asked about.
 
     The same two-character floor get_ipam_search applies: a one-character
-    LIKE matches most of the table and answers nothing."""
+    LIKE matches most of the table and answers nothing.
+
+    Two queries stand behind the one payload. A needle that is a whole MAC
+    in any spelling is "where is this card", and goes to
+    dhcp_leases_for_mac: an equality on the stored column, which
+    ix_dhcp_leases_mac answers, against search_dhcp's unavoidable scan of
+    every lease through a REPLACE expression. Anything else — a prefix,
+    the four digits off a label, a hostname, an address — is a search and
+    goes to search_dhcp. The rows are shaped by one function so the
+    browser cannot tell which ran: dhcp_leases_for_mac also joins the
+    scope's name, and it is deliberately left out here rather than sent
+    on one branch and absent on the other; the payload names the scope by
+    scope_id on both. The whole-MAC branch also skips the text clauses, so
+    a MAC that appears only in another lease's description is a search
+    hit and not a lookup hit — the lookup's answer is the leases the card
+    holds, which is what a whole address asks."""
     query = (params.get("q") or "").strip()
     if len(query) < 2:
         return {"leases": []}
-    return {"leases": [
-        {"id": r["id"], "server_id": r["server_id"], "server_label": r["server_label"],
-         "scope_id": r["scope_id"], "ip": r["ip"], "mac": r["mac"],
-         "hostname": r["hostname"], "address_state": r["address_state"],
-         "lease_expires": r["lease_expires_ts"],
-         "is_reservation": bool(r["is_reservation"]),
-         "description": r["description"], "polled": r["polled_ts"]}
-        for r in service.ipam_db.search_dhcp(query, limit=20)]}
+    if len(mac_search_digits(query)) == 12:
+        rows = service.ipam_db.dhcp_leases_for_mac(query, limit=20)
+    else:
+        rows = service.ipam_db.search_dhcp(query, limit=20)
+    return {"leases": [_dhcp_lease_search_json(r) for r in rows]}
+
+
+def _dhcp_lease_search_json(r) -> dict:
+    """One lease row as the lease search sends it — the same keys whichever
+    of the two queries produced the row; see get_ipam_dhcp_lease_search."""
+    return {"id": r["id"], "server_id": r["server_id"], "server_label": r["server_label"],
+            "scope_id": r["scope_id"], "ip": r["ip"], "mac": r["mac"],
+            "hostname": r["hostname"], "address_state": r["address_state"],
+            "lease_expires": r["lease_expires_ts"],
+            "is_reservation": bool(r["is_reservation"]),
+            "description": r["description"], "polled": r["polled_ts"]}
 
 
 def _subnet_json(row) -> dict:
@@ -3436,9 +3459,11 @@ def get_nodes_mac_search(service, params, body) -> dict:
     mac = nodesdb.looks_like_mac_search(text)
     if len(mac) < 4:
         return {"mac": "", "locations": [], "enabled_devices": 0}
+    rows = service.nodes_db.mac_locations(mac)
+    devices = _devices_for_rows(service, rows)
     locations = []
-    for row in service.nodes_db.mac_locations(mac):
-        device = service.nodes_db.device(row["device_id"])
+    for row in rows:
+        device = devices.get(row["device_id"])
         if device is None:
             continue
         locations.append({
@@ -3475,21 +3500,16 @@ def get_nodes_arp_search(service, params, body) -> dict:
     back rather than one picked here, for the reason the MAC search gives.
     """
     needle = (params.get("q") or "").strip()
+    rows = service.nodes_db.arp_locations(needle)
+    devices = _devices_for_rows(service, rows)
     locations = []
-    for row in service.nodes_db.arp_locations(needle):
-        device = service.nodes_db.device(row["device_id"])
+    for row in rows:
+        device = devices.get(row["device_id"])
         if device is None:
             continue
-        locations.append({
-            "device_id": row["device_id"],
-            "device_name": namelookup.device_name(device),
-            "if_index": row["if_index"],
-            "if_descr": row["if_descr"] or f"Interface {row['if_index']}",
-            "ip": row["ip"], "mac": row["mac"],
-            "entry_type": row["entry_type"],
-            "seen_ts": row["seen_ts"], "first_seen_ts": row["first_seen_ts"],
-            "present": bool(row["present"]),
-        })
+        locations.append(_arp_json(
+            row, device_name=namelookup.device_name(device),
+            if_descr=row["if_descr"] or f"Interface {row['if_index']}"))
     # How many devices walk their ARP cache at all — off is the shipped
     # default here, so "not found" and "nobody is collecting this" are
     # different sentences far more often than for the MAC table. One
@@ -3500,10 +3520,25 @@ def get_nodes_arp_search(service, params, body) -> dict:
                 service.nodes_settings.get("mac_table_retention_days", 7))}
 
 
-def _arp_json(row, local_port: str = "") -> dict:
+def _devices_for_rows(service, rows) -> dict:
+    """The device row behind each search hit, by id, in one read. The two
+    searches above run on a keystroke and answer up to their row limit,
+    and a device() per hit made one keystroke cost a query per row — two
+    hundred and one for a short address prefix. devices_by_ids is the
+    same read chunked to the bind-parameter limit, so this is one or two
+    statements whatever the hit count."""
+    return {d["id"]: d for d in service.nodes_db.devices_by_ids(
+        row["device_id"] for row in rows)}
+
+
+def _arp_json(row, **extra) -> dict:
+    """One arp_entries row as every ARP route spells it, plus whatever the
+    route knows that the row does not — the detail pane's local_port, the
+    search's device_name and if_descr. One shape, so the two cannot drift
+    on a field name."""
     return {
         "device_id": row["device_id"], "if_index": row["if_index"],
-        "local_port": local_port,
+        **extra,
         "ip": row["ip"], "mac": row["mac"], "entry_type": row["entry_type"],
         "seen_ts": row["seen_ts"], "first_seen_ts": row["first_seen_ts"],
         "present": bool(row["present"]),
@@ -3524,7 +3559,7 @@ def get_nodes_device_arp(service, params, body, device_id) -> dict:
     row = _require(service.nodes_db.device(device_id), "device")
     interval = int(service.nodes_db.effective_config(row).get("arp_table_interval_s") or 0)
     label = _neighbor_local_port_labeler(service)
-    return {"entries": [_arp_json(r, label(device_id, r["if_index"]))
+    return {"entries": [_arp_json(r, local_port=label(device_id, r["if_index"]))
                         for r in service.nodes_db.arp_entries_for(device_id)],
             "enabled": interval > 0, "interval_s": interval}
 

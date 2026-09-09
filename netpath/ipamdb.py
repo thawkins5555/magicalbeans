@@ -12,7 +12,7 @@ import ipaddress
 import sqlite3
 import time
 
-from .ipam_scan import mac_colon
+from .ipam_dhcp import stored_mac
 from .sqlitebase import SqliteStore
 
 
@@ -187,7 +187,7 @@ CREATE TABLE IF NOT EXISTS dhcp_scopes (
 -- hosts.mac is (ipam_scan.mac_colon: lower case, colons) rather than the
 -- way the server spells it (AA-BB-CC-DD-EE-FF), so the two tables compare
 -- equal for the same card and dhcp_leases_for_mac can look one up through
--- ix_dhcp_leases_mac instead of scanning; ipam_dhcp._stored_mac converts
+-- ix_dhcp_leases_mac instead of scanning; ipam_dhcp.stored_mac converts
 -- at ingest and _migrate below rewrote whatever was stored before it did.
 CREATE TABLE IF NOT EXISTS dhcp_leases (
     id               INTEGER PRIMARY KEY,
@@ -307,6 +307,10 @@ class IpamDatabase(SqliteStore):
         self.ensure_columns("dhcp_scopes", {"router": "TEXT"})
         self._normalise_lease_macs()
 
+    # The settings row that says _normalise_lease_macs has run — the same
+    # done-marker flowdb.drop_legacy_indexes keeps, for the same reason.
+    _LEASE_MACS_NORMALISED = "normalised_lease_macs"
+
     def _normalise_lease_macs(self) -> None:
         """Rewrite dhcp_leases.mac rows stored in the server's own spelling
         (`AA-BB-CC-DD-EE-FF`) into the colon form ipam_dhcp now writes at
@@ -316,24 +320,37 @@ class IpamDatabase(SqliteStore):
         Every poll replaces a server's leases wholesale, so ingest alone
         would self-heal within an interval; this makes the upgrade correct
         immediately and, more to the point, leaves nothing for a reader to
-        special-case. It runs the same mac_colon the ingest path runs, on
-        purpose — a SQL rewrite would be a second spelling of the rule, and
-        the two would drift. Idempotent: an already-colon row converts to
-        itself and is skipped; a ClientId that is not a MAC at all is left
-        exactly as stored, the same choice ipam_dhcp._stored_mac makes. The
-        caller holds the lock and commits, like the rest of _migrate.
+        special-case. It calls ipam_dhcp.stored_mac, the function the
+        ingest path calls per row, on purpose — a second spelling of the
+        rule here (a SQL rewrite, or mac_colon restated) would drift from
+        the first. So an already-colon row converts to itself and is
+        skipped, and a ClientId that is not a MAC at all is left exactly as
+        stored, because that is what ingest does with it.
+
+        Once, not on every open: the marker is a private settings row, and
+        a store that carries it is not scanned again — the scan is the
+        whole table, and an install's lease table is the one IPAM table
+        that can be large. Interrupted part-way it is still correct: the
+        caller holds the lock, the UPDATEs and the marker's own INSERT sit
+        in one transaction, and the marker is written last, so a crash
+        before the commit rolls both back and the next open starts over,
+        while a crash after it has nothing left to do.
         """
+        if self._private_setting(self._LEASE_MACS_NORMALISED):
+            return
         rows = self._conn.execute(
             "SELECT id, mac FROM dhcp_leases WHERE mac IS NOT NULL AND mac <> ''"
         ).fetchall()
         changed = []
         for row in rows:
-            canonical = mac_colon(row["mac"]) or row["mac"]
+            canonical = stored_mac(row["mac"])
             if canonical != row["mac"]:
                 changed.append((canonical, row["id"]))
         if changed:
             self._conn.executemany(
                 "UPDATE dhcp_leases SET mac=? WHERE id=?", changed)
+        # Joins the transaction the UPDATEs opened; its commit lands both.
+        self._set_private_setting(self._LEASE_MACS_NORMALISED, True)
 
     # --------------------------------------------------------------- subnets
 
@@ -783,9 +800,30 @@ class IpamDatabase(SqliteStore):
         says now — but IP and MAC belong here too: a lease is often the only
         record of a device that never answered SappiWhere's own ping sweep
         (asleep, off-segment, or behind a firewall that drops ICMP but still
-        asked the DHCP server for an address)."""
+        asked the DHCP server for an address).
+
+        "Any spelling" is a substring match on the bare hex of both sides,
+        and it discards the octet boundaries with the separators: "aa:bb"
+        finds 0a:ab:bc:00:00:01 as well as aa:bb:cc:dd:ee:ff. That is the
+        accepted price of a search that takes the four digits off a
+        device's label (a tail, not a prefix) in whatever spelling was to
+        hand — one more row in a list, never a missing one. A caller that
+        has a whole address and wants only that card asks
+        dhcp_leases_for_mac, which compares the stored form exactly.
+
+        The column can hold a ClientId that is not a MAC at all — a DHCPv6
+        DUID, a BOOTP reservation's hardware-type-prefixed id — which
+        stored_mac keeps as the server reported it and the lease table
+        shows. Those are longer than twelve hex digits, so the reduction
+        refuses them, and they are matched verbatim instead, in the
+        server's own spelling: the term the reduced clause replaced, kept
+        for the rows the reduced clause cannot describe. Only for those —
+        a needle that does read as hex stays under MAC_SEARCH_MIN_DIGITS'
+        floor, which a verbatim `LIKE '%ab%'` would have gone around."""
         like = f"%{query}%"
         mac_sql, mac_params = self._mac_clause("l.mac", query)
+        if not mac_search_digits(query):
+            mac_sql, mac_params = " OR l.mac LIKE ?", [like]
         with self._lock:
             return self._conn.execute(
                 "SELECT l.*, s.label AS server_label FROM dhcp_leases l"

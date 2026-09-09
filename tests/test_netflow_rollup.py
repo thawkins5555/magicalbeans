@@ -10,6 +10,7 @@ Plain script, no pytest: run it, read the PASS lines, non-zero exit on failure.
 """
 import os
 import shutil
+import sqlite3
 import sys
 import time
 import types
@@ -701,6 +702,94 @@ def test_14_a_named_series_is_whole_in_every_bucket() -> None:
     db.close()
 
 
+def test_15_the_repair_statement_fits_an_old_sqlite() -> None:
+    """_REPAIR_MAX_BUCKETS is a promise about a statement's size, and
+    nothing checked it: at 200 the worst case — every other bucket flagged,
+    so one UNION ALL arm and six bound parameters per bucket — built a
+    statement of some 1,200 parameters, and a SQLite older than 3.32 (the
+    3.31 an Ubuntu 20.04 Python links) refused it with "too many SQL
+    variables", so the chart that used to have holes now failed to draw.
+    The worst case is built here at exactly the bound, the connection is
+    held to the older limit, and overview must answer, and answer the same
+    as raw. No test flagged buckets by hand before, which is how the
+    arithmetic went unchecked."""
+    print("15: the worst-case repair statement fits an old SQLite's 999 variables")
+    limit = getattr(sqlite3, "SQLITE_LIMIT_VARIABLE_NUMBER", None)
+    if limit is None or not hasattr(sqlite3.Connection, "setlimit"):
+        # setlimit is Python 3.11+; the arithmetic check below still runs.
+        print("  (Connection.setlimit unavailable here; the live check is skipped)")
+    bound = flowdb._REPAIR_MAX_BUCKETS
+    # The comment on _REPAIR_MAX_BUCKETS is the arithmetic being pinned:
+    # six parameters a run, ten for the rest, a quarter of 999 to spare.
+    check(bound * 6 + 10 <= 999 * 3 // 4,
+          f"the bound leaves headroom under 999 variables "
+          f"({bound} runs * 6 + 10 = {bound * 6 + 10})")
+    check(bound + 2 <= 500,
+          f"...and under the default 500-arm compound select ({bound + 2} arms)")
+
+    db = store("variables.db")
+    end = flowdb._align_down(time.time() - 300, 60)
+    minutes = bound * 2 + 10
+    start = end - minutes * 60
+    rows = []
+    for minute in range(minutes):
+        ts = start + minute * 60 + 30
+        # Three conversations a minute, under the cap: the flags below are
+        # planted, not earned, so the repaired answer and the rollup's own
+        # are the same numbers and the raw comparison holds either way.
+        rows.extend(flow(k, ts, src_ip=f"10.4.0.{k}", dst_ip="10.9.9.9",
+                         bytes=1_000 + k, sampling=1) for k in range(3))
+    db.insert_flows(rows)
+    cover(db, hours=False)
+    dim = flowdb.DIMENSION_IDS["Conversation"]
+    flagged = [start + m * 60 for m in range(0, bound * 2, 2)]
+    with db._lock:
+        db._conn.executemany(
+            "INSERT OR IGNORE INTO flow_rollup_trunc(tier, dim, bucket)"
+            " VALUES (60, ?, ?)", [(dim, b) for b in flagged])
+        db._conn.commit()
+    plan = db._rollup_plan(start, end, "Conversation", NO_FILTERS, 60)
+    runs = db._repair_ranges(60, dim, start, plan[2]) if plan else []
+    check(plan is not None and len(runs) == bound,
+          f"the fixture is the worst case: {len(runs)} non-adjacent runs "
+          f"at the bound of {bound}")
+    if limit is not None and hasattr(db._conn, "setlimit"):
+        db._conn.setlimit(limit, 999)
+        check(db._conn.getlimit(limit) == 999,
+              "the connection is held to the older SQLite's 999 variables")
+    try:
+        got = db.overview(start, end, "Conversation", NO_FILTERS, 60,
+                          series_limit=8, top_limit=10)
+        error = None
+    except sqlite3.OperationalError as exc:
+        got, error = None, exc
+    check(error is None,
+          f"overview answers with every run repaired under the limit ({error})")
+    want = raw(db, "overview", start, end, "Conversation", NO_FILTERS, 60,
+               series_limit=8, top_limit=10)
+    check(got == want, "...and the repaired answer equals raw")
+
+    # One more non-adjacent flag is past the bound: the read must give up
+    # on the repair (serve the rollup as stored) rather than build a
+    # statement it cannot bind.
+    with db._lock:
+        db._conn.execute(
+            "INSERT OR IGNORE INTO flow_rollup_trunc(tier, dim, bucket)"
+            " VALUES (60, ?, ?)", (dim, start + bound * 2 * 60))
+        db._conn.commit()
+    check(db._repair_ranges(60, dim, start, plan[2]) == [],
+          "one run past the bound and the repair stands down")
+    try:
+        got = db.overview(start, end, "Conversation", NO_FILTERS, 60,
+                          series_limit=8, top_limit=10)
+        error = None
+    except sqlite3.OperationalError as exc:
+        got, error = None, exc
+    check(error is None and got == want,
+          f"...and overview still answers, from the rollup as stored ({error})")
+    db.close()
+
+
 TESTS = [
     test_1_rollup_and_raw_agree,
     test_2_totals_survive_truncation,
@@ -716,6 +805,7 @@ TESTS = [
     test_12_a_rewrite_reaches_both_tiers,
     test_13_one_slot_takes_the_coarsest_tier,
     test_14_a_named_series_is_whole_in_every_bucket,
+    test_15_the_repair_statement_fits_an_old_sqlite,
 ]
 
 
