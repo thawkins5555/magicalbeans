@@ -219,34 +219,91 @@ def _encrypt_secret(secret: str, unavailable: str) -> bytes:
         secret = None
 
 
-def _v3_fields(body: dict) -> tuple[str, str, str]:
-    """(user, auth_proto, password) from an SNMPv3 credential body — all
-    three required, since a v3 credential is meaningless without them."""
+def _clean_priv_proto(fields: dict) -> None:
+    """Validates `v3_priv_proto` in place, if present: blank means none
+    (nodesdb drops the privacy blob with it), anything else must be a
+    protocol snmpcrypt speaks. Refused by name rather than stored and
+    refused at poll time, because "DES" typed here and "unsupported" on
+    the device row an hour later is the kind of distance an operator
+    should not have to close."""
+    from .. import snmpcrypt
+
+    if "v3_priv_proto" not in fields:
+        return
+    proto = str(fields["v3_priv_proto"] or "").strip().upper()
+    if proto and proto not in snmpcrypt.PRIV_PROTOCOLS:
+        raise ValueError(
+            f"The privacy protocol must be AES (AES-128-CFB); {proto!r} is "
+            f"not supported — DES is not offered, and AES-192/256 need a key "
+            f"extension no RFC defines")
+    fields["v3_priv_proto"] = proto or None
+
+
+def _v3_fields(body: dict, *, allow_priv: bool) -> tuple[str, str, str, str | None, str | None]:
+    """(user, auth_proto, password, priv_proto, priv_password) from an
+    SNMPv3 credential body — the first three required, since a v3
+    credential is meaningless without them; the privacy pair optional, and
+    only ever both or neither, since a privacy password without a protocol
+    cannot be used and a protocol without a password is a promise the
+    poller cannot keep. A caller that cannot poll at authPriv passes
+    allow_priv=False and a typed privacy password is refused in words —
+    the wireless poller — rather than stored and ignored."""
     user = str(body.get("v3_user", "")).strip()
     password = str(body.get("v3_auth_pass", ""))
     auth_proto = str(body.get("v3_auth_proto", "")).strip()
     if not user or not password or not auth_proto:
         raise ValueError("A username, auth protocol, and password are all required")
-    return user, auth_proto, password
+    priv_password = str(body.get("v3_priv_pass", "") or "")
+    fields = {"v3_priv_proto": body.get("v3_priv_proto")}
+    _clean_priv_proto(fields)
+    priv_proto = fields["v3_priv_proto"]
+    if not allow_priv and (priv_password or priv_proto):
+        raise ValueError(
+            "A privacy password is not supported for this credential: only "
+            "Nodes devices and polling profiles can be polled at authPriv. "
+            "Leave the privacy fields empty, or give this user an authNoPriv "
+            "view on the device.")
+    if priv_password and not priv_proto:
+        raise ValueError("A privacy protocol (AES) is required with a privacy password")
+    return user, auth_proto, password, priv_proto, (priv_password or None)
 
 
 def _store_v3_credential(service, params, body, *, store, category, message,
-                         target, unavailable) -> dict:
-    """Store one SNMPv3 credential: validate the body, encrypt the password,
-    hand (user, auth_proto, encrypted) to `store`, then log and audit it.
+                         target, unavailable, allow_priv: bool = True) -> dict:
+    """Store one SNMPv3 credential: validate the body, encrypt the password
+    (and the privacy password, if one was typed), hand them to `store`,
+    then log and audit it.
 
     `store` is the caller's own database call, `unavailable` its own wording
-    for a host that cannot encrypt. The password never leaves this frame.
+    for a host that cannot encrypt. Neither password leaves this frame.
+    With allow_priv, `store` takes (user, auth_proto, encrypted, priv_proto,
+    priv_encrypted) — priv_encrypted None meaning "leave the stored one",
+    the form's "blank to keep"; without it, the three-argument shape the
+    wireless controller store has always had, and a privacy field in the
+    body is a ValueError before anything is encrypted.
     """
-    user, auth_proto, password = _v3_fields(body)
+    user, auth_proto, password, priv_proto, priv_password = _v3_fields(
+        body, allow_priv=allow_priv)
+    priv_encrypted = None
     try:
         encrypted = _encrypt_secret(password, unavailable)
+        if priv_password:
+            priv_encrypted = _encrypt_secret(priv_password, unavailable)
     finally:
         password = None
-    store(user, auth_proto, encrypted)
+        priv_password = None
+    if allow_priv:
+        store(user, auth_proto, encrypted, priv_proto, priv_encrypted)
+    else:
+        store(user, auth_proto, encrypted)
     service.log.add(category, message)
+    # The audit names what THIS call stored, not the row's resulting level:
+    # a blank privacy field keeps whatever privacy password was already
+    # there, and only the row knows whether that is anything.
     _audit(service, params, "credential.store", target=target,
-           detail=f"SNMPv3 user {user}")
+           detail=f"SNMPv3 user {user}"
+                  + (f" with a {priv_proto} privacy password (authPriv)"
+                     if priv_encrypted else ""))
     return {"ok": True}
 
 
@@ -2920,6 +2977,32 @@ def _may_read_secrets(service, params, module: str) -> bool:
     return _permissions.allows(granted.get(module), _permissions.WRITE)
 
 
+def _v3_level_fields(row) -> dict:
+    """The privacy protocol, whether a privacy password is stored (a
+    boolean, the same reduction the auth password gets — the blob itself
+    is never returned), and the security level DERIVED from the row the
+    way the poller derives it (nodepoll.security_level): authPriv when
+    both pairs are stored, authNoPriv with the auth pair, noAuthNoPriv
+    with neither, null for a v1/v2c row or a device row that does not
+    override the version. Read defensively for a row fetched before the
+    5.8.0 migration has run."""
+    from ..nodepoll import security_level
+
+    keys = row.keys()
+    priv_proto = row["v3_priv_proto"] if "v3_priv_proto" in keys else None
+    priv_blob = row["v3_priv_pass_enc"] if "v3_priv_pass_enc" in keys else None
+    version = row["snmp_version"] if "snmp_version" in keys else None
+    level = None
+    if version is not None and int(version) == 3:
+        level = security_level({
+            "snmp_version": 3, "v3_auth_proto": row["v3_auth_proto"],
+            "v3_auth_pass_enc": row["v3_auth_pass_enc"],
+            "v3_priv_proto": priv_proto, "v3_priv_pass_enc": priv_blob})
+    return {"v3_priv_proto": priv_proto,
+            "has_priv_credential": bool(priv_blob),
+            "security_level": level}
+
+
 def _device_json(row, reveal: bool = False) -> dict:
     return {
         "id": row["id"], "ip": row["ip"], "name": row["name"],
@@ -2930,6 +3013,7 @@ def _device_json(row, reveal: bool = False) -> dict:
         **_community_fields(row, reveal),
         "v3_user": row["v3_user"], "v3_auth_proto": row["v3_auth_proto"],
         "has_credential": bool(row["v3_auth_pass_enc"]),
+        **_v3_level_fields(row),
         "poll_interval_s": row["poll_interval_s"],
         "snmp_timeout_s": row["snmp_timeout_s"],
         "snmp_retries": row["snmp_retries"],
@@ -3078,6 +3162,7 @@ def _group_json(service, row, reveal: bool = False) -> dict:
         "v3_user": row["v3_user"],
         "v3_auth_proto": row["v3_auth_proto"],
         "has_credential": bool(row["v3_auth_pass_enc"]),
+        **_v3_level_fields(row),
         "poll_interval_s": row["poll_interval_s"],
         "snmp_timeout_s": row["snmp_timeout_s"], "snmp_retries": row["snmp_retries"],
         "ping_enabled": bool(row["ping_enabled"]), "snmp_enabled": bool(row["snmp_enabled"]),
@@ -3115,6 +3200,7 @@ def _group_credential_json(row, reveal: bool = False) -> dict:
         **_community_fields(row, reveal),
         "v3_user": row["v3_user"], "v3_auth_proto": row["v3_auth_proto"],
         "has_credential": bool(row["v3_auth_pass_enc"]),
+        **_v3_level_fields(row),
         "created_ts": row["created_ts"],
     }
 
@@ -3268,7 +3354,7 @@ def _discovery_identification(row, installed=None) -> dict:
 _DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id",
                          "display_name_source", "enabled",
                          "snmp_version", "community",
-                         "v3_user", "v3_auth_proto", "poll_interval_s",
+                         "v3_user", "v3_auth_proto", "v3_priv_proto", "poll_interval_s",
                          "snmp_timeout_s", "snmp_retries", "ping_enabled",
                          "snmp_enabled", "oid_set", "mib_file_id",
                          "ping_count", "ping_timeout_ms", "unreachable_ping_only",
@@ -3279,7 +3365,8 @@ _DEVICE_EDITABLE_BODY = ("name", "group_id", "device_group_id",
                          # — absent from _GROUP_EDITABLE_BODY below on purpose.
                          "web_scheme", "web_port")
 _GROUP_EDITABLE_BODY = ("name", "snmp_version", "community", "v3_user",
-                        "v3_auth_proto", "poll_interval_s", "snmp_timeout_s",
+                        "v3_auth_proto", "v3_priv_proto", "poll_interval_s",
+                        "snmp_timeout_s",
                         "snmp_retries", "ping_enabled", "snmp_enabled", "oid_set",
                         "mib_file_id", "ping_count", "ping_timeout_ms",
                         "unreachable_ping_only", "vendor_oid", "location_oid",
@@ -3872,6 +3959,7 @@ def post_nodes_device(service, params, body) -> dict:
     # Validated before the insert, like upstream_id above and for the same
     # reason: a refused value must not leave a half-configured device behind.
     _clean_web_fields(overrides)
+    _clean_priv_proto(overrides)
     try:
         device_id = service.nodes_db.add_device(
             ip, name=body.get("name") or None,
@@ -4000,9 +4088,18 @@ def get_nodes_device(service, params, body, device_id) -> dict:
     device = _device_json(row, reveal)
     # effective_config resolves the profile's own community into the
     # device's, so it carries one too and follows the same rule.
+    effective = service.nodes_db.effective_config(row)
     device["effective_config"] = {
-        k: v for k, v in service.nodes_db.effective_config(row).items()
-        if k != "v3_auth_pass_enc" and (reveal or k != "community")}
+        k: v for k, v in effective.items()
+        if k not in ("v3_auth_pass_enc", "v3_priv_pass_enc")
+        and (reveal or k != "community")}
+    # The level the poll actually goes out at, after the profile merge —
+    # the row-level security_level above is null for a device that does
+    # not override its version, which is most of them.
+    from ..nodepoll import security_level as _level
+    device["effective_config"]["security_level"] = _level(effective) or None
+    device["effective_config"]["has_credential"] = bool(effective.get("v3_auth_pass_enc"))
+    device["effective_config"]["has_priv_credential"] = bool(effective.get("v3_priv_pass_enc"))
     device["group_name"] = None
     if row["group_id"]:
         group = service.nodes_db.group(row["group_id"])
@@ -4132,6 +4229,7 @@ def put_nodes_device(service, params, body, device_id) -> dict:
     _check_display_name_source(body)
     fields = _pick(body, _DEVICE_EDITABLE_BODY)
     _clean_web_fields(fields)
+    _clean_priv_proto(fields)
     if "upstream_id" in fields:
         fields["upstream_id"] = _clean_upstream_id(
             service, device_id, fields["upstream_id"])
@@ -4400,6 +4498,7 @@ def post_nodes_devices_bulk_import(service, params, body) -> dict:
             # After the loop, not inside it: the refusal must be the same
             # sentence the single-device form gives.
             _clean_web_fields(overrides)
+            _clean_priv_proto(overrides)
         except ValueError as exc:
             invalid.append({"row": i, "ip": ip, "reason": str(exc)})
             continue
@@ -4868,9 +4967,21 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
         identity = None
     auth_proto = body.get("v3_auth_proto") or config.get("v3_auth_proto")
     password = body.get("v3_auth_pass")
-    if identity is None or (password is None and "v3_auth_pass" not in body):
+    # The privacy pair follows the auth pair's rule exactly: typed wins,
+    # stored is the fallback, and "v3_priv_pass" present-but-empty means
+    # "test without one" rather than "use the stored one". A blank protocol
+    # typed into the form means no privacy, whatever is stored.
+    priv_fields = {"v3_priv_proto": body["v3_priv_proto"]} if "v3_priv_proto" in body \
+        else {"v3_priv_proto": config.get("v3_priv_proto")}
+    _clean_priv_proto(priv_fields)
+    priv_proto = priv_fields["v3_priv_proto"]
+    priv_password = body.get("v3_priv_pass")
+    if identity is None or (password is None and "v3_auth_pass" not in body) \
+            or (priv_password is None and "v3_priv_pass" not in body):
         try:
-            stored_identity, stored_proto, stored_password = credential_for(config)
+            stored = credential_for(config)
+            stored_identity, stored_proto, stored_password = (
+                stored.identity, stored.auth_proto, stored.auth_password)
         except SnmpError as exc:
             # The STORED credential is itself refused — a v1/v2c community
             # carrying a comma, saved before nodesdb.clean_community existed
@@ -4885,6 +4996,11 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
         auth_proto = auth_proto or stored_proto
         if password is None and "v3_auth_pass" not in body:
             password = stored_password
+        if priv_password is None and "v3_priv_pass" not in body:
+            priv_password = stored.priv_password
+        stored = None
+    if not priv_proto:
+        priv_password = None
 
     result = {"ping": {"ok": None, "rtt_ms": None}, "snmp": {"ok": None, "error": None}}
     timeout_s = float(config.get("snmp_timeout_s", 3.0))
@@ -4915,7 +5031,9 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
         # typed-or-stored pair resolved above, since the typed password is
         # exactly the one credential_for cannot see.
         signed = bool(version >= 3 and auth_proto and password)
-        level = ("authNoPriv" if signed else "noAuthNoPriv") if version >= 3 else ""
+        encrypted = bool(signed and priv_proto and priv_password)
+        level = (("authPriv" if encrypted else "authNoPriv" if signed
+                  else "noAuthNoPriv") if version >= 3 else "")
         snmp["security_level"] = level or None
         for key in ("engine", "auth", "report", "error_status",
                     "error_status_name", "refused_oid", "hint"):
@@ -4983,7 +5101,8 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
                     session, pdu_tag, request_oids, identity=identity,
                     auth_proto=auth_proto, password=password, engine=engine[0],
                     max_repetitions=max_repetitions or 10, ip=row["ip"],
-                    learned=learned)
+                    learned=learned, priv_proto=priv_proto,
+                    priv_password=priv_password)
 
             started = time.time()
             try:
@@ -4997,8 +5116,12 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
                 # nothing about the password either way, and says so
                 # rather than claiming an authentication that never ran.
                 snmp["auth"] = (
-                    {"ok": True, "detail": "the device verified the signature "
-                                           "(authNoPriv) and answered"}
+                    {"ok": True, "detail": (
+                        "the device verified the signature, decrypted the "
+                        "request and answered encrypted; the reply's own "
+                        "signature verified here (authPriv)" if encrypted else
+                        "the device verified the signature and answered; "
+                        "the reply's own signature verified here (authNoPriv)")}
                     if signed else
                     {"ok": None, "detail": "the request was not signed "
                                            "(noAuthNoPriv), so there was nothing "
@@ -5046,6 +5169,15 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
                                           "counter this poller knows")}
             if name in ("wrongDigests", "unknownUserNames"):
                 snmp["auth"] = {"ok": False, "detail": explanation}
+            elif name == "decryptionErrors":
+                # The signature verified — USM checks it before it
+                # decrypts — so auth is proven and it is the PRIVACY
+                # password that is wrong. Said in its own words, or a wrong
+                # privacy password reads exactly like a wrong auth one.
+                snmp["auth"] = {"ok": True, "detail": (
+                    "the signature verified, so the authentication password "
+                    "is right; the device could not decrypt the request, so "
+                    "the privacy password or protocol is wrong")}
             elif name == "notInTimeWindows":
                 snmp["auth"] = {"ok": None, "detail": (
                     "the device rejected the engine time twice, so the "
@@ -5065,6 +5197,7 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
             snmp["error"] = str(exc)
         finally:
             password = None
+            priv_password = None
             if session is not None:
                 # Every datagram this test sent and threw away: from the
                 # wrong peer, undecodable, or answering a request id we
@@ -5342,6 +5475,7 @@ def post_nodes_group(service, params, body) -> dict:
         raise ValueError("A name is required")
     fields = {k: v for k, v in body.items()
              if k in _GROUP_EDITABLE_BODY and k != "name"}
+    _clean_priv_proto(fields)
     group_id = service.nodes_db.add_group(name, **fields)
     service.log.add(NODES_CATEGORY, f"Added polling profile {name}")
     _audit(service, params, "profile.create", target=f"profile:{name}")
@@ -5355,6 +5489,7 @@ def put_nodes_group(service, params, body, group_id) -> dict:
     # _GROUP_EDITABLE_BODY.
     before = _require(service.nodes_db.group(group_id), "polling profile")
     fields = _pick(body, _GROUP_EDITABLE_BODY)
+    _clean_priv_proto(fields)
     service.nodes_db.update_group(group_id, **fields)
     detail = _audit_diff(before, fields)
     if detail:
@@ -5413,12 +5548,13 @@ def delete_nodes_group_credential(service, params, body, group_id) -> dict:
 # in order, for a device that does not answer the primary.
 
 _GROUP_CREDENTIAL_EDITABLE = ("label", "snmp_version", "community", "v3_user",
-                              "v3_auth_proto")
+                              "v3_auth_proto", "v3_priv_proto")
 
 
 def post_nodes_group_credentials(service, params, body, group_id) -> dict:
     row = _require(service.nodes_db.group(group_id), "polling profile")
     fields = _pick(body, _GROUP_CREDENTIAL_EDITABLE)
+    _clean_priv_proto(fields)
     credential_id = service.nodes_db.add_group_credential(group_id, **fields)
     service.log.add(NODES_CATEGORY,
                     f"Added an additional SNMP credential to profile {row['name']}")
@@ -5430,6 +5566,7 @@ def put_nodes_group_credential(service, params, body, group_id, credential_id) -
     cred = _require(cred if cred and cred["group_id"] == int(group_id) else None,
                     "credential")
     fields = _pick(body, _GROUP_CREDENTIAL_EDITABLE)
+    _clean_priv_proto(fields)
     service.nodes_db.update_group_credential(credential_id, **fields)
     return {"ok": True}
 
@@ -7131,8 +7268,11 @@ def _store_controller_credential(service, controller_id, user, auth_proto, encry
 
 def post_wireless_controller_credential(service, params, body, controller_id) -> dict:
     row = _require(service.wireless_db.controller(controller_id), "controller")
+    # allow_priv=False: the wireless poller speaks authNoPriv at most (see
+    # fortipoll's docstring), so a privacy password typed for a controller
+    # is refused in words rather than stored and silently never sent.
     return _store_v3_credential(
-        service, params, body,
+        service, params, body, allow_priv=False,
         store=functools.partial(_store_controller_credential, service, controller_id),
         category=WIRELESS_CATEGORY,
         message=f"Stored an SNMPv3 credential for {row['name']}",

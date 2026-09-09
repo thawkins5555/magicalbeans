@@ -3238,6 +3238,27 @@
      profile the form currently shows plus the Nodes settings underneath it.
      Community is a secret and may be absent from effective_config for an
      account that cannot read secrets; it then shows "(profile)" alone. */
+  /* The SNMPv3 protocol lists, once. The auth list was pasted into three
+     forms; the privacy list would have made it six, and a protocol added to
+     five of them is a support call. Privacy is AES (AES-128-CFB, RFC 3826)
+     only: DES is not offered and AES-192/256 need a key extension no RFC
+     defines — see netpath/snmpcrypt.py. */
+  const V3_AUTH_PROTOCOLS = ['MD5', 'SHA', 'SHA224', 'SHA256', 'SHA384', 'SHA512'];
+  const V3_PRIV_PROTOCOLS = ['AES'];
+  const v3AuthOptions = (selected) => V3_AUTH_PROTOCOLS.map((p) =>
+    `<option value="${p}" ${selected === p ? 'selected' : ''}>${p}</option>`).join('');
+  /* The first option is "none": the level is derived from which pairs are
+     stored, so blank here is authNoPriv and AES with a stored password is
+     authPriv. `noneLabel` is the device form's "(profile)" inherit text. */
+  const v3PrivOptions = (selected, noneLabel) =>
+    `<option value="">${noneLabel || '(none — authNoPriv)'}</option>` +
+    V3_PRIV_PROTOCOLS.map((p) =>
+      `<option value="${p}" ${selected === p ? 'selected' : ''}>${p}</option>`).join('');
+  /* A credential's derived level for a list or summary: what the API
+     computed from the stored pairs, so the operator can see which level a
+     request goes out at without opening the form. */
+  const levelText = (c) => (c && c.security_level ? ` · ${c.security_level}` : '');
+
   function inheritedValues(d, groupId) {
     if (d && d.effective_config) return d.effective_config;
     const groups = view.groups || [];
@@ -3249,6 +3270,7 @@
     return {
       snmp_version: profile.snmp_version, community: profile.community,
       v3_user: profile.v3_user, v3_auth_proto: profile.v3_auth_proto,
+      v3_priv_proto: profile.v3_priv_proto,
       poll_interval_s: profile.poll_interval_s, snmp_timeout_s: profile.snmp_timeout_s,
       ping_enabled: profile.ping_enabled, snmp_enabled: profile.snmp_enabled,
       ping_count: pick('ping_count'), ping_timeout_ms: pick('ping_timeout_ms'),
@@ -3288,6 +3310,7 @@
     set('#nd-f-community', eff.community ? inheritText(eff.community) : 'inherit (stored value not shown)');
     set('#nd-f-v3user', inheritText(eff.v3_user));
     opt('#nd-f-authproto', inheritOption(eff.v3_auth_proto));
+    opt('#nd-f-privproto', inheritOption(eff.v3_priv_proto));
     set('#nd-f-interval', inheritText(eff.poll_interval_s, (v) => `${v} s`));
     set('#nd-f-timeout', inheritText(eff.snmp_timeout_s, (v) => `${v} s`));
     opt('#nd-f-ping', inheritOption(eff.ping_enabled, onOff));
@@ -3369,13 +3392,24 @@
         <label>v3 username <input id="nd-f-v3user" value="${escape(d.v3_user || '')}"></label>
         <label>v3 auth protocol <select id="nd-f-authproto">
           <option value="">(profile)</option>
-          ${['MD5','SHA','SHA224','SHA256','SHA384','SHA512'].map((p) =>
-            `<option value="${p}" ${d.v3_auth_proto === p ? 'selected' : ''}>${p}</option>`).join('')}
+          ${v3AuthOptions(d.v3_auth_proto)}
         </select></label>
         ${App.canStoreSecrets()
           ? `<label>v3 auth password <input id="nd-f-authpass" type="password"
               placeholder="${d.has_credential ? 'stored — leave blank to keep' : '(profile)'}"></label>`
           : App.credentialUnavailableHtml('An SNMPv3 auth password')}
+        <label>v3 privacy protocol <select id="nd-f-privproto">
+          ${v3PrivOptions(d.v3_priv_proto, '(profile)')}
+        </select></label>
+        ${App.canStoreSecrets()
+          ? `<label>v3 privacy password <input id="nd-f-privpass" type="password"
+              placeholder="${d.has_priv_credential ? 'stored — leave blank to keep' : '(profile)'}"></label>`
+          : App.credentialUnavailableHtml('An SNMPv3 privacy password')}
+        <p class="hint">The level is derived: an auth password makes the request
+          authNoPriv; a privacy protocol and password on top of it make it
+          authPriv, which is how PAN-OS and most firewalls provision their
+          SNMPv3 user. A privacy password is re-entered together with the
+          auth password.</p>
         <label>Poll interval <input id="nd-f-interval" type="number" min="10" value="${d.poll_interval_s || ''}"> s</label>
         <label>SNMP timeout <input id="nd-f-timeout" type="number" step="0.5" min="0.5" value="${d.snmp_timeout_s || ''}"> s</label>
         <label>Ping <select id="nd-f-ping">${triOptions(d.ping_enabled)}</select></label>${helpLinkNamed('nodes.profile.ping', 'Ping')}
@@ -3543,6 +3577,7 @@
     overrides.snmp_version = val('#nd-f-version') === '' ? null : Number(val('#nd-f-version'));
     overrides.v3_user = val('#nd-f-v3user') || null;
     overrides.v3_auth_proto = val('#nd-f-authproto') || null;
+    overrides.v3_priv_proto = val('#nd-f-privproto') || null;
     overrides.poll_interval_s = val('#nd-f-interval') ? Number(val('#nd-f-interval')) : null;
     overrides.snmp_timeout_s = val('#nd-f-timeout') ? Number(val('#nd-f-timeout')) : null;
     // The one exception, on purpose: the community is a secret the form is
@@ -4135,7 +4170,7 @@
         const group_id = Number(box.querySelector('#nd-f-group').value) || null;
         const device_group_id = Number(box.querySelector('#nd-f-devgroup').value) || null;
         const overrides = deviceOverrides(box);
-        const authPass = (box.querySelector('#nd-f-authpass') || {}).value || '';
+        const credential = credentialBody(box, '#nd-f-authpass', '#nd-f-privpass', overrides);
         const name = box.querySelector('#nd-f-name').value.trim();
         const display_name_source = box.querySelector('#nd-f-namesource').value;
         return App.runJob(button, { queued: 'Adding…', done: `Added ${name || ip}` },
@@ -4155,10 +4190,9 @@
             }
             throw error;
           }
-          if (authPass && overrides.v3_user && overrides.v3_auth_proto) {
-            await App.post(`/api/nodes/devices/${result.id}/credential`,
-              { v3_user: overrides.v3_user, v3_auth_proto: overrides.v3_auth_proto,
-                v3_auth_pass: authPass }).catch(() => {});
+          if (credential) {
+            await App.post(`/api/nodes/devices/${result.id}/credential`, credential)
+              .catch(() => {});
           }
           // Poll it now rather than waiting for the next scheduled tick, and
           // only after any v3 credential override above has been saved so
@@ -4208,15 +4242,13 @@
         const group_id = Number(box.querySelector('#nd-f-group').value) || null;
         const device_group_id = Number(box.querySelector('#nd-f-devgroup').value) || null;
         const overrides = deviceOverrides(box);
-        const authPass = (box.querySelector('#nd-f-authpass') || {}).value || '';
+        const credential = credentialBody(box, '#nd-f-authpass', '#nd-f-privpass', overrides);
         const name = box.querySelector('#nd-f-name').value.trim();
         const display_name_source = box.querySelector('#nd-f-namesource').value;
         await App.put(`/api/nodes/devices/${d.id}`,
           { name, group_id, device_group_id, display_name_source, ...overrides });
-        if (authPass && overrides.v3_user && overrides.v3_auth_proto) {
-          await App.post(`/api/nodes/devices/${d.id}/credential`,
-            { v3_user: overrides.v3_user, v3_auth_proto: overrides.v3_auth_proto,
-              v3_auth_pass: authPass });
+        if (credential) {
+          await App.post(`/api/nodes/devices/${d.id}/credential`, credential);
         }
         App.closeModal();
         loadDetail();
@@ -4309,13 +4341,37 @@
     wireDeviceGroupRows(box);
   }
 
+  /* The body of a credential POST from a form's typed passwords, or null
+     when nothing was typed. The auth password is the key to the whole
+     record — the API stores the pair as one — so a privacy password typed
+     alone is refused here, in the form, rather than posted and refused by
+     the server with a less specific message. `null` when there is nothing
+     to store, so callers keep their `if (body)` shape. */
+  function credentialBody(box, authId, privId, fields) {
+    const authPass = (box.querySelector(authId) || {}).value || '';
+    const privPass = (box.querySelector(privId) || {}).value || '';
+    if (!authPass && !privPass) return null;
+    if (!fields.v3_user || !fields.v3_auth_proto) return null;
+    if (privPass && !authPass) {
+      throw new Error('Type the auth password as well as the privacy password — ' +
+        'an SNMPv3 credential is stored as one pair.');
+    }
+    const body = { v3_user: fields.v3_user, v3_auth_proto: fields.v3_auth_proto,
+      v3_auth_pass: authPass };
+    if (fields.v3_priv_proto) body.v3_priv_proto = fields.v3_priv_proto;
+    if (privPass) body.v3_priv_pass = privPass;
+    return body;
+  }
+
   async function testDevice(box, deviceId) {
     const result = box.querySelector('#nd-f-test-result');
     result.textContent = 'Testing…';
     const overrides = deviceOverrides(box);
     const authPass = (box.querySelector('#nd-f-authpass') || {}).value || '';
+    const privPass = (box.querySelector('#nd-f-privpass') || {}).value || '';
     const body = { ...overrides };
     if (authPass) body.v3_auth_pass = authPass;
+    if (privPass) body.v3_priv_pass = privPass;
     try {
       const id = deviceId || 0;
       const r = id ? await App.post(`/api/nodes/devices/${id}/test`, body)
@@ -4479,7 +4535,9 @@
       <tr>
         <td>${escape(c.label || '—')}</td>
         <td>${escape(credentialSummary(c))}</td>
-        <td>${c.snmp_version === 3 ? (c.has_credential ? 'password stored' : 'no password yet') : ''}</td>
+        <td>${c.snmp_version === 3
+          ? escape((c.has_credential ? 'password stored' : 'no password yet') + levelText(c))
+          : ''}</td>
         <td><button type="button" class="cred-remove" data-cred-id="${c.id}">Remove</button></td>
       </tr>`).join('');
     return `<table><caption class="sr-only">Stored credentials</caption><thead><tr><th scope="col">Label</th><th scope="col">Credential</th><th scope="col"></th><th scope="col"></th></tr></thead>
@@ -4497,12 +4555,17 @@
       <label>Community (v1/v2c) <input id="nd-pc-community"></label>
       <label>v3 username <input id="nd-pc-v3user"></label>
       <label>v3 auth protocol <select id="nd-pc-authproto">
-        ${['MD5', 'SHA', 'SHA224', 'SHA256', 'SHA384', 'SHA512'].map((x) =>
-          `<option value="${x}">${x}</option>`).join('')}
+        ${v3AuthOptions()}
       </select></label>
       ${App.canStoreSecrets()
         ? '<label>v3 auth password <input id="nd-pc-authpass" type="password"></label>'
         : App.credentialUnavailableHtml('An SNMPv3 auth password')}
+      <label>v3 privacy protocol <select id="nd-pc-privproto">
+        ${v3PrivOptions()}
+      </select></label>
+      ${App.canStoreSecrets()
+        ? '<label>v3 privacy password <input id="nd-pc-privpass" type="password"></label>'
+        : App.credentialUnavailableHtml('An SNMPv3 privacy password')}
       <button type="button" id="nd-pc-add">Add credential</button>
       <p class="hint" id="nd-pc-status"></p>`;
   }
@@ -4556,29 +4619,31 @@
         community: box.querySelector('#nd-pc-community').value.trim(),
         v3_user: box.querySelector('#nd-pc-v3user').value.trim(),
         v3_auth_proto: box.querySelector('#nd-pc-authproto').value,
+        v3_priv_proto: box.querySelector('#nd-pc-privproto').value || null,
       };
-      const authPass = (box.querySelector('#nd-pc-authpass') || {}).value || '';
       status.innerHTML = '';
       addBtn.disabled = true;
       try {
+        const credential = credentialBody(box, '#nd-pc-authpass', '#nd-pc-privpass', fields);
         // The credential row and its optional v3 password are two
         // separate requests — a DPAPI failure on the second (this
         // machine can't encrypt a stored secret) must not make it look
         // like "Add credential" silently did nothing: the row itself is
         // still created and shown, just without a password stored yet.
         const result = await App.post(`/api/nodes/groups/${groupId}/credentials`, fields);
-        if (authPass && fields.v3_user && fields.v3_auth_proto) {
+        if (credential) {
           try {
             await App.post(`/api/nodes/groups/${groupId}/credentials/${result.id}/secret`,
-              { v3_user: fields.v3_user, v3_auth_proto: fields.v3_auth_proto, v3_auth_pass: authPass });
+              credential);
           } catch (error) {
             status.innerHTML = `<span class="err">Credential added, but its password ` +
               `wasn't stored: ${escape(error.message)}</span>`;
           }
         }
         await refreshCredentialsList(box, groupId);
-        // 'nd-pc-authpass' is absent on a host that cannot store secrets.
-        for (const id of ['nd-pc-label', 'nd-pc-community', 'nd-pc-v3user', 'nd-pc-authpass']) {
+        // The password fields are absent on a host that cannot store secrets.
+        for (const id of ['nd-pc-label', 'nd-pc-community', 'nd-pc-v3user',
+          'nd-pc-authpass', 'nd-pc-privpass']) {
           const field = box.querySelector(`#${id}`);
           if (field) field.value = '';
         }
@@ -4603,13 +4668,23 @@
       <label>Community (v1/v2c) <input id="nd-p-community" value="${escape(p.community || 'public')}"></label>
       <label>v3 username <input id="nd-p-v3user" value="${escape(p.v3_user || '')}"></label>
       <label>v3 auth protocol <select id="nd-p-authproto">
-        ${['MD5','SHA','SHA224','SHA256','SHA384','SHA512'].map((x) =>
-          `<option value="${x}" ${p.v3_auth_proto === x ? 'selected' : ''}>${x}</option>`).join('')}
+        ${v3AuthOptions(p.v3_auth_proto)}
       </select></label>
       ${App.canStoreSecrets()
         ? `<label>v3 auth password <input id="nd-p-authpass" type="password"
             placeholder="${p.has_credential ? 'stored — leave blank to keep' : ''}"></label>`
         : App.credentialUnavailableHtml('An SNMPv3 auth password')}
+      <label>v3 privacy protocol <select id="nd-p-privproto">
+        ${v3PrivOptions(p.v3_priv_proto)}
+      </select></label>
+      ${App.canStoreSecrets()
+        ? `<label>v3 privacy password <input id="nd-p-privpass" type="password"
+            placeholder="${p.has_priv_credential ? 'stored — leave blank to keep' : ''}"></label>`
+        : App.credentialUnavailableHtml('An SNMPv3 privacy password')}
+      <p class="hint">${p.security_level ? `This profile's v3 requests go out at <b>${escape(p.security_level)}</b>. ` : ''}An
+        auth password alone is authNoPriv; add a privacy protocol and password for
+        authPriv (what PAN-OS and most firewalls provision). Setting the privacy
+        protocol to none drops the stored privacy password.</p>
       <label>Poll interval <input id="nd-p-interval" type="number" min="10" value="${p.poll_interval_s || 120}"> s</label>
       <label>SNMP timeout <input id="nd-p-timeout" type="number" step="0.5" min="0.5" value="${p.snmp_timeout_s || 3}"> s</label>
       <label>SNMP retries <input id="nd-p-retries" type="number" min="0" value="${p.snmp_retries != null ? p.snmp_retries : 2}"></label>
@@ -4670,6 +4745,7 @@
       community: box.querySelector('#nd-p-community').value.trim(),
       v3_user: box.querySelector('#nd-p-v3user').value.trim(),
       v3_auth_proto: box.querySelector('#nd-p-authproto').value,
+      v3_priv_proto: box.querySelector('#nd-p-privproto').value || null,
       poll_interval_s: Number(box.querySelector('#nd-p-interval').value),
       snmp_timeout_s: Number(box.querySelector('#nd-p-timeout').value),
       snmp_retries: Number(box.querySelector('#nd-p-retries').value),
@@ -4696,11 +4772,10 @@
       { label: 'Add', primary: true, onClick: async (box) => {
         const fields = profileFields(box);
         if (!fields.name) return;
-        const authPass = (box.querySelector('#nd-p-authpass') || {}).value || '';
+        const credential = credentialBody(box, '#nd-p-authpass', '#nd-p-privpass', fields);
         const result = await App.post('/api/nodes/groups', fields);
-        if (authPass && fields.v3_user && fields.v3_auth_proto) {
-          await App.post(`/api/nodes/groups/${result.id}/credential`,
-            { v3_user: fields.v3_user, v3_auth_proto: fields.v3_auth_proto, v3_auth_pass: authPass });
+        if (credential) {
+          await App.post(`/api/nodes/groups/${result.id}/credential`, credential);
         }
         App.closeModal();
         App.refreshNow('nodes');
@@ -4876,11 +4951,10 @@
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (box) => {
         const fields = profileFields(box);
-        const authPass = (box.querySelector('#nd-p-authpass') || {}).value || '';
+        const credential = credentialBody(box, '#nd-p-authpass', '#nd-p-privpass', fields);
         await App.put(`/api/nodes/groups/${g.id}`, fields);
-        if (authPass && fields.v3_user && fields.v3_auth_proto) {
-          await App.post(`/api/nodes/groups/${g.id}/credential`,
-            { v3_user: fields.v3_user, v3_auth_proto: fields.v3_auth_proto, v3_auth_pass: authPass });
+        if (credential) {
+          await App.post(`/api/nodes/groups/${g.id}/credential`, credential);
         }
         App.closeModal();
         App.refreshNow('nodes');
