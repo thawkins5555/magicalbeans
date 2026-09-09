@@ -590,7 +590,7 @@ def apply(app_db, report=None, before_quiesce=None) -> dict:
         return {"ok": True, "up_to_date": True, "commit": sha[:10],
                 "message": message}
 
-    # Outside no try until now, this line is what escaped as "The update
+    # Outside every guard until now, this line is what escaped as "The update
     # stopped unexpectedly": mkdtemp against a per-session %TEMP% that Windows
     # had deleted raised FileNotFoundError straight past apply() into
     # _run_job's catch-all, naming no cause and offering no remedy. Staging
