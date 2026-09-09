@@ -1174,9 +1174,11 @@ having upgraded. Where it is switched on, a device's detail pane gets an
 **ARP** subtab listing its whole cache — present and aged-out rows alike,
 each MAC a link that runs the MAC search above it so the address leads
 straight to the switch port it was learned on — with its own CSV export,
-and the Find box and global search both gain an ARP result: type an IP to
-find the MAC it resolves to, or a MAC to find every IP it currently holds,
-across every router with the walk turned on. Entries age out on the same
+and global search gains an ARP result: type an IP to find the MAC it
+resolves to, or a MAC to find every IP it currently holds, across every
+router with the walk turned on. The Nodes Find box is unchanged — it still
+answers a MAC with the switch ports it is learned on, which is the
+question that box exists for. Entries age out on the same
 retention clock as the MAC table, since it is the identical "nothing has
 walked this device for a while" question rather than a second setting to
 learn.

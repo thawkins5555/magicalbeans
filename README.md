@@ -523,6 +523,15 @@ scopes, leases and reservations. Nothing here can write anything back — no
 scope, reservation or lease can be created, changed or removed from
 SappiWhere.
 
+**A lease's MAC is stored the way the rest of the application spells one**
+— lower case, colon-separated — rather than in the `AA-BB-CC-DD-EE-FF` form
+a Windows DHCP server reports it in, and an existing database is rewritten
+to match the first time 5.7.0 opens it. Searching for a MAC, in the global
+search or in IPAM's own Find box, reduces both what you typed and what is
+stored to bare hex before comparing, so every notation finds the same lease
+— colon, dash, Cisco's dotted form, bare hex, upper or lower case, and the
+first three octets of a vendor's OUI on their own.
+
 **Two ways to authenticate, chosen per server** — full detail, including
 exactly how a stored credential is encrypted and why, is in
 `CREDENTIAL-SECURITY.md`:
