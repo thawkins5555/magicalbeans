@@ -1010,6 +1010,12 @@ class NodesDatabase(SqliteStore):
             # "http on 80" — see _DEVICE_ONLY_COLUMNS.
             "web_scheme": "TEXT",
             "web_port": "INTEGER",
+            # Why this device's stored interface table is shorter than the
+            # device's own, when it is: the poller caps one read at
+            # nodepoll._MAX_INTERFACES. Kept apart from snmp_error because a
+            # designed limit is not a fault — see _poll_interfaces — and
+            # read back beside the interface list it explains.
+            "interfaces_note": "TEXT NOT NULL DEFAULT ''",
         })
         self.ensure_columns("groups", {
             "lldp_interval_s": "INTEGER", "poe_enabled": "INTEGER",
@@ -1928,7 +1934,8 @@ class NodesDatabase(SqliteStore):
     def record_poll(self, device_id: int, *, ping_ok, ping_rtt_ms, snmp_ok,
                     snmp_error, identity: dict | None,
                     uptime_ticks: int | None, status: str,
-                    reachable: bool) -> sqlite3.Row | None:
+                    reachable: bool,
+                    interfaces_note: str | None = None) -> sqlite3.Row | None:
         """Updates the device row's live-state columns. Returns the previous
         row first so the poller can diff old vs. new status without a
         second read.
@@ -1941,7 +1948,12 @@ class NodesDatabase(SqliteStore):
         literal status string: tying it to status=="up" would let the
         grace window's own preserved "up" label reset the failure streak
         back to zero on every poll, and a failing device could never
-        actually reach "down"."""
+        actually reach "down".
+
+        `interfaces_note` is None when this poll never read the interface
+        table at all, which leaves whatever the last read said standing:
+        the stored rows are still the truncated ones, so the sentence
+        explaining them must not vanish with a single missed poll."""
         with self._lock:
             previous = self._conn.execute(
                 "SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
@@ -1974,6 +1986,8 @@ class NodesDatabase(SqliteStore):
                     "vendor_confidence": identity.get("vendor_confidence") or "",
                     "vendor_arc": identity.get("vendor_arc"),
                 })
+            if interfaces_note is not None:
+                fields["interfaces_note"] = interfaces_note
             if uptime_ticks is not None:
                 fields["last_uptime_ticks"] = uptime_ticks
                 fields["last_uptime_ts"] = now

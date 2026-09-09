@@ -240,6 +240,73 @@ check("...while the next device along is untouched",
       and db.mute_row("device", "72") is not None)
 
 
+# --------------------------------------------- clearing re-arms held notices
+
+db = fresh("rearm")
+rule = db.rule_by_key("device_down")
+
+
+def held(dedup, entity_kind, entity_id, *, age_s=0.0):
+    """An alert whose held first notice was closed out by maintenance."""
+    row, _ = db.open_or_increment(rule["id"], dedup, entity_kind, str(entity_id),
+                                  "core1", 2, "is down", "", time.time() - age_s)
+    db.mark_notified(row["id"], maintenance_held=True)
+    return row["id"]
+
+
+device_alert = held("d:80", "device", 80)
+port_alert = held("i:80:3", "interface", "80:3")
+other_alert = held("d:81", "device", 81)
+sent_alert, _ = db.open_or_increment(rule["id"], "d:80:sent", "device", "80",
+                                     "core1", 2, "is down", "", time.time())
+db.mark_notified(sent_alert["id"])             # a genuine notification
+sent_stamp = db.alert(sent_alert["id"])["last_notified_ts"]
+
+db.set_maintenance(80, by="op")
+check("clear_maintenance re-arms the device's own held notice",
+      db.clear_maintenance(80, by="op") is True
+      and db.alert(device_alert)["last_notified_ts"] is None)
+check("...and the held notice of an alert on one of its PORTS, which is what"
+      " put the port's device into maintenance in the first place",
+      db.alert(port_alert)["last_notified_ts"] is None)
+check("...and not an alert that was genuinely notified before maintenance",
+      db.alert(sent_alert["id"])["last_notified_ts"] == sent_stamp)
+check("...and not another device's",
+      db.alert(other_alert)["last_notified_ts"] is not None)
+
+old = held("d:82", "device", 82, age_s=4.0 * 3600)
+db.set_maintenance(82, by="op")
+db.clear_maintenance(82, by="op")
+check("**a notice held through a four-hour maintenance is due the moment it"
+      " ends, not written off as backlog — the flag says the notice is"
+      " genuinely owed, which is what the grace floor cannot tell**",
+      any(r["id"] == old for r in db.alerts_due_first_notify(time.time() - 240)),
+      [r["id"] for r in db.alerts_due_first_notify(time.time() - 240)])
+
+db.mark_notified(old)
+check("...and the sweep's own stamp disarms the flag, so a later maintenance"
+      " toggle cannot replay a notice that has gone out",
+      db.clear_maintenance(82, by="op") is False
+      and db.alert(old)["last_notified_ts"] is not None)
+db.set_maintenance(82, by="op")
+db.clear_maintenance(82, by="op")
+check("...even across a whole second maintenance period",
+      db.alert(old)["last_notified_ts"] is not None)
+
+acked = held("d:83", "device", 83)
+gone = held("d:84", "device", 84)
+db.acknowledge(acked, "op")
+db.resolve(gone, by="op")
+db.set_maintenance(83, by="op")
+db.set_maintenance(84, by="op")
+db.clear_maintenance(83, by="op")
+db.clear_maintenance(84, by="op")
+check("an ACKNOWLEDGED alert is not re-armed — somebody already has it",
+      db.alert(acked)["last_notified_ts"] is not None)
+check("...nor a resolved one",
+      db.alert(gone)["last_notified_ts"] is not None)
+
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 sys.exit(1 if FAILS else 0)

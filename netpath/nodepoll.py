@@ -1904,13 +1904,17 @@ class NodePoller(Worker):
         # Whether the interface read finished. A partial read must not
         # delete the interfaces it never reached (see replace_interfaces).
         interfaces_complete = True
+        # None until an interface read actually happens, so a poll that
+        # never got that far leaves the stored note alone rather than
+        # blanking a truncation the stored rows still show.
+        interfaces_note = None
         metrics: list[tuple] = []   # (key, label, unit, kind, value)
 
         if config.get("snmp_enabled"):
             try:
                 cred_config, identity, uptime_ticks, metrics = \
                     self._poll_snmp_scalars_with_credential(device, config)
-                interfaces, interfaces_complete, interfaces_reason = \
+                interfaces, interfaces_complete, interfaces_reason, interfaces_note = \
                     self._poll_interfaces(device, cred_config)
                 # SNMP itself worked — the scalars answered — so snmp_ok
                 # stays true and the interface read is what degraded. The
@@ -1989,12 +1993,27 @@ class NodePoller(Worker):
         previous = self.db.record_poll(
             device_id, ping_ok=ping_ok, ping_rtt_ms=ping_rtt_ms, snmp_ok=snmp_ok,
             snmp_error=snmp_error, identity=identity, uptime_ticks=uptime_ticks,
-            status=status, reachable=reachable)
+            status=status, reachable=reachable, interfaces_note=interfaces_note)
         if previous is None:
             return
 
         if self.counters is not None and snmp_ok:
             self._bump("ok")
+
+        # Once, when it starts and when it stops — not every poll. A device
+        # over the interface cap stays over it, and a line repeated every
+        # poll interval is noise the next real one hides behind. The note
+        # itself lives on the device row for as long as it is true.
+        if interfaces_note is not None:
+            was = previous["interfaces_note"] if "interfaces_note" in previous.keys() else ""
+            if bool(interfaces_note) != bool(was):
+                self.log.add(
+                    NODES,
+                    (f"Interface table on {device['ip']}: {interfaces_note}."
+                     if interfaces_note else
+                     f"Interface table on {device['ip']} is no longer "
+                     f"truncated: every interface it reports is read."),
+                    target=device["ip"])
 
         # ---------------------------------------------------------- debug
         # A per-poll trace, the same shape monitor.py logs a trace with
@@ -2008,6 +2027,8 @@ class NodePoller(Worker):
         if snmp_ok:
             detail_lines.append(f"interfaces {len(interfaces)}"
                                 + ("" if interfaces_complete else " (incomplete)"))
+            if interfaces_note:
+                detail_lines.append(f"truncated  {interfaces_note}")
             detail_lines.append(f"metrics    {len(metrics)}")
             if snmp_error:
                 detail_lines.append(f"degraded   {snmp_error}")
@@ -3329,7 +3350,10 @@ class NodePoller(Worker):
         return values, True
 
     def _poll_interfaces(self, device, config: dict) -> tuple:
-        """(rows, complete, reason) for a device's interfaces.
+        """(rows, complete, reason, note) for a device's interfaces.
+
+        `reason` is a fault the caller stores as snmp_error; `note` is the
+        designed per-poll cap, which is not one — see _MAX_INTERFACES below.
 
         Walks the ifIndex column to discover interfaces, then reads the
         columns for each index.
@@ -3362,15 +3386,27 @@ class NodePoller(Worker):
         indexes, complete, reason = self._walk_indexes(
             device, config, nodeoids.IF_TABLE["if_index"], raise_on_timeout=True)
         if not indexes:
-            return [], complete, reason
+            return [], complete, reason, ""
         configured_version = config.get("snmp_version")
         is_v1 = configured_version is not None and int(configured_version) == 0
         want_ifx = True
         wanted = indexes[:self._MAX_INTERFACES]
+        note = ""
         if len(indexes) > self._MAX_INTERFACES:
             complete = False
-            reason = (f"the device reported {len(indexes)} interfaces, more "
-                      f"than the {self._MAX_INTERFACES} one poll reads")
+            # A NOTE, deliberately not the `reason` the caller stores as
+            # snmp_error: this cap is a designed limit, the same on every
+            # poll, and a core switch or a firewall with per-VLAN
+            # subinterfaces sits over it permanently. Reported as an SNMP
+            # error it painted a red line in the device pane and wrote a
+            # NODES log line every poll interval for ever, which is how a
+            # real error that arrives later gets missed. It still has to
+            # reach the operator — a table that stops at 512 with nothing
+            # saying why is the "healthy device, no interfaces" reading
+            # again in miniature — so it travels to the device row and is
+            # rendered under the interface table it describes.
+            note = (f"the device reported {len(indexes)} interfaces; one poll "
+                    f"reads the first {self._MAX_INTERFACES}")
         rows = []
         skipped = 0
         consecutive_timeouts = 0
@@ -3478,7 +3514,7 @@ class NodePoller(Worker):
         if reason:
             self.log.add(NODES, f"Interface read on {device['ip']} is "
                                 f"incomplete: {reason}", target=device["ip"])
-        return rows, complete, reason
+        return rows, complete, reason, note
 
     def _walk_column(self, device, config: dict, base_oid: str,
                      raise_on_timeout: bool = False,

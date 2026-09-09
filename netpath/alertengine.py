@@ -2224,7 +2224,8 @@ class AlertEngine(Worker):
             delay = 0.0
         return max(0.0, min(delay, NOTIFY_ROLLUP_DELAY_MAX_S))
 
-    def _skip_held_open_notify(self, alert_row, settings, reason: str) -> bool:
+    def _skip_held_open_notify(self, alert_row, settings, reason: str, *,
+                               maintenance_held: bool = False) -> bool:
         """Close out an alert's still-pending FIRST notification without
         sending it, when the roll-up hold is what is pending it.
 
@@ -2243,6 +2244,10 @@ class AlertEngine(Worker):
         mark_notified stamps last_notified_ts so alerts_due_first_notify
         never asks about this alert again — see its own docstring on why
         that column, not an in-memory set, is what "due" means.
+        `maintenance_held` is passed straight through to it: the one caller
+        whose decision an operator can undo (by ending the maintenance)
+        needs the row to remember that, so clear_maintenance can hand the
+        notice back.
         """
         if self._notify_rollup_delay(settings) <= 0:
             return False
@@ -2250,7 +2255,7 @@ class AlertEngine(Worker):
                 or alert_row["last_notified_ts"] is not None:
             return False
         self.db.record_notification(alert_row["id"], "alert", "", "", False, reason)
-        self.db.mark_notified(alert_row["id"])
+        self.db.mark_notified(alert_row["id"], maintenance_held=maintenance_held)
         return True
 
     def _occurrence_from_alert_row(self, alert_row, rule_row) -> Occurrence:
@@ -2983,7 +2988,8 @@ class AlertEngine(Worker):
            predicate _apply asks before opening a fresh occurrence
            (_rollup_parent, then _parent_operator_resolved).
         3. In maintenance mode. Decided, with a reason: that suppression has
-           no end date, so there is no moment left to wait for.
+           no end date, so there is no moment left to wait for. Flagged as
+           it is decided, so ending the maintenance re-arms it.
         4. Muted, or inside a maintenance window. Left pending rather than
            decided — both are temporary, and a device released before anyone
            sees this should still get the notice. Mirrors _notify_clear's own
@@ -3047,10 +3053,16 @@ class AlertEngine(Worker):
                 # deadline, so a held notice would sit with last_notified_ts
                 # NULL forever — reading as a bare "None sent." with no
                 # reason, and blocked by _sweep_renotify's own NULL guard
-                # from ever going out at all.
+                # from ever going out at all. Decided is not final, though:
+                # the row is flagged, and clear_maintenance re-arms it, so a
+                # two-minute cable move does not swallow the notice for good
+                # on the default settings (re-notify off — _sweep_renotify
+                # returns before it looks at anything, so this sweep is the
+                # only path that can ever send it).
                 self._skip_held_open_notify(
                     alert_row, settings,
-                    "not sent: the device is in maintenance mode")
+                    "not sent: the device is in maintenance mode",
+                    maintenance_held=True)
                 continue
             if self._muted_alert(alert_row):
                 continue
