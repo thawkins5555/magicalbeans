@@ -70,9 +70,13 @@ Sign out opens it for a mouse. Each group of results is its own independent
 lookup with its own failure handling: one group's endpoint being slow or
 erroring drops that group from the results rather than the ones after it —
 before 4.49.0 a single shared `try` meant one failing lookup silently emptied
-every group queried after it, in whatever order they happened to run. Not yet
-covered: an interface's own description or alias, and text inside a stored
-ConfigRX backup.
+every group queried after it, in whatever order they happened to run. From
+5.7.0 it also covers a switch's ARP cache — an IP typed in finds the MAC it
+resolves to, and vice versa, on whichever router has it — and DHCP leases
+and reservations as their own group, naming the scope, server, address and
+whether the entry is a reservation, rather than only surfacing a lease as
+part of a merged host record. Not yet covered: an interface's own
+description or alias, and text inside a stored ConfigRX backup.
 
 Every sub-panel is resizable. Each page's panels are separated by draggable
 dividers, sizes are remembered per splitter across reloads, double-clicking a
@@ -1154,6 +1158,29 @@ where it was; entries no walk has refreshed for the retention window (a
 week by default, set under **Nodes → Settings**) are then
 dropped.
 
+**A router or L3 switch's ARP cache can be read too, from 5.7.0** — which
+IP it currently resolves to which MAC, on which of its own routed
+interfaces. This is a different fact from the forwarding table above: the
+MAC table says which physical port a card is plugged into, the ARP cache
+says which IP a router is currently answering for on behalf of it, and an
+operator with only an address in hand needs the second to reach the
+first. A polling profile (or a single device) sets **Read the ARP cache
+every N seconds**; 0, the shipped default, means never — unlike MAC
+learning, this one is **off everywhere until asked for**, because a
+distribution router's cache routinely runs to tens of thousands of rows
+where an access switch's forwarding table runs to hundreds, and walking
+every router's cache unasked is not a cost every fleet should pay just for
+having upgraded. Where it is switched on, a device's detail pane gets an
+**ARP** subtab listing its whole cache — present and aged-out rows alike,
+each MAC a link that runs the MAC search above it so the address leads
+straight to the switch port it was learned on — with its own CSV export,
+and the Find box and global search both gain an ARP result: type an IP to
+find the MAC it resolves to, or a MAC to find every IP it currently holds,
+across every router with the walk turned on. Entries age out on the same
+retention clock as the MAC table, since it is the identical "nothing has
+walked this device for a while" question rather than a second setting to
+learn.
+
 **Vendor and Location can be read from an OID you choose.** Vendor is
 normally worked out from sysObjectID (an IANA arc assignment) with a sysDescr
 keyword fallback, and Location is sysLocation. Plenty of gear puts its real
@@ -2167,6 +2194,26 @@ block in each line's own colour so a name in the tooltip can be matched to its
 band in the stack without counting layers. The top-talkers bars are swatched to
 match, so the same application is the same colour in both.
 
+**The newest slot of the chart is drawn and reported at its real rate,
+from 5.7.0.** The last bucket of any window is almost always partial —
+still filling in, or simply the odd-sized remainder at the end of the
+range — and it used to be divided by a whole bucket's width regardless,
+so the most recent data on every chart drew as a cliff down to a fraction
+of its true value and the hover over it agreed with the wrong number. Each
+slot is now rated over the time it actually covers, and the axis draws the
+final slot spanning the real window instead of stopping one interval short
+of the right edge. The legend wraps onto a second row rather than
+dropping an entry that doesn't fit a single line, so a band is never drawn
+with nothing naming it, and a top-talkers bar past the eighth — past
+what the chart has a hue left for — takes the same neutral swatch the
+chart's own *— other —* band uses and says so in its tooltip, rather than
+reusing an early colour and claiming a band that isn't there. A
+drag-selection is honoured down to a few seconds and a few pixels of
+travel, rather than being silently discarded whenever it came out
+narrower than the window's current bucket, which used to make a
+sub-bucket zoom (six hours picked out of a 30-day chart, say) do nothing
+at all.
+
 **The flow record table sorts and resizes.** Click a column heading to order by
 it, click again to reverse. Drag the edge of a heading to widen or narrow the
 column; the widths are remembered per browser, and **Reset layout** clears them
@@ -2292,6 +2339,17 @@ heaviest in every period it appears in; a key that drops below that line in
 some periods is short by what it lost there, and that traffic appears in
 *— other —* rather than going missing. Filtered views are read from the
 records and are exact throughout.
+
+**From 5.7.0, a summary period that dropped a key is repaired from the
+individual records where they are still there to repair it from.** Every
+bucket a summary had to cut down to its heaviest keys is remembered as
+such, and a chart that reads one now goes back to the underlying records
+for exactly that bucket instead of serving the incomplete summary — so a
+series being watched that dips below the cap for a few minutes on a busy
+day no longer shows a hole for those minutes on an otherwise-summarised
+chart. Only a bucket old enough that its individual records have already
+been pruned still shows the gap; the totals were never affected either
+way.
 
 ---
 
@@ -2492,6 +2550,17 @@ in one list with its address, MAC, alive status, subnet and which of those
 sources found it. A result outside every subnet configured here isn't a
 bug: DHCP polling reads a server's scopes on its own, independent of what
 subnets IPAM has been told to sweep, and the source column says so.
+
+**A MAC matches here in any notation, from 5.7.0.** A DHCP lease used to be
+stored exactly as the server reported it — `AA-BB-CC-DD-EE-FF` — while
+every other MAC in this application is compared in the colon-lower-case
+form the subnet sweep uses, so searching a lease's own card by any other
+spelling than that one found nothing, and nothing here looks any different
+from "this address holds no lease." Both a lease's stored address and
+whatever is typed are now reduced to bare hex before comparing, so any
+notation — dashes, colons, dots, bare, upper or lower case — matches
+regardless of which one the DHCP server or the operator happened to use,
+including a vendor OUI prefix on its own.
 
 ### Subnets & Hosts
 
@@ -3028,6 +3097,19 @@ like any other module.
   chassis MAC that a device repeats across several of its own interfaces
   (a stack's base MAC, an SVI beside its port-channel), which produced the
   same doubled line by a different route.
+- **From 5.7.0, a cable walked from both ends by CDP alone is also one
+  line, not two.** The fold above needs a chassis MAC to pair the two
+  rows by; two classic Cisco switches speaking only CDP to each other
+  never offer one, so each end's row stayed unpaired and the cable still
+  drew twice — the VLAN count and both port labels painted over each
+  other exactly as before, on a pair of switches that had done nothing
+  wrong. It now folds those two rows as well, but only where the pairing
+  is forced rather than guessed: when a device pair has exactly one such
+  link reported from each side, meaning one cable with one port named at
+  each end. Two or more reported from either side — a LAG, or a pair of
+  switches cross-connected twice — still draws as separate lines, because
+  nothing says which port faces which and guessing would risk pairing the
+  wrong two.
 - **A link's tooltip names each end's own trunk/access mode, and calls out
   a native-VLAN mismatch by name.** Alongside every VLAN the link
   carries, hovering or clicking shows the mode each device itself reports

@@ -417,10 +417,10 @@ fourth setting).
 | --- | --- | --- |
 | `app.db` | `AppDatabase` (`appdb.py`) | global settings, `users`, `user_permissions` (per-account per-module read/write grants), `hostnames` (the shared reverse-DNS cache), `asn_cache` (ASN/owner per address, long TTL), a `meta` table for one-off markers like the update-installed commit |
 | `netpath.db` | `Database` (`db.py`) | `targets`, `traces`, `hops`, `hop_stats` (cumulative continuous-probe counters per target/hop), NetPath's own settings |
-| `flows.db` | `FlowDatabase` (`flowdb.py`) | `flows`, `flow_rollup` (top-K per dimension per bucket, two tiers), `flow_rollup_span` (each bucket's grand total), `exporters`, `interfaces`, `samplers`, NetFlow's own settings |
+| `flows.db` | `FlowDatabase` (`flowdb.py`) | `flows`, `flow_rollup` (top-K per dimension per bucket, two tiers), `flow_rollup_span` (each bucket's grand total), `flow_rollup_trunc` (5.7.0: which `(tier, dim, bucket)` cells the top-K cap actually cut short, so a read can repair them from `flows` instead of serving the incomplete rollup), `exporters`, `interfaces`, `samplers`, NetFlow's own settings |
 | `syslog.db` | `SyslogDatabase` (`syslogdb.py`) | `logs`, `log_counts` (hourly rollup), the FTS5 index, Syslog's own settings |
 | `ipam.db` | `IpamDatabase` (`ipamdb.py`) | `subnets`, `hosts`, `conflicts`, `scans`, `dhcp_servers`, `dhcp_scopes`, `dhcp_leases`, `dhcp_scope_history` (leased-IP trend), IPAM's own settings |
-| `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `device_groups` (organizational, unrelated to `groups`), `devices`, `interfaces`, `device_events`/`interface_events`, `discovery_jobs`/`discovery_results`, `vlans`/`vlan_ports`/`port_vlans` (per-port VLAN membership, for MAPPER), `mac_entries`, `neighbors`, `device_addresses`, `vendor_learned`, `interface_thresholds` (the alarm/warning levels a port's own transceiver publishes), Nodes' own settings. Also the facade over the two files below |
+| `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `device_groups` (organizational, unrelated to `groups`), `devices`, `interfaces`, `device_events`/`interface_events`, `discovery_jobs`/`discovery_results`, `vlans`/`vlan_ports`/`port_vlans` (per-port VLAN membership, for MAPPER), `mac_entries`, `arp_entries` (5.7.0: a device's own ARP cache — IP-to-MAC per interface, off by default), `neighbors`, `device_addresses`, `vendor_learned`, `interface_thresholds` (the alarm/warning levels a port's own transceiver publishes), Nodes' own settings. Also the facade over the two files below |
 | `nodes_series.db` | `NodesSeriesDatabase` (`nodesseriesdb.py`) | `metrics`, `samples`, `samples_hourly` — the Nodes tables that grow |
 | `nodes_mibs.db` | `NodesMibDatabase` (`nodesmibdb.py`) | `mib_files` (including each file's original text), `mib_objects` |
 | `alerts.db` | `AlertsDatabase` (`alertsdb.py`) | `rules`, `templates`, `alerts`, `notifications`, `meta` (per-source evaluation cursors), `smtp_credential`, `device_thresholds` (per-device threshold-rule overrides), Alerts' own settings |
@@ -2825,6 +2825,117 @@ The lookup runs only on a deliberate search — Enter in the Find box sets
 five-second refresh, because a dialog that reopens itself every five
 seconds is unusable.
 
+### ARP cache walk (`nodeoids.py`, `nodepoll.py`, `nodesdb.py`, `nodes.js`) — 5.7.0
+
+Nothing polled a switch or router's own ARP cache before this release —
+the only ARP-flavoured code in the app was `ipam_scan.py`'s reconciliation
+of the *collector host's own* kernel ARP table after a ping sweep, which
+answers for one broadcast domain and cannot see past it. This is a
+different mechanism entirely: a device's own `ipNetToMediaTable`, walked
+like the MAC and LLDP/CDP tables, off the poll cycle, on its own schedule.
+
+**Two MIB tables, walked as a fallback, never merged**
+(`NodePoller.read_device_arp_table` / `_read_arp_table_detail`).
+`ipNetToMediaTable` (RFC 1213, deprecated by IP-MIB but still what nearly
+every agent in the field actually answers) is walked first via
+`_walk_arp_table`, keying each row off its own index
+(`_arp_index_media`: `ifIndex.a.b.c.d`, so the phys-address column alone
+carries ifIndex, IP and MAC — the net-address column is never walked, the
+same shortcut the FDB walk takes off `dot1dTpFdbTable`'s index). The
+IPv6-capable successor, `ipNetToPhysicalTable`, is walked only when the
+first walk produced no rows at all (`_arp_index_physical`, decoding
+`ifIndex.addrType.addrLen.<addrLen arcs>` — InetAddressType 1/2 for
+IPv4/IPv6, 3/4 for the zoned forms, whose zone is dropped since the
+polled interface already says which link it is). The two are never
+merged: a modern agent answers both tables with the same IPv4 mappings,
+and merging would double-count every one of them, so the legacy table
+wins outright whenever it has anything to say and a device that keeps
+IPv6 neighbours only in the successor table loses them while it still
+answers the legacy one.
+
+**The fallback gate is "produced no rows," never "the walk failed."** An
+agent with no `ipNetToMedia` subtree at all answers the first GETNEXT
+with whatever object comes next, which `_walk_column_detail` reads as a
+clean, complete, *empty* walk — exactly the case the fallback exists for.
+A walk that stopped for any other reason (a timeout, an SNMP error, the
+`snmp_walk_max_rows` cap) returns `None` from either table rather than
+falling through to the other one, because handing a partial table to
+storage would mark its un-walked tail `present = 0` and quietly age out
+thousands of live entries every cycle it ran short. ARP caches are
+singled out for this: they are the one table this poller reads that
+routinely meets the row cap on a real core router, where the MAC walker
+never does (it can derive "answered" from the bridge-port map, which has
+no ARP equivalent).
+
+**Storage** (`nodesdb.arp_entries`, `replace_arp_entries`) mirrors
+`mac_entries`' present/seen_ts/first_seen_ts ageing with one deliberate
+difference: the primary key is `(device_id, if_index, ip)`, not the MAC.
+An IP has exactly one current holder on an interface, so a MAC behind an
+address changing (a host replaced, a VRRP failover) updates that row in
+place and keeps its original `first_seen_ts`, rather than a second row
+appearing beside a stale first the way `mac_entries` — keyed with the MAC
+included, because one MAC in two VLANs is two true facts at once — would.
+`prune_arp_entries` runs from the same `run_maintenance` sweep as
+`prune_mac_entries`, on the identical `mac_table_retention_days` clock:
+one more knob for the same "nothing has walked this device" question
+would tell an operator nothing the existing one doesn't.
+
+**Off everywhere by default, unlike the MAC walk** (`arp_table_interval_s`,
+inheritable device/group column exactly like `mac_table_interval_s` and
+`lldp_interval_s`, but `_merge_config`'s NULL fallback is `0`, not an
+hour). The MAC walk defaults on because GETBULK made it cheap enough to
+run unasked; that reasoning does not carry here; a distribution router's
+ARP cache is routinely the single largest table this poller ever reads,
+so an upgrade must add no SNMP load and no database growth anywhere until
+an operator opts a profile or device in. `NodesDatabase.arp_walk_enabled_count()`
+mirrors `mac_walk_enabled_count()`'s one-query shape and its `COALESCE`
+fallback — `0`, correctly, since the shipped default really is `0` here,
+unlike `mac_walk_enabled_count`'s own fallback (see below).
+
+**Logging is once per state change, not once per interval**
+(`NodePoller._run_arp_table`, `_arp_unanswered`): a device that answers
+neither table logs it the first time and stays quiet until it recovers,
+because an operator who opts a whole profile of L2-only switches in would
+otherwise get one "answers no ARP table" line per switch per cycle for as
+long as the setting stayed on. A walk cut short (the row cap, a timeout)
+logs its own reason instead, so the fix — raise `snmp_walk_max_rows`, or
+take the device off the schedule — is in the same line as the symptom.
+
+**The device detail pane's ARP subtab and search** (`nodes.js`,
+`api.get_nodes_device_arp`, `api.get_nodes_arp_search`) read
+`arp_entries` the way the neighbours tab reads `neighbors`: one device's
+whole cache, present and stale rows both, `enabled`/`interval_s`
+resolved server-side through `effective_config()` so an empty pane can
+say "off," "on but nothing collected yet," or "here's the table," which
+the browser cannot tell apart on its own (it holds a device's override
+and its profile's value separately and cannot resolve the inheritance).
+Each row's MAC cell runs the existing MAC search rather than duplicate
+it — the join an ARP cache exists to make: ARP gives the MAC, the
+forwarding table gives the port. `nodesdb.arp_locations(needle)` backs
+the global-search group and the Find box's own ARP lookup, matching
+either column: `looks_like_mac_search` decides a bare hex needle is a MAC
+prefix the way it already does for `mac_locations`, a digits-and-dots
+needle is an IPv4 prefix, and a colon-hex needle (an IPv6 prefix, or a
+Cisco-notation MAC — both normalise to valid hex) is matched against
+*both* columns and the results unioned, rather than guessing one and
+reporting "not found" for the other.
+
+### `mac_walk_enabled_count` undercounted inherited defaults (`nodesdb.py`) — 5.7.0
+
+`mac_walk_enabled_count()` backs the "N devices are learning MAC
+addresses" sentence the Find box shows when a search comes up empty. Its
+query was `COALESCE(d.mac_table_interval_s, g.mac_table_interval_s, 0) >
+0` — a literal `0` for "neither the device nor its profile set a
+value." That was correct when it was written, but 4.47.0 changed
+`_merge_config`'s own fallback for an unset `mac_table_interval_s` from
+`0` to `3600`, so that every device learns MAC addresses hourly by
+default unless something explicitly turned it off — and this count was
+never updated to match. Any device relying on that inherited default (the
+common case on an upgraded fleet, since 4.47.0 deliberately left an
+explicit `0` alone) was invisible to this query, so the sentence
+under-reported on exactly the installs that had never touched the
+setting. The literal now reads `3600`, matching `_merge_config` exactly.
+
 ### Device and interface dialogs (`nodes.js`)
 
 `drawIfaceTable` and `drawEventTable` used to hardcode `#nd-if-table` /
@@ -2956,8 +3067,38 @@ poller in the loop.
   far end through `port_label`; a name-matched row carries only the raw
   `port_id`/`port_descr` the neighbour advertised). The **reciprocal
   name-only** case — two rows, two local ports, no `matched_if_index` on
-  either — is deliberately left as two links, for `link_identity`'s own
-  reason: nothing there says the two ports face each other.
+  either — is left alone here, for `link_identity`'s own reason: nothing
+  in THIS pass says the two ports face each other. From 5.7.0 a second
+  pass, below, folds the unambiguous shape of that case; the genuinely
+  ambiguous remainder still draws as two lines.
+- **`_fold_reciprocal_name_matched(links_by_key)`, from 5.7.0, folds the
+  common shape `_fold_name_matched` cannot reach: two classic Cisco
+  switches joined by one cable and speaking only CDP to each other.**
+  `_walk_cdp` never writes a `chassis_id_subtype`, so neither row can ever
+  resolve a `matched_if_index` through the chassis-MAC join, and
+  `_fold_name_matched` finds no MAC-matched link on either side to fold
+  onto — so both rows survived as separate `("name-match", device, if)`
+  keys, on the same two nodes, drawing the same VLAN count and port
+  labels over each other a second time, half a release after 5.4.0 fixed
+  the LLDP/CDP-on-one-port half of this same doubling. Not a corner case:
+  every classic Cisco pair speaking CDP alone lands here.
+
+  It folds only where the pairing is forced. Surviving name-only links are
+  grouped by the unordered device pair they sit between; where a pair has
+  exactly one such link reported from *each* side, there is one cable with
+  one port at each end and both ends have named it, so nothing is being
+  guessed. Two or more reported from either side is the LAG /
+  cross-connected case `link_identity` already refuses to guess at — "A
+  has two ports facing B" says nothing about which faces which — and a
+  pair heard from only one side has no reciprocal row to fold with at
+  all; both shapes are left exactly as they are. It runs strictly *after*
+  `_fold_name_matched`, so a name-only row that pass already folded onto a
+  MAC-matched link does not still count against the pair here. The
+  survivor is the link whose `(a_device_id, a_if_index)` sorts lower — not
+  row order — and takes from the other row what only it knew: the far-end
+  `if_index` (`None` until now), the far-end's own `port_label()` in place
+  of the raw string CDP sent across the cable, the union of protocols and
+  VLANs, a native VLAN if the survivor had none, and the later `seen_ts`.
 - **`_NEIGHBOR_MATCH_SQL`'s chassis-MAC join resolves at most one
   interface, deterministically.** `interfaces` is unique only on
   `(device_id, if_index)` and one chassis MAC routinely sits on several of
@@ -5369,6 +5510,115 @@ ordering, and the same reason, as the `nodes_db.compact_rollup()` /
 already built those buckets, and `Service._rollup_lock` keeps the sweep's
 backfill and the timer's compaction from rebuilding one at the same time.
 
+### Repairing a truncated rollup bucket from raw (`flowdb.py`) — 5.7.0
+
+A rollup bucket that dips below `ROLLUP_KEYS[tier]` distinct keys keeps
+the grand total exact (`flow_rollup_span` is never capped) but drops the
+short-fall into `— other —`, so a *named* series being watched can have
+genuine holes in it wherever it briefly wasn't among the heaviest — and
+the response gave no way to tell a hole from a series that actually
+carried zero traffic that minute.
+
+**`flow_rollup_trunc(tier, dim, bucket)`** is a bare marker table: a row
+present means the cap bit for that cell, absent means it didn't.
+`_compact_bucket` writes it in the same transaction as the rollup rows it
+describes, keyed off the one signal available without a second scan
+— `INSERT ... LIMIT ?`'s own `rowcount` reaching the limit (a bucket
+holding *exactly* the cap is flagged too: a false positive costing one
+raw read and changing no number, the only way to avoid a second COUNT the
+cap exists to save). An hourly bucket also inherits the flag from any
+minute bucket inside it that was itself flagged, since an hour built from
+capped minutes is short by whatever those minutes lost regardless of its
+own `LIMIT`. `_delete_rollup` (bucket deleted) and rebuilding a bucket
+clean both clear the flag — it describes rows that exist right now, never
+a permanent verdict on the bucket.
+
+**`_repair_ranges(tier, dim, t0, seal)`** turns the flagged buckets in a
+window into `[low, upper)` runs (adjacent buckets merged, so an exporter
+over the cap in every minute of an hour costs one run, not sixty) and
+answers `[]` — "serve the rollup as stored" — past either of two bounds:
+`_REPAIR_MAX_BUCKETS` (200, so the worst case of no two buckets adjacent
+stays under SQLite's compound-select ceiling) and `_REPAIR_MAX_FLOWS`
+(100,000, since the query holds `flows.db`'s single write lock for its
+whole duration against a UDP collector that cannot be told to wait).
+Before returning a run, it checks the raw rows *still cover it*:
+`flow_rollup_span`'s own `flows` count for the run is compared against
+`COUNT(*) FROM flows` over the same range, and only a run where the raw
+table holds at least as many is repaired. This guard exists because
+retention ages raw rows out oldest-by-timestamp while the row cap deletes
+oldest-by-id — order an exporter with a skewed clock does not keep — so a
+naive "is this bucket newer than the oldest raw row" check mistook the
+first bucket of a store's whole history for one retention had pruned.
+
+**`_agg_rows` reads a repaired run from `flows` instead of `flow_rollup`
+for exactly that slice**, splicing an extra `UNION ALL` arm in per run and
+excluding the same `[low, upper)` range from the rollup arm with an
+`AND NOT (bucket >= ? AND bucket < ?)` per run, so each bucket is counted
+by exactly one arm. `flow_rollup_span` is untouched either way — spans
+were never capped, and the residual (`— other —`) is still measured
+against them, whichever arm answered for a given bucket. A store quiet
+enough to stay under `_REPAIR_MAX_FLOWS` gets its holes repaired; a store
+busy enough not to is exactly where it stood before this release — the
+point being that the two bounds fail toward the old (accurate-totals,
+holes-possible) behaviour rather than toward a slow chart.
+
+### The last bucket's rate, and the axis it sits on (`netflow.js`) — 5.7.0
+
+Every stacked-chart value used to be `series.values[i] * 8 / bucket_s` —
+dividing by the *nominal* bucket width regardless of how much of it the
+slot actually covers. `flowdb._agg_rows` sizes a window as
+`int(span / bucket) + 1` slots, so the final slot almost always covers
+less than a full bucket (whatever is left between its own start and the
+window's `t1`) — and dividing that short span by the full width drew the
+newest data at a fraction of its real rate, a cliff at the right edge of
+every chart, confirmed rather than caught by the hover tooltip reading
+the identical wrong number. `slotSeconds(data, slot)` now returns the
+true coverage for the last slot (`windowEnd(data) - data.times[last]`,
+floored at a few seconds to keep the division sane on a live window's
+sliver of a final bucket) and the nominal `bucket_s` for every other slot;
+`drawChart`'s running stack and `slotTip`'s per-series and total rates
+both divide by it, so the chart and its own tooltip cannot read
+differently for the same bucket.
+
+The x-axis had a matching, independent bug: slots were spread evenly
+across the plot width with the last one landing exactly on the right
+edge with zero width of its own, one interval short of where the data it
+held actually sat. `xOf`/`timeAt`/`slotAt` now map the true `[t0, t1)`
+window onto the plot — `t1` is the response's own `windowEnd`, not
+`view.t1`, which a pending fetch may already have moved past — with each
+slot's vertex at the centre of the time it covers (for the partial final
+slot, the centre of what it covers *so far*) and the filled area running
+flat from the first vertex to the left edge and the last to the right, so
+no part of the requested window is ever left undrawn. The crosshair, the
+drag brush and the tooltip all resolve a screen x through the same three
+functions, so the slot named under the cursor is always the slot the
+cursor is actually over.
+
+**The legend wraps instead of dropping an entry, and a Top-N row past the
+palette takes the neutral swatch instead of wrapping the colour index.**
+`seriesColor` used to be `SERIES[index % SERIES.length]`, so a ninth named
+series (or a Top-N row past the eighth, `netflow.js`'s bar list sharing
+the same indices) repainted `--cat-1` and visually claimed a match with a
+band that isn't there; it is now `OTHER` for any index past
+`SERIES.length`, with the row's tooltip and an `aria-describedby` span
+saying "Folded into — other — in the chart above" in words, not only in
+colour. The legend itself lays out before the plot height is chosen —
+`plot.h` used to be fixed and entries past the first row's width were
+silently dropped — so it can grow to a second row when an entry doesn't
+fit the first, and the plot shrinks to make room instead of the legend
+ever losing an entry outright.
+
+**The drag-selection floor moved from "one bucket of the previous
+response" to `DRAG_MIN_S` (3 seconds) and `DRAG_MIN_PX` (4 pixels of
+travel).** The old check (`Math.abs(to - from) > bucket`) compared the
+drag's time span against the *response the chart already had* — on a
+30-day chart that bucket is six hours, so any narrower drag (an operator
+picking six hours out of a month) did nothing at all, silently. The new
+floor is what the server's own bucket ladder (`api._flow_bucket`) can
+actually resolve a narrower window into, plus a pixel minimum so a click
+with a slight wobble on a wide chart — where one pixel already spans
+minutes — is still read as a click and not a drag.
+
 ### Zoom debounce and the stale-response guard (`netflow.js`)
 
 The `overview()` rework above halves nothing on its own if the page fires
@@ -5941,13 +6191,14 @@ and MAC pair doesn't create a second row.
 name sources meet. It queries three independent methods — none of them
 aware of the others — and merges by IP into one `dict[str, dict]`:
 
-- `IpamDatabase.search_hosts()` — `WHERE h.ip LIKE ? OR h.mac LIKE ?`
-  against the discovered-hosts table, joined to the subnet it belongs to.
-  This is the only source for a device the sweep found that has neither a
-  DHCP lease nor a PTR record.
-- `IpamDatabase.search_dhcp()` — `WHERE l.ip LIKE ? OR l.mac LIKE ? OR
-  l.hostname LIKE ? OR l.description LIKE ?` against `dhcp_leases`,
-  joined to the server it came from.
+- `IpamDatabase.search_hosts()` — `WHERE h.ip LIKE ?` plus, from 5.7.0, a
+  MAC clause built by `_mac_clause()` rather than a plain `OR h.mac LIKE
+  ?` — see below — against the discovered-hosts table, joined to the
+  subnet it belongs to. This is the only source for a device the sweep
+  found that has neither a DHCP lease nor a PTR record.
+- `IpamDatabase.search_dhcp()` — `WHERE l.ip LIKE ? OR l.hostname LIKE ?
+  OR l.description LIKE ?` plus the same `_mac_clause()` MAC term against
+  `dhcp_leases`, joined to the server it came from.
 - `AppDatabase.search_hostnames()` — `WHERE hostname LIKE ? OR ip LIKE ?`
   against the shared reverse-DNS cache — the same table `Resolver`
   writes to, so this also picks up the DHCP-fallback names described
@@ -5971,6 +6222,68 @@ expected, not a bug: DHCP polling (`IpamWorker._tick()`) iterates
 regardless of whether that address range was ever separately added as an
 IPAM subnet to sweep. The `sources` field is what makes this
 self-explanatory in the UI instead of a recurring support question.
+
+### A lease's MAC now matches by any spelling (`ipam_dhcp.py`, `ipamdb.py`) — 5.7.0
+
+`DhcpServer`'s own cmdlets report a client id as `AA-BB-CC-DD-EE-FF` —
+dashes, upper case — and `dhcp_leases.mac` stored that verbatim, while
+`hosts.mac` (the subnet sweep's own ARP reconciliation) has always been
+`ipam_scan.mac_colon()`'s form: lower case, colon-separated. A plain
+`mac LIKE '%query%'` compared the two on whatever spelling the operator
+happened to type, so a query that was not itself dash-separated upper
+case matched neither table's MAC column, and zero rows looked exactly
+like "this card holds no lease."
+
+`ipam_dhcp._stored_mac()` runs every incoming lease and reservation
+`ClientId` through `mac_colon()` at ingest, so a fresh poll writes the
+same spelling `hosts.mac` already used; `IpamDatabase._normalise_lease_macs()`
+(called from `_migrate()`, alongside the rest of `_migrate`'s work)
+rewrites whatever an older build already stored, once, so an upgraded
+install is correct from its first open rather than one poll interval
+later. A `ClientId` that is not a MAC at all — a DHCPv6 DUID, a
+hardware-type-prefixed id on a BOOTP reservation — is left exactly as
+reported rather than blanked, since an empty cell would read as "no
+client id" and that is not what happened.
+
+Search still has to accept whatever spelling was typed, which the stored
+column alone does not fix: `ipamdb.mac_search_digits(text)` reduces a
+query to bare lower-case hex (returning `""` for anything that reads as a
+digits-and-dots address, so `10.0.0.5` — hex-valid at `10005` — can never
+be reinterpreted as a MAC prefix), and `_mac_digits_sql(column)` applies
+the identical `REPLACE`/`REPLACE`/`REPLACE`/`LOWER` reduction to the
+stored column in SQL. `IpamDatabase._mac_clause(column, query)` is the
+shared plumbing both `search_hosts()` and `search_dhcp()` call: it
+returns an `OR <reduced column> LIKE '%<reduced query>%'` clause once the
+query reduces to at least `MAC_SEARCH_MIN_DIGITS` (4) hex digits, or
+nothing at all otherwise — the same floor `nodesdb`'s own MAC-prefix
+search uses, and for the same reason (two hex digits is noise). This is a
+substring match, not a prefix one, deliberately: an OUI is a prefix, but
+the four digits printed on a device's own label are its tail, and an
+operator searches by either.
+
+`IpamDatabase.dhcp_leases_for_mac(mac)` is the exact-match counterpart
+behind the new lease group in global search (below): it reduces `mac` the
+same way, rebuilds the canonical colon form directly from the twelve hex
+digits, and does a plain `WHERE l.mac = ?` — served by
+`ix_dhcp_leases_mac` rather than a scan, which the substring search can
+never use since its clause is a `LIKE` over a `REPLACE()` expression. A
+prefix short of a full address is refused (`len(digits) != 12`) since a
+prefix is what `search_dhcp()` is for.
+
+### DHCP leases as their own global-search group (`api.get_ipam_dhcp_lease_search`) — 5.7.0
+
+`/api/ipam/search` (the `Service.ipam_search()` merge above) folds a
+lease into a per-address host record, keeping the hostname and MAC and
+dropping exactly the fields that make a *lease* hit worth reading: which
+scope, which server, when it expires, whether it was reserved. Two DHCP
+servers each holding a lease for the same card — a laptop that moved
+between sites — collapse to one merged host there and stay two separate
+answers here. `GET /api/ipam/dhcp/lease-search` wraps `search_dhcp()`
+directly (the same two-character floor as the merged search) and returns
+lease rows verbatim; `app.js`'s global search calls it as a third,
+independently-failing IPAM lookup alongside the merged-host and subnet
+groups already there, landing on `#/ipam` since DHCP registers no
+per-lease page of its own to route to.
 
 ---
 
@@ -7369,10 +7682,12 @@ accessible name never changes — only how much of the bar three buttons cost
 changes, freeing room for the tab strip on a narrow viewport instead of
 crowding it.
 
-**`gsearchRun()`'s eight lookup groups (MAC, devices, alerts, NetPath
+**`gsearchRun()`'s lookup groups (MAC, devices, alerts, NetPath
 destinations, and — new in 4.49.0 — IPAM hosts, IPAM subnets, syslog
-messages, wireless APs) each get their own `try`/`catch` now, not one shared
-around the whole function.** The old single `try` carried a comment saying
+messages, wireless APs; from 5.7.0 also the ARP cache and DHCP leases as
+their own two groups, ten in all) each get their own `try`/`catch` now,
+not one shared around the whole function.** The old single `try` carried
+a comment saying
 "a failed lookup just leaves that group out", which the code did not
 actually do: an exception thrown by the devices lookup skipped every group
 queried after it in source order, not just that one. A working search that
