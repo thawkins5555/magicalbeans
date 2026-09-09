@@ -5545,8 +5545,13 @@ a permanent verdict on the bucket.
 window into `[low, upper)` runs (adjacent buckets merged, so an exporter
 over the cap in every minute of an hour costs one run, not sixty) and
 answers `[]` — "serve the rollup as stored" — past either of two bounds:
-`_REPAIR_MAX_BUCKETS` (200, so the worst case of no two buckets adjacent
-stays under SQLite's compound-select ceiling) and `_REPAIR_MAX_FLOWS`
+`_REPAIR_MAX_BUCKETS` (120, so the worst case of no two buckets adjacent
+stays under both SQLite's compound-select ceiling and — the binding one,
+and originally miscounted — its limit on bound variables: the statement
+costs ten fixed plus **six per run**, two for the exclusion and four for
+the run's own raw arm, so 120 runs is 730 against the 999 an older SQLite
+allows, and the 200 this bound used to be was about 1,210) and
+`_REPAIR_MAX_FLOWS`
 (100,000, since the query holds `flows.db`'s single write lock for its
 whole duration against a UDP collector that cannot be told to wait).
 Before returning a run, it checks the raw rows *still cover it*:
