@@ -145,16 +145,20 @@ MAX_HEAD_BYTES = 64 * 1024
 # A chunk size is a hex number and perhaps an extension; nothing else.
 MAX_LINE_BYTES = 8 * 1024
 
-_REQUEST_LINE = re.compile(rb"^([A-Za-z]+) (\S+) HTTP/1\.[01]$")
+_REQUEST_LINE = re.compile(rb"^([A-Za-z]+) (\S+) (HTTP/1\.[01])$")
 _STATUS_LINE = re.compile(rb"^HTTP/1\.[01] (\d{3})(?: [^\r\n]*)?$")
 _HEADER_LINE = re.compile(rb"^([!#$%&'*+.^_`|~0-9A-Za-z-]+):[ \t]*([^\r\n]*?)[ \t]*$")
 _DIGITS = re.compile(rb"^[0-9]+$")
-_ABSOLUTE_URL = re.compile(r"^https?://([^/?#]*)([/?#].*)?$", re.IGNORECASE)
+_ABSOLUTE_URL = re.compile(r"^(https?)://([^/?#]*)([/?#].*)?$", re.IGNORECASE)
 _REFRESH_URL = re.compile(r"""(\burl\s*=\s*)(["']?)([^"';\s]*)\2""", re.IGNORECASE)
 # The four ways a device names an address in a header. A body is never
 # rewritten: it is streamed, and a page's own links are the browser's to
 # resolve against the origin these put it on.
 REWRITTEN_HEADERS = (b"location", b"content-location", b"refresh", b"set-cookie")
+# The two ways a browser names the authority it reached. They have to move
+# with `Host:`, since a device that checks one against the other refuses a
+# POST whose origin is not its own.
+REQUEST_HEADERS = (b"origin", b"referer")
 
 
 def _host_name(authority: str) -> str:
@@ -166,14 +170,31 @@ def _host_name(authority: str) -> str:
     return host.split(":", 1)[0].lower()
 
 
+def _is_ours(match, names, origin: str) -> bool:
+    """Whether an absolute URL names one of `names` on the scheme this tunnel
+    carries. A device on plain HTTP answering `https://<itself>/` is saying
+    its UI is somewhere this tunnel does not go, and moving that onto the
+    relay's own `http` origin would only send the browser round again."""
+    return (match is not None and _host_name(match.group(2)) in names
+            and match.group(1).lower() == origin.split(":", 1)[0])
+
+
 def map_url(value: str, names, origin: str) -> str:
-    """An absolute URL naming the device or this server, moved onto the
-    relay's own origin. A relative URL, or one naming anywhere else, comes
-    back exactly as the device wrote it."""
+    """An absolute URL naming the device or this server, on this tunnel's own
+    scheme, moved onto the relay's origin. A relative URL, one naming
+    anywhere else, and one on the other scheme all come back exactly as they
+    were written."""
     match = _ABSOLUTE_URL.match(value.strip())
-    if match is None or _host_name(match.group(1)) not in names:
+    if not _is_ours(match, names, origin):
         return value
-    return origin + (match.group(2) or "/")
+    return origin + (match.group(3) or "/")
+
+
+def map_origin(value: str, names, origin: str) -> str:
+    """The same, for a header that is an origin and not a URL: no path is
+    added, since an origin carrying one matches nothing."""
+    match = _ABSOLUTE_URL.match(value.strip())
+    return origin if _is_ours(match, names, origin) else value
 
 
 def map_refresh(value: str, names, origin: str) -> str:
@@ -227,7 +248,9 @@ def _body_plan(fields, *, is_response: bool, code: int = 0, method: str = ""):
     if is_response and (code < 200 or code in (204, 304) or method == "HEAD"):
         return ("none", 0)
     if encodings:
-        if len(encodings) > 1 or encodings[0].rsplit(
+        # Both headers is two framings that can disagree, and which one the
+        # device honours is its own business — so read neither.
+        if lengths or len(encodings) > 1 or encodings[0].rsplit(
                 b",", 1)[-1].strip().lower() != b"chunked":
             return None
         return ("chunked", 0)
@@ -250,10 +273,13 @@ def _rebuild(start: bytes, lines, replaced: dict) -> bytes:
     return b"\r\n".join(out) + b"\r\n\r\n"
 
 
-def frame_request(head: bytes, authority: bytes):
-    """(head, body kind, body length, method) for one request, its `Host:`
-    pointed at the device itself so the device builds its URLs against its
-    own address. None sends the connection to the byte pump."""
+def frame_request(head: bytes, authority: bytes, names, origin: str):
+    """(head, body kind, body length, method) for one request, with every
+    place its head names the relay — `Host:`, `Origin:`, `Referer:`, and a
+    request target written out in full — pointed at the device instead, so
+    the device builds its URLs against its own address and the three it may
+    compare still agree there, as they did when nothing was read at all.
+    None sends the connection to the byte pump."""
     parts = _split_head(head)
     if parts is None:
         return None
@@ -264,8 +290,24 @@ def frame_request(head: bytes, authority: bytes):
     plan = _body_plan(fields, is_response=False)
     if plan is None:
         return None
-    replaced = {index: authority for index, (name, _value) in enumerate(fields)
-                if name == b"host"}
+    target = match.group(2)
+    if not target.startswith(b"/"):
+        start = b" ".join((
+            match.group(1),
+            map_url(target.decode("latin-1"), names, origin).encode("latin-1"),
+            match.group(3)))
+    replaced = {}
+    for index, (name, value) in enumerate(fields):
+        if name == b"host":
+            replaced[index] = authority
+            continue
+        if name not in REQUEST_HEADERS:
+            continue
+        text = value.decode("latin-1")
+        mapped = (map_origin if name == b"origin" else map_url)(
+            text, names, origin)
+        if mapped != text:
+            replaced[index] = mapped.encode("latin-1")
     return (_rebuild(start, lines, replaced), plan[0], plan[1],
             match.group(1).upper().decode("ascii"))
 
@@ -537,9 +579,10 @@ class WebRelaySession:
         self.relay_names = frozenset(
             name for name in (str(host).strip("[]").lower(),
                               str(target_ip).strip("[]").lower()) if name)
-        self.device_authority = (
-            f"[{target_ip}]:{target_port}" if ":" in target_ip
-            else f"{target_ip}:{target_port}").encode("latin-1")
+        authority = (f"[{target_ip}]:{target_port}" if ":" in target_ip
+                     else f"{target_ip}:{target_port}")
+        self.device_authority = authority.encode("latin-1")
+        self.device_origin = f"{scheme}://{authority}"
         self.opened_ts = time.time()
         self._last_traffic = self.opened_ts
         self._last_touch = 0.0
@@ -733,7 +776,9 @@ class WebRelaySession:
                 return
             if head is _BLIND:
                 return self._blindly(src, dst, to_device, state, buf)
-            framed = (frame_request(head, self.device_authority) if to_device
+            framed = (frame_request(head, self.device_authority,
+                                    self.relay_names, self.device_origin)
+                      if to_device
                       else frame_response(head, state.take, self.relay_names,
                                           self.origin))
             if framed is None:

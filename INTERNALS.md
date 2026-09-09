@@ -7904,19 +7904,38 @@ passed through verbatim, so a body is never buffered whole and crosses byte
 for byte. Keep-alive is the normal case; the loop just goes round again.
 Outbound, `Host:` becomes `device_authority` (`<ip>:<port>`), which is what
 stops a device rebuilding its URLs out of this server's name — the reported
-`Location: https://<server>/home.asp`. Inbound, `Location`,
-`Content-Location`, `Refresh` and `Set-Cookie`'s `Domain=` go through
-`map_url` / `map_refresh` / `map_cookie`: an absolute URL naming either
-`relay_names` member (the host the browser reached this server on, and the
-device's own address) is moved onto `origin`, and a `Domain=` naming either
-is dropped so the cookie is host-only and the browser keeps it on the relay.
-Nothing else is touched, bodies included.
+`Location: https://<server>/home.asp`. Everything else in the request head
+that names the browser-facing authority moves with it, onto `device_origin`
+(`<scheme>://<ip>:<port>`): `Origin` through `map_origin`, `Referer` and a
+request target written in absolute form through `map_url`. Moving `Host`
+alone would leave the three disagreeing at the device, and an embedded UI
+that compares `Origin` or `Referer` against `Host` answers such a POST 403 —
+a login form that worked before 5.4.0, when all three named the relay and
+agreed, and a fault that presents as the device's since GET is unaffected.
+Inbound, `Location`, `Content-Location`, `Refresh` and `Set-Cookie`'s
+`Domain=` go through `map_url` / `map_refresh` / `map_cookie`: an absolute
+URL naming either `relay_names` member (the host the browser reached this
+server on, and the device's own address) **on the scheme this tunnel
+carries** is moved onto `origin`, and a `Domain=` naming either is dropped so
+the cookie is host-only and the browser keeps it on the relay. Nothing else
+is touched, bodies included.
+
+**The scheme is part of the match** (`_is_ours`). An `http` device answering
+`Location: https://<itself>/` is saying its UI is on TLS, which this tunnel
+does not carry; mapping that onto the relay's own `http://` origin would send
+the browser back into the same plaintext tunnel, to the same redirect, until
+it gave up around twenty hops in. Such a `Location` is left exactly as the
+device wrote it, so the browser leaves the tunnel and fails naming the
+device — what it did before 5.4.0, and the true thing to tell an operator.
 
 **Falling back.** `frame_request` / `frame_response` return `None` for
 anything not fully understood — a `101` upgrade, a `CONNECT`, an
 unparseable request or status line, obsolete line folding, a
 `Transfer-Encoding` that is not plainly `chunked`, a `Content-Length` that
-is not one number, an over-long head. `_blindly` then sets
+is not one number, a head carrying both of those (two framings that can
+disagree, and which one the device honours is its own business — the relay
+reads neither rather than forwarding both and picking one), an over-long
+head. `_blindly` then sets
 `_HttpConnection.blind` and copies the rest with `_copy`, the head it could
 not read pushed back on the front of the buffer first, so not a byte is
 dropped or repeated. The switch is one-way and shared: `_read_head` checks
@@ -7927,9 +7946,8 @@ only after it has seen the `101`). The pump is the floor — no device that
 worked before 5.4.0 can be broken by the parser. A response's method comes
 from `_HttpConnection.take()`, pushed by the request direction before the
 request is forwarded and popped only for a final (non-1xx) response, since a
-`HEAD` answer carries no body however its head is framed. `Referer` and
-`Origin` are deliberately left naming the relay, and an `https` session
-never frames at all.
+`HEAD` answer carries no body however its head is framed. An `https`
+session never frames at all.
 
 **A known limitation, not fixed.** On a TLS install `server.py` sends
 `Strict-Transport-Security` for its own hostname. HSTS is host-scoped and
