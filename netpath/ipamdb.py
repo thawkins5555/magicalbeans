@@ -174,6 +174,12 @@ DEFAULTS = {
     "scan_interval_minutes": 60,
     "ping_timeout_ms": 800,
     "ping_workers": 64,
+    # How many subnets sweep at once. The real concurrency is this times
+    # ping_workers above -- 4 x 64 is 256 probes in flight -- which is why it
+    # was worth a setting rather than the module constant it used to be:
+    # until now it could not be changed by any means at all, from any screen
+    # or any API call, because it was in neither DEFAULTS nor any dialog.
+    "max_concurrent_scans": 4,
     # A safety ceiling on how many addresses one subnet may sweep, not a
     # suggestion: adding a subnet larger than this is refused outright,
     # because a fat-fingered /8 would otherwise turn into a few hundred

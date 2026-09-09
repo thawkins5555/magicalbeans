@@ -1110,6 +1110,12 @@
         ${number('i-interval', 'Scan every', s.scan_interval_minutes, 'min=5')} minutes
         ${number('i-timeout', 'Ping timeout (ms)', s.ping_timeout_ms, 'min=100 step=100')}
         ${number('i-workers', 'Concurrent pings', s.ping_workers, 'min=1 max=256')}
+        ${number('i-scans', 'Subnets scanned at once', s.max_concurrent_scans, 'min=1 max=16')}
+        <p class="hint">The two multiply: four subnets at 64 pings each is 256
+          probes in flight. Raise the subnet count for an estate of many small
+          subnets and the ping count for a few large ones — but raise either
+          deliberately, because a burst of hundreds of probes has been known to
+          upset legacy PLC and RTU stacks.</p>
         ${number('i-maxaddr', 'Largest subnet allowed (addresses)', s.max_scan_addresses, 'min=16 step=256')}
         <p class="hint">A subnet larger than this is refused when added, not silently truncated —
           raise it deliberately if you mean to sweep something this size. Conflict detection needs
@@ -1140,6 +1146,7 @@
           scan_interval_minutes: num('#i-interval'),
           ping_timeout_ms: num('#i-timeout'),
           ping_workers: num('#i-workers'),
+          max_concurrent_scans: num('#i-scans'),
           max_scan_addresses: num('#i-maxaddr'),
           dhcp_poll_interval_minutes: num('#i-dhcp-interval'),
           dhcp_timeout_s: num('#i-dhcp-timeout'),
