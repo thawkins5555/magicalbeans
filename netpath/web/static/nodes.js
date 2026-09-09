@@ -5448,7 +5448,22 @@
     const settingsBox = App.modal('Nodes settings', `
       <fieldset><legend>POLLING</legend>
         ${check('np-enabled', 'Run the poller', s.enabled)}
-        ${number('np-workers', 'Poll worker threads', s.poll_workers, 'min=1 max=256')}
+        ${check('np-workers-auto', 'Size the poll pool automatically', s.poll_workers_auto)}
+        ${number('np-workers-min', 'Fewest poll worker threads', s.poll_workers_min, 'min=1 max=512')}
+        ${number('np-workers-max', 'Most poll worker threads', s.poll_workers_max, 'min=1 max=512')}
+        ${number('np-headroom', 'Spare capacity multiplier', s.poll_pool_headroom, 'min=1 max=4 step=0.1')}
+        <p class="hint">With this on (the default), the poller adds up how long each
+          device's polls actually take and how often each one is due, keeps enough
+          threads for that plus the spare capacity above, and never goes below the
+          fewest or above the most. It grows quickly and shrinks slowly. A fleet
+          that outgrows the maximum still raises the
+          <strong>poll_pool_saturated</strong> alert, which is the one case that
+          needs a person. Turn it off to set the number yourself below.</p>
+        ${number('np-workers', 'Poll worker threads (when not automatic)', s.poll_workers, 'min=1 max=512')}
+        ${number('np-macworkers', 'Table-walk threads', s.mac_walk_workers, 'min=1 max=32')}
+        <p class="hint">MAC, LLDP/CDP and VLAN walks run on their own small pool,
+          deliberately separate from the poll pool so a walk of a core switch can
+          never starve ordinary polling. Four is the shipped default.</p>
         ${number('np-interval', 'Default poll interval', s.default_interval_s, 'min=10')} s
         ${number('np-focus', 'Selected-device poll interval (0 = off)', s.focus_poll_interval_s, 'min=0')} s
         ${number('np-timeout', 'Default SNMP timeout', s.default_snmp_timeout_s, 'min=0.5 step=0.5')} s
@@ -5584,6 +5599,11 @@
         const { on, num } = App.form.readers(box);
         await App.post('/api/settings', { scope: 'nodes', values: {
           enabled: on('#np-enabled'), poll_workers: num('#np-workers'),
+          poll_workers_auto: on('#np-workers-auto'),
+          poll_workers_min: num('#np-workers-min'),
+          poll_workers_max: num('#np-workers-max'),
+          poll_pool_headroom: num('#np-headroom'),
+          mac_walk_workers: num('#np-macworkers'),
           default_interval_s: num('#np-interval'), focus_poll_interval_s: num('#np-focus'),
           default_snmp_timeout_s: num('#np-timeout'),
           default_snmp_retries: num('#np-retries'), down_after_failures: num('#np-downafter'),

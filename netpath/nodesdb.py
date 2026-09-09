@@ -473,6 +473,23 @@ CREATE TABLE IF NOT EXISTS settings (
 DEFAULTS = {
     "enabled": True,
     "poll_workers": 16,
+    # The pool sizes itself between these two unless poll_workers_auto is
+    # off, in which case poll_workers above is the size, exactly as before.
+    # On an upgrade _migrate seeds poll_workers_min from the install's own
+    # poll_workers, so an existing fleet can only ever gain threads.
+    "poll_workers_auto": True,
+    "poll_workers_min": 16,
+    "poll_workers_max": 128,
+    # Multiplier on measured demand. Arrivals are bursty (the scheduler
+    # submits every due device at once) and poll costs are heavy-tailed (a
+    # device that stops answering costs thirty times one that does), so
+    # sizing to the bare mean would run late whenever either bit.
+    "poll_pool_headroom": 1.5,
+    # The MAC/LLDP/VLAN walk pool, which is deliberately NOT the poll pool
+    # and is not autoscaled: those walks are hourly at most and must never
+    # be able to starve polling. A setting only because until now it was a
+    # class constant with no way to change it at all.
+    "mac_walk_workers": 4,
     "default_interval_s": 120,
     "focus_poll_interval_s": 3,     # selected-device fast poll; 0 disables
     "default_snmp_timeout_s": 3.0,
@@ -1034,6 +1051,28 @@ class NodesDatabase(SqliteStore):
         for name in ("ix_vlans_device", "ix_vlan_ports_device", "ix_port_vlans_device"):
             self._conn.execute(f"DROP INDEX IF EXISTS {name}")
 
+        # The pool sizes itself from 5.4.0, and an upgrade must not be able
+        # to take threads away from a fleet that was tuned by hand. An
+        # install that has never seen poll_workers_min gets its own stored
+        # poll_workers as the floor, so the number the operator chose becomes
+        # the least the pool will ever run at and every change from here is
+        # upward. A fresh install has no stored poll_workers and takes
+        # DEFAULTS' 16 instead -- deliberately a different number from a
+        # tuned install's, because it is answering a different question.
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = 'poll_workers_min'").fetchone()
+        if row is None:
+            existing = self._conn.execute(
+                "SELECT value FROM settings WHERE key = 'poll_workers'").fetchone()
+            try:
+                floor = int(json.loads(existing["value"])) if existing else 16
+            except (TypeError, ValueError, json.JSONDecodeError):
+                floor = 16
+            floor = max(self.MIN_POLL_WORKERS, min(self.MAX_POLL_WORKERS, floor))
+            self._conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES "
+                "('poll_workers_min', ?)", (json.dumps(floor),))
+
     def _seed(self) -> None:
         """Creates a `Default` polling profile if none exists yet. Idempotent
         on every open — a device with no group falls back to this one, and
@@ -1064,10 +1103,58 @@ class NodesDatabase(SqliteStore):
 
     # --------------------------------------------------------------- settings
 
+    # A thread count, not a packet rate -- but an unbounded one is a way to
+    # take the process down from a settings form. poll_workers had no
+    # server-side bound at all before this: the browser said max=256 and an
+    # API client could ask for a hundred thousand.
+    MIN_POLL_WORKERS = 1
+    MAX_POLL_WORKERS = 512
+
     def save_settings(self, values: dict) -> None:
+        values = self._clamp_pool_settings(values)
         super().save_settings(values)
         with self._lock:
             self._config_generation += 1
+
+    def _clamp_pool_settings(self, values: dict) -> dict:
+        """Bound the worker counts, and keep the floor under the ceiling.
+
+        Clamped here rather than only in the API's range table so that every
+        writer is covered -- a bulk import, a migration, a test -- the way
+        db.py:203-205 already clamps trace_workers.
+        """
+        if not any(key in values for key in (
+                "poll_workers", "poll_workers_min", "poll_workers_max",
+                "mac_walk_workers", "poll_pool_headroom")):
+            return values
+        values = dict(values)
+        for key in ("poll_workers", "poll_workers_min", "poll_workers_max"):
+            if key in values:
+                try:
+                    values[key] = max(self.MIN_POLL_WORKERS,
+                                      min(self.MAX_POLL_WORKERS, int(values[key])))
+                except (TypeError, ValueError):
+                    values.pop(key)
+        if "mac_walk_workers" in values:
+            try:
+                values["mac_walk_workers"] = max(1, min(32, int(values["mac_walk_workers"])))
+            except (TypeError, ValueError):
+                values.pop("mac_walk_workers")
+        if "poll_pool_headroom" in values:
+            try:
+                values["poll_pool_headroom"] = max(1.0, min(4.0, float(
+                    values["poll_pool_headroom"])))
+            except (TypeError, ValueError):
+                values.pop("poll_pool_headroom")
+        # An inverted pair would make the clamp in _read_pool_settings pick
+        # one silently; settle it here, where the operator's intent is still
+        # visible, by letting the ceiling win.
+        stored = self.settings()
+        floor = values.get("poll_workers_min", stored.get("poll_workers_min", 16))
+        ceiling = values.get("poll_workers_max", stored.get("poll_workers_max", 128))
+        if int(floor) > int(ceiling):
+            values["poll_workers_min"] = int(ceiling)
+        return values
 
     # ----------------------------------------------------------------- groups
 

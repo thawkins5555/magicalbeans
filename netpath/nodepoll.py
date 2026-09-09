@@ -13,6 +13,7 @@ right shape, not IpamWorker's coarser "unseen = immediately due" one.
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 import socket
@@ -52,6 +53,22 @@ MAX_UDP = 65535
 # bounds the OUTPUT of a handful of column walks, not a loop that opens one
 # SNMP session per VLAN), and giving it its own class attribute of the same
 # name as the existing one would silently shadow it in the class namespace.
+# What a poll is assumed to cost before one has been measured, in seconds.
+# Only ever used for a device the poller has not polled yet, and only until
+# it has: a cold start must not size the pool to zero.
+_DEFAULT_POLL_COST = 1.0
+
+# The weight one poll carries in its device's mean. 0.3 settles within a
+# handful of polls, which at a 120 s interval is minutes -- fast enough to
+# follow a device going down, slow enough that one slow answer does not
+# resize the pool on its own.
+_POLL_COST_ALPHA = 0.3
+
+# A poll longer than this is not a measurement. The interface read alone is
+# bounded to half a poll interval and gives up after three timeouts, so
+# nothing legitimate approaches it.
+_POLL_COST_CEILING_S = 600.0
+
 _MAX_VLANS = 512
 _VLAN_WALK_BUDGET_S = 20.0
 
@@ -1002,6 +1019,34 @@ class NodePoller(Worker):
         # reported. See _note_saturation.
         self._saturated_since: float | None = None
         self._saturation_reported = False
+        # device_id -> an exponentially weighted mean of how long its polls
+        # actually take, in seconds, and the fleet-wide mean of the same.
+        # _run_one already stamps a start time and a finish time; this keeps
+        # the difference instead of formatting it into a log line and
+        # dropping it. It is what lets the pool size itself: see _autoscale.
+        # device_id -> how many consecutive cycles have skipped this
+        # device's SNMP phase while it is down. See _snmp_backoff_due.
+        self._snmp_backoff: dict[int, int] = {}
+        self._poll_cost: dict[int, float] = {}
+        self._poll_cost_mean: float = _DEFAULT_POLL_COST
+        # The autoscaler's own state, all in memory. Floor, ceiling and
+        # headroom are cached here at start()/reconfigure() time rather than
+        # read per pass, because tests/test_scheduler.py pins a steady
+        # scheduling pass at five SQL statements and asserts it never reads
+        # the settings table.
+        self._autoscale = {"auto": False, "min": 1, "max": 1, "headroom": 1.5}
+        self._manual_workers = 16
+        # None means "no ceiling has ever been computed", which is what
+        # _note_saturation reads to keep behaving exactly as it did before
+        # autoscaling existed -- including for a poller whose start() has
+        # not run, which is how test_poll_write_path drives it.
+        self._autoscale_ceiling: int | None = None
+        self._autoscale_at: float = 0.0
+        self._autoscale_resized_at: float = 0.0
+        self._autoscale_demand: float = 0.0        # rolling max this window
+        self._autoscale_want: int = 0              # last target computed
+        self._autoscale_shrink_votes: int = 0
+        self._autoscale_sat_since: float | None = None
         # Set by the application once the alert engine exists, so the poller
         # can raise a system alert about itself. Left None (and every use
         # guarded) so the poller runs standalone in tests and scripts.
@@ -1037,7 +1082,7 @@ class NodePoller(Worker):
         # when the tab is left or the browser closes — no cleanup path.
         self._focus: tuple[int, float, float] | None = None
         self.counters = {"polls": 0, "ok": 0, "timeout": 0, "auth_fail": 0,
-                         "unsupported": 0, "errors": 0, "overruns": 0,
+                         "unsupported": 0, "errors": 0, "overruns": 0, "snmp_backoff": 0,
                          "mac_walks": 0, "identifications": 0,
                          # lldp_walks counts completed LLDP/CDP walks;
                          # poe_polls/stp_polls/rf_polls count poll-cycle
@@ -1052,11 +1097,45 @@ class NodePoller(Worker):
     def start(self, settings: dict | None = None) -> None:
         self.stop()
         self._stop.clear()
-        workers = max(1, int((settings or self.db.settings()).get("poll_workers", 16)))
-        self._executor = ThreadPoolExecutor(max_workers=workers)
+        settings = settings if settings is not None else self.db.settings()
+        self._read_pool_settings(settings)
+        self._executor = ThreadPoolExecutor(max_workers=self._initial_pool_size())
         self._mac_executor = ThreadPoolExecutor(
-            max_workers=self._MAC_WALK_WORKERS, thread_name_prefix="mac-walk")
+            max_workers=max(1, int(settings.get("mac_walk_workers",
+                                                self._MAC_WALK_WORKERS))),
+            thread_name_prefix="mac-walk")
         self._spawn()
+
+    def _read_pool_settings(self, settings: dict) -> None:
+        """Cache the pool settings on the poller.
+
+        Read here and not in the scheduling pass on purpose:
+        tests/test_scheduler.py pins a steady pass at five SQL statements
+        regardless of fleet size and asserts it never reads the settings
+        table. reconfigure() runs on every Nodes settings save, so this
+        cache cannot go stale.
+        """
+        floor = max(1, int(settings.get("poll_workers_min",
+                                        settings.get("poll_workers", 16)) or 1))
+        ceiling = max(floor, int(settings.get("poll_workers_max", 128) or floor))
+        self._autoscale = {
+            "auto": bool(settings.get("poll_workers_auto", True)),
+            "min": floor,
+            "max": ceiling,
+            "headroom": max(1.0, float(settings.get("poll_pool_headroom", 1.5) or 1.5)),
+        }
+        self._autoscale_ceiling = ceiling if self._autoscale["auto"] else None
+        self._manual_workers = max(1, int(settings.get("poll_workers", 16) or 1))
+
+    def _initial_pool_size(self) -> int:
+        """Where the pool starts. With auto off that is poll_workers, exactly
+        as before. With auto on it is the floor -- which on an upgraded
+        install IS the operator's existing poll_workers, seeded by nodesdb's
+        migration, so no fleet ever starts with fewer threads than it had."""
+        if not self._autoscale["auto"]:
+            return self._manual_workers
+        return max(self._autoscale["min"],
+                   min(self._autoscale["max"], self._manual_workers))
 
     def reconfigure(self, settings: dict) -> None:
         """Hot pool resize, matching Monitor.set_workers: build a new
@@ -1067,12 +1146,19 @@ class NodePoller(Worker):
             if not self.running:
                 self.start(settings)
                 return
-            workers = max(1, int(settings.get("poll_workers", 16)))
+            self._read_pool_settings(settings)
+            workers = self._initial_pool_size()
+            if self._autoscale["auto"]:
+                # Auto keeps whatever size it has arrived at, only pulled
+                # back inside the operator's new bounds. Snapping to the
+                # floor on every unrelated settings save would throw away
+                # everything the controller had learned.
+                current = getattr(self._executor, "_max_workers", workers)
+                workers = max(self._autoscale["min"],
+                              min(self._autoscale["max"], current))
             if self._executor is not None and self._executor._max_workers == workers:
                 return
-            previous, self._executor = self._executor, ThreadPoolExecutor(max_workers=workers)
-            if previous:
-                previous.shutdown(wait=False)
+            self._apply_pool_size(workers)
         elif self.running:
             self.stop()
 
@@ -1205,14 +1291,67 @@ class NodePoller(Worker):
             queued = len(self._queued)
         workers = getattr(self._executor, "_max_workers", 0) if self._executor else 0
         return {"busy": busy, "queued": queued, "workers": workers,
-                "saturated": bool(workers and busy >= workers and queued)}
+                "saturated": bool(workers and busy >= workers and queued),
+                # Added beside the original four, never in place of them.
+                "auto": bool(self._autoscale["auto"]),
+                "floor": int(self._autoscale["min"]),
+                "ceiling": int(self._autoscale["max"]),
+                "demand": round(self._autoscale_want, 1)}
+
+    # How many cycles in a row a down device may skip SNMP. Two skips then
+    # one attempt is the ~3x cap: enough to take most of the cost out of a
+    # site outage, short enough that a device whose SNMP recovers before its
+    # ping does is still found within about three intervals.
+    _SNMP_BACKOFF_SKIPS = 2
+
+    def _snmp_backoff_due(self, device_id: int) -> bool:
+        """Whether this cycle skips SNMP for a device that is down.
+
+        Counts cycles rather than keeping a wall-clock next-run stamp, on
+        purpose. _last_ping/ping_interval_s is a wall clock because it
+        answers an operator's separate question ("ping less often than you
+        poll"); reusing it here would let that setting silently change how
+        SNMP backs off. A skip count is its own thing.
+        """
+        skipped = self._snmp_backoff.get(device_id, 0)
+        if skipped >= self._SNMP_BACKOFF_SKIPS:
+            self._snmp_backoff[device_id] = 0
+            return False
+        self._snmp_backoff[device_id] = skipped + 1
+        return True
+
+    def _record_poll_cost(self, device_id: int, elapsed: float) -> None:
+        """Fold one poll's wall time into this device's mean, and the fleet's.
+
+        Exponentially weighted rather than a plain average, because what the
+        pool has to be sized for is what polls cost NOW: a device that has
+        just gone down costs thirty times what it did an hour ago, and an
+        average over its whole history would take that long to notice.
+
+        Cheap on purpose -- two multiplies on a dict entry, on a path that
+        has just spent seconds talking to a device.
+        """
+        if elapsed < 0 or elapsed > _POLL_COST_CEILING_S:
+            # A clock step, or a poll that outlived a shutdown drain. Either
+            # way it describes the machine, not the device.
+            return
+        previous = self._poll_cost.get(device_id)
+        cost = elapsed if previous is None else (
+            _POLL_COST_ALPHA * elapsed + (1 - _POLL_COST_ALPHA) * previous)
+        self._poll_cost[device_id] = cost
+        self._poll_cost_mean = (
+            _POLL_COST_ALPHA * cost + (1 - _POLL_COST_ALPHA) * self._poll_cost_mean)
 
     def _running_text(self) -> str:
         n = self.db.device_count()
         pool = self.pool_state()
+        # The phrase "N busy and N queued of N worker(s)" is asserted
+        # verbatim by tests/test_poll_write_path.py. Additions go after it.
+        auto = (f" · auto {pool['floor']}-{pool['ceiling']}"
+                if pool["auto"] else "")
         return (f"Polling {n} device(s) · {pool['busy']} busy and "
-                f"{pool['queued']} queued of {pool['workers']} worker(s) · "
-                f"last poll {ago(self._last_completed)}")
+                f"{pool['queued']} queued of {pool['workers']} worker(s)"
+                f"{auto} · last poll {ago(self._last_completed)}")
 
     def worker_state(self) -> dict:
         with self._lock:
@@ -1489,6 +1628,13 @@ class NodePoller(Worker):
             self._forget_devices(set(self._configs))
         self._note_saturation(now)
         focus = self._focus
+        # Little's Law, accumulated in the loop that is already running:
+        # a device polled every `interval` seconds, each poll costing
+        # `cost` seconds of a worker, occupies cost/interval of one worker
+        # continuously. Summed over the fleet that is how many workers the
+        # configured cadence actually requires. No extra query, no extra
+        # iteration -- both terms are already in hand here.
+        demand = 0.0
         for device in self.db.schedule_rows():
             device_id = device["id"]
             config = self._configs.get(device_id)
@@ -1518,14 +1664,135 @@ class NodePoller(Worker):
                         self._record_overrun(device, now, config)
                 else:
                     self._submit(device_id)
+            demand += (self._poll_cost.get(device_id, self._poll_cost_mean)
+                       / max(interval, 1.0))
             self._maybe_walk_mac_table(device, config, now)
             self._maybe_walk_lldp(device, config, now)
             self._maybe_walk_vlans(device, config, now)
+        self._autoscale_pass(now, demand)
 
     # How long the pool has to look saturated before it is worth telling
     # somebody. A burst at the top of a poll cycle is normal; five minutes
     # of it means the pool is genuinely too small for the fleet.
     _SATURATION_S = 300.0
+
+    # How often the pool's size is reconsidered, and how rarely it is
+    # actually changed. The two are deliberately different numbers.
+    #
+    # Evaluating often is free -- it is arithmetic over dicts already in
+    # hand -- and evaluating rarely would mean a site outage waited out the
+    # interval before anyone noticed the fleet had got expensive.
+    #
+    # RESIZING often is not free. reconfigure() builds a whole new
+    # ThreadPoolExecutor and calls shutdown(wait=False) on the old one,
+    # which does not cancel running futures; the executor also keeps a
+    # module-global entry per worker thread and an atexit handler. Once a
+    # minute means at most one abandoned pool draining at a time. Seconds
+    # apart would mean a heap of them.
+    _AUTOSCALE_INTERVAL_S = 15.0
+    _AUTOSCALE_COOLDOWN_S = 60.0
+    # A target within this fraction of the current size is not worth a new
+    # pool: 16 -> 17 is noise, not a decision.
+    _AUTOSCALE_DEADBAND = 0.10
+    _AUTOSCALE_DEADBAND_FLOOR = 2
+    # Consecutive evaluations that must agree before shrinking. Growing
+    # answers a fleet being polled late, which an operator can see; shrinking
+    # answers nothing urgent at all, and every shrink abandons a pool.
+    _AUTOSCALE_SHRINK_VOTES = 4
+    # Saturation this long with the model still not asking for more means the
+    # cost estimates are behind the truth -- the first seconds of an outage,
+    # before any expensive poll has completed to move an EWMA. Push up anyway.
+    _AUTOSCALE_RATCHET_S = 60.0
+
+    def _autoscale_pass(self, now: float, demand: float) -> None:
+        """Size the poll pool from what the fleet actually costs.
+
+        Called once a second with this pass's demand figure; keeps the
+        rolling maximum and acts on it at most every _AUTOSCALE_INTERVAL_S,
+        resizing at most every _AUTOSCALE_COOLDOWN_S.
+
+        The maximum rather than the latest sample: demand dips for a pass
+        that happens to fall between due times, and sizing off a trough is
+        how a pool ends up too small a second later.
+        """
+        if demand > self._autoscale_demand:
+            self._autoscale_demand = demand
+        settings = self._autoscale
+        if not settings["auto"] or self._executor is None:
+            return
+        if now - self._autoscale_at < self._AUTOSCALE_INTERVAL_S:
+            return
+        self._autoscale_at = now
+
+        floor, ceiling = int(settings["min"]), int(settings["max"])
+        current = getattr(self._executor, "_max_workers", floor)
+        want = math.ceil(self._autoscale_demand * float(settings["headroom"]))
+        self._autoscale_demand = 0.0
+
+        # The corrective term, and the only one. Overruns are not usable
+        # here: _record_overrun returns early for a device that is down or
+        # failing, so the overrun counter goes quiet during exactly the
+        # outage that makes the fleet expensive. Measured on a 300-device
+        # fleet at half the workers it needed, the counter read zero while
+        # 182 devices sat queued and p95 lateness was already 8.95 s on a
+        # 15 s interval. Saturation is the signal that moves when it should.
+        pool = self.pool_state()
+        if pool["saturated"]:
+            if self._autoscale_sat_since is None:
+                self._autoscale_sat_since = now
+            elif (now - self._autoscale_sat_since >= self._AUTOSCALE_RATCHET_S
+                    and want <= current):
+                # The model is behind the truth: nothing has completed yet to
+                # tell it these polls have got expensive. Push up regardless.
+                want = current + max(1, current // 4)
+        else:
+            self._autoscale_sat_since = None
+
+        want = max(floor, min(ceiling, want))
+        self._autoscale_want = want
+        self._autoscale_ceiling = ceiling
+        if want == current:
+            self._autoscale_shrink_votes = 0
+            return
+
+        deadband = max(self._AUTOSCALE_DEADBAND_FLOOR,
+                       int(current * self._AUTOSCALE_DEADBAND))
+        if abs(want - current) < deadband and want > floor and want < ceiling:
+            self._autoscale_shrink_votes = 0
+            return
+
+        if want < current:
+            # Shrinking buys nothing an operator can see and costs an
+            # abandoned pool, so it has to be asked for repeatedly.
+            self._autoscale_shrink_votes += 1
+            if self._autoscale_shrink_votes < self._AUTOSCALE_SHRINK_VOTES:
+                return
+            want = max(want, current - max(1, current // 4))
+        else:
+            self._autoscale_shrink_votes = 0
+            want = min(want, max(current * 2, current + 1))
+
+        if now - self._autoscale_resized_at < self._AUTOSCALE_COOLDOWN_S:
+            return
+        self._autoscale_shrink_votes = 0
+        self._autoscale_resized_at = now
+        self._apply_pool_size(want)
+        self.log.add(NODES, f"Poll pool resized from {current} to {want} worker(s) "
+                            f"(floor {floor}, ceiling {ceiling})")
+
+    def _apply_pool_size(self, workers: int) -> None:
+        """Swap in a pool of this size and let the old one drain.
+
+        shutdown(wait=False) rather than cancel: a poll in flight is talking
+        to a device and holds no lock this cares about, so letting it finish
+        costs nothing, where cancelling it would leave a device unpolled for
+        an interval and its result unrecorded.
+        """
+        workers = max(1, int(workers))
+        previous, self._executor = self._executor, ThreadPoolExecutor(
+            max_workers=workers)
+        if previous is not None:
+            previous.shutdown(wait=False)
 
     def _note_saturation(self, now: float) -> None:
         """Raise (and clear) a system alert when every poll worker is busy
@@ -1536,7 +1803,19 @@ class NodePoller(Worker):
         """
         pool = self.pool_state()
         engine = self.alert_engine
-        if not pool["saturated"]:
+        # With the pool sizing itself, saturation below the ceiling is the
+        # controller's job and not news: it corrects within fifteen seconds,
+        # and an alert about something the application is already fixing is
+        # the kind of noise that teaches operators to stop reading alerts.
+        # Only the ceiling being reached means a human has to do something.
+        #
+        # _autoscale_ceiling is None until the autoscaler has run, which is
+        # also the case for a poller whose start() never ran -- that is how
+        # tests/test_poll_write_path.py drives this method, and None keeps
+        # the pre-autoscaling behaviour exactly.
+        ceiling = self._autoscale_ceiling
+        below_ceiling = ceiling is not None and pool["workers"] < ceiling
+        if not pool["saturated"] or below_ceiling:
             if self._saturation_reported:
                 clear = getattr(engine, "clear_system_occurrence", None)
                 if clear is not None:
@@ -1558,12 +1837,24 @@ class NodePoller(Worker):
             "poll_pool_saturated", "poller", "Polling pool", severity=3,
             extra={"busy": pool["busy"], "queued": pool["queued"],
                    "workers": pool["workers"],
-                   "saturated_minutes": round(minutes, 1)},
-            message=(f"Every one of the {pool['workers']} poll workers has "
-                     f"been busy with {pool['queued']} device(s) waiting for "
-                     f"{minutes:.0f} minutes. Devices are being polled later "
-                     f"than their interval. Raise Nodes → Settings → Poll "
-                     f"workers, or lengthen the polling interval."))
+                   "saturated_minutes": round(minutes, 1),
+                   # The evidence behind the number, so the alert says why
+                   # the ceiling is where it is as well as that it was hit.
+                   "auto": pool["auto"], "floor": pool["floor"],
+                   "ceiling": pool["ceiling"], "demand": pool["demand"]},
+            message=(
+                f"The poll pool has been at its ceiling of {pool['workers']} "
+                f"workers with {pool['queued']} device(s) waiting for "
+                f"{minutes:.0f} minutes. Devices are being polled later than "
+                f"their interval. Raise Nodes → Settings → Most poll worker "
+                f"threads, lengthen the polling interval, or split the fleet "
+                f"across instances."
+                if ceiling is not None else
+                f"Every one of the {pool['workers']} poll workers has "
+                f"been busy with {pool['queued']} device(s) waiting for "
+                f"{minutes:.0f} minutes. Devices are being polled later "
+                f"than their interval. Raise Nodes → Settings → Poll "
+                f"workers, or lengthen the polling interval."))
 
     def _forget_devices(self, keep: set) -> None:
         """Drop the per-device state of devices that no longer exist.
@@ -1577,7 +1868,8 @@ class NodePoller(Worker):
                       self._credentials, self._credential_probe_failed,
                       self._addresses_read, self._bulk_repetitions,
                       self._sensor_read, self._sensor_threshold_read,
-                      self._sensor_diag_ts):
+                      self._sensor_diag_ts, self._snmp_backoff,
+                      self._poll_cost):
             for device_id in [k for k in cache if k not in keep]:
                 cache.pop(device_id, None)
         with self._lock:
@@ -1763,9 +2055,12 @@ class NodePoller(Worker):
                              detail=traceback.format_exc())
                 traceback.print_exc()
         finally:
+            finished = time.time()
             with self._lock:
-                self._started.pop(device_id, None)
-                self._last_completed = time.time()
+                started = self._started.pop(device_id, None)
+                self._last_completed = finished
+            if started is not None:
+                self._record_poll_cost(device_id, finished - started)
 
     # ---------------------------------------------------------------- poll
 
@@ -1807,6 +2102,9 @@ class NodePoller(Worker):
                 ping_ok = None if previous_ok is None else bool(previous_ok)
                 ping_rtt_ms = device["ping_rtt_ms"]
 
+        if ping_ok:
+            self._snmp_backoff.pop(device_id, None)
+
         snmp_ok = None
         snmp_error = ""
         # Whether SNMP failed because the device refuses something this
@@ -1822,7 +2120,47 @@ class NodePoller(Worker):
         interfaces_complete = True
         metrics: list[tuple] = []   # (key, label, unit, kind, value)
 
-        if config.get("snmp_enabled"):
+        # A device already known to be down is the most expensive thing this
+        # poller does -- the ping timeouts plus the full SNMP timeout times
+        # its retries, about thirty times what a healthy device costs -- and
+        # a site outage is exactly when the pool can least afford it. So a
+        # device that is down skips the SNMP half of most cycles.
+        #
+        # Ping is NOT backed off, and that is what makes this safe: ping is
+        # what detects both the outage and the recovery, _next_run is
+        # untouched, and so the scheduled cadence, the status timeline, the
+        # outage duration and the up/down event stream are all exactly what
+        # they were. The cycle still runs; it just stops being expensive.
+        #
+        # Decided on THIS cycle's ping rather than on device["status"],
+        # which _run_one read before the poll and so describes the previous
+        # one. Gating on the stale row would skip SNMP on the very cycle
+        # whose ping came back -- the one cycle that most wants to run it.
+        # ping_enabled, and ping_ok is False rather than merely falsy, are
+        # both load-bearing. Ping being unbacked-off is the entire reason
+        # this is safe -- it is what still detects the recovery -- so where
+        # a profile has ping switched off there is no such safety and SNMP
+        # must not be skipped at all: SNMP is then the only evidence the
+        # device exists, and backing it off would mean a device that came
+        # back was never seen to. `is False` says the same thing about a
+        # cycle that carried a previous result forward instead of probing:
+        # None is "no ping evidence", and no evidence is not a failure.
+        backed_off = (device["status"] == "down"
+                      and config.get("ping_enabled")
+                      and ping_ok is False
+                      and config.get("snmp_enabled")
+                      and self._snmp_backoff_due(device_id))
+        if backed_off:
+            # None, not False: None is this file's established "the poll did
+            # not touch that method" (see the lane events below), and False
+            # here would be read as a real SNMP failure by snmp_failing_now
+            # once ping recovered, counting a phantom failure toward
+            # snmp_fail_alert_after on every recovery. record_poll is handed
+            # the previous values further down instead, so the device row
+            # keeps saying what it last actually knew.
+            self._bump("snmp_backoff")
+
+        if config.get("snmp_enabled") and not backed_off:
             try:
                 cred_config, identity, uptime_ticks, metrics = \
                     self._poll_snmp_scalars_with_credential(device, config)
@@ -1895,9 +2233,24 @@ class NodePoller(Worker):
                             now, ping_rtt_ms))
 
         # T1 — the device row.
+        #
+        # A backed-off cycle stores what SNMP last actually reported rather
+        # than the None it reasoned with above. record_poll overwrites both
+        # columns on every poll, so passing None would blank them: the
+        # device pane would show a down device's SNMP as unknown, and
+        # prev_snmp_ok would reset, so the next real failure would record a
+        # second snmp_down event for an outage already being reported. The
+        # skipped-ping branch carries its previous values forward for the
+        # same reason -- see ping_interval_s above.
+        stored_snmp_ok, stored_snmp_error = snmp_ok, snmp_error
+        if backed_off:
+            was = device["snmp_ok"]
+            stored_snmp_ok = None if was is None else bool(was)
+            stored_snmp_error = device["snmp_error"] or ""
         previous = self.db.record_poll(
-            device_id, ping_ok=ping_ok, ping_rtt_ms=ping_rtt_ms, snmp_ok=snmp_ok,
-            snmp_error=snmp_error, identity=identity, uptime_ticks=uptime_ticks,
+            device_id, ping_ok=ping_ok, ping_rtt_ms=ping_rtt_ms,
+            snmp_ok=stored_snmp_ok, snmp_error=stored_snmp_error,
+            identity=identity, uptime_ticks=uptime_ticks,
             status=status, reachable=reachable)
         if previous is None:
             return
