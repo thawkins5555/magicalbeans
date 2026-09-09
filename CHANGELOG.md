@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.5.0 — Measured first, then made faster](#550--measured-first-then-made-faster)
 - [5.4.0 — Eight asks](#540--eight-asks)
 - [5.3.0 — Six asks](#530--six-asks)
 - [5.2.0 — Eight asks](#520--eight-asks)
@@ -128,6 +129,164 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.5.0 — Measured first, then made faster
+
+One request — "investigate performance across page load, save, refresh and
+database search; and do pollers need to be statically set?" — answered by
+measuring before changing anything. Several things that looked slow were
+already fine and were left alone; the numbers below say which, and the five
+new `tests/bench_*.py` scripts reproduce all of them.
+
+**Pollers should not be statically set, and the answer to why not is a
+number.** `poll_workers` shipped at 16 and never moved unless somebody edited
+it, yet the application already knew when 16 was the wrong number — the
+saturation alert exists to say so, and its message told the operator to go and
+change it by hand. It now changes it itself. The poller adds up how long each
+device's polls actually take and how often each one is due — the sum of
+cost ÷ interval over the fleet, which is by definition the number of workers
+busy in steady state — and keeps enough threads for that plus a margin,
+between a floor and a ceiling that are still the operator's to set. Both
+figures were already in hand: the interval was in the scheduler's cached
+config, and the poll's wall time was already being computed and then formatted
+into a log line and dropped. Measured on 300 devices needing 20.4 workers'
+worth of work: started at 8, settled at **31**, which is that 20.4 times the
+1.5 headroom — and the median poll went from 2.47 seconds late to on time.
+The same fleet held at a fixed 8 workers stayed 8.94 seconds late at the 95th
+percentile with 181 devices queued.
+
+**Why it is not driven by the queue, and definitely not by overruns.** Queue
+depth is bimodal here by construction — the scheduler submits every due device
+at once, so a spike at the top of a cycle is normal rather than backlog. The
+overrun counter is worse than useless for this: `_record_overrun` is suppressed
+for a device that is down or failing, so it goes quiet during exactly the site
+outage that makes a fleet expensive. Measured at half the workers the fleet
+needed, it read **zero** while 182 devices sat queued and polls were already
+nine seconds late; it does not reach its first hundreds until the fleet is a
+cycle and a half behind. The runbook now says so, because the old text listed
+overruns first among the symptoms.
+
+**What that changes about the alert.** `poll_pool_saturated` keeps its name and
+its rule, and fires only when the **ceiling** was not enough — the one case
+that still needs a person. Below the ceiling it does not fire at all: the pool
+corrects itself within fifteen seconds, and an alert about something the
+application is already fixing is how operators learn to stop reading alerts.
+The alert now carries the demand figure the poller computed, so the message
+says how far past the ceiling the fleet actually is.
+
+**Nothing was taken away, and no install gets fewer threads.** *Poll worker
+threads* is still there and still decides the size outright for anyone who
+turns auto-sizing off. On upgrade it becomes the **floor**, so an install
+hand-tuned to 48 gets 48 as its minimum and can only ever gain threads. It also
+gained a bound it never had: the browser said `max=256` while nothing on the
+server checked at all, so an API client could have asked for a hundred thousand
+threads. Two more knobs that existed only as constants in the source — the
+table-walk pool and IPAM's concurrent-scan limit — now have settings.
+
+**Windows stopped forking a process for every ping, and this is the largest
+number in the release.** There is no unprivileged raw ICMP socket on Windows,
+so the poller gave up and shelled out to `ping.exe` — three per device per
+poll, measured here at 14 milliseconds of process creation each. For 2,000
+devices on a 60-second interval that is 84 seconds of forking to fit inside a
+60-second window: **140% of the window, before SNMP costs anything**, which is
+to say such a fleet could never keep up whatever else was tuned. Windows has an
+unprivileged answer the code had simply never reached for — `IcmpSendEcho`, no
+elevation needed — and it costs **0.22 ms**, the same work falling to about 2%
+of the window. Sixty times faster per probe. The IPAM sweep and discovery get
+it too, the Debug page names which path an install is on, and a host that
+cannot load the library falls back to `ping.exe` exactly as before.
+
+**A device that is down stops costing the pool so much.** A device that is not
+answering is about thirty times more expensive to poll than one that is — every
+ping timeout plus every SNMP timeout times its retries — and a site outage is
+precisely when the pool can least afford it. A device already down now skips
+the SNMP half of two cycles in three. **It is still pinged on every cycle**,
+which is the whole point: ping is what notices the recovery, the schedule is
+untouched, and so nothing about how quickly an outage or a recovery is seen has
+changed. Three things had to be right and each was wrong first: the decision
+reads *this* cycle's ping rather than the device row, which describes the
+previous one, or the very cycle whose ping came back would have been the one
+that skipped SNMP; a skipped cycle reasons with "did not run" but stores what
+SNMP last actually reported, because the first would have counted a phantom
+failure toward the SNMP-failing alert and the second would have blanked the
+device's state and re-reported an outage already open; and it requires ping to
+be switched on at all — on a ping-less profile SNMP is the only evidence the
+device exists, and the end-to-end suite caught a recovered device never being
+seen to recover.
+
+**Saving NetFlow, Syslog, SNMP-trap, Wireless or ConfigRX settings no longer
+holds the browser while the collector restarts.** Pressing Apply stopped and
+started the worker on the request thread, joining its thread for up to two
+seconds — and the syslog collector additionally joined every connected TCP
+client for two more. Measured with two clients attached: **4,266 ms to 8 ms**.
+The settings are still written, logged and version-bumped before the response,
+so the answer is still truthful about what was stored; only the restart moved,
+onto a single background worker that keeps restarts in order and can never
+overlap two. `/api/state` already reported each collector's running flag, so
+the interface shows the transition with nothing added.
+
+**Every open tab stopped paying for the same seven queries.** `/api/state` is
+polled every two seconds by every tab and ran seven fleet-count queries each
+time, every one of them taking a database lock the poller and the collectors
+were also queueing for. They are computed once per cycle now and shared:
+measured over 25 requests, lock acquisitions fell from **176 to 1**. With 25
+tabs open the server spends 5 milliseconds a second on it instead of 8. The
+Nodes tab also stopped fetching all five device sub-panes when four of them are
+behind hidden subtabs — twelve requests a tick to nine.
+
+**The retention sweep stopped freezing the interface.** Each database is one
+connection behind one lock, and a prune that deleted in a single statement
+held that lock for its whole duration — so every page reading that database
+waited for it, once every fifteen minutes. Measured at a million rows, the
+worst wait a reader saw: syslog **6,418 ms**, alerts **3,634**, traps
+**2,791**, MAC tables **891**. All five now delete in batches and hand the
+store back between them: **2,120 ms**, 185, **422**, 438. Two prunes that
+already released the lock were left alone and measured alongside as controls,
+which is how the run-to-run noise floor is known. Insert throughput is
+unchanged on every store.
+
+Syslog is the weak result and worth saying why: its full-text index has to be
+fed every deleted row, so the delete dominates and batches badly — three
+times better rather than the six to ten the others get. Two things were
+deliberately not done. The prunes were given no default deadline, because a
+budget that expires mid-sweep leaves rows past their retention, which is a
+retention change wearing a latency costume: with one applied, a syslog sweep
+stopped at 391,500 of the 500,008 rows it owed. And a larger batch size that
+cuts syslog's total sweep from 31.8 seconds to 9.4 was tried and rejected —
+measured per lock hold rather than per sweep it is a **578 ms** freeze every
+batch against 82 ms, and nothing waits on a sweep finishing while everything
+waits on a hold.
+
+**What the numbers said not to change.** The device search across seven columns
+was already documented in the source as costing about 13 ms at 2,000 devices;
+measured, it is **3.9 ms**, so that note was three times pessimistic and its
+conclusion — leave it alone — holds with more room than it claimed. SNMP-trap
+search looked like the worst thing in the application, six leading-wildcard
+LIKEs over every row with no full-text index to fall back on; measured, it is
+**flat in table size** (5.86 ms at 20,000 traps, 5.56 ms at 80,000), because a
+time range and a row limit bound it before the LIKEs ever run. The renotify sweep's query,
+which looked like the worst scaler of the lot because its COALESCE can use no
+index, was rewritten and measured: **117.5 ms to 113.4 ms**, three percent, for
+two more indexes the writer would pay for on every alert. The unindexable
+predicate was never the cost — the query returns three-quarters of the open
+alerts and every plan has to visit and sort them. It was left alone.
+
+All of those are in `bench_db_search.py` so the next person reads a number
+rather than a suspicion. Route dispatch, gzip levels and JSON cache headers
+were left alone for the same reason, and `temp_store=MEMORY` was set but
+should not be credited with anything: it moved none of these numbers at these
+volumes, because the sorts already fit in the cache SQLite had.
+
+**The application can now say what it is slow at.** Two measurements it was
+already taking and throwing away are kept: every request has always been timed
+and the figure handed to a function that ignored it, so latency is now recorded
+per route — by route pattern, so a thousand devices are still one row — and
+every database's lock is now instrumented for how long callers wait on it and
+hold it, which is the number that says whether the single-connection design is
+costing anything at a given fleet size. Both appear on the Debug page. The lock
+instrumentation is one change at one place and covers all 139 lock sites in the
+Nodes database alone; it costs 0.8 microseconds an acquisition, which is why it
+is always on rather than behind a flag nobody turns on until it is too late.
 
 ### 5.4.0 — Eight asks
 
