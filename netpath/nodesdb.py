@@ -710,6 +710,29 @@ _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
                      "mac_table_interval_s", "lldp_interval_s", "poe_enabled",
                      "stp_enabled", "vlan_interval_s", "arp_table_interval_s")
 
+# These two are cleared to "" rather than NULL, so "" is also "inherit".
+_EMPTY_IS_UNSET = frozenset(("vendor_oid", "location_oid"))
+
+_OVERRIDES_SQL = "(" + " OR ".join(
+    f"({col} IS NOT NULL AND {col} != '')" if col in _EMPTY_IS_UNSET
+    else f"{col} IS NOT NULL" for col in _OVERRIDE_COLUMNS) + ")"
+
+
+def override_fields(row) -> tuple[str, ...]:
+    """The _OVERRIDE_COLUMNS a device row actually overrides. The one place
+    the NULL-vs-"" rule lives; _OVERRIDES_SQL must agree with it."""
+    keys = set(row.keys())
+    out = []
+    for col in _OVERRIDE_COLUMNS:
+        if col not in keys:
+            continue
+        value = row[col]
+        if value is None or (value == "" and col in _EMPTY_IS_UNSET):
+            continue
+        out.append(col)
+    return tuple(out)
+
+
 _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
                    "v3_auth_proto", "v3_priv_proto", "poll_interval_s",
                    "snmp_timeout_s",
@@ -1590,7 +1613,8 @@ class NodesDatabase(SqliteStore):
 
     def _device_filter_clause(self, group_id: int | None, status: str | None,
                               text: str | None, device_group_id: int | None,
-                              exclude_up: bool, only_ids=None) -> tuple[str, list]:
+                              exclude_up: bool, only_ids=None, exclude_ids=None,
+                              overrides_only: bool = False) -> tuple[str, list]:
         clauses, params = [], []
         if only_ids is not None:
             # A set of ids decided OUTSIDE this database — today, the devices
@@ -1610,6 +1634,13 @@ class NodesDatabase(SqliteStore):
                 ors.append(f"id IN ({','.join('?' * len(chunk))})")
                 params.extend(chunk)
             clauses.append(f"({' OR '.join(ors)})")
+        # Each NOT IN chunk is its own clause so the outer AND joins them;
+        # OR-ing them like only_ids would exclude nothing.
+        for chunk in _id_chunks(int(i) for i in (exclude_ids or ())):
+            clauses.append(f"id NOT IN ({','.join('?' * len(chunk))})")
+            params.extend(chunk)
+        if overrides_only:
+            clauses.append(_OVERRIDES_SQL)
         if group_id is not None:
             clauses.append("group_id = ?")
             params.append(group_id)
@@ -1674,11 +1705,13 @@ class NodesDatabase(SqliteStore):
     def devices(self, group_id: int | None = None, status: str | None = None,
                text: str | None = None, device_group_id: int | None = None,
                exclude_up: bool = False, only_ids=None, limit: int | None = None,
-               offset: int = 0) -> list[sqlite3.Row]:
+               offset: int = 0, exclude_ids=None,
+               overrides_only: bool = False) -> list[sqlite3.Row]:
         # `limit=None` runs no LIMIT clause at all, so an unpaged caller
         # gets the whole matching set back.
         where, params = self._device_filter_clause(
-            group_id, status, text, device_group_id, exclude_up, only_ids)
+            group_id, status, text, device_group_id, exclude_up, only_ids,
+            exclude_ids=exclude_ids, overrides_only=overrides_only)
         query = f"SELECT * FROM devices{where} ORDER BY name COLLATE NOCASE, ip"
         if limit is not None:
             query += " LIMIT ? OFFSET ?"
@@ -1688,16 +1721,60 @@ class NodesDatabase(SqliteStore):
 
     def devices_count(self, group_id: int | None = None, status: str | None = None,
                       text: str | None = None, device_group_id: int | None = None,
-                      exclude_up: bool = False, only_ids=None) -> int:
+                      exclude_up: bool = False, only_ids=None, exclude_ids=None,
+                      overrides_only: bool = False) -> int:
         """How many devices match, ignoring `limit`/`offset` — the same
         shape alertsdb.count_alerts already established for "how many
         pages is this", asked with the identical filter clause devices()
         itself builds so the two can never disagree about what matched."""
         where, params = self._device_filter_clause(
-            group_id, status, text, device_group_id, exclude_up, only_ids)
+            group_id, status, text, device_group_id, exclude_up, only_ids,
+            exclude_ids=exclude_ids, overrides_only=overrides_only)
         with self._lock:
             return int(self._conn.execute(
                 f"SELECT COUNT(*) FROM devices{where}", params).fetchone()[0])
+
+    def device_ids(self, status=None, only_ids=None,
+                   device_group_ids=None) -> set[int]:
+        clauses, params = [], []
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if only_ids is not None or device_group_ids is not None:
+            ids = [int(i) for i in (only_ids or ())]
+            gids = [int(i) for i in (device_group_ids or ())]
+            if not ids and not gids:
+                return set()
+            ors = []
+            for col, values in (("id", ids), ("device_group_id", gids)):
+                for chunk in _id_chunks(values):
+                    ors.append(f"{col} IN ({','.join('?' * len(chunk))})")
+                    params.extend(chunk)
+            clauses.append(f"({' OR '.join(ors)})")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT id FROM devices{where}", params).fetchall()
+        return {int(r[0]) for r in rows}
+
+    def device_ips_by_name(self, fragment: str, limit: int = 500) -> list[str]:
+        """Distinct IPs (own and aliases) of devices whose name or sys_name
+        contains `fragment`. Narrower than devices(text=...) on purpose."""
+        fragment = (fragment or "").strip()
+        if not fragment:
+            return []
+        like = f"%{fragment}%"
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ip FROM ("
+                " SELECT ip FROM devices WHERE name LIKE ? OR sys_name LIKE ?"
+                " UNION"
+                " SELECT a.ip FROM device_addresses a"
+                "  JOIN devices d ON d.id = a.device_id"
+                "  WHERE d.name LIKE ? OR d.sys_name LIKE ?"
+                ") ORDER BY ip LIMIT ?",
+                (like, like, like, like, int(limit))).fetchall()
+        return [r[0] for r in rows]
 
     def device(self, device_id: int) -> sqlite3.Row | None:
         with self._lock:
@@ -3925,7 +4002,8 @@ class NodesDatabase(SqliteStore):
         return self.max_device_event_id()
 
     def count_events_by_device(self, since: float,
-                               kinds: list[str] | None = None) -> list[sqlite3.Row]:
+                               kinds: list[str] | None = None,
+                               limit: int | None = None) -> list[sqlite3.Row]:
         """(device_id, name, ip, sys_name, display_name_source, n) for the
         devices with the most events since a wall-clock timestamp, busiest
         first — the "top offenders" question a dashboard asks once.
@@ -3939,6 +4017,10 @@ class NodesDatabase(SqliteStore):
             clauses.append(f"e.kind IN ({marks})")
             params.extend(kinds)
         where = " AND ".join(clauses)
+        tail = ""
+        if limit is not None:
+            tail = " LIMIT ?"
+            params.append(int(limit))
         with self._lock:
             return self._conn.execute(
                 f"SELECT e.device_id AS device_id, d.name AS name, d.ip AS ip,"
@@ -3946,7 +4028,7 @@ class NodesDatabase(SqliteStore):
                 f" COUNT(*) AS n FROM device_events e"
                 f" JOIN devices d ON d.id = e.device_id"
                 f" WHERE {where} GROUP BY e.device_id"
-                f" ORDER BY n DESC, d.name COLLATE NOCASE", params).fetchall()
+                f" ORDER BY n DESC, d.name COLLATE NOCASE{tail}", params).fetchall()
 
     def record_interface_event(self, interface_id: int, kind: str, detail: str = "") -> None:
         with self._lock:
