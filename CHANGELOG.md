@@ -260,9 +260,11 @@ failures once shared one message. The downgrade message says plainly
 that the check is new in 5.8.0 and is a policy change, not a fault the
 operator introduced. And there is an off switch: **Verify the signature
 on every SNMPv3 reply**, in Nodes settings (and its twin in Wireless
-settings), defaulting on; turning it off gives up the digest check and
-the downgrade refusal for every device — the pre-5.8.0 acceptance,
-exactly — and its hint says so, so it is used to keep polling one
+settings), defaulting on; turning it off gives up the downgrade refusal
+for every device — an unsigned answer to a signed request is accepted
+again, as it always was before 5.8.0 — but a reply that *does* carry a
+signature still has it checked, which is the one thing the old
+behaviour never did. Its hint says so, so it is used to keep polling one
 misbehaving agent while chasing it, not as a fix. A downgrade is not an
 authentication failure — the password was never contradicted, because
 there was no signature to contradict it — and **it is not an outage

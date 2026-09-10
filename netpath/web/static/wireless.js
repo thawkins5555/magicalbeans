@@ -418,8 +418,9 @@
           controllers. New in 5.8.0, and on by default: a signed request's reply must
           come back signed with the same key, and anything less is refused as a
           downgrade with the controller saying why. <b>Turning this off gives that up
-          for every controller</b> — a reply's signature is no longer checked and an
-          unsigned answer is accepted, as every release before 5.8.0 accepted it — so
+          for every controller</b> — an unsigned answer is accepted, as every release
+          before 5.8.0 accepted it, though a reply that does carry a signature is
+          still verified — so
           use it only to keep polling one controller that sits behind something
           that strips or breaks the signature while you chase that, not as a fix.</p>
       </fieldset>

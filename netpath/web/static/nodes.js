@@ -5974,9 +5974,10 @@
         <p class="hint">New in 5.8.0, and on by default. A signed request's reply
           must come back signed with the same key, and an encrypted request's
           reply encrypted; anything less is refused as a downgrade and the device
-          shows why. <b>Turning this off gives that up for every device</b> — a
-          reply's signature is no longer checked and an unsigned answer is
-          accepted, as every release before 5.8.0 accepted it — so use it only to
+          shows why. <b>Turning this off gives that up for every device</b> — an
+          unsigned answer is accepted, as every release before 5.8.0 accepted
+          it, though a reply that does carry a signature is still verified —
+          so use it only to
           keep polling one agent or proxy that answers unsigned while you chase
           that device, not as a fix.</p>
       </fieldset>
