@@ -59,7 +59,8 @@
       figure(c.down || 0, 'down', '#/nodes?status=down',
              { className: (c.down || 0) > 0 ? 'fail' : '' }),
       // Planned work, not a fault: neutral, and never folded into `down`.
-      figure(c.maintenance || 0, 'maintenance', '#/nodes?maintenance_only=1'),
+      figure(c.maintenance || 0, 'maintenance',
+             '#/nodes?maintenance_only=1&status=down'),
       figure(c.unknown || 0, 'unknown', '#/nodes?status=unknown'),
       figure(c.auth || 0, 'auth failed', '#/nodes?status=auth',
              { className: (c.auth || 0) > 0 ? 'warn' : '' }),

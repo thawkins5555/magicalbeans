@@ -3564,11 +3564,18 @@ def _maintenance_only_ids(service, params):
     """
     if params.get("maintenance_only") is None:
         return None
-    return [int(i) for i in service.alerts_db.maintenance_device_ids()]
+    # Windows count here as well as in the Dashboard figure: "in maintenance"
+    # has to mean the same thing in the filter as in the number that links to
+    # it, or the count and the list it opens disagree.
+    ids, group_ids = _planned_scope(service)
+    if not ids and not group_ids:
+        return []
+    return sorted(service.nodes_db.device_ids(only_ids=ids,
+                                              device_group_ids=group_ids))
 
 
-def _planned_down(service) -> set[int]:
-    """Down devices whose outage is planned: maintenance mode or an active
+def _planned_scope(service) -> tuple[set[int], set[int]]:
+    """Device ids and group ids covered by maintenance mode or an active
     window. A mute is not planned — that device is still down, only quiet."""
     ids = {int(i) for i in service.alerts_db.maintenance_device_ids()}
     group_ids: set[int] = set()
@@ -3581,6 +3588,13 @@ def _planned_down(service) -> set[int]:
             ids.update(int(i) for i in json.loads(row["scope_device_ids"] or "[]"))
         except (TypeError, ValueError):
             continue
+    return ids, group_ids
+
+
+def _planned_down(service) -> set[int]:
+    """Those of them that are actually down, which is what the fleet counts
+    move out of `down`."""
+    ids, group_ids = _planned_scope(service)
     if not ids and not group_ids:
         return set()
     return service.nodes_db.device_ids(status="down", only_ids=ids,
@@ -9485,6 +9499,9 @@ def _dashboard_fleet(service) -> dict:
     counts, planned = _fleet_counts(service)
     # device_name, not `name`: the raw column is the IP for a device nobody renamed.
     down_total = service.nodes_db.devices_count(status="down", exclude_ids=planned)
+    # One clause for both, so a poll landing between the two reads cannot leave
+    # the tile's count disagreeing with its own "and N more".
+    counts["down"] = down_total
     down = [{"device_id": row["id"],
              "name": namelookup.device_name(row) or row["ip"],
              "ip": row["ip"]}

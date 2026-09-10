@@ -232,7 +232,10 @@
 
   // Neutral, not warn-text: an override is configuration, not a fault.
   function overridesTitle(row) {
-    return `Overrides the polling profile for: ${(row.override_fields || []).join(', ')}`;
+    const fields = row.override_fields || [];
+    return fields.length
+      ? `Overrides the polling profile for: ${fields.join(', ')}`
+      : 'Overrides the polling profile';
   }
   function overridesTag(row) {
     if (!row.override_count) return '';
@@ -278,7 +281,7 @@
     { key: 'last_poll_ts', label: 'Last poll', width: 100, numeric: true, on: true,
       value: (r) => r.last_poll_ts || 0, cell: (r) => App.agoCell(r.last_poll_ts) },
     { key: 'overrides', label: 'Overrides', width: 90, numeric: true,
-      value: (r) => r.override_count || 0,
+      value: (r) => r.override_count || null,
       cell: (r) => (r.override_count
         ? `<span title="${escape(overridesTitle(r))}">${r.override_count}</span>`
         : '\u2014') },
