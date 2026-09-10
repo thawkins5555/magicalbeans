@@ -2283,11 +2283,29 @@ def _syslog_filters(service, params) -> dict:
     # syslogdb match those too.
     host = filters["host"].strip()
     if host:
-        ips = set(service.nodes_db.device_ips_by_name(host, SYSLOG_HOST_IP_CAP))
-        for row in service.app_db.search_hostnames(host, SYSLOG_HOST_IP_CAP):
-            ips.add(row["ip"])
-        filters["host_ips"] = sorted(ips)[:SYSLOG_HOST_IP_CAP]
+        filters["host_ips"] = _syslog_host_ips(service, host)
     return filters
+
+
+# Both lookups are leading-% LIKE scans no index can serve, and the Syslog
+# tab re-runs its search every couple of seconds while Live is on. One entry
+# is enough: a Live tick repeats the same fragment, and holding one keeps the
+# memo bounded where a per-fragment cache would grow with whatever is typed.
+_HOST_IP_MEMO: tuple = ("", 0.0, ())
+_HOST_IP_MEMO_TTL_S = 5.0
+
+
+def _syslog_host_ips(service, host: str) -> list:
+    fragment, stamped, cached = _HOST_IP_MEMO
+    now = time.time()
+    if fragment == host and now - stamped < _HOST_IP_MEMO_TTL_S:
+        return list(cached)
+    ips = set(service.nodes_db.device_ips_by_name(host, SYSLOG_HOST_IP_CAP))
+    for row in service.app_db.search_hostnames(host, SYSLOG_HOST_IP_CAP):
+        ips.add(row["ip"])
+    resolved = sorted(ips)[:SYSLOG_HOST_IP_CAP]
+    globals()["_HOST_IP_MEMO"] = (host, now, tuple(resolved))
+    return resolved
 
 
 def get_syslog_overview(service, params, body) -> dict:

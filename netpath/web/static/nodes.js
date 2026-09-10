@@ -712,9 +712,13 @@
       // otherwise land under "looks like an attempt at a MAC address".
       if (key === 'q') view.macSearchPending = true;
     }
-    if (query.offline !== undefined) {
-      App.el('nd-filter-offline').checked = query.offline === '1'
-        || query.offline === 'true';
+    for (const [id, key] of [['nd-filter-offline', 'offline'],
+                             ['nd-filter-maintenance', 'maintenance_only'],
+                             ['nd-filter-overrides', 'overrides_only']]) {
+      if (query[key] === undefined) continue;
+      const box = App.el(id);
+      if (!box) continue;
+      box.checked = query[key] === '1' || query[key] === 'true';
       filtered = true;
     }
     if (filtered) {
