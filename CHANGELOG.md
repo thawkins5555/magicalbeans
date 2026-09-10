@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.9.0 — Six asks](#590--six-asks)
 - [5.8.1 — The restart that fixed it](#581--the-restart-that-fixed-it)
 - [5.8.0 — The privacy password, and the reply nobody checked](#580--the-privacy-password-and-the-reply-nobody-checked)
 - [5.7.2 — The password that was never wrong](#572--the-password-that-was-never-wrong)
@@ -135,6 +136,126 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.9.0 — Six asks
+
+Six reports from the floor, and one of them changed what the Dashboard is
+allowed to call an outage.
+
+**A device in maintenance is no longer counted as down.** Putting a device
+into maintenance mode has always stopped it alerting; it never stopped the
+Dashboard counting it among the down. An operator taking a switch out for
+planned work watched the outage figure climb anyway, which is the opposite
+of what the button is for.
+
+The reason it survived this long is structural, and worth stating because it
+constrains the fix. Maintenance lives in `alerts.db` — `device_maintenance`
+for the indefinite kind, `maintenance_windows` for the scheduled kind. The
+fleet counts come from `nodes.db`. Two SQLite files, so no query can join
+them; the subtraction has to happen above both, which is what the Nodes
+device list already did and what the counts never learned to do. The same
+blind helper fed three places, so all three are fixed together: the Dashboard
+fleet tile, the Nodes tab's status strip, and the per-tab badge counts. A
+figure that disagreed with the tile beside it would read as a fresh bug.
+
+**Nothing vanishes.** Subtracting from `down` and stopping there would make
+devices disappear from the interface entirely, which is worse than
+overcounting them. Each of the three now carries its own `in maintenance`
+figure beside `down`, in a neutral colour — planned work is not a fault —
+linking to the same list filtered to it.
+
+**A manual mute still counts as down**, deliberately. A mute means "stop
+telling me"; maintenance means "this is planned". A muted device that is
+genuinely broken belongs in the outage figure, and folding the two together
+would have been the easier change and the wrong one.
+
+The fleet is never enumerated to work this out. Maintenance rows are few, and
+an active window names either a group or an explicit device list, so the
+candidate set comes from the windows themselves and one bounded query
+intersects it with what is actually down. With no maintenance and no active
+window — the ordinary case — it costs nothing at all.
+
+**The syslog Host box now searches the name on the screen.** There was
+already a Host filter, and it already matched partial names, but only against
+the hostname a device puts in its own syslog header — which is frequently
+blank, or the sending address repeated. The name an operator actually reads
+in the Host column is usually cross-referenced from Nodes or DNS while the
+page is being drawn, after the query has already chosen its rows, and was
+never written down anywhere. So searching for the name on screen returned
+nothing, for precisely the devices the cross-reference exists to help with.
+
+The typed fragment is now resolved first — against Nodes' own device names
+and the DNS reverse cache — and the addresses it could mean are matched
+alongside the self-reported host. Two consequences worth knowing: it works on
+log history already recorded, because nothing had to be stored to make it
+work; and a device that reports its own name is still found that way, so a
+fragment matching both returns both.
+
+**The Dashboard is faster while the pollers are busy.** Three separate
+causes, all of them the sort that only show up under load.
+
+It was the one aggregate page in the application recomputing everything from
+scratch on every request, while every open tab asked again every five
+seconds. It now shares one computation per two seconds across every tab, the
+way the tab badges have since they were split out for exactly this reason.
+Each section is cached separately and copied before it is handed out, because
+the response is redacted per account and a shared object would let one
+account's redaction become everybody's.
+
+It fetched up to five thousand and one complete alert rows in order to count
+how many there were of each severity. That is now one `GROUP BY`.
+
+And the "most events" list scanned a full day of events for the entire fleet,
+with no limit, twice per request, to show ten rows. The limit is now in the
+SQL.
+
+Measured in-process at a thousand devices, cold cache against warm: the
+dashboard route drops from 0.87 ms to 0.10 ms and the offenders route from
+1.07 ms to 0.08 ms, with the severity tally alone going from 4.15 ms to
+0.34 ms. Lock acquisitions per dashboard request fall from seven to two, and
+time spent waiting on those locks from 4.52 ms to 0.07 ms — the figure that
+matters here, because every read in the application takes its store's write
+lock and therefore queues behind the pollers' commits. The end-to-end HTTP
+timing barely moves, and that is not modesty: every route in that harness
+sits on a fixed ~44 ms keep-alive floor that has nothing to do with this
+work.
+
+**You can see which devices override their polling profile.** A device column
+left empty means "inherit from the profile"; filled in means this device
+disagrees. Twenty-five columns work that way, and until now the only way to
+discover that a device had been customised was to open its edit dialog and
+read the fields one at a time — so a device polling on its own interval,
+years after someone set it that way, was invisible.
+
+Three ways to see it now, deliberately not one. Devices that override
+anything are marked in the list itself, with the field names in the tooltip;
+there is a sortable `Overrides` column for auditing the fleet by how
+customised it is; and an **Only with overrides** filter. The marker rather
+than the column is the primary answer, because a newly added column is only
+shown by default to operators who have never opened the column picker — that
+is, the ones least likely to be looking for this. The count also rides along
+in the CSV export.
+
+**What else the Forti-AP module could poll: a costed answer, not a change.**
+`FORTIAP-POLLING-OPTIONS.md` surveys the per-AP data the module does not
+collect today, grouped by what each would cost: derivable from rows the
+poller already walks, one extra column sweep each, a new per-client table, or
+abandoning SNMP for the REST API. It ends with a recommendation and an
+ordering.
+
+The first recommendation is to measure before choosing anything — walk the
+three table subtrees on a production controller and keep the output — because
+this MIB has already been caught describing a radio's transmit power in dBm
+while reporting a percentage, and an options list built from MIB documents
+rather than from a live controller inherits that risk. The note is explicit
+about which candidates are verified in this tree and which are capabilities
+named without a column number attached.
+
+It also names two defects found while surveying, neither of them fixed here:
+the wireless test stub serves two OIDs fewer than the poller reads, so it is
+behind the code it tests; and the wireless collector schedules every
+controller for the same instant, the same phase-lock the node poller stopped
+having in this release.
 
 ### 5.8.1 — The restart that fixed it
 

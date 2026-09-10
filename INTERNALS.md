@@ -6953,6 +6953,22 @@ reports as offline is not probed at all, and `PING_BUDGET_S` bounds the whole
 controller's sweep so a rack of unreachable APs cannot each add a timeout to
 the poll cycle.
 
+### What else the controller could be asked for
+
+`FORTIAP-POLLING-OPTIONS.md` is a costed survey of the per-AP data this
+module does *not* collect, written for 5.9.0 and not implemented. It groups
+candidates by what they cost — derivable from rows already walked, one extra
+column walk each, a new per-client table, or the REST API — and recommends
+walking the three table subtrees on a production controller first, because
+this MIB has already been caught misdescribing its own units
+(`nodeoids.py`'s note on `fgWcWtpSessionRadioOperatingPower`).
+
+Two defects it names in passing: `tests/stubs/wireless_stub_agent.py` serves
+neither `WTP_SESSION_IP` nor `WTP_RADIO_MODE`, so the stub is behind the
+poller it tests; and `_loop` seeds every controller's due time with
+`next_run.get(id, 0)` and takes `now` once per pass, so all controllers stay
+phase-locked — the shape the node poller stopped having in 5.9.0.
+
 ## ConfigRX (`configrxdb.py`, `configrx.py`)
 
 **No device table of its own.** Per the explicit product decision,

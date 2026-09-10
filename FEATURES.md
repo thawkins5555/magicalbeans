@@ -335,7 +335,7 @@ the application already had, refreshed on the interval in
 
 | Tile | Shows |
 | --- | --- |
-| Fleet | Total devices, and how many are up, down, unknown or failing authentication; underneath, the down devices themselves by name (up to ten, with "and N more" linking to the rest) and the poll pool's busy and queued worker counts |
+| Fleet | Total devices, and how many are up, down, in maintenance, unknown or failing authentication; underneath, the down devices themselves by name (up to ten, with "and N more" linking to the rest) and the poll pool's busy and queued worker counts |
 | Open alerts | The count by severity, coloured by the worst severity open rather than by the total, so one severity-1 outage is never hidden behind forty notices |
 | Workers | Every background process, by the noun its own tab uses — the Nodes poller, the alert engine, the NetFlow collector, the SNMP trap receiver, the Syslog collector, the IPAM worker, the Wireless poller, the ConfigRX worker: running or not, how much each has taken in, and every one of its counters that is not zero — dropped, dropped by the kernel, throttled, failed or unverified authentication, over the varbind limit, TCP connections refused, errors |
 | Storage headroom | Each database against its own size cap |
@@ -350,6 +350,14 @@ zero: the Dashboard is the one tab that is always visible, and it omits
 what the account has no grant for rather than showing a number that would
 be a lie. The six 24-hour lists are refreshed on a slower cadence than the
 tiles, since they are history rather than live state.
+
+**Planned work is not an outage.** A device in maintenance mode, or inside an
+active maintenance window, is not counted among the down — on this tile, on
+the Nodes status strip, or in the tab badges. It is shown as its own
+`in maintenance` figure beside the down count rather than disappearing, and
+that figure links to the same list filtered to it. A device you have merely
+*muted* still counts as down: a mute silences a fault, maintenance declares
+there isn't one.
 
 **The Worst ten lists name a device the way Nodes itself does.** A device
 discovered by IP has a raw `name` equal to its IP until someone renames it,
@@ -634,10 +642,29 @@ own subtabs.
 - **A "Only offline" checkbox** on the Devices filter bar shows devices
   whose status isn't `up` (down, unknown, unsupported, or auth-failed) —
   combinable with the Profile/Group/Status filters alongside it.
+- **You can see which devices override their polling profile.** Any of the
+  twenty-five inherited settings a device sets for itself marks it in the
+  list, with the field names in the tooltip; an **Only with overrides**
+  checkbox filters to them, a sortable **Overrides** column (off by default,
+  in the column picker) counts them for auditing, and the count is in the
+  CSV export. Until now the only way to find a device polling on its own
+  interval was to open its edit dialog and read the fields one at a time.
 - **The scheduler is shaped like NetPath's own trace `Monitor`**, not
   IPAM's worker: a hot-resizable thread pool, and restart-safe per-device
-  due-time seeding from each device's own last poll time, so a restart
-  with hundreds of devices configured does not fire all of them at once.
+  due-time seeding from each device's own last poll time.
+- **Polls are staggered, so the fleet doesn't arrive all at once.** Seeding
+  from the last poll time is only restart-safe while the service was down
+  for less than one poll interval; past that, every device is overdue at
+  once and the whole fleet lands on the pollers in a single pass. Worse, it
+  stayed that way — devices that came due together were all given the same
+  next due time, so a fleet that started in step never fell out of step.
+  Two spreads fix it: a device overdue at startup is given a moment inside
+  the next half minute rather than firing immediately, and every device's
+  first reschedule after that is pulled somewhere into the second half of
+  its interval, once, which breaks the shared phase for good. Both only ever
+  move a poll *earlier*, so nothing is polled less often than its profile
+  says. A device that has never been polled — one you just added — still
+  polls on the next pass, unspread.
 - **The selected device polls fast while you watch it** — selecting a
   device drops its SNMP poll cadence to a configurable few seconds
   (Nodes → Settings, "Selected-device poll interval"; default 3 s, 0
@@ -2514,6 +2541,15 @@ A collector, a search, and an hourly histogram.
   self-reported hostname is never overridden, only filled in when
   missing, and this always runs — unlike the Source column's resolved
   name, it isn't gated by **Resolve sending addresses to names**.
+- **The Host box searches that filled-in name too.** Because the
+  cross-referenced name is worked out while the page is drawn and never
+  stored on the message, searching for the name shown in the Host column
+  used to find nothing — exactly for the devices the fallback above exists
+  to help. The typed fragment is now resolved first, against Nodes' device
+  names and the reverse-DNS cache, and messages from any address it could
+  mean are matched alongside those that self-reported the name. Partial
+  names work, case does not matter, and it applies to log history already
+  collected, since nothing had to be stored to make it work.
 - **The message table resizes**, the same way NetFlow's flow record table
   does. Drag the edge of a heading to widen or narrow the column; the
   widths are remembered per browser, and **Reset layout** on the Settings
