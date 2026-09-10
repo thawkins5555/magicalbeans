@@ -20,9 +20,19 @@ therefore a working cryptography, and runs this for real.
   5. a tampered message is SnmpAuthError before any decryption; an
      unsigned reply to a signed request is SnmpDowngrade, whose message
      says it is new in 5.8.0 and names the setting; verify=False accepts
-     both, the pre-5.8.0 behaviour;
+     the unsigned reply — and STILL refuses the tampered one, because a
+     digest that is present is always checked;
   6. Reports are exempt: an unauthenticated Report decodes with keys given;
-  7. context_name is carried through.
+  7. context_name is carried through;
+  8. the decryption oracle is closed: a reply claiming privacy without
+     authentication never reaches the cipher, and a wrong privacy key's
+     message is a fixed sentence — the parser's "got 0x.." (the first
+     decrypted byte) is not in it;
+  9. the request-id check comes BEFORE the digest on an unencrypted reply
+     (a stray is SnmpStray, never SnmpAuthError) and after it on an
+     encrypted one, where the id is inside the ciphertext;
+ 10. SnmpDowngrade is not an SnmpAuthError, and the availability probe
+     rejects a real `cryptography` backend in CFB8 mode.
 """
 import sys
 
@@ -36,8 +46,8 @@ if not snmpcrypt.available():
     raise SystemExit(77)
 
 from netpath.snmppoll import (  # noqa: E402
-    FLAG_AUTH, FLAG_PRIV, SnmpAuthError, SnmpDowngrade, SnmpPrivError,
-    SnmpUnsupported, build_v3_request, decode_response, find_auth_span,
+    FLAG_AUTH, FLAG_PRIV, SnmpAuthError, SnmpDowngrade, SnmpError, SnmpPrivError,
+    SnmpStray, SnmpUnsupported, build_v3_request, decode_response, find_auth_span,
     scoped_pdu, sign_v3)
 from netpath.trapdecode import (  # noqa: E402
     PDU_GET, PDU_GETBULK, PDU_REPORT, Reader, T_OCTET_STRING, T_SEQUENCE,
@@ -248,19 +258,25 @@ except SnmpDowngrade as exc:
           "unencrypted" in str(exc), str(exc))
 accepted = decode_response(unsigned, auth_proto="SHA", auth_key=AUTH_KEY, verify=False)
 check("verify=False (the v3_verify_replies setting off) accepts the unsigned "
-      "reply — the pre-5.8.0 behaviour, exactly",
+      "reply — what every release before 5.8.0 did",
       accepted.request_id == 22 and accepted.auth_verified is False)
+accepted = decode_response(signed_only, auth_proto="SHA", auth_key=AUTH_KEY,
+                           priv_proto="AES", priv_key=PRIV_KEY, verify=False)
+check("...and the unencrypted reply to an encrypted request, with its digest "
+      "still verified", accepted.request_id == 22 and accepted.auth_verified is True)
 try:
-    accepted = decode_response(tampered, auth_proto="SHA", auth_key=AUTH_KEY,
-                               priv_proto="AES", priv_key=PRIV_KEY, verify=False)
-    unverified = accepted.auth_verified is False
-except SnmpPrivError:
-    unverified = True          # decrypted unread garbage instead — still not verified
+    decode_response(tampered, auth_proto="SHA", auth_key=AUTH_KEY,
+                    priv_proto="AES", priv_key=PRIV_KEY, verify=False)
+    check("...but a digest that IS present is still checked with verify=False", False,
+          "the tampered message was accepted")
 except SnmpAuthError:
-    unverified = False
-check("...and with verify=False a bad digest is not checked either: the tampered "
-      "message is decrypted, not refused — the cost the setting's hint describes",
-      unverified)
+    check("...but a digest that IS present is still checked with verify=False: "
+          "the setting relaxes only the downgrade refusal, so the tampered "
+          "authPriv message is refused before the cipher — an unverified "
+          "ciphertext never reaches it on request", True)
+except SnmpPrivError as exc:
+    check("...but a digest that IS present is still checked with verify=False",
+          False, f"decrypted instead: {exc}")
 
 print("\n-- Reports are exempt")
 report_pdu = _tlv(PDU_REPORT, enc_int(0) + enc_int(0) + enc_int(0) + _tlv(
@@ -290,6 +306,168 @@ check("default context_name is b'' — the pinned bytes in test_snmpv3_keys "
       "already prove the no-priv path is unchanged",
       b"vsys1" not in build_v3_request(1, 1, PDU_GET, OIDS, engine_id=ENGINE,
                                        engine_boots=1, engine_time=1, user="u"))
+
+
+# ===================================== § 8 the decryption oracle
+
+print("\n-- privacy without authentication never reaches the cipher")
+# The authPriv message from § 3 with the AUTH bit cleared in msgFlags: an
+# attacker's shape, since USM has no privNoAuth. Before the fix this fell
+# through the digest check (only run under FLAG_AUTH) straight into the
+# cipher, with an IV and ciphertext of the sender's choosing.
+top = Reader(message)
+bs, be = top.expect(T_SEQUENCE)
+body = Reader(message, bs, be)
+body.read_tlv()
+hs, he = body.expect(T_SEQUENCE)
+header = Reader(message, hs, he)
+header.read_tlv(); header.read_tlv()
+fs, fe = header.expect(T_OCTET_STRING)
+priv_no_auth = bytearray(message)
+priv_no_auth[fs] = FLAG_PRIV
+priv_no_auth = bytes(priv_no_auth)
+cipher_calls = []
+real_decrypt = snmpcrypt.decrypt
+
+
+def spying_decrypt(*args, **kwargs):
+    cipher_calls.append(args)
+    return real_decrypt(*args, **kwargs)
+
+
+snmpcrypt.decrypt = spying_decrypt
+try:
+    try:
+        decode_response(priv_no_auth, auth_proto="SHA", auth_key=AUTH_KEY,
+                        priv_proto="AES", priv_key=PRIV_KEY)
+        check("FLAG_PRIV without FLAG_AUTH is refused", False, "accepted")
+    except (SnmpAuthError, SnmpPrivError, SnmpDowngrade) as exc:
+        check("FLAG_PRIV without FLAG_AUTH is refused as plain garbage, not as a "
+              "verdict", False, f"{type(exc).__name__}: {exc}")
+    except SnmpError as exc:
+        check("FLAG_PRIV without FLAG_AUTH is a plain SnmpError — garbage from the "
+              "right address, which _Session drops and waits past (RFC 3412 s7.2)",
+              "RFC 3412" in str(exc) and "discarded" in str(exc), str(exc))
+    check("...and the cipher was never called with it", cipher_calls == [], cipher_calls)
+    # The same with no keys at all, and with verify=False: the check is
+    # structural and does not depend on what the caller holds.
+    for kwargs in ({}, {"auth_proto": "SHA", "auth_key": AUTH_KEY, "priv_proto": "AES",
+                        "priv_key": PRIV_KEY, "verify": False}):
+        try:
+            decode_response(priv_no_auth, **kwargs)
+            refused = False
+        except SnmpError:
+            refused = True
+    check("...whatever keys are given and with verify=False too", refused and cipher_calls == [])
+finally:
+    snmpcrypt.decrypt = real_decrypt
+
+print("\n-- a wrong privacy key's message is a fixed sentence")
+try:
+    decode_response(message, auth_proto="SHA", auth_key=AUTH_KEY,
+                    priv_proto="AES", priv_key=WRONG_PRIV)
+    check("wrong privacy key raises", False)
+except SnmpPrivError as exc:
+    text = str(exc)
+    check("the message carries no parser detail: no 'expected', no 'got 0x', no "
+          "hex byte — the first decrypted byte stays out of the device row, the "
+          "API and the alert email",
+          "expected" not in text and "got" not in text and "0x" not in text
+          and text.endswith(")"), text)
+# Many wrong keys, one message: were the plaintext leaking, the sentence
+# would differ between keys (a different first byte each time).
+messages = set()
+for n in range(8):
+    try:
+        decode_response(message, auth_proto="SHA", auth_key=AUTH_KEY, priv_proto="AES",
+                        priv_key=privacy_key("SHA", f"wrong-{n}", ENGINE))
+    except SnmpPrivError as exc:
+        messages.add(str(exc))
+check("eight wrong keys give one identical message", len(messages) == 1, messages)
+# Decrypting with no auth key given (the stub's own inbound path) must not
+# claim the signature verified.
+try:
+    decode_response(message, priv_proto="AES", priv_key=WRONG_PRIV)
+except SnmpPrivError as exc:
+    check("without an auth key the message says the signature was NOT checked, "
+          "rather than asserting the authentication password is fine",
+          "not checked" in str(exc) and "not the problem" not in str(exc), str(exc))
+
+
+# ===================================== § 9 the request id and the digest
+
+print("\n-- unencrypted: id first, then the digest; encrypted: digest first")
+# signed_only carries request id 22 and a digest under AUTH_KEY.
+try:
+    decode_response(signed_only, auth_proto="SHA", auth_key=wrong_auth,
+                    expect_request_id=424242)
+    check("a stray raises", False)
+except SnmpStray:
+    check("an unencrypted reply with a wrong-key digest AND a foreign request id "
+          "is SnmpStray — the id is in the clear and is checked first, so a "
+          "spoofed datagram is a dropped stray, not an auth alert", True)
+except SnmpAuthError as exc:
+    check("an unencrypted stray is SnmpStray, not SnmpAuthError", False, str(exc))
+try:
+    decode_response(signed_only, auth_proto="SHA", auth_key=wrong_auth,
+                    expect_request_id=22)
+    check("the right id with a wrong key raises", False)
+except SnmpAuthError:
+    check("...the same reply with OUR request id is SnmpAuthError: the digest is "
+          "still checked once the id matches", True)
+try:
+    decode_response(message, auth_proto="SHA", auth_key=wrong_auth, priv_proto="AES",
+                    priv_key=PRIV_KEY, expect_request_id=424242)
+    check("an encrypted stray with a bad digest raises", False)
+except SnmpAuthError:
+    check("an ENCRYPTED reply with a bad digest is SnmpAuthError whatever id it "
+          "carries — the id is inside the ciphertext, so only the digest can come "
+          "first there", True)
+except SnmpStray:
+    check("an encrypted reply's id cannot be read before the digest", False)
+try:
+    decode_response(message, auth_proto="SHA", auth_key=AUTH_KEY, priv_proto="AES",
+                    priv_key=PRIV_KEY, expect_request_id=424242)
+    check("an encrypted, verified stray raises", False)
+except SnmpStray:
+    check("...and once verified and decrypted, a foreign id is SnmpStray", True)
+check("no expect_request_id means no id check (the stub decodes inbound "
+      "requests this way)",
+      decode_response(signed_only, auth_proto="SHA", auth_key=AUTH_KEY).request_id == 22)
+check("a Report is exempt from the id check (it answers the msgID, not the "
+      "request id)",
+      decode_response(report, auth_proto="SHA", auth_key=AUTH_KEY,
+                      expect_request_id=424242).pdu_tag == PDU_REPORT)
+
+
+# ===================================== § 10 the types, and CFB8
+
+print("\n-- SnmpDowngrade is its own type; CFB8 is not the cipher")
+check("SnmpDowngrade is not an SnmpAuthError (test_snmpv3_priv catches it "
+      "first, so the except order above could not tell)",
+      not issubclass(SnmpDowngrade, SnmpAuthError))
+real_loader = snmpcrypt._load_backend
+
+
+def cfb8_backend():
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+    try:
+        from cryptography.hazmat.decrepit.ciphers.modes import CFB8
+    except ImportError:
+        from cryptography.hazmat.primitives.ciphers.modes import CFB8
+    return Cipher, algorithms.AES, CFB8
+
+
+snmpcrypt._load_backend = cfb8_backend
+try:
+    check("the real cryptography backend in CFB8 mode — which round-trips "
+          "perfectly and pads nothing — fails the known-answer probe",
+          snmpcrypt.available(recheck=True) is False
+          and "known-answer" in snmpcrypt.unavailable_reason(),
+          snmpcrypt.unavailable_reason())
+finally:
+    snmpcrypt._load_backend = real_loader
+check("...and the real backend is back", snmpcrypt.available(recheck=True) is True)
 
 print()
 if FAILS:

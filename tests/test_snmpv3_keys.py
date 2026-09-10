@@ -31,6 +31,7 @@ import hmac
 import os
 import sys
 import threading
+import time
 
 import _paths  # noqa: F401  (puts the repo root on sys.path)
 
@@ -188,12 +189,30 @@ check("...none all-zero, all 8 bytes",
 # is the one thing in this module that must not be wrong: two poll workers
 # drawing the same salt under one key is the IV reuse the whole design
 # exists to rule out. A single-threaded loop cannot tell whether the lock
-# is there, so this one races eight threads for the counter with the
-# interpreter switching as often as it can, and asks for every salt to be
-# distinct. Without the lock, dozens repeat.
-THREADS, PER_THREAD = 8, 20_000
+# is there — and neither, it turns out, can a plain racing one: CPython
+# switches threads only at particular bytecodes (function entry, backward
+# jumps), and none of those falls between the counter's read and its
+# write, so eight threads racing with the switch interval at its minimum
+# drew 160,000 distinct salts from an unlocked counter, three runs out of
+# three. The language promises none of that; it is an accident of one
+# interpreter's eval loop, and the lock is what makes the code right
+# rather than lucky. So the interleaving is injected: a trace hook that
+# yields the GIL at every line boundary INSIDE next_salt (and nowhere
+# else), which puts a thread switch exactly where the arithmetic is
+# half done. With the lock held across the function, the yield lets no
+# other thread past the acquire; without it, the thread that stored N
+# yields, the next stores N+1, and both return N+1.
+THREADS, PER_THREAD = 4, 60
 drawn: list[list[bytes]] = [[] for _ in range(THREADS)]
 start = threading.Barrier(THREADS)
+
+
+def yield_between_lines(frame, event, arg):
+    if frame.f_code is not snmpcrypt.next_salt.__code__:
+        return None                 # trace nothing else
+    if event == "line":
+        time.sleep(0.001)           # releases the GIL; a real switch, every time
+    return yield_between_lines
 
 
 def draw(bucket: list) -> None:
@@ -201,8 +220,7 @@ def draw(bucket: list) -> None:
     bucket.extend(snmpcrypt.next_salt() for _ in range(PER_THREAD))
 
 
-previous_interval = sys.getswitchinterval()
-sys.setswitchinterval(1e-6)
+threading.settrace(yield_between_lines)
 try:
     workers = [threading.Thread(target=draw, args=(bucket,)) for bucket in drawn]
     for worker in workers:
@@ -210,10 +228,11 @@ try:
     for worker in workers:
         worker.join()
 finally:
-    sys.setswitchinterval(previous_interval)
+    threading.settrace(None)
 raced = [s for bucket in drawn for s in bucket]
-check(f"{THREADS} threads x {PER_THREAD} next_salt() calls, racing, give "
-      f"{THREADS * PER_THREAD} distinct salts (the _salt_lock is load-bearing)",
+check(f"{THREADS} threads x {PER_THREAD} next_salt() calls, each yielding the "
+      f"GIL mid-function, give {THREADS * PER_THREAD} distinct salts (the "
+      f"_salt_lock is load-bearing)",
       len(set(raced)) == len(raced) == THREADS * PER_THREAD,
       f"{len(raced) - len(set(raced))} repeated")
 src = open(os.path.join(_paths.REPO_ROOT, "netpath", "snmpcrypt.py"), encoding="utf-8").read()

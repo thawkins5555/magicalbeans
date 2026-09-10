@@ -299,10 +299,17 @@ try:
           "new in 5.8.0" in error and "Verify the signature on every SNMPv3 reply" in error,
           error)
     check("...and it is NOT filed as an auth failure — the password was never "
-          "contradicted — nor as unsupported",
+          "contradicted — nor as unsupported, nor as an error: it has a count "
+          "of its own",
           "auth_fail" not in kinds(db, did) and poller.counters["auth_fail"] == 0
-          and row["status"] != "unsupported" and poller.counters["errors"] == 1,
+          and row["status"] != "unsupported" and poller.counters["errors"] == 0
+          and poller.counters["downgraded"] == 1,
           (kinds(db, did), poller.counters))
+    check("...the device is UP — it answered every request — and the event is "
+          "snmp_downgrade, not down (test_snmpv3_diagnostics polls this through "
+          "to the outage threshold)",
+          row["status"] == "up" and "snmp_downgrade" in kinds(db, did)
+          and "down" not in kinds(db, did), (row["status"], kinds(db, did)))
     result = api.post_nodes_device_test(FakeService(db), {}, {}, did)
     snmp = result["snmp"]
     check("the Test reports the same refusal with auth not proven either way",
@@ -315,6 +322,9 @@ try:
     check("with v3_verify_replies off the same unsigned reply is accepted — the "
           "pre-5.8.0 behaviour, for the operator with one such device",
           row["snmp_ok"] == 1 and not row["snmp_error"], row["snmp_error"])
+    check("...and that poll records snmp_verified, the event that clears the "
+          "device_downgrade alert",
+          kinds(db, did).count("snmp_verified") == 1, kinds(db, did))
     result = api.post_nodes_device_test(FakeService(db, {"v3_verify_replies": False}), {}, {}, did)
     check("...and the Test honours the setting too", result["snmp"]["ok"] is True, result["snmp"])
 finally:

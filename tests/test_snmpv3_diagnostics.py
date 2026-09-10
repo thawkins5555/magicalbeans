@@ -26,11 +26,34 @@ a digest (--auth-pass) and refuse an accepted request (--require-priv):
   6. engine discovery failing says that discovery was the phase;
   7. no message ever carries the community, the password or a key.
 
-There was no SNMPv3 suite at all before this one, which is how the fault
-shipped.
+And, since the 5.8.0 reply verification, the failures that verification
+itself can produce — none of which needs a cipher, so none skips:
+
+  8. a datagram from the right address with a wrong-key digest and a
+     request id we never sent is a dropped stray (the wait continues),
+     not an SnmpAuthError — the id is checked before the digest wherever
+     it can be read in the clear;
+  9. a Report under an engine id we did not send is not learned and does
+     not file the device as unsupported; only unknownEngineIDs may teach
+     a new id;
+ 10. an access_denied after an auth_fail records auth_ok: the agent's own
+     word that the password is right closes the alert that said it wasn't;
+ 11. a device answering unsigned to a signed request stays UP through the
+     outage threshold, records snmp_downgrade once and never down or
+     snmp_error, and snmp_verified when replies verify again — with the
+     device_downgrade rule and its CLEARS pair wired;
+ 12. a contradicted credential (downgrade, or a digest this end refused)
+     does not rotate onto the next candidate, and a sweep that ends in an
+     alternate's timeout still reports the primary's named refusal;
+ 13. an snmp_version of None is the v2c default, not a TypeError that
+     freezes the device;
+ 14. an authentication blob that will not decrypt raises rather than
+     polling unsigned — and a v2c profile carrying a stale blob does not.
 """
 import os
+import socket
 import sys
+import threading
 import time
 
 # Before any netpath import: off Windows dpapi.protect() is the portable
@@ -41,14 +64,18 @@ import _paths  # noqa: F401  (puts the repo root on sys.path)
 from _paths import free_udp_port, spawn_stub, tmpdir
 
 import netpath.nodepoll as nodepoll_mod
-from netpath import dpapi, nodeoids
+from netpath import alertrules, alertsdb, dpapi, nodeoids
 from netpath.nodepoll import (
-    NodePoller, _AuthFailure, _Session, access_denied_reason,
-    discover_engine, refused_oid, security_level, v3_exchange)
+    NodePoller, _AuthFailure, _Session, access_denied_reason, credential_for,
+    discover_engine, refused_oid, security_level, snmp_version_of, v3_exchange)
 from netpath.nodesdb import NodesDatabase
 from netpath.snmppoll import (
-    PDU_GET, PDU_REPORT, Response, SnmpAccessDenied, SnmpError,
-    SnmpUnsupported)
+    PDU_GET, PDU_REPORT, Response, SnmpAccessDenied, SnmpAuthError,
+    SnmpDowngrade, SnmpError, SnmpTimeout, SnmpUnsupported, _v3_message,
+    build_v3_request, decode_response)
+from netpath.trapdecode import (
+    T_COUNTER32, T_SEQUENCE, _tlv, enc_int, enc_octets, enc_unsigned,
+    enc_varbind, localized_key)
 from netpath.web import api
 
 TMP = tmpdir("snmpv3_diag_")
@@ -447,6 +474,352 @@ check("...and nothing else in testDevice assigns innerHTML",
       body.count(".innerHTML") == 1, body.count(".innerHTML"))
 check("the catch arm keeps textContent for the transport error",
       "result.textContent = `Error: ${error.message}`" in body)
+
+
+# ===================================== § 8 a stray before the digest
+
+print("\n-- a spoofed datagram with a foreign request id is a stray, not an auth alert")
+
+
+class FakeAgent:
+    """A loopback UDP peer answering every datagram with whatever
+    `answer(data)` returns — for the two faults the stub cannot stage: a
+    datagram that answers nothing we sent, and a Report under an engine
+    id that is not the agent's."""
+
+    def __init__(self, answer):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.port = self.sock.getsockname()[1]
+        self.answer = answer
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                data, addr = self.sock.recvfrom(65535)
+            except OSError:
+                return
+            for reply in self.answer(data) or ():
+                self.sock.sendto(reply, addr)
+
+    def close(self):
+        self.sock.close()
+
+
+FAKE_ENGINE = b"\x80\x00\x1f\x88\x80fake-engine"
+FORGED_ENGINE = b"\x80\x00\x1f\x88\x80forged"
+RIGHT_KEY = localized_key("SHA", PASSWORD, FAKE_ENGINE)
+WRONG_KEY = localized_key("SHA", WRONG, FAKE_ENGINE)
+USM_UNSUPPORTED = "1.3.6.1.6.3.15.1.1.1.0"
+USM_NOT_IN_TIME = "1.3.6.1.6.3.15.1.1.2.0"
+USM_UNKNOWN_ENGINE = "1.3.6.1.6.3.15.1.1.4.0"
+
+
+def report_under(engine_id: bytes, boots: int, engine_time: int, oid: str) -> bytes:
+    """An unsigned Report-PDU naming `oid`, under any engine id at all."""
+    pdu = _tlv(PDU_REPORT, enc_int(0) + enc_int(0) + enc_int(0) + _tlv(
+        T_SEQUENCE, enc_varbind(oid, enc_unsigned(T_COUNTER32, 1))))
+    return _v3_message(1, flags=0, engine_id=engine_id, engine_boots=boots,
+                       engine_time=engine_time, user="", auth_placeholder_len=0,
+                       priv_params=b"",
+                       scoped=_tlv(T_SEQUENCE, enc_octets(engine_id) + enc_octets("") + pdu))
+
+
+# The reviewers' reproduction: FLAG_AUTH, a wrong-key digest, request id
+# 424242 while ours is 1000. Before the fix: SnmpAuthError with dropped=0;
+# before 5.8.0: dropped, and the wait continued.
+spoof = build_v3_request(1, 424242, PDU_GET, [SYS_DESCR], engine_id=FAKE_ENGINE,
+                         engine_boots=1, engine_time=1, user="poller",
+                         auth_proto="SHA", auth_key=WRONG_KEY)
+agent = FakeAgent(lambda data: [spoof])
+session = _Session("127.0.0.1", agent.port, 0.4, 0)
+ours = build_v3_request(2, 1000, PDU_GET, [SYS_DESCR], engine_id=FAKE_ENGINE,
+                        engine_boots=1, engine_time=1, user="poller",
+                        auth_proto="SHA", auth_key=RIGHT_KEY)
+try:
+    try:
+        session.request(ours, 1000, auth_proto="SHA", auth_key=RIGHT_KEY)
+        check("the spoof is not accepted", False)
+    except SnmpTimeout:
+        check("a wrong-key datagram answering request id 424242 while we wait on "
+              "1000 is dropped and the wait continues: SnmpTimeout, dropped == 1",
+              session.dropped == 1, session.dropped)
+    except SnmpAuthError as exc:
+        check("a stray with a bad digest is dropped, not raised as an auth failure",
+              False, str(exc))
+    right_id = build_v3_request(1, 1000, PDU_GET, [SYS_DESCR], engine_id=FAKE_ENGINE,
+                                engine_boots=1, engine_time=1, user="poller",
+                                auth_proto="SHA", auth_key=WRONG_KEY)
+    agent.answer = lambda data: [right_id]
+    try:
+        session.request(ours, 1000, auth_proto="SHA", auth_key=RIGHT_KEY)
+        check("a bad digest on OUR id is refused", False)
+    except SnmpAuthError:
+        check("...while the same datagram carrying OUR request id is SnmpAuthError: "
+              "the digest is still checked once the id says it is ours", True)
+finally:
+    session.close()
+    agent.close()
+
+
+# ===================================== § 9 a Report under a foreign engine id
+
+print("\n-- a forged Report teaches nothing; only unknownEngineIDs may")
+
+
+def forger(oid: str):
+    """Answers discovery honestly (unknownEngineIDs under the real engine)
+    and every signed request with a Report naming `oid` under an engine id
+    we never sent, boots 99 — the poisoned cache the forgery is after."""
+    def answer(data):
+        if not decode_response(data).engine_id:
+            return [report_under(FAKE_ENGINE, 3, 100, USM_UNKNOWN_ENGINE)]
+        return [report_under(FORGED_ENGINE, 99, 1, oid)]
+    return answer
+
+
+agent = FakeAgent(forger(USM_NOT_IN_TIME))
+session = _Session("127.0.0.1", agent.port, 0.4, 0)
+learned = []
+try:
+    try:
+        v3_exchange(session, PDU_GET, [SYS_DESCR], identity="poller", auth_proto="SHA",
+                    password=PASSWORD, engine=(FAKE_ENGINE, 3, 100), ip="127.0.0.1",
+                    learned=lambda *e: learned.append(e))
+        check("a forged Report on every attempt ends the exchange", False)
+    except _AuthFailure as exc:
+        check("a Report under a foreign engine id on both attempts is a named "
+              "refusal, as a Report twice always was",
+              exc.usm_name == "notInTimeWindows", (exc.usm_name, str(exc)))
+    check("...but the forged engine id (boots 99) was never learned: the retry "
+          "rediscovered instead, and only discovery's real engine reached the cache",
+          learned == [(FAKE_ENGINE, 3, 100)], learned)
+finally:
+    session.close()
+    agent.close()
+
+agent = FakeAgent(forger(USM_UNSUPPORTED))
+session = _Session("127.0.0.1", agent.port, 0.4, 0)
+try:
+    try:
+        v3_exchange(session, PDU_GET, [SYS_DESCR], identity="poller", auth_proto="SHA",
+                    password=PASSWORD, engine=(FAKE_ENGINE, 3, 100), ip="127.0.0.1")
+        check("a forged unsupportedSecLevels ends the exchange", False)
+    except SnmpUnsupported as exc:
+        check("a forged unsupportedSecLevels under a foreign engine id does NOT file "
+              "the device as unsupported (a week-long alert from one datagram)",
+              False, str(exc))
+    except _AuthFailure:
+        check("a forged unsupportedSecLevels under a foreign engine id does NOT file "
+              "the device as unsupported (a week-long alert from one datagram)", True)
+finally:
+    session.close()
+    agent.close()
+
+# The legitimate shape: the same Report under the engine id we sent.
+agent = FakeAgent(lambda data: [report_under(FAKE_ENGINE, 3, 100, USM_UNSUPPORTED)])
+session = _Session("127.0.0.1", agent.port, 0.4, 0)
+try:
+    try:
+        v3_exchange(session, PDU_GET, [SYS_DESCR], identity="poller", auth_proto="SHA",
+                    password=PASSWORD, engine=(FAKE_ENGINE, 3, 100), ip="127.0.0.1")
+        check("a genuine unsupportedSecLevels is SnmpUnsupported", False)
+    except SnmpUnsupported:
+        check("...while unsupportedSecLevels under the engine id we sent is "
+              "SnmpUnsupported, as the stub's own is", True)
+finally:
+    session.close()
+    agent.close()
+
+
+# ===================================== § 10 auth_ok on the agent's own word
+
+print("\n-- a fixed password refused by VACM still closes the auth alert")
+stub, port = spawn_stub("stub_agent_iftable.py", "v3", "--auth-pass", PASSWORD,
+                        "--require-priv")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db, did = new_v3_db("authok", WRONG)
+    poller = NodePoller(db)
+    poller.log = CaptureLog()
+    poll_once(poller, db, did)
+    check("a wrong password records auth_fail", "auth_fail" in kinds(db, did), kinds(db, did))
+    db.set_group_credential(db.ensure_default_group(), "poller", "SHA",
+                            dpapi.protect(PASSWORD.encode("utf-8")))
+    poll_once(poller, db, did)
+    seen = kinds(db, did)
+    check("the fixed password, refused by VACM instead, records access_denied AND "
+          "auth_ok — the row says the message authenticated, so the alert saying "
+          "authentication is failing has been contradicted and must close",
+          "access_denied" in seen and "auth_ok" in seen
+          # device_events is newest first: auth_ok must be newer than auth_fail
+          and seen.index("auth_ok") < seen.index("auth_fail"), seen)
+    check("...and the device is out of _auth_failing", did not in poller._auth_failing)
+finally:
+    stub.kill()
+
+
+# ===================================== § 11 a downgrade is not an outage
+
+print("\n-- unsigned replies, polled past the outage threshold, ping off")
+stub, port = spawn_stub("stub_agent_iftable.py", "v3", "--auth-pass", PASSWORD,
+                        "--unsigned-replies")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db, did = new_v3_db("downgrade", PASSWORD)
+    poller = NodePoller(db)
+    poller.log = CaptureLog()
+    statuses = []
+    for _ in range(4):                     # down_after_failures ships as 3
+        poll_once(poller, db, did)
+        statuses.append(db.device(did)["status"])
+    seen = kinds(db, did)
+    check("the device is UP on every poll: it answered every request",
+          statuses == ["up"] * 4, statuses)
+    check("...no down event, no outage, and no auth_fail",
+          "down" not in seen and "auth_fail" not in seen, seen)
+    check("...one snmp_downgrade event, a transition, not one per poll",
+          seen.count("snmp_downgrade") == 1, seen)
+    check("...counted as downgraded, not as errors",
+          poller.counters["downgraded"] == 4 and poller.counters["errors"] == 0
+          and poller.counters["auth_fail"] == 0, poller.counters)
+    error = db.device(did)["snmp_error"] or ""
+    check("...and the row keeps the message that names the off switch",
+          "downgrade" in error and "Verify the signature on every SNMPv3 reply" in error,
+          error)
+    check("the credential loop did not rotate on it (no probe-failed stamp)",
+          did not in poller._credential_probe_failed)
+    # Ping on, answering: the device is up by ping alone, and the question
+    # is the snmp_error event that reads "SNMP is not answering".
+    real_ping = nodepoll_mod.ping_many
+    nodepoll_mod.ping_many = lambda ip, count=3, timeout_ms=1000: (count, count, 0.2)
+    try:
+        db.update_group(db.ensure_default_group(), ping_enabled=1)
+        for _ in range(4):                 # snmp_fail_alert_after ships as 3
+            poll_once(poller, db, did)
+    finally:
+        nodepoll_mod.ping_many = real_ping
+    check("with ping on, no snmp_error event either: 'SNMP is not answering' is "
+          "untrue of an agent that answered every request",
+          "snmp_error" not in kinds(db, did), kinds(db, did))
+    db.save_settings({"v3_verify_replies": False})
+    poll_once(poller, db, did)
+    check("with the setting off the next poll succeeds and records snmp_verified",
+          db.device(did)["snmp_ok"] == 1 and "snmp_verified" in kinds(db, did),
+          kinds(db, did))
+    check("...once: a second good poll records nothing",
+          (poll_once(poller, db, did), kinds(db, did).count("snmp_verified"))[1] == 1)
+    rule = next((r for r in alertsdb._BUILTIN_RULES if r[0] == "device_downgrade"), None)
+    check("the device_downgrade rule ships, on device_event/snmp_downgrade, with no "
+          "auto-resolve (a state with a real clear)",
+          rule is not None and rule[2:4] == ("device_event", "snmp_downgrade")
+          and "device_downgrade" not in alertsdb._BUILTIN_AUTO_RESOLVE_S, rule)
+    check("...cleared by snmp_verified (alertrules.CLEARS)",
+          alertrules.CLEARS.get(("device_event", "snmp_verified")) == "device_downgrade")
+finally:
+    stub.kill()
+
+
+# ===================================== § 12 rotation and the error that wins
+
+print("\n-- a contradicted credential does not rotate; the named refusal wins")
+db, did = new_v3_db("rotate", PASSWORD)
+poller = NodePoller(db)
+poller.log = CaptureLog()
+db.credential_candidates = lambda device: [
+    {"snmp_version": 3, "v3_user": "primary"},
+    {"snmp_version": 1, "community": "cleartext-alternate"}]
+tried: list[int] = []            # the snmp_version of each candidate tried
+scripted: list[Exception] = []
+
+
+def scripted_scalars(device, config):
+    tried.append(snmp_version_of(config))
+    raise scripted[len(tried) - 1]
+
+
+poller._poll_snmp_scalars = scripted_scalars
+scripted[:] = [SnmpDowngrade("the device's reply carried no signature — downgrade"),
+               SnmpTimeout("no reply from the alternate")]
+poll_once(poller, db, did)
+check("a downgrade on the primary stops the sweep: the v2c alternate is never "
+      "tried, so one forged unsigned reply cannot walk the poller onto a "
+      "cleartext community",
+      tried == [3], tried)
+check("...and the row carries the downgrade",
+      "downgrade" in (db.device(did)["snmp_error"] or ""))
+tried.clear()
+scripted[:] = [_AuthFailure("127.0.0.1: SNMPv3 reply rejected — the reply's "
+                            "signature does not verify"),
+               SnmpTimeout("no reply")]
+poll_once(poller, db, did)
+check("a digest THIS END refused (an _AuthFailure with no Report) does not rotate "
+      "either", tried == [3], tried)
+tried.clear()
+poller._credential_probe_failed.clear()
+scripted[:] = [_AuthFailure("127.0.0.1: SNMPv3 request refused (the authentication "
+                            "password or protocol is wrong) [usmStatsWrongDigests]",
+                            usm_name="wrongDigests", report=Response(pdu_tag=PDU_REPORT)),
+               SnmpTimeout("no reply from 127.0.0.1")]
+poll_once(poller, db, did)
+error = db.device(did)["snmp_error"] or ""
+check("a refusal the DEVICE named (a wrongDigests Report) does rotate: both "
+      "candidates tried", tried == [3, 1], tried)
+check("...and the alternate's timeout does not mask it: the row names "
+      "WrongDigests, not 'no reply'",
+      "WrongDigests" in error and "no reply" not in error, error)
+tried.clear()
+poller._credential_probe_failed.clear()
+scripted[:] = [SnmpTimeout("no reply from 127.0.0.1"),
+               SnmpAccessDenied("the device answered authorizationError(16)")]
+poll_once(poller, db, did)
+check("...the other way round too: a timeout first, then a named refusal — the "
+      "refusal is what is stored",
+      "authorizationError" in (db.device(did)["snmp_error"] or ""),
+      db.device(did)["snmp_error"])
+
+
+# ===================================== § 13 snmp_version None
+
+print("\n-- a None snmp_version is the v2c default, never a TypeError")
+check("snmp_version_of: None and absent are v2c (1); 0 stays v1; 3 stays v3",
+      snmp_version_of({"snmp_version": None}) == 1 and snmp_version_of({}) == 1
+      and snmp_version_of({"snmp_version": 0}) == 0 and snmp_version_of({"snmp_version": 3}) == 3)
+check("credential_for survives the None overlay",
+      credential_for({"snmp_version": None, "community": "public"}).identity == "public")
+nodepoll_mod.DEFAULT_SNMP_PORT = free_udp_port()      # nothing listens there
+db, did = new_v3_db("none-version", PASSWORD, timeout_s=0.2)
+poller = NodePoller(db)
+poller.log = CaptureLog()
+db.credential_candidates = lambda device: [{"snmp_version": None, "community": "public"}]
+try:
+    poll_once(poller, db, did)
+    check("a poll whose candidate carries snmp_version None completes as a timeout "
+          "(record_poll ran; the status did not freeze)",
+          db.device(did)["last_poll_ts"] is not None
+          and "no reply" in (db.device(did)["snmp_error"] or ""), db.device(did)["snmp_error"])
+except TypeError as exc:
+    check("a poll whose candidate carries snmp_version None completes", False, str(exc))
+
+
+# ===================================== § 14 an authentication blob that will not decrypt
+
+print("\n-- an undecryptable auth blob raises rather than polling unsigned")
+try:
+    credential_for({"snmp_version": 3, "v3_user": "poller", "v3_auth_proto": "SHA",
+                    "v3_auth_pass_enc": b"not-a-blob-this-machine-can-read"})
+    check("an undecryptable authentication blob raises", False, "returned a credential")
+except SnmpError as exc:
+    check("an undecryptable authentication blob raises, naming the authentication "
+          "password and the refusal to poll unsigned — the privacy blob's rule, "
+          "applied to both",
+          "authentication password" in str(exc) and "unsigned" in str(exc), str(exc))
+stale = credential_for({"snmp_version": 1, "community": "public",
+                        "v3_auth_pass_enc": b"stale", "v3_priv_proto": "AES",
+                        "v3_priv_pass_enc": b"stale-too"})
+check("...but a v2c profile carrying stale v3 blobs it never reads still polls "
+      "with its community", stale.identity == "public" and stale.auth_password is None)
 
 print()
 if FAILS:
