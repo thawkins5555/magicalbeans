@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.8.1 — The restart that fixed it](#581--the-restart-that-fixed-it)
 - [5.8.0 — The privacy password, and the reply nobody checked](#580--the-privacy-password-and-the-reply-nobody-checked)
 - [5.7.2 — The password that was never wrong](#572--the-password-that-was-never-wrong)
 - [5.7.1 — The temp folder that wasn't there](#571--the-temp-folder-that-wasnt-there)
@@ -134,6 +135,100 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.8.1 — The restart that fixed it
+
+An operator on 5.8.0 added a Palo Alto firewall polling SNMPv3 `authPriv`,
+and it worked. Three more, added to the **same profile** with the **same
+credential**, never polled once: each showed a bare
+
+> no reply
+
+with nothing at all in its event log, while the Test button passed on all
+three at full `authPriv`. Restarting the service fixed all three, for
+good. "A restart fixed it" is the sentence that gets a fault written off
+as gremlins; this one was a cache the poller had no way to drop.
+
+**What the poller was doing.** Every SNMPv3 device has one entry in
+`EngineCache`: the engine id, `engineBoots` and `engineTime` learned at
+discovery, kept for the life of the process and advanced with the clock.
+Until this release, exactly one thing invalidated that entry short of
+deleting the device — the `_AuthFailure` a Report-PDU raises after the
+resync retry is refused too. That was built on an assumption: a device
+that will not accept the cached parameters *says so*, with a
+`notInTimeWindows` Report, and the resync loop learns from it. Some
+agents do not say so. A message they will not accept is simply
+discarded, and a discarded message is a timeout — `SnmpTimeout` — which
+touched nothing. The next poll rebuilt the identical request from the
+identical cache, the agent discarded it again, and so on every cycle
+until the service restarted and the cache with it. Silence cannot
+self-heal a cache that only a Report is allowed to clear. The Test button
+holds no cache at all (it discovers fresh on every press), which is why
+it passed on every device the scheduler could not poll; and the operator's
+own retry from the device page reused the same cache, so it failed
+identically and diagnosed nothing.
+
+**Dropped on one timeout.** `_v3_exchange` now invalidates the cached
+engine when a request built from it draws no answer — after one
+`SnmpTimeout`, not two, and the reasoning is in the comment beside it.
+One `SnmpTimeout` reaching that point is already `retries + 1` unanswered
+datagrams (`_Session.request` retries; the profile default is two), so
+"consecutive" is built in one layer down. The cost of dropping wrongly is
+one unauthenticated discovery probe on the next poll of a device that is
+already failing; the failure being cured is permanent, and the churn
+being avoided is one packet. Requiring a second timeout would double the
+recovery latency — two poll intervals, ten minutes on a five-minute
+profile — to save one datagram. The scope guard is not a counter but a
+rule about freshness: an engine learned *inside* the failing call — a
+discovery, or a Report's re-teach whose retry then timed out — was just
+taught by the agent and is kept, or a slow device would rediscover on
+every poll. An empty cache has nothing to drop and does not claim to
+have dropped one. The error keeps its `no reply from …` prefix (existing
+checks match on it) and adds one sentence saying the request was built
+from a cached engine, that the cache was dropped, and that the next poll
+rediscovers. `EngineCache`'s own docstring, which stated the assumption,
+now states the correction.
+
+**Poll now starts from nothing.** An explicit retry is the one place a
+per-device cache is discarded on request: the operator is asking for the
+attempt the scheduler would make with no history, the same one the Test
+button makes. `poll_now` now drops the device's cached engine before it
+submits, beside the two sensor-cadence stamps it already dropped. Had it
+always, this report would have been self-diagnosing — the click would
+have polled where the scheduler failed — instead of failing identically.
+
+**The stub can now go silent in v3.** `stub_agent_iftable.py` answered
+every stale-boots or out-of-window request with a Report, and its
+`dark_after_*` silences were unreachable in v3 mode, so no existing flag
+could stage this fault. `--silent-out-of-window` drops such requests
+instead of Reporting on them, counted in `--stats` as `dropped_stale`,
+off by default so every existing suite is byte-for-byte unaffected;
+`--bump-boots-at` already stages the restart between two polls. § 15 of
+`test_snmpv3_diagnostics.py` runs the operator's shape against it at
+`authNoPriv` (no cipher needed): poll 1 discovers and caches; the agent
+restarts and drops poll 2's request — a timeout, no event, and the cache
+is gone; poll 3 rediscovers and succeeds; poll 4 makes no new discovery.
+Against 5.8.0 that section is red at exactly the two places the report
+describes — the cache survives, and poll 3 sends the same doomed packet.
+Three guards sit beside it: an engine learned inside the failing call is
+kept (red against a naive "invalidate on every timeout"; it cannot fail
+against 5.8.0, where nothing invalidated); `poll_now` drops the cache
+(red against 5.8.0, on an unstarted poller); and `_AuthFailure` still
+invalidates (a regression guard that passes before and after by
+construction).
+
+**The key cache under a lock.** `trapdecode._KEY_CACHE`, the bounded
+LRU behind `localized_key` and `privacy_key`, is mutated from every poll
+worker and from the trap receiver with no lock. The key is per
+(protocol, password, engine), so a race could never hand one device
+another's key — but `OrderedDict.move_to_end` on a key another thread's
+`popitem` has just evicted raises `KeyError`, which escaped
+`localized_key` into whichever poll was signing at the time. An earlier
+review had this down as a harmless re-hash; it is worse than that. The
+lock covers get-and-promote and set-and-evict; the 1 MiB hash is computed
+outside it, because serialising every worker's key derivation behind one
+lock would be a regression of its own. Not the reported bug, fixed in
+passing.
 
 ### 5.8.0 — The privacy password, and the reply nobody checked
 

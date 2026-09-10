@@ -1220,16 +1220,30 @@ if the target reboots"; that was true of `engine_id` and `boots` and false
 of `engine_time`, which advances with the agent's clock and must be
 advanced with it here.
 
-A Report-PDU is still what says a resynchronisation is needed. All three v3
-send paths — `_snmp_get`, `_snmp_get_next` and `_walk_request` — go
-through `NodePoller._v3_exchange()`, which is now only the engine cache's
-side of the exchange: it hands the cached parameters to the module-level
-`nodepoll.v3_exchange()`, keeps whatever a Report re-teaches (the `learned`
-callback), and drops the entry when even the retry was refused. The loop
-itself — learn boots/time from a first Report, retry once, and only then
-fail — lives in `v3_exchange()` since 5.7.2 and is shared with the Test
-button, which had its own copy that did not resync and so failed a device
-with a skewed clock that the poll shrugged off. A second Report raises
+A Report-PDU is what says a resynchronisation is needed — when the agent
+sends one. All three v3 send paths — `_snmp_get`, `_snmp_get_next` and
+`_walk_request` — go through `NodePoller._v3_exchange()`, which is now
+only the engine cache's side of the exchange: it hands the cached
+parameters to the module-level `nodepoll.v3_exchange()`, keeps whatever a
+Report re-teaches (the `learned` callback), and drops the entry when even
+the retry was refused. Since 5.8.1 it also drops the entry on an
+`SnmpTimeout`, when the request that went unanswered was built from a
+cached engine that was *not* relearned during the call: an agent past a
+restart or a clock step may discard a message it will not accept rather
+than Report on it, and until then a silently refused entry was reused on
+every poll until the process restarted (three firewalls on one working
+profile did exactly that, while the cache-less Test button passed). One
+timeout suffices because `_Session.request` has already retried
+`snmp_retries` times before raising one, so "consecutive" is built in a
+layer down; the guard against churn is freshness, not a count — an engine
+learned inside the failing call (a discovery, or a Report's re-teach whose
+retry then timed out) is kept, or a slow device would rediscover every
+poll. `poll_now` invalidates the entry before submitting, so an operator's
+explicit retry is the attempt the scheduler would make from nothing. The
+loop itself — learn boots/time from a first Report, retry once, and only
+then fail — lives in `v3_exchange()` since 5.7.2 and is shared with the
+Test button, which had its own copy that did not resync and so failed a
+device with a skewed clock that the poll shrugged off. A second Report raises
 `_AuthFailure` with the `usmStats*` counter decoded into a real message
 and carried by attribute (`usm_name`, `report`), and
 `usmStatsUnsupportedSecLevels` raises `SnmpUnsupported` so the device is

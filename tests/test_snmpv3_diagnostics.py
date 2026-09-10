@@ -49,7 +49,17 @@ itself can produce — none of which needs a cipher, so none skips:
      freezes the device;
  14. an authentication blob that will not decrypt raises rather than
      polling unsigned — and a v2c profile carrying a stale blob does not.
+
+And the 5.8.1 field report — three firewalls on one working profile that
+never polled until the service was restarted:
+
+ 15. a cached engine whose signed request is silently dropped (no Report)
+     is invalidated on that one timeout, the next poll rediscovers and
+     succeeds, and the poll after that makes no new discovery; an engine
+     learned INSIDE the failing call is kept; poll_now drops the cache
+     before submitting; and _AuthFailure still invalidates as it did.
 """
+import json
 import os
 import socket
 import sys
@@ -820,6 +830,145 @@ stale = credential_for({"snmp_version": 1, "community": "public",
                         "v3_priv_pass_enc": b"stale-too"})
 check("...but a v2c profile carrying stale v3 blobs it never reads still polls "
       "with its community", stale.identity == "public" and stale.auth_password is None)
+
+
+# ===================================== § 15 the cached engine nobody could drop
+
+# The field report's shape, against the real stub: poll 1 discovers and
+# succeeds; the agent restarts (boots + 1) while the poller sleeps; poll 2
+# goes out on the cached engine and the agent DROPS it — no Report, so
+# nothing the resync loop can learn from. Before 5.8.1 only _AuthFailure
+# invalidated the cache, so poll 3, 4, ... rebuilt the same doomed request
+# until the service was restarted.
+print("\n-- a silently dropped request on a cached engine: invalidated, rediscovered")
+stats = os.path.join(TMP, "silent.json")
+stub, port = spawn_stub("stub_agent_iftable.py", "v3", "--auth-pass", PASSWORD,
+                        "--bump-boots-at", "0.5", "--silent-out-of-window",
+                        "--window", "5", "--stats", stats)
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+
+
+def stub_counts() -> dict:
+    time.sleep(0.05)                      # the stub writes after it answers
+    with open(stats) as handle:
+        return json.load(handle)
+
+
+try:
+    db, did = new_v3_db("silent", PASSWORD, timeout_s=0.4)
+    poller = NodePoller(db)
+    poller.log = CaptureLog()
+    poll_once(poller, db, did)
+    first = poller._engines.get(did)
+    check("poll 1: discovers, polls, and caches the engine",
+          db.device(did)["snmp_ok"] == 1 and first is not None
+          and stub_counts().get("discoveries") == 1,
+          (db.device(did)["snmp_error"], first, stub_counts()))
+
+    time.sleep(0.8)                       # past --bump-boots-at: the agent restarts
+    poll_once(poller, db, did)
+    row = db.device(did)
+    error = row["snmp_error"] or ""
+    counts = stub_counts()
+    check("poll 2: the cached request is dropped without a Report — a timeout, "
+          "'no reply', no auth_fail event, and no discovery in that poll",
+          row["snmp_ok"] == 0 and "no reply" in error
+          and "auth_fail" not in kinds(db, did)
+          and counts.get("dropped_stale") == 1 and counts.get("discoveries") == 1,
+          (error, kinds(db, did), counts))
+    check("...and the cached engine was DROPPED on that one timeout "
+          "(red before 5.8.1: only _AuthFailure ever invalidated it)",
+          poller._engines.get(did) is None, poller._engines.get(did))
+    check("...the error says so, keeping the 'no reply' prefix every "
+          "existing check matches on",
+          error.startswith("no reply from") and "cached SNMPv3 engine" in error
+          and "next poll" in error, error)
+
+    poll_once(poller, db, did)
+    counts = stub_counts()
+    check("poll 3: rediscovers (discoveries == 2) and SUCCEEDS "
+          "(red before 5.8.1: the same doomed request, forever, until a restart)",
+          db.device(did)["snmp_ok"] == 1 and counts.get("discoveries") == 2,
+          (db.device(did)["snmp_error"], counts))
+
+    poll_once(poller, db, did)
+    counts = stub_counts()
+    check("poll 4: a good entry is kept — no new discovery, still polling",
+          db.device(did)["snmp_ok"] == 1 and counts.get("discoveries") == 2,
+          (db.device(did)["snmp_error"], counts))
+    check("nothing along the way carried the password",
+          secrets_absent(" ".join(poller.log.lines) + (db.device(did)["snmp_error"] or ""),
+                         PASSWORD))
+finally:
+    stub.kill()
+
+# The scope guard: an engine learned INSIDE the failing call is fresh —
+# the agent just taught it — and is kept. Discovery answers honestly, then
+# every signed request is dropped: a slow or firewalled device, not a
+# stale cache. Nothing invalidates here before OR after 5.8.1 (there was
+# nothing cached going in), so this cannot fail against the old code; it
+# fails against the naive "invalidate on every v3 timeout" and pins the
+# rule that keeps a slow device from rediscovering on every poll.
+print("\n-- an engine learned inside the failing call is kept")
+
+
+def discovery_only(data):
+    if not decode_response(data).engine_id:
+        return [report_under(FAKE_ENGINE, 3, 100, USM_UNKNOWN_ENGINE)]
+    return []
+
+
+agent = FakeAgent(discovery_only)
+nodepoll_mod.DEFAULT_SNMP_PORT = agent.port
+try:
+    db, did = new_v3_db("fresh", PASSWORD, timeout_s=0.4)
+    poller = NodePoller(db)
+    poller.log = CaptureLog()
+    poll_once(poller, db, did)
+    entry = poller._engines.get(did)
+    error = db.device(did)["snmp_error"] or ""
+    check("a timeout right after discovery in the same call keeps the fresh "
+          "engine: it was just learned, not stale",
+          db.device(did)["snmp_ok"] == 0 and "no reply" in error
+          and entry is not None and entry[:3] == (FAKE_ENGINE, 3, 100),
+          (error, entry))
+    check("...and the message does not claim a cached engine was dropped",
+          "cached SNMPv3 engine" not in error, error)
+finally:
+    agent.close()
+
+# An operator's explicit retry is the one place a cache is discarded on
+# request: had poll_now done this, the field report would have been
+# self-diagnosing (the click would have polled) instead of failing
+# identically to the scheduler. Unit-tested on an unstarted poller: there
+# is no pool, _submit returns False, and the drop is still observable.
+print("\n-- poll_now drops the cached engine before submitting")
+db, did = new_v3_db("pollnow", PASSWORD)
+poller = NodePoller(db)
+poller._engines.set(did, FAKE_ENGINE, 3, 100)
+queued = poller.poll_now(did)
+check("poll_now on an unstarted poller returns False (nothing to submit to)",
+      queued is False, queued)
+check("...and has dropped the device's cached engine (red before 5.8.1)",
+      poller._engines.get(did) is None, poller._engines.get(did))
+
+# The path that always invalidated must still: a refusal the device named
+# (wrongDigests, twice) drops the entry. Passes before and after by
+# construction — a regression guard on the arm the fix sits beside.
+print("\n-- _AuthFailure still invalidates")
+stub, port = spawn_stub("stub_agent_iftable.py", "v3", "--auth-pass", PASSWORD)
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db, did = new_v3_db("stillauth", WRONG)
+    poller = NodePoller(db)
+    poller.log = CaptureLog()
+    poll_once(poller, db, did)
+    check("a wrongDigests refusal records auth_fail and drops the cached engine, "
+          "as it always did",
+          "auth_fail" in kinds(db, did) and poller._engines.get(did) is None,
+          (kinds(db, did), poller._engines.get(did)))
+finally:
+    stub.kill()
 
 print()
 if FAILS:

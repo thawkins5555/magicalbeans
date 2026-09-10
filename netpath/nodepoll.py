@@ -197,8 +197,13 @@ class EngineCache:
     parameters from the Report-PDU, then proceeds with the real signed
     request. Entries are kept for the process lifetime — engine boots/time
     only need refreshing if the target actually reboots or its clock skews
-    enough to be rejected, which shows up as an auth failure and triggers
-    a fresh discovery on the next poll, not a background expiry timer."""
+    enough to be rejected, and that shows up either as an auth failure (a
+    Report) or, from an agent that discards what it will not accept, as a
+    timeout on a request built from this entry; either one drops it and
+    the next poll rediscovers. Not a background expiry timer. Until 5.8.1
+    only the auth failure did, on the assumption a stale entry always
+    draws a Report — it does not, and a silently refused entry was then
+    reused every poll until the process restarted."""
 
     def __init__(self):
         self._entries: dict[int, tuple[bytes, int, int, float]] = {}
@@ -1935,6 +1940,18 @@ class NodePoller(Worker):
         # stamp skips both _SENSOR_REFRESH_S and the hourly reprobe window.
         self._sensor_read.pop(device_id, None)
         self._sensor_threshold_read.pop(device_id, None)
+        # And "start from nothing": an explicit retry is the one place a
+        # per-device cache is discarded on request. The operator is asking
+        # for the attempt the scheduler would make with no history — the
+        # same one the Test button makes, which holds no cache — so the
+        # cached SNMPv3 engine goes too. Had it always, the 5.8.1 field
+        # report (three firewalls polled with a stale engine until the
+        # service restarted) would have been self-diagnosing: the click
+        # would have polled where the scheduler failed, instead of failing
+        # identically. Before _submit, so a worker that starts on this
+        # click cannot read the old entry first. The scheduler's own polls
+        # keep the cache; _v3_exchange's timeout rule covers them.
+        self._engines.invalidate(device_id)
         return self._submit(device_id)
 
     def set_focus(self, device_id: int, ttl_s: float, interval_s: float) -> None:
@@ -3445,18 +3462,36 @@ class NodePoller(Worker):
         lives in v3_exchange, shared with the Test button; what is left
         here is feeding it the cached engine parameters, keeping the ones
         a Report teaches, and dropping the entry when even the retry was
-        refused, so the next poll rediscovers from nothing."""
+        refused — or when a request built from it drew no answer at all —
+        so the next poll rediscovers from nothing.
+
+        That last case is the one 5.8.1 added. A Report is the agent
+        saying "not those parameters", and the resync loop learns from
+        it; but an agent past a restart or a clock step may simply
+        discard a message it will not accept, and silence teaches
+        nothing. With the cache dropped only on _AuthFailure, a device
+        that answered a stale engine with silence was polled with the
+        same doomed request every cycle until the service was restarted
+        (which is the only other thing that empties this cache). Three
+        firewalls on one working profile did exactly that."""
         credential = credential_for(config)
         device_id = device["id"]
+        # Captured up front, not read again after the failure: the
+        # question is whether the request that timed out was built from
+        # a cached engine, and the cache may have been rewritten since.
+        engine = self._engines.current(device_id)
+        relearned = False
 
         def learned(engine_id: bytes, boots: int, engine_time: int) -> None:
+            nonlocal relearned
+            relearned = True
             self._engines.set(device_id, engine_id, boots, engine_time)
 
         try:
             return v3_exchange(
                 session, pdu_tag, oids, identity=credential.identity,
                 auth_proto=credential.auth_proto, password=credential.auth_password,
-                engine=self._engines.current(device_id),
+                engine=engine,
                 max_repetitions=max_repetitions, ip=device["ip"], learned=learned,
                 priv_proto=credential.priv_proto,
                 priv_password=credential.priv_password,
@@ -3464,6 +3499,33 @@ class NodePoller(Worker):
         except _AuthFailure:
             self._engines.invalidate(device_id)
             raise
+        except SnmpTimeout as exc:
+            # Dropped after ONE timeout, not two, and only when the engine
+            # that went out was cached and was NOT relearned during this
+            # call. One SnmpTimeout reaching here is already retries + 1
+            # unanswered datagrams (_Session.request retries; the profile
+            # default snmp_retries is 2), so "consecutive" is built in one
+            # layer down. The cost of dropping wrongly is one
+            # unauthenticated discovery probe on the next poll of a device
+            # that is already failing; the failure being cured is
+            # permanent, and the churn avoided is one packet. Requiring a
+            # second timeout would double the recovery latency (two poll
+            # intervals) to save one datagram. The scope guard is the
+            # fresh-engine rule, not a counter: an engine `learned` inside
+            # this call — a discovery, or a Report's re-teach whose retry
+            # then timed out — was just taught by the agent and is kept,
+            # or a slow device would rediscover on every poll. An empty
+            # cache has nothing to drop and must not claim it dropped one.
+            if engine is None or relearned:
+                raise
+            self._engines.invalidate(device_id)
+            engine_id, boots, engine_time = engine
+            raise SnmpTimeout(
+                f"{exc}; the request was built from a cached SNMPv3 engine "
+                f"(boots {boots}, time {engine_time}) that an agent past a "
+                f"restart or a clock step may discard without a Report, so "
+                f"the cached engine was dropped and the next poll will "
+                f"rediscover it") from exc
         finally:
             credential = None
 

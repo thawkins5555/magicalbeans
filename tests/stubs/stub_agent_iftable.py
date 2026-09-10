@@ -104,7 +104,16 @@ Modes:
                    the stub verify a signed request and then answer it
                    UNSIGNED — the agent, proxy or middlebox that has always
                    done this and that 5.8.0's downgrade refusal is the
-                   first release to notice.
+                   first release to notice. --silent-out-of-window makes
+                   the stub DROP a signed request whose engineBoots or
+                   engineTime it will not accept, instead of answering it
+                   with notInTimeWindows — the agent that discards what
+                   it refuses rather than Reporting on it, which is what
+                   the 5.8.1 field report's firewalls did, and the one
+                   thing a poller holding a cached engine can never
+                   recover from by itself (a Report re-teaches; silence
+                   teaches nothing). With --bump-boots-at, that is a
+                   restart the poller is never told about.
                    Every one of these is off by default.
 
 Options: --host ADDRESS (bind elsewhere than 127.0.0.1 — "::1" opens an
@@ -116,7 +125,8 @@ answering walk requests at all, the mid-table timeout with rows already in
 hand), --stale-id N (prepend a wrong-request-id copy to the
 first N replies — the datagram _Session.dropped counts), and the v3
 --auth-pass/--auth-proto/--require-priv/--priv-pass/--priv-proto/
---tamper-reply/--unsigned-replies described above. Answering from
+--tamper-reply/--unsigned-replies/--silent-out-of-window described above.
+Answering from
 the wrong SOURCE PORT deliberately has no flag: _Session._is_peer compares
 the host only, because agents that reply from an ephemeral port are common
 and not forgery, so a wrong port is not a dropped datagram here.
@@ -170,8 +180,10 @@ class Agent:
                  dark_after_rows: int = 0, require_priv: bool = False,
                  auth_pass: str = "", auth_proto: str = "SHA",
                  priv_pass: str = "", priv_proto: str = "AES",
-                 tamper_reply: bool = False, unsigned_replies: bool = False):
+                 tamper_reply: bool = False, unsigned_replies: bool = False,
+                 silent_out_of_window: bool = False):
         self.mode = mode
+        self.silent_out_of_window = silent_out_of_window
         self.n_interfaces = interfaces
         self.require_priv = require_priv
         self.auth_pass = auth_pass
@@ -223,7 +235,10 @@ class Agent:
                        "wrong_digests": 0, "denied": 0,
                        # authPriv: requests decrypted, ones that would not
                        # decrypt, and a received salt seen twice (never).
-                       "decrypted": 0, "decrypt_errors": 0, "salt_reuse": 0}
+                       "decrypted": 0, "decrypt_errors": 0, "salt_reuse": 0,
+                       # --silent-out-of-window: stale-boots / out-of-window
+                       # requests discarded without a Report.
+                       "dropped_stale": 0}
 
     # ------------------------------------------------------------- SNMPv3
 
@@ -384,6 +399,15 @@ class Agent:
                                  USM_UNSUPPORTED_SEC_LEVELS)]
         if req.engine_boots != self.engine_boots \
                 or abs(req.engine_time - self.engine_time()) > self.window:
+            if self.silent_out_of_window:
+                # The signature verified, so this is OUR poller holding
+                # engine parameters this agent no longer accepts — and
+                # this agent says nothing about it. RFC 3414 s3.2 says
+                # to Report; the firewalls in the 5.8.1 field report did
+                # not, and a poller that only ever resyncs off a Report
+                # has to recover from this without being told anything.
+                self.counts["dropped_stale"] += 1
+                return []
             return [self._report(msg_id, req.request_id,
                                  USM_NOT_IN_TIME_WINDOWS, level)]
         self.counts["responses"] += 1
@@ -839,6 +863,7 @@ def main(argv):
     priv_proto = "AES"
     tamper_reply = False
     unsigned_replies = False
+    silent_out_of_window = False
     rest = list(argv[1:])
     while rest:
         item = rest.pop(0)
@@ -856,6 +881,8 @@ def main(argv):
             tamper_reply = True
         elif item == "--unsigned-replies":
             unsigned_replies = True
+        elif item == "--silent-out-of-window":
+            silent_out_of_window = True
         elif item == "--reply-delay":
             reply_delay = float(rest.pop(0))
         elif item == "--bulk-cap":
@@ -890,7 +917,7 @@ def main(argv):
           stats_path, dark_after, host, reply_delay, bulk_cap, tuple(gen_err),
           tuple(no_such_name), refuse_bulk, stale_id, dark_after_rows,
           require_priv, auth_pass, auth_proto, priv_pass, priv_proto,
-          tamper_reply, unsigned_replies).serve()
+          tamper_reply, unsigned_replies, silent_out_of_window).serve()
 
 
 if __name__ == "__main__":
