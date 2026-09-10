@@ -236,6 +236,52 @@ shown by default to operators who have never opened the column picker — that
 is, the ones least likely to be looking for this. The count also rides along
 in the CSV export.
 
+**Polling is staggered, so the fleet no longer arrives all at once.** The
+scheduler seeded each device's first due time from its own last poll, which
+is restart-safe only while the service was down for less than one poll
+interval. Past that — any real outage, a maintenance window, a bulk import —
+every device is overdue the moment the poller starts, and the whole fleet is
+submitted in a single pass.
+
+The worse half was that it stayed that way. Every device that came due in the
+same pass was given the *same* next due time, so a fleet that started in
+lockstep never fell out of it. Measured on 300 devices at a 15-second
+interval, submissions peaked at 300 per second on every cycle, for as long as
+the process ran.
+
+Two spreads, both of which only ever move a poll **earlier**, so nothing is
+polled less often than its profile says. A device already overdue at startup
+is given a moment inside the next thirty seconds (or one interval, whichever
+is shorter) instead of firing immediately. And each device's first reschedule
+after that lands somewhere in the second half of its interval, once, which
+breaks the shared phase permanently. A device that has never been polled —
+one you just added — still polls on the very next pass, because making that
+feel instant matters more than spreading it.
+
+On the same 300 devices with a pool that can keep up, restarting after an
+outage: submissions per cycle fall from 300/300/300/300 to 37/38/26/26, and
+lateness against schedule from a 19.03-second 95th percentile to 0.96
+seconds.
+
+**The cost, stated plainly:** the first sweep after a restart now takes
+longer to reach any given device — mean time to first poll goes from 2.26 to
+7.94 seconds, worst case from 6.43 to 15.76. That is the trade, it is bounded
+by the device's own interval, and a device that died during the outage is
+still noticed inside half a minute. There is also one bounded artefact: a
+device whose pulled-forward poll arrives while its previous one is still
+queued logs a single `poll_overrun` — at most once per device, ever, and only
+on a pool that is already behind.
+
+None of this was visible before because the benchmark had no way to model a
+restart. Its two modes now do, and the pre-fix numbers for both are identical
+in every behavioural column — which is precisely why the lockstep shipped
+unnoticed in the first place.
+
+A sequence-based spread was tried instead of a random one, on the theory that
+randomness clumps. It was measured and dropped: the residual peak is the
+one-off extra poll per device becoming visible, not clumping, and no sequence
+removes it.
+
 **What else the Forti-AP module could poll: a costed answer, not a change.**
 `FORTIAP-POLLING-OPTIONS.md` surveys the per-AP data the module does not
 collect today, grouped by what each would cost: derivable from rows the
