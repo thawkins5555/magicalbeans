@@ -150,6 +150,9 @@
     const c = nodes.counters || {};
     const parts = [`${counts.total || 0} device(s)`, `${counts.up || 0} up`,
       `${counts.down || 0} down`];
+    // Planned work is subtracted from `down` server-side, so without this the
+    // devices would simply vanish from the strip.
+    if (counts.maintenance) parts.push(`${counts.maintenance} in maintenance`);
     if (counts.unsupported) parts.push(`${counts.unsupported} unsupported`);
     if (counts.auth) parts.push(`${counts.auth} auth failed`);
     parts.push(`${c.polls || 0} polls · ${c.errors || 0} errors`);
@@ -159,6 +162,8 @@
         { value: counts.total || 0, label: 'devices' },
         { value: counts.up || 0, label: 'up', className: 'ok' },
         { value: counts.down || 0, label: 'down', className: counts.down ? 'fail' : '' },
+        ...(counts.maintenance
+          ? [{ value: counts.maintenance, label: 'in maintenance' }] : []),
       ]));
       return;
     }

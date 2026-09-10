@@ -75,7 +75,7 @@ _POLL_COST_CEILING_S = 600.0
 # Restart spread: long enough to flatten a large fleet, short enough that a
 # device that died during the outage is still noticed inside half a minute.
 _STARTUP_SPREAD_S = 30.0
-# The first reschedule after a poll lands in [fraction, 1.0] x interval --
+# The first reschedule after a poll lands in [fraction, 1.0) x interval --
 # earlier only, so no device is ever polled less often than configured.
 _STAGGER_MIN_FRACTION = 0.5
 
@@ -1455,6 +1455,7 @@ class NodePoller(Worker):
         self._started: dict[int, float] = {}
         self._next_run: dict[int, float] = {}
         self._staggered: set[int] = set()
+        self._stagger_count = 0
         # device_id -> when it was last pinged, so ping_interval_s can
         # decouple ICMP probing from the SNMP poll cadence.
         self._last_ping: dict[int, float] = {}
@@ -2197,6 +2198,13 @@ class NodePoller(Worker):
                 self.log.add(ERROR, self.error, detail=traceback.format_exc())
             self._stop.wait(1.0)
 
+    def _stagger_fraction(self) -> float:
+        # Golden-ratio sequence, not random: near-uniform by construction,
+        # so the phase break spreads the fleet without clumping it.
+        frac = (self._stagger_count * 0.6180339887498949) % 1.0
+        self._stagger_count += 1
+        return _STAGGER_MIN_FRACTION + frac * (1.0 - _STAGGER_MIN_FRACTION)
+
     def _schedule_pass(self) -> None:
         """One pass over the fleet: whose turn is it to be polled.
 
@@ -2246,16 +2254,18 @@ class NodePoller(Worker):
                     due = now + random.uniform(0, min(interval, _STARTUP_SPREAD_S))
                 self._next_run[device_id] = due
             if now >= due:
+                pending = device_id in self._started or device_id in self._queued
                 # Focus is left exact: it exists to make the selected device
-                # feel live, and the phase break waits for its first
-                # unfocused reschedule.
-                if focused or device_id in self._staggered:
+                # feel live. A pending device is left alone too: pulling it
+                # earlier while its last poll is still queued only logs an
+                # overrun. The phase break waits for the first reschedule
+                # that is neither.
+                if focused or pending or device_id in self._staggered:
                     self._next_run[device_id] = now + interval
                 else:
                     self._staggered.add(device_id)
-                    self._next_run[device_id] = now + interval * random.uniform(
-                        _STAGGER_MIN_FRACTION, 1.0)
-                if device_id in self._started or device_id in self._queued:
+                    self._next_run[device_id] = now + interval * self._stagger_fraction()
+                if pending:
                     # A poll slower than the fast focus cadence is
                     # expected, not an overrun worth logging — only
                     # blowing the device's own profile interval is.

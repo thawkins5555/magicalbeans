@@ -7,7 +7,7 @@ up test_*.py).
     python3 tests/bench_poll_cycle.py [devices ...] [--workers 8,16,32]
                                       [--interval 15] [--seconds 20]
                                       [--down-fraction 0.05] [--seed 7]
-                                      [--auto] [--cold-start]
+                                      [--auto] [--cold-start | --restart]
     python3 tests/bench_poll_cycle.py --stub [--interfaces 8,48,240]
 
 Each `devices` figure is one fleet, run once against each pool size.
@@ -21,9 +21,13 @@ lands on the next cycle too — which is why p95 and max matter more than the
 mean, and why overruns alone (the only signal the product ships today) reads
 as "fine" long after the fleet has stopped being watched in real time.
 
-`--cold-start` skips the steady-state stagger, so the run measures the
-restart burst itself: every device due on pass one. The sub/s columns (peak
-and mean submissions per second) are how big that burst is.
+`--cold-start` skips the steady-state stagger and leaves every last_poll_ts
+NULL: a fresh install or bulk import, never polled, all due on pass one.
+`--restart` seeds every last_poll_ts two intervals stale instead: a service
+restart after an outage, the case the scheduler's startup spread exists for.
+pk/cycle is the peak submissions per second inside each interval window of
+the run; first mean/max is how long after start each device's first poll
+began.
 
 `--synthetic` (the default) drives the REAL _loop/_schedule_pass against a
 REAL ThreadPoolExecutor over a REAL NodesDatabase. Only NodePoller._poll_device
@@ -169,7 +173,7 @@ class RecordingRuns(dict):
 
 def run_combo(db, devices: int, workers: int, interval: int, seconds: float,
               costs: list[float], auto: bool = False,
-              cold_start: bool = False) -> dict:
+              mode: str = "steady") -> dict:
     """One (device count x pool size) run of the real scheduler.
 
     _submit is wrapped rather than _schedule_pass. The patched _poll_device
@@ -178,12 +182,18 @@ def run_combo(db, devices: int, workers: int, interval: int, seconds: float,
     """
     ids = device_ids(db)
     by_id = {device_id: costs[index] for index, device_id in enumerate(ids)}
-    if not cold_start:
+    if mode == "steady":
         stagger(db, ids, interval)
+    elif mode == "restart":
+        with db._lock:
+            db._conn.execute("UPDATE devices SET last_poll_ts = ?",
+                             (time.time() - 2 * interval,))
+            db._conn.commit()
 
     due: dict[int, float] = {}
     lateness: list[float] = []
     submitted: list[float] = []
+    first: dict[int, float] = {}
     lock = threading.Lock()
 
     real_submit = NodePoller._submit
@@ -203,6 +213,8 @@ def run_combo(db, devices: int, workers: int, interval: int, seconds: float,
             expected = due.pop(device_id, None)
         if expected is not None:
             lateness.append(time.time() - expected)
+        with lock:
+            first.setdefault(device_id, time.time() - wall)
         time.sleep(by_id.get(device_id, 0.3))
 
     # poll_workers_auto is set EXPLICITLY, never left to DEFAULTS. With it
@@ -220,9 +232,9 @@ def run_combo(db, devices: int, workers: int, interval: int, seconds: float,
     poller = NodePoller(db)
     poller._next_run = RecordingRuns()
     sampler = Sampler(poller)
+    wall = time.time()
     try:
         started = time.perf_counter()
-        wall = time.time()
         poller.start(db.settings())
         sampler.start()
         time.sleep(seconds)
@@ -241,14 +253,20 @@ def run_combo(db, devices: int, workers: int, interval: int, seconds: float,
     for stamp in submitted:
         second = int(stamp - wall)
         per_second[second] = per_second.get(second, 0) + 1
+    cycles = max(1, int(seconds // interval))
+    peaks = [max((n for sec, n in per_second.items() if sec // interval == c),
+                 default=0) for c in range(cycles)]
+    firsts = list(first.values())
     return {"devices": devices, "interval": interval, "workers": workers,
             "ended": ended,
             "polls_min": polls * 60.0 / max(elapsed, 1e-9),
             "p50": pct(lateness, 0.50), "p95": pct(lateness, 0.95),
             "max": max(lateness) if lateness else 0.0,
             "overruns": overruns,
-            "sub_peak": max(per_second.values()) if per_second else 0,
+            "peaks": "/".join(str(n) for n in peaks),
             "sub_mean": len(submitted) / max(elapsed, 1e-9),
+            "first_mean": statistics.fmean(firsts) if firsts else 0.0,
+            "first_max": max(firsts) if firsts else 0.0,
             "busy_mean": statistics.fmean(sampler.busy) if sampler.busy else 0.0,
             "busy_p95": pct(sampler.busy, 0.95),
             "queue_p95": pct(sampler.queued, 0.95),
@@ -258,7 +276,7 @@ def run_combo(db, devices: int, workers: int, interval: int, seconds: float,
 HEADER = (f"  {'devices':>7} {'interval':>8} {'workers':>7} {'ended':>6} "
           f"{'polls/min':>9} "
           f"{'late p50':>9} {'late p95':>9} {'late max':>9} {'overruns':>8} "
-          f"{'sub/s pk':>8} {'sub/s mean':>10} "
+          f"{'pk/cycle':>14} {'sub/s':>6} {'first mean':>10} {'first max':>9} "
           f"{'busy mean':>9} {'busy p95':>8} {'queue p95':>9} {'sat %':>6}")
 
 
@@ -268,13 +286,14 @@ def row(result: dict) -> str:
             f"{result['polls_min']:>9.0f} "
             f"{result['p50']:>9.2f} {result['p95']:>9.2f} "
             f"{result['max']:>9.2f} {result['overruns']:>8} "
-            f"{result['sub_peak']:>8} {result['sub_mean']:>10.1f} "
+            f"{result['peaks']:>14} {result['sub_mean']:>6.1f} "
+            f"{result['first_mean']:>10.2f} {result['first_max']:>9.2f} "
             f"{result['busy_mean']:>9.1f} {result['busy_p95']:>8} "
             f"{result['queue_p95']:>9} {result['saturated_pct']:>5.0f}%")
 
 
 def synthetic(argv_sizes, workers, interval, seconds, down_fraction, seed,
-              auto=False, cold_start=False) -> int:
+              auto=False, mode="steady") -> int:
     folder = tmpdir("bench_poll_cycle_")
     print(f"scratch: {folder}")
     shares = list(DISTRIBUTION)
@@ -298,13 +317,14 @@ def synthetic(argv_sizes, workers, interval, seconds, down_fraction, seed,
               f"{seconds:.0f} s per pool size"
               + ("  [auto-sizing ON: workers is the START size, ended is where "
                  "it got to]" if auto else "")
-              + ("  [cold start: no stagger, the whole fleet is due on pass one]"
-                 if cold_start else ""))
+              + {"cold": "  [cold start: never polled, all due on pass one]",
+                 "restart": "  [restart: every last_poll_ts two intervals stale]",
+                 }.get(mode, ""))
         print(HEADER)
         try:
             for count in workers:
                 print(row(run_combo(db, devices, count, interval, seconds,
-                                    costs, auto, cold_start)))
+                                    costs, auto, mode)))
         finally:
             db.close()
     return 0
@@ -387,7 +407,7 @@ def main(argv) -> int:
     seed = 7
     mode = "synthetic"
     auto = False
-    cold_start = False
+    fleet_mode = "steady"
     interface_counts = [8, 48, 240]
     polls = 10
     index = 0
@@ -398,7 +418,9 @@ def main(argv) -> int:
         elif item == "--auto":
             auto = True
         elif item == "--cold-start":
-            cold_start = True
+            fleet_mode = "cold"
+        elif item == "--restart":
+            fleet_mode = "restart"
         elif item == "--synthetic":
             mode = "synthetic"
         elif item in ("--workers", "--interval", "--seconds", "--down-fraction",
@@ -425,7 +447,7 @@ def main(argv) -> int:
     if mode == "stub":
         return stub(interface_counts, polls)
     return synthetic(sizes or [300], workers, interval, seconds,
-                     down_fraction, seed, auto, cold_start)
+                     down_fraction, seed, auto, fleet_mode)
 
 
 if __name__ == "__main__":

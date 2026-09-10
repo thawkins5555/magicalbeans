@@ -2263,8 +2263,13 @@ def _get_audit_search(service, params) -> dict:
 
 # ------------------------------------------------------------------- syslog
 
-def _syslog_filters(params) -> dict:
-    return {
+# One id_chunks chunk from each lookup. Raising it is safe -- syslogdb's
+# host clause chunks whatever it is given.
+SYSLOG_HOST_IP_CAP = 500
+
+
+def _syslog_filters(service, params) -> dict:
+    filters = {
         "text": params.get("q", ""),
         "severity": params.get("severity") or None,
         "facility": params.get("facility") or None,
@@ -2272,6 +2277,17 @@ def _syslog_filters(params) -> dict:
         "host": params.get("host", ""),
         "app": params.get("app", ""),
     }
+    # The Host column often shows a name resolved from Nodes or DNS that was
+    # never stored on the row, so the stored host alone cannot answer a search
+    # for it. Resolve the fragment to the addresses it could mean and let
+    # syslogdb match those too.
+    host = filters["host"].strip()
+    if host:
+        ips = set(service.nodes_db.device_ips_by_name(host, SYSLOG_HOST_IP_CAP))
+        for row in service.app_db.search_hostnames(host, SYSLOG_HOST_IP_CAP):
+            ips.add(row["ip"])
+        filters["host_ips"] = sorted(ips)[:SYSLOG_HOST_IP_CAP]
+    return filters
 
 
 def get_syslog_overview(service, params, body) -> dict:
@@ -2279,7 +2295,7 @@ def get_syslog_overview(service, params, body) -> dict:
     t1 = _num(params, "t1", time.time())
     t0 = _num(params, "t0", t1 - 86400)
     bucket = _num(params, "bucket", 3600)
-    filters = _syslog_filters(params)
+    filters = _syslog_filters(service, params)
 
     buckets = service.syslog_db.histogram(t0, t1, bucket, filters)
     stats = service.cached_poll("syslog_stats", 10.0,
@@ -2311,7 +2327,7 @@ def _syslog_search_rows(service, params, cap: int, *,
                         ) -> tuple[list[dict], bool, float, int, bool]:
     t1 = _num(params, "t1", time.time())
     t0 = _num(params, "t0", t1 - 86400)
-    filters = _syslog_filters(params)
+    filters = _syslog_filters(service, params)
 
     started = time.time()
     # The screen's request carries a `limit` this bounds against `cap`. The
@@ -3095,11 +3111,13 @@ def _v3_level_fields(row) -> dict:
 
 
 def _device_json(row, reveal: bool = False) -> dict:
+    overrides = nodesdb.override_fields(row)
     return {
         "id": row["id"], "ip": row["ip"], "name": row["name"],
         "group_id": row["group_id"], "device_group_id": row["device_group_id"],
         "display_name_source": row["display_name_source"],
         "enabled": bool(row["enabled"]),
+        "override_fields": list(overrides), "override_count": len(overrides),
         "snmp_version": row["snmp_version"],
         **_community_fields(row, reveal),
         "v3_user": row["v3_user"], "v3_auth_proto": row["v3_auth_proto"],
@@ -3512,6 +3530,7 @@ def _device_filters(params) -> dict:
         # checkbox is checked, so its mere presence is the signal — no
         # string-vs-boolean parsing of a possible "false" needed.
         "exclude_up": params.get("offline_only") is not None,
+        "overrides_only": params.get("overrides_only") is not None,
     }
 
 
@@ -3551,13 +3570,11 @@ def _planned_down(service) -> set[int]:
 
 
 def _fleet_counts(service) -> tuple[dict, set[int]]:
-    """device_counts() with planned outages moved from `down` to their own
-    `maintenance` figure; `total` is untouched."""
+    """device_counts() with planned outages moved from `down` to `maintenance`."""
     counts = service.nodes_db.device_counts()
     planned = _planned_down(service)
     counts["maintenance"] = len(planned)
-    # Two reads, not one snapshot, so a poll landing between them is clamped.
-    counts["down"] = max(0, counts["down"] - len(planned))
+    counts["down"] = max(0, counts["down"] - len(planned))   # two reads, not one snapshot
     return counts, planned
 
 
@@ -3628,7 +3645,7 @@ def get_nodes_devices(service, params, body) -> dict:
 _DEVICE_CSV_HEADER = ["id", "name", "ip", "status", "group_id", "device_group_id",
                      "vendor", "sys_descr", "sys_name", "polling", "muted_until",
                      "maintenance_since", "poll_interval_s", "last_poll_ts",
-                     "addresses"]
+                     "override_count", "addresses"]
 
 
 def get_nodes_devices_export(service, params, body) -> dict:
@@ -3650,6 +3667,7 @@ def get_nodes_devices_export(service, params, body) -> dict:
                 d.get("muted_until"),
                 (d.get("maintenance") or {}).get("started_ts"),
                 d.get("poll_interval_s"), d.get("last_poll_ts"),
+                d.get("override_count"),
                 ", ".join(a["ip"] for a in d.get("addresses") or ())]
                for d in devices]
     return _csv_response("devices", header, csv_rows)
@@ -9429,9 +9447,7 @@ DASHBOARD_METRICS = (
 
 DASHBOARD_OFFENDER_N = 10
 DASHBOARD_OFFENDER_WINDOW_S = 86400.0
-# Matches STATE_COUNTS_TTL_S: a single tab at dashboard_refresh_s loses no
-# freshness; N tabs cost one compute.
-DASHBOARD_TTL_S = 2.0
+DASHBOARD_TTL_S = 2.0               # as STATE_COUNTS_TTL_S: one tab loses nothing
 DASHBOARD_OFFENDERS_TTL_S = 30.0    # against the 60 s client cadence
 
 
@@ -9441,23 +9457,15 @@ def _dash_can(service, params, module: str) -> bool:
 
 
 def _dashboard_section(service, key: str, ttl_s: float, compute):
-    # cached_poll hands one object to every caller; deep-copied so no
-    # response ever holds cached structure (tests/test_state_cache.py).
+    # cached_poll shares one object; a deep copy keeps every response its own.
     return copy.deepcopy(service.cached_poll(key, ttl_s, compute))
 
 
 def _dashboard_fleet(service) -> dict:
     poller = service.node_poller
-    # pool_state() separates busy from queued; the old gauge added them
-    # together against the pool size and read "48 of 32 busy".
     pool = poller.pool_state() if hasattr(poller, "pool_state") else {}
     counts, planned = _fleet_counts(service)
-    # Named here rather than in the browser: nodes.js's displayName is
-    # private to that module, so the tile would otherwise print the raw
-    # `name` column — which is the IP again for a device nobody renamed.
-    # Capped like the offender lists, with the remainder carried so the
-    # tile can say how many it is not showing rather than imply there are
-    # only ten.
+    # device_name, not `name`: the raw column is the IP for a device nobody renamed.
     down_total = service.nodes_db.devices_count(status="down", exclude_ids=planned)
     down = [{"device_id": row["id"],
              "name": namelookup.device_name(row) or row["ip"],
@@ -9478,8 +9486,6 @@ def _dashboard_alerts(service) -> dict:
     return {
         "open": summary.get("open", 0),
         "acked": summary.get("acked", 0),
-        # Coloured by the worst open severity, never the total: one
-        # severity-1 outage must not hide behind forty severity-6 notices.
         "worst": summary.get("worst"),
         "by_severity": service.alerts_db.open_counts_by_severity(),
         # A GROUP BY has no cap; the key stays because dashboard.js reads it.
@@ -9490,15 +9496,9 @@ def _dashboard_alerts(service) -> dict:
 
 
 def _dashboard_storage(service) -> list[dict]:
-    # Headroom, not raw sizes: "which database is closest to its cap" is
-    # the question, and it is answered worst-first.
+    # Headroom worst-first, over STORES so no view disagrees about the store count.
     settings = service.settings or {}
     stores = []
-    # STORES, not a list of its own: this one was hand-written beside
-    # _storage's and mapper.db went into that one and not this one, so
-    # two views of the same question disagreed about how many databases
-    # exist. A store with no cap reports its size with no fraction
-    # rather than 0% used.
     for store in STORES:
         db = db_for(service, store)
         if db is None:
@@ -9519,9 +9519,7 @@ def _dashboard_storage(service) -> list[dict]:
 
 
 def get_dashboard(service, params, body) -> dict:
-    """The cross-module numbers the tile grid shows, in one round trip.
-    Each section is cached under its own key and assembled into a fresh
-    dict only for a caller that may read its module."""
+    """The cross-module numbers the tile grid shows, in one round trip."""
     result: dict = {}
 
     if _dash_can(service, params, "nodes"):
@@ -9567,10 +9565,7 @@ def get_dashboard(service, params, body) -> dict:
 def _offender_rows(rows, n: int, value_key: str, unit: str) -> list[dict]:
     out = []
     for row in rows[:n]:
-        # namelookup.device_name mirrors Nodes' own display precedence;
-        # row["name"] alone equals the IP for a device nobody has
-        # renamed. A row without sys_name in its keys falls back to
-        # the raw name.
+        # A row without sys_name (top_metric) falls back to the raw name.
         keys = row.keys()
         name = (namelookup.device_name(row) if "sys_name" in keys else row["name"])
         out.append({"device_id": row["device_id"],
@@ -9582,12 +9577,9 @@ def _offender_rows(rows, n: int, value_key: str, unit: str) -> list[dict]:
 
 
 def _offender_node_lists(service, since: float, n: int) -> tuple[list, list]:
-    """(the two event lists, the metric lists) — the alerts list sits
-    between them in the response and is gated separately."""
+    """(event lists, metric lists); the gated alerts list goes between them."""
     events = service.nodes_db.count_events_by_device(since, limit=n)
-    # Interface flaps are device events too, and they are the ones an
-    # operator chases; kept as their own list rather than folded into the
-    # count above, which would hide a flapping port behind a noisy device.
+    # Flaps are their own list so a flapping port is not hidden by a noisy device.
     flaps = service.nodes_db.count_events_by_device(
         since, kinds=["interface_down", "interface_up", "interface_flapping"],
         limit=n)

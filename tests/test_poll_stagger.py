@@ -100,7 +100,7 @@ def restart_spread(clock):
     check(max(dues) - min(dues) > SPREAD / 2,
           f"…and spread across that window ({max(dues) - min(dues):.1f} s)")
 
-    run_passes(poller, clock, int(SPREAD) + 1)
+    run_passes(poller, clock, int(SPREAD))
     polled = {device_id for device_id, _at, _due in submissions}
     peak = max(per_pass(submissions).values(), default=0)
     check(polled == set(ids),
@@ -143,7 +143,15 @@ def never_polled_still_immediate(clock):
 def phase_break(clock):
     db, poller, ids, submissions = build()
     clock.now = T0
+    stuck = ids[-1]
+    poller._queued[stuck] = T0 - 1
     poller._schedule_pass()
+    check(poller._next_run[stuck] == T0 + INTERVAL
+          and stuck not in poller._staggered,
+          "a device still queued when it comes due is not pulled earlier, "
+          "and keeps its phase break for later")
+    del poller._queued[stuck]
+    ids = ids[:-1]
     dues = [poller._next_run[i] for i in ids]
     check(len(set(dues)) > DEVICES // 2,
           f"after one cycle a phase-locked fleet has dispersed due times "
@@ -159,8 +167,14 @@ def phase_break(clock):
     peak = max(per_pass(submissions).values())
     check(peak <= DEVICES // 4,
           f"the second cycle is spread rather than a burst (peak {peak} per pass)")
-    check(all(due - at == INTERVAL for _id, at, due in submissions),
+    check(all(due - at == INTERVAL
+              for device_id, at, due in submissions if device_id != stuck),
           "…and every reschedule after the first is the plain interval")
+    own = [due - at for device_id, at, due in submissions if device_id == stuck]
+    check(own and MIN_FRACTION * INTERVAL <= own[0] < INTERVAL
+          and all(gap == INTERVAL for gap in own[1:]),
+          f"…the once-stuck device gets its phase break on its next reschedule "
+          f"({own[:2]})")
 
     by_device: dict[int, list[float]] = {}
     for device_id, at, _due in submissions:
