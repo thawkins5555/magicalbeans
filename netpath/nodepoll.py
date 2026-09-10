@@ -72,6 +72,13 @@ _POLL_COST_ALPHA = 0.3
 # nothing legitimate approaches it.
 _POLL_COST_CEILING_S = 600.0
 
+# Restart spread: long enough to flatten a large fleet, short enough that a
+# device that died during the outage is still noticed inside half a minute.
+_STARTUP_SPREAD_S = 30.0
+# The first reschedule after a poll lands in [fraction, 1.0] x interval --
+# earlier only, so no device is ever polled less often than configured.
+_STAGGER_MIN_FRACTION = 0.5
+
 _MAX_VLANS = 512
 _VLAN_WALK_BUDGET_S = 20.0
 
@@ -1447,6 +1454,7 @@ class NodePoller(Worker):
         self._queued: dict[int, float] = {}
         self._started: dict[int, float] = {}
         self._next_run: dict[int, float] = {}
+        self._staggered: set[int] = set()
         # device_id -> when it was last pinged, so ping_interval_s can
         # decouple ICMP probing from the SNMP poll cadence.
         self._last_ping: dict[int, float] = {}
@@ -2232,10 +2240,21 @@ class NodePoller(Worker):
                 interval = min(interval, focus[2])
             due = self._next_run.get(device_id)
             if due is None:
-                due = (device["last_poll_ts"] + interval) if device["last_poll_ts"] else now
+                last = device["last_poll_ts"]
+                due = (last + interval) if last else now
+                if last and now >= due:
+                    due = now + random.uniform(0, min(interval, _STARTUP_SPREAD_S))
                 self._next_run[device_id] = due
             if now >= due:
-                self._next_run[device_id] = now + interval
+                # Focus is left exact: it exists to make the selected device
+                # feel live, and the phase break waits for its first
+                # unfocused reschedule.
+                if focused or device_id in self._staggered:
+                    self._next_run[device_id] = now + interval
+                else:
+                    self._staggered.add(device_id)
+                    self._next_run[device_id] = now + interval * random.uniform(
+                        _STAGGER_MIN_FRACTION, 1.0)
                 if device_id in self._started or device_id in self._queued:
                     # A poll slower than the fast focus cadence is
                     # expected, not an overrun worth logging — only
@@ -2479,6 +2498,8 @@ class NodePoller(Worker):
         # once" memory for a device that answers no ARP table.
         self._arp_unanswered.difference_update(
             [k for k in list(self._arp_unanswered) if k not in keep])
+        self._staggered.difference_update(
+            [k for k in list(self._staggered) if k not in keep])
         with self._lock:
             for jobs in (self._oid_walks, self._vendor_ids):
                 for device_id in [k for k in jobs if k not in keep]:

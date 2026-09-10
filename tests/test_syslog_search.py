@@ -114,6 +114,81 @@ try:
 finally:
     db.close()
 
+
+# --------------------------------- 3. host search widened by resolved IPs
+#
+# `logs.host` is only what the device put in the syslog header -- often
+# blank. The API resolves the typed fragment to device IPs and hands them in
+# as filters["host_ips"]; the host clause must then accept a row by source.
+
+db = SyslogDatabase(os.path.join(TMP, "syslog_hosts.db"))
+try:
+    T = 1_700_100_000.0
+    WIN = (T - 10, T + 10)
+
+    def row(ts, source, host, message):
+        return LogEntry(ts=ts, source=source, host=host, severity=6,
+                        message=message, raw=message)
+
+    many_ips = [f"10.9.{i // 256}.{i % 256}" for i in range(1, 602)]
+    db.insert([
+        row(T, "10.0.0.1", "", "blank host, source resolves"),
+        row(T + 1, "10.0.0.2", "core-sw-b", "self-reported host"),
+        row(T + 2, "10.0.0.3", "", "blank host, unrelated source"),
+        row(T + 3, many_ips[-1], "", "blank host, ip in second chunk"),
+        row(T - 100, "10.0.0.1", "", "resolves, but outside the window"),
+    ])
+
+    def hosts(filters, window=WIN):
+        return sorted(r["message"] for r in db.search(*window, filters))
+
+    check("blank self-reported host, source in host_ips: found",
+          hosts({"host": "core-sw", "host_ips": ["10.0.0.1"]})
+          == ["blank host, source resolves"],
+          hosts({"host": "core-sw", "host_ips": ["10.0.0.1"]}))
+    check("self-reported host still matches the LIKE alongside host_ips",
+          hosts({"host": "core-sw-b", "host_ips": ["10.0.0.1"]})
+          == ["blank host, source resolves", "self-reported host"],
+          hosts({"host": "core-sw-b", "host_ips": ["10.0.0.1"]}))
+    check("host_ips absent: only the LIKE, as before",
+          hosts({"host": "core-sw"}) == ["self-reported host"],
+          hosts({"host": "core-sw"}))
+    check("host_ips empty: same rows as absent",
+          hosts({"host": "core-sw", "host_ips": []})
+          == hosts({"host": "core-sw"}),
+          hosts({"host": "core-sw", "host_ips": []}))
+    check("host_ips without host is not a filter of its own",
+          len(hosts({"host_ips": ["10.0.0.1"]})) == 4,
+          hosts({"host_ips": ["10.0.0.1"]}))
+    where_plain = db._where(*WIN, {"host": "x"})
+    check("no host_ips: the WHERE is byte-identical to the plain host clause",
+          db._where(*WIN, {"host": "x", "host_ips": []}) == where_plain
+          and db._where(*WIN, {"host": "x", "host_ips": None}) == where_plain
+          and where_plain[0] == "l.ts >= ? AND l.ts <= ? AND l.host LIKE ?",
+          where_plain)
+
+    # 601 IPs -> two IN chunks. The match lives in the second chunk, and the
+    # out-of-window row with a first-chunk source must stay out: a chunk
+    # OR-ed at the wrong nesting level would let it through.
+    wide = {"host": "nomatch", "host_ips": ["10.0.0.1", *many_ips]}
+    check("more than 500 IPs still matches (second chunk)",
+          hosts(wide) == ["blank host, ip in second chunk",
+                          "blank host, source resolves"],
+          hosts(wide))
+    sql, params = db._where(*WIN, wide)
+    check("chunks are OR-ed inside the host parenthesis, under the time AND",
+          sql.startswith("l.ts >= ? AND l.ts <= ? AND (l.host LIKE ? OR l.source IN (")
+          and sql.count(" OR l.source IN (") == 2 and sql.endswith("))")
+          and len(params) == 2 + 1 + 602, sql[:120])
+    check("the histogram takes the same widened clause",
+          sum(b["total"] for b in db.histogram(WIN[0], WIN[1], 3600, wide)) == 2,
+          db.histogram(WIN[0], WIN[1], 3600, wide))
+    check("...and the out-of-window row stays out of the histogram",
+          sum(b["total"] for b in db.histogram(T - 200, T - 50, 3600, wide)) == 1,
+          db.histogram(T - 200, T - 50, 3600, wide))
+finally:
+    db.close()
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 raise SystemExit(1 if FAILS else 0)

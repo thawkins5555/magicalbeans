@@ -14,7 +14,7 @@ import threading
 import time
 
 from .eventlog import ERROR, NullLog, SYSTEM
-from .sqlitebase import SqliteStore
+from .sqlitebase import SqliteStore, id_chunks
 
 log = logging.getLogger(__name__)
 
@@ -586,8 +586,18 @@ class SyslogDatabase(SqliteStore):
             clauses.append("l.source LIKE ?")
             params.append(f"%{filters['source']}%")
         if filters.get("host"):
-            clauses.append("l.host LIKE ?")
+            clause = "l.host LIKE ?"
             params.append(f"%{filters['host']}%")
+            # Widened by the addresses the API resolved the fragment to;
+            # one parenthesis, so a second chunk cannot escape the time AND.
+            ips = [ip for ip in (filters.get("host_ips") or ()) if ip]
+            if ips:
+                ors = []
+                for chunk in id_chunks(ips):
+                    ors.append(f"l.source IN ({','.join('?' * len(chunk))})")
+                    params.extend(chunk)
+                clause = f"({clause} OR {' OR '.join(ors)})"
+            clauses.append(clause)
         if filters.get("app"):
             clauses.append("l.app LIKE ?")
             params.append(f"%{filters['app']}%")
