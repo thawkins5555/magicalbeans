@@ -4,8 +4,8 @@
 # FORTI-AP: what else can be polled, and what it would cost
 
 Research note, not an implementation. Nothing here is wired up. Every
-file:line reference below was checked against the tree at commit `e5e62b3`
-(the in-progress 5.9.0 branch) on 2026-09-10.
+file:line reference below was checked against the 5.9.0 release tree, with
+this release's documentation pass applied, on 2026-09-10.
 
 ## What is polled today
 
@@ -60,7 +60,7 @@ The columns polled today are 3 / 3, 6, 7, 12, 17 / 3, 7, 8, 9. The gaps
 are the candidates. Which of those gaps a given FortiOS build actually
 populates, and what it puts there, is an empirical question, and this MIB
 has already been caught answering it wrongly: `nodeoids.py:843-851` and
-`INTERNALS.md:6797-6810` document that `fgWcWtpSessionRadioOperatingPower`
+`INTERNALS.md:6832-6844` document that `fgWcWtpSessionRadioOperatingPower`
 is described as dBm and observed FortiOS returns its 0-100 power level in
 that object, which is why `api._power_unit` auto-detects per controller.
 A candidate list built from MIB text would inherit that risk on every
@@ -68,14 +68,14 @@ row. So:
 
 **Walk the three table entries and the `fgWc` root on a production
 controller, and keep the output.** The app can do this itself: the OID
-browser (`api.get_nodes_device_oids`, `netpath/web/api.py:4782`, backed by
-`NodePoller.walk_subtree`, `netpath/nodepoll.py:7160`) walks any numeric
+browser (`api.get_nodes_device_oids`, `netpath/web/api.py:4864`, backed by
+`NodePoller.walk_subtree`, `netpath/nodepoll.py:7184`) walks any numeric
 OID from a Nodes device's pane. Three practical points:
 
 1. The browser is a Nodes feature. The controller must exist as a Nodes
    device with working SNMP — the Wireless tab already assumes it usually
    does (`wireless.js:197-198`, the controller-to-device link).
-2. The browser caps a walk at 600 rows or 20 s (`nodepoll.py:7157-7158`)
+2. The browser caps a walk at 600 rows or 20 s (`nodepoll.py:7181-7182`)
    and says which limit it hit. On a controller with, say, 40 APs and a
    session table of 20-odd columns, walking `.4.1` whole is ~800 rows and
    will be cut short. Walk one column at a time (`.4.1.<n>`) on a big
@@ -105,7 +105,7 @@ not to exist on the walked firmware, strike it.
 
 Everything here is derived from rows the poller already has in hand each
 cycle. The cost is storage and a small amount of code; the design stance
-in `INTERNALS.md:6924-6932` ("derived ... so adding one costs no extra
+in `INTERNALS.md:6958-6966` ("derived ... so adding one costs no extra
 SNMP") is exactly this tier. It should go first.
 
 ### A1. Per-AP client count as a time series
@@ -117,7 +117,7 @@ built and charted for a module that is also "a handful of things":
 per poll, written by `record_scope_usage` (`:725-732`), read by a
 windowed query (`:734-742`), pruned at `dhcp_history_days` (default 35,
 `netpath/web/service.py:1430-1431`), served by `get_ipam_dhcp_scope_history`
-(`api.py:3023-3036`) and drawn by `drawScopeTrend` (`ipam.js:896`). An
+(`api.py:3058-3071`) and drawn by `drawScopeTrend` (`ipam.js:896`). An
 `ap_history(ap_id, ts, station_count)` table is that pattern copied
 verbatim, with its prune added beside `prune_ap_events()` at
 `service.py:1443`.
@@ -153,7 +153,7 @@ reason on the same scale (one DHCP server, a few scopes, still worth a
 trend line). One SVG per selected AP in the detail pane, 24 h / 7 d
 toggle, copied from `drawScopeTrend`. Note there is no shared chart
 helper in `app.js` — `ipam.js` and `nodes.js` (`drawSeriesChart`,
-`nodes.js:1161`) each carry their own — so this is a copy, not a call.
+`nodes.js:1189`) each carry their own — so this is a copy, not a call.
 
 ### A2. Channel-change events
 
@@ -257,7 +257,7 @@ verified; Step 0 decides which exist and at which column.
 For a per-AP column the poller side is one `_walk_column` call at
 `fortipoll.py:232-241` and one keyword into `upsert_ap` (`:264-272`); for
 a per-radio column it is the `radios.append` dict (`:287-294`) plus the
-INSERT in `replace_radios` and `_radio_json` (`api.py:7250-7267`) and the
+INSERT in `replace_radios` and `_radio_json` (`api.py:7333-7349`) and the
 detail pane lines (`wireless.js:207-227`) rather than `ALL_COLUMNS`.
 
 ## Tier C — a new table: per-client data
@@ -316,7 +316,7 @@ Cheap and well-trodden. Six touch points for a per-AP column:
 3. `netpath/fortipoll.py:232-241` — one `_walk_column` call; thread the
    value into `upsert_ap` at `:264-272`, with a `_format_*`/`_as_int`
    normaliser if the type needs one.
-4. `netpath/web/api.py:7294-7329` — one field in `_ap_json`.
+4. `netpath/web/api.py:7376-7411` — one field in `_ap_json`.
 5. `netpath/web/static/wireless.js:87-126` — one `ALL_COLUMNS` entry
    (off by default; `table_columns` in settings carries the operator's
    choice).
@@ -327,8 +327,8 @@ Plus two that are easy to forget: the demo persona
 (`demo/personas.py:1534-1552`) if the demo should show the column, and
 the column list in `FEATURES.md` (the "Choose which columns to show"
 paragraph). The cleanest worked example is the per-AP response time —
-`CHANGELOG.md:5201-5207`, which sits under the **4.28.0** heading at
-`:5153`, not 5.1.0 — which touched every one of these and added
+`CHANGELOG.md:5406-5412`, which sits under the **4.28.0** heading at
+`:5358`, not 5.1.0 — which touched every one of these and added
 `_format_ip` for a type that arrived in a form the MIB did not describe
 (`fortipoll.py:418-448`).
 
@@ -353,9 +353,9 @@ up to four controllers' walks and 20 s ping sweeps run in the same window
 every cycle. On a handful of controllers it is harmless; it becomes
 visible the moment a per-client table or more columns lengthen the cycle.
 The node poller does not have this shape: it seeds from the device's own
-`last_poll_ts` (`netpath/nodepoll.py:2233-2236`, and the docstring at
+`last_poll_ts` (`netpath/nodepoll.py:2241-2247`, and the docstring at
 `:4-5`), and its secondary walks spread the first run with
-`random.uniform(0, interval)` (`:2506-2508`, `:2538`, `:2567`, `:2605`).
+`random.uniform(0, interval)` (`:2530-2532`, `:2562`, `:2591`, `:2629`).
 Either is a two-line change here — seeding from `controllers.last_poll_ts`
 is the closer match. The node poller's own version of this was fixed in
 5.9.0: it now spreads the first poll after a restart and breaks the shared

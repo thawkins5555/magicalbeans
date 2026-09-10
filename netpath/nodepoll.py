@@ -2,7 +2,7 @@
 
 Monitor-shaped, not IpamWorker-shaped — a hot-resizable ThreadPoolExecutor,
 restart-safe per-device due-time seeding (from the device's own
-last_poll_ts, so a service restart does not fire every device at once),
+last_poll_ts, with a bounded spread for whatever an outage left overdue),
 reschedule-before-run, overrun logging, and a wrap-everything/finally
 worker discipline, all copied from netpath/monitor.py's Monitor class.
 Nodes will typically manage far more devices than IPAM manages subnets, so
@@ -2329,9 +2329,9 @@ class NodePoller(Worker):
             self._autoscale_demand = demand
 
         # Saturation is sampled on EVERY pass, not at the evaluation instants
-        # below, and any unsaturated pass resets the clock. The scheduler
-        # submits every due device at once, so a fleet whose devices share a
-        # due-time phase is saturated in bursts by design; sampling only
+        # below, and any unsaturated pass resets the clock. Devices due on the
+        # same pass are still submitted together (the stagger thins bursts, it
+        # does not remove them), so saturation arrives in bursts; sampling only
         # every 15 s can land inside burst after burst and read that as
         # continuous, ratcheting the pool up against a model that was right.
         # It would then shrink on the votes, re-lock, and ratchet again --

@@ -1,8 +1,9 @@
 """Jitter on the main poll cycle: a restart spreads a stale fleet over
 _STARTUP_SPREAD_S instead of firing it on pass one, and the first reschedule
 after a poll breaks the phase lock that kept devices due together for the
-life of the process. Neither may delay a first poll or stretch any device's
-period past its configured interval.
+life of the process. The startup spread is the one deliberate delay, bounded
+by _STARTUP_SPREAD_S or the interval; a never-polled device is never delayed,
+and neither spread stretches any device's period past its interval.
 
 No threads and no sleeps: _schedule_pass is driven directly against a clock
 the test advances by hand and a seeded random.Random swapped into nodepoll,

@@ -354,10 +354,13 @@ tiles, since they are history rather than live state.
 **Planned work is not an outage.** A device in maintenance mode, or inside an
 active maintenance window, is not counted among the down — on this tile, on
 the Nodes status strip, or in the tab badges. It is shown as its own
-`in maintenance` figure beside the down count rather than disappearing, and
-that figure links to the same list filtered to it. A device you have merely
-*muted* still counts as down: a mute silences a fault, maintenance declares
-there isn't one.
+`in maintenance` figure beside the down count rather than disappearing. On
+the Dashboard that figure links to the Nodes list filtered to devices that
+are both in maintenance and down, and the list's **Only in maintenance**
+filter counts a scheduled window as maintenance just as the figure does, so
+the number and the list it opens agree; the Nodes status strip shows the
+same figure as plain text. A device you have merely *muted* still counts as
+down: a mute silences a fault, maintenance declares there isn't one.
 
 **The Worst ten lists name a device the way Nodes itself does.** A device
 discovered by IP has a raw `name` equal to its IP until someone renames it,
@@ -658,13 +661,16 @@ own subtabs.
   once and the whole fleet lands on the pollers in a single pass. Worse, it
   stayed that way — devices that came due together were all given the same
   next due time, so a fleet that started in step never fell out of step.
-  Two spreads fix it: a device overdue at startup is given a moment inside
-  the next half minute rather than firing immediately, and every device's
-  first reschedule after that is pulled somewhere into the second half of
-  its interval, once, which breaks the shared phase for good. Both only ever
-  move a poll *earlier*, so nothing is polled less often than its profile
-  says. A device that has never been polled — one you just added — still
-  polls on the next pass, unspread.
+  Two spreads fix it, and they move a poll in opposite directions. A device
+  already overdue at startup is given a moment inside the next thirty
+  seconds, or one interval, whichever is shorter, rather than firing
+  immediately — the one place a poll is deliberately delayed, and by no more
+  than that. Every device's first reschedule after that is then pulled
+  somewhere into the second half of its interval, once, which breaks the
+  shared phase for good; that spread only ever moves a poll *earlier*, so
+  once running nothing is polled less often than its profile says. A device
+  that has never been polled — one you just added — still polls on the next
+  pass, unspread.
 - **The selected device polls fast while you watch it** — selecting a
   device drops its SNMP poll cadence to a configurable few seconds
   (Nodes → Settings, "Selected-device poll interval"; default 3 s, 0

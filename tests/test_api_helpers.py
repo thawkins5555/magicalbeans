@@ -448,9 +448,21 @@ try:
     # a mute does not — a muted device is still genuinely down, only quiet.
     # The excluded devices move to a sibling `maintenance` figure rather
     # than vanishing, so total is unchanged.
+    up_maint = service.nodes_db.add_device("203.0.113.41")
+    service.nodes_db.record_poll(
+        up_maint, ping_ok=True, ping_rtt_ms=1.0, snmp_ok=True,
+        snmp_error="", identity=None, uptime_ticks=None,
+        status="up", reachable=True)
+    service.alerts_db.set_maintenance(up_maint, by="test")
     raw_down = service.nodes_db.devices_count(status="down")
     total_before = service.nodes_db.device_count()
     now = time.time()
+    rule = service.alerts_db.rules()[0]
+    for n, dedup in enumerate(("dash-sev-open", "dash-sev-acked")):
+        row, _ = service.alerts_db.open_or_increment(
+            rule["id"], dedup, "device", str(down_ids[n]), f"dev{n}",
+            rule["severity"], "dashboard fixture", "", now)
+    service.alerts_db.acknowledge(row["id"], "test")
     service.alerts_db.set_maintenance(down_ids[1], by="test")
     service.alerts_db.add_window("dash-win-devices", "devices", now - 60, now + 3600,
                                  scope_device_ids=[down_ids[2]])
@@ -488,6 +500,18 @@ try:
     check("down_more is consistent with the reduced count",
           fleet.get("down_more") == counts.get("down", 0) - len(rows),
           (fleet.get("down_more"), counts.get("down"), len(rows)))
+    check("an up device in maintenance mode is not a planned outage",
+          up_maint not in api_mod._planned_down(service) and counts.get("maintenance") == 3,
+          (sorted(api_mod._planned_down(service)), counts))
+    check("…and stays in the up count",
+          counts.get("up") == service.nodes_db.devices_count(status="up") >= 1,
+          (counts.get("up"), service.nodes_db.devices_count(status="up")))
+    alerts = payload.get("dashboard", {}).get("alerts", {}) if status == 200 else {}
+    check("by_severity covers acked alerts as well as open ones",
+          alerts.get("acked", 0) >= 1
+          and sum(alerts.get("by_severity", {}).values())
+          == alerts.get("open", 0) + alerts.get("acked", 0),
+          alerts)
 
     status, payload = call("GET", "/api/nodes/overview", token=admin)
     overview_counts = payload.get("device_counts", {}) if status == 200 else {}

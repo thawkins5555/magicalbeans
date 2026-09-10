@@ -161,8 +161,12 @@ figure that disagreed with the tile beside it would read as a fresh bug.
 **Nothing vanishes.** Subtracting from `down` and stopping there would make
 devices disappear from the interface entirely, which is worse than
 overcounting them. Each of the three now carries its own `in maintenance`
-figure beside `down`, in a neutral colour — planned work is not a fault —
-linking to the same list filtered to it.
+figure beside `down`, in a neutral colour — planned work is not a fault. On
+the Dashboard that figure is a link, to the Nodes list filtered to devices
+that are both in maintenance and down; and the list's **Only in
+maintenance** filter now counts a scheduled maintenance window as
+maintenance, as the figure always has, so the number and the list it opens
+agree. The Nodes status strip shows its figure as plain text.
 
 **A manual mute still counts as down**, deliberately. A mute means "stop
 telling me"; maintenance means "this is planned". A muted device that is
@@ -173,7 +177,9 @@ The fleet is never enumerated to work this out. Maintenance rows are few, and
 an active window names either a group or an explicit device list, so the
 candidate set comes from the windows themselves and one bounded query
 intersects it with what is actually down. With no maintenance and no active
-window — the ordinary case — it costs nothing at all.
+window — the ordinary case — it costs two small reads of `alerts.db`, the
+maintenance rows and the active windows, and nothing more: with nothing in
+either there is no candidate set to intersect.
 
 **The syslog Host box now searches the name on the screen.** There was
 already a Host filter, and it already matched partial names, but only against
@@ -209,16 +215,13 @@ And the "most events" list scanned a full day of events for the entire fleet,
 with no limit, twice per request, to show ten rows. The limit is now in the
 SQL.
 
-Measured in-process at a thousand devices, cold cache against warm: the
-dashboard route drops from 0.87 ms to 0.10 ms and the offenders route from
-1.07 ms to 0.08 ms, with the severity tally alone going from 4.15 ms to
-0.34 ms. Lock acquisitions per dashboard request fall from seven to two, and
-time spent waiting on those locks from 4.52 ms to 0.07 ms — the figure that
-matters here, because every read in the application takes its store's write
-lock and therefore queues behind the pollers' commits. The end-to-end HTTP
-timing barely moves, and that is not modesty: every route in that harness
-sits on a fixed ~44 ms keep-alive floor that has nothing to do with this
-work.
+Measured at a thousand devices, before against after: lock acquisitions per
+dashboard request fall from seven to two, and time spent waiting on those
+locks from 4.54 ms to 0.07 ms — the figure that matters here, because every
+read in the application takes its store's write lock and therefore queues
+behind the pollers' commits. The end-to-end HTTP timing barely moves, and
+that is not modesty: every route in that harness sits on a fixed ~44 ms
+keep-alive floor that has nothing to do with this work.
 
 **The fleet no longer arrives at the pollers all at once.** Per-device due
 times were seeded from each device's own last poll, which is restart-safe only
@@ -229,18 +232,23 @@ moment the scheduler starts, and the whole fleet lands in a single pass.
 The worse half was that it never recovered. Every device that came due in the
 same pass was given the *same* next due time, computed from one timestamp
 taken once per pass, so a fleet that started in step stayed in step for the
-life of the process. The autoscaler's own notes had conceded this for some
-time: "a fleet whose devices share a due-time phase is saturated in bursts by
-design."
+life of the process: measured on 300 devices at a 15-second interval,
+submissions peaked at 300 per second on every cycle, for as long as the
+process ran. The autoscaler's own notes had conceded this for some time: "a
+fleet whose devices share a due-time phase is saturated in bursts by design."
 
-Two spreads, both of which only ever move a poll *earlier*, so nothing is
-polled less often than its profile says. A device already overdue when the
-scheduler starts is given a moment inside the next half minute instead of
-firing immediately. And each device's first reschedule after that is pulled
-somewhere into the second half of its interval, once — which breaks the shared
-phase permanently, since from then on every device counts its own interval
-from its own moment. A device that has never been polled at all still polls on
-the next pass, unspread: adding a device should feel instant, and it does.
+Two spreads, and they move a poll in opposite directions, which is worth
+being exact about. A device already overdue when the scheduler starts is
+given a moment inside the next thirty seconds, or one interval, whichever is
+shorter, instead of firing immediately — the one place a poll is
+deliberately delayed, and by no more than that. And each device's first
+reschedule after that is pulled somewhere into the second half of its
+interval, once — which breaks the shared phase permanently, since from then
+on every device counts its own interval from its own moment. That spread
+only ever moves a poll *earlier*, so once the service is running nothing is
+polled less often than its profile says. A device that has never been polled
+at all still polls on the next pass, unspread: adding a device should feel
+instant, and it does.
 
 Measured on 300 devices at a 15-second interval with 32 workers, restarting
 against poll times two intervals stale — the shape a service restart actually
@@ -251,28 +259,49 @@ leaves behind:
 | Lateness against schedule, p50 | 2.93 s | 0.04 s |
 | p95 | 19.03 s | 0.96 s |
 | worst | 21.43 s | 1.68 s |
-| Peak submissions per cycle | 300 / 300 / 300 / 300 | 37 / 38 / 26 / 26 |
+| Peak submissions per second, cycle by cycle | 300 / 300 / 300 / 300 | 37 / 38 / 26 / 26 |
 | Queue depth, p95 | 220 | 4 |
 | Pool saturated | 43% of the run | 11% |
 
 The four per-cycle figures are the point. Before, the entire fleet was
-submitted at once on every single cycle, forever. After, it is spread and
-stays spread.
+submitted inside one second on every single cycle, forever. After, it is
+spread and stays spread.
 
 **What it costs, stated plainly:** the first poll after a restart now takes
 longer to come round. Mean time to first poll goes from 2.26 s to 7.94 s and
 the slowest device from 6.43 s to 15.76 s. That is the trade — a burst that
-saturates the pool, exchanged for a bounded delay of at most half a minute —
-and an operator restarting the service should expect the first sweep to take
-that long rather than wonder what is wrong.
+saturates the pool, exchanged for a delay bounded by the device's own
+interval and never more than half a minute, so a device that died during the
+outage is still noticed inside that — and an operator restarting the service
+should expect the first sweep to take that long rather than wonder what is
+wrong. A fresh install pays none of it: never-polled devices are not spread,
+so its first sweep is exactly as quick as before (2.26 s mean, 6.43 s worst,
+unchanged), and the reschedule spread breaks the fleet up from the second
+cycle on.
 
 Two smaller notes for completeness. On a pool that is genuinely
 oversubscribed (the same fleet on 8 workers, needing 20), nothing here helps
 and nothing is meant to: every poll is late because there are not enough
 workers, which is what the pool autoscaler is for. And the spread costs one
-extra poll per device, once, which on a saturated pool can log a single
-`poll_overrun` for a device whose previous poll had not finished; devices with
-a poll still in flight are left alone specifically to keep that rare.
+extra poll per device, once, which on a pool that is already behind can log a
+single `poll_overrun` for a device whose previous poll had not finished;
+devices with a poll still in flight are left alone specifically to keep that
+rare — the 32-worker run above logged one.
+
+None of this was visible before because the benchmark had no way to model a
+restart. Its two modes now do, and on the pre-fix code they agree on peak
+submissions, queue depth, pool saturation and time to first poll — 300 per
+second on every cycle whether the fleet had never been polled or had been
+polled two intervals ago; only the lateness columns differ, since a restart
+measures the first poll against a due time that was already past when the
+process started. That agreement is precisely why the lockstep shipped
+unnoticed: the cold-start run the benchmark could already do showed nothing
+a restart run would not.
+
+A sequence-based spread was tried instead of a random one, on the theory that
+randomness clumps. It was measured and dropped: the residual peak is the
+one-off extra poll per device becoming visible, not clumping, and no sequence
+removes it.
 
 **You can see which devices override their polling profile.** A device column
 left empty means "inherit from the profile"; filled in means this device
@@ -285,56 +314,11 @@ Three ways to see it now, deliberately not one. Devices that override
 anything are marked in the list itself, with the field names in the tooltip;
 there is a sortable `Overrides` column for auditing the fleet by how
 customised it is; and an **Only with overrides** filter. The marker rather
-than the column is the primary answer, because a newly added column is only
-shown by default to operators who have never opened the column picker — that
-is, the ones least likely to be looking for this. The count also rides along
-in the CSV export.
-
-**Polling is staggered, so the fleet no longer arrives all at once.** The
-scheduler seeded each device's first due time from its own last poll, which
-is restart-safe only while the service was down for less than one poll
-interval. Past that — any real outage, a maintenance window, a bulk import —
-every device is overdue the moment the poller starts, and the whole fleet is
-submitted in a single pass.
-
-The worse half was that it stayed that way. Every device that came due in the
-same pass was given the *same* next due time, so a fleet that started in
-lockstep never fell out of it. Measured on 300 devices at a 15-second
-interval, submissions peaked at 300 per second on every cycle, for as long as
-the process ran.
-
-Two spreads, both of which only ever move a poll **earlier**, so nothing is
-polled less often than its profile says. A device already overdue at startup
-is given a moment inside the next thirty seconds (or one interval, whichever
-is shorter) instead of firing immediately. And each device's first reschedule
-after that lands somewhere in the second half of its interval, once, which
-breaks the shared phase permanently. A device that has never been polled —
-one you just added — still polls on the very next pass, because making that
-feel instant matters more than spreading it.
-
-On the same 300 devices with a pool that can keep up, restarting after an
-outage: submissions per cycle fall from 300/300/300/300 to 37/38/26/26, and
-lateness against schedule from a 19.03-second 95th percentile to 0.96
-seconds.
-
-**The cost, stated plainly:** the first sweep after a restart now takes
-longer to reach any given device — mean time to first poll goes from 2.26 to
-7.94 seconds, worst case from 6.43 to 15.76. That is the trade, it is bounded
-by the device's own interval, and a device that died during the outage is
-still noticed inside half a minute. There is also one bounded artefact: a
-device whose pulled-forward poll arrives while its previous one is still
-queued logs a single `poll_overrun` — at most once per device, ever, and only
-on a pool that is already behind.
-
-None of this was visible before because the benchmark had no way to model a
-restart. Its two modes now do, and the pre-fix numbers for both are identical
-in every behavioural column — which is precisely why the lockstep shipped
-unnoticed in the first place.
-
-A sequence-based spread was tried instead of a random one, on the theory that
-randomness clumps. It was measured and dropped: the residual peak is the
-one-off extra poll per device becoming visible, not clumping, and no sequence
-removes it.
+than the column is the primary answer, because the column is off by default
+— it is there for auditing, and has to be switched on in the column picker —
+and the operator who does not yet know there is anything to look for is
+exactly the one who will never switch it on. The count also rides along in
+the CSV export.
 
 **What else the Forti-AP module could poll: a costed answer, not a change.**
 `FORTIAP-POLLING-OPTIONS.md` surveys the per-AP data the module does not

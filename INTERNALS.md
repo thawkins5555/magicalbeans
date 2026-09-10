@@ -464,7 +464,7 @@ or device["ip"]` rather than the raw `devices.name` column — `name` equals
 `ip` for a device nobody has renamed, which is what the Dashboard's "Worst
 ten" tile showed before this; `count_events_by_device` carries
 `sys_name`/`display_name_source` alongside `name` for the same reason, so
-`api.get_dashboard_offenders`'s `_rows` helper can resolve the events and
+`api.get_dashboard_offenders`'s `_offender_rows` helper can resolve the events and
 interface-events lists' names the identical way. Since 5.3.0 the Fleet
 tile's own down list is named through `namelookup.device_name` server-side
 for the same reason: `nodes.js`'s `displayName` is private to that module,
@@ -1096,7 +1096,7 @@ buy by re-walking it as often.
 
 `NodePoller` is shaped like NetPath's own `Monitor`, not `IpamWorker` —
 deliberately, because Nodes typically manages far more devices than IPAM
-manages subnets, and a restart must not fire every device's poll at
+manages subnets, and a restart should not fire every device's poll at
 once. A hot-resizable `ThreadPoolExecutor` (`reconfigure()` builds a new
 pool and lets the old one drain in-flight work rather than cancelling
 it, exactly like `Monitor.set_workers`), restart-safe per-device due-time
@@ -1108,6 +1108,40 @@ detection (a device still running when its next tick comes due logs once
 and records a `poll_overrun` device event rather than queuing a second
 concurrent poll of the same device) are all copied from `Monitor`'s own
 algorithm.
+
+**Seeding from the last poll is not what stops a restart firing the fleet
+at once — the stagger is (5.9.0).** Seeding only holds while the service
+was down for less than one poll interval; past that, every device's seeded
+due time is already in the past on the first pass, and until 5.9.0 the
+whole fleet was submitted together and then *stayed* together, because
+every device that came due in one pass was rescheduled to the same
+`now + interval` from one timestamp taken once per pass
+(`tests/bench_poll_cycle.py --restart`, on the pre-fix code: peak
+submissions of 300 per second on every cycle, for the life of the run).
+`_schedule_pass` now spreads at two points, and they move a poll in
+opposite directions, which is worth being exact about. At startup, a
+device whose seeded `last_poll_ts + interval` is already past is given
+`now + uniform(0, min(interval, _STARTUP_SPREAD_S))` instead — this is the
+one place a poll is deliberately moved *later*, by at most thirty seconds
+(`_STARTUP_SPREAD_S`) or one interval, whichever is shorter; the constant
+is sized so a device that died during the outage is still noticed inside
+half a minute. A device with no `last_poll_ts` at all is seeded to `now`
+and not spread, so a newly added device polls on the next pass. Then, the
+first time a device is rescheduled after that, `_next_run` becomes
+`now + interval × uniform(_STAGGER_MIN_FRACTION, 1.0)` — the second half
+of its interval, so earlier only, never later: once running, nothing is
+polled less often than its profile says — and its id goes into the
+`_staggered` set, after which every reschedule is the plain
+`now + interval`. One pull is enough, because from then on each device
+counts its own interval from its own moment. Two kinds of device are not
+pulled: one under focus (the fast selected-device cadence exists to be
+exact), and one still pending — queued or running — because pulling a
+device whose previous poll has not finished only logs a `poll_overrun`;
+the phase break waits for the first reschedule that is neither, which is
+also why the spread's one-off extra poll per device seldom logs an overrun
+on a pool that can keep up. `_staggered` is pruned to the live device ids
+alongside the other per-device caches in `_forget_devices`, so a device
+deleted and added again is spread again.
 
 **An overrun is not recorded while the device is failing.** `_record_overrun`
 returns early when `device["status"] == "down"` **or**

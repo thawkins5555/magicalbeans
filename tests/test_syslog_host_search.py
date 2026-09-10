@@ -114,6 +114,25 @@ try:
     check("an unfiltered search is unaffected",
           len(payload.get("messages", [])) == 3, payload.get("messages"))
 
+    # A device's alias address, and a name only the reverse-DNS cache knows.
+    dist = service.nodes_db.add_device("10.20.3.6", name="dist-sw-02")
+    service.nodes_db.record_device_addresses(dist, ["10.20.3.66"], "test")
+    service.app_db.set_hostname("10.20.9.8", "dns-only-fw.example.net")
+    service.syslog_db.insert([
+        LogEntry(ts=now - 30, source="10.20.3.66", host="", message="from the alias"),
+        LogEntry(ts=now - 20, source="10.20.9.8", host="", message="dns only"),
+    ])
+
+    status, payload = call(f"/api/syslog/search?{window}&host=dist-sw", token)
+    sources = [m.get("source") for m in payload.get("messages", [])]
+    check("a device's name finds a row sent from its alias address",
+          sources == ["10.20.3.66"], sources)
+
+    status, payload = call(f"/api/syslog/search?{window}&host=dns-only-fw", token)
+    sources = [m.get("source") for m in payload.get("messages", [])]
+    check("a name known only to the DNS cache finds its address",
+          sources == ["10.20.9.8"], sources)
+
     # The overrides contract the Nodes table reads.
     status, payload = call("/api/nodes/devices?limit=10", token)
     devices = payload.get("devices", []) if status == 200 else []

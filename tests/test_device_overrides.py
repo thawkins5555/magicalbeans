@@ -9,7 +9,7 @@ import os
 
 from _paths import tmpdir  # noqa: F401  (repo root on sys.path)
 
-from netpath import nodesdb
+from netpath import nodesdb, sqlitebase
 from netpath.nodesdb import NodesDatabase, override_fields
 
 TMP = tmpdir("device_overrides_")
@@ -100,6 +100,20 @@ try:
           and db.devices_count(overrides_only=True, text="bulk")
           == len([r for r in everything
                   if override_fields(r) and r["name"].startswith("bulk")]))
+
+    # exclude_ids past one chunk: the NOT IN chunks must AND, never OR.
+    bulk = [db.add_device(f"10.1.{i // 250}.{i % 250}", f"chunk-{i:03d}", gid)
+            for i in range(520)]
+    excluded = set(bulk[:510])
+    check("the exclusion list spans more than one chunk",
+          len(excluded) > sqlitebase._ID_CHUNK, (len(excluded), sqlitebase._ID_CHUNK))
+    all_ids = {r["id"] for r in db.devices()}
+    kept = {r["id"] for r in db.devices(exclude_ids=excluded)}
+    check("exclude_ids spanning two chunks drops exactly those ids",
+          kept == all_ids - excluded, (len(kept), len(all_ids), len(excluded)))
+    check("devices_count(exclude_ids=...) agrees across chunks",
+          db.devices_count(exclude_ids=excluded) == len(all_ids) - len(excluded),
+          (db.devices_count(exclude_ids=excluded), len(all_ids) - len(excluded)))
 finally:
     db.close()
 

@@ -106,9 +106,11 @@ review, because one review and one push happen at end of day.
 4. **Stagger node polling so nodes do not all hit the pollers at once.**
    → The scheduler gave every device that came due together the same next due
    time, permanently, so a fleet that started in step stayed in step. Jitter
-   was added at two points: the first poll after a restart, and the first
-   reschedule after that. It only ever moves a poll earlier, so nothing is
-   polled less often than configured.
+   was added at two points: the first poll after a restart, which an already
+   overdue device now waits for by at most thirty seconds or one interval,
+   whichever is shorter; and the first reschedule after that, which only ever
+   moves a poll earlier, so once running nothing is polled less often than
+   configured.
 5. **The Dashboard loads slowly while the pollers are busy.**
    → It was the one aggregate page recomputing everything for every open tab
    every five seconds, fetching up to 5,001 alert rows to count them, and

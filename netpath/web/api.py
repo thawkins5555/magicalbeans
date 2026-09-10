@@ -3602,11 +3602,19 @@ def _planned_down(service) -> set[int]:
 
 
 def _fleet_counts(service) -> tuple[dict, set[int]]:
-    """device_counts() with planned outages moved from `down` to `maintenance`."""
+    """device_counts() with planned outages moved from `down` to `maintenance`.
+
+    `down` is re-counted with the planned ids excluded rather than having
+    len(planned) subtracted from it: subtraction spans two reads a poll can
+    land between, and it is a second definition of the same number that only
+    agrees with the clause below while everything else is correct.
+    """
     counts = service.nodes_db.device_counts()
     planned = _planned_down(service)
     counts["maintenance"] = len(planned)
-    counts["down"] = max(0, counts["down"] - len(planned))   # two reads, not one snapshot
+    if planned:
+        counts["down"] = service.nodes_db.devices_count(status="down",
+                                                        exclude_ids=planned)
     return counts, planned
 
 
@@ -9497,11 +9505,9 @@ def _dashboard_fleet(service) -> dict:
     poller = service.node_poller
     pool = poller.pool_state() if hasattr(poller, "pool_state") else {}
     counts, planned = _fleet_counts(service)
+    # The same number the tile prints, so "and N more" cannot disagree with it.
+    down_total = counts["down"]
     # device_name, not `name`: the raw column is the IP for a device nobody renamed.
-    down_total = service.nodes_db.devices_count(status="down", exclude_ids=planned)
-    # One clause for both, so a poll landing between the two reads cannot leave
-    # the tile's count disagreeing with its own "and N more".
-    counts["down"] = down_total
     down = [{"device_id": row["id"],
              "name": namelookup.device_name(row) or row["ip"],
              "ip": row["ip"]}
