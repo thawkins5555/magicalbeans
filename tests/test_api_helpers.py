@@ -18,6 +18,7 @@ import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 from netpath import permissions
 from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER, hash_password
 from netpath.web import Service, WebServer
+from netpath.web import api as api_mod
 from netpath.web.api import _csv_text, _flow_bucket, _window
 
 TMPDIR = _paths.tmpdir("api_review_")
@@ -439,6 +440,112 @@ try:
           "not an empty list",
           status == 200 and "fleet" not in payload.get("dashboard", {}),
           payload.get("dashboard", {}).keys())
+
+    # ---------------------------------------------------------------------
+    # 11. A down device under planned maintenance is not "down"
+    #
+    # Maintenance mode and an active window (either scope) count as planned;
+    # a mute does not — a muted device is still genuinely down, only quiet.
+    # The excluded devices move to a sibling `maintenance` figure rather
+    # than vanishing, so total is unchanged.
+    raw_down = service.nodes_db.devices_count(status="down")
+    total_before = service.nodes_db.device_count()
+    now = time.time()
+    service.alerts_db.set_maintenance(down_ids[1], by="test")
+    service.alerts_db.add_window("dash-win-devices", "devices", now - 60, now + 3600,
+                                 scope_device_ids=[down_ids[2]])
+    group_id = service.nodes_db.add_device_group("dash-maint-group")
+    grouped_id = service.nodes_db.add_device("203.0.113.40", device_group_id=group_id)
+    service.nodes_db.record_poll(
+        grouped_id, ping_ok=False, ping_rtt_ms=None, snmp_ok=False,
+        snmp_error="", identity=None, uptime_ticks=None,
+        status="down", reachable=False)
+    service.alerts_db.add_window("dash-win-group", "group", now - 60, now + 3600,
+                                 scope_group_id=group_id)
+    service.alerts_db.mute("device", str(down_ids[0]), 1.0)
+    planned = {down_ids[1], down_ids[2], grouped_id}
+
+    time.sleep(getattr(api_mod, "DASHBOARD_TTL_S", 0) + 0.2)
+    status, payload = call("GET", "/api/dashboard", token=admin)
+    fleet = payload.get("dashboard", {}).get("fleet", {}) if status == 200 else {}
+    counts = fleet.get("counts", {})
+    rows = fleet.get("down", [])
+    listed = {r.get("device_id") for r in rows}
+    check("maintenance mode, a devices-scoped window and a group-scoped window "
+          "each count as planned",
+          counts.get("maintenance") == 3, counts)
+    check("the three planned devices leave the down count",
+          counts.get("down") == raw_down + 1 - 3, (counts.get("down"), raw_down))
+    check("a muted down device is still counted as down",
+          counts.get("down") == service.nodes_db.devices_count(status="down") - 3,
+          (counts.get("down"), service.nodes_db.devices_count(status="down")))
+    check("total is unchanged by the exclusion",
+          counts.get("total") == total_before + 1, (counts.get("total"), total_before))
+    check("the down list carries none of the planned devices",
+          not (planned & listed), sorted(planned & listed))
+    check("the muted device is still in the down list",
+          down_ids[0] in listed, sorted(listed))
+    check("down_more is consistent with the reduced count",
+          fleet.get("down_more") == counts.get("down", 0) - len(rows),
+          (fleet.get("down_more"), counts.get("down"), len(rows)))
+
+    status, payload = call("GET", "/api/nodes/overview", token=admin)
+    overview_counts = payload.get("device_counts", {}) if status == 200 else {}
+    check("nodes overview carries the same maintenance figure",
+          overview_counts.get("maintenance") == 3, overview_counts)
+    check("nodes overview's down is the reduced count",
+          overview_counts.get("down") == raw_down + 1 - 3, overview_counts)
+
+    state_counts = api_mod._state_counts(service)["device_counts"]
+    check("the /api/state tab-badge counts carry the maintenance figure",
+          state_counts.get("maintenance") == 3, state_counts)
+    check("the /api/state tab-badge down is the reduced count",
+          state_counts.get("down") == raw_down + 1 - 3, state_counts)
+
+    # ---------------------------------------------------------------------
+    # 12. The dashboard cache never carries one account's view into another's
+    #
+    # Sections are cached server-side and shared by every caller inside the
+    # TTL. Three accounts with disjoint reads poll inside one window; each
+    # must keep exactly its own sections. Then, in process, a response's
+    # nested dicts must be copies — mutating one must not reach the next.
+    expected = {"admin": {"fleet", "alerts", "storage"},
+                "settings_only": {"storage"}, "reader": {"fleet"}}
+    tokens = {"admin": admin, "settings_only": settings_only, "reader": reader}
+    seen_wrong = []
+    for _ in range(4):
+        for who, token in tokens.items():
+            status, payload = call("GET", "/api/dashboard", token=token)
+            dash = payload.get("dashboard", {}) if status == 200 else {}
+            got = {k for k in ("fleet", "alerts", "storage") if k in dash}
+            if got != expected[who]:
+                seen_wrong.append((who, sorted(got)))
+    check("inside one cache window each account sees exactly its own sections",
+          not seen_wrong, seen_wrong)
+
+    admin_params = {"_username": DEFAULT_USER, "_token": "", "_cache": {}}
+    first = api_mod.get_dashboard(service, admin_params, {})["dashboard"]
+    first["fleet"]["counts"]["total"] = -999
+    first["fleet"]["down"].clear()
+    first["alerts"]["by_severity"]["poisoned"] = 1
+    first["storage"].clear()
+    second = api_mod.get_dashboard(service, dict(admin_params, _cache={}), {})["dashboard"]
+    check("poisoning one response's fleet counts does not reach the next",
+          second["fleet"]["counts"].get("total") != -999, second["fleet"]["counts"])
+    check("…nor its down list", len(second["fleet"]["down"]) == 10,
+          len(second["fleet"]["down"]))
+    check("…nor its severity breakdown",
+          "poisoned" not in second["alerts"]["by_severity"], second["alerts"]["by_severity"])
+    check("…nor its storage list", bool(second["storage"]), second["storage"])
+    status, payload = call("GET", "/api/dashboard/offenders", token=admin)
+    first_lists = payload.get("lists", []) if status == 200 else []
+    status, payload = call("GET", "/api/dashboard/offenders", token=settings_only)
+    check("offenders is refused, not served from cache, without Nodes read",
+          status == 403, (status, payload))
+    check("offenders still carries every list for the admin",
+          [l["key"] for l in first_lists] == ["events", "interface_events", "alerts",
+                                              "rtt", "loss", "cpu"],
+          [l["key"] for l in first_lists])
 
 finally:
     server.stop()

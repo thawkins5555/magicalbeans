@@ -143,13 +143,19 @@ try:
         return sorted(r["message"] for r in db.search(*window, filters))
 
     check("blank self-reported host, source in host_ips: found",
-          hosts({"host": "core-sw", "host_ips": ["10.0.0.1"]})
+          hosts({"host": "core-sw-a", "host_ips": ["10.0.0.1"]})
           == ["blank host, source resolves"],
-          hosts({"host": "core-sw", "host_ips": ["10.0.0.1"]}))
+          hosts({"host": "core-sw-a", "host_ips": ["10.0.0.1"]}))
     check("self-reported host still matches the LIKE alongside host_ips",
           hosts({"host": "core-sw-b", "host_ips": ["10.0.0.1"]})
           == ["blank host, source resolves", "self-reported host"],
           hosts({"host": "core-sw-b", "host_ips": ["10.0.0.1"]}))
+    # A fragment that LIKE-matches a self-reported host AND resolves to an
+    # IP returns the union, not either half.
+    check("fragment matching both a self-reported host and a resolved IP: union",
+          hosts({"host": "core-sw", "host_ips": ["10.0.0.1"]})
+          == ["blank host, source resolves", "self-reported host"],
+          hosts({"host": "core-sw", "host_ips": ["10.0.0.1"]}))
     check("host_ips absent: only the LIKE, as before",
           hosts({"host": "core-sw"}) == ["self-reported host"],
           hosts({"host": "core-sw"}))

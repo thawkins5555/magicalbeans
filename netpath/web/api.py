@@ -7,6 +7,7 @@ this file stays about the data.
 
 from __future__ import annotations
 
+import copy
 import csv
 import functools
 import io
@@ -663,7 +664,7 @@ def _state_counts(service) -> dict:
     return {
         "open_conflicts": service.ipam_db.conflict_count(),
         "device_count": service.nodes_db.device_count(),
-        "device_counts": service.nodes_db.device_counts(),
+        "device_counts": _fleet_counts(service)[0],
         "open_count": service.alerts_db.open_count(),
         # The badge on the tab is coloured by this. A count alone said
         # "there are alerts" in the same amber whether the worst of them
@@ -3490,7 +3491,7 @@ def get_nodes_overview(service, params, body) -> dict:
     return {
         "t0": t0, "t1": t1, "bucket_s": bucket,
         "buckets": histogram,
-        "device_counts": service.nodes_db.device_counts(),
+        "device_counts": _fleet_counts(service)[0],
         "poller": {
             "running": service.node_poller.running,
             "status": service.node_poller.status_text(),
@@ -3527,6 +3528,37 @@ def _maintenance_only_ids(service, params):
     if params.get("maintenance_only") is None:
         return None
     return [int(i) for i in service.alerts_db.maintenance_device_ids()]
+
+
+def _planned_down(service) -> set[int]:
+    """Down devices whose outage is planned: maintenance mode or an active
+    window. A mute is not planned — that device is still down, only quiet."""
+    ids = {int(i) for i in service.alerts_db.maintenance_device_ids()}
+    group_ids: set[int] = set()
+    for row in service.alerts_db.active_windows():
+        if row["scope_kind"] == "group":
+            if row["scope_group_id"] is not None:
+                group_ids.add(int(row["scope_group_id"]))
+            continue
+        try:
+            ids.update(int(i) for i in json.loads(row["scope_device_ids"] or "[]"))
+        except (TypeError, ValueError):
+            continue
+    if not ids and not group_ids:
+        return set()
+    return service.nodes_db.device_ids(status="down", only_ids=ids,
+                                       device_group_ids=group_ids)
+
+
+def _fleet_counts(service) -> tuple[dict, set[int]]:
+    """device_counts() with planned outages moved from `down` to their own
+    `maintenance` figure; `total` is untouched."""
+    counts = service.nodes_db.device_counts()
+    planned = _planned_down(service)
+    counts["maintenance"] = len(planned)
+    # Two reads, not one snapshot, so a poll landing between them is clamped.
+    counts["down"] = max(0, counts["down"] - len(planned))
+    return counts, planned
 
 
 def _device_rows_json(service, params, rows) -> list[dict]:

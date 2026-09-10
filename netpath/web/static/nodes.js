@@ -225,6 +225,16 @@
       `alerts and no mail until someone ends it; polling continues">maintenance</span>`;
   }
 
+  // Neutral, not warn-text: an override is configuration, not a fault.
+  function overridesTitle(row) {
+    return `Overrides the polling profile for: ${(row.override_fields || []).join(', ')}`;
+  }
+  function overridesTag(row) {
+    if (!row.override_count) return '';
+    return ` · <span class="hint overrides-tag" title="${escape(overridesTitle(row))}">` +
+      `${row.override_count} override${row.override_count === 1 ? '' : 's'}</span>`;
+  }
+
   const COLUMNS = [
     { key: 'check', label: '', sortable: false, fixed: true, width: 34,
       // Named, because a column of identical unlabelled checkboxes is
@@ -241,7 +251,7 @@
       // who silenced a device an hour ago and later wonders why it has gone
       // quiet should not have to go looking for the reason.
       cell: (r) => `${escape(displayName(r))}<div class="ip-line">${deviceIpCell(r)}` +
-        `${maintenanceTag(r)}${mutedTag(r)}</div>` },
+        `${maintenanceTag(r)}${mutedTag(r)}${overridesTag(r)}</div>` },
     { key: 'group', label: 'Profile', width: 130, on: true,
       value: (r) => r._groupName || '',
       cell: (r) => escape(r._groupName || '\u2014') },
@@ -262,6 +272,11 @@
         : (r.ping_ok ? `${(r.ping_rtt_ms || 0).toFixed(0)} ms (ping only)` : '\u2014')) },
     { key: 'last_poll_ts', label: 'Last poll', width: 100, numeric: true, on: true,
       value: (r) => r.last_poll_ts || 0, cell: (r) => App.agoCell(r.last_poll_ts) },
+    { key: 'overrides', label: 'Overrides', width: 90, numeric: true,
+      value: (r) => r.override_count || 0,
+      cell: (r) => (r.override_count
+        ? `<span title="${escape(overridesTitle(r))}">${r.override_count}</span>`
+        : '\u2014') },
     // Available but off by default — sysLocation is empty on plenty of gear,
     // and a column of dashes helps nobody. Worth offering now that it can be
     // pointed at a custom OID.
@@ -1058,6 +1073,7 @@
         ? field('alerts', `muted until ${App.when(d.muted_until)}`,
                 'nd-v warn-text')
         : '',
+      d.override_count ? field('overrides', (d.override_fields || []).join(', ')) : '',
       ...fields.map((f) => (optional[f] ? optional[f]() : '')),
       // 'snmp', not 'error': the value is the agent's own words, and those
       // already start with one — "error authorization error" is what the
@@ -3623,11 +3639,13 @@
     const status = App.el('nd-filter-status').value;
     const offline_only = App.el('nd-filter-offline').checked ? '1' : undefined;
     const maintenance_only = App.el('nd-filter-maintenance').checked ? '1' : undefined;
+    const overrides_only = App.el('nd-filter-overrides').checked ? '1' : undefined;
     // The export route ignores paging entirely — it always answers with
     // every device the current filter matches, not just the page on
     // screen, which is the whole point of an export over a table read.
     App.exportCsv('/api/nodes/devices/export.csv',
-      { q, group_id, device_group_id, status, offline_only, maintenance_only });
+      { q, group_id, device_group_id, status, offline_only, maintenance_only,
+        overrides_only });
   }
 
   function exportInterfacesCsv() {
@@ -6184,18 +6202,19 @@
     // server-side, because the list is paged and a page filtered after the
     // fact would disagree with its own total.
     const maintenance_only = App.el('nd-filter-maintenance').checked ? '1' : undefined;
+    const overrides_only = App.el('nd-filter-overrides').checked ? '1' : undefined;
     // A changed filter always lands back on page one — the offset a
     // previous filter's page 4 pointed to is meaningless once the
     // matching set is different, and could be past the end of it.
     const filterSig = JSON.stringify([q, group_id, device_group_id, status, offline_only,
-                                      maintenance_only]);
+                                      maintenance_only, overrides_only]);
     if (view.pageFilterSig !== null && view.pageFilterSig !== filterSig) view.pageOffset = 0;
     view.pageFilterSig = filterSig;
     view.pageLimit = Number(App.el('nd-page-size').value) || view.pageLimit;
     const generation = ++view.refreshGen;
     const [devices, groups, deviceGroups, mibs] = await Promise.all([
       App.get('/api/nodes/devices', { q, group_id, device_group_id, status, offline_only,
-                                      maintenance_only,
+                                      maintenance_only, overrides_only,
                                       limit: view.pageLimit, offset: view.pageOffset }),
       App.get('/api/nodes/groups'),
       App.get('/api/nodes/device-groups'),
@@ -6444,7 +6463,7 @@
        event, so these listeners do not fight it. */
     const CONTROLS = ['nd-q', 'nd-filter-group', 'nd-filter-devgroup',
       'nd-filter-status', 'nd-filter-offline', 'nd-filter-maintenance',
-      'disc-target', 'disc-pingonly'];
+      'nd-filter-overrides', 'disc-target', 'disc-pingonly'];
     App.rememberControls('nodes', CONTROLS);
     for (const btn of document.querySelectorAll('#page-nodes > .subtabs > .subtab')) {
       btn.onclick = () => {
@@ -6516,7 +6535,7 @@
     App.filterBar('nodes', {
       text: ['nd-q'],
       selects: ['nd-filter-group', 'nd-filter-devgroup', 'nd-filter-status',
-                'nd-filter-offline', 'nd-filter-maintenance'],
+                'nd-filter-offline', 'nd-filter-maintenance', 'nd-filter-overrides'],
       apply: 'nd-apply', clear: 'nd-clear',
       // A MAC lookup runs on a deliberate search, never on the five-second
       // refresh: it can open a dialog, and a dialog that reopens itself

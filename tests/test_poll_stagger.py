@@ -193,16 +193,13 @@ def focus_unjittered(clock):
           f"({len(own)} polls)")
 
     del submissions[:]
-    run_passes(poller, clock, INTERVAL)
-    own = [(at, due) for device_id, at, due in submissions if device_id == focused]
-    check(len(own) == 1 and MIN_FRACTION * INTERVAL <= own[0][1] - own[0][0] < INTERVAL,
+    run_passes(poller, clock, 2 * INTERVAL)
+    own = [due - at for device_id, at, due in submissions if device_id == focused]
+    check(len(own) >= 2 and MIN_FRACTION * INTERVAL <= own[0] < INTERVAL,
           f"…its first unfocused reschedule is the jittered one "
-          f"({own[0][1] - own[0][0] if own else None!r} s)")
-    del submissions[:]
-    run_passes(poller, clock, INTERVAL)
-    own = [(at, due) for device_id, at, due in submissions if device_id == focused]
-    check(len(own) == 1 and own[0][1] - own[0][0] == INTERVAL,
-          "…and the one after that is the plain interval")
+          f"({own[0] if own else None!r} s)")
+    check(len(own) >= 2 and all(gap == INTERVAL for gap in own[1:]),
+          f"…and every one after that is the plain interval ({own[1:]})")
     db.close()
 
 

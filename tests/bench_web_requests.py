@@ -88,6 +88,7 @@ ROUTES = [
     ("GET /api/nodes/mibs", "GET", "/api/nodes/mibs", None),
     ("GET /api/alerts?limit=300", "GET", "/api/alerts?limit=300", None),
     ("GET /api/dashboard", "GET", "/api/dashboard", None),
+    ("GET /api/dashboard/offenders", "GET", "/api/dashboard/offenders", None),
     ("GET /api/debug", "GET", "/api/debug", None),
     ("POST /api/settings (nodes)", "POST", "/api/settings",
      {"scope": "nodes", "values": {}}),

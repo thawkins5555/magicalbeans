@@ -2009,6 +2009,15 @@ class AlertsDatabase(SqliteStore):
         return {"open": open_n, "acked": acked_n, "worst": worst,
                "all_acked": open_n == 0 and acked_n > 0}
 
+    def open_counts_by_severity(self) -> dict[str, int]:
+        # Same state set as _alert_filter's "unresolved".
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT severity, COUNT(*) AS n FROM alerts"
+                " WHERE state IN ('open', 'acked') GROUP BY severity"
+                " ORDER BY severity").fetchall()
+        return {str(row["severity"]): row["n"] for row in rows}
+
     def histogram(self, t0: float, t1: float, bucket_s: float = 3600) -> list[dict]:
         bucket_s = max(float(bucket_s), 60.0)
         start = int(t0 // bucket_s) * bucket_s
