@@ -325,17 +325,50 @@ actual recovery.
 
 ---
 
-## 4. The optional SNMPv3 authentication password (Nodes)
+## 4. The optional SNMPv3 authentication and privacy passwords (Nodes)
 
 A device polled with SNMPv3 needs a username and an authentication
-password, stored per device or per polling profile (`netpath/nodesdb.py`,
-`netpath/dpapi.py`) — the same opt-in shape as the DHCP credential above,
-and the same underlying mechanism: DPAPI-encrypted, machine-scoped, never
-returned by any API response (only `has_credential: bool`), refused
-outright on any platform other than Windows rather than falling back to a
-weaker cipher or a plaintext file. `POST .../credential` and `DELETE
-.../credential` are the only two operations exposed — store or clear,
-never reveal.
+password, and — since 5.8.0, for a user provisioned at `authPriv` — a
+privacy password beside it. **Both are stored the same way**, per device
+or per polling profile (`netpath/nodesdb.py`, `netpath/dpapi.py`): the
+same opt-in shape as the DHCP credential above, and the same underlying
+mechanism — DPAPI-encrypted (or the passphrase store of §10 off Windows),
+machine-scoped, never returned by any API response (only
+`has_credential: bool` and `has_priv_credential: bool`), refused outright
+on a host that cannot encrypt rather than falling back to a weaker cipher
+or a plaintext file. `POST .../credential` and `DELETE .../credential`
+are the only two operations exposed — store or clear, never reveal — and
+the privacy password rides the same POST as the auth password (they are
+one record, and a privacy password without an authentication one is not a
+level USM has). Clearing the credential drops both blobs; setting the
+privacy protocol to none drops the privacy blob with it, so a secret
+nobody can use is not kept.
+
+Two honesties about the privacy password's life in memory that the
+authentication password shares and that no earlier edition of this
+section said. First, the *localised key* derived from either password —
+the 1 MiB hash of RFC 3414 A.2, then localisation to one engine — lives
+in a bounded, least-recently-used cache (`trapdecode._KEY_CACHE`, 256
+entries) for the lifetime of the process, because paying that hash per
+message would be hundreds of milliseconds per poll; the password itself
+is not cached, but a key that yields the password's signing and
+encryption power is, until evicted or the process exits. Second, Python
+`bytes` cannot be wiped: `credential_for()` sets its plaintext to `None`
+in a `finally:` so nothing holds a reference, but the interpreter frees
+the memory when it chooses and does not zero it. A memory dump of the
+running poller therefore may contain a recently used password or key.
+That is true of every credential in this document; it is stated here
+because a privacy key is the one that decrypts traffic, not just proves
+a message.
+
+**A privacy password that will not decrypt fails loudly.** The one
+deliberate asymmetry with the authentication password: an authentication
+blob this machine cannot decrypt has always yielded "no password" and a
+request at noAuthNoPriv; a privacy blob that will not decrypt raises and
+the device is not polled at all, because carrying on at authNoPriv would
+reintroduce from the inside the exact fault 5.7.2 was written to explain
+— a request at the wrong level, refused with `authorizationError(16)`
+against a password that was never wrong.
 
 A polling profile can hold more than one SNMP credential — its own
 primary one plus any number of additional alternates in
@@ -855,7 +888,14 @@ things remain outside its reach entirely:
   ConfigRX SSH credential.** Create a dedicated read-only DHCP account —
   membership in the DHCP server's local `DHCP Users` group is enough —
   rather than reusing a domain admin account because it's convenient;
-  give an SNMPv3 polling user read-only access on the device side; give
+  give an SNMPv3 polling user read-only access on the device side — and
+  give it that access **at the level the credential is sent at**: a
+  view granted only at `priv` (authPriv) is the commonest cause of
+  `authorizationError(16)` against a correct password, since RFC 3415's
+  access table is keyed on the security level and an entry at one level
+  matches nothing arriving at another; since 5.8.0 the fix can be either
+  side, a privacy password on the credential or an `authNoPriv` view on
+  the device; give
   the SMTP account only send rights, not a full mailbox; give a
   ConfigRX SSH account only enough privilege to run one read-only "show
   config" command — for most vendors that means no enable or configure

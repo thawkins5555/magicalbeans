@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.8.0 — The privacy password, and the reply nobody checked](#580--the-privacy-password-and-the-reply-nobody-checked)
 - [5.7.2 — The password that was never wrong](#572--the-password-that-was-never-wrong)
 - [5.7.1 — The temp folder that wasn't there](#571--the-temp-folder-that-wasnt-there)
 - [5.7.0 — Five reports](#570--five-reports)
@@ -133,6 +134,166 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.8.0 — The privacy password, and the reply nobody checked
+
+5.7.2 made the Palo Alto failure say what it was: the firewall's SNMPv3
+user is `authPriv`, this poller could only send `authNoPriv`, and RFC
+3415's access table matched nothing. It could not fix it, because there
+was no AES in the standard library and this application took no
+third-party dependency. This release takes one, and polls the firewall.
+
+**authPriv, AES-128-CFB, and only that.** A credential — a device's
+override, a profile's primary, or any additional credential on a profile
+— now carries a privacy protocol and a privacy password beside the
+authentication pair. The cipher is the `cryptography` package's, which
+paramiko already installs wherever ConfigRX works; it is declared in
+`requirements.txt` in its own right because paramiko's backend is not
+ours to depend on. **Nothing here is a cipher of our own.**
+`netpath/snmpcrypt.py` is a thin adapter around OpenSSL's AES-CFB and owns
+only the parts that are ours: RFC 3826's IV (`engineBoots ‖ engineTime ‖
+salt`, the same 8-byte salt sent as `msgPrivacyParameters`), the salt
+discipline, and the guard that decides whether the backend is usable.
+The salt is the whole ballgame — CFB with a repeated IV under one key
+leaks the XOR of two plaintexts, and an SNMP plaintext is the same OIDs
+poll after poll, so one repeat is practical plaintext recovery — and it
+is a counter from a random 64-bit start under a lock, never the `random`
+module (which seeds request ids, correctly, and would be wrong here).
+`tests/test_snmpv3_priv.py` proves 10,000 encryptions give 10,000 distinct
+salts and that the stub agent saw none repeat across a real walk. DES is
+not offered. AES-192/256 are not offered either, and deliberately: the
+cipher would be free, but the key extension that stretches USM's key to
+24 or 32 bytes exists only as two drafts with incompatible readings in
+shipping agents, and a construction that works against some devices and
+silently fails against others is worse than one that is absent.
+
+**The key is the auth protocol's.** USM has no privacy hash of its own;
+the privacy password goes through the *authentication* protocol's
+password-to-key and localisation (RFC 3414 A.2) and the AES key is the
+first 16 bytes of the result — MD5 gives exactly 16, SHA-1 20, the SHA-2
+family 28 to 64, and it is always the first, never the last, never a
+fold. `trapdecode.privacy_key` does that beside `localized_key`, through
+the same bounded cache, so the 1 MiB hash is paid once per (protocol,
+password, engine) and not per message. `localized_key` gets its first
+test in the bargain: RFC 3414's own A.3.1 and A.3.2 vectors (`maplesyrup`
+against engine `…0002`), which every signed request since 4.x has
+depended on and nothing had ever checked.
+
+**Encrypt, then authenticate; verify, then decrypt.** The ScopedPDU is
+encrypted first and the whole assembled message — ciphertext and salt
+included — is signed afterwards, and a reply has its digest verified
+before anything is decrypted. That is RFC 3414 §3.1/§3.2's order and it
+is what stops chosen-ciphertext games; both docstrings say so. The plain
+and the encrypted paths build the ScopedPDU through one function so they
+cannot drift. Privacy requires authentication (USM has no privNoAuth), so
+a privacy password with no authentication password raises rather than
+quietly sending `authNoPriv` — a silent downgrade would produce exactly
+the `authorizationError(16)` this release exists to fix. A decrypted
+buffer that is not a ScopedPDU is a **wrong privacy password** and is
+raised as one, because CFB turns any ciphertext into some plaintext and
+without that sentence a wrong privacy password reads as "malformed SNMP
+response" with the device blamed.
+
+**The security level is derived, never stored.** An authentication pair
+makes a request `authNoPriv`; a privacy pair on top of it makes it
+`authPriv`; neither is `noAuthNoPriv`. There is no level column: a fourth
+state can contradict the fields it summarises, and the implicit rule is
+what makes this upgrade a provable no-op — the two new columns on
+`devices`, `groups` and `group_credentials` are nullable with no default,
+the `ALTER` is metadata-only, and a row with both NULL derives exactly the
+level it derived before. `tests/test_snmpv3_keys.py` pins the bytes:
+`build_v3_request` with no privacy arguments produces output identical,
+to the byte, to what 5.7.2 produced, hex computed from that commit and
+pasted in. The *derived* level is now visible everywhere the operator
+looked for it and could not see it: in every credential's JSON, in the
+credential label the device row's errors use ("SNMPv3 user 'poller' at
+authPriv"), and in the Test button's payload.
+
+**Stored like the other one.** The privacy password gets the treatment
+`v3_auth_pass_enc` has — DPAPI or the passphrase store, decrypted just in
+time, never cached, `finally: password = None` — and the API exposes only
+`has_priv_credential`, never the blob. One deliberate asymmetry: a
+privacy blob that will not decrypt on this machine **fails loudly** and
+the device is not polled, rather than carrying on at `authNoPriv`.
+`credential_for` returns a `Credential` NamedTuple instead of the
+three-tuple it was, with a `security_level` property; `[0]` still works,
+and the old three-name unpack fails loudly, which is what you want when a
+fourth and fifth field appear. `CREDENTIAL-SECURITY.md` §4 now covers two
+secrets and says two things no earlier edition said: a derived key lives
+in a bounded cache for the process lifetime, and Python `bytes` cannot be
+wiped.
+
+**The UI.** Privacy protocol and password on each of the three forms that
+carry the auth pair — the device override, the profile's primary
+credential, and an additional credential — behind the same "this machine
+can store secrets" gate, with the protocol list defined once (the auth
+list was pasted three times; this would have made six). The privacy
+password is entered with the auth password, as one record; leaving it
+blank keeps the stored one; setting the protocol to none drops it.
+Wireless is out of scope and says so: the controller form has no privacy
+field and the API refuses a privacy password for a controller in words
+rather than storing it and never sending it. 5.7.2's advice for an
+`authNoPriv` refusal — which said honestly that there was no privacy
+field because `authPriv` was unimplemented — now says to set one.
+
+**A security gap closed, and how to open it again.** `snmppoll.py` said
+the caller verifies a v3 reply's digest "if it needs to", and **no caller
+ever did.** Nothing checked the signature on any SNMPv3 Response, so an
+off-path attacker who could guess a request could forge a plausible
+reply and the poller stored it as fact. With the auth key already
+threaded down to the decoder for privacy, the reply's digest is now
+verified with `hmac.compare_digest`, and — the part with regression
+potential — **a reply at a lower level than its request is refused as a
+downgrade**: an unsigned answer to a signed request, or an unencrypted
+answer to an encrypted one. Report-PDUs are exempt, because engine
+discovery and a `wrongDigests` refusal are unauthenticated by design and
+verifying them would break discovery on every device. **This is new,
+and on by default.** Response verification has never run in this product,
+so the first poll after this upgrade turns it on against every device at
+once, and an agent, proxy or middlebox that has always answered unsigned
+goes from "polling fine" to a new error on gear that worked yesterday.
+Three things are done about that. The two faults are separate types with
+separate words — `SnmpAuthError`, "the signature does not verify", is the
+stored password or tampering; `SnmpDowngrade`, "carried no signature at
+all", is the device — because 5.7.2 exists precisely because two SNMPv3
+failures once shared one message. The downgrade message says plainly
+that the check is new in 5.8.0 and is a policy change, not a fault the
+operator introduced. And there is an off switch: **Verify the signature
+on every SNMPv3 reply**, in Nodes settings (and its twin in Wireless
+settings), defaulting on; turning it off gives up the digest check and
+the downgrade refusal for every device — the pre-5.8.0 acceptance,
+exactly — and its hint says so, so it is used to keep polling one
+misbehaving agent while chasing it, not as a fix. A downgrade is filed
+as an ordinary SNMP error, not as an authentication failure: the
+password was never contradicted.
+
+**Reproducible.** `tests/stubs/stub_agent_iftable.py` is a real `authPriv`
+agent with `--priv-pass`: it verifies the digest first, decrypts, answers
+`usmStatsDecryptionErrors` to a message that will not decrypt (so a wrong
+privacy password is distinguishable from a wrong authentication one),
+`usmStatsUnsupportedSecLevels` to an unencrypted request for its user,
+encrypts every reply under a fresh salt of its own, signs every reply
+whenever it holds an auth key (a real agent does, and the poller now
+insists), and lists every salt it received and sent in `--stats` so a test
+can prove non-reuse across a walk. `--tamper-reply` flips a byte after
+signing; `--unsigned-replies` is the middlebox. Three suites:
+`test_snmpv3_keys.py` (stdlib only, never skips — the RFC 3414 vectors,
+the privacy-key derivation, the pinned bytes, the IV and salt framing,
+the availability guard against a backend that panics),
+`test_snmpv3_priv.py` and `test_snmpv3_priv_e2e.py` (a real GETBULK walk
+at `authPriv`, engine resync with privacy on, a wrong privacy password
+surfacing distinctly, a tampered reply refused, the downgrade refused and
+then accepted with the setting off). The last two skip with exit 77 when
+AES-CFB is not usable — and "usable" means the guard's real known-answer
+encrypt/decrypt passed, because on the machine this was written on
+`import cryptography` succeeds, reports a version, and then panics in the
+first cipher call.
+
+**Not in this release.** Trap decryption: `snmpcrypt.py` is a leaf module
+so the trap receiver can use it without a cycle, and wiring it in — a
+privacy password per trap user, the key localised to the sender's engine
+off the wire — is the deliberate follow-up. `authPriv` for the wireless
+poller. DES, and AES-192/256, for the reasons above.
 
 ### 5.7.2 — The password that was never wrong
 

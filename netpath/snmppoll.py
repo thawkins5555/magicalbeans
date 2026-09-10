@@ -54,6 +54,7 @@ class Response:
     # was given a key and the digest checked out against it.
     flags: int = 0
     auth_verified: bool = False
+    priv_params: bytes = b""     # the salt an encrypted message carried
 
 
 class SnmpError(Exception):
@@ -65,14 +66,36 @@ class SnmpTimeout(SnmpError):
 
 
 class SnmpAuthError(SnmpError):
-    """A v3 reply this poller will not accept as an answer: its digest did
-    not verify with the credential the request was signed with, or it
-    arrived at a lower security level than the request went out at (an
-    unsigned or unencrypted Response to a signed or encrypted request).
-    Raised, never dropped as a stray datagram: dropping it would turn a
-    wrong key — or a forgery — into a timeout, and a timeout is the one
-    diagnosis that sends an operator to look at the network instead of at
-    the credential. Reports are exempt (see _decode_v3)."""
+    """A v3 reply that CARRIED a digest and the digest did not verify with
+    the credential the request was signed with: the stored authentication
+    password or protocol is wrong for this engine, or the reply was forged
+    or altered in transit. Raised, never dropped as a stray datagram:
+    dropping it would turn a wrong key — or a forgery — into a timeout, and
+    a timeout is the one diagnosis that sends an operator to look at the
+    network instead of at the credential.
+
+    Deliberately NOT the same class as SnmpDowngrade. "Your digest did not
+    match my key" and "you sent no digest at all" have different remedies —
+    the first is the credential, the second is the device or the path —
+    and 5.7.2 exists because two different SNMPv3 failures once shared one
+    unhelpful message."""
+
+
+class SnmpDowngrade(SnmpError):
+    """A v3 reply that arrived at a LOWER security level than the request
+    went out at: an unsigned Response to a signed request, or an
+    unencrypted one to an encrypted request. The digest is not wrong — there
+    is none — which is exactly what an off-path forgery looks like, and
+    RFC 3414 s3.2 has the receiver discard it.
+
+    This check is new in 5.8.0 and on by default; nothing before it
+    verified a reply at all. That means an agent, proxy or middlebox that
+    has always answered unsigned goes from "polling fine" to this error on
+    the first poll after the upgrade, which is why the message says so in
+    as many words, and why the Nodes setting `v3_verify_replies` exists:
+    an operator with one such device can keep the rest of the estate
+    verified rather than choose between a broken device and a downgraded
+    fleet. Reports are exempt (see _decode_v3)."""
 
 
 class SnmpPrivError(SnmpError):
@@ -379,7 +402,7 @@ def _decode_v3(data: bytes, msg: Reader, *, auth_proto: str | None = None,
                         engine_boots=_unsigned(data, bs, be),
                         engine_time=_unsigned(data, ts_, te),
                         user=data[ns:ne].decode("utf-8", "replace"),
-                        flags=flags)
+                        flags=flags, priv_params=data[ps_:pe])
 
     if flags & FLAG_AUTH and auth_proto and auth_key:
         if not _verify_digest(data, as_, ae, auth_proto, auth_key):
@@ -455,7 +478,7 @@ def _decode(data: bytes, **keys) -> Response:
 
 def decode_response(data: bytes, *, auth_proto: str | None = None,
                     auth_key: bytes | None = None, priv_proto: str | None = None,
-                    priv_key: bytes | None = None) -> Response:
+                    priv_key: bytes | None = None, verify: bool = True) -> Response:
     """The mirror of trapdecode's trap decoder, but for a Response-PDU (or,
     given a just-built request, decodes it back — same code path, since a
     Response-PDU and a Get/GetNext/GetBulk-PDU share request-id/slot-2/
@@ -470,11 +493,19 @@ def decode_response(data: bytes, *, auth_proto: str | None = None,
     v3 reply carrying FLAG_AUTH has its digest verified before anything
     else is read (verify first, then decrypt — RFC 3414 s3.2), and a
     non-Report reply that arrives unsigned — or, given a privacy key,
-    unencrypted — is refused as SnmpAuthError: a reply at a lower level
+    unencrypted — is refused as SnmpDowngrade: a reply at a lower level
     than its request is not an answer, it is a downgrade, and until 5.8.0
     nothing on this end checked either. Report-PDUs are exempt both ways,
     because the discovery exchange and a wrongDigests refusal are
-    unauthenticated by design."""
+    unauthenticated by design.
+
+    `verify=False` is the operator's escape hatch (the Nodes setting
+    `v3_verify_replies`): the digest is not checked and a lower level is
+    not refused — the pre-5.8.0 behaviour, exactly — while an encrypted
+    reply is still decrypted, since without that there is no answer to
+    read at all."""
+    if not verify:
+        auth_key = None
     try:
         response = _decode(data, auth_proto=auth_proto, auth_key=auth_key,
                            priv_proto=priv_proto, priv_key=priv_key)
@@ -482,15 +513,25 @@ def decode_response(data: bytes, *, auth_proto: str | None = None,
         raise
     except (BerError, IndexError, ValueError, UnicodeError) as exc:
         raise SnmpError(f"malformed SNMP response: {exc}") from exc
-    if response.version == V3 and response.pdu_tag != PDU_REPORT:
+    if verify and response.version == V3 and response.pdu_tag != PDU_REPORT:
         if auth_key and auth_proto and not response.flags & FLAG_AUTH:
-            raise SnmpAuthError(
-                "the reply to a signed request is unsigned — refused as a "
-                "downgrade (RFC 3414 s3.2); the device did not answer this")
+            raise SnmpDowngrade(
+                "the device's reply to a signed request carried no signature "
+                "at all, and was refused as a downgrade (RFC 3414 s3.2). This "
+                "check is new in 5.8.0 and is deliberate: an unsigned answer "
+                "to a signed request is what a forged reply looks like, and "
+                "nothing verified replies before. A device that polled fine "
+                "last week and shows this now has always answered unsigned; "
+                "the Nodes setting 'Verify the signature on every SNMPv3 "
+                "reply' accepts such replies again, for every device, at the "
+                "cost of that protection")
         if priv_key and priv_proto and not response.flags & FLAG_PRIV:
-            raise SnmpAuthError(
-                "the reply to an encrypted request is not encrypted — "
-                "refused as a downgrade (RFC 3414 s3.2)")
+            raise SnmpDowngrade(
+                "the device's reply to an encrypted request came back "
+                "unencrypted, and was refused as a downgrade (RFC 3414 "
+                "s3.2). This check is new in 5.8.0; the Nodes setting "
+                "'Verify the signature on every SNMPv3 reply' turns it off "
+                "for every device")
     return response
 
 

@@ -5938,6 +5938,16 @@
           but whose SNMP is failing stays UP and shows its SNMP error, rather than
           being reported as an outage it isn't having. Turn it off to treat SNMP
           failing as down on its own. Overridable per device and per profile.</p>
+        ${check('np-v3verify', 'Verify the signature on every SNMPv3 reply',
+                s.v3_verify_replies !== false)}
+        <p class="hint">New in 5.8.0, and on by default. A signed request's reply
+          must come back signed with the same key, and an encrypted request's
+          reply encrypted; anything less is refused as a downgrade and the device
+          shows why. <b>Turning this off gives that up for every device</b> — a
+          reply's signature is no longer checked and an unsigned answer is
+          accepted, as every release before 5.8.0 accepted it — so use it only to
+          keep polling one agent or proxy that answers unsigned while you chase
+          that device, not as a fix.</p>
       </fieldset>
       <fieldset><legend>PING</legend>
         ${number('np-pingcount', 'Probes per ping', s.ping_count, 'min=1 max=20')}
@@ -6074,6 +6084,7 @@
           default_snmp_retries: num('#np-retries'), down_after_failures: num('#np-downafter'),
           snmp_fail_alert_after: num('#np-snmpfailafter'),
           unreachable_ping_only: on('#np-pingonly'),
+          v3_verify_replies: on('#np-v3verify'),
           ping_count: num('#np-pingcount'),
           ping_timeout_ms: num('#np-pingtimeout'),
           ping_interval_s: num('#np-pinginterval'),

@@ -368,11 +368,19 @@ own subtabs.
 
 ### Devices and polling
 
-- **Polled over SNMP v1, v2c or v3** (noAuthNoPriv/authNoPriv — authPriv
-  is rejected at session setup with a clear message, the same deferral
-  the SNMP Trap receiver made for inbound decryption: there is no AES/DES
-  in the standard library and this app takes no third-party dependency),
-  or **ping alone** for a device with SNMP switched off entirely. A
+- **Polled over SNMP v1, v2c or v3** at any USM level — noAuthNoPriv,
+  authNoPriv, or, since 5.8.0, **authPriv with AES-128-CFB** (RFC 3826),
+  the level PAN-OS and most firewalls provision their SNMPv3 user at. The
+  cipher comes from the `cryptography` package (already installed
+  wherever ConfigRX works, since paramiko depends on it); a credential
+  with a privacy password on a host without a working `cryptography`
+  says so and is filed as `unsupported` rather than silently sent at
+  authNoPriv. DES and AES-192/256 are not offered — see
+  `netpath/snmpcrypt.py` for why. The security level is never a field
+  you set: an auth password makes a request authNoPriv, a privacy
+  protocol and password on top of it make it authPriv, and the level a
+  credential derives to is shown beside it. Or **ping alone** for a
+  device with SNMP switched off entirely. A
   device's identity (`sysDescr`, `sysName`, vendor), interface table and
   scalar metrics all come from the same poll. **What "scalar metrics"
   means, exactly**, because an earlier edition of this file overstated it:
@@ -522,6 +530,23 @@ own subtabs.
   nothing about how quickly an outage or a recovery is seen has changed.
   A device answering ping with a failing SNMP agent is not down and is never
   backed off, so `snmp_failing_ping_ok` counts exactly as it did.
+- **Every SNMPv3 reply is verified, and an unsigned answer to a signed
+  request is refused.** New in 5.8.0, on by default. Before it, no reply's
+  digest was ever checked — the poller signed what it sent and believed
+  whatever came back — so an off-path attacker who could guess a request
+  could forge a plausible reply and have it stored as fact. Now a reply's
+  digest is verified with the same key, a reply at a lower level than its
+  request (unsigned to a signed one, unencrypted to an encrypted one) is
+  refused as a downgrade, and the device's error says which of the two it
+  was: "the signature does not verify" is the stored auth password or
+  tampering; "carried no signature at all" is a device, proxy or middlebox
+  that has always answered unsigned and that no release before this one
+  noticed. The refusal message says in so many words that the check is
+  new in 5.8.0. **Verify the signature on every SNMPv3 reply**, in Nodes
+  settings, turns it off for every device — the pre-5.8.0 acceptance,
+  exactly — for the operator with one such agent to chase; its hint says
+  what that gives up. Report-PDUs are exempt, since engine discovery is
+  unauthenticated by design.
 - **A device is DOWN only when ping and SNMP have both failed.** A switch
   that still answers ICMP but whose community string is wrong is
   reachable and misconfigured, not down, and reporting it as an outage
@@ -2400,8 +2425,10 @@ everyone else's history.
   password` line. The digest is computed over the whole message with the
   authentication field blanked in place, per RFC 3414. A trap sent
   authPriv is detected and its header decoded, but the encrypted payload
-  is not decrypted — decryption needs a block cipher the standard library
-  does not provide, and this app takes no third-party dependencies. Such
+  is not decrypted — the Nodes poller speaks AES-128-CFB since 5.8.0
+  through `netpath/snmpcrypt.py`, and wiring the trap receiver to it (a
+  privacy password per trap user, the key localised to the sender's
+  engine) is a planned follow-up rather than part of that release. Such
   traps are stored and flagged as encrypted, not decoded, rather than
   dropped.
 - **Every trap gets a severity, 0–7** — the exact scale Syslog uses — via a
@@ -2729,9 +2756,12 @@ Controller, without polling each AP individually — the controller
 reports on all of them in one SNMP walk.
 
 - **Add a controller** with its IP and an SNMP credential (v1/v2c
-  community, or SNMPv3 noAuthNoPriv/authNoPriv — the same limitation
-  Nodes has, since this app has no AES/DES implementation to speak
-  authPriv with; the controller-add form says so directly). Managed from
+  community, or SNMPv3 noAuthNoPriv/authNoPriv — authPriv is a Nodes
+  feature since 5.8.0 and has not been brought to the wireless poller,
+  which has no privacy field and refuses a privacy password in words
+  rather than dropping it; a signed controller reply IS verified, the way
+  Nodes verifies one, and the same **Verify the signature** switch exists
+  in Wireless settings). Managed from
   **Controllers**, next to the module's Settings button.
 - **Per AP: status, name, client count, model, MAC address, response
   time, and tx power** — the last shown per-radio, since a real AP has more than one

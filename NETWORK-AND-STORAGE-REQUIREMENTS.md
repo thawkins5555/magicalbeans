@@ -163,12 +163,14 @@ address-to-MAC mapping comes from the operating system's own ARP cache, which
 only reflects the local broadcast domain regardless.
 
 Nodes polls port 161 always — it is the standard SNMP agent port and is not
-currently configurable per device or profile. An SNMPv3 device with only
-`authPriv` configured is rejected at session setup rather than polled: this
-app has no AES/DES implementation and takes no third-party dependency, the
-same deferral the SNMP Trap receiver made for inbound decryption. Wireless
-polling is the identical shape and the identical `authPriv` limitation,
-against a controller instead of a device.
+currently configurable per device or profile. An SNMPv3 device provisioned
+at `authPriv` is polled at `authPriv` since 5.8.0 (AES-128-CFB, RFC 3826;
+the cipher is the `cryptography` package's, which paramiko already brings
+in). On a host without a working `cryptography` such a credential is filed
+as `unsupported` with a message saying so, never sent at a lower level.
+Wireless polling is the same shape against a controller instead of a
+device, but stops at `authNoPriv`: it has no privacy field and refuses a
+privacy password in words.
 
 ConfigRX is the one place this application makes an outbound SSH
 connection, and the one place it depends on a third-party library
@@ -213,8 +215,10 @@ browser with no internet access works normally.
 ### Not used
 
 sFlow, syslog over TLS, NetFlow over TCP or SCTP, and IPv6 flow export are
-not supported. SNMPv3 `authPriv` is not supported for polling, and v3
-informs are not acknowledged — see `FEATURES.md`. The application makes no
+not supported. SNMPv3 `authPriv` is supported for Nodes polling since
+5.8.0 (AES-128-CFB only — no DES, no AES-192/256), not for the wireless
+poller and not yet for inbound traps; v3 informs are not acknowledged —
+see `FEATURES.md`. The application makes no
 outbound connection to the internet other than DNS, the traceroute probes
 themselves, and — only if Alerts' email notification is turned on — the
 configured SMTP server.

@@ -35,7 +35,7 @@ from .nodesdb import NodesDatabase, detected_vendor
 from . import snmpcrypt
 from .snmppoll import (
     ERROR_STATUS, PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_REPORT, Response,
-    SnmpAccessDenied, SnmpAuthError, SnmpPrivError, SnmpError, SnmpTimeout, SnmpUnsupported, build_request,
+    SnmpAccessDenied, SnmpAuthError, SnmpDowngrade, SnmpPrivError, SnmpError, SnmpTimeout, SnmpUnsupported, build_request,
     build_v3_request, decode_response, discovery_probe,
 )
 from .alertmail import duration_text
@@ -302,13 +302,15 @@ class _Session:
 
     def request(self, packet: bytes, expect_request_id: int | None = None, *,
                 auth_proto: str | None = None, auth_key: bytes | None = None,
-                priv_proto: str | None = None, priv_key: bytes | None = None) -> Response:
+                priv_proto: str | None = None, priv_key: bytes | None = None,
+                verify: bool = True) -> Response:
         """Send, wait for OUR reply, decode it.
 
         The keys are the ones `packet` was built with, handed to
         decode_response so a signed reply's digest is verified and an
         encrypted one decrypted; a reply that fails either is raised, not
-        dropped — see the except arm below.
+        dropped — see the except arm below. `verify=False` is the
+        v3_verify_replies setting turned off: decrypt, but check nothing.
 
         A UDP socket accepts whatever arrives, so taking the first datagram
         would let a late answer to attempt 1 be read as the answer to
@@ -349,8 +351,8 @@ class _Session:
                 try:
                     response = decode_response(
                         data, auth_proto=auth_proto, auth_key=auth_key,
-                        priv_proto=priv_proto, priv_key=priv_key)
-                except (SnmpUnsupported, SnmpAuthError, SnmpPrivError):
+                        priv_proto=priv_proto, priv_key=priv_key, verify=verify)
+                except (SnmpUnsupported, SnmpAuthError, SnmpDowngrade, SnmpPrivError):
                     # Not garbage: a datagram from the right peer whose
                     # signature does not verify, or that cannot be
                     # decrypted, or that arrived below the level asked for.
@@ -483,7 +485,8 @@ def v3_exchange(session: _Session, pdu_tag: int, oids: list[str], *,
                 password: str | None, engine: tuple | None = None,
                 max_repetitions: int = 0, ip: str = "",
                 learned=None, priv_proto: str | None = None,
-                priv_password: str | None = None) -> Response:
+                priv_password: str | None = None,
+                verify_replies: bool = True) -> Response:
     """One authenticated v3 round trip, with the engine resync RFC 3414
     §3.2 actually prescribes — the ONE copy of it.
 
@@ -514,7 +517,12 @@ def v3_exchange(session: _Session, pdu_tag: int, oids: list[str], *,
     instead would be the silent downgrade that ends in
     authorizationError(16). A reply whose signature does not verify, or
     that cannot be decrypted, is an _AuthFailure: the credential is what
-    is wrong, and the engine cache is what the poller drops on one."""
+    is wrong, and the engine cache is what the poller drops on one. A
+    reply that carries NO signature to a signed request is SnmpDowngrade,
+    left as the plain SnmpError it is: the credential is not wrong, the
+    device (or something between here and it) is answering below the
+    level asked, and `verify_replies=False` — the v3_verify_replies
+    setting — is the operator's way to accept that."""
     encrypting = bool(priv_proto and priv_password)
     if encrypting and not (auth_proto and password):
         raise SnmpError(
@@ -548,7 +556,8 @@ def v3_exchange(session: _Session, pdu_tag: int, oids: list[str], *,
         try:
             response = session.request(
                 packet, request_id, auth_proto=auth_proto, auth_key=auth_key,
-                priv_proto=priv_proto if encrypting else None, priv_key=priv_key)
+                priv_proto=priv_proto if encrypting else None, priv_key=priv_key,
+                verify=verify_replies)
         except SnmpAuthError as exc:
             raise _AuthFailure(f"{ip}: SNMPv3 reply rejected — {exc}") from exc
         except SnmpPrivError as exc:
@@ -751,15 +760,20 @@ def _interface_reassigned(prior: "sqlite3.Row | dict", row: dict) -> bool:
     return False
 
 
-def _credential_label(config: dict) -> str:
+def _credential_label(config: dict, level: str | None = None) -> str:
     """How to name the credential in an operator-facing message, without
-    ever printing the credential itself: a community string is a secret."""
+    ever printing the credential itself: a community string is a secret.
+
+    The USM level is named too, because "I could not see what level I was
+    sending at" is what an authorizationError comes down to. `level` is
+    the level the request actually went out at when the caller knows it —
+    the Test button signs with a password that was typed and never stored,
+    so the config alone can be wrong about it — and is derived from the
+    config otherwise."""
     version = int(config.get("snmp_version", 1))
     if version == 3:
         user = config.get("v3_user")
-        # The level is named because "I could not see what level I was
-        # sending at" is what an authorizationError comes down to.
-        level = security_level(config)
+        level = level or security_level(config)
         return (f"SNMPv3 user {user!r} at {level}" if user
                 else f"SNMPv3 (no user set) at {level}")
     name = {0: "v1", 1: "v2c"}.get(version, f"v{version}")
@@ -860,7 +874,7 @@ def access_denied_advice(config: dict, level: str) -> str:
     v1/v2c); it is a parameter, not read from `config`, because the Test
     button signs with a password that was typed and never stored. Never
     prints a community, a password or a key: _credential_label is the rule."""
-    who = _credential_label(config)
+    who = _credential_label(config, level or None)
     if level == "authNoPriv":
         return (
             f"The message authenticated: the device verified the signature "
@@ -1367,6 +1381,11 @@ class NodePoller(Worker):
     def __init__(self, db: NodesDatabase, log=None):
         self.db = db
         self.log = log or NullLog()
+        # v3_verify_replies, read once per poll in _poll_device (settings()
+        # is a query, and a walk is hundreds of exchanges) and carried here
+        # for every v3 exchange that poll makes. True until a poll has read
+        # the setting, because verified is the shipped default.
+        self._verify_replies = True
         self._executor: ThreadPoolExecutor | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -2618,6 +2637,7 @@ class NodePoller(Worker):
         now = time.time()
 
         settings = self.db.settings()
+        self._verify_replies = bool(settings.get("v3_verify_replies", True))
         ping_ok = None
         ping_rtt_ms = None
         ping_loss_pct = None
@@ -3312,7 +3332,8 @@ class NodePoller(Worker):
                 engine=self._engines.current(device_id),
                 max_repetitions=max_repetitions, ip=device["ip"], learned=learned,
                 priv_proto=credential.priv_proto,
-                priv_password=credential.priv_password)
+                priv_password=credential.priv_password,
+                verify_replies=self._verify_replies)
         except _AuthFailure:
             self._engines.invalidate(device_id)
             raise
@@ -3342,8 +3363,9 @@ class NodePoller(Worker):
         cache miss, or if that candidate no longer works, walks the full
         candidate list from db.credential_candidates() in order. Every
         failure mode is credential-specific in a mixed profile — a v3
-        authPriv alternate raises SnmpUnsupported while a v2c alternate
-        right after it works — so every SnmpError subclass is caught
+        authPriv alternate raises SnmpUnsupported on a host whose
+        `cryptography` backend does not work, while a v2c alternate right
+        after it works — so every SnmpError subclass is caught
         uniformly and only the last one re-raised, once every candidate has
         failed. Returns (winning_config, identity, uptime_ticks, metrics)."""
         device_id = device["id"]

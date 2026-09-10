@@ -559,11 +559,51 @@ outbound signing share one implementation rather than risking drift
 between two. `discovery_probe()` builds the empty, unauthenticated,
 reportable GET RFC 3414 §4 defines for learning `engineID`/`engineBoots`/
 `engineTime` from a target's Report-PDU before any authenticated request
-can be built. `authPriv` is rejected — `decode_response` raises
-`SnmpUnsupported` if a decoded v3 message's `msgFlags` carry the privacy
-bit — matching the trap receiver's own inbound-decryption deferral;
-`nodesdb`'s schema has no privacy-protocol column at all, so the UI never
-offers configuring it in the first place.
+can be built. `authPriv` (AES-128-CFB, RFC 3826) since 5.8.0:
+`build_v3_request` takes `priv_proto`/`priv_key`, builds the plaintext
+ScopedPDU with `scoped_pdu()` (one function for both paths, so they cannot
+drift), encrypts it FIRST through `snmpcrypt.encrypt` — the RFC 3826 IV is
+engineBoots ‖ engineTime ‖ an 8-byte salt that is also sent as
+`msgPrivacyParameters`, CFB128 pads nothing so the ciphertext is the
+plaintext's length — and only then HMACs the assembled message, ciphertext
+and salt included (RFC 3414 §3.1). `decode_response` does the exact
+reverse: verify the digest, then decrypt, and a decrypted buffer that is
+not a BER SEQUENCE is raised as `SnmpPrivError` naming the privacy
+password, because CFB turns any ciphertext into some plaintext and "wrong
+key" is what a parse failure there almost always is. Privacy without
+authentication is refused, not downgraded: USM has no such level.
+`netpath/snmpcrypt.py` is a leaf module — `cryptography` and the standard
+library, nothing from `netpath` — owning the IV, the salt discipline (a
+random 64-bit start from `os.urandom` and a locked counter; never the
+`random` module, which seeds request ids) and the availability guard,
+which runs a NIST known-answer encrypt/decrypt rather than trusting that
+`import cryptography` worked, catches `BaseException` around it because a
+broken Rust backend panics with a pyo3 exception that is neither
+`ImportError` nor `Exception`, and imports `CFB` from
+`hazmat.decrepit` first with `hazmat.primitives` as the fallback (the mode
+is mid-move between the two and a pinned path is the bug that resurfaces
+after a patch). The privacy key is `trapdecode.privacy_key`: the auth
+protocol's `localized_key` — USM has no privacy hash of its own — cut to
+its first 16 bytes, through the same bounded `_KEY_CACHE`.
+
+**Reply verification, new in 5.8.0.** `decode_response` takes the keys the
+request was built with; a reply carrying `FLAG_AUTH` has its digest
+checked with `hmac.compare_digest` and a mismatch is `SnmpAuthError`; a
+non-Report reply that arrives below the request's level (unsigned to a
+signed request, unencrypted to an encrypted one) is `SnmpDowngrade`, a
+separate type with a separate message that says the check is new in
+5.8.0 and names the setting. Report-PDUs are exempt — the discovery
+exchange and a `wrongDigests` refusal are unauthenticated by design.
+`_Session.request` re-raises all three rather than treating them as
+stray datagrams, so a wrong key is never reported as a timeout;
+`v3_exchange` turns `SnmpAuthError`/`SnmpPrivError` into `_AuthFailure`
+(the credential is wrong; the engine cache is dropped) and lets
+`SnmpDowngrade` through as the plain `SnmpError` it is (the credential
+was never contradicted). `nodes_settings["v3_verify_replies"]` (and the
+same key in Wireless) is the off switch: `verify=False` skips the digest
+check and the downgrade refusal — the pre-5.8.0 behaviour — while still
+decrypting. The poller reads it once per poll and carries it, because
+`settings()` is a query and a walk is hundreds of exchanges.
 
 ### Vendor identification (`vendorid.py`, `enterprises.py`, `nodepoll.py`)
 
@@ -5801,8 +5841,8 @@ since the 1 MiB hash costs real milliseconds), zero-fills a `bytearray`
 copy of the datagram at the authentication parameter's recorded offsets,
 and compares an HMAC computed over that copy against what was sent, via
 `hmac.compare_digest`. If `priv`, the `ScopedPDU` is encrypted and is not
-parsed further — the standard library has no AES/DES implementation, and
-this app takes no third-party dependencies — the trap is stored with
+parsed further — `snmpcrypt.py` can (the poller uses it since 5.8.0), but
+wiring inbound decryption is a follow-up — the trap is stored with
 `auth_state="encrypted"` and everything the header carries in the clear;
 `AUTH_PROTOCOLS`'s comment block marks exactly where a future
 `trapcrypto.py` would plug in (`decrypt(protocol, key, priv_params,
@@ -6771,11 +6811,13 @@ by controller id instead of device id), `nodepoll.credential_for()`
 any of it. Table walking is repeated GETNEXT (`_walk_column`), not
 GETBULK: the same choice `nodepoll.py`'s own table walker already made
 ("avoiding a separate GETBULK code path"), matched here rather than
-introducing a second table-walking idiom for one small poller. Same v3
-limitation as Nodes: authPriv raises `SnmpUnsupported` at session setup,
-since there is no AES/DES in the standard library and this app takes no
-third-party dependency for it — v1/v2c community or v3 noAuthNoPriv/
-authNoPriv only.
+introducing a second table-walking idiom for one small poller. v1/v2c
+community or v3 noAuthNoPriv/authNoPriv only: Nodes gained authPriv in
+5.8.0 and this poller did not — `post_wireless_controller_credential`
+passes `allow_priv=False`, so a privacy password in the body is refused
+with a message rather than stored and never sent. A signed controller
+reply's digest is verified since 5.8.0 (`session.request(...,
+auth_key=...)`), honouring `wireless_settings["v3_verify_replies"]`.
 
 **Storage** (`wirelessdb.WirelessDatabase`): `controllers` (one row per
 configured controller, carrying its own SNMP credential columns —

@@ -71,6 +71,9 @@ class WirelessPoller(Worker):
         # Reset per controller in _poll_controller; defined here so the
         # helper is safe to call before a poll has started.
         self._ping_deadline = 0.0
+        # v3_verify_replies, read once per controller poll and carried for
+        # every GETNEXT of that poll — nodepoll keeps it the same way.
+        self._verify_replies = True
         self.counters = {"polls": 0, "ok": 0, "errors": 0}
 
     def start(self, settings: dict | None = None) -> None:
@@ -221,6 +224,7 @@ class WirelessPoller(Worker):
 
     def _poll_controller(self, controller) -> None:
         config = dict(controller)
+        self._verify_replies = bool(self.db.settings().get("v3_verify_replies", True))
         # One budget for the whole controller's sweep, so a rack of
         # unreachable APs cannot add a timeout each to the cycle.
         self._ping_deadline = time.time() + PING_BUDGET_S
@@ -374,7 +378,8 @@ class WirelessPoller(Worker):
                 engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
                 user=identity or "", auth_proto=auth_proto, auth_key=auth_key)
             response = session.request(packet, expect_request_id=request_id,
-                                       auth_proto=auth_proto, auth_key=auth_key)
+                                       auth_proto=auth_proto, auth_key=auth_key,
+                                       verify=self._verify_replies)
             if response.pdu_tag == PDU_REPORT:
                 self._engines.invalidate(controller["id"])
                 raise _AuthFailure(f"{controller['ip']}: engine resync required")

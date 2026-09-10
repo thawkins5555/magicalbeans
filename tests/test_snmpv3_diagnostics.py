@@ -76,10 +76,12 @@ class CaptureLog:
 
 class FakeService:
     """Just enough of web.Service for post_nodes_device_test: it reads
-    nodes_db and nothing else."""
+    nodes_db and, since 5.8.0, the nodes_settings dict (for
+    v3_verify_replies) and nothing else."""
 
-    def __init__(self, nodes_db):
+    def __init__(self, nodes_db, nodes_settings=None):
         self.nodes_db = nodes_db
+        self.nodes_settings = dict(nodes_settings or {})
 
 
 def new_v3_db(name: str, password: str | None, *, timeout_s: float = 1.0) -> tuple:
@@ -148,13 +150,19 @@ check("...says the message authenticated and this is VACM, not the password",
       "authenticated" in text and "not a bad password" in text and "VACM" in text, text)
 check("...raises authPriv as the likely cause and cites RFC 3415",
       "authPriv" in text and "RFC 3415" in text and "PAN-OS" in text, text)
-check("...says what to do, honestly: an authNoPriv view, since authPriv is "
-      "not implemented here",
-      "view at authNoPriv" in text and "not" in text and "implemented" in text, text)
+check("...says what to do: set the privacy protocol and password on this "
+      "credential (authPriv is implemented since 5.8.0), or grant an "
+      "authNoPriv view",
+      "privacy password on this credential" in text and "view at authNoPriv" in text
+      and "not implemented" not in text and "cannot" not in text, text)
+check("...and names the level the request went out at, beside the user",
+      "'poller' at authNoPriv" in text, text)
 text = access_denied_reason(v3_config, empty, SCALARS, "authPriv")
 check("a request already at authPriv blames the view and stops — no level "
-      "left to blame",
-      "does not include that object" in text and "authNoPriv" not in text, text)
+      "left to blame, and the label says authPriv even though the stored "
+      "config alone would derive authNoPriv (the Test button's typed password)",
+      "does not include that object" in text and "authNoPriv" not in text
+      and "'poller' at authPriv" in text, text)
 text = access_denied_reason({"snmp_version": 3, "v3_user": "poller"}, empty, SCALARS, "noAuthNoPriv")
 check("an unsigned v3 request is told a view at a higher level cannot match it",
       "noAuthNoPriv" in text and "unsigned" in text, text)

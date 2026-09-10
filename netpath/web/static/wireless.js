@@ -269,8 +269,10 @@
           ? `<label>Auth password <input id="wc-v3pass" type="password"
               placeholder="${c && c.has_credential ? 'stored — leave blank to keep' : ''}"></label>`
           : App.credentialUnavailableHtml('An SNMPv3 auth password')}
-        <p class="hint">authPriv is not supported — only noAuthNoPriv or authNoPriv will
-          reach the controller.</p>
+        <p class="hint">noAuthNoPriv or authNoPriv only: authPriv is a Nodes feature
+          (since 5.8.0) that has not been brought to the wireless poller, and a
+          privacy password sent here is refused rather than stored and never used.
+          Give the controller's SNMPv3 user an authNoPriv view instead.</p>
       </fieldset>`;
   }
 

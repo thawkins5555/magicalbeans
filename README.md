@@ -783,14 +783,18 @@ one thing configured: a passphrase. Set `NETPATH_SECRET_PASSPHRASE_FILE` to
 a file private to the service's own account (recommended — it survives an
 unattended restart the way a passphrase typed in cannot) or
 `NETPATH_SECRET_PASSPHRASE` directly (weaker: readable by anything else
-running as the same account), and SNMPv3 authentication passwords, the SSH
-password ConfigRX and the terminal need, an authenticated SMTP password and
+running as the same account), and SNMPv3 authentication and privacy
+passwords, the SSH password ConfigRX and the terminal need, an
+authenticated SMTP password and
 the wireless controller's SNMP credential can all be stored exactly as they
 are on Windows. The DHCP credential is the one exception, Windows or not —
 it depends on PowerShell/RSAT, not on DPAPI, so it stays Windows-only
 regardless. With no passphrase configured, the pre-4.47.0 behaviour is
 unchanged: none of those credentials can be stored, a Linux deployment polls
-SNMPv1/v2c and v3 noAuthNoPriv, relays mail through a server that does not
+SNMPv1/v2c and v3 noAuthNoPriv (authPriv, like authNoPriv, needs a stored
+password, and additionally the `cryptography` package — installed with
+paramiko, declared in `requirements.txt` in its own right), relays mail
+through a server that does not
 ask for authentication, and does not back up configurations.
 `CREDENTIAL-SECURITY.md` §10 sets out exactly what the passphrase-based
 store protects and what it does not — it is not tied to one machine the

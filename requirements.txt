@@ -4,3 +4,10 @@ PySide6>=6.5
 # Capped below 5.0: paramiko 5 removed SHA-1 key exchange outright, so a
 # switch offering nothing newer becomes unreachable; 3.x still offers it via allow_legacy_ssh.
 paramiko>=3.4,<5
+# SNMPv3 privacy (authPriv, AES-128-CFB) for the Nodes poller — see
+# netpath/snmpcrypt.py and CREDENTIAL-SECURITY.md s4. Already pulled in by
+# paramiko on every host where ConfigRX works, but paramiko's backend is not
+# ours to depend on, so it is named here in its own right. No lower bound:
+# the AES-CFB primitive predates every version still installable, and the
+# module tolerates CFB's move to hazmat.decrepit (41+ warns, later removes).
+cryptography

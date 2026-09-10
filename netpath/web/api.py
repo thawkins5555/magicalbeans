@@ -4082,24 +4082,32 @@ def post_nodes_device_merge(service, params, body, device_id) -> dict:
     return {"ok": True, "device_id": winner["id"], "plan": plan}
 
 
+def _effective_config_json(service, row, reveal: bool) -> dict:
+    """The device's effective_config as the API shows it: both stored
+    blobs withheld (has_credential/has_priv_credential say whether they
+    exist), the community only for a caller who may read secrets, and the
+    USM level the poll actually goes out at AFTER the profile merge — the
+    row-level security_level in _device_json is null for a device that
+    does not override its version, which is most of them."""
+    from ..nodepoll import security_level
+
+    effective = service.nodes_db.effective_config(row)
+    shown = {k: v for k, v in effective.items()
+             if k not in ("v3_auth_pass_enc", "v3_priv_pass_enc")
+             and (reveal or k != "community")}
+    shown["security_level"] = security_level(effective) or None
+    shown["has_credential"] = bool(effective.get("v3_auth_pass_enc"))
+    shown["has_priv_credential"] = bool(effective.get("v3_priv_pass_enc"))
+    return shown
+
+
 def get_nodes_device(service, params, body, device_id) -> dict:
     row = _require(service.nodes_db.device(device_id), "device")
     reveal = _may_read_secrets(service, params, "nodes")
     device = _device_json(row, reveal)
     # effective_config resolves the profile's own community into the
     # device's, so it carries one too and follows the same rule.
-    effective = service.nodes_db.effective_config(row)
-    device["effective_config"] = {
-        k: v for k, v in effective.items()
-        if k not in ("v3_auth_pass_enc", "v3_priv_pass_enc")
-        and (reveal or k != "community")}
-    # The level the poll actually goes out at, after the profile merge —
-    # the row-level security_level above is null for a device that does
-    # not override its version, which is most of them.
-    from ..nodepoll import security_level as _level
-    device["effective_config"]["security_level"] = _level(effective) or None
-    device["effective_config"]["has_credential"] = bool(effective.get("v3_auth_pass_enc"))
-    device["effective_config"]["has_priv_credential"] = bool(effective.get("v3_priv_pass_enc"))
+    device["effective_config"] = _effective_config_json(service, row, reveal)
     device["group_name"] = None
     if row["group_id"]:
         group = service.nodes_db.group(row["group_id"])
@@ -4945,8 +4953,8 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
         DEFAULT_SNMP_PORT, USM_STATS, _AuthFailure, _Session,
         access_denied_advice, access_denied_headline, credential_for,
         discover_engine, refused_oid, v3_exchange)
-    from ..snmppoll import (ERROR_STATUS, PDU_GET, SnmpAccessDenied, SnmpError,
-                            build_request)
+    from ..snmppoll import (ERROR_STATUS, PDU_GET, SnmpAccessDenied, SnmpDowngrade,
+                            SnmpError, build_request)
 
     row = _require(service.nodes_db.device(device_id), "device")
     config = service.nodes_db.effective_config(row)
@@ -5102,7 +5110,9 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
                     auth_proto=auth_proto, password=password, engine=engine[0],
                     max_repetitions=max_repetitions or 10, ip=row["ip"],
                     learned=learned, priv_proto=priv_proto,
-                    priv_password=priv_password)
+                    priv_password=priv_password,
+                    verify_replies=bool(service.nodes_settings.get(
+                        "v3_verify_replies", True)))
 
             started = time.time()
             try:
@@ -5188,6 +5198,16 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
                 snmp["auth"] = {"ok": None, "detail": "not proven either way: "
                                 + (explanation or "the device answered with "
                                                   "a Report-PDU")}
+        except SnmpDowngrade as exc:
+            # The device answered, but below the level it was asked at,
+            # and the reply was refused unread. Not an auth failure — the
+            # password was never contradicted — and said so, with the
+            # setting that accepts such replies named in the error itself.
+            snmp["ok"] = False
+            snmp["error"] = str(exc)
+            snmp["auth"] = {"ok": None, "detail": (
+                "not proven either way: the reply carried no signature, so "
+                "there was nothing to verify — refused as a downgrade")}
         except (SnmpError, OSError) as exc:
             # SnmpAccessDenied lands here too, with the headline as the
             # error and refused_oid/hint already filled in above. OSError:

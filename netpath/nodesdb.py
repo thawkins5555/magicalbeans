@@ -680,6 +680,14 @@ DEFAULTS = {
     # poll cycle. The arc hop in a discovery sweep is separate and cheap
     # ((arcs + 1) GETNEXTs per device that answers SNMP).
     "vendor_walk_enabled": True,
+    # Verify the digest on every signed SNMPv3 reply and refuse a reply
+    # that arrives below the level its request went out at. New in 5.8.0
+    # and on by default — nothing verified a reply before, so this is the
+    # first release in which a device that has always answered unsigned
+    # stops polling. Off restores the pre-5.8.0 acceptance for EVERY
+    # device (there is no per-device form of it, on purpose: one switch
+    # an operator can find, not a checkbox on a thousand devices).
+    "v3_verify_replies": True,
     "vendor_walk_max_objects": 500,
     "vendor_walk_budget_s": 20.0,
     "vendor_walk_parallel": 4,

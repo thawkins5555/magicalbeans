@@ -82,6 +82,29 @@ Modes:
                    (authorizationError) and error-index 1, because the
                    user's only access entry is at authPriv and an
                    authNoPriv request matches no entry at all (RFC 3415).
+                   --priv-pass PASSWORD (with --priv-proto AES) makes the
+                   stub a real authPriv agent, the PAN-OS user as
+                   provisioned: an inbound authPriv request has its digest
+                   verified FIRST and is then decrypted (RFC 3414 s3.2's
+                   order), one that will not decrypt to a ScopedPDU is
+                   answered with a Report naming usmStatsDecryptionErrors
+                   (a wrong privacy password, distinct from wrongDigests),
+                   an unencrypted request to this user with
+                   usmStatsUnsupportedSecLevels, and every reply goes back
+                   encrypted under a fresh salt of the stub's own. The
+                   salts it received and the salts it sent are both listed
+                   in --stats, so a test can prove none repeated across a
+                   real walk. Whenever the stub holds an auth key its
+                   replies are SIGNED, as a real agent's are — the poller
+                   verifies a reply's digest since 5.8.0 and refuses an
+                   unsigned answer to a signed request as a downgrade.
+                   --tamper-reply flips one byte of every Response after
+                   it is signed, the forged-or-altered reply that
+                   verification exists to catch. --unsigned-replies makes
+                   the stub verify a signed request and then answer it
+                   UNSIGNED — the agent, proxy or middlebox that has always
+                   done this and that 5.8.0's downgrade refusal is the
+                   first release to notice.
                    Every one of these is off by default.
 
 Options: --host ADDRESS (bind elsewhere than 127.0.0.1 — "::1" opens an
@@ -92,7 +115,8 @@ AF_INET6 socket), --interfaces N, --reboot-after N, --dark-after N, --window SEC
 answering walk requests at all, the mid-table timeout with rows already in
 hand), --stale-id N (prepend a wrong-request-id copy to the
 first N replies — the datagram _Session.dropped counts), and the v3
---auth-pass/--auth-proto/--require-priv described above. Answering from
+--auth-pass/--auth-proto/--require-priv/--priv-pass/--priv-proto/
+--tamper-reply/--unsigned-replies described above. Answering from
 the wrong SOURCE PORT deliberately has no flag: _Session._is_peer compares
 the host only, because agents that reply from an ephemeral port are common
 and not forgery, so a wrong port is not a dropped datagram here.
@@ -110,13 +134,16 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))  # the repo root, from tests/stubs/
 
-from netpath import nodeoids
-from netpath.snmppoll import FLAG_AUTH, FLAG_PRIV, decode_response, find_auth_span
+from netpath import nodeoids, snmpcrypt
+from netpath.snmppoll import (
+    FLAG_AUTH, FLAG_PRIV, SnmpPrivError, decode_response, find_auth_span, sign_v3,
+)
 from netpath.trapdecode import (
     AUTH_PROTOCOLS, PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_REPORT, PDU_RESPONSE,
     T_COUNTER32, T_COUNTER64, T_END_OF_MIB_VIEW, T_GAUGE32, T_NO_SUCH_OBJECT,
     T_NULL, T_INTEGER, T_OCTET_STRING, T_SEQUENCE, T_TIMETICKS, V3, Reader,
     _signed, _tlv, enc_int, enc_octets, enc_unsigned, enc_varbind, localized_key,
+    privacy_key,
 )
 
 COMMUNITY = "public"
@@ -126,6 +153,7 @@ USM_UNSUPPORTED_SEC_LEVELS = "1.3.6.1.6.3.15.1.1.1.0"
 USM_NOT_IN_TIME_WINDOWS = "1.3.6.1.6.3.15.1.1.2.0"
 USM_UNKNOWN_ENGINE_IDS = "1.3.6.1.6.3.15.1.1.4.0"
 USM_WRONG_DIGESTS = "1.3.6.1.6.3.15.1.1.5.0"
+USM_DECRYPTION_ERRORS = "1.3.6.1.6.3.15.1.1.6.0"
 # RFC 3416's authorizationError: the agent accepted the message and
 # refused the object under its own access control.
 AUTHORIZATION_ERROR = 16
@@ -140,12 +168,22 @@ class Agent:
                  gen_err: tuple = (), no_such_name: tuple = (),
                  refuse_bulk: bool = False, stale_id: int = 0,
                  dark_after_rows: int = 0, require_priv: bool = False,
-                 auth_pass: str = "", auth_proto: str = "SHA"):
+                 auth_pass: str = "", auth_proto: str = "SHA",
+                 priv_pass: str = "", priv_proto: str = "AES",
+                 tamper_reply: bool = False, unsigned_replies: bool = False):
         self.mode = mode
         self.n_interfaces = interfaces
         self.require_priv = require_priv
         self.auth_pass = auth_pass
         self.auth_proto = auth_proto
+        self.priv_pass = priv_pass
+        self.priv_proto = priv_proto
+        self.tamper_reply = tamper_reply
+        self.unsigned_replies = unsigned_replies
+        # Every msgPrivacyParameters this agent received and every one it
+        # sent, in order, as hex — the evidence for the non-reuse test.
+        self.salts_seen: list[str] = []
+        self.salts_sent: list[str] = []
         self.reply_delay = reply_delay
         self.bulk_cap = bulk_cap
         self.gen_err = tuple(gen_err)
@@ -182,7 +220,10 @@ class Agent:
                        "bulk_refused": 0, "stale": 0,
                        # v3 refusals, by kind: a wrong digest, and a
                        # request accepted and then denied the object.
-                       "wrong_digests": 0, "denied": 0}
+                       "wrong_digests": 0, "denied": 0,
+                       # authPriv: requests decrypted, ones that would not
+                       # decrypt, and a received salt seen twice (never).
+                       "decrypted": 0, "decrypt_errors": 0, "salt_reuse": 0}
 
     # ------------------------------------------------------------- SNMPv3
 
@@ -217,6 +258,21 @@ class Agent:
         expected = hmac.new(key, blank, ctor).digest()[:length]
         return hmac.compare_digest(expected, data[start:end])
 
+    def _auth_key(self) -> bytes:
+        return localized_key(self.auth_proto, self.auth_pass, ENGINE_ID)
+
+    def _priv_key(self) -> bytes:
+        return privacy_key(self.auth_proto, self.priv_pass, ENGINE_ID)
+
+    @staticmethod
+    def _priv_params(data: bytes) -> bytes:
+        """The msgPrivacyParameters an inbound message carried — the field
+        right after the one find_auth_span locates."""
+        _start, end = find_auth_span(data)
+        params = Reader(data, end)
+        ps, pe = params.expect(T_OCTET_STRING)
+        return data[ps:pe]
+
     def engine_time(self) -> int:
         return int(time.monotonic() - self.engine_epoch)
 
@@ -227,15 +283,39 @@ class Agent:
         self.engine_boots += 1
         self.engine_epoch = time.monotonic()
 
-    def _v3_message(self, msg_id: int, pdu: bytes) -> bytes:
-        header = _tlv(T_SEQUENCE, enc_int(msg_id) + enc_int(65507) +
-                      _tlv(T_OCTET_STRING, bytes([0])) + enc_int(3))
-        usm_body = (enc_octets(ENGINE_ID) + enc_int(self.engine_boots) +
-                    enc_int(self.engine_time()) + enc_octets("") +
-                    _tlv(T_OCTET_STRING, b"") + _tlv(T_OCTET_STRING, b""))
-        sec = _tlv(T_OCTET_STRING, _tlv(T_SEQUENCE, usm_body))
+    def _v3_message(self, msg_id: int, pdu: bytes, level: int = 0) -> bytes:
+        """One reply at `level` (FLAG_AUTH and/or FLAG_PRIV), clipped to
+        what this agent can actually produce: it signs only with an auth
+        key and encrypts only with a privacy key. Encrypt first, sign
+        last — the same order build_v3_request uses, because it is the
+        order RFC 3414 s3.1 prescribes for everyone."""
+        level &= ((FLAG_AUTH if self.auth_pass else 0) |
+                  (FLAG_PRIV if self.priv_pass else 0))
+        if self.unsigned_replies:
+            level = 0
+        boots, now = self.engine_boots, self.engine_time()
         scoped = _tlv(T_SEQUENCE, enc_octets(ENGINE_ID) + enc_octets("") + pdu)
-        return _tlv(T_SEQUENCE, enc_int(V3) + header + sec + scoped)
+        priv_params = b""
+        if level & FLAG_PRIV:
+            ciphertext, priv_params = snmpcrypt.encrypt(self._priv_key(), boots, now, scoped)
+            scoped = _tlv(T_OCTET_STRING, ciphertext)
+            self.salts_sent.append(priv_params.hex())
+        digest_len = AUTH_PROTOCOLS[self.auth_proto][1] if level & FLAG_AUTH else 0
+        header = _tlv(T_SEQUENCE, enc_int(msg_id) + enc_int(65507) +
+                      _tlv(T_OCTET_STRING, bytes([level])) + enc_int(3))
+        usm_body = (enc_octets(ENGINE_ID) + enc_int(boots) + enc_int(now) +
+                    enc_octets("") + _tlv(T_OCTET_STRING, bytes(digest_len)) +
+                    _tlv(T_OCTET_STRING, priv_params))
+        sec = _tlv(T_OCTET_STRING, _tlv(T_SEQUENCE, usm_body))
+        message = _tlv(T_SEQUENCE, enc_int(V3) + header + sec + scoped)
+        if level & FLAG_AUTH:
+            message = sign_v3(message, self.auth_proto, self._auth_key())
+        return message
+
+    def _tampered(self, message: bytes) -> bytes:
+        """The last byte flipped AFTER signing — inside the ScopedPDU, or
+        inside the ciphertext — so the digest no longer matches."""
+        return message[:-1] + bytes([message[-1] ^ 0xFF])
 
     @staticmethod
     def _pdu(tag: int, request_id: int, varbinds: bytes,
@@ -246,14 +326,25 @@ class Agent:
         return _tlv(tag, enc_int(request_id) + enc_int(error_status) +
                     enc_int(error_index) + _tlv(T_SEQUENCE, varbinds))
 
-    def _report(self, msg_id: int, request_id: int, oid: str) -> bytes:
+    def _report(self, msg_id: int, request_id: int, oid: str, level: int = 0) -> bytes:
+        """A Report-PDU. Unauthenticated by default, as an agent's are for
+        everything it could not verify (unknown engine or user, a wrong
+        digest, a level it does not serve, a message it could not
+        decrypt); notInTimeWindows alone is sent signed (authNoPriv) when
+        the request was, the way net-snmp does it, since by then the
+        signature HAS verified and the manager is expected to check the
+        Report's own."""
         self.counts["reports"] += 1
         body = enc_varbind(oid, enc_unsigned(T_COUNTER32, self.counts["reports"]))
-        return self._v3_message(msg_id, self._pdu(PDU_REPORT, request_id, body))
+        return self._v3_message(msg_id, self._pdu(PDU_REPORT, request_id, body),
+                                level & FLAG_AUTH)
 
     def _v3_handle(self, req, msg_id: int, flags: int = 0,
-                   data: bytes = b"") -> list:
+                   data: bytes = b"", verified: bool = False) -> list:
         self.counts["requests"] += 1
+        # Replies go back at the request's own level; the flags that
+        # arrived are the flags that leave (clipped by what we can do).
+        level = flags & (FLAG_AUTH | FLAG_PRIV)
         now = time.monotonic()
         # The requests of one poll arrive within milliseconds of each other;
         # the test's deliberate sleep between polls is the only gap that
@@ -281,13 +372,20 @@ class Agent:
             if not flags & FLAG_AUTH:
                 return [self._report(msg_id, req.request_id,
                                      USM_UNSUPPORTED_SEC_LEVELS)]
-            if not self._digest_ok(data):
+            if not verified and not self._digest_ok(data):
                 self.counts["wrong_digests"] += 1
                 return [self._report(msg_id, req.request_id, USM_WRONG_DIGESTS)]
+        if self.priv_pass and not flags & FLAG_PRIV:
+            # An authPriv user sent an authNoPriv request: USM refuses it
+            # before VACM ever sees it (RFC 3414 s3.2 step 5). This is the
+            # OTHER thing a real agent may do with the PAN-OS case —
+            # --require-priv is the VACM version of the same mismatch.
+            return [self._report(msg_id, req.request_id,
+                                 USM_UNSUPPORTED_SEC_LEVELS)]
         if req.engine_boots != self.engine_boots \
                 or abs(req.engine_time - self.engine_time()) > self.window:
             return [self._report(msg_id, req.request_id,
-                                 USM_NOT_IN_TIME_WINDOWS)]
+                                 USM_NOT_IN_TIME_WINDOWS, level)]
         self.counts["responses"] += 1
         if self.require_priv and not flags & FLAG_PRIV and \
                 req.pdu_tag in (PDU_GET, PDU_GETNEXT, PDU_GETBULK):
@@ -303,21 +401,56 @@ class Agent:
             return [self._v3_message(
                 msg_id, self._pdu(PDU_RESPONSE, req.request_id, echo,
                                   error_status=AUTHORIZATION_ERROR,
-                                  error_index=1))]
+                                  error_index=1), level)]
+        reply = None
         if req.pdu_tag == PDU_GET:
             body = b""
             for vb in req.varbinds:
                 value = self.value_for(vb["oid"])
                 body += enc_varbind(vb["oid"], value if value is not None
                                     else _tlv(T_NO_SUCH_OBJECT, b""))
-            return [self._v3_message(
-                msg_id, self._pdu(PDU_RESPONSE, req.request_id, body))]
-        if req.pdu_tag in (PDU_GETNEXT, PDU_GETBULK):
+            reply = self._v3_message(
+                msg_id, self._pdu(PDU_RESPONSE, req.request_id, body), level)
+        elif req.pdu_tag in (PDU_GETNEXT, PDU_GETBULK):
             oid, value = self._next_after(req.varbinds[0]["oid"])
-            return [self._v3_message(
+            reply = self._v3_message(
                 msg_id, self._pdu(PDU_RESPONSE, req.request_id,
-                                  enc_varbind(oid, value)))]
-        return []
+                                  enc_varbind(oid, value)), level)
+        if reply is None:
+            return []
+        return [self._tampered(reply) if self.tamper_reply else reply]
+
+    def _v3_encrypted(self, msg_id: int, flags: int, data: bytes) -> list:
+        """An inbound message with the privacy flag set. The digest is
+        verified BEFORE anything is decrypted — RFC 3414 s3.2, and the
+        same reason the poller does it in that order — and a message that
+        decrypts to something other than a ScopedPDU draws
+        usmStatsDecryptionErrors with request-id 0, since the id is inside
+        the part that could not be read. A real agent does exactly this,
+        which is what makes a wrong privacy password distinguishable from
+        a wrong authentication one at the poller."""
+        if not self.priv_pass:
+            # This user is not provisioned for privacy: refused before any
+            # attempt to read the PDU, as an agent must (RFC 3414 s3.2 5).
+            self.counts["requests"] += 1
+            return [self._report(msg_id, 0, USM_UNSUPPORTED_SEC_LEVELS)]
+        if self.auth_pass and (not flags & FLAG_AUTH or not self._digest_ok(data)):
+            self.counts["requests"] += 1
+            self.counts["wrong_digests"] += 1
+            return [self._report(msg_id, 0, USM_WRONG_DIGESTS)]
+        salt = self._priv_params(data).hex()
+        if salt in self.salts_seen:
+            self.counts["salt_reuse"] += 1
+        self.salts_seen.append(salt)
+        try:
+            req = decode_response(data, priv_proto=self.priv_proto,
+                                  priv_key=self._priv_key())
+        except SnmpPrivError:
+            self.counts["requests"] += 1
+            self.counts["decrypt_errors"] += 1
+            return [self._report(msg_id, 0, USM_DECRYPTION_ERRORS)]
+        self.counts["decrypted"] += 1
+        return self._v3_handle(req, msg_id, flags, data, verified=True)
 
     def write_stats(self) -> None:
         """Rewritten atomically: the test reads this file while the stub is
@@ -326,7 +459,9 @@ class Agent:
             return
         temporary = self.stats_path + ".tmp"
         with open(temporary, "w") as handle:
-            json.dump(dict(self.counts, engine_boots=self.engine_boots), handle)
+            json.dump(dict(self.counts, engine_boots=self.engine_boots,
+                           salts_seen=self.salts_seen, salts_sent=self.salts_sent),
+                      handle)
         # On Windows the replace fails with EACCES while the test has the
         # destination open for its own read. Retry briefly; and never let a
         # stats hiccup escape, because this is called from serve() and a
@@ -591,10 +726,12 @@ class Agent:
     def handle(self, data: bytes) -> list:
         """Every datagram this agent wants to send back, in order. A list
         because a misbehaving agent sends more than one."""
-        req = decode_response(data)
         if self.mode == "v3":
             msg_id, flags = self._msg_header(data)
-            return self._v3_handle(req, msg_id, flags, data)
+            if flags & FLAG_PRIV:
+                return self._v3_encrypted(msg_id, flags, data)
+            return self._v3_handle(decode_response(data), msg_id, flags, data)
+        req = decode_response(data)
         if req.pdu_tag == PDU_GET:
             self.gets += 1
             self.counts["get"] += 1
@@ -698,6 +835,10 @@ def main(argv):
     require_priv = False
     auth_pass = ""
     auth_proto = "SHA"
+    priv_pass = ""
+    priv_proto = "AES"
+    tamper_reply = False
+    unsigned_replies = False
     rest = list(argv[1:])
     while rest:
         item = rest.pop(0)
@@ -707,6 +848,14 @@ def main(argv):
             auth_pass = rest.pop(0)
         elif item == "--auth-proto":
             auth_proto = rest.pop(0)
+        elif item == "--priv-pass":
+            priv_pass = rest.pop(0)
+        elif item == "--priv-proto":
+            priv_proto = rest.pop(0)
+        elif item == "--tamper-reply":
+            tamper_reply = True
+        elif item == "--unsigned-replies":
+            unsigned_replies = True
         elif item == "--reply-delay":
             reply_delay = float(rest.pop(0))
         elif item == "--bulk-cap":
@@ -740,7 +889,8 @@ def main(argv):
     Agent(port, mode, interfaces, reboot_after, window, bump_boots_at,
           stats_path, dark_after, host, reply_delay, bulk_cap, tuple(gen_err),
           tuple(no_such_name), refuse_bulk, stale_id, dark_after_rows,
-          require_priv, auth_pass, auth_proto).serve()
+          require_priv, auth_pass, auth_proto, priv_pass, priv_proto,
+          tamper_reply, unsigned_replies).serve()
 
 
 if __name__ == "__main__":

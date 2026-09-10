@@ -84,6 +84,11 @@ DEFAULTS = {
     # controller itself unreachable) is aged out rather than kept forever
     # showing a stale "online" status from its last successful poll.
     "stale_after_polls": 5,
+    # Same switch as Nodes' v3_verify_replies, for the same reason and
+    # with the same default: the wireless poller verifies a controller's
+    # signed reply since 5.8.0, and a controller behind something that
+    # strips or breaks the signature needs a way to keep polling.
+    "v3_verify_replies": True,
     # Comma-joined column keys the AP table shows; "" means the frontend's
     # defaults. Lives here (not in the browser's localStorage) so it sits
     # beside the rest of the dialog's settings and survives Reset layout,
