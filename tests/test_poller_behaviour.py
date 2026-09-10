@@ -224,10 +224,19 @@ def _force_dt(db: NodesDatabase, device_id: int, if_index: int, dt: float) -> No
     milliseconds later, so the realized dt is `dt` plus that small,
     negligible overhead rather than whatever a real sleep would jitter
     by."""
-    db._conn.execute(
-        "UPDATE interfaces SET last_sample_ts=? WHERE device_id=? AND if_index=?",
-        (time.time() - dt, device_id, if_index))
-    db._conn.commit()
+    # Under the store's own lock, because this reaches past the store into
+    # its connection while a poller thread may be writing through it. Without
+    # the lock the two interleave, the worker's commit lands between this
+    # UPDATE and this commit, and sqlite raises "cannot commit - no
+    # transaction is active" -- a failure with nothing to do with the speed
+    # arithmetic under test, roughly one run in ten, in whichever suite
+    # happened to call this.
+    with db._lock:
+        db._conn.execute(
+            "UPDATE interfaces SET last_sample_ts=? WHERE device_id=? AND if_index=?",
+            (time.time() - dt, device_id, if_index))
+        if db._conn.in_transaction:
+            db._conn.commit()
 
 
 def test_independent_octet_widths():
