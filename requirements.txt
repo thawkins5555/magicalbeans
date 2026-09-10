@@ -7,7 +7,11 @@ paramiko>=3.4,<5
 # SNMPv3 privacy (authPriv, AES-128-CFB) for the Nodes poller — see
 # netpath/snmpcrypt.py and CREDENTIAL-SECURITY.md s4. Already pulled in by
 # paramiko on every host where ConfigRX works, but paramiko's backend is not
-# ours to depend on, so it is named here in its own right. No lower bound:
-# the AES-CFB primitive predates every version still installable, and the
-# module tolerates CFB's move to hazmat.decrepit (41+ warns, later removes).
-cryptography
+# ours to depend on, so it is named here in its own right.
+# Floored at 3.3: snmpcrypt builds Cipher(aes(key), cfb(iv)) with no
+# backend argument, which is legal only from 3.1, and paramiko>=3.4 above
+# already needs >=3.3, so the floor costs nothing and says what the code
+# assumes. No cap: the module tolerates CFB's move to hazmat.decrepit
+# (41+ warns, later removes) and snmpcrypt's self-test refuses a backend
+# that cannot round-trip a known answer rather than trusting the version.
+cryptography>=3.3

@@ -598,9 +598,16 @@ exchange and a `wrongDigests` refusal are unauthenticated by design.
 stray datagrams, so a wrong key is never reported as a timeout;
 `v3_exchange` turns `SnmpAuthError`/`SnmpPrivError` into `_AuthFailure`
 (the credential is wrong; the engine cache is dropped) and lets
-`SnmpDowngrade` through as the plain `SnmpError` it is (the credential
-was never contradicted). `nodes_settings["v3_verify_replies"]` (and the
-same key in Wireless) is the off switch: `verify=False` skips the digest
+`SnmpDowngrade` through untouched — the credential was never
+contradicted — for `_poll_device` to catch by type, ahead of the generic
+`SnmpError` arm: that arm is the outage path, and a device answering
+below the level asked is answering. It counts as answered for the
+device's status, records `snmp_downgrade` on entering the state and
+`snmp_verified` on the first verified reply after it (the
+`_downgraded` set), and the built-in `device_downgrade` rule pairs the
+two the way `access_denied`/`access_ok` pair.
+`nodes_settings["v3_verify_replies"]` (and the same key in Wireless) is
+the off switch: `verify=False` skips the digest
 check and the downgrade refusal — the pre-5.8.0 behaviour — while still
 decrypting. The poller reads it once per poll and carries it, because
 `settings()` is a query and a walk is hundreds of exchanges.
@@ -1263,7 +1270,17 @@ primary; `NodesDatabase.credential_candidates(device_row)` resolves the
 ordered list to try for a given device: a device's own credential override,
 if it has one set, is always exactly one candidate (a human already told
 this app the real credentials for this specific device, so nothing else is
-worth trying); otherwise it's the profile's primary credential followed by
+worth trying) — and that candidate is the device's non-NULL columns laid
+over the profile's primary, not the device's columns alone. An override
+is partial far more often than not (every credential field on the edit
+form has a "(profile)" choice), and the bare columns carried
+`snmp_version: None` into the poll, where `int(None)` is a `TypeError`
+that escaped the poll's `except SnmpError`, so `record_poll` never ran
+and the device's status froze for good. The merge is also what makes the
+poll read the same credential `effective_config()` shows: before it, a
+device inheriting an authPriv profile with one field overridden was
+displayed and Test-buttoned at `authPriv` and polled at `authNoPriv`.
+Otherwise it's the profile's primary credential followed by
 every `group_credentials` row for that profile, in `id` order (insertion
 order — no separate priority column). `NodePoller._credentials` is an
 in-memory `device_id -> winning candidate index` cache, the same
@@ -6812,12 +6829,18 @@ any of it. Table walking is repeated GETNEXT (`_walk_column`), not
 GETBULK: the same choice `nodepoll.py`'s own table walker already made
 ("avoiding a separate GETBULK code path"), matched here rather than
 introducing a second table-walking idiom for one small poller. v1/v2c
-community or v3 noAuthNoPriv/authNoPriv only: Nodes gained authPriv in
-5.8.0 and this poller did not — `post_wireless_controller_credential`
-passes `allow_priv=False`, so a privacy password in the body is refused
-with a message rather than stored and never sent. A signed controller
-reply's digest is verified since 5.8.0 (`session.request(...,
-auth_key=...)`), honouring `wireless_settings["v3_verify_replies"]`.
+community or v3 noAuthNoPriv/authNoPriv only, at any of the six auth
+protocols Nodes offers (the signing goes through the same `localized_key`;
+`wireless.js` keeps its own copy of the list because modules load lazily,
+and `test_frontend_contracts.py` pins the two copies equal): Nodes gained
+authPriv in 5.8.0 and this poller did not — `post_wireless_controller_credential`
+passes `allow_priv=False`, and `_refuse_controller_privacy` guards the
+controller add and edit routes too, so a privacy field on any of the
+three writes is refused with a message rather than allow-list-dropped
+behind `{"ok": true}`. A signed controller reply's digest is verified
+since 5.8.0 (`session.request(..., auth_key=...)`), honouring
+`wireless_settings["v3_verify_replies"]`, which the Wireless settings
+dialog exposes as the same switch Nodes settings has.
 
 **Storage** (`wirelessdb.WirelessDatabase`): `controllers` (one row per
 configured controller, carrying its own SNMP credential columns —

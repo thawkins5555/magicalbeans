@@ -357,6 +357,11 @@ CLEARS = {
     ("device_event", "up"): "device_down",
     ("device_event", "auth_ok"): "device_auth_fail",
     ("device_event", "access_ok"): "device_access_denied",
+    # snmp_verified is recorded on the first poll whose reply verified
+    # after replies were being refused as a downgrade (the operator fixed
+    # the agent, or turned v3_verify_replies off) — nodepoll's
+    # _downgraded transition, the same shape as the two above.
+    ("device_event", "snmp_verified"): "device_downgrade",
     # mib_present is recorded when a device's vendor-MIB coverage flips
     # from missing to present (a MIB got uploaded), pairing with
     # mib_missing exactly the way up pairs with down.

@@ -219,13 +219,16 @@ def _encrypt_secret(secret: str, unavailable: str) -> bytes:
         secret = None
 
 
-# The names snmpcrypt accepts for a protocol that are not the name it is
-# stored and shown under. "AES128" is net-snmp's spelling of the same
-# cipher, and snmpcrypt takes it so a name copied from an agent's own
-# configuration works — but a row that STORED it was a one-click loss: the
-# form's select has no "AES128" option, so it showed "(none)", and the next
-# Save posted a blank protocol and dropped the privacy blob with it.
-_PRIV_PROTO_ALIASES = {"AES128": "AES"}
+# The other spellings of the one cipher, mapped to the name it is stored
+# and shown under. "AES128" is net-snmp's and snmpcrypt takes it so a name
+# copied from an agent's own configuration works; "AES-128" is how PAN-OS
+# and most vendor UIs print it. Mapped BEFORE the membership check below,
+# not after, because a spelling that passed validation and was stored
+# verbatim was a one-click loss: the form's select has only "AES", so an
+# "AES128" row showed "(none)", and the next Save posted a blank protocol
+# and dropped the privacy blob with it. tests/test_frontend_contracts.py
+# pins the stored names to the select's options for the same reason.
+_PRIV_PROTO_ALIASES = {"AES128": "AES", "AES-128": "AES"}
 
 
 def _clean_priv_proto(fields: dict) -> None:
@@ -240,27 +243,48 @@ def _clean_priv_proto(fields: dict) -> None:
     if "v3_priv_proto" not in fields:
         return
     proto = str(fields["v3_priv_proto"] or "").strip().upper()
+    proto = _PRIV_PROTO_ALIASES.get(proto, proto)
     if proto and proto not in snmpcrypt.PRIV_PROTOCOLS:
         raise ValueError(
             f"The privacy protocol must be AES (AES-128-CFB); {proto!r} is "
             f"not supported — DES is not offered, and AES-192/256 need a key "
             f"extension no RFC defines")
-    fields["v3_priv_proto"] = _PRIV_PROTO_ALIASES.get(proto, proto) or None
+    fields["v3_priv_proto"] = proto or None
 
 
-def _refuse_orphaned_v3_secret(fields: dict, row) -> None:
-    """Refuses a profile or additional-credential write that blanks
-    `v3_auth_proto` while the row still holds an SNMPv3 password.
-    security_level needs the protocol AND the password to sign, so the row
-    would derive noAuthNoPriv and every poll would be refused before it
-    was sent — with the JSON still saying has_credential: true, a
-    credential that exists and can never work. Profile rows only: on a
-    device NULL means "inherit the profile's", which is a working state.
-    The form offers no blank protocol, so this is reachable by API alone,
-    and refusing it is cheaper than a stored secret nobody can use."""
+def _blank_device_override_is_inherit(fields: dict) -> None:
+    """On a device row a blank `v3_user` or `v3_auth_proto` is stored as
+    NULL — "the profile's" — never as the empty string. The edit form
+    already posts null for a field left at "(profile)", so this only
+    changes what an API caller sending "" gets: effective_config resolves
+    a NULL column to the profile's and keeps "" as a value, so "" with the
+    device's own stored password was a row that said has_credential: true
+    and derived noAuthNoPriv, refused before every poll. The community is
+    not here: nodesdb.clean_community owns it, and a blank one is hidden-
+    not-cleared for an account that cannot read secrets (deviceOverrides
+    in nodes.js says why)."""
+    for key in ("v3_user", "v3_auth_proto"):
+        if key in fields and isinstance(fields[key], str) and not fields[key].strip():
+            fields[key] = None
+
+
+def _refuse_orphaned_v3_secret(fields: dict, row, inherited=None) -> None:
+    """Refuses a write that blanks `v3_auth_proto` while the row still
+    holds an SNMPv3 password. security_level needs the protocol AND the
+    password to sign, so the row would derive noAuthNoPriv and every poll
+    would be refused before it was sent — with the JSON still saying
+    has_credential: true, a credential that exists and can never work.
+    `inherited` is what a blank resolves to on a device row — the
+    profile's protocol — where NULL means "the profile's", a working
+    state as long as the profile has one; a profile or additional
+    credential has nothing to inherit from and passes None. The form
+    offers no blank protocol, so this is reachable by API alone, and
+    refusing it is cheaper than a stored secret nobody can use."""
     if "v3_auth_proto" not in fields:
         return
     if str(fields["v3_auth_proto"] or "").strip():
+        return
+    if str(inherited or "").strip():
         return
     if row["v3_auth_pass_enc"] or row["v3_priv_pass_enc"]:
         raise ValueError(
@@ -4026,6 +4050,7 @@ def post_nodes_device(service, params, body) -> dict:
     # reason: a refused value must not leave a half-configured device behind.
     _clean_web_fields(overrides)
     _clean_priv_proto(overrides)
+    _blank_device_override_is_inherit(overrides)
     try:
         device_id = service.nodes_db.add_device(
             ip, name=body.get("name") or None,
@@ -4304,6 +4329,14 @@ def put_nodes_device(service, params, body, device_id) -> dict:
     fields = _pick(body, _DEVICE_EDITABLE_BODY)
     _clean_web_fields(fields)
     _clean_priv_proto(fields)
+    _blank_device_override_is_inherit(fields)
+    if "v3_auth_proto" in fields and not fields["v3_auth_proto"]:
+        # Against the profile the device is in AFTER this write — the same
+        # PUT can move it — since a NULL protocol is that profile's.
+        target = fields.get("group_id", before["group_id"])
+        group = service.nodes_db.group(target) if target else None
+        _refuse_orphaned_v3_secret(
+            fields, before, inherited=group["v3_auth_proto"] if group else None)
     if "upstream_id" in fields:
         fields["upstream_id"] = _clean_upstream_id(
             service, device_id, fields["upstream_id"])

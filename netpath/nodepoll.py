@@ -35,7 +35,7 @@ from .nodesdb import NodesDatabase, detected_vendor
 from . import snmpcrypt
 from .snmppoll import (
     ERROR_STATUS, PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_REPORT, Response,
-    SnmpAccessDenied, SnmpAuthError, SnmpDowngrade, SnmpPrivError, SnmpError, SnmpTimeout, SnmpUnsupported, build_request,
+    SnmpAccessDenied, SnmpAuthError, SnmpDowngrade, SnmpPrivError, SnmpError, SnmpStray, SnmpTimeout, SnmpUnsupported, build_request,
     build_v3_request, decode_response, discovery_probe,
 )
 from .alertmail import duration_text
@@ -310,15 +310,22 @@ class _Session:
         decode_response so a signed reply's digest is verified and an
         encrypted one decrypted; a reply that fails either is raised, not
         dropped — see the except arm below. `verify=False` is the
-        v3_verify_replies setting turned off: decrypt, but check nothing.
+        v3_verify_replies setting turned off: a reply below the level
+        asked is accepted (a digest that IS present is still checked).
 
         A UDP socket accepts whatever arrives, so taking the first datagram
         would let a late answer to attempt 1 be read as the answer to
         attempt 2, and let any other address answer at all. A datagram from
         the wrong peer, or carrying a different request id, is dropped and
-        the wait continues. A Report-PDU is exempt from the id test: an
-        agent reports an engine mismatch against its own msgID, and dropping
-        it would turn one v3 resync into a timeout.
+        the wait continues. The id test lives in decode_response
+        (expect_request_id) rather than after it, because where it falls
+        relative to the digest check matters: on an unencrypted reply the
+        id is in the clear and is checked first, so a spoofed datagram
+        with a made-up id is a dropped stray and not an auth alert; on an
+        encrypted reply the id is inside the ciphertext and only the digest
+        can come first. A Report-PDU is exempt from the id test: an agent
+        reports an engine mismatch against its own msgID, and dropping it
+        would turn one v3 resync into a timeout.
 
         Retries on timeout up to self.retries times; raises SnmpTimeout if
         every attempt times out.
@@ -351,14 +358,19 @@ class _Session:
                 try:
                     response = decode_response(
                         data, auth_proto=auth_proto, auth_key=auth_key,
-                        priv_proto=priv_proto, priv_key=priv_key, verify=verify)
+                        priv_proto=priv_proto, priv_key=priv_key, verify=verify,
+                        expect_request_id=expect_request_id)
+                except SnmpStray:
+                    # Somebody else's answer, or a late one: not ours.
+                    self.dropped += 1
+                    continue
                 except (SnmpUnsupported, SnmpAuthError, SnmpDowngrade, SnmpPrivError):
-                    # Not garbage: a datagram from the right peer whose
-                    # signature does not verify, or that cannot be
-                    # decrypted, or that arrived below the level asked for.
-                    # Waiting on past it would report a wrong key as a
-                    # timeout, which is the misdiagnosis this exists to
-                    # prevent.
+                    # Not garbage: a datagram from the right peer, answering
+                    # THIS request, whose signature does not verify, or
+                    # that cannot be decrypted, or that arrived below the
+                    # level asked for. Waiting on past it would report a
+                    # wrong key as a timeout, which is the misdiagnosis
+                    # this exists to prevent.
                     raise
                 except SnmpError as exc:
                     # Garbage from the right address is not an answer: keep
@@ -366,11 +378,6 @@ class _Session:
                     # than failing the whole request on it.
                     self.dropped += 1
                     last_error = exc
-                    continue
-                if (expect_request_id is not None
-                        and response.pdu_tag != PDU_REPORT
-                        and response.request_id != expect_request_id):
-                    self.dropped += 1
                     continue
                 return response
         raise last_error or SnmpTimeout(f"no reply from {self.ip}:{self.port}")
@@ -419,13 +426,19 @@ def credential_for(config: dict) -> Credential:
     effective_config() merge of a device's own overrides over its group's
     defaults.
 
-    The two secrets are treated identically at rest and in flight, with
-    one deliberate asymmetry on failure. An authentication blob that will
-    not decrypt yields no password, as it always has. A PRIVACY blob that
-    will not decrypt raises: the alternative — carrying on at authNoPriv —
-    reintroduces from the inside the exact fault 5.7.2 was written to
-    explain, a request at the wrong level answered with
-    authorizationError(16) against a password that was never wrong.
+    The two secrets are treated identically at rest, in flight and on
+    failure: a stored blob that will not decrypt on this machine RAISES,
+    it does not quietly become "no password". Until 5.8.0 an undecryptable
+    authentication blob polled the device unsigned, which is the silent
+    downgrade this whole release refuses at the other end of the wire —
+    and after a database move it did so to every authNoPriv device at
+    once, with the advice telling the operator to set a password that IS
+    stored. A privacy blob that will not decrypt polling at authNoPriv is
+    the same fault one level down: a request at the wrong level answered
+    with authorizationError(16) against a password that was never wrong,
+    the exact thing 5.7.2 was written to explain. Both only for a v3
+    credential — a profile switched back to v2c can carry a stale blob it
+    never reads, and that must not stop the community working.
 
     The identity is stripped, and a v1/v2c community carrying a comma is
     refused rather than transmitted. Both because an agent that dislikes
@@ -435,7 +448,8 @@ def credential_for(config: dict) -> Credential:
     a timeout indistinguishable from an unreachable device.
     nodesdb.clean_community refuses the same comma at save time; this is
     what a database written before it did still reads as."""
-    if int(config.get("snmp_version", 1)) == 3:
+    v3 = snmp_version_of(config) == 3
+    if v3:
         identity = config.get("v3_user")
     else:
         identity = config.get("community")
@@ -449,15 +463,20 @@ def credential_for(config: dict) -> Credential:
     auth_proto = config.get("v3_auth_proto")
     blob = config.get("v3_auth_pass_enc")
     password = None
-    if blob:
+    if blob and v3:
         try:
             password = _decrypt_secret(blob)
-        except Exception:
-            password = None
+        except Exception as exc:
+            raise SnmpError(
+                f"the stored SNMPv3 authentication password for {identity!r} "
+                f"could not be decrypted on this machine ({type(exc).__name__}) "
+                f"— refusing to poll unsigned instead; re-enter the credential "
+                f"here, or see CREDENTIAL-SECURITY.md on moving a database "
+                f"between machines") from exc
     priv_proto = config.get("v3_priv_proto")
     priv_blob = config.get("v3_priv_pass_enc")
     priv_password = None
-    if priv_proto and priv_blob:
+    if priv_proto and priv_blob and v3:
         try:
             priv_password = _decrypt_secret(priv_blob)
         except Exception as exc:
@@ -469,6 +488,19 @@ def credential_for(config: dict) -> Credential:
                 f"credential here, or see CREDENTIAL-SECURITY.md on moving a "
                 f"database between machines") from exc
     return Credential(identity, auth_proto, password, priv_proto, priv_password)
+
+
+def snmp_version_of(config: dict) -> int:
+    """The SNMP version a merged config polls at: 0 for v1, 1 for v2c, 3
+    for v3, v2c when the column is absent. A None is the v2c default too,
+    NOT `int(None)`: a device override row lays `snmp_version: None` over
+    its profile when the field is left at "(profile)", nodesdb merges that
+    away, and a merge that ever misses it again would make the poll die
+    of a TypeError — which no `except SnmpError` catches, so record_poll
+    never runs and the device's status freezes at whatever it last was.
+    `or 1` would be wrong here: 0 is v1."""
+    value = config.get("snmp_version")
+    return 1 if value is None else int(value)
 
 
 def discover_engine(session: _Session, ip: str) -> tuple[bytes, int, int]:
@@ -519,10 +551,11 @@ def v3_exchange(session: _Session, pdu_tag: int, oids: list[str], *,
     that cannot be decrypted, is an _AuthFailure: the credential is what
     is wrong, and the engine cache is what the poller drops on one. A
     reply that carries NO signature to a signed request is SnmpDowngrade,
-    left as the plain SnmpError it is: the credential is not wrong, the
-    device (or something between here and it) is answering below the
-    level asked, and `verify_replies=False` — the v3_verify_replies
-    setting — is the operator's way to accept that."""
+    passed through untouched: the credential is not wrong, the device (or
+    something between here and it) is answering below the level asked —
+    the poll files that as its own finding, neither an auth failure nor
+    an outage — and `verify_replies=False` (the v3_verify_replies
+    setting) is the operator's way to accept such replies."""
     encrypting = bool(priv_proto and priv_password)
     if encrypting and not (auth_proto and password):
         raise SnmpError(
@@ -567,7 +600,24 @@ def v3_exchange(session: _Session, pdu_tag: int, oids: list[str], *,
             return response
         last = response
         name, explanation = report_reason(response)
-        if name == "unsupportedSecLevels":
+        # A Report is unauthenticated and exempt from the request-id
+        # filter, so one forged datagram could teach this poller an
+        # engine id, boots and time of the forger's choosing — after which
+        # the signed retry fails against the real agent — or, naming
+        # unsupportedSecLevels, file the device as 'unsupported' for a
+        # week. The one thing the forger cannot know is what we sent:
+        # a Report about OUR request comes back with the engine id we put
+        # in it (RFC 3414 s3.2 answers under the agent's own id, which is
+        # that one whenever the request was addressed to it at all). The
+        # single legitimate exception is unknownEngineIDs, the Report
+        # whose whole purpose is to tell us an id we did not have. Any
+        # other Report under a foreign id is not learned and not acted on;
+        # the retry rediscovers instead. Not a proof — discovery itself is
+        # unauthenticated, by RFC — but one datagram no longer poisons a
+        # cache that a signed exchange had already confirmed.
+        trusted = (name == "unknownEngineIDs"
+                   or (bool(response.engine_id) and response.engine_id == engine_id))
+        if name == "unsupportedSecLevels" and trusted:
             raise SnmpUnsupported(f"{ip}: {explanation}")
         if attempt == 0:
             # The Report carries the agent's own authoritative engine id,
@@ -575,7 +625,7 @@ def v3_exchange(session: _Session, pdu_tag: int, oids: list[str], *,
             # them rather than throwing the answer away and rediscovering
             # on the next poll.
             engine = None
-            if response.engine_id:
+            if response.engine_id and trusted:
                 engine = (response.engine_id, response.engine_boots,
                           response.engine_time)
                 if learned is not None:
@@ -770,7 +820,7 @@ def _credential_label(config: dict, level: str | None = None) -> str:
     the Test button signs with a password that was typed and never stored,
     so the config alone can be wrong about it — and is derived from the
     config otherwise."""
-    version = int(config.get("snmp_version", 1))
+    version = snmp_version_of(config)
     if version == 3:
         user = config.get("v3_user")
         level = level or security_level(config)
@@ -807,7 +857,7 @@ def security_level(config: dict) -> str:
     contradict the four fields it summarises; the implicit rule is what
     makes the 5.8.0 upgrade a provable no-op — two NULL columns cannot
     change the answer for any existing row."""
-    if int(config.get("snmp_version", 1)) != 3:
+    if snmp_version_of(config) != 3:
         return ""
     if config.get("v3_auth_proto") and config.get("v3_auth_pass_enc"):
         if config.get("v3_priv_proto") and config.get("v3_priv_pass_enc"):
@@ -1525,6 +1575,11 @@ class NodePoller(Worker):
         # In memory for the same reason _auth_failing is — see the events
         # block in _poll_device.
         self._access_denied: set[int] = set()
+        # And once more for a device whose replies are refused as a
+        # downgrade (SnmpDowngrade: answering, but below the level asked):
+        # entering records snmp_downgrade, leaving on a poll whose reply
+        # verified records snmp_verified.
+        self._downgraded: set[int] = set()
         # Devices whose per-method lane events have been confirmed to exist
         # (or seeded) since this process started — see the events block in
         # _poll_device and nodesdb.has_method_events. One query per device
@@ -1546,6 +1601,12 @@ class NodePoller(Worker):
                          # apart from auth_fail because it is the opposite
                          # finding about the password.
                          "unsupported": 0, "denied": 0,
+                         # downgraded: the device answered, below the level
+                         # it was asked at, and the reply was refused unread
+                         # — its own count because it is neither an auth
+                         # failure (nothing contradicted the password) nor
+                         # an error (nothing failed on this end).
+                         "downgraded": 0,
                          "errors": 0, "overruns": 0, "snmp_backoff": 0,
                          "mac_walks": 0, "identifications": 0,
                          # lldp_walks counts completed LLDP/CDP walks;
@@ -2694,6 +2755,16 @@ class NodePoller(Worker):
         # in the message was already raising auth_fail for faults that
         # proved the password GOOD.
         snmp_auth_failed = False
+        # Whether the device answered every request, but below the level
+        # it was asked at, and the reply was refused as a downgrade
+        # (SnmpDowngrade). Type-decided like the three above. Not an
+        # outage — the device is demonstrably answering — and not an auth
+        # failure — nothing contradicted the password, there was no
+        # signature to contradict it — which is why it is neither in the
+        # down path nor in snmp_failing_now below. Before this flag it fell
+        # into the generic arm, and with ping off a device that answered
+        # every single request was marked down and mailed as one.
+        snmp_downgraded = False
         identity = None
         uptime_ticks = None
         interfaces: list[dict] = []
@@ -2772,6 +2843,13 @@ class NodePoller(Worker):
                 snmp_error = str(exc)
                 snmp_auth_failed = True
                 self._bump("auth_fail")
+            except SnmpDowngrade as exc:
+                # Before SnmpError, which it is a subclass of — the generic
+                # arm is the outage path.
+                snmp_ok = False
+                snmp_error = str(exc)
+                snmp_downgraded = True
+                self._bump("downgraded")
             except SnmpError as exc:
                 snmp_ok = False
                 snmp_error = str(exc)
@@ -2780,6 +2858,16 @@ class NodePoller(Worker):
         # -------------------------------------------------------- status
 
         down_after = int(settings.get("down_after_failures", 3))
+        # SNMP's evidence that the device is up is wider than snmp_ok. An
+        # authorizationError is the agent's own verified Response — it
+        # accepted the message and refused the object — and a downgrade is
+        # a reply to every request that merely lacked the signature asked
+        # for. Neither is silence, and "down" means silence: a device that
+        # answers is not having an outage, whatever else is wrong with it.
+        # An auth failure is deliberately NOT here: a Report is the agent
+        # declining to say anything about the request, and the existing
+        # choice that it follows ping alone stands.
+        snmp_answered = bool(snmp_ok) or snmp_denied or snmp_downgraded
         if not config.get("snmp_enabled"):
             # A ping-only device by design (SNMP off entirely) is reachable
             # by ping alone, regardless of the "degrade gracefully when
@@ -2789,7 +2877,7 @@ class NodePoller(Worker):
             reachable = bool(ping_ok)
         elif not config.get("ping_enabled"):
             # Nothing is pinging it, so SNMP is the only evidence there is.
-            reachable = bool(snmp_ok)
+            reachable = snmp_answered
         else:
             # Both probes run, so DOWN means both failed. A device answering
             # ICMP with a broken community string is reachable and
@@ -2797,7 +2885,7 @@ class NodePoller(Worker):
             # an outage that isn't happening. Per device and per profile,
             # because occasionally SNMP failing really is the outage.
             ping_only_ok = bool(config.get("unreachable_ping_only", True))
-            reachable = bool(snmp_ok) or (ping_only_ok and bool(ping_ok))
+            reachable = snmp_answered or (ping_only_ok and bool(ping_ok))
 
         # snmp_denied deliberately has NO status of its own, and does not
         # reuse "unsupported" either. "unsupported" is a verdict about the
@@ -2807,9 +2895,11 @@ class NodePoller(Worker):
         # fifth value there is a vocabulary change in six files for a
         # diagnostics fix. A refused object is a verdict about the
         # device's configuration, and the device itself is demonstrably
-        # reachable (its agent verified the message and answered), so the
-        # status follows reachability exactly as it does for an auth
-        # failure, and the access_denied event below carries the finding.
+        # reachable (its agent verified the message and answered), so it
+        # counts as answered above and the status is "up" — an outage is
+        # the one thing it is not — and the access_denied event below
+        # carries the finding. A downgrade is filed the same way, for the
+        # same reason, with snmp_downgrade as its event.
         if snmp_unsupported:
             status = "unsupported"
         elif reachable:
@@ -2927,6 +3017,26 @@ class NodePoller(Worker):
         if access_event is not None:
             self.db.record_device_event(device_id, access_event[0], access_event[1])
 
+        # snmp_downgrade: the same shape again, for a device answering below
+        # the level asked. A transition, because the device that does this
+        # does it on every poll until the operator either fixes the agent or
+        # turns v3_verify_replies off — and then the next poll's verified
+        # reply records snmp_verified, the pair alertrules.CLEARS uses to
+        # close device_downgrade. Only a poll that succeeded leaves the set:
+        # every other outcome — a timeout, a Report — says nothing about
+        # whether replies verify now.
+        with self._lock:
+            if snmp_downgraded and device_id not in self._downgraded:
+                self._downgraded.add(device_id)
+                downgrade_event = ("snmp_downgrade", snmp_error)
+            elif snmp_ok and device_id in self._downgraded:
+                self._downgraded.discard(device_id)
+                downgrade_event = ("snmp_verified", "")
+            else:
+                downgrade_event = None
+        if downgrade_event is not None:
+            self.db.record_device_event(device_id, downgrade_event[0], downgrade_event[1])
+
         # Per-method transitions (snmp_up/snmp_down, ping_up/ping_down): the
         # status timeline's split SNMP/ping lanes are built from these, not
         # from the up/down events above, which follow `status` — effectively
@@ -2987,11 +3097,23 @@ class NodePoller(Worker):
         # failing" was raised for the one fault that proved the password
         # correct.
         auth_failing = bool(snmp_auth_failed and snmp_ok is False)
+        # What ends it is any outcome proving the credential was ACCEPTED,
+        # not only a successful poll. An authorizationError is one: the
+        # agent verified the message and refused the object, so the
+        # password is right by the device's own word. Leaving the set only
+        # on snmp_ok kept "SNMP authentication failing" open beside an
+        # access_denied whose text said the message authenticated — two
+        # alerts contradicting each other about one password, one of them
+        # stale. unsupportedSecLevels is NOT here: USM refuses the level
+        # (RFC 3414 s3.2 step 5) before it checks the digest (step 6), so
+        # that Report proves nothing about the password either way, and a
+        # downgrade is unsigned, so it proves nothing at all.
+        credential_accepted = bool(snmp_ok) or snmp_denied
         with self._lock:
             if auth_failing and device_id not in self._auth_failing:
                 self._auth_failing.add(device_id)
                 auth_event = ("auth_fail", snmp_error)
-            elif snmp_ok and device_id in self._auth_failing:
+            elif credential_accepted and device_id in self._auth_failing:
                 self._auth_failing.discard(device_id)
                 auth_event = ("auth_ok", "")
             else:
@@ -3017,9 +3139,12 @@ class NodePoller(Worker):
         # later.
         # A refused object is excluded the way unsupported is: "SNMP is not
         # answering" is untrue of an agent that verified the message and
-        # answered it, and the access_denied event above is its report.
+        # answered it, and the access_denied event above is its report. So
+        # is a downgrade, for the same reason — the agent answered every
+        # request — and the snmp_downgrade event above is its report.
         snmp_failing_now = (not auth_failing and snmp_ok is False and ping_ok
-                            and not snmp_unsupported and not snmp_denied)
+                            and not snmp_unsupported and not snmp_denied
+                            and not snmp_downgraded)
         with self._lock:
             if snmp_failing_now:
                 fail_count = self._snmp_failing_count.get(device_id, 0) + 1
@@ -3275,7 +3400,9 @@ class NodePoller(Worker):
             try:
                 self._snmp_get(device, trial,
                                [nodeoids.SYSTEM_SCALARS["sys_object_id"]])
-            except SnmpError:
+            except SnmpError as exc:
+                if _credential_contradicted(exc):
+                    break        # see _poll_snmp_scalars_with_credential
                 continue
             self._credentials[device["id"]] = index
             # The winning credential is returned with the device's own retry
@@ -3287,7 +3414,7 @@ class NodePoller(Worker):
     def _snmp_get(self, device, config: dict, oids: list[str]) -> Response:
         """One GET round trip against a device, handling v1/v2c/v3 (at
         whichever USM level the credential implies) transparently."""
-        version = int(config.get("snmp_version", 1))
+        version = snmp_version_of(config)
         timeout_s = float(config.get("snmp_timeout_s", 3.0))
         retries = int(config.get("snmp_retries", 2))
         session = _Session(device["ip"], DEFAULT_SNMP_PORT, timeout_s, retries)
@@ -3365,9 +3492,28 @@ class NodePoller(Worker):
         failure mode is credential-specific in a mixed profile — a v3
         authPriv alternate raises SnmpUnsupported on a host whose
         `cryptography` backend does not work, while a v2c alternate right
-        after it works — so every SnmpError subclass is caught
-        uniformly and only the last one re-raised, once every candidate has
-        failed. Returns (winning_config, identity, uptime_ticks, metrics)."""
+        after it works — so every SnmpError subclass is caught and the
+        sweep goes on, with two exceptions.
+
+        A failure that CONTRADICTS the credential does not rotate. A digest
+        that did not verify, a reply that would not decrypt, or an unsigned
+        answer to a signed request is this end refusing what came back,
+        not the device refusing the request — and it is exactly what one
+        forged datagram looks like. Rotating on it would let that datagram
+        walk the poller off a verified v3 credential and onto the cleartext
+        v1/v2c community further down the list, which is a downgrade an
+        attacker can ask for. Only a refusal the DEVICE named (a Report,
+        an authorizationError, a level it does not serve, silence) is
+        worth trying the next candidate on.
+
+        And once every candidate has failed, the MOST SPECIFIC error is
+        re-raised, not the last. A profile whose v3 primary is refused by
+        name and whose v2c alternate the device simply ignores used to
+        show whichever came last — the alternate's "no reply" — and hide
+        the one message that named the fault; a sweep that ends in a
+        timeout after a named refusal is still that refusal. Among equals
+        the later one still wins, as before.
+        Returns (winning_config, identity, uptime_ticks, metrics)."""
         device_id = device["id"]
         candidates = self.db.credential_candidates(device)
         cached_index = self._credentials.get(device_id)
@@ -3389,7 +3535,11 @@ class NodePoller(Worker):
             try:
                 identity, uptime_ticks, metrics = self._poll_snmp_scalars(device, trial_config)
             except SnmpError as exc:
-                last_error = exc
+                if _credential_contradicted(exc):
+                    raise
+                if last_error is None or \
+                        _error_specificity(exc) >= _error_specificity(last_error):
+                    last_error = exc
                 continue
             self._credentials[device_id] = index
             self._credential_probe_failed.pop(device_id, None)
@@ -5759,7 +5909,7 @@ class NodePoller(Worker):
         "this switch cannot tell us" from "it can, and this port has learned
         nothing" on a device whose global context answers neither.
         """
-        if int(config.get("snmp_version", 1)) == 3:
+        if snmp_version_of(config) == 3:
             return [], False
         community = config.get("community")
         if not community:
@@ -5937,7 +6087,7 @@ class NodePoller(Worker):
         contexts — the community@vlan path read_mac_table already needs,
         without the per-port filter. Bounded in VLAN count and wall clock
         for the same reason: a trunk switch can carry hundreds of VLANs."""
-        if int(config.get("snmp_version", 1)) == 3:
+        if snmp_version_of(config) == 3:
             return [], False
         community = config.get("community")
         if not community:
@@ -7178,7 +7328,7 @@ class NodePoller(Worker):
         return bases
 
     def _snmp_get_next(self, device, config: dict, oid: str) -> Response:
-        version = int(config.get("snmp_version", 1))
+        version = snmp_version_of(config)
         timeout_s = float(config.get("snmp_timeout_s", 3.0))
         retries = int(config.get("snmp_retries", 2))
         session = _Session(device["ip"], DEFAULT_SNMP_PORT, timeout_s, retries)
@@ -7210,7 +7360,7 @@ class NodePoller(Worker):
         every walk here is over a single column, so there is nothing to
         exempt from repetition. Ignored by `build_request`/`build_v3_request`
         for a non-GETBULK `pdu_tag`, so a v1 caller can pass it unused."""
-        version = int(config.get("snmp_version", 1))
+        version = snmp_version_of(config)
         if version in (0, 1):
             identity = credential_for(config).identity
             request_id = session.next_request_id()
@@ -7237,6 +7387,32 @@ class _AuthFailure(SnmpError):
         super().__init__(message)
         self.usm_name = usm_name
         self.report = report
+
+
+def _credential_contradicted(exc: Exception) -> bool:
+    """Whether a failure is THIS END refusing what the device sent back —
+    a digest that did not verify, a reply that would not decrypt, an
+    unsigned answer to a signed request — as opposed to the device
+    refusing the request by name. The credential loops stop on the first
+    kind and rotate on the second: see _poll_snmp_scalars_with_credential.
+    An _AuthFailure with no Report attached is the first kind — v3_exchange
+    raises it from SnmpAuthError/SnmpPrivError, and attaches the Report
+    for every refusal the agent itself named."""
+    if isinstance(exc, SnmpDowngrade):
+        return True
+    return isinstance(exc, _AuthFailure) and exc.report is None
+
+
+def _error_specificity(exc: Exception) -> int:
+    """How much a credential's failure says about the device: 0 for
+    silence, 2 for a refusal that names the fault (a Report, an
+    authorizationError, a level not served, a downgrade), 1 for the rest.
+    _poll_snmp_scalars_with_credential keeps the highest across a sweep."""
+    if isinstance(exc, SnmpTimeout):
+        return 0
+    if isinstance(exc, (_AuthFailure, SnmpAccessDenied, SnmpUnsupported, SnmpDowngrade)):
+        return 2
+    return 1
 
 
 if __name__ == "__main__":

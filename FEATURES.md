@@ -2756,7 +2756,8 @@ Controller, without polling each AP individually — the controller
 reports on all of them in one SNMP walk.
 
 - **Add a controller** with its IP and an SNMP credential (v1/v2c
-  community, or SNMPv3 noAuthNoPriv/authNoPriv — authPriv is a Nodes
+  community, or SNMPv3 noAuthNoPriv/authNoPriv at any of the auth
+  protocols Nodes offers, MD5 through SHA512 — authPriv is a Nodes
   feature since 5.8.0 and has not been brought to the wireless poller,
   which has no privacy field and refuses a privacy password in words
   rather than dropping it; a signed controller reply IS verified, the way

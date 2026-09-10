@@ -248,6 +248,20 @@
 
   /* -------------------------------------------------------- controllers */
 
+  /* The SNMPv3 auth protocols a controller can be signed with. The same
+     six as nodes.js's V3_AUTH_PROTOCOLS, and a second copy of that list
+     on purpose: modules are loaded the first time their tab is selected
+     (app.js's ensureModuleReady), so nothing in nodes.js is guaranteed to
+     exist when this dialog opens. The two are pinned equal by
+     tests/test_frontend_contracts.py, which is what makes a protocol
+     added to one and not the other a red test rather than a support
+     call. This form offered MD5 and SHA alone until 5.8.0's review, which
+     was a limit of the form and not the poller: fortipoll signs through
+     the same localized_key as Nodes, so a FortiGate user provisioned at
+     SHA256 (FortiOS offers the whole SHA-2 family) was unpollable here
+     for no reason. */
+  const V3_AUTH_PROTOCOLS = ['MD5', 'SHA', 'SHA224', 'SHA256', 'SHA384', 'SHA512'];
+
   function controllerCredentialFields(c) {
     return `
       <fieldset><legend>SNMP</legend>
@@ -262,8 +276,8 @@
         <label>Username <input id="wc-v3user" value="${escape(c ? c.v3_user : '')}"></label>
         <label>Auth protocol <select id="wc-v3proto">
           <option value="">None (noAuthNoPriv)</option>
-          <option value="MD5" ${c && c.v3_auth_proto === 'MD5' ? 'selected' : ''}>MD5</option>
-          <option value="SHA" ${c && c.v3_auth_proto === 'SHA' ? 'selected' : ''}>SHA</option>
+          ${V3_AUTH_PROTOCOLS.map((p) =>
+            `<option value="${p}" ${c && c.v3_auth_proto === p ? 'selected' : ''}>${p}</option>`).join('')}
         </select></label>
         ${App.canStoreSecrets()
           ? `<label>Auth password <input id="wc-v3pass" type="password"
@@ -396,6 +410,19 @@
           polls is removed from the list and raises an alert — unless it has been
           marked out of service, which exempts it from both.</p>
       </fieldset>
+      <fieldset><legend>SNMPv3</legend>
+        <label class="check"><input type="checkbox" id="wl-v3verify"
+          ${s.v3_verify_replies !== false ? 'checked' : ''}> Verify the signature on
+          every SNMPv3 reply</label>
+        <p class="hint">The same switch as in Nodes settings, for this poller's
+          controllers. New in 5.8.0, and on by default: a signed request's reply must
+          come back signed with the same key, and anything less is refused as a
+          downgrade with the controller saying why. <b>Turning this off gives that up
+          for every controller</b> — a reply's signature is no longer checked and an
+          unsigned answer is accepted, as every release before 5.8.0 accepted it — so
+          use it only to keep polling one controller that sits behind something
+          that strips or breaks the signature while you chase that, not as a fix.</p>
+      </fieldset>
       <fieldset><legend>RADIO TX POWER</legend>
         <label>Read fgWcWtpSessionRadioOperatingPower as
           <select id="wl-power-unit">
@@ -419,6 +446,7 @@
         await App.post('/api/settings', { scope: 'wireless', values: {
           enabled: m.querySelector('#wl-enabled').checked,
           poll_interval_s: Number(m.querySelector('#wl-interval').value),
+          v3_verify_replies: m.querySelector('#wl-v3verify').checked,
           radio_power_unit: m.querySelector('#wl-power-unit').value,
           table_columns: App.readColumnPicker(
             m.querySelector('#cols-wireless'), ALL_COLUMNS),

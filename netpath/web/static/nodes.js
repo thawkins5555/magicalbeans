@@ -4190,9 +4190,21 @@
             }
             throw error;
           }
+          // A refused credential is said, not swallowed: the device row
+          // already exists by now, so the dialog closes on it either way
+          // and the job still reports "Added" — that part is true — but the
+          // refusal follows it as its own toast, not a rethrow, because a
+          // rejection after the modal has closed is toasted by App.runJob
+          // AND by runModalAction, the same sentence twice. Swallowing it
+          // left a row with a user and auth protocol, no password, polling
+          // at noAuthNoPriv, and "Added" on the button with nothing after.
+          let credentialError = null;
           if (credential) {
-            await App.post(`/api/nodes/devices/${result.id}/credential`, credential)
-              .catch(() => {});
+            try {
+              await App.post(`/api/nodes/devices/${result.id}/credential`, credential);
+            } catch (error) {
+              credentialError = error;
+            }
           }
           // Poll it now rather than waiting for the next scheduled tick, and
           // only after any v3 credential override above has been saved so
@@ -4201,6 +4213,11 @@
           App.closeModal();
           selectDevice(result.id);
           App.refreshNow('nodes');
+          if (credentialError) {
+            const why = String(credentialError.message || credentialError).replace(/\.$/, '');
+            App.toast(`Added ${name || ip}, but its SNMPv3 credential was not stored: ` +
+              `${why}. Open the device and use Edit to store it.`, 'fail');
+          }
           return result;
         })());
       } },
@@ -4345,16 +4362,30 @@
      when nothing was typed. The auth password is the key to the whole
      record — the API stores the pair as one — so a privacy password typed
      alone is refused here, in the form, rather than posted and refused by
-     the server with a less specific message. `null` when there is nothing
-     to store, so callers keep their `if (body)` shape. */
+     the server with a less specific message. Every refusal is thrown
+     BEFORE the "(profile)" early return, and a typed password with the
+     user or auth protocol left at "(profile)" is a refusal too, not a
+     null: each of those used to return null first, so a password the
+     operator had typed was dropped without a word while the dialog
+     reported success. `null` only when nothing was typed, so callers keep
+     their `if (body)` shape. */
   function credentialBody(box, authId, privId, fields) {
     const authPass = (box.querySelector(authId) || {}).value || '';
     const privPass = (box.querySelector(privId) || {}).value || '';
     if (!authPass && !privPass) return null;
-    if (!fields.v3_user || !fields.v3_auth_proto) return null;
     if (privPass && !authPass) {
       throw new Error('Type the auth password as well as the privacy password — ' +
         'an SNMPv3 credential is stored as one pair.');
+    }
+    if (!fields.v3_user || !fields.v3_auth_proto) {
+      throw new Error('A password stored on the device needs its own v3 username ' +
+        'and auth protocol — set both, or leave the password blank to keep ' +
+        'using the profile\'s credential.');
+    }
+    if (privPass && !fields.v3_priv_proto) {
+      throw new Error('Pick the v3 privacy protocol (AES) to store a privacy ' +
+        'password — "(profile)" cannot hold one, and the server refuses the ' +
+        'whole credential without it.');
     }
     const body = { v3_user: fields.v3_user, v3_auth_proto: fields.v3_auth_proto,
       v3_auth_pass: authPass };

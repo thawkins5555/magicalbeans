@@ -11,17 +11,26 @@ so this suite never skips, whatever `cryptography` is installed here.
      exactly the bytes 5.7.2 produced, hex computed from that commit and
      pasted here. This is what proves the 5.8.0 upgrade changes no request
      an existing install sends;
-  4. the RFC 3826 IV is boots || time || salt, salts never repeat and are
-     never all-zero, and the salt generator is not the `random` module;
+  4. the RFC 3826 IV is boots || time || salt — with inputs wide enough
+     that a mask narrower than 32 bits gives a different answer — salts
+     never repeat, not even across threads racing for them, and are never
+     all-zero, and the salt generator is not the `random` module;
   5. a privacy key without an auth key is refused, not downgraded;
   6. the availability guard reports "unavailable" against a backend that
      panics — a BaseException, not an ImportError — rather than crashing,
-     and recovers on recheck;
+     and recovers on recheck; and against a backend that round-trips
+     cleanly but is not AES-128-CFB (the known answer, not a bare round
+     trip, is the probe);
   7. security_level and Credential.security_level derive the level the
-     same way, and the label names it.
+     same way, and the label names it;
+  8. the digest length a reply is checked against comes from the
+     configured protocol, never from the reply itself, and
+     SnmpDowngrade is not an SnmpAuthError.
 """
+import hmac
 import os
 import sys
+import threading
 
 import _paths  # noqa: F401  (puts the repo root on sys.path)
 
@@ -29,7 +38,9 @@ from netpath import snmpcrypt
 from netpath.nodepoll import (
     Credential, _credential_label, access_denied_advice, security_level)
 from netpath.snmppoll import (
-    SnmpError, build_v3_request, decode_response, discovery_probe, find_auth_span)
+    FLAG_AUTH, SnmpAuthError, SnmpDowngrade, SnmpError, _v3_message,
+    build_v3_request, decode_response, discovery_probe, find_auth_span,
+    scoped_pdu)
 from netpath.trapdecode import (
     AUTH_PROTOCOLS, PDU_GET, PDU_GETBULK, localized_key, privacy_key)
 
@@ -151,6 +162,16 @@ check("boots 7, time 1234 → 00000007 000004d2, then the salt",
       iv == bytes.fromhex("00000007" "000004d2") + salt and len(iv) == 16, iv.hex())
 check("boots and time are masked to 32 bits like the wire field",
       snmpcrypt.iv_for(2 ** 32 + 7, 2 ** 33 + 1234, salt) == iv)
+# Inputs that need all 32 bits: boots 7 and time 1234 fit in 16, so a
+# mask narrowed to 16 bits would pass the check above and break every
+# device with over ~18 h of uptime (65536 s) in production.
+wide = snmpcrypt.iv_for(0x00010007, 0x000204D2, salt)
+check("boots 0x00010007, time 0x000204d2 keep their high halves: the mask "
+      "is 32 bits, not 16",
+      wide == bytes.fromhex("00010007" "000204d2") + salt, wide.hex())
+check("...and the full 32-bit range survives too (0xffffffff twice)",
+      snmpcrypt.iv_for(0xFFFFFFFF, 0xFFFFFFFF, salt)
+      == bytes.fromhex("ffffffff" "ffffffff") + salt)
 try:
     snmpcrypt.iv_for(1, 1, b"short")
     check("a salt of the wrong length is a PrivError", False)
@@ -162,6 +183,39 @@ check("10,000 next_salt() calls give 10,000 distinct salts",
       len(salts) == 10_000, len(salts))
 check("...none all-zero, all 8 bytes",
       all(len(s) == 8 and s != bytes(8) for s in salts))
+
+# The salt counter's read-modify-write is guarded by a lock, and that lock
+# is the one thing in this module that must not be wrong: two poll workers
+# drawing the same salt under one key is the IV reuse the whole design
+# exists to rule out. A single-threaded loop cannot tell whether the lock
+# is there, so this one races eight threads for the counter with the
+# interpreter switching as often as it can, and asks for every salt to be
+# distinct. Without the lock, dozens repeat.
+THREADS, PER_THREAD = 8, 20_000
+drawn: list[list[bytes]] = [[] for _ in range(THREADS)]
+start = threading.Barrier(THREADS)
+
+
+def draw(bucket: list) -> None:
+    start.wait()
+    bucket.extend(snmpcrypt.next_salt() for _ in range(PER_THREAD))
+
+
+previous_interval = sys.getswitchinterval()
+sys.setswitchinterval(1e-6)
+try:
+    workers = [threading.Thread(target=draw, args=(bucket,)) for bucket in drawn]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+finally:
+    sys.setswitchinterval(previous_interval)
+raced = [s for bucket in drawn for s in bucket]
+check(f"{THREADS} threads x {PER_THREAD} next_salt() calls, racing, give "
+      f"{THREADS * PER_THREAD} distinct salts (the _salt_lock is load-bearing)",
+      len(set(raced)) == len(raced) == THREADS * PER_THREAD,
+      f"{len(raced) - len(set(raced))} repeated")
 src = open(os.path.join(_paths.REPO_ROOT, "netpath", "snmpcrypt.py"), encoding="utf-8").read()
 check("snmpcrypt does not import `random` (that seeds request ids; wrong for an IV)",
       "import random" not in src and "os.urandom" in src)
@@ -178,7 +232,10 @@ check("...only cryptography and the standard library",
       imported <= {"__future__", "os", "struct", "threading", "warnings",
                    "cryptography.hazmat.primitives.ciphers",
                    "cryptography.hazmat.decrepit.ciphers.modes",
-                   "cryptography.hazmat.primitives.ciphers.modes"}, sorted(imported))
+                   "cryptography.hazmat.primitives.ciphers.modes",
+                   # the deprecation-warning category the CFB fallback
+                   # silences; still cryptography, still not ours
+                   "cryptography.utils"}, sorted(imported))
 check("...and says what it is not: not a crypto library, no key generation, "
       "one construction",
       "not a cryptographic library" in src and "derives no keys" in src
@@ -235,6 +292,86 @@ finally:
 check("recheck=True after the fix restores whatever this machine really has "
       "('install it, then restart the worker' without an app restart)",
       snmpcrypt.available(recheck=True) is was)
+
+
+class _StreamCipher:
+    """A backend that round-trips perfectly and is not AES-CFB: a keystream
+    from key and IV, XORed in. Length-preserving, decrypt(encrypt(x)) == x,
+    so a probe that only asked for a round trip would bless it — and would
+    bless a real backend in CFB8 mode, or with a swapped byte order, just
+    the same. The known answer is what tells THIS cipher from those."""
+
+    def __init__(self, algorithm, mode):
+        self._stream = bytes((k + i + n) & 0xFF for n, (k, i) in enumerate(
+            zip(algorithm.key * 16, mode.iv * 16)))
+
+    def encryptor(self):
+        return self
+
+    decryptor = encryptor
+
+    def update(self, data):
+        return bytes(b ^ s for b, s in zip(data, self._stream))
+
+    @staticmethod
+    def finalize():
+        return b""
+
+
+class _Key:
+    def __init__(self, key):
+        self.key = key
+
+
+class _IV:
+    def __init__(self, iv):
+        self.iv = iv
+
+
+snmpcrypt._load_backend = lambda: (_StreamCipher, _Key, _IV)
+try:
+    check("a backend that round-trips but is not AES-128-CFB fails the known-"
+          "answer probe: available() is False...",
+          snmpcrypt.available(recheck=True) is False)
+    check("...and the reason names the known-answer test",
+          "known-answer" in snmpcrypt.unavailable_reason(), snmpcrypt.unavailable_reason())
+finally:
+    snmpcrypt._load_backend = real_loader
+snmpcrypt.available(recheck=True)
+
+
+# ===================================== § 8 the digest length, and the types
+
+print("\n-- the digest length is the protocol's, not the reply's")
+# A reply whose auth field is shorter than the protocol's digest. If the
+# receiver took the length from the field it was handed, an EMPTY field
+# would verify — HMAC(...)[:0] == b"" — and a one-byte one would fall to a
+# 1-in-256 guess. The message is assembled by hand with the short
+# placeholder and signed over that, so the only thing wrong with it is
+# the length; neither may verify.
+for short_len in (0, 1):
+    message = _v3_message(1, flags=FLAG_AUTH, engine_id=ENGINE, engine_boots=1,
+                          engine_time=1, user="poller", auth_placeholder_len=short_len,
+                          priv_params=b"",
+                          scoped=scoped_pdu(PDU_GET, 1, ["1.3.6.1.2.1.1.3.0"],
+                                            context_engine_id=ENGINE))
+    if short_len:
+        s, e = find_auth_span(message)
+        digest = hmac.new(localized_key("SHA", "authpassword", ENGINE),
+                          message, AUTH_PROTOCOLS["SHA"][0]).digest()[:short_len]
+        message = message[:s] + digest + message[e:]
+    try:
+        decode_response(message, auth_proto="SHA",
+                        auth_key=localized_key("SHA", "authpassword", ENGINE))
+        check(f"a {short_len}-byte auth field on a SHA reply is refused", False)
+    except SnmpAuthError:
+        check(f"a {short_len}-byte auth field on a SHA reply is refused (SHA "
+              f"means 12, and the reply does not get to say otherwise)", True)
+check("SnmpDowngrade is its own type: not an SnmpAuthError, and not the other "
+      "way round either — the two have different remedies",
+      not issubclass(SnmpDowngrade, SnmpAuthError)
+      and not issubclass(SnmpAuthError, SnmpDowngrade)
+      and issubclass(SnmpDowngrade, SnmpError))
 
 
 # ===================================== § 7 the derived level

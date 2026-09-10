@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from . import nodeoids as oids
 from .eventlog import ERROR, NullLog, WIRELESS
 from .nodeoids import oid_key
-from .nodepoll import EngineCache, _Session, credential_for
+from .nodepoll import EngineCache, _Session, credential_for, snmp_version_of
 from .snmppoll import (
     PDU_GETNEXT, PDU_REPORT, SnmpError,
     build_request, build_v3_request, discovery_probe,
@@ -346,7 +346,7 @@ class WirelessPoller(Worker):
         return values
 
     def _snmp_get_next(self, controller, config: dict, oid: str):
-        version = int(config.get("snmp_version", 1))
+        version = snmp_version_of(config)
         session = _Session(controller["ip"], SNMP_PORT, 3.0, 2)
         try:
             if version in (0, 1):

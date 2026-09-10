@@ -263,9 +263,20 @@ on every SNMPv3 reply**, in Nodes settings (and its twin in Wireless
 settings), defaulting on; turning it off gives up the digest check and
 the downgrade refusal for every device — the pre-5.8.0 acceptance,
 exactly — and its hint says so, so it is used to keep polling one
-misbehaving agent while chasing it, not as a fix. A downgrade is filed
-as an ordinary SNMP error, not as an authentication failure: the
-password was never contradicted.
+misbehaving agent while chasing it, not as a fix. A downgrade is not an
+authentication failure — the password was never contradicted, because
+there was no signature to contradict it — and **it is not an outage
+either**: the device answered every request. It is filed the way an
+access refusal is. The device's status follows the evidence that it is
+answering, `snmp_downgrade` is recorded on entering the state, a new
+built-in rule, **SNMPv3 replies refused as a downgrade**, raises on it,
+and `snmp_verified` — recorded on the first poll whose reply verified
+again, after the agent was fixed or the switch turned off — clears it,
+the way `access_denied`/`access_ok` pair. This was itself a review
+finding: the first cut filed a downgrade as an ordinary SNMP error, and
+in this poller's vocabulary an ordinary SNMP error *is* an outage, so
+with ping off a reachable device was marked down and a false outage
+alert went out for a device that answered every single request.
 
 **Reproducible.** `tests/stubs/stub_agent_iftable.py` is a real `authPriv`
 agent with `--priv-pass`: it verifies the digest first, decrypts, answers
@@ -288,6 +299,60 @@ AES-CFB is not usable — and "usable" means the guard's real known-answer
 encrypt/decrypt passed, because on the machine this was written on
 `import cryptography` succeeds, reports a version, and then panics in the
 first cipher call.
+
+**Found in review, fixed before release.** A four-pass review of the
+above reproduced seven faults by execution, and each is fixed here rather
+than in a point release. The one that mattered: **the Test button tested
+at the wrong level** for a device inheriting an authPriv profile. The
+edit form posts every override key on every Test, null for each left at
+"(profile)", and the route read a present-but-null privacy protocol as
+"no privacy" and threw away the stored privacy password — so against
+the PAN-OS box this release exists for, Test answered
+`unsupportedSecLevels` with 5.7.2's advice to set a privacy password
+that was already set, while the scheduled poll succeeded. Null now means
+"(profile)" for the privacy protocol exactly as it always has for the
+auth protocol; only the password keeps its "present-but-empty means test
+without one" reading, because that is the one field the form cannot say
+"inherit" for. Second, **the display and the poll read two different
+credentials**: `effective_config()` resolved a NULL device column to the
+profile's and `credential_candidates()` did not, so a device with one
+field overridden was shown at authPriv and polled at authNoPriv — and,
+worse, carried `snmp_version: None` into the poll, where `int(None)` is a
+`TypeError` the poll's error handling does not catch, `record_poll` never
+ran, and the device's status **froze for good**. The poll's candidate is
+now the device's own columns merged over the profile's primary, and a
+test pins the two functions equal across the override matrix. Third,
+**Add device swallowed a refused credential** (`.catch(() => {})`),
+leaving a row with a username and auth protocol, no password, polling at
+noAuthNoPriv, and "Added" on the button; the refusal is now said, and the
+form refuses a typed password it cannot store — a lone privacy password,
+or one with the user or protocol left at "(profile)" — before posting
+anything. Fourth, **`AES128` passed validation and the next Save
+destroyed the blob**: snmpcrypt accepts it as net-snmp's spelling, the
+row stored it verbatim, the form's select had no such option and showed
+"(none)", and saving posted a blank protocol that dropped the privacy
+password. Every accepted spelling (`AES128`, `AES-128`, any case, any
+whitespace) is stored as `AES`, and a contract test pins the set of
+names the server can store to the select's options. Fifth, **an
+authPriv row with no auth protocol was reachable by API** — `PUT` a
+blank `v3_auth_proto` on a profile, an additional credential, or a
+device whose profile had none to inherit, and the row kept both blobs,
+reported `has_priv_credential: true`, derived `noAuthNoPriv`, and was
+refused before every poll; it is refused at the write instead, and a
+device's blank is stored as NULL ("the profile's") rather than `""`.
+Sixth, three claims that were not true are true now: the verify-replies
+switch has its twin in Wireless settings (the setting existed; the
+control did not, so a FortiGate behind something that strips signatures
+had no way out but a raw API call); the controller form offers the same
+six auth protocols as Nodes rather than MD5 and SHA alone (the poller
+always signed through the same code; only the form was short); and a
+privacy field is refused on all three controller write routes, where
+the add and edit routes had allow-list-dropped it behind `{"ok": true}`.
+And `requirements.txt` gives `cryptography` the floor the code assumes
+(`>=3.3`: a backend-less `Cipher(...)` is legal only from 3.1, and
+paramiko already needs 3.3) instead of no floor and a comment with the
+wrong reasoning. `tests/test_v3_credential_storage.py` holds all of it,
+and would have held the four-pass review's findings before the fact.
 
 **Not in this release.** Trap decryption: `snmpcrypt.py` is a leaf module
 so the trap receiver can use it without a cycle, and wiring it in — a

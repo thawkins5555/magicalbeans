@@ -2055,6 +2055,97 @@ check(_WAIT_FOR_RESTART.count("reachable()") >= 3,
       "answered by the process that is about to exit sent the browser to "
       "/login on a service that was going down")
 
+# ---------------------------------------------- 5.8.0 the SNMPv3 protocol lists
+#
+# Two lists the server and the browser must agree on, and one the two
+# browser modules must agree on between themselves, none of which anything
+# else can see. The privacy one is the dangerous one: a name the server
+# stores that the select does not offer showed "(none)" in the form, and the
+# next Save posted a blank protocol and dropped the privacy blob with it --
+# that was "AES128" before the alias map. The wireless auth list is a second
+# copy of nodes.js's on purpose (modules load lazily, so nothing in nodes.js
+# is guaranteed to exist when the controller form opens), and a copy is only
+# safe while something checks it.
+sys.path.insert(0, REPO_ROOT)
+from netpath import snmpcrypt as _snmpcrypt  # noqa: E402
+from netpath import trapdecode as _trapdecode  # noqa: E402
+from netpath.web import api as _api  # noqa: E402
+
+_NODES58 = read("nodes.js")
+_WIRELESS58 = read("wireless.js")
+
+
+def _js_list(source, name):
+    match = re.search(r"const %s = \[(.*?)\];" % re.escape(name), source, re.S)
+    return re.findall(r"'([^']+)'", match.group(1)) if match else None
+
+
+_PRIV_LIST = _js_list(_NODES58, "V3_PRIV_PROTOCOLS")
+_AUTH_LIST = _js_list(_NODES58, "V3_AUTH_PROTOCOLS")
+_WIRELESS_AUTH = _js_list(_WIRELESS58, "V3_AUTH_PROTOCOLS")
+check(_PRIV_LIST == ["AES"],
+      "nodes.js's V3_PRIV_PROTOCOLS is exactly ['AES'] -- AES-128-CFB is the "
+      "one cipher offered (found: %r)" % (_PRIV_LIST,))
+# Every name the server can STORE, from every spelling it accepts, is a name
+# the select offers. The spellings are snmpcrypt's table plus api.py's alias
+# map, each pushed through the same _clean_priv_proto the routes call.
+_STORED = set()
+for _spelling in list(_snmpcrypt.PRIV_PROTOCOLS) + list(getattr(_api, "_PRIV_PROTO_ALIASES", {})):
+    for _variant in (_spelling, _spelling.lower(), " %s " % _spelling):
+        _fields = {"v3_priv_proto": _variant}
+        _api._clean_priv_proto(_fields)
+        _STORED.add(_fields["v3_priv_proto"])
+check(_STORED <= set(_PRIV_LIST or []),
+      "every privacy protocol name _clean_priv_proto can store is an option "
+      "of the form's select (stored: %s)" % sorted(_STORED))
+check(_AUTH_LIST is not None and set(_AUTH_LIST) <= set(_trapdecode.AUTH_PROTOCOLS),
+      "every auth protocol nodes.js offers is one trapdecode.AUTH_PROTOCOLS "
+      "can sign with (%r)" % (_AUTH_LIST,))
+check(_AUTH_LIST is not None and "SHA1" not in _AUTH_LIST,
+      "...and 'SHA1', the table's alias of 'SHA', is not offered as a second "
+      "option for the same digest")
+check(_WIRELESS_AUTH == _AUTH_LIST,
+      "wireless.js's V3_AUTH_PROTOCOLS is the same list as nodes.js's "
+      "(%r vs %r) -- fortipoll signs through the same localized_key"
+      % (_WIRELESS_AUTH, _AUTH_LIST))
+check("V3_AUTH_PROTOCOLS.map(" in _WIRELESS58
+      and '<option value="MD5"' not in _WIRELESS58,
+      "the controller form's auth select is built from that list, not from "
+      "hand-written options")
+
+# The Wireless settings dialog has the verify-replies switch the changelog
+# says it has, posts it under the key wirelessdb.DEFAULTS stores, and its
+# hint says what turning it off gives up.
+_WL_SETTINGS = _WIRELESS58[_WIRELESS58.index("function settingsDialog("):]
+check('id="wl-v3verify"' in _WL_SETTINGS
+      and "v3_verify_replies: m.querySelector('#wl-v3verify').checked" in _WL_SETTINGS,
+      "wireless.js's settings dialog carries the SNMPv3 verify-replies switch "
+      "and posts it as v3_verify_replies")
+check("s.v3_verify_replies !== false ? 'checked'" in _WL_SETTINGS,
+      "...rendered checked unless the stored value is explicitly false, the "
+      "same reading nodes.js gives the same key (a missing key is the default, on)")
+check("Turning this off gives that up" in _WL_SETTINGS
+      and "unsigned answer is accepted" in _WL_SETTINGS,
+      "...and its hint says what turning it off gives up")
+
+# credentialBody: every refusal is thrown before the '(profile)' early
+# return, and the add path says a refused credential rather than eating it.
+_CRED_BODY = _NODES58[_NODES58.index("function credentialBody("):]
+_CRED_BODY = _CRED_BODY[:_CRED_BODY.index("\n  }\n") + 4]
+_FIRST_NULL = _CRED_BODY.index("return null")
+check(_CRED_BODY.count("return null") == 1
+      and "throw new Error" not in _CRED_BODY[:_FIRST_NULL]
+      and _CRED_BODY.count("throw new Error") == 3
+      and "!fields.v3_user || !fields.v3_auth_proto" not in _CRED_BODY[:_FIRST_NULL],
+      "credentialBody returns null only when nothing was typed; a typed "
+      "password that cannot be stored is thrown, never dropped")
+_ADD_PATH = _NODES58[_NODES58.index("function addDevice("):_NODES58.index("function editDevice(")]
+check("/credential`, credential)\n              .catch(() => {})" not in _ADD_PATH
+      and "credentialError" in _ADD_PATH
+      and "but its SNMPv3 credential was not stored" in _ADD_PATH,
+      "addDevice no longer swallows a refused credential POST: the refusal is "
+      "toasted after the dialog closes on the row that was added")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

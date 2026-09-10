@@ -12,6 +12,7 @@ format the trap receiver already decodes.
 from __future__ import annotations
 
 import hmac
+import logging
 from dataclasses import dataclass, field
 
 from . import snmpcrypt
@@ -34,6 +35,8 @@ ERROR_STATUS = {
 FLAG_AUTH = 0x01
 FLAG_PRIV = 0x02
 FLAG_REPORTABLE = 0x04
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -63,6 +66,18 @@ class SnmpError(Exception):
 
 class SnmpTimeout(SnmpError):
     pass
+
+
+class SnmpStray(SnmpError):
+    """A well-formed reply that answers some request other than the one
+    being waited on: a late answer to the previous attempt, or a datagram
+    somebody else aimed at our port. Not an outcome — _Session drops it,
+    counts it, and keeps waiting — and never a verdict about the
+    credential, which is why decode_response raises it BEFORE checking
+    the digest wherever the request id can be read in the clear: a stray
+    that reached the digest check first came out as SnmpAuthError, and one
+    spoofed datagram with a made-up id became an auth alert, an engine
+    rediscovery and a credential rotation."""
 
 
 class SnmpAuthError(SnmpError):
@@ -362,14 +377,40 @@ def _read_scoped(buffer: bytes, ds: int, de: int, response: Response) -> None:
     _read_pdu(buffer, ps, pe, response)
 
 
+def _check_stray(response: Response, expect_request_id: int | None) -> None:
+    """SnmpStray for a non-Report reply carrying some other request id.
+    Reports are exempt: an agent reports an engine mismatch against its
+    own msgID, and dropping that would turn one v3 resync into a
+    timeout."""
+    if expect_request_id is None or response.pdu_tag == PDU_REPORT:
+        return
+    if response.request_id != expect_request_id:
+        raise SnmpStray(f"reply to request id {response.request_id}, not "
+                        f"the {expect_request_id} being waited on")
+
+
 def _decode_v3(data: bytes, msg: Reader, *, auth_proto: str | None = None,
                auth_key: bytes | None = None, priv_proto: str | None = None,
-               priv_key: bytes | None = None) -> Response:
+               priv_key: bytes | None = None,
+               expect_request_id: int | None = None) -> Response:
     """A v3 message at any level. With keys given, the digest is verified
-    FIRST and only then is the ScopedPDU decrypted — RFC 3414 s3.2's
-    order, the mirror of build_v3_request's encrypt-then-authenticate —
-    so nothing reaches the cipher, let alone the parser, that was not
-    proven to come from the key holder.
+    and only then is the ScopedPDU decrypted — RFC 3414 s3.2's order, the
+    mirror of build_v3_request's encrypt-then-authenticate — so nothing
+    reaches the cipher that was not proven to come from the key holder.
+
+    Where the request-id check falls differs by level, on purpose. In an
+    UNENCRYPTED reply the id is in the clear, and it is checked before
+    the digest: parsing the ScopedPDU is safe on untrusted bytes (v1/v2c
+    and unsigned replies are parsed that way always), and a stray
+    datagram — a late answer, a spoof with a made-up id — must be dropped
+    as a stray, not raised as a wrong key. In an ENCRYPTED reply the id
+    is inside the ciphertext, so the digest must come first there, and
+    the id is checked once the plaintext exists. A datagram that claims
+    privacy without authentication is discarded before either: USM has
+    no such level (RFC 3412 s7.2 has the receiver drop it), and passing
+    it to the cipher would decrypt an attacker-chosen IV and ciphertext
+    under our key with no proof of origin at all — a decryption oracle,
+    once the parser's complaint about the plaintext is shown to anyone.
 
     The digest is checked only when the reply carries FLAG_AUTH. That is
     not laxity: an agent's Report-PDU for usmStatsUnknownEngineIDs or
@@ -404,24 +445,38 @@ def _decode_v3(data: bytes, msg: Reader, *, auth_proto: str | None = None,
                         user=data[ns:ne].decode("utf-8", "replace"),
                         flags=flags, priv_params=data[ps_:pe])
 
-    if flags & FLAG_AUTH and auth_proto and auth_key:
-        if not _verify_digest(data, as_, ae, auth_proto, auth_key):
-            raise SnmpAuthError(
-                "the reply's signature does not verify with this "
-                "credential — the authentication password or protocol is "
-                "wrong for this engine, or the reply was forged or altered "
-                "in transit")
-        response.auth_verified = True
+    if flags & FLAG_PRIV and not flags & FLAG_AUTH:
+        # A plain SnmpError, so _Session treats it as garbage from the
+        # right address (dropped, the wait continues) rather than as a
+        # verdict about anything: RFC 3412 s7.2 says discard, and nothing
+        # about this datagram is worth a sentence in the device row.
+        raise SnmpError(
+            "privacy flag set without the authentication flag — a level "
+            "USM does not have (RFC 3412 s7.2); discarded unread")
+
+    def verify() -> None:
+        if flags & FLAG_AUTH and auth_proto and auth_key:
+            if not _verify_digest(data, as_, ae, auth_proto, auth_key):
+                raise SnmpAuthError(
+                    "the reply's signature does not verify with this "
+                    "credential — the authentication password or protocol "
+                    "is wrong for this engine, or the reply was forged or "
+                    "altered in transit")
+            response.auth_verified = True
 
     tag, ds, de = msg.read_tlv()
     if not flags & FLAG_PRIV:
         if tag != T_SEQUENCE:
             raise BerError("ScopedPDU is not a SEQUENCE")
         _read_scoped(data, ds, de, response)
+        _check_stray(response, expect_request_id)     # in the clear: first
+        verify()
         return response
 
     # encryptedPDU: an OCTET STRING whose value is the ScopedPDU under
     # AES-CFB with the IV built from THIS message's boots, time and salt.
+    # The id is inside it, so here the digest has to come first.
+    verify()
     if tag != T_OCTET_STRING:
         raise BerError("encryptedPDU is not an OCTET STRING")
     if not (priv_proto and priv_key):
@@ -446,15 +501,31 @@ def _decode_v3(data: bytes, msg: Reader, *, auth_proto: str | None = None,
         # not fail in the cipher — it fails here, as bytes that are not a
         # ScopedPDU. Name the cause, or a wrong privacy password reads as
         # "malformed SNMP response" and the device gets the blame.
+        #
+        # The parser's own complaint stays out of the message. It says
+        # what byte it found ("expected 0x30, got 0x5f"), and that byte is
+        # the first byte of the PLAINTEXT — under CFB, C[0] XOR the
+        # keystream — shown to whoever can read the device row, the API
+        # or the alert email. Anyone who can also put a datagram on the
+        # wire chooses the IV and ciphertext, so one disclosed byte per
+        # message is a keystream byte per message, and a captured reply
+        # falls a block at a time without the privacy password. A fixed
+        # sentence for the operator, the detail at debug level for us.
+        _log.debug("encrypted reply from engine %s did not decrypt to a "
+                   "ScopedPDU: %s", response.engine_id.hex(), exc)
         raise SnmpPrivError(
             "the reply decrypted to something that is not a ScopedPDU — the "
-            "privacy password or protocol is wrong for this user (the "
-            "signature verified, so the authentication password is not the "
-            f"problem): {exc}") from exc
+            "privacy password or protocol is wrong for this user "
+            + ("(the signature verified, so the authentication password is "
+               "not the problem)" if response.auth_verified else
+               "(the signature was not checked, so the authentication "
+               "password is not proven either way)")) from exc
+    _check_stray(response, expect_request_id)         # only now readable
     return response
 
 
-def _decode(data: bytes, **keys) -> Response:
+def _decode(data: bytes, *, expect_request_id: int | None = None,
+            **keys) -> Response:
     top = Reader(data)
     body_s, body_e = top.expect(T_SEQUENCE)
     msg = Reader(data, body_s, body_e)
@@ -468,17 +539,19 @@ def _decode(data: bytes, **keys) -> Response:
         tag, ps, pe = msg.read_tlv()
         response = Response(version=version, pdu_tag=tag)
         _read_pdu(data, ps, pe, response)
+        _check_stray(response, expect_request_id)
         return response
 
     if version == V3:
-        return _decode_v3(data, msg, **keys)
+        return _decode_v3(data, msg, expect_request_id=expect_request_id, **keys)
 
     raise BerError(f"unsupported version {version}")
 
 
 def decode_response(data: bytes, *, auth_proto: str | None = None,
                     auth_key: bytes | None = None, priv_proto: str | None = None,
-                    priv_key: bytes | None = None, verify: bool = True) -> Response:
+                    priv_key: bytes | None = None, verify: bool = True,
+                    expect_request_id: int | None = None) -> Response:
     """The mirror of trapdecode's trap decoder, but for a Response-PDU (or,
     given a just-built request, decodes it back — same code path, since a
     Response-PDU and a Get/GetNext/GetBulk-PDU share request-id/slot-2/
@@ -490,25 +563,36 @@ def decode_response(data: bytes, *, auth_proto: str | None = None,
     whole reply worthless.
 
     The keys are the ones the REQUEST was built with. Given an auth key, a
-    v3 reply carrying FLAG_AUTH has its digest verified before anything
-    else is read (verify first, then decrypt — RFC 3414 s3.2), and a
-    non-Report reply that arrives unsigned — or, given a privacy key,
-    unencrypted — is refused as SnmpDowngrade: a reply at a lower level
+    v3 reply carrying FLAG_AUTH has its digest verified before it is
+    returned — and before anything is decrypted (verify first, then
+    decrypt — RFC 3414 s3.2) — and a non-Report reply that arrives
+    unsigned — or, given a privacy key, unencrypted — is refused as
+    SnmpDowngrade: a reply at a lower level
     than its request is not an answer, it is a downgrade, and until 5.8.0
     nothing on this end checked either. Report-PDUs are exempt both ways,
     because the discovery exchange and a wrongDigests refusal are
     unauthenticated by design.
 
+    `expect_request_id` is the id the reply must carry; a non-Report reply
+    carrying another is SnmpStray, raised before the digest is checked
+    wherever the id can be read without decrypting (see _decode_v3), so
+    a caller waiting on a socket can drop it and keep waiting.
+
     `verify=False` is the operator's escape hatch (the Nodes setting
-    `v3_verify_replies`): the digest is not checked and a lower level is
-    not refused — the pre-5.8.0 behaviour, exactly — while an encrypted
-    reply is still decrypted, since without that there is no answer to
-    read at all."""
-    if not verify:
-        auth_key = None
+    `v3_verify_replies`): a lower level is not refused — the unsigned or
+    unencrypted answer is accepted, as every release before 5.8.0
+    accepted it. It does NOT skip the digest on a reply that carries one:
+    the setting exists for the one agent or proxy that answers unsigned,
+    and an agent that signs its replies still signs them with the key we
+    hold, so checking costs that agent nothing — while not checking would
+    hand the decryption path above an unverified ciphertext on request,
+    the very thing verify-then-decrypt exists to prevent. An encrypted
+    reply is decrypted either way, since without that there is no answer
+    to read at all."""
     try:
         response = _decode(data, auth_proto=auth_proto, auth_key=auth_key,
-                           priv_proto=priv_proto, priv_key=priv_key)
+                           priv_proto=priv_proto, priv_key=priv_key,
+                           expect_request_id=expect_request_id)
     except SnmpError:
         raise
     except (BerError, IndexError, ValueError, UnicodeError) as exc:

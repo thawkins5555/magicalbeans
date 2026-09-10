@@ -603,7 +603,7 @@ _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "auto_resolve_after_s", "notify")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 55 built-in rules: 8 device_event + 3 interface_event + 29 threshold +
+# 56 built-in rules: 9 device_event + 3 interface_event + 29 threshold +
 # 3 trap + 1 syslog + 1 ipam + 2 wireless_event + 1 dhcp_threshold +
 # 3 netpath_threshold + 4 system. Each `template` name is a
 # templates.key —
@@ -623,6 +623,18 @@ _BUILTIN_RULES = [
     # match on "auth". Cleared by access_ok (alertrules.CLEARS), the same
     # pair auth_fail/auth_ok make.
     ("device_access_denied", "SNMP access refused by the device", "device_event", "access_denied", 3, "event_notice", None, None, 1),
+    # The device answers every request, but below the level it was asked
+    # at — unsigned to a signed request, unencrypted to an encrypted one —
+    # and 5.8.0's reply verification refuses the answer unread. Its own
+    # rule because it is neither of the two it could be mistaken for: not
+    # device_auth_fail (no signature contradicted the password; there was
+    # none), and not device_down (the device is demonstrably answering).
+    # Before it had one, a downgrade fell through the poller's generic
+    # error arm and, with ping off, became a device_down outage alert for
+    # a device that answered every single request. Cleared by
+    # snmp_verified (alertrules.CLEARS), the pair access_denied/access_ok
+    # make; a state with a real clear, so no auto-resolve.
+    ("device_downgrade", "SNMPv3 replies refused as a downgrade", "device_event", "snmp_downgrade", 3, "event_notice", None, None, 1),
     ("poll_overrun", "Poll taking longer than its interval", "device_event", "poll_overrun", 4, "event_notice", None, None, 1),
     ("mib_missing", "Vendor MIB not uploaded for this device", "device_event", "mib_missing", 6, "event_notice", None, None, 1),
     # A device that answers ping while SNMP fails is invisible to

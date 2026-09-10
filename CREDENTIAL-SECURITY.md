@@ -342,7 +342,13 @@ the privacy password rides the same POST as the auth password (they are
 one record, and a privacy password without an authentication one is not a
 level USM has). Clearing the credential drops both blobs; setting the
 privacy protocol to none drops the privacy blob with it, so a secret
-nobody can use is not kept.
+nobody can use is not kept. For the same reason the API refuses to blank
+the *auth* protocol on a profile, additional credential or device that
+still holds a password: without a protocol nothing can sign, the row
+would derive `noAuthNoPriv` while reporting `has_credential: true`, and
+every poll would be refused before it was sent. On a device a blank
+protocol or username is stored as NULL — "the profile's" — and is refused
+only when the profile has none to lend.
 
 Two honesties about the privacy password's life in memory that the
 authentication password shares and that no earlier edition of this
