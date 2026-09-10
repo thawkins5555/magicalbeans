@@ -219,13 +219,22 @@ def _encrypt_secret(secret: str, unavailable: str) -> bytes:
         secret = None
 
 
+# The names snmpcrypt accepts for a protocol that are not the name it is
+# stored and shown under. "AES128" is net-snmp's spelling of the same
+# cipher, and snmpcrypt takes it so a name copied from an agent's own
+# configuration works — but a row that STORED it was a one-click loss: the
+# form's select has no "AES128" option, so it showed "(none)", and the next
+# Save posted a blank protocol and dropped the privacy blob with it.
+_PRIV_PROTO_ALIASES = {"AES128": "AES"}
+
+
 def _clean_priv_proto(fields: dict) -> None:
     """Validates `v3_priv_proto` in place, if present: blank means none
     (nodesdb drops the privacy blob with it), anything else must be a
-    protocol snmpcrypt speaks. Refused by name rather than stored and
-    refused at poll time, because "DES" typed here and "unsupported" on
-    the device row an hour later is the kind of distance an operator
-    should not have to close."""
+    protocol snmpcrypt speaks, stored under its one canonical name.
+    Refused by name rather than stored and refused at poll time, because
+    "DES" typed here and "unsupported" on the device row an hour later is
+    the kind of distance an operator should not have to close."""
     from .. import snmpcrypt
 
     if "v3_priv_proto" not in fields:
@@ -236,18 +245,66 @@ def _clean_priv_proto(fields: dict) -> None:
             f"The privacy protocol must be AES (AES-128-CFB); {proto!r} is "
             f"not supported — DES is not offered, and AES-192/256 need a key "
             f"extension no RFC defines")
-    fields["v3_priv_proto"] = proto or None
+    fields["v3_priv_proto"] = _PRIV_PROTO_ALIASES.get(proto, proto) or None
+
+
+def _refuse_orphaned_v3_secret(fields: dict, row) -> None:
+    """Refuses a profile or additional-credential write that blanks
+    `v3_auth_proto` while the row still holds an SNMPv3 password.
+    security_level needs the protocol AND the password to sign, so the row
+    would derive noAuthNoPriv and every poll would be refused before it
+    was sent — with the JSON still saying has_credential: true, a
+    credential that exists and can never work. Profile rows only: on a
+    device NULL means "inherit the profile's", which is a working state.
+    The form offers no blank protocol, so this is reachable by API alone,
+    and refusing it is cheaper than a stored secret nobody can use."""
+    if "v3_auth_proto" not in fields:
+        return
+    if str(fields["v3_auth_proto"] or "").strip():
+        return
+    if row["v3_auth_pass_enc"] or row["v3_priv_pass_enc"]:
+        raise ValueError(
+            "An SNMPv3 password is stored for this credential, and it cannot "
+            "be used without an auth protocol. Keep the auth protocol, or "
+            "clear the stored credential first.")
+
+
+# The wireless poller speaks authNoPriv at most (fortipoll's docstring), so
+# a privacy field for a controller is refused — on every route that could
+# carry one. The credential POST refused it from the start; the controller
+# add and edit routes allow-list-dropped the same two keys and answered
+# {"ok": true}, which is the "stored and never sent" this sentence exists
+# to prevent, worn as a success.
+_PRIVACY_UNSUPPORTED = (
+    "A privacy password is not supported for this credential: only "
+    "Nodes devices and polling profiles can be polled at authPriv. "
+    "Leave the privacy fields empty, or give this user an authNoPriv "
+    "view on the device.")
+
+
+def _refuse_controller_privacy(body: dict) -> None:
+    """ValueError for a controller body carrying a privacy protocol or
+    password — a value, not the key: the Nodes form always posts the key
+    as null, and null is nothing to refuse."""
+    if body.get("v3_priv_proto") or body.get("v3_priv_pass"):
+        raise ValueError(_PRIVACY_UNSUPPORTED)
 
 
 def _v3_fields(body: dict, *, allow_priv: bool) -> tuple[str, str, str, str | None, str | None]:
     """(user, auth_proto, password, priv_proto, priv_password) from an
     SNMPv3 credential body — the first three required, since a v3
-    credential is meaningless without them; the privacy pair optional, and
-    only ever both or neither, since a privacy password without a protocol
-    cannot be used and a protocol without a password is a promise the
-    poller cannot keep. A caller that cannot poll at authPriv passes
-    allow_priv=False and a typed privacy password is refused in words —
-    the wireless poller — rather than stored and ignored."""
+    credential is meaningless without them; the privacy pair optional. A
+    privacy password needs a protocol beside it, since without one it
+    cannot be used. A protocol WITHOUT a password is accepted, on purpose:
+    that is the form's "stored — leave blank to keep", an operator
+    re-typing the auth password without losing the privacy one, and the
+    store's COALESCE keeps the old blob. On a row with no privacy blob the
+    same body stores the protocol alone and derives authNoPriv, which
+    _store_v3_credential reports as a warning rather than refuses, because
+    refusing it would break the re-type. A caller that cannot poll at
+    authPriv passes allow_priv=False and a typed privacy password is
+    refused in words — the wireless poller — rather than stored and
+    ignored."""
     user = str(body.get("v3_user", "")).strip()
     password = str(body.get("v3_auth_pass", ""))
     auth_proto = str(body.get("v3_auth_proto", "")).strip()
@@ -258,18 +315,15 @@ def _v3_fields(body: dict, *, allow_priv: bool) -> tuple[str, str, str, str | No
     _clean_priv_proto(fields)
     priv_proto = fields["v3_priv_proto"]
     if not allow_priv and (priv_password or priv_proto):
-        raise ValueError(
-            "A privacy password is not supported for this credential: only "
-            "Nodes devices and polling profiles can be polled at authPriv. "
-            "Leave the privacy fields empty, or give this user an authNoPriv "
-            "view on the device.")
+        raise ValueError(_PRIVACY_UNSUPPORTED)
     if priv_password and not priv_proto:
         raise ValueError("A privacy protocol (AES) is required with a privacy password")
     return user, auth_proto, password, priv_proto, (priv_password or None)
 
 
 def _store_v3_credential(service, params, body, *, store, category, message,
-                         target, unavailable, allow_priv: bool = True) -> dict:
+                         target, unavailable, allow_priv: bool = True,
+                         priv_stored: bool = False) -> dict:
     """Store one SNMPv3 credential: validate the body, encrypt the password
     (and the privacy password, if one was typed), hand them to `store`,
     then log and audit it.
@@ -281,6 +335,12 @@ def _store_v3_credential(service, params, body, *, store, category, message,
     the form's "blank to keep"; without it, the three-argument shape the
     wireless controller store has always had, and a privacy field in the
     body is a ValueError before anything is encrypted.
+
+    `priv_stored` is whether the row already holds a privacy blob. A
+    protocol with no typed privacy password is "keep the stored one" when
+    there is one; when there is not, the row ends up at authNoPriv with a
+    protocol that promises more, and the answer carries a `warning` saying
+    so — the one case where "blank keeps" keeps nothing.
     """
     user, auth_proto, password, priv_proto, priv_password = _v3_fields(
         body, allow_priv=allow_priv)
@@ -304,7 +364,13 @@ def _store_v3_credential(service, params, body, *, store, category, message,
            detail=f"SNMPv3 user {user}"
                   + (f" with a {priv_proto} privacy password (authPriv)"
                      if priv_encrypted else ""))
-    return {"ok": True}
+    result = {"ok": True}
+    if priv_proto and not priv_encrypted and not priv_stored:
+        result["warning"] = (
+            f"Stored the auth password only: {priv_proto} is set as the "
+            "privacy protocol but no privacy password was typed and none "
+            "was stored, so this credential is authNoPriv until one is.")
+    return result
 
 
 def _clear_credential(service, params, *, clear, category, message=None,
@@ -4975,12 +5041,19 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
         identity = None
     auth_proto = body.get("v3_auth_proto") or config.get("v3_auth_proto")
     password = body.get("v3_auth_pass")
-    # The privacy pair follows the auth pair's rule exactly: typed wins,
-    # stored is the fallback, and "v3_priv_pass" present-but-empty means
-    # "test without one" rather than "use the stored one". A blank protocol
-    # typed into the form means no privacy, whatever is stored.
-    priv_fields = {"v3_priv_proto": body["v3_priv_proto"]} if "v3_priv_proto" in body \
-        else {"v3_priv_proto": config.get("v3_priv_proto")}
+    # The privacy pair follows the auth pair's rule exactly, including for
+    # the protocol: typed wins, the resolved config is the fallback, and a
+    # null or blank protocol is "(profile)" — the edit form posts every
+    # override key on every Test, null for each left at "(profile)", the
+    # same body Save sends. Reading present-but-null as "no privacy" tested
+    # a device inheriting an authPriv profile at authNoPriv, and against
+    # the PAN-OS box this release exists for the Test button answered
+    # unsupportedSecLevels with advice to set a privacy password that was
+    # already set, while the scheduled poll succeeded. Only the PASSWORD
+    # has a "present-but-empty means test without one" reading, because
+    # that is the one field the form cannot say "inherit" for.
+    priv_fields = {"v3_priv_proto": body.get("v3_priv_proto")
+                   or config.get("v3_priv_proto")}
     _clean_priv_proto(priv_fields)
     priv_proto = priv_fields["v3_priv_proto"]
     priv_password = body.get("v3_priv_pass")
@@ -5424,8 +5497,13 @@ def get_nodes_device_events(service, params, body, device_id) -> dict:
 
 def post_nodes_device_credential(service, params, body, device_id) -> dict:
     row = _require(service.nodes_db.device(device_id), "device")
+    # The EFFECTIVE blob, not the row's: a device with none of its own
+    # under a profile that holds one polls at authPriv, and warning it
+    # about a privacy password it inherits would be the Test button's
+    # old contradiction again.
+    priv_stored = bool(service.nodes_db.effective_config(row).get("v3_priv_pass_enc"))
     return _store_v3_credential(
-        service, params, body,
+        service, params, body, priv_stored=priv_stored,
         store=functools.partial(service.nodes_db.set_device_credential, device_id),
         category=NODES_CATEGORY,
         message=f"Stored an SNMPv3 credential for {row['ip']}",
@@ -5510,6 +5588,7 @@ def put_nodes_group(service, params, body, group_id) -> dict:
     before = _require(service.nodes_db.group(group_id), "polling profile")
     fields = _pick(body, _GROUP_EDITABLE_BODY)
     _clean_priv_proto(fields)
+    _refuse_orphaned_v3_secret(fields, before)
     service.nodes_db.update_group(group_id, **fields)
     detail = _audit_diff(before, fields)
     if detail:
@@ -5541,7 +5620,7 @@ def post_nodes_group_default(service, params, body, group_id) -> dict:
 def post_nodes_group_credential(service, params, body, group_id) -> dict:
     row = _require(service.nodes_db.group(group_id), "polling profile")
     return _store_v3_credential(
-        service, params, body,
+        service, params, body, priv_stored=bool(row["v3_priv_pass_enc"]),
         store=functools.partial(service.nodes_db.set_group_credential, group_id),
         category=NODES_CATEGORY,
         message=f"Stored an SNMPv3 credential for profile {row['name']}",
@@ -5587,6 +5666,7 @@ def put_nodes_group_credential(service, params, body, group_id, credential_id) -
                     "credential")
     fields = _pick(body, _GROUP_CREDENTIAL_EDITABLE)
     _clean_priv_proto(fields)
+    _refuse_orphaned_v3_secret(fields, cred)
     service.nodes_db.update_group_credential(credential_id, **fields)
     return {"ok": True}
 
@@ -5604,7 +5684,7 @@ def post_nodes_group_credential_secret(service, params, body, group_id, credenti
     cred = _require(cred if cred and cred["group_id"] == int(group_id) else None,
                     "credential")
     return _store_v3_credential(
-        service, params, body,
+        service, params, body, priv_stored=bool(cred["v3_priv_pass_enc"]),
         store=functools.partial(service.nodes_db.set_group_credential_password,
                                 credential_id),
         category=NODES_CATEGORY,
@@ -7245,6 +7325,7 @@ def post_wireless_controller(service, params, body) -> dict:
     ip = str(body.get("ip", "")).strip()
     if not name or not ip:
         raise ValueError("A name and IP address are required")
+    _refuse_controller_privacy(body)
     overrides = {k: v for k, v in body.items() if k in _CONTROLLER_EDITABLE_BODY
                 and k not in ("name", "ip", "enabled")}
     controller_id = service.wireless_db.add_controller(name, ip, **overrides)
@@ -7254,6 +7335,7 @@ def post_wireless_controller(service, params, body) -> dict:
 
 def put_wireless_controller(service, params, body, controller_id) -> dict:
     existing = _require(service.wireless_db.controller(controller_id), "controller")
+    _refuse_controller_privacy(body)
     fields = _pick(body, _CONTROLLER_EDITABLE_BODY)
     # Same rule as the DHCP server above: the stored SNMPv3 password was
     # stored for one controller at one address, so moving the row to a

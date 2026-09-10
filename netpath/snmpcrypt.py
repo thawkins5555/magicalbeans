@@ -99,8 +99,18 @@ def _load_backend():
     try:
         from cryptography.hazmat.decrepit.ciphers.modes import CFB
     except ImportError:
+        # Only the deprecation notice is expected here, so only that
+        # category is silenced: a blanket "ignore" would also hide any
+        # other warning the import raised, and a warning about the
+        # backend is exactly the kind of thing the operator's log should
+        # keep. The category is looked up rather than imported at module
+        # level so a `cryptography` too old to have it still loads.
+        try:
+            from cryptography.utils import CryptographyDeprecationWarning as _deprecation
+        except ImportError:
+            _deprecation = DeprecationWarning
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
+            warnings.simplefilter("ignore", _deprecation)
             from cryptography.hazmat.primitives.ciphers.modes import CFB
     return Cipher, algorithms.AES, CFB
 
@@ -129,7 +139,10 @@ def available(recheck: bool = False) -> bool:
     dies inside the first real cipher call with a pyo3 PanicException —
     which is a BaseException, not an ImportError and not an Exception. So
     this runs a real known-answer encrypt/decrypt and catches BaseException
-    around it, and only then says yes.
+    around it, and only then says yes. Two BaseExceptions are let through:
+    KeyboardInterrupt and SystemExit are the operator or the service
+    stopping the process, not a verdict about the backend, and swallowing
+    either would turn Ctrl-C during worker start into "AES unavailable".
 
     Cached and lock-guarded for the reason configrx.paramiko_available is:
     the verdict is read on hot paths (every authPriv exchange, the
@@ -145,6 +158,8 @@ def available(recheck: bool = False) -> bool:
                 backend = _load_backend()
                 _self_test(backend)
                 _backend, _status = backend, (True, "")
+            except (KeyboardInterrupt, SystemExit):
+                raise
             except BaseException as exc:      # noqa: BLE001 — see docstring
                 _backend = None
                 _status = (False, f"{type(exc).__name__}: {exc}"[:200])
@@ -196,11 +211,23 @@ def iv_for(engine_boots: int, engine_time: int, salt: bytes) -> bytes:
     big-endian) || snmpEngineTime (4 bytes, big-endian) || salt (8 bytes),
     and that same salt travels in the clear as msgPrivacyParameters. Both
     integers are masked to 32 bits the way the wire field is, so an engine
-    whose counters have wrapped still yields the IV the agent computes."""
+    whose counters have wrapped still yields the IV the agent computes.
+
+    A boots or time that is not a number is a PrivError like every other
+    refusal here, not the TypeError int() would raise: the callers catch
+    PrivError and classify it as an SNMP failure, and anything else would
+    escape a poll's error handling. Nothing hands this a None today — the
+    engine cache and discovery always carry ints — which is exactly why it
+    must not be the one exception type the poll loop cannot survive."""
     if len(salt) != SALT_LEN:
         raise PrivError(f"privacy salt must be {SALT_LEN} bytes, got {len(salt)}")
-    return struct.pack(">II", int(engine_boots) & 0xFFFFFFFF,
-                       int(engine_time) & 0xFFFFFFFF) + salt
+    try:
+        boots, seconds = int(engine_boots), int(engine_time)
+    except (TypeError, ValueError) as exc:
+        raise PrivError(
+            f"engineBoots/engineTime must be integers to build the IV, got "
+            f"{type(engine_boots).__name__}/{type(engine_time).__name__}") from exc
+    return struct.pack(">II", boots & 0xFFFFFFFF, seconds & 0xFFFFFFFF) + salt
 
 
 def _check_key(priv_key: bytes) -> None:

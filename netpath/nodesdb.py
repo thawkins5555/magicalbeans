@@ -2219,16 +2219,36 @@ class NodesDatabase(SqliteStore):
         columns — always present, unconditionally tried first) followed by
         every row in group_credentials, in the order they were added. A
         device with no profile at all falls back to a bare v2c/public
-        guess, matching the Default profile's own seeded values."""
+        guess, matching the Default profile's own seeded values.
+
+        The single candidate is the device's non-NULL columns laid over the
+        profile's primary, not the device's columns alone. An override is
+        partial far more often than not — the edit form's every credential
+        field has a "(profile)" choice, and "AES" picked with user, auth
+        and version all left at "(profile)" is a legitimate answer — and
+        the bare columns carried `snmp_version: None` into the poll, where
+        `int(None)` is a TypeError rather than an SnmpError: it escaped the
+        poll's error handling, record_poll never ran, and that device's
+        status froze at whatever it last was, for good. Merging here is
+        also what makes this agree with effective_config(), which has
+        always resolved a NULL column to the profile's, so the device
+        page, the Test button and the poll read one credential rather than
+        two that differ on privacy."""
         keys = self._CREDENTIAL_KEYS
-        if any(device_row[k] is not None for k in keys if k in device_row.keys()):
-            return [{k: device_row[k] if k in device_row.keys() else None for k in keys}]
         group_row = self.group(device_row["group_id"]) if device_row["group_id"] else None
         if group_row is None:
-            return [{"snmp_version": 1, "community": "public", "v3_user": None,
-                     "v3_auth_proto": None, "v3_auth_pass_enc": None,
-                     "v3_priv_proto": None, "v3_priv_pass_enc": None}]
-        candidates = [{k: group_row[k] for k in keys}]
+            primary = {"snmp_version": 1, "community": "public", "v3_user": None,
+                       "v3_auth_proto": None, "v3_auth_pass_enc": None,
+                       "v3_priv_proto": None, "v3_priv_pass_enc": None}
+        else:
+            primary = {k: group_row[k] for k in keys}
+        own = {k: device_row[k] for k in keys
+               if k in device_row.keys() and device_row[k] is not None}
+        if own:
+            return [{**primary, **own}]
+        if group_row is None:
+            return [primary]
+        candidates = [primary]
         candidates.extend({k: row[k] for k in keys}
                           for row in self.group_credentials(group_row["id"]))
         return candidates
