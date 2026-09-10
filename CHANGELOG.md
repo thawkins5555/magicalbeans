@@ -220,6 +220,60 @@ timing barely moves, and that is not modesty: every route in that harness
 sits on a fixed ~44 ms keep-alive floor that has nothing to do with this
 work.
 
+**The fleet no longer arrives at the pollers all at once.** Per-device due
+times were seeded from each device's own last poll, which is restart-safe only
+while the service was down for less than one poll interval. Past that — any
+real outage, a bulk import, a fresh install — every device is overdue the
+moment the scheduler starts, and the whole fleet lands in a single pass.
+
+The worse half was that it never recovered. Every device that came due in the
+same pass was given the *same* next due time, computed from one timestamp
+taken once per pass, so a fleet that started in step stayed in step for the
+life of the process. The autoscaler's own notes had conceded this for some
+time: "a fleet whose devices share a due-time phase is saturated in bursts by
+design."
+
+Two spreads, both of which only ever move a poll *earlier*, so nothing is
+polled less often than its profile says. A device already overdue when the
+scheduler starts is given a moment inside the next half minute instead of
+firing immediately. And each device's first reschedule after that is pulled
+somewhere into the second half of its interval, once — which breaks the shared
+phase permanently, since from then on every device counts its own interval
+from its own moment. A device that has never been polled at all still polls on
+the next pass, unspread: adding a device should feel instant, and it does.
+
+Measured on 300 devices at a 15-second interval with 32 workers, restarting
+against poll times two intervals stale — the shape a service restart actually
+leaves behind:
+
+| | before | after |
+| --- | --- | --- |
+| Lateness against schedule, p50 | 2.93 s | 0.04 s |
+| p95 | 19.03 s | 0.96 s |
+| worst | 21.43 s | 1.68 s |
+| Peak submissions per cycle | 300 / 300 / 300 / 300 | 37 / 38 / 26 / 26 |
+| Queue depth, p95 | 220 | 4 |
+| Pool saturated | 43% of the run | 11% |
+
+The four per-cycle figures are the point. Before, the entire fleet was
+submitted at once on every single cycle, forever. After, it is spread and
+stays spread.
+
+**What it costs, stated plainly:** the first poll after a restart now takes
+longer to come round. Mean time to first poll goes from 2.26 s to 7.94 s and
+the slowest device from 6.43 s to 15.76 s. That is the trade — a burst that
+saturates the pool, exchanged for a bounded delay of at most half a minute —
+and an operator restarting the service should expect the first sweep to take
+that long rather than wonder what is wrong.
+
+Two smaller notes for completeness. On a pool that is genuinely
+oversubscribed (the same fleet on 8 workers, needing 20), nothing here helps
+and nothing is meant to: every poll is late because there are not enough
+workers, which is what the pool autoscaler is for. And the spread costs one
+extra poll per device, once, which on a saturated pool can log a single
+`poll_overrun` for a device whose previous poll had not finished; devices with
+a poll still in flight are left alone specifically to keep that rare.
+
 **You can see which devices override their polling profile.** A device column
 left empty means "inherit from the profile"; filled in means this device
 disagrees. Twenty-five columns work that way, and until now the only way to
