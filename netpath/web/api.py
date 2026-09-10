@@ -9428,6 +9428,11 @@ DASHBOARD_METRICS = (
 )
 
 DASHBOARD_OFFENDER_N = 10
+DASHBOARD_OFFENDER_WINDOW_S = 86400.0
+# Matches STATE_COUNTS_TTL_S: a single tab at dashboard_refresh_s loses no
+# freshness; N tabs cost one compute.
+DASHBOARD_TTL_S = 2.0
+DASHBOARD_OFFENDERS_TTL_S = 30.0    # against the 60 s client cadence
 
 
 def _dash_can(service, params, module: str) -> bool:
@@ -9435,57 +9440,99 @@ def _dash_can(service, params, module: str) -> bool:
     return _permissions.allows(granted.get(module), _permissions.READ)
 
 
+def _dashboard_section(service, key: str, ttl_s: float, compute):
+    # cached_poll hands one object to every caller; deep-copied so no
+    # response ever holds cached structure (tests/test_state_cache.py).
+    return copy.deepcopy(service.cached_poll(key, ttl_s, compute))
+
+
+def _dashboard_fleet(service) -> dict:
+    poller = service.node_poller
+    # pool_state() separates busy from queued; the old gauge added them
+    # together against the pool size and read "48 of 32 busy".
+    pool = poller.pool_state() if hasattr(poller, "pool_state") else {}
+    counts, planned = _fleet_counts(service)
+    # Named here rather than in the browser: nodes.js's displayName is
+    # private to that module, so the tile would otherwise print the raw
+    # `name` column — which is the IP again for a device nobody renamed.
+    # Capped like the offender lists, with the remainder carried so the
+    # tile can say how many it is not showing rather than imply there are
+    # only ten.
+    down_total = service.nodes_db.devices_count(status="down", exclude_ids=planned)
+    down = [{"device_id": row["id"],
+             "name": namelookup.device_name(row) or row["ip"],
+             "ip": row["ip"]}
+            for row in service.nodes_db.devices(status="down", exclude_ids=planned,
+                                                limit=DASHBOARD_OFFENDER_N)]
+    return {
+        "counts": counts,
+        "running": poller.running,
+        "pool": dict(pool or {}),
+        "down": down,
+        "down_more": max(0, down_total - len(down)),
+    }
+
+
+def _dashboard_alerts(service) -> dict:
+    summary = service.alerts_db.open_summary()
+    return {
+        "open": summary.get("open", 0),
+        "acked": summary.get("acked", 0),
+        # Coloured by the worst open severity, never the total: one
+        # severity-1 outage must not hide behind forty severity-6 notices.
+        "worst": summary.get("worst"),
+        "by_severity": service.alerts_db.open_counts_by_severity(),
+        # A GROUP BY has no cap; the key stays because dashboard.js reads it.
+        "counted_capped": False,
+        "engine_running": service.alert_engine.running,
+        "counters": dict(service.alert_engine.counters or {}),
+    }
+
+
+def _dashboard_storage(service) -> list[dict]:
+    # Headroom, not raw sizes: "which database is closest to its cap" is
+    # the question, and it is answered worst-first.
+    settings = service.settings or {}
+    stores = []
+    # STORES, not a list of its own: this one was hand-written beside
+    # _storage's and mapper.db went into that one and not this one, so
+    # two views of the same question disagreed about how many databases
+    # exist. A store with no cap reports its size with no fraction
+    # rather than 0% used.
+    for store in STORES:
+        db = db_for(service, store)
+        if db is None:
+            continue
+        try:
+            used = int(db.size_bytes())
+        except Exception:                                 # noqa: BLE001
+            continue
+        cap_mb = settings.get(store.cap_key) if store.cap_key else None
+        cap = int(cap_mb) * 1024 * 1024 if cap_mb else None
+        stores.append({
+            "label": store.label, "bytes": used, "cap_bytes": cap,
+            "used_fraction": (used / cap) if cap else None,
+        })
+    stores.sort(key=lambda s: (s["used_fraction"] is None,
+                               -(s["used_fraction"] or 0)))
+    return stores
+
+
 def get_dashboard(service, params, body) -> dict:
-    """The cross-module numbers the tile grid shows, in one round trip."""
+    """The cross-module numbers the tile grid shows, in one round trip.
+    Each section is cached under its own key and assembled into a fresh
+    dict only for a caller that may read its module."""
     result: dict = {}
 
     if _dash_can(service, params, "nodes"):
-        poller = service.node_poller
-        # pool_state() separates busy from queued; the old gauge added them
-        # together against the pool size and read "48 of 32 busy".
-        pool = poller.pool_state() if hasattr(poller, "pool_state") else {}
-        # Named here rather than in the browser: nodes.js's displayName is
-        # private to that module, so the tile would otherwise print the raw
-        # `name` column — which is the IP again for a device nobody renamed.
-        # Capped like the offender lists, with the remainder carried so the
-        # tile can say how many it is not showing rather than imply there are
-        # only ten.
-        down_total = service.nodes_db.devices_count(status="down")
-        down = [{"device_id": row["id"],
-                 "name": namelookup.device_name(row) or row["ip"],
-                 "ip": row["ip"]}
-                for row in service.nodes_db.devices(status="down",
-                                                    limit=DASHBOARD_OFFENDER_N)]
-        result["fleet"] = {
-            "counts": service.nodes_db.device_counts(),
-            "running": poller.running,
-            "pool": pool,
-            "down": down,
-            "down_more": max(0, down_total - len(down)),
-        }
+        result["fleet"] = _dashboard_section(
+            service, "dashboard_fleet", DASHBOARD_TTL_S,
+            lambda: _dashboard_fleet(service))
 
     if _dash_can(service, params, "alerts"):
-        summary = service.alerts_db.open_summary()
-        # One severity-1 outage must never be hidden behind forty severity-6
-        # notices, so the tile is coloured by the worst open severity and
-        # broken down by severity rather than shown as one total. The
-        # breakdown is counted from the open rows up to a bound, and says
-        # when the bound is what answered.
-        by_severity: dict[str, int] = {}
-        rows = service.alerts_db.alerts(state="unresolved",
-                                        limit=ALERT_TOTAL_CAP + 1)
-        for row in rows[:ALERT_TOTAL_CAP]:
-            key = str(row["severity"])
-            by_severity[key] = by_severity.get(key, 0) + 1
-        result["alerts"] = {
-            "open": summary.get("open", 0),
-            "acked": summary.get("acked", 0),
-            "worst": summary.get("worst"),
-            "by_severity": by_severity,
-            "counted_capped": len(rows) > ALERT_TOTAL_CAP,
-            "engine_running": service.alert_engine.running,
-            "counters": service.alert_engine.counters,
-        }
+        result["alerts"] = _dashboard_section(
+            service, "dashboard_alerts", DASHBOARD_TTL_S,
+            lambda: _dashboard_alerts(service))
 
     # Every background process, each by the noun its own tab uses for it.
     collectors = []
@@ -9510,34 +9557,68 @@ def get_dashboard(service, params, body) -> dict:
         result["collectors"] = collectors
 
     if _dash_can(service, params, "settings"):
-        # Headroom, not raw sizes: "which database is closest to its cap" is
-        # the question, and it is answered worst-first.
-        settings = service.settings or {}
-        stores = []
-        # STORES, not a list of its own: this one was hand-written beside
-        # _storage's and mapper.db went into that one and not this one, so
-        # two views of the same question disagreed about how many databases
-        # exist. A store with no cap reports its size with no fraction
-        # rather than 0% used.
-        for store in STORES:
-            db = db_for(service, store)
-            if db is None:
-                continue
-            try:
-                used = int(db.size_bytes())
-            except Exception:                                 # noqa: BLE001
-                continue
-            cap_mb = settings.get(store.cap_key) if store.cap_key else None
-            cap = int(cap_mb) * 1024 * 1024 if cap_mb else None
-            stores.append({
-                "label": store.label, "bytes": used, "cap_bytes": cap,
-                "used_fraction": (used / cap) if cap else None,
-            })
-        stores.sort(key=lambda s: (s["used_fraction"] is None,
-                                   -(s["used_fraction"] or 0)))
-        result["storage"] = stores
+        result["storage"] = _dashboard_section(
+            service, "dashboard_storage", DASHBOARD_TTL_S,
+            lambda: _dashboard_storage(service))
 
     return {"dashboard": result}
+
+
+def _offender_rows(rows, n: int, value_key: str, unit: str) -> list[dict]:
+    out = []
+    for row in rows[:n]:
+        # namelookup.device_name mirrors Nodes' own display precedence;
+        # row["name"] alone equals the IP for a device nobody has
+        # renamed. A row without sys_name in its keys falls back to
+        # the raw name.
+        keys = row.keys()
+        name = (namelookup.device_name(row) if "sys_name" in keys else row["name"])
+        out.append({"device_id": row["device_id"],
+                    "name": name or row["ip"],
+                    "ip": row["ip"],
+                    "value": row[value_key],
+                    "unit": unit})
+    return out
+
+
+def _offender_node_lists(service, since: float, n: int) -> tuple[list, list]:
+    """(the two event lists, the metric lists) — the alerts list sits
+    between them in the response and is gated separately."""
+    events = service.nodes_db.count_events_by_device(since, limit=n)
+    # Interface flaps are device events too, and they are the ones an
+    # operator chases; kept as their own list rather than folded into the
+    # count above, which would hide a flapping port behind a noisy device.
+    flaps = service.nodes_db.count_events_by_device(
+        since, kinds=["interface_down", "interface_up", "interface_flapping"],
+        limit=n)
+    head = [
+        {"key": "events", "title": "Most device events (24 h)",
+         "unit": "", "rows": _offender_rows(events, n, "n", "")},
+        {"key": "interface_events", "title": "Most interface events (24 h)",
+         "unit": "", "rows": _offender_rows(flaps, n, "n", "")},
+    ]
+    tail = []
+    for key, metric, title, unit, ascending in DASHBOARD_METRICS:
+        rows = service.nodes_db.top_metric(metric, n, ascending=ascending)
+        tail.append({"key": key, "title": title, "unit": unit,
+                     "rows": _offender_rows(rows, n, "last_value", unit)})
+    return head, tail
+
+
+def _offender_alert_list(service, since: float, n: int) -> dict:
+    counts: dict[str, dict] = {}
+    for row in service.alerts_db.alerts(t0=since, limit=ALERT_TOTAL_CAP):
+        if row["entity_kind"] != "device":
+            continue
+        key = str(row["entity_id"])
+        entry = counts.setdefault(
+            key, {"device_id": _int_or_none(row["entity_id"]),
+                  "name": row["entity_label"] or key, "ip": "",
+                  "value": 0, "unit": ""})
+        entry["value"] += 1
+    ranked = sorted(counts.values(), key=lambda e: -e["value"])[:n]
+    return {"key": "alerts", "title": "Most alerts (24 h)",
+            "unit": "", "rows": ranked}
 
 
 def get_dashboard_offenders(service, params, body) -> dict:
@@ -9549,60 +9630,29 @@ def get_dashboard_offenders(service, params, body) -> dict:
     if not _dash_can(service, params, "nodes"):
         raise PermissionError("Reading devices is not permitted")
 
-    window_s = _num(params, "window_s", 86400.0) or 86400.0
+    window_s = _num(params, "window_s", DASHBOARD_OFFENDER_WINDOW_S) or DASHBOARD_OFFENDER_WINDOW_S
     since = time.time() - float(window_s)
     n = int(_num(params, "n", DASHBOARD_OFFENDER_N, int) or DASHBOARD_OFFENDER_N)
     n = max(1, min(n, 50))
+    # Only the shape dashboard.js asks for is cached: _poll_cache never
+    # evicts, so caller-chosen window_s/n must not become keys.
+    cached = window_s == DASHBOARD_OFFENDER_WINDOW_S and n == DASHBOARD_OFFENDER_N
 
-    def _rows(rows, value_key, unit):
-        out = []
-        for row in rows[:n]:
-            # namelookup.device_name mirrors Nodes' own display precedence;
-            # row["name"] alone equals the IP for a device nobody has
-            # renamed. A row without sys_name in its keys falls back to
-            # the raw name.
-            keys = row.keys()
-            name = (namelookup.device_name(row) if "sys_name" in keys else row["name"])
-            out.append({"device_id": row["device_id"],
-                        "name": name or row["ip"],
-                        "ip": row["ip"],
-                        "value": row[value_key],
-                        "unit": unit})
-        return out
-
-    lists = []
-    events = service.nodes_db.count_events_by_device(since)
-    lists.append({"key": "events", "title": "Most device events (24 h)",
-                  "unit": "", "rows": _rows(events, "n", "")})
-
-    # Interface flaps are device events too, and they are the ones an
-    # operator chases; kept as their own list rather than folded into the
-    # count above, which would hide a flapping port behind a noisy device.
-    flaps = service.nodes_db.count_events_by_device(
-        since, kinds=["interface_down", "interface_up", "interface_flapping"])
-    lists.append({"key": "interface_events", "title": "Most interface events (24 h)",
-                  "unit": "", "rows": _rows(flaps, "n", "")})
-
+    if cached:
+        head, tail = _dashboard_section(
+            service, "dashboard_offenders_nodes", DASHBOARD_OFFENDERS_TTL_S,
+            lambda: _offender_node_lists(service, since, n))
+    else:
+        head, tail = _offender_node_lists(service, since, n)
+    lists = list(head)
     if _dash_can(service, params, "alerts"):
-        counts: dict[str, dict] = {}
-        for row in service.alerts_db.alerts(t0=since, limit=ALERT_TOTAL_CAP):
-            if row["entity_kind"] != "device":
-                continue
-            key = str(row["entity_id"])
-            entry = counts.setdefault(
-                key, {"device_id": _int_or_none(row["entity_id"]),
-                      "name": row["entity_label"] or key, "ip": "",
-                      "value": 0, "unit": ""})
-            entry["value"] += 1
-        ranked = sorted(counts.values(), key=lambda e: -e["value"])[:n]
-        lists.append({"key": "alerts", "title": "Most alerts (24 h)",
-                      "unit": "", "rows": ranked})
-
-    for key, metric, title, unit, ascending in DASHBOARD_METRICS:
-        rows = service.nodes_db.top_metric(metric, n, ascending=ascending)
-        lists.append({"key": key, "title": title, "unit": unit,
-                      "rows": _rows(rows, "last_value", unit)})
-
+        if cached:
+            lists.append(_dashboard_section(
+                service, "dashboard_offenders_alerts", DASHBOARD_OFFENDERS_TTL_S,
+                lambda: _offender_alert_list(service, since, n)))
+        else:
+            lists.append(_offender_alert_list(service, since, n))
+    lists.extend(tail)
     return {"window_s": window_s, "lists": lists}
 
 
