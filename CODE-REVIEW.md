@@ -74,7 +74,7 @@ frontend modules) are complete; every finding marked *Fixed* below landed with i
 | POLL-F4 | medium | security | A v3 reply's `msgID` is discarded, so a spoofed Report installs a chosen engine id | `netpath/snmppoll.py:425` | Fixed |
 | POLL-F5 | medium | performance | `_poll_interfaces` opens one socket and one credential decrypt per interface | `netpath/nodepoll.py:4438`, `:4516` | Fixed |
 | POLL-F6 | medium | correctness, design | `_poll_custom_mib` GETs every object at once, so an auto-assigned MIB yields nothing | `netpath/nodepoll.py:4360` | Fixed |
-| DATA-F5 | medium | correctness | Ten search paths pass operator text into LIKE without escaping `%` and `_` | `netpath/nodesdb.py:1688`, +9 sites | Fixed |
+| DATA-F5 | medium | correctness | Ten search paths pass operator text into LIKE without escaping `%` and `_` | `netpath/nodesdb.py:1688`, +9 sites | Fixed (the two `snmptrapdb` sites in 5.11.0) |
 | DATA-F6 | medium | design | The four stores holding operator credentials run `synchronous=NORMAL` | `netpath/sqlitebase.py:414` | Fixed |
 | ALRT-F5 | medium | security | ConfigRX redaction leaves SNMP communities in the clear for Siemens and Ubiquiti | `netpath/configrx_redact.py:21` | Fixed |
 | ALRT-F6 | medium | performance | `_evaluate_dhcp_thresholds` reads every DHCP lease every five seconds | `netpath/alertengine.py:1539` | Fixed |
@@ -682,7 +682,7 @@ minutes and the request timed out — next to three sibling buttons that are bat
 
 **DATA-F5 (medium, correctness).** Ten search paths build `f"%{text}%"` from an operator's search
 box and bind it to a bare `LIKE ?` — `nodesdb.py:1688` and `:1768`, `appdb.py:882`,
-`alertsdb.py:1945`, `flowdb.py:936`, `snmptrapdb.py:205`/`:227`, `syslogdb.py:586`/`:664`,
+`alertsdb.py:1945`, `flowdb.py:936`, `snmptrapdb._where`/`_scan_clause`, `syslogdb.py:586`/`:664`,
 `ipamdb.py:791`/`:831` — while `appdb.audit_query` (`:823`) does it correctly with
 `LIKE ? ESCAPE '\'` and the needle escaped. There is no injection, but `_` means "any character"
 and `%` means "anything", so the search answers a different question from the one asked:
@@ -690,7 +690,10 @@ and `%` means "anything", so the search answers a different question from the on
 returned every device. On a fleet where hyphen and underscore conventions coexist, the list is
 quietly wrong at the moment somebody is deciding which switch to walk to. Fixed with
 `like_contains`/`like_prefix` helpers in `sqlitebase.py` and `ESCAPE '\'` on each clause; a typed
-`_` or `%` now matches itself.
+`_` or `%` now matches itself. Eight of the ten shipped in 5.9.1; the trap store's two —
+`_where`'s Source, OID/name and Community filters and `_scan_clause` over `SCAN_COLUMNS` — were
+missed then (this entry's site list pointed at the wrong lines of that file) and shipped in
+5.11.0, covered by the traps section of `tests/test_search_wildcards.py`.
 
 **DATA-F6 (medium, design/durability).** The base pragma set is
 `journal_mode=WAL, synchronous=NORMAL`, overridden to `FULL` in `db.py`, `appdb.py` and

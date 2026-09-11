@@ -9,9 +9,9 @@ single `%` returned the lot.
 
 The stores with a search suite of their own are covered there
 (test_device_search_fields, test_ipam_dhcp_search, test_syslog_search); this
-suite covers the rest — the reverse-DNS cache, the Alerts list filter and the
-NetFlow record filter — and the shared helper all of them now build the
-needle with.
+suite covers the rest — the reverse-DNS cache, the Alerts list filter, the
+NetFlow record filter and the trap store's own filters and free-text scan —
+and the shared helper all of them now build the needle with.
 """
 import os
 import time
@@ -21,6 +21,7 @@ import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 from netpath.alertsdb import AlertsDatabase
 from netpath.appdb import AppDatabase
 from netpath.flowdb import FlowDatabase
+from netpath.snmptrapdb import SnmpTrapDatabase
 from netpath.sqlitebase import LIKE_ESCAPE, like_contains, like_prefix
 
 TMP = _paths.tmpdir("search_wildcards_")
@@ -144,6 +145,59 @@ check("the destination half is escaped too",
       where.count(LIKE_ESCAPE) == 1 and params[-1] == r"%192.168.0.1\_%",
       (where, params))
 flow_db.close()
+
+# ------------------------------- 5. snmptrapdb's filters and free-text scan
+
+trap_db = SnmpTrapDatabase(os.path.join(TMP, "traps.db"))
+with trap_db._lock:
+    trap_db._conn.executemany(
+        "INSERT INTO traps(ts, source, version, community, engine_id,"
+        " security, auth_state, trap_oid, trap_name, trap_kind, severity,"
+        " generic, specific, enterprise, agent_addr, uptime, is_inform,"
+        " varbind_n, varbinds, varbind_text, raw_len, raw)"
+        " VALUES (?,?,1,?,'','','',?,?,'linkDown',4,0,0,'','',0,0,0,'[]',?,"
+        "0,NULL)",
+        [(now - 10, "core-sw-2", "pub-lic", "1.3.6.1.2.1", "linkDown",
+          "ifDescr Gi1/0/1"),
+         (now - 10, "core_sw_2", "pub_lic", "1.3.6.1.4.1", "coldStart",
+          "ifDescr Gi2/0/1")])
+    trap_db._conn.commit()
+
+
+def trap_sources(filters):
+    return sorted(row["source"] for row in
+                  trap_db.search(now - 60, now + 60, filters))
+
+
+check("an underscore in the trap Source filter is an underscore",
+      trap_sources({"source": "core_sw"}) == ["core_sw_2"],
+      trap_sources({"source": "core_sw"}))
+check("a per-cent sign in the trap Source filter is not every trap",
+      trap_sources({"source": "%"}) == [], trap_sources({"source": "%"}))
+check("the hyphenated source is still found by its own text",
+      trap_sources({"source": "core-sw"}) == ["core-sw-2"],
+      trap_sources({"source": "core-sw"}))
+check("the trap Community filter escapes too",
+      trap_sources({"community": "pub_lic"}) == ["core_sw_2"],
+      trap_sources({"community": "pub_lic"}))
+check("...and a lone per-cent there matches nothing",
+      trap_sources({"community": "%"}) == [], trap_sources({"community": "%"}))
+check("the trap OID/name filter escapes both of its halves",
+      trap_sources({"oid": "%"}) == [], trap_sources({"oid": "%"}))
+check("...while a real OID fragment still matches",
+      trap_sources({"oid": "1.3.6.1.2"}) == ["core-sw-2"],
+      trap_sources({"oid": "1.3.6.1.2"}))
+check("the free-text scan across every trap column escapes each term",
+      trap_sources({"text": "core_sw"}) == ["core_sw_2"],
+      trap_sources({"text": "core_sw"}))
+check("...and a bare per-cent typed into it returns nothing",
+      trap_sources({"text": "%"}) == [], trap_sources({"text": "%"}))
+where, params = trap_db._where(0, 1, {"source": "a_b"})
+check("the trap where-clause carries the escape once per LIKE",
+      where.count(LIKE_ESCAPE) == 1 and params[-1] == r"%a\_b%",
+      (where, params))
+trap_db.close()
+
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")

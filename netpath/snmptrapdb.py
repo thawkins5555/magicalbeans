@@ -12,7 +12,7 @@ import logging
 import sqlite3
 import time
 
-from .sqlitebase import SqliteStore
+from .sqlitebase import LIKE_ESCAPE, SqliteStore, like_contains
 
 log = logging.getLogger(__name__)
 
@@ -442,15 +442,16 @@ class SnmpTrapDatabase(SqliteStore):
             clauses.append("trap_kind = ?")
             params.append(filters["kind"])
         if filters.get("source"):
-            clauses.append("source LIKE ?")
-            params.append(f"%{filters['source']}%")
+            clauses.append(f"source LIKE ? {LIKE_ESCAPE}")
+            params.append(like_contains(filters["source"]))
         if filters.get("oid"):
-            clauses.append("(trap_oid LIKE ? OR trap_name LIKE ?)")
-            params.append(f"%{filters['oid']}%")
-            params.append(f"%{filters['oid']}%")
+            clauses.append(f"(trap_oid LIKE ? {LIKE_ESCAPE}"
+                           f" OR trap_name LIKE ? {LIKE_ESCAPE})")
+            params.append(like_contains(filters["oid"]))
+            params.append(like_contains(filters["oid"]))
         if filters.get("community"):
-            clauses.append("community LIKE ?")
-            params.append(f"%{filters['community']}%")
+            clauses.append(f"community LIKE ? {LIKE_ESCAPE}")
+            params.append(like_contains(filters["community"]))
         return " AND ".join(clauses), params
 
     # The columns a free-text search looks in.
@@ -464,8 +465,9 @@ class SnmpTrapDatabase(SqliteStore):
         clauses, params = [], []
         for term in terms:
             clauses.append("(" + " OR ".join(
-                f"{column} LIKE ?" for column in self.SCAN_COLUMNS) + ")")
-            params.extend([f"%{term}%"] * len(self.SCAN_COLUMNS))
+                f"{column} LIKE ? {LIKE_ESCAPE}"
+                for column in self.SCAN_COLUMNS) + ")")
+            params.extend([like_contains(term)] * len(self.SCAN_COLUMNS))
         return " AND ".join(clauses), params
 
     def search(self, t0: float, t1: float, filters: dict, limit: int = 300,

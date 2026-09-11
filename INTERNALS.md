@@ -445,8 +445,11 @@ carrying alone: `like_contains()`/`like_prefix()` escape `\`, `%` and `_` in
 the operator's text and `LIKE_ESCAPE` is the `ESCAPE '\'` clause each must be
 paired with. Every search box in the product feeds `LIKE`, where a typed `_`
 or `%` was a wildcard — `core_sw` matched `core-sw-1` — so `nodesdb`,
-`alertsdb`, `flowdb`, `syslogdb`, `ipamdb`, `configrxdb` and `appdb` all route
-through the two helpers now. `nodesmibdb` is the opposite change: its three
+`alertsdb`, `flowdb`, `syslogdb`, `ipamdb` and `appdb` all route through the
+two helpers now; `snmptrapdb` followed in 5.11.0, its `_where` filters and
+`_scan_clause` having been missed by the first pass. `configrxdb` is not on
+the list because it has no `LIKE` at all — its search is FTS-backed.
+`nodesmibdb` is the opposite change: its three
 vendor-coverage queries dropped `LIKE 'prefix.%'` for `oid >= 'prefix.' AND oid
 < 'prefix/'`, which selects the identical rows (`'/'` is `'.'`+1 and an OID is
 `[0-9.]`) while giving the index both bounds instead of one. That query runs on

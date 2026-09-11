@@ -2718,6 +2718,8 @@ about something going down.
 SQL's own pattern syntax, and every search box in the product feeds one, so
 `core_sw` typed into the Nodes, Alerts, NetFlow, Syslog, IPAM or audit-log
 search matched `core-sw-1` as well. What you type is matched literally now.
+The SNMP Trap list's Source, OID and Community filters and its free-text
+search were left behind by that pass and joined it in 5.11.0.
 
 Because the sending address is indexed with the message, an IP typed into the
 search box finds messages from that device without having to reach for the
