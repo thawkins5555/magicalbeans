@@ -491,6 +491,13 @@ def _learn_prompt(banner: str) -> str:
     return ""
 
 
+# How much of the stream's tail ends a read. A prompt or a pager marker is a
+# few dozen characters, so nothing older than this can decide anything — and
+# the read loops keep exactly this much rather than re-joining the whole
+# capture on every recv, which made a multi-megabyte config O(n^2).
+TAIL_CHARS = 4096
+
+
 def _waiting_at(text: str, needle_re=None, prompt: str = "") -> bool:
     """True when the device has stopped talking and is sitting at `prompt`
     (or at a pager marker matching `needle_re`) waiting for input.
@@ -500,7 +507,7 @@ def _waiting_at(text: str, needle_re=None, prompt: str = "") -> bool:
     the cursor stays on it. A config line that merely reads "switch#" is
     followed by a newline and so never ends the read.
     """
-    tail = _ANSI_RE.sub("", text[-4096:]).replace("\r", "").rstrip(" \t")
+    tail = _ANSI_RE.sub("", text[-TAIL_CHARS:]).replace("\r", "").rstrip(" \t")
     if not tail or tail.endswith("\n"):
         return False
     if needle_re is not None:
@@ -529,6 +536,7 @@ def _read_until_prompt(channel, prompt: str, max_s: float,
     """
     channel.settimeout(0.5)
     chunks: list[str] = []
+    tail = ""
     started = time.time()
     last_data = started
     pager_replies = 0
@@ -546,17 +554,21 @@ def _read_until_prompt(channel, prompt: str, max_s: float,
             return "".join(chunks), "closed"
         if not data:
             return "".join(chunks), "closed"
-        chunks.append(data.decode("utf-8", "replace"))
+        decoded = data.decode("utf-8", "replace")
+        chunks.append(decoded)
         last_data = time.time()
-        text = "".join(chunks)
-        if _waiting_at(text, needle_re=_PAGER_TAIL_RE):
+        # A rolling tail, joined once at each return: _waiting_at reads no
+        # more than TAIL_CHARS anyway, and rebuilding the whole buffer on
+        # every 64 KB read cost seconds of CPU on a multi-megabyte config.
+        tail = (tail + decoded)[-TAIL_CHARS:]
+        if _waiting_at(tail, needle_re=_PAGER_TAIL_RE):
             if pager_replies >= MAX_PAGER_REPLIES:
-                return text, "pager-loop"
+                return "".join(chunks), "pager-loop"
             pager_replies += 1
             channel.send(" ")
             continue
-        if _waiting_at(text, prompt=prompt):
-            return text, "prompt"
+        if _waiting_at(tail, prompt=prompt):
+            return "".join(chunks), "prompt"
 
 
 def _read_until_match(channel, pattern, max_s: float,
@@ -569,6 +581,7 @@ def _read_until_match(channel, pattern, max_s: float,
     ("quiet"/"timeout"/"closed", plus "matched" here in place of "prompt")."""
     channel.settimeout(0.5)
     chunks: list[str] = []
+    tail = ""
     started = time.time()
     last_data = started
     while True:
@@ -585,9 +598,11 @@ def _read_until_match(channel, pattern, max_s: float,
             return "".join(chunks), "closed"
         if not data:
             return "".join(chunks), "closed"
-        chunks.append(data.decode("utf-8", "replace"))
+        decoded = data.decode("utf-8", "replace")
+        chunks.append(decoded)
         last_data = time.time()
-        if _waiting_at("".join(chunks), needle_re=pattern):
+        tail = (tail + decoded)[-TAIL_CHARS:]      # see _read_until_prompt
+        if _waiting_at(tail, needle_re=pattern):
             return "".join(chunks), "matched"
 
 

@@ -294,6 +294,66 @@ finally:
     asa.close()
 
 
+# ---- The read loop itself: only the tail of the stream can end a read, so
+# only the tail is examined. Re-joining the whole capture on every 64 KB recv
+# made a large config (a FortiGate `show full-configuration`, an IOS-XR
+# running-config) quadratic in its own size — seconds of CPU per device, on
+# up to configrx_workers threads at once.
+print("the capture read loop looks at the tail, not the whole buffer, per recv")
+
+
+class FakeChannel:
+    """A channel that hands out `size` bytes at a time from one big capture
+    and then sits at the prompt, like a real device that has finished."""
+
+    def __init__(self, text, chunk=65536):
+        self.data = text.encode()
+        self.at = 0
+        self.chunk = chunk
+        self.sent = []
+
+    def settimeout(self, _seconds):
+        pass
+
+    def recv(self, _size):
+        if self.at >= len(self.data):
+            raise OSError("closed")
+        piece = self.data[self.at:self.at + self.chunk]
+        self.at += len(piece)
+        return piece
+
+    def send(self, text):
+        self.sent.append(text)
+
+
+BIG = ("interface GigabitEthernet0/1\n switchport mode access\n" * 400_000
+       + "big-sw#")
+seen_lengths = []
+real_waiting_at = configrx._waiting_at
+
+
+def counting_waiting_at(text, **kwargs):
+    seen_lengths.append(len(text))
+    return real_waiting_at(text, **kwargs)
+
+
+configrx._waiting_at = counting_waiting_at
+try:
+    started = time.time()
+    text, ended = configrx._read_until_prompt(FakeChannel(BIG), "big-sw#",
+                                              max_s=60.0)
+    elapsed = time.time() - started
+finally:
+    configrx._waiting_at = real_waiting_at
+
+check(f"a {len(BIG) // (1024 * 1024)} MB capture still ends on the prompt, "
+      f"whole ({len(text)} chars in {elapsed:.3f}s)",
+      ended == "prompt" and text == BIG, (ended, len(text)))
+check(f"...and no single check looked at more than TAIL_CHARS "
+      f"({configrx.TAIL_CHARS}) characters — longest was {max(seen_lengths)}",
+      max(seen_lengths) <= configrx.TAIL_CHARS, max(seen_lengths))
+
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 raise SystemExit(1 if FAILS else 0)
