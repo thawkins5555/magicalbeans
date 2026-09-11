@@ -313,13 +313,15 @@ session has left**. Sign-in keeps the flag, so a bookmark works.
 
 The **Account** dialog can build the same link without typing it: choose
 which tabs to **Rotate through** and **Every** how many seconds, then
-**Open this view as a wall display**. A hand-edited `rotate=` list naming a
-view that does not exist drops that name and rotates through the rest; from
-5.9.1 a name that is not a plain tab name is dropped the same way rather than
-leaving a blank, dead page, and a kiosk that cannot be set up at all falls
-back to the ordinary layout instead of taking the page down with it. A rotating kiosk shows a row of dots
+**Open this view as a wall display**. A rotating kiosk shows a row of dots
 for the views in the cycle and a countdown to the next one, so a person
 walking past the wall can see what's coming as well as what's on it now.
+
+A hand-edited `rotate=` list naming a view that does not exist drops that name
+and rotates through the rest. From 5.9.1 a name that is not a plain tab name
+is dropped the same way rather than leaving a blank, dead page, and a kiosk
+that cannot be set up at all falls back to the ordinary layout instead of
+taking the page down with it.
 
 The session is held open — the heartbeat goes without anyone at the
 keyboard — **only for an account with no write permission on any module**.
@@ -2471,11 +2473,10 @@ everyone else's history.
   removing a line removes its password with it. The settings panel says how
   many of the listed users have a password stored. The digest is computed
   over the whole message with the authentication field blanked in place, per
-  RFC 3414. A trap sent
-  authPriv is detected and its header decoded, but the encrypted payload
-  is not decrypted — the Nodes poller speaks AES-128-CFB since 5.8.0
-  through `netpath/snmpcrypt.py`, and wiring the trap receiver to it (a
-  privacy password per trap user, the key localised to the sender's
+  RFC 3414. A trap sent authPriv is detected and its header decoded, but the
+  encrypted payload is not decrypted — the Nodes poller speaks AES-128-CFB
+  since 5.8.0 through `netpath/snmpcrypt.py`, and wiring the trap receiver to
+  it (a privacy password per trap user, the key localised to the sender's
   engine) is a planned follow-up rather than part of that release. Such
   traps are stored and flagged as encrypted, not decoded, rather than
   dropped.
