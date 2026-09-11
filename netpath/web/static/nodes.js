@@ -69,6 +69,10 @@
     discAutoOffered: new Set(),
     mibFiles: [],
     mibSelected: null,
+    // When the three configuration lists above (groups, deviceGroups,
+    // mibFiles) were last read. 0 means "read them on the next refresh" —
+    // what every editor in this file sets it to after a successful write.
+    configAt: 0,
     // Server-side paging (4.47.0): the full-fleet fetch this table always
     // made cost 2.86 MB decoded and a ~1s table fill at 2,000 devices,
     // measured. pageFilterSig is the last filter combination a page was
@@ -1502,8 +1506,11 @@
       && s.value <= DARK_OPTIC_MAX_DBM;
   }
   function domValueCell(s) {
+    // A device is not trusted input: read_dom coerces this reading to a
+    // number today, which is the only reason the raw interpolation never
+    // bit, and every sibling cell in these two tables already escapes.
     return darkOptic(s) ? '<td>No signal</td>'
-      : `<td>${s.value} ${escape(s.unit)}</td>`;
+      : `<td>${escape(String(s.value))} ${escape(s.unit)}</td>`;
   }
   function domRowAttrs(s) {
     return darkOptic(s) ? ` title="${escape(`${s.value} ${s.unit}`)}"` : '';
@@ -1706,7 +1713,9 @@
     let lossRange = 3600;
     let lossRequestId = 0;
 
-    const box = App.modal(escape(displayName(listed || {})) || 'Device', `
+    // Not escaped here: App.modal escapes a plain-string title itself, and
+    // a second pass put &amp; on screen for a device named "R1 & R2".
+    const box = App.modal(displayName(listed || {}) || 'Device', `
       <div id="ndd-summary" class="nd-summary">Loading\u2026</div>
       <div class="bar"><span class="section">PACKET LOSS</span>
         <select id="ndd-loss-range" aria-label="Chart range"></select></div>
@@ -1886,6 +1895,11 @@
       drawEventTable(box.querySelector('#ndd-ev-table'), events);
     }).catch(() => {
       if (!current()) return;
+      // The heading is set from the listed row too: the successful path
+      // above overwrites it with the fetched device's name, so without this
+      // a failed fetch left whatever the modal opened with on screen for
+      // the life of the dialog.
+      box.querySelector('h2').textContent = displayName(listed || {}) || 'Device';
       box.querySelector('#ndd-summary').innerHTML =
         '<span class="err">Could not read this device.</span>';
     });
@@ -2291,6 +2305,7 @@
         const job = status.job;
         if (!job || !['running', 'starting', 'queued'].includes(job.state)) break;
       }
+      view.configAt = 0;
       if (current()) refresh().catch(() => {});
     };
   }
@@ -2771,8 +2786,13 @@
       // A slow tick must not repaint over a newer one, the same way the
       // status timeline guards its own range changes.
       const requestId = (view.ifaceRequestId = (view.ifaceRequestId || 0) + 1);
+      // One interface, not the device's whole interface list: this dialog
+      // wanted a single row and re-read 263 KB of a core switch's 500 ports
+      // for it every five seconds. if_index filters server-side; the reply
+      // keeps the same shape, so the find() below still answers for a
+      // server that has not learned the filter yet.
       const [ifaces, events] = await Promise.all([
-        App.get(`/api/nodes/devices/${deviceId}/interfaces`),
+        App.get(`/api/nodes/devices/${deviceId}/interfaces`, { if_index: ifIndex }),
         App.get(`/api/nodes/devices/${deviceId}/events`),
       ]);
       if (!current() || requestId !== view.ifaceRequestId) return;
@@ -2787,6 +2807,16 @@
       box.querySelector('#ifd-events').innerHTML = ifaceEventsHtml(ifIndex, events);
     }
 
+    // The in/out metric ids for THIS port, looked up once and then kept for
+    // the life of the dialog. Reading them meant listing the device's whole
+    // metric catalogue — 570 KB on a 500-port switch — every 15 s to find
+    // two numbers that cannot change while the dialog is open: the id of
+    // `if_in_bps.<n>` is stable, and a port that loses its metrics entirely
+    // draws the same empty chart either way. Null until the first
+    // successful lookup, so a device with no samples yet is asked again
+    // rather than charted as permanently empty.
+    let chartMetrics = null;
+
     async function refreshChart() {
       if (!current()) { stop(); return; }
       const requestId = (view.ifaceChartRequestId = (view.ifaceChartRequestId || 0) + 1);
@@ -2794,11 +2824,19 @@
       // view.metrics: loadDetail() replaces that wholesale on every refresh
       // and can even switch the selected device underneath an open dialog,
       // which is how this chart ended up requesting another device's series.
-      const metrics = await App.get(`/api/nodes/devices/${deviceId}/metrics`);
-      if (!current() || requestId !== view.ifaceChartRequestId) return;
-      const list = metrics.metrics || [];
-      const inM = list.find((m) => m.key === `if_in_bps.${ifIndex}`);
-      const outM = list.find((m) => m.key === `if_out_bps.${ifIndex}`);
+      let found = chartMetrics;
+      if (!found) {
+        const metrics = await App.get(`/api/nodes/devices/${deviceId}/metrics`);
+        if (!current() || requestId !== view.ifaceChartRequestId) return;
+        const list = metrics.metrics || [];
+        found = {
+          in: list.find((m) => m.key === `if_in_bps.${ifIndex}`) || null,
+          out: list.find((m) => m.key === `if_out_bps.${ifIndex}`) || null,
+        };
+        if (found.in || found.out) chartMetrics = found;
+      }
+      const inM = found.in;
+      const outM = found.out;
       const t1 = Date.now() / 1000;
       const t0 = t1 - 3600;
       // 1 h at 15 s buckets is 240 points — enough to look continuous
@@ -3107,7 +3145,7 @@
       <input type="radio" name="nd-merge-winner" value="${id}"
         ${id === winnerId ? 'checked' : ''}> Keep ${escape(name)}
       <span class="hint">${escape(ip)}</span></label>`;
-    const box = App.modal(`Merge ${escape(pair.a_name)} and ${escape(pair.b_name)}`, `
+    const box = App.modal(`Merge ${pair.a_name} and ${pair.b_name}`, `
       <p class="hint">${escape((pair.reasons || []).join('; '))}</p>
       ${sideHtml(pair.a_id, pair.a_name, pair.a_ip)}
       ${sideHtml(pair.b_id, pair.b_name, pair.b_ip)}
@@ -3206,14 +3244,52 @@
         'airMAX and Cambium radios only.</p>';
       return;
     }
-    rfEl.innerHTML = rf.map((m) => `
-      <div class="bar"><span class="section">${escape(m.label)}</span>
-        <span class="nd-v">${escape(formatMetricValue(m.unit, m.last_value))}</span></div>
-      <div class="canvas chart" style="height:110px" data-rf-metric="${m.id}"><svg></svg></div>
-    `).join('');
-    for (const wrap of rfEl.querySelectorAll('[data-rf-metric]')) {
-      loadRfChart(wrap, Number(wrap.dataset.rfMetric)).catch(() => {});
+    // Holders are reused, never rebuilt: this runs on every refresh tick
+    // while the pane is on screen, and assigning rfEl.innerHTML destroyed
+    // and recreated every RF chart — with whatever tooltip or keyboard
+    // focus was inside it — two or three times a second. Same treatment
+    // resourceHolder() gives the device dialog's RESOURCES charts.
+    const wanted = new Set(rf.map((m) => String(m.id)));
+    for (const holder of [...rfEl.children]) {
+      if (!wanted.has(holder.dataset.rfHolder || '')) holder.remove();
     }
+    for (const m of rf) {
+      const holder = rfHolder(rfEl, m);
+      App.setText(holder.querySelector('.section'), m.label);
+      App.setText(holder.querySelector('.nd-v'), formatMetricValue(m.unit, m.last_value));
+      const wrap = holder.querySelector('[data-rf-metric]');
+      // The series behind each chart is an hour of history on its own
+      // slower clock, the same reasoning the per-port bandwidth chart's
+      // 15 s re-fetch already carries: one poll cannot move an hourly
+      // chart, and six radios on a two-second tick was three /series
+      // requests a second, for ever.
+      const now = Date.now();
+      if (now - Number(wrap.dataset.seriesAt || 0) >= RF_SERIES_MAX_AGE_MS) {
+        wrap.dataset.seriesAt = String(now);
+        loadRfChart(wrap, m.id).catch(() => { wrap.dataset.seriesAt = '0'; });
+      }
+    }
+  }
+
+  const RF_SERIES_MAX_AGE_MS = 15000;
+
+  /* One RF metric's holder — the value line and the chart box — created
+     once and found again by metric id on every later tick. */
+  function rfHolder(container, metric) {
+    // Number(), not the raw field: a metric id reaches a selector here, and
+    // this file's rule is that a value off the wire is never interpolated
+    // into one unchecked (see initKiosk in app.js).
+    const id = Number(metric.id);
+    let holder = container.querySelector(`[data-rf-holder="${id}"]`);
+    if (holder) return holder;
+    holder = document.createElement('div');
+    holder.dataset.rfHolder = String(id);
+    holder.innerHTML = '<div class="bar"><span class="section"></span>' +
+      '<span class="nd-v"></span></div>' +
+      `<div class="canvas chart" style="height:110px" data-rf-metric="${id}">` +
+      '<svg></svg></div>';
+    container.appendChild(holder);
+    return holder;
   }
 
   /* One RF metric's last hour, in its own small chart — the same
@@ -3773,9 +3849,18 @@
      so the CSV is built from the very rows already on screen rather than
      asking the server a second time for the same numbers in another
      shape. */
+  /* The same lead characters api.py's _CSV_FORMULA_LEAD guards — = + - @
+     tab and CR — with the same inert apostrophe in front of them. A device
+     name comes from its own sysName or from another operator, and a
+     spreadsheet opens a cell starting with one of these as a live formula:
+     these two reports are the only CSVs built in the browser, and they were
+     the only two skipping the guard every server-side export applies. */
+  const CSV_FORMULA_LEAD = /^[=+\-@\t\r]/;
+
   function csvField(value) {
     const s = value === null || value === undefined ? '' : String(value);
-    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    const guarded = CSV_FORMULA_LEAD.test(s) ? `'${s}` : s;
+    return /[",\r\n]/.test(guarded) ? `"${guarded.replace(/"/g, '""')}"` : guarded;
   }
 
   function saveReportCsv(filename, header, rows) {
@@ -4341,6 +4426,7 @@
           save.disabled = false;
         }
         await refreshDeviceGroupsList(box);
+        view.configAt = 0;
         App.refreshNow('nodes');
       };
       tr.querySelector('.devgroup-remove').onclick = () => {
@@ -4353,6 +4439,7 @@
           '<p class="hint">Devices in this group are not deleted — they become ' +
           'ungrouped.</p>', 'Remove', async () => {
             await App.del(`/api/nodes/device-groups/${id}`);
+            view.configAt = 0;
             App.refreshNow('nodes');
           }, manageDeviceGroups);  // reopen either way: the list is refetched
       };
@@ -4382,6 +4469,7 @@
         await App.post('/api/nodes/device-groups', { name });
         input.value = '';
         await refreshDeviceGroupsList(box);
+        view.configAt = 0;
         App.refreshNow('nodes');
       } },
     ]);
@@ -4664,6 +4752,7 @@
           'poll. Any device already using it falls back to the profile\'s other ' +
           'credentials.</p>', 'Remove', async () => {
             await App.del(`/api/nodes/groups/${groupId}/credentials/${btn.dataset.credId}`);
+            view.configAt = 0;
           }, (confirmed) => { if (!confirmed) editProfile(); });
       };
     }
@@ -4702,6 +4791,7 @@
           }
         }
         await refreshCredentialsList(box, groupId);
+        view.configAt = 0;
         // The password fields are absent on a host that cannot store secrets.
         for (const id of ['nd-pc-label', 'nd-pc-community', 'nd-pc-v3user',
           'nd-pc-authpass', 'nd-pc-privpass']) {
@@ -4839,6 +4929,7 @@
           await App.post(`/api/nodes/groups/${result.id}/credential`, credential);
         }
         App.closeModal();
+        view.configAt = 0;
         App.refreshNow('nodes');
       } },
     ]);
@@ -5018,6 +5109,7 @@
           await App.post(`/api/nodes/groups/${g.id}/credential`, credential);
         }
         App.closeModal();
+        view.configAt = 0;
         App.refreshNow('nodes');
       } },
     ]);
@@ -5028,6 +5120,7 @@
   function profileStatus(message, isError) {
     const el = App.el('nd-profile-status');
     el.innerHTML = isError ? `<span class="err">${escape(message)}</span>` : escape(message || '');
+    if (message) App.announce(message);
   }
 
   function removeProfile() {
@@ -5046,6 +5139,7 @@
         if (!confirmed) return;
         profileStatus('');
         view.groupSelected = null;
+        view.configAt = 0;
         App.refreshNow('nodes');
       });
   }
@@ -5060,6 +5154,7 @@
       return;
     }
     profileStatus(`${g.name} is now the default profile.`);
+    view.configAt = 0;
     App.refreshNow('nodes');
   }
 
@@ -5541,6 +5636,9 @@
     const el = App.el('disc-status');
     el.textContent = text;
     el.className = isError ? 'err' : 'hint';
+    // #disc-status is a plain <span> with no live-region role, so this line
+    // was said only to whoever could see it. App.announce is the house way.
+    if (text) App.announce(text);
   }
 
   /* The approve/deny dialog: lists everything a finished/cancelled scan
@@ -5607,8 +5705,8 @@
     }
     const checked = new Set(seed);
     const title = cancelled
-      ? `Discovery of ${escape(job.target)} cancelled`
-      : `Discovery of ${escape(job.target)} finished`;
+      ? `Discovery of ${job.target} cancelled`
+      : `Discovery of ${job.target} finished`;
     const lead = cancelled
       ? `The scan stopped after probing ${job.probed} of ${job.total}
          address(es) but had already found the devices below. Add the
@@ -5773,6 +5871,7 @@
         `<td><button class="mib-resolve">Resolve</button> <button class="mib-remove">Remove</button></td>`;
       tr.querySelector('.mib-resolve').onclick = async () => {
         await App.post(`/api/nodes/mibs/${f.id}/resolve`, {});
+        view.configAt = 0;
         App.refreshNow('nodes');
       };
       tr.querySelector('.mib-remove').onclick = () => {
@@ -5784,6 +5883,7 @@
           'bundled MIB removed here is not re-added on the next restart.</p>',
           'Remove', async () => {
             await App.del(`/api/nodes/mibs/${f.id}`);
+            view.configAt = 0;
             App.refreshNow('nodes');
           });
       };
@@ -5872,6 +5972,7 @@
       for (const other of box.querySelectorAll('.cat-install')) {
         other.disabled = other.dataset.done === '1';
       }
+      view.configAt = 0;
       App.refreshNow('nodes');
     }
 
@@ -5941,6 +6042,7 @@
             (result.unresolved.length ? `<p class="hint">Unresolved parents: ${escape(result.unresolved.join(', '))} — upload the MIB that defines them, then hit Resolve.</p>` : ''), [
             { label: 'Close', onClick: App.closeModal },
           ]);
+          view.configAt = 0;
           App.refreshNow('nodes');
         } catch (error) {
           status.textContent = `Error: ${error.message}`;
@@ -6196,6 +6298,39 @@
 
   /* ----------------------------------------------------------- refresh */
 
+  /* Polling profiles, device groups and MIB files are configuration: they
+     change when somebody edits one, not every couple of seconds. Re-fetched
+     on the first refresh, again the moment an edit in this browser sets
+     view.configAt to 0 (every editor here does, beside its
+     App.refreshNow('nodes')), and otherwise on a clock slow enough that
+     another operator's edit still arrives on its own. The MIB list is the
+     expensive one: 3.5 KB for the bundled files and ~50 KB on an install
+     that takes the vendor bundles, per tick, for a list nobody asked for.
+     Same shape as alerts.js's loadConfig, for the same reason. */
+  const CONFIG_MAX_AGE_MS = 60000;
+
+  async function loadNodesConfig() {
+    if (view.configAt && Date.now() - view.configAt < CONFIG_MAX_AGE_MS) return;
+    const [groups, deviceGroups, mibs] = await Promise.all([
+      App.get('/api/nodes/groups'),
+      App.get('/api/nodes/device-groups'),
+      App.get('/api/nodes/mibs'),
+    ]);
+    view.groups = groups.groups;
+    view.deviceGroups = deviceGroups.groups;
+    view.mibFiles = mibs.files;
+    view.configAt = Date.now();
+  }
+
+  /* True only while the PROFILES & MIBS sub-view is the one on screen —
+     discoveryVisible()'s sibling, and for the same reason: the two tables
+     behind it were rebuilt from scratch on every tick whether or not
+     anybody could see them. */
+  function profilesVisible() {
+    const pane = document.getElementById('nodes-sub-profiles');
+    return !!pane && pane.classList.contains('active');
+  }
+
   async function refresh() {
     if (App.state.tab !== 'nodes') return;
     drawStatus();
@@ -6224,13 +6359,11 @@
     view.pageFilterSig = filterSig;
     view.pageLimit = Number(App.el('nd-page-size').value) || view.pageLimit;
     const generation = ++view.refreshGen;
-    const [devices, groups, deviceGroups, mibs] = await Promise.all([
+    const [devices] = await Promise.all([
       App.get('/api/nodes/devices', { q, group_id, device_group_id, status, offline_only,
                                       maintenance_only, overrides_only,
                                       limit: view.pageLimit, offset: view.pageOffset }),
-      App.get('/api/nodes/groups'),
-      App.get('/api/nodes/device-groups'),
-      App.get('/api/nodes/mibs'),
+      loadNodesConfig(),
       loadDiscJobsIfNeeded(),
     ]);
     // A newer refresh already redrew this, or the operator has left.
@@ -6238,16 +6371,23 @@
     view.devices = devices.devices;
     view.pageTotal = devices.total != null ? devices.total : view.devices.length;
     drawPager();
-    view.groups = groups.groups;
-    view.deviceGroups = deviceGroups.groups;
-    view.mibFiles = mibs.files;
     // A filter/sort change can drop rows out from under a bulk
     // selection — keep only ids still actually on screen.
     const visibleIds = new Set(view.devices.map((d) => d.id));
     for (const id of view.devicesChecked) {
       if (!visibleIds.has(id)) view.devicesChecked.delete(id);
     }
-    if (view.selected && !view.devices.some((d) => d.id === view.selected)) {
+    // view.devices is ONE PAGE of the result set, not the fleet (4.47.0), so
+    // "not in this list" does not mean "gone": a deep link, the global
+    // search or a MAC hit can select a device that sorts onto page 3, and
+    // dropping it here switched the pane to the first row of page 1 a tick
+    // after it opened. Cleared only when this page IS the whole result set,
+    // where absence really does mean the device was deleted or filtered
+    // out. loadDetail() fetches the selected device by id and never reads
+    // view.devices, so an off-page selection stays correct.
+    const wholeResultSet = view.pageTotal <= view.devices.length;
+    if (view.selected && wholeResultSet
+        && !view.devices.some((d) => d.id === view.selected)) {
       view.selected = null;
     }
     if (!view.selected && view.devices.length) view.selected = view.devices[0].id;
@@ -6256,8 +6396,12 @@
     fillDiscGroups();
     fillReportDevGroupSelects();
     drawTable();
-    drawProfilesTable();
-    drawMibsTable();
+    // Drawn only for the sub-view that shows them; selectSub() draws them
+    // for the switch that reveals the pane.
+    if (profilesVisible()) {
+      drawProfilesTable();
+      drawMibsTable();
+    }
     if (view.selected) await loadDetail();
     else { App.el('nd-detail-empty').hidden = false; App.el('nd-detail').hidden = true; }
     if (view.macSearchPending) {
@@ -6299,7 +6443,14 @@
     note.hidden = true;
     note.innerHTML = '';
     if (!text) return;
-    const show = (html) => { note.hidden = false; note.innerHTML = html; };
+    // The whole answer to a MAC search lands in this <div>, which carries
+    // no live-region role: announced as text as well as drawn, so it is not
+    // said only to whoever can see it.
+    const show = (html) => {
+      note.hidden = false;
+      note.innerHTML = html;
+      App.announce(note.textContent);
+    };
     const payload = await App.get('/api/nodes/mac-search', { q: text });
     if (!payload.mac) {
       // This box's Enter always tries a MAC lookup on top of filtering the
@@ -6408,8 +6559,25 @@
      broken. Fetched only for the SELECTED job and only while the Discovery
      sub-view is on screen; the draw re-applies the operator's sort and
      their ticks, which are keyed by result id and so survive new rows. */
+  /* The jobs list is what the DISCOVERY table draws from, but the strip
+     above the subtabs and the approval dialog follow it from any sub-view,
+     so it cannot simply stop when that pane is hidden the way the results
+     fetch does. Every tick while the pane is on screen or a sweep is
+     actually running — the two cases where the answer changes — and
+     otherwise on the same slow clock the configuration lists use. */
+  const DISC_JOBS_MAX_AGE_MS = 15000;
+  let discJobsAt = 0;
+
+  function discJobsDue() {
+    if (discoveryVisible()) return true;
+    if (view.discJobs.some((j) => j.state === 'running')) return true;
+    return !discJobsAt || Date.now() - discJobsAt >= DISC_JOBS_MAX_AGE_MS;
+  }
+
   async function loadDiscJobsIfNeeded() {
+    if (!discJobsDue()) return;
     const jobs = await App.get('/api/nodes/discovery');
+    discJobsAt = Date.now();
     view.discJobs = jobs.jobs;
     drawDiscJobsTable();
     const job = discSelectedJob();
@@ -6592,6 +6760,7 @@
         'finishes resolving here.</p>', [
         { label: 'Close', onClick: App.closeModal },
       ]);
+      view.configAt = 0;
       App.refreshNow('nodes');
     };
     App.el('nd-settings').onclick = settingsDialog;
@@ -6659,6 +6828,13 @@
     // for a job that has since finished, there may be no next tick.
     if (name === 'discovery' && view.discSelected) {
       loadDiscResults().catch(() => {});
+    }
+    // Same for Profiles & MIBs: refresh() draws those two tables only while
+    // this pane is up, so the switch that reveals it draws them itself
+    // rather than showing the previous pane's contents until the next tick.
+    if (name === 'profiles') {
+      drawProfilesTable();
+      drawMibsTable();
     }
   }
 

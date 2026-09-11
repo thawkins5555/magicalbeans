@@ -2472,6 +2472,11 @@ for _name in MODULES:
 check(not _escaped_titles59,
       "no App.modal title is escaped by its caller — App.modal is the one "
       "owner of that (found: %s)" % (", ".join(_escaped_titles59) or "none"))
+# The approval dialog builds its heading into a variable first, so the scan
+# above cannot see it; it is the third of the three sites.
+check("escape(" not in slice_(_N59, "    const title = cancelled", "\n    const lead"),
+      "the discovery approval dialog's heading is not escaped by its caller "
+      "either")
 _DEVDLG59 = slice_(_N59, "    Promise.all([\n      App.get(`/api/nodes/devices/${deviceId}`),",
                    "    // Hardware sensors and DOM/SFP sensors are their own on-demand")
 check("box.querySelector('h2').textContent = displayName(listed || {})" in _DEVDLG59,

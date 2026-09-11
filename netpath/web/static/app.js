@@ -697,7 +697,12 @@ const App = (() => {
     const byIp = new Map();
     const byId = new Map();
     try {
-      const payload = await get('/api/nodes/devices');
+      // The projection, not the 25-column device record: this index is two
+      // Maps for a name/ip cross-link, and the full unpaged fleet was 1.5 MB
+      // at 812 devices, decoded on the main thread every 30 s for whichever
+      // modules are open. A server that does not know `fields` answers with
+      // the full rows, which carry these keys too.
+      const payload = await get('/api/nodes/devices', { fields: 'index' });
       for (const d of payload.devices || []) {
         if (d.ip) byIp.set(d.ip, d);
         byId.set(d.id, d);
@@ -4644,6 +4649,11 @@ const App = (() => {
      that do not exist, are dropped rather than failing the whole list. */
   let kioskRotation = null;   // {views, everyMs, lastSwitch} or null
 
+  /* A tab name is only ever a lowercase word, and both places below put one
+     inside a `.tab[data-tab="…"]` selector. boot.js applies the identical
+     test to the remembered tab, for the identical reason. */
+  const TAB_NAME_RE = /^[a-z]+$/;
+
   function initKiosk() {
     let wanted = false;
     let params = new URLSearchParams();
@@ -4660,6 +4670,12 @@ const App = (() => {
     const rotateParam = params.get('rotate') || '';
     const views = rotateParam.split(',').map((s) => s.trim()).filter(Boolean)
       .filter((name) => {
+        // The query string is untrusted: a name carrying a quote made an
+        // invalid attribute selector, querySelector threw, and the throw
+        // out of initKiosk took start() — and with it every module, the
+        // poll timer and the connection indicator — down with it. Same
+        // shape boot.js:35 already applies to the stored tab name.
+        if (!TAB_NAME_RE.test(name)) return false;
         const tab = document.querySelector(`.tab[data-tab="${name}"]`);
         return tab && !tab.hidden;
       });
@@ -4684,9 +4700,11 @@ const App = (() => {
     dots.innerHTML = kioskRotation.views.map((name, i) =>
       `<span class="dot${i === index ? ' current' : ''}"></span>`).join('');
     const nextIndex = (index + 1) % kioskRotation.views.length;
-    const nextTab = document.querySelector(`.tab[data-tab="${kioskRotation.views[nextIndex]}"]`);
+    const nextName = kioskRotation.views[nextIndex];
+    const nextTab = TAB_NAME_RE.test(nextName)
+      ? document.querySelector(`.tab[data-tab="${nextName}"]`) : null;
     const nextLabel = nextTab ? nextTab.textContent.replace(/\d+$/, '').trim()
-      : kioskRotation.views[nextIndex];
+      : nextName;
     const remainS = Math.max(0, Math.ceil(
       (kioskRotation.everyMs - (now - kioskRotation.lastSwitch)) / 1000));
     next.textContent = `Next: ${nextLabel} (${remainS}s)`;
@@ -5389,7 +5407,21 @@ const App = (() => {
     // Before any module's init() builds a form that depends on it.
     await loadPlatform();
 
-    initKiosk();
+    // Nothing kiosk mode does is worth taking the application down for: it
+    // used to run bare here, so anything it threw skipped the splitters,
+    // the density pass, every module init and the poll timer. A half-built
+    // kiosk is dropped back to the ordinary layout rather than left with
+    // its dialogs degraded to toasts and no bar to replace them.
+    try {
+      initKiosk();
+    } catch (error) {
+      state.kiosk = false;
+      kioskRotation = null;
+      delete document.documentElement.dataset.kiosk;
+      document.body.classList.remove('kiosk');
+      const kioskBar = document.getElementById('kiosk-bar');
+      if (kioskBar) kioskBar.hidden = true;
+    }
     initSplitters();
     applyDensity();
     window.addEventListener('resize', applyDensity);

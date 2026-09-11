@@ -430,6 +430,31 @@ def _window(params, default_span_s: float = 3600.0) -> tuple[float, float]:
     return clamp_window(t0, t1)
 
 
+# The histogram stores allocate one dict per bucket BEFORE they run any
+# query, so the bucket count — not the span — decides what an overview
+# request costs in memory. Bounded the way _flow_bucket bounds the same
+# hazard: widen the bucket until the count fits rather than narrow the
+# window the caller asked for. Two slots are held back from the cap because
+# each store floors its first bucket to a boundary below t0 and adds a
+# trailing partial one.
+HIST_MAX_BUCKETS = 5000
+
+
+def _hist_window(params, default_span_s: float = 86400.0,
+                 default_bucket_s: float = 3600.0) -> tuple[float, float, float]:
+    """The (t0, t1, bucket_s) the three overview histograms read from the
+    query string: the window through _window, then a bucket no smaller than
+    the stores' own 60 s floor and no smaller than HIST_MAX_BUCKETS allows."""
+    t0, t1 = _window(params, default_span_s)
+    bucket = _num(params, "bucket", default_bucket_s)
+    if bucket is None or not math.isfinite(bucket):
+        bucket = default_bucket_s
+    bucket = max(float(bucket), 60.0)
+    if (t1 - t0) / bucket > HIST_MAX_BUCKETS - 2:
+        bucket = float(math.ceil((t1 - t0) / (HIST_MAX_BUCKETS - 2)))
+    return t0, t1, bucket
+
+
 def _id_list(raw) -> list[int] | None:
     """A comma-separated `device_ids=1,2,3` query param -> [1, 2, 3], or
     None when the param was not given at all — distinct from an explicit
@@ -1576,9 +1601,24 @@ def get_debug(service, params, body) -> dict:
     schedule = service.monitor.next_runs()
     now = time.time()
 
+    # Every section below names something from another module — NetPath
+    # destination hostnames, device names and addresses, subnet and DHCP
+    # server labels, discovery CIDRs, the addresses out for reverse lookup —
+    # so `debug: read` alone must not read any of them, exactly as it must
+    # not read the event stream. A section the account cannot read comes
+    # back empty rather than as a 403, the contract get_state and
+    # get_dashboard already use.
+    granted = request_permissions(service, params)
+
+    def can(module: str) -> bool:
+        return _permissions.allows(granted.get(module), _permissions.READ)
+
+    see_netpath = can("netpath")
+    see_nodes = can("nodes")
+
     workers = []
     running = queued = 0
-    targets = service.db.targets()
+    targets = service.db.targets() if see_netpath else []
     last_traces = service.db.last_traces([target["id"] for target in targets])
     for target in targets:
         last = last_traces.get(target["id"])
@@ -1613,7 +1653,6 @@ def get_debug(service, params, body) -> dict:
     # addresses, DHCP server labels, ConfigRX failure detail, sign-in
     # history — so `debug: read` alone must not read all of it. Each
     # category is filtered by the module it belongs to.
-    granted = request_permissions(service, params)
     visible = {category for category, module in _EVENT_CATEGORY_MODULE.items()
                if _permissions.allows(granted.get(module), _permissions.READ)}
     events = [
@@ -1622,8 +1661,9 @@ def get_debug(service, params, body) -> dict:
         for e in service.log.since(since) if e.category in visible
     ]
 
-    # One row per address currently out for a reverse lookup.
-    dns_state = service.resolver.worker_state()
+    # One row per address currently out for a reverse lookup. Under
+    # `settings`, the module _EVENT_CATEGORY_MODULE assigns the dns category.
+    dns_state = service.resolver.worker_state() if can("settings") else {}
     dns_workers = sorted(
         [{"ip": ip, "elapsed": now - info["started"]}
          for ip, info in dns_state.items() if info["started"]],
@@ -1633,7 +1673,7 @@ def get_debug(service, params, body) -> dict:
     # currently being polled — both come from the same worker, so they share
     # a table rather than needing a section each for what is usually zero or
     # one row.
-    ipam_state = service.ipam.state()
+    ipam_state = service.ipam.state() if can("ipam") else {}
     ipam_workers = []
     if ipam_state.get("scan_started") or ipam_state.get("poll_started"):
         subnets_by_id = {s["id"]: s for s in service.ipam_db.subnets_by_ids(
@@ -1660,7 +1700,7 @@ def get_debug(service, params, body) -> dict:
     # shape the NetPath `workers` table above uses, without its per-target
     # budget/schedule columns: a device's poll has no fixed budget the way a
     # trace's hop/probe counts imply one.
-    node_state = service.node_poller.worker_state()
+    node_state = service.node_poller.worker_state() if see_nodes else {}
     node_workers = []
     if node_state:
         devices_by_id = {d["id"]: d for d in
@@ -1680,7 +1720,7 @@ def get_debug(service, params, body) -> dict:
     # progress counters — same shape as the worker tables above plus the
     # probed/found columns a bounded sweep naturally has.
     discovery_scans = []
-    for job in service.nodes_db.discovery_jobs(20):
+    for job in (service.nodes_db.discovery_jobs(20) if see_nodes else []):
         if job["state"] != "running":
             continue
         discovery_scans.append({
@@ -1701,7 +1741,7 @@ def get_debug(service, params, body) -> dict:
         "node_workers": node_workers,
         # polls/ok/timeout/auth_fail/unsupported/errors/overruns — already
         # computed on every poll, previously never surfaced anywhere.
-        "node_counters": service.node_poller.counters,
+        "node_counters": service.node_poller.counters if see_nodes else {},
         "discovery_scans": discovery_scans,
         "events": events,
         "last_seq": service.log.last_seq,
@@ -1717,9 +1757,9 @@ def get_debug(service, params, body) -> dict:
         # endpoint is actually slow.
         "routes": _route_latency(service),
         "summary": {
-            "scheduler": service.monitor.running,
+            "scheduler": service.monitor.running if see_netpath else False,
             "workers_busy": running,
-            "workers_total": service.monitor.workers,
+            "workers_total": service.monitor.workers if see_netpath else 0,
             "queued": queued,
             "resolver": bool(service.resolver._thread
                              and service.resolver._thread.is_alive()),
@@ -2310,9 +2350,7 @@ def _syslog_host_ips(service, host: str) -> list:
 
 def get_syslog_overview(service, params, body) -> dict:
     """Histogram plus the context the page needs; deliberately cheap."""
-    t1 = _num(params, "t1", time.time())
-    t0 = _num(params, "t0", t1 - 86400)
-    bucket = _num(params, "bucket", 3600)
+    t0, t1, bucket = _hist_window(params)
     filters = _syslog_filters(service, params)
 
     buckets = service.syslog_db.histogram(t0, t1, bucket, filters)
@@ -2484,9 +2522,7 @@ def _snmp_filters(params) -> dict:
 
 def get_snmp_overview(service, params, body) -> dict:
     """Histogram plus the context the page needs; deliberately cheap."""
-    t1 = _num(params, "t1", time.time())
-    t0 = _num(params, "t0", t1 - 86400)
-    bucket = _num(params, "bucket", 3600)
+    t0, t1, bucket = _hist_window(params)
     filters = _snmp_filters(params)
 
     buckets = service.snmp_db.histogram(t0, t1, bucket, filters)
@@ -2547,7 +2583,12 @@ def _snmp_trap_rows(service, params, cap: int, *,
             "source_name": names.get(row["source"], ""),
             "version": row["version"],
             "version_name": VERSION_NAMES.get(row["version"], "?"),
-            "community": row["community"] or "",
+            # The sending device's own trap community (its USM user name for
+            # v3), so the same rule _community_fields applies to a device's
+            # stored community applies here: shown to callers who could
+            # change it anyway, a has_community boolean for everyone else.
+            "community": (row["community"] or "") if reveal else "",
+            "has_community": bool(row["community"]),
             "engine_id": row["engine_id"] or "",
             "security": row["security"] or "",
             "auth_state": row["auth_state"] or "",
@@ -4204,15 +4245,26 @@ def get_nodes_device_addresses(service, params, body, device_id) -> dict:
         row, service.nodes_db.device_addresses(device_id))}
 
 
+# The same ceiling shape DEVICE_LIST_MAX_LIMIT uses. The pair count is
+# O(devices squared) on a fleet with repeated sys_names, which is the very
+# case this feature exists to find, so an unclamped limit is a fleet-sized
+# body built under the nodes.db lock.
+DUPLICATES_MAX_LIMIT = 2000
+
+
 def get_nodes_duplicates(service, params, body) -> dict:
     """Pairs that look like one device entered twice. Fetched on demand
     from the Duplicates button, not the Devices page's refresh tick — it's
     three self-joins over the fleet."""
-    limit = int(_num(params, "limit", 200))
+    limit, _offset = _page(params, 200, DUPLICATES_MAX_LIMIT)
+    candidates = service.nodes_db.duplicate_candidates(limit)
+    rows = {d["id"]: d for d in service.nodes_db.devices_by_ids(
+        {pair["a_id"] for pair in candidates}
+        | {pair["b_id"] for pair in candidates})}
     pairs = []
-    for pair in service.nodes_db.duplicate_candidates(limit):
-        a = service.nodes_db.device(pair["a_id"])
-        b = service.nodes_db.device(pair["b_id"])
+    for pair in candidates:
+        a = rows.get(pair["a_id"])
+        b = rows.get(pair["b_id"])
         if a is None or b is None:
             continue
         pairs.append({
@@ -4914,7 +4966,13 @@ def post_nodes_device_oid_walk(service, params, body, device_id) -> dict:
 def get_nodes_device_oid_walk(service, params, body, device_id) -> dict:
     """Progress, or the finished walk. `download` asks for the file text:
     once handed over, the rows are dropped, since a walk exists to be
-    downloaded once."""
+    downloaded once.
+
+    Dropped only for a caller who could start another one. Watching a walk
+    is a read, but forgetting it is not: without the write check any
+    `nodes: read` account could delete a finished walk out from under the
+    engineer who ran it, and re-running it needs `nodes: write`."""
+    _require(service.nodes_db.device(device_id), "device")
     status = service.node_poller.oid_walk_status(
         int(device_id), with_rows=params.get("download") is not None)
     if status is None:
@@ -4924,12 +4982,14 @@ def get_nodes_device_oid_walk(service, params, body, device_id) -> dict:
         return {"walk": status}
     rows = status.pop("walk", [])
     text = _oid_walk_text(service, status, rows)
-    service.node_poller.forget_oid_walk(int(device_id))
+    if _may_read_secrets(service, params, "nodes"):
+        service.node_poller.forget_oid_walk(int(device_id))
     return {"walk": status, "text": text,
             "filename": _oid_walk_filename(status)}
 
 
 def delete_nodes_device_oid_walk(service, params, body, device_id) -> dict:
+    _require(service.nodes_db.device(device_id), "device")
     return {"cancelled": service.node_poller.cancel_oid_walk(int(device_id))}
 
 
@@ -4937,6 +4997,7 @@ def post_nodes_device_identify(service, params, body, device_id) -> dict:
     """Re-identify: start the bounded vendor walk now, or report the one
     already running. A job, not a synchronous answer — the walk is up to
     20 s, the page refreshes every few seconds, and bulk cannot wait."""
+    _require(service.nodes_db.device(device_id), "device")
     return {"job": service.node_poller.start_identify(int(device_id), trigger="manual")}
 
 
@@ -4951,6 +5012,7 @@ def get_nodes_device_identify(service, params, body, device_id) -> dict:
 
 
 def delete_nodes_device_identify(service, params, body, device_id) -> dict:
+    _require(service.nodes_db.device(device_id), "device")
     return {"cancelled": service.node_poller.cancel_identify(int(device_id))}
 
 
@@ -6381,9 +6443,7 @@ def _template_json(row, with_tokens: bool = False) -> dict:
 
 
 def get_alerts_overview(service, params, body) -> dict:
-    t1 = _num(params, "t1", time.time())
-    t0 = _num(params, "t0", t1 - 86400)
-    bucket = _num(params, "bucket", 3600)
+    t0, t1, bucket = _hist_window(params)
     return {
         "t0": t0, "t1": t1, "bucket_s": bucket,
         "buckets": service.alerts_db.histogram(t0, t1, bucket),
@@ -6818,6 +6878,10 @@ def _bulk_alert_ids(body) -> list[int]:
     ids = body.get("alert_ids") or []
     if not ids:
         raise ValueError("alert_ids is required")
+    if len(ids) > BULK_DEVICE_ID_MAX:
+        raise ValueError(
+            f"Too many alerts in one request: {len(ids)}, limit is "
+            f"{BULK_DEVICE_ID_MAX}. Send them in batches.")
     return [int(i) for i in ids]
 
 
@@ -7697,6 +7761,10 @@ def post_configrx_backups_bulk_delete(service, params, body) -> dict:
     ids = body.get("backup_ids") or []
     if not ids:
         raise ValueError("backup_ids is required")
+    if len(ids) > BULK_DEVICE_ID_MAX:
+        raise ValueError(
+            f"Too many backups in one request: {len(ids)}, limit is "
+            f"{BULK_DEVICE_ID_MAX}. Send them in batches.")
     removed = service.configrx_db.delete_backups([int(i) for i in ids])
     service.log.add(CONFIGRX_CATEGORY, f"Deleted {removed} stored config backup(s)")
     _audit(service, params, "configrx.backup_bulk_delete", target=f"{removed} backups")
@@ -9661,7 +9729,7 @@ def get_dashboard_offenders(service, params, body) -> dict:
     and `top_metric` exist for exactly this.
     """
     if not _dash_can(service, params, "nodes"):
-        raise PermissionError("Reading devices is not permitted")
+        raise _permissions.Forbidden("Reading devices is not permitted")
 
     window_s = _num(params, "window_s", DASHBOARD_OFFENDER_WINDOW_S) or DASHBOARD_OFFENDER_WINDOW_S
     since = time.time() - float(window_s)
