@@ -950,6 +950,115 @@ async function checkRouting(page, base, dir, tag) {
   await shoot(page, dir, `route-${tag}`);
 }
 
+/* 5.10.0: the Dashboard used to stay blank until the operator clicked to
+   another tab and back — start() awaited /api/state, /api/config and
+   /api/platform (each up to 30 s, all three slowest right after the pollers
+   start) before the eager module painted so much as "Loading…", and before
+   the first /api/dashboard went out. A fresh page with no selectTab call of
+   any kind is the only place that is observable, which is why these two run
+   on their own page rather than on the one the rest of the walk has driven.
+   The remembered tab is written first so the check does not depend on
+   whichever tab the walk above happened to leave behind. */
+async function checkDashboardFirstLoad(context, base, dir, tag) {
+  section('The Dashboard paints before anything is clicked (5.10.0)');
+
+  async function coldPage(stateDelayMs) {
+    const fresh = await context.newPage();
+    fresh.setDefaultTimeout(30000);
+    await fresh.addInitScript(() => {
+      try { localStorage.setItem('sappiwhere.tab', 'dashboard'); } catch { /* private browsing */ }
+    });
+    if (stateDelayMs) {
+      await fresh.route('**/api/state', async (route) => {
+        await sleep(stateDelayMs);
+        await route.continue();
+      });
+    }
+    return fresh;
+  }
+
+  // Every request the page makes on its own, so "in parallel with /api/state"
+  // can be asserted as an ordering rather than inferred from a screenshot.
+  function watchBoot(fresh) {
+    const marks = { dashboardRequest: null, stateResponse: null };
+    const started = Date.now();
+    fresh.on('request', (request) => {
+      if (marks.dashboardRequest) return;
+      if (new URL(request.url()).pathname === '/api/dashboard') {
+        marks.dashboardRequest = Date.now() - started;
+      }
+    });
+    fresh.on('response', (response) => {
+      if (marks.stateResponse) return;
+      if (new URL(response.url()).pathname === '/api/state') {
+        marks.stateResponse = Date.now() - started;
+      }
+    });
+    return marks;
+  }
+
+  await check('a cold load paints the tiles with no tab click at all', async () => {
+    const fresh = await coldPage(0);
+    try {
+      await fresh.goto(`${base}/`, { waitUntil: 'domcontentloaded' });
+      // "Loading…" (or the tiles, if the server is quick) on the first frame.
+      await fresh.waitForFunction(() => {
+        const grid = document.getElementById('dash-grid');
+        return !!grid && grid.textContent.trim().length > 0;
+      }, null, { timeout: 2000 });
+      await fresh.waitForFunction(
+        () => document.querySelectorAll('#dash-grid .tile').length > 0,
+        null, { timeout: 20000 });
+      const state = await fresh.evaluate(() => ({
+        tab: App.state.tab,
+        tiles: document.querySelectorAll('#dash-grid .tile').length,
+        clicked: false,
+      }));
+      assert(state.tab === 'dashboard', `landed on the ${state.tab} tab`);
+      assert(state.tiles >= 1, 'the grid drew no tile');
+      await shoot(fresh, dir, `dashboard-first-load-${tag}`);
+      return `${state.tiles} tile(s), nothing clicked`;
+    } finally {
+      await fresh.close().catch(() => {});
+    }
+  });
+
+  await check('a slow /api/state does not hold the first /api/dashboard behind it',
+    async () => {
+      const fresh = await coldPage(3000);
+      try {
+        const marks = watchBoot(fresh);
+        await fresh.goto(`${base}/`, { waitUntil: 'domcontentloaded' });
+        await fresh.waitForFunction(() => {
+          const grid = document.getElementById('dash-grid');
+          return !!grid && grid.textContent.trim().length > 0;
+        }, null, { timeout: 2500 });
+        await fresh.waitForFunction(
+          () => document.querySelectorAll('#dash-grid .tile').length > 0,
+          null, { timeout: 20000 });
+        // Read where the boot had got to at the moment the tiles were on
+        // screen: ordinarily /api/state has not answered at all yet, which
+        // is the whole point — the grid no longer waits for it.
+        const painted = { ...marks };
+        assert(painted.dashboardRequest != null, '/api/dashboard was never requested');
+        assert(painted.stateResponse == null
+               || painted.dashboardRequest < painted.stateResponse,
+               `/api/dashboard went out at ${painted.dashboardRequest} ms, after `
+               + `/api/state answered at ${painted.stateResponse} ms`);
+        const timer = await fresh.evaluate(() => !!App.state.timer);
+        assert(timer, 'the heartbeat had not started while /api/state was slow');
+        // The throttle is real, not a route that never continued.
+        await fresh.waitForFunction(() => !!App.state.serverState,
+                                    null, { timeout: 20000 });
+        return `tiles at ${painted.dashboardRequest} ms with /api/state `
+             + `${painted.stateResponse == null ? 'still in flight' : `answered at ${painted.stateResponse} ms`}`;
+      } finally {
+        await fresh.unroute('**/api/state').catch(() => {});
+        await fresh.close().catch(() => {});
+      }
+    });
+}
+
 async function checkDashboard(page, dir, tag) {
   section('The Dashboard is populated, and every count is a link (E10)');
 
@@ -1552,6 +1661,7 @@ async function main() {
 
     await checkTabsAndAria(page, dir, args.tag, adminWatcher);
     await checkDialog(page, dir, args.tag);
+    await checkDashboardFirstLoad(context, args.base, dir, args.tag);
     await checkDashboard(page, dir, args.tag);
     await checkRouting(page, args.base, dir, args.tag);
     await checkMisc(page, adminWatcher);

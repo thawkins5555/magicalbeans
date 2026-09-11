@@ -1175,6 +1175,20 @@ def seed_trace(netpath_db, target_id, ts, loss_pct, reached=0, rtt_ms=None):
     conn.close()
 
 
+def seed_https_check(netpath_db, target_id, ts, ok, error="HTTP 503",
+                     status_code=503, latency_ms=25.0):
+    """One web-page check row, written with a chosen ts — the checker itself
+    stamps time.time(), and these sections need checks minutes apart."""
+    conn = sqlite3.connect(netpath_db.path)
+    conn.execute(
+        "INSERT INTO https_checks(target_id, ts, ok, status_code, latency_ms,"
+        " error, final_url) VALUES (?,?,?,?,?,?,?)",
+        (target_id, ts, 1 if ok else 0, None if ok else status_code,
+         latency_ms, "" if ok else error, "https://10.31.11.10/"))
+    conn.commit()
+    conn.close()
+
+
 # ---- B9a: DHCP scope — count stays 1 across ticks with the same poll,
 # and only advances on a genuinely new poll.
 nodes, alerts, snmp, syslog, ipam, engine = build()
@@ -1295,6 +1309,65 @@ opened_np10 = open_rows(alerts, "netpath_unreachable", target_b10)
 assert len(opened_np10) == 1, opened_np10
 ok("netpath_unreachable with for_seconds=1200 opens only once the breach "
    "has spanned that long in trace time, not at for_polls' third trace")
+
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- B10c: NetPath web page — three failed checks open it, one success
+# clears it, and only a genuinely new check moves the count.
+nodes, alerts, snmp, syslog, ipam, engine = build()
+netpath_b10c = engine.netpath_db
+target_b10c = netpath_b10c.add_target("10.31.11.10", label="b10c-dest",
+                                      interval_s=300)
+netpath_b10c.update_target(target_b10c, https_url="https://10.31.11.10/")
+engine._tick()
+
+base_np10c = time.time() - 5 * 310
+for i in range(3):    # netpath_https_down ships for_polls=3
+    seed_https_check(netpath_b10c, target_b10c, base_np10c + i * 310, ok=False)
+    engine._tick()
+    if i < 2:
+        assert open_rows(alerts, "netpath_https_down", target_b10c) == [], \
+            f"opened before the third failed check (check {i})"
+opened_https = open_rows(alerts, "netpath_https_down", target_b10c)
+assert len(opened_https) == 1, opened_https
+assert "HTTP 503" in opened_https[0]["message"], opened_https[0]["message"]
+assert "10.31.11.10" in opened_https[0]["message"], opened_https[0]["message"]
+ok("netpath_https_down opens on the third consecutive failed web page check, "
+   "with the reason in its message")
+
+https_alert_id = opened_https[0]["id"]
+for _ in range(4):
+    engine._tick()          # no new check landed between these ticks
+held = open_rows(alerts, "netpath_https_down", target_b10c)
+assert len(held) == 1 and held[0]["id"] == https_alert_id, held
+assert held[0]["count"] == 1, held[0]["count"]
+ok("...and its count stays 1 across ticks that saw no new check")
+
+seed_https_check(netpath_b10c, target_b10c, base_np10c + 3 * 310, ok=False)
+engine._tick()
+again_https = open_rows(alerts, "netpath_https_down", target_b10c)
+assert len(again_https) == 1 and again_https[0]["count"] == 2, again_https
+ok("a fourth failed check bumps the count to 2")
+
+seed_https_check(netpath_b10c, target_b10c, base_np10c + 4 * 310, ok=True)
+engine._tick()
+assert open_rows(alerts, "netpath_https_down", target_b10c) == [], \
+    open_rows(alerts, "netpath_https_down", target_b10c)
+ok("the first successful check clears it outright")
+
+# A destination whose URL is cleared has nothing left to evaluate, so its
+# alert must not sit open for ever — the same sweep the threshold rules use.
+for i in range(3):
+    seed_https_check(netpath_b10c, target_b10c, base_np10c + (5 + i) * 310,
+                     ok=False)
+    engine._tick()
+assert len(open_rows(alerts, "netpath_https_down", target_b10c)) == 1
+netpath_b10c.update_target(target_b10c, https_url="")
+engine._tick()
+assert open_rows(alerts, "netpath_https_down", target_b10c) == [], \
+    "clearing the URL left the alert open with nothing left to clear it"
+ok("clearing the destination's URL resolves its open web page alert")
 
 nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
 

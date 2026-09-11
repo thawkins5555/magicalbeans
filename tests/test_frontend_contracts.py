@@ -2499,6 +2499,113 @@ check("escape(String(s.value))" in _slice59(_N59, "  function domValueCell(s) {"
                                             "  function domRowAttrs(s) {"),
       "domValueCell escapes its value like every sibling cell in those tables")
 
+# ---------------------------------------------------------------------------
+# 50. THE DASHBOARD PAINTS ON THE FIRST FRAME (5.10.0).
+#
+# start() wired the tabs, then awaited /api/state -> /api/config ->
+# /api/platform — each up to 30 s, and all three at their slowest in the
+# seconds right after the pollers start — before the eager module's init()
+# painted so much as "Loading…" and before the first /api/dashboard went
+# out. The heartbeat was the last line of all. Clicking to another tab and
+# back was the reported workaround: that path runs activate()+refreshNow
+# and waits for none of it.
+DASH = read("dashboard.js")
+_START = APP[APP.index("  async function start()"):APP.index("  // Started from here")]
+# The boot chain's own first await — not the `await post('/api/logout')`
+# inside the sign-out handler start() wires further up.
+_FIRST_AWAIT = _START.index("await loadState()")
+check("plannedInitialTab()" in _START
+      and _START.index("plannedInitialTab()") < _FIRST_AWAIT,
+      "start() works out the landing tab before its first await")
+check("page.init()" in _START and _START.index("page.init()") < _FIRST_AWAIT,
+      "the eager module's init() runs before the boot fetches, so the "
+      "Dashboard paints 'Loading…' on the first frame")
+check("selectTab(landing" in _START and _START.index("selectTab(landing") < _FIRST_AWAIT,
+      "...and its selectTab issues the first /api/dashboard in parallel with "
+      "/api/state rather than behind it")
+check("restartTimer();" in _START and _START.index("restartTimer();") < _FIRST_AWAIT,
+      "the heartbeat starts before the awaits, not after them — a page that "
+      "loads hidden never reached the last line of start() at all")
+check(_START.count("restartTimer();") == 1,
+      "...and it is started in exactly one place in start()")
+check("addEventListener('visibilitychange', onVisibilityChange)" in _START
+      and _START.index("addEventListener('visibilitychange'") < _FIRST_AWAIT,
+      "the visibility handler comes up with the heartbeat: a page brought "
+      "forward while the boot is still fetching must not miss the one event "
+      "that would start its timer")
+check("function plannedInitialTab()" in APP
+      and APP.count("localStorage.getItem(TAB_KEY)") == 1,
+      "the landing tab (hash, then the remembered tab, then Dashboard) is "
+      "worked out in one function rather than twice")
+_ENSURE = APP[APP.index("  function ensureModuleReady(name)"):
+              APP.index("  const activationReported = new Set();")]
+_EAGER50 = _ENSURE.split("if (!isLazyModule(name))")[1].split(
+    "if (pages[name] && pages[name].__ready)")[0]
+check("if (!pages[name])" in _EAGER50
+      and _EAGER50.index("Promise.reject(") < _EAGER50.index("Promise.resolve("),
+      "ensureModuleReady checks an eager module exists before resolving with "
+      "it — activating one that never registered was a silent no-op")
+check("never registered" in _EAGER50,
+      "...and it rejects with the same 'never registered' error the lazy path uses")
+_ACTIVATE = APP[APP.index("  const activationReported = new Set();"):
+                APP.index("  /* ---------------------------------------------------- host capabilities")]
+check("activationReported" in _ACTIVATE and "console.error(" in _ACTIVATE,
+      "activateTab's catch reports the failure once instead of swallowing it")
+_MASTER50 = APP[APP.index("  async function master()"):
+                APP.index("  function restartTimer()")]
+check("!first.lastFetch" in _MASTER50 and "refreshNow(state.tab)" in _MASTER50,
+      "a page that has never fetched still gets one refresh while /api/state "
+      "is failing — a tab switch would have fetched it")
+check("!state.loadingState" in _MASTER50 and "state.loadingState = false" in _MASTER50,
+      "the state poll is single-in-flight like a page's own refresh: an "
+      "/api/state slower than the 2 s tick would otherwise be aborted as "
+      "superseded by the next tick, for ever, and never land at all")
+check("state.loadingState = true" in _START
+      and _START.index("state.loadingState = true") < _FIRST_AWAIT,
+      "...and the boot's own first load claims the same flag, so the "
+      "heartbeat started above it cannot abort it")
+_PERMS50 = APP[APP.index("  function applyPermissions()"):APP.index("  const pages = {};")]
+check("page.permissionsChanged()" in _PERMS50,
+      "applyPermissions tells the modules already on screen that permissions "
+      "have landed (the Dashboard now paints before /api/config answers)")
+check("function permissionsChanged()" in DASH
+      and "permissionsChanged" in DASH.split("App.pages.dashboard = ")[1],
+      "...and dashboard.js takes that hook, so the offenders lists appear as "
+      "soon as the nodes grant arrives")
+_SPLIT50 = _START[_START.index("initKiosk();"):_START.index("window.addEventListener('resize'")]
+check(_SPLIT50.count("try {") >= 2,
+      "initSplitters() and applyDensity() are wrapped the way initKiosk() is, "
+      "so neither takes the module inits and the boot route down with it")
+_DRAW50 = DASH[DASH.index("  function draw() {"):DASH.index("  async function refresh()")]
+check("const parts = [errorLine];" in _DRAW50,
+      "dashboard.js draws a failed read as a line ABOVE the tiles rather than "
+      "replacing a whole shift's view with one sentence")
+_DREFRESH50 = DASH[DASH.index("  async function refresh()"):DASH.index("  function activate()")]
+check("if (error && error.superseded) { draw(); return; }" in _DREFRESH50,
+      "a superseded first fetch still draws — returning left the grid on "
+      "'Loading…' whenever the boot and the first poll tick overlapped")
+_OFFENDERS50 = _DREFRESH50[_DREFRESH50.index("OFFENDERS_EVERY_MS) {"):]
+check(_OFFENDERS50.index("view.offendersFetchedAt = now;")
+      > _OFFENDERS50.index("await App.get('/api/dashboard/offenders')"),
+      "...and offendersFetchedAt is stamped on the answer, not on the attempt")
+
+
+# --- 51. 5.10.0: the firmware report, the HTTPS check and the Debug column ----
+NODES51 = read("nodes.js")
+NETPATH51 = read("netpath.js")
+DEBUG51 = read("debug.js")
+ALERTS51 = read("alerts.js")
+for needle in ("'/api/nodes/reports/firmware'", "'/api/nodes/reports/firmware/export.csv'",
+               "['sw_version', ", "['sw_image', "):
+    check(needle in NODES51, "nodes.js carries the firmware report route / detail field %s" % needle)
+for needle in ("f-https-url", "f-https-insecure", "WEB PAGE", "/api/netpath/https"):
+    check(needle in NETPATH51, "netpath.js carries the web-page check element %s" % needle)
+check("stat-web" in read("index.html"), "the Routes pane has the fifth 'Web page' tile")
+check("'Web page'" in DEBUG51 and "worker.https" in DEBUG51,
+      "the Debug page shows each destination's web-page state beside its trace state")
+check('value="netpath_event"' in ALERTS51,
+      "a custom rule can be given the netpath_event kind the HTTPS rule uses")
+
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

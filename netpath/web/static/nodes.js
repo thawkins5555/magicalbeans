@@ -97,6 +97,8 @@
     repAvailSort: App.recallSort('nodes-rep-avail', { key: 'availability_pct', descending: false }),
     repTopn: null,
     repTopnSort: App.recallSort('nodes-rep-topn', { key: 'peak', descending: true }),
+    repFirmware: null,
+    repFirmwareSort: App.recallSort('nodes-rep-fw', { key: 'sw_version', descending: false }),
   };
 
   const escape = App.escapeHtml;
@@ -159,6 +161,12 @@
     if (counts.maintenance) parts.push(`${counts.maintenance} in maintenance`);
     if (counts.unsupported) parts.push(`${counts.unsupported} unsupported`);
     if (counts.auth) parts.push(`${counts.auth} auth failed`);
+    // A delete answers at once and the history goes in background batches,
+    // so this line is where "it is still going" is visible.
+    const purges = nodes.purges || {};
+    if (purges.pending) {
+      parts.push(`purging history for ${purges.pending} device(s)`);
+    }
     parts.push(`${c.polls || 0} polls · ${c.errors || 0} errors`);
     // On a wall the counts are the point: figures, not a line of prose.
     if (App.state.kiosk) {
@@ -305,6 +313,13 @@
     { key: 'sys_object_id', label: 'sysObjectID', width: 180,
       value: (r) => r.sys_object_id || '',
       cell: (r) => escape(r.sys_object_id || '\u2014') },
+    // Off by default like Location above: plenty of gear names no version,
+    // and this is here so a fleet can be SORTED by what it runs \u2014 the
+    // Reports tab's Firmware inventory is the fuller answer.
+    { key: 'sw_version', label: 'Software', width: 130,
+      value: (r) => r.sw_version || '',
+      cell: (r) => escape(r.sw_version || '\u2014')
+        + (r.sw_image ? `<div class="ip-line">${escape(r.sw_image)}</div>` : '') },
   ];
 
   // A device can answer on more addresses than the one it was entered
@@ -666,6 +681,8 @@
         if (view.selected && ids.includes(view.selected)) view.selected = null;
         view.devicesChecked.clear();
         App.refreshNow('nodes');
+        App.toast(`Removed ${ids.length} device(s); their history is being `
+          + 'purged in the background', 'ok');
       });
   }
 
@@ -1023,7 +1040,7 @@
     const s = App.state.nodesSettings || {};
     // ?? not ||: an admin who unchecks every field means "just IP·status",
     // which arrives as '' and must not fall back to the defaults.
-    const fields = String(s.detail_fields ?? 'sys_descr,vendor,snmp_version')
+    const fields = String(s.detail_fields ?? 'sys_descr,vendor,snmp_version,sw_version,sw_image')
       .split(',').map((f) => f.trim()).filter(Boolean);
     // IP · status always leads and any SNMP error always trails; the
     // fields between them are the admin's Settings choice.
@@ -1057,6 +1074,15 @@
       }[d.vendor_source] || '')
         + (d.vendor && d.vendor_confidence && d.vendor_confidence !== 'high'
            ? ` ${d.vendor_confidence}` : '')),
+      // What the device is running (netpath/swversion.py). The image line
+      // carries the boot image FILE after it where one was read: on an
+      // IOS-XE box in install mode the file (bootflash:packages.conf) is
+      // all there is, and on a classic one the pair together is what an
+      // operator checks an upgrade against.
+      sw_version: () => field('software', d.sw_version),
+      sw_image: () => field('image', (d.sw_image || d.sw_image_file || '')
+        && (d.sw_image || '') + (d.sw_image && d.sw_image_file ? ' — ' : '')
+           + (d.sw_image_file || '')),
       // effective_config is only on the single-device endpoint; guarded so
       // this stays safe for any caller passing a plain list row.
       snmp_version: () => field('SNMP', (d.effective_config
@@ -3827,7 +3853,8 @@
   }
 
   function fillReportDevGroupSelects() {
-    for (const id of ['nd-rep-avail-devgroup', 'nd-rep-topn-devgroup']) {
+    for (const id of ['nd-rep-avail-devgroup', 'nd-rep-topn-devgroup',
+                      'nd-rep-fw-devgroup']) {
       const select = App.el(id);
       const current = select.value;
       select.innerHTML = reportDevGroupOptionsHtml();
@@ -4095,6 +4122,119 @@
     const to = App.isoLocal(report.t1).slice(0, 10);
     saveReportCsv(`top-metrics-${report.key.replace(/[^\w.-]/g, '_')}-${from}-to-${to}.csv`,
       header, rows);
+  }
+
+  /* ------------------------------------------------ firmware inventory
+
+     No period: /api/nodes/reports/firmware reads the identity columns as
+     they stand, so this report has a group filter and nothing else. */
+  const FIRMWARE_COLUMNS = [
+    { key: 'name', label: 'Device', width: 190,
+      value: (r) => r.name || r.ip || `#${r.device_id}`,
+      cell: (r) => App.deviceNameLink(r.name || r.ip || `#${r.device_id}`,
+                                      { id: r.device_id }) +
+        (r.name && r.ip ? `<div class="ip-line">${escape(r.ip)}</div>` : '') },
+    { key: 'vendor', label: 'Vendor', width: 110,
+      cell: (r) => escape(r.vendor || '—') },
+    { key: 'sw_version', label: 'Software', width: 140,
+      cell: (r) => (r.sw_version ? escape(r.sw_version)
+        : '<span class="hint">not reported</span>') },
+    { key: 'sw_image', label: 'Image', width: 200,
+      cell: (r) => escape(r.sw_image || '—') +
+        (r.sw_image_file ? `<div class="ip-line">${escape(r.sw_image_file)}</div>` : '') },
+    { key: 'model_hint', label: 'Description', width: 220,
+      cell: (r) => escape(r.model_hint || '—') },
+    { key: 'last_poll_ts', label: 'Last poll', width: 100, numeric: true,
+      value: (r) => r.last_poll_ts || 0, cell: (r) => App.agoCell(r.last_poll_ts) },
+  ];
+
+  function onFirmwareSort(key, descending) {
+    view.repFirmwareSort = { key, descending };
+    drawFirmwareReportTable();
+  }
+
+  function drawFirmwareReportTable() {
+    const report = view.repFirmware;
+    const rows = report ? report.rows : [];
+    const table = App.grid(App.el('nd-rep-fw-table'), {
+      name: 'nodes-rep-fw', caption: 'Firmware inventory report',
+      columns: FIRMWARE_COLUMNS, sort: view.repFirmwareSort, onSort: onFirmwareSort });
+    const body = document.createElement('tbody');
+    const sorted = App.sortRows(rows, view.repFirmwareSort.key,
+      view.repFirmwareSort.descending, FIRMWARE_COLUMNS);
+    App.drawRows(body, sorted, FIRMWARE_COLUMNS, (tr, r) => {
+      if (!r._known) { tr.className = ''; tr.onclick = null; return; }
+      tr.className = 'clickable';
+      tr.title = 'Open this device on the Devices subtab';
+      tr.onclick = () => {
+        App.rememberSub('nodes', 'devices');
+        selectSub('devices');
+        selectDevice(r.device_id);
+      };
+    }, report ? 'No devices matched this report.'
+      : 'Click Run report.');
+    table.appendChild(body);
+    App.wireRowKeyboard(body);
+  }
+
+  /* Same shape as the other two runs: the group lookup happens inside the
+     promise App.runJob is given, never before it. */
+  function runFirmwareReport() {
+    const button = App.el('nd-rep-fw-run');
+    return App.runJob(button, {
+      queued: 'Running…',
+      done: (result) => (result ? `${result.rows.length} device(s)` : 'No matching devices'),
+    }, (async () => {
+      const device_ids = await reportDeviceIds('nd-rep-fw-devgroup');
+      if (device_ids && !device_ids.length) {
+        view.repFirmware = null;
+        drawFirmwareReportTable();
+        App.setText(App.el('nd-rep-fw-summary'), 'No devices in that group.');
+        return null;
+      }
+      const params = {};
+      if (device_ids) params.device_ids = device_ids.join(',');
+      const result = await App.get('/api/nodes/reports/firmware', params);
+      const { byId } = await App.deviceIndex();
+      for (const row of result.rows) { row.id = row.device_id; row._known = byId.has(row.device_id); }
+      view.repFirmware = result;
+      drawFirmwareReportTable();
+      App.setText(App.el('nd-rep-fw-summary'),
+        `${result.device_count} device(s) · ${result.version_count} distinct ` +
+        `version(s)` + (result.unknown_count
+          ? ` · ${result.unknown_count} reporting none` : ''));
+      return result;
+    })());
+  }
+
+  const FIRMWARE_CSV_HEADER = ['device_id', 'name', 'ip', 'vendor', 'model_hint',
+    'sw_version', 'sw_image', 'sw_image_file', 'last_poll_ts'];
+
+  function exportFirmwareReportCsv() {
+    const report = view.repFirmware;
+    if (!report || !report.rows.length) {
+      App.toast('Run the report first.', 'warn');
+      return;
+    }
+    const rows = report.rows.map((r) => [r.device_id, r.name, r.ip, r.vendor,
+      r.model_hint, r.sw_version, r.sw_image, r.sw_image_file, r.last_poll_ts]);
+    saveReportCsv(`firmware-${App.isoLocal(report.generated_ts).slice(0, 10)}.csv`,
+      FIRMWARE_CSV_HEADER, rows);
+  }
+
+  /* The server builds the same rows again rather than the browser sending
+     up the ones it holds: a 900-device fleet is a file to hand somebody,
+     and this way the download does not depend on the report having been
+     run — or on the tab having stayed open while it was. */
+  async function exportFirmwareReportCsvFromServer() {
+    const device_ids = await reportDeviceIds('nd-rep-fw-devgroup');
+    if (device_ids && !device_ids.length) {
+      App.toast('No devices in that group.', 'warn');
+      return;
+    }
+    const params = {};
+    if (device_ids) params.device_ids = device_ids.join(',');
+    App.exportCsv('/api/nodes/reports/firmware/export.csv', params);
   }
 
   function selectReportsSub(name) {
@@ -4592,6 +4732,10 @@
         view.detail = null;
         loadDetail();
         App.refreshNow('nodes');
+        // The device is gone from every list already; what is still
+        // running is the delete of its history, which the status strip
+        // counts down.
+        App.toast('Removed; its history is being purged in the background', 'ok');
       }, (confirmed) => { if (!confirmed) editDevice(); });
   }
 
@@ -6060,6 +6204,8 @@
     ['sys_location', 'Location (sysLocation)'],
     ['vendor', 'Vendor'],
     ['snmp_version', 'SNMP version in use'],
+    ['sw_version', 'Software version'],
+    ['sw_image', 'Software image (and boot file)'],
   ];
 
   function settingsDialog() {
@@ -6791,8 +6937,14 @@
     App.el('nd-rep-topn-90d').onclick = () => setPeriodDays('nd-rep-topn', 90);
     App.el('nd-rep-topn-run').onclick = () => { runTopMetricsReport()?.catch(() => {}); };
     App.el('nd-rep-topn-export-csv').onclick = exportTopnReportCsv;
+    App.el('nd-rep-fw-run').onclick = () => { runFirmwareReport()?.catch(() => {}); };
+    App.el('nd-rep-fw-export-csv').onclick = exportFirmwareReportCsv;
+    App.el('nd-rep-fw-export-server').onclick = () => {
+      exportFirmwareReportCsvFromServer().catch(() => {});
+    };
     drawAvailReportTable();
     drawTopnReportTable();
+    drawFirmwareReportTable();
 
     // The timeline is drawn into a viewBox sized from its box, so a
     // resize needs a redraw from the data already loaded — no refetch.

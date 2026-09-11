@@ -646,8 +646,9 @@ DEFAULTS = {
     "max_mib_bundle_bytes": 64 * 1024 * 1024,
     "resolve_addresses": True,
     "max_scan_addresses": 1024,
-    "detail_fields": "sys_descr,vendor,snmp_version",  # identity fields shown in
-                                                       # the device detail header
+    # Identity fields shown in the device detail header. An install with a
+    # saved setting keeps its own list; the picker simply offers the new boxes.
+    "detail_fields": "sys_descr,vendor,snmp_version,sw_version,sw_image",
     "seeded_mib_files": "",  # CSV of bundled netpath/mibs/*.mib filenames ever
                               # auto-loaded, so a deliberate delete is never
                               # silently redone on the next restart
@@ -1225,6 +1226,13 @@ class NodesDatabase(SqliteStore):
             # read back beside the interface list it explains.
             "interfaces_note": "TEXT NOT NULL DEFAULT ''",
         })
+        # What software the device is running, split by swversion.py out of
+        # sysDescr and one best-effort vendor GET. NULL where nothing
+        # matched — never a guess. sw_image_file is Cisco's sysConfigName,
+        # the boot image's file path, which is not a version.
+        self.ensure_columns("devices", {
+            "sw_version": "TEXT", "sw_image": "TEXT", "sw_image_file": "TEXT",
+        })
         self.ensure_columns("groups", {
             "lldp_interval_s": "INTEGER", "poe_enabled": "INTEGER",
             "stp_enabled": "INTEGER", "vlan_interval_s": "INTEGER",
@@ -1270,6 +1278,25 @@ class NodesDatabase(SqliteStore):
         # keep them until this runs.
         for name in ("ix_vlans_device", "ix_vlan_ports_device", "ix_port_vlans_device"):
             self._conn.execute(f"DROP INDEX IF EXISTS {name}")
+
+        # One row per device whose history is still being deleted; see
+        # request_device_removal. The row reserves the id: devices.id is
+        # INTEGER PRIMARY KEY without AUTOINCREMENT, and the devices row is
+        # dropped only once every child and series row is gone.
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS device_purges ("
+            " device_id    INTEGER PRIMARY KEY,"
+            " ip           TEXT,"
+            " name         TEXT,"
+            " requested_ts REAL,"
+            " phase        TEXT,"
+            " rows_removed INTEGER NOT NULL DEFAULT 0)")
+        # The one foreign key with no index of its own: without it the
+        # ON DELETE SET NULL fired by every device delete scans the whole
+        # discovery history.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_discovery_results_promoted"
+            " ON discovery_results(promoted_device_id)")
 
         # The pool sizes itself from 5.5.0, and an upgrade must not be able
         # to take threads away from a fleet that was tuned by hand. An
@@ -1629,7 +1656,10 @@ class NodesDatabase(SqliteStore):
                               text: str | None, device_group_id: int | None,
                               exclude_up: bool, only_ids=None, exclude_ids=None,
                               overrides_only: bool = False) -> tuple[str, list]:
-        clauses, params = [], []
+        # A device whose removal has been requested is gone as far as every
+        # reader is concerned; only the purge itself still sees the row.
+        clauses = ["id NOT IN (SELECT device_id FROM device_purges)"]
+        params: list = []
         if only_ids is not None:
             # A set of ids decided OUTSIDE this database — today, the devices
             # alerts.db says are in maintenance mode. Filtered here rather
@@ -1697,8 +1727,12 @@ class NodesDatabase(SqliteStore):
             # LIKE above, which leaves it just as far under anything an
             # operator would notice. A leading-% LIKE cannot use
             # ix_device_addresses_ip, at this scale or any other.
+            # sw_version/sw_image too, so "which boxes are still on 15.2(7)E4"
+            # is a search rather than a report — the firmware report answers
+            # the fleet-wide question, this answers the one-off one.
             text_cols = ("ip", "name", "sys_name", "sys_location",
-                         "sys_descr", "sys_contact", "vendor")
+                         "sys_descr", "sys_contact", "vendor",
+                         "sw_version", "sw_image")
             text_sql = " OR ".join(f"{col} LIKE ? {LIKE_ESCAPE}"
                                    for col in text_cols)
             text_sql += (" OR id IN (SELECT device_id FROM device_addresses"
@@ -1794,9 +1828,12 @@ class NodesDatabase(SqliteStore):
         return [r[0] for r in rows]
 
     def device(self, device_id: int) -> sqlite3.Row | None:
+        # None once removal has been requested, so every route that starts
+        # with _require(device(...)) answers 404 while the purge runs.
         with self._lock:
             return self._conn.execute(
-                "SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+                "SELECT * FROM devices WHERE id = ? AND id NOT IN"
+                " (SELECT device_id FROM device_purges)", (device_id,)).fetchone()
 
     def device_by_ip(self, ip: str) -> sqlite3.Row | None:
         with self._lock:
@@ -2032,7 +2069,16 @@ class NodesDatabase(SqliteStore):
 
         identified_ts is deliberately left NULL: the sweep's arc hop names a
         vendor, but scoring the MIB corpus and assigning a MIB need the
-        poller, so the first poll still runs the full fingerprint."""
+        poller, so the first poll still runs the full fingerprint.
+
+        The software version is derived here rather than passed in: a sweep
+        reads sysDescr and sysObjectID and nothing else, and those two are
+        already everything swversion.extract() needs for the vendors that
+        write the version into sysDescr. The first poll overwrites it with
+        the vendor-scalar answer where there is one."""
+        from . import nodeoids, swversion
+        sw = swversion.extract(nodeoids.enterprise_arc(sys_object_id or ""),
+                               sys_descr, {})
         with self._lock:
             # vendor_detected too: discovery identified this from SNMP, so it
             # is a detected value by definition, and leaving it NULL until the
@@ -2041,10 +2087,12 @@ class NodesDatabase(SqliteStore):
             self._conn.execute(
                 "UPDATE devices SET sys_descr = ?, sys_name = ?,"
                 " sys_object_id = ?, vendor = ?, vendor_detected = ?,"
-                " vendor_source = ?, vendor_confidence = ?, vendor_evidence = ?"
+                " vendor_source = ?, vendor_confidence = ?, vendor_evidence = ?,"
+                " sw_version = ?, sw_image = ?"
                 " WHERE id = ?",
                 (sys_descr, sys_name, sys_object_id, vendor, vendor,
                  vendor_source or "", vendor_confidence or "", vendor_evidence,
+                 sw.version or None, sw.image or None,
                  device_id))
             self._conn.commit()
 
@@ -2124,21 +2172,245 @@ class NodesDatabase(SqliteStore):
         return ids
 
     def bulk_remove_devices(self, device_ids: list[int]) -> int:
-        if not device_ids:
+        """Queue many devices for removal and purge them here and now.
+
+        Synchronous, as it always was; only the HTTP route is asynchronous.
+        """
+        queued = self.request_device_removal(device_ids)
+        self.purge_all()
+        return queued
+
+    # ------------------------------------------------------------- removal
+    #
+    # A device delete is the one write whose size is set by how long the
+    # device has been polled: nine child tables here and, across the file
+    # boundary, every sample and rollup of every metric it ever had —
+    # ~3.4M rows for one 48-port switch at shipped retention, which as one
+    # transaction stopped the poll cycle and every chart read for as long
+    # as it took. So the request writes a tombstone and the rows go in
+    # batches.
+
+    # Seconds of work per purge_step() call.
+    PURGE_BUDGET_S = 1.0
+
+    # Deleted in this order: interface_events reaches its rows through
+    # interfaces, so it goes before them, and every table goes before the
+    # devices row itself. The last three carry no foreign key at all (see
+    # their CREATE TABLE comments), so before this they were orphaned by a
+    # delete rather than removed by it.
+    _PURGE_TABLES = (
+        ("interface_events",
+         "interface_id IN (SELECT id FROM interfaces WHERE device_id = ?)"),
+        ("interfaces", "device_id = ?"),
+        ("interface_thresholds", "device_id = ?"),
+        ("mac_entries", "device_id = ?"),
+        ("arp_entries", "device_id = ?"),
+        ("neighbors", "device_id = ?"),
+        ("device_addresses", "device_id = ?"),
+        ("device_events", "device_id = ?"),
+        ("vlans", "device_id = ?"),
+        ("vlan_ports", "device_id = ?"),
+        ("port_vlans", "device_id = ?"),
+    )
+
+    def request_device_removal(self, device_ids) -> int:
+        """Mark devices for removal, in one short transaction.
+
+        The device stops being polled, stops being visible and gives up its
+        address at once — deleting a device to re-add it at the same IP must
+        not mean waiting out the purge — while the id stays reserved by the
+        device_purges row until the last child row is gone.
+        """
+        ids = [int(i) for i in device_ids or ()]
+        if not ids:
             return 0
-        removed = 0
+        now = time.time()
+        queued = 0
         with self._lock:
-            for chunk in _id_chunks(device_ids):
+            for chunk in _id_chunks(ids):
                 marks = ",".join("?" * len(chunk))
-                cursor = self._conn.execute(
-                    f"DELETE FROM devices WHERE id IN ({marks})", chunk)
-                removed += cursor.rowcount or 0
+                rows = self._conn.execute(
+                    f"SELECT id, ip, name FROM devices WHERE id IN ({marks})",
+                    chunk).fetchall()
+                for row in rows:
+                    cursor = self._conn.execute(
+                        "INSERT OR IGNORE INTO device_purges(device_id, ip,"
+                        " name, requested_ts, phase) VALUES (?,?,?,?,'queued')",
+                        (row["id"], row["ip"], row["name"], now))
+                    queued += cursor.rowcount or 0
+                self._conn.execute(
+                    "UPDATE devices SET enabled = 0,"
+                    " ip = 'purging:' || id WHERE id IN"
+                    f" ({marks}) AND id IN (SELECT device_id FROM device_purges)",
+                    chunk)
             self._conn.commit()
             self._config_generation += 1
-        # The ON DELETE CASCADE that used to reach `metrics` now crosses a
-        # file boundary, so it is one more call rather than one more clause.
-        self.series_db.delete_metrics_for_devices(device_ids)
+        return queued
+
+    def purges_pending(self) -> int:
+        with self._lock:
+            return int(self._conn.execute(
+                "SELECT COUNT(*) FROM device_purges").fetchone()[0])
+
+    def purge_status(self) -> dict:
+        """What the status payload and /api/nodes/purges report."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS pending, COALESCE(SUM(rows_removed), 0)"
+                " AS rows_removed FROM device_purges").fetchone()
+            current = self._conn.execute(
+                "SELECT ip, name, phase FROM device_purges"
+                " ORDER BY requested_ts, device_id LIMIT 1").fetchone()
+        return {
+            "pending": int(row["pending"]),
+            "rows_removed": int(row["rows_removed"]),
+            "current": ({"ip": current["ip"], "name": current["name"],
+                         "phase": current["phase"] or ""} if current else None),
+        }
+
+    def purge_step(self, stop_event=None, budget_s: float | None = None) -> dict:
+        """Delete some of what the pending purges still hold, then return.
+
+        Every batch inside is its own lock hold and commit, and nothing is
+        remembered between calls beyond the device_purges rows — which is
+        what makes a purge interrupted by a restart resume.
+        """
+        deadline = time.monotonic() + (self.PURGE_BUDGET_S if budget_s is None
+                                       else max(0.0, budget_s))
+        removed = 0
+        purged = 0
+        while stop_event is None or not stop_event.is_set():
+            row = self._next_purge()
+            if row is None:
+                break
+            got, done = self._purge_device(row, stop_event, deadline)
+            removed += got
+            if not done:
+                break
+            purged += 1
+            if time.monotonic() >= deadline:
+                break
+        status = self.purge_status()
+        status.update({"rows_removed_now": removed, "purged": purged})
+        return status
+
+    def purge_all(self, stop_event=None) -> int:
+        """Run the pending purges to completion — the synchronous path
+        remove_device/bulk_remove_devices and the tests keep."""
+        removed = 0
+        while self.purges_pending():
+            if stop_event is not None and stop_event.is_set():
+                break
+            step = self.purge_step(stop_event, budget_s=float("inf"))
+            removed += step["rows_removed_now"]
+            if not step["purged"]:
+                break
         return removed
+
+    def _next_purge(self) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM device_purges ORDER BY requested_ts, device_id"
+                " LIMIT 1").fetchone()
+
+    def _purge_device(self, purge: sqlite3.Row, stop_event,
+                      deadline: float) -> tuple[int, bool]:
+        """One device's rows, series first and its own row last."""
+        device_id = int(purge["device_id"])
+        removed = 0
+        # Series first: it is the large half, it is in the other file, and
+        # a metrics row left behind once the devices row is gone would be
+        # inherited by whatever device SQLite hands the freed id to next.
+        self._set_purge_phase(device_id, "history")
+        got, done = self.series_db.delete_metrics_for_device_batched(
+            device_id, deadline)
+        removed += got
+        if done:
+            for table, where in self._PURGE_TABLES:
+                if stop_event is not None and stop_event.is_set():
+                    done = False
+                    break
+                got, done = self._delete_rows_batched(
+                    table, where, (device_id,), deadline)
+                removed += got
+                if not done:
+                    break
+        if removed:
+            self._count_purged(device_id, removed)
+        if not done:
+            return removed, False
+        with self._lock:
+            # upstream_id carries no foreign key (it names a device in this
+            # same table), so nothing would clear it: the next device handed
+            # this id would silently become the upstream of whatever this
+            # one was the upstream of.
+            self._conn.execute(
+                "UPDATE devices SET upstream_id = NULL WHERE upstream_id = ?",
+                (device_id,))
+            # The devices row last, once the cascade below it finds
+            # nothing, and the tombstone with it: the id is reusable only
+            # from this commit on.
+            self._conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
+            self._conn.execute(
+                "DELETE FROM device_purges WHERE device_id = ?", (device_id,))
+            self._conn.commit()
+            self._config_generation += 1
+        self._reclaim_both(0.5)
+        return removed, True
+
+    def _reclaim_both(self, budget_s: float) -> None:
+        """Hand the freed pages back, in slices short enough that a reader
+        waiting on the lock gets in between them.
+
+        Not SqliteStore._reclaim_until: that reacquires in a tight loop for
+        its whole budget, and a Python lock is not fair — 950 ms of reader
+        stall on bench_prune's device-delete case.
+        """
+        for store in (self, self.series_db):
+            deadline = time.monotonic() + budget_s
+            while time.monotonic() < deadline:
+                if not reclaim(store._conn, store._lock, pages=500,
+                               budget_s=0.05, label=store.LABEL):
+                    break
+                time.sleep(0.01)
+
+    def _set_purge_phase(self, device_id: int, phase: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE device_purges SET phase = ? WHERE device_id = ?",
+                (phase, device_id))
+            self._conn.commit()
+
+    def _count_purged(self, device_id: int, rows: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE device_purges SET rows_removed = rows_removed + ?"
+                " WHERE device_id = ?", (int(rows), device_id))
+            self._conn.commit()
+
+    def _delete_rows_batched(self, table: str, where: str, params,
+                             deadline: float) -> tuple[int, bool]:
+        """Rows matching `where`, in batches of rowids — _prune_seen_ts'
+        shape, with a deadline. Returns (rows removed, finished)."""
+        with self._lock:
+            bounds = self._conn.execute(
+                f"SELECT MIN(rowid) AS lo, MAX(rowid) AS hi FROM {table}"
+                f" WHERE {where}", params).fetchone()
+        if bounds["lo"] is None:
+            return 0, True
+        cut = bounds["hi"] + 1
+
+        def delete(low_id: int, upper: int) -> int:
+            cursor = self._conn.execute(
+                f"DELETE FROM {table} WHERE rowid >= ? AND rowid < ?"
+                f" AND {where}", (low_id, upper, *params))
+            return cursor.rowcount or 0
+
+        removed, reached = self._delete_batches(
+            bounds["lo"], cut, deadline, delete, chunk=EVENT_PRUNE_CHUNK,
+            chunk_min=EVENT_PRUNE_CHUNK_MIN, chunk_max=EVENT_PRUNE_CHUNK_MAX,
+            pause=self.series_db.PURGE_PAUSE_S)
+        return removed, reached >= cut
 
     def set_device_credential(self, device_id: int, user: str, auth_proto: str,
                               password_enc: bytes, priv_proto: str | None = None,
@@ -2159,11 +2431,14 @@ class NodesDatabase(SqliteStore):
             self._config_generation += 1
 
     def remove_device(self, device_id: int) -> None:
-        with self._lock:
-            self._conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
-            self._conn.commit()
-            self._config_generation += 1
-        self.series_db.delete_metrics_for_devices([device_id])
+        """Queue the device for removal and purge it to completion.
+
+        Still synchronous — see bulk_remove_devices. The routes call
+        request_device_removal instead and leave the purge to the
+        DevicePurger thread.
+        """
+        self.request_device_removal([device_id])
+        self.purge_all()
 
     def config_generation(self) -> int:
         """A counter that moves whenever a settings, profile, credential or
@@ -2187,7 +2462,8 @@ class NodesDatabase(SqliteStore):
         with self._lock:
             return self._conn.execute(
                 "SELECT id, name, ip, status, consecutive_fail, last_poll_ts"
-                " FROM devices WHERE enabled = 1").fetchall()
+                " FROM devices WHERE enabled = 1 AND id NOT IN"
+                " (SELECT device_id FROM device_purges)").fetchall()
 
     def effective_configs(self) -> dict:
         """effective_config() for every enabled device, with the settings
@@ -2403,6 +2679,13 @@ class NodesDatabase(SqliteStore):
                     "vendor_confidence": identity.get("vendor_confidence") or "",
                     "vendor_arc": identity.get("vendor_arc"),
                 })
+                # Written (NULL included, so a re-identified box does not
+                # keep the version it used to run) only when the poll
+                # actually read them: an identity dict from a caller that
+                # predates them leaves whatever is on file alone.
+                for key in ("sw_version", "sw_image", "sw_image_file"):
+                    if key in identity:
+                        fields[key] = identity[key] or None
             if interfaces_note is not None:
                 fields["interfaces_note"] = interfaces_note
             if uptime_ticks is not None:

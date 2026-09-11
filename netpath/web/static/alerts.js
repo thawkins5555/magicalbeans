@@ -1108,7 +1108,8 @@
     const isThreshold = r.kind === 'threshold' || r.kind === 'dhcp_threshold'
       || r.kind === 'netpath_threshold';
     const pollNoun = { dhcp_threshold: 'DHCP polls',
-                       netpath_threshold: 'traces' }[r.kind] || 'polls';
+                       netpath_threshold: 'traces',
+                       netpath_event: 'web page checks' }[r.kind] || 'polls';
     // The flapping rule counts link transitions in a time window rather than
     // comparing a value to a threshold, so it gets its own two fields
     // instead of the threshold ones. Its kind is interface_event, not
@@ -1198,6 +1199,14 @@
           ' reached the destination.',
       }[r.source_kind] || 'Evaluated once per completed trace to this' +
         ' destination, so "consecutive traces" means what it says.'}</p>` : ''}` : ''}
+      ${r.kind === 'netpath_event' ? `
+      <label>Consecutive ${pollNoun} before firing <input id="ar-forpolls"
+        type="number" min="1" value="${r.for_polls || 1}"></label>
+      <p class="hint">One HTTPS GET of the destination's page runs on that
+        destination's own trace interval. Anything in the 200s or 300s is
+        available; a 4xx/5xx, a timeout, a DNS failure or a certificate that
+        does not verify is not. The alert clears on the first check that
+        succeeds, so this number is the only anti-flap it has.</p>` : ''}
       ${isFlapping ? `
       <label>Flaps before firing <input id="ar-flapcount" type="number" min="2"
         placeholder="3" value="${r.flap_min_transitions ?? ''}"></label>
@@ -1248,6 +1257,10 @@
               ? null : Number(text);
           }
         }
+        // for_polls lives outside the threshold block for a kind that
+        // counts checks rather than comparing a value (netpath_event).
+        const forPollsEl = box.querySelector('#ar-forpolls');
+        if (!isThreshold && forPollsEl) values.for_polls = Number(forPollsEl.value);
         if (isFlapping) {
           // Blank means NULL — "use the shipped defaults" — not zero, which
           // would mean "fire on no transitions at all".
@@ -1276,6 +1289,7 @@
         <option value="threshold">threshold</option>
         <option value="dhcp_threshold">dhcp_threshold</option>
         <option value="netpath_threshold">netpath_threshold</option>
+        <option value="netpath_event">netpath_event</option>
         <option value="wireless_event">wireless_event</option>
         <option value="trap">trap</option>
         <option value="syslog">syslog</option>

@@ -72,6 +72,22 @@ CREATE TABLE IF NOT EXISTS hops (
 CREATE INDEX IF NOT EXISTS ix_hops_trace ON hops(trace_id, ttl);
 CREATE INDEX IF NOT EXISTS ix_hops_ip ON hops(ip);
 
+-- One HTTPS availability check of a destination's web page. Its own table
+-- rather than a column on traces: the two run on their own schedules and a
+-- destination can have one without the other.
+CREATE TABLE IF NOT EXISTS https_checks (
+    id          INTEGER PRIMARY KEY,
+    target_id   INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+    ts          REAL    NOT NULL,
+    ok          INTEGER NOT NULL,
+    status_code INTEGER,
+    latency_ms  REAL,
+    error       TEXT,
+    final_url   TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_https_checks_target_ts
+    ON https_checks(target_id, ts);
+
 CREATE TABLE IF NOT EXISTS hop_stats (
     target_id  INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
     ip         TEXT    NOT NULL,
@@ -186,7 +202,10 @@ class Database(SqliteStore):
         self.ensure_columns("traces", {"icmp_code": "TEXT", "icmp_from": "TEXT"})
         self.ensure_columns("targets", {
             "timeout_s": "REAL NOT NULL DEFAULT 2.0",
-            "hop_probe_enabled": "INTEGER NOT NULL DEFAULT 0"})
+            "hop_probe_enabled": "INTEGER NOT NULL DEFAULT 0",
+            # Empty or NULL means this destination has no web page to check.
+            "https_url": "TEXT",
+            "https_insecure": "INTEGER NOT NULL DEFAULT 0"})
 
     # -------------------------------------------------------------- settings
 
@@ -250,7 +269,7 @@ class Database(SqliteStore):
         allowed = {
             "host", "label", "interval_s", "max_hops", "probes",
             "warn_rtt_ms", "warn_loss", "timeout_s", "enabled",
-            "hop_probe_enabled",
+            "hop_probe_enabled", "https_url", "https_insecure",
         }
         sets = {k: v for k, v in fields.items() if k in allowed}
         if not sets:
@@ -270,6 +289,7 @@ class Database(SqliteStore):
                                "(SELECT id FROM traces WHERE target_id=?)", (target_id,))
             self._conn.execute("DELETE FROM traces WHERE target_id=?", (target_id,))
             self._conn.execute("DELETE FROM hop_stats WHERE target_id=?", (target_id,))
+            self._conn.execute("DELETE FROM https_checks WHERE target_id=?", (target_id,))
             self._conn.execute("DELETE FROM targets WHERE id=?", (target_id,))
             self._conn.commit()
 
@@ -414,6 +434,48 @@ class Database(SqliteStore):
                 " FROM traces t JOIN hops h ON h.trace_id = t.id"
                 " WHERE t.target_id=? AND t.started_ts>=? AND t.started_ts<=?"
                 " ORDER BY t.started_ts, h.ttl",
+                (target_id, t0, t1),
+            ).fetchall()
+
+    # ----------------------------------------------------------- web checks
+
+    def record_https_check(self, target_id: int, result) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO https_checks(target_id, ts, ok, status_code,"
+                " latency_ms, error, final_url) VALUES (?,?,?,?,?,?,?)",
+                (target_id, time.time(), 1 if result.ok else 0,
+                 result.status_code, result.latency_ms, result.error or None,
+                 result.final_url or None),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def last_https_checks(self, target_ids) -> dict[int, sqlite3.Row]:
+        """The newest check per destination in one query — the same shape
+        last_traces uses, for the same reason: the destination list, the
+        Debug feed and the alert engine all want it for every target at
+        once."""
+        target_ids = list(target_ids)
+        if not target_ids:
+            return {}
+        marks = ",".join("?" * len(target_ids))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT c.* FROM https_checks c"
+                f" JOIN (SELECT target_id, MAX(ts) AS ts FROM https_checks"
+                f" WHERE target_id IN ({marks}) GROUP BY target_id) latest"
+                f" ON c.target_id = latest.target_id AND c.ts = latest.ts",
+                target_ids,
+            ).fetchall()
+        return {row["target_id"]: row for row in rows}
+
+    def https_checks_between(self, target_id: int, t0: float,
+                             t1: float) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM https_checks WHERE target_id=? AND ts>=? AND ts<=?"
+                " ORDER BY ts",
                 (target_id, t0, t1),
             ).fetchall()
 
@@ -655,35 +717,62 @@ class Database(SqliteStore):
                 "SELECT MIN(id) AS lo, MAX(id) AS hi FROM traces"
                 " WHERE started_ts < ?", (cutoff,)).fetchone()
         low, high = bounds["lo"], bounds["hi"]
-        if low is None:
-            self.last_prune_incomplete = False
-            return 0
         deadline = time.monotonic() + budget_s
-        cut = high + 1   # exclusive: every id in [low, cut) is a candidate
+        self.last_prune_incomplete = False
+        removed = 0
+        if low is not None:
+            cut = high + 1   # exclusive: every id in [low, cut) is a candidate
 
-        def delete(lo: int, up: int) -> int:
-            self._conn.execute(
-                "DELETE FROM hops WHERE trace_id IN (SELECT id FROM traces"
-                " WHERE id >= ? AND id < ? AND started_ts < ?)",
-                (lo, up, cutoff))
-            cursor = self._conn.execute(
-                "DELETE FROM traces"
-                " WHERE id >= ? AND id < ? AND started_ts < ?",
-                (lo, up, cutoff))
-            return cursor.rowcount or 0
+            def delete(lo: int, up: int) -> int:
+                self._conn.execute(
+                    "DELETE FROM hops WHERE trace_id IN (SELECT id FROM traces"
+                    " WHERE id >= ? AND id < ? AND started_ts < ?)",
+                    (lo, up, cutoff))
+                cursor = self._conn.execute(
+                    "DELETE FROM traces"
+                    " WHERE id >= ? AND id < ? AND started_ts < ?",
+                    (lo, up, cutoff))
+                return cursor.rowcount or 0
 
-        # The chunk bounds are passed from this module's globals rather than
-        # left to the base's, because they are the ones tests adjust.
-        removed, low = self._delete_batches(
-            low, cut, deadline, delete, chunk=TRIM_CHUNK,
-            chunk_min=TRIM_CHUNK_MIN, chunk_max=TRIM_CHUNK_MAX)
-        self.last_prune_incomplete = low < cut
-        if self.last_prune_incomplete:
-            log.warning("netpath.db: prune of traces older than %.1f days did "
-                        "not finish within its budget; continuing at the next "
-                        "maintenance pass", older_than_days)
+            # The chunk bounds are passed from this module's globals rather
+            # than left to the base's, because they are the ones tests adjust.
+            removed, low = self._delete_batches(
+                low, cut, deadline, delete, chunk=TRIM_CHUNK,
+                chunk_min=TRIM_CHUNK_MIN, chunk_max=TRIM_CHUNK_MAX)
+            self.last_prune_incomplete = low < cut
+            if self.last_prune_incomplete:
+                log.warning("netpath.db: prune of traces older than %.1f days "
+                            "did not finish within its budget; continuing at "
+                            "the next maintenance pass", older_than_days)
+        removed += self._prune_https_checks(cutoff, deadline)
         if removed:
             # Its own deadline, not `deadline` above: that one may already be
             # spent on deletes, and reclaim is worth a little time even then.
             self._reclaim_until(time.monotonic() + PRUNE_RECLAIM_BUDGET_S)
+        return removed
+
+    def _prune_https_checks(self, cutoff: float, deadline: float) -> int:
+        """The web-page checks, swept exactly the way prune() sweeps traces
+        and against the same retention: one row per destination per interval,
+        so the same id-range batching keeps the lock hold bounded."""
+        with self._lock:
+            bounds = self._conn.execute(
+                "SELECT MIN(id) AS lo, MAX(id) AS hi FROM https_checks"
+                " WHERE ts < ?", (cutoff,)).fetchone()
+        low, high = bounds["lo"], bounds["hi"]
+        if low is None:
+            return 0
+        cut = high + 1
+
+        def delete(lo: int, up: int) -> int:
+            cursor = self._conn.execute(
+                "DELETE FROM https_checks WHERE id >= ? AND id < ? AND ts < ?",
+                (lo, up, cutoff))
+            return cursor.rowcount or 0
+
+        removed, low = self._delete_batches(
+            low, cut, deadline, delete, chunk=TRIM_CHUNK,
+            chunk_min=TRIM_CHUNK_MIN, chunk_max=TRIM_CHUNK_MAX)
+        if low < cut:
+            self.last_prune_incomplete = True
         return removed

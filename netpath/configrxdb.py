@@ -375,9 +375,12 @@ class ConfigRxDatabase(SqliteStore):
         with self._lock:
             self._conn.execute("DELETE FROM device_config WHERE device_id = ?", (device_id,))
             self._conn.execute("DELETE FROM backups WHERE device_id = ?", (device_id,))
-            self._delete_search_lines(device_id)
             self._conn.execute("DELETE FROM compliance_results WHERE device_id = ?", (device_id,))
             self._conn.commit()
+        # Outside that transaction, and in chunks: retiring tens of
+        # thousands of FTS entries under one lock hold was the longest part
+        # of deleting a device.
+        self._delete_search_lines(device_id, batched=True)
 
     def reassign_device(self, old_device_id: int, new_device_id: int,
                         move_config: bool = True) -> bool:
@@ -643,26 +646,51 @@ class ConfigRxDatabase(SqliteStore):
                 "SELECT 1 FROM config_lines WHERE device_id = ? LIMIT 1",
                 (device_id,)).fetchone() is not None
 
-    def _delete_search_lines(self, device_id: int) -> None:
-        """Drop one device's lines and their index entries. Lock held.
+    # Lines retired per lock hold when _delete_search_lines is batched.
+    SEARCH_LINE_CHUNK = 2_000
+
+    def _delete_search_lines(self, device_id: int, *, batched: bool = False) -> None:
+        """Drop one device's lines and their index entries. Lock held,
+        unless `batched`: then each chunk takes the lock and commits on its
+        own, which the caller must not be inside a transaction for.
 
         RETURNING hands back what FTS5 needs to retire each entry, so the cost
         is proportional to the lines removed rather than a whole re-index.
         """
+        if not batched:
+            self._delete_search_chunk(device_id, None)
+            return
+        while True:
+            with self._lock:
+                removed = self._delete_search_chunk(device_id,
+                                                    self.SEARCH_LINE_CHUNK)
+                self._conn.commit()
+            if removed < self.SEARCH_LINE_CHUNK:
+                return
+
+    def _delete_search_chunk(self, device_id: int, limit: int | None) -> int:
+        """At most `limit` of one device's lines (all of them when None)."""
+        where = "device_id = ?"
+        params: tuple = (device_id,)
+        if limit is not None:
+            where = ("id IN (SELECT id FROM config_lines WHERE device_id = ?"
+                     " LIMIT ?)")
+            params = (device_id, int(limit))
         if self.search_fts and HAS_RETURNING:
             rows = self._conn.execute(
-                "DELETE FROM config_lines WHERE device_id = ? RETURNING id, line",
-                (device_id,)).fetchall()
+                f"DELETE FROM config_lines WHERE {where} RETURNING id, line",
+                params).fetchall()
             if rows:
                 self._conn.executemany(
                     "INSERT INTO config_lines_fts(config_lines_fts, rowid, line)"
                     " VALUES ('delete', ?, ?)",
                     [(row["id"], row["line"]) for row in rows])
-            return
+            return len(rows)
         cursor = self._conn.execute(
-            "DELETE FROM config_lines WHERE device_id = ?", (device_id,))
+            f"DELETE FROM config_lines WHERE {where}", params)
         if cursor.rowcount and self.search_fts:
             self._rebuild_search_index()
+        return cursor.rowcount or 0
 
     def _rebuild_search_index(self) -> None:
         """Pre-3.35 fallback, at most once an hour. Orphaned index rows are

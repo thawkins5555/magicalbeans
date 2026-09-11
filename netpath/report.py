@@ -1,4 +1,4 @@
-"""Availability and top-N-saturation reports, computed read-only from
+"""Availability, top-N-saturation and firmware-inventory reports, read-only from
 history nodesdb.py/alertsdb.py already keep (device_events, samples_hourly,
 maintenance_windows, mutes, device_maintenance). A history gap is not
 necessarily downtime: it is clipped to the device's created_ts, excluded
@@ -10,6 +10,7 @@ really a stopped poller rather than a quiet, healthy device.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import asdict, dataclass, field
 
@@ -406,6 +407,85 @@ def _if_index(key: str) -> int | None:
         return None
     tail = key.rsplit(".", 1)[1]
     return int(tail) if tail.isdigit() else None
+
+
+def _model_hint(sys_descr: str) -> str:
+    """A short model-ish hint off sysDescr, for a report row that has to fit
+    on a line: the first clause, capped. Never parsed into a model number —
+    a description is not a model, and pretending otherwise on eleven vendors'
+    string formats is exactly the invention swversion.py refuses to make."""
+    text = " ".join((sys_descr or "").split())
+    if not text:
+        return ""
+    head = re.split(r"[,;]", text, maxsplit=1)[0].strip()
+    return head[:80]
+
+
+@dataclass
+class FirmwareRow:
+    device_id: int
+    name: str
+    ip: str
+    vendor: str
+    model_hint: str
+    sw_version: str
+    sw_image: str
+    sw_image_file: str
+    last_poll_ts: float | None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class FirmwareReport:
+    generated_ts: float
+    device_count: int
+    version_count: int          # distinct non-empty sw_version values
+    unknown_count: int          # devices with no version on file at all
+    rows: list[FirmwareRow]
+
+    def to_dict(self) -> dict:
+        return {"generated_ts": self.generated_ts,
+                "device_count": self.device_count,
+                "version_count": self.version_count,
+                "unknown_count": self.unknown_count,
+                "rows": [r.to_dict() for r in self.rows]}
+
+
+def firmware_inventory(nodesdb, device_ids: list[int] | None = None
+                       ) -> FirmwareReport:
+    """What every device is running, from the columns the identity poll
+    already stores (nodepoll._poll_software_version) — no SNMP, no history.
+    `device_ids` narrows it; omitted, the whole fleet is reported on.
+
+    Sorted by vendor then version so a fleet groups itself into "these
+    forty are on 15.2(7)E4 and these three are not". A device with no
+    version on file is still a row: "which of my switches has never told me
+    what it runs" is the other half of the question this answers."""
+    rows_in = (nodesdb.devices_by_ids(sorted(set(device_ids)))
+               if device_ids is not None else nodesdb.devices())
+    rows: list[FirmwareRow] = []
+    for row in rows_in:
+        keys = row.keys()
+        rows.append(FirmwareRow(
+            device_id=row["id"], name=row["name"] or row["ip"], ip=row["ip"],
+            vendor=row["vendor"] or "",
+            model_hint=_model_hint(row["sys_descr"] or ""),
+            sw_version=(row["sw_version"] or "") if "sw_version" in keys else "",
+            sw_image=(row["sw_image"] or "") if "sw_image" in keys else "",
+            sw_image_file=(row["sw_image_file"] or "") if "sw_image_file" in keys else "",
+            last_poll_ts=row["last_poll_ts"]))
+    # A device with no version sorts last within its vendor rather than
+    # first, where an empty string would put it: the rows worth reading are
+    # the ones that answered.
+    rows.sort(key=lambda r: (r.vendor.lower(), not r.sw_version,
+                             r.sw_version.lower(), r.name.lower()))
+    versions = {r.sw_version for r in rows if r.sw_version}
+    return FirmwareReport(
+        generated_ts=time.time(), device_count=len(rows),
+        version_count=len(versions),
+        unknown_count=sum(1 for r in rows if not r.sw_version), rows=rows)
 
 
 def top_metric_ranking(nodesdb, key: str, t0: float, t1: float, *,

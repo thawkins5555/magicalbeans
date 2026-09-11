@@ -1,6 +1,6 @@
 """Device search (nodesdb.devices/devices_count `text` filter) matches what an
-operator knows about a device: sys_location, sys_descr, sys_contact and vendor
-as well as name/IP/sys_name/MAC. Proves each of the four fields matches, that
+operator knows about a device: sys_location, sys_descr, sys_contact, vendor and
+the software version/image as well as name/IP/sys_name/MAC. Proves each matches, that
 name/IP/sys_name/MAC behaviour is unchanged, and that a match tracks a device
 live across rename/re-identify/update/delete, since the search reads the
 devices table's own columns (see nodesdb.py's _device_filter_clause).
@@ -88,6 +88,20 @@ check("sys_contact finds its device",
 
 check("devices_count agrees with devices() for a newly-searchable field",
       db.devices_count(text="Site-B") == 1, db.devices_count(text="Site-B"))
+
+# The software columns the identity poll fills (netpath/swversion.py): "which
+# boxes are still on 15.2(7)E4" is the one-off version of the question the
+# firmware report answers for the whole fleet.
+set_identity_fields(db, cisco_id, sw_version="15.2(7)E4",
+                    sw_image="C2960X-UNIVERSALK9-M")
+r = db.devices(text="15.2(7)E4")
+check("sw_version finds its device", names(r) == ["acc-sw-114"], names(r))
+r = db.devices(text="C2960X-UNIVERSALK9")
+check("sw_image finds its device", names(r) == ["acc-sw-114"], names(r))
+check("...and devices_count agrees",
+      db.devices_count(text="15.2(7)E4") == 1, db.devices_count(text="15.2(7)E4"))
+r = db.devices(text="17.9.4a")
+check("a version nothing runs matches nothing", r == [], names(r))
 
 r = db.devices(text="nonexistent-field-value-xyz")
 check("a term matching nothing in any column returns nothing",

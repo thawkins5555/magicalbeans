@@ -419,6 +419,36 @@ class NodesSeriesDatabase(SqliteStore):
             self._conn.commit()
         return removed
 
+    # Between the purge's batches — see _delete_batches' `pause`.
+    PURGE_PAUSE_S = 0.01
+
+    def delete_metrics_for_device_batched(self, device_id: int,
+                                          deadline: float) -> tuple[int, bool]:
+        """One device's series history, in lock-bounded batches.
+
+        The same rows delete_metrics_for_devices removes in a single
+        transaction — a 48-port switch at shipped retention is ~3.4M of
+        them, which is the whole poll cycle and every chart read queued
+        behind one commit. Returns (rows removed, finished); a False
+        finish means `deadline` ran out and the next call resumes, so the
+        caller's purge cursor is the only state that has to survive.
+        """
+        device_id = int(device_id)
+        where = "metric_id IN (SELECT id FROM metrics WHERE device_id = ?)"
+        removed = 0
+        for table in ("samples", "samples_hourly"):
+            got, done = self._delete_by_rowid(table, where, (device_id,), deadline,
+                                              pause=self.PURGE_PAUSE_S)
+            removed += got
+            if not done:
+                return removed, False
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM metrics WHERE device_id = ?", (device_id,))
+            removed += cursor.rowcount or 0
+            self._conn.commit()
+        return removed, True
+
     def prune_orphan_metrics(self, live_ids) -> int:
         """Metrics whose device is gone from nodes.db — catches what the
         cross-file split's ON DELETE CASCADE no longer does."""
@@ -478,13 +508,19 @@ class NodesSeriesDatabase(SqliteStore):
         timestamp, and a device with a wrong clock puts the two out of step.
         Wide but cheap -- a batch that finds nothing is an index probe.
         """
+        removed, _ = self._delete_by_rowid(table, where, params, float("inf"))
+        return removed
+
+    def _delete_by_rowid(self, table: str, where: str, params, deadline: float,
+                         pause: float = 0.0) -> tuple[int, bool]:
+        """_prune_by_rowid's body with a deadline: (rows removed, finished)."""
         with self._lock:
             bounds = self._conn.execute(
                 f"SELECT MIN(rowid) AS lo, MAX(rowid) AS hi FROM {table}"
                 f" WHERE {where}", params).fetchone()
         low = bounds["lo"]
         if low is None:
-            return 0
+            return 0, True
         cut = bounds["hi"] + 1
 
         def delete(low_id: int, upper: int) -> int:
@@ -493,10 +529,11 @@ class NodesSeriesDatabase(SqliteStore):
                 f" AND {where}", (low_id, upper, *params))
             return cursor.rowcount or 0
 
-        removed, _ = self._delete_batches(
-            low, cut, float("inf"), delete, chunk=SAMPLE_PRUNE_CHUNK,
-            chunk_min=SAMPLE_PRUNE_CHUNK_MIN, chunk_max=SAMPLE_PRUNE_CHUNK_MAX)
-        return removed
+        removed, reached = self._delete_batches(
+            low, cut, deadline, delete, chunk=SAMPLE_PRUNE_CHUNK,
+            chunk_min=SAMPLE_PRUNE_CHUNK_MIN, chunk_max=SAMPLE_PRUNE_CHUNK_MAX,
+            pause=pause)
+        return removed, reached >= cut
 
     def prune(self, *, sample_days: float = 3, rollup_days: float = 400,
               max_samples_per_metric: int = 0) -> int:

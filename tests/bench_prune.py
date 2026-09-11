@@ -433,6 +433,92 @@ def ipam_store(folder, rows):
     return db, cases, insert_probe
 
 
+def delete_store(folder, rows):
+    """Deleting one device, the old way beside the new one.
+
+    Not a retention prune, but the same question and the same answer: this
+    is the other delete whose size is set by how long a device has been
+    polled, and until 5.10 it ran as one transaction under both Nodes
+    locks. Two devices are seeded identically; the first is deleted the way
+    remove_device used to (one DELETE per file, one commit each), the
+    second through request_device_removal + purge_step. The reader runs
+    against nodes_series.db, where the rows are.
+    """
+    db = NodesDatabase(os.path.join(folder, "nodes.db"))
+    series = db.series_db
+    now = time.time()
+    group_id = db.ensure_default_group()
+    ports = 48
+    devices = []
+    for which in range(2):
+        device_id = db.add_device(f"10.30.0.{which + 1}", f"sw-del-{which}",
+                                  group_id=group_id)
+        devices.append(device_id)
+        metric_ids = [series.record_metric_sample(
+            device_id, f"bench.{i}", f"metric {i}", "u", "gauge", now, 0.0)
+            for i in range(METRICS)]
+        fill(series, "INSERT OR REPLACE INTO samples(metric_id, ts, value)"
+                     " VALUES (?,?,?)",
+             ((metric_ids[i % METRICS], now - i, float(i % 1000))
+              for i in range(rows)))
+        fill(series, "INSERT OR REPLACE INTO samples_hourly(metric_id, hour,"
+                     " n, vmin, vavg, vmax) VALUES (?,?,?,?,?,?)",
+             ((metric_ids[i % METRICS], int(now) - i * 3600, 60, 0.0,
+               float(i % 100), 100.0)
+              for i in range(max(1, rows // 4))))
+        fill(db, "INSERT INTO interfaces(device_id, if_index, descr,"
+                 " last_seen_ts) VALUES (?,?,?,?)",
+             ((device_id, i + 1, f"Gi0/{i + 1}", now) for i in range(ports)))
+        fill(db, "INSERT INTO device_events(device_id, ts, kind, detail)"
+                 " VALUES (?,?,'down','bench')",
+             ((device_id, now - i) for i in range(max(1, rows // 10))))
+        fill(db, "INSERT INTO mac_entries(device_id, if_index, mac, vlan,"
+                 " seen_ts, first_seen_ts, present) VALUES (?,?,?,'1',?,?,1)",
+             ((device_id, i % ports + 1, "aa:bb:%08x" % i, now, now)
+              for i in range(max(1, rows // 10))))
+
+    def unbatched():
+        """remove_device as it stood before 5.10.0.
+
+        Counted with total_changes, not rowcount: most of what this deletes
+        goes through ON DELETE CASCADE, which rowcount does not see, and a
+        row that says 201 beside the batched row's half-million reads as a
+        different amount of work rather than the same work done differently.
+        """
+        before = series._conn.total_changes + db._conn.total_changes
+        series.delete_metrics_for_devices([devices[0]])
+        with db._lock:
+            db._conn.execute("DELETE FROM devices WHERE id = ?", (devices[0],))
+            db._conn.commit()
+        return series._conn.total_changes + db._conn.total_changes - before
+
+    def batched():
+        db.request_device_removal([devices[1]])
+        removed = 0
+        while db.purges_pending():
+            step = db.purge_step(budget_s=30.0)
+            removed += step["rows_removed_now"]
+            if not step["purged"] and not step["rows_removed_now"]:
+                break
+        return removed
+
+    def insert_probe(n):
+        base = time.time() + 1.0
+        metric_id = series.record_metric_sample(
+            devices[0], "bench.probe", "probe", "u", "gauge", base, 0.0)
+        fill(series, "INSERT OR REPLACE INTO samples(metric_id, ts, value)"
+                     " VALUES (?,?,?)",
+             ((metric_id, base + i * 0.001, float(i)) for i in range(n)))
+
+    cases = [
+        Case("nodes.db", "delete: one hold", series, unbatched,
+             tables=("samples", "samples_hourly")),
+        Case("nodes.db", "delete: purge_step", series, batched,
+             tables=("samples", "samples_hourly")),
+    ]
+    return db, cases, insert_probe
+
+
 # nodesseriesdb first: `samples` is the highest-volume table in the product,
 # so its row is the headline this whole bench exists for.
 STORES = (("nodes_series.db", series_store),
@@ -440,6 +526,7 @@ STORES = (("nodes_series.db", series_store),
           ("snmptraps.db", trap_store),
           ("alerts.db", alerts_store),
           ("nodes.db", nodes_store),
+          ("device delete", delete_store),
           ("ipam.db", ipam_store))
 
 

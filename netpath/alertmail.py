@@ -25,6 +25,11 @@ from urllib.parse import urlparse
 from .alertrules import SEVERITY_NAMES
 from .worker import Worker
 
+# What {{severity_tag}} renders as on a RESOLUTION, in place of the cleared
+# alert's own level. One constant, since the engine passes it explicitly on
+# the clear path and build_context derives it from the resolved row.
+RECOVER_TAG = "[RECOVER]"
+
 # Every subject leads with {{severity_tag}}: whether an alert is critical
 # or informational is what decides whether an operator gets out of bed,
 # and a site outage produces subjects that otherwise differ only by
@@ -229,6 +234,9 @@ def build_context(alert_row, rule_row, extra: dict | None = None) -> dict:
         "trap_name": "", "trap_oid": "", "varbinds": "",
         "down_since": "", "recovered_time": "", "downtime": "",
         "downtime_line": "",
+        # "[RECOVER]" on a resolution, empty on an alert of any kind — set
+        # in the resolved branch below, beside the other recovery tokens.
+        "recover_tag": "",
     }
     # Derived here, from the row, rather than only where the engine happens to
     # know them: a recovery sends TWO notifications — the "Device recovered"
@@ -246,6 +254,15 @@ def build_context(alert_row, rule_row, extra: dict | None = None) -> dict:
         context["down_since"] = _clock(alert_row["opened_ts"])
         context["recovered_time"] = _clock(resolved_ts)
         context["downtime"] = duration_text(resolved_ts - alert_row["opened_ts"])
+        # A resolution's subject leads with [RECOVER] rather than the
+        # cleared alert's own level: "[CRITICAL] SappiWhere: sw1 has
+        # recovered" reads as a new emergency in a notification preview,
+        # which is exactly where a tag is read. An OPENING alert keeps its
+        # level, the standalone "Device recovered" rule's own included —
+        # that one is an alert in its own right, not a recovery of
+        # anything, and its row has no resolved_ts.
+        context["severity_tag"] = RECOVER_TAG
+        context["recover_tag"] = RECOVER_TAG
     if extra:
         context.update(extra)
     # After the update, never before: the engine supplies down_since and
@@ -270,7 +287,7 @@ def token_reference() -> list[dict]:
         {"token": "detail", "description": "Extra detail text, if any"},
         {"token": "severity", "description": "Severity number, 0 (emergency) to 7 (debug)"},
         {"token": "severity_name", "description": "Severity name, e.g. 'critical'"},
-        {"token": "severity_tag", "description": "Severity as a bracketed, upper-case subject tag, e.g. '[CRITICAL]'"},
+        {"token": "severity_tag", "description": "Severity as a bracketed, upper-case subject tag, e.g. '[CRITICAL]' — '[RECOVER]' on a recovery notification, whatever the cleared alert's own severity was"},
         {"token": "count", "description": "How many times this alert has occurred"},
         {"token": "opened_time", "description": "When the alert first opened"},
         {"token": "last_time", "description": "When the alert most recently recurred"},
@@ -288,6 +305,7 @@ def token_reference() -> list[dict]:
         {"token": "recovered_time", "description": "When it recovered (resolution notifications only)"},
         {"token": "downtime", "description": "How long it was down, e.g. '2 h 14 m' (resolution notifications only)"},
         {"token": "downtime_line", "description": "The whole 'Down since … — … in total.' sentence, or nothing when the outage start is unknown"},
+        {"token": "recover_tag", "description": "'[RECOVER]' on a recovery notification, empty on an alert (resolution notifications only)"},
         {"token": "trap_name", "description": "The trap's resolved name (trap rules only)"},
         {"token": "trap_oid", "description": "The trap's OID (trap rules only)"},
         {"token": "varbinds", "description": "The trap's varbind summary (trap rules only)"},

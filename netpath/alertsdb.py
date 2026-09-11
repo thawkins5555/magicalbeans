@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS rules (
     id              INTEGER PRIMARY KEY,
     key             TEXT NOT NULL UNIQUE,
     name            TEXT NOT NULL,
-    kind            TEXT NOT NULL,          -- 'device_event'|'interface_event'|'threshold'|'dhcp_threshold'|'netpath_threshold'|'trap'|'syslog'|'ipam'|'wireless_event'|'system'
+    kind            TEXT NOT NULL,          -- 'device_event'|'interface_event'|'threshold'|'dhcp_threshold'|'netpath_threshold'|'netpath_event'|'trap'|'syslog'|'ipam'|'wireless_event'|'system'
     source_kind     TEXT,                   -- meaning depends on kind, see nodesdb/alertrules
     severity        INTEGER NOT NULL DEFAULT 4,   -- syslog 0-7 scale, shared across every module
     enabled         INTEGER NOT NULL DEFAULT 1,
@@ -604,9 +604,9 @@ _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "auto_resolve_after_s", "notify")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 56 built-in rules: 9 device_event + 3 interface_event + 29 threshold +
-# 3 trap + 1 syslog + 1 ipam + 2 wireless_event + 1 dhcp_threshold +
-# 3 netpath_threshold + 4 system. Each `template` name is a
+# 60 built-in rules: 10 device_event + 3 interface_event + 29 threshold +
+# 3 trap + 1 syslog + 1 ipam + 4 wireless_event + 1 dhcp_threshold +
+# 3 netpath_threshold + 1 netpath_event + 4 system. Each `template` name is a
 # templates.key —
 # most non-primary rules reuse a generic template rather than a bespoke
 # one, since only 6 ship; an admin can point any rule at any template.
@@ -791,6 +791,17 @@ _BUILTIN_RULES = [
     # working" are different facts with different remedies. An AP marked out
     # of service raises neither.
     ("wireless_ap_offline", "Access point offline", "wireless_event", "ap_offline", 3, "event_notice", None, None, 1),
+    # fgWcWtpSessionWtpUpTime falling, read by the wireless poller off the
+    # same session table it already walks. The Nodes counterpart of this is
+    # device_rebooted, and it carries the same severity for the same reason:
+    # an AP that reboots on its own is worth a notice tomorrow morning.
+    ("wireless_ap_rebooted", "Access point rebooted", "wireless_event", "ap_rebooted", 4, "event_notice", None, None, 1),
+    # Shipped DISABLED (_BUILTIN_DISABLED): on a fleet with DARRP on, a
+    # channel change is the radio resource manager doing its job several
+    # times a day, so alerting on it by default would be pure noise. The rule
+    # exists so an operator who does want to know can switch it on without
+    # having to know the source kind to type into a custom rule.
+    ("wireless_radio_channel_changed", "Access point radio changed channel", "wireless_event", "radio_channel_changed", 5, "event_notice", None, None, 1),
     # DHCP scope utilization, as a percentage of the scope's address range
     # that is leased or reserved. Its own kind rather than a "threshold"
     # rule because the threshold evaluator reads Nodes' metrics table for a
@@ -833,6 +844,14 @@ _BUILTIN_RULES = [
     ("netpath_unreachable", "NetPath destination unreachable", "netpath_threshold", "trace_loss_pct", 2, "threshold_breach", 100.0, 100.0, 3),
     ("netpath_path_unstable", "NetPath path repeatedly failing", "netpath_threshold", "trace_unreached_pct", 4, "threshold_breach", 50.0, 20.0, 1),
     ("netpath_latency_high", "NetPath latency far above normal", "netpath_threshold", "trace_rtt_warn_pct", 4, "threshold_breach", 300.0, 150.0, 3),
+    # The other half of "is this destination working": the path can be
+    # perfect while the web page on it returns 503. Event-shaped rather than
+    # a threshold rule because a GET answers available/unavailable, not a
+    # number -- see alertengine._evaluate_netpath_https, where for_polls
+    # counts that destination's own checks. Three consecutive failures, which
+    # on the shipped interval is a quarter of an hour of a page answering
+    # nothing usable, and any single success clears it.
+    ("netpath_https_down", "NetPath web page unavailable", "netpath_event", "https_down", 2, "event_notice", None, None, 3),
     # kind='system' is the application reporting on itself. Its occurrences
     # come from AlertEngine.system_occurrence rather than from a source
     # cursor, and source_kind is the rule key so one system condition matches
@@ -914,6 +933,10 @@ _BUILTIN_AUTO_RESOLVE_S = {
     "trap_link_down_unmanaged": 86400,
     "syslog_critical": 86400,
     "ipam_new_conflict": 604800,
+    # Both are momentary facts about an AP with no state to clear, the same
+    # shape as device_rebooted above and on the same day-long clock.
+    "wireless_ap_rebooted": 86400,
+    "wireless_radio_channel_changed": 86400,
     # Both of these report a CONDITION through repeated events rather than
     # through a state with a clear, so last_ts is what says whether it is
     # still happening: while the condition holds the events keep arriving and
@@ -960,6 +983,12 @@ _EVENT_NOTICE_REBIND = {
 # seeding 250 devices. The alerts are useful — they are the to-do list for
 # MIB uploads — and mailing them is not.
 _BUILTIN_NOTIFY_OFF = ("mib_missing",)
+
+# Rules that ship switched OFF, kept apart from _BUILTIN_RULES for the same
+# reason as _BUILTIN_NOTIFY_OFF above: one column that a single row uses.
+# Only _seed_rules reads it, so an operator who enables one of these keeps
+# that choice — INSERT OR IGNORE never rewrites a row that already exists.
+_BUILTIN_DISABLED = ("wireless_radio_channel_changed",)
 
 
 def _builtin_rule_defaults() -> dict:
@@ -1668,8 +1697,9 @@ class AlertsDatabase(SqliteStore):
                     " severity, enabled, is_builtin, device_filter, notify,"
                     " threshold, clear_threshold, comparison, for_polls,"
                     " for_seconds, auto_resolve_after_s, template_id,"
-                    " created_ts) VALUES (?,?,?,?,?,1,1,'',?,?,?,?,?,?,?,?,?)",
+                    " created_ts) VALUES (?,?,?,?,?,?,1,'',?,?,?,?,?,?,?,?,?)",
                     (key, name, kind, source_kind, severity,
+                     0 if key in _BUILTIN_DISABLED else 1,
                      0 if key in _BUILTIN_NOTIFY_OFF else 1, threshold,
                      clear_threshold, _BUILTIN_COMPARISON.get(key, "above"),
                      for_polls, _BUILTIN_FOR_SECONDS.get(key),
@@ -2666,6 +2696,15 @@ class AlertsDatabase(SqliteStore):
             self._conn.execute(
                 "DELETE FROM alert_mutes WHERE entity_kind = 'device'"
                 " AND entity_id = ?", (key,))
+            # Both are keyed on device_id alone, so both would otherwise
+            # be inherited by the next device handed this rowid: someone
+            # else's limits, and an alert about a device that is gone.
+            self._conn.execute(
+                "DELETE FROM device_thresholds WHERE device_id = ?",
+                (int(device_id),))
+            self._conn.execute(
+                "DELETE FROM pending_alerts WHERE device_id = ?",
+                (int(device_id),))
             self._conn.commit()
 
     # ------------------------------------------------- maintenance windows

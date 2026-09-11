@@ -1,9 +1,11 @@
-"""The two /api/nodes/reports/* routes over netpath/report.py, which is itself
-covered by test_report_availability.py and test_report_topn.py; this suite is
-the thin dispatch layer. Covers: availability with no device_ids reports the
-whole fleet, device_ids narrows it, t0/t1 are honoured; top-metrics requires a
-key and a rank_by of 'peak'|'mean', ranking seeded samples_hourly; fleet-wide
-ranking over more than 7 days is refused; both routes are gated "nodes" read."""
+"""The /api/nodes/reports/* routes over netpath/report.py, which is itself
+covered by test_report_availability.py, test_report_topn.py and
+test_report_firmware.py; this suite is the thin dispatch layer. Covers:
+availability with no device_ids reports the whole fleet, device_ids narrows it,
+t0/t1 are honoured; top-metrics requires a key and a rank_by of 'peak'|'mean',
+ranking seeded samples_hourly; fleet-wide ranking over more than 7 days is
+refused; firmware answers both JSON and a CSV file for the same rows; every
+route is gated "nodes" read."""
 import http.client
 import json
 import os
@@ -178,6 +180,45 @@ try:
     check("...and the plain default-window whole-fleet call is unaffected",
           status == 200, (status, payload))
 
+    # ---------------------------------------------------------- firmware
+    print("GET /api/nodes/reports/firmware (+ its CSV)")
+    db._conn.execute(
+        "UPDATE devices SET vendor = 'cisco', sw_version = '15.2(7)E4',"
+        " sw_image = 'C2960X-UNIVERSALK9-M' WHERE id = ?", (dev1,))
+    db._conn.commit()
+
+    status, payload = call("GET", "/api/nodes/reports/firmware", token=admin)
+    check("200, every device on file, versions carried through",
+          status == 200 and {r["device_id"] for r in payload["rows"]} == {dev1, dev2}
+          and {r["sw_version"] for r in payload["rows"]} == {"15.2(7)E4", ""},
+          (status, payload))
+    check("the summary counts devices, distinct versions and the silent ones",
+          payload["device_count"] == 2 and payload["version_count"] == 1
+          and payload["unknown_count"] == 1, payload)
+
+    status, payload = call(
+        "GET", f"/api/nodes/reports/firmware?device_ids={dev1}", token=admin)
+    check("device_ids narrows it",
+          status == 200 and [r["device_id"] for r in payload["rows"]] == [dev1],
+          (status, payload))
+
+    status, payload = call("GET", "/api/nodes/reports/firmware/export.csv",
+                           token=admin)
+    check("the server-side CSV route answers a csv/filename/count payload",
+          status == 200 and payload["count"] == 2
+          and payload["filename"].endswith(".csv")
+          and payload["csv"].splitlines()[0].lstrip("﻿").startswith(
+              "device_id,name,ip,vendor"),
+          (status, payload))
+    check("...with the same versions the JSON route reported",
+          "15.2(7)E4" in payload["csv"], payload["csv"])
+
+    status, payload = call(
+        "GET", f"/api/nodes/reports/firmware/export.csv?device_ids={dev2}",
+        token=admin)
+    check("...and honours the same device_ids filter",
+          status == 200 and payload["count"] == 1, (status, payload))
+
     # -------------------------------------------------------------- gates
     print("gates: nodes:read allowed, no grant refused")
     service.app_db.add_user("report-reader", hash_password("ReportReaderPW2026"),
@@ -190,7 +231,9 @@ try:
     outsider = login("report-outsider", "ReportOutsiderPW2026")
 
     for path in ("/api/nodes/reports/availability",
-                "/api/nodes/reports/top-metrics?key=cpu_pct"):
+                "/api/nodes/reports/top-metrics?key=cpu_pct",
+                "/api/nodes/reports/firmware",
+                "/api/nodes/reports/firmware/export.csv"):
         status, payload = call("GET", path, token=reader)
         check(f"a nodes:read account may read {path}", status == 200, (status, payload))
         status, payload = call("GET", path, token=outsider)

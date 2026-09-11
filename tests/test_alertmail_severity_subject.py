@@ -45,6 +45,55 @@ check("severity_tag is documented in the template editor's token palette",
       any(t["token"] == "severity_tag" for t in alertmail.token_reference()),
       alertmail.token_reference())
 
+# ------------------------------------------------------------ [RECOVER]
+#
+# A resolution renders the generic device_up template through
+# AlertEngine._notify_clear, so the subject led with the CLEARED alert's own
+# level: "[CRITICAL] SappiWhere: sw1 has recovered" read, in a notification
+# preview, as a new emergency.
+
+def clear_context(severity: int, extra=None) -> dict:
+    """What _notify_clear renders: the resolved row, with the recovery tags
+    the engine passes through `extra`."""
+    row = {**_ALERT_ROW_SHAPE, "severity": severity,
+           "opened_ts": 300.0, "last_ts": 900.0, "resolved_ts": 900.0}
+    return alertmail.build_context(row, None, extra=extra)
+
+
+check("a recovery's severity_tag is [RECOVER], not the cleared alert's level",
+      clear_context(2)["severity_tag"] == "[RECOVER]", clear_context(2))
+check("...whatever the cleared alert's own severity was",
+      clear_context(6)["severity_tag"] == "[RECOVER]", clear_context(6))
+check("...and the engine's own extra (what _notify_clear passes) says the same",
+      clear_context(2, {"severity_tag": alertmail.RECOVER_TAG,
+                        "recover_tag": alertmail.RECOVER_TAG})["severity_tag"]
+      == "[RECOVER]")
+check("recover_tag is [RECOVER] on a recovery and empty on an opening alert",
+      clear_context(2)["recover_tag"] == "[RECOVER]"
+      and context_for(2)["recover_tag"] == "",
+      (clear_context(2)["recover_tag"], context_for(2)["recover_tag"]))
+check("an OPENING alert still leads with its own level — the standalone "
+      "'Device recovered' rule is an alert in its own right, not a recovery "
+      "of anything",
+      context_for(5)["severity_tag"] == "[NOTICE]"
+      and context_for(2)["severity_tag"] == "[CRITICAL]",
+      (context_for(5), context_for(2)))
+check("a resolved row still renders its downtime sentence as well as the tag",
+      clear_context(2)["recovered_time"] and clear_context(2)["downtime_line"],
+      clear_context(2))
+check("the token palette says severity_tag reads [RECOVER] on a recovery",
+      any(t["token"] == "severity_tag" and "[RECOVER]" in t["description"]
+          for t in alertmail.token_reference()),
+      alertmail.token_reference())
+check("...and documents recover_tag itself",
+      any(t["token"] == "recover_tag" for t in alertmail.token_reference()),
+      alertmail.token_reference())
+check("no built-in template text changed for any of this "
+      "(_PREVIOUS_BUILTIN_TEMPLATES stays untouched)",
+      alertmail.BUILTIN_TEMPLATES["device_up"]["subject"]
+      == "{{severity_tag}} SappiWhere: {{device_name}} has recovered",
+      alertmail.BUILTIN_TEMPLATES["device_up"]["subject"])
+
 # --------------------------------------------------- every built-in template
 
 for key, spec in alertmail.BUILTIN_TEMPLATES.items():

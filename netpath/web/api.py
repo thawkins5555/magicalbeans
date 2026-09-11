@@ -18,12 +18,14 @@ import math
 import secrets
 import threading
 import time
+import urllib.parse
 
 from .. import alertrules
 from ..alertrules import device_id_for
 from .. import alertsdb
 from ..alertsdb import is_window_active
-from ..analysis import availability, build_timeline, build_topology, clamp_window
+from ..analysis import (MAX_BUCKETS, availability, build_timeline,
+                        build_topology, clamp_window)
 from .. import namelookup
 from ..services import format_bytes, format_packets, format_rate, port_name, protocol_name
 from ..tracer import expected_budget, unreachable_text
@@ -48,6 +50,7 @@ from .. import nodediscover
 from .. import nodepoll
 from .. import nodesdb
 from .. import db as netpathdb
+from .. import httpcheck
 from .. import report as reportmod
 from .. import permissions as _permissions
 from .. import appdb as _appdb
@@ -812,6 +815,12 @@ def get_state(service, params, body) -> dict:
             "counters": service.node_poller.counters,
             "device_count": counts["device_count"],
             "device_counts": dict(counts["device_counts"]),
+            # Beside the counts rather than on a route of its own so the
+            # Nodes strip can say "still purging" without a second poll;
+            # /api/nodes/purges serves the same dict for anything asking
+            # about a delete in particular.
+            "purges": service.cached_poll("nodes_purges", 3,
+                                          service.nodes_db.purge_status),
         },
         "alerts": {
             "running": service.alert_engine.running,
@@ -896,8 +905,34 @@ def _validate_target_host(host: str) -> str:
     return host
 
 
-def _target_json(service, row, last=None) -> dict:
+def _validate_target_url(url: str) -> str:
+    """The destination's web page URL: HTTPS only, with a host, and bounded.
+
+    Plain HTTP is refused rather than upgraded: the check verifies a
+    certificate, and silently measuring a cleartext page instead would
+    answer a different question from the one the page's badge claims to
+    answer. Empty means the destination has no web page to check, which is
+    the shipped state and not an error.
+    """
+    url = str(url or "").strip()
+    if not url:
+        return ""
+    if len(url) > httpcheck.URL_MAX:
+        raise ValueError(f"https_url must be {httpcheck.URL_MAX} characters "
+                         f"or fewer")
+    if not httpcheck.is_https_url(url):
+        raise ValueError("https_url must start with https:// — a web page "
+                         "check verifies a certificate, so a plain http:// "
+                         "address cannot be checked")
+    parsed = urllib.parse.urlsplit(url)
+    if not parsed.hostname:
+        raise ValueError("https_url needs a host, e.g. https://switch.example/")
+    return url
+
+
+def _target_json(service, row, last=None, https=None) -> dict:
     keys = row.keys()
+    url = str(row["https_url"] or "") if "https_url" in keys else ""
     return {
         "id": row["id"],
         "host": row["host"],
@@ -913,13 +948,29 @@ def _target_json(service, row, last=None) -> dict:
         "status": last["status"] if last else "none",
         "last_rtt_ms": last["rtt_ms"] if last else None,
         "last_run": last["started_ts"] if last else None,
+        "https_url": url,
+        "https_insecure": (bool(row["https_insecure"])
+                           if "https_insecure" in keys else False),
+        # "none" is a destination with no web page configured, which is a
+        # different thing from one whose page has not been checked yet: the
+        # latter has a URL and simply no row yet, and reads as "none" until
+        # the first check lands rather than claiming either verdict.
+        "https_state": ("none" if not url or https is None
+                        else ("up" if https["ok"] else "down")),
+        "https_status_code": https["status_code"] if https else None,
+        "https_latency_ms": https["latency_ms"] if https else None,
+        "https_error": (https["error"] or "") if https else "",
+        "https_last_ts": https["ts"] if https else None,
     }
 
 
 def get_targets(service, params, body) -> dict:
     rows = service.db.targets()
-    last_traces = service.db.last_traces([row["id"] for row in rows])
-    return {"targets": [_target_json(service, row, last_traces.get(row["id"]))
+    ids = [row["id"] for row in rows]
+    last_traces = service.db.last_traces(ids)
+    last_https = service.db.last_https_checks(ids)
+    return {"targets": [_target_json(service, row, last_traces.get(row["id"]),
+                                     last_https.get(row["id"]))
                         for row in rows]}
 
 
@@ -981,8 +1032,13 @@ def post_target(service, params, body) -> dict:
         "warn_loss": body.get("warn_loss", defaults["default_warn_loss"]),
         "timeout_s": body.get("timeout_s", defaults["default_timeout_s"]),
     })
+    https_url = _validate_target_url(body.get("https_url", ""))
     target_id = service.db.add_target(
         host=host, label=str(body.get("label") or host).strip(), **fields)
+    if https_url or body.get("https_insecure"):
+        service.db.update_target(
+            target_id, https_url=https_url,
+            https_insecure=1 if body.get("https_insecure") else 0)
     service.monitor.trace_now(target_id)
     _audit(service, params, "target.create", target=str(target_id),
           detail=f"host={host}")
@@ -995,7 +1051,12 @@ def put_target(service, params, body, target_id: int) -> dict:
     # about to overwrite.
     before = service.db.target(target_id)
     fields = _pick(body, {"host", "label", "interval_s", "max_hops", "probes",
-                          "warn_rtt_ms", "warn_loss", "timeout_s", "enabled"})
+                          "warn_rtt_ms", "warn_loss", "timeout_s", "enabled",
+                          "https_url", "https_insecure"})
+    if "https_url" in fields:
+        fields["https_url"] = _validate_target_url(fields["https_url"])
+    if "https_insecure" in fields:
+        fields["https_insecure"] = 1 if fields["https_insecure"] else 0
     # The same check the add route makes: without it, a destination could be
     # added with a host that resolves and then edited to anything at all,
     # leaving the traceroute thread failing every interval against a name
@@ -1071,6 +1132,91 @@ def get_timeline(service, params, body) -> dict:
             for b in buckets
         ],
         "summary": {"healthy_pct": ok_pct, "avg_rtt": avg_rtt, "traces": count},
+    }
+
+
+def get_netpath_https(service, params, body) -> dict:
+    """Web-page availability over the window, bucketed like the timeline.
+
+    Same grid as get_timeline — blocks snapped to an epoch-anchored grid of
+    the destination's own check interval, widened past MAX_BUCKETS — so the
+    web lane lines up block for block with the three lanes above it.
+    """
+    target_id = int(params.get("target", 0))
+    target = service.db.target(target_id)
+    if target is None:
+        return {"buckets": [], "summary": {}}
+    keys = target.keys()
+    url = str(target["https_url"] or "") if "https_url" in keys else ""
+    t0, t1 = _window(params)
+    if not url:
+        return {"t0": t0, "t1": t1, "url": "", "buckets": [],
+                "summary": {"state": "none", "checks": 0}}
+
+    bucket_s, per_block = _block_size(service, target, t1 - t0,
+                                      _num(params, "width", 1200))
+    bucket_s = max(float(bucket_s), 1e-3)
+    start = math.floor(t0 / bucket_s) * bucket_s
+    count = max(1, int(math.ceil((t1 - start) / bucket_s)))
+    if count > MAX_BUCKETS:
+        bucket_s = max((t1 - t0) / (MAX_BUCKETS - 1), 1e-3)
+        start = math.floor(t0 / bucket_s) * bucket_s
+        count = max(1, min(MAX_BUCKETS,
+                           int(math.ceil((t1 - start) / bucket_s))))
+
+    totals = [0] * count
+    passed = [0] * count
+    latencies: list[list[float]] = [[] for _ in range(count)]
+    errors = [""] * count
+    codes: list[int | None] = [None] * count
+    rows = service.db.https_checks_between(target_id, start, t1)
+    for row in rows:
+        index = int((row["ts"] - start) / bucket_s)
+        if index < 0 or index >= count:
+            continue
+        totals[index] += 1
+        if row["ok"]:
+            passed[index] += 1
+        elif not errors[index]:
+            errors[index] = row["error"] or ""
+            codes[index] = row["status_code"]
+        if row["latency_ms"] is not None:
+            latencies[index].append(float(row["latency_ms"]))
+
+    buckets = []
+    for index in range(count):
+        total = totals[index]
+        times = latencies[index]
+        buckets.append({
+            "t0": start + index * bucket_s,
+            "t1": start + (index + 1) * bucket_s,
+            "total": total,
+            "ok": passed[index],
+            "ok_pct": (100.0 * passed[index] / total) if total else None,
+            "avg_latency_ms": (sum(times) / len(times)) if times else None,
+            "last_error": errors[index],
+            "status_code": codes[index],
+        })
+
+    checks = sum(totals)
+    every = [value for group in latencies for value in group]
+    last = rows[-1] if rows else None
+    return {
+        "t0": t0,
+        "t1": t1,
+        "url": url,
+        "bucket_s": bucket_s,
+        "polls_per_block": per_block,
+        "buckets": buckets,
+        "summary": {
+            "state": "none" if last is None else ("up" if last["ok"] else "down"),
+            "checks": checks,
+            "ok_pct": (100.0 * sum(passed) / checks) if checks else 0.0,
+            "avg_latency_ms": (sum(every) / len(every)) if every else None,
+            "last_error": (last["error"] or "") if last is not None else "",
+            "last_status_code": last["status_code"] if last is not None else None,
+            "last_ts": last["ts"] if last is not None else None,
+        },
     }
 
 
@@ -1640,11 +1786,16 @@ def get_debug(service, params, body) -> dict:
     running = queued = 0
     targets = service.db.targets() if see_netpath else []
     last_traces = service.db.last_traces([target["id"] for target in targets])
+    last_https = service.db.last_https_checks([t["id"] for t in targets])
+    https_state = service.https_checker.worker_state()
+    https_schedule = service.https_checker.next_runs()
     for target in targets:
         last = last_traces.get(target["id"])
         work = state.get(target["id"])
         keys = target.keys()
         timeout_s = float(target["timeout_s"]) if "timeout_s" in keys else 2.0
+        check = last_https.get(target["id"])
+        url = str(target["https_url"] or "") if "https_url" in keys else ""
         entry = {
             "id": target["id"],
             "label": target["label"] or target["host"],
@@ -1657,6 +1808,22 @@ def get_debug(service, params, body) -> dict:
             "next_run": schedule.get(target["id"]),
             "interval_s": target["interval_s"],
             "status": last["status"] if last else "none",
+            # The web page check for this destination, on the same row as
+            # its trace: "checking" while a GET is out, otherwise the last
+            # verdict. A destination with no URL reports state "none".
+            "https": {
+                "url": url,
+                "state": ("none" if not url or check is None
+                          else ("up" if check["ok"] else "down")),
+                "checking": target["id"] in https_state,
+                "elapsed": (now - (https_state[target["id"]]["started"] or now)
+                            if target["id"] in https_state else None),
+                "next_run": https_schedule.get(target["id"]),
+                "last_run": check["ts"] if check else None,
+                "status_code": check["status_code"] if check else None,
+                "latency_ms": check["latency_ms"] if check else None,
+                "error": (check["error"] or "") if check else "",
+            },
         }
         if work:
             if work.get("started"):
@@ -3267,6 +3434,14 @@ def _device_json(row, reveal: bool = False) -> dict:
         "vendor_source": row["vendor_source"] or "",
         "vendor_oid": row["vendor_oid"] or "",
         "location_oid": row["location_oid"] or "",
+        # What software the device is running (netpath/swversion.py), keyed
+        # defensively like the columns above for a row handed in from
+        # before the migration that added them. NULL where nothing matched:
+        # the header and the firmware report both show nothing rather than
+        # a guess. sw_image_file is Cisco's boot image path, not a version.
+        "sw_version": (row["sw_version"] if "sw_version" in row.keys() else None),
+        "sw_image": (row["sw_image"] if "sw_image" in row.keys() else None),
+        "sw_image_file": (row["sw_image_file"] if "sw_image_file" in row.keys() else None),
         "status": row["status"], "ping_ok": _tri(row["ping_ok"]),
         "ping_rtt_ms": row["ping_rtt_ms"], "snmp_ok": _tri(row["snmp_ok"]),
         "snmp_error": row["snmp_error"], "consecutive_fail": row["consecutive_fail"],
@@ -3764,7 +3939,8 @@ def get_nodes_devices(service, params, body) -> dict:
 _DEVICE_CSV_HEADER = ["id", "name", "ip", "status", "group_id", "device_group_id",
                      "vendor", "sys_descr", "sys_name", "polling", "muted_until",
                      "maintenance_since", "poll_interval_s", "last_poll_ts",
-                     "override_count", "addresses"]
+                     "override_count", "addresses",
+                     "sw_version", "sw_image", "sw_image_file"]
 
 
 def get_nodes_devices_export(service, params, body) -> dict:
@@ -3787,7 +3963,8 @@ def get_nodes_devices_export(service, params, body) -> dict:
                 (d.get("maintenance") or {}).get("started_ts"),
                 d.get("poll_interval_s"), d.get("last_poll_ts"),
                 d.get("override_count"),
-                ", ".join(a["ip"] for a in d.get("addresses") or ())]
+                ", ".join(a["ip"] for a in d.get("addresses") or ()),
+                d.get("sw_version"), d.get("sw_image"), d.get("sw_image_file")]
                for d in devices]
     return _csv_response("devices", header, csv_rows)
 
@@ -4589,10 +4766,19 @@ def delete_nodes_device(service, params, body, device_id) -> dict:
     # then arrive silenced with nothing on screen saying why.
     service.alerts_db.forget_device(device_id)
     service.configrx_db.forget_device(device_id)
-    service.nodes_db.remove_device(device_id)
+    service.mapper_db.forget_device(device_id)
+    # Nodes last, and only the request: the device stops being polled,
+    # stops being visible and gives up its address in one short
+    # transaction, and its history — up to millions of sample rows for a
+    # long-polled chassis — is deleted in background batches by the
+    # DevicePurger. The freed-rowid argument above still holds: the
+    # device_purges row keeps the id reserved until the last of those rows
+    # is gone, and only then is the devices row itself deleted.
+    queued = service.nodes_db.request_device_removal([device_id])
+    service.device_purger.wake()
     service.log.add(NODES_CATEGORY, f"Removed device {row['ip']}")
     _audit(service, params, "device.delete", target=f"device:{row['ip']}")
-    return {"ok": True}
+    return {"ok": True, "queued": queued}
 
 
 # The 16 MB body cap leaves room for well over a million integers, and an
@@ -4649,10 +4835,19 @@ def post_nodes_devices_bulk_delete(service, params, body) -> dict:
     for device_id in device_ids:
         service.alerts_db.forget_device(device_id)
         service.configrx_db.forget_device(device_id)
-    removed = service.nodes_db.bulk_remove_devices(device_ids)
+        service.mapper_db.forget_device(device_id)
+    # One transaction for the whole list, then the purge runs in the
+    # background — see delete_nodes_device.
+    removed = service.nodes_db.request_device_removal(device_ids)
+    service.device_purger.wake()
     service.log.add(NODES_CATEGORY, f"Bulk-removed {removed} device(s)")
     _audit(service, params, "device.bulk_delete", target=f"{len(device_ids)} devices")
-    return {"ok": True, "removed": removed}
+    return {"ok": True, "removed": removed, "queued": removed}
+
+
+def get_nodes_purges(service, params, body) -> dict:
+    """How much of the deleted devices' history is still being removed."""
+    return service.nodes_db.purge_status()
 
 
 # ------------------------------------------------------------ bulk import
@@ -5729,6 +5924,36 @@ def get_nodes_reports_top_metrics(service, params, body) -> dict:
         service.nodes_db, key, t0, t1, n=n, rank_by=rank_by,
         ascending=ascending, like=like, device_ids=device_ids)
     return result.to_dict()
+
+
+_FIRMWARE_CSV_HEADER = ["device_id", "name", "ip", "vendor", "model_hint",
+                        "sw_version", "sw_image", "sw_image_file", "last_poll_ts"]
+
+
+def _firmware_report(service, params):
+    """The shared body of the JSON route and the CSV one, so the file an
+    operator downloads cannot drift from the table they looked at. No
+    window: this report reads the identity columns as they stand, not
+    history, so there is nothing to clamp and nothing to cap."""
+    return reportmod.firmware_inventory(
+        service.nodes_db, _id_list(params.get("device_ids")))
+
+
+def get_nodes_reports_firmware(service, params, body) -> dict:
+    """What software every device is running, from the columns the identity
+    poll already stores. `device_ids` (comma-separated) narrows it to a
+    group; omitted, the whole fleet is reported on."""
+    return _firmware_report(service, params).to_dict()
+
+
+def get_nodes_reports_firmware_export(service, params, body) -> dict:
+    """The same report as a CSV file, server-side — the report screen also
+    builds one from the rows on screen, but a 900-device fleet is a file to
+    hand somebody, not a table to scroll."""
+    report = _firmware_report(service, params)
+    csv_rows = [[r.device_id, r.name, r.ip, r.vendor, r.model_hint, r.sw_version,
+                 r.sw_image, r.sw_image_file, r.last_poll_ts] for r in report.rows]
+    return _csv_response("firmware", _FIRMWARE_CSV_HEADER, csv_rows)
 
 
 def get_nodes_device_events(service, params, body, device_id) -> dict:
@@ -7140,8 +7365,8 @@ def post_alerts_rule(service, params, body) -> dict:
             "A rule key may use letters, digits, underscore, hyphen and dot "
             f"only, up to {ALERT_RULE_KEY_MAX} characters")
     if kind not in ("device_event", "interface_event", "threshold",
-                    "dhcp_threshold", "netpath_threshold", "trap", "syslog",
-                    "ipam", "wireless_event", "system"):
+                    "dhcp_threshold", "netpath_threshold", "netpath_event",
+                    "trap", "syslog", "ipam", "wireless_event", "system"):
         raise ValueError("Unrecognized rule kind")
     if service.alerts_db.rule_by_key(key):
         raise ValueError(f"A rule with key '{key}' already exists")
@@ -7298,7 +7523,13 @@ def post_alerts_template_preview(service, params, body, template_id) -> dict:
             extra={"metric_label": "CPU", "value": "95%", "threshold": "90%",
                   "previous_uptime": "12d 4h", "current_uptime": "0d 0h 2m",
                   "trap_name": "coldStart", "trap_oid": "1.3.6.1.6.3.1.1.5.1",
-                  "varbinds": "(sample)"})
+                  "varbinds": "(sample)",
+                  # Only the recovery template is ever sent as a resolution;
+                  # every other template previews as the opening alert it is.
+                  **({"severity_tag": alertmail.RECOVER_TAG,
+                      "recover_tag": alertmail.RECOVER_TAG}
+                     if row["key"] == "device_up" else
+                     {"severity_tag": "[WARNING]", "recover_tag": ""})})
     return {"subject": alertmail.render(subject, context),
             "body": alertmail.render(template_body, context),
             "is_html": is_html}
@@ -7517,6 +7748,11 @@ def _radio_json(row) -> dict:
         "operating_power_dbm": row["operating_power_dbm"],
         "mode": (row["mode"] if "mode" in keys else None) or "",
         "station_count": row["station_count"],
+        # fgWcWtpSessionRadioBaseBssid, and the width the radio's PROFILE
+        # configures — fgWcWtpSessionRadioEntry has no width column at all,
+        # so this is joined on through the AP's profile name.
+        "bssid": (row["bssid"] if "bssid" in keys else None) or "",
+        "channel_width": (row["channel_width"] if "channel_width" in keys else None) or "",
     }
     # Named for what it is rather than converted into a percentage of
     # something: a scanning radio has no transmit power to express in any
@@ -7550,6 +7786,18 @@ def _power_unit(service, powers) -> str:
     return "percent" if any(p > MAX_PLAUSIBLE_DBM for p in powers) else "dbm"
 
 
+def _ap_uptime_s(row):
+    """fgWcWtpSessionWtpUpTime aged forward from the poll that read it —
+    exactly what _sys_uptime_s does for a Nodes device's sysUpTime, and for
+    the same reason: the stored figure is only true as of its timestamp.
+    None until the controller has answered the column once."""
+    ticks = row["uptime_ticks"]
+    read_at = row["uptime_ts"]
+    if ticks is None or not read_at:
+        return None
+    return round(ticks / 100 + max(0.0, time.time() - read_at))
+
+
 def _ap_json(service, row) -> dict:
     radios = [_radio_json(r) for r in service.wireless_db.radios_for(row["id"])]
     # The at-a-glance table shows one tx-power figure per AP; a real AP
@@ -7561,6 +7809,7 @@ def _ap_json(service, row) -> dict:
               if r["operating_power_dbm"] is not None and not r["is_scan"]]
     channels = [str(r["channel"]) for r in radios if r["channel"] not in (None, "")]
     radio_stations = [r["station_count"] for r in radios if r["station_count"] is not None]
+    uptime_s = _ap_uptime_s(row)
     return {
         "id": row["id"], "controller_id": row["controller_id"],
         "wtp_id": row["wtp_id"], "vdom": row["vdom"], "name": row["name"],
@@ -7581,6 +7830,15 @@ def _ap_json(service, row) -> dict:
         "radio_count": len(radios),
         "radio_modes": ", ".join(r["mode"] for r in radios if r["mode"]),
         "channels": ", ".join(channels),
+        "bssids": ", ".join(r["bssid"] for r in radios if r["bssid"]),
+        # The AP's own uptime, aged forward from the poll that read it the
+        # way a Nodes device's is, plus the same figure pre-formatted: the
+        # column sorts on the number and shows the text.
+        "profile": row["profile"] or "",
+        "uptime_s": uptime_s,
+        "uptime_text": format_ticks(round(uptime_s * 100)) if uptime_s is not None else "",
+        "session_uptime_text": (format_ticks(row["session_uptime_ticks"])
+                                if row["session_uptime_ticks"] is not None else ""),
         "radio_station_count": sum(radio_stations) if radio_stations else None,
         "out_of_service": bool(row["out_of_service"]),
         "radios": radios,

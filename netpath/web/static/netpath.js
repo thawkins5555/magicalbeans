@@ -4,7 +4,13 @@
   const NODE_W = 212, NODE_H = 66, COL_GAP = 54, ROW_GAP = 18;
   const PAD_X = 10, TICKS_H = 7, LABEL_H = 13, LANE_GAP = 9, AXIS_H = 20;
   const STATUS_H = 26, MIN_BLOCK_PX = 3;
-  const LANE_ORDER = ['rtt', 'loss', 'status'];
+  /* The web lane is drawn only for a destination that has a web page URL,
+     so laneOrder() below is what the geometry and the drawing both read. */
+  const WEB_H = 14;
+  const LANE_ORDER = ['rtt', 'loss', 'status', 'web'];
+
+  const WEB_COLOR = { up: 'var(--ok)', down: 'var(--fail)', none: 'var(--nodata)' };
+  const WEB_LABEL = { up: 'Available', down: 'Unavailable', none: 'Not checked yet' };
 
   const STATUS_COLOR = {
     ok: 'var(--ok)', warn: 'var(--warn)', fail: 'var(--fail)',
@@ -21,6 +27,7 @@
   const view = {
     targets: [],
     targetId: null,
+    https: null,
     windows: {},
     windowFor: null,
     t0: Date.now() / 1000 - 3600,
@@ -170,7 +177,11 @@
       `<b>every</b> ${App.span(t.interval_s)} · ` +
       `<b>warn above</b> ${t.warn_rtt_ms} ms or ${t.warn_loss}% loss · ` +
       `<b>probe</b> ${t.max_hops} hops × ${t.probes} at ${t.timeout_s}s ` +
-      `(worst case ${budget}s)`;
+      `(worst case ${budget}s)` +
+      (t.https_url
+        ? ` · <b>web page</b> checked every ${App.span(t.interval_s)}`
+          + (t.https_insecure ? ', untrusted certificate accepted' : '')
+        : '');
   }
 
   // Which destination the keyboard is on, kept by id (not index) since the
@@ -228,6 +239,7 @@
                        (target.hop_probe_enabled
                          ? ' <span title="Continuous per-hop probing is on for this destination" style="color:var(--accent);font-size:var(--fs-2xs);font-weight:700;">MTR</span>'
                          : '') +
+                       httpsBadge(target) +
                        `</div><div class="host">${escape(target.host)}</div>`;
       li.append(dot, spoken, text);
       list.appendChild(li);
@@ -266,6 +278,18 @@
 
   const escape = App.escapeHtml;
 
+  /* The web page's state beside the MTR badge: the word carries it, the
+     colour only reinforces it, and the title says what was measured. */
+  function httpsBadge(target) {
+    if (!target.https_url) return '';
+    const state = target.https_state || 'none';
+    const parts = [WEB_LABEL[state] || state, target.https_url];
+    if (target.https_error) parts.push(target.https_error);
+    else if (target.https_latency_ms) parts.push(`${Math.round(target.https_latency_ms)} ms`);
+    return ` <span title="Web page: ${escape(parts.join(' · '))}"` +
+           ` style="color:${WEB_COLOR[state]};font-size:var(--fs-2xs);font-weight:700;">HTTPS</span>`;
+  }
+
   function targetForm(target) {
     const d = App.state.settings;
     const t = target || {};
@@ -286,6 +310,17 @@
       <fieldset><legend>THRESHOLDS</legend>
         ${field('Warn above (ms)', 'f-warn-rtt', t.warn_rtt_ms ?? d.default_warn_rtt_ms, 'type=number min=1')}
         ${field('Warn at loss (%)', 'f-warn-loss', t.warn_loss ?? d.default_warn_loss, 'type=number min=0 max=100')}
+      </fieldset>
+      <fieldset><legend>WEB PAGE</legend>
+        ${field('Page URL', 'f-https-url', escape(t.https_url ?? ''),
+                'placeholder="https://device.example/status"')}
+        <label class="check"><input type="checkbox" id="f-https-insecure" ${t.https_insecure ? 'checked' : ''}>
+          Accept an untrusted certificate</label>
+        <p class="hint">Blank means no web page is checked. A GET runs on the
+          trace interval above: anything in the 200s or 300s is available,
+          a 4xx/5xx, a timeout, a DNS failure or a certificate that does not
+          verify is not. Tick the box for an appliance whose management page
+          serves a self-signed certificate.</p>
       </fieldset>
       ${target ? `
       <fieldset><legend>CONTINUOUS PROBING</legend>
@@ -325,6 +360,8 @@
       timeout_s: Number(value('#f-timeout')),
       warn_rtt_ms: Number(value('#f-warn-rtt')),
       warn_loss: Number(value('#f-warn-loss')),
+      https_url: value('#f-https-url').trim(),
+      https_insecure: box.querySelector('#f-https-insecure').checked,
       // Only present on the edit form — a target must exist before it can
       // opt in to continuous probing.
       ...(probeEl ? { hop_probe_enabled: probeEl.checked } : {}),
@@ -881,18 +918,31 @@
     return `${Math.round(ms)} ms`;
   }
 
+  /* Which lanes this destination has. A destination with no web page has
+     nothing to draw in the fourth lane, so it gets the three it always had
+     and the full height for them. */
+  function laneOrder() {
+    const target = currentTarget();
+    return (target && target.https_url)
+      ? LANE_ORDER : LANE_ORDER.filter((name) => name !== 'web');
+  }
+
   function lanes(width, height) {
+    const order = laneOrder();
+    const hasWeb = order.includes('web');
     const usable = width - 2 * PAD_X;
-    let spare = height - AXIS_H - TICKS_H - 3 * LABEL_H - 2 * LANE_GAP - STATUS_H;
+    let spare = height - AXIS_H - TICKS_H - order.length * LABEL_H
+      - (order.length - 1) * LANE_GAP - STATUS_H - (hasWeb ? WEB_H : 0);
     spare = Math.max(spare, 44);
     const heights = {
       rtt: Math.max(spare * 0.55, 22),
       loss: Math.max(spare - Math.max(spare * 0.55, 22), 22),
       status: STATUS_H,
+      web: WEB_H,
     };
     const out = {};
     let y = TICKS_H + LABEL_H;
-    for (const name of LANE_ORDER) {
+    for (const name of order) {
       out[name] = { x: PAD_X, y, w: usable, h: heights[name] };
       y += heights[name] + LANE_GAP + LABEL_H;
     }
@@ -941,7 +991,8 @@
     // place by the pointermove handler below, so a drag no longer misses the
     // signature and rebuilds the whole timeline once per pointer event.
     const sig = `${width}x${height}:${t0}:${t1}:${data ? data.buckets.length : 'x'}` +
-      `:${view.pinned || ''}`;
+      `:${view.pinned || ''}:${view.https ? view.https.buckets.length : 'x'}` +
+      `:${view.https ? view.https.summary.checks : ''}`;
     if (svg.dataset.timelineSig === sig) {
       if (view.playhead) {
         const x = playheadX(width, t0, t1);
@@ -959,7 +1010,7 @@
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
     timelineEl.tabIndex = 0;
     timelineEl.setAttribute('role', 'img');
-    const summary = ['stat-healthy', 'stat-rtt', 'stat-traces']
+    const summary = ['stat-healthy', 'stat-rtt', 'stat-traces', 'stat-web']
       .map((id) => App.el(id).textContent.replace(/\s+/g, ' ').trim())
       .filter(Boolean).join(', ');
     timelineEl.setAttribute('aria-label', `Timeline. ${summary || 'No data'}. ` +
@@ -989,6 +1040,11 @@
     label(L.rtt, 'ROUND-TRIP TIME', peak ? `peak ${rttText(peak)}` : '');
     label(L.loss, 'PACKET LOSS', '100%');
     label(L.status, 'STATUS', '');
+    if (L.web) {
+      const web = view.https && view.https.summary;
+      label(L.web, 'WEB PAGE',
+        web && web.checks ? `${web.ok_pct.toFixed(0)}% available` : '');
+    }
 
     // The warn thresholds, drawn where the eye already is. A bar crossing the
     // dashed line is exactly why the block below it turned amber.
@@ -1057,6 +1113,41 @@
       }
     }
 
+    // The web lane: one cell per check block, green where every check in it
+    // answered, red where none did, amber where the block is mixed. Its own
+    // pass rather than a branch inside the loop above, because the two series
+    // are bucketed on the same grid but arrive as separate payloads.
+    if (L.web && view.https) {
+      for (const bucket of view.https.buckets) {
+        const x0 = xFor(bucket.t0), x1b = xFor(bucket.t1);
+        if (x1b < PAD_X || x0 > width - PAD_X) continue;
+        const w = Math.max(x1b - x0, 1);
+        const bw = Math.max(w - (w > 4 ? 1 : 0), 1);
+        if (!bucket.total) {
+          svg.appendChild(App.svgNode('rect', {
+            x: x0, y: L.web.y, width: bw, height: L.web.h,
+            fill: 'var(--nodata)',
+          }));
+          continue;
+        }
+        const fill = bucket.ok_pct >= 100 ? 'var(--ok)'
+          : (bucket.ok_pct <= 0 ? 'var(--fail)' : 'var(--warn)');
+        svg.appendChild(App.svgNode('rect', {
+          x: x0, y: L.web.y, width: bw, height: L.web.h,
+          fill, 'fill-opacity': 0.85,
+        }));
+        // The same texture vocabulary the status lane uses, so no state in
+        // this pane is carried by hue alone.
+        const texture = App.statusPatternUrl(
+          bucket.ok_pct >= 100 ? 'ok' : (bucket.ok_pct <= 0 ? 'fail' : 'warn'), svg);
+        if (texture) {
+          svg.appendChild(App.svgNode('rect', {
+            x: x0, y: L.web.y, width: bw, height: L.web.h, fill: texture,
+          }));
+        }
+      }
+    }
+
     // The hatch and the bars this file defined by hand now live in app.js
     // beside the three the other states need, so the two timelines cannot
     // drift apart.
@@ -1072,11 +1163,15 @@
       }, App.stamp(ts, span)));
     }
 
+    // The bottom of the drawn lanes: the web lane where there is one, the
+    // status lane otherwise. Every full-height line and the brush measure
+    // against it.
+    const lastLane = L.web || L.status;
     if (view.pinned) {
       const x = xFor(view.pinned);
       if (x >= PAD_X && x <= width - PAD_X) {
         svg.appendChild(App.svgNode('line', {
-          x1: x, y1: L.rtt.y - 6, x2: x, y2: L.status.y + L.status.h,
+          x1: x, y1: L.rtt.y - 6, x2: x, y2: lastLane.y + lastLane.h,
           stroke: 'var(--text)', 'stroke-width': 1.5,
         }));
       }
@@ -1084,7 +1179,7 @@
       // "Now" inside the window — the one line fastTick repositions on its
       // own, between the real redraws above (see the signature check).
       view.playhead = App.svgNode('line', {
-        y1: L.rtt.y - 6, y2: L.status.y + L.status.h,
+        y1: L.rtt.y - 6, y2: lastLane.y + lastLane.h,
         stroke: 'var(--accent)', 'stroke-dasharray': '1 2',
       });
       svg.appendChild(view.playhead);
@@ -1095,7 +1190,7 @@
     }
     const brush = App.svgNode('rect', {
       x: 0, y: L.rtt.y - 4, width: 0,
-      height: L.status.y + L.status.h - L.rtt.y + 8,
+      height: lastLane.y + lastLane.h - L.rtt.y + 8,
       fill: 'var(--accent)', 'fill-opacity': 0.14,
       stroke: 'var(--accent)', visibility: 'hidden',
     });
@@ -1120,7 +1215,7 @@
       view.drag = { from: timeAt(x), to: timeAt(x), moved: false };
     };
     const crosshair = App.svgNode('line', {
-      y1: L.rtt.y, y2: L.status.y + L.status.h,
+      y1: L.rtt.y, y2: lastLane.y + lastLane.h,
       stroke: 'var(--muted)', 'stroke-dasharray': '2 3', visibility: 'hidden',
     });
     svg.appendChild(crosshair);
@@ -1253,7 +1348,23 @@
       lines.push(`${bucket.icmp_code} ${bucket.icmp_text} from ${bucket.icmp_from}`);
     }
     if (bucket.path_changed) lines.push('route changed in this window');
+    lines.push(...webTipLines(ts));
     return lines.join('\n');
+  }
+
+  /* The web-page block under the same instant, appended to the tooltip the
+     three lanes above already build. */
+  function webTipLines(ts) {
+    if (!view.https || !view.https.url) return [];
+    const bucket = view.https.buckets.find((b) => ts >= b.t0 && ts <= b.t1);
+    if (!bucket) return [];
+    if (!bucket.total) return ['Web page: no check recorded'];
+    const lines = [`Web page ${bucket.ok}/${bucket.total} available`];
+    if (bucket.avg_latency_ms !== null && bucket.avg_latency_ms !== undefined) {
+      lines.push(`  ${Math.round(bucket.avg_latency_ms)} ms avg`);
+    }
+    if (bucket.last_error) lines.push(`  ${bucket.last_error}`);
+    return lines;
   }
 
   const STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200,
@@ -1261,6 +1372,24 @@
   function niceStep(span) {
     const want = span / 7;
     return STEPS.find((s) => s >= want) || STEPS[STEPS.length - 1];
+  }
+
+  /* The fifth window-summary tile: what the web page did over the window,
+     in the same "state · number" shape the other four use. */
+  function renderWebStat() {
+    const el = App.el('stat-web');
+    if (!el) return;
+    const target = currentTarget();
+    if (!target || !target.https_url) { el.textContent = 'Web page  —'; return; }
+    const summary = (view.https && view.https.summary) || {};
+    if (!summary.checks) { el.textContent = 'Web page  no checks yet'; return; }
+    const state = summary.state === 'up' ? 'up' : 'down';
+    const tail = state === 'up'
+      ? (summary.avg_latency_ms ? `${Math.round(summary.avg_latency_ms)} ms` : '—')
+      : (summary.last_error || 'unavailable');
+    el.textContent = `Web page  ${state} · ${tail}`;
+    el.title = `${summary.ok_pct.toFixed(1)}% of ${summary.checks} check(s) ` +
+      `available · ${target.https_url}`;
   }
 
   /* ----------------------------------------------------------- refresh */
@@ -1281,6 +1410,8 @@
     if (view.targetId === null) {
       view.timeline = null;
       view.topology = null;
+      view.https = null;
+      renderWebStat();
       drawTimeline();
       drawRoute();
       return;
@@ -1312,6 +1443,18 @@
     App.el('stat-rtt').textContent = summary.avg_rtt
       ? `Avg RTT   ${summary.avg_rtt.toFixed(1)} ms` : 'Avg RTT      —';
     App.el('stat-traces').textContent = `Traces    ${summary.traces ?? 0}`;
+
+    // Only for a destination that has a page: the route is fetched for every
+    // destination, this one is not.
+    if (currentTarget() && currentTarget().https_url) {
+      view.https = await App.get('/api/netpath/https', {
+        target: view.targetId, t0: view.t0, t1: view.t1, width,
+      });
+      if (view.refreshGen !== generation || App.state.tab !== 'netpath') return;
+    } else {
+      view.https = null;
+    }
+    renderWebStat();
 
     const params = { target: view.targetId, t0: view.t0, t1: view.t1 };
     if (view.pinned) params.at = view.pinned;

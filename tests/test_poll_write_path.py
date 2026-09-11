@@ -516,6 +516,128 @@ def _poll_once(poller, db, device_id):
     poller._poll_device(device, db.effective_config(device))
 
 
+def software_version():
+    """The three sw_* columns a poll writes: the split of sysDescr and the
+    one best-effort vendor GET (netpath/swversion.py) reaching the device
+    row through record_poll, over real BER off a stub — not asserted by
+    calling extract() with a string, which test_swversion.py already does."""
+    print("\n-- software version and image")
+
+    proc, port = spawn_stub("stub_agent_vendor_health.py", "cisco")
+    try:
+        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        db = NodesDatabase(os.path.join(TMPDIR, "sw_cisco.db"))
+        group_id = db.ensure_default_group()
+        device_id = db.add_device(
+            "127.0.0.1", "sw-cisco", group_id=group_id,
+            snmp_version=1, community="public", ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=1.0, snmp_retries=1)
+        poller = NodePoller(db)
+        _poll_once(poller, db, device_id)
+        row = db.device(device_id)
+        check(row["sw_version"] == "15.2(7)E4",
+              f"a Cisco poll stores the sysDescr version, not the older "
+              f"entPhysicalSoftwareRev the same device also answers "
+              f"({row['sw_version']!r})")
+        check(row["sw_image"] == "C2960X-UNIVERSALK9-M",
+              f"…and the image out of the same string ({row['sw_image']!r})")
+        check(row["sw_image_file"]
+              and row["sw_image_file"].endswith("c2960x-universalk9-mz.152-7.E4.bin"),
+              f"…and sysConfigName as the boot image FILE, kept apart from "
+              f"the image name ({row['sw_image_file']!r})")
+
+        # One extra GET per identity poll, not one per object: the vendor
+        # OIDs, entPhysicalSoftwareRev and sysConfigName ride in a single
+        # request, and a device answering none of them costs that datagram
+        # and nothing else.
+        device = db.device(device_id)
+        config = db.effective_config(device)
+        identity, _uptime, _metrics = poller._poll_snmp_scalars(device, config)
+        calls = []
+        real_get = poller._snmp_get
+        poller._snmp_get = lambda *a, **kw: (calls.append(a[2]), real_get(*a, **kw))[1]
+        try:
+            fields = poller._poll_software_version(device, config, identity)
+        finally:
+            poller._snmp_get = real_get
+        check(len(calls) == 1,
+              f"the software read is exactly one GET ({len(calls)})")
+        check(fields["sw_version"] == "15.2(7)E4",
+              f"…answering the same three fields the poll stored ({fields})")
+        poller.shutdown()
+        db.close()
+    finally:
+        proc.kill()
+
+    proc, port = spawn_stub("stub_agent_vendor_health.py", "fortinet")
+    try:
+        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        db = NodesDatabase(os.path.join(TMPDIR, "sw_fortinet.db"))
+        group_id = db.ensure_default_group()
+        device_id = db.add_device(
+            "127.0.0.1", "sw-fgt", group_id=group_id,
+            snmp_version=1, community="public", ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=1.0, snmp_retries=1)
+        poller = NodePoller(db)
+        _poll_once(poller, db, device_id)
+        row = db.device(device_id)
+        check(row["sw_version"] == "7.2.8",
+              f"a FortiGate's fgSysVersion splits into a version "
+              f"({row['sw_version']!r})")
+        check(row["sw_image"] == "build1639 (GA.M)",
+              f"…and a build as the image ({row['sw_image']!r})")
+        check(row["sw_image_file"] is None,
+              f"…with no boot file, which only Cisco answers "
+              f"({row['sw_image_file']!r})")
+        poller.shutdown()
+        db.close()
+    finally:
+        proc.kill()
+
+    # Discovery's own seeding: a promoted sweep result has a sysDescr and a
+    # sysObjectID and nothing else, which is already everything the vendors
+    # that write the version into sysDescr need — so a just-promoted device
+    # shows one before its first poll rather than a blank.
+    db = NodesDatabase(os.path.join(TMPDIR, "sw_seed.db"))
+    seeded = db.add_device("10.77.0.1", "seeded")
+    db.seed_identity(
+        seeded,
+        sys_descr="Cisco IOS Software, C2960X Software (C2960X-UNIVERSALK9-M),"
+                  " Version 15.2(7)E4, RELEASE SOFTWARE (fc2)",
+        sys_name="seeded", sys_object_id="1.3.6.1.4.1.9.1.1208", vendor="cisco")
+    row = db.device(seeded)
+    check(row["sw_version"] == "15.2(7)E4" and row["sw_image"] == "C2960X-UNIVERSALK9-M",
+          f"discovery seeds the version and image from sysDescr alone "
+          f"({row['sw_version']!r}, {row['sw_image']!r})")
+    db.close()
+
+    # A device that answers none of it: three NULLs, no invention, and the
+    # poll is still a success.
+    proc, port = spawn_stub("stub_agent_iftable.py", "ok", "--interfaces", "2")
+    try:
+        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        db = NodesDatabase(os.path.join(TMPDIR, "sw_none.db"))
+        group_id = db.ensure_default_group()
+        device_id = db.add_device(
+            "127.0.0.1", "sw-plain", group_id=group_id,
+            snmp_version=1, community="public", ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=1.0, snmp_retries=1)
+        poller = NodePoller(db)
+        _poll_once(poller, db, device_id)
+        row = db.device(device_id)
+        check(row["sw_version"] is None and row["sw_image"] is None
+              and row["sw_image_file"] is None,
+              f"a device that names no software stores NULLs "
+              f"({row['sw_version']!r}, {row['sw_image']!r})")
+        check(row["status"] == "up" and not row["snmp_error"],
+              f"…and the unanswered software GET is not a poll failure "
+              f"({row['status']!r}, {row['snmp_error']!r})")
+        poller.shutdown()
+        db.close()
+    finally:
+        proc.kill()
+
+
 def interface_reads():
     """The three ways reading a device's interfaces used to go wrong: an
     SNMPv1 agent answering noSuchName for the whole PDU, a device that
@@ -570,13 +692,15 @@ def interface_reads():
     # --dark-after counts plain GETs answered before the agent goes silent:
     # the identity read and the UCD-SNMP read (2), plus, since nodepoll grew
     # a UPS-MIB probe tried on every device exactly like UCD-SNMP is
-    # (nodepoll._poll_ups_health), one more (3) — all three land before the
-    # interface walk even starts. 4 is what leaves interface 1's own GET
-    # (the first one issued once the per-interface loop begins) as the last
-    # one this agent still answers, which is the scenario this section is
-    # for: one interface read before the device goes dark, none after.
+    # (nodepoll._poll_ups_health), one more (3), plus the software-version
+    # read (nodepoll._poll_software_version), one more again (4) — all four
+    # land before the interface walk even starts. 5 is what leaves interface
+    # 1's own GET (the first one issued once the per-interface loop begins)
+    # as the last one this agent still answers, which is the scenario this
+    # section is for: one interface read before the device goes dark, none
+    # after.
     proc, port = spawn_stub("stub_agent_iftable.py", "dark_after_walk",
-                            "--interfaces", "40", "--dark-after", "4")
+                            "--interfaces", "40", "--dark-after", "5")
     try:
         nodepoll_mod.DEFAULT_SNMP_PORT = port
         db = NodesDatabase(os.path.join(TMPDIR, "dark.db"))
@@ -852,6 +976,7 @@ def main():
     reboot_suppression()
     interface_reads()
     vendor_health()
+    software_version()
     ipv6_polling()
     pool_and_walks()
     request_matching()

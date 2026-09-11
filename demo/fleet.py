@@ -6,7 +6,7 @@ the UNMODIFIED app can poll them — nodeoids.py and fortipoll.py hard-wire
 DEFAULT_SNMP_PORT = 161, so a stub on any other port could never be
 reached the same way.
 
-    python3 demo/fleet.py --count 300 [--control-port 8099]
+    python3 demo/fleet.py --count 300 [--control-port 8099] [--page-port 8444]
                           [--scenario demo/scenario.json] [--quiet]
 
 One line containing "listening" is printed once every socket is bound —
@@ -781,6 +781,65 @@ class _ControlHandler(BaseHTTPRequestHandler):
         self._send(200, {"ok": True, "applied": applied})
 
 
+class _PageHandler(BaseHTTPRequestHandler):
+    """The web page half of a demo destination: one URL that works and one
+    that does not, so NetPath's per-destination HTTPS check has something
+    real to measure."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args) -> None:
+        pass
+
+    def do_GET(self) -> None:
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        code, body = (200, b"demo device management page\n")
+        if path == "/broken":
+            code, body = 503, b"service unavailable\n"
+        elif path != "/":
+            code, body = 404, b"no such path\n"
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def start_page_server(port: int) -> ThreadingHTTPServer | None:
+    """A loopback HTTPS listener with a throwaway self-signed certificate.
+
+    stdlib ssl can only serve from a certificate file, so one is generated
+    with openssl at start. No openssl, no demo web page — the fleet carries
+    on without it and the seeded destinations simply report the check
+    failing, which is itself a truthful demo state.
+    """
+    import ssl
+    import subprocess
+    import tempfile
+
+    folder = tempfile.mkdtemp(prefix="fleet_page_")
+    cert = os.path.join(folder, "cert.pem")
+    key = os.path.join(folder, "key.pem")
+    try:
+        done = subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", key, "-out", cert, "-days", "30",
+             "-subj", "/CN=localhost"],
+            capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0 or not os.path.isfile(cert):
+        return None
+    server = ThreadingHTTPServer(("127.0.0.1", port), _PageHandler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, name="page",
+                     daemon=True).start()
+    return server
+
+
 def start_control_server(fleet: Fleet, port: int) -> ThreadingHTTPServer:
     handler = type("ControlHandler", (_ControlHandler,), {"fleet": fleet})
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
@@ -834,6 +893,8 @@ def main(argv=None) -> int:
                         help="how many devices to simulate (default 30)")
     parser.add_argument("--control-port", type=int, default=8099,
                         help="control HTTP port on 127.0.0.1 (default 8099)")
+    parser.add_argument("--page-port", type=int, default=8444,
+                        help="HTTPS demo web page on 127.0.0.1 (default 8444)")
     parser.add_argument("--scenario", default="",
                         help="JSON file of time-scheduled events")
     parser.add_argument("--quiet", action="store_true",
@@ -851,6 +912,13 @@ def main(argv=None) -> int:
         print(f"control port {args.control_port} unavailable: {exc}",
               file=sys.stderr, flush=True)
 
+    pages = None
+    try:
+        pages = start_page_server(args.page_port)
+    except OSError as exc:
+        print(f"page port {args.page_port} unavailable: {exc}",
+              file=sys.stderr, flush=True)
+
     def shutdown(_signum, _frame):
         fleet.stop()
 
@@ -865,10 +933,15 @@ def main(argv=None) -> int:
     print(f"fleet listening on {len(fleet.devices)} devices "
           f"{first}:{SNMP_PORT}..{last}:{SNMP_PORT}, control "
           f"http://127.0.0.1:{args.control_port}/state", flush=True)
+    print(f"demo web page https://127.0.0.1:{args.page_port}/ (and /broken)"
+          if pages is not None else
+          "no demo web page: openssl produced no certificate", flush=True)
 
     try:
         fleet.serve_forever()
     finally:
+        if pages is not None:
+            pages.shutdown()
         if server is not None:
             server.shutdown()
         fleet.close()

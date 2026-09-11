@@ -238,16 +238,18 @@
   function draw() {
     const root = App.el('dash-grid');
     if (!root) return;
-    if (view.error) {
-      root.innerHTML = `<p class="warn-text">${escape(view.error)}</p>`;
-      return;
-    }
+    // A failed read is a line ABOVE the tiles, not instead of them: the
+    // numbers on screen are the last ones the server actually answered, and
+    // replacing a whole shift's view with one sentence threw away the only
+    // reading there was during precisely the outage it was reporting.
+    const errorLine = view.error
+      ? `<p class="warn-text">${escape(view.error)}</p>` : '';
     const d = view.dashboard;
     if (!d) {
-      root.innerHTML = App.loading();
+      root.innerHTML = errorLine || App.loading();
       return;
     }
-    const parts = [];
+    const parts = [errorLine];
     if (d.fleet) parts.push(fleetTile(d.fleet));
     if (d.alerts) parts.push(alertsTile(d.alerts));
     if (d.collectors) parts.push(collectorsTile(d.collectors));
@@ -265,7 +267,11 @@
       view.dashboard = payload.dashboard || {};
       view.error = null;
     } catch (error) {
-      if (error && error.superseded) return;
+      // Superseded means a newer fetch of this same URL is already running,
+      // so there is nothing to report — but this call still has to draw:
+      // returning here left the very first refresh's "Loading…" on screen
+      // for good whenever the boot and the first poll tick overlapped.
+      if (error && error.superseded) { draw(); return; }
       view.error = `The dashboard could not be read: ${error.message}`;
       draw();
       throw error;               // so App.connected() sees a real outcome
@@ -273,13 +279,14 @@
     const now = Date.now();
     if (App.canRead('nodes')
         && now - view.offendersFetchedAt >= OFFENDERS_EVERY_MS) {
-      view.offendersFetchedAt = now;
       try {
         view.offenders = await App.get('/api/dashboard/offenders');
+        // Stamped on the answer, not on the attempt: a fetch that failed has
+        // not been made, and must not hold the lists back for a minute.
+        view.offendersFetchedAt = now;
       } catch (error) {
         // A failed offenders fetch leaves the previous lists on screen and
         // does not take the tiles down with it.
-        if (!(error && error.superseded)) view.offendersFetchedAt = 0;
       }
     }
     draw();
@@ -292,9 +299,15 @@
     draw();
   }
 
+  /* The tiles paint before /api/config has answered now, so the offenders
+     gate above may have refused a fetch this account is in fact allowed. */
+  function permissionsChanged() {
+    if (!view.offenders) view.offendersFetchedAt = 0;
+  }
+
   function init() {
     draw();
   }
 
-  App.pages.dashboard = { init, refresh, activate };
+  App.pages.dashboard = { init, refresh, activate, permissionsChanged };
 })();

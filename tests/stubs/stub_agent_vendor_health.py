@@ -13,6 +13,10 @@ Modes:
            StatusValue: two rows (45, 52) -- column_max takes 52 (the
            metric this stub exists for: Cisco had zero temperature
            coverage before this sweep).
+  fortinet A Fortinet sysObjectID (enterprise arc 12356) answering
+           fgSysVersion "v7.2.8,build1639,240416 (GA.M)" and nothing else
+           the software read asks for -- the vendor-scalar half of
+           netpath/swversion.py, over the wire.
   juniper  A Juniper sysObjectID (enterprise arc 2636). jnxOperatingCPU:
            two rows (20, 40) -- column_first takes 20. jnxOperatingTemp:
            two rows (38, 44) -- column_max takes 44 (already covered
@@ -43,10 +47,32 @@ GENERIC_SCALARS = {
     "1.3.6.1.2.1.1.3.0": ("int", 13579),
     "1.3.6.1.2.1.1.5.0": ("str", "vh-stub"),
 }
+# A real IOS 15 sysDescr: the image in parentheses, the version after it.
+CISCO_SYS_DESCR = ("Cisco IOS Software, C2960X Software (C2960X-UNIVERSALK9-M),"
+                   " Version 15.2(7)E4, RELEASE SOFTWARE (fc2)")
 CISCO_SCALARS = {**GENERIC_SCALARS,
+                 "1.3.6.1.2.1.1.1.0": ("str", CISCO_SYS_DESCR),
                  "1.3.6.1.2.1.1.2.0": ("str", "1.3.6.1.4.1.9.1.1208")}
 JUNIPER_SCALARS = {**GENERIC_SCALARS,
                    "1.3.6.1.2.1.1.2.0": ("str", "1.3.6.1.4.1.2636.1.1.1.2.82")}
+FORTINET_SCALARS = {**GENERIC_SCALARS,
+                    "1.3.6.1.2.1.1.1.0": ("str", "FortiGate-100F"),
+                    "1.3.6.1.2.1.1.2.0": ("str", "1.3.6.1.4.1.12356.101.1.10000")}
+
+# The software read (netpath/swversion.py): OLD-CISCO-SYS-MIB sysConfigName,
+# the boot image's file path, and ENTITY-MIB entPhysicalSoftwareRev on the
+# chassis row. Deliberately DISAGREEING with the sysDescr version above, so
+# the test can tell which one the split actually used.
+CISCO_SOFTWARE = {
+    "1.3.6.1.4.1.9.2.1.73.0":
+        ("str", "flash:/c2960x-universalk9-mz.152-7.E4/"
+                "c2960x-universalk9-mz.152-7.E4.bin"),
+    "1.3.6.1.2.1.47.1.1.1.1.10.1": ("str", "15.0(2)SE11"),
+}
+# fgSysVersion -- version 7.2.8, image "build1639 (GA.M)".
+FORTINET_SOFTWARE = {
+    "1.3.6.1.4.1.12356.101.4.1.1.0": ("str", "v7.2.8,build1639,240416 (GA.M)"),
+}
 
 # cpmCPUTotal5minRev, two routing-engine-ish rows: column_first takes 30.
 CISCO_CPU_TABLE = {
@@ -80,7 +106,10 @@ MODE = "cisco"
 
 def table_for():
     if MODE == "cisco":
-        return {**CISCO_SCALARS, **CISCO_CPU_TABLE, **CISCO_TEMP_TABLE}
+        return {**CISCO_SCALARS, **CISCO_CPU_TABLE, **CISCO_TEMP_TABLE,
+                **CISCO_SOFTWARE}
+    if MODE == "fortinet":
+        return {**FORTINET_SCALARS, **FORTINET_SOFTWARE}
     if MODE == "juniper":
         return {**JUNIPER_SCALARS, **JUNIPER_CPU_TABLE, **JUNIPER_TEMP_TABLE,
                 **JUNIPER_BUFFER_TABLE}

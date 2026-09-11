@@ -229,6 +229,9 @@ class ConsoleWindow(QMainWindow):
     # that thread may be touched from the teardown thread directly.
     teardown_status = Signal(str)
     teardown_done = Signal(str)
+    # Same contract for the storage card's figures, which are read off the
+    # GUI thread so a database lock cannot freeze the window.
+    storage_ready = Signal(str)
 
     def __init__(self, service, server, capture=None):
         super().__init__()
@@ -240,6 +243,7 @@ class ConsoleWindow(QMainWindow):
         self._teardown_started = False
         self._notice = None
         self._force_timer = None
+        self._storage_thread: threading.Thread | None = None
 
         from . import __version__
 
@@ -248,6 +252,7 @@ class ConsoleWindow(QMainWindow):
         self._build_ui()
         self._load_fields()
 
+        self.storage_ready.connect(self.storage_label.setText)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._refresh)
         self.timer.start(1000)
@@ -411,9 +416,25 @@ class ConsoleWindow(QMainWindow):
         return card
 
     def _refresh_storage(self) -> None:
-        # Driven from service.STORES rather than a list of its own: this card
-        # used to name ten of the thirteen stores and read IPAM's cap as 0,
-        # so the console called a capped file uncapped.
+        """Ask a worker thread for the figures; the last ones stay on screen
+        meanwhile.
+
+        Every line here is a database read — size_bytes() stats three files
+        and oldest_ts() is a MIN() over an index — and each takes that
+        store's lock, which a poll, a prune or a device purge can be
+        holding. Run on the GUI thread at 1 Hz, as this was, that is the
+        window not repainting while a background delete runs.
+        """
+        if self._storage_thread is not None and self._storage_thread.is_alive():
+            return
+        self._storage_thread = threading.Thread(
+            target=self._read_storage, name="console-storage", daemon=True)
+        self._storage_thread.start()
+
+    def _read_storage(self) -> None:
+        # Off the GUI thread. Driven from service.STORES rather than a list
+        # of its own: this card used to name ten of the thirteen stores and
+        # read IPAM's cap as 0, so the console called a capped file uncapped.
         settings = self.service.settings
         rows = []
         for store in STORES:
@@ -423,17 +444,23 @@ class ConsoleWindow(QMainWindow):
             cap_mb = settings.get(store.cap_key, 0) if store.cap_key else 0
             rows.append((store.label, database, cap_mb))
         lines = []
-        for label, database, cap_mb in rows:
-            used = database.size_bytes()
-            cap = int(cap_mb) * 1024 * 1024
-            share = f"{used / cap * 100:5.1f}% of {int(cap_mb)} MB" if cap else "no cap"
-            oldest = database.oldest_ts()
-            # What the cap beside it has actually cost, in history, not bytes.
-            age = (f"oldest {_duration(time.time() - oldest)}" if oldest
-                   else "no history")
-            lines.append(f"{label:13s} {_size(used):>10s}   {share:>22s}   "
-                         f"{age:>16s}   {database.path}")
-        self.storage_label.setText("\n".join(lines))
+        try:
+            for label, database, cap_mb in rows:
+                used = database.size_bytes()
+                cap = int(cap_mb) * 1024 * 1024
+                share = (f"{used / cap * 100:5.1f}% of {int(cap_mb)} MB"
+                         if cap else "no cap")
+                oldest = database.oldest_ts()
+                # What the cap beside it has actually cost, in history, not bytes.
+                age = (f"oldest {_duration(time.time() - oldest)}" if oldest
+                       else "no history")
+                lines.append(f"{label:13s} {_size(used):>10s}   {share:>22s}   "
+                             f"{age:>16s}   {database.path}")
+        except Exception:                                     # noqa: BLE001
+            # A store closing under a shutdown, most likely. The card keeps
+            # the previous figures rather than the traceback.
+            return
+        self.storage_ready.emit("\n".join(lines))
 
     def _load_fields(self) -> None:
         """Read from the server, not the saved settings.

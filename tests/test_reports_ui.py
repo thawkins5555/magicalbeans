@@ -1,7 +1,7 @@
 """Static checks for the Nodes -> REPORTS subtab (nodes.js/index.html), in the
 style of test_frontend_contracts.py: shipped files read as text, no browser.
-Covers: both report routes are called from nodes.js; the subtab and its
-AVAILABILITY / TOP-N BY METRIC subpages use the standard subtab markup; no
+Covers: every report route is called from nodes.js; the subtab and its
+AVAILABILITY / TOP-N BY METRIC / FIRMWARE INVENTORY subpages use the standard subtab markup; no
 data-requires-write control anywhere; CSV export goes through App.saveCsv;
 tables use App.grid/sortRows/drawRows; a run request runs inside App.runJob."""
 import os
@@ -38,6 +38,11 @@ check("'/api/nodes/reports/availability'" in NODES,
       "nodes.js calls GET /api/nodes/reports/availability")
 check("'/api/nodes/reports/top-metrics'" in NODES,
       "nodes.js calls GET /api/nodes/reports/top-metrics")
+check("'/api/nodes/reports/firmware'" in NODES,
+      "nodes.js calls GET /api/nodes/reports/firmware")
+check("'/api/nodes/reports/firmware/export.csv'" in NODES,
+      "nodes.js offers the server-side firmware CSV as well as the "
+      "client-side one, so a 900-device fleet is a file rather than a table")
 
 # ---------------------------------------------------------------------------
 # 2. The REPORTS subtab exists on the Nodes page, alongside the other four,
@@ -67,6 +72,9 @@ check('data-subtab="availability"' in REPORTS_SECTION
 check('data-subtab="topmetrics"' in REPORTS_SECTION
       and 'id="nd-rep-sub-topmetrics"' in REPORTS_SECTION,
       "the Top-N report subtab and its subpage exist")
+check('data-subtab="firmware"' in REPORTS_SECTION
+      and 'id="nd-rep-sub-firmware"' in REPORTS_SECTION,
+      "the Firmware inventory report subtab and its subpage exist")
 check("function selectReportsSub(" in NODES,
       "nodes.js wires the nested reports subtabs by hand, like selectDetailSub")
 check("recallSub('nodes.reports'" in NODES and "rememberSub('nodes.reports'" in NODES,
@@ -97,6 +105,13 @@ for element_id in ["nd-rep-topn-key", "nd-rep-topn-like", "nd-rep-topn-rankby",
                    "nd-rep-topn-export-csv", "nd-rep-topn-table"]:
     check('id="%s"' % element_id in NODES_SECTION,
           "Top-N report control #%s exists" % element_id)
+# The firmware report has no period at all -- it reads the identity columns
+# as they stand -- so its bar is a group filter, Run, and the two exports.
+for element_id in ["nd-rep-fw-devgroup", "nd-rep-fw-run", "nd-rep-fw-export-csv",
+                   "nd-rep-fw-export-server", "nd-rep-fw-summary",
+                   "nd-rep-fw-table"]:
+    check('id="%s"' % element_id in NODES_SECTION,
+          "Firmware report control #%s exists" % element_id)
 
 # ---------------------------------------------------------------------------
 # 6. report.py's own query parameters are the ones actually sent: rank_by,
@@ -114,20 +129,24 @@ for param in ["key", "t0", "t1", "rank_by", "ascending", "like", "n", "device_id
 #    same contract test_frontend_contracts.py enforces for setText/setBg/
 #    deviceIndex/plottedRange, applied to App.grid/App.sortRows/App.drawRows.
 check(NODES.count("App.grid(App.el('nd-rep-avail-table')") == 1
-      and NODES.count("App.grid(App.el('nd-rep-topn-table')") == 1,
-      "both report tables are built with App.grid")
+      and NODES.count("App.grid(App.el('nd-rep-topn-table')") == 1
+      and NODES.count("App.grid(App.el('nd-rep-fw-table')") == 1,
+      "all three report tables are built with App.grid")
 check("App.sortRows(rows, view.repAvailSort.key" in NODES
-      and "App.sortRows(rows, view.repTopnSort.key" in NODES,
-      "both report tables sort with App.sortRows, not an inline .sort()")
+      and "App.sortRows(rows, view.repTopnSort.key" in NODES
+      and "App.sortRows(rows, view.repFirmwareSort.key" in NODES,
+      "all three report tables sort with App.sortRows, not an inline .sort()")
 check(NODES.count("App.drawRows(body,") >= 2 or NODES.count("App.drawRows(body, sorted") >= 1,
       "row rendering goes through App.drawRows")
 
 # ---------------------------------------------------------------------------
-# 8. CSV export: report.py has no export.csv route (its two routes answer
-#    JSON only), so the file is built from the rows already fetched rather
-#    than a second round trip — but it still leaves the browser through
-#    App.saveCsv, the one function every other export in this app uses,
-#    not a second copy of the Blob-and-anchor trick.
+# 8. CSV export: availability and top-N have no export.csv route (those two
+#    answer JSON only), so their file is built from the rows already fetched
+#    rather than a second round trip — but it still leaves the browser
+#    through App.saveCsv, the one function every other export in this app
+#    uses, not a second copy of the Blob-and-anchor trick. The firmware
+#    report has both: the same client-side helper, and App.exportCsv against
+#    its own server route for a fleet too large to want as a table.
 check("function saveReportCsv(" in NODES and "App.saveCsv(" in NODES,
       "report CSV export goes out through App.saveCsv")
 CSV_HELPER = NODES[NODES.index("function csvField("):NODES.index("const AVAIL_COLUMNS")]
@@ -136,8 +155,12 @@ check("new Blob(" not in CSV_HELPER,
       "App.saveCsv already does (nodes.js has its own, unrelated, for the "
       "OID walk download — this checks only the report CSV code)")
 check("App.el('nd-rep-avail-export-csv').onclick = exportAvailReportCsv" in NODES
-      and "App.el('nd-rep-topn-export-csv').onclick = exportTopnReportCsv" in NODES,
-      "both Export CSV buttons are wired to a report-specific export function")
+      and "App.el('nd-rep-topn-export-csv').onclick = exportTopnReportCsv" in NODES
+      and "App.el('nd-rep-fw-export-csv').onclick = exportFirmwareReportCsv" in NODES,
+      "every Export CSV button is wired to a report-specific export function")
+check("App.exportCsv('/api/nodes/reports/firmware/export.csv'" in NODES,
+      "the firmware report's server-side download goes through App.exportCsv, "
+      "the same helper every other server-built export uses")
 
 # ---------------------------------------------------------------------------
 # 9. The device-group filter resolves through App.deviceIndex(), the one
@@ -155,7 +178,8 @@ check("function reportDeviceIds(" in NODES and "App.deviceIndex()" in NODES,
 #     aborts the first one as "superseded" and App.runJob reports that as
 #     a failure that never actually happened.
 for fn_name, call_name in [("runAvailabilityReport", "reportDeviceIds('nd-rep-avail-devgroup')"),
-                           ("runTopMetricsReport", "reportDeviceIds('nd-rep-topn-devgroup')")]:
+                           ("runTopMetricsReport", "reportDeviceIds('nd-rep-topn-devgroup')"),
+                           ("runFirmwareReport", "reportDeviceIds('nd-rep-fw-devgroup')")]:
     body = NODES[NODES.index("function %s(" % fn_name):]
     body = body[:body.index("\n  }\n", body.index("App.runJob("))]
     run_job_at = body.index("App.runJob(")

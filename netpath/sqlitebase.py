@@ -662,13 +662,22 @@ class SqliteStore:
 
     def _delete_batches(self, low: int, cut: int, deadline: float, delete=None,
                         *, chunk: int | None = None, chunk_min: int | None = None,
-                        chunk_max: int | None = None) -> tuple[int, int]:
+                        chunk_max: int | None = None,
+                        pause: float = 0.0) -> tuple[int, int]:
         """Delete ids in [low, cut) in batches until `deadline`.
 
         Returns (rows removed, the id reached). `delete` defaults to
         _trim_delete; the chunk bounds default to this module's, and are
         passed explicitly by callers whose own module globals are the ones
         tests adjust.
+
+        `pause` sleeps that long between batches. A short lock hold is not
+        the same thing as a lock a reader can get: this loop reacquires the
+        moment it lets go and a Python lock is not fair, so a reader polling
+        every few milliseconds can lose the race for the length of the whole
+        sweep. Left at 0 for the retention prunes, which run to a budget;
+        the device purge, which is background work with nothing waiting on
+        it, passes one.
         """
         delete = delete or self._trim_delete
         batch = TRIM_CHUNK if chunk is None else chunk
@@ -683,6 +692,8 @@ class SqliteStore:
                 self._conn.commit()
             held = time.monotonic() - started
             low = upper
+            if pause:
+                time.sleep(pause)
             # Keep one batch's lock hold near TRIM_LOCK_TARGET_S however large
             # the rows turn out to be — a trap with its raw frame stored costs
             # an order of magnitude more than a syslog line, and one fixed

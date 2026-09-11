@@ -51,7 +51,20 @@
   }
 
   const WORKER_COLUMNS = ['Destination', 'Host', 'State', 'Elapsed', 'Last run',
-                          'Took', 'Next run', 'Every', 'Last status'];
+                          'Took', 'Next run', 'Every', 'Last status', 'Web page'];
+
+  function webPageCell(https) {
+    if (!https || !https.url) return '\u2014';
+    if (https.checking) return 'checking\u2026';
+    if (https.state === 'up') {
+      const ms = https.latency_ms == null ? '' : ` \u00b7 ${Math.round(https.latency_ms)} ms`;
+      return `<span class="status-fg">up</span>${ms}`;
+    }
+    if (https.state === 'down') {
+      return `<span class="status-fg bad">down</span> \u00b7 ${escape(https.error || 'unavailable')}`;
+    }
+    return 'not checked yet';
+  }
 
   /* The elapsed figure is the only thing on this page that moves continuously.
      Rather than polling ten times a second for it, the server's value is
@@ -145,6 +158,7 @@
         until(worker.next_run),
         `${worker.interval_s}s`,
         statusSpan(worker.status),
+        webPageCell(worker.https),
       ].map((value) => `<td>${value}</td>`).join('');
       body.appendChild(tr);
     }

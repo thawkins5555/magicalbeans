@@ -330,6 +330,7 @@
     <nav class="subtabs nested">
       <button class="subtab active" data-subtab="availability">AVAILABILITY</button>
       <button class="subtab" data-subtab="topmetrics">TOP-N BY METRIC</button>
+      <button class="subtab" data-subtab="firmware">FIRMWARE INVENTORY</button>
     </nav>
 
     <div id="nd-rep-sub-availability" class="subpage active">
@@ -383,6 +384,23 @@
         <span id="nd-rep-topn-summary" class="hint"></span>
       </div>
       <div class="table-wrap"><table id="nd-rep-topn-table"></table></div>
+    </div>
+
+    <div id="nd-rep-sub-firmware" class="subpage">
+      <div class="bar wrap">
+        <span class="section">FIRMWARE INVENTORY</span>
+        <span class="hint">What software each device is running, from its last identity poll. No period: this is the estate as it stands.</span>
+      </div>
+      <div class="bar wrap">
+        <label>Group <select id="nd-rep-fw-devgroup"></select></label>
+        <button id="nd-rep-fw-run" class="primary">Run report</button>
+        <button id="nd-rep-fw-export-csv">Export CSV</button>
+        <button id="nd-rep-fw-export-server">Download CSV from server</button>
+      </div>
+      <div class="bar wrap">
+        <span id="nd-rep-fw-summary" class="hint"></span>
+      </div>
+      <div class="table-wrap"><table id="nd-rep-fw-table"></table></div>
     </div>
   </div>
 </section>
@@ -497,6 +515,7 @@
       <div class="stat" id="stat-rtt">Avg RTT   —</div>
       <div class="stat" id="stat-traces">Traces    —</div>
       <div class="stat" id="stat-routes">Routes    —</div>
+      <div class="stat" id="stat-web">Web page  —</div>
     </div>
     <p class="legend">
       Every state carries a texture as well as a colour, so the lane reads

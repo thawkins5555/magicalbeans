@@ -717,4 +717,68 @@ finally:
     alerts.close()
 
 
+# ================================================ 11: [RECOVER] on a clear
+print("\n11 — a resolution's subject leads with [RECOVER]; an opening alert "
+      "keeps its own level")
+
+# Delay 0, so both notices a recovery produces go out on the tick that
+# raises them: the resolution of the outage (rendered through the generic
+# device_up template by _notify_clear) and the standalone "Device recovered"
+# rule's own alert, which renders the same template and so differs only by
+# the tag under test.
+nodes, alerts, snmp, syslog, ipam, engine, folder = build(
+    notify_rollup_delay_s=0, webhook_enabled=True,
+    webhook_url="http://127.0.0.1:9/hook")
+sent = FakeMail()
+alertmail.send = sent
+posted = []
+real_webhook = alertmail.send_webhook
+alertmail.send_webhook = lambda url, headers, timeout, payload: posted.append(payload)
+try:
+    engine._tick()
+    did = add_device(nodes, "10.20.11.1", "core-sw-k")
+    nodes.record_device_event(did, "down", "stopped responding")
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    down = open_rows(alerts, "device_down", did)
+    down_id = down[0]["id"]
+    assert [s for s, _b, _t in sent.attempts][0].startswith("[ALERT] "), sent.attempts
+    ok("the outage's own email still leads with its severity tag")
+
+    nodes.record_device_event(did, "up", "responding again")
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    assert engine._webhook.wait_idle(10.0)
+    assert alerts.alert(down_id)["state"] == "resolved"
+    subjects = [s for s, _b, _t in sent.attempts]
+    recovered = [s for s in subjects if "has recovered" in s]
+    assert len(recovered) == 2, subjects
+    assert [s for s in recovered if s.startswith("[RECOVER] ")], recovered
+    ok("the resolution email's subject leads with [RECOVER], not the cleared "
+       "alert's own level")
+    assert [s for s in recovered if s.startswith("[NOTICE] ")], recovered
+    ok("...while the standalone 'Device recovered' rule's own alert keeps its "
+       "level tag — it is an alert in its own right, not a recovery")
+
+    clears = [n for n in alerts.notifications_for(down_id) if n["kind"] == "clear"]
+    assert len(clears) == 1, [dict(n) for n in alerts.notifications_for(down_id)]
+    assert clears[0]["subject"].startswith("[RECOVER] "), dict(clears[0])
+    ok("...and the alert's own notification history records the sent subject")
+
+    clear_posts = [p for p in posted if p["state"] == "clear"]
+    assert len(clear_posts) == 1, posted
+    assert clear_posts[0]["subject"].startswith("[RECOVER] "), clear_posts[0]
+    ok("the webhook payload's subject says [RECOVER] too — one context feeds "
+       "both channels")
+    open_posts = [p for p in posted if p["state"] == "open"
+                  and "has recovered" in p["subject"]]
+    assert len(open_posts) == 1 and open_posts[0]["subject"].startswith("[NOTICE] "), \
+        open_posts
+    ok("...and the device_up rule's own webhook keeps its level tag")
+finally:
+    alertmail.send = real_send
+    alertmail.send_webhook = real_webhook
+close_all(nodes, alerts, snmp, syslog, ipam, engine)
+
+
 print(f"\n{len(PASSED)} checks passed")

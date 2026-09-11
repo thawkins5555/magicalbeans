@@ -721,6 +721,58 @@ def identify_vendor(sys_object_id: str, sys_descr: str = "") -> tuple[str, str]:
     return "", ""
 
 
+# -------------------------------------------------- software version/image
+#
+# What software a device is running, read once per identity poll in a single
+# best-effort GET (nodepoll._poll_software_version) and split by swversion.py.
+# Keyed by enterprise arc exactly like VENDOR_HEALTH above, so a device is
+# only ever asked for objects its own maker defines.
+#
+# (version OID | None, image OID | None) — None where the vendor's answer
+# comes out of sysDescr instead, which is most of them: sysDescr is already
+# read every poll and costs nothing, and it is where Cisco, Juniper, HP,
+# Arista, Comware and airOS actually write the version.
+ENT_PHYSICAL_SOFTWARE_REV = "1.3.6.1.2.1.47.1.1.1.1.10"   # ENTITY-MIB, per entity
+# Index 1 is the chassis on Cisco, Aruba CX, Arista and FortiGate. A device
+# that numbers it otherwise answers nothing here and falls back to sysDescr.
+ENT_PHYSICAL_SOFTWARE_REV_FIRST = ENT_PHYSICAL_SOFTWARE_REV + ".1"
+# OLD-CISCO-SYS-MIB sysConfigName: "the name of the system boot image", e.g.
+# flash:/c2960x-universalk9-mz.152-7.E4/....bin, or bootflash:packages.conf on
+# an IOS-XE install-mode box. A file path, not a version — stored as
+# sw_image_file and used as the image name only when sysDescr has none.
+CISCO_SYS_CONFIG_NAME = "1.3.6.1.4.1.9.2.1.73.0"
+# HOST-RESOURCES-MIB hrSWInstalledName's first row — on Junos the installed
+# package, "JUNOS Software Release [20.4R3.8]", which carries both halves.
+HR_SW_INSTALLED_NAME_FIRST = "1.3.6.1.2.1.25.6.3.1.2.1"
+
+SW_VERSION_OIDS = {
+    12356: ("1.3.6.1.4.1.12356.101.4.1.1.0", None),
+    # fgSysVersion, "v7.2.8,build1639,240416 (GA.M)"
+    2636: (None, HR_SW_INSTALLED_NAME_FIRST),
+    # hrSWInstalledName.1, "JUNOS Software Release [20.4R3.8]"
+    11: ("1.3.6.1.4.1.11.2.14.11.5.1.1.3.0", None),
+    # hpSwitchOsVersion (NETSWITCH-MIB hpOpSystem.3), "R.11.122"
+    14988: ("1.3.6.1.4.1.14988.1.1.4.4.0", "1.3.6.1.4.1.14988.1.1.7.4.0"),
+    # mtxrLicVersion "6.49.7"; mtxrFirmwareVersion "6.48.6" (RouterBOOT)
+    25461: ("1.3.6.1.4.1.25461.2.1.2.1.1.0", None),
+    # panSysSwVersion, "10.1.9"
+    1916: ("1.3.6.1.4.1.1916.1.1.1.13.0", None),
+    # extremePrimarySoftwareRev (EXTREME-SYSTEM-MIB), "31.7.1.4"
+    674: ("1.3.6.1.4.1.674.10895.3000.1.2.100.4.0", None),
+    # productIdentificationVersion (Dell-Vendor-MIB), "6.6.0.19"
+    1991: ("1.3.6.1.4.1.1991.1.1.2.1.11.0", None),
+    # snAgImgVer (FOUNDRY-SN-AGENT-MIB snAgentGbl.11), "08.0.30tT213".
+    # snAgImgLoad, its neighbour, is a load-STATUS enum, not an image name.
+    41112: ("1.3.6.1.4.1.41112.1.6.3.6.0", None),
+    # unifiApSystemVersion (UBNT-UniFi-MIB), "6.5.28.15047"
+    9: (None, CISCO_SYS_CONFIG_NAME),
+}
+# airOS radios answer sysObjectID under arc 10002 while implementing
+# Ubiquiti's own 41112 objects — the same second entry RF_METRICS carries,
+# and for the same reason.
+SW_VERSION_OIDS[10002] = SW_VERSION_OIDS[41112]
+
+
 # ---------------------------------------------------------- custom identity
 
 def normalize_oid(text: str) -> str:
@@ -809,12 +861,18 @@ def suggest_group(sys_descr: str, sys_object_id: str, groups: list) -> int | Non
 # FortiGate Wireless Controller (fgWc) OIDs, hand-listed from the vendor's
 # FORTINET-CORE-MIB.mib / FORTINET-FORTIGATE-MIB.mib rather than parsed at
 # runtime -- the same "not a MIB compiler" convention the rest of this file
-# uses. Three tables, all indexed by (fgVdEntIndex, WtpId[, RadioId]):
+# uses. Four tables, three of them indexed by (fgVdEntIndex, WtpId[, RadioId]):
 #
 #   fortinet(1.3.6.1.4.1.12356).fnFortiGateMib(101).fgWc(14).fgWcWtpTables(4)
+#     .fgWcWtpProfileRadioTable(2)   -- per-profile radio config (channel width)
 #     .fgWcWtpConfigTable(3)         -- the AP's configured name
 #     .fgWcWtpSessionTable(4)        -- live status, MAC, model, client count
 #     .fgWcWtpSessionRadioTable(5)   -- per-radio channel/tx power/clients
+#
+# fgWcWtpProfileRadioTable is the odd one out: it is indexed by
+# (fgVdEntIndex, fgWcWtpProfileRadioProfileName, fgWcWtpProfileRadioRadioId)
+# rather than by WtpId, so a value read from it is joined onto an AP through
+# fgWcWtpSessionWtpProfileName below.
 # ---------------------------------------------------------------------------
 
 FORTINET = "1.3.6.1.4.1.12356"
@@ -824,6 +882,7 @@ WTP_TABLES = f"{FG_WC}.4"
 
 # Column OIDs, relative to each table's own entry base
 # (<WTP_TABLES>.<table>.1.<column>) -- the base itself, not a leaf value.
+WTP_PROFILE_RADIO_ENTRY = f"{WTP_TABLES}.2.1"
 WTP_CONFIG_ENTRY = f"{WTP_TABLES}.3.1"
 WTP_SESSION_ENTRY = f"{WTP_TABLES}.4.1"
 WTP_SESSION_RADIO_ENTRY = f"{WTP_TABLES}.5.1"
@@ -839,11 +898,20 @@ WTP_CONFIG_NAME = f"{WTP_CONFIG_ENTRY}.3"          # DisplayString
 WTP_SESSION_IP = f"{WTP_SESSION_ENTRY}.3"           # InetAddress
 WTP_SESSION_MAC = f"{WTP_SESSION_ENTRY}.6"          # PhysAddress
 WTP_SESSION_CONNECTION_STATE = f"{WTP_SESSION_ENTRY}.7"   # INTEGER, see below
+# "the time (in hundredths of a second) since the WTP boots" -- the AP's own
+# uptime, which is what makes an AP reboot visible without ever talking to the
+# AP. Distinct from column 10, "since the WTP connects to the AC": a session
+# that restarted while the AP stayed up is a controller/CAPWAP event, not a
+# reboot, and the two columns are how the difference is told apart.
+WTP_SESSION_UPTIME = f"{WTP_SESSION_ENTRY}.8"           # TimeTicks
+WTP_SESSION_SESSION_UPTIME = f"{WTP_SESSION_ENTRY}.10"  # TimeTicks
+WTP_SESSION_PROFILE = f"{WTP_SESSION_ENTRY}.11"     # DisplayString
 WTP_SESSION_MODEL = f"{WTP_SESSION_ENTRY}.12"       # DisplayString
 WTP_SESSION_STATION_COUNT = f"{WTP_SESSION_ENTRY}.17"      # Gauge32
 
 # fgWcWtpSessionRadioEntry (per-radio, indexed by an additional RadioId)
 WTP_RADIO_MODE = f"{WTP_SESSION_RADIO_ENTRY}.3"             # FgWcWtpRadioMode
+WTP_RADIO_BSSID = f"{WTP_SESSION_RADIO_ENTRY}.4"            # PhysAddress (6|8)
 WTP_RADIO_CHANNEL = f"{WTP_SESSION_RADIO_ENTRY}.7"          # FgWcWtpRadioChannelNumber
 # fgWcWtpSessionRadioOperatingPower. The MIB's DESCRIPTION reads, verbatim:
 # "Represents the current operating power of this radio, in dBm." Observed
@@ -856,6 +924,17 @@ WTP_RADIO_CHANNEL = f"{WTP_SESSION_RADIO_ENTRY}.7"          # FgWcWtpRadioChanne
 # and the raw number is always shown so the guess can be checked.
 WTP_RADIO_OPERATING_POWER = f"{WTP_SESSION_RADIO_ENTRY}.8"  # Integer32
 WTP_RADIO_STATION_COUNT = f"{WTP_SESSION_RADIO_ENTRY}.9"    # Gauge32
+
+# fgWcWtpProfileRadioEntry. fgWcWtpSessionRadioEntry has nine columns and none
+# of them is a width, so the width a radio is RUNNING is not in this MIB at
+# all; this is the width its profile CONFIGURES, which is the same number
+# except while a change is being pushed.
+WTP_PROFILE_RADIO_CHANNEL_WIDTH = f"{WTP_PROFILE_RADIO_ENTRY}.20"  # FgWcWtpChannelWidthType
+
+# FgWcWtpChannelWidthType, quoted from the MIB's TEXTUAL-CONVENTION.
+CHANNEL_WIDTH = {
+    0: "other", 1: "20 MHz", 2: "40 MHz", 3: "80 MHz", 4: "160 MHz",
+}
 
 # The highest conducted output any Wi-Fi radio plausibly reports in dBm.
 # 30 dBm is 1 W, already above every regulatory domain's indoor limit, so a

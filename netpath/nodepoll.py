@@ -25,7 +25,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import NamedTuple
 
-from . import mibcatalog, nodeoids, nodesdb, vendorid
+from . import mibcatalog, nodeoids, nodesdb, swversion, vendorid
 from .alertrules import DARK_OPTIC_DBM, is_dark_optic
 from .eventlog import ERROR, NODES, NullLog
 from .ipam_scan import ping_many
@@ -3740,6 +3740,23 @@ class NodePoller(Worker):
                 if vb["type"] not in ("noSuchObject", "noSuchInstance",
                                       "endOfMibView")}
 
+    def _poll_software_version(self, device, config: dict, identity: dict) -> dict:
+        """`sw_version`/`sw_image`/`sw_image_file` for the identity dict.
+
+        ONE extra GET per identity poll, of the objects this device's own
+        maker defines plus the standard entPhysicalSoftwareRev — through
+        _identity_extras, so a v1 agent's noSuchName spoils only this
+        request and never the scalars, and a device that answers none of
+        them costs nothing but the datagram. Everything else comes out of
+        the sysDescr already in hand. Nothing matched is three NULLs, not a
+        guess."""
+        arc = identity.get("vendor_arc")
+        scalars = self._identity_extras(device, config,
+                                        list(swversion.oids_for(arc)))
+        info = swversion.extract(arc, identity.get("sys_descr") or "", scalars)
+        return {"sw_version": info.version or None, "sw_image": info.image or None,
+                "sw_image_file": info.image_file or None}
+
     def _poll_snmp_scalars(self, device, config: dict):
         oids = list(nodeoids.SYSTEM_SCALARS.values())
         # An operator-chosen OID for vendor and/or location. Both the bare and
@@ -3798,6 +3815,8 @@ class NodePoller(Worker):
         custom_location = nodeoids.first_text(values, custom["location"])
         if custom_location:
             identity["sys_location"] = custom_location
+
+        identity.update(self._poll_software_version(device, config, identity))
 
         uptime = values.get(nodeoids.SYSTEM_SCALARS["sys_uptime"])
         uptime_ticks = int(uptime) if isinstance(uptime, (int, float)) else None

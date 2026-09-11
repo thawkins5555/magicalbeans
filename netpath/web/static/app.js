@@ -351,6 +351,14 @@ const App = (() => {
       if (!allowed) denied.push(el);
     }
     explainDeniedGroups(denied);
+    /* A module can now be on screen before its permissions have landed (the
+       Dashboard paints on the first frame, ahead of /api/config), so a fetch
+       a module gated on canRead() and skipped has to be reachable again
+       rather than waiting out its own slow clock. */
+    for (const page of Object.values(pages)) {
+      if (!page.permissionsChanged) continue;
+      try { page.permissionsChanged(); } catch (error) { /* one module must not break the gate pass */ }
+    }
     // The open tab can stop being showable underneath the operator — access
     // revoked, or its module hidden after a failed init — so move off it
     // rather than leaving an empty page behind a still-highlighted tab.
@@ -427,7 +435,17 @@ const App = (() => {
      tab being hidden is what stops a second attempt — a reload is the way
      back, as it is for a permission-denied module. */
   function ensureModuleReady(name) {
-    if (!isLazyModule(name)) return Promise.resolve(pages[name]);
+    if (!isLazyModule(name)) {
+      /* An eager module is in the page's own <script> tags, so a missing one
+         is a build or a load failure, not something to wait for. Resolving
+         with `undefined` made every activation of it a silent no-op — the
+         Dashboard sitting on "Loading…" with nothing in the console. */
+      if (!pages[name]) {
+        return Promise.reject(
+          new Error(`${name}.js never registered App.pages.${name}`));
+      }
+      return Promise.resolve(pages[name]);
+    }
     if (pages[name] && pages[name].__ready) return Promise.resolve(pages[name]);
     const inFlight = moduleLoads.get(name);
     if (inFlight) return inFlight;
@@ -476,13 +494,21 @@ const App = (() => {
      module itself still finishes loading and initialising regardless (see
      ensureModuleReady): only the activation this specific call wanted is
      skipped. */
+  const activationReported = new Set();
   function activateTab(name, options = {}) {
     ensureModuleReady(name).then((page) => {
       if (state.tab !== name) return;
       if (options.route) { deliverRoute(options.route); return; }
       if (page && page.activate) page.activate();
       refreshNow(name);
-    }).catch(() => { /* ensureModuleReady already reported and degraded this */ });
+    }).catch((error) => {
+      // A lazy module's failure is already reported and degraded inside
+      // ensureModuleReady; an eager one that never registered is only ever
+      // said here, and once per tab rather than on every poll tick.
+      if (activationReported.has(name)) return;
+      activationReported.add(name);
+      console.error(`${name}: tab could not be activated`, error);
+    });
   }
 
   /* ---------------------------------------------------- host capabilities
@@ -4919,6 +4945,24 @@ const App = (() => {
 
   const TAB_KEY = 'sappiwhere.tab';
 
+  /* Which tab this load is going to land on, answered before the boot
+     fetches so the eager module can be painted on the first frame. Same
+     order of precedence start() applies below: the address bar first (a
+     link is more specific than a memory), then the remembered tab, then
+     Dashboard. */
+  function plannedInitialTab() {
+    const route = parseRoute();
+    if (route.tab) {
+      const button = document.querySelector(`.tab[data-tab="${route.tab}"]`);
+      if (button && !button.hidden) return route.tab;
+    }
+    try {
+      const stored = localStorage.getItem(TAB_KEY);
+      if (stored) return stored;
+    } catch (error) { /* private browsing, or storage full: default to dashboard */ }
+    return 'dashboard';
+  }
+
   function selectTab(name, options = {}) {
     state.tab = name;
     try { localStorage.setItem(TAB_KEY, name); } catch (error) { /* private browsing, or storage full: not worth failing */ }
@@ -5136,14 +5180,36 @@ const App = (() => {
   async function master() {
     const now = Date.now();
     try {
-      if (now - (state.lastState || 0) >= STATE_MS) {
+      /* The same single-in-flight rule page.refreshing gives a page's own
+         refresh, for the state poll: an /api/state slower than the two
+         seconds between ticks would otherwise have the next tick abort it
+         as superseded, and the one after that abort THAT, so a server that
+         answers in three seconds never completed a poll at all — no config,
+         no permissions, no tabs. Now the boot's own first load runs
+         alongside this heartbeat, that is reachable on an ordinary slow
+         start rather than only under a throttle. */
+      if (!state.loadingState && now - (state.lastState || 0) >= STATE_MS) {
         state.lastState = now;
-        await loadState();
+        state.loadingState = true;
+        try {
+          await loadState();
+        } finally {
+          state.loadingState = false;
+        }
         connected(true);
       }
     } catch (error) {
       if (error && error.superseded) return;
       connected(false, String(error.message || error));
+      /* A page that has never fetched anything is still on "Loading…", and
+         /api/state failing says nothing about whether its own endpoint
+         answers — a tab switch would have fetched it. One attempt, guarded
+         on lastFetch, so a genuine outage does not turn this into a second
+         poll loop. */
+      const first = pages[state.tab];
+      if (first && first.refresh && !first.lastFetch && !first.refreshing) {
+        refreshNow(state.tab);
+      }
       return;
     }
 
@@ -5398,8 +5464,62 @@ const App = (() => {
       showHelp(link.dataset.help, link);
     });
 
+    /* Paint first, then wait. The three boot fetches below are at their
+       slowest in the seconds after service.start() sets the pollers going,
+       and everything used to sit behind them: the Dashboard did not even
+       show "Loading…" until they had all answered, and its first
+       /api/dashboard went out after them rather than beside them. Clicking
+       to another tab and back was the workaround, because that path runs
+       activate()+refreshNow without waiting for any of this.
+
+       Only the eager module can be painted here — every other tab is a lazy
+       module whose script has not been fetched yet, so those still start
+       below, after loadPlatform(), with the config their init() reads
+       already in hand. */
+    let paintedEarly = false;
+    const landing = plannedInitialTab();
+    // Read before the selection below writes one of its own, so a link into
+    // this same tab still reaches the module as the route it was.
+    const bootRoute = parseRoute();
+    if (!isLazyModule(landing) && pages[landing]) {
+      try {
+        const page = pages[landing];
+        if (page.init && !page.__ready) {
+          page.init();
+          page.__ready = true;
+        }
+        selectTab(landing, bootRoute.tab === landing
+          ? { fromRoute: true, route: bootRoute } : {});
+        paintedEarly = true;
+      } catch (error) {
+        brokenPages.add(landing);
+        const tab = stripTabs().find((t) => t.dataset.tab === landing);
+        if (tab) tab.hidden = true;
+        console.error(`${landing}: module failed to start, tab hidden`, error);
+      }
+    }
+    /* Before the awaits, not after them: a load that took thirty seconds to
+       get through /api/state had no heartbeat at all until it had, and a
+       page that loads hidden (the console's Open button putting the browser
+       behind itself) never reached the last line of start() to start one.
+       master() already tolerates a state that is still loading and a
+       pages[state.tab] that is not there yet. The visibility handler comes
+       up with it: a page that loads hidden and is brought forward WHILE the
+       boot is still fetching would otherwise miss the one event that starts
+       its timer, and poll nothing for the rest of the session. */
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    restartTimer();
     try {
-      await loadState();
+      // Claimed before the first tick, through the same two fields master()
+      // uses, so the heartbeat now running alongside this does not abort the
+      // boot's own /api/state as superseded and start again from nothing.
+      state.lastState = Date.now();
+      state.loadingState = true;
+      try {
+        await loadState();
+      } finally {
+        state.loadingState = false;
+      }
       connected(true);
     } catch (error) {
       connected(false, String(error.message || error));
@@ -5422,10 +5542,16 @@ const App = (() => {
       const kioskBar = document.getElementById('kiosk-bar');
       if (kioskBar) kioskBar.hidden = true;
     }
-    initSplitters();
-    applyDensity();
+    // Same reasoning as initKiosk above: a saved splitter position that no
+    // longer matches the layout, or a density pass over a pane a build
+    // moved, is not worth the module inits and the boot route below.
+    try {
+      initSplitters();
+    } catch (error) { console.error('splitters: left at their default sizes', error); }
+    try {
+      applyDensity();
+    } catch (error) { console.error('density: left at its default', error); }
     window.addEventListener('resize', applyDensity);
-    document.addEventListener('visibilitychange', onVisibilityChange);
 
     // Every module initialises inside its own try/catch: this loop was the
     // single point of failure for the whole application, and /api/state
@@ -5438,7 +5564,7 @@ const App = (() => {
     // what stops either place running init() twice.
     const tabButtons = stripTabs();
     for (const [name, page] of Object.entries(pages)) {
-      if (!page.init) continue;
+      if (!page.init || page.__ready) continue;
       try {
         page.init();
         page.__ready = true;
@@ -5465,25 +5591,26 @@ const App = (() => {
       if (writingRoute) return;
       applyRoute();
     });
-    if (!applyRoute(true)) {
+    if (paintedEarly && state.tab === landing) {
+      // Selected on the first frame, before the boot fetches: its tab, its
+      // hash, its route and its first fetch are all already done, and
+      // re-applying them here would only queue a second fetch of what the
+      // early selection is fetching. The hashchange listener above covers
+      // every navigation from here on.
+    } else if (!applyRoute(true)) {
       // A refresh should land back on whichever module was open, rather than
       // resetting to Dashboard — but only if that tab is one this browser
       // can actually show: a build could drop it, the account may not be
       // allowed to read it, or its module may have just failed above.
-      let initialTab = 'dashboard';
-      try {
-        const stored = localStorage.getItem(TAB_KEY);
-        if (stored) initialTab = stored;
-      } catch (error) { /* private browsing, or storage full: default to dashboard */ }
+      let initialTab = plannedInitialTab();
       if (!usableTab(initialTab)) {
         // Dashboard is the last resort rather than an error page: it is
         // never permission-gated and has no module state of its own to break.
         initialTab = visibleTabs()
           .map((tab) => tab.dataset.tab).find(usableTab) || 'dashboard';
       }
-      selectTab(initialTab);
+      if (!(paintedEarly && initialTab === state.tab)) selectTab(initialTab);
     }
-    restartTimer();
   }
 
   // Started from here rather than an inline script in the page: the server

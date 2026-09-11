@@ -9,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 from .db import Database
 from .eventlog import DNS, ERROR, NullLog, SYSTEM, TRACE
+from .httpcheck import DEFAULT_TIMEOUT_S as HTTPS_TIMEOUT_S
+from .httpcheck import check as check_https
 from .namelookup import asn_lookup, reverse
 from .tracer import TraceResult, expected_budget, ping, run_trace
 from .worker import Worker
@@ -807,3 +809,205 @@ class HopProber(Worker):
         if self.overruns:
             text += f" \u00b7 {self.overruns} probe(s) skipped, still running"
         return text
+
+
+def https_url_for(target) -> str:
+    """The destination's web page URL, or "" for one with none.
+
+    A row read from a database that predates the column has no key at all,
+    which is a different thing from an empty one \u2014 the same `in row.keys()`
+    guard every other late-added target column here is read through.
+    """
+    keys = target.keys()
+    if "https_url" not in keys:
+        return ""
+    return str(target["https_url"] or "").strip()
+
+
+class HttpsChecker(Worker):
+    """Checks each destination's web page on that destination's own interval.
+
+    The traceroute says the path works; this says the thing at the end of it
+    is serving. Scheduled exactly the way Monitor schedules traces \u2014 a due
+    time per destination derived from the last check's timestamp, a small
+    pool, and an in-flight set so a slow page cannot queue behind itself \u2014
+    but kept as its own worker rather than folded into Monitor because a
+    destination can have one without the other and a page fetch has nothing
+    to do with a traceroute's own budget.
+    """
+
+    THREAD_NAME = "netpath-https"
+    STOPPED_TEXT = "Web page checks are off"
+
+    def __init__(self, db: Database, workers: int = 4, log=None):
+        self.db = db
+        self.workers = workers
+        self.log = log or NullLog()
+        self._executor = ThreadPoolExecutor(max_workers=workers)
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._inflight: set[int] = set()
+        self._started: dict[int, float] = {}
+        self._next_run: dict[int, float] = {}
+        # Last recorded verdict per destination, so an event-log line is
+        # written on a transition rather than on every check.
+        self._state: dict[int, bool] = {}
+
+    def start(self) -> None:
+        if self.running:
+            return
+        self._stop.clear()
+        self._spawn()
+        self.log.add(SYSTEM, f"Web page checks started with {self.workers} "
+                             f"worker threads")
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def begin_stop(self) -> None:
+        self.stop()
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def finish_stop(self, deadline: float) -> None:
+        self._join(timeout=max(0.0, deadline - time.monotonic()))
+        self.drain(max(0.0, deadline - time.monotonic()))
+
+    def shutdown(self, drain_s: float = 3.0) -> None:
+        self.begin_stop()
+        self.drain(drain_s)
+
+    def drain(self, timeout_s: float = 3.0) -> bool:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if not self.inflight():
+                return True
+            time.sleep(0.05)
+        return not self.inflight()
+
+    def inflight(self) -> set[int]:
+        with self._lock:
+            return set(self._inflight)
+
+    def worker_state(self) -> dict[int, dict[str, float]]:
+        with self._lock:
+            return {target_id: {"started": self._started.get(target_id)}
+                    for target_id in self._inflight}
+
+    def next_runs(self) -> dict[int, float]:
+        return dict(self._next_run)
+
+    def check_now(self, target_id: int) -> None:
+        self._submit(target_id)
+
+    # ------------------------------------------------------------- internals
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                now = time.time()
+                targets = [t for t in self.db.targets()
+                           if t["enabled"] and https_url_for(t)]
+                unknown = [t["id"] for t in targets
+                           if self._next_run.get(t["id"]) is None]
+                last = self.db.last_https_checks(unknown) if unknown else {}
+                for target in targets:
+                    target_id = target["id"]
+                    due = self._next_run.get(target_id)
+                    if due is None:
+                        row = last.get(target_id)
+                        due = (row["ts"] + target["interval_s"]) if row else now
+                        self._next_run[target_id] = due
+                    if now >= due:
+                        self._next_run[target_id] = now + target["interval_s"]
+                        self._submit(target_id)
+                live = {t["id"] for t in targets}
+                for gone in [tid for tid in self._next_run if tid not in live]:
+                    self._next_run.pop(gone, None)
+                    self._state.pop(gone, None)
+            except Exception as exc:                          # noqa: BLE001
+                import traceback
+                self.log.add(ERROR, f"Web page check tick failed: {exc}",
+                             detail=traceback.format_exc())
+            self._stop.wait(1.0)
+
+    def _submit(self, target_id: int) -> None:
+        if self._stop.is_set():
+            return
+        with self._lock:
+            if target_id in self._inflight:
+                return
+            self._inflight.add(target_id)
+            self._started[target_id] = time.time()
+        try:
+            self._executor.submit(self._check_one, target_id)
+        except RuntimeError:
+            with self._lock:
+                self._inflight.discard(target_id)
+                self._started.pop(target_id, None)
+
+    def _check_one(self, target_id: int) -> None:
+        label = str(target_id)
+        try:
+            target = self.db.target(target_id)
+            if target is None:
+                return
+            label = target["label"] or target["host"]
+            url = https_url_for(target)
+            if not url:
+                return
+            keys = target.keys()
+            insecure = bool(target["https_insecure"]) \
+                if "https_insecure" in keys else False
+            # A page fetch is not an ICMP probe, so it does not inherit the
+            # destination's per-probe timeout; it is bounded by the check
+            # interval instead, so a slow page can never overrun its own slot.
+            timeout_s = min(HTTPS_TIMEOUT_S,
+                            max(float(target["interval_s"] or 0), 2.0))
+            result = check_https(url, timeout_s=timeout_s, insecure=insecure)
+            if self.db.target(target_id) is None:
+                return
+            self.db.record_https_check(target_id, result)
+            self._log_result(target_id, label, url, result)
+        except Exception as exc:                              # noqa: BLE001
+            if isinstance(exc, sqlite3.ProgrammingError) and self._stop.is_set():
+                return
+            import traceback
+            self.log.add(ERROR, f"Web page check raised "
+                                f"{type(exc).__name__}: {exc}",
+                         target=label, detail=traceback.format_exc())
+        finally:
+            with self._lock:
+                self._inflight.discard(target_id)
+                self._started.pop(target_id, None)
+
+    def _log_result(self, target_id: int, label: str, url: str, result) -> None:
+        previous = self._state.get(target_id)
+        self._state[target_id] = bool(result.ok)
+        if previous is not None and previous == bool(result.ok):
+            return
+        latency = f"{result.latency_ms:.0f} ms" if result.latency_ms else "no timing"
+        detail = (f"url       {url}\n"
+                  f"status    {result.status_code or '-'}\n"
+                  f"latency   {latency}\n"
+                  f"final     {result.final_url or url}")
+        if result.ok:
+            self.log.add(TRACE, f"Web page available: {url}", target=label,
+                         detail=detail)
+        else:
+            self.log.add(ERROR, f"Web page unavailable: {url} \u00b7 "
+                                f"{result.error}", target=label, detail=detail)
+
+    def status_text(self) -> str:
+        if self.error:
+            return self.error
+        try:
+            pages = sum(1 for t in self.db.targets()
+                        if t["enabled"] and https_url_for(t))
+        except Exception:                                     # noqa: BLE001
+            pages = 0
+        if not self.running:
+            return self.STOPPED_TEXT
+        if not pages:
+            return "No destination has a web page to check"
+        return (f"Checking {pages} web page(s) "
+                f"({len(self.inflight())} in flight)")

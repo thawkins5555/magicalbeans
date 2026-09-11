@@ -324,6 +324,28 @@ class MapperDatabase(SqliteStore):
             self._conn.commit()
         return moved
 
+    def forget_device(self, device_id: int) -> int:
+        """Every placement of a device Nodes has deleted, removed from the
+        maps it was on.
+
+        reassign_device's shape, without a destination. Without this the
+        node rows keep a device_id nothing owns, and devices.id is INTEGER
+        PRIMARY KEY without AUTOINCREMENT — so the next device added would
+        appear, already placed, on whatever maps the deleted one was on.
+        """
+        now = time.time()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, map_id FROM map_nodes WHERE device_id = ?",
+                (int(device_id),)).fetchall()
+            for row in rows:
+                self._conn.execute(
+                    "DELETE FROM map_nodes WHERE id = ?", (row["id"],))
+            for map_id in {row["map_id"] for row in rows}:
+                self._touch_map(map_id, now)
+            self._conn.commit()
+        return len(rows)
+
     def remove_node(self, map_id: int, node_id: int) -> bool:
         with self._lock:
             cur = self._conn.execute(

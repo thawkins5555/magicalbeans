@@ -13,6 +13,7 @@ import time
 import _paths  # noqa: F401
 
 import netpath.monitor as monitor_mod
+from netpath import httpcheck
 from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER
 from netpath.tracer import TraceResult
 from netpath.web import Service, WebServer
@@ -139,6 +140,75 @@ try:
     check("...and the refused PUTs above did not silently apply anyway",
           row["interval_s"] != 0 and row["probes"] != 999 and row["max_hops"] == 100,
           row)
+
+    # ------------------------------------------------------ https_url field
+    print("POST/PUT /api/netpath/targets: the web page URL")
+    status, payload = call("POST", "/api/netpath/targets",
+                           {"host": "10.90.11.1",
+                            "https_url": "https://10.90.11.1/status",
+                            "https_insecure": True}, token=admin)
+    https_id = payload.get("id")
+    check("a destination can be created with an https:// URL", status == 200,
+          (status, payload))
+    status, payload = call("GET", "/api/netpath/targets", token=admin)
+    row = next(t for t in payload["targets"] if t["id"] == https_id)
+    check("...and it comes back on the target, with the opt-out",
+          row["https_url"] == "https://10.90.11.1/status"
+          and row["https_insecure"] is True, row)
+    check("...with no check recorded yet, so https_state is 'none'",
+          row["https_state"] == "none" and row["https_last_ts"] is None, row)
+
+    for index, bad_url in enumerate(["http://10.90.11.9/", "ftp://10.90.11.9/",
+                                     "10.90.11.9", "https://",
+                                     "https://" + "x" * 3000]):
+        status, payload = call("POST", "/api/netpath/targets",
+                               {"host": f"10.90.12.{index}", "https_url": bad_url},
+                               token=admin)
+        check(f"https_url={bad_url[:24]!r} -> 400 naming the field",
+              status == 400 and "https_url" in str(payload.get("error", "")),
+              (status, payload))
+
+    status, payload = call("PUT", f"/api/netpath/targets/{https_id}",
+                           {"https_url": "http://10.90.11.1/"}, token=admin)
+    check("an http:// URL on PUT -> 400", status == 400, (status, payload))
+    status, payload = call("PUT", f"/api/netpath/targets/{https_id}",
+                           {"https_url": "https://10.90.11.1/health",
+                            "https_insecure": False}, token=admin)
+    check("an https:// URL on PUT -> 200", status == 200, (status, payload))
+    status, payload = call("GET", "/api/netpath/targets", token=admin)
+    row = next(t for t in payload["targets"] if t["id"] == https_id)
+    check("...and the round trip stored both fields",
+          row["https_url"] == "https://10.90.11.1/health"
+          and row["https_insecure"] is False, row)
+    status, payload = call("PUT", f"/api/netpath/targets/{https_id}",
+                           {"https_url": ""}, token=admin)
+    status, payload = call("GET", "/api/netpath/targets", token=admin)
+    row = next(t for t in payload["targets"] if t["id"] == https_id)
+    check("an empty URL turns the check off rather than being refused",
+          row["https_url"] == "", row)
+
+    print("GET /api/netpath/https: the bucketed series for the web lane")
+    status, payload = call("GET", f"/api/netpath/https?target={https_id}", token=admin)
+    check("200 with no URL configured, and nothing to draw",
+          status == 200 and payload["buckets"] == []
+          and payload["summary"]["state"] == "none", (status, payload))
+    call("PUT", f"/api/netpath/targets/{https_id}",
+         {"https_url": "https://10.90.11.1/health"}, token=admin)
+    service.db.record_https_check(
+        https_id, httpcheck.HttpsResult(False, 503, 42.0, "HTTP 503",
+                                        "https://10.90.11.1/health"))
+    status, payload = call("GET", f"/api/netpath/https?target={https_id}", token=admin)
+    failing = [b for b in payload["buckets"] if b["total"]]
+    check("the recorded check lands in exactly one bucket", len(failing) == 1,
+          [b for b in payload["buckets"] if b["total"]])
+    check("...carrying ok_pct, the latency and the reason",
+          failing and failing[0]["ok_pct"] == 0.0
+          and failing[0]["avg_latency_ms"] == 42.0
+          and failing[0]["last_error"] == "HTTP 503", failing[:1])
+    check("...and the summary reports the destination down",
+          payload["summary"]["state"] == "down"
+          and payload["summary"]["last_status_code"] == 503
+          and payload["summary"]["checks"] == 1, payload["summary"])
 
     # ------------------------------------------------- settings (netpath scope)
     print("POST /api/settings (scope=netpath): the same five fields")

@@ -398,6 +398,17 @@ NETPATH_TARGETS = [
     ("127.0.0.2", "Core switch (loopback fleet)"),
 ]
 
+# Two of the destinations above also get a web page to check, served by the
+# fleet's own HTTPS listener (demo/fleet.py --page-port, default 8444). Its
+# certificate is self-signed, so the one that accepts an untrusted
+# certificate reports its page available and the one that does not reports
+# exactly why it will not trust it — both states on screen at once.
+NETPATH_WEB_PORT = 8444
+NETPATH_WEB_PAGES = {
+    "10.0.0.1": (f"https://127.0.0.1:{NETPATH_WEB_PORT}/", 1),
+    "10.0.0.6": (f"https://127.0.0.1:{NETPATH_WEB_PORT}/broken", 0),
+}
+
 SITES = ("Site-A", "Site-B", "Site-C")
 
 
@@ -590,13 +601,16 @@ def step_netpath(client: Client, log: SeedLog) -> dict:
     for host, label in NETPATH_TARGETS:
         if host in have:
             continue
-        client.post("/api/netpath/targets", {
-            "host": host, "label": label, "interval_s": 60, "max_hops": 12,
-            "probes": 3, "timeout_s": 1})
+        body = {"host": host, "label": label, "interval_s": 60,
+                "max_hops": 12, "probes": 3, "timeout_s": 1}
+        page = NETPATH_WEB_PAGES.get(host)
+        if page:
+            body["https_url"], body["https_insecure"] = page[0], bool(page[1])
+        client.post("/api/netpath/targets", body)
         created += 1
-    print("[4] netpath targets: %d created, %d already present"
-          % (created, len(NETPATH_TARGETS) - created))
-    return {"created": created}
+    print("[4] netpath targets: %d created, %d already present, %d with a web page"
+          % (created, len(NETPATH_TARGETS) - created, len(NETPATH_WEB_PAGES)))
+    return {"created": created, "web_pages": len(NETPATH_WEB_PAGES)}
 
 
 def step_ipam(client: Client, log: SeedLog) -> dict:

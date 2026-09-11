@@ -150,6 +150,9 @@ class AlertEngine(Worker):
         # while this engine ticks every five seconds, so a streak that
         # advanced per tick would satisfy "three traces" in fifteen seconds.
         self._netpath_streaks: dict[tuple, tuple[float | None, int, float | None]] = {}
+        # The same, keyed on a web-page check's own ts — see
+        # _evaluate_netpath_https.
+        self._netpath_https_streaks: dict[tuple, tuple[float | None, int, float | None]] = {}
         # dedup_key -> latest resolved_ts of a hand resolve, refreshed once
         # per tick from AlertsDatabase.operator_resolved_since (one indexed
         # query) rather than queried per breaching rule/device. See
@@ -304,6 +307,7 @@ class AlertEngine(Worker):
         occurrences += self._evaluate_thresholds(settings)
         occurrences += self._evaluate_dhcp_thresholds(settings)
         occurrences += self._evaluate_netpath_thresholds(settings)
+        occurrences += self._evaluate_netpath_https(settings)
         rules = [r for r in self.db.rules() if r["enabled"]]
         self._rules_by_key = {r["key"]: r for r in rules if r["key"]}
         occurrences += self._drain_pending()
@@ -1112,8 +1116,9 @@ class AlertEngine(Worker):
                 self._notify_clear(resolved, rule, settings)
 
     def _drain_ap_events(self, settings) -> list[Occurrence]:
-        """Wireless AP lifecycle events — today just ap_removed, raised by
-        wirelessdb.prune_stale when a controller stops reporting an AP.
+        """Wireless AP lifecycle events — ap_removed/ap_returned,
+        ap_offline/ap_online, ap_rebooted and radio_channel_changed, raised
+        by wirelessdb as the poller writes.
         Same cursor shape as every other drain above. An AP a human marked
         out of service never produces one of these in the first place, so
         no filtering is needed here."""
@@ -1920,6 +1925,89 @@ class AlertEngine(Worker):
         self._sweep_netpath_alerts(rules, live)
         return occurrences
 
+    def _evaluate_netpath_https(self, settings) -> list[Occurrence]:
+        """NetPath destinations' web pages against the https_down rule.
+
+        Event-shaped rather than threshold-shaped: a check answers
+        available or unavailable-with-a-reason, and there is no number to
+        compare against a threshold. What it does borrow from the threshold
+        evaluators is their streak discipline — the consecutive run is
+        counted against the CHECK's own timestamp, so `for_polls` means
+        consecutive checks of that destination rather than five-second
+        engine ticks — and their operator-resolve gate, so a breach somebody
+        resolved by hand does not re-open on the next tick.
+
+        The first successful check clears the alert outright. There is no
+        hysteresis to tune: "the page answered" is not a value hovering
+        around a boundary, and the three-check streak is the anti-flap.
+        """
+        if self.netpath_db is None:
+            return []
+        rules = [r for r in self.db.rules()
+                 if r["enabled"] and r["kind"] == "netpath_event"
+                 and (r["source_kind"] or "") == "https_down"]
+        if not rules:
+            return []
+        targets = [t for t in self.netpath_db.targets()
+                   if t["enabled"] and "https_url" in t.keys()
+                   and str(t["https_url"] or "").strip()]
+        latest = self.netpath_db.last_https_checks([t["id"] for t in targets])
+
+        occurrences = []
+        live = set()
+        for target in targets:
+            entity_id = str(target["id"])
+            live.add(entity_id)
+            check = latest.get(target["id"])
+            if check is None:
+                continue
+            label = target["label"] or target["host"]
+            url = str(target["https_url"] or "").strip()
+            sample_ts = check["ts"]
+            reason = check["error"] or "no response"
+            for rule in rules:
+                streak_key = (rule["id"], entity_id)
+                previous_ts, streak, first_breach_ts = \
+                    self._netpath_https_streaks.get(streak_key, (None, 0, None))
+                if check["ok"]:
+                    streak, first_breach_ts = 0, None
+                elif sample_ts != previous_ts:
+                    streak += 1
+                    if first_breach_ts is None:
+                        first_breach_ts = sample_ts
+                self._netpath_https_streaks[streak_key] = (
+                    sample_ts, streak, first_breach_ts)
+                occurrence = Occurrence(
+                    kind="netpath_event", source_kind="https_down",
+                    entity_kind="netpath_target", entity_id=entity_id,
+                    entity_label=label, ts=time.time(),
+                    message=f"{label}: {url} is not answering — {reason}",
+                    device_name=label, device_ip=target["host"],
+                    extra={"url": url, "error": reason,
+                           "status_code": str(check["status_code"] or ""),
+                           "metric_label": "the destination's web page",
+                           "failed_checks": str(streak)})
+                if check["ok"]:
+                    resolved = self.db.resolve_by_dedup(
+                        dedup_key(rule, occurrence), by="")
+                    if resolved:
+                        self.counters["resolved"] += 1
+                        self._notify_clear(resolved, rule, settings)
+                    continue
+                if sample_ts is not None and sample_ts == previous_ts:
+                    # Nothing has been checked since the last tick, so there
+                    # is no new fact to report — the same guard the threshold
+                    # evaluators make, and the reason `count` on the open
+                    # alert means failed checks rather than engine ticks.
+                    continue
+                if streak < max(int(rule["for_polls"] or 1), 1):
+                    continue
+                if self._operator_resolved(rule, occurrence, first_breach_ts):
+                    continue
+                occurrences.append(occurrence)
+        self._sweep_netpath_alerts(rules, live)
+        return occurrences
+
     def _sweep_netpath_alerts(self, rules, live: set) -> None:
         """Resolve open NetPath alerts whose destination is no longer being
         traced.
@@ -2571,7 +2659,7 @@ class AlertEngine(Worker):
             # stop matching any custom rule that has one set.
             if rule["kind"] in ("device_event", "interface_event", "trap",
                                 "wireless_event", "threshold", "dhcp_threshold",
-                                "netpath_threshold", "system"):
+                                "netpath_threshold", "netpath_event", "system"):
                 if (rule["source_kind"] or "") and rule["source_kind"] != occurrence.source_kind:
                     continue
             if rule["kind"] == "threshold" and occurrence.rule_key:
@@ -3066,7 +3154,15 @@ class AlertEngine(Worker):
             # whether or not its caller had anything better. A caller that
             # does — the device drain knows the exact poll the device answered
             # on — passes it here and it wins.
-            extra=dict(extra or {}))
+            #
+            # The tags are the exception that does not yield to the caller:
+            # this is a resolution whatever raised it, and its subject leads
+            # with [RECOVER] rather than the cleared alert's own level. Both
+            # channels read this same context, so the webhook's subject
+            # follows the email's for free.
+            extra={**dict(extra or {}),
+                   "severity_tag": alertmail.RECOVER_TAG,
+                   "recover_tag": alertmail.RECOVER_TAG})
         self._notify(alert_row, rule_row, occurrence, settings,
                      notify_kind="clear", template_override=template)
 

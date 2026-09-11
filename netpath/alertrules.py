@@ -445,6 +445,9 @@ ROLLED_UP_BY = {
     # from the next trace rather than needing to be un-suppressed.
     "netpath_path_unstable": "netpath_unreachable",
     "netpath_latency_high": "netpath_unreachable",
+    # And the web page on a destination nothing comes back from cannot be
+    # fetched either, so an open "destination unreachable" already says it.
+    "netpath_https_down": "netpath_unreachable",
     # Not an outage rollup like every entry above — both rules read the SAME
     # temp_chassis_c metric (see alertsdb._BUILTIN_RULES), so a device at
     # 90 C breaches both. Reusing ROLLED_UP_BY here rather than inventing a

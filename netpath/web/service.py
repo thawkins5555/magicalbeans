@@ -32,7 +32,7 @@ from ..ipamdb import IpamDatabase
 from ..ipam_worker import IpamWorker
 from ..mapperdb import MapperDatabase
 from ..mibparse import known_oids_for, load_into, resolve_all
-from ..monitor import AsnResolver, HopProber, Monitor, Resolver
+from ..monitor import AsnResolver, HopProber, HttpsChecker, Monitor, Resolver
 from ..nodepoll import NodePoller
 from .. import permissions
 from ..nodesdb import NodesDatabase
@@ -44,6 +44,7 @@ from ..syslogd import SyslogCollector
 from ..syslogdb import SyslogDatabase
 from ..webrelay import WebRelayRegistry
 from ..wirelessdb import WirelessDatabase
+from ..worker import Worker
 
 MAINTENANCE_INTERVAL_S = 900
 
@@ -272,6 +273,84 @@ SHUTDOWN_DEADLINE_S = 8.0
 SHUTDOWN_DB_GRACE_S = 2.0
 
 
+class DevicePurger(Worker):
+    """Deletes the history of removed devices, a batch at a time.
+
+    A device delete is the one write whose size is set by how long the
+    device was polled — see nodesdb.request_device_removal. The route
+    writes the tombstone and wakes this thread; the rows go in batches
+    short enough that the poll cycle and the web page never wait for more
+    than one of them, and an interrupted purge resumes from the
+    device_purges table on the next start.
+    """
+
+    THREAD_NAME = "netpath-device-purge"
+    STOPPED_TEXT = "Purge worker stopped"
+    # How often the queue is re-read without a wake — a purge left over
+    # from a previous run has nobody to wake the thread for it.
+    TICK_S = 5.0
+    # Between steps, so the batches never become one long occupation.
+    REST_S = 0.05
+
+    def __init__(self, nodes_db, log=None):
+        self.nodes_db = nodes_db
+        self.log = log
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self.counters = {"devices": 0, "rows": 0}
+        self.pending = 0
+
+    def start(self) -> None:
+        if self.running:
+            return
+        self.error = None
+        self._stop.clear()
+        self._spawn()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self.begin_stop()
+        self.finish_stop(time.monotonic() + timeout)
+
+    def begin_stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+
+    def wake(self) -> None:
+        """Called by the delete routes: there is work now."""
+        self._wake.set()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                status = self.nodes_db.purge_step(self._stop)
+            except Exception:                                 # noqa: BLE001
+                if self._stop.is_set():
+                    return          # a store closing under the teardown
+                self.error = "The background device purge failed"
+                if self.log is not None:
+                    self.log.add(ERROR, self.error,
+                                 detail=traceback.format_exc())
+                self._stop.wait(self.TICK_S)
+                continue
+            self.error = None
+            self.pending = status["pending"]
+            if status["purged"]:
+                self._bump("devices", status["purged"])
+            if status["rows_removed_now"]:
+                self._bump("rows", status["rows_removed_now"])
+            if self.pending:
+                self._stop.wait(self.REST_S)
+                continue
+            self._wake.wait(self.TICK_S)
+            self._wake.clear()
+
+    def _running_text(self) -> str:
+        if not self.pending:
+            return "Idle"
+        return f"Purging the history of {self.pending} removed device(s)"
+
+
 class LdapUnavailable(Exception):
     """The directory could not be used at all — unreachable, timed out, or
     misconfigured (an unset or malformed ldap_url/bind_dn_template) —
@@ -357,6 +436,7 @@ class Service:
         self._restarts_closed = False
 
         self.hop_prober = HopProber(self.db, log=self.log)
+        self.https_checker = HttpsChecker(self.db, log=self.log)
         self.monitor = Monitor(
             self.db,
             workers=int(self.settings["trace_workers"]),
@@ -421,6 +501,9 @@ class Service:
         self._maintenance_thread: threading.Thread | None = None
         self._rollup_thread: threading.Thread | None = None
         self._nodes_split_thread: threading.Thread | None = None
+        # Beside the split thread for the same reason: it works on the
+        # Nodes stores in the background and nothing waits for it.
+        self.device_purger = DevicePurger(self.nodes_db, log=self.log)
         # The maintenance thread waits on the first between ticks, so
         # request_maintenance() wakes it at once; the second marks that
         # pass done.
@@ -553,6 +636,7 @@ class Service:
     def start(self) -> None:
         self.monitor.start()
         self.hop_prober.start()
+        self.https_checker.start()
         if self.settings.get("dns_enabled", True):
             self.resolver.start()
         if self.settings.get("asn_enabled", True):
@@ -625,6 +709,9 @@ class Service:
             target=self._rollup_loop, name="netpath-flow-rollup", daemon=True)
         self._rollup_thread.start()
         self._start_nodes_split()
+        # Last, and unconditional: a purge left unfinished by the previous
+        # run resumes from its device_purges rows.
+        self.device_purger.start()
         self.log.add(SYSTEM, "Service started")
 
     def _start_nodes_split(self) -> None:
@@ -667,6 +754,7 @@ class Service:
             ("web relays", self.web_relays),
             ("trace scheduler", self.monitor),
             ("hop prober", self.hop_prober),
+            ("web page checks", self.https_checker),
             ("DNS resolver", self.resolver),
             ("ASN resolver", self.asn_resolver),
             ("flow collector", self.collector),
@@ -679,6 +767,10 @@ class Service:
             ("Nodes poller", self.node_poller),
             ("wireless poller", self.wireless),
             ("ConfigRX worker", self.configrx),
+            # After the Nodes poller: it holds no work anyone is waiting
+            # for, and what it leaves half-done it picks up on the next
+            # start from the device_purges rows.
+            ("device purger", self.device_purger),
         ]
 
     def _stores(self) -> list:

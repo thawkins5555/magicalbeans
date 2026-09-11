@@ -240,6 +240,7 @@ ROUTES = [
     ("POST", r"^/api/netpath/targets/(\d+)/trace$", api.trace_now, ("netpath", W)),
     ("GET", r"^/api/netpath/timeline$", api.get_timeline, ("netpath", R)),
     ("GET", r"^/api/netpath/topology$", api.get_topology, ("netpath", R)),
+    ("GET", r"^/api/netpath/https$", api.get_netpath_https, ("netpath", R)),
     ("GET", r"^/api/netflow/overview$", api.get_flow_overview, ("netflow", R)),
     ("GET", r"^/api/netflow/records$", api.get_flow_records, ("netflow", R)),
     ("GET", r"^/api/netflow/records/export\.csv$", api.get_flow_records_export, ("netflow", R)),
@@ -300,6 +301,7 @@ ROUTES = [
     ("GET", r"^/api/nodes/devices/(\d+)$", api.get_nodes_device, ("nodes", R)),
     ("PUT", r"^/api/nodes/devices/(\d+)$", api.put_nodes_device, ("nodes", W)),
     ("DELETE", r"^/api/nodes/devices/(\d+)$", api.delete_nodes_device, ("nodes", W)),
+    ("GET", r"^/api/nodes/purges$", api.get_nodes_purges, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/addresses$", api.get_nodes_device_addresses, ("nodes", R)),
     ("POST", r"^/api/nodes/devices/(\d+)/merge$", api.post_nodes_device_merge, ("nodes", W)),
     ("GET", r"^/api/nodes/duplicates$", api.get_nodes_duplicates, ("nodes", R)),
@@ -360,6 +362,12 @@ ROUTES = [
      api.get_nodes_reports_availability, ("nodes", R)),
     ("GET", r"^/api/nodes/reports/top-metrics$",
      api.get_nodes_reports_top_metrics, ("nodes", R)),
+    # Firmware inventory, and the same report as a file. Read-only like the
+    # two above, so a viewer account can run and export it.
+    ("GET", r"^/api/nodes/reports/firmware$",
+     api.get_nodes_reports_firmware, ("nodes", R)),
+    ("GET", r"^/api/nodes/reports/firmware/export\.csv$",
+     api.get_nodes_reports_firmware_export, ("nodes", R)),
     ("POST", r"^/api/nodes/devices/(\d+)/credential$", api.post_nodes_device_credential, ("nodes", W)),
     ("DELETE", r"^/api/nodes/devices/(\d+)/credential$", api.delete_nodes_device_credential, ("nodes", W)),
     ("GET", r"^/api/nodes/device-groups$", api.get_nodes_device_groups, ("nodes", R)),
