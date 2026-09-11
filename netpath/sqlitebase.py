@@ -297,6 +297,25 @@ def id_chunks(ids, size: int = _ID_CHUNK):
         yield ids[start:start + size]
 
 
+# A LIKE needle that matches the operator's text literally. Every search box
+# in the product feeds LIKE, where a typed `_` or `%` is a wildcard unless
+# escaped; pair each of these with `LIKE ? ESCAPE '\\'`.
+LIKE_ESCAPE = "ESCAPE '\\'"
+
+
+def _like_escape(text) -> str:
+    return (str(text).replace("\\", "\\\\")
+            .replace("%", "\\%").replace("_", "\\_"))
+
+
+def like_contains(text) -> str:
+    return "%" + _like_escape(text) + "%"
+
+
+def like_prefix(text) -> str:
+    return _like_escape(text) + "%"
+
+
 # --------------------------------------------------------------------- trim
 
 TRIM_CHUNK = 2_000         # rows per lock acquisition, adapted below
