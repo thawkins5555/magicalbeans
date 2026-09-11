@@ -1049,16 +1049,20 @@ class AlertEngine(Worker):
         return occurrences
 
     def _drain_ipam_conflicts(self, settings) -> list[Occurrence]:
-        all_conflicts = self.ipam_db.conflicts(include_resolved=True)
         if not self.db.has_cursor("ipam_conflicts"):
-            seed = max((row["id"] for row in all_conflicts), default=0)
-            self.db.set_cursor("ipam_conflicts", seed)
+            self.db.set_cursor("ipam_conflicts", self.ipam_db.conflicts_max_id())
             return []
         cursor = self.db.cursor("ipam_conflicts")
-        rows = [row for row in all_conflicts if row["id"] > cursor]
         occurrences = []
         max_id = cursor
-        for row in rows:
+        # Through _read_forward like every other source, rather than reading
+        # every conflict ever recorded and keeping the new ones in Python:
+        # that read was the whole table, resolved rows included, on every
+        # tick, and it was the one drain the row/time budgets and the
+        # backlog counter passed by.
+        for row in self._read_forward("ipam_conflicts",
+                                      self.ipam_db.conflicts_since, cursor,
+                                      self.ipam_db.conflicts_max_id):
             max_id = max(max_id, row["id"])
             label = namelookup.resolve_name(
                 self.nodes_db, self.app_db, row["ip"]) or row["ip"]
@@ -1071,10 +1075,10 @@ class AlertEngine(Worker):
                 device_ip=row["ip"]))
         if max_id > cursor:
             self._advance_cursor("ipam_conflicts", max_id)
-        self._pair_ipam_resolutions(all_conflicts, settings)
+        self._pair_ipam_resolutions(settings)
         return occurrences
 
-    def _pair_ipam_resolutions(self, all_conflicts, settings) -> None:
+    def _pair_ipam_resolutions(self, settings) -> None:
         """Resolve the alert for an IPAM conflict a person has marked
         resolved in the IPAM module.
 
@@ -1086,13 +1090,14 @@ class AlertEngine(Worker):
         One query for the module's open alerts and a set intersection, rather
         than a resolve_by_dedup per resolved conflict: the conflicts list
         includes every conflict ever recorded, and almost all of them are
-        both resolved and long since alerted about.
+        both resolved and long since alerted about. Ids only — the rows
+        themselves were never read here.
         """
         rule = self.db.rule_by_key("ipam_new_conflict")
         if rule is None:
             return
-        resolved_ids = {str(row["id"]) for row in all_conflicts
-                        if row["resolved_ts"]}
+        resolved_ids = {str(conflict_id)
+                        for conflict_id in self.ipam_db.resolved_conflict_ids()}
         if not resolved_ids:
             return
         for alert_row in self.db.alerts(state="unresolved", rule_id=rule["id"],
@@ -1578,10 +1583,12 @@ class AlertEngine(Worker):
 
         from .ipamdb import scope_size
 
-        leases_by_scope: dict[tuple, list] = {}
-        for lease in self.ipam_db.dhcp_leases():
-            leases_by_scope.setdefault(
-                (lease["server_id"], lease["scope_id"]), []).append(lease)
+        # Two counts per scope from SQL, not every lease row: `used` and
+        # `reserved` are the only two values below derives, and reading the
+        # whole lease table for them cost ~100 ms of every 5-second tick on a
+        # 24,000-lease estate, under the lock the DHCP poller writes with.
+        usage = {(row["server_id"], row["scope_id"]): row
+                 for row in self.ipam_db.dhcp_scope_usage()}
         servers = {row["id"]: row for row in self.ipam_db.dhcp_servers()}
 
         occurrences = []
@@ -1595,9 +1602,10 @@ class AlertEngine(Worker):
                 # size) has no utilization to speak of; skipping is honest,
                 # whereas 0% would read as "plenty of room".
                 continue
-            leases = leases_by_scope.get((scope["server_id"], scope["scope_id"]), [])
-            reserved = sum(1 for row in leases if row["is_reservation"])
-            used = len(leases)          # reservations occupy addresses too
+            counted = usage.get((scope["server_id"], scope["scope_id"]))
+            reserved = int(counted["reserved"] or 0) if counted else 0
+            used = int(counted["used"] or 0) if counted else 0
+            # reservations occupy addresses too, so `used` counts them
             value = 100.0 * used / total
             server = servers.get(scope["server_id"])
             label = (f"{scope['name'] or scope['scope_id']} on "

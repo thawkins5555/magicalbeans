@@ -585,6 +585,13 @@ class IpamDatabase(SqliteStore):
         with self._lock:
             return self._conn.execute(sql, params).fetchall()
 
+    def conflicts_max_id(self) -> int:
+        """The highest conflict id, for a drain's cursor seed and its
+        backlog figure."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM conflicts").fetchone()[0]
+
     def resolved_conflict_ids(self) -> set:
         """Ids of conflicts that have been resolved. _pair_ipam_resolutions
         intersects this with its open alerts; it has no use for the rows."""
