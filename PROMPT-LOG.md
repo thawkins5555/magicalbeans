@@ -213,3 +213,43 @@ inventory report. `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`,
 `FORTIAP-POLLING-OPTIONS.md`, `NETWORK-AND-STORAGE-REQUIREMENTS.md` and
 `RUNBOOK.md` are updated to match. The full test suite and the browser walk
 ran once at the end, as the standing constraint requires: 137 of 139 suites passed, 9 skipped for optional dependencies (paramiko, PySide6); the two failures were `test_collectors_hardening.py`, which passed once `traceroute` was installed on the container, and the pre-existing `test_prune_lock_hold.py` lock-fairness flake on `syslog logs` (code this release does not touch, recorded as intermittent since 5.9.0); the browser walk passed 65 of 65 checks including the new cold-load Dashboard check.
+
+## 5.11.0 — Four asks, one deferred
+
+**"Plan with Fable and deploy with up to 5 Opus agents ... To work on: [five
+items]"** — the standing constraints restated: comments only where necessary
+(prose 10% or less), remove nothing without permission, this log kept per
+prompt, check on every agent at least every ten minutes, one full test-suite
+pass at the end, then a code review of the day's changes and a push to main.
+→ Planned first; two rounds of questions answered before any agent started.
+Ships as 5.11.0 on today's branch, above 5.10.0. Subagent lanes in worktrees
+rather than a teammate group: the items are independent and each lane's
+deliverable is a commit plus a report.
+
+**"What branch are you working off of ... confirm that you see all changes
+made today"** and **"Everything will need to be re-run vs the branch from
+today and the code review needs to include all changes made to the repository
+branches today."**
+→ The local checkout was at 5.5.0; the remote carried 5.9.1 on `main` and
+5.10.0 on today's branch. All work rebased onto today's branch; the review
+covers every commit made to any branch today.
+
+**Planning answers** — the "1 override" marker is the 5.9.0 feature naming
+which polling-profile columns a device sets itself; the operator will check
+whether those are legitimate and report back (**deferred**). The 7-day option
+goes everywhere the mute dropdown appears and the server cap rises to 168
+hours. A per-alert mute is scoped to one rule on one device, sharing the
+duration dropdown with *Mute device*. The Debug log fix resyncs the page's
+cursor after a restart, makes the cursor read atomic, raises the ring to
+10,000 events with a setting, and marks the restart in the log. The Neighbours
+table keeps its format; an IP-only remote is named through the same chain as
+Nodes (device, then DNS cache). Review depth: full for 5.10.0 and the new work,
+a lighter pass over the 5.9.1 fixes. At the end `main` is fast-forwarded to
+the branch and both are pushed.
+
+1. **Mute a device for 7 days.**
+2. **Mute a specific alert on a specific device.**
+3. **The Debug event log seems to randomly clear.**
+4. **Neighbours: name the remote device.**
+→ Three Opus lanes (alerts, debug log, neighbours), then three Opus reviewers,
+with Sonnet for docs and the test runs.
