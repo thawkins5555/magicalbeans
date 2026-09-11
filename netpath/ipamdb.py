@@ -571,6 +571,27 @@ class IpamDatabase(SqliteStore):
                 "SELECT * FROM conflicts WHERE resolved_ts IS NULL"
                 " ORDER BY last_seen_ts DESC").fetchall()
 
+    def conflicts_since(self, cursor: int, limit: int | None = None
+                        ) -> list[sqlite3.Row]:
+        """Conflicts newer than `cursor`, oldest first, for a cursor-scoped
+        reader. conflicts(include_resolved=True) read every conflict ever
+        recorded (~60 ms at 20,000 rows, on every engine tick) so the caller
+        could keep the handful with a higher id."""
+        sql = "SELECT * FROM conflicts WHERE id > ? ORDER BY id"
+        params: list = [int(cursor)]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        with self._lock:
+            return self._conn.execute(sql, params).fetchall()
+
+    def resolved_conflict_ids(self) -> set:
+        """Ids of conflicts that have been resolved. _pair_ipam_resolutions
+        intersects this with its open alerts; it has no use for the rows."""
+        with self._lock:
+            return {row["id"] for row in self._conn.execute(
+                "SELECT id FROM conflicts WHERE resolved_ts IS NOT NULL")}
+
     def conflict_count(self) -> int:
         """Open conflicts, counted in SQL. /api/state used to take len() of
         conflicts() — every open row fetched and thrown away, twice a second
@@ -722,6 +743,21 @@ class IpamDatabase(SqliteStore):
                 f"SELECT l.*, s.label AS server_label FROM dhcp_leases l"
                 f" JOIN dhcp_servers s ON s.id = l.server_id{where}"
                 f" ORDER BY l.ip", params).fetchall()
+
+    def dhcp_scope_usage(self) -> list[sqlite3.Row]:
+        """(server_id, scope_id, used, reserved) per scope, counted in SQL.
+
+        The alert engine wants two numbers per scope on every 5-second tick;
+        reading dhcp_leases() for them materialised the whole lease table as
+        Row objects under this database's lock (~100 ms at 24,000 leases,
+        twelve times a minute) to compute a figure that changes once per
+        15-minute DHCP poll. The index on (server_id, scope_id) covers this.
+        """
+        with self._lock:
+            return self._conn.execute(
+                "SELECT server_id, scope_id, COUNT(*) AS used,"
+                " SUM(CASE WHEN is_reservation THEN 1 ELSE 0 END) AS reserved"
+                " FROM dhcp_leases GROUP BY server_id, scope_id").fetchall()
 
     def record_scope_usage(self, server_id: int, scope_id: str, leased: int,
                            reserved: int, total: int | None) -> None:

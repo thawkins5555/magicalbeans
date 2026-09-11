@@ -182,6 +182,19 @@ try:
     check("fifteen hundred ids in one bulk resolve is answered, not a 500",
           status == 200 and payload.get("resolved") == 0, (status, payload))
 
+    # And above the cap the answer is a 400 naming the limit, not the 500 an
+    # OperationalError from a fleet-sized IN (...) used to produce. The same
+    # ceiling _bulk_device_ids has, for the same reason.
+    for route, key in [("/api/alerts/bulk-ack", "alert_ids"),
+                       ("/api/alerts/bulk-unack", "alert_ids"),
+                       ("/api/alerts/bulk-resolve", "alert_ids"),
+                       ("/api/configrx/backups/bulk-delete", "backup_ids")]:
+        status, payload = call("POST", route, {key: list(range(1, 50_002))},
+                               token=admin_token)
+        check(f"an oversized id list on {route} is a 400 naming the limit",
+              status == 400 and "limit is" in str(payload.get("error", "")),
+              (route, status, payload))
+
     status, payload = call("GET", f"/api/alerts?rule_id={down_rule['id']}",
                            token=admin_token)
     resolved = [row for row in payload["alerts"] if row["state"] == "resolved"]

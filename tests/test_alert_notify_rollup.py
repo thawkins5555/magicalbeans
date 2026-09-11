@@ -342,13 +342,32 @@ try:
     assert alerts.alert(alert_id)["last_notified_ts"] is None
     ok("a muted device's due alert sends nothing and is not marked decided")
 
+    # A mute runs to MAX_MUTE_HOURS (24) and a maintenance window longer
+    # still, but alerts_due_first_notify drops a pending row once it is
+    # older than FIRST_NOTIFY_BACKLOG_GRACE_S with nothing marking it — so
+    # the held notice used to be lost for good an hour into the mute, with
+    # _sweep_renotify's own NULL guard skipping it for ever after.
+    backdate_opened(alerts, alert_id, FIRST_NOTIFY_BACKLOG_GRACE_S + 60)
+    engine._tick()
+    assert engine._mail.wait_idle(10.0)
+    assert sent.attempts == [], sent.attempts
+    assert alerts.alert(alert_id)["last_notified_ts"] is None
+    pending = [row["id"] for row in
+               alerts.alerts_due_first_notify(time.time() - 240)]
+    assert alert_id in pending, (alert_id, pending)
+    ok("an hour into the mute the notice is still owed, not aged out of the "
+       "pending-notify sweep")
+
     alerts.unmute("device", did)
     engine._tick()
     assert engine._mail.wait_idle(10.0)
     assert len(sent.attempts) == 1, sent.attempts
     kinds = [n["kind"] for n in alerts.notifications_for(alert_id)]
     assert kinds == ["alert"], kinds
-    ok("once unmuted, the still-pending held notice is delivered")
+    assert alerts.alert(alert_id)["maint_held_notify_ts"] is None, \
+        "the hold mark is cleared once the notice is finally decided"
+    ok("once unmuted, the still-pending held notice is delivered — even when "
+       "the mute outlasted the backlog floor")
 finally:
     alertmail.send = real_send
 close_all(nodes, alerts, snmp, syslog, ipam, engine)

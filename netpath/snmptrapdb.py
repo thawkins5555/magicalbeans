@@ -89,9 +89,9 @@ CREATE TABLE IF NOT EXISTS settings (
 -- JSON `settings` row, for alertsdb.smtp_credential's reason: a DPAPI blob
 -- is not a string/number, and a row that /api/config serves to every
 -- account with `snmp: read` is the wrong place for a password the rest of
--- the product encrypts (CREDENTIAL-SECURITY.md, "The trap receiver's
--- SNMPv3 users"). The name and protocol stay in the settings row, which is
--- what the Settings textarea shows and edits.
+-- the product encrypts (CREDENTIAL-SECURITY.md s11). The name and protocol
+-- stay in the settings row, which is what the Settings textarea shows and
+-- edits.
 CREATE TABLE IF NOT EXISTS trap_v3_users (
     name          TEXT PRIMARY KEY,
     auth_proto    TEXT,
@@ -154,11 +154,6 @@ DEFAULTS = {
 }
 
 
-# What settings() puts in place of a stored password, and what a save may
-# send back unchanged to keep it. Any run of asterisks is read as "keep",
-# so an operator who retypes the mask does not blank the credential.
-V3_PASSWORD_MASK = "********"
-
 V3_NO_CREDENTIAL_STORE = (
     "This machine cannot store an SNMPv3 trap password: it is not Windows "
     "and no portable secret store passphrase is configured "
@@ -172,7 +167,9 @@ def parse_v3_user_lines(text) -> list[tuple[str, str, str | None]]:
 
     A password of None means the line carried none — "keep whatever is
     stored for this name", which is what every line looks like once
-    settings() has been through it.
+    settings() has been through it. A password of nothing but asterisks
+    reads the same way, so an operator who retypes a mask they saw
+    somewhere does not blank the credential with it.
     """
     users = []
     for line in str(text or "").splitlines():

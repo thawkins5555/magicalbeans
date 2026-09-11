@@ -1988,6 +1988,160 @@ end
           SERVICE.config_version == start_version + 50,
           f"{start_version} -> {SERVICE.config_version}")
 
+    # ------------------------------- D27 a read gate cannot destroy a walk
+    #
+    # `GET .../oid-walk?download=1` hands the rows over and then drops the
+    # job. Starting a walk needs nodes:write and the rows exist only in
+    # memory, so a reader doing the drop is an unrecoverable denial of the
+    # feature to the account that ran it.
+    from netpath import nodepoll as _nodepoll
+
+    walk_reader = make_user("walkreader", {"nodes": "read"})
+    walk_writer = make_user("walkwriter", {"nodes": "write"})
+    walk_group = SERVICE.nodes_db.ensure_default_group()
+    walk_device = SERVICE.nodes_db.add_device("198.18.0.9", name="walkme",
+                                              group_id=walk_group)
+
+    def seed_walk():
+        job = _nodepoll._OidWalkJob(SERVICE.node_poller, walk_device,
+                                    base="1.3.6.1", max_rows=10, budget_s=1.0)
+        job.state = "done"
+        job.stopped = "end of subtree"
+        job.finished_ts = time.time()
+        job.device_label = "walkme"
+        job.rows = [{"oid": "1.3.6.1.2.1.1.5.0", "type": "OctetString",
+                     "value": "walkme", "text": "walkme"}]
+        job._count = 1
+        SERVICE.node_poller._oid_walks[walk_device] = job
+
+    seed_walk()
+    path = f"/api/nodes/devices/{walk_device}/oid-walk"
+    status, _h, payload = req("GET", path + "?download=1", cookie=walk_reader)
+    check("D27 a nodes:read account may still download a finished walk",
+          status == 200 and isinstance(payload, dict)
+          and "1.3.6.1.2.1.1.5.0" in payload.get("text", ""), (status, payload))
+    status, _h, payload = req("GET", path, cookie=walk_writer)
+    check("D27 …and the walk is still there for the account that ran it",
+          status == 200 and (payload or {}).get("walk") is not None,
+          (status, payload))
+
+    status, _h, payload = req("GET", path + "?download=1", cookie=walk_writer)
+    check("D27 a nodes:write download still gets the file", status == 200
+          and "1.3.6.1.2.1.1.5.0" in (payload or {}).get("text", ""),
+          (status, payload))
+    status, _h, payload = req("GET", path, cookie=walk_writer)
+    check("D27 …and it is dropped afterwards, as it always was",
+          status == 200 and (payload or {}).get("walk") is None,
+          (status, payload))
+
+    # ------------------- D28 /api/debug carries no module the account lacks
+    #
+    # The event stream is filtered by module; the worker tables beside it
+    # named every NetPath destination, device, subnet and DHCP server to an
+    # account holding nothing but `debug: read`.
+    debug_reader = make_user("debugreader", {"debug": "read"})
+    SERVICE.db.add_target("secret-plant-fw.internal", label="Plant firewall")
+    SERVICE.node_poller._queued[walk_device] = time.time()
+    status, _h, payload = req("GET", "/api/debug", cookie=debug_reader)
+    body = json.dumps(payload)
+    check("D28 debug:read alone is served, not refused", status == 200, status)
+    check("D28 …with no NetPath target inventory in it",
+          payload.get("workers") == []
+          and "secret-plant-fw.internal" not in body,
+          payload.get("workers"))
+    check("D28 …no node workers, counters or discovery scans",
+          payload.get("node_workers") == []
+          and payload.get("node_counters") == {}
+          and payload.get("discovery_scans") == [], payload.get("node_counters"))
+    check("D28 …no IPAM or DNS worker rows",
+          payload.get("ipam_workers") == [] and payload.get("dns_workers") == [],
+          (payload.get("ipam_workers"), payload.get("dns_workers")))
+    check("D28 …and no walkme device name anywhere in the payload",
+          "walkme" not in body and "198.18.0.9" not in body)
+
+    status, _h, payload = req("GET", "/api/debug", cookie=admin_cookie)
+    check("D28 an administrator still sees the NetPath targets",
+          status == 200
+          and any(w.get("host") == "secret-plant-fw.internal"
+                  for w in payload.get("workers", [])),
+          payload.get("workers"))
+    check("D28 …and the node worker queued behind them",
+          any(w.get("label") == "walkme"
+              for w in payload.get("node_workers", [])),
+          payload.get("node_workers"))
+    SERVICE.node_poller._queued.pop(walk_device, None)
+
+    # ------------- D29 a trap's community is the sending device's credential
+    from netpath.trapdecode import Trap
+
+    SERVICE.snmp_db.insert([Trap(ts=time.time(), source="198.18.0.20",
+                                 version=1, community="plant-rw",
+                                 trap_oid="1.3.6.1.6.3.1.1.5.3",
+                                 trap_name="linkDown", trap_kind="link",
+                                 severity=4)])
+    snmp_reader = make_user("snmpreader", {"snmp": "read"})
+    snmp_writer = make_user("snmpwriter", {"snmp": "write"})
+    for route in ("/api/snmp/traps", "/api/snmp/traps/export.csv"):
+        status, _h, payload = req("GET", route, cookie=snmp_reader)
+        text = payload if isinstance(payload, (bytes, str)) else json.dumps(payload)
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", "replace")
+        check(f"D29 {route} hides the community from a read-only account",
+              status == 200 and "plant-rw" not in text, (status, text[:200]))
+        status, _h, payload = req("GET", route, cookie=snmp_writer)
+        text = payload if isinstance(payload, (bytes, str)) else json.dumps(payload)
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", "replace")
+        check(f"D29 …and shows it to an account that could change it",
+              status == 200 and "plant-rw" in text, (status, text[:200]))
+
+    status, _h, payload = req("GET", "/api/snmp/traps", cookie=snmp_reader)
+    rows = (payload or {}).get("traps", [])
+    check("D29 …while still saying one is set",
+          bool(rows) and rows[0]["has_community"] is True
+          and rows[0]["community"] == "", rows[:1])
+
+    # ------------- D30 a throttled sign-in does not hold a verification slot
+    #
+    # The delay is slept before the semaphore, not inside it: four throttled
+    # attempts holding all four scrypt slots for their whole delay is how a
+    # handful of bad guesses would queue every legitimate sign-in behind
+    # them. Observed rather than timed — the spy counts the slots still free
+    # at the moment the handler asks how long to wait.
+    import netpath.web.api as api_mod
+
+    free_slots = []
+    real_delay_for = SERVICE.throttle.delay_for
+
+    def spy_delay_for(username, client):
+        taken = []
+        while api_mod._LOGIN_SLOTS.acquire(blocking=False):
+            taken.append(1)
+        for _ in taken:
+            api_mod._LOGIN_SLOTS.release()
+        free_slots.append(len(taken))
+        return real_delay_for(username, client)
+
+    SERVICE.throttle.delay_for = spy_delay_for
+    try:
+        login("walkreader", "Corr3ct-Horse-Battery")
+    finally:
+        SERVICE.throttle.delay_for = real_delay_for
+    check("D30 the throttle delay is decided before a verification slot is "
+          "taken", free_slots == [4], free_slots)
+
+    # And the wait itself is still truncated at five seconds, whatever the
+    # throttle's own ladder says.
+    SERVICE.throttle.delay_for = lambda username, client: 30.0
+    try:
+        started = time.time()
+        _cookie, status, _p = login("walkreader", "Corr3ct-Horse-Battery")
+        elapsed = time.time() - started
+    finally:
+        SERVICE.throttle.delay_for = real_delay_for
+    check("D30 …and a 30-second throttle still sleeps at most five",
+          status == 200 and 4.0 <= elapsed < 12.0, f"{elapsed:.1f}s status={status}")
+
     return 0
 
 

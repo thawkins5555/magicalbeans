@@ -18,6 +18,7 @@ import json
 import threading
 import time
 import traceback
+import urllib.parse
 from dataclasses import asdict
 
 from . import alertmail
@@ -83,6 +84,24 @@ DIGEST_THRESHOLD = 3
 # operator who resolved the outage has said they know about it, and handing
 # them the six alerts it implies is the opposite of what they asked for.
 SUPPRESSED = object()
+
+
+def webhook_host(url: str) -> str:
+    """`url` reduced to scheme and host, for a notification row.
+
+    For Slack, Teams and PagerDuty the path of an incoming-webhook URL is
+    the credential itself, and every notification row is served to any
+    account with alerts: read. The host still identifies the destination,
+    which is what delivery history is read for.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url or "")
+    except ValueError:
+        return ""
+    host = parts.hostname or ""
+    if host and parts.port:
+        host = f"{host}:{parts.port}"
+    return f"{parts.scheme}://{host}" if parts.scheme and host else ""
 
 
 class AlertEngine(Worker):
@@ -396,10 +415,13 @@ class AlertEngine(Worker):
         ordinary case) keeps the single row every other caller has always
         written.
         """
-        if ok:
-            self.counters["emails_sent"] += 1
-        else:
-            self.counters["send_errors"] += 1
+        # Under the lock: `+= 1` is a load/add/store, and this runs on the
+        # mail worker's thread while _tick counts opened/resolved on its own.
+        with self._system_lock:
+            if ok:
+                self.counters["emails_sent"] += 1
+            else:
+                self.counters["send_errors"] += 1
         alert_ids = getattr(job, "alert_ids", None) or [job.alert_id]
         for alert_id in alert_ids:
             self.db.record_notification(alert_id, job.kind,
@@ -425,13 +447,19 @@ class AlertEngine(Worker):
         the two channels can tell them apart, and to_addr holds the URL
         rather than a recipient list, which is what an operator reading the
         alert's notification history wants to see for a webhook row."""
-        if ok:
-            self.counters["webhooks_sent"] += 1
-        else:
-            self.counters["webhook_errors"] += 1
+        with self._system_lock:                      # see _mail_result
+            if ok:
+                self.counters["webhooks_sent"] += 1
+            else:
+                self.counters["webhook_errors"] += 1
         alert_ids = getattr(job, "alert_ids", None) or [job.alert_id]
+        # Scheme and host only. For Slack, Teams and PagerDuty the path of an
+        # incoming-webhook URL IS the credential, and a notification row is
+        # served to any account with alerts: read; which host took the
+        # delivery is all that history is read for.
+        to_addr = webhook_host(job.url)
         for alert_id in alert_ids:
-            self.db.record_notification(alert_id, job.kind, job.url,
+            self.db.record_notification(alert_id, job.kind, to_addr,
                                         job.subject, ok, error)
 
     # ------------------------------------------------------- drain plumbing
@@ -532,17 +560,28 @@ class AlertEngine(Worker):
         cache[source] = device
         return device
 
-    def _source_name(self, device, source: str) -> str:
+    def _source_name(self, device, source: str, cache: dict | None = None) -> str:
         """A display name for a trap/syslog sender, given a cached device row.
 
         nodes_db is withheld from resolve_name when the cache already
         answered "not a device we poll", because resolve_name's own
         device_by_ip fallback would repeat exactly the lookup that produced
         that answer, once per row. The DNS-cache half still runs.
+
+        `cache` memoises the answer per drain beside the device dict: for an
+        unmanaged sender resolve_name falls through to a single-IP
+        app_db.hostnames() query, and a full-budget syslog burst is 5,000
+        rows from a handful of addresses — 5,000 queries on the lock the
+        reverse-DNS resolver writes under.
         """
-        return namelookup.resolve_name(
+        if cache is not None and source in cache:
+            return cache[source]
+        name = namelookup.resolve_name(
             self.nodes_db if device is not None else None, self.app_db,
             source, device=device) or source
+        if cache is not None:
+            cache[source] = name
+        return name
 
     def _muted(self, occurrence: Occurrence, muted: set) -> bool:
         """True when this occurrence is about a device an operator silenced —
@@ -782,7 +821,7 @@ class AlertEngine(Worker):
             resolved, cleared_rule = None, None
             clears_key = ("device_event", row["kind"])
             if clears_key in CLEARS:
-                cleared_rule = self.db.rule_by_key(CLEARS[clears_key])
+                cleared_rule = self._rule_by_key(CLEARS[clears_key])
                 if cleared_rule:
                     paired_dedup = f"{cleared_rule['key']}:device:{device['id']}"
                     resolved = self.db.resolve_by_dedup(paired_dedup, by="")
@@ -877,7 +916,8 @@ class AlertEngine(Worker):
                 ts=row["ts"], message=row["detail"] or f"{label}: {row['kind']}",
                 device_name=device["name"] or "", device_ip=device["ip"]))
             if row["kind"] == "link_up":
-                cleared_rule = self.db.rule_by_key(CLEARS.get(("interface_event", "link_up"), ""))
+                cleared_rule = self._rule_by_key(
+                    CLEARS.get(("interface_event", "link_up"), ""))
                 if cleared_rule:
                     paired_dedup = f"{cleared_rule['key']}:interface:{device['id']}:{interface['if_index']}"
                     resolved = self.db.resolve_by_dedup(paired_dedup, by="")
@@ -930,6 +970,7 @@ class AlertEngine(Worker):
         occurrences = []
         max_id = cursor
         devices: dict = {}
+        names: dict = {}
         for row in self._read_forward("traps", self.snmp_db.traps_since,
                                       cursor, self.snmp_db.max_id):
             max_id = max(max_id, row["id"])
@@ -940,7 +981,7 @@ class AlertEngine(Worker):
             # subject. The sending address is in hand on every row; the
             # managed device behind it usually is too.
             device = self._device_for_source(devices, row["source"])
-            source_label = self._source_name(device, row["source"])
+            source_label = self._source_name(device, row["source"], names)
             trap_label = row["trap_name"] or row["trap_oid"] or "trap"
             occurrences.append(Occurrence(
                 kind="trap", source_kind=row["trap_kind"] or "", entity_kind="trap",
@@ -973,6 +1014,7 @@ class AlertEngine(Worker):
         occurrences = []
         max_id = cursor
         devices: dict = {}
+        names: dict = {}
         for row in self._read_forward("syslog", self.syslog_db.rows_since,
                                       cursor, self.syslog_db.max_id):
             max_id = max(max_id, row["id"])
@@ -985,7 +1027,7 @@ class AlertEngine(Worker):
             if row["host"] and row["host"] != row["source"]:
                 label = row["host"]
             else:
-                label = self._source_name(device, row["source"])
+                label = self._source_name(device, row["source"], names)
             occurrences.append(Occurrence(
                 kind="syslog", source_kind="", entity_kind="syslog",
                 # Source AND message signature: keyed on the host alone, a
@@ -1887,7 +1929,12 @@ class AlertEngine(Worker):
         re-enabled and starts breaching the same rule again.
         """
         for rule in rules:
-            for row in self.db.alerts(state="unresolved", rule_id=rule["id"]):
+            # An explicit limit, matching _pair_ipam_resolutions: the default
+            # is 300 ordered by last_ts DESC, so every alert past the 300th
+            # on one rule -- a multi-site path outage, or a batch of
+            # destinations disabled at once -- sat open for ever.
+            for row in self.db.alerts(state="unresolved", rule_id=rule["id"],
+                                      limit=2000):
                 if row["entity_kind"] != "netpath_target":
                     continue
                 if row["entity_id"] in live:
@@ -2274,6 +2321,49 @@ class AlertEngine(Worker):
         self.db.mark_notified(alert_row["id"], maintenance_held=maintenance_held)
         return True
 
+    def _rule_by_key(self, key: str):
+        """The rule with this key, preferring the tick's own snapshot.
+
+        The database fallback is not redundant and must stay: _rules_by_key
+        holds only ENABLED rules, and the absorb paths deliberately resolve a
+        DISABLED rule's already-open children. ROLLS_UP["device_down"] has
+        fourteen entries, so a site outage was thousands of single-row
+        queries per tick for answers the engine already held in memory.
+        """
+        if not key:
+            return None
+        rule = self._rules_by_key.get(key)
+        if rule is not None:
+            return rule
+        return self.db.rule_by_key(key)
+
+    def _hold_quiet_notify(self, alert_row) -> None:
+        """Keep a muted or window-covered alert's first notice owed.
+
+        A mute and a maintenance window both end at a moment an operator can
+        name, so the notice waits here rather than being decided. But waiting
+        is only free for an hour: a row with last_notified_ts NULL and
+        nothing else drops out of alerts_due_first_notify once it is older
+        than FIRST_NOTIFY_BACKLOG_GRACE_S, and a mute runs to MAX_MUTE_HOURS
+        (24) while windows are routinely longer still — so the notice was
+        lost for good, with the alert left reading "None sent." for ever.
+        maint_held_notify_ts is that floor's only exemption, so the row is
+        stamped with it and re-armed straight back to owed; the send path's
+        own mark_notified clears both the moment the silence lifts.
+        """
+        if alert_row["state"] != "open":
+            # rearm_maintenance_held only re-arms open rows, so stamping an
+            # acked one would decide its notice instead of holding it.
+            return
+        if "maint_held_notify_ts" not in alert_row.keys() \
+                or alert_row["maint_held_notify_ts"] is not None:
+            return
+        device_id = device_id_for(alert_row["entity_kind"], alert_row["entity_id"])
+        if device_id is None:
+            return
+        self.db.mark_notified(alert_row["id"], maintenance_held=True)
+        self.db.rearm_maintenance_held(device_id)
+
     def _occurrence_from_alert_row(self, alert_row, rule_row) -> Occurrence:
         """Rebuild the Occurrence an alert row was opened from, out of its
         own stored extras — for a caller with no fresh occurrence to hand
@@ -2323,7 +2413,7 @@ class AlertEngine(Worker):
         out, so it is closed out here rather than left to the flush sweep.
         """
         for child_key in ROLLS_UP.get(parent_rule["key"] or "", ()):
-            child_rule = self.db.rule_by_key(child_key)
+            child_rule = self._rule_by_key(child_key)
             if child_rule is None:
                 continue
             for resolved in self._absorb_one(child_rule, occurrence,
@@ -2439,7 +2529,7 @@ class AlertEngine(Worker):
                            entity_kind="device", entity_id=device_id,
                            entity_label=device_label, ts=ts, message="")
         for child_key in ROLLS_UP.get("device_down", ()):
-            child_rule = self.db.rule_by_key(child_key)
+            child_rule = self._rule_by_key(child_key)
             if child_rule is None:
                 continue
             for resolved in self._absorb_one(child_rule, probe, note_alert_id):
@@ -3081,6 +3171,7 @@ class AlertEngine(Worker):
                     maintenance_held=True)
                 continue
             if self._muted_alert(alert_row):
+                self._hold_quiet_notify(alert_row)
                 continue
             sendable.append((alert_row, rule_row, occurrence))
         if not sendable:

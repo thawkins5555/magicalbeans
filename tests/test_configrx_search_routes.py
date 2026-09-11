@@ -222,6 +222,58 @@ try:
     check("a configrx:read account may NOT create a rule set (needs write)",
           status == 403, (status, payload))
 
+    # ---------------------------------------- the device list is one read
+    #
+    # The ConfigRX tab refreshes on a timer, and a device_config() per device
+    # was one configrx.db lock acquisition per device per tick, queued behind
+    # whatever backup was committing. all_device_configs() is the read
+    # get_configrx_overview already does beside it.
+    print()
+    print("GET /api/configrx/devices")
+    fleet = [db.add_device(f"10.95.1.{n}", name=f"cx-bulk-{n}", group_id=gid)
+             for n in range(1, 51)]
+    for device_id in fleet[:10]:
+        service.configrx_db.update_device_config(device_id, backup_enabled=True)
+
+    per_device = {"n": 0}
+    real_device_config = service.configrx_db.device_config
+
+    def counted_device_config(*a, **kw):
+        per_device["n"] += 1
+        return real_device_config(*a, **kw)
+
+    service.configrx_db.device_config = counted_device_config
+    try:
+        status, payload = call("GET", "/api/configrx/devices", token=admin)
+    finally:
+        service.configrx_db.device_config = real_device_config
+    rows = payload.get("devices", []) if status == 200 else []
+    check("the ConfigRX device list still carries every device",
+          status == 200 and len(rows) >= len(fleet), (status, len(rows)))
+    check("...and the ten with a stored config still report it",
+          sum(1 for r in rows if r["backup_enabled"]) == 10,
+          sum(1 for r in rows if r["backup_enabled"]))
+    check("...read in one query for the whole list, not one per device",
+          per_device["n"] == 0, per_device["n"])
+
+    per_device["n"] = 0
+    service.configrx_db.device_config = counted_device_config
+    try:
+        status, payload = call("POST", "/api/configrx/devices/bulk-backup",
+                               {"device_ids": fleet}, token=admin)
+    finally:
+        service.configrx_db.device_config = real_device_config
+    check("bulk backup still sorts the selection into enabled and not",
+          status in (200, 400)
+          and (status == 400 or len(payload.get("not_enabled", [])) == 40),
+          (status, payload if status != 200 else len(payload.get("not_enabled", []))))
+    check("...without a device_config query per device either",
+          per_device["n"] == 0, per_device["n"])
+
+    status, payload = call("GET", f"/api/configrx/devices/{fleet[0]}", token=admin)
+    check("the single-device route is unchanged", status == 200
+          and payload["device"]["id"] == fleet[0], (status, payload))
+
     print()
     print("FAILURES:", FAILS if FAILS else "none")
 finally:
