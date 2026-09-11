@@ -212,6 +212,8 @@ def _parse_oid_tail(braces_text: str):
     if not tokens:
         return None, None, None
     if all(re.fullmatch(r"-?\d+", t) for t in tokens):
+        if any(t.startswith("-") for t in tokens):
+            return None, None, None
         return None, None, ".".join(tokens)
     if re.fullmatch(r"-?\d+", tokens[0]):
         return None, None, None   # malformed: starts numeric but isn't all-numeric
@@ -220,11 +222,14 @@ def _parse_oid_tail(braces_text: str):
     for token in tokens[1:]:
         annotated = re.fullmatch(r"[A-Za-z][\w-]*\((-?\d+)\)", token)
         if annotated:
-            arcs.append(annotated.group(1))
+            arc = annotated.group(1)
         elif re.fullmatch(r"-?\d+", token):
-            arcs.append(token)
+            arc = token
         else:
             return None, None, None   # an unannotated bare name mid-chain: bail
+        if arc.startswith("-"):
+            return None, None, None
+        arcs.append(arc)
     if not arcs:
         return None, None, None
     return parent_name, ".".join(arcs), None

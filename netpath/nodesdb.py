@@ -22,8 +22,8 @@ import time
 
 from .nodesmibdb import NodesMibDatabase
 from .nodesseriesdb import RAW_WINDOW_S, NodesSeriesDatabase
-from .sqlitebase import (SqliteStore, id_chunks as _id_chunks,
-                         reclaim)
+from .sqlitebase import (LIKE_ESCAPE, SqliteStore, id_chunks as _id_chunks,
+                         like_contains, reclaim)
 
 log = logging.getLogger(__name__)
 
@@ -1458,7 +1458,7 @@ class NodesDatabase(SqliteStore):
             self._conn.execute(
                 "UPDATE groups" + self._SET_CREDENTIAL_SQL,
                 (user, auth_proto, password_enc, priv_proto, priv_enc, group_id))
-            self._conn.commit()
+            self._commit_durable()
             self._config_generation += 1
 
     def clear_group_credential(self, group_id: int) -> None:
@@ -1565,7 +1565,7 @@ class NodesDatabase(SqliteStore):
             self._conn.execute(
                 "UPDATE group_credentials" + self._SET_CREDENTIAL_SQL,
                 (user, auth_proto, password_enc, priv_proto, priv_enc, credential_id))
-            self._conn.commit()
+            self._commit_durable()
             self._config_generation += 1
 
     def clear_group_credential_password(self, credential_id: int) -> None:
@@ -1699,10 +1699,11 @@ class NodesDatabase(SqliteStore):
             # ix_device_addresses_ip, at this scale or any other.
             text_cols = ("ip", "name", "sys_name", "sys_location",
                          "sys_descr", "sys_contact", "vendor")
-            text_sql = " OR ".join(f"{col} LIKE ?" for col in text_cols)
+            text_sql = " OR ".join(f"{col} LIKE ? {LIKE_ESCAPE}"
+                                   for col in text_cols)
             text_sql += (" OR id IN (SELECT device_id FROM device_addresses"
-                         "           WHERE ip LIKE ?)")
-            like = [f"%{text}%"] * (len(text_cols) + 1)
+                         f"           WHERE ip LIKE ? {LIKE_ESCAPE})")
+            like = [like_contains(text)] * (len(text_cols) + 1)
             mac = looks_like_mac_search(text)
             if len(mac) >= 4:
                 clauses.append(
@@ -1777,15 +1778,17 @@ class NodesDatabase(SqliteStore):
         fragment = (fragment or "").strip()
         if not fragment:
             return []
-        like = f"%{fragment}%"
+        like = like_contains(fragment)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT ip FROM ("
-                " SELECT ip FROM devices WHERE name LIKE ? OR sys_name LIKE ?"
+                f" SELECT ip FROM devices WHERE name LIKE ? {LIKE_ESCAPE}"
+                f"  OR sys_name LIKE ? {LIKE_ESCAPE}"
                 " UNION"
                 " SELECT a.ip FROM device_addresses a"
                 "  JOIN devices d ON d.id = a.device_id"
-                "  WHERE d.name LIKE ? OR d.sys_name LIKE ?"
+                f"  WHERE d.name LIKE ? {LIKE_ESCAPE}"
+                f"   OR d.sys_name LIKE ? {LIKE_ESCAPE}"
                 ") ORDER BY ip LIMIT ?",
                 (like, like, like, like, int(limit))).fetchall()
         return [r[0] for r in rows]
@@ -2144,7 +2147,7 @@ class NodesDatabase(SqliteStore):
             self._conn.execute(
                 "UPDATE devices" + self._SET_CREDENTIAL_SQL,
                 (user, auth_proto, password_enc, priv_proto, priv_enc, device_id))
-            self._conn.commit()
+            self._commit_durable()
             self._config_generation += 1
 
     def clear_device_credential(self, device_id: int) -> None:

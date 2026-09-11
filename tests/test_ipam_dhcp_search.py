@@ -244,6 +244,47 @@ check("search_hosts: nothing for text that is neither address nor MAC",
       db.search_hosts("printer") == [])
 
 
+# ----------------------------- 4b. `_` and `%` typed into the search box
+#
+# Both are LIKE wildcards. An operator typing one means the character:
+# before the escape, "10.20.3.4_" matched every 10.20.3.4x address and a
+# bare "%" returned everything either search holds.
+db.record_host("10.20.3.7", sub, True, None)
+check("an underscore in a host search is an underscore, not any character",
+      db.search_hosts("10.20.3.4_") == [], 
+      [r["ip"] for r in db.search_hosts("10.20.3.4_")])
+check("a per-cent sign in a host search is not 'everything'",
+      db.search_hosts("%") == [], [r["ip"] for r in db.search_hosts("%")])
+check("...and an ordinary address fragment still matches",
+      [r["ip"] for r in db.search_hosts("10.20.3.7")] == ["10.20.3.7"],
+      [r["ip"] for r in db.search_hosts("10.20.3.7")])
+
+# Its own server, so the fixtures the later sections read are untouched.
+srv_w = db.add_dhcp_server("dhcp-w.example", label="Site W")
+db.replace_dhcp_scopes(srv_w, [{"scope_id": "10.40.0.0", "name": "Site W",
+                                "start_ip": "10.40.0.10", "end_ip": "10.40.0.250",
+                                "mask": "255.255.255.0", "state": "Active",
+                                "lease_duration_s": 86400}])
+db.replace_dhcp_leases(srv_w, [
+    {"scope_id": "10.40.0.0", "ip": "10.40.0.120", "mac": "de:ad:be:ef:00:09",
+     "hostname": "till_2", "address_state": "Active",
+     "lease_expires_ts": time.time() + 3600, "is_reservation": False,
+     "description": "50% duty"},
+    {"scope_id": "10.40.0.0", "ip": "10.40.0.121", "mac": "de:ad:be:ef:00:0a",
+     "hostname": "till-3", "address_state": "Active",
+     "lease_expires_ts": time.time() + 3600, "is_reservation": False,
+     "description": None}])
+check("an underscore in a DHCP search matches the hostname that has one",
+      [r["ip"] for r in db.search_dhcp("till_")] == ["10.40.0.120"],
+      [r["ip"] for r in db.search_dhcp("till_")])
+check("a per-cent sign matches the description that has one, not every lease",
+      [r["ip"] for r in db.search_dhcp("50%")] == ["10.40.0.120"],
+      [r["ip"] for r in db.search_dhcp("50%")])
+check("a bare per-cent sign matches only the row that contains one",
+      [r["ip"] for r in db.search_dhcp("%")] == ["10.40.0.120"],
+      [r["ip"] for r in db.search_dhcp("%")])
+
+
 # ------------------------------------------ 5. dhcp_leases_for_mac
 for spelling in SPELLINGS:
     rows = db.dhcp_leases_for_mac(spelling)

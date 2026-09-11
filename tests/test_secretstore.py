@@ -282,6 +282,37 @@ def test_world_readable_passphrase_file_refused():
     check("...and accepted once tightened to owner-only", ok)
 
 
+def test_foreign_owned_passphrase_file_refused():
+    """CREDENTIAL-SECURITY.md promises the file is refused unless it is
+    chmod 600 *and* owned by the account the service runs as. Only the mode
+    half was enforced."""
+    reset()
+    if os.name == "nt" or os.getuid() != 0:
+        check("passphrase file owned by another account refused "
+              "(skipped: needs POSIX and root to chown)", True)
+        return
+    path = passphrase_file("owned by somebody else\n")
+    os.chown(path, 12345, 12345)
+    os.environ[ss.ENV_PASSPHRASE_FILE] = path
+    ss._key_cache.clear()
+    try:
+        ss.protect(b"should never be reachable")
+        ok, detail = False, "did not raise"
+    except ss.SecretStoreError as exc:
+        detail = str(exc)
+        ok = "owned by" in detail and "12345" in detail
+    check("a 0600 passphrase file owned by another account is refused", ok, detail)
+
+    os.chown(path, os.getuid(), -1)
+    ss._key_cache.clear()
+    try:
+        ss.protect(b"now this should work")
+        ok, detail = True, ""
+    except ss.SecretStoreError as exc:
+        ok, detail = False, str(exc)
+    check("...and accepted once it belongs to this account", ok, detail)
+
+
 def test_missing_passphrase_file_refused():
     reset()
     os.environ[ss.ENV_PASSPHRASE_FILE] = os.path.join(TMPDIR, "does-not-exist.txt")
@@ -727,6 +758,7 @@ def main() -> int:
     test_tamper_every_region_of_the_blob()
     test_blob_tag_discrimination()
     test_world_readable_passphrase_file_refused()
+    test_foreign_owned_passphrase_file_refused()
     test_missing_passphrase_file_refused()
     test_empty_passphrase_file_refused()
     test_nonce_never_repeats()

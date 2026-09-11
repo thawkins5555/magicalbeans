@@ -15,7 +15,8 @@ import time
 from urllib.parse import urlparse
 
 from . import alertrules
-from .sqlitebase import SqliteStore, reclaim
+from .sqlitebase import (LIKE_ESCAPE, SqliteStore, id_chunks,
+                         like_contains, reclaim)
 
 log = logging.getLogger(__name__)
 
@@ -1700,7 +1701,7 @@ class AlertsDatabase(SqliteStore):
                 "INSERT INTO smtp_credential(id, password_enc) VALUES (1, ?)"
                 " ON CONFLICT(id) DO UPDATE SET password_enc=excluded.password_enc",
                 (password_enc,))
-            self._conn.commit()
+            self._commit_durable()
 
     def clear_smtp_credential(self) -> None:
         with self._lock:
@@ -1955,11 +1956,12 @@ class AlertsDatabase(SqliteStore):
             clauses.append("rule_id = ?")
             params.append(rule_id)
         if device_text:
-            clauses.append("entity_label LIKE ?")
-            params.append(f"%{device_text}%")
+            clauses.append(f"entity_label LIKE ? {LIKE_ESCAPE}")
+            params.append(like_contains(device_text))
         if text:
-            clauses.append("(message LIKE ? OR entity_label LIKE ?)")
-            params.extend([f"%{text}%"] * 2)
+            clauses.append(f"(message LIKE ? {LIKE_ESCAPE}"
+                           f" OR entity_label LIKE ? {LIKE_ESCAPE})")
+            params.extend([like_contains(text)] * 2)
         if t0 is not None:
             clauses.append("last_ts >= ?")
             params.append(t0)
@@ -2197,14 +2199,19 @@ class AlertsDatabase(SqliteStore):
     def resolve_many(self, alert_ids: list[int], by: str = "") -> int:
         if not alert_ids:
             return 0
-        marks = ",".join("?" * len(alert_ids))
+        now = time.time()
+        changed = 0
         with self._lock:
-            cursor = self._conn.execute(
-                f"UPDATE alerts SET state='resolved', resolved_ts=?, resolved_by=?"
-                f" WHERE id IN ({marks}) AND state IN ('open','acked')",
-                (time.time(), by, *alert_ids))
+            for chunk in id_chunks(alert_ids):
+                marks = ",".join("?" * len(chunk))
+                cursor = self._conn.execute(
+                    f"UPDATE alerts SET state='resolved', resolved_ts=?,"
+                    f" resolved_by=? WHERE id IN ({marks})"
+                    f" AND state IN ('open','acked')",
+                    (now, by, *chunk))
+                changed += cursor.rowcount or 0
             self._conn.commit()
-            return cursor.rowcount or 0
+            return changed
 
     # ------------------------------------------------- held occurrences
 
@@ -2469,6 +2476,42 @@ class AlertsDatabase(SqliteStore):
             self._conn.commit()
         return self.open_maintenance(device_id)
 
+    def set_maintenance_many(self, device_ids, by: str = "",
+                             reason: str = "") -> int:
+        """Bulk set_maintenance — one lock hold and one commit for the whole
+        selection, in mute_many's shape — returning how many devices this
+        actually put into maintenance.
+
+        Idempotent per device exactly as set_maintenance is, so a device
+        already in a period keeps it with its clock and its author
+        untouched, and the count is the devices that were not already in
+        one. The NOT EXISTS guard is kept on the INSERT as well as read
+        ahead of it, so the statement is still safe on its own.
+        """
+        ids = list(dict.fromkeys(int(device_id) for device_id in device_ids))
+        if not ids:
+            return 0
+        now = time.time()
+        with self._lock:
+            already = set()
+            for chunk in id_chunks(ids):
+                marks = ",".join("?" * len(chunk))
+                already.update(row[0] for row in self._conn.execute(
+                    f"SELECT device_id FROM device_maintenance"
+                    f" WHERE ended_ts IS NULL AND device_id IN ({marks})",
+                    chunk).fetchall())
+            fresh = [device_id for device_id in ids if device_id not in already]
+            if fresh:
+                self._conn.executemany(
+                    "INSERT INTO device_maintenance(device_id, started_ts,"
+                    " started_by, reason) SELECT ?,?,?,? WHERE NOT EXISTS"
+                    " (SELECT 1 FROM device_maintenance WHERE device_id = ?"
+                    "  AND ended_ts IS NULL)",
+                    [(device_id, now, by, reason, device_id)
+                     for device_id in fresh])
+            self._conn.commit()
+        return len(fresh)
+
     def clear_maintenance(self, device_id: int, by: str = "") -> bool:
         """End the open period, keeping the row: a closed period is the
         availability report's evidence that those seconds were planned.
@@ -2486,6 +2529,54 @@ class AlertsDatabase(SqliteStore):
             if cleared:
                 self.rearm_maintenance_held(device_id)
         return cleared
+
+    def clear_maintenance_many(self, device_ids, by: str = "") -> int:
+        """Bulk clear_maintenance — one lock hold and one commit — returning
+        how many devices actually came out of maintenance.
+
+        Devices not in a period are ignored rather than counted, matching
+        clear_maintenance's False. The held first notices are handed back
+        here too, in the same transaction: one pass over the flagged alerts
+        for the whole selection rather than one per device.
+        """
+        ids = list(dict.fromkeys(int(device_id) for device_id in device_ids))
+        if not ids:
+            return 0
+        now = time.time()
+        cleared: set[int] = set()
+        with self._lock:
+            for chunk in id_chunks(ids):
+                marks = ",".join("?" * len(chunk))
+                open_ids = [row[0] for row in self._conn.execute(
+                    f"SELECT device_id FROM device_maintenance"
+                    f" WHERE ended_ts IS NULL AND device_id IN ({marks})",
+                    chunk).fetchall()]
+                if not open_ids:
+                    continue
+                cleared.update(open_ids)
+                self._conn.execute(
+                    f"UPDATE device_maintenance SET ended_ts = ?, ended_by = ?"
+                    f" WHERE ended_ts IS NULL AND device_id IN ({marks})",
+                    (now, by, *chunk))
+            if cleared:
+                self._rearm_held(cleared)
+            self._conn.commit()
+        return len(cleared)
+
+    def _rearm_held(self, device_ids) -> int:
+        """rearm_maintenance_held's body over a set of devices, without
+        committing: the caller owns the transaction."""
+        rows = self._conn.execute(
+            "SELECT id, entity_kind, entity_id FROM alerts"
+            " WHERE maint_held_notify_ts IS NOT NULL AND state = 'open'"
+        ).fetchall()
+        ids = [(row["id"],) for row in rows
+               if alertrules.device_id_for(row["entity_kind"],
+                                           row["entity_id"]) in device_ids]
+        if ids:
+            self._conn.executemany(
+                "UPDATE alerts SET last_notified_ts = NULL WHERE id = ?", ids)
+        return len(ids)
 
     def rearm_maintenance_held(self, device_id: int) -> int:
         """Make due again the first notices maintenance mode decided for
@@ -2515,18 +2606,10 @@ class AlertsDatabase(SqliteStore):
         maintenance mode is holding a notice for right now.
         """
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT id, entity_kind, entity_id FROM alerts"
-                " WHERE maint_held_notify_ts IS NOT NULL AND state = 'open'"
-            ).fetchall()
-            ids = [(row["id"],) for row in rows
-                   if alertrules.device_id_for(row["entity_kind"],
-                                               row["entity_id"]) == int(device_id)]
-            if ids:
-                self._conn.executemany(
-                    "UPDATE alerts SET last_notified_ts = NULL WHERE id = ?", ids)
+            count = self._rearm_held({int(device_id)})
+            if count:
                 self._conn.commit()
-        return len(ids)
+        return count
 
     def open_maintenance(self, device_id: int) -> sqlite3.Row | None:
         with self._lock:
@@ -2817,14 +2900,18 @@ class AlertsDatabase(SqliteStore):
         selection and takes every open alert on the server."""
         if not alert_ids:
             return 0
-        marks = ",".join("?" * len(alert_ids))
+        now = time.time()
+        changed = 0
         with self._lock:
-            cursor = self._conn.execute(
-                f"UPDATE alerts SET state='acked', acked_ts=?, acked_by=?"
-                f" WHERE id IN ({marks}) AND state='open'",
-                (time.time(), by, *alert_ids))
+            for chunk in id_chunks(alert_ids):
+                marks = ",".join("?" * len(chunk))
+                cursor = self._conn.execute(
+                    f"UPDATE alerts SET state='acked', acked_ts=?, acked_by=?"
+                    f" WHERE id IN ({marks}) AND state='open'",
+                    (now, by, *chunk))
+                changed += cursor.rowcount or 0
             self._conn.commit()
-            return cursor.rowcount or 0
+            return changed
 
     def resolve_by_dedup(self, dedup_key: str, by: str = "",
                         rolled_up_into: int | None = None) -> sqlite3.Row | None:
@@ -2881,10 +2968,14 @@ class AlertsDatabase(SqliteStore):
                     " resolved_by=?, rolled_up_into=? WHERE id=?",
                     (now, by, rolled_up_into, row["id"]))
             self._conn.commit()
-            marks = ",".join("?" * len(rows))
-            return self._conn.execute(
-                f"SELECT * FROM alerts WHERE id IN ({marks}) ORDER BY opened_ts",
-                [row["id"] for row in rows]).fetchall()
+            resolved: list[sqlite3.Row] = []
+            for chunk in id_chunks([row["id"] for row in rows]):
+                marks = ",".join("?" * len(chunk))
+                resolved.extend(self._conn.execute(
+                    f"SELECT * FROM alerts WHERE id IN ({marks})", chunk
+                ).fetchall())
+            resolved.sort(key=lambda row: row["opened_ts"])
+            return resolved
 
     def alerts_rolled_up_into(self, parent_id: int) -> list[sqlite3.Row]:
         """Every alert absorbed DIRECTLY into `parent_id`'s rollup, oldest
@@ -3043,14 +3134,17 @@ class AlertsDatabase(SqliteStore):
         acked rather than raising for them."""
         if not alert_ids:
             return 0
-        marks = ",".join("?" * len(alert_ids))
+        changed = 0
         with self._lock:
-            cursor = self._conn.execute(
-                f"UPDATE alerts SET state='open', acked_ts=NULL, acked_by=NULL,"
-                f" ack_note=NULL WHERE id IN ({marks}) AND state='acked'",
-                alert_ids)
+            for chunk in id_chunks(alert_ids):
+                marks = ",".join("?" * len(chunk))
+                cursor = self._conn.execute(
+                    f"UPDATE alerts SET state='open', acked_ts=NULL,"
+                    f" acked_by=NULL, ack_note=NULL WHERE id IN ({marks})"
+                    f" AND state='acked'", chunk)
+                changed += cursor.rowcount or 0
             self._conn.commit()
-            return cursor.rowcount or 0
+            return changed
 
     # ------------------------------------------------------------ notifications
 

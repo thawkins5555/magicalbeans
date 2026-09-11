@@ -246,7 +246,12 @@ def _decode_value(data: bytes, tag: int, s: int, e: int,
                   max_chars: int) -> tuple[str, str, object]:
     """Returns (type_name, display_text, native_value)."""
     if tag == T_INTEGER:
-        n = _signed(data, s, e)
+        # Clamped the way the trap decoder already clamps its own INTEGER
+        # fields: SMIv2 has no INTEGER wider than Integer32, and a 60 KB
+        # BER integer otherwise becomes a 480,000-bit Python int that a
+        # consumer may then use as an exponent (see nodepoll's
+        # _scaled_sensor_value).
+        n = _clamp_int32(_signed(data, s, e))
         return "INTEGER", str(n), n
     if tag == T_OCTET_STRING:
         text = _octets_text(data[s:e])
@@ -782,15 +787,27 @@ def enc_octets(value) -> bytes:
 
 
 def enc_oid(oid: str) -> bytes:
+    """A dotted OID -> its BER OBJECT IDENTIFIER TLV.
+
+    A negative arc is refused rather than encoded: `-1 >> 7` is `-1` in
+    Python, so the base-128 loop below would never terminate and the
+    caller's thread would be gone for the life of the process. ASN.1 has
+    no negative sub-identifier, so nothing legitimate is being turned
+    away — but a MIB file, an operator's OID override and an API caller
+    can all put one here.
+    """
     arcs = [int(a) for a in str(oid).strip(".").split(".") if a != ""]
     if len(arcs) < 2:
         arcs = [1, 3]
+    if any(arc < 0 for arc in arcs):
+        raise ValueError(f"{oid!r} has a negative arc: an OID sub-identifier "
+                         f"is never negative")
     body = bytearray()
     first = arcs[0] * 40 + arcs[1]
     for value in [first, *arcs[2:]]:
         chunk = [value & 0x7F]
         value >>= 7
-        while value:
+        while value > 0:
             chunk.append((value & 0x7F) | 0x80)
             value >>= 7
         body.extend(reversed(chunk))

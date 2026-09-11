@@ -732,7 +732,12 @@ def normalize_oid(text: str) -> str:
     if not oid:
         return ""
     parts = oid.split(".")
-    if len(parts) < 2 or not all(part.isdigit() for part in parts):
+    # isascii() as well as isdigit(): str.isdigit() is True for '\u00b2' and
+    # '\u0663', which int() then refuses -- and this string goes on to be
+    # BER-encoded into a request, where that refusal is a ValueError no
+    # SNMP error handler catches.
+    if len(parts) < 2 or not all(part.isascii() and part.isdigit()
+                                 for part in parts):
         return ""
     return oid
 

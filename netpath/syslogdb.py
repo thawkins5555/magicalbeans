@@ -14,7 +14,7 @@ import threading
 import time
 
 from .eventlog import ERROR, NullLog, SYSTEM
-from .sqlitebase import SqliteStore, id_chunks
+from .sqlitebase import LIKE_ESCAPE, SqliteStore, id_chunks, like_contains
 
 log = logging.getLogger(__name__)
 
@@ -583,11 +583,11 @@ class SyslogDatabase(SqliteStore):
             # Matched against the resolved name as well, so the box accepts
             # either `10.20.3.4` or `core-sw-01` without the user having to
             # know which one this device reports.
-            clauses.append("l.source LIKE ?")
-            params.append(f"%{filters['source']}%")
+            clauses.append(f"l.source LIKE ? {LIKE_ESCAPE}")
+            params.append(like_contains(filters["source"]))
         if filters.get("host"):
-            clause = "l.host LIKE ?"
-            params.append(f"%{filters['host']}%")
+            clause = f"l.host LIKE ? {LIKE_ESCAPE}"
+            params.append(like_contains(filters["host"]))
             # Widened by the addresses the API resolved the fragment to;
             # one parenthesis, so a second chunk cannot escape the time AND.
             ips = [ip for ip in (filters.get("host_ips") or ()) if ip]
@@ -599,8 +599,8 @@ class SyslogDatabase(SqliteStore):
                 clause = f"({clause} OR {' OR '.join(ors)})"
             clauses.append(clause)
         if filters.get("app"):
-            clauses.append("l.app LIKE ?")
-            params.append(f"%{filters['app']}%")
+            clauses.append(f"l.app LIKE ? {LIKE_ESCAPE}")
+            params.append(like_contains(filters["app"]))
         return " AND ".join(clauses), params
 
     # Trigram indexes runs of three characters, so it has nothing to match on
@@ -661,8 +661,9 @@ class SyslogDatabase(SqliteStore):
         clauses, params = [], []
         for term in terms:
             clauses.append("(" + " OR ".join(
-                f"{column} LIKE ?" for column in self.SCAN_COLUMNS) + ")")
-            params.extend([f"%{term}%"] * len(self.SCAN_COLUMNS))
+                f"{column} LIKE ? {LIKE_ESCAPE}"
+                for column in self.SCAN_COLUMNS) + ")")
+            params.extend([like_contains(term)] * len(self.SCAN_COLUMNS))
         return " AND ".join(clauses), params
 
     def search(self, t0: float, t1: float, filters: dict, limit: int = 300,

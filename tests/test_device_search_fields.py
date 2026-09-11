@@ -144,6 +144,39 @@ r = db.devices(text="Site-C")
 check("...under every one of its fields, not just the one just checked",
       r == [], names(r))
 
+# --------------------------------------------- wildcards typed in the box
+#
+# `_` and `%` are LIKE's own wildcards. An operator typing a device name that
+# contains one means the character, not the pattern: before the escape,
+# searching "core_sw" also returned "core-sw-1" and searching "%" returned
+# the whole fleet.
+lit_a = db.add_device("10.9.0.1", "core-sw-1")
+lit_b = db.add_device("10.9.0.2", "core_sw_2")
+lit_c = db.add_device("10.9.0.3", "100% full")
+set_identity_fields(db, lit_c, sys_location="Plant_A")
+
+r = db.devices(text="core_sw")
+check("an underscore in the search box matches an underscore, not any character",
+      names(r) == ["core_sw_2"], names(r))
+check("...and the count agrees with the list",
+      db.devices_count(text="core_sw") == 1, db.devices_count(text="core_sw"))
+r = db.devices(text="%")
+check("a per-cent sign matches the device that has one, not every device",
+      names(r) == ["100% full"], names(r))
+check("...and its count too",
+      db.devices_count(text="%") == 1, db.devices_count(text="%"))
+r = db.devices(text="Plant_A")
+check("the same on the identity fields the box also searches",
+      names(r) == ["100% full"], names(r))
+check("a backslash in the search box is a backslash",
+      db.devices(text="a\\b") == [], db.devices(text="a\\b"))
+check("device_ips_by_name takes the text literally as well",
+      db.device_ips_by_name("core_sw") == ["10.9.0.2"],
+      db.device_ips_by_name("core_sw"))
+check("...and a hyphen still finds the hyphenated one",
+      db.device_ips_by_name("core-sw") == ["10.9.0.1"],
+      db.device_ips_by_name("core-sw"))
+
 print()
 if FAILS:
     print(f"{len(FAILS)} check(s) failed: {', '.join(FAILS)}")

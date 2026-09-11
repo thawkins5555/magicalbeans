@@ -16,6 +16,7 @@ import socket
 import sqlite3
 import ssl
 import stat
+import struct
 import sys
 import tarfile
 import tempfile
@@ -1736,6 +1737,223 @@ end
     check("D20 …confirmed: both secrets gone via the wide route",
           config["ssh_password_enc"] is None and config["enable_secret_enc"] is None,
           config)
+
+    # ------------------------------ D21 the body is read after the gate, not before
+    # ~250 routes carry a fixed (module, level). Reading the body first meant
+    # an account with no grant at all could make the server buffer up to the
+    # route's whole cap — 85 MB on the MIB upload — before its 403, and be
+    # told what that cap was on the way.
+    readonly_cookie = make_user("bodygate", {"netpath": "read"})
+    oversized = SERVER.httpd.RequestHandlerClass.MAX_BODY_BYTES * 4
+    conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=30)
+    conn.request("POST", "/api/nodes/mibs", None,
+                 {"Content-Type": "application/json", "Cookie": readonly_cookie,
+                  "Content-Length": str(oversized)})
+    response = conn.getresponse()
+    payload = response.read()
+    conn.close()
+    check("D21 an account with no grant is refused before its body is read",
+          response.status == 403, f"{response.status} {payload[:120]}")
+    check("D21 …and is not told the server's body limit",
+          b"limit" not in payload, payload[:120])
+
+    # The two callable requirements still decide from the body, so they must
+    # still be read first: changing your own password is allowed, and the
+    # route can only know that from what the body asks for.
+    status, _h, payload = req("POST", "/api/password",
+                              {"current_password": "Corr3ct-Horse-Battery",
+                               "new_password": "Corr3ct-Horse-Battery-2"},
+                              cookie=readonly_cookie)
+    check("D21 a body-derived requirement still works", status == 200,
+          f"{status} {payload}")
+
+    # ------------------------------------- D22 what a refusal will read and drop
+    def raw_exchange(request_bytes, timeout=2.0):
+        """(bytes received, whether the server closed the connection)."""
+        sock = socket.create_connection(("127.0.0.1", PORT), timeout=timeout)
+        try:
+            sock.sendall(request_bytes)
+            chunks, closed = [], False
+            while True:
+                try:
+                    piece = sock.recv(65536)
+                except (socket.timeout, TimeoutError, OSError):
+                    break
+                if not piece:
+                    closed = True
+                    break
+                chunks.append(piece)
+            return b"".join(chunks), closed
+        finally:
+            sock.close()
+
+    handler_class = SERVER.httpd.RequestHandlerClass
+    check("D22 the drain cap is 64 KiB, far below the body cap",
+          handler_class.MAX_DRAIN_BYTES == 64 * 1024,
+          str(handler_class.MAX_DRAIN_BYTES))
+
+    big = b"A" * (128 * 1024)
+    reply, closed = raw_exchange(
+        b"POST /api/nodes/devices HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        b"Cookie: %s\r\nContent-Type: text/plain\r\n"
+        b"Content-Length: %d\r\n\r\n" % (admin_cookie.encode(), len(big))
+        + big)
+    check("D22 a refused request with a large body is answered and closed, "
+          "not read to the end", b" 415 " in reply.split(b"\r\n")[0] and closed,
+          (reply[:60], closed))
+
+    small = b'{"ip": "10.20.30.41"}'
+    reply, closed = raw_exchange(
+        b"POST /api/nodes/devices HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        b"Cookie: %s\r\nContent-Type: text/plain\r\n"
+        b"Content-Length: %d\r\n\r\n" % (admin_cookie.encode(), len(small))
+        + small
+        + b"GET /login HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+    check("D22 …while a small one is still drained so the connection lives on",
+          reply.count(b"HTTP/1.1 ") == 2, reply[:60])
+
+    # ------------------------------------------------ D23 a ceiling on connections
+    import netpath.web.server as server_mod
+
+    check("D23 the shipped ceiling is 512 connections",
+          server_mod.MAX_CONNECTIONS == 512, str(server_mod.MAX_CONNECTIONS))
+
+    saved_ceiling = server_mod.MAX_CONNECTIONS
+    saved_access_log = SERVICE.access_log
+    server_mod.MAX_CONNECTIONS = 4
+    spare_port = _paths.free_tcp_port()
+    spare = WebServer(SERVICE, host="127.0.0.1", port=spare_port)
+    held = []
+    try:
+        if not spare.start(block=False):
+            check("D23 a second listener came up", False, spare.error)
+        else:
+            for _ in range(4):
+                sock = socket.create_connection(("127.0.0.1", spare_port),
+                                                timeout=5)
+                sock.sendall(b"GET /login HTTP")   # deliberately unfinished
+                held.append(sock)
+            deadline = time.time() + 5
+            while spare.access.active < 4 and time.time() < deadline:
+                time.sleep(0.02)
+            check("D23 the ceiling's worth of connections are served",
+                  spare.access.active == 4, str(spare.access.active))
+
+            over = socket.create_connection(("127.0.0.1", spare_port), timeout=3)
+            held.append(over)
+            over.sendall(b"GET /login HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            try:
+                answer = over.recv(65536)
+            except (socket.timeout, TimeoutError, OSError):
+                answer = b"(no answer)"
+            check("D23 one past the ceiling is closed, not served",
+                  answer == b"", answer[:60])
+
+            # And the slot comes back: close one, and the next is served.
+            held[0].close()
+            held.pop(0)
+            deadline = time.time() + 5
+            served = b""
+            while time.time() < deadline and not served:
+                time.sleep(0.05)
+                try:
+                    again = socket.create_connection(("127.0.0.1", spare_port),
+                                                     timeout=3)
+                except OSError:
+                    continue
+                held.append(again)
+                again.sendall(b"GET /login HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                try:
+                    served = again.recv(65536)
+                except (socket.timeout, TimeoutError, OSError):
+                    served = b""
+            check("D23 …and a finished connection gives its slot back",
+                  served.startswith(b"HTTP/1.1 200"), served[:60])
+    finally:
+        for sock in held:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        spare.stop()
+        server_mod.MAX_CONNECTIONS = saved_ceiling
+        SERVICE.access_log = saved_access_log
+
+    # ------------------------------------- D24 a client that walks away is not a fault
+    captured = io.StringIO()
+    real_stderr = sys.stderr
+    sys.stderr = captured
+    try:
+        for _ in range(3):
+            sock = socket.create_connection(("127.0.0.1", PORT), timeout=5)
+            # SO_LINGER (1, 0): close() sends an RST rather than a FIN, which
+            # is what a browser tab closing mid-poll looks like to the server.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                            struct.pack("ii", 1, 0))
+            sock.sendall(b"GET /app.js HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                         b"Cookie: %s\r\n\r\n" % admin_cookie.encode())
+            sock.close()
+        time.sleep(1.0)
+    finally:
+        sys.stderr = real_stderr
+    noise = captured.getvalue()
+    check("D24 a client that resets mid-response prints nothing",
+          "Traceback" not in noise, noise[:200])
+
+    captured = io.StringIO()
+    real_stderr = sys.stderr
+    sys.stderr = captured
+    try:
+        try:
+            raise RuntimeError("a genuine handler fault")
+        except RuntimeError:
+            SERVER.httpd.handle_error(None, ("127.0.0.1", 0))
+    finally:
+        sys.stderr = real_stderr
+    check("D24 …but a genuine fault still does",
+          "a genuine handler fault" in captured.getvalue(),
+          captured.getvalue()[:200])
+
+    # ------------------------------------------- D25 stop() waits for the traffic
+    saved_access_log = SERVICE.access_log
+    quiet_port = _paths.free_tcp_port()
+    quiet = WebServer(SERVICE, host="127.0.0.1", port=quiet_port)
+    try:
+        if not quiet.start(block=False):
+            check("D25 a third listener came up", False, quiet.error)
+        else:
+            started = time.time()
+            quiet.stop()
+            check("D25 an idle listener stops at once",
+                  time.time() - started < 1.0, f"{time.time() - started:.2f}s")
+
+        quiet = WebServer(SERVICE, host="127.0.0.1", port=quiet_port)
+        if quiet.start(block=False):
+            busy = socket.create_connection(("127.0.0.1", quiet_port), timeout=5)
+            busy.sendall(b"GET /login HTTP")       # deliberately unfinished
+            deadline = time.time() + 5
+            while quiet.access.active < 1 and time.time() < deadline:
+                time.sleep(0.02)
+            started = time.time()
+            quiet.stop()
+            elapsed = time.time() - started
+            busy.close()
+            check("D25 …and one with traffic still on it waits for the grace, "
+                  "bounded", 1.0 < elapsed < 4.0, f"{elapsed:.2f}s")
+    finally:
+        quiet.stop()
+        SERVICE.access_log = saved_access_log
+
+    # --------------------------------------------- D26 config_version is atomic
+    start_version = SERVICE.config_version
+    bumpers = [threading.Thread(target=SERVICE.bump_config) for _ in range(50)]
+    for one in bumpers:
+        one.start()
+    for one in bumpers:
+        one.join()
+    check("D26 fifty concurrent bumps are fifty increments",
+          SERVICE.config_version == start_version + 50,
+          f"{start_version} -> {SERVICE.config_version}")
 
     return 0
 

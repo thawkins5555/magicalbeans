@@ -13,7 +13,8 @@ import sqlite3
 import time
 
 from . import sqlitebase
-from .sqlitebase import SqliteStore, reclaim
+from .sqlitebase import (LIKE_ESCAPE, SqliteStore, like_contains,
+                         like_prefix, reclaim)
 
 log_module = logging.getLogger(__name__)
 
@@ -820,8 +821,9 @@ class AppDatabase(SqliteStore):
             clauses.append("target = ?")
             args.append(target)
         if q:
-            clauses.append("(target LIKE ? ESCAPE '\\' OR detail LIKE ? ESCAPE '\\')")
-            like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            clauses.append(f"(target LIKE ? {LIKE_ESCAPE}"
+                           f" OR detail LIKE ? {LIKE_ESCAPE})")
+            like = like_contains(q)
             args.extend([like, like])
         if before_id is not None:
             clauses.append("id < ?")
@@ -879,9 +881,11 @@ class AppDatabase(SqliteStore):
         since a caller may already half-know the address."""
         with self._lock:
             return self._conn.execute(
-                "SELECT ip, hostname FROM hostnames WHERE hostname LIKE ? OR ip LIKE ?"
-                " ORDER BY (hostname LIKE ?) DESC, hostname LIMIT ?",
-                (f"%{query}%", f"%{query}%", f"{query}%", limit)).fetchall()
+                f"SELECT ip, hostname FROM hostnames"
+                f" WHERE hostname LIKE ? {LIKE_ESCAPE} OR ip LIKE ? {LIKE_ESCAPE}"
+                f" ORDER BY (hostname LIKE ? {LIKE_ESCAPE}) DESC, hostname LIMIT ?",
+                (like_contains(query), like_contains(query),
+                 like_prefix(query), limit)).fetchall()
 
     def set_hostname(self, ip: str, hostname: str | None) -> None:
         with self._lock:

@@ -32,7 +32,8 @@ import sqlite3
 import time
 
 from .sqlitebase import (  # re-exported: tests adjust netpath.flowdb.TRIM_CHUNK
-    TRIM_BUDGET_S, TRIM_CHUNK, TRIM_CHUNK_MAX, TRIM_CHUNK_MIN, SqliteStore)
+    LIKE_ESCAPE, TRIM_BUDGET_S, TRIM_CHUNK, TRIM_CHUNK_MAX, TRIM_CHUNK_MIN,
+    SqliteStore, like_contains)
 
 log = logging.getLogger(__name__)
 
@@ -933,11 +934,11 @@ class FlowDatabase(SqliteStore):
         clauses = ["ts_end >= ?", "ts_end <= ?"]
         params: list = [t0, t1]
         if filters.get("src_ip"):
-            clauses.append("src_ip LIKE ?")
-            params.append(f"%{filters['src_ip']}%")
+            clauses.append(f"src_ip LIKE ? {LIKE_ESCAPE}")
+            params.append(like_contains(filters["src_ip"]))
         if filters.get("dst_ip"):
-            clauses.append("dst_ip LIKE ?")
-            params.append(f"%{filters['dst_ip']}%")
+            clauses.append(f"dst_ip LIKE ? {LIKE_ESCAPE}")
+            params.append(like_contains(filters["dst_ip"]))
         if filters.get("port"):
             clauses.append("(src_port = ? OR dst_port = ?)")
             params.extend([int(filters["port"]), int(filters["port"])])

@@ -48,6 +48,11 @@ class Response:
     error_index: int = 0
     varbinds: list = field(default_factory=list)   # same shape trapdecode uses
     # v3 only
+    # The msgID the reply carried. Kept, not just stepped over: RFC 3412
+    # s7.2 has the receiver match it against the outstanding request, and
+    # for a Report — exempt from the request-id filter by design — it is
+    # the only field that says the datagram answers OUR message.
+    msg_id: int = 0
     engine_id: bytes = b""
     engine_boots: int = 0
     engine_time: int = 0
@@ -389,10 +394,29 @@ def _check_stray(response: Response, expect_request_id: int | None) -> None:
                         f"the {expect_request_id} being waited on")
 
 
+def _check_report_msg_id(response: Response, expect_msg_id: int | None) -> None:
+    """_check_stray's shape for the one reply it lets through: a Report.
+
+    A Report is unauthenticated and exempt from the request-id filter, so
+    without this its only remaining checks are the source address and
+    v3_exchange's engine-id rule — and that rule deliberately admits
+    usmStatsUnknownEngineIDs under any engine id, since that is the Report
+    whose purpose is to teach one. The msgID is the piece a forger cannot
+    know: RFC 3412 s7.2 has the receiver match it against the outstanding
+    request. A Report carrying another is dropped and counted like any
+    other stray, and the real exchange goes on waiting."""
+    if expect_msg_id is None or response.pdu_tag != PDU_REPORT:
+        return
+    if response.msg_id != expect_msg_id:
+        raise SnmpStray(f"Report against msgID {response.msg_id}, not the "
+                        f"{expect_msg_id} being waited on")
+
+
 def _decode_v3(data: bytes, msg: Reader, *, auth_proto: str | None = None,
                auth_key: bytes | None = None, priv_proto: str | None = None,
                priv_key: bytes | None = None,
-               expect_request_id: int | None = None) -> Response:
+               expect_request_id: int | None = None,
+               expect_msg_id: int | None = None) -> Response:
     """A v3 message at any level. With keys given, the digest is verified
     and only then is the ScopedPDU decrypted — RFC 3414 s3.2's order, the
     mirror of build_v3_request's encrypt-then-authenticate — so nothing
@@ -422,7 +446,7 @@ def _decode_v3(data: bytes, msg: Reader, *, auth_proto: str | None = None,
     sent."""
     hs, he = msg.expect(T_SEQUENCE)
     header = Reader(data, hs, he)
-    header.expect(T_INTEGER)                       # msgID
+    is_, ie = header.expect(T_INTEGER)             # msgID
     header.expect(T_INTEGER)                       # msgMaxSize
     fs, fe = header.expect(T_OCTET_STRING)
     flags = data[fs] if fe > fs else 0
@@ -439,7 +463,8 @@ def _decode_v3(data: bytes, msg: Reader, *, auth_proto: str | None = None,
     as_, ae = params.expect(T_OCTET_STRING)         # auth params (offsets kept)
     ps_, pe = params.expect(T_OCTET_STRING)         # priv params — the salt
 
-    response = Response(version=V3, engine_id=data[es:ee],
+    response = Response(version=V3, msg_id=_signed(data, is_, ie),
+                        engine_id=data[es:ee],
                         engine_boots=_unsigned(data, bs, be),
                         engine_time=_unsigned(data, ts_, te),
                         user=data[ns:ne].decode("utf-8", "replace"),
@@ -470,6 +495,7 @@ def _decode_v3(data: bytes, msg: Reader, *, auth_proto: str | None = None,
             raise BerError("ScopedPDU is not a SEQUENCE")
         _read_scoped(data, ds, de, response)
         _check_stray(response, expect_request_id)     # in the clear: first
+        _check_report_msg_id(response, expect_msg_id)
         verify()
         return response
 
@@ -521,11 +547,12 @@ def _decode_v3(data: bytes, msg: Reader, *, auth_proto: str | None = None,
                "(the signature was not checked, so the authentication "
                "password is not proven either way)")) from exc
     _check_stray(response, expect_request_id)         # only now readable
+    _check_report_msg_id(response, expect_msg_id)
     return response
 
 
 def _decode(data: bytes, *, expect_request_id: int | None = None,
-            **keys) -> Response:
+            expect_msg_id: int | None = None, **keys) -> Response:
     top = Reader(data)
     body_s, body_e = top.expect(T_SEQUENCE)
     msg = Reader(data, body_s, body_e)
@@ -543,7 +570,8 @@ def _decode(data: bytes, *, expect_request_id: int | None = None,
         return response
 
     if version == V3:
-        return _decode_v3(data, msg, expect_request_id=expect_request_id, **keys)
+        return _decode_v3(data, msg, expect_request_id=expect_request_id,
+                          expect_msg_id=expect_msg_id, **keys)
 
     raise BerError(f"unsupported version {version}")
 
@@ -551,7 +579,8 @@ def _decode(data: bytes, *, expect_request_id: int | None = None,
 def decode_response(data: bytes, *, auth_proto: str | None = None,
                     auth_key: bytes | None = None, priv_proto: str | None = None,
                     priv_key: bytes | None = None, verify: bool = True,
-                    expect_request_id: int | None = None) -> Response:
+                    expect_request_id: int | None = None,
+                    expect_msg_id: int | None = None) -> Response:
     """The mirror of trapdecode's trap decoder, but for a Response-PDU (or,
     given a just-built request, decodes it back — same code path, since a
     Response-PDU and a Get/GetNext/GetBulk-PDU share request-id/slot-2/
@@ -577,6 +606,9 @@ def decode_response(data: bytes, *, auth_proto: str | None = None,
     carrying another is SnmpStray, raised before the digest is checked
     wherever the id can be read without decrypting (see _decode_v3), so
     a caller waiting on a socket can drop it and keep waiting.
+    `expect_msg_id` is the same test for the one reply exempt from that
+    one — a v3 Report, whose msgID must be the one we sent (see
+    _check_report_msg_id).
 
     `verify=False` is the operator's escape hatch (the Nodes setting
     `v3_verify_replies`): a lower level is not refused — the unsigned or
@@ -592,7 +624,8 @@ def decode_response(data: bytes, *, auth_proto: str | None = None,
     try:
         response = _decode(data, auth_proto=auth_proto, auth_key=auth_key,
                            priv_proto=priv_proto, priv_key=priv_key,
-                           expect_request_id=expect_request_id)
+                           expect_request_id=expect_request_id,
+                           expect_msg_id=expect_msg_id)
     except SnmpError:
         raise
     except (BerError, IndexError, ValueError, UnicodeError) as exc:

@@ -13,7 +13,8 @@ import sqlite3
 import time
 
 from .ipam_dhcp import stored_mac
-from .sqlitebase import SqliteStore
+from .sqlitebase import (LIKE_ESCAPE, SqliteStore, like_contains,
+                         like_prefix)
 
 
 _MAC_SEPARATORS = ":-. \t"
@@ -782,13 +783,13 @@ class IpamDatabase(SqliteStore):
         belong here rather than in the DHCP or reverse-DNS searches: a host
         SappiWhere's own sweep found can be alive with neither a lease nor
         a PTR record to its name."""
-        like = f"%{query}%"
+        like = like_contains(query)
         mac_sql, mac_params = self._mac_clause("h.mac", query)
         with self._lock:
             return self._conn.execute(
                 "SELECT h.*, s.cidr AS subnet_cidr FROM hosts h"
                 " LEFT JOIN subnets s ON s.id = h.subnet_id"
-                f" WHERE h.ip LIKE ?{mac_sql}"
+                f" WHERE h.ip LIKE ? {LIKE_ESCAPE}{mac_sql}"
                 " ORDER BY h.ip LIMIT ?",
                 (like, *mac_params, limit)).fetchall()
 
@@ -820,19 +821,21 @@ class IpamDatabase(SqliteStore):
         for the rows the reduced clause cannot describe. Only for those —
         a needle that does read as hex stays under MAC_SEARCH_MIN_DIGITS'
         floor, which a verbatim `LIKE '%ab%'` would have gone around."""
-        like = f"%{query}%"
+        like = like_contains(query)
         mac_sql, mac_params = self._mac_clause("l.mac", query)
         if not mac_search_digits(query):
-            mac_sql, mac_params = " OR l.mac LIKE ?", [like]
+            mac_sql, mac_params = f" OR l.mac LIKE ? {LIKE_ESCAPE}", [like]
         with self._lock:
             return self._conn.execute(
                 "SELECT l.*, s.label AS server_label FROM dhcp_leases l"
                 " JOIN dhcp_servers s ON s.id = l.server_id"
-                " WHERE l.ip LIKE ? OR l.hostname LIKE ?"
-                f"    OR l.description LIKE ?{mac_sql}"
-                " ORDER BY (l.hostname LIKE ?) DESC, l.ip"
+                f" WHERE l.ip LIKE ? {LIKE_ESCAPE}"
+                f"    OR l.hostname LIKE ? {LIKE_ESCAPE}"
+                f"    OR l.description LIKE ? {LIKE_ESCAPE}{mac_sql}"
+                f" ORDER BY (l.hostname LIKE ? {LIKE_ESCAPE}) DESC, l.ip"
                 " LIMIT ?",
-                (like, like, like, *mac_params, f"{query}%", limit)).fetchall()
+                (like, like, like, *mac_params,
+                 like_prefix(query), limit)).fetchall()
 
     def dhcp_leases_for_mac(self, mac: str, limit: int = 50) -> list[sqlite3.Row]:
         """Every lease and reservation held by one MAC, across every server,

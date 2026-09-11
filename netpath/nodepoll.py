@@ -1553,6 +1553,12 @@ class NodePoller(Worker):
         # test_scheduler pins a steady pass at five SQL statements and
         # asserts it never reads the settings table.
         self._autoscale = {"auto": False, "min": 1, "max": 1, "headroom": 1.5}
+        # The two walk limits, cached the same way and for the same reason:
+        # a full poll of a switch makes about thirty column walks and each
+        # read the settings table twice, on the shared nodes-db lock, for
+        # constants. None until start()/reconfigure() has run, so a poller
+        # driven directly (a script, a test) still reads the live value.
+        self._walk_settings: dict | None = None
         self._manual_workers = 16
         # None = no ceiling computed yet, which is what _note_saturation
         # reads to behave exactly as it did before autoscaling existed.
@@ -1675,6 +1681,22 @@ class NodePoller(Worker):
         self._autoscale_ceiling = ceiling if self._autoscale["auto"] else None
         self._manual_workers = max(1, min(cap, int(
             settings.get("poll_workers", 16) or 1)))
+        self._walk_settings = {
+            "max_rows": int(settings.get("snmp_walk_max_rows", 16384) or 16384),
+            "max_repetitions": int(
+                settings.get("snmp_bulk_max_repetitions", 40) or 0),
+        }
+
+    def _walk_limits(self) -> tuple[int, int]:
+        """(snmp_walk_max_rows, snmp_bulk_max_repetitions) for a walk about
+        to start — from the cache _read_pool_settings fills, or from the
+        settings table when there is none yet."""
+        cached = self._walk_settings
+        if cached is not None:
+            return cached["max_rows"], cached["max_repetitions"]
+        settings = self.db.settings()
+        return (int(settings.get("snmp_walk_max_rows", 16384) or 16384),
+                int(settings.get("snmp_bulk_max_repetitions", 40) or 0))
 
     def _mac_walk_workers(self, settings: dict) -> int:
         return max(1, min(32, int(settings.get("mac_walk_workers",
@@ -2894,6 +2916,18 @@ class NodePoller(Worker):
             except SnmpError as exc:
                 snmp_ok = False
                 snmp_error = str(exc)
+                self._bump("errors")
+            except ValueError as exc:
+                # An OID this poll was configured with cannot be encoded --
+                # a MIB object or an override carrying an arc that is not a
+                # non-negative integer, refused by enc_oid. A ValueError is
+                # not an SnmpError, so without this arm it escaped to
+                # _run_one, record_poll never ran, and the device's status,
+                # last_poll_ts and snmp_error froze for good while one
+                # ERROR line per interval filled the event log.
+                snmp_ok = False
+                snmp_error = (f"an OID configured for this device is not a "
+                              f"valid object identifier: {exc}")
                 self._bump("errors")
 
         # -------------------------------------------------------- status
@@ -4387,6 +4421,13 @@ class NodePoller(Worker):
     # own poll interval, with a floor so a 3-second focus poll still reads.
     _INTERFACE_BUDGET_FRACTION = 0.5
     _INTERFACE_BUDGET_FLOOR_S = 3.0
+    # The same shape for a column walk that was given no deadline of its
+    # own, and a ceiling on what one walk may retain: 16,384 rows of MAC
+    # addresses is well under a megabyte, while 16,384 rows of 64 KB octet
+    # strings is three gigabytes on one poll worker.
+    _WALK_BUDGET_FRACTION = 0.5
+    _WALK_BUDGET_FLOOR_S = 10.0
+    _WALK_MAX_BYTES = 4 * 1024 * 1024
     _INTERFACE_GIVE_UP_TIMEOUTS = 3
     _MAX_INTERFACES = 512
 
@@ -4667,8 +4708,15 @@ class NodePoller(Worker):
         with that status named in the reason. It used to fall through to
         the non-increasing-OID guard and end the walk with nothing said at
         all, which is a device reading healthy with zero interfaces. Stops
-        at the subtree end or `settings["snmp_walk_max_rows"]` (logged
-        once, not per row).
+        at the subtree end, at `settings["snmp_walk_max_rows"]`, or at
+        _WALK_MAX_BYTES of retained values (either cap logged once, not per
+        row) — the row cap alone does not bound memory, since one row can
+        carry a 64 KB octet string that renders three bytes of `str` per
+        wire byte. A caller that passes no `deadline` gets one derived
+        from the device's own poll interval, the way _poll_interfaces
+        derives its interface budget: without it an agent answering each
+        GETBULK just inside its timeout can hold a poll worker for twenty
+        minutes on one walk.
 
         A mid-walk SnmpTimeout means the device stopped answering, not that
         the table ended, so a caller whose result drives the device's own
@@ -4680,8 +4728,11 @@ class NodePoller(Worker):
         undecodable, wrong request id) are a different fault from no reply
         at all, and only one of them is a firewall.
         """
-        settings = self.db.settings()
-        max_rows = int(settings.get("snmp_walk_max_rows", 16384) or 16384)
+        max_rows = self._walk_limits()[0]
+        if deadline is None:
+            interval = float(config.get("poll_interval_s") or 120)
+            deadline = time.time() + max(self._WALK_BUDGET_FLOOR_S,
+                                         self._WALK_BUDGET_FRACTION * interval)
         # GETBULK does not exist in v1, so whether to use it is decided on
         # the configured version with 0 (v1) the only value that says no —
         # an absent version means v2c, the same default `_walk_request`,
@@ -4693,16 +4744,17 @@ class NodePoller(Worker):
 
         values: dict[str, object] = {}
         current = base_oid
-        hit_cap = False
+        hit_cap = ""
+        retained = 0
         complete = True
         reason = ""
         session = self._session_for(device, config)
         try:
             while True:
                 if len(values) >= max_rows:
-                    hit_cap = True
+                    hit_cap = f"stopped at the {max_rows}-row cap"
                     complete = False
-                    reason = f"stopped at the {max_rows}-row cap"
+                    reason = hit_cap
                     break
                 if deadline is not None and time.time() > deadline:
                     # The caller's own wall-clock budget. Checked inside
@@ -4763,11 +4815,19 @@ class NodePoller(Worker):
                         stop = True
                         break
                     values[oid[len(base_oid) + 1:]] = vb["value"]
+                    retained += len(str(vb["value"]))
                     current = oid
                     if len(values) >= max_rows:
-                        hit_cap = True
+                        hit_cap = f"stopped at the {max_rows}-row cap"
                         complete = False
-                        reason = f"stopped at the {max_rows}-row cap"
+                        reason = hit_cap
+                        stop = True
+                        break
+                    if retained >= self._WALK_MAX_BYTES:
+                        hit_cap = (f"stopped at the {self._WALK_MAX_BYTES}-byte "
+                                   f"cap after {len(values)} row(s)")
+                        complete = False
+                        reason = hit_cap
                         stop = True
                         break
                 if stop:
@@ -4777,8 +4837,8 @@ class NodePoller(Worker):
         finally:
             session.close()
         if hit_cap:
-            self.log.add(NODES, f"Table walk of {base_oid} on {device['ip']} "
-                                f"stopped at the {max_rows}-row cap",
+            self.log.add(NODES, f"Table walk of {base_oid} on "
+                                f"{device['ip']} {hit_cap}",
                          target=device["ip"])
         return values, complete, reason
 
@@ -4924,10 +4984,35 @@ class NodePoller(Worker):
         SAME scale and precision as the entity's reading, and a second copy
         of three lines of exponent arithmetic is how the two would drift a
         factor of a thousand apart without anything looking wrong.
+
+        Both come off the wire, and both are exponents: a device answering
+        entPhySensorScale = 2147483647 (a legal Integer32) would have
+        CPython build a multi-billion-digit integer and never return, on a
+        poll worker or on the HTTP thread behind read_dom. RFC 3433 gives
+        entitySensorDataScale nine legal values and entitySensorPrecision
+        the range -8..9; anything outside either is not a reading this
+        function can honour, so it is read at the MIB's own default
+        (units, no folded decimals) rather than multiplied out.
         """
         scale = int(scale or 9)             # 9 = units (10^0)
-        precision = int(precision or 0)
+        if not (NodePoller._SENSOR_SCALE_MIN <= scale
+                <= NodePoller._SENSOR_SCALE_MAX):
+            scale = 9
+        precision = NodePoller._sensor_precision(precision)
         return raw * (10 ** (3 * (scale - 9))) / (10 ** precision)
+
+    # RFC 3433's own ranges for entitySensorDataScale and
+    # entitySensorPrecision.
+    _SENSOR_SCALE_MIN, _SENSOR_SCALE_MAX = 1, 9
+    _SENSOR_PRECISION_MIN, _SENSOR_PRECISION_MAX = -8, 9
+
+    @staticmethod
+    def _sensor_precision(precision) -> int:
+        value = int(precision or 0)
+        if not (NodePoller._SENSOR_PRECISION_MIN <= value
+                <= NodePoller._SENSOR_PRECISION_MAX):
+            return 0
+        return value
 
     def _decode_entity_sensor(self, suffix: str, raw, types: dict, scales: dict,
                               precisions: dict, statuses: dict, units: dict,
@@ -4950,7 +5035,7 @@ class NodePoller(Worker):
         except ValueError:
             return None
         sensor_type = int(types.get(suffix) or 0)
-        precision = int(precisions.get(suffix) or 0)
+        precision = self._sensor_precision(precisions.get(suffix))
         value = self._scaled_sensor_value(
             raw, scales.get(suffix), precisions.get(suffix))
         unit = str(units.get(suffix) or "").strip() or \
@@ -7205,7 +7290,11 @@ class NodePoller(Worker):
         if not config.get("snmp_enabled", True):
             return None
         base = (base_oid or "").strip().strip(".")
-        if not base or not all(part.isdigit() for part in base.split(".")):
+        # isascii() as well: str.isdigit() accepts superscript and
+        # Arabic-Indic digits that int() -- and so the BER encoder -- does
+        # not. See nodeoids.normalize_oid.
+        if not base or not all(part.isascii() and part.isdigit()
+                               for part in base.split(".")):
             raise ValueError("An OID must be numeric, like 1.3.6.1.2.1.1")
 
         max_rows = int(max_rows or self._BROWSE_MAX_ROWS)
@@ -7229,8 +7318,7 @@ class NodePoller(Worker):
         round trip per walk against exactly the devices least able to
         afford one.
         """
-        settings = self.db.settings()
-        configured = int(settings.get("snmp_bulk_max_repetitions", 40) or 0)
+        configured = self._walk_limits()[1]
         raw_version = config.get("snmp_version")
         is_v1 = raw_version is not None and int(raw_version) == 0
         if is_v1 or configured <= 0:
@@ -7262,6 +7350,7 @@ class NodePoller(Worker):
         """
         deadline = time.time() + budget_s
         rows: list[dict] = []
+        retained = 0
         stopped = "end of subtree"
         current = base
         use_bulk, repetitions = self._bulk_settings(device, config)
@@ -7273,6 +7362,10 @@ class NodePoller(Worker):
                     break
                 if len(rows) >= max_rows:
                     stopped = f"stopped at the {max_rows}-row limit"
+                    break
+                if retained >= self._WALK_MAX_BYTES:
+                    stopped = (f"stopped at the {self._WALK_MAX_BYTES}-byte "
+                               f"limit after {len(rows)} row(s)")
                     break
                 if time.time() > deadline:
                     stopped = f"stopped after {budget_s:.0f}s"
@@ -7332,11 +7425,20 @@ class NodePoller(Worker):
                     row = {"oid": oid, "type": vb["type"],
                            "value": vb["value"], "text": vb.get("text")}
                     rows.append(row)
+                    retained += len(str(vb["value"]))
                     if on_row is not None:
                         on_row(row)
                     current = oid
                     if len(rows) >= max_rows:
                         stopped = f"stopped at the {max_rows}-row limit"
+                        done = True
+                        break
+                    if retained >= self._WALK_MAX_BYTES:
+                        # A row count alone does not bound what a walk
+                        # holds: an agent answering 64 KB octet strings
+                        # fills memory long before the row limit.
+                        stopped = (f"stopped at the {self._WALK_MAX_BYTES}-byte "
+                                   f"limit after {len(rows)} row(s)")
                         done = True
                         break
                 if done:

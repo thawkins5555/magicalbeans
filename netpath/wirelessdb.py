@@ -173,7 +173,7 @@ class WirelessDatabase(SqliteStore):
             self._conn.execute(
                 "UPDATE controllers SET v3_auth_pass_enc = ? WHERE id = ?",
                 (password_enc, controller_id))
-            self._conn.commit()
+            self._commit_durable()
 
     def record_poll(self, controller_id: int, ok: bool, error: str = "") -> None:
         with self._lock:

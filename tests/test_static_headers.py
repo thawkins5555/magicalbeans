@@ -9,6 +9,7 @@ import gzip
 import http.client
 import json
 import os
+import socket
 import sys
 
 from _paths import free_tcp_port, tmpdir
@@ -43,6 +44,30 @@ def request(method, path, headers=None, body=None):
     hdrs = {k.lower(): v for k, v in resp.getheaders()}
     conn.close()
     return resp.status, hdrs, raw
+
+
+def raw_exchange(request_bytes, timeout=5.0):
+    """Send bytes exactly as given — no client library to normalise them —
+    and return everything the server writes back before it goes quiet."""
+    sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        sock.sendall(request_bytes)
+        chunks = []
+        while True:
+            try:
+                piece = sock.recv(65536)
+            except (socket.timeout, TimeoutError, OSError):
+                break
+            if not piece:
+                break
+            chunks.append(piece)
+        return b"".join(chunks)
+    finally:
+        sock.close()
+
+
+def status_lines(reply):
+    return [line for line in reply.split(b"\r\n") if line.startswith(b"HTTP/")]
 
 
 def check(label, condition, detail=""):
@@ -250,6 +275,65 @@ try:
         check(f"{path} refused", status in (404, 400), status)
     status, _, _ = request("GET", "/vendor/xterm.css", auth)
     check("a real vendor file is served", status == 200, status)
+
+    # ------------------------------------------------------ message framing
+    # Content-Length is the only framing this server accepts, so it is parsed
+    # in one place and strictly: a negative length reached read(-1) — a read
+    # to EOF, unauthenticated and uncapped — and two disagreeing values are a
+    # request-smuggling differential against any front end that picks the
+    # other one.
+    print("content-length framing")
+    body = json.dumps({"username": "x", "password": "y"}).encode()
+    reply = raw_exchange(
+        b"POST /api/login HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        b"Content-Type: application/json\r\nContent-Length: -1\r\n\r\n"
+        + b"A" * 4096)
+    check("a negative Content-Length is refused, not read to EOF",
+          len(status_lines(reply)) == 1 and b" 400 " in reply.split(b"\r\n")[0],
+          reply[:80])
+
+    # The same header with a content type that is refused BEFORE the handler:
+    # the refusal must not leave the "body" in the socket for the next parse.
+    reply = raw_exchange(
+        b"POST /api/login HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        b"Content-Type: text/plain\r\nContent-Length: -1\r\n\r\n"
+        b"GET /login HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+    check("…and the refusal answers once, not once per smuggled request",
+          len(status_lines(reply)) == 1, status_lines(reply))
+
+    reply = raw_exchange(
+        b"POST /api/login HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: %d\r\nContent-Length: 5\r\n\r\n" % len(body)
+        + body + b"GET /login HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+    first = reply.split(b"\r\n")[0]
+    check("two disagreeing Content-Length values are refused",
+          len(status_lines(reply)) == 1
+          and (b" 400 " in first or b" 411 " in first), reply[:80])
+
+    reply = raw_exchange(
+        b"POST /api/login HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        b"Content-Type: application/json\r\nContent-Length: 3_1\r\n\r\n"
+        + body)
+    check("a Content-Length that is not plain decimal digits is refused",
+          b" 400 " in reply.split(b"\r\n")[0], reply[:80])
+
+    # Two identical values are one length, and a body that measures up is
+    # still served — the strictness must not cost a conforming client.
+    status, _h, _b = request("POST", "/api/login",
+                             {"Content-Type": "application/json"}, body)
+    check("a well-formed sign-in attempt still reaches the handler",
+          status in (401, 429), status)
+
+    # ------------------------------------------------------ static latency
+    # Static responses match no route pattern, so they used to be filed under
+    # `<unrouted>` together with every 404 from a port scanner.
+    print("debug route table")
+    request("GET", "/app.css", auth)
+    debug = json.loads(request("GET", "/api/debug", auth)[2])
+    routes = debug.get("routes") or {}
+    check("static responses get their own key in the route latency table",
+          "GET <static>" in routes, sorted(routes)[:8])
 
     print("FAILED: " + ", ".join(failures) if failures else "ALL STATIC HANDLER ASSERTIONS PASSED")
 finally:

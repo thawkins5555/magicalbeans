@@ -15,7 +15,7 @@ import time
 import zlib
 
 from . import configrx_redact
-from .sqlitebase import SqliteStore, reclaim
+from .sqlitebase import SqliteStore, id_chunks, reclaim
 
 # RETURNING (SQLite 3.35) is what makes the targeted FTS delete in
 # _delete_search_lines possible instead of a whole-index rebuild.
@@ -328,7 +328,7 @@ class ConfigRxDatabase(SqliteStore):
                     "UPDATE device_config SET ssh_username = ?, ssh_password_enc = ?,"
                     " enable_secret_enc = ? WHERE device_id = ?",
                     (username, password_enc, enable_secret_enc, device_id))
-            self._conn.commit()
+            self._commit_durable()
 
     def clear_credential(self, device_id: int) -> None:
         """Both stored secrets, not just the password.
@@ -358,7 +358,7 @@ class ConfigRxDatabase(SqliteStore):
             self._conn.execute(
                 "UPDATE device_config SET enable_secret_enc = ? WHERE device_id = ?",
                 (enable_secret_enc, device_id))
-            self._conn.commit()
+            self._commit_durable()
 
     def clear_enable_secret(self, device_id: int) -> None:
         self.set_enable_secret(device_id, None)
@@ -562,12 +562,15 @@ class ConfigRxDatabase(SqliteStore):
         """The bulk form, one statement rather than one per id."""
         if not backup_ids:
             return 0
-        marks = ",".join("?" * len(backup_ids))
+        removed = 0
         with self._lock:
-            cur = self._conn.execute(
-                f"DELETE FROM backups WHERE id IN ({marks})", backup_ids)
+            for chunk in id_chunks(backup_ids):
+                marks = ",".join("?" * len(chunk))
+                cur = self._conn.execute(
+                    f"DELETE FROM backups WHERE id IN ({marks})", chunk)
+                removed += cur.rowcount or 0
             self._conn.commit()
-            return cur.rowcount or 0
+            return removed
 
     def prune(self, retention_days: float, retention_count_per_device: int) -> int:
         """retention_days=0 deletes every backup regardless of age;
@@ -585,10 +588,10 @@ class ConfigRxDatabase(SqliteStore):
                         "SELECT id FROM backups WHERE device_id = ? ORDER BY ts DESC",
                         (device_id,))]
                     stale = ids[retention_count_per_device:]
-                    if stale:
-                        marks = ",".join("?" * len(stale))
+                    for chunk in id_chunks(stale):
+                        marks = ",".join("?" * len(chunk))
                         cur = self._conn.execute(
-                            f"DELETE FROM backups WHERE id IN ({marks})", stale)
+                            f"DELETE FROM backups WHERE id IN ({marks})", chunk)
                         removed += cur.rowcount or 0
             self._conn.commit()
         # Reclaim after the lock, in steps.

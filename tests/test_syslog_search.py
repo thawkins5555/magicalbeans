@@ -9,6 +9,7 @@ from _paths import spawn_stub, tmpdir  # noqa: F401  (repo root on sys.path)
 
 TMP = tmpdir("syslog_search_")
 
+from netpath.sqlitebase import LIKE_ESCAPE
 from netpath.syslogdb import SyslogDatabase
 from netpath.syslogparse import LogEntry
 
@@ -170,7 +171,8 @@ try:
     check("no host_ips: the WHERE is byte-identical to the plain host clause",
           db._where(*WIN, {"host": "x", "host_ips": []}) == where_plain
           and db._where(*WIN, {"host": "x", "host_ips": None}) == where_plain
-          and where_plain[0] == "l.ts >= ? AND l.ts <= ? AND l.host LIKE ?",
+          and where_plain[0] == ("l.ts >= ? AND l.ts <= ? AND l.host LIKE ? "
+                                 + LIKE_ESCAPE),
           where_plain)
 
     # 601 IPs -> two IN chunks. The match lives in the second chunk, and the
@@ -183,7 +185,8 @@ try:
           hosts(wide))
     sql, params = db._where(*WIN, wide)
     check("chunks are OR-ed inside the host parenthesis, under the time AND",
-          sql.startswith("l.ts >= ? AND l.ts <= ? AND (l.host LIKE ? OR l.source IN (")
+          sql.startswith("l.ts >= ? AND l.ts <= ? AND (l.host LIKE ? "
+                         + LIKE_ESCAPE + " OR l.source IN (")
           and sql.count(" OR l.source IN (") == 2 and sql.endswith("))")
           and len(params) == 2 + 1 + 602, sql[:120])
     check("the histogram takes the same widened clause",
@@ -192,6 +195,43 @@ try:
     check("...and the out-of-window row stays out of the histogram",
           sum(b["total"] for b in db.histogram(T - 200, T - 50, 3600, wide)) == 1,
           db.histogram(T - 200, T - 50, 3600, wide))
+finally:
+    db.close()
+
+
+# ------------------ 4. `_` and `%` typed into the syslog filter boxes
+#
+# Both are LIKE wildcards. Without the escape, host "core_sw" also matched
+# "core-sw" and a bare "%" in any box matched every line.
+
+db = SyslogDatabase(os.path.join(TMP, "syslog_literal.db"))
+try:
+    T = 1_700_200_000.0
+    WIN = (T - 60, T + 60)
+    db.insert([
+        LogEntry(ts=T, source="10.1.0.1", host="core-sw-1", severity=6,
+                 app="bgp", message="neighbour up", raw=""),
+        LogEntry(ts=T + 1, source="10.1.0.2", host="core_sw_2", severity=6,
+                 app="bgp_v2", message="neighbour down 50% loss", raw=""),
+    ])
+
+    def found(filters):
+        return sorted(r["host"] for r in db.search(*WIN, filters))
+
+    check("an underscore in the host box is an underscore",
+          found({"host": "core_sw"}) == ["core_sw_2"], found({"host": "core_sw"}))
+    check("a per-cent sign in the host box is not 'every host'",
+          found({"host": "%"}) == [], found({"host": "%"}))
+    check("the app box takes its text literally too",
+          found({"app": "bgp_"}) == ["core_sw_2"], found({"app": "bgp_"}))
+    check("and the source box",
+          found({"source": "10.1.0._"}) == [], found({"source": "10.1.0._"}))
+    # The free-text scan path, which is what a term under three characters
+    # or an un-indexed store falls back to.
+    scan, params = db._scan_clause("50%")
+    check("the free-text scan clause escapes every column it searches",
+          scan.count(LIKE_ESCAPE) == len(db.SCAN_COLUMNS)
+          and params == ["%50\\%%"] * len(db.SCAN_COLUMNS), (scan, params))
 finally:
     db.close()
 
