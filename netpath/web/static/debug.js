@@ -26,6 +26,7 @@
 
   const view = {
     seq: 0, events: [], paused: false, selected: null, targets: new Set(),
+    epoch: null, capacity: 3000,
     // The seq of the last row painted, so an ordinary poll appends only
     // what arrived instead of rebuilding two thousand rows.
     drawnSeq: null,
@@ -411,6 +412,24 @@
   async function refresh() {
     if (App.state.tab !== 'debug') return;
     const payload = await App.get('/api/debug', { since: view.seq });
+    /* The server restarted: seq counts from 0 again, so this cursor asks
+       for events that will not exist for hours and the page goes quiet —
+       which is what "the log cleared itself" actually was. The refetch asks
+       since=0, so it cannot re-trigger. A Clear leaves _seq running and is
+       therefore not read as a restart. */
+    if ((view.epoch !== null && payload.log_epoch !== view.epoch)
+        || payload.last_seq < view.seq) {
+      view.seq = 0;
+      view.events = [];
+      view.selected = null;
+      view.drawnSeq = null;
+      view.targets.clear();
+      App.el('dbg-target').innerHTML = '<option value="">All destinations</option>';
+      view.epoch = payload.log_epoch;
+      return refresh();
+    }
+    view.epoch = payload.log_epoch;
+    view.capacity = payload.capacity || view.capacity;
     drawWorkers(payload.workers);
     drawDnsWorkers(payload.dns_workers || []);
     drawIpamWorkers(payload.ipam_workers || []);
@@ -457,7 +476,9 @@
     if (!view.paused && payload.events.length) {
       view.seq = payload.last_seq;
       view.events.push(...payload.events);
-      if (view.events.length > 3000) view.events.splice(0, view.events.length - 3000);
+      if (view.events.length > view.capacity) {
+        view.events.splice(0, view.events.length - view.capacity);
+      }
 
       const select = App.el('dbg-target');
       for (const name of payload.targets) {

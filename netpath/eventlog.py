@@ -32,8 +32,11 @@ CATEGORIES = [TRACE, DNS, NETFLOW, SNMP, NODES, ALERTS, IPAM, WIRELESS,
 DETAIL_LIMIT = 6000
 MESSAGE_LIMIT = 512
 
+# The default ring, overridable per install by `debug_log_capacity`.
+DEFAULT_CAPACITY = 10000
+
 # How many distinct targets the filter drop-down remembers. The events
-# themselves are capped at `capacity` (3,000), but the set of targets seen
+# themselves are capped at `capacity`, but the set of targets seen
 # was not capped, pruned, or cleared: the resolver adds one per address it
 # looks up, the SSH terminal one per device, ConfigRX one per device, and
 # the trap and syslog paths one per source -- so on a fleet that also
@@ -60,10 +63,14 @@ class Event:
 
 
 class EventLog:
-    def __init__(self, capacity: int = 3000, target_limit: int = TARGET_LIMIT):
+    def __init__(self, capacity: int = DEFAULT_CAPACITY,
+                 target_limit: int = TARGET_LIMIT):
         self._lock = threading.Lock()
-        self._events: deque[Event] = deque(maxlen=capacity)
+        self._events: deque[Event] = deque(maxlen=max(1, int(capacity)))
         self._seq = 0
+        # Identifies this process's log: seq restarts at 0 on every start,
+        # so a reader's cursor is only meaningful within one epoch.
+        self.epoch = time.time()
         # An OrderedDict used as an LRU set: re-seeing a target moves it to
         # the end, so what falls off the front is genuinely the least
         # recently mentioned. `_sorted_targets` caches what targets() hands
@@ -105,9 +112,28 @@ class EventLog:
         with self._lock:
             return [event for event in self._events if event.seq > seq]
 
+    def since_with_seq(self, seq: int) -> tuple[list[Event], int]:
+        """One snapshot. Read under two lock holds, an event landing between
+        them is absent from the batch and already behind the cursor."""
+        with self._lock:
+            return ([event for event in self._events if event.seq > seq],
+                    self._seq)
+
     def all(self) -> list[Event]:
         with self._lock:
             return list(self._events)
+
+    def set_capacity(self, n: int) -> None:
+        n = max(1, int(n))
+        with self._lock:
+            if self._events.maxlen == n:
+                return
+            # maxlen keeps the LAST n, so a shrink drops the oldest.
+            self._events = deque(self._events, maxlen=n)
+
+    @property
+    def capacity(self) -> int:
+        return self._events.maxlen
 
     @property
     def last_seq(self) -> int:
@@ -136,11 +162,23 @@ class NullLog:
     def add(self, *args, **kwargs) -> None:
         return None
 
+    epoch = 0.0
+
     def since(self, seq: int) -> list:
         return []
 
+    def since_with_seq(self, seq: int) -> tuple:
+        return ([], 0)
+
     def all(self) -> list:
         return []
+
+    def set_capacity(self, n: int) -> None:
+        return None
+
+    @property
+    def capacity(self) -> int:
+        return 0
 
     @property
     def last_seq(self) -> int:

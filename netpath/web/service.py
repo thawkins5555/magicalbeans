@@ -24,7 +24,7 @@ from ..collector import Collector
 from ..configrx import ConfigRxWorker
 from ..configrxdb import ConfigRxDatabase
 from ..db import Database, FORCED_PRUNE_BUDGET_S, TRIM_BUDGET_S
-from ..eventlog import ERROR, NODES, SYSTEM, EventLog
+from ..eventlog import DEFAULT_CAPACITY, ERROR, NODES, SYSTEM, EventLog
 from ..flowdb import ROLLUP_TIERS, FlowDatabase
 from ..fortipoll import WirelessPoller
 from .. import ipam_scan
@@ -358,6 +358,7 @@ class Service:
                  nodes_db_path: str, alerts_db_path: str,
                  wireless_db_path: str, configrx_db_path: str):
         self.log = EventLog()
+        self.log.add(SYSTEM, "Event log started")
         self.app_db = AppDatabase(app_db_path)
         # Before the trace database is opened for normal use: on an install
         # that predates app.db this lifts the settings, accounts and name cache
@@ -393,6 +394,8 @@ class Service:
         # Global keys and NetPath keys, merged for reading. Each store filters
         # this dict down to what it owns when it is written back.
         self.settings = {**self.app_db.settings(), **self.db.settings()}
+        self.log.set_capacity(
+            int(self.settings.get("debug_log_capacity", DEFAULT_CAPACITY)))
         self.flow_settings = self.flow_db.settings()
         self.syslog_settings = self.syslog_db.settings()
         self.ipam_settings = self.ipam_db.settings()
@@ -931,6 +934,8 @@ class Service:
             self.asn_resolver.start()
         else:
             self.asn_resolver.stop()
+        self.log.set_capacity(
+            int(self.settings.get("debug_log_capacity", DEFAULT_CAPACITY)))
         self.log.add(SYSTEM, "Global settings applied")
         # Asked for, not run here: this is an HTTP thread, and the sweep it
         # wants is the whole 13-store prune and trim.

@@ -1822,10 +1822,12 @@ def get_debug(service, params, body) -> dict:
     # category is filtered by the module it belongs to.
     visible = {category for category, module in _EVENT_CATEGORY_MODULE.items()
                if _permissions.allows(granted.get(module), _permissions.READ)}
+    # One lock hold for the batch and the cursor that goes with it.
+    raw, last_seq = service.log.since_with_seq(since)
     events = [
         {"seq": e.seq, "ts": e.ts, "clock": e.clock, "category": e.category,
          "target": e.target, "message": e.message, "detail": e.detail}
-        for e in service.log.since(since) if e.category in visible
+        for e in raw if e.category in visible
     ]
 
     # One row per address currently out for a reverse lookup. Under
@@ -1911,8 +1913,12 @@ def get_debug(service, params, body) -> dict:
         "node_counters": service.node_poller.counters if see_nodes else {},
         "discovery_scans": discovery_scans,
         "events": events,
-        "last_seq": service.log.last_seq,
-        "targets": sorted({e["target"] for e in events if e["target"]}),
+        "last_seq": last_seq,
+        "log_epoch": service.log.epoch,
+        "capacity": service.log.capacity,
+        # A full load gets every target the log knows; a delta stays a delta.
+        "targets": (service.log.targets() if since == 0
+                    else sorted({e["target"] for e in events if e["target"]})),
         # Every read in this application takes its store's write lock, so
         # `wait_s` here is time the web tier spent queued behind the poller
         # and the collectors on a file WAL would have let it read anyway.
@@ -2055,6 +2061,7 @@ _GLOBAL_SETTINGS_RANGES = {
     "configrx_refresh_s": (1, 3600),
     "dashboard_refresh_s": (1, 3600),
     "debug_refresh_s": (1, 60),
+    "debug_log_capacity": (1000, 50000),
     "max_trace_db_mb": (16, None),
     # The age cap beside the size cap. The maintenance pass calls prune()
     # every interval, so a 0 posted straight to the API (the Settings page's

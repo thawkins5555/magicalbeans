@@ -23,6 +23,7 @@
     ['syslog_refresh_s', 'set-refresh-syslog', 'num'],
     ['ipam_refresh_s', 'set-refresh-ipam', 'num'],
     ['debug_refresh_s', 'set-refresh-debug', 'num'],
+    ['debug_log_capacity', 'set-debug-capacity', 'num'],
     ['dashboard_refresh_s', 'set-refresh-dashboard', 'num'],
     ['wireless_refresh_s', 'set-refresh-wireless', 'num'],
     ['configrx_refresh_s', 'set-refresh-configrx', 'num'],
@@ -68,6 +69,7 @@
     App.el('set-refresh-syslog').value = s.syslog_refresh_s;
     App.el('set-refresh-ipam').value = s.ipam_refresh_s;
     App.el('set-refresh-debug').value = s.debug_refresh_s;
+    App.el('set-debug-capacity').value = s.debug_log_capacity ?? 10000;
     App.el('set-refresh-dashboard').value = s.dashboard_refresh_s ?? 5;
     App.el('set-refresh-wireless').value = s.wireless_refresh_s ?? 2;
     App.el('set-refresh-configrx').value = s.configrx_refresh_s ?? 2;
@@ -1325,7 +1327,10 @@
       rate costs nothing and saves a lot of work.</p>
       <p>The Debug page's elapsed counters advance smoothly ten times a second without
       asking the server again, so its rate only controls how often new events and
-      worker state are fetched.</p>` },
+      worker state are fetched.</p>
+      <p>The event log itself lives in memory on the server and keeps the most recent
+      events up to the count set here; a large fleet writes fast enough that a small
+      buffer covers only minutes, and the count applies the moment it is saved.</p>` },
     'settings.data.appfile': { title: 'The application data file', html: `
       <p>Holds settings, accounts, and the shared reverse-DNS and ASN caches — one row
       per address rather than one row per event, so it stays small on its own; those

@@ -202,6 +202,8 @@ GLOBAL_DEFAULTS = {
     "wireless_refresh_s": 15,
     "configrx_refresh_s": 15,
     "debug_refresh_s": 1,
+    # Events the in-memory debug log keeps; not a disk cap.
+    "debug_log_capacity": 10000,
     "web_host": "0.0.0.0",
     "web_port": 8443,
     "web_cert": "",

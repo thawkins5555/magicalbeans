@@ -2620,6 +2620,24 @@ check("(reverse DNS)" in _NB52 and "r.resolved_source === 'dns'" in _NB52,
 check("'(not in Nodes)'" in _NB52 or "(not in Nodes)" in _NB52,
       "...while still saying plainly that the neighbour is not a Nodes device")
 
+# --- 53. 5.11.0: the Debug log resyncs itself after a server restart ---------
+# "The event log randomly clears" was the page holding a cursor from the
+# previous process: seq restarts at 0, so since=<old seq> matched nothing
+# ever again. These four lines are the resync and the capacity that replaced
+# the hardcoded ring; each was a one-line omission that produced the bug.
+DEBUG52 = read("debug.js")
+check("payload.last_seq < view.seq" in DEBUG52,
+      "debug.js notices the server's cursor has gone backwards (a restart) "
+      "rather than polling a seq the new log will not reach for hours")
+check("payload.log_epoch !== view.epoch" in DEBUG52,
+      "...and notices a different process's log even when the seq happens to "
+      "have caught up")
+check("view.events.length - view.capacity" in DEBUG52,
+      "the in-memory trim follows the server's capacity instead of a "
+      "hardcoded 3000")
+check("const EVENT_ROW_CAP = 2000;" in DEBUG52,
+      "...while the DOM row bound stays its own, separate number")
+
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

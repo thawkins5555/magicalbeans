@@ -81,6 +81,13 @@ for key in sorted(keys):
         missing.append(key)
 check(not missing, "every refresh rate has an input (missing: %s)" % (missing or "none"))
 check('id="set-refresh-debug" min="1"' in INDEX, "the Debug rate input cannot ask for a fraction the floor ignores")
+# The event log's depth sits in the same fieldset as the rate: how often the
+# page asks and how much there is to ask for are one operator decision.
+check('id="set-debug-capacity" min="1000"' in INDEX,
+      "the Debug log depth has an input, floored where the API floors it")
+check("['debug_log_capacity', 'set-debug-capacity', 'num']" in read("settings.js"),
+      "...and settings.js round-trips it, so Apply/Revert and the range check "
+      "all see it")
 
 # --------------------------------------------------------------------------
 # 4. One noun per module: status fallback, toggle pair, and the Dashboard.
