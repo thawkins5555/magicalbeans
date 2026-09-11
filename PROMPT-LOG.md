@@ -122,3 +122,23 @@ review, because one review and one push happen at end of day.
 **"Try again"** — after the development model hit a session limit and four
 parallel streams died mid-flight.
 → Resumed all four from where they stopped rather than restarting.
+
+## 5.9.1 — In-depth code review
+
+**"Plan with Fable and deploy with up to 5 Opus agents ... An in-depth code
+review of the application paying special attention to performance, security,
+design quality and maintainability."** — with the standing constraints restated:
+comments only where necessary (prose 10% or less), remove nothing without
+permission, no push to `main` and no review of the diff (both happen at end of
+day), one full test-suite pass at the end, and this log kept per prompt.
+→ Branch restarted from `origin/main` (5.9.0), since the designated branch's
+history was already wholly inside `main`. Planning questions asked before any
+agent was started; see the answers recorded below.
+
+**Planning answers** — deliver a report *and* fix confirmed defects (larger
+design items become proposals); the report is `CODE-REVIEW.md` in the repo
+root; fixes ship as 5.9.1; scope is everything under `netpath/` (backend and
+frontend, vendored xterm excluded), with `demo/` and the test harness out of
+scope; benchmarks run only where a fix is meant to move one.
+→ Five Opus reviewers by area, one Sonnet gathering code metrics, then a
+consolidation pass that re-verifies every finding before any fix is written.
