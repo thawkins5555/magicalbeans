@@ -55,6 +55,9 @@ from .service import STORES, db_for, disk_space
 
 MIN_BLOCK_PX = 3
 
+# "no argument given", distinct from an argument that is None.
+_UNSET = object()
+
 
 # ---------------------------------------------------------------------- CSV
 #
@@ -2572,6 +2575,7 @@ def _snmp_trap_rows(service, params, cap: int, *,
                  service.app_db.hostnames({row["source"] for row in rows}).items()
                  if name}
 
+    reveal = _may_read_secrets(service, params, "snmp")
     traps = []
     for row in rows:
         try:
@@ -3971,8 +3975,13 @@ UPSTREAM_SUGGESTIONS_DEFAULT_LIMIT = 500
 UPSTREAM_SUGGESTIONS_MAX_LIMIT = 2000
 
 
-def _upstream_suggestion_json(service, label, suggestion: dict) -> dict:
-    device = service.nodes_db.device(suggestion["device_id"])
+def _upstream_suggestion_json(service, label, suggestion: dict,
+                              rows: dict | None = None) -> dict:
+    # `rows` is the page's device rows read in one devices_by_ids, the way
+    # the port labels beside them are already batched; without it this was a
+    # device() — one nodes.db lock — per suggestion, up to the page cap.
+    device = (rows.get(suggestion["device_id"]) if rows is not None
+              else service.nodes_db.device(suggestion["device_id"]))
     candidates = []
     for candidate in suggestion["candidates"]:
         candidates.append({
@@ -3998,6 +4007,11 @@ def _upstream_suggestion_json(service, label, suggestion: dict) -> dict:
     }
 
 
+def _suggestion_device_rows(service, suggestions) -> dict:
+    return {d["id"]: d for d in service.nodes_db.devices_by_ids(
+        {s["device_id"] for s in suggestions})}
+
+
 def get_nodes_upstream_suggestions(service, params, body) -> dict:
     """Candidate devices.upstream_id assignments for an operator to review
     and accept — one entry per device with no upstream_id yet whose own
@@ -4017,13 +4031,15 @@ def get_nodes_upstream_suggestions(service, params, body) -> dict:
     label = _neighbor_local_port_labeler(service)
     if params.get("limit") is None and params.get("offset") is None:
         suggestions = service.nodes_db.upstream_suggestions()
-        return {"suggestions": [_upstream_suggestion_json(service, label, s)
+        rows = _suggestion_device_rows(service, suggestions)
+        return {"suggestions": [_upstream_suggestion_json(service, label, s, rows)
                                 for s in suggestions],
                 "total": total}
     limit, offset = _page(params, UPSTREAM_SUGGESTIONS_DEFAULT_LIMIT,
                           UPSTREAM_SUGGESTIONS_MAX_LIMIT)
     suggestions = service.nodes_db.upstream_suggestions(limit=limit, offset=offset)
-    return {"suggestions": [_upstream_suggestion_json(service, label, s)
+    rows = _suggestion_device_rows(service, suggestions)
+    return {"suggestions": [_upstream_suggestion_json(service, label, s, rows)
                             for s in suggestions],
             "total": total, "limit": limit, "offset": offset}
 
@@ -4055,7 +4071,7 @@ def _upstream_assignment_pairs(body) -> dict:
     return pairs
 
 
-def _find_upstream_cycle(service, overrides: dict) -> list | None:
+def _find_upstream_cycle(service, overrides: dict, rows: dict | None = None) -> list | None:
     """Whether `overrides` (device_id -> new, already-cleaned upstream_id),
     applied on top of what is on file for every OTHER device, would create
     a cycle reachable from any device this batch touches. Returns the
@@ -4073,10 +4089,14 @@ def _find_upstream_cycle(service, overrides: dict) -> list | None:
     rather than risk missing one longer than eight levels the way that
     cap would.
     """
+    rows = rows or {}
+
     def upstream_of(device_id):
         if device_id in overrides:
             return overrides[device_id]
-        row = service.nodes_db.device(device_id)
+        row = rows.get(device_id)
+        if row is None:
+            row = service.nodes_db.device(device_id)
         return int(row["upstream_id"]) if row and row["upstream_id"] is not None else None
 
     ceiling = service.nodes_db.device_count() + 1
@@ -4415,7 +4435,7 @@ def _check_display_name_source(body) -> None:
         raise ValueError("display_name_source must be 'auto' or 'manual'")
 
 
-def _clean_upstream_id(service, device_id, value):
+def _clean_upstream_id(service, device_id, value, rows: dict | None = None):
     """The upstream device an alert rollup will look through, validated.
 
     Empty, null and 0 all mean "no upstream" — the form's blank option sends
@@ -4434,7 +4454,10 @@ def _clean_upstream_id(service, device_id, value):
         raise ValueError("upstream_id must be a device id")
     if upstream == int(device_id):
         raise ValueError("A device cannot be its own upstream device")
-    _require(service.nodes_db.device(upstream), "upstream device")
+    # `rows` is a batch caller's pre-read device map; falling back to
+    # device() keeps the single-device PUT path unchanged.
+    if rows is None or upstream not in rows:
+        _require(service.nodes_db.device(upstream), "upstream device")
     return upstream
 
 
@@ -7682,8 +7705,13 @@ def post_ipam_worker(service, params, body) -> dict:
 
 # ----------------------------------------------------------------- configrx
 
-def _configrx_device_json(service, device_row, worker_state=None) -> dict:
-    config = service.configrx_db.device_config(device_row["id"])
+def _configrx_device_json(service, device_row, worker_state=None,
+                          config=_UNSET) -> dict:
+    # `config` pre-read by a list caller that fetched every row in one query
+    # (all_device_configs); _UNSET rather than None so "this device has no
+    # config row" stays distinguishable from "nobody looked it up yet".
+    if config is _UNSET:
+        config = service.configrx_db.device_config(device_row["id"])
     # Whether a backup is in flight for this device right now — the same join
     # the Nodes list does with node_poller.worker_state(). Without it the row
     # sat on the last COMPLETED attempt for the whole duration of a run, so a
@@ -7795,7 +7823,13 @@ def get_configrx_devices(service, params, body) -> dict:
     text = params.get("q") or None
     rows = service.nodes_db.devices(text=text)
     worker_state = service.configrx.worker_state()
-    devices = [_configrx_device_json(service, r, worker_state) for r in rows]
+    # One read for the whole list, the shape get_configrx_overview already
+    # uses: a device_config() per device was one configrx.db lock
+    # acquisition per device on every refresh tick.
+    configs = {c["device_id"]: c for c in service.configrx_db.all_device_configs()}
+    devices = [_configrx_device_json(service, r, worker_state,
+                                     configs.get(r["id"]))
+               for r in rows]
     if params.get("enabled_only") is not None:
         devices = [d for d in devices if d["backup_enabled"]]
     # Filtered on the effective vendor, so picking "cisco" gives the devices
@@ -7879,12 +7913,13 @@ def post_configrx_devices_bulk_backup(service, params, body) -> dict:
     # One query for the whole selection rather than device() per id, the
     # same shape post_nodes_devices_bulk_poll uses.
     existing = {d["id"] for d in service.nodes_db.devices_by_ids(device_ids)}
+    configs = {c["device_id"]: c for c in service.configrx_db.all_device_configs()}
     queued, busy, missing, not_enabled = [], [], [], []
     for device_id in device_ids:
         if device_id not in existing:
             missing.append(device_id)
             continue
-        config = service.configrx_db.device_config(device_id)
+        config = configs.get(device_id)
         if not (config and config["backup_enabled"]):
             not_enabled.append(device_id)
             continue
