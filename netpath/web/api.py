@@ -614,6 +614,23 @@ def _drop_unreadable(result: dict, granted: dict, module_keys: dict) -> None:
                 result.pop(key, None)
 
 
+def _alerts_settings_json(service, params) -> dict:
+    """The Alerts settings block as this caller may see it.
+
+    For Slack, Teams and PagerDuty the incoming-webhook URL *is* the bearer
+    credential, and `webhook_headers` is where an Authorization header goes,
+    so both follow _community_fields' rule rather than travelling in the
+    clear to every `alerts: read` account: the values for a caller who could
+    change them anyway, a boolean for everyone else. A copy, because the
+    dict here is the live one service.alerts_settings hands out."""
+    settings = service.alerts_settings
+    flags = {"has_webhook_url": bool(settings.get("webhook_url")),
+             "has_webhook_headers": bool(settings.get("webhook_headers"))}
+    if _may_read_secrets(service, params, "alerts"):
+        return {**settings, **flags}
+    return {**settings, **flags, "webhook_url": "", "webhook_headers": []}
+
+
 def get_config(service, params, body) -> dict:
     """Everything the browser needs that only an operator can change.
 
@@ -648,7 +665,7 @@ def get_config(service, params, body) -> dict:
         "trap_kinds": list(trapdecode.KINDS),
         "ipam_settings": service.ipam_settings,
         "nodes_settings": service.nodes_settings,
-        "alerts_settings": service.alerts_settings,
+        "alerts_settings": _alerts_settings_json(service, params),
         "wireless_settings": service.wireless_settings,
         "configrx_settings": service.configrx_settings,
         "mapper_settings": service.mapper_settings,
@@ -3699,6 +3716,17 @@ def _device_rows_json(service, params, rows) -> list[dict]:
     return devices
 
 
+_DEVICE_INDEX_FIELDS = ("id", "ip", "name", "sys_name", "display_name_source",
+                        "device_group_id", "status")
+
+
+def _device_index_rows_json(service, params, rows) -> list[dict]:
+    """The seven columns a device lookup table needs, and nothing else —
+    no per-row mute/maintenance/alias reads, no sys_descr, no credential
+    fields for _may_read_secrets to decide about."""
+    return [{field: row[field] for field in _DEVICE_INDEX_FIELDS} for row in rows]
+
+
 # Paging here is opt-in, not the default: a caller that sends neither
 # `limit` nor `offset` still gets the whole fleet back, because nothing here
 # can be sure it is the only caller (test_frontend_contracts.py and tests/ui/
@@ -3718,12 +3746,18 @@ def get_nodes_devices(service, params, body) -> dict:
             return {"devices": [], "total": 0}
         filters["only_ids"] = only_ids
     total = service.nodes_db.devices_count(**filters)
+    # `fields=index` is app.js's shared ip->device / id->device cache, which
+    # reads seven columns and was being handed the whole 25-column row for
+    # every device in the fleet, every thirty seconds, per open tab. Paging
+    # is unchanged; only the projection differs.
+    to_json = (_device_index_rows_json if params.get("fields") == "index"
+               else _device_rows_json)
     if params.get("limit") is None and params.get("offset") is None:
         rows = service.nodes_db.devices(**filters)
-        return {"devices": _device_rows_json(service, params, rows), "total": total}
+        return {"devices": to_json(service, params, rows), "total": total}
     limit, offset = _page(params, DEVICE_LIST_DEFAULT_LIMIT, DEVICE_LIST_MAX_LIMIT)
     rows = service.nodes_db.devices(limit=limit, offset=offset, **filters)
-    return {"devices": _device_rows_json(service, params, rows),
+    return {"devices": to_json(service, params, rows),
             "total": total, "limit": limit, "offset": offset}
 
 
@@ -5525,6 +5559,12 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
 def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
     device = _require(service.nodes_db.device(device_id), "device")
     rows = service.nodes_db.interfaces(device_id)
+    # The open port dialog refreshes one row every five seconds and was
+    # re-fetching the whole table — a quarter of a megabyte on a 500-port
+    # switch — to read it. Same shape, one interface.
+    if_index = _num(params, "if_index", None, int)
+    if if_index is not None:
+        rows = [r for r in rows if r["if_index"] == if_index]
     keys = rows[0].keys() if rows else ()
     # Why this list stops where it does, when the poller's per-poll cap is
     # what stopped it. It rides with the interfaces rather than with the
@@ -7080,6 +7120,9 @@ def _validated_threshold_fields(kind: str, row, fields: dict, key: str = "") -> 
         reference, fields.get("threshold"), fields.get("clear_threshold"),
         comparison=comparison, allow_equal=True)
     return fields
+
+
+ALERT_RULE_KEY_MAX = 80
 
 
 def post_alerts_rule(service, params, body) -> dict:

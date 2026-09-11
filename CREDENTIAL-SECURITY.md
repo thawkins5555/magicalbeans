@@ -111,10 +111,28 @@ ever guessing at a password.
 `LoginThrottle` tracks failures two ways at once — per username and per
 source address — and after 5 failures in a 15-minute window, each further
 attempt is delayed before the server even checks the password: `min(30s, 2^(failures - 5))`
-seconds, doubling each time up to a 30-second cap. Tracking both ways
-means one noisy source address cannot lock a real account for everyone else
-by spraying failed logins at it, and a botnet cannot avoid throttling by
-spreading a single account's guesses across many addresses.
+seconds, doubling each time. The sign-in handler then truncates that wait at
+**5 seconds** before sleeping it, so a request thread is never held longer
+than that; the delay is slept before the handler takes one of its four
+password-verification slots, so a throttled attempt cannot occupy a slot a
+legitimate sign-in needs. Tracking both ways means one noisy source address
+cannot lock a real account for everyone else by spraying failed logins at
+it, and a botnet cannot avoid throttling by spreading a single account's
+guesses across many addresses.
+
+### And past 20 failures, the attempt is refused outright
+
+The delay is the gentle half. Once either counter — that username, or that
+source address — reaches **20 failures inside the same 15-minute window**,
+sign-in is refused before any password is looked at or hashed: the response
+says how many minutes are left, and the refusal is written to the event log
+and the audit trail as `signin.locked_out`. The lock is not a fixed
+sentence; it lifts as soon as the oldest failure still counting towards the
+threshold ages out of the 15-minute window, so an account locked by someone
+else's guessing frees itself without an administrator. Counted per username
+**and** per source address for the same reason the delay is: neither a
+single noisy address nor a single targeted account can be used to deny the
+other.
 
 ### A weak password is refused before it's ever hashed
 

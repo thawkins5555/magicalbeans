@@ -31,6 +31,13 @@ RESAMPLE_MAX_AGE_S = 900
 # Rows buffered before a flush goes early rather than waiting out the second.
 FLUSH_ROWS = 5000
 
+# Sampling-rate rewrites applied per flush. Each one is a retention-window
+# UPDATE on the writer thread under the flow lock (tens of milliseconds on a
+# busy store), and a sender cycling flowSamplerID can announce thousands in a
+# second. The remainder waits for the next flush, so a legitimately announced
+# rate still rewrites its own window, one flush later at worst.
+MAX_RESAMPLE_PER_FLUSH = 64
+
 
 class Collector(udpsock.UdpReceiver):
     NOUN = "Collector"
@@ -41,8 +48,8 @@ class Collector(udpsock.UdpReceiver):
     # is a ceiling of roughly 600,000 buffered flows.
     QUEUE_SIZE = 20000
     COUNTERS = {"packets": 0, "flows": 0, "dropped": 0, "rejected": 0,
-                "errors": 0, "resampled": 0, "last_packet": 0.0,
-                "last_template": 0.0}
+                "errors": 0, "resampled": 0, "truncated_flows": 0,
+                "last_packet": 0.0, "last_template": 0.0}
 
     def __init__(self, db: FlowDatabase, on_batch=None, log=None):
         super().__init__(log)
@@ -142,21 +149,31 @@ class Collector(udpsock.UdpReceiver):
         flows = self.decoder.decode(data, exporter)
 
         if self._first_from(exporter):
-            self.log.add(NETFLOW, f"First packet from exporter {exporter}",
-                         target=exporter,
-                         detail=f"version  {int.from_bytes(data[:2], 'big')}\n"
-                                f"bytes    {len(data)}\n"
-                                f"sampling {self.decoder.sampling_for(exporter)}")
+            # Throttled like the error below: _seen is an LRU of 4,096, so a
+            # sender rotating source addresses makes every packet "first".
+            self._log_throttled(
+                f"first:{exporter}", f"First packet from exporter {exporter}",
+                target=exporter, level=NETFLOW,
+                detail=lambda: f"version  {int.from_bytes(data[:2], 'big')}\n"
+                               f"bytes    {len(data)}\n"
+                               f"sampling {self.decoder.sampling_for(exporter)}")
         gained = self.decoder.stats["templates"] - templates_before
         if gained:
             self.counters["last_template"] = time.time()
             self.log.add(NETFLOW, f"Received {gained} template(s) from {exporter}",
                          target=exporter)
         if self.decoder.stats["errors"] > errors_before:
-            self.log.add(ERROR, f"Undecodable packet from {exporter}",
-                         target=exporter,
-                         detail=f"{len(data)} bytes, first 32: {data[:32].hex(' ')}")
+            # One line a minute, not one per datagram: the event log is a
+            # 3,000-entry ring, and a flood of runts emptied it of everything
+            # an operator would want at exactly the moment they looked. The
+            # counters below still show the full volume.
+            self._log_throttled("undecodable",
+                                f"Undecodable packet from {exporter}",
+                                target=exporter,
+                                detail=lambda: f"{len(data)} bytes, first 32: "
+                                               f"{data[:32].hex(' ')}")
         self._sync_error_counter()
+        self.counters["truncated_flows"] = self.decoder.stats["truncated_flows"]
         if not flows:
             return
         try:
@@ -227,8 +244,9 @@ class Collector(udpsock.UdpReceiver):
 
     def _apply_learned_rates(self) -> None:
         """Store any sampling rate announced since the last flush, and correct
-        the flows that arrived before the announcement."""
-        rates, self.decoder.learned_rates = self.decoder.learned_rates, []
+        the flows that arrived before the announcement. At most
+        MAX_RESAMPLE_PER_FLUSH of them per flush; the rest wait."""
+        rates = self.decoder.drain_learned_rates(MAX_RESAMPLE_PER_FLUSH)
         if not rates:
             return
         try:
@@ -241,6 +259,12 @@ class Collector(udpsock.UdpReceiver):
             self.counters["resampled"] += corrected
 
     # ------------------------------------------------------------------ status
+
+    def _status_parts(self) -> list[str]:
+        parts = []
+        if self.counters["truncated_flows"]:
+            parts.append(f"{self.counters['truncated_flows']} truncated")
+        return parts
 
     def _listening_text(self) -> str:
         address, port = self.bound or ("?", 0)

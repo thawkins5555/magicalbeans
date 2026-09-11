@@ -9,6 +9,7 @@ from __future__ import annotations
 import collections
 import socket
 import struct
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -55,6 +56,20 @@ MAX_FIELDS_PER_TEMPLATE = 128
 # the highest plausible hardware rate -- while staying nowhere near int64's
 # ceiling (~9.2e18), so it costs no real deployment anything.
 MAX_PLAUSIBLE_SAMPLING = 1_000_000
+
+# How many flows one datagram may yield. Nothing in the wire format bounds
+# this: a template of a single short field gives a record length of a byte or
+# two, so one 64 KB datagram used to decode to ~65,000 Flow objects (~48 MB,
+# 600 ms) and the collector's queue -- bounded in datagrams, on the assumption
+# of about thirty flows each -- became a ceiling of a billion buffered flows.
+# The largest real v9/IPFIX packet is well under a hundred records.
+MAX_FLOWS_PER_PACKET = 4096
+
+# A record shorter than this is not a real IE set; the shorter it is the more
+# records one data set yields, which is the other half of the same
+# amplification. Zero-length was already refused (it never advanced the read
+# offset at all); four bytes is below any single real counter or address IE.
+MIN_RECORD_BYTES = 4
 
 V5 = 5
 V9 = 9
@@ -304,13 +319,18 @@ class Decoder:
         # (exporter, observation domain, sampler id) -> rate
         self.sampling: _Lru = _Lru(MAX_SAMPLING)
         # Rates learned since the caller last drained this, so it can correct
-        # flows stored before the options record that announced them.
-        self.learned_rates: list[tuple[str, int, int, int]] = []
+        # flows stored before the options record that announced them. Keyed
+        # like self.sampling and bounded the same way: as a list, a sender
+        # cycling flowSamplerID appended one entry per options record for
+        # ever, and each entry costs the flow writer a retention-window
+        # UPDATE. Latest rate wins; the oldest key is dropped at the cap.
+        self.learned_rates: dict[tuple[str, int, int], int] = {}
+        self._rates_lock = threading.Lock()
         self.default_sampling = max(1, int(default_sampling))
         self.trust_exporter_sampling = trust_exporter_sampling
         self.stats = {"packets": 0, "flows": 0, "templates": 0, "errors": 0,
                       "no_template": 0, "bad_template": 0,
-                      "implausible_sampling": 0}
+                      "implausible_sampling": 0, "truncated_flows": 0}
 
     def sampling_for(self, exporter: str, domain: int = 0,
                      sampler_id: int = 0) -> int:
@@ -353,7 +373,22 @@ class Decoder:
             self.sampling[key] = rate           # refresh its LRU position
             return
         self.sampling[key] = rate
-        self.learned_rates.append((exporter, domain, sampler_id, rate))
+        with self._rates_lock:
+            self.learned_rates.pop(key, None)
+            self.learned_rates[key] = rate
+            while len(self.learned_rates) > MAX_SAMPLING:
+                self.learned_rates.pop(next(iter(self.learned_rates)))
+
+    def drain_learned_rates(self, limit: int | None = None) -> list[tuple[str, int, int, int]]:
+        """Take up to `limit` announced rates, oldest first, leaving the rest
+        for the next call. Taking them under the same lock _set_sampling
+        appends under is what keeps a rate announced mid-drain from being
+        dropped by the swap."""
+        with self._rates_lock:
+            keys = list(self.learned_rates)
+            if limit is not None:
+                keys = keys[:limit]
+            return [(*key, self.learned_rates.pop(key)) for key in keys]
 
     def decode(self, data: bytes, exporter: str) -> list[Flow]:
         self.stats["packets"] += 1
@@ -438,7 +473,8 @@ class Decoder:
                 self._read_options_template(body, exporter, domain, ipfix=False)
             elif set_id >= 256:
                 flows.extend(self._read_data(body, exporter, domain, set_id,
-                                             V9, boot, unix_secs))
+                                             V9, boot, unix_secs,
+                                             MAX_FLOWS_PER_PACKET - len(flows)))
             offset += set_len
         return flows
 
@@ -463,7 +499,8 @@ class Decoder:
                 self._read_options_template(body, exporter, domain, ipfix=True)
             elif set_id >= 256:
                 flows.extend(self._read_data(body, exporter, domain, set_id,
-                                             IPFIX, 0.0, export_time))
+                                             IPFIX, 0.0, export_time,
+                                             MAX_FLOWS_PER_PACKET - len(flows)))
             offset += set_len
         return flows
 
@@ -568,7 +605,8 @@ class Decoder:
     # ------------------------------------------------------------- data
 
     def _read_data(self, body: bytes, exporter: str, domain: int, template_id: int,
-                   version: int, boot: float, export_time: float) -> list[Flow]:
+                   version: int, boot: float, export_time: float,
+                   budget: int = MAX_FLOWS_PER_PACKET) -> list[Flow]:
         template = self.templates.get((exporter, domain, template_id))
         if template is None:
             self.stats["no_template"] += 1
@@ -577,10 +615,11 @@ class Decoder:
         flows: list[Flow] = []
         offset = 0
         fixed = template.length
-        if fixed is not None and fixed <= 0:
+        if fixed is not None and fixed < MIN_RECORD_BYTES:
             # Belt and braces beside the guard in _read_templates: a cached
             # template from before this check, or one whose fields sum to
-            # zero, would never advance `offset`.
+            # zero, would never advance `offset`; one summing to a byte or
+            # two yields a record per byte of the set (see MIN_RECORD_BYTES).
             self.stats["bad_template"] += 1
             self.stats["errors"] += 1
             self.templates.pop((exporter, domain, template_id), None)
@@ -599,6 +638,10 @@ class Decoder:
             if template.is_options:
                 self._apply_options(values, exporter, domain)
                 continue
+
+            if len(flows) >= budget:
+                self.stats["truncated_flows"] += 1
+                break
 
             flow = self._build_flow(values, exporter, version, boot, export_time,
                                     domain)
