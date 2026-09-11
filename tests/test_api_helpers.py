@@ -294,21 +294,38 @@ try:
     # query, so a `read` grant on the module was enough to ask for
     # 1,666,667 of them. Same trade as _flow_bucket: coarser buckets, not a
     # narrower window, and the browser reads bucket_s back off the response.
-    for name, handler in [("alerts", get_alerts_overview),
-                          ("snmp", get_snmp_overview),
-                          ("syslog", get_syslog_overview)]:
-        payload = handler(service, {"t0": "0", "t1": "100000000",
-                                    "bucket": "60"}, {})
-        check(f"/api/{name}/overview caps the buckets it allocates",
-              len(payload["buckets"]) <= HIST_MAX_BUCKETS,
-              len(payload["buckets"]))
-        check("...and reports the widened bucket_s back to the caller",
-              payload["bucket_s"] > 60, payload["bucket_s"])
-        payload = handler(service, {"t0": "0", "t1": "1e18", "bucket": "1"}, {})
-        check("...and a non-finite-ish span is clamped first",
-              len(payload["buckets"]) <= HIST_MAX_BUCKETS,
-              len(payload["buckets"]))
-        # What every shipped tab actually sends: 24 h at one hour.
+    # The window is asserted at the store's door rather than on the returned
+    # list on purpose: the whole point of the finding is that the store
+    # allocates the buckets before it queries anything, so a suite that let
+    # the unfixed code build them would be the denial of service it is
+    # testing for.
+    for name, store, handler in [("alerts", "alerts_db", get_alerts_overview),
+                                 ("snmp", "snmp_db", get_snmp_overview),
+                                 ("syslog", "syslog_db", get_syslog_overview)]:
+        database = getattr(service, store)
+        asked = []
+        real_histogram = database.histogram
+
+        def spy(t0, t1, bucket_s, *a, _asked=asked, **kw):
+            _asked.append((t0, t1, bucket_s))
+            return []
+
+        database.histogram = spy
+        try:
+            handler(service, {"t0": "0", "t1": "100000000", "bucket": "60"}, {})
+            handler(service, {"t0": "0", "t1": "1e18", "bucket": "1"}, {})
+            handler(service, {"t0": "-inf", "t1": "inf", "bucket": "nan"}, {})
+        finally:
+            database.histogram = real_histogram
+        check(f"/api/{name}/overview never asks its store for more than "
+              f"{HIST_MAX_BUCKETS} buckets",
+              len(asked) == 3 and all((t1 - t0) / bucket <= HIST_MAX_BUCKETS
+                                      for t0, t1, bucket in asked), asked)
+        check("...by widening the bucket, not by narrowing the window",
+              all(bucket > 60 for _t0, _t1, bucket in asked), asked)
+
+        # What every shipped tab actually sends: 24 h at one hour, answered
+        # for real, at the resolution asked for.
         now = time.time()
         payload = handler(service, {"t0": str(now - 86400), "t1": str(now),
                                     "bucket": "3600"}, {})

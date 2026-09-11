@@ -1220,3 +1220,53 @@ note that a community string is not encrypted anywhere, on any platform, and
 is returned by the API to accounts with the **write** grant on the module
 that owns it. Read-only accounts see only whether a community is set, not
 its value.
+## 11. The SNMPv3 trap users' authentication passwords (Events → SNMP)
+
+The trap receiver verifies the authentication digest on an incoming v3
+trap, which means it needs that user's authentication password in a form it
+can turn back into the password — it derives the RFC 3414 localised key
+from it on every engine it hears from. So, like §4's polling credential and
+unlike a login password, this one is encrypted at rest rather than hashed.
+
+**Where it lives.** In `snmp.db`, table `trap_v3_users`
+(`netpath/snmptrapdb.py`): one row per user, holding the name, the hash
+algorithm, and `auth_pass_enc` — a blob from the same `netpath/dpapi.py`
+used everywhere else, so Windows DPAPI machine-scoped where there is one
+and §10's portable secret store where there is not. A host that can do
+neither refuses the save, naming what to configure, rather than storing the
+password in the clear.
+
+**What the API returns.** Nothing of it. The `v3_users` settings value —
+the one `/api/config` serves to every account holding `snmp: read` — is
+`name / SHA` lines with no third field, and `SnmpTrapDatabase.settings()`
+strips a password out of whatever is stored before returning it. Beside it
+is `v3_users_stored`, a count, so the Settings dialog can say a password is
+on file without being handed one. There is no route that reads a stored
+trap password back.
+
+**Setting and keeping one.** The Settings textarea is still the whole
+interface: a line typed as `name / SHA / password` sets or replaces that
+user's password, a line typed as `name / SHA` keeps whatever is already
+stored for that name, and a name deleted from the textarea takes its stored
+password with it. That is the "blank keeps" idiom the Nodes credential form
+already uses, in the shape this control has always had.
+
+**Before 5.9.1** the password was an ordinary line of the `v3_users`
+settings row: plain JSON in `snmp.db`, readable with `strings` on the file
+or on a backup of it, and returned verbatim by `/api/config` to read-only
+accounts holding no `settings` and no `admin` grant. Opening the database
+once on a build with this fix migrates any such password into
+`trap_v3_users`, encrypted, and rewrites the settings row without it. The
+one case where that migration cannot run is a host with no credential store
+at all: there is nowhere to put the password, and blanking the row would
+stop the receiver verifying traps it verifies today, so the row is left as
+it is, a warning is logged, and the first open after a store is configured
+encrypts it. `settings()` strips the password out of the API's copy either
+way — so even on that host, no API response carries it.
+
+**What this does not protect.** The localised keys derived from the
+password are cached for the process lifetime (`trapdecode.localized_key`),
+as §4 already records for the poller, and a decrypted password is an
+ordinary Python string while the receiver is running. This is
+encryption at rest, not against someone who already has the running
+process.

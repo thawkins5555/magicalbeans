@@ -3848,13 +3848,10 @@
      have no server-side export.csv route (report.py answers JSON only),
      so the CSV is built from the very rows already on screen rather than
      asking the server a second time for the same numbers in another
-     shape. */
-  /* The same lead characters api.py's _CSV_FORMULA_LEAD guards — = + - @
-     tab and CR — with the same inert apostrophe in front of them. A device
-     name comes from its own sysName or from another operator, and a
-     spreadsheet opens a cell starting with one of these as a live formula:
-     these two reports are the only CSVs built in the browser, and they were
-     the only two skipping the guard every server-side export applies. */
+     shape. Including the formula guard: api.py's _CSV_FORMULA_LEAD, the
+     same six lead characters and the same inert apostrophe. A device name
+     comes from its own sysName or from another operator, and a spreadsheet
+     opens a cell starting with one of them as a live formula. */
   const CSV_FORMULA_LEAD = /^[=+\-@\t\r]/;
 
   function csvField(value) {

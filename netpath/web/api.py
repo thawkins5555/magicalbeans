@@ -2370,9 +2370,7 @@ def _syslog_host_ips(service, host: str) -> list:
 
 def get_syslog_overview(service, params, body) -> dict:
     """Histogram plus the context the page needs; deliberately cheap."""
-    t1 = _num(params, "t1", time.time())
-    t0 = _num(params, "t0", t1 - 86400)
-    bucket = _num(params, "bucket", 3600)
+    t0, t1, bucket = _hist_window(params)
     filters = _syslog_filters(service, params)
 
     buckets = service.syslog_db.histogram(t0, t1, bucket, filters)
@@ -2544,9 +2542,7 @@ def _snmp_filters(params) -> dict:
 
 def get_snmp_overview(service, params, body) -> dict:
     """Histogram plus the context the page needs; deliberately cheap."""
-    t1 = _num(params, "t1", time.time())
-    t0 = _num(params, "t0", t1 - 86400)
-    bucket = _num(params, "bucket", 3600)
+    t0, t1, bucket = _hist_window(params)
     filters = _snmp_filters(params)
 
     buckets = service.snmp_db.histogram(t0, t1, bucket, filters)
@@ -6540,9 +6536,7 @@ def _template_json(row, with_tokens: bool = False) -> dict:
 
 
 def get_alerts_overview(service, params, body) -> dict:
-    t1 = _num(params, "t1", time.time())
-    t0 = _num(params, "t0", t1 - 86400)
-    bucket = _num(params, "bucket", 3600)
+    t0, t1, bucket = _hist_window(params)
     return {
         "t0": t0, "t1": t1, "bucket_s": bucket,
         "buckets": service.alerts_db.histogram(t0, t1, bucket),
