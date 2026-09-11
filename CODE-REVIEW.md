@@ -27,70 +27,64 @@ design work deliberately not done in this pass) and **20 unconfirmed items**. Th
 consolidated the seven reports, spot-verified the top finding of each, and assigned the
 fixes to file-owned lanes so that parallel fixers never touch the same file; every fix ships
 with a test that fails before it and passes after, proved by running the new test against a
-stash of the change. Four lanes (server, data, poller, frontend modules) are complete;
-the api, alerts, trapsecrets and frontend-core lanes were still running when this document
-was drafted and their findings are marked *Fix in progress*.
-
-> Note on the counts: the seven reports' own `- Severity:` lines total 2 critical, 17 high,
-> 29 medium, 33 low. The review brief's summary line said 16 high / 30 medium. The reports
-> are authoritative here and are what this document uses.
+stash of the change. All eight lanes (server, data, poller, api, alerts, trapsecrets, frontend core,
+frontend modules) are complete; every finding marked *Fixed* below landed with its test.
 
 ---
 
 ## Findings
 
-81 findings, sorted by severity and then by area. Status is as of this draft:
-*Fixed* — landed with its test; *Fix in progress* — assigned to a lane still running;
+81 findings, sorted by severity and then by area. Status:
+*Fixed* — landed with a test that failed before it and passes after;
 *Proposal* — the lead judged it design work, not a defect to patch now;
-*Documented* — the answer is a documentation change, deferred to the docs phase;
-*Reported* — recorded here only. The lead updates this column at the end of the release.
+*Documented* — answered by a documentation change (RUNBOOK.md).
 
 | ID | Sev | Lens | Finding | Where | Status |
 |---|---|---|---|---|---|
 | WEB-F1 | critical | security | Negative `Content-Length` bypasses every body cap: unauthenticated, unbounded memory | `netpath/web/server.py:970` | Fixed |
-| ALRT-F1 | critical | security, performance | 880 KB of NetFlow options records stalls the flow writer ~15 minutes | `netpath/nfdecode.py:311`, `netpath/collector.py:228` | Fix in progress |
+| ALRT-F1 | critical | security, performance | 880 KB of NetFlow options records stalls the flow writer ~15 minutes | `netpath/nfdecode.py:311`, `netpath/collector.py:228` | Fixed |
 | WEB-F2 | high | security, performance | Request body read in full (~85 MB) before the route's permission check | `netpath/web/server.py:1206` | Fixed |
-| API-F1 | high | security, performance | Three overview routes allocate one dict per bucket with no ceiling | `netpath/web/api.py:2311`, `:2485`, `:6383` | Fix in progress |
-| API-F2 | high | security | `GET …/oid-walk?download=1` destroys server state behind a read gate | `netpath/web/api.py:4914` | Fix in progress |
+| API-F1 | high | security, performance | Three overview routes allocate one dict per bucket with no ceiling | `netpath/web/api.py:2311`, `:2485`, `:6383` | Fixed |
+| API-F2 | high | security | `GET …/oid-walk?download=1` destroys server state behind a read gate | `netpath/web/api.py:4914` | Fixed |
 | POLL-F1 | high | security | A device's own `entPhySensorScale` hangs a poll worker for ever | `netpath/nodepoll.py:4930` | Fixed |
 | POLL-F2 | high | security, correctness | Negative OID arc spins `enc_oid`; a non-ASCII digit freezes the device's status | `netpath/trapdecode.py:784` | Fixed |
-| DATA-F1 | high | security | SNMPv3 trap-receiver auth passwords stored and served in the clear | `netpath/snmptrapdb.py:107` | Fix in progress |
+| DATA-F1 | high | security | SNMPv3 trap-receiver auth passwords stored and served in the clear | `netpath/snmptrapdb.py:107` | Fixed |
 | DATA-F2 | high | performance | Every poll pays a full index scan of the MIB corpus (prefix LIKE) | `netpath/nodesmibdb.py:182`, `:197` | Fixed |
 | DATA-F3 | high | performance | The alert engine full-scans `alerts` every five seconds | `netpath/alertsdb.py:2145`, `:2030` | Fixed |
 | DATA-F4 | high | performance | `nodes.db` and `nodes_series.db` prune in single unbatched DELETEs | `netpath/nodesdb.py:4395`, `netpath/nodesseriesdb.py:456` | Fixed |
-| ALRT-F2 | high | security | `compile_bounded` exempts exactly the regex shape that backtracks exponentially | `netpath/configrx_compliance.py:66` | Fix in progress |
-| ALRT-F3 | high | security, performance | One 64 KB NetFlow datagram decodes to 65,483 flows (~48 MB) | `netpath/nfdecode.py:565` | Fix in progress |
-| ALRT-F4 | high | correctness | An alert muted during its roll-up hold loses its first notification for good | `netpath/alertengine.py:3080` | Fix in progress |
-| FE-F1 | high | correctness | The Nodes pane changes device under the operator 10–20 s after a deep link | `netpath/web/static/nodes.js:6250` | Fix in progress |
-| FE-F2 | high | security, correctness | A crafted `?kiosk=1&rotate=…` link kills the whole application | `netpath/web/static/app.js:4661` | Fix in progress |
-| FE-F3 | high | performance | The Nodes tab re-downloads ~1 MB and blocks the main thread 185–350 ms per tick | `netpath/web/static/nodes.js:6227` | Fix in progress |
-| FE-F4 | high | performance | One open port dialog on a 500-port switch costs ~150 KiB/s | `netpath/web/static/nodes.js:2769` | Fix in progress |
+| ALRT-F2 | high | security | `compile_bounded` exempts exactly the regex shape that backtracks exponentially | `netpath/configrx_compliance.py:66` | Fixed |
+| ALRT-F3 | high | security, performance | One 64 KB NetFlow datagram decodes to 65,483 flows (~48 MB) | `netpath/nfdecode.py:565` | Fixed |
+| ALRT-F4 | high | correctness | An alert muted during its roll-up hold loses its first notification for good | `netpath/alertengine.py:3080` | Fixed |
+| FE-F1 | high | correctness | The Nodes pane changes device under the operator 10–20 s after a deep link | `netpath/web/static/nodes.js:6250` | Fixed |
+| FE-F2 | high | security, correctness | A crafted `?kiosk=1&rotate=…` link kills the whole application | `netpath/web/static/app.js:4661` | Fixed |
+| FE-F3 | high | performance | The Nodes tab re-downloads ~1 MB and blocks the main thread 185–350 ms per tick | `netpath/web/static/nodes.js:6227` | Fixed |
+| FE-F4 | high | performance | One open port dialog on a 500-port switch costs ~150 KiB/s | `netpath/web/static/nodes.js:2769` | Fixed |
 | FM-F1 | high | security | Alerts rule `key` interpolated into an HTML attribute unescaped | `netpath/web/static/alerts.js:875` | Fixed |
 | WEB-F3 | medium | security | Duplicate and loosely-parsed `Content-Length` headers accepted (CL.CL smuggling) | `netpath/web/server.py:947`, `:970` | Fixed |
 | WEB-F4 | medium | performance, security | No bound on concurrent connections or handler threads | `netpath/web/server.py:1421` | Fixed |
 | WEB-F5 | medium | maintainability | A client reset mid-response prints a full traceback per request | `netpath/web/server.py:896` | Fixed |
-| WEB-F6 | medium | security, design | Login delay capped at 5 s, not the documented 30 s, and slept inside the 4-slot semaphore | `netpath/web/api.py:8871` | Fix in progress |
-| API-F3 | medium | performance, security | `GET /api/nodes/duplicates` takes an unclamped `limit`, then queries per device | `netpath/web/api.py:4207` | Fix in progress |
-| API-F4 | medium | correctness, security | Four bulk routes bind one SQL placeholder per id, uncapped | `netpath/web/api.py:6817`, `:7696` | Fix in progress |
-| API-F5 | medium | security | `GET /api/debug` filters its event stream by module, then leaks the same data beside it | `netpath/web/api.py:1573` | Fix in progress |
-| API-F6 | medium | security | SNMP trap rows hand every device's community (and v3 user name) to a read-only account | `netpath/web/api.py:2550` | Fix in progress |
-| API-F7 | medium | performance | `GET /api/configrx/devices` runs one `device_config` query per device | `netpath/web/api.py:7723` | Fix in progress |
-| API-F8 | medium | performance | Upstream-suggestions apply makes three `device()` queries per assignment | `netpath/web/api.py:4058`, `:3933` | Fix in progress |
+| WEB-F6 | medium | security, design | Login delay capped at 5 s, not the documented 30 s, and slept inside the 4-slot semaphore | `netpath/web/api.py:8871` | Fixed |
+| API-F3 | medium | performance, security | `GET /api/nodes/duplicates` takes an unclamped `limit`, then queries per device | `netpath/web/api.py:4207` | Fixed |
+| API-F4 | medium | correctness, security | Four bulk routes bind one SQL placeholder per id, uncapped | `netpath/web/api.py:6817`, `:7696` | Fixed |
+| API-F5 | medium | security | `GET /api/debug` filters its event stream by module, then leaks the same data beside it | `netpath/web/api.py:1573` | Fixed |
+| API-F6 | medium | security | SNMP trap rows hand every device's community (and v3 user name) to a read-only account | `netpath/web/api.py:2550` | Fixed |
+| API-F7 | medium | performance | `GET /api/configrx/devices` runs one `device_config` query per device | `netpath/web/api.py:7723` | Fixed |
+| API-F8 | medium | performance | Upstream-suggestions apply makes three `device()` queries per assignment | `netpath/web/api.py:4058`, `:3933` | Fixed |
 | POLL-F3 | medium | security, performance | A table walk is bounded by row count only — not bytes, and mostly not time | `netpath/nodepoll.py:4684`, `:4765` | Fixed |
 | POLL-F4 | medium | security | A v3 reply's `msgID` is discarded, so a spoofed Report installs a chosen engine id | `netpath/snmppoll.py:425` | Fixed |
 | POLL-F5 | medium | performance | `_poll_interfaces` opens one socket and one credential decrypt per interface | `netpath/nodepoll.py:4438`, `:4516` | Fixed |
 | POLL-F6 | medium | correctness, design | `_poll_custom_mib` GETs every object at once, so an auto-assigned MIB yields nothing | `netpath/nodepoll.py:4360` | Fixed |
 | DATA-F5 | medium | correctness | Ten search paths pass operator text into LIKE without escaping `%` and `_` | `netpath/nodesdb.py:1688`, +9 sites | Fixed |
 | DATA-F6 | medium | design | The four stores holding operator credentials run `synchronous=NORMAL` | `netpath/sqlitebase.py:414` | Fixed |
-| ALRT-F5 | medium | security | ConfigRX redaction leaves SNMP communities in the clear for Siemens and Ubiquiti | `netpath/configrx_redact.py:21` | Fix in progress |
-| ALRT-F6 | medium | performance | `_evaluate_dhcp_thresholds` reads every DHCP lease every five seconds | `netpath/alertengine.py:1539` | Fix in progress |
-| ALRT-F7 | medium | performance | `_drain_ipam_conflicts` reads the whole conflicts table each tick | `netpath/alertengine.py:1006` | Fix in progress |
-| ALRT-F8 | medium | security, design | The flow collector logs an unthrottled ERROR per undecodable datagram | `netpath/collector.py:144` | Fix in progress |
-| ALRT-F9 | medium | security | The webhook URL and its headers are stored and served in the clear | `netpath/alertsdb.py:279`, `:1668` | Fix in progress |
-| ALRT-F10 | medium | performance | Rollup absorb paths re-query the rules table instead of the per-tick snapshot | `netpath/alertengine.py:2357`, `:2443` | Fix in progress |
-| FE-F5 | medium | performance | Bridge & RF rebuilds its charts and re-fetches every RF series each tick | `netpath/web/static/nodes.js:3204` | Fix in progress |
-| FE-F6 | medium | performance | `App.deviceIndex()` pulls the whole unpaged fleet — 1.5 MB at 812 devices | `netpath/web/static/app.js:693` | Fix in progress |
-| FE-F7 | medium | security | Two client-built CSV exports skip the formula-injection guard | `netpath/web/static/nodes.js:3776` | Fix in progress |
+| ALRT-F5 | medium | security | ConfigRX redaction leaves SNMP communities in the clear for Siemens and Ubiquiti | `netpath/configrx_redact.py:21` | Fixed |
+| ALRT-F6 | medium | performance | `_evaluate_dhcp_thresholds` reads every DHCP lease every five seconds | `netpath/alertengine.py:1539` | Fixed |
+| ALRT-F7 | medium | performance | `_drain_ipam_conflicts` reads the whole conflicts table each tick | `netpath/alertengine.py:1006` | Fixed |
+| ALRT-F8 | medium | security, design | The flow collector logs an unthrottled ERROR per undecodable datagram | `netpath/collector.py:144` | Fixed |
+| ALRT-F9 | medium | security | The webhook URL and its headers are stored and served in the clear | `netpath/alertsdb.py:279`, `:1668` | Fixed |
+| ALRT-F10 | medium | performance | Rollup absorb paths re-query the rules table instead of the per-tick snapshot | `netpath/alertengine.py:2357`, `:2443` | Fixed |
+| FE-F5 | medium | performance | Bridge & RF rebuilds its charts and re-fetches every RF series each tick | `netpath/web/static/nodes.js:3204` | Fixed |
+| FE-F6 | medium | performance | `App.deviceIndex()` pulls the whole unpaged fleet — 1.5 MB at 812 devices | `netpath/web/static/app.js:693` | Fixed |
+| FE-F7 | medium | security | Two client-built CSV exports skip the formula-injection guard | `netpath/web/static/nodes.js:3776` | Fixed |
 | FM-F2 | medium | security | Wireless radio `channel` written into `#wl-detail` innerHTML unescaped | `netpath/web/static/wireless.js:213` | Fixed |
 | FM-F3 | medium | performance | MAPPER's node drag redraws every attached link per pointermove | `netpath/web/static/mapper.js:1528` | Fixed |
 | FM-F4 | medium | performance | Debug's event filter re-reads the DOM once per event, per draw | `netpath/web/static/debug.js:221` | Fixed |
@@ -102,26 +96,26 @@ was drafted and their findings are marked *Fix in progress*.
 | WEB-F11 | low | design, correctness | `WebServer.stop()` does not wait for in-flight requests | `netpath/web/server.py:1463` | Fixed |
 | WEB-F12 | low | performance, maintainability | Static files are unattributed in the latency table and cost two stats each | `netpath/web/server.py:1041`, `:1336` | Fixed |
 | WEB-F13 | low | security | The self-update's vendored CA bundle only ever widens the trusted set | `netpath/selfupdate.py:114` | Proposal |
-| API-F9 | low | performance | `GET …/devices/(\d+)/upstream` pulls the whole fleet's `SELECT *` for a dropdown | `netpath/web/api.py:9706` | Fix in progress |
+| API-F9 | low | performance | `GET …/devices/(\d+)/upstream` pulls the whole fleet's `SELECT *` for a dropdown | `netpath/web/api.py:9706` | Fixed |
 | API-F10 | low | correctness | `wsock._drain` uses the one `select` call the module documents as unsafe | `netpath/web/wsock.py:463` | Fixed |
-| API-F11 | low | design, maintainability | Inconsistent existence checks and one wrong exception type across sibling handlers | `netpath/web/api.py:4932`, `:9663` | Fix in progress |
+| API-F11 | low | design, maintainability | Inconsistent existence checks and one wrong exception type across sibling handlers | `netpath/web/api.py:4932`, `:9663` | Fixed |
 | API-F12 | low | security | The request body is read before the permission gate (api-side view of WEB-F2) | `netpath/web/server.py:1206` | Fixed |
-| API-F13 | low | performance | `post_alerts_bulk_maintenance` does two queries per device over an uncapped scope | `netpath/web/api.py:6689` | Fix in progress |
+| API-F13 | low | performance | `post_alerts_bulk_maintenance` does two queries per device over an uncapped scope | `netpath/web/api.py:6689` | Fixed |
 | POLL-F7 | low | performance | `settings()` is uncached and read twice per column walk | `netpath/nodepoll.py:4683`, `:7232` | Fixed |
 | POLL-F8 | low | performance, maintainability | Six per-device / per-job caches are never pruned | `netpath/nodepoll.py:2479` | Fixed |
 | POLL-F9 | low | security | A refused community string is printed verbatim into the device row and event log | `netpath/nodepoll.py:468` | Fixed |
 | DATA-F7 | low | maintainability | Bulk id lists in `alertsdb` and `configrxdb` bypass `sqlitebase.id_chunks` | `netpath/alertsdb.py:2188`, `netpath/configrxdb.py:561` | Fixed |
-| ALRT-F11 | low | performance | `_read_until_prompt` re-joins the whole capture on every recv | `netpath/configrx.py:543` | Fix in progress |
-| ALRT-F12 | low | correctness | Notification counters incremented from sender threads without a lock | `netpath/alertengine.py:390`, `:419` | Fix in progress |
-| ALRT-F13 | low | performance | `_source_name` does one `app.db` query per drained syslog/trap row | `netpath/alertengine.py:526` | Fix in progress |
-| ALRT-F14 | low | correctness | `_sweep_netpath_alerts` only ever sees the first 300 open alerts per rule | `netpath/alertengine.py:1888` | Fix in progress |
-| ALRT-F15 | low | security | Syslog TCP accepts and slots a connection before the allow list is consulted | `netpath/syslogd.py:256` | Fix in progress |
-| ALRT-F16 | low | correctness | Per-source syslog rate buckets mutated from several threads without a lock | `netpath/syslogd.py:187` | Fix in progress |
-| ALRT-F17 | low | security | C1 control characters survive syslog sanitisation | `netpath/syslogparse.py:49` | Fix in progress |
+| ALRT-F11 | low | performance | `_read_until_prompt` re-joins the whole capture on every recv | `netpath/configrx.py:543` | Fixed |
+| ALRT-F12 | low | correctness | Notification counters incremented from sender threads without a lock | `netpath/alertengine.py:390`, `:419` | Fixed |
+| ALRT-F13 | low | performance | `_source_name` does one `app.db` query per drained syslog/trap row | `netpath/alertengine.py:526` | Fixed |
+| ALRT-F14 | low | correctness | `_sweep_netpath_alerts` only ever sees the first 300 open alerts per rule | `netpath/alertengine.py:1888` | Fixed |
+| ALRT-F15 | low | security | Syslog TCP accepts and slots a connection before the allow list is consulted | `netpath/syslogd.py:256` | Fixed |
+| ALRT-F16 | low | correctness | Per-source syslog rate buckets mutated from several threads without a lock | `netpath/syslogd.py:187` | Fixed |
+| ALRT-F17 | low | security | C1 control characters survive syslog sanitisation | `netpath/syslogparse.py:49` | Fixed |
 | ALRT-F18 | low | security | The trap receiver is an unauthenticated UDP reflector for inform acknowledgements | `netpath/snmptrapd.py:248` | Documented |
-| FE-F8 | low | correctness, design | Three dialog titles are HTML-escaped twice; one stays wrong | `netpath/web/static/nodes.js:1709`, `:3110`, `:5610` | Fix in progress |
-| FE-F9 | low | design | Three status lines are silent to assistive technology | `netpath/web/static/nodes.js:6302`, `:5540`, `:5028` | Fix in progress |
-| FE-F10 | low | security | `domValueCell` is the one cell in the device dialogs that does not escape | `netpath/web/static/nodes.js:1504` | Fix in progress |
+| FE-F8 | low | correctness, design | Three dialog titles are HTML-escaped twice; one stays wrong | `netpath/web/static/nodes.js:1709`, `:3110`, `:5610` | Fixed |
+| FE-F9 | low | design | Three status lines are silent to assistive technology | `netpath/web/static/nodes.js:6302`, `:5540`, `:5028` | Fixed |
+| FE-F10 | low | security | `domValueCell` is the one cell in the device dialogs that does not escape | `netpath/web/static/nodes.js:1504` | Fixed |
 | FM-F6 | low | performance | Alerts re-fetches four configuration endpoints every 10 s | `netpath/web/static/alerts.js:1775` | Fixed |
 | FM-F7 | low | performance | 10 Hz fastTicks doing layout and unconditional property writes | `netpath/web/static/netpath.js:911`, `netpath/web/static/mapper.js:1788` | Fixed |
 | FM-F8 | low | performance, design | Late-filled `<select>`s rebuilt with innerHTML on every poll | `netpath/web/static/alerts.js:1877`, `wireless.js:476`, `configrx.js:1599` | Fixed |
@@ -645,7 +639,7 @@ gave `settings() returns: 'noc / SHA / correcthorsebatterystaple'` and
 is a DPAPI-encrypted `*_pass_enc` BLOB exposed only as `has_credential: bool`, and
 `CREDENTIAL-SECURITY.md:793-796` says flatly that no password is stored in a recoverable form or
 returned through any API response — the document has no section covering the trap receiver at all.
-The fix (trapsecrets lane, in progress) keeps the textarea format operators already use, stores
+The fix (trapsecrets lane) keeps the textarea format operators already use, stores
 the password DPAPI-encrypted in its own table, has `settings()` mask it the way
 `AlertsDatabase.settings()` reduces the SMTP password to `has_smtp_credential`, and keeps the
 stored value when the placeholder comes back unchanged.
@@ -768,7 +762,7 @@ redirect refusals were verified empirically. The defects cluster in three places
 on wire data that are bounded everywhere except one (ALRT-F1, F3), per-tick reads that fetch a
 whole table to compute a number a `GROUP BY` would answer (F6, F7, F10, F13), and secrets or
 sanitising rules one pattern short of the vendors the product ships support for (F5, F9, F17).
-The whole lane is in progress; it started after the data lane because it shares `ipamdb.py`.
+The whole lane is complete; it started after the data lane because it shares `ipamdb.py`.
 
 **ALRT-F1 (critical, security/performance).** Every structure in the v9/IPFIX decoder keyed on
 wire data is a bounded LRU with a comment saying why — except `Decoder.learned_rates`
@@ -990,7 +984,7 @@ list, the detail pane and three dialogs without a single `pageerror` or a fired 
 escapes nothing (FE-F10) and its field is numeric today. The real weight here is performance: four
 high findings, all the same shape — a refresh that fetches configuration at telemetry cadence, or an
 entire collection to use one row of it. The measured totals are large enough to matter on a NOC
-wall. This lane is still running.
+wall. This lane is complete.
 
 **FE-F1 (high, correctness).** 4.47.0 made `/api/nodes/devices` server-side paged, but `refresh()`
 still treats `view.devices` as the fleet: `nodes.js:6250` clears `view.selected` when it is not in
