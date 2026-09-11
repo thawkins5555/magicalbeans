@@ -170,3 +170,35 @@ container too. That run surfaced one integration defect (a sensor-scale clamp
 stopping at units where the MIB runs to yotta), fixed before the walk. The
 browser walk passed 63 of 63 checks as admin and as viewer with no console,
 page or HTTP error. `main` fast-forwarded to 5.9.1 and pushed.
+
+## 5.10.0 — Six asks
+
+**"Plan with Fable and deploy with up to 5 Opus agents ... To work on: [six
+items]"** — with the standing constraints restated: comments only where
+necessary (prose 10% or less), remove nothing without permission, no push to
+`main` and no review of the diff (both happen at end of day), one full
+test-suite pass at the end, this log kept per prompt, check on every agent at
+least every ten minutes.
+→ Planned first; eight planning questions asked and answered before any agent
+started. Ships as 5.10.0 on the same branch, above 5.9.1.
+
+**Planning answers** — recovery subjects carry `[RECOVER]` in place of the
+level tag; FORTI-AP B5 delivers BSSID plus the *configured* channel width via
+the WTP-profile join (the MIB has no per-radio noise floor — struck); an AP
+reboot raises a warning rule shipped enabled, a channel change is an event
+with its rule shipped disabled; Cisco software version and image are split
+from sysDescr with the boot-image path kept as a third field; the HTTPS check
+counts 2xx/3xx as available, verifies certificates with a per-destination
+opt-out, follows the destination's trace interval, and opens a critical alert
+after three failures; device delete becomes an asynchronous background purge
+in lock-friendly batches; release is 5.10.0 with this log as the per-prompt
+record.
+
+1. **`[RECOVER]` on recovery notifications.**
+2. **FORTI-AP A2, B1, B5 and their prerequisites.**
+3. **Routes: HTTPS availability check per destination.**
+4. **Deleting devices with large history freezes the application.**
+5. **Dashboard often blank until another tab is visited.**
+6. **Software version and image in the device header, plus a firmware report.**
+→ Five Opus lanes (wireless, nodes-firmware, nodes-delete, netpath-https,
+frontend-core + alerts subject), Sonnet for docs and demo data.
