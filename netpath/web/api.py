@@ -4139,12 +4139,23 @@ def post_nodes_upstream_suggestions_apply(service, params, body) -> dict:
     assignments that happen not to be part of it.
     """
     pairs = _upstream_assignment_pairs(body)
+    # Every device this batch names, and every device it points at, in one
+    # read: the batch cap is 2,000 assignments and each one used to cost
+    # three single-row queries, each taking the nodes.db write lock.
+    wanted = set(pairs)
+    for value in pairs.values():
+        if value not in (None, "", 0, "0"):
+            try:
+                wanted.add(int(value))
+            except (TypeError, ValueError):
+                pass
+    rows = {d["id"]: d for d in service.nodes_db.devices_by_ids(wanted)}
     for device_id in pairs:
-        if not service.nodes_db.device(device_id):
+        if device_id not in rows:
             raise ValueError(f"No such device {device_id}")
-    cleaned = {device_id: _clean_upstream_id(service, device_id, upstream_id)
+    cleaned = {device_id: _clean_upstream_id(service, device_id, upstream_id, rows)
               for device_id, upstream_id in pairs.items()}
-    cycle = _find_upstream_cycle(service, cleaned)
+    cycle = _find_upstream_cycle(service, cleaned, rows)
     if cycle:
         raise ValueError(
             "This would create an upstream cycle through device(s): "
@@ -6351,11 +6362,30 @@ def post_nodes_mib_resolve(service, params, body, mib_file_id) -> dict:
             "unresolved": unresolved}
 
 
+def _clean_oid(value) -> str:
+    """A dotted numeric OID, or ValueError.
+
+    isascii() as well as isdigit(), and an explicit refusal of a leading
+    '-', because the BER encoder this eventually reaches shifts each arc
+    right seven bits at a time: a negative arc never terminates that loop,
+    and str.isdigit() is True for superscript and Arabic-Indic digits that
+    int() rejects. Both would land here as a stored OID the poller then
+    reads on every poll.
+    """
+    oid = str(value or "").strip().strip(".")
+    parts = oid.split(".") if oid else []
+    if not parts or not all(part.isascii() and part.isdigit() for part in parts):
+        raise ValueError("An OID must be numeric, like 1.3.6.1.2.1.1")
+    return oid
+
+
 def put_nodes_mib_object(service, params, body, mib_file_id, obj_id) -> dict:
     objects = {r["id"]: r for r in service.nodes_db.mib_objects(mib_file_id)}
     if obj_id not in objects:
         raise ValueError("No such MIB object")
     fields = _pick(body, ("name", "oid", "description", "syntax", "enums"))
+    if "oid" in fields:
+        fields["oid"] = _clean_oid(fields["oid"])
     service.nodes_db.update_mib_object(obj_id, **fields)
     # A rename or a re-pointed OID changes what the table says without
     # changing any of the three numbers mib_generation() counts.
@@ -6651,6 +6681,10 @@ def _bulk_silence_device_ids(service, body) -> list[str]:
     if not ids:
         raise ValueError("device_ids and/or group_id is required, naming at "
                          "least one device")
+    if len(ids) > BULK_DEVICE_ID_MAX:
+        raise ValueError(
+            f"Too many devices in one request: {len(ids)}, limit is "
+            f"{BULK_DEVICE_ID_MAX}. Send them in batches.")
     try:
         wanted = {int(i) for i in ids}
     except (TypeError, ValueError):
@@ -6768,16 +6802,14 @@ def post_alerts_bulk_maintenance(service, params, body) -> dict:
     clear = bool(body.get("clear"))
     reason = str(body.get("reason", ""))
     username = params.get("_username", "")
-    changed = 0
-    for device_id in device_ids:
-        if clear:
-            changed += bool(service.alerts_db.clear_maintenance(
-                int(device_id), by=username))
-        else:
-            was_open = service.alerts_db.open_maintenance(int(device_id)) is not None
-            service.alerts_db.set_maintenance(int(device_id), by=username,
-                                              reason=reason)
-            changed += 0 if was_open else 1
+    # One lock hold and one commit for the whole selection: the per-device
+    # loop was two alerts.db statements and a commit per device, on the
+    # request thread, while the alert engine ticked against the same file.
+    if clear:
+        changed = service.alerts_db.clear_maintenance_many(device_ids, by=username)
+    else:
+        changed = service.alerts_db.set_maintenance_many(device_ids, by=username,
+                                                         reason=reason)
     _audit(service, params, "alert.maintenance_bulk",
           target=f"{len(device_ids)} devices",
           detail=f"{'off' if clear else 'on'}, {changed} changed: {reason}")
@@ -7057,6 +7089,14 @@ def post_alerts_rule(service, params, body) -> dict:
     source_kind = str(body.get("source_kind", "") or "")
     if not key or not name or not kind:
         raise ValueError("key, name and kind are all required")
+    # A rule key is a stable identifier, not prose: it is matched against
+    # alertrules' own key constants and written into the page as an
+    # attribute, so anything outside this charset is a mistake at best.
+    if len(key) > ALERT_RULE_KEY_MAX or not all(
+            char.isascii() and (char.isalnum() or char in "_-.") for char in key):
+        raise ValueError(
+            "A rule key may use letters, digits, underscore, hyphen and dot "
+            f"only, up to {ALERT_RULE_KEY_MAX} characters")
     if kind not in ("device_event", "interface_event", "threshold",
                     "dhcp_threshold", "netpath_threshold", "trap", "syslog",
                     "ipam", "wireless_event", "system"):
@@ -8909,10 +8949,10 @@ def _client(params) -> str:
 
 # At most this many password verifications at once. Each is a scrypt at
 # N=2^17 — about 128 MiB and half a second — on an endpoint that needs no
-# session, so unbounded concurrency is both a memory exhaustion (30 parallel
-# attempts is ~4 GB) and the thing that defeats the throttle: the server is
-# threaded, so simultaneous guesses would sleep out their five seconds in
-# parallel.
+# session, so unbounded concurrency is a memory exhaustion (30 parallel
+# attempts is ~4 GB) on a threaded server. It bounds the HASHING only: the
+# throttle delay is slept before the slot is taken, so a throttled caller
+# never holds one of the four while it waits.
 _LOGIN_SLOTS = threading.Semaphore(4)
 
 _dummy_hash_value: str | None = None
@@ -8971,11 +9011,16 @@ def post_login(service, params, body) -> dict:
         raise LockedOut(f"Too many failed sign-ins. Try again in "
                         f"{max(1, round(remaining / 60))} minute(s).")
 
-    with _LOGIN_SLOTS:
-        delay = service.throttle.delay_for(username, client)
-        if delay:
-            time.sleep(min(delay, 5))
+    # Slept OUTSIDE the semaphore: a throttled caller waiting inside one of
+    # the four verification slots holds it for the whole delay, so a handful
+    # of already-throttled attempts would queue every legitimate sign-in
+    # behind them. Truncated at 5 s either way — the throttle's own ceiling
+    # is 30 s, but a request thread held that long is its own denial.
+    delay = service.throttle.delay_for(username, client)
+    if delay:
+        time.sleep(min(delay, 5))
 
+    with _LOGIN_SLOTS:
         row = service.app_db.user(username) if username else None
         stored = row["password"] if row else None
 
@@ -9822,7 +9867,7 @@ def get_nodes_device_upstream(service, params, body, device_id) -> dict:
     # error the operator could have been spared.
     candidates = [
         {"id": d["id"], "name": d["name"] or d["ip"], "ip": d["ip"]}
-        for d in service.nodes_db.devices()
+        for d in service.nodes_db.device_summaries()
         if d["id"] != device_id
     ]
     candidates.sort(key=lambda d: (d["name"] or "").lower())
