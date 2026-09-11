@@ -308,8 +308,10 @@ CREATE INDEX IF NOT EXISTS ix_pending_due ON pending_alerts(fire_after_ts);
 
 -- Entities whose new alerts are suppressed until until_ts: an operator
 -- working on a device silences it for an hour rather than watching the same
--- outage arrive six times. entity_kind is "device" today; the column exists
--- so a future per-interface or per-AP mute needs no migration.
+-- outage arrive six times. entity_kind is "device" (the whole box) or
+-- "device_rule" (one rule on one box, entity_id "<device_id>:<rule_key>");
+-- the column is general, so a future per-interface or per-AP mute needs no
+-- migration either.
 --
 -- A mute stops what happens NEXT. Alerts already open stay open and are
 -- worked normally — hiding them would lose the operator's own place in the
@@ -413,6 +415,25 @@ CREATE INDEX IF NOT EXISTS ix_device_maintenance_device
 # the cap is here so a hand-made API call cannot silence a device until next
 # year. A maintenance window is still the mechanism for longer than this.
 MAX_MUTE_HOURS = 168.0
+
+# A mute covering ONE rule on ONE device. Rule keys never carry a colon, so
+# "<device_id>:<rule_key>" splits unambiguously — no column, no migration.
+DEVICE_RULE_KIND = "device_rule"
+
+
+def device_rule_entity(device_id, rule_key: str) -> str:
+    return f"{int(device_id)}:{rule_key}"
+
+
+def split_device_rule(entity_id: str) -> tuple[int, str] | None:
+    """The (device id, rule key) a device_rule entity_id names, or None."""
+    device, sep, rule_key = str(entity_id).partition(":")
+    if not sep or not rule_key:
+        return None
+    try:
+        return int(device), rule_key
+    except ValueError:
+        return None
 
 # How long a single maintenance window occurrence may span. Long enough for
 # any real cutover (a "weekend" is 60 hours) with room to spare; short enough
@@ -2379,7 +2400,7 @@ class AlertsDatabase(SqliteStore):
         """
         old_key, new_key = str(old_device_id), str(new_device_id)
         moved = {"thresholds": 0, "pending": 0, "windows": 0, "mute": False,
-                 "maintenance": 0}
+                 "rule_mutes": 0, "maintenance": 0}
         with self._lock:
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO device_thresholds(device_id, rule_key,"
@@ -2402,6 +2423,18 @@ class AlertsDatabase(SqliteStore):
                 self._conn.execute(
                     "DELETE FROM alert_mutes WHERE entity_kind = 'device'"
                     " AND entity_id = ?", (old_key,))
+            # Per-rule mutes move by rewriting the device half of their id.
+            # OR IGNORE because the winner may already hold the same rule's
+            # mute, and a merge must never fail on a constraint.
+            cur = self._conn.execute(
+                "UPDATE OR IGNORE alert_mutes SET entity_id = ?"
+                " || substr(entity_id, ?) WHERE entity_kind = ?"
+                " AND entity_id LIKE ?",
+                (new_key, len(old_key) + 1, DEVICE_RULE_KIND, old_key + ":%"))
+            moved["rule_mutes"] = cur.rowcount or 0
+            self._conn.execute(
+                "DELETE FROM alert_mutes WHERE entity_kind = ?"
+                " AND entity_id LIKE ?", (DEVICE_RULE_KIND, old_key + ":%"))
             cur = self._conn.execute(
                 "UPDATE pending_alerts SET device_id = ? WHERE device_id = ?",
                 (new_device_id, old_device_id))
@@ -2676,6 +2709,9 @@ class AlertsDatabase(SqliteStore):
             self._conn.execute(
                 "DELETE FROM alert_mutes WHERE entity_kind = 'device'"
                 " AND entity_id = ?", (key,))
+            self._conn.execute(
+                "DELETE FROM alert_mutes WHERE entity_kind = ?"
+                " AND entity_id LIKE ?", (DEVICE_RULE_KIND, key + ":%"))
             self._conn.execute(
                 "DELETE FROM device_thresholds WHERE device_id = ?",
                 (int(device_id),))

@@ -2652,6 +2652,24 @@ for _id in ("alerts-d-mute-hours", "bm-hours"):
     check("MUTE_HOURS.map(" in _near52,
           "the %s select is built from MUTE_HOURS rather than its own list" % _id)
 
+# --- 53. 5.11.0: muting one rule on one device -----------------------------
+ALERTS53 = read("alerts.js")
+NODES53 = read("nodes.js")
+for needle in ("alerts-d-mute-rule", "alerts-d-unmute-rule", "alerts-d-rule-muted"):
+    check(needle in ALERTS53,
+          "the alert detail carries the per-rule mute control %s" % needle)
+check("rule_key: ruleKey" in ALERTS53,
+      "...and the mute/unmute calls send the rule key the pane muted on")
+check("ruleMutedUntil || ''" in ALERTS53,
+      "...and the pane's rebuild signature includes the per-rule mute, so a "
+      "lifted one is not left on screen until something else moves")
+check("m.entity_kind === 'device_rule'" in ALERTS53,
+      "refresh() fills view.ruleMutes from the device_rule rows of one "
+      "/api/alerts/mutes read rather than a second request")
+check("rule_muted_count" in NODES53,
+      "the Nodes device list reads rule_muted_count, so a device with one "
+      "muted rule is not drawn as fully alerting")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

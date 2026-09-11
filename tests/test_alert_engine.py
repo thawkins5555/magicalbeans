@@ -143,12 +143,12 @@ real_set_cursor = alerts.set_cursor
 boom = {"n": 0}
 
 
-def apply_spy(rules, occurrence, settings):
+def apply_spy(rules, occurrence, settings, rule_muted=None):
     boom["n"] += 1
     trace.append(("apply", occurrence.entity_id))
     if boom["n"] == 2:
         raise RuntimeError("boom in _apply")
-    return real_apply(rules, occurrence, settings)
+    return real_apply(rules, occurrence, settings, rule_muted)
 
 
 def set_cursor_spy(source, value):

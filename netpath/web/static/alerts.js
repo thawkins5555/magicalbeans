@@ -39,6 +39,9 @@
     hist: null,
     // device entity_id -> until_ts, refreshed with the rest of the page.
     mutes: new Map(),
+    // "<device_id>:<rule_key>" -> until_ts. Its own map beside `mutes`: a
+    // device can be under both at once and neither answers for the other.
+    ruleMutes: new Map(),
     // device id -> the open maintenance period. Separate from `mutes`
     // because a device can be in both at once and neither answers for the
     // other: a mute has an until_ts, maintenance mode has no end at all.
@@ -67,8 +70,7 @@
 
   const MUTE_HOURS = [1, 6, 12, 24, 168];
 
-  /* Hours as an operator reads them: 168 in a dropdown is a number nobody
-     converts, so the top entry reads "7 days". */
+  /* 168 in a dropdown is a number nobody converts: this reads "7 days". */
   const muteLabel = (h) => (h >= 24 && h % 24 === 0
     ? `${h / 24} day${h === 24 ? '' : 's'}`
     : `${h} hour${h === 1 ? '' : 's'}`);
@@ -231,7 +233,10 @@
       cell: (r) => App.deviceNameLink(r.entity_label,
                                       { id: r.device_id, search: false })
         || '\u2014' },
-    { key: 'rule_name', label: 'Rule', width: 150, on: true },
+    // The tag rides in this column: an operator scanning for alerts that
+    // are not arriving needs the reason beside the rule not raising them.
+    { key: 'rule_name', label: 'Rule', width: 150, on: true,
+      cell: (r) => escape(r.rule_name || '\u2014') + mutedTagFor(r) },
     { key: 'message', label: 'Message', width: 260, on: true,
       cell: (r) => `<span class="msg">${escape(r.message)}</span>` },
     { key: 'count', label: 'Count', width: 60, numeric: true, on: true,
@@ -247,6 +252,20 @@
       cell: (r) => App.agoCell(r.resolved_ts, '\u2014') },
     { key: 'entity_kind', label: 'Kind', width: 80 },
   ];
+
+  /* " muted" beside a rule name when this alert's device is muted, or this
+     rule is muted on it. Rebuilt per draw: view.rules is replaced on every
+     refresh. */
+  let ruleKeyById = new Map();
+
+  function mutedTagFor(row) {
+    const deviceId = row.device_id ? String(row.device_id) : '';
+    if (!deviceId) return '';
+    const key = ruleKeyById.get(row.rule_id) || '';
+    if (!view.mutes.has(deviceId)
+        && !(key && view.ruleMutes.has(`${deviceId}:${key}`))) return '';
+    return ` <span class="hint muted-tag">muted</span>`;
+  }
 
   const alertColumns = () => App.visibleColumns(
     COLUMNS, (App.state.alertsSettings || {}).table_columns);
@@ -285,6 +304,7 @@
   }
 
   function drawTable() {
+    ruleKeyById = new Map((view.rules || []).map((r) => [r.id, r.key || '']));
     const columns = alertColumns();
     const checked = view.checked;
     const table = App.grid(App.el('alerts-table'), {
@@ -506,6 +526,12 @@
     // null. It is in the signature because the mute area is drawn from it.
     const deviceId = row.device_id ? String(row.device_id) : '';
     const mutedUntil = deviceId ? (view.mutes.get(deviceId) || null) : null;
+    // Before the signature, not after: the per-rule mute area is drawn from
+    // this key, so the pane has to rebuild when it changes.
+    const rule = (view.rules || []).find((r) => r.id === row.rule_id);
+    const ruleKey = rule ? (rule.key || '') : '';
+    const ruleMutedUntil = deviceId && ruleKey
+      ? (view.ruleMutes.get(`${deviceId}:${ruleKey}`) || null) : null;
     // In the signature for the same reason mutedUntil is: the pane is only
     // rebuilt when this string changes, so a maintenance state left out of
     // it would leave the line and its button showing the previous answer
@@ -513,12 +539,11 @@
     const maint = deviceId ? (view.maintenance.get(deviceId) || null) : null;
     const signature = [row.id, row.state, row.count, row.last_ts,
                        row.acked_by, row.resolved_ts, row.rollup_note,
-                       deviceId, mutedUntil || '',
+                       deviceId, mutedUntil || '', ruleMutedUntil || '',
+                       ruleKey,
                        maint ? maint.started_ts : ''].join('|');
     if (view.detailSignature === signature) return;
     view.detailSignature = signature;
-    const rows = view.rules.length ? view.rules : [];
-    const rule = rows.find((r) => r.id === row.rule_id);
     // Checked against canWrite here rather than tagged data-requires-write,
     // because applyPermissions only ever runs over markup that already
     // exists — see the note on it in app.js.
@@ -537,20 +562,44 @@
         ? 'The device this alert is about is no longer in Nodes'
         : `Mute is for device alerts; this one is about ` +
           `${KIND_LABELS[row.entity_kind] || 'an object outside Nodes'}`);
-    let muteHtml;
+    // A rule the page never loaded (deleted since) has nothing to key on.
+    const ruleMuteable = muteable && Boolean(ruleKey);
+    const ruleWhy = muteable
+      ? 'This alert\u2019s rule is no longer in the rules list' : why;
+    // One dropdown for both buttons: two would be one too many to read.
+    const hoursHtml =
+      `<select id="alerts-d-mute-hours" class="fixed" title="How long to silence new alerts">` +
+      MUTE_HOURS.map((h) => `<option value="${h}">${muteLabel(h)}</option>`).join('') +
+      `</select>`;
+    let ruleMuteHtml;
+    if (ruleMutedUntil) {
+      const until = escape(App.when(ruleMutedUntil));
+      ruleMuteHtml =
+        `<span class="hint" id="alerts-d-rule-muted">Alert muted until ${until}</span>` +
+        (ruleMuteable
+          ? `<button id="alerts-d-unmute-rule">Lift alert mute</button>`
+          : `<button disabled title="${escape(ruleWhy)}">Lift alert mute</button>`);
+    } else if (ruleMuteable) {
+      ruleMuteHtml = `<button id="alerts-d-mute-rule">Mute alert</button>`;
+    } else {
+      ruleMuteHtml = `<button id="alerts-d-mute-rule" disabled title="${
+        escape(ruleWhy)}">Mute alert</button>`;
+    }
+    let deviceMuteHtml;
     if (mutedUntil) {
       const until = escape(App.when(mutedUntil));
-      muteHtml = `<span class="hint" id="alerts-d-muted">Muted until ${until}</span>` +
+      deviceMuteHtml = `<span class="hint" id="alerts-d-muted">Muted until ${until}</span>` +
         (muteable
           ? `<button id="alerts-d-unmute">Lift mute</button>`
           : `<button disabled title="${escape(why)}">Lift mute</button>`);
     } else if (muteable) {
-      muteHtml = `<select id="alerts-d-mute-hours" class="fixed" title="How long to silence new alerts for this device">` +
-        MUTE_HOURS.map((h) => `<option value="${h}">${muteLabel(h)}</option>`).join('') +
-        `</select><button id="alerts-d-mute">Mute device</button>`;
+      deviceMuteHtml = `<button id="alerts-d-mute">Mute device</button>`;
     } else {
-      muteHtml = `<button id="alerts-d-mute" disabled title="${escape(why)}">Mute device</button>`;
+      deviceMuteHtml = `<button id="alerts-d-mute" disabled title="${escape(why)}">Mute device</button>`;
     }
+    // The picker is drawn whenever either button would actually use it.
+    const muteHtml = ((!mutedUntil && muteable) || (!ruleMutedUntil && ruleMuteable)
+      ? hoursHtml : '') + ruleMuteHtml + deviceMuteHtml;
     // One line under the bar saying why the button is dead, because a
     // disabled control with only a tooltip is unreadable on a touch screen
     // and invisible to anyone who does not think to hover it.
@@ -605,15 +654,27 @@
     const unackBtn = document.getElementById('alerts-d-unack');
     if (unackBtn) unackBtn.onclick = () =>
       detailAction('Unacknowledge', () => App.post(`/api/alerts/${row.id}/unack`, {}), unackBtn);
+    const muteHours = () => {
+      const select = App.el('alerts-d-mute-hours');
+      return (select && Number(select.value)) || 1;
+    };
     const muteBtn = muteable ? document.getElementById('alerts-d-mute') : null;
-    if (muteBtn) muteBtn.onclick = () => detailAction('Mute', () => {
-      const hours = Number(App.el('alerts-d-mute-hours').value) || 1;
-      return App.post('/api/alerts/mute',
-                      { entity_kind: 'device', entity_id: deviceId, hours });
-    }, muteBtn);
+    if (muteBtn) muteBtn.onclick = () => detailAction('Mute', () =>
+      App.post('/api/alerts/mute',
+               { entity_kind: 'device', entity_id: deviceId, hours: muteHours() }),
+      muteBtn);
     const unmuteBtn = document.getElementById('alerts-d-unmute');
     if (unmuteBtn) unmuteBtn.onclick = () => detailAction('Lift mute', () =>
       App.del('/api/alerts/mute', { entity_kind: 'device', entity_id: deviceId }), unmuteBtn);
+    const muteRuleBtn = ruleMuteable ? document.getElementById('alerts-d-mute-rule') : null;
+    if (muteRuleBtn) muteRuleBtn.onclick = () => detailAction('Mute alert', () =>
+      App.post('/api/alerts/mute', { entity_kind: 'device', entity_id: deviceId,
+                                     rule_key: ruleKey, hours: muteHours() }),
+      muteRuleBtn);
+    const unmuteRuleBtn = document.getElementById('alerts-d-unmute-rule');
+    if (unmuteRuleBtn) unmuteRuleBtn.onclick = () => detailAction('Lift alert mute', () =>
+      App.del('/api/alerts/mute', { entity_kind: 'device', entity_id: deviceId,
+                                    rule_key: ruleKey }), unmuteRuleBtn);
     const endMaintBtn = document.getElementById('alerts-d-end-maintenance');
     if (endMaintBtn) endMaintBtn.onclick = () => detailAction('End maintenance', () =>
       App.del('/api/alerts/maintenance', { device_id: deviceId }), endMaintBtn);
@@ -1876,6 +1937,9 @@
     // entity_id -> until_ts, for the devices with an active mute. The server
     // only ever returns unexpired ones, so presence here means muted.
     view.mutes = new Map(mutes.mutes.filter((m) => m.entity_kind === 'device')
+      .map((m) => [String(m.entity_id), m.until_ts]));
+    view.ruleMutes = new Map(mutes.mutes
+      .filter((m) => m.entity_kind === 'device_rule')
       .map((m) => [String(m.entity_id), m.until_ts]));
     // The route only ever returns OPEN periods, so presence here means "in
     // maintenance right now" — the same read `mutes` above gets.

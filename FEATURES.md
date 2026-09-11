@@ -1631,6 +1631,20 @@ alerts and optionally emailing about them.
   read-only account can see what is muted but cannot mute, and sees no
   Resolve or Acknowledge in the detail either, the same gate the bulk
   buttons carry.
+- **One rule on one device can be muted** — **Mute alert** beside **Mute
+  device** in the alert detail, for the one rule that is noisy on one box
+  when silencing the box would hide the outage you actually care about.
+  Everything the device-wide mute does, it does for that rule alone: no new
+  alert, no email, no recovery message, no re-notify reminder, and alerting
+  back the moment it expires or is lifted. Every other rule on that device,
+  and the same rule on every other device, carries on untouched. Muting a
+  rule on a switch covers its **ports** the same way a device mute does, it
+  is offered on exactly the alerts *Mute device* is offered on, and it takes
+  the same durations and the same 7-day cap. The Alerts list tags a rule
+  that is muted on its device, the Nodes device list says how many of a
+  device's rules are muted when the device itself is not, and the device
+  pane names them. A device can be under a device mute and a rule mute at
+  once; the pane shows both lines.
 - **A whole list or group can be muted in one call, from 4.47.0** —
   **Mute selected**, alongside the other bulk actions — still under the
   same 7-day ad-hoc cap a single mute has.

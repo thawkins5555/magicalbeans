@@ -222,7 +222,15 @@
   /* " · alerts muted" when this device has an active mute, blank otherwise.
      muted_until comes from the Alerts module via the devices endpoint. */
   function mutedTag(row) {
-    if (!row.muted_until) return '';
+    if (!row.muted_until) {
+      // Only when there is no device-wide mute, which says more than a count.
+      const count = row.rule_muted_count || 0;
+      if (!count) return '';
+      return ` · <span class="hint muted-tag" title="${count} of this ` +
+        `device's alert rules ${count === 1 ? 'is' : 'are'} muted; the rest ` +
+        `still alert — see the device's Alerts line">${count} alert` +
+        `${count === 1 ? '' : 's'} muted</span>`;
+    }
     const until = App.when(row.muted_until);
     return ` · <span class="warn-text muted-tag" title="New alerts for this ` +
       `device are suppressed until ${escape(until)}">alerts muted</span>`;
@@ -1108,6 +1116,9 @@
         ? field('alerts', `muted until ${App.when(d.muted_until)}`,
                 'nd-v warn-text')
         : '',
+      ...(d.rule_mutes || []).map((m) => field(
+        'alert', `${m.rule_key} muted until ${App.when(m.until_ts)}`,
+        'nd-v warn-text')),
       d.override_count ? field('overrides', (d.override_fields || []).join(', ')) : '',
       ...fields.map((f) => (optional[f] ? optional[f]() : '')),
       // 'snmp', not 'error': the value is the agent's own words, and those

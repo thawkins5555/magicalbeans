@@ -4598,10 +4598,18 @@ ever ALTERs tables that already exist. Unique on `(entity_kind,
 entity_id)`, with `mute()` upserting so pressing the button again extends
 a mute instead of failing on the index.
 
-The gate is in `_tick`, beside `_hold_for_new_device`, **not** in
-`_apply`. A mute is per device, not per rule, so it belongs where one
-check covers an occurrence rather than where one check covers a
-(rule, occurrence) pair. `_occurrence_device` already resolves both
+The device-wide gate is in `_tick`, beside `_hold_for_new_device`, **not**
+in `_apply`: a device mute is per device, not per rule, so it belongs where
+one check covers an occurrence rather than where one check covers a
+(rule, occurrence) pair. The per-rule mute added in 5.11.0 is the mirror of
+that argument and so sits in the other place — `alert_mutes` rows with
+`entity_kind = 'device_rule'` and `entity_id = "<device_id>:<rule_key>"`
+(rule keys are identifiers and never carry a colon, so no column and no
+migration were needed), read once per tick into a dict like `muted` and
+checked by `_rule_muted` inside `_apply`, after `match_device` and before
+`dedup_key`, which is the first point where both halves of the pair are
+known. `_muted_alert` grew the same check for the already-open paths, and
+takes the rule its caller already has in hand rather than re-reading it. `_occurrence_device` already resolves both
 `entity_kind="device"` and `entity_kind="interface"` to a device row and
 returns None for everything structurally outside Nodes, so a muted
 switch's ports go quiet with it and syslog/trap/IPAM/AP occurrences

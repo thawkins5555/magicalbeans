@@ -28,6 +28,7 @@ from .alertrules import CLEARS, PUBLISHED_HYSTERESIS, \
     UNMANAGED_ONLY_RULES, Occurrence, breaches, dedup_key, device_id_for, \
     comparison_of, evaluate_flapping, evaluate_threshold, interface_label, \
     match_device, same_metric_pair, syslog_signature
+from .alertsdb import DEVICE_RULE_KIND
 from .eventlog import ALERTS, ERROR, NODES, NullLog
 from .nodepoll import reboot_uptimes
 from .nodesdb import TIMELINE_ONLY_EVENT_KINDS
@@ -213,7 +214,8 @@ class AlertEngine(Worker):
         self._system_clears: list[tuple[str, str]] = []
         self.counters = {"evaluated": 0, "opened": 0, "resolved": 0,
                          "emails_sent": 0, "suppressed": 0, "send_errors": 0,
-                         "rolled_up": 0, "muted": 0, "apply_errors": 0,
+                         "rolled_up": 0, "muted": 0, "rule_muted": 0,
+                         "apply_errors": 0,
                          "backlog": 0, "webhooks_sent": 0, "webhook_errors": 0,
                          "webhook_suppressed": 0}
         self._last_tick_ts: float = 0.0
@@ -330,6 +332,9 @@ class AlertEngine(Worker):
         # maintenance mode is quiet here too, and it has no until_ts to fold
         # into a dict keyed on one. Membership is all this gate reads.
         muted = self.db.quiet_device_ids(window_covered=window_covered)
+        # Read once per tick like `muted`, checked in _apply where the rule
+        # is known.
+        rule_muted = self.db.muted_entity_ids(DEVICE_RULE_KIND)
         for occurrence in occurrences:
             self.counters["evaluated"] += 1
             # Per occurrence, not per tick. The apply path is not
@@ -347,7 +352,7 @@ class AlertEngine(Worker):
                     continue
                 if muted and self._muted(occurrence, muted):
                     continue
-                self._apply(rules, occurrence, settings)
+                self._apply(rules, occurrence, settings, rule_muted)
             except Exception:
                 self.counters["apply_errors"] += 1
                 self.log.add(ERROR,
@@ -608,7 +613,23 @@ class AlertEngine(Worker):
         self.counters["muted"] += 1
         return True
 
-    def _muted_alert(self, alert_row) -> bool:
+    def _rule_muted(self, rule, occurrence: Occurrence, rule_muted) -> bool:
+        """True when THIS rule is muted on the device this occurrence is
+        about. In _apply, not beside _muted, because the answer needs the
+        rule too; device_id_for gives it a device mute's exact reach.
+        """
+        rule_key = rule["key"] or ""
+        if not rule_key:
+            return False
+        device_id = device_id_for(occurrence.entity_kind, occurrence.entity_id)
+        if device_id is None:
+            return False
+        if f"{device_id}:{rule_key}" not in rule_muted:
+            return False
+        self.counters["rule_muted"] += 1
+        return True
+
+    def _muted_alert(self, alert_row, rule_row=None) -> bool:
         """Whether an existing alert's device is in maintenance mode, muted,
         OR covered by an active maintenance window.
 
@@ -626,6 +647,13 @@ class AlertEngine(Worker):
         if device_id is None:
             return False
         if self.db.mute_row("device", str(device_id)) is not None:
+            return True
+        # Or muting one rule would stop its alerts opening and still mail
+        # about the ones already open. Callers pass the rule they hold.
+        rule = rule_row if rule_row is not None else self.db.rule(alert_row["rule_id"])
+        rule_key = (rule["key"] or "") if rule is not None else ""
+        if rule_key and self.db.mute_row(
+                DEVICE_RULE_KIND, f"{device_id}:{rule_key}") is not None:
             return True
         device = self.nodes_db.device(device_id)
         device_group_id = device["device_group_id"] if device is not None else None
@@ -2622,7 +2650,8 @@ class AlertEngine(Worker):
                     self._skip_held_open_notify(
                         resolved, settings, self._ROLLUP_NO_ROW_REASON)
 
-    def _apply(self, rules, occurrence: Occurrence, settings) -> None:
+    def _apply(self, rules, occurrence: Occurrence, settings,
+               rule_muted=None) -> None:
         rollup = bool(settings.get("rollup_enabled", True))
         for rule in rules:
             if rule["kind"] != occurrence.kind:
@@ -2683,6 +2712,8 @@ class AlertEngine(Worker):
                 # trap_critical, and interface_down from polling.
                 continue
             if not match_device(rule, occurrence):
+                continue
+            if rule_muted and self._rule_muted(rule, occurrence, rule_muted):
                 continue
             key = dedup_key(rule, occurrence)
             if rollup:
@@ -2822,7 +2853,7 @@ class AlertEngine(Worker):
             # alerts_due_renotify reads COALESCE(last_notified_ts, opened_ts),
             # so the alert is still due the moment the silence lifts and one
             # reminder goes out then.
-            if self._muted_alert(row):
+            if self._muted_alert(row, rule):
                 continue
             occurrence = self._occurrence_from_alert_row(row, rule)
             self._notify(row, rule, occurrence, settings, renotify=True)
@@ -3119,7 +3150,7 @@ class AlertEngine(Worker):
         # alert itself still resolves — the list stays truthful whatever the
         # mute says — but "muted" has to mean the operator's inbox goes
         # quiet, or the mute has silenced only half of what it promised.
-        if self._muted_alert(alert_row):
+        if self._muted_alert(alert_row, rule_row):
             return
         template = self.db.template_by_key("device_up")
         if template is None:
@@ -3249,7 +3280,7 @@ class AlertEngine(Worker):
                     "not sent: the device is in maintenance mode",
                     maintenance_held=True)
                 continue
-            if self._muted_alert(alert_row):
+            if self._muted_alert(alert_row, rule_row):
                 self._hold_quiet_notify(alert_row)
                 continue
             sendable.append((alert_row, rule_row, occurrence))

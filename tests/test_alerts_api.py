@@ -292,6 +292,107 @@ try:
          {"comparison": "above", "threshold": 90.0, "clear_threshold": 80.0},
          token=admin)
 
+    # ------------------------------- 4d. muting ONE rule on ONE device
+
+    rule_mark = service.app_db.audit_last_id()
+    pair = f"{switch}:device_down"
+
+    status, payload = call("POST", "/api/alerts/mute",
+                           {"entity_kind": "device", "entity_id": str(switch),
+                            "rule_key": "device_down", "hours": 2}, token=admin)
+    mute = payload.get("mute", {}) if status == 200 else {}
+    check("a mute naming a rule_key is stored under the device_rule kind",
+          status == 200 and mute.get("entity_kind") == "device_rule"
+          and mute.get("entity_id") == pair
+          and mute.get("rule_key") == "device_down"
+          and mute.get("device_id") == switch, (status, payload))
+
+    status, payload = call("GET", "/api/alerts/mutes", token=viewer)
+    listed = ([m for m in payload.get("mutes", [])
+               if m["entity_kind"] == "device_rule"] if status == 200 else [])
+    check("a read-only account sees it in the mute list, spelled out",
+          status == 200 and len(listed) == 1 and listed[0]["entity_id"] == pair
+          and listed[0]["rule_key"] == "device_down", (status, payload))
+
+    status, payload = call("GET", f"/api/alerts/{device_alert}", token=admin)
+    check("the single-alert route carries the rule key the pane mutes on",
+          status == 200 and payload["alert"]["rule_key"] == "device_down",
+          (status, payload))
+
+    status, payload = call("POST", "/api/alerts/mute",
+                           {"entity_kind": "device", "entity_id": str(switch),
+                            "rule_key": "no_such_rule", "hours": 1}, token=admin)
+    check("an unknown rule key is refused rather than stored as a mute that "
+          "silences nothing", status == 400, (status, payload))
+
+    status, payload = call("POST", "/api/alerts/mute",
+                           {"entity_kind": "device", "entity_id": "987654",
+                            "rule_key": "device_down", "hours": 1}, token=admin)
+    # _require's "No such <thing>" shape, which this API answers 400 for.
+    check("a device that is not in Nodes is refused by name",
+          status == 400 and "No such device" in str(payload), (status, payload))
+
+    status, payload = call("POST", "/api/alerts/mute",
+                           {"entity_kind": "device", "entity_id": str(switch),
+                            "rule_key": "device_down", "hours": 1}, token=viewer)
+    check("a read-only account cannot mute one rule either", status == 403,
+          (status, payload))
+    status, payload = call("DELETE", "/api/alerts/mute",
+                           {"entity_kind": "device", "entity_id": str(switch),
+                            "rule_key": "device_down"}, token=viewer)
+    check("...nor lift one", status == 403, (status, payload))
+
+    status, payload = call("GET", "/api/nodes/devices", token=viewer)
+    devices = {d["id"]: d for d in payload.get("devices", [])} if status == 200 else {}
+    check("the Nodes row counts the muted rule and does NOT claim the whole "
+          "device is muted",
+          devices.get(switch, {}).get("rule_muted_count") == 1
+          and devices.get(switch, {}).get("muted_until") is None,
+          devices.get(switch))
+
+    status, payload = call("GET", f"/api/nodes/devices/{switch}", token=viewer)
+    rule_mutes = payload.get("device", {}).get("rule_mutes", []) if status == 200 else []
+    check("...and the device pane names which rule, and until when",
+          len(rule_mutes) == 1 and rule_mutes[0]["rule_key"] == "device_down"
+          and rule_mutes[0]["until_ts"] > time.time(), (status, rule_mutes))
+
+    status, payload = call("DELETE", "/api/alerts/mute",
+                           {"entity_kind": "device", "entity_id": str(switch),
+                            "rule_key": "device_down"}, token=admin)
+    check("lifting it by the same pair reports the row it removed",
+          status == 200 and payload.get("lifted") is True, (status, payload))
+    status, payload = call("GET", "/api/nodes/devices", token=admin)
+    devices = {d["id"]: d for d in payload.get("devices", [])} if status == 200 else {}
+    check("...and the Nodes count is back to zero",
+          devices.get(switch, {}).get("rule_muted_count") == 0,
+          devices.get(switch))
+
+    rule_audit = [(r["action"], r["target"])
+                  for r in service.app_db.audit_events(rule_mark, 500)]
+    check("the audit target names the kind and the pair, so a reader can tell "
+          "a per-rule mute from a whole-device one",
+          ("alert.mute", f"device_rule:{pair}") in rule_audit, rule_audit)
+
+    # Direct, not over the wire: a Nodes merge does far more than this, and
+    # only what Alerts does with the loser's rule mutes is under test.
+    loser = service.nodes_db.add_device("192.0.2.40", name="Duplicate Switch",
+                                        group_id=group_id)
+    service.alerts_db.mute("device_rule", f"{loser}:device_down", 2.0, by="admin")
+    service.alerts_db.mute("device_rule", f"{loser}:device_rebooted", 2.0, by="admin")
+    service.alerts_db.mute("device_rule", f"{switch}:device_rebooted", 2.0, by="admin")
+    moved = service.alerts_db.merge_device(loser, switch)
+    check("a merge hands the loser's per-rule mutes to the surviving id",
+          moved.get("rule_mutes") == 1
+          and service.alerts_db.mute_row("device_rule", pair) is not None, moved)
+    check("...and the one the winner already held is dropped, not duplicated "
+          "or left pointing at an id that is gone",
+          service.alerts_db.mute_row("device_rule", f"{loser}:device_down") is None
+          and service.alerts_db.mute_row("device_rule", f"{loser}:device_rebooted") is None
+          and service.alerts_db.mute_row("device_rule",
+                                         f"{switch}:device_rebooted") is not None)
+    service.alerts_db.unmute("device_rule", pair)
+    service.alerts_db.unmute("device_rule", f"{switch}:device_rebooted")
+
     # ------------------------------- 5. a device that is gone is not muteable
 
     ghost = service.nodes_db.add_device("192.0.2.21", name="Removed Switch",
@@ -442,10 +543,13 @@ try:
     # Deleting a device must take its maintenance with it: devices.id is
     # reissued, so a leftover period would silence whoever inherits it.
     call("POST", "/api/alerts/maintenance", {"device_id": spare}, token=admin)
+    service.alerts_db.mute("device_rule", f"{spare}:device_down", 2.0, by="admin")
     call("DELETE", f"/api/nodes/devices/{spare}", token=admin)
     check("deleting a device leaves no maintenance period behind for the "
           "next device to inherit its rowid",
           service.alerts_db.open_maintenance(spare) is None)
+    check("...nor any of its per-rule mutes, for exactly the same reason",
+          service.alerts_db.mute_row("device_rule", f"{spare}:device_down") is None)
 
     # ------------------------------- bulk maintenance is one batch, not a loop
     #

@@ -3855,6 +3855,13 @@ def _device_rows_json(service, params, rows) -> list[dict]:
     # until_ts, and anything rendering muted_until prints "muted until <a
     # date>" — an operator handed a date that never arrives waits for it.
     maintenance = service.alerts_db.maintenance_device_ids()
+    # A count, not a list: the row has room for "2 alerts muted" and the
+    # device pane below spells them out.
+    rule_muted_counts: dict[int, int] = {}
+    for entity_id in service.alerts_db.muted_entity_ids(alertsdb.DEVICE_RULE_KIND):
+        pair = alertsdb.split_device_rule(entity_id)
+        if pair is not None:
+            rule_muted_counts[pair[0]] = rule_muted_counts.get(pair[0], 0) + 1
     # A device merged into another keeps the address it was entered under as
     # an alias, and the list is where an operator looks for that address —
     # so the whole set rides along, in one read for the page rather than one
@@ -3866,6 +3873,7 @@ def _device_rows_json(service, params, rows) -> list[dict]:
         device = _device_json(row, reveal)
         device["polling"] = row["id"] in worker_state
         device["muted_until"] = muted.get(str(row["id"]))
+        device["rule_muted_count"] = rule_muted_counts.get(row["id"], 0)
         maint_row = maintenance.get(str(row["id"]))
         device["maintenance"] = _maintenance_json(maint_row) if maint_row else None
         device["addresses"] = _device_addresses_json(
@@ -4653,6 +4661,14 @@ def get_nodes_device(service, params, body, device_id) -> dict:
     # can be muted AND in maintenance at once, and both lines render.
     maint_row = service.alerts_db.open_maintenance(device_id)
     device["maintenance"] = _maintenance_json(maint_row) if maint_row else None
+    # Named rather than counted: the one place with room to say which.
+    rule_mutes = []
+    for entity_id, until_ts in service.alerts_db.muted_entity_ids(
+            alertsdb.DEVICE_RULE_KIND).items():
+        pair = alertsdb.split_device_rule(entity_id)
+        if pair is not None and pair[0] == device_id:
+            rule_mutes.append({"rule_key": pair[1], "until_ts": until_ts})
+    device["rule_mutes"] = sorted(rule_mutes, key=lambda m: m["rule_key"])
     # Rides in the device JSON rather than behind its own fetch: the
     # ADDRESSES subtab is one short list the detail pane already has a
     # round trip for, and a second request per device selection to carry
@@ -6883,6 +6899,8 @@ def get_alert(service, params, body, alert_id) -> dict:
     alert = _alert_json(row, _alert_device_ids(service, [row]))
     rule = service.alerts_db.rule(row["rule_id"])
     alert["rule_name"] = rule["name"] if rule else ""
+    # What a per-rule mute is keyed on, for the detail pane's Mute alert.
+    alert["rule_key"] = (rule["key"] or "") if rule else ""
     notifications = service.alerts_db.notifications_for(alert_id)
     return {"alert": alert, "notifications": [
         {"id": n["id"], "kind": n["kind"], "ts": n["ts"], "to_addr": n["to_addr"],
@@ -6913,24 +6931,56 @@ def post_alert_resolve(service, params, body, alert_id) -> dict:
 
 
 def _mute_json(row) -> dict:
+    """One mute row, with the pair a device_rule id encodes spelled out."""
+    pair = (alertsdb.split_device_rule(row["entity_id"])
+            if row["entity_kind"] == alertsdb.DEVICE_RULE_KIND else None)
+    if pair is not None:
+        device_id, rule_key = pair
+    else:
+        rule_key = None
+        try:
+            device_id = int(row["entity_id"])
+        except (TypeError, ValueError):
+            device_id = None
     return {"entity_kind": row["entity_kind"], "entity_id": row["entity_id"],
+            "device_id": device_id, "rule_key": rule_key,
             "until_ts": row["until_ts"], "created_ts": row["created_ts"],
             "created_by": row["created_by"], "reason": row["reason"]}
 
 
-def _mute_entity(body) -> tuple[str, str]:
-    """The (kind, id) a mute request names, refusing anything the engine
-    would not actually check — a mute that silences nothing is worse than
-    an error, because the operator walks away believing it worked."""
+def _mute_entity(service, body, require_rule: bool) -> tuple[str, str, int]:
+    """The (kind, id, device id) a mute request names, refusing anything the
+    engine would not actually check — a mute that silences nothing is worse
+    than an error, because the operator walks away believing it worked.
+
+    A per-rule mute arrives either way round: a device id plus `rule_key`,
+    or kind "device_rule" with the pair joined. `require_rule` is off on
+    DELETE, so a rule deleted under a live mute is still liftable."""
     kind = str(body.get("entity_kind", "device")).strip() or "device"
-    if kind != "device":
+    if kind not in ("device", alertsdb.DEVICE_RULE_KIND):
         # The column is general, so a per-interface or per-AP mute later
         # needs no migration; nothing else is muteable today.
         raise ValueError("Only devices can be muted")
+    rule_key = str(body.get("rule_key", "") or "").strip()
     entity_id = str(body.get("entity_id", "")).strip()
+    if kind == alertsdb.DEVICE_RULE_KIND and not rule_key:
+        pair = alertsdb.split_device_rule(entity_id)
+        if pair is None:
+            raise ValueError("A device and a rule are required")
+        entity_id, rule_key = str(pair[0]), pair[1]
     if not entity_id:
         raise ValueError("A device is required")
-    return kind, entity_id
+    try:
+        device_id = int(entity_id)
+    except (TypeError, ValueError):
+        raise ValueError("A device is required")
+    _require(service.nodes_db.device(device_id), "device")
+    if not rule_key:
+        return "device", str(device_id), device_id
+    if require_rule and service.alerts_db.rule_by_key(rule_key) is None:
+        raise ValueError(f"No rule with key {rule_key}")
+    return (alertsdb.DEVICE_RULE_KIND,
+            alertsdb.device_rule_entity(device_id, rule_key), device_id)
 
 
 def get_alerts_mutes(service, params, body) -> dict:
@@ -6938,12 +6988,7 @@ def get_alerts_mutes(service, params, body) -> dict:
 
 
 def post_alerts_mute(service, params, body) -> dict:
-    kind, entity_id = _mute_entity(body)
-    try:
-        device = service.nodes_db.device(int(entity_id))
-    except (TypeError, ValueError):
-        device = None
-    _require(device, "device")
+    kind, entity_id, _device_id = _mute_entity(service, body, require_rule=True)
     try:
         hours = float(body.get("hours", 1))
     except (TypeError, ValueError):
@@ -6959,7 +7004,7 @@ def post_alerts_mute(service, params, body) -> dict:
 
 
 def delete_alerts_mute(service, params, body) -> dict:
-    kind, entity_id = _mute_entity(body)
+    kind, entity_id, _device_id = _mute_entity(service, body, require_rule=False)
     lifted = service.alerts_db.unmute(kind, entity_id)
     _audit(service, params, "alert.unmute", target=f"{kind}:{entity_id}")
     return {"lifted": lifted}
