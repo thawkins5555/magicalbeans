@@ -8,11 +8,14 @@ resolver this file starts and stops itself. Timing bounds carry a wide margin.
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import time
 
 from _paths import REPO_ROOT, STUBS_DIR
 
 from netpath import mibparse
+from netpath import nodeoids
 from netpath import syslogparse
 
 MIB_DIR = os.path.join(REPO_ROOT, "netpath", "mibs")
@@ -1201,6 +1204,80 @@ def syslog_mib_dos_regressions():
 
 
 syslog_mib_dos_regressions()
+
+
+# ------------------------------- H13: an OID arc that is not a whole number
+#
+# enc_oid's base-128 loop is `while value:` over `value >>= 7`, and -1 >> 7
+# is -1 in Python: one negative arc spins it for ever, appending a byte per
+# turn. Three paths fed it text nobody had checked -- a MIB clause
+# (`::= { enterprises -7 }`), an operator's OID override, and the MIB-object
+# PUT route -- and str.isdigit(), which both OID validators used, is True
+# for '²' and '٣' while int() refuses them.
+
+print("H13 an OID with a negative or non-ASCII arc never reaches the encoder")
+
+ENC_OID_PROBE = f"""
+import sys
+sys.path.insert(0, {REPO_ROOT!r})
+from netpath.trapdecode import enc_oid
+for bad in ("1.3.-1", "1.3.6.1.4.1.-7", "1.-2.3"):
+    try:
+        enc_oid(bad)
+    except ValueError:
+        continue
+    raise SystemExit(f"{{bad}} was encoded instead of refused")
+assert enc_oid("1.3.6.1.2.1.1.1.0").hex() == "06082b06010201010100"
+print("ok")
+"""
+
+try:
+    done = subprocess.run([sys.executable, "-c", ENC_OID_PROBE], timeout=30,
+                          capture_output=True, text=True)
+    encoder_ok = done.returncode == 0
+    encoder_detail = (done.stdout + done.stderr).strip()
+except subprocess.TimeoutExpired:
+    encoder_ok, encoder_detail = False, "enc_oid still running after 30s"
+check("enc_oid refuses a negative arc instead of looping for ever "
+      "(and still encodes a real OID byte for byte)", encoder_ok, encoder_detail)
+
+neg_mib = """TEST-MIB DEFINITIONS ::= BEGIN
+goodRoot OBJECT IDENTIFIER ::= { enterprises 99999 }
+literalNeg OBJECT IDENTIFIER ::= { enterprises -7 }
+absoluteNeg OBJECT IDENTIFIER ::= { 1 3 6 1 4 1 -7 }
+negScalar OBJECT-TYPE
+    SYNTAX INTEGER
+    ACCESS read-only
+    STATUS mandatory
+    DESCRIPTION "hangs the poller of every device this file is assigned to"
+    ::= { goodRoot -1 }
+goodScalar OBJECT-TYPE
+    SYNTAX INTEGER
+    ACCESS read-only
+    STATUS mandatory
+    DESCRIPTION "the neighbour that must still resolve"
+    ::= { goodRoot 1 }
+END
+"""
+parsed = mibparse.parse(neg_mib)
+mibparse.resolve(parsed.objects, dict(mibparse.WELL_KNOWN_ROOTS))
+oids = {obj.name: obj.oid for obj in parsed.objects}
+check("a MIB clause hanging off a negative arc leaves its object unresolved, "
+      "so no poll ever asks for it",
+      oids.get("literalNeg") is None and oids.get("absoluteNeg") is None
+      and oids.get("negScalar") is None, repr(oids))
+check("...while its neighbours in the same file resolve as they always did",
+      oids.get("goodScalar") == "1.3.6.1.4.1.99999.1", repr(oids))
+
+check("normalize_oid refuses a superscript or Arabic-Indic digit, which "
+      "str.isdigit() alone accepts and int() then refuses",
+      nodeoids.normalize_oid("1.3.\u00b2") == ""
+      and nodeoids.normalize_oid("1.3.6.1.4.1.\u0663") == "",
+      repr((nodeoids.normalize_oid("1.3.\u00b2"),
+            nodeoids.normalize_oid("1.3.6.1.4.1.\u0663"))))
+check("...and still accepts an ordinary one",
+      nodeoids.normalize_oid(" .1.3.6.1.4.1.9.1.1208 ") == "1.3.6.1.4.1.9.1.1208",
+      nodeoids.normalize_oid(" .1.3.6.1.4.1.9.1.1208 "))
 
 if failures:
     print(f"\nFAILED: {len(failures)} check(s): {', '.join(failures)}")

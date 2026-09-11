@@ -908,11 +908,25 @@
     return PAD_X + frac * (width - 2 * PAD_X);
   }
 
+  /* getBoundingClientRect forces a synchronous layout, and fastTick calls
+     drawTimeline ten times a second: the size is measured on the first draw
+     and again only when something that can change it says so (init's resize
+     and panes-resized listeners clear the cache). A pane with no layout yet
+     measures 0 and falls back to the minimum, which is not cached — or the
+     timeline would stay 300x150 once the real layout arrived. */
+  let timelineSize = null;
+
+  function measureTimeline() {
+    const box = App.el('timeline').getBoundingClientRect();
+    const size = { width: Math.max(box.width, 300), height: Math.max(box.height, 150) };
+    timelineSize = (box.width && box.height) ? size : null;
+    return size;
+  }
+
   function drawTimeline() {
     const svg = App.el('timeline-svg');
     const timelineEl = App.el('timeline');
-    const box = timelineEl.getBoundingClientRect();
-    const width = Math.max(box.width, 300), height = Math.max(box.height, 150);
+    const { width, height } = timelineSize || measureTimeline();
     const data = view.timeline;
     const t0 = view.t0, t1 = view.t1;
 
@@ -923,8 +937,11 @@
     // live playhead is the one thing that genuinely moves every beat, so
     // when the key below still matches what was last drawn, only that
     // line's position is touched and nothing else is rebuilt.
+    // No drag state in the key: the brush is one persistent rect moved in
+    // place by the pointermove handler below, so a drag no longer misses the
+    // signature and rebuilds the whole timeline once per pointer event.
     const sig = `${width}x${height}:${t0}:${t1}:${data ? data.buckets.length : 'x'}` +
-      `:${view.pinned || ''}:${view.drag ? `${view.drag.from}-${view.drag.to}` : ''}`;
+      `:${view.pinned || ''}`;
     if (svg.dataset.timelineSig === sig) {
       if (view.playhead) {
         const x = playheadX(width, t0, t1);
@@ -1076,16 +1093,24 @@
       view.playhead.setAttribute('x2', x);
       svg.dataset.playheadX = String(x);
     }
-    if (view.drag) {
+    const brush = App.svgNode('rect', {
+      x: 0, y: L.rtt.y - 4, width: 0,
+      height: L.status.y + L.status.h - L.rtt.y + 8,
+      fill: 'var(--accent)', 'fill-opacity': 0.14,
+      stroke: 'var(--accent)', visibility: 'hidden',
+    });
+    svg.appendChild(brush);
+    // A timeline rebuilt mid-drag (a refresh landing) gets the brush back
+    // from view.drag here; every pointermove only moves it.
+    const paintBrush = () => {
+      if (!view.drag) { brush.setAttribute('visibility', 'hidden'); return; }
       const a = xFor(Math.min(view.drag.from, view.drag.to));
       const b = xFor(Math.max(view.drag.from, view.drag.to));
-      svg.appendChild(App.svgNode('rect', {
-        x: a, y: L.rtt.y - 4, width: Math.max(b - a, 2),
-        height: L.status.y + L.status.h - L.rtt.y + 8,
-        fill: 'var(--accent)', 'fill-opacity': 0.14,
-        stroke: 'var(--accent)',
-      }));
-    }
+      brush.setAttribute('x', a);
+      brush.setAttribute('width', Math.max(b - a, 2));
+      brush.setAttribute('visibility', 'visible');
+    };
+    paintBrush();
 
     svg.onpointerdown = (event) => {
       if (event.button !== 0 || !event.isPrimary) return;
@@ -1105,7 +1130,7 @@
       if (view.drag) {
         view.drag.to = timeAt(x);
         view.drag.moved = Math.abs(xFor(view.drag.to) - xFor(view.drag.from)) > 5;
-        drawTimeline();
+        paintBrush();
         return;
       }
       crosshair.setAttribute('x1', x);
@@ -1121,11 +1146,12 @@
       if (!view.drag) return;
       const { from, to, moved } = view.drag;
       view.drag = null;
+      paintBrush();
       if (moved) { view.pinned = null; setWindow(Math.min(from, to), Math.max(from, to), false); }
       else { view.pinned = from; App.refreshNow('netpath'); }
     };
     // A cancelled gesture selects nothing and pins nothing.
-    svg.onpointercancel = () => { view.drag = null; drawTimeline(); };
+    svg.onpointercancel = () => { view.drag = null; paintBrush(); drawTimeline(); };
     svg.oncontextmenu = (event) => {
       event.preventDefault();
       view.pinned = null;
@@ -1432,6 +1458,9 @@
     // rebuilt for the new size, not just stretched.
     for (const event of ['resize', 'panes-resized']) {
       window.addEventListener(event, () => {
+        // Dropped whichever tab is on screen: a resize while the operator is
+        // elsewhere would otherwise leave the cached size behind for good.
+        timelineSize = null;
         if (App.state.tab === 'netpath') { drawTimeline(); drawRoute(); }
       });
     }

@@ -740,8 +740,8 @@ def test_interface_cap_is_a_note_not_an_error():
         # answers every per-interface GET with nothing in particular.
         poller._walk_indexes = lambda device, config, oid, raise_on_timeout=False: (
             list(range(1, reported + 1)), True, "")
-        poller._interface_varbinds = lambda device, config, if_index, is_v1, want_ifx: (
-            {}, want_ifx)
+        poller._interface_varbinds = lambda device, config, if_index, is_v1, \
+            want_ifx, session=None, credential=None: ({}, want_ifx)
         poller._poll_snmp_scalars_with_credential = lambda device, config: (
             config, {"sys_descr": "big chassis", "sys_name": "core-chassis"},
             100_000, [])

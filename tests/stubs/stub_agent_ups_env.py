@@ -15,6 +15,10 @@ Modes:
              takes 118) and a two-line upsOutputTable (55%, 72% --
              column_max takes 72). A generic (non-APC) sysObjectID, so the
              APC runtime fallback is never reached from this mode.
+  wild_scale The `hardware` sensor table with entPhySensorScale answered as
+             2147483647 and entPhySensorPrecision as -2147483648 on every
+             row: both are exponents, and an unclamped reader never
+             returns from one such row.
   no_ups     Generic scalars only, no UPS-MIB object at all: proves the two
              UPS table walks are never attempted when the scalar batch
              answered nothing.
@@ -220,6 +224,21 @@ HARDWARE_TABLE = {
     "1.3.6.1.2.1.99.1.1.1.4.5": ("int", 35),    # #5 value: 35 A
     "1.3.6.1.2.1.99.1.1.1.5.5": ("int", 1),     # #5 status: ok
     "1.3.6.1.2.1.47.1.1.1.1.4.5": ("int", 1),   # entPhysicalContainedIn: 5 -> 1
+}
+
+# HARDWARE_TABLE with every entPhySensorScale answered as the largest legal
+# Integer32 and every entPhySensorPrecision as the smallest -- the shape a
+# buggy or hostile agent produces, and the one that made
+# _scaled_sensor_value build a multi-billion-digit integer and never
+# return. Every other column is untouched, so a reader that clamps the two
+# exponents gets the raw values back at scale 9 / precision 0.
+_SENSOR_SCALE_COLUMN = "1.3.6.1.2.1.99.1.1.1.2."
+_SENSOR_PRECISION_COLUMN = "1.3.6.1.2.1.99.1.1.1.3."
+WILD_SCALE_TABLE = {
+    oid: (("int", 2147483647) if oid.startswith(_SENSOR_SCALE_COLUMN) else
+          ("int", -2147483648) if oid.startswith(_SENSOR_PRECISION_COLUMN)
+          else value)
+    for oid, value in HARDWARE_TABLE.items()
 }
 
 # CISCO-ENVMON-MIB (1.3.6.1.4.1.9.9.13): one row each of supply/fan/
@@ -540,6 +559,8 @@ def table_for():
         return {**GENERIC_SCALARS, **SENSOR_TABLE_NO_HUMIDITY}
     if MODE == "hardware":
         return {**CISCO_SCALARS, **HARDWARE_TABLE, **CISCO_ENVMON_TABLE}
+    if MODE == "wild_scale":
+        return {**CISCO_SCALARS, **WILD_SCALE_TABLE}
     if MODE == "cisco_dom":
         return {**CISCO_SCALARS, **CISCO_DOM_TABLE}
     if MODE == "cisco_dom_thresholds":

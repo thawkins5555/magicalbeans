@@ -13,9 +13,11 @@ with read_dom() on value/unit/status for the same sensor; the two api.py
 routes; a device with no SNMP and a device with no sensors at all.
 """
 import socket
+import subprocess
+import sys
 import time
 
-from _paths import spawn_stub, tmpdir
+from _paths import REPO_ROOT, spawn_stub, tmpdir
 
 import netpath.nodepoll as nodepoll_mod
 from netpath.nodesdb import NodesDatabase
@@ -402,6 +404,69 @@ try:
           "already had -- a timeout is not evidence the optic was pulled",
           db.interfaces(did)[0]["media"] == "optic",
           db.interfaces(did)[0]["media"])
+    db.close()
+finally:
+    stub.kill()
+
+# ============================ § 6 a device's own entPhySensorScale
+
+# entPhySensorScale and entPhySensorPrecision come off the wire and are
+# used as EXPONENTS: raw x 10^(3*(scale-9)) / 10^precision. An agent
+# answering scale = 2147483647 -- a perfectly legal Integer32 -- had
+# CPython build a multi-billion-digit integer and never return, on a poll
+# worker and, through read_dom/read_hardware, on an HTTP thread too. Run
+# in a child process under a timeout: an unfixed tree does not fail these
+# assertions, it hangs on them.
+
+SENSOR_PROBE = f"""
+import sys
+sys.path.insert(0, {REPO_ROOT!r})
+from netpath.nodepoll import NodePoller
+
+poller = NodePoller.__new__(NodePoller)
+row = poller._decode_entity_sensor(
+    "1001", 42, {{"1001": 8}}, {{"1001": 2147483647}},
+    {{"1001": -2147483648}}, {{"1001": 1}}, {{}}, {{"1001": "Te1/1/1"}})
+assert row is not None and row["value"] == 42.0, row
+assert poller._scaled_sensor_value(1, 10 ** 7, 0) == 1
+assert poller._scaled_sensor_value(5, 8, 1) == 0.0005, \\
+    poller._scaled_sensor_value(5, 8, 1)
+print("ok")
+"""
+
+
+def run_probe(source: str, seconds: float = 30.0):
+    """(finished, stdout) for a snippet run in its own interpreter."""
+    try:
+        done = subprocess.run([sys.executable, "-c", source], timeout=seconds,
+                              capture_output=True, text=True)
+    except subprocess.TimeoutExpired:
+        return False, f"still running after {seconds:.0f}s"
+    return done.returncode == 0, (done.stdout + done.stderr).strip()
+
+
+finished, output = run_probe(SENSOR_PROBE)
+check("a sensor row quoting scale 2147483647 and precision -2147483648 is "
+      "decoded (at the MIB's own default scale) instead of pinning the "
+      "worker for ever", finished, output)
+
+# The real read path, through a stub answering the same nonsense.
+stub, port = spawn_stub("stub_agent_ups_env.py", "wild_scale")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_nodes_db("wild_scale")
+    did = device_against(db, "hw-6")
+    db.replace_interfaces(did, [{"if_index": 1, "descr": "Gi0/1"}])
+    poller = NodePoller(db)
+    started = time.time()
+    result = poller.read_hardware(did)
+    elapsed = time.time() - started
+    sensors = {s["entity"]: s for s in result["sensors"]}
+    check("read_hardware finishes against an agent answering an out-of-range "
+          "entPhySensorScale on every row", elapsed < 20.0, f"{elapsed:.1f}s")
+    check("...and every sensor row still comes back, read at scale 9",
+          set(sensors) == {1, 2, 3, 4, 5} and sensors[1]["value"] == 451.0,
+          sorted((e, s["value"]) for e, s in sensors.items()))
     db.close()
 finally:
     stub.kill()

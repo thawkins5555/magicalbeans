@@ -170,6 +170,18 @@ try:
           status == 200 and payload["alerts"] == [],
           (status, [row.get("message") for row in payload.get("alerts", [])]))
 
+    # A selection accumulated across Alerts pages is a Set that survives
+    # paging, so the route genuinely receives thousands of ids. One statement
+    # per call would bind one parameter each and fail with "too many SQL
+    # variables" — a 500 — on any host whose Python links a SQLite older than
+    # 3.32, where the ceiling is 999 rather than 32,766. See
+    # tests/test_bulk_id_chunking.py for the store-level half.
+    status, payload = call("POST", "/api/alerts/bulk-resolve",
+                           {"alert_ids": list(range(900_000, 901_500))},
+                           token=admin_token)
+    check("fifteen hundred ids in one bulk resolve is answered, not a 500",
+          status == 200 and payload.get("resolved") == 0, (status, payload))
+
     status, payload = call("GET", f"/api/alerts?rule_id={down_rule['id']}",
                            token=admin_token)
     resolved = [row for row in payload["alerts"] if row["state"] == "resolved"]

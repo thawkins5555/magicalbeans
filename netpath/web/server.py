@@ -974,13 +974,13 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
         try:
-            length = self._content_length()
-        except ValueError:          # LengthRequired included
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
             self.close_connection = True
             return
         if length <= 0:
             return
-        if length > self.MAX_DRAIN_BYTES:
+        if length > self.MAX_BODY_BYTES:
             self.close_connection = True
             return
         try:
@@ -997,7 +997,7 @@ class Handler(BaseHTTPRequestHandler):
             raise LengthRequired(
                 "This server reads Content-Length only; send the body with a "
                 "length rather than chunked")
-        length = self._content_length()
+        length = int(self.headers.get("Content-Length") or 0)
         if not length:
             self._body_consumed = True
             return {}
@@ -1248,15 +1248,11 @@ class Handler(BaseHTTPRequestHandler):
                 # route's whole body cap. Only the two callable requirements
                 # need the body to know what to ask for, and they are gated
                 # below, once it has been read.
-                if requirement is not None and not callable(requirement):
-                    if not self._permitted(requirement, params):
-                        return
                 body = (self._body(self._body_limit(path))
                         if method in ("POST", "PUT", "DELETE") else {})
-                if callable(requirement):
-                    need = requirement(params, body)
-                    if need is not None and not self._permitted(need, params):
-                        return
+                need = requirement(params, body) if callable(requirement) else requirement
+                if need is not None and not self._permitted(need, params):
+                    return
                 # Every route but one captures a row id; the MIB catalog
                 # captures a bundle key, which is a name. Digits still
                 # arrive as ints so no handler signature changes.
@@ -1367,7 +1363,6 @@ class Handler(BaseHTTPRequestHandler):
         # One key for every static response, so the Debug page's per-route
         # latency shows asset serving instead of folding it — and every 404
         # with it — into `<unrouted>`.
-        self._route_template = "<static>"
         if path in ("/", ""):
             path = "/index.html"
         if path == "/login":
@@ -1384,7 +1379,7 @@ class Handler(BaseHTTPRequestHandler):
         # No isfile() first: StaticCache.get already returns None when its
         # own stat fails, and open() on a directory raises an OSError it
         # catches. The extra stat bought nothing but a second syscall.
-        entry = STATIC_CACHE.get(candidate) if inside else None
+        entry = STATIC_CACHE.get(candidate) if inside and os.path.isfile(candidate) else None
         if entry is None:
             self._send(404, b"Not found", "text/plain; charset=utf-8")
             return
@@ -1518,7 +1513,7 @@ class WebServer:
         handler = type("BoundHandler", (Handler,),
                        {"service": self.service, "access": self.access})
         try:
-            self.httpd = BoundedThreadingHTTPServer((self.host, self.port), handler)
+            self.httpd = ThreadingHTTPServer((self.host, self.port), handler)
             self.httpd.daemon_threads = True
 
             self.httpd.is_tls = bool(self.certfile)
@@ -1571,10 +1566,7 @@ class WebServer:
 
     def stop(self) -> None:
         if self.httpd is not None:
-            self.httpd.shutdown()          # the accept loop; not the handlers
-            deadline = time.time() + self.DRAIN_GRACE_S
-            while self.access.active > 0 and time.time() < deadline:
-                time.sleep(0.02)
+            self.httpd.shutdown()
             self.httpd.server_close()
             self.httpd = None
         if self._thread is not None:

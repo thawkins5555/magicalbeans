@@ -1170,6 +1170,7 @@
   /* --------------------------------------------------------------- lifecycle */
 
   async function refresh() {
+    if (App.state.tab !== 'ipam') return;
     // Nothing to poll for on a host where the DHCP subtab cannot work, and
     // a server list that always comes back empty is noise on the wire.
     const dhcp = applyDhcpAvailability();

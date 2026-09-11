@@ -426,13 +426,12 @@
     // every refresh and on every frame of a divider drag, tearing the SVG
     // down and rebuilding one hit rectangle with three listeners per
     // bucket each time, whether or not anything was different.
-    // The brush is drawn from view.drag, so a drag in progress is part of
-    // the signature too: without it, the redraw each pointermove asks for
-    // during a drag was skipped as "nothing changed" and the brush never
-    // appeared at all.
+    // The brush is NOT part of the signature: it is one persistent rect
+    // moved in place by the pointermove handler below, so a drag no longer
+    // misses the signature, rebuilds the whole chart and re-stringifies
+    // view.data once per pointer event.
     const signature = `${width}x${height}:`
-      + (view.loading || view.failed ? emptyMessage() : JSON.stringify(view.data))
-      + (view.drag ? `:drag=${view.drag.from}-${view.drag.to}` : '');
+      + (view.loading || view.failed ? emptyMessage() : JSON.stringify(view.data));
     if (svg.dataset.signature === signature) return;
     svg.dataset.signature = signature;
     svg.innerHTML = '';
@@ -544,14 +543,23 @@
       }, entry.label));
     }
 
-    if (view.drag) {
+    const brush = App.svgNode('rect', {
+      x: 0, y: plot.y, width: 0, height: plot.h,
+      fill: 'var(--accent)', 'fill-opacity': 0.18, stroke: 'var(--accent)',
+      visibility: 'hidden',
+    });
+    svg.appendChild(brush);
+    // Moved in place per pointermove; a chart rebuilt mid-drag (a refresh
+    // landing) gets it back from view.drag here.
+    const paintBrush = () => {
+      if (!view.drag) { brush.setAttribute('visibility', 'hidden'); return; }
       const a = xOf(Math.min(view.drag.from, view.drag.to));
       const b = xOf(Math.max(view.drag.from, view.drag.to));
-      svg.appendChild(App.svgNode('rect', {
-        x: a, y: plot.y, width: Math.max(b - a, 2), height: plot.h,
-        fill: 'var(--accent)', 'fill-opacity': 0.18, stroke: 'var(--accent)',
-      }));
-    }
+      brush.setAttribute('x', a);
+      brush.setAttribute('width', Math.max(b - a, 2));
+      brush.setAttribute('visibility', 'visible');
+    };
+    paintBrush();
 
     const crosshair = App.svgNode('line', {
       y1: plot.y, y2: plot.y + plot.h,
@@ -572,7 +580,7 @@
       if (view.drag) {
         view.drag.to = timeAt(x);
         view.drag.moved = true;
-        drawChart();
+        paintBrush();
         return;
       }
       if (x < plot.x || x > plot.x + plot.w) {
@@ -592,6 +600,7 @@
       if (!view.drag) return;
       const { from, to, moved } = view.drag;
       view.drag = null;
+      paintBrush();
       // A click (`moved` false) redraws and nothing more, as it always has;
       // a drag is accepted down to DRAG_MIN_S and DRAG_MIN_PX, not down to
       // the previous response's bucket. The server picks the bucket for
@@ -601,7 +610,7 @@
         setWindow(Math.min(from, to), Math.max(from, to), false);
       } else drawChart();
     };
-    svg.onpointercancel = () => { view.drag = null; drawChart(); };
+    svg.onpointercancel = () => { view.drag = null; paintBrush(); drawChart(); };
     svg.onwheel = (event) => {
       event.preventDefault();
       const x = event.offsetX * (width / svg.clientWidth);

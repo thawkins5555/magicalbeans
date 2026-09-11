@@ -1548,10 +1548,18 @@ check("function slotCount(data)" in _NETFLOW and "count: drawn" in _NF_CHART
       and "slot < drawn" in _NF_CHART,
       "an exactly bucket-aligned t1 leaves a final slot that covers nothing; "
       "it is neither drawn nor ticked rather than landing past the right edge")
-check(":drag=" in _NF_CHART,
-      "a drag in progress is part of the redraw signature: without it the "
-      "redraw each pointermove asks for was skipped as unchanged and the "
-      "brush never appeared")
+# 5.9.1: the drag came OUT of the signature again, the other way round. It
+# made every pointermove a full chart rebuild (and a JSON.stringify of the
+# whole response) to move one rectangle; the brush is now the persistent rect
+# mapper.js's rubber band already was, so it appears without the miss.
+check(":drag=" not in _NF_CHART,
+      "a drag in progress is not part of the redraw signature: it would make "
+      "every pointermove tear down and rebuild the whole chart")
+check("const paintBrush = () =>" in _NF_CHART
+      and _NF_CHART.count("paintBrush();") >= 3,
+      "...because the brush is one persistent rect moved in place — painted "
+      "once per rebuild, by the pointermove that moves it, and by the release "
+      "that has to take it away")
 check("Math.abs(to - from) > bucket" not in _NF_CHART
       and "Math.abs(to - from) >= DRAG_MIN_S" in _NF_CHART
       and "DRAG_MIN_PX" in _NF_CHART,
@@ -2145,6 +2153,161 @@ check("/credential`, credential)\n              .catch(() => {})" not in _ADD_PA
       and "but its SNMPv3 credential was not stored" in _ADD_PATH,
       "addDevice no longer swallows a refused credential POST: the refusal is "
       "toasted after the dialog closes on the row that was added")
+
+# ---------------------------------------------------------------------------
+# 48. FRONTEND MODULES (5.9.1 review): the escaping, the per-event work and
+#     the house patterns the module review of alerts/mapper/debug/netflow/
+#     netpath/wireless/configrx/ipam/ssh turned up. Each is one line of text
+#     in a file no linter reads.
+_A59 = read("alerts.js")
+_M59 = read("mapper.js")
+_D59 = read("debug.js")
+_NP59 = read("netpath.js")
+_W59 = read("wireless.js")
+_CX59 = read("configrx.js")
+
+# 48a. A custom rule's key is operator-supplied text the server stores
+#      verbatim, and it was the one field in that table written into the
+#      markup raw — an attribute break that every account with alerts:read
+#      then parsed.
+check('data-rule-key="${escape(' in _A59,
+      "the alerts rule key is escaped into its data attribute like every "
+      "other field in that table")
+
+# 48b. wireless radio channel is a TEXT column fed from an SNMP varbind, not
+#      a number, and #wl-detail is written with innerHTML.
+check("channel      ${escape(" in _W59,
+      "the radio channel is escaped into the wireless detail pane — it is a "
+      "TEXT column carrying whatever the controller answered")
+
+# 48c. A node drag redrew every link touching the selection once per
+#      pointermove. draw() has been rAF-coalesced since 5.0.1; the drag path
+#      is the one that skipped it, and it needs its own handle so a queued
+#      full redraw and a queued drag redraw do not cancel each other.
+_NODE_DRAG59 = _M59[_M59.index("  function onNodePointerDown("):
+                    _M59.index("  function queuePositionWrite(")]
+check("function requestDragDraw()" in _M59 and "let dragPending = 0;" in _M59
+      and "dragPending = window.requestAnimationFrame(" in _M59,
+      "the drag redraw is coalesced to one animation frame on its own "
+      "pending handle, not on draw()'s")
+check("requestDragDraw();" in _NODE_DRAG59 and "redrawDragged();" not in _NODE_DRAG59,
+      "...and the pointermove handler asks for that frame rather than "
+      "rebuilding the links inside the event")
+
+# 48d. Debug's filter read the DOM once per event: a querySelectorAll over
+#      the category boxes and a fresh Set for each of up to 3,000 events, on
+#      every one-second poll.
+check("function passes(event, filter)" in _D59,
+      "debug's passes() takes the filter it is to apply")
+_PASSES59 = _D59[_D59.index("  function passes(event, filter)"):
+                 _D59.index("  const EVENT_COLUMNS")]
+check("categoriesOn()" not in _PASSES59 and "App.el(" not in _PASSES59,
+      "...and reads no control of its own, per event")
+check("function currentFilter()" in _D59
+      and _D59.count("const filter = currentFilter();") == 2
+      and "view.events.filter(passes)" not in _D59,
+      "the categories, the destination and the search needle are read once "
+      "per draw and once per export, and both pass them in")
+
+# 48e. NetPath's timeline: the same brush fix as NetFlow above, and the rect
+#      measured before the signature check — a forced layout ten times a
+#      second for a signature that was going to match.
+_TL59 = _NP59[_NP59.index("  function drawTimeline() {"):
+              _NP59.index("  /* The overrun note is a sentence")]
+check("view.drag" not in _TL59[:_TL59.index("svg.dataset.timelineSig = sig;")],
+      "a drag in progress is not part of the timeline's redraw signature")
+check("const paintBrush = () =>" in _TL59 and _TL59.count("paintBrush();") >= 3,
+      "...the timeline brush is one persistent rect moved in place, painted "
+      "by the rebuild, by the pointermove and by the release")
+check("getBoundingClientRect" not in _TL59[:_TL59.index("if (svg.dataset.timelineSig === sig)")],
+      "drawTimeline does not measure the pane before the signature check — "
+      "fastTick calls it ten times a second and getBoundingClientRect forces "
+      "a synchronous layout")
+_RESIZE59 = _NP59[_NP59.index("for (const event of ['resize', 'panes-resized'])"):]
+_RESIZE59 = _RESIZE59[:_RESIZE59.index("\n    }\n")]
+check("function measureTimeline()" in _NP59
+      and "timelineSize = null;" in _RESIZE59
+      and "timelineSize || measureTimeline()" in _TL59,
+      "...the size is measured on the first draw and dropped again by the "
+      "resize/panes-resized listeners, which are the only things that change it")
+
+# 48f. mapper's toolbar state runs on the same 10Hz fastTick and wrote five
+#      .disabled properties unconditionally.
+_TOOLBAR59 = _M59[_M59.index("  function drawToolbarState() {"):
+                  _M59.index("  /* -------------------------------------------------------------- VLANs */")]
+check("button.disabled !== disabled" in _TOOLBAR59
+      and "App.el('mp-remove-node').disabled =" not in _TOOLBAR59,
+      "the mapper toolbar compares before assigning .disabled, the same rule "
+      "App.setText/setHidden carry for every other fastTick redraw")
+
+# 48g. Alerts re-fetched four configuration endpoints every 10s. They are
+#      read on the first refresh, on a local edit, and otherwise on a slow
+#      clock.
+_REFRESH59 = _A59[_A59.index("  async function refresh() {"):
+                  _A59.index("  function drawAlertsPager()")]
+check("async function loadConfig()" in _A59 and "CONFIG_MAX_AGE_MS" in _A59,
+      "the alerts rules/extras/templates/device-thresholds reads live in one "
+      "place with an age on them")
+for _path in ("'/api/alerts/rules'", "'/api/alerts/rules/extras'",
+              "'/api/alerts/templates'", "'/api/alerts/device-thresholds'"):
+    check(_path not in _REFRESH59,
+          "%s is configuration: refresh() does not re-read it six times a "
+          "minute" % _path)
+check("const config = loadConfig();" in _REFRESH59 and "await config;" in _REFRESH59,
+      "...refresh() still starts that read in its own round trip and waits "
+      "for it before painting")
+check(_A59.count("view.configAt = 0;") >= 7,
+      "every editor in alerts.js drops the cached configuration beside its "
+      "App.refreshNow('alerts'), so a local edit is on screen at once")
+
+# 48h. Three late-filled <select>s were rebuilt on every poll whether or not
+#      the list had changed. app.js has carried the write-only-if-changed
+#      helper since 4.55.0.
+check("App.setHtml(select, '<option value=\"\">any rule</option>'" in _A59,
+      "the alerts rule filter is filled through App.setHtml")
+check("App.setHtml(filterSelect, '<option value=\"\">All controllers</option>'" in _W59,
+      "the wireless controller filter is filled through App.setHtml")
+check("App.setHtml(select, '<option value=\"\">All vendors</option>'" in _CX59,
+      "the ConfigRX vendor filter is filled through App.setHtml")
+
+# 48i. editTemplate takes an id. The Reset cancel passed the template object,
+#      so the lookup fell through to whatever row happened to be selected.
+check("editTemplate(t.id);" in _A59 and "editTemplate(t);" not in _A59,
+      "cancelling a template reset reopens that template by its id, not by "
+      "an object the lookup can never match")
+
+# 48j. The house pattern: refresh() opens with the tab check, and one with
+#      more than one await re-checks after the last of them. dashboard.js is
+#      not in this list on purpose — it is the one module that is not lazy.
+for _name in ("alerts", "configrx", "debug", "ipam", "mapper", "netflow",
+              "netpath", "nodes", "wireless"):
+    _body = read("%s.js" % _name)
+    _start = _body.index("async function refresh()")
+    check("if (App.state.tab !== '%s') return;" % _name in _body[_start:_start + 200],
+          "%s.js's refresh() opens with the tab guard" % _name)
+# 48k. The SSH page's comment said Escape was the documented way out of the
+#      terminal; the hint under it and attachCustomKeyEventHandler both say
+#      Ctrl+F6, and ssh.js explains why Escape deliberately is not (it is a
+#      real keystroke to the device). A maintainer following the comment
+#      would break vi/less/menu consoles for every operator.
+_SSH_HTML59 = read("ssh.html")
+_SSH_JS59 = read("ssh.js")
+_SSH_COMMENT59 = _SSH_HTML59[_SSH_HTML59.index("<!-- The terminal traps Tab"):]
+_SSH_COMMENT59 = _SSH_COMMENT59[:_SSH_COMMENT59.index("-->")]
+check("Ctrl+F6" in _SSH_COMMENT59
+      and "Escape is the documented" not in _SSH_COMMENT59,
+      "ssh.html's comment names the exit the code actually implements")
+check("event.key === 'F6' && event.ctrlKey" in _SSH_JS59
+      and "<kbd>Ctrl</kbd>+<kbd>F6</kbd>" in _SSH_HTML59,
+      "...which is still Ctrl+F6, in the handler and in the visible hint")
+
+
+_WL_REFRESH59 = _W59[_W59.index("  async function refresh() {"):
+                     _W59.index("  function exportApsCsv()")]
+check(_WL_REFRESH59.count("App.state.tab !== 'wireless'") == 2,
+      "wireless's refresh re-checks the tab after its second await, before it "
+      "paints the detail pane and the table")
+
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

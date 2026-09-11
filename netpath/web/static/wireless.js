@@ -476,8 +476,10 @@
     const filterSelect = App.el('wl-controller');
     const current = filterSelect.value ||
       App.savedControl('wireless', 'wl-controller') || '';
-    filterSelect.innerHTML = '<option value="">All controllers</option>' +
-      view.controllers.map((c) => `<option value="${c.id}">${escape(c.name)}</option>`).join('');
+    // Written only when the list actually changed — see App.setHtml: the
+    // controllers are the same on nearly every poll.
+    App.setHtml(filterSelect, '<option value="">All controllers</option>' +
+      view.controllers.map((c) => `<option value="${c.id}">${escape(c.name)}</option>`).join(''));
     filterSelect.value = current;
     if (filterSelect.selectedIndex < 0) {
       filterSelect.value = '';
@@ -488,6 +490,9 @@
       ...App.filterValues('wl', ['q', 'state']),
       controller_id: filterSelect.value || undefined,
     });
+    // Same check as the one at the top, now that both fetches have landed:
+    // a tab switch during either of them must not paint a hidden page.
+    if (App.state.tab !== 'wireless') return;
     view.aps = search.aps;
     view.lastReportedTs = search.last_reported_ts;
     // The selected AP can have been filtered out (or removed) by this

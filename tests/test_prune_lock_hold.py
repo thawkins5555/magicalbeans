@@ -28,6 +28,8 @@ import time
 import _paths  # noqa: F401  (puts the repo root and tests/ on sys.path)
 
 from netpath.alertsdb import AlertsDatabase
+from netpath import nodesdb as nodesdb_module
+from netpath import nodesseriesdb as nodesseriesdb_module
 from netpath.nodesdb import NodesDatabase
 from netpath.nodesseriesdb import NodesSeriesDatabase
 from netpath.snmptrapdb import SnmpTrapDatabase
@@ -429,6 +431,24 @@ ok("a sweep with nothing to delete returns 0 without a delete loop")
 nodes_db.close()
 
 
+def without_reclaim(module, call):
+    """Run `call` with that module's reclaim() stubbed out.
+
+    reclaim takes and releases the store lock hundreds of times in tiny
+    slices, deliberately (test_db_reclaim.py is where that belongs), and the
+    two prunes below call it. Left in, those holds swamp the distribution
+    this suite measures, which is the prune's own DELETE batches: the median
+    of a thousand microsecond holds is zero however long the delete held the
+    lock for.
+    """
+    real = module.reclaim
+    module.reclaim = lambda *args, **kwargs: None
+    try:
+        return call()
+    finally:
+        module.reclaim = real
+
+
 # ================================================== nodes.db: device_events
 #
 # The by-age sweep the maintenance timer runs every 15 minutes, and that the
@@ -453,12 +473,14 @@ with nodes_db._lock:
 
 expected = set(range(EVENT_ROWS // 2 + 1, EVENT_ROWS + 1))
 measure("device_events", nodes_db,
-        lambda: nodes_db.prune(event_days=EVENT_DAYS, discovery_days=30),
+        lambda: without_reclaim(nodesdb_module, lambda: nodes_db.prune(
+            event_days=EVENT_DAYS, discovery_days=30)),
         "SELECT id FROM device_events", expected)
 
 # And the button: event_days=0 is a cutoff of "now", i.e. every row.
 measure("device_events, delete-everything", nodes_db,
-        lambda: nodes_db.prune(event_days=0, discovery_days=0),
+        lambda: without_reclaim(nodesdb_module, lambda: nodes_db.prune(
+            event_days=0, discovery_days=0)),
         "SELECT id FROM device_events", set())
 nodes_db.close()
 
@@ -495,7 +517,8 @@ expected = surviving(series_db, "SELECT rowid FROM samples WHERE ts > %r"
                                 % (now - SAMPLE_DAYS * DAY,))
 assert len(expected) == SAMPLE_ROWS - SAMPLE_ROWS // 2, len(expected)
 measure("samples", series_db,
-        lambda: series_db.prune(sample_days=SAMPLE_DAYS, rollup_days=400),
+        lambda: without_reclaim(nodesseriesdb_module, lambda: series_db.prune(
+            sample_days=SAMPLE_DAYS, rollup_days=400)),
         "SELECT rowid FROM samples", expected)
 
 # The hourly rollups are the second table the same sweep ages out.
@@ -511,12 +534,14 @@ with series_db._lock:
 expected = surviving(series_db, "SELECT rowid FROM samples_hourly WHERE hour > %r"
                                 % (now - ROLLUP_DAYS * DAY,))
 measure("samples_hourly", series_db,
-        lambda: series_db.prune(sample_days=SAMPLE_DAYS, rollup_days=ROLLUP_DAYS),
+        lambda: without_reclaim(nodesseriesdb_module, lambda: series_db.prune(
+            sample_days=SAMPLE_DAYS, rollup_days=ROLLUP_DAYS)),
         "SELECT rowid FROM samples_hourly", expected)
 
 # "Delete all stored samples" from the Settings maintenance panel.
 measure("samples, delete-everything", series_db,
-        lambda: series_db.prune(sample_days=0, rollup_days=0),
+        lambda: without_reclaim(nodesseriesdb_module, lambda: series_db.prune(
+            sample_days=0, rollup_days=0)),
         "SELECT rowid FROM samples", set())
 assert surviving(series_db, "SELECT rowid FROM samples_hourly") == set()
 ok("a retention of 0 still empties both tables, as the button promises")

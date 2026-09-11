@@ -526,11 +526,16 @@ USM_NOT_IN_TIME = "1.3.6.1.6.3.15.1.1.2.0"
 USM_UNKNOWN_ENGINE = "1.3.6.1.6.3.15.1.1.4.0"
 
 
-def report_under(engine_id: bytes, boots: int, engine_time: int, oid: str) -> bytes:
-    """An unsigned Report-PDU naming `oid`, under any engine id at all."""
+def report_under(engine_id: bytes, boots: int, engine_time: int, oid: str,
+                 msg_id: int = 1) -> bytes:
+    """An unsigned Report-PDU naming `oid`, under any engine id at all.
+
+    `msg_id` echoes the request's own msgID, which is what a real agent
+    does and what the poller now requires of a Report (RFC 3412 s7.2):
+    a Report against some other msgID is a stray and is dropped."""
     pdu = _tlv(PDU_REPORT, enc_int(0) + enc_int(0) + enc_int(0) + _tlv(
         T_SEQUENCE, enc_varbind(oid, enc_unsigned(T_COUNTER32, 1))))
-    return _v3_message(1, flags=0, engine_id=engine_id, engine_boots=boots,
+    return _v3_message(msg_id, flags=0, engine_id=engine_id, engine_boots=boots,
                        engine_time=engine_time, user="", auth_placeholder_len=0,
                        priv_params=b"",
                        scoped=_tlv(T_SEQUENCE, enc_octets(engine_id) + enc_octets("") + pdu))
@@ -584,8 +589,10 @@ def forger(oid: str):
     we never sent, boots 99 — the poisoned cache the forgery is after."""
     def answer(data):
         if not decode_response(data).engine_id:
-            return [report_under(FAKE_ENGINE, 3, 100, USM_UNKNOWN_ENGINE)]
-        return [report_under(FORGED_ENGINE, 99, 1, oid)]
+            return [report_under(FAKE_ENGINE, 3, 100, USM_UNKNOWN_ENGINE,
+                                 decode_response(data).msg_id)]
+        return [report_under(FORGED_ENGINE, 99, 1, oid,
+                             decode_response(data).msg_id)]
     return answer
 
 
@@ -628,7 +635,8 @@ finally:
     agent.close()
 
 # The legitimate shape: the same Report under the engine id we sent.
-agent = FakeAgent(lambda data: [report_under(FAKE_ENGINE, 3, 100, USM_UNSUPPORTED)])
+agent = FakeAgent(lambda data: [report_under(
+    FAKE_ENGINE, 3, 100, USM_UNSUPPORTED, decode_response(data).msg_id)])
 session = _Session("127.0.0.1", agent.port, 0.4, 0)
 try:
     try:
@@ -914,7 +922,8 @@ print("\n-- an engine learned inside the failing call is kept")
 
 def discovery_only(data):
     if not decode_response(data).engine_id:
-        return [report_under(FAKE_ENGINE, 3, 100, USM_UNKNOWN_ENGINE)]
+        return [report_under(FAKE_ENGINE, 3, 100, USM_UNKNOWN_ENGINE,
+                             decode_response(data).msg_id)]
     return []
 
 

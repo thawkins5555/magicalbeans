@@ -1609,9 +1609,11 @@
     // filter naming a vendor nothing carried any more.
     if (current && (fromSelect || seen.has(current))) seen.add(current);
     const options = [...seen].sort();
-    select.innerHTML = '<option value="">All vendors</option>' +
+    // Written only when the list actually changed — see App.setHtml: the
+    // vendors present are the same on nearly every poll.
+    App.setHtml(select, '<option value="">All vendors</option>' +
       options.map((v) =>
-        `<option value="${escape(v)}">${escape(v)}</option>`).join('');
+        `<option value="${escape(v)}">${escape(v)}</option>`).join(''));
     select.value = current;
     // Dropped from the store as well as from the control: while it is stored,
     // refresh() above would go on filtering by a vendor with no devices and

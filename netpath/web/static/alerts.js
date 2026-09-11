@@ -59,6 +59,10 @@
     // tick, so two overlapping polls never share a URL and app.js's
     // per-path abort-dedupe cannot cancel either one.
     refreshGen: 0,
+    // When the four configuration endpoints below were last read. 0 means
+    // "read them on the next refresh" — what every editor in this file sets
+    // it to after a successful write.
+    configAt: 0,
   };
 
   const MUTE_HOURS = [1, 6, 12, 24];
@@ -1001,6 +1005,9 @@
           enabled: box.querySelector('#ado-enabled').checked,
         });
         App.closeModal();
+        // The Rules table's "N device overrides" count is drawn from the
+        // fleet-wide copy, which this write has just invalidated.
+        view.configAt = 0;
         await deviceOverridesDialog(rule);
       } },
     ]);
@@ -1069,7 +1076,7 @@
           `<p>Remove the ${escape(rule.name)} override for <b>${escape(name)}</b>?</p>` +
           '<p class="hint">This device goes back to the rule’s own numbers.</p>', 'Remove',
           () => App.post('/api/alerts/device-thresholds', { device_id: o.device_id, rule_key: rule.key, clear: true }),
-          () => deviceOverridesDialog(rule));
+          () => { view.configAt = 0; deviceOverridesDialog(rule); });
       };
     }
     return box;
@@ -1251,6 +1258,9 @@
         }
         await App.put(`/api/alerts/rules/${r.id}`, values);
         App.closeModal();
+        // The rules/templates/overrides in hand are now out of date: read
+        // them again on the refresh below rather than up to a minute later.
+        view.configAt = 0;
         App.refreshNow('alerts');
       } },
     ]);
@@ -1313,6 +1323,7 @@
         values.notify = box.querySelector('#ar-notify').checked;
         await App.post('/api/alerts/rules', values);
         App.closeModal();
+        view.configAt = 0;
         App.refreshNow('alerts');
       } },
     ]);
@@ -1328,6 +1339,7 @@
       (confirmed) => {
         if (!confirmed) return;
         view.rulesSelected = null;
+        view.configAt = 0;
         App.refreshNow('alerts');
       });
   }
@@ -1401,6 +1413,7 @@
           '<p class="hint">Your edits to this template\'s subject and body are ' +
           'discarded and cannot be recovered.</p>', 'Reset', async () => {
             await App.post(`/api/alerts/templates/${t.id}/reset`, {});
+            view.configAt = 0;
             App.refreshNow('alerts');
           }, (confirmed) => { if (!confirmed) editTemplate(t.id); });
       } }] : []),
@@ -1434,6 +1447,7 @@
       return;
     }
     App.closeModal();
+    view.configAt = 0;
     App.refreshNow('alerts');
   }
 
@@ -1455,6 +1469,7 @@
           is_html: box.querySelector('#at-html').checked,
         });
         App.closeModal();
+        view.configAt = 0;
         App.refreshNow('alerts');
       } },
     ], { buttonsTop: true });
@@ -1685,6 +1700,7 @@
         } });
         await App.loadState();
         App.closeModal();
+        view.configAt = 0;
         App.refreshNow('alerts');
         })()) },
     ], { buttonsTop: true });
@@ -1761,6 +1777,33 @@
 
   /* ----------------------------------------------------------- refresh */
 
+  /* Rules, rule extras, templates and the fleet-wide device thresholds are
+     configuration: they change when somebody edits them, not six times a
+     minute, and the fleet-wide thresholds are the largest of the four. They
+     are read on the first refresh, again the moment an edit in this browser
+     sets view.configAt to 0 (every editor here does, beside its
+     App.refreshNow('alerts')), and otherwise on a clock slow enough that
+     another operator's edit still arrives on its own. */
+  const CONFIG_MAX_AGE_MS = 60000;
+
+  async function loadConfig() {
+    if (view.configAt && Date.now() - view.configAt < CONFIG_MAX_AGE_MS) return;
+    const [rules, ruleExtras, templates, deviceThresholds] = await Promise.all([
+      App.get('/api/alerts/rules'),
+      App.get('/api/alerts/rules/extras'),
+      App.get('/api/alerts/templates'),
+      // Fleet-wide (no device_id): the Rules table's own "N overrides" count
+      // per threshold rule, the same one call the overrides dialog itself
+      // would otherwise have to make a second time on every row.
+      App.get('/api/alerts/device-thresholds'),
+    ]);
+    view.rules = rules.rules;
+    view.ruleExtras = ruleExtras.rules || {};
+    view.templates = templates.templates;
+    view.deviceThresholds = deviceThresholds.device_thresholds || [];
+    view.configAt = Date.now();
+  }
+
   async function refresh() {
     if (App.state.tab !== 'alerts') return;
     drawStatus();
@@ -1772,27 +1815,22 @@
     if (view.pageFilterSig !== null && view.pageFilterSig !== filterSig) view.pageOffset = 0;
     view.pageFilterSig = filterSig;
     const generation = ++view.refreshGen;
-    const [overview, list, total, rules, ruleExtras, templates, mutes, maintenance,
-           deviceThresholds] =
+    // Started here so it shares the round trip when it does run at all.
+    const config = loadConfig();
+    const [overview, list, total, mutes, maintenance] =
       await Promise.all([
       App.get('/api/alerts/overview', { t0, t1, bucket }),
       App.get('/api/alerts', { ...f, limit: view.pageLimit, offset: view.pageOffset }),
       // Same filters, in the same round trip, so the label under the table
       // can say what fraction of the matches is on screen.
       App.get('/api/alerts/total', f),
-      App.get('/api/alerts/rules'),
-      App.get('/api/alerts/rules/extras'),
-      App.get('/api/alerts/templates'),
       App.get('/api/alerts/mutes'),
       // In the same round trip as the mutes, for the same reason: the detail
       // pane draws both, and a second poll for one of them would let the two
       // disagree for a tick.
       App.get('/api/alerts/maintenance'),
-      // Fleet-wide (no device_id): the Rules table's own "N overrides" count
-      // per threshold rule, the same one call the overrides dialog itself
-      // would otherwise have to make a second time on every row.
-      App.get('/api/alerts/device-thresholds'),
     ]);
+    await config;
     // A newer refresh already redrew this, or the operator has left.
     if (view.refreshGen !== generation || App.state.tab !== 'alerts') return;
     view.hist = overview.buckets;
@@ -1812,10 +1850,6 @@
     view.alerts = list.alerts;
     view.alertTotal = total;
     drawAlertsPager();
-    view.rules = rules.rules;
-    view.ruleExtras = ruleExtras.rules || {};
-    view.templates = templates.templates;
-    view.deviceThresholds = deviceThresholds.device_thresholds || [];
     // entity_id -> until_ts, for the devices with an active mute. The server
     // only ever returns unexpired ones, so presence here means muted.
     view.mutes = new Map(mutes.mutes.filter((m) => m.entity_kind === 'device')
@@ -1877,8 +1911,11 @@
   function fillRuleFilter() {
     const select = App.el('alerts-filter-rule');
     const current = select.value || App.savedControl('alerts', 'alerts-filter-rule') || '';
-    select.innerHTML = '<option value="">any rule</option>' +
-      view.rules.map((r) => `<option value="${r.id}">${escape(r.name)}</option>`).join('');
+    // Written only when the list actually changed: the options are the same
+    // on nearly every poll, and rebuilding them throws away the element the
+    // operator may have open.
+    App.setHtml(select, '<option value="">any rule</option>' +
+      view.rules.map((r) => `<option value="${r.id}">${escape(r.name)}</option>`).join(''));
     select.value = current;
     // Dropped from the store as well as from the control: while it is stored,
     // filters() above would go on sending a rule id that matches nothing.

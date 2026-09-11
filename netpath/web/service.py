@@ -814,8 +814,7 @@ class Service:
 
     def bump_config(self) -> None:
         """Say that something /api/config carries has changed."""
-        with self._config_lock:
-            self.config_version += 1
+        self.config_version += 1
 
     def cached_poll(self, key: str, ttl_s: float, compute):
         """`compute()` at most once per `ttl_s`, shared by every open tab.

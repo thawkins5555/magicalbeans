@@ -277,6 +277,111 @@ try:
     check("the trap database's default size cap matches Syslog and Nodes (1024 MB)",
           appdb.GLOBAL_DEFAULTS["max_snmp_db_mb"] == 1024,
           appdb.GLOBAL_DEFAULTS["max_snmp_db_mb"])
+
+    # ------------------------------- 10. bulk maintenance, at the store
+    #
+    # A planned cutover puts a whole device group into maintenance from the
+    # bulk bar. Done a device at a time that is two alerts.db lock
+    # acquisitions and one commit per device, on the request thread, while
+    # the alert engine ticks against the same file. These are the batch
+    # forms: one lock hold, one commit, the same parameters and the same
+    # per-device semantics as set_maintenance/clear_maintenance.
+
+    alerts_db = service.alerts_db
+    FLEET = list(range(9000, 9500))
+
+    class CountingConn:
+        """The store's connection, with commits counted."""
+
+        def __init__(self, inner):
+            self._inner = inner
+            self.commits = 0
+
+        def commit(self):
+            self.commits += 1
+            return self._inner.commit()
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    real_conn = alerts_db._conn
+    alerts_db._conn = CountingConn(real_conn)
+    try:
+        opened = alerts_db.set_maintenance_many(FLEET, by=DEFAULT_USER,
+                                                reason="core cutover")
+        commits = alerts_db._conn.commits
+    finally:
+        alerts_db._conn = real_conn
+    check(f"set_maintenance_many puts all {len(FLEET)} devices into"
+          f" maintenance in one commit",
+          opened == len(FLEET) and commits == 1, (opened, commits))
+    row = alerts_db.open_maintenance(FLEET[0])
+    check("...with the same row set_maintenance writes: who, when and why",
+          row is not None and row["started_by"] == DEFAULT_USER
+          and row["reason"] == "core cutover" and row["ended_ts"] is None,
+          dict(row) if row else None)
+    check("...and every device reads as in maintenance",
+          len(alerts_db.maintenance_device_ids()) >= len(FLEET),
+          len(alerts_db.maintenance_device_ids()))
+
+    started = row["started_ts"]
+    again = alerts_db.set_maintenance_many(FLEET, by="someone-else",
+                                           reason="different reason")
+    row = alerts_db.open_maintenance(FLEET[0])
+    check("a second press changes nothing and reports nothing changed —"
+          " the same idempotence set_maintenance has",
+          again == 0 and row["started_ts"] == started
+          and row["started_by"] == DEFAULT_USER, (again, dict(row)))
+
+    mixed = alerts_db.set_maintenance_many([FLEET[0], 9999], by=DEFAULT_USER)
+    check("a mixed selection counts only the devices it actually opened",
+          mixed == 1, mixed)
+    alerts_db.clear_maintenance_many([9999], by=DEFAULT_USER)
+
+    # A first notice that maintenance mode swallowed must be handed back by
+    # the batch clear, exactly as clear_maintenance hands it back.
+    held_rule = alerts_db.rule_by_key("device_down")
+    held_row, _opened = alerts_db.open_or_increment(
+        held_rule["id"], "maint-held:9000", "device", str(FLEET[0]),
+        "sw-9000", 2, "stopped answering", "", time.time())
+    with alerts_db._lock:
+        alerts_db._conn.execute(
+            "UPDATE alerts SET last_notified_ts = ?, maint_held_notify_ts = ?"
+            " WHERE id = ?", (time.time(), time.time(), held_row["id"]))
+        alerts_db._conn.commit()
+
+    alerts_db._conn = CountingConn(real_conn)
+    try:
+        cleared = alerts_db.clear_maintenance_many(FLEET, by=DEFAULT_USER)
+        commits = alerts_db._conn.commits
+    finally:
+        alerts_db._conn = real_conn
+    check(f"clear_maintenance_many takes all {len(FLEET)} back out in one"
+          f" commit",
+          cleared == len(FLEET) and commits == 1, (cleared, commits))
+    check("...and none of them is in maintenance any more",
+          alerts_db.open_maintenance(FLEET[0]) is None
+          and alerts_db.open_maintenance(FLEET[-1]) is None)
+    with alerts_db._lock:
+        closed = alerts_db._conn.execute(
+            "SELECT COUNT(*) FROM device_maintenance WHERE device_id = ?"
+            " AND ended_ts IS NOT NULL", (FLEET[0],)).fetchone()[0]
+    check("...the closed period is kept rather than deleted — it is the"
+          " availability report's evidence those seconds were planned",
+          closed == 1, closed)
+    check("...and the held first notice is due again",
+          alerts_db.alert(held_row["id"])["last_notified_ts"] is None,
+          alerts_db.alert(held_row["id"])["last_notified_ts"])
+
+    check("clearing devices that are not in maintenance reports nothing"
+          " changed, as clear_maintenance's False does",
+          alerts_db.clear_maintenance_many(FLEET, by=DEFAULT_USER) == 0)
+    check("an empty selection is a no-op on both",
+          alerts_db.set_maintenance_many([]) == 0
+          and alerts_db.clear_maintenance_many([]) == 0)
+    check("a duplicated id is one device, not two rows",
+          alerts_db.set_maintenance_many([9001, 9001, 9001]) == 1)
+    alerts_db.clear_maintenance_many([9001])
 finally:
     server.stop()
     service.shutdown()
