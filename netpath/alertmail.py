@@ -25,9 +25,6 @@ from urllib.parse import urlparse
 from .alertrules import SEVERITY_NAMES
 from .worker import Worker
 
-# What {{severity_tag}} renders as on a RESOLUTION, in place of the cleared
-# alert's own level. One constant, since the engine passes it explicitly on
-# the clear path and build_context derives it from the resolved row.
 RECOVER_TAG = "[RECOVER]"
 
 # Every subject leads with {{severity_tag}}: whether an alert is critical
@@ -234,8 +231,6 @@ def build_context(alert_row, rule_row, extra: dict | None = None) -> dict:
         "trap_name": "", "trap_oid": "", "varbinds": "",
         "down_since": "", "recovered_time": "", "downtime": "",
         "downtime_line": "",
-        # "[RECOVER]" on a resolution, empty on an alert of any kind — set
-        # in the resolved branch below, beside the other recovery tokens.
         "recover_tag": "",
     }
     # Derived here, from the row, rather than only where the engine happens to
@@ -254,13 +249,7 @@ def build_context(alert_row, rule_row, extra: dict | None = None) -> dict:
         context["down_since"] = _clock(alert_row["opened_ts"])
         context["recovered_time"] = _clock(resolved_ts)
         context["downtime"] = duration_text(resolved_ts - alert_row["opened_ts"])
-        # A resolution's subject leads with [RECOVER] rather than the
-        # cleared alert's own level: "[CRITICAL] SappiWhere: sw1 has
-        # recovered" reads as a new emergency in a notification preview,
-        # which is exactly where a tag is read. An OPENING alert keeps its
-        # level, the standalone "Device recovered" rule's own included —
-        # that one is an alert in its own right, not a recovery of
-        # anything, and its row has no resolved_ts.
+        # Resolutions lead with [RECOVER], not the cleared alert's own level.
         context["severity_tag"] = RECOVER_TAG
         context["recover_tag"] = RECOVER_TAG
     if extra:

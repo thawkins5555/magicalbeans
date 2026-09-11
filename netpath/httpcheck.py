@@ -1,13 +1,4 @@
-"""Is the web page on this destination answering?
-
-A traceroute says the path to a destination works; it says nothing about
-whether the thing at the end of it is serving anything. This module is the
-other half: one HTTPS GET, mapped onto available / unavailable-with-a-reason.
-
-GET rather than HEAD deliberately — a great many servers answer HEAD with 405
-and would be reported down while serving the page perfectly. The body is read
-only far enough to prove the response is real (MAX_BODY_BYTES) and discarded.
-"""
+"""One HTTPS GET, mapped onto available / unavailable-with-a-reason."""
 
 from __future__ import annotations
 
@@ -23,21 +14,15 @@ from . import __version__
 
 USER_AGENT = f"SappiWhere/{__version__}"
 
-# Follow a redirect chain this far and no further. A site that bounces
-# through a login and a region picker is normal; a loop is not.
+# Follow a redirect chain this far and no further.
 MAX_REDIRECTS = 5
 
-# Enough to prove a response body exists without pulling a disk image
-# through a monitoring check every interval.
 MAX_BODY_BYTES = 64 * 1024
 
-# The longest an operator-configured URL may be, matching what the API
-# refuses past.
 URL_MAX = 2048
 
 DEFAULT_TIMEOUT_S = 10.0
 
-# An error string is stored on every failed check and rendered in a badge.
 ERROR_MAX = 200
 
 
@@ -51,19 +36,9 @@ class HttpsResult:
 
 
 class _CountedRedirects(urllib.request.HTTPRedirectHandler):
-    """Follow, but only so far, and never off HTTPS.
+    """Follow, but only so far, and never off HTTPS."""
 
-    redirect_request is the one extension point every 3xx handler calls
-    through (the shape alertmail._RefuseRedirects uses to refuse them), so
-    counting here covers 301/302/303/307/308 rather than only the couple
-    urllib's own handler names. A redirect onto plain HTTP is refused
-    outright: the destination was configured as an HTTPS URL, and quietly
-    measuring an unverified cleartext page instead would be answering a
-    different question.
-    """
-
-    # Above MAX_REDIRECTS, so urllib's own two guards never fire first and
-    # report a chain that is merely long as an HTTP error from the last hop.
+    # Above MAX_REDIRECTS so urllib's own guards never fire first.
     max_repeats = MAX_REDIRECTS + 1
     max_redirections = MAX_REDIRECTS + 1
 
@@ -89,7 +64,6 @@ def _tls_text(error) -> str:
 
 
 def _error_text(error) -> str:
-    """The short reason a check failed, as it is stored and shown."""
     if isinstance(error, ssl.SSLCertVerificationError):
         return f"TLS: certificate verify failed ({error.verify_message})" \
             if error.verify_message else "TLS: certificate verify failed"
@@ -109,14 +83,7 @@ def _error_text(error) -> str:
 
 def check(url: str, timeout_s: float = DEFAULT_TIMEOUT_S,
           insecure: bool = False) -> HttpsResult:
-    """One GET. 2xx/3xx is available; everything else is not, with the reason.
-
-    Certificates are verified against the system store plus the vendored
-    bundle (selfupdate._ssl_context, the same context every other outbound
-    HTTPS call here uses) unless the destination opted out with `insecure`,
-    which is for the appliances whose management page ships a self-signed
-    certificate nobody is going to replace.
-    """
+    """One GET. 2xx/3xx is available; everything else is not, with the reason."""
     url = (url or "").strip()
     if not is_https_url(url):
         return HttpsResult(False, error="URL must start with https://")
@@ -139,8 +106,6 @@ def check(url: str, timeout_s: float = DEFAULT_TIMEOUT_S,
         ok = 200 <= code < 400
         return HttpsResult(ok, code, latency, "" if ok else f"HTTP {code}", final)
     except urllib.error.HTTPError as error:
-        # The server answered, which is a real measurement of an unhealthy
-        # page rather than a failure to reach one.
         try:
             error.read(MAX_BODY_BYTES)
         except Exception:

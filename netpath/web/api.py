@@ -815,10 +815,7 @@ def get_state(service, params, body) -> dict:
             "counters": service.node_poller.counters,
             "device_count": counts["device_count"],
             "device_counts": dict(counts["device_counts"]),
-            # Beside the counts rather than on a route of its own so the
-            # Nodes strip can say "still purging" without a second poll;
-            # /api/nodes/purges serves the same dict for anything asking
-            # about a delete in particular.
+            # Also exposed at /api/nodes/purges for anything asking about a delete alone.
             "purges": service.cached_poll("nodes_purges", 3,
                                           service.nodes_db.purge_status),
         },
@@ -906,14 +903,7 @@ def _validate_target_host(host: str) -> str:
 
 
 def _validate_target_url(url: str) -> str:
-    """The destination's web page URL: HTTPS only, with a host, and bounded.
-
-    Plain HTTP is refused rather than upgraded: the check verifies a
-    certificate, and silently measuring a cleartext page instead would
-    answer a different question from the one the page's badge claims to
-    answer. Empty means the destination has no web page to check, which is
-    the shipped state and not an error.
-    """
+    """The destination's web page URL: HTTPS only, with a host, and bounded."""
     url = str(url or "").strip()
     if not url:
         return ""
@@ -951,10 +941,7 @@ def _target_json(service, row, last=None, https=None) -> dict:
         "https_url": url,
         "https_insecure": (bool(row["https_insecure"])
                            if "https_insecure" in keys else False),
-        # "none" is a destination with no web page configured, which is a
-        # different thing from one whose page has not been checked yet: the
-        # latter has a URL and simply no row yet, and reads as "none" until
-        # the first check lands rather than claiming either verdict.
+        # "none" covers both no URL configured and a URL not yet checked.
         "https_state": ("none" if not url or https is None
                         else ("up" if https["ok"] else "down")),
         "https_status_code": https["status_code"] if https else None,
@@ -1136,12 +1123,7 @@ def get_timeline(service, params, body) -> dict:
 
 
 def get_netpath_https(service, params, body) -> dict:
-    """Web-page availability over the window, bucketed like the timeline.
-
-    Same grid as get_timeline — blocks snapped to an epoch-anchored grid of
-    the destination's own check interval, widened past MAX_BUCKETS — so the
-    web lane lines up block for block with the three lanes above it.
-    """
+    """Web-page availability over the window, bucketed like the timeline."""
     target_id = int(params.get("target", 0))
     target = service.db.target(target_id)
     if target is None:
@@ -1808,9 +1790,7 @@ def get_debug(service, params, body) -> dict:
             "next_run": schedule.get(target["id"]),
             "interval_s": target["interval_s"],
             "status": last["status"] if last else "none",
-            # The web page check for this destination, on the same row as
-            # its trace: "checking" while a GET is out, otherwise the last
-            # verdict. A destination with no URL reports state "none".
+            # The web page check for this destination, on the same row as its trace.
             "https": {
                 "url": url,
                 "state": ("none" if not url or check is None
@@ -3434,11 +3414,7 @@ def _device_json(row, reveal: bool = False) -> dict:
         "vendor_source": row["vendor_source"] or "",
         "vendor_oid": row["vendor_oid"] or "",
         "location_oid": row["location_oid"] or "",
-        # What software the device is running (netpath/swversion.py), keyed
-        # defensively like the columns above for a row handed in from
-        # before the migration that added them. NULL where nothing matched:
-        # the header and the firmware report both show nothing rather than
-        # a guess. sw_image_file is Cisco's boot image path, not a version.
+        # sw_image_file is Cisco's boot image path, not a version.
         "sw_version": (row["sw_version"] if "sw_version" in row.keys() else None),
         "sw_image": (row["sw_image"] if "sw_image" in row.keys() else None),
         "sw_image_file": (row["sw_image_file"] if "sw_image_file" in row.keys() else None),
@@ -4767,13 +4743,7 @@ def delete_nodes_device(service, params, body, device_id) -> dict:
     service.alerts_db.forget_device(device_id)
     service.configrx_db.forget_device(device_id)
     service.mapper_db.forget_device(device_id)
-    # Nodes last, and only the request: the device stops being polled,
-    # stops being visible and gives up its address in one short
-    # transaction, and its history — up to millions of sample rows for a
-    # long-polled chassis — is deleted in background batches by the
-    # DevicePurger. The freed-rowid argument above still holds: the
-    # device_purges row keeps the id reserved until the last of those rows
-    # is gone, and only then is the devices row itself deleted.
+    # History (up to millions of rows) is purged in background batches by the DevicePurger.
     queued = service.nodes_db.request_device_removal([device_id])
     service.device_purger.wake()
     service.log.add(NODES_CATEGORY, f"Removed device {row['ip']}")
@@ -4836,8 +4806,7 @@ def post_nodes_devices_bulk_delete(service, params, body) -> dict:
         service.alerts_db.forget_device(device_id)
         service.configrx_db.forget_device(device_id)
         service.mapper_db.forget_device(device_id)
-    # One transaction for the whole list, then the purge runs in the
-    # background — see delete_nodes_device.
+    # One transaction, then the purge runs in the background — see delete_nodes_device.
     removed = service.nodes_db.request_device_removal(device_ids)
     service.device_purger.wake()
     service.log.add(NODES_CATEGORY, f"Bulk-removed {removed} device(s)")
@@ -5931,25 +5900,18 @@ _FIRMWARE_CSV_HEADER = ["device_id", "name", "ip", "vendor", "model_hint",
 
 
 def _firmware_report(service, params):
-    """The shared body of the JSON route and the CSV one, so the file an
-    operator downloads cannot drift from the table they looked at. No
-    window: this report reads the identity columns as they stand, not
-    history, so there is nothing to clamp and nothing to cap."""
+    """Shared body of the JSON route and the CSV one, so they cannot drift."""
     return reportmod.firmware_inventory(
         service.nodes_db, _id_list(params.get("device_ids")))
 
 
 def get_nodes_reports_firmware(service, params, body) -> dict:
-    """What software every device is running, from the columns the identity
-    poll already stores. `device_ids` (comma-separated) narrows it to a
-    group; omitted, the whole fleet is reported on."""
+    """What software every device is running. `device_ids` narrows to a group."""
     return _firmware_report(service, params).to_dict()
 
 
 def get_nodes_reports_firmware_export(service, params, body) -> dict:
-    """The same report as a CSV file, server-side — the report screen also
-    builds one from the rows on screen, but a 900-device fleet is a file to
-    hand somebody, not a table to scroll."""
+    """The same report as a CSV file, built server-side."""
     report = _firmware_report(service, params)
     csv_rows = [[r.device_id, r.name, r.ip, r.vendor, r.model_hint, r.sw_version,
                  r.sw_image, r.sw_image_file, r.last_poll_ts] for r in report.rows]
@@ -7524,8 +7486,7 @@ def post_alerts_template_preview(service, params, body, template_id) -> dict:
                   "previous_uptime": "12d 4h", "current_uptime": "0d 0h 2m",
                   "trap_name": "coldStart", "trap_oid": "1.3.6.1.6.3.1.1.5.1",
                   "varbinds": "(sample)",
-                  # Only the recovery template is ever sent as a resolution;
-                  # every other template previews as the opening alert it is.
+                  # Only the recovery template is ever sent as a resolution.
                   **({"severity_tag": alertmail.RECOVER_TAG,
                       "recover_tag": alertmail.RECOVER_TAG}
                      if row["key"] == "device_up" else
@@ -7748,9 +7709,7 @@ def _radio_json(row) -> dict:
         "operating_power_dbm": row["operating_power_dbm"],
         "mode": (row["mode"] if "mode" in keys else None) or "",
         "station_count": row["station_count"],
-        # fgWcWtpSessionRadioBaseBssid, and the width the radio's PROFILE
-        # configures — fgWcWtpSessionRadioEntry has no width column at all,
-        # so this is joined on through the AP's profile name.
+        # channel_width has no column of its own; joined through the AP's profile name.
         "bssid": (row["bssid"] if "bssid" in keys else None) or "",
         "channel_width": (row["channel_width"] if "channel_width" in keys else None) or "",
     }
@@ -7787,10 +7746,7 @@ def _power_unit(service, powers) -> str:
 
 
 def _ap_uptime_s(row):
-    """fgWcWtpSessionWtpUpTime aged forward from the poll that read it —
-    exactly what _sys_uptime_s does for a Nodes device's sysUpTime, and for
-    the same reason: the stored figure is only true as of its timestamp.
-    None until the controller has answered the column once."""
+    """fgWcWtpSessionWtpUpTime aged forward from the poll that read it."""
     ticks = row["uptime_ticks"]
     read_at = row["uptime_ts"]
     if ticks is None or not read_at:
@@ -7831,9 +7787,6 @@ def _ap_json(service, row) -> dict:
         "radio_modes": ", ".join(r["mode"] for r in radios if r["mode"]),
         "channels": ", ".join(channels),
         "bssids": ", ".join(r["bssid"] for r in radios if r["bssid"]),
-        # The AP's own uptime, aged forward from the poll that read it the
-        # way a Nodes device's is, plus the same figure pre-formatted: the
-        # column sorts on the number and shows the text.
         "profile": row["profile"] or "",
         "uptime_s": uptime_s,
         "uptime_text": format_ticks(round(uptime_s * 100)) if uptime_s is not None else "",

@@ -150,8 +150,7 @@ class AlertEngine(Worker):
         # while this engine ticks every five seconds, so a streak that
         # advanced per tick would satisfy "three traces" in fifteen seconds.
         self._netpath_streaks: dict[tuple, tuple[float | None, int, float | None]] = {}
-        # The same, keyed on a web-page check's own ts — see
-        # _evaluate_netpath_https.
+        # The same, keyed on a web-page check's own ts.
         self._netpath_https_streaks: dict[tuple, tuple[float | None, int, float | None]] = {}
         # dedup_key -> latest resolved_ts of a hand resolve, refreshed once
         # per tick from AlertsDatabase.operator_resolved_since (one indexed
@@ -1116,9 +1115,7 @@ class AlertEngine(Worker):
                 self._notify_clear(resolved, rule, settings)
 
     def _drain_ap_events(self, settings) -> list[Occurrence]:
-        """Wireless AP lifecycle events — ap_removed/ap_returned,
-        ap_offline/ap_online, ap_rebooted and radio_channel_changed, raised
-        by wirelessdb as the poller writes.
+        """Wireless AP lifecycle events, raised by wirelessdb as the poller writes.
         Same cursor shape as every other drain above. An AP a human marked
         out of service never produces one of these in the first place, so
         no filtering is needed here."""
@@ -1926,21 +1923,7 @@ class AlertEngine(Worker):
         return occurrences
 
     def _evaluate_netpath_https(self, settings) -> list[Occurrence]:
-        """NetPath destinations' web pages against the https_down rule.
-
-        Event-shaped rather than threshold-shaped: a check answers
-        available or unavailable-with-a-reason, and there is no number to
-        compare against a threshold. What it does borrow from the threshold
-        evaluators is their streak discipline — the consecutive run is
-        counted against the CHECK's own timestamp, so `for_polls` means
-        consecutive checks of that destination rather than five-second
-        engine ticks — and their operator-resolve gate, so a breach somebody
-        resolved by hand does not re-open on the next tick.
-
-        The first successful check clears the alert outright. There is no
-        hysteresis to tune: "the page answered" is not a value hovering
-        around a boundary, and the three-check streak is the anti-flap.
-        """
+        """NetPath destinations' web pages against the https_down rule."""
         if self.netpath_db is None:
             return []
         rules = [r for r in self.db.rules()
@@ -1995,10 +1978,7 @@ class AlertEngine(Worker):
                         self._notify_clear(resolved, rule, settings)
                     continue
                 if sample_ts is not None and sample_ts == previous_ts:
-                    # Nothing has been checked since the last tick, so there
-                    # is no new fact to report — the same guard the threshold
-                    # evaluators make, and the reason `count` on the open
-                    # alert means failed checks rather than engine ticks.
+                    # Nothing new checked since the last tick.
                     continue
                 if streak < max(int(rule["for_polls"] or 1), 1):
                     continue
@@ -3154,12 +3134,7 @@ class AlertEngine(Worker):
             # whether or not its caller had anything better. A caller that
             # does — the device drain knows the exact poll the device answered
             # on — passes it here and it wins.
-            #
-            # The tags are the exception that does not yield to the caller:
-            # this is a resolution whatever raised it, and its subject leads
-            # with [RECOVER] rather than the cleared alert's own level. Both
-            # channels read this same context, so the webhook's subject
-            # follows the email's for free.
+            # Tags always say RECOVER here, regardless of the caller's extra.
             extra={**dict(extra or {}),
                    "severity_tag": alertmail.RECOVER_TAG,
                    "recover_tag": alertmail.RECOVER_TAG})

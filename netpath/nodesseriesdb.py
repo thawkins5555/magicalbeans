@@ -419,20 +419,11 @@ class NodesSeriesDatabase(SqliteStore):
             self._conn.commit()
         return removed
 
-    # Between the purge's batches — see _delete_batches' `pause`.
     PURGE_PAUSE_S = 0.01
 
     def delete_metrics_for_device_batched(self, device_id: int,
                                           deadline: float) -> tuple[int, bool]:
-        """One device's series history, in lock-bounded batches.
-
-        The same rows delete_metrics_for_devices removes in a single
-        transaction — a 48-port switch at shipped retention is ~3.4M of
-        them, which is the whole poll cycle and every chart read queued
-        behind one commit. Returns (rows removed, finished); a False
-        finish means `deadline` ran out and the next call resumes, so the
-        caller's purge cursor is the only state that has to survive.
-        """
+        """One device's series history, in lock-bounded, resumable batches."""
         device_id = int(device_id)
         where = "metric_id IN (SELECT id FROM metrics WHERE device_id = ?)"
         removed = 0

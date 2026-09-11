@@ -72,9 +72,7 @@ CREATE TABLE IF NOT EXISTS hops (
 CREATE INDEX IF NOT EXISTS ix_hops_trace ON hops(trace_id, ttl);
 CREATE INDEX IF NOT EXISTS ix_hops_ip ON hops(ip);
 
--- One HTTPS availability check of a destination's web page. Its own table
--- rather than a column on traces: the two run on their own schedules and a
--- destination can have one without the other.
+-- One HTTPS availability check of a destination's web page.
 CREATE TABLE IF NOT EXISTS https_checks (
     id          INTEGER PRIMARY KEY,
     target_id   INTEGER NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
@@ -452,10 +450,7 @@ class Database(SqliteStore):
             return int(cur.lastrowid)
 
     def last_https_checks(self, target_ids) -> dict[int, sqlite3.Row]:
-        """The newest check per destination in one query — the same shape
-        last_traces uses, for the same reason: the destination list, the
-        Debug feed and the alert engine all want it for every target at
-        once."""
+        """The newest check per destination in one query, keyed by target id."""
         target_ids = list(target_ids)
         if not target_ids:
             return {}
@@ -734,8 +729,7 @@ class Database(SqliteStore):
                     (lo, up, cutoff))
                 return cursor.rowcount or 0
 
-            # The chunk bounds are passed from this module's globals rather
-            # than left to the base's, because they are the ones tests adjust.
+            # Chunk bounds come from this module's globals, which tests adjust.
             removed, low = self._delete_batches(
                 low, cut, deadline, delete, chunk=TRIM_CHUNK,
                 chunk_min=TRIM_CHUNK_MIN, chunk_max=TRIM_CHUNK_MAX)
@@ -746,15 +740,12 @@ class Database(SqliteStore):
                             "the next maintenance pass", older_than_days)
         removed += self._prune_https_checks(cutoff, deadline)
         if removed:
-            # Its own deadline, not `deadline` above: that one may already be
-            # spent on deletes, and reclaim is worth a little time even then.
+            # Own deadline: `deadline` above may already be spent on deletes.
             self._reclaim_until(time.monotonic() + PRUNE_RECLAIM_BUDGET_S)
         return removed
 
     def _prune_https_checks(self, cutoff: float, deadline: float) -> int:
-        """The web-page checks, swept exactly the way prune() sweeps traces
-        and against the same retention: one row per destination per interval,
-        so the same id-range batching keeps the lock hold bounded."""
+        """Web-page checks, swept the same batched way prune() sweeps traces."""
         with self._lock:
             bounds = self._conn.execute(
                 "SELECT MIN(id) AS lo, MAX(id) AS hi FROM https_checks"

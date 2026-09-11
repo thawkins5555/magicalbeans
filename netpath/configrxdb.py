@@ -377,9 +377,7 @@ class ConfigRxDatabase(SqliteStore):
             self._conn.execute("DELETE FROM backups WHERE device_id = ?", (device_id,))
             self._conn.execute("DELETE FROM compliance_results WHERE device_id = ?", (device_id,))
             self._conn.commit()
-        # Outside that transaction, and in chunks: retiring tens of
-        # thousands of FTS entries under one lock hold was the longest part
-        # of deleting a device.
+        # Outside that transaction and chunked: was the longest part of deleting a device.
         self._delete_search_lines(device_id, batched=True)
 
     def reassign_device(self, old_device_id: int, new_device_id: int,
@@ -646,13 +644,10 @@ class ConfigRxDatabase(SqliteStore):
                 "SELECT 1 FROM config_lines WHERE device_id = ? LIMIT 1",
                 (device_id,)).fetchone() is not None
 
-    # Lines retired per lock hold when _delete_search_lines is batched.
     SEARCH_LINE_CHUNK = 2_000
 
     def _delete_search_lines(self, device_id: int, *, batched: bool = False) -> None:
-        """Drop one device's lines and their index entries. Lock held,
-        unless `batched`: then each chunk takes the lock and commits on its
-        own, which the caller must not be inside a transaction for.
+        """Drop one device's lines and their index entries. Lock held (unless `batched`).
 
         RETURNING hands back what FTS5 needs to retire each entry, so the cost
         is proportional to the lines removed rather than a whole re-index.

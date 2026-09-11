@@ -229,8 +229,6 @@ class ConsoleWindow(QMainWindow):
     # that thread may be touched from the teardown thread directly.
     teardown_status = Signal(str)
     teardown_done = Signal(str)
-    # Same contract for the storage card's figures, which are read off the
-    # GUI thread so a database lock cannot freeze the window.
     storage_ready = Signal(str)
 
     def __init__(self, service, server, capture=None):
@@ -416,15 +414,7 @@ class ConsoleWindow(QMainWindow):
         return card
 
     def _refresh_storage(self) -> None:
-        """Ask a worker thread for the figures; the last ones stay on screen
-        meanwhile.
-
-        Every line here is a database read — size_bytes() stats three files
-        and oldest_ts() is a MIN() over an index — and each takes that
-        store's lock, which a poll, a prune or a device purge can be
-        holding. Run on the GUI thread at 1 Hz, as this was, that is the
-        window not repainting while a background delete runs.
-        """
+        """Ask a worker thread for the figures; must not block the GUI thread."""
         if self._storage_thread is not None and self._storage_thread.is_alive():
             return
         self._storage_thread = threading.Thread(
@@ -432,9 +422,7 @@ class ConsoleWindow(QMainWindow):
         self._storage_thread.start()
 
     def _read_storage(self) -> None:
-        # Off the GUI thread. Driven from service.STORES rather than a list
-        # of its own: this card used to name ten of the thirteen stores and
-        # read IPAM's cap as 0, so the console called a capped file uncapped.
+        # Off the GUI thread.
         settings = self.service.settings
         rows = []
         for store in STORES:
@@ -457,9 +445,7 @@ class ConsoleWindow(QMainWindow):
                 lines.append(f"{label:13s} {_size(used):>10s}   {share:>22s}   "
                              f"{age:>16s}   {database.path}")
         except Exception:                                     # noqa: BLE001
-            # A store closing under a shutdown, most likely. The card keeps
-            # the previous figures rather than the traceback.
-            return
+            return  # a store closing under shutdown, most likely
         self.storage_ready.emit("\n".join(lines))
 
     def _load_fields(self) -> None:

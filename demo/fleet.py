@@ -782,9 +782,7 @@ class _ControlHandler(BaseHTTPRequestHandler):
 
 
 class _PageHandler(BaseHTTPRequestHandler):
-    """The web page half of a demo destination: one URL that works and one
-    that does not, so NetPath's per-destination HTTPS check has something
-    real to measure."""
+    """The web page half of a demo destination: one URL that works, one that doesn't."""
 
     protocol_version = "HTTP/1.1"
 
@@ -806,13 +804,7 @@ class _PageHandler(BaseHTTPRequestHandler):
 
 
 def start_page_server(port: int) -> ThreadingHTTPServer | None:
-    """A loopback HTTPS listener with a throwaway self-signed certificate.
-
-    stdlib ssl can only serve from a certificate file, so one is generated
-    with openssl at start. No openssl, no demo web page — the fleet carries
-    on without it and the seeded destinations simply report the check
-    failing, which is itself a truthful demo state.
-    """
+    """A loopback HTTPS listener with a throwaway openssl-generated certificate."""
     import ssl
     import subprocess
     import tempfile

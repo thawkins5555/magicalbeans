@@ -274,23 +274,13 @@ SHUTDOWN_DB_GRACE_S = 2.0
 
 
 class DevicePurger(Worker):
-    """Deletes the history of removed devices, a batch at a time.
-
-    A device delete is the one write whose size is set by how long the
-    device was polled — see nodesdb.request_device_removal. The route
-    writes the tombstone and wakes this thread; the rows go in batches
-    short enough that the poll cycle and the web page never wait for more
-    than one of them, and an interrupted purge resumes from the
-    device_purges table on the next start.
-    """
+    """Deletes the history of removed devices, a batch at a time; see
+    nodesdb.request_device_removal for why it's batched."""
 
     THREAD_NAME = "netpath-device-purge"
     STOPPED_TEXT = "Purge worker stopped"
-    # How often the queue is re-read without a wake — a purge left over
-    # from a previous run has nobody to wake the thread for it.
-    TICK_S = 5.0
-    # Between steps, so the batches never become one long occupation.
-    REST_S = 0.05
+    TICK_S = 5.0  # how often the queue is re-read without a wake
+    REST_S = 0.05  # between steps
 
     def __init__(self, nodes_db, log=None):
         self.nodes_db = nodes_db
@@ -501,8 +491,6 @@ class Service:
         self._maintenance_thread: threading.Thread | None = None
         self._rollup_thread: threading.Thread | None = None
         self._nodes_split_thread: threading.Thread | None = None
-        # Beside the split thread for the same reason: it works on the
-        # Nodes stores in the background and nothing waits for it.
         self.device_purger = DevicePurger(self.nodes_db, log=self.log)
         # The maintenance thread waits on the first between ticks, so
         # request_maintenance() wakes it at once; the second marks that
@@ -709,8 +697,6 @@ class Service:
             target=self._rollup_loop, name="netpath-flow-rollup", daemon=True)
         self._rollup_thread.start()
         self._start_nodes_split()
-        # Last, and unconditional: a purge left unfinished by the previous
-        # run resumes from its device_purges rows.
         self.device_purger.start()
         self.log.add(SYSTEM, "Service started")
 
@@ -767,9 +753,6 @@ class Service:
             ("Nodes poller", self.node_poller),
             ("wireless poller", self.wireless),
             ("ConfigRX worker", self.configrx),
-            # After the Nodes poller: it holds no work anyone is waiting
-            # for, and what it leaves half-done it picks up on the next
-            # start from the device_purges rows.
             ("device purger", self.device_purger),
         ]
 

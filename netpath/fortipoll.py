@@ -51,9 +51,7 @@ PING_BUDGET_S = 20.0
 
 SNMP_PORT = 161
 
-# How far apart _first_due may push two controllers that came due together.
-# nodepoll's _STARTUP_SPREAD_S, for the same reason: every controller used to
-# be seeded due at 0 on start and so stayed phase-locked to the others.
+# Like nodepoll's _STARTUP_SPREAD_S: breaks the phase lock of controllers seeded due at 0 together.
 POLL_SPREAD_S = 30.0
 
 
@@ -159,10 +157,7 @@ class WirelessPoller(Worker):
             self._stop.wait(1.0)
 
     def _first_due(self, last_poll_ts, now: float, interval: float) -> float:
-        """A controller's first due time this process. Never polled at all:
-        now. Otherwise its own period, but never sooner than a random point
-        inside the spread window — which is what breaks the phase lock a
-        restart imposes. Bounded by the interval, so a short one is kept."""
+        """A controller's first due time this process; jittered to break phase lock on restart."""
         if not last_poll_ts:
             return now
         jitter = random.uniform(0.0, min(POLL_SPREAD_S, interval))
@@ -334,8 +329,7 @@ class WirelessPoller(Worker):
                     "operating_power_dbm": _as_int(powers.get(radio_suffix)),
                     "station_count": _as_int(radio_stations.get(radio_suffix)),
                     "bssid": _format_mac(bssids.get(radio_suffix)) or None,
-                    # The profile-radio table is keyed by profile name, not by
-                    # AP, so every AP on one profile reads the same row.
+                    # Profile-radio table is keyed by profile name, so every AP on it reads the same row.
                     "channel_width": width_by_profile.get((vdom, profile, radio_id)),
                 })
             self.db.replace_radios(ap_id, radios, controller_id=controller["id"],
@@ -436,11 +430,7 @@ class WirelessPoller(Worker):
 
 
 def _split_vdom_name(suffix: str) -> tuple[str, str, str] | None:
-    """'<vdomIndex>.<len>.<char>...[.<rest>]' -> (vdom, name, rest). A
-    DisplayString table index is a length prefix followed by that many
-    decimal char-code arcs -- the convention any string-indexed SNMP table
-    uses. Here the string is the WtpId in the session tables and the profile
-    name in fgWcWtpProfileRadioTable; `rest` is the radio id in both."""
+    """'<vdomIndex>.<len>.<char>...[.<rest>]' -> (vdom, name, rest); name is WtpId or profile name."""
     parts = suffix.split(".")
     if len(parts) < 2:
         return None
@@ -462,8 +452,7 @@ def _split_vdom_wtp(suffix: str) -> tuple[str, str] | None:
 
 
 def _channel_widths(values: dict[str, object]) -> dict[tuple[str, str, str], str]:
-    """fgWcWtpProfileRadioChannelWidth keyed by (vdom, profile, radio id),
-    which is what an AP's own (vdom, profile) plus a radio id joins onto."""
+    """fgWcWtpProfileRadioChannelWidth keyed by (vdom, profile, radio id)."""
     widths: dict[tuple[str, str, str], str] = {}
     for suffix, value in values.items():
         parsed = _split_vdom_name(suffix)

@@ -107,9 +107,7 @@ CONTROLLER_EDITABLE = ("name", "ip", "enabled", "snmp_version", "community",
 
 
 def _radio_changes(previous: dict, radios: list[dict]) -> list[str]:
-    """One sentence per radio whose channel or mode moved. A radio with no
-    previous row is silent (a new AP is not a channel change), and so is a
-    reading that arrived or vanished — "— to 44" is a radio being enabled."""
+    """One sentence per radio whose channel or mode moved; a new radio is silent."""
     changes = []
     for radio in radios:
         old = previous.get(radio["radio_id"])
@@ -133,16 +131,14 @@ class WirelessDatabase(SqliteStore):
         self.ensure_columns("access_points", {
             "ip": "TEXT", "response_ms": "REAL",
             "out_of_service": "INTEGER NOT NULL DEFAULT 0"})
-        # uptime_ticks/uptime_ts are the pair detect_reboot compares, stored
-        # the way nodesdb stores last_uptime_ticks/last_uptime_ts.
+        # uptime_ticks/uptime_ts are the pair detect_reboot compares, as nodesdb does.
         self.ensure_columns("access_points", {
             "uptime_ticks": "INTEGER", "uptime_ts": "REAL",
             "session_uptime_ticks": "INTEGER", "profile": "TEXT"})
         # fgWcWtpSessionRadioMode, stored decoded rather than as the raw enum
         # so the mapping lives in one place (nodeoids.RADIO_MODE).
         self.ensure_columns("radios", {"mode": "TEXT"})
-        # channel_width is the PROFILE's configured width, joined on by
-        # (vdom, profile, radio id) -- there is no per-radio width in the MIB.
+        # channel_width is the profile's configured width; there is no per-radio width in the MIB.
         self.ensure_columns("radios", {"bssid": "TEXT", "channel_width": "TEXT"})
 
     # ------------------------------------------------------------ controllers
@@ -295,10 +291,7 @@ class WirelessDatabase(SqliteStore):
                 f"{name} is {fields.get('status') or 'reachable'} again")
 
     def _record_reboot(self, controller_id, wtp_id, vdom, previous, fields) -> None:
-        """Records ap_rebooted when fgWcWtpSessionWtpUpTime falls. The
-        comparison — and the 497-day TimeTicks wrap it rules out — is Nodes'
-        own detect_reboot; the import is local because nothing else in this
-        storage module needs the SNMP stack behind it. Lock already held."""
+        """Records ap_rebooted when fgWcWtpSessionWtpUpTime falls, via Nodes' detect_reboot."""
         from .nodepoll import detect_reboot
 
         ticks = fields.get("uptime_ticks")
@@ -319,12 +312,7 @@ class WirelessDatabase(SqliteStore):
     def replace_radios(self, ap_id: int, radios: list[dict], *,
                        controller_id: int | None = None, wtp_id: str | None = None,
                        vdom: str = "", name: str = "") -> None:
-        """The radio rows are replaced wholesale, so the diff has to be taken
-        first: a channel or mode that moved (DARRP re-picking a channel, a
-        radio switched to monitor) would otherwise be overwritten silently.
-        The keyword arguments are what an ap_event needs and a radio row does
-        not carry; without them the diff is skipped and this is a plain
-        replace, which is what keeps every existing caller working."""
+        """Diffs against the previous rows before replacing, so a channel/mode change is still logged."""
         with self._lock:
             previous = {}
             if controller_id is not None and wtp_id is not None:

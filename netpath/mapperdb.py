@@ -325,14 +325,7 @@ class MapperDatabase(SqliteStore):
         return moved
 
     def forget_device(self, device_id: int) -> int:
-        """Every placement of a device Nodes has deleted, removed from the
-        maps it was on.
-
-        reassign_device's shape, without a destination. Without this the
-        node rows keep a device_id nothing owns, and devices.id is INTEGER
-        PRIMARY KEY without AUTOINCREMENT — so the next device added would
-        appear, already placed, on whatever maps the deleted one was on.
-        """
+        """Remove every placement of a device Nodes has deleted."""
         now = time.time()
         with self._lock:
             rows = self._conn.execute(

@@ -362,8 +362,7 @@ ROUTES = [
      api.get_nodes_reports_availability, ("nodes", R)),
     ("GET", r"^/api/nodes/reports/top-metrics$",
      api.get_nodes_reports_top_metrics, ("nodes", R)),
-    # Firmware inventory, and the same report as a file. Read-only like the
-    # two above, so a viewer account can run and export it.
+    # Firmware inventory, and the same report as a file.
     ("GET", r"^/api/nodes/reports/firmware$",
      api.get_nodes_reports_firmware, ("nodes", R)),
     ("GET", r"^/api/nodes/reports/firmware/export\.csv$",

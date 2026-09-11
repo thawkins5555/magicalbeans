@@ -4,8 +4,7 @@
   const NODE_W = 212, NODE_H = 66, COL_GAP = 54, ROW_GAP = 18;
   const PAD_X = 10, TICKS_H = 7, LABEL_H = 13, LANE_GAP = 9, AXIS_H = 20;
   const STATUS_H = 26, MIN_BLOCK_PX = 3;
-  /* The web lane is drawn only for a destination that has a web page URL,
-     so laneOrder() below is what the geometry and the drawing both read. */
+  // The web lane is drawn only for a destination with a web page URL; see laneOrder() below.
   const WEB_H = 14;
   const LANE_ORDER = ['rtt', 'loss', 'status', 'web'];
 
@@ -278,8 +277,7 @@
 
   const escape = App.escapeHtml;
 
-  /* The web page's state beside the MTR badge: the word carries it, the
-     colour only reinforces it, and the title says what was measured. */
+  // The state word carries the meaning here; colour only reinforces it.
   function httpsBadge(target) {
     if (!target.https_url) return '';
     const state = target.https_state || 'none';
@@ -918,9 +916,7 @@
     return `${Math.round(ms)} ms`;
   }
 
-  /* Which lanes this destination has. A destination with no web page has
-     nothing to draw in the fourth lane, so it gets the three it always had
-     and the full height for them. */
+  // A destination with no web page skips the fourth lane entirely.
   function laneOrder() {
     const target = currentTarget();
     return (target && target.https_url)
@@ -1113,10 +1109,7 @@
       }
     }
 
-    // The web lane: one cell per check block, green where every check in it
-    // answered, red where none did, amber where the block is mixed. Its own
-    // pass rather than a branch inside the loop above, because the two series
-    // are bucketed on the same grid but arrive as separate payloads.
+    // Its own pass rather than a branch above: the two series are bucketed alike but arrive as separate payloads.
     if (L.web && view.https) {
       for (const bucket of view.https.buckets) {
         const x0 = xFor(bucket.t0), x1b = xFor(bucket.t1);
@@ -1136,8 +1129,7 @@
           x: x0, y: L.web.y, width: bw, height: L.web.h,
           fill, 'fill-opacity': 0.85,
         }));
-        // The same texture vocabulary the status lane uses, so no state in
-        // this pane is carried by hue alone.
+        // Same texture vocabulary as the status lane, so state isn't carried by hue alone.
         const texture = App.statusPatternUrl(
           bucket.ok_pct >= 100 ? 'ok' : (bucket.ok_pct <= 0 ? 'fail' : 'warn'), svg);
         if (texture) {
@@ -1163,9 +1155,7 @@
       }, App.stamp(ts, span)));
     }
 
-    // The bottom of the drawn lanes: the web lane where there is one, the
-    // status lane otherwise. Every full-height line and the brush measure
-    // against it.
+    // Bottom of the drawn lanes: web lane if present, else status.
     const lastLane = L.web || L.status;
     if (view.pinned) {
       const x = xFor(view.pinned);
@@ -1352,8 +1342,6 @@
     return lines.join('\n');
   }
 
-  /* The web-page block under the same instant, appended to the tooltip the
-     three lanes above already build. */
   function webTipLines(ts) {
     if (!view.https || !view.https.url) return [];
     const bucket = view.https.buckets.find((b) => ts >= b.t0 && ts <= b.t1);
@@ -1374,8 +1362,6 @@
     return STEPS.find((s) => s >= want) || STEPS[STEPS.length - 1];
   }
 
-  /* The fifth window-summary tile: what the web page did over the window,
-     in the same "state · number" shape the other four use. */
   function renderWebStat() {
     const el = App.el('stat-web');
     if (!el) return;
@@ -1444,8 +1430,7 @@
       ? `Avg RTT   ${summary.avg_rtt.toFixed(1)} ms` : 'Avg RTT      —';
     App.el('stat-traces').textContent = `Traces    ${summary.traces ?? 0}`;
 
-    // Only for a destination that has a page: the route is fetched for every
-    // destination, this one is not.
+    // Unlike the route, this is only fetched for a destination with a page.
     if (currentTarget() && currentTarget().https_url) {
       view.https = await App.get('/api/netpath/https', {
         target: view.targetId, t0: view.t0, t1: view.t1, width,

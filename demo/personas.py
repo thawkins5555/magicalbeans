@@ -1531,9 +1531,7 @@ def _wtp_suffix(vdom: str, wtp_id: str) -> str:
 
 
 def _wtp_profile_radio_suffix(vdom: str, profile: str, radio_id: int) -> str:
-    """Same length-prefixed string index as _wtp_suffix, for the fgWcWtp-
-    ProfileRadioTable, which is indexed by profile name rather than WTP id
-    and carries a trailing radioId arc."""
+    """Same length-prefixed string index as _wtp_suffix, keyed by profile name."""
     chars = ".".join(str(ord(c)) for c in profile)
     return f"{vdom}.{len(profile)}.{chars}.{radio_id}"
 
@@ -1582,9 +1580,7 @@ def _build_fortigate_wlc(wrap32: bool, ports: int, vlan: str | None) -> dict:
             (lambda st, now, k=n: 0) if not online else
             (lambda st, now, k=n: max(0, 8 + (h("clients", st.name, k) % 22) +
                                       int(6 * math.sin(now / 41.0 + k)))))
-        # fgWcWtpSessionWtpUpTime / WtpSessionUpTime: real per-AP clocks, not
-        # tied to the controller's own uptime — AP0007 wraps every 20
-        # minutes to show the "Access point rebooted" event.
+        # AP0007's clock wraps every 20 min to show the "rebooted" event.
         entries[f"{fgoids.WTP_SESSION_UPTIME}.{suffix}"] = (
             T_TIMETICKS,
             (lambda st, now, w=wtp_id: 0) if not online else
@@ -1624,8 +1620,7 @@ def _build_fortigate_wlc(wrap32: bool, ports: int, vlan: str | None) -> dict:
             bssid = mac[:5] + bytes(((mac[5] + radio) & 0xFF,))
             entries[f"{fgoids.WTP_RADIO_BSSID}.{rsuffix}"] = (
                 T_OCTET_STRING, bssid)
-    # fgWcWtpProfileRadioChannelWidth: one row per (profile, radioId), not
-    # per AP — both demo profiles' two radios.
+    # fgWcWtpProfileRadioChannelWidth: keyed by (profile, radioId), not per AP.
     profile_widths = {
         ("FAP231F-default", 1): 1,      # 20 MHz
         ("FAP231F-default", 2): 3,      # 80 MHz

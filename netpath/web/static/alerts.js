@@ -1257,8 +1257,7 @@
               ? null : Number(text);
           }
         }
-        // for_polls lives outside the threshold block for a kind that
-        // counts checks rather than comparing a value (netpath_event).
+        // for_polls lives outside the threshold block: netpath_event counts checks, not a threshold.
         const forPollsEl = box.querySelector('#ar-forpolls');
         if (!isThreshold && forPollsEl) values.for_polls = Number(forPollsEl.value);
         if (isFlapping) {

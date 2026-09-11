@@ -161,8 +161,7 @@
     if (counts.maintenance) parts.push(`${counts.maintenance} in maintenance`);
     if (counts.unsupported) parts.push(`${counts.unsupported} unsupported`);
     if (counts.auth) parts.push(`${counts.auth} auth failed`);
-    // A delete answers at once and the history goes in background batches,
-    // so this line is where "it is still going" is visible.
+    // A delete answers at once; history purge runs in the background, tracked here.
     const purges = nodes.purges || {};
     if (purges.pending) {
       parts.push(`purging history for ${purges.pending} device(s)`);
@@ -313,9 +312,7 @@
     { key: 'sys_object_id', label: 'sysObjectID', width: 180,
       value: (r) => r.sys_object_id || '',
       cell: (r) => escape(r.sys_object_id || '\u2014') },
-    // Off by default like Location above: plenty of gear names no version,
-    // and this is here so a fleet can be SORTED by what it runs \u2014 the
-    // Reports tab's Firmware inventory is the fuller answer.
+    // Off by default like Location above; the Reports tab's Firmware inventory is the fuller answer.
     { key: 'sw_version', label: 'Software', width: 130,
       value: (r) => r.sw_version || '',
       cell: (r) => escape(r.sw_version || '\u2014')
@@ -1074,11 +1071,7 @@
       }[d.vendor_source] || '')
         + (d.vendor && d.vendor_confidence && d.vendor_confidence !== 'high'
            ? ` ${d.vendor_confidence}` : '')),
-      // What the device is running (netpath/swversion.py). The image line
-      // carries the boot image FILE after it where one was read: on an
-      // IOS-XE box in install mode the file (bootflash:packages.conf) is
-      // all there is, and on a classic one the pair together is what an
-      // operator checks an upgrade against.
+      // netpath/swversion.py; image line appends the boot image file when one was read.
       sw_version: () => field('software', d.sw_version),
       sw_image: () => field('image', (d.sw_image || d.sw_image_file || '')
         && (d.sw_image || '') + (d.sw_image && d.sw_image_file ? ' — ' : '')
@@ -4124,10 +4117,7 @@
       header, rows);
   }
 
-  /* ------------------------------------------------ firmware inventory
-
-     No period: /api/nodes/reports/firmware reads the identity columns as
-     they stand, so this report has a group filter and nothing else. */
+  // ------------------------------------------------ firmware inventory
   const FIRMWARE_COLUMNS = [
     { key: 'name', label: 'Device', width: 190,
       value: (r) => r.name || r.ip || `#${r.device_id}`,
@@ -4177,8 +4167,7 @@
     App.wireRowKeyboard(body);
   }
 
-  /* Same shape as the other two runs: the group lookup happens inside the
-     promise App.runJob is given, never before it. */
+  // Same shape as the other two runs: the group lookup happens inside the App.runJob promise.
   function runFirmwareReport() {
     const button = App.el('nd-rep-fw-run');
     return App.runJob(button, {
@@ -4222,10 +4211,7 @@
       FIRMWARE_CSV_HEADER, rows);
   }
 
-  /* The server builds the same rows again rather than the browser sending
-     up the ones it holds: a 900-device fleet is a file to hand somebody,
-     and this way the download does not depend on the report having been
-     run — or on the tab having stayed open while it was. */
+  // The server rebuilds rows itself so this doesn't depend on the report having been run in this tab.
   async function exportFirmwareReportCsvFromServer() {
     const device_ids = await reportDeviceIds('nd-rep-fw-devgroup');
     if (device_ids && !device_ids.length) {
@@ -4732,9 +4718,6 @@
         view.detail = null;
         loadDetail();
         App.refreshNow('nodes');
-        // The device is gone from every list already; what is still
-        // running is the delete of its history, which the status strip
-        // counts down.
         App.toast('Removed; its history is being purged in the background', 'ok');
       }, (confirmed) => { if (!confirmed) editDevice(); });
   }

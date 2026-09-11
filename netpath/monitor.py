@@ -812,12 +812,7 @@ class HopProber(Worker):
 
 
 def https_url_for(target) -> str:
-    """The destination's web page URL, or "" for one with none.
-
-    A row read from a database that predates the column has no key at all,
-    which is a different thing from an empty one \u2014 the same `in row.keys()`
-    guard every other late-added target column here is read through.
-    """
+    """The destination's web page URL, or "" for one with none."""
     keys = target.keys()
     if "https_url" not in keys:
         return ""
@@ -825,16 +820,7 @@ def https_url_for(target) -> str:
 
 
 class HttpsChecker(Worker):
-    """Checks each destination's web page on that destination's own interval.
-
-    The traceroute says the path works; this says the thing at the end of it
-    is serving. Scheduled exactly the way Monitor schedules traces \u2014 a due
-    time per destination derived from the last check's timestamp, a small
-    pool, and an in-flight set so a slow page cannot queue behind itself \u2014
-    but kept as its own worker rather than folded into Monitor because a
-    destination can have one without the other and a page fetch has nothing
-    to do with a traceroute's own budget.
-    """
+    """Checks each destination's web page on that destination's own interval."""
 
     THREAD_NAME = "netpath-https"
     STOPPED_TEXT = "Web page checks are off"
@@ -849,8 +835,7 @@ class HttpsChecker(Worker):
         self._inflight: set[int] = set()
         self._started: dict[int, float] = {}
         self._next_run: dict[int, float] = {}
-        # Last recorded verdict per destination, so an event-log line is
-        # written on a transition rather than on every check.
+        # Last recorded verdict per destination, so we log only transitions.
         self._state: dict[int, bool] = {}
 
     def start(self) -> None:
@@ -958,9 +943,7 @@ class HttpsChecker(Worker):
             keys = target.keys()
             insecure = bool(target["https_insecure"]) \
                 if "https_insecure" in keys else False
-            # A page fetch is not an ICMP probe, so it does not inherit the
-            # destination's per-probe timeout; it is bounded by the check
-            # interval instead, so a slow page can never overrun its own slot.
+            # Bounded by the check interval, not the destination's ping timeout.
             timeout_s = min(HTTPS_TIMEOUT_S,
                             max(float(target["interval_s"] or 0), 2.0))
             result = check_https(url, timeout_s=timeout_s, insecure=insecure)

@@ -3741,15 +3741,7 @@ class NodePoller(Worker):
                                       "endOfMibView")}
 
     def _poll_software_version(self, device, config: dict, identity: dict) -> dict:
-        """`sw_version`/`sw_image`/`sw_image_file` for the identity dict.
-
-        ONE extra GET per identity poll, of the objects this device's own
-        maker defines plus the standard entPhysicalSoftwareRev — through
-        _identity_extras, so a v1 agent's noSuchName spoils only this
-        request and never the scalars, and a device that answers none of
-        them costs nothing but the datagram. Everything else comes out of
-        the sysDescr already in hand. Nothing matched is three NULLs, not a
-        guess."""
+        """`sw_version`/`sw_image`/`sw_image_file` for the identity dict, via one extra GET."""
         arc = identity.get("vendor_arc")
         scalars = self._identity_extras(device, config,
                                         list(swversion.oids_for(arc)))

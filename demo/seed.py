@@ -398,11 +398,7 @@ NETPATH_TARGETS = [
     ("127.0.0.2", "Core switch (loopback fleet)"),
 ]
 
-# Two of the destinations above also get a web page to check, served by the
-# fleet's own HTTPS listener (demo/fleet.py --page-port, default 8444). Its
-# certificate is self-signed, so the one that accepts an untrusted
-# certificate reports its page available and the one that does not reports
-# exactly why it will not trust it — both states on screen at once.
+# Two destinations get a web page: one trusts the self-signed cert, one doesn't.
 NETPATH_WEB_PORT = 8444
 NETPATH_WEB_PAGES = {
     "10.0.0.1": (f"https://127.0.0.1:{NETPATH_WEB_PORT}/", 1),

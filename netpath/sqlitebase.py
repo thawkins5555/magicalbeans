@@ -669,15 +669,8 @@ class SqliteStore:
         Returns (rows removed, the id reached). `delete` defaults to
         _trim_delete; the chunk bounds default to this module's, and are
         passed explicitly by callers whose own module globals are the ones
-        tests adjust.
-
-        `pause` sleeps that long between batches. A short lock hold is not
-        the same thing as a lock a reader can get: this loop reacquires the
-        moment it lets go and a Python lock is not fair, so a reader polling
-        every few milliseconds can lose the race for the length of the whole
-        sweep. Left at 0 for the retention prunes, which run to a budget;
-        the device purge, which is background work with nothing waiting on
-        it, passes one.
+        tests adjust. `pause` sleeps that long between batches, giving a
+        reader a chance at the lock; left at 0 except by the device purge.
         """
         delete = delete or self._trim_delete
         batch = TRIM_CHUNK if chunk is None else chunk
