@@ -799,6 +799,90 @@ try:
         stub4.close()
     wait_idle()
 
+    # ---------------------------------- a username off the socket is not a blob
+
+    # A WebSocket text frame may be wsock.MAX_MESSAGE_BYTES (2 MiB), and the
+    # refused-login audit names the username that was tried. Unclamped, five
+    # of those was 10 MB of device_events rows per device.
+    stub5 = StubDevice(mode="slow", pause_s=0.05, host="127.0.0.5")
+    blob_device = service.nodes_db.add_device("127.0.0.5", name="blob-target",
+                                              group_id=group_id)
+    service.configrx_db.update_device_config(blob_device, ssh_port=stub5.port)
+    stub_module._Server.check_auth_password = \
+        lambda self, username, password: paramiko.AUTH_FAILED
+    try:
+        huge = "U" * 100_000
+        blobber = WsClient(web_port, f"/api/ssh/devices/{blob_device}/socket",
+                           token)
+        blobber.send_json({"type": "open", "cols": 80, "rows": 24})
+        assert blobber.next_control("need-credentials", timeout=30)
+        blobber.send_json({"type": "auth", "username": huge, "password": "x"})
+        events = wait_for_event(blob_device, "refused (attempt", timeout=30)
+        assert events, "the refusal was never audited"
+        detail = events[0]["detail"]
+        assert len(detail) < 1000, len(detail)
+        assert huge not in detail, len(detail)
+        assert "U" * sshterm.MAX_USERNAME_CHARS in detail, detail[:200]
+        assert "U" * (sshterm.MAX_USERNAME_CHARS + 1) not in detail, detail[:200]
+        blobber.close()
+        wait_idle()
+        print(f"PASS: a 100 KB SSH username is clamped to "
+              f"{sshterm.MAX_USERNAME_CHARS} characters before it reaches the "
+              f"device event log")
+    finally:
+        stub_module._Server.check_auth_password = accept_password
+        stub5.close()
+    wait_idle()
+
+    # ------------------------- a permission read that cannot answer is not forever
+
+    # The watchdog fails open when app.db raises — "a database that cannot
+    # answer is not a verdict" — but failing open forever means a revoked
+    # grant never ends a live shell, which is the one thing the check exists
+    # for. Bounded to MAX_PERMISSION_ERRORS consecutive failures.
+    status, payload = call("POST", "/api/users",
+                           {"username": "blindeduser",
+                            "password": "Corr3ct-Horse-B7t",
+                            "grants": {"ssh": "write"}}, token=token)
+    assert status == 200, (status, payload)
+    blinded_token = login("blindeduser", "Corr3ct-Horse-B7t")
+    blinded = WsClient(web_port, f"/api/ssh/devices/{device}/socket",
+                       blinded_token)
+    blinded.send_json({"type": "open", "cols": 80, "rows": 24})
+    until_connected(blinded)
+
+    real_permissions_for = service.app_db.permissions_for
+    asked = []
+    original_permission_ticks = sshterm.PERMISSION_EVERY_TICKS
+    sshterm.PERMISSION_EVERY_TICKS = 1     # one read a second, not one in five
+
+    def blind_permissions_for(username):
+        if username == "blindeduser":
+            asked.append(username)
+            raise RuntimeError("app.db cannot answer")
+        return real_permissions_for(username)
+
+    service.app_db.permissions_for = blind_permissions_for
+    try:
+        # Fails open first: the shell is still alive several ticks in.
+        deadline = time.time() + 15
+        while len(asked) < 3 and time.time() < deadline:
+            time.sleep(0.1)
+        assert len(asked) >= 3, asked
+        assert not blinded.close_code, blinded.close_code
+        closed = blinded.wait_closed(
+            sshterm.MAX_PERMISSION_ERRORS + 15)
+    finally:
+        service.app_db.permissions_for = real_permissions_for
+        sshterm.PERMISSION_EVERY_TICKS = original_permission_ticks
+    assert closed == 4401, closed
+    assert len(asked) >= sshterm.MAX_PERMISSION_ERRORS, len(asked)
+    blinded.close()
+    wait_idle()
+    print(f"PASS: a permission read that keeps raising fails open for "
+          f"{sshterm.MAX_PERMISSION_ERRORS} consecutive attempts and then "
+          f"closes the shell, rather than leaving it running unchecked")
+
     # ------------------------------------- a shell is only as live as its session
 
     status, payload = call("POST", "/api/users",

@@ -828,6 +828,37 @@ try:
     check("revoking the permission closes the relay within a few ticks",
           wait_until(lambda: service.web_relays.get(doomed["session_id"]) is None,
                      2 * webrelay.PERMISSION_EVERY_TICKS + 4))
+
+    # A permission read that cannot answer fails open — "a database that
+    # cannot answer is not a verdict" — but not forever: failing open with no
+    # end means a revoked grant never closes a live tunnel, which is the one
+    # thing this check exists for.
+    blinded_token = make_user("blindrelay", {"nodes": "read", "web": "write"})
+    status, blinded, _ = call("POST", f"/api/web/devices/{device_id}/relay",
+                              {}, token=blinded_token)
+    assert status == 200, (status, blinded)
+    real_permissions_for = service.app_db.permissions_for
+    asked = []
+
+    def blind_permissions_for(username):
+        if username == "blindrelay":
+            asked.append(username)
+            raise RuntimeError("app.db cannot answer")
+        return real_permissions_for(username)
+
+    service.app_db.permissions_for = blind_permissions_for
+    try:
+        check("a tunnel is not closed by the first few reads that raise",
+              wait_until(lambda: len(asked) >= 3, 10)
+              and service.web_relays.get(blinded["session_id"]) is not None,
+              len(asked))
+        check("…and is closed once they keep failing",
+              wait_until(
+                  lambda: service.web_relays.get(blinded["session_id"]) is None,
+                  webrelay.MAX_PERMISSION_ERRORS + 10),
+              len(asked))
+    finally:
+        service.app_db.permissions_for = real_permissions_for
     webrelay.PERMISSION_EVERY_TICKS = saved_ticks
 
     signed_out = make_user("signout", {"nodes": "read", "web": "write"})

@@ -487,6 +487,32 @@ reader.join(timeout=5)
 assert not reader.is_alive(), "the parked reader was never released"
 assert not ws._drain_pending, "the reader did not take over the drain"
 print("PASS: close() from another thread defers the drain to the parked reader")
+
+# The drain's own wait has to be the module's, for the same reason the
+# reader's is: select.select raises ValueError for a descriptor at or above
+# FD_SETSIZE, and the arm around the drain swallows it — so on a busy
+# appliance the drain quietly consumed nothing and the close frame naming
+# the reason could be lost to the reset it exists to prevent.
+try:
+    sock, ws = high_fd_pair()
+except OSError as exc:
+    print(f"SKIP: no descriptor available at {HIGH_FD} here ({exc})")
+else:
+    assert ws.sock.fileno() >= 1024, ws.sock.fileno()
+    sock.sendall(b"z" * 4096)
+    time.sleep(0.2)
+    ws._drain()
+    ws.sock.settimeout(0.3)
+    try:
+        left = ws.sock.recv(65536)
+    except (socket.timeout, TimeoutError, BlockingIOError):
+        left = b""
+    assert left == b"", \
+        f"{len(left)} bytes left unread on fd {ws.sock.fileno()}"
+    print(f"PASS: the drain empties a socket numbered above FD_SETSIZE "
+          f"(fd {ws.sock.fileno()}), where select.select could only raise")
+    ws.close()
+    sock.close()
 sock.close()
 
 print("ALL WSOCK ASSERTIONS PASSED")

@@ -210,7 +210,7 @@
       const raw = radio.operating_power_dbm;
       lines.push(`radio ${escape(String(radio.radio_id))}`,
         `  mode         ${escape(radio.mode || '—')}`,
-        `  channel      ${radio.channel ?? '—'}`,
+        `  channel      ${escape(radio.channel ?? '—')}`,
         // Both the reading and the number it was read from, so an operator
         // can check the guess against the controller's own display.
         `  tx power     ${escape(powerText(raw, row.power_unit, radio.is_scan))}` +

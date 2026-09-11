@@ -313,6 +313,7 @@ class _Session:
         return packed == mine
 
     def request(self, packet: bytes, expect_request_id: int | None = None, *,
+                expect_msg_id: int | None = None,
                 auth_proto: str | None = None, auth_key: bytes | None = None,
                 priv_proto: str | None = None, priv_key: bytes | None = None,
                 verify: bool = True) -> Response:
@@ -337,7 +338,9 @@ class _Session:
         encrypted reply the id is inside the ciphertext and only the digest
         can come first. A Report-PDU is exempt from the id test: an agent
         reports an engine mismatch against its own msgID, and dropping it
-        would turn one v3 resync into a timeout.
+        would turn one v3 resync into a timeout — but its msgID is
+        checked instead (expect_msg_id), which is the field RFC 3412 s7.2
+        has the receiver match and the one a forger cannot guess.
 
         Retries on timeout up to self.retries times; raises SnmpTimeout if
         every attempt times out.
@@ -371,7 +374,8 @@ class _Session:
                     response = decode_response(
                         data, auth_proto=auth_proto, auth_key=auth_key,
                         priv_proto=priv_proto, priv_key=priv_key, verify=verify,
-                        expect_request_id=expect_request_id)
+                        expect_request_id=expect_request_id,
+                        expect_msg_id=expect_msg_id)
                 except SnmpStray:
                     # Somebody else's answer, or a late one: not ours.
                     self.dropped += 1
@@ -466,10 +470,13 @@ def credential_for(config: dict) -> Credential:
     else:
         identity = config.get("community")
         if identity and "," in identity:
+            # Named, never printed: this message reaches devices.snmp_error,
+            # the device event log, the API and any alert mail, and a
+            # community string is a secret (see _credential_label).
             raise SnmpError(
-                f"the community {identity!r} contains a comma — one device "
-                f"is polled with one community; put the alternates in the "
-                f"polling profile's credentials instead")
+                "the community configured for this device contains a comma "
+                "— one device is polled with one community; put the "
+                "alternates in the polling profile's credentials instead")
     if isinstance(identity, str):
         identity = identity.strip()
     auth_proto = config.get("v3_auth_proto")
@@ -517,8 +524,14 @@ def snmp_version_of(config: dict) -> int:
 
 def discover_engine(session: _Session, ip: str) -> tuple[bytes, int, int]:
     """RFC 3414 §4's engine discovery: the empty, unauthenticated probe, and
-    the (engine_id, boots, time) the agent's Report-PDU answers with."""
-    response = session.request(discovery_probe())
+    the (engine_id, boots, time) the agent's Report-PDU answers with.
+
+    The probe carries this session's own msgID rather than the fixed 1 the
+    builder defaults to, so the Report that answers it can be matched
+    against it — a Report is exempt from the request-id filter, and
+    discovery is the one exchange whose whole answer is a Report."""
+    msg_id = session.next_request_id()
+    response = session.request(discovery_probe(msg_id), expect_msg_id=msg_id)
     if not response.engine_id:
         raise SnmpError(f"{ip}: no engine id in discovery reply")
     return response.engine_id, response.engine_boots, response.engine_time
@@ -592,15 +605,17 @@ def v3_exchange(session: _Session, pdu_tag: int, oids: list[str], *,
         priv_key = privacy_key(auth_proto, priv_password, engine_id) \
             if encrypting else None
         request_id = session.next_request_id()
+        msg_id = session.next_request_id()
         packet = build_v3_request(
-            session.next_request_id(), request_id, pdu_tag, oids,
+            msg_id, request_id, pdu_tag, oids,
             engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
             user=identity or "", auth_proto=auth_proto, auth_key=auth_key,
             max_repetitions=max_repetitions,
             priv_proto=priv_proto if encrypting else None, priv_key=priv_key)
         try:
             response = session.request(
-                packet, request_id, auth_proto=auth_proto, auth_key=auth_key,
+                packet, request_id, expect_msg_id=msg_id,
+                auth_proto=auth_proto, auth_key=auth_key,
                 priv_proto=priv_proto if encrypting else None, priv_key=priv_key,
                 verify=verify_replies)
         except SnmpAuthError as exc:
@@ -624,9 +639,12 @@ def v3_exchange(session: _Session, pdu_tag: int, oids: list[str], *,
         # single legitimate exception is unknownEngineIDs, the Report
         # whose whole purpose is to tell us an id we did not have. Any
         # other Report under a foreign id is not learned and not acted on;
-        # the retry rediscovers instead. Not a proof — discovery itself is
-        # unauthenticated, by RFC — but one datagram no longer poisons a
-        # cache that a signed exchange had already confirmed.
+        # the retry rediscovers instead. The second thing the forger
+        # cannot know is the msgID we sent, which _check_report_msg_id
+        # matches before this code sees the datagram at all. Not a proof —
+        # discovery itself is unauthenticated, by RFC — but one datagram
+        # no longer poisons a cache that a signed exchange had already
+        # confirmed.
         trusted = (name == "unknownEngineIDs"
                    or (bool(response.engine_id) and response.engine_id == engine_id))
         if name == "unsupportedSecLevels" and trusted:
@@ -1534,6 +1552,10 @@ class NodePoller(Worker):
         # remembering that means the next walk starts where the last one
         # ended up rather than re-learning the same limit every time.
         self._bulk_repetitions: dict[int, int] = {}
+        # device_id -> the GET varbind count that last worked for it — the
+        # same idea as the line above, in the other direction: an agent
+        # that answered "tooBig" to a 25-varbind GET is asked 12 next time.
+        self._get_batch: dict[int, int] = {}
         # Forwarding-table walks run here, not on the poll pool: one walk is
         # hundreds to thousands of rows, and parking poll workers on them is
         # what made the pool saturate.
@@ -2516,20 +2538,33 @@ class NodePoller(Worker):
                       self._addresses_read, self._bulk_repetitions,
                       self._sensor_read, self._sensor_threshold_read,
                       self._sensor_diag_ts, self._snmp_backoff,
+                      self._snmp_failing_count, self._get_batch,
                       self._poll_cost):
             for device_id in [k for k in list(cache) if k not in keep]:
                 cache.pop(device_id, None)
-        # A set rather than a dict, so not in the loop above: the "logged
-        # once" memory for a device that answers no ARP table.
-        self._arp_unanswered.difference_update(
-            [k for k in list(self._arp_unanswered) if k not in keep])
-        self._staggered.difference_update(
-            [k for k in list(self._staggered) if k not in keep])
+        # Sets rather than dicts, so not in the loop above: the "logged
+        # once" memory for a device that answers no ARP table, the stagger,
+        # and the four per-device verdicts whose whole purpose is to make
+        # the next poll's transition (auth_ok, access_ok, snmp_verified)
+        # once rather than every cycle.
+        for members in (self._arp_unanswered, self._staggered,
+                        self._auth_failing, self._access_denied,
+                        self._downgraded, self._method_seeded):
+            members.difference_update(
+                [k for k in list(members) if k not in keep])
         with self._lock:
             for jobs in (self._oid_walks, self._vendor_ids):
                 for device_id in [k for k in jobs if k not in keep]:
                     if not jobs[device_id].running:
                         jobs.pop(device_id, None)
+        # Not keyed by device id at all: a finished sweep keeps its whole
+        # settings dict, one _owners entry per address swept and a dead
+        # Thread for the life of the process, and drain() walks the dict
+        # every 50 ms. Running ones stay, the way a running walk job does.
+        with self._discovery_lock:
+            for job_id in [k for k, job in list(self._discovery_jobs.items())
+                           if not job.running]:
+                self._discovery_jobs.pop(job_id, None)
         self._engines.forget(keep)
 
     def _maybe_walk_mac_table(self, device, config: dict, now: float) -> None:
@@ -3488,29 +3523,41 @@ class NodePoller(Worker):
 
     def _snmp_get(self, device, config: dict, oids: list[str]) -> Response:
         """One GET round trip against a device, handling v1/v2c/v3 (at
-        whichever USM level the credential implies) transparently."""
-        version = snmp_version_of(config)
-        timeout_s = float(config.get("snmp_timeout_s", 3.0))
-        retries = int(config.get("snmp_retries", 2))
-        session = _Session(device["ip"], DEFAULT_SNMP_PORT, timeout_s, retries)
+        whichever USM level the credential implies) transparently, on a
+        socket of its own. A caller making several GETs in a row should
+        open one session and use _snmp_get_on instead."""
+        session = self._session_for(device, config)
         try:
-            if version in (0, 1):
-                identity = credential_for(config).identity
-                request_id = session.next_request_id()
-                packet = build_request(version, identity or "public", PDU_GET,
-                                       request_id, oids)
-                response = session.request(packet, request_id)
-                self._check_error_status(response, config, oids)
-                return response
-
-            response = self._v3_exchange(session, device, config, PDU_GET, oids)
-            self._check_error_status(response, config, oids)
-            return response
+            return self._snmp_get_on(session, device, config, oids)
         finally:
             session.close()
 
+    def _snmp_get_on(self, session: _Session, device, config: dict,
+                     oids: list[str], credential: Credential | None = None) -> Response:
+        """_snmp_get over an already-open session — the `_walk_request` /
+        `_snmp_get_next` split, for GET.
+
+        `credential` is the already-decrypted credential for `config` when
+        the caller holds one for the length of its read (see
+        _poll_interfaces): a v3 GET per interface otherwise re-decrypts the
+        stored password blob once per port, 512 times on a full chassis.
+        """
+        version = snmp_version_of(config)
+        if version in (0, 1):
+            identity = (credential or credential_for(config)).identity
+            request_id = session.next_request_id()
+            packet = build_request(version, identity or "public", PDU_GET,
+                                   request_id, oids)
+            response = session.request(packet, request_id)
+        else:
+            response = self._v3_exchange(session, device, config, PDU_GET, oids,
+                                         credential=credential)
+        self._check_error_status(response, config, oids)
+        return response
+
     def _v3_exchange(self, session: _Session, device, config: dict, pdu_tag: int,
-                     oids: list[str], max_repetitions: int = 0) -> Response:
+                     oids: list[str], max_repetitions: int = 0,
+                     credential: Credential | None = None) -> Response:
         """The poller's side of the module-level v3_exchange: the engine
         cache. Every v3 caller once went through its own copy of "build
         the message, send it, and if a Report comes back give up" — so a
@@ -3532,7 +3579,11 @@ class NodePoller(Worker):
         same doomed request every cycle until the service was restarted
         (which is the only other thing that empties this cache). Three
         firewalls on one working profile did exactly that."""
-        credential = credential_for(config)
+        # Decrypted here unless the caller already holds one for the
+        # length of its read; either way it is a local that is dropped in
+        # the finally below, never cached on the poller.
+        owned = credential is None
+        credential = credential_for(config) if owned else credential
         device_id = device["id"]
         # Captured up front, not read again after the failure: the
         # question is whether the request that timed out was built from
@@ -3585,7 +3636,8 @@ class NodePoller(Worker):
                 f"the cached engine was dropped and the next poll will "
                 f"rediscover it") from exc
         finally:
-            credential = None
+            if owned:
+                credential = None
 
     def _check_error_status(self, response: Response, config: dict,
                             oids: list[str]) -> None:
@@ -4390,7 +4442,16 @@ class NodePoller(Worker):
         the instance to GET is that OID plus the standard ".0" — the same
         convention nodeoids.SYSTEM_SCALARS' hand-written OIDs bake in. Table
         objects are out of scope: ".0" on a table column always misses, and
-        so contributes nothing rather than raising."""
+        so contributes nothing rather than raising.
+
+        Read in batches of _CUSTOM_MIB_BATCH, halving on a tooBig(1)
+        Response the way _walk_column_detail already halves a GETBULK and
+        remembering the size that worked beside the walk's own learned
+        repetition count. One GET of every object in the file is how this
+        silently produced nothing at all: IP-MIB alone is 267 varbinds,
+        most agents answer tooBig well below that, and RFC 3416 has a
+        tooBig Response carry an empty varbind list — no metric, no error,
+        one wasted round trip per device per poll."""
         objects = [o for o in self.db.mib_objects(mib_file_id, resolved_only=True)
                   if not o["is_notification"]]
         if not objects:
@@ -4398,8 +4459,7 @@ class NodePoller(Worker):
         instance_oids = [f"{o['oid']}.0" for o in objects]
         metrics = []
         try:
-            response = self._snmp_get(device, config, instance_oids)
-            values = {vb["oid"]: vb for vb in response.varbinds}
+            values = self._custom_mib_values(device, config, instance_oids)
             for obj, instance_oid in zip(objects, instance_oids):
                 vb = values.get(instance_oid)
                 if not vb or vb["type"] in ("noSuchObject", "noSuchInstance"):
@@ -4414,6 +4474,29 @@ class NodePoller(Worker):
         except SnmpError:
             pass   # best-effort: this MIB's objects aren't answered by this device
         return metrics
+
+    # The conventional safe varbind count for one GET; halved per device
+    # and remembered whenever an agent answers tooBig.
+    _CUSTOM_MIB_BATCH = 25
+
+    def _custom_mib_values(self, device, config: dict,
+                           instance_oids: list[str]) -> dict:
+        """oid -> varbind for a whole MIB's scalars, in batches this device
+        has been shown to cope with."""
+        device_id = device["id"]
+        batch = self._get_batch.get(device_id) or self._CUSTOM_MIB_BATCH
+        values: dict = {}
+        index = 0
+        while index < len(instance_oids):
+            chunk = instance_oids[index:index + batch]
+            response = self._snmp_get(device, config, chunk)
+            if response.error_status == 1 and len(chunk) > 1:    # tooBig
+                batch = max(1, batch // 2)
+                self._get_batch[device_id] = batch
+                continue
+            values.update({vb["oid"]: vb for vb in response.varbinds})
+            index += len(chunk)
+        return values
 
     # Without a budget, a device the walk enumerated but whose
     # per-interface GETs stop answering costs N x timeout x (retries + 1) on
@@ -4432,7 +4515,8 @@ class NodePoller(Worker):
     _MAX_INTERFACES = 512
 
     def _v1_get_dropping_unknown(self, device, config: dict, oids: list,
-                                 max_drops: int = 3) -> dict:
+                                 max_drops: int = 3, *, session: _Session,
+                                 credential: Credential | None = None) -> dict:
         """A GET against an SNMPv1 agent, minus the objects it does not
         implement.
 
@@ -4448,7 +4532,8 @@ class NodePoller(Worker):
         for _ in range(max_drops + 1):
             if not remaining:
                 return {}
-            response = self._snmp_get(device, config, remaining)
+            response = self._snmp_get_on(session, device, config, remaining,
+                                         credential)
             if response.error_status != 2:            # noSuchName
                 return {vb["oid"]: vb for vb in response.varbinds}
             index = response.error_index
@@ -4458,9 +4543,11 @@ class NodePoller(Worker):
         return {}
 
     def _interface_varbinds(self, device, config: dict, if_index: int,
-                            is_v1: bool, want_ifx: bool) -> tuple:
+                            is_v1: bool, want_ifx: bool, *, session: _Session,
+                            credential: Credential | None = None) -> tuple:
         """(oid -> varbind, whether ifXTable still answers) for one
-        interface.
+        interface, over the session and credential _poll_interfaces holds
+        for the whole read.
 
         On v2c and v3 the IF-MIB and ifXTable columns ride in one GET: an
         object the agent lacks comes back as a per-varbind noSuchObject and
@@ -4476,13 +4563,17 @@ class NodePoller(Worker):
         oids = [f"{oid}.{if_index}" for oid in nodeoids.IF_TABLE.values()]
         ifx_oids = [f"{oid}.{if_index}" for oid in nodeoids.IFX_TABLE.values()]
         if not is_v1:
-            response = self._snmp_get(device, config, oids + ifx_oids)
+            response = self._snmp_get_on(session, device, config,
+                                         oids + ifx_oids, credential)
             return {vb["oid"]: vb for vb in response.varbinds}, want_ifx
-        values = self._v1_get_dropping_unknown(device, config, oids)
+        values = self._v1_get_dropping_unknown(device, config, oids,
+                                               session=session,
+                                               credential=credential)
         if not want_ifx:
             return values, False
         try:
-            response = self._snmp_get(device, config, ifx_oids)
+            response = self._snmp_get_on(session, device, config, ifx_oids,
+                                         credential)
         except SnmpTimeout:
             raise
         except SnmpError:
@@ -4554,96 +4645,107 @@ class NodePoller(Worker):
         skipped = 0
         consecutive_timeouts = 0
         abandoned = ""
-        for if_index in wanted:
-            if time.time() > deadline:
-                abandoned = "the poll's interface budget ran out"
-                break
-            if consecutive_timeouts >= self._INTERFACE_GIVE_UP_TIMEOUTS:
-                abandoned = (f"{consecutive_timeouts} interfaces in a row did "
-                             f"not answer")
-                break
-            try:
-                values, want_ifx = self._interface_varbinds(
-                    device, config, if_index, is_v1, want_ifx)
-            except SnmpTimeout:
-                # One interface's own GET timing out doesn't invalidate the
-                # whole poll — the device answered enough to enumerate its
-                # interfaces, so the rest are still worth collecting. Three
-                # in a row does mean the device has gone quiet.
-                skipped += 1
-                consecutive_timeouts += 1
-                continue
-            except SnmpError:
-                skipped += 1
+        # One socket and one credential decrypt for the whole read, not
+        # one of each per interface: a 512-port chassis otherwise opens
+        # 512 ephemeral UDP ports and re-decrypts the stored v3 password
+        # 512 times, per device, per poll.
+        session = self._session_for(device, config)
+        credential = credential_for(config)
+        try:
+            for if_index in wanted:
+                if time.time() > deadline:
+                    abandoned = "the poll's interface budget ran out"
+                    break
+                if consecutive_timeouts >= self._INTERFACE_GIVE_UP_TIMEOUTS:
+                    abandoned = (f"{consecutive_timeouts} interfaces in a row did "
+                                 f"not answer")
+                    break
+                try:
+                    values, want_ifx = self._interface_varbinds(
+                        device, config, if_index, is_v1, want_ifx,
+                        session=session, credential=credential)
+                except SnmpTimeout:
+                    # One interface's own GET timing out doesn't invalidate the
+                    # whole poll — the device answered enough to enumerate its
+                    # interfaces, so the rest are still worth collecting. Three
+                    # in a row does mean the device has gone quiet.
+                    skipped += 1
+                    consecutive_timeouts += 1
+                    continue
+                except SnmpError:
+                    skipped += 1
+                    consecutive_timeouts = 0
+                    continue
                 consecutive_timeouts = 0
-                continue
-            consecutive_timeouts = 0
-            # Stamped right after this interface's own GET returns, not at
-            # poll start: at a 3 s focus cadence that gap is a large
-            # fraction of dt. This is the timestamp counter_rate and
-            # update_interface_rates use for this row.
-            sample_ts = time.time()
+                # Stamped right after this interface's own GET returns, not at
+                # poll start: at a 3 s focus cadence that gap is a large
+                # fraction of dt. This is the timestamp counter_rate and
+                # update_interface_rates use for this row.
+                sample_ts = time.time()
 
-            def _val(table, key, _values=values, _index=if_index):
-                vb = _values.get(f"{table[key]}.{_index}")
-                if not vb or vb["type"] in ("noSuchObject", "noSuchInstance",
-                                            "endOfMibView", "null"):
-                    return None
-                return vb["value"]
+                def _val(table, key, _values=values, _index=if_index):
+                    vb = _values.get(f"{table[key]}.{_index}")
+                    if not vb or vb["type"] in ("noSuchObject", "noSuchInstance",
+                                                "endOfMibView", "null"):
+                        return None
+                    return vb["value"]
 
-            speed = _val(nodeoids.IF_TABLE, "if_speed")
-            high_speed = _val(nodeoids.IFX_TABLE, "if_high_speed")
-            if_type = _val(nodeoids.IF_TABLE, "if_type")
-            # ifSpeed is a Gauge32 that RFC 2863 saturates at 4294967295 for
-            # any link it cannot express in 32 bits of bits/sec, which is why
-            # ifHighSpeed (Mbit/s) exists. The sentinel is left as a literal
-            # denominator rather than treated as "unknown": in_util/out_util
-            # are clamped to [0, 100], so a row stuck with it still reports a
-            # bounded number instead of losing the metric.
-            speed_bps = interface_speed_bps(speed, high_speed, if_type)
-            hc_in = _val(nodeoids.IFX_TABLE, "if_hc_in_octets")
-            hc_out = _val(nodeoids.IFX_TABLE, "if_hc_out_octets")
-            in_octets = hc_in if isinstance(hc_in, (int, float)) else _val(nodeoids.IF_TABLE, "if_in_octets")
-            out_octets = hc_out if isinstance(hc_out, (int, float)) else _val(nodeoids.IF_TABLE, "if_out_octets")
-            # in_octets and out_octets fall back from the 64-bit ifXTable
-            # counters to the 32-bit ifTable ones independently, so the wrap
-            # width has to be tracked independently too: an agent answering
-            # ifHCInOctets but not ifHCOutOctets would otherwise apply a
-            # width of 64 to a genuinely 32-bit counter, and counter_rate
-            # would drop the sample at every wrap.
-            in_octet_bits = 64 if isinstance(hc_in, (int, float)) else 32
-            out_octet_bits = 64 if isinstance(hc_out, (int, float)) else 32
+                speed = _val(nodeoids.IF_TABLE, "if_speed")
+                high_speed = _val(nodeoids.IFX_TABLE, "if_high_speed")
+                if_type = _val(nodeoids.IF_TABLE, "if_type")
+                # ifSpeed is a Gauge32 that RFC 2863 saturates at 4294967295 for
+                # any link it cannot express in 32 bits of bits/sec, which is why
+                # ifHighSpeed (Mbit/s) exists. The sentinel is left as a literal
+                # denominator rather than treated as "unknown": in_util/out_util
+                # are clamped to [0, 100], so a row stuck with it still reports a
+                # bounded number instead of losing the metric.
+                speed_bps = interface_speed_bps(speed, high_speed, if_type)
+                hc_in = _val(nodeoids.IFX_TABLE, "if_hc_in_octets")
+                hc_out = _val(nodeoids.IFX_TABLE, "if_hc_out_octets")
+                in_octets = hc_in if isinstance(hc_in, (int, float)) else _val(nodeoids.IF_TABLE, "if_in_octets")
+                out_octets = hc_out if isinstance(hc_out, (int, float)) else _val(nodeoids.IF_TABLE, "if_out_octets")
+                # in_octets and out_octets fall back from the 64-bit ifXTable
+                # counters to the 32-bit ifTable ones independently, so the wrap
+                # width has to be tracked independently too: an agent answering
+                # ifHCInOctets but not ifHCOutOctets would otherwise apply a
+                # width of 64 to a genuinely 32-bit counter, and counter_rate
+                # would drop the sample at every wrap.
+                in_octet_bits = 64 if isinstance(hc_in, (int, float)) else 32
+                out_octet_bits = 64 if isinstance(hc_out, (int, float)) else 32
 
-            admin_raw = _val(nodeoids.IF_TABLE, "if_admin_status")
-            oper_raw = _val(nodeoids.IF_TABLE, "if_oper_status")
-            in_errors = _val(nodeoids.IF_TABLE, "if_in_errors")
-            out_errors = _val(nodeoids.IF_TABLE, "if_out_errors")
-            in_discards = _val(nodeoids.IF_TABLE, "if_in_discards")
-            out_discards = _val(nodeoids.IF_TABLE, "if_out_discards")
-            discontinuity = _val(nodeoids.IFX_TABLE, "if_discontinuity")
-            rows.append({
-                "if_index": if_index,
-                "descr": _val(nodeoids.IF_TABLE, "if_descr") or "",
-                "alias": _val(nodeoids.IFX_TABLE, "if_alias") or "",
-                "phys_addr": (_val(nodeoids.IF_TABLE, "if_phys_addr") or ""),
-                "speed_bps": speed_bps,
-                "admin_status": {1: "up", 2: "down", 3: "testing"}.get(
-                    int(admin_raw), "") if admin_raw is not None else "",
-                "oper_status": {1: "up", 2: "down", 3: "testing", 4: "unknown",
-                               5: "dormant", 6: "notPresent", 7: "lowerLayerDown"}.get(
-                    int(oper_raw), "") if oper_raw is not None else "",
-                "in_octets": int(in_octets) if isinstance(in_octets, (int, float)) else None,
-                "out_octets": int(out_octets) if isinstance(out_octets, (int, float)) else None,
-                "in_errors": int(in_errors) if isinstance(in_errors, (int, float)) else None,
-                "out_errors": int(out_errors) if isinstance(out_errors, (int, float)) else None,
-                "in_discards": int(in_discards) if isinstance(in_discards, (int, float)) else None,
-                "out_discards": int(out_discards) if isinstance(out_discards, (int, float)) else None,
-                "discontinuity_ts": (float(discontinuity)
-                                     if isinstance(discontinuity, (int, float)) else None),
-                "_in_octet_bits": in_octet_bits,
-                "_out_octet_bits": out_octet_bits,
-                "_sample_ts": sample_ts,
-            })
+                admin_raw = _val(nodeoids.IF_TABLE, "if_admin_status")
+                oper_raw = _val(nodeoids.IF_TABLE, "if_oper_status")
+                in_errors = _val(nodeoids.IF_TABLE, "if_in_errors")
+                out_errors = _val(nodeoids.IF_TABLE, "if_out_errors")
+                in_discards = _val(nodeoids.IF_TABLE, "if_in_discards")
+                out_discards = _val(nodeoids.IF_TABLE, "if_out_discards")
+                discontinuity = _val(nodeoids.IFX_TABLE, "if_discontinuity")
+                rows.append({
+                    "if_index": if_index,
+                    "descr": _val(nodeoids.IF_TABLE, "if_descr") or "",
+                    "alias": _val(nodeoids.IFX_TABLE, "if_alias") or "",
+                    "phys_addr": (_val(nodeoids.IF_TABLE, "if_phys_addr") or ""),
+                    "speed_bps": speed_bps,
+                    "admin_status": {1: "up", 2: "down", 3: "testing"}.get(
+                        int(admin_raw), "") if admin_raw is not None else "",
+                    "oper_status": {1: "up", 2: "down", 3: "testing", 4: "unknown",
+                                   5: "dormant", 6: "notPresent", 7: "lowerLayerDown"}.get(
+                        int(oper_raw), "") if oper_raw is not None else "",
+                    "in_octets": int(in_octets) if isinstance(in_octets, (int, float)) else None,
+                    "out_octets": int(out_octets) if isinstance(out_octets, (int, float)) else None,
+                    "in_errors": int(in_errors) if isinstance(in_errors, (int, float)) else None,
+                    "out_errors": int(out_errors) if isinstance(out_errors, (int, float)) else None,
+                    "in_discards": int(in_discards) if isinstance(in_discards, (int, float)) else None,
+                    "out_discards": int(out_discards) if isinstance(out_discards, (int, float)) else None,
+                    "discontinuity_ts": (float(discontinuity)
+                                         if isinstance(discontinuity, (int, float)) else None),
+                    "_in_octet_bits": in_octet_bits,
+                    "_out_octet_bits": out_octet_bits,
+                    "_sample_ts": sample_ts,
+                })
+        finally:
+            credential = None
+            session.close()
         if skipped or abandoned:
             complete = False
             per_interface = abandoned or f"{skipped} did not answer"

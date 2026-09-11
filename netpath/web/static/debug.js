@@ -226,14 +226,23 @@
     return out;
   }
 
-  function passes(event) {
-    if (!categoriesOn().has(event.category)) return false;
-    const target = App.el('dbg-target').value;
-    if (target && event.target !== target) return false;
-    const needle = App.el('dbg-search').value.trim().toLowerCase();
-    if (needle) {
+  /* The three controls, read once per draw rather than once per event: the
+     buffer is up to 3,000 events and this ran a querySelectorAll over the
+     category boxes, plus a fresh Set, for every one of them on every poll. */
+  function currentFilter() {
+    return {
+      categories: categoriesOn(),
+      target: App.el('dbg-target').value,
+      needle: App.el('dbg-search').value.trim().toLowerCase(),
+    };
+  }
+
+  function passes(event, filter) {
+    if (!filter.categories.has(event.category)) return false;
+    if (filter.target && event.target !== filter.target) return false;
+    if (filter.needle) {
       const hay = `${event.message}\n${event.target}\n${event.detail}`.toLowerCase();
-      if (!hay.includes(needle)) return false;
+      if (!hay.includes(filter.needle)) return false;
     }
     return true;
   }
@@ -306,7 +315,9 @@
           EVENT_COLUMNS.map((c) => `<th scope="col">${c}</th>`).join('')}</tr></thead>`;
     }
     const tbody = eventsBody();
-    const visible = view.events.filter(passes).slice(-EVENT_ROW_CAP);
+    const filter = currentFilter();
+    const visible = view.events.filter((event) => passes(event, filter))
+      .slice(-EVENT_ROW_CAP);
     let changed;
 
     if (options.append && view.drawnSeq != null) {
@@ -367,7 +378,8 @@
     // stream in three zones, none of them stated.
     const lines = [`# SappiWhere debug log, exported ${App.isoLocal(Date.now() / 1000)}` +
                    ` — times are ${App.timeZoneLabel()}`];
-    for (const event of view.events.filter(passes)) {
+    const filter = currentFilter();
+    for (const event of view.events.filter((event) => passes(event, filter))) {
       lines.push(`${App.isoLocal(event.ts)} [${event.category}] ` +
                  `${event.target || '-'} :: ${event.message}`);
       if (event.detail) {
@@ -503,8 +515,8 @@
       event.target.textContent = view.paused ? 'Resume' : 'Pause';
     };
     /* Ticking every category back on one at a time is the reason "None" on
-       its own would be a trap, so both directions are offered. categoriesOn()
-       reads the boxes live on every draw, so nothing here has to be kept in
+       its own would be a trap, so both directions are offered. Every draw
+       reads the boxes as they stand, so nothing here has to be kept in
        step with them — but the store does, since setting .checked from script
        is silent (see below). */
     const setAllCategories = (on) => {

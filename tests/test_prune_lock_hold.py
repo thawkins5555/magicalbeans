@@ -29,6 +29,7 @@ import _paths  # noqa: F401  (puts the repo root and tests/ on sys.path)
 
 from netpath.alertsdb import AlertsDatabase
 from netpath.nodesdb import NodesDatabase
+from netpath.nodesseriesdb import NodesSeriesDatabase
 from netpath.snmptrapdb import SnmpTrapDatabase
 from netpath.sqlitebase import TRIM_LOCK_TARGET_S
 from netpath import syslogdb
@@ -426,6 +427,100 @@ ok("a retention of zero or less still prunes nothing, on every table in "
 assert nodes_db.prune_neighbors(365 * DAY) == 0
 ok("a sweep with nothing to delete returns 0 without a delete loop")
 nodes_db.close()
+
+
+# ================================================== nodes.db: device_events
+#
+# The by-age sweep the maintenance timer runs every 15 minutes, and that the
+# Settings panel's "delete all stored events" button runs with a cutoff of
+# `now` — on the HTTP request thread, over the whole table.
+print("\nnodesdb.prune ages out the event log in batches")
+
+now = time.time()
+nodes_db = NodesDatabase(os.path.join(TMPDIR, "nodes_events.db"))
+EVENT_ROWS = 300_000
+EVENT_DAYS = 180.0
+group_id = nodes_db.ensure_default_group()
+device_ids = [nodes_db.add_device(f"10.30.{i // 251}.{i % 251}", f"sw-{i}",
+                                  group_id=group_id) for i in range(200)]
+with nodes_db._lock:
+    nodes_db._conn.executemany(
+        "INSERT INTO device_events(device_id, ts, kind, detail)"
+        " VALUES (?,?,?,?)",
+        [(device_ids[i % 200], ts, ("down", "up")[i % 2], "stopped answering")
+         for i, ts in enumerate(spread(EVENT_ROWS, EVENT_DAYS, now))])
+    nodes_db._conn.commit()
+
+expected = set(range(EVENT_ROWS // 2 + 1, EVENT_ROWS + 1))
+measure("device_events", nodes_db,
+        lambda: nodes_db.prune(event_days=EVENT_DAYS, discovery_days=30),
+        "SELECT id FROM device_events", expected)
+
+# And the button: event_days=0 is a cutoff of "now", i.e. every row.
+measure("device_events, delete-everything", nodes_db,
+        lambda: nodes_db.prune(event_days=0, discovery_days=0),
+        "SELECT id FROM device_events", set())
+nodes_db.close()
+
+
+# ================================================= nodes_series.db: samples
+#
+# The largest table in the product, behind the same single lock every chart
+# read and every record_poll write takes.
+print("\nnodesseriesdb.prune ages out raw samples and rollups in batches")
+
+now = time.time()
+series_db = NodesSeriesDatabase(os.path.join(TMPDIR, "nodes_series.db"))
+SAMPLE_ROWS = 300_000
+SAMPLE_DAYS = 3.0
+METRICS = 5_000
+with series_db._lock:
+    series_db._conn.executemany(
+        "INSERT INTO metrics(device_id, key, label, unit, kind)"
+        " VALUES (?,?,?,?,'gauge')",
+        [(i % 250, f"if_{i // 250}_in", "In", "bps") for i in range(METRICS)])
+    series_db._conn.commit()
+    metric_ids = [row[0] for row in
+                  series_db._conn.execute("SELECT id FROM metrics ORDER BY id")]
+    # metric_id cycles, so a contiguous rowid batch spans every metric —
+    # the layout that makes the chunk size matter here (see
+    # SAMPLE_PRUNE_CHUNK).
+    series_db._conn.executemany(
+        "INSERT INTO samples(metric_id, ts, value) VALUES (?,?,?)",
+        [(metric_ids[i % METRICS], ts, float(i))
+         for i, ts in enumerate(spread(SAMPLE_ROWS, SAMPLE_DAYS, now))])
+    series_db._conn.commit()
+
+expected = surviving(series_db, "SELECT rowid FROM samples WHERE ts > %r"
+                                % (now - SAMPLE_DAYS * DAY,))
+assert len(expected) == SAMPLE_ROWS - SAMPLE_ROWS // 2, len(expected)
+measure("samples", series_db,
+        lambda: series_db.prune(sample_days=SAMPLE_DAYS, rollup_days=400),
+        "SELECT rowid FROM samples", expected)
+
+# The hourly rollups are the second table the same sweep ages out.
+ROLLUP_ROWS = 200_000
+ROLLUP_DAYS = 400.0
+with series_db._lock:
+    series_db._conn.executemany(
+        "INSERT INTO samples_hourly(metric_id, hour, n, vmin, vavg, vmax)"
+        " VALUES (?,?,4,1.0,2.0,3.0)",
+        [(metric_ids[i % METRICS], int(hour))
+         for i, hour in enumerate(spread(ROLLUP_ROWS, ROLLUP_DAYS, now))])
+    series_db._conn.commit()
+expected = surviving(series_db, "SELECT rowid FROM samples_hourly WHERE hour > %r"
+                                % (now - ROLLUP_DAYS * DAY,))
+measure("samples_hourly", series_db,
+        lambda: series_db.prune(sample_days=SAMPLE_DAYS, rollup_days=ROLLUP_DAYS),
+        "SELECT rowid FROM samples_hourly", expected)
+
+# "Delete all stored samples" from the Settings maintenance panel.
+measure("samples, delete-everything", series_db,
+        lambda: series_db.prune(sample_days=0, rollup_days=0),
+        "SELECT rowid FROM samples", set())
+assert surviving(series_db, "SELECT rowid FROM samples_hourly") == set()
+ok("a retention of 0 still empties both tables, as the button promises")
+series_db.close()
 
 
 print(f"\nALL {len(PASSED)} PRUNE-LOCK-HOLD ASSERTIONS PASSED")

@@ -1082,6 +1082,16 @@
     view.sceneGroup.setAttribute('transform', `translate(${tx},${ty}) scale(${view.zoom})`);
   }
 
+  // One drag redraw per animation frame, on its own handle: a pointermove
+  // fires faster than 60Hz, and a queued full draw and a queued drag redraw
+  // must not cancel each other out.
+  let dragPending = 0;
+
+  function requestDragDraw() {
+    if (dragPending) return;
+    dragPending = window.requestAnimationFrame(() => { dragPending = 0; redrawDragged(); });
+  }
+
   // Redraws only the dragged nodes and the links touching them.
   function redrawDragged() {
     if (!view.nodeDrag || !view.nodeEls.size) { requestDraw(); return; }
@@ -1537,7 +1547,7 @@
       }
       view.nodeDrag.dx = cdx * perPixelX;
       view.nodeDrag.dy = cdy * perPixelY;
-      redrawDragged();
+      requestDragDraw();
     };
     const detach = () => {
       target.removeEventListener('pointermove', move);
@@ -1787,12 +1797,22 @@
 
   function drawToolbarState() {
     const canWrite = App.canWrite('mapper');
-    App.el('mp-remove-node').disabled = !canWrite || view.selection.size === 0;
-    App.el('mp-align').disabled = !canWrite || view.selection.size < 2;
     const hasMap = view.mapId !== null;
-    App.el('mp-add-device').disabled = !canWrite || !hasMap;
-    App.el('mp-add-neighbours').disabled = !canWrite || !hasMap;
-    App.el('mp-snap').disabled = !canWrite || !hasMap;
+    // Compared before assigning, for the reason App.setText/setHidden exist:
+    // fastTick runs this ten times a second and an unconditional write
+    // queues a real mutation even when the value is already there. There is
+    // no App.setDisabled to borrow.
+    const states = [
+      ['mp-remove-node', !canWrite || view.selection.size === 0],
+      ['mp-align', !canWrite || view.selection.size < 2],
+      ['mp-add-device', !canWrite || !hasMap],
+      ['mp-add-neighbours', !canWrite || !hasMap],
+      ['mp-snap', !canWrite || !hasMap],
+    ];
+    for (const [id, disabled] of states) {
+      const button = App.el(id);
+      if (button && button.disabled !== disabled) button.disabled = disabled;
+    }
   }
 
   /* -------------------------------------------------------------- VLANs */

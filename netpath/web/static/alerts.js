@@ -872,7 +872,7 @@
   function overridesCellHtml(r) {
     if (r.kind !== 'threshold') return '';
     const count = view.deviceThresholds.filter((o) => o.rule_key === r.key).length;
-    return `<button type="button" class="ar-overrides-btn" data-rule-key="${r.key}">${
+    return `<button type="button" class="ar-overrides-btn" data-rule-key="${escape(r.key)}">${
       count ? `${count} device override${count === 1 ? '' : 's'}` : 'No overrides'}</button>`;
   }
 
@@ -1402,7 +1402,7 @@
           'discarded and cannot be recovered.</p>', 'Reset', async () => {
             await App.post(`/api/alerts/templates/${t.id}/reset`, {});
             App.refreshNow('alerts');
-          }, (confirmed) => { if (!confirmed) editTemplate(t); });
+          }, (confirmed) => { if (!confirmed) editTemplate(t.id); });
       } }] : []),
       { label: 'Save', primary: true, onClick: (box) => saveTemplate(box, t, false) },
     ], { buttonsTop: true });

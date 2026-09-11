@@ -12,7 +12,8 @@ import time
 import _paths  # noqa: F401  (puts the repo root and tests/ on sys.path)
 
 from netpath import alertmail
-from netpath.alertsdb import AlertsDatabase, NOTIFY_ROLLUP_DELAY_MAX_S
+from netpath.alertsdb import (AlertsDatabase, FIRST_NOTIFY_BACKLOG_GRACE_S,
+                              NOTIFY_ROLLUP_DELAY_MAX_S)
 from netpath.alertengine import AlertEngine, DIGEST_THRESHOLD
 from netpath.ipamdb import IpamDatabase
 from netpath.nodesdb import NodesDatabase
@@ -611,6 +612,90 @@ try:
     ok("0 round-trips as 0 (the disabled state), not back to the default")
 finally:
     close_all(nodes, alerts, snmp, syslog, ipam, engine)
+
+
+# ====================== 10: the sweep's own query is an index seek
+print("\n10 — alerts_due_first_notify seeks an index instead of scanning "
+      "the whole alerts table")
+
+# The engine asks this on every TICK_S = 5.0 for as long as
+# notify_rollup_delay_s is set, which it is by default. At the shipped
+# 180-day retention on a flapping fleet the table reaches seven figures, and
+# a scan of it is 5 s of alerts.db's single lock spent to find that five
+# notices are pending — the same lock the Alerts page, every device page's
+# maintenance read and every open_or_increment queue behind.
+folder = os.path.join(TMPDIR, "plan")
+os.makedirs(folder, exist_ok=True)
+alerts = AlertsDatabase(os.path.join(folder, "alerts.db"))
+try:
+    rule_id = alerts.add_rule("plan.cpu", "Plan CPU", "threshold", "device")
+    now = time.time()
+    SEEDED = 50_000
+    with alerts._lock:
+        # Realistic distribution: everything already notified except the
+        # handful still awaiting a first notice, which is the whole reason
+        # the pending index can be partial.
+        alerts._conn.executemany(
+            "INSERT INTO alerts(rule_id, dedup_key, entity_kind, entity_id,"
+            " entity_label, severity, message, state, opened_ts, last_ts,"
+            " last_notified_ts) VALUES (?,?,'device',?,?,?,?,'open',?,?,?)",
+            [(rule_id, f"cpu:{i}", str(i), f"sw-{i}", i % 8, "cpu high",
+              now - 120 if i % 10_000 == 0 else now - 86400 + i * 0.01, now,
+              None if i % 10_000 == 0 else now)
+             for i in range(SEEDED)])
+        alerts._conn.commit()
+        alerts._conn.execute("ANALYZE")
+
+    seen = []
+    alerts._conn.set_trace_callback(seen.append)
+    try:
+        due = alerts.alerts_due_first_notify(now)
+    finally:
+        alerts._conn.set_trace_callback(None)
+    sql = max((q for q in seen if q.lstrip()[:6].upper() == "SELECT"), key=len)
+    with alerts._lock:
+        plan = [row[3] for row in alerts._conn.execute(
+            "EXPLAIN QUERY PLAN " + sql).fetchall()]
+
+    assert not any(line.strip() == "SCAN alerts" for line in plan), plan
+    ok(f"the pending-notify sweep no longer scans the table: {plan[0]}")
+    assert any("ix_alerts_pending_notify" in line for line in plan), plan
+    ok("...it seeks ix_alerts_pending_notify, the partial index on the rows "
+       "still awaiting a first notice")
+
+    # Same rows an index-free reading of the predicate would return.
+    wanted = set()
+    with alerts._lock:
+        for row in alerts._conn.execute(
+                "SELECT id, opened_ts, last_notified_ts, maint_held_notify_ts"
+                " FROM alerts").fetchall():
+            if row["last_notified_ts"] is not None:
+                continue
+            if row["opened_ts"] > now:
+                continue
+            if (row["opened_ts"] >= now - FIRST_NOTIFY_BACKLOG_GRACE_S
+                    or row["maint_held_notify_ts"] is not None):
+                wanted.add(row["id"])
+    assert {row["id"] for row in due} == wanted, (len(due), len(wanted))
+    assert wanted, "the fixture seeded no pending row: nothing is being proved"
+    ok(f"...and returns exactly the {len(wanted)} row(s) the predicate "
+       f"selects, out of {SEEDED:,}")
+
+    # The histogram the Alerts overview polls per open tab, on the same table.
+    seen = []
+    alerts._conn.set_trace_callback(seen.append)
+    try:
+        alerts.histogram(now - 86400, now, 3600)
+    finally:
+        alerts._conn.set_trace_callback(None)
+    sql = max((q for q in seen if q.lstrip()[:6].upper() == "SELECT"), key=len)
+    with alerts._lock:
+        plan = [row[3] for row in alerts._conn.execute(
+            "EXPLAIN QUERY PLAN " + sql).fetchall()]
+    assert not any(line.strip() == "SCAN alerts" for line in plan), plan
+    ok(f"the overview histogram seeks too: {plan[0]}")
+finally:
+    alerts.close()
 
 
 print(f"\n{len(PASSED)} checks passed")
