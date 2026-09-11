@@ -1388,6 +1388,14 @@ From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
   there is no page of its own for it in Nodes, the same way the MAC table
   and the neighbour table feed MAPPER and the device pane rather than a
   dedicated tab of their own.
+- **From 5.11.0 a neighbour that only reported an address is named, not
+  numbered.** Where LLDP sent a network-address chassis id or CDP sent an
+  address as the device id, the Remote device column names it the way
+  Syslog's Host column names a sender — the Nodes device answering on that
+  address first, then the reverse-DNS cache — and a match against a device
+  makes the row a link like any other. Nothing is looked up live: the
+  address is queued for the background reverse-lookup the rest of the
+  application already runs, so a name appears once the cache has it.
 - **The device pane gains NEIGHBOURS and BRIDGE & RF sections.** NEIGHBOURS
   lists what that device's own ports have reported; BRIDGE & RF shows STP
   bridge and per-port state (BRIDGE-MIB) and, for a radio, RSSI, remote

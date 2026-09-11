@@ -3510,6 +3510,23 @@ poller in the loop.
   `if_index` (`None` until now), the far-end's own `port_label()` in place
   of the raw string CDP sent across the cable, the union of protocols and
   VLANs, a native VLAN if the survivor had none, and the later `seen_ts`.
+- **Address-identified neighbours are named above the SQL, not inside it.**
+  `_NEIGHBOR_MATCH_SQL` matches on sysName and chassis MAC only, and stays
+  that way: MAPPER keys its links off these raw rows, so widening the join
+  would change what a map draws. The naming instead happens in
+  `api._resolve_neighbor_names`, over the JSON the per-device route has
+  already built. `_neighbor_ip_candidates` reads an address out of a row —
+  `remote_address`, a subtype-5 `chassis_id` (decoded by
+  `nodepoll.format_chassis_address`, which strips the IANA address-family
+  byte and reuses `format_cdp_address` for the dotted form), or a `sys_name`
+  that is an address — and each candidate goes through
+  `namelookup.device_for_ip`, then one batched `app_db.hostnames()`. That
+  second step is a cache read and never a live query, the rule the Syslog
+  Host column set; `nodesdb.neighbour_addresses()` feeds the same addresses
+  to `Service._extra_resolve_targets` so the background resolver fills the
+  cache. A device hit fills `matched_device_id`/`matched_device_name`, so an
+  IP-identified managed device becomes a link in the table without the join
+  ever having matched it.
 - **`_NEIGHBOR_MATCH_SQL`'s chassis-MAC join resolves at most one
   interface, deterministically.** `interfaces` is unique only on
   `(device_id, if_index)` and one chassis MAC routinely sits on several of

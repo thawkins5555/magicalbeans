@@ -25,7 +25,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from typing import NamedTuple
 
-from . import mibcatalog, nodeoids, nodesdb, swversion, vendorid
+from . import mibcatalog, namelookup, nodeoids, nodesdb, swversion, vendorid
 from .alertrules import DARK_OPTIC_DBM, is_dark_optic
 from .eventlog import ERROR, NODES, NullLog
 from .ipam_scan import ping_many
@@ -1015,7 +1015,7 @@ def _with_dropped(reason: str, session: "_Session") -> str:
 _oid_key = nodeoids.oid_key
 
 
-def _format_cdp_address(raw) -> str:
+def format_cdp_address(raw) -> str:
     """cdpCacheAddress, as this app's OCTET_STRING decoder hands it back,
     is a space-separated run of hex bytes for anything non-printable (see
     trapdecode._octets_text) — a raw IPv4 address decodes as e.g.
@@ -1034,6 +1034,33 @@ def _format_cdp_address(raw) -> str:
     if len(octets) == 4 and all(0 <= o <= 255 for o in octets):
         return ".".join(str(o) for o in octets)
     return text
+
+
+def format_chassis_address(raw) -> str:
+    """An LLDP chassis id of subtype 5 (network address) as a plain address
+    literal, or "" when it does not decode to one. Subtype 5 is an IANA
+    address-family byte followed by the address, so the raw form the
+    OCTET_STRING decoder hands back is five hex bytes for IPv4
+    ("01 0A 28 00 09") and seventeen for IPv6; an agent that writes the
+    dotted form straight into the varbind is returned unchanged."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if namelookup.is_ip_literal(text):
+        return text
+    parts = text.split()
+    try:
+        octets = [int(part, 16) for part in parts]
+    except ValueError:
+        return ""
+    if not octets or not all(0 <= o <= 255 for o in octets):
+        return ""
+    if len(octets) in (5, 17) and octets[0] in (1, 2):
+        parts, octets = parts[1:], octets[1:]
+    if len(octets) == 16:
+        return str(ipaddress.IPv6Address(bytes(octets)))
+    address = format_cdp_address(" ".join(parts))
+    return address if namelookup.is_ip_literal(address) else ""
 
 
 def _int_keyed(column: dict) -> dict:
@@ -1103,7 +1130,7 @@ def _octets_from_value(raw) -> bytes:
     """The bytes behind a PortList/VLAN-bitmap OCTET STRING, whether `raw`
     is already bytes (callers and tests that have them directly) or has
     been through this app's shared OCTET_STRING decoder for a live walk
-    (trapdecode._octets_text — the same one _format_cdp_address documents):
+    (trapdecode._octets_text — the same one format_cdp_address documents):
     plain text when every byte happened to be printable, colon-separated
     lowercase hex when the string was exactly six bytes and not all
     printable (that decoder's MAC-address special case), or space-separated
@@ -7016,7 +7043,7 @@ class NodePoller(Worker):
                 "sys_name": device_id_text,
                 "port_id": str(values["device_port"].get(suffix) or ""),
                 "platform": str(values["platform"].get(suffix) or ""),
-                "remote_address": _format_cdp_address(values["address"].get(suffix)),
+                "remote_address": format_cdp_address(values["address"].get(suffix)),
             })
         return entries, True
 

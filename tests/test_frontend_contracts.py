@@ -2607,6 +2607,20 @@ check('value="netpath_event"' in ALERTS51,
       "a custom rule can be given the netpath_event kind the HTTPS rule uses")
 
 
+
+# --- 52. 5.11.0: a neighbour known only by its IP gets a name ---------------
+NODES52 = read("nodes.js")
+_NB52 = NODES52[NODES52.index("  function drawNeighborsTable()"):]
+_NB52 = _NB52[:_NB52.index("App.wireRowKeyboard(body)")]
+check("r.resolved_name" in _NB52,
+      "nodes.js' neighbours table shows the name the API resolved for an "
+      "IP-only neighbour rather than the address")
+check("(reverse DNS)" in _NB52 and "r.resolved_source === 'dns'" in _NB52,
+      "...and says when that name came from a PTR record, address in the title")
+check("'(not in Nodes)'" in _NB52 or "(not in Nodes)" in _NB52,
+      "...while still saying plainly that the neighbour is not a Nodes device")
+
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

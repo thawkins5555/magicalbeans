@@ -20,6 +20,7 @@ import sqlite3
 import threading
 import time
 
+from .namelookup import is_ip_literal
 from .nodesmibdb import NodesMibDatabase
 from .nodesseriesdb import RAW_WINDOW_S, NodesSeriesDatabase
 from .sqlitebase import (LIKE_ESCAPE, SqliteStore, id_chunks as _id_chunks,
@@ -3429,6 +3430,36 @@ class NodesDatabase(SqliteStore):
                 self._NEIGHBOR_MATCH_SQL +
                 " ORDER BY n.device_id, n.if_index, n.protocol, n.rem_index"
                 ).fetchall()
+
+    def neighbour_addresses(self, limit: int = 500) -> list[str]:
+        """The addresses present neighbour rows identify themselves by — CDP's
+        cdpCacheAddress and an LLDP subtype-5 (network address) chassis id —
+        for the background resolver to name, so the Neighbours table's own
+        naming stays a cache read. nodepoll is imported inside the method
+        because it imports this module."""
+        from .nodepoll import format_chassis_address
+
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT remote_address AS value, 0 AS chassis"
+                " FROM neighbors WHERE present = 1 AND remote_address != ''"
+                " UNION"
+                " SELECT DISTINCT chassis_id AS value, 1 AS chassis"
+                " FROM neighbors WHERE present = 1 AND chassis_id != ''"
+                "   AND chassis_id_subtype = 5").fetchall()
+
+        addresses = []
+        seen = set()
+        for row in rows:
+            text = (format_chassis_address(row["value"]) if row["chassis"]
+                    else str(row["value"] or "").strip())
+            if not text or text in seen or not is_ip_literal(text):
+                continue
+            seen.add(text)
+            addresses.append(text)
+            if len(addresses) >= limit:
+                break
+        return addresses
 
     def neighbours_for_devices(self, device_ids) -> list[sqlite3.Row]:
         """all_neighbours(), restricted to neighbour rows OBSERVED BY one of

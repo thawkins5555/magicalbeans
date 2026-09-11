@@ -151,6 +151,88 @@ try:
           status == 200 and read_csv(csv_payload["csv"])[0][0] == "if_index",
           (status, csv_payload))
 
+    # ----------------------------------------- neighbours identified by IP
+    # Four ways a neighbour arrives with an address where a name should be:
+    # an LLDP subtype-5 chassis id (dotted and raw), a CDP device id that is
+    # an address, and a CDP cdpCacheAddress with nothing else to go on.
+    print("IP-only neighbours named through the Nodes/DNS chain")
+    mgmt_id = db.add_device("10.40.0.9", name="mgmt-sw", group_id=gid)
+    db.record_device_addresses(edge_id, ["10.40.0.22"], "test")
+    service.app_db.set_hostname("10.40.0.50", "printer-3.corp.example")
+
+    db.replace_neighbors(core_id, [
+        {"if_index": 1, "protocol": "lldp", "rem_index": "0.1.1",
+         "chassis_id": "bb:bb:bb:bb:bb:01", "chassis_id_subtype": 4,
+         "sys_name": "edge-sw-1", "port_id": "Gi0/1"},
+        {"if_index": 2, "protocol": "lldp", "rem_index": "0.2.1",
+         "chassis_id": "cc:cc:cc:cc:cc:02", "chassis_id_subtype": 4,
+         "sys_name": "unmanaged-ap", "port_id": "eth0", "platform": "generic-ap"},
+        {"if_index": 3, "protocol": "lldp", "rem_index": "0.3.1",
+         "chassis_id": "10.40.0.9", "chassis_id_subtype": 5, "port_id": "Gi1/1"},
+        {"if_index": 4, "protocol": "cdp", "rem_index": "4.1",
+         "chassis_id": "10.40.0.22", "chassis_id_subtype": 1,
+         "sys_name": "10.40.0.22", "remote_address": "10.40.0.22", "port_id": "Gi0/24"},
+        {"if_index": 5, "protocol": "cdp", "rem_index": "5.1",
+         "remote_address": "10.40.0.50", "port_id": "eth0"},
+        {"if_index": 6, "protocol": "lldp", "rem_index": "0.6.1",
+         "chassis_id": "10.40.0.77", "chassis_id_subtype": 5, "port_id": "e1"},
+        # The raw IANA address-family + octets form a real agent sends.
+        {"if_index": 7, "protocol": "lldp", "rem_index": "0.7.1",
+         "chassis_id": "01 0A 28 00 09", "chassis_id_subtype": 5, "port_id": "Gi1/2"},
+    ])
+
+    status, payload = call("GET", f"/api/nodes/devices/{core_id}/neighbors", token=admin)
+    by_port = {r["if_index"]: r for r in payload.get("neighbors", [])}
+    check("all seven neighbour rows come back", len(by_port) == 7, sorted(by_port))
+
+    row = by_port.get(3)
+    check("a subtype-5 chassis IP of a managed device resolves to that device",
+          row is not None and row["matched_device_id"] == mgmt_id
+          and row["matched_device_name"] == "mgmt-sw"
+          and row["resolved_source"] == "nodes", row)
+
+    row = by_port.get(4)
+    check("a CDP address matching a device's alias resolves to that device",
+          row is not None and row["matched_device_id"] == edge_id
+          and row["matched_device_name"] == "edge-sw-1"
+          and row["resolved_source"] == "nodes", row)
+
+    row = by_port.get(5)
+    check("an unmanaged address with a cached PTR shows the DNS name",
+          row is not None and row["matched_device_id"] is None
+          and row["resolved_name"] == "printer-3.corp.example"
+          and row["resolved_source"] == "dns", row)
+
+    row = by_port.get(6)
+    check("an address nothing knows stays the address",
+          row is not None and row["matched_device_id"] is None
+          and row["resolved_name"] is None and row["resolved_source"] == ""
+          and row["chassis_id"] == "10.40.0.77", row)
+
+    row = by_port.get(7)
+    check("a raw address-family + octets chassis id decodes and resolves",
+          row is not None and row["matched_device_id"] == mgmt_id
+          and row["resolved_source"] == "nodes", row)
+
+    check("the MAC-matched row is untouched by the name chain",
+          by_port[1]["matched_device_id"] == edge_id
+          and by_port[1]["resolved_source"] == "", by_port[1])
+
+    status, csv_payload = call(
+        "GET", f"/api/nodes/devices/{core_id}/neighbors/export.csv", token=admin)
+    csv_rows = read_csv(csv_payload["csv"])
+    header = csv_rows[0]
+    exported = next((r for r in csv_rows[1:] if r[0] == "5"), None)
+    check("the export carries resolved_name/resolved_source, appended",
+          status == 200 and header[-2:] == ["resolved_name", "resolved_source"]
+          and exported is not None
+          and exported[header.index("resolved_name")] == "printer-3.corp.example",
+          (header, exported))
+
+    check("the resolver is fed the neighbour addresses it must name",
+          "10.40.0.77" in service._extra_resolve_targets(),
+          [a for a in service._extra_resolve_targets() if a.startswith("10.40.0.")])
+
     # ----------------------------------------------------- PoE/STP surfaced
     print("PoE/STP fields on the device and interfaces responses")
     db.set_poe_capable(core_id, True)

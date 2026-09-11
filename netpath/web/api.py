@@ -4121,7 +4121,73 @@ def _neighbor_json(row, local_port: str = "") -> dict:
         "present": bool(row["present"]),
         "matched_device_id": row["matched_device_id"] if "matched_device_id" in keys else None,
         "matched_device_name": row["matched_device_name"] if "matched_device_name" in keys else None,
+        "resolved_name": None,
+        "resolved_source": "",
     }
+
+
+def _neighbor_ip_candidates(row: dict) -> list[str]:
+    """The addresses a neighbour row identifies itself by, best evidence
+    first: CDP's cdpCacheAddress, an LLDP chassis id of subtype 5 (which
+    *is* an address), and a CDP device id written as one — nodepoll copies
+    cdpCacheDeviceId into both chassis_id and sys_name."""
+    candidates = []
+
+    def add(text):
+        text = str(text or "").strip()
+        if namelookup.is_ip_literal(text) and text not in candidates:
+            candidates.append(text)
+
+    add(row.get("remote_address"))
+    if row.get("chassis_id_subtype") == 5:
+        add(nodepoll.format_chassis_address(row.get("chassis_id")))
+    add(row.get("sys_name"))
+    return candidates
+
+
+def _resolve_neighbor_names(service, neighbors: list[dict]) -> None:
+    """Name the neighbours whose only identity is an IP address, through the
+    chain the Syslog Host column uses: the Nodes device answering on that
+    address first, then the reverse-DNS cache. Cache-only like that column —
+    nodesdb.neighbour_addresses feeds Service._extra_resolve_targets, so the
+    background resolver is what fills the cache, never a request."""
+    pending = [(n, _neighbor_ip_candidates(n)) for n in neighbors
+               if n.get("matched_device_id") is None]
+    pending = [item for item in pending if item[1]]
+    if not pending:
+        return
+
+    devices = {}
+    for _, candidates in pending:
+        for ip in candidates:
+            if ip not in devices:
+                devices[ip] = namelookup.device_for_ip(service.nodes_db, ip)
+
+    unnamed = set()
+    for neighbor, candidates in pending:
+        for ip in candidates:
+            device = devices.get(ip)
+            if device is not None:
+                name = namelookup.device_name(device) or device["name"]
+                neighbor["matched_device_id"] = device["id"]
+                neighbor["matched_device_name"] = name
+                neighbor["resolved_name"] = name
+                neighbor["resolved_source"] = "nodes"
+                break
+        else:
+            unnamed.update(candidates)
+
+    if not unnamed:
+        return
+    names = service.app_db.hostnames(sorted(unnamed))
+    for neighbor, candidates in pending:
+        if neighbor["resolved_source"]:
+            continue
+        for ip in candidates:
+            if names.get(ip):
+                neighbor["resolved_name"] = names[ip]
+                neighbor["resolved_source"] = "dns"
+                break
 
 
 def get_nodes_device_neighbors(service, params, body, device_id) -> dict:
@@ -4135,7 +4201,9 @@ def get_nodes_device_neighbors(service, params, body, device_id) -> dict:
     _require(service.nodes_db.device(device_id), "device")
     rows = service.nodes_db.neighbours_of(device_id)
     label = _neighbor_local_port_labeler(service)
-    return {"neighbors": [_neighbor_json(r, label(device_id, r["if_index"])) for r in rows]}
+    neighbors = [_neighbor_json(r, label(device_id, r["if_index"])) for r in rows]
+    _resolve_neighbor_names(service, neighbors)
+    return {"neighbors": neighbors}
 
 
 def get_nodes_device_neighbors_export(service, params, body, device_id) -> dict:
@@ -4145,7 +4213,8 @@ def get_nodes_device_neighbors_export(service, params, body, device_id) -> dict:
     neighbors = get_nodes_device_neighbors(service, params, body, device_id)["neighbors"]
     header = ["if_index", "local_port", "protocol", "chassis_id", "sys_name",
              "port_id", "platform", "remote_address", "matched_device_id",
-             "matched_device_name", "present", "seen_ts", "first_seen_ts"]
+             "matched_device_name", "present", "seen_ts", "first_seen_ts",
+             "resolved_name", "resolved_source"]
     csv_rows = [[n.get(key) for key in header] for n in neighbors]
     return _csv_response("neighbours", header, csv_rows)
 

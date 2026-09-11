@@ -2983,11 +2983,20 @@
       // so seeing that device's own detail should be one click, not a
       // separate search. An unmatched neighbour names whatever it reported
       // about itself and says plainly that Nodes could not place it.
-      const remote = r.matched_device_id != null
-        ? `<button class="linkish nd-nb-link" data-device="${r.matched_device_id}">` +
-          `${escape(r.matched_device_name || r.sys_name || 'device')}</button>`
-        : `${escape(r.sys_name || r.chassis_id || 'unidentified')}` +
+      // A neighbour that only named itself by IP carries the name the API
+      // resolved; the address stays in the tooltip when a PTR record made it.
+      let remote;
+      if (r.matched_device_id != null) {
+        remote = `<button class="linkish nd-nb-link" data-device="${r.matched_device_id}">` +
+          `${escape(r.matched_device_name || r.sys_name || 'device')}</button>`;
+      } else {
+        const label = escape(r.resolved_name || r.sys_name || r.chassis_id || 'unidentified');
+        const address = r.remote_address || r.chassis_id || '';
+        remote = (r.resolved_source === 'dns' && r.resolved_name
+                  ? `<span title="${escape(address)} (reverse DNS)">${label}</span>`
+                  : label) +
           '<span class="hint"> (not in Nodes)</span>';
+      }
       tr.innerHTML = `<td>${escape(r.local_port || `if ${r.if_index}`)}</td>` +
         `<td>${escape((r.protocol || '').toUpperCase())}</td>` +
         `<td>${remote}</td>` +

@@ -1367,6 +1367,9 @@ class Service:
                              if row["alive"])
         if self.nodes_settings.get("resolve_addresses", True):
             addresses.extend(row["ip"] for row in self.nodes_db.devices())
+            # api._resolve_neighbor_names only reads the cache, so this is
+            # what puts a neighbour's address in it.
+            addresses.extend(self.nodes_db.neighbour_addresses())
         return addresses
 
     def _maintenance_loop(self) -> None:
