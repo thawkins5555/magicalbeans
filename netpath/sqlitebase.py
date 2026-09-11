@@ -519,6 +519,21 @@ class SqliteStore:
             added.add(name)
         return added
 
+    def _commit_durable(self) -> None:
+        """Commit, and do not return until the transaction is on the platter.
+
+        For the handful of writers that store an operator-entered credential.
+        Most of these stores run `synchronous=NORMAL`, which in WAL mode does
+        not fsync at commit: the write is safe against corruption but a power
+        loss can lose a transaction SQLite already reported committed, and
+        "we said we stored your password" has to stay true. A full checkpoint
+        forces the log back into the database file and syncs it; it costs a
+        few milliseconds, on writes that happen a handful of times a year.
+        """
+        with self._lock:
+            self._conn.commit()
+            self._conn.execute("PRAGMA wal_checkpoint(FULL)")
+
     # How long close() waits for whatever holds the store lock before closing
     # anyway. The lock is held by ordinary queries, and the web server's
     # request threads are daemons that survive WebServer.stop() (see

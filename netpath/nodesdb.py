@@ -60,6 +60,20 @@ WALK_PRUNE_CHUNK = 20_000
 WALK_PRUNE_CHUNK_MIN = 10_000
 WALK_PRUNE_CHUNK_MAX = 40_000
 
+# The same three figures for device_events / interface_events /
+# discovery_jobs, which prune() sweeps by age. Lower than the walk tables':
+# these rows are deleted in very nearly the order their ts indexes are laid
+# out in, so a batch dirties a run of leaf pages rather than all of them.
+# 400,000 device_events over 500 devices, with bench_prune's 5 ms reader:
+#
+#     unbatched      2.6 s, one hold of 2,594 ms, reader stalled 1,259 ms
+#      2,000 rows    1.7 s, 53 holds, median 22 ms, reader stalled  510 ms
+#     10,000 rows    1.3 s, 22 holds, median 70 ms, reader stalled  278 ms
+#     50,000 rows    1.4 s, 14 holds, median 91 ms, reader stalled  867 ms
+EVENT_PRUNE_CHUNK = 10_000
+EVENT_PRUNE_CHUNK_MIN = 2_000
+EVENT_PRUNE_CHUNK_MAX = 40_000
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS groups (               -- "polling profiles"
     id              INTEGER PRIMARY KEY,
@@ -2862,6 +2876,35 @@ class NodesDatabase(SqliteStore):
                         table, older_than_s / 86400.0)
         return removed
 
+    def _prune_by_id(self, table: str, where: str, params) -> int:
+        """The same batched by-age DELETE as _prune_seen_ts, for the tables
+        that have an `id` of their own and their own predicate.
+
+        Every batch still carries `where`, so the id range decides only how
+        the sweep is cut up and never which rows go. Each batch is its own
+        transaction, as on every other store's prune: a sweep interrupted
+        half way has deleted fewer rows than asked, never the wrong ones.
+        """
+        with self._lock:
+            bounds = self._conn.execute(
+                f"SELECT MIN(id) AS lo, MAX(id) AS hi FROM {table}"
+                f" WHERE {where}", params).fetchone()
+        low = bounds["lo"]
+        if low is None:
+            return 0
+        cut = bounds["hi"] + 1
+
+        def delete(low_id: int, upper: int) -> int:
+            cursor = self._conn.execute(
+                f"DELETE FROM {table} WHERE id >= ? AND id < ? AND {where}",
+                (low_id, upper, *params))
+            return cursor.rowcount or 0
+
+        removed, _ = self._delete_batches(
+            low, cut, float("inf"), delete, chunk=EVENT_PRUNE_CHUNK,
+            chunk_min=EVENT_PRUNE_CHUNK_MIN, chunk_max=EVENT_PRUNE_CHUNK_MAX)
+        return removed
+
     def prune_mac_entries(self, older_than_s: float) -> int:
         """Drop entries nothing has refreshed for this long, present or
         stale alike. Now that replace_mac_entries keeps a stale row around
@@ -4390,21 +4433,17 @@ class NodesDatabase(SqliteStore):
         metrics before the 5.0.0 split."""
         removed = 0
         now = time.time()
-        with self._lock:
-            # Unconditional: a caller that wants "delete everything now" (the
-            # Settings page's maintenance button) passes 0, which computes a
-            # cutoff of "now" and so matches every existing row.
-            cursor = self._conn.execute(
-                "DELETE FROM device_events WHERE ts < ?", (now - event_days * 86400,))
-            removed += cursor.rowcount or 0
-            cursor = self._conn.execute(
-                "DELETE FROM interface_events WHERE ts < ?", (now - event_days * 86400,))
-            removed += cursor.rowcount or 0
-            cursor = self._conn.execute(
-                "DELETE FROM discovery_jobs WHERE started_ts < ? AND state != 'running'",
-                (now - discovery_days * 86400,))
-            removed += cursor.rowcount or 0
-            self._conn.commit()
+        # Unconditional: a caller that wants "delete everything now" (the
+        # Settings page's maintenance button) passes 0, which computes a
+        # cutoff of "now" and so matches every existing row -- which is
+        # exactly why these three are batched: that button issues them from
+        # the HTTP request thread over the whole table.
+        event_cutoff = now - event_days * 86400
+        removed += self._prune_by_id("device_events", "ts < ?", (event_cutoff,))
+        removed += self._prune_by_id("interface_events", "ts < ?", (event_cutoff,))
+        removed += self._prune_by_id(
+            "discovery_jobs", "started_ts < ? AND state != 'running'",
+            (now - discovery_days * 86400,))
         if removed:
             # Freed pages go back in short steps with the lock released
             # between them, not through a whole-file VACUUM.

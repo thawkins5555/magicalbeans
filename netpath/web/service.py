@@ -443,6 +443,11 @@ class Service:
         # Monotonic within a process; a restart starting again from 1 is
         # fine, because the client compares for inequality, not order.
         self.config_version = 1
+        # bump_config() runs on request threads — every settings save, every
+        # collector toggle, every user create — and `+= 1` is a read, an add
+        # and a store, so two saves at once could both read N and both write
+        # N+1. One of the two operators would then never be told to refetch.
+        self._config_lock = threading.Lock()
         # Per-poll figures that are expensive to compute and cannot usefully
         # change faster than an operator can read them: storage sizes (30
         # stat() calls) and the reverse-DNS cache fill (three queries).
@@ -809,7 +814,8 @@ class Service:
 
     def bump_config(self) -> None:
         """Say that something /api/config carries has changed."""
-        self.config_version += 1
+        with self._config_lock:
+            self.config_version += 1
 
     def cached_poll(self, key: str, ttl_s: float, compute):
         """`compute()` at most once per `ttl_s`, shared by every open tab.

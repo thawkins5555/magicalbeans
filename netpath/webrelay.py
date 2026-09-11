@@ -51,6 +51,12 @@ TOUCH_INTERVAL_S = 30
 # The web session is re-read every tick (a dict lookup); the permission is a
 # database read, so it gets its own slower cadence.
 PERMISSION_EVERY_TICKS = 5
+
+# Consecutive watchdog permission reads that may fail before the tunnel is
+# closed anyway. A database that cannot answer is not a verdict — but it is
+# not an indefinite reprieve either, and at one read every
+# PERMISSION_EVERY_TICKS seconds this is about a minute.
+MAX_PERMISSION_ERRORS = 12
 # Total budget for every session, not each — sessions stop concurrently.
 SHUTDOWN_BUDGET_S = 3.0
 # Large enough that a page of images is a handful of reads per socket, small
@@ -595,6 +601,8 @@ class WebRelaySession:
         self.device_authority = authority.encode("latin-1")
         self.device_origin = f"{scheme}://{authority}"
         self.opened_ts = time.time()
+        # Consecutive permission reads that raised, so failing open has an end.
+        self._permission_errors = 0
         self._last_traffic = self.opened_ts
         self._last_touch = 0.0
         self._stopped = threading.Event()
@@ -957,7 +965,18 @@ class WebRelaySession:
         try:
             granted = self.service.app_db.permissions_for(self.app_user).get("web")
         except Exception:
-            return True           # a database that cannot answer is not a verdict
+            # A database that cannot answer is not a verdict — for a while.
+            # Failing open forever would mean a revoked grant never ends a
+            # live tunnel, which is the one thing this check exists to do.
+            self._permission_errors += 1
+            if self._permission_errors < MAX_PERMISSION_ERRORS:
+                return True
+            if self._permission_errors == MAX_PERMISSION_ERRORS:
+                log.warning("Cannot read web permissions for %s after %d "
+                            "attempts; closing the tunnel",
+                            self.app_user, self._permission_errors)
+            return False
+        self._permission_errors = 0
         return permissions.allows(granted, permissions.WRITE)
 
     # ----------------------------------------------------------------- close

@@ -69,6 +69,16 @@ TOUCH_INTERVAL_S = 30
 # web session every tick, which is one dictionary lookup; the permission is a
 # database read). Five seconds from revoked to closed.
 PERMISSION_EVERY_TICKS = 5
+
+# The SSH username arrives on the socket and is named in the device event
+# log; RFC 4253 sets no length, but nothing real is longer than this.
+MAX_USERNAME_CHARS = 128
+
+# Consecutive watchdog permission reads that may fail before the shell is
+# closed anyway. A database that cannot answer is not a verdict — but it is
+# not an indefinite reprieve either, and at one read every
+# PERMISSION_EVERY_TICKS seconds this is about a minute.
+MAX_PERMISSION_ERRORS = 12
 # How long `SshSessionRegistry.shutdown()` may take in total — for every
 # session, not for each one. Sessions are stopped concurrently inside it:
 # stopping one takes its socket's I/O lock, which its own output pump can
@@ -323,6 +333,8 @@ class SshSession:
         # Whether the watchdog has already reported a failed tick; one line
         # per session, not one a second.
         self._watch_failed = False
+        # Consecutive permission reads that raised, so failing open has an end.
+        self._permission_errors = 0
         self._last_input = time.time()
         self._last_touch = 0.0
         self._auth_failures = 0
@@ -483,7 +495,10 @@ class SshSession:
                 return False
             if message.get("type") != "auth":
                 continue
-            username = str(message.get("username", "") or "")
+            # Clamped before it can reach an event-log row: a WebSocket text
+            # frame may be MAX_MESSAGE_BYTES (2 MiB) and _audit_auth_failure
+            # names the username that was tried. No account name is longer.
+            username = str(message.get("username", "") or "")[:MAX_USERNAME_CHARS]
             if not username:
                 self._error("A username is required.")
                 continue
@@ -782,7 +797,18 @@ class SshSession:
         try:
             granted = self.service.app_db.permissions_for(self.app_user).get("ssh")
         except Exception:
-            return True           # a database that cannot answer is not a verdict
+            # A database that cannot answer is not a verdict — for a while.
+            # Failing open forever would mean a revoked grant never ends a
+            # live shell, which is the one thing this check exists to do.
+            self._permission_errors += 1
+            if self._permission_errors < MAX_PERMISSION_ERRORS:
+                return True
+            if self._permission_errors == MAX_PERMISSION_ERRORS:
+                log.warning("Cannot read SSH permissions for %s after %d "
+                            "attempts; closing the session",
+                            self.app_user, self._permission_errors)
+            return False
+        self._permission_errors = 0
         return permissions.allows(granted, permissions.WRITE)
 
     def _end_unauthorized(self, message: str, audit: str) -> None:

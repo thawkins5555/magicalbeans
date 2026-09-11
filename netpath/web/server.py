@@ -20,6 +20,7 @@ import mimetypes
 import os
 import re
 import ssl
+import sys
 import threading
 import time
 import traceback
@@ -913,10 +914,13 @@ class Handler(BaseHTTPRequestHandler):
     # setting (64 MB by default, ~85 MB once encoded). Raising the limit for
     # exactly these paths keeps the general cap tight without breaking a
     # documented setting.
+    # Matched whole, not as a prefix: `/api/nodes/mibs/12/resolve` and the
+    # DELETE beside it carry a handful of bytes and were inheriting the
+    # upload's 85 MB ceiling.
     LARGE_BODY_PATHS = ("/api/nodes/mibs",)
 
     def _body_limit(self, path: str) -> int:
-        if not path.startswith(self.LARGE_BODY_PATHS):
+        if path not in self.LARGE_BODY_PATHS:
             return self.MAX_BODY_BYTES
         try:
             budget = int(self.service.nodes_settings.get(
@@ -925,6 +929,32 @@ class Handler(BaseHTTPRequestHandler):
             budget = 0
         # base64 is four bytes per three, plus the JSON envelope around it.
         return max(self.MAX_BODY_BYTES, (budget * 4) // 3 + 65536)
+
+    # What a refusal will read and throw away to keep a persistent
+    # connection usable. Deliberately far below MAX_BODY_BYTES: reading 16 MB
+    # before writing a 401 is work an unauthenticated caller should not be
+    # able to ask for, and a body that large is not the "small body" this
+    # drain was written for. Above it the connection closes instead.
+    MAX_DRAIN_BYTES = 64 * 1024
+
+    def _content_length(self) -> int:
+        """The request's Content-Length, parsed once, for both body paths.
+
+        Strict on purpose. Several values that do not agree cannot be framed
+        (RFC 9110 §8.6), and a front end that picks a different one from this
+        server is a request-smuggling differential. `int()` would also accept
+        `+5`, ` 5 ` and `3_1` — the same hazard by another route — and a
+        negative length reached `read(-1)`, which reads to EOF with no cap at
+        all. Raises, so the caller answers rather than guesses."""
+        values = self.headers.get_all("Content-Length") or []
+        if len({value.strip() for value in values}) > 1:
+            raise LengthRequired(
+                "Conflicting Content-Length headers: send exactly one length")
+        raw = values[0].strip() if values else "0"
+        if not raw or not all(char in "0123456789" for char in raw):
+            raise ValueError(
+                "Content-Length must be a plain decimal byte count")
+        return int(raw)
 
     def _drain_request_body(self) -> None:
         """Consume a request body the handler never read, before answering.
@@ -944,13 +974,13 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
+            length = self._content_length()
+        except ValueError:          # LengthRequired included
             self.close_connection = True
             return
         if length <= 0:
             return
-        if length > self.MAX_BODY_BYTES:
+        if length > self.MAX_DRAIN_BYTES:
             self.close_connection = True
             return
         try:
@@ -967,7 +997,7 @@ class Handler(BaseHTTPRequestHandler):
             raise LengthRequired(
                 "This server reads Content-Length only; send the body with a "
                 "length rather than chunked")
-        length = int(self.headers.get("Content-Length") or 0)
+        length = self._content_length()
         if not length:
             self._body_consumed = True
             return {}
@@ -1109,6 +1139,15 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _permitted(self, need, params: dict) -> bool:
+        """Whether this caller holds `need`, answering 403 itself when not."""
+        module, level = need
+        granted = api.request_permissions(self.service, params).get(module)
+        if permissions.allows(granted, level):
+            return True
+        self._json({"error": f"No {level} access to {module}"}, 403)
+        return False
+
     def _route(self, method: str) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
@@ -1203,15 +1242,20 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             self._route_template = pattern.pattern
             try:
+                # Before the body, not after it. Almost every route carries a
+                # fixed (module, level), so a caller with no grant is refused
+                # without the server first reading — and buffering — up to the
+                # route's whole body cap. Only the two callable requirements
+                # need the body to know what to ask for, and they are gated
+                # below, once it has been read.
+                if requirement is not None and not callable(requirement):
+                    if not self._permitted(requirement, params):
+                        return
                 body = (self._body(self._body_limit(path))
                         if method in ("POST", "PUT", "DELETE") else {})
-                need = requirement(params, body) if callable(requirement) else requirement
-                if need is not None:
-                    module, level = need
-                    granted = api.request_permissions(
-                        self.service, params).get(module)
-                    if not permissions.allows(granted, level):
-                        self._json({"error": f"No {level} access to {module}"}, 403)
+                if callable(requirement):
+                    need = requirement(params, body)
+                    if need is not None and not self._permitted(need, params):
                         return
                 # Every route but one captures a row id; the MIB catalog
                 # captures a bundle key, which is a name. Digits still
@@ -1320,6 +1364,10 @@ class Handler(BaseHTTPRequestHandler):
         self._static(path, versioned="v" in params)
 
     def _static(self, path: str, versioned: bool = False) -> None:
+        # One key for every static response, so the Debug page's per-route
+        # latency shows asset serving instead of folding it — and every 404
+        # with it — into `<unrouted>`.
+        self._route_template = "<static>"
         if path in ("/", ""):
             path = "/index.html"
         if path == "/login":
@@ -1333,7 +1381,10 @@ class Handler(BaseHTTPRequestHandler):
             inside = os.path.commonpath([STATIC_DIR, candidate]) == STATIC_DIR
         except ValueError:
             inside = False
-        entry = STATIC_CACHE.get(candidate) if inside and os.path.isfile(candidate) else None
+        # No isfile() first: StaticCache.get already returns None when its
+        # own stat fails, and open() on a directory raises an OSError it
+        # catches. The extra stat bought nothing but a second syscall.
+        entry = STATIC_CACHE.get(candidate) if inside else None
         if entry is None:
             self._send(404, b"Not found", "text/plain; charset=utf-8")
             return
@@ -1378,6 +1429,55 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
 
+# How many connections may be open at once. One accepted connection is one
+# thread with its own stack, and HTTP/1.1 keep-alive holds each of them for
+# up to `Handler.timeout`, so without a ceiling a few thousand half-open
+# sockets are a few thousand threads. Far above any real operator
+# population — the same shape of cap sshterm and webrelay already carry.
+MAX_CONNECTIONS = 512
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a ceiling on concurrent connections, and
+    without a traceback for every client that walks away mid-response."""
+
+    def __init__(self, *args, **kwargs):
+        # BoundedSemaphore, not Semaphore: a release that is not matched by
+        # an acquire is a leak in the other direction, and a leaked slot
+        # eventually refuses every connection. This way it raises instead.
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # The thread never started, so nothing else will release it.
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+    def handle_error(self, request, client_address):
+        """A client that reset the connection is not a fault worth printing.
+
+        log_message is silenced on purpose ("the event log is the log"), and
+        a browser closing a tab mid-poll would otherwise put a ~1.7 KB
+        traceback on stderr per aborted request. Everything else still
+        prints — this narrows the arm, it does not close it."""
+        if isinstance(sys.exc_info()[1],
+                      (BrokenPipeError, ConnectionResetError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 class WebServer:
     def __init__(self, service: Service, host: str = "0.0.0.0", port: int = 8443,
                  certfile: str | None = None, keyfile: str | None = None):
@@ -1386,7 +1486,7 @@ class WebServer:
         self.port = port
         self.certfile = certfile
         self.keyfile = keyfile
-        self.httpd: ThreadingHTTPServer | None = None
+        self.httpd: BoundedThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self.access = AccessLog()
         # The Debug page reads per-route latency through the service, which
@@ -1418,7 +1518,7 @@ class WebServer:
         handler = type("BoundHandler", (Handler,),
                        {"service": self.service, "access": self.access})
         try:
-            self.httpd = ThreadingHTTPServer((self.host, self.port), handler)
+            self.httpd = BoundedThreadingHTTPServer((self.host, self.port), handler)
             self.httpd.daemon_threads = True
 
             self.httpd.is_tls = bool(self.certfile)
@@ -1460,9 +1560,21 @@ class WebServer:
             self.keyfile = keyfile or None
         return self.start(block=False)
 
+    # How long stop() gives requests already in flight. daemon_threads means
+    # server_close() joins none of them, so without this the teardown that
+    # follows — service.shutdown(), which closes every store — can meet a
+    # handler mid-query. `access.active` counts open connections rather than
+    # running handlers, so this is an upper bound on the wait, not a measure
+    # of the work; and it is bounded either way, because a WebSocket terminal
+    # holds its connection for as long as the operator keeps it open.
+    DRAIN_GRACE_S = 2.0
+
     def stop(self) -> None:
         if self.httpd is not None:
-            self.httpd.shutdown()
+            self.httpd.shutdown()          # the accept loop; not the handlers
+            deadline = time.time() + self.DRAIN_GRACE_S
+            while self.access.active > 0 and time.time() < deadline:
+                time.sleep(0.02)
             self.httpd.server_close()
             self.httpd = None
         if self._thread is not None:

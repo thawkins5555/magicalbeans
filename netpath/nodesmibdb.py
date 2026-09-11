@@ -174,7 +174,13 @@ class NodesMibDatabase(SqliteStore):
         vendor arc. "Covering" means deeper than the bare enterprise root
         (e.g. 1.3.6.1.4.1.9 alone names the vendor but decodes nothing) —
         this app ships ~20 vendor roots, so a plain prefix test would
-        never report anything missing."""
+        never report anything missing.
+
+        A range, not `oid LIKE 'prefix.%'`: LIKE gives ix_mib_objects_oid a
+        lower bound only, so this scanned the rest of the corpus on every
+        poll of every device. `'/'` is `'.'`+1 in ASCII and every OID is
+        [0-9.], so the two select the identical rows. Same in
+        mib_file_covering below, and in enterprise_objects."""
         from . import nodeoids
         prefix = nodeoids.enterprise_root(sys_object_id)
         if not prefix:
@@ -182,7 +188,8 @@ class NodesMibDatabase(SqliteStore):
         with self._lock:
             row = self._conn.execute(
                 "SELECT 1 FROM mib_objects WHERE oid IS NOT NULL"
-                " AND oid LIKE ? LIMIT 1", (prefix + ".%",)).fetchone()
+                " AND oid >= ? AND oid < ? LIMIT 1",
+                (prefix + ".", prefix + "/")).fetchone()
         return row is not None
 
     def mib_file_covering(self, sys_object_id: str) -> int | None:
@@ -197,9 +204,9 @@ class NodesMibDatabase(SqliteStore):
         with self._lock:
             row = self._conn.execute(
                 "SELECT mib_file_id, COUNT(*) AS n FROM mib_objects"
-                " WHERE oid IS NOT NULL AND oid LIKE ?"
+                " WHERE oid IS NOT NULL AND oid >= ? AND oid < ?"
                 " GROUP BY mib_file_id ORDER BY n DESC LIMIT 1",
-                (prefix + ".%",)).fetchone()
+                (prefix + ".", prefix + "/")).fetchone()
         return row["mib_file_id"] if row else None
 
     def all_known_oids(self) -> dict[str, str]:

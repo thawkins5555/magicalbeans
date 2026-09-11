@@ -1163,6 +1163,19 @@ class AlertsDatabase(SqliteStore):
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_alerts_state_resolved"
             " ON alerts(state, resolved_ts, dedup_key)")
+        # alerts_due_first_notify, which the engine asks on every 5 s tick
+        # for as long as notify_rollup_delay_s is set (it is, by default),
+        # and which scanned the whole table to find the handful of rows
+        # awaiting a first notice. PARTIAL on purpose: it holds only those
+        # rows, so an insert adds one entry and mark_notified removes it -
+        # which is the answer to the objection that indexing the notify
+        # columns would make the writer pay on every alert.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_alerts_pending_notify"
+            " ON alerts(opened_ts) WHERE last_notified_ts IS NULL")
+        # histogram()'s opened_ts window, for the Alerts overview.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_alerts_opened ON alerts(opened_ts)")
 
     # Post-seed migrations, in the order they were introduced. A migration
     # belongs here rather than in _migrate() when it has to read or rewrite

@@ -460,9 +460,15 @@ class WebSocket:
             return
         try:
             for _ in range(rounds):
-                if not select.select([self.sock], [], [], 0)[0]:
-                    return
-                if not self.sock.recv(65536):
+                # _poll_readable, not select.select: this module refuses the
+                # latter everywhere else because it raises ValueError for a
+                # descriptor at or above FD_SETSIZE, and the arm below would
+                # have swallowed that silently.
+                self._poll_readable(0)
+                try:
+                    if not self.sock.recv(65536):
+                        return
+                except BlockingIOError:
                     return
         except (OSError, ValueError, AttributeError):
             pass

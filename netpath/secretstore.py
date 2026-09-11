@@ -61,11 +61,12 @@ def _load_passphrase() -> bytes:
     file_path = os.environ.get(ENV_PASSPHRASE_FILE)
     if file_path:
         try:
-            mode = stat.S_IMODE(os.stat(file_path).st_mode)
+            info = os.stat(file_path)
         except OSError as exc:
             raise SecretStoreError(
                 f"NETPATH_SECRET_PASSPHRASE_FILE is set to {file_path!r} but "
                 f"it could not be read: {exc}") from exc
+        mode = stat.S_IMODE(info.st_mode)
         # Windows has no meaningful POSIX mode bits (see __main__.py's own
         # note on the data folder) — this check only means something on the
         # platforms this module exists for in the first place.
@@ -73,6 +74,18 @@ def _load_passphrase() -> bytes:
             raise SecretStoreError(
                 f"NETPATH_SECRET_PASSPHRASE_FILE ({file_path!r}) is readable "
                 f"by more than its owner (mode {oct(mode)}). Anyone who can "
+                f"read it can decrypt every credential this application has "
+                f"stored, so it is refused until the file is chmod 600 (or "
+                f"narrower) and owned by the account this service runs as.")
+        # The other half of the sentence above, which used to be promised and
+        # not enforced: a 0600 file belonging to somebody else is exactly the
+        # case it says is refused. root is allowed because a service started
+        # as root before dropping privileges reads a root-owned file.
+        if os.name != "nt" and info.st_uid not in (0, os.getuid()):
+            raise SecretStoreError(
+                f"NETPATH_SECRET_PASSPHRASE_FILE ({file_path!r}) is owned by "
+                f"uid {info.st_uid}, not by root or by the account this "
+                f"service runs as (uid {os.getuid()}). Anyone who can "
                 f"read it can decrypt every credential this application has "
                 f"stored, so it is refused until the file is chmod 600 (or "
                 f"narrower) and owned by the account this service runs as.")

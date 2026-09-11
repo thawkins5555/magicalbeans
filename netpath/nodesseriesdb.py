@@ -25,6 +25,21 @@ log = logging.getLogger(__name__)
 # samples_hourly; sample_retention_days defaults to the same three days.
 RAW_WINDOW_S = 3 * 86400
 
+# One batch of prune(), in rows, and the band _delete_batches may move it
+# inside. Sized like the walk tables' rather than like netpath.db's: a batch
+# of contiguous rowids spans every metric in the fleet, so it touches very
+# nearly every leaf page of the (metric_id, ts) primary key whatever its
+# size, and small batches pay that whole cost again per commit. 400,000
+# samples over 20,000 metrics, with bench_prune's 5 ms reader:
+#
+#     unbatched      1.9 s, one hold of 1,864 ms, reader stalled 919 ms
+#      2,000 rows    1.8 s, 53 holds, median  20 ms, reader stalled 919 ms
+#     20,000 rows    1.8 s, 20 holds, median  96 ms, reader stalled 448 ms
+#     50,000 rows    1.5 s, 16 holds, median 105 ms, reader stalled 1516 ms
+SAMPLE_PRUNE_CHUNK = 20_000
+SAMPLE_PRUNE_CHUNK_MIN = 5_000
+SAMPLE_PRUNE_CHUNK_MAX = 80_000
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS metrics (
     id              INTEGER PRIMARY KEY,
@@ -447,23 +462,54 @@ class NodesSeriesDatabase(SqliteStore):
                 self._conn.commit()
         return removed
 
+    def _prune_by_rowid(self, table: str, where: str, params) -> int:
+        """A by-age DELETE cut into lock-bounded batches by rowid.
+
+        `samples` is the largest table in the product and this store guards
+        one connection with one lock, so an unbatched sweep -- and above all
+        the "delete every stored sample" the Settings maintenance button
+        issues on the request thread -- held it for the whole delete, which
+        is every chart read and every record_poll write queued behind it.
+
+        Chunked by rowid because neither table has an id of its own; every
+        batch still carries `where`, so the range decides only how the sweep
+        is cut up and never which rows go. The range is wide: rowids are
+        handed out in arrival order while the cutoff is on the row's own
+        timestamp, and a device with a wrong clock puts the two out of step.
+        Wide but cheap -- a batch that finds nothing is an index probe.
+        """
+        with self._lock:
+            bounds = self._conn.execute(
+                f"SELECT MIN(rowid) AS lo, MAX(rowid) AS hi FROM {table}"
+                f" WHERE {where}", params).fetchone()
+        low = bounds["lo"]
+        if low is None:
+            return 0
+        cut = bounds["hi"] + 1
+
+        def delete(low_id: int, upper: int) -> int:
+            cursor = self._conn.execute(
+                f"DELETE FROM {table} WHERE rowid >= ? AND rowid < ?"
+                f" AND {where}", (low_id, upper, *params))
+            return cursor.rowcount or 0
+
+        removed, _ = self._delete_batches(
+            low, cut, float("inf"), delete, chunk=SAMPLE_PRUNE_CHUNK,
+            chunk_min=SAMPLE_PRUNE_CHUNK_MIN, chunk_max=SAMPLE_PRUNE_CHUNK_MAX)
+        return removed
+
     def prune(self, *, sample_days: float = 3, rollup_days: float = 400,
               max_samples_per_metric: int = 0) -> int:
         """Age out raw samples and hourly rollups. Passing 0 (the Settings
         page's maintenance button) matches every existing row."""
         removed = 0
         now = time.time()
-        with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM samples WHERE ts < ?", (now - sample_days * 86400,))
-            removed += cursor.rowcount or 0
-            # The hourly rollups are the long history now, so they are
-            # bounded by their own retention rather than kept forever.
-            cursor = self._conn.execute(
-                "DELETE FROM samples_hourly WHERE hour < ?",
-                (now - rollup_days * 86400,))
-            removed += cursor.rowcount or 0
-            self._conn.commit()
+        removed += self._prune_by_rowid(
+            "samples", "ts < ?", (now - sample_days * 86400,))
+        # The hourly rollups are the long history now, so they are
+        # bounded by their own retention rather than kept forever.
+        removed += self._prune_by_rowid(
+            "samples_hourly", "hour < ?", (now - rollup_days * 86400,))
         removed += self.cap_samples_per_metric(max_samples_per_metric)
         if removed:
             # Freed pages go back in short steps with the lock released
