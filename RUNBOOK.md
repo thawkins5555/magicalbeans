@@ -14,6 +14,7 @@ backup, `INTERNALS.md` is why any of this works the way it does.
 - [The poller has stopped](#the-poller-has-stopped)
 - [A collector says "stopped unexpectedly"](#a-collector-says-stopped-unexpectedly)
 - [A collector is losing messages (`kernel_dropped`)](#a-collector-is-losing-messages-kernel_dropped)
+- [The trap receiver answers informs from anywhere](#the-trap-receiver-answers-informs-from-anywhere)
 - [The alert engine is behind (`backlog`)](#the-alert-engine-is-behind-backlog)
 - [Charts are empty, or history has vanished](#charts-are-empty-or-history-has-vanished)
 - [The disk is filling up](#the-disk-is-filling-up)
@@ -155,6 +156,24 @@ reported zero dropped.
 5. **Check the writer is not the bottleneck.** If `queue` in the Debug counters
    is also high, the receive thread is fine and the database write path is
    behind — see the disk section.
+
+---
+
+## The trap receiver answers informs from anywhere
+
+With the shipped defaults — `auto_accept_sources` on, an empty
+`allowed_sources` list and `acknowledge_informs` on — the SNMP trap receiver
+sends a response to every InformRequest it accepts, to whatever source
+address the datagram carried. Over UDP that address is whatever the sender
+wrote, so a host that can reach port 162 from the internet can have this
+receiver send one small reply per inform to a victim of its choosing. The
+reply is about the size of the inform, so it is a reflector rather than an
+amplifier, but it is still traffic you did not ask to send.
+
+If the receiver's port is reachable from outside the estate, either list
+the exporters that may send to it in `allowed_sources` (the response is only
+ever sent to an accepted source) or turn `acknowledge_informs` off, in which
+case a sender that uses informs will retransmit until it gives up.
 
 ---
 
