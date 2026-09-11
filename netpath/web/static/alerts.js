@@ -1817,6 +1817,10 @@
     const generation = ++view.refreshGen;
     // Started here so it shares the round trip when it does run at all.
     const config = loadConfig();
+    // Awaited below, which is what reports a failure; this only marks the
+    // rejection handled for the case where the fetches below fail first and
+    // the await is never reached.
+    config.catch(() => {});
     const [overview, list, total, mutes, maintenance] =
       await Promise.all([
       App.get('/api/alerts/overview', { t0, t1, bucket }),

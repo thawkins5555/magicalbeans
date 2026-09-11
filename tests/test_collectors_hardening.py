@@ -1624,6 +1624,32 @@ def test_c11_bgp_oids_and_visible_truncation() -> None:
     check(f"bgpPeerRemoteAddr.{peer}={peer}" in trap.varbind_text,
           f"the flattened text agrees ({trap.varbind_text})")
 
+    # --- an INTEGER is an Integer32, however many bytes arrive -----------
+    # _decode_value returned int.from_bytes() of whatever the sender wrote,
+    # so a 60 KB BER integer became a 480,000-bit Python int -- passed
+    # straight on to consumers that use it as an exponent (nodepoll's
+    # entPhySensorScale). The trap decoder's own INTEGER fields were
+    # already clamped; the varbind values were not.
+    huge = _tlv(0x30, _oid_tlv("1.3.6.1.2.1.99.1.1.1.2.1")
+                + _tlv(0x02, b"\x7f" + b"\xff" * 8_000))
+    trap = decoder.decode(v2c_trap("1.3.6.1.6.3.1.1.5.3", huge), "10.0.0.1")
+    value = trap.varbinds[-1]["value"] if trap and trap.varbinds else None
+    check(value == 2147483647,
+          f"an 8 KB INTEGER varbind decodes to Integer32's ceiling, not to a "
+          f"64,000-bit integer ({value if value is None else value.bit_length()} "
+          f"bits)")
+    negative = _tlv(0x30, _oid_tlv("1.3.6.1.2.1.99.1.1.1.2.2")
+                    + _tlv(0x02, b"\x80" + b"\x00" * 8_000))
+    trap = decoder.decode(v2c_trap("1.3.6.1.6.3.1.1.5.3", negative), "10.0.0.1")
+    value = trap.varbinds[-1]["value"] if trap and trap.varbinds else None
+    check(value == -2147483648,
+          f"and the same at the negative end ({value})")
+    ordinary = _tlv(0x30, _oid_tlv("1.3.6.1.2.1.99.1.1.1.2.3")
+                    + _tlv(0x02, (-3).to_bytes(1, "big", signed=True)))
+    trap = decoder.decode(v2c_trap("1.3.6.1.6.3.1.1.5.3", ordinary), "10.0.0.1")
+    value = trap.varbinds[-1]["value"] if trap and trap.varbinds else None
+    check(value == -3, f"while an ordinary INTEGER is untouched ({value})")
+
     # --- truncation is counted where an operator can see it ---------------
     trap_db = SnmpTrapDatabase(db_path("c11-traps.db"))
     traps = TrapCollector(trap_db)

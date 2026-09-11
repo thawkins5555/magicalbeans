@@ -801,6 +801,323 @@ def test_interface_cap_is_a_note_not_an_error():
         db.close()
 
 
+# ------------------------------------------------- the walk's own two caps
+
+class _BigColumnAgent:
+    """Answers any walk of one column with an endless supply of rows, each
+    carrying `value_bytes` of non-printable octet string, optionally after
+    `delay_s`. One varbind per reply whatever max-repetitions asks for,
+    which is a legal GetBulk answer and the only one that fits in a
+    datagram at this size."""
+
+    BASE = "1.3.6.1.2.1.17.1.4.1.2"          # dot1dBasePortIfIndex
+
+    def __init__(self, value_bytes: int = 60_000, delay_s: float = 0.0):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.port = self.sock.getsockname()[1]
+        self.sock.settimeout(0.5)
+        self.value = bytes((index % 256) or 0xFF for index in range(value_bytes))
+        self.delay_s = delay_s
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=2)
+        self.sock.close()
+
+    def _serve(self):
+        while not self._stop.is_set():
+            try:
+                data, addr = self.sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            try:
+                req = decode_response(data)
+                oid = req.varbinds[0]["oid"]
+                if oid == self.BASE:
+                    index = 0
+                elif oid.startswith(self.BASE + "."):
+                    index = int(oid[len(self.BASE) + 1:])
+                else:
+                    continue
+                body = enc_varbind(f"{self.BASE}.{index + 1}", enc_octets(self.value))
+                pdu = _tlv(PDU_RESPONSE, enc_int(req.request_id) + enc_int(0) +
+                           enc_int(0) + _tlv(T_SEQUENCE, body))
+                reply = _tlv(T_SEQUENCE, enc_int(req.version) +
+                             enc_octets("public") + pdu)
+            except Exception as exc:  # pragma: no cover - debug aid
+                print("big-column agent error:", exc, flush=True)
+                continue
+            if self.delay_s:
+                time.sleep(self.delay_s)
+            self.sock.sendto(reply, addr)
+
+
+def _walk_device(prefix: str, port: int, **overrides):
+    db = NodesDatabase(os.path.join(tmpdir(prefix), "nodes.db"))
+    group_id = db.ensure_default_group()
+    device_id = db.add_device("127.0.0.1", "walk-target", group_id=group_id,
+                              snmp_version=1, community="public",
+                              ping_enabled=0, poll_interval_s=999,
+                              snmp_timeout_s=1.0, snmp_retries=0, **overrides)
+    nodepoll_mod.DEFAULT_SNMP_PORT = port
+    poller = NodePoller(db)
+    return db, poller, db.device(device_id)
+
+
+def test_a_column_walk_is_bounded_by_bytes_not_only_rows():
+    """16,384 rows of 64 KB octet string is three gigabytes retained on one
+    poll worker: the row cap alone does not bound memory, because
+    _decode_value renders a non-printable string as three bytes of Python
+    str per wire byte and truncates only `text`. The row cap here is set
+    far below the default so the unfixed walk finishes at all."""
+    agent = _BigColumnAgent(value_bytes=60_000)
+    agent.start()
+    db, poller, device = _walk_device("poller_review_bytecap_", agent.port)
+    try:
+        db.save_settings({**db.settings(), "snmp_walk_max_rows": 200})
+        lines = []
+        poller.log = types.SimpleNamespace(
+            add=lambda category, message, target="", detail="": lines.append(message))
+        values, complete, reason = poller._walk_column_detail(
+            device, db.effective_config(device), agent.BASE)
+        retained = sum(len(str(value)) for value in values.values())
+        check(complete is False and "byte" in reason,
+              f"a walk of 60 KB rows stops at the byte cap and says so "
+              f"({reason!r})")
+        check(len(values) < 200,
+              f"...well before the 200-row cap it was given ({len(values)} rows)")
+        check(retained <= poller._WALK_MAX_BYTES + 200_000,
+              f"...having retained about the cap, not the row count times the "
+              f"row size ({retained} bytes)")
+        check(poller._WALK_MAX_BYTES >= 1024 * 1024,
+              f"the cap is a few MB, not a limit a real table could reach "
+              f"({poller._WALK_MAX_BYTES})")
+        check(sum("byte" in line for line in lines) == 1,
+              f"...and it is logged once, the way the row cap is ({lines})")
+    finally:
+        db.close()
+        agent.stop()
+
+
+def test_a_column_walk_has_a_deadline_even_when_the_caller_gives_none():
+    """Of the ~30 column walks a full poll makes, two passed a deadline. An
+    agent that answers each request just inside its timeout could hold a
+    poll worker for the whole walk with no wall-clock ceiling at all."""
+    agent = _BigColumnAgent(value_bytes=8, delay_s=0.1)
+    agent.start()
+    db, poller, device = _walk_device("poller_review_walkclock_", agent.port)
+    try:
+        db.save_settings({**db.settings(), "snmp_walk_max_rows": 30})
+        poller._WALK_BUDGET_FRACTION = 0.0
+        poller._WALK_BUDGET_FLOOR_S = 0.5
+        started = time.time()
+        values, complete, reason = poller._walk_column_detail(
+            device, db.effective_config(device), agent.BASE)
+        elapsed = time.time() - started
+        check(complete is False and "time budget" in reason,
+              f"a walk given no deadline derives one from the poll interval "
+              f"and stops on it ({reason!r})")
+        check(elapsed < 2.0 and len(values) < 30,
+              f"...rather than running to the row cap ({len(values)} rows in "
+              f"{elapsed:.1f}s)")
+    finally:
+        db.close()
+        agent.stop()
+
+
+# ------------------------------------- one socket per interface read, not 512
+
+def test_the_interface_read_opens_one_socket_and_decrypts_once():
+    """_interface_varbinds went through _snmp_get, which builds its own
+    _Session -- a fresh UDP socket, and on v3 a fresh credential decrypt --
+    per interface. A 512-port chassis was 512 ephemeral ports and 512
+    decrypts per device per poll."""
+    agent = _OneInterfaceAgent(if_speed=1_000_000_000, if_high_speed=1000,
+                               hc_out_answers=True)
+    agent.start()
+    db, poller, device = _walk_device("poller_review_ifsockets_", agent.port)
+    sessions = {"n": 0}
+    credentials = {"n": 0}
+    real_session, real_credential = nodepoll_mod._Session, nodepoll_mod.credential_for
+
+    class CountingSession(real_session):
+        def __init__(self, *args, **kwargs):
+            sessions["n"] += 1
+            super().__init__(*args, **kwargs)
+
+    def counting_credential(config):
+        credentials["n"] += 1
+        return real_credential(config)
+
+    nodepoll_mod._Session = CountingSession
+    nodepoll_mod.credential_for = counting_credential
+    try:
+        # The ifIndex walk has its own session either way; this is about the
+        # per-interface reads that follow it.
+        poller._walk_indexes = lambda device, config, oid, raise_on_timeout=False: (
+            list(range(1, 33)), True, "")
+        rows, complete, reason, note = poller._poll_interfaces(
+            device, db.effective_config(device))
+        check(len(rows) == 32,
+              f"all 32 interfaces are still read ({len(rows)})")
+        check(rows[0]["descr"] == "Gi0/1" and rows[0]["speed_bps"] == 1_000_000_000,
+              f"...and the row the agent really answers is unchanged ({rows[0]})")
+        check(sessions["n"] == 1,
+              f"32 interfaces cost ONE UDP socket, not one each "
+              f"({sessions['n']} opened)")
+        check(credentials["n"] == 1,
+              f"...and one credential decrypt, not one each "
+              f"({credentials['n']} decrypts)")
+    finally:
+        nodepoll_mod._Session = real_session
+        nodepoll_mod.credential_for = real_credential
+        db.close()
+        agent.stop()
+
+
+# ------------------------------- an OID that cannot be encoded, mid-poll
+
+def test_an_unencodable_oid_does_not_freeze_the_device():
+    """A ValueError is not an SnmpError, so one raised while building a
+    request escaped _poll_device's every except clause: record_poll never
+    ran and the device's status, last_poll_ts and snmp_error froze at
+    whatever they last were, for ever. The same shape as the 5.8.0
+    int(None) regression, through a different door -- here a stored MIB
+    object whose OID carries an arc int() will not take."""
+    agent, db, poller, device_id = _setup_reassignable_device(
+        "poller_review_badoid_", "bad-oid-stub")
+    try:
+        _poll_once(poller, db, device_id)
+        mib_id = db.add_mib_file("bad.mib", "BAD-MIB", 1, [], "")
+        db.replace_mib_objects(mib_id, [
+            {"name": "badScalar", "oid": "1.3.6.1.4.1.99999.\u00b2",
+             "description": "", "syntax": "INTEGER", "enums": None,
+             "is_notification": False}])
+        db.update_device(device_id, mib_file_id=mib_id)
+        before = db.device(device_id)["last_poll_ts"]
+        time.sleep(0.01)
+        raised = ""
+        try:
+            _poll_once(poller, db, device_id)
+        except Exception as exc:
+            raised = f"{type(exc).__name__}: {exc}"
+        row = db.device(device_id)
+        check(not raised,
+              f"a MIB object whose OID cannot be encoded does not take the "
+              f"poll with it ({raised})")
+        check(row["last_poll_ts"] and row["last_poll_ts"] != before,
+              "...record_poll still ran, so the device's status is this "
+              "poll's rather than frozen at the last good one")
+        check("not a valid object identifier" in (row["snmp_error"] or ""),
+              f"...and the device row says what was wrong "
+              f"({row['snmp_error']!r})")
+
+        raised = ""
+        try:
+            poller.walk_subtree(device_id, "1.3.\u00b2")
+        except ValueError as exc:
+            raised = str(exc)
+        check("An OID must be numeric" in raised,
+              f"the OID browser refuses a non-ASCII digit up front rather "
+              f"than letting the encoder refuse it on the wire ({raised!r})")
+    finally:
+        agent.stop()
+        db.close()
+
+
+# --------------------------------------- per-device state of deleted devices
+
+def test_deleting_a_device_drops_every_cache_keyed_on_it():
+    """_forget_devices' own docstring says every per-device container is
+    pruned. Five were not in its list, and _discovery_jobs was pruned
+    nowhere at all: a finished sweep kept its settings dict, one _owners
+    entry per address swept and a dead Thread for the life of the
+    process, and drain() walks that dict every 50 ms."""
+    db = NodesDatabase(os.path.join(tmpdir("poller_review_forget_"), "nodes.db"))
+    try:
+        group_id = db.ensure_default_group()
+        device_id = db.add_device("192.0.2.5", "doomed", group_id=group_id,
+                                  poll_interval_s=999)
+        poller = NodePoller(db)
+        poller._schedule_pass()
+        sets = (poller._auth_failing, poller._access_denied, poller._downgraded,
+                poller._method_seeded, poller._arp_unanswered, poller._staggered)
+        for members in sets:
+            members.add(device_id)
+        poller._snmp_failing_count[device_id] = 2
+        poller._get_batch[device_id] = 12
+        poller._credentials[device_id] = 0
+        poller._discovery_jobs[1] = types.SimpleNamespace(
+            running=False, target="192.0.2.0/24")
+        poller._discovery_jobs[2] = types.SimpleNamespace(
+            running=True, target="192.0.2.128/25")
+
+        db.remove_device(device_id)
+        poller._schedule_pass()
+
+        leaked = [name for name, members in
+                  (("_auth_failing", poller._auth_failing),
+                   ("_access_denied", poller._access_denied),
+                   ("_downgraded", poller._downgraded),
+                   ("_method_seeded", poller._method_seeded),
+                   ("_arp_unanswered", poller._arp_unanswered),
+                   ("_staggered", poller._staggered),
+                   ("_snmp_failing_count", poller._snmp_failing_count),
+                   ("_get_batch", poller._get_batch),
+                   ("_credentials", poller._credentials))
+                  if device_id in members]
+        check(not leaked,
+              f"every per-device container forgets a deleted device ({leaked})")
+        check(1 not in poller._discovery_jobs,
+              "a finished discovery job is dropped with its settings dict, "
+              "its address map and its dead thread")
+        check(2 in poller._discovery_jobs,
+              "...while a sweep still on the wire is kept")
+    finally:
+        db.close()
+
+
+# ------------------------------------------- a secret in an error message
+
+def test_a_refused_community_is_not_printed():
+    """credential_for refuses a community containing a comma -- and put the
+    community itself in the message, which _poll_device writes to
+    devices.snmp_error, the device event log, the per-poll debug line, the
+    API and any alert mail. _credential_label exists three screens above
+    to prevent exactly this."""
+    db = NodesDatabase(os.path.join(tmpdir("poller_review_secret_"), "nodes.db"))
+    try:
+        group_id = db.ensure_default_group()
+        device_id = db.add_device("127.0.0.1", "comma-community",
+                                  group_id=group_id, snmp_version=1,
+                                  ping_enabled=0, poll_interval_s=999,
+                                  snmp_timeout_s=0.3, snmp_retries=0)
+        # Written past clean_community, which refuses this at save time now:
+        # the fault is a database written before it did.
+        secret = "s3cret,alternate"
+        with db._lock:
+            db._conn.execute("UPDATE devices SET community = ? WHERE id = ?",
+                             (secret, device_id))
+            db._conn.commit()
+        poller = NodePoller(db)
+        poller.log = types.SimpleNamespace(
+            add=lambda category, message, target="", detail="": None)
+        _poll_once(poller, db, device_id)
+        error = db.device(device_id)["snmp_error"] or ""
+        check("comma" in error,
+              f"the refusal still reaches the operator ({error!r})")
+        check(secret not in error and "s3cret" not in error,
+              f"...without the community string in it ({error!r})")
+    finally:
+        db.close()
+
+
 def main():
     test_counter_rate_width_matters()
     test_format_ticks_divides_by_a_hundred()
@@ -814,6 +1131,12 @@ def main():
     test_link_down_recorded_without_reboot()
     test_fortipoll_walk_terminates_on_stuck_oid()
     test_interface_cap_is_a_note_not_an_error()
+    test_a_column_walk_is_bounded_by_bytes_not_only_rows()
+    test_a_column_walk_has_a_deadline_even_when_the_caller_gives_none()
+    test_the_interface_read_opens_one_socket_and_decrypts_once()
+    test_an_unencodable_oid_does_not_freeze_the_device()
+    test_deleting_a_device_drops_every_cache_keyed_on_it()
+    test_a_refused_community_is_not_printed()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} test(s) failed:")

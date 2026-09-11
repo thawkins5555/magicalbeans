@@ -68,6 +68,12 @@ def in_database_file(store, sql, params=()):
 SECRET = b"\x01encrypted-blob\x02"
 
 
+def holds(row, index=0) -> bool:
+    """Whether that column of the copied row is the secret. Tolerant of a
+    missing row and a NULL, which is what a lost transaction looks like."""
+    return bool(row) and row[index] is not None and bytes(row[index]) == SECRET
+
+
 # ------------------------------------------------- nodes.db (three writers)
 
 nodes = NodesDatabase(os.path.join(TMP, "nodes.db"))
@@ -94,27 +100,25 @@ row = in_database_file(
     (device_id,))
 check("a device credential has reached the database file by the time"
       " set_device_credential returns",
-      row is not None and bytes(row[0]) == SECRET and bytes(row[1]) == SECRET,
-      row)
+      holds(row, 0) and holds(row, 1), row)
 
 nodes.set_group_credential(group_id, "noc", "SHA", SECRET)
 row = in_database_file(nodes, "SELECT v3_auth_pass_enc FROM groups WHERE id = ?",
                        (group_id,))
-check("...and a polling profile's credential",
-      row is not None and bytes(row[0]) == SECRET, row)
+check("...and a polling profile's credential", holds(row), row)
 
 nodes.set_group_credential_password(credential_id, "noc2", "SHA", SECRET)
 row = in_database_file(
     nodes, "SELECT v3_auth_pass_enc FROM group_credentials WHERE id = ?",
     (credential_id,))
-check("...and an additional credential on a profile",
-      row is not None and bytes(row[0]) == SECRET, row)
+check("...and an additional credential on a profile", holds(row), row)
 
 # The durable commit is a commit: the ordinary write that was waiting in the
 # log goes out with it, and the store reads the same either way.
+pending = in_database_file(nodes, "SELECT name FROM devices WHERE id = ?",
+                           (device_id,))
 check("the write that was pending in the log went out with it, not lost",
-      in_database_file(nodes, "SELECT name FROM devices WHERE id = ?",
-                       (device_id,))[0] == "renamed-in-the-log")
+      bool(pending) and pending[0] == "renamed-in-the-log", pending)
 check("and the store itself reads back what was written",
       nodes.device(device_id)["name"] == "renamed-in-the-log")
 nodes.close()
@@ -129,14 +133,13 @@ row = in_database_file(
               " WHERE device_id = ?", (7,))
 check("an SSH password has reached configrx.db by the time set_credential"
       " returns",
-      row is not None and row[0] == "admin" and bytes(row[1]) == SECRET, row)
+      bool(row) and row[0] == "admin" and holds(row, 1), row)
 
 configrx.set_enable_secret(7, SECRET)
 row = in_database_file(
     configrx, "SELECT enable_secret_enc FROM device_config WHERE device_id = ?",
     (7,))
-check("...and an enable secret set on its own",
-      row is not None and bytes(row[0]) == SECRET, row)
+check("...and an enable secret set on its own", holds(row), row)
 configrx.close()
 
 
@@ -151,7 +154,7 @@ row = in_database_file(
     wireless, "SELECT v3_auth_pass_enc FROM controllers WHERE id = ?",
     (controller_id,))
 check("a wireless controller's credential has reached wireless.db",
-      row is not None and bytes(row[0]) == SECRET, row)
+      holds(row), row)
 wireless.close()
 
 
@@ -161,8 +164,7 @@ alerts = settled(AlertsDatabase(os.path.join(TMP, "alerts.db")))
 alerts.set_smtp_credential(SECRET)
 row = in_database_file(alerts,
                        "SELECT password_enc FROM smtp_credential WHERE id = 1")
-check("the SMTP password has reached alerts.db",
-      row is not None and bytes(row[0]) == SECRET, row)
+check("the SMTP password has reached alerts.db", holds(row), row)
 check("...and the store still reports it holds one",
       alerts.smtp_password_enc() == SECRET)
 alerts.close()

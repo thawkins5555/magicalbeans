@@ -651,6 +651,101 @@ finally:
     agent.close()
 
 
+# ============================== § 9b a Report against another msgID is a stray
+
+# RFC 3412 s7.2 has the receiver match a reply's msgID against the request
+# it is waiting on. Reports are (correctly) exempt from the request-id
+# filter, and the trusted rule above deliberately admits unknownEngineIDs
+# under ANY engine id -- that is the Report whose purpose is to teach one.
+# The msgID is what is left: the one field an off-path forger cannot know.
+
+print("\n-- a Report whose msgID is not ours is dropped, not learned from")
+
+
+def msg_id_offset(data):
+    """Discovery answered honestly; every signed request answered with an
+    unknownEngineIDs Report under an engine id of the forger's choosing,
+    against a msgID one higher than the one we sent."""
+    request = decode_response(data)
+    if not request.engine_id:
+        return [report_under(FAKE_ENGINE, 3, 100, USM_UNKNOWN_ENGINE,
+                             request.msg_id)]
+    return [report_under(FORGED_ENGINE, 99, 1, USM_UNKNOWN_ENGINE,
+                         request.msg_id + 1)]
+
+
+agent = FakeAgent(msg_id_offset)
+session = _Session("127.0.0.1", agent.port, 0.4, 0)
+learned = []
+try:
+    try:
+        v3_exchange(session, PDU_GET, [SYS_DESCR], identity="poller",
+                    auth_proto="SHA", password=PASSWORD,
+                    engine=(FAKE_ENGINE, 3, 100), ip="127.0.0.1",
+                    learned=lambda *e: learned.append(e))
+        check("a Report against the wrong msgID does not complete the exchange",
+              False)
+    except (SnmpTimeout, SnmpError):
+        check("a Report against a msgID we never sent is dropped and the wait "
+              "continues, so the exchange ends in silence rather than in the "
+              "forger's answer", True)
+    check("...the forged engine id is never learned",
+          not any(e[0] == FORGED_ENGINE for e in learned), repr(learned))
+    check("...and the datagram is counted as a stray",
+          session.dropped >= 1, session.dropped)
+finally:
+    session.close()
+    agent.close()
+
+# The same agent, echoing the msgID it was sent: the exchange proceeds
+# exactly as it did before, which is what makes the check above safe.
+agent = FakeAgent(lambda data: [report_under(
+    FAKE_ENGINE, 3, 100, USM_UNKNOWN_ENGINE, decode_response(data).msg_id)])
+session = _Session("127.0.0.1", agent.port, 0.4, 0)
+learned = []
+try:
+    try:
+        v3_exchange(session, PDU_GET, [SYS_DESCR], identity="poller",
+                    auth_proto="SHA", password=PASSWORD,
+                    engine=(FAKE_ENGINE, 3, 100), ip="127.0.0.1",
+                    learned=lambda *e: learned.append(e))
+    except SnmpError:
+        pass
+    check("a conforming agent's Report -- same msgID -- still teaches its "
+          "engine parameters", any(e[0] == FAKE_ENGINE for e in learned),
+          repr(learned))
+    check("...and nothing was dropped on the way", session.dropped == 0,
+          session.dropped)
+finally:
+    session.close()
+    agent.close()
+
+# discovery_probe() defaulted to msgID 1 for every probe ever sent, so the
+# one exchange whose whole answer is a Report had nothing to match against.
+sent = []
+
+
+def capture_probe(data):
+    sent.append(data)
+    return [report_under(FAKE_ENGINE, 3, 100, USM_UNKNOWN_ENGINE,
+                         decode_response(data).msg_id)]
+
+
+agent = FakeAgent(capture_probe)
+session = _Session("127.0.0.1", agent.port, 0.4, 0)
+try:
+    engine = discover_engine(session, "127.0.0.1")
+    probes = [decode_response(data).msg_id for data in sent]
+    check("discovery still learns the engine", engine[0] == FAKE_ENGINE,
+          repr(engine))
+    check("...from a probe carrying this session's own msgID rather than the "
+          "fixed 1 every probe used to send",
+          probes and probes[0] != 1, repr(probes))
+finally:
+    session.close()
+    agent.close()
+
+
 # ===================================== § 10 auth_ok on the agent's own word
 
 print("\n-- a fixed password refused by VACM still closes the auth alert")

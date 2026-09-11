@@ -1745,15 +1745,23 @@ end
     # told what that cap was on the way.
     readonly_cookie = make_user("bodygate", {"netpath": "read"})
     oversized = SERVER.httpd.RequestHandlerClass.MAX_BODY_BYTES * 4
-    conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=30)
-    conn.request("POST", "/api/nodes/mibs", None,
-                 {"Content-Type": "application/json", "Cookie": readonly_cookie,
-                  "Content-Length": str(oversized)})
-    response = conn.getresponse()
-    payload = response.read()
-    conn.close()
+    conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+    try:
+        # The length is declared and the body never sent: a server that reads
+        # first sits here waiting for 64 MiB that will not arrive, which is
+        # the defect, so the wait is bounded and reported rather than raised.
+        conn.request("POST", "/api/nodes/mibs", None,
+                     {"Content-Type": "application/json",
+                      "Cookie": readonly_cookie,
+                      "Content-Length": str(oversized)})
+        response = conn.getresponse()
+        status, payload = response.status, response.read()
+    except (TimeoutError, socket.timeout, OSError) as exc:
+        status, payload = 0, f"no answer: {exc!r}".encode()
+    finally:
+        conn.close()
     check("D21 an account with no grant is refused before its body is read",
-          response.status == 403, f"{response.status} {payload[:120]}")
+          status == 403, f"{status} {payload[:120]}")
     check("D21 …and is not told the server's body limit",
           b"limit" not in payload, payload[:120])
 
@@ -1945,15 +1953,30 @@ end
         SERVICE.access_log = saved_access_log
 
     # --------------------------------------------- D26 config_version is atomic
+    # `self.config_version += 1` is a read, an add and a store, so a thread
+    # switch between them loses one of two concurrent saves — and the browser
+    # refetches /api/config only when the number moves. Enough bumps, and a
+    # switch interval short enough to land inside one, that the race is not
+    # left to luck.
+    def bump_many():
+        for _ in range(5000):
+            SERVICE.bump_config()
+
     start_version = SERVICE.config_version
-    bumpers = [threading.Thread(target=SERVICE.bump_config) for _ in range(50)]
-    for one in bumpers:
-        one.start()
-    for one in bumpers:
-        one.join()
-    check("D26 fifty concurrent bumps are fifty increments",
-          SERVICE.config_version == start_version + 50,
-          f"{start_version} -> {SERVICE.config_version}")
+    saved_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        bumpers = [threading.Thread(target=bump_many) for _ in range(8)]
+        for one in bumpers:
+            one.start()
+        for one in bumpers:
+            one.join()
+    finally:
+        sys.setswitchinterval(saved_interval)
+    check("D26 forty thousand concurrent bumps are forty thousand increments",
+          SERVICE.config_version == start_version + 40_000,
+          f"{start_version} -> {SERVICE.config_version}, "
+          f"{start_version + 40_000 - SERVICE.config_version} lost")
 
     return 0
 
