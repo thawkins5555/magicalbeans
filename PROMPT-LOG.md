@@ -149,3 +149,12 @@ plus 30 larger proposals and 20 unconfirmed items. Every finding was re-read
 against the code by the lead before a fixer was given it; two were reclassified
 as proposals (a deliberate CA-bundle choice, a reflector best handled in the
 runbook). Fixers run in file-owned lanes so no two agents edit the same module.
+
+**Fix phase complete** — eight file-owned lanes (server, data, poller, api,
+alerts, trap secrets, frontend core, frontend modules) fixed 79 of the 81
+findings; one became a proposal (the update path's CA bundle, a deliberate
+choice) and one a runbook note (the trap receiver acknowledging informs from
+any source). Every fix carries a test shown red before it. Report in
+`CODE-REVIEW.md`; release notes under 5.9.1 in `CHANGELOG.md`; internals and
+features updated where a mechanism or a screen changed. Full-suite pass and
+the browser walk follow, once, at the end.
