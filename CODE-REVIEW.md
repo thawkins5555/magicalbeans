@@ -495,7 +495,7 @@ multi-billion-digit integer: driving the real `_decode_entity_sensor` gave `exit
 30 s, and the growth curve is `10^6 → 1.183 s`, `10^7 → 47.404 s`. The same object is read on
 the **HTTP thread** through `read_dom`/`read_dom_all`/`read_hardware`, so opening that device's
 interface dialog hangs a web worker too, and `_run_one`'s `except Exception` never runs because
-nothing is raised. Fixed: scale clamped to 1..9 and precision to -8..9 before any arithmetic,
+nothing is raised. Fixed: scale clamped to RFC 3433's 1..17 (yocto to yotta) and precision to -8..9 before any arithmetic,
 with `T_INTEGER` clamped to Integer32 in the decoder as the second line.
 
 **POLL-F2 (high, security/correctness).** `enc_oid` (`trapdecode.py:784`) does

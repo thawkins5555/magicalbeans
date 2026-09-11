@@ -5091,7 +5091,7 @@ class NodePoller(Worker):
         entPhySensorScale = 2147483647 (a legal Integer32) would have
         CPython build a multi-billion-digit integer and never return, on a
         poll worker or on the HTTP thread behind read_dom. RFC 3433 gives
-        entitySensorDataScale nine legal values and entitySensorPrecision
+        entitySensorDataScale seventeen legal values and entitySensorPrecision
         the range -8..9; anything outside either is not a reading this
         function can honour, so it is read at the MIB's own default
         (units, no folded decimals) rather than multiplied out.
@@ -5105,7 +5105,8 @@ class NodePoller(Worker):
 
     # RFC 3433's own ranges for entitySensorDataScale and
     # entitySensorPrecision.
-    _SENSOR_SCALE_MIN, _SENSOR_SCALE_MAX = 1, 9
+    # RFC 3433 EntitySensorDataScale: yocto(1) .. units(9) .. yotta(17).
+    _SENSOR_SCALE_MIN, _SENSOR_SCALE_MAX = 1, 17
     _SENSOR_PRECISION_MIN, _SENSOR_PRECISION_MAX = -8, 9
 
     @staticmethod

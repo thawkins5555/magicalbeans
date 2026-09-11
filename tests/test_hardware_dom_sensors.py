@@ -431,6 +431,11 @@ row = poller._decode_entity_sensor(
     {{"1001": -2147483648}}, {{"1001": 1}}, {{}}, {{"1001": "Te1/1/1"}})
 assert row is not None and row["value"] == 42.0, row
 assert poller._scaled_sensor_value(1, 10 ** 7, 0) == 1
+# The whole enum is legal, not just yocto..units: kilo(10) is 10^3 and
+# yotta(17) is 10^24; only 18 and above is out of range.
+assert poller._scaled_sensor_value(12345, 10, 2) == 123450.0
+assert poller._scaled_sensor_value(1, 17, 0) == 1e24
+assert poller._scaled_sensor_value(1, 18, 0) == 1
 assert poller._scaled_sensor_value(5, 8, 1) == 0.0005, \\
     poller._scaled_sensor_value(5, 8, 1)
 print("ok")
