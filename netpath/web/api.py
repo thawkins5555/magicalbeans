@@ -6405,12 +6405,11 @@ def post_nodes_mib_resolve(service, params, body, mib_file_id) -> dict:
 def _clean_oid(value) -> str:
     """A dotted numeric OID, or ValueError.
 
-    isascii() as well as isdigit(), and an explicit refusal of a leading
-    '-', because the BER encoder this eventually reaches shifts each arc
-    right seven bits at a time: a negative arc never terminates that loop,
-    and str.isdigit() is True for superscript and Arabic-Indic digits that
-    int() rejects. Both would land here as a stored OID the poller then
-    reads on every poll.
+    isascii() as well as isdigit(), and no sign accepted, because the BER
+    encoder this eventually reaches shifts each arc right seven bits at a
+    time: a negative arc never terminates that loop, and str.isdigit() is
+    True for superscript and Arabic-Indic digits that int() rejects. Either
+    would land here as a stored OID the poller then reads on every poll.
     """
     oid = str(value or "").strip().strip(".")
     parts = oid.split(".") if oid else []
@@ -9059,10 +9058,11 @@ def post_login(service, params, body) -> dict:
     # of already-throttled attempts would queue every legitimate sign-in
     # behind them. Truncated at 5 s either way — the throttle's own ceiling
     # is 30 s, but a request thread held that long is its own denial.
+    delay = service.throttle.delay_for(username, client)
+    if delay:
+        time.sleep(min(delay, 5))
+
     with _LOGIN_SLOTS:
-        delay = service.throttle.delay_for(username, client)
-        if delay:
-            time.sleep(min(delay, 5))
         row = service.app_db.user(username) if username else None
         stored = row["password"] if row else None
 

@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.9.1 — Second full code review: eighty-one findings](#591--second-full-code-review-eighty-one-findings)
 - [5.9.0 — Six asks](#590--six-asks)
 - [5.8.1 — The restart that fixed it](#581--the-restart-that-fixed-it)
 - [5.8.0 — The privacy password, and the reply nobody checked](#580--the-privacy-password-and-the-reply-nobody-checked)
@@ -136,6 +137,288 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.9.1 — Second full code review: eighty-one findings
+
+The second whole-tree review of the application, and the first that took the
+browser modules and performance in with the code. 4.46.4 was the first and
+left the interface out of scope. This one ran as seven area reviews — web
+server core and credentials, HTTP API, poller and SNMP, data layer, alerts and
+collectors, frontend core, frontend modules — each against four lenses in
+priority order: security, performance, design quality, maintainability, with
+correctness defects taken wherever they appeared. Eighty-one findings: two
+critical, seventeen high, twenty-nine medium, thirty-three low.
+
+No feature, page, dialog, button, endpoint or setting was removed to make any
+of this work, and the application stays standard-library-only — no finding
+proposed a dependency. The larger design work the review turned up is recorded
+as thirty proposals in `CODE-REVIEW.md` rather than done here, and that
+document is where the method is written down as well: seven area reviews
+against four lenses, every finding verified against the running code before it
+was accepted — a `path:line` citation, the decisive lines quoted, a concrete
+failure scenario — every cost claim measured, and every fix shipped with a test
+that failed before it. The findings themselves, their evidence and their status
+are there rather than repeated below.
+
+#### Web and sign-in
+
+- **A request declaring a negative or malformed `Content-Length` was read
+  until the connection ended.** No size limit applied to it and no sign-in was
+  required to send one: `int("-1")` passed both length guards and reached a
+  read with no cap at all. One parser now answers for both body paths — ASCII
+  digits only, one value, never negative — and anything else is refused with
+  400 before a byte of body is read (`tests/test_web_security.py`).
+- **Two disagreeing `Content-Length` headers were accepted**, and the bytes
+  past the first length were parsed as a second request — request smuggling
+  behind a reverse proxy that picks the other header. Several lengths that do
+  not agree cannot be framed, so they are refused with 411.
+- **A request body was read in full before the route's permission check.** On
+  the MIB upload that is up to 85 MB buffered for a caller who is about to be
+  told 403. The permission is checked first now for every route whose
+  requirement is a fixed `(module, level)`; only the two routes whose
+  requirement depends on the body are still gated after it.
+- **The 85 MB upload ceiling applied to every path under `/api/nodes/mibs`.**
+  It applies to the MIB upload itself now; the resolve and delete routes beside
+  it, which carry a handful of bytes, are back under the ordinary cap.
+- **A request refused before its handler read and discarded up to 16 MB
+  first**, to leave the persistent connection usable. That is work an
+  unauthenticated caller should not be able to ask for: capped at 64 KiB, above
+  which the connection closes instead (`tests/test_static_headers.py`).
+- **The web server accepted unlimited simultaneous connections.** One accepted
+  connection is one thread with its own stack, held for the keep-alive timeout,
+  so a few thousand half-open sockets were a few thousand threads. Ceiling of
+  512, with slots returned as connections finish.
+- **Closing a browser tab mid-request wrote a full traceback per aborted
+  request.** A client reset is silent now; a genuine fault still prints.
+- **Two simultaneous settings saves could record as one version change**, so
+  one of the two operators was never told to refetch. The counter is
+  serialised.
+- **Stopping the service closed the databases under requests still in
+  flight.** It waits up to two seconds for them first.
+- **The passphrase file is refused when it belongs to another account.**
+  `NETPATH_SECRET_PASSPHRASE_FILE` has always been refused unless it is 0600,
+  and the refusal has always said "and owned by the account this service runs
+  as" — which was never enforced. It is now: root, or the service's own uid
+  (`tests/test_secretstore.py`).
+- **A live SSH session or device WEB relay stayed open indefinitely when
+  `app.db` could not answer its permission check.** Failing open is right for a
+  moment and wrong for ever — a grant taken away would never end a live shell,
+  which is the one thing that check exists to do. Twelve consecutive failures,
+  about a minute, then it closes with one log line (`tests/test_ssh_terminal.py`,
+  `tests/test_web_relay.py`).
+- **An SSH terminal username was written to the device event log at whatever
+  length it arrived**, up to the 2 MB a WebSocket text frame may carry.
+  Clamped to 128 characters.
+- **The WebSocket close path used `select()`**, which fails above 1,024 open
+  files; it uses the module's own poll path now, as everything else there
+  already did (`tests/test_wsock.py`).
+- **The SSH window's in-page comment named Escape as the way out of the
+  terminal.** Escape is a real keystroke to the device; the documented
+  keyboard-only way out is Ctrl+F6, which is what it says.
+- **A `?kiosk=1&rotate=…` link with an unexpected view name left a blank, dead
+  page.** The name reached a CSS attribute selector, `querySelector` threw, and
+  the throw out of kiosk setup took the rest of the application's start —
+  splitters, every module, the poll timer — with it. A name that is not a plain
+  lowercase word is ignored, and a half-built kiosk drops back to the ordinary
+  layout rather than leaving the page dead.
+- **A typed `_` or `%` in a search box was a wildcard.** In the Nodes, Alerts,
+  NetFlow, Syslog, IPAM and audit-log search boxes, `core_sw` matched
+  `core-sw-1`. Searches match the typed text literally
+  (`tests/test_search_wildcards.py`).
+- **A confirmed credential save now survives a power loss.** Device, group,
+  ConfigRX, wireless and SMTP credential writes checkpoint to disk before the
+  save returns; every other write keeps the cheap commit
+  (`tests/test_credential_durability.py`).
+
+<!-- TODO(lead): api lane -->
+
+#### Nodes
+
+- **A device answering a nonsensical `entPhySensorScale` or
+  `entPhySensorPrecision` pinned a poll worker for ever** — and the web thread
+  behind the interface dialog with it — while memory climbed. Both are
+  exponents, and a legal `Integer32` asks for a multi-billion-digit number.
+  They are read within the ranges RFC 3433 defines, and a value outside them is
+  taken as the MIB's own default rather than multiplied out.
+- **An OID with a negative arc spun the encoder for ever, and one with a
+  non-ASCII digit escaped every SNMP error handler**, so the device's status,
+  last poll time and error text froze permanently while one line per interval
+  filled the event log. Both are refused where they enter — a MIB file, an OID
+  override, the OID browser — and a poll that meets one still records its
+  result with the reason (`tests/test_parsers_hardening.py`).
+- **A table walk was bounded by row count only.** Sixteen thousand rows of MAC
+  addresses is well under a megabyte; the same count of 64 KB octet strings is
+  gigabytes on one poll worker. A walk also stops at 4 MiB of retained values
+  now, and every column walk carries a time budget derived from the device's
+  own poll interval — without one, an agent answering just inside its timeout
+  could hold a worker for twenty minutes on a single walk.
+- **A spoofed SNMPv3 Report could install an attacker-chosen engine id.** A
+  Report is exempt from the request-id filter by design, since dropping it
+  would turn a v3 resync into a timeout, so it is matched against the msgID of
+  the request it answers — the field RFC 3412 §7.2 has the receiver match, and
+  the one a forger cannot guess. A mismatch counts as a dropped stray and the
+  real exchange goes on waiting (`tests/test_snmpv3_diagnostics.py`).
+- **Reading a device's interfaces opened a UDP socket and decrypted the stored
+  credential once per interface.** One of each for the whole read now: on 32
+  interfaces, 33 sockets and 33 decrypts became one.
+- **An assigned custom MIB produced no metrics at all on a larger file,
+  silently.** One GET of every object in the file is hundreds of varbinds —
+  IP-MIB alone is 267 — and most agents answer `tooBig` well below that, which
+  RFC 3416 has carry an empty varbind list: no metric, no error, one wasted
+  round trip per device per poll. It is read in batches of 25, halving on
+  `tooBig` and remembering the size that worked (`tests/test_custom_mib_e2e.py`,
+  with a new `stub_agent_toobig.py`).
+- **The poller re-read the Nodes settings table twice per table walk** — about
+  thirty walks per switch poll, on the shared store lock, for two constants.
+  Both are cached when settings are saved.
+- **Per-device failure state and finished discovery sweeps were held for the
+  life of the process.** They are released when the device is deleted or the
+  sweep ends.
+- **A community string containing a comma is still refused, but the message no
+  longer prints the community.** That message reaches the device's stored error
+  field, the device event log, the API and any alert mail.
+- **Every poll asked the MIB store whether a vendor's arc was covered with a
+  prefix `LIKE`**, which gives the index a lower bound and then scans the rest
+  of the corpus: 9–30 ms at 120,000 objects, per device, per poll. A bounded
+  range answers in microseconds (`tests/test_mib_vendor_coverage.py`).
+- **Pruning device events, interface events, discovery jobs, samples and
+  hourly rollups ran as single `DELETE`s** holding the store lock for seconds —
+  reader stalls of 0.9–1.3 s measured — and the Settings page's maintenance
+  button issues exactly that delete from the request thread. They run in
+  lock-bounded batches now, like every other store.
+- **A device opened by link, search or a MAC/ARP hit switched to a different
+  device seconds later** when it was not on the first page of the list. The
+  list holds one page, not the fleet, so "not in this list" never meant "gone";
+  the selection is cleared only when the page is the whole result set.
+- **The tab re-downloaded polling profiles, device groups and MIB files on
+  every poll**, and redrew the Profiles, MIBs and Discovery tables while they
+  were off screen. Those three lists are read on opening the tab, again the
+  moment an edit made here changes one, and otherwise once a minute: 56 → 42
+  requests per 40 seconds idle, with an edit you make still showing
+  immediately.
+- **An open port dialog re-fetched the whole switch's interface list and
+  metric catalogue** to refresh one row. It asks for that one interface, and
+  looks the chart's two metric ids up once for the life of the dialog: 4.48 →
+  2.84 MiB over 31 seconds on a 500-port device.
+- **Bridge & RF charts were destroyed and rebuilt on every poll**, taking
+  whatever tooltip or keyboard focus was inside them with them. They update in
+  place, and their hour of history is re-read every 15 seconds rather than
+  three times a second.
+- **The shared device lookup behind every cross-tab device link downloaded the
+  whole device record for the whole fleet** — 1,513,393 bytes for 812 devices,
+  every 30 seconds, for each open tab. It asks for the seven columns it reads.
+- **Availability and Top-N CSV exports prefix a cell starting with `=`, `+`,
+  `-` or `@` with an apostrophe**, as every other export in the product already
+  did: a device name comes from its own sysName or from another operator, and a
+  spreadsheet opens such a cell as a live formula.
+- **Dialog headings show `&`, `<` and `>` in device and profile names
+  correctly**, and a device dialog whose details fail to load still names the
+  device rather than keeping the heading it opened with.
+- **The MAC-search answer, the discovery status line and the polling-profile
+  status line are announced to screen readers.** All three are plain elements
+  with no live-region role, so they were said only to whoever could see them.
+- **Sensor readings in the DOM and SFP tables are escaped**, like every other
+  cell in them.
+
+  The frontend fixes above are covered by `tests/test_frontend_contracts.py`
+  §49, twenty-eight checks, alongside browser evidence against an 812-device
+  instance.
+
+#### Alerts
+
+- **A custom rule whose key contained a quote or an angle bracket broke out of
+  the Rules table's markup** for everyone who could read Alerts. The key is
+  escaped like every other field in that table.
+- **The engine's five-second first-notification query and the overview
+  histogram scanned the whole `alerts` table** — 106 ms and 95 ms at a million
+  rows. Two indexes, one of them partial so it holds only the rows awaiting a
+  first notice, bring them to 0.1 ms and 11 ms.
+- **Bulk resolve and acknowledge bound one SQL placeholder per id.** On an
+  older SQLite, a thousand ids was a 500. They chunk like the Nodes bulk routes
+  (`tests/test_bulk_id_chunking.py`).
+- **Putting a group of devices into maintenance, or taking it out, committed
+  once per device** on the request thread while the engine ticked against the
+  same file. One commit for the whole selection: 500 commits and 41 ms became
+  one commit and 4 ms.
+- **Rules, templates and per-device threshold overrides were re-fetched every
+  ten seconds.** They are configuration, not live data: read on opening the
+  tab, again after any edit made here, and otherwise once a minute.
+- **Cancelling "Reset to default" on a template reopened whichever row was
+  selected**, rather than the template you were editing.
+- **The rule filter drop-down was rebuilt on every poll**, throwing away the
+  list an operator had open. It is written only when the list changes.
+
+<!-- TODO(lead): alerts lane -->
+
+#### NetPath
+
+- **Dragging a window selection rebuilt the entire SVG on every pointer
+  event.** The selection rectangle is one persistent shape moved in place.
+- **The timeline measured its pane ten times a second even when nothing had
+  changed.** Measuring forces a synchronous layout; it measures once, and again
+  on a resize.
+
+#### NetFlow
+
+- **Dragging a window selection rebuilt the entire SVG on every pointer
+  event**, re-serialising the whole dataset each time to decide whether
+  anything had changed. The selection rectangle is moved in place.
+
+#### SNMP traps
+
+- **The trap receiver's SNMPv3 user passwords were stored in plain text** in
+  `snmp.db`, and returned by the API to any account that can read the SNMP
+  module. They are encrypted at rest now, like every other stored password;
+  existing ones are moved into that store the first time the service opens the
+  database; and the Settings page shows only the user name and hash algorithm —
+  type a password only when setting or changing one, and leave it off the line
+  to keep the one already stored. On a host with no credential store, an
+  existing plaintext password is left where it is and logged rather than
+  blanked — the receiver goes on verifying the traps it verifies today — but it
+  is never returned by the API. (`tests/test_trap_v3_credentials.py`;
+  `CREDENTIAL-SECURITY.md` §11.)
+
+#### IPAM
+
+- **A refresh finishing after the operator left the tab redrew a hidden
+  page.** The tab is checked again once the fetches have landed.
+
+#### Wireless
+
+- **A channel reported as text by a controller was parsed as markup in the AP
+  detail pane.** It is escaped.
+- **The controller filter drop-down was rebuilt on every poll**; it is written
+  only when the list changes. And a refresh finishing after a tab switch no
+  longer redraws a hidden page.
+
+#### ConfigRX
+
+- **Bulk backup delete bound one placeholder per id**, the same 500 a thousand
+  ids produced in Alerts. It chunks.
+- **The filter drop-down was rebuilt on every poll**; it is written only when
+  the list changes.
+
+#### MAPPER
+
+- **Dragging a large selection redrew every attached link on every pointer
+  event**, which fires faster than the screen refreshes. The redraw is
+  coalesced to one per animation frame.
+- **The toolbar's enabled/disabled state was written ten times a second**
+  whether or not it had changed. It is written when it changes.
+
+#### Debug and Settings
+
+- **The event filter re-read the category boxes, the destination and the
+  search text once per event**, on every one-second poll, over a buffer of up
+  to 3,000 events. They are read once per draw and once per export.
+- **Static files were folded into the per-route timings' `<unrouted>` row**,
+  along with every 404 in it. Asset serving has its own `<static>` row, and a
+  static request costs one file check instead of two.
+
+One test note for the record: `tests/test_prune_lock_hold.py` carries a
+pre-existing intermittent lock-fairness assertion that trips under load
+independently of this work — three runs in six failed without the new indexes,
+none in six with them.
 
 ### 5.9.0 — Six asks
 

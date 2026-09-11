@@ -431,6 +431,50 @@ fourth setting).
 
 ---
 
+### Literal search text, batched prunes, and two indexes on `alerts` — 5.9.1
+
+`sqlitebase` gained the search-box half that `appdb`'s audit search had been
+carrying alone: `like_contains()`/`like_prefix()` escape `\`, `%` and `_` in
+the operator's text and `LIKE_ESCAPE` is the `ESCAPE '\'` clause each must be
+paired with. Every search box in the product feeds `LIKE`, where a typed `_`
+or `%` was a wildcard — `core_sw` matched `core-sw-1` — so `nodesdb`,
+`alertsdb`, `flowdb`, `syslogdb`, `ipamdb`, `configrxdb` and `appdb` all route
+through the two helpers now. `nodesmibdb` is the opposite change: its three
+vendor-coverage queries dropped `LIKE 'prefix.%'` for `oid >= 'prefix.' AND oid
+< 'prefix/'`, which selects the identical rows (`'/'` is `'.'`+1 and an OID is
+`[0-9.]`) while giving the index both bounds instead of one. That query runs on
+every poll of every device, and the prefix form scanned to the end of the
+corpus behind it: 9–30 ms at 120,000 objects.
+
+Prunes are batched the way `trim_to_size` already was. `nodesdb._prune_by_id`
+and `nodesseriesdb._prune_by_rowid` cut a by-age `DELETE` into `_delete_batches`
+runs over an id (or rowid) range, each batch its own transaction and each still
+carrying the original `WHERE`, so the range decides only how the sweep is cut up
+and never which rows go; a sweep interrupted half way has deleted fewer rows,
+never the wrong ones. The chunk bands differ because the tables do —
+`EVENT_PRUNE_CHUNK` 10,000 for `device_events`/`interface_events`/
+`discovery_jobs`, whose rows go in very nearly their index order, and
+`SAMPLE_PRUNE_CHUNK` 20,000 for `samples`/`samples_hourly`, where a contiguous
+rowid span touches nearly every leaf page of the `(metric_id, ts)` key whatever
+its size. Measured against `bench_prune`'s 5 ms reader, 400,000 rows: one
+2,594 ms lock hold and a 1,259 ms reader stall became 22 holds with a 70 ms
+median and a 278 ms stall. The Settings page's maintenance button is the case
+that matters — it passes 0, which matches every row, from the HTTP request
+thread.
+
+`alertsdb` adds two indexes: `ix_alerts_pending_notify` on `opened_ts`
+`WHERE last_notified_ts IS NULL`, partial so it holds only the handful of rows
+awaiting a first notice and the writer pays one entry per insert and one
+removal per `mark_notified`; and `ix_alerts_opened` on `opened_ts` for the
+overview histogram's window. The engine asks the first query on every five-
+second tick and both full-scanned the table: 106 ms and 95 ms at a million rows
+became 0.1 ms and 11 ms. `_commit_durable()` (commit plus
+`PRAGMA wal_checkpoint(FULL)`) is the other new `SqliteStore` helper, called by
+the handful of writers that store an operator-entered credential: most stores
+run `synchronous=NORMAL`, which in WAL mode does not fsync at commit, and "we
+said we stored your password" has to survive a power loss. It costs a few
+milliseconds on writes that happen a few times a year.
+
 ### Nodes split (5.0.0)
 
 Until 4.54 `nodes.db` held everything the module knows: the device
@@ -611,6 +655,20 @@ the off switch: `verify=False` skips the digest
 check and the downgrade refusal — the pre-5.8.0 behaviour — while still
 decrypting. The poller reads it once per poll and carries it, because
 `settings()` is a query and a walk is hundreds of exchanges.
+
+**A v3 Report is matched on its msgID — 5.9.1.** Report-PDUs are exempt from
+the request-id filter above, which leaves the discovery exchange — the one
+exchange whose entire answer is a Report — with only the source address and
+`v3_exchange`'s engine-id rule between a forged datagram and an
+attacker-chosen engine id; and that rule deliberately admits
+`usmStatsUnknownEngineIDs` under any engine id, since teaching one is what
+that Report is for. `Response.msg_id` is now kept rather than stepped over,
+`decode_response` takes `expect_msg_id`, and `_check_report_msg_id` raises
+`SnmpStray` for a Report carrying another — counted as a dropped stray, with
+the real exchange still waiting. `discovery_probe()` takes the probe's msgID
+from `session.next_request_id()` instead of the builder's fixed 1, and
+`v3_exchange` passes the msgID it sent alongside the request id. RFC 3412 §7.2
+is what has the receiver match this field.
 
 ### Vendor identification (`vendorid.py`, `enterprises.py`, `nodepoll.py`)
 
@@ -2974,6 +3032,43 @@ The lookup runs only on a deliberate search — Enter in the Find box sets
 `view.macSearchPending`, which `refresh()` consumes once — never on the
 five-second refresh, because a dialog that reopens itself every five
 seconds is unusable.
+
+### Walk bounds, one session per interface read, and custom-MIB chunking (`nodepoll.py`) — 5.9.1
+
+Three limits the walker did not have. `_WALK_MAX_BYTES` (4 MiB of retained
+values, counted as `len(str(value))`) stops a walk that the row cap cannot:
+16,384 rows of MAC addresses is well under a megabyte, 16,384 rows of 64 KB
+octet strings is gigabytes on one poll worker. A `_walk_column_detail` called
+with no `deadline` derives one from the device's own poll interval —
+`max(_WALK_BUDGET_FLOOR_S, _WALK_BUDGET_FRACTION × interval)`, 10 s and 0.5 —
+the way `_poll_interfaces` already derives its interface budget; without it an
+agent answering each GETBULK just inside its timeout holds a worker for twenty
+minutes on one walk. Either cap is logged once, not per row, and `hit_cap` now
+carries the reason text rather than a boolean so the log line says which of the
+two stopped it. And the two walk settings are read once into `_walk_settings`
+at `reconfigure()`/`_read_pool_settings` rather than `db.settings()` twice per
+column walk — about thirty walks per switch poll, each taking the shared nodes
+lock for two constants. `_walk_limits()` falls back to the live table when the
+cache is empty, so a poller driven directly by a script or a test still reads
+the stored value.
+
+`_poll_interfaces` opens one `_Session` and decrypts one `Credential` for the
+whole read and passes both down through `_interface_varbinds` and
+`_snmp_get_on` (the GET counterpart of the `_walk_request`/`_snmp_get_next`
+split), closing the session and dropping the credential in a `finally`. It was
+one ephemeral UDP socket and one decrypt of the stored v3 password per
+interface: 33 of each for 32 interfaces, 513 on a full chassis, per device, per
+poll. Custom MIBs go the other way — `_custom_mib_values` reads them in
+`_CUSTOM_MIB_BATCH` (25) varbinds at a time, halving into `_get_batch` on an
+`error_status == 1` (tooBig) Response the way `_walk_column_detail` already
+halves a GETBULK. One GET of a whole file is hundreds of varbinds (IP-MIB
+alone is 267), most agents refuse well below that, and RFC 3416 has a tooBig
+Response carry an empty varbind list — so a large assigned MIB produced no
+metrics and no error at all. `_get_batch` joins the per-device caches
+`_forget_devices` prunes, which now also drops `_auth_failing`,
+`_access_denied`, `_downgraded` and `_method_seeded`, and pops finished
+discovery jobs (a finished sweep otherwise kept its settings dict, an `_owners`
+entry per address swept and a dead `Thread` for the life of the process).
 
 ### ARP cache walk (`nodeoids.py`, `nodepoll.py`, `nodesdb.py`, `nodes.js`) — 5.7.0
 
@@ -5480,6 +5575,26 @@ fields converted using the header's boot time) and clamps anything more
 than 30 days old or an hour in the future to "now" — one exporter with a
 wrong clock would otherwise stretch every chart's time axis to fit it.
 
+**Two bounds on what one datagram may cost — 5.9.1.** `MAX_FLOWS_PER_PACKET`
+(4096) is the budget `_decode_v9`/`_decode_ipfix` pass down to `_read_data` and
+spend across the sets in one packet; nothing in the wire format bounds this, so
+a template of a single short field turned one 64 KB datagram into ~65,000
+`Flow` objects, and the collector's queue — bounded in datagrams on the
+assumption of about thirty flows each — became a ceiling of a billion buffered
+flows. A truncated set counts `stats["truncated_flows"]`, which the collector
+mirrors into its own counters and names in its status line. `MIN_RECORD_BYTES`
+(4) is the other half: a zero-length record was already refused because it
+never advanced the read offset, but a one- or two-byte one yields a record per
+byte of the set, so anything below a single real counter or address IE drops
+the template. And `learned_rates` is a dict keyed like `self.sampling` rather
+than a list, bounded at `MAX_SAMPLING` with the latest rate winning, drained
+under its own lock by `drain_learned_rates(limit)`: each entry costs the flow
+writer a retention-window `UPDATE`, and a sender cycling `flowSamplerID`
+appended one per options record for ever. `collector.MAX_RESAMPLE_PER_FLUSH`
+(64) is the drain limit; the remainder waits for the next flush, so a
+legitimately announced rate still rewrites its own window, one flush later at
+worst.
+
 ### Collector threading (`collector.py`)
 
 `Collector` subclasses `udpsock.UdpReceiver` (bind, the receive-thread
@@ -5970,6 +6085,29 @@ joined, grouped or aggregated — a child table would add write
 amplification on the hot insert path to buy an ability nothing asks for,
 and free-text search over the varbinds is already served by the
 denormalized `varbind_text` column.
+
+**The v3 users' passwords are their own table — 5.9.1.** `trap_v3_users`
+(`name`, `auth_proto`, `auth_pass_enc`) holds them DPAPI-encrypted, for
+`alertsdb.smtp_credential`'s reason: a blob is not a string or a number, and
+the `settings` row is served by `/api/config` to every account holding
+`snmp: read`, which is the wrong place for a password (`CREDENTIAL-SECURITY.md`
+§11). The textarea format is unchanged — `parse_v3_user_lines` reads
+`name / SHA / password` lines and `v3_user_lines` writes them back without the
+password — so `settings()` always answers `name / SHA`, plus a
+`v3_users_stored` count so the dialog can say a credential exists without
+showing it. A line carrying a password sets or replaces that user's; a line
+without one, or one whose password is nothing but asterisks, keeps what is
+stored; a name no longer listed loses its password with its line.
+`_write_v3_users` encrypts every password before it writes anything, so a host
+that cannot encrypt refuses the save whole. `_migrate_v3_passwords` runs from
+`_after_open` at every open and moves anything still in the clear across,
+blanking it out of the settings row; on a host with no credential store it logs
+and leaves the row alone rather than blanking it, since blanking would stop the
+receiver verifying traps it verifies today — `_legacy_v3_password` reads it
+from there, and `settings()` still refuses to hand it to the API. The decoder
+never sees the table: `snmptrapd` sets `Decoder.secret_source` to
+`SnmpTrapDatabase.v3_user_secret`, and `_configure_users` asks it by name for
+any line that carries no password.
 
 ---
 
@@ -7444,6 +7582,42 @@ because one `Handler` instance now serves every request on a connection.
 `tests/test_static_headers.py` sends the exact refused-POST-then-GET
 sequence over one connection.
 
+**One `Content-Length` parser, a drain that is not a body, and a ceiling on
+connections — 5.9.1.** `_content_length()` is the only place the header is
+read, for `_body()` and `_drain_request_body()` alike: ASCII digits only (so
+not `+5`, ` 5 ` or `3_1`, all of which `int()` takes), a single value, never
+negative. A negative one reached `read(-1)` — read to EOF, no cap, no sign-in
+needed — and two disagreeing values let a front end and this server frame the
+same bytes differently, which is request smuggling; the first is a 400, the
+second a 411 (RFC 9110 §8.6). The drain has its own much smaller cap,
+`MAX_DRAIN_BYTES` (64 KiB), rather than `MAX_BODY_BYTES`: reading 16 MB before
+writing a 401 is work an unauthenticated caller should not be able to ask for,
+and above it the connection closes instead. `LARGE_BODY_PATHS` is matched whole
+rather than as a prefix, so the MIB upload's ~85 MB ceiling no longer covers
+`/api/nodes/mibs/<id>/resolve` and the DELETE beside it. And `_route` checks a
+route's permission **before** reading the body, not after: almost every route
+carries a fixed `(module, level)`, so a caller with no grant is refused without
+the server buffering the route's whole body cap first. Only the two callable
+requirements need the body to know what to ask for, and they are still gated
+once it has been read.
+
+`BoundedThreadingHTTPServer` adds the other two. `MAX_CONNECTIONS` (512) is a
+`BoundedSemaphore` taken in `process_request` and released in
+`process_request_thread` — one accepted connection is one thread with its own
+stack held for up to `Handler.timeout`, so without a ceiling a few thousand
+half-open sockets are a few thousand threads; bounded rather than plain so a
+mismatched release raises instead of leaking a slot. `handle_error` swallows
+`BrokenPipeError`/`ConnectionResetError`/`TimeoutError` and nothing else: a
+browser closing a tab mid-poll otherwise put a ~1.7 KB traceback on stderr per
+aborted request, and `log_message` is silenced here on purpose. `_static` sets
+`_route_template` to `"<static>"` so the Debug page's per-route latency shows
+asset serving instead of folding it, and every 404 with it, into `<unrouted>`;
+it also drops the `isfile()` that ran before `StaticCache.get`, which does its
+own `stat`. `WebServer.stop()` waits `DRAIN_GRACE_S` (2 s) for `access.active`
+to fall to zero between `shutdown()` and `server_close()` — `daemon_threads`
+means no handler is joined, so without it `service.shutdown()` could close a
+store under a handler mid-query.
+
 ### `web/api.py`
 
 One function per route, `(service, params, body, *path_args) -> dict`
@@ -7790,6 +7964,37 @@ Panel splitters (`data-splitter` attributes) and table column widths
 persist to `localStorage`, keyed by page/table name, independent of
 anything server-side — a layout tuned for one screen survives a reload
 without needing a server round trip or a per-user setting.
+
+### Configuration is not live data, and a brush is not a redraw (`nodes.js`, `alerts.js`, `netflow.js`, `netpath.js`) — 5.9.1
+
+Two shapes, each applied in two modules. The first: `loadNodesConfig()` and
+`alerts.js`'s `loadConfig()` hold the lists that change when somebody edits one
+rather than six times a minute — polling profiles, device groups and MIB files
+in Nodes; rules, rule extras, templates and the fleet-wide device thresholds in
+Alerts. Each is read on the first refresh, again the moment `view.configAt` is
+set to 0 (every editor in either file does that beside its
+`App.refreshNow(...)`, so an edit you make shows immediately), and otherwise on
+a `CONFIG_MAX_AGE_MS` 60 s clock so another operator's edit still arrives on
+its own. A 60 s clock rather than `config_version`: the API does not bump that
+counter for profile, group or MIB writes. The same reasoning gives the
+discovery jobs list its own cadence — every tick while the DISCOVERY pane is up
+or a sweep is running, otherwise `DISC_JOBS_MAX_AGE_MS` 15 s, because the
+page-level "discovery found N" strip and the auto-approval dialog follow it
+from any sub-view — and the RF charts `RF_SERIES_MAX_AGE_MS` 15 s for their
+hour of history. Measured on the Nodes tab: 56 → 42 requests per 40 s idle.
+
+The second: `netflow.js`'s `drawChart()` and `netpath.js`'s `drawTimeline()`
+both skip a redraw when a signature says nothing changed, and both used to put
+the drag's own extent in that signature — so every `pointermove` missed it,
+rebuilt the whole SVG and re-stringified `view.data` to do it. The brush is one
+persistent `<rect>` appended `visibility: hidden` and moved in place by
+`paintBrush()`, which the pointer handlers call instead of the draw; the draw
+calls it once itself, so a chart rebuilt mid-drag by a refresh landing gets the
+brush back from `view.drag`. `netpath.js` also caches the timeline's measured
+box in `timelineSize` — `getBoundingClientRect` forces a synchronous layout and
+`fastTick` draws ten times a second — re-measuring on the `resize` and
+`panes-resized` listeners, and not caching a pane that measured 0 so the
+minimum fallback is not kept once a real layout arrives.
 
 ### Cross-tab device links (`App.deviceNameLink`, `app.js`) — 5.4.0
 

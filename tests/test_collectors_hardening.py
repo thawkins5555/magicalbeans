@@ -1441,6 +1441,26 @@ def test_c9_netpath_probing_tracing_and_v6_listeners() -> None:
     check(match is not None and match.group(1) == "93.184.216.34",
           "and so does tracert's")
 
+    # --- a hop token is stored as an address only if it is one ------------
+    # Whatever the unix parser keeps here is stored in the trace, re-pinged
+    # by HopProber and handed to ping's argv as its last element, so a
+    # build or locale whose output puts extra text on a line matching
+    # _HOP_LINE must not be able to put that text there. _parse_windows has
+    # always checked with _is_ip; this is the same check on the same token.
+    output = (" 1  10.0.0.254  1.0 ms\n"
+              " 2  -oProxyCommand=x  2.0 ms\n"
+              " 3  2001:db8::1  3.0 ms\n")
+    hops = tracer._parse_unix(output)
+    addresses = [addr for hop in hops for addr in hop.addrs]
+    check(addresses == ["10.0.0.254", "2001:db8::1"],
+          f"only the tokens that parse as addresses are stored ({addresses})")
+    check(hops[1].lost == 1 and not hops[1].addrs,
+          f"a hop whose token is not an address counts as unanswered rather "
+          f"than naming it ({hops[1].addrs}, lost={hops[1].lost})")
+    plain = tracer._parse_unix(" 1  10.0.0.254  1.0 ms  2.0 ms\n")
+    check(plain[0].addrs.get("10.0.0.254") == [1.0, 2.0],
+          f"an ordinary hop is unchanged ({plain[0].addrs})")
+
     # --- dual-stack listeners --------------------------------------------
     check(udpsock.normalise_source("::ffff:10.1.2.3") == "10.1.2.3",
           "an IPv4-mapped source address folds back to its dotted quad")

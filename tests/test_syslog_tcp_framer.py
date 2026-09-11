@@ -126,6 +126,115 @@ finally:
     db.close()
 
 
+# ------------------------------------------- the allow list, per connection
+#
+# allowed_sources was applied in _enqueue, per message. A source outside it
+# still took one of the (default 64) client slots and one thread, for up to
+# 30 seconds an idle period — so anyone who could reach the port could hold
+# every slot while `rejected` climbed and the counters read as if the allow
+# list were working.
+
+print("\nT2  syslog TCP: the allow list is consulted before a slot is taken")
+
+db = SyslogDatabase(":memory:")
+collector = SyslogCollector(db)
+assert collector.start({"accept_udp": False, "accept_tcp": True, "port": 0,
+                        "tcp_port": 0, "bind_address": "127.0.0.1",
+                        "allowed_sources": "10.99.99.99",
+                        "max_tcp_clients": 4})
+port = collector._tcp.getsockname()[1]
+hoggers = []
+try:
+    for _ in range(8):
+        hog = socket.create_connection(("127.0.0.1", port), timeout=5)
+        hoggers.append(hog)
+    deadline = time.time() + 3.0
+    while time.time() < deadline and collector.counters["rejected"] < 8:
+        time.sleep(0.05)
+    check("a connection from a source outside the allow list is refused at "
+          "accept() and counted",
+          collector.counters["rejected"] >= 8, collector.counters)
+    check("...so it never takes one of the client slots",
+          collector.counters["tcp_clients"] == 0, collector.counters)
+    check("...and none of them is counted as a slot refusal, which would say "
+          "the transport was full rather than the sender unknown",
+          collector.counters["tcp_refused"] == 0, collector.counters)
+    check("nothing is stored from a refused connection",
+          collector.counters["messages"] == 0, collector.counters)
+finally:
+    for hog in hoggers:
+        try:
+            hog.close()
+        except OSError:
+            pass
+    collector.stop()
+    db.close()
+
+# The default (empty allow list, auto_accept on) is unchanged.
+collector, db, port = start_collector()
+try:
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sock.sendall(b"<134>Sep  5 00:00:00 host app: hello\n")
+    deadline = time.time() + 3.0
+    while time.time() < deadline and collector.counters["messages"] < 1:
+        time.sleep(0.05)
+    check("with no allow list configured a connection is accepted exactly as "
+          "before", collector.counters["messages"] == 1, collector.counters)
+    check("...and it holds a client slot while it is open",
+          collector.counters["tcp_clients"] == 1, collector.counters)
+    sock.close()
+finally:
+    collector.stop()
+    db.close()
+
+
+# ------------------------------------- the rate buckets under several threads
+#
+# _buckets is reached from the UDP receive thread and from every
+# syslog-tcp-client thread at once. get/move_to_end against another thread's
+# eviction loop could raise KeyError for a key just evicted, and the message
+# was dropped as a receive error.
+
+print("\nT3  syslog rate buckets survive being hammered from many threads")
+
+import threading  # noqa: E402
+
+from netpath.syslogd import MAX_RATE_SOURCES  # noqa: E402
+
+db = SyslogDatabase(":memory:")
+collector = SyslogCollector(db)
+assert collector.start({"accept_udp": True, "accept_tcp": False, "port": 0,
+                        "bind_address": "127.0.0.1", "per_source_rate": 1000})
+errors = []
+try:
+    def hammer(offset):
+        try:
+            now = time.time()
+            for i in range(5_000):
+                source = f"10.{(i + offset) % 256}.{(i // 256) % 256}.1"
+                collector._within_rate(source, now)
+                collector._enqueue(b"<134>x", source)
+        except Exception as exc:                     # noqa: BLE001
+            errors.append(repr(exc))
+
+    threads = [threading.Thread(target=hammer, args=(n,)) for n in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    check("no exception escapes 80,000 bucket updates from 16 threads",
+          not errors, errors[:3])
+    check(f"and the bucket table stays bounded at MAX_RATE_SOURCES "
+          f"({MAX_RATE_SOURCES})",
+          len(collector._buckets) <= MAX_RATE_SOURCES, len(collector._buckets))
+    accepted = collector.counters["messages"] + collector.counters["throttled"]
+    check("every message is counted exactly once, none lost to a torn +=",
+          accepted == 80_000, dict(collector.counters))
+finally:
+    collector.stop()
+    db.close()
+
+
 if FAILURES:
     print(f"\nFAILED: {len(FAILURES)} check(s): {', '.join(FAILURES)}")
     raise SystemExit(1)

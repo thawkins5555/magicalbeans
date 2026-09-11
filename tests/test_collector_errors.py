@@ -470,6 +470,26 @@ def test_r6_syslog_strips_control_and_ansi_bytes() -> None:
           f"each line's own words stay intact and space-separated "
           f"({multi.message!r})")
 
+    # C1 (U+0080-U+009F) is the other half of the same primitive: U+009B is
+    # the 8-bit CSI introducer, and its UTF-8 encoding decodes cleanly
+    # through data.decode("utf-8", "replace"), so the class stopping at
+    # \x7f left "\x9b2J" -- CSI 2J, clear screen -- in the stored message.
+    check(syslogparse._strip_control("a\u009b2Jb") == "a 2Jb",
+          "the 8-bit CSI introducer is stripped like ESC is")
+    csi = syslogparse.parse(b"<14>a\xc2\x9b2Jb", "10.0.0.1")
+    check("\u009b" not in csi.message and "\u009b" not in csi.raw,
+          f"...through a real datagram, in message and raw both "
+          f"({csi.message!r})")
+    check(syslogparse._strip_control("a\u202eb\u2066c") == "a b c",
+          "the bidi overrides, which reorder everything rendered after "
+          "them, go the same way")
+    accented = syslogparse.parse(
+        "<134>Sep  5 00:00:03 host app: h\u00e9llo w\u00f6rld".encode(),
+        "10.0.0.1")
+    check(accented.message == "h\u00e9llo w\u00f6rld",
+          f"while printable non-ASCII above the C1 range is untouched "
+          f"({accented.message!r})")
+
     plain = syslogparse.parse(b"<134>Sep  5 00:00:01 host app: plain message",
                               "10.0.0.1")
     check(plain.message == "plain message",
