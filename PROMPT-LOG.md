@@ -158,3 +158,7 @@ any source). Every fix carries a test shown red before it. Report in
 `CODE-REVIEW.md`; release notes under 5.9.1 in `CHANGELOG.md`; internals and
 features updated where a mechanism or a screen changed. Full-suite pass and
 the browser walk follow, once, at the end.
+
+**"push to main once complete"** — lifts the earlier hold on `main`.
+→ After the final full-suite pass and the browser walk, `main` is
+fast-forwarded to this branch and pushed, so the estate updates to 5.9.1.
