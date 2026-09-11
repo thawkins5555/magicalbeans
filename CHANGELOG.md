@@ -387,7 +387,26 @@ are there rather than repeated below.
   goes in those headers; every other account is told whether each is set,
   which is the rule a device's stored community already followed.
 
-<!-- TODO(lead): alerts lane -->
+- **An alert muted, or covered by a maintenance window, while its first
+  notification was held lost that notification for good** once the hold was an
+  hour old: the backlog floor exempted only maintenance *mode*, and the
+  re-notify sweep's own guard then skipped it for ever. The held notice is now
+  stamped as held and goes out the moment the silence lifts
+  (`tests/test_alert_notify_rollup.py`, section 6).
+- **A webhook's URL was written verbatim into delivery history**, where for
+  Slack, Teams and PagerDuty the path is the credential. History records the
+  destination host only.
+- **The engine read every DHCP lease and every IPAM conflict ever recorded on
+  every five-second tick** — 24,000 leases cost about 100 ms a tick under the
+  IPAM lock for a figure that changes four times an hour — re-queried the rules
+  table once per roll-up child, and looked a sender's name up once per drained
+  syslog or trap row. All four now come from one grouped query, a cursor-scoped
+  read, or the tick's own snapshot.
+- **The sweep that closes NetPath alerts whose destination was disabled or
+  deleted saw only the first 300 open alerts per rule.** It sees them all.
+- **Email and webhook counters were incremented from the sender threads without
+  a lock** and could under-report deliveries. They are bumped under the lock
+  the engine already holds for the breaker.
 
 #### NetPath
 
@@ -397,11 +416,29 @@ are there rather than repeated below.
   changed.** Measuring forces a synchronous layout; it measures once, and again
   on a resize.
 
+- **A traceroute token that is not an address was stored as a hop and re-pinged.**
+  A hop is recorded only when the token parses as an IP address; otherwise the
+  probe is counted lost, as the Windows parser already did.
+
 #### NetFlow
 
 - **Dragging a window selection rebuilt the entire SVG on every pointer
   event**, re-serialising the whole dataset each time to decide whether
   anything had changed. The selection rectangle is moved in place.
+
+- **A sender varying `flowSamplerID` could queue unlimited sampling-rate
+  rewrites**, each a retention-window UPDATE on the flow writer under the
+  flows.db lock: 880 KB of UDP bought about fifteen minutes of flow-collection
+  outage. Learned rates are one entry per sampler, capped, and at most 64 are
+  rewritten per flush; the rest wait for the next one.
+- **One 64 KB datagram could decode to 65,000 flows (about 48 MB in memory).**
+  A packet now yields at most 4,096 records, a template whose record is under
+  four bytes is refused, and the collector's status line says how many records
+  were truncated.
+- **An undecodable datagram, and a packet from a never-seen exporter, each
+  filed their own event-log line**, so a flood of runts emptied the 3,000-entry
+  log of everything useful. Both are logged at most once a minute; the error
+  counters still carry the full volume.
 
 #### SNMP traps
 
@@ -420,6 +457,18 @@ are there rather than repeated below.
   USM user name on v3 — only to accounts that can change SNMP settings.**
   Everyone else sees the column blank and a flag saying whether one is set, as
   the Nodes device list already did.
+
+#### Syslog
+
+- **A TCP connection from a source outside `allowed_sources` took one of the
+  client slots** until it idled out, so an unlisted host could hold every slot
+  while the counters said the allow list was working. The list is applied at
+  accept, before a slot is taken. The per-source rate buckets and the message
+  counters, touched from the UDP thread and every TCP client thread, are
+  updated under a lock.
+- **C1 control characters — notably the 8-bit CSI introducer — and Unicode
+  bidi overrides survived sanitisation** and reached CLI and export consumers.
+  They are stripped like ESC and NUL.
 
 #### IPAM
 
@@ -442,6 +491,20 @@ are there rather than repeated below.
   the list changes.
 - **The device list read every device's backup settings one device at a
   time.** One query for the page.
+
+- **A search or compliance pattern like `(x+){1,100}` was accepted and could
+  peg a CPU core indefinitely** — the nested-repetition check exempted bounded
+  outer repeats whatever the bound, and one `search()` call cannot be
+  interrupted by the per-line budget. A counted repeat of an already-repeating
+  group is refused above 4; `(\d{1,3}\.){3}` and other small fixed repeats
+  still compile.
+- **SNMP communities in Siemens SCALANCE (`snmp community x ro`) and Ubiquiti
+  airOS (`snmp.1.community=`) configurations were stored in the clear**: every
+  redaction pattern anchored on the Cisco spelling. Both are redacted now,
+  along with airOS wireless keys.
+- **A multi-megabyte capture took seconds of CPU per device in the SSH read
+  loop**, re-joining the whole buffer on every read to inspect its last 4,096
+  characters. It keeps a rolling tail: a 20 MB capture went from 2.7 s to 6 ms.
 
 #### MAPPER
 
