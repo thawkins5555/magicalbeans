@@ -1953,30 +1953,40 @@ end
         SERVICE.access_log = saved_access_log
 
     # --------------------------------------------- D26 config_version is atomic
-    # `self.config_version += 1` is a read, an add and a store, so a thread
-    # switch between them loses one of two concurrent saves — and the browser
-    # refetches /api/config only when the number moves. Enough bumps, and a
-    # switch interval short enough to land inside one, that the race is not
-    # left to luck.
-    def bump_many():
-        for _ in range(5000):
-            SERVICE.bump_config()
+    # `self.config_version += 1` is a read, an add and a store. Whether a
+    # thread switch can land between them is an interpreter detail — CPython
+    # 3.11 does not check its eval breaker inside that sequence, so the lost
+    # update cannot be provoked here — which is exactly why the guarantee is
+    # asserted against the lock rather than against luck: while the lock is
+    # held, a bump waits, and it lands the moment the lock is free.
+    lock = getattr(SERVICE, "_config_lock", None)
+    landed = threading.Event()
+    start_version = SERVICE.config_version
+    if lock is None:
+        check("D26 the version bump is serialised", False,
+              "bump_config takes no lock")
+    else:
+        waiter = threading.Thread(
+            target=lambda: (SERVICE.bump_config(), landed.set()))
+        with lock:
+            waiter.start()
+            blocked = not landed.wait(0.5)
+        waiter.join(timeout=5)
+        check("D26 the version bump is serialised",
+              blocked and landed.wait(5), f"blocked={blocked}")
+        check("D26 …and still lands once", SERVICE.config_version
+              == start_version + 1,
+              f"{start_version} -> {SERVICE.config_version}")
 
     start_version = SERVICE.config_version
-    saved_interval = sys.getswitchinterval()
-    sys.setswitchinterval(1e-6)
-    try:
-        bumpers = [threading.Thread(target=bump_many) for _ in range(8)]
-        for one in bumpers:
-            one.start()
-        for one in bumpers:
-            one.join()
-    finally:
-        sys.setswitchinterval(saved_interval)
-    check("D26 forty thousand concurrent bumps are forty thousand increments",
-          SERVICE.config_version == start_version + 40_000,
-          f"{start_version} -> {SERVICE.config_version}, "
-          f"{start_version + 40_000 - SERVICE.config_version} lost")
+    bumpers = [threading.Thread(target=SERVICE.bump_config) for _ in range(50)]
+    for one in bumpers:
+        one.start()
+    for one in bumpers:
+        one.join()
+    check("D26 fifty concurrent bumps are fifty increments",
+          SERVICE.config_version == start_version + 50,
+          f"{start_version} -> {SERVICE.config_version}")
 
     return 0
 

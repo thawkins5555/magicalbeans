@@ -2,6 +2,7 @@ import base64
 import http.client
 import json
 import os
+import socket
 import sys
 import time
 
@@ -140,8 +141,60 @@ try:
     assert metric["label"] == "testScalar", metric
     print("custom MIB scalar polled and stored under its own name with the right value OK")
 
-    print("ALL CUSTOM-MIB E2E ASSERTIONS PASSED")
 finally:
     server.stop()
     service.shutdown()
     stub.kill()
+
+
+# ------------------------------------------- a MIB too large for one GET
+#
+# _poll_custom_mib put every resolved object of the file into ONE GET:
+# IP-MIB alone is 267 varbinds, and an agent that will not answer that many
+# replies tooBig(1) with an empty varbind list (RFC 3416). Nothing raised,
+# nothing was logged and no metric was ever produced -- for a MIB
+# _auto_assign_mib had attached with no operator involvement.
+
+from netpath.nodepoll import NodePoller
+from netpath.nodesdb import NodesDatabase
+
+big_stub, big_port = spawn_stub("stub_agent_toobig.py", "10")
+nodepoll_mod.DEFAULT_SNMP_PORT = big_port
+try:
+    db = NodesDatabase(os.path.join(TMPDIR, "toobig.db"))
+    group_id = db.ensure_default_group()
+    db.update_group(group_id, snmp_version=1, community="public",
+                    snmp_timeout_s=1.0, snmp_retries=0)
+    mib_id = db.add_mib_file("big.mib", "BIG-MIB", 100, [], "")
+    db.replace_mib_objects(mib_id, [
+        {"name": f"bigScalar{n:03d}", "oid": f"1.3.6.1.4.1.99999.{n}",
+         "description": "", "syntax": "INTEGER", "enums": None,
+         "is_notification": False}
+        for n in range(1, 101)])
+    device_id = db.add_device("127.0.0.1", "toobig-device", group_id=group_id,
+                              ping_enabled=0, mib_file_id=mib_id)
+    poller = NodePoller(db)
+    device = db.device(device_id)
+    metrics = poller._poll_custom_mib(device, db.effective_config(device), mib_id)
+    values = {key: value for key, _label, _unit, _kind, value in metrics}
+    assert len(values) == 100, (len(values), sorted(values)[:5])
+    assert values["mib_bigScalar001"] == 1 and values["mib_bigScalar100"] == 100, \
+        (values.get("mib_bigScalar001"), values.get("mib_bigScalar100"))
+    print(f"a 100-object MIB against an agent that refuses more than 10 "
+          f"varbinds produced all {len(values)} metrics OK")
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.settimeout(2.0)
+    probe.sendto(b"BIGGEST", ("127.0.0.1", big_port))
+    biggest = int(probe.recv(64))
+    probe.close()
+    assert biggest <= 25, biggest
+    learned = poller._get_batch.get(device_id)
+    assert learned is not None and learned <= 10, learned
+    print(f"the largest GET it ever sent was {biggest} varbinds, and the "
+          f"batch size this agent takes ({learned}) is remembered OK")
+    db.close()
+finally:
+    big_stub.kill()
+
+print("ALL CUSTOM-MIB E2E ASSERTIONS PASSED")

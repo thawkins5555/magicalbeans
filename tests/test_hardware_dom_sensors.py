@@ -414,13 +414,15 @@ finally:
 # used as EXPONENTS: raw x 10^(3*(scale-9)) / 10^precision. An agent
 # answering scale = 2147483647 -- a perfectly legal Integer32 -- had
 # CPython build a multi-billion-digit integer and never return, on a poll
-# worker and, through read_dom/read_hardware, on an HTTP thread too. Run
-# in a child process under a timeout: an unfixed tree does not fail these
-# assertions, it hangs on them.
+# worker and, through read_dom/read_hardware, on an HTTP thread too. Both
+# halves run in a child process under a timeout: an unfixed tree does not
+# fail these assertions, it hangs on them, and a big-integer multiply
+# holds the GIL, so a thread with a join timeout would not come back
+# either.
 
-SENSOR_PROBE = f"""
+SENSOR_PROBE = """
 import sys
-sys.path.insert(0, {REPO_ROOT!r})
+sys.path.insert(0, {root!r})
 from netpath.nodepoll import NodePoller
 
 poller = NodePoller.__new__(NodePoller)
@@ -434,9 +436,30 @@ assert poller._scaled_sensor_value(5, 8, 1) == 0.0005, \\
 print("ok")
 """
 
+READ_HARDWARE_PROBE = """
+import sys, tempfile, os
+sys.path.insert(0, {root!r})
+import netpath.nodepoll as nodepoll_mod
+from netpath.nodesdb import NodesDatabase
+from netpath.nodepoll import NodePoller
 
-def run_probe(source: str, seconds: float = 30.0):
-    """(finished, stdout) for a snippet run in its own interpreter."""
+nodepoll_mod.DEFAULT_SNMP_PORT = {port}
+db = NodesDatabase(os.path.join(tempfile.mkdtemp(prefix="wild_scale_"), "nodes.db"))
+gid = db.ensure_default_group()
+db.update_group(gid, snmp_version=1, community="public", snmp_timeout_s=1.0,
+                snmp_retries=0)
+did = db.add_device("127.0.0.1", name="hw-6", group_id=gid)
+db.replace_interfaces(did, [{{"if_index": 1, "descr": "Gi0/1"}}])
+result = NodePoller(db).read_hardware(did)
+sensors = {{s["entity"]: s["value"] for s in result["sensors"]}}
+assert set(sensors) == {{1, 2, 3, 4, 5}}, sensors
+assert sensors[1] == 451.0, sensors
+print("ok")
+"""
+
+
+def run_probe(source: str, seconds: float = 40.0):
+    """(finished, output) for a snippet run in its own interpreter."""
     try:
         done = subprocess.run([sys.executable, "-c", source], timeout=seconds,
                               capture_output=True, text=True)
@@ -445,29 +468,18 @@ def run_probe(source: str, seconds: float = 30.0):
     return done.returncode == 0, (done.stdout + done.stderr).strip()
 
 
-finished, output = run_probe(SENSOR_PROBE)
+finished, output = run_probe(SENSOR_PROBE.format(root=REPO_ROOT))
 check("a sensor row quoting scale 2147483647 and precision -2147483648 is "
       "decoded (at the MIB's own default scale) instead of pinning the "
       "worker for ever", finished, output)
 
-# The real read path, through a stub answering the same nonsense.
 stub, port = spawn_stub("stub_agent_ups_env.py", "wild_scale")
-nodepoll_mod.DEFAULT_SNMP_PORT = port
 try:
-    db = new_nodes_db("wild_scale")
-    did = device_against(db, "hw-6")
-    db.replace_interfaces(did, [{"if_index": 1, "descr": "Gi0/1"}])
-    poller = NodePoller(db)
-    started = time.time()
-    result = poller.read_hardware(did)
-    elapsed = time.time() - started
-    sensors = {s["entity"]: s for s in result["sensors"]}
-    check("read_hardware finishes against an agent answering an out-of-range "
-          "entPhySensorScale on every row", elapsed < 20.0, f"{elapsed:.1f}s")
-    check("...and every sensor row still comes back, read at scale 9",
-          set(sensors) == {1, 2, 3, 4, 5} and sensors[1]["value"] == 451.0,
-          sorted((e, s["value"]) for e, s in sensors.items()))
-    db.close()
+    finished, output = run_probe(
+        READ_HARDWARE_PROBE.format(root=REPO_ROOT, port=port))
+    check("read_hardware -- the HTTP thread's own path -- finishes against an "
+          "agent answering an out-of-range entPhySensorScale on every row, "
+          "with every sensor read at scale 9", finished, output)
 finally:
     stub.kill()
 

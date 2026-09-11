@@ -149,6 +149,33 @@ def main():
 
     poller._stop.set()
     thread.join(timeout=3)
+
+    # ------------------------------------- a walk reads no settings either
+    #
+    # _read_pool_settings exists so a scheduling pass costs no settings
+    # read; the poll workers then read the table twice per column walk
+    # (snmp_walk_max_rows, then snmp_bulk_max_repetitions from
+    # _bulk_settings), on the shared nodes-db lock, about thirty times per
+    # device per poll. No agent here: the walk fails on the first request
+    # against a port nothing is bound to, which is after both reads.
+
+    poller.error = None
+    walk_id = db.add_device("127.0.0.1", "walk-target", group_id=group_id,
+                            snmp_version=1, community="public",
+                            snmp_timeout_s=0.2, snmp_retries=0)
+    poller._read_pool_settings(db.settings())
+    device = db.device(walk_id)
+    config = db.effective_config(device)
+    with StatementCounter(db._conn) as counter:
+        poller._walk_column(device, config, "1.3.6.1.2.1.2.2.1.1")
+    reads = [statement for statement in counter.statements
+             if "FROM settings" in statement]
+    check(not reads,
+          f"one column walk reads the settings table {len(reads)} time(s) "
+          f"(the cached limits are read instead)")
+    check(poller._walk_settings["max_rows"] == db.settings()["snmp_walk_max_rows"],
+          "…and what it cached is what the settings table says")
+
     db.close()
 
     print()

@@ -4459,7 +4459,8 @@ class NodePoller(Worker):
         instance_oids = [f"{o['oid']}.0" for o in objects]
         metrics = []
         try:
-            values = self._custom_mib_values(device, config, instance_oids)
+            response = self._snmp_get(device, config, instance_oids)
+            values = {vb["oid"]: vb for vb in response.varbinds}
             for obj, instance_oid in zip(objects, instance_oids):
                 vb = values.get(instance_oid)
                 if not vb or vb["type"] in ("noSuchObject", "noSuchInstance"):
