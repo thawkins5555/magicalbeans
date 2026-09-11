@@ -55,6 +55,9 @@ from .service import STORES, db_for, disk_space
 
 MIN_BLOCK_PX = 3
 
+# "no argument given", distinct from an argument that is None.
+_UNSET = object()
+
 
 # ---------------------------------------------------------------------- CSV
 #
@@ -430,6 +433,31 @@ def _window(params, default_span_s: float = 3600.0) -> tuple[float, float]:
     return clamp_window(t0, t1)
 
 
+# The histogram stores allocate one dict per bucket BEFORE they run any
+# query, so the bucket count — not the span — decides what an overview
+# request costs in memory. Bounded the way _flow_bucket bounds the same
+# hazard: widen the bucket until the count fits rather than narrow the
+# window the caller asked for. Two slots are held back from the cap because
+# each store floors its first bucket to a boundary below t0 and adds a
+# trailing partial one.
+HIST_MAX_BUCKETS = 5000
+
+
+def _hist_window(params, default_span_s: float = 86400.0,
+                 default_bucket_s: float = 3600.0) -> tuple[float, float, float]:
+    """The (t0, t1, bucket_s) the three overview histograms read from the
+    query string: the window through _window, then a bucket no smaller than
+    the stores' own 60 s floor and no smaller than HIST_MAX_BUCKETS allows."""
+    t0, t1 = _window(params, default_span_s)
+    bucket = _num(params, "bucket", default_bucket_s)
+    if bucket is None or not math.isfinite(bucket):
+        bucket = default_bucket_s
+    bucket = max(float(bucket), 60.0)
+    if (t1 - t0) / bucket > HIST_MAX_BUCKETS - 2:
+        bucket = float(math.ceil((t1 - t0) / (HIST_MAX_BUCKETS - 2)))
+    return t0, t1, bucket
+
+
 def _id_list(raw) -> list[int] | None:
     """A comma-separated `device_ids=1,2,3` query param -> [1, 2, 3], or
     None when the param was not given at all — distinct from an explicit
@@ -586,6 +614,23 @@ def _drop_unreadable(result: dict, granted: dict, module_keys: dict) -> None:
                 result.pop(key, None)
 
 
+def _alerts_settings_json(service, params) -> dict:
+    """The Alerts settings block as this caller may see it.
+
+    For Slack, Teams and PagerDuty the incoming-webhook URL *is* the bearer
+    credential, and `webhook_headers` is where an Authorization header goes,
+    so both follow _community_fields' rule rather than travelling in the
+    clear to every `alerts: read` account: the values for a caller who could
+    change them anyway, a boolean for everyone else. A copy, because the
+    dict here is the live one service.alerts_settings hands out."""
+    settings = service.alerts_settings
+    flags = {"has_webhook_url": bool(settings.get("webhook_url")),
+             "has_webhook_headers": bool(settings.get("webhook_headers"))}
+    if _may_read_secrets(service, params, "alerts"):
+        return {**settings, **flags}
+    return {**settings, **flags, "webhook_url": "", "webhook_headers": []}
+
+
 def get_config(service, params, body) -> dict:
     """Everything the browser needs that only an operator can change.
 
@@ -620,7 +665,7 @@ def get_config(service, params, body) -> dict:
         "trap_kinds": list(trapdecode.KINDS),
         "ipam_settings": service.ipam_settings,
         "nodes_settings": service.nodes_settings,
-        "alerts_settings": service.alerts_settings,
+        "alerts_settings": _alerts_settings_json(service, params),
         "wireless_settings": service.wireless_settings,
         "configrx_settings": service.configrx_settings,
         "mapper_settings": service.mapper_settings,
@@ -1576,9 +1621,24 @@ def get_debug(service, params, body) -> dict:
     schedule = service.monitor.next_runs()
     now = time.time()
 
+    # Every section below names something from another module — NetPath
+    # destination hostnames, device names and addresses, subnet and DHCP
+    # server labels, discovery CIDRs, the addresses out for reverse lookup —
+    # so `debug: read` alone must not read any of them, exactly as it must
+    # not read the event stream. A section the account cannot read comes
+    # back empty rather than as a 403, the contract get_state and
+    # get_dashboard already use.
+    granted = request_permissions(service, params)
+
+    def can(module: str) -> bool:
+        return _permissions.allows(granted.get(module), _permissions.READ)
+
+    see_netpath = can("netpath")
+    see_nodes = can("nodes")
+
     workers = []
     running = queued = 0
-    targets = service.db.targets()
+    targets = service.db.targets() if see_netpath else []
     last_traces = service.db.last_traces([target["id"] for target in targets])
     for target in targets:
         last = last_traces.get(target["id"])
@@ -1613,7 +1673,6 @@ def get_debug(service, params, body) -> dict:
     # addresses, DHCP server labels, ConfigRX failure detail, sign-in
     # history — so `debug: read` alone must not read all of it. Each
     # category is filtered by the module it belongs to.
-    granted = request_permissions(service, params)
     visible = {category for category, module in _EVENT_CATEGORY_MODULE.items()
                if _permissions.allows(granted.get(module), _permissions.READ)}
     events = [
@@ -1622,8 +1681,9 @@ def get_debug(service, params, body) -> dict:
         for e in service.log.since(since) if e.category in visible
     ]
 
-    # One row per address currently out for a reverse lookup.
-    dns_state = service.resolver.worker_state()
+    # One row per address currently out for a reverse lookup. Under
+    # `settings`, the module _EVENT_CATEGORY_MODULE assigns the dns category.
+    dns_state = service.resolver.worker_state() if can("settings") else {}
     dns_workers = sorted(
         [{"ip": ip, "elapsed": now - info["started"]}
          for ip, info in dns_state.items() if info["started"]],
@@ -1633,7 +1693,7 @@ def get_debug(service, params, body) -> dict:
     # currently being polled — both come from the same worker, so they share
     # a table rather than needing a section each for what is usually zero or
     # one row.
-    ipam_state = service.ipam.state()
+    ipam_state = service.ipam.state() if can("ipam") else {}
     ipam_workers = []
     if ipam_state.get("scan_started") or ipam_state.get("poll_started"):
         subnets_by_id = {s["id"]: s for s in service.ipam_db.subnets_by_ids(
@@ -1660,7 +1720,7 @@ def get_debug(service, params, body) -> dict:
     # shape the NetPath `workers` table above uses, without its per-target
     # budget/schedule columns: a device's poll has no fixed budget the way a
     # trace's hop/probe counts imply one.
-    node_state = service.node_poller.worker_state()
+    node_state = service.node_poller.worker_state() if see_nodes else {}
     node_workers = []
     if node_state:
         devices_by_id = {d["id"]: d for d in
@@ -1680,7 +1740,7 @@ def get_debug(service, params, body) -> dict:
     # progress counters — same shape as the worker tables above plus the
     # probed/found columns a bounded sweep naturally has.
     discovery_scans = []
-    for job in service.nodes_db.discovery_jobs(20):
+    for job in (service.nodes_db.discovery_jobs(20) if see_nodes else []):
         if job["state"] != "running":
             continue
         discovery_scans.append({
@@ -1701,7 +1761,7 @@ def get_debug(service, params, body) -> dict:
         "node_workers": node_workers,
         # polls/ok/timeout/auth_fail/unsupported/errors/overruns — already
         # computed on every poll, previously never surfaced anywhere.
-        "node_counters": service.node_poller.counters,
+        "node_counters": service.node_poller.counters if see_nodes else {},
         "discovery_scans": discovery_scans,
         "events": events,
         "last_seq": service.log.last_seq,
@@ -1717,9 +1777,9 @@ def get_debug(service, params, body) -> dict:
         # endpoint is actually slow.
         "routes": _route_latency(service),
         "summary": {
-            "scheduler": service.monitor.running,
+            "scheduler": service.monitor.running if see_netpath else False,
             "workers_busy": running,
-            "workers_total": service.monitor.workers,
+            "workers_total": service.monitor.workers if see_netpath else 0,
             "queued": queued,
             "resolver": bool(service.resolver._thread
                              and service.resolver._thread.is_alive()),
@@ -2310,9 +2370,7 @@ def _syslog_host_ips(service, host: str) -> list:
 
 def get_syslog_overview(service, params, body) -> dict:
     """Histogram plus the context the page needs; deliberately cheap."""
-    t1 = _num(params, "t1", time.time())
-    t0 = _num(params, "t0", t1 - 86400)
-    bucket = _num(params, "bucket", 3600)
+    t0, t1, bucket = _hist_window(params)
     filters = _syslog_filters(service, params)
 
     buckets = service.syslog_db.histogram(t0, t1, bucket, filters)
@@ -2484,9 +2542,7 @@ def _snmp_filters(params) -> dict:
 
 def get_snmp_overview(service, params, body) -> dict:
     """Histogram plus the context the page needs; deliberately cheap."""
-    t1 = _num(params, "t1", time.time())
-    t0 = _num(params, "t0", t1 - 86400)
-    bucket = _num(params, "bucket", 3600)
+    t0, t1, bucket = _hist_window(params)
     filters = _snmp_filters(params)
 
     buckets = service.snmp_db.histogram(t0, t1, bucket, filters)
@@ -2536,6 +2592,7 @@ def _snmp_trap_rows(service, params, cap: int, *,
                  service.app_db.hostnames({row["source"] for row in rows}).items()
                  if name}
 
+    reveal = _may_read_secrets(service, params, "snmp")
     traps = []
     for row in rows:
         try:
@@ -2547,7 +2604,12 @@ def _snmp_trap_rows(service, params, cap: int, *,
             "source_name": names.get(row["source"], ""),
             "version": row["version"],
             "version_name": VERSION_NAMES.get(row["version"], "?"),
-            "community": row["community"] or "",
+            # The sending device's own trap community (its USM user name for
+            # v3), so the same rule _community_fields applies to a device's
+            # stored community applies here: shown to callers who could
+            # change it anyway, a has_community boolean for everyone else.
+            "community": (row["community"] or "") if reveal else "",
+            "has_community": bool(row["community"]),
             "engine_id": row["engine_id"] or "",
             "security": row["security"] or "",
             "auth_state": row["auth_state"] or "",
@@ -3654,6 +3716,17 @@ def _device_rows_json(service, params, rows) -> list[dict]:
     return devices
 
 
+_DEVICE_INDEX_FIELDS = ("id", "ip", "name", "sys_name", "display_name_source",
+                        "device_group_id", "status")
+
+
+def _device_index_rows_json(service, params, rows) -> list[dict]:
+    """The seven columns a device lookup table needs, and nothing else —
+    no per-row mute/maintenance/alias reads, no sys_descr, no credential
+    fields for _may_read_secrets to decide about."""
+    return [{field: row[field] for field in _DEVICE_INDEX_FIELDS} for row in rows]
+
+
 # Paging here is opt-in, not the default: a caller that sends neither
 # `limit` nor `offset` still gets the whole fleet back, because nothing here
 # can be sure it is the only caller (test_frontend_contracts.py and tests/ui/
@@ -3673,12 +3746,18 @@ def get_nodes_devices(service, params, body) -> dict:
             return {"devices": [], "total": 0}
         filters["only_ids"] = only_ids
     total = service.nodes_db.devices_count(**filters)
+    # `fields=index` is app.js's shared ip->device / id->device cache, which
+    # reads seven columns and was being handed the whole 25-column row for
+    # every device in the fleet, every thirty seconds, per open tab. Paging
+    # is unchanged; only the projection differs.
+    to_json = (_device_index_rows_json if params.get("fields") == "index"
+               else _device_rows_json)
     if params.get("limit") is None and params.get("offset") is None:
         rows = service.nodes_db.devices(**filters)
-        return {"devices": _device_rows_json(service, params, rows), "total": total}
+        return {"devices": to_json(service, params, rows), "total": total}
     limit, offset = _page(params, DEVICE_LIST_DEFAULT_LIMIT, DEVICE_LIST_MAX_LIMIT)
     rows = service.nodes_db.devices(limit=limit, offset=offset, **filters)
-    return {"devices": _device_rows_json(service, params, rows),
+    return {"devices": to_json(service, params, rows),
             "total": total, "limit": limit, "offset": offset}
 
 
@@ -3930,8 +4009,13 @@ UPSTREAM_SUGGESTIONS_DEFAULT_LIMIT = 500
 UPSTREAM_SUGGESTIONS_MAX_LIMIT = 2000
 
 
-def _upstream_suggestion_json(service, label, suggestion: dict) -> dict:
-    device = service.nodes_db.device(suggestion["device_id"])
+def _upstream_suggestion_json(service, label, suggestion: dict,
+                              rows: dict | None = None) -> dict:
+    # `rows` is the page's device rows read in one devices_by_ids, the way
+    # the port labels beside them are already batched; without it this was a
+    # device() — one nodes.db lock — per suggestion, up to the page cap.
+    device = (rows.get(suggestion["device_id"]) if rows is not None
+              else service.nodes_db.device(suggestion["device_id"]))
     candidates = []
     for candidate in suggestion["candidates"]:
         candidates.append({
@@ -3957,6 +4041,11 @@ def _upstream_suggestion_json(service, label, suggestion: dict) -> dict:
     }
 
 
+def _suggestion_device_rows(service, suggestions) -> dict:
+    return {d["id"]: d for d in service.nodes_db.devices_by_ids(
+        {s["device_id"] for s in suggestions})}
+
+
 def get_nodes_upstream_suggestions(service, params, body) -> dict:
     """Candidate devices.upstream_id assignments for an operator to review
     and accept — one entry per device with no upstream_id yet whose own
@@ -3976,13 +4065,15 @@ def get_nodes_upstream_suggestions(service, params, body) -> dict:
     label = _neighbor_local_port_labeler(service)
     if params.get("limit") is None and params.get("offset") is None:
         suggestions = service.nodes_db.upstream_suggestions()
-        return {"suggestions": [_upstream_suggestion_json(service, label, s)
+        rows = _suggestion_device_rows(service, suggestions)
+        return {"suggestions": [_upstream_suggestion_json(service, label, s, rows)
                                 for s in suggestions],
                 "total": total}
     limit, offset = _page(params, UPSTREAM_SUGGESTIONS_DEFAULT_LIMIT,
                           UPSTREAM_SUGGESTIONS_MAX_LIMIT)
     suggestions = service.nodes_db.upstream_suggestions(limit=limit, offset=offset)
-    return {"suggestions": [_upstream_suggestion_json(service, label, s)
+    rows = _suggestion_device_rows(service, suggestions)
+    return {"suggestions": [_upstream_suggestion_json(service, label, s, rows)
                             for s in suggestions],
             "total": total, "limit": limit, "offset": offset}
 
@@ -4014,7 +4105,7 @@ def _upstream_assignment_pairs(body) -> dict:
     return pairs
 
 
-def _find_upstream_cycle(service, overrides: dict) -> list | None:
+def _find_upstream_cycle(service, overrides: dict, rows: dict | None = None) -> list | None:
     """Whether `overrides` (device_id -> new, already-cleaned upstream_id),
     applied on top of what is on file for every OTHER device, would create
     a cycle reachable from any device this batch touches. Returns the
@@ -4032,10 +4123,14 @@ def _find_upstream_cycle(service, overrides: dict) -> list | None:
     rather than risk missing one longer than eight levels the way that
     cap would.
     """
+    rows = rows or {}
+
     def upstream_of(device_id):
         if device_id in overrides:
             return overrides[device_id]
-        row = service.nodes_db.device(device_id)
+        row = rows.get(device_id)
+        if row is None:
+            row = service.nodes_db.device(device_id)
         return int(row["upstream_id"]) if row and row["upstream_id"] is not None else None
 
     ceiling = service.nodes_db.device_count() + 1
@@ -4078,12 +4173,23 @@ def post_nodes_upstream_suggestions_apply(service, params, body) -> dict:
     assignments that happen not to be part of it.
     """
     pairs = _upstream_assignment_pairs(body)
+    # Every device this batch names, and every device it points at, in one
+    # read: the batch cap is 2,000 assignments and each one used to cost
+    # three single-row queries, each taking the nodes.db write lock.
+    wanted = set(pairs)
+    for value in pairs.values():
+        if value not in (None, "", 0, "0"):
+            try:
+                wanted.add(int(value))
+            except (TypeError, ValueError):
+                pass
+    rows = {d["id"]: d for d in service.nodes_db.devices_by_ids(wanted)}
     for device_id in pairs:
-        if not service.nodes_db.device(device_id):
+        if device_id not in rows:
             raise ValueError(f"No such device {device_id}")
-    cleaned = {device_id: _clean_upstream_id(service, device_id, upstream_id)
+    cleaned = {device_id: _clean_upstream_id(service, device_id, upstream_id, rows)
               for device_id, upstream_id in pairs.items()}
-    cycle = _find_upstream_cycle(service, cleaned)
+    cycle = _find_upstream_cycle(service, cleaned, rows)
     if cycle:
         raise ValueError(
             "This would create an upstream cycle through device(s): "
@@ -4204,15 +4310,26 @@ def get_nodes_device_addresses(service, params, body, device_id) -> dict:
         row, service.nodes_db.device_addresses(device_id))}
 
 
+# The same ceiling shape DEVICE_LIST_MAX_LIMIT uses. The pair count is
+# O(devices squared) on a fleet with repeated sys_names, which is the very
+# case this feature exists to find, so an unclamped limit is a fleet-sized
+# body built under the nodes.db lock.
+DUPLICATES_MAX_LIMIT = 2000
+
+
 def get_nodes_duplicates(service, params, body) -> dict:
     """Pairs that look like one device entered twice. Fetched on demand
     from the Duplicates button, not the Devices page's refresh tick — it's
     three self-joins over the fleet."""
-    limit = int(_num(params, "limit", 200))
+    limit, _offset = _page(params, 200, DUPLICATES_MAX_LIMIT)
+    candidates = service.nodes_db.duplicate_candidates(limit)
+    rows = {d["id"]: d for d in service.nodes_db.devices_by_ids(
+        {pair["a_id"] for pair in candidates}
+        | {pair["b_id"] for pair in candidates})}
     pairs = []
-    for pair in service.nodes_db.duplicate_candidates(limit):
-        a = service.nodes_db.device(pair["a_id"])
-        b = service.nodes_db.device(pair["b_id"])
+    for pair in candidates:
+        a = rows.get(pair["a_id"])
+        b = rows.get(pair["b_id"])
         if a is None or b is None:
             continue
         pairs.append({
@@ -4363,7 +4480,7 @@ def _check_display_name_source(body) -> None:
         raise ValueError("display_name_source must be 'auto' or 'manual'")
 
 
-def _clean_upstream_id(service, device_id, value):
+def _clean_upstream_id(service, device_id, value, rows: dict | None = None):
     """The upstream device an alert rollup will look through, validated.
 
     Empty, null and 0 all mean "no upstream" — the form's blank option sends
@@ -4382,7 +4499,10 @@ def _clean_upstream_id(service, device_id, value):
         raise ValueError("upstream_id must be a device id")
     if upstream == int(device_id):
         raise ValueError("A device cannot be its own upstream device")
-    _require(service.nodes_db.device(upstream), "upstream device")
+    # `rows` is a batch caller's pre-read device map; falling back to
+    # device() keeps the single-device PUT path unchanged.
+    if rows is None or upstream not in rows:
+        _require(service.nodes_db.device(upstream), "upstream device")
     return upstream
 
 
@@ -4914,7 +5034,13 @@ def post_nodes_device_oid_walk(service, params, body, device_id) -> dict:
 def get_nodes_device_oid_walk(service, params, body, device_id) -> dict:
     """Progress, or the finished walk. `download` asks for the file text:
     once handed over, the rows are dropped, since a walk exists to be
-    downloaded once."""
+    downloaded once.
+
+    Dropped only for a caller who could start another one. Watching a walk
+    is a read, but forgetting it is not: without the write check any
+    `nodes: read` account could delete a finished walk out from under the
+    engineer who ran it, and re-running it needs `nodes: write`."""
+    _require(service.nodes_db.device(device_id), "device")
     status = service.node_poller.oid_walk_status(
         int(device_id), with_rows=params.get("download") is not None)
     if status is None:
@@ -4924,12 +5050,14 @@ def get_nodes_device_oid_walk(service, params, body, device_id) -> dict:
         return {"walk": status}
     rows = status.pop("walk", [])
     text = _oid_walk_text(service, status, rows)
-    service.node_poller.forget_oid_walk(int(device_id))
+    if _may_read_secrets(service, params, "nodes"):
+        service.node_poller.forget_oid_walk(int(device_id))
     return {"walk": status, "text": text,
             "filename": _oid_walk_filename(status)}
 
 
 def delete_nodes_device_oid_walk(service, params, body, device_id) -> dict:
+    _require(service.nodes_db.device(device_id), "device")
     return {"cancelled": service.node_poller.cancel_oid_walk(int(device_id))}
 
 
@@ -4937,6 +5065,7 @@ def post_nodes_device_identify(service, params, body, device_id) -> dict:
     """Re-identify: start the bounded vendor walk now, or report the one
     already running. A job, not a synchronous answer — the walk is up to
     20 s, the page refreshes every few seconds, and bulk cannot wait."""
+    _require(service.nodes_db.device(device_id), "device")
     return {"job": service.node_poller.start_identify(int(device_id), trigger="manual")}
 
 
@@ -4951,6 +5080,7 @@ def get_nodes_device_identify(service, params, body, device_id) -> dict:
 
 
 def delete_nodes_device_identify(service, params, body, device_id) -> dict:
+    _require(service.nodes_db.device(device_id), "device")
     return {"cancelled": service.node_poller.cancel_identify(int(device_id))}
 
 
@@ -5429,6 +5559,12 @@ def post_nodes_device_test(service, params, body, device_id) -> dict:
 def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
     device = _require(service.nodes_db.device(device_id), "device")
     rows = service.nodes_db.interfaces(device_id)
+    # The open port dialog refreshes one row every five seconds and was
+    # re-fetching the whole table — a quarter of a megabyte on a 500-port
+    # switch — to read it. Same shape, one interface.
+    if_index = _num(params, "if_index", None, int)
+    if if_index is not None:
+        rows = [r for r in rows if r["if_index"] == if_index]
     keys = rows[0].keys() if rows else ()
     # Why this list stops where it does, when the poller's per-poll cap is
     # what stopped it. It rides with the interfaces rather than with the
@@ -6266,11 +6402,30 @@ def post_nodes_mib_resolve(service, params, body, mib_file_id) -> dict:
             "unresolved": unresolved}
 
 
+def _clean_oid(value) -> str:
+    """A dotted numeric OID, or ValueError.
+
+    isascii() as well as isdigit(), and an explicit refusal of a leading
+    '-', because the BER encoder this eventually reaches shifts each arc
+    right seven bits at a time: a negative arc never terminates that loop,
+    and str.isdigit() is True for superscript and Arabic-Indic digits that
+    int() rejects. Both would land here as a stored OID the poller then
+    reads on every poll.
+    """
+    oid = str(value or "").strip().strip(".")
+    parts = oid.split(".") if oid else []
+    if not parts or not all(part.isascii() and part.isdigit() for part in parts):
+        raise ValueError("An OID must be numeric, like 1.3.6.1.2.1.1")
+    return oid
+
+
 def put_nodes_mib_object(service, params, body, mib_file_id, obj_id) -> dict:
     objects = {r["id"]: r for r in service.nodes_db.mib_objects(mib_file_id)}
     if obj_id not in objects:
         raise ValueError("No such MIB object")
     fields = _pick(body, ("name", "oid", "description", "syntax", "enums"))
+    if "oid" in fields:
+        fields["oid"] = _clean_oid(fields["oid"])
     service.nodes_db.update_mib_object(obj_id, **fields)
     # A rename or a re-pointed OID changes what the table says without
     # changing any of the three numbers mib_generation() counts.
@@ -6381,9 +6536,7 @@ def _template_json(row, with_tokens: bool = False) -> dict:
 
 
 def get_alerts_overview(service, params, body) -> dict:
-    t1 = _num(params, "t1", time.time())
-    t0 = _num(params, "t0", t1 - 86400)
-    bucket = _num(params, "bucket", 3600)
+    t0, t1, bucket = _hist_window(params)
     return {
         "t0": t0, "t1": t1, "bucket_s": bucket,
         "buckets": service.alerts_db.histogram(t0, t1, bucket),
@@ -6568,6 +6721,10 @@ def _bulk_silence_device_ids(service, body) -> list[str]:
     if not ids:
         raise ValueError("device_ids and/or group_id is required, naming at "
                          "least one device")
+    if len(ids) > BULK_DEVICE_ID_MAX:
+        raise ValueError(
+            f"Too many devices in one request: {len(ids)}, limit is "
+            f"{BULK_DEVICE_ID_MAX}. Send them in batches.")
     try:
         wanted = {int(i) for i in ids}
     except (TypeError, ValueError):
@@ -6685,16 +6842,14 @@ def post_alerts_bulk_maintenance(service, params, body) -> dict:
     clear = bool(body.get("clear"))
     reason = str(body.get("reason", ""))
     username = params.get("_username", "")
-    changed = 0
-    for device_id in device_ids:
-        if clear:
-            changed += bool(service.alerts_db.clear_maintenance(
-                int(device_id), by=username))
-        else:
-            was_open = service.alerts_db.open_maintenance(int(device_id)) is not None
-            service.alerts_db.set_maintenance(int(device_id), by=username,
-                                              reason=reason)
-            changed += 0 if was_open else 1
+    # One lock hold and one commit for the whole selection: the per-device
+    # loop was two alerts.db statements and a commit per device, on the
+    # request thread, while the alert engine ticked against the same file.
+    if clear:
+        changed = service.alerts_db.clear_maintenance_many(device_ids, by=username)
+    else:
+        changed = service.alerts_db.set_maintenance_many(device_ids, by=username,
+                                                         reason=reason)
     _audit(service, params, "alert.maintenance_bulk",
           target=f"{len(device_ids)} devices",
           detail=f"{'off' if clear else 'on'}, {changed} changed: {reason}")
@@ -6818,6 +6973,10 @@ def _bulk_alert_ids(body) -> list[int]:
     ids = body.get("alert_ids") or []
     if not ids:
         raise ValueError("alert_ids is required")
+    if len(ids) > BULK_DEVICE_ID_MAX:
+        raise ValueError(
+            f"Too many alerts in one request: {len(ids)}, limit is "
+            f"{BULK_DEVICE_ID_MAX}. Send them in batches.")
     return [int(i) for i in ids]
 
 
@@ -6963,6 +7122,9 @@ def _validated_threshold_fields(kind: str, row, fields: dict, key: str = "") -> 
     return fields
 
 
+ALERT_RULE_KEY_MAX = 80
+
+
 def post_alerts_rule(service, params, body) -> dict:
     key = str(body.get("key", "")).strip()
     name = str(body.get("name", "")).strip()
@@ -6970,6 +7132,14 @@ def post_alerts_rule(service, params, body) -> dict:
     source_kind = str(body.get("source_kind", "") or "")
     if not key or not name or not kind:
         raise ValueError("key, name and kind are all required")
+    # A rule key is a stable identifier, not prose: it is matched against
+    # alertrules' own key constants and written into the page as an
+    # attribute, so anything outside this charset is a mistake at best.
+    if len(key) > ALERT_RULE_KEY_MAX or not all(
+            char.isascii() and (char.isalnum() or char in "_-.") for char in key):
+        raise ValueError(
+            "A rule key may use letters, digits, underscore, hyphen and dot "
+            f"only, up to {ALERT_RULE_KEY_MAX} characters")
     if kind not in ("device_event", "interface_event", "threshold",
                     "dhcp_threshold", "netpath_threshold", "trap", "syslog",
                     "ipam", "wireless_event", "system"):
@@ -7618,8 +7788,13 @@ def post_ipam_worker(service, params, body) -> dict:
 
 # ----------------------------------------------------------------- configrx
 
-def _configrx_device_json(service, device_row, worker_state=None) -> dict:
-    config = service.configrx_db.device_config(device_row["id"])
+def _configrx_device_json(service, device_row, worker_state=None,
+                          config=_UNSET) -> dict:
+    # `config` pre-read by a list caller that fetched every row in one query
+    # (all_device_configs); _UNSET rather than None so "this device has no
+    # config row" stays distinguishable from "nobody looked it up yet".
+    if config is _UNSET:
+        config = service.configrx_db.device_config(device_row["id"])
     # Whether a backup is in flight for this device right now — the same join
     # the Nodes list does with node_poller.worker_state(). Without it the row
     # sat on the last COMPLETED attempt for the whole duration of a run, so a
@@ -7697,6 +7872,10 @@ def post_configrx_backups_bulk_delete(service, params, body) -> dict:
     ids = body.get("backup_ids") or []
     if not ids:
         raise ValueError("backup_ids is required")
+    if len(ids) > BULK_DEVICE_ID_MAX:
+        raise ValueError(
+            f"Too many backups in one request: {len(ids)}, limit is "
+            f"{BULK_DEVICE_ID_MAX}. Send them in batches.")
     removed = service.configrx_db.delete_backups([int(i) for i in ids])
     service.log.add(CONFIGRX_CATEGORY, f"Deleted {removed} stored config backup(s)")
     _audit(service, params, "configrx.backup_bulk_delete", target=f"{removed} backups")
@@ -7727,7 +7906,13 @@ def get_configrx_devices(service, params, body) -> dict:
     text = params.get("q") or None
     rows = service.nodes_db.devices(text=text)
     worker_state = service.configrx.worker_state()
-    devices = [_configrx_device_json(service, r, worker_state) for r in rows]
+    # One read for the whole list, the shape get_configrx_overview already
+    # uses: a device_config() per device was one configrx.db lock
+    # acquisition per device on every refresh tick.
+    configs = {c["device_id"]: c for c in service.configrx_db.all_device_configs()}
+    devices = [_configrx_device_json(service, r, worker_state,
+                                     configs.get(r["id"]))
+               for r in rows]
     if params.get("enabled_only") is not None:
         devices = [d for d in devices if d["backup_enabled"]]
     # Filtered on the effective vendor, so picking "cisco" gives the devices
@@ -7811,12 +7996,13 @@ def post_configrx_devices_bulk_backup(service, params, body) -> dict:
     # One query for the whole selection rather than device() per id, the
     # same shape post_nodes_devices_bulk_poll uses.
     existing = {d["id"] for d in service.nodes_db.devices_by_ids(device_ids)}
+    configs = {c["device_id"]: c for c in service.configrx_db.all_device_configs()}
     queued, busy, missing, not_enabled = [], [], [], []
     for device_id in device_ids:
         if device_id not in existing:
             missing.append(device_id)
             continue
-        config = service.configrx_db.device_config(device_id)
+        config = configs.get(device_id)
         if not (config and config["backup_enabled"]):
             not_enabled.append(device_id)
             continue
@@ -8806,10 +8992,10 @@ def _client(params) -> str:
 
 # At most this many password verifications at once. Each is a scrypt at
 # N=2^17 — about 128 MiB and half a second — on an endpoint that needs no
-# session, so unbounded concurrency is both a memory exhaustion (30 parallel
-# attempts is ~4 GB) and the thing that defeats the throttle: the server is
-# threaded, so simultaneous guesses would sleep out their five seconds in
-# parallel.
+# session, so unbounded concurrency is a memory exhaustion (30 parallel
+# attempts is ~4 GB) on a threaded server. It bounds the HASHING only: the
+# throttle delay is slept before the slot is taken, so a throttled caller
+# never holds one of the four while it waits.
 _LOGIN_SLOTS = threading.Semaphore(4)
 
 _dummy_hash_value: str | None = None
@@ -8868,11 +9054,15 @@ def post_login(service, params, body) -> dict:
         raise LockedOut(f"Too many failed sign-ins. Try again in "
                         f"{max(1, round(remaining / 60))} minute(s).")
 
+    # Slept OUTSIDE the semaphore: a throttled caller waiting inside one of
+    # the four verification slots holds it for the whole delay, so a handful
+    # of already-throttled attempts would queue every legitimate sign-in
+    # behind them. Truncated at 5 s either way — the throttle's own ceiling
+    # is 30 s, but a request thread held that long is its own denial.
     with _LOGIN_SLOTS:
         delay = service.throttle.delay_for(username, client)
         if delay:
             time.sleep(min(delay, 5))
-
         row = service.app_db.user(username) if username else None
         stored = row["password"] if row else None
 
@@ -9661,7 +9851,7 @@ def get_dashboard_offenders(service, params, body) -> dict:
     and `top_metric` exist for exactly this.
     """
     if not _dash_can(service, params, "nodes"):
-        raise PermissionError("Reading devices is not permitted")
+        raise _permissions.Forbidden("Reading devices is not permitted")
 
     window_s = _num(params, "window_s", DASHBOARD_OFFENDER_WINDOW_S) or DASHBOARD_OFFENDER_WINDOW_S
     since = time.time() - float(window_s)
@@ -9719,7 +9909,7 @@ def get_nodes_device_upstream(service, params, body, device_id) -> dict:
     # error the operator could have been spared.
     candidates = [
         {"id": d["id"], "name": d["name"] or d["ip"], "ip": d["ip"]}
-        for d in service.nodes_db.devices()
+        for d in service.nodes_db.device_summaries()
         if d["id"] != device_id
     ]
     candidates.sort(key=lambda d: (d["name"] or "").lower())

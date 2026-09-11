@@ -2098,8 +2098,8 @@ end
     status, _h, payload = req("GET", "/api/snmp/traps", cookie=snmp_reader)
     rows = (payload or {}).get("traps", [])
     check("D29 …while still saying one is set",
-          bool(rows) and rows[0]["has_community"] is True
-          and rows[0]["community"] == "", rows[:1])
+          bool(rows) and rows[0].get("has_community") is True
+          and rows[0].get("community") == "", rows[:1])
 
     # ------------- D30 a throttled sign-in does not hold a verification slot
     #
