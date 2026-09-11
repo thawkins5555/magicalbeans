@@ -313,7 +313,11 @@ session has left**. Sign-in keeps the flag, so a bookmark works.
 
 The **Account** dialog can build the same link without typing it: choose
 which tabs to **Rotate through** and **Every** how many seconds, then
-**Open this view as a wall display**. A rotating kiosk shows a row of dots
+**Open this view as a wall display**. A hand-edited `rotate=` list naming a
+view that does not exist drops that name and rotates through the rest; from
+5.9.1 a name that is not a plain tab name is dropped the same way rather than
+leaving a blank, dead page, and a kiosk that cannot be set up at all falls
+back to the ordinary layout instead of taking the page down with it. A rotating kiosk shows a row of dots
 for the views in the cycle and a countdown to the next one, so a person
 walking past the wall can see what's coming as well as what's on it now.
 
@@ -1870,6 +1874,12 @@ alerts and optionally emailing about them.
   duplicate — enforced by the database itself (an alert's dedup key can
   only be open or acknowledged once at a time), not by application logic
   that could race.
+- **A rule, template or per-device override you edit shows at once; somebody
+  else's shows within a minute.** From 5.9.1 these three lists are read when
+  you open the **Alerts** tab and again straight after any edit made here,
+  and otherwise once a minute rather than every ten seconds — they are
+  configuration, not live data. The alert list itself keeps its own refresh
+  interval, unchanged.
 
 ### One outage, one alert
 
@@ -2454,9 +2464,14 @@ everyone else's history.
   snmpTrapOID identity v2c uses, so both versions are one searchable,
   filterable axis rather than two.
 - **v3 authentication is verified** — MD5, SHA1, and the SHA-224/256/384/
-  512 variants — against a list of configured users, each a `name / SHA /
-  password` line. The digest is computed over the whole message with the
-  authentication field blanked in place, per RFC 3414. A trap sent
+  512 variants — against a list of configured users, one `name / SHA` line
+  each. A password is typed only when it is being set or changed, as
+  `name / SHA / password`: from 5.9.1 it is stored encrypted and never shown
+  again, so a line with no password on it keeps the one already on file, and
+  removing a line removes its password with it. The settings panel says how
+  many of the listed users have a password stored. The digest is computed
+  over the whole message with the authentication field blanked in place, per
+  RFC 3414. A trap sent
   authPriv is detected and its header decoded, but the encrypted payload
   is not decrypted — the Nodes poller speaks AES-128-CFB since 5.8.0
   through `netpath/snmpcrypt.py`, and wiring the trap receiver to it (a
@@ -2571,6 +2586,11 @@ and app. Every search reports how long it took, next to the controls.
 finds `interface`; `onsole` finds `console`. Several words must all appear, in
 any order and in any field, so `10.20.3.4 down` finds messages from that device
 about something going down.
+
+**`_` and `%` are ordinary characters, from 5.9.1.** Both are wildcards in
+SQL's own pattern syntax, and every search box in the product feeds one, so
+`core_sw` typed into the Nodes, Alerts, NetFlow, Syslog, IPAM or audit-log
+search matched `core-sw-1` as well. What you type is matched literally now.
 
 Because the sending address is indexed with the message, an IP typed into the
 search box finds messages from that device without having to reach for the

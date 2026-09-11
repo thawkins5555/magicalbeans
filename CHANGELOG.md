@@ -230,7 +230,11 @@ are there rather than repeated below.
   save returns; every other write keeps the cheap commit
   (`tests/test_credential_durability.py`).
 
-<!-- TODO(lead): api lane -->
+- **A failed sign-in's delay held one of the four password-verification
+  slots while it waited.** The delay is taken outside them now. The wait is
+  still capped at five seconds, and `CREDENTIAL-SECURITY.md` says so, along
+  with the twenty-failure, fifteen-minute lockout that applies per username
+  and per source address.
 
 #### Nodes
 
@@ -319,6 +323,26 @@ are there rather than repeated below.
   with no live-region role, so they were said only to whoever could see them.
 - **Sensor readings in the DOM and SFP tables are escaped**, like every other
   cell in them.
+- **Downloading a finished OID walk discarded it.** Watching a walk is a read;
+  forgetting one is not, and re-running it needs Nodes **write** — so any
+  account with Nodes read could delete a finished walk out from under the
+  engineer who ran it, by opening the download. A read-only viewer gets the
+  file and the walk stays.
+- **The Duplicates list had no page cap**, on a pair count that grows with the
+  square of a fleet's repeated sysNames — which is the case the feature exists
+  to find. Capped at 2,000 pairs, with the devices behind them read in one
+  query instead of two per pair.
+- **Applying a batch of upstream suggestions, and listing them, read the
+  devices involved one row at a time**, each read taking the nodes store's
+  lock, up to the 2,000-assignment batch cap. Both read them in one query now,
+  and the upstream picker asks only for the columns it shows.
+- **Re-identify and delete-OID-walk answered as though a job had run** for an
+  id that names no device. They answer "No such device".
+- **A MIB object's OID must be a plain dotted number.** A negative arc or a
+  non-ASCII digit is refused at the API rather than stored for the poller to
+  meet on every poll.
+
+  These are covered by `tests/test_nodes_api_fixes.py`.
 
   The frontend fixes above are covered by `tests/test_frontend_contracts.py`
   §49, twenty-eight checks, alongside browser evidence against an 812-device
@@ -347,6 +371,21 @@ are there rather than repeated below.
   selected**, rather than the template you were editing.
 - **The rule filter drop-down was rebuilt on every poll**, throwing away the
   list an operator had open. It is written only when the list changes.
+- **The Alerts, SNMP Trap and Syslog overview charts allocated one bucket
+  dictionary per slot before running any query, with no ceiling** — so a very
+  wide window at a fine resolution was an 11 MB response. The bucket widens
+  until the count fits `HIST_MAX_BUCKETS` (5,000) rather than the window
+  narrowing, the same trade the NetFlow chart already made.
+- **An oversized bulk selection answered with a server error.** Bulk
+  acknowledge, un-acknowledge, resolve, backup delete and maintenance answer
+  400 naming the limit instead.
+- **A custom alert rule key must be letters, digits, underscore, hyphen or
+  dot**, up to 80 characters.
+- **The Alerts webhook URL and its extra headers are shown only to accounts
+  that can change Alerts settings.** For Slack, Teams and PagerDuty the
+  incoming-webhook URL *is* the bearer credential, and an Authorization header
+  goes in those headers; every other account is told whether each is set,
+  which is the rule a device's stored community already followed.
 
 <!-- TODO(lead): alerts lane -->
 
@@ -377,6 +416,10 @@ are there rather than repeated below.
   blanked — the receiver goes on verifying the traps it verifies today — but it
   is never returned by the API. (`tests/test_trap_v3_credentials.py`;
   `CREDENTIAL-SECURITY.md` §11.)
+- **The trap list and its CSV export show the sending device's community — its
+  USM user name on v3 — only to accounts that can change SNMP settings.**
+  Everyone else sees the column blank and a flag saying whether one is set, as
+  the Nodes device list already did.
 
 #### IPAM
 
@@ -397,6 +440,8 @@ are there rather than repeated below.
   ids produced in Alerts. It chunks.
 - **The filter drop-down was rebuilt on every poll**; it is written only when
   the list changes.
+- **The device list read every device's backup settings one device at a
+  time.** One query for the page.
 
 #### MAPPER
 
@@ -414,6 +459,14 @@ are there rather than repeated below.
 - **Static files were folded into the per-route timings' `<unrouted>` row**,
   along with every 404 in it. Asset serving has its own `<static>` row, and a
   static request costs one file check instead of two.
+- **The Debug page showed every section to any account holding Debug read.**
+  Every section names something owned by another module — NetPath
+  destinations, device names and addresses, subnet and DHCP labels, discovery
+  ranges, the addresses out for reverse lookup — so each is gated on that
+  module's own read grant and comes back empty rather than 403 when it is
+  missing, the contract the state and dashboard routes already use. The event
+  filter's own target list, derived from events the page may already see,
+  stays.
 
 One test note for the record: `tests/test_prune_lock_hold.py` carries a
 pre-existing intermittent lock-fairness assertion that trips under load

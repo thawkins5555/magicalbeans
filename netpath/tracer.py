@@ -286,6 +286,15 @@ def _parse_unix(output: str) -> list[Hop]:
                 i += 2
             else:
                 i += 1
+            # Only if it really is one. With -n the binary prints numeric
+            # addresses and nothing else, so a token that does not parse is
+            # some build's or locale's extra text on a line that happened to
+            # match _HOP_LINE — and this value is stored, re-pinged by
+            # HopProber and handed to ping's argv. _parse_windows has always
+            # checked; this is the same check, on the same kind of token.
+            if not _is_ip(addr):
+                current = None
+                continue
             current = addr
             hop.addrs.setdefault(current, [])
         hops.append(hop)

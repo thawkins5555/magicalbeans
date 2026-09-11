@@ -61,6 +61,11 @@ class SyslogCollector(udpsock.UdpReceiver):
         # lazily on arrival, so throttling costs O(1) per message and cannot
         # grow past MAX_RATE_SOURCES entries however many addresses appear.
         self._buckets: collections.OrderedDict = collections.OrderedDict()
+        # Reached from the UDP receive thread and from every TCP client
+        # thread at once: without this, one thread's move_to_end could raise
+        # KeyError for a key another had just evicted, and the message was
+        # silently dropped as a receive error.
+        self._rate_lock = threading.Lock()
         self._rate = 0.0
         self._max_tcp_clients = 64
         # (thread, socket) per accepted connection, not just the thread: a
@@ -193,20 +198,22 @@ class SyslogCollector(udpsock.UdpReceiver):
         """
         if self._rate <= 0:
             return True
-        bucket = self._buckets.get(source)
-        if bucket is None:
-            bucket = [self._rate, now]
-            self._buckets[source] = bucket
-            while len(self._buckets) > MAX_RATE_SOURCES:
-                self._buckets.popitem(last=False)
-        else:
-            self._buckets.move_to_end(source)
-            bucket[0] = min(self._rate, bucket[0] + (now - bucket[1]) * self._rate)
-            bucket[1] = now
-        if bucket[0] < 1.0:
-            return False
-        bucket[0] -= 1.0
-        return True
+        with self._rate_lock:
+            bucket = self._buckets.get(source)
+            if bucket is None:
+                bucket = [self._rate, now]
+                self._buckets[source] = bucket
+                while len(self._buckets) > MAX_RATE_SOURCES:
+                    self._buckets.popitem(last=False)
+            else:
+                self._buckets.move_to_end(source)
+                bucket[0] = min(self._rate,
+                                bucket[0] + (now - bucket[1]) * self._rate)
+                bucket[1] = now
+            if bucket[0] < 1.0:
+                return False
+            bucket[0] -= 1.0
+            return True
 
     # ----------------------------------------------------------------- threads
 
@@ -215,11 +222,13 @@ class SyslogCollector(udpsock.UdpReceiver):
         # to refresh "last message just now", so the status strip read healthy
         # while every packet was being thrown away.
         if not self._accepted(source):
-            self.counters["rejected"] += 1
+            with self._rate_lock:
+                self.counters["rejected"] += 1
             return
         now = time.time()
         if not self._within_rate(source, now):
-            self.counters["throttled"] += 1
+            with self._rate_lock:
+                self.counters["throttled"] += 1
             self._log_throttled("throttle",
                                 f"Throttling syslog from {source}: more than "
                                 f"{self._rate:.0f} messages a second",
@@ -230,8 +239,9 @@ class SyslogCollector(udpsock.UdpReceiver):
                                        "the per-source rate in Settings to keep "
                                        "them all.")
             return
-        self.counters["messages"] += 1
-        self.counters["last_message"] = now
+        with self._rate_lock:
+            self.counters["messages"] += 1
+            self.counters["last_message"] = now
         if self._first_from(source):
             self.log.add(SYSTEM, f"First syslog message from {source}",
                          target=source)
@@ -273,6 +283,18 @@ class SyslogCollector(udpsock.UdpReceiver):
             # exhausted threads and then memory. Dead ones are reaped on every
             # accept and the live ones are capped.
             address = (udpsock.normalise_source(address[0]),) + tuple(address[1:])
+            # Before the slot, not per message: allowed_sources was applied
+            # in _enqueue alone, so a source outside it still held one of the
+            # (default 64) connections and its thread for up to 30 seconds
+            # an idle period, while real devices were refused.
+            if not self._accepted(address[0]):
+                with self._rate_lock:
+                    self.counters["rejected"] += 1
+                try:
+                    client.close()
+                except OSError:
+                    pass
+                continue
             self._clients = [pair for pair in self._clients if pair[0].is_alive()]
             self.counters["tcp_clients"] = len(self._clients)
             if len(self._clients) >= self._max_tcp_clients:

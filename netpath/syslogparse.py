@@ -46,12 +46,21 @@ CLOCK_SKEW_S = 3600.0
 # more to parse; see _strip_structured_data for what it costs without a cap.
 MAX_SD_ELEMENTS = 64
 
-# Every *run* of C0 control bytes (0x00-0x1F) and DEL (0x7F), replaced with a
-# single space rather than deleted — an embedded ESC sequence is a terminal-
-# escape-injection primitive for any later CLI/export consumer, but deleting
-# outright would weld adjacent words together across a legitimate multi-line
-# message (a stack trace, a config diff) sent as one datagram.
-_CONTROL_BYTES = re.compile(r"[\x00-\x1f\x7f]+")
+# Every *run* of C0 control bytes (0x00-0x1F), DEL (0x7F), the C1 range
+# (0x80-0x9F) and the bidi overrides, replaced with a single space rather
+# than deleted — an embedded ESC sequence is a terminal-escape-injection
+# primitive for any later CLI/export consumer, but deleting outright would
+# weld adjacent words together across a legitimate multi-line message (a
+# stack trace, a config diff) sent as one datagram.
+#
+# C1 is in the class for the same reason C0 is: U+009B is the 8-bit CSI
+# introducer, so b"\xc2\x9b2J" decodes cleanly through
+# data.decode("utf-8", "replace") and is CSI 2J to a terminal in 8-bit mode.
+# The bidi overrides (U+202A-202E, U+2066-2069) reorder the rendering of
+# everything after them, which is how a message makes an export read as
+# something it does not say.
+_CONTROL_BYTES = re.compile(
+    "[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]+")
 
 
 def _strip_control(text: str) -> str:

@@ -31,6 +31,13 @@ covered in full in `CREDENTIAL-SECURITY.md`, not repeated here.
 | ICMP Echo Reply (type 0) from the destination | ICMP | — | Windows only, for NetPath |
 | UDP Port Unreachable replies from the destination | ICMP | — | macOS/Linux only, for NetPath |
 
+**The web server accepts 512 simultaneous connections, from 5.9.1.** One
+accepted connection is one thread held for the keep-alive timeout, so the
+count is bounded here rather than left to the operating system; a connection
+arriving over the ceiling is closed straight away. That is far above any real
+operator population, but worth knowing where 8443 sits behind a reverse proxy
+or a load balancer that keeps connections open on its own account.
+
 **IPv6.** From 4.39.0 the three collectors bind dual-stack where the operating
 system allows it (`AF_INET6` with `IPV6_V6ONLY` off, falling back to IPv4 if
 that is refused), and a source arriving as an IPv4-mapped address is normalised
