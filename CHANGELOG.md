@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.11.0 — Four asks, one deferred](#5110--four-asks-one-deferred)
 - [5.10.0 — Six asks](#5100--six-asks)
 - [5.9.1 — Second full code review: eighty-one findings](#591--second-full-code-review-eighty-one-findings)
 - [5.9.0 — Six asks](#590--six-asks)
@@ -138,6 +139,131 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.11.0 — Four asks, one deferred
+
+Four reports from the floor, and one where the right next step is a
+person's judgement, not a patch.
+
+**A device flagged "1 override" is for the operator to read, not for this
+release to explain.** That marker is the 5.9.0 feature: a device whose own
+polling-profile columns diverge from what its group's profile sets gets a
+sortable **Overrides** column and an "Only with overrides" filter, naming
+which columns it overrode. Whether one particular device's single override
+is legitimate — something an operator chose on purpose — or accidental is
+not a question the marker itself can answer, and no code change here
+decides it either. The likely source, if it turns out to be accidental, is
+`_auto_assign_mib`: the poller's own automatic MIB assignment writes
+`mib_file_id` onto the device the first time it identifies which uploaded
+MIB describes that device's vendor-specific data, and that column is an
+ordinary override column like any other, so a device the poller has
+fingerprinted for itself reads exactly like one an operator configured by
+hand. **Deferred** — the operator will check that device's override against
+its polling profile and report back on whether it is a defect worth a fix
+or the auto-assignment working as designed.
+
+**A mute now lasts up to 7 days, not 24 hours.** An operator working a box
+for a week was re-muting it every day or reaching for a maintenance window
+just to get past a weekend. `MAX_MUTE_HOURS` — the server-side cap behind
+every mute, ad-hoc or bulk — rises from 24 to 168, and the `MUTE_HOURS`
+dropdown that drives both the alert detail's *Mute device* button and
+*Bulk mute* gains a **7 days** entry alongside 1, 6, 12 and 24 hours, through
+one shared `muteLabel()` so an hour count that happens to be a whole number
+of days reads as "N days" rather than a number nobody wants to convert. The
+prose that promised 24 hours — the engine's held-notice docstring, the
+Availability report's caveat, `FEATURES.md`, `RUNBOOK.md` and
+`INTERNALS.md` — is corrected with it. A **maintenance window** is still
+the answer for anything longer than a week: it has no cap and no expiry an
+operator has to remember to extend, where a mute is deliberately a
+short, capped, self-expiring silence.
+
+**One rule on one device can be muted, without muting the whole box.**
+Silencing a device to quiet one noisy rule hides every *other* thing that
+device might do while it is silenced — the outage an operator actually
+cares about. **Mute alert** now sits beside **Mute device** in the alert
+detail, sharing the same duration dropdown, and covers exactly that rule on
+that device, nothing wider. Storage reuses the existing `alert_mutes`
+table rather than adding one: a new entity kind, `device_rule`, with
+`entity_id` written as `"<device_id>:<rule_key>"` — rule keys never carry a
+colon, so the pair splits back out unambiguously — needs no migration and
+no new column. The engine checks it inside `_apply`, right where both
+halves of the pair — the rule and the device an occurrence is about — are
+already in hand, counted separately as `rule_muted` beside the existing
+`muted` counter; the three notification paths that already answer for a
+device mute — the renotify sweep, the recovery mail, and a first notice
+held past its backlog grace — take the same check, so muting a rule
+silences it as completely as muting the device would, just narrower. A
+switch's interface occurrence resolves to its device the same way a device
+mute already does, so muting a port-flap rule on a switch covers all of
+its ports. The Alerts list tags a muted alert's rule name with **muted**;
+Nodes shows **"N alerts muted"** on a device whose rules are muted without
+the device itself being muted (a device-wide mute already says enough on
+its own); the device pane names each muted rule and its expiry rather than
+just counting them, since that is the one place with room to say which.
+`forget_device` drops a device's rule mutes with it, and `merge_device`
+carries them to the survivor, rewriting the device half of each id — with
+`OR IGNORE`, since the surviving device may already hold a mute on the same
+rule. The mute API takes `rule_key` beside the usual `entity_id`, refuses
+an unknown rule key on the way in (a mute that silences nothing is worse
+than an error) but deliberately not on the way out, so a rule deleted out
+from under a live mute can still be lifted, and audits the target as
+`device_rule:<device_id>:<rule_key>`.
+
+**"The Debug event log seems to randomly clear" was three faults at
+once, not one.** `EventLog._seq` counts from 0 in each process, and the
+buffer itself is memory only, so after a self-update, a service restart or
+a crash the page kept polling `since=<a large seq the previous process
+had reached>` — a cursor that would never match anything again — and the
+next reload showed an almost-empty log, which is what actually looked like
+random clearing. `EventLog` now carries an `epoch`, returned beside
+`last_seq` on `/api/debug`; `debug.js` resyncs from zero the moment the
+epoch changes or the server's own cursor reads as having gone backwards,
+with one refetch at `since=0` rather than a page the operator has to
+reload by hand. The service itself writes **"Event log started"** as the
+first event of every run, so the boundary between one run's history and
+the next is a line in the log rather than something inferred from its
+absence. Clearing the log on purpose deliberately does not reset `_seq` or
+look like a restart to this check. The second, smaller fault: `get_debug`
+read the cursor and the event batch under two separate lock holds, so an
+event appended in the gap between them was both missing from that batch
+and already behind the cursor handed back — delivered to nobody, ever.
+`since_with_seq()` returns both from one hold, closing the gap. Last, the
+ring itself was a hard-coded 3,000 events — minutes of history on a large
+fleet — raised to a `DEFAULT_CAPACITY` of 10,000 with a new
+`debug_log_capacity` setting (1,000–50,000) in Settings → Refresh rates,
+applied to the running log immediately through `apply_global_settings` as
+well as at startup; `set_capacity` rebuilds the deque, keeping the newest
+events on a shrink. The page's own in-memory trim now follows the server's
+capacity instead of its old fixed 3,000, while `EVENT_ROW_CAP` stays its
+own separate DOM bound.
+
+**Neighbours names a device that only ever reported an IP address.**
+Nodes → Devices → Device Details → Neighbours showed a bare address in the
+**Remote device** column wherever LLDP sent a subtype-5 (network address)
+chassis id or CDP reported an address as the device's own id. That row is
+now named through the same chain the Syslog **Host** column already uses:
+first a Nodes device answering on that address (by polling address, then
+its alias table), and failing that the reverse-DNS cache. `nodepoll`'s
+private `_format_cdp_address` is now the public `format_cdp_address`,
+reused by a new `format_chassis_address` that strips the IANA
+address-family byte an LLDP subtype-5 chassis id carries before its raw
+address octets. The lookup is cache-only on the request path, the same
+restraint the Host column applies — nothing is resolved live while a page
+is open — with the addresses themselves queued by
+`nodesdb.neighbour_addresses()` into `Service._extra_resolve_targets` so
+the existing background resolver is what actually fills the cache. A
+device match makes the row a link into Nodes exactly like any other
+matched neighbour; a cache-only DNS hit fills `resolved_name` with source
+`"dns"`; anything still unknown shows the bare address as before. The
+neighbours CSV export gains `resolved_name` and `resolved_source` columns
+alongside the existing ones. `_NEIGHBOR_MATCH_SQL` itself is untouched —
+MAPPER keys its own links off those raw rows — so all of this happens over
+the JSON in `api._resolve_neighbor_names`, once per request, after the raw
+match.
+
+No feature, page, dialog, button, endpoint or setting was removed to make
+any of this work, and the application stays standard-library-only — no
+part of the above needed a dependency.
 
 ### 5.10.0 — Six asks
 

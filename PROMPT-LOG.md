@@ -253,3 +253,30 @@ the branch and both are pushed.
 4. **Neighbours: name the remote device.**
 → Three Opus lanes (alerts, debug log, neighbours), then three Opus reviewers,
 with Sonnet for docs and the test runs.
+
+**Deployment complete** — four of the five items shipped; the fifth, the "1
+override" marker, is deferred to the operator's own check rather than a
+code change. The mute cap rose from 24 hours to 168 (7 days) everywhere the
+mute dropdown appears, on the server and in both the alert detail and Bulk
+mute. A per-alert mute — **Mute alert** beside **Mute device** — scopes to
+one rule on one device, stored in the existing `alert_mutes` table as
+entity kind `device_rule` with no migration, checked in the engine's
+`_apply` alongside the renotify, recovery-mail and held-first-notice gates
+it already had, surfaced as a tag on the Alerts list, a count on Nodes and
+a named list in the device pane, and carried through `forget_device` and
+`merge_device`. The Debug event log's three faults — the page's cursor not
+surviving a server restart, the cursor-and-batch read across two lock
+holds, and a fixed 3,000-event ring — are fixed: a `log_epoch` per process
+plus a cursor-went-backwards check drives a one-time refetch from zero, one
+lock hold now covers a snapshot of both cursor and batch, and the ring is
+10,000 by default with a new `debug_log_capacity` setting (1,000–50,000)
+applied live, with an "Event log started" line marking every restart.
+Neighbours names an IP-only remote through the same chain Syslog's Host
+column uses — a matched Nodes device, then the reverse-DNS cache — cache
+only, with the addresses queued for the background resolver; the CSV
+export gained `resolved_name` and `resolved_source`, and MAPPER's own
+matching SQL is untouched. `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`
+and `RUNBOOK.md` are updated to match. The full test suite and the browser
+walk, then a code review of the day's changes, follow once at the end, as
+the standing constraint requires — counts and findings appended here when
+they complete.
