@@ -56,7 +56,8 @@ netpath/
                    elapsed-time formatting; the Worker mixin background
                    workers subclass for start/stop/status plumbing
   auth.py          password hashing, sessions, login throttling
-  eventlog.py      bounded in-memory event buffer
+  eventlog.py      bounded in-memory event buffer (see "The debug log's
+                   cursor" below)
   appdb.py         app.db: global settings, users, shared reverse-DNS cache
   dpapi.py         Windows DPAPI wrapper for the stored DHCP credential
   ipamdb.py        ipam.db: subnets, hosts, conflicts, DHCP scopes/leases
@@ -9587,3 +9588,38 @@ names the collateral (interfaces, metric history, events, and the ConfigRX
 settings, credential and stored backups that `delete_nodes_device` drops
 through `forget_device`); like Clear credential it passes `afterClose` to
 reopen the editor when the operator backs out. Bulk Delete is untouched.
+
+### The debug log's cursor, its epoch and its depth (`eventlog.py`)
+
+Three faults sat behind one report, "the Debug event log seems to randomly
+clear".
+
+`EventLog._seq` counts from 0 in each process and the buffer is memory only,
+so after a restart the server's sequence is back near 1 while the page is
+still polling `since=<a large seq from the previous process>`. Nothing ever
+matches, `refresh()` only appended when `payload.events.length` was non-zero,
+and the operator's eventual reload showed an almost empty log. `EventLog`
+now carries `epoch` (the `time.time()` of its construction) and `get_debug`
+returns it beside `last_seq`; `debug.js` resyncs — cursor to 0, events,
+selection, drawn-seq and the destination drop-down cleared — when either the
+epoch changes or `payload.last_seq < view.seq`, then refetches once. That
+refetch asks `since=0`, so it cannot re-trigger the same branch. A **Clear**
+leaves `_seq` running deliberately, which is why it is not read as a restart.
+`Service.__init__` writes `Event log started` as event 1, so the boundary is
+in the log itself rather than only inferable from a gap.
+
+`get_debug` read `service.log.since(since)` and `service.log.last_seq` under
+two separate lock holds. An event appended between them was absent from the
+batch and already behind the cursor handed back, so the next poll asked for
+`> last_seq` and never delivered it. `since_with_seq()` returns both from one
+hold. `tests/test_debug_log_cursor.py` asserts `last_seq == max(e.seq for e
+in events)` against a thread hammering `add()`; the two-lock version fails it.
+
+Capacity was a hardcoded 3,000, minutes of history on a large fleet. It is
+`DEFAULT_CAPACITY = 10000` and the global setting `debug_log_capacity`
+(1,000–50,000), applied in `__init__` once the settings load and again in
+`apply_global_settings` so it takes effect live. `set_capacity` rebuilds the
+deque as `deque(self._events, maxlen=n)`, which keeps the *last* n — a shrink
+drops the oldest, which is the only sensible direction for a log. The page's
+in-memory trim follows the server's `capacity`; `EVENT_ROW_CAP = 2000` stays
+its own number because it bounds table rows in the DOM, not history held.

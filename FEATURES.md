@@ -3440,7 +3440,18 @@ disk.
   the exact error text — so "is this device really not answering, or is it
   something else" has a concrete answer instead of a guess. Cumulative
   poll counters (ok/timeout/auth-failed/unsupported/error) show in the
-  status strip alongside the trace/DNS/IPAM/Nodes summary line.
+  status strip alongside the trace/DNS/IPAM/Nodes summary line. How many
+  events the log keeps is **Debug log keeps N events** under Settings →
+  Refresh rates (1,000–50,000, 10,000 by default; it was a fixed 3,000,
+  which on a large fleet is minutes of history). Changing it applies to the
+  running log immediately — no restart.
+- **Restarts are visible, and the page follows them.** The log lives in
+  memory, so a service restart, a self-update or a crash starts a new one:
+  its first line is always **Event log started**, which is the boundary
+  between one run's history and the next. The page notices the new log on
+  its next poll and reloads the log from the top by itself, rather than
+  sitting on a position in the old log and showing nothing — which is what
+  made a restart look like the log had spontaneously cleared.
 - Filter by destination, by category (Traceroute, Reverse DNS, NetFlow, SNMP
   Trap, Nodes, Alerts, IPAM, Wireless, ConfigRX, System, Errors) or by free
   text across both messages and details. **All** and **None** beside the
