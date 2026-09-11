@@ -6,8 +6,9 @@ disk, in one place.
 Nothing outside this document is opened, contacted or written: there is no
 telemetry, no update check, no outbound connection to anywhere but the plant
 (the poller's own targets, and — from 5.1.0 — a device's own web interface
-when an operator opens a WEB tunnel to it), and no file created anywhere
-other than the locations below. How the credentials that do exist — a web
+when an operator opens a WEB tunnel to it) or a URL an operator has
+explicitly configured (a NetPath destination's own web page check, from
+5.10.0), and no file created anywhere other than the locations below. How the credentials that do exist — a web
 login password, an optional stored DHCP credential, an optional stored
 SNMPv3, SMTP, Wireless SNMP or ConfigRX SSH credential — are protected is
 covered in full in `CREDENTIAL-SECURITY.md`, not repeated here.
@@ -132,9 +133,11 @@ reachable.
 | Nodes per-device or per-subnet discovery | ICMP Echo Request (type 8), then UDP 161 | — | Same shape as IPAM's own subnet sweep, plus an SNMP identity probe against whatever answers |
 | Nodes per-port VLAN membership walk, for MAPPER | UDP | 161 (fixed) | Q-BRIDGE-MIB column walk against every device, plus CISCO-VTP-MIB on Cisco gear, on `vlan_interval_s` (default one hour, 0 disables it) — the same port and the same GET/GETBULK shape as ordinary SNMP polling, no new port and no new device credential |
 | Nodes ARP cache walk | UDP | 161 (fixed) | `ipNetToMediaTable`, falling back to `ipNetToPhysicalTable` only when the first answers no rows at all, on `arp_table_interval_s` — **0, disabled, unless a polling profile or device sets it**, unlike the VLAN walk above: the same port, credential and GET/GETBULK shape as ordinary SNMP polling, but a router's ARP cache is routinely the largest table this poller reads, so it is opt-in rather than on for every upgraded fleet |
+| Nodes software version/image identification, from 5.10.0 | UDP | 161 (fixed) | One extra best-effort GET per device per identity poll, of that device's own vendor version/image objects plus ENTITY-MIB's `entPhysicalSoftwareRev` — the same port and credential as ordinary SNMP polling, and never a cause of poll failure on its own |
 | Alerts email notification | TCP (SMTP) | 25/587/465 (server-dependent) | Only if email notification is enabled; none, STARTTLS or SSL/TLS per the configured server |
 | Wireless SNMP polling | UDP | 161 (fixed) | GETNEXT to each configured FortiGate Wireless Controller, on its own poll interval — never to the APs behind it individually |
 | ConfigRX config backup | TCP (SSH) | 22 (configurable per device) | Only for a device with backup enabled and a credential stored; read-only — one fixed "show config" command, plus, for a vendor whose login shell is not already privileged EXEC (currently just Cisco ASA), a fixed `enable` step; never a push |
+| NetPath web page check, from 5.10.0 | TCP (HTTPS) | 443, or the URL's own port | Only for a destination with a page URL set — one GET per destination per trace interval, to whatever host and port the URL names |
 
 Traceroute probes go to every destination you add, and to every router on the
 path to it. Firewalls between here and a destination need to permit the probe
@@ -190,6 +193,18 @@ login shell (currently just Cisco ASA), the fixed `enable` command,
 answered with that device's own stored enable secret — never anything
 that could change a device's configuration.
 
+A NetPath destination's **web page check**, from 5.10.0, is one plain
+HTTPS GET per configured destination per trace interval — the same
+schedule as its traceroute, a separate worker pool from it. Certificates
+are verified against the system store plus the application's own bundled
+CA file unless a destination opts out with **Accept an untrusted
+certificate**, for an appliance whose management page carries a
+self-signed one. A redirect is followed up to five hops and refused
+outright if it ever lands off HTTPS. The URL is whatever an operator
+types into a destination's WEB PAGE field — it need not resolve to the
+destination's own host or port, so a firewall rule written for the
+traceroute above does not automatically cover it.
+
 A **device WEB tunnel** is the other outbound TCP connection this
 application makes, and only while an operator has one open: a connection to
 one device's own web interface, on the scheme and port that device's record
@@ -225,10 +240,10 @@ sFlow, syslog over TLS, NetFlow over TCP or SCTP, and IPv6 flow export are
 not supported. SNMPv3 `authPriv` is supported for Nodes polling since
 5.8.0 (AES-128-CFB only — no DES, no AES-192/256), not for the wireless
 poller and not yet for inbound traps; v3 informs are not acknowledged —
-see `FEATURES.md`. The application makes no
+see `FEATURES.md`. Otherwise the application makes no
 outbound connection to the internet other than DNS, the traceroute probes
-themselves, and — only if Alerts' email notification is turned on — the
-configured SMTP server.
+themselves, and — only if enabled — Alerts' configured SMTP server, or,
+from 5.10.0, a NetPath destination's own web page check.
 
 ---
 
@@ -243,12 +258,12 @@ code directory can be read-only.
 | File | Holds | Grows with |
 | --- | --- | --- |
 | `app.db` | Global settings, user accounts, the shared reverse-DNS cache | Distinct addresses seen — kilobytes |
-| `netpath.db` | Destinations, traces, per-hop samples, NetPath settings | Trace frequency |
+| `netpath.db` | Destinations, traces, per-hop samples, web-page checks (`https_checks`, from 5.10.0), NetPath settings | Trace frequency, plus one row per web-page check where a destination has a URL set |
 | `flows.db` | Flow records, exporters, interface names, NetFlow settings | Exported flow volume |
 | `snmptraps.db` | Traps, hourly rollup counts, SNMP Trap settings | Trap rate — normally light; a device stuck in a fault loop is the exception |
 | `syslog.db` | Messages, hourly rollup counts, the search index, Syslog settings | Message rate — the substring index is roughly the size of the messages again |
 | `ipam.db` | Subnets, discovered hosts, conflicts, DHCP scopes and leases, IPAM settings, an optional DHCP credential | Subnet sizes swept and DHCP scope sizes — bounded by the per-subnet address cap |
-| `nodes.db` | Devices, polling profiles, interfaces, device/interface events, discovery jobs, MAC, ARP and LLDP/CDP tables, per-port VLAN membership, Nodes settings, optional SNMPv3 credentials | Device count, and the two event tables — the inventory itself is nearly static. The ARP table is off by default and, where enabled, can dwarf the MAC table on a router with a large cache |
+| `nodes.db` | Devices, polling profiles, interfaces, device/interface events, discovery jobs, MAC, ARP and LLDP/CDP tables, per-port VLAN membership, device-purge tombstones (`device_purges`, from 5.10.0), Nodes settings, optional SNMPv3 credentials | Device count, and the two event tables — the inventory itself is nearly static. The ARP table is off by default and, where enabled, can dwarf the MAC table on a router with a large cache. `device_purges` holds one row per device currently being deleted in the background and is empty otherwise |
 | `nodes_series.db` | Polled metric definitions, their raw samples and the hourly rollups | Device count × poll frequency × metrics per device — the Nodes file that actually grows |
 | `nodes_mibs.db` | Uploaded MIB files (original text kept for re-parsing) and the objects parsed out of them | How many vendor MIB bundles you install — a few MB each, and static between uploads |
 | `alerts.db` | Rules, email templates, alerts, notification history, Alerts settings, an optional SMTP credential | Alert volume — normally light; a flapping device or a noisy threshold is the exception |

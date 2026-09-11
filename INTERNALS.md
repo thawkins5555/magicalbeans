@@ -32,7 +32,10 @@ netpath/
   selfupdate.py    self-update: check, download, swap, restart
   tracer.py        runs traceroute/tracert, parses output
   db.py            NetPath's SQLite: targets, traces, hops
-  monitor.py       Monitor (trace scheduler), Resolver (reverse DNS)
+  monitor.py       Monitor (trace scheduler), Resolver (reverse DNS),
+                   HttpsChecker (per-destination web page checks) — 5.10.0
+  httpcheck.py     one HTTPS GET, mapped to available/unavailable-with-a-
+                   reason: redirect limit, body cap, certificate verify — 5.10.0
   analysis.py      traces -> topology graph, traces -> timeline buckets
   theme.py         palettes, fonts, stylesheet for the console window
   nfdecode.py      NetFlow v5/v9/IPFIX decoding, template cache
@@ -64,6 +67,8 @@ netpath/
                    also the OID constants for FortiGate Wireless Controller
                    polling
   nodepoll.py      NodePoller: the per-device SNMP/ping scheduler
+  swversion.py     pure sysDescr/vendor-OID parser: splits a device's
+                   software version, image and boot-image file — 5.10.0
   nodesdb.py       nodes.db: devices, profiles, interfaces, state
                    events, discovery jobs; the facade over the two below
   nodesseriesdb.py nodes_series.db: metrics, samples, samples_hourly
@@ -103,8 +108,9 @@ netpath/
   sshterm.py       interactive SSH sessions for the browser terminal,
                    over a WebSocket
   permissions.py   the per-module read/write permission model
-  report.py        availability and link-saturation reports, from
-                   history Nodes and Alerts already keep
+  report.py        availability, link-saturation and (5.10.0) firmware-
+                   inventory reports, from history and identity data Nodes
+                   and Alerts already keep
   sqlitebase.py    the `SqliteStore` base class every database module
                    subclasses (open/pragma/migrate/close, settings,
                    trim/reclaim); opens a SQLite file with owner-only
@@ -853,6 +859,63 @@ away; it is now stored, because an IANA arc assignment and a sysDescr
 substring guess are not equally trustworthy and the header used to present
 them identically.
 
+### Software version and image (`swversion.py`, `nodepoll._poll_software_version`) — 5.10.0
+
+Pure and dependency-free — no I/O, no SNMP, no database — `swversion.py`
+takes the enterprise arc `vendorid.py` already worked out, the `sys_descr`
+already in hand, and a small `{oid: value}` dict from **one extra
+best-effort GET per device per identity poll** (`oids_for(arc)`: the
+vendor's own version/image scalars where `nodeoids.SW_VERSION_OIDS` names
+any, deduplicated against ENTITY-MIB's `entPhysicalSoftwareRev.1`, which
+is always appended). That GET goes through `_identity_extras` — the same
+helper the custom identity-OID probe already used — so on SNMPv1 a
+`noSuchName` spoils only this one request, never the six system scalars,
+and a device that answers none of it costs nothing but the datagram; it
+is never allowed to fail the poll.
+
+`extract(arc, sys_descr, scalars)` tries, **in this order**, the arc's own
+rule (its vendor scalar first, then a sysDescr pattern specific to that
+vendor — `_RULES`, keyed by enterprise number: 9 Cisco, 12356 Fortinet,
+2636 Juniper, 11 and 14823 HP/Aruba ProCurve, 25506 Comware, 30065 Arista,
+1916 Extreme, 14988 MikroTik, 41112/10002 Ubiquiti/UniFi, 25461 Palo
+Alto, 674 Dell, 1991 Brocade/Ruckus), then, for an arc with no rule or a
+rule that matched nothing, `entPhysicalSoftwareRev` itself, then a
+deliberately narrow generic sysDescr regex (`(?:firmware|version|
+revision|release)[:\s]+v?([0-9][\w.()-]*)` — it must start with a digit
+straight after one of those four words, so "Linux 5.15.0-76-generic
+#83-Ubuntu SMP", which names no such word, falls through to nothing
+rather than a guess). A device that matches nothing at every stage comes
+back as three empty strings, stored as `NULL` and shown as nothing — it
+never invents a version. `SwInfo.source` names which of the four rules
+actually answered, for anyone reading the code rather than the UI; it is
+not itself persisted.
+
+Cisco's rule is the one with a third field: `image_file` is
+`OLD-CISCO-SYS-MIB`'s `sysConfigName` (`nodeoids.CISCO_SYS_CONFIG_NAME`,
+OID `1.3.6.1.4.1.9.2.1.73.0`) — "the name of the system boot image", a
+file path such as `flash:/c2960x-universalk9-mz.152-7.E4.bin`, or
+`bootflash:packages.conf` on an IOS-XE box running in install mode, which
+says nothing else useful in `sysDescr` at all. The version/image split
+itself comes from `_CISCO_IMAGE_VERSION`
+(`\(([^()]{1,64})\)\s*,\s*Version\s+([^,\s]+)`, anchored on the
+parenthesis immediately followed by `, Version` so IOS's own `(tm)` never
+matches it), which is the one shape every Cisco train writes end to end —
+IOS's `(C2960X-UNIVERSALK9-M), Version 15.2(7)E4`, IOS-XE's `(CAT9K_IOSXE),
+Version 17.9.4a`, NX-OS's `Software (NXOS 64-bit), Version 9.3(8)`. On an
+install-mode box with no such parenthesis, `image` falls back to the boot
+file's own basename, stripped of its path and volume prefix.
+
+`nodesdb.py` stores the three fields as `devices.sw_version`, `sw_image`,
+`sw_image_file` (plain `ensure_columns` migration), searchable by the
+device search box. `seed_identity()` — called when a discovery result is
+promoted — also calls `swversion.extract()` itself, with an empty
+`scalars` dict, since a discovery sweep reads only `sysDescr` and
+`sysObjectID` and never gets as far as the vendor-scalar GET: enough for
+every vendor whose rule writes its version straight into `sysDescr`, so a
+just-promoted device shows a version immediately rather than waiting for
+its first full poll, which then overwrites it with the vendor-scalar
+answer where one exists.
+
 ### UPS and environmental health (`nodeoids.py`, `nodepoll.py`, `alertsdb.py`) — 4.49.0
 
 Two new best-effort reads ride the ordinary poll, both added because a plant
@@ -1427,14 +1490,109 @@ profile, losing an organizational folder is harmless.
 
 **Bulk device operations** (`bulk_update_devices`/`bulk_remove_devices`,
 `nodesdb.py`; `post_nodes_devices_bulk_update`/`_bulk_delete`, `api.py`):
-one `UPDATE ... WHERE id IN (...)` / `DELETE ... WHERE id IN (...)`
-inside a single lock/commit per call, the same "operate on a list of
-ids from one request" shape `post_nodes_discovery_promote`'s
-`result_ids` list already established, rather than one HTTP round trip
-per device. `bulk_update_devices` reuses `update_device`'s
-`_DEVICE_EDITABLE` allow-list unchanged, so a bulk "remove from group"
-is exactly `device_group_id: null` through the same code path a
-single-device edit already uses — no separate "clear" endpoint.
+one `UPDATE ... WHERE id IN (...)` for an edit, inside a single
+lock/commit per call, the same "operate on a list of ids from one
+request" shape `post_nodes_discovery_promote`'s `result_ids` list already
+established, rather than one HTTP round trip per device.
+`bulk_update_devices` reuses `update_device`'s `_DEVICE_EDITABLE`
+allow-list unchanged, so a bulk "remove from group" is exactly
+`device_group_id: null` through the same code path a single-device edit
+already uses — no separate "clear" endpoint. `bulk_remove_devices` no
+longer does one `DELETE ... WHERE id IN (...)`, from 5.10.0 — see *Device
+delete: an asynchronous purge*, below, for what it does instead and why.
+
+### Device delete: an asynchronous purge (`nodesdb.py`, `web/service.py`, `web/api.py`, `console.py`) — 5.10.0
+
+A device delete is the one write whose size is set by how long the
+device was polled — up to millions of sample rows for a long-polled
+chassis — and it used to run as one transaction under `nodes.db`'s single
+lock: the poll cycle, every other read and the browser's own 30-second
+request timeout all waited on it, and a chassis with enough history could
+make the delete itself look like the failure.
+
+`delete_nodes_device`/`post_nodes_devices_bulk_delete` (`api.py`) no
+longer delete anything directly. They call `alerts_db.forget_device`,
+`configrx_db.forget_device` and `mapper_db.forget_device` (unchanged —
+these were already small), then `nodesdb.request_device_removal(ids)`,
+which runs in one short transaction: an `INSERT OR IGNORE INTO
+device_purges(device_id, ip, name, requested_ts, phase='queued')` row per
+device, and `UPDATE devices SET enabled = 0, ip = 'purging:' || id`. That
+rewrite is deliberate — the device stops being polled and disappears from
+the list, counts and scheduler at once, *and* its address is freed
+immediately, so deleting a device to re-add it at the same IP does not
+mean waiting out the purge. The route then calls
+`service.device_purger.wake()` and returns `{"ok": true, "queued": n}`
+within about a second regardless of how much history is behind it.
+
+`device_purges` (`device_id INTEGER PRIMARY KEY, ip, name, requested_ts,
+phase, rows_removed`) is the tombstone: `devices.id` is `INTEGER PRIMARY
+KEY` **without** `AUTOINCREMENT`, so SQLite reissues a freed rowid to the
+next device added, and this row is what reserves the id until every
+child and series row behind it is actually gone — a freed address handed
+to a new device can never inherit the old one's thresholds, mutes or
+configuration this way.
+
+**`service.DevicePurger`** (`web/service.py`, a `Worker`) is a single
+background thread: `_loop` calls `nodesdb.purge_step()` in a cycle,
+resting `REST_S` (50 ms) between calls while work remains and waking
+either on `device_purger.wake()` (called by the delete routes) or every
+`TICK_S` (5 s) otherwise, so a purge left queued from a previous run does
+not need anyone to wake it. `purge_step()` pulls the oldest queued device
+(`_next_purge`, ordered by `requested_ts`) and calls `_purge_device`,
+which deletes that one device's rows in this order and this order only:
+`nodes_series.db`'s samples/rollups first (`delete_metrics_for_device_batched`
+— the large half, and in the other file), then, table by table,
+`interface_events`, `interfaces`, `interface_thresholds`, `mac_entries`,
+`arp_entries`, `neighbors`, `device_addresses`, `device_events`, `vlans`,
+`vlan_ports` and `port_vlans` (`_PURGE_TABLES` — the last three carry no
+foreign key at all, so before 5.10.0 a device delete orphaned them
+rather than removing them), each batched by `_delete_rows_batched`
+(rowid-range chunks, the same `_delete_batches` shape every other prune
+in this app uses). **Only once every one of those has finished** does it
+null `upstream_id` references onto this device (another column with no
+foreign key), delete the `devices` row itself, and delete its own
+`device_purges` tombstone — in one final transaction, so a device's row
+is always either fully purged or not deleted at all, and the id becomes
+reusable only from that commit. `PURGE_BUDGET_S` (1.0 s) bounds how much
+one `purge_step()` call does before returning, so the purge thread never
+holds any one lock for long; `remove_device`/`bulk_remove_devices`, kept
+for callers that still want synchronous behaviour (tests, the demo
+seeder, `bulk_remove_devices` itself which purges "here and now" per its
+own docstring), call `request_device_removal` followed by `purge_all()`,
+which just loops `purge_step()` to completion.
+
+A restart resumes an interrupted purge with nothing extra to do: the
+`device_purges` rows are the only state, so `purge_step()` picks up
+exactly where it left off. `GET /api/nodes/purges`
+(`purge_status()` → `{pending, rows_removed, current: {ip, name,
+phase}}`) is also folded into `/api/state`'s `nodes.purges`, which is
+what drives the Nodes status strip's "purging history for N device(s)".
+
+A second, unrelated fix travelled with this one because it has the same
+cause: the desktop console's storage card read every store's
+`size_bytes()`/`oldest_ts()` on the GUI thread once a second, each call
+taking that store's lock — a lock a purge batch, a poll or a prune could
+be holding — so a slow read froze the whole window. `_refresh_storage`
+now hands the read to a short-lived worker thread (`_read_storage`) and
+the GUI thread only ever receives the finished text over a Qt signal
+(`storage_ready`); the card keeps showing its last figures while a read
+is in flight rather than blocking, and a store that raises mid-read
+(closing under a shutdown) is swallowed rather than shown as a
+traceback.
+
+The one new index this needed is on `discovery_results.promoted_device_id`
+(`ix_discovery_results_promoted`) — the one foreign key in `nodesdb.py`
+with `ON DELETE SET NULL` and no index of its own, which every device
+delete's cascade was scanning the whole discovery history to satisfy.
+
+Measured with `tests/bench_prune.py`'s "device delete" case at 290,000
+rows: the old single-transaction delete held its lock 0.83 s with a
+708 ms worst reader stall; the new background purge takes 1.86 s of wall
+time but the worst reader stall drops to 73 ms. At 580,000 rows: 4.77 s
+held / 4,538 ms worst stall becomes 3.15 s wall / 100 ms worst stall —
+the purge takes longer end to end, spent in small batches with room for
+everything else in between, rather than shorter and monopolizing the
+lock throughout.
 
 **Bulk selection is Ctrl/Cmd-click, not a checkbox column** (`nodes.js`
 Devices table, `alerts.js` Alerts table — identical shape in both). Each
@@ -3963,8 +4121,11 @@ occurrence increments one alert instead of opening a duplicate" behavior
 lives in the database's own conflict resolution, not in application code
 that could race between a read and a write.
 
-49 built-in rules and 6 built-in templates are seeded via `INSERT OR
-IGNORE` keyed on each row's unique `key`, run on every open — idempotent,
+60 built-in rules (5.10.0 adds `wireless_ap_rebooted`,
+`wireless_radio_channel_changed` and `netpath_https_down`; the middle one
+ships disabled via `_BUILTIN_DISABLED`) and 6 built-in templates are
+seeded via `INSERT OR IGNORE` keyed on each row's unique `key`, run on
+every open — idempotent,
 so a re-open never duplicates, and an admin's edit to a built-in rule's
 severity or a template's wording survives a restart because the seed
 only inserts a row that does not yet exist, never updates one that does.
@@ -5175,6 +5336,29 @@ read backwards on an email announcing that the problem is over.
 `interface_up` and every threshold clear too, the same reasoning that
 justified shipping only 5 built-in templates instead of one per rule.
 
+**`[RECOVER]`, from 5.10.0** (`alertmail.RECOVER_TAG = "[RECOVER]"`).
+`build_context()` sets `context["severity_tag"] = RECOVER_TAG` and a new
+token, `context["recover_tag"] = RECOVER_TAG`, in the same `if
+resolved_ts:` branch that already derives `down_since`/`recovered_time`/
+`downtime` — a resolution's subject leads with `[RECOVER]` rather than
+the cleared alert's own severity, since `[CRITICAL] … has recovered`
+reads as a fresh emergency in exactly the place a tag is read at a
+glance. `recover_tag` itself renders to `RECOVER_TAG` only there and to
+`""` everywhere else, for a template that wants the word somewhere other
+than the tag position. `_notify_clear` also passes both keys through its
+own `extra` dict, so the resolution channel is correct even before
+`alert_row["resolved_ts"]` is necessarily populated on whatever row the
+caller handed it — `extra` is applied after `build_context`'s own
+derivation (see above), so the explicit pair always wins. Only
+`_notify_clear`'s synthesized "clear" occurrence ever carries them: an
+*opening* alert, the standalone "Device recovered" rule's own alert
+included, has no `resolved_ts` and so takes the ordinary
+`severity_tag`/empty-`recover_tag` path. `token_reference()` documents
+both tokens for the template editor's palette. The **Preview** route
+(`api.py`) only fakes `resolved_ts` — and therefore the tags — when the
+template being previewed is `device_up`; every other built-in previews as
+the opening alert it actually renders as.
+
 `smtp_to_default` is a JSON array now (an add/remove list in the
 settings UI, `alerts.js`), not the comma-separated string it used to be
 — a change in what one settings value's JSON blob holds, not a schema
@@ -5259,8 +5443,34 @@ turns out to be slow too, not a guess.
 
 Both routes are thin dispatch over `report.py`'s own functions: query-string
 parsing, resolving an omitted `device_ids` to the whole fleet, and, for
-top-N, the refusal above. Neither has a page in the interface reading it
-yet.
+top-N, the refusal above. This claimed, in earlier releases of this file,
+that neither had a page reading it — stale even before 5.10.0: both are
+read from Nodes → REPORTS' AVAILABILITY and TOP-N BY METRIC subtabs.
+
+**Firmware inventory, from 5.10.0** (`report.firmware_inventory`,
+`get_nodes_reports_firmware`/`get_nodes_reports_firmware_export`). No
+window and no aggregate query: it reads `nodesdb.devices()` (or
+`devices_by_ids()` for a `device_ids` filter) as they stand and reshapes
+each row into a `FirmwareRow` — no SNMP, no history, so it costs nothing
+the identity poll had not already paid for. `_model_hint()` takes the
+first comma/semicolon-delimited clause of `sys_descr`, capped at 80
+characters, deliberately never parsed into a model number: a description
+is not a model, and inventing one across eleven vendors' string formats
+is exactly the guessing `swversion.py` itself refuses to do. Rows sort by
+`(vendor.lower(), not sw_version, sw_version.lower(), name.lower())` — the
+`not sw_version` term is what puts a device with no reported version last
+*within* its own vendor rather than first, where an empty string would
+otherwise sort it. `version_count` is `len({distinct non-empty
+sw_version})` and `unknown_count` counts rows with none at all, both
+folded once rather than recomputed by the caller.
+
+`get_nodes_reports_firmware_export` shares `_firmware_report()` (the
+route body) with the JSON route so the CSV an operator downloads can
+never drift from what the table on screen showed for the same filter —
+same rows, same order, no separate aggregate path to fall out of step.
+Both routes take `nodes:read`, matching Availability and Top-N; there is
+no window to cap, so no whole-fleet refusal applies here the way it does
+to Top-N.
 
 ---
 
@@ -5343,7 +5553,12 @@ TTL, truncated to 16 hex characters — used to detect a route change
 without storing the whole path twice) and `icmp_code`/`icmp_from` for a
 refusal. `hops` stores one row per (trace, TTL, address) — again, more
 than one row at the same TTL for the same trace is exactly how a
-within-run fork gets recorded.
+within-run fork gets recorded. A fourth table, `https_checks` (from
+5.10.0: `id, target_id, ts, ok, status_code, latency_ms, error,
+final_url`, `ON DELETE CASCADE` off `targets`), is its own table rather
+than columns on `traces` because the two run on independent schedules and
+a destination can carry a web page check without ever having a full
+trace's worth of hops — see *Web page checks*, below.
 
 `Monitor` (`monitor.py`) runs a 1-second-granularity loop
 (`_loop()`) that computes each enabled target's next-due time from its
@@ -5388,6 +5603,66 @@ weeks still costs one row per hop, not thousands. `_topology_json()` in
 `build_topology()` derived from the traceroute history itself — the two
 are independent measurements of the same path, shown side by side in the
 hop tooltip in `netpath.js` rather than merged into one number.
+
+### Web page checks (`httpcheck.py`, `HttpsChecker` in `monitor.py`) — 5.10.0
+
+A traceroute proves the path works; it says nothing about whether the
+thing at the end of it is serving anything. `httpcheck.check()` is the
+other half, pure and dependency-free: one GET — deliberately not HEAD,
+since plenty of servers answer HEAD with 405 and would read as down while
+serving the page fine — through a `urllib.request` opener built with
+`selfupdate._ssl_context()` (the same certificate bundle every other
+outbound HTTPS call in this app verifies against) unless the destination
+opted out with `https_insecure`, in which case
+`ssl._create_unverified_context()` is used instead. A custom
+`_CountedRedirects` handler follows up to `MAX_REDIRECTS` (5) and refuses
+a redirect that lands off HTTPS outright — the destination was configured
+as an HTTPS URL, and silently measuring an unverified cleartext page
+instead would answer a different question. The body is read only far
+enough to prove the response is real (`MAX_BODY_BYTES`, 64 KiB) and
+discarded. `2xx`/`3xx` is `ok=True`; everything else — an HTTP error
+status, a timeout, `socket.gaierror` (`"DNS: …"`), an
+`ssl.SSLCertVerificationError` (`"TLS: certificate verify failed (…)"`)
+or any other `ssl.SSLError` — is `ok=False` with a short reason capped at
+`ERROR_MAX` (200 chars), the same string stored, badged and put in the
+alert message.
+
+`monitor.HttpsChecker` schedules it exactly the way `Monitor` schedules
+traces — a `_next_run` due time per destination seeded from the last
+recorded check, a small `ThreadPoolExecutor` (default 4 workers) and an
+`_inflight` set so a slow page can never queue behind itself — but it is
+its own `Worker` rather than folded into `Monitor`, because a destination
+can have a web-page check without continuous probing or vice versa, and a
+page fetch has nothing to do with a traceroute's own hop/probe budget. Its
+timeout is `min(httpcheck.DEFAULT_TIMEOUT_S, max(interval_s, 2.0))` — a
+page fetch does not inherit the destination's per-probe timeout, so a slow
+page can never overrun its own check slot. `_log_result` writes one event
+log line per state *transition*, not per check, the same debounce
+`ap_offline`/`ap_online` and `device_up`/`device_down` already use.
+`GET /api/netpath/https?target=&t0=&t1=` (`get_netpath_https`) buckets
+`https_checks` onto the exact same epoch-anchored grid `get_timeline`
+buckets traces onto, so the WEB PAGE timeline lane lines up block for
+block with the three above it; target JSON gains `https_url`,
+`https_insecure`, `https_state` (`up`/`down`/`none`),
+`https_status_code`, `https_latency_ms`, `https_error` and
+`https_last_ts`, and the Debug feed's per-destination block gains an
+`https` sub-object.
+
+**Alerting** (`alertengine._evaluate_netpath_https`) is event-shaped
+rather than threshold-shaped — a check answers available or
+unavailable-with-a-reason, and there is no number to compare against a
+clear value — so it borrows only the streak discipline the threshold
+evaluators use, not their hysteresis. `self._netpath_https_streaks` is a
+`{(rule_id, target_id): (last_sample_ts, consecutive_failures,
+first_breach_ts)}` dict; the streak advances only when a *new* check has
+landed since the last tick (compared by the check's own `ts`, not the
+engine's 5-second cadence), a success resets it to zero and resolves any
+open alert outright, and the built-in `netpath_https_down` rule
+(`for_polls` 3) only raises once three checks in a row have failed. The
+same function's `live` set (every enabled target with a non-blank
+`https_url`) feeds `_sweep_netpath_alerts`, so clearing the URL,
+disabling, or deleting a destination resolves its open web-page alert the
+same way it already resolved the other three NetPath rules.
 
 ### ASN and owner lookup (`AsnResolver`, in `monitor.py` + `namelookup.py`)
 
@@ -6964,8 +7239,18 @@ already uses for other fixed, known vendor tables (see
 Nodes above). Three tables under `fgWc` (`1.3.6.1.4.1.12356.101.14`),
 all indexed by `(fgVdEntIndex, WtpId[, RadioId])`: `fgWcWtpConfigTable`
 (the AP's configured name), `fgWcWtpSessionTable` (live status/MAC/
-model/client count) and `fgWcWtpSessionRadioTable` (per-radio mode/
-channel/tx power/client count, one additional `RadioId` index arc).
+model/client count and, from 5.10.0, `fgWcWtpSessionWtpUpTime`,
+`fgWcWtpSessionWtpSessionUpTime` and `fgWcWtpSessionWtpProfileName`) and
+`fgWcWtpSessionRadioTable` (per-radio mode/channel/tx power/client count,
+one additional `RadioId` index arc, plus `fgWcWtpSessionRadioBaseBssid`
+from 5.10.0). A fourth table, `fgWcWtpProfileRadioChannelWidth`
+(`…14.4.2.1.20`), is walked from 5.10.0 too — it is keyed by
+`(vdom, profileName, radioId)`, not by AP, since it names what a *profile*
+configures rather than what a radio reports. The session table has
+exactly nine columns end to end; there is no per-radio noise floor and no
+operating-channel-width object anywhere in this MIB, which is why B5
+(below) can only ever be BSSID plus the profile's *configured* width, not
+a measured one.
 
 **The tx-power unit is a decision, not a constant.**
 `fgWcWtpSessionRadioOperatingPower` (column 8) has the DESCRIPTION
@@ -7028,6 +7313,17 @@ since 5.8.0 (`session.request(..., auth_key=...)`), honouring
 `wireless_settings["v3_verify_replies"]`, which the Wireless settings
 dialog exposes as the same switch Nodes settings has.
 
+**Controllers are staggered, from 5.10.0** (`_loop` → `_schedule_pass()`,
+`_first_due`). Each controller's next due time is kept in `_next_run`
+rather than recomputed from one `now` taken once per pass: a
+never-polled controller is due immediately, and every other one's first
+due time this process is `max(last_poll_ts + interval, now +
+random.uniform(0, min(POLL_SPREAD_S, interval)))` — `POLL_SPREAD_S` is 30
+seconds. This is the exact shape Nodes' own scheduler uses for the same
+reason: without it, controllers that came due together on a restart
+stayed phase-locked, submitting to the same one-second window on every
+cycle for the life of the process.
+
 **Storage** (`wirelessdb.WirelessDatabase`): `controllers` (one row per
 configured controller, carrying its own SNMP credential columns —
 there's no group/profile system here, since a handful of controllers
@@ -7037,6 +7333,59 @@ wholesale on each successful poll of that controller via
 after a controller's own poll *succeeded* — a transient controller
 outage never wipes its AP list, only a poll that genuinely completed but
 no longer sees a particular AP does.
+
+`access_points` gains four columns from 5.10.0, added by `_migrate()` the
+same `ensure_columns` way every other one was: `uptime_ticks`/`uptime_ts`
+(the pair `detect_reboot` compares, stored the same shape
+`last_uptime_ticks`/`last_uptime_ts` already are on a Nodes device),
+`session_uptime_ticks` (the CAPWAP session's own uptime — a different
+clock from the AP's, since a session can restart without the AP
+rebooting) and `profile`, the WTP profile name, which is what the
+channel-width join below keys on. `radios` gains `bssid` and
+`channel_width` — the latter is the *profile's* configured width, not
+something a radio reports about itself; there is no such object in the
+MIB.
+
+**The channel-width join** (`fortipoll._channel_widths`,
+`_poll_controller`) reads `fgWcWtpProfileRadioChannelWidth` once per
+controller into a `{(vdom, profile, radio_id): width}` dict, and every AP
+on the same profile looks up the same row — the join key is `(vdom, this
+AP's own profile, radio_id)`, read off the session table's
+`fgWcWtpSessionWtpProfileName` for that AP, not a separate per-AP walk.
+An AP whose profile has no matching row (a profile with no radios
+configured, or a controller whose profile table answered short) simply
+gets `NULL` for that radio's width.
+
+**An AP reboot is detected by reusing Nodes' own `detect_reboot`**
+(`wirelessdb._record_reboot`, imported locally from `nodepoll` since
+nothing else in this storage module needs the SNMP stack behind it): the
+same 497-day `TimeTicks`-wrap-safe comparison a device's own uptime
+already gets, run against `fgWcWtpSessionWtpUpTime` instead. A detected
+drop writes an `ap_rebooted` event with the same sentence `detect_reboot`
+already renders — "rebooted — uptime dropped from 03:25:45.00 to
+00:04:10.00" — and the built-in `wireless_ap_rebooted` rule
+(`wireless_event`, severity 4/warning, enabled) turns it into an alert
+that auto-resolves after 24 hours (`_BUILTIN_AUTO_RESOLVE_S` in
+`alertsdb.py` — the same 24 hours the radio-channel-changed rule below
+also carries), since neither event has a clearing counterpart to wait for
+the way a device coming back does.
+
+**A radio channel or mode change is diffed, not silently overwritten**
+(`wirelessdb._radio_changes`, called from `replace_radios` before the old
+rows are deleted): the caller now passes the controller id, WTP id, vdom
+and name alongside the radio list, and for each radio whose channel or
+mode differs from what was stored, one `radio_channel_changed` event is
+written — "radio 2: channel 44 → 149" or "radio 1: mode ap → monitor". A
+radio with no previous row (a new AP) is silent, and so is a reading that
+appeared or vanished (a radio being enabled or going dark is not a
+"change" — "— to 44" would misdescribe it as one). Existing callers that
+omit the new keyword arguments get a plain replace with no diff, so
+`replace_radios` stayed backward-compatible for anything not passing
+them. The built-in `wireless_radio_channel_changed` rule
+(`wireless_event`, severity 5/notice) ships in `_BUILTIN_DISABLED` rather
+than enabled — a FortiAP running DARRP repicks its channel by design, and
+paging on every one of those would train an operator to ignore the rule
+rather than watch it; a site that wants to know turns it on itself.
 
 **AP removal is an event, not a silent delete.** `prune_stale()` records
 an `ap_removed` row (via `add_ap_event`, the one owner of that INSERT)
@@ -7128,18 +7477,22 @@ the poll cycle.
 ### What else the controller could be asked for
 
 `FORTIAP-POLLING-OPTIONS.md` is a costed survey of the per-AP data this
-module does *not* collect, written for 5.9.0 and not implemented. It groups
-candidates by what they cost — derivable from rows already walked, one extra
-column walk each, a new per-client table, or the REST API — and recommends
-walking the three table subtrees on a production controller first, because
-this MIB has already been caught misdescribing its own units
-(`nodeoids.py`'s note on `fgWcWtpSessionRadioOperatingPower`).
+module did not collect as of 5.9.0. Three of its candidates — A2 (radio
+channel/mode change as an event), B1 (AP uptime and reboot detection) and
+B5 (BSSID plus the profile's configured channel width) — are implemented
+in 5.10.0, described above; the note's per-AP client table and REST-API
+candidates are not, and the rest of the document remains a research
+record rather than a to-do list (see the note's own header).
 
-Two defects it names in passing: `tests/stubs/wireless_stub_agent.py` serves
-neither `WTP_SESSION_IP` nor `WTP_RADIO_MODE`, so the stub is behind the
-poller it tests; and `_loop` seeds every controller's due time with
-`next_run.get(id, 0)` and takes `now` once per pass, so all controllers stay
-phase-locked — the shape the node poller stopped having in 5.9.0.
+The two defects the note named in passing against the 5.9.0 tree are both
+fixed in 5.10.0. `tests/stubs/wireless_stub_agent.py` now serves every
+column the poller walks, including `WTP_SESSION_IP` and `WTP_RADIO_MODE`,
+across two APs on two different profiles, so the stub no longer trails
+what the poller actually asks for; and `_loop`/`_schedule_pass` no longer
+seed every controller's due time from one `now` taken once per pass — see
+*Controllers are staggered*, above — so controllers polled together no
+longer stay phase-locked for the life of the process the way the node
+poller stopped doing in 5.9.0.
 
 ## ConfigRX (`configrxdb.py`, `configrx.py`)
 
@@ -8067,6 +8420,75 @@ its tab hidden, the failure logged once, `updateTabOverflow()`/
 `updateTabShortcuts()` recalculated for the tab that just disappeared, and
 the operator moved off it automatically if it was the one open. The tab being
 hidden is what stops a second attempt — never a silent retry loop.
+
+### Dashboard: painted before the boot fetches, not after (`app.js`, `dashboard.js`) — 5.10.0
+
+`start()` used to wire the tab clicks, then `await loadState()` →
+`loadPlatform()` in sequence — each up to a 30 s request, and slowest in
+the seconds right after `service.start()` sets every poller going — before
+initialising Dashboard's own module or firing its first `/api/dashboard`.
+An account landing on the Dashboard therefore sat on whatever placeholder
+markup `index.html` shipped until both boot fetches answered; clicking any
+other tab and back bypassed the wait entirely, because that path runs
+`activate()`+`refreshNow` without going through `start()` again — the
+reported workaround.
+
+`start()` now computes `plannedInitialTab()` (the `landing` tab) and, when
+it is not a lazy module — Dashboard, the only eager one — calls its
+`init()` and `selectTab(landing, …)` **before** `await loadState()`, so
+Dashboard's `paintedEarly` selection fires its first `/api/dashboard`
+alongside the boot's own `/api/state` fetch rather than after it. The
+visibility handler and `restartTimer()` (the heartbeat) are started
+immediately after that, before either `await`, for the same reason: a
+page that loaded hidden (the desktop console's Open button putting the
+browser behind itself) used to never reach the last line of `start()` to
+start its heartbeat at all, and a boot that took thirty seconds to get
+through `/api/state` ran with no heartbeat for that whole span. Guarding
+`paintedEarly && state.tab === landing` after the boot fetches finish is
+what stops the ordinary post-boot `applyRoute()`/`selectTab()` logic from
+re-selecting — and re-fetching — the tab this early path already handled.
+
+Three related defects travelled with it, all found reasoning about this
+same code:
+
+- **`ensureModuleReady` rejected loudly instead of silently for a missing
+  *eager* module.** A lazy module missing from `pages` after its script
+  loaded already threw; an eager module (Dashboard) missing from `pages`
+  at call time resolved with `undefined`, so an activation of it was a
+  silent no-op — "Loading…" forever, nothing in the console. It now
+  rejects with the same `"<name>.js never registered App.pages.<name>"`
+  shape a load failure already used, so a broken Dashboard build fails
+  the same visible way a broken lazy module does.
+- **A `/api/dashboard` fetch superseded by a newer one used to leave
+  `draw()` uncalled.** `App.get`'s inFlight-by-path convention (aborting
+  an older request to the same URL as `superseded` rather than letting
+  both land) meant the very first `refresh()` after boot could be
+  aborted by the heartbeat's own tick landing moments later, leaving the
+  initial "Loading…" markup on screen for good. `refresh()` now calls
+  `draw()` on a superseded error too, and any other failure keeps the
+  previous tiles up with `view.error`'s line drawn above them rather than
+  clearing the page.
+- **`initSplitters()`/`applyDensity()` were unguarded** in the same
+  stretch of `start()` as `initKiosk()`, so either throwing (a saved
+  splitter position that no longer matches the layout, a density pass
+  over a pane a build moved) took every module `init()` and the poll
+  timer down with it, the same class of single-point-of-failure
+  `initKiosk()` already had a `try`/`catch` for. Both are wrapped now.
+
+**Single in-flight state load.** `state.loadingState`, set before `await
+loadState()` in both `start()`'s boot path and the heartbeat's periodic
+poll, and cleared in a `finally`, is checked by the heartbeat before it
+starts its own `/api/state` tick (`if (!state.loadingState && now -
+state.lastState >= STATE_MS)`). Before this, a slow boot fetch could be
+aborted as `superseded` by the heartbeat's own periodic call to the same
+URL landing first, which is exactly backwards — the boot's own load is
+the one populating `state` for the very first time.
+
+Browser walk, cold load with no tab click: the Dashboard's ten tiles
+painted with no tab click at all. With `/api/state` delayed 3 s
+artificially, the tiles still appeared at roughly 200 ms — bounded by
+`/api/dashboard` alone, no longer chained behind the two boot fetches.
+65 of 65 walk checks passed.
 
 ### Tab bar: flat groups, icon collapse, the overflow fade (`index.html`, `app.css`, `app.js`) — 4.49.0
 

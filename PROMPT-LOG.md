@@ -202,3 +202,14 @@ record.
 6. **Software version and image in the device header, plus a firmware report.**
 → Five Opus lanes (wireless, nodes-firmware, nodes-delete, netpath-https,
 frontend-core + alerts subject), Sonnet for docs and demo data.
+
+**Deployment complete** — all six shipped: `[RECOVER]` subjects on recovery
+notifications; FORTI-AP's channel-change and reboot events plus BSSID and
+configured channel width; a per-destination HTTPS availability check on
+Routes with its own alert rule; device delete as an asynchronous background
+purge; a Dashboard that paints on the very first load; and software
+version/image in the device header, an optional column, and a new Firmware
+inventory report. `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`,
+`FORTIAP-POLLING-OPTIONS.md`, `NETWORK-AND-STORAGE-REQUIREMENTS.md` and
+`RUNBOOK.md` are updated to match. The full test suite and the browser walk
+ran once at the end, as the standing constraint requires: 137 of 139 suites passed, 9 skipped for optional dependencies (paramiko, PySide6); the two failures were `test_collectors_hardening.py`, which passed once `traceroute` was installed on the container, and the pre-existing `test_prune_lock_hold.py` lock-fairness flake on `syslog logs` (code this release does not touch, recorded as intermittent since 5.9.0); the browser walk passed 65 of 65 checks including the new cold-load Dashboard check.

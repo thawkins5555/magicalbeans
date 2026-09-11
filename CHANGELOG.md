@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.10.0 — Six asks](#5100--six-asks)
 - [5.9.1 — Second full code review: eighty-one findings](#591--second-full-code-review-eighty-one-findings)
 - [5.9.0 — Six asks](#590--six-asks)
 - [5.8.1 — The restart that fixed it](#581--the-restart-that-fixed-it)
@@ -137,6 +138,190 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.10.0 — Six asks
+
+Six reports from the floor, none of them small.
+
+**A recovery email no longer looks like a fresh emergency.** A resolution's
+subject used to lead with the cleared alert's own severity tag — `[CRITICAL]
+SappiWhere: core-sw-b has recovered` reads, at a glance in an inbox, exactly
+like a new critical alert rather than the end of one. It now leads with
+`[RECOVER]` instead: `[RECOVER] SappiWhere: core-sw-b has recovered`. A new
+token, `recover_tag`, renders to `[RECOVER]` on a resolution and to nothing
+on an opening alert, for a template that wants the word placed somewhere
+other than the front of the subject line; `severity_tag` itself becomes
+`[RECOVER]` on the same notification, so a subject built from either token
+is correct without editing. Only a genuine *resolution* is affected — an
+opening alert, including the standalone "Device recovered" rule's own
+alert, still leads with its real severity, since that one is a fresh alert
+in its own right and not the clearing of anything. The template editor's
+**Preview** shows `[RECOVER]` only when previewing the recovery template
+itself; every other template still previews as the opening alert it is.
+
+**FORTI-AP gets three of the additions its own research note costed out.**
+`FORTIAP-POLLING-OPTIONS.md`, written for 5.9.0, surveyed what more the
+module could poll without a change to what it talks to; three of its
+candidates ship now, with what they actually cost measured against the
+current tree rather than guessed. What they are not is as important as what
+they are: this MIB does not carry a per-radio noise floor anywhere, at all
+— `fgWcWtpSessionRadioEntry` has exactly nine columns, and none of them
+is the width a radio is *running* either (the channel number itself has
+always been polled), so "how wide is this radio right now" is not a number
+this application, or any SNMP client, can ask a FortiGate Wireless
+Controller for.
+
+- **A radio changing channel or mode is now an event.** `replace_radios`
+  reads the old radio rows before overwriting them and, for any radio whose
+  channel or mode actually differs, writes one line to the AP event log —
+  "radio 2: channel 44 → 149", or "radio 1: mode ap → monitor". A radio
+  switching on or going dark (a reading that appeared or vanished, rather
+  than changed) is not treated as a "change". The built-in rule, **Access
+  point radio changed channel** (severity notice), ships **disabled**: a
+  FortiAP running DARRP repicks its own channel by design, and paging on
+  every one of those would train an operator to ignore the rule rather than
+  read it. A site that wants to know turns it on in Alerts → Rules.
+- **An AP reboot is detected and alerted on.** The controller reports each
+  AP's own uptime (`fgWcWtpSessionWtpUpTime`), and a drop in it — the same
+  497-day-wraparound-safe comparison a Nodes device's own uptime already
+  gets — is a reboot: an event is logged ("rebooted — uptime dropped from
+  03:25:45.00 to 00:04:10.00") and the built-in **Access point rebooted**
+  rule (severity warning, enabled) opens an alert, auto-resolving after 24
+  hours since a reboot has no clearing event of its own to wait for.
+- **BSSID and channel width join the AP detail pane and, optionally, the
+  table.** Width is joined from the controller's WTP-profile table by
+  `(vdom, profile, radio id)` — it is the width that AP's profile is
+  *configured* to run each radio at, not a measurement of what the radio is
+  actually doing, because the MIB has no such measurement to offer. Three
+  new optional columns — Uptime, Profile, BSSIDs — join the existing list
+  in Wireless → Settings → Columns, off by default like the rest of it; the
+  detail pane gains **profile**, **uptime** and **session up** (a separate
+  clock from uptime — a CAPWAP session can restart while the AP itself
+  stays up), and each radio block gains **width** and **bssid**.
+- **What this costs, per poll cycle:** for N access points, R radios and a
+  profile table of P profiles × r radios each, the walk grows from
+  6(N+1)+4(R+1) GETNEXTs to 9(N+1)+5(R+1)+(P·r+1) — three more session
+  columns, one more radio column, and one new table walked once per
+  controller regardless of how many APs share a profile.
+- Two defects the research note found in the *current* tree, fixed in
+  passing: the test stub was missing two columns the poller already walked
+  (so a change to either could have shipped with the suite still green),
+  and every controller's next poll was seeded from one `now` taken once per
+  pass, so a fleet of controllers that came due together stayed phase-locked
+  on the same second forever — the exact shape Nodes' own poller stopped
+  having in 5.9.0. Controllers are staggered the same way now.
+
+**Routes/NetPath can watch a destination's web page, not just its path.** A
+traceroute proves the network gets there; it says nothing about whether the
+thing at the end of it is serving anything. A destination's Add/Edit dialog
+gains a **WEB PAGE** fieldset — a URL and an **Accept an untrusted
+certificate** checkbox — and, where a URL is set, a plain HTTPS GET runs on
+the same interval as the traceroute: 2xx/3xx counts as available, a
+4xx/5xx status, a timeout, a DNS failure or a certificate that does not
+verify does not, each with its own short reason. Certificates are verified
+against the system store plus this application's own bundled CA file unless
+the checkbox opts out, for the appliance whose own management page ships a
+certificate nobody is going to replace; a redirect off HTTPS is refused
+outright rather than silently measuring an unverified page instead. An
+**HTTPS** badge sits beside the destination's name, coloured by its latest
+state; a fourth **WEB PAGE** timeline lane and a fifth window-summary tile
+join the three lanes and four tiles already there, both only where a URL is
+set. A new built-in rule, **NetPath web page unavailable** (critical),
+opens after three consecutive failed checks with the reason in its message,
+clears on the first success, and rolls up under the same "destination
+unreachable" alert the other three NetPath rules already fold into.
+
+**Deleting a device with a lot of history no longer freezes the
+application.** The cost of a device delete was always set by how long it
+had been polled — up to millions of sample rows for a long-polled chassis —
+and it ran as one transaction under the whole store's write lock: the poll
+cycle, every other read, and the desktop console's once-a-second storage
+figures all waited on it, and a delete slow enough could make the browser's
+own 30-second timeout report a failure for a delete that was still running
+fine. A delete now returns within about a second regardless of how much
+history is behind it: the device stops being polled, disappears from every
+list and count, and gives up its address for reuse immediately, while a
+tombstone row keeps its id reserved so a freed address can never let a new
+device inherit the old one's thresholds, mutes or configuration. Its
+history is then removed by a background worker in small batches with a
+pause between each, resumable if the service restarts mid-purge. The Nodes
+status strip shows **"purging history for N device(s)"** while that runs.
+Measured with `tests/bench_prune.py`'s device-delete case: at 290,000 rows,
+the old single-transaction delete held its lock 0.83 s with a 708 ms worst
+reader stall; the new background purge takes 1.86 s of wall time but the
+worst reader stall drops to 73 ms. At 580,000 rows: 4.77 s held / 4,538 ms
+worst stall becomes 3.15 s wall / 100 ms worst stall. The desktop console's
+storage card, which read every database's size on the GUI thread and could
+freeze the window behind the same lock, now reads it on a worker thread and
+keeps its last figures on screen while a read is in flight.
+
+**The Dashboard paints on the very first load, not after clicking away and
+back.** Start-up used to wire the tab strip, then wait on `/api/state` and
+`/api/platform` — each up to 30 seconds, and slowest in the seconds right
+after the service starts every poller at once — before the Dashboard's own
+module initialised or its first `/api/dashboard` went out; clicking any
+other tab and then back bypassed the wait entirely, which was the
+workaround an operator had to discover for themselves. The Dashboard now
+initialises and paints before those two requests are awaited, so its own
+first fetch goes out alongside them rather than behind them; the heartbeat
+and the tab-visibility handler start at the same point, so a page that
+loads hidden (opened behind another window) no longer waits out the entire
+boot before its first tick. A `/api/dashboard` fetch superseded by a newer
+one now still draws — with the previous tiles and an error line above them
+rather than a blank page — instead of leaving the very first "Loading…" on
+screen for good, and an activation of a missing eager module now fails
+loudly instead of as a silent no-op. Measured on a cold load: the ten
+Dashboard tiles paint with no tab click at all; with `/api/state` delayed
+three seconds artificially, the tiles still appear at roughly 200 ms. The
+browser walk passed all 65 checks.
+
+**A device's software version and image are in its header, its own
+column, and a new report.** OID `1.3.6.1.4.1.9.2.1.73.0` is
+OLD-CISCO-SYS-MIB's `sysConfigName` — "the name of the system boot image",
+a file path such as `flash:/c2960x-universalk9-mz.152-7.E4.bin`, or
+`bootflash:packages.conf` on an IOS-XE box running in install mode, which
+otherwise says nothing useful in `sysDescr` at all. That path is stored as
+a third field, `sw_image_file`, alongside the version/image split itself,
+which for Cisco comes from the one shape every IOS train writes into
+`sysDescr` end to end — `(C2960X-UNIVERSALK9-M), Version 15.2(7)E4` on
+classic IOS, `(CAT9K_IOSXE), Version 17.9.4a` on IOS-XE, `Software (NXOS
+64-bit), Version 9.3(8)` on NX-OS. Every vendor gets the same three-field
+answer from its own sources — at most one extra best-effort GET per device
+per identity poll, added to the existing SNMP session and never a cause of
+poll failure — with ENTITY-MIB's `entPhysicalSoftwareRev.1` as the standard
+fallback and a deliberately narrow generic `sysDescr` regex behind that.
+Briefly, per vendor: Fortinet's `fgSysVersion.0` ("v7.2.8,build1639,240416
+(GA.M)" → version `7.2.8`, image `build1639 (GA.M)`), also parsed from
+`sysDescr` when the scalar goes unanswered; Juniper's `hrSWInstalledName.1`
+and `sysDescr`'s `kernel JUNOS X`; HP/Aruba ProCurve's
+`hpSwitchOsVersion.0` and `sysDescr`'s `revision X, ROM Y` (Aruba's own arc
+uses the same rule); Comware's `sysDescr` "Software Version X … Release Y";
+Arista's `sysDescr` "EOS version X"; Extreme's
+`extremePrimarySoftwareRev.0`; MikroTik's `mtxrLicVersion.0` plus
+`mtxrFirmwareVersion.0` (RouterBOOT as the image); Palo Alto's
+`panSysSwVersion.0`; Dell's `productIdentificationVersion.0`;
+Brocade/Ruckus's `snAgImgVer.0`; Ubiquiti/UniFi's `sysDescr` "firmware X" or
+`unifiApSystemVersion.0`; everything else tries `entPhysicalSoftwareRev`
+and then the generic regex. A device that matches nothing comes back with
+all three fields empty, stored as NULL and shown as nothing — never a
+guess. The device header (Nodes → Settings' detail-fields picker, on by
+default for a new install) shows `software 15.2(7)E3` and `image
+C2960X-UNIVERSALK9-M — flash:/…bin`; an optional **Software** column joins
+the Devices table's column picker; the device CSV export always carries
+all three fields. Nodes → REPORTS gains a third subtab, **FIRMWARE
+INVENTORY**: a group filter, **Run report**, **Export CSV**, and
+**Download CSV from server** (`GET
+/api/nodes/reports/firmware/export.csv`) for a fleet too large to leave
+open in a tab, with a summary reading "N device(s) · M distinct version(s)
+· K reporting none". (Two earlier editions of this file said Reporting had
+no page yet — that was already stale before this release: Availability and
+Top-N have had one for some time, and this section is corrected along with
+adding the third.)
+
+No feature, page, dialog, button, endpoint or setting was removed to make
+any of this work, and the application stays standard-library-only — no
+part of the above needed a dependency, including the web page check's own
+HTTPS client.
 
 ### 5.9.1 — Second full code review: eighty-one findings
 

@@ -1,5 +1,11 @@
-<!-- Research note, 5.9.0. Nothing here is implemented: it exists so the
-     additional per-AP data can be chosen with its cost known. -->
+<!-- Research note, 5.9.0. As of 5.10.0, A2 (radio channel/mode change as
+     an event), B1 (AP uptime and reboot detection) and B5 (BSSID plus the
+     AP's CONFIGURED channel width — this MIB has no per-radio noise
+     floor, so that half of B5 was struck) are implemented; see
+     CHANGELOG.md and INTERNALS.md. The "Two defects to fix in passing"
+     below (the stub trailing the poller; controllers polling in the same
+     second) are also both fixed in 5.10.0. Everything else here remains
+     a research record, not a to-do list. -->
 
 # FORTI-AP: what else can be polled, and what it would cost
 

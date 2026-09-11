@@ -641,6 +641,19 @@ own subtabs.
   device in one request rather than one per device. A plain click still
   opens the device's detail pane, unchanged. (Ctrl-click no longer
   selects — the checkboxes replaced it.)
+- **Deleting a device — one, or in bulk — returns at once, from 5.10.0.**
+  A device with millions of history rows used to hold the whole
+  application's write lock for as long as the delete took; now the device
+  is removed from the list, the scheduler and the counts immediately, its
+  address is freed for reuse right away, and its samples, rollups and
+  every other table's rows for it are removed afterwards on a background
+  thread, in small batches with a pause between each so pollers and other
+  requests are never blocked behind it. The Nodes status strip shows
+  **"purging history for N device(s)"** while that is still running, and a
+  restart resumes an interrupted purge rather than losing track of it. A
+  deleted device's id is never reused until its purge is completely done,
+  so a freed address handed to a new device can never inherit the old
+  one's thresholds, mutes or configuration.
 - **Sort the device list by any column** — click its heading, the same
   way every other table in the app sorts. Status, Name, Profile, Group,
   Vendor, Response and Last poll all sort on what the column actually
@@ -1138,8 +1151,19 @@ and an SFP slot without one shows **SFP**; opening a device's dialog
 upgrades a port to **DOM** if its live read finds sensors there, even one
 the poller has not yet walked. Which SNMP identity
 fields the header shows (sysDescr, sysName, sysObjectID, contact,
-location, vendor, SNMP version) is chosen in Nodes → Settings; the IP,
-status and any SNMP error always show.
+location, vendor, SNMP version, and, from 5.10.0, software version and
+software image) is chosen in Nodes → Settings' detail-fields picker; the
+two new ones are on by default for a fresh install, and an install with
+its own saved list keeps exactly that list — the picker just offers the
+two new boxes to add. **Software** carries the version on its own line
+and the image, with the boot image file after it where one was read, on
+the line below — `software 15.2(7)E3` / `image
+C2960X-UNIVERSALK9-M — flash:/…bin`. The IP, status and any SNMP error
+always show. An optional **Software** column (off by default, in the
+Devices column picker, next to sysObjectID) puts the version and image on
+the device list itself, and the device CSV export always carries all
+three fields — version, image and boot file — regardless of what the
+header or the column picker show.
 
 **A port's speed is sanity-checked against what Ethernet can actually be.**
 Speed is read from ifHighSpeed (megabits per second) in preference to
@@ -1407,24 +1431,49 @@ everywhere it cannot.
   becomes one of its addresses. It cannot be undone, needs Nodes write,
   and is recorded in the audit trail.
 
-### Reporting — reachable through the API, no page yet
+### Reporting — Nodes → REPORTS
 
-The two figures an operator is asked for by name every month, computed from
-history the poller already keeps rather than requiring a query written by
-hand: **device availability** — per device or the whole fleet, over any
-window — with outage count, longest outage and mean time to recovery, and
-**a top-N ranking** of any metric the poller records by peak or mean over
-the same kind of window, which is how "which twenty links came closest to
-saturation" gets answered. Availability is built on the same status-segment
-history the device pane's own timeline reads, with five different ways a
-gap in it is deliberately *not* counted as downtime — the device not having
-existed yet, a maintenance window, an indefinite maintenance-mode period,
-a mute still on file, the poller itself having gone quiet — each accounted
-for explicitly rather than silently
-assumed. A whole-fleet top-N ranking over more than a week is refused
-outright rather than left to answer slowly; a shorter window or a narrower
-device list gets an answer. No tab or dialog reads either report yet — both
-are reachable through the API today.
+Three reports, computed from history and identity data the poller already
+keeps rather than requiring a query written by hand. All three live on
+their own subtab of Nodes → **REPORTS**, all three are read-only
+(`nodes:read`, so a viewer account can run them in full), and all three
+take an optional device **Group** filter to narrow from the whole fleet
+to one group.
+
+**Availability** — per device or the whole fleet, over a chosen period —
+with uptime, outage count, downtime, longest outage and mean time to
+recovery. Built on the same status-segment history the device pane's own
+timeline reads, with five different ways a gap in it is deliberately *not*
+counted as downtime — the device not having existed yet, a maintenance
+window, an indefinite maintenance-mode period, a mute still on file, the
+poller itself having gone quiet — each accounted for explicitly rather
+than silently assumed.
+
+**Top-N by metric** — the N worst, or (ticked) least busy, devices or
+interfaces by one metric's peak or mean over a chosen period, which is how
+"which twenty links came closest to saturation" gets answered. A
+whole-fleet ranking over more than a week is refused outright rather than
+left to answer slowly; a shorter window or a narrower device list gets an
+answer.
+
+**Firmware inventory**, from 5.10.0 — what every device is running, off
+the software version/image columns the identity poll already stores (see
+*Devices and polling*, above) rather than a fresh poll of anything. There
+is no period to pick: this is the estate as it stands. Rows sort by vendor
+then version, so a fleet groups itself into "these forty are on
+15.2(7)E4 and these three are not"; a device that has never reported a
+version is still a row, sorted last within its own vendor rather than lost
+among the ones that answered. The summary line reads "N device(s) · M
+distinct version(s) · K reporting none".
+
+Availability and Top-N build their **Export CSV** from the rows already on
+screen. Firmware inventory has that same button plus a **Download CSV
+from server** one, which asks the server to build the report again rather
+than send up what the browser already holds — the file an operator hands
+somebody then does not depend on the report still being on screen, or the
+tab having stayed open while it ran. All three are also reachable directly
+through the API: `GET /api/nodes/reports/availability`, `/top-metrics` and
+`/firmware`, plus `/firmware/export.csv` for the server-built file.
 
 ---
 
@@ -1638,17 +1687,23 @@ alerts and optionally emailing about them.
 
 ### Rules
 
-- **49 built-in rules** ship enabled: a device not responding, a device
-  recovering, a device rebooting, SNMP authentication failing, a device
-  needing unsupported SNMPv3 privacy, a poll running longer than its own
-  interval, a device whose vendor MIB is missing, an interface going
+- **60 built-in rules ship, 59 of them enabled**: a device not responding, a
+  device recovering, a device rebooting, SNMP authentication failing, a
+  device needing unsupported SNMPv3 privacy, a poll running longer than its
+  own interval, a device whose vendor MIB is missing, an interface going
   down/up/flapping, twenty-three CPU/memory/interface-utilization/
   error-and-discard-rate/disk/ping-latency/packet-loss/UPS/
   environmental thresholds, a critical or cold-start SNMP trap, a
   linkDown trap from a device Nodes is not itself polling, a critical
   syslog line, a new IPAM address conflict, an access point removed from
-  its controller or gone offline, a DHCP scope running out of leases, and
-  three NetPath path rules (below). Seven of the interface and disk
+  its controller or gone offline, an access point rebooting, a DHCP scope
+  running out of leases, and four NetPath path rules (below), the newest of
+  which watches a destination's web page (see NetPath and Alerts → NetPath
+  destinations). The sixtieth, **Access point radio changed channel**, is the
+  one rule from 5.10.0 that ships **disabled** rather than enabled: a
+  FortiAP running DARRP changes channel on its own by design, and paging an
+  operator for every one of those would be noise rather than signal — it is
+  there to turn on for a site that wants to know anyway. Seven of the interface and disk
   thresholds among those could never fire before 4.39.0, because nothing
   wrote the metric key they read: the poller now records `if_in_util_pct`,
   `if_out_util_pct`, `if_in_error_rate`, `if_out_error_rate`,
@@ -1933,7 +1988,7 @@ under, and guessing would hide real faults.
 
 ### NetPath destinations
 
-Three rules watch the paths NetPath traces, and all three are deliberately
+Four rules watch the paths NetPath traces, and all four are deliberately
 hard to trip — a path monitor that cries wolf gets turned off.
 
 | Rule | Fires when | Clears |
@@ -1941,6 +1996,7 @@ hard to trip — a path monitor that cries wolf gets turned off.
 | Destination unreachable | Nothing comes back from the destination on 3 consecutive traces — a quarter of an hour on the default interval | One answered probe |
 | Path repeatedly failing | Half the traces in the window did not reach the destination | The share drops back under 20% |
 | Latency far above normal | Round-trip time reaches 3x this destination's own warn threshold, on 3 consecutive traces | It falls back under 1.5x |
+| NetPath web page unavailable | The destination's own web page check (below) fails 3 checks in a row — a 4xx/5xx, a timeout, a DNS failure or a certificate that does not verify | The first check that succeeds |
 
 - **Latency is measured against each destination's own warn threshold**, not a
   fixed number of milliseconds, so one rule suits a LAN hop and a satellite
@@ -1950,13 +2006,22 @@ hard to trip — a path monitor that cries wolf gets turned off.
   to whichever router refused it.
 - **The window rule needs enough traces to mean anything.** Its window is the
   longer of an hour and six trace intervals, and it says nothing until at least
-  five traces have landed in it. It is the only one of the three that can see a
+  five traces have landed in it. It is the only one of the four that can see a
   path which works intermittently, since counting consecutive failures by
   definition cannot.
 - **One broken path is one alert.** An unreachable destination also has failing
-  traces and unmeasurable latency, so the unreachable alert absorbs the other
-  two for that destination, exactly as *Device not responding* absorbs the
-  alerts a dead device implies.
+  traces, unmeasurable latency and (if a web page is set) a failing web page
+  check, so the unreachable alert absorbs the other three for that
+  destination, exactly as *Device not responding* absorbs the alerts a dead
+  device implies.
+- **The web page rule needs a URL set, and nothing else.** It watches the
+  per-check result the WEB PAGE fieldset below turns on — a 4xx/5xx, a
+  timeout, a DNS failure or a certificate that does not verify — rather than
+  a trace, and a check runs on the same interval as the traceroute above.
+  Clearing the URL, disabling the destination, or deleting it resolves the
+  alert the same way a stopped destination resolves the other three; there
+  is nothing left to re-evaluate. A custom rule can also be pointed at it —
+  kind `netpath_event`, source `https_down`.
 - **A trace that could not run is never an outage.** A traceroute that failed
   on this machine, and a slot skipped because the previous run was still going,
   both record 100% loss by construction; alerting on them would report a
@@ -2056,6 +2121,20 @@ hard to trip — a path monitor that cries wolf gets turned off.
   device answering again does. It used to say "as of {{last_time}}", which
   on a resolution is when the *problem* last recurred, a moment before it
   cleared.
+- **A recovery's subject leads with `[RECOVER]`, from 5.10.0**, in place of
+  the severity tag every opening alert carries — `[RECOVER] SappiWhere:
+  core-sw-b has recovered`, not `[WARNING]`, since a resolution is not a
+  fresh problem at the severity the outage was. A new token, `recover_tag`,
+  renders to `[RECOVER]` on a resolution and to nothing on an opening
+  alert, for a template that wants the word somewhere other than the start
+  of the subject; `severity_tag` itself becomes `[RECOVER]` on the same
+  notification, so a subject line built from either token stays correct
+  without editing. Only a *resolution* email is ever affected — an opening
+  alert, including the standalone "Device recovered" rule's own alert, still
+  leads with its real severity. The template editor's **Preview** shows
+  `[RECOVER]` only when previewing the recovery template itself
+  (`device_up`); every other template still previews as the opening alert
+  it is.
 - **Test sends a real email** to an address typed in, using whatever SMTP
   settings are currently in the form before they are saved — the same
   "test what's typed" idiom as IPAM's DHCP test.
@@ -2091,6 +2170,19 @@ trip are under **Alerts → NetPath destinations**.
 The destination the route graph is currently showing is bold in the list, so it
 stays obvious after focus moves to the graph or the timeline. The dot beside
 each one carries its latest status.
+
+- **A destination can also watch a web page, from 5.10.0.** Its Add/Edit
+  dialog carries a **WEB PAGE** fieldset — a page URL and an "Accept an
+  untrusted certificate" checkbox — beside the traceroute settings above it.
+  Blank means no web page is checked; a URL means a GET runs on the same
+  interval as the traceroute, and anything in the 200s or 300s counts as
+  available, a 4xx/5xx, a timeout, a DNS failure or a certificate that does
+  not verify does not. The checkbox is for an appliance whose own
+  management page serves a self-signed certificate — without it, that
+  destination would otherwise never show available. A destination with a
+  URL set carries an **HTTPS** badge beside its name in the list, coloured
+  by its latest check and naming the URL, the state and either the latency
+  or the failure reason in its tooltip.
 
 ### Route graph
 
@@ -2166,13 +2258,15 @@ the same reassuring green as a healthy one.
 
 ### Timeline
 
-Three lanes on one shared time axis, with one block per scheduled poll.
+Three lanes on one shared time axis, with one block per scheduled poll, and a
+fourth for a destination with a web page set.
 
 | Lane | Shows |
 | --- | --- |
 | Round-trip time | Bar per block, scaled to the window's peak |
 | Packet loss | Bar per block, fixed 0–100% scale, amber through red |
 | Status | Worst verdict in the block |
+| Web page, from 5.10.0 (only when a URL is set) | Percentage of the window's checks that were available |
 
 Blocks are sized by the destination's trace interval, not by pixel width, so a
 60-minute window on a destination polled every minute draws 60 blocks and a
@@ -2180,6 +2274,12 @@ dark block means a poll that did not happen. Boundaries snap to a wall-clock
 grid, so a block covers the same slice of time as the window moves.
 
 Ticks above the RTT lane mark blocks where the route changed.
+
+Beside the timeline, a **Window summary** card totals the same window into
+five tiles: Healthy, Avg RTT, Traces and Routes, plus a fifth, **Web page**,
+from 5.10.0 — the destination's up/down state and either its average
+latency or its last failure reason, blank for a destination with no URL
+set.
 
 Presets run 15 minutes to 30 days. Drag to focus a range, scroll to zoom
 (anchored on the cursor), buttons to zoom and pan, right-click to clear.
@@ -2231,7 +2331,11 @@ thresholds that turn a trace amber. All of it is stated under the route header
 case 195s)` — and the two warn thresholds are drawn as dashed guides across the
 RTT and loss lanes, so a bar crossing the line is visibly the reason the block
 below it changed colour. The dialog shows the worst case those
-settings imply, which is what an unreachable destination costs a worker.
+settings imply, which is what an unreachable destination costs a worker. A
+destination with a web page set appends `· web page checked every 60s` (and
+`, untrusted certificate accepted` where that box is ticked) to the same
+line, since the colours on the new fourth lane deserve the same stated
+criteria as the other three.
 
 ---
 
@@ -2830,7 +2934,14 @@ reports on all of them in one SNMP walk.
 - **Per AP: status, name, client count, model, MAC address, response
   time, and tx power** — the last shown per-radio, since a real AP has more than one
   (2.4/5/6 GHz). Selecting a row shows the full per-radio breakdown:
-  mode, channel, tx power and client count for each.
+  mode, channel, tx power and client count for each, plus, from 5.10.0,
+  each radio's **width** (the width its WTP profile configures it to run
+  at, not one it reports itself — the MIB has no such column) and
+  **bssid**. The detail pane also gains **profile** (which WTP profile the
+  AP is bound to), **uptime** (the AP's own, since it last rebooted) and
+  **session up** (how long its CAPWAP session to the controller has stood
+  — a different clock, since a session can restart while the AP's own
+  uptime keeps climbing).
 - **Radio mode is shown, which explains an odd extra radio.** A FortiAP
   reports each radio as ap, monitor, sniffer, disabled or not present; a
   monitor radio is a dedicated rogue-AP scanner, so its "power" and
@@ -2871,16 +2982,25 @@ reports on all of them in one SNMP walk.
   auto-detection gets it wrong.
 - **Choose which columns to show** in Settings → Columns. The six above
   are the defaults; Controller, VDOM, WTP id, Radios, Radio modes,
-  Channels, Radio clients and Last seen can be added. The list is the fields the
+  Channels, Radio clients and Last seen can be added, and, from 5.10.0, so
+  can **Uptime**, **Profile** and **BSSIDs** — all three off by default,
+  like the rest of this list. The list is the fields the
   controller's own SNMP tables report, so adding one costs no extra
   polling; Response and IP are there too.
 - **Polled on a fixed interval** (default 60 s) via repeated SNMP
   GETNEXT walks of the FortiGate Wireless Controller MIB's
-  `fgWcWtpConfigTable`/`fgWcWtpSessionTable`/`fgWcWtpSessionRadioTable` —
-  the exact same table-walking approach Nodes' own SNMP poller uses,
-  rather than a second, separate GETBULK code path. A controller that's
-  briefly unreachable does not wipe its AP list; only a poll that
-  genuinely succeeded but no longer sees that AP counts against it.
+  `fgWcWtpConfigTable`/`fgWcWtpSessionTable`/`fgWcWtpSessionRadioTable`,
+  and, from 5.10.0, its profile-radio table for each radio's configured
+  channel width — the exact same table-walking approach Nodes' own SNMP
+  poller uses, rather than a second, separate GETBULK code path. A
+  controller that's briefly unreachable does not wipe its AP list; only a
+  poll that genuinely succeeded but no longer sees that AP counts against
+  it.
+- **Controllers no longer all poll in the same second, from 5.10.0.** A
+  never-polled controller is due at once; every other controller's next
+  due time is spread across a small window the same way Nodes' own poller
+  staggers a fleet, so a handful of controllers polled together do not
+  submit in lockstep forever.
 - **An AP that disappears raises an alert rather than vanishing
   quietly.** Once a controller has failed to report an AP for the
   configured number of consecutive polls, it is removed from the list —
@@ -2889,6 +3009,19 @@ reports on all of them in one SNMP walk.
   unplugged AP is something you are told about rather than something you
   notice missing later. An AP that comes back auto-resolves its own
   removal alert, the same way a device coming back resolves device-down.
+- **An AP rebooting, or a radio changing channel, is recorded too, from
+  5.10.0.** A drop in the AP's own uptime is a reboot: an event is logged
+  ("<name> rebooted — uptime dropped from 03:25:45.00 to 00:04:10.00") and
+  the built-in **Access point rebooted** rule (severity warning) opens an
+  alert, auto-resolving after 24 hours since a reboot has no clearing
+  event of its own to wait for. A radio's mode or channel changing between
+  polls is logged the same way ("radio 2: channel 44 → 149"), but its
+  built-in rule, **Access point radio changed channel**, ships
+  **disabled** — a FortiAP running DARRP changes channel on its own by
+  design, and a site that wants to know anyway turns the rule on in
+  Alerts → Rules. Neither event is raised for a radio that was empty on
+  one side of the change (a radio switching on, or going dark, is not a
+  "change").
 - **Mark an AP Out Of Service** when its absence is expected. That
   exempts it from both halves of the above: it is never aged out of the
   list (so the marking, and the AP, survive the controller dropping it —
@@ -3532,12 +3665,12 @@ Thirteen SQLite files, in WAL mode. One for the application, twelve for records.
 | File | Holds |
 | --- | --- |
 | `app.db` | Global settings, user accounts, per-account per-module permissions, the shared reverse-DNS cache |
-| `netpath.db` | Destinations, traces, per-hop samples, NetPath settings |
+| `netpath.db` | Destinations, traces, per-hop samples, web-page checks, NetPath settings |
 | `flows.db` | Flow records, exporters, interface names, NetFlow settings |
 | `snmptraps.db` | Traps, an OID name table, SNMP Trap settings |
 | `syslog.db` | Messages, hourly rollup counts, search index, Syslog settings |
 | `ipam.db` | Subnets, discovered hosts, conflicts, DHCP scopes and leases, IPAM settings, an optional DHCP credential |
-| `nodes.db` | Devices, polling profiles, interfaces, device/interface events, MAC and neighbour tables, per-port VLAN membership, discovery jobs, Nodes settings, optional SNMPv3 credentials |
+| `nodes.db` | Devices, polling profiles, interfaces, device/interface events, MAC and neighbour tables, per-port VLAN membership, discovery jobs, device-purge tombstones, Nodes settings, optional SNMPv3 credentials |
 | `nodes_series.db` | Polled metric definitions, their raw samples and the hourly rollups — the Nodes tables that grow, so they carry their own size cap |
 | `nodes_mibs.db` | Uploaded MIB files (the original text is kept, so a re-resolve never needs the upload again) and the objects parsed out of them |
 | `alerts.db` | Rules, email templates, alerts, notification history, Alerts settings, an optional SMTP credential |

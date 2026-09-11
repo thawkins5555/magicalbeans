@@ -21,6 +21,8 @@ backup, `INTERNALS.md` is why any of this works the way it does.
 - [Alert email has stopped](#alert-email-has-stopped)
 - [A ConfigRX backup says the host key changed](#a-configrx-backup-says-the-host-key-changed)
 - [The poll pool is saturated](#the-poll-pool-is-saturated)
+- [Nodes shows "purging history for N device(s)"](#nodes-shows-purging-history-for-n-devices)
+- [A NetPath web page check stays red](#a-netpath-web-page-check-stays-red)
 - [A flood of alerts nobody asked for](#a-flood-of-alerts-nobody-asked-for)
 - [Planned maintenance](#planned-maintenance)
 - [Nobody can sign in](#nobody-can-sign-in)
@@ -447,6 +449,58 @@ concurrency: 48 against a pool of 16 means 16 polls in flight and 32 waiting.
    from 5.5.0, so a site outage costs the pool far less than it used to.
    Ping is deliberately *not* backed off — it is what notices the recovery —
    so nothing about outage or recovery timing changed.
+
+---
+
+## Nodes shows "purging history for N device(s)"
+
+**Symptom.** Deleting a device (or a bulk delete) returns immediately and the
+device disappears from the list at once, but the Nodes status strip keeps
+showing **"purging history for N device(s)"** for a while afterward, and
+`GET /api/nodes/purges` reports a nonzero `pending`.
+
+**What it means.** From 5.10.0 a device delete no longer deletes the
+device's history in the request that asks for it — for a long-polled
+chassis that could be millions of rows, and doing it in one transaction
+used to hold up the poll cycle and every other read for as long as it
+took. The device is disabled, hidden and freed to be re-added at the same
+address immediately; its samples, rollups and other rows are removed
+afterward by a background worker, in small batches so nothing else waits
+on it. This is expected, not a fault — leave it running.
+
+**Checks.** If the count is falling, it is working; a large fleet delete
+can take a while in proportion to how much history was behind it. If the
+service restarts mid-purge, it resumes on its own — nothing needs
+re-deleting. A count that is large and genuinely stuck (not falling over
+several minutes) is worth a look at the Debug tab for an error from the
+purge worker, the same as any other background worker in this document.
+
+---
+
+## A NetPath web page check stays red
+
+**Symptom.** A destination's **HTTPS** badge stays red, or the WEB PAGE
+timeline lane and the Web page summary tile show `down`, even though the
+page opens fine in a browser.
+
+**Checks.**
+
+1. **Outbound 443 (or the URL's own port) from this server.** The check is
+   a plain HTTPS GET made by the service itself, not by your browser — it
+   needs its own outbound path to the URL's host and port, which is not
+   necessarily the same path a browser on your desk has. See
+   `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
+2. **A self-signed or otherwise untrusted certificate.** Read the badge's
+   tooltip or the timeline block's detail for the reason — a message
+   starting `TLS:` means the certificate did not verify. For an
+   appliance's own management page, which commonly ships one, tick
+   **Accept an untrusted certificate** in that destination's WEB PAGE
+   settings rather than treating every check as a security incident; for
+   anything else, a certificate failure is worth investigating before
+   working around it.
+3. **A redirect off HTTPS, or too many of them.** The check refuses a
+   redirect that lands on plain HTTP outright, and follows at most five —
+   both read as a failure with the reason stated, not a hang.
 
 ---
 
