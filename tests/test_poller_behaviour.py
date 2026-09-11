@@ -1033,6 +1033,165 @@ def test_an_unencodable_oid_does_not_freeze_the_device():
 
 # --------------------------------------- per-device state of deleted devices
 
+# ------------------------- a truncated forwarding table never reaches storage
+
+def _stub_columns(poller, answers: dict, seen: list):
+    """Drive every column walk from a table of base OID -> (values, complete).
+
+    _walk_column and _walk_column_status both funnel through
+    _walk_column_detail, so one stub covers all three shapes, and each call's
+    deadline is recorded so the budget's own clock can be checked.
+    """
+    def detail(device, config, base_oid, raise_on_timeout=False, deadline=None):
+        seen.append((base_oid, deadline))
+        values, complete = answers.get(base_oid, ({}, True))
+        return dict(values), complete, "" if complete else "cut short"
+    poller._walk_column_detail = detail
+
+
+def test_a_truncated_mac_table_never_reaches_storage():
+    """read_device_mac_table walked the two FDB columns through
+    _walk_column, which throws the `complete` flag away -- so a table that
+    stopped on the row cap, the byte cap or the walk's own time budget
+    reached replace_mac_entries as if it were the whole truth, and every
+    stored row the walk never got to was marked absent. On a core switch
+    that is thousands of MACs reading as gone, once per mac_table_interval_s.
+    The ARP walker has refused this since it was written; this is the same
+    rule, on the table it matters most for."""
+    db = NodesDatabase(os.path.join(tmpdir("poller_review_macpartial_"), "nodes.db"))
+    try:
+        group_id = db.ensure_default_group()
+        device_id = db.add_device("127.0.0.1", "fdb-sw", group_id=group_id,
+                                  snmp_version=1, community="public",
+                                  ping_enabled=0, poll_interval_s=120,
+                                  mac_table_interval_s=3600)
+        stored_before = db.replace_mac_entries(device_id, [
+            {"if_index": 10, "mac": "aa:bb:cc:00:00:01", "vlan": "10"},
+            {"if_index": 10, "mac": "aa:bb:cc:00:00:02", "vlan": "10"},
+            {"if_index": 20, "mac": "aa:bb:cc:00:00:03", "vlan": "20"},
+        ])
+        poller = NodePoller(db)
+        poller.log = types.SimpleNamespace(
+            add=lambda category, message, target="", detail="": None)
+        bridge = NodePoller._DOT1D_BASE_PORT_IF_INDEX
+        qbridge = NodePoller._DOT1Q_FDB_PORT
+
+        # The bridge-port map answers in full; the FDB column stops half way.
+        seen = []
+        _stub_columns(poller, {
+            bridge: ({"1": 10, "2": 20}, True),
+            qbridge: ({"10.170.187.204.0.0.1": 1}, False),
+        }, seen)
+        entries = poller.read_device_mac_table(device_id)
+        check(entries is None,
+              f"a forwarding-table column cut short reads as None, not as a "
+              f"one-row table ({entries})")
+
+        poller._run_mac_table(device_id)
+        rows = db.mac_entries_for(device_id)
+        present = [row["mac"] for row in rows if row["present"]]
+        check(len(rows) == stored_before == 3 and len(present) == 3,
+              f"...so the scheduled walk leaves all three stored MACs present "
+              f"({len(present)} of {len(rows)} still present)")
+
+        # The budget comes off mac_table_interval_s (3600 -> 1800s), not the
+        # 120s poll interval that _walk_column_detail would have derived.
+        fdb_deadlines = [deadline for oid, deadline in seen if oid == qbridge]
+        budget = fdb_deadlines[0] if fdb_deadlines else None
+        remaining = (budget - time.time()) if budget else 0.0
+        check(remaining > 300,
+              f"the FDB walk is given a budget off its own hourly cadence, not "
+              f"half a two-minute poll interval ({remaining:.0f}s left)")
+
+        # The same columns, finished: now the walk is authoritative again.
+        _stub_columns(poller, {
+            bridge: ({"1": 10, "2": 20}, True),
+            qbridge: ({"10.170.187.204.0.0.9": 1}, True),
+        }, [])
+        entries = poller.read_device_mac_table(device_id)
+        check(entries is not None and len(entries) == 1
+              and entries[0]["mac"] == "aa:bb:cc:00:00:09",
+              f"a walk that reached the end of the subtree still stores its "
+              f"rows ({entries})")
+        poller._run_mac_table(device_id)
+        present = [row["mac"] for row in db.mac_entries_for(device_id)
+                   if row["present"]]
+        check(present == ["aabbcc000009"],      # nodesdb normalises on the way in
+              f"...and ages out the three it genuinely no longer reports "
+              f"({present})")
+    finally:
+        db.close()
+
+
+def test_a_truncated_neighbour_or_vlan_column_never_reaches_storage():
+    """The reviewer's open question, settled by stub. LLDP/CDP and the VLAN
+    walk read several columns each, every one its own walk with its own
+    budget, and every one discarded `complete`. A column that stops short
+    still contributes its suffixes to the joined rows -- so the rows land
+    with the truncated column's field BLANK, and every row past the
+    truncation is aged out. Both now leave storage alone instead."""
+    db = NodesDatabase(os.path.join(tmpdir("poller_review_l2partial_"), "nodes.db"))
+    try:
+        group_id = db.ensure_default_group()
+        device_id = db.add_device("127.0.0.1", "l2-sw", group_id=group_id,
+                                  snmp_version=1, community="public",
+                                  ping_enabled=0, poll_interval_s=120,
+                                  lldp_interval_s=3600, vlan_interval_s=3600)
+        poller = NodePoller(db)
+        poller.log = types.SimpleNamespace(
+            add=lambda category, message, target="", detail="": None)
+
+        # --- LLDP: chassis id finishes, port id is cut short ---------------
+        suffix = "0.1.1"
+        columns = {NodePoller._LLDP_COLUMNS["chassis_id"]:
+                   ({suffix: "aa:bb:cc:dd:ee:ff"}, True),
+                   NodePoller._LLDP_COLUMNS["sys_name"]: ({suffix: "core-1"}, True),
+                   NodePoller._LLDP_COLUMNS["port_id"]: ({}, False)}
+        _stub_columns(poller, columns, [])
+        entries = poller.read_device_neighbors(device_id)
+        check(entries is None,
+              f"an LLDP column cut short discards the whole pass rather than "
+              f"storing neighbours with a blank port_id ({entries})")
+
+        # What the pre-fix shape would have stored, shown directly: the join
+        # really does produce a blanked row, which is why this is worth
+        # refusing rather than merging.
+        device = db.device(device_id)
+        rows, answered, complete = poller._walk_lldp(
+            device, db.effective_config(device))
+        check(answered and not complete and len(rows) == 1
+              and rows[0]["chassis_id"] == "aa:bb:cc:dd:ee:ff"
+              and rows[0]["port_id"] == "",
+              f"...and the row it would have stored is indeed blanked ({rows})")
+
+        columns[NodePoller._LLDP_COLUMNS["port_id"]] = ({suffix: "Gi0/24"}, True)
+        _stub_columns(poller, columns, [])
+        entries = poller.read_device_neighbors(device_id)
+        check(entries is not None and len(entries) == 1
+              and entries[0]["port_id"] == "Gi0/24",
+              f"a pass whose every column finished still stores ({entries})")
+
+        # --- VLAN: the static name column finishes, the egress bitmap does not
+        vlan_columns = {
+            nodeoids.DOT1D_BASE_PORT_IFINDEX: ({"1": 10}, True),
+            nodeoids.DOT1Q_VLAN_STATIC_NAME: ({"10": "users"}, True),
+            nodeoids.DOT1Q_VLAN_STATIC_EGRESS: ({"10": "\x80"}, False),
+        }
+        _stub_columns(poller, vlan_columns, [])
+        result = poller.read_device_vlans(device_id)
+        check(result is None,
+              f"a VLAN column cut short discards the whole pass rather than "
+              f"ageing out the memberships it never reached ({result})")
+
+        vlan_columns[nodeoids.DOT1Q_VLAN_STATIC_EGRESS] = ({"10": "\x80"}, True)
+        _stub_columns(poller, vlan_columns, [])
+        result = poller.read_device_vlans(device_id)
+        check(result is not None and [v["vlan"] for v in result["vlans"]] == [10],
+              f"...while a finished VLAN pass still stores ({result})")
+    finally:
+        db.close()
+
+
 def test_deleting_a_device_drops_every_cache_keyed_on_it():
     """_forget_devices' own docstring says every per-device container is
     pruned. Five were not in its list, and _discovery_jobs was pruned
@@ -1135,6 +1294,8 @@ def main():
     test_a_column_walk_has_a_deadline_even_when_the_caller_gives_none()
     test_the_interface_read_opens_one_socket_and_decrypts_once()
     test_an_unencodable_oid_does_not_freeze_the_device()
+    test_a_truncated_mac_table_never_reaches_storage()
+    test_a_truncated_neighbour_or_vlan_column_never_reaches_storage()
     test_deleting_a_device_drops_every_cache_keyed_on_it()
     test_a_refused_community_is_not_printed()
 

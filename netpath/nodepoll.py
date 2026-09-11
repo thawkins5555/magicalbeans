@@ -4800,6 +4800,24 @@ class NodePoller(Worker):
                                 f"incomplete: {reason}", target=device["ip"])
         return rows, complete, reason, note
 
+    def _table_walk_deadline(self, config: dict, interval_key: str) -> float:
+        """The wall-clock budget for one whole-device table walk, off the
+        cadence THAT walk actually runs on.
+
+        _walk_column_detail derives a default budget from poll_interval_s,
+        which is the right clock for the ~30 column walks a poll makes and
+        the wrong one for a table walked on its own schedule: a MAC or
+        LLDP walk every hour was being cut off at half of a two-minute poll
+        interval. Same floor and fraction, different clock — and back to
+        poll_interval_s if the cadence is somehow unset, so this can only
+        ever widen the budget, never narrow it.
+        """
+        interval = float(config.get(interval_key) or 0)
+        if interval <= 0:
+            interval = float(config.get("poll_interval_s") or 120)
+        return time.time() + max(self._WALK_BUDGET_FLOOR_S,
+                                 self._WALK_BUDGET_FRACTION * interval)
+
     def _walk_column(self, device, config: dict, base_oid: str,
                      raise_on_timeout: bool = False,
                      deadline: float | None = None) -> dict[str, object]:
@@ -4902,7 +4920,9 @@ class NodePoller(Worker):
                     # sweep that checked only between VLANs could run two
                     # unbounded walks past the budget it was given.
                     complete = False
-                    reason = "the walk's own time budget ran out"
+                    hit_cap = (f"stopped after {len(values)} row(s) when the "
+                               f"walk's own time budget ran out")
+                    reason = hit_cap
                     break
                 try:
                     pdu_tag = PDU_GETBULK if use_bulk else PDU_GETNEXT
@@ -6341,6 +6361,15 @@ class NodePoller(Worker):
         which the caller must not confuse with an empty one: "this switch
         cannot tell us" and "this switch has learned nothing" are different
         facts, and only the second should overwrite what we already stored.
+
+        None as well whenever an FDB column walk did not reach the end of
+        its subtree — exactly the rule _walk_arp_table already applies, and
+        for the same reason. A truncated forwarding table handed to
+        replace_mac_entries marks every stored row the walk never reached
+        absent: a core switch whose 40,000-entry table stopped on the row
+        cap or the time budget read as tens of thousands of MACs having
+        vanished, once per mac_table_interval_s. A walk cut short is not
+        evidence that anything is gone.
         """
         device = self.db.device(device_id)
         if device is None:
@@ -6349,20 +6378,30 @@ class NodePoller(Worker):
         if not config.get("snmp_enabled", True):
             return None
 
-        port_map = self._bridge_port_map(device, config)
+        # This walk runs on mac_table_interval_s, so that is the clock its
+        # budget comes off — not poll_interval_s, which _walk_column_detail
+        # would otherwise derive one from. An hourly MAC walk given half a
+        # two-minute poll interval is a table truncated at sixty seconds
+        # every time on any switch large enough to matter.
+        deadline = self._table_walk_deadline(config, "mac_table_interval_s")
+        port_map = self._bridge_port_map(device, config, deadline=deadline)
         is_cisco = detected_vendor(device).lower() == "cisco"
         answered = bool(port_map)
 
         entries = []
         if port_map:
             ports = set(port_map)
-            entries = self._fdb_entries(
-                self._walk_column(device, config, self._DOT1Q_FDB_PORT),
-                ports, None, True, port_map)
+            fdb, complete = self._walk_column_status(
+                device, config, self._DOT1Q_FDB_PORT, deadline=deadline)
+            if not complete:
+                return None
+            entries = self._fdb_entries(fdb, ports, None, True, port_map)
             if not entries:
-                entries = self._fdb_entries(
-                    self._walk_column(device, config, self._DOT1D_FDB_PORT),
-                    ports, None, False, port_map)
+                fdb, complete = self._walk_column_status(
+                    device, config, self._DOT1D_FDB_PORT, deadline=deadline)
+                if not complete:
+                    return None
+                entries = self._fdb_entries(fdb, ports, None, False, port_map)
         if not entries and is_cisco:
             entries, cisco_answered = self._cisco_vlan_device_fdb(
                 device, config, port_map)
@@ -6913,9 +6952,9 @@ class NodePoller(Worker):
     # entry is walked as its own column (the same one-GETBULK-walk-per-
     # column shape _fdb_entries' callers already use for the FDB), then
     # joined back together on the shared lldpRemTimeMark.lldpRemLocalPortNum.
-    # lldpRemIndex suffix in _walk_lldp — a device answering some columns
-    # and timing out on others still contributes a row with whatever did
-    # answer, rather than the whole walk failing on the slowest column.
+    # lldpRemIndex suffix in _walk_lldp. A column that stops short is
+    # therefore NOT absorbed into a row with that field left blank: see
+    # read_device_neighbors on why the whole pass is discarded instead.
     _LLDP_COLUMNS = {
         "chassis_id_subtype": nodeoids.LLDP_REM_CHASSIS_ID_SUBTYPE,
         "chassis_id":         nodeoids.LLDP_REM_CHASSIS_ID,
@@ -6948,33 +6987,56 @@ class NodePoller(Worker):
         if not config.get("snmp_enabled", True):
             return None
 
-        entries, lldp_answered = self._walk_lldp(device, config)
+        deadline = self._table_walk_deadline(config, "lldp_interval_s")
+        entries, lldp_answered, complete = self._walk_lldp(device, config,
+                                                           deadline)
         answered = lldp_answered
         if detected_vendor(device).lower() == "cisco":
-            cdp_entries, cdp_answered = self._walk_cdp(device, config)
+            cdp_entries, cdp_answered, cdp_complete = self._walk_cdp(
+                device, config, deadline)
             entries.extend(cdp_entries)
             answered = answered or cdp_answered
+            complete = complete and cdp_complete
         if not answered:
+            return None
+        if not complete:
+            # Each column is its own walk, so one that stopped early does
+            # not stop the others: the suffixes the columns that DID finish
+            # produced still become rows, with the truncated column's field
+            # blank. Handed to replace_neighbors that is a stored neighbour
+            # rewritten with an empty port_id/sys_name, and every row past
+            # the truncation aged out — a walk cut short editing the
+            # topology. Same verdict as _walk_arp_table's: leave storage
+            # alone. The cost, as there, is a device whose agent refuses
+            # one column outright (a genErr for a subtree it will not
+            # serve) never storing neighbours rather than storing them with
+            # that column blank.
             return None
         return entries
 
-    def _walk_lldp(self, device, config: dict) -> tuple[list[dict], bool]:
-        """(neighbour rows, whether the device answered anything). See
-        nodeoids' LLDP block for why lldpRemLocalPortNum is used directly
-        as the local ifIndex rather than resolved through lldpLocPortTable.
+    def _walk_lldp(self, device, config: dict,
+                   deadline: float | None = None) -> tuple:
+        """(neighbour rows, whether the device answered anything, whether
+        every column walk reached the end of its subtree). See nodeoids'
+        LLDP block for why lldpRemLocalPortNum is used directly as the
+        local ifIndex rather than resolved through lldpLocPortTable, and
+        read_device_neighbors for what the third element is for.
         """
         values: dict[str, dict] = {}
         answered = False
+        complete = True
         for key, oid in self._LLDP_COLUMNS.items():
             try:
-                column = self._walk_column(device, config, oid)
+                column, column_done = self._walk_column_status(
+                    device, config, oid, deadline=deadline)
             except SnmpError:
-                column = {}
+                column, column_done = {}, False
             if column:
                 answered = True
+            complete = complete and column_done
             values[key] = column
         if not answered:
-            return [], False
+            return [], False, complete
         suffixes: set = set()
         for column in values.values():
             suffixes.update(column)
@@ -7004,24 +7066,29 @@ class NodePoller(Worker):
                 "sys_name": str(values["sys_name"].get(suffix) or ""),
                 "sys_descr": str(values["sys_descr"].get(suffix) or ""),
             })
-        return entries, True
+        return entries, True, complete
 
-    def _walk_cdp(self, device, config: dict) -> tuple[list[dict], bool]:
-        """(neighbour rows, whether the device answered anything) from
-        CISCO-CDP-MIB's cdpCacheTable. Indexed by cdpCacheIfIndex directly,
-        so — unlike LLDP above — no local-port assumption is needed."""
+    def _walk_cdp(self, device, config: dict,
+                  deadline: float | None = None) -> tuple:
+        """(neighbour rows, whether the device answered anything, whether
+        every column walk finished) from CISCO-CDP-MIB's cdpCacheTable.
+        Indexed by cdpCacheIfIndex directly, so — unlike LLDP above — no
+        local-port assumption is needed."""
         values: dict[str, dict] = {}
         answered = False
+        complete = True
         for key, oid in self._CDP_COLUMNS.items():
             try:
-                column = self._walk_column(device, config, oid)
+                column, column_done = self._walk_column_status(
+                    device, config, oid, deadline=deadline)
             except SnmpError:
-                column = {}
+                column, column_done = {}, False
             if column:
                 answered = True
+            complete = complete and column_done
             values[key] = column
         if not answered:
-            return [], False
+            return [], False, complete
         suffixes: set = set()
         for column in values.values():
             suffixes.update(column)
@@ -7045,7 +7112,7 @@ class NodePoller(Worker):
                 "platform": str(values["platform"].get(suffix) or ""),
                 "remote_address": format_cdp_address(values["address"].get(suffix)),
             })
-        return entries, True
+        return entries, True, complete
 
     def _run_lldp_table(self, device_id: int) -> None:
         """One scheduled LLDP/CDP walk, mirroring _run_mac_table exactly:
@@ -7120,12 +7187,20 @@ class NodePoller(Worker):
         # one of eight start after the budget was already spent.
         deadline = time.time() + _VLAN_WALK_BUDGET_S
         answered = False
+        complete = True
 
         def walk(oid: str, *, evidence: bool = True) -> dict:
-            nonlocal answered
-            column = self._walk_column(device, config, oid, deadline=deadline)
+            nonlocal answered, complete
+            column, column_done = self._walk_column_status(
+                device, config, oid, deadline=deadline)
             if column and evidence:
                 answered = True
+            # Tracked for EVERY column, evidence=False included: a
+            # dot1dBasePortIfIndex walk cut half way resolves the other
+            # columns' bridge ports against half a map, which is a
+            # membership recorded against the wrong interface rather than a
+            # missing one.
+            complete = complete and column_done
             return column
 
         # (a) bridge port -> ifIndex. BRIDGE-MIB, not a VLAN table: it only
@@ -7323,6 +7398,16 @@ class NodePoller(Worker):
                     memberships[(if_index, native)] = False
 
         if not answered:
+            return None
+        if not complete:
+            # One of the dozen column walks above stopped short — the
+            # shared budget, the row cap, a timeout. Every one of them
+            # feeds replace_vlans/replace_vlan_ports/replace_port_vlans,
+            # which age out whatever this pass did not report: a truncated
+            # egress bitmap silently drops real memberships, and a
+            # truncated untagged bitmap relabels access ports as tagged.
+            # Same verdict as the MAC and neighbour walks — storage is
+            # left alone until a walk finishes.
             return None
 
         # (d) mac_entries fallback — evidence, not configuration, only for
