@@ -106,6 +106,23 @@ CONTROLLER_EDITABLE = ("name", "ip", "enabled", "snmp_version", "community",
                        "v3_user", "v3_auth_proto")
 
 
+def _radio_changes(previous: dict, radios: list[dict]) -> list[str]:
+    """One sentence per radio whose channel or mode moved. A radio with no
+    previous row is silent (a new AP is not a channel change), and so is a
+    reading that arrived or vanished — "— to 44" is a radio being enabled."""
+    changes = []
+    for radio in radios:
+        old = previous.get(radio["radio_id"])
+        if old is None:
+            continue
+        label = f"radio {radio['radio_id']}"
+        for field, word in (("channel", "channel"), ("mode", "mode")):
+            was, now = old[field], radio.get(field)
+            if was and now and str(was) != str(now):
+                changes.append(f"{label}: {word} {was} → {now}")
+    return changes
+
+
 class WirelessDatabase(SqliteStore):
     SCHEMA = SCHEMA
     DEFAULTS = DEFAULTS
@@ -116,9 +133,17 @@ class WirelessDatabase(SqliteStore):
         self.ensure_columns("access_points", {
             "ip": "TEXT", "response_ms": "REAL",
             "out_of_service": "INTEGER NOT NULL DEFAULT 0"})
+        # uptime_ticks/uptime_ts are the pair detect_reboot compares, stored
+        # the way nodesdb stores last_uptime_ticks/last_uptime_ts.
+        self.ensure_columns("access_points", {
+            "uptime_ticks": "INTEGER", "uptime_ts": "REAL",
+            "session_uptime_ticks": "INTEGER", "profile": "TEXT"})
         # fgWcWtpSessionRadioMode, stored decoded rather than as the raw enum
         # so the mapping lives in one place (nodeoids.RADIO_MODE).
         self.ensure_columns("radios", {"mode": "TEXT"})
+        # channel_width is the PROFILE's configured width, joined on by
+        # (vdom, profile, radio id) -- there is no per-radio width in the MIB.
+        self.ensure_columns("radios", {"bssid": "TEXT", "channel_width": "TEXT"})
 
     # ------------------------------------------------------------ controllers
 
@@ -198,7 +223,8 @@ class WirelessDatabase(SqliteStore):
                                   ("last_seen_ts", "missed_polls", *fields))
         with self._lock:
             existed = self._conn.execute(
-                "SELECT status, out_of_service FROM access_points"
+                "SELECT status, out_of_service, uptime_ticks, uptime_ts"
+                " FROM access_points"
                 " WHERE controller_id = ? AND vdom = ?"
                 " AND wtp_id = ?", (controller_id, vdom, wtp_id)).fetchone()
             self._conn.execute(
@@ -220,6 +246,7 @@ class WirelessDatabase(SqliteStore):
             else:
                 self._record_status_change(controller_id, wtp_id, vdom, existed,
                                            fields)
+                self._record_reboot(controller_id, wtp_id, vdom, existed, fields)
             row = self._conn.execute(
                 "SELECT id FROM access_points WHERE controller_id = ? AND vdom = ?"
                 " AND wtp_id = ?", (controller_id, vdom, wtp_id)).fetchone()
@@ -267,18 +294,58 @@ class WirelessDatabase(SqliteStore):
                 controller_id, wtp_id, vdom, name, "ap_online",
                 f"{name} is {fields.get('status') or 'reachable'} again")
 
-    def replace_radios(self, ap_id: int, radios: list[dict]) -> None:
+    def _record_reboot(self, controller_id, wtp_id, vdom, previous, fields) -> None:
+        """Records ap_rebooted when fgWcWtpSessionWtpUpTime falls. The
+        comparison — and the 497-day TimeTicks wrap it rules out — is Nodes'
+        own detect_reboot; the import is local because nothing else in this
+        storage module needs the SNMP stack behind it. Lock already held."""
+        from .nodepoll import detect_reboot
+
+        ticks = fields.get("uptime_ticks")
+        read_at = fields.get("uptime_ts")
+        if ticks is None or not read_at or previous["uptime_ticks"] is None:
+            return
+        if not previous["uptime_ts"]:
+            return
+        rebooted, sentence = detect_reboot(int(ticks), float(read_at),
+                                           int(previous["uptime_ticks"]),
+                                           float(previous["uptime_ts"]))
+        if not rebooted:
+            return
+        name = str(fields.get("name") or wtp_id)
+        self.add_ap_event(controller_id, wtp_id, vdom, name, "ap_rebooted",
+                          f"{name} rebooted — {sentence}")
+
+    def replace_radios(self, ap_id: int, radios: list[dict], *,
+                       controller_id: int | None = None, wtp_id: str | None = None,
+                       vdom: str = "", name: str = "") -> None:
+        """The radio rows are replaced wholesale, so the diff has to be taken
+        first: a channel or mode that moved (DARRP re-picking a channel, a
+        radio switched to monitor) would otherwise be overwritten silently.
+        The keyword arguments are what an ap_event needs and a radio row does
+        not carry; without them the diff is skipped and this is a plain
+        replace, which is what keeps every existing caller working."""
         with self._lock:
+            previous = {}
+            if controller_id is not None and wtp_id is not None:
+                previous = {row["radio_id"]: row for row in self._conn.execute(
+                    "SELECT radio_id, channel, mode FROM radios WHERE ap_id = ?",
+                    (ap_id,)).fetchall()}
             self._conn.execute("DELETE FROM radios WHERE ap_id = ?", (ap_id,))
             for radio in radios:
                 self._conn.execute(
                     "INSERT INTO radios(ap_id, radio_id, channel,"
-                    " operating_power_dbm, station_count, mode)"
-                    " VALUES (?,?,?,?,?,?)",
+                    " operating_power_dbm, station_count, mode, bssid,"
+                    " channel_width) VALUES (?,?,?,?,?,?,?,?)",
                     (ap_id, radio["radio_id"], radio.get("channel"),
                      radio.get("operating_power_dbm"),
-                     radio.get("station_count"), radio.get("mode")))
+                     radio.get("station_count"), radio.get("mode"),
+                     radio.get("bssid"), radio.get("channel_width")))
             self._conn.commit()
+            for detail in _radio_changes(previous, radios):
+                self.add_ap_event(controller_id, wtp_id, vdom,
+                                  name or wtp_id or "", "radio_channel_changed",
+                                  detail)
 
     def access_points(self, controller_id: int | None = None) -> list[sqlite3.Row]:
         clause = " WHERE controller_id = ?" if controller_id is not None else ""

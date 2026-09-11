@@ -1212,7 +1212,13 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
             T_GAUGE32, lambda st, now: 12 + (h("cpu5", st.name) % 30)),
         "1.3.6.1.4.1.9.9.48.1.1.1.5.1": (
             T_GAUGE32, lambda st, now: 90_000_000 + (h("memfree", st.name) % 40_000_000)),
+        "1.3.6.1.4.1.9.2.1.73.0": (               # sysConfigName (boot image)
+            T_OCTET_STRING,
+            "flash:/c2960x-universalk9-mz.152-7.E3/"
+            "c2960x-universalk9-mz.152-7.E3.bin"),
     }))
+    entries["1.3.6.1.2.1.47.1.1.1.1.10.1"] = (     # entPhysicalSoftwareRev.1
+        T_OCTET_STRING, "15.2(7)E3")
     # L2 topology: every access switch's real uplink is core-sw-01 (see
     # this section's own module comment) — reported via both LLDP and CDP,
     # the way a real Cisco access switch actually answers both at once.
@@ -1289,7 +1295,11 @@ def _build_cisco_core(wrap32: bool, ports: int, vlan: str | None) -> dict:
     entries.update(arc_objects(9, {
         "1.3.6.1.4.1.9.9.109.1.1.1.1.8.1": (
             T_GAUGE32, lambda st, now: 20 + (h("cpu5", st.name) % 40)),
+        "1.3.6.1.4.1.9.2.1.73.0": (               # sysConfigName (boot image)
+            T_OCTET_STRING, "bootflash:packages.conf"),
     }))
+    entries["1.3.6.1.2.1.47.1.1.1.1.10.1"] = (     # entPhysicalSoftwareRev.1
+        T_OCTET_STRING, "17.3.5")
     if vlan is not None:
         # Classic IOS: the bridge table only exists inside a per-VLAN
         # community context. Each VLAN shows a slice of the MACs.
@@ -1361,6 +1371,8 @@ def _build_aruba(wrap32: bool, ports: int, vlan: str | None) -> dict:
         "1.3.6.1.4.1.14823.2.2.1.1.1.9.0": (
             T_INTEGER, lambda st, now: 15 + (h("acpu", st.name) % 35)),
     }))
+    entries["1.3.6.1.4.1.11.2.14.11.5.1.1.3.0"] = (  # hpSwitchOsVersion
+        T_OCTET_STRING, "WC.16.10.0021")
     # L2 topology: this switch's uplink (its last port, 1/24) really does
     # go to the plant core. No CDP — Aruba is not Cisco.
     entries.update(lldp_neighbor(
@@ -1388,6 +1400,8 @@ def _build_fortigate(wrap32: bool, ports: int, vlan: str | None) -> dict:
     entries.update(host_resources(2, [("Physical memory", 1024, 2097152, 0.55),
                                       ("/data", 4096, 1048576, 0.31)]))
     entries.update(arc_objects(12356, {
+        "1.3.6.1.4.1.12356.101.4.1.1.0": (            # fgSysVersion
+            T_OCTET_STRING, "v7.2.5,build1517,230606 (GA.M)"),
         # Real Fortinet scalars the app does NOT poll — here so a demo can
         # show that a FortiGate's session count and CPU are invisible to
         # SappiWhere unless somebody adds them as a custom MIB object.
@@ -1418,7 +1432,8 @@ def _build_paloalto(wrap32: bool, ports: int, vlan: str | None) -> dict:
     entries.update(host_resources(4, [("Physical memory", 1024, 8388608, 0.42),
                                       ("/opt/panlogs", 4096, 4194304, 0.66)]))
     entries.update(arc_objects(25461, {
-        "1.3.6.1.4.1.25461.2.1.2.1.1.0": (T_OCTET_STRING, "PA-3220"),
+        "1.3.6.1.4.1.25461.2.1.2.1.1.0": (            # panSysSwVersion
+            T_OCTET_STRING, "10.2.7-h3"),
         "1.3.6.1.4.1.25461.2.1.2.1.3.0": (T_OCTET_STRING, "10.2.6-h3"),
         "1.3.6.1.4.1.25461.2.1.2.3.1.0": (            # panSessionUtilization
             T_GAUGE32, lambda st, now: 10 + (h("panu", st.name) % 40)),
@@ -1445,6 +1460,8 @@ def _build_juniper(wrap32: bool, ports: int, vlan: str | None) -> dict:
         "1.3.6.1.4.1.2636.3.1.13.1.11.9.1.0.0": (     # jnxOperatingBuffer
             T_INTEGER, lambda st, now: 30 + (h("jbuf", st.name) % 40)),
     }))
+    entries["1.3.6.1.2.1.25.6.3.1.2.1"] = (            # hrSWInstalledName.1
+        T_OCTET_STRING, "JUNOS Base OS Software Suite [20.4R3-S4.8]")
     # L2 topology: this distribution switch's first uplink (xe-0/1/0,
     # ifIndex 25) goes to the plant core.
     entries.update(lldp_neighbor(
@@ -1513,6 +1530,14 @@ def _wtp_suffix(vdom: str, wtp_id: str) -> str:
     return f"{vdom}.{len(wtp_id)}.{chars}"
 
 
+def _wtp_profile_radio_suffix(vdom: str, profile: str, radio_id: int) -> str:
+    """Same length-prefixed string index as _wtp_suffix, for the fgWcWtp-
+    ProfileRadioTable, which is indexed by profile name rather than WTP id
+    and carries a trailing radioId arc."""
+    chars = ".".join(str(ord(c)) for c in profile)
+    return f"{vdom}.{len(profile)}.{chars}.{radio_id}"
+
+
 AP_NAMES = ["Lobby", "Reception", "Warehouse-N", "Warehouse-S", "Office-1",
             "Office-2", "Canteen", "Loading-Bay", "Meeting-A", "Meeting-B",
             "Yard", "Server-Room"]
@@ -1526,11 +1551,23 @@ def _build_fortigate_wlc(wrap32: bool, ports: int, vlan: str | None) -> dict:
                             1_000_000_000, hc=not wrap32,
                             alias=lambda i, d: f"ap segment {i}"))
     offline = {"AP0003", "AP0011"}
+    reboot_ap, drift_ap = "AP0007", "AP0005"
+
+    def ap_boot_epoch(st, wtp_id):
+        return st.start_ts - (h("apboot", st.name, wtp_id) % 3_456_000) - 600
+
+    def ap_uptime_secs(st, now, wtp_id):
+        boot_epoch = ap_boot_epoch(st, wtp_id)
+        if wtp_id == reboot_ap:
+            return (now - boot_epoch) % 1200
+        return max(0.0, now - boot_epoch)
+
     for n, label in enumerate(AP_NAMES, start=1):
         wtp_id = f"AP{n:04d}"
         suffix = _wtp_suffix("1", wtp_id)
         online = wtp_id not in offline
         mac = bytes((0x00, 0x11, 0x93, 0x00, (n >> 8) & 0xFF, n & 0xFF))
+        profile = "FAP231F-default" if n % 2 else "FAP231F-warehouse"
         entries[f"{fgoids.WTP_CONFIG_NAME}.{suffix}"] = (
             T_OCTET_STRING, f"{label}-AP")
         entries[f"{fgoids.WTP_SESSION_IP}.{suffix}"] = (
@@ -1545,11 +1582,34 @@ def _build_fortigate_wlc(wrap32: bool, ports: int, vlan: str | None) -> dict:
             (lambda st, now, k=n: 0) if not online else
             (lambda st, now, k=n: max(0, 8 + (h("clients", st.name, k) % 22) +
                                       int(6 * math.sin(now / 41.0 + k)))))
+        # fgWcWtpSessionWtpUpTime / WtpSessionUpTime: real per-AP clocks, not
+        # tied to the controller's own uptime — AP0007 wraps every 20
+        # minutes to show the "Access point rebooted" event.
+        entries[f"{fgoids.WTP_SESSION_UPTIME}.{suffix}"] = (
+            T_TIMETICKS,
+            (lambda st, now, w=wtp_id: 0) if not online else
+            (lambda st, now, w=wtp_id:
+                int(ap_uptime_secs(st, now, w) * 100) % (2 ** 32)))
+        entries[f"{fgoids.WTP_SESSION_SESSION_UPTIME}.{suffix}"] = (
+            T_TIMETICKS,
+            (lambda st, now, w=wtp_id: 0) if not online else
+            (lambda st, now, w=wtp_id:
+                int(max(0.0, ap_uptime_secs(st, now, w) - 90) * 100)
+                % (2 ** 32)))
+        entries[f"{fgoids.WTP_SESSION_PROFILE}.{suffix}"] = (
+            T_OCTET_STRING, profile)
         for radio in (1, 2):
             rsuffix = f"{suffix}.{radio}"
             channel = (1, 6, 11)[n % 3] if radio == 1 else (36, 44, 149)[n % 3]
             entries[f"{fgoids.WTP_RADIO_MODE}.{rsuffix}"] = (T_INTEGER, 3)
-            entries[f"{fgoids.WTP_RADIO_CHANNEL}.{rsuffix}"] = (T_INTEGER, channel)
+            if wtp_id == drift_ap and radio == 2:
+                # Demo channel-change event: flips every 10 minutes.
+                entries[f"{fgoids.WTP_RADIO_CHANNEL}.{rsuffix}"] = (
+                    T_INTEGER,
+                    lambda st, now: 44 if int(now // 600) % 2 == 0 else 149)
+            else:
+                entries[f"{fgoids.WTP_RADIO_CHANNEL}.{rsuffix}"] = (
+                    T_INTEGER, channel)
             # Deliberately in FortiOS's own 0-100 "power level" units, not
             # dBm — the exact mismatch fortipoll.py auto-detects.
             entries[f"{fgoids.WTP_RADIO_OPERATING_POWER}.{rsuffix}"] = (
@@ -1560,7 +1620,24 @@ def _build_fortigate_wlc(wrap32: bool, ports: int, vlan: str | None) -> dict:
                 (lambda st, now, k=n, r=radio:
                     max(0, 4 + (h("rclients", st.name, k, r) % 12) +
                         int(3 * math.sin(now / 37.0 + k + r)))))
+            # fgWcWtpSessionRadioBaseBssid: derived from the AP's own MAC.
+            bssid = mac[:5] + bytes(((mac[5] + radio) & 0xFF,))
+            entries[f"{fgoids.WTP_RADIO_BSSID}.{rsuffix}"] = (
+                T_OCTET_STRING, bssid)
+    # fgWcWtpProfileRadioChannelWidth: one row per (profile, radioId), not
+    # per AP — both demo profiles' two radios.
+    profile_widths = {
+        ("FAP231F-default", 1): 1,      # 20 MHz
+        ("FAP231F-default", 2): 3,      # 80 MHz
+        ("FAP231F-warehouse", 1): 2,    # 40 MHz
+        ("FAP231F-warehouse", 2): 2,    # 40 MHz
+    }
+    for (profile, radio_id), width in profile_widths.items():
+        psuffix = _wtp_profile_radio_suffix("1", profile, radio_id)
+        entries[f"{fgoids.WTP_PROFILE_RADIO_CHANNEL_WIDTH}.{psuffix}"] = (T_INTEGER, width)
     entries.update(arc_objects(12356, {
+        "1.3.6.1.4.1.12356.101.4.1.1.0": (        # fgSysVersion
+            T_OCTET_STRING, "v7.2.8,build1639,240110 (GA.M)"),
         "1.3.6.1.4.1.12356.101.4.1.3.0": (
             T_GAUGE32, lambda st, now: 14 + (h("wlccpu", st.name) % 20)),
         "1.3.6.1.4.1.12356.101.4.1.4.0": (
@@ -1582,8 +1659,10 @@ def _build_mikrotik(wrap32: bool, ports: int, vlan: str | None) -> dict:
     entries.update(arc_objects(14988, {
         "1.3.6.1.4.1.14988.1.1.3.100.1.3.1": (        # mtxrHlTemperature
             T_INTEGER, lambda st, now: 380 + (h("mttemp", st.name) % 90)),
-        "1.3.6.1.4.1.14988.1.1.7.4.0": (              # mtxrLicVersion
-            T_OCTET_STRING, "7.11.2"),
+        "1.3.6.1.4.1.14988.1.1.4.4.0": (              # mtxrLicVersion
+            T_OCTET_STRING, "6.49.10"),
+        "1.3.6.1.4.1.14988.1.1.7.4.0": (              # mtxrFirmwareVersion
+            T_OCTET_STRING, "6.49.10"),
     }))
     return entries
 

@@ -51,6 +51,11 @@ PING_BUDGET_S = 20.0
 
 SNMP_PORT = 161
 
+# How far apart _first_due may push two controllers that came due together.
+# nodepoll's _STARTUP_SPREAD_S, for the same reason: every controller used to
+# be seeded due at 0 on start and so stayed phase-locked to the others.
+POLL_SPREAD_S = 30.0
+
 
 class _AuthFailure(SnmpError):
     pass
@@ -67,6 +72,7 @@ class WirelessPoller(Worker):
         self._executor: ThreadPoolExecutor | None = None
         self._stop = threading.Event()
         self._queued: set[int] = set()
+        self._next_run: dict[int, float] = {}
         self._lock = threading.Lock()
         # Reset per controller in _poll_controller; defined here so the
         # helper is safe to call before a poll has started.
@@ -79,6 +85,7 @@ class WirelessPoller(Worker):
     def start(self, settings: dict | None = None) -> None:
         self.stop()
         self._stop.clear()
+        self._next_run.clear()
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._spawn()
 
@@ -147,20 +154,38 @@ class WirelessPoller(Worker):
                 self._queued.discard(controller_id)
 
     def _loop(self) -> None:
-        next_run: dict[int, float] = {}
         while not self._stop.is_set():
-            settings = self.db.settings()
-            if settings.get("enabled", True):
-                interval = max(10, int(settings.get("poll_interval_s", 60)))
-                now = time.time()
-                for controller in self.db.controllers():
-                    if not controller["enabled"]:
-                        continue
-                    due = next_run.get(controller["id"], 0)
-                    if now >= due:
-                        next_run[controller["id"]] = now + interval
-                        self.poll_now(controller["id"])
+            self._schedule_pass()
             self._stop.wait(1.0)
+
+    def _first_due(self, last_poll_ts, now: float, interval: float) -> float:
+        """A controller's first due time this process. Never polled at all:
+        now. Otherwise its own period, but never sooner than a random point
+        inside the spread window — which is what breaks the phase lock a
+        restart imposes. Bounded by the interval, so a short one is kept."""
+        if not last_poll_ts:
+            return now
+        jitter = random.uniform(0.0, min(POLL_SPREAD_S, interval))
+        return max(last_poll_ts + interval, now + jitter)
+
+    def _schedule_pass(self) -> None:
+        settings = self.db.settings()
+        if not settings.get("enabled", True):
+            return
+        interval = max(10, int(settings.get("poll_interval_s", 60)))
+        now = time.time()
+        for controller in self.db.controllers():
+            controller_id = controller["id"]
+            if not controller["enabled"]:
+                self._next_run.pop(controller_id, None)
+                continue
+            due = self._next_run.get(controller_id)
+            if due is None:
+                due = self._next_run[controller_id] = self._first_due(
+                    controller["last_poll_ts"], now, interval)
+            if now >= due:
+                self._next_run[controller_id] = now + interval
+                self.poll_now(controller_id)
 
     def _run_one(self, controller_id: int) -> None:
         try:
@@ -235,10 +260,17 @@ class WirelessPoller(Worker):
             states = self._walk_column(controller, config, oids.WTP_SESSION_CONNECTION_STATE)
             models = self._walk_column(controller, config, oids.WTP_SESSION_MODEL)
             stations = self._walk_column(controller, config, oids.WTP_SESSION_STATION_COUNT)
+            uptimes = self._walk_column(controller, config, oids.WTP_SESSION_UPTIME)
+            session_uptimes = self._walk_column(
+                controller, config, oids.WTP_SESSION_SESSION_UPTIME)
+            profiles = self._walk_column(controller, config, oids.WTP_SESSION_PROFILE)
             modes = self._walk_column(controller, config, oids.WTP_RADIO_MODE)
+            bssids = self._walk_column(controller, config, oids.WTP_RADIO_BSSID)
             channels = self._walk_column(controller, config, oids.WTP_RADIO_CHANNEL)
             powers = self._walk_column(controller, config, oids.WTP_RADIO_OPERATING_POWER)
             radio_stations = self._walk_column(controller, config, oids.WTP_RADIO_STATION_COUNT)
+            widths = self._walk_column(
+                controller, config, oids.WTP_PROFILE_RADIO_CHANNEL_WIDTH)
         except SnmpError as exc:
             self.db.record_poll(controller["id"], ok=False, error=str(exc))
             self.log.add(ERROR, f"Wireless controller {controller['name']} unreachable",
@@ -250,6 +282,8 @@ class WirelessPoller(Worker):
         # DisplayString index is in SNMP's OID-suffix convention); WTP_CONFIG_NAME
         # shares that same (vdom, wtpId) key. WTP_RADIO_* adds one more
         # trailing arc for the radio id.
+        width_by_profile = _channel_widths(widths)
+        now = time.time()
         seen: set[tuple[str, str]] = set()
         for suffix, mac in macs.items():
             vdom_wtp = _split_vdom_wtp(suffix)
@@ -261,15 +295,23 @@ class WirelessPoller(Worker):
             status = oids.CONNECTION_STATE.get(
                 int(state_num) if state_num is not None else -1, "other")
             ip = _format_ip(ips.get(suffix))
+            name = names.get(suffix) or wtp_id
+            profile = str(profiles.get(suffix) or "")
+            uptime_ticks = _as_int(uptimes.get(suffix))
             ap_id = self.db.upsert_ap(
                 controller["id"], wtp_id, vdom,
-                name=names.get(suffix) or wtp_id,
+                name=name,
                 status=status,
                 model=models.get(suffix) or "",
                 mac_address=_format_mac(mac),
                 ip=ip,
                 response_ms=self._ping_ap(ip, status),
-                station_count=_as_int(stations.get(suffix)))
+                station_count=_as_int(stations.get(suffix)),
+                profile=profile,
+                # No reading, no timestamp: the two are only true together.
+                uptime_ticks=uptime_ticks,
+                uptime_ts=now if uptime_ticks is not None else None,
+                session_uptime_ticks=_as_int(session_uptimes.get(suffix)))
             radios = []
             prefix = suffix + "."
             # Keyed off the mode column rather than the channel column: a
@@ -291,8 +333,13 @@ class WirelessPoller(Worker):
                         int(mode_num) if mode_num is not None else -1, "other"),
                     "operating_power_dbm": _as_int(powers.get(radio_suffix)),
                     "station_count": _as_int(radio_stations.get(radio_suffix)),
+                    "bssid": _format_mac(bssids.get(radio_suffix)) or None,
+                    # The profile-radio table is keyed by profile name, not by
+                    # AP, so every AP on one profile reads the same row.
+                    "channel_width": width_by_profile.get((vdom, profile, radio_id)),
                 })
-            self.db.replace_radios(ap_id, radios)
+            self.db.replace_radios(ap_id, radios, controller_id=controller["id"],
+                                   wtp_id=wtp_id, vdom=vdom, name=name)
 
         self.db.record_poll(controller["id"], ok=True)
         stale_after_polls = int(self.db.settings().get("stale_after_polls", 5))
@@ -388,11 +435,12 @@ class WirelessPoller(Worker):
             session.close()
 
 
-def _split_vdom_wtp(suffix: str) -> tuple[str, str] | None:
-    """'<vdomIndex>.<len>.<char> <len>.<char>...' -> (vdom, wtp_id). WtpId
-    is an ASN.1 OCTET STRING/DisplayString table index, so its OID-suffix
-    encoding is a length prefix followed by that many decimal char-code
-    arcs -- the same convention any string-indexed SNMP table uses."""
+def _split_vdom_name(suffix: str) -> tuple[str, str, str] | None:
+    """'<vdomIndex>.<len>.<char>...[.<rest>]' -> (vdom, name, rest). A
+    DisplayString table index is a length prefix followed by that many
+    decimal char-code arcs -- the convention any string-indexed SNMP table
+    uses. Here the string is the WtpId in the session tables and the profile
+    name in fgWcWtpProfileRadioTable; `rest` is the radio id in both."""
     parts = suffix.split(".")
     if len(parts) < 2:
         return None
@@ -402,10 +450,30 @@ def _split_vdom_wtp(suffix: str) -> tuple[str, str] | None:
         chars = parts[2:2 + length]
         if len(chars) != length:
             return None
-        wtp_id = "".join(chr(int(c)) for c in chars)
+        name = "".join(chr(int(c)) for c in chars)
     except (ValueError, IndexError):
         return None
-    return vdom, wtp_id
+    return vdom, name, ".".join(parts[2 + length:])
+
+
+def _split_vdom_wtp(suffix: str) -> tuple[str, str] | None:
+    parsed = _split_vdom_name(suffix)
+    return None if parsed is None else (parsed[0], parsed[1])
+
+
+def _channel_widths(values: dict[str, object]) -> dict[tuple[str, str, str], str]:
+    """fgWcWtpProfileRadioChannelWidth keyed by (vdom, profile, radio id),
+    which is what an AP's own (vdom, profile) plus a radio id joins onto."""
+    widths: dict[tuple[str, str, str], str] = {}
+    for suffix, value in values.items():
+        parsed = _split_vdom_name(suffix)
+        if parsed is None or not parsed[2]:
+            continue
+        vdom, profile, radio_id = parsed
+        width = oids.CHANNEL_WIDTH.get(_as_int(value))
+        if width:
+            widths[(vdom, profile, radio_id)] = width
+    return widths
 
 
 def _as_int(value) -> int | None:

@@ -121,6 +121,15 @@
     { key: 'radio_modes', label: 'Radio modes', width: 150 },
     { key: 'channels', label: 'Channels', width: 110 },
     { key: 'radio_station_count', label: 'Radio clients', width: 100, numeric: true },
+    /* The AP's own uptime, not the controller's: the server ages it forward
+       from the poll that read it, so the column sorts on uptime_s (seconds)
+       and shows uptime_text. Blank, not zero, on a controller whose FortiOS
+       does not answer the column. */
+    { key: 'uptime', label: 'Uptime', width: 110, numeric: true, align: 'left',
+      cell: (r) => escape(r.uptime_text || '—'),
+      value: (r) => (r.uptime_s == null ? null : r.uptime_s) },
+    { key: 'profile', label: 'Profile', width: 150 },
+    { key: 'bssids', label: 'BSSIDs', width: 200 },
     { key: 'last_seen_ts', label: 'Last seen', width: 100, numeric: true, align: 'left',
       cell: (r) => App.agoCell(r.last_seen_ts), value: (r) => r.last_seen_ts || 0 },
   ];
@@ -203,6 +212,13 @@
       `model       ${escape(row.model || '—')}`,
       `MAC         ${escape(row.mac_address || '—')}`,
       `clients     ${row.station_count ?? '—'}`,
+      `profile     ${escape(row.profile || '—')}`,
+      /* Two different clocks, and the pair is the point: uptime is the AP's
+         own, session uptime is how long its CAPWAP session to the controller
+         has been up. A session that restarted while the uptime kept climbing
+         is a controller-side event, not a reboot. */
+      `uptime      ${escape(row.uptime_text || '—')}`,
+      `session up  ${escape(row.session_uptime_text || '—')}`,
       `last seen   ${escape(App.when(row.last_seen_ts))}`,
       '', `radios (${row.radios.length})`, '-'.repeat(40),
     ];
@@ -211,6 +227,10 @@
       lines.push(`radio ${escape(String(radio.radio_id))}`,
         `  mode         ${escape(radio.mode || '—')}`,
         `  channel      ${escape(radio.channel ?? '—')}`,
+        /* The width its profile configures, not one it reports running:
+           fgWcWtpSessionRadioEntry carries no width column at all. */
+        `  width        ${escape(radio.channel_width || '—')}`,
+        `  bssid        ${escape(radio.bssid || '—')}`,
         // Both the reading and the number it was read from, so an operator
         // can check the guess against the controller's own display.
         `  tx power     ${escape(powerText(raw, row.power_unit, radio.is_scan))}` +
