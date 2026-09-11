@@ -1482,5 +1482,8 @@ What could not be exercised:
   the follow-up.
 - **One pre-existing test flake, recorded.** `tests/test_prune_lock_hold.py` carries a lock-fairness
   assertion (`reader.worst < total*0.8`) that trips intermittently under load, independent of the
-  changes here — A/B measured at 0 failures in 6 runs with the new indexes and 3 in 6 without. It is
-  not caused by this work and is not fixed by it.
+  changes here — A/B measured at 0 failures in 6 runs with the new indexes and 3 in 6 without, and
+  the lead ran the unchanged suite against `origin/main` in this container three times: it failed
+  all three, each time on a different store, with the reader's worst wait close to the whole sweep.
+  It is not caused by this work and is not fixed by it; on this host the reader thread is simply
+  not scheduled while the writer runs.

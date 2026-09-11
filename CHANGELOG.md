@@ -534,7 +534,8 @@ are there rather than repeated below.
 One test note for the record: `tests/test_prune_lock_hold.py` carries a
 pre-existing intermittent lock-fairness assertion that trips under load
 independently of this work — three runs in six failed without the new indexes,
-none in six with them.
+none in six with them, and the unchanged suite on 5.9.0 failed three runs in
+three on the same container.
 
 ### 5.9.0 — Six asks
 
