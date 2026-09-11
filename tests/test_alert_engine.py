@@ -1521,7 +1521,9 @@ nodes, alerts, snmp, syslog, ipam, engine = build()
 for i in range(30):
     ipam.record_conflict(f"10.33.1.{i}", "aa:bb:cc:dd:ee:01",
                          "aa:bb:cc:dd:ee:02", source="arp")
-    ipam.resolve_conflict(ipam.conflicts(include_resolved=True)[0]["id"])
+    # conflicts() orders by last_seen_ts, which ties within this loop.
+    ipam.resolve_conflict([row["id"] for row in ipam.conflicts(include_resolved=True)
+                           if row["ip"] == f"10.33.1.{i}"][0])
 engine._tick()                                  # seeds the cursor
 whole_table = []
 real_conflicts = ipam.conflicts

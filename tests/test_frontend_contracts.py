@@ -2652,7 +2652,7 @@ for _id in ("alerts-d-mute-hours", "bm-hours"):
     check("MUTE_HOURS.map(" in _near52,
           "the %s select is built from MUTE_HOURS rather than its own list" % _id)
 
-# --- 53. 5.11.0: muting one rule on one device -----------------------------
+# --- 55. 5.11.0: muting one rule on one device -----------------------------
 ALERTS53 = read("alerts.js")
 NODES53 = read("nodes.js")
 for needle in ("alerts-d-mute-rule", "alerts-d-unmute-rule", "alerts-d-rule-muted"):
