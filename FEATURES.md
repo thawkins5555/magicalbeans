@@ -1606,7 +1606,7 @@ alerts and optionally emailing about them.
   same precedence Syslog's Host column uses (Nodes' SNMP-polled name,
   then DNS, then the bare IP as a last resort) — rather than the raw IP
   or a bare manually-set device name it showed before.
-- **A device's alerts can be muted for 1, 6, 12 or 24 hours.** *Mute
+- **A device's alerts can be muted for 1, 6, 12 or 24 hours, or 7 days.** *Mute
   device* sits beside Resolve and Acknowledge in the alert detail, for
   the hours you are working on a box and do not want to be told about it.
   A mute stops what happens **next** — new alerts and the emails they
@@ -1633,8 +1633,8 @@ alerts and optionally emailing about them.
   buttons carry.
 - **A whole list or group can be muted in one call, from 4.47.0** —
   **Mute selected**, alongside the other bulk actions — still under the
-  same 24-hour ad-hoc cap a single mute has always had.
-- **Maintenance windows cover planned work longer than 24 hours.** Named,
+  same 7-day ad-hoc cap a single mute has.
+- **Maintenance windows cover planned work longer than 7 days.** Named,
   scheduled once or weekly, scoped to a device group or an explicit device
   list, up to fourteen days, creatable ahead of time and endable early.
   While one is active the devices it covers behave exactly like muted
@@ -1644,7 +1644,7 @@ alerts and optionally emailing about them.
   cutover never looks like an unexplained gap in monitoring. Alerts →
   **Maintenance** is where they are created and ended.
 - **Maintenance mode takes a device out of service indefinitely.** The
-  third silencing mechanism, beside the 24-hour mute and the scheduled
+  third silencing mechanism, beside the 7-day mute and the scheduled
   maintenance window, for the box that is off the network until somebody
   says otherwise: a decommissioning, a chassis away for RMA, a site being
   rebuilt. It has **no expiry and no cap** — it stays on until a person
@@ -1674,7 +1674,7 @@ alerts and optionally emailing about them.
   Nodes has an **Only in maintenance** filter for finding what has been
   left in it. Setting it needs **Alerts** write, not Nodes write — it
   silences alerts, so it is gated the way the mute is — and a read-only
-  account can see it without being able to change it. The 24-hour mute and
+  account can see it without being able to change it. The 7-day mute and
   the maintenance windows are both unchanged and still there; a device can
   be under any combination of the three at once.
 - **Un-acknowledge, single and bulk**, undoes an Acknowledge the same way

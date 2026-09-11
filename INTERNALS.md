@@ -4623,8 +4623,10 @@ re-derive from live metrics on the next tick and a still-down device keeps
 recording events. Expired rows read as "not muted" from `until_ts` alone
 (the reads are on the hot path); `prune()` deletes them on the
 housekeeping pass so the table does not grow a row per mute ever set.
-`MAX_MUTE_HOURS` caps what the API will store, so a hand-made call cannot
-silence a device until next year.
+`MAX_MUTE_HOURS` (168, seven days since 5.11.0) caps what the API will
+store, so a hand-made call cannot silence a device until next year; over
+that length a maintenance window, with its own start and end, is the
+mechanism.
 
 ### Device maintenance mode (`alertsdb.py`, `report.py`)
 
@@ -4768,7 +4770,7 @@ unsorted (it feeds an `IN (...)` list, which has no order to respect), and
 `NodesDatabase.devices_by_ids` chunks it 500 ids to a statement: an alert
 list is up to 2000 rows, and SQLite builds before 3.32 cap a statement at
 999 bind parameters. `alerts.js showDetail` draws the mute area
-from that field alone: enabled (the 1/6/12/24 h picker, or "Muted until … /
+from that field alone: enabled (the 1/6/12/24 h/7 d picker, or "Muted until … /
 Lift mute" looked up in `view.mutes` by the same id) when it is set and the
 account holds alerts write, otherwise disabled with a `title` and a `.hint`
 line naming the reason. Before this the page tested `entity_kind ===

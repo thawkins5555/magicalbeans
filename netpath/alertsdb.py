@@ -376,7 +376,7 @@ CREATE INDEX IF NOT EXISTS ix_maint_windows_start ON maintenance_windows(start_t
 -- A device an operator has taken out of service INDEFINITELY: no new
 -- alerts, no notification of any kind (the recovery mail included), until
 -- a person turns it off again. The third suppression mechanism, beside
--- the 24-hour mute and the time-bounded window, and deliberately not a
+-- the 7-day mute and the time-bounded window, and deliberately not a
 -- shape of either — a mute has a cap and an expiry an operator can read,
 -- a window has a planned span, and this has neither by design.
 --
@@ -409,9 +409,10 @@ CREATE INDEX IF NOT EXISTS ix_device_maintenance_device
     ON device_maintenance(device_id, started_ts);
 """
 
-# How long a mute may last. The dropdown offers 1/6/12/24 hours; the cap is
-# here so a hand-made API call cannot silence a device until next year.
-MAX_MUTE_HOURS = 24.0
+# How long a mute may last. The dropdown offers 1/6/12/24 hours and 7 days;
+# the cap is here so a hand-made API call cannot silence a device until next
+# year. A maintenance window is still the mechanism for longer than this.
+MAX_MUTE_HOURS = 168.0
 
 # How long a single maintenance window occurrence may span. Long enough for
 # any real cutover (a "weekend" is 60 hours) with room to spare; short enough

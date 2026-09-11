@@ -546,9 +546,9 @@ the current filter — its confirmation says so.
 
 ## Planned maintenance
 
-**Use this instead of muting by hand for anything over 24 hours.** Muting a
-device or a group ad hoc is capped at 24 hours by design — it is meant for
-"I am working on this right now", not for a weekend cutover. From 4.47.0,
+**Use this instead of muting by hand for anything over 7 days.** Muting a
+device or a group ad hoc is capped at 168 hours (7 days) by design — it is
+meant for "I am working on this", not for a month-long rebuild. From 4.47.0,
 **Alerts → Maintenance** creates a named window instead: scoped to a
 device group or an explicit device list, one-off or weekly, up to fourteen
 days, and it can be created ahead of the work rather than started at the
@@ -567,7 +567,7 @@ Nothing needs to be undone by hand afterwards: the window simply lapses (or
 or group involved, generously — an outage that outlasts its window starts
 alerting normally again, which is a stricter failure mode than the window
 running a little long. Bulk-muting the same set by hand as a fallback is
-still there (**Mute selected**, capped at 24 hours), but a window is the
+still there (**Mute selected**, capped at 7 days), but a window is the
 mechanism built for this.
 
 ---

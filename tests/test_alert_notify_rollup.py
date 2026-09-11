@@ -342,7 +342,7 @@ try:
     assert alerts.alert(alert_id)["last_notified_ts"] is None
     ok("a muted device's due alert sends nothing and is not marked decided")
 
-    # A mute runs to MAX_MUTE_HOURS (24) and a maintenance window longer
+    # A mute runs to MAX_MUTE_HOURS (168) and a maintenance window longer
     # still, but alerts_due_first_notify drops a pending row once it is
     # older than FIRST_NOTIFY_BACKLOG_GRACE_S with nothing marking it — so
     # the held notice used to be lost for good an hour into the mute, with

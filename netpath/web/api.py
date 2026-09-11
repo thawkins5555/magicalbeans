@@ -7044,7 +7044,7 @@ def _maintenance_device(service, body):
     if "hours" in body:
         raise ValueError("Maintenance mode has no duration — it stays on "
                          "until someone turns it off. Use a mute for a "
-                         "1-24 hour silence.")
+                         "1-hour to 7-day silence.")
     if "until_ts" in body:
         raise ValueError("Maintenance mode has no end time — it stays on "
                          "until someone turns it off. Use a maintenance "

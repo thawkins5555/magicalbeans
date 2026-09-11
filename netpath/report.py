@@ -22,7 +22,7 @@ from netpath.analysis import clamp_window
 GAP_FLAG_S = 3 * 3600.0
 
 # Bounds how much of a gap an ad-hoc mute can retroactively explain (matches
-# alertsdb.MAX_MUTE_HOURS' one-day ceiling without a hard import dependency).
+# alertsdb.MAX_MUTE_HOURS' seven-day ceiling without a hard import dependency).
 MUTE_HISTORY_CAVEAT = (
     "ad-hoc device mutes are deleted once they expire, so only a mute "
     "still active when this report ran could be excluded; a mute that "

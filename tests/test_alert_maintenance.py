@@ -228,12 +228,12 @@ try:
 
     status, payload = call("POST", "/api/alerts/bulk-mute",
                            {"group_id": dgid, "hours": 500}, token=admin)
-    check("bulk mute respects the 24h ad-hoc cap even for a group",
+    check("bulk mute respects the 7-day ad-hoc cap even for a group",
           status == 200, (status, payload))
     if status == 200:
         row = service.alerts_db.mute_row("device", str(d1))
-        check("...capped at 24 hours, not 500",
-              row is not None and 23.9 * 3600 < row["until_ts"] - time.time() < 24.1 * 3600,
+        check("...capped at 168 hours, not 500",
+              row is not None and 167.9 * 3600 < row["until_ts"] - time.time() < 168.1 * 3600,
               row["until_ts"] - time.time() if row else None)
 
     status, payload = call("POST", "/api/alerts/bulk-mute", {"hours": 1}, token=admin)

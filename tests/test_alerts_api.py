@@ -171,6 +171,26 @@ try:
     check("...for about the hours asked for",
           6000 < until - time.time() < 7400, until - time.time())
 
+    status, payload = call("POST", "/api/alerts/mute",
+                           {"entity_kind": "device", "entity_id": mute_id,
+                            "hours": 168}, token=admin)
+    left = payload["mute"]["until_ts"] - time.time() if status == 200 else 0
+    check("a 168-hour (7-day) mute is accepted at full length",
+          status == 200 and 167.9 * 3600 < left < 168.1 * 3600, (status, left))
+
+    status, payload = call("POST", "/api/alerts/mute",
+                           {"entity_kind": "device", "entity_id": mute_id,
+                            "hours": 169}, token=admin)
+    left = payload["mute"]["until_ts"] - time.time() if status == 200 else 0
+    check("169 hours is clamped to the 7-day cap, not refused",
+          status == 200 and 167.9 * 3600 < left < 168.1 * 3600, (status, left))
+
+    # Back to the two hours the checks below read, since re-muting replaces.
+    status, payload = call("POST", "/api/alerts/mute",
+                           {"entity_kind": "device", "entity_id": mute_id,
+                            "hours": 2}, token=admin)
+    until = payload["mute"]["until_ts"] if status == 200 else 0
+
     status, payload = call("GET", "/api/alerts/mutes", token=viewer)
     listed = {m["entity_id"]: m for m in payload.get("mutes", [])} if status == 200 else {}
     check("the mute is listed, and a read-only account may see it",

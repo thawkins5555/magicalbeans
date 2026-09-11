@@ -2421,7 +2421,7 @@ class AlertEngine(Worker):
         is only free for an hour: a row with last_notified_ts NULL and
         nothing else drops out of alerts_due_first_notify once it is older
         than FIRST_NOTIFY_BACKLOG_GRACE_S, and a mute runs to MAX_MUTE_HOURS
-        (24) while windows are routinely longer still — so the notice was
+        (168) while windows are routinely longer still — so the notice was
         lost for good, with the alert left reading "None sent." for ever.
         maint_held_notify_ts is that floor's only exemption, so the row is
         stamped with it and re-armed straight back to owed; the send path's

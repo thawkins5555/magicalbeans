@@ -65,7 +65,13 @@
     configAt: 0,
   };
 
-  const MUTE_HOURS = [1, 6, 12, 24];
+  const MUTE_HOURS = [1, 6, 12, 24, 168];
+
+  /* Hours as an operator reads them: 168 in a dropdown is a number nobody
+     converts, so the top entry reads "7 days". */
+  const muteLabel = (h) => (h >= 24 && h % 24 === 0
+    ? `${h / 24} day${h === 24 ? '' : 's'}`
+    : `${h} hour${h === 1 ? '' : 's'}`);
 
   /* How the detail pane names an alert's object when it has to explain why
      Mute is unavailable. Only the kinds that do NOT resolve to a device need
@@ -540,7 +546,7 @@
           : `<button disabled title="${escape(why)}">Lift mute</button>`);
     } else if (muteable) {
       muteHtml = `<select id="alerts-d-mute-hours" class="fixed" title="How long to silence new alerts for this device">` +
-        MUTE_HOURS.map((h) => `<option value="${h}">${h} hour${h === 1 ? '' : 's'}</option>`).join('') +
+        MUTE_HOURS.map((h) => `<option value="${h}">${muteLabel(h)}</option>`).join('') +
         `</select><button id="alerts-d-mute">Mute device</button>`;
     } else {
       muteHtml = `<button id="alerts-d-mute" disabled title="${escape(why)}">Mute device</button>`;
@@ -551,7 +557,7 @@
     const muteHint = muteable
       ? '' : `<p class="hint" id="alerts-d-mute-why">${escape(why)}</p>`;
     // Shown, and endable, but never STARTABLE from here: an indefinite
-    // option offered beside a 24-hour dropdown is one an operator picks by
+    // option offered beside a 7-day dropdown is one an operator picks by
     // accident. Nodes' device pane is where it is turned on, with the
     // dialog that says what it does.
     let maintHtml = '';
@@ -712,9 +718,9 @@
     App.modal('Bulk mute', `
       ${scopeFieldsHtml('bm', groups, devices)}
       <label>For <select id="bm-hours" class="fixed">${MUTE_HOURS.map((h) =>
-        `<option value="${h}">${h} hour${h === 1 ? '' : 's'}</option>`).join('')}</select></label>
+        `<option value="${h}">${muteLabel(h)}</option>`).join('')}</select></label>
       <label>Reason (optional) <input id="bm-reason"></label>
-      <p class="hint">Same 24-hour cap as muting one device. For a planned
+      <p class="hint">Same 7-day cap as muting one device. For a planned
         cutover measured in days, use a <b>maintenance window</b> instead —
         its duration is set by when it ends, not by this cap.</p>`, [
       { label: 'Cancel', onClick: App.closeModal },

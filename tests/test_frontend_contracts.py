@@ -2639,6 +2639,19 @@ check("const EVENT_ROW_CAP = 2000;" in DEBUG52,
       "...while the DOM row bound stays its own, separate number")
 
 
+# --- 54. 5.11.0: the mute cap is seven days, in both mute dropdowns --------
+ALERTS52 = read("alerts.js")
+check("const MUTE_HOURS = [1, 6, 12, 24, 168];" in ALERTS52,
+      "alerts.js offers the 168-hour (7-day) mute alongside the shorter ones")
+check("const muteLabel = (h) =>" in ALERTS52,
+      "...through a muteLabel() helper, so 168 never reaches a dropdown raw")
+check("7-day cap" in ALERTS52,
+      "...and the bulk-mute hint names the 7-day cap, not the old 24-hour one")
+for _id in ("alerts-d-mute-hours", "bm-hours"):
+    _near52 = ALERTS52[ALERTS52.index('id="%s"' % _id):][:400]
+    check("MUTE_HOURS.map(" in _near52,
+          "the %s select is built from MUTE_HOURS rather than its own list" % _id)
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
