@@ -144,8 +144,8 @@ scope; benchmarks run only where a fix is meant to move one.
 consolidation pass that re-verifies every finding before any fix is written.
 
 **Review phase complete** — seven reviewers (five backend areas, two frontend)
-and a metrics pass returned 81 findings: 2 critical, 15 high, 29 medium, 35 low,
-plus 30 larger proposals and 17 unconfirmed items. Every finding was re-read
+and a metrics pass returned 81 findings: 2 critical, 16 high, 30 medium, 33 low,
+plus 30 larger proposals and 20 unconfirmed items. Every finding was re-read
 against the code by the lead before a fixer was given it; two were reclassified
 as proposals (a deliberate CA-bundle choice, a reflector best handled in the
 runbook). Fixers run in file-owned lanes so no two agents edit the same module.
