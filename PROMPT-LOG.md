@@ -162,3 +162,11 @@ the browser walk follow, once, at the end.
 **"push to main once complete"** — lifts the earlier hold on `main`.
 → After the final full-suite pass and the browser walk, `main` is
 fast-forwarded to this branch and pushed, so the estate updates to 5.9.1.
+
+**Closed out** — the full suite ran once at the end: 140 of 141 passed, the
+skip being the desktop console suite (no PySide6 here) and the failure the
+pre-existing lock-fairness assertion that fails on unchanged 5.9.0 in this
+container too. That run surfaced one integration defect (a sensor-scale clamp
+stopping at units where the MIB runs to yotta), fixed before the walk. The
+browser walk passed 63 of 63 checks as admin and as viewer with no console,
+page or HTTP error. `main` fast-forwarded to 5.9.1 and pushed.
