@@ -1395,6 +1395,228 @@ finally:
 nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
 
 
+# =================================================================== B13
+print("\nB13 — the per-tick reads the engine stopped repeating, and the "
+      "sweeps that stopped stopping short")
+
+# ---- B13a: the DHCP evaluator counts in SQL instead of reading every lease
+nodes, alerts, snmp, syslog, ipam, engine = build()
+engine._tick()
+server_b13 = ipam.add_dhcp_server("10.32.0.5", "dhcp-b13")
+SCOPE_B13 = {"scope_id": "10.32.1.0", "name": "B13 scope",
+             "start_ip": "10.32.1.10", "end_ip": "10.32.1.29",
+             "mask": "255.255.255.0", "state": "active"}
+ipam.replace_dhcp_scopes(server_b13, [SCOPE_B13])
+ipam.replace_dhcp_leases(server_b13, [
+    {"scope_id": SCOPE_B13["scope_id"], "ip": f"10.32.1.{10 + i}",
+     "mac": f"00:11:22:cc:dd:{i:02x}", "address_state": "active",
+     "is_reservation": 1 if i < 4 else 0}
+    for i in range(18)])                      # 18/20 = 90 %, 4 of them reserved
+conn = sqlite3.connect(ipam.path)
+conn.execute("UPDATE dhcp_scopes SET polled_ts=? WHERE server_id=?",
+             (time.time(), server_b13))
+conn.commit()
+conn.close()
+
+lease_reads = []
+real_leases = ipam.dhcp_leases
+ipam.dhcp_leases = lambda *a, **k: (lease_reads.append(1), real_leases(*a, **k))[1]
+try:
+    engine._tick()
+finally:
+    ipam.dhcp_leases = real_leases
+scope_entity_b13 = f"{server_b13}:{SCOPE_B13['scope_id']}"
+rows = open_rows(alerts, "dhcp_scope_exhaustion", scope_entity_b13)
+assert len(rows) == 1, rows
+extra = json.loads(rows[0]["extra_json"] or "{}")
+assert extra["leased"] == "14" and extra["reserved"] == "4" \
+    and extra["total"] == "20" and extra["available"] == "2", extra
+assert extra["value"] == "90.0", extra
+ok("the DHCP evaluator's leased/reserved/available extras are unchanged")
+assert lease_reads == [], f"{len(lease_reads)} whole-table lease reads per tick"
+ok("...and it no longer reads every DHCP lease row on every tick")
+
+usage = {(r["server_id"], r["scope_id"]): r for r in ipam.dhcp_scope_usage()}
+counted = usage[(server_b13, SCOPE_B13["scope_id"])]
+assert counted["used"] == 18 and counted["reserved"] == 4, dict(counted)
+ok("dhcp_scope_usage counts used and reserved per scope in one GROUP BY")
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- B13b: the IPAM conflict drain reads forward from its cursor
+nodes, alerts, snmp, syslog, ipam, engine = build()
+for i in range(30):
+    ipam.record_conflict(f"10.33.1.{i}", "aa:bb:cc:dd:ee:01",
+                         "aa:bb:cc:dd:ee:02", source="arp")
+    ipam.resolve_conflict(ipam.conflicts(include_resolved=True)[0]["id"])
+engine._tick()                                  # seeds the cursor
+whole_table = []
+real_conflicts = ipam.conflicts
+ipam.conflicts = lambda *a, **k: (whole_table.append(1), real_conflicts(*a, **k))[1]
+try:
+    ipam.record_conflict("10.33.9.9", "aa:bb:cc:dd:ee:03",
+                         "aa:bb:cc:dd:ee:04", source="arp")
+    new_id = [row["id"] for row in real_conflicts(include_resolved=True)
+              if row["ip"] == "10.33.9.9"][0]
+    engine._tick()
+finally:
+    ipam.conflicts = real_conflicts
+opened = open_rows(alerts, "ipam_new_conflict")
+assert [row["entity_id"] for row in opened] == [str(new_id)], \
+    [dict(row) for row in opened]
+ok("only the conflict newer than the cursor becomes an alert")
+assert whole_table == [], f"{len(whole_table)} whole-table conflict reads per tick"
+ok("...without reading every conflict ever recorded to find it")
+
+# The same rows an unfiltered read would have kept, straight from SQL.
+fresh = ipam.conflicts_since(new_id - 1)
+assert [row["id"] for row in fresh] == [new_id], [dict(r) for r in fresh]
+assert len(ipam.conflicts_since(0, limit=5)) == 5, "the reader pages"
+assert new_id not in ipam.resolved_conflict_ids(), "the new one is not resolved"
+assert len(ipam.resolved_conflict_ids()) == 30, ipam.resolved_conflict_ids()
+ok("conflicts_since is cursor-scoped and paged, and the resolution pairing "
+   "reads ids alone")
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- B13c: the rollup absorb paths use the tick's own rules snapshot
+from netpath.alertrules import ROLLS_UP  # noqa: E402
+
+nodes, alerts, snmp, syslog, ipam, engine = build(rollup_enabled=True)
+engine._tick()
+disabled_children = [key for key in ROLLS_UP.get("device_down", ())
+                     if (alerts.rule_by_key(key) is None
+                         or not alerts.rule_by_key(key)["enabled"])]
+queries = []
+real_rule_by_key = alerts.rule_by_key
+alerts.rule_by_key = lambda key: (queries.append(key), real_rule_by_key(key))[1]
+try:
+    engine._tick()                              # a tick with nothing to open
+    baseline = len(queries)
+    did_b13 = add_device(nodes, "10.34.5.1", "core-sw-b13")
+    nodes.record_device_event(did_b13, "down", "stopped responding")
+    engine._tick()                              # opens device_down, absorbs
+    opening = queries[baseline:]
+finally:
+    alerts.rule_by_key = real_rule_by_key
+assert len(open_rows(alerts, "device_down", did_b13)) == 1, "the alert opened"
+children = set(ROLLS_UP.get("device_down", ()))
+asked = [key for key in opening if key in children]
+assert set(asked) <= set(disabled_children), (
+    f"{len(asked)} of the {len(children)} roll-up children were re-queried "
+    f"although the tick's own snapshot already held them: {asked}")
+ok(f"opening a device_down alert re-queries {len(asked)} of its "
+   f"{len(children)} roll-up children, the disabled ones the snapshot "
+   f"cannot hold")
+assert engine._rule_by_key("device_down") is not None, "the snapshot answers"
+assert engine._rule_by_key("no_such_rule_key") is None
+ok("_rule_by_key still falls back to the database, which is what keeps a "
+   "DISABLED child rule's open alerts absorbable")
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- B13d: one name lookup per distinct syslog/trap source per drain
+class CountingAppDb:
+    """Only the method namelookup.resolve_name reaches for."""
+
+    def __init__(self):
+        self.calls = []
+
+    def hostnames(self, ips):
+        self.calls.append(list(ips))
+        return {}
+
+
+nodes, alerts, snmp, syslog, ipam, engine = build()
+engine.app_db = CountingAppDb()
+engine._tick()
+for i in range(200):
+    seed_syslog(syslog, f"10.35.1.{i % 4}", f"%LINK-3-UPDOWN: port {i} down",
+                severity=2)
+for i in range(200):
+    seed_trap(snmp, f"10.35.2.{i % 3}", "1.3.6.1.6.3.1.1.5.3", "linkDown")
+engine.app_db.calls.clear()
+engine._tick()
+lookups = [ips[0] for ips in engine.app_db.calls if ips]
+assert len(lookups) <= 7, f"{len(lookups)} hostname lookups for 7 sources"
+assert len(set(lookups)) == len(lookups), lookups
+ok(f"400 drained rows from 7 unmanaged senders cost {len(lookups)} name "
+   f"lookups, not one per row")
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- B13e: the NetPath sweep sees past the first 300 open alerts
+nodes, alerts, snmp, syslog, ipam, engine = build()
+engine._tick()
+sweep_rule = alerts.rule_by_key("device_down")
+now_b13 = time.time()
+for i in range(350):
+    alerts.open_or_increment(
+        sweep_rule["id"], f"netpath_stale:netpath_target:{i}", "netpath_target",
+        str(i), f"target {i}", 3, "loss high", "", now_b13 + i * 0.001)
+before = len(alerts.alerts(state="unresolved", rule_id=sweep_rule["id"],
+                           limit=5000))
+assert before == 350, before
+engine._sweep_netpath_alerts([sweep_rule], set())      # every target gone
+after = alerts.alerts(state="unresolved", rule_id=sweep_rule["id"], limit=5000)
+assert after == [], f"{len(after)} of 350 left open past the default limit"
+ok("all 350 open NetPath alerts resolve when their destinations go away, "
+   "not just the first 300")
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
+# ---- B13f: the notification counters are bumped under a lock
+nodes, alerts, snmp, syslog, ipam, engine = build()
+
+
+class FakeJob:
+    alert_id = None
+    alert_ids = None
+    kind = "alert"
+    to_addrs = ["noc@example.invalid"]
+    subject = "subject"
+    url = "https://hooks.example.invalid/services/T00/B00/XXXXsecret"
+
+
+engine.db.record_notification = lambda *a, **k: None
+job_b13 = FakeJob()
+ROUNDS = 5000
+
+
+def hammer():
+    for _ in range(ROUNDS // 8):
+        engine._mail_result(job_b13, True, "")
+        engine._webhook_result(job_b13, True, "")
+
+
+threads = [threading.Thread(target=hammer) for _ in range(8)]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join()
+assert engine.counters["emails_sent"] == ROUNDS, engine.counters["emails_sent"]
+assert engine.counters["webhooks_sent"] == ROUNDS, engine.counters["webhooks_sent"]
+ok(f"{ROUNDS} deliveries counted from 8 sender threads are {ROUNDS}, not "
+   f"whatever a lost read-modify-write left behind")
+
+# A lost `+= 1` is by nature intermittent, so the invariant above cannot fail
+# on demand. This is the same fact asked deterministically: with the lock
+# held, a result callback arriving on a sender thread has to wait for it.
+waited = []
+with engine._system_lock:
+    worker = threading.Thread(
+        target=lambda: (engine._mail_result(job_b13, True, ""),
+                        waited.append("finished")))
+    worker.start()
+    worker.join(0.3)
+    waited.append("still running" if worker.is_alive() else "finished early")
+worker.join(5.0)
+assert waited[0] == "still running", waited
+ok("a delivery counted from a sender thread waits on the engine's lock, the "
+   "same lock _tick counts opened/resolved under")
+nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
+
+
 # ============================================================ storage trim
 print("\nStorage — alerts.db opens tightly and reclaims without VACUUM")
 

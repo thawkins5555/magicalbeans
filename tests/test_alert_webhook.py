@@ -163,6 +163,17 @@ try:
     check("a notification row records the delivery, kind webhook_alert",
           any(r["kind"] == "webhook_alert" and r["ok"] for r in rows),
           [(r["kind"], r["ok"]) for r in rows])
+    # For Slack, Teams and PagerDuty the PATH of an incoming-webhook URL is
+    # the bearer credential, and GET /api/alerts/{id} serves every
+    # notification row to any account with alerts: read.
+    webhook_rows = [r for r in rows if r["kind"] == "webhook_alert"]
+    check("the notification row names the host it delivered to",
+          all(r["to_addr"] == f"http://127.0.0.1:{receiver.port}"
+              for r in webhook_rows),
+          [r["to_addr"] for r in webhook_rows])
+    check("...and not the URL's path, which is the credential itself",
+          all("/hook" not in (r["to_addr"] or "") for r in webhook_rows),
+          [r["to_addr"] for r in webhook_rows])
 finally:
     engine._webhook.stop()
     receiver.stop()
@@ -363,6 +374,23 @@ try:
 finally:
     engine._webhook.stop()
     receiver.stop()
+
+
+# ======================================================================= C9
+print("\nC9 — webhook_host keeps scheme and host and drops everything else")
+
+from netpath.alertengine import webhook_host  # noqa: E402
+
+for url, wanted in (
+        ("https://hooks.slack.com/services/T000/B000/XXXXXXXXsecret",
+         "https://hooks.slack.com"),
+        ("https://example.invalid:8443/a/b?token=secret",
+         "https://example.invalid:8443"),
+        ("https://user:pw@example.invalid/hook", "https://example.invalid"),
+        ("http://10.0.0.1/hook", "http://10.0.0.1"),
+        ("", ""), ("not a url", "")):
+    check(f"{url!r} -> {wanted!r}", webhook_host(url) == wanted,
+          webhook_host(url))
 
 
 print()

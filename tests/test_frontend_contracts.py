@@ -2314,11 +2314,11 @@ check(_WL_REFRESH59.count("App.state.tab !== 'wireless'") == 2,
 #     list, the kiosk query string, the per-tick configuration fetches, the
 #     two browser-built CSVs and the three status lines nobody could hear.
 #
-# The anchors below are looked up through slice_(), which answers "" for a
+# The anchors below are looked up through _slice59(), which answers "" for a
 # fragment that is no longer there: a check that has been edited out of the
 # code should read as a failed contract here, not as a traceback that hides
 # every check after it.
-def slice_(body, start, end=None):
+def _slice59(body, start, end=None):
     if start not in body:
         return ""
     tail = body[body.index(start):]
@@ -2327,13 +2327,13 @@ def slice_(body, start, end=None):
     return tail[:tail.index(end)] if end in tail else tail
 
 
-def before(body, first, second):
+def _before59(body, first, second):
     return first in body and second in body and body.index(first) < body.index(second)
 
 
 _N59 = read("nodes.js")
-_NODES_REFRESH59 = slice_(_N59, "  async function refresh() {",
-                          "  // aabbccddeeff -> aa:bb:cc:dd:ee:ff")
+_NODES_REFRESH59 = _slice59(_N59, "  async function refresh() {",
+                            "  // aabbccddeeff -> aa:bb:cc:dd:ee:ff")
 
 # 49a. F1. /api/nodes/devices has been paged since 4.47.0, so view.devices is
 #      one page, not the fleet: dropping a selection that is not on it sent
@@ -2353,16 +2353,16 @@ check("if (!view.selected && view.devices.length) view.selected = view.devices[0
 #      URL failed the same way.
 check("const TAB_NAME_RE = /^[a-z]+$/;" in APP,
       "app.js pins the tab-name shape boot.js already validates against")
-_KIOSK59 = slice_(APP, "  function initKiosk() {", "  let lastKioskDraw = 0;")
+_KIOSK59 = _slice59(APP, "  function initKiosk() {", "  let lastKioskDraw = 0;")
 for _variable in ("name", "nextName"):
-    check(before(_KIOSK59, "TAB_NAME_RE.test(%s)" % _variable,
+    check(_before59(_KIOSK59, "TAB_NAME_RE.test(%s)" % _variable,
                  '.tab[data-tab="${%s}"]' % _variable),
           "the kiosk rotate name is validated before it reaches "
           '.tab[data-tab="${%s}"]' % _variable)
 check(_KIOSK59.count("TAB_NAME_RE.test(") == 2,
       "both places kiosk mode builds a .tab[data-tab=] selector validate the "
       "name first — initKiosk's filter and drawKioskDots")
-check(slice_(APP, "    try {\n      initKiosk();").startswith(
+check(_slice59(APP, "    try {\n      initKiosk();").startswith(
           "    try {\n      initKiosk();\n    } catch (error) {"),
       "start() wraps initKiosk in try/catch: a bad query string cannot take "
       "the splitters, the module inits and the poll timer with it")
@@ -2392,7 +2392,7 @@ check("function discJobsDue()" in _N59 and "if (!discJobsDue()) return;" in _N59
 # 49d. F4. One open port dialog on a 500-port switch re-read the device's
 #      whole interface list every 5 s and its whole metric catalogue every
 #      15 s, to paint one row and find two ids that cannot change.
-_IFD59 = slice_(_N59, "    async function refreshStats() {", "    let tick = 0;")
+_IFD59 = _slice59(_N59, "    async function refreshStats() {", "    let tick = 0;")
 check("`/api/nodes/devices/${deviceId}/interfaces`, { if_index: ifIndex }" in _IFD59,
       "the port dialog's stats refresh asks for the one interface it draws, "
       "not the device's whole interface list")
@@ -2405,8 +2405,8 @@ check("let chartMetrics = null;" in _IFD59
 # 49e. F5. drawCapabilitiesTab runs on every tick while Bridge & RF is on
 #      screen; it rebuilt every RF chart from innerHTML and re-fetched every
 #      RF series with it. resourceHolder() is the precedent.
-_RF59 = slice_(_N59, "    const rf = (view.metrics || []).filter(",
-               "  /* One RF metric's last hour")
+_RF59 = _slice59(_N59, "    const rf = (view.metrics || []).filter(",
+                 "  /* One RF metric's last hour")
 check(_RF59.count("rfEl.innerHTML =") == 1,
       "the RF section assigns innerHTML only in its 'no RF metrics' branch — "
       "the charts themselves are reused, not rebuilt per tick")
@@ -2420,8 +2420,8 @@ check("RF_SERIES_MAX_AGE_MS" in _RF59,
 
 # 49f. F6. The one full-fleet fetch 4.47.0's paging work left behind: 1.5 MB
 #      at 812 devices, every 30 s, for two Maps of {id, ip, name}.
-_INDEX59 = slice_(APP, "  async function deviceIndex() {",
-                  "  /* Upgrades a plain IP address into a link")
+_INDEX59 = _slice59(APP, "  async function deviceIndex() {",
+                    "  /* Upgrades a plain IP address into a link")
 check("get('/api/nodes/devices', { fields: 'index' })" in _INDEX59,
       "App.deviceIndex asks for the index projection, not every column of "
       "every device")
@@ -2432,12 +2432,12 @@ check("get('/api/nodes/devices', { fields: 'index' })" in _INDEX59,
 with open(os.path.join(REPO_ROOT, "netpath", "web", "api.py"), encoding="utf-8") as _handle:
     _API59 = _handle.read()
 _SERVER_LEADS59 = [json.loads('"%s"' % _part.strip().strip('"'))
-                   for _part in slice_(_API59, "_CSV_FORMULA_LEAD = (", ")").split("(")[1].split(",")
+                   for _part in _slice59(_API59, "_CSV_FORMULA_LEAD = (", ")").split("(")[1].split(",")
                    if _part.strip()]
-_CSV_FIELD59 = slice_(_N59, "  function csvField(value) {", "  function saveReportCsv(")
+_CSV_FIELD59 = _slice59(_N59, "  function csvField(value) {", "  function saveReportCsv(")
 check("CSV_FORMULA_LEAD.test(s)" in _CSV_FIELD59,
       "nodes' csvField applies a formula-lead guard before it quotes")
-_JS_LEAD59 = slice_(_N59, "  const CSV_FORMULA_LEAD = /", "\n")
+_JS_LEAD59 = _slice59(_N59, "  const CSV_FORMULA_LEAD = /", "\n")
 _JS_CLASS59 = _JS_LEAD59.split("= ")[1].strip().strip(";")[1:-1] if "= " in _JS_LEAD59 else None
 _missing59 = [c for c in _SERVER_LEADS59
               if not _JS_CLASS59 or not re.compile(_JS_CLASS59).match(c)]
@@ -2448,7 +2448,7 @@ check(_SERVER_LEADS59 and not _missing59,
 # 49h. F8. App.modal escapes a plain-string title itself — the three call
 #      sites that escaped first put &amp; and &lt; on screen, and the device
 #      dialog's failed-fetch path left the mangled heading there for good.
-def first_argument(body, open_paren):
+def _first_argument59(body, open_paren):
     depth = 0
     for i in range(open_paren, len(body)):
         ch = body[i]
@@ -2467,18 +2467,18 @@ _escaped_titles59 = []
 for _name in MODULES:
     _body = read(_name)
     for _match in re.finditer(r"App\.modal\(", _body):
-        if "escape(" in first_argument(_body, _match.end() - 1):
+        if "escape(" in _first_argument59(_body, _match.end() - 1):
             _escaped_titles59.append("%s:%d" % (_name, _body.count("\n", 0, _match.start()) + 1))
 check(not _escaped_titles59,
       "no App.modal title is escaped by its caller — App.modal is the one "
       "owner of that (found: %s)" % (", ".join(_escaped_titles59) or "none"))
 # The approval dialog builds its heading into a variable first, so the scan
 # above cannot see it; it is the third of the three sites.
-check("escape(" not in slice_(_N59, "    const title = cancelled", "\n    const lead"),
+check("escape(" not in _slice59(_N59, "    const title = cancelled", "\n    const lead"),
       "the discovery approval dialog's heading is not escaped by its caller "
       "either")
-_DEVDLG59 = slice_(_N59, "    Promise.all([\n      App.get(`/api/nodes/devices/${deviceId}`),",
-                   "    // Hardware sensors and DOM/SFP sensors are their own on-demand")
+_DEVDLG59 = _slice59(_N59, "    Promise.all([\n      App.get(`/api/nodes/devices/${deviceId}`),",
+                     "    // Hardware sensors and DOM/SFP sensors are their own on-demand")
 check("box.querySelector('h2').textContent = displayName(listed || {})" in _DEVDLG59,
       "...and the device dialog names the device from the row it was opened "
       "from when its detail fetch fails")
@@ -2488,15 +2488,15 @@ check("box.querySelector('h2').textContent = displayName(listed || {})" in _DEVD
 for _function, _what in (("  function discStatus(text, isError) {", "discovery status"),
                          ("  function profileStatus(message, isError) {",
                           "polling-profile status")):
-    check("App.announce(" in slice_(_N59, _function, "\n  }\n"),
+    check("App.announce(" in _slice59(_N59, _function, "\n  }\n"),
           "the %s line is announced, not said only to whoever can see it" % _what)
-check("App.announce(" in slice_(_N59, "    const show = (html) => {", "\n    };\n"),
+check("App.announce(" in _slice59(_N59, "    const show = (html) => {", "\n    };\n"),
       "the answer to a MAC search is announced as well as drawn")
 
 # 49j. F10. The one cell in the DOM/SFP tables that did not escape its
 #      device-supplied value.
-check("escape(String(s.value))" in slice_(_N59, "  function domValueCell(s) {",
-                                          "  function domRowAttrs(s) {"),
+check("escape(String(s.value))" in _slice59(_N59, "  function domValueCell(s) {",
+                                            "  function domRowAttrs(s) {"),
       "domValueCell escapes its value like every sibling cell in those tables")
 
 
