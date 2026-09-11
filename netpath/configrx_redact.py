@@ -146,6 +146,23 @@ PATTERNS = [
     ("hp/aruba key-string", re.compile(
         r"(?P<keep>^\s*key\s+\d+\s+key-string\s+(?:cipher\s+|simple\s+)?)"
         r"(?P<secret>\S+)(?P<tail>.*)$", _FLAGS)),
+
+    # ------------------------------------------- Siemens SCALANCE, Moxa
+    # `snmp community <string> ro|rw` — the same secret as Cisco's
+    # `snmp-server community`, spelled without the hyphen, so the Cisco
+    # pattern above never saw it. The tail keeps ro/rw readable in a diff.
+    ("snmp community", re.compile(
+        r"(?P<keep>^\s*snmp\s+community\s+)(?P<secret>\S+)"
+        r"(?P<tail>.*)$", _FLAGS)),
+
+    # ------------------------------------------------------ Ubiquiti airOS
+    # airOS has no CLI config: /tmp/system.cfg is key=value, one per line,
+    # so these anchor on the key the way the MikroTik pair above do. The
+    # section index varies (snmp.1.community, snmp.community).
+    ("airos snmp community", re.compile(
+        r"(?P<keep>\bsnmp(?:\.\d+)*\.community=)(?P<secret>\S+)", _FLAGS)),
+    ("airos wpa key", re.compile(
+        r"(?P<keep>\b(?:wpakey|wpapsk|psk)=)(?P<secret>\S+)", _FLAGS)),
 ]
 
 # Values that are not secrets and must not be replaced: redacting them

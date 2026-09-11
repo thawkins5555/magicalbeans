@@ -149,14 +149,7 @@ class Collector(udpsock.UdpReceiver):
         flows = self.decoder.decode(data, exporter)
 
         if self._first_from(exporter):
-            # Throttled like the error below: _seen is an LRU of 4,096, so a
-            # sender rotating source addresses makes every packet "first".
-            self._log_throttled(
-                f"first:{exporter}", f"First packet from exporter {exporter}",
-                target=exporter, level=NETFLOW,
-                detail=lambda: f"version  {int.from_bytes(data[:2], 'big')}\n"
-                               f"bytes    {len(data)}\n"
-                               f"sampling {self.decoder.sampling_for(exporter)}")
+            self._log_first_seen(exporter, data)
         gained = self.decoder.stats["templates"] - templates_before
         if gained:
             self.counters["last_template"] = time.time()
@@ -180,6 +173,26 @@ class Collector(udpsock.UdpReceiver):
             self._queue.put_nowait((exporter, flows))
         except queue.Full:
             self.counters["dropped"] += len(flows)
+
+    def _log_first_seen(self, exporter: str, data: bytes) -> None:
+        """One "first packet from" line a minute, whoever it is from.
+
+        This is a NetFlow-category line rather than an error, so it cannot go
+        through _log_throttled, which files ERRORs — but it needs the same
+        rate limit: _seen is an LRU of 4,096 source addresses, so a sender
+        rotating spoofed addresses makes every packet the first from someone
+        and empties the 3,000-entry event log. One shared key, not one per
+        exporter, because varying the exporter is the flood.
+        """
+        now = time.time()
+        if now - self._log_times.get("first", 0.0) < 60.0:
+            return
+        self._log_times["first"] = now
+        self.log.add(NETFLOW, f"First packet from exporter {exporter}",
+                     target=exporter,
+                     detail=f"version  {int.from_bytes(data[:2], 'big')}\n"
+                            f"bytes    {len(data)}\n"
+                            f"sampling {self.decoder.sampling_for(exporter)}")
 
     def _write(self) -> None:
         pending: list = []

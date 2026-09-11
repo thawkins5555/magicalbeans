@@ -21,6 +21,7 @@ except ImportError:                       # run_all.py reports this as SKIP
 
 from demo import fake_ssh  # noqa: E402
 from netpath import configrx  # noqa: E402
+from netpath import configrx_redact  # noqa: E402
 from stubs import stub_ssh_device  # noqa: E402
 
 TMPDIR = _paths.tmpdir("configrx_ubiquiti_")
@@ -122,6 +123,30 @@ if vendor is not None and persona is not None:
                   "wireless.1.ssid=PtP-Link-01" in (content or ""), (content or "")[:200])
     finally:
         device.close()
+
+
+# ---- Redaction. airOS writes key=value lines, so none of the CLI-shaped
+# community patterns matched and the community in a stored system.cfg was
+# served in the clear by the backup-content and diff routes.
+print("the airOS system.cfg community and wireless key are redacted before storage")
+airos = fake_ssh.PERSONAS["ubiquiti-airos"]["config"]
+redacted, count = configrx_redact.redact(airos)
+check("at least one secret is recognised in an airOS capture", count >= 1, count)
+check("the read community is not left in the clear",
+      "PlantRO2026" not in redacted,
+      [line for line in redacted.splitlines() if "community" in line])
+check("the key itself is kept, so the line still parses",
+      "snmp.1.community=<redacted>" in redacted,
+      [line for line in redacted.splitlines() if "community" in line])
+
+wpa = "\n".join(["wireless.1.security.wpakey=PlantPSK2026",
+                 "aaa.1.wpa.psk=PlantPSK2026",
+                 "wireless.1.ssid=PtP-Link-01"])
+wpa_redacted, wpa_count = configrx_redact.redact(wpa)
+check("an airOS wpakey/psk is redacted too", wpa_count == 2, wpa_count)
+check("and nothing else on those lines is touched",
+      "PlantPSK2026" not in wpa_redacted
+      and "wireless.1.ssid=PtP-Link-01" in wpa_redacted, wpa_redacted)
 
 
 print()

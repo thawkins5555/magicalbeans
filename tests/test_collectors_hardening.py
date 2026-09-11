@@ -25,7 +25,9 @@ from netpath import namelookup, nfdecode, tracer, trapdecode, udpsock
 from netpath.db import Database as NetPathDb
 from netpath.monitor import HopProber
 from netpath.tracer import PingResult
+from netpath import collector as collector_mod
 from netpath.collector import Collector
+from netpath.eventlog import EventLog
 from netpath.flowdb import FlowDatabase
 from netpath.snmptrapd import TrapCollector
 from netpath.snmptrapdb import SnmpTrapDatabase
@@ -705,6 +707,91 @@ def test_c6_forged_v3_traps_are_dropped() -> None:
     from netpath import snmptrapdb as snmptrapdb_mod
     check(snmptrapdb_mod.DEFAULTS.get("reject_failed_auth") is True,
           "the setting ships on by default")
+
+
+def test_c6b_v3_passwords_are_never_stored_in_the_clear() -> None:
+    """The user name, the hash and the *password* were one plain JSON row in
+    snmp.db, which /api/config then handed to every account holding
+    `snmp: read`. The password now lives encrypted in trap_v3_users and the
+    settings value carries only "name / SHA"."""
+    print("C6b: the v3 users' passwords are encrypted, not in the settings row")
+
+    from netpath import dpapi, secretstore
+
+    passphrase = "correcthorsebatterystaple"
+    salt_path, key_cache = secretstore._salt_path, dict(secretstore._key_cache)
+    before = {name: os.environ.get(name)
+              for name in ("NETPATH_SECRET_PASSPHRASE",
+                           "NETPATH_SECRET_PASSPHRASE_FILE")}
+
+    # --- with a credential store, which is what a shipping install has.
+    os.environ["NETPATH_SECRET_PASSPHRASE"] = "collectors-hardening-suite"
+    os.environ.pop("NETPATH_SECRET_PASSPHRASE_FILE", None)
+    secretstore._salt_path = lambda: db_path("c6b.salt")
+    secretstore._key_cache.clear()
+    path = db_path("c6b-traps.db")
+    try:
+        trap_db = SnmpTrapDatabase(path)
+        try:
+            trap_db.save_settings({"v3_users": f"noc / SHA / {passphrase}"})
+            settings = trap_db.settings()
+            check(passphrase not in settings["v3_users"],
+                  f"settings() carries no password ({settings['v3_users']!r})")
+            check(settings["v3_users_stored"] == 1,
+                  "and says instead that one password is on file")
+            decoder = TrapCollector(trap_db).decoder
+            decoder.configure(settings)
+            check(decoder.users.get("noc") == ("SHA", passphrase),
+                  "the receiver's decoder still resolves it, by name, through "
+                  "the database")
+        finally:
+            trap_db.close()
+        blob = b""
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(path + suffix):
+                with open(path + suffix, "rb") as fh:
+                    blob += fh.read()
+        check(passphrase.encode() not in blob,
+              "and `strings snmp.db` no longer finds the passphrase")
+
+        # --- with none, on a host that cannot encrypt anything: refused,
+        #     rather than written in the clear.
+        os.environ.pop("NETPATH_SECRET_PASSPHRASE", None)
+        secretstore._key_cache.clear()
+        if dpapi.available():
+            print("  (skipped: this host can always encrypt — Windows DPAPI)")
+        else:
+            unprotected = db_path("c6b-nostore.db")
+            trap_db = SnmpTrapDatabase(unprotected)
+            try:
+                live = {"v3_users": f"noc / SHA / {passphrase}"}
+                refused = ""
+                try:
+                    trap_db.save_settings(live)
+                except ValueError as exc:
+                    refused = str(exc)
+                check("secret store" in refused or "Windows" in refused,
+                      f"a host with no credential store refuses the save "
+                      f"({refused[:60]!r})")
+                check(passphrase not in live["v3_users"],
+                      "and scrubs the password out of the live settings dict "
+                      "the refusal leaves behind")
+                check(passphrase not in trap_db.settings()["v3_users"],
+                      "nothing of it reached the settings row")
+            finally:
+                trap_db.close()
+            with open(unprotected, "rb") as fh:
+                check(passphrase.encode() not in fh.read(),
+                      "nor the database file")
+    finally:
+        secretstore._salt_path = salt_path
+        secretstore._key_cache.clear()
+        secretstore._key_cache.update(key_cache)
+        for name, value in before.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def v1_trap(agent_addr: str = "192.168.255.7",
@@ -1516,7 +1603,7 @@ def test_c10_exporter_versions_and_per_sampler_rates() -> None:
           f"a flow after the announcement carries its sampler's rate "
           f"({flows[0].sampling if flows else None})")
 
-    learned = [entry for entry in decoder.learned_rates]
+    learned = [(*key, rate) for key, rate in decoder.learned_rates.items()]
     check(("10.2.0.1", 7, 3, 1000) in learned and ("10.2.0.1", 7, 4, 100) in learned,
           "both rates are offered to the caller for the back-fill")
 
@@ -1728,6 +1815,131 @@ def test_c12_greedy_drain_and_the_dropped_exporter_index() -> None:
     flow_db.close()
 
 
+def test_c13_flood_bounds_on_the_flow_collector() -> None:
+    """Three unbounded quantities on the NetFlow receive path. Rates learned
+    from options records were an unbounded list, one retention-window UPDATE
+    each on the writer thread. One datagram could decode to tens of thousands
+    of flows, because nothing capped records per packet and a template's
+    record length could be a single byte. And every undecodable datagram
+    filed its own ERROR line into a 3,000-entry ring."""
+    print("C13: learned rates, flows per datagram, and the event-log flood")
+
+    # --- (a) learned rates are bounded and keyed, not appended -------------
+    decoder = nfdecode.Decoder()
+    options = v9_options_template(800, [(nfdecode.FLOW_SAMPLER_ID, 4),
+                                        (nfdecode.SAMPLING_INTERVAL, 4)])
+    decoder.decode(v9_packet(ipfix_set(1, options)), "10.7.0.1")
+    sent = 10000
+    for start in range(0, sent, 250):
+        body = b"".join(struct.pack("!III", 0, sampler, 100 + sampler)
+                        for sampler in range(start, min(start + 250, sent)))
+        decoder.decode(v9_packet(ipfix_set(800, body)), "10.7.0.1")
+    check(len(decoder.learned_rates) <= nfdecode.MAX_SAMPLING,
+          f"{sent} options records with rotating sampler ids leave at most "
+          f"MAX_SAMPLING rates queued ({len(decoder.learned_rates)} of "
+          f"{nfdecode.MAX_SAMPLING})")
+
+    repeated = len(decoder.learned_rates)
+    body = struct.pack("!III", 0, 9, 500) * 4
+    decoder.decode(v9_packet(ipfix_set(800, body)), "10.7.0.1")
+    check(len(decoder.learned_rates) == repeated,
+          "and re-announcing one sampler's rate overwrites its own entry "
+          f"rather than adding another ({len(decoder.learned_rates)})")
+
+    # --- (b) one flush rewrites a bounded number of them -------------------
+    class CountingFlows:
+        def __init__(self):
+            self.batches = []
+
+        def record_sampling_rates(self, rates, since_ts=0.0):
+            rows = list(rates)
+            self.batches.append(len(rows))
+            return 0
+
+    flows_db = CountingFlows()
+    collector = Collector(flows_db)
+    collector.decoder = decoder
+    queued = len(decoder.learned_rates)
+    collector._apply_learned_rates()
+    check(flows_db.batches == [collector_mod.MAX_RESAMPLE_PER_FLUSH],
+          f"one flush issues at most MAX_RESAMPLE_PER_FLUSH rewrites "
+          f"({flows_db.batches})")
+    check(len(decoder.learned_rates) == queued - collector_mod.MAX_RESAMPLE_PER_FLUSH,
+          f"and carries the rest to the next flush "
+          f"({len(decoder.learned_rates)} still queued)")
+
+    # A rate announced while the drain is in flight is not lost with it.
+    decoder.learned_rates.clear()
+    decoder._set_sampling("10.7.0.9", 0, 0, 77)
+    taken = decoder.drain_learned_rates(None)
+    check(taken == [("10.7.0.9", 0, 0, 77)] and not decoder.learned_rates,
+          f"a full drain hands over every queued rate exactly once ({taken})")
+
+    # --- (c) one datagram cannot decode to unbounded flows -----------------
+    decoder = nfdecode.Decoder()
+    one_byte = (struct.pack("!HH", 256, 1)
+                + struct.pack("!HH", nfdecode.OCTETS, 1))
+    packet = v9_packet(ipfix_set(0, one_byte) + ipfix_set(256, b"\x01" * 60000))
+    flows = decoder.decode(packet, "10.7.0.2")
+    check(not flows and decoder.stats["bad_template"] >= 1,
+          f"a template whose record is a single byte is refused rather than "
+          f"yielding one flow per byte of the set ({len(flows)} flows)")
+
+    four_byte = (struct.pack("!HH", 257, 1)
+                 + struct.pack("!HH", nfdecode.OCTETS, 4))
+    payload = struct.pack("!I", 256) * 16000
+    packet = v9_packet(ipfix_set(0, four_byte) + ipfix_set(257, payload))
+    flows = decoder.decode(packet, "10.7.0.2")
+    check(len(flows) <= nfdecode.MAX_FLOWS_PER_PACKET,
+          f"and a 64 KB datagram of minimum-length records yields at most "
+          f"MAX_FLOWS_PER_PACKET flows ({len(flows)})")
+    check(decoder.stats["truncated_flows"] >= 1,
+          f"with the truncation counted "
+          f"({decoder.stats['truncated_flows']})")
+
+    flow_db = FlowDatabase(db_path("c13-flows.db"))
+    collector = Collector(flow_db)
+    port = free_udp_port()
+    assert collector.start({"port": port, "bind_address": "127.0.0.1"})
+    try:
+        collector._handle_datagram(packet, ("10.7.0.2", 40000))
+        check(collector.counters["truncated_flows"] >= 1,
+              f"the collector counts it too "
+              f"({collector.counters['truncated_flows']})")
+        check("truncated" in collector.status_text(),
+              f"and says so on the status line ({collector.status_text()})")
+    finally:
+        collector.stop()
+    flow_db.close()
+
+    # --- (d) a flood of runts does not empty the event log -----------------
+    log = EventLog()
+    flow_db = FlowDatabase(db_path("c13-throttle.db"))
+    collector = Collector(flow_db, log=log)
+    port = free_udp_port()
+    assert collector.start({"port": port, "bind_address": "127.0.0.1"})
+    try:
+        log.clear()
+        runt = struct.pack("!H", 9)          # version 9 and nothing else
+        for index in range(500):
+            collector._handle_datagram(runt, (f"10.8.{index // 256}.{index % 256}",
+                                              40000))
+        errors = [event for event in log.all() if event.category == "error"]
+        firsts = [event for event in log.all()
+                  if event.message.startswith("First packet")]
+        check(len(errors) <= 2,
+              f"500 undecodable datagrams file at most a couple of ERROR "
+              f"lines ({len(errors)})")
+        check(len(firsts) <= 2,
+              f"and 500 never-seen source addresses at most a couple of "
+              f"first-packet lines ({len(firsts)})")
+        check(collector.counters["errors"] >= 500,
+              f"while the counter still shows every one of them "
+              f"({collector.counters['errors']})")
+    finally:
+        collector.stop()
+    flow_db.close()
+
 TESTS = [
     test_c1_receive_threads_survive_bad_input,
     test_c2_template_guards_and_bounded_caches,
@@ -1736,12 +1948,14 @@ TESTS = [
     test_c4b_trim_never_holds_the_lock,
     test_c5_drain_sources_can_be_caught_up,
     test_c6_forged_v3_traps_are_dropped,
+    test_c6b_v3_passwords_are_never_stored_in_the_clear,
     test_c7_syslog_robustness,
     test_c8_device_correlation_through_aliases,
     test_c9_netpath_probing_tracing_and_v6_listeners,
     test_c10_exporter_versions_and_per_sampler_rates,
     test_c11_bgp_oids_and_visible_truncation,
     test_c12_greedy_drain_and_the_dropped_exporter_index,
+    test_c13_flood_bounds_on_the_flow_collector,
 ]
 
 

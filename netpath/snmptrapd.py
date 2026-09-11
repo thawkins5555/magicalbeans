@@ -44,6 +44,11 @@ class TrapCollector(udpsock.UdpReceiver):
         self.nodes_db = nodes_db
         self.on_batch = on_batch
         self.decoder = Decoder()
+        # The v3 users' passwords are not in the settings text the decoder is
+        # configured with — they are encrypted in the trap database — so the
+        # decoder asks for them by name. Set before any configure(), start()'s
+        # and the MIB merge's alike.
+        self.decoder.secret_source = getattr(db, "v3_user_secret", None)
         self._allowed: set[str] = set()
         self._auto_accept = True
         self._communities: set[str] = set()

@@ -706,8 +706,13 @@
           so this is a filter, not a secret.</p>
       </fieldset>
       <fieldset><legend>SNMPv3</legend>
-        <label>Users, one per line: <code>name / SHA / password</code>
+        <label>Users, one per line: <code>name / SHA</code>, or
+          <code>name / SHA / password</code> to set one
           <textarea id="sp-v3users" rows="3" placeholder="monitor / SHA / a-long-passphrase">${escape(s.v3_users || '')}</textarea></label>
+        <p class="hint">Passwords are stored encrypted and never shown: a line with no
+          password keeps the one already on file, and removing a line removes its
+          password with it.${s.v3_users_stored ? ` ${s.v3_users_stored} password(s) on
+          file.` : ''}</p>
         <p class="hint">Used to verify the authentication digest. Traps sent authPriv
           are stored with their header fields but their payload is encrypted and is
           not decoded.</p>

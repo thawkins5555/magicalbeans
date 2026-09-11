@@ -329,6 +329,32 @@ for still_unsafe in (r"(a+)+", r"(a|aa)+", r"((a+){3})+", r"(\d{1,3}\.){3,}"):
     except cs.UnsafeRegex:
         check(f"{still_unsafe!r} still refused", True)
 
+# A counted outer repeat is only harmless while the count is small: a bound
+# of 3 is the dotted-quad idiom, a bound of 100 backtracks exponentially
+# exactly as (a+)+ does, and _has_adjacent_quantifiers never saw it because
+# it reads "{1,100}" as literal characters rather than as a quantifier.
+print("a LARGE counted outer repeat of an ambiguous group is refused, and "
+      "refused without ever being run")
+for label, pattern in {"(a+){1,100}b": r"(a+){1,100}b",
+                       "(a+){2,64}b": r"(a+){2,64}b",
+                       "([a-z]+){1,50}!": r"([a-z]+){1,50}!",
+                       "(.+){1,100}zzz": r"(.+){1,100}zzz"}.items():
+    started = time.time()
+    try:
+        cs.compile_bounded(pattern)
+        check(f"{label}: should have been refused (counted outer repeat past "
+              f"MAX_SAFE_COUNTED_REPEAT)", False)
+    except cs.UnsafeRegex:
+        elapsed = time.time() - started
+        check(f"{label}: refused in {elapsed:.3f}s, without ever running",
+              elapsed < 1.0, elapsed)
+
+check(f"the small fixed repeats stay exempt up to "
+      f"MAX_SAFE_COUNTED_REPEAT ({cs.MAX_SAFE_COUNTED_REPEAT})",
+      cs.compile_bounded(r"(\d{1,3}\.){3}\d{1,3}") is not None
+      and cs.compile_bounded(r"(a+){1,%d}b" % cs.MAX_SAFE_COUNTED_REPEAT)
+      is not None)
+
 
 # --------------------------------------------- compliance sweep wall-clock budget
 #

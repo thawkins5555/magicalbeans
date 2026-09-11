@@ -18,6 +18,7 @@ except ImportError:                       # run_all.py reports this as SKIP
 
 from demo import fake_ssh  # noqa: E402
 from netpath import configrx  # noqa: E402
+from netpath import configrx_redact  # noqa: E402
 from stubs import stub_ssh_device  # noqa: E402
 
 FAILS = []
@@ -103,6 +104,27 @@ for name, (vendor_key, marker, expected_sent) in INDUSTRIAL_PERSONAS.items():
 print("rockwellautomation: resolve() finds the lowercase key from the mixed-case canonical form")
 check("resolve() is case-insensitive on the canonical vendor key",
       configrx.resolve("rockwellAutomation") is configrx.resolve("rockwellautomation"))
+
+
+# ---- Redaction. Every SNMP-community pattern anchored on the Cisco spelling
+# `snmp-server community`, so SCALANCE's own `snmp community <x> ro` was
+# stored verbatim in configrx.db and served by the backup-content and diff
+# routes — which the module documents as redacted by default.
+print("siemens-scalance: the SNMP community is redacted before storage")
+siemens = fake_ssh.PERSONAS["siemens-scalance"]["config"]
+redacted, count = configrx_redact.redact(siemens)
+check("at least one secret is recognised in a SCALANCE capture", count >= 1, count)
+check("the read community is not left in the clear",
+      "PlantRO2026" not in redacted,
+      [line for line in redacted.splitlines() if "community" in line])
+check("and ro/rw survives, so the line still reads in a diff",
+      "snmp community <redacted> ro" in redacted,
+      [line for line in redacted.splitlines() if "community" in line])
+
+print("moxa: the Cisco-spelled community stays redacted as it was")
+moxa_redacted, moxa_count = configrx_redact.redact(fake_ssh.PERSONAS["moxa"]["config"])
+check("a Moxa capture still redacts snmp-server community",
+      moxa_count >= 1 and "PlantRO2026" not in moxa_redacted, moxa_count)
 
 
 print()

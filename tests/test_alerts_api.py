@@ -427,6 +427,111 @@ try:
           "next device to inherit its rowid",
           service.alerts_db.open_maintenance(spare) is None)
 
+    # ------------------------------- bulk maintenance is one batch, not a loop
+    #
+    # The scope resolution is the same as above; what is pinned here is that
+    # the store is touched once for the whole selection rather than twice per
+    # device (an open_maintenance read and a set_maintenance write, each its
+    # own alerts.db lock and commit) on the request thread.
+    bulk_ids = [service.nodes_db.add_device(f"198.51.100.{n}", name=f"bulk{n}",
+                                            group_id=group_id)
+                for n in range(1, 21)]
+    singles = {"set": 0, "clear": 0, "open": 0}
+    real_set = service.alerts_db.set_maintenance
+    real_clear = service.alerts_db.clear_maintenance
+    real_open = service.alerts_db.open_maintenance
+
+    def counted_set(*a, **kw):
+        singles["set"] += 1
+        return real_set(*a, **kw)
+
+    def counted_clear(*a, **kw):
+        singles["clear"] += 1
+        return real_clear(*a, **kw)
+
+    def counted_open(*a, **kw):
+        singles["open"] += 1
+        return real_open(*a, **kw)
+
+    service.alerts_db.set_maintenance = counted_set
+    service.alerts_db.clear_maintenance = counted_clear
+    service.alerts_db.open_maintenance = counted_open
+    try:
+        status, payload = call("POST", "/api/alerts/bulk-maintenance",
+                               {"device_ids": bulk_ids, "reason": "cutover"},
+                               token=admin)
+        check("bulk maintenance puts the whole selection in at once",
+              status == 200 and payload["changed"] == len(bulk_ids),
+              (status, payload))
+        check("...without one set_maintenance/open_maintenance pair per device",
+              singles["set"] == 0 and singles["open"] == 0, singles)
+        status, payload = call("POST", "/api/alerts/bulk-maintenance",
+                               {"device_ids": bulk_ids, "reason": "cutover"},
+                               token=admin)
+        check("...and a device already in maintenance still does not count "
+              "as changed", status == 200 and payload["changed"] == 0,
+              (status, payload))
+        status, payload = call("POST", "/api/alerts/bulk-maintenance",
+                               {"device_ids": bulk_ids, "clear": True},
+                               token=admin)
+        check("clearing the selection is one batch too",
+              status == 200 and payload["changed"] == len(bulk_ids)
+              and singles["clear"] == 0, (status, payload, singles))
+        check("...and every device is really out of maintenance",
+              all(service.alerts_db.open_maintenance(i) is None
+                  for i in bulk_ids))
+    finally:
+        service.alerts_db.set_maintenance = real_set
+        service.alerts_db.clear_maintenance = real_clear
+        service.alerts_db.open_maintenance = real_open
+
+    status, payload = call("POST", "/api/alerts/bulk-maintenance",
+                           {"device_ids": list(range(1, 50002))}, token=admin)
+    check("an oversized bulk maintenance scope is a 400 naming the limit, "
+          "not a fleet-sized loop", status == 400
+          and "limit is" in str(payload.get("error", "")), (status, payload))
+
+    # --------------------------------------------- a rule key is an identifier
+    for bad, why in [('x" autofocus onfocus="alert(1)', "quotes and spaces"),
+                     ("rule key", "a space"),
+                     ("rule/key", "a slash"),
+                     ("ruéle", "a non-ASCII letter"),
+                     ("k" * 200, "length")]:
+        status, payload = call("POST", "/api/alerts/rules",
+                               {"key": bad, "name": "Bad key", "kind": "system"},
+                               token=admin)
+        check(f"a rule key with {why} is refused", status == 400,
+              (bad[:40], status, payload))
+        check("...and nothing was stored for it",
+              service.alerts_db.rule_by_key(bad) is None)
+
+    status, payload = call("POST", "/api/alerts/rules",
+                           {"key": "site-a.custom_rule2", "name": "Fine key",
+                            "kind": "system"}, token=admin)
+    check("an ordinary key — letters, digits, dot, hyphen, underscore — is "
+          "still accepted", status == 200, (status, payload))
+
+    # ------------------------------- the webhook URL is a bearer credential
+    service.apply_settings("alerts", {
+        "webhook_url": "https://hooks.example.com/services/T000/B000/XXXsecret",
+        "webhook_headers": ["Authorization: Bearer sekrit"]})
+    status, payload = call("GET", "/api/config", token=viewer)
+    settings = payload.get("alerts_settings", {}) if status == 200 else {}
+    check("a read-only Alerts account is not handed the webhook URL",
+          status == 200 and settings.get("webhook_url") == ""
+          and "XXXsecret" not in json.dumps(payload), (status, settings))
+    check("...nor the webhook headers", settings.get("webhook_headers") == []
+          and "sekrit" not in json.dumps(payload), settings)
+    check("...but is told both are set",
+          settings.get("has_webhook_url") is True
+          and settings.get("has_webhook_headers") is True, settings)
+    status, payload = call("GET", "/api/config", token=admin)
+    settings = payload.get("alerts_settings", {}) if status == 200 else {}
+    check("an account that could change them still sees them",
+          settings.get("webhook_url", "").endswith("XXXsecret")
+          and settings.get("webhook_headers") == ["Authorization: Bearer sekrit"],
+          settings)
+
     actions = [row["action"] for row in audit_since_mark()]
     check("the audit trail records maintenance being turned on",
           "alert.maintenance_on" in actions, actions)

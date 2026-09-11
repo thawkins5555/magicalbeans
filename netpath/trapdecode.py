@@ -429,6 +429,12 @@ class Decoder:
         self.oid_names: dict[str, str] = dict(WELL_KNOWN)
         self.severity_rules: list[tuple[str, int]] = list(DEFAULT_SEVERITY_RULES)
         self.users: dict[str, tuple[str, str]] = {}   # user -> (auth_proto, auth_pass)
+        # name -> password | None, for the v3 users whose configured line
+        # carries no password because the receiver keeps it encrypted
+        # (snmptrapd sets this to SnmpTrapDatabase.v3_user_secret). None
+        # here means a line without a password configures nothing, which is
+        # what a line without a password has always done.
+        self.secret_source = None
         self.max_varbinds = 64
         self.max_value_chars = 512
 
@@ -465,13 +471,32 @@ class Decoder:
         users = {}
         for line in str(settings.get("v3_users", "") or "").splitlines():
             parts = [p.strip() for p in line.split("/")]
-            if len(parts) >= 3 and parts[0]:
-                users[parts[0]] = (parts[1].upper().replace("-", ""), parts[2])
+            if len(parts) < 2 or not parts[0]:
+                continue
+            password = parts[2] if len(parts) >= 3 else ""
+            if not password or set(password) == {"*"}:
+                password = self._user_secret(parts[0])
+            if password:
+                users[parts[0]] = (parts[1].upper().replace("-", ""), password)
         self.users = users
         # Not cleared here: the module-level key cache (localized_key's
         # _KEY_CACHE) is shared with snmppoll.py's outbound signing and is
         # keyed on (protocol, password, engine) — a changed password simply
         # misses under its new key, so a stale entry is never returned.
+
+    def _user_secret(self, name: str) -> str:
+        """The stored password for a v3 user, or "" — in which case the user
+        is left unconfigured and their traps read as unverified, exactly as
+        a line with no password always did."""
+        source = self.secret_source
+        if source is None:
+            return ""
+        try:
+            return str(source(name) or "")
+        except Exception:
+            # A credential store that cannot answer must not stop the
+            # receiver starting; every other user still configures.
+            return ""
 
     def resolve_oid(self, oid: str) -> str:
         """A readable name for an OID: exact hit, else the longest known prefix

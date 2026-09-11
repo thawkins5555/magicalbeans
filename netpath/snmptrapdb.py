@@ -84,6 +84,19 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- The SNMPv3 trap users' authentication passwords. Its own table, not the
+-- JSON `settings` row, for alertsdb.smtp_credential's reason: a DPAPI blob
+-- is not a string/number, and a row that /api/config serves to every
+-- account with `snmp: read` is the wrong place for a password the rest of
+-- the product encrypts (CREDENTIAL-SECURITY.md, "The trap receiver's
+-- SNMPv3 users"). The name and protocol stay in the settings row, which is
+-- what the Settings textarea shows and edits.
+CREATE TABLE IF NOT EXISTS trap_v3_users (
+    name          TEXT PRIMARY KEY,
+    auth_proto    TEXT,
+    auth_pass_enc BLOB
+);
 """
 
 DEFAULTS = {
@@ -107,7 +120,10 @@ DEFAULTS = {
     # arrives inside the packet rather than on the sending address.
     "auto_accept_communities": True,
     "accepted_communities": "",
-    # SNMPv3 users, one per line: "name / SHA / password".
+    # SNMPv3 users, one per line. Stored, and returned by settings(), as
+    # "name / SHA": the password is kept encrypted in trap_v3_users and
+    # never travels in this value. A save may carry "name / SHA / password"
+    # to set or change one; see save_settings below.
     # Used only to verify the authentication digest on authNoPriv and authPriv
     # messages; privacy (decryption) is not implemented.
     "v3_users": "",
@@ -138,6 +154,45 @@ DEFAULTS = {
 }
 
 
+# What settings() puts in place of a stored password, and what a save may
+# send back unchanged to keep it. Any run of asterisks is read as "keep",
+# so an operator who retypes the mask does not blank the credential.
+V3_PASSWORD_MASK = "********"
+
+V3_NO_CREDENTIAL_STORE = (
+    "This machine cannot store an SNMPv3 trap password: it is not Windows "
+    "and no portable secret store passphrase is configured "
+    "(NETPATH_SECRET_PASSPHRASE_FILE or NETPATH_SECRET_PASSPHRASE — see "
+    "CREDENTIAL-SECURITY.md). Leave the password off the line to keep "
+    "whatever is already stored for that user.")
+
+
+def parse_v3_user_lines(text) -> list[tuple[str, str, str | None]]:
+    """The textarea's lines as (name, protocol, password) triples.
+
+    A password of None means the line carried none — "keep whatever is
+    stored for this name", which is what every line looks like once
+    settings() has been through it.
+    """
+    users = []
+    for line in str(text or "").splitlines():
+        parts = [part.strip() for part in line.split("/")]
+        if not parts[0]:
+            continue
+        proto = parts[1] if len(parts) > 1 else ""
+        password = parts[2] if len(parts) > 2 else ""
+        if not password or set(password) == {"*"}:
+            password = None
+        users.append((parts[0], proto, password))
+    return users
+
+
+def v3_user_lines(users) -> str:
+    """The triples back as textarea text, with no password in it."""
+    return "\n".join(f"{name} / {proto}" if proto else name
+                     for name, proto, _ in users)
+
+
 class SnmpTrapDatabase(SqliteStore):
     SCHEMA = SCHEMA
     DEFAULTS = DEFAULTS
@@ -152,6 +207,194 @@ class SnmpTrapDatabase(SqliteStore):
     def __init__(self, path: str):
         self.store_raw = False
         super().__init__(path)
+
+    def _after_open(self) -> None:
+        self._migrate_v3_passwords()
+
+    # -------------------------------------------------------------- v3 users
+
+    def settings(self) -> dict:
+        """The stored settings, with no v3 password in them.
+
+        `v3_users` comes back as "name / SHA" lines whatever is stored, and
+        `v3_users_stored` says how many of those names have a password on
+        file, so the Settings dialog can tell an operator a credential
+        exists without being shown it. /api/config serves this dict to every
+        account holding `snmp: read`, which is why the password never joins
+        it.
+        """
+        values = super().settings()
+        users = parse_v3_user_lines(values.get("v3_users", ""))
+        values["v3_users"] = v3_user_lines(users)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT name FROM trap_v3_users"
+                " WHERE auth_pass_enc IS NOT NULL").fetchall()
+        stored = {row["name"] for row in rows}
+        # A password still in the settings row counts too: on a host with no
+        # credential store _migrate_v3_passwords cannot encrypt it yet, and
+        # the receiver is nonetheless authenticating traps with it.
+        stored.update(name for name, _, password in users if password)
+        values["v3_users_stored"] = len(stored)
+        return values
+
+    def save_settings(self, values: dict) -> None:
+        """Store the settings, routing any v3 password to trap_v3_users.
+
+        A line carrying a password sets or replaces that user's; a line
+        without one keeps what is stored for that name; a name no longer
+        listed loses its stored password with its line. Only names and
+        protocols reach the settings row.
+        """
+        if "v3_users" in values:
+            users = parse_v3_user_lines(values["v3_users"])
+            # Stripped in the caller's own dict, and before anything can
+            # fail: `values` is the live settings dict the service hands
+            # /api/config, so a save this host refuses must not leave the
+            # typed password sitting in it either.
+            values["v3_users"] = v3_user_lines(users)
+            self._write_v3_users(users)
+        super().save_settings(values)
+
+    def v3_user_secret(self, name: str) -> str | None:
+        """A v3 user's authentication password, or None.
+
+        The trap decoder's secret source (snmptrapd wires it in), and the
+        only way back to a stored password: nothing serves it to a caller
+        outside this process.
+        """
+        name = str(name)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT auth_pass_enc FROM trap_v3_users WHERE name = ?",
+                (name,)).fetchone()
+        if row is not None and row["auth_pass_enc"]:
+            from . import dpapi
+            try:
+                return dpapi.unprotect(bytes(row["auth_pass_enc"])).decode("utf-8")
+            except (dpapi.DpapiUnavailable, UnicodeDecodeError) as exc:
+                log.warning("netpath.snmptrapdb: the stored SNMPv3 password "
+                            "for trap user %r could not be decrypted (%s); "
+                            "traps from that user cannot be verified until it "
+                            "is entered again", name, exc)
+                return None
+        return self._legacy_v3_password(name)
+
+    def _legacy_v3_password(self, name: str) -> str | None:
+        """The password out of the settings row, on a database whose
+        migration could not run because this host has no credential store.
+        Unchanged from where it has always been — settings() still refuses
+        to hand it to the API — and encrypted by the first open that can."""
+        for stored, _, password in parse_v3_user_lines(self._stored_v3_users()):
+            if stored == name and password:
+                return password
+        return None
+
+    def _stored_v3_users(self) -> str:
+        """The v3_users settings value as it is on disk, passwords and all."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM settings WHERE key = 'v3_users'").fetchone()
+        if row is None:
+            return ""
+        try:
+            return str(json.loads(row["value"]) or "")
+        except (ValueError, TypeError):
+            return ""
+
+    def _set_v3_user(self, name: str, proto: str, password_enc) -> None:
+        with self._lock:
+            if password_enc is None:
+                self._conn.execute(
+                    "INSERT INTO trap_v3_users(name, auth_proto) VALUES (?,?)"
+                    " ON CONFLICT(name) DO UPDATE SET"
+                    " auth_proto = excluded.auth_proto",
+                    (name, proto))
+            else:
+                self._conn.execute(
+                    "INSERT INTO trap_v3_users(name, auth_proto, auth_pass_enc)"
+                    " VALUES (?,?,?) ON CONFLICT(name) DO UPDATE SET"
+                    " auth_proto = excluded.auth_proto,"
+                    " auth_pass_enc = excluded.auth_pass_enc",
+                    (name, proto, password_enc))
+            self._commit_durable()
+
+    def _write_v3_users(self, users) -> None:
+        """Every password encrypted before anything is written, so a host
+        that cannot encrypt refuses the save whole rather than storing half
+        of it."""
+        from . import dpapi
+
+        encrypted = []
+        for name, proto, password in users:
+            if password is None:
+                encrypted.append((name, proto, None))
+                continue
+            if not dpapi.available():
+                raise ValueError(V3_NO_CREDENTIAL_STORE)
+            try:
+                encrypted.append(
+                    (name, proto, dpapi.protect(password.encode("utf-8"))))
+            except dpapi.DpapiUnavailable as exc:
+                raise ValueError(str(exc)) from exc
+
+        for name, proto, blob in encrypted:
+            self._set_v3_user(name, proto, blob)
+
+        listed = {name for name, _, _ in users}
+        with self._lock:
+            rows = self._conn.execute("SELECT name FROM trap_v3_users").fetchall()
+            # One statement per departing name rather than an IN list: the
+            # textarea has no length limit and SQLite's variable ceiling is
+            # not knowable here (sqlitebase.id_chunks' note), and a v3 user
+            # list is a handful of rows.
+            for row in rows:
+                if row["name"] not in listed:
+                    self._conn.execute(
+                        "DELETE FROM trap_v3_users WHERE name = ?", (row["name"],))
+            self._conn.commit()
+
+    def _migrate_v3_passwords(self) -> None:
+        """Move a plaintext password out of the settings row into
+        trap_v3_users, encrypted, and blank it out of the row.
+
+        Runs at every open and does nothing once nothing is left in the
+        clear, which is after the first open on a host that can encrypt. A
+        host that cannot keeps the row it has always had: blanking it would
+        stop the receiver verifying traps it verifies today, and there is
+        nowhere else to put the password until a credential store exists.
+        """
+        users = parse_v3_user_lines(self._stored_v3_users())
+        if not any(password for _, _, password in users):
+            return
+
+        from . import dpapi
+        if not dpapi.available():
+            log.warning("netpath.snmptrapdb: the SNMPv3 trap users' passwords "
+                        "are still stored in the clear because this host has "
+                        "no credential store; configure one and restart to "
+                        "have them encrypted (see CREDENTIAL-SECURITY.md)")
+            return
+        try:
+            blobs = [(name, proto,
+                      None if password is None
+                      else dpapi.protect(password.encode("utf-8")))
+                     for name, proto, password in users]
+        except dpapi.DpapiUnavailable as exc:
+            log.warning("netpath.snmptrapdb: could not encrypt the stored "
+                        "SNMPv3 trap passwords (%s); they stay as they are", exc)
+            return
+
+        for name, proto, blob in blobs:
+            self._set_v3_user(name, proto, blob)
+        with self._lock:
+            self._conn.execute(
+                "UPDATE settings SET value = ? WHERE key = 'v3_users'",
+                (json.dumps(v3_user_lines(users)),))
+            self._commit_durable()
+        log.info("netpath.snmptrapdb: encrypted %d stored SNMPv3 trap "
+                 "password(s) and removed them from the settings row",
+                 sum(1 for _, _, password in users if password))
 
     # ------------------------------------------------------------------ write
 

@@ -19,7 +19,9 @@ from netpath import permissions
 from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER, hash_password
 from netpath.web import Service, WebServer
 from netpath.web import api as api_mod
-from netpath.web.api import _csv_text, _flow_bucket, _window
+from netpath.web.api import (HIST_MAX_BUCKETS, _csv_text, _flow_bucket,
+                             _window, get_alerts_overview, get_snmp_overview,
+                             get_syslog_overview)
 
 TMPDIR = _paths.tmpdir("api_review_")
 
@@ -286,6 +288,33 @@ try:
     bucket = _flow_bucket(_TinyBucket(), span)
     check("a configured tiny bucket is widened for a wide span too",
           span / bucket <= 5000 + 1, bucket)
+
+    # The three histogram overviews read t0/t1/bucket straight off the query
+    # string and each store allocates one dict per bucket before running any
+    # query, so a `read` grant on the module was enough to ask for
+    # 1,666,667 of them. Same trade as _flow_bucket: coarser buckets, not a
+    # narrower window, and the browser reads bucket_s back off the response.
+    for name, handler in [("alerts", get_alerts_overview),
+                          ("snmp", get_snmp_overview),
+                          ("syslog", get_syslog_overview)]:
+        payload = handler(service, {"t0": "0", "t1": "100000000",
+                                    "bucket": "60"}, {})
+        check(f"/api/{name}/overview caps the buckets it allocates",
+              len(payload["buckets"]) <= HIST_MAX_BUCKETS,
+              len(payload["buckets"]))
+        check("...and reports the widened bucket_s back to the caller",
+              payload["bucket_s"] > 60, payload["bucket_s"])
+        payload = handler(service, {"t0": "0", "t1": "1e18", "bucket": "1"}, {})
+        check("...and a non-finite-ish span is clamped first",
+              len(payload["buckets"]) <= HIST_MAX_BUCKETS,
+              len(payload["buckets"]))
+        # What every shipped tab actually sends: 24 h at one hour.
+        now = time.time()
+        payload = handler(service, {"t0": str(now - 86400), "t1": str(now),
+                                    "bucket": "3600"}, {})
+        check("...while the shipped 24 h / 3600 s request is untouched",
+              payload["bucket_s"] == 3600 and 24 <= len(payload["buckets"]) <= 26,
+              (payload["bucket_s"], len(payload["buckets"])))
 
     # ---------------------------------------------------------------------
     # 6. A CSV cell is data, not a formula

@@ -32,6 +32,19 @@ class UnsafeRegex(ValueError):
 
 _COUNTED_RE = re.compile(r"\{\d*(?:,\d*)?\}")
 
+# A counted repeat of an already-repeating group is only safe while the count
+# is small: (a+){1,100} backtracks exponentially exactly as (a+)+ does, and
+# MAX_LINE_CHARS_FOR_MATCH is 250. Past this many repeats a counted
+# quantifier is treated as unbounded, which keeps the documented exemption
+# for small fixed repeats like (\d{1,3}\.){3}.
+MAX_SAFE_COUNTED_REPEAT = 4
+
+
+def _counted_upper(inner: str) -> int:
+    """The largest repeat count `{...}`'s body allows, 0 if it does not say."""
+    upper = inner.split(",")[-1]
+    return int(upper) if upper.isdigit() else 0
+
 
 def _quantifier_at(pattern: str, i: int) -> tuple[bool, int, bool]:
     """(is there a quantifier at i, how many chars it spans, is it
@@ -46,7 +59,9 @@ def _quantifier_at(pattern: str, i: int) -> tuple[bool, int, bool]:
         if m:
             end = m.end()
             lazy = end < len(pattern) and pattern[end] == "?"
-            unbounded = pattern[i + 1:end - 1].endswith(",")
+            inner = pattern[i + 1:end - 1]
+            unbounded = (inner.endswith(",")
+                         or _counted_upper(inner) > MAX_SAFE_COUNTED_REPEAT)
             return True, (end - i) + (1 if lazy else 0), unbounded
     return False, 0, False
 
@@ -166,8 +181,9 @@ def compile_bounded(pattern: str, flags: int = 0) -> re.Pattern:
             "time on ordinary text. Rewrite it without the nested "
             "repetition, e.g. a+ instead of (a+)+. A group repeated a "
             "small FIXED number of times, like (\\d{1,3}\\.){3}\\d{1,3}, "
-            "is fine — only an open-ended outer repeat (+, *, or {n,} "
-            "with no upper limit) of an already-repeating group is refused.")
+            f"is fine — an outer repeat that is open-ended (+, *, or "
+            f"{{n,}} with no upper limit) or larger than "
+            f"{MAX_SAFE_COUNTED_REPEAT} is refused.")
     if _has_adjacent_quantifiers(pattern):
         raise UnsafeRegex(
             f"Pattern chains more than {MAX_ADJACENT_QUANTIFIER_RUN} "

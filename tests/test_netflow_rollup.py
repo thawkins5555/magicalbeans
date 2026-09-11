@@ -237,7 +237,7 @@ def test_4_sampling_in_both_orders() -> None:
                      flow(1, now - 60, exporter="10.0.0.9", sampling=1)])
     collector = Collector(db)
     collector.started_at = 0.0
-    collector.decoder.learned_rates = [("10.0.0.9", 0, 0, 33)]
+    collector.decoder.learned_rates = {("10.0.0.9", 0, 0): 33}
     collector._apply_learned_rates()
     rates = db._conn.execute(
         "SELECT ts_end, sampling FROM flows WHERE exporter = '10.0.0.9'"
