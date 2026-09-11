@@ -1456,6 +1456,14 @@ then consolidated, spot-verified at least the top finding of every report agains
 the fixes into lanes by file ownership so parallel fixers never contend; each fix had to ship with a
 test proved to fail before it, by running the new test against a stash or a temporary revert.
 
+The whole suite ran once at the end, after every lane had landed: 140 of 141 suites passed. The
+one skip is `test_console_shutdown.py`, which needs PySide6 and the desktop console; the one
+failure is the pre-existing `test_prune_lock_hold.py` fairness assertion described below, which
+fails on unchanged 5.9.0 in the same container. One integration defect surfaced only in that run
+and was fixed before it: the poller lane had clamped `entPhySensorScale` to 1..9 on the
+reviewer's word, where RFC 3433's enum runs to yotta(17), so a kilo(10) sensor read a thousand
+times too small until `test_ups_environment.py` caught it.
+
 What could not be exercised:
 
 - **Only Chromium.** The frontend work used Playwright's Chromium against a live instance. Firefox
