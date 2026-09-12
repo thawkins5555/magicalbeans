@@ -2099,7 +2099,7 @@ end
     rows = (payload or {}).get("traps", [])
     check("D29 …while still saying one is set",
           bool(rows) and rows[0].get("has_community") is True
-          and rows[0].get("community") == "", rows[:1])
+          and "community" not in rows[0], rows[:1])
 
     # ------------- D30 a throttled sign-in does not hold a verification slot
     #
@@ -2141,6 +2141,68 @@ end
         SERVICE.throttle.delay_for = real_delay_for
     check("D30 …and a 30-second throttle still sleeps at most five",
           status == 200 and 4.0 <= elapsed < 12.0, f"{elapsed:.1f}s status={status}")
+
+
+    # ---------- D31 what a reader is NOT shown is said, not faked
+    #
+    # Two separate places answered a read-only account with a value that
+    # reads as a fact about the system rather than as "you cannot see this".
+    #
+    # A trap's community came back as "", which is precisely what a trap
+    # carrying none looks like — and on v3 that field is the USM user name,
+    # so the account lost the sender's identity as well. The sibling
+    # _community_fields has always OMITTED the key instead, which is what
+    # lets the page print "not shown" for the absence.
+    status, _h, payload = req("GET", "/api/snmp/traps", cookie=snmp_reader)
+    reader_rows = (payload or {}).get("traps", [])
+    status, _h, payload = req("GET", "/api/snmp/traps", cookie=snmp_writer)
+    writer_rows = (payload or {}).get("traps", [])
+    check("D31 the community key is ABSENT for a read-only account, not "
+          "blank — a blank cell is what 'this trap carried none' looks like",
+          bool(reader_rows) and "community" not in reader_rows[0]
+          and reader_rows[0].get("has_community") is True, reader_rows[:1])
+    check("D31 …and present, with the value, for an account that could "
+          "change it",
+          bool(writer_rows) and writer_rows[0].get("community") == "plant-rw",
+          writer_rows[:1])
+
+    # The CSV keeps the column either way: dropping it would change the
+    # header an operator's spreadsheet is built around, and an empty cell
+    # would say "no community" rather than "not shown to you".
+    status, _h, payload = req("GET", "/api/snmp/traps/export.csv",
+                              cookie=snmp_reader)
+    csv_text = payload.decode("utf-8", "replace") if isinstance(payload, bytes) \
+        else str(payload)
+    check("D31 the export keeps its community column and marks it not shown",
+          status == 200 and "community" in csv_text.splitlines()[0]
+          and "not shown" in csv_text and "plant-rw" not in csv_text,
+          csv_text[:300])
+
+    # And /api/debug's summary: `debug: read` alone cannot see NetPath, and
+    # answering False/0 for the scheduler and its workers rendered on the
+    # Debug page as "scheduler stopped, 0 of 0 trace workers busy" — a fault
+    # report about a service that was running perfectly well. None is the
+    # only honest answer, and the page draws it as an em dash.
+    status, _h, payload = req("GET", "/api/debug", cookie=debug_reader)
+    summary = (payload or {}).get("summary", {})
+    check("D31 a debug:read account is told nothing about the NetPath "
+          "scheduler, rather than told it is stopped",
+          status == 200 and summary.get("scheduler", False) is None,
+          summary.get("scheduler"))
+    check("D31 …and nothing about its worker pool, rather than 0 of 0",
+          summary.get("workers_total", 0) is None,
+          summary.get("workers_total"))
+    check("D31 …while the booleans it may see are still real booleans",
+          isinstance(summary.get("collector"), bool)
+          and isinstance(summary.get("nodes"), bool),
+          (summary.get("collector"), summary.get("nodes")))
+
+    status, _h, payload = req("GET", "/api/debug", cookie=admin_cookie)
+    admin_summary = (payload or {}).get("summary", {})
+    check("D31 …and an administrator still gets the real pair",
+          isinstance(admin_summary.get("scheduler"), bool)
+          and isinstance(admin_summary.get("workers_total"), int),
+          (admin_summary.get("scheduler"), admin_summary.get("workers_total")))
 
     return 0
 

@@ -264,7 +264,11 @@
       view.hist = overview;
       view.rows = search[spec.rowsKey];
       const total = overview.buckets.reduce((sum, b) => sum + b.total, 0);
-      view.histPlot = App.plottedRange(overview.buckets, bucket, t0, t1);
+      // bucket is what we asked for; overview.bucket_s is what the server
+      // used, which is wider whenever the window would have overrun
+      // HIST_MAX_BUCKETS. The bars are drawn at the width they cover.
+      view.histPlot = App.plottedRange(overview.buckets,
+                                       overview.bucket_s ?? bucket, t0, t1);
       const p = view.histPlot;
       el('hist-summary').textContent =
         `${total.toLocaleString()} ${spec.unit} · ${App.stamp(p.t0, p.span)} – ${App.stamp(p.t1, p.span)}` +
@@ -537,6 +541,17 @@
       .map((v) => `${v.name}=${v.text}`).join('  ');
   }
 
+  /* The sending device's community — its USM user name on v3 — for the
+     account looking at it. api.py sends the value only to callers who could
+     change SNMP settings and drops the key for everyone else, leaving
+     has_community: "—" is the trap that carried none, and a trap that
+     carried one says so without naming it. */
+  function communityText(row) {
+    if (row.community) return row.community;
+    if (!('community' in row) && row.has_community) return 'not shown';
+    return '—';
+  }
+
   App.pages.snmp = eventsPage({
     tab: 'snmp', prefix: 'sn', stateKey: 'snmpSettings',
     sortName: 'snmp-traps', caption: 'SNMP traps', tableId: 'snmp-table',
@@ -564,7 +579,12 @@
       shared.source,
       { key: 'version', label: 'Ver', width: 54, on: true,
         value: (r) => r.version_name || '', cell: (r) => escape(r.version_name) },
-      { key: 'community', label: 'Community / user', width: 130, on: true },
+      { key: 'community', label: 'Community / user', width: 130, on: true,
+        // The sort value is blank where the cell is a dash: app.js sorts
+        // blanks last whichever way the column points, and a row with no
+        // community is absent, not smallest.
+        value: (r) => (r.community || (!('community' in r) && r.has_community ? 'not shown' : '')),
+        cell: (r) => escape(communityText(r)) },
       { key: 'trap', label: 'Trap', width: 200, on: true,
         value: (r) => r.trap_name || r.trap_oid || '',
         cell: (r) => escape(r.trap_name || r.trap_oid)
@@ -606,12 +626,12 @@
         `version     SNMP${escape(row.version_name)}${row.is_inform ? '  (InformRequest)' : ''}`,
       ];
       if (row.version === 3) {
-        lines.push(`user        ${escape(row.community || '—')}`,
+        lines.push(`user        ${escape(communityText(row))}`,
                    `engine id   ${escape(row.engine_id || '—')}`,
                    `security    ${escape(row.security || '—')}`,
                    `auth        ${escape(row.auth_state || '—')}`);
       } else {
-        lines.push(`community   ${escape(row.community || '—')}`);
+        lines.push(`community   ${escape(communityText(row))}`);
       }
       lines.push(`trap        ${escape(row.trap_name || '—')}`,
                  `trap OID    ${escape(row.trap_oid || '—')}`,

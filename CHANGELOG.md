@@ -766,8 +766,9 @@ are there rather than repeated below.
   `CREDENTIAL-SECURITY.md` §11.)
 - **The trap list and its CSV export show the sending device's community — its
   USM user name on v3 — only to accounts that can change SNMP settings.**
-  Everyone else sees the column blank and a flag saying whether one is set, as
-  the Nodes device list already did.
+  Everyone else sees "not shown" where a trap carried one and "—" where it did
+  not, in the column, in the detail pane and in the exported CSV — the same
+  distinction the Nodes device list already drew.
 
 #### Syslog
 

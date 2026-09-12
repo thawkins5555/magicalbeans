@@ -917,6 +917,14 @@ def _validate_target_url(url: str) -> str:
     parsed = urllib.parse.urlsplit(url)
     if not parsed.hostname:
         raise ValueError("https_url needs a host, e.g. https://switch.example/")
+    # A credential in the URL cannot work and cannot stay secret. http.client
+    # is handed the whole netloc, so the check fails with "nonnumeric port:
+    # ..." carrying the password -- and that string is stored in
+    # https_checks.error, served as https_error to every netpath:read account
+    # and written into the event log with the URL beside it. Refused at the
+    # boundary rather than leaked at the first failure.
+    if parsed.username or parsed.password:
+        raise ValueError("https_url must not contain a username or password")
     return url
 
 
@@ -1930,9 +1938,13 @@ def get_debug(service, params, body) -> dict:
         # endpoint is actually slow.
         "routes": _route_latency(service),
         "summary": {
-            "scheduler": service.monitor.running if see_netpath else False,
+            # None, not False/0: an account without `netpath` is not being
+            # told the scheduler is stopped and has no workers — it is being
+            # told nothing, and debug.js renders the absence as "—". A false
+            # "scheduler stopped" on the Debug page is a page fault report.
+            "scheduler": service.monitor.running if see_netpath else None,
             "workers_busy": running,
-            "workers_total": service.monitor.workers if see_netpath else 0,
+            "workers_total": service.monitor.workers if see_netpath else None,
             "queued": queued,
             "resolver": bool(service.resolver._thread
                              and service.resolver._thread.is_alive()),
@@ -2762,7 +2774,10 @@ def _snmp_trap_rows(service, params, cap: int, *,
             # v3), so the same rule _community_fields applies to a device's
             # stored community applies here: shown to callers who could
             # change it anyway, a has_community boolean for everyone else.
-            "community": (row["community"] or "") if reveal else "",
+            # Omitted rather than blanked, exactly as _community_fields omits
+            # it — a "" was indistinguishable from a trap that carried none,
+            # and the page cannot say "not shown" for a key that is there.
+            **({"community": row["community"] or ""} if reveal else {}),
             "has_community": bool(row["community"]),
             "engine_id": row["engine_id"] or "",
             "security": row["security"] or "",
@@ -2799,7 +2814,16 @@ def get_snmp_traps_export(service, params, body) -> dict:
     header = ["id", "ts", "source", "source_name", "version_name", "trap_name",
              "trap_oid", "trap_kind", "severity_name", "community",
              "agent_addr", "is_inform"]
-    csv_rows = [[t.get(key) for key in header] for t in traps]
+
+    # The column stays, whoever exports: a blank cell would say "this trap
+    # carried no community", which is a different fact from "you are not
+    # shown it". Same two words the trap table and its detail pane use.
+    def _cell(trap, key):
+        if key == "community" and "community" not in trap:
+            return "not shown" if trap.get("has_community") else ""
+        return trap.get(key)
+
+    csv_rows = [[_cell(t, key) for key in header] for t in traps]
     return _csv_response("snmp-traps", header, csv_rows, truncated=truncated,
                          cap=EXPORT_ROW_CAP)
 
@@ -4172,11 +4196,14 @@ def _resolve_neighbor_names(service, neighbors: list[dict]) -> None:
     if not pending:
         return
 
-    devices = {}
-    for _, candidates in pending:
-        for ip in candidates:
-            if ip not in devices:
-                devices[ip] = namelookup.device_for_ip(service.nodes_db, ip)
+    # One batched read for every candidate address on the pane, not
+    # namelookup.device_for_ip per address: that is the same rule (primary
+    # `ip` first, then the newest alias) asked once instead of up to four
+    # statements and three lock acquisitions for each of them. device_for_ip
+    # stays where a single address is all a caller has.
+    candidate_ips = {ip for _, candidates in pending for ip in candidates}
+    devices = (service.nodes_db.devices_by_addresses(candidate_ips)
+               if service.nodes_db is not None else {})
 
     unnamed = set()
     for neighbor, candidates in pending:
@@ -6988,7 +7015,7 @@ def get_alerts_mutes(service, params, body) -> dict:
 
 
 def post_alerts_mute(service, params, body) -> dict:
-    kind, entity_id, _device_id = _mute_entity(service, body, require_rule=True)
+    kind, entity_id, device_id = _mute_entity(service, body, require_rule=True)
     try:
         hours = float(body.get("hours", 1))
     except (TypeError, ValueError):
@@ -6998,15 +7025,21 @@ def post_alerts_mute(service, params, body) -> dict:
     row = service.alerts_db.mute(kind, entity_id, hours,
                                  by=params.get("_username", ""),
                                  reason=str(body.get("reason", "")))
+    # The device id is in the detail because the target is not always
+    # readable as one: a per-rule mute's entity_id is the device and the rule
+    # key joined, so "which device was silenced" was a string somebody had to
+    # take apart by hand in the one log that exists to answer that.
     _audit(service, params, "alert.mute", target=f"{kind}:{entity_id}",
-           detail=f"{hours:g}h: {str(body.get('reason', ''))}")
+           detail=f"device {device_id}: {hours:g}h: "
+                  f"{str(body.get('reason', ''))}")
     return {"mute": _mute_json(row)}
 
 
 def delete_alerts_mute(service, params, body) -> dict:
-    kind, entity_id, _device_id = _mute_entity(service, body, require_rule=False)
+    kind, entity_id, device_id = _mute_entity(service, body, require_rule=False)
     lifted = service.alerts_db.unmute(kind, entity_id)
-    _audit(service, params, "alert.unmute", target=f"{kind}:{entity_id}")
+    _audit(service, params, "alert.unmute", target=f"{kind}:{entity_id}",
+           detail=f"device {device_id}")
     return {"lifted": lifted}
 
 
