@@ -328,9 +328,9 @@ try:
     status, payload = call("POST", "/api/alerts/mute",
                            {"entity_kind": "device", "entity_id": "987654",
                             "rule_key": "device_down", "hours": 1}, token=admin)
-    # _require's "No such <thing>" shape, which this API answers 400 for.
+    # _require's "No such <thing>" shape, which server.py answers 404 for.
     check("a device that is not in Nodes is refused by name",
-          status == 400 and "No such device" in str(payload), (status, payload))
+          status == 404 and "No such device" in str(payload), (status, payload))
 
     status, payload = call("POST", "/api/alerts/mute",
                            {"entity_kind": "device", "entity_id": str(switch),
@@ -457,7 +457,7 @@ try:
     status, payload = call("POST", "/api/alerts/maintenance",
                            {"device_id": 999999}, token=admin)
     check("a device Nodes does not have is refused, the same 'No such device' "
-          "a mute answers with", status == 400 and "device" in str(payload),
+          "a mute answers with", status == 404 and "device" in str(payload),
           (status, payload))
 
     # The devices endpoint carries it, and leaves muted_until alone.

@@ -1359,6 +1359,12 @@ class Handler(BaseHTTPRequestHandler):
                 # is a different answer from "that is not an address", and
                 # the browser offers "add anyway" off the 409 alone.
                 self._json({"error": str(exc), **exc.payload}, 409)
+            except api.NotFound as exc:
+                # Before the ValueError arm below, which this subclasses:
+                # "there is no such row" is a 404, not "that request was
+                # malformed", and the browser's not-found handling keys on
+                # the status rather than on the message's wording.
+                self._json({"error": str(exc)}, 404)
             except ValueError as exc:
                 self._json({"error": str(exc)}, 400)
             except OverflowError:

@@ -8019,8 +8019,8 @@ reserving raised exceptions for genuinely unexpected conditions.
 
 **Shared route helpers.** `_page(params, default, cap)` is the `(limit,
 offset)` every paginated list route reads and clamps. `_require(row, what)`
-hands `row` back or raises `ValueError(f"No such {what}")` — the shape every
-not-found route used to build by hand. `_pick(body, allowed)` is the
+hands `row` back or raises `NotFound(f"No such {what}")` — a `ValueError`
+subclass `server.py` answers 404 for, ahead of the generic 400 arm. `_pick(body, allowed)` is the
 allow-list filter an update route runs its body through before anything
 reaches a database column. `_encrypt_secret(secret, unavailable)` is the one
 place a credential is DPAPI/passphrase-encrypted for storage, raising the

@@ -212,7 +212,8 @@ try:
 
     # ---------------------------------------------------------------- gating
     status, payload = call("POST", "/api/nodes/discovery/999999/rescan", {}, token=admin)
-    check("an unknown job is refused", status == 400
+    check("an unknown job is refused with a 404, not the 400 a malformed "
+          "request gets", status == 404
           and "No such discovery job" in str(payload.get("error", "")), (status, payload))
 
     service.app_db.add_user("rescan-reader", hash_password("RescanReaderPW2026"),

@@ -313,7 +313,7 @@ check("DELETE answers in well under the browser's timeout, whatever the "
 
 status_code, payload = call("GET", f"/api/nodes/devices/{target}", token=TOKEN)
 check("the device already reads as gone to every route that loads one",
-      status_code == 400 and "No such device" in str(payload),
+      status_code == 404 and "No such device" in str(payload),
       f"{status_code} {payload}")
 status_code, payload = call("GET", "/api/nodes/purges", token=TOKEN)
 check("/api/nodes/purges reports the work still to do",

@@ -261,6 +261,23 @@ try:
           400 <= status < 500, f"{status} {payload}")
 
     # ---------------------------------------------------------------------
+    # 4b. A row that is not there is a 404, not a 400
+    #
+    # _require raised a plain ValueError, which the router answered 400 for —
+    # the same status a malformed request gets, so nothing downstream could
+    # tell "you asked wrongly" from "it is gone" without reading the prose.
+
+    status, payload = call("GET", "/api/nodes/devices/999999", token=admin)
+    check("a missing device id answers 404",
+          status == 404 and "No such device" in str(payload), f"{status} {payload}")
+    check("api.NotFound is still a ValueError, so a generic handler copes",
+          issubclass(api_mod.NotFound, ValueError))
+    status, payload = call("POST", "/api/nodes/devices", {"address": "not-an-ip"},
+                           token=admin)
+    check("...and a malformed request is still a 400", status == 400,
+          f"{status} {payload}")
+
+    # ---------------------------------------------------------------------
     # 5. A time window is bounded before anything is sized from it
     #
     # flowdb.overview allocates one float per bucket per series from

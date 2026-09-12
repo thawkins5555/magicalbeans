@@ -115,6 +115,11 @@ class Conflict(ValueError):
         self.payload = payload or {}
 
 
+class NotFound(ValueError):
+    """"That row is not here" — a ValueError subclass so any generic handler
+    still reports it sensibly; server.py turns it into a 404."""
+
+
 def _audit(service, params, action: str, target: str = "",
            detail: str = "") -> None:
     """One line in the on-disk audit trail (appdb.audit).
@@ -184,10 +189,10 @@ def _page(params, default, cap) -> tuple[int, int]:
 
 
 def _require(row, what: str):
-    """`row` back, or ValueError("No such <what>") — the not-found shape
-    server.py turns into a 404-equivalent error response."""
+    """`row` back, or NotFound("No such <what>") — the not-found shape
+    server.py answers 404 for."""
     if not row:
-        raise ValueError(f"No such {what}")
+        raise NotFound(f"No such {what}")
     return row
 
 
@@ -4426,7 +4431,7 @@ def post_nodes_upstream_suggestions_apply(service, params, body) -> dict:
     rows = {d["id"]: d for d in service.nodes_db.devices_by_ids(wanted)}
     for device_id in pairs:
         if device_id not in rows:
-            raise ValueError(f"No such device {device_id}")
+            raise NotFound(f"No such device {device_id}")
     cleaned = {device_id: _clean_upstream_id(service, device_id, upstream_id, rows)
               for device_id, upstream_id in pairs.items()}
     cycle = _find_upstream_cycle(service, cleaned, rows)
@@ -6703,7 +6708,7 @@ def _clean_oid(value) -> str:
 def put_nodes_mib_object(service, params, body, mib_file_id, obj_id) -> dict:
     objects = {r["id"]: r for r in service.nodes_db.mib_objects(mib_file_id)}
     if obj_id not in objects:
-        raise ValueError("No such MIB object")
+        raise NotFound("No such MIB object")
     fields = _pick(body, ("name", "oid", "description", "syntax", "enums"))
     if "oid" in fields:
         fields["oid"] = _clean_oid(fields["oid"])
@@ -8515,7 +8520,7 @@ def get_configrx_diff(service, params, body) -> dict:
     """
     device_id = _num(params, "device", None, int)
     if not device_id or not service.nodes_db.device(device_id):
-        raise ValueError("No such device")
+        raise NotFound("No such device")
     backups = service.configrx_db.backups_for(device_id)
     if len(backups) < 2:
         raise ValueError("At least two stored backups are needed to diff")

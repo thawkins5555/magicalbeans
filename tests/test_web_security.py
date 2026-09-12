@@ -1805,8 +1805,8 @@ end
     status, _h, payload = req(
         "DELETE", "/api/configrx/devices/999999/credential/enable-secret",
         {}, cookie=admin_cookie)
-    check("D20 an unknown device id is a clean error, not a traceback",
-          status == 400 and payload.get("error") != "Internal Server Error",
+    check("D20 an unknown device id is a clean 404, not a traceback",
+          status == 404 and payload.get("error") != "Internal Server Error",
           f"{status} {payload}")
 
     # And the wide route beside it still does what D17 already pinned:

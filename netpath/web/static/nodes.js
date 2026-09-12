@@ -740,7 +740,7 @@
     App.el('nd-detail').hidden = true;
   }
 
-  /* "No such row", not "server unreachable": api.py's _require raises ValueError, answered as a 400 "No such device"; 404 is the other shape. */
+  /* "No such row", not "server unreachable": _require raises api.NotFound, answered as a 404 "No such device"; the 400 shape stays accepted for older builds. */
   function isMissing(error) {
     return !!error && (error.status === 404
                        || (error.status === 400
