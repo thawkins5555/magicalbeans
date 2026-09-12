@@ -623,23 +623,43 @@ class NodesSeriesDatabase(SqliteStore):
             reclaim(self._conn, self._lock, label=self.LABEL)
         return removed
 
+    # The flat floor under either table, and the per-metric ones above it:
+    # half an hour of raw polling, a day of hours of rollup.
     _TRIM_SAMPLE_FLOOR = 5_000
+    _TRIM_RAW_PER_METRIC = 30
+    _TRIM_HOURS_PER_METRIC = 24
+
+    def _metric_count(self) -> int:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) AS n FROM metrics").fetchone()["n"]
+
+    def _sample_floor(self) -> int:
+        """How far down the raw samples may be trimmed: half an hour of
+        polling per metric, or the flat floor, whichever is larger. It was
+        the flat 5,000 alone, a tenth of a sample per metric across a
+        49,607-metric fleet, so a store on its cap had every maintenance
+        pass shred the window the 1-hour charts read."""
+        return max(self._TRIM_RAW_PER_METRIC * self._metric_count(),
+                   self._TRIM_SAMPLE_FLOOR)
 
     def _hourly_floor(self) -> int:
         """How far down the rollups may be trimmed: a day of hours per
-        metric, or the raw floor, whichever is larger -- below that a wide
+        metric, or the flat floor, whichever is larger -- below that a wide
         chart has nothing left to draw and the raw fallback is long gone."""
-        with self._lock:
-            metrics = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM metrics").fetchone()["n"]
-        return max(24 * metrics, self._TRIM_SAMPLE_FLOOR)
+        return max(self._TRIM_HOURS_PER_METRIC * self._metric_count(),
+                   self._TRIM_SAMPLE_FLOOR)
 
     def trim_to_size(self, max_bytes: int, budget_s: float | None = None) -> int:
-        """Delete the oldest metric history until under the size cap: raw
-        samples first, then the hourly rollups.
+        """Delete the oldest metric history until under the size cap: the
+        hourly rollups first, then the raw samples.
+
+        The rollups give first: losing their oldest hours costs a wide chart
+        its far end, while the raw table losing rows costs every 1-hour
+        chart the window it is about to read.
 
         Incremental reclaim, not VACUUM: a whole-file rewrite under the
-        module lock stalls every poll worker and HTTP handler. Stage two
+        module lock stalls every poll worker and HTTP handler. Stage one
         deletes by `hour` ascending, so it never touches the recent hours
         compact_rollup's redo window rewrites.
         """
@@ -647,6 +667,7 @@ class NodesSeriesDatabase(SqliteStore):
             return 0
         deadline = None if budget_s is None else time.monotonic() + max(0.0, budget_s)
         hourly_floor = self._hourly_floor()
+        sample_floor = self._sample_floor()
         removed = 0
         for _ in range(6):
             if self.size_bytes() <= max_bytes:
@@ -655,8 +676,8 @@ class NodesSeriesDatabase(SqliteStore):
                 break
             shrank = False
             for table, column, floor in (
-                    ("samples", "ts", self._TRIM_SAMPLE_FLOOR),
-                    ("samples_hourly", "hour", hourly_floor)):
+                    ("samples_hourly", "hour", hourly_floor),
+                    ("samples", "ts", sample_floor)):
                 with self._lock:
                     total = self._conn.execute(
                         f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
@@ -670,7 +691,7 @@ class NodesSeriesDatabase(SqliteStore):
                     shrank = shrank or bool(cursor.rowcount)
                     self._conn.commit()
                 if shrank:
-                    break   # the rollups give only once the raw floor is reached
+                    break   # raw gives only once the rollups are at their floor
             reclaim(self._conn, self._lock, label=self.LABEL)
             # Neither table can give anything up; another pass would only
             # re-measure and reclaim what's already reclaimed.

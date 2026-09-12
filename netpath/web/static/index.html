@@ -1333,9 +1333,11 @@
       <p class="hint">Nodes is three files: the device inventory and its event log, the metric
         history (samples and hourly rollups — the one that grows), and the uploaded MIBs. The
         MIB file has no cap: a MIB is not history, and trimming it would stop traps decoding.
-        The metric history cap takes the raw samples first and then, once those are at their
-        floor, the oldest hourly rollups — so a cap set low enough shortens how far back a wide
-        chart can go, whatever the rollup retention setting says.</p>
+        The metric history cap takes the oldest hourly rollups first and then, once those are at
+        their floor, the oldest raw samples — so a cap set low enough shortens how far back a
+        wide chart can go, whatever the rollup retention setting says, before it touches the
+        recent window the one-hour charts read. Both floors scale with the number of metrics
+        being polled.</p>
       <p class="hint">The application file has no cap because it is the one file worth
         backing up.<button type="button" class="help-link" data-help="settings.data.appfile"
         title="What does this control?" aria-label="Help">?</button></p>

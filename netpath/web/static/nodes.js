@@ -6345,9 +6345,10 @@
           which at the default interval is roughly a week.</p>
         <p class="hint">All four settings are ceilings, not guarantees: the
           metric history file also has a size cap on Settings → Data &amp;
-          Retention, and when it is over that cap the oldest raw samples go
-          first and then the oldest hourly rollups, whichever tier they belong
-          to. Settings shows how far back the file still reaches.</p>
+          Retention, and when it is over that cap the oldest hourly rollups
+          go first and then, once those are at their floor, the oldest raw
+          samples, whichever tier they belong to. Settings shows how far back
+          the file still reaches.</p>
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,

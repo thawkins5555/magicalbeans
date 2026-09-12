@@ -370,13 +370,14 @@ print("PASS: a writer is never blocked for more than a step of the reclaim")
 
 trim_db.close()
 
-# ------------------------------------------- stage two: the hourly rollups
+# --------------------------------- the rollup stage: the hourly rollups
 #
-# 5.1.0: stage one stops at the 5,000-row raw floor, and before this the
-# trim then gave up -- samples_hourly was the table actually holding the
-# file open and no size cap ever touched it. Stage two takes the oldest
-# hours, so the far end of the history goes and the recent hours
-# compact_rollup rewrites in its two-hour redo window are never touched.
+# 5.1.0: samples_hourly was the table actually holding the file open and no
+# size cap ever touched it. The rollup stage takes the oldest hours, so the
+# far end of the history goes and the recent hours compact_rollup rewrites
+# in its two-hour redo window are never touched. Since 5.14.0 it runs
+# first, before the raw samples, but a rollup-heavy file exercises it
+# either way.
 
 stage2_db = NodesDatabase(os.path.join(TMPDIR, "stage2.db"))
 stage2 = stage2_db.series_db
@@ -385,7 +386,7 @@ stage2_device = stage2_db.add_device("127.0.0.6", name="stage2", group_id=stage2
 
 HOURS, METRICS = 1500, 20
 top_hour = int(_time.time() // 3600) * 3600
-# One raw sample per metric only: stage one has nothing to give up (the
+# One raw sample per metric only: the raw stage has nothing to give up (the
 # floor is 5,000 rows), which is exactly the state the old trim gave up in.
 stage2_db.record_metric_samples(
     stage2_device,
@@ -418,7 +419,7 @@ with stage2._lock:
         "SELECT COUNT(*) AS n FROM samples").fetchone()["n"]
     newest_left = stage2._conn.execute(
         "SELECT MAX(hour) AS h FROM samples_hourly").fetchone()["h"]
-print(f"stage two removed {stage2_removed} row(s); hourly {hourly_before} -> "
+print(f"the rollup stage removed {stage2_removed} row(s); hourly {hourly_before} -> "
       f"{hourly_after}; file {bytes_before:,} -> {stage2.size_bytes():,} bytes")
 assert stage2.size_bytes() <= bytes_before // 2, (stage2.size_bytes(), bytes_before)
 print("PASS: the size cap now brings a rollup-heavy file under its cap")
@@ -443,8 +444,10 @@ print(f"PASS: an unreachable cap stops at the rollup floor ({floor_left} rows le
 
 stage2_db.close()
 
-# Stage two waits for stage one: while raw samples are still above their
-# floor, a cap that raw alone can satisfy must not cost an hour of history.
+# Since 5.14.0 the rollups are the first stage: while they are still above
+# their floor, a cap they alone can satisfy must not cost a raw sample. It
+# was the other way round, and a store on its cap shredded the raw window
+# every pass while the history it was protecting gave up nothing.
 mixed_db = NodesDatabase(os.path.join(TMPDIR, "mixed.db"))
 mixed = mixed_db.series_db
 mixed_device = mixed_db.add_device("127.0.0.7", name="mixed",
@@ -459,22 +462,25 @@ with mixed._lock:
     mixed._conn.executemany(
         "INSERT INTO samples_hourly(metric_id, hour, n, vmin, vavg, vmax)"
         " VALUES (?,?,60,0.0,1.0,2.0)",
-        [(i, top_hour - h * 3600) for i in ids for h in range(400)])
+        [(i, top_hour - h * 3600) for i in ids for h in range(2000)])
     mixed._conn.commit()
     mixed._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     mixed_hourly = mixed._conn.execute(
         "SELECT COUNT(*) AS n FROM samples_hourly").fetchone()["n"]
     mixed_raw = mixed._conn.execute("SELECT COUNT(*) AS n FROM samples").fetchone()["n"]
 assert mixed_raw > 5000, mixed_raw
+# The rollups have headroom enough to satisfy the cap alone -- the only
+# state in which "raw was not touched" means anything.
+assert mixed_hourly > mixed._hourly_floor() * 4, (mixed_hourly, mixed._hourly_floor())
 mixed_bytes = mixed.size_bytes()
 mixed.trim_to_size(int(mixed_bytes * 0.9))
 with mixed._lock:
     hourly_kept = mixed._conn.execute(
         "SELECT COUNT(*) AS n FROM samples_hourly").fetchone()["n"]
     raw_kept = mixed._conn.execute("SELECT COUNT(*) AS n FROM samples").fetchone()["n"]
-assert raw_kept < mixed_raw, (mixed_raw, raw_kept)
-assert hourly_kept == mixed_hourly, (mixed_hourly, hourly_kept)
-print("PASS: with raw samples above the floor, a modest cap costs no rollups")
+assert hourly_kept < mixed_hourly, (mixed_hourly, hourly_kept)
+assert raw_kept == mixed_raw, (mixed_raw, raw_kept)
+print("PASS: with the rollups above their floor, a modest cap costs no raw samples")
 mixed_db.close()
 
 nodes_db.close()
