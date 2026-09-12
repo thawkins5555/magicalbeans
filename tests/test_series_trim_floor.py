@@ -132,8 +132,37 @@ check("and the raw rows that did go were the oldest ones",
       or oldest(db, "samples", "ts") > BASE_TS,
       (raw_before, raw_floored, oldest(db, "samples", "ts")))
 
+
+# ----------- 4. metrics with no raw rows must not deepen the cut
+
+# The bug this pins: `keep` divided the survivors by COUNT(metrics), so two
+# metrics holding 100 rows between them were each capped to 50/2 = 25 and
+# the 50-row floor went with them. Only one of the two has raw rows.
+two = NodesSeriesDatabase(os.path.join(TMPDIR, "two_metrics.db"))
+with two._lock:
+    two._conn.executemany(
+        "INSERT INTO metrics(device_id, key, label, unit, kind)"
+        " VALUES (?,?,?,?,?)",
+        [(1, "cpu_pct", "CPU", "%", "gauge"),
+         (1, "mem_pct", "Memory", "%", "gauge")])
+    holder = two._conn.execute(
+        "SELECT id FROM metrics WHERE key = 'cpu_pct'").fetchone()["id"]
+    two._conn.executemany(
+        "INSERT INTO samples(metric_id, ts, value) VALUES (?,?,?)",
+        [(holder, BASE_TS + s * 60.0, float(s)) for s in range(100)])
+    two._conn.commit()
+
+two._trim_raw(50)
+raw_two, _ = counts(two)
+check("2 metrics with 100 raw rows and 0: the cut is divided by the metric "
+      "that actually holds rows, so the 50-row floor still stands",
+      raw_two >= 50, raw_two)
+check("...and it did give something up rather than declining to trim",
+      raw_two < 100, raw_two)
+
 db.close()
 small.close()
+two.close()
 shutil.rmtree(TMPDIR, ignore_errors=True)
 
 print()

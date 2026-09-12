@@ -2,24 +2,16 @@
 
     py -m netpath.dbreport <data_dir>
 
-Read-only, and safe against a running service: every store is opened
-`file:...?mode=ro` so the write-ahead log is read along with the file. A
-store whose file is not there is skipped with a note rather than failing the
-run, and one whose WAL cannot be read read-only falls back to `immutable=1`
-with a note saying the WAL was not counted.
+Read-only and safe against a running service: every store is opened
+`file:...?mode=ro`, falling back to `immutable=1` with a note saying the
+WAL was not counted; a missing file is skipped with a note.
 
-Row counts are exact. Bytes are exact too where `dbstat` is compiled in
-(`basis` is then "measured"); where it is not -- which is the common case,
-including the sqlite3 shipped with CPython -- they are `rows *
-BYTES_PER_ROW` and `basis` is "estimated". Each report ends with an
-`unaccounted` line reconciling the sum against `page_count * page_size`, so
-the column adds up to the file and nobody has to trust an estimate
-silently.
-
-Not on the /api/state path, ever: COUNT(*) over a hundred-million-row
-`samples` is seconds, and /api/state is polled every two seconds by every
-open tab. The route that serves this (GET /api/db/report) is cached for
-five minutes.
+Row counts are exact; bytes are exact where `dbstat` is compiled in
+(`basis` "measured") and `rows * BYTES_PER_ROW` where it is not. Each
+report ends with an `unaccounted` line reconciling the sum against
+`page_count * page_size`. Never on the /api/state path: COUNT(*) over a
+hundred-million-row `samples` is seconds, and GET /api/db/report, which
+serves this, is cached for five minutes.
 """
 
 from __future__ import annotations
@@ -30,10 +22,8 @@ import sqlite3
 import sys
 from urllib.parse import quote
 
-# The filename each store keeps in the data folder. One dict because
-# __main__.py's *_path_for helpers each had the name written into them and
-# Store.name is not the filename, so a tool that wanted the files had no way
-# to ask for them.
+# The filename each store keeps in the data folder. One dict, because
+# Store.name is not the filename and nothing else could be asked for it.
 STORE_FILENAMES = {
     "app": "app.db",
     "trace": "netpath.db",
@@ -51,17 +41,11 @@ STORE_FILENAMES = {
 }
 
 # Bytes per row including the table's own indexes, measured rather than
-# guessed: each layout was built in an in-memory database at fleet shape
-# (250 devices, 48 ports each, 49,607 metrics of which 46,748 are per-port,
-# half the per-port values exactly 0.0) and `page_count * page_size` divided
-# by the row count. 2.0 M rows for samples, 1.5 M for samples_hourly,
-# 200-400 k for the walk tables. sqlite3 3.45.3, page_size 4096.
-#
-# The live install corroborates the first two: its own nodes_series.db is
-# 4030 pages over 229,018 samples and 14,709 metrics, about 65 B/sample.
-# Re-measured for the WITHOUT ROWID shape: samples 66.2 -> 23.8, having lost
-# the rowid, its automatic (metric_id, ts) index and the index on ts;
-# samples_hourly 66.3 -> 47.5, keeping its index on hour.
+# guessed: each layout built in an in-memory database at fleet shape
+# (49,607 metrics, 46,748 of them per-port), `page_count * page_size`
+# divided by the row count, sqlite3 3.45.3 at page_size 4096. Re-measured
+# for the WITHOUT ROWID shape: samples 66.2 -> 23.8, having lost the rowid,
+# its automatic (metric_id, ts) index and the index on ts.
 BYTES_PER_ROW = {
     "samples": 23.8,
     "samples_hourly": 47.5,
@@ -73,16 +57,14 @@ BYTES_PER_ROW = {
     "port_vlans": 56.4,
     "device_addresses": 91.5,
 }
-# Everything unmeasured. A row with a few integers and a timestamp lands
-# near here; a row carrying a device config or a MIB does not, which is what
-# the `unaccounted` line exists to make visible.
+# Everything unmeasured. A row with a few integers lands near here; one
+# carrying a device config or a MIB does not, hence the `unaccounted` line.
 DEFAULT_BYTES_PER_ROW = 64
 
 
 def _uri(path: str) -> str:
     """`C:\\x\\y.db` -> `file:C:/x/y.db`, escaped. Not `immutable=1`: that
-    skips the WAL, which under-reports against a running install by however
-    much has not been checkpointed."""
+    skips the WAL, and so under-reports against a running install."""
     absolute = os.path.abspath(path).replace("\\", "/")
     return "file:" + quote(absolute, safe="/:")
 
@@ -90,21 +72,26 @@ def _uri(path: str) -> str:
 def _connect(path: str) -> tuple[sqlite3.Connection, str]:
     """Read-only, and a note if that had to be weakened.
 
-    A read-only open of a WAL database needs its -shm, which a stopped
-    service may have taken with it and a locked one may not let us make. The
-    fallback still answers, and says what it left out."""
+    A read-only open of a WAL database needs its -shm, which a locked
+    service may not let us make. The pragma is inside the try because
+    connect() does no I/O: that fails on the first statement, not the open.
+    """
+    probe = None
     try:
-        return sqlite3.connect(_uri(path) + "?mode=ro", uri=True), ""
+        probe = sqlite3.connect(_uri(path) + "?mode=ro", uri=True)
+        probe.execute("PRAGMA page_size").fetchone()
+        return probe, ""
     except sqlite3.Error as exc:
+        if probe is not None:
+            probe.close()
         conn = sqlite3.connect(_uri(path) + "?immutable=1", uri=True)
         return conn, (f"opened immutable ({exc}); anything still in the "
                       f"write-ahead log is not counted")
 
 
 def _measured(conn: sqlite3.Connection) -> dict[str, int] | None:
-    """Per-table bytes from `dbstat`, each index folded into its own table so
-    the column means the same thing on both bases. None where dbstat is not
-    compiled in."""
+    """Per-table bytes from `dbstat`, each index folded into its own table
+    so the column means the same on both bases. None without dbstat."""
     try:
         rows = conn.execute(
             "SELECT name, SUM(pgsize) AS bytes FROM dbstat GROUP BY name"
@@ -121,11 +108,9 @@ def _measured(conn: sqlite3.Connection) -> dict[str, int] | None:
     return out
 
 
-# nodesseriesdb writes these while it rewrites a table into its WITHOUT
-# ROWID shape, band of metric ids at a time. Surfaced in the note because a
-# store mid-rewrite holds two half-tables, which is otherwise an operator
-# looking at a `samples_new` line and a row count that does not match
-# retention with nothing telling them why.
+# nodesseriesdb writes these while it rewrites a table WITHOUT ROWID. In
+# the note because a store mid-rewrite holds two half-tables, which is
+# otherwise an unexplained `samples_new` line.
 _REWRITE_TABLES = ("samples", "samples_hourly")
 
 
@@ -188,8 +173,7 @@ def _report_store(name: str, path: str) -> dict:
             if exact is not None:
                 size = exact.get(table, 0)
             else:
-                # A `<table>_new` mid-rewrite costs what its finished form
-                # will, not the unmeasured default.
+                # A `<table>_new` costs what its finished form will.
                 measured = BYTES_PER_ROW.get(
                     table[:-4] if table.endswith("_new") else table,
                     DEFAULT_BYTES_PER_ROW)
@@ -247,9 +231,8 @@ def _print_store(entry: dict) -> None:
     if entry.get("missing"):
         print(f"  -- {entry['note']}")
         return
-    # Two figures, because they answer different questions: the file plus
-    # its write-ahead log is what the disk is holding, and the pages are
-    # what the column below adds up to.
+    # Two figures: the file plus its write-ahead log is what the disk
+    # holds, and the pages are what the column below adds up to.
     print(f"  {entry['file_bytes'] / (1024 * 1024):,.1f} MiB on disk with its"
           f" write-ahead log; {entry['page_count'] * entry['page_size'] / (1024 * 1024):,.1f}"
           f" MiB in {entry['page_count']:,} pages of {entry['page_size']:,}"
