@@ -4486,7 +4486,9 @@ def post_nodes_upstream_suggestions_apply(service, params, body) -> dict:
     rows = {d["id"]: d for d in service.nodes_db.devices_by_ids(wanted)}
     for device_id in pairs:
         if device_id not in rows:
-            raise NotFound(f"No such device {device_id}")
+            # A body field, not the addressed resource: 400, like the profile
+            # and group references bulk update refuses.
+            raise ValueError(f"No such device {device_id}")
     cleaned = {device_id: _clean_upstream_id(service, device_id, upstream_id, rows)
               for device_id, upstream_id in pairs.items()}
     cycle = _find_upstream_cycle(service, cleaned, rows)
@@ -4810,7 +4812,8 @@ def _clean_upstream_id(service, device_id, value, rows: dict | None = None):
     # `rows` is a batch caller's pre-read device map; falling back to
     # device() keeps the single-device PUT path unchanged.
     if rows is None or upstream not in rows:
-        _require(service.nodes_db.device(upstream), "upstream device")
+        if not service.nodes_db.device(upstream):
+            raise ValueError("No such upstream device")
     return upstream
 
 

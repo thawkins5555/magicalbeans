@@ -151,7 +151,7 @@ try:
                            {"assignments": [{"device_id": dup_ids[0],
                                              "upstream_id": 999999}]},
                            token=admin)
-    check("an upstream that does not exist is still refused", status == 404,
+    check("an upstream that does not exist is still refused", status == 400,
           (status, payload))
     status, payload = call("POST", "/api/nodes/upstream-suggestions/apply",
                            {"assignments": [{"device_id": core,
