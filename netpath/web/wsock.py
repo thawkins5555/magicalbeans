@@ -381,19 +381,23 @@ class WebSocket:
                             type(exc).__name__, exc)
             time.sleep(READ_SLICE_S)
 
-    def _poll_readable(self, timeout: float) -> None:
+    def _poll_readable(self, timeout: float) -> bool:
         """One readability wait on this socket, with no ceiling on the
-        descriptor's value. Both objects are per-call: `select.poll()` costs
-        no descriptor at all, and a selector is only built on the platforms
-        that have no `poll`."""
+        descriptor's value. True when the wait says the socket is readable.
+
+        Both objects are per-call: `select.poll()` costs no descriptor at
+        all, and a selector is only built on the platforms that have no
+        `poll`. The return value matters only to _drain, whose guard was
+        inert while this returned None; _wait_readable wants the wait
+        itself, not its answer, and ignores it.
+        """
         if _HAS_POLL:
             poller = select.poll()
             poller.register(self.sock.fileno(), select.POLLIN | select.POLLPRI)
-            poller.poll(timeout * 1000.0)
-            return
+            return bool(poller.poll(timeout * 1000.0))
         with selectors.DefaultSelector() as selector:
             selector.register(self.sock, selectors.EVENT_READ)
-            selector.select(timeout)
+            return bool(selector.select(timeout))
 
     # ------------------------------------------------------------- writing
 
@@ -464,7 +468,20 @@ class WebSocket:
                 # latter everywhere else because it raises ValueError for a
                 # descriptor at or above FD_SETSIZE, and the arm below would
                 # have swallowed that silently.
-                self._poll_readable(0)
+                #
+                # The guard was inert while _poll_readable returned None --
+                # the loop only stopped because settimeout(0) makes recv
+                # raise BlockingIOError -- so the wait cost a syscall per
+                # round and decided nothing. A wait that cannot be
+                # performed at all is not evidence either way, and the recv
+                # below is non-blocking regardless, so it is tried anyway
+                # rather than abandoning the drain this exists to complete.
+                try:
+                    readable = self._poll_readable(0)
+                except (OSError, ValueError):
+                    readable = True
+                if not readable:
+                    return
                 try:
                     if not self.sock.recv(65536):
                         return

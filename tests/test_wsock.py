@@ -5,6 +5,7 @@ of the same contract (a real upgrade over the real server, and a session on
 top of it) is tests/test_ssh_terminal.py."""
 import email
 import os
+import select
 import socket
 import struct
 import threading
@@ -493,26 +494,59 @@ print("PASS: close() from another thread defers the drain to the parked reader")
 # FD_SETSIZE, and the arm around the drain swallows it — so on a busy
 # appliance the drain quietly consumed nothing and the close frame naming
 # the reason could be lost to the reset it exists to prevent.
+#
+# Driven by making select.select raise rather than by dup2'ing a real
+# descriptor to 1100: Windows has no descriptor that high to dup2 to, so
+# the case that matters only ever ran on POSIX, and this is the fault that
+# high descriptor PRODUCES. A _drain written on select.select fails here,
+# whether or not this host can number a socket above FD_SETSIZE.
+sock, ws = pair()
+real_select = select.select
+
+
+def refusing_select(*args, **kwargs):
+    raise ValueError("filedescriptor out of range in select()")
+
+
+select.select = refusing_select
 try:
-    sock, ws = high_fd_pair()
-except OSError as exc:
-    print(f"SKIP: no descriptor available at {HIGH_FD} here ({exc})")
-else:
-    assert ws.sock.fileno() >= 1024, ws.sock.fileno()
     sock.sendall(b"z" * 4096)
     time.sleep(0.2)
     ws._drain()
-    ws.sock.settimeout(0.3)
-    try:
-        left = ws.sock.recv(65536)
-    except (socket.timeout, TimeoutError, BlockingIOError):
-        left = b""
-    assert left == b"", \
-        f"{len(left)} bytes left unread on fd {ws.sock.fileno()}"
-    print(f"PASS: the drain empties a socket numbered above FD_SETSIZE "
-          f"(fd {ws.sock.fileno()}), where select.select could only raise")
-    ws.close()
-    sock.close()
+finally:
+    select.select = real_select
+ws.sock.settimeout(0.3)
+try:
+    left = ws.sock.recv(65536)
+except (socket.timeout, TimeoutError, BlockingIOError):
+    left = b""
+assert left == b"", f"{len(left)} bytes left unread with select.select refusing"
+print("PASS: the drain empties its socket even where select.select can only "
+      "raise ValueError (the FD_SETSIZE fault, on any platform)")
+ws.close()
+sock.close()
+
+# ...and the guard in front of that recv is live. _poll_readable was
+# declared `-> None`, so `self._poll_readable(0)` decided nothing: the loop
+# only ended because settimeout(0) makes recv raise BlockingIOError, and
+# every round paid for a wait whose answer was thrown away.
+sock, ws = pair()
+asked = []
+ws._poll_readable = lambda timeout: asked.append(timeout) or False
+sock.sendall(b"y" * 4096)
+time.sleep(0.2)
+ws._drain()
+assert asked == [0], f"the drain asked its wait {len(asked)} time(s): {asked}"
+ws.sock.settimeout(0.3)
+try:
+    kept = ws.sock.recv(65536)
+except (socket.timeout, TimeoutError, BlockingIOError):
+    kept = b""
+assert kept == b"y" * 4096, \
+    f"a wait saying 'not readable' did not stop the drain ({len(kept)} bytes left)"
+print("PASS: a wait that says the socket is not readable stops the drain, "
+      "rather than its answer being discarded")
+ws.close()
 sock.close()
 
 print("ALL WSOCK ASSERTIONS PASSED")
