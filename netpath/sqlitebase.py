@@ -318,17 +318,14 @@ def like_prefix(text) -> str:
 
 # ----------------------------------------------------------------- histogram
 
-# The three event stores (alerts, traps, syslog) all answer /histogram with
-# the same shape: a contiguous list of fixed-width buckets over [t0, t1] that
-# rows are added into by slot index. Bucket building, accumulation and the
-# hourly-rollup fast path live here so the three cannot drift apart.
+# The three event stores (alerts, traps, syslog) answer /histogram with one
+# shape: contiguous fixed-width buckets over [t0, t1], added into by slot
+# index. Shared here so the three cannot drift apart.
 
 def hist_buckets(t0: float, t1: float, bucket_s: float) -> tuple:
     """(start, bucket_s, slots, buckets) for a histogram over [t0, t1].
-
     bucket_s is floored at a minute and start snapped down to a bucket
-    boundary, so the first bucket may begin before t0.
-    """
+    boundary, so the first bucket may begin before t0."""
     bucket_s = max(float(bucket_s), 60.0)
     start = int(t0 // bucket_s) * bucket_s
     slots = max(1, int((t1 - start) / bucket_s) + 1)
@@ -717,8 +714,7 @@ class SqliteStore:
             return default
 
     def _set_private_setting(self, key: str, value, commit: bool = True) -> None:
-        """commit=False for a caller that owns the transaction — progress
-        written beside the chunk it describes must land or roll back with it."""
+        """commit=False for a caller that owns the transaction."""
         with self._lock:
             self._conn.execute(
                 "INSERT INTO settings(key, value) VALUES (?,?)"
@@ -728,9 +724,8 @@ class SqliteStore:
                 self._conn.commit()
 
     def _clear_private_setting(self, key: str, commit: bool = True) -> None:
-        """Remove the row rather than storing a null: for bookkeeping whose
-        ABSENCE is the fact, a stored null reads back the same but leaves a
-        row that looks like state. commit=False as above."""
+        """Remove the row rather than storing a null, for bookkeeping whose
+        ABSENCE is the fact. commit=False as above."""
         with self._lock:
             self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
             if commit:

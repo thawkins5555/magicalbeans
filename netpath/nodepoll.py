@@ -2817,16 +2817,8 @@ class NodePoller(Worker):
 
     def _best_effort(self, label, fn, *args):
         """Run one optional read, swallowing "this device does not answer
-        that" and nothing else.
-
-        An absent object is the normal case for PoE, STP, environment
-        sensors, UCD-SNMP and an admin's custom MIB, and is what each of
-        these sites was written to ignore with a bare `except SnmpError:
-        pass`. A credential or security-level verdict is not that: it is a
-        proven fact about this device's access, with its own device event and
-        its own remedy (see _CREDENTIAL_VERDICTS), and one raised by an
-        optional read used to vanish here — leaving the operator whichever
-        later failure happened to look different. Those are re-raised for the
+        that" and nothing else. A credential or security-level verdict is
+        not that (see _CREDENTIAL_VERDICTS): those are re-raised for the
         caller's own handler, named so the log says which read produced it.
         """
         try:
@@ -7803,8 +7795,8 @@ class _AuthFailure(SnmpError):
 
 # The SnmpError verdicts about the credential or security level rather than
 # about one absent object; _best_effort re-raises these and swallows the rest.
-# SnmpAccessDenied is not here: authorizationError is what a restricted v3
-# view answers for exactly the optional subtrees these reads ask about.
+# SnmpAccessDenied is not here: a restricted v3 view answers authorizationError
+# for exactly the optional subtrees these reads ask about.
 _CREDENTIAL_VERDICTS = (_AuthFailure, SnmpAuthError, SnmpDowngrade,
                         SnmpPrivError, SnmpUnsupported)
 

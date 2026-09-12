@@ -551,13 +551,9 @@ class AlertEngine(Worker):
     def _drain_from(self, source: str, fetch, max_id_fn):
         """Yield every row past `source`'s cursor, then advance it once.
 
-        The eleven lines each id-ordered drain used to keep its own copy of:
-        seed an unseeded cursor at the current max id (so a fresh install
-        does not alert on the history it just imported), read through
-        _read_forward for the row/time budgets and the backlog counter, and
-        advance only once the caller has finished with every row - never if
-        the caller raises, so a failed tick hands the batch back rather than
-        skipping it (see _advance_cursor).
+        An unseeded cursor seeds at the current max id, so a fresh install
+        does not alert on imported history; the cursor advances only once the
+        caller has finished every row, never if it raises.
         """
         if not self.db.has_cursor(source):
             self.db.set_cursor(source, max_id_fn())

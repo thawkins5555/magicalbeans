@@ -116,8 +116,7 @@ class Conflict(ValueError):
 
 
 class NotFound(ValueError):
-    """"That row is not here" — a ValueError subclass so any generic handler
-    still reports it sensibly; server.py turns it into a 404."""
+    """"That row is not here" — server.py turns it into a 404."""
 
 
 def _audit(service, params, action: str, target: str = "",
@@ -189,8 +188,8 @@ def _page(params, default, cap) -> tuple[int, int]:
 
 
 def _require(row, what: str):
-    """`row` back, or NotFound("No such <what>") — the not-found shape
-    server.py answers 404 for."""
+    """`row` back, or NotFound("No such <what>"), which server.py answers
+    404 for."""
     if not row:
         raise NotFound(f"No such {what}")
     return row
@@ -483,8 +482,7 @@ def _id_list(raw) -> list[int] | None:
             out.append(int(piece))
         except ValueError:
             raise ValueError(f"device_ids must be a comma-separated list of ids, not {piece!r}")
-    # Through the same reader as every POST body's list, so a GET that
-    # narrows a report by id obeys the one bulk cap too.
+    # Same reader as every POST body's list, so a GET obeys the bulk cap too.
     return _bulk_ids({"device_ids": out}, "device_ids", required=False)
 
 
@@ -874,9 +872,8 @@ def _storage(service) -> dict:
     if total:
         result["disk_free"] = free
         result["disk_total"] = total
-    # app.db carries the audit trail, which no sweep may trim, so it has a
-    # warning where every other store has a cap: the one line saying it is
-    # large enough to want an operator's attention.
+    # app.db carries the audit trail, which no sweep may trim, so it gets a
+    # warning where every other store gets a cap.
     warn_mib = int(service.settings.get("app_db_warn_mib") or 0)
     app_bytes = result.get("app_bytes")
     if warn_mib and app_bytes and app_bytes > warn_mib * 1024 * 1024:
@@ -1768,8 +1765,8 @@ def _debug_can(granted, module: str) -> bool:
 
 
 def _debug_netpath_workers(service, params, granted, now) -> tuple:
-    """One row per NetPath destination — its trace and its web page check on
-    the same row — plus the running/queued counts the summary reports."""
+    """One row per NetPath destination — its trace and its web page check
+    on the same row — plus the running/queued counts."""
     if not _debug_can(granted, "netpath"):
         return [], 0, 0
     state = service.monitor.worker_state()
@@ -1829,10 +1826,8 @@ def _debug_netpath_workers(service, params, granted, now) -> tuple:
 
 def _debug_events(service, params, granted, since) -> tuple:
     """The event batch and the cursor that goes with it. One stream carries
-    every module's events — device names and addresses, DHCP server labels,
-    ConfigRX failure detail, sign-in history — so `debug: read` alone must
-    not read all of it. Each category is filtered by the module it belongs
-    to."""
+    every module's events, so each category is filtered by the module it
+    belongs to rather than by `debug: read` alone."""
     visible = {category for category, module in _EVENT_CATEGORY_MODULE.items()
                if _debug_can(granted, module)}
     # One lock hold for the batch and the cursor that goes with it.
@@ -1846,8 +1841,8 @@ def _debug_events(service, params, granted, since) -> tuple:
 
 
 def _debug_dns_workers(service, params, granted, now) -> list:
-    """One row per address currently out for a reverse lookup. Under
-    `settings`, the module _EVENT_CATEGORY_MODULE assigns the dns category."""
+    """One row per address currently out for a reverse lookup, under
+    `settings` — the module _EVENT_CATEGORY_MODULE gives the dns category."""
     dns_state = service.resolver.worker_state() if _debug_can(granted, "settings") else {}
     return sorted(
         [{"ip": ip, "elapsed": now - info["started"]}
@@ -1856,10 +1851,8 @@ def _debug_dns_workers(service, params, granted, now) -> list:
 
 
 def _debug_ipam_workers(service, params, granted, now) -> list:
-    """One row per subnet currently being scanned, one per DHCP server
-    currently being polled — both come from the same worker, so they share a
-    table rather than needing a section each for what is usually zero or one
-    row."""
+    """One row per subnet being scanned and one per DHCP server being
+    polled: one worker, so one shared table."""
     ipam_state = service.ipam.state() if _debug_can(granted, "ipam") else {}
     ipam_workers = []
     if ipam_state.get("scan_started") or ipam_state.get("poll_started"):
@@ -1886,10 +1879,8 @@ def _debug_ipam_workers(service, params, granted, now) -> list:
 
 
 def _debug_node_workers(service, params, granted, now) -> list:
-    """One row per device currently being polled or queued to be — the same
-    shape the NetPath `workers` table uses, without its per-target
-    budget/schedule columns: a device's poll has no fixed budget the way a
-    trace's hop/probe counts imply one."""
+    """One row per device being polled or queued — the NetPath `workers`
+    shape without its per-target budget/schedule columns."""
     node_state = service.node_poller.worker_state() if _debug_can(granted, "nodes") else {}
     node_workers = []
     if node_state:
@@ -1909,9 +1900,8 @@ def _debug_node_workers(service, params, granted, now) -> list:
 
 
 def _debug_discovery_scans(service, params, granted, now) -> list:
-    """One row per discovery scan currently sweeping, with its live progress
-    counters — same shape as the worker tables plus the probed/found columns
-    a bounded sweep naturally has."""
+    """One row per sweeping discovery scan — the worker-table shape plus
+    the probed/found counters a bounded sweep has."""
     see_nodes = _debug_can(granted, "nodes")
     discovery_scans = []
     for job in (service.nodes_db.discovery_jobs(20) if see_nodes else []):
@@ -1928,8 +1918,8 @@ def _debug_discovery_scans(service, params, granted, now) -> list:
 
 
 def _debug_summary(service, params, granted, sections) -> dict:
-    """The one-line "is everything running" header, counted from the sections
-    already assembled."""
+    """The "is everything running" header, counted from the assembled
+    sections."""
     from ..ipam_scan import ping_mode_summary
     ping_mode = ping_mode_summary()
     see_netpath = _debug_can(granted, "netpath")
@@ -1950,8 +1940,7 @@ def _debug_summary(service, params, granted, sections) -> dict:
         "nodes_active": len(sections["node_workers"]),
         "discovery_active": len(sections["discovery_scans"]),
         "buffered": len(service.log.all()),
-        # Same fact the startup log line states once, here so it stays
-        # visible without hunting back through the event log for it.
+        # Same fact the startup log line states once, kept visible here.
         "ping_path": ping_mode["path"],
         "ping_kind": ping_mode["kind"],
         "ping_mode_env": ping_mode["mode_env"],
@@ -1962,13 +1951,9 @@ def get_debug(service, params, body) -> dict:
     since = int(_num(params, "since", 0, int) or 0)
     now = time.time()
 
-    # Every section below names something from another module — NetPath
-    # destination hostnames, device names and addresses, subnet and DHCP
-    # server labels, discovery CIDRs, the addresses out for reverse lookup —
-    # so `debug: read` alone must not read any of them, exactly as it must
-    # not read the event stream. A section the account cannot read comes
-    # back empty rather than as a 403, the contract get_state and
-    # get_dashboard already use.
+    # Every section below names something from another module, so `debug:
+    # read` alone must not read any of them. A section the account cannot
+    # read comes back empty rather than as a 403, as get_state does.
     granted = request_permissions(service, params)
 
     workers, running, queued = _debug_netpath_workers(service, params, granted, now)
@@ -3374,25 +3359,10 @@ def _tri(value):
 # anyway (module WRITE); everyone else gets `has_community`, the same
 # reduction `v3_auth_pass_enc` already gets.
 # Every store column whose value IS a secret — not a boolean about one. A
-# serialiser that names one of these owes the caller a `reveal` decision
-# (_may_read_secrets) before the value leaves the process; the encrypted
-# blobs never leave it at all, and appear here so a future serialiser that
-# reaches for one is caught by tests/test_api_helpers.py's contract rather
-# than by an operator reading a JSON response.
-#
-# `community`: the v1/v2c string a device checks before answering (nodes
-# devices/groups/credentials, wireless controllers, trap senders).
-# `community_or_user`: the same, as discovery recorded whichever worked.
-# `password`: the users table's hash — a hash, but still the credential.
-# `token_hash`: the same for an API token. The rest are DPAPI blobs: SNMPv3
-# auth/privacy passwords, ConfigRX's SSH password and enable secret, and
-# IPAM's and Alerts' stored service credentials.
-#
-# Deliberately NOT here: `has_community` and every other has_* boolean (the
-# reduction this rule exists to force), `username`/`ssh_username` (shown so
-# a form can prefill), and configrx compliance's `pattern`, which MIGHT be a
-# secret rather than being one — _compliance_rule_json gates it for its own
-# stated reason.
+# serialiser that names one owes the caller a `reveal` decision
+# (_may_read_secrets); the encrypted blobs never leave the process at all.
+# Deliberately NOT here: has_* booleans, `username`/`ssh_username`, and
+# compliance's `pattern`, which _compliance_rule_json gates for itself.
 SECRET_COLUMNS = frozenset({
     "community", "community_or_user", "password", "password_enc",
     "token_hash", "v3_auth_pass_enc", "v3_priv_pass_enc", "auth_pass_enc",
@@ -4947,12 +4917,8 @@ BULK_DEVICE_ID_MAX = 50000
 
 def _bulk_ids(body, key, cap=BULK_DEVICE_ID_MAX, *, required=True,
               noun="devices") -> list[int]:
-    """The one reader for every `body[key]` that is a list of row ids: the
-    same cap, the same refusal wording and the same int coercion whether the
-    list names devices, alerts, backups or discovery results. `required`
-    is each route's own semantics, not a default: a bulk mute may name a
-    group instead of devices, so its list is optional, while a bulk delete
-    with no list has nothing to do."""
+    """The one reader for every `body[key]` list of row ids: one cap, one
+    refusal wording, one int coercion. `required` is each route's own."""
     ids = body.get(key) or []
     if not ids:
         if required:
@@ -7121,8 +7087,7 @@ def _bulk_silence_device_ids(service, body) -> list[str]:
     (like _mute_entity above) a request that would end up silencing
     nothing. Shared by bulk mute and bulk maintenance mode: the two take the
     same scope, and only differ in what they then do with it."""
-    # Optional here, unlike every other bulk route: a group_id alone is a
-    # complete request, so an absent device_ids is not yet an error.
+    # Optional here: a group_id alone is already a complete request.
     wanted = set(_bulk_ids(body, "device_ids", required=False))
     group_id = body.get("group_id")
     if group_id:
@@ -7135,8 +7100,7 @@ def _bulk_silence_device_ids(service, body) -> list[str]:
     if not wanted:
         raise ValueError("device_ids and/or group_id is required, naming at "
                          "least one device")
-    # Re-checked on the union: the body's own list was capped above, but a
-    # group's membership is added after that.
+    # Re-checked on the union: group membership is added after the cap.
     if len(wanted) > BULK_DEVICE_ID_MAX:
         raise ValueError(
             f"Too many devices in one request: {len(wanted)}, limit is "
@@ -7323,8 +7287,7 @@ def _window_body_fields(service, body) -> dict:
             fields["scope_group_id"] = int(group_id)
             fields["scope_device_ids"] = None
         elif scope_kind == "devices":
-            # Optional at this layer: post_alerts_window's own required-field
-            # loop is what refuses a "devices" window naming none.
+            # Optional here: post_alerts_window's own loop refuses an empty one.
             wanted = set(_bulk_ids(body, "scope_device_ids", required=False))
             present = {row["id"] for row in service.nodes_db.devices_by_ids(wanted)}
             missing = wanted - present
@@ -9412,8 +9375,7 @@ def _client(params) -> str:
 
 
 class Busy(Exception):
-    """"Come back in a moment" — server.py answers 503 with a `Retry-After`.
-    Not a ValueError: nothing about the request was wrong."""
+    """"Come back in a moment" — server.py answers 503 with a `Retry-After`."""
 
     retry_after = 2
 
@@ -9426,9 +9388,7 @@ class Busy(Exception):
 # never holds one of the four while it waits.
 _LOGIN_SLOTS = threading.Semaphore(4)
 
-# And a caller that cannot have a slot within this waits no longer: parking
-# request threads indefinitely behind four scrypts is its own exhaustion, one
-# thread and one socket at a time. A 503 with a Retry-After says so honestly.
+# A caller that waits longer than this gets a 503 with a Retry-After.
 _LOGIN_SLOT_WAIT_S = 5.0
 
 _dummy_hash_value: str | None = None

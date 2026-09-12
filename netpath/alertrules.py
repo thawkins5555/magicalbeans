@@ -383,46 +383,23 @@ CLEARS = {
 
 
 # PREDICATES: rule kind -> whether one rule of that kind is about one
-# occurrence, asked after the kind itself has matched. The per-kind half of
-# AlertEngine._apply's matching, which was a run of `if rule["kind"] == ...`
-# guards inside the loop; a kind whose matching rule is missing is now a
-# missing table entry a test can see rather than a fall-through nobody
-# notices. Everything that is true of EVERY kind (device_filter, the
-# unmanaged-only rules, mute) stays in _apply, which is where the engine
-# state those need lives.
-#
-# Keyed and consulted exactly like CLEARS above, and the same reasoning
-# applies: which fact a rule is about is a property of what this app
-# measures, not a per-site preference.
+# occurrence, asked after the kind itself has matched. Whatever is true of
+# EVERY kind (device_filter, unmanaged-only rules, mute) stays in _apply.
 
 
 def _source_kind_matches(rule, occurrence) -> bool:
     """A rule's source_kind, when set, is which event/metric it is about; an
-    occurrence about something else is not that rule's business.
-
-    "threshold" belongs on this table and used to be missing, which meant a
-    single CPU breach opened all eleven threshold alerts for that device —
-    every one of them carrying the CPU occurrence's message.
-
-    syslog and ipam deliberately have no entry: their occurrences always
-    carry source_kind "", so filtering on it would silently stop matching
-    any custom rule that has one set.
+    occurrence about something else is not that rule's business. syslog and
+    ipam have no entry: their occurrences always carry source_kind "".
     """
     return (not (rule["source_kind"] or "")
             or rule["source_kind"] == occurrence.source_kind)
 
 
 def _severity_floor(rule, occurrence) -> bool:
-    """Lower number = more severe (RFC 5424): the rule's own severity is the
-    threshold it fires at — "this severity and worse" — not just a label
-    stamped on the resulting alert. Traps were exempt, so "Critical SNMP trap
-    received" opened at severity 2 for fifty informational config-save traps.
-
-    Only for a rule with NO source_kind, i.e. one that is about every trap or
-    every message. A rule naming one trap already says exactly which fact it
-    is about, and the shipped coldStart rule (severity 4) would otherwise
-    never fire: a trap with no severity mapping decodes as 5, which is worse
-    than 4 on this scale.
+    """Lower number = more severe (RFC 5424): the rule's severity is the
+    threshold it fires at, "this severity and worse". Only for a rule with
+    NO source_kind, i.e. one about every trap or every message.
     """
     if (rule["source_kind"] or "") or occurrence.severity is None:
         return True
@@ -430,18 +407,9 @@ def _severity_floor(rule, occurrence) -> bool:
 
 
 def _threshold_rule_matches(rule, occurrence) -> bool:
-    """Two threshold rules CAN legitimately share a source_kind —
-    ups_battery_low/ups_battery_replace already did, and
-    temp_chassis_high/temp_chassis_critical now read the same temp_chassis_c
-    metric on purpose (see alertsdb._BUILTIN_RULES). Without this, the
-    occurrence AlertEngine._evaluate_thresholds built for evaluating ONE of
-    them also matched the OTHER (same kind, same source_kind),
-    double-incrementing it with the wrong rule's message and defeating the
-    streak accounting evaluate_threshold just did for its own rule.
-
-    occurrence.rule_key pins an occurrence to the one rule that actually
-    raised it; empty (every occurrence not from _evaluate_thresholds, and one
-    parked before this field existed) leaves matching exactly as it was.
+    """Two threshold rules CAN legitimately share a source_kind (see
+    alertsdb._BUILTIN_RULES), so occurrence.rule_key pins an occurrence to
+    the one rule that raised it; empty leaves matching as it was.
     """
     return not occurrence.rule_key or rule["key"] == occurrence.rule_key
 
