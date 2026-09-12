@@ -215,7 +215,7 @@ try:
     check("a device with only one stored backup is refused",
           status == 400, (status, payload))
     status, payload = call("GET", "/api/configrx/diff", {"device": 999999}, token=admin)
-    check("an unknown device is refused", status == 400, (status, payload))
+    check("an unknown device is refused", status == 404, (status, payload))
 
     print("gates: matches get_configrx_backup exactly (configrx read is enough)")
     service.app_db.add_user("cx-diff-writer", hash_password("CxDiffWriterPW2026"), must_change=False)

@@ -359,7 +359,7 @@ try:
     status, payload = call("DELETE", f"/api/mapper/maps/{throwaway_id}", token=admin)
     check("deleting a map is accepted", status == 200 and payload["ok"], (status, payload))
     status, payload = call("GET", f"/api/mapper/maps/{throwaway_id}", token=admin)
-    check("...and it is really gone", status == 400, (status, payload))
+    check("...and it is really gone", status == 404, (status, payload))
 
     # -------------------------------------------------- 11. settings
 

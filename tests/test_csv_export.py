@@ -138,7 +138,7 @@ try:
     check("interfaces export answers 200 even with no polled interfaces yet",
           status == 200 and empty_if.get("count") == 0, (status, empty_if))
     status, missing = call("GET", "/api/nodes/devices/999999/interfaces/export.csv", token=admin)
-    check("interfaces export 400s for a device that does not exist", status == 400, status)
+    check("interfaces export 404s for a device that does not exist", status == 404, status)
 
     # ------------------------------------------------------------ alerts
     print("alerts export exceeds the 2,000-row screen cap")

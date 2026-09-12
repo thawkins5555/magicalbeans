@@ -90,9 +90,16 @@ def main():
 
     from netpath.web import api as web_api
 
+    class _FakePerms:
+        # The serialiser asks for the caller's Nodes grant before it hands
+        # back community_or_user; this stands in for the accounts database.
+        def permissions_for(self, username):
+            return {"nodes": "write"}
+
     class _FakeService:
         def __init__(self, nodes_db):
             self.nodes_db = nodes_db
+            self.app_db = _FakePerms()
 
     served = web_api.get_nodes_discovery_job(_FakeService(db), {}, {}, job_id5)
     served_result = served["results"][0]

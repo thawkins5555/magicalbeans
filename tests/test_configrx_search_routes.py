@@ -200,7 +200,7 @@ try:
     status, payload = call("DELETE", f"/api/configrx/rule-sets/{rule_set_id}", token=admin)
     check("rule set delete: 200", status == 200, (status, payload))
     status, payload = call("GET", f"/api/configrx/rule-sets/{rule_set_id}", token=admin)
-    check("...and it's actually gone", status == 400, (status, payload))
+    check("...and it's actually gone", status == 404, (status, payload))
 
     # -------------------------------------------------------------- gates
     print("gates: configrx:read may search/read, may not write; no grant refused both")

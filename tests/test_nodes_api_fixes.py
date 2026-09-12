@@ -151,7 +151,7 @@ try:
                            {"assignments": [{"device_id": dup_ids[0],
                                              "upstream_id": 999999}]},
                            token=admin)
-    check("an upstream that does not exist is still refused", status == 400,
+    check("an upstream that does not exist is still refused", status == 404,
           (status, payload))
     status, payload = call("POST", "/api/nodes/upstream-suggestions/apply",
                            {"assignments": [{"device_id": core,
@@ -166,8 +166,8 @@ try:
                          ("DELETE", "/api/nodes/devices/999999/oid-walk"),
                          ("GET", "/api/nodes/devices/999999/oid-walk")]:
         status, payload = call(method, path, token=admin)
-        check(f"{method} {path.split('/')[-1]} on an unknown device is a 400, "
-              f"not a 200 naming a job that never ran", status == 400,
+        check(f"{method} {path.split('/')[-1]} on an unknown device is a 404, "
+              f"not a 200 naming a job that never ran", status == 404,
               (method, path, status, payload))
 
     # --------------------------------------- 4. a MIB object's OID is numeric
