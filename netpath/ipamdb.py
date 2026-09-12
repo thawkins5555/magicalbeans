@@ -13,7 +13,7 @@ import sqlite3
 import time
 
 from .ipam_dhcp import stored_mac
-from .sqlitebase import (LIKE_ESCAPE, SqliteStore, like_contains,
+from .sqlitebase import (LIKE_ESCAPE, SqliteStore, id_chunks, like_contains,
                          like_prefix)
 
 
@@ -400,10 +400,13 @@ class IpamDatabase(SqliteStore):
         the call site, never input."""
         if not ids:
             return []
-        marks = ",".join("?" * len(ids))
+        rows: list[sqlite3.Row] = []
         with self._lock:
-            return self._conn.execute(
-                f"SELECT * FROM {table} WHERE id IN ({marks})", ids).fetchall()
+            for chunk in id_chunks(ids):
+                marks = ",".join("?" * len(chunk))
+                rows += self._conn.execute(
+                    f"SELECT * FROM {table} WHERE id IN ({marks})", chunk).fetchall()
+        return rows
 
     def subnets_by_ids(self, subnet_ids: list[int]) -> list[sqlite3.Row]:
         """subnet() for many ids in one query, for labeling a handful of

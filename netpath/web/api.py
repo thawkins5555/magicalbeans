@@ -483,7 +483,9 @@ def _id_list(raw) -> list[int] | None:
             out.append(int(piece))
         except ValueError:
             raise ValueError(f"device_ids must be a comma-separated list of ids, not {piece!r}")
-    return out
+    # Through the same reader as every POST body's list, so a GET that
+    # narrows a report by id obeys the one bulk cap too.
+    return _bulk_ids({"device_ids": out}, "device_ids", required=False)
 
 
 # ------------------------------------------------------------------ general
@@ -4909,15 +4911,31 @@ def delete_nodes_device(service, params, body, device_id) -> dict:
 BULK_DEVICE_ID_MAX = 50000
 
 
-def _bulk_device_ids(body) -> list[int]:
-    ids = body.get("device_ids") or []
+def _bulk_ids(body, key, cap=BULK_DEVICE_ID_MAX, *, required=True,
+              noun="devices") -> list[int]:
+    """The one reader for every `body[key]` that is a list of row ids: the
+    same cap, the same refusal wording and the same int coercion whether the
+    list names devices, alerts, backups or discovery results. `required`
+    is each route's own semantics, not a default: a bulk mute may name a
+    group instead of devices, so its list is optional, while a bulk delete
+    with no list has nothing to do."""
+    ids = body.get(key) or []
     if not ids:
-        raise ValueError("device_ids is required")
-    if len(ids) > BULK_DEVICE_ID_MAX:
+        if required:
+            raise ValueError(f"{key} is required")
+        return []
+    if len(ids) > cap:
         raise ValueError(
-            f"Too many devices in one request: {len(ids)}, limit is "
-            f"{BULK_DEVICE_ID_MAX}. Send them in batches.")
-    return [int(i) for i in ids]
+            f"Too many {noun} in one request: {len(ids)}, limit is "
+            f"{cap}. Send them in batches.")
+    try:
+        return [int(i) for i in ids]
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be a list of ids") from None
+
+
+def _bulk_device_ids(body) -> list[int]:
+    return _bulk_ids(body, "device_ids")
 
 
 def post_nodes_devices_bulk_update(service, params, body) -> dict:
@@ -6508,11 +6526,9 @@ def delete_nodes_discovery_job(service, params, body, job_id) -> dict:
 
 def post_nodes_discovery_promote(service, params, body, job_id) -> dict:
     _require(service.nodes_db.discovery_job(job_id), "discovery job")
-    result_ids = body.get("result_ids") or []
-    if not result_ids:
-        raise ValueError("result_ids is required")
+    result_ids = _bulk_ids(body, "result_ids", noun="discovery results")
     device_ids = service.node_poller.promote(
-        job_id, [int(r) for r in result_ids], force=bool(body.get("force")))
+        job_id, result_ids, force=bool(body.get("force")))
     service.log.add(NODES_CATEGORY,
                     f"Promoted {len(device_ids)} device(s) from discovery job #{job_id}")
     return {"device_ids": device_ids}
@@ -7070,28 +7086,28 @@ def _bulk_silence_device_ids(service, body) -> list[str]:
     (like _mute_entity above) a request that would end up silencing
     nothing. Shared by bulk mute and bulk maintenance mode: the two take the
     same scope, and only differ in what they then do with it."""
-    ids = {str(i) for i in (body.get("device_ids") or [])}
+    # Optional here, unlike every other bulk route: a group_id alone is a
+    # complete request, so an absent device_ids is not yet an error.
+    wanted = set(_bulk_ids(body, "device_ids", required=False))
     group_id = body.get("group_id")
     if group_id:
         try:
             group_id = int(group_id)
         except (TypeError, ValueError):
             raise ValueError("group_id must be a number")
-        ids |= {str(row["id"]) for row in
-               service.nodes_db.devices(device_group_id=group_id)}
-    if not ids:
+        wanted |= {int(row["id"]) for row in
+                  service.nodes_db.devices(device_group_id=group_id)}
+    if not wanted:
         raise ValueError("device_ids and/or group_id is required, naming at "
                          "least one device")
-    if len(ids) > BULK_DEVICE_ID_MAX:
+    # Re-checked on the union: the body's own list was capped above, but a
+    # group's membership is added after that.
+    if len(wanted) > BULK_DEVICE_ID_MAX:
         raise ValueError(
-            f"Too many devices in one request: {len(ids)}, limit is "
+            f"Too many devices in one request: {len(wanted)}, limit is "
             f"{BULK_DEVICE_ID_MAX}. Send them in batches.")
-    try:
-        wanted = {int(i) for i in ids}
-    except (TypeError, ValueError):
-        raise ValueError("device_ids must be device ids")
     present = {row["id"] for row in service.nodes_db.devices_by_ids(wanted)}
-    ids = _require([i for i in ids if int(i) in present], "device(s)")
+    ids = _require([str(i) for i in wanted if i in present], "device(s)")
     return sorted(ids, key=int)
 
 
@@ -7272,11 +7288,9 @@ def _window_body_fields(service, body) -> dict:
             fields["scope_group_id"] = int(group_id)
             fields["scope_device_ids"] = None
         elif scope_kind == "devices":
-            ids = body.get("scope_device_ids") or []
-            try:
-                wanted = {int(i) for i in ids}
-            except (TypeError, ValueError):
-                raise ValueError("scope_device_ids must be device ids")
+            # Optional at this layer: post_alerts_window's own required-field
+            # loop is what refuses a "devices" window naming none.
+            wanted = set(_bulk_ids(body, "scope_device_ids", required=False))
             present = {row["id"] for row in service.nodes_db.devices_by_ids(wanted)}
             missing = wanted - present
             if missing:
@@ -7331,14 +7345,7 @@ def post_alerts_ack_all(service, params, body) -> dict:
 
 
 def _bulk_alert_ids(body) -> list[int]:
-    ids = body.get("alert_ids") or []
-    if not ids:
-        raise ValueError("alert_ids is required")
-    if len(ids) > BULK_DEVICE_ID_MAX:
-        raise ValueError(
-            f"Too many alerts in one request: {len(ids)}, limit is "
-            f"{BULK_DEVICE_ID_MAX}. Send them in batches.")
-    return [int(i) for i in ids]
+    return _bulk_ids(body, "alert_ids", noun="alerts")
 
 
 def post_alerts_bulk_ack(service, params, body) -> dict:
@@ -8254,14 +8261,8 @@ def delete_configrx_backup(service, params, body, backup_id) -> dict:
 
 
 def post_configrx_backups_bulk_delete(service, params, body) -> dict:
-    ids = body.get("backup_ids") or []
-    if not ids:
-        raise ValueError("backup_ids is required")
-    if len(ids) > BULK_DEVICE_ID_MAX:
-        raise ValueError(
-            f"Too many backups in one request: {len(ids)}, limit is "
-            f"{BULK_DEVICE_ID_MAX}. Send them in batches.")
-    removed = service.configrx_db.delete_backups([int(i) for i in ids])
+    removed = service.configrx_db.delete_backups(
+        _bulk_ids(body, "backup_ids", noun="backups"))
     service.log.add(CONFIGRX_CATEGORY, f"Deleted {removed} stored config backup(s)")
     _audit(service, params, "configrx.backup_bulk_delete", target=f"{removed} backups")
     return {"ok": True, "removed": removed}

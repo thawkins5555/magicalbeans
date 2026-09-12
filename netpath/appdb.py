@@ -13,7 +13,7 @@ import sqlite3
 import time
 
 from . import sqlitebase
-from .sqlitebase import (LIKE_ESCAPE, SqliteStore, like_contains,
+from .sqlitebase import (LIKE_ESCAPE, SqliteStore, id_chunks, like_contains,
                          like_prefix, reclaim)
 
 log_module = logging.getLogger(__name__)
@@ -867,8 +867,7 @@ class AppDatabase(SqliteStore):
             return {}
         found: dict[str, str | None] = {}
         with self._lock:
-            for chunk in range(0, len(ips), 400):
-                batch = ips[chunk:chunk + 400]
+            for batch in id_chunks(ips):
                 marks = ",".join("?" * len(batch))
                 rows = self._conn.execute(
                     f"SELECT ip, hostname FROM hostnames WHERE ip IN ({marks})", batch
@@ -924,8 +923,7 @@ class AppDatabase(SqliteStore):
         cutoff = time.time() - (cache_ttl_s or HOSTNAME_TTL_S)
         known: set[str] = set()
         with self._lock:
-            for start in range(0, len(ips), 400):
-                batch = ips[start:start + 400]
+            for batch in id_chunks(ips):
                 marks = ",".join("?" * len(batch))
                 rows = self._conn.execute(
                     f"SELECT ip FROM hostnames WHERE ip IN ({marks})"
@@ -963,8 +961,7 @@ class AppDatabase(SqliteStore):
             return {}
         found: dict[str, tuple[int | None, str | None]] = {}
         with self._lock:
-            for chunk in range(0, len(ips), 400):
-                batch = ips[chunk:chunk + 400]
+            for batch in id_chunks(ips):
                 marks = ",".join("?" * len(batch))
                 rows = self._conn.execute(
                     f"SELECT ip, asn, org FROM asn_cache WHERE ip IN ({marks})",
@@ -982,8 +979,7 @@ class AppDatabase(SqliteStore):
         cutoff = time.time() - (cache_ttl_s or ASN_TTL_S)
         known: set[str] = set()
         with self._lock:
-            for start in range(0, len(ips), 400):
-                batch = ips[start:start + 400]
+            for batch in id_chunks(ips):
                 marks = ",".join("?" * len(batch))
                 rows = self._conn.execute(
                     f"SELECT ip FROM asn_cache WHERE ip IN ({marks})"

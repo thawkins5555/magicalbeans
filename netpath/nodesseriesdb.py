@@ -272,28 +272,37 @@ class NodesSeriesDatabase(SqliteStore):
         """Peak and mean of every matching metric series over [h0, h1], from
         samples_hourly — a raw scan wouldn't finish at fleet scale."""
         key_clause = "m.key LIKE ?" if like else "m.key = ?"
-        params: list = [key]
-        device_clause = ""
-        if device_ids:
-            marks = ",".join("?" * len(device_ids))
-            device_clause = f" AND m.device_id IN ({marks})"
-            params.extend(device_ids)
-        params.extend([h0, h1])
-        with self._lock:
-            return self._conn.execute(
-                f"WITH candidates AS ("
-                f" SELECT m.id AS metric_id, m.device_id, m.key, m.label, m.unit"
-                f" FROM metrics m WHERE {key_clause}{device_clause})"
-                f" SELECT c.metric_id, c.device_id, c.key, c.label, c.unit,"
-                f" MAX(sh.vmax) AS peak, SUM(sh.vavg * sh.n) AS sum_avg_n,"
-                f" SUM(sh.n) AS total_n, COUNT(*) AS n_hours"
-                # CROSS JOIN disables join reordering: forces small `candidates`
-                # to drive the loop instead of SQLite scanning samples_hourly
-                # from the hour index across unrelated metrics.
-                f" FROM candidates c CROSS JOIN samples_hourly sh"
-                f" ON sh.metric_id = c.metric_id"
-                f" WHERE sh.hour >= ? AND sh.hour <= ? GROUP BY c.metric_id",
-                params).fetchall()
+        # One pass per id chunk, concatenated: every output row is one
+        # metric's own aggregate, so splitting the narrowing list cannot
+        # merge or double-count anything. None/empty means "whole fleet",
+        # which is a single pass with no device clause at all.
+        chunks = (list(id_chunks(device_ids, self._IDS_PER_QUERY))
+                  if device_ids else [None])
+        rows: list[sqlite3.Row] = []
+        for chunk in chunks:
+            device_clause = ""
+            params: list = [key]
+            if chunk:
+                marks = ",".join("?" * len(chunk))
+                device_clause = f" AND m.device_id IN ({marks})"
+                params.extend(chunk)
+            params.extend([h0, h1])
+            with self._lock:
+                rows += self._conn.execute(
+                    f"WITH candidates AS ("
+                    f" SELECT m.id AS metric_id, m.device_id, m.key, m.label, m.unit"
+                    f" FROM metrics m WHERE {key_clause}{device_clause})"
+                    f" SELECT c.metric_id, c.device_id, c.key, c.label, c.unit,"
+                    f" MAX(sh.vmax) AS peak, SUM(sh.vavg * sh.n) AS sum_avg_n,"
+                    f" SUM(sh.n) AS total_n, COUNT(*) AS n_hours"
+                    # CROSS JOIN disables join reordering: forces small `candidates`
+                    # to drive the loop instead of SQLite scanning samples_hourly
+                    # from the hour index across unrelated metrics.
+                    f" FROM candidates c CROSS JOIN samples_hourly sh"
+                    f" ON sh.metric_id = c.metric_id"
+                    f" WHERE sh.hour >= ? AND sh.hour <= ? GROUP BY c.metric_id",
+                    params).fetchall()
+        return rows
 
     def series(self, device_id: int, metric_id: int, t0: float, t1: float,
                bucket_s: float = 0) -> list[dict]:
@@ -468,8 +477,7 @@ class NodesSeriesDatabase(SqliteStore):
             metric_ids = [row["id"] for row in
                           self._conn.execute("SELECT id FROM metrics").fetchall()]
         removed = 0
-        for start in range(0, len(metric_ids), max(1, chunk)):
-            batch = metric_ids[start:start + max(1, chunk)]
+        for batch in id_chunks(metric_ids, max(1, chunk)):
             marks = ",".join("?" * len(batch))
             with self._lock:
                 cursor = self._conn.execute(

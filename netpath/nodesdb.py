@@ -1867,8 +1867,7 @@ class NodesDatabase(SqliteStore):
             return []
         rows: list[sqlite3.Row] = []
         with self._lock:
-            for start in range(0, len(ids), self._IDS_PER_QUERY):
-                chunk = ids[start:start + self._IDS_PER_QUERY]
+            for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
                 marks = ",".join("?" * len(chunk))
                 rows += self._conn.execute(
                     f"SELECT * FROM devices WHERE id IN ({marks})", chunk).fetchall()
@@ -1883,8 +1882,7 @@ class NodesDatabase(SqliteStore):
         # ip -> (seen_ts, device_id) for alias-only hits; most-recent picked here, not in SQL.
         aliases: dict = {}
         with self._lock:
-            for start in range(0, len(wanted), self._IDS_PER_QUERY):
-                chunk = wanted[start:start + self._IDS_PER_QUERY]
+            for chunk in _id_chunks(wanted, self._IDS_PER_QUERY):
                 marks = ",".join("?" * len(chunk))
                 for row in self._conn.execute(
                         f"SELECT * FROM devices WHERE ip IN ({marks})", chunk):
@@ -1952,8 +1950,7 @@ class NodesDatabase(SqliteStore):
                 found: list[int] = []
                 # Chunked: SQLite's bound-variable limit is generous but not
                 # infinite, and a wide level can be thousands of ids.
-                for start in range(0, len(frontier), 500):
-                    batch = frontier[start:start + 500]
+                for batch in _id_chunks(frontier):
                     marks = ",".join("?" * len(batch))
                     for row in self._conn.execute(
                             f"SELECT id FROM devices WHERE upstream_id IN ({marks})"
@@ -2027,8 +2024,7 @@ class NodesDatabase(SqliteStore):
             return {}
         counts: dict = {}
         with self._lock:
-            for start in range(0, len(ids), self._IDS_PER_QUERY):
-                chunk = ids[start:start + self._IDS_PER_QUERY]
+            for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
                 marks = ",".join("?" * len(chunk))
                 for row in self._conn.execute(
                         "SELECT device_id, COUNT(*) AS n FROM interfaces"
@@ -2046,8 +2042,7 @@ class NodesDatabase(SqliteStore):
             return []
         rows: list[sqlite3.Row] = []
         with self._lock:
-            for start in range(0, len(ids), self._IDS_PER_QUERY):
-                chunk = ids[start:start + self._IDS_PER_QUERY]
+            for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
                 marks = ",".join("?" * len(chunk))
                 rows += self._conn.execute(
                     "SELECT device_id, if_index, descr, alias FROM interfaces"
@@ -2778,8 +2773,7 @@ class NodesDatabase(SqliteStore):
             return {}
         found: dict[int, list[sqlite3.Row]] = {}
         with self._lock:
-            for start in range(0, len(ids), self._IDS_PER_QUERY):
-                chunk = ids[start:start + self._IDS_PER_QUERY]
+            for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
                 marks = ",".join("?" * len(chunk))
                 rows = self._conn.execute(
                     f"SELECT * FROM device_addresses WHERE device_id IN ({marks})"
@@ -3541,8 +3535,7 @@ class NodesDatabase(SqliteStore):
             return []
         rows: list[sqlite3.Row] = []
         with self._lock:
-            for start in range(0, len(ids), self._IDS_PER_QUERY):
-                chunk = ids[start:start + self._IDS_PER_QUERY]
+            for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
                 marks = ",".join("?" * len(chunk))
                 rows += self._conn.execute(
                     self._NEIGHBOR_MATCH_SQL + f" WHERE n.device_id IN ({marks})"
@@ -3753,8 +3746,7 @@ class NodesDatabase(SqliteStore):
             return []
         rows: list[sqlite3.Row] = []
         with self._lock:
-            for start in range(0, len(ids), self._IDS_PER_QUERY):
-                chunk = ids[start:start + self._IDS_PER_QUERY]
+            for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
                 marks = ",".join("?" * len(chunk))
                 rows += self._conn.execute(
                     f"SELECT * FROM vlans WHERE device_id IN ({marks})"
@@ -3792,8 +3784,7 @@ class NodesDatabase(SqliteStore):
             return []
         rows: list[sqlite3.Row] = []
         with self._lock:
-            for start in range(0, len(ids), self._IDS_PER_QUERY):
-                chunk = ids[start:start + self._IDS_PER_QUERY]
+            for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
                 marks = ",".join("?" * len(chunk))
                 rows += self._conn.execute(
                     f"SELECT * FROM vlan_ports WHERE device_id IN ({marks})"
@@ -3818,8 +3809,7 @@ class NodesDatabase(SqliteStore):
             return []
         rows: list[sqlite3.Row] = []
         with self._lock:
-            for start in range(0, len(ids), self._IDS_PER_QUERY):
-                chunk = ids[start:start + self._IDS_PER_QUERY]
+            for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
                 marks = ",".join("?" * len(chunk))
                 rows += self._conn.execute(
                     f"SELECT * FROM port_vlans WHERE device_id IN ({marks})"
