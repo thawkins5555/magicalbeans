@@ -1192,6 +1192,115 @@ def test_a_truncated_neighbour_or_vlan_column_never_reaches_storage():
         db.close()
 
 
+def _counting_sessions(counts: dict):
+    """Patch nodepoll's _Session/credential_for to count opens, closes and
+    credential decrypts. Returns the restore callable."""
+    real_session, real_credential = nodepoll_mod._Session, nodepoll_mod.credential_for
+    counts.update(opened=0, closed=0, decrypts=0)
+
+    class CountingSession(real_session):
+        def __init__(self, *args, **kwargs):
+            counts["opened"] += 1
+            super().__init__(*args, **kwargs)
+
+        def close(self):
+            counts["closed"] += 1
+            return super().close()
+
+    def counting_credential(config):
+        counts["decrypts"] += 1
+        return real_credential(config)
+
+    nodepoll_mod._Session = CountingSession
+    nodepoll_mod.credential_for = counting_credential
+
+    def restore():
+        nodepoll_mod._Session = real_session
+        nodepoll_mod.credential_for = real_credential
+    return restore
+
+
+def test_the_custom_mib_read_opens_one_socket_and_decrypts_once():
+    """_custom_mib_values called _snmp_get per batch, and _snmp_get builds
+    its own _Session -- a fresh UDP socket, and on v3 a fresh credential
+    decrypt -- for each one. IP-MIB is 267 objects at 25 to a batch: eleven
+    ephemeral ports and twenty-two key derivations per device per poll, for
+    eleven round trips of actual work. _snmp_get_on exists for exactly
+    this, and _poll_interfaces has used it since its own fix."""
+    agent = _OneInterfaceAgent(if_speed=1_000_000_000, if_high_speed=1000,
+                               hc_out_answers=True)
+    agent.start()
+    db, poller, device = _walk_device("poller_review_mibsockets_", agent.port)
+    counts: dict = {}
+    restore = _counting_sessions(counts)
+    try:
+        oids = [f"1.3.6.1.4.1.9999.1.{index}.0" for index in range(267)]
+        values = poller._custom_mib_values(device, db.effective_config(device),
+                                           oids)
+        batches = -(-len(oids) // poller._CUSTOM_MIB_BATCH)
+        check(batches >= 10,
+              f"the read really is split into batches ({batches} of "
+              f"{poller._CUSTOM_MIB_BATCH})")
+        check(counts["opened"] == 1,
+              f"a 267-object MIB costs ONE UDP socket, not one per batch "
+              f"({counts['opened']} opened)")
+        check(counts["decrypts"] == 1,
+              f"...and one credential decrypt, not one per batch "
+              f"({counts['decrypts']} decrypts)")
+        check(counts["closed"] == counts["opened"],
+              f"...and the socket it did open is closed ({counts['closed']} "
+              f"of {counts['opened']})")
+        check(isinstance(values, dict),
+              f"the varbind map still comes back ({type(values).__name__})")
+    finally:
+        restore()
+        db.close()
+        agent.stop()
+
+
+def test_a_refused_credential_does_not_leak_the_interface_socket():
+    """_poll_interfaces opened its shared session and THEN read the
+    credential, both outside the try that closes it. credential_for refuses
+    a malformed credential by raising SnmpError -- a community carrying a
+    comma is the case that ships -- so every poll of a misconfigured device
+    leaked one UDP socket, for ever: nothing about a bad configuration
+    heals on its own."""
+    db = NodesDatabase(os.path.join(tmpdir("poller_review_ifleak_"), "nodes.db"))
+    counts: dict = {}
+    restore = _counting_sessions(counts)
+    try:
+        group_id = db.ensure_default_group()
+        device_id = db.add_device("127.0.0.1", "comma-community",
+                                  group_id=group_id, snmp_version=1,
+                                  ping_enabled=0, poll_interval_s=999,
+                                  snmp_timeout_s=0.3, snmp_retries=0)
+        # Written past clean_community, which refuses this at save time now.
+        with db._lock:
+            db._conn.execute("UPDATE devices SET community = ? WHERE id = ?",
+                             ("s3cret,alternate", device_id))
+            db._conn.commit()
+        poller = NodePoller(db)
+        poller.log = types.SimpleNamespace(
+            add=lambda category, message, target="", detail="": None)
+        device = db.device(device_id)
+        poller._walk_indexes = lambda device, config, oid, raise_on_timeout=False: (
+            [1, 2, 3], True, "")
+        raised = ""
+        try:
+            poller._poll_interfaces(device, db.effective_config(device))
+        except Exception as exc:
+            raised = type(exc).__name__
+        check(raised == "SnmpError",
+              f"a comma-bearing community still refuses the interface read "
+              f"({raised})")
+        check(counts["opened"] == counts["closed"],
+              f"...with no socket left open behind it ({counts['opened']} "
+              f"opened, {counts['closed']} closed)")
+    finally:
+        restore()
+        db.close()
+
+
 def test_deleting_a_device_drops_every_cache_keyed_on_it():
     """_forget_devices' own docstring says every per-device container is
     pruned. Five were not in its list, and _discovery_jobs was pruned
@@ -1296,6 +1405,8 @@ def main():
     test_an_unencodable_oid_does_not_freeze_the_device()
     test_a_truncated_mac_table_never_reaches_storage()
     test_a_truncated_neighbour_or_vlan_column_never_reaches_storage()
+    test_the_custom_mib_read_opens_one_socket_and_decrypts_once()
+    test_a_refused_credential_does_not_leak_the_interface_socket()
     test_deleting_a_device_drops_every_cache_keyed_on_it()
     test_a_refused_community_is_not_printed()
 

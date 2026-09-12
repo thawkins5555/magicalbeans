@@ -4520,20 +4520,34 @@ class NodePoller(Worker):
     def _custom_mib_values(self, device, config: dict,
                            instance_oids: list[str]) -> dict:
         """oid -> varbind for a whole MIB's scalars, in batches this device
-        has been shown to cope with."""
+        has been shown to cope with.
+
+        One session and one credential for the whole read, the way
+        _poll_interfaces holds its own: _snmp_get opens a socket per call
+        and re-decrypts the stored v3 password blob per call, so IP-MIB's
+        267 objects at 25 to a batch cost eleven ephemeral ports and
+        twenty-two key derivations per device per poll for a read that is
+        eleven round trips of work.
+        """
         device_id = device["id"]
         batch = self._get_batch.get(device_id) or self._CUSTOM_MIB_BATCH
         values: dict = {}
         index = 0
-        while index < len(instance_oids):
-            chunk = instance_oids[index:index + batch]
-            response = self._snmp_get(device, config, chunk)
-            if response.error_status == 1 and len(chunk) > 1:    # tooBig
-                batch = max(1, batch // 2)
-                self._get_batch[device_id] = batch
-                continue
-            values.update({vb["oid"]: vb for vb in response.varbinds})
-            index += len(chunk)
+        credential = credential_for(config)
+        session = self._session_for(device, config)
+        try:
+            while index < len(instance_oids):
+                chunk = instance_oids[index:index + batch]
+                response = self._snmp_get_on(session, device, config, chunk,
+                                             credential=credential)
+                if response.error_status == 1 and len(chunk) > 1:    # tooBig
+                    batch = max(1, batch // 2)
+                    self._get_batch[device_id] = batch
+                    continue
+                values.update({vb["oid"]: vb for vb in response.varbinds})
+                index += len(chunk)
+        finally:
+            session.close()
         return values
 
     # Without a budget, a device the walk enumerated but whose
@@ -4687,8 +4701,15 @@ class NodePoller(Worker):
         # one of each per interface: a 512-port chassis otherwise opens
         # 512 ephemeral UDP ports and re-decrypts the stored v3 password
         # 512 times, per device, per poll.
-        session = self._session_for(device, config)
+        #
+        # The credential FIRST: credential_for refuses a malformed one
+        # (a community carrying a comma, a v3 blob that will not decrypt)
+        # by raising SnmpError, and raised between the socket opening and
+        # the try that closes it, that leaked the socket on every poll of
+        # a misconfigured device — for ever, since nothing about the
+        # configuration heals on its own.
         credential = credential_for(config)
+        session = self._session_for(device, config)
         try:
             for if_index in wanted:
                 if time.time() > deadline:
