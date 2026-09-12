@@ -367,5 +367,21 @@ the accent, hot pink for fail, lime for ok, yellow for warn.
   CREDENTIAL-SECURITY prose).
 → Tier 2: eight of eleven landed (nodes.refresh split, drawRows, window
   helpers, escaping contract, mapper_upstream split, drain contract,
-  PREDICATES, best_effort); histogram dedup, WEB-P3 and API-P2/P3 still in
-  flight.
+  PREDICATES, best_effort); histogram dedup, WEB-P3 and API-P2/P3 landed
+  after that note. API-P3's contract found `_discovery_result_json` handing
+  the SNMP community to read-only accounts; fixed.
+→ Review (Bob, after Javariius hit the account's Fable quota): two fixes —
+  an access-denied optional SNMP read is not a credential verdict, and a
+  body field naming a missing device stays a 400. Comment prose trimmed
+  from 25% to 18% of added lines.
+→ Suites: 153. The first full run was killed for memory at 121 with
+  agents still alive; the other 32 ran individually. 141 pass, 1 skipped
+  (no PySide6), 11 fail identically on the pristine base or on this
+  cp1252 console (palo_alto_polling, prune_lock_hold, selfupdate_job,
+  service_shutdown, snmpv3_diagnostics, snmpv3_keys, snmpv3_priv_e2e,
+  https_check, ipam_dhcp_temp, temppath, wireless_radio_events). Eight
+  suites needed 400→404 updated for the new not-found path, one fake
+  service needed a permissions stub.
+→ Walk: 932 steps, 887 ok, 45 planned skips, 0 failed; the 40 console
+  errors are the viewer/NOC 403s the matrix provokes, the 3 page errors
+  are on paths this release did not touch.

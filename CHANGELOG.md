@@ -257,10 +257,16 @@ queries, a generation scheme for the `replace_*` writers, a real
 each recorded against a future release rather than built against this
 one.
 
-Two suites, `tests/test_snmpv3_diagnostics.py` and
-`tests/test_palo_alto_polling.py`, were verified failing on a pristine
-base worktree before any of this work started, independently of it —
-pre-existing. And two items handed to this wave as findings needed
+Eleven suites fail identically on a pristine base worktree or on this
+cp1252 console, independently of any of this work — `snmpv3_diagnostics`,
+`palo_alto_polling`, `selfupdate_job`, `temppath`, `https_check`,
+`ipam_dhcp_temp`, `service_shutdown`, `prune_lock_hold`, `snmpv3_keys`,
+`snmpv3_priv_e2e`, `wireless_radio_events` — and the other 141 pass (one
+skips for want of PySide6). The browser walk ran its full matrix: 932
+steps, none failed. The review's two fixes are in: an access-denied
+optional SNMP read is swallowed as before rather than re-raised as a
+credential verdict, and a body field naming a missing device stays a
+400 while only the addressed resource answers 404. And two items handed to this wave as findings needed
 nothing: WEB-P1 (one `Content-Length` verdict shared by both body-length
 checks) and API-P1 (`_window`/`_hist_window` sharing one implementation)
 were already implemented by the time this review reached them.
