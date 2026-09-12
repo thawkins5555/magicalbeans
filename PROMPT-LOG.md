@@ -278,5 +278,9 @@ export gained `resolved_name` and `resolved_source`, and MAPPER's own
 matching SQL is untouched. `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`
 and `RUNBOOK.md` are updated to match. The full test suite and the browser
 walk, then a code review of the day's changes, follow once at the end, as
-the standing constraint requires — counts and findings appended here when
-they complete.
+the standing constraint requires. The suite: 141 of 142 passed, 9 skipped
+for optional dependencies (paramiko, PySide6), the one failure the
+pre-existing `test_prune_lock_hold.py` lock-fairness flake recorded since
+5.9.0. The review's findings are in `CODE-REVIEW.md`. (The container
+restarted while the first run of this suite was waiting on its slowest
+member; the counts above are from the re-run that followed.)
