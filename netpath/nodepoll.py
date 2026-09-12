@@ -3778,22 +3778,54 @@ class NodePoller(Worker):
         silent for the same reason the UCD-SNMP read below is: not answering
         is the normal case, not an error.
         """
+        return self._identity_extras_detail(device, config, oids)[0]
+
+    def _identity_extras_detail(self, device, config: dict,
+                                oids: list[str]) -> tuple:
+        """(answers, whether the GET itself got a reply).
+
+        The second element is _identity_extras' own missing distinction: an
+        empty dict is both "the device answered, and implements none of
+        these" and "the request drew nothing at all". Most callers are
+        right not to care — either way there is nothing to use — but one
+        of them writes NULL over a stored column on the strength of it.
+        See _poll_software_version.
+        """
         if not oids:
-            return {}
+            return {}, True
         try:
             response = self._snmp_get(device, config, oids)
         except SnmpError:
-            return {}
-        return {vb["oid"]: vb["value"] for vb in response.varbinds
-                if vb["type"] not in ("noSuchObject", "noSuchInstance",
-                                      "endOfMibView")}
+            return {}, False
+        return ({vb["oid"]: vb["value"] for vb in response.varbinds
+                 if vb["type"] not in ("noSuchObject", "noSuchInstance",
+                                       "endOfMibView")}, True)
 
     def _poll_software_version(self, device, config: dict, identity: dict) -> dict:
-        """`sw_version`/`sw_image`/`sw_image_file` for the identity dict, via one extra GET."""
+        """`sw_version`/`sw_image`/`sw_image_file` for the identity dict, via
+        one extra GET — or NOTHING AT ALL when this poll learned nothing.
+
+        update_from_poll writes these three "only when the poll actually
+        read them, NULL included", which it decides on the keys being
+        present. Returning all three unconditionally made that guard
+        meaningless: _identity_extras swallows an SnmpError and returns
+        {}, so one timed-out vendor GET wrote NULL over a stored version.
+        On MikroTik, Palo Alto, UniFi and Extreme, where the version comes
+        only from the vendor OID and never from sysDescr, that is the
+        firmware column emptying on a single lost datagram and filling
+        again on the next poll.
+
+        So: keys omitted when the vendor GET drew no reply AND the sysDescr
+        rule found no version either. A device that genuinely ANSWERED with
+        nothing still writes NULL — that is a real change of fact, and the
+        column should follow it.
+        """
         arc = identity.get("vendor_arc")
-        scalars = self._identity_extras(device, config,
-                                        list(swversion.oids_for(arc)))
+        oids = list(swversion.oids_for(arc))
+        scalars, answered = self._identity_extras_detail(device, config, oids)
         info = swversion.extract(arc, identity.get("sys_descr") or "", scalars)
+        if oids and not answered and not info.source:
+            return {}
         return {"sw_version": info.version or None, "sw_image": info.image or None,
                 "sw_image_file": info.image_file or None}
 

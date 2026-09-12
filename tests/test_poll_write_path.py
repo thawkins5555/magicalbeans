@@ -334,6 +334,91 @@ def pool_and_walks():
         proc.kill()
 
 
+def software_version_survives_a_lost_vendor_get():
+    """_poll_software_version returned all three sw_* keys whatever
+    happened, so update_from_poll's "only set when the poll actually read
+    them" guard -- which decides on the keys being PRESENT -- could never
+    decline. _identity_extras swallows an SnmpError and returns {}, so one
+    timed-out vendor GET wrote NULL over a stored version. On the vendors
+    whose version comes only from the vendor OID and never from sysDescr
+    (MikroTik, Palo Alto, UniFi, Extreme) that is the firmware column
+    emptying on a lost datagram and filling again next poll."""
+    print("\n-- a lost vendor GET does not empty the firmware column")
+
+    proc, port = spawn_stub("stub_agent_vendor_health.py", "cisco")
+    try:
+        nodepoll_mod.DEFAULT_SNMP_PORT = port
+        db = NodesDatabase(os.path.join(TMPDIR, "sw_lost_get.db"))
+        group_id = db.ensure_default_group()
+        device_id = db.add_device(
+            "127.0.0.1", "sw-keep", group_id=group_id,
+            snmp_version=1, community="public", ping_enabled=0,
+            poll_interval_s=999, snmp_timeout_s=1.0, snmp_retries=1)
+        poller = NodePoller(db)
+        _poll_once(poller, db, device_id)
+        stored = db.device(device_id)["sw_version"]
+        check(bool(stored),
+              f"the first poll stores a version to lose ({stored!r})")
+
+        device = db.device(device_id)
+        config = db.effective_config(device)
+        identity, _uptime, _metrics = poller._poll_snmp_scalars(device, config)
+        # A device whose version comes only from the vendor OID: no sysDescr
+        # rule can stand in for the GET that just failed.
+        identity = {**identity, "sys_descr": "", "vendor_arc": "1.3.6.1.4.1.14988"}
+        real_get = poller._snmp_get
+
+        def timing_out(*args, **kwargs):
+            raise nodepoll_mod.SnmpTimeout("no reply")
+
+        poller._snmp_get = timing_out
+        try:
+            fields = poller._poll_software_version(device, config, identity)
+        finally:
+            poller._snmp_get = real_get
+        check(fields == {},
+              f"a vendor GET that drew no reply reports NOTHING, so the guard "
+              f"in update_from_poll can decline ({fields})")
+
+        _record(db, device_id, {**identity, **fields})
+        check(db.device(device_id)["sw_version"] == stored,
+              f"...and the stored version survives the failed poll "
+              f"({db.device(device_id)['sw_version']!r} was {stored!r})")
+
+        # A device that genuinely ANSWERS with nothing is a real change of
+        # fact, and still clears the column.
+        poller._snmp_get = lambda *a, **kw: _EmptyResponse()
+        try:
+            fields = poller._poll_software_version(device, config, identity)
+        finally:
+            poller._snmp_get = real_get
+        check(fields == {"sw_version": None, "sw_image": None,
+                         "sw_image_file": None},
+              f"a device that answers with nothing still reports NULLs "
+              f"({fields})")
+        _record(db, device_id, {**identity, **fields})
+        check(db.device(device_id)["sw_version"] is None,
+              f"...and the column follows it "
+              f"({db.device(device_id)['sw_version']!r})")
+        poller.shutdown()
+        db.close()
+    finally:
+        proc.kill()
+
+
+class _EmptyResponse:
+    """A Response the device really did send, carrying no usable object."""
+    error_status = 0
+    varbinds: list = []
+
+
+def _record(db, device_id: int, identity: dict) -> None:
+    """One successful poll's device-row write, identity and all."""
+    db.record_poll(device_id, ping_ok=None, ping_rtt_ms=None, snmp_ok=True,
+                   snmp_error="", identity=identity, uptime_ticks=None,
+                   status="up", reachable=True)
+
+
 def ipv6_polling():
     """§4.1 N3: AF_INET was hardcoded in _Session and in the discovery
     probe, and tracer.resolve used the IPv4-only gethostbyname, so an
@@ -977,6 +1062,7 @@ def main():
     interface_reads()
     vendor_health()
     software_version()
+    software_version_survives_a_lost_vendor_get()
     ipv6_polling()
     pool_and_walks()
     request_matching()
