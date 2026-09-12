@@ -1,6 +1,391 @@
-# SappiWhere 5.9.1 — Full code review
+# SappiWhere — Code review reports
 
-## Summary
+Newest first. Each section is one review: its scope, its findings and what was done about them.
+
+## 5.11.0 — Review of the day's branches
+
+### Summary
+
+This section covers every commit made to any branch on 2026-09-11: the 5.9.1
+review-and-fix session on `main` (`f4c7bc4..dc4ad11`, reviewed here at a lighter
+consistency-pass depth over the fix commits themselves), the 5.10.0 release on
+today's branch (`dc4ad11..48daab6`, full depth), and the 5.11.0 lanes that
+followed (after `e8291e2`, full depth). Three reviewers worked by area — R1
+backend (nodepoll, api.py, db.py, the mute and HTTPS-check lanes), R2 frontend
+(debug.js, netpath.js, alerts.js, nodes.js), and R3 a consistency pass checking
+the 5.9.1 fix commits against their own claims, the tests that were supposed to
+prove them, and `CODE-REVIEW.md`/`INTERNALS.md`/`FEATURES.md`/`CHANGELOG.md`
+against the code they describe. As in the 5.9.1 review, every finding had to be
+verified against the code before acceptance — a `path:line` or, where the
+reviewer's note gives only a symbol, that symbol — before it was accepted into
+this list; nothing here is a raw grep hit.
+
+The three reports carry **34 findings — 5 high, 9 medium, 20 low** — plus **6
+documentation-drift items** from R3's pass over the docs that describe the
+5.9.1 fixes. R1 found 5 (1 medium, 4 low) in this session's backend lanes; R2
+found 7 (1 high, 3 medium, 3 low) in this session's frontend lanes; R3 found 22
+(4 high, 5 medium, 13 low) plus the 6 doc-drift items in the 5.9.1 fix commits
+already on `main`. One of R3's findings (#7, a Windows test ordering flake) was
+already fixed by the lead in `f228dbc` before this pass started, and is marked
+accordingly rather than assigned to a lane. Every finding below is fixed, each
+with a test shown to fail before its fix and pass after.
+
+---
+
+### Findings
+
+34 findings, sorted by severity and then by area. Status: *Fixed (lane F1/F2/F3)*
+— landed by the file-owned fixer lane the reviewer's note names; *Fixed (lead)*
+— landed by the lead outside the lanes.
+
+| ID | Sev | Lens | Finding | Where | Status |
+|---|---|---|---|---|---|
+| R2-H1 | high | performance | A paused Debug page re-downloads the whole ring every second | `netpath/web/static/debug.js:476` | Fixed (lane F3) |
+| R3-H1 | high | correctness | MAC FDB walk truncation stored as a complete table | `netpath/nodepoll.py` — `read_device_mac_table`, `_walk_column`, `replace_mac_entries` | Fixed (lane F1) |
+| R3-H2 | high | correctness, design | `snmptrapdb` search is still raw LIKE; three docs claim otherwise | `netpath/snmptrapdb.py` — `_where`, `_scan_clause` | Fixed (lane F2) |
+| R3-H3 | high | correctness | ConfigRX's nested-repetition guard refuses legitimate fixed-repeat regexes | `netpath/configrx_compliance.py` — `_has_nested_repetition` | Fixed (lane F2) |
+| R3-H4 | high | security | Four `record_notification` call sites still store the raw webhook URL | `netpath/alertengine.py` — `record_notification` (rate-limited, queue-full, digest ×2) | Fixed (lane F2) |
+| R1-M1 | medium | performance | `_resolve_neighbor_names` does up to 4 statements and 3 lock holds per IP-only neighbour, on a pane re-fetched every tick | `netpath/web/api.py` — `_resolve_neighbor_names` | Fixed (lane F3) |
+| R2-M1 | medium | correctness | An unguarded HTTPS-availability fetch takes the whole Routes pane offline on failure | `netpath/web/static/netpath.js:1435` | Fixed (lane F3) |
+| R2-M2 | medium | design | Device-wide and per-rule mutes share one "muted" tag with no distinguishing title | `netpath/web/static/alerts.js:261` — `mutedTagFor` | Fixed (lane F3) |
+| R2-M3 | medium | correctness | Pre-5.10.0 stored `detail_fields` hides the new software/image header lines after upgrade | `netpath/web/static/nodes.js:1048` (and `nodesdb`) | Fixed (lane F3) |
+| R3-M1 | medium | correctness | A device deleted elsewhere on a multi-page fleet stays selected; detail 404s every tick with a banner that never clears | `netpath/web/static/nodes.js` (FE-F1 regression) | Fixed (lane F3) |
+| R3-M2 | medium | security | A third unthrottled `log.add` in the flow collector logs one event per template | `netpath/collector.py` — "Received N template(s)" | Fixed (lane F1) |
+| R3-M3 | medium | correctness | `test_alert_engine.py` B13b red on Windows: tie-ordered `conflicts()` | `tests/test_alert_engine.py` — B13b | Fixed (lead, f228dbc) |
+| R3-M4 | medium | maintainability | An aborted API response inside `_route`'s try still prints a traceback and attempts a second 500 | `netpath/web/server.py` — `_route` | Fixed (lane F2) |
+| R3-M5 | medium | security | `has_community` is computed into the trap JSON but never rendered; a read-only account sees a blank column instead of the redaction it was meant to get | `netpath/web/api.py` — trap JSON, `has_community` | Fixed (lane F3) |
+| R1-L1 | low | security | `_validate_target_url` accepts userinfo it can never reject; the password lands in `https_checks.error`/`https_error` for any `netpath:read` account and in the debug log | `netpath/web/api.py` — `_validate_target_url`; `netpath/monitor.py:980` | Fixed (lane F3) |
+| R1-L2 | low | correctness | `_poll_software_version` always returns all keys, so one timed-out vendor GET NULLs a stored `sw_version` | `netpath/nodepoll.py` — `_poll_software_version` | Fixed (lane F1) |
+| R1-L3 | low | design | `_prune_https_checks` shares the exhausted trace-sweep deadline, so `https_checks` can grow past retention indefinitely | `netpath/db.py` — `_prune_https_checks` | Fixed (lane F2) |
+| R1-L4 | low | maintainability | `_mute_entity`'s third return value is discarded by both callers | `netpath/web/api.py` — `_mute_entity` | Fixed (lane F3) |
+| R2-L1 | low | correctness | A restart resync drops the destination filter while Debug is paused | `netpath/web/static/debug.js:427` | Fixed (lane F3) |
+| R2-L2 | low | design | A DNS-resolved neighbour's IP is reachable only via a title attribute on a span, invisible to assistive tech | `netpath/web/static/nodes.js:3005` | Fixed (lane F3) |
+| R2-L3 | low | correctness | A deep link opened before rules load shows a false "rule no longer in the list" reason for one poll interval | `netpath/web/static/alerts.js:531` | Fixed (lane F3) |
+| R3-L1 | low | design | `server.stop()` waits on connections, not requests; masked today by a fixed 2 s sleep under keep-alive | `netpath/web/server.py` — `stop()` | Fixed (lane F2) |
+| R3-L2 | low | security | `get_debug`'s summary gates scheduler/`workers_total` to `False`/`0` for `debug:read`, hiding real health from a role meant to see it | `netpath/web/api.py` — `get_debug` | Fixed (lane F3) |
+| R3-L3 | low | maintainability | The API-F10 `wsock` fix's test skips on Windows, so the regression it guards is unverified there | `tests/` — API-F10 wsock test | Fixed (lane F1) |
+| R3-L4 | low | maintainability | The WEB-F8 secretstore fix's test is a literal `True` on Windows/non-root, asserting nothing | `tests/` — WEB-F8 secretstore test | Fixed (lane F2) |
+| R3-L5 | low | correctness | The ALRT-F16 syslog lock-safety test passes even with the lock removed; four counters are still unguarded | `netpath/syslogd.py` — ALRT-F16 fix and its test | Fixed (lane F2) |
+| R3-L6 | low | performance | `_custom_mib_values` opens a session per batch, undoing POLL-F5's per-cycle credential decrypt fix | `netpath/nodepoll.py` — `_custom_mib_values` | Fixed (lane F1) |
+| R3-L7 | low | correctness | `_poll_interfaces` leaks its socket if `credential_for` raises | `netpath/nodepoll.py` — `_poll_interfaces` | Fixed (lane F1) |
+| R3-L8 | low | correctness | `_walk_settings` is never refreshed while polling is disabled | `netpath/nodepoll.py` — `_walk_settings` | Fixed (lane F1) |
+| R3-L9 | low | correctness | The POLL-F2 fix's arm reports any `ValueError` as an OID fault, over-broad for the negative-arc case it targets | `netpath/trapdecode.py` — POLL-F2 fix | Fixed (lane F1) |
+| R3-L10 | low | performance | `configrxdb.search_fts_match`/`all_search_lines` still pass unchunked IN lists | `netpath/configrxdb.py` — `search_fts_match`, `all_search_lines` | Fixed (lane F2) |
+| R3-L11 | low | maintainability | `test_frontend_contracts.py` section 48 uses a bare `.index()`, so a missing pin fails with an unhelpful `ValueError` | `tests/test_frontend_contracts.py` — §48 | Fixed (lane F3) |
+| R3-L12 | low | maintainability | `wsock._drain`'s `_poll_readable` result is computed and discarded | `netpath/web/wsock.py` — `_drain` | Fixed (lane F1) |
+| R3-L13 | low | design | The flow-collector throttle key is global with no suppressed-count surfaced, so a burst across many templates is invisible in the metric | `netpath/collector.py` — throttle keys | Fixed (lane F1) |
+
+---
+
+#### High
+
+**R2-H1 (high, performance).** `debug.js:476` advances the read cursor only
+when the page is not paused, but the poll that fetches new events keeps
+running regardless. R2's note sizes the ring at "10,000 default / 50,000
+max," so a Debug tab left paused re-requests the same growing window every
+second: "~2–10 MB/s per paused tab." Nothing stops a bookmark or an idle
+browser tab from staying paused for hours. Fixed: gate the fetch itself on
+the pause state, not just the cursor advance. Fixed (lane F3).
+
+**R3-H1 (high, correctness).** The MAC FDB walk treats a truncated table as
+complete: `read_device_mac_table` calls `_walk_column` and discards the
+`complete` flag it returns, the default deadline is derived from
+`poll_interval_s` rather than the (typically longer) `mac_table_interval_s`,
+and `replace_mac_entries` then marks every row the walk didn't reach as
+absent. On a switch with a large FDB and a short poll interval, entries
+flicker present/absent on nothing but the poller's own timing. Fixed: honour
+`complete`, size the deadline off the right interval, and stop treating a
+partial walk as ground truth. Fixed (lane F1).
+
+**R3-H2 (high, correctness, design).** `snmptrapdb`'s `_where` (source, OID,
+community) and `_scan_clause` still build raw `LIKE` predicates from operator
+search text — the exact class of defect DATA-F5 fixed everywhere else in
+5.9.1. Three documents say otherwise: `CODE-REVIEW.md:77` and `:684` claim it
+was fixed, `INTERNALS.md:436` lists `configrxdb` instead of `snmptrapdb` for
+the same fix, and `FEATURES.md:2591` repeats the false claim. An operator
+searching trap history for `50%` gets the LIKE-metacharacter behaviour DATA-F5
+was supposed to close everywhere. Fixed (lane F2), with the three docs
+corrected alongside (R3-D1, R3-D2).
+
+**R3-H3 (high, correctness).** ConfigRX's `_has_nested_repetition` — added to
+close ALRT-F2's backtracking exposure — refuses any regex with a fixed-repeat
+group, which is exactly the shape of the vendored MAC, IPv6 and FQDN
+patterns. The fail-closed path that results carries no reason string, and
+`configrx.py` drops the offending ignore pattern silently, so an operator
+who adds one of those patterns gets quiet non-enforcement with no error
+anywhere. Fixed: narrow the heuristic to the actual backtracking shape and
+surface why a pattern was refused. Fixed (lane F2).
+
+**R3-H4 (high, security).** ALRT-F9 was meant to stop the webhook URL and its
+headers being stored in the clear, but `alertengine.py`'s `record_notification`
+is called from four sites — the rate-limited path, the queue-full path, and
+the digest path twice — and all four still pass the raw URL through.
+`CODE-REVIEW.md:83` credits the fix as complete. Any of those four paths
+writing a notification row leaves the webhook's credentials-bearing URL
+readable by anyone with access to the alerts store. Fixed (lane F2), with
+`CODE-REVIEW.md:83` corrected (R3-D4).
+
+#### Medium
+
+**R1-M1 (medium, performance).** `_resolve_neighbor_names` in `api.py` takes
+up to 4 statements and 3 lock holds per IP-only neighbour address, and the
+Neighbours pane that calls it re-fetches every tick. R1's note sizes this at
+"400 neighbours → 1200 statements, 800 lock waits" for one refresh of one
+pane on one busy device. Fixed: batch the address lookup into one query
+rather than one per address. Fixed (lane F3).
+
+**R2-M1 (medium, correctness).** The new per-destination HTTPS check
+(`/api/netpath/https`) is fetched alongside the Routes pane's essential
+fetches with no isolation; `netpath.js:1435` lets its failure propagate and
+take the rest of the pane offline with it, so one unreachable HTTPS
+destination degrades routes that have nothing to do with it. Fixed: guard
+the HTTPS fetch so its failure doesn't cascade. Fixed (lane F3).
+
+**R2-M2 (medium, design).** `mutedTagFor` (`alerts.js:261`) renders the same
+"muted" tag for a device-wide mute and the new per-alert (`device_rule`) mute,
+with no title distinguishing them. An operator scanning the Alerts list can't
+tell whether a tag means the whole device is muted or just this one rule.
+Fixed: distinct tag text or a title attribute per mute scope. Fixed (lane F3).
+
+**R2-M3 (medium, correctness).** `nodes.js:1048` and `nodesdb` read a stored
+`detail_fields` value from before 5.10.0's software/image header lines
+existed; on an upgraded install that old value hides the new header rows
+rather than showing them alongside the fields the operator already had
+configured. Fixed: a one-time settings migration that adds the new fields to
+any pre-5.10.0 stored list. Fixed (lane F3).
+
+**R3-M1 (medium, correctness).** This is the FE-F1 regression: on a fleet
+spanning more than one page, a device deleted elsewhere stays selected in
+the UI, its detail fetch 404s on every refresh tick, and the resulting stale
+banner never clears because nothing in the refresh path treats a 404 as
+"deselect." Fixed (lane F3).
+
+**R3-M2 (medium, security).** `collector.py` has a third unthrottled
+`log.add` call — "Received N template(s)" — alongside the two ALRT-F1/ALRT-F8
+already throttled. 500 identical NetFlow templates in a burst produce 500
+log events, the same log-flooding shape those two findings closed elsewhere
+in the same file. Fixed (lane F1).
+
+**R3-M3 (medium, correctness).** `tests/test_alert_engine.py`'s case B13b
+failed on Windows because `conflicts()` doesn't order tie-broken results
+deterministically. Already fixed by the lead in `f228dbc`, ahead of and
+outside this review's fix lanes. Fixed (lead, f228dbc).
+
+**R3-M4 (medium, maintainability).** An API response aborted inside
+`_route`'s try block still falls through to print a full traceback and
+attempt to send a second 500 on a connection that's already gone — the same
+family of defect WEB-F5 fixed for the plain-write path, left unfixed for
+this one. Fixed (lane F2).
+
+**R3-M5 (medium, security).** The trap JSON response computes `has_community`
+but never renders it anywhere in the payload, so a read-only account sees a
+blank column instead of the redaction indicator the field exists to provide.
+`CHANGELOG.md`'s sentence describing this behaviour is therefore also wrong
+(R3-D6). Fixed (lane F3).
+
+#### Low
+
+**R1-L1 (low, security).** `_validate_target_url` accepts a URL with
+userinfo but its check can never actually succeed against one, so the
+password in a URL like `https://user:pass@host/` lands in
+`https_checks.error` and `https_error` — both readable by any `netpath:read`
+account — and in the debug log via `monitor.py:980`. Fixed (lane F3).
+
+**R1-L2 (low, correctness).** `_poll_software_version` always returns every
+key it's asked for, including ones the device didn't answer, so one
+timed-out vendor GET on a multi-field poll NULLs a previously-stored
+`sw_version` — the exact behaviour the comment in `nodesdb.update_from_poll`
+says should not happen. Fixed (lane F1).
+
+**R1-L3 (low, design).** `_prune_https_checks` shares its deadline with the
+trace-sweep prune it runs alongside, and that deadline is routinely
+exhausted before `https_checks` gets its turn, so the table can grow past its
+configured retention indefinitely rather than just occasionally lagging.
+Fixed (lane F2).
+
+**R1-L4 (low, maintainability).** `_mute_entity`'s third return value is
+computed and then discarded by both of its callers — dead signal, not a
+defect with a runtime scenario, but wasted work on a hot mute path. Fixed
+(lane F3).
+
+**R2-L1 (low, correctness).** Restarting the Debug log's poll resyncs the
+cursor but drops whatever destination filter the operator had set while
+paused, so unpausing shows the unfiltered stream until the filter is
+re-applied by hand. Fixed (lane F3).
+
+**R2-L2 (low, design).** A DNS-resolved neighbour's IP address is exposed
+only through a `title` attribute on a `<span>` — invisible to a screen
+reader and to anyone who doesn't hover. Fixed (lane F3).
+
+**R2-L3 (low, correctness).** Opening an alert deep link before the rules
+list has finished loading shows a false "rule no longer in the list" reason
+for the one poll interval before rules arrive, misleading anyone following a
+notification link. Fixed (lane F3).
+
+**R3-L1 (low, design).** `server.stop()` waits on connections rather than
+in-flight requests, per WEB-F11; today that's masked by a fixed 2-second
+sleep under keep-alive, and the D25 test pins the degenerate case rather
+than the general one. Fixed (lane F2).
+
+**R3-L2 (low, security).** `get_debug`'s summary gates `scheduler` and
+`workers_total` to `False`/`0` for a `debug:read`-only account, so that role
+sees a falsely unhealthy summary instead of the real (permitted) values.
+Fixed (lane F3).
+
+**R3-L3 (low, maintainability).** The API-F10 `wsock` fix shipped with a test
+that skips on Windows, so the unsafe-`select` regression it guards against
+is unverified on a shipping platform. Fixed (lane F1).
+
+**R3-L4 (low, maintainability).** The WEB-F8 secretstore ownership-check fix
+shipped with a test that is a literal `True` on Windows or when not running
+as root, asserting nothing on the platforms where it runs in CI. Fixed
+(lane F2).
+
+**R3-L5 (low, correctness).** The ALRT-F16 syslog lock-safety test passes
+even with the lock it's meant to verify removed; four rate-bucket counters
+in `syslogd.py` remain unguarded against concurrent mutation. Fixed
+(lane F2).
+
+**R3-L6 (low, performance).** `_custom_mib_values` opens a new session per
+batch, which undoes the per-poll-cycle credential-decrypt consolidation
+POLL-F5 shipped in 5.9.1 for this same code path. Fixed (lane F1).
+
+**R3-L7 (low, correctness).** `_poll_interfaces` leaks its socket when
+`credential_for` raises before the socket is closed — a resource leak on an
+error path rather than the happy path POLL-F5 optimised. Fixed (lane F1).
+
+**R3-L8 (low, correctness).** `_walk_settings` is read once and never
+refreshed while polling is disabled, so a setting changed during a pause
+doesn't take effect until the next full poll cycle after re-enabling. Fixed
+(lane F1).
+
+**R3-L9 (low, correctness).** POLL-F2's arm reports any `ValueError` at all
+as an OID fault, which is broader than the negative-arc case it was written
+to catch and can mask an unrelated bug behind the same fault message. Fixed
+(lane F1).
+
+**R3-L10 (low, performance).** `configrxdb.search_fts_match` and
+`all_search_lines` still build unchunked `IN` lists, the same shape DATA-F7
+moved everywhere else in the store onto `sqlitebase.id_chunks`. Fixed
+(lane F2).
+
+**R3-L11 (low, maintainability).** `test_frontend_contracts.py` section 48
+uses a bare `.index()` to find its pin, so a missing or moved pin fails with
+an unhelpful `ValueError` instead of a message naming what wasn't found.
+Fixed (lane F3).
+
+**R3-L12 (low, maintainability).** `wsock._drain`'s `_poll_readable` call is
+made and its result discarded — dead work left behind by the API-F10 fix
+rather than a correctness bug. Fixed (lane F1).
+
+**R3-L13 (low, design).** The flow collector's log-throttle key is global
+across all templates with no suppressed-event counter, so a burst spread
+across many distinct templates produces no visible signal that anything was
+throttled at all. Fixed (lane F1).
+
+---
+
+### Documentation drift (R3)
+
+R3's pass compared `CODE-REVIEW.md`, `INTERNALS.md`, `FEATURES.md` and
+`CHANGELOG.md` against the code the 5.9.1 fixes actually shipped. Six places
+where the documentation and the code disagree:
+
+| ID | Doc | Claim vs. code | Status |
+|---|---|---|---|
+| R3-D1 | `INTERNALS.md:436-440` | Lists `configrxdb` as having the LIKE-escaping fix and omits `snmptrapdb`, which is the module that still needs it (R3-H2) | Fixed (lane F2) |
+| R3-D2 | `FEATURES.md:2591-2594` | Describes trap search as fixed alongside the other LIKE sites; false for the reason in R3-H2 | Fixed (lane F2) |
+| R3-D3 | `CODE-REVIEW.md:1459` | States "140 of 141" for the 5.9.1 closing suite run; the actual run was 142 suites, and B13b (R3-M3) was a second failure not counted | *Fixed (lead)* |
+| R3-D4 | `CODE-REVIEW.md:83` | Overstates ALRT-F9's fix — the webhook URL is still stored in the clear at four `record_notification` sites (R3-H4) | Fixed (lane F2) |
+| R3-D5 | `CHANGELOG.md`/`CODE-REVIEW.md` (FM-F6) | Says Alerts reads its four configuration endpoints "on opening the tab"; the code still polls them every 10 s until the F3 fix lands | Fixed (lane F3) |
+| R3-D6 | `CHANGELOG.md` | The `has_community` sentence describes redaction behaviour the API doesn't implement (R3-M5) | Fixed (lane F3) |
+
+---
+
+### Checked and fine
+
+Merged across the three reports, deduplicated:
+
+**This session's backend lanes (R1).** Route gating on all five new routes;
+SQL construction throughout (constants or `?` placeholders; LIKE patterns
+built only from integer ids); per-rule mute engine placement and reach; the
+mute rule-key partition round-trip; merge/forget-device handling of mutes
+(tested); purge-table coverage and its index-served bounds queries; purged
+devices hidden from readers; lock nesting (reentrant, no new deadlock shape);
+the event-log cursor and capacity handling; `debug_log_capacity`'s default,
+range and live apply; additive-only schema migrations; software-version
+regexes are bounded; the HTTPS-check window clamps; nothing removed; the two
+new modules sit at 9%/6% prose.
+
+**This session's frontend lanes (R2).** XSS-checked at every new
+interpolation; permission gating on every new button; every new DOM id
+resolves; the mute key round-trip matches `alertsdb`; `MUTE_HOURS` and
+`MAX_MUTE_HOURS` agree with the server-side cap and capacity constants; the
+Dashboard's boot/route/`localStorage` first-paint path; `master()`'s fallback
+fires exactly once; Dashboard offenders handling; the timeline signature;
+CSV export paths; theme tokens; nothing removed; `test_frontend_contracts.py`
+§50–§55 genuinely pin what they claim to pin.
+
+**5.9.1 fix commits on `main` (R3).** Nothing removed — 257 routes, 973 ids
+and 136 columns identical on both sides of the fixes; `CODE-REVIEW.md`'s own
+arithmetic checks out; every finding marked *Fixed* in that document has a
+changed file behind it. Verified sound as shipped: WEB-F1, WEB-F2, WEB-F3,
+WEB-F5 (the static-file half), WEB-F7, WEB-F9, WEB-F10, WEB-F12; POLL-F1
+(sensor-scale clamp), POLL-F2, POLL-F3 (the ARP half), POLL-F4, POLL-F5,
+POLL-F6, POLL-F8, POLL-F9; DATA-F1 through DATA-F7 except `snmptrapdb`
+(R3-H2); ALRT-F1, ALRT-F3, ALRT-F4, ALRT-F5, ALRT-F6, ALRT-F10, ALRT-F11,
+ALRT-F12, ALRT-F14, ALRT-F15, ALRT-F17; API-F1 through API-F13 except API-F5
+and API-F6 (see R3-M5/R3-D6 above); WEB-F6's premise still holds (the 5 s cap
+is unchanged from 5.9.1). The frontend contract suite's pinned assertions all
+fail against the pre-fix code, confirming they test what they claim. The full
+suite runs 30/30 green on a pristine `dc4ad11` checkout.
+
+---
+
+### Unconfirmed
+
+Merged across the three reports, deduplicated; each is a question with the
+experiment that would settle it, not a claim.
+
+- **SSRF reach of the HTTPS availability check** (R1) — a product call, since
+  destinations are trusted operator input in the same way `smtp_host` and
+  `webhook_url` already are.
+- **Per-destination streak dicts never pruned for deleted HTTPS destinations**
+  (R1) — believed negligible residue; not measured at scale.
+- **Prose share over the whole 5.10.0 diff** (R1) — roughly 50% if moved long
+  comments count toward prose; there is no house checker that draws that line.
+- **Layout of the Debug worker table and the FORTI-AP table at 400 px** (R2) —
+  not walked at that width.
+- **Real byte cost of a paused Debug poll** (R2) — the "~2–10 MB/s per paused
+  tab" figure in R2-H1 is a ring-size calculation, not a captured trace.
+- **Whether this install actually has a stored `detail_fields`** (R2) — R2-M3
+  is a code-path finding; not reproduced against a real upgraded instance.
+- **`GET /api/nodes/purges` has no static caller** (R2) — either dead code or
+  a route meant for a client not yet written; not settled which.
+- **LLDP/CDP/VLAN partial-column walks** (R3) — same truncation shape as
+  R3-H1's MAC FDB walk; deferred to lane F1 to settle alongside the fix.
+- **`_commit_durable` ignoring its `wal_checkpoint` result** (R3) — deferred
+  to lane F2.
+- **`MIN_RECORD_BYTES` on NetFlow options templates** (R3) — not settled
+  whether the same options-record cost ALRT-F1 fixed for data records also
+  applies here.
+- **`plottedRange` bucket sizing (`bucket_s`)** (R3) — deferred to lane F3.
+- **A 1,500-id smoke test for `bulk_resolve`** (R3) — not run; the chunking
+  fix (R3-L10 and siblings) is unverified at that scale.
+- **D21's secondary check** (R3) — named but not run in this pass.
+- **Whether FE-F1's stale-selection fix should narrow its filter on a
+  multi-page fleet** (R3) — a product call, not a defect.
+- **`#timeline`'s height without a resize event** (R3) — not reproduced.
+- **`configrxdb`'s whole-fleet scope** (R3) — deferred to lane F2 to settle
+  alongside R3-L10.
+- **`permissions_for`'s lock timeout** (R3) — pre-existing, not introduced by
+  any commit reviewed here.
+
+---
+
+## SappiWhere 5.9.1 — Full code review
+
+### Summary
 
 This is the second whole-tree review of the application (the first was 4.46.4, fifteen
 defects) and the first that took the interface, the browser modules and performance in
@@ -32,7 +417,7 @@ frontend modules) are complete; every finding marked *Fixed* below landed with i
 
 ---
 
-## Findings
+### Findings
 
 81 findings, sorted by severity and then by area. Status:
 *Fixed* — landed with a test that failed before it and passes after;
@@ -125,7 +510,7 @@ frontend modules) are complete; every finding marked *Fixed* below landed with i
 
 ---
 
-## Web server core, process model and credentials
+### Web server core, process model and credentials
 
 `netpath/web/server.py`, `service.py`, `auth.py`, `permissions.py`, `secretstore.py`,
 `dpapi.py`, `ldapclient.py`, `webrelay.py`, `selfupdate.py`, `sshterm.py`, `hostkeys.py`,
@@ -255,7 +640,7 @@ decides what code this host runs next. The lead left it as a proposal: the docst
 the redundancy deliberately, and a fallback-only context could break updates on a host whose
 system store is stale. `updates_enabled` is off by default.
 
-### Verified sound
+#### Verified sound
 
 - Static path traversal: `normpath` + `commonpath` against `STATIC_DIR` refuses `/../`,
   `%2e%2e`, `/static/../../` and a Windows drive-letter path.
@@ -300,7 +685,7 @@ system store is stale. `updates_enabled` is off by default.
 
 ---
 
-## HTTP API
+### HTTP API
 
 `netpath/web/api.py` (9,745 lines, 425 top-level functions) and `netpath/web/wsock.py`.
 
@@ -433,7 +818,7 @@ with no cap, while `mute_many` next door demonstrates the batched shape. Fix:
 `set_maintenance_many`/`clear_maintenance_many` in alertsdb (already landed in the data lane:
 500 commits / 41 ms → 1 commit / 4 ms) plus the `BULK_DEVICE_ID_MAX` cap on the API side.
 
-### Verified sound
+#### Verified sound
 
 - Route-table gating: every state-changing route carries `(module, WRITE)`; the seven
   `None`-gated routes each filter per module inside the handler, checked line by line.
@@ -470,7 +855,7 @@ with no cap, while `mute_many` next door demonstrates the batched shape. Fix:
 
 ---
 
-## Poller and the SNMP/ICMP wire stack
+### Poller and the SNMP/ICMP wire stack
 
 `netpath/nodepoll.py` (7,531 lines), `snmppoll.py`, `snmpcrypt.py`, `udpsock.py`,
 `mibparse.py`, `nodediscover.py`, `fortipoll.py`, with `trapdecode.py`'s BER layer read in
@@ -579,7 +964,7 @@ never be printed. `_poll_device` assigns `snmp_error = str(exc)`, so the communi
 `devices.snmp_error`, the `down` event's detail, the per-poll Debug line, the API and any alert
 mail. Fixed: the refusal stands, the message no longer echoes the value.
 
-### Verified sound
+#### Verified sound
 
 - BER decoder bounds: high-tag form, indefinite length, `0xFF`, >4-byte lengths and
   value-overruns all refused; parsing iterative throughout, so no stack-depth exposure;
@@ -614,7 +999,7 @@ mail. Fixed: the refusal stands, the message no longer echoes the value.
 
 ---
 
-## Data layer
+### Data layer
 
 `netpath/sqlitebase.py`, `db.py`, `appdb.py`, `nodesdb.py` (4,765 lines), `nodesseriesdb.py`,
 `nodesmibdb.py`, `alertsdb.py` (3,231 lines), `mapperdb.py`, `wirelessdb.py`, plus `flowdb.py`,
@@ -717,7 +1102,7 @@ list. The last is not operator-driven at all — an install that ran with
 surplus backup in one statement. Fixed by chunking inside the existing single lock and commit, so
 the transaction boundary is unchanged.
 
-### Verified sound
+#### Verified sound
 
 - `sqlitebase.connect`'s pragma set and `_tighten`'s 0600 chmod of the db/`-wal`/`-shm` triple,
   including the deliberate second `_tighten` after WAL creates the companions.
@@ -752,7 +1137,7 @@ the transaction boundary is unchanged.
 
 ---
 
-## Alerts, collectors and ConfigRX
+### Alerts, collectors and ConfigRX
 
 `netpath/alertengine.py` (3,263 lines), `alertrules.py`, `alertmail.py`, `report.py`, `monitor.py`,
 `tracer.py`, `namelookup.py`, `analysis.py`, `collector.py`, `nfdecode.py`, `syslogd.py`,
@@ -935,7 +1320,7 @@ TLV span — so the value to an attacker is low and `allowed_sources` closes it 
 verdict was documentation rather than code: RUNBOOK and the SNMP settings help will say that
 `acknowledge_informs` on an internet-reachable port makes this host a reflector and name the control.
 
-### Verified sound
+#### Verified sound
 
 - `nfdecode` bounds other than ALRT-F3: the `_decode_v9`/`_decode_ipfix` offset arithmetic, the
   per-exporter template LRU, the zero-length and over-count template refusals, the sampling clamp,
@@ -976,7 +1361,7 @@ verdict was documentation rather than code: RUNBOOK and the SNMP settings help w
 
 ---
 
-## Frontend core
+### Frontend core
 
 `netpath/web/static/app.js` (5,500 lines), `nodes.js` (6,676), `dashboard.js`, `events.js`,
 `boot.js`, `tokens.css`, with `index.html` and `app.css` read in the parts that matter. Everything
@@ -1086,7 +1471,7 @@ device-supplied and reaches two `innerHTML` assignments; it is numeric today onl
 `nodepoll.read_dom` coerces it, which is why this is defence in depth rather than a live hole. Fix:
 `escape(String(s.value))`.
 
-### Verified sound
+#### Verified sound
 
 - Output escaping across `app.js`, `nodes.js`, `events.js` and `dashboard.js`: every interpolation
   enumerated, the ~180 touching server data hand-checked, and a live payload walk that left
@@ -1116,7 +1501,7 @@ device-supplied and reaches two `innerHTML` assignments; it is numeric today onl
 
 ---
 
-## Frontend modules
+### Frontend modules
 
 `netpath/web/static/alerts.js`, `mapper.js`, `netflow.js`, `debug.js`, `wireless.js`, `ssh.*` read
 end to end; `configrx.js`, `settings.js`, `netpath.js`, `ipam.js` read for every DOM sink, fetch path
@@ -1215,7 +1600,7 @@ keyboard-only way out", the visible hint one line below says Ctrl+F6, and
 Escape deliberately is *not* the exit because it is a real keystroke to the device. A maintainer
 following the comment would break vi, less and every menu console. Fixed: the comment.
 
-### Verified sound
+#### Verified sound
 
 - No listener leaks across tab switches: every `window`/`document` listener in these nine modules is
   registered exactly once inside `init()` and guarded by the tab check; no `setInterval` anywhere in
@@ -1243,9 +1628,9 @@ following the comment would break vi, less and every menu console. Fixed: the co
 
 ---
 
-## Cross-cutting assessment, by lens
+### Cross-cutting assessment, by lens
 
-### Security
+#### Security
 
 The posture is better than the finding count suggests, and the reviewers' "verified sound" lists are
 the evidence: the whole route table's gating checked line by line with no missing gate; every
@@ -1294,7 +1679,7 @@ has it. The reviewers' P3 (api) and P1 (frontend-modules) both propose making th
 failure rather than a review finding, which is the right conclusion to draw from four independent
 sightings.
 
-### Performance
+#### Performance
 
 Every performance finding in this review is one of four shapes, and in each case the codebase already
 contains a correct example of the thing that should have been done.
@@ -1333,7 +1718,7 @@ the server-side twin: two full settings reads per column walk, ~60,000 lock acqu
 scheduler's statement count can be pinned by a test. FM-F3, FM-F5 and FM-F7 are the input-event
 version: work at pointer or 10 Hz rate that the same files already coalesce correctly elsewhere.
 
-### Design quality and maintainability
+#### Design quality and maintainability
 
 The metrics say what the reading says: a few files carry far more than their share, and every one of
 them is a file where a finding survived because no reader can hold it in their head.
@@ -1377,7 +1762,7 @@ whole-tree identifier scan (`AlertsDatabase.purge_expired_mutes`, `_Tee.isatty`,
 `do_HEAD`/`do_PUT`/`do_DELETE`); the last three are reflective dispatch and the first two want a
 human's eye, not a deletion.
 
-#### Proposals
+##### Proposals
 
 The 30 proposals the reviewers raised, none of which is part of this pass. Size is a rough estimate:
 *small* is a contained change with an existing test to extend; *medium* touches several files or
@@ -1418,7 +1803,7 @@ needs a new test shape; *large* is a release of its own.
 
 ---
 
-## Unconfirmed
+### Unconfirmed
 
 Twenty items the reviewers could not settle. None is a claim; each is a question with the experiment
 that would answer it.
@@ -1448,7 +1833,7 @@ that would answer it.
 
 ---
 
-## Method and limits
+### Method and limits
 
 Seven reviewers each took an area and read their files end to end, saying in their own reports which
 files they only skimmed. Each read `CHANGELOG.md` §4.46.4 (the previous whole-tree review), §5.5.0
@@ -1462,10 +1847,12 @@ then consolidated, spot-verified at least the top finding of every report agains
 the fixes into lanes by file ownership so parallel fixers never contend; each fix had to ship with a
 test proved to fail before it, by running the new test against a stash or a temporary revert.
 
-The whole suite ran once at the end, after every lane had landed: 140 of 141 suites passed. The
+The whole suite ran once at the end, after every lane had landed: 140 of the 142 suites passed. The
 one skip is `test_console_shutdown.py`, which needs PySide6 and the desktop console; the one
 failure is the pre-existing `test_prune_lock_hold.py` fairness assertion described below, which
-fails on unchanged 5.9.0 in the same container. One integration defect surfaced only in that run
+fails on unchanged 5.9.0 in the same container. The 5.11.0 review found a second failure this
+sentence did not count: `test_alert_engine.py`'s B13b fixture resolved whichever conflict row a
+tie in `last_seen_ts` happened to order first (R3-M3 below). One integration defect surfaced only in that run
 and was fixed before it: the poller lane had clamped `entPhySensorScale` to 1..9 on the
 reviewer's word, where RFC 3433's enum runs to yotta(17), so a kilo(10) sensor read a thousand
 times too small until `test_ups_environment.py` caught it.
