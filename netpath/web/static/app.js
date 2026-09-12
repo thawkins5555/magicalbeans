@@ -402,6 +402,13 @@ const App = (() => {
     return promise;
   }
 
+  /* An extension file a page fetches on demand (a dialog too big to ship
+     with its tab); it registers itself on App.extras. */
+  const extras = {};
+  function loadExtra(stem) {
+    return loadScript(`/${stem}.js${ASSET_VERSION_QUERY}`);
+  }
+
   /* The only visible sign a script is still in flight: the same accent
      line app.css already draws for an ordinary data refresh that takes
      more than 400 ms (.page[aria-busy="true"]::before) — a lazy tab's
@@ -5612,7 +5619,7 @@ const App = (() => {
     grid, sortRows, canRead, canWrite, applyPermissions, accountModal, wireRowKeyboard,
     statusPatternDefs, statusPatternUrl, statusMark,
     visibleColumns, readColumnPicker, drawRows, escapeHtml,
-    windowSet, windowZoom, windowPan,
+    windowSet, windowZoom, windowPan, loadExtra, extras,
     refreshSelectAll, columnPickerFieldset, wireColumnPickers,
     sortableTable,
   };

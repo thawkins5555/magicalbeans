@@ -2061,7 +2061,7 @@ NAME_LINK_SITES = {
     "nodes.js": ["{ key: 'name', label: 'Device'",
                  "{ key: 'device_name', label: 'Device'"],
     "configrx.js": ["{ key: 'device', label: 'Device'"],
-    "mapper.js": ["suggestionName(s)", "candidateLink"],
+    "mapper_upstream.js": ["suggestionName(s)", "candidateLink"],
     "events.js": ["{ key: 'source', label: 'Source'",
                   "{ key: 'source_name', label: 'Source name'"],
     "wireless.js": ["{ key: 'name', label: 'Name'",
