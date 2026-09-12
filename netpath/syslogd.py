@@ -61,11 +61,14 @@ class SyslogCollector(udpsock.UdpReceiver):
         # lazily on arrival, so throttling costs O(1) per message and cannot
         # grow past MAX_RATE_SOURCES entries however many addresses appear.
         self._buckets: collections.OrderedDict = collections.OrderedDict()
-        # Reached from the UDP receive thread and from every TCP client
-        # thread at once: without this, one thread's move_to_end could raise
-        # KeyError for a key another had just evicted, and the message was
-        # silently dropped as a receive error.
-        self._rate_lock = threading.Lock()
+        # Reached from the UDP receive thread, the TCP accept loop and every
+        # TCP client thread at once: without this, one thread's move_to_end
+        # could raise KeyError for a key another had just evicted, and the
+        # message was silently dropped as a receive error. It guards the
+        # counters below for the same reason -- `+= 1` is a read, an add and
+        # a store from threads that genuinely run side by side -- so it is
+        # named for both, not for the buckets alone.
+        self._counter_lock = threading.Lock()
         self._rate = 0.0
         self._max_tcp_clients = 64
         # (thread, socket) per accepted connection, not just the thread: a
@@ -170,7 +173,8 @@ class SyslogCollector(udpsock.UdpReceiver):
                 thread.join(timeout=max(0.0, deadline - time.monotonic()))
         landed = landed and not any(t.is_alive() for t, _ in self._clients)
         self._clients = []
-        self.counters["tcp_clients"] = 0
+        with self._counter_lock:
+            self.counters["tcp_clients"] = 0
         return landed
 
     # ------------------------------------------------------------------ errors
@@ -178,7 +182,8 @@ class SyslogCollector(udpsock.UdpReceiver):
     def _note_error(self, exc: Exception) -> None:
         # The counters survive a restart, so errors are accumulated in the
         # counter itself rather than republished from a per-run total.
-        self.counters["errors"] += 1
+        with self._counter_lock:
+            self.counters["errors"] += 1
         self._log_throttled("receive", f"Receive error: {exc}",
                             detail=traceback.format_exc)
 
@@ -198,7 +203,7 @@ class SyslogCollector(udpsock.UdpReceiver):
         """
         if self._rate <= 0:
             return True
-        with self._rate_lock:
+        with self._counter_lock:
             bucket = self._buckets.get(source)
             if bucket is None:
                 bucket = [self._rate, now]
@@ -222,12 +227,12 @@ class SyslogCollector(udpsock.UdpReceiver):
         # to refresh "last message just now", so the status strip read healthy
         # while every packet was being thrown away.
         if not self._accepted(source):
-            with self._rate_lock:
+            with self._counter_lock:
                 self.counters["rejected"] += 1
             return
         now = time.time()
         if not self._within_rate(source, now):
-            with self._rate_lock:
+            with self._counter_lock:
                 self.counters["throttled"] += 1
             self._log_throttled("throttle",
                                 f"Throttling syslog from {source}: more than "
@@ -239,7 +244,7 @@ class SyslogCollector(udpsock.UdpReceiver):
                                        "the per-source rate in Settings to keep "
                                        "them all.")
             return
-        with self._rate_lock:
+        with self._counter_lock:
             self.counters["messages"] += 1
             self.counters["last_message"] = now
         if self._first_from(source):
@@ -288,7 +293,7 @@ class SyslogCollector(udpsock.UdpReceiver):
             # (default 64) connections and its thread for up to 30 seconds
             # an idle period, while real devices were refused.
             if not self._accepted(address[0]):
-                with self._rate_lock:
+                with self._counter_lock:
                     self.counters["rejected"] += 1
                 try:
                     client.close()
@@ -296,9 +301,11 @@ class SyslogCollector(udpsock.UdpReceiver):
                     pass
                 continue
             self._clients = [pair for pair in self._clients if pair[0].is_alive()]
-            self.counters["tcp_clients"] = len(self._clients)
+            with self._counter_lock:
+                self.counters["tcp_clients"] = len(self._clients)
             if len(self._clients) >= self._max_tcp_clients:
-                self.counters["tcp_refused"] += 1
+                with self._counter_lock:
+                    self.counters["tcp_refused"] += 1
                 try:
                     client.close()
                 except OSError:
@@ -308,14 +315,16 @@ class SyslogCollector(udpsock.UdpReceiver):
                 target=lambda c=client, a=address[0]: self._read_stream(c, a),
                 name="syslog-tcp-client", daemon=True)
             self._clients.append((thread, client))
-            self.counters["tcp_clients"] = len(self._clients)
+            with self._counter_lock:
+                self.counters["tcp_clients"] = len(self._clients)
             thread.start()
 
     def _note_oversized(self, source: str, declared: int | None = None) -> None:
         """Count a TCP message that hit MAX_TCP_MESSAGE_BYTES, and log at most
         one line a minute so a sender doing this repeatedly cannot fill the
         event log."""
-        self.counters["tcp_oversized"] += 1
+        with self._counter_lock:
+            self.counters["tcp_oversized"] += 1
         what = (f"a declared length of {declared:,} bytes" if declared is not None
                 else f"no newline within {MAX_TCP_MESSAGE_BYTES:,} bytes")
         self._log_throttled("oversized",

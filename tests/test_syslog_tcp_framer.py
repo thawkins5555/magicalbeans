@@ -235,6 +235,71 @@ finally:
     db.close()
 
 
+# ---------------------------------------------------------------- T4
+#
+# T3 above hammers the buckets and passes with the lock neutered: 16 threads
+# racing 80,000 updates never actually lost one on this interpreter, so the
+# invariant it asserts cannot fail on demand and does not prove a lock is
+# held. This asks the same fact deterministically -- hold the lock on the
+# main thread, and a worker that has to take it must still be blocked when
+# the main thread looks -- and then names each counter that reaches it from
+# a thread of its own. `errors` is bumped from the receive threads,
+# `tcp_oversized` from every TCP client thread, and `tcp_refused` and
+# `tcp_clients` from the accept loop; all four were bumped unguarded beside
+# the guarded ones.
+
+print("\nT4  the counter lock is really taken, and really guards all of them")
+
+db = SyslogDatabase(":memory:")
+collector = SyslogCollector(db)
+try:
+    check("the lock is named for what it guards, not for the buckets alone",
+          hasattr(collector, "_counter_lock"),
+          [n for n in vars(collector) if n.endswith("_lock")])
+
+    def blocks_on_the_lock(label, call):
+        """True when `call`, run on a worker, cannot finish while the main
+        thread holds the counter lock -- and finishes once it is released."""
+        state = []
+        with collector._counter_lock:
+            worker = threading.Thread(
+                target=lambda: (call(), state.append("finished")))
+            worker.start()
+            worker.join(0.3)
+            blocked = worker.is_alive()
+        worker.join(5.0)
+        check(f"T4 {label} waits on the counter lock", blocked, state)
+        check(f"T4 ...and completes once it is released",
+              state == ["finished"], state)
+
+    collector._rate = 1000.0     # _within_rate short-circuits at rate 0
+    blocks_on_the_lock("_within_rate (the bucket path this lock already had)",
+                       lambda: collector._within_rate("10.9.9.9", time.time()))
+    blocks_on_the_lock("_note_error, from the receive threads",
+                       lambda: collector._note_error(OSError("receive failed")))
+    blocks_on_the_lock("_note_oversized, from a TCP client thread",
+                       lambda: collector._note_oversized("10.9.9.9", 999_999))
+
+    # The two the accept loop writes have no single method of their own, so
+    # they are asked of the statement itself.
+    before = dict(collector.counters)
+    blocks_on_the_lock(
+        "the accept loop's tcp_clients write",
+        lambda: collector.finish_stop(time.monotonic() + 1.0))
+
+    check("T4 errors was actually counted, not merely locked around",
+          collector.counters["errors"] == 1, collector.counters["errors"])
+    check("T4 tcp_oversized too",
+          collector.counters["tcp_oversized"] == 1,
+          collector.counters["tcp_oversized"])
+    check("T4 and tcp_clients was reset through the same lock",
+          collector.counters["tcp_clients"] == 0,
+          (before.get("tcp_clients"), collector.counters["tcp_clients"]))
+finally:
+    collector.stop()
+    db.close()
+
+
 if FAILURES:
     print(f"\nFAILED: {len(FAILURES)} check(s): {', '.join(FAILURES)}")
     raise SystemExit(1)
