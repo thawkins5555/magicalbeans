@@ -1751,30 +1751,20 @@ _EVENT_CATEGORY_MODULE = {
 }
 
 
-def get_debug(service, params, body) -> dict:
-    since = int(_num(params, "since", 0, int) or 0)
+def _debug_can(granted, module: str) -> bool:
+    return _permissions.allows(granted.get(module), _permissions.READ)
+
+
+def _debug_netpath_workers(service, params, granted, now) -> tuple:
+    """One row per NetPath destination — its trace and its web page check on
+    the same row — plus the running/queued counts the summary reports."""
+    if not _debug_can(granted, "netpath"):
+        return [], 0, 0
     state = service.monitor.worker_state()
     schedule = service.monitor.next_runs()
-    now = time.time()
-
-    # Every section below names something from another module — NetPath
-    # destination hostnames, device names and addresses, subnet and DHCP
-    # server labels, discovery CIDRs, the addresses out for reverse lookup —
-    # so `debug: read` alone must not read any of them, exactly as it must
-    # not read the event stream. A section the account cannot read comes
-    # back empty rather than as a 403, the contract get_state and
-    # get_dashboard already use.
-    granted = request_permissions(service, params)
-
-    def can(module: str) -> bool:
-        return _permissions.allows(granted.get(module), _permissions.READ)
-
-    see_netpath = can("netpath")
-    see_nodes = can("nodes")
-
     workers = []
     running = queued = 0
-    targets = service.db.targets() if see_netpath else []
+    targets = service.db.targets()
     last_traces = service.db.last_traces([target["id"] for target in targets])
     last_https = service.db.last_https_checks([t["id"] for t in targets])
     https_state = service.https_checker.worker_state()
@@ -1798,7 +1788,6 @@ def get_debug(service, params, body) -> dict:
             "next_run": schedule.get(target["id"]),
             "interval_s": target["interval_s"],
             "status": last["status"] if last else "none",
-            # The web page check for this destination, on the same row as its trace.
             "https": {
                 "url": url,
                 "state": ("none" if not url or check is None
@@ -1823,13 +1812,17 @@ def get_debug(service, params, body) -> dict:
                 entry["state"] = "queued"
                 entry["elapsed"] = now - (work.get("queued") or now)
         workers.append(entry)
+    return workers, running, queued
 
-    # One stream carries every module's events — device names and
-    # addresses, DHCP server labels, ConfigRX failure detail, sign-in
-    # history — so `debug: read` alone must not read all of it. Each
-    # category is filtered by the module it belongs to.
+
+def _debug_events(service, params, granted, since) -> tuple:
+    """The event batch and the cursor that goes with it. One stream carries
+    every module's events — device names and addresses, DHCP server labels,
+    ConfigRX failure detail, sign-in history — so `debug: read` alone must
+    not read all of it. Each category is filtered by the module it belongs
+    to."""
     visible = {category for category, module in _EVENT_CATEGORY_MODULE.items()
-               if _permissions.allows(granted.get(module), _permissions.READ)}
+               if _debug_can(granted, module)}
     # One lock hold for the batch and the cursor that goes with it.
     raw, last_seq = service.log.since_with_seq(since)
     events = [
@@ -1837,20 +1830,25 @@ def get_debug(service, params, body) -> dict:
          "target": e.target, "message": e.message, "detail": e.detail}
         for e in raw if e.category in visible
     ]
+    return events, last_seq
 
-    # One row per address currently out for a reverse lookup. Under
-    # `settings`, the module _EVENT_CATEGORY_MODULE assigns the dns category.
-    dns_state = service.resolver.worker_state() if can("settings") else {}
-    dns_workers = sorted(
+
+def _debug_dns_workers(service, params, granted, now) -> list:
+    """One row per address currently out for a reverse lookup. Under
+    `settings`, the module _EVENT_CATEGORY_MODULE assigns the dns category."""
+    dns_state = service.resolver.worker_state() if _debug_can(granted, "settings") else {}
+    return sorted(
         [{"ip": ip, "elapsed": now - info["started"]}
          for ip, info in dns_state.items() if info["started"]],
         key=lambda row: row["elapsed"], reverse=True)
 
-    # One row per subnet currently being scanned, one per DHCP server
-    # currently being polled — both come from the same worker, so they share
-    # a table rather than needing a section each for what is usually zero or
-    # one row.
-    ipam_state = service.ipam.state() if can("ipam") else {}
+
+def _debug_ipam_workers(service, params, granted, now) -> list:
+    """One row per subnet currently being scanned, one per DHCP server
+    currently being polled — both come from the same worker, so they share a
+    table rather than needing a section each for what is usually zero or one
+    row."""
+    ipam_state = service.ipam.state() if _debug_can(granted, "ipam") else {}
     ipam_workers = []
     if ipam_state.get("scan_started") or ipam_state.get("poll_started"):
         subnets_by_id = {s["id"]: s for s in service.ipam_db.subnets_by_ids(
@@ -1872,12 +1870,15 @@ def get_debug(service, params, body) -> dict:
                 "elapsed": now - started,
             })
         ipam_workers.sort(key=lambda row: row["elapsed"], reverse=True)
+    return ipam_workers
 
-    # One row per device currently being polled or queued to be — the same
-    # shape the NetPath `workers` table above uses, without its per-target
-    # budget/schedule columns: a device's poll has no fixed budget the way a
-    # trace's hop/probe counts imply one.
-    node_state = service.node_poller.worker_state() if see_nodes else {}
+
+def _debug_node_workers(service, params, granted, now) -> list:
+    """One row per device currently being polled or queued to be — the same
+    shape the NetPath `workers` table uses, without its per-target
+    budget/schedule columns: a device's poll has no fixed budget the way a
+    trace's hop/probe counts imply one."""
+    node_state = service.node_poller.worker_state() if _debug_can(granted, "nodes") else {}
     node_workers = []
     if node_state:
         devices_by_id = {d["id"]: d for d in
@@ -1892,10 +1893,14 @@ def get_debug(service, params, body) -> dict:
                 node_workers.append({"kind": "queued", "label": label,
                                      "elapsed": now - (work.get("queued") or now)})
         node_workers.sort(key=lambda row: row["elapsed"], reverse=True)
+    return node_workers
 
-    # One row per discovery scan currently sweeping, with its live
-    # progress counters — same shape as the worker tables above plus the
-    # probed/found columns a bounded sweep naturally has.
+
+def _debug_discovery_scans(service, params, granted, now) -> list:
+    """One row per discovery scan currently sweeping, with its live progress
+    counters — same shape as the worker tables plus the probed/found columns
+    a bounded sweep naturally has."""
+    see_nodes = _debug_can(granted, "nodes")
     discovery_scans = []
     for job in (service.nodes_db.discovery_jobs(20) if see_nodes else []):
         if job["state"] != "running":
@@ -1907,19 +1912,74 @@ def get_debug(service, params, body) -> dict:
             "elapsed": now - job["started_ts"],
         })
     discovery_scans.sort(key=lambda row: row["elapsed"], reverse=True)
+    return discovery_scans
 
+
+def _debug_summary(service, params, granted, sections) -> dict:
+    """The one-line "is everything running" header, counted from the sections
+    already assembled."""
     from ..ipam_scan import ping_mode_summary
     ping_mode = ping_mode_summary()
+    see_netpath = _debug_can(granted, "netpath")
+    return {
+        # None, not False/0: an account without `netpath` sees nothing, not a false "stopped".
+        "scheduler": service.monitor.running if see_netpath else None,
+        "workers_busy": sections["running"],
+        "workers_total": service.monitor.workers if see_netpath else None,
+        "queued": sections["queued"],
+        "resolver": bool(service.resolver._thread
+                         and service.resolver._thread.is_alive()),
+        "dns_pending": len(sections["dns_workers"]),
+        "collector": service.collector.running,
+        "packets": service.collector.counters["packets"],
+        "ipam": service.ipam.running,
+        "ipam_active": len(sections["ipam_workers"]),
+        "nodes": service.node_poller.running,
+        "nodes_active": len(sections["node_workers"]),
+        "discovery_active": len(sections["discovery_scans"]),
+        "buffered": len(service.log.all()),
+        # Same fact the startup log line states once, here so it stays
+        # visible without hunting back through the event log for it.
+        "ping_path": ping_mode["path"],
+        "ping_kind": ping_mode["kind"],
+        "ping_mode_env": ping_mode["mode_env"],
+    }
+
+
+def get_debug(service, params, body) -> dict:
+    since = int(_num(params, "since", 0, int) or 0)
+    now = time.time()
+
+    # Every section below names something from another module — NetPath
+    # destination hostnames, device names and addresses, subnet and DHCP
+    # server labels, discovery CIDRs, the addresses out for reverse lookup —
+    # so `debug: read` alone must not read any of them, exactly as it must
+    # not read the event stream. A section the account cannot read comes
+    # back empty rather than as a 403, the contract get_state and
+    # get_dashboard already use.
+    granted = request_permissions(service, params)
+
+    workers, running, queued = _debug_netpath_workers(service, params, granted, now)
+    events, last_seq = _debug_events(service, params, granted, since)
+    sections = {
+        "running": running,
+        "queued": queued,
+        "dns_workers": _debug_dns_workers(service, params, granted, now),
+        "ipam_workers": _debug_ipam_workers(service, params, granted, now),
+        "node_workers": _debug_node_workers(service, params, granted, now),
+        "discovery_scans": _debug_discovery_scans(service, params, granted, now),
+    }
 
     return {
         "workers": workers,
-        "dns_workers": dns_workers,
-        "ipam_workers": ipam_workers,
-        "node_workers": node_workers,
+        "dns_workers": sections["dns_workers"],
+        "ipam_workers": sections["ipam_workers"],
+        "node_workers": sections["node_workers"],
         # polls/ok/timeout/auth_fail/unsupported/errors/overruns — already
         # computed on every poll, previously never surfaced anywhere.
-        "node_counters": service.node_poller.counters if see_nodes else {},
-        "discovery_scans": discovery_scans,
+        "node_counters": (service.node_poller.counters
+                          if _debug_can(granted, "nodes") else {}),
+        "discovery_scans": sections["discovery_scans"],
         "events": events,
         "last_seq": last_seq,
         "log_epoch": service.log.epoch,
@@ -1937,29 +1997,7 @@ def get_debug(service, params, body) -> dict:
         # away; it is kept now because it is the only number that says which
         # endpoint is actually slow.
         "routes": _route_latency(service),
-        "summary": {
-            # None, not False/0: an account without `netpath` sees nothing, not a false "stopped".
-            "scheduler": service.monitor.running if see_netpath else None,
-            "workers_busy": running,
-            "workers_total": service.monitor.workers if see_netpath else None,
-            "queued": queued,
-            "resolver": bool(service.resolver._thread
-                             and service.resolver._thread.is_alive()),
-            "dns_pending": len(dns_workers),
-            "collector": service.collector.running,
-            "packets": service.collector.counters["packets"],
-            "ipam": service.ipam.running,
-            "ipam_active": len(ipam_workers),
-            "nodes": service.node_poller.running,
-            "nodes_active": len(node_workers),
-            "discovery_active": len(discovery_scans),
-            "buffered": len(service.log.all()),
-            # Same fact the startup log line states once, here so it stays
-            # visible without hunting back through the event log for it.
-            "ping_path": ping_mode["path"],
-            "ping_kind": ping_mode["kind"],
-            "ping_mode_env": ping_mode["mode_env"],
-        },
+        "summary": _debug_summary(service, params, granted, sections),
     }
 
 

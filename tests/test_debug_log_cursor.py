@@ -261,6 +261,38 @@ try:
           "below it — the signal debug.js resyncs on",
           status == 200 and payload["last_seq"] < 9999999,
           str(payload.get("last_seq")))
+
+    # ------------------------------- get_debug assembles per-section helpers
+    # Each section is its own `_debug_<section>` function now; the response
+    # must still carry every one of them, and a section whose module is not
+    # granted must still come back empty rather than as a refusal.
+    from netpath.web import api as api_mod
+
+    status, payload = call("GET", "/api/debug?since=0", token=admin)
+    expected = {"workers", "dns_workers", "ipam_workers", "node_workers",
+                "node_counters", "discovery_scans", "events", "last_seq",
+                "log_epoch", "capacity", "targets", "store_locks", "routes",
+                "summary"}
+    check("the assembled /api/debug response still carries every section",
+          status == 200 and expected <= set(payload), sorted(expected - set(payload or {})))
+    check("...and its summary still carries the header counters",
+          {"scheduler", "workers_busy", "queued", "dns_pending", "ping_path"}
+          <= set(payload.get("summary") or {}), sorted(payload.get("summary") or {}))
+
+    empty = {"debug": "read"}
+    check("_debug_netpath_workers is empty without `netpath` read",
+          api_mod._debug_netpath_workers(service, {}, empty, time.time())
+          == ([], 0, 0))
+    check("...and the dns, ipam, nodes and discovery sections likewise",
+          all(helper(service, {}, empty, time.time()) == []
+              for helper in (api_mod._debug_dns_workers,
+                             api_mod._debug_ipam_workers,
+                             api_mod._debug_node_workers,
+                             api_mod._debug_discovery_scans)))
+    events, last_seq = api_mod._debug_events(service, {}, empty, 0)
+    check("...and the event stream is filtered to nothing, cursor intact",
+          events == [] and last_seq == service.log.last_seq,
+          f"{len(events)} {last_seq}")
 finally:
     server.stop()
     service.shutdown()
