@@ -1036,10 +1036,7 @@ def test_an_unencodable_oid_does_not_freeze_the_device():
 # ------------------------- a truncated forwarding table never reaches storage
 
 def _stub_columns(poller, answers: dict, seen: list):
-    """Drive every column walk from a table of base OID -> (values,
-    complete). _walk_column/_walk_column_status both funnel through
-    _walk_column_detail, so one stub covers all three, and each call's
-    deadline is recorded so the budget's clock can be checked."""
+    """Drives every column walk from a table of base OID -> (values, complete); stubs _walk_column_detail, which both _walk_column and _walk_column_status funnel through."""
     def detail(device, config, base_oid, raise_on_timeout=False, deadline=None):
         seen.append((base_oid, deadline))
         values, complete = answers.get(base_oid, ({}, True))
@@ -1048,11 +1045,7 @@ def _stub_columns(poller, answers: dict, seen: list):
 
 
 def test_a_truncated_mac_table_never_reaches_storage():
-    """read_device_mac_table walked the two FDB columns through
-    _walk_column, which throws `complete` away -- so a table cut short by
-    the row cap, the byte cap or the clock reached replace_mac_entries as
-    the whole truth and every row past the truncation was marked absent.
-    The ARP walker has always refused this; same rule, bigger table."""
+    """A truncated FDB column must not reach replace_mac_entries as a complete table."""
     db = NodesDatabase(os.path.join(tmpdir("poller_review_macpartial_"), "nodes.db"))
     try:
         group_id = db.ensure_default_group()
@@ -1089,8 +1082,7 @@ def test_a_truncated_mac_table_never_reaches_storage():
               f"...so the scheduled walk leaves all three stored MACs present "
               f"({len(present)} of {len(rows)} still present)")
 
-        # The budget comes off mac_table_interval_s (3600 -> 1800s), not the
-        # 120s poll interval that _walk_column_detail would have derived.
+        # Budget comes off mac_table_interval_s (1800s), not the 120s poll interval.
         fdb_deadlines = [deadline for oid, deadline in seen if oid == qbridge]
         budget = fdb_deadlines[0] if fdb_deadlines else None
         remaining = (budget - time.time()) if budget else 0.0
@@ -1119,11 +1111,7 @@ def test_a_truncated_mac_table_never_reaches_storage():
 
 
 def test_a_truncated_neighbour_or_vlan_column_never_reaches_storage():
-    """LLDP/CDP and the VLAN walk read several columns each, every one its
-    own walk with its own budget, and every one discarded `complete`. A
-    column that stops short still contributes its suffixes to the join --
-    so rows land with that column's field BLANK. Both leave storage alone
-    now, and the blanked row is shown here directly."""
+    """A truncated LLDP/CDP or VLAN column must not contribute a blank-field row; both now leave storage alone."""
     db = NodesDatabase(os.path.join(tmpdir("poller_review_l2partial_"), "nodes.db"))
     try:
         group_id = db.ensure_default_group()
@@ -1147,9 +1135,7 @@ def test_a_truncated_neighbour_or_vlan_column_never_reaches_storage():
               f"an LLDP column cut short discards the whole pass rather than "
               f"storing neighbours with a blank port_id ({entries})")
 
-        # What the pre-fix shape would have stored, shown directly: the join
-        # really does produce a blanked row, which is why this is worth
-        # refusing rather than merging.
+        # Shown directly: the join really would produce a blanked row.
         device = db.device(device_id)
         rows, answered, complete = poller._walk_lldp(
             device, db.effective_config(device))
@@ -1187,8 +1173,7 @@ def test_a_truncated_neighbour_or_vlan_column_never_reaches_storage():
 
 
 def _counting_sessions(counts: dict):
-    """Count _Session opens/closes and credential decrypts; returns the
-    restore callable."""
+    """Count _Session opens/closes and credential decrypts; returns the restore callable."""
     real_session, real_credential = nodepoll_mod._Session, nodepoll_mod.credential_for
     counts.update(opened=0, closed=0, decrypts=0)
 
@@ -1215,11 +1200,7 @@ def _counting_sessions(counts: dict):
 
 
 def test_the_custom_mib_read_opens_one_socket_and_decrypts_once():
-    """_custom_mib_values called _snmp_get per batch, and _snmp_get builds
-    its own _Session -- a fresh socket and, on v3, a fresh credential
-    decrypt -- for each. IP-MIB is 267 objects at 25 to a batch: eleven
-    ports and twenty-two key derivations a poll, for eleven round trips of
-    work. _snmp_get_on exists for exactly this."""
+    """_custom_mib_values must open one _Session and decrypt once for the whole batch, not per call: IP-MIB's 267 objects at 25/batch would otherwise cost eleven ports and twenty-two key derivations a poll."""
     agent = _OneInterfaceAgent(if_speed=1_000_000_000, if_high_speed=1000,
                                hc_out_answers=True)
     agent.start()
@@ -1252,10 +1233,7 @@ def test_the_custom_mib_read_opens_one_socket_and_decrypts_once():
 
 
 def test_a_refused_credential_does_not_leak_the_interface_socket():
-    """_poll_interfaces opened its shared session and THEN read the
-    credential, both outside the try that closes it -- so a credential_for
-    that refuses (a community carrying a comma) leaked one UDP socket per
-    poll, for ever: a bad configuration does not heal on its own."""
+    """A refused credential (community with a comma) must not leak the interface socket _poll_interfaces already opened."""
     db = NodesDatabase(os.path.join(tmpdir("poller_review_ifleak_"), "nodes.db"))
     counts: dict = {}
     restore = _counting_sessions(counts)
@@ -1293,10 +1271,7 @@ def test_a_refused_credential_does_not_leak_the_interface_socket():
 
 
 def test_stopping_the_poller_drops_the_cached_walk_limits():
-    """POLL-F7's cache is filled only by _read_pool_settings, which only
-    reconfigure()'s ENABLED branch reaches -- so a snmp_bulk_max_repetitions
-    change made while polling is off never reached start_oid_walk, which
-    runs whether the poller does or not."""
+    """Stopping the poller must drop the cached walk limits, so a setting changed while off still reaches start_oid_walk."""
     db = NodesDatabase(os.path.join(tmpdir("poller_review_walkcache_"), "nodes.db"))
     try:
         poller = NodePoller(db)
@@ -1310,10 +1285,8 @@ def test_stopping_the_poller_drops_the_cached_walk_limits():
               f"the cache starts at the configured repetitions "
               f"({poller._walk_limits()[1]})")
 
-        # Polling off through reconfigure's own disabled branch, then the
-        # setting changed while it is off. `running` is a read-only property,
-        # so it is stubbed on the class for the length of that one call
-        # rather than the branch being reached by some other door.
+        # `running` is read-only, so stubbed on the class for this one call
+        # to reach reconfigure's disabled branch.
         real_running = NodePoller.running
         NodePoller.running = property(lambda self: True)
         try:
@@ -1332,10 +1305,7 @@ def test_stopping_the_poller_drops_the_cached_walk_limits():
 
 
 def test_only_an_unencodable_oid_is_reported_as_an_oid_fault():
-    """POLL-F2's arm wrapped the whole scalar/interface/custom-MIB block in
-    `except ValueError` and named an OID for every one of them. The poll
-    must still be recorded -- that is what the arm exists for -- without
-    sending anyone off to edit a perfectly good OID."""
+    """Only an unencodable OID (SnmpBadOid) is reported as an OID fault; other ValueErrors still record the poll."""
     agent, db, poller, device_id = _setup_reassignable_device(
         "poller_review_narrowoid_", "narrow-oid-stub")
     try:

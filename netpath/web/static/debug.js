@@ -322,8 +322,7 @@
      the log is a tail) appends only the new rows and trims the front;
      anything that changes which events match — a filter, a search, a clear —
      rebuilds, and that rebuild is debounced. */
-  /* One destination added to the late-filled select, once. The list only
-     ever grows, so "already listed" is the common case. */
+  /* Adds one destination option to the select, if not already listed. */
   function addTargetOption(select, name) {
     if (view.targets.has(name)) return;
     view.targets.add(name);
@@ -333,13 +332,7 @@
     select.appendChild(option);
   }
 
-  /* Late-filled: destinations are discovered from the event stream, so a
-     remembered choice may name one no batch has mentioned yet — the list
-     only ever grows, and a quiet destination can be several batches away. So
-     the choice is OFFERED rather than forgotten: it goes in as an option of
-     its own and is selected, and the batch that does name it finds it
-     already in view.targets and adds nothing. Forgetting it instead is what
-     dropped a restored destination on the first tick after a reload. */
+  /* Restores a saved destination, adding it as an option if not yet mentioned. */
   function restoreSavedTarget(select) {
     if (select.value) return;
     const saved = App.savedControl('debug', 'dbg-target') || '';
@@ -438,11 +431,7 @@
   async function refresh() {
     if (App.state.tab !== 'debug') return;
     const payload = await App.get('/api/debug', { since: view.seq });
-    /* The server restarted: seq counts from 0 again, so this cursor asks
-       for events that will not exist for hours and the page goes quiet —
-       which is what "the log cleared itself" actually was. The refetch asks
-       since=0, so it cannot re-trigger. A Clear leaves _seq running and is
-       therefore not read as a restart. */
+    /* log_epoch changing or last_seq dropping means a restart; a Clear leaves _seq running, so it isn't mistaken for one. */
     if ((view.epoch !== null && payload.log_epoch !== view.epoch)
         || payload.last_seq < view.seq) {
       view.seq = 0;
@@ -452,10 +441,7 @@
       view.targets.clear();
       const select = App.el('dbg-target');
       select.innerHTML = '<option value="">All destinations</option>';
-      // The resync empties the select, which is the same state a reload
-      // leaves it in — so it restores the remembered destination the same
-      // way. Without this a restart silently moved the page back to "All
-      // destinations" and left it there.
+      // Restore the remembered destination, same as a fresh reload does.
       restoreSavedTarget(select);
       view.epoch = payload.log_epoch;
       return refresh();
@@ -471,8 +457,7 @@
     const summary = payload.summary;
     const dns = (App.state.serverState || {}).dns || {};
     const parts = [
-      // null is "you cannot see this module", which is not "stopped" and
-      // not "no workers" — api.py sends it for an account without netpath.
+      // null means the account cannot see this module (api.py), not "stopped".
       `scheduler ${summary.scheduler == null
         ? '—' : (summary.scheduler ? 'running' : 'stopped')}`,
       (summary.workers_total == null
@@ -510,13 +495,7 @@
     }
     App.el('dbg-summary').textContent = parts.join('  ·  ');
 
-    /* The cursor, the buffer and the destination list advance whether or not
-       the view is paused. Holding `since` at the moment Pause was pressed
-       made every one-second poll ask for everything since then, so a paused
-       tab converged on re-downloading the whole ring — 10,000 events by
-       default, 50,000 at the cap — once a second, for as long as it was
-       held. Pause is a drawing state, not a subscription state: only the
-       draw below sits inside it, and Resume paints the buffer. */
+    /* Pause only gates drawing; holding `since` instead re-downloaded the whole ring (10,000 events default, 50,000 at the cap) on every poll. */
     if (payload.events.length) {
       view.seq = payload.last_seq;
       view.events.push(...payload.events);
@@ -528,11 +507,8 @@
       for (const name of payload.targets) addTargetOption(select, name);
       const selectedBefore = select.value;
       restoreSavedTarget(select);
-      // Only new rows are appended: nothing about which events match has
-      // changed, so there is nothing to rebuild — unless the restore above
-      // just changed which destination is selected. Written to view.drawnSeq
-      // rather than acted on here, so a restore that lands while paused
-      // still forces the rebuild when the draw eventually runs.
+      // Only new rows are appended unless the restore changed the selection
+      // (recorded via drawnSeq, so it rebuilds once drawing resumes).
       if (selectedBefore !== select.value) view.drawnSeq = null;
       if (!view.paused) drawEvents({ append: true });
     }
@@ -566,8 +542,7 @@
     App.el('dbg-pause').onclick = (event) => {
       view.paused = !view.paused;
       event.target.textContent = view.paused ? 'Resume' : 'Pause';
-      // The buffer kept filling while it was held, so Resume has rows to
-      // paint now rather than up to a second from now.
+      // Buffer kept filling while paused, so Resume paints immediately.
       if (!view.paused) drawEvents({ append: true });
     };
     /* Ticking every category back on one at a time is the reason "None" on

@@ -1956,15 +1956,12 @@ def test_c13_flood_bounds_on_the_flow_collector() -> None:
         check(collector.counters["errors"] >= 500,
               f"while the counter still shows every one of them "
               f"({collector.counters['errors']})")
-        # The throttle key is global, so the 499 exporters that line stood
-        # in for were marked seen by _first_from and never mentioned again.
-        # They are counted, and the line that did get through says so.
+        # The 499 suppressed exporters were seen by _first_from but never
+        # mentioned; they're counted instead.
         check(collector.counters["first_seen_suppressed"] >= 490,
               f"and the exporters whose own line was suppressed are counted "
               f"rather than lost ({collector.counters['first_seen_suppressed']})")
-        # ...and carried onto the next line the throttle lets through:
-        # reopen the window as a minute passing would, then let one more
-        # never-seen exporter in.
+        # ...and carried onto the next line the throttle lets through.
         collector._log_times["first"] = 0.0
         collector._handle_datagram(runt, ("10.9.9.9", 40000))
         carried = [event.message for event in log.all()
@@ -1977,10 +1974,8 @@ def test_c13_flood_bounds_on_the_flow_collector() -> None:
     flow_db.close()
 
     # --- (e) a re-sent template does not file a line per datagram ----------
-    # _read_templates counts every store, re-sends included, so 500 identical
-    # v9 template datagrams filed 500 "Received 1 template(s)" lines: the
-    # third unthrottled log call on this path, and the only one a healthy
-    # exporter triggers for ever.
+    # _read_templates counts every store, re-sends included, so unthrottled
+    # this filed one line per datagram.
     log = EventLog()
     flow_db = FlowDatabase(db_path("c13-templates.db"))
     collector = Collector(flow_db, log=log)

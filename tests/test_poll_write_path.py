@@ -335,11 +335,7 @@ def pool_and_walks():
 
 
 def software_version_survives_a_lost_vendor_get():
-    """_poll_software_version returned all three sw_* keys whatever
-    happened, so record_poll's "only set when the poll actually read them"
-    guard -- which decides on the keys being PRESENT -- could never
-    decline, and one timed-out vendor GET wrote NULL over a stored
-    version."""
+    """A timed-out vendor GET must not write NULL over a stored version."""
     print("\n-- a lost vendor GET does not empty the firmware column")
 
     proc, port = spawn_stub("stub_agent_vendor_health.py", "cisco")
@@ -360,8 +356,7 @@ def software_version_survives_a_lost_vendor_get():
         device = db.device(device_id)
         config = db.effective_config(device)
         identity, _uptime, _metrics = poller._poll_snmp_scalars(device, config)
-        # A device whose version comes only from the vendor OID: no sysDescr
-        # rule can stand in for the GET that just failed.
+        # No sysDescr rule can stand in for the failed vendor OID GET here.
         identity = {**identity, "sys_descr": "", "vendor_arc": "1.3.6.1.4.1.14988"}
         real_get = poller._snmp_get
 
@@ -382,8 +377,7 @@ def software_version_survives_a_lost_vendor_get():
               f"...and the stored version survives the failed poll "
               f"({db.device(device_id)['sw_version']!r} was {stored!r})")
 
-        # A device that genuinely ANSWERS with nothing is a real change of
-        # fact, and still clears the column.
+        # A device that genuinely answers with nothing is a real change; the column still clears.
         poller._snmp_get = lambda *a, **kw: _EmptyResponse()
         try:
             fields = poller._poll_software_version(device, config, identity)

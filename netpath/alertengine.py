@@ -332,8 +332,7 @@ class AlertEngine(Worker):
         # maintenance mode is quiet here too, and it has no until_ts to fold
         # into a dict keyed on one. Membership is all this gate reads.
         muted = self.db.quiet_device_ids(window_covered=window_covered)
-        # Read once per tick like `muted`, checked in _apply where the rule
-        # is known.
+        # Read once per tick like `muted`, checked in _apply where the rule is known.
         rule_muted = self.db.muted_entity_ids(DEVICE_RULE_KIND)
         for occurrence in occurrences:
             self.counters["evaluated"] += 1
@@ -614,10 +613,7 @@ class AlertEngine(Worker):
         return True
 
     def _rule_muted(self, rule, occurrence: Occurrence, rule_muted) -> bool:
-        """True when THIS rule is muted on the device this occurrence is
-        about. In _apply, not beside _muted, because the answer needs the
-        rule too; device_id_for gives it a device mute's exact reach.
-        """
+        """True when this rule is muted on the device this occurrence is about."""
         rule_key = rule["key"] or ""
         if not rule_key:
             return False
@@ -648,8 +644,7 @@ class AlertEngine(Worker):
             return False
         if self.db.mute_row("device", str(device_id)) is not None:
             return True
-        # Or muting one rule would stop its alerts opening and still mail
-        # about the ones already open. Callers pass the rule they hold.
+        # A per-rule mute also stops here, so alerts already open still get mailed as usual.
         rule = rule_row if rule_row is not None else self.db.rule(alert_row["rule_id"])
         rule_key = (rule["key"] or "") if rule is not None else ""
         if rule_key and self.db.mute_row(
@@ -3014,8 +3009,7 @@ class AlertEngine(Worker):
         url = str(settings.get("webhook_url") or "").strip()
         if not url:
             return
-        # Everything recorded about this delivery names the host, for
-        # _webhook_result's reason. These rows used to carry the whole URL.
+        # Recorded notifications name the host (webhook_host), not the whole URL.
         to_addr = webhook_host(url)
         now = time.time()
         hour_ago = now - 3600

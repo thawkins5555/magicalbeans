@@ -412,12 +412,10 @@ CREATE INDEX IF NOT EXISTS ix_device_maintenance_device
 """
 
 # How long a mute may last. The dropdown offers 1/6/12/24 hours and 7 days;
-# the cap is here so a hand-made API call cannot silence a device until next
-# year. A maintenance window is still the mechanism for longer than this.
+# the cap is here so a hand-made API call cannot silence a device until next year.
 MAX_MUTE_HOURS = 168.0
 
-# A mute covering ONE rule on ONE device. Rule keys never carry a colon, so
-# "<device_id>:<rule_key>" splits unambiguously — no column, no migration.
+# A mute covering ONE rule on ONE device; rule keys never carry a colon, so "<device_id>:<rule_key>" splits unambiguously.
 DEVICE_RULE_KIND = "device_rule"
 
 
@@ -2423,9 +2421,8 @@ class AlertsDatabase(SqliteStore):
                 self._conn.execute(
                     "DELETE FROM alert_mutes WHERE entity_kind = 'device'"
                     " AND entity_id = ?", (old_key,))
-            # Per-rule mutes move by rewriting the device half of their id.
-            # OR IGNORE because the winner may already hold the same rule's
-            # mute, and a merge must never fail on a constraint.
+            # Per-rule mutes move by rewriting the device half of their id;
+            # OR IGNORE since the winner may already hold the same rule's mute.
             cur = self._conn.execute(
                 "UPDATE OR IGNORE alert_mutes SET entity_id = ?"
                 " || substr(entity_id, ?) WHERE entity_kind = ?"

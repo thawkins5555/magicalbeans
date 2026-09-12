@@ -1,20 +1,6 @@
-"""Four store- and API-level fixes from the 5.11.0 review, each pinned by the
-thing that was wrong rather than by the code that is now right:
-
-  * ipamdb.conflicts() paged unstably over rows a single scan stamped with the
-    same last_seen_ts;
-  * an upgraded nodes.db carried the pre-5.10.0 `detail_fields` default, so
-    the software version and image lines never appeared on any install that
-    had ever opened Nodes -> Settings;
-  * the neighbours pane resolved every unmanaged neighbour's address with its
-    own queries -- 400 neighbours were 1,200 statements per request, on a pane
-    the browser re-reads every tick;
-  * the mute audit trail named a device+rule pair as one opaque string and
-    threw away the device id the handler had already worked out.
-
-Stores and handlers directly: none of these needs a socket, and three of them
-are about how many statements reach SQLite.
-"""
+"""Four store- and API-level fixes from the 5.11.0 review: ipamdb.conflicts()
+tie-order paging, nodes.db's detail_fields upgrade default, batched
+neighbour-address resolution, and the mute audit trail's device id."""
 import os
 import shutil
 import sqlite3
@@ -40,11 +26,8 @@ def check(name, ok, detail=""):
 
 try:
     # -------------------------------------------------- conflicts() tie order
-    #
-    # One scan opens every conflict it finds inside the same second, so
-    # `ORDER BY last_seen_ts DESC` alone left SQLite free to return the tied
-    # rows in any order it liked -- and a caller paging over the list could
-    # see one row twice and miss another entirely.
+    # Ties on last_seen_ts need a deterministic secondary order, or paging
+    # over the list can duplicate or skip rows.
     ipam = IpamDatabase(os.path.join(TMPDIR, "ipam.db"))
     for index in range(12):
         ipam.record_conflict(f"198.51.100.{index}", "aa:bb:cc:00:00:01",
@@ -64,8 +47,7 @@ try:
     check("...and include_resolved=True is ordered the same way",
           with_resolved == sorted(with_resolved, reverse=True), with_resolved)
 
-    # Both halves of the list are still reachable across a page boundary:
-    # the top 6 and the next 6 together are every row, each exactly once.
+    # Top 6 and next 6 together are every row, each exactly once.
     page_one, page_two = first[:6], first[6:]
     check("paging over the tie sees each conflict exactly once",
           sorted(page_one + page_two) == sorted({*page_one, *page_two})
@@ -73,21 +55,15 @@ try:
     ipam.close()
 
     # ----------------------------------------- detail_fields after an upgrade
-    #
-    # 5.10.0 widened this default to add the software version and image lines.
-    # A stored value beats a default, so every install that had ever saved
-    # Nodes -> Settings kept the old three-field string and never saw either
-    # new line: the feature shipped invisible to exactly the configured
-    # installs.
+    # 5.10.0 widened this default; a stored old value must be rewritten once
+    # so upgraded installs see the new lines.
     OLD = "sys_descr,vendor,snmp_version"
     NEW = NODE_DEFAULTS["detail_fields"]
     check("the shipped default still carries both 5.10.0 lines",
           "sw_version" in NEW and "sw_image" in NEW, NEW)
 
     def open_nodes(name, stored=None, seen_migration=True):
-        """A nodes.db with `stored` already in its settings table, opened the
-        way the application opens it. `seen_migration=False` reproduces an
-        install upgrading for the first time."""
+        """A nodes.db with `stored` in its settings table; `seen_migration=False` reproduces a first-time upgrade."""
         path = os.path.join(TMPDIR, name)
         if stored is not None:
             db = NodesDatabase(path)
@@ -121,8 +97,7 @@ try:
           custom.settings()["detail_fields"])
     custom.close()
 
-    # And it is a ONE-TIME rewrite: an operator who later picks those same
-    # three fields keeps them through the next restart.
+    # One-time rewrite: picking those same three fields afterward keeps them on restart.
     rechosen = open_nodes("nodes-rechosen.db", OLD)
     check("an operator who picks those three fields after the upgrade keeps "
           "them",
@@ -149,9 +124,7 @@ try:
           "192.0.2.77" not in hits and "" not in hits, sorted(hits))
     check("an empty request asks nothing", nodes.devices_by_addresses([]) == {})
 
-    # The point of the method: the statement count does not grow with the
-    # number of addresses. Counted at the connection, which is where the cost
-    # actually lands.
+    # Statement count should not grow with address count; counted at the connection.
     statements = []
     nodes._conn.set_trace_callback(statements.append)
     try:
@@ -201,11 +174,8 @@ try:
     nodes.close()
 
     # ------------------------------------ the mute audit names the device id
-    #
-    # A per-rule mute's entity_id is the device and the rule key joined, so
-    # the audit target alone did not say which device had been silenced --
-    # in the one log that exists to answer exactly that. The handler already
-    # had the id and threw it away.
+    # A per-rule mute's entity_id joins device+rule_key, so the audit target
+    # alone didn't say which device was silenced.
     import inspect
 
     mute_source = inspect.getsource(web_api.post_alerts_mute)

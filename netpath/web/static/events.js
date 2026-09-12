@@ -264,9 +264,7 @@
       view.hist = overview;
       view.rows = search[spec.rowsKey];
       const total = overview.buckets.reduce((sum, b) => sum + b.total, 0);
-      // bucket is what we asked for; overview.bucket_s is what the server
-      // used, which is wider whenever the window would have overrun
-      // HIST_MAX_BUCKETS. The bars are drawn at the width they cover.
+      // overview.bucket_s is the server's actual width, wider past HIST_MAX_BUCKETS.
       view.histPlot = App.plottedRange(overview.buckets,
                                        overview.bucket_s ?? bucket, t0, t1);
       const p = view.histPlot;
@@ -541,11 +539,8 @@
       .map((v) => `${v.name}=${v.text}`).join('  ');
   }
 
-  /* The sending device's community — its USM user name on v3 — for the
-     account looking at it. api.py sends the value only to callers who could
-     change SNMP settings and drops the key for everyone else, leaving
-     has_community: "—" is the trap that carried none, and a trap that
-     carried one says so without naming it. */
+  /* api.py sends community only to callers who can change SNMP settings;
+     has_community distinguishes "carried none" from "value withheld". */
   function communityText(row) {
     if (row.community) return row.community;
     if (!('community' in row) && row.has_community) return 'not shown';
@@ -580,9 +575,7 @@
       { key: 'version', label: 'Ver', width: 54, on: true,
         value: (r) => r.version_name || '', cell: (r) => escape(r.version_name) },
       { key: 'community', label: 'Community / user', width: 130, on: true,
-        // The sort value is blank where the cell is a dash: app.js sorts
-        // blanks last whichever way the column points, and a row with no
-        // community is absent, not smallest.
+        // Blank sort value so app.js sorts no-community rows last, not smallest.
         value: (r) => (r.community || (!('community' in r) && r.has_community ? 'not shown' : '')),
         cell: (r) => escape(communityText(r)) },
       { key: 'trap', label: 'Trap', width: 200, on: true,

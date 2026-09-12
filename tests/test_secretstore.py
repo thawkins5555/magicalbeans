@@ -287,15 +287,7 @@ def test_world_readable_passphrase_file_refused():
 def test_foreign_owned_passphrase_file_refused():
     """CREDENTIAL-SECURITY.md promises the file is refused unless it is
     chmod 600 *and* owned by the account the service runs as. Only the mode
-    half was enforced.
-
-    This used to `return check(..., True)` on Windows or as a non-root user,
-    which between them is every runner the suite actually runs on -- so the
-    refusal it names shipped never once executed. The ownership check reads
-    `secretstore._POSIX` and `os.getuid()`, and both are patchable; what the
-    real chown gave (a 0600 file whose st_uid is somebody else's) a patched
-    `os.stat` gives just as truthfully, and on every platform.
-    """
+    half was enforced."""
     reset()
     path = passphrase_file("owned by somebody else\n")
     os.environ[ss.ENV_PASSPHRASE_FILE] = path
@@ -314,10 +306,7 @@ def test_foreign_owned_passphrase_file_refused():
             same = False
         if not same:
             return info
-        # st_mode is index 0 of the 10-tuple stat_result is built from and
-        # st_uid is index 4. The mode is forced to a real 0600 because
-        # Windows' chmod cannot produce one, and leaving it would trip the
-        # mode refusal above and never reach the ownership half under test.
+        # fields[0]=st_mode, fields[4]=st_uid; force 0600 since Windows chmod can't.
         fields = list(info[:10])
         fields[0] = stat_mod.S_IFREG | 0o600
         fields[4] = THEIRS
@@ -350,8 +339,7 @@ def test_foreign_owned_passphrase_file_refused():
             ok, detail = False, str(exc)
         check("...and accepted once it belongs to this account", ok, detail)
 
-        # root is allowed on purpose: a service started as root before
-        # dropping privileges reads a root-owned file.
+        # root is allowed: a service drops privileges after reading a root-owned file.
         os.getuid = lambda: OURS
         fields = list(real_stat(path)[:10])
         fields[0] = stat_mod.S_IFREG | 0o600
@@ -378,10 +366,7 @@ def test_foreign_owned_passphrase_file_refused():
 
 
 def test_foreign_owned_check_is_skipped_off_posix():
-    """The refusal above is POSIX-only on purpose -- Windows has no
-    meaningful st_uid -- and _POSIX is what says so. With it False the same
-    foreign-owned file is accepted, which is the behaviour a Windows host
-    gets and the reason the check needs a flag rather than an inline test."""
+    """POSIX-only: Windows has no meaningful st_uid, so _POSIX gates it off."""
     reset()
     path = passphrase_file("owned by somebody else\n")
     os.environ[ss.ENV_PASSPHRASE_FILE] = path

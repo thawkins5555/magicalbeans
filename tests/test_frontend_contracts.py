@@ -2155,10 +2155,8 @@ check("/credential`, credential)\n              .catch(() => {})" not in _ADD_PA
       "toasted after the dialog closes on the row that was added")
 
 # ---------------------------------------------------------------------------
-# The anchors in sections 48 and 49 are looked up through _slice59(), which
-# answers "" for a fragment that is no longer there: a check that has been
-# edited out of the code should read as a failed contract here, not as a
-# traceback that hides every check after it.
+# _slice59 returns "" for a missing anchor, so an edited-out check fails
+# here rather than crashing and hiding every check after it.
 def _slice59(body, start, end=None):
     if start not in body:
         return ""
@@ -2628,10 +2626,6 @@ check("'(not in Nodes)'" in _NB52 or "(not in Nodes)" in _NB52,
       "...while still saying plainly that the neighbour is not a Nodes device")
 
 # --- 53. 5.11.0: the Debug log resyncs itself after a server restart ---------
-# "The event log randomly clears" was the page holding a cursor from the
-# previous process: seq restarts at 0, so since=<old seq> matched nothing
-# ever again. These four lines are the resync and the capacity that replaced
-# the hardcoded ring; each was a one-line omission that produced the bug.
 DEBUG52 = read("debug.js")
 check("payload.last_seq < view.seq" in DEBUG52,
       "debug.js notices the server's cursor has gone backwards (a restart) "
@@ -2678,21 +2672,15 @@ check("rule_muted_count" in NODES53,
       "muted rule is not drawn as fully alerting")
 
 # ---------------------------------------------------------------------------
-# 54. 5.11.0 FIX LANE: the defects a review found in the shipped browser code.
-#     Each is one line of text in a file no linter reads, and each was a wrong
-#     answer on screen rather than a style preference.
+# 54. 5.11.0 FIX LANE: defects a review found in the shipped browser code.
 NODES54 = read("nodes.js")
 EVENTS54 = read("events.js")
 DEBUG54 = read("debug.js")
 ALERTS54 = read("alerts.js")
 NETPATH54 = read("netpath.js")
 
-# 54a. A device deleted from another session while it was selected, and off
-#      the page on screen (refresh() keeps an off-page selection on purpose
-#      since 4.47.0), made loadDetail() 404 every tick. The rejection reached
-#      runRefresh, which called connected(false): the stale banner came up
-#      over a healthy server and never cleared, because the selection that
-#      caused it never moved.
+# 54a. A device deleted elsewhere while selected made loadDetail() 404 every
+#      tick, raising runRefresh's stale-connection banner and never clearing it.
 _LOAD54 = _slice59(NODES54, "  async function loadDetail() {",
                    "  /* One sub-pane fetched and redrawn on its own")
 check(_LOAD54 and "catch (error)" in _LOAD54 and "isMissing(error)" in _LOAD54,
@@ -2714,11 +2702,8 @@ check(_NODES_REFRESH59
       "...while refresh() still keeps an off-page selection: one page is not "
       "the fleet, and \"not in this list\" still does not mean \"gone\"")
 
-# 54b. api.py sent `community: ""` to an account that may not read it, which
-#      is exactly what a trap carrying no community looks like -- and on v3
-#      it threw the USM user name away with it. The sibling _community_fields
-#      omits the key instead, and the Nodes device form has always said
-#      "stored value not shown" for the absence.
+# 54b. api.py sent `community: ""` to accounts that can't read it, indistinguishable
+#      from a trap that carried none; the sibling _community_fields omits the key instead.
 check("function communityText(row)" in EVENTS54,
       "events.js decides the Community / user cell in one place")
 check("if (!('community' in row) && row.has_community) return 'not shown';"
@@ -2730,38 +2715,28 @@ check("cell: (r) => escape(communityText(r))" in EVENTS54,
 check(EVENTS54.count("escape(communityText(row))") == 2,
       "...and so do both detail lines, the v3 user and the v1/v2c community")
 
-# 54c. /api/debug's summary answered `false` and `0` for the two NetPath
-#      figures when the account could not see NetPath, so a `debug: read`
-#      operator read "scheduler stopped, 0 of 0 trace workers busy" -- a
-#      fault report about a service that was running perfectly well.
+# 54c. /api/debug answered false/0 for NetPath figures an account can't see,
+#      reading as a false fault report instead of "no access".
 check("summary.scheduler == null" in DEBUG54,
       "debug.js renders a null scheduler as an em dash, not as 'stopped': "
       "null is 'you cannot see this module'")
 check("summary.workers_total == null" in DEBUG54,
       "...and the same for the worker counts, rather than '0 of 0 busy'")
 
-# 54d. Alerts' configuration lists are read on a 60-second clock, which is
-#      right for a tab left open and wrong for one just opened -- the release
-#      notes and the review both promised a read on opening.
+# 54d. Alerts' config lists were read on a 60s clock, wrong for a tab just opened.
 _ACT54 = _slice59(ALERTS54, "  async function activate(opts) {",
                   "  /* ----------------------------------------------------------- refresh */")
 check(_ACT54 and _before59(_ACT54, "view.configAt = 0;", "if (!opts) return;"),
       "entering the Alerts tab drops the cached configuration BEFORE the "
       "opts guard -- a plain tab switch calls activate() with none")
 
-# 54e. Both histogram pages plotted the bucket width they ASKED for. The
-#      server widens it when the window would overrun HIST_MAX_BUCKETS and
-#      says so in bucket_s, so the bars were drawn at the wrong span for
-#      exactly the windows that get widened.
+# 54e. Both histogram pages plotted the width asked for, not the server's actual (wider) bucket_s.
 for _name, _body in (("alerts.js", ALERTS54), ("events.js", EVENTS54)):
     check("overview.bucket_s ?? bucket" in _body,
           "%s plots the bucket width the server used, not the one it asked "
           "for" % _name)
 
-# 54f. Pause froze the cursor as well as the drawing, so every one-second
-#      poll re-asked for everything since the pause: a paused tab converged
-#      on re-downloading the whole ring, once a second, for as long as it
-#      was held.
+# 54f. Pause froze the cursor too, so a paused tab re-downloaded the whole ring every poll.
 _REF54 = _slice59(DEBUG54, "  async function refresh() {", "  function init()")
 check(_REF54 and "if (payload.events.length) {" in _REF54
       and "if (!view.paused && payload.events.length)" not in _REF54,
@@ -2773,17 +2748,15 @@ check(_REF54 and _before59(_REF54, "view.seq = payload.last_seq;",
 check("if (!view.paused) drawEvents({ append: true });" in DEBUG54,
       "...and Resume paints the buffer that filled while it was held")
 
-# 54g. The restart resync empties the destination select, which is the same
-#      state a reload leaves it in -- but the restore lived inside the batch
-#      block, so a restart quietly moved the page back to "All destinations".
+# 54g. The restart resync emptied the destination select but skipped the
+#      restore, moving the page back to "All destinations".
 check("function restoreSavedTarget(select)" in DEBUG54
       and DEBUG54.count("restoreSavedTarget(select)") >= 3,
       "the remembered Debug destination is restored by the restart resync as "
       "well as by an ordinary batch")
 
-# 54h. One failing secondary series took the whole NetPath page down: the
-#      await rejected refresh(), runRefresh reported the page disconnected,
-#      and the topology fetch and both draws below it never ran.
+# 54h. One failing secondary series rejected refresh() entirely, taking the
+#      topology fetch and both draws below it down too.
 _HTTPS54 = _slice59(
     NETPATH54, "if (currentTarget() && currentTarget().https_url) {",
     "renderWebStat();")
@@ -2795,10 +2768,7 @@ check(_HTTPS54 and "error.superseded" in _HTTPS54,
       "...while a superseded request is still rethrown, so an overlapping "
       "refresh is not mistaken for a failure")
 
-# 54i. "muted" beside a rule name meant either "every alert for this device
-#      is silenced" or "only this rule is, on this device" -- the very
-#      distinction the 5.11.0 per-rule mute exists to make -- with no title
-#      to tell the two apart.
+# 54i. "muted" beside a rule name didn't distinguish a device-wide mute from a per-rule one.
 _TAG54 = _slice59(ALERTS54, "  function mutedTagFor(row) {",
                   "  const alertColumns")
 check(_TAG54 and "'device muted'" in _TAG54 and "'rule muted'" in _TAG54,
@@ -2807,19 +2777,14 @@ check(_TAG54 and "Every alert for this device is muted until" in _TAG54
       and "This rule is muted on this device until" in _TAG54,
       "...and its title says which, and until when")
 
-# 54j. On a deep link the detail pane can paint before the rules load, and an
-#      empty view.rules looks exactly like a deleted rule: for one interval a
-#      live rule was reported as no longer existing.
+# 54j. An empty view.rules (not loaded yet) read as a deleted rule for one interval.
 check("'Loading rules" in ALERTS54 and "(view.rules || []).length" in ALERTS54,
       "an empty rules list reads as 'still loading', not as 'this alert's "
       "rule has been deleted'")
 
 
 # --- 56. 5.11.0: a rule that could not be evaluated says so ----------------
-#      A compliance rule whose pattern the bounded-regex guard refuses fails
-#      closed, and the API carries a `reason` for it. Rendering the
-#      description alone reported the device as non-compliant with no way to
-#      tell that from a rule that never ran.
+#      Fails closed with a `reason`, instead of reading as plain non-compliance.
 CONFIGRX56 = read("configrx.js")
 check("f.reason" in CONFIGRX56,
       "the Failed rules cell shows why a rule could not be evaluated, not "

@@ -699,8 +699,8 @@ class AccessLog:
         self.errors = 0
         self.active = 0
         self.peak_active = 0
-        # Requests being served, which an idle keep-alive connection is none
-        # of though it is one of `active`. stop() waits on this one.
+        # In-flight requests only, unlike `active` which also counts idle
+        # keep-alive connections. stop() waits on this one.
         self.in_flight = 0
         self.started_at = time.time()
         # Per-route latency. Keyed by the route's PATTERN, not by the path:
@@ -1372,10 +1372,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "A numeric value in that request is out "
                                      "of range"}, 400)
             except (BrokenPipeError, ConnectionResetError, TimeoutError):
-                # The client went away mid-write. handle_error narrows this
-                # too, but only sees what escapes finish_request: an abort
-                # raised INSIDE this try was caught below instead, and
-                # answered with a 500 down a socket that had just died.
+                # Client went away mid-write; don't answer a 500 down a dead socket.
                 self.close_connection = True
                 return
             except Exception as exc:
@@ -1591,11 +1588,10 @@ class WebServer:
     # How long stop() gives requests already in flight. daemon_threads means
     # server_close() joins none of them, so without this the teardown that
     # follows — service.shutdown(), which closes every store — can meet a
-    # handler mid-query. It waits on `access.in_flight`: `access.active`
-    # counts open CONNECTIONS, so one idle keep-alive socket turned every
-    # stop() into a flat 2 s sleep while never waiting for the handler this
-    # exists for. Still an upper bound: a WebSocket terminal runs its handler
-    # for as long as the operator keeps the page open.
+    # handler mid-query. It waits on `access.in_flight`, not `access.active`
+    # (which counts open connections, not running handlers). Still an upper
+    # bound: a WebSocket terminal runs its handler as long as the operator
+    # keeps the page open.
     DRAIN_GRACE_S = 2.0
 
     def stop(self) -> None:

@@ -1012,8 +1012,7 @@ TIMELINE_ONLY_EVENT_KINDS = frozenset(
 class NodesDatabase(SqliteStore):
     SCHEMA = SCHEMA
     DEFAULTS = DEFAULTS
-    # What "detail_fields" defaulted to before 5.10.0, and the bookkeeping
-    # row that says the one-time rewrite below has already run.
+    # Pre-5.10.0 detail_fields default, and the marker that the one-time rewrite ran.
     _DETAIL_FIELDS_PRE_5_10 = "sys_descr,vendor,snmp_version"
     _DETAIL_FIELDS_MIGRATED = "detail_fields_widened_5_10"
     LABEL = "nodes"
@@ -1336,15 +1335,9 @@ class NodesDatabase(SqliteStore):
                     "('poll_workers_max', ?)", (json.dumps(floor),))
 
 
-        # 5.10.0 added the software version and image lines to the device
-        # detail header by widening this default. A stored value wins over a
-        # default, so every install that had ever opened Nodes -> Settings
-        # carried the OLD default string in nodes.db and never saw either
-        # new line -- the feature shipped invisible to exactly the installs
-        # that had been configured. Rewritten once, and only where the
-        # stored string IS the old default: a value an operator chose is
-        # never touched, and the marker below means an operator who later
-        # picks those same three fields keeps them through the next restart.
+        # One-time widen: a stored detail_fields equal to the pre-5.10.0
+        # default is rewritten to the new default; any other stored value
+        # (an operator's own choice) is left alone.
         if not self._private_setting(self._DETAIL_FIELDS_MIGRATED):
             row = self._conn.execute(
                 "SELECT value FROM settings WHERE key = 'detail_fields'").fetchone()
@@ -1883,24 +1876,12 @@ class NodesDatabase(SqliteStore):
         return rows
 
     def devices_by_addresses(self, ips) -> dict:
-        """{ip: device row} for the addresses that name a device, by the same
-        rule device_id_for_address applies one at a time: the primary `ip`
-        column first, then the most recently seen alias.
-
-        Asked one address at a time, this was three lock acquisitions and up
-        to four statements EACH, on a pane the browser re-reads every tick:
-        400 unmanaged CDP neighbours cost 1,200 statements per request. Here
-        it is two statements per chunk of addresses plus one batch read for
-        the alias hits, whatever the neighbour count. Addresses that name
-        nothing are simply absent from the answer.
-        """
+        """{ip: device row} for addresses that name a device, by the same rule device_id_for_address applies one at a time (primary `ip` column first, then most recent alias) -- batched instead of one address at a time, which cost 1,200 statements per request for 400 CDP neighbours."""
         wanted = [t for t in dict.fromkeys(str(ip or "").strip() for ip in ips) if t]
         if not wanted:
             return {}
         found: dict = {}
-        # ip -> (seen_ts, device_id) for the addresses only an alias answers,
-        # resolved to rows in one go below. ORDER BY seen_ts DESC LIMIT 1 is
-        # per-address, so it is kept here rather than asked of SQLite.
+        # ip -> (seen_ts, device_id) for alias-only hits; most-recent picked here, not in SQL.
         aliases: dict = {}
         with self._lock:
             for start in range(0, len(wanted), self._IDS_PER_QUERY):
@@ -3509,11 +3490,7 @@ class NodesDatabase(SqliteStore):
                 ).fetchall()
 
     def neighbour_addresses(self, limit: int = 500) -> list[str]:
-        """The addresses present neighbour rows identify themselves by — CDP's
-        cdpCacheAddress and an LLDP subtype-5 (network address) chassis id —
-        for the background resolver to name, so the Neighbours table's own
-        naming stays a cache read. nodepoll is imported inside the method
-        because it imports this module."""
+        """Addresses present neighbour rows identify by (CDP's cdpCacheAddress and an LLDP subtype-5 chassis id), for the background resolver to name. nodepoll is imported here to avoid a circular import."""
         from .nodepoll import format_chassis_address
 
         with self._lock:

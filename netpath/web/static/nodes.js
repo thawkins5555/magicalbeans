@@ -807,18 +807,14 @@
 
   const DETAIL_EMPTY_TEXT = 'Select a device to see its stats.';
 
-  /* The placeholder that stands where the detail pane would be, with the
-     sentence for the occasion: the ordinary invitation, or loadDetail's
-     "that one is gone". */
+  /* Placeholder shown where the detail pane would be: the ordinary invitation, or loadDetail's "that one is gone". */
   function showDetailEmpty(text) {
     App.setText(App.el('nd-detail-empty'), text || DETAIL_EMPTY_TEXT);
     App.el('nd-detail-empty').hidden = false;
     App.el('nd-detail').hidden = true;
   }
 
-  /* A refusal that means "no such row", not "the server is unreachable".
-     api.py's _require raises ValueError, which server.py answers 400 with
-     "No such device"; a 404 is the other shape the same answer can take. */
+  /* "No such row", not "server unreachable": api.py's _require raises ValueError, answered as a 400 "No such device"; 404 is the other shape. */
   function isMissing(error) {
     return !!error && (error.status === 404
                        || (error.status === 400
@@ -855,12 +851,8 @@
         sub ? App.get(`/api/nodes/devices/${deviceId}/${sub.path}`) : null,
       ]);
     } catch (error) {
-      // The selection can be off the page on screen (refresh() keeps it —
-      // one page is not the fleet), so the only thing that can tell us the
-      // device is gone is this fetch. Deleted from another session it 404s
-      // every tick, and rethrowing made runRefresh report a transport
-      // failure and raise the stale banner for as long as the selection
-      // stood. Said once, here, and the selection moves on.
+      // Deleted from another session, this fetch 404s every tick; rethrowing
+      // made runRefresh raise the stale-data banner instead. Said once, here.
       if (!isMissing(error)) throw error;
       if (view.selected !== deviceId) return;
       showDetailEmpty('That device has been removed.');
@@ -3031,13 +3023,8 @@
       // so seeing that device's own detail should be one click, not a
       // separate search. An unmatched neighbour names whatever it reported
       // about itself and says plainly that Nodes could not place it.
-      // A neighbour that only named itself by IP carries the name the API
-      // resolved. The address goes on a visible second line, the way the
-      // firmware report prints a device's: as a title alone on a span
-      // nothing can focus, it was unreachable from the keyboard, invisible
-      // on a touch screen and uncopyable — and the address is the thing an
-      // operator takes to the next tool. The title stays for the hover, and
-      // is what says the name came from a PTR record.
+      // Address shown on a visible line, not title-only (unreachable by
+      // keyboard, invisible on touch, uncopyable); title still says when it came from PTR.
       let remote;
       if (r.matched_device_id != null) {
         remote = `<button class="linkish nd-nb-link" data-device="${r.matched_device_id}">` +

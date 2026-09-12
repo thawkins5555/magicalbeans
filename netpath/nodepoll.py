@@ -1038,12 +1038,7 @@ def format_cdp_address(raw) -> str:
 
 
 def format_chassis_address(raw) -> str:
-    """An LLDP chassis id of subtype 5 (network address) as a plain address
-    literal, or "" when it does not decode to one. Subtype 5 is an IANA
-    address-family byte followed by the address, so the raw form the
-    OCTET_STRING decoder hands back is five hex bytes for IPv4
-    ("01 0A 28 00 09") and seventeen for IPv6; an agent that writes the
-    dotted form straight into the varbind is returned unchanged."""
+    """An LLDP chassis id of subtype 5 (network address) as a plain address literal, or "" if it does not decode to one."""
     text = str(raw or "").strip()
     if not text:
         return ""
@@ -1816,9 +1811,7 @@ class NodePoller(Worker):
 
     def begin_stop(self) -> None:
         self._stop.set()
-        # Only reconfigure()'s enabled branch refills this cache, so with
-        # polling off it would go stale under start_oid_walk, which runs
-        # either way. Dropped here, _walk_limits reads the live settings.
+        # Dropped here so _walk_limits re-reads live settings instead of a stale cache.
         self._walk_settings = None
         for job in list(self._discovery_jobs.values()):
             job.cancel()
@@ -2987,18 +2980,13 @@ class NodePoller(Worker):
             except SnmpBadOid as exc:
                 # An OID this poll was configured with cannot be encoded --
                 # a MIB object or an override carrying an arc that is not a
-                # non-negative integer, refused by enc_oid. Before the
-                # generic arm below, which this used to BE -- and so named
-                # an OID for every ValueError a poll could raise, sending
-                # operators to edit a perfectly good one.
+                # non-negative integer, refused by enc_oid.
                 snmp_ok = False
                 snmp_error = (f"an OID configured for this device is not a "
                               f"valid object identifier: {exc}")
                 self._bump("errors")
             except ValueError as exc:
-                # Everything else. The arm stays -- without it a ValueError
-                # escaped to _run_one, record_poll never ran and the device
-                # row froze for good -- but it no longer blames an OID.
+                # Everything else; kept so a ValueError doesn't freeze the device row.
                 snmp_ok = False
                 snmp_error = f"the poll could not be completed: {exc}"
                 self._bump("errors")
@@ -3772,9 +3760,7 @@ class NodePoller(Worker):
 
     def _identity_extras_detail(self, device, config: dict,
                                 oids: list[str]) -> tuple:
-        """(answers, whether the GET itself got a reply) — the distinction
-        an empty dict cannot make. Only _poll_software_version needs it,
-        because only it writes NULL over a stored column."""
+        """(answers, whether the GET itself got a reply); only _poll_software_version needs the distinction."""
         if not oids:
             return {}, True
         try:
@@ -3786,14 +3772,7 @@ class NodePoller(Worker):
                                        "endOfMibView")}, True)
 
     def _poll_software_version(self, device, config: dict, identity: dict) -> dict:
-        """`sw_version`/`sw_image`/`sw_image_file` for the identity dict, via
-        one extra GET — or NO KEYS AT ALL when this poll learned nothing.
-
-        record_poll writes these three only when the keys are present, so
-        returning them unconditionally let one timed-out vendor GET write
-        NULL over a stored version. A device that genuinely ANSWERED with
-        nothing still gets NULLs: that is a real change of fact.
-        """
+        """`sw_version`/`sw_image`/`sw_image_file` for the identity dict, via one extra GET — or no keys at all when this poll learned nothing."""
         arc = identity.get("vendor_arc")
         oids = list(swversion.oids_for(arc))
         scalars, answered = self._identity_extras_detail(device, config, oids)
@@ -4546,14 +4525,7 @@ class NodePoller(Worker):
 
     def _custom_mib_values(self, device, config: dict,
                            instance_oids: list[str]) -> dict:
-        """oid -> varbind for a whole MIB's scalars, in batches this device
-        has been shown to cope with.
-
-        One session and one credential for the whole read, the way
-        _poll_interfaces holds its own: _snmp_get opens a socket and
-        re-decrypts the v3 blob per call, so IP-MIB's 267 objects cost
-        eleven ephemeral ports and twenty-two key derivations a poll.
-        """
+        """oid -> varbind for a whole MIB's scalars, in batches this device has been shown to cope with. One session for the whole read, like _poll_interfaces: opening one per call cost IP-MIB's 267 objects eleven ephemeral ports and twenty-two key derivations a poll."""
         device_id = device["id"]
         batch = self._get_batch.get(device_id) or self._CUSTOM_MIB_BATCH
         values: dict = {}
@@ -4726,9 +4698,8 @@ class NodePoller(Worker):
         # one of each per interface: a 512-port chassis otherwise opens
         # 512 ephemeral UDP ports and re-decrypts the stored v3 password
         # 512 times, per device, per poll.
-        # The credential FIRST: it refuses a malformed one by raising, and
-        # raised between the socket opening and the try, that leaked the
-        # socket on every poll of a misconfigured device.
+        # Credential first: it can raise on a malformed one, and raising after
+        # opening the socket leaked it.
         credential = credential_for(config)
         session = self._session_for(device, config)
         try:
@@ -4843,11 +4814,7 @@ class NodePoller(Worker):
         return rows, complete, reason, note
 
     def _table_walk_deadline(self, config: dict, interval_key: str) -> float:
-        """The wall-clock budget for one whole-device table walk, off the
-        cadence THAT walk runs on — _walk_column_detail's own floor and
-        fraction against the right clock, since poll_interval_s cut an
-        hourly table walk off at sixty seconds. Falls back to
-        poll_interval_s, so it can only widen the budget."""
+        """Wall-clock budget for one table walk, off its own cadence rather than poll_interval_s (which cut an hourly walk off at 60s); falls back to poll_interval_s, so it only widens the budget."""
         interval = float(config.get(interval_key) or 0)
         if interval <= 0:
             interval = float(config.get("poll_interval_s") or 120)
@@ -6398,10 +6365,7 @@ class NodePoller(Worker):
         cannot tell us" and "this switch has learned nothing" are different
         facts, and only the second should overwrite what we already stored.
 
-        None as well whenever an FDB column walk did not reach the end of
-        its subtree — _walk_arp_table's rule, for its reason: handed to
-        replace_mac_entries, a truncated table marks every row past the
-        truncation absent, and a walk cut short is not evidence of absence.
+        Also None when an FDB column walk did not finish: a truncated table is not evidence of absence, so nothing is overwritten.
         """
         device = self.db.device(device_id)
         if device is None:
@@ -6410,8 +6374,7 @@ class NodePoller(Worker):
         if not config.get("snmp_enabled", True):
             return None
 
-        # On mac_table_interval_s, not the poll interval _walk_column_detail
-        # would otherwise derive a budget from.
+        # Budget off mac_table_interval_s, not the poll interval.
         deadline = self._table_walk_deadline(config, "mac_table_interval_s")
         port_map = self._bridge_port_map(device, config, deadline=deadline)
         is_cisco = detected_vendor(device).lower() == "cisco"
@@ -6981,9 +6944,7 @@ class NodePoller(Worker):
     # entry is walked as its own column (the same one-GETBULK-walk-per-
     # column shape _fdb_entries' callers already use for the FDB), then
     # joined back together on the shared lldpRemTimeMark.lldpRemLocalPortNum.
-    # lldpRemIndex suffix in _walk_lldp. A column that stops short is
-    # therefore NOT absorbed into a row with that field left blank: see
-    # read_device_neighbors on why the whole pass is discarded instead.
+    # lldpRemIndex suffix in _walk_lldp. A short column no longer fills a blank-field row; see read_device_neighbors for why the pass is discarded instead.
     _LLDP_COLUMNS = {
         "chassis_id_subtype": nodeoids.LLDP_REM_CHASSIS_ID_SUBTYPE,
         "chassis_id":         nodeoids.LLDP_REM_CHASSIS_ID,
@@ -7029,23 +6990,13 @@ class NodePoller(Worker):
         if not answered:
             return None
         if not complete:
-            # A column that stopped early still lets the columns that
-            # finished produce rows — with its own field blank, and every
-            # row past the truncation aged out. Same verdict as the MAC and
-            # ARP walks: leave storage alone. The cost, as there, is a
-            # device whose agent refuses one column outright storing no
-            # neighbours rather than storing them with that field blank.
+            # A short column would still produce rows with that field blank; same verdict as the MAC/ARP walks — leave storage alone.
             return None
         return entries
 
     def _walk_lldp(self, device, config: dict,
                    deadline: float | None = None) -> tuple:
-        """(neighbour rows, whether the device answered anything, whether
-        every column walk reached the end of its subtree). See nodeoids'
-        LLDP block for why lldpRemLocalPortNum is used directly as the
-        local ifIndex rather than resolved through lldpLocPortTable, and
-        read_device_neighbors for what the third element is for.
-        """
+        """(neighbour rows, whether the device answered anything, whether every column walk reached the end of its subtree). See nodeoids' LLDP block for why lldpRemLocalPortNum is used directly as the local ifIndex."""
         values: dict[str, dict] = {}
         answered = False
         complete = True
@@ -7094,10 +7045,7 @@ class NodePoller(Worker):
 
     def _walk_cdp(self, device, config: dict,
                   deadline: float | None = None) -> tuple:
-        """(neighbour rows, whether the device answered anything, whether
-        every column walk finished) from CISCO-CDP-MIB's cdpCacheTable.
-        Indexed by cdpCacheIfIndex directly, so — unlike LLDP above — no
-        local-port assumption is needed."""
+        """(neighbour rows, whether the device answered anything, whether every column walk finished) from CISCO-CDP-MIB's cdpCacheTable."""
         values: dict[str, dict] = {}
         answered = False
         complete = True
@@ -7219,8 +7167,7 @@ class NodePoller(Worker):
                 device, config, oid, deadline=deadline)
             if column and evidence:
                 answered = True
-            # Every column, evidence=False included: half a bridge-port
-            # map resolves the others against the wrong interfaces.
+            # Every column, evidence=False included: half a bridge-port map is wrong too.
             complete = complete and column_done
             return column
 
@@ -7421,10 +7368,7 @@ class NodePoller(Worker):
         if not answered:
             return None
         if not complete:
-            # A truncated egress bitmap drops real memberships and a
-            # truncated untagged one relabels access ports as tagged, and
-            # all three replace_* writers age out what this pass did not
-            # report. Same verdict as the MAC and neighbour walks.
+            # A truncated bitmap drops or mislabels real memberships; same verdict as the MAC/neighbour walks.
             return None
 
         # (d) mac_entries fallback — evidence, not configuration, only for
@@ -7805,12 +7749,7 @@ class NodePoller(Worker):
 
 
 class SnmpBadOid(ValueError):
-    """An OID this poller was asked to send cannot be encoded (enc_oid).
-
-    A ValueError and deliberately NOT an SnmpError: that is what the
-    encoder has always raised, so it still travels past the best-effort
-    `except SnmpError` arms a poll is full of. Its own class is what lets
-    _poll_device name an OID for this and nothing else."""
+    """An OID this poller was asked to send cannot be encoded (enc_oid). Deliberately NOT an SnmpError, so it still travels past `except SnmpError` arms."""
 
 
 def _assemble(build, *args, **kwargs) -> bytes:

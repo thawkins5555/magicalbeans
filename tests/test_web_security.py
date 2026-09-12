@@ -1895,9 +1895,7 @@ end
     real_stderr = sys.stderr
     sys.stderr = captured
     try:
-        # /app.js is served past the route table, so an abort there escapes
-        # to handle_error. /api/state is served from inside _route's try,
-        # where the generic arm used to catch it.
+        # /app.js escapes to handle_error; /api/state is served from inside _route's try.
         for target in (b"/app.js", b"/api/state", b"/api/state"):
             sock = socket.create_connection(("127.0.0.1", PORT), timeout=5)
             # SO_LINGER (1, 0): close() sends an RST rather than a FIN, which
@@ -1914,8 +1912,7 @@ end
     check("D24 a client that resets mid-response prints nothing",
           "Traceback" not in noise, noise[:200])
 
-    # The RST above races the response out of the socket buffer, so it is
-    # real but not decisive. The same abort, made deterministic:
+    # The RST above is real but racy; here the same abort is made deterministic.
     aborting = threading.Event()
 
     def _abort_handler(service, params, body):
@@ -1961,11 +1958,8 @@ end
           captured.getvalue()[:200])
 
     # ------------------------------------------- D25 stop() waits for the traffic
-    #
-    # It waited on access.active, which counts open CONNECTIONS, so a browser
-    # sitting on a page made every stop() sleep the whole grace while never
-    # waiting for a handler -- and the partial request line this used to hold
-    # the server with is that same idle connection.
+    # Now waits on access.in_flight, not access.active (which also counts idle
+    # keep-alive connections).
     saved_access_log = SERVICE.access_log
     quiet_port = _paths.free_tcp_port()
     quiet = WebServer(SERVICE, host="127.0.0.1", port=quiet_port)
@@ -2242,15 +2236,8 @@ end
 
 
     # ---------- D31 what a reader is NOT shown is said, not faked
-    #
-    # Two separate places answered a read-only account with a value that
-    # reads as a fact about the system rather than as "you cannot see this".
-    #
-    # A trap's community came back as "", which is precisely what a trap
-    # carrying none looks like — and on v3 that field is the USM user name,
-    # so the account lost the sender's identity as well. The sibling
-    # _community_fields has always OMITTED the key instead, which is what
-    # lets the page print "not shown" for the absence.
+    # A trap's community came back as "", indistinguishable from a trap that
+    # carried none; the sibling _community_fields omits the key instead.
     status, _h, payload = req("GET", "/api/snmp/traps", cookie=snmp_reader)
     reader_rows = (payload or {}).get("traps", [])
     status, _h, payload = req("GET", "/api/snmp/traps", cookie=snmp_writer)
@@ -2264,9 +2251,8 @@ end
           bool(writer_rows) and writer_rows[0].get("community") == "plant-rw",
           writer_rows[:1])
 
-    # The CSV keeps the column either way: dropping it would change the
-    # header an operator's spreadsheet is built around, and an empty cell
-    # would say "no community" rather than "not shown to you".
+    # CSV keeps the column either way; an empty cell would say "no community"
+    # rather than "not shown".
     status, _h, payload = req("GET", "/api/snmp/traps/export.csv",
                               cookie=snmp_reader)
     csv_text = payload.decode("utf-8", "replace") if isinstance(payload, bytes) \
@@ -2276,11 +2262,8 @@ end
           and "not shown" in csv_text and "plant-rw" not in csv_text,
           csv_text[:300])
 
-    # And /api/debug's summary: `debug: read` alone cannot see NetPath, and
-    # answering False/0 for the scheduler and its workers rendered on the
-    # Debug page as "scheduler stopped, 0 of 0 trace workers busy" — a fault
-    # report about a service that was running perfectly well. None is the
-    # only honest answer, and the page draws it as an em dash.
+    # debug:read can't see NetPath; None (not False/0) is the honest answer,
+    # drawn as an em dash.
     status, _h, payload = req("GET", "/api/debug", cookie=debug_reader)
     summary = (payload or {}).get("summary", {})
     check("D31 a debug:read account is told nothing about the NetPath "

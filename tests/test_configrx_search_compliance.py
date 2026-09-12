@@ -478,10 +478,8 @@ check("finishes in a small fraction of the budget",
 
 
 # ------------------------------- a FIXED inner repeat is not "already repeating"
-#
-# ANY quantifier inside a group marked it ambiguous, fixed `{2}` included, so
-# three of the four patterns anyone writes for a network address were refused
-# while the refusal text itself promised they were fine.
+# ANY quantifier used to mark a group ambiguous, fixed `{2}` included, wrongly
+# refusing common address patterns.
 
 print("the address idioms a compliance rule is actually written with are accepted")
 REAL_WORLD = {
@@ -500,8 +498,7 @@ for label, pattern in REAL_WORLD.items():
     except cs.UnsafeRegex as exc:
         check(f"{label}: should not have been refused", False, str(exc))
 
-# And for the right reason: microseconds against the worst 250-character line
-# each can be handed, not the seconds a real nested repetition takes.
+# Also checks the right reason: microseconds, not the seconds real nested repetition would take.
 WORST_LINES = ("1." * 125, "1" * 250, "a" * 250, "ab" * 125, "a." * 125,
                "0a:" * 83 + "0a")
 for label, pattern in REAL_WORLD.items():
@@ -524,9 +521,8 @@ for still_unsafe in (r"(a+){1,100}b", r"(\d{1,3}){3,}", r"(\s*\w+)+b",
 
 
 # ------------------------- a rule that cannot be compiled fails WITH a reason
-#
-# Failing it CLOSED is right; appending only {rule_id, description} is not --
-# every device flipped to "fail" with nothing saying the rule had never run.
+# Failing closed is right; without a reason every device read as failing for
+# no stated cause.
 
 print("a stored rule compile_bounded refuses fails closed AND says why")
 reason_db = ConfigRxDatabase(os.path.join(TMPDIR, "reason.db"))
@@ -536,8 +532,7 @@ reason_db.add_backup(1, "hostname sw1\nntp server 10.0.0.1\n")
 reason_set = cc.add_rule_set(reason_db, "Refused-rule set")
 good_rule = cc.add_rule(reason_db, reason_set, "NTP is configured",
                         cc.RuleKind.MUST_MATCH, r"^ntp server ")
-# add_rule validates, so a refused pattern gets here the way a deployment
-# holds one: a row written before the guard existed.
+# add_rule validates; this simulates a row written before the guard existed.
 with reason_db._lock:
     reason_db._conn.execute(
         "UPDATE compliance_rules SET pattern = ? WHERE id = ?",

@@ -519,21 +519,16 @@ class SqliteStore:
             added.add(name)
         return added
 
-    # A FULL checkpoint cannot run past another connection's read lock, and
-    # reports that in the first column of its result row (0 completed, 1
-    # busy) rather than raising. Measured: one blocked attempt returns
-    # (1, 3, 2) after blocking the whole 5 s busy_timeout, three more with
-    # that wound down cost 344 ms between them, and the moment the reader
-    # lets go it completes in under a millisecond -- hence the low timeout.
+    # A FULL checkpoint can't run past another connection's read lock,
+    # reporting that in the result row's first column (0 completed, 1 busy)
+    # rather than raising. Measured: retries after the 5s busy_timeout cost
+    # ~344ms total, completing in under a millisecond once the reader lets go.
     CHECKPOINT_RETRIES = 4
     CHECKPOINT_RETRY_TIMEOUT_MS = 50
     CHECKPOINT_RETRY_WAIT_S = 0.05
 
     def _checkpoint_full(self) -> bool:
-        """Fold the log back into the database file. True when it really did.
-
-        The caller holds the store lock.
-        """
+        """Fold the log back into the database file. True when it really did. The caller holds the store lock."""
         if not self._conn.execute("PRAGMA wal_checkpoint(FULL)").fetchone()[0]:
             return True
         restore = self._conn.execute("PRAGMA busy_timeout").fetchone()[0]
@@ -560,11 +555,8 @@ class SqliteStore:
         forces the log back into the database file and syncs it; it costs a
         few milliseconds, on writes that happen a handful of times a year.
 
-        The pragma's own answer used to be dropped on the floor, so a
-        checkpoint another connection's read lock had stopped read exactly
-        like one that had worked -- and the credential the operator was told
-        was saved was still only in the -wal beside the file. It is retried
-        briefly and, if it still cannot run, said out loud.
+        Retried briefly and, if it still cannot run, logged rather than
+        silently dropped.
         """
         with self._lock:
             self._conn.commit()

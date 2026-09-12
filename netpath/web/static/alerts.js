@@ -39,8 +39,7 @@
     hist: null,
     // device entity_id -> until_ts, refreshed with the rest of the page.
     mutes: new Map(),
-    // "<device_id>:<rule_key>" -> until_ts. Its own map beside `mutes`: a
-    // device can be under both at once and neither answers for the other.
+    // "<device_id>:<rule_key>" -> until_ts; separate from `mutes` since a device can be under both.
     ruleMutes: new Map(),
     // device id -> the open maintenance period. Separate from `mutes`
     // because a device can be in both at once and neither answers for the
@@ -233,8 +232,7 @@
       cell: (r) => App.deviceNameLink(r.entity_label,
                                       { id: r.device_id, search: false })
         || '\u2014' },
-    // The tag rides in this column: an operator scanning for alerts that
-    // are not arriving needs the reason beside the rule not raising them.
+    // Tag rides here: an operator scanning for missing alerts needs the reason beside the rule.
     { key: 'rule_name', label: 'Rule', width: 150, on: true,
       cell: (r) => escape(r.rule_name || '\u2014') + mutedTagFor(r) },
     { key: 'message', label: 'Message', width: 260, on: true,
@@ -253,16 +251,9 @@
     { key: 'entity_kind', label: 'Kind', width: 80 },
   ];
 
-  /* A tag beside a rule name when this alert's device is muted, or when this
-     rule alone is muted on it. Rebuilt per draw: view.rules is replaced on
-     every refresh.
-
-     The two are different facts and used to read the same: one word, no
-     title, so "muted" on a row could mean the whole device is silent or
-     only this one rule is — the distinction the 5.11.0 per-rule mute
-     exists to make. Both the wording and the hover now say which, and
-     until when; the device mute is named first because it is the wider of
-     the two and outlives the rule's. */
+  /* Tag beside a rule name when the device or this rule alone is muted;
+     wording and hover say which and until when. Device mute is named
+     first since it's the wider of the two. */
   let ruleKeyById = new Map();
 
   function mutedTagFor(row) {
@@ -539,8 +530,7 @@
     // null. It is in the signature because the mute area is drawn from it.
     const deviceId = row.device_id ? String(row.device_id) : '';
     const mutedUntil = deviceId ? (view.mutes.get(deviceId) || null) : null;
-    // Before the signature, not after: the per-rule mute area is drawn from
-    // this key, so the pane has to rebuild when it changes.
+    // Before the signature: the per-rule mute area depends on this key.
     const rule = (view.rules || []).find((r) => r.id === row.rule_id);
     const ruleKey = rule ? (rule.key || '') : '';
     const ruleMutedUntil = deviceId && ruleKey
@@ -577,11 +567,8 @@
           `${KIND_LABELS[row.entity_kind] || 'an object outside Nodes'}`);
     // A rule the page never loaded (deleted since) has nothing to key on.
     const ruleMuteable = muteable && Boolean(ruleKey);
-    // On a deep link the pane can paint before loadConfig's rules land,
-    // and an empty view.rules looks exactly like a deleted rule — so for
-    // one interval a live rule was reported as gone. An empty list is not
-    // evidence of anything, and the signature rebuilds the pane when it
-    // fills.
+    // An empty view.rules (not loaded yet) looks like a deleted rule; not
+    // evidence of deletion, and the signature rebuilds the pane once it fills.
     const ruleWhy = muteable
       ? ((view.rules || []).length
         ? 'This alert\u2019s rule is no longer in the rules list'
@@ -1845,11 +1832,9 @@
      missing — a link from a ticket is usually to something older than the
      300 rows on screen. */
   async function activate(opts) {
-    // Entering the tab re-reads the configuration lists: loadConfig's
-    // 60-second clock is for a tab left open, not for one just opened, and
-    // both the release notes and the review say they are read on opening.
-    // Before the `opts` guard — a plain tab switch calls activate() with
-    // none, and app.js runs the refresh that acts on this straight after.
+    // Forces a fresh config read on entering the tab (loadConfig's 60s clock
+    // is for a tab left open); before the `opts` guard since a plain tab
+    // switch calls activate() with none.
     view.configAt = 0;
     if (!opts) return;
     const parts = opts.parts || [];
@@ -1945,9 +1930,7 @@
     // A newer refresh already redrew this, or the operator has left.
     if (view.refreshGen !== generation || App.state.tab !== 'alerts') return;
     view.hist = overview.buckets;
-    // The server may widen the bucket it was asked for (HIST_MAX_BUCKETS) and
-    // says so in bucket_s. Plotting the width we asked for drew the bars at
-    // the wrong span for exactly the windows that get widened.
+    // overview.bucket_s is the server's actual width, wider past HIST_MAX_BUCKETS.
     view.histPlot = App.plottedRange(overview.buckets,
                                      overview.bucket_s ?? bucket, t0, t1);
     // No dedicated summary line exists for this histogram yet (unlike

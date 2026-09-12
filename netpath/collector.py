@@ -61,8 +61,7 @@ class Collector(udpsock.UdpReceiver):
         self._settings: dict = {}
         self._allowed: set[str] = set()
         self._versions: set[int] = {V5, V9, IPFIX}
-        # Counted since each throttle's last line, so that line can say
-        # what it stood in for.
+        # Counted since each throttle's last line, for that line to report.
         self._templates_pending = 0
         self._first_seen_pending = 0
 
@@ -159,11 +158,8 @@ class Collector(udpsock.UdpReceiver):
             self._log_first_seen(exporter, data)
         gained = self.decoder.stats["templates"] - templates_before
         if gained:
-            # Outside the throttle: the status strip's last-template time
-            # must move on every re-send, line or no line.
+            # Outside the throttle: last_template must move on every re-send.
             self.counters["last_template"] = time.time()
-            # _read_templates counts every store, re-sends included, so this
-            # was a line per datagram from a perfectly healthy exporter.
             self._templates_pending += gained
             if self._log_netflow_throttled(
                     "templates",
@@ -191,9 +187,7 @@ class Collector(udpsock.UdpReceiver):
 
     def _log_netflow_throttled(self, key: str, message: str, detail="",
                                target: str = "", interval_s: float = 60.0) -> bool:
-        """_log_throttled, filing NETFLOW instead of ERROR — for the two
-        lines here that are news rather than faults and still need the rate
-        limit, the event log being a 3,000-entry ring."""
+        """Like _log_throttled but files NETFLOW instead of ERROR."""
         now = time.time()
         if now - self._log_times.get(key, 0.0) < interval_s:
             return False
@@ -204,13 +198,7 @@ class Collector(udpsock.UdpReceiver):
         return True
 
     def _log_first_seen(self, exporter: str, data: bytes) -> None:
-        """One "first packet from" line a minute, whoever it is from, and a
-        count of the exporters it stood in for.
-
-        One shared key, not one per exporter, because varying the exporter
-        IS the flood — but _first_from has already marked the suppressed
-        ones seen, so without the count they are never mentioned again.
-        """
+        """One "first packet from" line a minute, plus a count suppressed."""
         pending = self._first_seen_pending
         extra = (f" (and {pending} other new exporter(s) since the last such "
                  f"line)" if pending else "")

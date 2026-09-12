@@ -917,12 +917,7 @@ def _validate_target_url(url: str) -> str:
     parsed = urllib.parse.urlsplit(url)
     if not parsed.hostname:
         raise ValueError("https_url needs a host, e.g. https://switch.example/")
-    # A credential in the URL cannot work and cannot stay secret. http.client
-    # is handed the whole netloc, so the check fails with "nonnumeric port:
-    # ..." carrying the password -- and that string is stored in
-    # https_checks.error, served as https_error to every netpath:read account
-    # and written into the event log with the URL beside it. Refused at the
-    # boundary rather than leaked at the first failure.
+    # A credential in the URL leaks via http.client's error, which gets stored, served, and logged.
     if parsed.username or parsed.password:
         raise ValueError("https_url must not contain a username or password")
     return url
@@ -1938,10 +1933,7 @@ def get_debug(service, params, body) -> dict:
         # endpoint is actually slow.
         "routes": _route_latency(service),
         "summary": {
-            # None, not False/0: an account without `netpath` is not being
-            # told the scheduler is stopped and has no workers — it is being
-            # told nothing, and debug.js renders the absence as "—". A false
-            # "scheduler stopped" on the Debug page is a page fault report.
+            # None, not False/0: an account without `netpath` sees nothing, not a false "stopped".
             "scheduler": service.monitor.running if see_netpath else None,
             "workers_busy": running,
             "workers_total": service.monitor.workers if see_netpath else None,
@@ -2774,9 +2766,7 @@ def _snmp_trap_rows(service, params, cap: int, *,
             # v3), so the same rule _community_fields applies to a device's
             # stored community applies here: shown to callers who could
             # change it anyway, a has_community boolean for everyone else.
-            # Omitted rather than blanked, exactly as _community_fields omits
-            # it — a "" was indistinguishable from a trap that carried none,
-            # and the page cannot say "not shown" for a key that is there.
+            # Omitted rather than blanked, like _community_fields, to not read as "carried none".
             **({"community": row["community"] or ""} if reveal else {}),
             "has_community": bool(row["community"]),
             "engine_id": row["engine_id"] or "",
@@ -2815,9 +2805,7 @@ def get_snmp_traps_export(service, params, body) -> dict:
              "trap_oid", "trap_kind", "severity_name", "community",
              "agent_addr", "is_inform"]
 
-    # The column stays, whoever exports: a blank cell would say "this trap
-    # carried no community", which is a different fact from "you are not
-    # shown it". Same two words the trap table and its detail pane use.
+    # A blank cell would say "carried none" instead of "not shown".
     def _cell(trap, key):
         if key == "community" and "community" not in trap:
             return "not shown" if trap.get("has_community") else ""
@@ -3879,8 +3867,7 @@ def _device_rows_json(service, params, rows) -> list[dict]:
     # until_ts, and anything rendering muted_until prints "muted until <a
     # date>" — an operator handed a date that never arrives waits for it.
     maintenance = service.alerts_db.maintenance_device_ids()
-    # A count, not a list: the row has room for "2 alerts muted" and the
-    # device pane below spells them out.
+    # A count, not a list: the row only has room for "2 alerts muted".
     rule_muted_counts: dict[int, int] = {}
     for entity_id in service.alerts_db.muted_entity_ids(alertsdb.DEVICE_RULE_KIND):
         pair = alertsdb.split_device_rule(entity_id)
@@ -4166,10 +4153,7 @@ def _neighbor_json(row, local_port: str = "") -> dict:
 
 
 def _neighbor_ip_candidates(row: dict) -> list[str]:
-    """The addresses a neighbour row identifies itself by, best evidence
-    first: CDP's cdpCacheAddress, an LLDP chassis id of subtype 5 (which
-    *is* an address), and a CDP device id written as one — nodepoll copies
-    cdpCacheDeviceId into both chassis_id and sys_name."""
+    """Addresses a neighbour row identifies itself by, best evidence first: CDP's cdpCacheAddress, an LLDP subtype-5 chassis id, or sys_name (nodepoll copies cdpCacheDeviceId into both)."""
     candidates = []
 
     def add(text):
@@ -4185,22 +4169,14 @@ def _neighbor_ip_candidates(row: dict) -> list[str]:
 
 
 def _resolve_neighbor_names(service, neighbors: list[dict]) -> None:
-    """Name the neighbours whose only identity is an IP address, through the
-    chain the Syslog Host column uses: the Nodes device answering on that
-    address first, then the reverse-DNS cache. Cache-only like that column —
-    nodesdb.neighbour_addresses feeds Service._extra_resolve_targets, so the
-    background resolver is what fills the cache, never a request."""
+    """Names neighbours whose only identity is an IP, via the Syslog Host column's chain: Nodes device match first, then the reverse-DNS cache."""
     pending = [(n, _neighbor_ip_candidates(n)) for n in neighbors
                if n.get("matched_device_id") is None]
     pending = [item for item in pending if item[1]]
     if not pending:
         return
 
-    # One batched read for every candidate address on the pane, not
-    # namelookup.device_for_ip per address: that is the same rule (primary
-    # `ip` first, then the newest alias) asked once instead of up to four
-    # statements and three lock acquisitions for each of them. device_for_ip
-    # stays where a single address is all a caller has.
+    # Batched via devices_by_addresses rather than one device_for_ip call per address.
     candidate_ips = {ip for _, candidates in pending for ip in candidates}
     devices = (service.nodes_db.devices_by_addresses(candidate_ips)
                if service.nodes_db is not None else {})
@@ -6976,13 +6952,7 @@ def _mute_json(row) -> dict:
 
 
 def _mute_entity(service, body, require_rule: bool) -> tuple[str, str, int]:
-    """The (kind, id, device id) a mute request names, refusing anything the
-    engine would not actually check — a mute that silences nothing is worse
-    than an error, because the operator walks away believing it worked.
-
-    A per-rule mute arrives either way round: a device id plus `rule_key`,
-    or kind "device_rule" with the pair joined. `require_rule` is off on
-    DELETE, so a rule deleted under a live mute is still liftable."""
+    """The (kind, id, device id) a mute request names, refusing anything the engine would not actually check. `require_rule` is off on DELETE, so a rule deleted under a live mute is still liftable."""
     kind = str(body.get("entity_kind", "device")).strip() or "device"
     if kind not in ("device", alertsdb.DEVICE_RULE_KIND):
         # The column is general, so a per-interface or per-AP mute later
@@ -7025,10 +6995,7 @@ def post_alerts_mute(service, params, body) -> dict:
     row = service.alerts_db.mute(kind, entity_id, hours,
                                  by=params.get("_username", ""),
                                  reason=str(body.get("reason", "")))
-    # The device id is in the detail because the target is not always
-    # readable as one: a per-rule mute's entity_id is the device and the rule
-    # key joined, so "which device was silenced" was a string somebody had to
-    # take apart by hand in the one log that exists to answer that.
+    # Device id spelled out, since entity_id may be an unreadable joined device+rule_key.
     _audit(service, params, "alert.mute", target=f"{kind}:{entity_id}",
            detail=f"device {device_id}: {hours:g}h: "
                   f"{str(body.get('reason', ''))}")

@@ -237,15 +237,7 @@ try:
     db.close()
 
     # ---------------------------------------------------------------------
-    # A credential in the URL is refused, and stripped from one already stored
-    #
-    # `https://admin:pass@host/` could never be checked: http.client is handed
-    # the whole netloc and answers "nonnumeric port: pass@host" -- with the
-    # password in it. That sentence is stored in https_checks.error, served as
-    # https_error to every netpath:read account and written to the event log
-    # beside the URL. So the boundary refuses one, and the single funnel every
-    # caller inside the checker goes through drops the userinfo from the URLs
-    # that are already in the database.
+    # A credential in the URL is refused at the boundary, and stripped from any already stored.
     from netpath.monitor import https_url_for
     from netpath.web import api as web_api
 
@@ -275,9 +267,7 @@ try:
           https_url_for(_Row(https_url="https://switch.example/x"))
           == "https://switch.example/x")
     # ----------------------------------------------------------------------
-    # This sweep used to be handed what was left of the traces deadline, and
-    # _delete_batches checks that before its FIRST batch: on any netpath.db
-    # busy enough to spend it, the table was swept zero rows a pass.
+    # https_checks gets its own prune budget instead of whatever the traces sweep left, which could be zero.
     db = Database(os.path.join(TMPDIR, "prune_budget.db"))
     starved = db.add_target("10.80.0.4", label="starved", interval_s=60)
     for _ in range(6):

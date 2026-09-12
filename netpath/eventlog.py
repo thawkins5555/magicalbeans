@@ -68,8 +68,7 @@ class EventLog:
         self._lock = threading.Lock()
         self._events: deque[Event] = deque(maxlen=max(1, int(capacity)))
         self._seq = 0
-        # Identifies this process's log: seq restarts at 0 on every start,
-        # so a reader's cursor is only meaningful within one epoch.
+        # Identifies this process's log; seq restarts at 0 on every start.
         self.epoch = time.time()
         # An OrderedDict used as an LRU set: re-seeing a target moves it to
         # the end, so what falls off the front is genuinely the least
@@ -113,8 +112,7 @@ class EventLog:
             return [event for event in self._events if event.seq > seq]
 
     def since_with_seq(self, seq: int) -> tuple[list[Event], int]:
-        """One snapshot. Read under two lock holds, an event landing between
-        them is absent from the batch and already behind the cursor."""
+        """One snapshot: the batch and the cursor read under the same lock hold."""
         with self._lock:
             return ([event for event in self._events if event.seq > seq],
                     self._seq)

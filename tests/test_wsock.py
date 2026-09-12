@@ -495,11 +495,8 @@ print("PASS: close() from another thread defers the drain to the parked reader")
 # appliance the drain quietly consumed nothing and the close frame naming
 # the reason could be lost to the reset it exists to prevent.
 #
-# Driven by making select.select raise rather than by dup2'ing a real
-# descriptor to 1100: Windows has no descriptor that high to dup2 to, so
-# the case that matters only ever ran on POSIX, and this is the fault that
-# high descriptor PRODUCES. A _drain written on select.select fails here,
-# whether or not this host can number a socket above FD_SETSIZE.
+# Driven by making select.select raise (cross-platform) rather than dup2'ing
+# a real descriptor above FD_SETSIZE (POSIX-only).
 sock, ws = pair()
 real_select = select.select
 
@@ -526,10 +523,8 @@ print("PASS: the drain empties its socket even where select.select can only "
 ws.close()
 sock.close()
 
-# ...and the guard in front of that recv is live. _poll_readable was
-# declared `-> None`, so `self._poll_readable(0)` decided nothing: the loop
-# only ended because settimeout(0) makes recv raise BlockingIOError, and
-# every round paid for a wait whose answer was thrown away.
+# ...and the guard in front of that recv is live: _poll_readable's answer
+# must actually stop the loop, not be thrown away.
 sock, ws = pair()
 asked = []
 ws._poll_readable = lambda timeout: asked.append(timeout) or False
