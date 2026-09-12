@@ -382,6 +382,96 @@ CLEARS = {
 }
 
 
+# PREDICATES: rule kind -> whether one rule of that kind is about one
+# occurrence, asked after the kind itself has matched. The per-kind half of
+# AlertEngine._apply's matching, which was a run of `if rule["kind"] == ...`
+# guards inside the loop; a kind whose matching rule is missing is now a
+# missing table entry a test can see rather than a fall-through nobody
+# notices. Everything that is true of EVERY kind (device_filter, the
+# unmanaged-only rules, mute) stays in _apply, which is where the engine
+# state those need lives.
+#
+# Keyed and consulted exactly like CLEARS above, and the same reasoning
+# applies: which fact a rule is about is a property of what this app
+# measures, not a per-site preference.
+
+
+def _source_kind_matches(rule, occurrence) -> bool:
+    """A rule's source_kind, when set, is which event/metric it is about; an
+    occurrence about something else is not that rule's business.
+
+    "threshold" belongs on this table and used to be missing, which meant a
+    single CPU breach opened all eleven threshold alerts for that device —
+    every one of them carrying the CPU occurrence's message.
+
+    syslog and ipam deliberately have no entry: their occurrences always
+    carry source_kind "", so filtering on it would silently stop matching
+    any custom rule that has one set.
+    """
+    return (not (rule["source_kind"] or "")
+            or rule["source_kind"] == occurrence.source_kind)
+
+
+def _severity_floor(rule, occurrence) -> bool:
+    """Lower number = more severe (RFC 5424): the rule's own severity is the
+    threshold it fires at — "this severity and worse" — not just a label
+    stamped on the resulting alert. Traps were exempt, so "Critical SNMP trap
+    received" opened at severity 2 for fifty informational config-save traps.
+
+    Only for a rule with NO source_kind, i.e. one that is about every trap or
+    every message. A rule naming one trap already says exactly which fact it
+    is about, and the shipped coldStart rule (severity 4) would otherwise
+    never fire: a trap with no severity mapping decodes as 5, which is worse
+    than 4 on this scale.
+    """
+    if (rule["source_kind"] or "") or occurrence.severity is None:
+        return True
+    return occurrence.severity <= rule["severity"]
+
+
+def _threshold_rule_matches(rule, occurrence) -> bool:
+    """Two threshold rules CAN legitimately share a source_kind —
+    ups_battery_low/ups_battery_replace already did, and
+    temp_chassis_high/temp_chassis_critical now read the same temp_chassis_c
+    metric on purpose (see alertsdb._BUILTIN_RULES). Without this, the
+    occurrence AlertEngine._evaluate_thresholds built for evaluating ONE of
+    them also matched the OTHER (same kind, same source_kind),
+    double-incrementing it with the wrong rule's message and defeating the
+    streak accounting evaluate_threshold just did for its own rule.
+
+    occurrence.rule_key pins an occurrence to the one rule that actually
+    raised it; empty (every occurrence not from _evaluate_thresholds, and one
+    parked before this field existed) leaves matching exactly as it was.
+    """
+    return not occurrence.rule_key or rule["key"] == occurrence.rule_key
+
+
+def _both(first, second):
+    def matches(rule, occurrence) -> bool:
+        return first(rule, occurrence) and second(rule, occurrence)
+    return matches
+
+
+def matches_any(rule, occurrence) -> bool:
+    """The kind has matched and the kind has nothing else to ask."""
+    return True
+
+
+PREDICATES: dict[str, callable] = {
+    "device_event": _source_kind_matches,
+    "interface_event": _source_kind_matches,
+    "wireless_event": _source_kind_matches,
+    "netpath_event": _source_kind_matches,
+    "system": _source_kind_matches,
+    "dhcp_threshold": _source_kind_matches,
+    "netpath_threshold": _source_kind_matches,
+    "threshold": _both(_source_kind_matches, _threshold_rule_matches),
+    "trap": _both(_source_kind_matches, _severity_floor),
+    "syslog": _severity_floor,
+    "ipam": matches_any,
+}
+
+
 # The entity kinds that take part in rollup at all. A rollup pairing says
 # "this alert is implied by that one about the SAME thing", so it is only
 # meaningful where an entity can have both; listing the kinds explicitly stops

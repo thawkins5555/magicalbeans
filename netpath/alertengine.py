@@ -23,11 +23,11 @@ from dataclasses import asdict
 
 from . import alertmail
 from . import namelookup
-from .alertrules import CLEARS, PUBLISHED_HYSTERESIS, \
+from .alertrules import CLEARS, PREDICATES, PUBLISHED_HYSTERESIS, \
     PUBLISHED_THRESHOLD_RULES, ROLLED_UP_BY, ROLLS_UP, ROLLUP_ENTITY_KINDS, \
     UNMANAGED_ONLY_RULES, Occurrence, breaches, dedup_key, device_id_for, \
     comparison_of, evaluate_flapping, evaluate_threshold, interface_label, \
-    match_device, same_metric_pair, syslog_signature
+    match_device, matches_any, same_metric_pair, syslog_signature
 from .alertsdb import DEVICE_RULE_KIND
 from .eventlog import ALERTS, ERROR, NODES, NullLog
 from .nodepoll import reboot_uptimes
@@ -2622,58 +2622,14 @@ class AlertEngine(Worker):
     def _apply(self, rules, occurrence: Occurrence, settings,
                rule_muted=None) -> None:
         rollup = bool(settings.get("rollup_enabled", True))
+        # The per-kind matching rules live in alertrules.PREDICATES, beside
+        # CLEARS and ROLLED_UP_BY; only what is true of every kind is here.
+        matches = PREDICATES.get(occurrence.kind, matches_any)
         for rule in rules:
             if rule["kind"] != occurrence.kind:
                 continue
-            # A rule's source_kind, when set, is which event/metric it is
-            # about; an occurrence that is about something else is not this
-            # rule's business. "threshold" belongs on this list and used to be
-            # missing, which meant a single CPU breach opened all eleven
-            # threshold alerts for that device — every one of them carrying
-            # the CPU occurrence's message.
-            #
-            # syslog and ipam are deliberately absent: their occurrences
-            # always carry source_kind "", so filtering on it would silently
-            # stop matching any custom rule that has one set.
-            if rule["kind"] in ("device_event", "interface_event", "trap",
-                                "wireless_event", "threshold", "dhcp_threshold",
-                                "netpath_threshold", "netpath_event", "system"):
-                if (rule["source_kind"] or "") and rule["source_kind"] != occurrence.source_kind:
-                    continue
-            if rule["kind"] == "threshold" and occurrence.rule_key:
-                # Two threshold rules CAN legitimately share a source_kind —
-                # ups_battery_low/ups_battery_replace already did, and
-                # temp_chassis_high/temp_chassis_critical now read the same
-                # temp_chassis_c metric on purpose (see alertsdb._BUILTIN_
-                # RULES). Without this, the occurrence _evaluate_thresholds
-                # built for evaluating ONE of them also matched the OTHER
-                # here (same kind, same source_kind), double-incrementing it
-                # with the wrong rule's message and defeating the streak
-                # accounting evaluate_threshold just did for its own rule.
-                # occurrence.rule_key pins an occurrence to the one rule that
-                # actually raised it; empty (every occurrence not from
-                # _evaluate_thresholds, and one parked before this field
-                # existed) leaves matching exactly as it was.
-                if rule["key"] != occurrence.rule_key:
-                    continue
-            if (rule["kind"] in ("syslog", "trap")
-                    and not (rule["source_kind"] or "")
-                    and occurrence.severity is not None):
-                # Lower number = more severe (RFC 5424): the rule's own
-                # severity is the threshold it fires at — "this severity
-                # and worse" — not just a label stamped on the resulting
-                # alert. Traps were exempt, so "Critical SNMP trap received"
-                # opened at severity 2 for fifty informational config-save
-                # traps.
-                #
-                # Only for a rule with NO source_kind, i.e. one that is about
-                # every trap or every message. A rule naming one trap already
-                # says exactly which fact it is about, and the shipped
-                # coldStart rule (severity 4) would otherwise never fire: a
-                # trap with no severity mapping decodes as 5, which is worse
-                # than 4 on this scale.
-                if occurrence.severity > rule["severity"]:
-                    continue
+            if not matches(rule, occurrence):
+                continue
             if (rule["key"] or "") in UNMANAGED_ONLY_RULES and occurrence.managed:
                 # "Link-down trap from an unmanaged device" has advertised
                 # this check since it shipped and never performed it, so a

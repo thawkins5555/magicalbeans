@@ -118,6 +118,22 @@ check("a built-in rule is still refused regardless of alert history "
       builtin is not None and db.remove_rule(builtin["id"]) is False, None)
 db.close()
 
+# ---- every rule kind has a matching predicate
+#
+# _apply dispatches on rule kind through alertrules.PREDICATES. A kind with
+# no entry there falls through to matches_any, which would match every rule
+# of that kind against every occurrence of it.
+from netpath.alertrules import PREDICATES            # noqa: E402
+from netpath.alertsdb import _BUILTIN_RULES          # noqa: E402
+
+_shipped_kinds = {rule[2] for rule in _BUILTIN_RULES}
+check("every shipped rule kind has a PREDICATES entry",
+      not (_shipped_kinds - set(PREDICATES)),
+      sorted(_shipped_kinds - set(PREDICATES)))
+check("...and PREDICATES names no kind the registry does not",
+      not (set(PREDICATES) - _shipped_kinds),
+      sorted(set(PREDICATES) - _shipped_kinds))
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 raise SystemExit(1 if FAILS else 0)
