@@ -181,6 +181,7 @@ a.dash-sev-row:focus-visible, a.dash-row:focus-visible {
   font: 600 var(--fs-sm)/1 var(--ui);
   letter-spacing: var(--track-tab);
   color: var(--text);
+  text-shadow: var(--tube-text);
   text-transform: none;
   white-space: nowrap;
 }
@@ -283,7 +284,12 @@ body.tiny .brand span { display: none; }
   gap: 6px;
 }
 .tab:hover { color: var(--text); }
-.tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.tab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  box-shadow: var(--tube);
+  text-shadow: var(--tube-text);
+}
 /* 44px of padding per tab across twelve tabs is 528px on its own. Below
    1500px there is no longer room to spend that freely. */
 @media (max-width: 1500px) {
@@ -351,6 +357,7 @@ body.tiny .brand span { display: none; }
   background: var(--panel);
   color: var(--text);
   border-bottom-color: transparent;
+  box-shadow: var(--tube);
 }
 .subpage { display: none; flex: 1; min-height: 0; flex-direction: column; }
 .subpage.active { display: flex; }
@@ -506,7 +513,7 @@ button:hover { border-color: var(--accent); }
    disabled state has to carry. */
 button:disabled { color: var(--muted); border-color: var(--grid); cursor: default; }
 button:disabled:hover { border-color: var(--grid); }
-button.primary { background: var(--accent); color: var(--bg); border: none; font-weight: 600; }
+button.primary { background: var(--accent); color: var(--bg); border: none; font-weight: 600; box-shadow: var(--tube); }
 button.primary:hover { background: var(--accent-hover); }
 /* Declared after .primary on purpose. The two rules have equal specificity,
    so the earlier button:disabled lost on source order and a disabled
@@ -580,6 +587,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); }
 :focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
+  box-shadow: var(--tube);
 }
 /* Inside a table the offset would draw the ring over the neighbouring rows,
    and on a full-bleed pane it would fall outside the scroll box entirely. */
@@ -700,6 +708,7 @@ body.tiny .terms { display: none; }
   background: var(--panel);
   border: 1px solid var(--hairline);
   border-radius: var(--radius);
+  box-shadow: var(--tube);
 }
 .panel.float, .login-box, .ssh-panel, .modal-box, .gsearch-box {
   border-radius: var(--radius-lg);
@@ -744,6 +753,7 @@ body.tiny .terms { display: none; }
 #nd-d-name, .subnet-detail-title, .modal-box h2, .ssh-panel h2, h2 {
   font: 600 var(--fs-md)/1.3 var(--ui);
   color: var(--text);
+  text-shadow: var(--tube-text);
   letter-spacing: 0;
   text-transform: none;   /* #nd-d-name also carries .section; a device name is not an eyebrow */
   margin: 0 0 var(--space-sm);
@@ -1898,4 +1908,25 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
     vertical-align: bottom;
   }
   input, select, textarea { max-width: 100%; }
+}
+
+/* -------------------------------------------------------------- neon tubes
+   A `none` shadow cannot sit inside a comma list, so the parts that already
+   carry a shadow or a hairline take the glow behind the theme guard. */
+:root[data-theme="neon"] .panel.float,
+:root[data-theme="neon"] .login-box,
+:root[data-theme="neon"] .ssh-panel,
+:root[data-theme="neon"] .modal-box,
+:root[data-theme="neon"] .gsearch-box {
+  box-shadow: var(--shadow-pop), var(--tube);
+}
+:root[data-theme="neon"] .status-fg,
+:root[data-theme="neon"] .status-mark,
+:root[data-theme="neon"] .dot {
+  text-shadow: var(--tube-text);
+}
+:root[data-theme="neon"] .topbar,
+:root[data-theme="neon"] .subtabs {
+  border-bottom-color: var(--tube-line);
+  box-shadow: var(--tube);
 }
