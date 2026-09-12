@@ -17,6 +17,8 @@ import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 
 TMPDIR = _paths.tmpdir("secretstore_")
 
+import stat as stat_mod  # noqa: E402
+
 import netpath.secretstore as ss  # noqa: E402
 import netpath.dpapi as dpapi  # noqa: E402
 from netpath import configrx_redact  # noqa: E402
@@ -285,32 +287,117 @@ def test_world_readable_passphrase_file_refused():
 def test_foreign_owned_passphrase_file_refused():
     """CREDENTIAL-SECURITY.md promises the file is refused unless it is
     chmod 600 *and* owned by the account the service runs as. Only the mode
-    half was enforced."""
-    reset()
-    if os.name == "nt" or os.getuid() != 0:
-        check("passphrase file owned by another account refused "
-              "(skipped: needs POSIX and root to chown)", True)
-        return
-    path = passphrase_file("owned by somebody else\n")
-    os.chown(path, 12345, 12345)
-    os.environ[ss.ENV_PASSPHRASE_FILE] = path
-    ss._key_cache.clear()
-    try:
-        ss.protect(b"should never be reachable")
-        ok, detail = False, "did not raise"
-    except ss.SecretStoreError as exc:
-        detail = str(exc)
-        ok = "owned by" in detail and "12345" in detail
-    check("a 0600 passphrase file owned by another account is refused", ok, detail)
+    half was enforced.
 
-    os.chown(path, os.getuid(), -1)
-    ss._key_cache.clear()
+    This used to `return check(..., True)` on Windows or as a non-root user,
+    which between them is every runner the suite actually runs on -- so the
+    refusal it names shipped never once executed. The ownership check reads
+    `secretstore._POSIX` and `os.getuid()`, and both are patchable; what the
+    real chown gave (a 0600 file whose st_uid is somebody else's) a patched
+    `os.stat` gives just as truthfully, and on every platform.
+    """
+    reset()
+    path = passphrase_file("owned by somebody else\n")
+    os.environ[ss.ENV_PASSPHRASE_FILE] = path
+
+    real_stat = os.stat
+    real_getuid = getattr(os, "getuid", None)
+    real_posix = ss._POSIX
+    target = os.path.abspath(path)
+    OURS, THEIRS = 1000, 12345
+
+    def fake_stat(p, *args, **kwargs):
+        info = real_stat(p, *args, **kwargs)
+        try:
+            same = os.path.abspath(p) == target
+        except TypeError:                        # a file descriptor, not a path
+            same = False
+        if not same:
+            return info
+        # st_mode is index 0 of the 10-tuple stat_result is built from and
+        # st_uid is index 4. The mode is forced to a real 0600 because
+        # Windows' chmod cannot produce one, and leaving it would trip the
+        # mode refusal above and never reach the ownership half under test.
+        fields = list(info[:10])
+        fields[0] = stat_mod.S_IFREG | 0o600
+        fields[4] = THEIRS
+        return os.stat_result(fields)
+
+    os.stat = fake_stat
+    os.getuid = lambda: OURS
+    ss._POSIX = True
     try:
-        ss.protect(b"now this should work")
-        ok, detail = True, ""
-    except ss.SecretStoreError as exc:
-        ok, detail = False, str(exc)
-    check("...and accepted once it belongs to this account", ok, detail)
+        ss._key_cache.clear()
+        try:
+            ss.protect(b"should never be reachable")
+            ok, detail = False, "did not raise"
+        except ss.SecretStoreError as exc:
+            detail = str(exc)
+            ok = "owned by" in detail and str(THEIRS) in detail
+        check("a 0600 passphrase file owned by another account is refused",
+              ok, detail)
+        check("...and the refusal names the uid the service runs as, so "
+              "whoever configured it can see both halves",
+              ok and str(OURS) in detail, detail)
+
+        # The same file, now ours: the check must not refuse every file.
+        os.getuid = lambda: THEIRS
+        ss._key_cache.clear()
+        try:
+            ss.protect(b"now this should work")
+            ok, detail = True, ""
+        except ss.SecretStoreError as exc:
+            ok, detail = False, str(exc)
+        check("...and accepted once it belongs to this account", ok, detail)
+
+        # root is allowed on purpose: a service started as root before
+        # dropping privileges reads a root-owned file.
+        os.getuid = lambda: OURS
+        fields = list(real_stat(path)[:10])
+        fields[0] = stat_mod.S_IFREG | 0o600
+        fields[4] = 0
+        os.stat = lambda p, *a, **k: (os.stat_result(fields)
+                                      if os.path.abspath(p) == target
+                                      else real_stat(p, *a, **k))
+        ss._key_cache.clear()
+        try:
+            ss.protect(b"root-owned is fine")
+            ok, detail = True, ""
+        except ss.SecretStoreError as exc:
+            ok, detail = False, str(exc)
+        check("...and a root-owned file is still accepted, for a service "
+              "that drops privileges after start-up", ok, detail)
+    finally:
+        os.stat = real_stat
+        if real_getuid is None:
+            del os.getuid
+        else:
+            os.getuid = real_getuid
+        ss._POSIX = real_posix
+        ss._key_cache.clear()
+
+
+def test_foreign_owned_check_is_skipped_off_posix():
+    """The refusal above is POSIX-only on purpose -- Windows has no
+    meaningful st_uid -- and _POSIX is what says so. With it False the same
+    foreign-owned file is accepted, which is the behaviour a Windows host
+    gets and the reason the check needs a flag rather than an inline test."""
+    reset()
+    path = passphrase_file("owned by somebody else\n")
+    os.environ[ss.ENV_PASSPHRASE_FILE] = path
+    real_posix = ss._POSIX
+    ss._POSIX = False
+    try:
+        ss._key_cache.clear()
+        try:
+            ss.protect(b"accepted off POSIX")
+            ok, detail = True, ""
+        except ss.SecretStoreError as exc:
+            ok, detail = False, str(exc)
+        check("off POSIX the ownership check does not run at all", ok, detail)
+    finally:
+        ss._POSIX = real_posix
+        ss._key_cache.clear()
 
 
 def test_missing_passphrase_file_refused():
@@ -759,6 +846,7 @@ def main() -> int:
     test_blob_tag_discrimination()
     test_world_readable_passphrase_file_refused()
     test_foreign_owned_passphrase_file_refused()
+    test_foreign_owned_check_is_skipped_off_posix()
     test_missing_passphrase_file_refused()
     test_empty_passphrase_file_refused()
     test_nonce_never_repeats()

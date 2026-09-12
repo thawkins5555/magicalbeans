@@ -47,6 +47,14 @@ class SecretStoreError(Exception):
 
 # ------------------------------------------------------------ configuration
 
+# Whether this host has POSIX ownership and mode bits worth checking. A
+# module attribute rather than `os.name != "nt"` spelled inline at each use,
+# so the two refusals below can be exercised on a Windows runner -- which is
+# where this application is mostly developed, and where, written inline, they
+# were dead code no test could reach.
+_POSIX = os.name != "nt"
+
+
 def configured() -> bool:
     """A passphrase source is named, whether or not it will actually work
     once read — mirrors dpapi.available()'s cheap, side-effect-free check;
@@ -70,7 +78,7 @@ def _load_passphrase() -> bytes:
         # Windows has no meaningful POSIX mode bits (see __main__.py's own
         # note on the data folder) — this check only means something on the
         # platforms this module exists for in the first place.
-        if os.name != "nt" and mode & 0o077:
+        if _POSIX and mode & 0o077:
             raise SecretStoreError(
                 f"NETPATH_SECRET_PASSPHRASE_FILE ({file_path!r}) is readable "
                 f"by more than its owner (mode {oct(mode)}). Anyone who can "
@@ -81,7 +89,7 @@ def _load_passphrase() -> bytes:
         # not enforced: a 0600 file belonging to somebody else is exactly the
         # case it says is refused. root is allowed because a service started
         # as root before dropping privileges reads a root-owned file.
-        if os.name != "nt" and info.st_uid not in (0, os.getuid()):
+        if _POSIX and info.st_uid not in (0, os.getuid()):
             raise SecretStoreError(
                 f"NETPATH_SECRET_PASSPHRASE_FILE ({file_path!r}) is owned by "
                 f"uid {info.st_uid}, not by root or by the account this "
