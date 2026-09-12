@@ -42,17 +42,14 @@ def raw_window_for_scope(scope: int) -> float:
 # rowid any more, so a by-age sweep is cut up by bands of the primary key's
 # leading column, as wide as the rows it deletes and no wider.
 #
-# A band is metrics, but the lock hold is rows, and one metric of a 3-day
-# raw window is thousands: 500 to start put ~400 k rows in the first DELETE
-# of a device purge. So the first band is sized from a rows-per-metric
-# guess, and _delete_batches widens it against TRIM_LOCK_TARGET_S.
+# The first band is sized from a rows-per-metric guess (500 metrics put
+# ~400 k rows in one DELETE); _delete_batches widens it from there.
 SAMPLE_BAND_FIRST_ROWS = 20_000
 RAW_ROWS_PER_METRIC_GUESS = RAW_WINDOW_S / 60     # a 60-second poll
 SAMPLE_BAND_METRICS_START = max(
     1, int(SAMPLE_BAND_FIRST_ROWS // RAW_ROWS_PER_METRIC_GUESS))
 SAMPLE_BAND_METRICS = 500
-# 1, not a floor of its own: a band that overran the target must be allowed
-# below the starting width, which is already only a few metrics.
+# 1: an overrunning band may narrow below the starting width.
 SAMPLE_BAND_METRICS_MIN = 1
 SAMPLE_BAND_METRICS_MAX = 5_000
 
@@ -170,9 +167,7 @@ class NodesSeriesDatabase(SqliteStore):
     SCHEMA = SCHEMA
     DEFAULTS: dict = {}
     LABEL = "nodes_series"
-    # Rollups reach furthest back, so MIN(hour) IS the answer once any hour
-    # has been summarised. A fallback rather than a MIN of both because
-    # `samples` has no index on ts to probe.
+    # MIN(hour) once any hour is summarised; `samples` has no ts index.
     OLDEST_TS_SQL = ("SELECT COALESCE((SELECT MIN(hour) FROM samples_hourly),"
                      " (SELECT MIN(ts) FROM samples))")
 
