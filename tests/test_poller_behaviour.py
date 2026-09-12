@@ -1301,6 +1301,103 @@ def test_a_refused_credential_does_not_leak_the_interface_socket():
         db.close()
 
 
+def test_stopping_the_poller_drops_the_cached_walk_limits():
+    """POLL-F7's cache is filled only by _read_pool_settings, which only
+    reconfigure()'s ENABLED branch reaches. Disable polling, then raise
+    snmp_bulk_max_repetitions: the disabled branch stopped the poller and
+    left the old limits cached, so start_oid_walk -- which runs whether or
+    not the poller does -- kept walking at the previous repetition count
+    with nothing that would ever refresh it."""
+    db = NodesDatabase(os.path.join(tmpdir("poller_review_walkcache_"), "nodes.db"))
+    try:
+        poller = NodePoller(db)
+        poller.log = types.SimpleNamespace(
+            add=lambda category, message, target="", detail="": None)
+        settings = {**db.settings(), "enabled": True,
+                    "snmp_bulk_max_repetitions": 10}
+        db.save_settings(settings)
+        poller._read_pool_settings(settings)
+        check(poller._walk_limits()[1] == 10,
+              f"the cache starts at the configured repetitions "
+              f"({poller._walk_limits()[1]})")
+
+        # Polling off through reconfigure's own disabled branch, then the
+        # setting changed while it is off. `running` is a read-only property,
+        # so it is stubbed on the class for the length of that one call
+        # rather than the branch being reached by some other door.
+        real_running = NodePoller.running
+        NodePoller.running = property(lambda self: True)
+        try:
+            poller.reconfigure({**settings, "enabled": False})
+        finally:
+            NodePoller.running = real_running
+        db.save_settings({**settings, "snmp_bulk_max_repetitions": 40})
+        check(poller._walk_settings is None,
+              f"disabling polling drops the cached walk limits "
+              f"({poller._walk_settings})")
+        check(poller._walk_limits()[1] == 40,
+              f"...so a walk started with the poller off reads the live "
+              f"setting ({poller._walk_limits()[1]})")
+    finally:
+        db.close()
+
+
+def test_only_an_unencodable_oid_is_reported_as_an_oid_fault():
+    """POLL-F2's arm wrapped the whole scalar/interface/custom-MIB block in
+    `except ValueError` and told the operator "an OID configured for this
+    device is not a valid object identifier" for ANY of them -- an int()
+    on a malformed response, a decode this file does not own. The poll
+    must still be recorded (that is what the arm exists for), but it must
+    not send someone editing a perfectly good OID."""
+    agent, db, poller, device_id = _setup_reassignable_device(
+        "poller_review_narrowoid_", "narrow-oid-stub")
+    try:
+        _poll_once(poller, db, device_id)
+        real = poller._poll_interfaces
+
+        def raises_unrelated(device, config):
+            raise ValueError("invalid literal for int() with base 10: 'n/a'")
+
+        poller._poll_interfaces = raises_unrelated
+        before = db.device(device_id)["last_poll_ts"]
+        time.sleep(0.01)
+        raised = ""
+        try:
+            _poll_once(poller, db, device_id)
+        except Exception as exc:
+            raised = f"{type(exc).__name__}: {exc}"
+        row = db.device(device_id)
+        error = row["snmp_error"] or ""
+        check(not raised,
+              f"an unrelated ValueError still does not take the poll with it "
+              f"({raised})")
+        check(row["last_poll_ts"] and row["last_poll_ts"] != before,
+              "...record_poll still ran, so the device is not frozen")
+        check("object identifier" not in error and "OID" not in error,
+              f"...and it is NOT reported as an OID fault ({error!r})")
+        check("n/a" in error,
+              f"...while still saying what actually went wrong ({error!r})")
+        poller._poll_interfaces = real
+
+        # The genuine case still reads as one, through the dedicated class.
+        raised = ""
+        try:
+            nodepoll_mod._assemble(nodepoll_mod.build_request, 1, "public",
+                                   nodepoll_mod.PDU_GET, 1, ["1.3.-6.1"])
+        except nodepoll_mod.SnmpBadOid as exc:
+            raised = str(exc)
+        check("negative arc" in raised,
+              f"the encoder's refusal arrives as SnmpBadOid ({raised!r})")
+        check(issubclass(nodepoll_mod.SnmpBadOid, ValueError)
+              and not issubclass(nodepoll_mod.SnmpBadOid,
+                                 nodepoll_mod.SnmpError),
+              "...a ValueError and deliberately not an SnmpError, so it still "
+              "travels past the poll's best-effort SnmpError arms")
+    finally:
+        agent.stop()
+        db.close()
+
+
 def test_deleting_a_device_drops_every_cache_keyed_on_it():
     """_forget_devices' own docstring says every per-device container is
     pruned. Five were not in its list, and _discovery_jobs was pruned
@@ -1407,6 +1504,8 @@ def main():
     test_a_truncated_neighbour_or_vlan_column_never_reaches_storage()
     test_the_custom_mib_read_opens_one_socket_and_decrypts_once()
     test_a_refused_credential_does_not_leak_the_interface_socket()
+    test_stopping_the_poller_drops_the_cached_walk_limits()
+    test_only_an_unencodable_oid_is_reported_as_an_oid_fault()
     test_deleting_a_device_drops_every_cache_keyed_on_it()
     test_a_refused_community_is_not_printed()
 

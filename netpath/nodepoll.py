@@ -606,7 +606,8 @@ def v3_exchange(session: _Session, pdu_tag: int, oids: list[str], *,
             if encrypting else None
         request_id = session.next_request_id()
         msg_id = session.next_request_id()
-        packet = build_v3_request(
+        packet = _assemble(
+            build_v3_request,
             msg_id, request_id, pdu_tag, oids,
             engine_id=engine_id, engine_boots=boots, engine_time=engine_time,
             user=identity or "", auth_proto=auth_proto, auth_key=auth_key,
@@ -1815,6 +1816,13 @@ class NodePoller(Worker):
 
     def begin_stop(self) -> None:
         self._stop.set()
+        # The walk limits are cached by _read_pool_settings, which only the
+        # ENABLED branch of reconfigure() reaches. Disabling polling and then
+        # changing snmp_bulk_max_repetitions therefore left start_oid_walk --
+        # which still runs, poller or no poller -- reading the old value out
+        # of a cache nothing would refresh until polling came back on.
+        # Dropping it here sends _walk_limits back to the live settings read.
+        self._walk_settings = None
         for job in list(self._discovery_jobs.values()):
             job.cancel()
         if self._executor:
@@ -2979,17 +2987,30 @@ class NodePoller(Worker):
                 snmp_ok = False
                 snmp_error = str(exc)
                 self._bump("errors")
-            except ValueError as exc:
+            except SnmpBadOid as exc:
                 # An OID this poll was configured with cannot be encoded --
                 # a MIB object or an override carrying an arc that is not a
-                # non-negative integer, refused by enc_oid. A ValueError is
-                # not an SnmpError, so without this arm it escaped to
-                # _run_one, record_poll never ran, and the device's status,
-                # last_poll_ts and snmp_error froze for good while one
-                # ERROR line per interval filled the event log.
+                # non-negative integer, refused by enc_oid. Before the
+                # generic ValueError arm below, which this used to BE:
+                # wrapped round the whole scalar/interface/custom-MIB
+                # block, it reported ANY ValueError from anywhere in a poll
+                # -- an int() on a malformed response, a decode this file
+                # does not own -- as "an OID configured for this device is
+                # not a valid object identifier", which sends an operator
+                # editing a perfectly good OID.
                 snmp_ok = False
                 snmp_error = (f"an OID configured for this device is not a "
                               f"valid object identifier: {exc}")
+                self._bump("errors")
+            except ValueError as exc:
+                # Everything else that is not an SnmpError. The arm stays --
+                # a ValueError is not an SnmpError, so without it one
+                # escaped to _run_one, record_poll never ran, and the
+                # device's status, last_poll_ts and snmp_error froze for
+                # good while one ERROR line per interval filled the event
+                # log -- but it no longer blames an OID for it.
+                snmp_ok = False
+                snmp_error = f"the poll could not be completed: {exc}"
                 self._bump("errors")
 
         # -------------------------------------------------------- status
@@ -3573,8 +3594,8 @@ class NodePoller(Worker):
         if version in (0, 1):
             identity = (credential or credential_for(config)).identity
             request_id = session.next_request_id()
-            packet = build_request(version, identity or "public", PDU_GET,
-                                   request_id, oids)
+            packet = _assemble(build_request, version, identity or "public",
+                               PDU_GET, request_id, oids)
             response = session.request(packet, request_id)
         else:
             response = self._v3_exchange(session, device, config, PDU_GET, oids,
@@ -7771,8 +7792,9 @@ class NodePoller(Worker):
             if version in (0, 1):
                 identity = credential_for(config).identity
                 request_id = session.next_request_id()
-                packet = build_request(version, identity or "public", PDU_GETNEXT,
-                                       request_id, [oid])
+                packet = _assemble(build_request, version,
+                                   identity or "public", PDU_GETNEXT,
+                                   request_id, [oid])
                 return session.request(packet, request_id)
             return self._v3_exchange(session, device, config, PDU_GETNEXT, [oid])
         finally:
@@ -7799,12 +7821,37 @@ class NodePoller(Worker):
         if version in (0, 1):
             identity = credential_for(config).identity
             request_id = session.next_request_id()
-            packet = build_request(version, identity or "public", pdu_tag,
-                                   request_id, [oid],
-                                   max_repetitions=max_repetitions)
+            packet = _assemble(build_request, version, identity or "public",
+                               pdu_tag, request_id, [oid],
+                               max_repetitions=max_repetitions)
             return session.request(packet, request_id)
         return self._v3_exchange(session, device, config, pdu_tag, [oid],
                                  max_repetitions=max_repetitions)
+
+
+class SnmpBadOid(ValueError):
+    """An OID this poller was asked to send cannot be encoded — an arc that
+    is not a non-negative integer, refused by enc_oid inside
+    build_request/build_v3_request.
+
+    A ValueError and deliberately NOT an SnmpError: that is what the
+    encoder has always raised, so it still travels past the best-effort
+    `except SnmpError` arms a poll is full of (_poll_custom_mib's in
+    particular) and reaches the one place that can report a configuration
+    fault as one. What its own class adds is that _poll_device now names
+    an OID for THIS and nothing else — the arm used to catch bare
+    ValueError around the whole scalar/interface/custom-MIB block and told
+    the operator to fix an OID whenever anything at all in a poll raised
+    one."""
+
+
+def _assemble(build, *args, **kwargs) -> bytes:
+    """One request built, with an OID the encoder refuses reported as
+    SnmpBadOid rather than as a bare ValueError out of the BER layer."""
+    try:
+        return build(*args, **kwargs)
+    except ValueError as exc:
+        raise SnmpBadOid(str(exc)) from exc
 
 
 class _AuthFailure(SnmpError):
