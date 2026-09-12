@@ -682,16 +682,17 @@ On Linux the equivalent is `systemctl stop sappiwhere`, replace the directory,
 4.39.0**: it does nothing until an administrator turns on the `updates_enabled`
 setting.
 
-Once it is on, that button installs **whatever is at the tip of `main`**. It
-does not check a signature, a tag or a digest, so anyone who can push to this
-repository can choose the code every install runs at the next press of it, on
-hosts holding your SNMP communities and SSH credentials. This is known,
-deliberate and temporary — 4.39.0 briefly required a published, digest-verified
-release instead, which left every install already in the field unable to reach
-4.39.0 through the button at all. See the SECURITY NOTE at the top of
-`netpath/selfupdate.py` for what has to change to put the verified path back.
-If you cannot accept that exposure, leave `updates_enabled` off — the default —
-and replace the directory by hand.
+Once it is on, that button prefers a verified release: a published tag newer
+than the running version whose GitHub release carries a `SHA256SUMS` asset.
+Absent that — which, with this repository's one tag and no releases, is every
+install today — it falls back to **whatever is at the tip of `main`**,
+unchecked against any signature, tag or digest, so anyone who can push to this
+repository chooses the code every install runs at the next press of it, on
+hosts holding your SNMP communities and SSH credentials. See
+[Releasing](#releasing) for what closes that gap, and the SECURITY NOTE at the
+top of `netpath/selfupdate.py` for the mechanics. If you cannot accept that
+exposure, leave `updates_enabled` off — the default — and replace the
+directory by hand.
 
 ### A file share, even less setup
 
@@ -993,27 +994,47 @@ Self-update is off by default (`updates_enabled`, in Settings). An install
 that leaves it off never contacts GitHub at all, and is updated by replacing
 the `netpath` directory by hand.
 
-**What the Update button does today**: `GET .../commits/main` for the current
-tip of the branch; stop if that commit is already recorded as installed;
-download `codeload.github.com/.../tar.gz/<sha>`, capped at 64 MiB with
-nothing verifying those bytes beyond the cap; unpack, stop every worker,
-replace the `netpath` package, record the commit, and re-exec. Whoever can
-push to `main` therefore chooses what every install with the setting on will
-run at the next press, on hosts holding SNMP communities and SSH credentials.
-That is known, deliberate and temporary — see the SECURITY NOTE at the top of
-`netpath/selfupdate.py` for what has to change to put the verified path below
-back in use. If that exposure is not acceptable, leave `updates_enabled` off
-— the default — and replace the directory by hand instead.
+**What the Update button does**: `GET .../tags` for the newest published tag
+by version order. If that tag is newer than the running version
+(`netpath/__init__.py`'s `__version__`) and its GitHub release publishes a
+`SHA256SUMS` asset with a line for `<repo>-<tag>.tar.gz`, that digest is
+fetched first, the tag's tarball is downloaded from
+`codeload.github.com/.../tar.gz/refs/tags/<tag>` (capped at 64 MiB) and its
+SHA-256 must equal the published digest before the archive is so much as
+opened. A mismatch ends the update on the `failed` step with the install
+untouched, and is never retried against `main`. Only after a match does it
+unpack, stop every worker, replace the `netpath` package, record the tag and
+commit, and re-exec.
 
-**The verified path** (implemented; not what the button currently uses): the
-newest published tag by version order, that tag's GitHub release, and in its
-asset list a file called exactly `SHA256SUMS` — no asset, no install. The
-tag's tarball is downloaded and hashed as it streams, compared against
+**The fallback, which is what runs today**: no tag newer than the running
+version, no GitHub release for that tag, or a release with no usable
+`SHA256SUMS` entry, and the updater falls back to the tip of `main` — `GET
+.../commits/main`, stop if that commit is already recorded as installed,
+download `codeload.github.com/.../tar.gz/<sha>` with nothing verifying those
+bytes beyond the 64 MiB cap. Whoever can push to `main` therefore chooses
+what every install with the setting on will run at the next press, on hosts
+holding SNMP communities and SSH credentials. This repository has one tag
+(`v4.39.0`, some 70 versions behind) and no GitHub releases, so **every
+install takes this fallback until a release is cut as described below**.
+Each fallback is logged to `update_restart.log` with which of the four
+conditions caused it. If that exposure is not acceptable, leave
+`updates_enabled` off — the default — and replace the directory by hand
+instead. A digest that exists but cannot be read is *not* a fallback: the
+update is refused rather than installed unverified.
+
+**The verified path** (what the button prefers, `latest_tag` /
+`tarball_name` / `published_digest` in `netpath/selfupdate.py`): the newest
+published tag by version order, that tag's GitHub release, and in its asset
+list a file called exactly `SHA256SUMS` — no asset, no verified install. The
+tag's tarball is downloaded under the 64 MiB cap and hashed, compared against
 `SHA256SUMS`'s line for `<repo>-<tag>.tar.gz`, and only a match is unpacked
 and swapped in. It proves the tarball is byte-for-byte what the release
 named; it does not prove who named it — there is no signature.
 
-**Cutting a release:**
+**Cutting a release:** the difference between a verified update and the
+unverified `main`-tip fallback for every install, from here on, is whether
+this release carries a `SHA256SUMS` asset — it is no longer optional
+polish.
 
 ```sh
 # 1. Tag the commit and push the tag.

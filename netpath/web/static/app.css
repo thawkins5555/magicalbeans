@@ -926,7 +926,6 @@ body.compact .canvas.small, body.tiny .canvas.small { min-height: 120px; }
 .gap-t { margin-top: 10px; }
 .gap-t-sm { margin-top: var(--space-sm); }
 .gap-t-xs { margin-top: 6px; }
-.dot-inline { vertical-align: -1px; }
 .table-wrap.short { max-height: 220px; }
 .table-wrap.tall { max-height: 420px; }
 .pane { display: flex; flex-direction: column; min-width: 0; flex: 1; }

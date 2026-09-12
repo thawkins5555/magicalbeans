@@ -3847,26 +3847,6 @@ const App = (() => {
     return table;
   }
 
-  /* The same three things for a table this module did not build: the ~20
-     grids that are still a `<thead>` written as markup by their own module.
-     Idempotent, so a render that runs on every poll can just call it. */
-  function a11yTable(table, caption) {
-    if (!table) return table;
-    for (const th of table.querySelectorAll('thead th, tr:first-child > th')) {
-      if (!th.getAttribute('scope')) th.scope = 'col';
-    }
-    if (caption) {
-      let node = table.querySelector(':scope > caption');
-      if (!node) {
-        node = document.createElement('caption');
-        node.className = 'sr-only';
-        table.insertBefore(node, table.firstChild);
-      }
-      if (node.textContent !== caption) node.textContent = caption;
-    }
-    return table;
-  }
-
   /* The same escape every module file defines for itself, needed here now
      that app.js builds markup of its own. */
   const escapeHtml = (s) => String(s ?? '').replace(/[&<>"'`]/g,
@@ -3882,9 +3862,8 @@ const App = (() => {
      and none of these ever went through the grid. Teaching each renderer to
      opt in is also teaching the next one that gets written, forever, so
      instead one delegated pair of listeners on `document` makes every plain
-     table with a header row sortable on its own, the same way a11yTable
-     just above already reaches into markup none of these functions asked it
-     to touch.
+     table with a header row sortable on its own, reaching into markup none
+     of these functions asked it to touch.
 
      The one thing a delegated listener cannot do for a table that redraws
      itself with `table.innerHTML = head; table.appendChild(newBody)` on

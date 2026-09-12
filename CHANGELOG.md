@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.12.0 — The verified path, restored](#5120--the-verified-path-restored)
 - [5.11.0 — Four asks, one deferred](#5110--four-asks-one-deferred)
 - [5.10.0 — Six asks](#5100--six-asks)
 - [5.9.1 — Second full code review: eighty-one findings](#591--second-full-code-review-eighty-one-findings)
@@ -139,6 +140,79 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.12.0 — The verified path, restored
+
+A cleanup release: the verified-update path 4.40.0 set aside "knowingly and
+temporarily" comes back, guarded against the hole a careless version of it
+would have opened; the rest is code, a duplicated delete and two documents
+that had stopped earning their place in the working tree.
+
+**Self-update takes the verified path again.** `apply()` used to install
+the tip of `main` unconditionally, checked only for size and "looks like
+SappiWhere." It now calls `_resolve_target()` first: `latest_tag()` reads
+every published tag from GitHub's `/tags` API and picks the newest by
+version order, and when that tag is newer than the running `__version__`
+and its GitHub release publishes a `SHA256SUMS` asset naming
+`<repo>-<tag>.tar.gz`, `apply()` downloads that tag's tarball and refuses
+to unpack, record or swap in anything whose SHA-256 does not match the
+digest `published_digest()` read from that asset. A mismatch ends the job
+on the `failed` step with the existing install untouched — no marker
+written, no restart scheduled, and never quietly retried against `main`. A
+digest that exists but could not be read is refused the same way, not
+installed unverified; only an HTTP 404 counts as the release genuinely
+having none.
+
+Four conditions still fall back to the old `main`-tip behaviour instead —
+no tag at all, no tag newer than the running version, no release for the
+newest tag, or no usable `SHA256SUMS` entry in it — and each is written to
+`update_restart.log` naming which one fired. **Because this repository has
+no tagged release carrying a `SHA256SUMS` asset yet, that fallback is the
+path every install still takes today** — restoring the verified branch
+does not make it live until a release actually publishes the digest it
+checks against.
+
+A version gate, `_version_key(tag) <= _version_key(__version__)`, closes
+the hole the bare version of this would have opened: without it, attaching
+a `SHA256SUMS` asset to the stale `v4.39.0` release would have let every
+5.11.0-or-later install "update" itself back roughly seventy versions —
+verified, and so trusted completely. `RUNBOOK.md` also joins
+`_COPY_ALONGSIDE`, so the on-call runbook a self-updated install used to
+lose is copied forward with the rest. The fallback reasons, the version
+gate and a digest mismatch aborting cleanly are covered by the self-update
+test suite.
+
+**Dead code, removed once nothing called it.** `ipam_scan.scan_subnet()`,
+`dpapi.self_test()`, `secretstore.self_test()`, `HttpsChecker.check_now`,
+nodesdb's unused `import threading`, and `PDU_SET`/`enc_oid` — dropped
+from snmppoll's own `trapdecode` import, though both stay defined in
+`trapdecode.py` itself — go, along with the
+`--vlan-1..16` design tokens and the `tests/test_design_tokens.py` section
+that checked them, superseded since 4.54.0 by `--canvas-vlan-*`;
+`a11yTable()`; two unreferenced `STATUS_COLOR` objects; two unreferenced
+`ago` bindings; and the `.dot-inline` CSS rule. None of it rendered
+anything or ran on any request — zero pixels and zero responses changed —
+and `INTERNALS.md` is corrected wherever it still described one of these
+by name.
+
+**`AlertsDatabase.prune()` no longer repeats its own mute-expiry
+`DELETE`.** It now calls `purge_expired_mutes()` — the function that
+already existed and already ran the identical delete on its own clock —
+instead of inlining a second copy. Behaviour is unchanged: the table was
+already being pruned, so this is de-duplication, not a fix for a leak that
+never existed. The call sits outside `prune()`'s maintenance-delete lock
+block, so each owns its own short hold and commit rather than sharing one.
+
+**Two working records move to `docs/history/`.** `CODE-REVIEW.md` (the
+audit trail of review sessions, every finding marked Fixed) and
+`FORTIAP-POLLING-OPTIONS.md` (a costed survey pinned to 5.9.0, drifting
+since) are session records this project keeps for provenance, not
+maintained product documentation, and neither belonged beside
+`FEATURES.md`/`INTERNALS.md` any longer. Clearing stale demo output off
+disk turned up `DEMO-EVALUATION.md`, a fleet operator's 588-line
+buying-question evaluation of 4.46.4 run against a real device population
+— worth keeping, unlike the output around it — so it joins the other two
+in `docs/history/` rather than going out with the rest.
 
 ### 5.11.0 — Four asks, one deferred
 
@@ -286,7 +360,7 @@ in its own right and not the clearing of anything. The template editor's
 itself; every other template still previews as the opening alert it is.
 
 **FORTI-AP gets three of the additions its own research note costed out.**
-`FORTIAP-POLLING-OPTIONS.md`, written for 5.9.0, surveyed what more the
+`docs/history/FORTIAP-POLLING-OPTIONS.md`, written for 5.9.0, surveyed what more the
 module could poll without a change to what it talks to; three of its
 candidates ship now, with what they actually cost measured against the
 current tree rather than guessed. What they are not is as important as what
@@ -463,7 +537,7 @@ critical, seventeen high, twenty-nine medium, thirty-three low.
 No feature, page, dialog, button, endpoint or setting was removed to make any
 of this work, and the application stays standard-library-only — no finding
 proposed a dependency. The larger design work the review turned up is recorded
-as thirty proposals in `CODE-REVIEW.md` rather than done here, and that
+as thirty proposals in `docs/history/CODE-REVIEW.md` rather than done here, and that
 document is where the method is written down as well: seven area reviews
 against four lenses, every finding verified against the running code before it
 was accepted — a `path:line` citation, the decisive lines quoted, a concrete
@@ -1033,7 +1107,7 @@ exactly the one who will never switch it on. The count also rides along in
 the CSV export.
 
 **What else the Forti-AP module could poll: a costed answer, not a change.**
-`FORTIAP-POLLING-OPTIONS.md` surveys the per-AP data the module does not
+`docs/history/FORTIAP-POLLING-OPTIONS.md` surveys the per-AP data the module does not
 collect today, grouped by what each would cost: derivable from rows the
 poller already walks, one extra column sweep each, a new per-client table, or
 abandoning SNMP for the REST API. It ends with a recommendation and an

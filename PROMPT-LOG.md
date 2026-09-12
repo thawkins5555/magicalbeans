@@ -280,3 +280,59 @@ and `RUNBOOK.md` are updated to match. The full test suite and the browser
 walk, then a code review of the day's changes, follow once at the end, as
 the standing constraint requires — counts and findings appended here when
 they complete.
+
+## 5.12.0 — What is no longer in use
+
+**"Your only job is to look for code, documents and files that are no longer in
+use and suggest plan for removal."** — the standing working policy, plus a
+single standing task: find what is dead and plan its removal, removing nothing
+from the GUI without express permission.
+→ Audited the whole tree mechanically rather than by reading: 1,865 top-level
+Python definitions, 1,295 methods, 1,091 imports, 72 modules, every static
+`.js` symbol, 294 CSS classes, 108 custom properties, 261 HTTP routes, 237
+settings keys, 151 test suites, 21 bundled MIBs. The tree was close to clean —
+about 210 lines of genuinely dead code in a 3.5 MB package, and not one
+orphaned module, file, dependency or test. What was actually recoverable was
+2.0 GB of disk, eleven stale branches and three documents that were working
+records rather than product documentation.
+
+**Removed:** `ipam_scan.scan_subnet()` (a pre-composed wrapper superseded by
+`IpamWorker._scan` composing `sweep`/`read_arp_table`/`usable_addresses`
+itself), `dpapi.self_test()` and `secretstore.self_test()` (written for a
+"Check encryption" button that was never built), `HttpsChecker.check_now` (a
+copy of the live `HopProber.trace_now`, never routed), `nodesdb`'s unused
+`import threading`, `PDU_SET` and `enc_oid` from `snmppoll`'s trapdecode
+import, the `--vlan-1..16` design tokens and their test contract (superseded by
+`--canvas-vlan-*`, which every consumer had already moved to), `a11yTable()`,
+two unreferenced `STATUS_COLOR` objects, two unreferenced `ago` bindings and the
+`.dot-inline` rule. Nothing removed rendered anything: zero pixels changed.
+
+**Archived, not deleted** — `docs/history/` now holds `CODE-REVIEW.md` (a
+session log whose findings are all marked fixed, kept as the audit trail for
+security work), `FORTIAP-POLLING-OPTIONS.md` (whose own header declares its
+implemented parts historical, kept for per-OID measurements recorded nowhere
+else) and `DEMO-EVALUATION.md`, a 588-line fleet evaluation rescued from an
+abandoned branch that was 439 commits behind before that branch was dropped.
+
+**Three findings were not cleanup, and were fixed rather than deleted.** The
+self-update verified path — newest tag plus published `SHA256SUMS` — was fully
+implemented and tested but never called, so `apply()` followed the mutable
+`main` tip with nothing checking the bytes it swapped in. It is now wired up,
+with an explicitly logged fallback and a hard abort on digest mismatch. This
+repository carries one tag and no releases, so the fallback is what runs until
+the release process starts cutting tags with a `SHA256SUMS` asset: the change
+is correct and dormant, and engaging it is a process change, not a code one.
+`RUNBOOK.md` was missing from `_COPY_ALONGSIDE`, so every self-update stripped
+the on-call runbook from the install that README tells the operator to read
+before going live; it now ships. And `alertsdb.purge_expired_mutes()` had no
+callers — but `prune()` was already deleting those rows with its own inline
+SQL, so this was duplicated logic rather than the storage leak it first looked
+like; `prune()` now calls the method instead of re-implementing it, at
+identical behaviour.
+
+**Flagged, not actioned:** eleven pieces of live duplication (a whole
+seven-function time-window controller reimplemented across `netflow.js` and
+`netpath.js`, the bulk-selection trio written three times, `histogram()` in two
+stores), five routes with no front-end caller that are deliberate token-API
+surface, and a mechanical split for `api.py`'s 10,268 lines along the 27
+section boundaries it already carries.

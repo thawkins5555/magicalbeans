@@ -6,13 +6,6 @@
    reached from the status strip, the same way Nodes' device-group
    management lives behind its own control rather than its own tab. */
 (() => {
-  const STATUS_COLOR = { online: 'var(--ok)', offline: 'var(--fail)',
-    standby: 'var(--warn)', downloading_image: 'var(--warn)',
-    connected_image: 'var(--warn)', other: 'var(--line)',
-    // Not a reported status — an admin marking, deliberately muted so an
-    // AP someone already knows about doesn't read as a live failure.
-    out_of_service: 'var(--line)' };
-
   const view = {
     controllers: [],
     aps: [],

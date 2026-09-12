@@ -64,31 +64,6 @@
   --cat-7: #8F76E8;
   --cat-8: #DC5A5A;
 
-  /* VLAN palette: one strand per VLAN on a MAPPER trunk, so unlike --cat-1..8 (drawn as filled
-     areas, where 3:1 against the panel is the whole test) these are 1.5px lines that also have to
-     stay apart from EACH OTHER, side by side, in all seven themes — checked the same way --cat-1..8
-     was, simulating protanopia and deuteranopia and comparing in CIE Lab, not just eyeballed.
-     Sixteen hues evenly spaced 22.5 degrees apart (HSL, one lightness/saturation pair per theme
-     "family") hold a 12.7 CIE76 gap here against the dark panel; kept clear of --ok/--warn/--fail's
-     hues so a strand is never misread as a status. Light-ground themes cannot use this set as-is —
-     see --vlan-* under :root[data-theme="light"] and the other light theme below. */
-  --vlan-1: #DA6C6C;
-  --vlan-2: #DA956C;
-  --vlan-3: #DABF6C;
-  --vlan-4: #CDDA6C;
-  --vlan-5: #A3DA6C;
-  --vlan-6: #7ADA6C;
-  --vlan-7: #6CDA88;
-  --vlan-8: #6CDAB1;
-  --vlan-9: #6CDADA;
-  --vlan-10: #6CB1DA;
-  --vlan-11: #6C88DA;
-  --vlan-12: #7A6CDA;
-  --vlan-13: #A36CDA;
-  --vlan-14: #CD6CDA;
-  --vlan-15: #DA6CBF;
-  --vlan-16: #DA6C95;
-
   /* Route canvas: NetPath draws its route on white on purpose (it prints); greys tuned for black have no
      contrast there, so it keeps its own set. MAPPER's own canvas (#mp-canvas) is drawn on this same white
      ground in every theme but Contrast -- see --canvas-vlan-* below for why the VLAN strand palette needed
@@ -282,27 +257,6 @@
   --shadow-pop: 0 12px 40px rgba(20, 30, 45, 0.25);
   --shadow-float: 0 6px 20px rgba(20, 30, 45, 0.2);
   --scrim: rgba(20, 30, 45, 0.45);
-
-  /* The dark set's --vlan-* hues are too light to hold 3:1 against a white-ish panel, the same
-     problem the badge tones solve above by going dark-on-light instead of light-on-dark. Same 16
-     hues, same 22.5-degree spacing, re-lit for this ground: 3.5:1 lowest against --panel here, and
-     the pairwise CIE76 gap (10.4 at its tightest) is what tests/test_design_tokens.py's VLAN_DISTANCE_FLOOR is measured from. */
-  --vlan-1: #862727;
-  --vlan-2: #864B27;
-  --vlan-3: #866F27;
-  --vlan-4: #7A8627;
-  --vlan-5: #578627;
-  --vlan-6: #338627;
-  --vlan-7: #27863F;
-  --vlan-8: #278663;
-  --vlan-9: #278686;
-  --vlan-10: #276386;
-  --vlan-11: #273F86;
-  --vlan-12: #332786;
-  --vlan-13: #572786;
-  --vlan-14: #7A2786;
-  --vlan-15: #86276F;
-  --vlan-16: #86274B;
 }
 
 /* Midnight: deeper and cooler than Dark, for a NOC watched at 3am — every surface pushed further
@@ -390,10 +344,6 @@
   --cat-6: #88C0D0;
   --cat-7: #5E81AC;
   --cat-8: #BF616A;
-  /* --vlan-12 is the only strand that does not clear 3:1 against this theme's unusually light
-     --panel at the base hue (2.71:1); lifted in lightness only, same hue, same position in the
-     16-hue rotation, so it still sits the same distance from its two neighbours. */
-  --vlan-12: #A097D8;
 }
 
 /* Solarized: Solarized Dark's ochre-tinted base tones (base03/02 surfaces, the accent hues Ethan
@@ -481,22 +431,4 @@
   --cat-6: #3F7A2E;
   --cat-7: #74459E;
   --cat-8: #A6291F;
-  /* Same re-lit rotation the existing Light theme uses under :root[data-theme="light"] — a second
-     light theme needs the same fix for the same reason, not a fresh derivation. */
-  --vlan-1: #862727;
-  --vlan-2: #864B27;
-  --vlan-3: #866F27;
-  --vlan-4: #7A8627;
-  --vlan-5: #578627;
-  --vlan-6: #338627;
-  --vlan-7: #27863F;
-  --vlan-8: #278663;
-  --vlan-9: #278686;
-  --vlan-10: #276386;
-  --vlan-11: #273F86;
-  --vlan-12: #332786;
-  --vlan-13: #572786;
-  --vlan-14: #7A2786;
-  --vlan-15: #86276F;
-  --vlan-16: #86274B;
 }

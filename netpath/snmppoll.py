@@ -18,9 +18,9 @@ from dataclasses import dataclass, field
 from . import snmpcrypt
 from .trapdecode import (
     AUTH_PROTOCOLS, BerError, PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_REPORT,
-    PDU_RESPONSE, PDU_SET, Reader, T_INTEGER, T_NULL, T_OCTET_STRING, T_OID,
+    PDU_RESPONSE, Reader, T_INTEGER, T_NULL, T_OCTET_STRING, T_OID,
     T_SEQUENCE, V1, V2C, V3, _decode_value, _oid, _signed, _tlv, _unsigned,
-    enc_int, enc_octets, enc_oid, enc_unsigned, enc_varbind, localized_key,
+    enc_int, enc_octets, enc_unsigned, enc_varbind, localized_key,
 )
 
 ERROR_STATUS = {

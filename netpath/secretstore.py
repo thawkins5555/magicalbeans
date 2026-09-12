@@ -363,16 +363,3 @@ def is_portable_blob(blob: bytes) -> bool:
     """Cheap tag check, no passphrase or MAC involved — what dpapi.py uses
     to decide which implementation a given stored blob belongs to."""
     return bytes(blob).startswith(MAGIC)
-
-
-def self_test() -> bool:
-    """Round-trips a throwaway value, the same shape as dpapi.self_test()
-    and used for the same reason: a "Check encryption" style verification
-    that does not depend on any credential actually being stored yet."""
-    if not configured():
-        return False
-    probe = os.urandom(32)
-    try:
-        return unprotect(protect(probe)) == probe
-    except SecretStoreError:
-        return False

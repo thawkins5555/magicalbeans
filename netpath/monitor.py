@@ -899,9 +899,6 @@ class HttpsChecker(Worker):
     def next_runs(self) -> dict[int, float]:
         return dict(self._next_run)
 
-    def check_now(self, target_id: int) -> None:
-        self._submit(target_id)
-
     # ------------------------------------------------------------- internals
 
     def _loop(self) -> None:

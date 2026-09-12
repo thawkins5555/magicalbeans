@@ -1,14 +1,25 @@
-"""Update this install from the GitHub repository (stdlib only): check the
-tip of `main`, download its tarball, swap it in for the running `netpath`
-package, and re-exec.
+"""Update this install from the GitHub repository (stdlib only): resolve the
+newest release tag, download that tag's tarball, check its bytes against the
+digest the release published, swap it in for the running `netpath` package,
+and re-exec.
 
-SECURITY NOTE — accepted debt: step 1 follows the mutable `main` branch and
-the download is checked only for size and "looks like SappiWhere", not any
-signature or digest — whoever can push to main controls what every install
-runs next. The verified path (newest tag + published SHA256SUMS) still
-exists and is tested (`latest_tag`, `published_digest`, `tarball_name`);
-`apply()` just doesn't call it yet. Until it does, leave `updates_enabled`
-off (the default) and install by hand.
+SECURITY NOTE: `apply()` takes the verified path — `latest_tag`,
+`tarball_name`, `published_digest` — whenever the newest tag is newer than
+the running version and its release publishes a SHA256SUMS entry for the
+tarball. The SHA-256 of the downloaded bytes must then equal the published
+digest before anything is unpacked, recorded or swapped in, and a mismatch
+ends the job on the `failed` step with the install untouched. A mismatch is
+never fallen back from: only an ABSENT digest lets the fallback run.
+
+The fallback is the tip of the mutable `main` branch, checked only for size
+and "looks like SappiWhere" — so whoever can push to main controls what it
+installs. It exists because a release that publishes no SHA256SUMS, or a
+repository that tags nothing, must not leave a host unable to update at
+all; today, with no tagged release carrying that asset, it is the path
+every install takes. Each fallback is logged to update_restart.log (see
+_FALLBACK_*) with the condition that caused it. A host that must
+never take it should leave `updates_enabled` off (the default) and install
+by hand.
 """
 
 from __future__ import annotations
@@ -29,7 +40,7 @@ import traceback
 import urllib.error
 import urllib.request
 
-from . import temppath
+from . import __version__, temppath
 
 OWNER = "thawkins5555"
 REPO = "magicalbeans"
@@ -64,8 +75,9 @@ _NETPATH_DIR = os.path.dirname(os.path.abspath(__file__))
 _APP_ROOT = os.path.dirname(_NETPATH_DIR)
 _CACERT_PATH = os.path.join(_NETPATH_DIR, "cacert.pem")
 
-_COPY_ALONGSIDE = ("requirements.txt", "README.md", "CHANGELOG.md", "FEATURES.md",
-                   "INTERNALS.md", "CREDENTIAL-SECURITY.md",
+_COPY_ALONGSIDE = ("requirements.txt", "README.md", "RUNBOOK.md",
+                   "CHANGELOG.md", "FEATURES.md", "INTERNALS.md",
+                   "CREDENTIAL-SECURITY.md",
                    "NETWORK-AND-STORAGE-REQUIREMENTS.md")
 
 
@@ -160,8 +172,8 @@ def _version_key(tag: str) -> tuple:
 
 def latest_commit(timeout: float = 10.0) -> dict:
     """The current tip of BRANCH, from GitHub's commits API — what apply()
-    installs. See the module's SECURITY NOTE: a branch tip moves, and
-    nothing here proves who moved it."""
+    installs on its fallback path. See the module's SECURITY NOTE: a branch
+    tip moves, and nothing here proves who moved it."""
     head = _fetch_json(
         f"https://api.github.com/repos/{OWNER}/{REPO}/commits/{BRANCH}",
         timeout=timeout)
@@ -176,8 +188,8 @@ def latest_commit(timeout: float = 10.0) -> dict:
 
 def latest_tag(timeout: float = 10.0) -> dict:
     """The newest published tag, from GitHub's tags API, chosen by version
-    order (not API return order). Part of the verified path apply() does
-    not currently use — see the module's SECURITY NOTE."""
+    order (not API return order). The first step of the verified path
+    apply() takes — see the module's SECURITY NOTE."""
     tags = _fetch_json(f"https://api.github.com/repos/{OWNER}/{REPO}/tags",
                        timeout=timeout)
     named = [t for t in (tags or []) if t.get("name")]
@@ -198,7 +210,7 @@ def tarball_name(tag: str) -> str:
 def published_digest(tag: str, timeout: float = 10.0) -> str:
     """The SHA-256 the release for `tag` published, read from the release's
     SHA256SUMS asset (a digest carried inside the archive it describes would
-    prove nothing). Part of the verified path apply() does not use yet."""
+    prove nothing). What apply() checks the downloaded bytes against."""
     release = _fetch_json(
         f"https://api.github.com/repos/{OWNER}/{REPO}/releases/tags/{tag}",
         timeout=timeout)
@@ -225,10 +237,80 @@ def published_digest(tag: str, timeout: float = 10.0) -> str:
     raise ValueError(f"{SUMS_ASSET} for {tag} has no entry for {wanted}")
 
 
+# Why _resolve_target did not take the verified path. Each is logged, with
+# the exception that produced it, so an operator can tell "nobody has tagged
+# a release" from "the release forgot its SHA256SUMS".
+_FALLBACK_NO_TAG = "no tag could be read from that repository"
+_FALLBACK_NOT_NEWER = "no tag is newer than the running version"
+_FALLBACK_NO_RELEASE = "the newest tag has no GitHub release"
+_FALLBACK_NO_DIGEST = f"that release publishes no usable {SUMS_ASSET} entry"
+
+
+def _resolve_target() -> dict:
+    """What apply() should install: `{"tag", "sha", "digest", "ref",
+    "message"}`.
+
+    The verified path when the newest tag is newer than the running version
+    and its release publishes a digest for the tarball — `digest` filled in
+    and `ref` naming the tag. Otherwise the tip of BRANCH, with `tag` and
+    `digest` empty and the reason logged; that fallback is what every
+    install takes while releases carry no SHA256SUMS (see the SECURITY
+    NOTE), so it is a branch of its own rather than an `except` that swallows.
+
+    Raises ValueError when a digest exists but could not be read: "could not
+    check" is not "nothing to check against", and installing unverified
+    because the check itself was blocked is the one thing this must not do.
+    Network failures on the branch tip are left to raise, so apply() reports
+    them exactly as it always has.
+    """
+    tag = sha = digest = ""
+    try:
+        release = latest_tag()
+        tag, sha = str(release["tag"]), str(release.get("sha", ""))
+    except Exception as exc:
+        # Broad on purpose: nothing that goes wrong looking for a release may
+        # leave a host with no way to update at all.
+        why = f"{_FALLBACK_NO_TAG} ({exc})"
+    else:
+        if _version_key(tag) <= _version_key(__version__):
+            why = f"{_FALLBACK_NOT_NEWER} ({tag} against {__version__})"
+        else:
+            try:
+                digest = published_digest(tag)
+            except ValueError as exc:
+                why = f"{_FALLBACK_NO_DIGEST} ({exc})"
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    raise ValueError(
+                        f"Could not read the published digest for {tag} "
+                        f"(HTTP {exc.code}) — refusing to install anything "
+                        f"that cannot be checked against it. Nothing on this "
+                        f"host has been changed.")
+                why = f"{_FALLBACK_NO_RELEASE} ({tag}: {exc})"
+            except Exception as exc:
+                raise ValueError(
+                    f"Could not read the published digest for {tag} ({exc}) "
+                    f"— refusing to install anything that cannot be checked "
+                    f"against it. Nothing on this host has been changed.")
+
+    if digest:
+        return {"tag": tag, "sha": sha, "digest": digest,
+                "ref": f"refs/tags/{tag}", "message": tag}
+
+    _log_restart(f"verified update not available: {why}. Falling back to the "
+                 f"tip of {BRANCH}, which no published digest covers — see "
+                 f"the SECURITY NOTE in selfupdate.py")
+    head = latest_commit()
+    sha = head["sha"]
+    return {"tag": "", "sha": sha, "digest": "", "ref": sha,
+            "message": head["message"] or sha[:10]}
+
+
 def _download_tarball(ref: str, dest_path: str, timeout: float = 60.0) -> str:
-    """The tarball for `ref`, written to `dest_path`. Returns its SHA-256.
-    `ref` is a commit id for apply()'s branch pull; codeload also accepts
-    `refs/tags/<tag>` for the (currently unused) verified path."""
+    """The tarball for `ref`, written to `dest_path`. Returns its SHA-256 —
+    what apply() checks against the published digest. `ref` is
+    `refs/tags/<tag>` on the verified path and a commit id on the branch
+    fallback; codeload serves both."""
     url = f"https://codeload.github.com/{OWNER}/{REPO}/tar.gz/{ref}"
     raw = _fetch_bytes(url, timeout=timeout, max_bytes=MAX_DOWNLOAD_BYTES)
     with open(dest_path, "wb") as handle:
@@ -561,7 +643,7 @@ def apply(app_db, report=None, before_quiesce=None) -> dict:
 
     step("checking", message="", error="", commit="")
     try:
-        head = latest_commit()
+        target = _resolve_target()
     except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
         # OSError rather than TimeoutError alone: socket.timeout, TimeoutError
         # and ssl.SSLError are all OSError subclasses, and URLError is too, so
@@ -581,9 +663,12 @@ def apply(app_db, report=None, before_quiesce=None) -> dict:
         step("failed", error=str(exc))
         return {"ok": False, "error": str(exc)}
 
-    sha = head["sha"]
-    message = head["message"] or sha[:10]
-    if app_db.meta(INSTALLED_COMMIT_KEY) == sha:
+    tag, sha, message = target["tag"], target["sha"], target["message"]
+    if tag:
+        current = app_db.meta(INSTALLED_TAG_KEY) == tag
+    else:
+        current = app_db.meta(INSTALLED_COMMIT_KEY) == sha
+    if current:
         # Its own step: "update failed" for a host that was already
         # current is the complaint this job exists to answer.
         step("up_to_date", message=message, commit=sha[:10])
@@ -605,13 +690,20 @@ def apply(app_db, report=None, before_quiesce=None) -> dict:
         step("downloading", message=message, commit=sha[:10])
         archive_path = os.path.join(tmp_dir, "update.tar.gz")
         try:
-            # Nothing checks this digest: the branch pull has no published
-            # digest to check it against. See the SECURITY NOTE at the top.
-            _download_tarball(sha, archive_path)
+            downloaded = _download_tarball(target["ref"], archive_path)
         except (urllib.error.URLError, http.client.HTTPException,
                 ValueError, OSError) as exc:
             step("failed", error=f"Download failed: {exc}")
             return {"ok": False, "error": f"Download failed: {exc}"}
+
+        # Before the archive is even opened, and never fallen back from.
+        if target["digest"] and downloaded != target["digest"]:
+            error = (f"The download for {tag} does not match the SHA256 that "
+                     f"release published ({downloaded} against "
+                     f"{target['digest']}) — refusing to install it. Nothing "
+                     f"on this host has been changed.")
+            step("failed", error=error)
+            return {"ok": False, "error": error}
 
         step("extracting")
         extract_dir = os.path.join(tmp_dir, "extracted")
@@ -645,9 +737,9 @@ def apply(app_db, report=None, before_quiesce=None) -> dict:
         try:
             app_db.set_meta(INSTALLED_COMMIT_KEY, sha)
             app_db.set_meta(INSTALLED_AT_KEY, str(time.time()))
-            # A branch pull cannot honestly claim a tag, and a stale one
-            # would read as what is installed.
-            app_db.set_meta(INSTALLED_TAG_KEY, "")
+            # Empty on the fallback: a branch pull cannot honestly claim a
+            # tag, and a stale one would read as what is installed.
+            app_db.set_meta(INSTALLED_TAG_KEY, tag)
         except Exception as exc:
             error = f"Could not record the update in app.db: {exc}"
             step("failed", error=error)

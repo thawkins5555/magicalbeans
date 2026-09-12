@@ -3327,12 +3327,14 @@ class AlertsDatabase(SqliteStore):
 
         # Neither of these two grows at alert volume - one row per mute ever
         # set, one per maintenance period - and neither is worth batching.
-        # Their own short lock hold rather than a share of the sweep's.
+        # Their own short lock holds rather than a share of the sweep's.
+
+        # Lapsed mutes read as "not muted" from the moment they expire; this
+        # only stops the table growing a row per mute ever set. Its own call,
+        # so it commits on its own rather than inside the hold below.
+        self.purge_expired_mutes()
+
         with self._lock:
-            # Lapsed mutes read as "not muted" from the moment they expire;
-            # this only stops the table growing a row per mute ever set.
-            self._conn.execute("DELETE FROM alert_mutes WHERE until_ts <= ?",
-                               (time.time(),))
             # A CLOSED maintenance period is history the availability
             # report replays, so it ages out on the same retention as the
             # alerts it explains rather than on a clock of its own. An OPEN

@@ -585,7 +585,7 @@ MIB is not history, and trimming it would silently stop traps decoding.
 
 Every BER/ASN.1 primitive (`Reader`, tag constants, `_signed`/`_unsigned`/
 `_oid`/`_decode_value`, `_tlv`/`enc_int`/`enc_unsigned`/`enc_octets`/
-`enc_oid`/`enc_varbind`) is imported from `trapdecode.py`, not
+`enc_varbind`) is imported from `trapdecode.py`, not
 duplicated — this file is purely the poller-specific half (request
 building, response decoding) of the same wire format the trap receiver
 already decodes. `build_request()` builds GET/GETNEXT/GETBULK/SET for
@@ -6641,9 +6641,9 @@ not true zero — a secondary, expected consequence of the non-zero floor
 worth knowing if the fill ever looks like it's covering less than it
 used to.
 
-### Subnet sweep (`ipam_scan.py`)
+### Subnet sweep (`ipam_scan.py`, composed by `IpamWorker._scan` in `ipam_worker.py`)
 
-`scan_subnet()` does exactly two things in order: `sweep()` pings every
+`IpamWorker._scan()` does exactly two things in order: `sweep()` pings every
 address in the CIDR concurrently (a `ThreadPoolExecutor`, default 64
 workers, one OS `ping` subprocess per address — `_ping_command()` builds
 `ping -c 1 -W <timeout>` on Unix, `ping -n 1 -w <timeout_ms>` on
@@ -6652,9 +6652,12 @@ whole sweep, and its result is filtered to only addresses inside the
 subnet's own `ipaddress.ip_network`:
 
 ```python
-in_subnet = {ip: mac for ip, mac in arp.items()
-            if ipaddress.ip_address(ip) in net}
+arp = {ip: mac for ip, mac in read_arp_table().items()
+      if ipaddress.ip_address(ip) in net}
 ```
+
+The address list itself comes from `usable_addresses()`, capped by the
+subnet's `max_scan_addresses` setting.
 
 This filter is the reason a discovered-host row can never have an
 address outside its own subnet's CIDR — it is structurally impossible
@@ -7507,7 +7510,7 @@ the poll cycle.
 
 ### What else the controller could be asked for
 
-`FORTIAP-POLLING-OPTIONS.md` is a costed survey of the per-AP data this
+`docs/history/FORTIAP-POLLING-OPTIONS.md` is a costed survey of the per-AP data this
 module did not collect as of 5.9.0. Three of its candidates — A2 (radio
 channel/mode change as an event), B1 (AP uptime and reboot detection) and
 B5 (BSSID plus the profile's configured channel width) — are implemented
@@ -8744,49 +8747,44 @@ every other page just waits for the observer.
   midnight, nord, solarized and slate at ordinary AA, contrast at AAA —
   and requires each theme block to define the full themed set, so a dark
   tone inherited onto a light ground fails instead of vanishing. From
-  4.54.0 the same file also enforces two sixteen-entry VLAN palettes, both
-  keyed by `vlan_color_index` and both held to the same two checks: each
-  hue at least 3:1 against its own ground, and — since a hue nudged
-  towards ANY of the other fifteen is as much a bug as one nudged towards
-  its neighbour in the rotation — every one of the 120 pairs within a
-  palette at least `VLAN_DISTANCE_FLOOR` (10.0) apart in CIE76
+  4.54.0 the same file also enforces a sixteen-entry VLAN palette, keyed
+  by `vlan_color_index` and held to two checks: each hue at least 3:1
+  against `--canvas` — the ground a MAPPER trunk strand is actually drawn
+  on (`mapper.js`'s `drawLink`, `var(--canvas-vlan-N)`, on `#mp-canvas`,
+  whose background is `--canvas` — white in every theme but Contrast, the
+  same route-canvas idiom NetPath's own graph already established) — and,
+  since a hue nudged towards ANY of the other fifteen is as much a bug as
+  one nudged towards its neighbour in the rotation, every one of the 120
+  pairs at least `VLAN_DISTANCE_FLOOR` (10.0) apart in CIE76
   (`lab()`/`delta_e76()`, the test file's own sRGB → CIE L\*a\*b\*
-  conversion), not just adjacent-in-rotation pairs. **The two palettes are
-  not interchangeable, and treating them as one was a defect two separate
-  reviews caught before release, at two different layers.**
-  `--canvas-vlan-1..16` is tuned against `--canvas`: a MAPPER trunk strand
-  itself (`mapper.js`'s `drawLink`, `var(--canvas-vlan-N)`) draws on
-  `#mp-canvas`, whose background is `--canvas` — white in every theme but
-  Contrast, the same route-canvas idiom NetPath's own graph already
-  established — not `--panel`. `--vlan-1..16` is tuned against `--panel`
-  instead. Nine or ten of the sixteen `--vlan-*` hues fall under 3:1
-  measured against white (`--vlan-4` lands near 1.5:1), which is what made
-  the second palette necessary in the first place rather than reusing the
-  first one for both grounds — the first review caught the strand itself
-  needing its own copy. **A second review, after that fix had shipped,
-  caught that MAPPER's own chrome — the VLAN table's colour swatch and its
-  sixteen-swatch colour picker — still read `--vlan-1..16`, the
-  `--panel`-tuned palette, rather than the `--canvas-vlan-1..16` a strand
-  is actually stroked with:** in Dark, Midnight, Nord and Solarized, not
-  one of the sixteen pairs was the same colour, so picking "Colour 1" off
-  the swatch showed a hue the map never actually drew for VLAN 1 (Dark:
-  swatch `--vlan-1` #DA6C6C, strand `--canvas-vlan-1` #862727). The table
-  swatch (`mapper.js`'s `VLAN_COLUMNS`) and the picker
-  (`openVlanColorPicker`) both read `--canvas-vlan-N` now, the same value
-  the strand is stroked with; `.mp-swatch`'s own CSS border also moved
-  from `--hairline` (a 1.3–1.6:1 surface-step divider, not meant to be
-  seen on its own) to `--line` (≥3.38:1 against `--panel` in every theme),
-  so the swatch still reads as a square even where its `--canvas-vlan-*`
-  fill sits close to invisible against `--panel` (worst case, Nord:
-  ~1.03:1 fill-on-panel). `--vlan-1..16` is no longer read by any part of
-  the interface, though it stays defined and held to the same two checks
-  in `test_design_tokens.py`. `--canvas-vlan-1..16` needs its own override
-  only under `data-theme="contrast"` (the one theme where `--canvas`
-  itself goes dark), reusing the light-on-dark `--vlan-1..16` rotation
-  there for the same reason in reverse — the other six themes share one
-  definition, since `--canvas` is the identical white for all of them.
-  `theme.py` (the console window) stays on the dark values, unchanged by
-  any of the six new theme blocks.
+  conversion), not just adjacent-in-rotation pairs. The VLAN table's
+  colour swatch (`mapper.js`'s `VLAN_COLUMNS`) and its sixteen-swatch
+  colour picker (`openVlanColorPicker`) read `--canvas-vlan-N` too, the
+  same value the strand is stroked with. That was not always so: a
+  second, `--panel`-tuned `--vlan-1..16` palette used to back the table
+  swatch and picker instead, and two separate reviews caught it drifting
+  from the strand's own palette at two different layers — first that
+  nine or ten of the sixteen `--vlan-*` hues fell under 3:1 measured
+  against white (`--vlan-4` near 1.5:1), which is what made a second,
+  `--canvas`-tuned palette necessary in the first place; then, after that
+  fix shipped, that the swatch and picker still read the old `--panel`-
+  tuned palette rather than the one the strand was actually stroked with,
+  so picking "Colour 1" off the swatch could show a hue the map never
+  drew for VLAN 1. `.mp-swatch`'s own CSS border is `--line` (≥3.38:1
+  against `--panel` in every theme), not `--hairline` (a 1.3–1.6:1
+  surface-step divider, not meant to be seen on its own), so the swatch
+  still reads as a square where its `--canvas-vlan-*` fill sits close to
+  invisible against `--panel` (worst case, Nord: ~1.03:1 fill-on-panel).
+  `--vlan-1..16` and the `test_design_tokens.py` section that checked it
+  are gone this release — nothing had read the tokens since the swatch
+  and picker moved to `--canvas-vlan-*`, so the dead palette outlived its
+  only callers. `--canvas-vlan-1..16` needs its own override only under
+  `data-theme="contrast"` (the one theme where `--canvas` itself goes
+  dark), reusing the same light-on-dark rotation the old `--vlan-1..16`
+  used to carry there, for the same reason in reverse — the other six
+  themes share one definition, since `--canvas` is the identical white
+  for all of them. `theme.py` (the console window) stays on the dark
+  values, unchanged by any of the six new theme blocks.
 - **Breakpoints.** `@media (max-width: 1200px)` makes the fixed widths
   fluid; `(max-width: 900px)` stacks `[data-splitter].cols` and the NetPath
   page (both selectors the row rule uses, since boot.js's first-frame rule

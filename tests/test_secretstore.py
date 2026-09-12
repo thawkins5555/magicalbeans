@@ -518,8 +518,9 @@ def test_real_dpapi_through_the_dhcp_credential_route():
     if os.name == "nt":
         print("      note: skipping the real end-to-end pass -- this host "
               "IS Windows, so it is DPAPI, not the portable store, that "
-              "would actually be exercised, and that is covered by dpapi's "
-              "own self_test(), not this suite.")
+              "would actually be exercised, and that path is already "
+              "covered by the credential-storage tests' own dpapi.protect()"
+              "/unprotect() calls, not this suite.")
         return
     reset()
     path = passphrase_file("end-to-end-passphrase, not typed anywhere else\n")

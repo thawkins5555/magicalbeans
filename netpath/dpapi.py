@@ -97,16 +97,3 @@ def unprotect(ciphertext: bytes) -> bytes:
     if not ok:
         raise DpapiUnavailable(f"CryptUnprotectData failed: {ctypes.WinError()}")
     return _from_blob(blob_out)
-
-
-def self_test() -> bool:
-    """Round-trips a throwaway value through whichever implementation
-    available() says this host has. For a "Check encryption" button and
-    confirming a fresh install works before anyone depends on it."""
-    if not available():
-        return False
-    probe = os.urandom(32)
-    try:
-        return unprotect(protect(probe)) == probe
-    except DpapiUnavailable:
-        return False

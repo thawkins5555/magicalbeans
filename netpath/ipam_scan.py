@@ -786,25 +786,3 @@ def sweep(addresses: list[str], timeout_ms: int = 800, workers: int = 64,
         for ip, alive in zip(to_probe, pool.map(paced, enumerate(to_probe))):
             results[ip] = alive
     return results
-
-
-def scan_subnet(cidr: str, max_addresses: int, timeout_ms: int = 800,
-                workers: int = 64,
-                probes_per_second: float = DEFAULT_PROBES_PER_SECOND,
-                never_scan=(),
-                stop=None) -> tuple[dict[str, bool], dict[str, str]]:
-    """One full pass: ping every address, then read the ARP table once.
-
-    Returns (alive, arp) — alive is every address probed, arp is whatever the
-    local table now holds for addresses in this subnet (a superset of what
-    just answered is fine; the caller only looks up addresses it asked about).
-    """
-    addresses = usable_addresses(cidr, max_addresses)
-    alive = sweep(addresses, timeout_ms=timeout_ms, workers=workers,
-                  probes_per_second=probes_per_second, never_scan=never_scan,
-                  stop=stop)
-    arp = read_arp_table()
-    net = ipaddress.ip_network(str(cidr).strip(), strict=False)
-    in_subnet = {ip: mac for ip, mac in arp.items()
-                if ipaddress.ip_address(ip) in net}
-    return alive, in_subnet

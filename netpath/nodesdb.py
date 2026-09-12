@@ -17,7 +17,6 @@ import logging
 import os
 import re
 import sqlite3
-import threading
 import time
 
 from .namelookup import is_ip_literal

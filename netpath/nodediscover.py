@@ -230,10 +230,10 @@ class DiscoveryJob:
                                  or DEFAULT_DISCOVERY_WORKERS)))
         groups = self.db.groups()
 
-        # One bulk ping pass first, then SNMP per address — mirrors
-        # ipam_scan.scan_subnet's own shape rather than interleaving. Extra
-        # ping passes (per-scan retries) only revisit the addresses that
-        # have not answered yet.
+        # One bulk ping pass first, then SNMP per address — mirrors the IPAM
+        # subnet scan's sweep-then-lookup shape rather than interleaving.
+        # Extra ping passes (per-scan retries) only revisit the addresses
+        # that have not answered yet.
         # Pacing and the deny list, both from settings so a site can be
         # gentler than the default without a code change. `never_scan_cidrs`
         # is the list of networks this application must never put a probe

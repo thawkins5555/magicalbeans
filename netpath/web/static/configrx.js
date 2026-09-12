@@ -60,24 +60,16 @@
 
   const escape = App.escapeHtml;
 
-  const ago = App.ago;
-
   function bytesText(n) {
     if (n < 1024) return `${n} B`;
     if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
     return `${(n / 1048576).toFixed(1)} MB`;
   }
 
-  const STATUS_COLOR = { changed: 'var(--ok)', unchanged: 'var(--accent)',
-    error: 'var(--fail)', suspect: 'var(--warn)' };
-  /* Backup outcomes mapped onto the tones App.statusMark draws. "changed"
-     is information rather than health — a device whose config differs from
-     the last copy is working exactly as intended — so it takes the info
-     tone and its own shape, instead of the green that means "up" on every
-     other page in the product. "suspect" is a capture under a fifth of the
-     device's previous one: stored, because refusing it outright is worse,
-     but flagged rather than shown as an ordinary change (see configrx.py's
-     SUSPECT_SHRINK_RATIO). */
+  /* "changed" is information, not ill health — a config differing from the
+     last copy is the feature working — so it takes the info tone, not the
+     green that means "up" elsewhere. "suspect" is a capture under a fifth of
+     the previous one: stored, but flagged (configrx.py SUSPECT_SHRINK_RATIO). */
   const STATUS_TONE = { changed: 'info', unchanged: 'ok', error: 'fail', suspect: 'warn' };
 
   function statusDot(status) {

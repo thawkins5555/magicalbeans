@@ -275,44 +275,6 @@ if CLAIM and len(TINTS) == 3:
               % (theme_name, peak_tint * 100, ratio))
 
 # --------------------------------------------------------------------------
-# 2. The VLAN palette: one strand per VLAN on a MAPPER trunk. Unlike the
-#    fixed-role pairs above, these sixteen also have to stay apart from EACH
-#    OTHER — a MAPPER trunk lays them down as 1.5px lines side by side, and a
-#    hue too close to its neighbour is a bug a screenshot will not show.
-#    --ok/--warn/--fail already carry a fixed meaning elsewhere in the app;
-#    the sixteen VLAN hues are chosen clear of those (by hue, checked by eye
-#    and under simulated protanopia/deuteranopia the way --cat-1..8's
-#    comment above describes — sixteen swatches do not fit a numeric floor
-#    the way the pairwise check below does, so that part stays a design
-#    check, not an automated one).
-VLAN_ROLES = ["--vlan-%d" % n for n in range(1, 17)]
-# Not a colour-science standard: the tightest pair this file actually
-# produces is the light-ground rotation ("light" and "slate" both reuse it)
-# at 10.40 apart in CIE76. The floor sits just under that, so a future edit
-# that lets two VLAN hues drift together fails here before it is visible on
-# screen, without being so tight that float rounding trips it.
-VLAN_DISTANCE_FLOOR = 10.0
-for theme_name in sorted(THEMES):
-    values = THEMES[theme_name]
-    missing = [role for role in VLAN_ROLES if role not in values]
-    check(not missing, "[%s] all sixteen --vlan-* tokens are defined (missing %s)"
-          % (theme_name, missing or "none"))
-    if missing:
-        continue
-    for role in VLAN_ROLES:
-        ratio = contrast(tok(role, theme_name), tok("--panel", theme_name))
-        check(ratio >= 3.0, "[%s] %s on --panel = %.2f:1 (floor 3.0)" % (theme_name, role, ratio))
-    # Every one of the 120 pairs, not just neighbours in the hue rotation: a
-    # hue nudged towards a non-adjacent one is just as much a MAPPER bug as
-    # one nudged towards its neighbour, since which sixteen VLANs land next
-    # to each other on a given trunk is decided by the network, not by us.
-    hexes = [tok(role, theme_name) for role in VLAN_ROLES]
-    min_gap = min(delta_e76(a, b) for a, b in itertools.combinations(hexes, 2))
-    check(min_gap >= VLAN_DISTANCE_FLOOR,
-          "[%s] closest pair among the sixteen VLAN hues is %.2f apart (floor %.1f)"
-          % (theme_name, min_gap, VLAN_DISTANCE_FLOOR))
-
-# --------------------------------------------------------------------------
 # 2b. The pairing actually drawn on a MAPPER trunk is --canvas-vlan-*
 #     against --canvas, not --vlan-* against --panel: mapper.js's drawLink
 #     strokes a strand with --canvas-vlan-N because the strand is drawn on
@@ -320,15 +282,19 @@ for theme_name in sorted(THEMES):
 #     VLAN table's swatch and the colour picker read --canvas-vlan-* too, as
 #     of the second review pass: they name a colour the operator is about to
 #     see on the canvas, so showing them the --panel-tuned value meant the
-#     legend and the line disagreed in four of the seven themes. Section 2
-#     above still holds --vlan-* to its own contract because tokens.css
-#     still defines it, and because a swatch on --panel needs its own
-#     readable border either way (.mp-swatch uses var(--line), not
-#     var(--hairline), for exactly that reason). A code review caught nine or
-#     ten of the sixteen --vlan-* hues failing 3:1 on white before
-#     --canvas-vlan-* existed (--vlan-4 measured ~1.5:1) — this is the check
-#     that catches a regression back to that bug, by checking the ground the
-#     strand is actually drawn on instead of --panel.
+#     legend and the line disagreed in four of the seven themes. A swatch on
+#     --panel still needs its own readable border either way (.mp-swatch
+#     uses var(--line), not var(--hairline), for exactly that reason). A code
+#     review caught nine or ten of the sixteen --vlan-* hues failing 3:1 on
+#     white before --canvas-vlan-* existed (--vlan-4 measured ~1.5:1) — this
+#     is the check that catches a regression back to that bug, by checking
+#     the ground the strand is actually drawn on instead of --panel.
+# Not a colour-science standard: the tightest pair this file actually
+# produces is the light-ground rotation ("light" and "slate" both reuse it)
+# at 10.40 apart in CIE76. The floor sits just under that, so a future edit
+# that lets two --canvas-vlan-* hues drift together fails here before it is
+# visible on screen, without being so tight that float rounding trips it.
+VLAN_DISTANCE_FLOOR = 10.0
 CANVAS_VLAN_ROLES = ["--canvas-vlan-%d" % n for n in range(1, 17)]
 for theme_name in sorted(THEMES):
     values = THEMES[theme_name]

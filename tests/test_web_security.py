@@ -263,13 +263,23 @@ def main() -> int:
     # selfupdate that touch the network are the only boundary, and both are
     # replaced here.
     #
-    # apply() follows the tip of main — see the SECURITY NOTE in
-    # selfupdate.py for the exposure that carries and why it is accepted for
-    # now. The tag-and-digest helpers it no longer calls are still exercised
-    # directly further down, so the verified path stays covered and putting
-    # it back stays a change to apply() rather than a rewrite.
+    # apply() tries the verified path first — the newest tag, that tag's
+    # release, the SHA256SUMS it publishes — and the digest is checked
+    # before anything is unpacked, recorded or swapped in. It falls back to
+    # the tip of main only for the four named reasons in selfupdate.py
+    # (_FALLBACK_*), and never for a digest that was read and did not match.
+    #
+    # This repository's newest tag by version order is v9.10.0-broken, and
+    # its release publishes no SHA256SUMS, so the fixture below takes the
+    # fallback — which is the path every real install takes today, for the
+    # same reason. The verified path's own outcomes (a mismatch, and the
+    # version gate) get fixtures of their own at the end of this section.
     TAG = "v9.9.9"
     TIP = "b" * 40
+
+    TAGS = [{"name": "v9.8.0", "commit": {"sha": "a" * 40}},
+            {"name": TAG, "commit": {"sha": "b" * 40}},
+            {"name": "v9.10.0-broken", "commit": {"sha": "c" * 40}}]
 
     def build_tarball(root: str) -> bytes:
         raw = io.BytesIO()
@@ -287,7 +297,8 @@ def main() -> int:
     GOOD_DIGEST = hashlib.sha256(build_tarball("magicalbeans-9.9.9")).hexdigest()
 
     state = {"digest": GOOD_DIGEST, "tarball": TARBALL, "sha": TIP,
-             "message": "The commit at the tip\n\nand its body", "calls": []}
+             "message": "The commit at the tip\n\nand its body",
+             "tags": list(TAGS), "calls": []}
 
     def fake_json(url, timeout=10.0):
         state["calls"].append(url)
@@ -295,9 +306,7 @@ def main() -> int:
             return {"sha": state["sha"],
                     "commit": {"message": state["message"]}}
         if url.endswith("/tags"):
-            return [{"name": "v9.8.0", "commit": {"sha": "a" * 40}},
-                    {"name": TAG, "commit": {"sha": "b" * 40}},
-                    {"name": "v9.10.0-broken", "commit": {"sha": "c" * 40}}]
+            return state["tags"]
         if "/releases/tags/" in url:
             if url.endswith("v9.10.0-broken"):
                 return {"assets": []}
@@ -355,8 +364,11 @@ def main() -> int:
     try:
         SERVICE.app_db.save_settings({"updates_enabled": True})
 
-        # The tip of main is what is installed, and it is reached without
-        # asking about tags or releases at all.
+        # The verified path is asked for first and cannot finish here — the
+        # newest tag's release publishes no digest — so the tip of main is
+        # what installs. What is being proved is the order: the tag and its
+        # release are consulted before anything is downloaded, and the bytes
+        # that do get downloaded are the branch commit's, not a tag's.
         state["calls"].clear()
         commit_before = SERVICE.app_db.meta(selfupdate.INSTALLED_COMMIT_KEY)
         result = selfupdate.apply(SERVICE.app_db)
@@ -365,10 +377,20 @@ def main() -> int:
               and result.get("commit") == TIP[:10], str(result))
         check("D3 …with the commit subject as its message, not its whole body",
               result.get("message") == "The commit at the tip", str(result))
-        check("D3 …asking GitHub only for the branch tip and that tarball",
-              not any("/tags" in url or "/releases" in url
-                      for url in state["calls"]),
-              str(state["calls"]))
+        calls = list(state["calls"])
+        tags_at = next((i for i, url in enumerate(calls)
+                        if url.endswith("/tags")), -1)
+        codeload_at = next((i for i, url in enumerate(calls)
+                            if "codeload" in url), -1)
+        check("D3 …after asking for the newest tag and its release first, "
+              "and downloading the branch commit because that tag published "
+              "no digest",
+              tags_at == 0
+              and any("/releases/tags/v9.10.0-broken" in url for url in calls)
+              and codeload_at > tags_at
+              and f"tar.gz/{TIP}" in calls[codeload_at]
+              and not any("tar.gz/refs/tags/" in url for url in calls),
+              str(calls))
         check("D3 …the workers were quiesced before the swap",
               bool(quiesced) and bool(swapped), f"{quiesced} {swapped}")
         check("D3 …and the installed commit is recorded",
@@ -449,8 +471,11 @@ def main() -> int:
         check("D3 a completed update is audited even though app.db is closed",
               actions == ["update.requested", "update.installed"], str(actions))
 
-        # The verified path apply() no longer uses, still covered so that
-        # restoring it stays a change to apply() rather than a rewrite.
+        # The two verified-path helpers apply() reaches through
+        # _resolve_target, called directly as well: choosing the newest tag
+        # by version order, and refusing a release that publishes nothing to
+        # check against, are properties of these functions rather than of
+        # apply(), and a direct call pins each one on its own.
         release = selfupdate.latest_tag()
         check("D3 (retained) the newest tag is chosen by version order",
               release["tag"] == "v9.10.0-broken", release["tag"])
@@ -464,6 +489,70 @@ def main() -> int:
         check("D3 (retained) a published digest is read from the asset list",
               selfupdate.published_digest(TAG) == GOOD_DIGEST,
               selfupdate.published_digest(TAG))
+
+        # And the verified path end to end, through apply(). The newest tag
+        # is now one that IS newer than the running version and whose
+        # release does publish a SHA256SUMS — so the digest is fetched and
+        # the download is checked against it — and the digest published is
+        # not the digest of the bytes codeload serves.
+        #
+        # A mismatch is the one condition this whole path exists for, and it
+        # is a hard abort: if a wrong tarball could push apply() back onto
+        # the unverified tip of main, then serving a wrong tarball would be
+        # all it took to defeat the check, and the check would be worth
+        # nothing. Only an ABSENT digest may fall back.
+        SERVICE.app_db.save_settings({"updates_enabled": True})
+        state["tags"] = [{"name": TAG, "commit": {"sha": "b" * 40}}]
+        state["digest"] = "0" * 64      # well-formed, and not these bytes'
+        state["calls"].clear()
+        before_commit = SERVICE.app_db.meta(selfupdate.INSTALLED_COMMIT_KEY)
+        before_tag = SERVICE.app_db.meta(selfupdate.INSTALLED_TAG_KEY)
+        before_swaps = len(swapped)
+        result = selfupdate.apply(SERVICE.app_db)
+        check("D3 a download that does not match the published digest is "
+              "refused",
+              not result.get("ok") and not result.get("up_to_date")
+              and "does not match" in result.get("error", "")
+              and TAG in result.get("error", ""), str(result))
+        check("D3 …and the job says so rather than ending on a later step",
+              selfupdate.status().get("step") == "failed",
+              str(selfupdate.status()))
+        check("D3 …it fetched the tag's tarball and then stopped, without "
+              "falling back to the tip of main",
+              any(f"tar.gz/refs/tags/{TAG}" in url for url in state["calls"])
+              and not any("/commits/" in url for url in state["calls"])
+              and not any("codeload" in url and state["sha"] in url
+                          for url in state["calls"]),
+              str(state["calls"]))
+        check("D3 …nothing was unpacked into place",
+              len(swapped) == before_swaps, str(swapped[before_swaps:]))
+        check("D3 …and the recorded install is exactly what it was before",
+              SERVICE.app_db.meta(selfupdate.INSTALLED_COMMIT_KEY) == before_commit
+              and SERVICE.app_db.meta(selfupdate.INSTALLED_TAG_KEY) == before_tag,
+              f"commit {before_commit!r} -> "
+              f"{SERVICE.app_db.meta(selfupdate.INSTALLED_COMMIT_KEY)!r}, "
+              f"tag {before_tag!r} -> "
+              f"{SERVICE.app_db.meta(selfupdate.INSTALLED_TAG_KEY)!r}")
+
+        # The version gate: a tag OLDER than the running version can never
+        # install, so a repository whose newest tag has gone backwards
+        # cannot be used to push a host down onto old code. The gate
+        # short-circuits before /releases, so the digest is not even asked
+        # for — the tip of main is what installs instead.
+        state["tags"] = [{"name": "v0.0.1", "commit": {"sha": "e" * 40}}]
+        LATER_TIP = "f" * 40
+        state["sha"], state["message"] = LATER_TIP, "Newer than the old tag"
+        state["tarball"] = build_tarball(f"magicalbeans-{LATER_TIP}")
+        state["calls"].clear()
+        result = selfupdate.apply(SERVICE.app_db)
+        check("D3 a tag older than the running version is not installed",
+              result.get("ok") and result.get("commit") == LATER_TIP[:10]
+              and SERVICE.app_db.meta(selfupdate.INSTALLED_COMMIT_KEY) == LATER_TIP
+              and not SERVICE.app_db.meta(selfupdate.INSTALLED_TAG_KEY),
+              f"{result} {SERVICE.app_db.meta(selfupdate.INSTALLED_TAG_KEY)!r}")
+        check("D3 …and its release is not even asked for",
+              not any("/releases" in url for url in state["calls"]),
+              str(state["calls"]))
     finally:
         selfupdate._fetch_json, selfupdate._fetch_bytes = real_json, real_bytes
         selfupdate._swap_in, selfupdate.schedule_restart = real_swap, real_restart

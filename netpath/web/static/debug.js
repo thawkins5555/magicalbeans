@@ -42,8 +42,6 @@
 
   const escape = App.escapeHtml;
 
-  const ago = (ts) => App.ago(ts, '\u2014');
-
   function until(ts) {
     if (!ts) return '\u2014';
     const delta = ts - Date.now() / 1000;
