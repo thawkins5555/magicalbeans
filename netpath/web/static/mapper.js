@@ -1184,7 +1184,6 @@
     const linkLayer = App.svgNode('g');
     const nodeLayer = App.svgNode('g');
     group.append(gridLayer, linkLayer, nodeLayer);
-    svg.appendChild(group);
     if (shouldDrawGrid() && bounds) drawGrid(gridLayer, bounds);
     // Own <g> per link: redrawDragged refills just the ones that moved.
     for (const link of view.links) {
@@ -1197,6 +1196,12 @@
 
     view.rubberEl = App.svgNode('rect', { class: 'mp-rubber' });
     group.appendChild(view.rubberEl);
+    // Built detached and appended once: every layer above filled while the
+    // group was out of the document, so a map's worth of nodes and links is
+    // one insertion rather than thousands into a live tree. Nothing above
+    // measures layout (the two getBoundingClientRect calls in drawLink and
+    // drawNode are inside focus handlers), so it is safe to attach here.
+    svg.appendChild(group);
     view.sceneGroup = group;
     drawRubber();
     applyTransform();
