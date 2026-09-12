@@ -7801,16 +7801,12 @@ class _AuthFailure(SnmpError):
         self.report = report
 
 
-# The SnmpError verdicts that are about this device's credential or the
-# security level it serves rather than about one object being absent: a
-# digest that did not verify, a reply that would not decrypt, an unsigned
-# answer to a signed request, a level that cannot be built or is not served,
-# an engine-sync/auth refusal, and the agent's own authorizationError. Each
-# has its own device event and its own remedy, which is why _best_effort
-# re-raises these and swallows the rest (a timeout, a stray, a bad OID, a
-# plain SnmpError).
-_CREDENTIAL_VERDICTS = (_AuthFailure, SnmpAccessDenied, SnmpAuthError,
-                        SnmpDowngrade, SnmpPrivError, SnmpUnsupported)
+# The SnmpError verdicts about the credential or security level rather than
+# about one absent object; _best_effort re-raises these and swallows the rest.
+# SnmpAccessDenied is not here: authorizationError is what a restricted v3
+# view answers for exactly the optional subtrees these reads ask about.
+_CREDENTIAL_VERDICTS = (_AuthFailure, SnmpAuthError, SnmpDowngrade,
+                        SnmpPrivError, SnmpUnsupported)
 
 
 def _credential_contradicted(exc: Exception) -> bool:
