@@ -364,15 +364,6 @@
     drawTable();
   }
 
-  // device id -> { tr, cells: [rendered <td> html per column], columnsKey }.
-  // drawTable() runs on every poll tick (nodes_refresh_s, 2s by default),
-  // not just on user action, so rebuilding every <tr> from scratch every
-  // cycle is real, recurring cost once the device count is in the hundreds.
-  // Kept across draws so a row whose rendered output hasn't actually
-  // changed reuses its existing DOM node instead of being torn down and
-  // recreated.
-  let rowCache = new Map();
-
   function drawTable() {
     const columns = deviceColumns();
     const checked = view.devicesChecked;
@@ -404,53 +395,10 @@
     const rows = App.sortRows(view.devices, view.deviceSort.key,
                               view.deviceSort.descending, columns);
 
-    // This table keeps its own row cache below rather than going through
-    // App.drawRows, so it has to ask for App.emptyRow's plumbing by hand
-    // too — the main Devices list showed a bare header over nothing under
-    // any filter that matched zero rows, the one table in this file that
-    // had never been given the "widen or clear a filter" sentence every
-    // sibling list already has.
-    if (!rows.length) {
-      // No row survives a filter that matches nothing: same cleanup the
-      // non-empty path does below, just with an empty `seen`.
-      for (const id of rowCache.keys()) rowCache.delete(id);
-      App.emptyRow(body, columns, 'No devices match these filters. Widen the search or clear a filter.');
-      table.appendChild(body);
-      App.wireRowKeyboard(body);
-      App.el('nd-count').textContent = App.countLabel(view.devices.length, view.pageTotal);
-      drawBulkBar();
-      return;
-    }
-    // Changes when the operator picks different columns (Nodes → Settings →
-    // Columns) — a layout change, not a data change, so a row cached under
-    // the old column set is rebuilt rather than cell-diffed against a
-    // <tr> whose <td> count/order no longer matches.
-    const columnsKey = columns.map((c) => c.key).join(',');
-    const seen = new Set();
-    for (const row of rows) {
-      seen.add(row.id);
-      const cellHtml = columns.map((c) => {
-        if (c.cell) return c.cell(row);
-        const raw = row[c.key];
-        const blank = raw === null || raw === undefined || raw === '';
-        return blank ? '\u2014' : escape(raw);
-      });
-      const cached = rowCache.get(row.id);
-      let tr;
-      if (cached && cached.columnsKey === columnsKey) {
-        tr = cached.tr;
-        for (let i = 0; i < cellHtml.length; i++) {
-          if (cached.cells[i] !== cellHtml[i]) {
-            tr.children[i].innerHTML = cellHtml[i];
-            cached.cells[i] = cellHtml[i];
-          }
-        }
-      } else {
-        tr = document.createElement('tr');
-        tr.innerHTML = columns.map((c, i) =>
-          `<td class="${c.numeric ? 'num' : ''}">${cellHtml[i]}</td>`).join('');
-        rowCache.set(row.id, { tr, cells: cellHtml, columnsKey });
-      }
+    // App.drawRows keys its cache by column set; mono is pinned off so the
+    // cells keep the look this table had under its own cache.
+    const drawColumns = columns.map((c) => ({ ...c, mono: c.mono === undefined ? false : c.mono }));
+    App.drawRows(body, rows, drawColumns, (tr, row) => {
       const className = 'clickable'
         + (view.selected === row.id ? ' selected' : '')
         + (view.devicesChecked.has(row.id) ? ' bulk-checked' : '');
@@ -466,11 +414,8 @@
       if (box) {
         // The markup diff can't be trusted for the tick itself: toggleChecked
         // flips the live `checked` property in place without going through
-        // drawTable, so the cached markup and the real box can disagree. If
-        // the selection then flips back (Clear, select-all, a header click)
-        // the recomputed markup matches the stale cache, the cell is left
-        // alone, and the box would stay in the wrong state. Setting the
-        // property directly is cheap and always right.
+        // drawTable, so the cached markup and the real box can disagree.
+        // Setting the property directly is cheap and always right.
         box.checked = view.devicesChecked.has(row.id);
         box.onclick = (event) => {
           event.stopPropagation();
@@ -478,32 +423,13 @@
         };
       }
       tr.onclick = () => selectDevice(row.id);
-      // Single click keeps its meaning — move the detail pane. A double
-      // click opens the device in a dialog, which need not be the selected
-      // one; alerts.js's templates table is the same gesture. Assigned on
-      // every draw for the same reason onclick is: a cached <tr> already
-      // carries a handler closed over the previous draw's `row`, and a
-      // plain property assignment replaces it rather than stacking.
-      // The row itself, not document.activeElement: selectDevice() above
-      // just ran drawTable(), which (see App.grid) detaches and reattaches
-      // this very <tr> to swap the tbody, so by the time the second click's
-      // dblclick fires, focus has already fallen to <body> and App.modal's
-      // own activeElement fallback would capture that instead of the row.
+      // Single click moves the detail pane; a double click opens the device
+      // in a dialog. The row itself, not document.activeElement: selectDevice()
+      // just ran drawTable(), which (see App.grid) detaches and reattaches this
+      // very <tr>, so by the time dblclick fires, focus has fallen to <body>.
       tr.ondblclick = () => deviceDialog(row.id, tr);
-      body.appendChild(tr);
-    }
-    // Drop cache entries for devices no longer in the list (removed, or
-    // filtered out) so the cache can't grow without bound.
-    for (const id of rowCache.keys()) {
-      if (!seen.has(id)) rowCache.delete(id);
-    }
+    }, 'No devices match these filters. Widen the search or clear a filter.');
     table.appendChild(body);
-    // This table builds its own rows rather than going through
-    // App.drawRows, so it asks for the keyboard behaviour explicitly. Safe
-    // to call on every draw: the wiring is idempotent, and the position of
-    // the one tabbable row is recomputed from the current selection. (It
-    // was called twice here; the second walk did nothing but cost.)
-    App.wireRowKeyboard(body);
     // Server-side paging means this can genuinely be fewer than every
     // matching device — the pager below already says "1-500 of 4,120", and
     // this line used to just say "500 device(s)" with nothing to compare it

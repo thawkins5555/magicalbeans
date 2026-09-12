@@ -4288,11 +4288,8 @@ const App = (() => {
     // <tr> away on every poll, whether or not anything moved.
     //
     // The 154ms-per-refresh figure quoted for this was measured on the Nodes
-    // DEVICE table, which does not come through here — it has kept its own
-    // row cache since before that measurement. What this helps is every table
-    // that does: the interface lists, discovery results, syslog, traps, flow
-    // records. Stated because a comment claiming someone else's number is
-    // the kind of thing this file exists not to do.
+    // DEVICE table under its own, since-retired copy of this cache (5.13.0
+    // routed it through here too).
     //
     // `onRow` runs again on a reused <tr>, so it must be idempotent —
     // assigning handlers is fine, `addEventListener` and appendChild are not.
