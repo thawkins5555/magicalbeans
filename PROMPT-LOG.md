@@ -385,3 +385,31 @@ the accent, hot pink for fail, lime for ok, yellow for warn.
 → Walk: 932 steps, 887 ok, 45 planned skips, 0 failed; the 40 console
   errors are the viewer/NOC 403s the matrix provokes, the 3 page errors
   are on paths this release did not touch.
+
+## 5.14.0 — The Nodes database, and what it keeps
+
+**Team setup** — a named team for this release: Bob leads; Dora explores;
+Thing1 and Thing2 on Opus; Testy, Fisty and Stephen King on Sonnet; Dingus1
+and Dingus2 on Haiku; Javariius reviewing on Fable. Standing rules carried
+forward. Task: reduce the nodes database's size, verify temp data (MAC/ARP)
+is actually aged out, split long-term from short-term storage, list what is
+kept forever, and propose options.
+→ Team and rules recorded; task assigned across the waves.
+
+**Planning answers** — build the trim-floor fix, a storage report, per-port
+retention tiering (1 day raw, 90 days hourly; device-level stays at 3/400),
+the WITHOUT ROWID rewrite, and device_addresses age-out tied to the 180-day
+event retention. Defer the hour-index watermark, the daily tier and
+zero-suppression. Raise the series cap default from 1 GB to 8 GB. The user
+will run the storage report against the live install before defaults are
+final.
+→ Aging verified: MAC, ARP, LLDP and VLAN tables age out at 7 days, events
+  at 180, discovery at 30, per-port raw at 3 days, hourly at 400 days.
+→ Stored forever, by design and otherwise: inventory tables, vendor_learned
+  and MIB files are correctly permanent; device_addresses and stuck
+  discovery jobs are leaks with no age-out path.
+→ Where the bytes go: 94% of metrics are per-port; each sample is stored
+  three times over; default retention at 250 devices runs to roughly 39 GB
+  against a 1 GB cap, so the cap is trimming raw data to a 5,000-row floor
+  every minute.
+→ In progress; outcomes appended when the waves complete.
