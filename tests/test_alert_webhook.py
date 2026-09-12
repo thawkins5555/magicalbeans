@@ -393,6 +393,123 @@ for url, wanted in (
           webhook_host(url))
 
 
+# ====================================================================== C10
+# C1 proves the DELIVERY-RESULT row names only the host. The rows written
+# when a delivery never happens at all took the raw URL instead -- the same
+# bearer path, in the same column, served to the same accounts, and reached
+# by nothing more exotic than a busy hour.
+print("\nC10 - a webhook that is never sent records the host too, not the URL")
+
+receiver = Receiver()
+nodes, alerts, snmp, syslog, ipam, engine = build(receiver.url,
+                                                  webhook_max_per_hour=1)
+try:
+    engine._webhook.start()
+    first = add_device(nodes, "10.8.0.30", "sw-budget-1")
+    second = add_device(nodes, "10.8.0.31", "sw-budget-2")
+    engine._tick()                   # seed cursors
+    go_down(nodes, first)
+    engine._tick()
+    assert engine._webhook.wait_idle(10.0)
+    check("the first alert spends the whole 1/hour budget",
+          len(receiver.received) == 1, len(receiver.received))
+
+    go_down(nodes, second)
+    engine._tick()
+    assert engine._webhook.wait_idle(10.0)
+    check("the second alert is not delivered", len(receiver.received) == 1,
+          len(receiver.received))
+
+    suppressed = [row for alert in alerts.alerts(state="unresolved")
+                  if alert["entity_label"] and "budget-2" in alert["entity_label"]
+                  for row in alerts.notifications_for(alert["id"])
+                  if row["kind"].startswith("webhook_")]
+    check("the over-budget alert still got a notification row saying why",
+          len(suppressed) == 1 and suppressed[0]["ok"] in (0, False),
+          [(r["kind"], r["ok"], r["error"]) for r in suppressed])
+    check("...and that row names the host only",
+          all(r["to_addr"] == f"http://127.0.0.1:{receiver.port}"
+              for r in suppressed), [r["to_addr"] for r in suppressed])
+    check("...with the URL's path, which is the credential, nowhere in it",
+          all("/hook" not in (r["to_addr"] or "") for r in suppressed),
+          [r["to_addr"] for r in suppressed])
+finally:
+    engine._webhook.stop()
+    receiver.stop()
+
+
+# ====================================================================== C11
+print("\nC11 - the same for the row written when the send queue is full")
+
+receiver = Receiver()
+nodes, alerts, snmp, syslog, ipam, engine = build(receiver.url)
+try:
+    engine._webhook.start()
+    # A full queue is what submit() returning False means; forcing it is the
+    # only way to reach that branch without racing a real backlog.
+    engine._webhook.submit = lambda job: False
+    dev = add_device(nodes, "10.8.0.32", "sw-queue-full")
+    engine._tick()                   # seed cursors
+    go_down(nodes, dev)
+    engine._tick()
+    check("nothing reached the receiver", len(receiver.received) == 0,
+          len(receiver.received))
+    alert_id = alerts.alerts(state="unresolved")[0]["id"]
+    queued = [r for r in alerts.notifications_for(alert_id)
+              if r["kind"].startswith("webhook_")]
+    check("the dropped delivery is recorded against the alert",
+          len(queued) == 1 and "queue full" in (queued[0]["error"] or ""),
+          [(r["kind"], r["error"]) for r in queued])
+    check("and it names the host, not the URL",
+          all(r["to_addr"] == f"http://127.0.0.1:{receiver.port}"
+              for r in queued), [r["to_addr"] for r in queued])
+    check("...path-free, like every other webhook row",
+          all("/hook" not in (r["to_addr"] or "") for r in queued),
+          [r["to_addr"] for r in queued])
+finally:
+    engine._webhook.stop()
+    receiver.stop()
+
+
+# ====================================================================== C12
+print("\nC12 - the digest's two never-sent rows narrow the URL as well")
+
+receiver = Receiver()
+nodes, alerts, snmp, syslog, ipam, engine = build(
+    receiver.url, notify_rollup_delay_s=1, webhook_max_per_hour=1)
+try:
+    engine._webhook.start()
+    devices = [add_device(nodes, f"10.8.2.{n}", f"sw-digest-{n}")
+               for n in range(DIGEST_THRESHOLD + 2)]
+    engine._tick()                   # seed cursors
+    for device_id in devices:
+        go_down(nodes, device_id)
+    engine._tick()                   # held inside the roll-up window
+    # The hour's one send is already spent when the digest comes due. Stamped
+    # directly rather than by delivering a real alert first, because that
+    # alert would be held by the same roll-up window and join this digest.
+    engine._webhook_sent_this_hour = [time.time()]
+    time.sleep(1.2)
+    engine._tick()
+    assert engine._webhook.wait_idle(10.0)
+    check("the digest went over the budget and was not delivered",
+          len(receiver.received) == 0, len(receiver.received))
+
+    digest_rows = [row for alert in alerts.alerts(state="unresolved")
+                   for row in alerts.notifications_for(alert["id"])
+                   if row["kind"] == "webhook_digest"]
+    check("every alert the digest spoke for got its own suppressed row",
+          len(digest_rows) == len(devices), len(digest_rows))
+    check("each one names the host only, never the URL's bearer path",
+          bool(digest_rows) and all(
+              r["to_addr"] == f"http://127.0.0.1:{receiver.port}"
+              for r in digest_rows),
+          sorted({r["to_addr"] for r in digest_rows}))
+finally:
+    engine._webhook.stop()
+    receiver.stop()
+
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 sys.exit(1 if FAILS else 0)

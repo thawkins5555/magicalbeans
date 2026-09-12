@@ -80,7 +80,7 @@ frontend modules) are complete; every finding marked *Fixed* below landed with i
 | ALRT-F6 | medium | performance | `_evaluate_dhcp_thresholds` reads every DHCP lease every five seconds | `netpath/alertengine.py:1539` | Fixed |
 | ALRT-F7 | medium | performance | `_drain_ipam_conflicts` reads the whole conflicts table each tick | `netpath/alertengine.py:1006` | Fixed |
 | ALRT-F8 | medium | security, design | The flow collector logs an unthrottled ERROR per undecodable datagram | `netpath/collector.py:144` | Fixed |
-| ALRT-F9 | medium | security | The webhook URL and its headers are stored and served in the clear | `netpath/alertsdb.py:279`, `:1668` | Fixed |
+| ALRT-F9 | medium | security | The webhook URL and its headers are stored and served in the clear | `netpath/alertsdb.py:279`, `:1668` | Contained (full fix is ALRT-P1) |
 | ALRT-F10 | medium | performance | Rollup absorb paths re-query the rules table instead of the per-tick snapshot | `netpath/alertengine.py:2357`, `:2443` | Fixed |
 | FE-F5 | medium | performance | Bridge & RF rebuilds its charts and re-fetches every RF series each tick | `netpath/web/static/nodes.js:3204` | Fixed |
 | FE-F6 | medium | performance | `App.deviceIndex()` pulls the whole unpaged fleet — 1.5 MB at 812 devices | `netpath/web/static/app.js:693` | Fixed |
@@ -861,7 +861,10 @@ for a webhook credential at all. The URL is also written into `notifications.to_
 by `GET /api/alerts/{id}` at `alerts: read`, so tightening the settings payload alone would not
 close it. The contained half ships now: scheme+host only in `to_addr` (all an operator reading
 delivery history needs) and `webhook_headers` masked for non-reveal callers. The real credential
-slot is P1.
+slot is P1, which is why this row reads Contained rather than Fixed. The narrowing itself covered
+only `_webhook_result`'s delivery-history row at first: the four rows written when a delivery never
+happens -- over the per-hour limit and send-queue-full, in `_webhook_notify` and `_webhook_digest`
+alike -- still wrote the raw URL until 5.11.0, reachable by nothing more exotic than a busy hour.
 
 **ALRT-F10 (medium, performance).** `_absorb_subordinates` and `_absorb_children_of` call
 `self.db.rule_by_key(child_key)` in a loop, and `_drain_device_events`/`_drain_interface_events`

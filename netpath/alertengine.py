@@ -3014,6 +3014,11 @@ class AlertEngine(Worker):
         url = str(settings.get("webhook_url") or "").strip()
         if not url:
             return
+        # Everything recorded about this delivery names the host, never the
+        # URL: for Slack, Teams and PagerDuty the path IS the credential, and
+        # a notification row is served to any account with alerts: read. The
+        # delivery-result path already narrowed it; these rows did not.
+        to_addr = webhook_host(url)
         now = time.time()
         hour_ago = now - 3600
         self._webhook_sent_this_hour = [
@@ -3024,7 +3029,7 @@ class AlertEngine(Worker):
         if max_per_hour and len(self._webhook_sent_this_hour) >= max_per_hour:
             self.counters["webhook_suppressed"] += 1
             self.db.record_notification(
-                alert_row["id"], webhook_kind, url, "", False,
+                alert_row["id"], webhook_kind, to_addr, "", False,
                 f"not sent: over the {max_per_hour}/hour webhook limit")
             if self._webhook_suppression_logged_hour != current_hour:
                 self._webhook_suppression_logged_hour = current_hour
@@ -3064,7 +3069,7 @@ class AlertEngine(Worker):
             kind=webhook_kind)
         if not self._webhook.submit(job):
             self.counters["webhook_errors"] += 1
-            self.db.record_notification(alert_row["id"], webhook_kind, url,
+            self.db.record_notification(alert_row["id"], webhook_kind, to_addr,
                                         subject, False, "send queue full")
 
     def _device_ip_for(self, alert_row) -> str:
@@ -3418,6 +3423,7 @@ class AlertEngine(Worker):
         url = str(settings.get("webhook_url") or "").strip()
         if not url:
             return
+        to_addr = webhook_host(url)          # see _webhook_notify
         now = time.time()
         hour_ago = now - 3600
         self._webhook_sent_this_hour = [
@@ -3429,7 +3435,7 @@ class AlertEngine(Worker):
             reason = f"not sent: over the {max_per_hour}/hour webhook limit"
             for alert_row, _rule_row, _occurrence in sendable:
                 self.db.record_notification(alert_row["id"], "webhook_digest",
-                                            url, "", False, reason)
+                                            to_addr, "", False, reason)
             if self._webhook_suppression_logged_hour != current_hour:
                 self._webhook_suppression_logged_hour = current_hour
                 self.log.add(ERROR, f"Alert webhook volume over {max_per_hour}/hour"
@@ -3461,4 +3467,5 @@ class AlertEngine(Worker):
             self.counters["webhook_errors"] += 1
             for alert_row, _rule_row, _occurrence in sendable:
                 self.db.record_notification(alert_row["id"], "webhook_digest",
-                                            url, subject, False, "send queue full")
+                                            to_addr, subject, False,
+                                            "send queue full")
