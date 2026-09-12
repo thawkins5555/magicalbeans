@@ -186,9 +186,9 @@ rather than records to work through.
 
 ### Themes
 
-Seven, chosen in the **Account** dialog under **Appearance · this
+Eight, chosen in the **Account** dialog under **Appearance · this
 browser**: Dark (the default), Light, High contrast, and, new in 4.54.0,
-Midnight, Nord, Solarized and Slate. Picking one previews it at once, needs
+Midnight, Nord, Solarized and Slate, and, new in 5.13.0, Neon. Picking one previews it at once, needs
 no Apply; **Save theme**, new in 5.0.0, is what keeps it — to the browser,
 so a shared NOC workstation keeps it across sign-ins, and to the account, so
 the same choice follows that operator to any other browser they sign into.
@@ -206,12 +206,26 @@ those names, kept close to their canonical hues while lifting whichever
 tones would otherwise fall short of this product's own contrast floors;
 **Slate** is a second light theme, a warm paper-grey alternative to Light's
 climb to near-white for a room that finds a stark white panel harder on the
-eyes for a whole shift. All seven — old and new alike — are held to the
+eyes for a whole shift.
+
+**Neon**, new in 5.13.0, is a neon-sign palette rather than a recolouring of
+Dark: a near-black ground with a magenta cast, electric cyan as the accent,
+hot pink for fail, lime for ok and yellow for warn, with a glow on panels,
+the active tab, primary buttons, the wordmark, headings, status marks and
+the focus ring — structure everywhere else, wearing a shadow nowhere else.
+The glow is steady, not a flicker; there is no animation to sit through on
+a page an operator watches for hours. It is the brightest palette in the
+product and the only one with glows, which is exactly what it trades away:
+legible across a demo wall or in a dark room, but not the theme for a
+NOC operator's 8-hour shift, where the same glow becomes the thing the eye
+tires of first.
+
+All eight — old and new alike — are held to the
 same accessibility harness (`tests/test_design_tokens.py`): the same
 text/muted/dim/line hierarchy, the same minimum contrast pairs, and, from
 4.54.0, the same sixteen-colour VLAN palette MAPPER's trunk strands use,
 each theme's sixteen hues checked pairwise so two VLANs on the same trunk
-are never confusable in any of the seven.
+are never confusable in any of the eight.
 
 ### Any width
 

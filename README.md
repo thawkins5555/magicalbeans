@@ -340,8 +340,8 @@ Route changes are recorded as a path signature per trace and drawn as ticks, but
 
 ## Display: themes, small screens, the wall
 
-Seven themes — Dark, Light, High contrast, Midnight, Nord, Solarized and
-Slate — under **Appearance · this browser**, in the **Account** dialog
+Eight themes — Dark, Light, High contrast, Midnight, Nord, Solarized,
+Slate and Neon — under **Appearance · this browser**, in the **Account** dialog
 reachable from the top bar, stored per browser so a shared workstation
 keeps its choice across sign-ins. The layout
 works down to a 768 px tablet; every drag works from a finger or a pen, and

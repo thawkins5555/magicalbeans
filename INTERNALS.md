@@ -3375,7 +3375,10 @@ so it inherits the heading's size — a line in the body would render as
 MAPPER (`mapper.py`, `mapperdb.py`, `web/static/mapper.js`) is a manually-
 built L2 map: an operator places devices and unmanaged peers on a named
 map and MAPPER draws the links between whatever is placed, resolved live
-against `nodesdb`'s neighbour and VLAN tables. Nothing here polls anything
+against `nodesdb`'s neighbour and VLAN tables. `web/static/mapper_upstream.js`,
+cut out of `mapper.js` in 5.13.0, holds the upstream-suggestions dialog on
+its own; it is not shipped with the rest of the tab, but fetched on first
+use through `App.loadExtra`. Nothing here polls anything
 of its own — `web/service.py`'s `_apply_mapper` is a documented no-op, and
 `Service.mapper_db`'s path is derived from `configrx_db_path`'s directory
 rather than taking an eleventh constructor argument, specifically so every
@@ -8727,8 +8730,9 @@ every other page just waits for the observer.
 ### Themes, breakpoints, pointer capture and kiosk (`tokens.css`, `boot.js`, `app.js`) — 4.46.0
 
 - **Themes.** `tokens.css` is a base `:root` block (dark, `color-scheme:
-  dark`) plus, from 4.54.0, six `:root[data-theme="…"]` blocks — `contrast`,
-  `light`, `midnight`, `nord`, `solarized`, `slate` — each redefining every
+  dark`) plus, from 4.54.0, and now `neon` from 5.13.0, seven
+  `:root[data-theme="…"]` blocks — `contrast`, `light`, `midnight`, `nord`,
+  `solarized`, `slate`, `neon` — each redefining every
   surface, text, structure, emphasis, meaning and selection token. Dark is
   the *absence* of the attribute, so a browser that never chose stores
   nothing. The choice lives in `localStorage['sappiwhere.theme']`, per
@@ -8738,15 +8742,22 @@ every other page just waits for the observer.
   off the application page); `App.setTheme()` changes it live, a `storage`
   listener follows other tabs, and Settings' Appearance fieldset is the UI.
   `boot.js`'s `THEMES` array and `app.js`'s own copy must list the same
-  seven ids — a theme one file rejects that the other stored silently
+  eight ids — a theme one file rejects that the other stored silently
   reverts to dark on whichever reload hits the disagreeing file first. The
   `--canvas-*` set (route/map canvas chrome — background, hairline, grid,
-  text, the status colours) is untouched by all seven, with one exception
+  text, the status colours) is untouched by all eight, with one exception
   from 4.54.0: `--canvas-vlan-1..16`, below. `tests/test_design_tokens.py`
   parses the file per block and recomputes every pair per theme — light,
-  midnight, nord, solarized and slate at ordinary AA, contrast at AAA —
-  and requires each theme block to define the full themed set, so a dark
-  tone inherited onto a light ground fails instead of vanishing. From
+  midnight, nord, solarized, slate and neon at ordinary AA, contrast at
+  AAA — and requires each theme block to define the full themed set, so a
+  dark tone inherited onto a light ground fails instead of vanishing.
+  `neon` adds three base tokens of its own on top of that set — `--tube`,
+  `--tube-text` and `--tube-line`, the box-shadow, text-shadow and hue a
+  neon tube glows in — declared `none` on bare `:root` and left there by
+  every theme but Neon, so `app.css`'s glow hooks on panels, the active
+  tab, primary buttons, the wordmark, headings, status marks and the focus
+  ring draw nothing extra in a theme that never gives the tokens a value.
+  From
   4.54.0 the same file also enforces a sixteen-entry VLAN palette, keyed
   by `vlan_color_index` and held to two checks: each hue at least 3:1
   against `--canvas` — the ground a MAPPER trunk strand is actually drawn
@@ -8781,10 +8792,10 @@ every other page just waits for the observer.
   only callers. `--canvas-vlan-1..16` needs its own override only under
   `data-theme="contrast"` (the one theme where `--canvas` itself goes
   dark), reusing the same light-on-dark rotation the old `--vlan-1..16`
-  used to carry there, for the same reason in reverse — the other six
+  used to carry there, for the same reason in reverse — the other seven
   themes share one definition, since `--canvas` is the identical white
   for all of them. `theme.py` (the console window) stays on the dark
-  values, unchanged by any of the six new theme blocks.
+  values, unchanged by any of the seven new theme blocks.
 - **Breakpoints.** `@media (max-width: 1200px)` makes the fixed widths
   fluid; `(max-width: 900px)` stacks `[data-splitter].cols` and the NetPath
   page (both selectors the row rule uses, since boot.js's first-frame rule

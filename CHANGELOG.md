@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.13.0 — Neon Signs, and the backlog nobody had actioned](#5130--neon-signs-and-the-backlog-nobody-had-actioned)
 - [5.12.0 — The verified path, restored](#5120--the-verified-path-restored)
 - [5.11.0 — Four asks, one deferred](#5110--four-asks-one-deferred)
 - [5.10.0 — Six asks](#5100--six-asks)
@@ -140,6 +141,118 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.13.0 — Neon Signs, and the backlog nobody had actioned
+
+Two work items this release: a Neon Signs theme, and a sweep of the
+backlog that earlier reviews had flagged and left sitting. `PROMPT-LOG.md`
+carries the plan and the outcomes in full; this entry is the shipped
+result.
+
+**Neon, the eighth theme, and the only one that glows.** `tokens.css`
+gains a `:root[data-theme="neon"]` block: a near-black ground with a
+magenta cast rather than a neutral dark screen, so a tube has somewhere
+to glow against, electric cyan as the accent, hot pink for fail, lime for
+ok and yellow for warn. Three base tokens carry the glow itself —
+`--tube`, `--tube-text` and `--tube-line` — declared `none` on bare
+`:root` and therefore inert in every other theme; Neon is the only block
+that gives them a value. `app.css` hooks them onto panels (`.panel.float`,
+the login box, the SSH panel, the modal box, the search box), the active
+tab and the sub-tab strip's underline, primary buttons, the wordmark, the
+heading set, the status marks and dots, and the focus ring — structure
+that already existed, wearing a shadow that does nothing anywhere but
+Neon. There is no animation: a glow, not a flicker, on a page an operator
+may be watching for hours. `tests/test_design_tokens.py` recomputes every
+AA pair across all eight theme blocks now, Neon included; its tightest
+pair, `--fail` text on the `--selected` row tint, clears at 5.49:1. The
+brightest palette in the product trades subtlety for legibility on a wall
+or in a dark room — it is not the one to leave on for an 8-hour shift, and
+`FEATURES.md` says so.
+
+**Tier 1 — twelve items closed.** The device dialog's loss chart now
+offers the full range set, up to 30 days, because the hourly rollup table
+that wider windows read from is populated now instead of standing empty
+(`0faafd8`). A route or an id that does not exist answers 404 through a
+new `NotFound` — a `ValueError` subclass `server.py` recognises ahead of
+the generic 400 arm — rather than the same 400 a malformed request gets
+(`99dd917`). `get_debug` is a dispatcher over one helper per section now,
+each gated on its own module's read grant, in place of one long function
+that built every section inline (`413c673`). A login slot queue that is
+still full after five seconds answers 503 with a `Retry-After` instead of
+parking the request thread indefinitely behind four scrypts (`f7c958f`).
+`app.db`'s audit trail is never trimmed, so it gets a warning where every
+other store has a cap: past the new `app_db_warn_mib` setting (512 MiB by
+default), the storage block names the size and the setting to raise or
+the file to archive (`3f1184c`). The syslog backfill cursor now rides
+`sqlitebase`'s own private-settings helpers, `_set_private_setting` /
+`_clear_private_setting`, in place of hand-rolled SQL against the
+`settings` table (`41a1d4e`). Four dialog pollers — the loss timer, the
+watch timer, refresh and two poll loops — go through one new
+`App.pollWhileModal`, which honours `document.hidden` so a backgrounded
+tab stops polling instead of working for a dialog nobody can see
+(`58c1ee7`). MAPPER's map scene is built detached and appended to the DOM
+once, not assembled node-by-node against a live tree (`b0907fb`). The
+poller's `_refresh_addresses` call moves from inside `_poll_vendor_health`
+to `_poll_device` itself, so it runs on every poll rather than only when
+vendor-health polling happens to run (`af4df94`). ConfigRX compliance
+gets a 512-entry pattern cache in front of `compile_bounded`, so a rule
+set evaluated against a fleet compiles each pattern once instead of once
+per device (`55649aa`). The `requirements.txt` comment above the
+`paramiko` cap is corrected — the cap is precautionary for hosts that
+still need SHA-1 key exchange, not a hard incompatibility, and 5.0.0 is
+verified working by `tests/test_ssh*.py` (`836e88e`). And
+`CREDENTIAL-SECURITY.md`'s browser-UI caveat, which still said the UI
+"has not caught up," is corrected to say it did, in 4.39.0 (`ebe794b`) —
+the sentence had simply outlived the fix it was describing.
+
+**Tier 2 shipped so far.** `nodes.refresh()` is split into its filter,
+reconcile and draw halves rather than one function doing all three
+(`23830cd`); the Nodes device table now draws through the shared
+`App.drawRows`, and its own private row cache is retired with it
+(`95dc86d`). Time-window arithmetic is shared: `App.windowSet` /
+`windowZoom` / `windowPan` replace the separate copies NetFlow and
+NetPath each carried (`33b8963`). Every HTML template interpolation in
+every frontend module is now checked mechanically for escaping —
+`tests/test_frontend_contracts.py`'s new section walks every backtick
+template, flags a bare dotted field reaching the DOM unescaped, and holds
+an explicit allow-list (ids, counts, numeric settings) that any addition
+has to be argued into (`8b6dee9`). `mapper_upstream.js` is cut out of
+`mapper.js` — the upstream-suggestions dialog is its own file now,
+fetched through `App.loadExtra` the first time it is opened rather than
+shipped with every load of the MAPPER tab (`e530608`). The alert engine's
+six id-ordered drains go through one `_drain_from` contract instead of
+each copying the same cursor preamble by hand (`b5e7e7b`). Rule-kind
+matching in `_apply` dispatches through a new `alertrules.PREDICATES`
+table, one entry per rule kind, in place of a run of sequential
+`if rule["kind"] == ...` guards (`4b29da3`). And the poller's five
+optional SNMP reads — PoE, STP, environment, the UCD-SNMP scalars and an
+admin's custom MIB objects — go through a new `_best_effort` helper that
+still swallows "this device does not answer that" but no longer swallows
+a credential or security-level verdict along with it (`cfead9c`).
+
+**Still in flight at the time of writing.** `histogram()` deduplication
+across the three stores that each carry a copy, the permission-registry
+contract (WEB-P3), the bulk-id reader with its `IN`-chunking contract
+(API-P2), and the reveal/secret-column contract (API-P3) were assigned
+this release but had not landed as this entry was written. Bob will
+rewrite this paragraph once they do.
+
+**Recorded, not actioned.** Tier 3 stays a written proposal rather than
+code, on the wave's own planning answer: trap inbound decryption (the
+`trapcrypto.py` seam), the three-way split of `api.py`, `nodepoll.py` and
+`alertengine.py`, GETBULK interface reads, SQL-paged upstream-suggestion
+queries, a generation scheme for the `replace_*` writers, a real
+`webhook_credential` slot, and an ETag path for the paged device list are
+each recorded against a future release rather than built against this
+one.
+
+Two suites, `tests/test_snmpv3_diagnostics.py` and
+`tests/test_palo_alto_polling.py`, were verified failing on a pristine
+base worktree before any of this work started, independently of it —
+pre-existing. And two items handed to this wave as findings needed
+nothing: WEB-P1 (one `Content-Length` verdict shared by both body-length
+checks) and API-P1 (`_window`/`_hist_window` sharing one implementation)
+were already implemented by the time this review reached them.
 
 ### 5.12.0 — The verified path, restored
 

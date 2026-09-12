@@ -358,4 +358,14 @@ SQL-paged upstream suggestions, the generation scheme, the webhook credential
 slot, ETag on the device list) is deferred to a written proposal rather than
 built. The Neon theme: glow on structure only, no flicker; electric cyan as
 the accent, hot pink for fail, lime for ok, yellow for warn.
-→ In progress; outcomes appended when the waves complete.
+→ Neon shipped: eighth theme, three new `--tube`/`--tube-text`/`--tube-line`
+  tokens, glow hooks across structure, all eight themes' AA pairs
+  recomputed (tightest 5.49:1).
+→ Tier 1 shipped in full: all twelve items landed (chart range, 404s,
+  get_debug split, login 503, app.db warning, syslog cursor, dialog
+  pollers, mapper scene, address refresh, pattern cache, paramiko and
+  CREDENTIAL-SECURITY prose).
+→ Tier 2: eight of eleven landed (nodes.refresh split, drawRows, window
+  helpers, escaping contract, mapper_upstream split, drain contract,
+  PREDICATES, best_effort); histogram dedup, WEB-P3 and API-P2/P3 still in
+  flight.
