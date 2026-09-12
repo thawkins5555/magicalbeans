@@ -10,6 +10,10 @@ permission to make one.
 
 from __future__ import annotations
 
+# Nothing derives this list from the three tables that must agree with it —
+# server.ROUTES' permission tuples, api.SETTINGS_SCOPES and
+# service._MODULE_SCOPES. tests/test_permission_registry.py is what keeps the
+# four in step; a new module means editing all four and that suite says so.
 MODULES = (
     "netpath", "netflow", "snmp", "syslog", "ipam", "nodes", "alerts",
     "wireless", "configrx",
