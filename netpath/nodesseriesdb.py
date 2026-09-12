@@ -88,13 +88,19 @@ CREATE TABLE IF NOT EXISTS samples (
     PRIMARY KEY (metric_id, ts)
 ) WITHOUT ROWID;
 
+-- WITHOUT ROWID too: 66.3 -> 47.5 measured bytes per row, the rowid and
+-- its automatic index having been a second copy of the key. The index on
+-- hour stays, unlike samples': trim_to_size deletes by `hour` ascending
+-- and MIN(hour) is what oldest_ts() reports, and neither has a cheap plan
+-- without it. Dropping it is worth a further 14.2 B/row and wants a
+-- persisted oldest-hour watermark, which is its own change.
 CREATE TABLE IF NOT EXISTS samples_hourly (
     metric_id       INTEGER NOT NULL REFERENCES metrics(id) ON DELETE CASCADE,
     hour            INTEGER NOT NULL,
     n               INTEGER NOT NULL,
     vmin            REAL, vavg REAL, vmax REAL,
     PRIMARY KEY (metric_id, hour)
-);
+) WITHOUT ROWID;
 -- The PK leads on metric_id; prune()'s "older than N days" needs this too.
 CREATE INDEX IF NOT EXISTS ix_samples_hourly_hour ON samples_hourly(hour);
 
@@ -134,6 +140,19 @@ _REWRITE_SPEC = {
         " ts REAL NOT NULL, value REAL,"
         " PRIMARY KEY (metric_id, ts)) WITHOUT ROWID",
         (),
+    ),
+    "samples_hourly": (
+        "hour", "metric_id, hour, n, vmin, vavg, vmax",
+        "CREATE TABLE samples_hourly_new ("
+        " metric_id INTEGER NOT NULL REFERENCES metrics(id) ON DELETE CASCADE,"
+        " hour INTEGER NOT NULL, n INTEGER NOT NULL,"
+        " vmin REAL, vavg REAL, vmax REAL,"
+        " PRIMARY KEY (metric_id, hour)) WITHOUT ROWID",
+        # Dropped with the old table, so recreated after the rename -- and
+        # inside the same transaction, since prune and oldest_ts have no
+        # cheap plan without it.
+        ("CREATE INDEX IF NOT EXISTS ix_samples_hourly_hour"
+         " ON samples_hourly(hour)",),
     ),
 }
 
@@ -883,10 +902,13 @@ class NodesSeriesDatabase(SqliteStore):
         if not self._rewriting(table):
             return table
         key, columns, _ddl, _indexes = _REWRITE_SPEC[table]
+        # Aliases spelled out: samples_hourly has a column called `n`, and a
+        # one-letter table alias beside it is a needless ambiguity.
         return (f"(SELECT {columns} FROM {table} UNION ALL"
-                f" SELECT {columns} FROM {table}_new n WHERE NOT EXISTS ("
-                f" SELECT 1 FROM {table} o WHERE o.metric_id = n.metric_id"
-                f" AND o.{key} = n.{key}))")
+                f" SELECT {columns} FROM {table}_new _new WHERE NOT EXISTS ("
+                f" SELECT 1 FROM {table} _old"
+                f" WHERE _old.metric_id = _new.metric_id"
+                f" AND _old.{key} = _new.{key}))")
 
     def _metric_bands(self, width: int | None = None):
         """Contiguous (low, high) metric-id ranges covering every metric,
@@ -1154,13 +1176,20 @@ class NodesSeriesDatabase(SqliteStore):
         this store still lacks. What phase 3 checks before dropping the
         legacy tables."""
         floor = 0.0 if min_hour is None else float(min_hour)
+        # Over the union: a rewrite marked at open runs after the split on
+        # the same thread, so rows already lifted across may be sitting in
+        # the new half, and counting only the old one would have phase 3
+        # copy them a second time.
+        here = self._union_sql("samples_hourly").replace(
+            "samples_hourly", "main.samples_hourly")
         with self._lock, self._attached(legacy_path) as conn:
             row = conn.execute(
-                "SELECT COUNT(*) FROM old.samples_hourly sh WHERE sh.hour >= ?"
-                " AND EXISTS (SELECT 1 FROM main.metrics m WHERE m.id = sh.metric_id)"
-                " AND NOT EXISTS (SELECT 1 FROM main.samples_hourly h"
-                "                 WHERE h.metric_id = sh.metric_id"
-                "                   AND h.hour = sh.hour)", (floor,)).fetchone()
+                f"SELECT COUNT(*) FROM old.samples_hourly sh WHERE sh.hour >= ?"
+                f" AND EXISTS (SELECT 1 FROM main.metrics m"
+                f"             WHERE m.id = sh.metric_id)"
+                f" AND NOT EXISTS (SELECT 1 FROM {here} h"
+                f"                 WHERE h.metric_id = sh.metric_id"
+                f"                   AND h.hour = sh.hour)", (floor,)).fetchone()
         return int(row[0] or 0)
 
     def legacy_hourly_rows(self, legacy_path: str, metric_id: int,

@@ -134,7 +134,8 @@ check("opening an old-shape file marks the rewrite rather than doing it on "
       "the open thread", db.rewrite_pending() is True
       and db._private_setting("samples_rewrite_state") == "rewriting",
       db._private_setting("samples_rewrite_state"))
-check("...and creates the new table beside the old one, empty",
+check("...for both tables, and creates each new table beside the old one,"
+      " empty",
       "WITHOUT ROWID" in table_sql(db, "samples_new").upper()
       and keys(db, "SELECT COUNT(*) FROM samples_new") == {(0,)},
       table_sql(db, "samples_new"))
@@ -253,17 +254,85 @@ check("every (metric_id, ts) survived, the live tail past the freeze "
 check("the values came with them",
       keys(db, "SELECT value FROM samples WHERE metric_id = 1 AND ts = %r"
                % live_ts) == {(7.5,)})
-check("the rollups were not touched by the raw table's rewrite",
-      keys(db, "SELECT metric_id, hour FROM samples_hourly") >= hourly_keys)
+check("the rollups were not touched by the raw table's rewrite -- the two "
+      "tables are rewritten one at a time",
+      keys(db, "SELECT metric_id, hour FROM samples_hourly_new") == set()
+      and keys(db, "SELECT metric_id, hour FROM samples_hourly") >= hourly_keys)
 check("the marker reads 'done' and the bookkeeping rows are gone",
       db._private_setting("samples_rewrite_state") == "done"
       and db._private_setting("samples_rewrite_cursor") is None,
       (db._private_setting("samples_rewrite_state"),
        db._private_setting("samples_rewrite_cursor")))
+check("...but the rewrite is still pending, because samples_hourly is next",
+      db.rewrite_pending() is True)
+
+
+# -------------------------------------------- the second table, same machinery
+
+# The baseline is taken here, not from the fixture: compact_rollup ran
+# above and summarised hours of its own, and what this proves is that
+# whatever the table held before the rewrite it holds after.
+hourly_keys = keys(db, "SELECT metric_id, hour FROM samples_hourly")
+WIDE = (NOW - 20 * 86400, NOW)
+AGG = (NOW_HOUR - 200 * HOUR, NOW_HOUR)
+wide_before = len(db.series(FIRST_DEVICE, metric_ids[0], *WIDE))
+agg_before = db.metric_window_aggregates("cpu_pct_0", *AGG)[0]
+
+# An hour of rollups written mid-rewrite, which is what compact_rollup does
+# while the bands run: it lands in the old half and must win there.
+hourly_live = NOW_HOUR - 100 * HOUR
+stop3 = StopAfter(3)
+check("a stop between bands leaves the rollup rewrite unfinished too",
+      db._rewrite_table("samples_hourly", stop=stop3, band=BAND) is False)
+hourly_cursor = int(db._private_setting("samples_hourly_rewrite_cursor"))
+with db._lock:
+    db._conn.execute(
+        "INSERT INTO samples_hourly(metric_id, hour, n, vmin, vavg, vmax)"
+        " VALUES (1,?,5,0.0,4.25,9.0)", (hourly_live,))
+    db._conn.commit()
+hourly_keys.add((1, hourly_live))
+
+hourly_split = keys(db, "SELECT metric_id, hour FROM samples_hourly") \
+    | keys(db, "SELECT metric_id, hour FROM samples_hourly_new")
+check("nothing is lost across the rollup split either",
+      hourly_split == hourly_keys,
+      (len(hourly_split), len(hourly_keys)))
+wide = db.series(FIRST_DEVICE, metric_ids[0], *WIDE)
+check("a wide chart reads the rollup union while the split is in flight",
+      len(wide) == wide_before + 1, (len(wide), wide_before))
+aggregates = db.metric_window_aggregates("cpu_pct_0", *AGG)
+check("metric_window_aggregates reads it too, counting the hour written "
+      "after the band passed exactly once",
+      len(aggregates) == 1
+      and aggregates[0]["n_hours"] == agg_before["n_hours"] + 1
+      and aggregates[0]["total_n"] == agg_before["total_n"] + 5,
+      [tuple(row) for row in aggregates])
+
+stop4 = StopAfter(10_000)
+check("the rest of the rollup rewrite finishes",
+      db._rewrite_table("samples_hourly", stop=stop4, band=BAND) is True)
+check("samples_hourly reports WITHOUT ROWID",
+      "WITHOUT ROWID" in table_sql(db, "samples_hourly").upper(),
+      table_sql(db, "samples_hourly"))
+check("...and the index on hour was rebuilt after the rename, since prune "
+      "and oldest_ts have no cheap plan without it",
+      "ix_samples_hourly_hour" in index_names(db), sorted(index_names(db)))
+check("every (metric_id, hour) survived, including the one written after "
+      "its band had passed",
+      keys(db, "SELECT metric_id, hour FROM samples_hourly") == hourly_keys,
+      len(keys(db, "SELECT metric_id, hour FROM samples_hourly")
+          ^ hourly_keys))
+check("...and the old table's fresher copy is the one that came across",
+      keys(db, "SELECT n, vavg FROM samples_hourly WHERE metric_id = 1"
+               " AND hour = %d" % hourly_live) == {(5, 4.25)},
+      keys(db, "SELECT n, vavg FROM samples_hourly WHERE metric_id = 1"
+               " AND hour = %d" % hourly_live))
 check("rewrite_pending() is False, so nothing starts a thread for it again",
       db.rewrite_pending() is False)
+check("...and oldest_ts() reports the oldest hour, off that index",
+      db.oldest_ts() == min(h for _m, h in hourly_keys), db.oldest_ts())
 
-worst = max(stop.pages + stop2.pages)
+worst = max(stop.pages + stop2.pages + stop3.pages + stop4.pages)
 # One band of this fixture is 8 metrics of 40 samples; a copy-then-swap
 # would have to reach 2x the table's pages, which is the number this bounds
 # well away from.

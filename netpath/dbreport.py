@@ -60,10 +60,11 @@ STORE_FILENAMES = {
 # The live install corroborates the first two: its own nodes_series.db is
 # 4030 pages over 229,018 samples and 14,709 metrics, about 65 B/sample.
 # Re-measured for the WITHOUT ROWID shape: samples 66.2 -> 23.8, having lost
-# the rowid, its automatic (metric_id, ts) index and the index on ts.
+# the rowid, its automatic (metric_id, ts) index and the index on ts;
+# samples_hourly 66.3 -> 47.5, keeping its index on hour.
 BYTES_PER_ROW = {
     "samples": 23.8,
-    "samples_hourly": 66.3,
+    "samples_hourly": 47.5,
     "mac_entries": 139.4,
     "arp_entries": 157.1,
     "neighbors": 344.8,
