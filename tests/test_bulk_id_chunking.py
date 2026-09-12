@@ -8,7 +8,9 @@ one statement therefore works on one operator's install and answers 500 —
 "too many SQL variables" — on another's. sqlitebase.id_chunks exists for
 exactly that and the bulk writers in alertsdb and configrxdb now go through
 it, inside their existing single lock and single commit: the split is a
-statement-size detail, not a transaction boundary.
+statement-size detail, not a transaction boundary. The two config-search
+readers are here for the same reason: their id list is a caller's
+`?device=1,2,3`, not a fleet the store chose.
 
 The chunk size is shrunk to 3 here rather than 1,500 rows being written: what
 is under test is that the loop exists and that a result assembled from
@@ -165,6 +167,83 @@ check("prune's stale list is chunked too",
 check("...and keeps exactly the newest five",
       len(configrx.backups_for(1)) == 5, len(configrx.backups_for(1)))
 configrx.close()
+
+# ------------------------------------------- configrx.db's two search readers
+#
+# delete_backups and prune above are writers the store builds its own id list
+# for. These two take theirs straight from the request (`?device=1,2,3` ->
+# api._id_list -> configrx_compliance.search), which is the list nothing
+# bounds: they were the last `",".join("?" * len(device_ids))` left in the
+# file.
+
+search_db = ConfigRxDatabase(os.path.join(TMP, "configrx_search.db"))
+DEVICES = list(range(1, 11))
+for device_id in DEVICES:
+    # replace_search_lines, not add_backup: the search index is written by
+    # the indexer, and these two readers only ever see what is in it.
+    search_db.replace_search_lines(
+        device_id,
+        f"hostname sw-{device_id}\n"
+        f"ntp server 10.0.0.{device_id}\n"
+        f"snmp-server community public\n")
+
+# The rows one unchunked statement returns, to compare every chunked answer
+# against. Taken with the real chunk size (500), which is one statement for
+# ten ids.
+whole_scan = [tuple(r) for r in search_db.all_search_lines(DEVICES)]
+check("the fixture indexed every device's lines",
+      len({r[0] for r in whole_scan}) == len(DEVICES),
+      sorted({r[0] for r in whole_scan}))
+
+with tiny_chunks(configrxdb_module) as spy:
+    chunked_scan = [tuple(r) for r in search_db.all_search_lines(DEVICES)]
+check("all_search_lines splits a caller's device list into chunks",
+      spy.calls and max(spy.calls) > 1, spy.calls)
+check("...and a result assembled from four chunks is the same result",
+      chunked_scan == whole_scan,
+      (len(chunked_scan), len(whole_scan)))
+check("...still ordered by device, which is what the caller groups on",
+      [r[0] for r in chunked_scan] == sorted(r[0] for r in chunked_scan),
+      [r[0] for r in chunked_scan][:12])
+
+with tiny_chunks(configrxdb_module) as spy:
+    subset = [tuple(r) for r in search_db.all_search_lines([9, 2, 5])]
+check("an unordered subset comes back in device order too",
+      [r[0] for r in subset] == sorted(r[0] for r in subset) and
+      {r[0] for r in subset} == {2, 5, 9},
+      [r[0] for r in subset])
+check("no device outside the list leaks in through a chunk boundary",
+      all(r[0] in (2, 5, 9) for r in subset), sorted({r[0] for r in subset}))
+
+if search_db.search_fts:
+    fts_query = '"ntp server"'
+    whole_fts = [tuple(r) for r in
+                 search_db.search_fts_match(fts_query, DEVICES, 500)]
+    check("the FTS index answers for every device", len(whole_fts) == 10,
+          len(whole_fts))
+    with tiny_chunks(configrxdb_module) as spy:
+        chunked_fts = [tuple(r) for r in
+                       search_db.search_fts_match(fts_query, DEVICES, 500)]
+    check("search_fts_match chunks the same list",
+          spy.calls and max(spy.calls) > 1, spy.calls)
+    check("...and finds the same rows across the chunks",
+          sorted(chunked_fts) == sorted(whole_fts),
+          (len(chunked_fts), len(whole_fts)))
+
+    # The LIMIT is the caller's total, not a per-chunk allowance: four
+    # chunks of three devices must not return four times the limit.
+    with tiny_chunks(configrxdb_module) as spy:
+        capped = search_db.search_fts_match(fts_query, DEVICES, 4)
+    check("the limit still caps the whole answer, not each chunk",
+          len(capped) == 4, len(capped))
+    check("...and it stops early rather than running every chunk to fill it",
+          spy.calls, spy.calls)
+else:
+    check("FTS5 unavailable: search_fts_match chunking not exercised here",
+          True)
+
+search_db.close()
+
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")
