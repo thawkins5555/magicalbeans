@@ -873,9 +873,7 @@ def _storage(service) -> dict:
     if total:
         result["disk_free"] = free
         result["disk_total"] = total
-    # What the metric history's rollup retention asks for, beside how far
-    # back the file actually reaches: the two together are what says whether
-    # the cap or the retention setting is the thing bounding that file. A
+    # What the retention asks for, beside how far back the file reaches. A
     # settings read, not a query, so it stays on the /api/state path.
     nodes_settings = getattr(service, "nodes_settings", None) or {}
     result["nodes_series_rollup_days"] = float(
@@ -893,16 +891,8 @@ def _storage(service) -> dict:
 
 
 def get_db_report(service, params, body) -> dict:
-    """Where the bytes in each database are, per table.
-
-    Its own route rather than a block inside /api/state, and cached for five
-    minutes: this is COUNT(*) over every table in thirteen files, which over
-    a hundred-million-row `samples` is seconds. /api/state is polled every
-    two seconds by every open tab and must never carry it.
-
-    Row counts are exact; `basis` says whether the byte figures are dbstat's
-    or the measured per-row constants, and the `unaccounted` line reconciles
-    the column against the file."""
+    """Where the bytes in each database are, per table. Its own route, cached
+    five minutes: COUNT(*) over every table in thirteen files is seconds."""
     return {"stores": service.cached_poll(
         "db_report", 300, lambda: dbreport.report(_report_paths(service)))}
 

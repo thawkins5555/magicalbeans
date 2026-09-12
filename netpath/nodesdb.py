@@ -1891,7 +1891,9 @@ class NodesDatabase(SqliteStore):
         if not wanted:
             return {}
         found: dict = {}
-        # ip -> (seen_ts, device_id) for alias-only hits; most-recent picked here, not in SQL.
+        # ip -> (present, seen_ts, device_id) for alias-only hits; the winner is
+        # picked here, not in SQL, on device_id_for_address's key: a row the
+        # device still reports beats a stale one whatever its seen_ts.
         aliases: dict = {}
         with self._lock:
             for chunk in _id_chunks(wanted, self._IDS_PER_QUERY):
@@ -1900,19 +1902,20 @@ class NodesDatabase(SqliteStore):
                         f"SELECT * FROM devices WHERE ip IN ({marks})", chunk):
                     found.setdefault(row["ip"], row)
                 for row in self._conn.execute(
-                        "SELECT device_id, ip, seen_ts FROM device_addresses"
-                        f" WHERE ip IN ({marks})", chunk):
+                        "SELECT device_id, ip, seen_ts, present FROM device_addresses"
+                        f" WHERE ip IN ({marks})"
+                        " ORDER BY present DESC, seen_ts DESC", chunk):
                     ip = row["ip"]
                     if ip in found:
                         continue          # the primary address wins, as ever
-                    seen = row["seen_ts"] or 0.0
+                    key = (1 if row["present"] else 0, row["seen_ts"] or 0.0)
                     best = aliases.get(ip)
-                    if best is None or seen > best[0]:
-                        aliases[ip] = (seen, row["device_id"])
+                    if best is None or key > best[:2]:
+                        aliases[ip] = (key[0], key[1], row["device_id"])
         if aliases:
             by_id = {row["id"]: row for row in self.devices_by_ids(
-                [device_id for _seen, device_id in aliases.values()])}
-            for ip, (_seen, device_id) in aliases.items():
+                [device_id for _p, _seen, device_id in aliases.values()])}
+            for ip, (_p, _seen, device_id) in aliases.items():
                 row = by_id.get(device_id)
                 if row is not None:
                     found[ip] = row
@@ -2969,12 +2972,18 @@ class NodesDatabase(SqliteStore):
                     "DELETE FROM device_addresses WHERE device_id = ? AND ip = ?",
                     (winner_id, winner["ip"]))
                 if loser["ip"] and loser["ip"] != winner["ip"]:
+                    # The loser's primary ip has no device_addresses row of its
+                    # own (see the table's comment), so its first_seen_ts is
+                    # the loser's created_ts rather than NULL.
                     self._conn.execute(
                         "INSERT INTO device_addresses(device_id, ip, source,"
-                        " seen_ts) VALUES (?,?,?,?)"
+                        " seen_ts, first_seen_ts) VALUES (?,?,?,?,?)"
                         " ON CONFLICT(device_id, ip) DO UPDATE SET"
-                        " source=excluded.source, seen_ts=excluded.seen_ts",
-                        (winner_id, loser["ip"], "merge", now))
+                        " source=excluded.source, seen_ts=excluded.seen_ts,"
+                        " first_seen_ts=COALESCE(device_addresses.first_seen_ts,"
+                        " excluded.first_seen_ts)",
+                        (winner_id, loser["ip"], "merge", now,
+                         loser["created_ts"] or now))
                 self._conn.execute(
                     "UPDATE devices SET upstream_id = ? WHERE upstream_id = ?"
                     " AND id <> ?", (winner_id, loser_id, winner_id))
@@ -4788,9 +4797,9 @@ class NodesDatabase(SqliteStore):
         back under its cap.
 
         Since 5.0.0 those two are the only tables here that grow without an
-        age rule — the samples went to nodes_series.db, which has its own cap. Incremental
-        reclaim rather than VACUUM: a whole-file rewrite under the module
-        lock stalls every poll worker and HTTP handler.
+        age rule — the samples went to nodes_series.db, which has its own
+        cap. Incremental reclaim rather than VACUUM: a whole-file rewrite
+        under the module lock stalls every poll worker and HTTP handler.
         """
         if max_bytes <= 0:
             return 0

@@ -491,27 +491,26 @@
       }
     }
     // Which of the two limits is actually deciding how much metric history
-    // there is. A 1 GiB cap against 400 days of rollups delivered about 2.6%
-    // of what the retention setting said was kept, and nothing on this page
-    // or Nodes' own STORAGE fieldset ever said so.
+    // there is. The cap only gets the blame once the file is nearly on it:
+    // a short reach on a near-empty file is a young install, not a cap.
     const bound = App.el('set-series-bound');
     if (bound) {
       const ts = storage.nodes_series_oldest_ts;
       const days = Number(storage.nodes_series_rollup_days || 0);
+      const seriesCap = Number(App.el('set-nodes-series-cap').value || 0) * 1024 * 1024;
+      const seriesBytes = storage.nodes_series_bytes || 0;
       const reach = ts ? (Date.now() / 1000 - ts) / 86400 : 0;
       bound.textContent = !known || !days ? ''
         : !ts ? 'Nodes metric history is empty, so neither the cap nor the '
           + 'rollup retention setting is bounding it yet.'
-        : reach < days * 0.9
+        : seriesCap && seriesBytes >= seriesCap * 0.9 && reach < days * 0.9
           ? `The CAP is what bounds Nodes metric history: it reaches back `
             + `${Math.round(reach)} days against the ${Math.round(days)} days `
             + 'rollup retention asks for, so the size cap is deleting history '
             + 'the retention setting would have kept. Raise the cap, or expect '
             + 'this much.'
-          : `RETENTION is what bounds Nodes metric history: it reaches back `
-            + `${Math.round(reach)} of the ${Math.round(days)} days rollup `
-            + 'retention asks for and is under its cap, so the retention '
-            + 'setting is what decides how far back a wide chart goes.';
+          : `Nodes metric history reaches back ${Math.round(reach)} days so `
+            + `far, of the ${Math.round(days)} the retention allows.`;
     }
     const disk = App.el('use-disk');
     disk.textContent = known && storage.disk_total

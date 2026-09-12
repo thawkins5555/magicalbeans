@@ -117,8 +117,8 @@ check("the breakdown says which basis its byte figures are on, so an "
       "estimate is never read as a measurement",
       "'measured'" in SETTINGS and "per-row size" in SETTINGS)
 
-check("one line says whether the CAP or the RETENTION setting is what "
-      "bounds the metric history file",
+check("one line says how far back the metric history file reaches, and "
+      "names the cap only when the file is on it",
       'id="set-series-bound"' in RETENTION
       and "nodes_series_rollup_days" in USAGE)
 
@@ -265,15 +265,27 @@ else:
     capped_by_cap = render(
         {"nodes_series_bytes": 512 * MB, "nodes_series_oldest_ts": NOW - 9 * DAY,
          "nodes_series_rollup_days": 400}, CAPS)["set-series-bound"]["textContent"]
-    check("a file reaching back nine days against a 400-day retention "
-          "names the CAP as what is bounding it",
+    check("a file sitting on its cap and reaching back nine days against a "
+          "400-day retention names the CAP as what is bounding it",
           "CAP is what bounds" in capped_by_cap and "9 days" in capped_by_cap,
           capped_by_cap)
+    # The same nine days on a file nowhere near its cap is a young install,
+    # and the page used to blame the cap for it on every such machine.
+    young = render(
+        {"nodes_series_bytes": 20 * MB, "nodes_series_oldest_ts": NOW - 9 * DAY,
+         "nodes_series_rollup_days": 400}, CAPS)["set-series-bound"]["textContent"]
+    check("...while the same reach on a file at 4% of its cap blames "
+          "nothing and just says how far back it goes",
+          "CAP" not in young and "reaches back 9 days so far" in young
+          and "of the 400 the retention allows" in young,
+          young)
     capped_by_retention = render(
         {"nodes_series_bytes": 64 * MB, "nodes_series_oldest_ts": NOW - 398 * DAY,
          "nodes_series_rollup_days": 400}, CAPS)["set-series-bound"]["textContent"]
-    check("...and one reaching nearly the whole window names RETENTION",
-          "RETENTION is what bounds" in capped_by_retention,
+    check("...and one reaching nearly the whole window under its cap "
+          "reports the reach without naming the cap",
+          "CAP" not in capped_by_retention
+          and "reaches back 398 days so far" in capped_by_retention,
           capped_by_retention)
     check("an empty metric history claims neither",
           "empty" in render({"nodes_series_rollup_days": 400},

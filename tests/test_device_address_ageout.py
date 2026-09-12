@@ -71,6 +71,18 @@ with db._lock:
 check("...even when the stale row carries the newer seen_ts",
       db.device_id_for_address("10.30.9.2") == rt)
 
+print("4b. the batched lookup resolves by the same rule")
+batch = db.devices_by_addresses(["10.30.9.2", "10.30.9.7", "10.30.0.1"])
+check("the batch path also prefers the present row over the newer stale one",
+      batch["10.30.9.2"]["id"] == rt,
+      batch.get("10.30.9.2") and batch["10.30.9.2"]["id"])
+check("...an alias only one device holds still resolves to it",
+      batch["10.30.9.7"]["id"] == sw, batch.get("10.30.9.7"))
+check("...and a primary address resolves to its own device",
+      batch["10.30.0.1"]["id"] == sw, batch.get("10.30.0.1"))
+check("...with one answer per address asked about and none invented",
+      set(batch) == {"10.30.9.2", "10.30.9.7", "10.30.0.1"}, sorted(batch))
+
 print("5. prune deletes what nothing has refreshed")
 with db._lock:
     db._conn.execute("UPDATE device_addresses SET seen_ts = ? WHERE device_id = ?",

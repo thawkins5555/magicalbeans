@@ -704,19 +704,9 @@ class Service:
         self.log.add(SYSTEM, "Service started")
 
     def _start_nodes_split(self) -> None:
-        """Phase 2 of the 5.0.0 nodes.db split and, after it, the series
-        store's WITHOUT ROWID rewrite -- on one thread: the hourly rollups
-        can be hundreds of megabytes and nothing, least of all the web
-        server, should wait on them.
-
-        One thread rather than two because both phases rewrite
-        nodes_series.db and must not overlap: the rewrite moving
-        samples_hourly out from under import_legacy_rollups' cursor would
-        be a race with data in it. The existing thread already carries the
-        lifecycle both want -- self._stop as the between-batches stop
-        signal, and a join in shutdown() before the stores close -- so the
-        only change is the gate, which now opens for either phase.
-        """
+        """The 5.0.0 nodes.db split and then the series store's WITHOUT ROWID
+        rewrite, on one background thread: both rewrite nodes_series.db, so
+        they must not overlap, and neither may block a request."""
         split = self.nodes_db.split_pending()
         rewrite = self.nodes_db.series_db.rewrite_pending()
         if not (split or rewrite):
@@ -1622,15 +1612,14 @@ class Service:
             float(self.nodes_settings.get("mac_table_retention_days", 7)) * 86400)
         self.nodes_db.prune_port_vlans(
             float(self.nodes_settings.get("mac_table_retention_days", 7)) * 86400)
-        # Aliases on the event clock: a management address seen only now
-        # and then must outlive a week of walks that did not list it.
+        # On the event clock: an alias must outlive a week of walks.
         self.nodes_db.prune_device_addresses(
             float(self.nodes_settings.get("event_retention_days", 180)) * 86400)
         self._trim_db("max_nodes_db_mb", self.nodes_db, "Nodes database",
                       "oldest events")
         # Own cap since 5.0.0: growth lives here, not in the inventory file.
-        # Two stages, so the noun names both: the oldest hourly rollups go
-        # first, raw samples only once the rollups are at their floor.
+        # Two stages, so the noun names both: rollups first, raw samples
+        # only once they are at their floor.
         self._trim_db("max_nodes_series_db_mb", self.nodes_db.series_db,
                       "Nodes metric history",
                       "oldest hourly rollups and samples")

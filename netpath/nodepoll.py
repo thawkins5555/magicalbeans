@@ -4041,7 +4041,6 @@ class NodePoller(Worker):
                     continue
                 details.setdefault(address, {})[key] = entry
         addresses = [str(value) for value in rows.values() if value]
-        # The walk answered, so this is every address the table holds now.
         self.db.record_device_addresses(device_id, addresses, "ipAddrTable",
                                         details=details, complete=True)
 
