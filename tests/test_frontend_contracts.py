@@ -2334,7 +2334,9 @@ check(_WL_REFRESH59.count("App.state.tab !== 'wireless'") == 2,
 #     list, the kiosk query string, the per-tick configuration fetches, the
 #     two browser-built CSVs and the three status lines nobody could hear.
 _N59 = read("nodes.js")
-_NODES_REFRESH59 = _slice59(_N59, "  async function refresh() {",
+# refresh() and the three helpers it was split into (readDeviceFilters,
+# reconcileSelection, drawDevicePage) are one contiguous region.
+_NODES_REFRESH59 = _slice59(_N59, "  function readDeviceFilters() {",
                             "  // aabbccddeeff -> aa:bb:cc:dd:ee:ff")
 
 # 49a. F1. /api/nodes/devices has been paged since 4.47.0, so view.devices is

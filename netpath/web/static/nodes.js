@@ -6513,9 +6513,9 @@
     return !!pane && pane.classList.contains('active');
   }
 
-  async function refresh() {
-    if (App.state.tab !== 'nodes') return;
-    drawStatus();
+  // The device-list query the filter bar currently describes, with the
+  // page reset a changed filter implies.
+  function readDeviceFilters() {
     const q = App.el('nd-q').value.trim();
     // Same fallback as fillGroupFilter: until the options exist the first
     // fetch has to honour the restored choice, or the list would contradict
@@ -6540,19 +6540,13 @@
     if (view.pageFilterSig !== null && view.pageFilterSig !== filterSig) view.pageOffset = 0;
     view.pageFilterSig = filterSig;
     view.pageLimit = Number(App.el('nd-page-size').value) || view.pageLimit;
-    const generation = ++view.refreshGen;
-    const [devices] = await Promise.all([
-      App.get('/api/nodes/devices', { q, group_id, device_group_id, status, offline_only,
-                                      maintenance_only, overrides_only,
-                                      limit: view.pageLimit, offset: view.pageOffset }),
-      loadNodesConfig(),
-      loadDiscJobsIfNeeded(),
-    ]);
-    // A newer refresh already redrew this, or the operator has left.
-    if (view.refreshGen !== generation || App.state.tab !== 'nodes') return;
-    view.devices = devices.devices;
-    view.pageTotal = devices.total != null ? devices.total : view.devices.length;
-    drawPager();
+    return { q, group_id, device_group_id, status, offline_only, maintenance_only,
+             overrides_only, limit: view.pageLimit, offset: view.pageOffset };
+  }
+
+  // Bulk ticks and the detail-pane selection, reconciled against the page
+  // just fetched.
+  function reconcileSelection() {
     // A filter/sort change can drop rows out from under a bulk
     // selection — keep only ids still actually on screen.
     const visibleIds = new Set(view.devices.map((d) => d.id));
@@ -6573,6 +6567,9 @@
       view.selected = null;
     }
     if (!view.selected && view.devices.length) view.selected = view.devices[0].id;
+  }
+
+  function drawDevicePage() {
     fillGroupFilter();
     fillDevGroupFilter();
     fillDiscGroups();
@@ -6584,11 +6581,30 @@
       drawProfilesTable();
       drawMibsTable();
     }
+  }
+
+  async function refresh() {
+    if (App.state.tab !== 'nodes') return;
+    drawStatus();
+    const query = readDeviceFilters();
+    const generation = ++view.refreshGen;
+    const [devices] = await Promise.all([
+      App.get('/api/nodes/devices', query),
+      loadNodesConfig(),
+      loadDiscJobsIfNeeded(),
+    ]);
+    // A newer refresh already redrew this, or the operator has left.
+    if (view.refreshGen !== generation || App.state.tab !== 'nodes') return;
+    view.devices = devices.devices;
+    view.pageTotal = devices.total != null ? devices.total : view.devices.length;
+    drawPager();
+    reconcileSelection();
+    drawDevicePage();
     if (view.selected) await loadDetail();
     else showDetailEmpty();
     if (view.macSearchPending) {
       view.macSearchPending = false;
-      await resolveMacSearch(q).catch(() => {});
+      await resolveMacSearch(query.q).catch(() => {});
     }
   }
 
