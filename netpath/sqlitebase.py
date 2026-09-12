@@ -672,13 +672,25 @@ class SqliteStore:
         except (ValueError, TypeError):
             return default
 
-    def _set_private_setting(self, key: str, value) -> None:
+    def _set_private_setting(self, key: str, value, commit: bool = True) -> None:
+        """commit=False for a caller that owns the transaction — progress
+        written beside the chunk it describes must land or roll back with it."""
         with self._lock:
             self._conn.execute(
                 "INSERT INTO settings(key, value) VALUES (?,?)"
                 " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, json.dumps(value)))
-            self._conn.commit()
+            if commit:
+                self._conn.commit()
+
+    def _clear_private_setting(self, key: str, commit: bool = True) -> None:
+        """Remove the row rather than storing a null: for bookkeeping whose
+        ABSENCE is the fact, a stored null reads back the same but leaves a
+        row that looks like state. commit=False as above."""
+        with self._lock:
+            self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+            if commit:
+                self._conn.commit()
 
     # ------------------------------------------------------------------ trim
 

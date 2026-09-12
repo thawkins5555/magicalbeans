@@ -482,6 +482,45 @@ check("every message landed in the index exactly once -- resuming from a "
      _indexed == N_MESSAGES, _indexed)
 syslog5c.close()
 
+# The cursor itself: kept through sqlitebase's private-setting helpers now
+# rather than its own hand-written SQL, and still writing WITHOUT committing
+# (both helpers commit by default) so progress cannot outlive the chunk it
+# describes.
+syslog5e = SyslogDatabase(SYSLOG5, log=_LogSpy())
+with syslog5e._lock:
+    syslog5e._write_backfill_cursor(4242)
+    check("the cursor reads back through the shared private-setting helper",
+         syslog5e._read_backfill_cursor() == 4242,
+         syslog5e._read_backfill_cursor())
+    syslog5e._conn.rollback()
+check("the write does not commit on its own -- a rollback takes the progress "
+     "with the chunk it belonged to",
+     syslog5e._read_backfill_cursor() is None, syslog5e._read_backfill_cursor())
+with syslog5e._lock:
+    syslog5e._write_backfill_cursor(77)
+    syslog5e._conn.commit()
+check("...and the caller's own commit persists it",
+     syslog5e._read_backfill_cursor() == 77, syslog5e._read_backfill_cursor())
+with syslog5e._lock:
+    syslog5e._write_backfill_cursor(None)
+    syslog5e._conn.commit()
+    _gone = syslog5e._conn.execute(
+        "SELECT value FROM settings WHERE key = '_fts_backfill_cursor'").fetchone()
+check("...and None deletes the row rather than storing a null, which would "
+     "read back the same but look like state", _gone is None, _gone)
+# What an upgrade finds on disk: the old code wrote a bare integer, which is
+# also its JSON, so json.loads reads it unchanged.
+with syslog5e._lock:
+    syslog5e._conn.execute(
+        "INSERT INTO settings(key, value) VALUES ('_fts_backfill_cursor', '9001')")
+    syslog5e._conn.commit()
+check("a cursor written by a pre-upgrade build still reads back",
+     syslog5e._read_backfill_cursor() == 9001, syslog5e._read_backfill_cursor())
+with syslog5e._lock:
+    syslog5e._write_backfill_cursor(None)
+    syslog5e._conn.commit()
+syslog5e.close()
+
 # A genuine failure (not a stop) still disables search and says so -- the
 # guard above must not have gone the other way and swallowed a real one.
 log5d = _LogSpy()

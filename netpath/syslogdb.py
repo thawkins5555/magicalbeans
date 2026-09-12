@@ -258,33 +258,28 @@ class SyslogDatabase(SqliteStore):
     def _read_backfill_cursor(self) -> int | None:
         """The row id an earlier, shutdown-interrupted backfill had reached,
         or None if there is nothing to resume (never started one, or the
-        last one ran to completion). Caller holds no lock of its own — this
-        one does, and is only ever called from inside __init__/_enable_fts,
-        which hold the same RLock and so re-enter it rather than blocking."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT value FROM settings WHERE key = ?",
-                (self._BACKFILL_CURSOR_KEY,)).fetchone()
-        if row is None or row["value"] is None:
-            return None
+        last one ran to completion). `_private_setting` takes the same RLock
+        this one's callers (__init__/_enable_fts) already hold, and so
+        re-enters it rather than blocking. A cursor written by a build before
+        this one is a bare integer, which is also its JSON, so it reads back
+        unchanged."""
+        value = self._private_setting(self._BACKFILL_CURSOR_KEY)
         try:
-            return int(row["value"])
+            return int(value) if value is not None else None
         except (TypeError, ValueError):
             return None
 
     def _write_backfill_cursor(self, cursor: int | None) -> None:
         """cursor=None clears the marker (nothing to resume) rather than a
         second done flag standing for the same fact. Caller holds the lock
-        and commits — this never does either on its own, so it can share a
-        transaction with the chunk it is persisting progress for."""
+        and commits, so both helpers are asked NOT to commit — they do by
+        default — and progress shares a transaction with the chunk it
+        describes."""
         if cursor is None:
-            self._conn.execute(
-                "DELETE FROM settings WHERE key = ?", (self._BACKFILL_CURSOR_KEY,))
+            self._clear_private_setting(self._BACKFILL_CURSOR_KEY, commit=False)
         else:
-            self._conn.execute(
-                "INSERT INTO settings(key, value) VALUES (?, ?)"
-                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (self._BACKFILL_CURSOR_KEY, str(cursor)))
+            self._set_private_setting(self._BACKFILL_CURSOR_KEY, int(cursor),
+                                      commit=False)
 
     # ------------------------------------------------------------ backfill
 
