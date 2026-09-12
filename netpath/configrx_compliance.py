@@ -338,6 +338,21 @@ def _device_ids_in_scope(nodes_db, rule_set_row) -> list[int]:
     return [row["id"] for row in rows]
 
 
+_PATTERN_CACHE: dict[str, re.Pattern] = {}
+
+
+def _cached_pattern(pattern: str) -> re.Pattern:
+    """Returns cached compiled pattern or compiles and caches it.
+    Clears cache when it exceeds 512 entries. UnsafeRegex propagates."""
+    if pattern in _PATTERN_CACHE:
+        return _PATTERN_CACHE[pattern]
+    if len(_PATTERN_CACHE) >= 512:
+        _PATTERN_CACHE.clear()
+    compiled = compile_bounded(pattern)
+    _PATTERN_CACHE[pattern] = compiled
+    return compiled
+
+
 def evaluate_device(db, device_id: int, rules, deadline: float | None = None) -> dict:
     """One device against an already-fetched list of compliance_rules rows.
     Returns {"status", "failed_rules", "backup_id", "truncated"}; does not
@@ -360,7 +375,7 @@ def evaluate_device(db, device_id: int, rules, deadline: float | None = None) ->
             truncated = True
             break
         try:
-            pattern = compile_bounded(rule["pattern"])
+            pattern = _cached_pattern(rule["pattern"])
         except UnsafeRegex as exc:
             # A rule stored before this check existed (or tightened since) fails
             # CLOSED rather than vanishing silently, and it carries why.
