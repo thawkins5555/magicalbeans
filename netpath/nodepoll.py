@@ -2815,6 +2815,28 @@ class NodePoller(Worker):
 
     # ---------------------------------------------------------------- poll
 
+    def _best_effort(self, label, fn, *args):
+        """Run one optional read, swallowing "this device does not answer
+        that" and nothing else.
+
+        An absent object is the normal case for PoE, STP, environment
+        sensors, UCD-SNMP and an admin's custom MIB, and is what each of
+        these sites was written to ignore with a bare `except SnmpError:
+        pass`. A credential or security-level verdict is not that: it is a
+        proven fact about this device's access, with its own device event and
+        its own remedy (see _CREDENTIAL_VERDICTS), and one raised by an
+        optional read used to vanish here — leaving the operator whichever
+        later failure happened to look different. Those are re-raised for the
+        caller's own handler, named so the log says which read produced it.
+        """
+        try:
+            return fn(*args)
+        except _CREDENTIAL_VERDICTS as exc:
+            self.log.add(NODES, f"{label}: {exc}")
+            raise
+        except SnmpError:
+            return None
+
     def _poll_device(self, device, config: dict) -> None:
         device_id = device["id"]
         ip = device["ip"]
@@ -3463,27 +3485,27 @@ class NodePoller(Worker):
         if snmp_ok and config.get("snmp_enabled"):
             if config.get("poe_enabled", True):
                 try:
-                    self._poll_poe(device_id, device, cred_config)
-                except SnmpError:
-                    pass
+                    self._best_effort(f"PoE read for device #{device_id}",
+                                      self._poll_poe,
+                                      device_id, device, cred_config)
                 except Exception:
                     self._bump("errors")
                     self.log.add(ERROR, f"PoE read failed for device #{device_id}",
                                  detail=traceback.format_exc())
             if config.get("stp_enabled", True):
                 try:
-                    self._poll_stp(device_id, device, cred_config)
-                except SnmpError:
-                    pass
+                    self._best_effort(f"STP read for device #{device_id}",
+                                      self._poll_stp,
+                                      device_id, device, cred_config)
                 except Exception:
                     self._bump("errors")
                     self.log.add(ERROR, f"STP read failed for device #{device_id}",
                                  detail=traceback.format_exc())
             try:
-                self._poll_environment(device_id, device, cred_config,
-                                       {m[0] for m in metrics}, now)
-            except SnmpError:
-                pass
+                self._best_effort(
+                    f"Environmental sensor read for device #{device_id}",
+                    self._poll_environment,
+                    device_id, device, cred_config, {m[0] for m in metrics}, now)
             except Exception:
                 self._bump("errors")
                 self.log.add(ERROR, f"Environmental sensor read failed for "
@@ -3848,7 +3870,8 @@ class NodePoller(Worker):
         uptime_ticks = int(uptime) if isinstance(uptime, (int, float)) else None
 
         metrics = []
-        try:
+
+        def read_ucd_snmp():        # best-effort: often not present at all
             extra_response = self._snmp_get(device, config, list(nodeoids.UCD_SNMP.values()))
             extra = {vb["oid"]: vb["value"] for vb in extra_response.varbinds
                      if vb["type"] not in ("noSuchObject", "noSuchInstance")}
@@ -3860,8 +3883,8 @@ class NodePoller(Worker):
             if isinstance(avail, (int, float)) and isinstance(total, (int, float)) and total:
                 metrics.append(("mem_pct", "Memory", "%", "gauge",
                                max(0.0, 100.0 * (1 - float(avail) / float(total)))))
-        except SnmpError:
-            pass   # best-effort: UCD-SNMP-MIB not present on this device
+
+        self._best_effort(f"UCD-SNMP read for {device['ip']}", read_ucd_snmp)
 
         metrics.extend(self._poll_vendor_health(device, config, identity,
                                                 already={m[0] for m in metrics}))
@@ -4502,7 +4525,8 @@ class NodePoller(Worker):
             return []
         instance_oids = [f"{o['oid']}.0" for o in objects]
         metrics = []
-        try:
+
+        def read_mib_objects():    # best-effort: this device may answer none
             values = self._custom_mib_values(device, config, instance_oids)
             for obj, instance_oid in zip(objects, instance_oids):
                 vb = values.get(instance_oid)
@@ -4515,8 +4539,8 @@ class NodePoller(Worker):
                 # (see counter_rate), which an arbitrary admin-picked MIB
                 # object does not get.
                 metrics.append((f"mib_{obj['name']}", obj["name"], "", "gauge", vb["value"]))
-        except SnmpError:
-            pass   # best-effort: this MIB's objects aren't answered by this device
+
+        self._best_effort(f"Custom MIB read for {device['ip']}", read_mib_objects)
         return metrics
 
     # The conventional safe varbind count for one GET; halved per device
@@ -7775,6 +7799,18 @@ class _AuthFailure(SnmpError):
         super().__init__(message)
         self.usm_name = usm_name
         self.report = report
+
+
+# The SnmpError verdicts that are about this device's credential or the
+# security level it serves rather than about one object being absent: a
+# digest that did not verify, a reply that would not decrypt, an unsigned
+# answer to a signed request, a level that cannot be built or is not served,
+# an engine-sync/auth refusal, and the agent's own authorizationError. Each
+# has its own device event and its own remedy, which is why _best_effort
+# re-raises these and swallows the rest (a timeout, a stray, a bad OID, a
+# plain SnmpError).
+_CREDENTIAL_VERDICTS = (_AuthFailure, SnmpAccessDenied, SnmpAuthError,
+                        SnmpDowngrade, SnmpPrivError, SnmpUnsupported)
 
 
 def _credential_contradicted(exc: Exception) -> bool:
