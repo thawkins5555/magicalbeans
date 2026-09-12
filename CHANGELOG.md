@@ -224,20 +224,28 @@ discovery result — recording one address never marks the rest of that
 device's addresses gone. A discovery job left stuck in `running` past the
 retention window is pruned alongside it.
 
-**Table rewrite, in flight at the time of writing.** `samples` and
-`samples_hourly` are being re-expressed as `WITHOUT ROWID` tables keyed by
-range rather than by a synthetic rowid plus a second index — measured at
-23.8 and 47.5 bytes per row, against 66.7 today. The migration is a
-batched copy-and-delete by key band, run from the existing nodes-split
-maintenance thread, that never doubles the file on disk and can be
-stopped and resumed mid-way. This paragraph describes the design as
-planned; Bob rewrites it to describe what actually shipped once the
-rewrite lands.
+**The table rewrite.** `samples` and `samples_hourly` are now
+`WITHOUT ROWID` tables keyed by (metric, time); the raw table's timestamp
+index is gone and the hourly table keeps its hour index. Measured at
+23.8 and 47.5 bytes per row against 66.7 before. Every path that used the
+rowid — the per-metric cap, the two prune passes, device deletion and the
+cap trim — walks metric-id bands instead; the cap trim now caps every
+metric to the same depth in key order rather than sorting the whole table
+for its oldest rows, which without the index would have been a full scan.
+An existing file is migrated by the nodes-split maintenance thread as a
+second phase: one band at a time is copied into the new table and deleted
+from the old in the same transaction, so the file never doubles (the
+rehearsal peaked 215 pages above its 4,052), reads see the union of both
+halves with the old row winning while it runs, a stop resumes where it
+left off, and the old table is dropped only after a row-count check. The
+rehearsal ran the real code path against a copy of this machine's live
+`nodes_series.db` with a stop and a restart in the middle: 230,485 samples
+before and after, identical rows at five sampled offsets and mid-split,
+the file 21.9 MB → 7.0 MB. The storage report's note shows the band in
+progress while a rewrite is running.
 
 **Recorded, not built.** Three follow-ups were identified and deliberately
-deferred rather than built this release: the hour-index watermark that
-would let phase 2 of the WITHOUT ROWID migration skip re-scanning rows it
-has already covered (waits on the rewrite above landing first), a daily
+deferred rather than built this release: dropping the hourly table's hour index behind a persisted oldest-hour watermark, worth a further 14 bytes per row (waits until the rewrite has run on real installs), a daily
 rollup tier below the hourly one (waits on real numbers from the storage
 report before a third tier is worth the complexity), and zero-suppression
 for metrics that sit at zero for long stretches (waits on measuring how
