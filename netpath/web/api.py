@@ -3373,6 +3373,33 @@ def _tri(value):
 # wire already leaks. The value is shown to callers who could change it
 # anyway (module WRITE); everyone else gets `has_community`, the same
 # reduction `v3_auth_pass_enc` already gets.
+# Every store column whose value IS a secret — not a boolean about one. A
+# serialiser that names one of these owes the caller a `reveal` decision
+# (_may_read_secrets) before the value leaves the process; the encrypted
+# blobs never leave it at all, and appear here so a future serialiser that
+# reaches for one is caught by tests/test_api_helpers.py's contract rather
+# than by an operator reading a JSON response.
+#
+# `community`: the v1/v2c string a device checks before answering (nodes
+# devices/groups/credentials, wireless controllers, trap senders).
+# `community_or_user`: the same, as discovery recorded whichever worked.
+# `password`: the users table's hash — a hash, but still the credential.
+# `token_hash`: the same for an API token. The rest are DPAPI blobs: SNMPv3
+# auth/privacy passwords, ConfigRX's SSH password and enable secret, and
+# IPAM's and Alerts' stored service credentials.
+#
+# Deliberately NOT here: `has_community` and every other has_* boolean (the
+# reduction this rule exists to force), `username`/`ssh_username` (shown so
+# a form can prefill), and configrx compliance's `pattern`, which MIGHT be a
+# secret rather than being one — _compliance_rule_json gates it for its own
+# stated reason.
+SECRET_COLUMNS = frozenset({
+    "community", "community_or_user", "password", "password_enc",
+    "token_hash", "v3_auth_pass_enc", "v3_priv_pass_enc", "auth_pass_enc",
+    "ssh_password_enc", "enable_secret_enc",
+})
+
+
 def _community_fields(row, reveal: bool) -> dict:
     community = row["community"]
     fields = {"has_community": bool(community)}
@@ -3707,7 +3734,7 @@ def _discovery_duplicate(row, index, addresses) -> dict:
 
 
 def _discovery_result_json(row, installed=None, devices_by_ip=None,
-                           index=None, folded_ips=()) -> dict:
+                           index=None, folded_ips=(), reveal: bool = False) -> dict:
     """`installed` is the set of MIB filenames present, and `devices_by_ip`
     an ip -> device row map, each passed by the caller once per listing so
     neither the MIB hint nor the already-added check is a query per row.
@@ -3716,7 +3743,13 @@ def _discovery_result_json(row, installed=None, devices_by_ip=None,
     too; either source wins because promote() always reuses that same row.
 
     `index` adds the duplicate verdict; `folded_ips` are absorbed siblings'
-    addresses."""
+    addresses.
+
+    `community_or_user` is the credential that actually answered this
+    address, so it follows _community_fields' rule rather than riding out
+    with the rest of the row: omitted (not blanked, which would read as
+    "the scan found none") for a caller without Nodes write, which gets
+    `has_community_or_user` instead."""
     existing = devices_by_ip.get(row["ip"]) if devices_by_ip else None
     existing_id = existing["id"] if existing else row["promoted_device_id"]
     existing_name = _device_display_name(existing) if existing else None
@@ -3727,7 +3760,8 @@ def _discovery_result_json(row, installed=None, devices_by_ip=None,
             addresses.append(address)
     return {"id": row["id"], "job_id": row["job_id"], "ip": row["ip"],
             "ping_ok": bool(row["ping_ok"]), "snmp_ok": bool(row["snmp_ok"]),
-            "community_or_user": row["community_or_user"],
+            "has_community_or_user": bool(row["community_or_user"]),
+            **({"community_or_user": row["community_or_user"]} if reveal else {}),
             "snmp_version": row["snmp_version"], "sys_descr": row["sys_descr"],
             "sys_name": row["sys_name"], "sys_object_id": row["sys_object_id"],
             "vendor": row["vendor"], "suggested_group_id": row["suggested_group_id"],
@@ -6506,9 +6540,10 @@ def get_nodes_discovery_job(service, params, body, job_id) -> dict:
             folded.setdefault(into, []).append(row["ip"])
         else:
             primaries.append(row)
+    reveal = _may_read_secrets(service, params, "nodes")
     return {"job": _discovery_job_json(job),
             "results": [_discovery_result_json(r, installed, devices_by_ip, index,
-                                               folded.get(r["id"], ()))
+                                               folded.get(r["id"], ()), reveal)
                         for r in primaries]}
 
 

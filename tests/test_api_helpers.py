@@ -5,9 +5,11 @@ unredacted to a read-only caller; a threshold rule needs both thresholds;
 oversized integers and unbounded time windows answer 400; a CSV cell cannot
 start a formula; device delete drops ConfigRX credentials; ?limit=-1 clamps.
 """
+import ast
 import http.client
 import json
 import os
+import pathlib
 import shutil
 import sqlite3
 import sys
@@ -32,6 +34,109 @@ def check(name, ok, detail=""):
     print(("PASS  " if ok else "FAIL  ") + name + (f"   {detail}" if detail and not ok else ""))
     if not ok:
         FAILS.append(name)
+
+
+# ------------------------------------------------- the reveal boundary
+# _may_read_secrets and _community_fields make the DECISION available; what
+# nothing enforced until now is that every serialiser touching a
+# secret-bearing column actually asks. A `_*_json` naming a SECRET_COLUMNS
+# column must either take `reveal` and guard the value with it, or reduce
+# the column to a boolean (`bool(row["password_enc"])` -> has_credential) so
+# there is no value to withhold. Read from the source rather than by calling
+# every route: a serialiser added tomorrow is caught whether or not anyone
+# remembers to give it a test.
+API_SOURCE = pathlib.Path(api_mod.__file__).read_text(encoding="utf-8")
+API_TREE = ast.parse(API_SOURCE)
+API_LINES = API_SOURCE.splitlines()
+
+_PARENTS = {}
+for _node in ast.walk(API_TREE):
+    for _child in ast.iter_child_nodes(_node):
+        _PARENTS[_child] = _node
+
+
+def _reduced_to_bool(node):
+    """Whether this `row["secret"]` is only ever asked "is there one?" —
+    bool(...) or `if row[...]`, never a value that reaches the response."""
+    parent = _PARENTS.get(node)
+    return (isinstance(parent, ast.Call) and isinstance(parent.func, ast.Name)
+            and parent.func.id == "bool")
+
+
+GUARDS = ("if reveal", "reveal else", "not reveal", "_community_fields(")
+
+serialisers = [n for n in ast.walk(API_TREE)
+               if isinstance(n, ast.FunctionDef)
+               and n.name.startswith("_") and n.name.endswith("_json")]
+check("the scan found the serialisers it is meant to police",
+      len(serialisers) > 20 and any(n.name == "_device_json" for n in serialisers),
+      len(serialisers))
+
+leaks = []
+guarded_names = []
+for fn in serialisers:
+    named = set()
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+                and node.value.id == "row"
+                and isinstance(node.slice, ast.Constant)
+                and node.slice.value in api_mod.SECRET_COLUMNS
+                and not _reduced_to_bool(node)):
+            named.add(node.slice.value)
+        if isinstance(node, ast.Dict):
+            for key in node.keys:
+                if (isinstance(key, ast.Constant)
+                        and key.value in api_mod.SECRET_COLUMNS):
+                    named.add(key.value)
+    if not named:
+        continue
+    body = "\n".join(API_LINES[fn.lineno - 1:fn.end_lineno])
+    args = [a.arg for a in fn.args.args] + [a.arg for a in fn.args.kwonlyargs]
+    if "reveal" not in args or not any(g in body for g in GUARDS):
+        leaks.append(f"{fn.name} (line {fn.lineno}) names {sorted(named)}")
+    else:
+        guarded_names.append(fn.name)
+
+check("no serialiser hands out a secret column without consulting reveal",
+      not leaks, "; ".join(leaks))
+check("the discovery result's credential is one of the guarded ones",
+      "_discovery_result_json" in guarded_names, sorted(guarded_names))
+
+# The four that reach `community` through the shared helper never name the
+# column themselves, so the scan above cannot see them: pin them by name, or
+# a rewrite that inlines _community_fields drops out of the contract unseen.
+by_name = {fn.name: fn for fn in serialisers}
+for name in ("_device_json", "_group_json", "_group_credential_json",
+             "_controller_json"):
+    fn = by_name.get(name)
+    body = "" if fn is None else "\n".join(API_LINES[fn.lineno - 1:fn.end_lineno])
+    check(f"{name} still reaches community through _community_fields",
+          fn is not None and "_community_fields(" in body
+          and "reveal" in [a.arg for a in fn.args.args])
+
+# A `reveal` a route decides for itself is the whole hole this closes.
+passes_true = []
+for fn in ast.walk(API_TREE):
+    if not isinstance(fn, ast.FunctionDef):
+        continue
+    hardcoded = False
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        for kw in node.keywords:
+            if (kw.arg == "reveal" and isinstance(kw.value, ast.Constant)
+                    and kw.value.value is True):
+                hardcoded = True
+    if hardcoded:
+        body = "\n".join(API_LINES[fn.lineno - 1:fn.end_lineno])
+        if "_may_read_secrets(" not in body:
+            passes_true.append(f"{fn.name} (line {fn.lineno})")
+
+check("nothing passes reveal=True without deriving it from _may_read_secrets",
+      not passes_true, "; ".join(passes_true))
+check("SECRET_COLUMNS holds columns, not has_* booleans",
+      not [c for c in api_mod.SECRET_COLUMNS if c.startswith("has_")],
+      sorted(api_mod.SECRET_COLUMNS))
 
 
 service = Service(
@@ -142,6 +247,23 @@ try:
     check("a ConfigRX reader never sees a stored secret, whatever the flag says",
           status == 200 and "R4diusKey" not in content,
           f"{status} {content!r}")
+
+    # The same boundary on the discovery results list, which shipped the
+    # community that actually answered each address to any Nodes reader.
+    job_id = service.nodes_db.add_discovery_job("range", "192.0.2.0/30")
+    service.nodes_db.add_discovery_result(
+        job_id, ip="192.0.2.41", ping_ok=1, snmp_ok=1,
+        community_or_user="Sw33pC0mmunity", snmp_version="2c")
+    status, payload = call("GET", f"/api/nodes/discovery/{job_id}", token=reader)
+    shown = payload.get("results", [{}])[0] if isinstance(payload, dict) else {}
+    check("a Nodes reader is told a credential answered, not which one",
+          status == 200 and "community_or_user" not in shown
+          and shown.get("has_community_or_user") is True, f"{status} {shown}")
+    status, payload = call("GET", f"/api/nodes/discovery/{job_id}", token=admin)
+    shown = payload.get("results", [{}])[0] if isinstance(payload, dict) else {}
+    check("an account that could change it still sees it",
+          status == 200 and shown.get("community_or_user") == "Sw33pC0mmunity",
+          f"{status} {shown}")
 
     # ---------------------------------------------------------------------
     # 3. A threshold rule that cannot raise, or cannot clear, is refused
