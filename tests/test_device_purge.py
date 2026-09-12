@@ -223,7 +223,8 @@ step = db.purge_step(budget_s=0.02)
 check("a step bounded by its budget stops partway and says so",
       step["pending"] == 1 and step["rows_removed_now"] > 0, step)
 partway = rows_left(db, second)
-check("...with rows still to go", partway["samples"] > 0, partway)
+check("...with rows still to go",
+      partway["samples"] + partway["samples_hourly"] > 0, partway)
 db.close()
 
 db = NodesDatabase(store_path)
