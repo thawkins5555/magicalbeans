@@ -554,7 +554,8 @@ class NodesSeriesDatabase(SqliteStore):
             for table in self._live_tables(base):
                 got, done = self._delete_by_band(
                     table, where, (device_id,), deadline,
-                    pause=self.PURGE_PAUSE_S)
+                    pause=self.PURGE_PAUSE_S,
+                    bounds_where="device_id = ?", bounds_params=(device_id,))
                 removed += got
                 if not done:
                     return removed, False
@@ -632,27 +633,27 @@ class NodesSeriesDatabase(SqliteStore):
         return removed
 
     def _delete_by_band(self, table: str, where: str, params, deadline: float,
-                        pause: float = 0.0,
-                        interface_only: bool = False) -> tuple[int, bool]:
+                        pause: float = 0.0, interface_only: bool = False,
+                        bounds_where: str = "", bounds_params=()) -> tuple[int, bool]:
         """_prune_by_band's body with a deadline: (rows removed, finished).
-
-        `interface_only` narrows to the per-port class on the band itself, a
-        short index range rather than a fleet-wide semijoin per row. The
-        bands come from `metrics`, small and indexed on id: probing `samples`
-        for them was a full scan, it having no index on ts.
-        """
+        Bands come from `metrics` (probing `samples` would be a full scan);
+        `bounds_where` narrows them, so a purge starts at its device's ids."""
         scope_clause = ""
-        scope_probe = ""
+        probe_terms = []
+        probe_params = list(bounds_params)
         if interface_only:
             scope_clause = (f" AND metric_id IN (SELECT id FROM metrics"
                             f" WHERE scope = {SCOPE_INTERFACE}"
                             f" AND id >= ? AND id < ?)")
-            scope_probe = f" WHERE scope = {SCOPE_INTERFACE}"
+            probe_terms.append(f"scope = {SCOPE_INTERFACE}")
+        if bounds_where:
+            probe_terms.append(f"({bounds_where})")
+        scope_probe = (" WHERE " + " AND ".join(probe_terms)) if probe_terms else ""
         base = table[:-4] if table.endswith("_new") else table
         with self._lock:
             bounds = self._conn.execute(
                 f"SELECT MIN(id) AS lo, MAX(id) AS hi"
-                f" FROM metrics{scope_probe}").fetchone()
+                f" FROM metrics{scope_probe}", probe_params).fetchone()
         low = bounds["lo"]
         if low is None:
             return 0, True
@@ -783,21 +784,17 @@ class NodesSeriesDatabase(SqliteStore):
         return removed
 
     def _raw_holders(self) -> list[tuple[int, int, int]]:
-        """(scope, raw rows, metrics that hold raw rows) per metric class.
-        Holders, not every metric: COUNT(metrics) counts the ones with no
-        raw rows to give, so the depth comes out too shallow and the trim
-        overshoots past _sample_floor. One PK EXISTS probe per metric."""
-        tables = self._live_tables("samples")
-        exists = " OR ".join(
-            f"EXISTS (SELECT 1 FROM {table} s WHERE s.metric_id = m.id)"
-            for table in tables)
+        """(scope, raw rows, metrics holding raw rows) per class; an empty
+        metric must not count toward the depth or the trim overshoots."""
         out = []
         for scope in (SCOPE_DEVICE, SCOPE_INTERFACE):
             rows = 0
             with self._lock:
+                tables = self._live_tables("samples")
+                exists = " OR ".join(
+                    f"EXISTS (SELECT 1 FROM {table} s WHERE s.metric_id = m.id)"
+                    for table in tables)
                 for table in tables:
-                    if not self._still_live("samples", table):
-                        continue
                     rows += self._conn.execute(
                         f"SELECT COUNT(*) AS n FROM {table} WHERE metric_id IN"
                         f" (SELECT id FROM metrics WHERE scope = ?)",
