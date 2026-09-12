@@ -104,7 +104,7 @@ check("an estimate that overshoots the file says so in the note rather "
       or "overshoots" in entry["note"],
       (accounted, pages, entry["note"]))
 check("the estimate is still in the right order of magnitude: 20,000 "
-      "samples at the measured 66.7 B/row is what this file mostly is",
+      "samples at the measured 23.8 B/row is what this file mostly is",
       pages * 0.4 <= rows["samples"]["bytes"] <= pages * 1.5,
       (rows["samples"]["bytes"], pages))
 

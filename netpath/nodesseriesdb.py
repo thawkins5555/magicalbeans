@@ -40,20 +40,21 @@ def raw_window_for_scope(scope: int) -> float:
     return (INTERFACE_RAW_WINDOW_S if scope == SCOPE_INTERFACE
             else RAW_WINDOW_S)
 
-# One batch of prune(), in rows, and the band _delete_batches may move it
-# inside. Sized like the walk tables' rather than like netpath.db's: a batch
-# of contiguous rowids spans every metric in the fleet, so it touches very
-# nearly every leaf page of the (metric_id, ts) primary key whatever its
-# size, and small batches pay that whole cost again per commit. 400,000
-# samples over 20,000 metrics, with bench_prune's 5 ms reader:
+# One batch of prune(), in METRIC IDS rather than rows: neither table has a
+# rowid any more, so a by-age sweep is cut up by bands of the primary key's
+# leading column. That is the change the old rowid band's own comment was
+# apologising for -- a contiguous rowid batch spanned every metric in the
+# fleet and so touched very nearly every leaf page whatever its size, while
+# a metric-id band is exactly as wide as the rows it deletes.
 #
-#     unbatched      1.9 s, one hold of 1,864 ms, reader stalled 919 ms
-#      2,000 rows    1.8 s, 53 holds, median  20 ms, reader stalled 919 ms
-#     20,000 rows    1.8 s, 20 holds, median  96 ms, reader stalled 448 ms
-#     50,000 rows    1.5 s, 16 holds, median 105 ms, reader stalled 1516 ms
-SAMPLE_PRUNE_CHUNK = 20_000
-SAMPLE_PRUNE_CHUNK_MIN = 5_000
-SAMPLE_PRUNE_CHUNK_MAX = 80_000
+# 500 ids to start, the figure _IDS_PER_QUERY already uses, which at a
+# 3-day raw window and a 60-second poll is ~2.2 M rows of the fleet-shape
+# table; _delete_batches' adaptive rule moves it from there against
+# TRIM_LOCK_TARGET_S, and the wide accept band means a first batch landing
+# inside it never moves at all.
+SAMPLE_BAND_METRICS = 500
+SAMPLE_BAND_METRICS_MIN = 50
+SAMPLE_BAND_METRICS_MAX = 5_000
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS metrics (
@@ -72,15 +73,20 @@ CREATE TABLE IF NOT EXISTS metrics (
 -- can't serve; in SCHEMA since this table is created fresh here.
 CREATE INDEX IF NOT EXISTS ix_metrics_key ON metrics(key);
 
+-- WITHOUT ROWID, and no index on ts: 66.7 -> 23.8 measured bytes per row,
+-- which on the largest table in the product is most of the file. The rowid
+-- and its automatic (metric_id, ts) index were a second copy of the key,
+-- and the ts index a third. What paid for them was compact_rollup's
+-- per-hour aggregate and prune's delete-by-age; both now walk metric-id
+-- bands of the primary key instead, which is a range scan already in the
+-- order the GROUP BY wants. An existing file is rewritten into this shape
+-- by _rewrite_table.
 CREATE TABLE IF NOT EXISTS samples (
     metric_id       INTEGER NOT NULL REFERENCES metrics(id) ON DELETE CASCADE,
     ts              REAL NOT NULL,
     value           REAL,
     PRIMARY KEY (metric_id, ts)
-);
--- The PK leads on metric_id; without this, compact_rollup's per-hour
--- aggregate and prune's delete-by-age scanned the whole (largest) table.
-CREATE INDEX IF NOT EXISTS ix_samples_ts ON samples(ts);
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS samples_hourly (
     metric_id       INTEGER NOT NULL REFERENCES metrics(id) ON DELETE CASCADE,
@@ -107,6 +113,38 @@ LEGACY_LOCK_TARGET_S = 0.15
 _LEGACY_ROWID = "legacy_rollup_rowid"
 _LEGACY_END = "legacy_rollup_end"
 
+# The WITHOUT ROWID rewrite. One band of metric ids per transaction, copied
+# into `<table>_new` and deleted from `<table>` in that same transaction, so
+# the file never holds two copies of the table -- a copy-then-swap would
+# double the largest file in the product, which on an install already living
+# at its size cap is exactly the wrong thing. Bands start narrower than the
+# prune ones because each carries an insert as well as a delete.
+REWRITE_BAND_METRICS = 200
+REWRITE_BAND_MIN = 20
+REWRITE_BAND_MAX = 2_000
+REWRITE_LOCK_TARGET_S = 0.15
+
+# Per table: the key column beside metric_id, the column list to copy, the
+# `_new` table's DDL, and the indexes to recreate after the rename.
+_REWRITE_SPEC = {
+    "samples": (
+        "ts", "metric_id, ts, value",
+        "CREATE TABLE samples_new ("
+        " metric_id INTEGER NOT NULL REFERENCES metrics(id) ON DELETE CASCADE,"
+        " ts REAL NOT NULL, value REAL,"
+        " PRIMARY KEY (metric_id, ts)) WITHOUT ROWID",
+        (),
+    ),
+}
+
+
+def _rewrite_keys(table: str) -> tuple[str, str, str, str]:
+    """The four private settings rows one table's rewrite keeps: its state
+    (""/"rewriting"/"done"), the band cursor, the metric id it ends at, and
+    the freeze point past which rows are left for the final transaction."""
+    return (f"{table}_rewrite_state", f"{table}_rewrite_cursor",
+            f"{table}_rewrite_end", f"{table}_rewrite_freeze")
+
 
 class NodesSeriesDatabase(SqliteStore):
     """metrics / samples / samples_hourly, and nothing else."""
@@ -114,15 +152,20 @@ class NodesSeriesDatabase(SqliteStore):
     SCHEMA = SCHEMA
     DEFAULTS: dict = {}
     LABEL = "nodes_series"
-    # Rollups reach furthest back; raw samples cover the first hour,
-    # before any hour is summarised.
-    OLDEST_TS_SQL = ("SELECT MIN(ts) FROM (SELECT MIN(hour) AS ts FROM"
-                     " samples_hourly UNION ALL SELECT MIN(ts) FROM samples)")
+    # Rollups reach furthest back, so MIN(hour) IS the answer whenever any
+    # hour has been summarised; the raw fallback matters only in the first
+    # hour of a fresh install. Written as a fallback rather than a MIN of
+    # both because `samples` has no index on ts to probe -- taking the MIN
+    # of both would put a full scan of the largest table in the product on
+    # the Settings page's ten-second storage poll.
+    OLDEST_TS_SQL = ("SELECT COALESCE((SELECT MIN(hour) FROM samples_hourly),"
+                     " (SELECT MIN(ts) FROM samples))")
 
     _CAP_MIN_SQLITE = (3, 25, 0)   # window functions
 
     def __init__(self, path: str):
         self._warned_no_window = False
+        self._rewrite_state: dict[str, str] = {}
         super().__init__(path)
 
     def _migrate(self) -> None:
@@ -132,6 +175,8 @@ class NodesSeriesDatabase(SqliteStore):
                                {"scope": "INTEGER NOT NULL DEFAULT 0"}):
             self._conn.execute(
                 "UPDATE metrics SET scope = 1 WHERE key LIKE '%.%'")
+        for table in _REWRITE_SPEC:
+            self._open_rewrite(table)
 
     # ---------------------------------------------------------------- writes
 
@@ -323,7 +368,8 @@ class NodesSeriesDatabase(SqliteStore):
                     # CROSS JOIN disables join reordering: forces small `candidates`
                     # to drive the loop instead of SQLite scanning samples_hourly
                     # from the hour index across unrelated metrics.
-                    f" FROM candidates c CROSS JOIN samples_hourly sh"
+                    f" FROM candidates c CROSS JOIN"
+                    f" {self._union_sql('samples_hourly')} sh"
                     f" ON sh.metric_id = c.metric_id"
                     f" WHERE sh.hour >= ? AND sh.hour <= ? GROUP BY c.metric_id",
                     params).fetchall()
@@ -351,25 +397,28 @@ class NodesSeriesDatabase(SqliteStore):
             if not owner:
                 return []
             if (t1 - t0) <= raw_window_for_scope(owner["scope"]):
+                raw = self._union_sql("samples")
                 if bucket_s and bucket_s > 0:
                     rows = self._conn.execute(
-                        "SELECT (CAST(ts / ? AS INTEGER)) * ? AS bucket_ts,"
-                        " AVG(value) AS avg, MIN(value) AS min, MAX(value) AS max,"
-                        " COUNT(*) AS n FROM samples WHERE metric_id = ?"
-                        " AND ts >= ? AND ts <= ? GROUP BY 1 ORDER BY 1",
+                        f"SELECT (CAST(ts / ? AS INTEGER)) * ? AS bucket_ts,"
+                        f" AVG(value) AS avg, MIN(value) AS min,"
+                        f" MAX(value) AS max, COUNT(*) AS n FROM {raw}"
+                        f" WHERE metric_id = ?"
+                        f" AND ts >= ? AND ts <= ? GROUP BY 1 ORDER BY 1",
                         (bucket_s, bucket_s, metric_id, t0, t1)).fetchall()
                     return [{"ts": row["bucket_ts"], "avg": row["avg"],
                             "min": row["min"], "max": row["max"], "n": row["n"]}
                             for row in rows]
                 rows = self._conn.execute(
-                    "SELECT ts, value FROM samples WHERE metric_id = ?"
-                    " AND ts >= ? AND ts <= ? ORDER BY ts",
+                    f"SELECT ts, value FROM {raw} WHERE metric_id = ?"
+                    f" AND ts >= ? AND ts <= ? ORDER BY ts",
                     (metric_id, t0, t1)).fetchall()
                 return [{"ts": row["ts"], "value": row["value"]} for row in rows]
             rows = self._conn.execute(
-                "SELECT hour, n, vmin, vavg, vmax FROM samples_hourly"
-                " WHERE metric_id = ? AND hour >= ? AND hour <= ? ORDER BY hour",
-                (metric_id, t0, t1)).fetchall()
+                f"SELECT hour, n, vmin, vavg, vmax"
+                f" FROM {self._union_sql('samples_hourly')}"
+                f" WHERE metric_id = ? AND hour >= ? AND hour <= ?"
+                f" ORDER BY hour", (metric_id, t0, t1)).fetchall()
             return [{"ts": row["hour"], "min": row["vmin"], "avg": row["vavg"],
                     "max": row["vmax"], "n": row["n"]} for row in rows]
 
@@ -418,8 +467,12 @@ class NodesSeriesDatabase(SqliteStore):
         watermark = self._private_setting(self._ROLLUP_WATERMARK)
         if watermark is None:
             with self._lock:
+                # Once only, on a store that has never rolled up: a fresh
+                # install's samples table is empty or an hour old, so the
+                # missing ts index costs nothing here.
                 row = self._conn.execute(
-                    "SELECT MIN(ts) AS oldest FROM samples").fetchone()
+                    f"SELECT MIN(ts) AS oldest"
+                    f" FROM {self._union_sql('samples')}").fetchone()
             oldest = row["oldest"] if row else None
             if oldest is None:
                 self._set_private_setting(self._ROLLUP_WATERMARK,
@@ -430,24 +483,35 @@ class NodesSeriesDatabase(SqliteStore):
             hour = int(watermark) - self._ROLLUP_REDO_HOURS * 3600
         written = 0
         processed = 0
+        source = self._union_sql("samples")
         while hour <= latest_complete and processed < max_hours:
-            with self._lock:
-                rows = self._conn.execute(
-                    "SELECT metric_id, COUNT(*) AS n, MIN(value) AS vmin,"
-                    " AVG(value) AS vavg, MAX(value) AS vmax FROM samples"
-                    " WHERE ts >= ? AND ts < ? AND value IS NOT NULL"
-                    " GROUP BY metric_id", (hour, hour + 3600)).fetchall()
-                if rows:
-                    self._conn.executemany(
-                        "INSERT INTO samples_hourly(metric_id, hour, n, vmin,"
-                        " vavg, vmax) VALUES (?,?,?,?,?,?)"
-                        " ON CONFLICT(metric_id, hour) DO UPDATE SET"
-                        " n=excluded.n, vmin=excluded.vmin, vavg=excluded.vavg,"
-                        " vmax=excluded.vmax",
-                        [(row["metric_id"], hour, row["n"], row["vmin"],
-                          row["vavg"], row["vmax"]) for row in rows])
-                    written += len(rows)
-                self._conn.commit()
+            # One statement per metric-id band rather than one per hour over
+            # the whole table: without the ts index the aggregate is a
+            # primary-key range scan, which returns in metric order and so
+            # needs no sort for the GROUP BY. The old plan seeked the ts
+            # index and then sorted a million rowid lookups per hour into
+            # metric order.
+            for low, high in self._metric_bands():
+                with self._lock:
+                    rows = self._conn.execute(
+                        f"SELECT metric_id, COUNT(*) AS n, MIN(value) AS vmin,"
+                        f" AVG(value) AS vavg, MAX(value) AS vmax"
+                        f" FROM {source}"
+                        f" WHERE metric_id >= ? AND metric_id <= ?"
+                        f" AND ts >= ? AND ts < ? AND value IS NOT NULL"
+                        f" GROUP BY metric_id",
+                        (low, high, hour, hour + 3600)).fetchall()
+                    if rows:
+                        self._conn.executemany(
+                            "INSERT INTO samples_hourly(metric_id, hour, n,"
+                            " vmin, vavg, vmax) VALUES (?,?,?,?,?,?)"
+                            " ON CONFLICT(metric_id, hour) DO UPDATE SET"
+                            " n=excluded.n, vmin=excluded.vmin,"
+                            " vavg=excluded.vavg, vmax=excluded.vmax",
+                            [(row["metric_id"], hour, row["n"], row["vmin"],
+                              row["vavg"], row["vmax"]) for row in rows])
+                        written += len(rows)
+                    self._conn.commit()
             hour += 3600
             processed += 1
         self._set_private_setting(self._ROLLUP_WATERMARK, hour)
@@ -479,12 +543,14 @@ class NodesSeriesDatabase(SqliteStore):
         device_id = int(device_id)
         where = "metric_id IN (SELECT id FROM metrics WHERE device_id = ?)"
         removed = 0
-        for table in ("samples", "samples_hourly"):
-            got, done = self._delete_by_rowid(table, where, (device_id,), deadline,
-                                              pause=self.PURGE_PAUSE_S)
-            removed += got
-            if not done:
-                return removed, False
+        for base in ("samples", "samples_hourly"):
+            for table in self._live_tables(base):
+                got, done = self._delete_by_band(
+                    table, where, (device_id,), deadline,
+                    pause=self.PURGE_PAUSE_S)
+                removed += got
+                if not done:
+                    return removed, False
         with self._lock:
             cursor = self._conn.execute(
                 "DELETE FROM metrics WHERE device_id = ?", (device_id,))
@@ -520,23 +586,28 @@ class NodesSeriesDatabase(SqliteStore):
             metric_ids = [row["id"] for row in
                           self._conn.execute("SELECT id FROM metrics").fetchall()]
         removed = 0
-        for batch in id_chunks(metric_ids, max(1, chunk)):
-            marks = ",".join("?" * len(batch))
-            with self._lock:
-                cursor = self._conn.execute(
-                    f"DELETE FROM samples WHERE rowid IN ("
-                    f" SELECT rowid FROM ("
-                    f"  SELECT rowid, ROW_NUMBER() OVER ("
-                    f"   PARTITION BY metric_id ORDER BY ts DESC) AS rn"
-                    f"  FROM samples WHERE metric_id IN ({marks})"
-                    f" ) WHERE rn > ?)", (*batch, int(n)))
-                removed += cursor.rowcount or 0
-                self._conn.commit()
+        for table in self._live_tables("samples"):
+            for batch in id_chunks(metric_ids, max(1, chunk)):
+                marks = ",".join("?" * len(batch))
+                with self._lock:
+                    # The row value (metric_id, ts) in place of the rowid
+                    # this table no longer has -- the same key the window
+                    # function is already partitioned by. Row values need
+                    # SQLite 3.15, well under the 3.25 the window needs.
+                    cursor = self._conn.execute(
+                        f"DELETE FROM {table} WHERE (metric_id, ts) IN ("
+                        f" SELECT metric_id, ts FROM ("
+                        f"  SELECT metric_id, ts, ROW_NUMBER() OVER ("
+                        f"   PARTITION BY metric_id ORDER BY ts DESC) AS rn"
+                        f"  FROM {table} WHERE metric_id IN ({marks})"
+                        f" ) WHERE rn > ?)", (*batch, int(n)))
+                    removed += cursor.rowcount or 0
+                    self._conn.commit()
         return removed
 
-    def _prune_by_rowid(self, table: str, where: str, params,
-                        interface_only: bool = False) -> int:
-        """A by-age DELETE cut into lock-bounded batches by rowid.
+    def _prune_by_band(self, table: str, where: str, params,
+                       interface_only: bool = False) -> int:
+        """A by-age DELETE cut into lock-bounded batches by metric-id band.
 
         `samples` is the largest table in the product and this store guards
         one connection with one lock, so an unbatched sweep -- and above all
@@ -544,48 +615,60 @@ class NodesSeriesDatabase(SqliteStore):
         issues on the request thread -- held it for the whole delete, which
         is every chart read and every record_poll write queued behind it.
 
-        Chunked by rowid because neither table has an id of its own; every
-        batch still carries `where`, so the range decides only how the sweep
-        is cut up and never which rows go. The range is wide: rowids are
+        Chunked by metric_id, the leading column of both tables' primary
+        keys, because neither has a rowid any more; every batch still
+        carries `where`, so the band decides only how the sweep is cut up
+        and never which rows go. It replaces a rowid band that spanned every
+        metric in the fleet however narrow it was, because rowids were
         handed out in arrival order while the cutoff is on the row's own
-        timestamp, and a device with a wrong clock puts the two out of step.
-        Wide but cheap -- a batch that finds nothing is an index probe.
+        timestamp. A band is a contiguous primary-key range, so a batch that
+        finds nothing is one index probe.
         """
-        removed, _ = self._delete_by_rowid(table, where, params, float("inf"),
+        removed, _ = self._delete_by_band(table, where, params, float("inf"),
                                           interface_only=interface_only)
         return removed
 
-    def _delete_by_rowid(self, table: str, where: str, params, deadline: float,
-                         pause: float = 0.0,
-                         interface_only: bool = False) -> tuple[int, bool]:
-        """_prune_by_rowid's body with a deadline: (rows removed, finished).
+    def _delete_by_band(self, table: str, where: str, params, deadline: float,
+                        pause: float = 0.0,
+                        interface_only: bool = False) -> tuple[int, bool]:
+        """_prune_by_band's body with a deadline: (rows removed, finished).
 
-        `interface_only` narrows every statement -- the bounds probe and
-        each batch alike -- to the per-port class, through `where` rather
-        than the rowid band so the batching is unchanged.
+        `interface_only` narrows to the per-port class as a test on the
+        band itself: the metric ids it lists are bounded by the band, so it
+        is a short index range rather than the fleet-wide semijoin an
+        unbounded `metric_id IN (SELECT ...)` would run per candidate row.
         """
+        scope_clause = ""
         if interface_only:
-            where = (f"({where}) AND metric_id IN (SELECT id FROM metrics"
+            scope_clause = (f" AND metric_id IN (SELECT id FROM metrics"
+                            f" WHERE scope = {SCOPE_INTERFACE}"
+                            f" AND id >= ? AND id < ?)")
+        probe = where
+        if interface_only:
+            probe = (f"({where}) AND metric_id IN (SELECT id FROM metrics"
                      f" WHERE scope = {SCOPE_INTERFACE})")
         with self._lock:
             bounds = self._conn.execute(
-                f"SELECT MIN(rowid) AS lo, MAX(rowid) AS hi FROM {table}"
-                f" WHERE {where}", params).fetchone()
+                f"SELECT MIN(metric_id) AS lo, MAX(metric_id) AS hi"
+                f" FROM {table} WHERE {probe}", params).fetchone()
         low = bounds["lo"]
         if low is None:
             return 0, True
         cut = bounds["hi"] + 1
 
         def delete(low_id: int, upper: int) -> int:
+            args = [low_id, upper, *params]
+            if interface_only:
+                args += [low_id, upper]
             cursor = self._conn.execute(
-                f"DELETE FROM {table} WHERE rowid >= ? AND rowid < ?"
-                f" AND {where}", (low_id, upper, *params))
+                f"DELETE FROM {table} WHERE metric_id >= ? AND metric_id < ?"
+                f" AND {where}{scope_clause}", args)
             return cursor.rowcount or 0
 
         removed, reached = self._delete_batches(
-            low, cut, deadline, delete, chunk=SAMPLE_PRUNE_CHUNK,
-            chunk_min=SAMPLE_PRUNE_CHUNK_MIN, chunk_max=SAMPLE_PRUNE_CHUNK_MAX,
-            pause=pause)
+            low, cut, deadline, delete, chunk=SAMPLE_BAND_METRICS,
+            chunk_min=SAMPLE_BAND_METRICS_MIN,
+            chunk_max=SAMPLE_BAND_METRICS_MAX, pause=pause)
         return removed, reached >= cut
 
     def prune(self, *, sample_days: float = 3, rollup_days: float = 400,
@@ -604,18 +687,20 @@ class NodesSeriesDatabase(SqliteStore):
         """
         removed = 0
         now = time.time()
-        removed += self._prune_by_rowid(
-            "samples", "ts < ?", (now - sample_days * 86400,))
-        removed += self._prune_by_rowid(
-            "samples", "ts < ?", (now - interface_sample_days * 86400,),
-            interface_only=True)
+        for table in self._live_tables("samples"):
+            removed += self._prune_by_band(
+                table, "ts < ?", (now - sample_days * 86400,))
+            removed += self._prune_by_band(
+                table, "ts < ?", (now - interface_sample_days * 86400,),
+                interface_only=True)
         # The hourly rollups are the long history now, so they are
         # bounded by their own retention rather than kept forever.
-        removed += self._prune_by_rowid(
-            "samples_hourly", "hour < ?", (now - rollup_days * 86400,))
-        removed += self._prune_by_rowid(
-            "samples_hourly", "hour < ?",
-            (now - interface_rollup_days * 86400,), interface_only=True)
+        for table in self._live_tables("samples_hourly"):
+            removed += self._prune_by_band(
+                table, "hour < ?", (now - rollup_days * 86400,))
+            removed += self._prune_by_band(
+                table, "hour < ?",
+                (now - interface_rollup_days * 86400,), interface_only=True)
         removed += self.cap_samples_per_metric(max_samples_per_metric)
         if removed:
             # Freed pages go back in short steps with the lock released
@@ -674,30 +759,270 @@ class NodesSeriesDatabase(SqliteStore):
                 break
             if deadline is not None and time.monotonic() >= deadline:
                 break
-            shrank = False
-            for table, column, floor in (
-                    ("samples_hourly", "hour", hourly_floor),
-                    ("samples", "ts", sample_floor)):
-                with self._lock:
-                    total = self._conn.execute(
-                        f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
-                    if total <= floor:
-                        continue
-                    chunk = min(total - floor, max(int(total * 0.15), floor))
-                    cursor = self._conn.execute(
-                        f"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM"
-                        f" {table} ORDER BY {column} ASC LIMIT ?)", (chunk,))
-                    removed += cursor.rowcount or 0
-                    shrank = shrank or bool(cursor.rowcount)
-                    self._conn.commit()
-                if shrank:
-                    break   # raw gives only once the rollups are at their floor
+            # Raw gives only once the rollups are at their floor.
+            gave = self._trim_hourly(hourly_floor)
+            if not gave:
+                gave = self._trim_raw(sample_floor)
+            removed += gave
             reclaim(self._conn, self._lock, label=self.LABEL)
             # Neither table can give anything up; another pass would only
             # re-measure and reclaim what's already reclaimed.
-            if not shrank:
+            if not gave:
                 break
         return removed
+
+    def _trim_hourly(self, floor: int) -> int:
+        """The oldest hours, by the hour index, in one statement per pass.
+        The row value (metric_id, hour) stands in for the rowid the table
+        no longer has; it is the primary key, so the delete is a key
+        lookup per row rather than the index seek plus rowid fetch it was."""
+        removed = 0
+        for table in self._live_tables("samples_hourly"):
+            with self._lock:
+                total = self._conn.execute(
+                    f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+                if total <= floor:
+                    continue
+                chunk = min(total - floor, max(int(total * 0.15), floor))
+                cursor = self._conn.execute(
+                    f"DELETE FROM {table} WHERE (metric_id, hour) IN ("
+                    f" SELECT metric_id, hour FROM {table}"
+                    f" ORDER BY hour ASC LIMIT ?)", (chunk,))
+                removed += cursor.rowcount or 0
+                self._conn.commit()
+        return removed
+
+    def _trim_raw(self, floor: int) -> int:
+        """Each metric's oldest raw samples, evenly, down to `floor` rows in
+        total.
+
+        Not "the globally oldest rows" any more: `samples` has no index on
+        ts, so `ORDER BY ts ASC LIMIT n` over it would be a full scan of the
+        largest table in the product feeding a sorter holding 15% of it.
+        Capping every metric to the same depth is the same amount of history
+        given up, walks the primary key in order, and sheds it evenly rather
+        than emptying whichever metric happens to hold the oldest row.
+        """
+        total = 0
+        for table in self._live_tables("samples"):
+            with self._lock:
+                total += self._conn.execute(
+                    f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
+        if total <= floor:
+            return 0
+        metrics = max(1, self._metric_count())
+        want = min(total - floor, max(int(total * 0.15), floor))
+        # Rounded up, so the survivors land on or above the floor rather
+        # than integer division taking the store just under it.
+        keep = max(1, -(-(total - want) // metrics))
+        return self.cap_samples_per_metric(keep)
+
+    # --------------------------------------------- the WITHOUT ROWID rewrite
+
+    def _open_rewrite(self, table: str) -> None:
+        """Decide at open what this table's rewrite still owes, and cache it.
+
+        Cached because every delete path asks -- a settings read per band
+        per statement would cost more than the rewrite does.
+        """
+        state_key, cursor_key, end_key, freeze_key = _rewrite_keys(table)
+        _key, _columns, ddl, _indexes = _REWRITE_SPEC[table]
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table,)).fetchone()
+        if row is None:
+            return
+        if "WITHOUT ROWID" in (row["sql"] or "").upper():
+            # Created fresh in the new shape, or a rewrite that finished.
+            self._rewrite_state[table] = ""
+            return
+        state = self._private_setting(state_key, "") or ""
+        have_new = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table + "_new",)).fetchone() is not None
+        # A state of "rewriting" with no `_new` table beside it is not
+        # resumable: start over rather than fail every band.
+        if state != "rewriting" or not have_new:
+            self._conn.execute(f"DROP TABLE IF EXISTS {table}_new")
+            self._conn.execute(ddl)
+            bounds = self._conn.execute(
+                f"SELECT MAX(metric_id) AS hi FROM {table}").fetchone()
+            self._set_private_setting(cursor_key, 0, commit=False)
+            self._set_private_setting(end_key, int((bounds["hi"] or 0)) + 1,
+                                      commit=False)
+            # Rows past the freeze are the live tail the poller is still
+            # writing; they are caught up inside the rename transaction.
+            self._set_private_setting(freeze_key, time.time(), commit=False)
+            self._set_private_setting(state_key, "rewriting", commit=False)
+            log.info("nodes_series: %s is the old rowid shape; rewriting it "
+                     "WITHOUT ROWID in metric-id bands", table)
+        self._rewrite_state[table] = "rewriting"
+
+    def _rewriting(self, table: str) -> bool:
+        return self._rewrite_state.get(table) == "rewriting"
+
+    def _live_tables(self, table: str) -> tuple[str, ...]:
+        """`table`, plus the half-written `_new` beside it while a rewrite is
+        in flight. Every delete path iterates this: a prune that skipped the
+        new table would leave rows no retention setting could reach until the
+        rename, and "delete every stored sample" would not."""
+        return (table, table + "_new") if self._rewriting(table) else (table,)
+
+    def _union_sql(self, table: str) -> str:
+        """A FROM-clause source covering both halves of a split table.
+
+        The bands are disjoint by construction -- new holds the copied
+        bands, old the rest plus the live tail -- but a writer can put a key
+        back in the old table after its band has passed (compact_rollup
+        rewriting an hour, a re-poll of the same timestamp). The old table
+        holds the fresher row in that case and wins, so the new half
+        contributes only keys the old one does not have: a primary-key probe
+        per row, for the minutes a rewrite runs. Same merge-while-migrating
+        shape nodesdb.series already uses for the legacy rollups.
+        """
+        if not self._rewriting(table):
+            return table
+        key, columns, _ddl, _indexes = _REWRITE_SPEC[table]
+        return (f"(SELECT {columns} FROM {table} UNION ALL"
+                f" SELECT {columns} FROM {table}_new n WHERE NOT EXISTS ("
+                f" SELECT 1 FROM {table} o WHERE o.metric_id = n.metric_id"
+                f" AND o.{key} = n.{key}))")
+
+    def _metric_bands(self, width: int | None = None):
+        """Contiguous (low, high) metric-id ranges covering every metric,
+        `width` ids at a time -- the unit compact_rollup walks the primary
+        key in now that there is no index on ts to seek instead."""
+        with self._lock:
+            ids = [row[0] for row in self._conn.execute(
+                "SELECT id FROM metrics ORDER BY id").fetchall()]
+        for chunk in id_chunks(ids, self._IDS_PER_QUERY if width is None
+                               else max(1, int(width))):
+            yield chunk[0], chunk[-1]
+
+    def rewrite_pending(self) -> bool:
+        """Whether any table still owes a rewrite. False on a fresh install
+        and on every ordinary start after the first."""
+        return any(self._rewriting(table) for table in _REWRITE_SPEC)
+
+    def rewrite_progress(self) -> dict:
+        """{table: (cursor, end)} for the tables mid-rewrite, for the
+        storage report's note."""
+        out = {}
+        for table in _REWRITE_SPEC:
+            if not self._rewriting(table):
+                continue
+            _state, cursor_key, end_key, _freeze = _rewrite_keys(table)
+            out[table] = (int(self._private_setting(cursor_key, 0) or 0),
+                          int(self._private_setting(end_key, 0) or 0))
+        return out
+
+    def continue_rewrite(self, stop=None, log_add=None) -> bool:
+        """Rewrite whatever is still owed, one table at a time, returning
+        True once nothing is. Stops cleanly on `stop` between bands with the
+        cursor persisted, so the next start resumes rather than repeats."""
+        for table in _REWRITE_SPEC:
+            if not self._rewriting(table):
+                continue
+            started = time.monotonic()
+            if not self._rewrite_table(table, stop=stop):
+                return False
+            if log_add is not None:
+                log_add(f"Nodes: rewrote {table} into its smaller "
+                        f"WITHOUT ROWID form "
+                        f"({time.monotonic() - started:.0f} s)")
+        return True
+
+    def _rewrite_table(self, table: str, *, stop=None,
+                       band: int | None = None) -> bool:
+        """Copy-and-delete `table` into `<table>_new` band by band, then
+        rename. Returns False when `stop` interrupted it."""
+        key, columns, _ddl, _indexes = _REWRITE_SPEC[table]
+        _state_key, cursor_key, end_key, freeze_key = _rewrite_keys(table)
+        cursor = int(self._private_setting(cursor_key, 0) or 0)
+        end = int(self._private_setting(end_key, 0) or 0)
+        freeze = float(self._private_setting(freeze_key, 0) or 0)
+        width = REWRITE_BAND_METRICS if band is None else int(band)
+        while cursor < end:
+            if stop is not None and stop.is_set():
+                return False
+            upper = min(cursor + width, end)
+            started = time.monotonic()
+            # Per band, not around the loop: the rewrite runs for minutes on
+            # a real file and polling, charts and alerting all want this
+            # connection meanwhile.
+            with self._lock:
+                self._conn.execute(
+                    f"INSERT OR REPLACE INTO {table}_new({columns})"
+                    f" SELECT {columns} FROM {table}"
+                    f" WHERE metric_id >= ? AND metric_id < ? AND {key} < ?",
+                    (cursor, upper, freeze))
+                self._conn.execute(
+                    f"DELETE FROM {table} WHERE metric_id >= ?"
+                    f" AND metric_id < ? AND {key} < ?",
+                    (cursor, upper, freeze))
+                self._set_private_setting(cursor_key, upper, commit=False)
+                self._conn.commit()
+            held = time.monotonic() - started
+            cursor = upper
+            if held > REWRITE_LOCK_TARGET_S:
+                width = max(REWRITE_BAND_MIN, width // 2)
+            elif held < REWRITE_LOCK_TARGET_S / 4:
+                width = min(REWRITE_BAND_MAX, width * 2)
+        return self._finish_rewrite(table)
+
+    def _finish_rewrite(self, table: str) -> bool:
+        """The last transaction: catch up the live tail, verify no key was
+        left behind, drop, rename, rebuild the indexes."""
+        key, columns, _ddl, indexes = _REWRITE_SPEC[table]
+        state_key, cursor_key, end_key, freeze_key = _rewrite_keys(table)
+        with self._lock:
+            # A pragma is a no-op mid-transaction, and a read may hold one.
+            self._conn.commit()
+            self._conn.execute("PRAGMA foreign_keys=OFF")
+            self._conn.execute("PRAGMA legacy_alter_table=ON")
+            try:
+                self._conn.execute(
+                    f"INSERT OR REPLACE INTO {table}_new({columns})"
+                    f" SELECT {columns} FROM {table}")
+                left = self._conn.execute(
+                    f"SELECT COUNT(*) FROM {table} o WHERE NOT EXISTS ("
+                    f" SELECT 1 FROM {table}_new n WHERE n.metric_id ="
+                    f" o.metric_id AND n.{key} = o.{key})").fetchone()[0]
+                before = self._conn.execute(
+                    f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                after = self._conn.execute(
+                    f"SELECT COUNT(*) FROM {table}_new").fetchone()[0]
+                if left or after < before:
+                    self._conn.rollback()
+                    log.error("nodes_series: %s rewrite left %d of %d rows "
+                              "uncopied (%d in the new table); keeping the "
+                              "old table and retrying on the next start",
+                              table, left, before, after)
+                    return False
+                self._conn.execute(f"DROP TABLE {table}")
+                self._conn.execute(
+                    f"ALTER TABLE {table}_new RENAME TO {table}")
+                for ddl in indexes:
+                    self._conn.execute(ddl)
+                self._conn.commit()
+            finally:
+                self._conn.execute("PRAGMA legacy_alter_table=OFF")
+                self._conn.execute("PRAGMA foreign_keys=ON")
+        self._rewrite_state[table] = "done"
+        self._set_private_setting(state_key, "done", commit=False)
+        for stale in (cursor_key, end_key, freeze_key):
+            self._clear_private_setting(stale, commit=False)
+        self._set_private_setting(state_key, "done")
+        log.info("nodes_series: %s is now WITHOUT ROWID (%d rows)",
+                 table, after)
+        reclaim(self._conn, self._lock, label=self.LABEL)
+        return True
+
+    def rewrite_now(self, band: int | None = None) -> bool:
+        """The whole rewrite, synchronously. For tests, the demo seeder, and
+        any caller that would rather wait than have the old table linger."""
+        return all(self._rewrite_table(table, band=band)
+                   for table in list(_REWRITE_SPEC) if self._rewriting(table))
 
     # ------------------------------------------------------------- migration
 

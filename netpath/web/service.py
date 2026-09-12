@@ -704,14 +704,31 @@ class Service:
         self.log.add(SYSTEM, "Service started")
 
     def _start_nodes_split(self) -> None:
-        """Phase 2 of the 5.0.0 nodes.db split, on its own thread: the
-        hourly rollups can be hundreds of megabytes and nothing, least of
-        all the web server, should wait on them."""
-        if not self.nodes_db.split_pending():
+        """Phase 2 of the 5.0.0 nodes.db split and, after it, the series
+        store's WITHOUT ROWID rewrite -- on one thread: the hourly rollups
+        can be hundreds of megabytes and nothing, least of all the web
+        server, should wait on them.
+
+        One thread rather than two because both phases rewrite
+        nodes_series.db and must not overlap: the rewrite moving
+        samples_hourly out from under import_legacy_rollups' cursor would
+        be a race with data in it. The existing thread already carries the
+        lifecycle both want -- self._stop as the between-batches stop
+        signal, and a join in shutdown() before the stores close -- so the
+        only change is the gate, which now opens for either phase.
+        """
+        split = self.nodes_db.split_pending()
+        rewrite = self.nodes_db.series_db.rewrite_pending()
+        if not (split or rewrite):
             return
-        self.log.add(SYSTEM, "Nodes: moving the metric history into "
-                             "nodes_series.db in the background. Charts and "
-                             "polling work throughout.")
+        if split:
+            self.log.add(SYSTEM, "Nodes: moving the metric history into "
+                                 "nodes_series.db in the background. Charts "
+                                 "and polling work throughout.")
+        if rewrite:
+            self.log.add(SYSTEM, "Nodes: rewriting the metric history into a "
+                                 "smaller on-disk form in the background. "
+                                 "Charts and polling work throughout.")
         min_hour = time.time() - float(
             self.nodes_settings.get("rollup_retention_days", 400)) * 86400
         self._nodes_split_thread = threading.Thread(
@@ -727,6 +744,15 @@ class Service:
         except Exception as exc:                              # noqa: BLE001
             self.log.add(SYSTEM, f"Nodes: the background history move failed "
                                  f"({exc}); it retries on the next start.")
+        if self._stop.is_set():
+            return
+        try:
+            self.nodes_db.series_db.continue_rewrite(
+                self._stop, lambda text: self.log.add(SYSTEM, text))
+        except Exception as exc:                              # noqa: BLE001
+            self.log.add(SYSTEM, f"Nodes: the background history rewrite "
+                                 f"failed ({exc}); it retries on the next "
+                                 f"start.")
 
     # Every subsystem shutdown() brings down, in the order its waits must
     # happen. Signalling order does not matter — nothing in a begin_stop()

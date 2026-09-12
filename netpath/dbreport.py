@@ -59,8 +59,10 @@ STORE_FILENAMES = {
 #
 # The live install corroborates the first two: its own nodes_series.db is
 # 4030 pages over 229,018 samples and 14,709 metrics, about 65 B/sample.
+# Re-measured for the WITHOUT ROWID shape: samples 66.2 -> 23.8, having lost
+# the rowid, its automatic (metric_id, ts) index and the index on ts.
 BYTES_PER_ROW = {
-    "samples": 66.7,
+    "samples": 23.8,
     "samples_hourly": 66.3,
     "mac_entries": 139.4,
     "arp_entries": 157.1,
@@ -118,6 +120,32 @@ def _measured(conn: sqlite3.Connection) -> dict[str, int] | None:
     return out
 
 
+# nodesseriesdb writes these while it rewrites a table into its WITHOUT
+# ROWID shape, band of metric ids at a time. Surfaced in the note because a
+# store mid-rewrite holds two half-tables, which is otherwise an operator
+# looking at a `samples_new` line and a row count that does not match
+# retention with nothing telling them why.
+_REWRITE_TABLES = ("samples", "samples_hourly")
+
+
+def _rewrite_note(conn: sqlite3.Connection) -> str:
+    try:
+        rows = dict(conn.execute(
+            "SELECT key, value FROM settings WHERE key LIKE '%\\_rewrite\\_%'"
+            " ESCAPE '\\'").fetchall())
+    except sqlite3.Error:
+        return ""
+    notes = []
+    for table in _REWRITE_TABLES:
+        if rows.get(f"{table}_rewrite_state", "") != '"rewriting"':
+            continue
+        cursor = rows.get(f"{table}_rewrite_cursor", "0")
+        end = rows.get(f"{table}_rewrite_end", "0")
+        notes.append(f"{table}: rewriting WITHOUT ROWID, band at metric id "
+                     f"{cursor} of {end}")
+    return "; ".join(notes)
+
+
 def _file_bytes(path: str) -> int:
     total = 0
     for suffix in ("", "-wal", "-shm"):
@@ -159,10 +187,15 @@ def _report_store(name: str, path: str) -> dict:
             if exact is not None:
                 size = exact.get(table, 0)
             else:
-                size = int(rows * BYTES_PER_ROW.get(
-                    table, DEFAULT_BYTES_PER_ROW))
+                # A `<table>_new` mid-rewrite costs what its finished form
+                # will, not the unmeasured default.
+                measured = BYTES_PER_ROW.get(
+                    table[:-4] if table.endswith("_new") else table,
+                    DEFAULT_BYTES_PER_ROW)
+                size = int(rows * measured)
             tables.append({"name": table, "type": "table", "rows": rows,
                            "bytes": size})
+        note = "; ".join(filter(None, [note, _rewrite_note(conn)]))
     finally:
         conn.close()
     tables.sort(key=lambda row: (-row["bytes"], row["name"]))

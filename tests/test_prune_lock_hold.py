@@ -503,7 +503,7 @@ print("\nnodesseriesdb.prune ages out raw samples and rollups in batches")
 
 now = time.time()
 series_db = NodesSeriesDatabase(os.path.join(TMPDIR, "nodes_series.db"))
-SAMPLE_ROWS = max(600_000, nodesseriesdb_module.SAMPLE_PRUNE_CHUNK * 30)
+SAMPLE_ROWS = max(600_000, nodesseriesdb_module.SAMPLE_BAND_METRICS * 1_200)
 SAMPLE_DAYS = 3.0
 METRICS = 5_000
 with series_db._lock:
@@ -514,25 +514,33 @@ with series_db._lock:
     series_db._conn.commit()
     metric_ids = [row[0] for row in
                   series_db._conn.execute("SELECT id FROM metrics ORDER BY id")]
-    # metric_id cycles, so a contiguous rowid batch spans every metric —
-    # the layout that makes the chunk size matter here (see
-    # SAMPLE_PRUNE_CHUNK).
+    # metric_id cycles and ts ascends, so every metric's rows are spread
+    # over the whole window — the layout that makes the band width matter
+    # here (see SAMPLE_BAND_METRICS), and the one the old rowid band could
+    # not cut up at all, since a contiguous rowid batch spanned every metric
+    # in the fixture whatever its size.
     series_db._conn.executemany(
         "INSERT INTO samples(metric_id, ts, value) VALUES (?,?,?)",
         [(metric_ids[i % METRICS], ts, float(i))
          for i, ts in enumerate(spread(SAMPLE_ROWS, SAMPLE_DAYS, now))])
     series_db._conn.commit()
 
-expected = surviving(series_db, "SELECT rowid FROM samples WHERE ts > %r"
+expected = surviving(series_db, "SELECT metric_id || ':' || ts FROM samples WHERE ts > %r"
                                 % (now - SAMPLE_DAYS * DAY,))
 assert len(expected) == SAMPLE_ROWS - SAMPLE_ROWS // 2, len(expected)
 measure("samples", series_db,
         lambda: without_reclaim(nodesseriesdb_module, lambda: series_db.prune(
             sample_days=SAMPLE_DAYS, rollup_days=400)),
-        "SELECT rowid FROM samples", expected)
+        "SELECT metric_id || ':' || ts FROM samples", expected)
 
-# The hourly rollups are the second table the same sweep ages out.
-ROLLUP_ROWS = 200_000
+# The hourly rollups are the second table the same sweep ages out. Sized
+# like SAMPLE_ROWS rather than at the 200,000 it was: a metric-id band
+# deletes only the rows of the metrics it names, where the rowid band it
+# replaced touched every leaf page of the primary key per batch, so the old
+# figure now finishes in under 200 ms -- and on a sweep that short "nine
+# holds in ten are under half of it" is nobody's property, the same reason
+# the reader ratio is skipped below.
+ROLLUP_ROWS = 600_000
 ROLLUP_DAYS = 400.0
 with series_db._lock:
     series_db._conn.executemany(
@@ -541,19 +549,20 @@ with series_db._lock:
         [(metric_ids[i % METRICS], int(hour))
          for i, hour in enumerate(spread(ROLLUP_ROWS, ROLLUP_DAYS, now))])
     series_db._conn.commit()
-expected = surviving(series_db, "SELECT rowid FROM samples_hourly WHERE hour > %r"
+expected = surviving(series_db, "SELECT metric_id || ':' || hour FROM samples_hourly WHERE hour > %r"
                                 % (now - ROLLUP_DAYS * DAY,))
 measure("samples_hourly", series_db,
         lambda: without_reclaim(nodesseriesdb_module, lambda: series_db.prune(
             sample_days=SAMPLE_DAYS, rollup_days=ROLLUP_DAYS)),
-        "SELECT rowid FROM samples_hourly", expected, reader_ratio=None)
+        "SELECT metric_id || ':' || hour FROM samples_hourly", expected, reader_ratio=None)
 
 # "Delete all stored samples" from the Settings maintenance panel.
 measure("samples, delete-everything", series_db,
         lambda: without_reclaim(nodesseriesdb_module, lambda: series_db.prune(
             sample_days=0, rollup_days=0)),
-        "SELECT rowid FROM samples", set(), reader_ratio=None)
-assert surviving(series_db, "SELECT rowid FROM samples_hourly") == set()
+        "SELECT metric_id || ':' || ts FROM samples", set(), reader_ratio=None)
+assert surviving(series_db,
+                 "SELECT metric_id || ':' || hour FROM samples_hourly") == set()
 ok("a retention of 0 still empties both tables, as the button promises")
 series_db.close()
 
