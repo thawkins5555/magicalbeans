@@ -170,26 +170,20 @@ configrx.close()
 
 # ------------------------------------------- configrx.db's two search readers
 #
-# delete_backups and prune above are writers the store builds its own id list
-# for. These two take theirs straight from the request (`?device=1,2,3` ->
-# api._id_list -> configrx_compliance.search), which is the list nothing
-# bounds: they were the last `",".join("?" * len(device_ids))` left in the
-# file.
+# delete_backups and prune above build their own id lists. These two take
+# theirs straight from the request (`?device=1,2,3`), which nothing bounds.
 
 search_db = ConfigRxDatabase(os.path.join(TMP, "configrx_search.db"))
 DEVICES = list(range(1, 11))
 for device_id in DEVICES:
-    # replace_search_lines, not add_backup: the search index is written by
-    # the indexer, and these two readers only ever see what is in it.
+    # replace_search_lines, not add_backup: these two readers see the index.
     search_db.replace_search_lines(
         device_id,
         f"hostname sw-{device_id}\n"
         f"ntp server 10.0.0.{device_id}\n"
         f"snmp-server community public\n")
 
-# The rows one unchunked statement returns, to compare every chunked answer
-# against. Taken with the real chunk size (500), which is one statement for
-# ten ids.
+# What one unchunked statement returns, to compare the chunked answers with.
 whole_scan = [tuple(r) for r in search_db.all_search_lines(DEVICES)]
 check("the fixture indexed every device's lines",
       len({r[0] for r in whole_scan}) == len(DEVICES),
@@ -230,8 +224,7 @@ if search_db.search_fts:
           sorted(chunked_fts) == sorted(whole_fts),
           (len(chunked_fts), len(whole_fts)))
 
-    # The LIMIT is the caller's total, not a per-chunk allowance: four
-    # chunks of three devices must not return four times the limit.
+    # The LIMIT is the caller's total, not a per-chunk allowance.
     with tiny_chunks(configrxdb_module) as spy:
         capped = search_db.search_fts_match(fts_query, DEVICES, 4)
     check("the limit still caps the whole answer, not each chunk",

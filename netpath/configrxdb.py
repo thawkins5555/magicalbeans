@@ -712,10 +712,8 @@ class ConfigRxDatabase(SqliteStore):
             if not device_ids:
                 return self._conn.execute(
                     sql.format(where=""), (fts_query, limit)).fetchall()
-            # The id list comes from a caller (`?device=1,2,3`), so it is
-            # chunked like every other IN this application builds: one
-            # statement binds at most 999 parameters on a pre-3.32 SQLite.
-            # `limit` is the total across chunks, not per chunk.
+            # A caller's list (`?device=1,2,3`), so chunked like every
+            # other IN here. `limit` is the total, not per chunk.
             rows: list[sqlite3.Row] = []
             for chunk in id_chunks(device_ids):
                 marks = ",".join("?" * len(chunk))
@@ -739,9 +737,8 @@ class ConfigRxDatabase(SqliteStore):
             if not device_ids:
                 return self._conn.execute(sql.format(where=""), ()).fetchall()
             rows: list[sqlite3.Row] = []
-            # Chunked for search_fts_match's reason, and the ids sorted first
-            # so the chunks arrive in the same device order one statement
-            # would have produced -- the caller groups on that order.
+            # Chunked for search_fts_match's reason; sorted so the chunks
+            # arrive in the device order the caller groups on.
             for chunk in id_chunks(sorted(set(device_ids))):
                 marks = ",".join("?" * len(chunk))
                 rows.extend(self._conn.execute(

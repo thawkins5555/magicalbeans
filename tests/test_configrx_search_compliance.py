@@ -479,15 +479,9 @@ check("finishes in a small fraction of the budget",
 
 # ------------------------------- a FIXED inner repeat is not "already repeating"
 #
-# The bounded-outer fix above left the other half of the same confusion in
-# place: _has_nested_repetition marked a group ambiguous for ANY quantifier
-# inside it, fixed `{2}` included, so three of the four patterns anyone
-# actually writes for a network address were refused outright while the
-# dotted quad -- and compile_bounded's own refusal text, which promises "a
-# group repeated a small FIXED number of times is fine" -- said they were
-# allowed. A group is ambiguous only when two neighbouring repeats of it can
-# trade characters: it holds an alternation, or its LAST element repeats a
-# varying number of times.
+# ANY quantifier inside a group marked it ambiguous, fixed `{2}` included, so
+# three of the four patterns anyone writes for a network address were refused
+# while the refusal text itself promised they were fine.
 
 print("the address idioms a compliance rule is actually written with are accepted")
 REAL_WORLD = {
@@ -506,10 +500,8 @@ for label, pattern in REAL_WORLD.items():
     except cs.UnsafeRegex as exc:
         check(f"{label}: should not have been refused", False, str(exc))
 
-# Accepted, and worth proving they are accepted for the right reason: each
-# one run against the worst 250-character line it can be handed (the per-line
-# cap) finishes in microseconds, not the seconds a real nested repetition
-# takes. If the heuristic is ever loosened further, this is what catches it.
+# And for the right reason: microseconds against the worst 250-character line
+# each can be handed, not the seconds a real nested repetition takes.
 WORST_LINES = ("1." * 125, "1" * 250, "a" * 250, "ab" * 125, "a." * 125,
                "0a:" * 83 + "0a")
 for label, pattern in REAL_WORLD.items():
@@ -533,11 +525,8 @@ for still_unsafe in (r"(a+){1,100}b", r"(\d{1,3}){3,}", r"(\s*\w+)+b",
 
 # ------------------------- a rule that cannot be compiled fails WITH a reason
 #
-# evaluate_device fails such a rule CLOSED, which is right -- but it used to
-# append only {rule_id, description}, indistinguishable from the device
-# genuinely not matching. Every device in the rule set flipped to "fail" with
-# the rule's own description as the only explanation, and nothing said the
-# rule had never been run at all.
+# Failing it CLOSED is right; appending only {rule_id, description} is not --
+# every device flipped to "fail" with nothing saying the rule had never run.
 
 print("a stored rule compile_bounded refuses fails closed AND says why")
 reason_db = ConfigRxDatabase(os.path.join(TMPDIR, "reason.db"))
@@ -547,8 +536,8 @@ reason_db.add_backup(1, "hostname sw1\nntp server 10.0.0.1\n")
 reason_set = cc.add_rule_set(reason_db, "Refused-rule set")
 good_rule = cc.add_rule(reason_db, reason_set, "NTP is configured",
                         cc.RuleKind.MUST_MATCH, r"^ntp server ")
-# add_rule validates, so the only way to hold a refused pattern is the way a
-# real deployment holds one: a row written before the guard existed.
+# add_rule validates, so a refused pattern gets here the way a deployment
+# holds one: a row written before the guard existed.
 with reason_db._lock:
     reason_db._conn.execute(
         "UPDATE compliance_rules SET pattern = ? WHERE id = ?",

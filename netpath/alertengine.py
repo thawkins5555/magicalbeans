@@ -3014,10 +3014,8 @@ class AlertEngine(Worker):
         url = str(settings.get("webhook_url") or "").strip()
         if not url:
             return
-        # Everything recorded about this delivery names the host, never the
-        # URL: for Slack, Teams and PagerDuty the path IS the credential, and
-        # a notification row is served to any account with alerts: read. The
-        # delivery-result path already narrowed it; these rows did not.
+        # Everything recorded about this delivery names the host, for
+        # _webhook_result's reason. These rows used to carry the whole URL.
         to_addr = webhook_host(url)
         now = time.time()
         hour_ago = now - 3600

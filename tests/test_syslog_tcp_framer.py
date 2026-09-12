@@ -237,16 +237,9 @@ finally:
 
 # ---------------------------------------------------------------- T4
 #
-# T3 above hammers the buckets and passes with the lock neutered: 16 threads
-# racing 80,000 updates never actually lost one on this interpreter, so the
-# invariant it asserts cannot fail on demand and does not prove a lock is
-# held. This asks the same fact deterministically -- hold the lock on the
-# main thread, and a worker that has to take it must still be blocked when
-# the main thread looks -- and then names each counter that reaches it from
-# a thread of its own. `errors` is bumped from the receive threads,
-# `tcp_oversized` from every TCP client thread, and `tcp_refused` and
-# `tcp_clients` from the accept loop; all four were bumped unguarded beside
-# the guarded ones.
+# T3 above passes with the lock neutered: 80,000 racing updates never lost
+# one here, so its invariant cannot fail on demand. This asks the same fact
+# deterministically, of each counter and the thread it arrives on.
 
 print("\nT4  the counter lock is really taken, and really guards all of them")
 
@@ -280,8 +273,7 @@ try:
     blocks_on_the_lock("_note_oversized, from a TCP client thread",
                        lambda: collector._note_oversized("10.9.9.9", 999_999))
 
-    # The two the accept loop writes have no single method of their own, so
-    # they are asked of the statement itself.
+    # The accept loop's two have no method of their own to ask.
     before = dict(collector.counters)
     blocks_on_the_lock(
         "the accept loop's tcp_clients write",

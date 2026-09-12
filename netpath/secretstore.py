@@ -48,10 +48,8 @@ class SecretStoreError(Exception):
 # ------------------------------------------------------------ configuration
 
 # Whether this host has POSIX ownership and mode bits worth checking. A
-# module attribute rather than `os.name != "nt"` spelled inline at each use,
-# so the two refusals below can be exercised on a Windows runner -- which is
-# where this application is mostly developed, and where, written inline, they
-# were dead code no test could reach.
+# module attribute, not `os.name != "nt"` inline, so the two refusals below
+# can be exercised on the Windows runners where they were dead code.
 _POSIX = os.name != "nt"
 
 

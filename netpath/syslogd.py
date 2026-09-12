@@ -63,11 +63,8 @@ class SyslogCollector(udpsock.UdpReceiver):
         self._buckets: collections.OrderedDict = collections.OrderedDict()
         # Reached from the UDP receive thread, the TCP accept loop and every
         # TCP client thread at once: without this, one thread's move_to_end
-        # could raise KeyError for a key another had just evicted, and the
-        # message was silently dropped as a receive error. It guards the
-        # counters below for the same reason -- `+= 1` is a read, an add and
-        # a store from threads that genuinely run side by side -- so it is
-        # named for both, not for the buckets alone.
+        # could raise KeyError for a key another had just evicted. It guards
+        # the counters below for the same reason, and is named for both.
         self._counter_lock = threading.Lock()
         self._rate = 0.0
         self._max_tcp_clients = 64

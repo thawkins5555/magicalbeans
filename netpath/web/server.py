@@ -699,9 +699,8 @@ class AccessLog:
         self.errors = 0
         self.active = 0
         self.peak_active = 0
-        # Requests actually being served, which is not the same number as
-        # `active`: an idle keep-alive connection is one of those and none
-        # of these. stop() waits on this one.
+        # Requests being served, which an idle keep-alive connection is none
+        # of though it is one of `active`. stop() waits on this one.
         self.in_flight = 0
         self.started_at = time.time()
         # Per-route latency. Keyed by the route's PATTERN, not by the path:
@@ -1373,13 +1372,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "A numeric value in that request is out "
                                      "of range"}, 400)
             except (BrokenPipeError, ConnectionResetError, TimeoutError):
-                # The client went away mid-write. handle_error already
-                # narrows this arm, but it only ever sees what escapes
-                # finish_request -- an abort raised INSIDE this try was
-                # caught below instead, printing a ~1.7 KB traceback per
-                # closed tab and then trying to write a 500 down the socket
-                # that just died. Neither is worth doing; the connection is
-                # finished either way.
+                # The client went away mid-write. handle_error narrows this
+                # too, but only sees what escapes finish_request: an abort
+                # raised INSIDE this try was caught below instead, and
+                # answered with a 500 down a socket that had just died.
                 self.close_connection = True
                 return
             except Exception as exc:
@@ -1595,12 +1591,11 @@ class WebServer:
     # How long stop() gives requests already in flight. daemon_threads means
     # server_close() joins none of them, so without this the teardown that
     # follows — service.shutdown(), which closes every store — can meet a
-    # handler mid-query. It waits on `access.in_flight`, the requests being
-    # served: `access.active` counts open CONNECTIONS, so one idle keep-alive
-    # socket -- a browser sitting on a page -- turned every stop() into a flat
-    # 2 s sleep while never once waiting for the handler this exists for. The
-    # grace is still an upper bound, because a WebSocket terminal runs its
-    # handler for as long as the operator keeps the page open.
+    # handler mid-query. It waits on `access.in_flight`: `access.active`
+    # counts open CONNECTIONS, so one idle keep-alive socket turned every
+    # stop() into a flat 2 s sleep while never waiting for the handler this
+    # exists for. Still an upper bound: a WebSocket terminal runs its handler
+    # for as long as the operator keeps the page open.
     DRAIN_GRACE_S = 2.0
 
     def stop(self) -> None:

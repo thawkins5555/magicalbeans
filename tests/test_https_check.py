@@ -275,12 +275,9 @@ try:
           https_url_for(_Row(https_url="https://switch.example/x"))
           == "https://switch.example/x")
     # ----------------------------------------------------------------------
-    # The https_checks sweep runs after the traces sweep, and used to be
-    # handed what was left of the traces deadline. _delete_batches checks
-    # that deadline before its FIRST batch, so on any netpath.db busy enough
-    # for the traces sweep to use its budget, this table was swept zero rows
-    # a pass and grew past retention for ever -- ~144,000 rows a day at 100
-    # destinations on a 60 s interval.
+    # This sweep used to be handed what was left of the traces deadline, and
+    # _delete_batches checks that before its FIRST batch: on any netpath.db
+    # busy enough to spend it, the table was swept zero rows a pass.
     db = Database(os.path.join(TMPDIR, "prune_budget.db"))
     starved = db.add_target("10.80.0.4", label="starved", interval_s=60)
     for _ in range(6):
@@ -288,7 +285,7 @@ try:
     old_ts = time.time() - 30 * 86400
     conn = sqlite3.connect(db.path)
     conn.execute("UPDATE https_checks SET ts=?", (old_ts,))
-    # Old traces too, so the traces sweep has real work to not finish.
+    # Old traces too, so the traces sweep has work it will not finish.
     for n in range(6):
         conn.execute("INSERT INTO traces(target_id, started_ts, status,"
                      " reached) VALUES (?,?,?,1)", (starved, old_ts, "ok"))
@@ -299,8 +296,7 @@ try:
     check("the starved-sweep fixture has rows to prune", len(before) == 6,
           len(before))
 
-    # budget_s=0: the traces deadline is spent before the first batch, which
-    # is exactly the state a busy install's traces sweep leaves behind.
+    # budget_s=0: the state a busy install's traces sweep leaves behind.
     db.prune(1.0, budget_s=0.0)
     after = db.https_checks_between(starved, 0, time.time() + 3600)
     check("old https_checks are still swept when the traces sweep had no "

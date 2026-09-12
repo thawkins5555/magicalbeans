@@ -520,14 +520,11 @@ class SqliteStore:
         return added
 
     # A FULL checkpoint cannot run past another connection's read lock, and
-    # it does not raise when it hits one: it reports it in the first column
-    # of its result row (0 completed, 1 busy) and leaves the frames it could
-    # not copy in the log. Measured on this SQLite: one blocked attempt
-    # returns (1, 3, 2) -- the just-committed frame not backfilled -- after
-    # blocking the connection's whole 5 s busy_timeout first, three more with
-    # that timeout wound down cost 344 ms between them, and the moment the
-    # reader lets go the checkpoint completes in under a millisecond. So the
-    # retries below lower the timeout rather than paying 5 s each.
+    # reports that in the first column of its result row (0 completed, 1
+    # busy) rather than raising. Measured: one blocked attempt returns
+    # (1, 3, 2) after blocking the whole 5 s busy_timeout, three more with
+    # that wound down cost 344 ms between them, and the moment the reader
+    # lets go it completes in under a millisecond -- hence the low timeout.
     CHECKPOINT_RETRIES = 4
     CHECKPOINT_RETRY_TIMEOUT_MS = 50
     CHECKPOINT_RETRY_WAIT_S = 0.05

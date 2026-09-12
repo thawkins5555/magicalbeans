@@ -180,18 +180,11 @@ alerts.close()
 
 # ------------------------------------- nodes.db, with a reader on the file
 #
-# `PRAGMA wal_checkpoint(FULL)` returns (busy, log_frames, backfilled) and
-# does not raise: a 1 in the first column means another connection's read
-# lock stopped it and the frames it could not copy are still in the log
-# alone. _commit_durable ignored that row entirely, so this -- a poll or a
-# search running while somebody saves an SSH password, which is the ordinary
-# state of a busy install -- returned success having stored nothing in the
-# database file.
-#
-# The store's busy_timeout is wound down for these two cases. At the shipped
-# 5 s the first attempt blocks for the whole of it before reporting busy,
-# which would make this section a ten-second test and would hide the retry
-# behind a timeout long enough to outlast any reader a test can hold.
+# The checkpoint reports a busy read lock in the first column of its result
+# row rather than raising, and _commit_durable ignored it: a save made while
+# a poll was reading returned success having stored nothing in the database
+# file. busy_timeout is wound down here: at the shipped 5 s the first attempt
+# blocks for all of it before saying so.
 
 
 class Reader:
@@ -226,15 +219,12 @@ busy_nodes = settled(busy_nodes)
 with busy_nodes._lock:
     busy_nodes._conn.execute("PRAGMA busy_timeout=50")
 
-# 1. A reader that lets go while the retries are still running. The write
-#    must reach the database file, which is what the caller was promised.
+# 1. A reader that lets go while the retries run: the write must still land.
 reader = Reader(busy_nodes.path)
 
 
 def release_shortly():
-    # Long enough that the first attempt is certainly refused (the store's
-    # busy_timeout is 50 ms here), short enough that the retry window still
-    # covers it.
+    # Past the first attempt (busy_timeout is 50 ms here), inside the retries.
     time.sleep(0.15)
     reader.let_go()
 
@@ -253,8 +243,7 @@ check("a credential saved while another connection holds a read lock still "
 check("...and the retry is bounded, not a wait on the reader",
       elapsed < 3.0, f"{elapsed:.2f}s")
 
-# 2. A reader that never lets go. The checkpoint genuinely cannot run, and
-#    the point of the fix is that this is now said rather than swallowed.
+# 2. A reader that never lets go: it genuinely cannot run, and says so.
 stubborn = Reader(busy_nodes.path)
 records = []
 

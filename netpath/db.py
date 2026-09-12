@@ -23,12 +23,11 @@ log = logging.getLogger(__name__)
 # older_than_days' delete deadline: a long delete sweep would otherwise leave
 # reclaim nothing, and the file would sit large until a later pass had spare.
 PRUNE_RECLAIM_BUDGET_S = 5.0
-# And the https_checks sweep gets its own, for the same reason the reclaim
-# pass does: it runs after the traces sweep, which on a busy netpath.db has
-# already spent every second of the shared deadline. _delete_batches checks
-# that deadline before its first batch, so what "after" meant in practice was
-# zero batches, every pass -- and https_checks is the table that needs the
-# sweep most (100 destinations on a 60 s interval is ~144,000 rows a day).
+# And the https_checks sweep gets its own, for the reason the reclaim pass
+# does: it runs after the traces sweep, which on a busy netpath.db has spent
+# every second of the shared deadline, and _delete_batches checks that before
+# its first batch -- so "after" meant zero batches a pass, on the table that
+# grows fastest (~144,000 rows a day at 100 destinations on 60 s).
 PRUNE_HTTPS_BUDGET_S = 2.0
 
 # A settings save runs maintenance synchronously on the HTTP thread, so that
@@ -746,8 +745,7 @@ class Database(SqliteStore):
                 log.warning("netpath.db: prune of traces older than %.1f days "
                             "did not finish within its budget; continuing at "
                             "the next maintenance pass", older_than_days)
-        # Own deadline: `deadline` above is the traces sweep's, and it may
-        # already be spent -- on a busy install it always is.
+        # Own deadline: `deadline` above is the traces sweep's, and spent.
         removed += self._prune_https_checks(
             cutoff, time.monotonic() + PRUNE_HTTPS_BUDGET_S)
         if removed:

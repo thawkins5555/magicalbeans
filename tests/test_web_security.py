@@ -1896,9 +1896,8 @@ end
     sys.stderr = captured
     try:
         # /app.js is served past the route table, so an abort there escapes
-        # to handle_error. /api/state is matched by _route and served from
-        # inside its try, where the generic `except Exception` used to catch
-        # the abort, print the traceback and then try a 500 on a dead socket.
+        # to handle_error. /api/state is served from inside _route's try,
+        # where the generic arm used to catch it.
         for target in (b"/app.js", b"/api/state", b"/api/state"):
             sock = socket.create_connection(("127.0.0.1", PORT), timeout=5)
             # SO_LINGER (1, 0): close() sends an RST rather than a FIN, which
@@ -1916,9 +1915,7 @@ end
           "Traceback" not in noise, noise[:200])
 
     # The RST above races the response out of the socket buffer, so it is
-    # real but not decisive. This is the same abort made deterministic: a
-    # route-matched handler raising the error a dead socket raises, on a
-    # connection that is still open to be answered on.
+    # real but not decisive. The same abort, made deterministic:
     aborting = threading.Event()
 
     def _abort_handler(service, params, body):
@@ -1965,12 +1962,10 @@ end
 
     # ------------------------------------------- D25 stop() waits for the traffic
     #
-    # It used to wait on access.active, which counts open CONNECTIONS. A
-    # browser sitting on a page keeps one open and idle, so every stop()
-    # slept the whole grace while never once waiting for a running handler --
-    # exactly backwards from what the grace exists for. A partial request
-    # line, which is what this used to hold the server with, is that same
-    # idle connection: it proved the sleep, not the drain.
+    # It waited on access.active, which counts open CONNECTIONS, so a browser
+    # sitting on a page made every stop() sleep the whole grace while never
+    # waiting for a handler -- and the partial request line this used to hold
+    # the server with is that same idle connection.
     saved_access_log = SERVICE.access_log
     quiet_port = _paths.free_tcp_port()
     quiet = WebServer(SERVICE, host="127.0.0.1", port=quiet_port)
@@ -1983,8 +1978,7 @@ end
             check("D25 an idle listener stops at once",
                   time.time() - started < 1.0, f"{time.time() - started:.2f}s")
 
-        # An open keep-alive connection with no request running on it: the
-        # browser case. stop() must not wait for it at all.
+        # A keep-alive connection with nothing running on it.
         quiet = WebServer(SERVICE, host="127.0.0.1", port=quiet_port)
         if quiet.start(block=False):
             idle = socket.create_connection(("127.0.0.1", quiet_port), timeout=5)
@@ -2006,8 +2000,7 @@ end
                   idle_elapsed < quiet.DRAIN_GRACE_S / 2,
                   f"{idle_elapsed:.2f}s of {quiet.DRAIN_GRACE_S:.1f}s")
 
-        # A handler genuinely in flight: stop() must wait for it, and return
-        # as soon as it finishes rather than sitting out the rest of the grace.
+        # A handler genuinely in flight: waited for, and no longer.
         release = threading.Event()
         entered = threading.Event()
 

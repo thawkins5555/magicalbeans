@@ -395,9 +395,8 @@ for url, wanted in (
 
 # ====================================================================== C10
 # C1 proves the DELIVERY-RESULT row names only the host. The rows written
-# when a delivery never happens at all took the raw URL instead -- the same
-# bearer path, in the same column, served to the same accounts, and reached
-# by nothing more exotic than a busy hour.
+# when a delivery never happens took the raw URL -- the same bearer path,
+# the same column, the same readers, and a busy hour to reach it.
 print("\nC10 - a webhook that is never sent records the host too, not the URL")
 
 receiver = Receiver()
@@ -485,9 +484,8 @@ try:
     for device_id in devices:
         go_down(nodes, device_id)
     engine._tick()                   # held inside the roll-up window
-    # The hour's one send is already spent when the digest comes due. Stamped
-    # directly rather than by delivering a real alert first, because that
-    # alert would be held by the same roll-up window and join this digest.
+    # The hour's one send is spent when the digest comes due. Stamped
+    # directly: a real alert would join this digest instead.
     engine._webhook_sent_this_hour = [time.time()]
     time.sleep(1.2)
     engine._tick()
