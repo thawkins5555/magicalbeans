@@ -230,12 +230,23 @@ admin's custom MIB objects — go through a new `_best_effort` helper that
 still swallows "this device does not answer that" but no longer swallows
 a credential or security-level verdict along with it (`cfead9c`).
 
-**Still in flight at the time of writing.** `histogram()` deduplication
-across the three stores that each carry a copy, the permission-registry
-contract (WEB-P3), the bulk-id reader with its `IN`-chunking contract
-(API-P2), and the reveal/secret-column contract (API-P3) were assigned
-this release but had not landed as this entry was written. Bob will
-rewrite this paragraph once they do.
+**The last four landed before the suite ran.** `histogram()` is one bucket
+contract in `sqlitebase` (`hist_buckets`/`hist_add`/`hist_from_rollup`)
+that `alertsdb`, `snmptrapdb` and `syslogdb` all call, byte-identical
+output. WEB-P3 is a contract rather than a refactor: the new
+`tests/test_permission_registry.py` holds `permissions.MODULES`,
+`server.ROUTES`, `api.SETTINGS_SCOPES` and `service._MODULE_SCOPES` in
+step. API-P2 gives every bulk route one reader, `_bulk_ids`, and every
+caller-sized `IN (...)` in the stores goes through `id_chunks` — seventeen
+sites fixed, two of which had no cap at all, with `tests/test_bulk_contracts.py`
+enforcing the allow-list both ways. API-P3 is the one that found something:
+`SECRET_COLUMNS` plus an AST contract over every `_*_json` serialiser showed
+`_discovery_result_json` returning `community_or_user` — the credential that
+answered each swept address — to any account with Nodes read. It now takes
+`reveal` from `_may_read_secrets` like every other serialiser; no page read
+the field, so nothing on screen changed. The bulk-selection trio the 5.12.0
+audit counted was already three-line wrappers over `App.bulkBar` and is
+left as it is.
 
 **Recorded, not actioned.** Tier 3 stays a written proposal rather than
 code, on the wave's own planning answer: trap inbound decryption (the
