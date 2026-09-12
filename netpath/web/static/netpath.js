@@ -1432,9 +1432,18 @@
 
     // Unlike the route, this is only fetched for a destination with a page.
     if (currentTarget() && currentTarget().https_url) {
-      view.https = await App.get('/api/netpath/https', {
-        target: view.targetId, t0: view.t0, t1: view.t1, width,
-      });
+      try {
+        view.https = await App.get('/api/netpath/https', {
+          target: view.targetId, t0: view.t0, t1: view.t1, width,
+        });
+      } catch (error) {
+        // A secondary series, on the same footing as the dashboard's
+        // offenders list: this failing used to reject refresh(), which took
+        // the topology fetch, the timeline and the route pane down with it
+        // and raised the disconnected banner over a page whose primary
+        // fetches had both succeeded. The previous figures stay on screen.
+        if (error && error.superseded) throw error;
+      }
       if (view.refreshGen !== generation || App.state.tab !== 'netpath') return;
     } else {
       view.https = null;

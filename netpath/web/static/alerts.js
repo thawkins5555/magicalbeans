@@ -253,18 +253,31 @@
     { key: 'entity_kind', label: 'Kind', width: 80 },
   ];
 
-  /* " muted" beside a rule name when this alert's device is muted, or this
-     rule is muted on it. Rebuilt per draw: view.rules is replaced on every
-     refresh. */
+  /* A tag beside a rule name when this alert's device is muted, or when this
+     rule alone is muted on it. Rebuilt per draw: view.rules is replaced on
+     every refresh.
+
+     The two are different facts and used to read the same: one word, no
+     title, so "muted" on a row could mean the whole device is silent or
+     only this one rule is — the distinction the 5.11.0 per-rule mute
+     exists to make. Both the wording and the hover now say which, and
+     until when; the device mute is named first because it is the wider of
+     the two and outlives the rule's. */
   let ruleKeyById = new Map();
 
   function mutedTagFor(row) {
     const deviceId = row.device_id ? String(row.device_id) : '';
     if (!deviceId) return '';
     const key = ruleKeyById.get(row.rule_id) || '';
-    if (!view.mutes.has(deviceId)
-        && !(key && view.ruleMutes.has(`${deviceId}:${key}`))) return '';
-    return ` <span class="hint muted-tag">muted</span>`;
+    const deviceUntil = view.mutes.get(deviceId) || null;
+    const ruleUntil = key ? (view.ruleMutes.get(`${deviceId}:${key}`) || null) : null;
+    if (!deviceUntil && !ruleUntil) return '';
+    const [label, title] = deviceUntil
+      ? ['device muted',
+         `Every alert for this device is muted until ${App.when(deviceUntil)}`]
+      : ['rule muted',
+         `This rule is muted on this device until ${App.when(ruleUntil)}`];
+    return ` <span class="hint muted-tag" title="${escape(title)}">${escape(label)}</span>`;
   }
 
   const alertColumns = () => App.visibleColumns(
@@ -564,8 +577,16 @@
           `${KIND_LABELS[row.entity_kind] || 'an object outside Nodes'}`);
     // A rule the page never loaded (deleted since) has nothing to key on.
     const ruleMuteable = muteable && Boolean(ruleKey);
+    // On a deep link the pane can paint before loadConfig's rules land,
+    // and an empty view.rules looks exactly like a deleted rule — so for
+    // one interval a live rule was reported as gone. An empty list is not
+    // evidence of anything, and the signature rebuilds the pane when it
+    // fills.
     const ruleWhy = muteable
-      ? 'This alert\u2019s rule is no longer in the rules list' : why;
+      ? ((view.rules || []).length
+        ? 'This alert\u2019s rule is no longer in the rules list'
+        : 'Loading rules\u2026')
+      : why;
     // One dropdown for both buttons: two would be one too many to read.
     const hoursHtml =
       `<select id="alerts-d-mute-hours" class="fixed" title="How long to silence new alerts">` +
@@ -1824,6 +1845,12 @@
      missing — a link from a ticket is usually to something older than the
      300 rows on screen. */
   async function activate(opts) {
+    // Entering the tab re-reads the configuration lists: loadConfig's
+    // 60-second clock is for a tab left open, not for one just opened, and
+    // both the release notes and the review say they are read on opening.
+    // Before the `opts` guard — a plain tab switch calls activate() with
+    // none, and app.js runs the refresh that acts on this straight after.
+    view.configAt = 0;
     if (!opts) return;
     const parts = opts.parts || [];
     const query = opts.query || {};
@@ -1918,7 +1945,11 @@
     // A newer refresh already redrew this, or the operator has left.
     if (view.refreshGen !== generation || App.state.tab !== 'alerts') return;
     view.hist = overview.buckets;
-    view.histPlot = App.plottedRange(overview.buckets, bucket, t0, t1);
+    // The server may widen the bucket it was asked for (HIST_MAX_BUCKETS) and
+    // says so in bucket_s. Plotting the width we asked for drew the bars at
+    // the wrong span for exactly the windows that get widened.
+    view.histPlot = App.plottedRange(overview.buckets,
+                                     overview.bucket_s ?? bucket, t0, t1);
     // No dedicated summary line exists for this histogram yet (unlike
     // Syslog/SNMP's #sl-hist-summary / #sn-hist-summary) — guarded until
     // index.html grows an #alerts-hist-summary span beside "ALERTS PER
