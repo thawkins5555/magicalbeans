@@ -1800,11 +1800,9 @@
     token = App.modalToken();
     box.classList.add('wide');
 
-    // Only up to three days, same reasoning as the pane's own loss chart
-    // used to have: a wider window reads the hourly rollup, and nothing
-    // populates it for this metric, so 7 and 30 days would be permanently
-    // empty options.
-    App.fillRanges(box.querySelector('#ndd-loss-range'), 'Last hour', 259200);
+    // The full range set: past three days the series reads samples_hourly,
+    // which compact_rollup populates.
+    App.fillRanges(box.querySelector('#ndd-loss-range'), 'Last hour');
 
     // Escape and a backdrop click close the modal without Close ever being
     // pressed, so the timer hangs off the close event rather than off that

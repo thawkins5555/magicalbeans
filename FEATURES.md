@@ -1077,11 +1077,11 @@ pinned to 0–100 %, so a healthy device draws a flat line along the bottom
 rather than an auto-scaled one that makes a fraction of a percent look like an
 outage. A device that is not being ping-probed says so instead of showing an
 empty chart. The chart refreshes every fifteen seconds while the dialog is
-open, so the fast polling a selected device gets shows up in it. Its ranges
-stop at three days, because a wider metric window reads from an hourly rollup
-table that nothing populates — a 7-day option would be permanently empty. The
-status timeline keeps every range, since it is built from the event log rather
-than from samples.
+open, so the fast polling a selected device gets shows up in it. From 5.13.0 it
+offers the full range set, up to 30 days: a window wider than three days reads
+from the hourly rollup table, which the rollup pass populates. The status
+timeline keeps every range, since it is built from the event log rather than
+from samples.
 
 **From 5.0.0, a RESOURCES section under PACKET LOSS charts CPU, memory and
 chassis temperature** over that same range, sharing its dropdown and its
