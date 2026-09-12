@@ -151,7 +151,7 @@ const LOOPBACK_TESTS = [
 ];
 
 const THEMES = ['dark', 'light', 'contrast', 'midnight', 'nord', 'solarized',
-                'slate'];
+                'slate', 'neon'];
 const VIEWPORTS = [[1920, 1080], [1366, 768], [1280, 720]];
 
 /**

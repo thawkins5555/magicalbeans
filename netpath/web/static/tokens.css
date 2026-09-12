@@ -150,6 +150,11 @@
   --shadow-float: 0 6px 20px rgba(0, 0, 0, 0.45);
   --scrim: rgba(0, 0, 0, 0.55);
 
+  /* Tube glow: a box-shadow, a text-shadow and the hue they burn in. Inert everywhere but Neon. */
+  --tube: none;
+  --tube-text: none;
+  --tube-line: var(--accent);
+
   /* Stacking: every fixed layer, in order, so nothing is given a z-index by guessing a bigger number. */
   --z-sticky: 1;      /* table headers, a dialog's top button row */
   --z-divider: 2;     /* pane splitters, over the panes they separate */
@@ -431,4 +436,44 @@
   --cat-6: #3F7A2E;
   --cat-7: #74459E;
   --cat-8: #A6291F;
+}
+
+/* Neon: a neon-sign palette — cyan, magenta and lime tubes at the saturation a sign actually burns.
+   The ground is a dark room rather than a dark screen, near-black with a violet cast, so a tube has
+   somewhere to glow; the glow itself is --tube/--tube-text, inert in every other theme. */
+:root[data-theme="neon"] {
+  --bg: #07050D;
+  --panel: #0E0B18;
+  --raised: #161228;
+  --hairline: #2C2450;
+  --grid: #1E183A;
+  --text: #F2F0FF;
+  --muted: #B9B0E6;
+  --dim: #A69CD9;
+  --line: #7C6FB8;
+  --data-neutral: #6F63A8;
+  --accent: #39F0FF;
+  --accent-hover: #7FF6FF;
+  --focus: #FFFFFF;
+  --ok: #39FF88;
+  --warn: #FFE43A;
+  --fail: #FF4D8D;
+  --blocked: #FF8C3A;
+  --overrun: #4DE3FF;
+  --error: #C77DFF;
+  --nodata: #14102A;
+  --selected: #1B1440;
+  --checked: #23195A;
+  --checked-strong: #2F2278;
+  --tube: 0 0 6px var(--tube-line), 0 0 16px color-mix(in srgb, var(--tube-line) 55%, transparent);
+  --tube-text: 0 0 6px color-mix(in srgb, currentColor 80%, transparent), 0 0 14px color-mix(in srgb, currentColor 45%, transparent);
+  /* The same series numbering as Dark, in the colours a sign comes in. */
+  --cat-1: #39F0FF;
+  --cat-2: #FF4D8D;
+  --cat-3: #39FF88;
+  --cat-4: #FFE43A;
+  --cat-5: #C77DFF;
+  --cat-6: #FF8C3A;
+  --cat-7: #4D7CFF;
+  --cat-8: #FF5E5E;
 }

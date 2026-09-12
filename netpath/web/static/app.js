@@ -103,6 +103,7 @@ const App = (() => {
           <option value="nord">Nord</option>
           <option value="solarized">Solarized</option>
           <option value="slate">Slate</option>
+          <option value="neon">Neon</option>
         </select></label>
         <p class="hint" id="am-theme-status">Saved to your account and kept in this browser.</p>
         <p class="hint">A wall display opens this view full-screen with the tab strip
@@ -4586,8 +4587,8 @@ const App = (() => {
 
   /* ------------------------------------------------------------- theme
 
-     Seven palettes in tokens.css — dark (the default, no attribute),
-     light, high contrast, midnight, nord, solarized and slate — selected
+     Eight palettes in tokens.css — dark (the default, no attribute),
+     light, high contrast, midnight, nord, solarized, slate and neon — selected
      per BROWSER, not per account: it is a property of the screen and the
      eyes in front of it, and a shared NOC workstation keeps its choice
      across sign-ins. boot.js reads the same key before first paint so no
@@ -4597,7 +4598,7 @@ const App = (() => {
      agree, or a theme stored by one and rejected by the other silently
      reverts to dark on the next reload that hits the other file first. */
   const THEME_KEY = 'sappiwhere.theme';
-  const THEMES = ['dark', 'light', 'contrast', 'midnight', 'nord', 'solarized', 'slate'];
+  const THEMES = ['dark', 'light', 'contrast', 'midnight', 'nord', 'solarized', 'slate', 'neon'];
 
   function currentTheme() {
     const theme = document.documentElement.dataset.theme;

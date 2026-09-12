@@ -89,7 +89,7 @@ tokens_css = read(STATIC, "tokens.css")
 # measured against that theme's light ground and fails, instead of being
 # invisible in a browser.
 BLOCKS = re.findall(r':root(?:\[data-theme="([a-z]+)"\])?\s*\{(.*?)\n\}', tokens_css, re.S)
-check(len(BLOCKS) == 7, "tokens.css has a base block and six theme blocks (found %d)" % len(BLOCKS))
+check(len(BLOCKS) == 8, "tokens.css has a base block and seven theme blocks (found %d)" % len(BLOCKS))
 BASE = {}
 OVERRIDES = {}
 for theme_name, body_text in BLOCKS:
@@ -114,8 +114,8 @@ if all(name in TOKENS for name in SPACE_STEPS):
 THEMES = {"dark": dict(BASE)}
 for theme_name, values in OVERRIDES.items():
     THEMES[theme_name] = dict(BASE, **values)
-check(sorted(THEMES) == ["contrast", "dark", "light", "midnight", "nord", "slate", "solarized"],
-      "the themes are dark, light, contrast, midnight, nord, solarized and slate")
+check(sorted(THEMES) == ["contrast", "dark", "light", "midnight", "neon", "nord", "slate", "solarized"],
+      "the themes are dark, light, contrast, midnight, nord, solarized, slate and neon")
 # Every role a light ground makes unreadable if left dark. A theme block
 # must say each one explicitly.
 THEMED_ROLES = ["--bg", "--panel", "--raised", "--hairline", "--grid", "--text", "--muted",
@@ -195,7 +195,7 @@ GRAPHIC_ON = [
 # changing here.
 FLOOR_LIFT = {"dark": (0.0, 0.0), "light": (0.0, 0.0), "contrast": (2.5, 1.5),
               "midnight": (0.0, 0.0), "nord": (0.0, 0.0), "solarized": (0.0, 0.0),
-              "slate": (0.0, 0.0)}
+              "slate": (0.0, 0.0), "neon": (0.0, 0.0)}
 for theme_name in sorted(THEMES):
     text_lift, graphic_lift = FLOOR_LIFT[theme_name]
     for fg, bg, floor in TEXT_ON:

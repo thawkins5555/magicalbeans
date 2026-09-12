@@ -9543,7 +9543,7 @@ def _first_run(service) -> bool:
 
 # Must mirror app.js's THEMES (and boot.js's copy) exactly, or a theme
 # rejected here silently reverts to dark instead of saving.
-THEMES = ("dark", "light", "contrast", "midnight", "nord", "solarized", "slate")
+THEMES = ("dark", "light", "contrast", "midnight", "nord", "solarized", "slate", "neon")
 
 
 def get_session(service, params, body) -> dict:

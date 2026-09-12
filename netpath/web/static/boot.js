@@ -4,7 +4,7 @@
 (function () {
   // Every page loads this. Dark is the default, and is the ABSENCE of the
   // attribute, so a browser that never chose stores nothing.
-  var THEMES = ['dark', 'light', 'contrast', 'midnight', 'nord', 'solarized', 'slate'];
+  var THEMES = ['dark', 'light', 'contrast', 'midnight', 'nord', 'solarized', 'slate', 'neon'];
   var theme = 'dark';
   try {
     theme = localStorage.getItem('sappiwhere.theme') || 'dark';
