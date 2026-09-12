@@ -2815,6 +2815,17 @@ check("'Loading rules" in ALERTS54 and "(view.rules || []).length" in ALERTS54,
       "rule has been deleted'")
 
 
+# --- 56. 5.11.0: a rule that could not be evaluated says so ----------------
+#      A compliance rule whose pattern the bounded-regex guard refuses fails
+#      closed, and the API carries a `reason` for it. Rendering the
+#      description alone reported the device as non-compliant with no way to
+#      tell that from a rule that never ran.
+CONFIGRX56 = read("configrx.js")
+check("f.reason" in CONFIGRX56,
+      "the Failed rules cell shows why a rule could not be evaluated, not "
+      "just which rule it was")
+
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

@@ -1267,7 +1267,12 @@
           ? ' <span class="hint">(from a suspect, likely truncated capture — see Devices)</span>'
           : '') },
     { key: 'failed_rules', label: 'Failed rules', sortable: false,
-      cell: (r) => ((r.failed_rules || []).map((f) => escape(f.description)).join('; ') || '—') },
+      // `reason` is set when the rule could not be evaluated at all, rather
+      // than evaluated and not matched. Without it a refused pattern reads
+      // as a device that failed the check.
+      cell: (r) => ((r.failed_rules || []).map((f) => escape(f.description)
+        + (f.reason ? ` <span class="hint">(${escape(f.reason)})</span>` : ''))
+        .join('; ') || '—') },
     { key: 'evaluated_ts', label: 'Evaluated', numeric: true, cell: (r) => App.agoCell(r.evaluated_ts) },
   ];
 
