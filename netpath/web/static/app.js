@@ -1365,6 +1365,32 @@ const App = (() => {
   /* maxSeconds trims the list for a chart whose data source cannot answer
      the wider ones — an option that is always empty is worse than an option
      that is not offered. */
+  /* A chart's time window: NetFlow and NetPath each keep {t0, t1, follow}
+     on their view and a follow checkbox; the arithmetic is the same. */
+  const WINDOW_MIN_S = 60;
+  const WINDOW_MAX_S = 2592000 * 4;
+  const clampSpan = (s) => Math.min(Math.max(s, WINDOW_MIN_S), WINDOW_MAX_S);
+  function windowSet(view, followEl, t0, t1, follow) {
+    if (t1 - t0 < WINDOW_MIN_S) t1 = t0 + WINDOW_MIN_S;
+    view.t0 = t0; view.t1 = t1;
+    if (follow !== undefined) {
+      view.follow = follow;
+      followEl.checked = follow;
+    }
+  }
+  function windowZoom(view, factor, setWindow) {
+    const s = clampSpan((view.t1 - view.t0) * factor);
+    if (view.follow) setWindow(view.t1 - s, view.t1);
+    else {
+      const mid = (view.t0 + view.t1) / 2;
+      setWindow(mid - s / 2, mid + s / 2);
+    }
+  }
+  function windowPan(view, fraction, setWindow) {
+    const shift = (view.t1 - view.t0) * fraction;
+    setWindow(view.t0 + shift, view.t1 + shift, false);
+  }
+
   function fillRanges(select, defaultLabel, maxSeconds) {
     select.innerHTML = '';
     for (const [label, seconds] of RANGES) {
@@ -5586,6 +5612,7 @@ const App = (() => {
     grid, sortRows, canRead, canWrite, applyPermissions, accountModal, wireRowKeyboard,
     statusPatternDefs, statusPatternUrl, statusMark,
     visibleColumns, readColumnPicker, drawRows, escapeHtml,
+    windowSet, windowZoom, windowPan,
     refreshSelectAll, columnPickerFieldset, wireColumnPickers,
     sortableTable,
   };

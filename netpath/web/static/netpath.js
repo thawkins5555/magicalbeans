@@ -52,8 +52,6 @@
 
   /* ----------------------------------------------------------- helpers */
 
-  const clampSpan = (s) => Math.min(Math.max(s, 60), 2592000 * 4);
-
   /* ------------------------------------------- per-destination windows */
 
   /* One window for the whole page meant switching destinations dragged the
@@ -129,29 +127,13 @@
   }
 
   function setWindow(t0, t1, follow) {
-    if (t1 - t0 < 60) t1 = t0 + 60;
-    view.t0 = t0; view.t1 = t1;
-    if (follow !== undefined) {
-      view.follow = follow;
-      App.el('tl-follow').checked = follow;
-    }
+    App.windowSet(view, App.el('tl-follow'), t0, t1, follow);
     rememberWindow();
     App.refreshNow('netpath');
   }
 
-  function zoom(factor) {
-    const s = clampSpan((view.t1 - view.t0) * factor);
-    if (view.follow) setWindow(view.t1 - s, view.t1);
-    else {
-      const mid = (view.t0 + view.t1) / 2;
-      setWindow(mid - s / 2, mid + s / 2);
-    }
-  }
-
-  function pan(fraction) {
-    const shift = (view.t1 - view.t0) * fraction;
-    setWindow(view.t0 + shift, view.t1 + shift, false);
-  }
+  const zoom = (factor) => App.windowZoom(view, factor, setWindow);
+  const pan = (fraction) => App.windowPan(view, fraction, setWindow);
 
   function resetWindow() {
     const seconds = Number(App.el('range-select').value) || 3600;

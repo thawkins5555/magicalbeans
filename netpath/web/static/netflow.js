@@ -107,8 +107,6 @@
 
   const escape = App.escapeHtml;
 
-  const clampSpan = (s) => Math.min(Math.max(s, 60), 2592000 * 4);
-
   const ago = App.ago;
 
   // How many flow records the table asks the server for. The select's three
@@ -174,12 +172,7 @@
   // window this way because activating the tab issues its first fetch a
   // moment later anyway, and asking here as well painted every open twice.
   function applyWindow(t0, t1, follow) {
-    if (t1 - t0 < 60) t1 = t0 + 60;
-    view.t0 = t0; view.t1 = t1;
-    if (follow !== undefined) {
-      view.follow = follow;
-      App.el('nf-follow').checked = follow;
-    }
+    App.windowSet(view, App.el('nf-follow'), t0, t1, follow);
     showWindow();
   }
 
@@ -188,19 +181,8 @@
     requestFetch(true);
   }
 
-  function zoom(factor) {
-    const s = clampSpan((view.t1 - view.t0) * factor);
-    if (view.follow) setWindow(view.t1 - s, view.t1);
-    else {
-      const mid = (view.t0 + view.t1) / 2;
-      setWindow(mid - s / 2, mid + s / 2);
-    }
-  }
-
-  function pan(fraction) {
-    const shift = (view.t1 - view.t0) * fraction;
-    setWindow(view.t0 + shift, view.t1 + shift, false);
-  }
+  const zoom = (factor) => App.windowZoom(view, factor, setWindow);
+  const pan = (fraction) => App.windowPan(view, fraction, setWindow);
 
   // The span nf-range names, ending now.
   function rangeWindow() {
