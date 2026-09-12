@@ -1888,17 +1888,24 @@ end
         SERVICE.access_log = saved_access_log
 
     # ------------------------------------- D24 a client that walks away is not a fault
+    import re as _re
+    import netpath.web.server as server_mod
+
     captured = io.StringIO()
     real_stderr = sys.stderr
     sys.stderr = captured
     try:
-        for _ in range(3):
+        # /app.js is served past the route table, so an abort there escapes
+        # to handle_error. /api/state is matched by _route and served from
+        # inside its try, where the generic `except Exception` used to catch
+        # the abort, print the traceback and then try a 500 on a dead socket.
+        for target in (b"/app.js", b"/api/state", b"/api/state"):
             sock = socket.create_connection(("127.0.0.1", PORT), timeout=5)
             # SO_LINGER (1, 0): close() sends an RST rather than a FIN, which
             # is what a browser tab closing mid-poll looks like to the server.
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
                             struct.pack("ii", 1, 0))
-            sock.sendall(b"GET /app.js HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            sock.sendall(b"GET " + target + b" HTTP/1.1\r\nHost: 127.0.0.1\r\n"
                          b"Cookie: %s\r\n\r\n" % admin_cookie.encode())
             sock.close()
         time.sleep(1.0)
@@ -1907,6 +1914,40 @@ end
     noise = captured.getvalue()
     check("D24 a client that resets mid-response prints nothing",
           "Traceback" not in noise, noise[:200])
+
+    # The RST above races the response out of the socket buffer, so it is
+    # real but not decisive. This is the same abort made deterministic: a
+    # route-matched handler raising the error a dead socket raises, on a
+    # connection that is still open to be answered on.
+    aborting = threading.Event()
+
+    def _abort_handler(service, params, body):
+        aborting.set()
+        raise ConnectionResetError(10054, "forcibly closed by the remote host")
+
+    server_mod.COMPILED.insert(
+        0, ("GET", _re.compile(r"^/api/_abort_test$"), _abort_handler, None))
+    captured = io.StringIO()
+    real_stderr = sys.stderr
+    sys.stderr = captured
+    answer = b""
+    try:
+        sock = socket.create_connection(("127.0.0.1", PORT), timeout=5)
+        sock.sendall(b"GET /api/_abort_test HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                     b"Cookie: %s\r\n\r\n" % admin_cookie.encode())
+        try:
+            answer = sock.recv(65536)
+        except (socket.timeout, TimeoutError, OSError):
+            answer = b""
+        sock.close()
+    finally:
+        sys.stderr = real_stderr
+        server_mod.COMPILED.pop(0)
+    check("D24 the aborting route was actually reached", aborting.is_set())
+    check("D24 an abort raised INSIDE the route's try prints no traceback",
+          "Traceback" not in captured.getvalue(), captured.getvalue()[:300])
+    check("D24 ...and no 500 is attempted down the socket that just died",
+          not answer.startswith(b"HTTP/1.1 500"), answer[:80])
 
     captured = io.StringIO()
     real_stderr = sys.stderr
@@ -1918,11 +1959,18 @@ end
             SERVER.httpd.handle_error(None, ("127.0.0.1", 0))
     finally:
         sys.stderr = real_stderr
-    check("D24 …but a genuine fault still does",
+    check("D24 \u2026but a genuine fault still does",
           "a genuine handler fault" in captured.getvalue(),
           captured.getvalue()[:200])
 
     # ------------------------------------------- D25 stop() waits for the traffic
+    #
+    # It used to wait on access.active, which counts open CONNECTIONS. A
+    # browser sitting on a page keeps one open and idle, so every stop()
+    # slept the whole grace while never once waiting for a running handler --
+    # exactly backwards from what the grace exists for. A partial request
+    # line, which is what this used to hold the server with, is that same
+    # idle connection: it proved the sleep, not the drain.
     saved_access_log = SERVICE.access_log
     quiet_port = _paths.free_tcp_port()
     quiet = WebServer(SERVICE, host="127.0.0.1", port=quiet_port)
@@ -1935,19 +1983,76 @@ end
             check("D25 an idle listener stops at once",
                   time.time() - started < 1.0, f"{time.time() - started:.2f}s")
 
+        # An open keep-alive connection with no request running on it: the
+        # browser case. stop() must not wait for it at all.
         quiet = WebServer(SERVICE, host="127.0.0.1", port=quiet_port)
         if quiet.start(block=False):
-            busy = socket.create_connection(("127.0.0.1", quiet_port), timeout=5)
-            busy.sendall(b"GET /login HTTP")       # deliberately unfinished
+            idle = socket.create_connection(("127.0.0.1", quiet_port), timeout=5)
+            idle.sendall(b"GET /login HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            served = idle.recv(65536)
+            check("D25 the keep-alive connection was served and stays open",
+                  served.startswith(b"HTTP/1.1 200"), served[:60])
             deadline = time.time() + 5
             while quiet.access.active < 1 and time.time() < deadline:
                 time.sleep(0.02)
+            check("D25 ...and the server still counts it as an open connection",
+                  quiet.access.active >= 1, quiet.access.active)
             started = time.time()
             quiet.stop()
-            elapsed = time.time() - started
-            busy.close()
-            check("D25 …and one with traffic still on it waits for the grace, "
-                  "bounded", 1.0 < elapsed < 4.0, f"{elapsed:.2f}s")
+            idle_elapsed = time.time() - started
+            idle.close()
+            check("D25 an idle keep-alive connection is not waited for "
+                  "(it used to cost the whole grace)",
+                  idle_elapsed < quiet.DRAIN_GRACE_S / 2,
+                  f"{idle_elapsed:.2f}s of {quiet.DRAIN_GRACE_S:.1f}s")
+
+        # A handler genuinely in flight: stop() must wait for it, and return
+        # as soon as it finishes rather than sitting out the rest of the grace.
+        release = threading.Event()
+        entered = threading.Event()
+
+        def _slow_handler(service, params, body):
+            entered.set()
+            release.wait(10.0)
+            return {"ok": True}
+
+        server_mod.COMPILED.insert(
+            0, ("GET", _re.compile(r"^/api/_drain_test$"), _slow_handler, None))
+        quiet = WebServer(SERVICE, host="127.0.0.1", port=quiet_port)
+        try:
+            if quiet.start(block=False):
+                busy = socket.create_connection(("127.0.0.1", quiet_port),
+                                                timeout=10)
+                busy.sendall(b"GET /api/_drain_test HTTP/1.1\r\n"
+                             b"Host: 127.0.0.1\r\n"
+                             b"Cookie: %s\r\n\r\n" % admin_cookie.encode())
+                check("D25 the slow handler is running", entered.wait(5.0))
+                check("D25 ...and is counted as a request in flight, not just "
+                      "a connection", quiet.access.in_flight >= 1,
+                      quiet.access.in_flight)
+
+                stopped_at = []
+
+                def _stopper():
+                    began = time.time()
+                    quiet.stop()
+                    stopped_at.append(time.time() - began)
+
+                stopper = threading.Thread(target=_stopper)
+                stopper.start()
+                time.sleep(0.4)
+                check("D25 stop() is still waiting while the handler runs",
+                      not stopped_at, stopped_at)
+                release.set()
+                stopper.join(timeout=6)
+                busy.close()
+                check("D25 ...and returns once it finishes, well inside the "
+                      "grace rather than sitting it out",
+                      bool(stopped_at) and 0.4 <= stopped_at[0] < quiet.DRAIN_GRACE_S,
+                      stopped_at)
+        finally:
+            release.set()
+            server_mod.COMPILED.pop(0)
     finally:
         quiet.stop()
         SERVICE.access_log = saved_access_log

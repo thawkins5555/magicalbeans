@@ -699,6 +699,10 @@ class AccessLog:
         self.errors = 0
         self.active = 0
         self.peak_active = 0
+        # Requests actually being served, which is not the same number as
+        # `active`: an idle keep-alive connection is one of those and none
+        # of these. stop() waits on this one.
+        self.in_flight = 0
         self.started_at = time.time()
         # Per-route latency. Keyed by the route's PATTERN, not by the path:
         # `/api/nodes/devices/(\d+)` is one key however many devices there
@@ -750,6 +754,14 @@ class AccessLog:
     def closed(self) -> None:
         with self._lock:
             self.active = max(0, self.active - 1)
+
+    def entered(self) -> None:
+        with self._lock:
+            self.in_flight += 1
+
+    def left(self) -> None:
+        with self._lock:
+            self.in_flight = max(0, self.in_flight - 1)
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -1085,10 +1097,13 @@ class Handler(BaseHTTPRequestHandler):
         # what keeps a revoked grant refused on the very next request.
         self._request_cache = {}
         started = time.perf_counter()
+        if self.access:
+            self.access.entered()
         try:
             self._route(method)
         finally:
             if self.access:
+                self.access.left()
                 self.access.record(
                     self.client_address[0], method, urlparse(self.path).path,
                     getattr(self, "_status", 0),
@@ -1357,6 +1372,16 @@ class Handler(BaseHTTPRequestHandler):
                 # reflecting back.
                 self._json({"error": "A numeric value in that request is out "
                                      "of range"}, 400)
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                # The client went away mid-write. handle_error already
+                # narrows this arm, but it only ever sees what escapes
+                # finish_request -- an abort raised INSIDE this try was
+                # caught below instead, printing a ~1.7 KB traceback per
+                # closed tab and then trying to write a 500 down the socket
+                # that just died. Neither is worth doing; the connection is
+                # finished either way.
+                self.close_connection = True
+                return
             except Exception as exc:
                 traceback.print_exc()
                 self._json({"error": "Internal Server Error"}, 500)
@@ -1570,17 +1595,19 @@ class WebServer:
     # How long stop() gives requests already in flight. daemon_threads means
     # server_close() joins none of them, so without this the teardown that
     # follows — service.shutdown(), which closes every store — can meet a
-    # handler mid-query. `access.active` counts open connections rather than
-    # running handlers, so this is an upper bound on the wait, not a measure
-    # of the work; and it is bounded either way, because a WebSocket terminal
-    # holds its connection for as long as the operator keeps it open.
+    # handler mid-query. It waits on `access.in_flight`, the requests being
+    # served: `access.active` counts open CONNECTIONS, so one idle keep-alive
+    # socket -- a browser sitting on a page -- turned every stop() into a flat
+    # 2 s sleep while never once waiting for the handler this exists for. The
+    # grace is still an upper bound, because a WebSocket terminal runs its
+    # handler for as long as the operator keeps the page open.
     DRAIN_GRACE_S = 2.0
 
     def stop(self) -> None:
         if self.httpd is not None:
             self.httpd.shutdown()          # the accept loop; not the handlers
             deadline = time.time() + self.DRAIN_GRACE_S
-            while self.access.active > 0 and time.time() < deadline:
+            while self.access.in_flight > 0 and time.time() < deadline:
                 time.sleep(0.02)
             self.httpd.server_close()
             self.httpd = None
