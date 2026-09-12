@@ -336,3 +336,26 @@ seven-function time-window controller reimplemented across `netflow.js` and
 stores), five routes with no front-end caller that are deliberate token-API
 surface, and a mechanical split for `api.py`'s 10,268 lines along the 27
 section boundaries it already carries.
+
+## 5.13.0 — Neon Signs, and the backlog nobody had actioned
+
+**Team setup** — a named team for this release: Bob leads; Troy and Laura on
+Opus; Testy, Fisty and Stephen King on Sonnet; Securitas on Opus; Dingus1 and
+Dingus2 on Haiku; Javariius reviewing on Fable. Standing rules: no HTML docs,
+comments capped at 20% prose, nothing removed from the GUI, everything written
+for a network engineer or CTO reading it, plan before running to completion.
+Testy runs no repeated full suites and drives the browser walk instead; Stephen
+King keeps this prompt log; Javariius reviews before any push. Two work items:
+a Neon Signs theme with neon tubes running across the page, bright but
+readable and contrasty, and a sweep of the previously flagged backlog with a
+plan to implement it.
+→ Team and rules recorded; work assigned across the waves.
+
+**Planning answers** — build the Neon theme together with Tier 1 (twelve
+small items) and Tier 2 (the medium refactors and the eleven duplications);
+Tier 3 (trap decryption, the three big file splits, GETBULK interface reads,
+SQL-paged upstream suggestions, the generation scheme, the webhook credential
+slot, ETag on the device list) is deferred to a written proposal rather than
+built. The Neon theme: glow on structure only, no flicker; electric cyan as
+the accent, hot pink for fail, lime for ok, yellow for warn.
+→ In progress; outcomes appended when the waves complete.
