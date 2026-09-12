@@ -336,13 +336,10 @@ def pool_and_walks():
 
 def software_version_survives_a_lost_vendor_get():
     """_poll_software_version returned all three sw_* keys whatever
-    happened, so update_from_poll's "only set when the poll actually read
-    them" guard -- which decides on the keys being PRESENT -- could never
-    decline. _identity_extras swallows an SnmpError and returns {}, so one
-    timed-out vendor GET wrote NULL over a stored version. On the vendors
-    whose version comes only from the vendor OID and never from sysDescr
-    (MikroTik, Palo Alto, UniFi, Extreme) that is the firmware column
-    emptying on a lost datagram and filling again next poll."""
+    happened, so record_poll's "only set when the poll actually read them"
+    guard -- which decides on the keys being PRESENT -- could never
+    decline, and one timed-out vendor GET wrote NULL over a stored
+    version."""
     print("\n-- a lost vendor GET does not empty the firmware column")
 
     proc, port = spawn_stub("stub_agent_vendor_health.py", "cisco")

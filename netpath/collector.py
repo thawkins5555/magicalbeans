@@ -61,8 +61,8 @@ class Collector(udpsock.UdpReceiver):
         self._settings: dict = {}
         self._allowed: set[str] = set()
         self._versions: set[int] = {V5, V9, IPFIX}
-        # Counted since the last line each throttle let through, so the line
-        # that does get through can say what it stood in for.
+        # Counted since each throttle's last line, so that line can say
+        # what it stood in for.
         self._templates_pending = 0
         self._first_seen_pending = 0
 
@@ -159,15 +159,11 @@ class Collector(udpsock.UdpReceiver):
             self._log_first_seen(exporter, data)
         gained = self.decoder.stats["templates"] - templates_before
         if gained:
-            # The timestamp is deliberately outside the throttle: the status
-            # strip's "last template" is how an operator sees that a v9
-            # exporter is still re-sending, and it must move on every one.
+            # Outside the throttle: the status strip's last-template time
+            # must move on every re-send, line or no line.
             self.counters["last_template"] = time.time()
-            # _read_templates counts every STORE, re-sends included, so an
-            # exporter re-announcing one template each second filed a line a
-            # second -- the third unthrottled log call on this path, and the
-            # one that outlives the other two, because a re-send is not an
-            # error and never stops.
+            # _read_templates counts every store, re-sends included, so this
+            # was a line per datagram from a perfectly healthy exporter.
             self._templates_pending += gained
             if self._log_netflow_throttled(
                     "templates",
@@ -195,15 +191,9 @@ class Collector(udpsock.UdpReceiver):
 
     def _log_netflow_throttled(self, key: str, message: str, detail="",
                                target: str = "", interval_s: float = 60.0) -> bool:
-        """_log_throttled, filing NETFLOW instead of ERROR.
-
-        Both lines this governs are ordinary NetFlow news rather than faults
-        — a template arriving, an exporter heard from for the first time —
-        which is why they cannot go through _log_throttled itself. They need
-        its rate limit all the same: the event log is a 3,000-entry ring,
-        and either line unthrottled empties it of everything an operator
-        wants at exactly the moment they look.
-        """
+        """_log_throttled, filing NETFLOW instead of ERROR — for the two
+        lines here that are news rather than faults and still need the rate
+        limit, the event log being a 3,000-entry ring."""
         now = time.time()
         if now - self._log_times.get(key, 0.0) < interval_s:
             return False
@@ -215,17 +205,11 @@ class Collector(udpsock.UdpReceiver):
 
     def _log_first_seen(self, exporter: str, data: bytes) -> None:
         """One "first packet from" line a minute, whoever it is from, and a
-        count of the exporters that line stood in for.
+        count of the exporters it stood in for.
 
-        _seen is an LRU of 4,096 source addresses, so a sender rotating
-        spoofed addresses makes every packet the first from someone. One
-        shared key, not one per exporter, because varying the exporter IS
-        the flood — but that also means twenty exporters turned on at once
-        file one line between them, and _first_from has already marked the
-        other nineteen seen, so they are never mentioned again. Hence the
-        suppressed count on the next line and the running total in
-        counters["first_seen_suppressed"]: the throttle drops the lines, not
-        the fact that there were more.
+        One shared key, not one per exporter, because varying the exporter
+        IS the flood — but _first_from has already marked the suppressed
+        ones seen, so without the count they are never mentioned again.
         """
         pending = self._first_seen_pending
         extra = (f" (and {pending} other new exporter(s) since the last such "

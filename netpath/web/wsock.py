@@ -383,13 +383,11 @@ class WebSocket:
 
     def _poll_readable(self, timeout: float) -> bool:
         """One readability wait on this socket, with no ceiling on the
-        descriptor's value. True when the wait says the socket is readable.
+        descriptor's value. True when the wait says it is readable — which
+        only _drain reads; _wait_readable wants the wait, not its answer.
 
         Both objects are per-call: `select.poll()` costs no descriptor at
-        all, and a selector is only built on the platforms that have no
-        `poll`. The return value matters only to _drain, whose guard was
-        inert while this returned None; _wait_readable wants the wait
-        itself, not its answer, and ignores it.
+        all, and a selector is only built where there is no `poll`.
         """
         if _HAS_POLL:
             poller = select.poll()
@@ -469,13 +467,9 @@ class WebSocket:
                 # descriptor at or above FD_SETSIZE, and the arm below would
                 # have swallowed that silently.
                 #
-                # The guard was inert while _poll_readable returned None --
-                # the loop only stopped because settimeout(0) makes recv
-                # raise BlockingIOError -- so the wait cost a syscall per
-                # round and decided nothing. A wait that cannot be
-                # performed at all is not evidence either way, and the recv
-                # below is non-blocking regardless, so it is tried anyway
-                # rather than abandoning the drain this exists to complete.
+                # A wait that cannot be performed at all is evidence of
+                # nothing, and the recv below is non-blocking regardless,
+                # so it is tried rather than the drain abandoned.
                 try:
                     readable = self._poll_readable(0)
                 except (OSError, ValueError):
