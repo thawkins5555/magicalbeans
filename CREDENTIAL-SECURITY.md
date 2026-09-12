@@ -1195,11 +1195,8 @@ about, and the portable store is no exception:
   the UI right after rewriting the passphrase file re-encrypts them under
   the new one immediately, in the same running process, rather than
   silently continuing to use whatever passphrase this process first read.
-- **The browser UI has not caught up** — see "A gap this workstream did not
-  close" above. The backend enforces and works correctly regardless; the
-  disabled-looking form fields are a display issue, not a security one, but
-  they will confuse an operator who configured a passphrase and still sees
-  "Windows DPAPI only" until that follow-up lands.
+- **The browser UI caught up in 4.39.0** — `platform.secret_store` now reports
+  the real availability, and the disabled-field copy names both remedies.
 - **A version this build does not recognise, or a blob too short to hold its
   own header, is refused by name** rather than guessed at — relevant mainly
   to a future format change, not to normal operation.
