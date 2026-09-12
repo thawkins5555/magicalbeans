@@ -434,4 +434,20 @@ final.
   for MAC/ARP; prune deletes those rows on the existing 180-day event
   clock; a present alias wins resolution over a stale one; a discovery job
   stuck `running` past the window is pruned alongside it.
-→ Table rewrite in flight; suite counts appended at close.
+→ Table rewrite landed: samples and samples_hourly WITHOUT ROWID (23.8 /
+  47.5 B/row from 66.7), copy-and-delete migration rehearsed against a
+  copy of this box's live file with a stop and restart: 230,485 rows
+  before and after, 21.9 MB → 7.0 MB, peak +215 pages.
+→ Review (Javariius, two passes): nine findings, then two more, all
+  closed — the prune's band probe had become a full scan of samples, the
+  migration's tail catch-up was unbounded, the cap line blamed the cap
+  on every young install, the batched alias lookup ignored `present`,
+  a purge walked the fleet's id space to its device. Prose 27.8% → 19.8%.
+→ Suites: 157. One full run, alone: 145 pass, 1 skipped (no PySide6),
+  11 known pre-existing failures, and one test expectation updated (a
+  budgeted purge step may now finish the raw table before the hourly).
+→ Walk: 932 steps, 887 ok, 45 planned skips, 0 failed; the 40 console
+  errors and 2 page errors are the viewer/NOC permission refusals the
+  matrix provokes. Storage panel expand and the two per-port fields
+  checked by hand.
+→ Pushed to main.

@@ -244,6 +244,24 @@ before and after, identical rows at five sampled offsets and mid-split,
 the file 21.9 MB → 7.0 MB. The storage report's note shows the band in
 progress while a rewrite is running.
 
+**Reviewed, and what the review changed.** Two passes found eleven
+things, none losing data, all fixed before the push: the prune's band
+probe had turned into a full scan of `samples` once the timestamp index
+was gone (bands now come from `metrics`); the migration's final tail was
+copied in one unbounded transaction (it now re-bands against an advancing
+freeze until fewer than 50,000 rows remain); a rename could land between
+a caller's table lookup and its statement (state is flipped under the lock
+and every guarded statement re-checks); a device purge walked the fleet's
+id space and reached its device at maximum band width (bands start at the
+device's own ids); the cap-trim's per-metric depth counted metrics with no
+raw rows and could undercut the floor (holders per class instead); the
+Settings line blamed the cap on every install younger than 360 days (it
+now needs the file at 90% of the cap); the batched alias lookup ignored
+`present`; and the report's immutable fallback could never trigger. The
+full suite ran once, alone: 145 of 157 pass, one skipped, eleven failing
+identically on the untouched base or on this cp1252 console; the browser
+walk ran its 932-step matrix with none failed.
+
 **Recorded, not built.** Three follow-ups were identified and deliberately
 deferred rather than built this release: dropping the hourly table's hour index behind a persisted oldest-hour watermark, worth a further 14 bytes per row (waits until the rewrite has run on real installs), a daily
 rollup tier below the hourly one (waits on real numbers from the storage
