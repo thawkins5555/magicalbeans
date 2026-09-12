@@ -805,10 +805,29 @@
               draw: () => drawEventTable() },
   };
 
+  const DETAIL_EMPTY_TEXT = 'Select a device to see its stats.';
+
+  /* The placeholder that stands where the detail pane would be, with the
+     sentence for the occasion: the ordinary invitation, or loadDetail's
+     "that one is gone". */
+  function showDetailEmpty(text) {
+    App.setText(App.el('nd-detail-empty'), text || DETAIL_EMPTY_TEXT);
+    App.el('nd-detail-empty').hidden = false;
+    App.el('nd-detail').hidden = true;
+  }
+
+  /* A refusal that means "no such row", not "the server is unreachable".
+     api.py's _require raises ValueError, which server.py answers 400 with
+     "No such device"; a 404 is the other shape the same answer can take. */
+  function isMissing(error) {
+    return !!error && (error.status === 404
+                       || (error.status === 400
+                           && /^No such /.test(String(error.message || ''))));
+  }
+
   async function loadDetail() {
     if (!view.selected) {
-      App.el('nd-detail-empty').hidden = false;
-      App.el('nd-detail').hidden = true;
+      showDetailEmpty();
       return;
     }
     // Renew the fast-poll focus for the selected device on every refresh
@@ -828,10 +847,28 @@
     const deviceId = view.selected;
     const subName = view.detailSub;
     const sub = DETAIL_SUBS[subName];
-    const [detail, subPayload] = await Promise.all([
-      App.get(`/api/nodes/devices/${deviceId}`),
-      sub ? App.get(`/api/nodes/devices/${deviceId}/${sub.path}`) : null,
-    ]);
+    let detail;
+    let subPayload;
+    try {
+      [detail, subPayload] = await Promise.all([
+        App.get(`/api/nodes/devices/${deviceId}`),
+        sub ? App.get(`/api/nodes/devices/${deviceId}/${sub.path}`) : null,
+      ]);
+    } catch (error) {
+      // The selection can be off the page on screen (refresh() keeps it —
+      // one page is not the fleet), so the only thing that can tell us the
+      // device is gone is this fetch. Deleted from another session it 404s
+      // every tick, and rethrowing made runRefresh report a transport
+      // failure and raise the stale banner for as long as the selection
+      // stood. Said once, here, and the selection moves on.
+      if (!isMissing(error)) throw error;
+      if (view.selected !== deviceId) return;
+      showDetailEmpty('That device has been removed.');
+      view.selected = view.devices.length ? view.devices[0].id : null;
+      view.detailSubFor = null;
+      drawTable();
+      return;
+    }
     // The selection can move while this is in flight — a big switch's
     // interface read is slower than a small one's, so two ticks can land out
     // of order. Without this, the slow reply would paint the previous
@@ -2995,7 +3032,12 @@
       // separate search. An unmatched neighbour names whatever it reported
       // about itself and says plainly that Nodes could not place it.
       // A neighbour that only named itself by IP carries the name the API
-      // resolved; the address stays in the tooltip when a PTR record made it.
+      // resolved. The address goes on a visible second line, the way the
+      // firmware report prints a device's: as a title alone on a span
+      // nothing can focus, it was unreachable from the keyboard, invisible
+      // on a touch screen and uncopyable — and the address is the thing an
+      // operator takes to the next tool. The title stays for the hover, and
+      // is what says the name came from a PTR record.
       let remote;
       if (r.matched_device_id != null) {
         remote = `<button class="linkish nd-nb-link" data-device="${r.matched_device_id}">` +
@@ -3003,10 +3045,15 @@
       } else {
         const label = escape(r.resolved_name || r.sys_name || r.chassis_id || 'unidentified');
         const address = r.remote_address || r.chassis_id || '';
-        remote = (r.resolved_source === 'dns' && r.resolved_name
+        const fromDns = r.resolved_source === 'dns' && r.resolved_name;
+        remote = (fromDns
                   ? `<span title="${escape(address)} (reverse DNS)">${label}</span>`
                   : label) +
-          '<span class="hint"> (not in Nodes)</span>';
+          '<span class="hint"> (not in Nodes)</span>' +
+          (address && address !== label
+            ? `<div class="ip-line">${escape(address)}` +
+              (fromDns ? '<span class="hint"> (reverse DNS)</span>' : '') + '</div>'
+            : '');
       }
       tr.innerHTML = `<td>${escape(r.local_port || `if ${r.if_index}`)}</td>` +
         `<td>${escape((r.protocol || '').toUpperCase())}</td>` +
@@ -6549,7 +6596,7 @@
       drawMibsTable();
     }
     if (view.selected) await loadDetail();
-    else { App.el('nd-detail-empty').hidden = false; App.el('nd-detail').hidden = true; }
+    else showDetailEmpty();
     if (view.macSearchPending) {
       view.macSearchPending = false;
       await resolveMacSearch(q).catch(() => {});

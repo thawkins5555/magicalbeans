@@ -2155,6 +2155,23 @@ check("/credential`, credential)\n              .catch(() => {})" not in _ADD_PA
       "toasted after the dialog closes on the row that was added")
 
 # ---------------------------------------------------------------------------
+# The anchors in sections 48 and 49 are looked up through _slice59(), which
+# answers "" for a fragment that is no longer there: a check that has been
+# edited out of the code should read as a failed contract here, not as a
+# traceback that hides every check after it.
+def _slice59(body, start, end=None):
+    if start not in body:
+        return ""
+    tail = body[body.index(start):]
+    if end is None:
+        return tail
+    return tail[:tail.index(end)] if end in tail else tail
+
+
+def _before59(body, first, second):
+    return first in body and second in body and body.index(first) < body.index(second)
+
+
 # 48. FRONTEND MODULES (5.9.1 review): the escaping, the per-event work and
 #     the house patterns the module review of alerts/mapper/debug/netflow/
 #     netpath/wireless/configrx/ipam/ssh turned up. Each is one line of text
@@ -2184,13 +2201,14 @@ check("channel      ${escape(" in _W59,
 #      pointermove. draw() has been rAF-coalesced since 5.0.1; the drag path
 #      is the one that skipped it, and it needs its own handle so a queued
 #      full redraw and a queued drag redraw do not cancel each other.
-_NODE_DRAG59 = _M59[_M59.index("  function onNodePointerDown("):
-                    _M59.index("  function queuePositionWrite(")]
+_NODE_DRAG59 = _slice59(_M59, "  function onNodePointerDown(",
+                        "  function queuePositionWrite(")
 check("function requestDragDraw()" in _M59 and "let dragPending = 0;" in _M59
       and "dragPending = window.requestAnimationFrame(" in _M59,
       "the drag redraw is coalesced to one animation frame on its own "
       "pending handle, not on draw()'s")
-check("requestDragDraw();" in _NODE_DRAG59 and "redrawDragged();" not in _NODE_DRAG59,
+check(_NODE_DRAG59 and "requestDragDraw();" in _NODE_DRAG59
+      and "redrawDragged();" not in _NODE_DRAG59,
       "...and the pointermove handler asks for that frame rather than "
       "rebuilding the links inside the event")
 
@@ -2199,9 +2217,10 @@ check("requestDragDraw();" in _NODE_DRAG59 and "redrawDragged();" not in _NODE_D
 #      every one-second poll.
 check("function passes(event, filter)" in _D59,
       "debug's passes() takes the filter it is to apply")
-_PASSES59 = _D59[_D59.index("  function passes(event, filter)"):
-                 _D59.index("  const EVENT_COLUMNS")]
-check("categoriesOn()" not in _PASSES59 and "App.el(" not in _PASSES59,
+_PASSES59 = _slice59(_D59, "  function passes(event, filter)",
+                     "  const EVENT_COLUMNS")
+check(_PASSES59 and "categoriesOn()" not in _PASSES59
+      and "App.el(" not in _PASSES59,
       "...and reads no control of its own, per event")
 check("function currentFilter()" in _D59
       and _D59.count("const filter = currentFilter();") == 2
@@ -2212,19 +2231,22 @@ check("function currentFilter()" in _D59
 # 48e. NetPath's timeline: the same brush fix as NetFlow above, and the rect
 #      measured before the signature check — a forced layout ten times a
 #      second for a signature that was going to match.
-_TL59 = _NP59[_NP59.index("  function drawTimeline() {"):
-              _NP59.index("  /* The overrun note is a sentence")]
-check("view.drag" not in _TL59[:_TL59.index("svg.dataset.timelineSig = sig;")],
+_TL59 = _slice59(_NP59, "  function drawTimeline() {",
+                 "  /* The overrun note is a sentence")
+check("svg.dataset.timelineSig = sig;" in _TL59
+      and not _before59(_TL59, "view.drag", "svg.dataset.timelineSig = sig;"),
       "a drag in progress is not part of the timeline's redraw signature")
 check("const paintBrush = () =>" in _TL59 and _TL59.count("paintBrush();") >= 3,
       "...the timeline brush is one persistent rect moved in place, painted "
       "by the rebuild, by the pointermove and by the release")
-check("getBoundingClientRect" not in _TL59[:_TL59.index("if (svg.dataset.timelineSig === sig)")],
+check("if (svg.dataset.timelineSig === sig)" in _TL59
+      and not _before59(_TL59, "getBoundingClientRect",
+                        "if (svg.dataset.timelineSig === sig)"),
       "drawTimeline does not measure the pane before the signature check — "
       "fastTick calls it ten times a second and getBoundingClientRect forces "
       "a synchronous layout")
-_RESIZE59 = _NP59[_NP59.index("for (const event of ['resize', 'panes-resized'])"):]
-_RESIZE59 = _RESIZE59[:_RESIZE59.index("\n    }\n")]
+_RESIZE59 = _slice59(_NP59, "for (const event of ['resize', 'panes-resized'])",
+                     "\n    }\n")
 check("function measureTimeline()" in _NP59
       and "timelineSize = null;" in _RESIZE59
       and "timelineSize || measureTimeline()" in _TL59,
@@ -2233,8 +2255,9 @@ check("function measureTimeline()" in _NP59
 
 # 48f. mapper's toolbar state runs on the same 10Hz fastTick and wrote five
 #      .disabled properties unconditionally.
-_TOOLBAR59 = _M59[_M59.index("  function drawToolbarState() {"):
-                  _M59.index("  /* -------------------------------------------------------------- VLANs */")]
+_TOOLBAR59 = _slice59(
+    _M59, "  function drawToolbarState() {",
+    "  /* -------------------------------------------------------------- VLANs */")
 check("button.disabled !== disabled" in _TOOLBAR59
       and "App.el('mp-remove-node').disabled =" not in _TOOLBAR59,
       "the mapper toolbar compares before assigning .disabled, the same rule "
@@ -2243,14 +2266,14 @@ check("button.disabled !== disabled" in _TOOLBAR59
 # 48g. Alerts re-fetched four configuration endpoints every 10s. They are
 #      read on the first refresh, on a local edit, and otherwise on a slow
 #      clock.
-_REFRESH59 = _A59[_A59.index("  async function refresh() {"):
-                  _A59.index("  function drawAlertsPager()")]
+_REFRESH59 = _slice59(_A59, "  async function refresh() {",
+                      "  function drawAlertsPager()")
 check("async function loadConfig()" in _A59 and "CONFIG_MAX_AGE_MS" in _A59,
       "the alerts rules/extras/templates/device-thresholds reads live in one "
       "place with an age on them")
 for _path in ("'/api/alerts/rules'", "'/api/alerts/rules/extras'",
               "'/api/alerts/templates'", "'/api/alerts/device-thresholds'"):
-    check(_path not in _REFRESH59,
+    check(_REFRESH59 and _path not in _REFRESH59,
           "%s is configuration: refresh() does not re-read it six times a "
           "minute" % _path)
 check("const config = loadConfig();" in _REFRESH59 and "await config;" in _REFRESH59,
@@ -2282,8 +2305,8 @@ check("editTemplate(t.id);" in _A59 and "editTemplate(t);" not in _A59,
 for _name in ("alerts", "configrx", "debug", "ipam", "mapper", "netflow",
               "netpath", "nodes", "wireless"):
     _body = read("%s.js" % _name)
-    _start = _body.index("async function refresh()")
-    check("if (App.state.tab !== '%s') return;" % _name in _body[_start:_start + 200],
+    _opening = _slice59(_body, "async function refresh()")[:200]
+    check("if (App.state.tab !== '%s') return;" % _name in _opening,
           "%s.js's refresh() opens with the tab guard" % _name)
 # 48k. The SSH page's comment said Escape was the documented way out of the
 #      terminal; the hint under it and attachCustomKeyEventHandler both say
@@ -2292,9 +2315,8 @@ for _name in ("alerts", "configrx", "debug", "ipam", "mapper", "netflow",
 #      would break vi/less/menu consoles for every operator.
 _SSH_HTML59 = read("ssh.html")
 _SSH_JS59 = read("ssh.js")
-_SSH_COMMENT59 = _SSH_HTML59[_SSH_HTML59.index("<!-- The terminal traps Tab"):]
-_SSH_COMMENT59 = _SSH_COMMENT59[:_SSH_COMMENT59.index("-->")]
-check("Ctrl+F6" in _SSH_COMMENT59
+_SSH_COMMENT59 = _slice59(_SSH_HTML59, "<!-- The terminal traps Tab", "-->")
+check(_SSH_COMMENT59 and "Ctrl+F6" in _SSH_COMMENT59
       and "Escape is the documented" not in _SSH_COMMENT59,
       "ssh.html's comment names the exit the code actually implements")
 check("event.key === 'F6' && event.ctrlKey" in _SSH_JS59
@@ -2302,8 +2324,8 @@ check("event.key === 'F6' && event.ctrlKey" in _SSH_JS59
       "...which is still Ctrl+F6, in the handler and in the visible hint")
 
 
-_WL_REFRESH59 = _W59[_W59.index("  async function refresh() {"):
-                     _W59.index("  function exportApsCsv()")]
+_WL_REFRESH59 = _slice59(_W59, "  async function refresh() {",
+                         "  function exportApsCsv()")
 check(_WL_REFRESH59.count("App.state.tab !== 'wireless'") == 2,
       "wireless's refresh re-checks the tab after its second await, before it "
       "paints the detail pane and the table")
@@ -2313,24 +2335,6 @@ check(_WL_REFRESH59.count("App.state.tab !== 'wireless'") == 2,
 # 49. NODES/APP (5.9.1 review): the frontend-core findings. The paged device
 #     list, the kiosk query string, the per-tick configuration fetches, the
 #     two browser-built CSVs and the three status lines nobody could hear.
-#
-# The anchors below are looked up through _slice59(), which answers "" for a
-# fragment that is no longer there: a check that has been edited out of the
-# code should read as a failed contract here, not as a traceback that hides
-# every check after it.
-def _slice59(body, start, end=None):
-    if start not in body:
-        return ""
-    tail = body[body.index(start):]
-    if end is None:
-        return tail
-    return tail[:tail.index(end)] if end in tail else tail
-
-
-def _before59(body, first, second):
-    return first in body and second in body and body.index(first) < body.index(second)
-
-
 _N59 = read("nodes.js")
 _NODES_REFRESH59 = _slice59(_N59, "  async function refresh() {",
                             "  // aabbccddeeff -> aa:bb:cc:dd:ee:ff")
@@ -2616,7 +2620,10 @@ check("r.resolved_name" in _NB52,
       "nodes.js' neighbours table shows the name the API resolved for an "
       "IP-only neighbour rather than the address")
 check("(reverse DNS)" in _NB52 and "r.resolved_source === 'dns'" in _NB52,
-      "...and says when that name came from a PTR record, address in the title")
+      "...and says when that name came from a PTR record")
+check('<div class="ip-line">' in _NB52,
+      "...with the address on a visible line of its own, not only in a title "
+      "on a span no keyboard or touch screen can reach")
 check("'(not in Nodes)'" in _NB52 or "(not in Nodes)" in _NB52,
       "...while still saying plainly that the neighbour is not a Nodes device")
 
@@ -2669,6 +2676,144 @@ check("m.entity_kind === 'device_rule'" in ALERTS53,
 check("rule_muted_count" in NODES53,
       "the Nodes device list reads rule_muted_count, so a device with one "
       "muted rule is not drawn as fully alerting")
+
+# ---------------------------------------------------------------------------
+# 54. 5.11.0 FIX LANE: the defects a review found in the shipped browser code.
+#     Each is one line of text in a file no linter reads, and each was a wrong
+#     answer on screen rather than a style preference.
+NODES54 = read("nodes.js")
+EVENTS54 = read("events.js")
+DEBUG54 = read("debug.js")
+ALERTS54 = read("alerts.js")
+NETPATH54 = read("netpath.js")
+
+# 54a. A device deleted from another session while it was selected, and off
+#      the page on screen (refresh() keeps an off-page selection on purpose
+#      since 4.47.0), made loadDetail() 404 every tick. The rejection reached
+#      runRefresh, which called connected(false): the stale banner came up
+#      over a healthy server and never cleared, because the selection that
+#      caused it never moved.
+_LOAD54 = _slice59(NODES54, "  async function loadDetail() {",
+                   "  /* One sub-pane fetched and redrawn on its own")
+check(_LOAD54 and "catch (error)" in _LOAD54 and "isMissing(error)" in _LOAD54,
+      "loadDetail() catches a not-found from its own fetch instead of "
+      "rejecting into the refresh plumbing")
+check("function isMissing(error)" in NODES54
+      and "error.status === 404" in NODES54 and "No such " in NODES54,
+      "...and 'not found' means the two shapes the API actually answers "
+      "with: a 404, or the 400 server.py turns _require's ValueError into")
+check("That device has been removed." in _LOAD54,
+      "...the pane says so in words rather than just going blank")
+check("view.selected = view.devices.length ? view.devices[0].id : null;"
+      in _LOAD54,
+      "...and the selection moves to the first row on the page, so the next "
+      "tick is healthy")
+check(_NODES_REFRESH59
+      and "const wholeResultSet = view.pageTotal <= view.devices.length;"
+      in _NODES_REFRESH59,
+      "...while refresh() still keeps an off-page selection: one page is not "
+      "the fleet, and \"not in this list\" still does not mean \"gone\"")
+
+# 54b. api.py sent `community: ""` to an account that may not read it, which
+#      is exactly what a trap carrying no community looks like -- and on v3
+#      it threw the USM user name away with it. The sibling _community_fields
+#      omits the key instead, and the Nodes device form has always said
+#      "stored value not shown" for the absence.
+check("function communityText(row)" in EVENTS54,
+      "events.js decides the Community / user cell in one place")
+check("if (!('community' in row) && row.has_community) return 'not shown';"
+      in EVENTS54,
+      "...a trap that carried one says so without naming it, off the "
+      "has_community flag and the ABSENCE of the key")
+check("cell: (r) => escape(communityText(r))" in EVENTS54,
+      "...the trap table's column renders through it")
+check(EVENTS54.count("escape(communityText(row))") == 2,
+      "...and so do both detail lines, the v3 user and the v1/v2c community")
+
+# 54c. /api/debug's summary answered `false` and `0` for the two NetPath
+#      figures when the account could not see NetPath, so a `debug: read`
+#      operator read "scheduler stopped, 0 of 0 trace workers busy" -- a
+#      fault report about a service that was running perfectly well.
+check("summary.scheduler == null" in DEBUG54,
+      "debug.js renders a null scheduler as an em dash, not as 'stopped': "
+      "null is 'you cannot see this module'")
+check("summary.workers_total == null" in DEBUG54,
+      "...and the same for the worker counts, rather than '0 of 0 busy'")
+
+# 54d. Alerts' configuration lists are read on a 60-second clock, which is
+#      right for a tab left open and wrong for one just opened -- the release
+#      notes and the review both promised a read on opening.
+_ACT54 = _slice59(ALERTS54, "  async function activate(opts) {",
+                  "  /* ----------------------------------------------------------- refresh */")
+check(_ACT54 and _before59(_ACT54, "view.configAt = 0;", "if (!opts) return;"),
+      "entering the Alerts tab drops the cached configuration BEFORE the "
+      "opts guard -- a plain tab switch calls activate() with none")
+
+# 54e. Both histogram pages plotted the bucket width they ASKED for. The
+#      server widens it when the window would overrun HIST_MAX_BUCKETS and
+#      says so in bucket_s, so the bars were drawn at the wrong span for
+#      exactly the windows that get widened.
+for _name, _body in (("alerts.js", ALERTS54), ("events.js", EVENTS54)):
+    check("overview.bucket_s ?? bucket" in _body,
+          "%s plots the bucket width the server used, not the one it asked "
+          "for" % _name)
+
+# 54f. Pause froze the cursor as well as the drawing, so every one-second
+#      poll re-asked for everything since the pause: a paused tab converged
+#      on re-downloading the whole ring, once a second, for as long as it
+#      was held.
+_REF54 = _slice59(DEBUG54, "  async function refresh() {", "  function init()")
+check(_REF54 and "if (payload.events.length) {" in _REF54
+      and "if (!view.paused && payload.events.length)" not in _REF54,
+      "the debug cursor and buffer advance outside the paused guard -- Pause "
+      "stops the drawing, not the subscription")
+check(_REF54 and _before59(_REF54, "view.seq = payload.last_seq;",
+                           "if (!view.paused) drawEvents("),
+      "...the cursor advances first and only the draw is conditional")
+check("if (!view.paused) drawEvents({ append: true });" in DEBUG54,
+      "...and Resume paints the buffer that filled while it was held")
+
+# 54g. The restart resync empties the destination select, which is the same
+#      state a reload leaves it in -- but the restore lived inside the batch
+#      block, so a restart quietly moved the page back to "All destinations".
+check("function restoreSavedTarget(select)" in DEBUG54
+      and DEBUG54.count("restoreSavedTarget(select)") >= 3,
+      "the remembered Debug destination is restored by the restart resync as "
+      "well as by an ordinary batch")
+
+# 54h. One failing secondary series took the whole NetPath page down: the
+#      await rejected refresh(), runRefresh reported the page disconnected,
+#      and the topology fetch and both draws below it never ran.
+_HTTPS54 = _slice59(
+    NETPATH54, "if (currentTarget() && currentTarget().https_url) {",
+    "renderWebStat();")
+check(_HTTPS54 and "try {" in _HTTPS54 and "catch (error)" in _HTTPS54,
+      "netpath.js' web-page series is fetched inside a try, like the "
+      "dashboard's offenders list -- it is not allowed to take the topology "
+      "fetch and the two draws below it down with it")
+check(_HTTPS54 and "error.superseded" in _HTTPS54,
+      "...while a superseded request is still rethrown, so an overlapping "
+      "refresh is not mistaken for a failure")
+
+# 54i. "muted" beside a rule name meant either "every alert for this device
+#      is silenced" or "only this rule is, on this device" -- the very
+#      distinction the 5.11.0 per-rule mute exists to make -- with no title
+#      to tell the two apart.
+_TAG54 = _slice59(ALERTS54, "  function mutedTagFor(row) {",
+                  "  const alertColumns")
+check(_TAG54 and "'device muted'" in _TAG54 and "'rule muted'" in _TAG54,
+      "the muted tag says WHICH kind of mute is on the row")
+check(_TAG54 and "Every alert for this device is muted until" in _TAG54
+      and "This rule is muted on this device until" in _TAG54,
+      "...and its title says which, and until when")
+
+# 54j. On a deep link the detail pane can paint before the rules load, and an
+#      empty view.rules looks exactly like a deleted rule: for one interval a
+#      live rule was reported as no longer existing.
+check("'Loading rules" in ALERTS54 and "(view.rules || []).length" in ALERTS54,
+      "an empty rules list reads as 'still loading', not as 'this alert's "
+      "rule has been deleted'")
+
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))
