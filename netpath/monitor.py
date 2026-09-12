@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 from .db import Database
@@ -812,11 +813,28 @@ class HopProber(Worker):
 
 
 def https_url_for(target) -> str:
-    """The destination's web page URL, or "" for one with none."""
+    """The destination's web page URL, or "" for one with none.
+
+    Any `user:password@` is dropped on the way out. It never worked -- the
+    whole netloc reaches http.client, which answers "nonnumeric port: ..."
+    with the password inside it -- and that sentence is stored as the check's
+    error, served to every netpath:read account and written to the event log.
+    _validate_target_url refuses a new one; this is for the URLs already in
+    the database, and it is the single funnel every caller here goes through.
+    """
     keys = target.keys()
     if "https_url" not in keys:
         return ""
-    return str(target["https_url"] or "").strip()
+    url = str(target["https_url"] or "").strip()
+    if "@" not in url:
+        return url
+    parts = urllib.parse.urlsplit(url)
+    if not (parts.username or parts.password):
+        return url
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urllib.parse.urlunsplit(parts._replace(netloc=host))
 
 
 class HttpsChecker(Worker):

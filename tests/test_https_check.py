@@ -236,6 +236,45 @@ try:
           db.https_checks_between(kept, 0, time.time() + 3600))
     db.close()
 
+    # ---------------------------------------------------------------------
+    # A credential in the URL is refused, and stripped from one already stored
+    #
+    # `https://admin:pass@host/` could never be checked: http.client is handed
+    # the whole netloc and answers "nonnumeric port: pass@host" -- with the
+    # password in it. That sentence is stored in https_checks.error, served as
+    # https_error to every netpath:read account and written to the event log
+    # beside the URL. So the boundary refuses one, and the single funnel every
+    # caller inside the checker goes through drops the userinfo from the URLs
+    # that are already in the database.
+    from netpath.monitor import https_url_for
+    from netpath.web import api as web_api
+
+    for _bad in ("https://admin:hunter2@switch.example/",
+                 "https://admin@switch.example:8443/status"):
+        try:
+            web_api._validate_target_url(_bad)
+            refused = ""
+        except ValueError as exc:
+            refused = str(exc)
+        check("a web page URL carrying a credential is refused: %s" % _bad,
+              refused == "https_url must not contain a username or password",
+              refused)
+    check("...while an ordinary one is still accepted",
+          web_api._validate_target_url("https://switch.example:8443/status")
+          == "https://switch.example:8443/status")
+
+    class _Row(dict):
+        def keys(self):
+            return list(dict.keys(self))
+
+    check("a stored credential never reaches the check or the log",
+          https_url_for(_Row(https_url="https://admin:hunter2@switch.example:8443/x"))
+          == "https://switch.example:8443/x",
+          https_url_for(_Row(https_url="https://admin:hunter2@switch.example:8443/x")))
+    check("...and a URL with no credential is handed on unchanged",
+          https_url_for(_Row(https_url="https://switch.example/x"))
+          == "https://switch.example/x")
+
     print()
     print("FAILURES:", FAILS if FAILS else "none")
 finally:

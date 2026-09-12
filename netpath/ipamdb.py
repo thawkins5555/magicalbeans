@@ -563,13 +563,18 @@ class IpamDatabase(SqliteStore):
             return True
 
     def conflicts(self, include_resolved: bool = False) -> list[sqlite3.Row]:
+        # `, id DESC` is the tie-break, not decoration: one scan stamps every
+        # conflict it opens with the same last_seen_ts, so on a tie SQLite is
+        # free to return them in any order and a caller paging over the list
+        # could see one row twice and another not at all.
         with self._lock:
             if include_resolved:
                 return self._conn.execute(
-                    "SELECT * FROM conflicts ORDER BY last_seen_ts DESC").fetchall()
+                    "SELECT * FROM conflicts"
+                    " ORDER BY last_seen_ts DESC, id DESC").fetchall()
             return self._conn.execute(
                 "SELECT * FROM conflicts WHERE resolved_ts IS NULL"
-                " ORDER BY last_seen_ts DESC").fetchall()
+                " ORDER BY last_seen_ts DESC, id DESC").fetchall()
 
     def conflicts_since(self, cursor: int, limit: int | None = None
                         ) -> list[sqlite3.Row]:
