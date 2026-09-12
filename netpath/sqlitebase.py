@@ -519,6 +519,39 @@ class SqliteStore:
             added.add(name)
         return added
 
+    # A FULL checkpoint cannot run past another connection's read lock, and
+    # it does not raise when it hits one: it reports it in the first column
+    # of its result row (0 completed, 1 busy) and leaves the frames it could
+    # not copy in the log. Measured on this SQLite: one blocked attempt
+    # returns (1, 3, 2) -- the just-committed frame not backfilled -- after
+    # blocking the connection's whole 5 s busy_timeout first, three more with
+    # that timeout wound down cost 344 ms between them, and the moment the
+    # reader lets go the checkpoint completes in under a millisecond. So the
+    # retries below lower the timeout rather than paying 5 s each.
+    CHECKPOINT_RETRIES = 4
+    CHECKPOINT_RETRY_TIMEOUT_MS = 50
+    CHECKPOINT_RETRY_WAIT_S = 0.05
+
+    def _checkpoint_full(self) -> bool:
+        """Fold the log back into the database file. True when it really did.
+
+        The caller holds the store lock.
+        """
+        if not self._conn.execute("PRAGMA wal_checkpoint(FULL)").fetchone()[0]:
+            return True
+        restore = self._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        self._conn.execute(
+            f"PRAGMA busy_timeout={self.CHECKPOINT_RETRY_TIMEOUT_MS}")
+        try:
+            for _ in range(self.CHECKPOINT_RETRIES):
+                time.sleep(self.CHECKPOINT_RETRY_WAIT_S)
+                if not self._conn.execute(
+                        "PRAGMA wal_checkpoint(FULL)").fetchone()[0]:
+                    return True
+        finally:
+            self._conn.execute(f"PRAGMA busy_timeout={restore}")
+        return False
+
     def _commit_durable(self) -> None:
         """Commit, and do not return until the transaction is on the platter.
 
@@ -529,10 +562,25 @@ class SqliteStore:
         "we said we stored your password" has to stay true. A full checkpoint
         forces the log back into the database file and syncs it; it costs a
         few milliseconds, on writes that happen a handful of times a year.
+
+        The pragma's own answer used to be dropped on the floor, so a
+        checkpoint another connection's read lock had stopped read exactly
+        like one that had worked -- and the credential the operator was told
+        was saved was still only in the -wal beside the file. It is retried
+        briefly and, if it still cannot run, said out loud.
         """
         with self._lock:
             self._conn.commit()
-            self._conn.execute("PRAGMA wal_checkpoint(FULL)")
+            if self._checkpoint_full():
+                return
+            log.warning(
+                "%s: the credential just written is committed but still only "
+                "in the write-ahead log -- a full checkpoint could not run "
+                "past another connection's read lock in %.1fs. The row is "
+                "there and readable; it is a power loss before the next "
+                "checkpoint that could lose it.",
+                os.path.basename(self.path),
+                self.CHECKPOINT_RETRIES * self.CHECKPOINT_RETRY_WAIT_S)
 
     # How long close() waits for whatever holds the store lock before closing
     # anyway. The lock is held by ordinary queries, and the web server's
