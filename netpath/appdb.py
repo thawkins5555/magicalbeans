@@ -217,6 +217,9 @@ GLOBAL_DEFAULTS = {
     # after login regardless of activity, as a hard ceiling.
     "session_idle_minutes": 10,
     "session_max_hours": 12,
+    # app.db is never trimmed — the audit trail is the one history that must
+    # survive every sweep — so it gets a warning instead of a cap.
+    "app_db_warn_mib": 512,
     "max_trace_db_mb": 512,
     "max_flow_db_mb": 2048,
     # nodes.db is just the inventory since 5.0.0 and barely grows; the

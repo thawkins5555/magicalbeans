@@ -219,6 +219,40 @@ check("...and the stores that keep no history still report None there",
       and storage["mapper_oldest_ts"] is None,
       (storage["nodes_mibs_oldest_ts"], storage["mapper_oldest_ts"]))
 
+# --------------------------- 3b. app.db has a warning where others have a cap
+# The audit trail is never trimmed, so app.db is the one store no sweep can
+# bring back under a ceiling. The storage block says so once it is large,
+# and names the setting that decides "large".
+check("app_db_warn_mib defaults to 512 MiB",
+      service.settings.get("app_db_warn_mib") == 512,
+      service.settings.get("app_db_warn_mib"))
+check("no warning while app.db is under the threshold",
+      "app_db_warning" not in storage, storage.get("app_db_warning"))
+
+real_size_bytes = service.app_db.size_bytes
+service.app_db.size_bytes = lambda: 600 * 1024 * 1024
+try:
+    warned = api_mod._storage(service)
+    service.settings["app_db_warn_mib"] = 1024
+    raised = api_mod._storage(service)
+finally:
+    service.settings["app_db_warn_mib"] = 512
+    service.app_db.size_bytes = real_size_bytes
+
+check("app.db past the threshold carries a warning line, naming the size and "
+      "the setting",
+      "600" in str(warned.get("app_db_warning"))
+      and "app_db_warn_mib" in str(warned.get("app_db_warning")),
+      warned.get("app_db_warning"))
+check("...and it is a warning only: the byte count and the store list are "
+      "unchanged",
+      warned["app_bytes"] == 600 * 1024 * 1024
+      and {k for k in warned if k.endswith("_bytes")}
+      == {k for k in storage if k.endswith("_bytes")},
+      sorted(warned))
+check("...and raising the threshold past the file clears it",
+      "app_db_warning" not in raised, raised.get("app_db_warning"))
+
 service.shutdown()
 
 

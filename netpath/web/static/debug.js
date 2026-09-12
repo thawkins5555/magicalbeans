@@ -484,6 +484,9 @@
         (summary.discovery_active ? `, ${summary.discovery_active} scan(s) sweeping` : ''),
       `${summary.buffered} events buffered`,
     ];
+    /* app.db is the one store with no cap (its audit trail is never trimmed), so its size is only ever a warning. */
+    const storageWarning = ((App.state.serverState || {}).storage || {}).app_db_warning;
+    if (storageWarning) parts.push(storageWarning);
     const nc = payload.node_counters;
     if (nc) {
       parts.push(`Nodes polls: ${nc.polls || 0} total, ${nc.ok || 0} ok, ` +

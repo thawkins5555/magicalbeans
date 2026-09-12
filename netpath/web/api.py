@@ -872,6 +872,16 @@ def _storage(service) -> dict:
     if total:
         result["disk_free"] = free
         result["disk_total"] = total
+    # app.db carries the audit trail, which no sweep may trim, so it has a
+    # warning where every other store has a cap: the one line saying it is
+    # large enough to want an operator's attention.
+    warn_mib = int(service.settings.get("app_db_warn_mib") or 0)
+    app_bytes = result.get("app_bytes")
+    if warn_mib and app_bytes and app_bytes > warn_mib * 1024 * 1024:
+        result["app_db_warning"] = (
+            f"app.db is {app_bytes / (1024 * 1024):.0f} MiB, past the "
+            f"{warn_mib} MiB app_db_warn_mib mark — its audit trail is never "
+            f"trimmed; archive the file or raise the threshold")
     return result
 
 
@@ -2123,6 +2133,7 @@ _GLOBAL_SETTINGS_RANGES = {
     # on writing to it.
     "rollup_minute_days": (0, 3650),
     "rollup_retention_days": (0, 3650),
+    "app_db_warn_mib": (16, None),
     "max_flow_db_mb": (16, None),
     "max_snmp_db_mb": (16, None),
     "max_syslog_db_mb": (16, None),
