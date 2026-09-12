@@ -5205,6 +5205,20 @@ const App = (() => {
     state.timer = setInterval(master, MASTER_MS);
   }
 
+  /* A dialog's own poll loop, with the two rules the master loop already
+     follows and every hand-rolled dialog timer used to miss: a hidden tab
+     ticks nothing, and a poll outlives neither its dialog nor the next one
+     to replace it. Returns the stop function; `fn` may call it too. */
+  function pollWhileModal(token, ms, fn) {
+    const timer = setInterval(() => {
+      if (document.hidden) return;
+      if (!modalIsCurrent(token)) { stop(); return; }
+      fn();
+    }, ms);
+    function stop() { clearInterval(timer); }
+    return stop;
+  }
+
   /* Coming back to a tab that has been hidden for an hour: the data on it is
      an hour old, so say so until the first successful poll lands, and make
      that poll happen now rather than at the next slot. */
@@ -5560,7 +5574,7 @@ const App = (() => {
     emptyText, stackedHistogram, plottedRange, filterBar, filterValues,
     timeZoneLabel, timeZoneTitle, countLabel,
     bytes, rate, formatMac, fillRanges, wheelWindow,
-    modal, modalToken, modalIsCurrent,
+    modal, modalToken, modalIsCurrent, pollWhileModal,
     closeModal, requestCloseModal, confirmDestructive, el, svgNode,
     setText, setHtml, setBg, setHidden, strip, wireToggle,
     tooltip, hideTooltip, toast, showModalError, clearModalError, requireFields,

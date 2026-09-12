@@ -1808,8 +1808,9 @@
     // pressed, so the timer hangs off the close event rather than off that
     // button — the interfaceDialog idiom, so a closed device dialog cannot
     // leave a timer painting into whatever replaced it.
+    let stopLossTimer = null;
     const stopLoss = () => {
-      clearInterval(lossTimer);
+      if (stopLossTimer) stopLossTimer();
       window.removeEventListener('modal-closed', onLossClosed);
     };
     const onLossClosed = () => stopLoss();
@@ -1906,7 +1907,8 @@
 
     // Fast-poll focus (see the interface dialog) keeps new samples landing
     // every few seconds while this dialog is open.
-    const lossTimer = setInterval(() => { loadCharts().catch(() => {}); }, 15000);
+    stopLossTimer = App.pollWhileModal(token, 15000,
+      () => { loadCharts().catch(() => {}); });
     loadCharts().catch(() => {});
 
     // Two independent fetches racing to paint; the optic set patches this
@@ -2560,7 +2562,7 @@
     const fullBtn = box.querySelector('#oid-full');
     const cancelBtn = box.querySelector('#oid-full-cancel');
     const fullStatus = box.querySelector('#oid-full-status');
-    let watchTimer = null;
+    let watchTimer = null;                // the poll's stop function
     // Starting a walk is a write (it drives the device over SNMP), and
     // applyPermissions only ever runs over markup that already exists, so
     // dynamically-built controls check canWrite themselves — see app.js.
@@ -2575,7 +2577,7 @@
     }
 
     function stopWatching() {
-      if (watchTimer) clearInterval(watchTimer);
+      if (watchTimer) watchTimer();
       watchTimer = null;
       fullBtn.disabled = false;
       cancelBtn.hidden = true;
@@ -2660,7 +2662,8 @@
         return;
       }
       if (!current()) { stopWatching(); return; }
-      watchTimer = setInterval(() => { pollFullWalk().catch(() => {}); }, 1000);
+      watchTimer = App.pollWhileModal(token, 1000,
+        () => { pollFullWalk().catch(() => {}); });
       pollFullWalk().catch(() => {});
     };
 
@@ -2796,8 +2799,9 @@
     // Escape and a backdrop click close the modal without the Close button
     // ever being pressed, so the timer hangs off the close event rather than
     // off that button — otherwise every dismissed dialog left a timer running.
+    let stopRefreshTimer = null;
     const stop = () => {
-      clearInterval(refreshTimer);
+      if (stopRefreshTimer) stopRefreshTimer();
       window.removeEventListener('modal-closed', onClosed);
     };
     const onClosed = () => stop();
@@ -2920,11 +2924,11 @@
     // (15 s — one bucket's worth, so a redraw always has a whole new bucket
     // to show rather than repainting a partial one).
     let tick = 0;
-    const refreshTimer = setInterval(() => {
+    stopRefreshTimer = App.pollWhileModal(token, 5000, () => {
       tick += 1;
       refreshStats().catch(() => {});
       if (tick % 3 === 0) refreshChart().catch(() => {});
-    }, 5000);
+    });
     refreshStats().catch(() => {});
     refreshChart().catch(() => {});
 
@@ -6110,9 +6114,9 @@
     box.classList.add('wide');
 
     const status = box.querySelector('#nd-cat-status');
-    let poll = null;
+    let poll = null;                      // the poll's stop function
     const stop = () => {
-      clearInterval(poll);
+      if (poll) poll();
       window.removeEventListener('modal-closed', stop);
     };
     window.addEventListener('modal-closed', stop);
@@ -6164,23 +6168,23 @@
           for (const other of box.querySelectorAll('.cat-install')) other.disabled = false;
           return;
         }
-        poll = setInterval(async () => {
+        poll = App.pollWhileModal(token, 1000, async () => {
           if (!current()) { stop(); return; }
           try {
             paint((await App.get('/api/nodes/mib-catalog/status')).job);
           } catch (error) { /* transient; the next tick retries */ }
-        }, 1000);
+        });
       };
     }
     // An install started before this dialog was opened keeps reporting here.
     if (payload.job && payload.job.state === 'running') {
       paint(payload.job);
-      poll = setInterval(async () => {
+      poll = App.pollWhileModal(token, 1000, async () => {
         if (!current()) { stop(); return; }
         try {
           paint((await App.get('/api/nodes/mib-catalog/status')).job);
         } catch (error) { /* transient */ }
-      }, 1000);
+      });
     }
     return box;
   }

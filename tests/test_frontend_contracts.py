@@ -2791,6 +2791,25 @@ check("f.reason" in CONFIGRX56,
       "just which rule it was")
 
 
+# --- 57. FE-P4/P5: dialog polls go through App.pollWhileModal --------------
+#      The dialog timers each re-implemented "stop when the dialog is gone"
+#      and none of them honoured document.hidden, so a backgrounded tab kept
+#      four dialogs' worth of fetches running.
+NODES57 = read("nodes.js")
+check("function pollWhileModal(" in APP and "pollWhileModal," in APP,
+      "app.js defines App.pollWhileModal and exports it")
+_POLL57 = APP[APP.find("function pollWhileModal("):]
+check("document.hidden" in _POLL57[:400],
+      "...and it skips the tick while the tab is hidden, like the master loop")
+check("modalIsCurrent(token)" in _POLL57[:400],
+      "...and stops itself once its dialog is no longer the current one")
+check(NODES57.count("setInterval(") == 0,
+      "nodes.js hand-rolls no dialog poller of its own: all 5 of its former "
+      "setInterval( calls go through App.pollWhileModal")
+check(NODES57.count("clearInterval(") == 0,
+      "...and every clear path routes through the stop function it returns")
+
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
