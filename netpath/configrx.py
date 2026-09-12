@@ -455,11 +455,15 @@ def _clean_output(raw: str, vendor: str = "",
     return cleaned.strip() + "\n"
 
 
-def _compile_extra_patterns(raw: str) -> tuple[re.Pattern, ...]:
+def _compile_extra_patterns(raw: str,
+                            dropped: list | None = None) -> tuple[re.Pattern, ...]:
     """The `ignore_line_patterns` setting (one regex per line) compiled with
     the same bounded-regex guard configrx_compliance uses. A line that fails
     (e.g. a row saved before api.post_settings validated it) is skipped
-    rather than raising, matching _clean_output's never-raises contract."""
+    rather than raising, matching _clean_output's never-raises contract --
+    but it is appended to `dropped` as (line, reason), because a silently
+    dropped ignore pattern surfaces as a recurring spurious diff with
+    nothing anywhere saying which line stopped being stripped."""
     patterns = []
     for line in (raw or "").splitlines():
         line = line.strip()
@@ -467,7 +471,9 @@ def _compile_extra_patterns(raw: str) -> tuple[re.Pattern, ...]:
             continue
         try:
             patterns.append(configrx_compliance.compile_bounded(line))
-        except configrx_compliance.UnsafeRegex:
+        except configrx_compliance.UnsafeRegex as exc:
+            if dropped is not None:
+                dropped.append((line, str(exc)))
             continue
     return tuple(patterns)
 
@@ -1076,9 +1082,20 @@ class ConfigRxWorker(Worker):
             client.close()
             enable_secret = None
 
+        dropped_ignores: list = []
         cleaned = _clean_output(
             raw, vendor_key,
-            _compile_extra_patterns(settings.get("ignore_line_patterns", "")))
+            _compile_extra_patterns(settings.get("ignore_line_patterns", ""),
+                                    dropped_ignores))
+        if dropped_ignores:
+            self.log.add(
+                ERROR,
+                f"ConfigRX could not compile {len(dropped_ignores)} of its "
+                f"ignore-line patterns",
+                detail="Those lines are NOT being stripped from captures, so a "
+                       "diff may show changes that are only noise.\n\n"
+                       + "\n\n".join(f"{line}\n  {why}"
+                                      for line, why in dropped_ignores))
         # A truncated capture must never be stored. Storing one is worse than
         # storing nothing: it overwrites nothing, but it becomes the newest
         # "good" version, so the next real backup reads as a huge change and

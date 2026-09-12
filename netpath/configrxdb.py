@@ -159,7 +159,10 @@ CREATE INDEX IF NOT EXISTS ix_compliance_rules_set ON compliance_rules(rule_set_
 -- `failed_rules` is a JSON list of {"rule_id", "description"} — never the
 -- line that failed the rule, so a compliance view cannot become a second
 -- way to read a config line a searcher would otherwise be refused (see
--- configrx_compliance.py's module docstring). status is 'not_assessed'
+-- configrx_compliance.py's module docstring). An entry may carry a third
+-- key, "reason", when the rule could not be run at all (its pattern is one
+-- compile_bounded refuses); it describes the pattern, never the capture.
+-- status is 'not_assessed'
 -- for a device with no capture yet, never a silent 'pass'.
 CREATE TABLE IF NOT EXISTS compliance_results (
     device_id    INTEGER NOT NULL,

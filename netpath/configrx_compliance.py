@@ -66,6 +66,26 @@ def _quantifier_at(pattern: str, i: int) -> tuple[bool, int, bool]:
     return False, 0, False
 
 
+def _variable_repeat_at(pattern: str, i: int) -> bool:
+    """Whether the quantifier at i can match a VARYING number of copies --
+    '+', '*', and '{m,n}' with m != n. A fixed '{2}' cannot, so it always
+    divides the input at the same place and two neighbouring repeats of the
+    group holding it can never trade characters with each other."""
+    if i >= len(pattern):
+        return False
+    if pattern[i] in "+*":
+        return True
+    if pattern[i] == "{":
+        m = _COUNTED_RE.match(pattern, i)
+        if m:
+            parts = pattern[i + 1:m.end() - 1].split(",")
+            if len(parts) == 1:
+                return False                      # {n}: exactly n copies
+            low, high = parts[0] or "0", parts[1]
+            return not (low.isdigit() and high.isdigit() and low == high)
+    return False
+
+
 def _skip_char_class(pattern: str, i: int) -> int:
     """Index just past the `[...]` starting at i (which must be '['),
     treating a leading ']' as the literal IEEE/POSIX convention does."""
@@ -79,47 +99,71 @@ def _skip_char_class(pattern: str, i: int) -> int:
 
 
 def _has_nested_repetition(pattern: str) -> bool:
-    """True for a group that can already match the same text more than one
-    way ((a+)+, (a|aa)+) and is itself quantified with no upper bound — a
-    BOUNDED outer repeat like (\\d{1,3}\\.){3} is exempt. Not a full
-    analysis; a heuristic, deliberately over-inclusive."""
+    r"""True for a group that can already match the same run of text more than
+    one way ((a+)+, (a|aa)+) and is itself quantified with no upper bound.
+
+    A group only counts as ambiguous when it holds an alternation, or when its
+    LAST element repeats a varying number of times -- that is what lets two
+    neighbouring repeats of the group trade characters with each other, which
+    is the whole of the blow-up. A group whose last element is a fixed repeat
+    ({2}) or a separator the repeat cannot match (\w+\.) divides the input at
+    one place instead, so the MAC, IPv6 and FQDN patterns an operator actually
+    writes are accepted alongside the documented (\d{1,3}\.){3}\d{1,3}, while
+    (\d{1,3}){3,} -- the same idiom with nothing between the repeats -- is
+    not. Not a full analysis; a heuristic, deliberately over-inclusive.
+    """
     n = len(pattern)
     i = 0
-    # Per open group: can it already match a run of input more than one way?
-    open_groups: list[bool] = []
+    # Per open group: [it contains an alternation, its last element so far
+    # repeats a varying number of times].
+    open_groups: list[list[bool]] = []
+
+    def tail(varying: bool) -> None:
+        if open_groups:
+            open_groups[-1][1] = varying
+
     while i < n:
         c = pattern[i]
         if c == "\\":
             i += 2
+            tail(False)
             continue
         if c == "[":
             i = _skip_char_class(pattern, i)
+            tail(False)
             continue
         if c == "(":
-            open_groups.append(False)
+            open_groups.append([False, False])
             i += 1
             continue
         if c == ")":
             if open_groups:
-                ambiguous = open_groups.pop()
+                alternation, varying_tail = open_groups.pop()
+                ambiguous = alternation or varying_tail
                 quantified_after, consumed, unbounded_after = _quantifier_at(pattern, i + 1)
                 if ambiguous and quantified_after and unbounded_after:
                     return True
-                # Propagate "can match more than one way" outward to the parent group.
-                if open_groups and (ambiguous or quantified_after):
-                    open_groups[-1] = True
+                # The group is one element of its parent, and leaves the parent
+                # open to the same split only when it can itself swallow a run
+                # of text more than one way or without an upper bound.
+                tail(ambiguous or (quantified_after and unbounded_after))
                 i += 1 + consumed
                 continue
             i += 1
             continue
-        if c == "|" and open_groups:
-            open_groups[-1] = True
+        if c == "|":
+            if open_groups:
+                open_groups[-1][0] = True
+                open_groups[-1][1] = False
             i += 1
             continue
         quantifier_here, consumed, _unbounded_here = _quantifier_at(pattern, i)
-        if quantifier_here and open_groups:
-            open_groups[-1] = True
-        i += max(consumed, 1)
+        if quantifier_here:
+            tail(_variable_repeat_at(pattern, i))
+            i += consumed
+            continue
+        tail(False)
+        i += 1
     return False
 
 
@@ -175,8 +219,10 @@ def compile_bounded(pattern: str, flags: int = 0) -> re.Pattern:
     if _has_nested_repetition(pattern):
         raise UnsafeRegex(
             "Pattern repeats a group that can already repeat, with nothing "
-            "bounding how many times the outer repeat can happen (something "
-            "shaped like (a+)+ or (a|aa)+) — this is the construct behind "
+            "bounding how many times the outer repeat can happen — a group "
+            "counts as already repeating when it holds an alternation or "
+            "ends in an open-ended repeat (something shaped like (a+)+ or "
+            "(a|aa)+) — this is the construct behind "
             "almost every regular expression that runs in exponential "
             "time on ordinary text. Rewrite it without the nested "
             "repetition, e.g. a+ instead of (a+)+. A group repeated a "
@@ -333,10 +379,13 @@ def evaluate_device(db, device_id: int, rules, deadline: float | None = None) ->
             break
         try:
             pattern = compile_bounded(rule["pattern"])
-        except UnsafeRegex:
+        except UnsafeRegex as exc:
             # A rule stored before this check existed (or tightened since) fails
-            # CLOSED rather than vanishing silently from every result.
-            failed.append({"rule_id": rule["id"], "description": rule["description"]})
+            # CLOSED rather than vanishing silently from every result -- and
+            # carries why, so the failure does not read as the device's fault.
+            failed.append({"rule_id": rule["id"],
+                           "description": rule["description"],
+                           "reason": f"Rule not evaluated: {exc}"})
             continue
         matched = False
         for line in lines:

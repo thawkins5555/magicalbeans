@@ -321,7 +321,7 @@ check("(a+){3} — a bounded outer repeat of a single quantified atom — "
 
 print("an UNBOUNDED outer repeat of an ambiguous group is still refused, "
       "bounded or not underneath")
-for still_unsafe in (r"(a+)+", r"(a|aa)+", r"((a+){3})+", r"(\d{1,3}\.){3,}"):
+for still_unsafe in (r"(a+)+", r"(a|aa)+", r"((a+){3})+", r"(\d{1,3}){3,}"):
     try:
         cs.compile_bounded(still_unsafe)
         check(f"{still_unsafe!r} should still be refused (unbounded outer "
@@ -475,6 +475,123 @@ check("not truncated — nowhere near the budget for realistic rules",
      normal_stats.get("truncated") is False, normal_stats)
 check("finishes in a small fraction of the budget",
      normal_elapsed < cc.COMPLIANCE_SWEEP_BUDGET_S / 2, f"{normal_elapsed:.3f}s")
+
+
+# ------------------------------- a FIXED inner repeat is not "already repeating"
+#
+# The bounded-outer fix above left the other half of the same confusion in
+# place: _has_nested_repetition marked a group ambiguous for ANY quantifier
+# inside it, fixed `{2}` included, so three of the four patterns anyone
+# actually writes for a network address were refused outright while the
+# dotted quad -- and compile_bounded's own refusal text, which promises "a
+# group repeated a small FIXED number of times is fine" -- said they were
+# allowed. A group is ambiguous only when two neighbouring repeats of it can
+# trade characters: it holds an alternation, or its LAST element repeats a
+# varying number of times.
+
+print("the address idioms a compliance rule is actually written with are accepted")
+REAL_WORLD = {
+    "MAC address ([0-9a-f]{2}:){5}[0-9a-f]{2}": r"([0-9a-f]{2}:){5}[0-9a-f]{2}",
+    "IPv6 ([0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}":
+        r"([0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}",
+    "FQDN (\\w+\\.){1,10}\\w+": r"(\w+\.){1,10}\w+",
+    "dotted quad (\\d{1,3}\\.){3}\\d{1,3}": r"(\d{1,3}\.){3}\d{1,3}",
+    "an unbounded outer repeat over a separated group (\\d{1,3}\\.){3,}":
+        r"(\d{1,3}\.){3,}",
+}
+for label, pattern in REAL_WORLD.items():
+    try:
+        compiled = cs.compile_bounded(pattern)
+        check(f"{label}: accepted", compiled is not None)
+    except cs.UnsafeRegex as exc:
+        check(f"{label}: should not have been refused", False, str(exc))
+
+# Accepted, and worth proving they are accepted for the right reason: each
+# one run against the worst 250-character line it can be handed (the per-line
+# cap) finishes in microseconds, not the seconds a real nested repetition
+# takes. If the heuristic is ever loosened further, this is what catches it.
+WORST_LINES = ("1." * 125, "1" * 250, "a" * 250, "ab" * 125, "a." * 125,
+               "0a:" * 83 + "0a")
+for label, pattern in REAL_WORLD.items():
+    compiled = cs.compile_bounded(pattern + "ZZZ")
+    started = time.monotonic()
+    for line in WORST_LINES:
+        compiled.search(cs.bounded_line(line))
+    elapsed = time.monotonic() - started
+    check(f"{label}: runs in {elapsed * 1000:.3f} ms over every worst-case "
+          f"line, so it is safe and not merely allowed", elapsed < 0.25, elapsed)
+
+print("a group that really can trade characters with its neighbour is still refused")
+for still_unsafe in (r"(a+){1,100}b", r"(\d{1,3}){3,}", r"(\s*\w+)+b",
+                     r"(a+)*", r"(.*)*"):
+    try:
+        cs.compile_bounded(still_unsafe)
+        check(f"{still_unsafe!r} should still be refused", False)
+    except cs.UnsafeRegex:
+        check(f"{still_unsafe!r} still refused", True)
+
+
+# ------------------------- a rule that cannot be compiled fails WITH a reason
+#
+# evaluate_device fails such a rule CLOSED, which is right -- but it used to
+# append only {rule_id, description}, indistinguishable from the device
+# genuinely not matching. Every device in the rule set flipped to "fail" with
+# the rule's own description as the only explanation, and nothing said the
+# rule had never been run at all.
+
+print("a stored rule compile_bounded refuses fails closed AND says why")
+reason_db = ConfigRxDatabase(os.path.join(TMPDIR, "reason.db"))
+reason_nodes = FakeNodesDB()
+reason_nodes.add(1)
+reason_db.add_backup(1, "hostname sw1\nntp server 10.0.0.1\n")
+reason_set = cc.add_rule_set(reason_db, "Refused-rule set")
+good_rule = cc.add_rule(reason_db, reason_set, "NTP is configured",
+                        cc.RuleKind.MUST_MATCH, r"^ntp server ")
+# add_rule validates, so the only way to hold a refused pattern is the way a
+# real deployment holds one: a row written before the guard existed.
+with reason_db._lock:
+    reason_db._conn.execute(
+        "UPDATE compliance_rules SET pattern = ? WHERE id = ?",
+        (r"(a+){1,100}b", good_rule))
+    reason_db._conn.commit()
+
+rules = reason_db.rules_for(reason_set)
+result = cc.evaluate_device(reason_db, 1, rules)
+check("the refused rule fails the device closed, never silently passes",
+      result["status"] == "fail", result)
+refused = [f for f in result["failed_rules"] if f["rule_id"] == good_rule]
+check("exactly one failed rule, the refused one", len(refused) == 1,
+      result["failed_rules"])
+check("it carries a non-empty reason, so the failure does not read as the "
+      "device's fault",
+      bool(refused and refused[0].get("reason")), refused)
+check("the reason names the pattern problem rather than the config",
+      bool(refused) and "not evaluated" in refused[0].get("reason", "").lower(),
+      refused[0].get("reason") if refused else None)
+check("the reason still carries no config line from the capture",
+      bool(refused) and "hostname sw1" not in refused[0].get("reason", ""),
+      refused)
+reason_db.close()
+
+
+# ------------------- a dropped ignore-line pattern is reported, not swallowed
+
+print("configrx._compile_extra_patterns hands back the lines it had to drop")
+from netpath import configrx as _configrx  # noqa: E402  (local to this section)
+
+dropped: list = []
+compiled = _configrx._compile_extra_patterns(
+    "^ntp clock-period \\d+$\n(a+){1,100}b\n\n^Building configuration",
+    dropped)
+check("the usable patterns are still compiled", len(compiled) == 2, compiled)
+check("the refused one is reported back with its line and a reason",
+      len(dropped) == 1 and dropped[0][0] == r"(a+){1,100}b"
+      and bool(dropped[0][1]), dropped)
+untouched: list = []
+_configrx._compile_extra_patterns("^Building configuration", untouched)
+check("nothing is reported when every line compiles", untouched == [], untouched)
+check("the old single-argument call still works (nothing to report to)",
+      len(_configrx._compile_extra_patterns("(a+){1,100}b\n^ok")) == 1)
 
 
 print()
