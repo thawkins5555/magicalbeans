@@ -609,14 +609,19 @@ Destination defaults are worth a note: they seed the Add dialog only. Changing t
 
 ### Retention and rollups
 
-Three settings on the Nodes settings dialog decide how much metric history
-survives, and from 4.39.0 they mean what they say.
+Settings on the Nodes settings dialog decide how much metric history
+survives, and from 4.39.0 they mean what they say. From 5.14.0 per-port
+metrics — the great majority of the rows in the metric history file —
+carry their own, shorter pair, since a per-port error/discard counter
+does not need the same history as a device-level one.
 
 | Setting | Default | What it bounds |
 | --- | --- | --- |
-| `sample_retention_days` | 3 | how long a raw sample is kept, per sample |
+| `sample_retention_days` | 3 | how long a device-level raw sample is kept, per sample |
+| `interface_sample_retention_days` | 1 | how long a per-port raw sample is kept, per sample — new in 5.14.0 |
 | `sample_row_cap_per_metric` | 5,000 | the newest N samples **per metric**, not per database |
-| `rollup_retention_days` | 400 | how long the hourly min/avg/max rollups are kept |
+| `rollup_retention_days` | 400 | how long a device-level hourly min/avg/max rollup is kept |
+| `interface_rollup_retention_days` | 90 | how long a per-port hourly rollup is kept — new in 5.14.0 |
 
 The cap is the one that changed. It used to be applied to the `samples` table as
 a whole: 50,000 rows survived each maintenance pass no matter how many devices
@@ -630,8 +635,15 @@ called it, so `samples_hourly` was always empty and any chart window wider than
 the raw retention returned no points. Maintenance now aggregates each complete
 hour into min, average and max, keeps a watermark so it never re-does work, and
 — importantly — no longer deletes the raw rows it aggregated. Charts read raw
-samples inside three days and hourly rollups beyond that; the settings dialog
-says so beside the retention field.
+samples inside a metric's own raw retention window — three days for a
+device-level metric, one day by default for a per-port one, from 5.14.0 — and
+hourly rollups beyond that; the settings dialog says so beside the retention
+fields.
+
+`py -m netpath.dbreport <data_dir>`, new in 5.14.0, prints exactly where the
+bytes in every data file are, table by table — useful before deciding whether
+to raise a retention setting or a size cap. The same breakdown is one click
+away, per file, under Settings → Data & Retention.
 
 What this means in practice: a 48-port switch polled every 120 seconds writes
 about 100 metrics per poll, so three days of raw samples is roughly 65 MB per
@@ -857,6 +869,8 @@ netpath/
                    the hourly rollups — the tables that grow
   nodesmibdb.py    nodes_mibs.db: uploaded MIB files and the objects parsed
                    out of them
+  dbreport.py      per-table row and byte counts for every data file —
+                   `py -m netpath.dbreport <data_dir>` — 5.14.0
   nodediscover.py  per-device and per-subnet discovery: ping sweep plus
                    best-effort SNMP v1/v2c identification
   snmppoll.py      SNMP wire format for the Nodes poller: GET/GETNEXT/

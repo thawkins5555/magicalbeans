@@ -1092,10 +1092,13 @@ rather than an auto-scaled one that makes a fraction of a percent look like an
 outage. A device that is not being ping-probed says so instead of showing an
 empty chart. The chart refreshes every fifteen seconds while the dialog is
 open, so the fast polling a selected device gets shows up in it. From 5.13.0 it
-offers the full range set, up to 30 days: a window wider than three days reads
-from the hourly rollup table, which the rollup pass populates. The status
-timeline keeps every range, since it is built from the event log rather than
-from samples.
+offers the full range set, up to 30 days: a window wider than the metric's own
+raw retention reads from the hourly rollup table, which the rollup pass
+populates. From 5.14.0 that boundary is per metric rather than a single fixed
+number — three days for a device-level metric, one day by default for a
+per-port one — so a chart picks the right source for the metric it is
+actually drawing. The status timeline keeps every range, since it is built
+from the event log rather than from samples.
 
 **From 5.0.0, a RESOURCES section under PACKET LOSS charts CPU, memory and
 chassis temperature** over that same range, sharing its dropdown and its
@@ -3556,11 +3559,37 @@ trims those; the day-based retention settings on the IPAM Settings
 dialog are. Nodes and Alerts follow the identical split: devices,
 polling profiles, interfaces and MIB objects describe the network as it
 is configured now and are never trimmed by a cap, only samples/events
-(Nodes) and resolved alerts/notifications (Alerts) are. For the Nodes
-metric history the cap takes the raw samples first and then, once those are
-at their floor, the oldest hourly rollups — so a cap set low enough
-shortens how far back a wide chart reaches, whatever the rollup retention
-setting says.
+(Nodes) and resolved alerts/notifications (Alerts) are. From 5.14.0 the
+Nodes metric history cap takes the oldest hourly rollups first and then,
+once those are at their own floor, the raw samples — losing a wide
+chart's far end costs less than shredding the window every 1-hour chart
+is about to read — so a cap set low enough still shortens how far back a
+wide chart reaches, whatever the rollup retention setting says. The
+default cap rose from 1 GB to 8 GB in 5.14.0 (a 250-device fleet's
+default retention runs to roughly 39 GB, so 1 GB was delivering a few
+per cent of what the retention setting on the Nodes Settings dialog
+claimed); an install with its own saved value keeps it.
+
+**Per-port metrics keep their own, shorter retention, from 5.14.0.** The
+Nodes Settings dialog's STORAGE fieldset has two more day fields — *Keep
+per-port raw samples for* (default 1) and *Keep per-port hourly rollups
+for* (default 90) — beside the existing device-level pair (3 and 400),
+because the great majority of the rows in the metric history file are
+per-port error and discard counters, not device-level ones. Shortening
+either tier, per-port or device-level, is a one-way door: history already
+aged out does not return if the number is raised again afterwards.
+
+**Where the bytes actually are, from 5.14.0.** Each of the thirteen data
+files on this subtab can be expanded into a per-table breakdown — exact
+row counts, and bytes measured exactly where SQLite's `dbstat` is
+available or estimated from a measured per-row constant where it is not,
+with a reconciling `unaccounted` line so an estimate is never mistaken
+for a fact. Nodes' own row also states plainly which of the size cap or
+the rollup retention setting is the one actually bounding its metric
+history, since the two can disagree — a low cap silently trims below
+what the retention setting on the Nodes dialog implies. The same report
+is available from the command line, against a stopped or a running
+install alike, as `py -m netpath.dbreport <data_dir>`.
 
 Each data file also says **how far back it still reaches** — "oldest record
 14.0d ago", or "no history" for a file nothing has written to yet — beside

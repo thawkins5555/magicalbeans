@@ -412,4 +412,26 @@ final.
   three times over; default retention at 250 devices runs to roughly 39 GB
   against a 1 GB cap, so the cap is trimming raw data to a 5,000-row floor
   every minute.
-→ In progress; outcomes appended when the waves complete.
+→ Part 0 (trim floor): both floors under `trim_to_size` now scale with the
+  metric count instead of a flat 5,000, and the stage order is reversed —
+  hourly rollups give up their oldest hours first, raw samples only once
+  those are at their own floor.
+→ Part 1 (storage report): `netpath/dbreport.py` reports every store's
+  exact row counts and measured-or-estimated bytes, on the command line
+  and behind `GET /api/db/report`; Settings → Data & Retention gains a
+  per-file expand and a line naming whether the cap or the retention
+  setting is what actually bounds Nodes metric history. The series cap
+  default rises from 1 GB to 8 GB; saved values untouched.
+→ Part 2 (retention tiering): `metrics.scope` distinguishes per-port from
+  device-level (a dot in the key, not the `if_` prefix); two new settings,
+  `interface_sample_retention_days` (1) and `interface_rollup_retention_days`
+  (90), carry the same 1..3650 floor as the existing rollup setting;
+  `series()` picks raw versus hourly per metric by its own class. Shortens
+  per-port history on the first maintenance pass after upgrade, and is
+  one-way for data already gone.
+→ Part 4 (device_addresses age-out): a complete walk marks the addresses
+  it did not see `present=0`, following the walk-table shape already used
+  for MAC/ARP; prune deletes those rows on the existing 180-day event
+  clock; a present alias wins resolution over a stale one; a discovery job
+  stuck `running` past the window is pruned alongside it.
+→ Table rewrite in flight; suite counts appended at close.

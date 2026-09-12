@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.14.0 — The Nodes database, and what it keeps](#5140--the-nodes-database-and-what-it-keeps)
 - [5.13.0 — Neon Signs, and the backlog nobody had actioned](#5130--neon-signs-and-the-backlog-nobody-had-actioned)
 - [5.12.0 — The verified path, restored](#5120--the-verified-path-restored)
 - [5.11.0 — Four asks, one deferred](#5110--four-asks-one-deferred)
@@ -141,6 +142,113 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.14.0 — The Nodes database, and what it keeps
+
+The Nodes database family grows faster than any other store. This release
+verifies that the temporary data (MAC, ARP, LLDP, VLAN) is actually aged
+out, lists what is kept forever and why, fixes the two places that were
+leaking, and takes real bytes off the file. `PROMPT-LOG.md` carries the
+plan and the wave-by-wave outcomes; this entry is the shipped result.
+
+**What is aged and what is kept.** MAC, ARP, LLDP/CDP and VLAN and
+port-VLAN tables were already aging correctly: each walk marks a row that
+did not reappear `present=0`, and the maintenance sweep deletes it by
+`seen_ts` after `mac_table_retention_days` (7). Device and interface
+events age at 180 days, discovery jobs at 30, per-port raw samples at 3
+days (device-level; see below for per-port), hourly rollups at 400.
+**Stored forever, correctly:** the inventory and configuration tables —
+`devices`, `interfaces`, `interface_thresholds`, `groups`,
+`group_credentials`, `device_groups`, `settings` — plus `vendor_learned`
+(deliberate fleet memory) and uploaded MIB files. All of these scale with
+the size of the fleet, never with time, so "forever" costs nothing that
+grows. **Two leaks fixed:** `device_addresses` never removed an address a
+device had stopped reporting, and a discovery job stuck in `running` past
+its window kept its results forever. Both age out now (see below).
+
+**Where the bytes go.** 94% of the metric catalogue is per-port
+error/discard counters — seven metrics per port, on a fleet where ports
+outnumber devices many times over. `samples` and `samples_hourly` are
+ordinary rowid tables carrying a composite key plus a second index, so
+every sample is physically stored three times; measured cost is 66.7
+bytes per row. At default retention and 250 devices that comes to roughly
+39 GB, against a series cap that defaulted to 1 GB — so the cap, not the
+retention setting the Settings page displayed, was what actually bounded
+the file. It did that by trimming raw samples down to a flat 5,000-row
+floor across roughly 49,607 metrics, every single maintenance pass, a
+minute apart.
+
+**The trim floor.** That flat 5,000-row floor is now `max(30 × metric
+count, 5,000)` for raw samples and a matching per-metric floor for hourly
+rollups, so a fleet with tens of thousands of metrics is not trimmed down
+to a tenth of a sample apiece. `trim_to_size`'s stage order is reversed
+too: the hourly rollups give up their oldest hours first, and only once
+they are at their own floor does the raw table give anything — losing the
+long history costs a wide chart its far end, but losing raw rows was
+costing every 1-hour chart the window it was about to read.
+
+**The storage report.** `py -m netpath.dbreport <data_dir>` prints, for
+every store, each table's exact row count and its size in bytes — exact
+where SQLite's `dbstat` is compiled in, and `rows × a measured per-row
+constant` with an `unaccounted` line reconciling the estimate against the
+file where it is not, so an estimate is never read as gospel. The same
+report backs a collapsed per-table breakdown under Settings → Data &
+Retention, fetched only when a file row is expanded, plus one line saying
+plainly whether the size cap or the rollup retention setting is what is
+actually bounding the Nodes metric history — the two could disagree
+silently before this, and did. The series cap's own default rises from
+1 GB to 8 GB; saved values are left exactly as they were.
+
+**Per-port retention.** Two new settings, `interface_sample_retention_days`
+(default 1) and `interface_rollup_retention_days` (default 90), sit beside
+the existing device-level pair (3 and 400) in the Nodes STORAGE fieldset.
+The discriminator between a device-level and a per-port metric is a dot in
+its key — nodepoll's own per-port naming convention — and not the `if_`
+prefix, because several device-level metrics are bare `if_*` keys naming a
+worst-port summary an alert rule reads, while the `sfp_*.N` family is
+per-port without being `if_*` at all. `series()` now picks raw versus
+hourly per metric by that metric's own class rather than a single fixed
+window, so a two-day chart on a per-port metric correctly reads the hourly
+rollup instead of a `samples` table that was only ever asked to hold one
+day. This shortens per-port history on the first maintenance pass after
+upgrade, and it is a one-way door: data already aged out under the shorter
+window does not come back if the setting is raised again afterwards.
+
+**device_addresses.** A complete walk now marks every address it did not
+see `present=0`, the same shape the MAC and ARP tables already used, and
+prune deletes those rows on the existing 180-day event-retention clock. A
+present alias wins over a stale one when resolving which device owns an
+address that both a trap and a walk have reported. Because only a
+*complete* walk marks absence, a partial writer — a trap handler, a
+discovery result — recording one address never marks the rest of that
+device's addresses gone. A discovery job left stuck in `running` past the
+retention window is pruned alongside it.
+
+**Table rewrite, in flight at the time of writing.** `samples` and
+`samples_hourly` are being re-expressed as `WITHOUT ROWID` tables keyed by
+range rather than by a synthetic rowid plus a second index — measured at
+23.8 and 47.5 bytes per row, against 66.7 today. The migration is a
+batched copy-and-delete by key band, run from the existing nodes-split
+maintenance thread, that never doubles the file on disk and can be
+stopped and resumed mid-way. This paragraph describes the design as
+planned; Bob rewrites it to describe what actually shipped once the
+rewrite lands.
+
+**Recorded, not built.** Three follow-ups were identified and deliberately
+deferred rather than built this release: the hour-index watermark that
+would let phase 2 of the WITHOUT ROWID migration skip re-scanning rows it
+has already covered (waits on the rewrite above landing first), a daily
+rollup tier below the hourly one (waits on real numbers from the storage
+report before a third tier is worth the complexity), and zero-suppression
+for metrics that sit at zero for long stretches (waits on measuring how
+much of the per-port catalogue is actually zero most of the time).
+
+No combination of these changes lets 3 days of raw plus 400 days of
+hourly fit inside a 1 GB cap at 250 devices — that arithmetic simply does
+not close. What this release does is take the true cost down from
+roughly 39 GB to roughly 5 GB, and make the two remaining numbers (the cap
+and the retention setting) tell the truth about which of them is actually
+in charge.
 
 ### 5.13.0 — Neon Signs, and the backlog nobody had actioned
 

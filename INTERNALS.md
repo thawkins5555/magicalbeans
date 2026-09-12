@@ -74,6 +74,8 @@ netpath/
                    events, discovery jobs; the facade over the two below
   nodesseriesdb.py nodes_series.db: metrics, samples, samples_hourly
   nodesmibdb.py    nodes_mibs.db: mib_files, mib_objects
+  dbreport.py      per-table row/byte report for every store, on the
+                   command line and behind GET /api/db/report — 5.14.0
   nodediscover.py  per-device/subnet discovery: ping sweep + best-effort
                    SNMP v1/v2c identification
   snmppoll.py      SNMP wire format for the Nodes poller: GET/GETNEXT/
@@ -337,15 +339,23 @@ hops before the trace row itself; `syslogdb.py` routes `_trim_delete`
 through its own FTS-aware `_delete_logs()` so the search index and the
 message rows never disagree; `nodesdb.py`, `nodesseriesdb.py` and `alertsdb.py` keep their own
 `trim_to_size()` entirely, since each spans several tables rather than one
-dominant one. `nodesseriesdb.trim_to_size` runs in two stages: raw
-`samples` oldest-first down to a 5,000-row floor, then — only once that
-floor is reached and the file is still over cap — `samples_hourly`
-oldest-first by `hour` down to a day of rollups per metric, one `reclaim()`
-per outer pass and a `shrank` flag that ends the loop when neither table
-will give anything up. Deleting by `hour` ascending is what keeps stage two
-clear of the two-hour redo window `compact_rollup` rewrites. Before 5.1.0
-there was no stage two, so a file whose bulk was rollups sat over its cap
-for good. `Service.run_maintenance()` (`web/service.py`) calls
+dominant one. `nodesseriesdb.trim_to_size` runs in two stages, and from
+5.14.0 in this order: `samples_hourly` oldest-first by `hour` first, down
+to `_hourly_floor()`, then — only once that floor is reached and the file
+is still over cap — raw `samples` oldest-first down to `_sample_floor()`,
+one `reclaim()` per outer pass and a `shrank` flag that ends the loop when
+neither table will give anything up. The rollups give first because
+losing their oldest hours costs a wide chart only its far end, while the
+raw table losing rows was costing every 1-hour chart the window it was
+about to read. Both floors scale with the metric count from 5.14.0 —
+`max(30 × metrics, 5_000)` for raw, `max(24 × metrics, 5_000)` for hourly
+— rather than the flat 5,000-row floor either used before, which across a
+49,607-metric fleet was a tenth of a sample per metric and meant a store
+sitting on its cap spent every maintenance pass shredding the window the
+1-hour charts read. Deleting by `hour` ascending is what keeps the rollup
+stage clear of the two-hour redo window `compact_rollup` rewrites. Before
+5.1.0 there was no rollup stage at all, so a file whose bulk was rollups
+sat over its cap for good. `Service.run_maintenance()` (`web/service.py`) calls
 `Service._trim_db()` for each of the eight databases that has a
 `max_*_db_mb` setting (netpath, flow, syslog, snmp, ipam, nodes,
 nodes_series, alerts — not `app.db`, `wireless.db`, `configrx.db`,
@@ -364,6 +374,52 @@ answers `None` for a store this service has not opened rather than raising.
 sweep's size alerts all read it, which is what stopped them disagreeing:
 each was hand-written, and `mapper.db` went into one and was missed in the
 other — the Dashboard's own comment recorded it.
+
+**Per-table byte accounting, from 5.14.0 (`dbreport.py`).** `STORES` names
+where a database lives in memory; `dbreport.STORE_FILENAMES` is the
+companion dict naming where each one lives on disk, factored out of
+`__main__.py`'s eleven `*_path_for` helpers, which each used to carry the
+filename written inline. `dbreport.report(paths)` opens every store
+`mode=ro` (so a running install's write-ahead log is counted, and a WAL
+that cannot be opened read-only falls back to `immutable=1` with a note
+saying so) and returns, per store, `file_bytes`, `page_count`,
+`freelist_pages` and a `tables` list of `{name, rows, bytes, basis}` —
+`basis` is `"measured"` where SQLite's `dbstat` virtual table is compiled
+in, `"estimated"` (`rows × a per-table constant` measured against a real
+database) where it is not, which is the common case including the
+`sqlite3` CPython ships. Every report carries an `unaccounted` line
+reconciling the table sum against `page_count × page_size`, so an
+estimate is never silently read as exact. `py -m netpath.dbreport
+<data_dir>` is the CLI entry point; `GET /api/db/report` (gated on
+`settings: read`) serves the identical structure behind
+`service.cached_poll("db_report", 300, ...)`, deliberately not folded
+into `/api/state` — `COUNT(*)` over a hundred-million-row `samples` table
+takes seconds, and `/api/state` is polled every two seconds by every open
+tab. `settings.js` fetches it once per page load, on the first `<details>`
+a viewer expands under Settings → Data & Retention, and caches the
+in-flight promise so opening four rows costs one request, not four.
+
+**`metrics.scope`, from 5.14.0.** A new `INTEGER NOT NULL DEFAULT 0`
+column on `metrics`, backfilled by the series store's first `_migrate`
+(`UPDATE metrics SET scope = 1 WHERE key LIKE '%.%'`) and set at creation
+time in `record_metric_samples`. The discriminator is a dot in the
+metric's key — `nodepoll.py`'s own documented per-port naming convention
+— rather than the `if_` prefix: six device-level worst-port summaries
+(`if_in_errors_max`, and its siblings) are bare `if_*` keys an alert rule
+reads directly, and the five `sfp_*` families are per-port without being
+`if_*` at all, so the prefix sorts neither group correctly. `prune()`
+takes both device-level and per-port day counts and runs two passes per
+table: the unfiltered device-level cutoff first (cheap — anything that
+old goes regardless of scope), then the shorter per-port cutoff
+restricted to `scope = 1` via `_delete_by_rowid`'s existing `where`
+clause, so both passes stay exactly as batched as the single pass was.
+`series()` and `nodesdb.series` used to choose raw versus hourly from a
+single module-level `RAW_WINDOW_S` constant; from 5.14.0 they read the
+metric's own `scope` in the ownership check they already perform and
+compare the requested window against that class's own raw retention
+(`raw_window_s()`), so a per-port metric with a one-day raw window
+correctly reads the hourly rollup for anything wider than a day, instead
+of a two-day-wide `RAW_WINDOW_S` reading an empty half of `samples`.
 
 The sweep ends in **`Service._sample_storage_alerts()`**, after the trims
 rather than on a clock of its own, so the size it reads is what is left once
@@ -428,7 +484,7 @@ fourth setting).
 | `syslog.db` | `SyslogDatabase` (`syslogdb.py`) | `logs`, `log_counts` (hourly rollup), the FTS5 index, Syslog's own settings |
 | `ipam.db` | `IpamDatabase` (`ipamdb.py`) | `subnets`, `hosts`, `conflicts`, `scans`, `dhcp_servers`, `dhcp_scopes`, `dhcp_leases`, `dhcp_scope_history` (leased-IP trend), IPAM's own settings |
 | `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `device_groups` (organizational, unrelated to `groups`), `devices`, `interfaces`, `device_events`/`interface_events`, `discovery_jobs`/`discovery_results`, `vlans`/`vlan_ports`/`port_vlans` (per-port VLAN membership, for MAPPER), `mac_entries`, `arp_entries` (5.7.0: a device's own ARP cache — IP-to-MAC per interface, off by default), `neighbors`, `device_addresses`, `vendor_learned`, `interface_thresholds` (the alarm/warning levels a port's own transceiver publishes), Nodes' own settings. Also the facade over the two files below |
-| `nodes_series.db` | `NodesSeriesDatabase` (`nodesseriesdb.py`) | `metrics`, `samples`, `samples_hourly` — the Nodes tables that grow |
+| `nodes_series.db` | `NodesSeriesDatabase` (`nodesseriesdb.py`) | `metrics` (from 5.14.0, with its own `scope` column), `samples`, `samples_hourly` — the Nodes tables that grow |
 | `nodes_mibs.db` | `NodesMibDatabase` (`nodesmibdb.py`) | `mib_files` (including each file's original text), `mib_objects` |
 | `alerts.db` | `AlertsDatabase` (`alertsdb.py`) | `rules`, `templates`, `alerts`, `notifications`, `meta` (per-source evaluation cursors), `smtp_credential`, `device_thresholds` (per-device threshold-rule overrides), Alerts' own settings |
 | `snmptraps.db` | `SnmpTrapDatabase` (`snmptrapdb.py`) | `traps` (received traps and informs, decoded), `trap_counts` (hourly rollup), SNMP Trap's own settings |
@@ -572,9 +628,10 @@ after.
 
 `nodes.db` itself is now almost static, so its `trim_to_size` trims the
 oldest 15% of `device_events`/`interface_events` (floor 5,000 each) — the
-only unbounded tables it has left — while `max_nodes_series_db_mb` (default
-1024) caps the metric history, raw samples first and then the oldest hourly
-rollups. `nodes_mibs.db` is deliberately uncapped: a
+only unbounded tables it has left — while `max_nodes_series_db_mb`
+(default 8192, raised from 1024 in 5.14.0) caps the metric history,
+hourly rollups first and then the oldest raw samples (see the trim-floor
+detail above). `nodes_mibs.db` is deliberately uncapped: a
 MIB is not history, and trimming it would silently stop traps decoding.
 
 ---
@@ -2722,6 +2779,28 @@ configured and an alias is only ever supporting evidence.
 upsert, so a source that knows only the address — a trap, a discovery
 fold — never erases what the poller's fuller walk learned) and
 `discovery_results.ip_addresses`/`folded_into_result_id`.
+
+**`device_addresses` ages out, from 5.14.0.** Before this it was the one
+table in `nodes.db` with no age-out path at all: an address a device
+stopped reporting stayed forever. `_migrate` adds `present` and
+`first_seen_ts` (the `mac_entries` migration shape), backfilling
+`first_seen_ts = seen_ts` for existing rows. `record_device_addresses`
+gains a `complete` keyword, defaulting `False`; only `_refresh_addresses`
+— the full `ipAddrTable` walk — passes `complete=True`, and only then are
+rows this walk did not see marked `present=0`. A trap or a discovery fold
+writes a partial set and must never mark the rest of a device's addresses
+absent, so it always calls with the default. An empty complete walk (a
+device that has genuinely stopped answering `ipAddrTable`) still reaches
+the marking step and marks everything absent, rather than being treated
+as "nothing to report." `device_id_for_address` orders candidates
+`present DESC, seen_ts DESC`, so a present alias beats a stale one when a
+trap or syslog address happens to resolve to more than one row.
+`prune_device_addresses`, called from the service's prune block on the
+existing `event_retention_days` (180) — no new setting — deletes rows
+`present = 0` past that age, through `_prune_seen_ts`. A discovery job
+left stuck `running` past the same window is pruned alongside it, closing
+the other leak found in the same pass; the `trim_to_size` docstring's
+stale claim about what it covers is corrected to match.
 
 **Confidence, and what each level may do.** `_discovery_duplicate` in
 `api.py` grades every discovery result against `_device_index(service)`
