@@ -49,6 +49,7 @@ class Collector(udpsock.UdpReceiver):
     QUEUE_SIZE = 20000
     COUNTERS = {"packets": 0, "flows": 0, "dropped": 0, "rejected": 0,
                 "errors": 0, "resampled": 0, "truncated_flows": 0,
+                "first_seen_suppressed": 0,
                 "last_packet": 0.0, "last_template": 0.0}
 
     def __init__(self, db: FlowDatabase, on_batch=None, log=None):
@@ -60,6 +61,10 @@ class Collector(udpsock.UdpReceiver):
         self._settings: dict = {}
         self._allowed: set[str] = set()
         self._versions: set[int] = {V5, V9, IPFIX}
+        # Counted since the last line each throttle let through, so the line
+        # that does get through can say what it stood in for.
+        self._templates_pending = 0
+        self._first_seen_pending = 0
 
     # --------------------------------------------------------------- lifecycle
 
@@ -67,6 +72,8 @@ class Collector(udpsock.UdpReceiver):
         self.stop()
         self._settings = dict(settings)
         self._reset_for_start()
+        self._templates_pending = 0
+        self._first_seen_pending = 0
 
         self._versions = set()
         if settings.get("accept_v5", True):
@@ -152,9 +159,21 @@ class Collector(udpsock.UdpReceiver):
             self._log_first_seen(exporter, data)
         gained = self.decoder.stats["templates"] - templates_before
         if gained:
+            # The timestamp is deliberately outside the throttle: the status
+            # strip's "last template" is how an operator sees that a v9
+            # exporter is still re-sending, and it must move on every one.
             self.counters["last_template"] = time.time()
-            self.log.add(NETFLOW, f"Received {gained} template(s) from {exporter}",
-                         target=exporter)
+            # _read_templates counts every STORE, re-sends included, so an
+            # exporter re-announcing one template each second filed a line a
+            # second -- the third unthrottled log call on this path, and the
+            # one that outlives the other two, because a re-send is not an
+            # error and never stops.
+            self._templates_pending += gained
+            if self._log_netflow_throttled(
+                    "templates",
+                    f"Received {self._templates_pending} template(s) from "
+                    f"{exporter}", target=exporter):
+                self._templates_pending = 0
         if self.decoder.stats["errors"] > errors_before:
             # One line a minute, not one per datagram: the event log is a
             # 3,000-entry ring, and a flood of runts emptied it of everything
@@ -174,25 +193,53 @@ class Collector(udpsock.UdpReceiver):
         except queue.Full:
             self.counters["dropped"] += len(flows)
 
-    def _log_first_seen(self, exporter: str, data: bytes) -> None:
-        """One "first packet from" line a minute, whoever it is from.
+    def _log_netflow_throttled(self, key: str, message: str, detail="",
+                               target: str = "", interval_s: float = 60.0) -> bool:
+        """_log_throttled, filing NETFLOW instead of ERROR.
 
-        This is a NetFlow-category line rather than an error, so it cannot go
-        through _log_throttled, which files ERRORs — but it needs the same
-        rate limit: _seen is an LRU of 4,096 source addresses, so a sender
-        rotating spoofed addresses makes every packet the first from someone
-        and empties the 3,000-entry event log. One shared key, not one per
-        exporter, because varying the exporter is the flood.
+        Both lines this governs are ordinary NetFlow news rather than faults
+        — a template arriving, an exporter heard from for the first time —
+        which is why they cannot go through _log_throttled itself. They need
+        its rate limit all the same: the event log is a 3,000-entry ring,
+        and either line unthrottled empties it of everything an operator
+        wants at exactly the moment they look.
         """
         now = time.time()
-        if now - self._log_times.get("first", 0.0) < 60.0:
+        if now - self._log_times.get(key, 0.0) < interval_s:
+            return False
+        self._log_times[key] = now
+        if callable(detail):
+            detail = detail()
+        self.log.add(NETFLOW, message, target=target, detail=detail)
+        return True
+
+    def _log_first_seen(self, exporter: str, data: bytes) -> None:
+        """One "first packet from" line a minute, whoever it is from, and a
+        count of the exporters that line stood in for.
+
+        _seen is an LRU of 4,096 source addresses, so a sender rotating
+        spoofed addresses makes every packet the first from someone. One
+        shared key, not one per exporter, because varying the exporter IS
+        the flood — but that also means twenty exporters turned on at once
+        file one line between them, and _first_from has already marked the
+        other nineteen seen, so they are never mentioned again. Hence the
+        suppressed count on the next line and the running total in
+        counters["first_seen_suppressed"]: the throttle drops the lines, not
+        the fact that there were more.
+        """
+        pending = self._first_seen_pending
+        extra = (f" (and {pending} other new exporter(s) since the last such "
+                 f"line)" if pending else "")
+        if self._log_netflow_throttled(
+                "first", f"First packet from exporter {exporter}{extra}",
+                target=exporter,
+                detail=lambda: (f"version  {int.from_bytes(data[:2], 'big')}\n"
+                                f"bytes    {len(data)}\n"
+                                f"sampling {self.decoder.sampling_for(exporter)}")):
+            self._first_seen_pending = 0
             return
-        self._log_times["first"] = now
-        self.log.add(NETFLOW, f"First packet from exporter {exporter}",
-                     target=exporter,
-                     detail=f"version  {int.from_bytes(data[:2], 'big')}\n"
-                            f"bytes    {len(data)}\n"
-                            f"sampling {self.decoder.sampling_for(exporter)}")
+        self._first_seen_pending = pending + 1
+        self.counters["first_seen_suppressed"] += 1
 
     def _write(self) -> None:
         pending: list = []

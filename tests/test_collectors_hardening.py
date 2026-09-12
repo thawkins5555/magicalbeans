@@ -1956,6 +1956,59 @@ def test_c13_flood_bounds_on_the_flow_collector() -> None:
         check(collector.counters["errors"] >= 500,
               f"while the counter still shows every one of them "
               f"({collector.counters['errors']})")
+        # The throttle key is global, so the 499 exporters that line stood
+        # in for were marked seen by _first_from and never mentioned again.
+        # They are counted, and the line that did get through says so.
+        check(collector.counters["first_seen_suppressed"] >= 490,
+              f"and the exporters whose own line was suppressed are counted "
+              f"rather than lost ({collector.counters['first_seen_suppressed']})")
+        # ...and carried onto the next line the throttle lets through:
+        # reopen the window as a minute passing would, then let one more
+        # never-seen exporter in.
+        collector._log_times["first"] = 0.0
+        collector._handle_datagram(runt, ("10.9.9.9", 40000))
+        carried = [event.message for event in log.all()
+                   if event.message.startswith("First packet")][-1]
+        check("499 other new exporter" in carried,
+              f"...with that count carried onto the next line the throttle "
+              f"lets through ({carried!r})")
+    finally:
+        collector.stop()
+    flow_db.close()
+
+    # --- (e) a re-sent template does not file a line per datagram ----------
+    # _read_templates counts every store, re-sends included, so 500 identical
+    # v9 template datagrams filed 500 "Received 1 template(s)" lines: the
+    # third unthrottled log call on this path, and the only one a healthy
+    # exporter triggers for ever.
+    log = EventLog()
+    flow_db = FlowDatabase(db_path("c13-templates.db"))
+    collector = Collector(flow_db, log=log)
+    port = free_udp_port()
+    assert collector.start({"port": port, "bind_address": "127.0.0.1"})
+    try:
+        log.clear()
+        template = v9_flow_packet()
+        for _index in range(500):
+            collector._handle_datagram(template, ("10.9.0.1", 40000))
+        lines = [event for event in log.all()
+                 if "template(s) from" in event.message]
+        check(len(lines) <= 2,
+              f"500 re-sends of one template file at most a couple of lines "
+              f"({len(lines)})")
+        check(all(event.category == "netflow" for event in lines),
+              f"...still filed as NetFlow news, not as errors "
+              f"({[event.category for event in lines]})")
+        check(collector.counters["last_template"] > 0,
+              f"while the status strip's last-template time still moves on "
+              f"every re-send ({collector.counters['last_template']})")
+        collector._log_times["templates"] = 0.0
+        collector._handle_datagram(template, ("10.9.0.1", 40000))
+        carried = [event.message for event in log.all()
+                   if "template(s) from" in event.message][-1]
+        check("500 template(s)" in carried,
+              f"...and the next line the throttle lets through names every "
+              f"re-send it stood in for ({carried!r})")
     finally:
         collector.stop()
     flow_db.close()
