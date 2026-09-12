@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 
@@ -90,6 +91,37 @@ check("an uncapped store gets no meter span at all -- a full grey track "
       [s.name for s in STORES if not s.cap_key
        and f'id="use-{s.name.replace("_", "-")}"' in RETENTION])
 
+# ------------------------------- 1b. the per-table breakdown, per store row
+
+for store in STORES:
+    dashed = store.name.replace("_", "-")
+    check(f"{store.name}: its file row carries a collapsed per-table "
+          f"breakdown of its own",
+          f'<details id="tables-{dashed}">' in RETENTION
+          and f'id="tablebody-{dashed}"' in RETENTION)
+    check(f"{store.name}: and showUsage wires that row's toggle",
+          f"tables-${{name.replace(/_/g, '-')}}" in USAGE)
+
+check("no breakdown ships open -- this is a settings page, and opening one "
+      "is what pays for the COUNT(*) sweep behind it",
+      "<details open" not in RETENTION and " open>" not in RETENTION)
+check("showUsage itself never fetches the breakdown: /api/db/report is "
+      "COUNT(*) over every table in every file and is asked for only when "
+      "a row is expanded",
+      "App.get('/api/db/report')" not in USAGE
+      and "App.get('/api/db/report')" in SETTINGS)
+check("...and the expand handler holds one report for every row rather "
+      "than one sweep per row opened",
+      "dbReport = dbReport || App.get('/api/db/report')" in SETTINGS)
+check("the breakdown says which basis its byte figures are on, so an "
+      "estimate is never read as a measurement",
+      "'measured'" in SETTINGS and "per-row size" in SETTINGS)
+
+check("one line says whether the CAP or the RETENTION setting is what "
+      "bounds the metric history file",
+      'id="set-series-bound"' in RETENTION
+      and "nodes_series_rollup_days" in USAGE)
+
 check("the free-space thresholds have inputs of their own, so the alert "
       "they drive can be tuned from the page it is about",
       'id="set-disk-warn"' in RETENTION and 'id="set-disk-critical"' in RETENTION
@@ -124,7 +156,10 @@ const CAPS = %s;
 const elements = {};
 function stub(id) {
   if (!elements[id]) {
+    // `dataset`, `hidden`, `open` and `ontoggle` are the <details> row's:
+    // showUsage wires the per-table breakdown's toggle and never opens it.
     elements[id] = { id, textContent: '', innerHTML: '', className: '',
+                     dataset: {}, hidden: false, open: false, ontoggle: null,
                      value: CAPS[id] === undefined ? '' : String(CAPS[id]) };
   }
   return elements[id];
@@ -136,7 +171,10 @@ const App = {
 };
 %s
 showUsage(%s);
-console.log(JSON.stringify(elements));
+// A handler is a function, which JSON drops silently: 'fn' is how the
+// checks below can see that a row was wired at all.
+console.log(JSON.stringify(elements,
+  (key, value) => (typeof value === 'function' ? 'fn' : value)));
 """
 
 
@@ -157,6 +195,7 @@ def render(storage, caps):
         shutil.rmtree(folder, ignore_errors=True)
 
 
+NOW = time.time()
 MB = 1024 * 1024
 CAPS = {f"set-{s.name.replace('_', '-')}-cap": 512 for s in CAPPED}
 
@@ -218,6 +257,43 @@ else:
     check("the total counts every file the server reported",
           over["set-sizes"]["textContent"].startswith("1029 MB on disk in total"),
           over["set-sizes"]["textContent"][:60])
+
+    # Which of the two limits is binding. A 1 GiB cap against 400 days of
+    # rollups delivered about 2.6% of the history the page said was kept,
+    # and neither this page nor Nodes' STORAGE fieldset said so anywhere.
+    DAY = 86400
+    capped_by_cap = render(
+        {"nodes_series_bytes": 512 * MB, "nodes_series_oldest_ts": NOW - 9 * DAY,
+         "nodes_series_rollup_days": 400}, CAPS)["set-series-bound"]["textContent"]
+    check("a file reaching back nine days against a 400-day retention "
+          "names the CAP as what is bounding it",
+          "CAP is what bounds" in capped_by_cap and "9 days" in capped_by_cap,
+          capped_by_cap)
+    capped_by_retention = render(
+        {"nodes_series_bytes": 64 * MB, "nodes_series_oldest_ts": NOW - 398 * DAY,
+         "nodes_series_rollup_days": 400}, CAPS)["set-series-bound"]["textContent"]
+    check("...and one reaching nearly the whole window names RETENTION",
+          "RETENTION is what bounds" in capped_by_retention,
+          capped_by_retention)
+    check("an empty metric history claims neither",
+          "empty" in render({"nodes_series_rollup_days": 400},
+                            CAPS)["set-series-bound"]["textContent"])
+    check("and with the storage block withheld it claims nothing at all",
+          withheld["set-series-bound"]["textContent"] == "",
+          withheld["set-series-bound"]["textContent"])
+
+    check("a breakdown row is hidden until the server has reported the "
+          "files at all, rather than offering to expand into nothing",
+          all(withheld[f"tables-{s.name.replace('_', '-')}"]["hidden"]
+              for s in STORES)
+          and not any(over[f"tables-{s.name.replace('_', '-')}"]["hidden"]
+                      for s in STORES))
+    check("...and showUsage leaves every one of them closed",
+          not any(over[f"tables-{s.name.replace('_', '-')}"]["open"]
+                  for s in STORES))
+    check("...with a toggle handler on each, which is what fetches it",
+          all(over[f"tables-{s.name.replace(chr(95), chr(45))}"]["ontoggle"] == "fn"
+              for s in STORES))
 
     # A cap of 0 is "no cap" everywhere else in the product; the meter has
     # to read it the same way rather than dividing by it.

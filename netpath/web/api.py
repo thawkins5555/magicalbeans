@@ -41,6 +41,7 @@ from ..trapdecode import GENERIC_NAMES, VERSION_NAMES, enc_octets, format_ticks
 from .. import trapdecode
 from .. import nodeoids
 from .. import configrx
+from .. import dbreport
 from .. import configrx_compliance
 from .. import configrx_redact
 from .. import sshterm, webrelay
@@ -872,6 +873,13 @@ def _storage(service) -> dict:
     if total:
         result["disk_free"] = free
         result["disk_total"] = total
+    # What the metric history's rollup retention asks for, beside how far
+    # back the file actually reaches: the two together are what says whether
+    # the cap or the retention setting is the thing bounding that file. A
+    # settings read, not a query, so it stays on the /api/state path.
+    nodes_settings = getattr(service, "nodes_settings", None) or {}
+    result["nodes_series_rollup_days"] = float(
+        nodes_settings.get("rollup_retention_days", 400) or 0)
     # app.db carries the audit trail, which no sweep may trim, so it gets a
     # warning where every other store gets a cap.
     warn_mib = int(service.settings.get("app_db_warn_mib") or 0)
@@ -882,6 +890,30 @@ def _storage(service) -> dict:
             f"{warn_mib} MiB app_db_warn_mib mark — its audit trail is never "
             f"trimmed; archive the file or raise the threshold")
     return result
+
+
+def get_db_report(service, params, body) -> dict:
+    """Where the bytes in each database are, per table.
+
+    Its own route rather than a block inside /api/state, and cached for five
+    minutes: this is COUNT(*) over every table in thirteen files, which over
+    a hundred-million-row `samples` is seconds. /api/state is polled every
+    two seconds by every open tab and must never carry it.
+
+    Row counts are exact; `basis` says whether the byte figures are dbstat's
+    or the measured per-row constants, and the `unaccounted` line reconciles
+    the column against the file."""
+    return {"stores": service.cached_poll(
+        "db_report", 300, lambda: dbreport.report(_report_paths(service)))}
+
+
+def _report_paths(service) -> dict:
+    paths = {}
+    for store in STORES:
+        db = db_for(service, store)
+        if db is not None:
+            paths[store.name] = db.path
+    return paths
 
 
 # ------------------------------------------------------------------ netpath

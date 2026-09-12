@@ -17,6 +17,8 @@ import signal
 import sys
 import threading
 
+from .dbreport import STORE_FILENAMES
+
 
 def default_db_path() -> str:
     """The data folder, created owner-only.
@@ -42,7 +44,7 @@ def default_db_path() -> str:
                 os.chmod(folder, 0o700)
         except OSError:
             pass          # a folder someone deliberately shared; not ours to fight
-    return os.path.join(folder, "netpath.db")
+    return os.path.join(folder, STORE_FILENAMES["trace"])
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -85,58 +87,50 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def beside_db(args, store: str) -> str:
+    """The default path for `store`: its filename, in --db's folder. The
+    filename comes from dbreport.STORE_FILENAMES, which is also what the
+    storage report resolves a data folder with -- these eleven helpers each
+    had it written into them, so nothing else could ask which file a store
+    keeps."""
+    return os.path.join(os.path.dirname(args.db) or ".",
+                        STORE_FILENAMES[store])
+
+
 def flow_path_for(args) -> str:
-    if args.flow_db:
-        return args.flow_db
-    return os.path.join(os.path.dirname(args.db) or ".", "flows.db")
+    return args.flow_db or beside_db(args, "flow")
 
 
 def syslog_path_for(args) -> str:
-    if args.syslog_db:
-        return args.syslog_db
-    return os.path.join(os.path.dirname(args.db) or ".", "syslog.db")
+    return args.syslog_db or beside_db(args, "syslog")
 
 
 def app_path_for(args) -> str:
-    if args.app_db:
-        return args.app_db
-    return os.path.join(os.path.dirname(args.db) or ".", "app.db")
+    return args.app_db or beside_db(args, "app")
 
 
 def ipam_path_for(args) -> str:
-    if args.ipam_db:
-        return args.ipam_db
-    return os.path.join(os.path.dirname(args.db) or ".", "ipam.db")
+    return args.ipam_db or beside_db(args, "ipam")
 
 
 def snmp_path_for(args) -> str:
-    if args.snmp_db:
-        return args.snmp_db
-    return os.path.join(os.path.dirname(args.db) or ".", "snmptraps.db")
+    return args.snmp_db or beside_db(args, "snmp")
 
 
 def nodes_path_for(args) -> str:
-    if args.nodes_db:
-        return args.nodes_db
-    return os.path.join(os.path.dirname(args.db) or ".", "nodes.db")
+    return args.nodes_db or beside_db(args, "nodes")
 
 
 def alerts_path_for(args) -> str:
-    if args.alerts_db:
-        return args.alerts_db
-    return os.path.join(os.path.dirname(args.db) or ".", "alerts.db")
+    return args.alerts_db or beside_db(args, "alerts")
 
 
 def wireless_path_for(args) -> str:
-    if args.wireless_db:
-        return args.wireless_db
-    return os.path.join(os.path.dirname(args.db) or ".", "wireless.db")
+    return args.wireless_db or beside_db(args, "wireless")
 
 
 def configrx_path_for(args) -> str:
-    if args.configrx_db:
-        return args.configrx_db
-    return os.path.join(os.path.dirname(args.db) or ".", "configrx.db")
+    return args.configrx_db or beside_db(args, "configrx")
 
 
 def build_service(args):

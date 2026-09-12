@@ -226,7 +226,14 @@ GLOBAL_DEFAULTS = {
     # metric history moved to nodes_series.db below. nodes_mibs.db is
     # uncapped on purpose: trimming a MIB file would silently un-decode traps.
     "max_nodes_db_mb": 1024,
-    "max_nodes_series_db_mb": 1024,  # samples accumulate; closer to flows than traps
+    # 8 GiB, from 1 GiB. The measured cost of the default retention at a
+    # 250-device fleet is ~39 GB (107 M raw rows at 66.7 B, 476 M rollup
+    # rows at 66.3 B), so a 1 GiB cap delivered about 2.6% of the history
+    # the Settings page says is kept -- the cap, not the retention setting,
+    # was what every install of that size was living with, silently. This
+    # does not change a saved value: an operator who set one keeps it, and
+    # Settings -> Data & Retention now says which of the two is binding.
+    "max_nodes_series_db_mb": 8192,
     "max_alerts_db_mb": 128,       # alert/notification history, much lighter
     # Was 256: a 75-second burst on a 250-device review install wrote 98.6 MB
     # (38% of that cap) — a real storm reaches 256 MB in minutes and starts

@@ -1275,6 +1275,16 @@ fieldset .hint { margin: var(--space-sm) 0 0; }
    these readouts are spans on a row: it would drop each one below the
    control it belongs beside. */
 #settings-sub-retention fieldset > label > .hint { margin: 0; }
+/* The per-table breakdown gets a row of its own: the file row's four
+   columns are already full, and a table list is wider than any of them. */
+#settings-sub-retention fieldset > .tables { grid-column: 1 / -1; }
+#settings-sub-retention fieldset > .tables summary {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+}
+#settings-sub-retention fieldset > .tables td { padding-right: var(--space-md); }
+#settings-sub-retention fieldset > .tables .num { text-align: right; }
 
 /* A visible scrollbar: this page scrolls and a thin auto-hiding bar gives no
    hint that there is more below. */

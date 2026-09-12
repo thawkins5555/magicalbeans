@@ -1273,42 +1273,68 @@
       <label>Application <input id="set-app-path" readonly>
         <span class="usage" id="size-app"></span>
         <span class="hint" id="age-app"></span></label>
+      <div class="tables"><details id="tables-app"><summary>Tables</summary>
+        <span class="usage" id="tablebody-app"></span></details></div>
       <label>Traces <input id="set-trace-path" readonly>
         <span class="usage" id="size-trace"></span>
         <span class="hint" id="age-trace"></span></label>
+      <div class="tables"><details id="tables-trace"><summary>Tables</summary>
+        <span class="usage" id="tablebody-trace"></span></details></div>
       <label>Flows <input id="set-flow-path" readonly>
         <span class="usage" id="size-flow"></span>
         <span class="hint" id="age-flow"></span></label>
+      <div class="tables"><details id="tables-flow"><summary>Tables</summary>
+        <span class="usage" id="tablebody-flow"></span></details></div>
       <label>SNMP traps <input id="set-snmp-path" readonly>
         <span class="usage" id="size-snmp"></span>
         <span class="hint" id="age-snmp"></span></label>
+      <div class="tables"><details id="tables-snmp"><summary>Tables</summary>
+        <span class="usage" id="tablebody-snmp"></span></details></div>
       <label>Syslog <input id="set-syslog-path" readonly>
         <span class="usage" id="size-syslog"></span>
         <span class="hint" id="age-syslog"></span></label>
+      <div class="tables"><details id="tables-syslog"><summary>Tables</summary>
+        <span class="usage" id="tablebody-syslog"></span></details></div>
       <label>IPAM <input id="set-ipam-path" readonly>
         <span class="usage" id="size-ipam"></span>
         <span class="hint" id="age-ipam"></span></label>
+      <div class="tables"><details id="tables-ipam"><summary>Tables</summary>
+        <span class="usage" id="tablebody-ipam"></span></details></div>
       <label>Nodes <input id="set-nodes-path" readonly>
         <span class="usage" id="size-nodes"></span>
         <span class="hint" id="age-nodes"></span></label>
+      <div class="tables"><details id="tables-nodes"><summary>Tables</summary>
+        <span class="usage" id="tablebody-nodes"></span></details></div>
       <label>Nodes metric history <input id="set-nodes-series-path" readonly>
         <span class="usage" id="size-nodes-series"></span>
         <span class="hint" id="age-nodes-series"></span></label>
+      <div class="tables"><details id="tables-nodes-series"><summary>Tables</summary>
+        <span class="usage" id="tablebody-nodes-series"></span></details></div>
       <label>Nodes MIBs <input id="set-nodes-mibs-path" readonly>
         <span class="usage" id="size-nodes-mibs"></span>
         <span class="hint" id="age-nodes-mibs"></span></label>
+      <div class="tables"><details id="tables-nodes-mibs"><summary>Tables</summary>
+        <span class="usage" id="tablebody-nodes-mibs"></span></details></div>
       <label>Alerts <input id="set-alerts-path" readonly>
         <span class="usage" id="size-alerts"></span>
         <span class="hint" id="age-alerts"></span></label>
+      <div class="tables"><details id="tables-alerts"><summary>Tables</summary>
+        <span class="usage" id="tablebody-alerts"></span></details></div>
       <label>Wireless <input id="set-wireless-path" readonly>
         <span class="usage" id="size-wireless"></span>
         <span class="hint" id="age-wireless"></span></label>
+      <div class="tables"><details id="tables-wireless"><summary>Tables</summary>
+        <span class="usage" id="tablebody-wireless"></span></details></div>
       <label>ConfigRX <input id="set-configrx-path" readonly>
         <span class="usage" id="size-configrx"></span>
         <span class="hint" id="age-configrx"></span></label>
+      <div class="tables"><details id="tables-configrx"><summary>Tables</summary>
+        <span class="usage" id="tablebody-configrx"></span></details></div>
       <label>Mapper <input id="set-mapper-path" readonly>
         <span class="usage" id="size-mapper"></span>
         <span class="hint" id="age-mapper"></span></label>
+      <div class="tables"><details id="tables-mapper"><summary>Tables</summary>
+        <span class="usage" id="tablebody-mapper"></span></details></div>
       <label>Trace database cap <input type="number" id="set-trace-cap" min="16" step="64"> MB
         <span class="usage" id="use-trace"></span></label>
       <label>Flow database cap <input type="number" id="set-flow-cap" min="16" step="256"> MB
@@ -1326,6 +1352,7 @@
       <label>Alerts database cap <input type="number" id="set-alerts-cap" min="16" step="16"> MB
         <span class="usage" id="use-alerts"></span></label>
       <p class="hint" id="set-sizes"></p>
+      <p class="hint" id="set-series-bound"></p>
       <p class="hint">Checked every 15 minutes. When a file is over its cap the oldest records are
         deleted until it fits, so the cap wins over the retention setting. For IPAM that means the
         oldest scan history first — subnets, discovered hosts and open conflicts describe the

@@ -29,6 +29,7 @@ from netpath import sqlitebase as settingsutil  # noqa: E402
 from netpath import appdb as appdb_module  # noqa: E402
 from netpath import db as db_module  # noqa: E402
 from netpath import nodesdb as nodesdb_module  # noqa: E402
+from netpath.web import api as api_module  # noqa: E402
 from netpath.web.server import WebServer  # noqa: E402
 from netpath.web.service import Service  # noqa: E402
 
@@ -227,6 +228,39 @@ def main() -> int:
         check("loader appdb poisoned dns_workers falls back to default",
               service.app_db.settings()["dns_workers"]
               == appdb_module.GLOBAL_DEFAULTS["dns_workers"])
+
+        # ------------------------------- (c) the metric history cap default
+        #
+        # Raised 1024 -> 8192. The default retention costs ~39 GB at a
+        # 250-device fleet, so a 1 GiB cap was delivering about 2.6% of the
+        # history the Settings page said was kept. What must not happen is
+        # a raise reaching into an install that had chosen its own figure.
+        SERIES_CAP = "max_nodes_series_db_mb"
+        check("the metric history cap defaults to 8 GiB, not 1",
+              appdb_module.GLOBAL_DEFAULTS[SERIES_CAP] == 8192,
+              appdb_module.GLOBAL_DEFAULTS[SERIES_CAP])
+        check("...as an int, so coerce_settings keeps it one",
+              isinstance(appdb_module.GLOBAL_DEFAULTS[SERIES_CAP], int))
+        _low, _high = api_module._GLOBAL_SETTINGS_RANGES[SERIES_CAP]
+        check("...and inside the bounds POST /api/settings enforces, so the "
+              "default is a value the page can also be set back to",
+              _low <= appdb_module.GLOBAL_DEFAULTS[SERIES_CAP]
+              and (_high is None
+                   or appdb_module.GLOBAL_DEFAULTS[SERIES_CAP] <= _high),
+              (_low, _high))
+        check("a store that has never been told reads the new default",
+              service.app_db.settings()[SERIES_CAP] == 8192,
+              service.app_db.settings()[SERIES_CAP])
+        with service.app_db._lock:
+            service.app_db._conn.execute(
+                "INSERT INTO settings(key,value) VALUES (?,'1024')"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (SERIES_CAP,))
+            service.app_db._conn.commit()
+        check("a saved 1024 survives the raised default untouched -- an "
+              "operator who chose a cap keeps it",
+              service.app_db.settings()[SERIES_CAP] == 1024,
+              service.app_db.settings()[SERIES_CAP])
 
         # ------------------------------------------------------------- login
         admin_cookie, status, _p = login(port, "admin", "admin")

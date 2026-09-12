@@ -232,6 +232,11 @@ ROUTES = [
     # same way the settings that configure it are (ADMIN_ONLY_SETTINGS).
     ("POST", r"^/api/settings/ldap-test$", api.post_ldap_test, ("admin", W)),
     ("GET", r"^/api/state$", api.get_state, None),
+    # The per-table breakdown of every database, behind `settings: read` the
+    # way the storage block inside /api/state is. Its own route because it
+    # is COUNT(*) over every table in thirteen files; the handler caches it
+    # for five minutes, and /api/state never carries it.
+    ("GET", r"^/api/db/report$", api.get_db_report, ("settings", R)),
     ("GET", r"^/api/config$", api.get_config, None),
     ("GET", r"^/api/netpath/targets$", api.get_targets, ("netpath", R)),
     ("POST", r"^/api/netpath/targets$", api.post_target, ("netpath", W)),

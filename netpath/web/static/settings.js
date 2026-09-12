@@ -480,6 +480,38 @@
         age.textContent = !known || !keepsHistory ? ''
           : ts ? `oldest record ${App.ago(ts)}` : 'no history';
       }
+      // The per-table breakdown, on its own row under the file. Collapsed,
+      // and fetched only when it is opened: /api/db/report is COUNT(*) over
+      // every table in thirteen files, which is why it is not in the
+      // storage block above.
+      const details = App.el(`tables-${name.replace(/_/g, '-')}`);
+      if (details) {
+        details.hidden = !known;
+        details.ontoggle = () => { if (details.open) showTables(name); };
+      }
+    }
+    // Which of the two limits is actually deciding how much metric history
+    // there is. A 1 GiB cap against 400 days of rollups delivered about 2.6%
+    // of what the retention setting said was kept, and nothing on this page
+    // or Nodes' own STORAGE fieldset ever said so.
+    const bound = App.el('set-series-bound');
+    if (bound) {
+      const ts = storage.nodes_series_oldest_ts;
+      const days = Number(storage.nodes_series_rollup_days || 0);
+      const reach = ts ? (Date.now() / 1000 - ts) / 86400 : 0;
+      bound.textContent = !known || !days ? ''
+        : !ts ? 'Nodes metric history is empty, so neither the cap nor the '
+          + 'rollup retention setting is bounding it yet.'
+        : reach < days * 0.9
+          ? `The CAP is what bounds Nodes metric history: it reaches back `
+            + `${Math.round(reach)} days against the ${Math.round(days)} days `
+            + 'rollup retention asks for, so the size cap is deleting history '
+            + 'the retention setting would have kept. Raise the cap, or expect '
+            + 'this much.'
+          : `RETENTION is what bounds Nodes metric history: it reaches back `
+            + `${Math.round(reach)} of the ${Math.round(days)} days rollup `
+            + 'retention asks for and is under its cap, so the retention '
+            + 'setting is what decides how far back a wide chart goes.';
     }
     const disk = App.el('use-disk');
     disk.textContent = known && storage.disk_total
@@ -501,6 +533,50 @@
     const el = App.el('set-status');
     el.textContent = message;
     el.style.color = colour || 'var(--muted)';
+  }
+
+  /* One /api/db/report for every store, held for the life of the page: the
+     server caches it five minutes anyway, and an operator opening four rows
+     should not pay for four sweeps. Reset on failure so a retry re-asks. */
+  let dbReport = null;
+
+  async function showTables(name) {
+    const body = App.el(`tablebody-${name.replace(/_/g, '-')}`);
+    if (!body || body.dataset.filled === '1') return;
+    body.textContent = 'Reading…';
+    try {
+      dbReport = dbReport || App.get('/api/db/report');
+      const payload = await dbReport;
+      body.innerHTML = tableRows(
+        (payload.stores || []).find((store) => store.name === name));
+      body.dataset.filled = '1';
+    } catch (error) {
+      dbReport = null;
+      body.textContent = `Could not read the breakdown: ${error.message}`;
+    }
+  }
+
+  function tableRows(store) {
+    const escape = App.escapeHtml;
+    if (!store) return 'This service has not opened that database.';
+    if (store.missing) return escape(store.note);
+    // The basis line is not decoration: where dbstat is not compiled in the
+    // bytes are row counts times a measured per-row size, and the
+    // `unaccounted` row is what reconciles the column against the file.
+    const basis = store.basis === 'measured'
+      ? 'Bytes measured exactly, per table, including its indexes.'
+      : 'Rows are exact; bytes are rows times a measured per-row size, '
+        + 'indexes included.';
+    const rows = (store.tables || []).map((row) => '<tr>'
+      + `<td>${escape(row.name)}</td>`
+      + `<td class="num">${row.rows === null ? '' : row.rows.toLocaleString()}</td>`
+      + `<td class="num">${App.bytes(row.bytes)}</td></tr>`).join('');
+    // What the column adds up to is the pages, not the file: the size on
+    // the row above includes a write-ahead log that holds no table.
+    const held = `${App.bytes(store.page_count * store.page_size)} in pages, `
+      + `of ${App.bytes(store.file_bytes)} on disk with the write-ahead log. `;
+    return `<div>${held}${basis}${store.note ? ` ${escape(store.note)}` : ''}</div>`
+      + `<table><tbody>${rows}</tbody></table>`;
   }
 
   // The detailed status() line above sits at the far left of the footer
