@@ -1692,6 +1692,54 @@ ok("a delivery counted from a sender thread waits on the engine's lock, the "
 nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
 
 
+# ================================================================== B14
+print("\nB14 — every id-ordered drain goes through the one drain contract")
+
+# Grep, not behaviour: the eleven-line cursor preamble was copied into each
+# drain and the copy that got a line wrong got it wrong silently (ALRT-F7).
+# Same style as tests/test_frontend_contracts.py — read the module as text
+# and assert the small number of things that must be true of it.
+ENGINE_SRC = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               os.pardir, "netpath", "alertengine.py"),
+                  encoding="utf-8").read()
+
+# The two that read no id-ordered table: one drains an in-process queue, the
+# other a due-time table with no cursor at all.
+EXEMPT = {"_drain_system_occurrences", "_drain_pending", "_drain_from"}
+
+drain_bodies = {}
+for chunk in ENGINE_SRC.split("\n    def ")[1:]:
+    name = chunk.split("(")[0]
+    if name.startswith("_drain_"):
+        drain_bodies[name] = chunk
+
+assert len(drain_bodies) == 9, sorted(drain_bodies)   # 8 drains + the helper
+contracted = sorted(set(drain_bodies) - EXEMPT)
+assert len(contracted) == 6, contracted
+ok(f"{len(drain_bodies) - 1} _drain_* methods found, {len(contracted)} of them "
+   f"id-ordered")
+
+for name in contracted:
+    body = drain_bodies[name]
+    assert "self._drain_from(" in body, f"{name} does not use _drain_from"
+    for banned in ("has_cursor(", "self.db.cursor(", "_advance_cursor(",
+                   "_read_forward("):
+        assert banned not in body, f"{name} still hand-rolls {banned}"
+ok("all six route their cursor through _drain_from and hand-roll none of "
+   "has_cursor / cursor / _advance_cursor / _read_forward")
+
+helper = drain_bodies["_drain_from"]
+assert "self.db.set_cursor(source, max_id_fn())" in helper
+ok("_drain_from seeds an unseeded cursor at the source's current max id")
+assert "if max_id > cursor:" in helper and \
+    helper.index("yield row") < helper.index("if max_id > cursor:")
+ok("...and advances only after the caller's loop has had every row")
+
+for name in EXEMPT - {"_drain_from"}:
+    assert "self._drain_from(" not in drain_bodies[name], name
+ok("the two structurally different drains are left alone")
+
+
 # ============================================================ storage trim
 print("\nStorage — alerts.db opens tightly and reclaims without VACUUM")
 

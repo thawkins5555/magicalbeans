@@ -548,6 +548,29 @@ class AlertEngine(Worker):
             except Exception:
                 pass
 
+    def _drain_from(self, source: str, fetch, max_id_fn):
+        """Yield every row past `source`'s cursor, then advance it once.
+
+        The eleven lines each id-ordered drain used to keep its own copy of:
+        seed an unseeded cursor at the current max id (so a fresh install
+        does not alert on the history it just imported), read through
+        _read_forward for the row/time budgets and the backlog counter, and
+        advance only once the caller has finished with every row - never if
+        the caller raises, so a failed tick hands the batch back rather than
+        skipping it (see _advance_cursor).
+        """
+        if not self.db.has_cursor(source):
+            self.db.set_cursor(source, max_id_fn())
+            return
+        cursor = self.db.cursor(source)
+        max_id = cursor
+        for row in self._read_forward(source, fetch, cursor, max_id_fn):
+            if row["id"] > max_id:
+                max_id = row["id"]
+            yield row
+        if max_id > cursor:
+            self._advance_cursor(source, max_id)
+
     def _device_for_source(self, cache: dict, source: str):
         """The managed device that sent this trap or syslog message, or None.
 
@@ -823,16 +846,10 @@ class AlertEngine(Worker):
         return message, detail, extra
 
     def _drain_device_events(self, settings) -> list[Occurrence]:
-        if not self.db.has_cursor("device_events"):
-            self.db.set_cursor("device_events", self.nodes_db.max_device_event_id())
-            return []
-        cursor = self.db.cursor("device_events")
         occurrences = []
-        max_id = cursor
-        for row in self._read_forward("device_events",
-                                      self.nodes_db.device_events_since, cursor,
-                                      self.nodes_db.max_device_event_id):
-            max_id = max(max_id, row["id"])
+        for row in self._drain_from("device_events",
+                                    self.nodes_db.device_events_since,
+                                    self.nodes_db.max_device_event_id):
             if row["kind"] in _TIMELINE_ONLY_EVENT_KINDS:
                 continue
             device = self.nodes_db.device(row["device_id"])
@@ -874,8 +891,6 @@ class AlertEngine(Worker):
             if resolved:
                 self.counters["resolved"] += 1
                 self._notify_clear(resolved, cleared_rule, settings, extra=extra)
-        if max_id > cursor:
-            self._advance_cursor("device_events", max_id)
         return occurrences
 
     def _replay_downstream_outages(self, device) -> list[Occurrence]:
@@ -915,17 +930,11 @@ class AlertEngine(Worker):
         return out
 
     def _drain_interface_events(self, settings) -> list[Occurrence]:
-        if not self.db.has_cursor("interface_events"):
-            self.db.set_cursor("interface_events", self.nodes_db.max_interface_event_id())
-            return []
-        cursor = self.db.cursor("interface_events")
         occurrences = []
-        max_id = cursor
         touched_interfaces: set[int] = set()
-        for row in self._read_forward("interface_events",
-                                      self.nodes_db.interface_events_since, cursor,
-                                      self.nodes_db.max_interface_event_id):
-            max_id = max(max_id, row["id"])
+        for row in self._drain_from("interface_events",
+                                    self.nodes_db.interface_events_since,
+                                    self.nodes_db.max_interface_event_id):
             touched_interfaces.add(row["interface_id"])
             interface = self.nodes_db.interface_by_id(row["interface_id"])
             if interface is None:
@@ -984,22 +993,14 @@ class AlertEngine(Worker):
                 entity_id=f"{device['id']}:{interface['if_index']}", entity_label=label,
                 ts=time.time(), message=f"{label} is flapping",
                 device_name=device["name"] or "", device_ip=device["ip"]))
-        if max_id > cursor:
-            self._advance_cursor("interface_events", max_id)
         return occurrences
 
     def _drain_traps(self, settings) -> list[Occurrence]:
-        if not self.db.has_cursor("traps"):
-            self.db.set_cursor("traps", self.snmp_db.max_id())
-            return []
-        cursor = self.db.cursor("traps")
         occurrences = []
-        max_id = cursor
         devices: dict = {}
         names: dict = {}
-        for row in self._read_forward("traps", self.snmp_db.traps_since,
-                                      cursor, self.snmp_db.max_id):
-            max_id = max(max_id, row["id"])
+        for row in self._drain_from("traps", self.snmp_db.traps_since,
+                                    self.snmp_db.max_id):
             # A trap alert used to name only the trap ("linkDown"), because
             # nothing on the occurrence said which box sent it: device_name
             # was empty, so a rule's device_filter could not match a trap at
@@ -1027,23 +1028,15 @@ class AlertEngine(Worker):
                 managed=device is not None,
                 extra={"trap_name": row["trap_name"] or "", "trap_oid": row["trap_oid"] or "",
                       "varbinds": row["varbind_text"] or ""}))
-        if max_id > cursor:
-            self._advance_cursor("traps", max_id)
         return occurrences
 
     def _drain_syslog(self, settings) -> list[Occurrence]:
-        if not self.db.has_cursor("syslog"):
-            self.db.set_cursor("syslog", self.syslog_db.max_id())
-            return []
-        cursor = self.db.cursor("syslog")
         min_severity = int(settings.get("min_severity", 7))
         occurrences = []
-        max_id = cursor
         devices: dict = {}
         names: dict = {}
-        for row in self._read_forward("syslog", self.syslog_db.rows_since,
-                                      cursor, self.syslog_db.max_id):
-            max_id = max(max_id, row["id"])
+        for row in self._drain_from("syslog", self.syslog_db.rows_since,
+                                    self.syslog_db.max_id):
             if row["severity"] > min_severity:
                 continue
             device = self._device_for_source(devices, row["source"])
@@ -1070,26 +1063,13 @@ class AlertEngine(Worker):
                 device_ip=row["source"],
                 severity=row["severity"],
                 managed=device is not None))
-        if max_id > cursor:
-            self._advance_cursor("syslog", max_id)
         return occurrences
 
     def _drain_ipam_conflicts(self, settings) -> list[Occurrence]:
-        if not self.db.has_cursor("ipam_conflicts"):
-            self.db.set_cursor("ipam_conflicts", self.ipam_db.conflicts_max_id())
-            return []
-        cursor = self.db.cursor("ipam_conflicts")
         occurrences = []
-        max_id = cursor
-        # Through _read_forward like every other source, rather than reading
-        # every conflict ever recorded and keeping the new ones in Python:
-        # that read was the whole table, resolved rows included, on every
-        # tick, and it was the one drain the row/time budgets and the
-        # backlog counter passed by.
-        for row in self._read_forward("ipam_conflicts",
-                                      self.ipam_db.conflicts_since, cursor,
-                                      self.ipam_db.conflicts_max_id):
-            max_id = max(max_id, row["id"])
+        for row in self._drain_from("ipam_conflicts",
+                                    self.ipam_db.conflicts_since,
+                                    self.ipam_db.conflicts_max_id):
             label = namelookup.resolve_name(
                 self.nodes_db, self.app_db, row["ip"]) or row["ip"]
             occurrences.append(Occurrence(
@@ -1099,8 +1079,6 @@ class AlertEngine(Worker):
                 message=f"{row['ip']}: conflicting MAC addresses "
                         f"{row['mac_a']} and {row['mac_b']}",
                 device_ip=row["ip"]))
-        if max_id > cursor:
-            self._advance_cursor("ipam_conflicts", max_id)
         self._pair_ipam_resolutions(settings)
         return occurrences
 
@@ -1144,21 +1122,19 @@ class AlertEngine(Worker):
         no filtering is needed here."""
         if self.wireless_db is None:
             return []
-        if not self.db.has_cursor("ap_events"):
-            self.db.set_cursor("ap_events", self.wireless_db.max_ap_event_id())
-            return []
-        cursor = self.db.cursor("ap_events")
-        rows = list(self._read_forward("ap_events",
-                                       self.wireless_db.ap_events_since, cursor,
-                                       self.wireless_db.max_ap_event_id))
         occurrences = []
-        max_id = cursor
         # One controllers query per drain, not one per event row: a burst
         # (a mass decommission) can hand back up to 2000 rows that mostly
-        # share the same handful of controllers.
-        controllers = {c["id"]: c for c in self.wireless_db.controllers()} if rows else {}
-        for row in rows:
-            max_id = max(max_id, row["id"])
+        # share the same handful of controllers. Read on the first row rather
+        # than up front, so an empty drain still costs no query and the rows
+        # stay streamed - materialising them would advance the cursor before
+        # the loop below had seen any of them.
+        controllers = None
+        for row in self._drain_from("ap_events",
+                                    self.wireless_db.ap_events_since,
+                                    self.wireless_db.max_ap_event_id):
+            if controllers is None:
+                controllers = {c["id"]: c for c in self.wireless_db.controllers()}
             controller = controllers.get(row["controller_id"])
             label = row["name"] or row["wtp_id"]
             occurrences.append(Occurrence(
@@ -1180,8 +1156,6 @@ class AlertEngine(Worker):
                     if resolved:
                         self.counters["resolved"] += 1
                         self._notify_clear(resolved, cleared_rule, settings)
-        if max_id > cursor:
-            self._advance_cursor("ap_events", max_id)
         return occurrences
 
     def _evaluate_thresholds(self, settings) -> list[Occurrence]:
