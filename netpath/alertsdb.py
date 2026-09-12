@@ -15,8 +15,8 @@ import time
 from urllib.parse import urlparse
 
 from . import alertrules
-from .sqlitebase import (LIKE_ESCAPE, SqliteStore, id_chunks,
-                         like_contains, reclaim)
+from .sqlitebase import (LIKE_ESCAPE, SqliteStore, hist_add, hist_buckets,
+                         id_chunks, like_contains, reclaim)
 
 log = logging.getLogger(__name__)
 
@@ -2063,11 +2063,7 @@ class AlertsDatabase(SqliteStore):
         return {str(row["severity"]): row["n"] for row in rows}
 
     def histogram(self, t0: float, t1: float, bucket_s: float = 3600) -> list[dict]:
-        bucket_s = max(float(bucket_s), 60.0)
-        start = int(t0 // bucket_s) * bucket_s
-        slots = max(1, int((t1 - start) / bucket_s) + 1)
-        buckets = [{"t0": start + i * bucket_s, "t1": start + (i + 1) * bucket_s,
-                   "total": 0, "by_severity": {}} for i in range(slots)]
+        start, bucket_s, slots, buckets = hist_buckets(t0, t1, bucket_s)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT CAST((opened_ts - ?) / ? AS INTEGER) AS slot,"
@@ -2075,13 +2071,7 @@ class AlertsDatabase(SqliteStore):
                 " WHERE opened_ts >= ? AND opened_ts <= ? GROUP BY slot, severity",
                 (start, bucket_s, t0, t1)).fetchall()
         for row in rows:
-            index = row["slot"]
-            if index is None or not (0 <= index < slots):
-                continue
-            buckets[index]["total"] += row["n"]
-            key = str(row["severity"])
-            by = buckets[index]["by_severity"]
-            by[key] = by.get(key, 0) + row["n"]
+            hist_add(buckets, slots, row["slot"], row["severity"], row["n"])
         return buckets
 
     def open_or_increment(self, rule_id: int, dedup_key: str, entity_kind: str,

@@ -316,6 +316,50 @@ def like_prefix(text) -> str:
     return _like_escape(text) + "%"
 
 
+# ----------------------------------------------------------------- histogram
+
+# The three event stores (alerts, traps, syslog) all answer /histogram with
+# the same shape: a contiguous list of fixed-width buckets over [t0, t1] that
+# rows are added into by slot index. Bucket building, accumulation and the
+# hourly-rollup fast path live here so the three cannot drift apart.
+
+def hist_buckets(t0: float, t1: float, bucket_s: float) -> tuple:
+    """(start, bucket_s, slots, buckets) for a histogram over [t0, t1].
+
+    bucket_s is floored at a minute and start snapped down to a bucket
+    boundary, so the first bucket may begin before t0.
+    """
+    bucket_s = max(float(bucket_s), 60.0)
+    start = int(t0 // bucket_s) * bucket_s
+    slots = max(1, int((t1 - start) / bucket_s) + 1)
+    buckets = [{"t0": start + i * bucket_s, "t1": start + (i + 1) * bucket_s,
+                "total": 0, "by_severity": {}} for i in range(slots)]
+    return start, bucket_s, slots, buckets
+
+
+def hist_add(buckets: list, slots: int, index, severity, n: int) -> None:
+    """Add n rows of `severity` to bucket `index`, ignoring out-of-range slots."""
+    if index is None or not (0 <= index < slots):
+        return
+    buckets[index]["total"] += n
+    key = str(severity)
+    by = buckets[index]["by_severity"]
+    by[key] = by.get(key, 0) + n
+
+
+def hist_from_rollup(buckets: list, slots: int, start: float, bucket_s: float,
+                     rows, severity_cap=None) -> list:
+    """Fill buckets from hour/severity/n rollup rows, dropping rows above the
+    optional severity ceiling (a larger severity number is less severe)."""
+    cap = None if severity_cap in (None, "") else int(severity_cap)
+    for row in rows:
+        if cap is not None and row["severity"] > cap:
+            continue
+        hist_add(buckets, slots, int((row["hour"] - start) / bucket_s),
+                 row["severity"], row["n"])
+    return buckets
+
+
 # --------------------------------------------------------------------- trim
 
 TRIM_CHUNK = 2_000         # rows per lock acquisition, adapted below

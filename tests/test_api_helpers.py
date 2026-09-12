@@ -639,6 +639,17 @@ finally:
     service.shutdown()
     shutil.rmtree(TMPDIR, ignore_errors=True)
 
+# The bucket list the three overviews above read is built in one place,
+# sqlitebase.hist_buckets, not re-derived per store: three copies of
+# `buckets = [{...}]` is how the alerts list drifted from the log stores'
+# once already.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _module in ("alertsdb.py", "snmptrapdb.py", "syslogdb.py"):
+    with open(os.path.join(_REPO, "netpath", _module), encoding="utf-8") as _h:
+        _src = _h.read()
+    check(f"{_module} builds its histogram buckets through hist_buckets",
+          "buckets = [{" not in _src and "hist_buckets(" in _src)
+
 print()
 print("FAILURES:", FAILS if FAILS else "none")
 sys.exit(1 if FAILS else 0)

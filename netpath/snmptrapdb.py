@@ -12,7 +12,8 @@ import logging
 import sqlite3
 import time
 
-from .sqlitebase import LIKE_ESCAPE, SqliteStore, like_contains
+from .sqlitebase import (LIKE_ESCAPE, SqliteStore, hist_add, hist_buckets,
+                         hist_from_rollup, like_contains)
 
 log = logging.getLogger(__name__)
 
@@ -491,11 +492,7 @@ class SnmpTrapDatabase(SqliteStore):
                   filters: dict | None = None) -> list[dict]:
         """Counts per bucket, from the rollup when nothing else is filtered."""
         filters = filters or {}
-        bucket_s = max(float(bucket_s), 60.0)
-        start = int(t0 // bucket_s) * bucket_s
-        slots = max(1, int((t1 - start) / bucket_s) + 1)
-        buckets = [{"t0": start + i * bucket_s, "t1": start + (i + 1) * bucket_s,
-                    "total": 0, "by_severity": {}} for i in range(slots)]
+        start, bucket_s, slots, buckets = hist_buckets(t0, t1, bucket_s)
 
         plain = not any(filters.get(key) for key in
                         ("text", "version", "kind", "source", "oid", "community"))
@@ -504,17 +501,8 @@ class SnmpTrapDatabase(SqliteStore):
                 rows = self._conn.execute(
                     "SELECT hour, severity, n FROM trap_counts"
                     " WHERE hour >= ? AND hour <= ?", (start, t1)).fetchall()
-                for row in rows:
-                    if (filters.get("severity") not in (None, "")
-                            and row["severity"] > int(filters["severity"])):
-                        continue
-                    index = int((row["hour"] - start) / bucket_s)
-                    if 0 <= index < slots:
-                        buckets[index]["total"] += row["n"]
-                        key = str(row["severity"])
-                        by = buckets[index]["by_severity"]
-                        by[key] = by.get(key, 0) + row["n"]
-                return buckets
+                return hist_from_rollup(buckets, slots, start, bucket_s, rows,
+                                        filters.get("severity"))
 
             where, params = self._where(t0, t1, filters)
             text = (filters.get("text") or "").strip()
@@ -531,13 +519,7 @@ class SnmpTrapDatabase(SqliteStore):
                 args = (start, bucket_s, *params)
 
             for row in self._conn.execute(sql, args).fetchall():
-                index = row["slot"]
-                if index is None or not (0 <= index < slots):
-                    continue
-                buckets[index]["total"] += row["n"]
-                key = str(row["severity"])
-                by = buckets[index]["by_severity"]
-                by[key] = by.get(key, 0) + row["n"]
+                hist_add(buckets, slots, row["slot"], row["severity"], row["n"])
         return buckets
 
     def traps_since(self, last_id: int, limit: int | None = 500) -> list[sqlite3.Row]:
