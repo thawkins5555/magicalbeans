@@ -1492,6 +1492,115 @@ check("view.failed = false;" in _NF_REFRESH and "view.failed = false;" in _NF_LO
       "on the next window change, which is a new question either way")
 
 
+
+# --- 58. FM-P1: a mechanical escaping check --------------------------------
+#      Every `${...}` inside an HTML-bearing template literal is either a call
+#      (escape(), a *Html() builder, a formatter), a literal, a ternary, a
+#      nested template, or a bare name. A bare DOTTED name is a row field
+#      reaching the DOM unescaped, which is the shape both injection findings
+#      had; the ones below are ids, counts and numeric settings, and any
+#      addition to that set has to be argued here rather than slip in.
+ALLOWED_BARE_FIELDS = {
+    "alerts.js": {"d.id", "g.id", "o.device_id", "r.severity", "row.count", "row.severity",
+                  "t.id", "w.id"},
+    "app.js": {"c.key", "entry.html", "entry.title"},
+    "configrx.js": {"device.ssh_port", "g.id", "ids.length", "r.rule_set_id",
+                    "s.backup_interval_hours", "s.capture_timeout_s", "s.configrx_workers",
+                    "s.retention_count_per_device", "s.retention_days"},
+    "dashboard.js": {"pool.busy", "pool.queued"},
+    "events.js": {"r.severity"},
+    "ipam.js": {"result.scope_count", "s.id"},
+    "mapper.js": {"c.matched_device_id", "m.id", "m.node_count", "node.id", "r.id",
+                  "s.candidates.length", "s.device_id", "s.grid_size", "s.link_width_max",
+                  "s.link_width_min", "s.max_strand_vlans", "s.refresh_interval_s",
+                  "s.stale_link_hours", "s.vlan_collapse_threshold", "v.vlan", "vlans.length"},
+    "netflow.js": {"row.bytes_text", "row.rate_text"},
+    "netpath.js": {"s.default_interval_s", "s.default_max_hops", "s.default_probes",
+                   "s.default_timeout_s", "s.default_warn_loss", "s.default_warn_rtt_ms",
+                   "s.topology_stale_hours", "s.trace_retention_days", "s.trace_workers",
+                   "t.max_hops", "t.probes", "t.timeout_s", "t.warn_loss", "t.warn_rtt_ms"},
+    "nodes.js": {"c.id", "d.a_id", "d.b_id", "d.learned_from.device_id", "duplicate.device_id",
+                 "ev.walk.objects", "f.id", "g.id", "ids.length", "names.length", "owned.length",
+                 "p.row", "r.caveats.length", "r.matched_device_id", "r.override_count",
+                 "row.override_count"},
+    "wireless.js": {"c.id", "s.poll_interval_s"},
+}
+# mapper_upstream.js carries the upstream-suggestions dialog cut out of mapper.js.
+ALLOWED_BARE_FIELDS["mapper_upstream.js"] = ALLOWED_BARE_FIELDS["mapper.js"]
+
+
+def _template_literals(body):
+    i, n, out = 0, len(body), []
+    while i < n:
+        if body[i] == "`":
+            j, depth = i + 1, 0
+            while j < n:
+                c = body[j]
+                if c == "\\":
+                    j += 2
+                    continue
+                if c == "$" and body.startswith("${", j):
+                    depth += 1
+                    j += 2
+                    continue
+                if depth and c == "}":
+                    depth -= 1
+                elif not depth and c == "`":
+                    break
+                j += 1
+            out.append((body.count("\n", 0, i) + 1, body[i + 1:j]))
+            i = j + 1
+        else:
+            i += 1
+    return out
+
+
+def _interpolations(tpl):
+    i, n, out = 0, len(tpl), []
+    while i < n:
+        if tpl.startswith("${", i):
+            depth, j, quote = 1, i + 2, None
+            while j < n and depth:
+                c = tpl[j]
+                if quote:
+                    if c == "\\":
+                        j += 1
+                    elif c == quote:
+                        quote = None
+                elif c in "'\"`":
+                    quote = c
+                elif c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                j += 1
+            out.append(tpl[i + 2:j - 1].strip())
+            i = j
+        else:
+            i += 1
+    return out
+
+
+_DOTTED = re.compile(r"^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)+$")
+unescaped_fields = []
+for _name in MODULES:
+    if _name.startswith("vendor"):
+        continue
+    _body = read(_name)
+    for _line, _tpl in _template_literals(_body):
+        if "<" not in _tpl:
+            continue
+        for _expr in _interpolations(_tpl):
+            if _DOTTED.match(_expr) and _expr not in ALLOWED_BARE_FIELDS.get(_name, set()):
+                unescaped_fields.append("%s:%d ${%s}" % (_name, _line, _expr))
+check(not unescaped_fields,
+      "no HTML template interpolates a row field bare — wrap it in escape() or add "
+      "it to ALLOWED_BARE_FIELDS with a reason (found: %s)"
+      % (", ".join(unescaped_fields[:8]) or "none"))
+check(sum(len(v) for v in ALLOWED_BARE_FIELDS.values()) >= 70,
+      "the escaping allow-list still lists the fields it was written against "
+      "(an emptied list would pass vacuously)")
+
 print()
 # ---------------------------------------------------------------------------
 # 45a. NetFlow: "graphs are not showing all data from the timeline window".
