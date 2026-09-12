@@ -1340,6 +1340,12 @@ class Handler(BaseHTTPRequestHandler):
                            extra_headers=headers)
             except LengthRequired as exc:
                 self._json({"error": str(exc)}, 411)
+            except api.Busy as exc:
+                # Not a fault and not a bad request: the work this endpoint
+                # does is capped, and the cap was full. Retry-After gives the
+                # browser a number instead of a guess.
+                self._json({"error": str(exc)}, 503,
+                           extra_headers={"Retry-After": str(exc.retry_after)})
             except auth.LockedOut as exc:
                 # Before the ValueError arm below: LockedOut is an AuthError,
                 # not a ValueError, but keeping it here says plainly that

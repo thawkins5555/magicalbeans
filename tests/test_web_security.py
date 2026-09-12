@@ -2323,6 +2323,40 @@ end
     check("D30 …and a 30-second throttle still sleeps at most five",
           status == 200 and 4.0 <= elapsed < 12.0, f"{elapsed:.1f}s status={status}")
 
+    # ------------- D30b a full slot queue is a 503, not an indefinite park
+    #
+    # `with _LOGIN_SLOTS:` waited forever, so a burst of sign-ins parked one
+    # request thread and one socket each until a scrypt ahead of them
+    # finished. The wait is bounded now and the refusal says when to come
+    # back.
+    held = [api_mod._LOGIN_SLOTS.acquire(timeout=5) for _ in range(4)]
+    real_wait = api_mod._LOGIN_SLOT_WAIT_S
+    api_mod._LOGIN_SLOT_WAIT_S = 0.1
+    try:
+        started = time.time()
+        status, head, payload = req("POST", "/api/login",
+                                    {"username": "walkreader",
+                                     "password": "Corr3ct-Horse-Battery"})
+        elapsed = time.time() - started
+    finally:
+        api_mod._LOGIN_SLOT_WAIT_S = real_wait
+        for got in held:
+            if got:
+                api_mod._LOGIN_SLOTS.release()
+    check("D30b every verification slot busy answers 503 rather than blocking",
+          all(held) and status == 503, f"{status} {payload} held={held}")
+    check("D30b …with a Retry-After the browser can act on",
+          head.get("retry-after") == "2", head.get("retry-after"))
+    check("D30b …and it gave up after the bounded wait, not the scrypt's",
+          elapsed < 4.0, f"{elapsed:.2f}s")
+    check("D30b …and the slots are all free again afterwards",
+          api_mod._LOGIN_SLOTS.acquire(blocking=False)
+          and not api_mod._LOGIN_SLOTS.release(),
+          str(api_mod._LOGIN_SLOTS._value))
+    _cookie, status, _p = login("walkreader", "Corr3ct-Horse-Battery")
+    check("D30b …so the next sign-in succeeds normally", status == 200,
+          str(status))
+
 
     # ---------- D31 what a reader is NOT shown is said, not faked
     # A trap's community came back as "", indistinguishable from a trap that

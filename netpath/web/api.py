@@ -9364,6 +9364,13 @@ def _client(params) -> str:
     return params.get("_client", "")
 
 
+class Busy(Exception):
+    """"Come back in a moment" — server.py answers 503 with a `Retry-After`.
+    Not a ValueError: nothing about the request was wrong."""
+
+    retry_after = 2
+
+
 # At most this many password verifications at once. Each is a scrypt at
 # N=2^17 — about 128 MiB and half a second — on an endpoint that needs no
 # session, so unbounded concurrency is a memory exhaustion (30 parallel
@@ -9371,6 +9378,11 @@ def _client(params) -> str:
 # throttle delay is slept before the slot is taken, so a throttled caller
 # never holds one of the four while it waits.
 _LOGIN_SLOTS = threading.Semaphore(4)
+
+# And a caller that cannot have a slot within this waits no longer: parking
+# request threads indefinitely behind four scrypts is its own exhaustion, one
+# thread and one socket at a time. A 503 with a Retry-After says so honestly.
+_LOGIN_SLOT_WAIT_S = 5.0
 
 _dummy_hash_value: str | None = None
 _dummy_hash_lock = threading.Lock()
@@ -9437,7 +9449,13 @@ def post_login(service, params, body) -> dict:
     if delay:
         time.sleep(min(delay, 5))
 
-    with _LOGIN_SLOTS:
+    if not _LOGIN_SLOTS.acquire(timeout=_LOGIN_SLOT_WAIT_S):
+        service.log.add(ERROR_CATEGORY,
+                        f"Refused sign-in for {label} from {client}: every "
+                        f"password-verification slot busy for "
+                        f"{_LOGIN_SLOT_WAIT_S:.0f}s")
+        raise Busy("The server is busy verifying sign-ins. Try again in a moment.")
+    try:
         row = service.app_db.user(username) if username else None
         stored = row["password"] if row else None
 
@@ -9506,6 +9524,8 @@ def post_login(service, params, body) -> dict:
                    "signin.failed", target=row["username"],
                    detail="wrong password")
             raise PermissionError("Wrong username or password")
+    finally:
+        _LOGIN_SLOTS.release()
 
     service.throttle.clear(username)
     service.app_db.touch_login(row["username"])
