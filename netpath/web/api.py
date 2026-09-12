@@ -2155,7 +2155,9 @@ _GLOBAL_SETTINGS_RANGES = {
 # browser has always sent min=1 for it; this is the same floor for a client
 # that skips the browser.
 _SCOPE_SETTINGS_RANGES = {
-    "nodes": {"rollup_retention_days": (1, 3650)},
+    "nodes": {"rollup_retention_days": (1, 3650),
+              "interface_sample_retention_days": (1, 3650),
+              "interface_rollup_retention_days": (1, 3650)},
 }
 
 
