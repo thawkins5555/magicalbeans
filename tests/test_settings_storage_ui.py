@@ -27,6 +27,7 @@ import tempfile
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 
 from netpath.web.service import STORES
+from netpath.nodesdb import DEFAULTS as NODES_DEFAULTS
 
 STATIC = os.path.join(_paths.REPO_ROOT, "netpath", "web", "static")
 
@@ -46,6 +47,7 @@ def read(name):
 
 INDEX = read("index.html")
 SETTINGS = read("settings.js")
+NODES_JS = read("nodes.js")
 CSS = read("app.css")
 
 RETENTION = INDEX[INDEX.index('<div id="settings-sub-retention"'):
@@ -223,6 +225,43 @@ else:
     check("a cap of 0 renders no meter and no percentage, not Infinity",
           zero["use-trace"]["innerHTML"] == "" and "NaN" not in json.dumps(zero),
           zero["use-trace"]["innerHTML"])
+
+# --------------------------- 4. the Nodes STORAGE fieldset's retention tiers
+#
+# Four numbers, two tiers, and the failure mode is a field that renders but
+# is never read back: the operator edits it, Save reports success, and the
+# setting keeps its old value for ever.
+
+RETENTION_FIELDS = [
+    ("sample_retention_days", "np-sampledays"),
+    ("rollup_retention_days", "np-rollupdays"),
+    ("interface_sample_retention_days", "np-if-sampledays"),
+    ("interface_rollup_retention_days", "np-if-rollupdays"),
+]
+STORAGE = NODES_JS[NODES_JS.index("<legend>STORAGE</legend>"):
+                   NODES_JS.index("App.wireColumnPickers(settingsBox);")]
+
+for key, field_id in RETENTION_FIELDS:
+    check(f"nodes STORAGE renders {field_id} as a number field",
+          f"number('{field_id}'" in STORAGE and f"s.{key}" in STORAGE)
+    check(f"...and posts it back from #{field_id}",
+          f"{key}: num('#{field_id}')" in STORAGE)
+    check(f"...and {key} is a real nodes setting, so save_settings keeps it",
+          key in NODES_DEFAULTS, sorted(NODES_DEFAULTS)[:1])
+
+check("the per-port tier sits after the device-level pair rather than "
+      "between them, so the four read as two tiers",
+      (STORAGE.index("np-rollupdays") < STORAGE.index("np-if-sampledays")
+       < STORAGE.index("np-if-rollupdays")))
+
+check("...and the hints name both tiers rather than asserting three days "
+      "as a fact -- the figure they used to state is now one of four",
+      "three days" not in STORAGE
+      and "per-interface" in STORAGE and "device-level" in STORAGE)
+
+check("nothing was removed from the fieldset on the way",
+      all(name in STORAGE for name in
+          ("np-eventdays", "np-maxmib", "sample_row_cap_per_metric")))
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")

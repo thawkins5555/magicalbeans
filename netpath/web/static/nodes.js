@@ -6319,26 +6319,35 @@
       <fieldset><legend>STORAGE</legend>
         ${number('np-sampledays', 'Keep raw samples for', s.sample_retention_days, 'min=1')} days
         ${number('np-rollupdays', 'Keep hourly rollups for', s.rollup_retention_days, 'min=1')} days
+        ${number('np-if-sampledays', 'Keep per-port raw samples for', s.interface_sample_retention_days, 'min=1')} days
+        ${number('np-if-rollupdays', 'Keep per-port hourly rollups for', s.interface_rollup_retention_days, 'min=1')} days
         <p class="hint">Raw samples are rolled up into hourly minimum, average
-          and maximum after three days and the raw rows are then dropped, so
-          this is what decides how far back a wide chart can go. The setting
-          was honoured from the first release that had it; it simply had no
-          input.</p>
+          and maximum before the raw rows are dropped, so the rollup figure is
+          what decides how far back a wide chart can go. The first two fields
+          are the device-level tier — CPU, memory, reachability, the worst-port
+          summaries. The two below them are the per-interface tier, every
+          metric whose key ends in a port index: they are the great majority
+          of the rows in the metric history file, so they keep a shorter
+          history. Shortening either tier is a one-way door — history already
+          dropped does not come back if you raise the number again.</p>
         ${number('np-eventdays', 'Keep events for', s.event_retention_days, 'min=1')} days
         ${number('np-maxmib', 'Max MIB file size', Math.round((s.max_mib_bytes || 0) / 1024 / 1024), 'min=1')} MB
-        <p class="hint">A chart narrower than three days is drawn from raw
-          samples; anything wider reads hourly rollups (min, average and max
-          per hour), which are summarised once an hour and kept for
-          ${s.rollup_retention_days || 400} days. So raw retention decides how
-          far back you can see every individual poll — not how far back the
-          chart goes. Raw samples are also capped at
+        <p class="hint">A chart is drawn from raw samples while its window
+          fits inside that metric's own raw retention — ${s.sample_retention_days || 3}
+          days for a device-level metric, ${s.interface_sample_retention_days || 1}
+          for a per-port one; anything wider reads hourly rollups (min, average
+          and max per hour), which are summarised once an hour and kept for
+          ${s.rollup_retention_days || 400} days device-level and
+          ${s.interface_rollup_retention_days || 90} per port. So raw retention
+          decides how far back you can see every individual poll — not how far
+          back the chart goes. Raw samples are also capped at
           ${(s.sample_row_cap_per_metric || 5000).toLocaleString()} per metric,
           which at the default interval is roughly a week.</p>
-        <p class="hint">Both settings are ceilings, not guarantees: the metric
-          history file also has a size cap on Settings → Data &amp; Retention,
-          and when it is over that cap the oldest raw samples go first and then
-          the oldest hourly rollups. Settings shows how far back the file still
-          reaches.</p>
+        <p class="hint">All four settings are ceilings, not guarantees: the
+          metric history file also has a size cap on Settings → Data &amp;
+          Retention, and when it is over that cap the oldest raw samples go
+          first and then the oldest hourly rollups, whichever tier they belong
+          to. Settings shows how far back the file still reaches.</p>
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
@@ -6381,6 +6390,8 @@
             box.querySelector('#cols-ifaces'), IFACE_COLUMNS),
           sample_retention_days: num('#np-sampledays'),
           rollup_retention_days: num('#np-rollupdays'),
+          interface_sample_retention_days: num('#np-if-sampledays'),
+          interface_rollup_retention_days: num('#np-if-rollupdays'),
           event_retention_days: num('#np-eventdays'),
           max_mib_bytes: num('#np-maxmib') * 1024 * 1024,
         } });

@@ -21,7 +21,7 @@ import time
 
 from .namelookup import is_ip_literal
 from .nodesmibdb import NodesMibDatabase
-from .nodesseriesdb import RAW_WINDOW_S, NodesSeriesDatabase
+from .nodesseriesdb import NodesSeriesDatabase
 from .sqlitebase import (LIKE_ESCAPE, SqliteStore, id_chunks as _id_chunks,
                          like_contains, reclaim)
 
@@ -623,6 +623,12 @@ DEFAULTS = {
     # window up to three days wide; anything wider reads samples_hourly.
     "sample_retention_days": 3,
     "rollup_retention_days": 400,    # hourly rollups; what a year-wide chart reads
+    # Per-port metrics -- every key of the shape `<root>.<ifIndex>` -- are
+    # 94% of the rows in the series file at any real fleet size, so they
+    # carry a shorter history than the device-level handful. Raising these
+    # two back to the pair above undoes the tiering entirely.
+    "interface_sample_retention_days": 1,
+    "interface_rollup_retention_days": 90,
     # Per metric, not across the whole table: the old whole-table 50,000
     # left a 2,000-device fleet with a third of a sample per metric. At the
     # shipped 120 s interval this is about seven days of raw points for one
@@ -4735,6 +4741,8 @@ class NodesDatabase(SqliteStore):
     # -------------------------------------------------------------- storage
 
     def prune(self, *, sample_days: float = 3, rollup_days: float = 400,
+             interface_sample_days: float = 1,
+             interface_rollup_days: float = 90,
              event_days: float = 180, poll_days: float = 0,
              discovery_days: float = 30,
              max_samples_per_metric: int = 0) -> int:
@@ -4762,6 +4770,8 @@ class NodesDatabase(SqliteStore):
             reclaim(self._conn, self._lock, label="nodes")
         removed += self.series_db.prune(
             sample_days=sample_days, rollup_days=rollup_days,
+            interface_sample_days=interface_sample_days,
+            interface_rollup_days=interface_rollup_days,
             max_samples_per_metric=max_samples_per_metric)
         removed += self.series_db.prune_orphan_metrics(self.all_device_ids())
         return removed
@@ -4838,8 +4848,12 @@ class NodesDatabase(SqliteStore):
     def series(self, device_id: int, metric_id: int, t0: float, t1: float,
                bucket_s: float = 0) -> list[dict]:
         rows = self.series_db.series(device_id, metric_id, t0, t1, bucket_s)
-        if (self._split_state != "rollups" or (t1 - t0) <= RAW_WINDOW_S
-                or not self.series_db.owns_metric(device_id, metric_id)):
+        if self._split_state != "rollups":
+            return rows
+        # The boundary series() itself just used, asked for rather than
+        # restated; 0 is a metric this device does not own.
+        raw_window = self.series_db.raw_window_s(device_id, metric_id)
+        if not raw_window or (t1 - t0) <= raw_window:
             return rows
         # Phase 2 is still lifting old rollups across; merge them in so a
         # year-wide chart isn't missing what hasn't arrived yet.

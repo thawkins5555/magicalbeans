@@ -498,6 +498,33 @@ def main() -> int:
                                    cookie=admin_cookie)
         check("HTTP nodes rollup_retention_days at its floor (1) -> 200",
               status == 200, f"{status} {payload}")
+
+        # The per-port retention tier. DEFAULTS is both the whitelist
+        # save_settings filters against and the table coerce_settings infers
+        # a type from, so an int default is what makes a browser's "7" an
+        # int and a poisoned row fall back rather than reach prune().
+        for key, default in (("interface_sample_retention_days", 1),
+                             ("interface_rollup_retention_days", 90)):
+            check(f"{key} is in nodes DEFAULTS with an int default",
+                  isinstance(nodesdb_module.DEFAULTS.get(key), int)
+                  and nodesdb_module.DEFAULTS[key] == default,
+                  repr(nodesdb_module.DEFAULTS.get(key)))
+            status, _h, payload = req(port, "POST", "/api/settings",
+                                       {"scope": "nodes", "values": {key: "7"}},
+                                       cookie=admin_cookie)
+            stored = service.nodes_db.settings().get(key)
+            check(f"HTTP {key} takes a browser string and stores an int 7",
+                  status == 200 and stored == 7 and isinstance(stored, int),
+                  f"{status} {payload} {stored!r}")
+            with service.nodes_db._lock:
+                service.nodes_db._conn.execute(
+                    "INSERT INTO settings(key,value) VALUES (?,'null')"
+                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key,))
+                service.nodes_db._conn.commit()
+            check(f"loader nodes_db poisoned {key} falls back to default",
+                  service.nodes_db.settings()[key] == default,
+                  repr(service.nodes_db.settings()[key]))
     finally:
         try:
             server.stop()

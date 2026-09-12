@@ -1555,6 +1555,10 @@ class Service:
         self.nodes_db.prune(
             sample_days=float(self.nodes_settings.get("sample_retention_days", 3)),
             rollup_days=float(self.nodes_settings.get("rollup_retention_days", 400)),
+            interface_sample_days=float(self.nodes_settings.get(
+                "interface_sample_retention_days", 1)),
+            interface_rollup_days=float(self.nodes_settings.get(
+                "interface_rollup_retention_days", 90)),
             event_days=float(self.nodes_settings.get("event_retention_days", 180)),
             discovery_days=float(self.nodes_settings.get("discovery_retention_days", 30)),
             max_samples_per_metric=int(

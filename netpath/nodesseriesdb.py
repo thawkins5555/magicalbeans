@@ -22,8 +22,23 @@ from .sqlitebase import SqliteStore, id_chunks, reclaim
 log = logging.getLogger(__name__)
 
 # How wide a chart window still reads raw samples before falling back to
-# samples_hourly; sample_retention_days defaults to the same three days.
+# samples_hourly, one boundary per metric class; the two retention settings
+# default to the same spans. The boundary has to follow retention, or a
+# two-day window on a port metric reads `samples` and finds one day in it.
 RAW_WINDOW_S = 3 * 86400
+INTERFACE_RAW_WINDOW_S = 1 * 86400
+
+# metrics.scope. The dot, not the `if_` prefix: nodepoll writes per-port
+# metrics as `<root>.<ifIndex>` but six device-level worst-port ones as a
+# bare `if_*`, and the dot also catches the per-port `sfp_*` families.
+SCOPE_DEVICE = 0
+SCOPE_INTERFACE = 1
+
+
+def raw_window_for_scope(scope: int) -> float:
+    """The raw-vs-hourly boundary for one metric class."""
+    return (INTERFACE_RAW_WINDOW_S if scope == SCOPE_INTERFACE
+            else RAW_WINDOW_S)
 
 # One batch of prune(), in rows, and the band _delete_batches may move it
 # inside. Sized like the walk tables' rather than like netpath.db's: a batch
@@ -48,6 +63,7 @@ CREATE TABLE IF NOT EXISTS metrics (
     label           TEXT NOT NULL,
     unit            TEXT NOT NULL,
     kind            TEXT NOT NULL,                  -- 'gauge'|'counter_rate'
+    scope           INTEGER NOT NULL DEFAULT 0,     -- 0 device-level, 1 per-port
     last_value      REAL,
     last_ts         REAL,
     UNIQUE(device_id, key)
@@ -109,11 +125,19 @@ class NodesSeriesDatabase(SqliteStore):
         self._warned_no_window = False
         super().__init__(path)
 
+    def _migrate(self) -> None:
+        # Stored rather than re-derived per candidate row: prune filters
+        # on it, and a class cannot change under its history.
+        if self.ensure_columns("metrics",
+                               {"scope": "INTEGER NOT NULL DEFAULT 0"}):
+            self._conn.execute(
+                "UPDATE metrics SET scope = 1 WHERE key LIKE '%.%'")
+
     # ---------------------------------------------------------------- writes
 
     def record_metric_samples(self, device_id: int, rows: list) -> dict:
         """Every metric one poll produced, in one transaction rather than a
-        per-sample commit (~2,000 fsyncs on a 500-port chassis). `kind` is
+        per-sample commit (~2,000 fsyncs on a 500-port chassis). `kind` and `scope` are
         written only at creation — a poll must never silently change a
         metric's unit under months of chart history. A value of None
         updates last_ts and stores no sample: "polled, no answer" isn't a
@@ -131,13 +155,14 @@ class NodesSeriesDatabase(SqliteStore):
                 ids = {r["key"]: r["id"] for r in self._conn.execute(
                     "SELECT id, key FROM metrics WHERE device_id = ?",
                     (device_id,)).fetchall()}
-                missing = [(device_id, key, label, unit, kind)
+                missing = [(device_id, key, label, unit, kind,
+                            SCOPE_INTERFACE if "." in key else SCOPE_DEVICE)
                            for key, (label, unit, kind, _ts, _value) in latest.items()
                            if key not in ids]
                 if missing:
                     self._conn.executemany(
                         "INSERT OR IGNORE INTO metrics(device_id, key, label, unit,"
-                        " kind) VALUES (?,?,?,?,?)", missing)
+                        " kind, scope) VALUES (?,?,?,?,?,?)", missing)
                     marks = ",".join("?" * len(missing))
                     for r in self._conn.execute(
                             f"SELECT id, key FROM metrics WHERE device_id = ?"
@@ -314,13 +339,18 @@ class NodesSeriesDatabase(SqliteStore):
         same `{ts, avg, min, max}` shape the hourly rollup uses, so
         `drawSeriesChart` renders either unchanged; ignored once a window
         is wide enough to read the rollup instead.
+
+        "Wide enough" is the metric's own class, read from the same row as
+        the ownership check: a per-port metric keeps less raw history, so
+        its boundary is lower than a device-level one's.
         """
         with self._lock:
-            if not self._conn.execute(
-                    "SELECT 1 FROM metrics WHERE id = ? AND device_id = ?",
-                    (metric_id, device_id)).fetchone():
+            owner = self._conn.execute(
+                "SELECT scope FROM metrics WHERE id = ? AND device_id = ?",
+                (metric_id, device_id)).fetchone()
+            if not owner:
                 return []
-            if (t1 - t0) <= RAW_WINDOW_S:
+            if (t1 - t0) <= raw_window_for_scope(owner["scope"]):
                 if bucket_s and bucket_s > 0:
                     rows = self._conn.execute(
                         "SELECT (CAST(ts / ? AS INTEGER)) * ? AS bucket_ts,"
@@ -348,6 +378,19 @@ class NodesSeriesDatabase(SqliteStore):
             return self._conn.execute(
                 "SELECT 1 FROM metrics WHERE id = ? AND device_id = ?",
                 (metric_id, device_id)).fetchone() is not None
+
+    def raw_window_s(self, device_id: int, metric_id: int) -> float:
+        """The window width below which series() answers this metric from
+        raw samples, or 0 for a metric this device does not own.
+
+        Exists so nodesdb.series, mirroring the choice while it merges
+        legacy rollups, asks for it rather than keeping its own copy.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT scope FROM metrics WHERE id = ? AND device_id = ?",
+                (metric_id, device_id)).fetchone()
+        return 0.0 if row is None else raw_window_for_scope(row["scope"])
 
     def device_ids_with_metrics(self) -> list[int]:
         with self._lock:
@@ -491,7 +534,8 @@ class NodesSeriesDatabase(SqliteStore):
                 self._conn.commit()
         return removed
 
-    def _prune_by_rowid(self, table: str, where: str, params) -> int:
+    def _prune_by_rowid(self, table: str, where: str, params,
+                        interface_only: bool = False) -> int:
         """A by-age DELETE cut into lock-bounded batches by rowid.
 
         `samples` is the largest table in the product and this store guards
@@ -507,12 +551,22 @@ class NodesSeriesDatabase(SqliteStore):
         timestamp, and a device with a wrong clock puts the two out of step.
         Wide but cheap -- a batch that finds nothing is an index probe.
         """
-        removed, _ = self._delete_by_rowid(table, where, params, float("inf"))
+        removed, _ = self._delete_by_rowid(table, where, params, float("inf"),
+                                          interface_only=interface_only)
         return removed
 
     def _delete_by_rowid(self, table: str, where: str, params, deadline: float,
-                         pause: float = 0.0) -> tuple[int, bool]:
-        """_prune_by_rowid's body with a deadline: (rows removed, finished)."""
+                         pause: float = 0.0,
+                         interface_only: bool = False) -> tuple[int, bool]:
+        """_prune_by_rowid's body with a deadline: (rows removed, finished).
+
+        `interface_only` narrows every statement -- the bounds probe and
+        each batch alike -- to the per-port class, through `where` rather
+        than the rowid band so the batching is unchanged.
+        """
+        if interface_only:
+            where = (f"({where}) AND metric_id IN (SELECT id FROM metrics"
+                     f" WHERE scope = {SCOPE_INTERFACE})")
         with self._lock:
             bounds = self._conn.execute(
                 f"SELECT MIN(rowid) AS lo, MAX(rowid) AS hi FROM {table}"
@@ -535,17 +589,33 @@ class NodesSeriesDatabase(SqliteStore):
         return removed, reached >= cut
 
     def prune(self, *, sample_days: float = 3, rollup_days: float = 400,
+              interface_sample_days: float = 1,
+              interface_rollup_days: float = 90,
               max_samples_per_metric: int = 0) -> int:
-        """Age out raw samples and hourly rollups. Passing 0 (the Settings
-        page's maintenance button) matches every existing row."""
+        """Age out raw samples and hourly rollups, in two passes per table.
+
+        Per-port metrics are 94% of the rows, so they age out on their own
+        pair of cutoffs. The unfiltered device-level pass runs first and is
+        the cheap one -- anything that old goes whatever its class -- which
+        leaves the filtered pass only the rows between the two cutoffs.
+
+        Passing 0 (the Settings page's maintenance button) matches every
+        existing row.
+        """
         removed = 0
         now = time.time()
         removed += self._prune_by_rowid(
             "samples", "ts < ?", (now - sample_days * 86400,))
+        removed += self._prune_by_rowid(
+            "samples", "ts < ?", (now - interface_sample_days * 86400,),
+            interface_only=True)
         # The hourly rollups are the long history now, so they are
         # bounded by their own retention rather than kept forever.
         removed += self._prune_by_rowid(
             "samples_hourly", "hour < ?", (now - rollup_days * 86400,))
+        removed += self._prune_by_rowid(
+            "samples_hourly", "hour < ?",
+            (now - interface_rollup_days * 86400,), interface_only=True)
         removed += self.cap_samples_per_metric(max_samples_per_metric)
         if removed:
             # Freed pages go back in short steps with the lock released
@@ -639,9 +709,9 @@ class NodesSeriesDatabase(SqliteStore):
         with self._lock, self._attached(legacy_path) as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO main.metrics(id, device_id, key, label,"
-                " unit, kind, last_value, last_ts)"
+                " unit, kind, last_value, last_ts, scope)"
                 " SELECT id, device_id, key, label, unit, kind, last_value,"
-                " last_ts FROM old.metrics")
+                " last_ts, key LIKE '%.%' FROM old.metrics")
             conn.commit()
             here = conn.execute("SELECT COUNT(*) FROM main.metrics").fetchone()[0]
             there = conn.execute("SELECT COUNT(*) FROM old.metrics").fetchone()[0]
