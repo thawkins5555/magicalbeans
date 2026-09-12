@@ -472,6 +472,8 @@ CREATE TABLE IF NOT EXISTS device_addresses (
     ip              TEXT NOT NULL,
     source          TEXT NOT NULL DEFAULT '',
     seen_ts         REAL NOT NULL,
+    first_seen_ts   REAL,
+    present         INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (device_id, ip)
 );
 CREATE INDEX IF NOT EXISTS ix_device_addresses_ip ON device_addresses(ip);
@@ -1261,9 +1263,13 @@ class NodesDatabase(SqliteStore):
             "ip_addresses": "TEXT", "folded_into_result_id": "INTEGER",
         })
         # Lets an alias show as the interface/subnet it belongs to.
-        self.ensure_columns("device_addresses", {
+        added = self.ensure_columns("device_addresses", {
             "if_index": "INTEGER", "netmask": "TEXT",
+            "present": "INTEGER NOT NULL DEFAULT 1", "first_seen_ts": "REAL",
         })
+        if "first_seen_ts" in added:
+            self._conn.execute("UPDATE device_addresses SET first_seen_ts = seen_ts"
+                               " WHERE first_seen_ts IS NULL")
         # NOCASE, for _NEIGHBOR_MATCH_SQL's case-insensitive joins: a
         # collated comparison can only use an index of the same collation.
         # Here rather than SCHEMA so the DROPs below sit with them.
@@ -2690,7 +2696,8 @@ class NodesDatabase(SqliteStore):
     # ------------------------------------------------------- device addresses
 
     def record_device_addresses(self, device_id: int, ips, source: str,
-                                details: dict | None = None) -> int:
+                                details: dict | None = None,
+                                complete: bool = False) -> int:
         """Remember the addresses a device answers on besides its primary
         `ip`, so a trap or syslog message from its loopback or its
         management VRF correlates to the device that sent it.
@@ -2706,6 +2713,11 @@ class NodesDatabase(SqliteStore):
         `details` is {ip: {if_index, netmask}}; COALESCEd rather than
         overwritten so a source that only knows the address never erases
         what a fuller walk already learned.
+
+        `complete` says `ips` is the whole set this `source` reports now, so
+        the source's other rows for the device are marked present=0 (kept,
+        and aged out by prune_device_addresses). A trap or a discovery
+        sweep names one or a few addresses and leaves it False.
         """
         now = time.time()
         details = details or {}
@@ -2715,9 +2727,9 @@ class NodesDatabase(SqliteStore):
             if not text:
                 continue
             extra = details.get(text) or {}
-            rows.append((device_id, text, source or "", now,
+            rows.append((device_id, text, source or "", now, now,
                          extra.get("if_index"), extra.get("netmask")))
-        if not rows:
+        if not rows and not complete:
             return 0
         with self._lock:
             # The device's own address is not stored twice; a row that was
@@ -2727,15 +2739,20 @@ class NodesDatabase(SqliteStore):
                 "SELECT ip FROM devices WHERE id = ?", (device_id,)).fetchone()
             primary_ip = primary["ip"] if primary else ""
             rows = [row for row in rows if row[1] != primary_ip]
-            if not rows:
-                return 0
-            self._conn.executemany(
-                "INSERT INTO device_addresses(device_id, ip, source, seen_ts,"
-                " if_index, netmask) VALUES (?,?,?,?,?,?)"
-                " ON CONFLICT(device_id, ip) DO UPDATE SET"
-                " source=excluded.source, seen_ts=excluded.seen_ts,"
-                " if_index=COALESCE(excluded.if_index, device_addresses.if_index),"
-                " netmask=COALESCE(excluded.netmask, device_addresses.netmask)", rows)
+            if complete:
+                self._conn.execute(
+                    "UPDATE device_addresses SET present = 0"
+                    " WHERE device_id = ? AND source = ?", (device_id, source or ""))
+            if rows:
+                self._conn.executemany(
+                    "INSERT INTO device_addresses(device_id, ip, source, seen_ts,"
+                    " first_seen_ts, if_index, netmask) VALUES (?,?,?,?,?,?,?)"
+                    " ON CONFLICT(device_id, ip) DO UPDATE SET"
+                    " source=excluded.source, seen_ts=excluded.seen_ts, present=1,"
+                    " first_seen_ts=COALESCE(device_addresses.first_seen_ts,"
+                    " excluded.first_seen_ts),"
+                    " if_index=COALESCE(excluded.if_index, device_addresses.if_index),"
+                    " netmask=COALESCE(excluded.netmask, device_addresses.netmask)", rows)
             self._conn.commit()
         return len(rows)
 
@@ -2754,7 +2771,7 @@ class NodesDatabase(SqliteStore):
                 return row["id"]
             row = self._conn.execute(
                 "SELECT device_id FROM device_addresses WHERE ip = ?"
-                " ORDER BY seen_ts DESC LIMIT 1", (text,)).fetchone()
+                " ORDER BY present DESC, seen_ts DESC LIMIT 1", (text,)).fetchone()
         return row["device_id"] if row else None
 
     def device_addresses(self, device_id: int) -> list[sqlite3.Row]:
@@ -3172,6 +3189,10 @@ class NodesDatabase(SqliteStore):
             low, cut, float("inf"), delete, chunk=EVENT_PRUNE_CHUNK,
             chunk_min=EVENT_PRUNE_CHUNK_MIN, chunk_max=EVENT_PRUNE_CHUNK_MAX)
         return removed
+
+    def prune_device_addresses(self, older_than_s: float) -> int:
+        """An alias nothing has refreshed for this long, present or stale."""
+        return self._prune_seen_ts("device_addresses", older_than_s)
 
     def prune_mac_entries(self, older_than_s: float) -> int:
         """Drop entries nothing has refreshed for this long, present or
@@ -4732,8 +4753,9 @@ class NodesDatabase(SqliteStore):
         removed += self._prune_by_id("device_events", "ts < ?", (event_cutoff,))
         removed += self._prune_by_id("interface_events", "ts < ?", (event_cutoff,))
         removed += self._prune_by_id(
-            "discovery_jobs", "started_ts < ? AND state != 'running'",
-            (now - discovery_days * 86400,))
+            "discovery_jobs",
+            "started_ts < ? AND (state != 'running' OR started_ts < ?)",
+            (now - discovery_days * 86400, now - 86400))
         if removed:
             # Freed pages go back in short steps with the lock released
             # between them, not through a whole-file VACUUM.
@@ -4755,8 +4777,8 @@ class NodesDatabase(SqliteStore):
         """Delete the oldest device and interface events until the file is
         back under its cap.
 
-        Since 5.0.0 those two are the only unbounded tables left here — the
-        samples went to nodes_series.db, which has its own cap. Incremental
+        Since 5.0.0 those two are the only tables here that grow without an
+        age rule — the samples went to nodes_series.db, which has its own cap. Incremental
         reclaim rather than VACUUM: a whole-file rewrite under the module
         lock stalls every poll worker and HTTP handler.
         """

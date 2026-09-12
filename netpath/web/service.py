@@ -1592,6 +1592,10 @@ class Service:
             float(self.nodes_settings.get("mac_table_retention_days", 7)) * 86400)
         self.nodes_db.prune_port_vlans(
             float(self.nodes_settings.get("mac_table_retention_days", 7)) * 86400)
+        # Aliases on the event clock: a management address seen only now
+        # and then must outlive a week of walks that did not list it.
+        self.nodes_db.prune_device_addresses(
+            float(self.nodes_settings.get("event_retention_days", 180)) * 86400)
         self._trim_db("max_nodes_db_mb", self.nodes_db, "Nodes database",
                       "oldest events")
         # Own cap since 5.0.0: growth lives here, not in the inventory file.
