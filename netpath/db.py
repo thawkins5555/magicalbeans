@@ -23,6 +23,13 @@ log = logging.getLogger(__name__)
 # older_than_days' delete deadline: a long delete sweep would otherwise leave
 # reclaim nothing, and the file would sit large until a later pass had spare.
 PRUNE_RECLAIM_BUDGET_S = 5.0
+# And the https_checks sweep gets its own, for the same reason the reclaim
+# pass does: it runs after the traces sweep, which on a busy netpath.db has
+# already spent every second of the shared deadline. _delete_batches checks
+# that deadline before its first batch, so what "after" meant in practice was
+# zero batches, every pass -- and https_checks is the table that needs the
+# sweep most (100 destinations on a 60 s interval is ~144,000 rows a day).
+PRUNE_HTTPS_BUDGET_S = 2.0
 
 # A settings save runs maintenance synchronously on the HTTP thread, so that
 # path gets a short leash instead of the full TRIM_BUDGET_S; a backlog too big
@@ -703,8 +710,9 @@ class Database(SqliteStore):
         each batch still filters on started_ts, so a device with a wrong clock
         cannot make prune() drop the wrong rows.
 
-        `budget_s` bounds only the delete loop; the reclaim pass that follows
-        gets its own PRUNE_RECLAIM_BUDGET_S.
+        `budget_s` bounds only the traces delete loop; the https_checks sweep
+        and the reclaim pass that follow get their own PRUNE_HTTPS_BUDGET_S
+        and PRUNE_RECLAIM_BUDGET_S.
         """
         cutoff = time.time() - older_than_days * 86400
         with self._lock:
@@ -738,14 +746,20 @@ class Database(SqliteStore):
                 log.warning("netpath.db: prune of traces older than %.1f days "
                             "did not finish within its budget; continuing at "
                             "the next maintenance pass", older_than_days)
-        removed += self._prune_https_checks(cutoff, deadline)
+        # Own deadline: `deadline` above is the traces sweep's, and it may
+        # already be spent -- on a busy install it always is.
+        removed += self._prune_https_checks(
+            cutoff, time.monotonic() + PRUNE_HTTPS_BUDGET_S)
         if removed:
             # Own deadline: `deadline` above may already be spent on deletes.
             self._reclaim_until(time.monotonic() + PRUNE_RECLAIM_BUDGET_S)
         return removed
 
     def _prune_https_checks(self, cutoff: float, deadline: float) -> int:
-        """Web-page checks, swept the same batched way prune() sweeps traces."""
+        """Web-page checks, swept the same batched way prune() sweeps traces.
+
+        `deadline` is this sweep's own, never what is left of the caller's.
+        """
         with self._lock:
             bounds = self._conn.execute(
                 "SELECT MIN(id) AS lo, MAX(id) AS hi FROM https_checks"

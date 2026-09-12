@@ -274,6 +274,48 @@ try:
     check("...and a URL with no credential is handed on unchanged",
           https_url_for(_Row(https_url="https://switch.example/x"))
           == "https://switch.example/x")
+    # ----------------------------------------------------------------------
+    # The https_checks sweep runs after the traces sweep, and used to be
+    # handed what was left of the traces deadline. _delete_batches checks
+    # that deadline before its FIRST batch, so on any netpath.db busy enough
+    # for the traces sweep to use its budget, this table was swept zero rows
+    # a pass and grew past retention for ever -- ~144,000 rows a day at 100
+    # destinations on a 60 s interval.
+    db = Database(os.path.join(TMPDIR, "prune_budget.db"))
+    starved = db.add_target("10.80.0.4", label="starved", interval_s=60)
+    for _ in range(6):
+        db.record_https_check(starved, failing)
+    old_ts = time.time() - 30 * 86400
+    conn = sqlite3.connect(db.path)
+    conn.execute("UPDATE https_checks SET ts=?", (old_ts,))
+    # Old traces too, so the traces sweep has real work to not finish.
+    for n in range(6):
+        conn.execute("INSERT INTO traces(target_id, started_ts, status,"
+                     " reached) VALUES (?,?,?,1)", (starved, old_ts, "ok"))
+    conn.commit()
+    conn.close()
+
+    before = db.https_checks_between(starved, 0, time.time() + 3600)
+    check("the starved-sweep fixture has rows to prune", len(before) == 6,
+          len(before))
+
+    # budget_s=0: the traces deadline is spent before the first batch, which
+    # is exactly the state a busy install's traces sweep leaves behind.
+    db.prune(1.0, budget_s=0.0)
+    after = db.https_checks_between(starved, 0, time.time() + 3600)
+    check("old https_checks are still swept when the traces sweep had no "
+          "budget left to share", after == [], len(after))
+
+    with sqlite3.connect(db.path) as trace_conn:
+        left = trace_conn.execute(
+            "SELECT COUNT(*) FROM traces WHERE started_ts < ?",
+            (time.time() - 86400,)).fetchone()[0]
+    check("...and the traces sweep really was starved, so this is the "
+          "shared-deadline case and not a fixture that pruned everything",
+          left == 6, left)
+    check("...which prune() reports rather than hides",
+          db.last_prune_incomplete is True, db.last_prune_incomplete)
+    db.close()
 
     print()
     print("FAILURES:", FAILS if FAILS else "none")
