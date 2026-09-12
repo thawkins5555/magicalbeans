@@ -3489,6 +3489,7 @@ class NodePoller(Worker):
                 self.log.add(ERROR, f"Environmental sensor read failed for "
                                     f"device #{device_id}",
                              detail=traceback.format_exc())
+            self._refresh_addresses(device, config)
 
     def working_config(self, device) -> dict:
         """The config an *on-demand* read should use — effective_config()
@@ -4099,7 +4100,6 @@ class NodePoller(Worker):
                 if "mem_pct" not in known:
                     add("mem_pct", "Memory", "%",
                         self._host_resources_mem_pct(types, sizes, used))
-        self._refresh_addresses(device, config)
         return metrics
 
     def _poll_rf_metrics(self, device, config: dict, identity: dict) -> list[tuple]:
