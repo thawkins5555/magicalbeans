@@ -1627,10 +1627,7 @@ class NodePoller(Worker):
         # so a device that is simply down does not re-sweep its profile's
         # candidates on every dialog a human opens. See working_config().
         self._credential_probe_failed: dict[int, float] = {}
-        # device_id -> (when last walked, sysDescr then, sysUpTime ticks
-        # then, chassis entPhysicalIndex found then | None): the cost gate
-        # for _poll_software_version's two bounded walks. In memory and
-        # process-lifetime only, like _credentials above.
+        # device_id -> (walked_at, sysDescr, sysUpTime ticks, chassis index | None)
         self._sw_walk_state: dict[int, tuple[float, str, int | None, int | None]] = {}
         # device_id set: devices whose SNMP is currently failing on
         # AUTHENTICATION. auth_fail is recorded on entering the set and
@@ -3791,15 +3788,11 @@ class NodePoller(Worker):
                  if vb["type"] not in ("noSuchObject", "noSuchInstance",
                                        "endOfMibView")}, True)
 
-    # How long a device's vendor-column/ENTITY-MIB walk answer is trusted
-    # before _poll_software_version pays for another one.
     _SW_WALK_MAX_AGE_S = 86400.0
 
     def _sw_walk_due(self, device_id: int, sys_descr: str,
                      uptime_ticks: int | None, now: float) -> bool:
-        """Whether _poll_software_version may pay for a walk this poll: no
-        walk on record, the last one is stale, sysDescr changed (a new
-        image, or a different device on this IP), or the device rebooted."""
+        """No walk on record, stale, sysDescr changed, or rebooted since."""
         state = self._sw_walk_state.get(device_id)
         if state is None:
             return True
@@ -3815,9 +3808,7 @@ class NodePoller(Worker):
         return False
 
     def _walk_sw_columns(self, device, config: dict, arc) -> dict:
-        """{column OID: {index: value}} for every column SW_VERSION_COLUMNS
-        names for this arc, each bounded the way any other table walk in
-        this file is (row cap and wall-clock deadline in _walk_column_detail)."""
+        """{column OID: {index: value}} for the arc's SW_VERSION_COLUMNS entry."""
         (sw_column, fw_column), status_column = nodeoids.SW_VERSION_COLUMNS[arc]
         deadline = self._table_walk_deadline(config, "poll_interval_s")
         columns = {}
@@ -3830,16 +3821,9 @@ class NodePoller(Worker):
 
     def _entity_software_walk(self, device, config: dict,
                               cached_chassis_idx: int | None) -> tuple[dict, int | None]:
-        """({index: entPhysicalSoftwareRev/FirmwareRev value} keyed the way
-        swversion._FIRST expects, chassis entPhysicalIndex found) off
-        ENTITY-MIB, for a device with no vendor OID of its own.
-
-        A cached chassis index (from a previous walk, still fresh enough to
-        trust) turns this into two GETs; otherwise entPhysicalClass is
-        walked once to find the chassis row (class 3), falling back to the
-        first entPhysicalSoftwareRev row that answers when no chassis is
-        named — some agents number entities without ever using class 3.
-        """
+        """(scalars keyed as swversion's _FIRST constants, chassis index found).
+        A cached index costs one GET; otherwise entPhysicalClass is walked for
+        the chassis row (class 3), else the first populated SoftwareRev row."""
         idx = cached_chassis_idx
         if idx is None:
             deadline = self._table_walk_deadline(config, "poll_interval_s")
@@ -3871,16 +3855,9 @@ class NodePoller(Worker):
         return {}, None
 
     def _poll_software_version(self, device, config: dict, identity: dict) -> dict:
-        """`sw_version`/`sw_image`/`sw_image_file`/`fw_version`/`sw_source`/
-        `fw_source` for the identity dict.
-
-        Always one GET. When that answers nothing usable, at most one
-        bounded walk is added — the vendor's own table for a column arc
-        (nodeoids.SW_VERSION_COLUMNS), else ENTITY-MIB's chassis row — and
-        only when _sw_walk_due says this device's last walk (if any) is
-        stale, changed sysDescr, or followed a reboot. Returns no keys at
-        all when this poll learned nothing new, which keeps whatever is
-        already stored (see the caller)."""
+        """Version keys for the identity dict: one GET, then at most one gated
+        walk (vendor column, else ENTITY-MIB chassis row). No keys at all when
+        nothing new was learned, so the stored values stay."""
         arc = identity.get("vendor_arc")
         device_id = device["id"]
         oids = list(swversion.oids_for(arc))
@@ -3979,8 +3956,7 @@ class NodePoller(Worker):
 
         uptime = values.get(nodeoids.SYSTEM_SCALARS["sys_uptime"])
         uptime_ticks = int(uptime) if isinstance(uptime, (int, float)) else None
-        # Ahead of _poll_software_version, whose walk gate needs to tell a
-        # reboot from an ordinary re-poll (see _sw_walk_due).
+        # _sw_walk_due tells a reboot from a re-poll with this.
         identity["sys_uptime_ticks"] = uptime_ticks
 
         identity.update(self._poll_software_version(device, config, identity))
