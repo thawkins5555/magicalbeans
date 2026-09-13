@@ -4029,7 +4029,7 @@ _DEVICE_CSV_HEADER = ["id", "name", "ip", "status", "group_id", "device_group_id
                      "vendor", "sys_descr", "sys_name", "polling", "muted_until",
                      "maintenance_since", "poll_interval_s", "last_poll_ts",
                      "override_count", "addresses",
-                     "sw_version", "fw_version", "sw_image", "sw_image_file"]
+                     "sw_version", "sw_image", "sw_image_file", "fw_version"]
 
 
 def get_nodes_devices_export(service, params, body) -> dict:
@@ -4053,8 +4053,8 @@ def get_nodes_devices_export(service, params, body) -> dict:
                 d.get("poll_interval_s"), d.get("last_poll_ts"),
                 d.get("override_count"),
                 ", ".join(a["ip"] for a in d.get("addresses") or ()),
-                d.get("sw_version"), d.get("fw_version"), d.get("sw_image"),
-                d.get("sw_image_file")]
+                d.get("sw_version"), d.get("sw_image"), d.get("sw_image_file"),
+                d.get("fw_version")]
                for d in devices]
     return _csv_response("devices", header, csv_rows)
 
