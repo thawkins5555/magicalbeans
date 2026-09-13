@@ -495,5 +495,5 @@ name (SNMP, manual, or DNS).
   manual, reverse DNS, ip), a Firmware column, five new CSV columns.
 → Javariius: nine findings over two passes, all fixed, approved.
 → Full suite 151/157, the six known environmental failures only.
-→ Browser walk 887 steps, 0 failures; a firmware-report step added.
+→ Browser walk 890 steps ok, 0 failed; a firmware-report step added.
 → Pushed to main.

@@ -219,10 +219,11 @@ is how the Dell, Ruckus, Raritan and APC corrections were found. Full
 suite 151/157 with only the six known environmental failures
 (ipam_dhcp_temp, palo_alto_polling, selfupdate_job, service_shutdown,
 snmpv3_diagnostics, temppath); the suites this release touches were
-rerun on the final commits. Browser walk on the 250-device fleet: 887
-steps, 0 failures, plus a new `feature:nodes-firmware-report` step that
-runs the report, exports it and checks every Device cell carries its IP
-line and that the Firmware column is present.
+rerun on the final commits. Browser walk on the 250-device fleet: 890
+steps ok, 45 skipped, 0 failed, including a new
+`feature:nodes-firmware-report` step that runs the report, exports it and
+checks every Device cell carries its IP line and that the Firmware column
+is present (250 rows, 250 IP lines, for all three roles).
 
 **New device fields.** `fw_version`, `sw_source` and `fw_source` join
 `sw_version`/`sw_image`/`sw_image_file` on every device row, searchable
