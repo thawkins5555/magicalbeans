@@ -642,6 +642,7 @@ class Service:
         self._snmp_settings_with_mibs()
         if self.ipam_settings.get("enabled", True):
             self.ipam.start()
+        self._repair_profile_credential_overrides()
         if self.nodes_settings.get("enabled", True):
             self.node_poller.start(self.nodes_settings)
         if self.alerts_settings.get("enabled", True):
@@ -1196,6 +1197,23 @@ class Service:
                          f"{job.current or 'startup'}: {job.error}")
         finally:
             job.finished_ts = time.time()
+
+    # Settings marker: 5.16.0's discovery promote() fix (a device now lands
+    # in the sweep's own profile, not the vendor-suggested one) needs a
+    # one-time sweep over devices promoted before the fix, clearing a
+    # community/version override that only ever matched the device's own
+    # profile by coincidence of the old bug. Same style as
+    # NodesDatabase._DETAIL_FIELDS_MIGRATED_5_15.
+    _OVERRIDES_REPAIRED_5_16 = "overrides_repaired_5_16"
+
+    def _repair_profile_credential_overrides(self) -> None:
+        if self.nodes_db._private_setting(self._OVERRIDES_REPAIRED_5_16):
+            return
+        count = self.nodes_db.repair_profile_credential_overrides()
+        self.nodes_db._set_private_setting(self._OVERRIDES_REPAIRED_5_16, True)
+        if count:
+            self.log.add(NODES, f"Cleared a profile-matching community/version "
+                                f"override on {count} device(s) (5.16.0 repair)")
 
     def _seed_default_mibs(self) -> None:
         """Load the MIB files bundled under netpath/mibs/ through the same

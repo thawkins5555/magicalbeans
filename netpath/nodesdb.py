@@ -1662,6 +1662,44 @@ class NodesDatabase(SqliteStore):
             self._conn.commit()
             self._config_generation += 1
 
+    def repair_profile_credential_overrides(self) -> int:
+        """5.16.0 one-time repair (run once by the caller, behind its own
+        settings marker): a device whose stored `community`+`snmp_version`
+        override equals one of its own group's credentials — the group's
+        primary or an alternate — got that pin from discovery promote()
+        landing it in the vendor-suggested group instead of the profile
+        the sweep ran under. Clears just those two columns; a device whose
+        community genuinely differs from its profile is left alone, and a
+        device with no group is skipped (nothing to compare against).
+        Returns the number of devices repaired."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, group_id, community, snmp_version FROM devices "
+                "WHERE community IS NOT NULL AND snmp_version IS NOT NULL "
+                "AND group_id IS NOT NULL").fetchall()
+            groups = {row["id"]: row for row in
+                      self._conn.execute("SELECT * FROM groups").fetchall()}
+            creds_by_group: dict[int, list] = {}
+            for row in self._conn.execute(
+                    "SELECT * FROM group_credentials ORDER BY id").fetchall():
+                creds_by_group.setdefault(row["group_id"], []).append(row)
+            count = 0
+            for row in rows:
+                group_row = groups.get(row["group_id"])
+                if group_row is None:
+                    continue
+                known = [group_row] + creds_by_group.get(row["group_id"], [])
+                if any(g["community"] == row["community"]
+                       and g["snmp_version"] == row["snmp_version"] for g in known):
+                    self._conn.execute(
+                        "UPDATE devices SET community = NULL, snmp_version = NULL"
+                        " WHERE id = ?", (row["id"],))
+                    count += 1
+            if count:
+                self._conn.commit()
+                self._config_generation += 1
+        return count
+
     # ---------------------------------------------------------- device groups
     #
     # Purely organizational folders a device can optionally belong to —

@@ -2124,13 +2124,18 @@ class NodePoller(Worker):
 
     def promote(self, job_id: int, result_ids: list[int],
                 force: bool = False) -> list[int]:
-        """Creates a devices row per discovery result, carrying the
-        discovered community/version as a per-device override only when it
-        matches none of the target group's own credentials — its primary
-        credential or any additional one — so a device that a profile's
-        existing credential list already covers keeps trying that shared
-        list (and benefits from any future credential added to the
-        profile) instead of being pinned to one override. Already-promoted
+        """Creates a devices row per discovery result. The target profile
+        is the job's own group_id when the job carries one and that
+        profile still exists (a job started under a non-default profile
+        lands its devices there, not in the vendor-suggested group); a job
+        with no group_id (from before the rescan feature) falls back to
+        the suggested group. The discovered community/version is carried
+        as a per-device override only when it matches none of the target
+        profile's own credentials — its primary credential or any
+        additional one — so a device that a profile's existing credential
+        list already covers keeps trying that shared list (and benefits
+        from any future credential added to the profile) instead of being
+        pinned to one override. Already-promoted
         result ids are a no-op rather than a duplicate-IP error, so a
         second promote call with an overlapping selection is always safe
         to retry. A ping-only result (no SNMP answer) is skipped outright
@@ -2180,7 +2185,10 @@ class NodePoller(Worker):
                 self._mark_promoted_family(result_id, existing["id"], family)
                 device_ids.append(existing["id"])
                 continue
+            job_group_id = job["group_id"] if job and "group_id" in job.keys() else None
             group_id = result["suggested_group_id"]
+            if job_group_id and self.db.group(job_group_id) is not None:
+                group_id = job_group_id
             group_row = self.db.group(group_id) if group_id else None
             overrides = {}
             if result["snmp_ok"] and result["community_or_user"]:

@@ -5111,6 +5111,27 @@ def _resolve_bulk_named_id(value, lookup_rows):
     return row["id"]
 
 
+def _drop_profile_matching_credential(service, group_id, overrides) -> None:
+    """A CSV row that names a profile and pastes that profile's own
+    community/version is not carrying an override — it is restating the
+    profile's credential. Same rule as discovery promote(): drop both
+    columns when they equal the named profile's primary credential or one
+    of its alternates, so a bulk import under "Site B" does not pin
+    Site B's community on every row."""
+    if "community" not in overrides and "snmp_version" not in overrides:
+        return
+    group_row = service.nodes_db.group(group_id) if group_id else None
+    if group_row is None:
+        return
+    community = overrides.get("community", group_row["community"])
+    snmp_version = overrides.get("snmp_version", group_row["snmp_version"])
+    known = [group_row] + list(service.nodes_db.group_credentials(group_id))
+    if any(g["community"] == community and g["snmp_version"] == snmp_version
+           for g in known):
+        overrides.pop("community", None)
+        overrides.pop("snmp_version", None)
+
+
 def post_nodes_devices_bulk_import(service, params, body) -> dict:
     rows = _parse_bulk_import_rows(body)
     if not rows:
@@ -5178,6 +5199,7 @@ def post_nodes_devices_bulk_import(service, params, body) -> dict:
             # sentence the single-device form gives.
             _clean_web_fields(overrides)
             _clean_priv_proto(overrides)
+            _drop_profile_matching_credential(service, group_id, overrides)
         except ValueError as exc:
             invalid.append({"row": i, "ip": ip, "reason": str(exc)})
             continue

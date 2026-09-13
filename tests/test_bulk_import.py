@@ -131,6 +131,28 @@ try:
     check("the 'group' CSV column resolved a polling profile by NAME, not id",
           core_a is not None and core_a["group_id"] == switches["id"], core_a)
 
+    # A community/version pasted alongside a profile that already carries
+    # that same credential is not an override — same rule discovery
+    # promote() applies (Part A, 5.16.0).
+    service.nodes_db.add_group("SiteMatch", community="public", snmp_version=1)
+    service.nodes_db.add_group("SiteDiff", community="secretcomm", snmp_version=1)
+    csv_text = (
+        "address,group,community,snmp_version\n"
+        "10.81.0.20,SiteMatch,public,1\n"
+        "10.81.0.21,SiteDiff,public,1\n"
+    )
+    status, profile_csv = call("POST", "/api/nodes/devices/bulk-import",
+                               {"csv": csv_text}, token=admin)
+    check("profile-credential CSV import answers 200", status == 200, (status, profile_csv))
+    match_device = service.nodes_db.device_by_ip("10.81.0.20")
+    check("a community equal to the named profile's own is not written as an override",
+          match_device is not None and match_device["community"] is None
+          and match_device["snmp_version"] is None, match_device)
+    diff_device = service.nodes_db.device_by_ip("10.81.0.21")
+    check("a community outside the named profile's own credentials is still pinned",
+          diff_device is not None and diff_device["community"] == "public"
+          and diff_device["snmp_version"] == 1, diff_device)
+
     # A CSV cell naming a profile that does not exist is invalid, not a
     # device created with a random group.
     status, bad_group = call("POST", "/api/nodes/devices/bulk-import",

@@ -20,6 +20,7 @@ from urllib.parse import urlencode
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 
 import netpath.nodediscover as nodediscover
+import netpath.nodesdb as nodesdb
 from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER, hash_password
 from netpath.nodediscover import fold_target, register_addresses
 from netpath.web import Service, WebServer
@@ -334,6 +335,61 @@ try:
     check("a nodes:read-only account cannot merge", status == 403, (status, refused))
     status, readable = call("GET", "/api/nodes/duplicates", token=reader)
     check("...but may read the duplicates listing", status == 200, status)
+
+    # ------------------------------------------- 10. the profile is not an override
+    print("10. promote() targets the sweep's own profile, not the suggestion")
+
+    def run_sweep_under(group_id):
+        job_id = service.node_poller.start_discovery(
+            "device", "127.0.0.1", group_id=group_id,
+            overrides={"default_snmp_timeout_s": 1.0, "discovery_communities": "public",
+                      "discovery_arc_hop": False, "discovery_addresses": False})
+        for _ in range(100):
+            job = nodes.discovery_job(job_id)
+            if job["state"] != "running":
+                break
+            time.sleep(0.1)
+        return job_id, nodes.discovery_results(job_id)[0]
+
+    group_match = nodes.add_group("PartA-Match", community="public", snmp_version=1)
+    group_diff = nodes.add_group("PartA-Diff", community="secretcomm", snmp_version=1)
+
+    job_match, result_match = run_sweep_under(group_match)
+    match_devices = service.node_poller.promote(job_match, [result_match["id"]])
+    match_row = nodes.device(match_devices[0])
+    check("a sweep under a non-default profile lands the device in that profile",
+          match_row["group_id"] == group_match, match_row["group_id"])
+    check("...and a discovered community the profile's own credential already "
+          "covers is not pinned as an override",
+          nodesdb.override_fields(match_row) == (), nodesdb.override_fields(match_row))
+    nodes.remove_device(match_devices[0])
+
+    job_diff, result_diff = run_sweep_under(group_diff)
+    diff_devices = service.node_poller.promote(job_diff, [result_diff["id"]])
+    diff_row = nodes.device(diff_devices[0])
+    check("...still lands in the sweep's profile even when its community differs",
+          diff_row["group_id"] == group_diff, diff_row["group_id"])
+    check("...but a community outside that profile's own credentials is pinned",
+          diff_row["community"] == "public" and "community" in nodesdb.override_fields(diff_row),
+          (diff_row["community"], nodesdb.override_fields(diff_row)))
+    nodes.remove_device(diff_devices[0])
+
+    print("10b. the one-time repair")
+    repair_fixed = nodes.add_device("10.50.50.1", group_id=group_match,
+                                    community="public", snmp_version=1)
+    repair_kept = nodes.add_device("10.50.50.2", group_id=group_diff,
+                                   community="public", snmp_version=1)
+    fixed_count = nodes.repair_profile_credential_overrides()
+    check("the repair clears a community/version pin equal to the device's "
+          "own profile", fixed_count == 1, fixed_count)
+    repaired = nodes.device(repair_fixed)
+    check("...leaving both columns unset on the row it fixed",
+          repaired["community"] is None and repaired["snmp_version"] is None,
+          (repaired["community"], repaired["snmp_version"]))
+    kept = nodes.device(repair_kept)
+    check("...and leaving a genuinely different community alone",
+          kept["community"] == "public" and kept["snmp_version"] == 1,
+          (kept["community"], kept["snmp_version"]))
 
 finally:
     if stub is not None:
