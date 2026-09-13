@@ -139,7 +139,7 @@ def device_id_for(entity_kind: str, entity_id) -> int | None:
     try:
         if entity_kind == "device":
             return int(entity_id)
-        if entity_kind == "interface":
+        if entity_kind in ("interface", "sensor"):
             return int(str(entity_id).split(":")[0])
     except (TypeError, ValueError):
         return None
@@ -449,7 +449,7 @@ PREDICATES: dict[str, callable] = {
 # per-port utilization/error-rate alert is as much an outage artefact as
 # the device-level one it replaced. This set is necessary but not
 # sufficient -- ROLLED_UP_BY below is the actual gate.
-ROLLUP_ENTITY_KINDS = frozenset({"device", "interface", "netpath_target"})
+ROLLUP_ENTITY_KINDS = frozenset({"device", "interface", "sensor", "netpath_target"})
 
 
 # ROLLED_UP_BY: rule key -> the rule key whose open alert makes it redundant.
@@ -543,6 +543,14 @@ ROLLED_UP_BY = {
     "sfp_tx_power_low_alarm": "device_down",
     "sfp_tx_power_high": "sfp_tx_power_high_alarm",
     "sfp_tx_power_high_alarm": "device_down",
+    # 5.16.0 per-sensor pairs: same shape as the optic pairs, on a `sensor`
+    # entity ("<device_id>:<sensor index>").
+    "temp_sensor_high": "temp_sensor_critical",
+    "temp_sensor_critical": "device_down",
+    "temp_sensor_state_warning": "temp_sensor_state_critical",
+    "temp_sensor_state_critical": "device_down",
+    "psu_warning": "psu_failed",
+    "psu_failed": "device_down",
 }
 
 
@@ -586,7 +594,21 @@ def same_metric_pair(child_rule, parent_rule) -> bool:
 # common on older IOS, and it would leave an alarm that can never close. One
 # dB is comfortably outside the sample-to-sample wobble of a DOM reading and
 # comfortably inside the gap between a healthy optic and its own limit.
-PUBLISHED_HYSTERESIS = {"sfp_rx_dbm": 1.0, "sfp_tx_dbm": 1.0}
+PUBLISHED_HYSTERESIS = {"sfp_rx_dbm": 1.0, "sfp_tx_dbm": 1.0, "temp_sensor_c": 2.0}
+
+# Metric families whose per-index children are sensors, not ports: the
+# engine names them from the metric's own label and keys the alert
+# "<device_id>:<sensor index>" under entity kind `sensor`.
+SENSOR_FAMILIES = frozenset({"temp_sensor_c", "temp_sensor_state", "psu_state"})
+
+# A rule that is only the fallback for a device with no per-sensor
+# coverage: rule key -> the families whose presence (a published
+# temp_sensor_c limit, or any temp_sensor_state reading) makes the device
+# judged sensor by sensor instead. See alertengine._evaluate_thresholds.
+FALLBACK_OF = {
+    "temp_chassis_high": ("temp_sensor_c", "temp_sensor_state"),
+    "temp_chassis_critical": ("temp_sensor_c", "temp_sensor_state"),
+}
 
 # The rules whose threshold comes from the port's own transceiver, and
 # nowhere else: rule key -> (metric root, the interface_thresholds column).
@@ -608,6 +630,8 @@ PUBLISHED_THRESHOLD_RULES = {
     "sfp_tx_power_low_alarm": ("sfp_tx_dbm", "low_alarm"),
     "sfp_tx_power_high": ("sfp_tx_dbm", "high_warn"),
     "sfp_tx_power_high_alarm": ("sfp_tx_dbm", "high_alarm"),
+    "temp_sensor_high": ("temp_sensor_c", "high_warn"),
+    "temp_sensor_critical": ("temp_sensor_c", "high_alarm"),
 }
 
 # The rules that roll up under a given parent, the other way round — built

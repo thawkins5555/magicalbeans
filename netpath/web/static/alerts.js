@@ -80,7 +80,7 @@
   const KIND_LABELS = {
     trap: 'an SNMP trap', syslog: 'a syslog source', ipam: 'an IPAM address',
     ap: 'a wireless access point', dhcp_scope: 'a DHCP scope',
-    netpath_target: 'a NetPath destination',
+    netpath_target: 'a NetPath destination', sensor: 'a chassis sensor or power supply',
   };
 
   const escape = App.escapeHtml;
@@ -1166,7 +1166,9 @@
     'sfp_rx_power_high', 'sfp_rx_power_high_alarm',
     'sfp_tx_power_low', 'sfp_tx_power_low_alarm',
     'sfp_tx_power_high', 'sfp_tx_power_high_alarm',
+    'temp_sensor_high', 'temp_sensor_critical',
   ];
+  const SENSOR_PUBLISHED_KEYS = ['temp_sensor_high', 'temp_sensor_critical'];
 
   function templateOptionsHtml(selectedId) {
     return `<option value="">(none)</option>` + view.templates.map((t) =>
@@ -1230,7 +1232,13 @@
         fault — an optic's receive power. The clear threshold then sits above
         the threshold rather than below it, and the alert clears once the value
         rises past it.</p>
-      ${isPublished ? `
+      ${isPublished && SENSOR_PUBLISHED_KEYS.includes(r.key) ? `
+      <p><b>Threshold — from the device's own sensor.</b> Each temperature
+        sensor is judged against the warning or critical limit the device
+        publishes for it over SNMP, read by the poller. A sensor whose device
+        publishes no limit raises none of these alerts; the chassis
+        temperature rules and their per-device overrides still cover that
+        device.</p>` : isPublished ? `
       <p><b>Threshold — from the optic.</b> Each port is judged against the
         alarm and warning levels its own transceiver publishes, read from the
         switch, because a light level that means "failing" is a property of

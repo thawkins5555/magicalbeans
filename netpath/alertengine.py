@@ -23,7 +23,8 @@ from dataclasses import asdict
 
 from . import alertmail
 from . import namelookup
-from .alertrules import CLEARS, PREDICATES, PUBLISHED_HYSTERESIS, \
+from .alertrules import CLEARS, FALLBACK_OF, PREDICATES, PUBLISHED_HYSTERESIS, \
+    SENSOR_FAMILIES, \
     PUBLISHED_THRESHOLD_RULES, ROLLED_UP_BY, ROLLS_UP, ROLLUP_ENTITY_KINDS, \
     UNMANAGED_ONLY_RULES, Occurrence, breaches, dedup_key, device_id_for, \
     comparison_of, evaluate_flapping, evaluate_threshold, interface_label, \
@@ -1224,6 +1225,9 @@ class AlertEngine(Worker):
         # ticks: the rules in PUBLISHED_THRESHOLD_RULES are judged against
         # the port's own transceiver and nothing else.
         published = self._published_thresholds(rules, now)
+        published_devices: dict[str, set] = {}
+        for pub_device_id, pub_root, _pub_index in published:
+            published_devices.setdefault(pub_root, set()).add(pub_device_id)
         # dict(rule) is not free, and a per-port rule needs a copy for every
         # port whose published limit differs. Without these two caches a
         # 2,000-device fleet at 48 optics a switch built three quarters of a
@@ -1246,7 +1250,8 @@ class AlertEngine(Worker):
             for rule in rules:
                 child_rows = children.get((device_id, rule["source_kind"]))
                 if child_rows:
-                    targets = [("interface", f"{device_id}:{if_index}", if_index, metric)
+                    child_kind = "sensor" if rule["source_kind"] in SENSOR_FAMILIES else "interface"
+                    targets = [(child_kind, f"{device_id}:{if_index}", if_index, metric)
                                for if_index, metric in sorted(child_rows)]
                 else:
                     targets = [("device", str(device_id), None,
@@ -1280,6 +1285,16 @@ class AlertEngine(Worker):
                     # written into live_streaks below, so turning it back on
                     # later starts a fresh streak rather than resuming
                     # whatever was counted before it was switched off.
+                    continue
+                covered_by = FALLBACK_OF.get(rule["key"] or "")
+                if covered_by is not None and any(
+                        device_id in published_devices.get(family, ())
+                        or children.get((device_id, family))
+                        for family in covered_by):
+                    # Judged sensor by sensor instead; the fallback rule
+                    # steps aside the same way the override-disabled branch does.
+                    if self.db.resolve_by_dedup(f"{rule['key']}:device:{device_id}", by=""):
+                        self.counters["resolved"] += 1
                     continue
                 base_threshold = rule["threshold"]
                 base_clear = rule["clear_threshold"]
@@ -1438,9 +1453,10 @@ class AlertEngine(Worker):
                         # all: an operator reading "Threshold: -14.4" for one
                         # port and "-8.2" for the next needs to know why they
                         # differ before they go looking for the setting.
-                        "threshold_source": (" (published by the optic)"
-                                             if published_for is not None
-                                             else ""),
+                        "threshold_source": ("" if published_for is None
+                                             else " (published by the device)"
+                                             if published_for[0] in SENSOR_FAMILIES
+                                             else " (published by the optic)"),
                     }
                     if result == "breach" and sample_ts is not None and sample_ts == previous_ts:
                         # Nothing new and already open: no label, no read.
@@ -1466,6 +1482,12 @@ class AlertEngine(Worker):
                             (row["descr"] if row is not None else "") or "")
                         extra["interface_alias"] = (
                             (row["alias"] if row is not None else "") or "")
+                    elif entity_kind == "sensor" and result == "breach":
+                        sensor_name = ((metric["label"] if metric is not None else "")
+                                       or f"sensor {if_index}")
+                        entity_label = f"{label} / {sensor_name}"
+                        extra["sensor_index"] = str(if_index)
+                        extra["sensor_name"] = sensor_name
                     if result == "breach":
                         # The unit is in the message because a per-port optic
                         # reading is meaningless without it: "-24.1" is a
@@ -2050,7 +2072,7 @@ class AlertEngine(Worker):
         way, and the pairing would silently never fire. Both callers below
         make that choice before calling; this function has no way to see it.
         """
-        if occurrence.entity_kind != "interface":
+        if occurrence.entity_kind not in ("interface", "sensor"):
             return occurrence
         device_id = device_id_for(occurrence.entity_kind, occurrence.entity_id)
         if device_id is None:
@@ -3002,7 +3024,7 @@ class AlertEngine(Worker):
         try:
             if alert_row["entity_kind"] == "device":
                 device_id = int(alert_row["entity_id"])
-            elif alert_row["entity_kind"] == "interface":
+            elif alert_row["entity_kind"] in ("interface", "sensor"):
                 device_id = int(str(alert_row["entity_id"]).split(":")[0])
             elif alert_row["entity_kind"] == "dhcp_scope":
                 # "<server_id>:<scope_id>"; the nearest real address is the

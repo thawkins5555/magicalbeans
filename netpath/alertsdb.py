@@ -790,6 +790,18 @@ _BUILTIN_RULES = [
     # Reads sfp_temp_c.<if>, distinct from temp_optic_high's device-wide
     # temp_optic_c. 70 C is inside SFF-8472's typical high-warning range.
     ("sfp_temp_high", "Optic temperature high (per port)", "threshold", "sfp_temp_c", 4, "threshold_breach", 70.0, 65.0, 2),
+    # 5.16.0: each chassis temperature sensor judged against the limit the
+    # device itself publishes (interface_thresholds, metric_root
+    # temp_sensor_c), or against its own status enum where a vendor
+    # exposes only that; the chassis pair above stays as the fallback for
+    # a device with neither (alertrules.FALLBACK_OF). psu_state is 0 ok,
+    # 1 degraded, 2 failed or no input; an empty bay writes nothing.
+    ("temp_sensor_high", "Sensor temperature high (device limit)", "threshold", "temp_sensor_c", 4, "threshold_breach", None, None, 2),
+    ("temp_sensor_critical", "Sensor temperature critical (device limit)", "threshold", "temp_sensor_c", 2, "threshold_breach", None, None, 2),
+    ("temp_sensor_state_warning", "Sensor reports temperature warning", "threshold", "temp_sensor_state", 4, "threshold_breach", 1.0, 1.0, 1),
+    ("temp_sensor_state_critical", "Sensor reports temperature critical", "threshold", "temp_sensor_state", 2, "threshold_breach", 2.0, 2.0, 1),
+    ("psu_warning", "Power supply degraded", "threshold", "psu_state", 4, "threshold_breach", 1.0, 1.0, 1),
+    ("psu_failed", "Power supply failed or lost input", "threshold", "psu_state", 2, "threshold_breach", 2.0, 2.0, 1),
     # RH above ~80% starts to risk condensation on anything metal in the
     # room — unambiguous on its own: nothing but a dedicated environmental
     # monitor answers a humidity sensor at all, so this one metric key

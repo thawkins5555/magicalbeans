@@ -94,11 +94,11 @@ EDITOR = ALERTS[ALERTS.index("  const PUBLISHED_THRESHOLD_KEYS = ["):
                 ALERTS.index("  function addRule() {")]
 
 # The editor's copy of the published-threshold keys is a second list of the
-# same eight rules alertrules holds, so it can drift silently -- the editor
+# same rules alertrules holds (eight optic, two sensor), so it can drift silently -- the editor
 # would offer a threshold box for a rule whose number the engine ignores.
-_JS_PUBLISHED = set(re.findall(r"'(sfp_[a-z_]+)'",
+_JS_PUBLISHED = set(re.findall(r"'((?:sfp|temp_sensor)_[a-z_]+)'",
                                EDITOR[:EDITOR.index("function templateOptionsHtml(")]))
-check("the editor's published-threshold keys are alertrules' eight, exactly",
+check("the editor's published-threshold keys are alertrules' ten, exactly",
       _JS_PUBLISHED == set(alertrules.PUBLISHED_THRESHOLD_RULES),
       sorted(_JS_PUBLISHED ^ set(alertrules.PUBLISHED_THRESHOLD_RULES)))
 
