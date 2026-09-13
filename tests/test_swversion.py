@@ -170,9 +170,9 @@ CASES = [
      "Check Point Gateway",
      {nodeoids.SW_VERSION_OIDS[2620][0]: 81, nodeoids.SW_VERSION_OIDS[2620][1]: 20},
      "81.20", ""),
-    ("APC UPS, basic ident only (advanced slot empty)", 318,
-     "APC Web/SNMP Management Card", {nodeoids.SW_VERSION_OIDS[318][1]: "AP9631"},
-     "AP9631", ""),
+    ("NETGEAR smart-switch line answers under ng700smartswitch", 4526,
+     "GS308T", {nodeoids.SW_VERSION_OIDS[4526][1]: "1.0.0.10"},
+     "1.0.0.10", ""),
     ("net-snmp Linux: nothing is invented", 8072,
      "Linux nms-01 5.15.0-76-generic #83-Ubuntu SMP Thu Jun 15 19:16:32 UTC "
      "2023 x86_64",

@@ -212,10 +212,12 @@ def _checkpoint(sys_descr: str, scalars: dict) -> SwInfo:
     return SwInfo(version=version, source="vendor_oid" if version else "")
 
 
-def _apc(sys_descr: str, scalars: dict) -> SwInfo:
-    """upsAdvIdentFirmwareRevision, else upsBasicIdentFirmwareRevision."""
-    version = _scalar(scalars, 318, 0) or _scalar(scalars, 318, 1)
-    return SwInfo(version=version, source="vendor_oid" if version else "")
+def _either_scalar(arc):
+    """A vendor with the same object under two product-line arcs; whichever answered."""
+    def rule(sys_descr: str, scalars: dict) -> SwInfo:
+        version = _scalar(scalars, arc, 0) or _scalar(scalars, arc, 1)
+        return SwInfo(version=version, source="vendor_oid" if version else "")
+    return rule
 
 
 def _aruba_or_hp(sys_descr: str, scalars: dict) -> SwInfo:
@@ -292,7 +294,7 @@ _RULES = {
     674: _plain_scalar(674),
     1991: _plain_scalar(1991, r"IronWare Version ([^\s,]+)"),
     14179: _plain_scalar(14179),
-    4526: _plain_scalar(4526),
+    4526: _either_scalar(4526),
     8741: _plain_scalar(8741),
     6574: _plain_scalar(6574),
     6876: _plain_scalar(6876),
@@ -307,7 +309,7 @@ _RULES = {
     11863: _plain_scalar(11863),
     8691: _plain_scalar(8691),
     2620: _checkpoint,
-    318: _apc,
+    318: _plain_scalar(318),
 }
 
 # Last resort: a version-looking token after a version-ish word, deliberately
