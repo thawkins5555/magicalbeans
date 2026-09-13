@@ -103,6 +103,10 @@ check("...and devices_count agrees",
 r = db.devices(text="17.9.4a")
 check("a version nothing runs matches nothing", r == [], names(r))
 
+set_identity_fields(db, cisco_id, fw_version="ROMMON-15.2")
+r = db.devices(text="ROMMON-15.2")
+check("fw_version finds its device", names(r) == ["acc-sw-114"], names(r))
+
 r = db.devices(text="nonexistent-field-value-xyz")
 check("a term matching nothing in any column returns nothing",
       r == [], names(r))

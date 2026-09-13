@@ -212,6 +212,11 @@ try:
           (status, payload))
     check("...with the same versions the JSON route reported",
           "15.2(7)E4" in payload["csv"], payload["csv"])
+    check("the CSV header carries device/name_source/fw_version/sw_source/"
+          "fw_source after the existing columns",
+          payload["csv"].splitlines()[0].lstrip("﻿").split(",")[-5:] == [
+              "device", "name_source", "fw_version", "sw_source", "fw_source"],
+          payload["csv"].splitlines()[0])
 
     status, payload = call(
         "GET", f"/api/nodes/reports/firmware/export.csv?device_ids={dev2}",

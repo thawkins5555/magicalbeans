@@ -655,7 +655,7 @@ DEFAULTS = {
     "resolve_addresses": True,
     "max_scan_addresses": 1024,
     # Identity fields shown in the device detail header.
-    "detail_fields": "sys_descr,vendor,snmp_version,sw_version,sw_image",
+    "detail_fields": "sys_descr,vendor,snmp_version,sw_version,fw_version,sw_image",
     "seeded_mib_files": "",  # CSV of bundled netpath/mibs/*.mib filenames ever
                               # auto-loaded, so a deliberate delete is never
                               # silently redone on the next restart
@@ -1022,6 +1022,9 @@ class NodesDatabase(SqliteStore):
     # Pre-5.10.0 detail_fields default, and the marker that the one-time rewrite ran.
     _DETAIL_FIELDS_PRE_5_10 = "sys_descr,vendor,snmp_version"
     _DETAIL_FIELDS_MIGRATED = "detail_fields_widened_5_10"
+    # 5.10.0's default, superseded by fw_version in 5.15.0.
+    _DETAIL_FIELDS_PRE_5_15 = "sys_descr,vendor,snmp_version,sw_version,sw_image"
+    _DETAIL_FIELDS_MIGRATED_5_15 = "detail_fields_widened_5_15"
     LABEL = "nodes"
     # The two event logs; the device rows themselves are inventory.
     OLDEST_TS_SQL = ("SELECT MIN(ts) FROM (SELECT MIN(ts) AS ts FROM"
@@ -1239,6 +1242,7 @@ class NodesDatabase(SqliteStore):
         # sw_image_file is Cisco's sysConfigName (boot image file path), not a version.
         self.ensure_columns("devices", {
             "sw_version": "TEXT", "sw_image": "TEXT", "sw_image_file": "TEXT",
+            "fw_version": "TEXT", "sw_source": "TEXT", "fw_source": "TEXT",
         })
         self.ensure_columns("groups", {
             "lldp_interval_s": "INTEGER", "poe_enabled": "INTEGER",
@@ -1365,6 +1369,26 @@ class NodesDatabase(SqliteStore):
             self._conn.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                 (self._DETAIL_FIELDS_MIGRATED, json.dumps(True)))
+
+        # Same rewrite, one release later: a stored value still equal to
+        # 5.10.0's default (no fw_version) gets today's default; a custom
+        # list is untouched.
+        if not self._private_setting(self._DETAIL_FIELDS_MIGRATED_5_15):
+            row = self._conn.execute(
+                "SELECT value FROM settings WHERE key = 'detail_fields'").fetchone()
+            if row is not None:
+                try:
+                    stored = json.loads(row["value"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    stored = None
+                if stored == self._DETAIL_FIELDS_PRE_5_15:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO settings (key, value) VALUES "
+                        "('detail_fields', ?)",
+                        (json.dumps(DEFAULTS["detail_fields"]),))
+            self._conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (self._DETAIL_FIELDS_MIGRATED_5_15, json.dumps(True)))
 
     def _seed(self) -> None:
         """Creates a `Default` polling profile if none exists yet. Idempotent
@@ -1755,7 +1779,7 @@ class NodesDatabase(SqliteStore):
             # ix_device_addresses_ip, at this scale or any other.
             text_cols = ("ip", "name", "sys_name", "sys_location",
                          "sys_descr", "sys_contact", "vendor",
-                         "sw_version", "sw_image")
+                         "sw_version", "fw_version", "sw_image")
             text_sql = " OR ".join(f"{col} LIKE ? {LIKE_ESCAPE}"
                                    for col in text_cols)
             text_sql += (" OR id IN (SELECT device_id FROM device_addresses"
@@ -2132,15 +2156,18 @@ class NodesDatabase(SqliteStore):
             # is a detected value by definition, and leaving it NULL until the
             # first poll would make ConfigRX and the Cisco MAC read fall back
             # to a blank vendor on a device that was just identified.
+            firmware = getattr(sw, "firmware", "")
             self._conn.execute(
                 "UPDATE devices SET sys_descr = ?, sys_name = ?,"
                 " sys_object_id = ?, vendor = ?, vendor_detected = ?,"
                 " vendor_source = ?, vendor_confidence = ?, vendor_evidence = ?,"
-                " sw_version = ?, sw_image = ?"
+                " sw_version = ?, sw_image = ?, fw_version = ?,"
+                " sw_source = ?, fw_source = ?"
                 " WHERE id = ?",
                 (sys_descr, sys_name, sys_object_id, vendor, vendor,
                  vendor_source or "", vendor_confidence or "", vendor_evidence,
-                 sw.version or None, sw.image or None,
+                 sw.version or None, sw.image or None, firmware or None,
+                 sw.source or None, (sw.source or None) if firmware else None,
                  device_id))
             self._conn.commit()
 
@@ -2681,7 +2708,8 @@ class NodesDatabase(SqliteStore):
                     "vendor_arc": identity.get("vendor_arc"),
                 })
                 # Only set when the poll actually read them, NULL included.
-                for key in ("sw_version", "sw_image", "sw_image_file"):
+                for key in ("sw_version", "sw_image", "sw_image_file",
+                            "fw_version", "sw_source", "fw_source"):
                     if key in identity:
                         fields[key] = identity[key] or None
             if interfaces_note is not None:

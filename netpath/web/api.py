@@ -3512,8 +3512,11 @@ def _device_json(row, reveal: bool = False) -> dict:
         "location_oid": row["location_oid"] or "",
         # sw_image_file is Cisco's boot image path, not a version.
         "sw_version": (row["sw_version"] if "sw_version" in row.keys() else None),
+        "fw_version": (row["fw_version"] if "fw_version" in row.keys() else None),
         "sw_image": (row["sw_image"] if "sw_image" in row.keys() else None),
         "sw_image_file": (row["sw_image_file"] if "sw_image_file" in row.keys() else None),
+        "sw_source": (row["sw_source"] if "sw_source" in row.keys() else None),
+        "fw_source": (row["fw_source"] if "fw_source" in row.keys() else None),
         "status": row["status"], "ping_ok": _tri(row["ping_ok"]),
         "ping_rtt_ms": row["ping_rtt_ms"], "snmp_ok": _tri(row["snmp_ok"]),
         "snmp_error": row["snmp_error"], "consecutive_fail": row["consecutive_fail"],
@@ -4026,7 +4029,7 @@ _DEVICE_CSV_HEADER = ["id", "name", "ip", "status", "group_id", "device_group_id
                      "vendor", "sys_descr", "sys_name", "polling", "muted_until",
                      "maintenance_since", "poll_interval_s", "last_poll_ts",
                      "override_count", "addresses",
-                     "sw_version", "sw_image", "sw_image_file"]
+                     "sw_version", "fw_version", "sw_image", "sw_image_file"]
 
 
 def get_nodes_devices_export(service, params, body) -> dict:
@@ -4050,7 +4053,8 @@ def get_nodes_devices_export(service, params, body) -> dict:
                 d.get("poll_interval_s"), d.get("last_poll_ts"),
                 d.get("override_count"),
                 ", ".join(a["ip"] for a in d.get("addresses") or ()),
-                d.get("sw_version"), d.get("sw_image"), d.get("sw_image_file")]
+                d.get("sw_version"), d.get("fw_version"), d.get("sw_image"),
+                d.get("sw_image_file")]
                for d in devices]
     return _csv_response("devices", header, csv_rows)
 
@@ -6090,13 +6094,15 @@ def get_nodes_reports_top_metrics(service, params, body) -> dict:
 
 
 _FIRMWARE_CSV_HEADER = ["device_id", "name", "ip", "vendor", "model_hint",
-                        "sw_version", "sw_image", "sw_image_file", "last_poll_ts"]
+                        "sw_version", "sw_image", "sw_image_file", "last_poll_ts",
+                        "device", "name_source", "fw_version", "sw_source", "fw_source"]
 
 
 def _firmware_report(service, params):
     """Shared body of the JSON route and the CSV one, so they cannot drift."""
     return reportmod.firmware_inventory(
-        service.nodes_db, _id_list(params.get("device_ids")))
+        service.nodes_db, _id_list(params.get("device_ids")),
+        hostnames=service.app_db.hostnames)
 
 
 def get_nodes_reports_firmware(service, params, body) -> dict:
@@ -6108,7 +6114,9 @@ def get_nodes_reports_firmware_export(service, params, body) -> dict:
     """The same report as a CSV file, built server-side."""
     report = _firmware_report(service, params)
     csv_rows = [[r.device_id, r.name, r.ip, r.vendor, r.model_hint, r.sw_version,
-                 r.sw_image, r.sw_image_file, r.last_poll_ts] for r in report.rows]
+                 r.sw_image, r.sw_image_file, r.last_poll_ts,
+                 r.device, r.name_source, r.fw_version, r.sw_source, r.fw_source]
+                for r in report.rows]
     return _csv_response("firmware", _FIRMWARE_CSV_HEADER, csv_rows)
 
 

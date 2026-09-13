@@ -426,12 +426,36 @@ class FirmwareRow:
     vendor: str
     model_hint: str
     sw_version: str
+    fw_version: str
     sw_image: str
     sw_image_file: str
+    sw_source: str
+    fw_source: str
+    device: str
+    name_source: str
     last_poll_ts: float | None
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def device_label(row, dns_names: dict) -> tuple[str, str]:
+    """(name, source) for a device row: a manual name wins outright, then
+    sysName, then a manual name stored without display_name_source saying
+    so (pre-5.x rows), then reverse-DNS, then the bare IP — the same order
+    an operator would trust the fleet's own facts in."""
+    ip = row["ip"]
+    name = row["name"] or ""
+    if row["display_name_source"] == "manual" and name:
+        return name, "manual"
+    if row["sys_name"]:
+        return row["sys_name"], "sysName"
+    if name:
+        return name, "manual"
+    dns = (dns_names or {}).get(ip)
+    if dns:
+        return dns, "dns"
+    return ip, "ip"
 
 
 @dataclass
@@ -450,21 +474,37 @@ class FirmwareReport:
                 "rows": [r.to_dict() for r in self.rows]}
 
 
-def firmware_inventory(nodesdb, device_ids: list[int] | None = None
-                       ) -> FirmwareReport:
-    """What every device is running. `device_ids` narrows it; omitted, the whole fleet."""
+def firmware_inventory(nodesdb, device_ids: list[int] | None = None,
+                       dns_names: dict | None = None,
+                       hostnames=None) -> FirmwareReport:
+    """What every device is running. `device_ids` narrows it; omitted, the
+    whole fleet. `dns_names` is a pre-fetched reverse-DNS map (ip -> name);
+    `hostnames`, a callable(ips) -> that same map (service.app_db.hostnames),
+    is the one-query alternative when the caller has not already fetched the
+    device rows. device_label() falls back to either when a device has
+    neither a manual name nor a sysName; with neither given, that fallback
+    is simply skipped (bare IP)."""
     rows_in = (nodesdb.devices_by_ids(sorted(set(device_ids)))
                if device_ids is not None else nodesdb.devices())
+    if dns_names is None and hostnames is not None:
+        dns_names = hostnames([row["ip"] for row in rows_in])
     rows: list[FirmwareRow] = []
     for row in rows_in:
         keys = row.keys()
+        ip = row["ip"]
+        label, name_source = device_label(row, dns_names or {})
+        device = label if label == ip else f"{label} ({ip})"
         rows.append(FirmwareRow(
-            device_id=row["id"], name=row["name"] or row["ip"], ip=row["ip"],
+            device_id=row["id"], name=row["name"] or ip, ip=ip,
             vendor=row["vendor"] or "",
             model_hint=_model_hint(row["sys_descr"] or ""),
             sw_version=(row["sw_version"] or "") if "sw_version" in keys else "",
+            fw_version=(row["fw_version"] or "") if "fw_version" in keys else "",
             sw_image=(row["sw_image"] or "") if "sw_image" in keys else "",
             sw_image_file=(row["sw_image_file"] or "") if "sw_image_file" in keys else "",
+            sw_source=(row["sw_source"] or "") if "sw_source" in keys else "",
+            fw_source=(row["fw_source"] or "") if "fw_source" in keys else "",
+            device=device, name_source=name_source,
             last_poll_ts=row["last_poll_ts"]))
     # A device with no version sorts last within its vendor.
     rows.sort(key=lambda r: (r.vendor.lower(), not r.sw_version,

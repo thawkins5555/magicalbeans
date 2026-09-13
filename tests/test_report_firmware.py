@@ -98,8 +98,21 @@ check("to_dict() is JSON-shaped all the way down (a route returns it as is)",
       isinstance(payload["rows"], list) and isinstance(payload["rows"][0], dict)
       and set(payload["rows"][0]) == {
           "device_id", "name", "ip", "vendor", "model_hint", "sw_version",
-          "sw_image", "sw_image_file", "last_poll_ts"},
+          "fw_version", "sw_image", "sw_image_file", "sw_source", "fw_source",
+          "device", "name_source", "last_poll_ts"},
       payload["rows"][0])
+
+check("fw_version is carried through as stored, alongside sw_version",
+      by_name["acc-sw-01"].fw_version == "" and by_name["acc-sw-01"].sw_version,
+      by_name["acc-sw-01"])
+set_fields(db, sw1, fw_version="12.2(55)BOOT", sw_source="vendor_oid",
+          fw_source="entity")
+refreshed = {r.name: r for r in report.firmware_inventory(db).rows}
+check("...once a device has one, it comes through unchanged",
+      refreshed["acc-sw-01"].fw_version == "12.2(55)BOOT"
+      and refreshed["acc-sw-01"].sw_source == "vendor_oid"
+      and refreshed["acc-sw-01"].fw_source == "entity",
+      refreshed["acc-sw-01"])
 
 # A device with no name falls back to its IP, the way every other report and
 # table in this app names an unnamed device.
@@ -108,6 +121,56 @@ set_fields(db, nameless, name="", vendor="", sw_version="1.0")
 rows = report.firmware_inventory(db, [nameless]).rows
 check("an unnamed device is reported by its IP", rows[0].name == "10.1.0.9",
       rows[0])
+
+# --------------------------------------------------------- device/name_source
+# device_label()'s four name cases, checked through firmware_inventory's own
+# `device` (name + IP, or bare IP) and `name_source` fields.
+manual = db.add_device("10.1.1.1", "manual-name")
+set_fields(db, manual, display_name_source="manual", sys_name="switch7.example.net")
+row = report.firmware_inventory(db, [manual]).rows[0]
+check("a manual display name wins outright, over sysName",
+      row.name_source == "manual" and row.device == "manual-name (10.1.1.1)",
+      row)
+
+sysnamed = db.add_device("10.1.1.2", "sysnamed")
+set_fields(db, sysnamed, sys_name="switch8.example.net")
+row = report.firmware_inventory(db, [sysnamed]).rows[0]
+check("without display_name_source='manual', sysName wins over the stored name",
+      row.name_source == "sysName" and row.device == "switch8.example.net (10.1.1.2)",
+      row)
+
+named_no_sysname = db.add_device("10.1.1.3", "old-style-name")
+row = report.firmware_inventory(db, [named_no_sysname]).rows[0]
+check("a stored name with no sysName and no display_name_source is still "
+      "a manual name (pre-5.x rows)",
+      row.name_source == "manual" and row.device == "old-style-name (10.1.1.3)",
+      row)
+
+dns_only = db.add_device("10.1.1.4")
+set_fields(db, dns_only, name="")
+row = report.firmware_inventory(
+    db, [dns_only], dns_names={"10.1.1.4": "host4.example.net"}).rows[0]
+check("with neither a name nor a sysName, reverse-DNS supplies the label",
+      row.name_source == "dns" and row.device == "host4.example.net (10.1.1.4)",
+      row)
+
+bare_ip = db.add_device("10.1.1.5")
+set_fields(db, bare_ip, name="")
+row = report.firmware_inventory(db, [bare_ip]).rows[0]
+check("with nothing at all, the device is just its IP -- no ' (ip)' suffix",
+      row.name_source == "ip" and row.device == "10.1.1.5",
+      row)
+
+# The `hostnames` callable is the one-query alternative to a pre-fetched
+# dns_names map (api.py's _firmware_report uses it).
+calls = []
+def fake_hostnames(ips):
+    calls.append(sorted(ips))
+    return {"10.1.1.4": "host4.example.net"}
+row = report.firmware_inventory(
+    db, [dns_only], hostnames=fake_hostnames).rows[0]
+check("the hostnames callable is used when dns_names is not given",
+      row.device == "host4.example.net (10.1.1.4)" and calls, row)
 
 db.close()
 

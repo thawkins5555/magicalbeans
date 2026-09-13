@@ -75,6 +75,8 @@ try:
                 if not seen_migration:
                     fixture.execute("DELETE FROM settings WHERE key = ?",
                                     (NodesDatabase._DETAIL_FIELDS_MIGRATED,))
+                    fixture.execute("DELETE FROM settings WHERE key = ?",
+                                    (NodesDatabase._DETAIL_FIELDS_MIGRATED_5_15,))
         return NodesDatabase(path)
 
     fresh = NodesDatabase(os.path.join(TMPDIR, "nodes-fresh.db"))
@@ -104,6 +106,35 @@ try:
           rechosen.settings()["detail_fields"] == OLD,
           rechosen.settings()["detail_fields"])
     rechosen.close()
+
+    # ------------------------------- detail_fields after the 5.15.0 upgrade
+    # 5.15.0 added fw_version; a stored 5.10.0 default is rewritten once more.
+    PRE_5_15 = "sys_descr,vendor,snmp_version,sw_version,sw_image"
+    check("the shipped default now also carries fw_version",
+          "fw_version" in NEW, NEW)
+
+    upgraded_5_15 = open_nodes("nodes-upgraded-5-15.db", PRE_5_15,
+                               seen_migration=False)
+    check("an install carrying the 5.10.0 default is rewritten to the "
+          "5.15.0 one on open",
+          upgraded_5_15.settings()["detail_fields"] == NEW,
+          upgraded_5_15.settings()["detail_fields"])
+    upgraded_5_15.close()
+
+    custom_5_15 = open_nodes("nodes-custom-5-15.db", "vendor,location",
+                             seen_migration=False)
+    check("...while a custom list is left exactly as it is by the 5.15.0 "
+          "widen too",
+          custom_5_15.settings()["detail_fields"] == "vendor,location",
+          custom_5_15.settings()["detail_fields"])
+    custom_5_15.close()
+
+    rechosen_5_15 = open_nodes("nodes-rechosen-5-15.db", PRE_5_15)
+    check("an operator who picks the 5.10.0 fields after the 5.15.0 upgrade "
+          "keeps them",
+          rechosen_5_15.settings()["detail_fields"] == PRE_5_15,
+          rechosen_5_15.settings()["detail_fields"])
+    rechosen_5_15.close()
 
     # ------------------------------------- one read for a pane of neighbours
     nodes = NodesDatabase(os.path.join(TMPDIR, "nodes.db"))
