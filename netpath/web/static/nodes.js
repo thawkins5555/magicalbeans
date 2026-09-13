@@ -325,6 +325,9 @@
       value: (r) => r.sw_version || '',
       cell: (r) => escape(r.sw_version || '\u2014')
         + (r.sw_image ? `<div class="ip-line">${escape(r.sw_image)}</div>` : '') },
+    { key: 'fw_version', label: 'Firmware', width: 110,
+      value: (r) => r.fw_version || '',
+      cell: (r) => escape(r.fw_version || '—') },
   ];
 
   // A device can answer on more addresses than the one it was entered
@@ -995,6 +998,12 @@
      than reading view.detail so the device dialog can render a device that
      is not the selected one through the same code — the alternative was a
      second copy that would drift from the Settings-driven field list. */
+  const VERSION_SOURCES = {
+    sysDescr: 'sysDescr', vendor_oid: 'vendor OID',
+    entPhysicalSoftwareRev: 'ENTITY-MIB', entPhysicalFirmwareRev: 'ENTITY-MIB',
+  };
+  const versionSourceSuffix = (source) => (VERSION_SOURCES[source] ? ` (${VERSION_SOURCES[source]})` : '');
+
   function deviceSummaryHtml(d) {
     if (!d) return '';
     const s = App.state.nodesSettings || {};
@@ -1035,7 +1044,14 @@
         + (d.vendor && d.vendor_confidence && d.vendor_confidence !== 'high'
            ? ` ${d.vendor_confidence}` : '')),
       // netpath/swversion.py; image line appends the boot image file when one was read.
-      sw_version: () => field('software', d.sw_version),
+      // The software line always shows, so a device nothing could name reads
+      // "not reported" rather than nothing; the source says which object spoke.
+      sw_version: () => (d.sw_version
+        ? field('software', d.sw_version + versionSourceSuffix(d.sw_source))
+        : `<span class="nd-f"><span class="hint">software</span> ` +
+          `<span class="nd-v hint">not reported</span></span>`),
+      fw_version: () => field('firmware', (d.fw_version || '')
+        && d.fw_version + versionSourceSuffix(d.fw_source)),
       sw_image: () => field('image', (d.sw_image || d.sw_image_file || '')
         && (d.sw_image || '') + (d.sw_image && d.sw_image_file ? ' — ' : '')
            + (d.sw_image_file || '')),
@@ -4100,17 +4116,21 @@
   }
 
   // ------------------------------------------------ firmware inventory
+  const NAME_SOURCES = { sysName: 'sysName', manual: 'manual name', dns: 'reverse DNS', ip: 'ip' };
   const FIRMWARE_COLUMNS = [
-    { key: 'name', label: 'Device', width: 190,
-      value: (r) => r.name || r.ip || `#${r.device_id}`,
+    { key: 'name', label: 'Device', width: 210,
+      value: (r) => r.device || r.name || r.ip || `#${r.device_id}`,
       cell: (r) => App.deviceNameLink(r.name || r.ip || `#${r.device_id}`,
                                       { id: r.device_id }) +
-        (r.name && r.ip ? `<div class="ip-line">${escape(r.ip)}</div>` : '') },
+        `<div class="ip-line">${escape(r.ip || '')}${
+          r.name_source && r.name_source !== 'ip' ? ` · ${escape(NAME_SOURCES[r.name_source] || r.name_source)}` : ''}</div>` },
     { key: 'vendor', label: 'Vendor', width: 110,
       cell: (r) => escape(r.vendor || '—') },
     { key: 'sw_version', label: 'Software', width: 140,
       cell: (r) => (r.sw_version ? escape(r.sw_version)
         : '<span class="hint">not reported</span>') },
+    { key: 'fw_version', label: 'Firmware', width: 120,
+      cell: (r) => escape(r.fw_version || '\u2014') },
     { key: 'sw_image', label: 'Image', width: 200,
       cell: (r) => escape(r.sw_image || '—') +
         (r.sw_image_file ? `<div class="ip-line">${escape(r.sw_image_file)}</div>` : '') },
@@ -4179,7 +4199,8 @@
   }
 
   const FIRMWARE_CSV_HEADER = ['device_id', 'name', 'ip', 'vendor', 'model_hint',
-    'sw_version', 'sw_image', 'sw_image_file', 'last_poll_ts'];
+    'sw_version', 'sw_image', 'sw_image_file', 'last_poll_ts',
+    'device', 'name_source', 'fw_version', 'sw_source', 'fw_source'];
 
   function exportFirmwareReportCsv() {
     const report = view.repFirmware;
@@ -4188,7 +4209,8 @@
       return;
     }
     const rows = report.rows.map((r) => [r.device_id, r.name, r.ip, r.vendor,
-      r.model_hint, r.sw_version, r.sw_image, r.sw_image_file, r.last_poll_ts]);
+      r.model_hint, r.sw_version, r.sw_image, r.sw_image_file, r.last_poll_ts,
+      r.device, r.name_source, r.fw_version, r.sw_source, r.fw_source]);
     saveReportCsv(`firmware-${App.isoLocal(report.generated_ts).slice(0, 10)}.csv`,
       FIRMWARE_CSV_HEADER, rows);
   }
@@ -6170,6 +6192,7 @@
     ['vendor', 'Vendor'],
     ['snmp_version', 'SNMP version in use'],
     ['sw_version', 'Software version'],
+    ['fw_version', 'Firmware / boot ROM version'],
     ['sw_image', 'Software image (and boot file)'],
   ];
 
