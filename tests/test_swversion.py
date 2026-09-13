@@ -121,6 +121,58 @@ CASES = [
      "Brocade Communications Systems, Inc. ICX7250-48P, IronWare Version "
      "08.0.30tT213 Compiled on Sep 13 2016",
      {}, "08.0.30tT213", ""),
+    ("Cisco wireless (Catalyst 9800) agentInventoryProductVersion", 14179,
+     "Cisco Controller", {nodeoids.SW_VERSION_OIDS[14179][0]: "8.10.185.0"},
+     "8.10.185.0", ""),
+    ("Netgear agentInventorySoftwareVersion", 4526,
+     "NETGEAR GS724Tv4", {nodeoids.SW_VERSION_OIDS[4526][0]: "6.0.9.0"},
+     "6.0.9.0", ""),
+    ("SonicWall snwlSysFirmwareVersion", 8741,
+     "SonicWALL", {nodeoids.SW_VERSION_OIDS[8741][0]: "7.0.1-5119"},
+     "7.0.1-5119", ""),
+    ("Synology version scalar", 6574,
+     "Synology RackStation", {nodeoids.SW_VERSION_OIDS[6574][0]: "7.2-64570"},
+     "7.2-64570", ""),
+    ("VMware vmwProdVersion", 6876,
+     "VMware ESXi", {nodeoids.SW_VERSION_OIDS[6876][0]: "7.0.3"},
+     "7.0.3", ""),
+    ("Sophos sfosDeviceFWVersion", 2604,
+     "Sophos XG Firewall", {nodeoids.SW_VERSION_OIDS[2604][0]: "19.5.3"},
+     "19.5.3", ""),
+    ("F5 sysProductVersion", 3375,
+     "BIG-IP", {nodeoids.SW_VERSION_OIDS[3375][0]: "16.1.3.2"},
+     "16.1.3.2", ""),
+    ("F5's other module root (12276), same sysProductVersion object", 12276,
+     "BIG-IP", {nodeoids.SW_VERSION_OIDS[12276][0]: "15.1.5"},
+     "15.1.5", ""),
+    ("Citrix sysBuildVersion", 5951,
+     "NetScaler", {nodeoids.SW_VERSION_OIDS[5951][0]: "13.1-49.15"},
+     "13.1-49.15", ""),
+    ("Zyxel sysSwVersionString", 890,
+     "Zyxel GS1900-24", {nodeoids.SW_VERSION_OIDS[890][0]: "V2.70(AAHH.0)"},
+     "V2.70(AAHH.0)", ""),
+    ("Cambium swVersion", 161,
+     "Cambium ePMP 1000", {nodeoids.SW_VERSION_OIDS[161][0]: "4.7.1"},
+     "4.7.1", ""),
+    ("Cambium's other arc (17713), same swVersion object", 17713,
+     "Cambium PTP", {nodeoids.SW_VERSION_OIDS[17713][0]: "5.5.2"},
+     "5.5.2", ""),
+    ("Aerohive ahFirmwareVersion", 26928,
+     "Aerohive AP330", {nodeoids.SW_VERSION_OIDS[26928][0]: "10.0r8"},
+     "10.0r8", ""),
+    ("TP-Link tpSysInfoSwVersion", 11863,
+     "TP-Link T1600G-28TS", {nodeoids.SW_VERSION_OIDS[11863][0]: "1.0.0 Build 20210101"},
+     "1.0.0 Build 20210101", ""),
+    ("Moxa siStatProductInfoFirmwareVersion", 8691,
+     "Moxa NPort 5110", {nodeoids.SW_VERSION_OIDS[8691][0]: "2.5"},
+     "2.5", ""),
+    ("Check Point svnProdVerMajor/Minor composed", 2620,
+     "Check Point Gateway",
+     {nodeoids.SW_VERSION_OIDS[2620][0]: 81, nodeoids.SW_VERSION_OIDS[2620][1]: 20},
+     "81.20", ""),
+    ("APC UPS, basic ident only (advanced slot empty)", 318,
+     "APC Web/SNMP Management Card", {nodeoids.SW_VERSION_OIDS[318][1]: "AP9631"},
+     "AP9631", ""),
     ("net-snmp Linux: nothing is invented", 8072,
      "Linux nms-01 5.15.0-76-generic #83-Ubuntu SMP Thu Jun 15 19:16:32 UTC "
      "2023 x86_64",
@@ -189,14 +241,88 @@ check("a Cisco poll asks for the chassis entPhysicalSoftwareRev and "
       "sysConfigName",
       ENT in oids and CISCO_CONFIG in oids, oids)
 check("...and asks for each OID exactly once", len(oids) == len(set(oids)), oids)
-check("an unknown arc still asks for the standard entPhysicalSoftwareRev",
-      swversion.oids_for(None) == (ENT,), swversion.oids_for(None))
+ENT_FW = nodeoids.ENT_PHYSICAL_FIRMWARE_REV + ".1"
+check("an unknown arc still asks for the standard entPhysicalSoftwareRev "
+      "and entPhysicalFirmwareRev",
+      swversion.oids_for(None) == (ENT, ENT_FW), swversion.oids_for(None))
 check("a vendor with a scalar of its own asks for it too",
       nodeoids.SW_VERSION_OIDS[12356][0] in swversion.oids_for(12356),
       swversion.oids_for(12356))
 check("no vendor asks for more than four objects (one GET, not a walk)",
       all(len(swversion.oids_for(arc)) <= 4 for arc in nodeoids.SW_VERSION_OIDS),
       {arc: swversion.oids_for(arc) for arc in nodeoids.SW_VERSION_OIDS})
+
+oids = swversion.oids_for(8741)
+check("a vendor with a software scalar, a separate firmware scalar and both "
+      "ENTITY-MIB fallbacks asks for all four, once each",
+      len(oids) == 4 and len(oids) == len(set(oids)), oids)
+
+# ------------------------------------------------------------- ArubaOS 14823
+
+info = swversion.extract(14823, "ArubaOS (MODEL: Aruba7210)",
+                         {nodeoids.WLSX_SYS_EXT_SW_VERSION: "8.10.0.4"})
+check("Aruba's controller arc uses wlsxSysExtSwVersion when sysDescr says "
+      "ArubaOS, not the ProCurve _hp shape",
+      info.version == "8.10.0.4" and info.source == "vendor_oid", repr(info))
+
+# ------------------------------------------------------- firmware, dropped
+
+info = swversion.extract(47196, "Aruba JL663A 6300M",
+                         {ENT: "PL.10.09.0010", ENT_FW: "PL.10.09.0010"})
+check("firmware that just repeats the version is dropped rather than shown "
+      "twice",
+      info.version == "PL.10.09.0010" and info.firmware == "" and
+      info.fw_source == "", repr(info))
+
+info = swversion.extract(9, "Cisco IOS-XE running in install mode",
+                         {CISCO_CONFIG: "bootflash:packages.conf", ENT: "17.6.5",
+                          ENT_FW: "17.6.6"})
+check("...but a genuinely different firmware value is kept, sourced from "
+      "entPhysicalFirmwareRev",
+      info.version == "17.6.5" and info.firmware == "17.6.6" and
+      info.fw_source == "entPhysicalFirmwareRev", repr(info))
+
+# ----------------------------------------------------------- column vendors
+
+DELL_SW = nodeoids.SW_VERSION_COLUMNS[6027][0][0]
+info = swversion.extract(6027, "Dell Networking S4048", {},
+                         columns={DELL_SW: {"1": "10.5.1.6"}})
+check("Dell dellNetSwModuleRuntimeImgVersion, first row",
+      info.version == "10.5.1.6" and info.source == "vendor_oid", repr(info))
+
+RUCKUS_SW, RUCKUS_STATUS = nodeoids.SW_VERSION_COLUMNS[25053][0][0], \
+    nodeoids.SW_VERSION_COLUMNS[25053][1]
+info = swversion.extract(25053, "Ruckus ZoneFlex R510", {}, columns={
+    RUCKUS_SW: {"1": "112.0.0.0build158", "2": "112.0.0.10build162"},
+    RUCKUS_STATUS: {"1": 1, "2": 2},
+})
+check("Ruckus: the row whose ruckusSwRevStatus is active(2) wins over an "
+      "inactive row",
+      info.version == "112.0.0.10build162" and info.source == "vendor_oid",
+      repr(info))
+
+ARUBA_CX_SW, ARUBA_CX_FW = nodeoids.SW_VERSION_COLUMNS[47196][0]
+info = swversion.extract(47196, "Aruba JL658A 6300M", {}, columns={
+    ARUBA_CX_SW: {"1": "FL.10.09.0010"}, ARUBA_CX_FW: {"1": "1.0.0.6"},
+})
+check("Aruba CX: software column and firmware (ServiceOS) column both read",
+      info.version == "FL.10.09.0010" and info.firmware == "1.0.0.6" and
+      info.fw_source == "vendor_oid", repr(info))
+
+VERTIV_FW = nodeoids.SW_VERSION_COLUMNS[476][0][1]
+info = swversion.extract(476, "Liebert GXT5", {},
+                         columns={VERTIV_FW: {"1": "4.2.1"}})
+check("Vertiv: firmware-only column, no software column to answer `version`",
+      info.version == "" and info.firmware == "4.2.1" and
+      info.fw_source == "vendor_oid", repr(info))
+
+RARITAN_FW = nodeoids.SW_VERSION_COLUMNS[13742][0][1]
+info = swversion.extract(13742, "Raritan PX3-5000 PDU", {}, columns={
+    RARITAN_FW: {"1.2.1": "2.1.0", "1.1.1": "3.5.2"},
+})
+check("Raritan: the row whose boardType (index component 2) is 1 wins over "
+      "a boardType-2 row, regardless of walk order",
+      info.firmware == "3.5.2", repr(info))
 
 print()
 if FAILS:

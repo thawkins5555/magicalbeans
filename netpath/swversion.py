@@ -4,12 +4,14 @@ and one best-effort GET of the vendor objects nodeoids.SW_VERSION_OIDS names."""
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from . import nodeoids
 
 VENDOR_SW_OIDS = nodeoids.SW_VERSION_OIDS
+VENDOR_FW_OIDS = nodeoids.FW_VERSION_OIDS
 ENT_SOFTWARE_REV = nodeoids.ENT_PHYSICAL_SOFTWARE_REV_FIRST
+ENT_FIRMWARE_REV = nodeoids.ENT_PHYSICAL_FIRMWARE_REV_FIRST
 
 
 @dataclass(frozen=True)
@@ -18,6 +20,8 @@ class SwInfo:
     image: str = ""
     image_file: str = ""  # Cisco's sysConfigName: boot image file path, not a version.
     source: str = ""
+    firmware: str = ""
+    fw_source: str = ""
 
 
 def oids_for(arc) -> tuple[str, ...]:
@@ -26,8 +30,15 @@ def oids_for(arc) -> tuple[str, ...]:
     for oid in VENDOR_SW_OIDS.get(arc, (None, None)):
         if oid and oid not in oids:
             oids.append(oid)
+    fw_oid = VENDOR_FW_OIDS.get(arc)
+    if fw_oid and fw_oid not in oids:
+        oids.append(fw_oid)
     if ENT_SOFTWARE_REV not in oids:
         oids.append(ENT_SOFTWARE_REV)
+    if ENT_FIRMWARE_REV not in oids:
+        oids.append(ENT_FIRMWARE_REV)
+    if arc == 14823 and nodeoids.WLSX_SYS_EXT_SW_VERSION not in oids:
+        oids.append(nodeoids.WLSX_SYS_EXT_SW_VERSION)
     return tuple(oids)
 
 
@@ -47,6 +58,37 @@ def _text(value) -> str:
 def _scalar(scalars: dict, arc, which: int) -> str:
     oid = VENDOR_SW_OIDS.get(arc, (None, None))[which]
     return _text(scalars.get(oid)) if oid else ""
+
+
+def _num_text(value) -> str:
+    """An integer scalar (Gauge32/Integer32) as a printable string. Excludes
+    bool, which is an int subclass but never a version component."""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    return _text(value)
+
+
+def _num_scalar(scalars: dict, arc, which: int) -> str:
+    oid = VENDOR_SW_OIDS.get(arc, (None, None))[which]
+    return _num_text(scalars.get(oid)) if oid else ""
+
+
+def _index_key(index: str):
+    """Sort key for a walk's index suffixes, numeric when every component is."""
+    try:
+        return tuple(int(part) for part in index.split("."))
+    except ValueError:
+        return (index,)
+
+
+def _first_nonempty(rows: dict) -> str:
+    for index in sorted(rows, key=_index_key):
+        value = _text(rows[index])
+        if value:
+            return value
+    return ""
 
 
 def _search(pattern: str, text: str, group: int = 1) -> str:
@@ -162,12 +204,84 @@ def _plain_scalar(arc, descr_pattern: str = ""):
     return rule
 
 
+def _checkpoint(sys_descr: str, scalars: dict) -> SwInfo:
+    """svnProdVerMajor/Minor, two Gauge32 composed into one "major.minor"."""
+    major = _num_scalar(scalars, 2620, 0)
+    minor = _num_scalar(scalars, 2620, 1)
+    version = f"{major}.{minor}" if major and minor else ""
+    return SwInfo(version=version, source="vendor_oid" if version else "")
+
+
+def _apc(sys_descr: str, scalars: dict) -> SwInfo:
+    """upsAdvIdentFirmwareRevision, else upsBasicIdentFirmwareRevision."""
+    version = _scalar(scalars, 318, 0) or _scalar(scalars, 318, 1)
+    return SwInfo(version=version, source="vendor_oid" if version else "")
+
+
+def _aruba_or_hp(sys_descr: str, scalars: dict) -> SwInfo:
+    if "ArubaOS" in (sys_descr or ""):
+        version = _text(scalars.get(nodeoids.WLSX_SYS_EXT_SW_VERSION))
+        return SwInfo(version=version, source="vendor_oid" if version else "")
+    return _hp(sys_descr, scalars)
+
+
+# --------------------------------------------------------- column vendors
+
+def _raritan_row(rows: dict) -> str:
+    """The row whose compound index names boardType 1 (the main controller),
+    else the first non-empty row."""
+    for index in sorted(rows, key=_index_key):
+        parts = index.split(".")
+        if len(parts) > 1 and parts[1] == "1":
+            value = _text(rows[index])
+            if value:
+                return value
+    return _first_nonempty(rows)
+
+
+def _ruckus_row(sw_rows: dict, status_rows: dict) -> str:
+    """The row whose ruckusSwRevStatus is active(2), else the first non-empty row."""
+    for index in sorted(sw_rows, key=_index_key):
+        if _num_text(status_rows.get(index)) == "2":
+            value = _text(sw_rows[index])
+            if value:
+                return value
+    return _first_nonempty(sw_rows)
+
+
+def _column_first(arc):
+    """A rule reading nodeoids.SW_VERSION_COLUMNS's sw column out of a walk."""
+    (sw_column, _fw_column), status_column = nodeoids.SW_VERSION_COLUMNS[arc]
+    def rule(columns: dict) -> SwInfo:
+        rows = columns.get(sw_column) or {} if sw_column else {}
+        if not rows:
+            return SwInfo()
+        if arc == 25053:
+            version = _ruckus_row(rows, columns.get(status_column) or {})
+        elif arc == 13742:
+            version = _raritan_row(rows)
+        else:
+            version = _first_nonempty(rows)
+        return SwInfo(version=version, source="vendor_oid" if version else "")
+    return rule
+
+
+def _column_firmware(arc, columns: dict) -> str:
+    (_sw_column, fw_column), _status_column = nodeoids.SW_VERSION_COLUMNS[arc]
+    if not fw_column:
+        return ""
+    rows = columns.get(fw_column) or {}
+    if not rows:
+        return ""
+    return _raritan_row(rows) if arc == 13742 else _first_nonempty(rows)
+
+
 _RULES = {
     9: _cisco,
     12356: _fortinet,
     2636: _juniper,
     11: _hp,
-    14823: _hp,  # Aruba's own arc, for ProCurve-lineage switches sharing HP's sysDescr shape.
+    14823: _aruba_or_hp,
     25506: _comware,
     30065: _arista,
     1916: _extreme,
@@ -177,6 +291,23 @@ _RULES = {
     25461: _plain_scalar(25461),
     674: _plain_scalar(674),
     1991: _plain_scalar(1991, r"IronWare Version ([^\s,]+)"),
+    14179: _plain_scalar(14179),
+    4526: _plain_scalar(4526),
+    8741: _plain_scalar(8741),
+    6574: _plain_scalar(6574),
+    6876: _plain_scalar(6876),
+    2604: _plain_scalar(2604),
+    3375: _plain_scalar(3375),
+    12276: _plain_scalar(12276),
+    5951: _plain_scalar(5951),
+    890: _plain_scalar(890),
+    161: _plain_scalar(161),
+    17713: _plain_scalar(17713),
+    26928: _plain_scalar(26928),
+    11863: _plain_scalar(11863),
+    8691: _plain_scalar(8691),
+    2620: _checkpoint,
+    318: _apc,
 }
 
 # Last resort: a version-looking token after a version-ish word, deliberately
@@ -184,20 +315,43 @@ _RULES = {
 _GENERIC = r"(?:firmware|version|revision|release)[:\s]+v?([0-9][\w.()-]*)"
 
 
-def extract(arc, sys_descr: str, scalars: dict) -> SwInfo:
-    """(version, image, image_file, source) for one device."""
+def _fill_firmware(arc, info: SwInfo, scalars: dict, columns: dict) -> SwInfo:
+    """firmware/fw_source, in the vendor scalar > vendor column >
+    entPhysicalFirmwareRev order, dropped when it just repeats `version`."""
+    firmware = ""
+    fw_source = ""
+    fw_oid = VENDOR_FW_OIDS.get(arc)
+    if fw_oid:
+        firmware = _text(scalars.get(fw_oid))
+        fw_source = "vendor_oid" if firmware else ""
+    if not firmware and arc in nodeoids.SW_VERSION_COLUMNS:
+        firmware = _column_firmware(arc, columns)
+        fw_source = "vendor_oid" if firmware else ""
+    if not firmware:
+        firmware = _text(scalars.get(ENT_FIRMWARE_REV))
+        fw_source = "entPhysicalFirmwareRev" if firmware else ""
+    if firmware and firmware == info.version:
+        firmware, fw_source = "", ""
+    return replace(info, firmware=firmware, fw_source=fw_source)
+
+
+def extract(arc, sys_descr: str, scalars: dict, columns: dict = None) -> SwInfo:
+    """(version, image, image_file, source, firmware, fw_source) for one device."""
     scalars = scalars or {}
     sys_descr = sys_descr or ""
+    columns = columns or {}
     rule = _RULES.get(arc)
     info = rule(sys_descr, scalars) if rule else SwInfo()
-    if info.version:
-        return info
-    ent = _text(scalars.get(ENT_SOFTWARE_REV))
-    if ent:
-        return SwInfo(version=ent, image=info.image, image_file=info.image_file,
-                      source="entPhysicalSoftwareRev")
-    generic = _search(_GENERIC, sys_descr)
-    if generic:
-        return SwInfo(version=generic, image=info.image,
-                      image_file=info.image_file, source="sysDescr")
-    return info
+    if not info.version and arc in nodeoids.SW_VERSION_COLUMNS:
+        info = _column_first(arc)(columns)
+    if not info.version:
+        ent = _text(scalars.get(ENT_SOFTWARE_REV))
+        if ent:
+            info = SwInfo(version=ent, image=info.image, image_file=info.image_file,
+                          source="entPhysicalSoftwareRev")
+    if not info.version:
+        generic = _search(_GENERIC, sys_descr)
+        if generic:
+            info = SwInfo(version=generic, image=info.image,
+                          image_file=info.image_file, source="sysDescr")
+    return _fill_firmware(arc, info, scalars, columns)

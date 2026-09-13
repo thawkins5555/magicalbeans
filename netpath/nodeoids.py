@@ -723,8 +723,11 @@ def identify_vendor(sys_object_id: str, sys_descr: str = "") -> tuple[str, str]:
 
 ENT_PHYSICAL_SOFTWARE_REV = "1.3.6.1.2.1.47.1.1.1.1.10"   # ENTITY-MIB, per entity
 ENT_PHYSICAL_SOFTWARE_REV_FIRST = ENT_PHYSICAL_SOFTWARE_REV + ".1"  # index 1: chassis
+ENT_PHYSICAL_FIRMWARE_REV = "1.3.6.1.2.1.47.1.1.1.1.9"    # ENTITY-MIB, per entity
+ENT_PHYSICAL_FIRMWARE_REV_FIRST = ENT_PHYSICAL_FIRMWARE_REV + ".1"  # index 1: chassis
 CISCO_SYS_CONFIG_NAME = "1.3.6.1.4.1.9.2.1.73.0"  # OLD-CISCO-SYS-MIB sysConfigName: boot image file path
 HR_SW_INSTALLED_NAME_FIRST = "1.3.6.1.2.1.25.6.3.1.2.1"  # hrSWInstalledName.1
+WLSX_SYS_EXT_SW_VERSION = "1.3.6.1.4.1.14823.2.2.1.2.1.28.0"  # WLSX-SYSTEMEXT-MIB wlsxSysExtSwVersion
 
 SW_VERSION_OIDS = {  # (version OID | None, image OID | None) per arc; None = read from sysDescr
     12356: ("1.3.6.1.4.1.12356.101.4.1.1.0", None),                          # fgSysVersion
@@ -737,8 +740,49 @@ SW_VERSION_OIDS = {  # (version OID | None, image OID | None) per arc; None = re
     1991: ("1.3.6.1.4.1.1991.1.1.2.1.11.0", None),                          # snAgImgVer
     41112: ("1.3.6.1.4.1.41112.1.6.3.6.0", None),                           # unifiApSystemVersion
     9: (None, CISCO_SYS_CONFIG_NAME),
+    14179: ("1.3.6.1.4.1.14179.1.1.1.14.0", None),                          # agentInventoryProductVersion
+    4526: ("1.3.6.1.4.1.4526.10.1.1.1.13.0", None),                         # agentInventorySoftwareVersion
+    8741: ("1.3.6.1.4.1.8741.2.1.1.3.0", None),                             # snwlSysFirmwareVersion
+    6574: ("1.3.6.1.4.1.6574.1.5.3.0", None),                               # Synology version
+    6876: ("1.3.6.1.4.1.6876.1.2.0", None),                                 # vmwProdVersion
+    2604: ("1.3.6.1.4.1.2604.5.1.1.3.0", None),                             # sfosDeviceFWVersion
+    3375: ("1.3.6.1.4.1.3375.2.1.4.2.0", None),                             # sysProductVersion
+    5951: ("1.3.6.1.4.1.5951.4.1.1.1.0", None),                             # sysBuildVersion
+    890: ("1.3.6.1.4.1.890.1.15.3.1.6.0", None),                            # sysSwVersionString
+    161: ("1.3.6.1.4.1.161.19.3.3.1.25.0", None),                           # swVersion
+    26928: ("1.3.6.1.4.1.26928.1.2.12.0", None),                            # ahFirmwareVersion
+    11863: ("1.3.6.1.4.1.11863.6.1.1.6.0", None),                           # tpSysInfoSwVersion
+    8691: ("1.3.6.1.4.1.8691.602.1.1.2.2.1.0", None),                       # siStatProductInfoFirmwareVersion
+    2620: ("1.3.6.1.4.1.2620.1.6.2.0", "1.3.6.1.4.1.2620.1.6.3.0"),         # svnProdVerMajor; svnProdVerMinor
+    318: ("1.3.6.1.4.1.318.1.1.1.1.2.1.0", "1.3.6.1.4.1.318.1.1.1.1.1.4.0"),  # upsAdvIdentFirmwareRevision; upsBasicIdentFirmwareRevision
 }
 SW_VERSION_OIDS[10002] = SW_VERSION_OIDS[41112]  # airOS: sysObjectID 10002, same 41112 objects
+SW_VERSION_OIDS[12276] = SW_VERSION_OIDS[3375]  # F5's other module root, same sysProductVersion
+SW_VERSION_OIDS[17713] = SW_VERSION_OIDS[161]  # Cambium's other arc, same swVersion
+
+FW_VERSION_OIDS = {  # arc: firmware/boot-ROM OID, separate from the software version above
+    8741: "1.3.6.1.4.1.8741.2.1.1.4.0",   # snwlSysROMVersion
+    534: "1.3.6.1.4.1.534.1.1.3.0",       # xupsIdentSoftwareVersion
+}
+FW_VERSION_OIDS[705] = FW_VERSION_OIDS[534]  # Eaton's other arc, same XUPS-MIB
+
+# Column vendors: {arc: ((sw column OID | None, fw column OID | None), status column OID | None)}.
+# Walked (not GET) by nodepoll.py, gated as described there; extract() reads the
+# walk result through swversion._column_first(arc).
+SW_VERSION_COLUMNS = {
+    # DELL-NETWORKING-CHASSIS-MIB dellNetSwModuleRuntimeImgVersion, no status column
+    6027: (("1.3.6.1.4.1.6027.3.26.1.4.1.1.1", None), None),
+    # RUCKUS-SWINFO-MIB ruckusSwRevision / ruckusSwRevStatus (active(2) row wins)
+    25053: (("1.3.6.1.4.1.25053.1.1.3.1.1.1.1.3", None),
+            "1.3.6.1.4.1.25053.1.1.3.1.1.1.1.5"),
+    # ARUBAWIRED-VSF-MIB arubaWiredVsfMemberBootImage / ...BootRomVersion, first row
+    47196: (("1.3.6.1.4.1.47196.4.1.1.3.10.0.3.1.8",
+             "1.3.6.1.4.1.47196.4.1.1.3.10.0.3.1.12"), None),
+    # LIEBERT-GP-AGENT-MIB lgpAgentDeviceFirmwareVersion, first row
+    476: ((None, "1.3.6.1.4.1.476.1.42.2.4.2.1.5"), None),
+    # PDU2-MIB boardFirmwareVersion, row whose boardType (index component 2) is 1
+    13742: ((None, "1.3.6.1.4.1.13742.3.2.3.1.6"), None),
+}
 
 
 # ---------------------------------------------------------- custom identity
