@@ -530,6 +530,21 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
     return 'opened';
   });
 
+  // ---- 5.16.0: the per-sensor table under TEMPERATURE ALERTS, from the
+  // stored /sensors route (never a live walk), so it renders on any device.
+  await guarded(recorder, step('feature:device-sensors'), async () => {
+    if (!deviceDetailOpened) return 'absent — device-detail did not open';
+    await page.waitForSelector('#modal:not([hidden]) #ndd-sensors', { timeout: 10000 });
+    await page.waitForFunction(() => {
+      const el = document.querySelector('#modal:not([hidden]) #ndd-sensors');
+      return el && !/Reading per-sensor/.test(el.textContent);
+    }, null, { timeout: 10000 }).catch(() => {});
+    const text = await page.locator('#modal:not([hidden]) #ndd-sensors').innerText();
+    await shoot(page, dir, shot('feature', 'device-sensors'));
+    if (/Reading per-sensor/.test(text)) throw new Error('sensor table never loaded');
+    return text.split('\n')[0].slice(0, 120);
+  });
+
   await guarded(recorder, step('dlg:device-interface'), async () => {
     if (!deviceDetailOpened) return 'absent — device-detail did not open';
     // Interface rows inside the device dialog are SINGLE-click
@@ -541,6 +556,21 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
     await settle(page, 1000);
     await shoot(page, dir, shot('dlg', 'interface'));
     return 'opened';
+  });
+
+  // ---- 5.16.0: the port dialog's MAC section fills from the stored
+  // forwarding table first; a live read only ever replaces it later.
+  await guarded(recorder, step('feature:port-stored-macs'), async () => {
+    const open = await page.locator('#modal:not([hidden]) #ifd-mac').count();
+    if (!open) return 'absent — interface dialog not open';
+    await page.waitForFunction(() => {
+      const el = document.querySelector('#modal:not([hidden]) #ifd-mac');
+      return el && !/Reading MAC address table/.test(el.textContent);
+    }, null, { timeout: 8000 }).catch(() => {});
+    const text = await page.locator('#modal:not([hidden]) #ifd-mac').innerText();
+    await shoot(page, dir, shot('feature', 'port-stored-macs'));
+    if (/Reading MAC address table/.test(text)) throw new Error('stored MAC table never rendered');
+    return text.split('\n')[0].slice(0, 120);
   });
   await closeAnyModal(page);
 
@@ -611,6 +641,31 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
     return 'opened';
   });
   await closeAnyModal(page);
+
+  // ---- 5.16.0: Drag pans — left-drag on empty canvas pans when ticked,
+  // rubber-bands when not; link labels sit in their own haloed layer.
+  await guarded(recorder, step('feature:mapper-drag-pans'), async () => {
+    await selectTab(page, 'mapper');
+    await settle(page, 800);
+    const gate = await gateState(page, '#mp-drag-pans');
+    if (!gate.present || !gate.visible) return 'absent — #mp-drag-pans not visible';
+    const svg = await page.locator('#mp-svg').boundingBox();
+    if (!svg) return 'absent — no map canvas';
+    const before = await page.evaluate(() => (document.querySelector('#mp-svg > g') || {}).getAttribute?.('transform') || '');
+    await page.check('#mp-drag-pans');
+    const x = svg.x + svg.width - 40, y = svg.y + svg.height - 40;
+    await page.mouse.move(x, y); await page.mouse.down();
+    await page.mouse.move(x - 80, y - 60, { steps: 6 }); await page.mouse.up();
+    await settle(page, 300);
+    const after = await page.evaluate(() => (document.querySelector('#mp-svg > g') || {}).getAttribute?.('transform') || '');
+    const rubber = await page.evaluate(() => { const r = document.querySelector('.mp-rubber'); return r ? r.style.display : 'none'; });
+    await shoot(page, dir, shot('feature', 'mapper-drag-pans'));
+    await page.uncheck('#mp-drag-pans');
+    const labels = await page.locator('#mp-svg .mp-link-label').count().catch(() => 0);
+    if (before && before === after) throw new Error('drag with Drag pans ticked did not pan');
+    if (rubber && rubber !== 'none') throw new Error('rubber band drawn while Drag pans was ticked');
+    return `panned (${before || 'none'} -> ${after || 'none'}), ${labels} link label(s)`;
+  });
 
   // ---- Edit device (data-requires-write="nodes"), opened and immediately
   // Cancelled — nodes.js:2800 bails without a selected device, so this
@@ -757,6 +812,44 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
     if (rows && ipLines !== rows) throw new Error(`${rows} rows but ${ipLines} carry an IP line`);
     if (rows && !headers.some((h) => /firmware/i.test(h))) throw new Error('no Firmware column');
     return `${rows} row(s), ${ipLines} with an IP line, columns=${headers.join('|')}`;
+  });
+
+  // ---- 5.16.0 IPAM: hosts carry Seen by / Switch port, conflicts name the
+  // device source, a DHCP scope card counts addresses in use but not leased.
+  await guarded(recorder, step('feature:ipam-host-sources'), async () => {
+    await selectTab(page, 'ipam');
+    await page.click('#page-ipam .subtab[data-subtab="subnets"]').catch(() => {});
+    await settle(page, 600);
+    const subnets = await page.locator('#page-ipam .subnet-row').count().catch(() => 0);
+    if (!subnets) return 'absent — no IPAM subnets seeded';
+    await page.click('#page-ipam .subnet-row >> nth=0').catch(() => {});
+    await settle(page, 800);
+    const headers = await page.locator('#ipam-hosts-table thead th').allTextContents().catch(() => []);
+    await shoot(page, dir, shot('feature', 'ipam-host-sources'));
+    for (const want of ['Seen by', 'Switch port']) {
+      if (!headers.some((h) => h.includes(want))) throw new Error(`hosts table lacks a ${want} column`);
+    }
+    return `columns=${headers.join('|')}`;
+  });
+  await guarded(recorder, step('feature:ipam-conflict-sources'), async () => {
+    await page.click('#page-ipam .subtab[data-subtab="conflicts"]').catch(() => {});
+    await settle(page, 600);
+    const sources = await page.locator('#ipam-conflicts-table tbody tr td:nth-child(4)').allTextContents().catch(() => []);
+    await shoot(page, dir, shot('feature', 'ipam-conflict-sources'));
+    return `${sources.length} conflict(s): ${[...new Set(sources)].join('; ').slice(0, 160)}`;
+  });
+  await guarded(recorder, step('feature:dhcp-static-in-scope'), async () => {
+    await page.click('#page-ipam .subtab[data-subtab="dhcp"]').catch(() => {});
+    await settle(page, 600);
+    const scopes = await page.locator('#ipam-dhcp-scope-table .subnet-row').count().catch(() => 0);
+    if (!scopes) return 'absent — no DHCP scopes seeded';
+    await page.click('#ipam-dhcp-scope-table .subnet-row >> nth=0').catch(() => {});
+    await settle(page, 800);
+    const text = await page.locator('#ipam-scope-detail').innerText().catch(() => '');
+    await shoot(page, dir, shot('feature', 'dhcp-static-in-scope'));
+    if (!/In use, not leased/.test(text)) throw new Error('scope card has no "In use, not leased" line');
+    const m = text.match(/In use, not leased\s*(\d+)/);
+    return `in use, not leased = ${m ? m[1] : '?'}`;
   });
 
   // ---- OID browser (needs a selected device; nodes.js:1253 bails without

@@ -6223,9 +6223,16 @@ class NodePoller(Worker):
         # one row per lane, so a port can have several of the same root.
         per_port: dict[tuple[int, str], list[float]] = {}
         optic_ports: set[int] = set()
-        # Sensor index suffix -> the (ifIndex, root) its published limits
-        # belong to. See _poll_optic_thresholds.
+        # Sensor index suffix -> the (index, root) its published limits
+        # belong to. See _poll_published_thresholds.
         threshold_roots: dict[str, tuple] = {}
+        # entPhysicalIndex (as its own suffix string) -> reading, for every
+        # chassis-classified (not port-mapped, not ambient) temperature row
+        # -- the per-sensor sibling of the chassis_temps worst-of below, and
+        # the reason those rows are also in threshold_roots: a chassis
+        # sensor publishes its own limits through the same
+        # entSensorThresholdTable an optic does.
+        chassis_sensor_temps: dict[str, float] = {}
         for suffix, raw in sensor_values.items():
             sensor_type = int(types.get(suffix) or 0)
             try:
@@ -6267,14 +6274,16 @@ class NodePoller(Worker):
                     ambient_temps.append(value)
                 else:
                     chassis_temps.append(value)
+                    chassis_sensor_temps[suffix] = value
+                    threshold_roots[suffix] = (entity, "temp_sensor_c")
             if if_index is None or root is None:
                 continue
             if root == "sfp_bias_ma":
                 value *= self._BIAS_A_TO_MA
             per_port.setdefault((if_index, root), []).append(value)
 
-        self._poll_optic_thresholds(device_id, device, config, threshold_roots,
-                                    scales, precisions, now)
+        self._poll_published_thresholds(device_id, device, config, threshold_roots,
+                                        scales, precisions, now)
 
         # Worst (hottest/most humid) sensor of each kind wins — "the hot
         # spot is what matters", the same reasoning VENDOR_HEALTH's
@@ -6298,6 +6307,14 @@ class NodePoller(Worker):
         if humidities:
             samples.append(("humidity_pct", "Humidity", "%RH", "gauge", now,
                             max(humidities)))
+        # Per-sensor chassis temperature, alongside the worst-of temp_chassis_c
+        # above -- alertrules.SENSOR_FAMILIES treats temp_sensor_c.<idx> as a
+        # child entity of its own, so a hot supervisor and a hot PSU alert
+        # separately rather than one worst-of figure hiding the other.
+        for suffix, value in sorted(chassis_sensor_temps.items()):
+            label = (names.get(suffix) if names else None)                 or descrs.get(suffix) or f"Sensor {suffix}"
+            samples.append((f"temp_sensor_c.{suffix}", f"{label} temperature",
+                            "°C", "gauge", now, value))
         # Light levels take the LOWEST lane (the failing one on a multi-lane
         # optic is the dim one); everything else takes the highest, the same
         # "hot spot wins" rule the device keys above use.
