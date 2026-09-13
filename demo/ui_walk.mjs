@@ -856,6 +856,13 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
     return `in use, not leased = ${m ? m[1] : '?'}`;
   });
 
+  // ---- The IPAM steps above leave the walk on IPAM; the four Nodes
+  // dialogs below need Nodes > Devices with a row selected.
+  await selectTab(page, 'nodes');
+  await page.click('#page-nodes .subtab[data-subtab="devices"]').catch(() => {});
+  await page.click('#nodes-table tbody tr:first-child').catch(() => {});
+  await settle(page, 400);
+
   // ---- OID browser (needs a selected device; nodes.js:1253 bails without
   // one). Not write-gated in the markup.
   await guarded(recorder, step('dlg:oid-browser'), async () => {
