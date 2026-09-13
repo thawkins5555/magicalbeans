@@ -201,7 +201,14 @@ next four Nodes dialog steps could not find the button they were
 looking for. The walk now returns to Nodes › Devices, with a row
 selected, before those steps run.
 
-Verification: (filled by Bob)
+Verification: full suite run once, alone: 155 of 162 suites passed; six
+failures are the known environmental ones (ipam_dhcp_temp,
+palo_alto_polling, selfupdate_job, service_shutdown, snmpv3_diagnostics,
+temppath) and the seventh (web_security D23, the connection-ceiling
+socket timing) passes when run alone and on the 5.16.0 base. Reviewed by
+Javariius (approved; two precision items applied). The 60-device browser
+walk of the Nodes and Syslog pages was still running at push time, on the
+operator's instruction; its result is reported separately.
 
 ### 5.16.0 — Profile overrides, device-fed IPAM, per-sensor thresholds, power supplies
 
