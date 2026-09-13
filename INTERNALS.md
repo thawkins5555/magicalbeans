@@ -2033,6 +2033,21 @@ samples can still zoom back out. In/out interface metric pairs
 picker option (`pair:<inId>:<outId>`) client-side; the storage and
 series API stay strictly one-metric-per-id.
 
+**From 5.17.0, `drawSeriesChart` draws a hover layer on top of the
+polylines** — a transparent full-plot `<rect>`, a vertical guide line and
+one dot per series, hidden until pointer movement. On `mousemove` it finds
+the nearest sample by x (binary search on the first series' timestamps,
+then the same or nearest timestamp per other series) and calls the shared
+`App.tooltip([...], event)` (`app.js`) with the sample time
+(`App.when(ts)`) and one swatched row per series — label, `formatMetricValue`
+— plus the min–max band for a rollup point; `mouseleave` hides both the
+tooltip and the guide. The rect sits inside the same `<svg>` the wheel-zoom
+handler is attached to, so it adds no new listener surface for that "timeframe
+doesn't scale" bug to recur in. This is the one renderer both the Device
+Details charts and the interface dialog share, so all of them gained the
+hover the same way; an `opts.noHover` escape exists for a caller that wants
+none, unused today.
+
 **Chart smoothing** (`nodes.js movingAverage`): a centered moving
 average applied when the Smoothed checkbox is on (`opts.smooth`), before
 peak/axis computation so the Y scale reflects what's actually plotted.
@@ -3280,6 +3295,19 @@ an engineer to the core switch for an access-port problem. `nodes.js`
 decides from the count: exactly one (device, port) opens that port's
 dialog, several are listed as clickable hits.
 
+**From 5.17.0, `_device_where`'s MAC subquery excludes uplink sightings from
+the match itself**, rather than merely labelling them: it adds
+`AND NOT EXISTS (SELECT 1 FROM neighbors nb WHERE nb.device_id =
+mac_entries.device_id AND nb.if_index = mac_entries.if_index AND
+nb.present = 1)`, so a switch whose only sighting is on a port with a
+present LLDP/CDP neighbour drops out of both the Find box list and
+`devices_count` (which shares `_device_where`); a switch that also saw the
+address on an access port is unaffected. `mac_locations` keeps every row —
+it answers "where was this ever seen", not "where does it matter" — but
+now returns that same EXISTS as an `uplink` column, plus `uplink_to` (the
+neighbour's resolved name) for the note below the table and the wording
+`nodes.js`'s `resolveMacSearch` and the global search's MAC group both use.
+
 `replace_mac_entries` no longer deletes and reinserts a device's table on
 each walk. It marks every stored row for the device `present = 0`, then
 upserts this walk's rows back to `present = 1` with a fresh `seen_ts`
@@ -3658,6 +3686,19 @@ poller in the loop.
   `if_index` (`None` until now), the far-end's own `port_label()` in place
   of the raw string CDP sent across the cable, the union of protocols and
   VLANs, a native VLAN if the survivor had none, and the later `seen_ts`.
+- **From 5.17.0, LLDP rows carry a management address of their own.**
+  `nodeoids.LLDP_REM_MAN_ADDR_IF_SUBTYPE` (`1.0.8802.1.1.2.1.4.2.1.3`,
+  lldpRemManAddrTable) has no separate value column — the address lives in
+  the varbind's own OID suffix (`timeMark.localPort.remIndex.addrSubtype.
+  addrLen.addr…`) — so `_walk_lldp` walks it as an eighth column and parses
+  that suffix itself: subtype 1 (IPv4, length 4) decodes to dotted form,
+  subtype 2 (IPv6, length 16) to compressed form, and the first IPv4 found
+  wins over any IPv6 for a given `timeMark.localPort.remIndex` row. The
+  result lands in the existing `remote_address` column — no schema
+  change — which `replace_neighbors` already stored and which CDP rows
+  already populated from cdpCacheAddress; a device with no
+  lldpRemManAddrTable at all still yields neighbour rows, just with
+  `remote_address` empty as before.
 - **Address-identified neighbours are named above the SQL, not inside it.**
   `_NEIGHBOR_MATCH_SQL` matches on sysName and chassis MAC only, and stays
   that way: MAPPER keys its links off these raw rows, so widening the join
@@ -3701,6 +3742,20 @@ poller in the loop.
   endpoint that does not exist. Both subqueries stay on an index
   (`ix_interfaces_phys_addr_nocase` and the `(device_id, if_index)`
   autoindex respectively).
+- **From 5.17.0, `_NEIGHBOR_MATCH_SQL` also selects
+  `COALESCE(byname.ip, bymac.ip) AS matched_device_ip`**, so a matched row
+  carries the device's own IP alongside its name with no second lookup;
+  `_neighbor_json` passes it through, and `_resolve_neighbor_names` sets it
+  from `device["ip"]` for the address-identified case above, which matches
+  by IP rather than through this join. Both `neighbours_of` and
+  `all_neighbours` gain it. `nodes.js`'s `drawNeighborsTable` renders the
+  Remote device cell as two lines — the name, then `matched_device_ip` or
+  `remote_address` or an IP-literal chassis id, whichever is known —
+  collapsing to one line only when the name and the address are identical
+  text; the CSV export gained a `matched_device_ip` column to match. LLDP
+  rows carrying their own management address (above) also widens
+  `_neighbor_ip_candidates`'s matching, since a neighbour whose sysName
+  differs from its Nodes name can now match on address instead.
 - **VLANs on a link are the union of what each end's own port reports,
   never the intersection.** A trunk is only really usable for a VLAN both
   ends allow, so intersection looks like the "more correct" answer — but
@@ -6797,6 +6852,22 @@ Note the interaction with `analysis.PathNode.hostname_label`: it reports
 `"no PTR record"` when it is present but empty, so filling an entry is also
 what makes the hop count as *looked up* — which is correct, and a hop that is
 neither resolved nor managed still reads "resolving…".
+
+**From 5.17.0, the free-text search box resolves a device-name fragment
+too**, not only the dedicated Host filter. `_syslog_filters` (`api.py`)
+widens `_syslog_host_ips`'s single-entry memo into a small dict keyed by
+fragment (same 5 s TTL, capped at 8 entries) and, for each whitespace term
+of the free-text query that is three or more characters, resolves it with
+`_syslog_host_ips(service, term)` and attaches the addresses found as
+`filters["text_ips"] = {term: [ips]}`; a term that resolves to nothing
+carries no widening. `syslogdb.search` and the histogram bucket path share
+a new `_text_clause(text, text_ips)`: with no term resolved, behaviour is
+unchanged — FTS5 where indexable, else the LIKE scan. Once any term
+resolves, the query takes the scan shape (bounded by the time window like
+every scan) and that term's clause becomes `((cols LIKE …) OR l.source IN
+(…))`, chunked with `id_chunks` the same way the Host box already is; other
+terms keep their plain LIKE clauses, and a `*` suffix still works in the
+scan path.
 
 This lookup is **not** gated by the `resolve_sources` setting the way
 the Source column's separate `source_name` resolution still is — that

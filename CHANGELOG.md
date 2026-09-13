@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.17.0 — Uplink-clean Find box, chart tooltips, syslog name search, neighbour name and IP](#5170--uplink-clean-find-box-chart-tooltips-syslog-name-search-neighbour-name-and-ip)
 - [5.16.0 — Profile overrides, device-fed IPAM, per-sensor thresholds, power supplies](#5160--profile-overrides-device-fed-ipam-per-sensor-thresholds-power-supplies)
 - [5.15.0 — Software and firmware, for every catalog vendor](#5150--software-and-firmware-for-every-catalog-vendor)
 - [5.14.0 — The Nodes database, and what it keeps](#5140--the-nodes-database-and-what-it-keeps)
@@ -144,6 +145,63 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.17.0 — Uplink-clean Find box, chart tooltips, syslog name search, neighbour name and IP
+
+Four operator asks, each traced to a cause before anything was changed.
+
+**The Find box no longer lists a switch that only saw the MAC on its
+uplink.** A MAC on an uplink port is learned by every switch between
+here and the host, so a search used to list all of them, not just the
+one the address is actually plugged into. A switch whose only sighting
+of the address is on a port already known to face an LLDP/CDP neighbour
+is now excluded from the match, on both the results list and the count;
+a switch that also saw it on an access port still appears. The note
+below the table still lists every port a MAC was ever seen on — nothing
+is hidden, that is stated behaviour — but an uplink port is now worded
+"via uplink to *neighbour*" and access ports are listed first, so the
+port that actually matters is not lost among the switches it merely
+passed through. The global search's MAC group marks an uplink hit
+"(uplink)" the same way.
+
+**Device Details and pane line charts answer a hover with a number.**
+Every line chart — packet loss, the RESOURCES section, the per-port
+bandwidth chart, the RF chart — drew its lines and nothing else; reading
+an exact value meant guessing against the axis. Hovering (or, from the
+keyboard, focusing) any of them now shows the sample time and each
+series' own value at that point, with the same rollup min–max band the
+chart itself already draws when one is present. Wheel-zoom, panning and
+the existing keyboard access are unaffected.
+
+**Syslog's free-text search now finds a device by a fragment of its
+name, the way the Host box already does.** The Host column is often
+filled in at read time from Nodes or the reverse-DNS cache rather than
+stored on the message, so typing part of that name into the main Search
+box used to find nothing — exactly the case the dedicated Host box was
+fixed for in 5.9.0, and the free-text box never got the same fix. A term
+of three or more characters that resolves to a device now also matches
+every message from that device's known addresses, list and histogram
+alike, including log history already collected. A term that resolves to
+nothing behaves exactly as before.
+
+**Neighbours rows show the remote device's name and its IP, every
+row.** LLDP carries no management address in this application until
+now, so an LLDP neighbour could only ever be matched and named by its
+chassis id; CDP-only neighbours already had an address, and even a
+matched row only ever showed the device's name, not both. The LLDP walk
+now also reads `lldpRemManAddrTable` and stores the address it publishes
+for the port; a match — by name or by that address — now also carries
+the matched device's own IP. Every Neighbours row shows a name on one
+line and an address on the next, whichever sources found them, instead
+of one or the other.
+
+Also carried over from 5.16.0's close: the browser walk left the
+Devices dialog on the IPAM page after the IPAM feature steps, so its
+next four Nodes dialog steps could not find the button they were
+looking for. The walk now returns to Nodes › Devices, with a row
+selected, before those steps run.
+
+Verification: (filled by Bob)
 
 ### 5.16.0 — Profile overrides, device-fed IPAM, per-sensor thresholds, power supplies
 

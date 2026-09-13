@@ -1124,6 +1124,14 @@ to what the device actually reports, since it has no fixed ceiling to pin
 against. A metric this device has never reported — no chassis sensor, say —
 just leaves its chart out rather than showing an empty one.
 
+**From 5.17.0, every line chart answers a hover with a number.** The loss
+chart, RESOURCES, the per-port bandwidth chart and the RF chart drew lines
+and nothing else; reading an exact figure meant guessing against the axis.
+Hovering — or focusing the chart from the keyboard — now shows the sample
+time and each series' own value under the pointer, plus the rollup's
+min–max band wherever the chart is already drawing one. Wheel-zoom and
+panning are unaffected.
+
 **From 4.53.0, the device dialog also has a HARDWARE SENSORS section and a
 device-wide DOM / SFP SENSORS table.** HARDWARE SENSORS shows the latest
 polled CPU/memory/temperature figures, a live whole-device
@@ -1268,10 +1276,17 @@ three octets of a vendor OUI is a valid search. The list filters to the
 switches that have learned the address. When it resolves to exactly one
 switch and one port, that port's dialog opens; when it resolves to
 several, they are listed as a shortlist to pick from rather than one
-being chosen for you — a MAC seen on an uplink is on every switch between
-here and the host, which is the normal case, and guessing which one was
-meant sends someone to the wrong place. **A MAC no switch is holding right
-now** is not a dead end: the search says where and when it was last seen —
+being chosen for you. **From 5.17.0, a switch that only saw the address on
+an uplink port — a port already known to face an LLDP/CDP neighbour — is
+left off the list**, since that sighting says nothing about where the host
+actually plugs in; a switch that also saw it on an access port still
+appears. The note under the results still lists every port a MAC was ever
+seen on, uplink included — nothing is hidden — but words an uplink port
+"via uplink to *neighbour*" and lists access ports first, and the global
+search's MAC group marks an uplink hit "(uplink)" the same way.
+
+**A MAC no switch is holding right now** is not a dead end: the search
+says where and when it was last seen —
 "last seen on *switch* · *port* at *time*" — from forwarding-table history
 kept for the retention window, so an address that has gone quiet or moved
 still points somewhere.
@@ -1457,6 +1472,15 @@ From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
   makes the row a link like any other. Nothing is looked up live: the
   address is queued for the background reverse-lookup the rest of the
   application already runs, so a name appears once the cache has it.
+- **From 5.17.0, every NEIGHBOURS row shows a name and an address, not one
+  or the other.** LLDP carried no management address at all until now, so
+  an LLDP row could only ever be matched, or named, by its chassis id; a
+  matched row also only ever showed the device's name. The LLDP walk now
+  also reads the neighbour's management-address table, and a matched row
+  now carries that device's own IP as well as its name. The Remote device
+  cell shows the name on one line and the address on the next, from
+  whichever source found each one, instead of showing only whichever it
+  had.
 - **The device pane gains NEIGHBOURS and BRIDGE & RF sections.** NEIGHBOURS
   lists what that device's own ports have reported; BRIDGE & RF shows STP
   bridge and per-port state (BRIDGE-MIB) and, for a radio, RSSI, remote
@@ -2794,6 +2818,14 @@ A collector, a search, and an hourly histogram.
   mean are matched alongside those that self-reported the name. Partial
   names work, case does not matter, and it applies to log history already
   collected, since nothing had to be stored to make it work.
+- **From 5.17.0, the main Search box's free text does the same resolution.**
+  The Host-box fix above only ever widened the dedicated Host filter; typing
+  a fragment of a displayed device name into the free-text Search box still
+  found nothing, since the name is never stored on the message. A term of
+  three or more characters now resolves the same way — against Nodes'
+  device names and the reverse-DNS cache — and matches messages from any
+  address it could mean, in the list and in the histogram alike. A term
+  that resolves to nothing behaves exactly as before.
 - **The message table resizes**, the same way NetFlow's flow record table
   does. Drag the edge of a heading to widen or narrow the column; the
   widths are remembered per browser, and **Reset layout** on the Settings

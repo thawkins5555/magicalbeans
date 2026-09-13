@@ -528,3 +528,24 @@ the port dialog" — the dialog only ever waits on a live SNMP read.
   have been directed not to do so?" Thing2, running on Fable in error,
   was stopped and respawned on Sonnet; a memory note was written so
   every roster name is spawned with its assigned model from then on.
+
+## 5.17.0 — Find box uplink hits, chart tooltips, syslog name search, neighbour name + IP
+
+**"do not push to main - let me know when u are done and we will start the
+next work"** — a hold on `main`, to be lifted only once told.
+→ In force for this release; no push without a further instruction.
+
+**The 5.17.0 work prompt**, four items:
+
+1. Node search must not include LLDP entries that match.
+2. Device Details graphs need tooltips.
+3. Syslog cannot be searched for part of a host name.
+4. Neighbours tab should show the remote device name as well as its IP.
+→ Traced and planned before any agent started; see the planning answers below.
+
+**Planning answers** — the Find box case is a MAC search hitting
+uplink-learned entries; Neighbours rows show name and IP on every row;
+tooltips show the time and the value at the cursor; the syslog case is the
+free-text box, with the Host column already showing the Nodes name that
+free text could not search on.
+→ Plan approved; work assigned across the roster.
