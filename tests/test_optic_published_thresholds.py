@@ -204,12 +204,15 @@ try:
     limits = nodes.interface_thresholds(did)
     check("the port's optic limits are learned, one row per DOM root the "
           "device publishes a usable level for",
-          set(limits) == {(1, "sfp_rx_dbm"), (1, "sfp_tx_dbm"),
-                          (1, "sfp_temp_c"), (1, "sfp_bias_ma")},
+          {k for k in limits if k[1] != "temp_sensor_c"}
+          == {(1, "sfp_rx_dbm"), (1, "sfp_tx_dbm"),
+              (1, "sfp_temp_c"), (1, "sfp_bias_ma")},
           sorted(limits))
     check("the chassis inlet probe publishes thresholds too, and maps to no "
-          "port -- so it produces no row at all",
-          all(if_index == 1 for if_index, _root in limits), sorted(limits))
+          "port -- since 5.16.0 that is a temp_sensor_c row keyed by its own "
+          "entPhysicalIndex, never a port row",
+          all(if_index == 1 or root == "temp_sensor_c" for if_index, root in limits)
+          and any(root == "temp_sensor_c" for _i, root in limits), sorted(limits))
 
     # --- the decode proof. Tx is quoted units(9)/precision 1 and Rx
     # milli(8)/precision 0, so a threshold decoded against anything but its
@@ -298,7 +301,8 @@ try:
     config = nodes.effective_config(nodes.device(did))
     poller._poll_environment(did, nodes.device(did), config, set(), time.time())
     before = nodes.interface_thresholds(did)
-    check("limits are stored on the first pass", len(before) == 4, sorted(before))
+    check("limits are stored on the first pass",
+          len([k for k in before if k[1] != "temp_sensor_c"]) == 4, sorted(before))
 
     incomplete = [(dict(), False)] * 3
 
@@ -396,8 +400,8 @@ check("sfp_temp_high is untouched: only optical POWER moved to published "
       and ROLLED_UP_BY["sfp_temp_high"] == "device_down",
       dict(alerts.rule_by_key("sfp_temp_high")))
 check("every one of the eight is mapped to a (root, column) pair, and "
-      "nothing else is",
-      set(PUBLISHED_THRESHOLD_RULES) == set(EIGHT),
+      "nothing else is but 5.16.0's two per-sensor temperature rules",
+      set(PUBLISHED_THRESHOLD_RULES) == set(EIGHT) | {"temp_sensor_high", "temp_sensor_critical"},
       sorted(PUBLISHED_THRESHOLD_RULES))
 check("same_metric_pair recognises the new pairs and refuses an outage "
       "parent",
