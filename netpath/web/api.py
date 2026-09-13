@@ -9107,6 +9107,7 @@ def get_mapper_map(service, params, body, map_id) -> dict:
     # docstring) rather than pulling every device in the fleet to resolve a
     # dozen placements.
     devices_by_id = {row["id"]: row for row in service.nodes_db.devices_by_ids(device_ids)}
+    dns_names = service.app_db.hostnames(row["ip"] for row in devices_by_id.values())
 
     settings = service.mapper_settings
     badge_temp = bool(settings.get("badge_temp"))
@@ -9227,11 +9228,13 @@ def get_mapper_map(service, params, body, map_id) -> dict:
                 "temp_c": None, "cpu_pct": None, "port_count": None,
             })
             continue
-        name, resolved_name = _mapper_node_name(row["label"], namelookup.device_name(device))
+        resolved, name_source = reportmod.device_label(device, dns_names)
+        name, resolved_name = _mapper_node_name(row["label"], resolved)
         role, role_auto = _mapper_node_role(row, unmanaged=False, device=device)
         nodes.append({
             "id": row["id"], "device_id": device_id, "peer_key": "",
             "label": row["label"], "name": name, "resolved_name": resolved_name,
+            "name_source": name_source,
             "role": role, "role_auto": role_auto, "x": row["x"], "y": row["y"],
             "status": device["status"], "ip": device["ip"], "unmanaged": False,
             "missing": False,

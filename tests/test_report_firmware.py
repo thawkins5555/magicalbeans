@@ -154,6 +154,14 @@ check("with neither a name nor a sysName, reverse-DNS supplies the label",
       row.name_source == "dns" and row.device == "host4.example.net (10.1.1.4)",
       row)
 
+ip_named = db.add_device("10.1.1.6")
+row = report.firmware_inventory(
+    db, [ip_named], dns_names={"10.1.1.6": "host6.example.net"}).rows[0]
+check("add_device's default name (the IP itself) is not a manual name, so "
+      "reverse-DNS still wins over it",
+      row.name_source == "dns" and row.device == "host6.example.net (10.1.1.6)",
+      row)
+
 bare_ip = db.add_device("10.1.1.5")
 set_fields(db, bare_ip, name="")
 row = report.firmware_inventory(db, [bare_ip]).rows[0]

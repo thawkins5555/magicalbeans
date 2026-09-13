@@ -761,6 +761,30 @@ check(not mapper_ungated,
       "every write control in mapper.js's own markup carries "
       "data-requires-write=\"mapper\" (missing: %s)" % (", ".join(mapper_ungated) or "none"))
 
+# 28d. 5.16.0 mapper legibility: port/VLAN labels live in their own layer
+#      above every link and carry a canvas-coloured halo; the node box is
+#      wider with a longer name cut; a Drag pans checkbox turns left-drag on
+#      empty canvas into a pan and is a per-browser preference, not a write.
+INDEX_HTML = read("index.html")
+check("group.append(gridLayer, linkLayer, labelLayer, nodeLayer)" in MAPPER,
+      "the label layer sits between links and nodes")
+check("function drawLink(layer, link, labelLayer = layer)" in MAPPER
+      and MAPPER.count("labelLayer.appendChild(App.svgNode('text'") == 2
+      and "drawPortLabels(labelLayer, link" in MAPPER,
+      "every link label is appended to the label layer, none to the link holder")
+check("paint-order: stroke; stroke: var(--canvas)" in APP_CSS,
+      "link labels carry a canvas-coloured halo")
+check("'paint-order'" in MAPPER, "the PNG export inlines the halo's paint-order")
+check("const NODE_W = 176" in MAPPER and "truncate(info.name, 24)" in MAPPER,
+      "the node box is wider and shows more of the name")
+check('id="mp-drag-pans"' in INDEX_HTML and 'data-requires-write' not in
+      INDEX_HTML[INDEX_HTML.index('id="mp-drag-pans"') - 120:INDEX_HTML.index('id="mp-drag-pans"')],
+      "the Drag pans checkbox exists and is not a write control")
+check("if (view.dragPans) {" in MAPPER and "localStorage.getItem('mapper.dragPans')" in MAPPER,
+      "left-drag pans when the box is ticked and the choice is remembered per browser")
+check("NAME_SOURCES" in MAPPER and "node.name_source" in MAPPER,
+      "the node tooltip names the source of the displayed name")
+
 # ---------------------------------------------------------------------------
 # 29. The device dialog's RESOURCES section (CPU, memory, chassis
 #     temperature) shares the packet-loss chart's one /metrics fetch and

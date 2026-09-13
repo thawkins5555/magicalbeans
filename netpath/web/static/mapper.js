@@ -24,7 +24,7 @@
      rubber-band hit-testing, link endpoints, align/distribute) is simpler
      around a centre than a corner. Every read and write of x/y in this
      file agrees, so the convention only has to be right once. */
-  const NODE_W = 132, NODE_H = 54;
+  const NODE_W = 176, NODE_H = 54;
   const ICON = 16;   // the role glyph's own viewBox is 16x16
   // Position writes are debounced rather than sent on every pointermove —
   // a drag across a big map would otherwise queue one PUT per animation
@@ -88,6 +88,8 @@
     rubberEl: null,
     nodeEls: new Map(),        // map_nodes id -> its <g>
     linkEls: new Map(),        // link id -> the <g> holding that link's own elements
+    linkLabelEls: new Map(),   // link id -> its port/VLAN labels, drawn above every link
+    dragPans: false,           // the Drag pans checkbox: left-drag on empty canvas pans
     settings: {},        // mapperdb.DEFAULTS shape, refreshed with every maps/settings fetch
     candidates: { devices: [], neighbours: [] },
 
@@ -246,6 +248,10 @@
      the detail pane and the CSV export can never disagree about what a
      renamed node is called; `resolved_name` carries the underlying identity
      alongside it for anywhere that wants to say what the rename replaced. */
+  const NAME_SOURCES = {
+    manual: 'manual name', sysName: 'SNMP sysName', dns: 'reverse DNS', ip: 'address only',
+  };
+
   function resolveNode(node) {
     // Defensive only: drawLink already skips a link whose endpoint cannot
     // be found on this map, so a null here would mean map data changed
@@ -282,7 +288,8 @@
     return {
       node, name, sub: node.ip || '', tone, unmanaged: false, gone: false,
       role: node.role || '', badges,
-      tooltip: `${name}\n${node.ip || ''}\nStatus    ${statusWord}`,
+      tooltip: `${name}\n${node.ip || ''}\nStatus    ${statusWord}` +
+        (node.name_source ? `\nName      ${NAME_SOURCES[node.name_source] || node.name_source}` : ''),
     };
   }
 
@@ -716,7 +723,7 @@
     return name ? `${vlanId} (${name})` : `${vlanId}`;
   }
 
-  function drawLink(layer, link) {
+  function drawLink(layer, link, labelLayer = layer) {
     const a = linkNodeA(link), b = linkNodeB(link);
     if (!a || !b) return;   // an end not placed on THIS map: server already filters this out, belt-and-braces
     const pa = livePos(a), pb = livePos(b);
@@ -775,7 +782,7 @@
       layer.appendChild(path);
       return path;
     };
-    if (view.settings.show_port_labels) drawPortLabels(layer, link, from, to, nx, ny);
+    if (view.settings.show_port_labels) drawPortLabels(labelLayer, link, from, to, nx, ny);
     if (plan.mode === 'strands' && plan.strands.length) {
       // Finding 9: every strand used to get the identical aria-label/tooltip
       // (the link's own, naming no VLAN at all), so colour was the ONLY way
@@ -812,7 +819,7 @@
             tooltip: () => strandTooltip(link, strand),
           });
         if (view.settings.show_vlan_labels) {
-          layer.appendChild(App.svgNode('text', {
+          labelLayer.appendChild(App.svgNode('text', {
             class: 'mp-link-label', x: (from.x + to.x) / 2 + ox, y: (from.y + to.y) / 2 + oy - 3,
             'text-anchor': 'middle',
           }, `${strand.vlan}`));
@@ -827,7 +834,7 @@
     wireOne(path, plan.known === false ? 'unknown' : null);
     if (plan.mode === 'collapsed' && view.settings.show_vlan_labels) {
       const mx = (from.x + to.x) / 2, my = (from.y + to.y) / 2;
-      layer.appendChild(App.svgNode('text', {
+      labelLayer.appendChild(App.svgNode('text', {
         class: 'mp-link-label', x: mx, y: my - 4, 'text-anchor': 'middle',
       }, `${plan.vlan_count} VLANs`));
     }
@@ -967,10 +974,10 @@
     }
     const nameNode = App.svgNode('text', {
       class: 'mp-node-label', x: 30, y: 22,
-    }, truncate(info.name, 16));
+    }, truncate(info.name, 24));
     g.appendChild(nameNode);
     if (info.sub) {
-      g.appendChild(App.svgNode('text', { class: 'mp-node-sub', x: 30, y: 36 }, truncate(info.sub, 20)));
+      g.appendChild(App.svgNode('text', { class: 'mp-node-sub', x: 30, y: 36 }, truncate(info.sub, 26)));
     }
     // Badges: only ever present when the matching setting is on (the
     // server nulls each one out otherwise, see get_mapper_map), so no
@@ -1108,7 +1115,9 @@
       const holder = view.linkEls.get(link.id);
       if (!holder) continue;
       holder.textContent = '';
-      drawLink(holder, link);
+      const labels = view.linkLabelEls.get(link.id);
+      if (labels) labels.textContent = '';
+      drawLink(holder, link, labels || holder);
     }
   }
 
@@ -1149,6 +1158,7 @@
     view.rubberEl = null;
     view.nodeEls = new Map();
     view.linkEls = new Map();
+    view.linkLabelEls = new Map();
 
     if (!view.mapId) {
       return emptyCanvas(svg, canvas, 'No map selected. Use Maps to create or pick one.');
@@ -1182,15 +1192,19 @@
     const group = App.svgNode('g');
     const gridLayer = App.svgNode('g');
     const linkLayer = App.svgNode('g');
+    const labelLayer = App.svgNode('g');
     const nodeLayer = App.svgNode('g');
-    group.append(gridLayer, linkLayer, nodeLayer);
+    group.append(gridLayer, linkLayer, labelLayer, nodeLayer);
     if (shouldDrawGrid() && bounds) drawGrid(gridLayer, bounds);
     // Own <g> per link: redrawDragged refills just the ones that moved.
     for (const link of view.links) {
       const holder = App.svgNode('g');
       linkLayer.appendChild(holder);
       view.linkEls.set(link.id, holder);
-      drawLink(holder, link);
+      const labels = App.svgNode('g');
+      labelLayer.appendChild(labels);
+      view.linkLabelEls.set(link.id, labels);
+      drawLink(holder, link, labels);
     }
     for (const node of view.nodes) view.nodeEls.set(node.id, drawNode(nodeLayer, node));
 
@@ -1635,6 +1649,14 @@
     // here instead, or pressing down on one and moving a couple of pixels
     // before release would start a rubber-band from under a click.
     if (event.target.closest('.mp-node') || event.target.closest('.mp-link')) return;
+    if (view.dragPans) {
+      event.preventDefault();
+      focusCanvas();
+      event.currentTarget.setPointerCapture(event.pointerId);
+      view.panDrag = { x: event.clientX, y: event.clientY, pan: { ...view.pan } };
+      App.el('mp-svg').classList.add('dragging');
+      return;
+    }
     // Empty canvas: start a rubber-band multi-select.
     const p = scenePoint(event);
     if (!p) return;
@@ -1993,7 +2015,7 @@
   function inlineComputedColors(liveRoot, cloneRoot) {
     const liveEls = liveRoot.querySelectorAll('*');
     const cloneEls = cloneRoot.querySelectorAll('*');
-    const props = ['fill', 'stroke', 'color', 'stop-color'];
+    const props = ['fill', 'stroke', 'color', 'stop-color', 'stroke-width', 'paint-order', 'stroke-linejoin'];
     // Only the CLONE is touched — the live, on-screen canvas must come out
     // of an export exactly as it went in, background included.
     cloneRoot.style.background = getComputedStyle(App.el('mp-canvas')).backgroundColor;
@@ -2144,6 +2166,12 @@
     App.el('mp-zoom-out').onclick = () => zoomBy(1 / 1.25);
     App.el('mp-export-png').onclick = exportPng;
     App.el('mp-export-csv').onclick = exportCsvClick;
+    try { view.dragPans = localStorage.getItem('mapper.dragPans') === '1'; } catch (error) { view.dragPans = false; }
+    App.el('mp-drag-pans').checked = view.dragPans;
+    App.el('mp-drag-pans').onchange = (event) => {
+      view.dragPans = event.target.checked;
+      try { localStorage.setItem('mapper.dragPans', view.dragPans ? '1' : '0'); } catch (error) { /* per-browser convenience only */ }
+    };
     App.el('mp-snap').onchange = async (event) => {
       await App.post('/api/settings', { scope: 'mapper', values: { snap_to_grid: event.target.checked } });
       view.settings.snap_to_grid = event.target.checked;

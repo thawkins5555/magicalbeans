@@ -1810,7 +1810,8 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
    hiding them outright, so the rest of the topology stays legible while
    the chosen VLAN's path stands out from it. */
 .mp-link.dimmed { opacity: 0.22; }
-.mp-link-label { fill: var(--canvas-muted); font-family: var(--mono); font-size: var(--fs-2xs); }
+.mp-link-label { fill: var(--canvas-muted); font-family: var(--mono); font-size: var(--fs-2xs);
+  paint-order: stroke; stroke: var(--canvas); stroke-width: 3px; stroke-linejoin: round; }
 
 /* The grid: drawn only when snap-to-grid is on or the style calls for it
    (mapper.js's shouldDrawGrid decides which); the per-style strength of

@@ -447,6 +447,8 @@ def device_label(row, dns_names: dict) -> tuple[str, str]:
     an operator would trust the fleet's own facts in."""
     ip = row["ip"]
     name = row["name"] or ""
+    if name == ip:
+        name = ""
     if row["display_name_source"] == "manual" and name:
         return name, "manual"
     if row["sys_name"]:

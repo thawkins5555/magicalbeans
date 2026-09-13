@@ -219,6 +219,10 @@ try:
           status == 200 and next(n for n in payload["nodes"] if n["id"] == node_a)["ip"]
           == "192.0.2.10", payload)
     node_a_json = next(n for n in payload["nodes"] if n["id"] == node_a)
+    check("a device node says where its name came from (5.16.0: manual name, "
+          "sysName, reverse DNS or the bare address)",
+          node_a_json.get("name_source") == "manual" and node_a_json["name"] == "Switch A",
+          node_a_json)
     check("a node with no role override reports a role detected from its "
           "vendor/sysDescr (Gap 1)", node_a_json.get("role") == "firewall", node_a_json)
     check("...and role_auto is True when the operator has not overridden it",
