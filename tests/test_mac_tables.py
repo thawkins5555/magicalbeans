@@ -213,6 +213,31 @@ try:
           len(ordered) == 2 and ordered[0]["present"] == 1
           and not ordered[1]["present"], [dict(r) for r in ordered])
 
+    check("mac_locations rows carry uplink/uplink_to, both false/None off an "
+          "access port", all(l["uplink"] == 0 and l["uplink_to"] is None
+                             for l in ordered), [dict(r) for r in ordered])
+
+    # A present neighbour on if_index 9 turns that same port into an uplink.
+    db.replace_neighbors(did, [
+        {"if_index": 9, "protocol": "lldp", "rem_index": "1",
+         "sys_name": "core-sw-1", "chassis_id": "aabbccddee00",
+         "chassis_id_subtype": 4},
+    ], now=order_ts + 2.0)
+    db.replace_mac_entries(did, [
+        {"if_index": 8, "mac": "00:1a:2b:00:00:03", "vlan": ""},
+    ], now=order_ts + 2.0)
+    uplinked = db.mac_locations("001a2b")
+    on9 = [l for l in uplinked if l["if_index"] == 9]
+    on8 = [l for l in uplinked if l["if_index"] == 8]
+    check("a port with a present neighbour is flagged uplink, named by sys_name",
+          on9 and all(l["uplink"] == 1 and l["uplink_to"] == "core-sw-1"
+                      for l in on9), [dict(r) for r in on9])
+    check("an access port stays uplink=0",
+          on8 and all(l["uplink"] == 0 and l["uplink_to"] is None
+                      for l in on8), [dict(r) for r in on8])
+    check("access ports (uplink=0) sort before uplink ports",
+          uplinked[-1]["if_index"] == 9, [dict(r) for r in uplinked])
+
     # A MAC moving port: stale on the old port, present on the new one.
     walk3_ts = walk2_ts + 60.0
     db.replace_mac_entries(did, [{"if_index": 1, "mac": "aa:bb:cc:dd:ee:ff",

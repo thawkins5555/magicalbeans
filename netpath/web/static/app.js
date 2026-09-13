@@ -2245,6 +2245,7 @@ const App = (() => {
             name: formatMac(loc.mac),
             meta: [`${loc.device_name} · ${loc.if_descr}`,
                    loc.vlan ? `VLAN ${loc.vlan}` : '',
+                   loc.uplink ? 'uplink' : '',
                    loc.present ? 'present' : 'aged out',
                    loc.seen_ts ? `last seen ${when(loc.seen_ts)} (${ago(loc.seen_ts)})` : '']
               .filter(Boolean).join(' · '),

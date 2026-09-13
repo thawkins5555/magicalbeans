@@ -2766,6 +2766,12 @@ check('<div class="ip-line">' in _NB52,
 check("'(not in Nodes)'" in _NB52 or "(not in Nodes)" in _NB52,
       "...while still saying plainly that the neighbour is not a Nodes device")
 
+# 52a. 5.17.0: a MATCHED row also carries a visible IP line (its device's
+#      own IP), not just its name — the same two-line cell either way.
+check("r.matched_device_ip" in _NB52,
+      "a matched neighbour row's Remote device cell also shows the matched "
+      "device's IP, on its own ip-line, not the name alone")
+
 # --- 53. 5.11.0: the Debug log resyncs itself after a server restart ---------
 DEBUG52 = read("debug.js")
 check("payload.last_seq < view.seq" in DEBUG52,
@@ -2968,6 +2974,35 @@ check("stored: 1" in _between or "stored:1" in _between,
 _second_call_line = NODES58[_second_mac:_second_mac + 80]
 check("stored" not in _second_call_line,
       "...and the SECOND (live) fetch carries no stored=1 param")
+
+# --- 59. 5.17.0: every line chart carries a hover readout ------------------
+NODES59 = read("nodes.js")
+_hover = NODES59.find("function attachChartHover(")
+check(_hover != -1, "nodes.js defines attachChartHover for drawSeriesChart")
+check("if (!opts.noHover) attachChartHover(" in NODES59,
+      "drawSeriesChart attaches the hover layer unless a caller opts out")
+_hover_body = NODES59[_hover:_hover + 3000]
+check("class: 'chart-hover'" in _hover_body,
+      "the hover layer is a full-plot rect.chart-hover, the walk's hook")
+check("addEventListener('mousemove'" in _hover_body
+      and "App.tooltip([{ text: App.when(anchor) }" in _hover_body,
+      "mousemove shows App.tooltip with the sample time as its first row")
+check("addEventListener('mouseleave', hide)" in _hover_body
+      and "App.hideTooltip()" in _hover_body,
+      "mouseleave hides the tooltip and the guide")
+check("formatMetricValue(unit, p.min)" in _hover_body,
+      "rollup points show their min-max band beside the average")
+
+# --- 60. 5.17.0: the Find box words an uplink-learned MAC hit as such -------
+NODES60 = read("nodes.js")
+_RESOLVE60 = NODES60[NODES60.index("  async function resolveMacSearch("):]
+_RESOLVE60 = _RESOLVE60[:_RESOLVE60.index("\n  async function openPort(")]
+check("via uplink to" in _RESOLVE60,
+      "resolveMacSearch words an uplink-learned MAC hit as 'via uplink to "
+      "<neighbour>', not a plain port name indistinguishable from an "
+      "access-port hit")
+check("loc.uplink" in _RESOLVE60 and "loc.uplink_to" in _RESOLVE60,
+      "...reading the uplink/uplink_to fields the mac-search API returns")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

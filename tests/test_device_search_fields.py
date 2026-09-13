@@ -128,6 +128,42 @@ r = db.devices(text="aabbccddeeff")
 check("MAC-table search is unchanged",
       names(r) == ["acc-sw-114"], names(r))
 
+# ------------------------------------------------ uplink-learned MACs excluded
+#
+# A MAC on an uplink is learned by every switch between here and the host —
+# matching the device on it turns a Find-box hit into a shuffle of every
+# switch in the path. A present neighbour on that (device, if_index) marks
+# it an uplink; a stale one does not.
+db._conn.execute(
+    "INSERT INTO mac_entries(device_id, if_index, mac, seen_ts, present)"
+    " VALUES (?, 1, 'aabbccdd0001', ?, 1)", (cisco_id, 1e9))
+db._conn.commit()
+db.replace_neighbors(cisco_id, [
+    {"if_index": 1, "protocol": "lldp", "rem_index": "1",
+     "sys_name": "core-sw-9", "chassis_id": "112233445566",
+     "chassis_id_subtype": 4},
+])
+r = db.devices(text="aabbccdd0001")
+check("a MAC on a port with a present neighbour no longer matches the device",
+      r == [], names(r))
+check("...and devices_count agrees", db.devices_count(text="aabbccdd0001") == 0,
+      db.devices_count(text="aabbccdd0001"))
+
+db._conn.execute(
+    "INSERT INTO mac_entries(device_id, if_index, mac, seen_ts, present)"
+    " VALUES (?, 2, 'aabbccdd0002', ?, 1)", (cisco_id, 1e9))
+db._conn.commit()
+r = db.devices(text="aabbccdd0002")
+check("a MAC on an access port (no neighbour) still matches",
+      names(r) == ["acc-sw-114"], names(r))
+
+db.replace_neighbors(cisco_id, [])  # ages the neighbour row: present -> 0
+r = db.devices(text="aabbccdd0001")
+check("a stale (aged-out) neighbour row does not exclude the port",
+      names(r) == ["acc-sw-114"], names(r))
+check("...and devices_count agrees", db.devices_count(text="aabbccdd0001") == 1,
+      db.devices_count(text="aabbccdd0001"))
+
 r = db.devices()
 check("no text filter still returns every device",
       names(r) == ["acc-sw-114", "ind-switch-01", "printer-hp-01"], names(r))

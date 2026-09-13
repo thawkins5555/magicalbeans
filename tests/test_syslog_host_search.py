@@ -133,6 +133,39 @@ try:
     check("a name known only to the DNS cache finds its address",
           sources == ["10.20.9.8"], sources)
 
+    # ---- the free-text Search box gets the same widening as the Host box ----
+
+    # A second message from core-sw-01 whose stored host is the source IP
+    # rather than blank, so both of the shapes the Host column papers over
+    # (missing, or filled in with the IP) are covered by one fragment.
+    service.syslog_db.insert([
+        LogEntry(ts=now - 15, source="10.20.3.4", host="10.20.3.4",
+                 message="critical error"),
+    ])
+
+    status, payload = call(f"/api/syslog/search?{window}&q=core-sw", token)
+    sources = sorted(m.get("source") for m in payload.get("messages", []))
+    check("a free-text fragment of the resolved name finds a blank-host row",
+          "10.20.3.4" in sources and len(sources) == 2, sources)
+
+    status, payload = call(f"/api/syslog/search?{window}&q=core-sw+error", token)
+    sources = [m.get("source") for m in payload.get("messages", [])]
+    messages = [m.get("message") for m in payload.get("messages", [])]
+    check("a two-term free-text search requires both terms",
+          sources == ["10.20.3.4"] and messages == ["critical error"],
+          (sources, messages))
+
+    status, payload = call(f"/api/syslog/search?{window}&q=nothing-like-any-name", token)
+    check("a free-text fragment matching no device and no content returns nothing",
+          payload.get("messages") == [], payload.get("messages"))
+
+    status, overview = call(f"/api/syslog/overview?{window}&q=core-sw", token)
+    status, listing = call(f"/api/syslog/search?{window}&q=core-sw", token)
+    hist_total = sum(b["total"] for b in overview.get("buckets", []))
+    check("the histogram agrees with the list for the widened free-text search",
+          hist_total == len(listing.get("messages", [])),
+          (hist_total, len(listing.get("messages", []))))
+
     # The overrides contract the Nodes table reads.
     status, payload = call("/api/nodes/devices?limit=10", token)
     devices = payload.get("devices", []) if status == 200 else []

@@ -1835,7 +1835,11 @@ class NodesDatabase(SqliteStore):
                 clauses.append(
                     f"({text_sql}"
                     " OR id IN (SELECT device_id FROM mac_entries"
-                    "           WHERE mac LIKE ?))")
+                    "           WHERE mac LIKE ?"
+                    "           AND NOT EXISTS (SELECT 1 FROM neighbors nb"
+                    "             WHERE nb.device_id = mac_entries.device_id"
+                    "               AND nb.if_index = mac_entries.if_index"
+                    "               AND nb.present = 1)))")
                 params.extend([*like, f"{mac}%"])
             else:
                 clauses.append(f"({text_sql})")
@@ -3161,23 +3165,35 @@ class NodesDatabase(SqliteStore):
 
     def mac_locations(self, mac_prefix: str, limit: int = 200) -> list[sqlite3.Row]:
         """Every (device, port) a MAC starting with this prefix was learned
-        on — present (still seen on the last walk) first, then stale (not
-        seen on the last walk, but not pruned yet) newest-seen first. A MAC
-        on an uplink is on every switch between here and the host, so this
-        returns them all and lets the caller decide — picking one silently
-        is how you send an engineer to the core switch for a problem on an
-        access port. Each row carries present/seen_ts/first_seen_ts so the
-        caller can tell "here now" from "last seen here"."""
+        on — access ports first, then present (still seen on the last walk),
+        then stale (not seen on the last walk, but not pruned yet)
+        newest-seen first. A MAC on an uplink is on every switch between
+        here and the host, so this returns them all and lets the caller
+        decide — picking one silently is how you send an engineer to the
+        core switch for a problem on an access port. Each row carries
+        present/seen_ts/first_seen_ts so the caller can tell "here now" from
+        "last seen here", plus `uplink` (this port is a present neighbour
+        port) and `uplink_to` (that neighbour's sys_name, or its chassis_id
+        when sys_name is blank — first by rem_index; None off an access
+        port)."""
         prefix = normalize_mac(mac_prefix)
         if len(prefix) < 4:
             return []
         with self._lock:
             return self._conn.execute(
-                "SELECT m.*, i.descr AS if_descr FROM mac_entries m"
+                "SELECT m.*, i.descr AS if_descr,"
+                " EXISTS (SELECT 1 FROM neighbors nb WHERE nb.device_id = m.device_id"
+                "   AND nb.if_index = m.if_index AND nb.present = 1) AS uplink,"
+                " (SELECT CASE WHEN nb.sys_name != '' THEN nb.sys_name"
+                "              ELSE nb.chassis_id END"
+                "    FROM neighbors nb WHERE nb.device_id = m.device_id"
+                "      AND nb.if_index = m.if_index AND nb.present = 1"
+                "    ORDER BY nb.rem_index LIMIT 1) AS uplink_to"
+                " FROM mac_entries m"
                 " LEFT JOIN interfaces i ON i.device_id = m.device_id"
                 "   AND i.if_index = m.if_index"
-                " WHERE m.mac LIKE ? ORDER BY m.present DESC, m.seen_ts DESC,"
-                " m.device_id, m.if_index LIMIT ?",
+                " WHERE m.mac LIKE ? ORDER BY uplink ASC, m.present DESC,"
+                " m.seen_ts DESC, m.device_id, m.if_index LIMIT ?",
                 (f"{prefix}%", int(limit))).fetchall()
 
     def mac_entries_for(self, device_id: int,
@@ -3590,6 +3606,7 @@ class NodesDatabase(SqliteStore):
         "SELECT n.*,"
         " COALESCE(byname.id, bymac.id) AS matched_device_id,"
         " COALESCE(byname.name, bymac.name) AS matched_device_name,"
+        " COALESCE(byname.ip, bymac.ip) AS matched_device_ip,"
         # Exactly one if_index, always one belonging to the device COALESCE
         # picked: byname wins whenever it fires, so the two joins can resolve
         # to DIFFERENT devices, and pairing one device's id with another's

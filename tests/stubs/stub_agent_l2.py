@@ -15,6 +15,9 @@ Modes:
   lldp_and_cdp  a Cisco sysObjectID answering BOTH tables at once — the
                 "CDP supplements LLDP rather than only replacing it" case.
   no_l2         a Cisco sysObjectID with neither table implemented.
+  lldp_manaddr  three LLDP neighbours exercising lldpRemManAddrTable: an
+                IPv4 management address, an IPv6 one, and one with no
+                management address row at all.
   poe           POWER-ETHERNET-MIB: a PSE budget/consumption pair and two
                 ports (ifIndex 1 delivering power, ifIndex 2 disabled),
                 plus the Cisco per-port milliwatt extension on port 1.
@@ -96,6 +99,39 @@ LLDP_TABLE = {
     "1.0.8802.1.1.2.1.4.1.1.8.0.1.1": ("str", "uplink to core"),
     "1.0.8802.1.1.2.1.4.1.1.9.0.1.1": ("str", "core-sw-1"),
     "1.0.8802.1.1.2.1.4.1.1.10.0.1.1": ("str", "Core switch, IOS 15.2"),
+}
+
+# lldpRemManAddrTable: the address lives in the INDEX after the shared
+# timeMark.localPort.remIndex prefix — addrSubtype.addrLen.addr[.addr...]
+# (RFC 2579 InetAddress). Three neighbours: an IPv4 management address, an
+# IPv6 one, and a third with no management address row at all.
+LLDP_MANADDR_TABLE = {
+    # local port 1, remIndex 1 -- IPv4 management address 10.0.0.9
+    "1.0.8802.1.1.2.1.4.1.1.4.0.1.1": ("int", 4),
+    "1.0.8802.1.1.2.1.4.1.1.5.0.1.1": ("bytes", bytes([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01])),
+    "1.0.8802.1.1.2.1.4.1.1.6.0.1.1": ("int", 5),
+    "1.0.8802.1.1.2.1.4.1.1.7.0.1.1": ("str", "Gi0/1"),
+    "1.0.8802.1.1.2.1.4.1.1.8.0.1.1": ("str", "uplink v4"),
+    "1.0.8802.1.1.2.1.4.1.1.9.0.1.1": ("str", "core-sw-v4"),
+    "1.0.8802.1.1.2.1.4.1.1.10.0.1.1": ("str", "IPv4 neighbour"),
+    "1.0.8802.1.1.2.1.4.2.1.3.0.1.1.1.4.10.0.0.9": ("int", 1),
+    # local port 2, remIndex 1 -- IPv6 management address fe80::1
+    "1.0.8802.1.1.2.1.4.1.1.4.0.2.1": ("int", 4),
+    "1.0.8802.1.1.2.1.4.1.1.5.0.2.1": ("bytes", bytes([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02])),
+    "1.0.8802.1.1.2.1.4.1.1.6.0.2.1": ("int", 5),
+    "1.0.8802.1.1.2.1.4.1.1.7.0.2.1": ("str", "Gi0/2"),
+    "1.0.8802.1.1.2.1.4.1.1.8.0.2.1": ("str", "uplink v6"),
+    "1.0.8802.1.1.2.1.4.1.1.9.0.2.1": ("str", "core-sw-v6"),
+    "1.0.8802.1.1.2.1.4.1.1.10.0.2.1": ("str", "IPv6 neighbour"),
+    "1.0.8802.1.1.2.1.4.2.1.3.0.2.1.2.16.254.128.0.0.0.0.0.0.0.0.0.0.0.0.0.1": ("int", 2),
+    # local port 3, remIndex 1 -- no management address row at all
+    "1.0.8802.1.1.2.1.4.1.1.4.0.3.1": ("int", 4),
+    "1.0.8802.1.1.2.1.4.1.1.5.0.3.1": ("bytes", bytes([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x03])),
+    "1.0.8802.1.1.2.1.4.1.1.6.0.3.1": ("int", 5),
+    "1.0.8802.1.1.2.1.4.1.1.7.0.3.1": ("str", "Gi0/3"),
+    "1.0.8802.1.1.2.1.4.1.1.8.0.3.1": ("str", "no addr"),
+    "1.0.8802.1.1.2.1.4.1.1.9.0.3.1": ("str", "core-sw-none"),
+    "1.0.8802.1.1.2.1.4.1.1.10.0.3.1": ("str", "No address neighbour"),
 }
 
 # ------------------------------------------------------------------- CDP
@@ -275,6 +311,8 @@ def table_for():
         return {**GENERIC_SCALARS, **_without_hidden(ARP_BIG_TABLE)}
     if MODE == "lldp":
         return {**GENERIC_SCALARS, **LLDP_TABLE}
+    if MODE == "lldp_manaddr":
+        return {**GENERIC_SCALARS, **LLDP_MANADDR_TABLE}
     if MODE == "cdp":
         return {**CISCO_SCALARS, **CDP_TABLE}
     if MODE == "lldp_and_cdp":

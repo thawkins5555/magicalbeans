@@ -2567,27 +2567,45 @@ def _syslog_filters(service, params) -> dict:
     host = filters["host"].strip()
     if host:
         filters["host_ips"] = _syslog_host_ips(service, host)
+    # The free-text Search box hits the same gap: any word typed there might
+    # be the device name the Host column shows rather than anything the row
+    # has stored. Resolve each term long enough to be worth a lookup and let
+    # syslogdb match a hit by source address too.
+    text_ips = {}
+    for term in filters["text"].split():
+        fragment = term[:-1] if term.endswith("*") and len(term) > 1 else term
+        if len(fragment) >= 3:
+            ips = _syslog_host_ips(service, fragment)
+            if ips:
+                text_ips[term] = ips
+    if text_ips:
+        filters["text_ips"] = text_ips
     return filters
 
 
 # Both lookups are leading-% LIKE scans no index can serve, and the Syslog
-# tab re-runs its search every couple of seconds while Live is on. One entry
-# is enough: a Live tick repeats the same fragment, and holding one keeps the
-# memo bounded where a per-fragment cache would grow with whatever is typed.
-_HOST_IP_MEMO: tuple = ("", 0.0, ())
+# tab re-runs its search every couple of seconds while Live is on. Keyed by
+# fragment (the Host box, and now every free-text term worth resolving) and
+# capped at 8 entries so a page of scrolling searches cannot grow this
+# without bound.
+_HOST_IP_MEMO: dict = {}
 _HOST_IP_MEMO_TTL_S = 5.0
+_HOST_IP_MEMO_CAP = 8
 
 
 def _syslog_host_ips(service, host: str) -> list:
-    fragment, stamped, cached = _HOST_IP_MEMO
     now = time.time()
-    if fragment == host and now - stamped < _HOST_IP_MEMO_TTL_S:
-        return list(cached)
+    cached = _HOST_IP_MEMO.get(host)
+    if cached is not None and now - cached[0] < _HOST_IP_MEMO_TTL_S:
+        return list(cached[1])
     ips = set(service.nodes_db.device_ips_by_name(host, SYSLOG_HOST_IP_CAP))
     for row in service.app_db.search_hostnames(host, SYSLOG_HOST_IP_CAP):
         ips.add(row["ip"])
     resolved = sorted(ips)[:SYSLOG_HOST_IP_CAP]
-    globals()["_HOST_IP_MEMO"] = (host, now, tuple(resolved))
+    if host not in _HOST_IP_MEMO and len(_HOST_IP_MEMO) >= _HOST_IP_MEMO_CAP:
+        oldest = min(_HOST_IP_MEMO, key=lambda key: _HOST_IP_MEMO[key][0])
+        del _HOST_IP_MEMO[oldest]
+    _HOST_IP_MEMO[host] = (now, tuple(resolved))
     return resolved
 
 
@@ -4125,6 +4143,7 @@ def get_nodes_mac_search(service, params, body) -> dict:
             "mac": row["mac"], "vlan": row["vlan"], "seen_ts": row["seen_ts"],
             "first_seen_ts": row["first_seen_ts"],
             "present": bool(row["present"]),
+            "uplink": bool(row["uplink"]), "uplink_to": row["uplink_to"],
         })
     # How many devices are actually walking their forwarding tables, so the
     # frontend can say "nothing has been learned yet" rather than "not
@@ -4273,6 +4292,7 @@ def _neighbor_json(row, local_port: str = "") -> dict:
         "present": bool(row["present"]),
         "matched_device_id": row["matched_device_id"] if "matched_device_id" in keys else None,
         "matched_device_name": row["matched_device_name"] if "matched_device_name" in keys else None,
+        "matched_device_ip": row["matched_device_ip"] if "matched_device_ip" in keys else None,
         "resolved_name": None,
         "resolved_source": "",
     }
@@ -4315,6 +4335,7 @@ def _resolve_neighbor_names(service, neighbors: list[dict]) -> None:
                 name = namelookup.device_name(device) or device["name"]
                 neighbor["matched_device_id"] = device["id"]
                 neighbor["matched_device_name"] = name
+                neighbor["matched_device_ip"] = device["ip"]
                 neighbor["resolved_name"] = name
                 neighbor["resolved_source"] = "nodes"
                 break
@@ -4357,8 +4378,8 @@ def get_nodes_device_neighbors_export(service, params, body, device_id) -> dict:
     neighbors = get_nodes_device_neighbors(service, params, body, device_id)["neighbors"]
     header = ["if_index", "local_port", "protocol", "chassis_id", "sys_name",
              "port_id", "platform", "remote_address", "matched_device_id",
-             "matched_device_name", "present", "seen_ts", "first_seen_ts",
-             "resolved_name", "resolved_source"]
+             "matched_device_name", "matched_device_ip", "present", "seen_ts",
+             "first_seen_ts", "resolved_name", "resolved_source"]
     csv_rows = [[n.get(key) for key in header] for n in neighbors]
     return _csv_response("neighbours", header, csv_rows)
 

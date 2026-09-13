@@ -662,13 +662,53 @@ class SyslogDatabase(SqliteStore):
             params.extend([like_contains(term)] * len(self.SCAN_COLUMNS))
         return " AND ".join(clauses), params
 
+    def _text_clause(self, text: str, text_ips: dict | None = None) -> tuple[str, list]:
+        """Like _scan_clause, but a term the API resolved to device
+        addresses also matches by source IP -- for a fragment of the Host
+        column name that was never stored on the row (resolved from Nodes
+        or DNS after the fact). Used only when at least one term resolved;
+        callers fall back to _scan_clause otherwise so that case is unchanged.
+        """
+        text_ips = text_ips or {}
+        terms = [term for term in str(text).split() if term] or [text]
+        clauses, params = [], []
+        for term in terms:
+            # A trailing * is the app-wide prefix convention; the LIKE scan
+            # already matches a prefix as a substring, so drop it rather than
+            # searching for a literal asterisk no message will ever contain.
+            stripped = term[:-1] if term.endswith("*") and len(term) > 1 else term
+            clause = "(" + " OR ".join(
+                f"{column} LIKE ? {LIKE_ESCAPE}"
+                for column in self.SCAN_COLUMNS) + ")"
+            clause_params = [like_contains(stripped)] * len(self.SCAN_COLUMNS)
+            ips = [ip for ip in (text_ips.get(term) or ()) if ip]
+            if ips:
+                ors = []
+                for chunk in id_chunks(ips):
+                    ors.append(f"l.source IN ({','.join('?' * len(chunk))})")
+                    clause_params.extend(chunk)
+                clause = f"({clause} OR {' OR '.join(ors)})"
+            clauses.append(clause)
+            params.extend(clause_params)
+        return " AND ".join(clauses), params
+
     def search(self, t0: float, t1: float, filters: dict, limit: int = 300,
                newest_first: bool = True) -> list[sqlite3.Row]:
         where, params = self._where(t0, t1, filters)
         order = "DESC" if newest_first else "ASC"
         text = (filters.get("text") or "").strip()
+        text_ips = {term: ips for term, ips in (filters.get("text_ips") or {}).items() if ips}
 
         with self._lock:
+            # A term resolved to a device name takes the scan shape -- the
+            # FTS index has no way to also match by source address -- so this
+            # only diverges from the plain case when text_ips has an entry.
+            if text and text_ips:
+                scan, scan_params = self._text_clause(text, text_ips)
+                return self._conn.execute(
+                    f"SELECT l.* FROM logs l WHERE {where} AND {scan}"
+                    f" ORDER BY l.ts {order} LIMIT ?",
+                    (*params, *scan_params, limit)).fetchall()
             if text and self._can_index(text):
                 return self._conn.execute(
                     f"SELECT l.* FROM logs_fts f JOIN logs l ON l.id = f.rowid"
@@ -703,7 +743,14 @@ class SyslogDatabase(SqliteStore):
 
             where, params = self._where(t0, t1, filters)
             text = (filters.get("text") or "").strip()
-            if text and self._can_index(text):
+            text_ips = {term: ips for term, ips in (filters.get("text_ips") or {}).items() if ips}
+            if text and text_ips:
+                scan, scan_params = self._text_clause(text, text_ips)
+                sql = (f"SELECT CAST((l.ts - ?) / ? AS INTEGER) AS slot,"
+                       f" l.severity AS severity, COUNT(*) AS n FROM logs l"
+                       f" WHERE {where} AND {scan} GROUP BY slot, severity")
+                args = (start, bucket_s, *params, *scan_params)
+            elif text and self._can_index(text):
                 sql = (f"SELECT CAST((l.ts - ?) / ? AS INTEGER) AS slot,"
                        f" l.severity AS severity, COUNT(*) AS n"
                        f" FROM logs_fts f JOIN logs l ON l.id = f.rowid"

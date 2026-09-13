@@ -230,6 +230,14 @@ LLDP_REM_PORT_DESC          = "1.0.8802.1.1.2.1.4.1.1.8"
 LLDP_REM_SYS_NAME           = "1.0.8802.1.1.2.1.4.1.1.9"
 LLDP_REM_SYS_DESC           = "1.0.8802.1.1.2.1.4.1.1.10"
 
+# lldpRemManAddrTable is indexed on its own, longer suffix —
+# timeMark.localPort.remIndex.addrSubtype.addrLen.addr... (RFC 2579's
+# InetAddress convention: the address itself is part of the index, not a
+# column value) — rather than the three-arc lldpRemTable suffix the columns
+# above share, so it is walked and parsed separately in nodepoll._walk_lldp
+# and joined back on its leading timeMark.localPort.remIndex.
+LLDP_REM_MAN_ADDR_IF_SUBTYPE = "1.0.8802.1.1.2.1.4.2.1.3"
+
 # lldpRemChassisIdSubtype's enumeration — needed to tell "this chassis id is
 # a MAC address" (4, the common case, joinable against an interface's
 # phys_addr) from a locally-assigned string or a network address.

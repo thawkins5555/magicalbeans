@@ -1312,7 +1312,70 @@
         fill: 'var(--dim)',
         'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)' }, App.stamp(ts, t1 - t0)));
     }
+    if (!opts.noHover) attachChartHover(svg, seriesList, geo, data.unit || '', xFor, yFor, value);
     return geo;
+  }
+
+  // Hover readout for every line chart: nearest sample by time, one row per
+  // series, min-max band for rollup points. The rect is last so it is on top.
+  function nearestPoint(points, ts) {
+    let lo = 0;
+    let hi = points.length - 1;
+    if (hi < 0) return null;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (points[mid].ts < ts) lo = mid + 1; else hi = mid;
+    }
+    const after = points[lo];
+    const before = points[lo - 1];
+    return before && Math.abs(before.ts - ts) <= Math.abs(after.ts - ts) ? before : after;
+  }
+
+  function attachChartHover(svg, seriesList, geo, unit, xFor, yFor, value) {
+    const { plot } = geo;
+    const guide = App.svgNode('line', {
+      x1: 0, y1: plot.y, x2: 0, y2: plot.y + plot.h,
+      stroke: 'var(--dim)', 'stroke-dasharray': '3 3', visibility: 'hidden' });
+    svg.appendChild(guide);
+    const dots = seriesList.map((s) => {
+      const dot = App.svgNode('circle', { r: 3, fill: s.color, visibility: 'hidden' });
+      svg.appendChild(dot);
+      return dot;
+    });
+    const rect = App.svgNode('rect', {
+      x: plot.x, y: plot.y, width: plot.w, height: plot.h,
+      fill: 'transparent', class: 'chart-hover' });
+    svg.appendChild(rect);
+    const hide = () => {
+      guide.setAttribute('visibility', 'hidden');
+      for (const dot of dots) dot.setAttribute('visibility', 'hidden');
+      App.hideTooltip();
+    };
+    rect.addEventListener('mousemove', (event) => {
+      const box = svg.getBoundingClientRect();
+      const x = (event.clientX - box.left) * (geo.width / Math.max(box.width, 1));
+      const ts = geo.t0 + ((x - plot.x) / Math.max(plot.w, 1)) * (geo.t1 - geo.t0);
+      const rows = [];
+      let anchor = null;
+      seriesList.forEach((s, i) => {
+        const p = nearestPoint(s.points, ts);
+        const v = p ? value(p) : null;
+        if (v == null) { dots[i].setAttribute('visibility', 'hidden'); return; }
+        if (anchor === null) anchor = p.ts;
+        dots[i].setAttribute('cx', xFor(p.ts));
+        dots[i].setAttribute('cy', yFor(v));
+        dots[i].setAttribute('visibility', 'visible');
+        const band = p.avg !== undefined && p.min != null && p.max != null && p.min !== p.max
+          ? ` (${formatMetricValue(unit, p.min)} \u2013 ${formatMetricValue(unit, p.max)})` : '';
+        rows.push({ color: s.color, text: `${s.label || 'Value'} ${formatMetricValue(unit, v)}${band}` });
+      });
+      if (anchor === null) { hide(); return; }
+      guide.setAttribute('x1', xFor(anchor));
+      guide.setAttribute('x2', xFor(anchor));
+      guide.setAttribute('visibility', 'visible');
+      App.tooltip([{ text: App.when(anchor) }, ...rows], event);
+    });
+    rect.addEventListener('mouseleave', hide);
   }
 
   // Device dialog RESOURCES: one chart per metric present, in this order.
@@ -3039,8 +3102,12 @@
       // keyboard, invisible on touch, uncopyable); title still says when it came from PTR.
       let remote;
       if (r.matched_device_id != null) {
+        const mName = r.matched_device_name || r.sys_name || 'device';
+        const mAddr = r.matched_device_ip || '';
         remote = `<button class="linkish nd-nb-link" data-device="${r.matched_device_id}">` +
-          `${escape(r.matched_device_name || r.sys_name || 'device')}</button>`;
+          `${escape(mName)}</button>` +
+          (mAddr && mAddr !== mName
+            ? `<div class="ip-line">${escape(mAddr)}</div>` : '');
       } else {
         const label = escape(r.resolved_name || r.sys_name || r.chassis_id || 'unidentified');
         const address = r.remote_address || r.chassis_id || '';
@@ -6716,11 +6783,13 @@
     const present = all.filter((loc) => loc.present);
     const stale = all.filter((loc) => !loc.present);
     const mac = escape(formatMac(payload.mac));
+    const uplinkNote = (loc) => loc.uplink
+      ? ` via uplink to ${escape(loc.uplink_to || '?')}` : '';
     const port = (loc) => `${escape(loc.device_name)} · ${escape(loc.if_descr)}` +
-      `${loc.vlan ? ` · VLAN ${escape(loc.vlan)}` : ''}`;
+      `${loc.vlan ? ` · VLAN ${escape(loc.vlan)}` : ''}${uplinkNote(loc)}`;
     const lastSeen = (loc) => `${escape(loc.device_name)} · ${escape(loc.if_descr)}` +
       `${loc.vlan ? ` (VLAN ${escape(loc.vlan)})` : ''} at ${App.stamp(loc.seen_ts)} ` +
-      `(${ago(loc.seen_ts)})`;
+      `(${ago(loc.seen_ts)})${uplinkNote(loc)}`;
     const wireHits = (hits) => {
       for (const button of note.querySelectorAll('.nd-mac-hit')) {
         button.onclick = () => {

@@ -141,6 +141,8 @@ try:
           matched is not None and matched["matched_device_id"] == edge_id
           and matched["matched_device_name"] == "edge-sw-1"
           and matched["local_port"] == "Gi0/1", matched)
+    check("...and the matched device's own IP",
+          matched is not None and matched["matched_device_ip"] == "10.40.0.2", matched)
     unmatched = next((r for r in rows if r["if_index"] == 2), None)
     check("the unmatched row has no device match",
           unmatched is not None and unmatched["matched_device_id"] is None, unmatched)
@@ -190,18 +192,24 @@ try:
           row is not None and row["matched_device_id"] == mgmt_id
           and row["matched_device_name"] == "mgmt-sw"
           and row["resolved_source"] == "nodes", row)
+    check("...carrying that device's own IP",
+          row is not None and row["matched_device_ip"] == "10.40.0.9", row)
 
     row = by_port.get(4)
     check("a CDP address matching a device's alias resolves to that device",
           row is not None and row["matched_device_id"] == edge_id
           and row["matched_device_name"] == "edge-sw-1"
           and row["resolved_source"] == "nodes", row)
+    check("...carrying that device's own IP, not the alias it matched on",
+          row is not None and row["matched_device_ip"] == "10.40.0.2", row)
 
     row = by_port.get(5)
     check("an unmanaged address with a cached PTR shows the DNS name",
           row is not None and row["matched_device_id"] is None
           and row["resolved_name"] == "printer-3.corp.example"
           and row["resolved_source"] == "dns", row)
+    check("...with no matched device, so no matched_device_ip either",
+          row is not None and row["matched_device_ip"] is None, row)
 
     row = by_port.get(6)
     check("an address nothing knows stays the address",
@@ -228,6 +236,9 @@ try:
           and exported is not None
           and exported[header.index("resolved_name")] == "printer-3.corp.example",
           (header, exported))
+    check("...and matched_device_ip, right after matched_device_name",
+          header[header.index("matched_device_name") + 1] == "matched_device_ip",
+          header)
 
     check("the resolver is fed the neighbour addresses it must name",
           "10.40.0.77" in service._extra_resolve_targets(),

@@ -549,6 +549,25 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
     return text.split('\n')[0].slice(0, 120);
   });
 
+  // ---- 5.17.0: hovering a line chart shows the sample time and value.
+  await guarded(recorder, step('feature:chart-tooltip'), async () => {
+    if (!deviceDetailOpened) return 'absent — device-detail did not open';
+    const rect = page.locator('#modal:not([hidden]) #ndd-loss-chart-svg rect.chart-hover');
+    if (!(await rect.count())) return 'absent — loss chart drew no hover layer (no data)';
+    const box = await rect.boundingBox();
+    if (!box) return 'absent — hover layer has no box';
+    await page.mouse.move(box.x + box.width * 0.7, box.y + box.height / 2);
+    await page.mouse.move(box.x + box.width * 0.72, box.y + box.height / 2);
+    await settle(page, 300);
+    const tip = page.locator('.tooltip:not([hidden])');
+    if (!(await tip.count())) throw new Error('no tooltip on chart hover');
+    const text = await tip.innerText();
+    if (!/%/.test(text)) throw new Error(`tooltip carries no value: ${text}`);
+    await page.mouse.move(box.x - 40, box.y - 40);
+    await settle(page, 200);
+    return text.replace(/\n/g, ' | ').slice(0, 120);
+  });
+
   await guarded(recorder, step('dlg:device-interface'), async () => {
     if (!deviceDetailOpened) return 'absent — device-detail did not open';
     // Interface rows inside the device dialog are SINGLE-click
@@ -591,6 +610,24 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
       await shoot(page, dir, shot('sub', `device-${sub}`));
     }
     return 'opened';
+  });
+
+  // ---- 5.17.0: a Neighbours row with a known address (matched_device_ip
+  // or remote_address) shows it on its own .ip-line, not folded into the
+  // name. Lenient: the seeded demo data may have no neighbour with an
+  // address at all, in which case there is nothing to assert.
+  await guarded(recorder, step('feature:neighbour-ip'), async () => {
+    const rows = await page.locator('#nodes-table tbody tr').count();
+    if (!rows) return 'absent — no devices seeded';
+    await page.click('#nodes-table tbody tr:first-child');
+    await page.waitForSelector('#nd-detail:not([hidden])', { timeout: 10000 });
+    await page.click('#nd-d-subs .subtab[data-subtab="neighbours"]').catch(() => {});
+    await settle(page, 600);
+    const nbRows = await page.locator('#nd-nb-table tbody tr').count();
+    if (!nbRows) return 'absent — no neighbours on the first device';
+    const withIp = await page.locator('#nd-nb-table tbody tr .ip-line').count();
+    if (!withIp) return 'absent — no neighbour row carries a known address';
+    return `${withIp} of ${nbRows} neighbour row(s) show an .ip-line`;
   });
 
   // ---- SSH terminal (data-requires-write="ssh" — a separate module from

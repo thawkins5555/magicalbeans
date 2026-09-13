@@ -7580,6 +7580,13 @@ class NodePoller(Worker):
             values[key] = column
         if not answered:
             return [], False, complete
+        # lldpRemManAddrTable is walked but kept OUT of `values`/`complete`:
+        # its index carries the address itself after the shared 3-arc
+        # prefix (timeMark.localPort.remIndex.addrSubtype.addrLen.addr...),
+        # so it cannot join the per-row suffix set above, and a device that
+        # simply has no management address configured must not mark the
+        # whole pass incomplete or blank every row.
+        man_addrs = self._walk_lldp_man_addrs(device, config, deadline)
         suffixes: set = set()
         for column in values.values():
             suffixes.update(column)
@@ -7608,8 +7615,59 @@ class NodePoller(Worker):
                 "port_descr": str(values["port_descr"].get(suffix) or ""),
                 "sys_name": str(values["sys_name"].get(suffix) or ""),
                 "sys_descr": str(values["sys_descr"].get(suffix) or ""),
+                "remote_address": man_addrs.get(suffix, ""),
             })
         return entries, True, complete
+
+    def _walk_lldp_man_addrs(self, device, config: dict,
+                             deadline: float | None = None) -> dict:
+        """lldpRemManAddrTable, keyed back down to the plain
+        timeMark.localPort.remIndex suffix _walk_lldp's rows join on.
+
+        The table's own index is longer than that: RFC 2579's InetAddress
+        convention puts the address subtype, its length and the address
+        itself into the index rather than a column value —
+        timeMark.localPort.remIndex.addrSubtype.addrLen.addr[.addr...].
+        Only IPv4 (subtype 1, 4 octets) and IPv6 (subtype 2, 16 octets) are
+        parsed; anything else (subtype 0/none-configured or an OID/DNS
+        address) is skipped rather than guessed at. A remote system with
+        several management addresses can report more than one row per
+        neighbour — the first IPv4 wins, else the first IPv6 found."""
+        try:
+            column, _ = self._walk_column_status(
+                device, config, nodeoids.LLDP_REM_MAN_ADDR_IF_SUBTYPE,
+                deadline=deadline)
+        except SnmpError:
+            return {}
+        by_key: dict[str, tuple[int, str]] = {}   # key -> (subtype, address)
+        for suffix in column:
+            parts = suffix.split(".")
+            if len(parts) < 6:
+                continue
+            key = ".".join(parts[:3])
+            try:
+                addr_subtype = int(parts[3])
+                addr_len = int(parts[4])
+                octets = [int(p) for p in parts[5:5 + addr_len]]
+            except ValueError:
+                continue
+            if len(octets) != addr_len:
+                continue
+            if addr_subtype == 1 and addr_len == 4:
+                address = ".".join(str(o) for o in octets)
+            elif addr_subtype == 2 and addr_len == 16:
+                try:
+                    address = str(ipaddress.IPv6Address(bytes(octets)))
+                except ValueError:
+                    continue
+            else:
+                continue
+            existing = by_key.get(key)
+            if existing is None:
+                by_key[key] = (addr_subtype, address)
+            elif existing[0] != 1 and addr_subtype == 1:
+                by_key[key] = (addr_subtype, address)   # an IPv4 always wins
+        return {key: address for key, (_, address) in by_key.items()}
 
     def _walk_cdp(self, device, config: dict,
                   deadline: float | None = None) -> tuple:

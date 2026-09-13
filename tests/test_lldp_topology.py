@@ -59,8 +59,35 @@ try:
         check("...and sysName/portId carried through",
               row["sys_name"] == "core-sw-1" and row["port_id"] == "Gi0/24", row)
         check("...tagged protocol 'lldp'", row["protocol"] == "lldp", row)
+        check("a fake with no lldpRemManAddrTable at all still yields the row, "
+              "complete, with remote_address blank rather than missing",
+              row.get("remote_address") == "", row)
     check("a non-Cisco device never attempts CDP (one protocol only)",
           entries is not None and all(e["protocol"] == "lldp" for e in entries), entries)
+    db.close()
+finally:
+    stub.kill()
+
+# --------------------------------------- 1b. lldpRemManAddrTable parsing
+stub, port = spawn_stub("stub_agent_l2.py", "lldp_manaddr")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_db("lldp_manaddr")
+    did = device_against(db, port, vendor="", name="manaddr-sw")
+    poller = NodePoller(db)
+    entries = poller.read_device_neighbors(did)
+    check("all three neighbours come back",
+          entries is not None and len(entries) == 3, entries)
+    by_name = {e["sys_name"]: e for e in (entries or [])}
+    check("an IPv4 management address is parsed to dotted-decimal",
+          by_name.get("core-sw-v4", {}).get("remote_address") == "10.0.0.9",
+          by_name.get("core-sw-v4"))
+    check("an IPv6 management address is parsed and compressed",
+          by_name.get("core-sw-v6", {}).get("remote_address") == "fe80::1",
+          by_name.get("core-sw-v6"))
+    check("a neighbour with no management address row keeps remote_address ''",
+          by_name.get("core-sw-none", {}).get("remote_address") == "",
+          by_name.get("core-sw-none"))
     db.close()
 finally:
     stub.kill()
