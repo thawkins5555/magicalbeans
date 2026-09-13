@@ -461,27 +461,14 @@
 
   /* ------------------------------------------------------------- backups */
 
-  /* App.timeCell decides per row whether ITS OWN timestamp is "today" —
-     fine for a table of current activity, but a device's stored backups
-     span whatever the retention settings allow, so the row taken at 23:58
-     yesterday showed a date and the one from 00:02 this morning did not,
-     which read as though only some rows were dated at all. App.stamp's
-     span argument makes every row in the list agree on whether the date is
-     worth showing, based on how wide the whole list actually is. */
-  function backupTimeSpan() {
-    if (view.backups.length < 2) return 0;
-    const times = view.backups.map((b) => b.ts);
-    return Math.max(...times) - Math.min(...times);
-  }
-
   const BACKUP_COLUMNS = [
     { key: 'check', label: '', sortable: false, fixed: true, width: 30,
       cell: (r) => `<input type="checkbox" class="cx-bcheck"${
         view.backupsChecked.has(r.id) ? ' checked' : ''}>` },
-    { key: 'ts', label: 'Taken', width: 150, numeric: true, on: true,
+    { key: 'ts', label: 'Taken', width: 160, numeric: true, on: true,
       align: 'left', descendingFirst: true,
       title: App.timeZoneTitle(), cell: (r) => `<span class="when" title="${
-        escape(App.when(r.ts))}">${App.stamp(r.ts, backupTimeSpan())}</span>` },
+        escape(App.when(r.ts))}">${App.when(r.ts)}</span>` },
     { key: 'size_bytes', label: 'Size', width: 80, numeric: true, on: true,
       cell: (r) => bytesText(r.size_bytes) },
     { key: 'sha256', label: 'Digest', width: 110,

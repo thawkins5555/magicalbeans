@@ -280,6 +280,17 @@ check("uses App.statusMark for compliance status, the one status renderer "
       "App.statusMark(RESULT_TONE" in JS or "App.statusMark(tone" in JS)
 
 
+# ---------------------------------------------------------------------------
+# 11. The backups table's Taken column always shows date and time
+#     (App.when), never the span-based App.stamp that could drop the date
+#     for a device whose backups all fall within one hour.
+check("configrx.js no longer defines backupTimeSpan",
+      "backupTimeSpan" not in JS)
+check("the backups table's Taken cell renders App.when(r.ts)",
+      re.search(r"key: 'ts', label: 'Taken'[\s\S]{0,200}App\.when\(r\.ts\)", JS)
+      is not None)
+
+
 print()
 if FAILS:
     print(f"FAILED {len(FAILS)} check(s):")
