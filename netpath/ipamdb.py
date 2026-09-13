@@ -255,6 +255,9 @@ DEFAULTS = {
     "scan_history_days": 30,
     "resolve_hosts": True,
     "dhcp_poll_interval_minutes": 15,
+    # How often the stored device tables (ARP, addresses, learned MACs
+    # from nodes.db) are folded into hosts and conflicts. No SNMP of its own.
+    "device_ingest_minutes": 5,
     "dhcp_timeout_s": 30,
     "dhcp_history_days": 35,
     # Comma-joined column keys the IPAM host table shows; "" means the
@@ -311,6 +314,7 @@ class IpamDatabase(SqliteStore):
                              "switch_device_id": "INTEGER",
                              "switch_if_index": "INTEGER", "switch_port": "TEXT",
                              "switch_seen_ts": "REAL"})
+        self.ensure_columns("conflicts", {"detail": "TEXT"})
         self._normalise_lease_macs()
 
     # The settings row that says _normalise_lease_macs has run — the same
@@ -562,9 +566,95 @@ class IpamDatabase(SqliteStore):
             self._conn.commit()
         return cur.rowcount or 0
 
+    def record_observation(self, ip: str, subnet_id: int | None, mac: str | None,
+                           source: str, seen_ts: float, detail: str,
+                           fresh: bool) -> sqlite3.Row | None:
+        """A sighting from a stored device table (5.16.0): the same row
+        record_host writes for a sweep, but stamped with where it came from.
+        `fresh` means the source still lists the address now, so it counts
+        as up. Returns the previous row, for the caller's conflict check."""
+        with self._lock:
+            previous = self._conn.execute(
+                "SELECT * FROM hosts WHERE ip=?", (ip,)).fetchone()
+            if previous is None:
+                self._conn.execute(
+                    "INSERT INTO hosts(ip, subnet_id, mac, alive, first_seen, last_seen,"
+                    " last_up, last_mac_ts, seen_source, seen_detail)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (ip, subnet_id, mac, 1 if fresh else 0, seen_ts, seen_ts,
+                     seen_ts if fresh else None, seen_ts if mac else None, source, detail))
+            else:
+                mac_changed = bool(mac) and mac != previous["mac"]
+                self._conn.execute(
+                    "UPDATE hosts SET subnet_id=COALESCE(subnet_id, ?), mac=COALESCE(?, mac),"
+                    " alive=CASE WHEN ? THEN 1 ELSE alive END,"
+                    " last_seen=MAX(last_seen, ?),"
+                    " last_up=CASE WHEN ? THEN MAX(COALESCE(last_up, 0), ?) ELSE last_up END,"
+                    " last_mac_ts=CASE WHEN ? THEN ? ELSE last_mac_ts END,"
+                    " seen_source=?, seen_detail=? WHERE ip=?",
+                    (subnet_id, mac, fresh, seen_ts, fresh, seen_ts,
+                     mac_changed, seen_ts, source, detail, ip))
+            self._conn.commit()
+        return previous
+
+    def set_host_switch_port(self, ip: str, device_id: int, if_index: int,
+                             port: str, seen_ts: float) -> None:
+        """The access port a host's MAC was learned on; a newer sighting wins."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE hosts SET switch_device_id=?, switch_if_index=?, switch_port=?,"
+                " switch_seen_ts=? WHERE ip=? AND COALESCE(switch_seen_ts, 0) <= ?",
+                (device_id, if_index, port, seen_ts, ip, seen_ts))
+            self._conn.commit()
+
+    def host_macs(self) -> dict[str, str]:
+        """mac -> ip for every host with a MAC on file."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ip, mac FROM hosts WHERE mac IS NOT NULL AND mac != ''").fetchall()
+        return {row["mac"]: row["ip"] for row in rows}
+
+    def static_in_scope(self, fresh_s: float) -> dict[tuple, list[dict]]:
+        """(server_id, scope_id) -> the hosts inside that scope's dynamic
+        range that are up (alive, or answered within `fresh_s`) and hold
+        no lease or reservation on any server: in use, not handed out."""
+        cutoff = time.time() - fresh_s
+        with self._lock:
+            scopes = self._conn.execute(
+                "SELECT server_id, scope_id, start_ip, end_ip FROM dhcp_scopes").fetchall()
+            leased = {row["ip"] for row in
+                      self._conn.execute("SELECT ip FROM dhcp_leases").fetchall()}
+            hosts = self._conn.execute(
+                "SELECT ip, mac, seen_source, seen_detail, last_up FROM hosts"
+                " WHERE alive = 1 OR last_up >= ?", (cutoff,)).fetchall()
+        ranges = []
+        for scope in scopes:
+            try:
+                ranges.append((scope["server_id"], scope["scope_id"],
+                               int(ipaddress.IPv4Address(scope["start_ip"])),
+                               int(ipaddress.IPv4Address(scope["end_ip"]))))
+            except (ValueError, TypeError):
+                continue
+        out: dict[tuple, list[dict]] = {}
+        for host in hosts:
+            if host["ip"] in leased:
+                continue
+            try:
+                number = int(ipaddress.IPv4Address(host["ip"]))
+            except ValueError:
+                continue
+            for server_id, scope_id, low, high in ranges:
+                if low <= number <= high:
+                    out.setdefault((server_id, scope_id), []).append({
+                        "ip": host["ip"], "mac": host["mac"],
+                        "seen_source": host["seen_source"],
+                        "seen_detail": host["seen_detail"], "last_up": host["last_up"]})
+        return out
+
     # ------------------------------------------------------------- conflicts
 
-    def record_conflict(self, ip: str, mac_a: str, mac_b: str, source: str) -> bool:
+    def record_conflict(self, ip: str, mac_a: str, mac_b: str, source: str,
+                        detail: str | None = None) -> bool:
         """Open a conflict, or refresh an existing unresolved one for the same
         pair. Returns True for a newly opened conflict, which is what the
         scanner uses to decide whether this scan's summary should mention it."""
@@ -582,8 +672,8 @@ class IpamDatabase(SqliteStore):
                 return False
             self._conn.execute(
                 "INSERT INTO conflicts(ip, mac_a, mac_b, source, detected_ts,"
-                " last_seen_ts) VALUES (?,?,?,?,?,?)",
-                (ip, mac_a, mac_b, source, now, now))
+                " last_seen_ts, detail) VALUES (?,?,?,?,?,?,?)",
+                (ip, mac_a, mac_b, source, now, now, detail))
             self._conn.commit()
             return True
 

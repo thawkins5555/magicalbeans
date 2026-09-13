@@ -63,8 +63,13 @@ def credential_for_server(server) -> tuple[str | None, str | None]:
 class IpamWorker(Worker):
     THREAD_NAME = "ipam-worker"
 
-    def __init__(self, db: IpamDatabase, log=None, global_settings=None):
+    def __init__(self, db: IpamDatabase, log=None, global_settings=None,
+                 nodes_db=None):
         self.db = db
+        # nodes.db, for the device-table ingest (5.16.0); None means no ingest.
+        self.nodes_db = nodes_db
+        self._next_ingest = 0.0
+        self._last_ingest_ts = 0.0
         self.log = log or NullLog()
         # Called for the application-wide settings: never_scan_cidrs lives
         # there rather than in the IPAM module's own table, because which
@@ -160,6 +165,102 @@ class IpamWorker(Worker):
                 continue
             if now >= self._next_dhcp_poll.get(server["id"], 0) and server["id"] not in self._polling:
                 self._schedule_dhcp_poll(server["id"], settings)
+
+        if self.nodes_db is not None and now >= self._next_ingest:
+            self._next_ingest = now + max(1.0, float(settings.get("device_ingest_minutes", 5))) * 60
+            self._ingest_device_tables(settings)
+
+    # ------------------------------------------------- device-table ingest
+
+    @staticmethod
+    def _stored_mac(raw) -> str | None:
+        """nodes.db keeps bare hex (nodesdb.normalize_mac); hosts keeps
+        mac_colon's colon form, so the two are compared in the latter."""
+        text = str(raw or "").strip().lower()
+        if len(text) == 12 and all(c in "0123456789abcdef" for c in text):
+            return ":".join(text[i:i + 2] for i in range(0, 12, 2))
+        return mac_colon(text)
+
+    def _ingest_device_tables(self, settings: dict) -> int:
+        """Fold the stored device tables into hosts and conflicts: device
+        ARP rows (ip, mac, seen by which router), the addresses managed
+        devices hold themselves, and learned MACs joined to the ARP map for
+        the switch port. Only addresses inside a configured subnet. Returns
+        the number of conflicts opened."""
+        now = time.time()
+        since = self._last_ingest_ts
+        dhcp_cutoff = now - max(
+            float(settings.get("dhcp_poll_interval_minutes", 15)) * 60 * 3, 3600)
+        mac_fresh_s = max(float(settings.get("device_ingest_minutes", 5)) * 60 * 3, 3600)
+        subnet_cache: dict[str, int | None] = {}
+
+        def subnet_for(ip: str) -> int | None:
+            if ip not in subnet_cache:
+                subnet_cache[ip] = self.db.subnet_for_ip(ip)
+            return subnet_cache[ip]
+
+        def device_label(row) -> str:
+            return row["device_sys_name"] or row["device_name"] or row["device_ip"]
+
+        opened = 0
+        try:
+            for row in self.nodes_db.arp_entries_present(since):
+                ip, mac = row["ip"], self._stored_mac(row["mac"])
+                subnet_id = subnet_for(ip)
+                if subnet_id is None or not mac:
+                    continue
+                detail = f"{device_label(row)} {row['if_descr'] or 'if' + str(row['if_index'])}"
+                previous = self.db.record_observation(
+                    ip, subnet_id, mac, "device_arp", row["seen_ts"], detail, True)
+                if previous and previous["mac"] and previous["mac"] != mac \
+                        and (previous["last_mac_ts"] or 0) >= now - mac_fresh_s:
+                    if self.db.record_conflict(ip, previous["mac"], mac, "device_arp", detail):
+                        opened += 1
+                        self.log.add(IPAM, f"Possible IP conflict: {ip} is {previous['mac']} "
+                                           f"on file but {mac} in the ARP table of {detail}",
+                                     target=ip)
+                lease = self.db.dhcp_lease_for_ip(ip)
+                if lease and lease["mac"] and lease["polled_ts"] >= dhcp_cutoff:
+                    lease_mac = mac_colon(lease["mac"])
+                    if lease_mac and lease_mac != mac:
+                        if self.db.record_conflict(ip, lease_mac, mac, "device_arp_dhcp", detail):
+                            opened += 1
+                            self.log.add(IPAM, f"{ip} is {mac} in the ARP table of {detail}, "
+                                               f"but the DHCP server's lease says {lease_mac}",
+                                         target=ip)
+            for row in self.nodes_db.device_addresses_all():
+                subnet_id = subnet_for(row["ip"])
+                if subnet_id is None:
+                    continue
+                self.db.record_observation(
+                    row["ip"], subnet_id, None, "device_address", row["seen_ts"],
+                    device_label(row), bool(row["present"]))
+            # A device's polled address is its devices row, not a
+            # device_addresses row, so it is folded in from there.
+            for row in self.nodes_db.devices():
+                subnet_id = subnet_for(row["ip"])
+                if subnet_id is None:
+                    continue
+                self.db.record_observation(
+                    row["ip"], subnet_id, None, "device_address",
+                    row["last_poll_ts"] or now, row["sys_name"] or row["name"] or row["ip"],
+                    row["status"] == "up")
+            ip_by_mac = self.db.host_macs()
+            uplinks = {(r["device_id"], r["if_index"]) for r in self.nodes_db.neighbor_ports()}
+            for row in self.nodes_db.mac_entries_present(since):
+                if (row["device_id"], row["if_index"]) in uplinks:
+                    continue
+                ip = ip_by_mac.get(self._stored_mac(row["mac"]) or "")
+                if not ip:
+                    continue
+                port = row["if_descr"] or f"if{row['if_index']}"
+                self.db.set_host_switch_port(
+                    ip, row["device_id"], row["if_index"], port, row["seen_ts"])
+        except Exception as exc:
+            self.log.add(ERROR, f"IPAM device-table ingest failed: {exc}")
+            return opened
+        self._last_ingest_ts = now
+        return opened
 
     def _stagger_first_scans(self, subnets: list, settings: dict,
                              now: float) -> None:

@@ -3121,12 +3121,44 @@ def get_ipam_hosts(service, params, body) -> dict:
     if service.ipam_settings.get("resolve_hosts", True):
         names = {ip: name for ip, name in
                  service.app_db.hostnames({r["ip"] for r in rows}).items() if name}
+    dhcp_state = _ipam_dhcp_state_map(service)
     return {"hosts": [
         {"ip": r["ip"], "mac": r["mac"], "alive": bool(r["alive"]),
          "hostname": names.get(r["ip"], ""), "subnet_id": r["subnet_id"],
          "subnet_label": r["subnet_label"], "first_seen": r["first_seen"],
-         "last_seen": r["last_seen"], "last_up": r["last_up"]}
+         "last_seen": r["last_seen"], "last_up": r["last_up"],
+         "seen_source": r["seen_source"] or "", "seen_detail": r["seen_detail"] or "",
+         "switch_device_id": r["switch_device_id"], "switch_if_index": r["switch_if_index"],
+         "switch_port": r["switch_port"] or "", "switch_seen_ts": r["switch_seen_ts"],
+         "dhcp": dhcp_state(r["ip"], bool(r["alive"]))}
         for r in rows]}
+
+
+def _ipam_dhcp_state_map(service):
+    """ip -> 'leased' / 'reserved' / 'static in scope' / '' for the hosts
+    table: one read of the leases and scope ranges, then a lookup per row."""
+    leases = {}
+    for lease in service.ipam_db.dhcp_leases():
+        leases[lease["ip"]] = "reserved" if lease["is_reservation"] else "leased"
+    ranges = []
+    for scope in service.ipam_db.dhcp_scopes():
+        try:
+            ranges.append((int(ipaddress.IPv4Address(scope["start_ip"])),
+                           int(ipaddress.IPv4Address(scope["end_ip"]))))
+        except (ValueError, TypeError):
+            continue
+
+    def state(ip: str, alive: bool) -> str:
+        if ip in leases:
+            return leases[ip]
+        if not alive or not ranges:
+            return ""
+        try:
+            number = int(ipaddress.IPv4Address(ip))
+        except ValueError:
+            return ""
+        return "static in scope" if any(low <= number <= high for low, high in ranges) else ""
+    return state
 
 
 def get_ipam_hosts_export(service, params, body) -> dict:
@@ -3140,7 +3172,8 @@ def get_ipam_hosts_export(service, params, body) -> dict:
     if params.get("alive_only") is not None:
         hosts = [h for h in hosts if h["alive"]]
     header = ["ip", "mac", "alive", "hostname", "subnet_label",
-             "first_seen", "last_seen", "last_up"]
+             "first_seen", "last_seen", "last_up",
+             "seen_source", "seen_detail", "switch_port", "dhcp"]
     csv_rows = [[h.get(key) for key in header] for h in hosts]
     return _csv_response("ipam-hosts", header, csv_rows)
 
@@ -3150,7 +3183,7 @@ def get_ipam_conflicts(service, params, body) -> dict:
     rows = service.ipam_db.conflicts(include_resolved=include_resolved)
     return {"conflicts": [
         {"id": r["id"], "ip": r["ip"], "mac_a": r["mac_a"], "mac_b": r["mac_b"],
-         "source": r["source"], "detected": r["detected_ts"],
+         "source": r["source"], "detail": r["detail"] or "", "detected": r["detected_ts"],
          "last_seen": r["last_seen_ts"], "resolved": r["resolved_ts"]}
         for r in rows]}
 
@@ -3304,9 +3337,12 @@ def get_ipam_dhcp_scopes(service, params, body) -> dict:
     for lease in service.ipam_db.dhcp_leases(int(server_id) if server_id else None):
         by_scope.setdefault((lease["server_id"], lease["scope_id"]), []).append(lease)
 
+    static_by_scope = service.ipam_db.static_in_scope(
+        max(float(service.ipam_settings.get("dhcp_poll_interval_minutes", 15)) * 60 * 3, 3600))
     scopes = []
     for r in rows:
         leases = by_scope.get((r["server_id"], r["scope_id"]), [])
+        static_ips = static_by_scope.get((r["server_id"], r["scope_id"]), [])
         reserved = sum(1 for row in leases if row["is_reservation"])
         leased = len(leases) - reserved
         total = scope_size(r["start_ip"], r["end_ip"])
@@ -3319,7 +3355,9 @@ def get_ipam_dhcp_scopes(service, params, body) -> dict:
             "router": r["router"], "subnet": _scope_subnet(r["scope_id"], r["mask"]),
             "polled": r["polled_ts"],
             "usage": {"leased": leased, "reserved": reserved,
-                     "available": available, "total": total},
+                     "available": available, "total": total,
+                     "static_in_use": len(static_ips)},
+            "static_ips": static_ips,
         })
     return {"scopes": scopes}
 

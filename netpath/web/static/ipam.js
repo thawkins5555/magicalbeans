@@ -346,7 +346,24 @@
       align: 'left', value: (r) => r.first_seen, cell: (r) => App.agoCell(r.first_seen) },
     { key: 'last_seen', label: 'Last probed', width: 120, numeric: true,
       align: 'left', value: (r) => r.last_seen, cell: (r) => App.agoCell(r.last_seen) },
+    { key: 'seen_by', label: 'Seen by', width: 200, on: true,
+      value: (r) => `${SEEN_SOURCES[r.seen_source] || r.seen_source || ''} ${r.seen_detail || ''}`.trim(),
+      cell: (r) => (r.seen_source
+        ? `${escape(SEEN_SOURCES[r.seen_source] || r.seen_source)}` +
+          (r.seen_detail ? ` <span class="hint">${escape(r.seen_detail)}</span>` : '')
+        : 'sweep') },
+    { key: 'switch_port', label: 'Switch port', width: 200, on: true,
+      value: (r) => r.switch_port || '',
+      cell: (r) => (r.switch_device_id
+        ? `<a class="linkish inline" href="${App.buildRoute('nodes', [r.switch_device_id])}">` +
+          `${escape(r.switch_port || `if${r.switch_if_index}`)}</a>`
+        : '\u2014') },
+    { key: 'dhcp', label: 'DHCP', width: 130, value: (r) => r.dhcp || '',
+      cell: (r) => escape(r.dhcp || '\u2014') },
   ];
+  const SEEN_SOURCES = {
+    device_arp: 'device ARP table', device_address: 'device address', scan: 'sweep',
+  };
 
   const hostColumns = () => App.visibleColumns(
     HOST_COLUMNS, (App.state.ipamSettings || {}).table_columns_hosts);
@@ -408,6 +425,11 @@
       App.buildRoute('nodes', [], { q: mac })}">${escape(mac)}</a>`;
   }
 
+  const CONFLICT_SOURCES = {
+    scan: 'wire, two scans', scan_dhcp: 'wire vs. DHCP lease',
+    device_arp: 'device ARP table, two MACs', device_arp_dhcp: 'device ARP table vs. DHCP lease',
+  };
+
   function drawConflicts() {
     const table = App.el('ipam-conflicts-table');
     table.innerHTML = '<caption class="sr-only">Address conflicts</caption><thead><tr>' +
@@ -426,12 +448,12 @@
     }
     for (const c of view.conflicts) {
       const tr = document.createElement('tr');
-      const sourceText = c.source === 'scan_dhcp'
-        ? 'wire vs. DHCP lease' : 'wire, two scans';
+      const sourceText = (CONFLICT_SOURCES[c.source] || 'wire, two scans') +
+        (c.detail ? ` \u00b7 ${c.detail}` : '');
       tr.innerHTML =
         `<td class="mono"><span class="ipam-conflict-ip" data-ip="${escape(c.ip)}">${escape(c.ip)}</span></td>` +
         `<td class="mono">${macSearchLinkHtml(c.mac_a)}</td><td class="mono">${macSearchLinkHtml(c.mac_b)}</td>` +
-        `<td>${sourceText}</td><td>${App.agoCell(c.detected)}</td><td>${App.agoCell(c.last_seen)}</td><td></td>`;
+        `<td>${escape(sourceText)}</td><td>${App.agoCell(c.detected)}</td><td>${App.agoCell(c.last_seen)}</td><td></td>`;
       if (!c.resolved) {
         const button = document.createElement('button');
         button.textContent = 'Mark resolved';
@@ -707,6 +729,7 @@
       `leased       ${u.leased || 0}  (${pct(u.leased || 0)})`,
       `reserved     ${u.reserved || 0}  (${pct(u.reserved || 0)})`,
       `available    ${u.available ?? '?'}  (${pct(u.available || 0)})`,
+      `in use, not leased  ${u.static_in_use || 0}`,
     ].join('\n');
   }
 
@@ -835,6 +858,10 @@
       ` <b>${u.reserved || 0}</b> <span class="hint">(${pct(u.reserved || 0)})</span></div>` +
       `<div><span class="legend-dot" style="background:var(--data-neutral)"></span>Available` +
       ` <b>${u.available || 0}</b> <span class="hint">(${pct(u.available || 0)})</span></div>` +
+      `<div><span class="legend-dot" style="background:var(--warn)"></span>In use, not leased` +
+      ` <b>${u.static_in_use || 0}</b>${(scope.static_ips || []).length
+        ? ` <span class="hint mono">${escape((scope.static_ips || []).slice(0, 12).map((s) => s.ip).join(', '))}` +
+          `${(scope.static_ips || []).length > 12 ? ' \u2026' : ''}</span>` : ''}</div>` +
       `</div>` +
       `<div class="hint">${total} address(es) in range \u00b7 ${escape(scope.state || '')} \u00b7 ` +
       `polled ${ago(scope.polled)}</div>`;
@@ -1124,6 +1151,9 @@
       </fieldset>
       <fieldset><legend>DHCP</legend>
         ${number('i-dhcp-interval', 'Poll every', s.dhcp_poll_interval_minutes, 'min=5')} minutes
+        ${number('i-ingest-interval', 'Fold device ARP, address and MAC tables in every', s.device_ingest_minutes ?? 5, 'min=1')} minutes
+        <p class="hint">Reads what Nodes already stored from routers and switches \u2014 no extra SNMP \u2014 so a
+          remote subnet\u2019s hosts get MACs, a switch port, and conflict checks too.</p>
         ${number('i-dhcp-timeout', 'Poll timeout (s)', s.dhcp_timeout_s, 'min=5')}
         ${check('i-resolve', 'Resolve discovered hosts to names', s.resolve_hosts)}
       </fieldset>
@@ -1149,6 +1179,7 @@
           max_concurrent_scans: num('#i-scans'),
           max_scan_addresses: num('#i-maxaddr'),
           dhcp_poll_interval_minutes: num('#i-dhcp-interval'),
+          device_ingest_minutes: num('#i-ingest-interval'),
           dhcp_timeout_s: num('#i-dhcp-timeout'),
           resolve_hosts: on('#i-resolve'),
           host_retention_days: num('#i-host-days'),

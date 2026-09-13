@@ -460,7 +460,8 @@ class Service:
         self.syslog = SyslogCollector(self.syslog_db, log=self.log)
         self.snmp = TrapCollector(self.snmp_db, log=self.log, nodes_db=self.nodes_db)
         self.ipam = IpamWorker(self.ipam_db, log=self.log,
-                               global_settings=lambda: self.settings)
+                               global_settings=lambda: self.settings,
+                               nodes_db=self.nodes_db)
         self.node_poller = NodePoller(self.nodes_db, log=self.log)
         self.wireless = WirelessPoller(self.wireless_db, log=self.log)
         # Reads Nodes' device list for IP/vendor, so constructed after nodes_db.

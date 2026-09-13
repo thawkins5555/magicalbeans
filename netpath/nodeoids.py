@@ -951,3 +951,380 @@ CONNECTION_STATE = {
     0: "other", 1: "offline", 2: "online",
     3: "downloading_image", 4: "connected_image", 5: "standby",
 }
+
+# ---------------------------------------------------------------------------
+# Per-sensor temperature and power-supply tables (5.16.0) -- SENSOR_TABLES and
+# PSU_TABLES below. Cisco/Juniper/Arista's ENTITY-SENSOR-MIB population is
+# read straight off the existing entPhySensorTable walk in
+# nodepoll._poll_environment; the tables here are what nodepoll._poll_vendor_sensors
+# reads for every OTHER catalog vendor -- a mix of standalone tables and plain
+# scalars, so a "table" here can just as well be one reading with no index at
+# all (Synology's `temperature`).
+#
+# Every OID below was resolved mechanically from the vendor's own MIB text,
+# the same way nodeoids.SW_VERSION_COLUMNS was -- see
+# C:\Users\colou\.claude\jobs\c03e5c51\tmp\resolver_5_16.txt for the run this
+# shipped against. A bundle with nothing pollable (Palo Alto, WatchGuard,
+# Ruckus for temperature; Fortinet, Arista, SonicWall, Palo Alto, WatchGuard,
+# Ruckus, Cambium, Aerohive, TP-Link for PSU) simply has no entry.
+from dataclasses import dataclass, field
+
+
+@dataclass
+class SensorTable:
+    """One vendor's per-sensor temperature table (or scalar reading).
+
+    `value` is walked like any other table column -- a plain scalar OID
+    walks to one row, index suffix "0", the same way VENDOR_HEALTH's scalar
+    probes already do. `value_fallback` is tried only when `value` answers
+    nothing (Cisco's Rev1 reading falling back to the deprecated plain one;
+    MikroTik's health-table reading falling back to the older processor-only
+    scalar); `extra_scalars` is the opposite case -- independent scalar
+    readings that exist ALONGSIDE `value` and are always read (Sophos'
+    separate NPU/CPU scalars, Moxa's two power inputs), each given its own
+    fixed index and label rather than a walked suffix.
+
+    `name`/`label`: the sensor's own name column when the table has one,
+    else a literal used as the label -- "{idx}" is replaced with the row's
+    own index so "Unit {idx}" reads as "Unit 3". `name_filter` keeps only
+    rows whose walked name contains it (Fortinet's fgHwSensorTable also
+    carries fan/voltage rows under the same column).
+
+    `thresholds` are per-row columns sharing the value column's index;
+    `threshold_scalars` is a single global reading applied identically to
+    every row (Netgear's one chassis-wide normal range). `decimal_digits`
+    names a per-row column of decimal places that overrides `scale` when
+    present (Raritan, where the same table serves several sensor types at
+    different precisions).
+
+    `state_map` normalises a vendor's own enum to this feature's common
+    scale -- 0 normal, 1 warning, 2 critical, 3 shutdown -- keyed by the
+    raw value (an int, or a lowercased string for a vendor that answers
+    text). A raw value absent from the map is skipped outright: on some
+    vendors that is "not present"/"not functioning", not a fourth severity.
+    `skip_raw` drops specific READING values instead (APC's -1 for an
+    unpopulated I/O probe port; Juniper's 0, "not applicable" on that
+    table).
+    """
+    value: str
+    value_fallback: str | None = None
+    value_fallback_label: str | None = None
+    name: str | None = None
+    label: str | None = None
+    name_filter: str | None = None
+    thresholds: dict | None = None
+    threshold_scalars: dict | None = None
+    state: str | None = None
+    state_map: dict | None = None
+    scale: float = 1.0
+    numeric_prefix: bool = False
+    decimal_digits: str | None = None
+    skip_raw: tuple = ()
+    state_default: int | None = None
+    extra_scalars: tuple = field(default_factory=tuple)
+
+
+@dataclass
+class PsuTable:
+    """One vendor's power-supply state table.
+
+    Same shape as SensorTable's state half: `state_map` normalises to 0 ok,
+    1 warning, 2 failed/no input/shutdown, and a raw value missing from the
+    map (an empty bay, an admin-off slot) is skipped rather than written as
+    a fourth state. `class_col`/`class_values` gates a shared ENTITY-MIB-
+    style table down to just the power-supply rows (Cisco's FRU table
+    carries every powered module; VMware's env table carries fans and CPUs
+    beside PSUs). `skip_when_col`/`skip_when_values` reads a SECOND column
+    at the same index and skips the row when it matches (Ubiquiti's PSU
+    marked "standby" in a sibling column). `extra_scalars` is the same
+    always-read-alongside idea SensorTable uses, for a vendor exposing two
+    independent PSU scalars (MikroTik's primary/backup, Moxa's two inputs).
+    """
+    state: str
+    name: str | None = None
+    label: str | None = None
+    state_map: dict = field(default_factory=dict)
+    class_col: str | None = None
+    class_values: tuple = ()
+    skip_when_col: str | None = None
+    skip_when_values: tuple = ()
+    state_default: int | None = None
+    extra_scalars: tuple = field(default_factory=tuple)
+
+
+# Standard ENTITY-MIB (RFC 6933) columns, restated here (rather than imported
+# from nodepoll) because this file is a flat OID catalog with no runtime
+# dependency on the poller -- see nodepoll._ENT_PHYSICAL_NAME/_CLASS for the
+# same OIDs used against the general entPhysicalTable walk.
+_ENT_PHYSICAL_NAME = "1.3.6.1.2.1.47.1.1.1.1.7"
+_ENT_PHYSICAL_CLASS = "1.3.6.1.2.1.47.1.1.1.1.5"
+_ENT_CLASS_POWER_SUPPLY = 6
+
+# ARISTA-ENTITY-SENSOR-MIB's threshold pair for arc 30065, read directly by
+# nodepoll._poll_published_thresholds as a fixed (high_warn, high_alarm)
+# column pair -- unlike Cisco's entSensorThresholdTable there is no
+# severity/relation row to decode, so this never needed a SensorTable entry
+# of its own; Arista's readings already come off the standard ENTITY-SENSOR
+# walk _poll_environment does for every vendor.
+ARISTA_SENSOR_THRESHOLD_WARN = "1.3.6.1.4.1.30065.3.12.1.1.1.3"
+ARISTA_SENSOR_THRESHOLD_ALARM = "1.3.6.1.4.1.30065.3.12.1.1.1.4"
+
+SENSOR_TABLES = {
+    9: SensorTable(   # Cisco CISCO-ENVMON-MIB ciscoEnvMonTemperatureStatusTable
+        value="1.3.6.1.4.1.9.9.13.1.3.1.7",             # ...Rev1, Integer32
+        value_fallback="1.3.6.1.4.1.9.9.13.1.3.1.3",    # deprecated Gauge32
+        name="1.3.6.1.4.1.9.9.13.1.3.1.2",
+        thresholds={"high_alarm": "1.3.6.1.4.1.9.9.13.1.3.1.4"},
+        state="1.3.6.1.4.1.9.9.13.1.3.1.6",
+        # CiscoEnvMonState: normal(1) warning(2) critical(3) shutdown(4);
+        # notPresent(5)/notFunctioning(6) skipped -- not a state, a probe
+        # that answered nothing.
+        state_map={1: 0, 2: 1, 3: 2, 4: 3},
+    ),
+    2636: SensorTable(   # Juniper JUNIPER-MIB jnxOperatingTable (reading/name
+                         # already walked for temp_chassis_c's column_max --
+                         # this adds the per-sensor state only)
+        value="1.3.6.1.4.1.2636.3.1.13.1.7",
+        name="1.3.6.1.4.1.2636.3.1.13.1.5",
+        state="1.3.6.1.4.1.2636.3.1.13.1.6",
+        # JnxOperatingState: running(2) ready(3) standby(7) -> normal;
+        # down(6) -> critical. A row reading 0 C is "not applicable" on this
+        # table (a fan or PSU slot with no thermal sensor), not a cold row.
+        state_map={2: 0, 3: 0, 7: 0, 6: 2},
+        skip_raw=(0,),
+    ),
+    47196: SensorTable(   # Aruba CX ARUBAWIRED-TEMPSENSOR-MIB
+        value="1.3.6.1.4.1.47196.4.1.1.3.11.3.1.1.7",
+        name="1.3.6.1.4.1.47196.4.1.1.3.11.3.1.1.5",
+        state="1.3.6.1.4.1.47196.4.1.1.3.11.3.1.1.6",   # DisplayString
+        state_map={"normal": 0, "fault": 2, "critical": 2},
+        state_default=1,
+        scale=0.001,
+    ),
+    11: SensorTable(   # HP ProCurve HP-ICF-CHASSIS hpSystemAirTable
+        value="1.3.6.1.4.1.11.2.14.11.1.2.8.1.1.3",     # OCTET STRING "45C"
+        numeric_prefix=True,
+        thresholds={"high_alarm": "1.3.6.1.4.1.11.2.14.11.1.2.8.1.1.7"},
+        state="1.3.6.1.4.1.11.2.14.11.1.2.8.1.1.6",
+        state_map={1: 2, 2: 0},   # yes(1) over temp -> critical, no(2) -> normal
+    ),
+    12356: SensorTable(   # Fortinet FORTINET-FORTIGATE-MIB fgHwSensorTable
+        value="1.3.6.1.4.1.12356.101.4.3.2.1.3",        # DisplayString, mixed units
+        name="1.3.6.1.4.1.12356.101.4.3.2.1.2",
+        name_filter="temp",
+        numeric_prefix=True,
+        state="1.3.6.1.4.1.12356.101.4.3.2.1.4",
+        state_map={0: 0, 1: 2},   # threshold-exceeded flag only, no warning band
+    ),
+    1916: SensorTable(   # Extreme EXTREME-SYSTEM-MIB, one enclosure scalar
+        value="1.3.6.1.4.1.1916.1.1.1.8",
+        label="Enclosure",
+        state="1.3.6.1.4.1.1916.1.1.1.7",
+        state_map={1: 2, 2: 0},   # TruthValue true(1)/false(2)
+    ),
+    6027: SensorTable(   # Dell DELL-NETWORKING-CHASSIS-MIB dellNetStackUnitTable
+        value="1.3.6.1.4.1.6027.3.26.1.3.4.1.13",
+        label="Unit {idx}",
+    ),
+    4526: SensorTable(   # Netgear NETGEAR-BOXSERVICES-PRIVATE-MIB
+        value="1.3.6.1.4.1.4526.10.43.1.8.1.5",
+        threshold_scalars={"high_alarm": "1.3.6.1.4.1.4526.10.43.1.2"},
+        state="1.3.6.1.4.1.4526.10.43.1.8.1.4",
+        # low(0)/normal(1) -> normal, warning(2) -> warning, critical(3) ->
+        # critical, shutdown(4) -> shutdown; notpresent(5)/notoperational(6)
+        # skipped.
+        state_map={0: 0, 1: 0, 2: 1, 3: 2, 4: 3},
+    ),
+    890: SensorTable(   # Zyxel ZYXEL-HW-MONITOR-MIB zyHwMonitorTemperatureTable
+        value="1.3.6.1.4.1.890.1.15.3.26.1.2.1.3",
+        name="1.3.6.1.4.1.890.1.15.3.26.1.2.1.2",
+        thresholds={"high_alarm": "1.3.6.1.4.1.890.1.15.3.26.1.2.1.6"},
+        state="1.3.6.1.4.1.890.1.15.3.26.1.2.1.7",   # DisplayString
+        state_map={"normal": 0}, state_default=2,
+    ),
+    14988: SensorTable(   # MikroTik MIKROTIK-MIB, two scalars, older falls back
+        value="1.3.6.1.4.1.14988.1.1.3.10",
+        value_fallback="1.3.6.1.4.1.14988.1.1.3.11",
+        label="System", value_fallback_label="CPU",
+        scale=0.1,
+    ),
+    41112: SensorTable(   # Ubiquiti UBNT-EdgeMAX-MIB ubntThermTable
+        value="1.3.6.1.4.1.41112.1.5.4.2.1.3",
+        scale=0.001,
+    ),
+    2604: SensorTable(   # Sophos SFOS-FIREWALL-MIB, two independent scalars
+        value="1.3.6.1.4.1.2604.5.1.9.1",
+        label="NPU",
+        extra_scalars=(("1.3.6.1.4.1.2604.5.1.9.2", "2", "CPU"),),
+        scale=0.1,
+    ),
+    3375: SensorTable(   # F5 F5-BIGIP-SYSTEM-MIB sysChassisTempTable
+        value="1.3.6.1.4.1.3375.2.1.3.2.3.2.1.2",
+    ),
+    6574: SensorTable(   # Synology SYNOLOGY-SYSTEM-MIB, one scalar
+        value="1.3.6.1.4.1.6574.1.2",
+        label="System",
+    ),
+    318: SensorTable(   # APC/Schneider PowerNet-MIB uioSensorStatusTable
+        value="1.3.6.1.4.1.318.1.1.25.1.2.1.6",
+        skip_raw=(-1,),   # invalid/unpopulated I/O probe port
+        thresholds={"high_warn": "1.3.6.1.4.1.318.1.1.25.1.4.1.7",
+                    "high_alarm": "1.3.6.1.4.1.318.1.1.25.1.4.1.8"},
+        state="1.3.6.1.4.1.318.1.1.25.1.2.1.9",
+        state_map={1: 0, 2: 1, 3: 2},   # sensorStatusNotApplicable(4) skipped
+    ),
+    534: SensorTable(   # Eaton EATON-SENSOR-MIB temperature measurement table
+        value="1.3.6.1.4.1.534.6.8.1.2.3.1.3",
+        scale=0.1,
+        thresholds={"high_warn": "1.3.6.1.4.1.534.6.8.1.2.2.1.7",
+                    "high_alarm": "1.3.6.1.4.1.534.6.8.1.2.2.1.8"},
+        state="1.3.6.1.4.1.534.6.8.1.2.3.1.1",
+        # good(0) -> normal; lowWarning(1)/highWarning(3) -> warning;
+        # lowCritical(2)/highCritical(4) -> critical.
+        state_map={0: 0, 1: 1, 2: 2, 3: 1, 4: 2},
+    ),
+    476: SensorTable(   # Liebert/Vertiv LIEBERT-GP-ENVIRONMENTAL-MIB
+        value="1.3.6.1.4.1.476.1.42.3.4.1.3.3.1.3",
+        thresholds={"high_alarm": "1.3.6.1.4.1.476.1.42.3.4.1.3.3.1.4"},
+    ),
+    13742: SensorTable(   # Raritan PDU2-MIB external sensor table
+        value="1.3.6.1.4.1.13742.6.5.5.3.1.4",
+        name="1.3.6.1.4.1.13742.6.3.6.3.1.4",
+        thresholds={"high_warn": "1.3.6.1.4.1.13742.6.3.6.3.1.34",
+                    "high_alarm": "1.3.6.1.4.1.13742.6.3.6.3.1.33"},
+        state="1.3.6.1.4.1.13742.6.5.5.3.1.3",
+        # ok(0) -> normal; belowLowerWarning(1)/aboveUpperWarning(2) ->
+        # warning; belowLowerCritical(3)/aboveUpperCritical(4) -> critical.
+        # unavailable(-1) skipped.
+        state_map={0: 0, 1: 1, 2: 1, 3: 2, 4: 2},
+        decimal_digits="1.3.6.1.4.1.13742.6.3.6.3.1.17",
+    ),
+}
+
+PSU_TABLES = {
+    9: (
+        PsuTable(   # Cisco CISCO-ENVMON-MIB ciscoEnvMonSupplyStatusTable
+            state="1.3.6.1.4.1.9.9.13.1.5.1.3",
+            name="1.3.6.1.4.1.9.9.13.1.5.1.2",
+            # normal(1) -> ok; warning(2) -> warning; critical(3)/
+            # shutdown(4)/notFunctioning(6) -> failed; notPresent(5) skipped.
+            state_map={1: 0, 2: 1, 3: 2, 4: 2, 6: 2},
+        ),
+        PsuTable(   # Cisco CISCO-ENTITY-FRU-CONTROL-MIB, chassis platforms
+            state="1.3.6.1.4.1.9.9.117.1.1.2.1.2",
+            name=_ENT_PHYSICAL_NAME,
+            class_col=_ENT_PHYSICAL_CLASS, class_values=(_ENT_CLASS_POWER_SUPPLY,),
+            # on(2) -> ok; onButFanFail(9)/onButInlinePowerFail(12) ->
+            # warning; offEnvPower(5)/offEnvTemp(6)/offEnvFan(7)/failed(8)/
+            # offCooling(10) -> failed; offAdmin(3)/offDenied(4)/
+            # offEnvOther(1) skipped (administratively off, not a failure).
+            state_map={2: 0, 9: 1, 12: 1, 5: 2, 6: 2, 7: 2, 8: 2, 10: 2},
+        ),
+    ),
+    2636: PsuTable(   # Juniper JUNIPER-MIB jnxFruTable, PSU/power-entry rows
+        state="1.3.6.1.4.1.2636.3.1.15.1.8",
+        name="1.3.6.1.4.1.2636.3.1.15.1.5",
+        class_col="1.3.6.1.4.1.2636.3.1.15.1.6", class_values=(7, 18),
+        # online(6)/ready(4)/standby(10) -> ok; offline(8) -> failed;
+        # empty(2) skipped.
+        state_map={6: 0, 4: 0, 10: 0, 8: 2},
+    ),
+    47196: PsuTable(   # Aruba CX ARUBAWIRED-POWERSUPPLY-MIB
+        state="1.3.6.1.4.1.47196.4.1.1.3.11.2.1.1.11",
+        name="1.3.6.1.4.1.47196.4.1.1.3.11.2.1.1.3",
+        # ok(1) -> ok; warning(10)/alert(7) -> warning; faultInput(3)/
+        # faultOutput(4)/faultNoRecov(6)/faultAirflow(13)/overvoltage(16)/
+        # undervoltage(17) -> failed; faultAbsent(2)/empty(12)/init(11)/
+        # unknown(8)/unsupported(9) skipped.
+        state_map={1: 0, 10: 1, 7: 1, 3: 2, 4: 2, 6: 2, 13: 2, 16: 2, 17: 2},
+    ),
+    14823: PsuTable(   # Aruba wireless WLSX-SYSTEMEXT-MIB
+        state="1.3.6.1.4.1.14823.2.2.1.2.1.18.1.2",
+        label="Power supply {idx}",
+        state_map={1: 0, 2: 2},   # active(1)/inactive(2)
+    ),
+    11: PsuTable(   # HP ProCurve HP-ICF-CHASSIS hpicfPowerSupplyStatus
+        state="1.3.6.1.4.1.11.2.14.11.1.2.11.1.2",
+        label="Slot {idx}",
+        state_map={1: 0, 2: 0, 4: 2},   # ok(1)/inserted(2) -> ok; faulted(4) -> failed; removed(3) skipped
+    ),
+    14988: PsuTable(   # MikroTik MIKROTIK-MIB, primary + backup scalars
+        state="1.3.6.1.4.1.14988.1.1.3.15",
+        label="PSU",
+        extra_scalars=(("1.3.6.1.4.1.14988.1.1.3.16", "2", "Backup PSU"),),
+        state_map={1: 0, 0: 2},   # BoolValue true(1) "ok" / false(0) "failed"
+    ),
+    41112: PsuTable(   # Ubiquiti UBNT-EdgeMAX-MIB
+        state="1.3.6.1.4.1.41112.1.5.3.2.1.4",
+        label="PSU {idx}",
+        state_map={1: 0, 0: 2},   # ubntPsuOperStatus up(1)/down(0)
+        skip_when_col="1.3.6.1.4.1.41112.1.5.3.2.1.3", skip_when_values=(3,),  # ubntPsuStatus standby(3)
+    ),
+    1916: PsuTable(   # Extreme EXTREME-SYSTEM-MIB extremePowerSupplyStatus
+        state="1.3.6.1.4.1.1916.1.1.1.27.1.2",
+        label="Power supply {idx}",
+        # presentOK(2) -> ok; presentPowerOff(4) -> warning; presentNotOK(3)
+        # -> failed; notPresent(1) skipped.
+        state_map={2: 0, 4: 1, 3: 2},
+    ),
+    6027: PsuTable(   # Dell DELL-NETWORKING-CHASSIS-MIB dellNetPowerSupplyOperStatus
+        state="1.3.6.1.4.1.6027.3.26.1.4.6.1.4",
+        label="PSU {idx}",
+        state_map={1: 0, 2: 2},   # up(1)/down(2); absent(3) skipped
+    ),
+    4526: PsuTable(   # Netgear NETGEAR-BOXSERVICES-PRIVATE-MIB boxServicesPowSupplyItemState
+        state="1.3.6.1.4.1.4526.10.43.1.7.1.3",
+        label="PSU {idx}",
+        # operational(2)/powering(4) -> ok; notpowering(6)/incompatible(7)
+        # -> warning; failed(3)/nopower(5) -> failed; notpresent(1) skipped.
+        state_map={2: 0, 4: 0, 6: 1, 7: 1, 3: 2, 5: 2},
+    ),
+    6574: PsuTable(   # Synology SYNOLOGY-SYSTEM-MIB, one scalar
+        state="1.3.6.1.4.1.6574.1.3",
+        label="Power",
+        state_map={1: 0, 2: 2},
+    ),
+    2604: PsuTable(   # Sophos SFOS-FIREWALL-MIB sfosPowerSupplyStatus
+        state="1.3.6.1.4.1.2604.5.1.9.4.1.2",
+        label="PSU {idx}",
+        state_map={1: 0, 2: 2},   # up(1)/down(2)
+    ),
+    3375: PsuTable(   # F5 F5-BIGIP-SYSTEM-MIB sysChassisPowerSupplyStatus
+        state="1.3.6.1.4.1.3375.2.1.3.2.2.2.1.2",
+        label="PSU {idx}",
+        state_map={1: 0, 0: 2},   # good(1)/bad(0); notpresent(2) skipped
+    ),
+    890: PsuTable(   # Zyxel ZYXEL-HW-MONITOR-MIB zyHwMonitorPowerSourceStatus
+        state="1.3.6.1.4.1.890.1.15.3.26.1.4.2.1.3",
+        name="1.3.6.1.4.1.890.1.15.3.26.1.4.2.1.4",
+        # DisplayString: "normal"/"present" -> ok; "error" -> failed;
+        # "absent" skipped.
+        state_map={"normal": 0, "present": 0, "error": 2},
+    ),
+    6876: PsuTable(   # VMware VMWARE-ENV-MIB, powerSupply(3) rows only
+        state="1.3.6.1.4.1.6876.4.20.3.1.3",
+        name="1.3.6.1.4.1.6876.4.20.3.1.4",
+        class_col="1.3.6.1.4.1.6876.4.20.3.1.2", class_values=(3,),
+        # normal(2) -> ok; marginal(3) -> warning; critical(4)/failed(5) -> failed
+        state_map={2: 0, 3: 1, 4: 2, 5: 2},
+    ),
+    318: PsuTable(   # APC/Schneider PowerNet-MIB upsDiagSubSysSystemPowerSupplyStatus
+        state="1.3.6.1.4.1.318.1.1.1.13.4.14.1.3",
+        label="PSU {idx}",
+        # onOk(4)/offOk(3) -> ok; offFail(5)/onFail(6)/lostComm(7) ->
+        # failed; notInstalled(2) skipped.
+        state_map={4: 0, 3: 0, 5: 2, 6: 2, 7: 2},
+    ),
+    8691: PsuTable(   # Moxa MOXA-EDS510E-MIB, two independent input scalars
+        state="1.3.6.1.4.1.8691.7.84.1.10.1",
+        label="Power 1",
+        extra_scalars=(("1.3.6.1.4.1.8691.7.84.1.10.2", "2", "Power 2"),),
+        state_map={1: 0, 0: 2},   # present(1)/not-present(0)
+    ),
+    2620: PsuTable(   # Check Point CHECKPOINT-MIB powerSupplyStatus
+        state="1.3.6.1.4.1.2620.1.6.7.9.1.1.2",
+        label="PSU {idx}",
+        state_map={"up": 0}, state_default=2,   # DisplayString "Up"/else -> failed
+    ),
+}
+

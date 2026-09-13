@@ -1217,6 +1217,13 @@ class NodesDatabase(SqliteStore):
             "stp_capable": "INTEGER",
             "ups_capable": "INTEGER",
             "sensor_capable": "INTEGER",
+            # _poll_vendor_sensors' own probe-once-remember latch, alongside
+            # sensor_capable's ENTITY-SENSOR-MIB one: a vendor table
+            # (nodeoids.SENSOR_TABLES/PSU_TABLES) is a different walk on a
+            # different schedule, so a device answering neither must not be
+            # asked for either one every poll forever, and a device
+            # answering one must not suppress a probe of the other.
+            "vendor_sensor_capable": "INTEGER",
             # Bridge-wide STP state (BRIDGE-MIB dot1dStp), refreshed every
             # poll once stp_capable is true. Device state, not a time series;
             # the topology-change counter goes through metrics/samples.
@@ -4022,6 +4029,17 @@ class NodesDatabase(SqliteStore):
         with self._lock:
             self._conn.execute(
                 "UPDATE devices SET sensor_capable = ? WHERE id = ?",
+                (None if capable is None else (1 if capable else 0), device_id))
+            self._conn.commit()
+
+    def set_vendor_sensor_capable(self, device_id: int, capable: bool | None) -> None:
+        """set_sensor_capable's own counterpart for
+        nodepoll._poll_vendor_sensors' walk of nodeoids.SENSOR_TABLES/
+        PSU_TABLES: True once either table has answered anything for this
+        device's arc, False once both have answered nothing."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE devices SET vendor_sensor_capable = ? WHERE id = ?",
                 (None if capable is None else (1 if capable else 0), device_id))
             self._conn.commit()
 

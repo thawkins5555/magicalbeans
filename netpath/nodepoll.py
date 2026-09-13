@@ -1567,6 +1567,14 @@ class NodePoller(Worker):
         # limits a transceiver publishes change only when somebody pulls the
         # optic out. See _SENSOR_THRESHOLD_REFRESH_S.
         self._sensor_threshold_read: dict[int, float] = {}
+        # device_id -> when nodeoids.SENSOR_TABLES/PSU_TABLES was last
+        # walked for it (_poll_vendor_sensors) -- its own stamp, same shape
+        # as _sensor_read, since a device can have an ENTITY-SENSOR-MIB
+        # table, a vendor table, both or neither, each on its own cadence.
+        self._vendor_sensor_read: dict[int, float] = {}
+        # device_id -> when the vendor table's own published thresholds
+        # were last walked. See _SENSOR_THRESHOLD_REFRESH_S.
+        self._vendor_sensor_threshold_read: dict[int, float] = {}
         # device_id -> when a sensor-diagnostic event was last written for
         # it. See _log_sensor_diag.
         self._sensor_diag_ts: dict[int, float] = {}
@@ -2019,6 +2027,8 @@ class NodePoller(Worker):
         # stamp skips both _SENSOR_REFRESH_S and the hourly reprobe window.
         self._sensor_read.pop(device_id, None)
         self._sensor_threshold_read.pop(device_id, None)
+        self._vendor_sensor_read.pop(device_id, None)
+        self._vendor_sensor_threshold_read.pop(device_id, None)
         # And "start from nothing": an explicit retry is the one place a
         # per-device cache is discarded on request. The operator is asking
         # for the attempt the scheduler would make with no history — the
@@ -2572,6 +2582,7 @@ class NodePoller(Worker):
                       self._credentials, self._credential_probe_failed,
                       self._addresses_read, self._bulk_repetitions,
                       self._sensor_read, self._sensor_threshold_read,
+                      self._vendor_sensor_read, self._vendor_sensor_threshold_read,
                       self._sensor_diag_ts, self._snmp_backoff,
                       self._snmp_failing_count, self._get_batch,
                       self._poll_cost):
@@ -3511,6 +3522,16 @@ class NodePoller(Worker):
             except Exception:
                 self._bump("errors")
                 self.log.add(ERROR, f"Environmental sensor read failed for "
+                                    f"device #{device_id}",
+                             detail=traceback.format_exc())
+            try:
+                self._best_effort(
+                    f"Vendor sensor/PSU read for device #{device_id}",
+                    self._poll_vendor_sensors,
+                    device_id, device, cred_config, now)
+            except Exception:
+                self._bump("errors")
+                self.log.add(ERROR, f"Vendor sensor/PSU read failed for "
                                     f"device #{device_id}",
                              detail=traceback.format_exc())
             self._refresh_addresses(device, config)
@@ -4559,8 +4580,11 @@ class NodePoller(Worker):
         # Sensor plausibility depends on vendor (_cisco_sensor_table_plausible),
         # so a re-identification invalidates an old "no sensors" verdict.
         self.db.set_sensor_capable(device_id, None)
+        self.db.set_vendor_sensor_capable(device_id, None)
         self._sensor_read.pop(device_id, None)
         self._sensor_threshold_read.pop(device_id, None)
+        self._vendor_sensor_read.pop(device_id, None)
+        self._vendor_sensor_threshold_read.pop(device_id, None)
         job.start()
         return job.status()
 
@@ -5906,6 +5930,18 @@ class NodePoller(Worker):
     # nodesdb.replace_interface_thresholds.
     _CISCO_THRESHOLD_SOURCE = "CISCO-ENTITY-SENSOR-MIB"
 
+    # ARISTA-ENTITY-SENSOR-MIB publishes its own high-warning/high-critical
+    # columns directly -- no severity/relation row to decode, unlike Cisco's
+    # entSensorThresholdTable -- so its own source name and its own (much
+    # shorter) walk in _poll_published_thresholds.
+    _ARISTA_THRESHOLD_SOURCE = "ARISTA-ENTITY-SENSOR-MIB"
+
+    # A published temperature limit outside this range did not come from a
+    # sane sensor -- the same role _DBM_LIMIT_RANGE plays for optics, so a
+    # scale error on a sensor reading Fahrenheit or millidegrees is caught
+    # rather than alerting a switch at "high" 45000.
+    _TEMP_LIMIT_RANGE = (0.0, 150.0)
+
     def _sfp_root_for(self, sensor_type: int, suffix: str, names, descrs
                       ) -> str | None:
         """The per-port DOM metric root (_SFP_METRICS) this sensor writes,
@@ -5924,116 +5960,159 @@ class NodePoller(Worker):
             return f"sfp_{direction}_dbm" if direction else None
         return self._SFP_TYPE_ROOTS.get(sensor_type)
 
-    def _poll_optic_thresholds(self, device_id: int, device, config: dict,
-                               threshold_roots: dict, scales: dict,
-                               precisions: dict, now: float) -> None:
-        """The alarm/warning levels this device's own transceivers publish,
-        into nodes.db's interface_thresholds — see that table's schema
-        comment, and alertrules.PUBLISHED_THRESHOLD_RULES for what reads
-        them.
+    def _poll_published_thresholds(self, device_id: int, device, config: dict,
+                                   threshold_roots: dict, scales: dict,
+                                   precisions: dict, now: float) -> None:
+        """The alarm/warning levels this device's own sensors publish, into
+        nodes.db's interface_thresholds — see that table's schema comment,
+        and alertrules.PUBLISHED_THRESHOLD_RULES for what reads them.
 
-        `threshold_roots` maps a sensor's index suffix to the
-        (ifIndex, metric root) it belongs to; the caller builds it from the
-        walk it has already done, so this costs three column walks and no
-        re-walk of anything.
+        Was _poll_optic_thresholds through 5.15.0, transceivers only;
+        `threshold_roots` now also carries chassis-classified ENTITY-SENSOR
+        temperature rows as `(entPhysicalIndex, "temp_sensor_c")` (see
+        _poll_environment), so the same walk fills their high_warn/
+        high_alarm with no extra request. A low-side band on a temperature
+        sensor is written like any other column -- nothing here reads it,
+        alertrules' rules for temp_sensor_c only look at the high side.
 
-        Gated on _cisco_sensor_table_plausible rather than on which value
-        table answered: a Nexus answers the STANDARD sensor table and
-        publishes Cisco thresholds beside it, so gating on the value table's
-        source would miss the whole NX-OS fleet. Gated again on this device
-        having at least one port-mapped optic sensor this pass, so routers,
-        PDUs and copper-only switches never pay three dead walks an hour for
-        ever.
+        `threshold_roots` maps a sensor's index suffix to the (index, metric
+        root) it belongs to; the caller builds it from the walk it has
+        already done, so this costs three column walks (Cisco) or two
+        (Arista) and no re-walk of anything.
+
+        Two independent publishers, each gated on its own vendor evidence so
+        neither pays for a walk that could only time out on the other's
+        gear: CISCO-ENTITY-SENSOR-MIB's entSensorThresholdTable (severity +
+        relation decoded into a band and a side, same as always) on
+        _cisco_sensor_table_plausible; ARISTA-ENTITY-SENSOR-MIB's own high-
+        warning/high-critical columns, no decoding needed, on arc 30065.
+        Gated again on this device having at least one entry in
+        `threshold_roots` this pass, so routers, PDUs and copper-only
+        switches never pay a dead walk an hour for ever.
         """
-        if not threshold_roots or not self._cisco_sensor_table_plausible(device):
+        if not threshold_roots:
+            return
+        is_cisco = self._cisco_sensor_table_plausible(device)
+        arc = nodeoids.enterprise_arc(
+            (device["sys_object_id"]
+             if "sys_object_id" in (device.keys() if hasattr(device, "keys")
+                                    else device) else "") or "")
+        is_arista = arc == 30065
+        if not is_cisco and not is_arista:
             return
         if now - self._sensor_threshold_read.get(device_id, 0.0) < \
                 self._SENSOR_THRESHOLD_REFRESH_S:
             return
         self._sensor_threshold_read[device_id] = now
-        try:
-            values, complete = self._walk_column_status(
-                device, config, self._CISCO_THRESHOLD_VALUE)
-            severities, sev_done = self._walk_column_status(
-                device, config, self._CISCO_THRESHOLD_SEVERITY)
-            relations, rel_done = self._walk_column_status(
-                device, config, self._CISCO_THRESHOLD_RELATION)
-        except SnmpError:
-            return
-        if not (complete and sev_done and rel_done):
-            # Same doctrine as _sfp_slot_media's slots_complete, and it
-            # matters more here: an empty answer means "this device publishes
-            # nothing", which switches optic power alerting OFF for every
-            # port on it. A slow device must not be able to say that. All
-            # three columns, because a severity row the walk never reached
-            # loses its band and drops a level just as silently.
-            return
 
-        # (ifIndex, root) -> {column: value}. Several entities can land on
-        # one key -- a multi-lane optic reports a lane per entity -- and one
+        # (index, root) -> {column: value}. Several entities can land on one
+        # key -- a multi-lane optic reports a lane per entity -- and one
         # entity can quote the same band twice; both collapse the same way,
         # keeping whichever level alerts EARLIER.
         bands: dict[tuple, dict] = {}
-        for suffix, raw in values.items():
-            entity, _, _index = suffix.partition(".")
-            target = threshold_roots.get(entity)
-            if target is None or not isinstance(raw, (int, float)):
-                continue
-            side = self._CISCO_THRESHOLD_SIDE.get(
-                int(relations.get(suffix) or 0) or 0)
-            band = self._CISCO_THRESHOLD_BAND.get(
-                int(severities.get(suffix) or 0) or 0)
-            if side is None or band is None:
-                continue
-            # The threshold is quoted in the scale and precision of ITS OWN
-            # entity's reading, never the threshold row's index -- decoding
-            # one against another entity's scale is wrong by a factor of a
-            # thousand and still looks like a plausible dBm figure.
-            value = self._scaled_sensor_value(
-                raw, scales.get(entity), precisions.get(entity))
-            if target[1] == "sfp_bias_ma":
-                # The reading loop above quotes bias in milliamps; a limit
-                # left in the MIB's amperes would be a thousand times the
-                # metric it governs.
-                value *= self._BIAS_A_TO_MA
-            column = f"{side}_{band}"
-            existing = bands.setdefault(target, {}).get(column)
-            if existing is not None:
-                value = max(existing, value) if side == "low" \
-                    else min(existing, value)
-            bands[target][column] = value
+        source = self._CISCO_THRESHOLD_SOURCE
+
+        if is_cisco:
+            try:
+                values, complete = self._walk_column_status(
+                    device, config, self._CISCO_THRESHOLD_VALUE)
+                severities, sev_done = self._walk_column_status(
+                    device, config, self._CISCO_THRESHOLD_SEVERITY)
+                relations, rel_done = self._walk_column_status(
+                    device, config, self._CISCO_THRESHOLD_RELATION)
+            except SnmpError:
+                return
+            if not (complete and sev_done and rel_done):
+                # Same doctrine as _sfp_slot_media's slots_complete, and it
+                # matters more here: an empty answer means "this device
+                # publishes nothing", which switches alerting OFF for every
+                # sensor on it. A slow device must not be able to say that.
+                # All three columns, because a severity row the walk never
+                # reached loses its band and drops a level just as silently.
+                return
+            for suffix, raw in values.items():
+                entity, _, _index = suffix.partition(".")
+                target = threshold_roots.get(entity)
+                if target is None or not isinstance(raw, (int, float)):
+                    continue
+                side = self._CISCO_THRESHOLD_SIDE.get(
+                    int(relations.get(suffix) or 0) or 0)
+                band = self._CISCO_THRESHOLD_BAND.get(
+                    int(severities.get(suffix) or 0) or 0)
+                if side is None or band is None:
+                    continue
+                # The threshold is quoted in the scale and precision of ITS
+                # OWN entity's reading, never the threshold row's index --
+                # decoding one against another entity's scale is wrong by a
+                # factor of a thousand and still looks like a plausible
+                # figure.
+                value = self._scaled_sensor_value(
+                    raw, scales.get(entity), precisions.get(entity))
+                if target[1] == "sfp_bias_ma":
+                    # The reading loop above quotes bias in milliamps; a
+                    # limit left in the MIB's amperes would be a thousand
+                    # times the metric it governs.
+                    value *= self._BIAS_A_TO_MA
+                column = f"{side}_{band}"
+                existing = bands.setdefault(target, {}).get(column)
+                if existing is not None:
+                    value = max(existing, value) if side == "low" \
+                        else min(existing, value)
+                bands[target][column] = value
+        else:
+            source = self._ARISTA_THRESHOLD_SOURCE
+            try:
+                warns = self._walk_column(
+                    device, config, nodeoids.ARISTA_SENSOR_THRESHOLD_WARN)
+                alarms = self._walk_column(
+                    device, config, nodeoids.ARISTA_SENSOR_THRESHOLD_ALARM)
+            except SnmpError:
+                return
+            for column_name, column in (("high_warn", warns), ("high_alarm", alarms)):
+                for suffix, raw in column.items():
+                    target = threshold_roots.get(suffix)
+                    if target is None or not isinstance(raw, (int, float)):
+                        continue
+                    value = self._scaled_sensor_value(
+                        raw, scales.get(suffix), precisions.get(suffix))
+                    bands.setdefault(target, {})[column_name] = value
 
         rows = []
-        for (if_index, root), columns in sorted(bands.items()):
-            if not self._optic_band_sane(root, columns):
+        for (index, root), columns in sorted(bands.items()):
+            if not self._published_band_sane(root, columns):
                 self._log_sensor_diag(
-                    device, f"{device['ip']} publishes optic limits for "
-                            f"{root} on ifIndex {if_index} that do not make "
-                            f"sense together; they are ignored, so that port "
-                            f"raises no optical power alerts")
+                    device, f"{device['ip']} publishes {root} limits for "
+                            f"index {index} that do not make sense "
+                            f"together; they are ignored, so that sensor "
+                            f"raises no threshold alerts")
                 continue
-            rows.append({"if_index": if_index, "metric_root": root,
+            rows.append({"if_index": index, "metric_root": root,
                          "low_alarm": columns.get("low_alarm"),
                          "low_warn": columns.get("low_warn"),
                          "high_warn": columns.get("high_warn"),
                          "high_alarm": columns.get("high_alarm"),
                          "updated_ts": now})
-        self.db.replace_interface_thresholds(
-            device_id, self._CISCO_THRESHOLD_SOURCE, rows)
+        self.db.replace_interface_thresholds(device_id, source, rows)
 
-    def _optic_band_sane(self, root: str, columns: dict) -> bool:
+    def _published_band_sane(self, root: str, columns: dict) -> bool:
         """Whether a published band is coherent enough to alert on.
 
-        A partly-published band is fine and common (older IOS quotes an
-        alarm and no warning); a band that contradicts itself is not, and
-        the only honest thing to do with it is to alert on none of it. The
-        dBm range check is the one gate that can catch a scale misread,
-        which is otherwise invisible: -14.4 and -14400 are both numbers.
+        Was _optic_band_sane through 5.15.0; renamed once temp_sensor_c
+        started sharing it. A partly-published band is fine and common
+        (older IOS quotes an alarm and no warning); a band that contradicts
+        itself is not, and the only honest thing to do with it is to alert
+        on none of it. The range check is the one gate that can catch a
+        scale misread, which is otherwise invisible: -14.4 and -14400 are
+        both numbers, and so are 45 and 45000.
         """
         lows = [columns[c] for c in ("low_alarm", "low_warn") if c in columns]
         highs = [columns[c] for c in ("high_warn", "high_alarm") if c in columns]
         if root.endswith("_dbm"):
             floor, ceiling = self._DBM_LIMIT_RANGE
+            if any(not floor <= v <= ceiling for v in lows + highs):
+                return False
+        if root == "temp_sensor_c":
+            floor, ceiling = self._TEMP_LIMIT_RANGE
             if any(not floor <= v <= ceiling for v in lows + highs):
                 return False
         if "low_alarm" in columns and "low_warn" in columns \
