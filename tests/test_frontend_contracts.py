@@ -1180,8 +1180,8 @@ check("  function renderDetail()" in MAPPER_JS
 #      aria-label advertises did nothing at all after a click on the map.
 check("function focusCanvas()" in MAPPER_JS,
       "a press on the map moves focus to #mp-canvas itself")
-check(MAPPER_JS.count("focusCanvas();") == 3,
-      "all three presses that preventDefault — a node, a pan and a rubber band "
+check(MAPPER_JS.count("focusCanvas();") == 4,
+      "all four presses that preventDefault — a node, a pan, a Drag-pans pan and a rubber band "
       "— focus the canvas, so the keyboard controls its aria-label promises are "
       "live straight after a click")
 check("canvas.focus({ preventScroll: true })" in MAPPER_JS,
