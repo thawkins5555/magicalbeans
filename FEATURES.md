@@ -1168,19 +1168,34 @@ and an SFP slot without one shows **SFP**; opening a device's dialog
 upgrades a port to **DOM** if its live read finds sensors there, even one
 the poller has not yet walked. Which SNMP identity
 fields the header shows (sysDescr, sysName, sysObjectID, contact,
-location, vendor, SNMP version, and, from 5.10.0, software version and
-software image) is chosen in Nodes → Settings' detail-fields picker; the
-two new ones are on by default for a fresh install, and an install with
-its own saved list keeps exactly that list — the picker just offers the
-two new boxes to add. **Software** carries the version on its own line
-and the image, with the boot image file after it where one was read, on
-the line below — `software 15.2(7)E3` / `image
+location, vendor, SNMP version, software version and, from 5.15.0,
+firmware version and software image) is chosen in Nodes → Settings'
+detail-fields picker; a fresh install turns all of them on, and an
+install with its own saved list keeps exactly that list — the picker
+just offers the new box to add. **Software** always shows, even on a
+device that answered nothing: a version reads on its own line with the
+source in parentheses when known — `software 15.2(7)E4 (sysDescr)`,
+`7.0.12 (vendor OID)`, `… (ENTITY-MIB)` — and a device with none reads
+`software not reported` rather than hiding the line. **Firmware** is a
+separate line, shown only when a device has a firmware value distinct
+from its software one, and the image, with the boot image file after it
+where one was read, sits below that — `image
 C2960X-UNIVERSALK9-M — flash:/…bin`. The IP, status and any SNMP error
 always show. An optional **Software** column (off by default, in the
 Devices column picker, next to sysObjectID) puts the version and image on
 the device list itself, and the device CSV export always carries all
-three fields — version, image and boot file — regardless of what the
-header or the column picker show.
+version fields — software version, image, boot file and firmware —
+regardless of what the header or the column picker show.
+
+From 5.15.0, software and firmware versions are pollable for every
+vendor the MIB catalog ships, not just the 14 with the deepest coverage
+before: a scalar or table-column object for each, and an ENTITY-MIB
+fallback that finds the actual chassis row instead of guessing index 1.
+Three catalog vendors — WatchGuard, Rittal and Netgear's older broadcom
+line — have no version object in their MIBs at all and fall back to
+sysDescr/ENTITY-MIB like any unlisted vendor. See *Software version and
+image* in `INTERNALS.md` for the full vendor list and the once-a-day
+walk that backs the table-column and ENTITY-MIB cases.
 
 **A port's speed is sanity-checked against what Ethernet can actually be.**
 Speed is read from ifHighSpeed (megabits per second) in preference to
@@ -1490,6 +1505,15 @@ then version, so a fleet groups itself into "these forty are on
 version is still a row, sorted last within its own vendor rather than lost
 among the ones that answered. The summary line reads "N device(s) · M
 distinct version(s) · K reporting none".
+
+From 5.15.0 the Device column reads "name (ip)" on every row, with a
+hint naming where the name came from — sysName, a manual name, reverse
+DNS, or the bare IP when nothing else answered — so a row is never just
+an IP with no way to tell whether a name was actually missing or simply
+not shown. A **Firmware** column sits beside Software, filled from the
+same expanded vendor coverage described above. Both CSV exports (on-screen
+and server-built) add `device`, `name_source`, `fw_version`, `sw_source`
+and `fw_source` after the existing columns.
 
 Availability and Top-N build their **Export CSV** from the rows already on
 screen. Firmware inventory has that same button plus a **Download CSV

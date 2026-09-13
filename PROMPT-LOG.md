@@ -451,3 +451,39 @@ final.
   matrix provokes. Storage panel expand and the two per-port fields
   checked by hand.
 → Pushed to main.
+→ Post-release Q&A: "I'm struggling with the dbreport command - please
+  elaborate" — run it from the install directory as
+  `py -m netpath.dbreport <data_dir>`. "How long should the command take
+  to run? The database file immediately got larger after I updated the
+  application." — dbreport itself runs in seconds; the file growth is
+  separate, expected while the background rewrite is in progress and
+  because the cap no longer trims as aggressively.
+
+## 5.15.0 — [title tentative]
+
+**Team setup** — a named team for this release, same roster and rules
+carried forward from 5.14.0: Bob leads; Dora explores; Thing1 and Thing2
+on Sonnet; Testy, Fisty and Stephen King on Sonnet; Dingus1 and Dingus2 on
+Haiku; Javariius reviewing on Fable. Two work items assigned:
+(a) new ConfigRX backups show only time taken, not the date;
+(b) flesh out and polish firmware versions across all included MIBs —
+the Node → Device → Device Details dialog must show firmware version
+regardless of vendor; the firmware report must identify and export
+firmware and software versions for every device with an included MIB
+and auto ID; the report's Device field must include IP address and
+name (SNMP, manual, or DNS).
+→ Team and rules recorded; task assigned across the waves.
+→ Planning answers: two fields throughout, software and firmware version,
+  not one; the Device Details dialog always shows the software-version
+  line regardless of vendor; the firmware report's Device field renders
+  as "name (ip)" with the name source (SNMP, manual, or DNS) noted; the
+  ConfigRX backup list's Taken column always shows date and time, not
+  time alone.
+→ [outcome placeholder: ConfigRX backup date fix]
+→ [outcome placeholder: Device Details dialog firmware display]
+→ [outcome placeholder: firmware report identification/export]
+→ [outcome placeholder: firmware report Device field — IP + name]
+→ [outcome placeholder: review]
+→ [outcome placeholder: suites]
+→ [outcome placeholder: walk]
+→ [outcome placeholder: push]

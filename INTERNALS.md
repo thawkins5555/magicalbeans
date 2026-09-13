@@ -977,6 +977,67 @@ just-promoted device shows a version immediately rather than waiting for
 its first full poll, which then overwrites it with the vendor-scalar
 answer where one exists.
 
+**Every catalog vendor, and a fallback that finds the chassis — 5.15.0.**
+The resolution order is now: the arc's own vendor scalar or table column,
+then a walked ENTITY-MIB chassis row, then the generic sysDescr regex.
+`SW_VERSION_OIDS` (`nodeoids.py`) now names a verified object for 33 of
+the catalog's arcs, up from 14: nineteen more scalars/columns were added
+in 5.15.0, four of the pre-existing OIDs (Dell, Ruckus, Raritan) were
+corrected against the MIB text itself, and Netgear's smart-switch arc was
+added beside its managed-line one. `FW_VERSION_OIDS` is a second,
+smaller dict for arcs whose firmware/boot-ROM object is genuinely
+distinct from the software version (SonicWall, Eaton); `SwInfo.firmware`
+and `.fw_source` carry it, left empty when it would just repeat
+`version`. Three catalog vendors — WatchGuard, Rittal, and Netgear's
+older 4413 broadcom tree — have no version object in their MIBs at all
+and fall back to sysDescr/ENTITY-MIB like any vendor outside the catalog.
+
+Five vendors' version lives in a table column rather than a scalar —
+Dell, Ruckus, Aruba CX, Vertiv, Raritan — named in `SW_VERSION_COLUMNS`
+(`{arc: ((sw_column, fw_column | None), status_column | None)}`) and
+read through `swversion._column_first(arc)`/`_column_firmware(arc, …)`
+once `nodepoll._walk_sw_columns` has walked them. Ruckus picks the row
+whose `ruckusSwRevStatus` is `active(2)`; Raritan picks the row whose
+compound index names the main controller board (boardType 1); the rest
+take the first non-empty row. `extract()` takes an optional `columns`
+argument (`{oid: {index: value}}`) beside `scalars` for this.
+
+The ENTITY-MIB fallback no longer reads `entPhysicalSoftwareRev.1`
+unconditionally — right on some chassis, wrong on most, since index 1 is
+just whatever an agent numbered first. `nodepoll._entity_software_walk`
+walks `entPhysicalClass` to find the row of class 3 (chassis), reads that
+entity's software and firmware revisions with two GETs, and only when no
+class-3 row exists falls back to the first non-empty
+`entPhysicalSoftwareRev` row from a full column walk.
+
+Both the vendor-column walk and the ENTITY-MIB walk are bounded table
+walks (`_walk_column`, the same row-cap-and-deadline machinery every
+other table walk in this file uses), so `_poll_software_version` gates
+them: `_sw_walk_due()` allows at most one per device per 24 hours
+(`_SW_WALK_MAX_AGE_S`), and again immediately on a sysDescr change or a
+detected reboot (`detect_reboot`, comparing `sys_uptime_ticks`). State —
+last walk time, the sysDescr and uptime it saw, and the chassis index an
+ENTITY walk found — lives in `_sw_walk_state: dict[device_id, tuple]` on
+the poller, the same shape as `_credential_probe_failed`; a cached
+chassis index turns a later ENTITY walk into two GETs instead of a fresh
+class walk. `_poll_software_version` still issues exactly one GET on
+every poll (`swversion.oids_for(arc)`, now also carrying the firmware OID
+and, for the Aruba-controller arc, `wlsxSysExtSwVersion`); the walk is
+added only when that GET came back with nothing usable. A poll that
+neither answers nor walks returns no keys at all, which keeps whatever
+value is already stored.
+
+`sw_source`/`fw_source` — stored on `devices` alongside `fw_version` —
+take one of `sysDescr`, `vendor_oid` or `entity`, so Device Details and
+the firmware report can say which object actually spoke rather than
+just showing a bare string. `report.device_label(row, dns_names)` picks
+a device's display name in the same order ConfigRX and ordinary display
+logic use it in: a manual name (`display_name_source == 'manual'`) wins
+outright, then `sysName`, then a manual name stored without that marker
+(pre-5.x rows), then a reverse-DNS name from `service.app_db.hostnames`,
+then the bare IP; `firmware_inventory()`'s `device`/`name_source` fields
+and the firmware report's Device column both come from it.
+
 ### UPS and environmental health (`nodeoids.py`, `nodepoll.py`, `alertsdb.py`) — 4.49.0
 
 Two new best-effort reads ride the ordinary poll, both added because a plant
@@ -5584,6 +5645,18 @@ same rows, same order, no separate aggregate path to fall out of step.
 Both routes take `nodes:read`, matching Availability and Top-N; there is
 no window to cap, so no whole-fleet refusal applies here the way it does
 to Top-N.
+
+**Device naming and firmware — 5.15.0.** `_firmware_report()` now passes
+`hostnames=service.app_db.hostnames` into `firmware_inventory()`, which
+uses it as the one-query reverse-DNS fallback (`hostnames(ips)` →
+`{ip: name}`) `report.device_label()` needs when a device has neither a
+manual name nor a `sysName`. `FirmwareRow` gains `device` (the `"name
+(ip)"` string, or the bare IP when the label already is the IP) and
+`name_source` (`manual` / `sysName` / `dns` / `ip`) from `device_label()`,
+plus `fw_version`, `sw_source` and `fw_source` carried straight off the
+device row. The CSV header appends `device`, `name_source`, `fw_version`,
+`sw_source`, `fw_source` after the pre-5.15.0 columns, so an existing
+column position is never disturbed.
 
 ---
 

@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.15.0 — Software and firmware, for every catalog vendor](#5150--software-and-firmware-for-every-catalog-vendor)
 - [5.14.0 — The Nodes database, and what it keeps](#5140--the-nodes-database-and-what-it-keeps)
 - [5.13.0 — Neon Signs, and the backlog nobody had actioned](#5130--neon-signs-and-the-backlog-nobody-had-actioned)
 - [5.12.0 — The verified path, restored](#5120--the-verified-path-restored)
@@ -142,6 +143,109 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.15.0 — Software and firmware, for every catalog vendor
+
+Two asks. ConfigRX's backup list showed a bare clock time on a freshly
+added device; and software versions covered only 14 of the 33 vendor
+bundles the MIB catalog ships, so most non-Cisco devices showed nothing
+at all in Device Details or the firmware report.
+
+**ConfigRX "Taken" column.** `App.stamp(ts, span)` in `configrx.js`
+dropped the date whenever every backup of a device fell inside one hour —
+exactly the state of a device whose first backups were just taken, so its
+list read as though nothing had a date. The Taken column now always
+renders `App.when(r.ts)`, date and time on every row (year added only
+when it isn't this year), with the same tooltip as before; the span
+calculation that decided otherwise is gone.
+
+**Nineteen more vendors answer, with a name for each.** `SW_VERSION_OIDS`
+gains a verified scalar or table column, one MIB object per vendor,
+re-checked against the MIB text itself: Cisco wireless controllers
+(`agentInventoryProductVersion`), Netgear's managed line
+(`agentInventorySoftwareVersion`, smart-switch arc added alongside it),
+SonicWall (`snwlSysFirmwareVersion`/`snwlSysROMVersion`), APC
+(`upsAdvIdentFirmwareRevision`, falling back to
+`upsBasicIdentFirmwareRevision`), Synology (`version`), VMware
+(`vmwProdVersion`), Check Point (`svnProdVerMajor`/`svnProdVerMinor`
+composed into `major.minor`), Sophos (`sfosDeviceFWVersion`), F5
+(`sysProductVersion`), Citrix (`sysBuildVersion`), Zyxel
+(`sysSwVersionString`), Eaton (`xupsIdentSoftwareVersion`), Aruba
+controllers (`wlsxSysExtSwVersion`, only when sysDescr says "ArubaOS"),
+Cambium (`swVersion`), Aerohive (`ahFirmwareVersion`), TP-Link
+(`tpSysInfoSwVersion`) and Moxa (`siStatProductInfoFirmwareVersion`).
+Five more read a table column instead of a scalar, walked rather than
+GET: Dell (`dellNetSwModuleRuntimeImgVersion`), Ruckus
+(`ruckusSwRevision`, the row whose `ruckusSwRevStatus` is active),
+Aruba CX (`arubaWiredVsfMemberBootImage`/`...BootRomVersion`, first row),
+Vertiv (`lgpAgentDeviceFirmwareVersion`, first row) and Raritan
+(`boardFirmwareVersion`, the row naming the main controller board).
+Three vendors in the catalog have no pollable version object at all —
+WatchGuard, Rittal and Netgear's older 4413 broadcom tree — and fall back
+to sysDescr and ENTITY-MIB the way an unlisted vendor always has.
+
+**OIDs corrected.** Re-resolving every arc against the MIB text itself
+(rather than trusting an earlier pass) found four wrong: Dell's column
+OID, Ruckus's revision and status columns, and Raritan's board-firmware
+column all pointed at the wrong node and are fixed; APC's basic-ident
+fallback was undocumented and is now explicit; Netgear's smart-switch arc
+was entirely missing and is added beside the managed-line one.
+
+**The ENTITY-MIB fallback finds the chassis, not index 1.** A device with
+no vendor rule of its own used to read `entPhysicalSoftwareRev.1` and
+nothing else — right on some chassis, wrong on most, since index 1 is
+just whatever an agent numbered first. It now walks `entPhysicalClass`
+to find the row of class 3 (chassis) and reads that entity's software and
+firmware revisions; an agent that never uses class 3 falls back to the
+first non-empty software-revision row, whatever entity it is.
+
+**One walk, at most once a day.** Both the vendor-column walk and the
+ENTITY-MIB walk are bounded table walks, not a GET, so they are gated:
+at most one per device per 24 hours, and again immediately after a
+reboot or a sysDescr change (a new image, or a different device
+answering on the same IP). The chassis index found by an ENTITY walk is
+cached alongside the gate, so a later walk on the same device is a
+plain GET rather than a repeat of the class walk. A poll that does not
+walk returns nothing new and the previously stored value stands.
+
+*[Bob: fill in — this release's full-suite run, browser walk, and
+Javariius's review of the combined diff.]*
+
+**New device fields.** `fw_version`, `sw_source` and `fw_source` join
+`sw_version`/`sw_image`/`sw_image_file` on every device row, searchable
+the same way. `sw_source`/`fw_source` name which of `sysDescr`,
+`vendor_oid` or `entity` actually answered.
+
+**Device Details always shows the software line.** A device that
+answered nothing now reads "not reported" instead of hiding the line
+outright, with the source named in parentheses when known — `15.2(7)E4
+(sysDescr)`, `7.0.12 (vendor OID)`, `… (ENTITY-MIB)`. A new firmware line
+appears only when a device actually has one, so a device with a single
+version string isn't padded with an empty second line. Settings' detail-
+field picker gains the new field, and the picker's own default widens
+once more for an install still on 5.10.0's default (`sys_descr, vendor,
+snmp_version, sw_version, sw_image`) — a custom saved list is untouched.
+
+**The firmware report says which device it means.** The Device column
+now always reads "name (ip)", with a hint naming where the name came
+from — sysName, a manual name, reverse DNS, or the bare IP when none of
+those answered — instead of showing the IP alone whenever a name existed
+but leaving the reader to guess whose ip that displayed name was for. A
+new Firmware column sits beside Software; the CSV — both the browser's
+own export and the server-built one — gains `device`, `name_source`,
+`fw_version`, `sw_source` and `fw_source` after the existing columns, so
+neither drifts from what the screen showed. The devices CSV export gains
+`fw_version` at the end, existing column positions unchanged.
+
+*[Testy: fill in — contract-suite results per lane.]*
+
+Full test coverage: `tests/test_swversion.py` (one real-shaped case per
+new vendor, firmware slot, `oids_for` dedup), `tests/test_swversion_entity_walk.py`
+(the gate: walk once, skip within 24h, re-walk on reboot, first non-empty
+row wins), `tests/test_report_firmware.py` (the four name-source cases,
+`fw_version` carried, sort unchanged), `tests/test_report_routes.py` and
+the CSV header, plus the ConfigRX contract confirming `backupTimeSpan` is
+gone and the Taken cell uses `App.when`.
 
 ### 5.14.0 — The Nodes database, and what it keeps
 
