@@ -3898,6 +3898,7 @@ class NodePoller(Worker):
         if not info.version and arc in nodeoids.SW_VERSION_COLUMNS and walk_due:
             columns = self._walk_sw_columns(device, config, arc)
             info = swversion.extract(arc, sys_descr, scalars, columns)
+            self._sw_walk_state[device_id] = (now, sys_descr, uptime_ticks, cached_chassis_idx)
             walked = True
 
         if not info.version and walk_due:

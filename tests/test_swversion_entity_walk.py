@@ -144,6 +144,9 @@ check("...and never pays for the entPhysicalClass walk once the column "
       "answered",
       column_calls["dell"] == 1 and column_calls["class_walk"] == 0,
       column_calls)
+dell_again = poller2._poll_software_version(DEVICE, CONFIG, dell_identity)
+check("...and a second poll within the day does not walk the column again",
+      dell_again == {} and column_calls["dell"] == 1, (dell_again, column_calls))
 
 # ------------------------------------------------------------------ sysDescr
 
