@@ -377,15 +377,24 @@ def software_version_survives_a_lost_vendor_get():
               f"...and the stored version survives the failed poll "
               f"({db.device(device_id)['sw_version']!r} was {stored!r})")
 
-        # A device that genuinely answers with nothing is a real change; the column still clears.
+        # A device that genuinely answers with nothing -- not even
+        # ENTITY-MIB's fallback walk -- is a real change; the column clears.
+        real_walk_column = poller._walk_column
+        real_identity_extras = poller._identity_extras
         poller._snmp_get = lambda *a, **kw: _EmptyResponse()
+        poller._walk_column = lambda *a, **kw: {}
+        poller._identity_extras = lambda *a, **kw: {}
         try:
             fields = poller._poll_software_version(device, config, identity)
         finally:
             poller._snmp_get = real_get
+            poller._walk_column = real_walk_column
+            poller._identity_extras = real_identity_extras
         check(fields == {"sw_version": None, "sw_image": None,
-                         "sw_image_file": None},
-              f"a device that answers with nothing still reports NULLs "
+                         "sw_image_file": None, "fw_version": None,
+                         "sw_source": None, "fw_source": None},
+              f"a device that answers with nothing anywhere -- vendor GET "
+              f"or the ENTITY-MIB fallback walk -- still reports NULLs "
               f"({fields})")
         _record(db, device_id, {**identity, **fields})
         check(db.device(device_id)["sw_version"] is None,
