@@ -735,6 +735,30 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
     return `${rows} table row(s), summary="${summary}"`;
   });
 
+  // Firmware inventory (5.15.0 shape): every Device cell carries the IP
+  // line, and the Firmware column exists beside Software.
+  await guarded(recorder, step('feature:nodes-firmware-report'), async () => {
+    await page.click('#page-nodes .subtab[data-subtab="reports"]').catch(() => {});
+    await settle(page, 300);
+    await page.click('#nodes-sub-reports .subtab[data-subtab="firmware"]').catch(() => {});
+    await page.click('#nd-rep-fw-run', { timeout: 5000 });
+    await page.waitForFunction(
+      () => !document.getElementById('nd-rep-fw-run').disabled,
+      null, { timeout: 20000 }).catch(() => {});
+    await settle(page, 500);
+    await shoot(page, dir, shot('feature', 'nodes-firmware-report'));
+    const rows = await page.locator('#nd-rep-fw-table tbody tr').count().catch(() => 0);
+    const ipLines = await page.locator('#nd-rep-fw-table tbody tr td:first-child .ip-line').count().catch(() => 0);
+    const headers = await page.locator('#nd-rep-fw-table thead th').allTextContents().catch(() => []);
+    const gate = await gateState(page, '#nd-rep-fw-export-csv');
+    if (gate.present && gate.visible && !gate.disabled) {
+      await page.click('#nd-rep-fw-export-csv', { timeout: 5000 });
+    }
+    if (rows && ipLines !== rows) throw new Error(`${rows} rows but ${ipLines} carry an IP line`);
+    if (rows && !headers.some((h) => /firmware/i.test(h))) throw new Error('no Firmware column');
+    return `${rows} row(s), ${ipLines} with an IP line, columns=${headers.join('|')}`;
+  });
+
   // ---- OID browser (needs a selected device; nodes.js:1253 bails without
   // one). Not write-gated in the markup.
   await guarded(recorder, step('dlg:oid-browser'), async () => {
