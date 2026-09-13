@@ -463,6 +463,22 @@ own subtabs.
   overheating room. Three built-in rules replace the one this briefly
   shipped as, each tuned to its own kind of reading, plus a humidity-high
   rule for the one metric that never needed splitting.
+- **From 5.16.0, a device that publishes per-sensor temperature limits
+  is judged sensor by sensor, the same way an optic already is.** The
+  worst-of-chassis figure above stays for charts, badges and a device
+  with nothing better to offer, but a device that has one is also polled
+  for every individual sensor's own reading and, where the vendor
+  publishes one, its own warning/critical limit or a status enum — Cisco
+  ENVMON and ENTITY-SENSOR, Arista, Juniper, Aruba CX, HP ProCurve,
+  Fortinet, Extreme, Dell, Netgear, Zyxel, MikroTik, Ubiquiti, Sophos,
+  F5, Synology, APC, Eaton, Liebert and Raritan among the vendors
+  covered — reusing the same hourly published-limit walk the optics
+  already use. See Alerts → Rules for the four rules this feeds, and
+  INTERNALS for the full vendor-by-vendor object list.
+- **From 5.16.0, a power supply is polled too, on the same vendors' own
+  MIBs**, normalised to ok / warning / failed per bay; see Alerts →
+  Rules for what it feeds and INTERNALS for the object list. An empty
+  bay is never polled into an alerting state.
 - **Every optic's own readings are kept per port, not just the device's
   worst one.** The same five-minute walk records `sfp_rx_dbm`,
   `sfp_tx_dbm`, `sfp_bias_ma`, `sfp_volt` and `sfp_temp_c` for each port a
@@ -1389,6 +1405,19 @@ anything wins. Devices that answer none of them show "no MAC address
 data" instead of an empty table. Per-interface "show run" still appears as a placeholder
 until SSH integration lands.
 
+**From 5.16.0, the dialog shows what's already stored before it asks
+the device again.** The MAC section used to be empty until the live SNMP
+read above finished, which on a slow or unreachable device could be the
+better part of the wait for the whole dialog. It now renders the
+already-learned forwarding table for that port immediately — "as of"
+the last MAC walk, with an address no longer currently present shown
+dimmed — and the live read still runs and replaces it as soon as it
+answers. A live read that fails or the device doesn't support is the
+one case the stored table stays up, with a one-line hint saying so,
+rather than leaving the section blank; a device that has never had a
+MAC walk at all says learning is off for it, distinct from a walk that
+found nothing on this particular port.
+
 ### Neighbours, PoE and STP
 
 From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
@@ -1885,6 +1914,32 @@ alerts and optionally emailing about them.
   still genuinely breaching, re-opens as a new run the next time that
   rule's numbers are edited, the same as if the device had never been
   seen before.
+- **From 5.16.0, a temperature threshold can come from the sensor itself,
+  the same way an optic's already does.** Where a device publishes a
+  real per-sensor limit or a status enum for its own temperature
+  sensors — the appendix of vendor MIBs this covers is in INTERNALS —
+  four rules judge each sensor against its own reading rather than one
+  worst-of-chassis figure: **Sensor temperature high** and **critical**
+  on a published limit, and **Sensor temperature warning** and
+  **critical** on a vendor's own state enum where a limit is not
+  published at all. A device with at least one per-sensor reading is no
+  longer evaluated by the chassis-wide **Chassis temperature high/
+  critical** pair or its per-device override at all — that pair, and
+  the override, stay exactly as they are for a device with nothing
+  better to offer. Device Details' temperature block gains a per-sensor
+  table alongside the existing chassis controls; the rule editor shows
+  "Threshold — from the device's own sensor" in place of the number
+  boxes for the two published-limit rules, the same way an optic's do.
+- **From 5.16.0, a power supply that fails, loses input or shuts down
+  alerts.** Nothing polled PSU state before this release. **Power
+  supply warning** and **Power supply failed** read a normalised state
+  per bay from whichever power-supply object the device's vendor
+  publishes (the full list is in INTERNALS); an empty bay never
+  alerts — a supply that has never reported writes nothing at all — and
+  a supply that was present on the last poll and now reads not-present
+  clears back to normal rather than leaving a stale alert open. Both
+  rules roll up under a device outage the same way the temperature pair
+  does.
 - **Three of those 35 are new in 4.39.0**, and each one reports a failure
   that previously had nobody to report it. `snmp_failing_ping_ok` fires
   when a device answers ping while its SNMP agent has stopped answering —
@@ -2870,6 +2925,23 @@ reply** is when an address last actually answered;
 thing and is worth not confusing — an address swept for weeks without ever
 answering has a recent "first probed" and a "Last reply" of *never*.
 
+**From 5.16.0, a host also carries what the fleet's own devices have seen
+of it**, not only IPAM's own sweep. On a schedule of its own (**Device
+table ingest**, 5 minutes by default), IPAM reads three things Nodes
+already walks and stores — no SNMP of its own — device ARP tables,
+device IP address tables, and switches' learned-MAC tables — and folds
+them into the same host rows the sweep populates: an address seen only
+in a device's ARP table still updates **Last reply** and gains a
+**Seen by** column naming the source and which device saw it, and an
+address whose MAC was learned on a switch port gains a **Switch port**
+column naming that switch and port. A MAC learned on a port that also
+carries an LLDP/CDP neighbour is treated as an uplink and skipped, so
+the column always names the access port a host actually hangs off,
+never a link toward the rest of the network. Both columns are on by
+default in the column picker, and the Find box's source list now
+includes them ("seen in *device*'s ARP table", "learned on *switch*
+*port*").
+
 **Clear stats**, in a subnet's Edit dialog, deletes its discovered hosts and
 scan history — the donut resets to entirely "never seen," as if the subnet
 had just been added — without touching the subnet's own configuration or its
@@ -2892,6 +2964,13 @@ The DHCP cross-check only fires against reasonably fresh lease data — three
 times the DHCP poll interval, or an hour, whichever is longer — so a DHCP
 server that has not been polled recently does not generate false conflicts
 against records nobody would trust anyway.
+
+**From 5.16.0, a conflict can also come from a device's own ARP table**,
+now that IPAM ingests one (see Subnets & Hosts, above): `device_arp` is
+one device's ARP table disagreeing with the MAC already on file for an
+address, and `device_arp_dhcp` is a device's ARP table disagreeing with
+a fresh DHCP lease for it. Both read like the sweep-and-lease conflicts
+they sit beside, and name the device that reported the disagreement.
 
 ### DHCP
 
@@ -2972,6 +3051,17 @@ removes a stored one and reverts that server to ambient identity.
 A reservation with no client having claimed it yet has no lease of its own on
 the DHCP server, and would otherwise be invisible; SappiWhere synthesizes a
 row for it so a configured-but-unused reservation still shows up.
+
+**From 5.16.0, a scope's usage also counts addresses in use but not
+leased.** A statically-numbered device sitting inside a scope's range
+holds no lease and no reservation, so it used to be invisible on the
+usage donut — reading as spare capacity rather than an address nobody
+can safely hand out. The donut and legend gain an **In use, not
+leased** slice, counted from IPAM's own host data (an address inside
+the range that answers, with no lease and no reservation anywhere), and
+the scope detail lists those addresses alongside where IPAM last saw
+them. Nothing here is alerted on; the count is there to be seen on the
+scope card.
 
 Needs PowerShell with the `DhcpServer` module — part of RSAT: DHCP Server
 Tools. For ambient identity or Credential Manager, that's on the machine
@@ -3468,6 +3558,25 @@ like any other module.
   node chrome are a MAPPER concern of their own, worth choosing separately
   from whether the rest of the interface runs Dark, Light or one of the
   four newer themes.
+- **From 5.16.0, a port or VLAN label sits on a halo of its own** rather
+  than being drawn straight into the link layer, so a link added
+  afterward no longer paints over a label an earlier one already drew —
+  nothing else about where a label sits or what it says has changed.
+- **A node's name now follows the same order Nodes itself uses**: a
+  manual name, then sysName, then reverse DNS, with a device's IP always
+  on the line underneath. A manual name that is only the device's own IP
+  address (what a freshly added device starts with) no longer counts as
+  a real manual name and no longer shadows a DNS answer the way it used
+  to; hovering a node names which of the three answered.
+- **The node box is wider, and shows more of both lines** before either
+  truncates, so a longer hostname or a longer sub-label is less often
+  cut down to something unrecognisable.
+- **Drag pans**, a checkbox beside Snap, switches what a left-drag on
+  empty canvas does — rubber-band selection (unchanged default) or a pan
+  — for an operator who spends more time moving around a big map than
+  selecting things on it. It is a view preference remembered per browser,
+  not written to the map itself, and Space+drag and the middle button
+  still pan regardless of how it's set.
 
 ---
 

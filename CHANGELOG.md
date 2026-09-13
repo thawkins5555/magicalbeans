@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.16.0 — Profile overrides, device-fed IPAM, per-sensor thresholds, power supplies](#5160--profile-overrides-device-fed-ipam-per-sensor-thresholds-power-supplies)
 - [5.15.0 — Software and firmware, for every catalog vendor](#5150--software-and-firmware-for-every-catalog-vendor)
 - [5.14.0 — The Nodes database, and what it keeps](#5140--the-nodes-database-and-what-it-keeps)
 - [5.13.0 — Neon Signs, and the backlog nobody had actioned](#5130--neon-signs-and-the-backlog-nobody-had-actioned)
@@ -143,6 +144,107 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.16.0 — Profile overrides, device-fed IPAM, per-sensor thresholds, power supplies
+
+Eight asks, each confirmed against the code before it was touched.
+
+**Discovery promote no longer pins a matching credential as an override.**
+`promote()` used to land a device in the vendor-suggested (or Default)
+profile and, whenever the sweep's own community or version matched none
+of *that* profile's credentials, wrote it to the device row as an
+override — so a sweep run under a non-default profile could put its
+devices in Default carrying that profile's community as if it were
+something special about the device. Promote now targets the job's own
+`group_id` when the job recorded one (a job from before the rescan
+feature still falls back to the vendor suggestion), and checks the
+sweep's credential against *that* profile's primary and alternates
+before deciding anything is an override at all. CSV import's `profile`/
+`group` column follows the same rule. A one-time repair, gated by a
+settings marker so it runs once, clears the `community`/`snmp_version`
+override on any existing device whose pinned values equal one of its
+own profile's own credentials, and writes one Nodes event-log line with
+the count; nothing else on the row is touched, and a device whose
+override is a genuinely different community is left alone.
+
+**IPAM Conflicts and hosts now see what the fleet's own devices already
+know.** Conflicts and the Subnets & Hosts table used to hear about an
+address only from IPAM's own ping sweep and a polled DHCP server's
+leases. IPAM now also ingests, on its own schedule, three things Nodes
+already walks and stores: every device's ARP table, every device's own
+IP address table, and every switch's learned-MAC table — no SNMP of its
+own, just reading what is already on disk. Two new conflict sources
+follow from it: `device_arp` (a device's ARP table disagrees with the
+MAC already on file for an address) and `device_arp_dhcp` (a device's
+ARP table disagrees with a fresh DHCP lease for the same address) — a
+learned MAC on an access port, matched back to an address through the
+ARP data, gets that address a **Seen by** value (which source, and
+which device) and a **Switch port** value (the switch and port it was
+last learned on) in the Hosts table; a MAC seen only on an uplink port
+is skipped so the access port wins.
+
+**DHCP scope cards separate "in use" from "leased."** A scope's usage
+figure used to be its lease count alone, which reads as available
+capacity that a statically-addressed device sitting inside the range,
+with no lease and no reservation, was quietly occupying. The scope now
+also counts addresses inside its range that are up and unleased, with
+their own slice on the usage donut and their own list on the scope
+card, so a statically-numbered device inside a DHCP range is visible
+as consumed rather than invisible as spare.
+
+**Per-sensor temperature thresholds, read from the device itself.**
+Every temperature used to collapse into one worst-of-chassis figure
+per device, judged by a fixed threshold and a per-device override. The
+optic DOM pattern — read the transceiver's own published limits and
+judge each one against itself — is now applied to every temperature
+sensor a device exposes, across the whole MIB catalog: nine vendor
+bundles publish a real high-warning/high-alarm pair per sensor (Cisco
+ENVMON and ENTITY-SENSOR, Arista, Netgear, Zyxel, APC, Eaton, Liebert,
+Raritan), eight expose a status enum only (Juniper, Aruba CX, HP
+ProCurve, Fortinet, Extreme, Netgear's enum column, Zyxel's enum
+column, the rest folded per the appendix), eleven offer a bare reading
+with no limit of any kind (Dell, MikroTik, Ubiquiti, Sophos, F5,
+Synology among them), and three answer nothing at all (Palo Alto —
+which already answers the standard ENTITY-SENSOR table — WatchGuard
+and Ruckus). Four rules ship for it: **Sensor temperature high** and
+**critical** on a published limit, **Sensor temperature warning** and
+**critical** on a vendor's own state enum where that is all it gives.
+A device with at least one per-sensor reading is no longer judged by
+the old chassis-wide rule at all — that rule, and a device's own
+override of it, remain exactly as they were for every device that
+still has nothing better to offer.
+
+**A power supply that fails, loses input or shuts down now alerts.**
+Nothing polled PSU state before this release. Two rules ship —
+**Power supply warning** and **Power supply failed** — reading a
+normalised state per bay from whichever of the catalog's power-supply
+objects the device answers (Cisco ENVMON and ENTITY-FRU-CONTROL,
+Juniper, Aruba CX and wireless, HP ProCurve, MikroTik, Ubiquiti,
+Extreme, Dell, Netgear, Synology, Sophos, F5, Zyxel, VMware, APC,
+Moxa and Check Point). An empty bay never alerts — a supply that has
+never reported writes nothing, and a supply that reported present on
+the last poll and reads not-present now writes back to "normal" so an
+open alert on a pulled supply clears instead of going stale.
+
+**Mapper: labels you can read, boxes you can read them in, and a
+checkbox for how a drag behaves.** Port and VLAN labels now sit on a
+halo so a later-drawn link no longer paints over them. A node's name
+comes from a manual name, then sysName, then reverse DNS — a manual
+name that is just the device's own IP no longer shadows a real DNS
+answer — with the IP always on its own line underneath. The node box
+is wider and shows more of both lines before truncating. A new **Drag
+pans** checkbox beside Snap switches what a left-drag on empty canvas
+does, for an operator who pans more than they select; Space+drag and
+the middle button are unchanged either way.
+
+**The port dialog shows what's already known before it asks the device
+again.** The MAC addresses section used to wait on a live SNMP read
+every time it opened. It now renders the stored, previously-learned
+table immediately, then still runs the live read and replaces it — so
+a slow or unsupported live read leaves the stored table on screen with
+a hint, instead of an empty section.
+
+Verification: (filled by Bob after the suite and walk).
 
 ### 5.15.0 — Software and firmware, for every catalog vendor
 

@@ -497,3 +497,34 @@ name (SNMP, manual, or DNS).
 → Full suite 151/157, the six known environmental failures only.
 → Browser walk 890 steps ok, 0 failed; a firmware-report step added.
 → Pushed to main.
+
+## 5.16.0
+
+**Team setup** — a named team with eight work items assigned across the
+roster: (1) "Non-default profile counted as an override" — discovery
+promote pins the sweep's own community as if it were special; (2) "IPAM
+Conflicts wired to every IP source" — device ARP tables, addresses and
+learned MACs never reach IPAM; (3) "Per-sensor temperature thresholds
+from SNMP, all catalog vendors"; (4) "Power-supply loss alert" — nothing
+polls PSU state today; (5) "Mapper: port/VLAN labels crossed by lines;
+names should be hostname/DNS/SNMP plus IP"; (6) "Checkbox: drag selects
+or pans"; (7) "More of the name in the node box"; (8) "Learned MACs in
+the port dialog" — the dialog only ever waits on a live SNMP read.
+→ Planning answers: learned MACs feed IPAM as a "seen" source with the
+  switch and port shown on the address; the obscured mapper text is the
+  port/VLAN labels, not something else on the canvas; device-reported
+  thresholds are read first, with the existing chassis rule and
+  per-device override kept as the fallback for a device with nothing
+  better to offer; a PSU alert fires on failed/no input/shutdown for a
+  present supply, never on an empty bay.
+→ Clarification: the port dialog's MAC field should fill from the
+  stored, previously-learned table rather than waiting on a live walk.
+→ "Do not spawn any agents or teammates other than those listed."
+→ "1"
+→ /schedule and /loop status requests: a 15-minute status loop set for
+  the release.
+→ Plan approved.
+→ Interruption: "Why are you continuing to spawn Fable agents when you
+  have been directed not to do so?" Thing2, running on Fable in error,
+  was stopped and respawned on Sonnet; a memory note was written so
+  every roster name is spawned with its assigned model from then on.

@@ -4736,6 +4736,66 @@ keys rather than leaving a box the server refuses — a box an operator can
 type into and not save is exactly the silent ignore this release exists to
 remove.
 
+### Per-sensor temperature and PSU state as an entity kind (`alertrules.py`, `alertengine.py`, `nodeoids.py`, `nodepoll.py`) — 5.16.0
+
+Per-sensor temperature reuses `interface_thresholds` rather than a new
+table, exactly as the schema comment on that table's `metric_root`
+column already anticipated: a published limit for sensor `<idx>` on a
+device is a row keyed `(device_id, if_index=<idx>, metric_root=
+'temp_sensor_c')`, written by the same hourly walk `_poll_optic_thresholds`
+already ran for optics — renamed `_poll_published_thresholds` and given
+a second `threshold_roots` entry, `(idx, "temp_sensor_c")`, for a
+chassis-classified (not port-mapped) ENTITY-SENSOR row. `alertrules.
+PUBLISHED_THRESHOLD_RULES` gets `temp_sensor_high`/`temp_sensor_critical`
+mapped to `("temp_sensor_c", "high_warn")`/`("temp_sensor_c", "high_alarm")`
+next to the optic power keys, so the whole published-threshold machinery
+in `alertrules.py`, `alertengine.py` and `alertsdb.py` — the refusal of a
+typed number, the `" (published by …)"` label, the streak-reset-on-edit
+rule — applies with no change of its own; only the label text
+distinguishes the two (`" (published by the device)"`).
+
+A vendor exposing only a status enum writes `temp_sensor_state.<idx>`
+on a common 0/1/2/3 (normal/warning/critical/shutdown) scale instead —
+`temp_sensor_state_warning` (>= 1) and `temp_sensor_state_critical`
+(>= 2) read it directly, zero hysteresis, the same shape the UPS enum
+rules already use. `psu_state.<idx>` is the same idea for power
+supplies: 0 ok, 1 warning (degraded, fan fault), 2 failed/no input/
+shutdown, written by `_poll_vendor_sensors`/the Part D poller from
+whichever object `nodeoids.PSU_TABLES[arc]` names for that device's
+enterprise. A bay that has never reported writes nothing — so an empty
+bay never gets a `psu_state` key to alert on at all — and a bay that
+*was* present on a previous poll and now reads not-present writes 0 back
+onto its existing key rather than leaving it at its last (possibly
+failed) value: nothing today deletes a per-index metric key once
+written, so an alert on a pulled supply is cleared by that explicit
+0-write through the normal threshold-clear path, not by the key going
+stale (`threshold_stale_s` only resets a streak, it does not clear an
+open alert).
+
+`alertrules.SENSOR_FAMILIES = {"temp_sensor_c", "temp_sensor_state",
+"psu_state"}` tells the child-entity loop in `alertengine.py` to treat a
+metric in one of those families as entity kind `sensor` with entity id
+`<device_id>:<idx>` — parallel to the existing per-port entity kind, but
+labelled from the metric row's own stored label (the sensor's or bay's
+name, as the poller saw it) rather than looked up in the interfaces
+table, since a sensor has no interface row to look one up from. Dedup
+keys, rollup and the operator-resolve gate all fall out of the existing
+per-entity machinery unchanged once the entity kind and label are
+supplied.
+
+`alertrules.FALLBACK_OF = {"temp_chassis_high": "temp_sensor_c",
+"temp_chassis_critical": "temp_sensor_c"}` is read once per pass,
+alongside the published-threshold map: a device that has at least one
+`temp_sensor_c` row or a `temp_sensor_state` metric — genuine per-sensor
+coverage — has its chassis-wide rule(s) skipped for that device and
+anything already open under them resolved through the same
+`resolve_by_dedup` path the published-limit-missing branch already
+uses, rather than left to breach or clear against a worst-of figure that
+per-sensor coverage has made redundant. A device with no per-sensor
+coverage at all is evaluated exactly as before, per-device override
+included — the fallback is additive, not a replacement for the
+existing rule.
+
 ### Alert mutes (`alertsdb.py`, `alertengine._muted`)
 
 `alert_mutes(entity_kind, entity_id, until_ts, created_ts, created_by,
@@ -6976,6 +7036,48 @@ independent checks:
 
 `record_conflict()` itself dedupes: a conflict already open for that IP
 and MAC pair doesn't create a second row.
+
+### Device-table ingest (`ipam_worker.py`, `nodesdb.py`, `ipamdb.py`) — 5.16.0
+
+`IpamWorker` now takes `nodes_db` (from `service.py`, the same handle
+Nodes itself uses) and `_tick()` gained a third schedule alongside the
+subnet-scan and DHCP-poll ones: `_ingest_device_tables()`, gated on its
+own `_next_device_ingest` and due every `device_ingest_minutes` (a new
+IPAM setting, default 5). It issues no SNMP of its own — everything it
+reads was already walked and stored by Nodes' own pollers — and reads
+three sources in one pass:
+
+1. `nodes_db.arp_entries_present(since_ts)` — every `arp_entries` row
+   with `present=1` newer than the last ingest, carrying the device and
+   `if_index` that saw it. Each becomes an observation
+   `(ip, mac, "device_arp", seen_ts, detail)`.
+2. `nodes_db.device_addresses_all()` — every `device_addresses` row
+   (`ipAddrTable`), one observation per row naming the device the
+   address belongs to, with no MAC (the device *is* the address).
+3. `nodes_db.mac_entries_present(since_ts)` — every currently-present
+   `mac_entries` row, joined in memory against the ARP map built in step
+   1 (mac → ip) to find which host row a learned MAC belongs to. A MAC
+   learned on a port that also has a `neighbors` (LLDP/CDP) row is an
+   uplink and is skipped, so a host's `switch_device_id`/`switch_if_index`/
+   `switch_port` always names an access port, never a trunk toward the
+   rest of the network — the same rule `get_nodes_mac_search`'s own
+   docstring already describes for the MAC search feature.
+
+`ipamdb.record_observation(ip, mac, source, seen_ts, detail)` is the
+single write path for all three: it resolves the owning subnet via a
+new `subnet_for_ip()` (cached per ingest pass, not per row), then
+updates `hosts.mac`, `last_seen`, `last_up` — an ARP row younger than
+`arp_table_interval_s` counts the host as currently up — and two new
+`hosts` columns, `seen_source`/`seen_detail`, added through the existing
+`ensure_columns` migration style alongside `switch_device_id`,
+`switch_if_index`, `switch_port` and `switch_seen_ts`. Conflict
+detection is the same two-check shape `_scan()` already runs, extended
+with the same dedup: a fresh MAC that disagrees with the MAC already on
+file opens a `"device_arp"` conflict; a fresh MAC that disagrees with a
+still-fresh DHCP lease (the existing `dhcp_freshness_s` window) opens
+`"device_arp_dhcp"`. The ingest is idempotent — re-running it against
+rows already seen writes the same values back rather than duplicating
+observations or conflicts.
 
 ### Find: the cross-source hostname/IP/MAC search
 
