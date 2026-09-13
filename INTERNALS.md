@@ -2041,9 +2041,8 @@ then the same or nearest timestamp per other series) and calls the shared
 `App.tooltip([...], event)` (`app.js`) with the sample time
 (`App.when(ts)`) and one swatched row per series — label, `formatMetricValue`
 — plus the min–max band for a rollup point; `mouseleave` hides both the
-tooltip and the guide. The rect sits inside the same `<svg>` the wheel-zoom
-handler is attached to, so it adds no new listener surface for that "timeframe
-doesn't scale" bug to recur in. This is the one renderer both the Device
+tooltip and the guide. The rect is rebuilt with the rest of the `<svg>` on
+every redraw, so it adds no listener surface of its own. This is the one renderer both the Device
 Details charts and the interface dialog share, so all of them gained the
 hover the same way; an `opts.noHover` escape exists for a caller that wants
 none, unused today.
@@ -3295,13 +3294,13 @@ an engineer to the core switch for an access-port problem. `nodes.js`
 decides from the count: exactly one (device, port) opens that port's
 dialog, several are listed as clickable hits.
 
-**From 5.17.0, `_device_where`'s MAC subquery excludes uplink sightings from
+**From 5.17.0, `_device_filter_clause`'s MAC subquery excludes uplink sightings from
 the match itself**, rather than merely labelling them: it adds
 `AND NOT EXISTS (SELECT 1 FROM neighbors nb WHERE nb.device_id =
 mac_entries.device_id AND nb.if_index = mac_entries.if_index AND
 nb.present = 1)`, so a switch whose only sighting is on a port with a
 present LLDP/CDP neighbour drops out of both the Find box list and
-`devices_count` (which shares `_device_where`); a switch that also saw the
+`devices_count` (which shares `_device_filter_clause`); a switch that also saw the
 address on an access port is unaffected. `mac_locations` keeps every row —
 it answers "where was this ever seen", not "where does it matter" — but
 now returns that same EXISTS as an `uplink` column, plus `uplink_to` (the

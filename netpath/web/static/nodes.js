@@ -1352,8 +1352,11 @@
       App.hideTooltip();
     };
     rect.addEventListener('mousemove', (event) => {
-      const box = svg.getBoundingClientRect();
-      const x = (event.clientX - box.left) * (geo.width / Math.max(box.width, 1));
+      const pt = svg.createSVGPoint();
+      pt.x = event.clientX;
+      pt.y = event.clientY;
+      const ctm = svg.getScreenCTM();
+      const x = ctm ? pt.matrixTransform(ctm.inverse()).x : plot.x;
       const ts = geo.t0 + ((x - plot.x) / Math.max(plot.w, 1)) * (geo.t1 - geo.t0);
       const rows = [];
       let anchor = null;

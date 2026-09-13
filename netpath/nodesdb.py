@@ -3188,7 +3188,7 @@ class NodesDatabase(SqliteStore):
                 "              ELSE nb.chassis_id END"
                 "    FROM neighbors nb WHERE nb.device_id = m.device_id"
                 "      AND nb.if_index = m.if_index AND nb.present = 1"
-                "    ORDER BY nb.rem_index LIMIT 1) AS uplink_to"
+                "    ORDER BY CAST(nb.rem_index AS INTEGER), nb.rem_index LIMIT 1) AS uplink_to"
                 " FROM mac_entries m"
                 " LEFT JOIN interfaces i ON i.device_id = m.device_id"
                 "   AND i.if_index = m.if_index"

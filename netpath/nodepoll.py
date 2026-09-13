@@ -7653,7 +7653,7 @@ class NodePoller(Worker):
                 continue
             if len(octets) != addr_len:
                 continue
-            if addr_subtype == 1 and addr_len == 4:
+            if addr_subtype == 1 and addr_len == 4 and all(0 <= o <= 255 for o in octets):
                 address = ".".join(str(o) for o in octets)
             elif addr_subtype == 2 and addr_len == 16:
                 try:
