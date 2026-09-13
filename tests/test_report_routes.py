@@ -235,6 +235,25 @@ try:
     service.app_db.set_permissions("report-outsider", {"syslog": "read"})
     outsider = login("report-outsider", "ReportOutsiderPW2026")
 
+    # 5.16.0: the device's stored per-sensor rows joined to published limits.
+    sdev = service.nodes_db.add_device("10.9.9.9", name="sensor-sw")
+    service.nodes_db.record_metric_sample(sdev, "temp_sensor_c.3", "Supervisor inlet", "\u00b0C", "gauge", time.time(), 41.0)
+    service.nodes_db.record_metric_sample(sdev, "psu_state.1", "Power supply 1", "", "gauge", time.time(), 2.0)
+    service.nodes_db.replace_interface_thresholds(sdev, "CISCO-ENTITY-SENSOR-MIB", [
+        {"if_index": 3, "metric_root": "temp_sensor_c", "low_alarm": None, "low_warn": None,
+         "high_warn": 60.0, "high_alarm": 75.0, "updated_ts": time.time()}])
+    status, payload = call("GET", f"/api/nodes/devices/{sdev}/sensors", token=reader)
+    temp = next((s for s in payload.get("sensors", []) if s["kind"] == "temperature"), None)
+    psu = next((s for s in payload.get("sensors", []) if s["kind"] == "psu"), None)
+    check("/sensors joins a temperature row to its published limits",
+          status == 200 and temp and temp["name"] == "Supervisor inlet" and temp["value"] == 41.0
+          and temp["high_warn"] == 60.0 and temp["high_alarm"] == 75.0 and payload["covered"] is True,
+          (status, payload))
+    check("...and words a power supply's state",
+          psu and psu["state"] == 2 and psu["state_text"] == "failed / no input", psu)
+    status, payload = call("GET", f"/api/nodes/devices/{sdev}/sensors", token=outsider)
+    check("an account with no nodes grant is refused /sensors", status == 403, status)
+
     for path in ("/api/nodes/reports/availability",
                 "/api/nodes/reports/top-metrics?key=cpu_pct",
                 "/api/nodes/reports/firmware",

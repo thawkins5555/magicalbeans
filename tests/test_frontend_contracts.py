@@ -785,6 +785,12 @@ check("if (view.dragPans) {" in MAPPER and "localStorage.getItem('mapper.dragPan
 check("NAME_SOURCES" in MAPPER and "node.name_source" in MAPPER,
       "the node tooltip names the source of the displayed name")
 
+# 28e. 5.16.0: the TEMPERATURE ALERTS block ends with the per-sensor table,
+#      read from the stored /sensors route, never a live walk.
+check("async function renderSensorTable(" in NODES and "/sensors`" in NODES
+      and 'id="ndd-sensors"' in NODES,
+      "Device Details renders the per-sensor table from /api/nodes/devices/<id>/sensors")
+
 # ---------------------------------------------------------------------------
 # 29. The device dialog's RESOURCES section (CPU, memory, chassis
 #     temperature) shares the packet-loss chart's one /metrics fetch and

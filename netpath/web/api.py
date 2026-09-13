@@ -5273,6 +5273,49 @@ def get_nodes_device_hardware(service, params, body, device_id) -> dict:
     return service.node_poller.read_hardware(int(device_id))
 
 
+_SENSOR_FAMILY_KINDS = {"temp_sensor_c": "temperature", "temp_sensor_state": "temperature",
+                        "psu_state": "psu"}
+_PSU_STATE_WORDS = {0: "ok", 1: "degraded", 2: "failed / no input"}
+_TEMP_STATE_WORDS = {0: "normal", 1: "warning", 2: "critical", 3: "shutdown"}
+
+
+def get_nodes_device_sensors(service, params, body, device_id) -> dict:
+    """The per-sensor temperature and power-supply rows the poller stored
+    (temp_sensor_c.<i>, temp_sensor_state.<i>, psu_state.<i>) joined to the
+    limits the device published for them -- stored data only, no SNMP."""
+    _require(service.nodes_db.device(device_id), "device")
+    limits = service.nodes_db.interface_thresholds(int(device_id))
+    by_key: dict[tuple, dict] = {}
+    for row in service.nodes_db.metrics(int(device_id)):
+        root, _, suffix = str(row["key"]).partition(".")
+        kind = _SENSOR_FAMILY_KINDS.get(root)
+        if kind is None or not suffix.isdigit():
+            continue
+        index = int(suffix)
+        entry = by_key.setdefault((kind, index), {
+            "kind": kind, "index": index, "name": row["label"] or f"sensor {index}",
+            "value": None, "unit": "", "state": None, "state_text": "",
+            "high_warn": None, "high_alarm": None, "limit_source": "", "last_ts": None})
+        entry["last_ts"] = max(entry["last_ts"] or 0, row["last_ts"] or 0) or None
+        value = row["last_value"]
+        if root == "temp_sensor_c":
+            entry["value"], entry["unit"] = value, row["unit"] or "\u00b0C"
+            limit = limits.get((index, "temp_sensor_c"))
+            if limit is not None:
+                entry["high_warn"], entry["high_alarm"] = limit["high_warn"], limit["high_alarm"]
+                entry["limit_source"] = limit["source"]
+        else:
+            words = _PSU_STATE_WORDS if root == "psu_state" else _TEMP_STATE_WORDS
+            entry["state"] = None if value is None else int(value)
+            entry["state_text"] = words.get(entry["state"], str(value) if value is not None else "")
+    sensors = sorted(by_key.values(), key=lambda e: (e["kind"], e["index"]))
+    return {"sensors": sensors,
+            "covered": any(e["kind"] == "temperature" and (e["high_warn"] is not None
+                                                             or e["high_alarm"] is not None
+                                                             or e["state"] is not None)
+                           for e in sensors)}
+
+
 def get_nodes_device_dom_all(service, params, body, device_id) -> dict:
     """Every port's DOM/SFP reading in one call, for the device dialog's
     DOM / SFP SENSORS section -- read_dom() above stays the interface

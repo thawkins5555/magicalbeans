@@ -2051,6 +2051,38 @@
     </div>`;
   }
 
+  /* 5.16.0: the per-sensor rows the poller stored (each chassis temperature
+     sensor with the limit its device publishes, each power supply's state)
+     -- stored data, no SNMP. While a device has any of these, the chassis
+     rules above do not judge it (alertrules.FALLBACK_OF). */
+  async function renderSensorTable(holder, deviceId, current) {
+    const el = holder.querySelector('#ndd-sensors');
+    if (!el) return;
+    let r;
+    try { r = await App.get(`/api/nodes/devices/${deviceId}/sensors`); } catch (error) {
+      if (el && current()) el.innerHTML = `<p class="hint">Could not read sensors: ${escape(error.message)}</p>`;
+      return;
+    }
+    if (!current()) return;
+    const rows = r.sensors || [];
+    if (!rows.length) {
+      el.innerHTML = '<p class="hint">No per-sensor readings stored yet. They appear after the next ' +
+        'sensor poll on a device whose vendor exposes them; until then the chassis rules above apply.</p>';
+      return;
+    }
+    const limit = (v) => (v == null ? '\u2014' : fmtTemp(v));
+    el.innerHTML = `<p class="hint">${r.covered
+        ? 'Per-sensor coverage: each sensor below is judged on its own limit or status, and the chassis rules above stand aside for this device.'
+        : 'Readings only: this vendor publishes no limits or status, so the chassis rules above apply.'}</p>` +
+      '<table><caption class="sr-only">Per-sensor temperature and power-supply state</caption>' +
+      '<tr><th scope="col">Sensor</th><th scope="col">Reading</th><th scope="col">Warning</th>' +
+      '<th scope="col">Critical</th><th scope="col">Status</th><th scope="col">Last poll</th></tr>' +
+      rows.map((s) => `<tr><td>${escape(s.name)}${s.kind === 'psu' ? ' <span class="hint">(power supply)</span>' : ''}</td>` +
+        `<td>${s.value == null ? '\u2014' : escape(`${s.value}${s.unit}`)}</td>` +
+        `<td title="${escape(s.limit_source || '')}">${limit(s.high_warn)}</td><td title="${escape(s.limit_source || '')}">${limit(s.high_alarm)}</td>` +
+        `<td>${escape(s.state_text || '\u2014')}</td><td>${App.agoCell(s.last_ts)}</td></tr>`).join('') + '</table>';
+  }
+
   /* Fetches the two chassis rules and this device's overrides of them, and
      paints #ndd-temp-alerts. `chassisValue`/`unit` are the current reading
      already read by the hardware fetch above (or null when SNMP failed) —
@@ -2084,7 +2116,9 @@
     holder.innerHTML = (chassisValue != null
         ? `<p class="hint">Current chassis temperature: <b>${escape(fmtTemp(chassisValue))}</b></p>`
         : '<p class="hint">No current chassis-temperature reading.</p>') +
-      TEMP_RULE_KEYS.map((key) => tempRuleBlockHtml(byKey.get(key), overrideByKey.get(key))).join('');
+      TEMP_RULE_KEYS.map((key) => tempRuleBlockHtml(byKey.get(key), overrideByKey.get(key))).join('') +
+      '<div id="ndd-sensors"><p class="hint">Reading per-sensor limits\u2026</p></div>';
+    renderSensorTable(holder, deviceId, current);
     for (const btn of holder.querySelectorAll('.ndd-temp-save')) {
       btn.onclick = async () => {
         const key = btn.dataset.ruleKey;
