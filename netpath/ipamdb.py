@@ -306,6 +306,11 @@ class IpamDatabase(SqliteStore):
         self.ensure_columns("dhcp_servers",
                             {"username": "TEXT", "password_enc": "BLOB"})
         self.ensure_columns("dhcp_scopes", {"router": "TEXT"})
+        self.ensure_columns("hosts",
+                            {"seen_source": "TEXT", "seen_detail": "TEXT",
+                             "switch_device_id": "INTEGER",
+                             "switch_if_index": "INTEGER", "switch_port": "TEXT",
+                             "switch_seen_ts": "REAL"})
         self._normalise_lease_macs()
 
     # The settings row that says _normalise_lease_macs has run — the same
@@ -413,6 +418,23 @@ class IpamDatabase(SqliteStore):
         subnets (e.g. ones currently mid-scan) without loading the whole
         table."""
         return self._rows_by_ids("subnets", subnet_ids)
+
+    def subnet_for_ip(self, ip: str) -> int | None:
+        """ID of the enabled subnet whose CIDR contains the address, or None."""
+        try:
+            addr = ipaddress.ip_address(ip)
+        except (ValueError, TypeError):
+            return None
+        for subnet in self.subnets():
+            if not subnet["enabled"]:
+                continue
+            try:
+                net = ipaddress.ip_network(subnet["cidr"], strict=False)
+                if addr in net:
+                    return subnet["id"]
+            except (ValueError, TypeError):
+                continue
+        return None
 
     # ----------------------------------------------------------------- scans
 

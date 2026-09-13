@@ -3380,6 +3380,51 @@ class NodesDatabase(SqliteStore):
         with self._lock:
             return self._conn.execute(sql + " ORDER BY if_index, ip", args).fetchall()
 
+    def arp_entries_present(self, since_ts: float = 0.0) -> list[sqlite3.Row]:
+        """Present ARP entries with joined device and interface data."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT a.*, d.ip AS device_ip, d.name AS device_name,"
+                " d.sys_name AS device_sys_name, i.descr AS if_descr"
+                " FROM arp_entries a"
+                " JOIN devices d ON d.id = a.device_id"
+                " LEFT JOIN interfaces i ON i.device_id = a.device_id"
+                "  AND i.if_index = a.if_index"
+                " WHERE a.present = 1 AND a.seen_ts >= ?"
+                " ORDER BY a.seen_ts",
+                (since_ts,)).fetchall()
+
+    def mac_entries_present(self, since_ts: float = 0.0) -> list[sqlite3.Row]:
+        """Present MAC entries with joined device and interface data."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT m.*, d.ip AS device_ip, d.name AS device_name,"
+                " d.sys_name AS device_sys_name, i.descr AS if_descr"
+                " FROM mac_entries m"
+                " JOIN devices d ON d.id = m.device_id"
+                " LEFT JOIN interfaces i ON i.device_id = m.device_id"
+                "  AND i.if_index = m.if_index"
+                " WHERE m.present = 1 AND m.seen_ts >= ?"
+                " ORDER BY m.seen_ts",
+                (since_ts,)).fetchall()
+
+    def device_addresses_all(self) -> list[sqlite3.Row]:
+        """All device addresses with joined device data."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT a.device_id, a.ip, a.source, a.seen_ts, a.first_seen_ts,"
+                " a.present, d.ip AS device_ip, d.name AS device_name,"
+                " d.sys_name AS device_sys_name"
+                " FROM device_addresses a"
+                " JOIN devices d ON d.id = a.device_id").fetchall()
+
+    def neighbor_ports(self) -> list[sqlite3.Row]:
+        """Distinct (device_id, if_index) pairs from present neighbors."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT DISTINCT device_id, if_index FROM neighbors"
+                " WHERE present = 1").fetchall()
+
     def prune_arp_entries(self, older_than_s: float) -> int:
         """Drop ARP rows nothing has refreshed for this long, present or
         stale alike — prune_mac_entries' own by-age rule, applied to
