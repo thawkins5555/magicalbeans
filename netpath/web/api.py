@@ -5387,7 +5387,18 @@ def get_nodes_device_dom_all(service, params, body, device_id) -> dict:
 
 def get_nodes_device_mac_table(service, params, body, device_id, if_index) -> dict:
     _require(service.nodes_db.device(device_id), "device")
-    macs = service.node_poller.read_mac_table(int(device_id), int(if_index))
+    device_id, if_index = int(device_id), int(if_index)
+    if params.get("stored"):
+        # The port dialog's first paint: whatever the last walk stored, with
+        # no SNMP of its own, so it renders before the live read below even
+        # starts. `walked` distinguishes "this device has never had a MAC
+        # walk" from "walked, nothing learned on this port".
+        rows = service.nodes_db.mac_entries_for(device_id, if_index)
+        macs = [{"mac": row["mac"], "vlan": row["vlan"], "seen_ts": row["seen_ts"],
+                "present": row["present"]} for row in rows]
+        return {"macs": macs, "supported": True, "source": "stored",
+                "walked": service.nodes_db.has_mac_entries(device_id)}
+    macs = service.node_poller.read_mac_table(device_id, if_index)
     return {"macs": macs, "supported": macs is not None}
 
 

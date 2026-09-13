@@ -2927,31 +2927,62 @@
         if (dom && current()) dom.innerHTML = '<p class="hint">Sensor read failed — the device may not answer ENTITY-MIB requests.</p>';
       });
 
+    // The stored forwarding table renders immediately (no SNMP wait); the
+    // live read below then replaces it, or — on a failed/unsupported live
+    // read — leaves the stored table up with a one-line hint appended.
+    function macTableHtml(r, { asOf, hint } = {}) {
+      if (!r.macs || !r.macs.length) {
+        const empty = r.walked === false
+          ? 'MAC learning is off for this device (Read the MAC table every… on its profile or the device).'
+          : 'No MAC addresses learned on this port at the last walk.';
+        return App.emptyState(empty) + (hint ? `<p class="hint">${hint}</p>` : '');
+      }
+      // The VLAN column only earns its place when the source actually knew
+      // one: dot1dTpFdbTable has no VLAN in it at all.
+      const anyVlan = r.macs.some((m) => m.vlan);
+      return `${asOf ? `<p class="hint">as of ${escape(asOf)}</p>` : ''}` +
+        `<table><caption class="sr-only">MAC addresses learned on this port</caption><tr><th scope="col">MAC address</th>${
+          anyVlan ? '<th scope="col">VLAN</th>' : ''}</tr>` +
+        r.macs.map((m) => `<tr><td>${escape(m.mac)}${
+          m.present === 0 ? ' <span class="hint">(stale)</span>' : ''}</td>${
+          anyVlan ? `<td>${escape(m.vlan || '—')}</td>` : ''}</tr>`).join('') +
+        '</table>' + (hint ? `<p class="hint">${hint}</p>` : '');
+    }
+
+    let storedMacHtml = null;
+    App.get(`/api/nodes/devices/${deviceId}/interfaces/${ifIndex}/mac-table`, { stored: 1 })
+      .then((r) => {
+        const mac = box.querySelector('#ifd-mac');
+        if (!mac || !current()) return;
+        const newest = r.macs && r.macs.length
+          ? Math.max(...r.macs.map((m) => m.seen_ts || 0)) : 0;
+        storedMacHtml = macTableHtml(r, { asOf: newest ? App.when(newest) : '' });
+        mac.innerHTML = storedMacHtml;
+      })
+      .catch(() => {});
+
     App.get(`/api/nodes/devices/${deviceId}/interfaces/${ifIndex}/mac-table`)
       .then((r) => {
         const mac = box.querySelector('#ifd-mac');
         if (!mac || !current()) return;
         if (!r.supported) {
-          mac.innerHTML = '<p class="hint">No MAC address data available — this device answers ' +
+          mac.innerHTML = storedMacHtml !== null ? storedMacHtml +
+            '<p class="hint">This device answers neither the Q-BRIDGE nor the BRIDGE-MIB ' +
+            'forwarding tables — showing the last stored walk.</p>' :
+            '<p class="hint">No MAC address data available — this device answers ' +
             'neither the Q-BRIDGE nor the BRIDGE-MIB forwarding tables.</p>';
           return;
         }
-        if (!r.macs || !r.macs.length) {
-          mac.innerHTML = App.emptyState('No MAC addresses currently learned on this port.');
-          return;
-        }
-        // The VLAN column only earns its place when the source actually knew
-        // one: dot1dTpFdbTable has no VLAN in it at all.
-        const anyVlan = r.macs.some((m) => m.vlan);
-        mac.innerHTML = `<table><caption class="sr-only">MAC addresses learned on this port</caption><tr><th scope="col">MAC address</th>${
-          anyVlan ? '<th scope="col">VLAN</th>' : ''}</tr>` +
-          r.macs.map((m) => `<tr><td>${escape(m.mac)}</td>${
-            anyVlan ? `<td>${escape(m.vlan || '—')}</td>` : ''}</tr>`).join('') +
-          '</table>';
+        mac.innerHTML = macTableHtml(r);
       })
       .catch(() => {
         const mac = box.querySelector('#ifd-mac');
-        if (mac && current()) mac.innerHTML = '<p class="hint">MAC address table read failed — the device may not answer BRIDGE-MIB requests.</p>';
+        if (!mac || !current()) return;
+        // The stored table (already painted above) stays up; only append the
+        // hint rather than replacing it, unless nothing ever rendered.
+        mac.innerHTML = storedMacHtml !== null ? storedMacHtml +
+          '<p class="hint">Live MAC address table read failed — showing the last stored walk.</p>' :
+          '<p class="hint">MAC address table read failed — the device may not answer BRIDGE-MIB requests.</p>';
       });
   }
 

@@ -3192,6 +3192,17 @@ class NodesDatabase(SqliteStore):
         with self._lock:
             return self._conn.execute(sql + " ORDER BY mac, vlan", args).fetchall()
 
+    def has_mac_entries(self, device_id: int) -> bool:
+        """Whether this device has ever had a MAC walk at all (any row,
+        any port, present or stale) — the port dialog's "MAC learning is
+        off for this device" vs. "walked, nothing on this port" split.
+        A cheap EXISTS rather than mac_entries_for(device_id)'s full row
+        set, which can be thousands of rows on a big switch."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM mac_entries WHERE device_id = ?)",
+                (device_id,)).fetchone()[0] == 1
+
     def _prune_seen_ts(self, table: str, older_than_s: float,
                        budget_s: float | None = None) -> int:
         """The by-age DELETE the six walk-result tables share, batched.

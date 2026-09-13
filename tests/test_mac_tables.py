@@ -326,6 +326,27 @@ check("...while a device's explicit 0 still opts it out of the count",
       db.mac_walk_enabled_count() == 0
       and db.effective_config(db.device(did))["mac_table_interval_s"] == 0,
       (db.mac_walk_enabled_count(), dict(db.effective_config(db.device(did)))))
+
+# --------------------------------------- 7. the stored mac-table route (Part F)
+print("7. GET .../mac-table?stored=1")
+stored = api.get_nodes_device_mac_table(Svc, {"stored": "1"}, None, did, 1)
+check("stored=1 answers {macs, supported, source, walked} with no SNMP",
+      stored["supported"] is True and stored["source"] == "stored"
+      and stored["walked"] is True, stored)
+check("...carrying the walk's mac/vlan/seen_ts/present, present rows and stale alike",
+      {(m["mac"], m["vlan"], m["seen_ts"], m["present"]) for m in stored["macs"]}
+      == {("aabbccddeeff", "10", seen1, 0)}, stored["macs"])
+
+empty_did = db.add_device("10.0.0.11", name="never-walked", group_id=db.ensure_default_group())
+never_walked = api.get_nodes_device_mac_table(Svc, {"stored": "1"}, None, empty_did, 1)
+check("a device with no mac_entries rows at all answers walked=False",
+      never_walked["macs"] == [] and never_walked["walked"] is False, never_walked)
+db.remove_device(empty_did)
+
+no_rows_here = api.get_nodes_device_mac_table(Svc, {"stored": "1"}, None, did, 999)
+check("walked is True fleet-wide even when this port has no rows of its own",
+      no_rows_here["macs"] == [] and no_rows_here["walked"] is True, no_rows_here)
+
 db.close()
 
 print()

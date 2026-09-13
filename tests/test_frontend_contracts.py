@@ -2951,6 +2951,24 @@ check(NODES57.count("clearInterval(") == 0,
       "...and every clear path routes through the stop function it returns")
 
 
+
+# --- 58. Part F, 5.16.0: the port dialog reads the stored MAC table first --
+#      before waiting on the live SNMP read, so the dialog has something to
+#      show immediately rather than sitting on "Reading MAC address table…"
+#      for as long as the live walk takes.
+NODES58 = read("nodes.js")
+_MAC_ROUTE = "/mac-table`"
+_first_mac = NODES58.find(_MAC_ROUTE)
+_second_mac = NODES58.find(_MAC_ROUTE, _first_mac + 1)
+check(_first_mac != -1 and _second_mac != -1,
+      "nodes.js fetches the mac-table route twice (stored, then live)")
+_between = NODES58[_first_mac:_second_mac]
+check("stored: 1" in _between or "stored:1" in _between,
+      "the FIRST mac-table fetch asks for stored=1, before the live one")
+_second_call_line = NODES58[_second_mac:_second_mac + 80]
+check("stored" not in _second_call_line,
+      "...and the SECOND (live) fetch carries no stored=1 param")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
