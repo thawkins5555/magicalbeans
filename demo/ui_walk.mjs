@@ -305,7 +305,11 @@ async function settle(page, ms = 1200) {
   await sleep(ms);
 }
 
+// Screenshots are off by default (5.16.0, operator's call: the step
+// record is the result, the pictures were 600+ files per run). WALK_SHOTS=1
+// turns them back on for a visual check.
 async function shoot(page, dir, name) {
+  if (process.env.WALK_SHOTS !== '1') return null;
   const file = path.join(dir, `${name}.png`);
   await page.screenshot({ path: file, fullPage: false });
   return file;

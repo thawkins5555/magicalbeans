@@ -249,7 +249,14 @@ table immediately, then still runs the live read and replaces it — so
 a slow or unsupported live read leaves the stored table on screen with
 a hint, instead of an empty section.
 
-Verification: (filled by Bob after the suite and walk).
+Verification: full suite run once, alone, after every change including
+the review fixes: 156 of 162 suites passed; the six failures are the
+known environmental ones (ipam_dhcp_temp, palo_alto_polling,
+selfupdate_job, service_shutdown, snmpv3_diagnostics, temppath).
+Reviewed by Javariius (two rounds, approved). The browser walk was
+started against 250 seeded devices with the six new feature steps; the
+push went out on the operator's instruction before it finished, and
+from this release the walk takes no screenshots unless WALK_SHOTS=1.
 
 ### 5.15.0 — Software and firmware, for every catalog vendor
 
