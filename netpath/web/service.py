@@ -1332,7 +1332,16 @@ class Service:
             found["mac"] = found["mac"] or row["mac"]
             found["alive"] = bool(row["alive"])
             found["subnet"] = row["subnet_cidr"]
-            found["sources"].append("discovered by SappiWhere's own sweep")
+            keys = row.keys()
+            seen = row["seen_source"] if "seen_source" in keys else None
+            if seen == "device_arp":
+                found["sources"].append(f"seen in {row['seen_detail'] or 'a device'}'s ARP table")
+            elif seen == "device_address":
+                found["sources"].append(f"address of {row['seen_detail'] or 'a managed device'}")
+            else:
+                found["sources"].append("discovered by SappiWhere's own sweep")
+            if "switch_port" in keys and row["switch_port"]:
+                found["sources"].append(f"learned on switch port {row['switch_port']}")
             placed.add(row["ip"])
 
         for row in self.ipam_db.search_dhcp(query, limit):

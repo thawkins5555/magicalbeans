@@ -2950,6 +2950,7 @@
     }
 
     let storedMacHtml = null;
+    let liveRendered = false;
     App.get(`/api/nodes/devices/${deviceId}/interfaces/${ifIndex}/mac-table`, { stored: 1 })
       .then((r) => {
         const mac = box.querySelector('#ifd-mac');
@@ -2957,7 +2958,7 @@
         const newest = r.macs && r.macs.length
           ? Math.max(...r.macs.map((m) => m.seen_ts || 0)) : 0;
         storedMacHtml = macTableHtml(r, { asOf: newest ? App.when(newest) : '' });
-        mac.innerHTML = storedMacHtml;
+        if (!liveRendered) mac.innerHTML = storedMacHtml;
       })
       .catch(() => {});
 
@@ -2965,6 +2966,7 @@
       .then((r) => {
         const mac = box.querySelector('#ifd-mac');
         if (!mac || !current()) return;
+        liveRendered = true;
         if (!r.supported) {
           mac.innerHTML = storedMacHtml !== null ? storedMacHtml +
             '<p class="hint">This device answers neither the Q-BRIDGE nor the BRIDGE-MIB ' +
@@ -2978,6 +2980,7 @@
       .catch(() => {
         const mac = box.querySelector('#ifd-mac');
         if (!mac || !current()) return;
+        liveRendered = true;
         // The stored table (already painted above) stays up; only append the
         // hint rather than replacing it, unless nothing ever rendered.
         mac.innerHTML = storedMacHtml !== null ? storedMacHtml +

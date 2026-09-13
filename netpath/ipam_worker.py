@@ -192,26 +192,58 @@ class IpamWorker(Worker):
         dhcp_cutoff = now - max(
             float(settings.get("dhcp_poll_interval_minutes", 15)) * 60 * 3, 3600)
         mac_fresh_s = max(float(settings.get("device_ingest_minutes", 5)) * 60 * 3, 3600)
+        # An ARP or forwarding row counts as "up now" only inside two walk
+        # intervals: present=1 survives until the next walk, which may be
+        # days ago on a device whose walk was switched off.
+        try:
+            arp_interval = float(self.nodes_db.settings().get("arp_table_interval_s") or 0)
+        except Exception:
+            arp_interval = 0.0
+        fresh_cutoff = now - max(arp_interval * 2, 3600)
+        networks = []
+        for subnet in self.db.subnets():
+            if not subnet["enabled"]:
+                continue
+            try:
+                networks.append((ipaddress.ip_network(subnet["cidr"], strict=False), subnet["id"]))
+            except ValueError:
+                continue
         subnet_cache: dict[str, int | None] = {}
 
         def subnet_for(ip: str) -> int | None:
             if ip not in subnet_cache:
-                subnet_cache[ip] = self.db.subnet_for_ip(ip)
+                found = None
+                try:
+                    address = ipaddress.ip_address(ip)
+                    found = next((sid for net, sid in networks if address in net), None)
+                except ValueError:
+                    pass
+                subnet_cache[ip] = found
             return subnet_cache[ip]
+
+        leases = {}
+        for lease in self.db.dhcp_leases():
+            if lease["mac"] and lease["polled_ts"] >= dhcp_cutoff:
+                leases.setdefault(lease["ip"], lease)
 
         def device_label(row) -> str:
             return row["device_sys_name"] or row["device_name"] or row["device_ip"]
 
         opened = 0
         try:
+            observations = []
             for row in self.nodes_db.arp_entries_present(since):
                 ip, mac = row["ip"], self._stored_mac(row["mac"])
                 subnet_id = subnet_for(ip)
                 if subnet_id is None or not mac:
                     continue
                 detail = f"{device_label(row)} {row['if_descr'] or 'if' + str(row['if_index'])}"
-                previous = self.db.record_observation(
-                    ip, subnet_id, mac, "device_arp", row["seen_ts"], detail, True)
+                observations.append((ip, subnet_id, mac, "device_arp", row["seen_ts"],
+                                     detail, row["seen_ts"] >= fresh_cutoff))
+            for (ip, _sid, mac, _src, seen_ts, detail, fresh), previous in zip(
+                    observations, self.db.record_observations(observations)):
+                if not fresh:
+                    continue
                 if previous and previous["mac"] and previous["mac"] != mac \
                         and (previous["last_mac_ts"] or 0) >= now - mac_fresh_s:
                     if self.db.record_conflict(ip, previous["mac"], mac, "device_arp", detail):
@@ -219,8 +251,8 @@ class IpamWorker(Worker):
                         self.log.add(IPAM, f"Possible IP conflict: {ip} is {previous['mac']} "
                                            f"on file but {mac} in the ARP table of {detail}",
                                      target=ip)
-                lease = self.db.dhcp_lease_for_ip(ip)
-                if lease and lease["mac"] and lease["polled_ts"] >= dhcp_cutoff:
+                lease = leases.get(ip)
+                if lease is not None:
                     lease_mac = mac_colon(lease["mac"])
                     if lease_mac and lease_mac != mac:
                         if self.db.record_conflict(ip, lease_mac, mac, "device_arp_dhcp", detail):
@@ -228,34 +260,36 @@ class IpamWorker(Worker):
                             self.log.add(IPAM, f"{ip} is {mac} in the ARP table of {detail}, "
                                                f"but the DHCP server's lease says {lease_mac}",
                                          target=ip)
+            addresses = []
             for row in self.nodes_db.device_addresses_all():
                 subnet_id = subnet_for(row["ip"])
                 if subnet_id is None:
                     continue
-                self.db.record_observation(
-                    row["ip"], subnet_id, None, "device_address", row["seen_ts"],
-                    device_label(row), bool(row["present"]))
+                addresses.append((row["ip"], subnet_id, None, "device_address", row["seen_ts"],
+                                  device_label(row), bool(row["present"])))
             # A device's polled address is its devices row, not a
             # device_addresses row, so it is folded in from there.
             for row in self.nodes_db.devices():
                 subnet_id = subnet_for(row["ip"])
                 if subnet_id is None:
                     continue
-                self.db.record_observation(
-                    row["ip"], subnet_id, None, "device_address",
-                    row["last_poll_ts"] or now, row["sys_name"] or row["name"] or row["ip"],
-                    row["status"] == "up")
+                addresses.append((row["ip"], subnet_id, None, "device_address",
+                                  row["last_poll_ts"] or now,
+                                  row["sys_name"] or row["name"] or row["ip"],
+                                  row["status"] == "up"))
+            self.db.record_observations(addresses)
             ip_by_mac = self.db.host_macs()
             uplinks = {(r["device_id"], r["if_index"]) for r in self.nodes_db.neighbor_ports()}
+            ports = []
             for row in self.nodes_db.mac_entries_present(since):
-                if (row["device_id"], row["if_index"]) in uplinks:
+                if (row["device_id"], row["if_index"]) in uplinks or row["seen_ts"] < fresh_cutoff:
                     continue
                 ip = ip_by_mac.get(self._stored_mac(row["mac"]) or "")
                 if not ip:
                     continue
                 port = row["if_descr"] or f"if{row['if_index']}"
-                self.db.set_host_switch_port(
-                    ip, row["device_id"], row["if_index"], port, row["seen_ts"])
+                ports.append((ip, row["device_id"], row["if_index"], port, row["seen_ts"]))
+            self.db.set_host_switch_ports(ports)
         except Exception as exc:
             self.log.add(ERROR, f"IPAM device-table ingest failed: {exc}")
             return opened

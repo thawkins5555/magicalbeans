@@ -171,14 +171,23 @@ mk = nodeoids.PSU_TABLES[14988]
 poller_mk = new_poller()
 poller_mk._walk_column = table_walker({
     mk.state: {"0": 1},                              # primary ok
-    mk.extra_scalars[0][0]: {"0": 0},                 # backup failed
+    mk.extra_scalars[0][0]: {"0": 0},                 # backup absent reads false(0)
 })
 dev_mk = device("1.3.6.1.4.1.14988.1.1")
 poller_mk._poll_vendor_sensors(6, dev_mk, CONFIG, 1_700_000_000.0)
 samples_mk = poller_mk.db.samples_dict(6)
-check("MikroTik: primary and backup PSU are two independent scalars",
-      samples_mk.get("psu_state.0") == 0.0 and samples_mk.get("psu_state.2") == 2.0,
+check("MikroTik: the primary is ok and a backup reading false writes nothing "
+      "(a board with one supply must not alert on the second)",
+      samples_mk.get("psu_state.0") == 0.0 and "psu_state.2" not in samples_mk,
       samples_mk)
+poller_mk2 = new_poller()
+poller_mk2._walk_column = table_walker({
+    mk.state: {"0": 1},
+    mk.extra_scalars[0][0]: {"0": 1},                 # backup present and ok
+})
+poller_mk2._poll_vendor_sensors(6, dev_mk, CONFIG, 1_700_000_000.0)
+check("...and a backup reading true is its own ok row",
+      poller_mk2.db.samples_dict(6).get("psu_state.2") == 0.0, poller_mk2.db.samples_dict(6))
 
 # --------------------------------------------------------------- VMware class
 vm = nodeoids.PSU_TABLES[6876]

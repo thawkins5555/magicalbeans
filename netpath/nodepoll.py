@@ -235,19 +235,26 @@ def _vendor_state_value(raw, state_map: dict | None, state_default=None):
     return state_map.get(ikey, state_default)
 
 
-def _flatten_vendor_idx(suffix: str) -> str:
-    """A walked column's index suffix, collapsed to the last component.
+_VENDOR_IDX_BASE = 1000
 
-    Most of nodeoids.SENSOR_TABLES/PSU_TABLES are indexed by one plain
-    integer and this is a no-op; a compound index (Eaton's
-    sensorIndex.temperatureIndex, Raritan's pduId.sensorID) has no single
-    integer this feature's metric-key shape (root.<int>, digits only) could
-    keep whole, so only its last, most-specific component survives -- a
-    stable choice as long as the same table's sibling columns (name,
-    threshold, state) share the same index shape, which every entry here
-    does.
+
+def _flatten_vendor_idx(suffix: str) -> str:
+    """A walked column's index suffix as one integer string, the shape
+    the metric keys need (root.<int>). A plain index is unchanged; a
+    compound one (Netgear unit.sensor, Dell type.unit.psu, Raritan
+    pduId.sensorID) is packed base 1000 so unit 2 sensor 1 (2001) can never
+    overwrite unit 1 sensor 1 (1001). Sibling columns of one table share
+    the index shape, so every map built from them packs the same way.
     """
-    return suffix.rsplit(".", 1)[-1] if "." in suffix else suffix
+    if "." not in suffix:
+        return suffix
+    packed = 0
+    for part in suffix.split("."):
+        try:
+            packed = packed * _VENDOR_IDX_BASE + int(part)
+        except ValueError:
+            return suffix.rsplit(".", 1)[-1]
+    return str(packed)
 
 
 def report_reason(response) -> tuple[str, str]:
@@ -6470,7 +6477,9 @@ class NodePoller(Worker):
         raw_oid = device["sys_object_id"] if "sys_object_id" in keys else ""
         arc = nodeoids.enterprise_arc(raw_oid or "")
         sensor_table = nodeoids.SENSOR_TABLES.get(arc)
-        if device["sensor_capable"]:
+        read_device = getattr(self.db, "device", None)
+        latest = read_device(device_id) if read_device else None
+        if (latest if latest is not None else device)["sensor_capable"]:
             sensor_table = None
         psu_tables = nodeoids.PSU_TABLES.get(arc)
         if psu_tables is not None and not isinstance(psu_tables, tuple):
@@ -6629,13 +6638,15 @@ class NodePoller(Worker):
                 table.label.format(idx=idx) if table.label else f"PSU {idx}")
             rows[idx] = {"label": str(label),
                         "state": _vendor_state_value(raw, table.state_map, table.state_default)}
-        for oid, idx, label in table.extra_scalars:
+        for entry in table.extra_scalars:
+            oid, idx, label = entry[:3]
+            scalar_map = entry[3] if len(entry) > 3 else table.state_map
             extra = self._walk_column(device, config, oid)
             raw = extra.get("0")
             if raw is None:
                 continue
             rows[idx] = {"label": label,
-                        "state": _vendor_state_value(raw, table.state_map, table.state_default)}
+                        "state": _vendor_state_value(raw, scalar_map, table.state_default)}
         return rows
 
     def _vendor_threshold_source(self, table) -> str:

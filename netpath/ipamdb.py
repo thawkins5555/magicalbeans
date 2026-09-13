@@ -573,7 +573,22 @@ class IpamDatabase(SqliteStore):
         record_host writes for a sweep, but stamped with where it came from.
         `fresh` means the source still lists the address now, so it counts
         as up. Returns the previous row, for the caller's conflict check."""
+        return self.record_observations([(ip, subnet_id, mac, source, seen_ts, detail, fresh)])[0]
+
+    def record_observations(self, rows) -> list:
+        """record_observation for many rows under one lock and one commit --
+        an ingest pass over a core router's ARP table is tens of thousands
+        of rows. Returns each row's previous host row, in order."""
+        previous_rows = []
         with self._lock:
+            for ip, subnet_id, mac, source, seen_ts, detail, fresh in rows:
+                previous_rows.append(self._observe(ip, subnet_id, mac, source, seen_ts, detail, fresh))
+            if rows:
+                self._conn.commit()
+        return previous_rows
+
+    def _observe(self, ip, subnet_id, mac, source, seen_ts, detail, fresh):
+        if True:
             previous = self._conn.execute(
                 "SELECT * FROM hosts WHERE ip=?", (ip,)).fetchone()
             if previous is None:
@@ -594,18 +609,22 @@ class IpamDatabase(SqliteStore):
                     " seen_source=?, seen_detail=? WHERE ip=?",
                     (subnet_id, mac, fresh, seen_ts, fresh, seen_ts,
                      mac_changed, seen_ts, source, detail, ip))
-            self._conn.commit()
         return previous
 
     def set_host_switch_port(self, ip: str, device_id: int, if_index: int,
                              port: str, seen_ts: float) -> None:
         """The access port a host's MAC was learned on; a newer sighting wins."""
+        self.set_host_switch_ports([(ip, device_id, if_index, port, seen_ts)])
+
+    def set_host_switch_ports(self, rows) -> None:
         with self._lock:
-            self._conn.execute(
+            self._conn.executemany(
                 "UPDATE hosts SET switch_device_id=?, switch_if_index=?, switch_port=?,"
                 " switch_seen_ts=? WHERE ip=? AND COALESCE(switch_seen_ts, 0) <= ?",
-                (device_id, if_index, port, seen_ts, ip, seen_ts))
-            self._conn.commit()
+                [(device_id, if_index, port, seen_ts, ip, seen_ts)
+                 for ip, device_id, if_index, port, seen_ts in rows])
+            if rows:
+                self._conn.commit()
 
     def host_macs(self) -> dict[str, str]:
         """mac -> ip for every host with a MAC on file."""

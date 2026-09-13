@@ -1922,7 +1922,7 @@ alerts and optionally emailing about them.
   worst-of-chassis figure: **Sensor temperature high** and **critical**
   on a published limit, and **Sensor temperature warning** and
   **critical** on a vendor's own state enum where a limit is not
-  published at all. A device with at least one per-sensor reading is no
+  published at all. A device that publishes a per-sensor limit or status is no
   longer evaluated by the chassis-wide **Chassis temperature high/
   critical** pair or its per-device override at all — that pair, and
   the override, stay exactly as they are for a device with nothing

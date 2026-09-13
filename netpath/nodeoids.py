@@ -1251,7 +1251,9 @@ PSU_TABLES = {
     14988: PsuTable(   # MikroTik MIKROTIK-MIB, primary + backup scalars
         state="1.3.6.1.4.1.14988.1.1.3.15",
         label="PSU",
-        extra_scalars=(("1.3.6.1.4.1.14988.1.1.3.16", "2", "Backup PSU"),),
+        # The backup reads false(0) on a board with no second supply, so its
+        # own map has no failure value: 0 only clears a key that exists.
+        extra_scalars=(("1.3.6.1.4.1.14988.1.1.3.16", "2", "Backup PSU", {1: 0}),),
         state_map={1: 0, 0: 2},   # BoolValue true(1) "ok" / false(0) "failed"
     ),
     41112: PsuTable(   # Ubiquiti UBNT-EdgeMAX-MIB

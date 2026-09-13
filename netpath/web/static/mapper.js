@@ -286,7 +286,8 @@
     const tone = DEVICE_STATUS_TONE[node.status] || 'none';
     const statusWord = DEVICE_STATUS_LABEL[node.status] || node.status || 'Unknown';
     return {
-      node, name, sub: node.ip || '', tone, unmanaged: false, gone: false,
+      node, name, sub: (node.name_source === 'ip' || node.ip === name) ? '' : (node.ip || ''),
+      tone, unmanaged: false, gone: false,
       role: node.role || '', badges,
       tooltip: `${name}\n${node.ip || ''}\nStatus    ${statusWord}` +
         (node.name_source ? `\nName      ${NAME_SOURCES[node.name_source] || node.name_source}` : ''),

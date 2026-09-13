@@ -209,7 +209,7 @@ which already answers the standard ENTITY-SENSOR table — WatchGuard
 and Ruckus). Four rules ship for it: **Sensor temperature high** and
 **critical** on a published limit, **Sensor temperature warning** and
 **critical** on a vendor's own state enum where that is all it gives.
-A device with at least one per-sensor reading is no longer judged by
+A device that publishes a per-sensor limit or status is no longer judged by
 the old chassis-wide rule at all — that rule, and a device's own
 override of it, remain exactly as they were for every device that
 still has nothing better to offer.
@@ -224,7 +224,12 @@ Extreme, Dell, Netgear, Synology, Sophos, F5, Zyxel, VMware, APC,
 Moxa and Check Point). An empty bay never alerts — a supply that has
 never reported writes nothing, and a supply that reported present on
 the last poll and reads not-present now writes back to "normal" so an
-open alert on a pulled supply clears instead of going stale.
+open alert on a pulled supply clears instead of going stale. Two
+vendor notes: a MikroTik backup supply that reads "false" writes nothing
+(single-supply boards never alert on the second slot); a Moxa switch
+reports its second power input as not-present when nothing is wired to
+it, and that does alert ("Power 2") — turn the rule off for that device
+from its Device Details if the second input is deliberately unused.
 
 **Mapper: labels you can read, boxes you can read them in, and a
 checkbox for how a drag behaves.** Port and VLAN labels now sit on a

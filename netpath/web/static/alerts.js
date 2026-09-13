@@ -558,7 +558,7 @@
     // A device or interface alert whose device has since been removed from
     // Nodes resolves to nothing either, and saying so beats naming a kind
     // that plainly is muteable everywhere else on the page.
-    const wasDevice = row.entity_kind === 'device' || row.entity_kind === 'interface';
+    const wasDevice = ['device', 'interface', 'sensor'].includes(row.entity_kind);
     const why = deviceId
       ? 'Muting a device needs Alerts write'
       : (wasDevice

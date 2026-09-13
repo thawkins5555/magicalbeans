@@ -4783,8 +4783,8 @@ keys, rollup and the operator-resolve gate all fall out of the existing
 per-entity machinery unchanged once the entity kind and label are
 supplied.
 
-`alertrules.FALLBACK_OF = {"temp_chassis_high": "temp_sensor_c",
-"temp_chassis_critical": "temp_sensor_c"}` is read once per pass,
+`alertrules.FALLBACK_OF = {"temp_chassis_high": ("temp_sensor_c", "temp_sensor_state"),
+"temp_chassis_critical": ("temp_sensor_c", "temp_sensor_state")}` is read once per pass,
 alongside the published-threshold map: a device that has at least one
 `temp_sensor_c` row or a `temp_sensor_state` metric — genuine per-sensor
 coverage — has its chassis-wide rule(s) skipped for that device and
@@ -7042,7 +7042,7 @@ and MAC pair doesn't create a second row.
 `IpamWorker` now takes `nodes_db` (from `service.py`, the same handle
 Nodes itself uses) and `_tick()` gained a third schedule alongside the
 subnet-scan and DHCP-poll ones: `_ingest_device_tables()`, gated on its
-own `_next_device_ingest` and due every `device_ingest_minutes` (a new
+own `_next_ingest` and due every `device_ingest_minutes` (a new
 IPAM setting, default 5). It issues no SNMP of its own — everything it
 reads was already walked and stored by Nodes' own pollers — and reads
 three sources in one pass:
@@ -7063,18 +7063,20 @@ three sources in one pass:
    rest of the network — the same rule `get_nodes_mac_search`'s own
    docstring already describes for the MAC search feature.
 
-`ipamdb.record_observation(ip, mac, source, seen_ts, detail)` is the
-single write path for all three: it resolves the owning subnet via a
-new `subnet_for_ip()` (cached per ingest pass, not per row), then
-updates `hosts.mac`, `last_seen`, `last_up` — an ARP row younger than
-`arp_table_interval_s` counts the host as currently up — and two new
+`ipamdb.record_observations(rows)` (each row `(ip, subnet_id, mac, source, seen_ts, detail, fresh)`, one commit per pass) is the
+single write path for all three: the worker resolves the owning subnet
+from one read of the subnet list per pass (`subnet_for_ip()` stays for
+single lookups), then it updates `hosts.mac`, `last_seen`, `last_up` — an
+ARP or forwarding row younger than twice `arp_table_interval_s` (at least
+an hour) counts the host as currently up; an older `present=1` row only
+refreshes the MAC and source — and two new
 `hosts` columns, `seen_source`/`seen_detail`, added through the existing
 `ensure_columns` migration style alongside `switch_device_id`,
 `switch_if_index`, `switch_port` and `switch_seen_ts`. Conflict
 detection is the same two-check shape `_scan()` already runs, extended
 with the same dedup: a fresh MAC that disagrees with the MAC already on
 file opens a `"device_arp"` conflict; a fresh MAC that disagrees with a
-still-fresh DHCP lease (the existing `dhcp_freshness_s` window) opens
+still-fresh DHCP lease (the same three-poll window `_scan` uses) opens
 `"device_arp_dhcp"`. The ingest is idempotent — re-running it against
 rows already seen writes the same values back rather than duplicating
 observations or conflicts.
