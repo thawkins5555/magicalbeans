@@ -479,11 +479,21 @@ name (SNMP, manual, or DNS).
   as "name (ip)" with the name source (SNMP, manual, or DNS) noted; the
   ConfigRX backup list's Taken column always shows date and time, not
   time alone.
-→ [outcome placeholder: ConfigRX backup date fix]
-→ [outcome placeholder: Device Details dialog firmware display]
-→ [outcome placeholder: firmware report identification/export]
-→ [outcome placeholder: firmware report Device field — IP + name]
-→ [outcome placeholder: review]
-→ [outcome placeholder: suites]
-→ [outcome placeholder: walk]
-→ [outcome placeholder: push]
+→ ConfigRX: the Taken column dropped the date whenever a device's backups
+  all fell inside one hour (a freshly added device); it now shows date and
+  time on every row.
+→ Device Details always shows the software line ("not reported" when
+  nothing answered) with the source in brackets, and a firmware line when
+  the device has a separate boot/firmware version.
+→ Versions: 19 more vendor arcs answer from their own MIB object (every
+  OID re-derived mechanically from the catalog MIB text; four were wrong
+  in the first pass and fixed); five vendors read a table column; the
+  ENTITY-MIB fallback finds the chassis row instead of index 1; walks are
+  gated to once a day per device. WatchGuard, Rittal and Netgear's old
+  broadcom tree have no pollable object and stay on sysDescr/ENTITY.
+→ Firmware report: Device is "name (ip)" with the name source (sysName,
+  manual, reverse DNS, ip), a Firmware column, five new CSV columns.
+→ Javariius: nine findings over two passes, all fixed, approved.
+→ Full suite 151/157, the six known environmental failures only.
+→ Browser walk 887 steps, 0 failures; a firmware-report step added.
+→ Pushed to main.

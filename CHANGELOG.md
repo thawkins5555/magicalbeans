@@ -209,8 +209,20 @@ cached alongside the gate, so a later walk on the same device is a
 plain GET rather than a repeat of the class walk. A poll that does not
 walk returns nothing new and the previously stored value stands.
 
-*[Bob: fill in — this release's full-suite run, browser walk, and
-Javariius's review of the combined diff.]*
+**Verification.** Javariius reviewed the combined diff twice: nine
+findings (the vendor-column firmware lost to the ENTITY walk, the report
+linking the stored name rather than the one it chose, Vertiv's card
+scalar missing, four documentation and defensive nits, and the untested
+firmware scalars), all fixed in the same release and re-confirmed. Every
+shipped OID was re-derived mechanically from the catalog MIB text, which
+is how the Dell, Ruckus, Raritan and APC corrections were found. Full
+suite 151/157 with only the six known environmental failures
+(ipam_dhcp_temp, palo_alto_polling, selfupdate_job, service_shutdown,
+snmpv3_diagnostics, temppath); the suites this release touches were
+rerun on the final commits. Browser walk on the 250-device fleet: 887
+steps, 0 failures, plus a new `feature:nodes-firmware-report` step that
+runs the report, exports it and checks every Device cell carries its IP
+line and that the Firmware column is present.
 
 **New device fields.** `fw_version`, `sw_source` and `fw_source` join
 `sw_version`/`sw_image`/`sw_image_file` on every device row, searchable
@@ -239,7 +251,10 @@ own export and the server-built one — gains `device`, `name_source`,
 neither drifts from what the screen showed. The devices CSV export gains
 `fw_version` at the end, existing column positions unchanged.
 
-*[Testy: fill in — contract-suite results per lane.]*
+Per-lane contract suites (swversion, swversion_entity_walk,
+poll_write_path, device_identity, report_firmware, report_routes,
+reports_ui, frontend_contracts, configrx_search_compliance_ui,
+review_fixes_f3, device_search_fields, csv_export) all pass.
 
 Full test coverage: `tests/test_swversion.py` (one real-shaped case per
 new vendor, firmware slot, `oids_for` dedup), `tests/test_swversion_entity_walk.py`
