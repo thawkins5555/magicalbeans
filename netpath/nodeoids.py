@@ -765,6 +765,7 @@ FW_VERSION_OIDS = {  # arc: firmware/boot-ROM OID, separate from the software ve
     534: "1.3.6.1.4.1.534.1.1.3.0",       # xupsIdentSoftwareVersion
 }
 FW_VERSION_OIDS[705] = FW_VERSION_OIDS[534]  # Eaton's other arc, same XUPS-MIB
+FW_VERSION_OIDS[476] = "1.3.6.1.4.1.476.1.42.2.1.3.0"  # lgpAgentIdentFirmwareVersion: the card, when no managed device answers
 
 # Column vendors: {arc: ((sw column OID | None, fw column OID | None), status column OID | None)}.
 # Walked (not GET) by nodepoll.py, gated as described there; extract() reads the

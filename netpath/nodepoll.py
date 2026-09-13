@@ -3830,7 +3830,7 @@ class NodePoller(Worker):
             classes = _int_keyed(self._walk_column(
                 device, config, self._ENT_PHYSICAL_CLASS, deadline=deadline))
             for suffix, value in sorted(classes.items()):
-                if int(value or 0) == self._ENT_CLASS_CHASSIS:
+                if str(value).strip() == str(self._ENT_CLASS_CHASSIS):
                     idx = suffix
                     break
         if idx is not None:
@@ -3871,6 +3871,7 @@ class NodePoller(Worker):
         cached_chassis_idx = state[3] if state else None
         walk_due = answered and self._sw_walk_due(device_id, sys_descr, uptime_ticks, now)
         walked = False
+        columns = {}
 
         if not info.version and arc in nodeoids.SW_VERSION_COLUMNS and walk_due:
             columns = self._walk_sw_columns(device, config, arc)
@@ -3882,7 +3883,8 @@ class NodePoller(Worker):
             entity_scalars, chassis_idx = self._entity_software_walk(
                 device, config, cached_chassis_idx)
             if entity_scalars:
-                info = swversion.extract(arc, sys_descr, {**scalars, **entity_scalars})
+                info = swversion.extract(arc, sys_descr, {**scalars, **entity_scalars},
+                                         columns)
             self._sw_walk_state[device_id] = (now, sys_descr, uptime_ticks, chassis_idx)
             walked = True
 
@@ -5155,7 +5157,7 @@ class NodePoller(Worker):
     # match _TRANSCEIVER_TEXT even spelled out. Descr and model name carry
     # the whole job, for one fewer full walk of entPhysical per cadence.
     _ENT_PHYSICAL_CLASS = "1.3.6.1.2.1.47.1.1.1.1.5"
-    _ENT_CLASS_CHASSIS = 3  # entPhysicalClass chassis(3), the row _poll_software_version's ENTITY-MIB fallback wants
+    _ENT_CLASS_CHASSIS = 3  # entPhysicalClass chassis(3)
     _ENT_PHYSICAL_MODEL_NAME = "1.3.6.1.2.1.47.1.1.1.1.13"
     # entPhysicalName: RFC 6933 makes it optional, so read_dom's own decode
     # (shared with _poll_environment, both pre-dating this column's use

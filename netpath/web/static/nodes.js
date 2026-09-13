@@ -1009,7 +1009,7 @@
     const s = App.state.nodesSettings || {};
     // ?? not ||: an admin who unchecks every field means "just IP·status",
     // which arrives as '' and must not fall back to the defaults.
-    const fields = String(s.detail_fields ?? 'sys_descr,vendor,snmp_version,sw_version,sw_image')
+    const fields = String(s.detail_fields ?? 'sys_descr,vendor,snmp_version,sw_version,fw_version,sw_image')
       .split(',').map((f) => f.trim()).filter(Boolean);
     // IP · status always leads and any SNMP error always trails; the
     // fields between them are the admin's Settings choice.
@@ -4120,7 +4120,7 @@
   const FIRMWARE_COLUMNS = [
     { key: 'name', label: 'Device', width: 210,
       value: (r) => r.device || r.name || r.ip || `#${r.device_id}`,
-      cell: (r) => App.deviceNameLink(r.name || r.ip || `#${r.device_id}`,
+      cell: (r) => App.deviceNameLink(r.label || r.name || r.ip || `#${r.device_id}`,
                                       { id: r.device_id }) +
         `<div class="ip-line">${escape(r.ip || '')}${
           r.name_source && r.name_source !== 'ip' ? ` · ${escape(NAME_SOURCES[r.name_source] || r.name_source)}` : ''}</div>` },

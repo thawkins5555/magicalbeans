@@ -257,6 +257,31 @@ check("a vendor with a software scalar, a separate firmware scalar and both "
       "ENTITY-MIB fallbacks asks for all four, once each",
       len(oids) == 4 and len(oids) == len(set(oids)), oids)
 
+# ------------------------------------------------------- firmware scalars
+
+for name, arc, descr, version, firmware in (
+        ("SonicWall: snwlSysFirmwareVersion + snwlSysROMVersion", 8741,
+         "SonicWALL TZ 370", "7.0.1-5145", "6.4.0.0"),
+        ("Eaton 534: xupsIdentSoftwareVersion lands as firmware", 534,
+         "Eaton 5PX", "", "02.10.0012"),
+        ("Eaton 705 shares the XUPS-MIB object", 705,
+         "Eaton 9PX", "", "03.02.0001"),
+        ("Vertiv: the agent card's scalar when no managed device answered", 476,
+         "Liebert GXT4", "", "2.500.0")):
+    scalars = {nodeoids.FW_VERSION_OIDS[arc]: firmware}
+    if version:
+        scalars[nodeoids.SW_VERSION_OIDS[arc][0]] = version
+    info = swversion.extract(arc, descr, scalars)
+    check(name, info.version == version and info.firmware == firmware and
+          info.fw_source == "vendor_oid", repr(info))
+
+VERTIV_FW = nodeoids.SW_VERSION_COLUMNS[476][0][1]
+info = swversion.extract(476, "Liebert GXT4",
+                         {nodeoids.FW_VERSION_OIDS[476]: "2.500.0"},
+                         columns={VERTIV_FW: {"1": "UPS 4.1.2"}})
+check("...and the managed device's own firmware column beats the card's scalar",
+      info.firmware == "UPS 4.1.2", repr(info))
+
 # ------------------------------------------------------------- ArubaOS 14823
 
 info = swversion.extract(14823, "ArubaOS (MODEL: Aruba7210)",

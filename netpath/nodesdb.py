@@ -2156,7 +2156,7 @@ class NodesDatabase(SqliteStore):
             # is a detected value by definition, and leaving it NULL until the
             # first poll would make ConfigRX and the Cisco MAC read fall back
             # to a blank vendor on a device that was just identified.
-            firmware = getattr(sw, "firmware", "")
+            firmware = sw.firmware
             self._conn.execute(
                 "UPDATE devices SET sys_descr = ?, sys_name = ?,"
                 " sys_object_id = ?, vendor = ?, vendor_detected = ?,"
@@ -2167,7 +2167,7 @@ class NodesDatabase(SqliteStore):
                 (sys_descr, sys_name, sys_object_id, vendor, vendor,
                  vendor_source or "", vendor_confidence or "", vendor_evidence,
                  sw.version or None, sw.image or None, firmware or None,
-                 sw.source or None, (sw.source or None) if firmware else None,
+                 sw.source or None, sw.fw_source or None,
                  device_id))
             self._conn.commit()
 

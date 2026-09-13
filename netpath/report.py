@@ -432,6 +432,7 @@ class FirmwareRow:
     sw_source: str
     fw_source: str
     device: str
+    label: str
     name_source: str
     last_poll_ts: float | None
 
@@ -504,7 +505,7 @@ def firmware_inventory(nodesdb, device_ids: list[int] | None = None,
             sw_image_file=(row["sw_image_file"] or "") if "sw_image_file" in keys else "",
             sw_source=(row["sw_source"] or "") if "sw_source" in keys else "",
             fw_source=(row["fw_source"] or "") if "fw_source" in keys else "",
-            device=device, name_source=name_source,
+            device=device, label=label, name_source=name_source,
             last_poll_ts=row["last_poll_ts"]))
     # A device with no version sorts last within its vendor.
     rows.sort(key=lambda r: (r.vendor.lower(), not r.sw_version,

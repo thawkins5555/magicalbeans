@@ -187,8 +187,9 @@ to sysDescr and ENTITY-MIB the way an unlisted vendor always has.
 **OIDs corrected.** Re-resolving every arc against the MIB text itself
 (rather than trusting an earlier pass) found four wrong: Dell's column
 OID, Ruckus's revision and status columns, and Raritan's board-firmware
-column all pointed at the wrong node and are fixed; APC's basic-ident
-fallback was undocumented and is now explicit; Netgear's smart-switch arc
+column all pointed at the wrong node and are fixed; PowerNet-MIB has no
+basic-ident firmware object, so APC reads upsAdvIdentFirmwareRevision
+alone; Netgear's smart-switch arc
 was entirely missing and is added beside the managed-line one.
 
 **The ENTITY-MIB fallback finds the chassis, not index 1.** A device with
@@ -214,7 +215,8 @@ Javariius's review of the combined diff.]*
 **New device fields.** `fw_version`, `sw_source` and `fw_source` join
 `sw_version`/`sw_image`/`sw_image_file` on every device row, searchable
 the same way. `sw_source`/`fw_source` name which of `sysDescr`,
-`vendor_oid` or `entity` actually answered.
+`vendor_oid`, `entPhysicalSoftwareRev` or `entPhysicalFirmwareRev`
+actually answered.
 
 **Device Details always shows the software line.** A device that
 answered nothing now reads "not reported" instead of hiding the line

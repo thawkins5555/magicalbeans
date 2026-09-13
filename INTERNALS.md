@@ -1028,7 +1028,8 @@ neither answers nor walks returns no keys at all, which keeps whatever
 value is already stored.
 
 `sw_source`/`fw_source` — stored on `devices` alongside `fw_version` —
-take one of `sysDescr`, `vendor_oid` or `entity`, so Device Details and
+take one of `sysDescr`, `vendor_oid`, `entPhysicalSoftwareRev` or
+`entPhysicalFirmwareRev`, so Device Details and
 the firmware report can say which object actually spoke rather than
 just showing a bare string. `report.device_label(row, dns_names)` picks
 a device's display name in the same order ConfigRX and ordinary display

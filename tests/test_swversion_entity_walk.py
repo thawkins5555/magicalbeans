@@ -173,6 +173,50 @@ check("a sysDescr change (a new image, or a different device on the IP) "
       "re-walks inside the 24h window too",
       descr_calls["class_walk"] == 2, descr_calls)
 
+# ------------------------------------------ firmware-only column + no answer
+
+poller4 = new_poller()
+poller4._identity_extras_detail = lambda device, config, oids: ({}, True)
+VERTIV_FW = nodeoids.SW_VERSION_COLUMNS[476][0][1]
+vertiv_calls = {"fw": 0, "class_walk": 0}
+
+
+def fake_walk_column_vertiv(device, config, base_oid, raise_on_timeout=False, deadline=None):
+    if base_oid == VERTIV_FW:
+        vertiv_calls["fw"] += 1
+        return {"1": "UPS 4.1.2"}
+    if base_oid == poller4._ENT_PHYSICAL_CLASS:
+        vertiv_calls["class_walk"] += 1
+        return {"1": "3"}
+    return {}
+
+
+poller4._walk_column = fake_walk_column_vertiv
+poller4._identity_extras = lambda device, config, oids: {
+    f"{ENT_SW}.1": "AGENT 9.9", f"{ENT_FW}.1": ""}
+vertiv = poller4._poll_software_version(
+    DEVICE, CONFIG, {"vendor_arc": 476, "sys_descr": "Liebert GXT4", "sys_uptime_ticks": 10})
+check("a firmware-only column vendor keeps its column firmware when the "
+      "ENTITY walk then supplies the software version",
+      vertiv.get("fw_version") == "UPS 4.1.2" and vertiv.get("sw_version") == "AGENT 9.9"
+      and vertiv_calls == {"fw": 1, "class_walk": 1}, (vertiv, vertiv_calls))
+
+poller5 = new_poller()
+poller5._identity_extras_detail = lambda device, config, oids: ({}, False)
+silent_calls = {"walks": 0}
+
+
+def fake_walk_column_silent(device, config, base_oid, raise_on_timeout=False, deadline=None):
+    silent_calls["walks"] += 1
+    return {}
+
+
+poller5._walk_column = fake_walk_column_silent
+silent = poller5._poll_software_version(
+    DEVICE, CONFIG, {"vendor_arc": None, "sys_descr": "x", "sys_uptime_ticks": 10})
+check("a GET that got no reply at all suppresses the walk and keeps the stored values",
+      silent == {} and silent_calls["walks"] == 0, (silent, silent_calls))
+
 nodepoll_mod.time.time = _real_time
 
 print()

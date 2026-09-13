@@ -318,16 +318,16 @@ _GENERIC = r"(?:firmware|version|revision|release)[:\s]+v?([0-9][\w.()-]*)"
 
 
 def _fill_firmware(arc, info: SwInfo, scalars: dict, columns: dict) -> SwInfo:
-    """firmware/fw_source, in the vendor scalar > vendor column >
-    entPhysicalFirmwareRev order, dropped when it just repeats `version`."""
+    """firmware/fw_source: vendor column (the equipment) > vendor scalar >
+    entPhysicalFirmwareRev, dropped when it just repeats `version`."""
     firmware = ""
     fw_source = ""
-    fw_oid = VENDOR_FW_OIDS.get(arc)
-    if fw_oid:
-        firmware = _text(scalars.get(fw_oid))
-        fw_source = "vendor_oid" if firmware else ""
-    if not firmware and arc in nodeoids.SW_VERSION_COLUMNS:
+    if arc in nodeoids.SW_VERSION_COLUMNS:
         firmware = _column_firmware(arc, columns)
+        fw_source = "vendor_oid" if firmware else ""
+    fw_oid = VENDOR_FW_OIDS.get(arc)
+    if not firmware and fw_oid:
+        firmware = _text(scalars.get(fw_oid))
         fw_source = "vendor_oid" if firmware else ""
     if not firmware:
         firmware = _text(scalars.get(ENT_FIRMWARE_REV))

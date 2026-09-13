@@ -99,7 +99,7 @@ check("to_dict() is JSON-shaped all the way down (a route returns it as is)",
       and set(payload["rows"][0]) == {
           "device_id", "name", "ip", "vendor", "model_hint", "sw_version",
           "fw_version", "sw_image", "sw_image_file", "sw_source", "fw_source",
-          "device", "name_source", "last_poll_ts"},
+          "device", "label", "name_source", "last_poll_ts"},
       payload["rows"][0])
 
 check("fw_version is carried through as stored, alongside sw_version",
