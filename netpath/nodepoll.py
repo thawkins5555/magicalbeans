@@ -185,6 +185,71 @@ def _optical_direction(label: str, descr: str) -> str | None:
     return None
 
 
+_VENDOR_NUMERIC_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
+
+
+def _vendor_numeric(raw, numeric_prefix: bool) -> float | None:
+    """A nodeoids.SensorTable/PsuTable reading as a float, or None.
+
+    `numeric_prefix` vendors (HP's "45C", Fortinet's mixed-unit strings)
+    always go through the regex, since a plain float() would raise on the
+    trailing unit letter; every other vendor's column is already numeric
+    SNMP (Integer32/Gauge32), so the regex is only a fallback there for an
+    agent that answers it as a numeric string anyway.
+    """
+    if raw is None:
+        return None
+    if not numeric_prefix and isinstance(raw, (int, float)):
+        return float(raw)
+    match = _VENDOR_NUMERIC_RE.match(str(raw).strip())
+    return float(match.group(0)) if match else None
+
+
+def _vendor_state_value(raw, state_map: dict | None, state_default=None):
+    """A vendor's own state enum normalised through a
+    nodeoids.SensorTable/PsuTable's `state_map`, or None to skip the row
+    entirely (not present, administratively off — not a fourth severity).
+
+    An int raw value is looked up directly; a string one is matched exactly
+    first (a vendor answering "Normal"/"normal" alike) and then by
+    substring, for the handful of vendors whose free-text status embeds the
+    word that matters ("Fault detected" still means fault). `state_default`
+    covers a vendor with only a couple of named states and everything else
+    implied ("else -> critical") — a map with no default and no match skips
+    the row, which is the right call for silently-added new enum values.
+    """
+    if not state_map or raw is None:
+        return None
+    if isinstance(raw, str):
+        key = raw.strip().lower()
+        if key in state_map:
+            return state_map[key]
+        for needle, level in state_map.items():
+            if isinstance(needle, str) and needle and needle in key:
+                return level
+        return state_default
+    try:
+        ikey = int(raw)
+    except (TypeError, ValueError):
+        return state_default
+    return state_map.get(ikey, state_default)
+
+
+def _flatten_vendor_idx(suffix: str) -> str:
+    """A walked column's index suffix, collapsed to the last component.
+
+    Most of nodeoids.SENSOR_TABLES/PSU_TABLES are indexed by one plain
+    integer and this is a no-op; a compound index (Eaton's
+    sensorIndex.temperatureIndex, Raritan's pduId.sensorID) has no single
+    integer this feature's metric-key shape (root.<int>, digits only) could
+    keep whole, so only its last, most-specific component survives -- a
+    stable choice as long as the same table's sibling columns (name,
+    threshold, state) share the same index shape, which every entry here
+    does.
+    """
+    return suffix.rsplit(".", 1)[-1] if "." in suffix else suffix
+
+
 def report_reason(response) -> tuple[str, str]:
     """(usmStats name, plain explanation) for a Report-PDU, or ("", "")
     when it names nothing this table knows."""
@@ -6365,6 +6430,276 @@ class NodePoller(Worker):
         # with no ports; keep the badges until a walk answers.
         if port_map:
             self.db.update_interface_media(device_id, media_rows)
+
+    # ------------------------------------------------ vendor sensor/PSU tables
+    #
+    # nodeoids.SENSOR_TABLES/PSU_TABLES: temperature and power-supply
+    # objects for every catalog vendor _poll_environment's ENTITY-SENSOR/
+    # CISCO-ENTITY-SENSOR walk does not reach (see that module's own
+    # comment for the resolver run this shipped against). Same probe-once-
+    # remember cadence as _poll_environment (_SENSOR_REFRESH_S /
+    # _SENSOR_REPROBE_S), its own latch column (vendor_sensor_capable) so a
+    # device answering neither table stops being asked every poll, and its
+    # own threshold cadence (_SENSOR_THRESHOLD_REFRESH_S) for the vendors
+    # that publish per-sensor limits.
+
+    def _poll_vendor_sensors(self, device_id: int, device, config: dict,
+                             now: float) -> None:
+        """Per-sensor temp_sensor_c.<idx>/temp_sensor_state.<idx>/
+        psu_state.<idx> from nodeoids.SENSOR_TABLES/PSU_TABLES, keyed on
+        the device's own enterprise arc.
+
+        The temperature table is only tried for a device NOT already
+        confirmed to answer ENTITY-SENSOR-MIB (device['sensor_capable']):
+        Cisco's legacy CISCO-ENVMON-MIB table and CISCO-ENTITY-SENSOR-MIB
+        index their sensors completely differently (a status-table row
+        number vs. entPhysicalIndex), so a device answering both would have
+        two unrelated sensors sharing one temp_sensor_c.<1> key, each poll
+        overwriting the other's reading. PSU_TABLES has no such overlap —
+        ENTITY-SENSOR-MIB carries no PSU state at all — so it always runs.
+        """
+        if not config.get("snmp_enabled", True):
+            return
+        capable = device["vendor_sensor_capable"]
+        window = self._SENSOR_REPROBE_S if capable == 0 else self._SENSOR_REFRESH_S
+        if now - self._vendor_sensor_read.get(device_id, 0.0) < window:
+            return
+        self._vendor_sensor_read[device_id] = now
+
+        keys = device.keys() if hasattr(device, "keys") else device
+        raw_oid = device["sys_object_id"] if "sys_object_id" in keys else ""
+        arc = nodeoids.enterprise_arc(raw_oid or "")
+        sensor_table = nodeoids.SENSOR_TABLES.get(arc)
+        if device["sensor_capable"]:
+            sensor_table = None
+        psu_tables = nodeoids.PSU_TABLES.get(arc)
+        if psu_tables is not None and not isinstance(psu_tables, tuple):
+            psu_tables = (psu_tables,)
+        if sensor_table is None and not psu_tables:
+            if capable is None:
+                self.db.set_vendor_sensor_capable(device_id, False)
+            return
+
+        existing = {row["key"] for row in self.db.metrics(device_id)}
+        samples = []
+        answered = False
+
+        if sensor_table is not None:
+            rows = self._vendor_sensor_rows(device, config, sensor_table)
+            if rows:
+                answered = True
+            for idx, row in rows.items():
+                if row["value"] is not None:
+                    samples.append((f"temp_sensor_c.{idx}",
+                                    f"{row['label']} temperature", "°C",
+                                    "gauge", now, row["value"]))
+                if row["state"] is not None:
+                    samples.append((f"temp_sensor_state.{idx}",
+                                    f"{row['label']} state", "state",
+                                    "gauge", now, float(row["state"])))
+            if now - self._vendor_sensor_threshold_read.get(device_id, 0.0) \
+                    >= self._SENSOR_THRESHOLD_REFRESH_S:
+                self._vendor_sensor_threshold_read[device_id] = now
+                self._poll_vendor_sensor_thresholds(
+                    device_id, device, config, sensor_table, rows, now)
+
+        for table in psu_tables or ():
+            rows = self._vendor_psu_rows(device, config, table)
+            if rows:
+                answered = True
+            for idx, row in rows.items():
+                key = f"psu_state.{idx}"
+                if row["state"] is None:
+                    # Not present / administratively off this poll. A key
+                    # that never existed stays that way (an empty bay must
+                    # never alert); a key that DID exist -- this supply was
+                    # seen present before -- gets one explicit 0 so an open
+                    # alert on a pulled supply clears instead of going
+                    # stale forever (nothing else here deletes metric keys).
+                    if key in existing:
+                        samples.append((key, row["label"], "state", "gauge",
+                                        now, 0.0))
+                    continue
+                samples.append((key, row["label"], "state", "gauge", now,
+                                float(row["state"])))
+
+        if not capable and answered:
+            self.db.set_vendor_sensor_capable(device_id, True)
+        elif capable is None and not answered:
+            self.db.set_vendor_sensor_capable(device_id, False)
+        if samples:
+            self.db.record_metric_samples(device_id, samples)
+
+    def _vendor_sensor_rows(self, device, config: dict, table) -> dict:
+        """idx -> {"label", "value" (already scaled, or None), "state"
+        (0..3 or None), "scale"} for one nodeoids.SensorTable -- the walk
+        _poll_vendor_sensors and _poll_vendor_sensor_thresholds share, so a
+        published limit is only ever kept for an idx this poll actually
+        read a sensor for.
+        """
+        rows: dict[str, dict] = {}
+        values = {_flatten_vendor_idx(k): v for k, v in
+                  self._walk_column(device, config, table.value).items()}
+        label_override = None
+        if not values and table.value_fallback:
+            values = {_flatten_vendor_idx(k): v for k, v in
+                      self._walk_column(device, config, table.value_fallback).items()}
+            label_override = table.value_fallback_label
+        names = ({_flatten_vendor_idx(k): v for k, v in
+                  self._walk_column(device, config, table.name).items()}
+                 if table.name else {})
+        digits = ({_flatten_vendor_idx(k): v for k, v in
+                   self._walk_column(device, config, table.decimal_digits).items()}
+                  if table.decimal_digits else {})
+        for idx, raw in values.items():
+            name = names.get(idx)
+            if table.name_filter and (name is None or
+                    table.name_filter.lower() not in str(name).lower()):
+                continue
+            label = name or label_override \
+                or (table.label.format(idx=idx) if table.label else f"Sensor {idx}")
+            num = _vendor_numeric(raw, table.numeric_prefix)
+            if num is None or num in table.skip_raw:
+                continue
+            scale = table.scale
+            if idx in digits:
+                try:
+                    scale = 1.0 / (10 ** int(digits[idx]))
+                except (TypeError, ValueError, ZeroDivisionError):
+                    pass
+            rows[idx] = {"label": str(label), "value": num * scale,
+                        "state": None, "scale": scale}
+        for oid, idx, label in table.extra_scalars:
+            extra = self._walk_column(device, config, oid)
+            raw = extra.get("0")
+            if raw is None:
+                continue
+            num = _vendor_numeric(raw, table.numeric_prefix)
+            if num is None or num in table.skip_raw:
+                continue
+            rows[idx] = {"label": label, "value": num * table.scale,
+                        "state": None, "scale": table.scale}
+        if table.state:
+            states = {_flatten_vendor_idx(k): v for k, v in
+                      self._walk_column(device, config, table.state).items()}
+            for idx, raw in states.items():
+                state = _vendor_state_value(raw, table.state_map, table.state_default)
+                if state is None:
+                    continue
+                row = rows.get(idx)
+                if row is None:
+                    label = names.get(idx) or (
+                        table.label.format(idx=idx) if table.label else f"Sensor {idx}")
+                    row = rows[idx] = {"label": str(label), "value": None,
+                                       "state": None, "scale": table.scale}
+                row["state"] = state
+        return rows
+
+    def _vendor_psu_rows(self, device, config: dict, table) -> dict:
+        """idx -> {"label", "state" (0/1/2, or None to skip/clear)} for one
+        nodeoids.PsuTable. See _poll_vendor_sensors for what a None state
+        means to the caller."""
+        rows: dict[str, dict] = {}
+        class_map = ({_flatten_vendor_idx(k): v for k, v in
+                      self._walk_column(device, config, table.class_col).items()}
+                     if table.class_col else {})
+        skip_map = ({_flatten_vendor_idx(k): v for k, v in
+                     self._walk_column(device, config, table.skip_when_col).items()}
+                    if table.skip_when_col else {})
+        names = ({_flatten_vendor_idx(k): v for k, v in
+                  self._walk_column(device, config, table.name).items()}
+                 if table.name else {})
+        states = {_flatten_vendor_idx(k): v for k, v in
+                  self._walk_column(device, config, table.state).items()}
+        for idx, raw in states.items():
+            if table.class_col:
+                try:
+                    if int(class_map.get(idx)) not in table.class_values:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            if table.skip_when_col:
+                try:
+                    skip_raw = skip_map.get(idx)
+                    if skip_raw is not None and int(skip_raw) in table.skip_when_values:
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            label = names.get(idx) or (
+                table.label.format(idx=idx) if table.label else f"PSU {idx}")
+            rows[idx] = {"label": str(label),
+                        "state": _vendor_state_value(raw, table.state_map, table.state_default)}
+        for oid, idx, label in table.extra_scalars:
+            extra = self._walk_column(device, config, oid)
+            raw = extra.get("0")
+            if raw is None:
+                continue
+            rows[idx] = {"label": label,
+                        "state": _vendor_state_value(raw, table.state_map, table.state_default)}
+        return rows
+
+    def _vendor_threshold_source(self, table) -> str:
+        """A stable, human-legible source name for
+        nodesdb.replace_interface_thresholds -- the OID of the table's own
+        threshold column is unique enough per arc that it doubles as the
+        MIB name a later diff would recognise."""
+        return f"nodeoids.SENSOR_TABLES:{table.value}"
+
+    def _poll_vendor_sensor_thresholds(self, device_id: int, device, config: dict,
+                                       table, rows: dict, now: float) -> None:
+        """The published high-warning/high-critical limits one
+        nodeoids.SensorTable exposes, into interface_thresholds with
+        metric_root='temp_sensor_c' -- the vendor-table sibling of
+        _poll_published_thresholds' Cisco/Arista ENTITY-SENSOR walk.
+
+        Only ever writes a row for an idx `rows` (this poll's reading/state
+        walk) actually produced: a threshold column answering for an entity
+        the value walk never reached would publish a limit for a sensor
+        this poll has no reading to judge it against.
+        """
+        if not (table.thresholds or table.threshold_scalars) or not rows:
+            return
+        per_row_columns: dict[str, dict] = {}
+        for band, oid in (table.thresholds or {}).items():
+            for suffix, raw in self._walk_column(device, config, oid).items():
+                idx = _flatten_vendor_idx(suffix)
+                num = _vendor_numeric(raw, table.numeric_prefix)
+                if num is None:
+                    continue
+                scale = rows.get(idx, {}).get("scale", table.scale)
+                per_row_columns.setdefault(idx, {})[band] = num * scale
+        global_columns: dict = {}
+        for band, oid in (table.threshold_scalars or {}).items():
+            raw = self._walk_column(device, config, oid).get("0")
+            num = _vendor_numeric(raw, table.numeric_prefix)
+            if num is not None:
+                global_columns[band] = num * table.scale
+
+        published = []
+        for idx in rows:
+            band_values = dict(global_columns)
+            band_values.update(per_row_columns.get(idx, {}))
+            if not band_values:
+                continue
+            if not self._published_band_sane("temp_sensor_c", band_values):
+                self._log_sensor_diag(
+                    device, f"{device['ip']} publishes temp_sensor_c limits "
+                            f"for index {idx} that do not make sense "
+                            f"together; they are ignored, so that sensor "
+                            f"raises no threshold alerts")
+                continue
+            try:
+                if_index = int(idx)
+            except ValueError:
+                continue
+            published.append({"if_index": if_index, "metric_root": "temp_sensor_c",
+                              "low_alarm": band_values.get("low_alarm"),
+                              "low_warn": band_values.get("low_warn"),
+                              "high_warn": band_values.get("high_warn"),
+                              "high_alarm": band_values.get("high_alarm"),
+                              "updated_ts": now})
+        self.db.replace_interface_thresholds(
+            device_id, self._vendor_threshold_source(table), published)
 
     # BRIDGE-MIB (RFC 4188) columns used by read_mac_table() to map the
     # forwarding-database entries learned on a switch port back to the
