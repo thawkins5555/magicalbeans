@@ -196,7 +196,7 @@ class IpamWorker(Worker):
         # intervals: present=1 survives until the next walk, which may be
         # days ago on a device whose walk was switched off.
         try:
-            arp_interval = float(self.nodes_db.settings().get("arp_table_interval_s") or 0)
+            arp_interval = float(self.nodes_db.max_arp_table_interval_s())
         except Exception:
             arp_interval = 0.0
         fresh_cutoff = now - max(arp_interval * 2, 3600)

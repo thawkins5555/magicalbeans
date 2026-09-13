@@ -588,27 +588,26 @@ class IpamDatabase(SqliteStore):
         return previous_rows
 
     def _observe(self, ip, subnet_id, mac, source, seen_ts, detail, fresh):
-        if True:
-            previous = self._conn.execute(
-                "SELECT * FROM hosts WHERE ip=?", (ip,)).fetchone()
-            if previous is None:
-                self._conn.execute(
-                    "INSERT INTO hosts(ip, subnet_id, mac, alive, first_seen, last_seen,"
-                    " last_up, last_mac_ts, seen_source, seen_detail)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (ip, subnet_id, mac, 1 if fresh else 0, seen_ts, seen_ts,
-                     seen_ts if fresh else None, seen_ts if mac else None, source, detail))
-            else:
-                mac_changed = bool(mac) and mac != previous["mac"]
-                self._conn.execute(
-                    "UPDATE hosts SET subnet_id=COALESCE(subnet_id, ?), mac=COALESCE(?, mac),"
-                    " alive=CASE WHEN ? THEN 1 ELSE alive END,"
-                    " last_seen=MAX(last_seen, ?),"
-                    " last_up=CASE WHEN ? THEN MAX(COALESCE(last_up, 0), ?) ELSE last_up END,"
-                    " last_mac_ts=CASE WHEN ? THEN ? ELSE last_mac_ts END,"
-                    " seen_source=?, seen_detail=? WHERE ip=?",
-                    (subnet_id, mac, fresh, seen_ts, fresh, seen_ts,
-                     mac_changed, seen_ts, source, detail, ip))
+        previous = self._conn.execute(
+            "SELECT * FROM hosts WHERE ip=?", (ip,)).fetchone()
+        if previous is None:
+            self._conn.execute(
+                "INSERT INTO hosts(ip, subnet_id, mac, alive, first_seen, last_seen,"
+                " last_up, last_mac_ts, seen_source, seen_detail)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (ip, subnet_id, mac, 1 if fresh else 0, seen_ts, seen_ts,
+                 seen_ts if fresh else None, seen_ts if mac else None, source, detail))
+        else:
+            mac_changed = bool(mac) and mac != previous["mac"]
+            self._conn.execute(
+                "UPDATE hosts SET subnet_id=COALESCE(subnet_id, ?), mac=COALESCE(?, mac),"
+                " alive=CASE WHEN ? THEN 1 ELSE alive END,"
+                " last_seen=MAX(last_seen, ?),"
+                " last_up=CASE WHEN ? THEN MAX(COALESCE(last_up, 0), ?) ELSE last_up END,"
+                " last_mac_ts=CASE WHEN ? THEN ? ELSE last_mac_ts END,"
+                " seen_source=?, seen_detail=? WHERE ip=?",
+                (subnet_id, mac, fresh, seen_ts, fresh, seen_ts,
+                 mac_changed, seen_ts, source, detail, ip))
         return previous
 
     def set_host_switch_port(self, ip: str, device_id: int, if_index: int,

@@ -3360,6 +3360,16 @@ class NodesDatabase(SqliteStore):
             self._conn.commit()
         return len(rows)
 
+    def max_arp_table_interval_s(self) -> float:
+        """The longest ARP walk interval any device or profile sets -- the
+        IPAM ingest's freshness window (arp_table_interval_s is a column on
+        both, never a setting)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(v) FROM (SELECT arp_table_interval_s AS v FROM devices"
+                " UNION ALL SELECT arp_table_interval_s FROM groups)").fetchone()
+        return float(row[0] or 0)
+
     def arp_walk_enabled_count(self) -> int:
         """How many enabled devices are configured to walk their ARP cache
         — mac_walk_enabled_count's own one-query shape, for the same
