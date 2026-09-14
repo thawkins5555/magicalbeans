@@ -1732,6 +1732,10 @@
         <div id="as-sms-to-list">${smsNumbersListHtml(smsNumbers)}</div>
         <label>Add number <input id="as-sms-to-add" placeholder="+15551234567"></label>
         <button type="button" id="as-sms-to-add-btn">Add</button>
+        <p class="hint" id="as-sms-consent">By adding a number you confirm the person at that
+          number has agreed to receive network alert text messages from SappiWhere. Message
+          frequency varies by network activity. Message and data rates may apply.
+          Reply STOP to unsubscribe, HELP for help.</p>
         ${number('as-sms-maxhour', 'Max texts per hour', s.sms_max_per_hour ?? 30, 'min=1')}
         <p class="hint">One text per number per notification, cut to 160
           characters, with its own hourly budget apart from email's.</p>

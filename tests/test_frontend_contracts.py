@@ -3058,6 +3058,8 @@ check("twilio_auth_mode:" in NODES63,
       "Save sends twilio_auth_mode in the /api/settings values")
 check("for the selected method before saving" in NODES63,
       "Save refuses to silently switch auth mode without a new secret")
+check('id="as-sms-consent"' in NODES63, "the SMS number list carries the A2P consent notice")
+check("Reply STOP to unsubscribe" in NODES63, "...with STOP/HELP wording carriers expect")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))
