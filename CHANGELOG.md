@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.20.1 — SMS consent notice](#5201--sms-consent-notice)
 - [5.20.0 — Twilio API keys](#5200--twilio-api-keys)
 - [5.19.0 — Twilio SMS on alerts](#5190--twilio-sms-on-alerts)
 - [5.18.0 — Port names, device names everywhere, IPAM in-use rows, MIB auto-assign, chart ranges, mapper drawing and matching](#5180--port-names-device-names-everywhere-ipam-in-use-rows-mib-auto-assign-chart-ranges-mapper-drawing-and-matching)
@@ -148,6 +149,28 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.20.1 — SMS consent notice
+
+Twilio's A2P 10DLC campaign review asks for the exact consent wording
+and a screenshot of where it is collected. Numbers are only ever
+entered by an authenticated administrator on the Alerts settings
+dialog, so that screen is now the in-application opt-in evidence.
+
+**A consent notice under the Default numbers list.** The TEXT MESSAGES
+(TWILIO) section of Alerts settings now shows, beside **Add number**
+(`#as-sms-consent`): "By adding a number you confirm the person at
+that number has agreed to receive network alert text messages from
+SappiWhere. Message frequency varies by network activity. Message and
+data rates may apply. Reply STOP to unsubscribe, HELP for help." The
+app does not handle inbound replies; STOP and HELP are answered by
+Twilio's Advanced Opt-Out, which the operator turns on in the Twilio
+console.
+
+Files: `alerts.js`.
+
+Verification: `test_frontend_contracts.py` pins the notice text and
+its id.
 
 ### 5.20.0 — Twilio API keys
 

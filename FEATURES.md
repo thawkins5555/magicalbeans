@@ -2383,6 +2383,12 @@ hard to trip — a path monitor that cries wolf gets turned off.
   is only ever used with the Account SID, API Key SID and
   authentication method it was saved under; **Send test text** refuses
   a mismatch the same way it already refused a changed Account SID.
+- **From 5.20.1, a consent notice sits under the Default numbers
+  list**, beside **Add number** — Twilio's A2P 10DLC campaign review
+  wants the exact wording and a screenshot of where it is collected,
+  and since numbers are only ever entered here by an authenticated
+  administrator, this is that opt-in evidence. STOP and HELP are
+  handled by Twilio's Advanced Opt-Out, not by the app.
 
 ### Templates
 

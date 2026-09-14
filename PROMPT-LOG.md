@@ -638,3 +638,23 @@ gap. Testy ran one full pass plus a headless dialog walk. Javariius
 approved with nits (test precision, a mode-switch guard in the dialog, a
 stripped key SID), all closed before the branch was pushed and main
 fast-forwarded.
+
+## 5.20.1 — SMS consent notice
+
+**"Test SMS is failing immediately."** — traced with the operator to a
+blank From number, not a fault; the stored API key and the test route
+were proven against a Twilio stub.
+→ No code change; operator set the From number.
+
+**"Give me sample SMS messages ... for A2P Campaign examples"** —
+samples built from the real text builder (severity tag, rule, entity,
+detail), with the note that alert texts carry no brand name.
+→ Samples handed over for the campaign submission.
+
+**Twilio opt-in rejection reply** — advised in-app consent rather than
+a verbal script; drafted the reply and the consent wording.
+→ Reply sent; wording carried into the plan.
+
+**"Add the consent notice and push to main"**
+→ Thing2 added the notice and a contract check, Stephen_King the docs,
+Javariius reviewed, branch pushed and main fast-forwarded.
