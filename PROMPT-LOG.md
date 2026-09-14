@@ -751,3 +751,39 @@ agent** — Found on `main` in `54c699e`, pushed from another device after
 
 → Javariius reviewed the ten files against the operator's verbatim rules;
 one wording fix. Committed on the session branch and fast-forwarded to `main`.
+
+## 5.22.0 — TACACS+ sign-in, richer dashboard graphs, and a look at history
+
+**Operator prompt, five items:**
+- Add TACACS functionality for logging into the system
+- Dashboard graphs tile - I would like to be able to add multiple interfaces
+up/down traffic to a single graph. Graphs should also be able to be named
+and have a built in drop down to change the timeline period without having
+to 'edit layout' and then configure the tile. You should be able to set a
+maximum value for the graphs.
+- When adding an interface traffic graph on the dashboard the auto fill
+suggestions popup should match the theme. Currently it looks similar to a
+browser autofill which could be confusing.
+- All graphs should have the ability to drill down and select dates and
+times.
+- Research how the most popular network monitoring systems retrieve,
+display, filter and output historical data for devices, interfaces,
+environmental sensors, CPU, etc and give me options for different ways to
+implement into the GUI and platform.
+
+**Planning answers** — TACACS+ falls back to local accounts only when the
+AAA server is unreachable, and an explicit reject from the server is final
+(no silent fallback to local on a reject); local accounts are never sent
+to TACACS+ for verification; a TACACS+ user gets one configurable default
+role and is auto-created on first successful sign-in; the multi-interface
+graph extends the existing Interface traffic tile rather than adding a new
+tile type; drill-down (drag-to-zoom plus an explicit date/time picker)
+goes on every chart with a time axis, not just the dashboard; a time
+window picked directly on a tile (outside Edit layout) is saved back to
+the account's dashboard layout immediately; the research is delivered as
+both a chat summary and a standing reference doc,
+`docs/HISTORICAL-DATA-OPTIONS.md`, with no history-explorer feature built
+yet — it is a menu of options for a future decision. Version for this
+work: 5.22.0.
+
+→ (outcome to follow)
