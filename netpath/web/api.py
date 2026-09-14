@@ -3380,26 +3380,64 @@ def get_ipam_dhcp_scopes(service, params, body) -> dict:
     return {"scopes": scopes}
 
 
+def _ipam_static_in_use_rows(service, server_id: int | None, scope_id: str | None) -> list[dict]:
+    """One lease-shaped row per `static_in_scope` host for the requested
+    (server_id, scope_id): an address the poller sees answering inside a
+    scope's dynamic range that holds no lease anywhere — "in use" the DHCP
+    server never recorded. Same freshness argument get_ipam_dhcp_scopes
+    uses, so the summary count and these rows never disagree."""
+    fresh_s = max(
+        float(service.ipam_settings.get("dhcp_poll_interval_minutes", 15)) * 60 * 3, 3600)
+    static_by_scope = service.ipam_db.static_in_scope(fresh_s)
+    labels = {(r["server_id"], r["scope_id"]): r["server_label"]
+              for r in service.ipam_db.dhcp_scopes(server_id)}
+    rows = []
+    for (s_id, sc_id), hosts in static_by_scope.items():
+        if server_id is not None and s_id != server_id:
+            continue
+        if scope_id and sc_id != scope_id:
+            continue
+        server_label = labels.get((s_id, sc_id))
+        for host in hosts:
+            device = namelookup.device_for_ip(service.nodes_db, host["ip"])
+            hostname = namelookup.device_name(device) or None
+            if not hostname:
+                hostname = service.app_db.hostnames([host["ip"]]).get(host["ip"])
+            rows.append({
+                "id": None, "server_id": s_id, "server_label": server_label,
+                "scope_id": sc_id, "ip": host["ip"], "mac": host["mac"],
+                "hostname": hostname, "address_state": "in use, not leased",
+                "lease_expires": None, "is_reservation": False,
+                "in_use_only": True, "seen_source": host["seen_source"],
+                "seen_detail": host["seen_detail"], "description": "",
+                "polled": host["last_up"]})
+    return rows
+
+
 def get_ipam_dhcp_leases(service, params, body) -> dict:
     server_id = params.get("server_id")
     scope_id = params.get("scope_id")
-    rows = service.ipam_db.dhcp_leases(
-        int(server_id) if server_id else None, scope_id or None)
-    return {"leases": [
+    server_id_int = int(server_id) if server_id else None
+    scope_id = scope_id or None
+    rows = service.ipam_db.dhcp_leases(server_id_int, scope_id)
+    leases = [
         {"id": r["id"], "server_id": r["server_id"], "server_label": r["server_label"],
          "scope_id": r["scope_id"], "ip": r["ip"], "mac": r["mac"],
          "hostname": r["hostname"], "address_state": r["address_state"],
          "lease_expires": r["lease_expires_ts"],
          "is_reservation": bool(r["is_reservation"]),
+         "in_use_only": False, "seen_source": None, "seen_detail": None,
          "description": r["description"], "polled": r["polled_ts"]}
-        for r in rows]}
+        for r in rows]
+    leases.extend(_ipam_static_in_use_rows(service, server_id_int, scope_id))
+    return {"leases": leases}
 
 
 def get_ipam_dhcp_leases_export(service, params, body) -> dict:
     leases = get_ipam_dhcp_leases(service, params, body)["leases"]
     header = ["server_label", "scope_id", "ip", "mac", "hostname",
              "address_state", "lease_expires", "is_reservation",
-             "description", "polled"]
+             "in_use_only", "seen_detail", "description", "polled"]
     csv_rows = [[lease.get(key) for key in header] for lease in leases]
     return _csv_response("ipam-dhcp-leases", header, csv_rows)
 

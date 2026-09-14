@@ -1028,9 +1028,11 @@
       cell: (r) => App.deviceNameLink(r.hostname || r.description) },
     { key: 'state', label: 'State', width: 140, on: true,
       value: (r) => r.address_state || '',
-      cell: (r) => (r.is_reservation
-        ? `<span class="mono">${escape(r.address_state || 'reservation')}</span>`
-        : escape(r.address_state || '')) },
+      cell: (r) => (r.in_use_only
+        ? `<span class="legend-dot" style="background:var(--warn)"></span>${escape(r.address_state || '')}`
+        : r.is_reservation
+          ? `<span class="mono">${escape(r.address_state || 'reservation')}</span>`
+          : escape(r.address_state || '')) },
     { key: 'expires', label: 'Lease expires', width: 150, numeric: true, on: true,
       align: 'left', value: (r) => r.lease_expires || 0,
       cell: (r) => (r.lease_expires ? App.when(r.lease_expires) : '') },
@@ -1063,7 +1065,10 @@
         : 'No leases recorded for this scope yet.');
     table.appendChild(body);
     App.wireRowKeyboard(body);
-    App.el('ipam-lease-count').textContent = `${rows.length} lease(s)`;
+    const inUseOnly = rows.filter((r) => r.in_use_only).length;
+    App.el('ipam-lease-count').textContent = inUseOnly
+      ? `${rows.length} lease(s) · ${inUseOnly} in use, not leased`
+      : `${rows.length} lease(s)`;
   }
 
   async function loadDhcpServers() {
