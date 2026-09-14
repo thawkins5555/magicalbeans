@@ -1717,16 +1717,17 @@ class NodesDatabase(SqliteStore):
         return count
 
     def repair_auto_mib_overrides(self) -> int:
-        """5.20.4 one-time repair: before mib_file_auto existed, the old
+        """5.20.5 one-time repair: before mib_file_auto existed, the old
         _auto_assign_mib wrote mib_file_id with no marker, so a device it
         picked for still looks hand-overridden. The only signature left to
-        tell the two apart is "the stored MIB is still the vendor lookup's
-        pick" — a hand-pinned MIB that happens to match it can't be told
-        apart from an old auto-pick, so this only touches devices where
-        mib_file_id is the SOLE override (any other override means the
-        operator was in there editing the device on purpose). The lookup
-        keys on the identified vendor_arc, as the old auto-pick did, and
-        on sysObjectID only when no arc was recorded.
+        tell the two apart is "the stored MIB is one of the uploaded files
+        that describe the device's vendor arc" (the fingerprint could have
+        picked any of them) — a hand-pinned MIB that happens to match one
+        can't be told apart from an old auto-pick, so this only touches
+        devices where mib_file_id is the SOLE override (any other override
+        means the operator was in there editing the device on purpose).
+        The lookup keys on the identified vendor_arc, as the old auto-pick
+        did, and on sysObjectID only when no arc was recorded.
         Returns the number of devices repaired."""
         from . import nodeoids
         with self._lock:
@@ -1740,7 +1741,7 @@ class NodesDatabase(SqliteStore):
                 arc = row["vendor_arc"]
                 oid = (f"{nodeoids.ENTERPRISES}.{arc}" if arc
                        else str(row["sys_object_id"] or ""))
-                if not oid or self.mib_file_covering(oid) != row["mib_file_id"]:
+                if not oid or row["mib_file_id"] not in self.mib_files_covering(oid):
                     continue
                 self._conn.execute(
                     "UPDATE devices SET mib_file_auto = 1 WHERE id = ?", (row["id"],))
@@ -5172,6 +5173,9 @@ class NodesDatabase(SqliteStore):
 
     def mib_file_covering(self, sys_object_id: str) -> int | None:
         return self.mib_db.mib_file_covering(sys_object_id)
+
+    def mib_files_covering(self, sys_object_id: str) -> set[int]:
+        return self.mib_db.mib_files_covering(sys_object_id)
 
     def all_known_oids(self) -> dict[str, str]:
         return self.mib_db.all_known_oids()

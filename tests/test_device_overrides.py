@@ -145,16 +145,29 @@ try:
     db.replace_mib_objects(mib_good, [
         {"name": "goodScalar", "oid": "1.3.6.1.4.1.88888.1.1",
          "description": "", "syntax": "INTEGER", "enums": None,
+         "is_notification": False},
+        {"name": "goodScalar2", "oid": "1.3.6.1.4.1.88888.1.2",
+         "description": "", "syntax": "INTEGER", "enums": None,
          "is_notification": False}])
     mib_other = db.add_mib_file("other.mib", "OTHER-MIB", 1, [], "")
     db.replace_mib_objects(mib_other, [
         {"name": "otherScalar", "oid": "1.3.6.1.4.1.77777.1.1",
          "description": "", "syntax": "INTEGER", "enums": None,
          "is_notification": False}])
+    # A second file for the SAME vendor arc, with fewer objects than
+    # mib_good -- the fingerprint could still have picked this one.
+    mib_smaller = db.add_mib_file("smaller.mib", "SMALLER-MIB", 1, [], "")
+    db.replace_mib_objects(mib_smaller, [
+        {"name": "smallerScalar", "oid": "1.3.6.1.4.1.88888.2.1",
+         "description": "", "syntax": "INTEGER", "enums": None,
+         "is_notification": False}])
     VENDOR_ARC_OID = "1.3.6.1.4.1.88888.9.9"
     check("fixture sanity: mib_file_covering resolves the arc to mib_good",
           db.mib_file_covering(VENDOR_ARC_OID) == mib_good,
           db.mib_file_covering(VENDOR_ARC_OID))
+    check("mib_files_covering returns every uploaded file describing the arc",
+          db.mib_files_covering(VENDOR_ARC_OID) == {mib_good, mib_smaller},
+          db.mib_files_covering(VENDOR_ARC_OID))
 
     # (a) legacy auto-pick: no auto marker, sole override, still matches
     # the vendor lookup -> repaired.
@@ -172,6 +185,12 @@ try:
     legacy_mismatch = db.add_device("10.0.1.3", "legacy-mismatch", gid,
                                     mib_file_id=mib_other)
     db.seed_identity(legacy_mismatch, sys_object_id=VENDOR_ARC_OID)
+
+    # (i) sole override is the vendor arc's SMALLER file, not the top pick
+    # -- the fingerprint could have picked either, so this is repaired too.
+    legacy_second = db.add_device("10.0.1.7", "legacy-second", gid,
+                                  mib_file_id=mib_smaller)
+    db.seed_identity(legacy_second, sys_object_id=VENDOR_ARC_OID)
 
     # (d) already marked automatic -> nothing to do, not counted.
     already_auto = db.add_device("10.0.1.4", "already-auto", gid)
@@ -199,11 +218,15 @@ try:
 
     before = {d: override_fields(db.device(d))
              for d in (legacy, legacy_plus, legacy_mismatch, already_auto,
-                       legacy_walk, legacy_arc_other)}
+                       legacy_walk, legacy_arc_other, legacy_second)}
     repaired = db.repair_auto_mib_overrides()
 
     check("(e) the return value is the number of devices actually repaired",
-          repaired == 2, repaired)
+          repaired == 3, repaired)
+    check("(i) a sole override matching a non-top covering file is repaired too",
+          override_fields(db.device(legacy_second)) == ()
+          and db.device(legacy_second)["mib_file_auto"] == 1,
+          dict(db.device(legacy_second)))
     check("(g) a walk-identified device is matched on its vendor_arc, not sysObjectID",
           override_fields(db.device(legacy_walk)) == ()
           and db.device(legacy_walk)["mib_file_auto"] == 1,

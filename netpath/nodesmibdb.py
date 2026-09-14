@@ -209,6 +209,19 @@ class NodesMibDatabase(SqliteStore):
                 (prefix + ".", prefix + "/")).fetchone()
         return row["mib_file_id"] if row else None
 
+    def mib_files_covering(self, sys_object_id: str) -> set[int]:
+        """Every uploaded MIB with resolved objects under this vendor's arc, not just the top pick."""
+        from . import nodeoids
+        prefix = nodeoids.enterprise_root(sys_object_id)
+        if not prefix:
+            return set()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT mib_file_id FROM mib_objects"
+                " WHERE oid IS NOT NULL AND oid >= ? AND oid < ?",
+                (prefix + ".", prefix + "/")).fetchall()
+        return {row["mib_file_id"] for row in rows}
+
     def all_known_oids(self) -> dict[str, str]:
         """Every resolved mib_objects name -> OID, across every uploaded
         file — fed into mibparse.resolve()'s `known` dict so a later

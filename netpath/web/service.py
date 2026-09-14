@@ -1220,18 +1220,21 @@ class Service:
     # Settings marker: 5.18.0 added mib_file_auto so an auto-assigned MIB
     # stops counting as an override, but nothing backfilled devices the
     # old _auto_assign_mib had already assigned before the marker existed.
-    # Same style as _OVERRIDES_REPAIRED_5_16.
-    _MIB_AUTO_REPAIRED_5_20 = "mib_auto_repaired_5_20"
+    # Same style as _OVERRIDES_REPAIRED_5_16. 5.20.4's repair required the
+    # stored file to be the vendor arc's TOP pick, missing most devices
+    # when a vendor has several uploaded files; 5.20.5 accepts any file
+    # covering the arc, so it runs again behind its own marker.
+    _MIB_AUTO_REPAIRED_5_20_5 = "mib_auto_repaired_5_20_5"
 
     def _repair_auto_mib_overrides(self) -> None:
-        if self.nodes_db._private_setting(self._MIB_AUTO_REPAIRED_5_20):
+        if self.nodes_db._private_setting(self._MIB_AUTO_REPAIRED_5_20_5):
             return
         count = self.nodes_db.repair_auto_mib_overrides()
-        self.nodes_db._set_private_setting(self._MIB_AUTO_REPAIRED_5_20, True)
+        self.nodes_db._set_private_setting(self._MIB_AUTO_REPAIRED_5_20_5, True)
         if count:
             self.log.add(NODES, f"Reclassified the vendor-matching MIB as "
                                 f"automatic on {count} device(s) — no longer "
-                                f"counted as an override (5.20.4 repair)")
+                                f"counted as an override (5.20.5 repair)")
 
     def _seed_default_mibs(self) -> None:
         """Load the MIB files bundled under netpath/mibs/ through the same
