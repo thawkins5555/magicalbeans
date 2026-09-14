@@ -644,6 +644,7 @@ class Service:
         if self.ipam_settings.get("enabled", True):
             self.ipam.start()
         self._repair_profile_credential_overrides()
+        self._repair_auto_mib_overrides()
         if self.nodes_settings.get("enabled", True):
             self.node_poller.start(self.nodes_settings)
         if self.alerts_settings.get("enabled", True):
@@ -1215,6 +1216,22 @@ class Service:
         if count:
             self.log.add(NODES, f"Cleared a profile-matching community/version "
                                 f"override on {count} device(s) (5.16.0 repair)")
+
+    # Settings marker: 5.18.0 added mib_file_auto so an auto-assigned MIB
+    # stops counting as an override, but nothing backfilled devices the
+    # old _auto_assign_mib had already assigned before the marker existed.
+    # Same style as _OVERRIDES_REPAIRED_5_16.
+    _MIB_AUTO_REPAIRED_5_20 = "mib_auto_repaired_5_20"
+
+    def _repair_auto_mib_overrides(self) -> None:
+        if self.nodes_db._private_setting(self._MIB_AUTO_REPAIRED_5_20):
+            return
+        count = self.nodes_db.repair_auto_mib_overrides()
+        self.nodes_db._set_private_setting(self._MIB_AUTO_REPAIRED_5_20, True)
+        if count:
+            self.log.add(NODES, f"Reclassified the vendor-matching MIB as "
+                                f"automatic on {count} device(s) — no longer "
+                                f"counted as an override (5.20.4 repair)")
 
     def _seed_default_mibs(self) -> None:
         """Load the MIB files bundled under netpath/mibs/ through the same

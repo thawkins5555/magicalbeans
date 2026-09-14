@@ -1716,6 +1716,35 @@ class NodesDatabase(SqliteStore):
                 self._config_generation += 1
         return count
 
+    def repair_auto_mib_overrides(self) -> int:
+        """5.20.4 one-time repair: before mib_file_auto existed, the old
+        _auto_assign_mib wrote mib_file_id with no marker, so a device it
+        picked for still looks hand-overridden. The only signature left to
+        tell the two apart is "the stored MIB is still the vendor lookup's
+        pick" — a hand-pinned MIB that happens to match it can't be told
+        apart from an old auto-pick, so this only touches devices where
+        mib_file_id is the SOLE override (any other override means the
+        operator was in there editing the device on purpose).
+        Returns the number of devices repaired."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM devices WHERE mib_file_id IS NOT NULL"
+                " AND COALESCE(mib_file_auto, 0) = 0"
+                " AND sys_object_id IS NOT NULL AND sys_object_id != ''").fetchall()
+            count = 0
+            for row in rows:
+                if override_fields(row) != ("mib_file_id",):
+                    continue
+                if self.mib_file_covering(row["sys_object_id"]) != row["mib_file_id"]:
+                    continue
+                self._conn.execute(
+                    "UPDATE devices SET mib_file_auto = 1 WHERE id = ?", (row["id"],))
+                count += 1
+            if count:
+                self._conn.commit()
+                self._config_generation += 1
+        return count
+
     # ---------------------------------------------------------- device groups
     #
     # Purely organizational folders a device can optionally belong to —

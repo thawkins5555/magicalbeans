@@ -133,6 +133,75 @@ try:
     check("devices_count(exclude_ids=...) agrees across chunks",
           db.devices_count(exclude_ids=excluded) == len(all_ids) - len(excluded),
           (db.devices_count(exclude_ids=excluded), len(all_ids) - len(excluded)))
+
+    # ------------------------------------- repair_auto_mib_overrides (5.20.4)
+    #
+    # Pre-5.18.0, _auto_assign_mib set mib_file_id with no mib_file_auto
+    # marker, so devices it picked for still count "1 override" today.
+    # The repair only reclassifies mib_file_id where it is the device's
+    # SOLE override and still matches the vendor lookup -- anything else
+    # might be a hand pin, not a stale auto-pick.
+    mib_good = db.add_mib_file("good.mib", "GOOD-MIB", 1, [], "")
+    db.replace_mib_objects(mib_good, [
+        {"name": "goodScalar", "oid": "1.3.6.1.4.1.88888.1.1",
+         "description": "", "syntax": "INTEGER", "enums": None,
+         "is_notification": False}])
+    mib_other = db.add_mib_file("other.mib", "OTHER-MIB", 1, [], "")
+    db.replace_mib_objects(mib_other, [
+        {"name": "otherScalar", "oid": "1.3.6.1.4.1.77777.1.1",
+         "description": "", "syntax": "INTEGER", "enums": None,
+         "is_notification": False}])
+    VENDOR_ARC_OID = "1.3.6.1.4.1.88888.9.9"
+    check("fixture sanity: mib_file_covering resolves the arc to mib_good",
+          db.mib_file_covering(VENDOR_ARC_OID) == mib_good,
+          db.mib_file_covering(VENDOR_ARC_OID))
+
+    # (a) legacy auto-pick: no auto marker, sole override, still matches
+    # the vendor lookup -> repaired.
+    legacy = db.add_device("10.0.1.1", "legacy-auto", gid, mib_file_id=mib_good)
+    db.seed_identity(legacy, sys_object_id=VENDOR_ARC_OID)
+
+    # (b) same, plus a genuine second override -> the operator was in
+    # there on purpose, so leave it alone.
+    legacy_plus = db.add_device("10.0.1.2", "legacy-plus-override", gid,
+                                mib_file_id=mib_good, community="private")
+    db.seed_identity(legacy_plus, sys_object_id=VENDOR_ARC_OID)
+
+    # (c) stored MIB isn't what the vendor lookup would pick for this
+    # sysObjectID -> could be a hand choice, leave it alone.
+    legacy_mismatch = db.add_device("10.0.1.3", "legacy-mismatch", gid,
+                                    mib_file_id=mib_other)
+    db.seed_identity(legacy_mismatch, sys_object_id=VENDOR_ARC_OID)
+
+    # (d) already marked automatic -> nothing to do, not counted.
+    already_auto = db.add_device("10.0.1.4", "already-auto", gid)
+    db.update_device(already_auto, mib_file_id=mib_good, mib_file_auto=1)
+    db.seed_identity(already_auto, sys_object_id=VENDOR_ARC_OID)
+
+    before = {d: override_fields(db.device(d))
+             for d in (legacy, legacy_plus, legacy_mismatch, already_auto)}
+    repaired = db.repair_auto_mib_overrides()
+
+    check("(e) the return value is the number of devices actually repaired",
+          repaired == 1, repaired)
+    check("(a) the legacy auto-pick loses its override and gains the flag",
+          override_fields(db.device(legacy)) == ()
+          and db.device(legacy)["mib_file_auto"] == 1,
+          dict(db.device(legacy)))
+    check("(b) a device with a second override is left untouched",
+          override_fields(db.device(legacy_plus)) == before[legacy_plus]
+          and not db.device(legacy_plus)["mib_file_auto"],
+          dict(db.device(legacy_plus)))
+    check("(c) a stored MIB that isn't the vendor lookup's pick is left untouched",
+          override_fields(db.device(legacy_mismatch)) == before[legacy_mismatch]
+          and not db.device(legacy_mismatch)["mib_file_auto"],
+          dict(db.device(legacy_mismatch)))
+    check("(d) an already-automatic MIB is untouched and not recounted",
+          override_fields(db.device(already_auto)) == before[already_auto]
+          and db.device(already_auto)["mib_file_auto"] == 1,
+          dict(db.device(already_auto)))
+    check("(f) running the repair again finds nothing left to repair",
+          db.repair_auto_mib_overrides() == 0)
 finally:
     db.close()
 
