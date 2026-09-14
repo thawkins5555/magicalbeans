@@ -7699,11 +7699,10 @@ class NodePoller(Worker):
 
     def _walk_lldp_local_ports(self, device, config: dict,
                                deadline: float | None = None) -> dict:
-        """lldpLocPortNum -> ifIndex from lldpLocPortTable, for the ports the
-        table lets us place: a numeric port id that is a known ifIndex, or a
-        port id / port description equal (after _canonical_if_name) to a
-        stored interface's ifName or ifDescr. Anything else is left out so
-        the caller keeps the port number itself."""
+        """lldpLocPortNum -> ifIndex from lldpLocPortTable: an ifName/ifDescr
+        match on the port id or description, else a numeric local port id
+        that is a known ifIndex when the port number itself is not one.
+        Unplaced ports are left out; with no stored interfaces nothing is."""
         columns = {}
         for key, oid in (("subtype", nodeoids.LLDP_LOC_PORT_ID_SUBTYPE),
                          ("port_id", nodeoids.LLDP_LOC_PORT_ID),
@@ -7723,6 +7722,8 @@ class NodePoller(Worker):
                 canon = _canonical_if_name(text or "")
                 if canon and canon not in by_name:
                     by_name[canon] = row["if_index"]
+        if not known:
+            return {}
         port_map: dict[int, int] = {}
         for suffix in set(columns["port_id"]) | set(columns["desc"]):
             try:
@@ -7731,12 +7732,14 @@ class NodePoller(Worker):
                 continue
             port_id = str(columns["port_id"].get(suffix) or "").strip()
             desc = str(columns["desc"].get(suffix) or "").strip()
+            subtype = columns["subtype"].get(suffix)
             target = None
-            if port_id.isdigit() and (not known or int(port_id) in known):
-                target = int(port_id)
             for text in (port_id, desc):
                 if target is None and text:
                     target = by_name.get(_canonical_if_name(text))
+            if (target is None and subtype == 7 and port_id.isdigit()
+                    and local_port not in known and int(port_id) in known):
+                target = int(port_id)
             if target is not None and target != local_port:
                 port_map[local_port] = target
         return port_map

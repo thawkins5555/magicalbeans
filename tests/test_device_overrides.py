@@ -115,6 +115,10 @@ try:
     db.update_device(auto, mib_file_id=None)
     check("clearing the MIB clears the override",
           override_fields(db.device(auto)) == ())
+    db.update_device(auto, mib_file_id=5, mib_file_auto=1)
+    db.bulk_update_devices([auto], mib_file_id=6)
+    check("a bulk MIB assignment resets the auto flag too",
+          override_fields(db.device(auto)) == ("mib_file_id",), dict(db.device(auto)))
 
     # exclude_ids past one chunk: the NOT IN chunks must AND, never OR.
     bulk = [db.add_device(f"10.1.{i // 250}.{i % 250}", f"chunk-{i:03d}", gid)

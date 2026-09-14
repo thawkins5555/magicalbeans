@@ -2254,6 +2254,8 @@ class NodesDatabase(SqliteStore):
         allowed = {k: v for k, v in fields.items() if k in _DEVICE_EDITABLE}
         if "community" in allowed:
             allowed["community"] = clean_community(allowed["community"])
+        if "mib_file_id" in allowed and "mib_file_auto" not in allowed:
+            allowed["mib_file_auto"] = 0
         if not allowed or not device_ids:
             return
         clauses = ", ".join(f"{key} = ?" for key in allowed)
@@ -3747,19 +3749,9 @@ class NodesDatabase(SqliteStore):
         return rows
 
     def neighbour_device_matches(self, rows, candidates_for) -> dict:
-        """For neighbour rows _NEIGHBOR_MATCH_SQL left unmatched (no
-        matched_device_id), the same devices_by_addresses lookup api.
-        _resolve_neighbor_names and the mapper both apply on top of the SQL
-        join: `candidates_for(row)` names the address(es) a row identifies
-        itself by (nodepoll.neighbor_ip_candidates: remote_address, an LLDP
-        subtype-5 chassis id, sys_name), batched here through
-        devices_by_addresses rather than once per row. `rows` may be
-        sqlite3.Row or dict, matching devices_by_addresses' own tolerance.
-
-        Returns {index into `rows`: device row} for whichever resolved; an
-        already-matched row, or one with no addressable candidate, is
-        simply absent from the result -- callers key off the index because
-        neither row type is reliably hashable by identity."""
+        """{index into rows: device row} for rows the SQL join left unmatched
+        whose candidates_for(row) addresses name a device, one batched
+        devices_by_addresses read."""
         pending = []
         for index, row in enumerate(rows):
             if row["matched_device_id"] is not None:

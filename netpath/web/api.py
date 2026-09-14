@@ -3391,18 +3391,19 @@ def _ipam_static_in_use_rows(service, server_id: int | None, scope_id: str | Non
     static_by_scope = service.ipam_db.static_in_scope(fresh_s)
     labels = {(r["server_id"], r["scope_id"]): r["server_label"]
               for r in service.ipam_db.dhcp_scopes(server_id)}
-    entries = []
+    selected = []
     for (s_id, sc_id), hosts in static_by_scope.items():
         if server_id is not None and s_id != server_id:
             continue
         if scope_id and sc_id != scope_id:
             continue
-        for host in hosts:
-            device = namelookup.device_for_ip(service.nodes_db, host["ip"])
-            entries.append((s_id, sc_id, host, namelookup.device_name(device) or None))
+        selected.extend((s_id, sc_id, host) for host in hosts)
+    devices = (service.nodes_db.devices_by_addresses({h["ip"] for _, _, h in selected})
+               if selected and service.nodes_db is not None else {})
+    entries = [(s_id, sc_id, host,
+                namelookup.device_name(devices.get(host["ip"])) or None)
+               for s_id, sc_id, host in selected]
 
-    # One batched reverse-DNS read for every host no Nodes device named,
-    # rather than app_db.hostnames() once per host in the loop below.
     unnamed_ips = {host["ip"] for _, _, host, name in entries if not name}
     dns_names = service.app_db.hostnames(unnamed_ips) if unnamed_ips else {}
 
@@ -4344,11 +4345,7 @@ def _neighbor_json(row, local_port: str = "") -> dict:
 
 
 def _matched_device_names(service, device_ids) -> dict:
-    """{device_id: chain name} for a batch of already-known
-    matched_device_id values -- one devices_by_ids read plus one batched
-    app_db.hostnames read via namelookup.display_names, shared by the
-    Neighbours pane and the mapper so a device matched by chassis MAC,
-    sysName or address all show the same name Reports would."""
+    """{device_id: display name} for matched devices, one batched read."""
     ids = {d for d in device_ids if d is not None}
     if not ids or service.nodes_db is None:
         return {}
@@ -9277,18 +9274,9 @@ def _mapper_node_name(label: str, resolved: str) -> tuple[str, str]:
 
 
 def _apply_ip_matches(service, rows) -> list[dict]:
-    """neighbours_for_devices() rows (sqlite3.Row, immutable) as plain
-    dicts, with nodesdb.neighbour_device_matches' address lookup applied on
-    top of _NEIGHBOR_MATCH_SQL's own join -- the same match Nodes'
-    Neighbours pane places over the SQL join in _resolve_neighbor_names,
-    shared here so a device the mapper places by its LLDP/CDP-reported
-    address gets a link too. A row matched this way carries
-    matched_device_id/name/ip like a SQL-matched row, but matched_if_index
-    stays None: there is no interface evidence for an address match, so the
-    link draws with the reported remote port text instead, as a
-    name-matched row without a chassis MAC already does. Every matched
-    row's matched_device_name (SQL- or address-matched alike) is then
-    replaced by the display-name chain, batched across the whole set."""
+    """Neighbour rows as dicts with the address match applied over the SQL
+    join (matched_if_index stays None: no interface evidence) and every
+    matched name replaced by the display-name chain."""
     out = [dict(row) for row in rows]
     if service.nodes_db is None:
         return out
@@ -9309,10 +9297,8 @@ def _apply_ip_matches(service, rows) -> list[dict]:
 
 
 def _mapper_peer_name(service, rows):
-    """peer_name callable for mapper.assemble_links: the reverse-DNS cache
-    first -- one batched app_db.hostnames read across every row `rows`
-    left unmatched -- then sys_name/platform/chassis_id, the order
-    Add-neighbours' own candidate naming uses below."""
+    """peer_name callable for assemble_links: DNS cache (one batched read),
+    then sys_name/platform/chassis_id, the same order as the candidates."""
     candidate_ips = set()
     for row in rows:
         if row.get("matched_device_id") is None:

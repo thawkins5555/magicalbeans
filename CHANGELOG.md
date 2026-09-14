@@ -234,7 +234,10 @@ was offered as an unmanaged peer instead of the real device, or skipped
 outright, and produced no link. The IP-based match is now shared code,
 applied before the Mapper builds its candidate list and assembles links,
 so a neighbour placed by address behaves the same way here as it already
-does on Nodes. Files: `web/api.py`, `mapper.py`.
+does on Nodes. A peer that was placed on a map before this release and
+now matches a Nodes device by address is offered again as that device;
+add it as the device and remove the old peer node to get its links.
+Files: `web/api.py`, `mapper.py`.
 
 **Every Nodes report listed the device column as a bare IP whenever a
 device had no manual name, even when its sysName or a DNS entry would

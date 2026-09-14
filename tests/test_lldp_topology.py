@@ -118,6 +118,20 @@ try:
           by_name.get("n-103") == 3, by_name)
     check("a port the table cannot place keeps its local port number",
           by_name.get("n-104") == 104, by_name)
+    db.replace_interfaces(did, [
+        {"if_index": 2, "descr": "GigabitEthernet0/2", "name": "Gi0/2"},
+        {"if_index": 7, "descr": "GigabitEthernet0/7", "name": "Gi0/7"},
+        {"if_index": 101, "descr": "GigabitEthernet0/101", "name": "Gi0/101"},
+    ])
+    entries = poller.read_device_neighbors(did)
+    by_name = {e["sys_name"]: e["if_index"] for e in (entries or [])}
+    check("a local port number that already is an ifIndex is never remapped by a numeric id",
+          by_name.get("n-101") == 101, by_name)
+    db.replace_interfaces(did, [])
+    entries = poller.read_device_neighbors(did)
+    by_name = {e["sys_name"]: e["if_index"] for e in (entries or [])}
+    check("with no interfaces stored yet every port keeps its number",
+          by_name.get("n-101") == 101 and by_name.get("n-102") == 102, by_name)
     db.close()
 finally:
     stub.kill()

@@ -30,12 +30,10 @@
   // staggered VLAN label needs from its neighbour before it's worth
   // staggering at all.
   const STRAND_LABEL_MIN_GAP_PX = 22;
-  // Half the node box's diagonal: the farthest a port label could still be
-  // touching the box's own corner, from the edge point edgePoint() returns
-  // (an ellipse inscribed in the box, so a diagonal link's edge point sits
-  // short of the box's actual corner). Insetting by at least this much
-  // clears the box on every link angle, not just axis-aligned ones.
-  const PORT_LABEL_INSET = Math.max(18, Math.hypot(NODE_W / 2, NODE_H / 2));
+  // edgePoint() sits on the box's inscribed ellipse; the corner is this much
+  // further out on a diagonal link, so the inset clears the box at any angle.
+  const PORT_LABEL_INSET = Math.max(
+    18, Math.hypot(NODE_W / 2, NODE_H / 2) - Math.min(NODE_W, NODE_H) / 2);
   // Position writes are debounced rather than sent on every pointermove —
   // a drag across a big map would otherwise queue one PUT per animation
   // frame. 500ms after the last move (or the last align/distribute) is
@@ -836,7 +834,8 @@
           // falls back to the midpoint, same as before label_step existed.
           const n = plan.strands.length;
           const step = plan.label_step || 0;
-          const staggered = n > 1 && step * len >= STRAND_LABEL_MIN_GAP_PX;
+          const edgeLen = Math.hypot(to.x - from.x, to.y - from.y);
+          const staggered = n > 1 && step * edgeLen >= STRAND_LABEL_MIN_GAP_PX;
           const frac = staggered ? 0.5 + (i - (n - 1) / 2) * step : 0.5;
           labelLayer.appendChild(App.svgNode('text', {
             class: 'mp-link-label',

@@ -1067,7 +1067,7 @@
     App.wireRowKeyboard(body);
     const inUseOnly = rows.filter((r) => r.in_use_only).length;
     App.el('ipam-lease-count').textContent = inUseOnly
-      ? `${rows.length} lease(s) · ${inUseOnly} in use, not leased`
+      ? `${rows.length - inUseOnly} lease(s) + ${inUseOnly} in use, not leased`
       : `${rows.length} lease(s)`;
   }
 
