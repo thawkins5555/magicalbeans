@@ -869,7 +869,9 @@ only ever applied going forward. 5.20.4's
 `NodesDatabase.repair_auto_mib_overrides()`, gated by the private setting
 `mib_auto_repaired_5_20` so it runs once at startup, sets `mib_file_auto =
 1` on such a device only when `mib_file_id` is its *only* override and
-equals what `mib_file_covering(sys_object_id)` would assign today. Any
+equals what `mib_file_covering()` would assign today for the device's
+identified `vendor_arc` (the key the old auto-pick used), falling back to
+its sysObjectID only when no arc was recorded. Any
 other override present, or a stored MIB that no longer matches the vendor
 lookup, and the row is left alone — a hand-pinned MIB identical to the
 vendor match cannot be told apart from an old auto-assignment, and the

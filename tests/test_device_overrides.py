@@ -178,12 +178,40 @@ try:
     db.update_device(already_auto, mib_file_id=mib_good, mib_file_auto=1)
     db.seed_identity(already_auto, sys_object_id=VENDOR_ARC_OID)
 
+    # (g) identified by walk under a generic arc: the old auto-pick keyed
+    # on vendor_arc, so the repair must too.
+    legacy_walk = db.add_device("10.0.1.5", "legacy-walk", gid, mib_file_id=mib_good)
+    db.seed_identity(legacy_walk, sys_object_id="1.3.6.1.4.1.8072.3.2.10")
+    with db._lock:
+        db._conn.execute("UPDATE devices SET vendor_arc = 88888 WHERE id = ?",
+                         (legacy_walk,))
+        db._conn.commit()
+
+    # (h) vendor_arc points elsewhere even though sysObjectID sits under
+    # the covered arc: the recorded arc wins, so no match, untouched.
+    legacy_arc_other = db.add_device("10.0.1.6", "legacy-arc-other", gid,
+                                     mib_file_id=mib_good)
+    db.seed_identity(legacy_arc_other, sys_object_id=VENDOR_ARC_OID)
+    with db._lock:
+        db._conn.execute("UPDATE devices SET vendor_arc = 77777 WHERE id = ?",
+                         (legacy_arc_other,))
+        db._conn.commit()
+
     before = {d: override_fields(db.device(d))
-             for d in (legacy, legacy_plus, legacy_mismatch, already_auto)}
+             for d in (legacy, legacy_plus, legacy_mismatch, already_auto,
+                       legacy_walk, legacy_arc_other)}
     repaired = db.repair_auto_mib_overrides()
 
     check("(e) the return value is the number of devices actually repaired",
-          repaired == 1, repaired)
+          repaired == 2, repaired)
+    check("(g) a walk-identified device is matched on its vendor_arc, not sysObjectID",
+          override_fields(db.device(legacy_walk)) == ()
+          and db.device(legacy_walk)["mib_file_auto"] == 1,
+          dict(db.device(legacy_walk)))
+    check("(h) a vendor_arc that points elsewhere is not overridden by sysObjectID",
+          override_fields(db.device(legacy_arc_other)) == before[legacy_arc_other]
+          and not db.device(legacy_arc_other)["mib_file_auto"],
+          dict(db.device(legacy_arc_other)))
     check("(a) the legacy auto-pick loses its override and gains the flag",
           override_fields(db.device(legacy)) == ()
           and db.device(legacy)["mib_file_auto"] == 1,

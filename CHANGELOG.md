@@ -175,8 +175,10 @@ private setting, `mib_auto_repaired_5_20`, gates
 `NodesDatabase.repair_auto_mib_overrides()` to run once. It marks
 `mib_file_auto = 1` on a device only when both hold: the MIB is the
 device's *only* override, and the stored `mib_file_id` is exactly
-what `mib_file_covering(sys_object_id)` would assign today. Either
-condition failing leaves the device untouched.
+what the vendor lookup would assign today — keyed on the device's
+identified `vendor_arc`, as the old auto-pick was, and on its
+sysObjectID only when no arc was recorded. Either condition failing
+leaves the device untouched.
 
 **Deliberately left alone.** A device with any other override, or
 whose stored MIB no longer matches the vendor lookup, is skipped on

@@ -1724,18 +1724,23 @@ class NodesDatabase(SqliteStore):
         pick" — a hand-pinned MIB that happens to match it can't be told
         apart from an old auto-pick, so this only touches devices where
         mib_file_id is the SOLE override (any other override means the
-        operator was in there editing the device on purpose).
+        operator was in there editing the device on purpose). The lookup
+        keys on the identified vendor_arc, as the old auto-pick did, and
+        on sysObjectID only when no arc was recorded.
         Returns the number of devices repaired."""
+        from . import nodeoids
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM devices WHERE mib_file_id IS NOT NULL"
-                " AND COALESCE(mib_file_auto, 0) = 0"
-                " AND sys_object_id IS NOT NULL AND sys_object_id != ''").fetchall()
+                " AND COALESCE(mib_file_auto, 0) = 0").fetchall()
             count = 0
             for row in rows:
                 if override_fields(row) != ("mib_file_id",):
                     continue
-                if self.mib_file_covering(row["sys_object_id"]) != row["mib_file_id"]:
+                arc = row["vendor_arc"]
+                oid = (f"{nodeoids.ENTERPRISES}.{arc}" if arc
+                       else str(row["sys_object_id"] or ""))
+                if not oid or self.mib_file_covering(oid) != row["mib_file_id"]:
                     continue
                 self._conn.execute(
                     "UPDATE devices SET mib_file_auto = 1 WHERE id = ?", (row["id"],))
