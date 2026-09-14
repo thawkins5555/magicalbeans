@@ -656,6 +656,126 @@ try:
           and settings.get("webhook_headers") == ["Authorization: Bearer sekrit"],
           settings)
 
+    # --------------------------------------------------- 7. notify_sms (5.19.0)
+    status, payload = call("POST", "/api/alerts/rules",
+                           {"key": "site-a.sms_rule", "name": "SMS rule",
+                            "kind": "system", "notify_sms": True}, token=admin)
+    check("a custom rule accepts notify_sms on create",
+          status == 200, (status, payload))
+    sms_rule_id = payload["id"]
+
+    status, payload = call("GET", "/api/alerts/rules", token=admin)
+    by_key = {r["key"]: r for r in payload.get("rules", [])} if status == 200 else {}
+    check("...and it round-trips through _rule_json",
+          by_key.get("site-a.sms_rule", {}).get("notify_sms") is True,
+          by_key.get("site-a.sms_rule"))
+
+    status, payload = call("GET", "/api/alerts/rules/extras", token=admin)
+    extras = payload.get("rules", {}) if status == 200 else {}
+    check("...and through get_alerts_rule_extras",
+          extras.get(str(sms_rule_id), {}).get("notify_sms") is True,
+          extras.get(str(sms_rule_id)))
+
+    status, payload = call("PUT", f"/api/alerts/rules/{sms_rule_id}",
+                           {"notify_sms": False}, token=admin)
+    check("PUT can turn notify_sms back off", status == 200, (status, payload))
+    status, payload = call("GET", "/api/alerts/rules", token=admin)
+    by_key = {r["key"]: r for r in payload.get("rules", [])}
+    check("...and it round-trips off too",
+          by_key["site-a.sms_rule"]["notify_sms"] is False, by_key["site-a.sms_rule"])
+
+    # ---------------------------------------- 8. SMS settings validation
+    status, payload = call("POST", "/api/settings",
+                           {"scope": "alerts",
+                            "values": {"sms_to_default": ["bad"]}}, token=admin)
+    check("a bad SMS number is a 400 naming E.164",
+          status == 400 and "E.164" in str(payload.get("error", "")),
+          (status, payload))
+
+    status, payload = call("POST", "/api/settings",
+                           {"scope": "alerts",
+                            "values": {"sms_to_default": ["+15551234567"],
+                                      "twilio_account_sid":
+                                          "AC" + "0" * 32,
+                                      "twilio_from": "+15557654321"}},
+                           token=admin)
+    check("a good SMS number list saves", status == 200, (status, payload))
+
+    # ---------------------------------------- 9. SMS credential and test
+    from netpath import dpapi
+
+    if dpapi.available():
+        status, payload = call("POST", "/api/alerts/sms/credential",
+                               {"token": "AuthToken123"}, token=admin)
+        check("storing a Twilio auth token is accepted",
+              status == 200 and payload.get("ok") is True, (status, payload))
+
+        # The settings route caches service.alerts_settings; has_sms_credential
+        # is computed fresh by alerts_db.settings(), so read that directly
+        # rather than through the possibly-stale /api/config snapshot.
+        check("...and settings now report has_sms_credential",
+              service.alerts_db.settings().get("has_sms_credential") is True)
+
+        status, payload = call("DELETE", "/api/alerts/sms/credential", {},
+                               token=admin)
+        check("deleting the credential is accepted",
+              status == 200 and payload.get("ok") is True, (status, payload))
+
+        check("...and clears has_sms_credential",
+              service.alerts_db.settings().get("has_sms_credential") is False)
+    else:
+        check("DPAPI is unavailable on this machine, so credential storage "
+              "is skipped rather than faked here", True)
+
+    status, payload = call("POST", "/api/alerts/sms/test", {}, token=admin)
+    check("a missing destination number is a 400",
+          status == 400, (status, payload))
+
+    status, payload = call("POST", "/api/alerts/sms/test",
+                           {"to": "not-a-number"}, token=admin)
+    check("a badly formed destination number is a 400",
+          status == 400 and "E.164" in str(payload.get("error", "")),
+          (status, payload))
+
+    status, payload = call("POST", "/api/alerts/sms/test",
+                           {"to": "+15550001111",
+                            "twilio_account_sid": "AC" + "1" * 32},
+                           token=admin)
+    check("changing the Account SID without a typed token is refused",
+          status == 400
+          and "cannot use the saved" in str(payload.get("error", "")),
+          (status, payload))
+
+    from netpath import alertmail as alertmail_mod
+
+    real_send_sms = alertmail_mod.send_sms
+    alertmail_mod.send_sms = lambda *a, **kw: None
+    try:
+        status, payload = call("POST", "/api/alerts/sms/test",
+                               {"to": "+15550001111"}, token=admin)
+        check("a faked successful send reports ok",
+              status == 200 and payload.get("ok") is True, (status, payload))
+    finally:
+        alertmail_mod.send_sms = real_send_sms
+
+    def _boom(*a, **kw):
+        raise ValueError("Twilio said no")
+    alertmail_mod.send_sms = _boom
+    try:
+        status, payload = call("POST", "/api/alerts/sms/test",
+                               {"to": "+15550001111"}, token=admin)
+        check("a faked failing send reports ok:false with the error",
+              status == 200 and payload.get("ok") is False
+              and "Twilio said no" in payload.get("error", ""), (status, payload))
+    finally:
+        alertmail_mod.send_sms = real_send_sms
+
+    test_rows = service.alerts_db._conn.execute(
+        "SELECT kind, to_addr, ok FROM notifications WHERE alert_id IS NULL "
+        "AND to_addr = ? ORDER BY ts DESC", ("+15550001111",)).fetchall()
+    check("the test send is recorded as a notification row",
+          len(test_rows) >= 2 and test_rows[0]["kind"] == "test", list(test_rows))
+
     actions = [row["action"] for row in audit_since_mark()]
     check("the audit trail records maintenance being turned on",
           "alert.maintenance_on" in actions, actions)

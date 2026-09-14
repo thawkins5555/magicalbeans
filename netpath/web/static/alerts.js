@@ -156,6 +156,9 @@
       (c.webhooks_sent || c.webhook_errors
         ? ` · ${c.webhooks_sent || 0} webhooks sent` +
           (c.webhook_errors ? ` (${c.webhook_errors} failed)` : '') : '') +
+      (c.sms_sent || c.sms_errors
+        ? ` · ${c.sms_sent || 0} texts sent` +
+          (c.sms_errors ? ` (${c.sms_errors} failed)` : '') : '') +
       // How far behind the engine is, and how many events it could not
       // apply: an engine that has stopped keeping up used to look exactly
       // like one with nothing to do.
@@ -1223,6 +1226,8 @@
       <p class="hint">Off makes the rule raise alerts that appear in the list
         and the badge but never reach a mailbox — for the noisy ones nobody
         wants paged about, which used to mean disabling the rule outright.</p>
+      <label class="check"><input type="checkbox" id="ar-notify-sms" ${extras.notify_sms ? 'checked' : ''}> Send a text (SMS) for this rule</label>
+      <p class="hint">Needs Twilio set up under Settings &rarr; TEXT MESSAGES; texts cost per segment.</p>
       ${isThreshold ? `
       <label>Fault is when the value is <select id="ar-comparison">
         <option value="above" ${r.comparison === 'below' ? '' : 'selected'}>at or above the threshold</option>
@@ -1314,6 +1319,7 @@
         values.auto_resolve_after_s = autoText === '' || Number(autoText) === 0
           ? null : Number(autoText) * 60;
         values.notify = box.querySelector('#ar-notify').checked;
+        values.notify_sms = box.querySelector('#ar-notify-sms').checked;
         if (isThreshold) {
           // Blank means NULL here too — and NULL is refused by the server,
           // which is the point. Number('') is 0, so these two used to turn
@@ -1393,6 +1399,8 @@
         placeholder="never"> minutes (blank = never)</label>
       <label class="check"><input type="checkbox" id="ar-notify" checked>
         Send email for this rule</label>
+      <label class="check"><input type="checkbox" id="ar-notify-sms"> Send a text (SMS) for this rule</label>
+      <p class="hint">Needs Twilio set up under Settings &rarr; TEXT MESSAGES; texts cost per segment.</p>
       <p class="hint">A trap or syslog rule usually wants an auto-resolve: the
         event is momentary and nothing will ever arrive to clear it.</p>`, [
       { label: 'Cancel', onClick: App.closeModal },
@@ -1417,6 +1425,7 @@
           values.auto_resolve_after_s = Number(autoText) * 60;
         }
         values.notify = box.querySelector('#ar-notify').checked;
+        values.notify_sms = box.querySelector('#ar-notify-sms').checked;
         await App.post('/api/alerts/rules', values);
         App.closeModal();
         view.configAt = 0;
@@ -1624,9 +1633,20 @@
     return `<table><caption class="sr-only">Alert details</caption><tbody>${rows}</tbody></table>`;
   }
 
+  function smsNumbersListHtml(list) {
+    if (!list.length) return App.emptyState('No numbers yet.');
+    const rows = list.map((num, index) => `
+      <tr>
+        <td>${escape(num)}</td>
+        <td><button type="button" class="as-sms-to-remove" data-index="${index}">Remove</button></td>
+      </tr>`).join('');
+    return `<table><caption class="sr-only">Alert details</caption><tbody>${rows}</tbody></table>`;
+  }
+
   function settingsDialog() {
     const s = App.state.alertsSettings || {};
     const recipients = normalizeRecipients(s.smtp_to_default);
+    const smsNumbers = normalizeRecipients(s.sms_to_default);
     const { check, number } = App.form;
     const box = App.modal('Alerts settings', `
       <fieldset><legend>ENGINE</legend>
@@ -1681,6 +1701,26 @@
           this on for a big fleet should not eat into a mail quota someone
           already tuned.</p>
       </fieldset>
+      <fieldset><legend>TEXT MESSAGES (TWILIO)</legend>
+        ${check('as-sms', 'Send text (SMS) notifications', s.sms_enabled)}
+        <label>Text alerts of severity <select id="as-sms-minsev"></select>
+          and worse</label>
+        ${App.form.text('as-twilio-sid', 'Account SID', escape(s.twilio_account_sid || ''))}
+        ${App.canStoreSecrets()
+          ? `<label>Auth token <input id="as-twilio-token" type="password"
+          placeholder="${s.has_sms_credential ? 'stored — leave blank to keep' : ''}"></label>`
+          : App.credentialUnavailableHtml('A Twilio auth token')}
+        <p class="hint" id="as-sms-cred-status"></p>
+        ${App.form.text('as-twilio-from', 'From number', escape(s.twilio_from || ''), 'placeholder="+15551234567"')}
+        ${App.form.text('as-twilio-msid', 'Messaging Service SID (optional, replaces From)', escape(s.twilio_messaging_service_sid || ''))}
+        <p class="hint">Default numbers</p>
+        <div id="as-sms-to-list">${smsNumbersListHtml(smsNumbers)}</div>
+        <label>Add number <input id="as-sms-to-add" placeholder="+15551234567"></label>
+        <button type="button" id="as-sms-to-add-btn">Add</button>
+        ${number('as-sms-maxhour', 'Max texts per hour', s.sms_max_per_hour ?? 30, 'min=1')}
+        <p class="hint">One text per number per notification, cut to 160
+          characters, with its own hourly budget apart from email's.</p>
+      </fieldset>
       <fieldset><legend>VOLUME</legend>
         ${number('as-renotify', 'Re-notify an open alert every', s.renotify_minutes, 'min=0')} min (0 = once)
         ${check('as-clear', 'Send an email when an alert clears', s.notify_on_clear)}
@@ -1732,6 +1772,7 @@
                                  s.table_columns)}
       <fieldset><legend>TEST</legend>
         <label>Send a test email to <input id="as-testto" placeholder="you@example.com"></label>
+        <label>Send a test text to <input id="as-testsms" placeholder="+15551234567"></label>
       </fieldset>`, [
       { label: 'Cancel', onClick: App.closeModal },
       // The one control in the product whose only purpose is to report an
@@ -1749,6 +1790,25 @@
             return result;
           }));
       } },
+      { label: 'Send test text', onClick: (box, button) => {
+        if (!App.requireFields(box, [['#as-testsms', 'A destination number']])) return;
+        const to = box.querySelector('#as-testsms').value.trim();
+        const payload = { to };
+        const token = (box.querySelector('#as-twilio-token') || {}).value || '';
+        if (token) payload.token = token;
+        const sid = box.querySelector('#as-twilio-sid').value.trim();
+        if (sid !== (s.twilio_account_sid || '')) {
+          payload.twilio_account_sid = sid;
+          payload.twilio_from = box.querySelector('#as-twilio-from').value.trim();
+          payload.twilio_messaging_service_sid =
+            box.querySelector('#as-twilio-msid').value.trim();
+        }
+        return App.runJob(button, { queued: 'Sending…', done: 'Sent' },
+          App.post('/api/alerts/sms/test', payload).then((result) => {
+            if (!result.ok) throw new Error(result.error || 'not sent');
+            return result;
+          }));
+      } },
       { label: 'Save', primary: true, onClick: (box, button) => App.runJob(button,
         { queued: 'Saving…', done: 'Saved' }, (async () => {
         const { on, num, text } = App.form.readers(box);
@@ -1758,6 +1818,15 @@
             await App.post('/api/alerts/smtp/credential', { password });
           } catch (error) {
             box.querySelector('#as-cred-status').textContent = error.message;
+            throw error;
+          }
+        }
+        const smsToken = (box.querySelector('#as-twilio-token') || {}).value || '';
+        if (smsToken) {
+          try {
+            await App.post('/api/alerts/sms/credential', { token: smsToken });
+          } catch (error) {
+            box.querySelector('#as-sms-cred-status').textContent = error.message;
             throw error;
           }
         }
@@ -1791,6 +1860,13 @@
           notify_rollup_delay_s: num('#as-rollupdelay') * 60,
           new_device_grace_s: num('#as-grace') * 60,
           rollup_enabled: on('#as-rollup'),
+          sms_enabled: on('#as-sms'),
+          sms_min_severity: Number(box.querySelector('#as-sms-minsev').value),
+          twilio_account_sid: text('#as-twilio-sid'),
+          twilio_from: text('#as-twilio-from'),
+          twilio_messaging_service_sid: text('#as-twilio-msid'),
+          sms_to_default: smsNumbers,
+          sms_max_per_hour: num('#as-sms-maxhour'),
           table_columns: App.readColumnPicker(
             box.querySelector('#cols-alerts'), COLUMNS),
         } });
@@ -1802,7 +1878,8 @@
     ], { buttonsTop: true });
     App.wireColumnPickers(box);
     for (const [id, value] of [['#as-minsev', s.min_severity ?? 7],
-                               ['#as-notify-minsev', s.notify_min_severity ?? 7]]) {
+                               ['#as-notify-minsev', s.notify_min_severity ?? 7],
+                               ['#as-sms-minsev', s.sms_min_severity ?? 7]]) {
       const select = box.querySelector(id);
       (App.state.severities || []).forEach((name, index) => {
         const option = document.createElement('option');
@@ -1830,6 +1907,25 @@
       recipients.push(addr);
       input.value = '';
       renderRecipients();
+    };
+
+    function renderSmsNumbers() {
+      box.querySelector('#as-sms-to-list').innerHTML = smsNumbersListHtml(smsNumbers);
+      for (const btn of box.querySelectorAll('.as-sms-to-remove')) {
+        btn.onclick = () => {
+          smsNumbers.splice(Number(btn.dataset.index), 1);
+          renderSmsNumbers();
+        };
+      }
+    }
+    renderSmsNumbers();
+    box.querySelector('#as-sms-to-add-btn').onclick = () => {
+      const input = box.querySelector('#as-sms-to-add');
+      const num = input.value.trim();
+      if (!num || !/^\+[1-9][0-9]{7,14}$/.test(num)) return;
+      smsNumbers.push(num);
+      input.value = '';
+      renderSmsNumbers();
     };
   }
 

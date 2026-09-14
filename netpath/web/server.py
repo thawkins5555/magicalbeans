@@ -483,6 +483,9 @@ ROUTES = [
     ("POST", r"^/api/alerts/smtp/credential$", api.post_alerts_smtp_credential, ("alerts", W)),
     ("DELETE", r"^/api/alerts/smtp/credential$", api.delete_alerts_smtp_credential, ("alerts", W)),
     ("POST", r"^/api/alerts/smtp/test$", api.post_alerts_smtp_test, ("alerts", W)),
+    ("POST", r"^/api/alerts/sms/credential$", api.post_alerts_sms_credential, ("alerts", W)),
+    ("DELETE", r"^/api/alerts/sms/credential$", api.delete_alerts_sms_credential, ("alerts", W)),
+    ("POST", r"^/api/alerts/sms/test$", api.post_alerts_sms_test, ("alerts", W)),
     ("POST", r"^/api/alerts/engine$", api.post_alerts_engine, ("alerts", W)),
     # Per-device chassis-temperature (and future threshold-rule) overrides —
     # an Alerts concern even though the device dialog that edits one is most

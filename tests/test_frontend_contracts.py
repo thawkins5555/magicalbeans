@@ -3016,6 +3016,34 @@ check("App.fillRanges(box.querySelector('#ifd-range')" in _ifd_body,
 check("t1 - chartRange" in _ifd_body,
       "refreshChart reads the window from chartRange, not a hard-coded hour")
 
+# --- 62. 5.19.0: Twilio SMS notifications reach the rule editor and settings
+NODES62 = read("alerts.js")
+check('id="ar-notify-sms"' in NODES62,
+      "the rule editor's edit form offers a Send-a-text checkbox")
+_ar_notify_sms_count = NODES62.count('id="ar-notify-sms"')
+check(_ar_notify_sms_count >= 2,
+      "the checkbox is offered in both the edit and the create rule forms")
+check("values.notify_sms = box.querySelector('#ar-notify-sms').checked;" in NODES62,
+      "both forms' Save handlers send notify_sms")
+for _id in ("as-sms-minsev", "as-twilio-token", "as-sms-to-list",
+           "as-sms-to-add", "as-testsms"):
+    check('id="%s"' % _id in NODES62,
+          "the alerts settings dialog has the %s control for Twilio SMS" % _id)
+# These ids are handed to App.form.check/text/number as the first argument
+# rather than written as literal id="..." markup, so the id itself is the
+# quoted string those helpers are called with.
+for _id in ("as-sms", "as-twilio-sid", "as-twilio-from", "as-twilio-msid",
+           "as-sms-maxhour"):
+    check("'%s'" % _id in NODES62,
+          "the alerts settings dialog has the %s control for Twilio SMS" % _id)
+check("App.post('/api/alerts/sms/test'" in NODES62,
+      "Send test text posts to the SMS test route")
+check("App.post('/api/alerts/sms/credential'" in NODES62,
+      "Save stores a typed Twilio auth token through the SMS credential route")
+check("texts sent" in NODES62,
+      "the counters line reports texts sent the same way it reports emails "
+      "and webhooks")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

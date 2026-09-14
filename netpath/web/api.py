@@ -7088,6 +7088,7 @@ def _rule_json(row) -> dict:
         "auto_resolve_after_s": (row["auto_resolve_after_s"]
                                  if "auto_resolve_after_s" in row.keys() else None),
         "notify": (bool(row["notify"]) if "notify" in row.keys() else True),
+        "notify_sms": (bool(row["notify_sms"]) if "notify_sms" in row.keys() else False),
     }
 
 
@@ -7731,7 +7732,7 @@ def post_alerts_rule(service, params, body) -> dict:
     fields = _pick(body, ("severity", "enabled", "device_filter", "threshold",
                           "clear_threshold", "comparison", "for_polls",
                           "for_seconds", "template_id", "auto_resolve_after_s",
-                          "notify"))
+                          "notify", "notify_sms"))
     fields = _validated_threshold_fields(kind, None, fields, key=key)
     rule_id = service.alerts_db.add_rule(key, name, kind, source_kind, **fields)
     service.log.add(ALERTS_CATEGORY, f"Added alert rule {name}")
@@ -7752,7 +7753,7 @@ def put_alerts_rule(service, params, body, rule_id) -> dict:
     allowed_keys = ("name", "severity", "enabled", "device_filter", "threshold",
                     "clear_threshold", "comparison", "for_polls", "for_seconds",
                     "template_id", "flap_window_s", "flap_min_transitions",
-                    "auto_resolve_after_s", "notify")
+                    "auto_resolve_after_s", "notify", "notify_sms")
     if not row["is_builtin"]:
         allowed_keys = allowed_keys + ("kind", "source_kind")
     fields = _pick(body, allowed_keys)
@@ -7992,6 +7993,77 @@ def post_alerts_smtp_test(service, params, body) -> dict:
     finally:
         password = None
     service.alerts_db.record_notification(None, "test", to_addr, subject, ok, error)
+    return {"ok": ok, "error": error} if not ok else {"ok": True}
+
+
+def post_alerts_sms_credential(service, params, body) -> dict:
+    token = str(body.get("token", ""))
+    if not token:
+        raise ValueError("A token is required")
+    try:
+        encrypted = _encrypt_secret(token, (
+            "This machine cannot encrypt a stored credential — DPAPI is "
+            "Windows-only. A test text can still use a token typed "
+            "into Test each time; nothing will be saved here."))
+    finally:
+        token = None
+    service.alerts_db.set_sms_credential(encrypted)
+    service.log.add(ALERTS_CATEGORY, "Stored the Twilio auth token")
+    _audit(service, params, "credential.store", target="sms")
+    return {"ok": True}
+
+
+def delete_alerts_sms_credential(service, params, body) -> dict:
+    return _clear_credential(
+        service, params, clear=service.alerts_db.clear_sms_credential,
+        category=ALERTS_CATEGORY, message="Cleared the stored Twilio auth token",
+        target="sms")
+
+
+def post_alerts_sms_test(service, params, body) -> dict:
+    """Sends a real test text, the same "test what's typed before saving"
+    idiom as post_alerts_smtp_test, with the same saved-credential rule:
+    the saved auth token is only ever sent to the saved Account SID.
+    """
+    from .. import alertmail, dpapi
+
+    to_number = str(body.get("to", "")).strip()
+    if not to_number or not alertmail.is_e164(to_number):
+        raise ValueError(
+            "A destination number in E.164 form (+15551234567) is required")
+    settings = dict(service.alerts_settings)
+    sid_changed = ("twilio_account_sid" in body
+                   and str(body["twilio_account_sid"])
+                   != str(settings.get("twilio_account_sid", "")))
+    for key in ("twilio_account_sid", "twilio_from",
+               "twilio_messaging_service_sid", "sms_timeout_s"):
+        if key in body:
+            settings[key] = body[key]
+    token = body.get("token")
+    if token is None and sid_changed:
+        raise ValueError(
+            "This test changes the Account SID, so it cannot use the saved "
+            "auth token: type the token for that account into the test "
+            "instead. The saved one is only ever sent with the saved "
+            "Account SID.")
+    if token is None:
+        blob = service.alerts_db.sms_token_enc()
+        if blob:
+            try:
+                token = dpapi.unprotect(blob).decode("utf-8")
+            except Exception:
+                token = None
+    else:
+        token = str(token)
+    text = "SappiWhere test text from the Alerts module"
+    try:
+        alertmail.send_sms(settings, token, to_number, text)
+        ok, error = True, ""
+    except Exception as exc:
+        ok, error = False, str(exc)
+    finally:
+        token = None
+    service.alerts_db.record_notification(None, "test", to_number, text, ok, error)
     return {"ok": ok, "error": error} if not ok else {"ok": True}
 
 
@@ -10603,5 +10675,6 @@ def get_alerts_rule_extras(service, params, body) -> dict:
             "auto_resolve_after_s": (row["auto_resolve_after_s"]
                                      if "auto_resolve_after_s" in keys else None),
             "notify": (bool(row["notify"]) if "notify" in keys else True),
+            "notify_sms": (bool(row["notify_sms"]) if "notify_sms" in keys else False),
         }
     return {"rules": extras}
