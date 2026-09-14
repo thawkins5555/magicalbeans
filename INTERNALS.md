@@ -5897,6 +5897,11 @@ it for `urllib.request` the same way `send_sms()`'s opener already did.
 The webhook sender and the SMTP sender's verify-certificate branch call
 the identical helper, so all three channels relax the same one check in
 the same one place rather than three contexts drifting apart over time.
+From 5.20.3, `tls_context()` itself delegates to
+`tlscontext.verified_context()`, the same helper `selfupdate._ssl_context()`
+builds on — and so, through that, the HTTPS page monitor — so the senders,
+the self-updater and the HTTPS monitor all clear that one flag from one
+place.
 
 ### Reports (`report.py`, `web/api.py`) — 4.49.0
 

@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.20.3 — The HTTPS monitor behind an inspecting firewall](#5203--the-https-monitor-behind-an-inspecting-firewall)
 - [5.20.2 — TLS behind an inspecting firewall](#5202--tls-behind-an-inspecting-firewall)
 - [5.20.1 — SMS consent notice](#5201--sms-consent-notice)
 - [5.20.0 — Twilio API keys](#5200--twilio-api-keys)
@@ -151,6 +152,38 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 5.20.3 — The HTTPS monitor behind an inspecting firewall
+
+5.20.2 fixed the Twilio, webhook and SMTP senders against an
+SSL-inspecting firewall's re-signed certificates and named the HTTPS
+page monitor as the known follow-up: an operator watching an HTTPS
+page from behind such a firewall, on Python 3.13, would have seen that
+check fail with the same `[SSL: CERTIFICATE_VERIFY_FAILED] ... Missing
+Authority Key Identifier`, even though the page itself was fine.
+
+**One shared helper, used everywhere now.** `netpath/tlscontext.py`
+gains `verified_context(cafile=None)`, built once from what
+`alertmail.tls_context()` already did — system trust store, hostname
+checking, `CERT_REQUIRED`, `VERIFY_X509_STRICT` cleared — plus an
+optional extra CA bundle loaded in. `alertmail.tls_context()` now
+delegates to it, and `selfupdate._ssl_context()` builds on it the same
+way, adding the vendored cacert bundle as before. Because the HTTPS
+monitor (`httpcheck.check()`) already takes its context from
+`selfupdate._ssl_context()`, it picks up the fix through that same
+call, with no change to `httpcheck.py` itself: the NetPath HTTPS page
+check and the self-updater's GitHub calls now verify exactly alike.
+
+**Deliberately unchanged.** The HTTPS monitor's "insecure" opt-out and
+the SMTP verify-off opt-out still build
+`ssl._create_unverified_context()` and are untouched. The LDAP client
+still builds its own context and is not part of this shared helper.
+
+Files: `tlscontext.py`, `alertmail.py`, `selfupdate.py`.
+
+Verification: `test_https_check.py` checks the monitor's context flags
+(`VERIFY_X509_STRICT` cleared, `CERT_REQUIRED`, hostname checking on)
+and that `check()` uses it; `test_alert_sms.py` §2b is unchanged.
+
 ### 5.20.2 — TLS behind an inspecting firewall
 
 An operator's **Send test text** failed immediately with `[SSL:
@@ -184,7 +217,7 @@ verification off in Settings — that remains the only unverified path in
 this application. The LDAP client, the self-updater and the HTTPS
 monitor (`httpcheck.py`) build their own SSL contexts and none is touched
 by this release; the HTTPS monitor will meet the same failure behind an
-inspecting firewall and is the known follow-up.
+inspecting firewall and is the known follow-up, done in 5.20.3.
 
 Files: `alertmail.py`.
 

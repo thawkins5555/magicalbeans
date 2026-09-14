@@ -667,3 +667,11 @@ Authority Key Identifier"** — diagnosed as Python 3.13's stricter
 re-signed certificate; one shared verified context, with that one flag
 cleared, now used by the Twilio, webhook and SMTP senders alike.
 → Javariius reviewed; branch pushed and main fast-forwarded.
+
+## 5.20.3 — The HTTPS monitor behind an inspecting firewall
+
+**"Yes, fix the HTTPS monitor too"**
+→ One shared `verified_context()` in `tlscontext.py`; `alertmail` and
+`selfupdate` build on it, so the HTTPS monitor and the self-updater
+verify like the senders now do. Javariius reviewed; branch pushed and
+main fast-forwarded.
