@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.21.0 — A modular Dashboard, and global find to the switch port](#5210--a-modular-dashboard-and-global-find-to-the-switch-port)
 - [5.20.5 — The auto-assigned MIB, repaired for the fleet (second pass)](#5205--the-auto-assigned-mib-repaired-for-the-fleet-second-pass)
 - [5.20.4 — The auto-assigned MIB, repaired for the fleet](#5204--the-auto-assigned-mib-repaired-for-the-fleet)
 - [5.20.3 — The HTTPS monitor behind an inspecting firewall](#5203--the-https-monitor-behind-an-inspecting-firewall)
@@ -153,6 +154,110 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.21.0 — A modular Dashboard, and global find to the switch port
+
+Four items from the operator, all landing in one release: `PROMPT-LOG.md`
+carries the planning answers in full; this entry is the shipped result.
+
+**Global find follows an IP to the switch port.** Searching a MAC has
+always listed the switch and port it was learned on; searching an IP used
+to stop at the ARP row and never take the last step. `GET
+/api/nodes/arp-search` now chains address-matched ARP rows on to
+`NodesDatabase.mac_locations_for()` (the same query `mac_locations()`
+uses, for a set of exact MACs rather than one prefix, capped at 8) and
+returns a new `ports` field — one entry per (device, port) the resolved
+MAC was learned on, shaped exactly like a MAC-search hit plus the `ip`
+that led there. A MAC needle still returns `ports: []`, since the MAC
+group already answers that case. Global find renders a third results
+group, **"Switch port for that IP (ARP → MAC table)"**, naming the
+switch, port, VLAN, uplink and present/aged-out state, and routes
+straight to the port dialog. A MAC matched under several IPs — a router
+answering on a secondary address, say — names all of them, ordered,
+deduplicated and capped at four, comma-separated in that one port hit
+rather than picking just the first. When neither table has ever been
+walked for any device, a hint line explains that **Learn MAC addresses**
+and **Read the ARP cache** need turning on in a polling profile before an
+address can be searched.
+
+**Nodes CSV export names devices as the screen does.** The devices export
+wrote the raw stored `name` — seeded to the IP itself for every
+auto-discovered device — in the Name column, so an unrenamed device's own
+IP appeared twice in the same row. It now writes the same resolved
+display name Nodes, Syslog and Alerts already agree on; the `sys_name`
+column is untouched, so the raw SNMP hostname is still there for anything
+that wants it.
+
+**The Debug Event log keeps your place.** "Scroll to newest" used to pin
+the view to the bottom on every poll that appended rows, so reading an
+older row meant losing it again within seconds. `drawEvents` now measures
+whether the view is already at the bottom *before* drawing, and only
+snaps to the bottom when it was there already (or on a full rebuild — a
+first paint or a filter change) and the checkbox is ticked. Scroll up to
+read; scroll back to the bottom to resume following. Pause and the
+checkbox keep their existing meaning.
+
+**A modular Dashboard.** The ten fixed tiles are now a per-account,
+server-saved layout — a `users.dashboard_layout` column beside `theme`,
+and `GET`/`PUT`/`DELETE /api/dashboard/layout`. Sign in from a second
+browser and the same layout is there; a second account that has never
+opened **Edit layout** sees the shipped default — today's ten tiles, in
+today's order.
+
+- **Edit layout** turns the grid into something that can be rearranged: a
+  drag handle reorders tiles, width buttons set 1/2/3 columns, a
+  short/tall toggle on graph and list tiles, **Configure** on every tile
+  that takes one, **Remove**, and an **Add tile** dialog holding the
+  whole catalogue grouped by family — a type the signed-in account
+  cannot read is not offered, and a type already on a saved layout that
+  the account can no longer read renders "Not readable with your access"
+  rather than a number that would be a lie. **Reset to default** discards
+  the saved layout and restores the ten shipped tiles.
+- **The catalogue holds 24 tile types across five families:**
+  - *Fleet & alerts* — **Fleet** (device counts by status, the poll
+    worker pool, devices currently down); **Open alerts** (open counts
+    by severity); **Workers** (collector worker status and counters);
+    **Storage headroom** (disk usage against configured caps).
+  - *Graphs* — **Interface traffic** (in/out bandwidth for one
+    interface, 240-bucket chart); **Device metric** (one metric over
+    time for one device). Both default to a 24-hour window, refreshed
+    every 60 seconds.
+  - *Devices* — **Device status** (one device's status, RTT, loss, CPU
+    and open alert count).
+  - *Lists* — **Top: device events**, **Top: interface events**, **Top:
+    alerts**, **Top: RTT**, **Top: loss**, **Top: CPU** (the 24-hour
+    offender lists the Dashboard always had); **Top by metric** (devices
+    or interfaces ranked by peak or mean of a chosen metric); **Recent
+    alerts** (unresolved alerts up to a chosen severity); **Recent
+    events** (the most recent device events fleet-wide, off the new
+    `GET /api/nodes/events`); **Note** (a free-text note pinned to the
+    dashboard, the one tile with no module to read).
+  - *Module overviews* — **Syslog rate**, **Trap rate** (volume over
+    time and the busiest sources); **Top flows** (top talkers by a
+    chosen dimension); **Wireless summary** (access point counts and
+    poller status); **ConfigRX summary** (devices backing up and worker
+    status); **IPAM subnets** (subnet utilization, most full first);
+    **HTTPS monitors** (state, response code and latency for every
+    NetPath destination with a web check).
+- The four **Fleet & alerts** tiles and the six 24-hour offender lists
+  refresh on the Dashboard's own existing cadence (`dashboard_refresh_s`,
+  five seconds, and the offenders' own slower one); every other tile
+  fetches its own data on a 60-second cadence, independently, so one
+  slow module never holds up the rest of the grid.
+- The chart renderer Nodes' own three charts already used
+  (`drawSeriesChart`) is lifted into `App` alongside a new
+  `App.sparkline`, the way `tile`/`figure` were lifted in 4.46.0 — one
+  renderer for a device chart and a dashboard graph tile, so the two
+  cannot drift apart.
+- `PUT /api/dashboard/layout` validates before storing anything: at most
+  60 tiles, each with a bounded id, a known type, `w` in `{1,2,3}`, `h`
+  in `{1,2}`, and a `config` object whose keys are typed per tile type —
+  an unknown key or a wrong-shaped value is refused with 400 rather than
+  stored and handed back later to whatever reads it.
+
+Files: `appdb.py`, `web/api.py`, `web/server.py`, `web/static/dashboard.js`,
+`web/static/app.js`, `web/static/debug.js`, `web/static/nodes.js`,
+`web/static/index.html`, `web/static/app.css`, `nodesdb.py`.
 
 ### 5.20.5 — The auto-assigned MIB, repaired for the fleet (second pass)
 

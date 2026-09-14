@@ -353,13 +353,62 @@ every operator saw. It now answers "what should I look at first" from data
 the application already had, refreshed on the interval in
 `dashboard_refresh_s` (five seconds by default).
 
-| Tile | Shows |
-| --- | --- |
-| Fleet | Total devices, and how many are up, down, in maintenance, unknown or failing authentication; underneath, the down devices themselves by name (up to ten, with "and N more" linking to the rest) and the poll pool's busy and queued worker counts |
-| Open alerts | The count by severity, coloured by the worst severity open rather than by the total, so one severity-1 outage is never hidden behind forty notices |
-| Workers | Every background process, by the noun its own tab uses — the Nodes poller, the alert engine, the NetFlow collector, the SNMP trap receiver, the Syslog collector, the IPAM worker, the Wireless poller, the ConfigRX worker: running or not, how much each has taken in, and every one of its counters that is not zero — dropped, dropped by the kernel, throttled, failed or unverified authentication, over the varbind limit, TCP connections refused, errors |
-| Storage headroom | Each database against its own size cap |
-| Worst ten (24 h) | Six lists: most device events, most interface events, most alerts, slowest to answer, worst packet loss, highest CPU |
+**From 5.21.0 the tile grid is a per-account layout, not a fixed list.**
+Every account starts on the same shipped default — the ten tiles below,
+in this order — but can rearrange, resize, add and remove tiles from a
+wider catalogue, and what is saved is stored on the server against that
+account, not the browser: sign in from anywhere and the same layout is
+there. A second account sees its own layout, or the default if it has
+never saved one.
+
+- **Edit layout**, top right of the tab, turns editing on; the ordinary
+  view stays uncluttered until you ask for it. In edit mode every tile
+  gets a small toolbar: a drag handle to reorder (or ◀ ▶ as a keyboard
+  equivalent), width buttons for 1/2/3 grid columns, a short/tall toggle
+  on graph and list tiles, **Configure** on any tile type that takes
+  settings, and **Remove**.
+- **Add tile** opens the full catalogue grouped by family, each entry
+  with a one-line description; a type the signed-in account has no read
+  grant for is left out of the list entirely, the same rule the tiles
+  themselves already follow. A parameterised type (a device, an
+  interface, a metric, a note's text) opens its own **Configure** dialog
+  immediately after it is added.
+- **Reset to default** discards the saved layout and restores the ten
+  shipped tiles in their shipped order — a confirmed action, since it
+  throws away whatever was built.
+- **A tile whose module the account can no longer read** — a saved
+  layout outliving a permission change — renders its frame with "Not
+  readable with your access" rather than a stale or zeroed number.
+- Refresh cadence: the four Fleet & alerts tiles and the six 24-hour
+  offender lists follow the Dashboard's own existing cadence (five
+  seconds for the counters, a slower one for the lists, both below);
+  every other tile — every graph, every module overview, every
+  configurable list — fetches its own data on a 60-second cadence,
+  independently, so one slow module's tile never holds up the rest of
+  the grid.
+
+**The catalogue, by family:**
+
+| Family | Tile | Shows | Configurable |
+| --- | --- | --- | --- |
+| Fleet & alerts | Fleet | Total devices, and how many are up, down, in maintenance, unknown or failing authentication; underneath, the down devices themselves by name (up to ten, with "and N more" linking to the rest) and the poll pool's busy and queued worker counts | No |
+| Fleet & alerts | Open alerts | The count by severity, coloured by the worst severity open rather than by the total, so one severity-1 outage is never hidden behind forty notices | No |
+| Fleet & alerts | Workers | Every background process, by the noun its own tab uses — the Nodes poller, the alert engine, the NetFlow collector, the SNMP trap receiver, the Syslog collector, the IPAM worker, the Wireless poller, the ConfigRX worker: running or not, how much each has taken in, and every one of its counters that is not zero — dropped, dropped by the kernel, throttled, failed or unverified authentication, over the varbind limit, TCP connections refused, errors | No |
+| Fleet & alerts | Storage headroom | Each database against its own size cap | No |
+| Lists | Top: device events / interface events / alerts / RTT / loss / CPU | The Worst ten (24 h) lists Dashboard always had, one tile each now instead of one fixed block | No |
+| Lists | Top by metric | Devices or interfaces ranked by peak or mean of a chosen metric, over a chosen window | Metric, rows, window, rank by, ascending |
+| Lists | Recent alerts | Unresolved alerts up to a chosen severity | Max severity, rows |
+| Lists | Recent events | The most recent device events fleet-wide | Rows, window |
+| Lists | Note | A free-text note pinned to the dashboard — the one tile with no module to read, so every account can add it | Title, text |
+| Graphs | Interface traffic | In/out bandwidth for one interface, a 24-hour window by default | Device, interface, window |
+| Graphs | Device metric | One metric over time for one device, a 24-hour window by default | Device, metric, window |
+| Devices | Device status | One device's status, RTT, loss, CPU and open alert count | Device |
+| Module overviews | Syslog rate / Trap rate | Volume over time and the busiest sources | Window |
+| Module overviews | Top flows | Top talkers by a chosen NetFlow dimension | Dimension, rows, window |
+| Module overviews | Wireless summary | Access point counts and the poller's own status | No |
+| Module overviews | ConfigRX summary | Devices backing up configuration and the worker's status | No |
+| Module overviews | IPAM subnets | Subnet utilization, most full first | Rows |
+| Module overviews | HTTPS monitors | State, response code and latency for every NetPath destination with a web check | No |
 
 **Every count is a link**, and a real one — an anchor with an `href`, so it
 can be middle-clicked into a second tab or copied into a ticket. Clicking
@@ -1220,7 +1269,15 @@ location, vendor, SNMP version, software version and, from 5.15.0,
 firmware version and software image) is chosen in Nodes → Settings'
 detail-fields picker; a fresh install turns all of them on, and an
 install with its own saved list keeps exactly that list — the picker
-just offers the new box to add. **Software** always shows, even on a
+just offers the new box to add. **From 5.21.0, the CSV export's Name
+column matches what the screen shows** — the resolved display name (the
+manual name when the device is pinned to it, else the SNMP hostname,
+else the manual name, else the IP) — rather than the raw stored `name`,
+which is seeded to the device's own IP address until someone renames it;
+an unrenamed device used to export its IP twice, once as the name and
+again as the IP column. The `sys_name` column is unchanged, so the raw
+SNMP hostname is still there for anything that wants it. **Software**
+always shows, even on a
 device that answered nothing: a version reads on its own line with the
 source in parentheses when known — `software 15.2(7)E4 (sysDescr)`,
 `7.0.12 (vendor OID)`, `… (ENTITY-MIB)` — and a device with none reads
@@ -1359,6 +1416,22 @@ question that box exists for. Entries age out on the same
 retention clock as the MAC table, since it is the identical "nothing has
 walked this device for a while" question rather than a second setting to
 learn.
+
+**From 5.21.0, global search follows an IP the rest of the way to a switch
+port.** Typing a MAC already listed the switch and port it was learned
+on; typing an IP used to stop at the ARP row naming the MAC and go no
+further. It now chains that MAC on to the forwarding table the same way
+the ARP subtab's own MAC links do, and shows a third result group,
+**"Switch port for that IP (ARP → MAC table)"**, naming the switch, port,
+VLAN, uplink and present/aged-out state — the port hit opens the port
+dialog directly. A MAC answering to several matched IPs at once — a
+router with a secondary address, say — names all of them in that one
+port hit, comma-separated, ordered and deduplicated, up to four. A MAC
+search is unaffected; its own group already answers the question. When
+neither the forwarding table nor the ARP
+cache has ever been walked for any device, a hint line explains that
+**Learn MAC addresses** and **Read the ARP cache** need turning on in a
+polling profile before an address can be searched this way.
 
 **Vendor and Location can be read from an OID you choose.** Vendor is
 normally worked out from sysObjectID (an IANA arc assignment) with a sysDescr
@@ -3796,6 +3869,14 @@ disk.
   its next poll and reloads the log from the top by itself, rather than
   sitting on a position in the old log and showing nothing — which is what
   made a restart look like the log had spontaneously cleared.
+- **From 5.21.0, the log keeps your place while you are reading it.**
+  Scrolling up to read an older row holds the view there through the
+  next poll instead of being yanked back to the bottom; scroll back to
+  the bottom yourself and it resumes following. **Scroll to newest**
+  keeps its existing meaning — ticked is still "stay pinned to the
+  newest row" — it now only acts while you are actually at the bottom
+  already, or on a first paint or a filter change, rather than on every
+  single poll regardless of where you were reading.
 - Filter by destination, by category (Traceroute, Reverse DNS, NetFlow, SNMP
   Trap, Nodes, Alerts, IPAM, Wireless, ConfigRX, System, Errors) or by free
   text across both messages and details. **All** and **None** beside the

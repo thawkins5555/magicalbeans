@@ -2221,6 +2221,11 @@ const App = (() => {
     const token = ++gsearchToken;
     const groups = [];
     const needle = q.toLowerCase();
+    // Tracked so the "nothing collected yet" hint below can tell a query
+    // that never matched anything from a query that never had a chance to:
+    // every table it checked reports zero devices collecting it.
+    let addressLookupHit = false;
+    const addressEnabledDevices = [];
     // A MAC in any of the notations nodes.js already accepts is worth a
     // lookup on its own; a plain name never is, so this never fires one
     // for every keystroke of an ordinary search.
@@ -2234,7 +2239,9 @@ const App = (() => {
     if (hexOnly.length >= 4 && canRead('nodes')) {
       try {
         const mac = await get('/api/nodes/mac-search', { q });
+        addressEnabledDevices.push(mac.enabled_devices);
         if (mac.locations && mac.locations.length) {
+          addressLookupHit = true;
           // The forwarding-table hit: this MAC was learned on this switch
           // PORT, which is the physical answer "where is it plugged in".
           // VLAN, whether the last walk still saw it and when it was last
@@ -2257,7 +2264,9 @@ const App = (() => {
     if ((hexOnly.length >= 4 || addressish) && canRead('nodes')) {
       try {
         const arp = await get('/api/nodes/arp-search', { q });
+        addressEnabledDevices.push(arp.enabled_devices);
         if (arp.locations && arp.locations.length) {
+          addressLookupHit = true;
           // The ARP-cache hit: which IP this MAC holds, or which MAC this IP
           // resolves to, on which router. Routed to the device's ARP pane
           // and NOT to /port/<if_index>: an ARP row's ifIndex is a routed
@@ -2271,6 +2280,22 @@ const App = (() => {
                    loc.seen_ts ? `last seen ${when(loc.seen_ts)} (${ago(loc.seen_ts)})` : '']
               .filter(Boolean).join(' · '),
             route: `#/nodes/device/${loc.device_id}/arp`,
+          })) });
+        }
+        if (arp.ports && arp.ports.length) {
+          addressLookupHit = true;
+          // Chained one step further than the ARP-cache hit above: the MAC
+          // an IP resolves to, followed on to the switch port that learned
+          // it -- the physical answer, reached from an IP instead of a MAC.
+          groups.push({ title: 'Switch port for that IP (ARP → MAC table)', hits: arp.ports.slice(0, 8).map((p) => ({
+            name: `${p.ip} → ${formatMac(p.mac)}`,
+            meta: [`${p.device_name} · ${p.if_descr}`,
+                   p.vlan ? `VLAN ${p.vlan}` : '',
+                   p.uplink ? 'uplink' : '',
+                   p.present ? 'present' : 'aged out',
+                   p.seen_ts ? `last seen ${when(p.seen_ts)} (${ago(p.seen_ts)})` : '']
+              .filter(Boolean).join(' · '),
+            route: `#/nodes/device/${p.device_id}/port/${p.if_index}`,
           })) });
         }
       } catch (error) { /* this group's own failure, not every group after it */ }
@@ -2396,18 +2421,27 @@ const App = (() => {
     // separately (4.49.0). Wire a "Stored configurations" group here, the
     // same one-try-per-group shape as every group above, once it exists.
 
+    const notes = [];
+    if ((hexOnly.length >= 4 || addressish) && !addressLookupHit
+        && addressEnabledDevices.length && addressEnabledDevices.every((n) => n === 0)) {
+      notes.push('No forwarding tables or ARP caches have been collected yet '
+        + '— turn on Learn MAC addresses and Read the ARP cache in a '
+        + 'polling profile to search by MAC or IP.');
+    }
+
     if (token !== gsearchToken) return;   // superseded by a newer keystroke
-    gsearchRender(groups);
+    gsearchRender(groups, notes);
   }
 
-  function gsearchRender(groups) {
+  function gsearchRender(groups, notes = []) {
     const results = document.getElementById('gsearch-results');
     if (!results) return;
     gsearchActive = -1;
+    const notesHtml = notes.map((n) => `<p class="hint gsearch-note">${escapeHtml(n)}</p>`).join('');
     if (!groups.length) {
       results.innerHTML = '<p class="gsearch-empty">Type to search devices, interfaces, '
         + 'MACs on switch ports, ARP caches, alerts, NetPath destinations, IPAM hosts, '
-        + 'DHCP leases, syslog and wireless.</p>';
+        + 'DHCP leases, syslog and wireless.</p>' + notesHtml;
       return;
     }
     results.innerHTML = groups.map((group) => `<div class="gsearch-group">
@@ -2417,7 +2451,7 @@ const App = (() => {
           <span class="name">${escapeHtml(hit.name)}</span>
           ${hit.meta ? `<span class="meta">${escapeHtml(hit.meta)}</span>` : ''}
         </button>`).join('')}
-      </div>`).join('');
+      </div>`).join('') + notesHtml;
     for (const button of results.querySelectorAll('.gsearch-hit')) {
       button.onclick = () => gsearchGo(button.dataset.route);
     }
@@ -2749,6 +2783,294 @@ const App = (() => {
     return out;
   }
 
+  /* Chart renderer shared by Nodes' three charts and the Dashboard's
+     graph tiles: one series-drawing function so a dashboard tile and a
+     device chart never drift apart. nodes.js aliases these two names
+     (const drawSeriesChart = App.drawSeriesChart) rather than keeping a
+     second copy. */
+  const PAD = { left: 70, right: 12, top: 12, bottom: 22 };   // left fits "800.0 Kbps"
+
+  function niceCeiling(value) {
+    if (value <= 0) return 1;
+    const exponent = Math.floor(Math.log10(value));
+    const base = 10 ** exponent;
+    for (const step of [1, 1.5, 2, 2.5, 3, 4, 5, 7.5, 10]) {
+      if (value <= step * base) return step * base;
+    }
+    return 10 * base;
+  }
+
+  /* Centered moving average over {ts, value} (raw) or {ts, avg, min, max}
+     (bucketed) points, for the Smoothed checkbox. Time-aware, not
+     count-based: a count-based window let the effective smoothing span swing
+     with polling cadence. It targets a fixed ~90 s of wall clock —
+     clamp(round(90 / median spacing), 3, 25) — and shrinks at the edges
+     rather than reaching past the data. Only `avg`/`value` is smoothed;
+     `min`/`max` are already a bucket's real extremes, and averaging them
+     would blur out the spikes they exist to show. */
+  function movingAverage(points) {
+    const n = points.length;
+    if (n < 3) return points;
+    const spacings = [];
+    for (let i = 1; i < n; i += 1) {
+      const dt = points[i].ts - points[i - 1].ts;
+      if (dt > 0) spacings.push(dt);
+    }
+    spacings.sort((a, b) => a - b);
+    const median = spacings.length ? spacings[Math.floor(spacings.length / 2)] : 1;
+    const window = Math.max(3, Math.min(25, Math.round(90 / median)));
+    const half = Math.floor(window / 2);
+    const isRollup = points[0].avg !== undefined;
+    return points.map((p, i) => {
+      const lo = Math.max(0, i - half);
+      const hi = Math.min(n - 1, i + half);
+      let sum = 0, count = 0;
+      for (let j = lo; j <= hi; j += 1) {
+        const v = isRollup ? points[j].avg : points[j].value;
+        if (v != null) { sum += v; count += 1; }
+      }
+      const smoothed = count ? sum / count : null;
+      return isRollup ? { ...p, avg: smoothed } : { ts: p.ts, value: smoothed };
+    });
+  }
+
+  /* Axis-label formatting by metric unit — the raw number a metric
+     stores is not what a human reads on a gridline. */
+  function formatMetricValue(unit, v) {
+    if (unit === 'bps') return rate(v, 1);
+    // niceCeiling can pick a fractional peak (1.5, 2.5, 7.5, 0.75, ...),
+    // so a whole-number %-label would round a 1.5% peak up to "2%" —
+    // one decimal place is honest about that.
+    if (unit === '%') return `${v.toFixed(1)}%`;
+    if (unit === 'err/s') return `${v.toFixed(2)} err/s`;
+    const prefixes = ['', 'k', 'M', 'G', 'T'];
+    let n = v;
+    let i = 0;
+    while (Math.abs(n) >= 1000 && i < prefixes.length - 1) { n /= 1000; i += 1; }
+    const text = Math.abs(n) >= 100 || Number.isInteger(n) ? n.toFixed(0) : n.toFixed(1);
+    return `${text}${prefixes[i]}${unit ? ` ${unit}` : ''}`;
+  }
+
+  /* The one chart renderer, shared by the device metric chart and the
+     interface dialog: 1..n series, raw or rollup points, unit-aware Y
+     labels, time labels at fixed window fractions (sample positions
+     cluster and overlap). Returns the plot geometry so the caller can
+     anchor wheel-zoom math, or null when there was nothing to draw. */
+  function drawSeriesChart(svg, wrap, data, opts = {}) {
+    svg.innerHTML = '';
+    const box = wrap.getBoundingClientRect();
+    const width = Math.max(box.width, 300);
+    const height = Math.max(box.height, 120);
+    svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+    // A line chart has no per-point tab stops (a live one can carry hundreds
+    // of samples); the container itself is the one stop, described from
+    // whatever summary the caller already has for its own header.
+    wrap.tabIndex = 0;
+    wrap.setAttribute('role', 'img');
+    wrap.setAttribute('aria-label', opts.ariaLabel || 'Chart');
+    // No data object at all (nothing has ever loaded — e.g. no metric
+    // chosen yet) means there is no window to hand back for zooming
+    // either. An empty series list is different: the request window
+    // (data.t0/t1) is still known, so the caller can keep zooming out of
+    // an empty view instead of the wheel going dead — see below.
+    if (!data) return null;
+    // The min/max band only when a single series is drawn — two
+    // overlapping bands read as mud, the avg lines carry the story. Decided
+    // here (before smoothing) because it also decides whether a smoothed
+    // bucketed series keeps its min/max: smoothing the avg column is always
+    // fine, but a min/max band next to a single averaged line would read as
+    // the smoothed line's own error bars, which it isn't, if there's more
+    // than one series to confuse it with.
+    const drawBand = (data.series || []).length === 1;
+    const seriesList = (data.series || []).map((s) => {
+      const points = s.points || [];
+      if (!opts.smooth || points.length < 3) return { ...s, points };
+      const smoothed = movingAverage(points);
+      const isRollupPts = points[0].avg !== undefined;
+      return { ...s, points: isRollupPts && !drawBand
+        ? smoothed.map((p) => ({ ts: p.ts, avg: p.avg }))
+        : smoothed };
+    });
+    const value = (p) => p.avg !== undefined ? p.avg : p.value;
+    const allValues = seriesList.flatMap((s) => s.points.flatMap((p) =>
+      p.avg !== undefined ? [p.min, p.avg, p.max].filter((v) => v != null)
+        : (p.value != null ? [p.value] : [])));
+    const plot = { x: PAD.left, y: PAD.top,
+      w: Math.max(width - PAD.left - PAD.right, 10),
+      h: Math.max(height - PAD.top - PAD.bottom, 10) };
+    const { t0, t1 } = data;
+    const geo = { plot, width, t0, t1 };
+    if (!allValues.length) {
+      emptyText(svg, width, height, opts.emptyText || 'No data in this window');
+      return geo;
+    }
+    // opts.peak pins the axis for a metric with a known full scale (a
+    // percentage); everything else scales to what it actually got.
+    let peak = opts.peak || niceCeiling(Math.max(...allValues, 0.001));
+    // Axis hysteresis, auto-scaled charts only (a pinned opts.peak, like the
+    // loss chart's 100, never wobbles in the first place). Every redraw of
+    // a live chart recomputed the ceiling from that redraw's raw max, so a
+    // single low-traffic tick made the axis — and every line on it —
+    // visibly snap smaller and then snap back a few seconds later. Growing
+    // still happens immediately (a real spike must not be clipped), but a
+    // shrink is only honored once the new peak has fallen below half the
+    // previous one — a small dip no longer moves the axis at all.
+    if (!opts.peak && opts.axisMemory) {
+      const mem = opts.axisMemory;
+      if (mem.peak != null && peak < mem.peak && peak >= mem.peak / 2) {
+        peak = mem.peak;
+      }
+      mem.peak = peak;
+    }
+    const xFor = (ts) => plot.x + ((ts - t0) / Math.max(t1 - t0, 1)) * plot.w;
+    const yFor = (v) => plot.y + plot.h - (Math.max(v, 0) / peak) * plot.h;
+
+    for (let step = 0; step <= 2; step += 1) {
+      const frac = step / 2;
+      const y = plot.y + plot.h - plot.h * frac;
+      svg.appendChild(svgNode('line', {
+        x1: plot.x, y1: y, x2: plot.x + plot.w, y2: y, stroke: 'var(--grid)' }));
+      svg.appendChild(svgNode('text', {
+        x: plot.x - 6, y: y + 4, 'text-anchor': 'end', fill: 'var(--dim)',
+        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)' },
+        formatMetricValue(data.unit || '', peak * frac)));
+    }
+
+    for (const s of seriesList) {
+      const isRollup = s.points[0] && s.points[0].avg !== undefined;
+      if (isRollup && drawBand) {
+        const banded = s.points.filter((p) => p.min != null && p.max != null);
+        const band = banded.map((p) => `${xFor(p.ts)},${yFor(p.max)}`).join(' ') +
+          ' ' + banded.slice().reverse()
+          .map((p) => `${xFor(p.ts)},${yFor(p.min)}`).join(' ');
+        svg.appendChild(svgNode('polygon', {
+          points: band, fill: s.color, 'fill-opacity': 0.15, stroke: 'none' }));
+      }
+      const line = s.points.filter((p) => value(p) != null)
+        .map((p) => `${xFor(p.ts)},${yFor(value(p))}`).join(' ');
+      if (line) {
+        svg.appendChild(svgNode('polyline', {
+          points: line, fill: 'none', stroke: s.color, 'stroke-width': 1.5 }));
+      }
+    }
+
+    // Legend inside the plot's top-left when the lines need telling apart.
+    const labelled = seriesList.filter((s) => s.label);
+    if (labelled.length > 1) {
+      let x = plot.x + 8;
+      for (const s of labelled) {
+        svg.appendChild(svgNode('rect', {
+          x, y: plot.y + 4, width: 14, height: 3, fill: s.color }));
+        const text = svgNode('text', {
+          x: x + 18, y: plot.y + 9, fill: 'var(--dim)',
+          'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)' }, s.label);
+        svg.appendChild(text);
+        x += 18 + s.label.length * 6.5 + 14;
+      }
+    }
+
+    for (const frac of (opts.fractions || [0, 0.5, 1])) {
+      const ts = t0 + (t1 - t0) * frac;
+      svg.appendChild(svgNode('text', {
+        x: xFor(ts), y: height - 6,
+        'text-anchor': frac === 0 ? 'start' : frac === 1 ? 'end' : 'middle',
+        fill: 'var(--dim)',
+        'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)' }, stamp(ts, t1 - t0)));
+    }
+    if (!opts.noHover) attachChartHover(svg, seriesList, geo, data.unit || '', xFor, yFor, value);
+    return geo;
+  }
+
+  // Hover readout for every line chart: nearest sample by time, one row per
+  // series, min-max band for rollup points. The rect is last so it is on top.
+  function nearestPoint(points, ts) {
+    let lo = 0;
+    let hi = points.length - 1;
+    if (hi < 0) return null;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (points[mid].ts < ts) lo = mid + 1; else hi = mid;
+    }
+    const after = points[lo];
+    const before = points[lo - 1];
+    return before && Math.abs(before.ts - ts) <= Math.abs(after.ts - ts) ? before : after;
+  }
+
+  function attachChartHover(svg, seriesList, geo, unit, xFor, yFor, value) {
+    const { plot } = geo;
+    const guide = svgNode('line', {
+      x1: 0, y1: plot.y, x2: 0, y2: plot.y + plot.h,
+      stroke: 'var(--dim)', 'stroke-dasharray': '3 3', visibility: 'hidden' });
+    svg.appendChild(guide);
+    const dots = seriesList.map((s) => {
+      const dot = svgNode('circle', { r: 3, fill: s.color, visibility: 'hidden' });
+      svg.appendChild(dot);
+      return dot;
+    });
+    const rect = svgNode('rect', {
+      x: plot.x, y: plot.y, width: plot.w, height: plot.h,
+      fill: 'transparent', class: 'chart-hover' });
+    svg.appendChild(rect);
+    const hide = () => {
+      guide.setAttribute('visibility', 'hidden');
+      for (const dot of dots) dot.setAttribute('visibility', 'hidden');
+      hideTooltip();
+    };
+    rect.addEventListener('mousemove', (event) => {
+      const pt = svg.createSVGPoint();
+      pt.x = event.clientX;
+      pt.y = event.clientY;
+      const ctm = svg.getScreenCTM();
+      const x = ctm ? pt.matrixTransform(ctm.inverse()).x : plot.x;
+      const ts = geo.t0 + ((x - plot.x) / Math.max(plot.w, 1)) * (geo.t1 - geo.t0);
+      const rows = [];
+      let anchor = null;
+      seriesList.forEach((s, i) => {
+        const p = nearestPoint(s.points, ts);
+        const v = p ? value(p) : null;
+        if (v == null) { dots[i].setAttribute('visibility', 'hidden'); return; }
+        if (anchor === null) anchor = p.ts;
+        dots[i].setAttribute('cx', xFor(p.ts));
+        dots[i].setAttribute('cy', yFor(v));
+        dots[i].setAttribute('visibility', 'visible');
+        const band = p.avg !== undefined && p.min != null && p.max != null && p.min !== p.max
+          ? ` (${formatMetricValue(unit, p.min)} \u2013 ${formatMetricValue(unit, p.max)})` : '';
+        rows.push({ color: s.color, text: `${s.label || 'Value'} ${formatMetricValue(unit, v)}${band}` });
+      });
+      if (anchor === null) { hide(); return; }
+      guide.setAttribute('x1', xFor(anchor));
+      guide.setAttribute('x2', xFor(anchor));
+      guide.setAttribute('visibility', 'visible');
+      tooltip([{ text: when(anchor) }, ...rows], event);
+    });
+    rect.addEventListener('mouseleave', hide);
+  }
+
+  /* A tiny inline bar chart for overview tiles — no axes, no hover, just the
+     shape of `values` over its own min..max. Bars share one width; a null
+     or NaN entry leaves a gap rather than drawing a zero-height spike that
+     would read as "no traffic" instead of "no sample". */
+  function sparkline(values, options = {}) {
+    const width = options.width || 160;
+    const height = options.height || 32;
+    const cls = options.className ? ` class="${options.className}"` : '';
+    const nums = values.filter((v) => typeof v === 'number' && Number.isFinite(v));
+    const max = nums.length ? Math.max(...nums, 0) : 0;
+    const n = values.length || 1;
+    const gap = 1;
+    const barWidth = Math.max((width - gap * (n - 1)) / n, 1);
+    const bars = values.map((v, i) => {
+      if (typeof v !== 'number' || !Number.isFinite(v)) return '';
+      const h = max > 0 ? Math.max((v / max) * height, v > 0 ? 1 : 0) : 0;
+      const x = i * (barWidth + gap);
+      const y = height - h;
+      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barWidth.toFixed(1)}" ` +
+        `height="${h.toFixed(1)}" fill="currentColor" />`;
+    }).join('');
+    return `<svg${cls} viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" ` +
+      `role="img" aria-hidden="true">${bars}</svg>`;
+  }
+
   /* A tile and a figure: the Dashboard's building blocks, shared so the
      wall-display strips (kiosk mode) and any future summary use the same
      markup and the same CSS (.tile, .figures, .figure). A figure is one
@@ -2756,10 +3078,14 @@ const App = (() => {
      where the number can be acted on. */
   function tile(title, bodyHtml, options = {}) {
     const cls = ['card', 'tile'];
-    if (options.wide) cls.push('wide');
+    if (options.wide || options.w === 2) cls.push('w2');
+    if (options.w === 3) cls.push('w3');
+    if (options.h === 2) cls.push('tall');
     if (options.tone) cls.push(`tone-${options.tone}`);
-    return `<section class="${cls.join(' ')}">
+    const idAttr = options.id ? ` data-tile="${escapeHtml(options.id)}"` : '';
+    return `<section class="${cls.join(' ')}"${idAttr}>
       <h3>${escapeHtml(title)}</h3>
+      ${options.tools || ''}
       ${bodyHtml}
     </section>`;
   }
@@ -5614,6 +5940,7 @@ const App = (() => {
     canStoreSecrets, credentialUnavailableHtml,
     registerHelp, helpLink,
     resetLayout, onRelayout, setTheme, currentTheme, tile, figure, figures,
+    drawSeriesChart, formatMetricValue, sparkline,
     recallSort, rememberSort, restoreControls, rememberControls,
     rememberControl, savedControl, controlOrSaved, syncControls,
     recallSub, rememberSub, selectSub,

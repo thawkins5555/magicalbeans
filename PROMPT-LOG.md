@@ -702,8 +702,6 @@ fast-forwarded.
 
 ## 5.21.0 — A modular Dashboard, and global find to the switch port
 
-*(in progress)*
-
 **Team-rules prompt** — the standing rules as before, with four work items:
 (a) global find should show an IP or MAC's hits on switch-port MAC tables
 and ARP tables, naming the port; (b) the Nodes CSV export lists the IP in
@@ -725,4 +723,13 @@ rather than shipping the fixes first; graphs default to a 24-hour window
 refreshed every 60 seconds.
 
 **Plan approved.**
-→ Work assigned across the roster.
+→ Work assigned across the roster: Thing1 the backend (both fixes, the
+layout storage and routes, `/api/nodes/events`), Thing2 the frontend
+(the scroll fix, the shared chart renderer, `dashboard.js` and its
+catalogue of 24 tile types), Stephen_King the docs. Testy ran the full
+suite (152/158; the six failures were environmental or pre-existing on
+main) and a headless walk of Dashboard, Debug, Nodes CSV and global find.
+Javariius found one blocker (a graph tile with no device chosen made the
+layout unsaveable) and sixteen smaller findings; all closed, re-review
+"ready to push". Fisty chunked the new MAC query to the bulk contract and
+re-pinned the Workers tile check. Shipped as 5.21.0 on `main`.

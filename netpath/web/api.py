@@ -4217,16 +4217,23 @@ def get_nodes_arp_search(service, params, body) -> dict:
     # needle's ports are already the MAC group's answer.
     lowered = needle.lower()
     ports = []
-    macs, ip_for_mac = [], {}
+    macs, ips_for_mac = [], {}
     for row in rows:
-        mac = row["mac"]
-        if not mac or not str(row["ip"] or "").lower().startswith(lowered):
+        mac, ip = row["mac"], row["ip"]
+        if not mac or not str(ip or "").lower().startswith(lowered):
             continue
-        if mac not in ip_for_mac:
-            ip_for_mac[mac] = row["ip"]
+        if mac not in ips_for_mac:
+            if len(macs) >= 8:
+                continue
+            ips_for_mac[mac] = []
             macs.append(mac)
-        if len(macs) >= 8:
-            break
+        # A MAC that answers to more than one matched address (a router with
+        # secondaries, say) names all of them, not just the first row seen —
+        # capped at four so a busy MAC does not turn one port row into a
+        # paragraph.
+        ip_list = ips_for_mac[mac]
+        if ip not in ip_list and len(ip_list) < 4:
+            ip_list.append(ip)
     port_rows = service.nodes_db.mac_locations_for(macs) if macs else []
     if port_rows:
         port_devices = _devices_for_rows(service, port_rows)
@@ -4235,7 +4242,7 @@ def get_nodes_arp_search(service, params, body) -> dict:
             if device is None:
                 continue
             ports.append({**_mac_location_json(row, device),
-                          "ip": ip_for_mac.get(row["mac"], "")})
+                          "ip": ", ".join(ips_for_mac.get(row["mac"], []))})
     # How many devices walk their ARP cache at all — off is the shipped
     # default here, so "not found" and "nobody is collecting this" are
     # different sentences far more often than for the MAC table. One
@@ -10833,25 +10840,37 @@ def _validate_dashboard_layout(layout) -> dict:
         tile_type = tile.get("type")
         if tile_type not in DASHBOARD_TILE_TYPES:
             raise ValueError(f"Unknown tile type: {tile_type!r}")
-        w, h = tile.get("w"), tile.get("h")
-        if isinstance(w, bool) or w not in (1, 2, 3):
-            raise ValueError(f"Tile {tile_id}: w must be 1, 2 or 3")
-        if isinstance(h, bool) or h not in (1, 2):
-            raise ValueError(f"Tile {tile_id}: h must be 1 or 2")
+        # The same integer coercion every config field gets, not a bare
+        # `in (1, 2, 3)`: that literal check passes 1.0 straight through
+        # (1.0 == 1) and would store a float where every reader expects
+        # a Python int.
+        try:
+            w = _dash_int(tile.get("w"), allowed=(1, 2, 3))
+        except ValueError as exc:
+            raise ValueError(f"Tile {tile_id}: w must be 1, 2 or 3") from exc
+        try:
+            h = _dash_int(tile.get("h"), allowed=(1, 2))
+        except ValueError as exc:
+            raise ValueError(f"Tile {tile_id}: h must be 1 or 2") from exc
         config = tile.get("config")
         if not isinstance(config, dict):
             raise ValueError(f"Tile {tile_id}: config must be an object")
         schema = _DASHBOARD_CONFIG_SCHEMA.get(tile_type, {})
         clean_config = {}
         for key, value in config.items():
+            # A key the client omitted never reaches here at all; an
+            # explicit null is the same "not set" spelled the other way —
+            # dropped rather than failed through the field's own (int/str)
+            # validator, which null was never going to satisfy.
+            if value is None:
+                continue
             validator = schema.get(key)
             if validator is None:
                 raise ValueError(
                     f"Tile {tile_id}: unknown config key {key!r} for {tile_type}")
             clean_config[key] = validator(value)
         clean_tiles.append({"id": tile_id, "type": tile_type,
-                            "w": tile["w"], "h": tile["h"],
-                            "config": clean_config})
+                            "w": w, "h": h, "config": clean_config})
     return {"version": 1, "tiles": clean_tiles}
 
 
@@ -10903,7 +10922,7 @@ def get_nodes_events(service, params, body) -> dict:
     limit = max(1, min(int(_num(params, "limit", 50, int) or 50), 200))
     since_s = _num(params, "since_s", 86400.0)
     kinds_raw = params.get("kinds")
-    kinds = ([piece.strip() for piece in kinds_raw.split(",") if piece.strip()]
+    kinds = ([piece.strip() for piece in kinds_raw.split(",") if piece.strip()][:20]
              if kinds_raw else None)
     rows = service.nodes_db.device_events(
         None, since_s=since_s, kinds=kinds, limit=limit)

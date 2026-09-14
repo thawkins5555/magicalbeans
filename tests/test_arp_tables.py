@@ -577,6 +577,19 @@ check("arp-search by the IP chains to the switch port that learned its MAC",
 check("...and the uplink flag rides through from the neighbours row",
       port.get("uplink") is True and port.get("uplink_to") == "core-sw", port)
 
+# A router answering the same MAC on two addresses (a secondary, say) names
+# both, ordered and deduplicated, rather than only the first ARP row seen.
+db.replace_arp_entries(did, [
+    {"if_index": 7, "ip": "10.0.10.5", "mac": "aa:bb:cc:dd:ee:ff", "entry_type": "dynamic"},
+    {"if_index": 7, "ip": "10.0.10.9", "mac": "aa:bb:cc:dd:ee:ff", "entry_type": "dynamic"},
+    {"if_index": 9, "ip": "10.0.20.5", "mac": "00:11:22:33:44:55", "entry_type": "static"},
+], now=seen2 + 1.0)
+two_ip_chain = api.get_nodes_arp_search(Svc, {"q": "10.0.1"}, None)
+two_ip_port = next((p for p in two_ip_chain.get("ports", [])
+                    if p.get("mac") == "aabbccddeeff"), {})
+check("a MAC matched by two ARP rows names both ips, comma-joined",
+      two_ip_port.get("ip") == "10.0.10.5, 10.0.10.9", two_ip_chain)
+
 by_mac_prefix = api.get_nodes_arp_search(Svc, {"q": "AA-BB-CC-DD-EE-FF"}, None)
 check("arp-search by a MAC prefix answers ports == [] — the MAC group "
       "already answers", by_mac_prefix.get("ports") == [], by_mac_prefix)

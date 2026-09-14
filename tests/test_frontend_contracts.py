@@ -318,10 +318,23 @@ check("'MAC address on a switch port'" in GSEARCH
       "the MAC group's title names the switch port and it still routes to the port")
 check("get('/api/nodes/arp-search'" in GSEARCH and "'ARP cache (IP to MAC)'" in GSEARCH,
       "global search reaches the ARP caches, titled as the IP-to-MAC mapping")
-ARP_GROUP = GSEARCH[GSEARCH.index("get('/api/nodes/arp-search'"):GSEARCH.index("if (canRead('alerts'))")]
+ARP_GROUP = GSEARCH[GSEARCH.index("get('/api/nodes/arp-search'"):
+                    GSEARCH.index("'Switch port for that IP (ARP")]
 check("`#/nodes/device/${loc.device_id}/arp`" in ARP_GROUP
       and "/port/${loc.if_index}" not in ARP_GROUP,
       "an ARP hit routes to the device's ARP pane, not to a port dialog")
+# The IP -> MAC -> switch port chain: an ARP-search response that carries
+# ports (the needle matched as an address, not a MAC prefix) gets its own
+# group, routed to the port dialog like the MAC group above.
+check("'Switch port for that IP (ARP" in GSEARCH and "arp.ports" in GSEARCH
+      and "/port/${p.if_index}" in GSEARCH,
+      "global search follows an ARP hit's MAC on to the switch port it was "
+      "learned on")
+check("addressEnabledDevices" in GSEARCH and "gsearchRender(groups, notes)" in GSEARCH,
+      "a hint is built from enabled_devices across the address lookups and "
+      "passed to gsearchRender alongside the groups")
+check("No forwarding tables or ARP caches have been collected yet" in APP,
+      "the hint's wording matches what the plan promised the operator")
 check("get('/api/ipam/dhcp/lease-search'" in GSEARCH and "'DHCP leases'" in GSEARCH,
       "global search reaches DHCP leases through their own endpoint")
 GSEARCH_EMPTY = APP[APP.index('class="gsearch-empty"'):APP.index("</p>'", APP.index('class="gsearch-empty"'))]
@@ -2978,19 +2991,28 @@ check("stored" not in _second_call_line,
       "...and the SECOND (live) fetch carries no stored=1 param")
 
 # --- 59. 5.17.0: every line chart carries a hover readout ------------------
+# 5.21.0 lifted drawSeriesChart/formatMetricValue (and the private helpers
+# only they used — attachChartHover among them) into app.js, so the
+# Dashboard's new chart tiles share the exact renderer Nodes always had;
+# nodes.js keeps `const drawSeriesChart = App.drawSeriesChart` in their old
+# spot so its three charts are unaffected. This section now reads app.js.
 NODES59 = read("nodes.js")
-_hover = NODES59.find("function attachChartHover(")
-check(_hover != -1, "nodes.js defines attachChartHover for drawSeriesChart")
-check("if (!opts.noHover) attachChartHover(" in NODES59,
+check("const drawSeriesChart = App.drawSeriesChart;" in NODES59
+      and "const formatMetricValue = App.formatMetricValue;" in NODES59,
+      "nodes.js aliases the shared chart renderer rather than keeping its "
+      "own copy")
+_hover = APP.find("function attachChartHover(")
+check(_hover != -1, "app.js defines attachChartHover for drawSeriesChart")
+check("if (!opts.noHover) attachChartHover(" in APP,
       "drawSeriesChart attaches the hover layer unless a caller opts out")
-_hover_body = NODES59[_hover:_hover + 3000]
+_hover_body = APP[_hover:_hover + 3000]
 check("class: 'chart-hover'" in _hover_body,
       "the hover layer is a full-plot rect.chart-hover, the walk's hook")
 check("addEventListener('mousemove'" in _hover_body
-      and "App.tooltip([{ text: App.when(anchor) }" in _hover_body,
-      "mousemove shows App.tooltip with the sample time as its first row")
+      and "tooltip([{ text: when(anchor) }" in _hover_body,
+      "mousemove shows the tooltip with the sample time as its first row")
 check("addEventListener('mouseleave', hide)" in _hover_body
-      and "App.hideTooltip()" in _hover_body,
+      and "hideTooltip()" in _hover_body,
       "mouseleave hides the tooltip and the guide")
 check("formatMetricValue(unit, p.min)" in _hover_body,
       "rollup points show their min-max band beside the average")
@@ -3060,6 +3082,65 @@ check("for the selected method before saving" in NODES63,
       "Save refuses to silently switch auth mode without a new secret")
 check('id="as-sms-consent"' in NODES63, "the SMS number list carries the A2P consent notice")
 check("Reply STOP to unsubscribe" in NODES63, "...with STOP/HELP wording carriers expect")
+
+# --- 64. 5.21.0: the modular Dashboard --------------------------------------
+DASH64 = read("dashboard.js")
+INDEX64 = read("index.html")
+for _key in ("fleet", "open_alerts", "workers", "storage",
+            "top_events", "top_iface_events", "top_alerts", "top_rtt",
+            "top_loss", "top_cpu", "iface_traffic", "device_metric",
+            "device_status", "top_metric", "recent_alerts", "recent_events",
+            "note", "syslog_rate", "trap_rate", "netflow_top",
+            "wireless_summary", "configrx_summary", "ipam_subnets",
+            "https_monitors"):
+    check(("%s:" % _key in DASH64) or ("%s(" % _key in DASH64),
+          "TILE_TYPES carries the %s catalogue entry" % _key)
+for _id in ("dash-edit", "dash-add", "dash-done", "dash-cancel", "dash-reset"):
+    check('id="%s"' % _id in INDEX64,
+          "index.html carries the %s dashboard edit-mode control" % _id)
+check('draggable="true"' in DASH64,
+      "dashboard.js's tile tools carry a native HTML5 drag handle")
+check("/api/dashboard/layout" in DASH64
+      and "App.get('/api/dashboard/layout')" in DASH64
+      and "App.put('/api/dashboard/layout'" in DASH64
+      and "App.del('/api/dashboard/layout'" in DASH64,
+      "dashboard.js reads, saves and resets the layout through App's get/put/del")
+check("drawSeriesChart, formatMetricValue, sparkline," in APP,
+      "app.js exports drawSeriesChart, formatMetricValue and sparkline")
+check("const drawSeriesChart = App.drawSeriesChart;" in read("nodes.js")
+      and "const formatMetricValue = App.formatMetricValue;" in read("nodes.js"),
+      "nodes.js still aliases the shared chart renderer rather than keeping its own copy")
+check("Not readable with your access." in DASH64,
+      "a tile whose module the account cannot read says so instead of showing numbers")
+DEBUG64 = read("debug.js")
+_DRAW_EVENTS64 = DEBUG64[DEBUG64.index("  function drawEvents("):
+                        DEBUG64.index("  /* Typing eight characters")]
+_FOLLOW_IF = _DRAW_EVENTS64[_DRAW_EVENTS64.index("App.el('dbg-follow').checked"):
+                            _DRAW_EVENTS64.index("wrap.scrollTop = wrap.scrollHeight;")]
+check("atBottom" in _FOLLOW_IF and len(_FOLLOW_IF) < 120,
+      "the Debug event log's forced scroll-to-bottom line sits inside an if "
+      "that gates it on atBottom, not a bare follow-checkbox check")
+check("atBottom = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight <= 4;" in _DRAW_EVENTS64
+      and _DRAW_EVENTS64.index("atBottom =") < _DRAW_EVENTS64.index("frag.appendChild"),
+      "atBottom is measured before rows are appended, not after")
+
+# --- 65. Review fixes on the modular Dashboard ------------------------------
+# A picker left on its default null (a device/interface never chosen) is not
+# an int the server's config validation accepts — saveDraft must drop a
+# null/undefined config value before the PUT rather than send it literally.
+check("function sanitizedLayout(layout)" in DASH64,
+      "dashboard.js strips null/undefined config values before saving")
+_SANITIZED = DASH64[DASH64.index("function sanitizedLayout(layout)"):
+                    DASH64.index("async function saveDraft()")]
+check("value !== null && value !== undefined" in _SANITIZED,
+      "...specifically by dropping keys whose value is null or undefined")
+check("sanitizedLayout(view.draft)" in DASH64,
+      "...and saveDraft actually calls it rather than PUTting view.draft raw")
+_DRAGSTART = DASH64[DASH64.index("function onDragStart(event)"):
+                    DASH64.index("function onDragOver(event)")]
+check(_DRAGSTART.strip().startswith("function onDragStart(event) {\n    if (!view.editing) return;"),
+      "onDragStart bails out in view mode before it can preventDefault() a "
+      "plain link or text drag")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

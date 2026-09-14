@@ -3258,23 +3258,29 @@ class NodesDatabase(SqliteStore):
         normalised = normalised[:8]
         if not normalised:
             return []
+        rows: list[sqlite3.Row] = []
         with self._lock:
-            marks = ",".join("?" * len(normalised))
-            return self._conn.execute(
-                "SELECT m.*, i.descr AS if_descr,"
-                " EXISTS (SELECT 1 FROM neighbors nb WHERE nb.device_id = m.device_id"
-                "   AND nb.if_index = m.if_index AND nb.present = 1) AS uplink,"
-                " (SELECT CASE WHEN nb.sys_name != '' THEN nb.sys_name"
-                "              ELSE nb.chassis_id END"
-                "    FROM neighbors nb WHERE nb.device_id = m.device_id"
-                "      AND nb.if_index = m.if_index AND nb.present = 1"
-                "    ORDER BY CAST(nb.rem_index AS INTEGER), nb.rem_index LIMIT 1) AS uplink_to"
-                " FROM mac_entries m"
-                " LEFT JOIN interfaces i ON i.device_id = m.device_id"
-                "   AND i.if_index = m.if_index"
-                f" WHERE m.mac IN ({marks}) ORDER BY uplink ASC, m.present DESC,"
-                " m.seen_ts DESC, m.device_id, m.if_index LIMIT ?",
-                (*normalised, int(limit))).fetchall()
+            for chunk in _id_chunks(normalised):
+                marks = ",".join("?" * len(chunk))
+                rows += self._conn.execute(
+                    "SELECT m.*, i.descr AS if_descr,"
+                    " EXISTS (SELECT 1 FROM neighbors nb WHERE nb.device_id = m.device_id"
+                    "   AND nb.if_index = m.if_index AND nb.present = 1) AS uplink,"
+                    " (SELECT CASE WHEN nb.sys_name != '' THEN nb.sys_name"
+                    "              ELSE nb.chassis_id END"
+                    "    FROM neighbors nb WHERE nb.device_id = m.device_id"
+                    "      AND nb.if_index = m.if_index AND nb.present = 1"
+                    "    ORDER BY CAST(nb.rem_index AS INTEGER), nb.rem_index LIMIT 1) AS uplink_to"
+                    " FROM mac_entries m"
+                    " LEFT JOIN interfaces i ON i.device_id = m.device_id"
+                    "   AND i.if_index = m.if_index"
+                    f" WHERE m.mac IN ({marks})", chunk).fetchall()
+        # Chunked across at most 8 MACs (one chunk in practice), so the
+        # ORDER BY ... LIMIT ? the single-query version used is reproduced
+        # here across the union instead.
+        rows.sort(key=lambda r: (r["uplink"], 0 if r["present"] else 1,
+                                  -(r["seen_ts"] or 0), r["device_id"], r["if_index"]))
+        return rows[:int(limit)]
 
     def mac_entries_for(self, device_id: int,
                         if_index: int | None = None) -> list[sqlite3.Row]:

@@ -81,7 +81,15 @@
 <!-- =========================== DASHBOARD ============================ -->
 <section id="page-dashboard" class="page">
   <div class="dash-scroll pad-x pad-b pad-t">
-    <h2>Dashboard</h2>
+    <div class="dash-head">
+      <h2>Dashboard</h2>
+      <span class="grow"></span>
+      <button id="dash-edit">Edit layout</button>
+      <button id="dash-add" hidden>Add tile</button>
+      <button id="dash-reset" hidden>Reset to default</button>
+      <button id="dash-cancel" hidden>Cancel</button>
+      <button id="dash-done" hidden>Done</button>
+    </div>
     <div id="dash-grid" class="dash-grid"></div>
   </div>
 </section>
@@ -1614,6 +1622,9 @@
 <div id="toasts" class="toasts" aria-hidden="true"></div>
 
 <div id="modal" class="modal" hidden><div class="modal-box" id="modal-box"></div></div>
+<!-- Filled on input by the Dashboard's device-picker field (dashboard.js),
+     one shared list rather than one per Configure dialog. -->
+<datalist id="dash-devices"></datalist>
 
 <!-- `defer` on both, and never on boot.js above: they download in
      parallel and run in this order, before DOMContentLoaded, which is what

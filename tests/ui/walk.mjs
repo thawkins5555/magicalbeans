@@ -1114,6 +1114,122 @@ async function checkDashboard(page, dir, tag) {
              `the status filter reads "${state.status}", link asked for "${wanted}"`);
       return `${href} -> filter ${state.status}`;
     });
+
+  // Regression: an Interface traffic tile added and then left unconfigured
+  // (Configure cancelled, device_id stays null in the draft) used to 400 on
+  // Done — the server types every present config key strictly, and a null
+  // device_id is not a valid int. saveDraft now drops null/undefined config
+  // keys before the PUT, which a fetcher already reads as "not configured".
+  await check('adding an unconfigured Interface traffic tile still saves on Done',
+    async () => {
+      await selectTab(page, 'dashboard');
+      await settle(page, 900);
+      await page.click('#dash-edit');
+      await sleep(300);
+      await page.click('#dash-add');
+      await page.waitForSelector('#modal:not([hidden]) [data-add-type="iface_traffic"]',
+                                 { timeout: 10000 });
+      await page.click('#modal:not([hidden]) [data-add-type="iface_traffic"]');
+      // Configure opens automatically for a configurable type; cancel it
+      // without picking a device, leaving device_id/if_index null.
+      await page.waitForSelector('#modal:not([hidden]) #dc-device', { timeout: 10000 });
+      const cancelled = await page.evaluate(() => {
+        const cancel = [...document.querySelectorAll('#modal:not([hidden]) .modal-buttons button')]
+          .find((b) => b.textContent.trim() === 'Cancel');
+        if (!cancel) return false;
+        cancel.click();
+        return true;
+      });
+      assert(cancelled, 'no Cancel button in the Configure dialog');
+      await sleep(300);
+      await page.click('#dash-done');
+      await sleep(700);
+      const afterDone = await page.evaluate(() => ({
+        editHidden: document.getElementById('dash-edit').hidden,
+        failToast: (document.querySelector('.toast.fail') || {}).textContent || null,
+      }));
+      assert(!afterDone.failToast, `Done reported a failure: ${afterDone.failToast}`);
+      assert(!afterDone.editHidden,
+             'Done left edit mode showing — the save did not actually succeed');
+
+      // Clean up: remove the tile this check added so later checks see the
+      // layout they expect.
+      await page.click('#dash-edit');
+      await sleep(300);
+      const removed = await page.evaluate(() => {
+        const t = document.querySelector('#dash-grid [data-tile^="iface_traffic-"]');
+        const button = t && t.querySelector('[data-tt-remove]');
+        if (!button) return false;
+        button.click();
+        return true;
+      });
+      assert(removed, 'could not find the unconfigured tile to clean it up');
+      await sleep(300);
+      await page.click('#dash-done');
+      await sleep(600);
+      return 'saved with a null device_id, then cleaned up';
+    });
+
+  // 5.21.0: the layout is now per-account and editable — add a tile, save,
+  // reload to prove it persisted server-side, then remove it and prove that
+  // persists too. No screenshots: this is a state check, not a visual one.
+  await check('Edit layout: add a Note tile, Done, reload, Edit, Remove it, Done',
+    async () => {
+      await selectTab(page, 'dashboard');
+      await settle(page, 900);
+      const before = await page.evaluate(
+        () => document.querySelectorAll('#dash-grid .tile').length);
+      assert(before > 0, 'no tiles to compare against');
+
+      await page.click('#dash-edit');
+      await sleep(300);
+      await page.click('#dash-add');
+      await page.waitForSelector('#modal:not([hidden]) [data-add-type="note"]',
+                                 { timeout: 10000 });
+      await page.click('#modal:not([hidden]) [data-add-type="note"]');
+      await page.waitForSelector('#modal:not([hidden]) #dc-title', { timeout: 10000 });
+      await page.fill('#dc-title', 'Walk note');
+      await page.fill('#dc-text', 'Added by the UI walk.');
+      await page.click('#modal:not([hidden]) button.primary');
+      await sleep(300);
+      await page.click('#dash-done');
+      await sleep(600);
+
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await ready(page);
+      await selectTab(page, 'dashboard');
+      await settle(page, 900);
+      const afterAdd = await page.evaluate(
+        () => document.querySelectorAll('#dash-grid .tile').length);
+      assert(afterAdd === before + 1,
+             `tile count went ${before} -> ${afterAdd}, expected +1`);
+
+      await page.click('#dash-edit');
+      await sleep(300);
+      const removed = await page.evaluate(() => {
+        const tiles = [...document.querySelectorAll('#dash-grid .tile')];
+        const noteTile = tiles.find(
+          (t) => (t.querySelector('h3') || {}).textContent === 'Walk note');
+        const button = noteTile && noteTile.querySelector('[data-tt-remove]');
+        if (!button) return false;
+        button.click();
+        return true;
+      });
+      assert(removed, "could not find the added Note tile's Remove button");
+      await sleep(300);
+      await page.click('#dash-done');
+      await sleep(600);
+
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await ready(page);
+      await selectTab(page, 'dashboard');
+      await settle(page, 900);
+      const afterRemove = await page.evaluate(
+        () => document.querySelectorAll('#dash-grid .tile').length);
+      assert(afterRemove === before,
+             `tile count went ${before} -> ${afterAdd} -> ${afterRemove}, expected back to ${before}`);
+      return `${before} -> ${afterAdd} -> ${afterRemove}`;
+    });
 }
 
 async function checkOfflineBanner(context, page) {

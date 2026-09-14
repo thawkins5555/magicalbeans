@@ -123,6 +123,15 @@ try:
     check("a second account's GET is unaffected by the first account's PUT",
           status == 200 and payload.get("default") is True, payload)
 
+    status, payload = call("PUT", "/api/dashboard/layout", {"layout": {
+        "version": 1, "tiles": [{"id": "s1", "type": "note", "w": 1, "h": 1,
+                                 "config": {"title": "second's own", "text": ""}}]}},
+                           token=second)
+    check("setup: the second account saves its own layout", status == 200, (status, payload))
+    status, payload = call("GET", "/api/dashboard/layout", token=admin)
+    check("...and the first account's own layout is unaffected by it either way",
+          status == 200 and payload.get("layout") == custom_layout, payload)
+
     print("4. validation refuses bad layouts with 400")
     bad_cases = [
         ("unknown tile type", {"version": 1, "tiles": [
@@ -140,6 +149,14 @@ try:
             {"id": "dup", "type": "note", "w": 1, "h": 1, "config": {"title": "a", "text": ""}},
             {"id": "dup", "type": "note", "w": 1, "h": 1, "config": {"title": "b", "text": ""}},
         ]}),
+        ("w: true (a bool, not the int 1)", {"version": 1, "tiles": [
+            {"id": "x", "type": "note", "w": True, "h": 1,
+             "config": {"title": "t", "text": ""}}]}),
+        ("n: true for ipam_subnets (a bool, not an int)", {"version": 1, "tiles": [
+            {"id": "x", "type": "ipam_subnets", "w": 1, "h": 1, "config": {"n": True}}]}),
+        ("h out of range", {"version": 1, "tiles": [
+            {"id": "x", "type": "note", "w": 1, "h": 3,
+             "config": {"title": "t", "text": ""}}]}),
     ]
     for name, layout in bad_cases:
         status, payload = call("PUT", "/api/dashboard/layout",
@@ -176,7 +193,35 @@ try:
           api_mod._validate_dashboard_layout(api_mod.DEFAULT_DASHBOARD_LAYOUT)
           == api_mod.DEFAULT_DASHBOARD_LAYOUT, api_mod.DEFAULT_DASHBOARD_LAYOUT)
 
-    print("8. GET /api/nodes/events")
+    print("9. a stored layout that will not parse degrades to the default")
+    service.app_db.set_user_dashboard_layout(DEFAULT_USER, "{not json")
+    status, payload = call("GET", "/api/dashboard/layout", token=admin)
+    check("garbage stored JSON: GET still answers 200, never 500",
+          status == 200, (status, payload))
+    check("...reported as the default layout",
+          payload.get("default") is True
+          and payload.get("layout") == api_mod.DEFAULT_DASHBOARD_LAYOUT, payload)
+
+    service.app_db.set_user_dashboard_layout(
+        DEFAULT_USER, json.dumps({"version": 2, "tiles": []}))
+    status, payload = call("GET", "/api/dashboard/layout", token=admin)
+    check("a stored layout from a future version also degrades to the default",
+          status == 200 and payload.get("default") is True, payload)
+
+    print("10. iface_traffic tolerates a null device_id and an absent one")
+    for label, config in (
+            ("device_id: null", {"device_id": None, "if_index": 3, "window_s": 3600}),
+            ("device_id absent", {"if_index": 3, "window_s": 3600})):
+        layout = {"version": 1, "tiles": [
+            {"id": "it1", "type": "iface_traffic", "w": 1, "h": 1, "config": config}]}
+        status, payload = call("PUT", "/api/dashboard/layout",
+                               {"layout": layout}, token=admin)
+        check(f"iface_traffic with {label} is accepted, not a 400",
+              status == 200
+              and "device_id" not in payload["layout"]["tiles"][0]["config"],
+              (status, payload))
+
+    print("11. GET /api/nodes/events")
     service.app_db.add_user("dash-none", hash_password("DashNonePW2026"), must_change=False)
     service.app_db.set_permissions("dash-none", {})
     no_nodes = login("dash-none", "DashNonePW2026")

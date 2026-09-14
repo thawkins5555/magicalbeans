@@ -1329,6 +1329,71 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
     const rows = await page.locator('#users-table tbody tr').count();
     return `${rows} account row(s)`;
   });
+
+  // ---- 5.21.0: the Dashboard's per-account layout — add a Note tile,
+  // Done, reload to prove the PUT round-tripped, then remove it and prove
+  // the removal persisted too. A state check, not a visual one: no shots.
+  await guarded(recorder, step('dlg:dashboard-edit-layout'), async () => {
+    await selectTab(page, 'dashboard');
+    await settle(page, 900);
+    const before = await page.evaluate(
+      () => document.querySelectorAll('#dash-grid .tile').length);
+    if (!before) return 'absent — no tiles to compare against';
+
+    await page.click('#dash-edit', { timeout: 5000 });
+    await sleep(300);
+    await page.click('#dash-add', { timeout: 5000 });
+    await page.waitForSelector('#modal:not([hidden]) [data-add-type="note"]',
+                               { timeout: 10000 });
+    await page.click('#modal:not([hidden]) [data-add-type="note"]');
+    await page.waitForSelector('#modal:not([hidden]) #dc-title', { timeout: 10000 });
+    await page.fill('#dc-title', 'Walk note');
+    await page.fill('#dc-text', 'Added by the demo walk.');
+    await page.click('#modal:not([hidden]) button.primary');
+    await sleep(300);
+    await page.click('#dash-done', { timeout: 5000 });
+    await sleep(600);
+
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => typeof App !== 'undefined' && App.state,
+                               null, { timeout: 20000 });
+    await selectTab(page, 'dashboard');
+    await settle(page, 900);
+    const afterAdd = await page.evaluate(
+      () => document.querySelectorAll('#dash-grid .tile').length);
+    if (afterAdd !== before + 1) {
+      throw new Error(`tile count went ${before} -> ${afterAdd}, expected +1`);
+    }
+
+    await page.click('#dash-edit', { timeout: 5000 });
+    await sleep(300);
+    const removed = await page.evaluate(() => {
+      const tiles = [...document.querySelectorAll('#dash-grid .tile')];
+      const noteTile = tiles.find(
+        (t) => (t.querySelector('h3') || {}).textContent === 'Walk note');
+      const button = noteTile && noteTile.querySelector('[data-tt-remove]');
+      if (!button) return false;
+      button.click();
+      return true;
+    });
+    if (!removed) throw new Error("could not find the added Note tile's Remove button");
+    await sleep(300);
+    await page.click('#dash-done', { timeout: 5000 });
+    await sleep(600);
+
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => typeof App !== 'undefined' && App.state,
+                               null, { timeout: 20000 });
+    await selectTab(page, 'dashboard');
+    await settle(page, 900);
+    const afterRemove = await page.evaluate(
+      () => document.querySelectorAll('#dash-grid .tile').length);
+    if (afterRemove !== before) {
+      throw new Error(
+        `tile count went ${before} -> ${afterAdd} -> ${afterRemove}, expected back to ${before}`);
+    }
+    return `${before} -> ${afterAdd} -> ${afterRemove}`;
+  });
 }
 
 /* -------------------------------------------------------- write boundary */

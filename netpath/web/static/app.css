@@ -94,8 +94,27 @@ body {
    a sixth panel implementation with its own h3 rule that differed from
    .card h3 by 0.2px of letter-spacing and 2px of margin. The wide/tone
    variants below are the tile's own. */
-.tile.wide { grid-column: span 2; }
+.tile.wide, .tile.w2 { grid-column: span 2; }
+.tile.w3 { grid-column: span 3; }
+.tile.tall { min-height: 320px; }
 .tile.tone-bad { border-color: var(--fail); }
+/* Edit mode: every tile gets a dashed outline so the grid itself reads as
+   rearrangeable, and each carries a .tile-tools row of small controls
+   (drag handle, move, width, height, Configure, Remove) beside its title. */
+.dash-head { display: flex; align-items: center; gap: var(--space-sm); }
+.dash-head button { flex: none; }
+.dash-grid.editing .tile { outline: 1px dashed var(--line); }
+.tile-tools { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 8px; }
+.tile-tools button {
+  padding: 1px var(--space-xs);
+  font-size: var(--fs-2xs);
+}
+.tile.drop-before { box-shadow: -3px 0 0 var(--accent); }
+.tile-chart { height: 200px; }
+.tile.tall .tile-chart { height: 280px; }
+.tile-chart svg { width: 100%; height: 100%; }
+.gsearch-note { margin-top: 6px; }
+.dash-add-family { margin-bottom: var(--space-md); }
 /* A figure is one number with its label under it — the Dashboard's tiles
    are made of them, and in kiosk mode the Nodes and Alerts strips render
    their counters as a row of them (App.figures). One component, so a wall
@@ -1887,7 +1906,7 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
   [data-splitter].cols { flex-direction: column; }
   .cols > .divider { width: auto; height: 8px; cursor: row-resize; }
   .cols > .divider::after { left: 12px; right: 12px; top: 3px; bottom: auto; width: auto; height: 2px; }
-  .tile.wide { grid-column: span 1; }
+  .tile.wide, .tile.w2, .tile.w3 { grid-column: span 1; }
   .card.strip { flex-wrap: wrap; row-gap: 6px; }
   .card.strip > .stat, .card.strip > .hint { white-space: normal; }
 }

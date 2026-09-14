@@ -112,7 +112,13 @@ check("<legend>LISTENER</legend>" not in EVENTS and "<legend>RECEIVER</legend>" 
       "SNMP settings call it a receiver, like its strip")
 check("<legend>COLLECTOR</legend>" in EVENTS,
       "Syslog settings call it a collector, like its strip")
-check("tile('Workers'" in read("dashboard.js"), "the Dashboard tile is 'Workers'")
+# Pin the shape, not just the string: it must be TILE_TYPES.workers's own
+# title, not any 'Workers' text elsewhere in the file.
+_dashboard_js = read("dashboard.js")
+_workers_entry = _dashboard_js.find("\n    workers: {")
+check(_workers_entry != -1 and
+      "title: 'Workers'" in _dashboard_js[_workers_entry:_dashboard_js.find("\n    },", _workers_entry)],
+      "the workers entry in TILE_TYPES carries title: 'Workers'")
 check("App.tile" in read("dashboard.js") and "function tile(" not in read("dashboard.js"),
       "the Dashboard draws its tiles with the shared App.tile")
 

@@ -3601,6 +3601,48 @@ explicit `0` alone) was invisible to this query, so the sentence
 under-reported on exactly the installs that had never touched the
 setting. The literal now reads `3600`, matching `_merge_config` exactly.
 
+### Global find chains an IP to the switch port; the CSV export's Name column (`nodesdb.py`, `web/api.py`) — 5.21.0
+
+**`mac_locations_for(macs, limit=200)`** is `mac_locations()`'s own query
+run against a set of exact, normalised MACs (`WHERE m.mac IN (...)`)
+rather than one `LIKE` prefix — the ARP-chained search below resolves an
+IP to potentially several MACs (one per ARP row matched) in one call
+instead of one `mac_locations()` call per MAC. Deduplicated and capped
+at 8: a caller asking about more MACs than that has stopped asking a
+specific question. Both functions share one `SELECT`, including the
+`uplink`/`uplink_to` subqueries, so the two cannot drift on a field.
+
+**`get_nodes_arp_search`** (`web/api.py`) chains address-matched rows on
+to that query. After building its existing ARP-cache `locations` list
+exactly as before, it walks the same `rows` a second time collecting the
+distinct MACs of entries whose `ip` starts with the lowered needle —
+**only** rows matched by address, never by a MAC prefix, since a MAC
+needle's ports are already the MAC search's own answer and chaining them
+too would list every port twice under two different searches for the
+same question. Those MACs (capped at 8, first-IP-wins on a repeat MAC)
+go to `mac_locations_for`, and each returned row is shaped by
+`_mac_location_json` — the same shaping function `get_nodes_mac_search`
+uses for its own `locations` — plus the `ip` that led there, into the
+response's new `ports` field. A MAC-prefix search, or an address that
+resolved to nothing in the forwarding table, returns `ports: []`.
+
+`_mac_location_json(row, device)` is the one place either search turns a
+`mac_entries`-shaped row into JSON, so `get_nodes_mac_search`'s
+`locations` and `get_nodes_arp_search`'s `ports` are structurally
+identical — a front end consuming one can consume the other with the
+same code, which is exactly what `gsearchRun` in `app.js` does for its
+new third results group, "Switch port for that IP (ARP → MAC table)."
+
+**The Nodes CSV export's Name column** (`get_nodes_devices_export`) reads
+`_device_display_name(d)` instead of the raw `d.get("name")` it read
+before — the same resolver Nodes' own table, Syslog's Host column and
+Alerts' entity label already agree on, rather than the stored `name`
+column, which is seeded to the device's own IP address at discovery and
+stays that way until someone renames it. `sys_name` — the raw SNMP
+hostname, independent of any manual rename — is untouched as its own
+column, so nothing the export used to carry is lost; only what the Name
+column itself means has changed, to match what the screen already shows.
+
 ### Device and interface dialogs (`nodes.js`)
 
 `drawIfaceTable` and `drawEventTable` used to hardcode `#nd-if-table` /
@@ -9140,6 +9182,137 @@ artificially, the tiles still appeared at roughly 200 ms — bounded by
 `/api/dashboard` alone, no longer chained behind the two boot fetches.
 65 of 65 walk checks passed.
 
+### A modular Dashboard: per-account layout, the tile catalogue, and the chart renderer lifted to App (`appdb.py`, `web/api.py`, `web/static/dashboard.js`, `web/static/app.js`, `web/static/debug.js`) — 5.21.0
+
+**Storage.** `AppDatabase._migrate()` adds `users.dashboard_layout` the
+same way it added `theme` two lines above it (`ensure_columns("users",
+{"dashboard_layout": "TEXT NOT NULL DEFAULT ''"})`) — empty means "never
+saved," not "saved as nothing," so an account that has never opened
+**Edit layout** gets the shipped default rather than an empty grid.
+`user_dashboard_layout(username)` / `set_user_dashboard_layout(username,
+text)` read and write the raw JSON string; `appdb.py` never parses it —
+that is `web/api.py`'s job, at both the read and the write end, so a row
+the server itself could not produce (a future version's layout, hand-
+edited JSON) cannot reach the front end unvalidated either.
+
+**The three routes** (`server.py` ~621, permission `None` like `PUT
+/api/account/theme` — any signed-in account, its own row only):
+`get_dashboard_layout` returns the caller's stored layout, or
+`DEFAULT_DASHBOARD_LAYOUT` (today's ten tiles, in today's order,
+`_DASHBOARD_WIDE_TILES` giving `fleet`/`workers`/`storage` `w: 2`) both
+when nothing is stored *and* when what is stored fails to parse or
+validate — a layout saved by a future version degrades to the default
+rather than a 500, since **Reset to default** is always one click away.
+`put_dashboard_layout` runs the body through `_validate_dashboard_layout`
+before anything touches the database, and `delete_dashboard_layout`
+clears the row back to empty. `put_dashboard_layout` and
+`delete_dashboard_layout` both audit as `dashboard.layout`;
+`get_dashboard_layout` is a read and does not.
+
+**`_validate_dashboard_layout`** never trusts a stored or posted layout's
+shape past what it explicitly checks: `version == 1`; `tiles` a list of
+at most 60; each tile's `id` a 1–32 character string drawn only from
+`_DASHBOARD_TILE_ID_CHARS`, unique within the layout; `type` a member of
+`DASHBOARD_TILE_TYPES`; `w` in `{1, 2, 3}` and `h` in `{1, 2}`, with the
+bool-is-an-int trap guarded explicitly (`isinstance(w, bool)` fails
+first, since `True in (1, 2, 3)` is otherwise true); `config` an object
+whose keys are checked against `_DASHBOARD_CONFIG_SCHEMA[type]` — a type
+with no schema entry accepts no config keys at all, and an unknown key
+for a type that does have one is refused rather than stored and handed
+back later to whatever reads it. `_dash_int`/`_dash_str`/`_dash_bool`/
+`_dash_enum` are the same shape of small typed validator the rest of
+`api.py` already uses elsewhere; `_dash_int` guards the same bool trap a
+second time for numeric config values. Anything that fails raises
+`ValueError`, which `server.py` already turns into 400 for every route.
+
+**`DASHBOARD_TILE_TYPES`** is the server's own copy of the catalogue —
+type key to the module a tile needs read access to, `None` meaning any
+signed-in account (`workers` and `note`, the two tiles with no module
+behind them). `_validate_dashboard_layout` uses it only to check that a
+`PUT`'s tile `type` is a real one; it is not itself a permission gate —
+`put_dashboard_layout` will happily store a tile of a type the caller
+cannot read. The gate sits where the data actually is: each tile's own
+data route carries its own read permission (`GET /api/nodes/events` is
+`("nodes", R)`, same as every other Nodes read; a module-overview tile's
+route is gated by that module the same way), so a stored-but-unreadable
+tile simply cannot fetch anything. The client does the rest —
+`dashboard.js`'s **Add tile** dialog leaves out any type the signed-in
+account cannot read (`App.canRead(def.module)`), and `renderTile` checks
+the same thing for a tile already on a saved layout, rendering "Not
+readable with your access" rather than calling `fetch` at all. `dashboard.js`'s own
+`TILE_TYPES` is the richer registry with titles, renderers and fetchers,
+and the two are kept in step by hand rather than one generating the
+other — the server's copy is deliberately the smaller of the two, so it
+cannot drift into knowing about rendering.
+
+**`GET /api/nodes/events`** (`server.py` ~630, `("nodes", R)`) is the
+Recent events tile's own endpoint: `nodes_db.device_events(None, since_s,
+kinds, limit)` — `device_events`'s existing reader with no device filter,
+so the query the per-device Events subtab already runs now also answers
+fleet-wide — joined to device names through `_devices_for_rows` exactly
+as the search routes join theirs, and shaped through the same
+`_device_event_json` the per-device route uses so the two cannot drift
+on a field name.
+
+**`dashboard.js`'s `TILE_TYPES`** holds all 24 catalogue entries, each
+`{ catalogTitle, title, family, module, description, w, h, configurable,
+render, fetch?, every?, configForm?, readConfig? }`. The ten tiles
+Dashboard always had (`fleet`, `open_alerts`, `workers`, `storage`, and
+the six offenders built by the `offendersEntry()` helper) keep reading
+`view.dashboard`/`view.offenders` off the existing 5-second and
+offenders-cadence fetches — no `fetch` of their own, so nothing about
+their timing changed. Every other type declares its own `fetch(tile)`
+and an `every: 60000` — `refresh()` calls a tile's `fetch` only once
+`now - fetchedAt >= every`, in its own `try`/`catch`, so one module
+answering slowly or erroring shows only that tile's own one-line error
+rather than blanking the grid. `activate`/`permissionsChanged` zero every
+`tileData` entry's `fetchedAt`, the same reset the offenders block
+already did, so a permission change or a return to the tab re-fetches
+rather than showing stale data under a tile that may no longer be
+readable.
+
+`draw()` builds `parts` from `errorLine` plus `activeTiles().map(renderTile)`
+— `activeTiles()` reads `view.draft.tiles` while `view.editing` and
+`view.layout.tiles` otherwise, so the same renderer draws both the live
+grid and the in-progress edit without a second code path. `renderTile`
+checks `App.canRead(def.module)` itself (rather than trusting the server
+to have already filtered) and renders "Not readable with your access" in
+the tile's own frame when it fails — a saved layout outliving a
+permission change shows exactly that, not a stale number. `tileTools`
+(edit mode only) is a `data-tile`-keyed button bar — drag handle, ◀ ▶,
+width 1/2/3, a short/tall toggle gated to `family === 'Graphs' ||
+family === 'Lists'`, **Configure** gated to `def.configurable`, **Remove**
+— read by delegated click/dragover/drop handlers on `#dash-grid` rather
+than one listener per tile, so adding and removing tiles never has to
+rewire anything. **Done** (`saveDraft`) `PUT`s `view.draft` and adopts
+whatever the server hands back as the new `view.layout` — the validated,
+canonical form, not the draft verbatim — so a client and server that
+ever disagree on canonicalisation cannot leave the two silently
+diverged.
+
+**Chart renderer shared.** `drawSeriesChart` and its value formatter,
+previously private to `nodes.js`, are lifted into `App` as
+`App.drawSeriesChart` / `App.formatMetricValue` — exactly the `tile`/
+`figure` lift of 4.46.0, for the same reason: a dashboard graph tile
+needs the identical renderer Nodes' own three charts use, and a second
+copy is a second place for the two to drift apart. `nodes.js` keeps
+`const drawSeriesChart = App.drawSeriesChart;` so its own three call
+sites are untouched. A new `App.sparkline(values, opts)` — inline SVG
+bars via `App.svgNode`, no charting library, CSP stays `'self'` — backs
+the syslog/trap rate overview tiles' small volume-over-time bars.
+
+**`debug.js`'s `atBottom` gate** is the same idea applied to the Event
+log rather than the Dashboard: `drawEvents` measures `wrap.scrollHeight -
+wrap.scrollTop - wrap.clientHeight <= 4` *before* it appends anything,
+and only forces `wrap.scrollTop = wrap.scrollHeight` afterwards when
+**Scroll to newest** is ticked *and* (`atBottom` was true, or this draw
+was a full rebuild — `!options.append`, a first paint or a filter
+change). Previously the scroll-to-bottom was unconditional on the
+checkbox alone, so every poll that appended a row yanked the view back
+down regardless of where an operator had scrolled to read history. The
+checkbox's meaning is unchanged — it still means "stay pinned to the
+newest row" — only *when* that pinning is allowed to act has changed.
+
 ### Tab bar: flat groups, icon collapse, the overflow fade (`index.html`, `app.css`, `app.js`) — 4.49.0
 
 4.48.0 wrapped the twelve tabs in four `<div class="tab-group" data-label="…">`
@@ -9652,13 +9825,15 @@ finding an existing session) does *not* set this key — that path isn't a
 login, just a page that immediately sends an already-authenticated visitor
 onward, so whatever tab they had open stays open.
 
-**Dashboard** (`dashboard.js`) is a placeholder module, registered the
-same way every other page is (`App.pages.dashboard = { init, refresh }`,
-both no-ops) purely so it participates correctly in the tab machinery
+**Dashboard** (`dashboard.js`) is registered the same way every other
+page is (`App.pages.dashboard = { init, refresh, activate,
+permissionsChanged }`) so it participates correctly in the tab machinery
 above — `selectTab`/`master()`/the reload-restores-tab logic all key off
 `pages[name]` existing, so a tab with no module registered would either
-throw or silently never refresh. `page-dashboard`'s markup in
-`index.html` is static content, no chart or table of its own yet.
+throw or silently never refresh. From 5.21.0 `page-dashboard` is a
+per-account grid of up to 24 kinds of tile, several of them charts of
+their own — see *A modular Dashboard* under **Web layer** for the
+catalogue, the storage and the routes.
 
 ## Tests (`tests/`)
 

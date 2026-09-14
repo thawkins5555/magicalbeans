@@ -351,6 +351,8 @@
     const visible = view.events.filter((event) => passes(event, filter))
       .slice(-EVENT_ROW_CAP);
     let changed;
+    const wrap = table.parentElement;
+    const atBottom = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight <= 4;
 
     if (options.append && view.drawnSeq != null) {
       const fresh = visible.filter((e) => e.seq > view.drawnSeq);
@@ -380,8 +382,7 @@
       view.wiredSelected = view.selected;
     }
 
-    if (App.el('dbg-follow').checked) {
-      const wrap = table.parentElement;
+    if (App.el('dbg-follow').checked && (atBottom || !options.append)) {
       wrap.scrollTop = wrap.scrollHeight;
     }
   }
