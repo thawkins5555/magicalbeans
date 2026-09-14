@@ -863,6 +863,19 @@ columns together so a cleared MIB never leaves a stale auto flag behind.
 unchanged; the device JSON carries `mib_file_auto` so the pane can label the
 MIB select "(assigned automatically)" without hiding which MIB is in use.
 
+A device auto-identified before this column existed carries `mib_file_id`
+with no marker at all, stored identically to a hand pick — 5.18.0's fix
+only ever applied going forward. 5.20.4's
+`NodesDatabase.repair_auto_mib_overrides()`, gated by the private setting
+`mib_auto_repaired_5_20` so it runs once at startup, sets `mib_file_auto =
+1` on such a device only when `mib_file_id` is its *only* override and
+equals what `mib_file_covering(sys_object_id)` would assign today. Any
+other override present, or a stored MIB that no longer matches the vendor
+lookup, and the row is left alone — a hand-pinned MIB identical to the
+vendor match cannot be told apart from an old auto-assignment, and the
+"a person choosing a MIB, even one that matches, is still a real choice"
+rule above still governs it.
+
 ### Identity OIDs (`nodesdb.py`, `nodepoll.py`, `nodeoids.py`)
 
 `vendor_oid` and `location_oid` are ordinary members of `_OVERRIDE_COLUMNS`

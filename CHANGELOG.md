@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.20.4 — The auto-assigned MIB, repaired for the fleet](#5204--the-auto-assigned-mib-repaired-for-the-fleet)
 - [5.20.3 — The HTTPS monitor behind an inspecting firewall](#5203--the-https-monitor-behind-an-inspecting-firewall)
 - [5.20.2 — TLS behind an inspecting firewall](#5202--tls-behind-an-inspecting-firewall)
 - [5.20.1 — SMS consent notice](#5201--sms-consent-notice)
@@ -151,6 +152,48 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.20.4 — The auto-assigned MIB, repaired for the fleet
+
+An operator reported that roughly 300 devices still showed "1
+override" — traced to the vendor identification having auto-assigned
+their MIB before 5.18.0 existed to tell that apart from a hand pick.
+Every device identified since 5.18.0 shows none, as intended; only
+the older rows were stuck.
+
+**5.18.0 fixed the rule going forward, not the rows already written
+under the old one.** `mib_file_auto` is only ever set to 1 the moment
+`_auto_assign_mib` writes `mib_file_id`, so a device the poller had
+already auto-identified before that column existed carries
+`mib_file_id` with no marker at all — stored exactly as a hand-picked
+MIB would be, and counted as one override by
+`override_fields`/`_OVERRIDES_SQL` ever since, with nothing after
+5.18.0 able to tell the two apart on its own.
+
+**A one-time startup repair, gated the same way as 5.16.0's.** A
+private setting, `mib_auto_repaired_5_20`, gates
+`NodesDatabase.repair_auto_mib_overrides()` to run once. It marks
+`mib_file_auto = 1` on a device only when both hold: the MIB is the
+device's *only* override, and the stored `mib_file_id` is exactly
+what `mib_file_covering(sys_object_id)` would assign today. Either
+condition failing leaves the device untouched.
+
+**Deliberately left alone.** A device with any other override, or
+whose stored MIB no longer matches the vendor lookup, is skipped on
+purpose — a hand-pinned MIB that happens to equal the vendor match
+cannot be told apart from an old auto-assignment, and 5.18.0's own
+rule ("a person choosing a MIB, even one that matches, is still a
+real choice") still applies to it. Those devices go on showing their
+one override, same as any hand-picked MIB does; an operator who wants
+it gone clears it by hand in Edit device → OVERRIDES, same as always.
+One log line reports how many devices the repair actually changed.
+
+Files: `nodesdb.py`, `web/service.py`.
+
+Verification: `test_device_overrides.py` gets a new section covering
+the repair — a device whose only override is a vendor-matching
+pre-5.18.0 MIB gets marked, one with another override or a
+non-matching MIB does not, and the repair runs at most once.
 
 ### 5.20.3 — The HTTPS monitor behind an inspecting firewall
 

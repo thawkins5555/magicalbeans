@@ -675,3 +675,15 @@ cleared, now used by the Twilio, webhook and SMTP senders alike.
 `selfupdate` build on it, so the HTTPS monitor and the self-updater
 verify like the senders now do. Javariius reviewed; branch pushed and
 main fast-forwarded.
+
+## 5.20.4 — The auto-assigned MIB, repaired for the fleet
+
+**"I need a way to clear the single override that is listing on 300
+devices from when the auto vendor ID assigned their MIB..."**
+→ Dora found the rows carry no auto marker from before 5.18.0 — the
+`mib_file_auto` column didn't exist yet when they were written, so
+they're stored the same as a hand-picked MIB. Planning answers: a
+one-time startup repair rather than a bulk action, scoped to devices
+whose only override is a vendor-matching MIB, leaving any other
+override or a non-matching MIB alone. Thing1 built it, Javariius
+reviewed, branch pushed and main fast-forwarded.
