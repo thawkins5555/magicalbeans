@@ -313,6 +313,48 @@ try:
                       if n.get("device_id") == dev_c), None)
     check("...and says which placed device saw it", seen_from == dev_b, neighbours)
 
+    # ----------------------------------------- 6b. IP-matched neighbours
+    #
+    # A device Nodes knows only by address -- B's own neighbour row names
+    # no chassis MAC or sysName _NEIGHBOR_MATCH_SQL could join on, only a
+    # remote_address -- still shows up as a "kind": "device" candidate,
+    # named through the display-name chain (5.18.0), and a link is
+    # assembled once both ends are placed on the map.
+    dev_d = service.nodes_db.add_device("192.0.2.20", group_id=gid)
+    service.app_db.set_hostname("192.0.2.20", "printer-lobby.example")
+    service.nodes_db.replace_neighbors(dev_b, [
+        {"if_index": 3, "protocol": "lldp", "rem_index": "1",
+         "chassis_id": "", "sys_name": "Switch C", "port_id": "Gi0/1",
+         "port_descr": "Gi0/1"},
+        {"if_index": 4, "protocol": "cdp", "rem_index": "2",
+         "chassis_id": "", "sys_name": "", "port_id": "Gi0/3",
+         "remote_address": "192.0.2.20"},
+    ])
+
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}/candidates", token=admin)
+    neighbours = payload.get("neighbours", []) if status == 200 else []
+    ip_candidate = next((n for n in neighbours if n.get("device_id") == dev_d), None)
+    check("a device known only by address is still offered as a device "
+          "candidate, not left as an unmanaged peer",
+          status == 200 and ip_candidate is not None
+          and ip_candidate["kind"] == "device", (status, neighbours))
+    check("...named through the display-name chain (here, the reverse-DNS "
+          "cache, since it has neither a manual name nor a sysName)",
+          ip_candidate is not None
+          and ip_candidate["name"] == "printer-lobby.example", ip_candidate)
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/nodes",
+                           {"device_id": dev_d, "x": 300, "y": 20}, token=admin)
+    check("placing the address-matched device is accepted",
+          status == 200 and "id" in payload, (status, payload))
+
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    links = payload.get("links", []) if status == 200 else []
+    ip_link = next((l for l in links
+                    if {l.get("a_device_id"), l.get("b_device_id")} == {dev_b, dev_d}), None)
+    check("once both ends are placed, the address-matched link draws too",
+          status == 200 and ip_link is not None, (status, links))
+
     # ------------------------------------------------------ 7. export.csv
 
     status, payload = call("GET", f"/api/mapper/maps/{map_id}/export.csv", token=admin)
@@ -321,7 +363,8 @@ try:
     check("export.csv answers 200 with the mapper CSV header",
           status == 200 and csv_rows and csv_rows[0] == mapper_mod.LINK_CSV_HEADER,
           (status, csv_rows[:1] if csv_rows else payload))
-    check("...with one data row per link", len(csv_rows) == 2, csv_rows)
+    check("...with one data row per link (A-B, plus the address-matched "
+          "B-D link added just above)", len(csv_rows) == 3, csv_rows)
 
     # ---------------------------------------- 8. a device deleted from Nodes
 

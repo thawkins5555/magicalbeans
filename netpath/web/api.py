@@ -4337,57 +4337,58 @@ def _neighbor_json(row, local_port: str = "") -> dict:
     }
 
 
-def _neighbor_ip_candidates(row: dict) -> list[str]:
-    """Addresses a neighbour row identifies itself by, best evidence first: CDP's cdpCacheAddress, an LLDP subtype-5 chassis id, or sys_name (nodepoll copies cdpCacheDeviceId into both)."""
-    candidates = []
-
-    def add(text):
-        text = str(text or "").strip()
-        if namelookup.is_ip_literal(text) and text not in candidates:
-            candidates.append(text)
-
-    add(row.get("remote_address"))
-    if row.get("chassis_id_subtype") == 5:
-        add(nodepoll.format_chassis_address(row.get("chassis_id")))
-    add(row.get("sys_name"))
-    return candidates
+def _matched_device_names(service, device_ids) -> dict:
+    """{device_id: chain name} for a batch of already-known
+    matched_device_id values -- one devices_by_ids read plus one batched
+    app_db.hostnames read via namelookup.display_names, shared by the
+    Neighbours pane and the mapper so a device matched by chassis MAC,
+    sysName or address all show the same name Reports would."""
+    ids = {d for d in device_ids if d is not None}
+    if not ids or service.nodes_db is None:
+        return {}
+    devices = service.nodes_db.devices_by_ids(ids)
+    return namelookup.display_names(service.nodes_db, service.app_db, devices)
 
 
 def _resolve_neighbor_names(service, neighbors: list[dict]) -> None:
-    """Names neighbours whose only identity is an IP, via the Syslog Host column's chain: Nodes device match first, then the reverse-DNS cache."""
-    pending = [(n, _neighbor_ip_candidates(n)) for n in neighbors
-               if n.get("matched_device_id") is None]
-    pending = [item for item in pending if item[1]]
-    if not pending:
+    """Names every neighbour row with the chain Reports and the mapper use:
+    a row _NEIGHBOR_MATCH_SQL already matched gets its matched_device_name
+    replaced by the chain's name; a row it left unmatched is looked up by
+    address (nodesdb.neighbour_device_matches, shared with the mapper) and,
+    failing that, named from the reverse-DNS cache -- the Syslog Host
+    column's own order."""
+    if service.nodes_db is None:
         return
 
-    # Batched via devices_by_addresses rather than one device_for_ip call per address.
-    candidate_ips = {ip for _, candidates in pending for ip in candidates}
-    devices = (service.nodes_db.devices_by_addresses(candidate_ips)
-               if service.nodes_db is not None else {})
+    ip_matches = service.nodes_db.neighbour_device_matches(
+        neighbors, nodepoll.neighbor_ip_candidates)
+    for index, device in ip_matches.items():
+        neighbor = neighbors[index]
+        neighbor["matched_device_id"] = device["id"]
+        neighbor["matched_device_ip"] = device["ip"]
+        neighbor["resolved_source"] = "nodes"
 
-    unnamed = set()
-    for neighbor, candidates in pending:
-        for ip in candidates:
-            device = devices.get(ip)
-            if device is not None:
-                name = namelookup.device_name(device) or device["name"]
-                neighbor["matched_device_id"] = device["id"]
-                neighbor["matched_device_name"] = name
-                neighbor["matched_device_ip"] = device["ip"]
+    names = _matched_device_names(
+        service, (n.get("matched_device_id") for n in neighbors))
+    for neighbor in neighbors:
+        device_id = neighbor.get("matched_device_id")
+        if device_id in names:
+            name = names[device_id]
+            neighbor["matched_device_name"] = name
+            if neighbor.get("resolved_source") == "nodes":
                 neighbor["resolved_name"] = name
-                neighbor["resolved_source"] = "nodes"
-                break
-        else:
-            unnamed.update(candidates)
 
-    if not unnamed:
+    unresolved_ips: set = set()
+    for neighbor in neighbors:
+        if neighbor.get("matched_device_id") is None:
+            unresolved_ips.update(nodepoll.neighbor_ip_candidates(neighbor))
+    if not unresolved_ips:
         return
-    names = service.app_db.hostnames(sorted(unnamed))
-    for neighbor, candidates in pending:
-        if neighbor["resolved_source"]:
+    names = service.app_db.hostnames(sorted(unresolved_ips))
+    for neighbor in neighbors:
+        if neighbor.get("matched_device_id") is not None:
             continue
-        for ip in candidates:
+        for ip in nodepoll.neighbor_ip_candidates(neighbor):
             if names.get(ip):
                 neighbor["resolved_name"] = names[ip]
                 neighbor["resolved_source"] = "dns"
@@ -6216,7 +6217,8 @@ def get_nodes_reports_availability(service, params, body) -> dict:
     if device_ids is None:
         device_ids = [row["id"] for row in service.nodes_db.devices()]
     result = reportmod.device_availability_report(
-        service.nodes_db, device_ids, t0, t1, alertsdb=service.alerts_db)
+        service.nodes_db, device_ids, t0, t1, alertsdb=service.alerts_db,
+        hostnames=service.app_db.hostnames)
     return result.to_dict()
 
 
@@ -6264,7 +6266,8 @@ def get_nodes_reports_top_metrics(service, params, body) -> dict:
     n = max(1, min(int(_num(params, "n", 20, int) or 20), REPORT_TOP_METRICS_MAX_N))
     result = reportmod.top_metric_ranking(
         service.nodes_db, key, t0, t1, n=n, rank_by=rank_by,
-        ascending=ascending, like=like, device_ids=device_ids)
+        ascending=ascending, like=like, device_ids=device_ids,
+        hostnames=service.app_db.hostnames)
     return result.to_dict()
 
 
@@ -9267,6 +9270,58 @@ def _mapper_node_name(label: str, resolved: str) -> tuple[str, str]:
     return (label or resolved), resolved
 
 
+def _apply_ip_matches(service, rows) -> list[dict]:
+    """neighbours_for_devices() rows (sqlite3.Row, immutable) as plain
+    dicts, with nodesdb.neighbour_device_matches' address lookup applied on
+    top of _NEIGHBOR_MATCH_SQL's own join -- the same match Nodes'
+    Neighbours pane places over the SQL join in _resolve_neighbor_names,
+    shared here so a device the mapper places by its LLDP/CDP-reported
+    address gets a link too. A row matched this way carries
+    matched_device_id/name/ip like a SQL-matched row, but matched_if_index
+    stays None: there is no interface evidence for an address match, so the
+    link draws with the reported remote port text instead, as a
+    name-matched row without a chassis MAC already does. Every matched
+    row's matched_device_name (SQL- or address-matched alike) is then
+    replaced by the display-name chain, batched across the whole set."""
+    out = [dict(row) for row in rows]
+    if service.nodes_db is None:
+        return out
+    ip_matches = service.nodes_db.neighbour_device_matches(
+        out, nodepoll.neighbor_ip_candidates)
+    for index, device in ip_matches.items():
+        row = out[index]
+        row["matched_device_id"] = device["id"]
+        row["matched_device_ip"] = device["ip"]
+        row["matched_if_index"] = None
+
+    names = _matched_device_names(service, (row["matched_device_id"] for row in out))
+    for row in out:
+        device_id = row.get("matched_device_id")
+        if device_id in names:
+            row["matched_device_name"] = names[device_id]
+    return out
+
+
+def _mapper_peer_name(service, rows):
+    """peer_name callable for mapper.assemble_links: the reverse-DNS cache
+    first -- one batched app_db.hostnames read across every row `rows`
+    left unmatched -- then sys_name/platform/chassis_id, the order
+    Add-neighbours' own candidate naming uses below."""
+    candidate_ips = set()
+    for row in rows:
+        if row.get("matched_device_id") is None:
+            candidate_ips.update(nodepoll.neighbor_ip_candidates(row))
+    names = (service.app_db.hostnames(candidate_ips)
+            if candidate_ips and service.app_db is not None else {})
+
+    def peer_name(row) -> str:
+        for ip in nodepoll.neighbor_ip_candidates(row):
+            if names.get(ip):
+                return names[ip]
+        return row["sys_name"] or row["platform"] or row["chassis_id"] or ""
+    return peer_name
+
+
 def get_mapper_map(service, params, body, map_id) -> dict:
     """The whole drawing: this map's own placements, resolved against
     nodesdb's live device/neighbour/VLAN data through mapper.assemble_links
@@ -9329,10 +9384,13 @@ def get_mapper_map(service, params, body, map_id) -> dict:
     # map does not place can never produce a link OR a peer on it -- reading
     # the whole fleet's neighbour table to draw a handful of placements was
     # exactly the cost this route's report measured (12.4s at 10k rows).
+    neighbour_rows = _apply_ip_matches(
+        service, service.nodes_db.neighbours_for_devices(device_ids))
     links, peers = mapper.assemble_links(
-        service.nodes_db.neighbours_for_devices(device_ids), port_vlans=port_vlans,
+        neighbour_rows, port_vlans=port_vlans,
         port_label=port_label, on_map=on_map, now=now,
-        stale_after_s=stale_after_s)
+        stale_after_s=stale_after_s,
+        peer_name=_mapper_peer_name(service, neighbour_rows))
 
     color_overrides = service.mapper_db.vlan_colors()
     threshold = int(settings.get("vlan_collapse_threshold", 8))
@@ -9517,7 +9575,14 @@ def get_mapper_map_candidates(service, params, body, map_id) -> dict:
     # placed_device_ids below, so asking nodesdb for exactly that set of
     # devices' rows -- not the whole fleet -- returns the same rows without
     # the fleet-wide join cost get_mapper_map's own report measured.
-    for row in service.nodes_db.neighbours_for_devices(placed_device_ids):
+    #
+    # _apply_ip_matches, the same helper get_mapper_map uses, so a
+    # candidate LLDP/CDP only placed a Nodes device by address (not
+    # sysName or chassis MAC) is offered as "kind": "device" here too.
+    candidate_rows = _apply_ip_matches(
+        service, service.nodes_db.neighbours_for_devices(placed_device_ids))
+    peer_name = _mapper_peer_name(service, candidate_rows)
+    for row in candidate_rows:
         if row["device_id"] not in placed_device_ids or not row["present"]:
             continue
         if row["protocol"] not in mapper.LINK_PROTOCOLS:
@@ -9540,7 +9605,7 @@ def get_mapper_map_candidates(service, params, body, map_id) -> dict:
             seen_peers.add(peer_key)
             neighbours.append({
                 "kind": "peer", "peer_key": peer_key,
-                "name": row["sys_name"] or row["platform"] or row["chassis_id"] or peer_key,
+                "name": peer_name(row) or peer_key,
                 "platform": row["platform"] or "", "address": row["remote_address"] or "",
                 "seen_from_device_id": row["device_id"], "seen_from_port": local_port,
             })

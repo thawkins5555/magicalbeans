@@ -450,6 +450,43 @@ def device_for_ip(nodes_db, ip: str):
     return nodes_db.device(device_id) if device_id else None
 
 
+def device_label(row, dns_names: dict) -> tuple[str, str]:
+    """(name, source) for a device row: a manual name wins outright, then
+    sysName, then a manual name stored without display_name_source saying
+    so (pre-5.x rows), then reverse-DNS, then the bare IP. This is
+    report.device_label's own order -- kept here, with report.device_label
+    delegating to it, so this module's display_names (and anything else
+    that needs the chain without a device row database read) can use it
+    without namelookup importing report."""
+    ip = row["ip"]
+    name = row["name"] or ""
+    if name == ip:
+        name = ""
+    if row["display_name_source"] == "manual" and name:
+        return name, "manual"
+    if row["sys_name"]:
+        return row["sys_name"], "sysName"
+    if name:
+        return name, "manual"
+    dns = (dns_names or {}).get(ip)
+    if dns:
+        return dns, "dns"
+    return ip, "ip"
+
+
+def display_names(nodes_db, app_db, devices) -> dict[int, str]:
+    """{device_id: name} for a batch of device rows, using device_label's
+    order with one batched app_db.hostnames read across all of them --
+    the Neighbours pane, the mapper and Reports all call this rather than
+    each resolving reverse-DNS per device."""
+    devices = list(devices)
+    if not devices:
+        return {}
+    dns_names = (app_db.hostnames([d["ip"] for d in devices])
+                if app_db is not None else {})
+    return {d["id"]: device_label(d, dns_names)[0] for d in devices}
+
+
 def resolve_name(nodes_db, app_db, ip: str, device=None) -> str | None:
     """The Nodes module's device name first (see device_name), then the DNS
     reverse-lookup cache. None if nothing is known. Pass `device` when the

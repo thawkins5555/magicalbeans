@@ -165,6 +165,17 @@ try:
     db.record_device_addresses(edge_id, ["10.40.0.22"], "test")
     service.app_db.set_hostname("10.40.0.50", "printer-3.corp.example")
 
+    # A device never given a manual name (stored as its own IP) but with a
+    # polled sysName -- the SQL join matches it on chassis MAC alone, and
+    # matched_device_name must show the sysName, not the raw devices.name
+    # column (which is the bare IP for a device like this).
+    nameless_id = db.add_device("10.40.0.5", group_id=gid)
+    db._conn.execute("UPDATE devices SET sys_name = ? WHERE id = ?",
+                     ("core-sysname-only", nameless_id))
+    db._conn.commit()
+    db.replace_interfaces(nameless_id, [
+        {"if_index": 1, "descr": "Gi0/1", "phys_addr": "dd:dd:dd:dd:dd:01"}])
+
     db.replace_neighbors(core_id, [
         {"if_index": 1, "protocol": "lldp", "rem_index": "0.1.1",
          "chassis_id": "bb:bb:bb:bb:bb:01", "chassis_id_subtype": 4,
@@ -184,11 +195,14 @@ try:
         # The raw IANA address-family + octets form a real agent sends.
         {"if_index": 7, "protocol": "lldp", "rem_index": "0.7.1",
          "chassis_id": "01 0A 28 00 09", "chassis_id_subtype": 5, "port_id": "Gi1/2"},
+        {"if_index": 8, "protocol": "lldp", "rem_index": "0.8.1",
+         "chassis_id": "dd:dd:dd:dd:dd:01", "chassis_id_subtype": 4,
+         "sys_name": "core-sysname-only", "port_id": "Gi0/1"},
     ])
 
     status, payload = call("GET", f"/api/nodes/devices/{core_id}/neighbors", token=admin)
     by_port = {r["if_index"]: r for r in payload.get("neighbors", [])}
-    check("all seven neighbour rows come back", len(by_port) == 7, sorted(by_port))
+    check("all eight neighbour rows come back", len(by_port) == 8, sorted(by_port))
 
     row = by_port.get(3)
     check("a subtype-5 chassis IP of a managed device resolves to that device",
@@ -228,6 +242,12 @@ try:
     check("the MAC-matched row is untouched by the name chain",
           by_port[1]["matched_device_id"] == edge_id
           and by_port[1]["resolved_source"] == "", by_port[1])
+
+    row = by_port.get(8)
+    check("a MAC-matched row whose device has no manual name shows its "
+          "sysName, not the bare IP",
+          row is not None and row["matched_device_id"] == nameless_id
+          and row["matched_device_name"] == "core-sysname-only", row)
 
     status, csv_payload = call(
         "GET", f"/api/nodes/devices/{core_id}/neighbors/export.csv", token=admin)

@@ -15,6 +15,7 @@ import time
 from dataclasses import asdict, dataclass, field
 
 from netpath.analysis import clamp_window
+from netpath import namelookup
 
 # A segment longer than this with no transition inside it is flagged rather
 # than trusted outright — it might be a stopped poller, not a quiet device.
@@ -186,12 +187,17 @@ class AvailabilityReport:
 
 
 def device_availability_report(nodesdb, device_ids: list[int], t0: float, t1: float,
-                               *, alertsdb=None, now: float | None = None
+                               *, alertsdb=None, now: float | None = None,
+                               dns_names: dict | None = None, hostnames=None
                                ) -> AvailabilityReport:
     """Availability, outage count, total downtime, longest outage and MTTR
     for each of `device_ids` over [t0, t1]. `alertsdb` is optional — without
     it, `caveats` says maintenance/mute exclusion was skipped rather than
-    pretending it ran and found nothing to exclude."""
+    pretending it ran and found nothing to exclude. `dns_names` is a
+    pre-fetched reverse-DNS map (ip -> name); `hostnames`, a
+    callable(ips) -> that same map, is the one-query alternative
+    firmware_inventory's own `hostnames` argument offers, used here to name
+    a device by DNS when it has neither a manual name nor a sysName."""
     t0, t1 = clamp_window(t0, t1)
     now = time.time() if now is None else now
     global_caveats = [MUTE_HISTORY_CAVEAT, MAINTENANCE_MODE_HISTORY_CAVEAT]
@@ -215,9 +221,17 @@ def device_availability_report(nodesdb, device_ids: list[int], t0: float, t1: fl
     maintenance_by_device = (alertsdb.maintenance_periods(t0, t1)
                              if alertsdb is not None else {})
 
+    # One batched read for every device_id, rather than nodesdb.device()
+    # once per id -- devices_by_ids' own "many known ids, one indexed
+    # read" shape, applied here so the dns_names/hostnames lookup below
+    # can also be one call across the whole batch.
+    rows_by_id = {row["id"]: row for row in nodesdb.devices_by_ids(device_ids)}
+    if dns_names is None and hostnames is not None:
+        dns_names = hostnames([row["ip"] for row in rows_by_id.values()])
+
     results: list[DeviceAvailability] = []
     for device_id in device_ids:
-        row = nodesdb.device(device_id)
+        row = rows_by_id.get(device_id)
         if row is None:
             results.append(DeviceAvailability(
                 device_id=device_id, name="", ip="",
@@ -230,8 +244,9 @@ def device_availability_report(nodesdb, device_ids: list[int], t0: float, t1: fl
         created_ts = float(row["created_ts"] or t0)
         effective_start = max(t0, created_ts)
         excluded_before_created = max(0.0, effective_start - t0)
+        name, _name_source = namelookup.device_label(row, dns_names or {})
         report = DeviceAvailability(
-            device_id=device_id, name=row["name"] or row["ip"], ip=row["ip"],
+            device_id=device_id, name=name, ip=row["ip"],
             requested_start=t0, requested_end=t1,
             effective_start=effective_start, effective_end=t1,
             excluded_before_created_s=excluded_before_created,
@@ -444,21 +459,11 @@ def device_label(row, dns_names: dict) -> tuple[str, str]:
     """(name, source) for a device row: a manual name wins outright, then
     sysName, then a manual name stored without display_name_source saying
     so (pre-5.x rows), then reverse-DNS, then the bare IP — the same order
-    an operator would trust the fleet's own facts in."""
-    ip = row["ip"]
-    name = row["name"] or ""
-    if name == ip:
-        name = ""
-    if row["display_name_source"] == "manual" and name:
-        return name, "manual"
-    if row["sys_name"]:
-        return row["sys_name"], "sysName"
-    if name:
-        return name, "manual"
-    dns = (dns_names or {}).get(ip)
-    if dns:
-        return dns, "dns"
-    return ip, "ip"
+    an operator would trust the fleet's own facts in. Delegates to
+    namelookup.device_label, the chain the Neighbours pane and the mapper
+    also use now, kept as this name here since every existing caller in
+    this module and api.py already spells it this way."""
+    return namelookup.device_label(row, dns_names)
 
 
 @dataclass
@@ -498,7 +503,7 @@ def firmware_inventory(nodesdb, device_ids: list[int] | None = None,
         label, name_source = device_label(row, dns_names or {})
         device = label if label == ip else f"{label} ({ip})"
         rows.append(FirmwareRow(
-            device_id=row["id"], name=row["name"] or ip, ip=ip,
+            device_id=row["id"], name=label, ip=ip,
             vendor=row["vendor"] or "",
             model_hint=_model_hint(row["sys_descr"] or ""),
             sw_version=(row["sw_version"] or "") if "sw_version" in keys else "",
@@ -522,12 +527,16 @@ def firmware_inventory(nodesdb, device_ids: list[int] | None = None,
 def top_metric_ranking(nodesdb, key: str, t0: float, t1: float, *,
                        n: int = 20, rank_by: str = "peak",
                        ascending: bool = False, like: bool = False,
-                       device_ids: list[int] | None = None
+                       device_ids: list[int] | None = None,
+                       dns_names: dict | None = None, hostnames=None
                        ) -> TopMetricReport:
     """The top (or bottom) `n` metric series by peak or mean value over
     [t0, t1], read from samples_hourly (never samples — a raw scan would not
     finish at fleet scale). `query_ms` on the result is the wall-clock cost
     of the whole query, for a caller to watch on a wide/long request.
+    `dns_names`/`hostnames` name a device by DNS, same as
+    device_availability_report, when it has neither a manual name nor a
+    sysName.
     """
     t0, t1 = clamp_window(t0, t1)
     h0 = int(t0 // 3600) * 3600
@@ -545,6 +554,8 @@ def top_metric_ranking(nodesdb, key: str, t0: float, t1: float, *,
                                query_ms=query_ms, rows=[])
     devices = {row["id"]: row for row in nodesdb.devices_by_ids(
         sorted({arow["device_id"] for arow in agg_rows}))}
+    if dns_names is None and hostnames is not None:
+        dns_names = hostnames([row["ip"] for row in devices.values()])
 
     rows: list[MetricRank] = []
     for arow in agg_rows:
@@ -552,7 +563,8 @@ def top_metric_ranking(nodesdb, key: str, t0: float, t1: float, *,
         mean = (arow["sum_avg_n"] / total_n) if total_n else None
         device = devices.get(arow["device_id"])
         device_ip = device["ip"] if device else ""
-        device_name = (device["name"] if device else "") or device_ip
+        device_name = (namelookup.device_label(device, dns_names or {})[0]
+                      if device else device_ip)
         rows.append(MetricRank(
             device_id=arow["device_id"], device_name=device_name,
             device_ip=device_ip, metric_id=arow["metric_id"], key=arow["key"],

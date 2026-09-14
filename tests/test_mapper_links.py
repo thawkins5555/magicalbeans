@@ -130,6 +130,28 @@ if peers_p:
     check("...and the peer records both devices it was seen via",
           {v["device_id"] for v in peers_p[0]["seen_via"]} == {1, 2}, peers_p)
 
+# ------------------------------------------------------- peer_name callable
+
+rows_peer_named = [row(1, 15, chassis_id="ap:mac:2", sys_name="ap-fallback",
+                      platform="unifi", port_id="Gi0/3")]
+_, peers_named = assemble_links(
+    rows_peer_named, port_vlans={}, port_label=label_of, on_map=all_on_map,
+    now=NOW, peer_name=lambda r: "dns-name.example")
+check("a peer_name callable, when given, names the peer ahead of "
+      "sys_name/platform/chassis_id",
+      peers_named[0]["name"] == "dns-name.example", peers_named)
+
+_, peers_fallback = assemble_links(
+    rows_peer_named, port_vlans={}, port_label=label_of, on_map=all_on_map,
+    now=NOW, peer_name=lambda r: "")
+check("...but falls back to sys_name/platform/chassis_id when it answers nothing",
+      peers_fallback[0]["name"] == "ap-fallback", peers_fallback)
+
+_, peers_default = assemble_links(
+    rows_peer_named, port_vlans={}, port_label=label_of, on_map=all_on_map, now=NOW)
+check("omitting peer_name keeps today's sys_name/platform/chassis_id order",
+      peers_default[0]["name"] == "ap-fallback", peers_default)
+
 # ------------------------------------------------------- on_map gating
 
 def only_device_1(id_):

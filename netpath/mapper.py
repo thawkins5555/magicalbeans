@@ -452,9 +452,16 @@ def _fold_reciprocal_name_matched(links_by_key: dict) -> None:
 
 
 def assemble_links(neighbour_rows, *, port_vlans, port_label, on_map, now,
-                   stale_after_s=None) -> tuple[list[dict], list[dict]]:
+                   stale_after_s=None, peer_name=None) -> tuple[list[dict], list[dict]]:
     """Turn raw LLDP/CDP neighbour rows into the links and peers one map
     draws.
+
+    `peer_name`, if given, is a callable(row) -> str tried before the
+    sys_name/platform/chassis_id fallback below, for an unmatched row's
+    peer entry -- the route passes one that checks the reverse-DNS cache
+    first, so an unmanaged peer's name agrees with what Neighbours and
+    Reports would call the same address. Kept optional and passed in
+    rather than imported, so this module never depends on api.py.
 
     Processing order per row matters and is deliberate:
       1. protocol / present / staleness filters drop rows that should not
@@ -565,9 +572,11 @@ def assemble_links(neighbour_rows, *, port_vlans, port_label, on_map, now,
 
             peer = peers_by_key.get(peer_key)
             if peer is None:
+                default_name = (row["sys_name"] or row["platform"]
+                                or row["chassis_id"] or peer_key)
                 peer = {"peer_key": peer_key,
-                        "name": row["sys_name"] or row["platform"]
-                                or row["chassis_id"] or peer_key,
+                        "name": (peer_name(row) or default_name) if peer_name
+                                else default_name,
                         "platform": row["platform"] or "",
                         "address": row["remote_address"] or "",
                         "seen_via": [], "seen_ts": seen_ts}

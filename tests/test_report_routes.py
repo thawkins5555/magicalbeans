@@ -224,6 +224,48 @@ try:
     check("...and honours the same device_ids filter",
           status == 200 and payload["count"] == 1, (status, payload))
 
+    # -------------------------------------------- the shared name chain
+    # A device with no manual name (stored as its IP) but a polled sysName,
+    # and one with neither -- only a reverse-DNS cache entry -- must show
+    # that name in all three reports rather than the bare IP.
+    print("device_label's chain names all three reports the same way")
+    dev3 = db.add_device("10.85.0.3", group_id=gid)
+    db._conn.execute("UPDATE devices SET sys_name = ? WHERE id = ?",
+                     ("core-sw-3", dev3))
+    db._conn.commit()
+    dev4 = db.add_device("10.85.0.4", group_id=gid)
+    service.app_db.set_hostname("10.85.0.4", "dns-name-4.example")
+    seed_hourly_sample(db, dev3, "cpu_pct", "CPU", "percent", hour, 5, 30.0, 40.0, 55.0)
+    seed_hourly_sample(db, dev4, "cpu_pct", "CPU", "percent", hour, 5, 30.0, 40.0, 55.0)
+
+    status, payload = call(
+        "GET", f"/api/nodes/reports/availability?device_ids={dev3},{dev4}"
+               f"&t0={now - 3600}&t1={now}", token=admin)
+    by_id = {d["device_id"]: d for d in payload.get("devices", [])}
+    check("availability shows the sysName for a device named only by its IP",
+          status == 200 and by_id.get(dev3, {}).get("name") == "core-sw-3",
+          (status, payload))
+    check("...and the reverse-DNS name for a device with neither",
+          by_id.get(dev4, {}).get("name") == "dns-name-4.example", payload)
+
+    status, payload = call(
+        "GET", f"/api/nodes/reports/top-metrics?key=cpu_pct&t0={now - 3600}&t1={now + 60}"
+               f"&device_ids={dev3},{dev4}", token=admin)
+    by_id = {r["device_id"]: r for r in payload.get("rows", [])}
+    check("top-metrics names the sysName device the same way",
+          status == 200 and by_id.get(dev3, {}).get("device_name") == "core-sw-3",
+          (status, payload))
+    check("...and the DNS-only device",
+          by_id.get(dev4, {}).get("device_name") == "dns-name-4.example", payload)
+
+    status, payload = call(
+        "GET", f"/api/nodes/reports/firmware?device_ids={dev3},{dev4}", token=admin)
+    by_id = {r["device_id"]: r for r in payload.get("rows", [])}
+    check("firmware's own name field agrees, not just its device/label columns",
+          status == 200 and by_id.get(dev3, {}).get("name") == "core-sw-3"
+          and by_id.get(dev4, {}).get("name") == "dns-name-4.example",
+          (status, payload))
+
     # -------------------------------------------------------------- gates
     print("gates: nodes:read allowed, no grant refused")
     service.app_db.add_user("report-reader", hash_password("ReportReaderPW2026"),

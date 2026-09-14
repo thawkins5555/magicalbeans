@@ -1131,6 +1131,32 @@ def format_chassis_address(raw) -> str:
     return address if namelookup.is_ip_literal(address) else ""
 
 
+def neighbor_ip_candidates(row) -> list[str]:
+    """Addresses a neighbour row identifies itself by, best evidence first:
+    CDP's cdpCacheAddress, an LLDP subtype-5 chassis id, or sys_name (this
+    module copies cdpCacheDeviceId into both). `row` is a sqlite3.Row
+    (nodesdb.all_neighbours()/neighbours_for_devices()) or a hand-built
+    dict alike -- neither type can be relied on to have `.get`, so `in
+    row.keys()` guards every read, the same way mapper._get does."""
+    keys = row.keys()
+
+    def value(key):
+        return row[key] if key in keys else None
+
+    candidates = []
+
+    def add(text):
+        text = str(text or "").strip()
+        if namelookup.is_ip_literal(text) and text not in candidates:
+            candidates.append(text)
+
+    add(value("remote_address"))
+    if value("chassis_id_subtype") == 5:
+        add(format_chassis_address(value("chassis_id")))
+    add(value("sys_name"))
+    return candidates
+
+
 def _int_keyed(column: dict) -> dict:
     """A `_walk_column` result with every index suffix parsed to int,
     dropping anything that is not one. Several VLAN-walk columns below are
