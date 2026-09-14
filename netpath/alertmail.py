@@ -314,6 +314,7 @@ def tls_context() -> ssl.SSLContext:
 
 
 def _https_opener():
+    """_RefuseRedirects plus an HTTPSHandler carrying tls_context()."""
     return urllib.request.build_opener(
         _RefuseRedirects, urllib.request.HTTPSHandler(context=tls_context()))
 

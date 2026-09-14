@@ -181,13 +181,16 @@ its own context.
 **Deliberately unchanged.** The SMTP "verify certificate" opt-out still
 builds `ssl._create_unverified_context()` when an operator has turned
 verification off in Settings — that remains the only unverified path in
-this application. The LDAP client and the self-updater build their own
-SSL contexts and neither is touched by this release.
+this application. The LDAP client, the self-updater and the HTTPS
+monitor (`httpcheck.py`) build their own SSL contexts and none is touched
+by this release; the HTTPS monitor will meet the same failure behind an
+inspecting firewall and is the known follow-up.
 
 Files: `alertmail.py`.
 
 Verification: `test_alert_sms.py` §2b checks the context's flags
-(`VERIFY_X509_STRICT` cleared, everything else at its default) and that
+(`VERIFY_X509_STRICT` cleared and every other flag equal to the default
+context's) and that
 `_https_opener()` carries the same context.
 
 ### 5.20.1 — SMS consent notice

@@ -178,8 +178,10 @@ finally:
 ctx = alertmail.tls_context()
 check("tls_context still requires and verifies a certificate",
       ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname is True)
-check("...but VERIFY_X509_STRICT is off, so an AKI-less cert is not refused",
-      (ctx.verify_flags & getattr(ssl, "VERIFY_X509_STRICT", 0)) == 0, ctx.verify_flags)
+_STRICT = getattr(ssl, "VERIFY_X509_STRICT", 0)
+_EXPECTED_FLAGS = ssl.create_default_context().verify_flags & ~_STRICT
+check("...but VERIFY_X509_STRICT is off and every other flag is at its default",
+      ctx.verify_flags == _EXPECTED_FLAGS, (ctx.verify_flags, _EXPECTED_FLAGS))
 
 opener = alertmail._https_opener()
 https_handlers = [h for h in opener.handlers if isinstance(h, urllib.request.HTTPSHandler)]
@@ -188,7 +190,7 @@ if https_handlers:
     inner = https_handlers[0]._context
     check("...built on a tls_context (verified, hostname-checked, non-strict)",
           inner.verify_mode == ssl.CERT_REQUIRED and inner.check_hostname is True
-          and (inner.verify_flags & getattr(ssl, "VERIFY_X509_STRICT", 0)) == 0)
+          and inner.verify_flags == _EXPECTED_FLAGS)
 check("..._https_opener still refuses redirects",
       any(isinstance(h, alertmail._RefuseRedirects) for h in opener.handlers), opener.handlers)
 
