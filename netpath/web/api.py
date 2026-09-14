@@ -4147,7 +4147,7 @@ def get_nodes_devices_export(service, params, body) -> dict:
     rows = service.nodes_db.devices(**filters)
     devices = _device_rows_json(service, params, rows)
     header = _DEVICE_CSV_HEADER
-    csv_rows = [[d.get("id"), d.get("name"), d.get("ip"), d.get("status"),
+    csv_rows = [[d.get("id"), _device_display_name(d), d.get("ip"), d.get("status"),
                 d.get("group_id"), d.get("device_group_id"), d.get("vendor"),
                 d.get("sys_descr"), d.get("sys_name"), d.get("polling"),
                 d.get("muted_until"),
@@ -4176,21 +4176,8 @@ def get_nodes_mac_search(service, params, body) -> dict:
         return {"mac": "", "locations": [], "enabled_devices": 0}
     rows = service.nodes_db.mac_locations(mac)
     devices = _devices_for_rows(service, rows)
-    locations = []
-    for row in rows:
-        device = devices.get(row["device_id"])
-        if device is None:
-            continue
-        locations.append({
-            "device_id": row["device_id"],
-            "device_name": namelookup.device_name(device),
-            "if_index": row["if_index"],
-            "if_descr": row["if_descr"] or f"Interface {row['if_index']}",
-            "mac": row["mac"], "vlan": row["vlan"], "seen_ts": row["seen_ts"],
-            "first_seen_ts": row["first_seen_ts"],
-            "present": bool(row["present"]),
-            "uplink": bool(row["uplink"]), "uplink_to": row["uplink_to"],
-        })
+    locations = [_mac_location_json(row, devices[row["device_id"]])
+                for row in rows if row["device_id"] in devices]
     # How many devices are actually walking their forwarding tables, so the
     # frontend can say "nothing has been learned yet" rather than "not
     # found" when the feature is simply switched off everywhere. One query,
@@ -4226,11 +4213,34 @@ def get_nodes_arp_search(service, params, body) -> dict:
         locations.append(_arp_json(
             row, device_name=namelookup.device_name(device),
             if_descr=row["if_descr"] or f"Interface {row['if_index']}"))
+    # Chain to the switch port only for rows matched by address: a MAC
+    # needle's ports are already the MAC group's answer.
+    lowered = needle.lower()
+    ports = []
+    macs, ip_for_mac = [], {}
+    for row in rows:
+        mac = row["mac"]
+        if not mac or not str(row["ip"] or "").lower().startswith(lowered):
+            continue
+        if mac not in ip_for_mac:
+            ip_for_mac[mac] = row["ip"]
+            macs.append(mac)
+        if len(macs) >= 8:
+            break
+    port_rows = service.nodes_db.mac_locations_for(macs) if macs else []
+    if port_rows:
+        port_devices = _devices_for_rows(service, port_rows)
+        for row in port_rows:
+            device = port_devices.get(row["device_id"])
+            if device is None:
+                continue
+            ports.append({**_mac_location_json(row, device),
+                          "ip": ip_for_mac.get(row["mac"], "")})
     # How many devices walk their ARP cache at all — off is the shipped
     # default here, so "not found" and "nobody is collecting this" are
     # different sentences far more often than for the MAC table. One
     # query, for the reason mac_walk_enabled_count gives.
-    return {"needle": needle, "locations": locations,
+    return {"needle": needle, "locations": locations, "ports": ports,
             "enabled_devices": service.nodes_db.arp_walk_enabled_count(),
             "retention_days": float(
                 service.nodes_settings.get("mac_table_retention_days", 7))}
@@ -4245,6 +4255,22 @@ def _devices_for_rows(service, rows) -> dict:
     statements whatever the hit count."""
     return {d["id"]: d for d in service.nodes_db.devices_by_ids(
         row["device_id"] for row in rows)}
+
+
+def _mac_location_json(row, device) -> dict:
+    """One mac_locations/mac_locations_for row as the MAC search and the
+    ARP-chained port group both spell it — one shape, so the two cannot
+    drift on a field name."""
+    return {
+        "device_id": row["device_id"],
+        "device_name": namelookup.device_name(device),
+        "if_index": row["if_index"],
+        "if_descr": row["if_descr"] or f"Interface {row['if_index']}",
+        "mac": row["mac"], "vlan": row["vlan"], "seen_ts": row["seen_ts"],
+        "first_seen_ts": row["first_seen_ts"],
+        "present": bool(row["present"]),
+        "uplink": bool(row["uplink"]), "uplink_to": row["uplink_to"],
+    }
 
 
 def _arp_json(row, **extra) -> dict:
@@ -6317,9 +6343,7 @@ def get_nodes_device_events(service, params, body, device_id) -> dict:
          "ts": ev["ts"], "kind": ev["kind"], "detail": ev["detail"]}
         for ev in service.nodes_db.interface_events_for_device(device_id, since_s=since_s)]
     return {
-        "device_events": [
-            {"id": r["id"], "ts": r["ts"], "kind": r["kind"], "detail": r["detail"]}
-            for r in device_events],
+        "device_events": [_device_event_json(r) for r in device_events],
         "interface_events": interface_events,
     }
 
@@ -10653,6 +10677,246 @@ def _int_or_none(value):
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+# ------------------------------------------------------- dashboard layout
+#
+# A per-account arrangement of the tile grid, stored as one compact JSON
+# blob on the account's own `users` row (appdb.py, beside `theme`) — one
+# dashboard per account, nothing shared between them.
+
+# type key -> the module a tile needs read access to (None = any signed-in
+# account may add and see it). The server's own copy of the catalogue:
+# dashboard.js has the richer one (titles, renderers), this one only
+# validates and gates.
+DASHBOARD_TILE_TYPES = {
+    "fleet": "nodes", "open_alerts": "alerts", "workers": None,
+    "storage": "settings", "top_events": "nodes", "top_iface_events": "nodes",
+    "top_alerts": "alerts", "top_rtt": "nodes", "top_loss": "nodes",
+    "top_cpu": "nodes", "iface_traffic": "nodes", "device_metric": "nodes",
+    "device_status": "nodes", "top_metric": "nodes", "recent_alerts": "alerts",
+    "recent_events": "nodes", "note": None, "syslog_rate": "syslog",
+    "trap_rate": "snmp", "netflow_top": "netflow",
+    "wireless_summary": "wireless", "configrx_summary": "configrx",
+    "ipam_subnets": "ipam", "https_monitors": "netpath",
+}
+
+_DASHBOARD_WIDE_TILES = ("fleet", "workers", "storage")
+
+# Today's ten tiles, in today's order — an account that has never saved a
+# layout of its own sees exactly what it always has.
+DEFAULT_DASHBOARD_LAYOUT = {
+    "version": 1,
+    "tiles": [
+        {"id": tile_id, "type": tile_id,
+         "w": 2 if tile_id in _DASHBOARD_WIDE_TILES else 1,
+         "h": 1, "config": {}}
+        for tile_id in ("fleet", "open_alerts", "workers", "storage",
+                        "top_events", "top_iface_events", "top_alerts",
+                        "top_rtt", "top_loss", "top_cpu")
+    ],
+}
+
+# The graph tiles' window choices: 1h/6h/24h/7d, the only four dashboard.js
+# ever offers, so a config carrying anything else did not come from the
+# grid's own dialog.
+_DASHBOARD_WINDOW_S_VALUES = (3600, 21600, 86400, 604800)
+
+
+def _dash_int(value, lo=None, hi=None, allowed=None):
+    """One config value as a plain int, never a bool (a bool IS an int in
+    Python, and `True` is not what `n: 1` means here) and within bounds."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"expected an integer, got {value!r}")
+    if allowed is not None and value not in allowed:
+        raise ValueError(f"{value!r} is not one of {allowed!r}")
+    if lo is not None and value < lo:
+        raise ValueError(f"{value!r} is below the minimum {lo}")
+    if hi is not None and value > hi:
+        raise ValueError(f"{value!r} is above the maximum {hi}")
+    return value
+
+
+def _dash_str(value, max_len):
+    if not isinstance(value, str) or len(value) > max_len:
+        raise ValueError(f"expected a string of at most {max_len} characters")
+    return value
+
+
+def _dash_bool(value):
+    if not isinstance(value, bool):
+        raise ValueError(f"expected true or false, got {value!r}")
+    return value
+
+
+def _dash_enum(*options):
+    def validate(value):
+        if value not in options:
+            raise ValueError(f"{value!r} is not one of {options!r}")
+        return value
+    return validate
+
+
+# type key -> {config key: validator}. A type absent here (or a key absent
+# from its entry) accepts no config keys at all — `config: {}` is the only
+# legal value for the tile families with nothing to configure.
+_DASHBOARD_CONFIG_SCHEMA = {
+    "iface_traffic": {
+        "device_id": lambda v: _dash_int(v),
+        "if_index": lambda v: _dash_int(v),
+        "window_s": lambda v: _dash_int(v, allowed=_DASHBOARD_WINDOW_S_VALUES),
+    },
+    "device_metric": {
+        "device_id": lambda v: _dash_int(v),
+        "metric_key": lambda v: _dash_str(v, 200),
+        "window_s": lambda v: _dash_int(v, allowed=_DASHBOARD_WINDOW_S_VALUES),
+    },
+    "device_status": {"device_id": lambda v: _dash_int(v)},
+    "top_metric": {
+        "metric_key": lambda v: _dash_str(v, 200),
+        "n": lambda v: _dash_int(v, 1, 50),
+        "window_s": lambda v: _dash_int(v, allowed=_DASHBOARD_WINDOW_S_VALUES),
+        "rank_by": _dash_enum("peak", "mean"),
+        "ascending": _dash_bool,
+    },
+    "recent_alerts": {
+        "max_severity": lambda v: _dash_int(v, 0, 7),
+        "n": lambda v: _dash_int(v, 1, 50),
+    },
+    "recent_events": {
+        "n": lambda v: _dash_int(v, 1, 200),
+        "since_s": lambda v: _dash_int(v, 60, 604800),
+    },
+    "note": {
+        "title": lambda v: _dash_str(v, 200),
+        "text": lambda v: _dash_str(v, 2000),
+    },
+    "syslog_rate": {"window_s": lambda v: _dash_int(v, allowed=_DASHBOARD_WINDOW_S_VALUES)},
+    "trap_rate": {"window_s": lambda v: _dash_int(v, allowed=_DASHBOARD_WINDOW_S_VALUES)},
+    "netflow_top": {
+        "dimension": lambda v: _dash_str(v, 40),
+        "n": lambda v: _dash_int(v, 1, 50),
+        "window_s": lambda v: _dash_int(v, allowed=_DASHBOARD_WINDOW_S_VALUES),
+    },
+    "ipam_subnets": {"n": lambda v: _dash_int(v, 1, 50)},
+}
+
+_DASHBOARD_TILE_ID_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+
+
+def _validate_dashboard_layout(layout) -> dict:
+    """`layout` as a client (or a stored row) supplied it -> the cleaned,
+    canonical form, or ValueError naming what was wrong — server.py answers
+    every ValueError with 400. Never trusts a `config` value's shape past
+    what the tile type declares: an unknown key or a wrong type is refused
+    rather than stored and handed back to whatever reads it later."""
+    if not isinstance(layout, dict) or layout.get("version") != 1:
+        raise ValueError("layout.version must be 1")
+    tiles = layout.get("tiles")
+    if not isinstance(tiles, list):
+        raise ValueError("layout.tiles must be a list")
+    if len(tiles) > 60:
+        raise ValueError("A dashboard layout may hold at most 60 tiles")
+    seen_ids = set()
+    clean_tiles = []
+    for tile in tiles:
+        if not isinstance(tile, dict):
+            raise ValueError("Each tile must be an object")
+        tile_id = tile.get("id")
+        if (not isinstance(tile_id, str) or not (0 < len(tile_id) <= 32)
+                or not set(tile_id) <= _DASHBOARD_TILE_ID_CHARS):
+            raise ValueError(f"Bad tile id: {tile_id!r}")
+        if tile_id in seen_ids:
+            raise ValueError(f"Duplicate tile id: {tile_id}")
+        seen_ids.add(tile_id)
+        tile_type = tile.get("type")
+        if tile_type not in DASHBOARD_TILE_TYPES:
+            raise ValueError(f"Unknown tile type: {tile_type!r}")
+        w, h = tile.get("w"), tile.get("h")
+        if isinstance(w, bool) or w not in (1, 2, 3):
+            raise ValueError(f"Tile {tile_id}: w must be 1, 2 or 3")
+        if isinstance(h, bool) or h not in (1, 2):
+            raise ValueError(f"Tile {tile_id}: h must be 1 or 2")
+        config = tile.get("config")
+        if not isinstance(config, dict):
+            raise ValueError(f"Tile {tile_id}: config must be an object")
+        schema = _DASHBOARD_CONFIG_SCHEMA.get(tile_type, {})
+        clean_config = {}
+        for key, value in config.items():
+            validator = schema.get(key)
+            if validator is None:
+                raise ValueError(
+                    f"Tile {tile_id}: unknown config key {key!r} for {tile_type}")
+            clean_config[key] = validator(value)
+        clean_tiles.append({"id": tile_id, "type": tile_type,
+                            "w": tile["w"], "h": tile["h"],
+                            "config": clean_config})
+    return {"version": 1, "tiles": clean_tiles}
+
+
+def get_dashboard_layout(service, params, body) -> dict:
+    """The caller's saved tile arrangement, or the shipped default when
+    they have never saved one — or when what is stored no longer parses
+    (a layout saved by a future version, say): reported as the default
+    rather than a 500, since the account can always Reset to recover."""
+    stored = service.app_db.user_dashboard_layout(params.get("_username", ""))
+    if stored:
+        try:
+            return {"layout": _validate_dashboard_layout(json.loads(stored)),
+                    "default": False}
+        except Exception:                                 # noqa: BLE001
+            pass
+    return {"layout": copy.deepcopy(DEFAULT_DASHBOARD_LAYOUT), "default": True}
+
+
+def put_dashboard_layout(service, params, body) -> dict:
+    """Save the caller's tile arrangement to their own account — self-
+    service, own account only, like put_account_theme beside it."""
+    username = params.get("_username", "")
+    layout = _validate_dashboard_layout((body or {}).get("layout"))
+    service.app_db.set_user_dashboard_layout(
+        username, json.dumps(layout, separators=(",", ":")))
+    _audit(service, params, "dashboard.layout",
+          detail=f"{len(layout['tiles'])} tile(s)")
+    return {"layout": layout, "default": False}
+
+
+def delete_dashboard_layout(service, params, body) -> dict:
+    """Clear the caller's saved layout — back to the shipped default."""
+    service.app_db.set_user_dashboard_layout(params.get("_username", ""), "")
+    _audit(service, params, "dashboard.layout", detail="reset to default")
+    return {"layout": copy.deepcopy(DEFAULT_DASHBOARD_LAYOUT), "default": True}
+
+
+def _device_event_json(row) -> dict:
+    """One device_events row as get_nodes_device_events spells it — reused
+    by the fleet-wide route beside it, so the two cannot drift."""
+    return {"id": row["id"], "ts": row["ts"], "kind": row["kind"],
+            "detail": row["detail"]}
+
+
+def get_nodes_events(service, params, body) -> dict:
+    """Fleet-wide recent device events, for the Dashboard's Recent events
+    tile — get_nodes_device_events's own reader with no device filter,
+    joined to device names the way the search routes are."""
+    limit = max(1, min(int(_num(params, "limit", 50, int) or 50), 200))
+    since_s = _num(params, "since_s", 86400.0)
+    kinds_raw = params.get("kinds")
+    kinds = ([piece.strip() for piece in kinds_raw.split(",") if piece.strip()]
+             if kinds_raw else None)
+    rows = service.nodes_db.device_events(
+        None, since_s=since_s, kinds=kinds, limit=limit)
+    devices = _devices_for_rows(service, rows)
+    events = []
+    for row in rows:
+        device = devices.get(row["device_id"])
+        if device is None:
+            continue
+        events.append({**_device_event_json(row), "device_id": row["device_id"],
+                       "device_name": namelookup.device_name(device),
+                       "ip": device["ip"]})
+    return {"events": events}
 
 
 # Two fields the database and the write paths carry but the list

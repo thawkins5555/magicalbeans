@@ -335,6 +335,10 @@ class AppDatabase(SqliteStore):
         # choice alone rather than forcing dark on every account at once.
         self.ensure_columns(
             "users", {"theme": "TEXT NOT NULL DEFAULT ''"})
+        # Empty means "never saved" too — an account that has not opened
+        # Edit layout yet gets the shipped default, not an empty grid.
+        self.ensure_columns(
+            "users", {"dashboard_layout": "TEXT NOT NULL DEFAULT ''"})
 
     def backfill_permissions(self, log=None) -> None:
         """Grants the permissions an upgrade owes existing accounts. Call it
@@ -592,6 +596,20 @@ class AppDatabase(SqliteStore):
             self._conn.execute(
                 "UPDATE users SET theme = ? WHERE username = ? COLLATE NOCASE",
                 (theme, username))
+            self._conn.commit()
+
+    def user_dashboard_layout(self, username: str) -> str:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT dashboard_layout FROM users WHERE username = ?"
+                " COLLATE NOCASE", (username,)).fetchone()
+        return (row["dashboard_layout"] or "") if row else ""
+
+    def set_user_dashboard_layout(self, username: str, text: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE users SET dashboard_layout = ? WHERE username = ?"
+                " COLLATE NOCASE", (text, username))
             self._conn.commit()
 
     def touch_login(self, username: str) -> None:

@@ -131,6 +131,27 @@ try:
     check("...and the row it kept is the matching device",
           filtered_rows[1][header.index("ip")] == "10.90.0.1", filtered_rows)
 
+    # The Name column: displayName()'s precedence (SNMP hostname first),
+    # not the raw stored `name`, which is seeded to the IP for every
+    # auto-discovered device.
+    print("devices export Name column")
+    status, sysnamed = call("POST", "/api/nodes/devices",
+                            {"ip": "10.90.0.3"}, token=admin)
+    check("setup: a device created with no name at all", status == 200, (status, sysnamed))
+    service.nodes_db.seed_identity(sysnamed["id"], sys_name="switch-sysname")
+    status, manual = call("POST", "/api/nodes/devices",
+                          {"ip": "10.90.0.4", "name": "Manually Named"}, token=admin)
+    check("setup: a device given a manual name", status == 200, (status, manual))
+
+    status, name_export = call("GET", "/api/nodes/devices/export.csv", token=admin)
+    check("devices export (Name column) answers 200", status == 200, (status, name_export))
+    name_rows = {row[header.index("ip")]: row[header.index("name")]
+                for row in parse_csv(name_export["csv"])[1:]}
+    check("a device with no manual name exports its SNMP sysName",
+          name_rows.get("10.90.0.3") == "switch-sysname", name_rows)
+    check("a manually named device still exports its manual name",
+          name_rows.get("10.90.0.4") == "Manually Named", name_rows)
+
     # ------------------------------------------------------- interfaces
     print("interfaces export")
     status, empty_if = call("GET", f"/api/nodes/devices/{plain['id']}/interfaces/export.csv",

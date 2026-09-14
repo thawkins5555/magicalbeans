@@ -699,3 +699,30 @@ one uploaded file left most of its devices skipped. Widened the
 match to any of the vendor's covering files and reran the repair once
 under a new marker. Javariius reviewed; branch pushed and main
 fast-forwarded.
+
+## 5.21.0 — A modular Dashboard, and global find to the switch port
+
+*(in progress)*
+
+**Team-rules prompt** — the standing rules as before, with four work items:
+(a) global find should show an IP or MAC's hits on switch-port MAC tables
+and ARP tables, naming the port; (b) the Nodes CSV export lists the IP in
+both the Name and IP columns; (c) the Debug Event log resets its scroll
+position on every new event; (d) make the Dashboard modular — rearrange
+tiles, add and remove them, from a catalogue of tile types including
+interface graphs, taking cues from SolarWinds, Auvik, PRTG and Zabbix.
+
+**Planning answers, round one** — an IP search today surfaces only the ARP
+row, so the fix chains ARP to MAC to switch port; dashboard layout is per
+account, saved on the server; tiles drag-to-reorder in a grid with a
+per-tile width setting rather than free placement; one dashboard per
+account.
+
+**Planning answers, round two** — all four tile families ship: graphs,
+single-device status, module overviews, and lists/notes; an explicit Edit
+layout button rather than an always-editable canvas; one release, 5.21.0,
+rather than shipping the fixes first; graphs default to a 24-hour window
+refreshed every 60 seconds.
+
+**Plan approved.**
+→ Work assigned across the roster.

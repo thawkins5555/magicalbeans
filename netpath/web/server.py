@@ -616,10 +616,18 @@ ROUTES = [
     ("GET", r"^/api/dashboard$", api.get_dashboard, None),
     ("GET", r"^/api/dashboard/offenders$", api.get_dashboard_offenders,
      ("nodes", R)),
+    # The tile grid's saved arrangement: self-service, own account only,
+    # exactly like PUT /api/account/theme above.
+    ("GET", r"^/api/dashboard/layout$", api.get_dashboard_layout, None),
+    ("PUT", r"^/api/dashboard/layout$", api.put_dashboard_layout, None),
+    ("DELETE", r"^/api/dashboard/layout$", api.delete_dashboard_layout, None),
     # Two fields the write paths accept and the read serializers do not
     # return yet, so the forms that set them can show what is set.
     ("GET", r"^/api/nodes/devices/(\d+)/upstream$",
      api.get_nodes_device_upstream, ("nodes", R)),
+    # Fleet-wide recent device events, for the Dashboard's Recent events
+    # tile — the per-device route beside it, without the device filter.
+    ("GET", r"^/api/nodes/events$", api.get_nodes_events, ("nodes", R)),
     ("GET", r"^/api/alerts/rules/extras$", api.get_alerts_rule_extras,
      ("alerts", R)),
 ]

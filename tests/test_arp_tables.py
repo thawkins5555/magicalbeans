@@ -555,6 +555,36 @@ check("...and a row carries the same fields",
       export["count"] == 2 and len(lines) == 3
       and lines[1].startswith("7,Vlan10,10.0.10.5,aabbccddeeff,dynamic,False,")
       and lines[2].startswith("9,if 9,10.0.20.5,001122334455,static,True,"), lines)
+# ---- 8b. chaining IP -> ARP -> MAC -> switch port ("ports")
+switch_id = db.add_device("10.0.0.85", name="switch-1", group_id=gid)
+db.replace_interfaces(switch_id, [
+    {"if_index": 24, "descr": "Gi0/24", "phys_addr": "aa:bb:cc:dd:ee:00"}])
+db.replace_mac_entries(switch_id, [
+    {"if_index": 24, "mac": "aa:bb:cc:dd:ee:ff", "vlan": "10"}], now=seen2)
+db.replace_neighbors(switch_id, [
+    {"if_index": 24, "protocol": "lldp", "rem_index": "1",
+     "sys_name": "core-sw", "chassis_id": "aabbccddee01",
+     "chassis_id_subtype": 4}], now=seen2)
+
+chained = api.get_nodes_arp_search(Svc, {"q": "10.0.10.5"}, None)
+port = chained["ports"][0] if chained.get("ports") else {}
+check("arp-search by the IP chains to the switch port that learned its MAC",
+      len(chained.get("ports", [])) == 1
+      and port.get("device_id") == switch_id and port.get("device_name") == "switch-1"
+      and port.get("if_index") == 24 and port.get("if_descr") == "Gi0/24"
+      and port.get("mac") == "aabbccddeeff" and port.get("vlan") == "10"
+      and port.get("ip") == "10.0.10.5", chained)
+check("...and the uplink flag rides through from the neighbours row",
+      port.get("uplink") is True and port.get("uplink_to") == "core-sw", port)
+
+by_mac_prefix = api.get_nodes_arp_search(Svc, {"q": "AA-BB-CC-DD-EE-FF"}, None)
+check("arp-search by a MAC prefix answers ports == [] — the MAC group "
+      "already answers", by_mac_prefix.get("ports") == [], by_mac_prefix)
+
+unlearned = api.get_nodes_arp_search(Svc, {"q": "10.0.20.5"}, None)
+check("an IP whose MAC no switch has learned chains to no port",
+      unlearned.get("ports") == [], unlearned)
+
 try:
     api.get_nodes_device_arp(Svc, {}, None, did + 1000)
     check("device arp for a device that does not exist is refused", False)

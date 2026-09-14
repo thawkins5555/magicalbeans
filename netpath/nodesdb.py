@@ -3244,6 +3244,38 @@ class NodesDatabase(SqliteStore):
                 " m.seen_ts DESC, m.device_id, m.if_index LIMIT ?",
                 (f"{prefix}%", int(limit))).fetchall()
 
+    def mac_locations_for(self, macs, limit: int = 200) -> list[sqlite3.Row]:
+        """`mac_locations`'s own query, for a set of exact MACs rather than
+        one prefix — the ARP-chained search (an IP resolves to several
+        MACs at once, one per ARP row) asks this instead of one
+        mac_locations call per MAC. Capped at 8: a caller with more hits
+        than that has stopped asking a specific question."""
+        normalised = []
+        for mac in macs:
+            mac = normalize_mac(mac)
+            if len(mac) == 12 and mac not in normalised:
+                normalised.append(mac)
+        normalised = normalised[:8]
+        if not normalised:
+            return []
+        with self._lock:
+            marks = ",".join("?" * len(normalised))
+            return self._conn.execute(
+                "SELECT m.*, i.descr AS if_descr,"
+                " EXISTS (SELECT 1 FROM neighbors nb WHERE nb.device_id = m.device_id"
+                "   AND nb.if_index = m.if_index AND nb.present = 1) AS uplink,"
+                " (SELECT CASE WHEN nb.sys_name != '' THEN nb.sys_name"
+                "              ELSE nb.chassis_id END"
+                "    FROM neighbors nb WHERE nb.device_id = m.device_id"
+                "      AND nb.if_index = m.if_index AND nb.present = 1"
+                "    ORDER BY CAST(nb.rem_index AS INTEGER), nb.rem_index LIMIT 1) AS uplink_to"
+                " FROM mac_entries m"
+                " LEFT JOIN interfaces i ON i.device_id = m.device_id"
+                "   AND i.if_index = m.if_index"
+                f" WHERE m.mac IN ({marks}) ORDER BY uplink ASC, m.present DESC,"
+                " m.seen_ts DESC, m.device_id, m.if_index LIMIT ?",
+                (*normalised, int(limit))).fetchall()
+
     def mac_entries_for(self, device_id: int,
                         if_index: int | None = None) -> list[sqlite3.Row]:
         """Every row stored for this device (optionally one port), present
