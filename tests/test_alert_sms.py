@@ -7,8 +7,10 @@ clear, digest, sms_failing) follow the sender half.
 import json
 import os
 import sqlite3
+import ssl
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs
 
@@ -171,6 +173,24 @@ try:
     REPLY["body"] = {"sid": "SM2"}
 finally:
     pass
+
+# ------------------------------------------------------- 2b. TLS context
+ctx = alertmail.tls_context()
+check("tls_context still requires and verifies a certificate",
+      ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname is True)
+check("...but VERIFY_X509_STRICT is off, so an AKI-less cert is not refused",
+      (ctx.verify_flags & getattr(ssl, "VERIFY_X509_STRICT", 0)) == 0, ctx.verify_flags)
+
+opener = alertmail._https_opener()
+https_handlers = [h for h in opener.handlers if isinstance(h, urllib.request.HTTPSHandler)]
+check("_https_opener installs one HTTPSHandler", len(https_handlers) == 1, opener.handlers)
+if https_handlers:
+    inner = https_handlers[0]._context
+    check("...built on a tls_context (verified, hostname-checked, non-strict)",
+          inner.verify_mode == ssl.CERT_REQUIRED and inner.check_hostname is True
+          and (inner.verify_flags & getattr(ssl, "VERIFY_X509_STRICT", 0)) == 0)
+check("..._https_opener still refuses redirects",
+      any(isinstance(h, alertmail._RefuseRedirects) for h in opener.handlers), opener.handlers)
 
 # ------------------------------------------------------- 3. SmsQueue
 real_send_sms = alertmail.send_sms

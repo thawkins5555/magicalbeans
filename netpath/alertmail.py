@@ -302,6 +302,22 @@ def token_reference() -> list[dict]:
     ]
 
 
+def tls_context() -> ssl.SSLContext:
+    """Verified against the system trust store and hostname, without
+    VERIFY_X509_STRICT: Python 3.13 turns it on and it refuses the
+    AKI-less certificates SSL-inspecting firewalls and internal CAs issue."""
+    context = ssl.create_default_context()
+    strict = getattr(ssl, "VERIFY_X509_STRICT", 0)
+    if strict:
+        context.verify_flags &= ~strict
+    return context
+
+
+def _https_opener():
+    return urllib.request.build_opener(
+        _RefuseRedirects, urllib.request.HTTPSHandler(context=tls_context()))
+
+
 def send(smtp_settings: dict, password: str | None, to_addrs: list[str],
         subject: str, body: str, is_html: bool = False) -> None:
     """stdlib smtplib + email.message.EmailMessage. Raises on any failure —
@@ -318,7 +334,7 @@ def send(smtp_settings: dict, password: str | None, to_addrs: list[str],
     from_name = str(smtp_settings.get("smtp_from_name", "") or "")
 
     if verify:
-        context = ssl.create_default_context()
+        context = tls_context()
     else:
         # A deliberate opt-out, not a silent downgrade — the admin turned
         # certificate verification off explicitly in Settings.
@@ -664,7 +680,7 @@ def send_webhook(url: str, headers: list[tuple[str, str]], timeout: float,
     request.add_header("User-Agent", "SappiWhere-alert-webhook/1.0")
     for name, value in headers:
         request.add_header(name, value)
-    opener = urllib.request.build_opener(_RefuseRedirects)
+    opener = _https_opener()
     with opener.open(request, timeout=timeout) as response:
         status = response.status
     if status >= 300:
@@ -890,7 +906,7 @@ def send_sms(settings: dict, token: str | None, to_number: str, text: str) -> No
     request.add_header("User-Agent", "SappiWhere-alert-sms/1.0")
     auth = base64.b64encode(f"{basic_user}:{token}".encode("utf-8")).decode("ascii")
     request.add_header("Authorization", f"Basic {auth}")
-    opener = urllib.request.build_opener(_RefuseRedirects)
+    opener = _https_opener()
     try:
         with opener.open(request, timeout=timeout) as response:
             status = response.status
