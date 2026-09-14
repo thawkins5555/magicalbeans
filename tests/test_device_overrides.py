@@ -134,7 +134,7 @@ try:
           db.devices_count(exclude_ids=excluded) == len(all_ids) - len(excluded),
           (db.devices_count(exclude_ids=excluded), len(all_ids) - len(excluded)))
 
-    # ------------------------------------- repair_auto_mib_overrides (5.20.4)
+    # ------------------------------------- repair_auto_mib_overrides (5.20.4/5.20.5)
     #
     # Pre-5.18.0, _auto_assign_mib set mib_file_id with no mib_file_auto
     # marker, so devices it picked for still count "1 override" today.
