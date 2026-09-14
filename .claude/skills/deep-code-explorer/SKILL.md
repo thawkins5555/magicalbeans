@@ -10,7 +10,7 @@ description: >
 allowed-tools: Read, Grep, Glob, Bash(git log:*), Bash(git blame:*), Bash(rg:*)
 model: sonnet
 context: fork
-agent: Explore
+agent: dora
 ---
 
 # Deep Code Explorer

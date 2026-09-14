@@ -733,3 +733,21 @@ Javariius found one blocker (a graph tile with no device chosen made the
 layout unsaveable) and sixteen smaller findings; all closed, re-review
 "ready to push". Fisty chunked the new MAC query to the bulk contract and
 re-pinned the Workers tile check. Shipped as 5.21.0 on `main`.
+
+## Team rules in the repo
+
+**Does the web portal have a CLAUDE.md file I can edit so that I don't have to give
+the same instructions with every prompt?** — Yes. The repo's `CLAUDE.md` is loaded
+at session start from the fresh clone; it held one line pointing at the
+deep-code-explorer skill.
+
+**Set them up for me** — Standing rules written into `CLAUDE.md`; nine named
+teammates defined under `.claude/agents/` with their models pinned. The
+unnamed `deep-explorer.md` agent was folded into `dora.md`.
+
+**Please check the repo now for the deep-code-explorer skill and the explorer
+agent** — Found on `main` in `54c699e`, pushed from another device after
+5.21.0. The skill now runs as Dora, so no unnamed agent is spawned.
+
+→ Javariius reviewed the ten files against the operator's verbatim rules;
+one wording fix. Committed on the session branch and fast-forwarded to `main`.
