@@ -858,8 +858,8 @@ def send_sms(settings: dict, token: str | None, to_number: str, text: str) -> No
     if auth_mode not in ("auth_token", "api_key"):
         raise ValueError("Twilio authentication method must be auth_token or api_key")
     if auth_mode == "api_key":
-        api_key_sid = settings.get("twilio_api_key_sid")
-        if not _API_KEY_SID.match(str(api_key_sid or "")):
+        api_key_sid = str(settings.get("twilio_api_key_sid", "") or "").strip()
+        if not _API_KEY_SID.match(api_key_sid):
             raise ValueError("Twilio API Key SID must be SK followed by 32 hex characters")
         if not token:
             raise ValueError("No Twilio API key secret stored")

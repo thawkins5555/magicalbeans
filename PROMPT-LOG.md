@@ -634,5 +634,7 @@ Javariius on review.
 
 **Deployment**
 → Thing1 built the backend, Thing2 the dialog; Bob closed the stale-key-SID
-gap. Testy's one full pass plus a headless dialog walk stayed clean;
-Javariius approved, then the branch pushed and main fast-forwarded.
+gap. Testy ran one full pass plus a headless dialog walk. Javariius
+approved with nits (test precision, a mode-switch guard in the dialog, a
+stripped key SID), all closed before the branch was pushed and main
+fast-forwarded.

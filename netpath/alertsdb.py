@@ -587,8 +587,8 @@ def validate_sms_settings(values: dict) -> None:
     account = str(values.get("twilio_account_sid", "") or "").strip()
     if account and not alertmail._ACCOUNT_SID.match(account):
         raise ValueError("Twilio Account SID must be AC followed by 32 hex characters")
-    if "twilio_auth_mode" in values and str(values["twilio_auth_mode"] or "").strip() \
-            not in ("auth_token", "api_key"):
+    if (str(values.get("twilio_auth_mode", "auth_token") or "auth_token").strip()
+            not in ("auth_token", "api_key")):
         raise ValueError("Twilio authentication method must be auth_token or api_key")
     api_key_sid = str(values.get("twilio_api_key_sid", "") or "").strip()
     if api_key_sid and not alertmail._API_KEY_SID.match(api_key_sid):

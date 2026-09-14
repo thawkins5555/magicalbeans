@@ -8026,8 +8026,7 @@ def post_alerts_sms_credential(service, params, body) -> dict:
     try:
         encrypted = _encrypt_secret(token, (
             "This machine cannot encrypt a stored credential — DPAPI is "
-            "Windows-only. A test text can still use a credential typed "
-            "into Test each time; nothing will be saved here."))
+            "Windows-only; nothing will be saved here."))
     finally:
         token = None
     service.alerts_db.set_sms_credential(

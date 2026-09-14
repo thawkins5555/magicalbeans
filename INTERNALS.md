@@ -5881,9 +5881,8 @@ so a value left sitting in the hidden field can never mismatch an
 Auth Token send. `AlertsDatabase.sms_credential_binding()` reads the row
 back as the same shape; `AlertEngine._sms_token()` and
 `post_alerts_sms_test()` both compare `wanted != saved` on that tuple
-rather than the old bare SID equality, and `sms_credential_sid()` is
-kept as-is (it still reads `account_sid` alone) since nothing but the
-old single-column comparison ever called it.
+rather than the old bare SID equality; `sms_credential_sid()` remains
+for callers that only want the Account SID.
 
 ### Reports (`report.py`, `web/api.py`) — 4.49.0
 
