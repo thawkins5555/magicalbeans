@@ -785,6 +785,32 @@ try:
               status == 400 and "API Key SID" in str(payload.get("error", "")),
               (status, payload))
 
+        # Bind the saved settings to the same (mode, Account SID, API Key SID)
+        # as the API key credential stored above, so the test-send calls
+        # below actually exercise the API Key SID element of the binding
+        # instead of tripping over a stale auth_mode/Account SID mismatch.
+        status, payload = call("POST", "/api/settings",
+                               {"scope": "alerts",
+                                "values": {"twilio_auth_mode": "api_key",
+                                          "twilio_account_sid": "AC" + "a" * 32,
+                                          "twilio_api_key_sid": sk_sid}}, token=admin)
+        check("settings can be bound to the stored API key credential's SID",
+              status == 200, (status, payload))
+
+        from netpath import alertmail as alertmail_mod
+        real_send_sms = alertmail_mod.send_sms
+        alertmail_mod.send_sms = lambda *a, **kw: None
+        try:
+            status, payload = call("POST", "/api/alerts/sms/test",
+                                   {"to": "+15550001111", "twilio_auth_mode": "api_key",
+                                    "twilio_account_sid": "AC" + "a" * 32,
+                                    "twilio_api_key_sid": sk_sid}, token=admin)
+            check("a test body matching the saved API key credential's binding "
+                  "is not refused",
+                  status == 200 and payload.get("ok") is True, (status, payload))
+        finally:
+            alertmail_mod.send_sms = real_send_sms
+
         status, payload = call("POST", "/api/alerts/sms/test",
                                {"to": "+15550001111", "twilio_api_key_sid": "SK" + "9" * 32},
                                token=admin)

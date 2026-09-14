@@ -558,6 +558,27 @@ try:
     finally:
         engine._sms.stop()
 
+    # --------------------------------------------------------------- E2g
+    print("\nE2g — settings switched back to auth_token after an api_key "
+          "credential was stored (upgrade-then-switch) sends nothing")
+    nodes, alerts, engine = build_engine(twilio_auth_mode="auth_token")
+    alerts.set_sms_credential(dpapi.protect(b"secret"), SMS_SETTINGS["twilio_account_sid"],
+                              "api_key", sk)
+    engine._sms.start()
+    try:
+        rule = alerts.rule_by_key("device_down")
+        alerts.update_rule(rule["id"], notify_sms=True)
+        dev = add_device(nodes, "10.9.0.27", "sw27")
+        engine._tick()
+        sms_calls.clear()
+        go_down(nodes, dev)
+        engine._tick()
+        engine._sms.wait_idle(10.0)
+        check("a settings mode switched back to auth_token against a stored "
+              "api_key credential sends nothing", not sms_calls, sms_calls)
+    finally:
+        engine._sms.stop()
+
     # --------------------------------------------------------------- E3
     print("\nE3 — sms_min_severity below the alert's severity: no text")
     nodes, alerts, engine = build_engine(sms_min_severity=0)
