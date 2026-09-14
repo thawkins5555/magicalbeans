@@ -555,9 +555,9 @@ try:
           service.nodes_db.interface_counts([]) == {})
 
     labels = service.nodes_db.interface_port_labels_for_devices([dev_a, dev_b])
-    check("interface_port_labels_for_devices returns the four label columns, bounded",
+    check("interface_port_labels_for_devices returns the five label columns, bounded",
           bool(labels) and all(r["device_id"] != dev_c for r in labels)
-          and set(labels[0].keys()) == {"device_id", "if_index", "descr", "alias"},
+          and set(labels[0].keys()) == {"device_id", "if_index", "name", "descr", "alias"},
           [dict(r) for r in labels[:2]])
     check("...and its single-device form agrees with it",
           [dict(r) for r in service.nodes_db.interface_port_labels(dev_a)]
