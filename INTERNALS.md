@@ -5803,8 +5803,7 @@ segment boundary is a hard technical limit (Twilio bills, and some carriers
 silently drop, past one 160-character GSM-7 segment) that a free-form editor
 would only let an operator violate by accident.
 
-**`send_sms()` mirrors `send()`'s shape for the same reasons `MailQueue` mirrors
-`MailQueue`'s.** HTTP Basic auth over `AccountSID:AuthToken` (base64,
+**`send_sms()` mirrors `send()`'s shape, and `SmsQueue` subclasses `MailQueue`.** HTTP Basic auth over `AccountSID:AuthToken` (base64,
 built in-process, never handed to a library that might log it), the request
 built with `urllib.request` and posted through `_RefuseRedirects` — the same
 opener the webhook sender uses — so a Twilio-side 3xx cannot be followed
@@ -5812,13 +5811,12 @@ into an unexpected host. `MessagingServiceSid` is preferred over `From` when
 both are configured, matching Twilio's own precedence, and neither present
 raises before a request is ever sent rather than letting Twilio's own 400
 report it. `_twilio_error_text()` unpacks Twilio's JSON error body
-(`code`/`message`) the way `_smtp_error_text`-equivalent handling surfaces an
-SMTP relay's own rejection text, so a bad Account SID or an unverified
+(`code`/`message`) so a bad Account SID or an unverified
 trial-account destination number reads as Twilio's own words in the
 notification row, not a bare "HTTP 400".
 
 **Validation lives in `alertsdb.validate_sms_settings()`, called from the
-same settings-save path `validate_webhook_settings` already hooks.** Every
+same settings-save path `validate_webhook_url` already hooks.** Every
 number in `sms_to_default` and the `twilio_from` sender are checked against
 `alertmail.is_e164()` (`^\+[1-9][0-9]{7,14}$` — a leading `+`, no leading
 zero, 8–15 digits total); `twilio_account_sid` against `_ACCOUNT_SID`
@@ -5826,7 +5824,7 @@ zero, 8–15 digits total); `twilio_account_sid` against `_ACCOUNT_SID`
 (`MG` + 32 hex). Empty is always fine — an operator clearing a field back
 out is not the case this function exists to catch. A malformed value raises
 `ValueError` before anything is written, the same "refuse at the settings
-boundary, not at send time" discipline `validate_webhook_settings` already
+boundary, not at send time" discipline `validate_webhook_url` already
 established for the webhook URL.
 
 **The Auth Token gets its own single-row table, `sms_credential`
@@ -5842,9 +5840,9 @@ follow `smtp_credential`'s own three functions line for line.
 table (`INTEGER NOT NULL DEFAULT 0` — off by default, unlike `notify`'s own
 default, since a fleet upgrading into 5.19.0 should not suddenly start
 texting about every rule it was only ever emailing about). The system rules
-`_seed_rules()` seeds — including `sms_failing` itself — are never given
-the checkbox: a rule that exists to report a channel's own failure must not
-be able to depend on that same channel to report it.
+`_seed_rules()` seeds — including `sms_failing` itself — have both
+checkboxes ignored by `_notify`: a rule that exists to report a channel's
+own failure must not be able to depend on that same channel to report it.
 
 **`sms_failing` is a system alert with the identical shape `smtp_failing`
 already has**, raised when `SmsQueue`'s breaker opens and cleared when it

@@ -7997,9 +7997,19 @@ def post_alerts_smtp_test(service, params, body) -> dict:
 
 
 def post_alerts_sms_credential(service, params, body) -> dict:
+    """Stores the token bound to an Account SID: the one in the body (the
+    dialog sends what is typed, saved a moment later) or else the saved one."""
+    from .. import alertmail
+
     token = str(body.get("token", ""))
     if not token:
         raise ValueError("A token is required")
+    account_sid = str(body.get(
+        "account_sid", service.alerts_settings.get("twilio_account_sid", "")) or "").strip()
+    if not alertmail._ACCOUNT_SID.match(account_sid):
+        token = None
+        raise ValueError("Enter the Twilio Account SID (AC followed by 32 hex "
+                         "characters) before storing its auth token")
     try:
         encrypted = _encrypt_secret(token, (
             "This machine cannot encrypt a stored credential — DPAPI is "
@@ -8007,7 +8017,7 @@ def post_alerts_sms_credential(service, params, body) -> dict:
             "into Test each time; nothing will be saved here."))
     finally:
         token = None
-    service.alerts_db.set_sms_credential(encrypted)
+    service.alerts_db.set_sms_credential(encrypted, account_sid)
     service.log.add(ALERTS_CATEGORY, "Stored the Twilio auth token")
     _audit(service, params, "credential.store", target="sms")
     return {"ok": True}
@@ -8032,28 +8042,27 @@ def post_alerts_sms_test(service, params, body) -> dict:
         raise ValueError(
             "A destination number in E.164 form (+15551234567) is required")
     settings = dict(service.alerts_settings)
-    sid_changed = ("twilio_account_sid" in body
-                   and str(body["twilio_account_sid"])
-                   != str(settings.get("twilio_account_sid", "")))
     for key in ("twilio_account_sid", "twilio_from",
                "twilio_messaging_service_sid", "sms_timeout_s"):
         if key in body:
             settings[key] = body[key]
     token = body.get("token")
+    blob = service.alerts_db.sms_token_enc() if token is None else None
+    sid_changed = bool(blob) and (
+        str(settings.get("twilio_account_sid", "") or "").strip()
+        != service.alerts_db.sms_credential_sid())
     if token is None and sid_changed:
         raise ValueError(
             "This test changes the Account SID, so it cannot use the saved "
             "auth token: type the token for that account into the test "
             "instead. The saved one is only ever sent with the saved "
             "Account SID.")
-    if token is None:
-        blob = service.alerts_db.sms_token_enc()
-        if blob:
-            try:
-                token = dpapi.unprotect(blob).decode("utf-8")
-            except Exception:
-                token = None
-    else:
+    if token is None and blob:
+        try:
+            token = dpapi.unprotect(blob).decode("utf-8")
+        except Exception:
+            token = None
+    elif token is not None:
         token = str(token)
     text = "SappiWhere test text from the Alerts module"
     try:

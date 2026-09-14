@@ -185,7 +185,8 @@ CREATE TABLE IF NOT EXISTS smtp_credential (
 -- The Twilio auth token, stored the same way for the same reason.
 CREATE TABLE IF NOT EXISTS sms_credential (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    token_enc BLOB
+    token_enc BLOB,
+    account_sid TEXT NOT NULL DEFAULT ''
 );
 
 -- Per-device overrides of a threshold rule's own numbers. Generic over
@@ -1208,6 +1209,7 @@ class AlertsDatabase(SqliteStore):
             self._conn.execute(
                 "UPDATE rules SET for_seconds = 60 WHERE key = 'packet_loss_high'")
         self._migrate_templates()
+        self.ensure_columns("sms_credential", {"account_sid": "TEXT NOT NULL DEFAULT ''"})
         self.ensure_columns("alerts", {
             "last_notified_ts": "REAL",
             "extra_json": "TEXT NOT NULL DEFAULT '{}'",
@@ -1804,19 +1806,22 @@ class AlertsDatabase(SqliteStore):
                 "SELECT password_enc FROM smtp_credential WHERE id = 1").fetchone()
         return bytes(row["password_enc"]) if row and row["password_enc"] else None
 
-    def set_sms_credential(self, token_enc: bytes) -> None:
+    def set_sms_credential(self, token_enc: bytes, account_sid: str = "") -> None:
+        """The token is bound to the Account SID it was saved for; a send
+        under any other SID refuses it (see AlertEngine._sms_token)."""
         with self._lock:
             self._conn.execute(
-                "INSERT INTO sms_credential(id, token_enc) VALUES (1, ?)"
-                " ON CONFLICT(id) DO UPDATE SET token_enc=excluded.token_enc",
-                (token_enc,))
+                "INSERT INTO sms_credential(id, token_enc, account_sid) VALUES (1, ?, ?)"
+                " ON CONFLICT(id) DO UPDATE SET token_enc=excluded.token_enc,"
+                " account_sid=excluded.account_sid",
+                (token_enc, str(account_sid or "").strip()))
             self._commit_durable()
 
     def clear_sms_credential(self) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT INTO sms_credential(id, token_enc) VALUES (1, NULL)"
-                " ON CONFLICT(id) DO UPDATE SET token_enc=NULL")
+                "INSERT INTO sms_credential(id, token_enc, account_sid) VALUES (1, NULL, '')"
+                " ON CONFLICT(id) DO UPDATE SET token_enc=NULL, account_sid=''")
             self._conn.commit()
 
     def sms_token_enc(self) -> bytes | None:
@@ -1824,6 +1829,12 @@ class AlertsDatabase(SqliteStore):
             row = self._conn.execute(
                 "SELECT token_enc FROM sms_credential WHERE id = 1").fetchone()
         return bytes(row["token_enc"]) if row and row["token_enc"] else None
+
+    def sms_credential_sid(self) -> str:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT account_sid FROM sms_credential WHERE id = 1").fetchone()
+        return str(row["account_sid"] or "") if row else ""
 
     # ------------------------------------------------------------------ rules
 

@@ -1640,7 +1640,7 @@
         <td>${escape(num)}</td>
         <td><button type="button" class="as-sms-to-remove" data-index="${index}">Remove</button></td>
       </tr>`).join('');
-    return `<table><caption class="sr-only">Alert details</caption><tbody>${rows}</tbody></table>`;
+    return `<table><caption class="sr-only">Text message numbers</caption><tbody>${rows}</tbody></table>`;
   }
 
   function settingsDialog() {
@@ -1796,13 +1796,10 @@
         const payload = { to };
         const token = (box.querySelector('#as-twilio-token') || {}).value || '';
         if (token) payload.token = token;
-        const sid = box.querySelector('#as-twilio-sid').value.trim();
-        if (sid !== (s.twilio_account_sid || '')) {
-          payload.twilio_account_sid = sid;
-          payload.twilio_from = box.querySelector('#as-twilio-from').value.trim();
-          payload.twilio_messaging_service_sid =
-            box.querySelector('#as-twilio-msid').value.trim();
-        }
+        payload.twilio_account_sid = box.querySelector('#as-twilio-sid').value.trim();
+        payload.twilio_from = box.querySelector('#as-twilio-from').value.trim();
+        payload.twilio_messaging_service_sid =
+          box.querySelector('#as-twilio-msid').value.trim();
         return App.runJob(button, { queued: 'Sending…', done: 'Sent' },
           App.post('/api/alerts/sms/test', payload).then((result) => {
             if (!result.ok) throw new Error(result.error || 'not sent');
@@ -1824,7 +1821,9 @@
         const smsToken = (box.querySelector('#as-twilio-token') || {}).value || '';
         if (smsToken) {
           try {
-            await App.post('/api/alerts/sms/credential', { token: smsToken });
+            await App.post('/api/alerts/sms/credential', {
+              token: smsToken,
+              account_sid: box.querySelector('#as-twilio-sid').value.trim() });
           } catch (error) {
             box.querySelector('#as-sms-cred-status').textContent = error.message;
             throw error;

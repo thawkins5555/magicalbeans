@@ -707,8 +707,24 @@ try:
     if dpapi.available():
         status, payload = call("POST", "/api/alerts/sms/credential",
                                {"token": "AuthToken123"}, token=admin)
-        check("storing a Twilio auth token is accepted",
+        check("storing a token with no account_sid in the body binds it to the saved SID",
+              status == 200 and service.alerts_db.sms_credential_sid() == "AC" + "0" * 32,
+              (status, payload, service.alerts_db.sms_credential_sid()))
+        status, payload = call("POST", "/api/alerts/sms/test",
+                               {"to": "+15550001111",
+                                "twilio_account_sid": "AC" + "1" * 32},
+                               token=admin)
+        check("changing the Account SID without a typed token is refused",
+              status == 400
+              and "cannot use the saved" in str(payload.get("error", "")),
+              (status, payload))
+        status, payload = call("POST", "/api/alerts/sms/credential",
+                               {"token": "AuthToken123", "account_sid": "AC" + "a" * 32},
+                               token=admin)
+        check("storing a Twilio auth token with its Account SID is accepted",
               status == 200 and payload.get("ok") is True, (status, payload))
+        check("...bound to that SID",
+              service.alerts_db.sms_credential_sid() == "AC" + "a" * 32)
 
         # The settings route caches service.alerts_settings; has_sms_credential
         # is computed fresh by alerts_db.settings(), so read that directly
@@ -735,15 +751,6 @@ try:
                            {"to": "not-a-number"}, token=admin)
     check("a badly formed destination number is a 400",
           status == 400 and "E.164" in str(payload.get("error", "")),
-          (status, payload))
-
-    status, payload = call("POST", "/api/alerts/sms/test",
-                           {"to": "+15550001111",
-                            "twilio_account_sid": "AC" + "1" * 32},
-                           token=admin)
-    check("changing the Account SID without a typed token is refused",
-          status == 400
-          and "cannot use the saved" in str(payload.get("error", "")),
           (status, payload))
 
     from netpath import alertmail as alertmail_mod

@@ -210,6 +210,7 @@ class AlertEngine(Worker):
         self._sms = alertmail.SmsQueue(on_result=self._sms_result,
                                        on_breaker=self._sms_breaker)
         self._sms_sent_this_hour: list[float] = []
+        self._sms_sid_mismatch_logged = False
         self._sms_suppression_logged_hour: int | None = None
         # Occurrences raised by the application about itself (the mail path,
         # the poll pool) rather than read from a source. Appended from any
@@ -3087,6 +3088,7 @@ class AlertEngine(Worker):
             self.db.record_notification(
                 alert_row["id"], sms_kind, "", "", False,
                 f"not sent: over the {max_per_hour}/hour text limit")
+            self.db.mark_notified(alert_row["id"], now)
             if self._sms_suppression_logged_hour != current_hour:
                 self._sms_suppression_logged_hour = current_hour
                 self.log.add(ERROR, f"Alert text volume over {max_per_hour}/hour — "
@@ -3095,7 +3097,7 @@ class AlertEngine(Worker):
         numbers = self._sms_numbers(settings)
         if not numbers:
             return
-        token = self._sms_token()
+        token = self._sms_token(settings)
         if not token:
             return
         extra = dict(occurrence.extra)
@@ -3122,10 +3124,22 @@ class AlertEngine(Worker):
             return [a.strip() for a in raw_to.split(",") if a.strip()]
         return [str(a).strip() for a in raw_to if str(a).strip()]
 
-    def _sms_token(self) -> str | None:
+    def _sms_token(self, settings) -> str | None:
+        """The stored token, only when the configured Account SID is the
+        one it was saved for; a mismatch is logged once and sends nothing."""
         blob = self.db.sms_token_enc()
         if not blob:
             return None
+        wanted = str(settings.get("twilio_account_sid", "") or "").strip()
+        saved = self.db.sms_credential_sid()
+        if wanted != saved:
+            if not self._sms_sid_mismatch_logged:
+                self._sms_sid_mismatch_logged = True
+                self.log.add(ERROR, "The stored Twilio auth token was saved for a "
+                                    "different Account SID; texts are not being sent "
+                                    "until the token is re-entered")
+            return None
+        self._sms_sid_mismatch_logged = False
         try:
             from . import dpapi
             return dpapi.unprotect(blob).decode("utf-8")
@@ -3591,7 +3605,7 @@ class AlertEngine(Worker):
         numbers = self._sms_numbers(settings)
         if not numbers:
             return
-        token = self._sms_token()
+        token = self._sms_token(settings)
         if not token:
             return
         minutes = max(1, round(delay_s / 60.0))

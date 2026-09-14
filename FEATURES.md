@@ -2243,9 +2243,10 @@ hard to trip — a path monitor that cries wolf gets turned off.
   switch and its own budget. The per-rule **Send email for this rule**
   checkbox is still there and still silences one rule at every severity.
   A second checkbox, **Send a text (SMS) for this rule**, sits beside it
-  and does the same for texting — off by default, and never offered on
-  the system rules (`smtp_failing`, `sms_failing` and the like), which
-  would otherwise be able to text about their own channel failing.
+  and does the same for texting — off by default, and ignored (like the
+  email one) on the system rules (`smtp_failing`, `sms_failing` and the
+  like), which would otherwise be able to text about their own channel
+  failing.
 - **Email over the standard library's `smtplib`** — none, STARTTLS or
   SSL/TLS, with or without certificate verification (turning verification
   off is a deliberate, explicit opt-out, never a silent downgrade). A

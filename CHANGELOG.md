@@ -159,7 +159,7 @@ this rule** checkbox now has a sibling, **Send a text (SMS) for this
 rule** (`rules.notify_sms`), defaulting to off so an upgrading fleet does
 not suddenly start texting about everything it was only ever emailing
 about. The system rules — `smtp_failing`, the new `sms_failing` among
-them — never offer the checkbox: a rule reporting a channel's own failure
+them — ignore both checkboxes: a rule reporting a channel's own failure
 cannot depend on that channel to report it.
 
 **Settings → Alerts gains a TEXT MESSAGES (TWILIO) section.** On/off
@@ -203,7 +203,7 @@ SMS cannot report on SMS being down.
 failed)", once the first text has gone, beside the existing email count.
 
 Files: `alertmail.py`, `alertsdb.py`, `alertengine.py`, `web/api.py`,
-`alerts.js`, `rules.js`.
+`web/server.py`, `alerts.js`.
 
 Verification: (filled after the suite and walk)
 

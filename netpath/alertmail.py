@@ -831,7 +831,7 @@ def sms_text(tag: str, rule_name: str, entity_label: str, message: str,
         text = f"{text}: {body}" if text else body
     text = " ".join(text.split())
     if len(text) > limit:
-        text = text[:max(0, limit - 1)].rstrip() + "\u2026"
+        text = text[:max(0, limit - 3)].rstrip() + "..."
     return text
 
 
@@ -840,6 +840,8 @@ def send_sms(settings: dict, token: str | None, to_number: str, text: str) -> No
     account_sid = str(settings.get("twilio_account_sid", "") or "").strip()
     if not account_sid:
         raise ValueError("No Twilio Account SID configured")
+    if not _ACCOUNT_SID.match(account_sid):
+        raise ValueError("Twilio Account SID must be AC followed by 32 hex characters")
     if not token:
         raise ValueError("No Twilio auth token stored")
     if not is_e164(to_number):
@@ -912,7 +914,9 @@ class SmsJob:
 
 class SmsQueue(MailQueue):
     """MailQueue's worker, bounded queue and breaker, delivering SmsJobs:
-    one Twilio call per number, the job failed on the first error."""
+    one Twilio call per number, every number attempted. The job is ok
+    when any number was delivered; only a job with no delivery at all
+    counts toward the breaker."""
 
     THREAD_NAME = "alert-sms"
     breaker_error = SMS_BREAKER_ERROR
@@ -923,18 +927,20 @@ class SmsQueue(MailQueue):
             job.token = None
             self._finish(job, False, blocked)
             return
-        try:
-            for number in list(job.to_numbers):
-                try:
-                    send_sms(job.settings, job.token, number, job.text)
-                except Exception as exc:
-                    raise ValueError(
-                        f"{number}: {str(exc) or exc.__class__.__name__}") from None
-        except Exception as exc:
-            job.token = None
-            self._record_failure(str(exc))
-            self._finish(job, False, str(exc))
-        else:
-            job.token = None
+        errors = []
+        delivered = 0
+        for number in list(job.to_numbers):
+            try:
+                send_sms(job.settings, job.token, number, job.text)
+            except Exception as exc:
+                errors.append(f"{number}: {str(exc) or exc.__class__.__name__}")
+            else:
+                delivered += 1
+        job.token = None
+        error = "; ".join(errors)
+        if delivered:
             self._record_success()
-            self._finish(job, True, "")
+            self._finish(job, True, error)
+        else:
+            self._record_failure(error or "no numbers")
+            self._finish(job, False, error or "no numbers")

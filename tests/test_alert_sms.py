@@ -40,7 +40,9 @@ check("sms_text is one line: [TAG] rule - entity: message",
       text == "[CRITICAL] Device not responding - acc-sw-070: No reply to 5 polls in a row", text)
 long = alertmail.sms_text("[X]", "r" * 100, "e" * 100, "m" * 100)
 check("a long text is cut to one 160-character segment",
-      len(long) == 160 and long.endswith("…"), (len(long), long[-3:]))
+      len(long) == 160 and long.endswith("..."), (len(long), long[-3:]))
+check("...using GSM-7 characters only, so the cut text stays one segment",
+      all(ord(c) < 128 for c in long), long)
 check("no tag and no entity still reads sensibly",
       alertmail.sms_text("", "Rule", "", "msg") == "Rule: msg",
       alertmail.sms_text("", "Rule", "", "msg"))
@@ -101,6 +103,7 @@ try:
           and "From" not in SEEN[-1]["form"], SEEN[-1]["form"])
 
     for bad, name in (({**BASE, "twilio_account_sid": ""}, "no Account SID"),
+                      ({**BASE, "twilio_account_sid": "../x"}, "a malformed Account SID"),
                       ({**BASE, "twilio_from": ""}, "no From and no Messaging Service")):
         try:
             alertmail.send_sms(bad, "tok", "+15551234567", "x")
@@ -150,7 +153,7 @@ breaker = []
 
 def fake_send_sms(settings, token, to_number, text):
     calls.append((to_number, text, token))
-    if text.startswith("fail"):
+    if text.startswith("fail") or to_number == "+15550009999":
         raise ValueError("boom")
 
 
@@ -170,6 +173,17 @@ try:
           results and results[-1][1] is True and job.token is None, results[-1:])
     check("SmsJob exposes to_addrs/subject for the shared result writer",
           job.to_addrs == job.to_numbers and job.subject == "hello")
+    calls.clear()
+    q.submit(alertmail.SmsJob(settings=dict(BASE), token="tok",
+                              to_numbers=["+15550009999", "+15557654321"],
+                              text="hello", alert_id=9))
+    q.wait_idle(3)
+    check("a bad first number does not stop the second from being texted",
+          [c[0] for c in calls] == ["+15550009999", "+15557654321"], calls)
+    check("...the job is ok with the failed number named in the error",
+          results[-1][1] is True and results[-1][2] == "+15550009999: boom", results[-1][1:])
+    check("...and a per-number failure does not count toward the breaker",
+          not breaker and q._failures == 0, (breaker, q._failures))
     for _ in range(2):
         q.submit(alertmail.SmsJob(settings=dict(BASE), token="tok",
                                   to_numbers=["+15551234567"], text="fail", alert_id=2))
@@ -225,11 +239,14 @@ except ValueError:
     check("save_settings refuses a bad SMS number", True)
 db.save_settings({"sms_to_default": ["+15551234567"], "sms_enabled": True})
 check("...and stores a good one", db.settings()["sms_to_default"] == ["+15551234567"])
-db.set_sms_credential(b"blob")
+db.set_sms_credential(b"blob", "AC" + "c" * 32)
 check("the token blob is stored in its own table and flagged in settings",
       db.sms_token_enc() == b"blob" and db.settings()["has_sms_credential"] is True)
+check("...bound to the Account SID it was saved for",
+      db.sms_credential_sid() == "AC" + "c" * 32, db.sms_credential_sid())
 db.clear_sms_credential()
-check("...and cleared", db.sms_token_enc() is None and not db.settings()["has_sms_credential"])
+check("...and cleared", db.sms_token_enc() is None and not db.settings()["has_sms_credential"]
+      and db.sms_credential_sid() == "")
 rule = db.rule_by_key("device_down")
 check("every rule carries notify_sms, off by default", rule["notify_sms"] == 0)
 db.update_rule(rule["id"], notify_sms=True)
@@ -260,7 +277,7 @@ def build_engine(**settings):
     values = dict(SMS_SETTINGS)
     values.update(settings)
     alerts.save_settings(values)
-    alerts.set_sms_credential(dpapi.protect(b"tok"))
+    alerts.set_sms_credential(dpapi.protect(b"tok"), values["twilio_account_sid"])
     snmp = SnmpTrapDatabase(os.path.join(folder, "traps.db"))
     syslog = SyslogDatabase(os.path.join(folder, "syslog.db"))
     ipam = IpamDatabase(os.path.join(folder, "ipam.db"))
@@ -351,6 +368,67 @@ try:
         engine._tick()
         engine._sms.wait_idle(10.0)
         check("email off for the rule, SMS still sent", len(sms_calls) == 1, sms_calls)
+    finally:
+        engine._sms.stop()
+
+    # -------------------------------------------------------------- E2b
+    print("\nE2b — an SMS-only rule never emails or webhooks, even with both on")
+    real_send = alertmail.send
+    real_webhook = alertmail.send_webhook
+    mails, hooks = [], []
+    alertmail.send = lambda *a, **kw: mails.append(a)
+    alertmail.send_webhook = lambda *a, **kw: hooks.append(a)
+    nodes, alerts, engine = build_engine(
+        email_enabled=True, smtp_host="relay.example", smtp_to_default=["ops@example.com"],
+        webhook_enabled=True, webhook_url="https://hooks.example.com/x",
+        notify_on_clear=True)
+    engine._sms.start()
+    engine._mail.start()
+    engine._webhook.start()
+    try:
+        rule = alerts.rule_by_key("device_down")
+        alerts.update_rule(rule["id"], notify=False, notify_sms=True)
+        up_rule = alerts.rule_by_key("device_up")
+        alerts.update_rule(up_rule["id"], notify=False, notify_sms=False)
+        dev = add_device(nodes, "10.9.0.22", "sw22")
+        engine._tick()
+        sms_calls.clear()
+        go_down(nodes, dev)
+        engine._tick()
+        come_up(nodes, dev)
+        engine._tick()
+        engine._sms.wait_idle(10.0)
+        engine._mail.wait_idle(5.0)
+        engine._webhook.wait_idle(5.0)
+        check("the SMS-only rule texted the open and the clear",
+              len(sms_calls) == 2, sms_calls)
+        check("...and sent no email and no webhook", not mails and not hooks,
+              (len(mails), len(hooks)))
+    finally:
+        engine._sms.stop()
+        engine._mail.stop()
+        engine._webhook.stop()
+        alertmail.send = real_send
+        alertmail.send_webhook = real_webhook
+
+    # -------------------------------------------------------------- E2c
+    print("\nE2c — a token saved for another Account SID is never sent")
+    nodes, alerts, engine = build_engine()
+    alerts.set_sms_credential(dpapi.protect(b"tok"), "AC" + "f" * 32)
+    engine._sms.start()
+    try:
+        rule = alerts.rule_by_key("device_down")
+        alerts.update_rule(rule["id"], notify_sms=True)
+        dev = add_device(nodes, "10.9.0.23", "sw23")
+        engine._tick()
+        sms_calls.clear()
+        go_down(nodes, dev)
+        engine._tick()
+        engine._sms.wait_idle(10.0)
+        check("no text goes out with a token bound to a different SID",
+              not sms_calls, sms_calls)
+        check("...and the reason is logged once",
+              engine._sms_sid_mismatch_logged is True)
     finally:
         engine._sms.stop()
 
