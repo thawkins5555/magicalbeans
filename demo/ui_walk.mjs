@@ -1048,7 +1048,10 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
     await page.waitForSelector('#modal:not([hidden]) #ar-name', { timeout: 10000 });
     await settle(page, 400);
     await shoot(page, dir, shot('dlg', 'alert-rule'));
-    return 'opened';
+    // 5.19.0: the SMS checkbox sits beside the email one.
+    const smsBox = page.locator('#modal:not([hidden]) #ar-notify-sms');
+    if (!(await smsBox.count())) throw new Error('#ar-notify-sms missing from the rule editor');
+    return 'opened; ar-notify-sms present';
   });
   await closeAnyModal(page);
 
@@ -1064,6 +1067,15 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
       await page.waitForSelector('#modal:not([hidden])', { timeout: 8000 });
       await settle(page, 400);
       await shoot(page, dir, shot('dlg', `settings-${tab}`));
+      if (tab === 'alerts') {
+        // 5.19.0: the TEXT MESSAGES (TWILIO) fieldset.
+        for (const id of ['#as-sms', '#as-twilio-sid', '#as-sms-to-add', '#as-testsms']) {
+          if (!(await page.locator(`#modal:not([hidden]) ${id}`).count())) {
+            throw new Error(`${id} missing from the Alerts settings dialog`);
+          }
+        }
+        return 'opened; Twilio fieldset present';
+      }
       return 'opened';
     });
     await closeAnyModal(page);

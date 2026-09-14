@@ -205,7 +205,21 @@ failed)", once the first text has gone, beside the existing email count.
 Files: `alertmail.py`, `alertsdb.py`, `alertengine.py`, `web/api.py`,
 `web/server.py`, `alerts.js`.
 
-Verification: (filled after the suite and walk)
+Verification: `tests/test_alert_sms.py` (sender, queue, storage and eight
+engine sections), `test_alerts_api.py`, `test_alert_engine.py`,
+`test_alert_webhook.py`, `test_alert_notify_rollup.py`,
+`test_frontend_contracts.py` and `test_web_security.py` pass alone; the
+full suite once, detached: 158/164 with only the six known environmental
+failures (ipam_dhcp_temp, palo_alto_polling, selfupdate_job,
+service_shutdown, snmpv3_diagnostics, temppath). Browser walk of 60
+devices: 914 ok / 45 skipped / 0 failed, the rule editor shows
+`#ar-notify-sms` and the Alerts settings dialog shows the TEXT MESSAGES
+(TWILIO) fieldset for the admin and NOC accounts, console clean apart
+from the viewer/NOC 403s. Javariius reviewed the combined diff (CHANGES
+REQUIRED, then APPROVE after the SID binding, all-numbers delivery and
+ASCII truncation fixes). Note for any pre-release install that stored a
+token before the SID binding existed: the token carries an empty bound
+SID and texting stops with one logged line until it is re-entered.
 
 ### 5.18.0 — Port names, device names everywhere, IPAM in-use rows, MIB auto-assign, chart ranges, mapper drawing and matching
 
