@@ -735,8 +735,11 @@ _OVERRIDE_COLUMNS = ("snmp_version", "community", "v3_user", "v3_auth_proto",
 # These two are cleared to "" rather than NULL, so "" is also "inherit".
 _EMPTY_IS_UNSET = frozenset(("vendor_oid", "location_oid"))
 
+# A MIB the poller picked itself (mib_file_auto = 1) is not an override.
 _OVERRIDES_SQL = "(" + " OR ".join(
     f"({col} IS NOT NULL AND {col} != '')" if col in _EMPTY_IS_UNSET
+    else "(mib_file_id IS NOT NULL AND COALESCE(mib_file_auto, 0) = 0)"
+    if col == "mib_file_id"
     else f"{col} IS NOT NULL" for col in _OVERRIDE_COLUMNS) + ")"
 
 
@@ -750,6 +753,8 @@ def override_fields(row) -> tuple[str, ...]:
             continue
         value = row[col]
         if value is None or (value == "" and col in _EMPTY_IS_UNSET):
+            continue
+        if col == "mib_file_id" and "mib_file_auto" in keys and row["mib_file_auto"]:
             continue
         out.append(col)
     return tuple(out)
@@ -770,7 +775,7 @@ _GROUP_EDITABLE = ("name", "snmp_version", "community", "v3_user",
 _DEVICE_ONLY_COLUMNS = ("web_scheme", "web_port")
 
 _DEVICE_EDITABLE = (("name", "group_id", "device_group_id", "display_name_source",
-                     "enabled", "vendor_override", "upstream_id")
+                     "enabled", "vendor_override", "upstream_id", "mib_file_auto")
                     + _OVERRIDE_COLUMNS + _DEVICE_ONLY_COLUMNS)
 
 
@@ -1107,6 +1112,9 @@ class NodesDatabase(SqliteStore):
             # explanation, and which sysObjectID it was worked out for — so
             # the walk runs again only when the identity changes.
             "vendor_override": "TEXT",
+            # 1 when _auto_assign_mib chose mib_file_id; 0/NULL when an
+            # operator did. Any write of mib_file_id resets it to 0.
+            "mib_file_auto": "INTEGER",
             "vendor_confidence": "TEXT",
             "vendor_evidence": "TEXT",
             "identified_ts": "REAL",
@@ -1141,6 +1149,7 @@ class NodesDatabase(SqliteStore):
         })
 
         self.ensure_columns("interfaces", {
+            "name": "TEXT",                     # ifName
             "last_in_errors": "INTEGER",
             "last_out_errors": "INTEGER",
             # ifInDiscards/ifOutDiscards: congested rather than broken.
@@ -2122,7 +2131,7 @@ class NodesDatabase(SqliteStore):
         return counts
 
     def interface_port_labels_for_devices(self, device_ids) -> list[sqlite3.Row]:
-        """(device_id, if_index, descr, alias) for named devices — the four
+        """(device_id, if_index, name, descr, alias) for named devices — the
         columns a port LABEL needs. Prefills api._neighbor_local_port_labeler's
         cache in one query instead of one per device."""
         ids = list(dict.fromkeys(int(d) for d in device_ids))
@@ -2133,7 +2142,7 @@ class NodesDatabase(SqliteStore):
             for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
                 marks = ",".join("?" * len(chunk))
                 rows += self._conn.execute(
-                    "SELECT device_id, if_index, descr, alias FROM interfaces"
+                    "SELECT device_id, if_index, name, descr, alias FROM interfaces"
                     f" WHERE device_id IN ({marks}) ORDER BY device_id, if_index",
                     chunk).fetchall()
         return rows
@@ -2225,6 +2234,8 @@ class NodesDatabase(SqliteStore):
         _drop_priv_with_proto(allowed)
         if "community" in allowed:
             allowed["community"] = clean_community(allowed["community"])
+        if "mib_file_id" in allowed and "mib_file_auto" not in allowed:
+            allowed["mib_file_auto"] = 0
         if not allowed:
             return
         clauses = ", ".join(f"{key} = ?" for key in allowed)
@@ -4251,23 +4262,25 @@ class NodesDatabase(SqliteStore):
                     added.append(if_index)
                     inserts.append(
                         (device_id, if_index, row.get("descr"), row.get("alias"),
+                         row.get("name") or None,
                          row.get("phys_addr"), row.get("speed_bps"),
                          row.get("admin_status"), row.get("oper_status"), now))
                 else:
                     if prior["descr"] != row.get("descr"):
                         reindexed.append(if_index)
                     updates.append(
-                        (row.get("descr"), row.get("alias"), row.get("phys_addr"),
+                        (row.get("descr"), row.get("alias"), row.get("name") or None,
+                         row.get("phys_addr"),
                          row.get("speed_bps"), row.get("admin_status"),
                          row.get("oper_status"), now, device_id, if_index))
             if inserts:
                 self._conn.executemany(
                     "INSERT INTO interfaces(device_id, if_index, descr, alias,"
-                    " phys_addr, speed_bps, admin_status, oper_status,"
-                    " last_seen_ts) VALUES (?,?,?,?,?,?,?,?,?)", inserts)
+                    " name, phys_addr, speed_bps, admin_status, oper_status,"
+                    " last_seen_ts) VALUES (?,?,?,?,?,?,?,?,?,?)", inserts)
             if updates:
                 self._conn.executemany(
-                    "UPDATE interfaces SET descr=?, alias=?, phys_addr=?,"
+                    "UPDATE interfaces SET descr=?, alias=?, name=?, phys_addr=?,"
                     " speed_bps=?, admin_status=?, oper_status=?, last_seen_ts=?"
                     " WHERE device_id=? AND if_index=?", updates)
             if allow_delete:
@@ -5122,8 +5135,8 @@ class NodesDatabase(SqliteStore):
         self.mib_db.remove_mib_file(mib_file_id)
         with self._lock:
             self._conn.execute(
-                "UPDATE devices SET mib_file_id = NULL WHERE mib_file_id = ?",
-                (mib_file_id,))
+                "UPDATE devices SET mib_file_id = NULL, mib_file_auto = NULL"
+                " WHERE mib_file_id = ?", (mib_file_id,))
             self._conn.execute(
                 "UPDATE groups SET mib_file_id = NULL WHERE mib_file_id = ?",
                 (mib_file_id,))

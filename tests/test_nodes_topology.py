@@ -95,7 +95,8 @@ try:
     # Each device's own port the reciprocal LLDP walk saw, so nodesdb's
     # chassis-MAC join can resolve BOTH directions to a real device id.
     db.replace_interfaces(core_id, [
-        {"if_index": 1, "descr": "Gi0/1", "phys_addr": "aa:aa:aa:aa:aa:01"},
+        {"if_index": 1, "descr": "GigabitEthernet0/1", "name": "Gi0/1",
+         "phys_addr": "aa:aa:aa:aa:aa:01"},
         {"if_index": 2, "descr": "Gi0/2"}])
     db.replace_interfaces(edge_id, [
         {"if_index": 1, "descr": "Gi0/1", "phys_addr": "bb:bb:bb:bb:bb:01"}])
@@ -137,6 +138,8 @@ try:
     rows = payload.get("neighbors", [])
     check("both of core's neighbour rows come back", len(rows) == 2, rows)
     matched = next((r for r in rows if r["if_index"] == 1), None)
+    check("the local port label is the short ifName, not ifDescr",
+          matched is not None and matched["local_port"] == "Gi0/1", matched)
     check("the matched row carries matched_device_id/name and a local port label",
           matched is not None and matched["matched_device_id"] == edge_id
           and matched["matched_device_name"] == "edge-sw-1"

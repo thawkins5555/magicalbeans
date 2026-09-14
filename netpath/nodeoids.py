@@ -49,6 +49,7 @@ IF_TABLE = {
     "if_out_discards": "1.3.6.1.2.1.2.2.1.19",
 }
 IFX_TABLE = {   # ifXTable, preferred when present (RFC 2863)
+    "if_name":          "1.3.6.1.2.1.31.1.1.1.1",    # Gi1/0/10 form
     "if_alias":         "1.3.6.1.2.1.31.1.1.1.18",
     "if_high_speed":    "1.3.6.1.2.1.31.1.1.1.15",   # Mbps, use *1e6 over if_speed
     "if_hc_in_octets":  "1.3.6.1.2.1.31.1.1.1.6",    # 64-bit
@@ -218,10 +219,10 @@ IP_NET_TO_MEDIA_TYPE_ENUM = {1: "other", 2: "invalid", 3: "dynamic", 4: "static"
 # shared index suffix in nodepoll._run_lldp_table.
 #
 # lldpRemLocalPortNum is NOT necessarily an ifIndex: RFC 802.1AB maps a
-# local port to lldpLocPortTable, not to ifIndex. Nearly every agent this
-# app polls numbers them identically, so the identity is used directly
-# rather than resolving that table. A device that numbers them differently
-# stores neighbours against the wrong local port rather than not at all.
+# local port to lldpLocPortTable, so nodepoll._walk_lldp_local_ports reads
+# that table and maps each local port number onto the interface it names
+# (a numeric "local" port id, or an ifName/ifDescr match); a port it
+# cannot place keeps the number as its ifIndex, the pre-5.18.0 behaviour.
 LLDP_REM_CHASSIS_ID_SUBTYPE = "1.0.8802.1.1.2.1.4.1.1.4"
 LLDP_REM_CHASSIS_ID         = "1.0.8802.1.1.2.1.4.1.1.5"
 LLDP_REM_PORT_ID_SUBTYPE    = "1.0.8802.1.1.2.1.4.1.1.6"
@@ -237,6 +238,11 @@ LLDP_REM_SYS_DESC           = "1.0.8802.1.1.2.1.4.1.1.10"
 # above share, so it is walked and parsed separately in nodepoll._walk_lldp
 # and joined back on its leading timeMark.localPort.remIndex.
 LLDP_REM_MAN_ADDR_IF_SUBTYPE = "1.0.8802.1.1.2.1.4.2.1.3"
+
+# lldpLocPortTable, indexed by lldpLocPortNum alone.
+LLDP_LOC_PORT_ID_SUBTYPE = "1.0.8802.1.1.2.1.3.7.1.2"
+LLDP_LOC_PORT_ID         = "1.0.8802.1.1.2.1.3.7.1.3"
+LLDP_LOC_PORT_DESC       = "1.0.8802.1.1.2.1.3.7.1.4"
 
 # lldpRemChassisIdSubtype's enumeration — needed to tell "this chassis id is
 # a MAC address" (4, the common case, joinable against an interface's

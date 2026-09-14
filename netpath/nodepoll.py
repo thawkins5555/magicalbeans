@@ -4516,7 +4516,7 @@ class NodePoller(Worker):
         device-level auto-assignment layered over a group whose MIB was
         chosen by hand would BEAT that choice. Hence the effective
         (device-or-group) value is what is checked, not the device column.
-        It is an ordinary override afterwards.
+        mib_file_auto marks the pick so it is not counted as an override.
         """
         device = self.db.device(device_id)
         if device is None:
@@ -4533,7 +4533,7 @@ class NodePoller(Worker):
             mib_file_id = self.db.mib_file_covering(sys_object_id)
         if mib_file_id is None:
             return
-        self.db.update_device(device_id, mib_file_id=mib_file_id)
+        self.db.update_device(device_id, mib_file_id=mib_file_id, mib_file_auto=1)
         mib = self.db.mib_file(mib_file_id)
         name = (mib["module"] if mib and mib["module"] else
                 (mib["filename"] if mib else str(mib_file_id)))
@@ -4995,6 +4995,7 @@ class NodePoller(Worker):
                 rows.append({
                     "if_index": if_index,
                     "descr": _val(nodeoids.IF_TABLE, "if_descr") or "",
+                    "name": _val(nodeoids.IFX_TABLE, "if_name") or "",
                     "alias": _val(nodeoids.IFX_TABLE, "if_alias") or "",
                     "phys_addr": (_val(nodeoids.IF_TABLE, "if_phys_addr") or ""),
                     "speed_bps": speed_bps,
@@ -7587,6 +7588,7 @@ class NodePoller(Worker):
         # simply has no management address configured must not mark the
         # whole pass incomplete or blank every row.
         man_addrs = self._walk_lldp_man_addrs(device, config, deadline)
+        port_map = self._walk_lldp_local_ports(device, config, deadline)
         suffixes: set = set()
         for column in values.values():
             suffixes.update(column)
@@ -7601,7 +7603,7 @@ class NodePoller(Worker):
                 continue
             chassis_subtype = values["chassis_id_subtype"].get(suffix)
             entries.append({
-                "if_index": local_port,
+                "if_index": port_map.get(local_port, local_port),
                 "protocol": "lldp",
                 "rem_index": suffix,
                 "chassis_id": str(values["chassis_id"].get(suffix) or ""),
@@ -7668,6 +7670,50 @@ class NodePoller(Worker):
             elif existing[0] != 1 and addr_subtype == 1:
                 by_key[key] = (addr_subtype, address)   # an IPv4 always wins
         return {key: address for key, (_, address) in by_key.items()}
+
+    def _walk_lldp_local_ports(self, device, config: dict,
+                               deadline: float | None = None) -> dict:
+        """lldpLocPortNum -> ifIndex from lldpLocPortTable, for the ports the
+        table lets us place: a numeric port id that is a known ifIndex, or a
+        port id / port description equal (after _canonical_if_name) to a
+        stored interface's ifName or ifDescr. Anything else is left out so
+        the caller keeps the port number itself."""
+        columns = {}
+        for key, oid in (("subtype", nodeoids.LLDP_LOC_PORT_ID_SUBTYPE),
+                         ("port_id", nodeoids.LLDP_LOC_PORT_ID),
+                         ("desc", nodeoids.LLDP_LOC_PORT_DESC)):
+            try:
+                columns[key], _ = self._walk_column_status(
+                    device, config, oid, deadline=deadline)
+            except SnmpError:
+                columns[key] = {}
+        if not columns["port_id"] and not columns["desc"]:
+            return {}
+        by_name: dict[str, int] = {}
+        known: set[int] = set()
+        for row in self.db.interface_port_labels(device["id"]):
+            known.add(row["if_index"])
+            for text in (row["name"], row["descr"]):
+                canon = _canonical_if_name(text or "")
+                if canon and canon not in by_name:
+                    by_name[canon] = row["if_index"]
+        port_map: dict[int, int] = {}
+        for suffix in set(columns["port_id"]) | set(columns["desc"]):
+            try:
+                local_port = int(suffix.split(".")[-1])
+            except ValueError:
+                continue
+            port_id = str(columns["port_id"].get(suffix) or "").strip()
+            desc = str(columns["desc"].get(suffix) or "").strip()
+            target = None
+            if port_id.isdigit() and (not known or int(port_id) in known):
+                target = int(port_id)
+            for text in (port_id, desc):
+                if target is None and text:
+                    target = by_name.get(_canonical_if_name(text))
+            if target is not None and target != local_port:
+                port_map[local_port] = target
+        return port_map
 
     def _walk_cdp(self, device, config: dict,
                   deadline: float | None = None) -> tuple:

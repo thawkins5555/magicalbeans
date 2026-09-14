@@ -134,6 +134,35 @@ LLDP_MANADDR_TABLE = {
     "1.0.8802.1.1.2.1.4.1.1.10.0.3.1": ("str", "No address neighbour"),
 }
 
+# lldpLocPortTable: local port numbers 101-104 that are NOT ifIndexes.
+# 101 -> "7" (subtype 7 local, a numeric ifIndex); 102 -> "Gi0/2" (subtype
+# 5 interfaceName, matches ifDescr GigabitEthernet0/2 after expansion);
+# 103 -> opaque id, placed by its port description; 104 -> unplaceable.
+LLDP_LOCPORT_TABLE = {
+    "1.0.8802.1.1.2.1.3.7.1.2.101": ("int", 7),
+    "1.0.8802.1.1.2.1.3.7.1.3.101": ("str", "7"),
+    "1.0.8802.1.1.2.1.3.7.1.4.101": ("str", "port 7"),
+    "1.0.8802.1.1.2.1.3.7.1.2.102": ("int", 5),
+    "1.0.8802.1.1.2.1.3.7.1.3.102": ("str", "Gi0/2"),
+    "1.0.8802.1.1.2.1.3.7.1.4.102": ("str", "GigabitEthernet0/2"),
+    "1.0.8802.1.1.2.1.3.7.1.2.103": ("int", 7),
+    "1.0.8802.1.1.2.1.3.7.1.3.103": ("str", "slot-3"),
+    "1.0.8802.1.1.2.1.3.7.1.4.103": ("str", "GigabitEthernet0/3"),
+    "1.0.8802.1.1.2.1.3.7.1.2.104": ("int", 7),
+    "1.0.8802.1.1.2.1.3.7.1.3.104": ("str", "mgmt"),
+    "1.0.8802.1.1.2.1.3.7.1.4.104": ("str", "management"),
+}
+for _port, _name in ((101, "n-101"), (102, "n-102"), (103, "n-103"), (104, "n-104")):
+    LLDP_LOCPORT_TABLE.update({
+        f"1.0.8802.1.1.2.1.4.1.1.4.0.{_port}.1": ("int", 4),
+        f"1.0.8802.1.1.2.1.4.1.1.5.0.{_port}.1": ("bytes", bytes([0xaa, 0xbb, 0xcc, 0, 0, _port])),
+        f"1.0.8802.1.1.2.1.4.1.1.6.0.{_port}.1": ("int", 5),
+        f"1.0.8802.1.1.2.1.4.1.1.7.0.{_port}.1": ("str", "eth0"),
+        f"1.0.8802.1.1.2.1.4.1.1.8.0.{_port}.1": ("str", "uplink"),
+        f"1.0.8802.1.1.2.1.4.1.1.9.0.{_port}.1": ("str", _name),
+        f"1.0.8802.1.1.2.1.4.1.1.10.0.{_port}.1": ("str", "neighbour"),
+    })
+
 # ------------------------------------------------------------------- CDP
 CDP_TABLE = {
     # cdpCache<Column>.<ifIndex>.<deviceIndex>
@@ -313,6 +342,8 @@ def table_for():
         return {**GENERIC_SCALARS, **LLDP_TABLE}
     if MODE == "lldp_manaddr":
         return {**GENERIC_SCALARS, **LLDP_MANADDR_TABLE}
+    if MODE == "lldp_locport":
+        return {**GENERIC_SCALARS, **LLDP_LOCPORT_TABLE}
     if MODE == "cdp":
         return {**CISCO_SCALARS, **CDP_TABLE}
     if MODE == "lldp_and_cdp":

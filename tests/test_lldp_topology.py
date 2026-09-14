@@ -92,6 +92,36 @@ try:
 finally:
     stub.kill()
 
+# ------------------------------------- 1c. lldpLocPortTable -> ifIndex
+stub, port = spawn_stub("stub_agent_l2.py", "lldp_locport")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_db("lldp_locport")
+    did = device_against(db, port, vendor="", name="locport-sw")
+    db.replace_interfaces(did, [
+        {"if_index": 2, "descr": "GigabitEthernet0/2", "name": "Gi0/2"},
+        {"if_index": 3, "descr": "GigabitEthernet0/3", "name": "Gi0/3"},
+        {"if_index": 7, "descr": "GigabitEthernet0/7", "name": "Gi0/7"},
+    ])
+    check("ifName is stored on the interface row",
+          {r["if_index"]: r["name"] for r in db.interface_port_labels(did)}
+          == {2: "Gi0/2", 3: "Gi0/3", 7: "Gi0/7"},
+          [dict(r) for r in db.interface_port_labels(did)])
+    poller = NodePoller(db)
+    entries = poller.read_device_neighbors(did)
+    by_name = {e["sys_name"]: e["if_index"] for e in (entries or [])}
+    check("a numeric local port id (subtype 7) maps onto that ifIndex",
+          by_name.get("n-101") == 7, by_name)
+    check("an interfaceName port id maps onto the interface whose ifDescr expands to it",
+          by_name.get("n-102") == 2, by_name)
+    check("an opaque port id is placed by its port description",
+          by_name.get("n-103") == 3, by_name)
+    check("a port the table cannot place keeps its local port number",
+          by_name.get("n-104") == 104, by_name)
+    db.close()
+finally:
+    stub.kill()
+
 # ------------------------------------------------- 2. CDP-only fallback
 stub, port = spawn_stub("stub_agent_l2.py", "cdp")
 nodepoll_mod.DEFAULT_SNMP_PORT = port

@@ -3707,7 +3707,8 @@
           come from. Same shape as MAC address learning above: blank inherits the profile, an
           explicit <b>0 turns it off</b> for this device, and 3600 (one hour) is the shipped
           default so a fleet with no opinion still gets a walk, not silence.</p>
-        <label>Custom MIB <select id="nd-f-mib">${mibOptionsHtml(d.mib_file_id)}</select></label>
+        <label>Custom MIB <select id="nd-f-mib">${mibOptionsHtml(d.mib_file_id)}</select>
+          ${d.mib_file_auto ? '<span class="hint">(assigned automatically from the vendor walk; not an override)</span>' : ''}</label>
         <p class="hint">Polls that MIB's own scalar objects alongside the usual metrics,
           shown under its own names — see Nodes → MIBs to upload one first. The
           first option inherits whatever the polling profile has assigned and

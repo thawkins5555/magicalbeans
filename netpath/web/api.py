@@ -3508,6 +3508,7 @@ def _device_json(row, reveal: bool = False) -> dict:
         "ping_enabled": _tri(row["ping_enabled"]),
         "snmp_enabled": _tri(row["snmp_enabled"]),
         "oid_set": row["oid_set"], "mib_file_id": row["mib_file_id"],
+        "mib_file_auto": bool(row["mib_file_auto"]) if "mib_file_auto" in row.keys() else False,
         "ping_count": row["ping_count"], "ping_timeout_ms": row["ping_timeout_ms"],
         "unreachable_ping_only": row["unreachable_ping_only"],
         "mac_table_interval_s": row["mac_table_interval_s"],
@@ -4264,14 +4265,14 @@ def _neighbor_local_port_labeler(service, prefetch_ids=None):
             cache.setdefault(int(device_id), {})
         for row in service.nodes_db.interface_port_labels_for_devices(prefetch_ids):
             cache.setdefault(row["device_id"], {})[row["if_index"]] = (
-                row["descr"] or row["alias"] or "")
+                row["name"] or row["descr"] or row["alias"] or "")
 
     def label(device_id, if_index):
         if if_index is None:
             return ""
         ports = cache.get(device_id)
         if ports is None:
-            ports = {i["if_index"]: (i["descr"] or i["alias"] or "")
+            ports = {i["if_index"]: (i["name"] or i["descr"] or i["alias"] or "")
                      for i in service.nodes_db.interface_port_labels(device_id)}
             cache[device_id] = ports
         return ports.get(if_index) or f"if {if_index}"
@@ -6075,6 +6076,7 @@ def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
     # before the ALTER TABLE has run on this database will not have them.
     return {"note": note, "interfaces": [
         {"id": r["id"], "if_index": r["if_index"], "descr": r["descr"],
+         "name": r["name"] if "name" in r.keys() else None,
          "alias": r["alias"], "phys_addr": r["phys_addr"], "speed_bps": r["speed_bps"],
          "admin_status": r["admin_status"], "oper_status": r["oper_status"],
          "in_bps": r["in_bps"], "out_bps": r["out_bps"],
@@ -6096,7 +6098,7 @@ def get_nodes_device_interfaces_export(service, params, body, device_id) -> dict
     there is no export ceiling to lift here, only the same rows the JSON
     handler above already reads."""
     interfaces = get_nodes_device_interfaces(service, params, body, device_id)["interfaces"]
-    header = ["if_index", "descr", "alias", "phys_addr", "speed_bps",
+    header = ["if_index", "descr", "name", "alias", "phys_addr", "speed_bps",
              "admin_status", "oper_status", "in_bps", "out_bps",
              "in_error_rate", "out_error_rate", "last_in_errors", "last_out_errors",
              "last_seen_ts", "poe_admin", "poe_detect_status", "poe_power_mw",

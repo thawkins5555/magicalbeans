@@ -101,6 +101,21 @@ try:
           == len([r for r in everything
                   if override_fields(r) and r["name"].startswith("bulk")]))
 
+    auto = db.add_device("10.0.0.21", "auto-mib", gid)
+    db.update_device(auto, mib_file_id=5, mib_file_auto=1)
+    check("a MIB the poller assigned itself is not an override",
+          override_fields(db.device(auto)) == (), override_fields(db.device(auto)))
+    check("...and overrides_only agrees",
+          auto not in {r["id"] for r in db.devices(overrides_only=True)})
+    db.update_device(auto, mib_file_id=5)
+    check("the same MIB chosen by an operator is an override (auto flag reset)",
+          override_fields(db.device(auto)) == ("mib_file_id",)
+          and auto in {r["id"] for r in db.devices(overrides_only=True)},
+          dict(db.device(auto)))
+    db.update_device(auto, mib_file_id=None)
+    check("clearing the MIB clears the override",
+          override_fields(db.device(auto)) == ())
+
     # exclude_ids past one chunk: the NOT IN chunks must AND, never OR.
     bulk = [db.add_device(f"10.1.{i // 250}.{i % 250}", f"chunk-{i:03d}", gid)
             for i in range(520)]
