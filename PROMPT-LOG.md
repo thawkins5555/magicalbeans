@@ -606,3 +606,28 @@ most 160 characters, no template editor; Twilio set up with Account SID, Auth
 Token (stored encrypted like the SMTP password), From number, optional
 Messaging Service SID, and a "Send test text" button.
 → Plan approved.
+
+## 5.20.0 — Twilio API keys
+
+**Team-rules prompt** — the standing rules as before (named team led by Bob;
+no HTML pages for documents; comments at 20% prose or less; nothing removed
+from the GUI without permission; speak to the operator as a network
+engineer/CTO; Testy runs the full suite once after changes and walks only
+edited modules without screenshots; Stephen_King keeps this log; Javariius
+reviews before the push to main), with the work item: "Twilio SMS
+functionality was added with only 'Auth Tokens' please also add the ability
+to integrate with Twilio API keys."
+→ Dora mapped the 5.19.0 Twilio code (hand-rolled REST in alertmail.py, the
+auth token in its own DPAPI-encrypted single-row table bound to the Account
+SID, one fieldset in the Alerts settings dialog).
+
+**Planning answers** — an "Authenticate with" selector (Auth token | API
+key) with the Account SID always shown; one stored secret at a time, the
+existing sms_credential row widened with auth_mode and api_key_sid columns,
+existing installs migrating as auth_token; version 5.20.0; branch pushed
+then main fast-forwarded, no pull request.
+→ Plan written and approved.
+
+**Plan approved.**
+→ Thing1 on the backend, Thing2 on the dialog, Testy/Fisty on verification,
+Javariius on review.
