@@ -1069,7 +1069,8 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
       await shoot(page, dir, shot('dlg', `settings-${tab}`));
       if (tab === 'alerts') {
         // 5.19.0: the TEXT MESSAGES (TWILIO) fieldset.
-        for (const id of ['#as-sms', '#as-twilio-sid', '#as-sms-to-add', '#as-testsms']) {
+        for (const id of ['#as-sms', '#as-twilio-sid', '#as-twilio-auth',
+                          '#as-twilio-apikey-sid', '#as-sms-to-add', '#as-testsms']) {
           if (!(await page.locator(`#modal:not([hidden]) ${id}`).count())) {
             throw new Error(`${id} missing from the Alerts settings dialog`);
           }

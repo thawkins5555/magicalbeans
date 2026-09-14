@@ -3044,6 +3044,19 @@ check("texts sent" in NODES62,
       "the counters line reports texts sent the same way it reports emails "
       "and webhooks")
 
+# --- 63. 5.20.0: Twilio API key authentication -----------------------------
+NODES63 = read("alerts.js")
+for _id in ("as-twilio-auth", "as-twilio-apikey-secret", "as-twilio-token-fields",
+           "as-twilio-apikey-fields"):
+    check('id="%s"' % _id in NODES63,
+          "the alerts settings dialog has the %s control for Twilio API key auth" % _id)
+check("'as-twilio-apikey-sid'" in NODES63,
+      "the API Key SID field is built with App.form.text('as-twilio-apikey-sid', ...)")
+check("auth_mode:" in NODES63,
+      "Save posts auth_mode to the SMS credential route")
+check("twilio_auth_mode:" in NODES63,
+      "Save sends twilio_auth_mode in the /api/settings values")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

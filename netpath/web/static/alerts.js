@@ -1706,10 +1706,25 @@
         <label>Text alerts of severity <select id="as-sms-minsev"></select>
           and worse</label>
         ${App.form.text('as-twilio-sid', 'Account SID', escape(s.twilio_account_sid || ''))}
+        <label>Authenticate with <select id="as-twilio-auth">
+          <option value="auth_token" ${s.twilio_auth_mode === 'api_key' ? '' : 'selected'}>Auth token</option>
+          <option value="api_key" ${s.twilio_auth_mode === 'api_key' ? 'selected' : ''}>API key</option>
+        </select></label>
+        <div id="as-twilio-token-fields">
         ${App.canStoreSecrets()
           ? `<label>Auth token <input id="as-twilio-token" type="password"
-          placeholder="${s.has_sms_credential ? 'stored — leave blank to keep' : ''}"></label>`
+          placeholder="${s.has_sms_credential && s.sms_credential_mode !== 'api_key' ? 'stored — leave blank to keep' : ''}"></label>`
           : App.credentialUnavailableHtml('A Twilio auth token')}
+        </div>
+        <div id="as-twilio-apikey-fields">
+        ${App.form.text('as-twilio-apikey-sid', 'API Key SID', escape(s.twilio_api_key_sid || ''))}
+        ${App.canStoreSecrets()
+          ? `<label>API key secret <input id="as-twilio-apikey-secret" type="password"
+          placeholder="${s.has_sms_credential && s.sms_credential_mode === 'api_key' ? 'stored — leave blank to keep' : ''}"></label>`
+          : App.credentialUnavailableHtml('A Twilio API key secret')}
+        <p class="hint">A Standard API key from Twilio Console → Account → API keys &amp; tokens. The
+          Account SID is still required — it names the account in the request.</p>
+        </div>
         <p class="hint" id="as-sms-cred-status"></p>
         ${App.form.text('as-twilio-from', 'From number', escape(s.twilio_from || ''), 'placeholder="+15551234567"')}
         ${App.form.text('as-twilio-msid', 'Messaging Service SID (optional, replaces From)', escape(s.twilio_messaging_service_sid || ''))}
@@ -1794,9 +1809,14 @@
         if (!App.requireFields(box, [['#as-testsms', 'A destination number']])) return;
         const to = box.querySelector('#as-testsms').value.trim();
         const payload = { to };
-        const token = (box.querySelector('#as-twilio-token') || {}).value || '';
+        const mode = box.querySelector('#as-twilio-auth').value;
+        const token = mode === 'api_key'
+          ? (box.querySelector('#as-twilio-apikey-secret') || {}).value || ''
+          : (box.querySelector('#as-twilio-token') || {}).value || '';
         if (token) payload.token = token;
         payload.twilio_account_sid = box.querySelector('#as-twilio-sid').value.trim();
+        payload.twilio_auth_mode = mode;
+        payload.twilio_api_key_sid = box.querySelector('#as-twilio-apikey-sid').value.trim();
         payload.twilio_from = box.querySelector('#as-twilio-from').value.trim();
         payload.twilio_messaging_service_sid =
           box.querySelector('#as-twilio-msid').value.trim();
@@ -1818,12 +1838,18 @@
             throw error;
           }
         }
-        const smsToken = (box.querySelector('#as-twilio-token') || {}).value || '';
+        const smsAuthMode = box.querySelector('#as-twilio-auth').value;
+        const smsApiKeySid = box.querySelector('#as-twilio-apikey-sid').value.trim();
+        const smsToken = smsAuthMode === 'api_key'
+          ? (box.querySelector('#as-twilio-apikey-secret') || {}).value || ''
+          : (box.querySelector('#as-twilio-token') || {}).value || '';
         if (smsToken) {
           try {
             await App.post('/api/alerts/sms/credential', {
               token: smsToken,
-              account_sid: box.querySelector('#as-twilio-sid').value.trim() });
+              account_sid: box.querySelector('#as-twilio-sid').value.trim(),
+              auth_mode: smsAuthMode,
+              api_key_sid: smsApiKeySid });
           } catch (error) {
             box.querySelector('#as-sms-cred-status').textContent = error.message;
             throw error;
@@ -1862,6 +1888,8 @@
           sms_enabled: on('#as-sms'),
           sms_min_severity: Number(box.querySelector('#as-sms-minsev').value),
           twilio_account_sid: text('#as-twilio-sid'),
+          twilio_auth_mode: box.querySelector('#as-twilio-auth').value,
+          twilio_api_key_sid: text('#as-twilio-apikey-sid'),
           twilio_from: text('#as-twilio-from'),
           twilio_messaging_service_sid: text('#as-twilio-msid'),
           sms_to_default: smsNumbers,
@@ -1888,6 +1916,17 @@
       });
       select.value = String(value);
     }
+
+    const twilioAuthSelect = box.querySelector('#as-twilio-auth');
+    const twilioTokenFields = box.querySelector('#as-twilio-token-fields');
+    const twilioApiKeyFields = box.querySelector('#as-twilio-apikey-fields');
+    function updateTwilioAuthFields() {
+      const apiKey = twilioAuthSelect.value === 'api_key';
+      twilioTokenFields.hidden = apiKey;
+      twilioApiKeyFields.hidden = !apiKey;
+    }
+    twilioAuthSelect.addEventListener('change', updateTwilioAuthFields);
+    updateTwilioAuthFields();
 
     function renderRecipients() {
       box.querySelector('#as-to-list').innerHTML = recipientsListHtml(recipients);
