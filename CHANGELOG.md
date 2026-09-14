@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.20.5 — The auto-assigned MIB, repaired for the fleet (second pass)](#5205--the-auto-assigned-mib-repaired-for-the-fleet-second-pass)
 - [5.20.4 — The auto-assigned MIB, repaired for the fleet](#5204--the-auto-assigned-mib-repaired-for-the-fleet)
 - [5.20.3 — The HTTPS monitor behind an inspecting firewall](#5203--the-https-monitor-behind-an-inspecting-firewall)
 - [5.20.2 — TLS behind an inspecting firewall](#5202--tls-behind-an-inspecting-firewall)
@@ -153,6 +154,54 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 5.20.5 — The auto-assigned MIB, repaired for the fleet (second pass)
+
+After 5.20.4 shipped, the operator reported the "devices repaired" log
+line had only counted tens of the roughly 300 devices, not the whole
+fleet — the repair was real, just too narrow.
+
+**The cause: 5.20.4's signature was never what `_auto_assign_mib`
+actually does.** 5.20.4 required the stored `mib_file_id` to equal
+`mib_file_covering()`'s pick — the vendor's uploaded file with the
+most resolved objects under the arc. But `_auto_assign_mib` has always
+preferred the identification walk's own pick first: whichever of the
+vendor's uploaded files named the most of *that particular device's*
+objects, falling back to `mib_file_covering()`'s "most objects under
+the arc" guess only when the walk had no evidence to offer. Wherever a
+vendor has more than one uploaded MIB file, most devices ended up
+holding a file the walk had matched by evidence — not the single file
+5.20.4's repair would accept — so 5.20.4 skipped them.
+
+**The rule, widened.** `nodesmibdb.py` gains
+`mib_files_covering(sys_object_id)`, returning every uploaded file with
+resolved objects under the vendor's arc rather than only the top one.
+`repair_auto_mib_overrides()` (`nodesdb.py`) now accepts the stored
+`mib_file_id` when it is a *member* of that set, still keyed on the
+device's identified `vendor_arc` first and on sysObjectID only when no
+arc was recorded, and still only when the MIB is the device's sole
+override — every other 5.20.4 condition is unchanged.
+
+**The repair runs once more.** A new private setting,
+`mib_auto_repaired_5_20_5`, gates the run the same way
+`mib_auto_repaired_5_20` gated 5.20.4's, so it fires again at startup
+even on a database that already saw that one. The log line now reads
+"...(5.20.5 repair)" so the two runs are distinguishable in the log
+history.
+
+**Deliberately unchanged.** The same caveat 5.20.4 raised still stands:
+a hand-pinned MIB that happens to be one of the vendor's uploaded files
+cannot be told apart from an old auto-assignment, so it is reclassified
+right along with genuine auto-picks. Any device with another override,
+or whose stored MIB matches none of the vendor's uploaded files, is
+still left alone.
+
+Files: `nodesmibdb.py`, `nodesdb.py`, `web/service.py`.
+
+Verification: `test_device_overrides.py` adds the case 5.20.4 missed —
+a vendor with a second uploaded MIB file, smaller than the one
+`mib_file_covering()` would have picked, stored as a device's sole
+override — and checks it is now repaired too.
+
 ### 5.20.4 — The auto-assigned MIB, repaired for the fleet
 
 An operator reported that roughly 300 devices still showed "1
@@ -189,6 +238,7 @@ real choice") still applies to it. Those devices go on showing their
 one override, same as any hand-picked MIB does; an operator who wants
 it gone clears it by hand in Edit device → OVERRIDES, same as always.
 One log line reports how many devices the repair actually changed.
+5.20.5 widens the match to any of the vendor's uploaded files, see above.
 
 Files: `nodesdb.py`, `web/service.py`.
 

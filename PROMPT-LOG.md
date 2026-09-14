@@ -687,3 +687,15 @@ one-time startup repair rather than a bulk action, scoped to devices
 whose only override is a vendor-matching MIB, leaving any other
 override or a non-matching MIB alone. Thing1 built it, Javariius
 reviewed, branch pushed and main fast-forwarded.
+
+## 5.20.5 — The auto-assigned MIB, repaired for the fleet (second pass)
+
+**"Not sure how long this should take but it appears as though the
+nodes still show the 1 override item"**
+→ The 5.20.4 signature checked the stored MIB against the vendor's
+largest uploaded file, but `_auto_assign_mib` had always used the
+identification walk's own pick instead, so any vendor with more than
+one uploaded file left most of its devices skipped. Widened the
+match to any of the vendor's covering files and reran the repair once
+under a new marker. Javariius reviewed; branch pushed and main
+fast-forwarded.

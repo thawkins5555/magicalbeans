@@ -701,11 +701,12 @@ own subtabs.
   in the column picker) counts them for auditing, and the count is in the
   CSV export. Until now the only way to find a device polling on its own
   interval was to open its edit dialog and read the fields one at a time.
-  A one-time repair on upgrade to 5.20.4 reclassifies a MIB the vendor
-  identification auto-assigned before 5.18.0, so it stops counting as an
-  override too — but only where that MIB is the device's sole override
-  and still matches the vendor lookup; any other override, or a MIB that
-  no longer matches, still counts and is left for hand clearing.
+  A one-time repair on upgrade to 5.20.4/5.20.5 reclassifies a MIB the
+  vendor identification auto-assigned before 5.18.0, so it stops counting
+  as an override too — but only where that MIB is the device's sole
+  override and still matches any of the vendor's uploaded MIB files; any
+  other override, or a MIB that matches none of them, still counts and is
+  left for hand clearing.
 - **The scheduler is shaped like NetPath's own trace `Monitor`**, not
   IPAM's worker: a hot-resizable thread pool, and restart-safe per-device
   due-time seeding from each device's own last poll time.

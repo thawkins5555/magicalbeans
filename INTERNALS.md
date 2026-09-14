@@ -865,18 +865,25 @@ MIB select "(assigned automatically)" without hiding which MIB is in use.
 
 A device auto-identified before this column existed carries `mib_file_id`
 with no marker at all, stored identically to a hand pick — 5.18.0's fix
-only ever applied going forward. 5.20.4's
-`NodesDatabase.repair_auto_mib_overrides()`, gated by the private setting
-`mib_auto_repaired_5_20` so it runs once at startup, sets `mib_file_auto =
-1` on such a device only when `mib_file_id` is its *only* override and
-equals what `mib_file_covering()` would assign today for the device's
+only ever applied going forward. `NodesDatabase.repair_auto_mib_overrides()`
+sets `mib_file_auto = 1` on such a device only when `mib_file_id` is its
+*only* override and is a member of `mib_files_covering()` for the device's
 identified `vendor_arc` (the key the old auto-pick used), falling back to
-its sysObjectID only when no arc was recorded. Any
-other override present, or a stored MIB that no longer matches the vendor
-lookup, and the row is left alone — a hand-pinned MIB identical to the
-vendor match cannot be told apart from an old auto-assignment, and the
-"a person choosing a MIB, even one that matches, is still a real choice"
-rule above still governs it.
+its sysObjectID only when no arc was recorded. 5.20.4 first gated this
+behind the private setting `mib_auto_repaired_5_20`, but checked
+membership against `mib_file_covering()`'s single top pick — the vendor's
+file with the most objects under the arc — when `_auto_assign_mib` had
+always preferred the identification walk's own pick first, so a vendor
+with more than one uploaded file left most of its devices unrepaired.
+5.20.5 checks against `mib_files_covering()` instead — every uploaded file
+with resolved objects under the arc, not only the top one — and runs the
+repair again under its own private setting, `mib_auto_repaired_5_20_5`, so
+it also catches devices a database already saw the 5.20.4 pass on. Any
+other override present, or a stored MIB that matches none of the vendor's
+uploaded files, and the row is left alone — a hand-pinned MIB identical to
+one of those files cannot be told apart from an old auto-assignment, and
+the "a person choosing a MIB, even one that matches, is still a real
+choice" rule above still governs it.
 
 ### Identity OIDs (`nodesdb.py`, `nodepoll.py`, `nodeoids.py`)
 
