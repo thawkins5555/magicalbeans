@@ -592,3 +592,17 @@ future round rather than touched now.
 **Plan approved.**
 → Work assigned across the roster; lanes run in parallel in main's working
 tree.
+
+## 5.19.0 — Twilio SMS alerting
+
+**Team-rules prompt** — same standing rules as before, with the work item:
+"Implement Twilio Text Message integration on alerts. Each alert should have
+the ability to turn on or off SMS texting just like email."
+
+**Planning answers** — one global SMS number list in Settings → Alerts with a
+per-rule on/off toggle; SMS follows email's timing (roll-up hold, digest,
+re-notify, recovery texts) with its own hourly cap; a fixed short text of at
+most 160 characters, no template editor; Twilio set up with Account SID, Auth
+Token (stored encrypted like the SMTP password), From number, optional
+Messaging Service SID, and a "Send test text" button.
+→ Plan approved.

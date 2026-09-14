@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.19.0 — Twilio SMS on alerts](#5190--twilio-sms-on-alerts)
 - [5.18.0 — Port names, device names everywhere, IPAM in-use rows, MIB auto-assign, chart ranges, mapper drawing and matching](#5180--port-names-device-names-everywhere-ipam-in-use-rows-mib-auto-assign-chart-ranges-mapper-drawing-and-matching)
 - [5.17.0 — Uplink-clean Find box, chart tooltips, syslog name search, neighbour name and IP](#5170--uplink-clean-find-box-chart-tooltips-syslog-name-search-neighbour-name-and-ip)
 - [5.16.0 — Profile overrides, device-fed IPAM, per-sensor thresholds, power supplies](#5160--profile-overrides-device-fed-ipam-per-sensor-thresholds-power-supplies)
@@ -146,6 +147,65 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.19.0 — Twilio SMS on alerts
+
+One work item this release: a text-message channel for Alerts, alongside
+email and the webhook. `PROMPT-LOG.md` carries the planning answers in
+full; this entry is the shipped result.
+
+**A per-rule checkbox, off by default.** Every rule's **Send email for
+this rule** checkbox now has a sibling, **Send a text (SMS) for this
+rule** (`rules.notify_sms`), defaulting to off so an upgrading fleet does
+not suddenly start texting about everything it was only ever emailing
+about. The system rules — `smtp_failing`, the new `sms_failing` among
+them — never offer the checkbox: a rule reporting a channel's own failure
+cannot depend on that channel to report it.
+
+**Settings → Alerts gains a TEXT MESSAGES (TWILIO) section.** On/off
+(`sms_enabled`), its own severity floor (`sms_min_severity`, independent
+of email's), Account SID, Auth Token, From number, an optional Messaging
+Service SID (used in place of From when set), the destination number list
+(`sms_to_default`, each entry checked against E.164 on save), Max texts
+per hour (`sms_max_per_hour`, default 30) and a **Send test text** button.
+The Auth Token is stored encrypted in its own `sms_credential` table,
+never in the settings blob — the identical DPAPI/portable-store discipline
+the SMTP password already follows — and is only ever used together with
+the Account SID it was saved against; **Send test text** refuses to reuse
+a stored token with a different SID rather than risk authenticating as the
+wrong Twilio account.
+
+**Timing follows email's, with its own budget.** The roll-up hold, one
+`sms_digest` text for a mass outage, re-notify while an alert stays open
+and a `[RECOVER]`-tagged recovery text all reuse the engine's existing
+rollup/digest/re-notify machinery; mutes and maintenance windows are
+honoured exactly as they are for email. `sms_max_per_hour` is its own
+rolling cap, separate from email's and the webhook's — a text suppressed
+by it is recorded as "not sent: over the N/hour text limit" rather than
+silently dropped.
+
+**A fixed one-line text, no template editor.** `[CRITICAL] Rule name -
+device: message`, whitespace-collapsed and cut to 160 characters — one SMS
+segment — since a free-form template could turn one text into several
+without anyone noticing. Sent through Twilio's REST API
+(`Accounts/{SID}/Messages.json`, HTTP Basic auth, form-encoded, redirects
+refused) via `alertmail.send_sms`, one call per destination number.
+
+**Its own queue and its own breaker.** `alertmail.SmsQueue`, a subclass of
+the existing `MailQueue`, delivers texts off the engine's tick on a
+bounded queue with the same five-failure/fifteen-minute circuit breaker
+email already has. A breaker left open raises a new system alert, **Alert
+texts are not being delivered** (`sms_failing`), because a broken Twilio
+account is something the fleet can still be told about — by email, since
+SMS cannot report on SMS being down.
+
+**The Alerts counters line picks up a second count**, "N texts sent (M
+failed)", once the first text has gone, beside the existing email count.
+
+Files: `alertmail.py`, `alertsdb.py`, `alertengine.py`, `web/api.py`,
+`alerts.js`, `rules.js`.
+
+Verification: (filled after the suite and walk)
 
 ### 5.18.0 — Port names, device names everywhere, IPAM in-use rows, MIB auto-assign, chart ranges, mapper drawing and matching
 

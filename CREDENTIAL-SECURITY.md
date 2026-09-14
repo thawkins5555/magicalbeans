@@ -15,6 +15,7 @@ ways:
 | An optional DHCP polling credential | Encrypted in `ipam.db`, if you chose to store one | No — SappiWhere can decrypt it (that's the point), but it never leaves the process as plaintext. On Windows, a copy of the file on other hardware cannot decrypt it at all (DPAPI ties it to this machine). Off Windows, using the portable secret store, it *can* be decrypted elsewhere — but only by something that has both the same passphrase and the per-install salt file, neither of which travels with `ipam.db` itself. See §10. |
 | An optional SNMPv3 authentication password (Nodes) | Encrypted in `nodes.db`, per device or per polling profile, if you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
 | An optional SMTP password (Alerts) | Encrypted in `alerts.db`, if you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
+| An optional Twilio Auth Token (Alerts SMS), from 5.19.0 | Encrypted in `alerts.db`, in its own table alongside the SMTP password, if you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
 | An optional SNMP credential (Wireless controller) | Encrypted in `wireless.db`, if you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
 | An optional SSH config-backup password (ConfigRX) | Encrypted in `configrx.db`, if you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
 | An optional enable-mode secret (ConfigRX) | Encrypted in `configrx.db`, if the device's vendor needs one to reach privileged EXEC and you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
@@ -465,6 +466,40 @@ verification off is a real, logged configuration choice — an explicit
 opt-out visible in the settings dialog — never a silent downgrade a
 misconfiguration could trigger by accident.
 
+## 5a. The optional Twilio Auth Token (Alerts SMS), from 5.19.0
+
+Alerts' text-message channel (`netpath/alertmail.py`, `netpath/alertsdb.py`)
+follows the SMTP password above, rule for rule, in its own table
+(`sms_credential`) rather than sharing the SMTP one — the two are
+independent secrets for independent channels, and clearing one must never
+touch the other. One Auth Token for the whole module, encrypted the
+identical DPAPI, machine-scoped way, never returned by any API response
+(only `has_sms_credential: bool`), refused on non-Windows without a
+configured passphrase (see §10). `POST /api/alerts/sms/credential` and
+`DELETE /api/alerts/sms/credential` store or clear it; there is no
+"reveal" path.
+
+**The token is only ever used together with the Account SID it was saved
+with.** Twilio's API authenticates a request with Basic auth over the pair
+`AccountSID:AuthToken`, so a token saved against one SID and then sent
+against a different one (an operator pastes a new SID without re-entering
+the token) would silently authenticate as the wrong account rather than
+failing loudly. `sms_credential` is a single row, but the Account SID it
+was stored for is checked before every send: a saved token is used only
+when the currently configured `twilio_account_sid` still matches what it
+was saved under, and **Send test text** applies the identical check —
+refusing to reuse a stored token against a SID it was never paired with,
+rather than trying it and reporting a confusing Twilio authentication
+failure back to the operator.
+
+**Send test text** works the same two ways **Send test email** does: with
+a token already stored (and the current SID matching it), it decrypts and
+sends with that; with a token typed into the Settings dialog but not yet
+saved, it sends with that instead, for exactly that one test message. The
+plaintext exists only for the one Twilio request it authenticates, then is
+discarded, the same discipline every other credential in this document
+follows.
+
 ## 6. The optional SSH config-backup password (ConfigRX)
 
 ConfigRX (`netpath/configrx.py`, `netpath/configrxdb.py`) needs an SSH
@@ -809,7 +844,8 @@ route to the device.
 ## 8. What this application deliberately never does
 
 - Never stores a password in a form that can be turned back into the
-  password — not the web login, not a DHCP, SNMPv3 or SMTP credential.
+  password — not the web login, not a DHCP, SNMPv3, SMTP or Twilio
+  credential.
 - Never returns a password or an encrypted password blob through any API
   response.
 - Never builds a shell or PowerShell command by inserting a credential (or
@@ -908,8 +944,8 @@ filtered to the modules the reading account has a grant for.
 Encryption and hashing close the gaps this application controls. A few
 things remain outside its reach entirely:
 
-- **Least privilege for a stored DHCP, SNMPv3, SMTP, Wireless SNMP or
-  ConfigRX SSH credential.** Create a dedicated read-only DHCP account —
+- **Least privilege for a stored DHCP, SNMPv3, SMTP, Twilio, Wireless SNMP
+  or ConfigRX SSH credential.** Create a dedicated read-only DHCP account —
   membership in the DHCP server's local `DHCP Users` group is enough —
   rather than reusing a domain admin account because it's convenient;
   give an SNMPv3 polling user read-only access on the device side — and
@@ -967,9 +1003,9 @@ that it now describes an opt-in, not a wall.
 
 Every encrypted credential in the table at the top of this file — the DHCP
 credential, the SNMPv3 authentication password, the SMTP password, the
-wireless controller's SNMP credential, ConfigRX's SSH password, ConfigRX's
-optional enable secret, and the password the interactive SSH terminal
-reuses — goes through `netpath/dpapi.py`. On Windows that has always meant,
+Twilio Auth Token, the wireless controller's SNMP credential, ConfigRX's
+SSH password, ConfigRX's optional enable secret, and the password the
+interactive SSH terminal reuses — goes through `netpath/dpapi.py`. On Windows that has always meant,
 and still means, the Windows Data Protection API, unchanged:
 `dpapi.available()` is unconditionally
 true there, and `dpapi.protect()`/`dpapi.unprotect()` call `CryptProtectData`/
@@ -988,6 +1024,7 @@ out-of-the-box state — nothing about this is on by default):
 | SNMPv3 noAuthNoPriv polling | yes | yes |
 | SNMPv3 authNoPriv polling | yes | **no** — the auth password cannot be stored |
 | Authenticated SMTP for alert email | yes | **no** — relay must accept unauthenticated mail |
+| Twilio SMS on alerts, from 5.19.0 | yes | **no** — the Auth Token cannot be stored |
 | ConfigRX configuration backups | yes | **no** — the SSH password cannot be stored |
 | The interactive SSH terminal | yes | **no**, for the same reason |
 | Wireless (FortiGate controller) | yes | **no** — the controller's SNMP credential cannot be stored |

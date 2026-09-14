@@ -2242,6 +2242,10 @@ hard to trip — a path monitor that cries wolf gets turned off.
   chat room or a ticket queue is not somebody's inbox and has its own
   switch and its own budget. The per-rule **Send email for this rule**
   checkbox is still there and still silences one rule at every severity.
+  A second checkbox, **Send a text (SMS) for this rule**, sits beside it
+  and does the same for texting — off by default, and never offered on
+  the system rules (`smtp_failing`, `sms_failing` and the like), which
+  would otherwise be able to text about their own channel failing.
 - **Email over the standard library's `smtplib`** — none, STARTTLS or
   SSL/TLS, with or without certificate verification (turning verification
   off is a deliberate, explicit opt-out, never a silent downgrade). A
@@ -2326,6 +2330,47 @@ hard to trip — a path monitor that cries wolf gets turned off.
 - **Default recipients are a list**, in Alerts settings — add an address
   or remove one from the visible list rather than editing a single
   comma-separated field.
+
+### Text messages (Twilio), from 5.19.0
+
+- **A third channel, alongside email and the webhook.** **Alerts →
+  Settings → TEXT MESSAGES (TWILIO)** turns SMS on or off
+  (`sms_enabled`), sets its own severity floor (`sms_min_severity`,
+  same idea as the email floor above and independent of it), and holds
+  the Twilio **Account SID**, **Auth Token**, **From number**, an
+  optional **Messaging Service SID** (used in place of the From number
+  when set), the list of **destination numbers** (`sms_to_default`,
+  each validated as E.164 on save), a **Max texts per hour**
+  (`sms_max_per_hour`, default 30) and a **Send test text** button.
+  Texting follows the same timing as email — the roll-up hold, one
+  digest text for a mass outage, re-notify while an alert stays open,
+  and a recovery text tagged `[RECOVER]` — with mutes and maintenance
+  windows honoured exactly as they are for email; the hourly cap is its
+  own budget, separate from email's and the webhook's, and a text
+  suppressed by it is recorded as "not sent: over the N/hour text
+  limit" rather than silently dropped.
+- **The Auth Token is stored encrypted, never in Alerts settings** — the
+  same discipline as the SMTP password (see Credential Security below):
+  it lives in its own table alongside the Account SID it was saved
+  with, is used only together with that SID, and **Send test text**
+  refuses to send against a different SID than the one the token was
+  saved for rather than silently reusing it.
+- **A text is one line, cut to fit.** `[CRITICAL] Rule name - device:
+  message` is truncated to 160 characters — one SMS segment, so a long
+  device or rule name does not silently turn one text into several and
+  a bigger bill. There is no template editor for it: the wording is
+  fixed, unlike email's five editable templates.
+- **Texts are sent off the engine's tick, on their own queue and their
+  own breaker**, the same shape as email's: five consecutive failures
+  open a fifteen-minute circuit breaker, during which a text is
+  completed as failed without a Twilio request, and the breaker opening
+  raises its own alert, **Alert texts are not being delivered**
+  (`sms_failing`), so a broken Twilio account is itself something the
+  fleet can be told about — by email, since SMS cannot report on SMS
+  being down.
+- **The Alerts counters line picks up a second count** — "N texts sent
+  (M failed)" — once the first text has gone, beside the existing email
+  count.
 
 ### Templates
 
@@ -3750,7 +3795,7 @@ Configuration sits at the level it belongs to.
 | **Settings** button, top right of NetPath | Concurrent traces, retention, defaults for new destinations |
 | **Settings** button, top right of NetFlow | Listener, sampling, exporters, flow storage and display |
 | **Settings** button, top right of Nodes | Poll worker pool, default interval/timeout/retries, down-after-failures, discovery, storage retention |
-| **Settings** button, top right of Alerts | Engine on/off, evaluation severity floor, SMTP server and credential, volume limits |
+| **Settings** button, top right of Alerts | Engine on/off, evaluation severity floor, SMTP server and credential, Twilio SMS on/off and credential, volume limits |
 | **Settings** button, top right of Syslog | Listener and ports, volume limits, sources, time handling, retention |
 | **Settings** button, top right of Wireless | Poller on/off, poll interval — controllers themselves are managed from **Controllers**, next to it |
 | **Settings** button, top right of ConfigRX | Worker on/off, backup interval, capture timeout, retention (days and per-device count) |
@@ -3993,7 +4038,7 @@ Thirteen SQLite files, in WAL mode. One for the application, twelve for records.
 | `nodes.db` | Devices, polling profiles, interfaces, device/interface events, MAC and neighbour tables, per-port VLAN membership, discovery jobs, device-purge tombstones, Nodes settings, optional SNMPv3 credentials |
 | `nodes_series.db` | Polled metric definitions, their raw samples and the hourly rollups — the Nodes tables that grow, so they carry their own size cap |
 | `nodes_mibs.db` | Uploaded MIB files (the original text is kept, so a re-resolve never needs the upload again) and the objects parsed out of them |
-| `alerts.db` | Rules, email templates, alerts, notification history, Alerts settings, an optional SMTP credential |
+| `alerts.db` | Rules, email templates, alerts, notification history, Alerts settings, optional SMTP and Twilio credentials |
 | `wireless.db` | Wireless controllers, access points, per-radio detail, Wireless settings, optional SNMP credentials |
 | `configrx.db` | Per-device backup configuration (keyed by a Nodes device id, no real foreign key — see ConfigRX below), stored config backups, ConfigRX settings, optional SSH credentials |
 | `mapper.db` | Named maps, the devices and unmanaged peers placed on each one and where, a VLAN colour override table, Mapper settings |
@@ -4054,8 +4099,8 @@ settings, accounts and name cache into it on the first start.
   as the same account, documented as the fallback for tooling that can only
   set an environment variable). Configured, the SNMPv3 authentication
   password, the SSH password ConfigRX and the terminal need, an
-  authenticated SMTP password and the wireless controller's SNMP
-  credential all work the same as on Windows. The DHCP credential is the
+  authenticated SMTP password, a Twilio Auth Token and the wireless
+  controller's SNMP credential all work the same as on Windows. The DHCP credential is the
   one exception, passphrase or not: it depends on PowerShell/RSAT rather
   than on credential encryption, so it stays Windows-only regardless.
   Configure nothing, and the behaviour off Windows is exactly what it

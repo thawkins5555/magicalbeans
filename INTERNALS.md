@@ -5770,6 +5770,104 @@ regardless of whether email is enabled or currently rate-limited;
 misconfigured or over-quota mail server never blinds the Alerts page
 itself.
 
+### Text messages (Twilio) (`alertmail.py`, `alertsdb.py`, `alertengine.py`) — 5.19.0
+
+A third channel beside email and the webhook, built as a sibling of
+`MailQueue` rather than a fork of it. `SmsQueue(MailQueue)` overrides only
+`THREAD_NAME`, `breaker_error` and `_deliver()` — the bounded queue, the
+worker thread, `_record_failure`/`_record_success` and the
+`BREAKER_FAILURES`/`BREAKER_COOLDOWN_S` circuit-breaker arithmetic are all
+inherited unchanged, so a Twilio outage degrades exactly the way an SMTP
+one does: five consecutive failures open a fifteen-minute breaker, a
+half-open probe closes or re-opens it, and every queued job is completed as
+failed without a connection attempt while it's open. `SmsJob` is a
+dataclass alongside `MailJob`, not a variant of it, with `to_addrs` and
+`subject` exposed as read-only properties over `to_numbers`/`text` purely
+so the shared result-recording path (`_mail_result`-shaped consumers) can
+read one job or the other without an `isinstance` check.
+
+**One Twilio call per destination number, the job failed on the first
+error.** `SmsQueue._deliver()` loops `job.to_numbers` and calls
+`alertmail.send_sms()` for each; any exception is re-raised carrying which
+number failed, and the whole job — every number in it — is recorded as one
+failure rather than partially sent. Twilio's REST API takes one recipient
+per request (unlike SMTP's one connection, many `RCPT TO`s), so there is no
+cheaper way to fan a text out to several destination numbers.
+
+**`sms_text()` builds the fixed one-line format and enforces the 160-character
+ceiling itself**, rather than leaving truncation to the caller: `[TAG] rule
+- entity: message`, whitespace-collapsed, cut to `SMS_MAX_CHARS` (160) with
+a trailing `…` when it doesn't fit. There is no per-rule or per-installation
+template for this text — unlike email's five editable templates — because a
+segment boundary is a hard technical limit (Twilio bills, and some carriers
+silently drop, past one 160-character GSM-7 segment) that a free-form editor
+would only let an operator violate by accident.
+
+**`send_sms()` mirrors `send()`'s shape for the same reasons `MailQueue` mirrors
+`MailQueue`'s.** HTTP Basic auth over `AccountSID:AuthToken` (base64,
+built in-process, never handed to a library that might log it), the request
+built with `urllib.request` and posted through `_RefuseRedirects` — the same
+opener the webhook sender uses — so a Twilio-side 3xx cannot be followed
+into an unexpected host. `MessagingServiceSid` is preferred over `From` when
+both are configured, matching Twilio's own precedence, and neither present
+raises before a request is ever sent rather than letting Twilio's own 400
+report it. `_twilio_error_text()` unpacks Twilio's JSON error body
+(`code`/`message`) the way `_smtp_error_text`-equivalent handling surfaces an
+SMTP relay's own rejection text, so a bad Account SID or an unverified
+trial-account destination number reads as Twilio's own words in the
+notification row, not a bare "HTTP 400".
+
+**Validation lives in `alertsdb.validate_sms_settings()`, called from the
+same settings-save path `validate_webhook_settings` already hooks.** Every
+number in `sms_to_default` and the `twilio_from` sender are checked against
+`alertmail.is_e164()` (`^\+[1-9][0-9]{7,14}$` — a leading `+`, no leading
+zero, 8–15 digits total); `twilio_account_sid` against `_ACCOUNT_SID`
+(`AC` + 32 hex) and `twilio_messaging_service_sid` against `_MESSAGING_SID`
+(`MG` + 32 hex). Empty is always fine — an operator clearing a field back
+out is not the case this function exists to catch. A malformed value raises
+`ValueError` before anything is written, the same "refuse at the settings
+boundary, not at send time" discipline `validate_webhook_settings` already
+established for the webhook URL.
+
+**The Auth Token gets its own single-row table, `sms_credential`
+(`id INTEGER PRIMARY KEY CHECK (id = 1)`, `token_enc BLOB`), the identical
+shape `smtp_credential` already uses** — a DPAPI/portable-store blob cannot
+live in the generic JSON `settings` table alongside ordinary values, and a
+second single-row table costs nothing to add and keeps the two credentials'
+lifecycles (store, clear, `has_*_credential` flag) from becoming entangled.
+`set_sms_credential()`/`clear_sms_credential()`/the accompanying getter
+follow `smtp_credential`'s own three functions line for line.
+
+**A per-rule `notify_sms` column sits beside `notify`** on the `rules`
+table (`INTEGER NOT NULL DEFAULT 0` — off by default, unlike `notify`'s own
+default, since a fleet upgrading into 5.19.0 should not suddenly start
+texting about every rule it was only ever emailing about). The system rules
+`_seed_rules()` seeds — including `sms_failing` itself — are never given
+the checkbox: a rule that exists to report a channel's own failure must not
+be able to depend on that same channel to report it.
+
+**`sms_failing` is a system alert with the identical shape `smtp_failing`
+already has**, raised when `SmsQueue`'s breaker opens and cleared when it
+closes, at severity 2, rendered through the generic `event_notice`
+template rather than a dedicated one — the same reasoning that moved six
+other system rules onto `event_notice` rather than the outage template
+(see Notifications, above): "the SMS channel is down" is an event notice,
+not something that itself needs texting about.
+
+**Timing reuses the engine's existing rollup/digest/re-notify machinery
+rather than duplicating it**, gated by `sms_enabled` and each rule's own
+`notify_sms` the way email is gated by `email_enabled` and `notify`: the
+roll-up hold delays an SMS the same `notify_rollup_delay_s` window holds an
+email, a mass-outage batch collapses into one `sms_digest`-kind text instead
+of one email and one text per alert, `renotify_minutes` re-fires a text on
+the same cadence it re-fires an email, and a resolution renders with the
+same `[RECOVER]`-tagged wording `sms_text()` produces from the alert's own
+`recover_tag` context. `sms_max_per_hour` is evaluated on its own rolling
+window, entirely separate from `max_emails_per_hour` and
+`webhook_max_per_hour`, for the same reason the webhook's budget is its
+own: a suppressed text is a fact about the text channel, not about the
+mailbox.
+
 ### Reports (`report.py`, `web/api.py`) — 4.49.0
 
 Sits above `nodesdb.py`/`alertsdb.py` rather than inside either — it reads
