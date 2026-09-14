@@ -258,7 +258,18 @@ IPAM worker's observed-address detail falls through sysName/name/IP with no
 DNS step (`ipam_worker.py`). Events and NetFlow already resolve through the
 syslog/flow name caches.
 
-Verification: (filled by Bob)
+Verification: full suite run once, alone: 156 of 163 suites passed; six
+failures are the known environmental ones (ipam_dhcp_temp,
+palo_alto_polling, selfupdate_job, service_shutdown, snmpv3_diagnostics,
+temppath) and the seventh (web_security D23, the connection-ceiling
+socket timing) passed on rerun alone; server.py is untouched. Reviewed by
+Javariius (changes required, four items applied in 3de0583, then approved).
+60-device browser walk of Nodes, IPAM and Mapper: 914 ok, 45 skipped, 0
+failed; neighbour rows carried a name and an IP line, the interface
+dialog redrew after a range change, the firmware report showed an IP line
+under every device name. The demo seeds no DHCP scopes, so the
+in-use-not-leased grid rows are covered by tests/test_ipam_dhcp_leases.py
+rather than the walk.
 
 ### 5.17.0 — Uplink-clean Find box, chart tooltips, syslog name search, neighbour name and IP
 
