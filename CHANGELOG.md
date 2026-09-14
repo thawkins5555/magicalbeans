@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.20.0 — Twilio API keys](#5200--twilio-api-keys)
 - [5.19.0 — Twilio SMS on alerts](#5190--twilio-sms-on-alerts)
 - [5.18.0 — Port names, device names everywhere, IPAM in-use rows, MIB auto-assign, chart ranges, mapper drawing and matching](#5180--port-names-device-names-everywhere-ipam-in-use-rows-mib-auto-assign-chart-ranges-mapper-drawing-and-matching)
 - [5.17.0 — Uplink-clean Find box, chart tooltips, syslog name search, neighbour name and IP](#5170--uplink-clean-find-box-chart-tooltips-syslog-name-search-neighbour-name-and-ip)
@@ -147,6 +148,53 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.20.0 — Twilio API keys
+
+One follow-on to 5.19.0: Twilio's own guidance favors a scoped API key
+over the account's Auth Token, so the TEXT MESSAGES (TWILIO) fieldset in
+Alerts settings now offers either.
+
+**An "Authenticate with" selector, Auth token or API key.** Account SID
+is always shown and always required — Twilio's request URL names the
+account regardless of which secret authenticates it. Auth token mode is
+unchanged. API key mode swaps in two fields, API Key SID (`SK` + 32 hex)
+and API key secret, with a hint pointing at Twilio Console → Account →
+API keys & tokens for a Standard key.
+
+**One stored secret at a time.** Storing an API key secret replaces a
+stored Auth Token and vice versa; `sms_credential` gains `auth_mode` and
+`api_key_sid` columns, migrated via `ensure_columns` — existing rows
+become `auth_token`, so a previously stored Auth Token keeps working
+with no operator action. `alertmail.send_sms` builds HTTP Basic auth
+from `ApiKeySID:secret` in API key mode and `AccountSID:AuthToken`
+otherwise, against the same Messages.json POST.
+
+**The binding widens to three parts.** A stored secret is now bound to
+(authentication method, Account SID, API Key SID) via
+`alertmail.sms_binding`, rather than the Account SID alone — the API Key
+SID counts only in API key mode, so a value left in the hidden field
+cannot block an Auth Token send. `AlertEngine._sms_token` and **Send
+test text** (`POST /api/alerts/sms/test`) both refuse a stored secret
+whose binding no longer matches the current settings, logging once /
+returning an error naming "Account SID, API Key SID or authentication
+method" rather than the SID alone.
+
+**`POST /api/alerts/sms/credential`** now takes `{token, account_sid,
+auth_mode, api_key_sid}`; the settings blob exposes
+`sms_credential_mode` beside `has_sms_credential`, never the secret
+itself. Log lines: "Stored the Twilio API key secret" / "Stored the
+Twilio auth token" / "Cleared the stored Twilio credential".
+
+Files: `alertmail.py`, `alertsdb.py`, `alertengine.py`, `web/api.py`,
+`alerts.js`.
+
+Verification: `tests/test_alert_sms.py` (API-key request and header,
+validation, the three-way binding round-tripped, an old-shape table
+migrating on open, engine send and refusal, a stale API Key SID ignored
+in auth_token mode), `test_alerts_api.py` (store, the 400s, test-send
+refusal, log and audit), `test_frontend_contracts.py` §63 and
+`demo/ui_walk.mjs` asserting the new controls.
 
 ### 5.19.0 — Twilio SMS on alerts
 

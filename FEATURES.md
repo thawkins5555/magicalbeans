@@ -2372,6 +2372,17 @@ hard to trip — a path monitor that cries wolf gets turned off.
 - **The Alerts counters line picks up a second count** — "N texts sent
   (M failed)" — once the first text has gone, beside the existing email
   count.
+- **From 5.20.0, an "Authenticate with" selector chooses Auth token or
+  API key.** The Account SID field is always shown and always
+  required — it names the account in every Twilio request either way.
+  Auth token mode is unchanged; API key mode swaps in an **API Key
+  SID** (`SK` + 32 hex) and **API key secret**, with a hint pointing at
+  Twilio Console → Account → API keys & tokens for a Standard key.
+  Storing one secret replaces whichever was stored before — Auth Token
+  and API key secret are never both kept at once — and a stored secret
+  is only ever used with the Account SID, API Key SID and
+  authentication method it was saved under; **Send test text** refuses
+  a mismatch the same way it already refused a changed Account SID.
 
 ### Templates
 

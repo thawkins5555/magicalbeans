@@ -5866,6 +5866,25 @@ window, entirely separate from `max_emails_per_hour` and
 own: a suppressed text is a fact about the text channel, not about the
 mailbox.
 
+**From 5.20.0, `twilio_auth_mode` branches `send_sms()` between two Basic
+auth pairs**, `ApiKeySID:secret` in `api_key` mode against
+`AccountSID:AuthToken` otherwise, built at the same call site with no
+change to the request itself — same Messages.json POST, same
+`_RefuseRedirects` opener. `sms_credential` widens with `auth_mode` and
+`api_key_sid` columns, migrated in by `ensure_columns` on open (an
+existing row has no `auth_mode`, so it defaults to `'auth_token'` and a
+stored Auth Token keeps working untouched). The binding check that used
+to compare the Account SID alone now compares a three-tuple —
+`alertmail.sms_binding(settings)` returns `(auth_mode, account_sid,
+api_key_sid)`, with `api_key_sid` forced to `''` outside `api_key` mode
+so a value left sitting in the hidden field can never mismatch an
+Auth Token send. `AlertsDatabase.sms_credential_binding()` reads the row
+back as the same shape; `AlertEngine._sms_token()` and
+`post_alerts_sms_test()` both compare `wanted != saved` on that tuple
+rather than the old bare SID equality, and `sms_credential_sid()` is
+kept as-is (it still reads `account_sid` alone) since nothing but the
+old single-column comparison ever called it.
+
 ### Reports (`report.py`, `web/api.py`) — 4.49.0
 
 Sits above `nodesdb.py`/`alertsdb.py` rather than inside either — it reads

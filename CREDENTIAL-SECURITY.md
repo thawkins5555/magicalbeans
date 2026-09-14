@@ -472,33 +472,41 @@ Alerts' text-message channel (`netpath/alertmail.py`, `netpath/alertsdb.py`)
 follows the SMTP password above, rule for rule, in its own table
 (`sms_credential`) rather than sharing the SMTP one — the two are
 independent secrets for independent channels, and clearing one must never
-touch the other. One Auth Token for the whole module, encrypted the
-identical DPAPI, machine-scoped way, never returned by any API response
-(only `has_sms_credential: bool`), refused on non-Windows without a
-configured passphrase (see §10). `POST /api/alerts/sms/credential` and
-`DELETE /api/alerts/sms/credential` store or clear it; there is no
-"reveal" path.
+touch the other. One secret for the whole module — an Auth Token or,
+from 5.20.0, a Twilio API key secret — encrypted the identical DPAPI,
+machine-scoped way, never returned by any API response (only
+`has_sms_credential: bool` and, from 5.20.0, `sms_credential_mode`),
+refused on non-Windows without a configured passphrase (see §10). `POST
+/api/alerts/sms/credential` and `DELETE /api/alerts/sms/credential`
+store or clear it; there is no "reveal" path.
 
-**The token is only ever used together with the Account SID it was saved
-with.** Twilio's API authenticates a request with Basic auth over the pair
-`AccountSID:AuthToken`, so a token saved against one SID and then sent
-against a different one (an operator pastes a new SID without re-entering
-the token) would silently authenticate as the wrong account rather than
-failing loudly. `sms_credential` is a single row, but the Account SID it
-was stored for is checked before every send: a saved token is used only
-when the currently configured `twilio_account_sid` still matches what it
-was saved under, and **Send test text** applies the identical check —
-refusing to reuse a stored token against a SID it was never paired with,
-rather than trying it and reporting a confusing Twilio authentication
-failure back to the operator.
+**The secret is only ever used together with the settings it was saved
+under.** Twilio's API authenticates a request with Basic auth, over
+`AccountSID:AuthToken` in Auth token mode or `ApiKeySID:secret` in API
+key mode, so a secret saved against one Account SID and then sent
+against a different one (an operator pastes a new SID without
+re-entering the secret) would silently authenticate as the wrong account
+rather than failing loudly. `sms_credential` is a single row, but from
+5.20.0 the binding it was stored under is three-wide —
+`alertmail.sms_binding()`: authentication method, Account SID, and (in
+API key mode only) API Key SID — and is checked before every send: a
+saved secret is used only when the currently configured settings still
+match all three, and **Send test text** applies the identical check —
+refusing to reuse a stored secret against a binding it was never saved
+for, rather than trying it and reporting a confusing Twilio
+authentication failure back to the operator. Only one secret is ever
+stored at a time: saving an API key secret overwrites a stored Auth
+Token and vice versa, so there is never a question of which of two
+stored values a send should use.
 
 **Send test text** works the same two ways **Send test email** does: with
-a token already stored (and the current SID matching it), it decrypts and
-sends with that; with a token typed into the Settings dialog but not yet
-saved, it sends with that instead, for exactly that one test message. The
-plaintext exists only for the one Twilio request it authenticates, then is
-discarded, the same discipline every other credential in this document
-follows.
+a secret already stored (and the current settings matching its binding),
+it decrypts and sends with that; with a secret typed into the Settings
+dialog but not yet saved — an Auth Token or an API key secret, depending
+on the selector — it sends with that instead, for exactly that one test
+message. The plaintext exists only for the one Twilio request it
+authenticates, then is discarded, the same discipline every other
+credential in this document follows.
 
 ## 6. The optional SSH config-backup password (ConfigRX)
 

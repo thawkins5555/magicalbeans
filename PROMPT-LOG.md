@@ -631,3 +631,8 @@ then main fast-forwarded, no pull request.
 **Plan approved.**
 → Thing1 on the backend, Thing2 on the dialog, Testy/Fisty on verification,
 Javariius on review.
+
+**Deployment**
+→ Thing1 built the backend, Thing2 the dialog; Bob closed the stale-key-SID
+gap. Testy's one full pass plus a headless dialog walk stayed clean;
+Javariius approved, then the branch pushed and main fast-forwarded.
