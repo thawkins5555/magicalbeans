@@ -2789,6 +2789,7 @@
     const current = () => App.modalIsCurrent(token);
 
     let smooth = true;
+    let chartRange = 3600;
     let lastChart = null;   // last data drawn, so the checkbox can redraw it
     // The chart owns its own axis-hysteresis memory across redraws of this
     // one dialog; a fresh dialog (a different port, or this one reopened)
@@ -2803,11 +2804,12 @@
       } });
     }
     const box = App.modal({ html: ifaceTitle(iface, ifIndex, deviceId) }, `
-      <p class="section">BANDWIDTH — LAST HOUR
+      <div class="bar"><span class="section" id="ifd-bw-title">BANDWIDTH — LAST HOUR</span>
         <span class="hint">(<span style="color:var(--ok)">▬</span> in ·
         <span style="color:var(--accent)">▬</span> out)</span>
-        <label class="check" style="float:right;font-weight:400">
-          <input type="checkbox" id="ifd-smooth" checked> Smoothed</label></p>
+        <select id="ifd-range" aria-label="Chart range"></select>
+        <label class="check" style="margin-left:auto;font-weight:400">
+          <input type="checkbox" id="ifd-smooth" checked> Smoothed</label></div>
       <div id="ifd-chart" class="canvas chart" style="height:150px"><svg id="ifd-chart-svg"></svg></div>
       <p class="section">STATISTICS &amp; ERRORS</p>
       <div id="ifd-stats">${ifaceStatsHtml(iface)}</div>
@@ -2827,6 +2829,12 @@
     // Stamped by App.modal above; every paint below checks it first.
     token = App.modalToken();
     box.classList.add('wide');
+    App.fillRanges(box.querySelector('#ifd-range'), 'Last hour');
+    const rangeLabel = () => {
+      const select = box.querySelector('#ifd-range');
+      const chosen = select && select.selectedOptions[0];
+      return chosen ? chosen.textContent : 'Last hour';
+    };
     const configrxLink = box.querySelector('#ifd-configrx');
     if (configrxLink) {
       configrxLink.onclick = () => {
@@ -2863,11 +2871,14 @@
         .map((s) => { const v = lastOf(s); return v == null ? null : `${s.label} ${formatMetricValue('bps', v)}`; })
         .filter(Boolean);
       const portName = iface.descr || iface.alias || `port ${ifIndex}`;
+      const label = rangeLabel();
+      const title = box.querySelector('#ifd-bw-title');
+      if (title) title.textContent = `BANDWIDTH — ${label.toUpperCase()}`;
       drawSeriesChart(svg, wrap, lastChart, {
         emptyText: 'No samples yet — they arrive with each poll',
         smooth,
         axisMemory,
-        ariaLabel: `Bandwidth chart for ${portName}, last hour` +
+        ariaLabel: `Bandwidth chart for ${portName}, ${label.toLowerCase()}` +
           (parts.length ? `, most recently ${parts.join(', ')}` : ', no samples yet'),
       });
     }
@@ -2875,6 +2886,11 @@
     box.querySelector('#ifd-smooth').onchange = (event) => {
       smooth = event.target.checked;
       drawChart();
+    };
+
+    box.querySelector('#ifd-range').onchange = (event) => {
+      chartRange = Number(event.target.value);
+      refreshChart().catch(() => {});
     };
 
     // The text readout (title, stats, events) and the chart used to
@@ -2941,10 +2957,10 @@
       const inM = found.in;
       const outM = found.out;
       const t1 = Date.now() / 1000;
-      const t0 = t1 - 3600;
-      // 1 h at 15 s buckets is 240 points — enough to look continuous
+      const t0 = t1 - chartRange;
+      // 240 buckets across the chosen range — enough to look continuous
       // without redrawing thousands of raw 3 s focus-poll samples every
-      // tick; a wider window would ask for a proportionally wider bucket.
+      // tick; a wider window asks for a proportionally wider bucket.
       const bucketS = Math.max(15, (t1 - t0) / 240);
       const [inS, outS] = await Promise.all([
         inM ? App.get(`/api/nodes/devices/${deviceId}/series`,

@@ -3004,6 +3004,16 @@ check("via uplink to" in _RESOLVE60,
 check("loc.uplink" in _RESOLVE60 and "loc.uplink_to" in _RESOLVE60,
       "...reading the uplink/uplink_to fields the mac-search API returns")
 
+# --- 61. 5.18.0: the interface dialog's bandwidth chart has a range picker -
+NODES61 = read("nodes.js")
+_ifd_body = NODES61[NODES61.index("function interfaceDialog("):]
+check("id=\"ifd-range\" aria-label=\"Chart range\"" in _ifd_body,
+      "interfaceDialog's BANDWIDTH bar has a #ifd-range select")
+check("App.fillRanges(box.querySelector('#ifd-range')" in _ifd_body,
+      "...filled by App.fillRanges, the same helper #ndd-loss-range uses")
+check("t1 - chartRange" in _ifd_body,
+      "refreshChart reads the window from chartRange, not a hard-coded hour")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

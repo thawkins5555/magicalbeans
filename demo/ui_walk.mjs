@@ -578,6 +578,14 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
     await page.waitForSelector('#modal:not([hidden]) #ifd-chart', { timeout: 10000 });
     await settle(page, 1000);
     await shoot(page, dir, shot('dlg', 'interface'));
+    // 5.18.0: the bandwidth chart's range selector redraws on change.
+    const rangeSelect = page.locator('#modal:not([hidden]) #ifd-range');
+    if (await rangeSelect.count()) {
+      await rangeSelect.selectOption({ label: 'Last 6 hours' });
+      await settle(page, 1000);
+      const svgChildren = await page.locator('#modal:not([hidden]) #ifd-chart-svg *').count();
+      if (!svgChildren) throw new Error('chart is empty after changing #ifd-range');
+    }
     return 'opened';
   });
 
