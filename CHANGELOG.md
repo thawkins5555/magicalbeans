@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.18.0 — Port names, device names everywhere, IPAM in-use rows, MIB auto-assign, chart ranges, mapper drawing and matching](#5180--port-names-device-names-everywhere-ipam-in-use-rows-mib-auto-assign-chart-ranges-mapper-drawing-and-matching)
 - [5.17.0 — Uplink-clean Find box, chart tooltips, syslog name search, neighbour name and IP](#5170--uplink-clean-find-box-chart-tooltips-syslog-name-search-neighbour-name-and-ip)
 - [5.16.0 — Profile overrides, device-fed IPAM, per-sensor thresholds, power supplies](#5160--profile-overrides-device-fed-ipam-per-sensor-thresholds-power-supplies)
 - [5.15.0 — Software and firmware, for every catalog vendor](#5150--software-and-firmware-for-every-catalog-vendor)
@@ -145,6 +146,111 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.18.0 — Port names, device names everywhere, IPAM in-use rows, MIB auto-assign, chart ranges, mapper drawing and matching
+
+Nine operator asks, each traced to a cause before anything was changed.
+
+**A switch's Neighbours tab used to show a port as "if 12" instead of the
+port's real name.** The remote-port label is looked up by the port's
+ifIndex, but LLDP reports its own local-port number, which several
+vendors' agents number differently from the ifIndex — so the lookup
+missed and fell back to the bare number. The interface poll now also
+collects each port's ifName (`ifXTable`'s `ifName` column, not just
+`ifDescr`/`ifAlias`), and the LLDP walk builds its own local-port-number
+→ ifIndex map from the neighbour's own lldpLocPortTable — the subtype-7
+"local" form when the value is already an ifIndex, the subtype-5
+interfaceName or the port description matched against a device's own
+port names otherwise — before falling back to today's behaviour. A
+Gi1/0/10-style short name now shows wherever the mapping can be made.
+Files: `nodeoids.py`, `nodepoll.py`, `nodesdb.py`, `web/api.py`, `nodes.js`.
+
+**A neighbour that was never given a name of its own showed only its IP,
+even when the fleet already knew a name for it.** The SQL that matches a
+neighbour row to a known device only ever returned the stored device
+name — which is the IP itself for a device nobody has named — and a
+device whose reported sysName differs from its Nodes name, or whose
+chassis id isn't a MAC, matched nothing in that query at all. A single
+name chain (manual name, then sysName, then a stored name that isn't
+the IP, then the reverse-DNS cache, then the IP) now supplies the name
+for every matched Neighbours row, and rows the SQL can't match are also
+tried by address the same way the IP-matched path already worked. Files:
+`namelookup.py`, `nodesdb.py`, `web/api.py`.
+
+**A statically-addressed device sitting inside a DHCP scope's range
+looked like free capacity.** The DHCP leases grid only ever read the
+`dhcp_leases` table, so an address IPAM's own sweep could see was alive
+and in-range, but that had no lease and no reservation, never appeared
+on the grid at all — it just looked like an unused address. The grid
+now also lists those addresses, each row's **State** column reading "in
+use, not leased" so it reads as occupied rather than invisible; the CSV
+export carries the same rows. Files: `web/api.py`, `ipam.js`.
+
+**Add-neighbours on the Mapper offered a peer named only by its raw LLDP/
+CDP fields, with no attempt to look up who it actually was.** Building
+the candidate list, and drawing the links themselves, both skipped the
+name chain and IP-based matching that Nodes' own Neighbours tab already
+had — so a peer Nodes could name by address showed up on the map only
+as its sysName, platform string or chassis id, and a neighbour placed by
+IP match drew no link at all once both ends were on the map. Both the
+candidate list and link assembly now share the same IP-based match Nodes
+uses, and a matched peer is offered — and drawn — as the managed device
+it is rather than an unmanaged guess. Files: `web/api.py`, `mapper.py`.
+
+**A MIB the application picked for a device by itself counted as if an
+operator had pinned it, so every auto-identified device showed an
+override that didn't exist.** `_auto_assign_mib` writes the same
+`devices.mib_file_id` column a hand-picked MIB uses, and the overrides
+count treats any non-NULL value there as one. A new `mib_file_auto` flag
+marks a MIB the application chose for itself; the overrides count and
+filter now skip it, and picking a MIB by hand — or removing it — clears
+or resets the flag so a real choice still counts as one. The device pane
+still shows which MIB is in use, marked "(assigned automatically)" when
+it is. Files: `nodesdb.py`, `nodepoll.py`, `web/api.py`, `nodes.js`.
+
+**The per-port bandwidth chart could only ever show the last hour.** The
+loss chart has offered a range dropdown for a while; the interface
+dialog's own chart never got the same control, so a burst from three
+hours ago had no way to be looked at after the fact. It now has the same
+range list as the Packet loss chart, redrawing at once when the range is
+changed; the fifteen-second live refresh is unaffected. Files: `nodes.js`.
+
+**Mapper links drew over their own port and VLAN labels, and a trunk's
+VLAN numbers piled up in one unreadable stack.** Labels painted before
+the boxes and links that then covered them; every strand of a trunk put
+its VLAN number at the same point on the line, so a handful of VLANs
+read as an illegible smear the moment there was more than one. Labels
+now draw last, on a small halo so a link crossing under them stays
+legible; strand spacing has a floor so strands never crowd tighter than
+they're readable, and each strand's VLAN number is staggered along the
+link instead of stacked at the midpoint. Files: `mapper.js`, `mapper.py`,
+`app.css`.
+
+**A neighbour the Nodes page could place by address was invisible to the
+Mapper, and no link drew even once both devices were on the map.** The
+Mapper's own matching only ever knew the SQL join Nodes' Neighbours tab
+also uses (sysName or chassis MAC); a neighbour Nodes placed by IP match
+was offered as an unmanaged peer instead of the real device, or skipped
+outright, and produced no link. The IP-based match is now shared code,
+applied before the Mapper builds its candidate list and assembles links,
+so a neighbour placed by address behaves the same way here as it already
+does on Nodes. Files: `web/api.py`, `mapper.py`.
+
+**Every Nodes report listed the device column as a bare IP whenever a
+device had no manual name, even when its sysName or a DNS entry would
+have named it.** Availability, Top-N and Firmware inventory each built
+their own device label from `name or ip` — Firmware inventory's own name
+column, specifically, alongside a `device` column that already did this
+right. All three reports (and their CSV exports, which read the same
+rows) now go through the same name chain the Neighbours fix above uses,
+falling back to the IP only when nothing else answers. Files: `report.py`,
+`namelookup.py`, `web/api.py`.
+
+**Still showing bare IPs (next round):** Alerts, Events, NetFlow talker
+labels, Dashboard tiles, Wireless, IPAM host names — sites listed by
+Thing1's sweep.
+
+Verification: (filled by Bob)
 
 ### 5.17.0 — Uplink-clean Find box, chart tooltips, syslog name search, neighbour name and IP
 

@@ -1008,6 +1008,16 @@ own subtabs.
   device that answers SNMP, switchable off under Settings → Nodes), mark
   confidence in the results table, hint at the bundle to install, and carry
   the verdict into the device on promotion.
+- **From 5.18.0, a MIB the application chose for a device by itself no
+  longer counts as an operator override.** Auto-assigning a MIB writes the
+  same column a hand-picked MIB uses, so every auto-identified device used
+  to show up on the Overrides count and the overrides-only filter as if
+  someone had pinned it. A MIB the application assigned is now marked as
+  such internally, and is skipped by both the count and the filter; the
+  device dialog's MIB select still shows which one is in use, labelled
+  "(assigned automatically)" when it is one of these, so the choice stays
+  visible even though it no longer counts as an override. Choosing a MIB
+  by hand, or removing it, still counts exactly as before.
 
 ### Drill-down
 
@@ -1179,6 +1189,14 @@ the sample spacing, and the axis grows immediately for a real spike but does
 not shrink for a small dip. The figures in the dialog's text still refresh
 every five seconds; the chart redraws every fifteen, when it has a whole new
 point to show.
+
+**From 5.18.0, the chart has a range selector, the same list the Packet
+loss chart already offers.** It used to be pinned to the last hour with no
+way to look further back, so traffic from earlier in the day had already
+scrolled out of view by the time anyone went looking for it. Choosing a
+different range redraws the chart at once, at that range's own bucket
+size; the fifteen-second live refresh continues underneath it exactly as
+before.
 
 **Bandwidth is still a per-port question, so it is still asked per port** —
 there is no device-level bandwidth chart or metric picker. Clicking an
@@ -1481,6 +1499,22 @@ From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
   cell shows the name on one line and the address on the next, from
   whichever source found each one, instead of showing only whichever it
   had.
+- **From 5.18.0, the Local port column shows a port's short name — Gi1/0/10,
+  not "if 12".** LLDP reports its own local-port number, which several
+  agents number differently from that port's ifIndex, so the label used to
+  fall back to a bare "if N" whenever the two disagreed. The interface poll
+  now also collects each port's ifName, and the LLDP walk maps a
+  neighbour's local-port number back to the right ifIndex from the same
+  device's own lldpLocPortTable before naming it — falling back to today's
+  match-by-description, then the bare number, only where that mapping
+  can't be made.
+- **From 5.18.0, a matched Neighbours row is named the same way everywhere
+  else in the fleet is now named** — a manual name, then sysName, then a
+  stored name that isn't just the IP, then the reverse-DNS cache — rather
+  than whatever the matching device's own row happened to hold. A device
+  whose sysName differs from its Nodes name, or whose chassis id isn't a
+  MAC, can now also be matched and named by the address the LLDP/CDP walk
+  reported, the way an address-only chassis id already was from 5.11.0.
 - **The device pane gains NEIGHBOURS and BRIDGE & RF sections.** NEIGHBOURS
   lists what that device's own ports have reported; BRIDGE & RF shows STP
   bridge and per-port state (BRIDGE-MIB) and, for a radio, RSSI, remote
@@ -1567,6 +1601,15 @@ not shown. A **Firmware** column sits beside Software, filled from the
 same expanded vendor coverage described above. Both CSV exports (on-screen
 and server-built) add `device`, `name_source`, `fw_version`, `sw_source`
 and `fw_source` after the existing columns.
+
+**From 5.18.0, Availability and Top-N by metric name a device the same
+way Firmware inventory already did, and Firmware inventory's own bare
+`name` column follows it too.** All three used to fall back straight to
+the IP the moment a device had no manual name, even when its sysName or
+a reverse-DNS entry would have named it — Firmware inventory's `device`
+column got this right in 5.15.0, but its plain `name` column, and both
+other reports entirely, still hadn't. All three, and their CSV exports,
+now resolve every device through the same name chain.
 
 Availability and Top-N build their **Export CSV** from the rows already on
 screen. Firmware inventory has that same button plus a **Download CSV
@@ -3095,6 +3138,16 @@ the scope detail lists those addresses alongside where IPAM last saw
 them. Nothing here is alerted on; the count is there to be seen on the
 scope card.
 
+**From 5.18.0, those same addresses appear as rows in the Leases table
+itself, not only on the donut.** The grid used to read the DHCP server's
+own lease table alone, so a statically-numbered device inside the scope
+had nowhere to show up on the table an operator actually works from. One
+row per in-use-not-leased address is now mixed into the grid alongside
+the server's own leases, its **State** column reading "in use, not
+leased" rather than a lease time, with no reservation or expiry shown
+since it has neither. The count line reads "N lease(s) · M in use, not
+leased", and the CSV export carries the same rows.
+
 Needs PowerShell with the `DhcpServer` module — part of RSAT: DHCP Server
 Tools. For ambient identity or Credential Manager, that's on the machine
 running SappiWhere, not necessarily the DHCP server itself. For a stored
@@ -3609,6 +3662,30 @@ like any other module.
   selecting things on it. It is a view preference remembered per browser,
   not written to the map itself, and Space+drag and the middle button
   still pan regardless of how it's set.
+- **From 5.18.0, port and VLAN labels draw above node boxes and links,
+  not underneath them.** Labels were still drawn into a layer beneath the
+  boxes and links themselves, so a node or a later-drawn strand kept
+  painting over a label the halo (5.16.0, above) alone couldn't rescue.
+  They now draw last, on the same halo, so nothing subsequently drawn can
+  cover them.
+- **From 5.18.0, a trunk's VLAN numbers no longer stack on top of each
+  other.** Every strand of a trunk put its own VLAN number at the exact
+  midpoint of the link, so two or more strands read as one illegible
+  smear the moment there was more than one VLAN to show. Each strand's
+  number now sits at its own point staggered along the link, spaced far
+  enough apart to read individually; a link too short for that falls back
+  to the midpoint rather than crowding. Strand spacing itself also has a
+  floor, so a trunk carrying only a couple of VLANs draws strands wide
+  enough apart to tell apart rather than a few pixels off centre.
+- **From 5.18.0, Add-neighbours names a peer the same way, and draws the
+  same links, whether it's found by name or by address.** A peer Nodes
+  itself could place and name by address (see Neighbours, above) used to
+  reach the Mapper as an unmatched, unmanaged guess — named only by
+  whatever raw sysName, platform or chassis id its own LLDP/CDP row
+  carried — and once both ends of such a link were placed, no line drew
+  between them at all. Add-neighbours and link drawing both now share the
+  same address-based match Nodes uses, so a peer matched that way is
+  offered, named and linked as the managed device it is.
 
 ---
 

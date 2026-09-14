@@ -840,6 +840,29 @@ honest fix is a test that asserts each `VERIFIED` arc against a checked-in
 extract of the IANA registry, which would turn the claim into something CI
 keeps true; until that exists the docstring is the claim, and it is wrong.
 
+### mib_file_auto: an assigned MIB is not an override (`nodesdb.py`, `nodepoll.py`, `web/api.py`) — 5.18.0
+
+`_auto_assign_mib` (`nodepoll.py`) writes `devices.mib_file_id` — the same
+column a hand-picked MIB uses — the first time a device's own vendor
+identification names one and no preference exists yet. `mib_file_id` is
+also an `_OVERRIDE_COLUMNS` entry, and `override_fields`/`_OVERRIDES_SQL`
+(`nodesdb.py`) used to count *any* non-NULL value there as an operator
+override, so every auto-identified device showed one it never earned — the
+Overrides column and the overrides-only filter (`overridesTag`, `nodes.js`)
+had no way to tell "the application picked this" from "an operator pinned
+this". A new `devices.mib_file_auto INTEGER` column, set to 1 whenever
+`_auto_assign_mib` is what wrote `mib_file_id`, is what makes that
+distinction: `override_fields` and `_OVERRIDES_SQL` both skip `mib_file_id`
+when `mib_file_auto = 1`, so an auto-assigned MIB counts as zero overrides
+and a hand-picked one still counts as one. The device edit route clears
+`mib_file_auto` whenever `mib_file_id` is present in the PUT body — a
+person choosing a MIB, even one that happens to match what auto-assignment
+already picked, is still a real choice — and `remove_mib_file` NULLs both
+columns together so a cleared MIB never leaves a stale auto flag behind.
+`_auto_assign_mib`'s own "only where nothing already chose one" rule is
+unchanged; the device JSON carries `mib_file_auto` so the pane can label the
+MIB select "(assigned automatically)" without hiding which MIB is in use.
+
 ### Identity OIDs (`nodesdb.py`, `nodepoll.py`, `nodeoids.py`)
 
 `vendor_oid` and `location_oid` are ordinary members of `_OVERRIDE_COLUMNS`
@@ -919,6 +942,49 @@ where the two were the same value by definition. `vendor_source` —
 away; it is now stored, because an IANA arc assignment and a sysDescr
 substring guess are not equally trustworthy and the header used to present
 them identically.
+
+### ifName and the LLDP local-port map (`nodeoids.py`, `nodepoll.py`, `nodesdb.py`) — 5.18.0
+
+**A Neighbours row's Local port used to read "if 12" whenever LLDP's own
+port numbering didn't line up with the port table.** `_neighbor_local_port_
+labeler` (`web/api.py`) names a local port by looking `if_index` up in
+`interfaces.descr`/`alias`, falling back to `"if N"` when nothing has that
+index — and LLDP's own `lldpRemLocalPortNum` is the *neighbour's* local
+port number, which several vendors' agents number independently of the
+ifIndex `nodepoll` itself walks (`nodeoids.py`'s own comment on the arc
+admits as much). No ifName was ever collected either, only ifDescr and
+ifAlias, so even a correctly-indexed row could only ever show a
+description, never the shorter port name most engineers actually read off
+a switch.
+
+`nodeoids.IFX_TABLE` gains `"if_name": "1.3.6.1.2.1.31.1.1.1.1"`
+(`ifName`), walked alongside `ifDescr`/`ifAlias` by the same interface poll
+and stored as a new nullable `interfaces.name` column (`ensure_columns`);
+`replace_interfaces` carries it through on both insert and update, and
+`interface_port_labels_for_devices`/`interface_port_labels` select it as a
+fourth column. `_neighbor_local_port_labeler` now prefers `name`, then
+`descr`, then `alias` — the interfaces table and the interface dialog
+title are unchanged, since the operator only asked for the Neighbours
+label to shorten, not for the interfaces list's own Descr column.
+
+**The local-port-number mismatch itself is fixed at the source, not papered
+over in the labeler.** `_walk_lldp` (`nodepoll.py`) now also walks
+`lldpLocPortTable`'s `lldpLocPortIdSubtype` and `lldpLocPortId`
+(`nodeoids.LLDP_LOC_PORT_ID_SUBTYPE`/`LLDP_LOC_PORT_ID`) and
+`lldpLocPortDesc` (`LLDP_LOC_PORT_DESC`), once per polling pass, and builds
+a `local_port_num → if_index` map for the device being walked: subtype 7
+("local", the port's own ifIndex as an integer) is trusted outright; subtype
+5 ("interfaceName") and, failing that, the port description are matched
+against a device's own interface `name`/`descr` through the same
+canonicalising comparison `_canonical_if_name` already uses elsewhere in
+this file; a local port number this can't place at all falls through to
+today's identity behaviour (`local_port_num` treated as an ifIndex
+directly). Stored `lldpRem` rows carry the *mapped* `if_index`, so
+`_neighbor_local_port_labeler` needs no LLDP-specific logic of its own —
+by the time it runs, the row already names the right port. This walk is
+kept out of `complete`, the same as the management-address walk it sits
+beside: a device that doesn't answer it degrades to identity mapping
+rather than failing the poll.
 
 ### Software version and image (`swversion.py`, `nodepoll._poll_software_version`) — 5.10.0
 
@@ -3755,6 +3821,23 @@ poller in the loop.
   rows carrying their own management address (above) also widens
   `_neighbor_ip_candidates`'s matching, since a neighbour whose sysName
   differs from its Nodes name can now match on address instead.
+- **From 5.18.0, `nodesdb.neighbour_device_matches(rows)` factors the
+  IP-match step above out of `_resolve_neighbor_names` so the Mapper can
+  apply it too.** Before this, a neighbour row the SQL join left unmatched
+  only ever got a name and a device id when the *Nodes* Neighbours route
+  ran `_resolve_neighbor_names` over it; `get_mapper_map` and
+  `get_mapper_map_candidates` built their own candidate/link data straight
+  off `neighbours_for_devices` with no equivalent step, so a peer Nodes
+  could place by address reached the Mapper as an unmatched, unmanaged
+  guess, and drew no link at all once both ends were placed. Both routes
+  now run their rows through `neighbour_device_matches` before handing them
+  to `assemble_links`/candidate building, exactly the address lookup
+  (`_neighbor_ip_candidates` → `namelookup.device_for_ip` → one batched
+  `app_db.hostnames()`) Nodes already used — read-only, cache-backed, never
+  a live query. The far-end `matched_if_index` for a row matched this way
+  stays `None` either way: nothing here says which of the matched device's
+  own ports faces the cable, so the link still draws off the reported
+  remote-port text, the same as any other name-matched row.
 - **VLANs on a link are the union of what each end's own port reports,
   never the intersection.** A trunk is only really usable for a VLAN both
   ends allow, so intersection looks like the "more correct" answer — but
@@ -3830,6 +3913,23 @@ poller in the loop.
   (that pair would leave no strand mode ever reachable), but `render_plan`
   itself has no way to know its caller validated anything, so it enforces
   the cap unconditionally either way.**
+- **From 5.18.0, `render_plan` also fixes how tight strands can pack and
+  where each strand's VLAN number sits along the link.** `width_min * 2`
+  (above) is roughly 3 px for the default `width_min`, so a link with only
+  a couple of VLANs drew its strands close enough together that the label
+  layering fix (below) still left their numbers overlapping. Spacing is now
+  `max(width_min * 2, STRAND_GAP_PX)`, `STRAND_GAP_PX = 6`, so a lightly
+  loaded trunk's strands never sit closer than that regardless of
+  `width_min`. `render_plan`'s result also carries a `label_step`: rather
+  than every strand's VLAN number sitting at the link's exact midpoint —
+  which is what actually piled the numbers on top of each other — strand
+  `i` of `n` places its label at fraction `0.5 + (i - (n - 1) / 2) *
+  label_step` along the line, `label_step` chosen so adjacent labels land
+  at least 22 px apart; a link too short for that spacing falls back to the
+  shared midpoint rather than drawing labels off the ends of the line.
+  `mapper.js` reads `label_step` rather than computing its own, for the
+  same one-place-not-two reason the rest of this function's maths lives
+  server side.
 
 **`detect_role(vendor, sys_descr, sys_object_id, platform, unmanaged)`** is
 a node's auto-detected role, pure and side-effect free — a classification
@@ -5772,6 +5872,37 @@ plus `fw_version`, `sw_source` and `fw_source` carried straight off the
 device row. The CSV header appends `device`, `name_source`, `fw_version`,
 `sw_source`, `fw_source` after the pre-5.15.0 columns, so an existing
 column position is never disturbed.
+
+**One name chain, from 5.18.0, applied everywhere a device gets a display
+name.** `report.device_label(row, dns_names)` already existed — manual
+name pinned first, then `sysName`, then a stored `name` that isn't just
+the device's own IP, then the `dns_names` reverse-DNS cache, then the IP
+as the last resort — but Firmware inventory's `device` column (above) was
+its only caller; Availability's and Top-N's own device labels, and
+Firmware inventory's separate bare `name` field, still built `row["name"]
+or ip` by hand and so still showed a bare IP whenever `name` was empty,
+even when a `sysName` or a DNS entry would have named the device.
+`namelookup.display_names(nodes_db, app_db, devices)` is the new
+`{device_id: name}` helper that calls `device_label()` per row with one
+batched `app_db.hostnames()` read behind it, so a caller who just wants
+names for a set of devices doesn't re-derive `device_label`'s own
+precedence by hand. `namelookup.device_name` (used by Syslog's Host
+column) is the Nodes-only half of the same idea and is unchanged; the two
+exist because Syslog's caller never has a `report.py`-shaped row to feed
+`device_label` directly.
+
+`get_nodes_reports_availability`, `get_nodes_reports_top_metrics` and
+`get_nodes_reports_firmware` (`web/api.py`) all now pass `dns_names` from
+`app_db.hostnames` the way the firmware route already did, and
+`device_availability_report`/`top_metric_ranking`/`firmware_inventory`
+(`report.py`) run every row's name through `device_label` — Firmware
+inventory's `name` column included, so it agrees with its own `device`
+column instead of the two disagreeing about whether a name was actually
+known. The Neighbours matching described above (`api._resolve_neighbor_
+names`, `nodesdb.neighbour_device_matches`) and the Mapper's shared use of
+it are the other two callers this same release adds; none of the three
+CSV exports needed a schema change, since they already read the same rows
+their JSON routes build.
 
 ---
 

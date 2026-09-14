@@ -549,3 +549,46 @@ tooltips show the time and the value at the cursor; the syslog case is the
 free-text box, with the Host column already showing the Nodes name that
 free text could not search on.
 → Plan approved; work assigned across the roster.
+
+## 5.18.0 — Port names, device names everywhere, IPAM in-use rows, MIB auto-assign, chart ranges, mapper drawing and matching
+
+**The 5.18.0 work list**, nine items:
+
+1. "Local port shows 'if 12' instead of a real port name."
+2. "Remote device on Neighbours shows only the IP, no name."
+3. "IPAM addresses that are in use but not leased don't show on the DHCP
+   grid."
+4. "Mapper's Add-neighbours list doesn't resolve names for peers."
+5. "A MIB the app picked itself counts as an override."
+6. "The interface bandwidth chart is stuck at one hour."
+7. "Mapper draws labels under the link lines, and VLAN numbers stack on
+   top of each other."
+8. "Mapper misses a neighbour that Nodes can place by IP, and draws no
+   link for it."
+9. "Reports show the bare IP twice — once where a name should be."
+→ Traced and planned before any agent started; see the planning answers
+below.
+
+**Planning answers** — Local port should show the short ifName form
+(Gi1/0/10); the interface chart gets the same range list as the Packet
+loss chart; IPAM's in-use-not-leased addresses are mixed into the lease
+grid itself, with the State column saying "in use, not leased" rather
+than sitting only on the summary donut.
+→ Causes traced for all nine; plan drafted.
+
+**"i have updated the CLAUDE.md file can you please confirm you see it and
+understand its directions?"**
+→ Confirmed: exploration from here on must go through the deep-code-explorer
+skill, reporting back in its six-section form.
+
+**Further planning answers** — the Mapper fix has to cover both what
+Add-neighbours offers and what actually draws as a link, not just the
+candidate list; this round's name-chain sweep covers Reports, Neighbours
+and the Mapper, with every other bare-IP site (Alerts, Events, NetFlow
+talker labels, Dashboard tiles, Wireless, IPAM host names) listed for a
+future round rather than touched now.
+→ Plan updated to match.
+
+**Plan approved.**
+→ Work assigned across the roster; lanes run in parallel in main's working
+tree.
