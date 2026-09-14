@@ -5884,6 +5884,20 @@ back as the same shape; `AlertEngine._sms_token()` and
 rather than the old bare SID equality; `sms_credential_sid()` remains
 for callers that only want the Account SID.
 
+**From 5.20.2, `send_sms()` gets its TLS context from
+`alertmail.tls_context()` rather than building one inline.** Python
+3.13's `ssl.create_default_context()` turns on `VERIFY_X509_STRICT`,
+which enforces RFC 5280's extension-presence rules and refuses a
+non-self-issued certificate that lacks an Authority Key Identifier —
+what an SSL-inspecting firewall or an internal CA typically issues, and
+what Twilio's own chain always carries. `tls_context()` builds the
+ordinary verified context (system trust store, hostname checking,
+`CERT_REQUIRED`) and clears only that one flag; `_https_opener()` wraps
+it for `urllib.request` the same way `send_sms()`'s opener already did.
+The webhook sender and the SMTP sender's verify-certificate branch call
+the identical helper, so all three channels relax the same one check in
+the same one place rather than three contexts drifting apart over time.
+
 ### Reports (`report.py`, `web/api.py`) — 4.49.0
 
 Sits above `nodesdb.py`/`alertsdb.py` rather than inside either — it reads

@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.20.2 — TLS behind an inspecting firewall](#5202--tls-behind-an-inspecting-firewall)
 - [5.20.1 — SMS consent notice](#5201--sms-consent-notice)
 - [5.20.0 — Twilio API keys](#5200--twilio-api-keys)
 - [5.19.0 — Twilio SMS on alerts](#5190--twilio-sms-on-alerts)
@@ -149,6 +150,45 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.20.2 — TLS behind an inspecting firewall
+
+An operator's **Send test text** failed immediately with `[SSL:
+CERTIFICATE_VERIFY_FAILED] certificate verify failed: Missing Authority
+Key Identifier`. Twilio's own certificate chain carries that extension,
+so the failure meant something between this host and Twilio was
+re-signing the connection — an SSL-inspecting firewall or an internal
+CA, using a certificate the machine already trusts.
+
+**Python 3.13 turned on a stricter check by default.**
+`ssl.create_default_context()` now sets `VERIFY_X509_STRICT`, which
+enforces RFC 5280's extension-presence rules and refuses any
+non-self-issued certificate that lacks an Authority Key Identifier —
+exactly what SSL-inspecting firewalls and many internal CAs issue, and
+exactly what a publicly-trusted CA like Twilio's never omits. A machine
+on Python 3.13 behind such a firewall could no longer complete a TLS
+handshake with Twilio, the webhook target, or an SMTP server, even
+though the same certificate chain was trusted fine a version earlier.
+
+**One helper, shared by all three senders.** `alertmail.tls_context()`
+builds the ordinary verified context — system trust store, hostname
+checking, `CERT_REQUIRED` — and clears only the `VERIFY_X509_STRICT`
+flag; `alertmail._https_opener()` wraps it for `urllib`. The Twilio
+sender (`send_sms`), the webhook sender, and the SMTP sender's
+verify-certificate branch all call it now, rather than each building
+its own context.
+
+**Deliberately unchanged.** The SMTP "verify certificate" opt-out still
+builds `ssl._create_unverified_context()` when an operator has turned
+verification off in Settings — that remains the only unverified path in
+this application. The LDAP client and the self-updater build their own
+SSL contexts and neither is touched by this release.
+
+Files: `alertmail.py`.
+
+Verification: `test_alert_sms.py` §2b checks the context's flags
+(`VERIFY_X509_STRICT` cleared, everything else at its default) and that
+`_https_opener()` carries the same context.
 
 ### 5.20.1 — SMS consent notice
 

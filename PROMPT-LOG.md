@@ -658,3 +658,12 @@ a verbal script; drafted the reply and the consent wording.
 **"Add the consent notice and push to main"**
 → Thing2 added the notice and a contract check, Stephen_King the docs,
 Javariius reviewed, branch pushed and main fast-forwarded.
+
+## 5.20.2 — TLS behind an inspecting firewall
+
+**"After adding the correct from number I get this error: ... Missing
+Authority Key Identifier"** — diagnosed as Python 3.13's stricter
+`VERIFY_X509_STRICT` X.509 checking meeting an SSL-inspecting firewall's
+re-signed certificate; one shared verified context, with that one flag
+cleared, now used by the Twilio, webhook and SMTP senders alike.
+→ Javariius reviewed; branch pushed and main fast-forwarded.

@@ -466,6 +466,18 @@ verification off is a real, logged configuration choice — an explicit
 opt-out visible in the settings dialog — never a silent downgrade a
 misconfiguration could trigger by accident.
 
+From 5.20.2, the verified branch builds its context with
+`alertmail.tls_context()`, which clears Python 3.13's
+`VERIFY_X509_STRICT` flag so a certificate re-signed by an SSL-inspecting
+firewall or an internal CA — one that omits the Authority Key
+Identifier extension RFC 5280 makes optional — is no longer refused on
+that ground alone. This does not weaken trust: the chain is still
+validated against the system trust store and the hostname is still
+checked, exactly as before, only the extension-presence checks Python
+3.13 added on top of that are relaxed. The explicit "verify certificate
+off" opt-out above remains the only path that skips verification
+outright.
+
 ## 5a. The optional Twilio Auth Token (Alerts SMS), from 5.19.0
 
 Alerts' text-message channel (`netpath/alertmail.py`, `netpath/alertsdb.py`)
