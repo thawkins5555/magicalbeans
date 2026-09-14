@@ -1,4 +1,4 @@
-"""One verified TLS context for every outbound HTTPS/TLS client."""
+"""One verified TLS context for every outbound HTTPS client."""
 import os
 import ssl
 
@@ -16,5 +16,5 @@ def verified_context(cafile: str | None = None) -> ssl.SSLContext:
         try:
             context.load_verify_locations(cafile=cafile)
         except ssl.SSLError:
-            pass
+            pass  # a corrupt bundle shouldn't break the system store's own certs
     return context

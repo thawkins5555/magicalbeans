@@ -15,6 +15,7 @@ import os
 import subprocess
 import ssl
 import sys
+import tempfile
 import threading
 import time
 
@@ -162,6 +163,15 @@ try:
     check("verified_context ignores a missing cafile and still returns a working context",
           working.verify_mode == ssl.CERT_REQUIRED and working.check_hostname is True
           and working.verify_flags == _expected_flags, working.verify_flags)
+    with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as garbage:
+        garbage.write("not a certificate\n")
+    try:
+        corrupt = tlscontext.verified_context(cafile=garbage.name)
+        check("verified_context swallows a corrupt cafile and keeps the system store",
+              corrupt.verify_mode == ssl.CERT_REQUIRED
+              and corrupt.verify_flags == _expected_flags, corrupt.verify_flags)
+    finally:
+        os.unlink(garbage.name)
 
     print("httpcheck.check: timeouts")
     started = time.monotonic()

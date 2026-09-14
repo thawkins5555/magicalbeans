@@ -170,8 +170,10 @@ delegates to it, and `selfupdate._ssl_context()` builds on it the same
 way, adding the vendored cacert bundle as before. Because the HTTPS
 monitor (`httpcheck.check()`) already takes its context from
 `selfupdate._ssl_context()`, it picks up the fix through that same
-call, with no change to `httpcheck.py` itself: the NetPath HTTPS page
-check and the self-updater's GitHub calls now verify exactly alike.
+call, with no change to `httpcheck.py` itself, and so does the MIB
+catalog download (`mibcatalog.py`): the NetPath HTTPS page check, the
+self-updater's GitHub calls and the catalog fetch now verify exactly
+alike.
 
 **Deliberately unchanged.** The HTTPS monitor's "insecure" opt-out and
 the SMTP verify-off opt-out still build
