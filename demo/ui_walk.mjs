@@ -713,6 +713,20 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
     const labels = await page.locator('#mp-svg .mp-link-label').count().catch(() => 0);
     if (before && before === after) throw new Error('drag with Drag pans ticked did not pan');
     if (rubber && rubber !== 'none') throw new Error('rubber band drawn while Drag pans was ticked');
+    // 5.18.0: the label layer paints above the node layer, so port/VLAN
+    // text is never hidden under a node box.
+    const layerOrder = await page.evaluate(() => {
+      const g = document.querySelector('#mp-svg > g');
+      if (!g) return null;
+      const children = [...g.children];
+      const nodeIdx = children.findIndex((c) => c.querySelector('.mp-node-box'));
+      const labelIdx = children.findIndex((c) => c.querySelector('.mp-link-label'));
+      return { nodeIdx, labelIdx };
+    });
+    if (layerOrder && layerOrder.nodeIdx !== -1 && layerOrder.labelIdx !== -1
+        && layerOrder.nodeIdx >= layerOrder.labelIdx) {
+      throw new Error(`label layer does not paint above the node layer: ${JSON.stringify(layerOrder)}`);
+    }
     return `panned (${before || 'none'} -> ${after || 'none'}), ${labels} link label(s)`;
   });
 

@@ -18,6 +18,7 @@ from netpath.mapper import (
     LINK_CSV_HEADER,
     LINK_PROTOCOLS,
     ROLES,
+    STRAND_GAP_PX,
     VLAN_PALETTE_SIZE,
     assemble_links,
     detect_role,
@@ -284,9 +285,27 @@ check("...with one strand per VLAN",
 offsets = [s["offset"] for s in plan_strands["strands"]]
 check("...offsets symmetric about the centre line (sum ~= 0)",
       abs(sum(offsets)) < 1e-9, offsets)
-check("...offsets spaced by width_min * 2",
-      all(abs((offsets[i + 1] - offsets[i]) - 4.0) < 1e-9 for i in range(len(offsets) - 1)),
+check("...offsets spaced by max(width_min * 2, STRAND_GAP_PX)",
+      all(abs((offsets[i + 1] - offsets[i]) - max(4.0, STRAND_GAP_PX)) < 1e-9
+          for i in range(len(offsets) - 1)),
       offsets)
+check("...and label_step is present, positive and symmetric about the midpoint"
+      " (i and its mirror land equally far either side of 0.5)",
+      plan_strands["label_step"] > 0
+      and all(abs((0.5 + (i - (len(vlans_below) - 1) / 2) * plan_strands["label_step"] - 0.5)
+                  + (0.5 + ((len(vlans_below) - 1 - i) - (len(vlans_below) - 1) / 2)
+                     * plan_strands["label_step"] - 0.5)) < 1e-9
+              for i in range(len(vlans_below))),
+      plan_strands.get("label_step"))
+
+# A strand thin enough that width_min * 2 would fall under STRAND_GAP_PX
+# (the common case: width_min defaults to 1.5px) must still be at least
+# STRAND_GAP_PX apart -- otherwise adjacent VLAN colours blur together.
+plan_thin = render_plan({"vlans": [10, 20]}, threshold=8, max_strands=64,
+                        width_min=1.0, width_max=12.0)
+thin_offsets = [s["offset"] for s in plan_thin["strands"]]
+check("a thin strand's spacing is floored at STRAND_GAP_PX, not width_min * 2",
+      abs((thin_offsets[1] - thin_offsets[0]) - STRAND_GAP_PX) < 1e-9, thin_offsets)
 
 plan_collapsed = render_plan({"vlans": list(range(1, 9))}, **RP_KW)  # exactly threshold
 check("exactly `threshold` VLANs -> collapsed mode",
@@ -294,6 +313,9 @@ check("exactly `threshold` VLANs -> collapsed mode",
 check("...at width_min (no jump between strands and collapsed at the boundary)",
       abs(plan_collapsed["width"] - 2.0) < 1e-9, plan_collapsed)
 check("...carrying vlan_count", plan_collapsed["vlan_count"] == 8, plan_collapsed)
+check("plain and collapsed modes carry label_step 0.0 (nothing to stagger)",
+      plan0["label_step"] == 0.0 and plan_collapsed["label_step"] == 0.0,
+      (plan0.get("label_step"), plan_collapsed.get("label_step")))
 
 plan_max = render_plan({"vlans": list(range(1, 65))}, **RP_KW)  # == max_strands
 check("at max_strands VLANs, width reaches width_max",

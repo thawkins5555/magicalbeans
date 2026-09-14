@@ -26,6 +26,16 @@
      file agrees, so the convention only has to be right once. */
   const NODE_W = 176, NODE_H = 54;
   const ICON = 16;   // the role glyph's own viewBox is 16x16
+  // Matches mapper.py's STRAND_LABEL_GAP_PX — the minimum on-screen gap a
+  // staggered VLAN label needs from its neighbour before it's worth
+  // staggering at all.
+  const STRAND_LABEL_MIN_GAP_PX = 22;
+  // Half the node box's diagonal: the farthest a port label could still be
+  // touching the box's own corner, from the edge point edgePoint() returns
+  // (an ellipse inscribed in the box, so a diagonal link's edge point sits
+  // short of the box's actual corner). Insetting by at least this much
+  // clears the box on every link angle, not just axis-aligned ones.
+  const PORT_LABEL_INSET = Math.max(18, Math.hypot(NODE_W / 2, NODE_H / 2));
   // Position writes are debounced rather than sent on every pointermove —
   // a drag across a big map would otherwise queue one PUT per animation
   // frame. 500ms after the last move (or the last align/distribute) is
@@ -820,8 +830,18 @@
             tooltip: () => strandTooltip(link, strand),
           });
         if (view.settings.show_vlan_labels) {
+          // label_step (server-computed, render_plan) staggers each
+          // strand's number along the link instead of stacking every one
+          // at the midpoint; a link too short to fit them 22px apart
+          // falls back to the midpoint, same as before label_step existed.
+          const n = plan.strands.length;
+          const step = plan.label_step || 0;
+          const staggered = n > 1 && step * len >= STRAND_LABEL_MIN_GAP_PX;
+          const frac = staggered ? 0.5 + (i - (n - 1) / 2) * step : 0.5;
           labelLayer.appendChild(App.svgNode('text', {
-            class: 'mp-link-label', x: (from.x + to.x) / 2 + ox, y: (from.y + to.y) / 2 + oy - 3,
+            class: 'mp-link-label',
+            x: from.x + (to.x - from.x) * frac + ox,
+            y: from.y + (to.y - from.y) * frac + oy - 3,
             'text-anchor': 'middle',
           }, `${strand.vlan}`));
         }
@@ -853,7 +873,7 @@
     const dx = to.x - from.x, dy = to.y - from.y;
     const len = Math.max(Math.hypot(dx, dy), 1e-6);
     const ux = dx / len, uy = dy / len;
-    const inset = 18, aside = 8;
+    const inset = PORT_LABEL_INSET, aside = 8;
     if (link.a_port) {
       layer.appendChild(App.svgNode('text', {
         class: 'mp-link-label', x: from.x + ux * inset + nx * aside, y: from.y + uy * inset + ny * aside,
@@ -1195,7 +1215,7 @@
     const linkLayer = App.svgNode('g');
     const labelLayer = App.svgNode('g');
     const nodeLayer = App.svgNode('g');
-    group.append(gridLayer, linkLayer, labelLayer, nodeLayer);
+    group.append(gridLayer, linkLayer, nodeLayer, labelLayer);
     if (shouldDrawGrid() && bounds) drawGrid(gridLayer, bounds);
     // Own <g> per link: redrawDragged refills just the ones that moved.
     for (const link of view.links) {

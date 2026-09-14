@@ -641,6 +641,35 @@ def vlan_color_index(vlan: int, overrides: dict[int, int] | None = None) -> int:
     return hashed >> 28
 
 
+# A strand narrower than this (width_min under ~3 px, the usual case) used
+# to sit only width_min * 2 from its neighbour -- under 6 px apart on
+# screen, close enough that adjacent VLAN colours blurred together. This is
+# the floor `render_plan`'s strand spacing never goes below regardless of
+# width_min.
+STRAND_GAP_PX = 6
+
+# label_step (below) assumes a link at least this long -- two adjacent node
+# boxes plus a working gap, mapper.js's own NODE_W=176 plus room to route --
+# so that staggered VLAN numbers land STRAND_LABEL_GAP_PX apart on a
+# typical link. A shorter link cannot fit them this far apart; the client
+# checks the actual pixel length and falls every label back to the midpoint
+# when it can't.
+STRAND_LABEL_GAP_PX = 22
+_ASSUMED_MIN_LINK_PX = 220
+
+
+def _label_step(count: int) -> float:
+    """Fraction of the link's length between adjacent staggered VLAN
+    labels, for `count` strands. Chosen so that on a link of
+    `_ASSUMED_MIN_LINK_PX` -- the shortest a real link is likely to be --
+    neighbours land `STRAND_LABEL_GAP_PX` apart, while the whole bundle of
+    labels never spans more than 60% of the link (so the outermost labels
+    stay well clear of the node boxes at either end)."""
+    if count <= 1:
+        return 0.0
+    return min(STRAND_LABEL_GAP_PX / _ASSUMED_MIN_LINK_PX, 0.6 / (count - 1))
+
+
 def render_plan(link, *, threshold, max_strands, width_min, width_max,
                 color_overrides=None) -> dict:
     """The drawing instruction for one link, computed once, server side, so
@@ -658,10 +687,11 @@ def render_plan(link, *, threshold, max_strands, width_min, width_max,
         the same look would misreport a trunk as a single-VLAN access link.
       - fewer than `threshold` VLANs, AND fewer than `max_strands`
         ("strands"): one strand per VLAN, drawn side by side. Offsets are
-        spaced `width_min * 2` apart and centred on the link's centre line
-        (symmetric: for N strands they run from -(N-1)*width_min to
-        +(N-1)*width_min), so the whole strand bundle is centred wherever
-        the single-line link would have been, rather than the bundle
+        spaced `max(width_min * 2, STRAND_GAP_PX)` apart and centred on the
+        link's centre line (symmetric: for N strands they run from roughly
+        -(N-1)*spacing/2 to +(N-1)*spacing/2), so the whole strand bundle
+        is centred wherever the single-line link would have been, rather
+        than the bundle
         drifting to one side as VLAN count changes.
       - at or above `threshold`, OR at or above `max_strands`
         ("collapsed"): one thick line, width linearly interpolated between
@@ -693,10 +723,10 @@ def render_plan(link, *, threshold, max_strands, width_min, width_max,
 
     if count == 0:
         return {"mode": "plain", "width": width_min, "strands": [],
-                "known": False, "vlan_count": 0, "vlans": vlans}
+                "known": False, "vlan_count": 0, "vlans": vlans, "label_step": 0.0}
 
     if count < threshold and count < max_strands:
-        spacing = width_min * 2
+        spacing = max(width_min * 2, STRAND_GAP_PX)
         start = -spacing * (count - 1) / 2
         strands = [
             {"vlan": vlan, "color_index": vlan_color_index(vlan, color_overrides),
@@ -704,14 +734,15 @@ def render_plan(link, *, threshold, max_strands, width_min, width_max,
             for i, vlan in enumerate(vlans)
         ]
         return {"mode": "strands", "width": width_min, "strands": strands,
-                "known": True, "vlan_count": count, "vlans": vlans}
+                "known": True, "vlan_count": count, "vlans": vlans,
+                "label_step": _label_step(count)}
 
     span = max_strands - threshold
     frac = (count - threshold) / span if span > 0 else 1.0
     frac = min(max(frac, 0.0), 1.0)
     width = width_min + (width_max - width_min) * frac
     return {"mode": "collapsed", "width": width, "strands": [], "known": True,
-            "vlan_count": count, "vlans": vlans}
+            "vlan_count": count, "vlans": vlans, "label_step": 0.0}
 
 
 LINK_CSV_HEADER = ["A Device", "A Device ID", "A Port", "A Port Mode", "A Native VLAN",

@@ -765,9 +765,11 @@ check(not mapper_ungated,
 #      above every link and carry a canvas-coloured halo; the node box is
 #      wider with a longer name cut; a Drag pans checkbox turns left-drag on
 #      empty canvas into a pan and is a per-browser preference, not a write.
+# 5.18.0: the label layer moved above the node layer too, so a label is
+#      never painted under a node box.
 INDEX_HTML = read("index.html")
-check("group.append(gridLayer, linkLayer, labelLayer, nodeLayer)" in MAPPER,
-      "the label layer sits between links and nodes")
+check("group.append(gridLayer, linkLayer, nodeLayer, labelLayer)" in MAPPER,
+      "the label layer paints above both links and node boxes")
 check("function drawLink(layer, link, labelLayer = layer)" in MAPPER
       and MAPPER.count("labelLayer.appendChild(App.svgNode('text'") == 2
       and "drawPortLabels(labelLayer, link" in MAPPER,
