@@ -29,6 +29,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E40
 
 from netpath import httpcheck                                        # noqa: E402
 from netpath import monitor as monitor_mod                           # noqa: E402
+from netpath import selfupdate                                       # noqa: E402
+from netpath import tlscontext                                       # noqa: E402
 from netpath.db import Database                                      # noqa: E402
 
 TMPDIR = _paths.tmpdir("https_check_")
@@ -131,6 +133,35 @@ try:
           not result.ok and result.error.startswith("TLS:"), result)
     check("...and the opt-out is what accepts it",
           httpcheck.check(f"{BASE}/", timeout_s=5.0, insecure=True).ok)
+
+    print("httpcheck.check: the shared TLS context")
+    ctx = selfupdate._ssl_context()
+    check("selfupdate._ssl_context requires and verifies a certificate",
+          ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname is True)
+    _strict = getattr(ssl, "VERIFY_X509_STRICT", 0)
+    _expected_flags = ssl.create_default_context().verify_flags & ~_strict
+    check("...but VERIFY_X509_STRICT is off and every other flag is at its default",
+          ctx.verify_flags == _expected_flags, (ctx.verify_flags, _expected_flags))
+
+    _real_ssl_context = selfupdate._ssl_context
+    _ssl_context_calls = []
+
+    def _watching_ssl_context():
+        _ssl_context_calls.append(True)
+        return _real_ssl_context()
+
+    selfupdate._ssl_context = _watching_ssl_context
+    try:
+        httpcheck.check("https://127.0.0.1:1/", timeout_s=1.0, insecure=False)
+    finally:
+        selfupdate._ssl_context = _real_ssl_context
+    check("httpcheck.check(insecure=False) builds its context via selfupdate._ssl_context",
+          bool(_ssl_context_calls), _ssl_context_calls)
+
+    working = tlscontext.verified_context(cafile="/nonexistent/path")
+    check("verified_context ignores a missing cafile and still returns a working context",
+          working.verify_mode == ssl.CERT_REQUIRED and working.check_hostname is True
+          and working.verify_flags == _expected_flags, working.verify_flags)
 
     print("httpcheck.check: timeouts")
     started = time.monotonic()

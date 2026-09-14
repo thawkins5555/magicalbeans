@@ -40,7 +40,7 @@ import traceback
 import urllib.error
 import urllib.request
 
-from . import __version__, temppath
+from . import __version__, temppath, tlscontext
 
 OWNER = "thawkins5555"
 REPO = "magicalbeans"
@@ -126,13 +126,7 @@ def status() -> dict:
 def _ssl_context() -> ssl.SSLContext:
     """The system's trusted CAs plus our vendored bundle, so either one
     having the certificate GitHub needs is enough to verify the connection."""
-    context = ssl.create_default_context()
-    if os.path.isfile(_CACERT_PATH):
-        try:
-            context.load_verify_locations(cafile=_CACERT_PATH)
-        except ssl.SSLError:
-            pass  # a corrupt bundle shouldn't break the system store's own certs
-    return context
+    return tlscontext.verified_context(_CACERT_PATH)
 
 
 # Everything that reaches the network goes through these two functions —

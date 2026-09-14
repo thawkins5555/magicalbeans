@@ -23,6 +23,7 @@ from email.message import EmailMessage
 from email.utils import formataddr
 from urllib.parse import urlencode, urlparse
 
+from . import tlscontext
 from .alertrules import SEVERITY_NAMES
 from .worker import Worker
 
@@ -303,14 +304,8 @@ def token_reference() -> list[dict]:
 
 
 def tls_context() -> ssl.SSLContext:
-    """Verified against the system trust store and hostname, without
-    VERIFY_X509_STRICT: Python 3.13 turns it on and it refuses the
-    AKI-less certificates SSL-inspecting firewalls and internal CAs issue."""
-    context = ssl.create_default_context()
-    strict = getattr(ssl, "VERIFY_X509_STRICT", 0)
-    if strict:
-        context.verify_flags &= ~strict
-    return context
+    """Verified against the system trust store and hostname, non-strict."""
+    return tlscontext.verified_context()
 
 
 def _https_opener():
