@@ -246,9 +246,14 @@ rows) now go through the same name chain the Neighbours fix above uses,
 falling back to the IP only when nothing else answers. Files: `report.py`,
 `namelookup.py`, `web/api.py`.
 
-**Still showing bare IPs (next round):** Alerts, Events, NetFlow talker
-labels, Dashboard tiles, Wireless, IPAM host names — sites listed by
-Thing1's sweep.
+**Still showing bare IPs (next round):** the Dashboard's top-metric widget,
+down-devices tile and CPU/loss offender tiles (`nodesdb.top_metric`,
+`api._dashboard_fleet`, `api._offender_rows`) name a device from Nodes only,
+with no DNS step; the Alerts wireless AP event label and a removed AP's name
+in Wireless fall back to the AP id (`alertengine.py`, `wirelessdb.py`); the
+IPAM worker's observed-address detail falls through sysName/name/IP with no
+DNS step (`ipam_worker.py`). Events and NetFlow already resolve through the
+syslog/flow name caches.
 
 Verification: (filled by Bob)
 
