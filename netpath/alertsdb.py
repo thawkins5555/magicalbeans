@@ -186,7 +186,9 @@ CREATE TABLE IF NOT EXISTS smtp_credential (
 CREATE TABLE IF NOT EXISTS sms_credential (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     token_enc BLOB,
-    account_sid TEXT NOT NULL DEFAULT ''
+    account_sid TEXT NOT NULL DEFAULT '',
+    auth_mode TEXT NOT NULL DEFAULT 'auth_token',
+    api_key_sid TEXT NOT NULL DEFAULT ''
 );
 
 -- Per-device overrides of a threshold rule's own numbers. Generic over
@@ -301,6 +303,8 @@ DEFAULTS = {
     # cap. The auth token lives in sms_credential, never here.
     "sms_enabled": False,
     "twilio_account_sid": "",
+    "twilio_auth_mode": "auth_token",
+    "twilio_api_key_sid": "",
     "twilio_from": "",
     "twilio_messaging_service_sid": "",
     "sms_to_default": [],
@@ -583,6 +587,12 @@ def validate_sms_settings(values: dict) -> None:
     account = str(values.get("twilio_account_sid", "") or "").strip()
     if account and not alertmail._ACCOUNT_SID.match(account):
         raise ValueError("Twilio Account SID must be AC followed by 32 hex characters")
+    if "twilio_auth_mode" in values and str(values["twilio_auth_mode"] or "").strip() \
+            not in ("auth_token", "api_key"):
+        raise ValueError("Twilio authentication method must be auth_token or api_key")
+    api_key_sid = str(values.get("twilio_api_key_sid", "") or "").strip()
+    if api_key_sid and not alertmail._API_KEY_SID.match(api_key_sid):
+        raise ValueError("Twilio API Key SID must be SK followed by 32 hex characters")
     service = str(values.get("twilio_messaging_service_sid", "") or "").strip()
     if service and not alertmail._MESSAGING_SID.match(service):
         raise ValueError(
@@ -1209,7 +1219,11 @@ class AlertsDatabase(SqliteStore):
             self._conn.execute(
                 "UPDATE rules SET for_seconds = 60 WHERE key = 'packet_loss_high'")
         self._migrate_templates()
-        self.ensure_columns("sms_credential", {"account_sid": "TEXT NOT NULL DEFAULT ''"})
+        self.ensure_columns("sms_credential", {
+            "account_sid": "TEXT NOT NULL DEFAULT ''",
+            "auth_mode": "TEXT NOT NULL DEFAULT 'auth_token'",
+            "api_key_sid": "TEXT NOT NULL DEFAULT ''",
+        })
         self.ensure_columns("alerts", {
             "last_notified_ts": "REAL",
             "extra_json": "TEXT NOT NULL DEFAULT '{}'",
@@ -1771,12 +1785,14 @@ class AlertsDatabase(SqliteStore):
             cred = self._conn.execute(
                 "SELECT password_enc FROM smtp_credential WHERE id = 1").fetchone()
             sms_cred = self._conn.execute(
-                "SELECT token_enc FROM sms_credential WHERE id = 1").fetchone()
+                "SELECT token_enc, auth_mode FROM sms_credential WHERE id = 1").fetchone()
         values["notify_rollup_delay_s"] = max(0, min(
             int(values.get("notify_rollup_delay_s", 0) or 0),
             NOTIFY_ROLLUP_DELAY_MAX_S))
         values["has_smtp_credential"] = bool(cred and cred["password_enc"])
         values["has_sms_credential"] = bool(sms_cred and sms_cred["token_enc"])
+        values["sms_credential_mode"] = (
+            str(sms_cred["auth_mode"] or "") if values["has_sms_credential"] else "")
         return values
 
     def save_settings(self, values: dict) -> None:
@@ -1806,22 +1822,29 @@ class AlertsDatabase(SqliteStore):
                 "SELECT password_enc FROM smtp_credential WHERE id = 1").fetchone()
         return bytes(row["password_enc"]) if row and row["password_enc"] else None
 
-    def set_sms_credential(self, token_enc: bytes, account_sid: str = "") -> None:
-        """The token is bound to the Account SID it was saved for; a send
-        under any other SID refuses it (see AlertEngine._sms_token)."""
+    def set_sms_credential(self, token_enc: bytes, account_sid: str = "",
+                           auth_mode: str = "auth_token", api_key_sid: str = "") -> None:
+        """The secret is bound to (auth_mode, account_sid, api_key_sid); a
+        send under any other combination refuses it (see
+        AlertEngine._sms_token)."""
         with self._lock:
             self._conn.execute(
-                "INSERT INTO sms_credential(id, token_enc, account_sid) VALUES (1, ?, ?)"
+                "INSERT INTO sms_credential(id, token_enc, account_sid, auth_mode,"
+                " api_key_sid) VALUES (1, ?, ?, ?, ?)"
                 " ON CONFLICT(id) DO UPDATE SET token_enc=excluded.token_enc,"
-                " account_sid=excluded.account_sid",
-                (token_enc, str(account_sid or "").strip()))
+                " account_sid=excluded.account_sid, auth_mode=excluded.auth_mode,"
+                " api_key_sid=excluded.api_key_sid",
+                (token_enc, str(account_sid or "").strip(),
+                 str(auth_mode or "auth_token").strip(), str(api_key_sid or "").strip()))
             self._commit_durable()
 
     def clear_sms_credential(self) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT INTO sms_credential(id, token_enc, account_sid) VALUES (1, NULL, '')"
-                " ON CONFLICT(id) DO UPDATE SET token_enc=NULL, account_sid=''")
+                "INSERT INTO sms_credential(id, token_enc, account_sid, auth_mode,"
+                " api_key_sid) VALUES (1, NULL, '', 'auth_token', '')"
+                " ON CONFLICT(id) DO UPDATE SET token_enc=NULL, account_sid='',"
+                " auth_mode='auth_token', api_key_sid=''")
             self._conn.commit()
 
     def sms_token_enc(self) -> bytes | None:
@@ -1835,6 +1858,17 @@ class AlertsDatabase(SqliteStore):
             row = self._conn.execute(
                 "SELECT account_sid FROM sms_credential WHERE id = 1").fetchone()
         return str(row["account_sid"] or "") if row else ""
+
+    def sms_credential_binding(self) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT account_sid, auth_mode, api_key_sid FROM sms_credential"
+                " WHERE id = 1").fetchone()
+        if not row:
+            return {"account_sid": "", "auth_mode": "auth_token", "api_key_sid": ""}
+        return {"account_sid": str(row["account_sid"] or ""),
+                "auth_mode": str(row["auth_mode"] or "auth_token"),
+                "api_key_sid": str(row["api_key_sid"] or "")}
 
     # ------------------------------------------------------------------ rules
 

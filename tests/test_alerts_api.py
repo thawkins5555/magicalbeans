@@ -739,6 +739,71 @@ try:
 
         check("...and clears has_sms_credential",
               service.alerts_db.settings().get("has_sms_credential") is False)
+
+        # ------------------------------------- 9b. API Key SID credentials
+        sk_sid = "SK" + "b" * 32
+        log_mark = service.log.last_seq
+        status, payload = call("POST", "/api/alerts/sms/credential",
+                               {"token": "ApiKeySecret123", "auth_mode": "api_key",
+                                "account_sid": "AC" + "a" * 32, "api_key_sid": sk_sid},
+                               token=admin)
+        check("storing an API key secret with a good SK SID is accepted",
+              status == 200 and payload.get("ok") is True, (status, payload))
+        check("...settings now report sms_credential_mode api_key",
+              service.alerts_db.settings().get("sms_credential_mode") == "api_key",
+              service.alerts_db.settings().get("sms_credential_mode"))
+        check("...bound to that API Key SID",
+              service.alerts_db.sms_credential_binding().get("api_key_sid") == sk_sid,
+              service.alerts_db.sms_credential_binding())
+        check("...and the log records storing the API key secret",
+              any("Stored the Twilio API key secret" in e.message
+                  for e in service.log.since(log_mark)),
+              [e.message for e in service.log.since(log_mark)])
+        actions = [(row["action"], row["target"]) for row in audit_since_mark()]
+        check("...and the audit trail records the credential store against sms",
+              ("credential.store", "sms") in actions, actions)
+
+        status, payload = call("POST", "/api/alerts/sms/credential",
+                               {"token": "x", "auth_mode": "api_key",
+                                "account_sid": "AC" + "a" * 32}, token=admin)
+        check("storing an API key secret with no API Key SID is a 400",
+              status == 400 and "API Key SID" in str(payload.get("error", "")),
+              (status, payload))
+
+        status, payload = call("POST", "/api/alerts/sms/credential",
+                               {"token": "x", "auth_mode": "api_key",
+                                "account_sid": "AC" + "a" * 32, "api_key_sid": "SKshort"},
+                               token=admin)
+        check("storing an API key secret with a malformed SK SID is a 400",
+              status == 400 and "API Key SID" in str(payload.get("error", "")),
+              (status, payload))
+
+        status, payload = call("POST", "/api/settings",
+                               {"scope": "alerts",
+                                "values": {"twilio_api_key_sid": "SKshort"}}, token=admin)
+        check("a bad twilio_api_key_sid in /api/settings is a 400 naming the API Key SID",
+              status == 400 and "API Key SID" in str(payload.get("error", "")),
+              (status, payload))
+
+        status, payload = call("POST", "/api/alerts/sms/test",
+                               {"to": "+15550001111", "twilio_api_key_sid": "SK" + "9" * 32},
+                               token=admin)
+        check("a saved API key credential with a changed API Key SID in the test body "
+              "is refused, naming the API Key SID",
+              status == 400 and "API Key SID" in str(payload.get("error", "")),
+              (status, payload))
+
+        log_mark = service.log.last_seq
+        status, payload = call("DELETE", "/api/alerts/sms/credential", {}, token=admin)
+        check("deleting the API key credential is accepted",
+              status == 200 and payload.get("ok") is True, (status, payload))
+        check("...and the log records clearing the credential",
+              any("Cleared the stored Twilio credential" in e.message
+                  for e in service.log.since(log_mark)),
+              [e.message for e in service.log.since(log_mark)])
+        check("...and clears sms_credential_mode",
+              service.alerts_db.settings().get("sms_credential_mode") == "",
+              service.alerts_db.settings().get("sms_credential_mode"))
     else:
         check("DPAPI is unavailable on this machine, so credential storage "
               "is skipped rather than faked here", True)

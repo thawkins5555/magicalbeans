@@ -6,6 +6,7 @@ clear, digest, sms_failing) follow the sender half.
 """
 import json
 import os
+import sqlite3
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -122,6 +123,33 @@ try:
         check("send_sms refuses a non-E.164 number before any request",
               "E.164" in str(exc), str(exc))
 
+    SK_SID = "SK" + "a" * 32
+    api_key_settings = {**BASE, "twilio_auth_mode": "api_key", "twilio_api_key_sid": SK_SID}
+    alertmail.send_sms(api_key_settings, "secret", "+15551234567", "hi")
+    check("api_key mode posts to the same Messages.json path",
+          SEEN[-1]["path"] == f"/2010-04-01/Accounts/{SID}/Messages.json", SEEN[-1]["path"])
+    want_key = "Basic " + base64.b64encode(f"{SK_SID}:secret".encode()).decode()
+    check("...with HTTP Basic auth of ApiKeySID:secret", SEEN[-1]["auth"] == want_key,
+          SEEN[-1]["auth"])
+    try:
+        alertmail.send_sms({**api_key_settings, "twilio_api_key_sid": "SKshort"}, "secret",
+                           "+15551234567", "x")
+        check("send_sms refuses a malformed API Key SID", False)
+    except ValueError as exc:
+        check("send_sms refuses a malformed API Key SID", "API Key SID" in str(exc), str(exc))
+    try:
+        alertmail.send_sms({**BASE, "twilio_auth_mode": "bogus"}, "tok", "+15551234567", "x")
+        check("send_sms refuses an unknown auth mode", False)
+    except ValueError as exc:
+        check("send_sms refuses an unknown auth mode",
+              str(exc) == "Twilio authentication method must be auth_token or api_key", str(exc))
+    try:
+        alertmail.send_sms(api_key_settings, None, "+15551234567", "x")
+        check("send_sms refuses a missing API key secret", False)
+    except ValueError as exc:
+        check("send_sms refuses a missing API key secret",
+              str(exc) == "No Twilio API key secret stored", str(exc))
+
     REPLY["status"] = 400
     REPLY["body"] = {"code": 21211, "message": "The 'To' number is not a valid phone number.",
                      "status": 400}
@@ -227,6 +255,16 @@ validate_sms_settings({"sms_to_default": ["+15551234567", "+442071234567"],
                        "twilio_messaging_service_sid": ""})
 check("...and accepts good numbers with empty SIDs", True)
 
+for bad, name in (({"twilio_auth_mode": "bogus"}, "an unknown auth mode"),
+                  ({"twilio_api_key_sid": "SKshort"}, "a malformed API Key SID")):
+    try:
+        validate_sms_settings(bad)
+        check(f"validate_sms_settings refuses {name}", False)
+    except ValueError as exc:
+        check(f"validate_sms_settings refuses {name}", bool(str(exc)))
+validate_sms_settings({"twilio_auth_mode": "api_key", "twilio_api_key_sid": "SK" + "a" * 32})
+check("...and accepts a good API Key SID", True)
+
 db = AlertsDatabase(os.path.join(TMPDIR, "alerts.db"))
 s = db.settings()
 check("settings carry the SMS defaults: off, no numbers, 30/hour, floor 7",
@@ -247,6 +285,33 @@ check("...bound to the Account SID it was saved for",
 db.clear_sms_credential()
 check("...and cleared", db.sms_token_enc() is None and not db.settings()["has_sms_credential"]
       and db.sms_credential_sid() == "")
+
+db.set_sms_credential(b"blob2", "AC" + "d" * 32, "api_key", "SK" + "e" * 32)
+check("set_sms_credential stores auth_mode and api_key_sid, round-tripped via the binding",
+      db.sms_credential_binding() == {"account_sid": "AC" + "d" * 32, "auth_mode": "api_key",
+                                      "api_key_sid": "SK" + "e" * 32}, db.sms_credential_binding())
+check("sms_credential_sid still reads the account_sid alone",
+      db.sms_credential_sid() == "AC" + "d" * 32, db.sms_credential_sid())
+db.clear_sms_credential()
+check("clearing resets the binding to auth_token with empty SIDs",
+      db.sms_credential_binding() == {"account_sid": "", "auth_mode": "auth_token",
+                                      "api_key_sid": ""}, db.sms_credential_binding())
+
+old_path = os.path.join(TMPDIR, "old_shape.db")
+old_conn = sqlite3.connect(old_path)
+old_conn.execute("CREATE TABLE sms_credential (id INTEGER PRIMARY KEY CHECK (id = 1),"
+                 " token_enc BLOB, account_sid TEXT NOT NULL DEFAULT '')")
+old_conn.execute("INSERT INTO sms_credential(id, token_enc, account_sid) VALUES (1, ?, ?)",
+                 (b"oldblob", "AC" + "9" * 32))
+old_conn.commit()
+old_conn.close()
+old_db = AlertsDatabase(old_path)
+check("an old-shape sms_credential table migrates: auth_mode defaults to auth_token",
+      old_db.sms_credential_binding() == {"account_sid": "AC" + "9" * 32,
+                                          "auth_mode": "auth_token", "api_key_sid": ""},
+      old_db.sms_credential_binding())
+old_db.close()
+
 rule = db.rule_by_key("device_down")
 check("every rule carries notify_sms, off by default", rule["notify_sms"] == 0)
 db.update_rule(rule["id"], notify_sms=True)
@@ -429,6 +494,67 @@ try:
               not sms_calls, sms_calls)
         check("...and the reason is logged once",
               engine._sms_sid_mismatch_logged is True)
+    finally:
+        engine._sms.stop()
+
+    # --------------------------------------------------------------- E2d
+    print("\nE2d — engine sends in api_key mode when settings match the stored binding")
+    sk = "SK" + "b" * 32
+    nodes, alerts, engine = build_engine(twilio_auth_mode="api_key", twilio_api_key_sid=sk)
+    alerts.set_sms_credential(dpapi.protect(b"secret"), SMS_SETTINGS["twilio_account_sid"],
+                              "api_key", sk)
+    engine._sms.start()
+    try:
+        rule = alerts.rule_by_key("device_down")
+        alerts.update_rule(rule["id"], notify_sms=True)
+        dev = add_device(nodes, "10.9.0.24", "sw24")
+        engine._tick()
+        sms_calls.clear()
+        go_down(nodes, dev)
+        engine._tick()
+        engine._sms.wait_idle(10.0)
+        check("api_key mode: one text sent when the binding matches",
+              len(sms_calls) == 1, sms_calls)
+    finally:
+        engine._sms.stop()
+
+    # --------------------------------------------------------------- E2e
+    print("\nE2e — a mismatched API Key SID in settings sends nothing")
+    nodes, alerts, engine = build_engine(twilio_auth_mode="api_key", twilio_api_key_sid=sk)
+    alerts.set_sms_credential(dpapi.protect(b"secret"), SMS_SETTINGS["twilio_account_sid"],
+                              "api_key", "SK" + "c" * 32)
+    engine._sms.start()
+    try:
+        rule = alerts.rule_by_key("device_down")
+        alerts.update_rule(rule["id"], notify_sms=True)
+        dev = add_device(nodes, "10.9.0.25", "sw25")
+        engine._tick()
+        sms_calls.clear()
+        go_down(nodes, dev)
+        engine._tick()
+        engine._sms.wait_idle(10.0)
+        check("a mismatched API Key SID sends nothing", not sms_calls, sms_calls)
+    finally:
+        engine._sms.stop()
+
+    # --------------------------------------------------------------- E2f
+    print("\nE2f — a key SID left in settings does not block an auth_token send")
+    nodes, alerts, engine = build_engine(twilio_auth_mode="auth_token",
+                                         twilio_api_key_sid="SK" + "f" * 32)
+    alerts.set_sms_credential(dpapi.protect(b"tok"), SMS_SETTINGS["twilio_account_sid"],
+                              "auth_token", "")
+    engine._sms.start()
+    try:
+        rule = alerts.rule_by_key("device_down")
+        alerts.update_rule(rule["id"], notify_sms=True)
+        dev = add_device(nodes, "10.9.0.26", "sw26")
+        engine._tick()
+        sms_calls.clear()
+        go_down(nodes, dev)
+        engine._tick()
+        engine._sms.wait_idle(10.0)
+        check("auth_token mode ignores a stale API Key SID in settings",
+              len(sms_calls) == 1, sms_calls)
     finally:
         engine._sms.stop()
 

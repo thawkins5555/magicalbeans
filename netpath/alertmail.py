@@ -809,6 +809,7 @@ SMS_BREAKER_ERROR = "not attempted: alert texts are failing (delivery paused)"
 _E164 = re.compile(r"^\+[1-9][0-9]{7,14}$")
 _ACCOUNT_SID = re.compile(r"^AC[0-9a-fA-F]{32}$")
 _MESSAGING_SID = re.compile(r"^MG[0-9a-fA-F]{32}$")
+_API_KEY_SID = re.compile(r"^SK[0-9a-fA-F]{32}$")
 
 
 def is_e164(number) -> bool:
@@ -835,6 +836,17 @@ def sms_text(tag: str, rule_name: str, entity_label: str, message: str,
     return text
 
 
+def sms_binding(settings: dict) -> tuple:
+    """(auth_mode, account_sid, api_key_sid) a stored secret is bound to.
+    The key SID only counts in api_key mode, so a value left in the hidden
+    field cannot break an auth_token send."""
+    auth_mode = str(settings.get("twilio_auth_mode", "auth_token") or "auth_token").strip()
+    api_key_sid = str(settings.get("twilio_api_key_sid", "") or "").strip()
+    return (auth_mode,
+            str(settings.get("twilio_account_sid", "") or "").strip(),
+            api_key_sid if auth_mode == "api_key" else "")
+
+
 def send_sms(settings: dict, token: str | None, to_number: str, text: str) -> None:
     """One Twilio Messages.json POST. Raises on any failure, like send()."""
     account_sid = str(settings.get("twilio_account_sid", "") or "").strip()
@@ -842,8 +854,20 @@ def send_sms(settings: dict, token: str | None, to_number: str, text: str) -> No
         raise ValueError("No Twilio Account SID configured")
     if not _ACCOUNT_SID.match(account_sid):
         raise ValueError("Twilio Account SID must be AC followed by 32 hex characters")
-    if not token:
-        raise ValueError("No Twilio auth token stored")
+    auth_mode = str(settings.get("twilio_auth_mode", "auth_token") or "auth_token").strip()
+    if auth_mode not in ("auth_token", "api_key"):
+        raise ValueError("Twilio authentication method must be auth_token or api_key")
+    if auth_mode == "api_key":
+        api_key_sid = settings.get("twilio_api_key_sid")
+        if not _API_KEY_SID.match(str(api_key_sid or "")):
+            raise ValueError("Twilio API Key SID must be SK followed by 32 hex characters")
+        if not token:
+            raise ValueError("No Twilio API key secret stored")
+        basic_user = api_key_sid
+    else:
+        if not token:
+            raise ValueError("No Twilio auth token stored")
+        basic_user = account_sid
     if not is_e164(to_number):
         raise ValueError(f"not an E.164 number: {to_number!r}")
     fields = {"To": str(to_number).strip(), "Body": text}
@@ -864,7 +888,7 @@ def send_sms(settings: dict, token: str | None, to_number: str, text: str) -> No
         url, data=urlencode(fields).encode("utf-8"), method="POST")
     request.add_header("Content-Type", "application/x-www-form-urlencoded")
     request.add_header("User-Agent", "SappiWhere-alert-sms/1.0")
-    auth = base64.b64encode(f"{account_sid}:{token}".encode("utf-8")).decode("ascii")
+    auth = base64.b64encode(f"{basic_user}:{token}".encode("utf-8")).decode("ascii")
     request.add_header("Authorization", f"Basic {auth}")
     opener = urllib.request.build_opener(_RefuseRedirects)
     try:

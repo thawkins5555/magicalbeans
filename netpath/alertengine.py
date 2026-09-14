@@ -3072,6 +3072,9 @@ class AlertEngine(Worker):
             return
         if not settings.get("twilio_account_sid"):
             return
+        auth_mode = str(settings.get("twilio_auth_mode", "auth_token") or "auth_token").strip()
+        if auth_mode == "api_key" and not settings.get("twilio_api_key_sid"):
+            return
         if not (settings.get("twilio_from") or settings.get("twilio_messaging_service_sid")):
             return
         floor = int(settings.get("sms_min_severity", 7) or 0)
@@ -3125,19 +3128,22 @@ class AlertEngine(Worker):
         return [str(a).strip() for a in raw_to if str(a).strip()]
 
     def _sms_token(self, settings) -> str | None:
-        """The stored token, only when the configured Account SID is the
-        one it was saved for; a mismatch is logged once and sends nothing."""
+        """The stored secret, only when the configured Account SID, API Key
+        SID and authentication method are the ones it was saved for; a
+        mismatch is logged once and sends nothing."""
         blob = self.db.sms_token_enc()
         if not blob:
             return None
-        wanted = str(settings.get("twilio_account_sid", "") or "").strip()
-        saved = self.db.sms_credential_sid()
+        wanted = alertmail.sms_binding(settings)
+        saved = self.db.sms_credential_binding()
+        saved = (saved["auth_mode"], saved["account_sid"], saved["api_key_sid"])
         if wanted != saved:
             if not self._sms_sid_mismatch_logged:
                 self._sms_sid_mismatch_logged = True
-                self.log.add(ERROR, "The stored Twilio auth token was saved for a "
-                                    "different Account SID; texts are not being sent "
-                                    "until the token is re-entered")
+                self.log.add(ERROR, "The stored Twilio credential was saved for a "
+                                    "different Account SID, API Key SID or "
+                                    "authentication method; texts are not being sent "
+                                    "until it is re-entered")
             return None
         self._sms_sid_mismatch_logged = False
         try:

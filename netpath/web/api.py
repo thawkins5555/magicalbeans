@@ -7997,28 +7997,43 @@ def post_alerts_smtp_test(service, params, body) -> dict:
 
 
 def post_alerts_sms_credential(service, params, body) -> dict:
-    """Stores the token bound to an Account SID: the one in the body (the
-    dialog sends what is typed, saved a moment later) or else the saved one."""
+    """Stores the secret bound to (auth_mode, Account SID, API Key SID): the
+    values in the body (the dialog sends what is typed, saved a moment
+    later) or else the saved settings."""
     from .. import alertmail
 
     token = str(body.get("token", ""))
     if not token:
         raise ValueError("A token is required")
+    saved_settings = service.alerts_settings
+    auth_mode = str(body.get(
+        "auth_mode", saved_settings.get("twilio_auth_mode", "auth_token")) or "auth_token").strip()
+    if auth_mode not in ("auth_token", "api_key"):
+        token = None
+        raise ValueError("Twilio authentication method must be auth_token or api_key")
     account_sid = str(body.get(
-        "account_sid", service.alerts_settings.get("twilio_account_sid", "")) or "").strip()
+        "account_sid", saved_settings.get("twilio_account_sid", "")) or "").strip()
     if not alertmail._ACCOUNT_SID.match(account_sid):
         token = None
         raise ValueError("Enter the Twilio Account SID (AC followed by 32 hex "
                          "characters) before storing its auth token")
+    api_key_sid = str(body.get(
+        "api_key_sid", saved_settings.get("twilio_api_key_sid", "")) or "").strip()
+    if auth_mode == "api_key" and not alertmail._API_KEY_SID.match(api_key_sid):
+        token = None
+        raise ValueError("Enter the Twilio API Key SID (SK followed by 32 hex "
+                         "characters) before storing its secret")
     try:
         encrypted = _encrypt_secret(token, (
             "This machine cannot encrypt a stored credential — DPAPI is "
-            "Windows-only. A test text can still use a token typed "
+            "Windows-only. A test text can still use a credential typed "
             "into Test each time; nothing will be saved here."))
     finally:
         token = None
-    service.alerts_db.set_sms_credential(encrypted, account_sid)
-    service.log.add(ALERTS_CATEGORY, "Stored the Twilio auth token")
+    service.alerts_db.set_sms_credential(
+        encrypted, account_sid, auth_mode, api_key_sid if auth_mode == "api_key" else "")
+    service.log.add(ALERTS_CATEGORY, "Stored the Twilio API key secret"
+                    if auth_mode == "api_key" else "Stored the Twilio auth token")
     _audit(service, params, "credential.store", target="sms")
     return {"ok": True}
 
@@ -8026,14 +8041,15 @@ def post_alerts_sms_credential(service, params, body) -> dict:
 def delete_alerts_sms_credential(service, params, body) -> dict:
     return _clear_credential(
         service, params, clear=service.alerts_db.clear_sms_credential,
-        category=ALERTS_CATEGORY, message="Cleared the stored Twilio auth token",
+        category=ALERTS_CATEGORY, message="Cleared the stored Twilio credential",
         target="sms")
 
 
 def post_alerts_sms_test(service, params, body) -> dict:
     """Sends a real test text, the same "test what's typed before saving"
     idiom as post_alerts_smtp_test, with the same saved-credential rule:
-    the saved auth token is only ever sent to the saved Account SID.
+    the saved credential is only ever sent with the settings it was saved
+    under (Account SID, API Key SID and authentication method).
     """
     from .. import alertmail, dpapi
 
@@ -8042,21 +8058,22 @@ def post_alerts_sms_test(service, params, body) -> dict:
         raise ValueError(
             "A destination number in E.164 form (+15551234567) is required")
     settings = dict(service.alerts_settings)
-    for key in ("twilio_account_sid", "twilio_from",
-               "twilio_messaging_service_sid", "sms_timeout_s"):
+    for key in ("twilio_account_sid", "twilio_auth_mode", "twilio_api_key_sid",
+               "twilio_from", "twilio_messaging_service_sid", "sms_timeout_s"):
         if key in body:
             settings[key] = body[key]
     token = body.get("token")
     blob = service.alerts_db.sms_token_enc() if token is None else None
-    sid_changed = bool(blob) and (
-        str(settings.get("twilio_account_sid", "") or "").strip()
-        != service.alerts_db.sms_credential_sid())
-    if token is None and sid_changed:
+    wanted = alertmail.sms_binding(settings)
+    saved = service.alerts_db.sms_credential_binding()
+    binding_changed = bool(blob) and (
+        wanted != (saved["auth_mode"], saved["account_sid"], saved["api_key_sid"]))
+    if token is None and binding_changed:
         raise ValueError(
-            "This test changes the Account SID, so it cannot use the saved "
-            "auth token: type the token for that account into the test "
-            "instead. The saved one is only ever sent with the saved "
-            "Account SID.")
+            "This test changes the Account SID, API Key SID or authentication "
+            "method, so it cannot use the saved credential: type the secret "
+            "for it into the test instead. The saved one is only ever sent "
+            "with the settings it was saved under.")
     if token is None and blob:
         try:
             token = dpapi.unprotect(blob).decode("utf-8")
