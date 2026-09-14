@@ -1068,7 +1068,7 @@ async function walkDialogs(page, dir, tag, recorder, account = 'admin') {
       await settle(page, 400);
       await shoot(page, dir, shot('dlg', `settings-${tab}`));
       if (tab === 'alerts') {
-        // 5.19.0: the TEXT MESSAGES (TWILIO) fieldset.
+        // 5.19.0/5.20.0: the TEXT MESSAGES (TWILIO) fieldset and its auth selector.
         for (const id of ['#as-sms', '#as-twilio-sid', '#as-twilio-auth',
                           '#as-twilio-apikey-sid', '#as-sms-to-add', '#as-testsms']) {
           if (!(await page.locator(`#modal:not([hidden]) ${id}`).count())) {

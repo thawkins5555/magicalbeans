@@ -1843,6 +1843,12 @@
         const smsToken = smsAuthMode === 'api_key'
           ? (box.querySelector('#as-twilio-apikey-secret') || {}).value || ''
           : (box.querySelector('#as-twilio-token') || {}).value || '';
+        if (App.canStoreSecrets() && !smsToken && s.has_sms_credential &&
+            smsAuthMode !== (s.sms_credential_mode || 'auth_token')) {
+          const msg = 'Enter the API key secret (or Auth token) for the selected method before saving';
+          box.querySelector('#as-sms-cred-status').textContent = msg;
+          throw new Error(msg);
+        }
         if (smsToken) {
           try {
             await App.post('/api/alerts/sms/credential', {
