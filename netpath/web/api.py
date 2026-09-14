@@ -3391,26 +3391,32 @@ def _ipam_static_in_use_rows(service, server_id: int | None, scope_id: str | Non
     static_by_scope = service.ipam_db.static_in_scope(fresh_s)
     labels = {(r["server_id"], r["scope_id"]): r["server_label"]
               for r in service.ipam_db.dhcp_scopes(server_id)}
-    rows = []
+    entries = []
     for (s_id, sc_id), hosts in static_by_scope.items():
         if server_id is not None and s_id != server_id:
             continue
         if scope_id and sc_id != scope_id:
             continue
-        server_label = labels.get((s_id, sc_id))
         for host in hosts:
             device = namelookup.device_for_ip(service.nodes_db, host["ip"])
-            hostname = namelookup.device_name(device) or None
-            if not hostname:
-                hostname = service.app_db.hostnames([host["ip"]]).get(host["ip"])
-            rows.append({
-                "id": None, "server_id": s_id, "server_label": server_label,
-                "scope_id": sc_id, "ip": host["ip"], "mac": host["mac"],
-                "hostname": hostname, "address_state": "in use, not leased",
-                "lease_expires": None, "is_reservation": False,
-                "in_use_only": True, "seen_source": host["seen_source"],
-                "seen_detail": host["seen_detail"], "description": "",
-                "polled": host["last_up"]})
+            entries.append((s_id, sc_id, host, namelookup.device_name(device) or None))
+
+    # One batched reverse-DNS read for every host no Nodes device named,
+    # rather than app_db.hostnames() once per host in the loop below.
+    unnamed_ips = {host["ip"] for _, _, host, name in entries if not name}
+    dns_names = service.app_db.hostnames(unnamed_ips) if unnamed_ips else {}
+
+    rows = []
+    for s_id, sc_id, host, name in entries:
+        hostname = name or dns_names.get(host["ip"])
+        rows.append({
+            "id": None, "server_id": s_id, "server_label": labels.get((s_id, sc_id)),
+            "scope_id": sc_id, "ip": host["ip"], "mac": host["mac"],
+            "hostname": hostname, "address_state": "in use, not leased",
+            "lease_expires": None, "is_reservation": False,
+            "in_use_only": True, "seen_source": host["seen_source"],
+            "seen_detail": host["seen_detail"], "description": "",
+            "polled": host["last_up"]})
     return rows
 
 
