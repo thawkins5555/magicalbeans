@@ -14,7 +14,7 @@ import sqlite3
 import time
 from urllib.parse import urlparse
 
-from . import alertrules
+from . import alertmail, alertrules
 from .sqlitebase import (LIKE_ESCAPE, SqliteStore, hist_add, hist_buckets,
                          id_chunks, like_contains, reclaim)
 
@@ -182,6 +182,12 @@ CREATE TABLE IF NOT EXISTS smtp_credential (
     password_enc BLOB
 );
 
+-- The Twilio auth token, stored the same way for the same reason.
+CREATE TABLE IF NOT EXISTS sms_credential (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    token_enc BLOB
+);
+
 -- Per-device overrides of a threshold rule's own numbers. Generic over
 -- rule_key rather than a temp-specific table: a core switch in a hot closet
 -- and an access switch in a comms room do not share a sane chassis-
@@ -289,6 +295,17 @@ DEFAULTS = {
     # sharing the email one, so turning webhooks on for a big fleet does not
     # eat into the mail quota an operator already tuned.
     "webhook_max_per_hour": 600,
+    # Text messages through Twilio: a per-rule notify_sms switch beside
+    # notify, one global number list, its own severity floor and hourly
+    # cap. The auth token lives in sms_credential, never here.
+    "sms_enabled": False,
+    "twilio_account_sid": "",
+    "twilio_from": "",
+    "twilio_messaging_service_sid": "",
+    "sms_to_default": [],
+    "sms_min_severity": 7,
+    "sms_max_per_hour": 30,
+    "sms_timeout_s": 10.0,
 }
 
 PENDING_SCHEMA = """
@@ -548,6 +565,29 @@ def validate_webhook_url(url: str) -> None:
             " a private (RFC1918) address")
 
 
+def validate_sms_settings(values: dict) -> None:
+    """Raise ValueError for a Twilio setting that must not be saved:
+    numbers not in E.164 form, or a malformed SID. Empty is fine."""
+    numbers = values.get("sms_to_default")
+    if isinstance(numbers, str):
+        numbers = [n.strip() for n in numbers.split(",") if n.strip()]
+    for number in numbers or []:
+        if not alertmail.is_e164(number):
+            raise ValueError(
+                f"SMS number {number!r} must be in E.164 form (+15551234567)")
+    sender = str(values.get("twilio_from", "") or "").strip()
+    if sender and not alertmail.is_e164(sender):
+        raise ValueError(
+            f"Twilio From number {sender!r} must be in E.164 form (+15551234567)")
+    account = str(values.get("twilio_account_sid", "") or "").strip()
+    if account and not alertmail._ACCOUNT_SID.match(account):
+        raise ValueError("Twilio Account SID must be AC followed by 32 hex characters")
+    service = str(values.get("twilio_messaging_service_sid", "") or "").strip()
+    if service and not alertmail._MESSAGING_SID.match(service):
+        raise ValueError(
+            "Twilio Messaging Service SID must be MG followed by 32 hex characters")
+
+
 def _check_published_threshold(rule_key: str, threshold, clear_threshold) -> None:
     """Raise ValueError if a number is being set on a rule whose threshold
     the PORT publishes (alertrules.PUBLISHED_THRESHOLD_RULES).
@@ -621,12 +661,12 @@ def _check_threshold_direction(rule, threshold, clear_threshold, *,
 _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "clear_threshold", "comparison", "for_polls", "for_seconds",
                   "template_id", "flap_window_s", "flap_min_transitions",
-                  "auto_resolve_after_s", "notify")
+                  "auto_resolve_after_s", "notify", "notify_sms")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 60 built-in rules: 10 device_event + 3 interface_event + 29 threshold +
+# 61 built-in rules: 10 device_event + 3 interface_event + 29 threshold +
 # 3 trap + 1 syslog + 1 ipam + 4 wireless_event + 1 dhcp_threshold +
-# 3 netpath_threshold + 1 netpath_event + 4 system. Each `template` name is a
+# 3 netpath_threshold + 1 netpath_event + 5 system. Each `template` name is a
 # templates.key —
 # most non-primary rules reuse a generic template rather than a bespoke
 # one, since only 6 ship; an admin can point any rule at any template.
@@ -877,6 +917,7 @@ _BUILTIN_RULES = [
     # working, and the others would be reporting a fault in the machinery
     # they would have to use.
     ("smtp_failing", "Alert email is not being delivered", "system", "smtp_failing", 2, "event_notice", None, None, 1),
+    ("sms_failing", "Alert texts are not being delivered", "system", "sms_failing", 2, "event_notice", None, None, 1),
     # Raised by the poller when every worker is busy and the queue is not
     # draining: polls are being skipped, so every other rule in this table is
     # quietly evaluating stale data. Its own rule rather than a log line,
@@ -990,6 +1031,7 @@ _EVENT_NOTICE_REBIND = {
     # New in this release and never in an operator's hands bound to
     # trap_forwarded, whose body would render three empty trap fields.
     "smtp_failing": "trap_forwarded",
+    "sms_failing": "trap_forwarded",
 }
 
 # Rules that ship with email off. mib_missing is the onboarding storm: every
@@ -1153,6 +1195,7 @@ class AlertsDatabase(SqliteStore):
             "for_seconds": "INTEGER",
             "auto_resolve_after_s": "INTEGER",
             "notify": "INTEGER NOT NULL DEFAULT 1",
+            "notify_sms": "INTEGER NOT NULL DEFAULT 0",
             "comparison": "TEXT NOT NULL DEFAULT 'above'",
         })
         if "notify" in added:
@@ -1725,15 +1768,19 @@ class AlertsDatabase(SqliteStore):
         with self._lock:
             cred = self._conn.execute(
                 "SELECT password_enc FROM smtp_credential WHERE id = 1").fetchone()
+            sms_cred = self._conn.execute(
+                "SELECT token_enc FROM sms_credential WHERE id = 1").fetchone()
         values["notify_rollup_delay_s"] = max(0, min(
             int(values.get("notify_rollup_delay_s", 0) or 0),
             NOTIFY_ROLLUP_DELAY_MAX_S))
         values["has_smtp_credential"] = bool(cred and cred["password_enc"])
+        values["has_sms_credential"] = bool(sms_cred and sms_cred["token_enc"])
         return values
 
     def save_settings(self, values: dict) -> None:
         if "webhook_url" in values:
             validate_webhook_url(values["webhook_url"])
+        validate_sms_settings(values)
         super().save_settings(values)
 
     def set_smtp_credential(self, password_enc: bytes) -> None:
@@ -1756,6 +1803,27 @@ class AlertsDatabase(SqliteStore):
             row = self._conn.execute(
                 "SELECT password_enc FROM smtp_credential WHERE id = 1").fetchone()
         return bytes(row["password_enc"]) if row and row["password_enc"] else None
+
+    def set_sms_credential(self, token_enc: bytes) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO sms_credential(id, token_enc) VALUES (1, ?)"
+                " ON CONFLICT(id) DO UPDATE SET token_enc=excluded.token_enc",
+                (token_enc,))
+            self._commit_durable()
+
+    def clear_sms_credential(self) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO sms_credential(id, token_enc) VALUES (1, NULL)"
+                " ON CONFLICT(id) DO UPDATE SET token_enc=NULL")
+            self._conn.commit()
+
+    def sms_token_enc(self) -> bytes | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT token_enc FROM sms_credential WHERE id = 1").fetchone()
+        return bytes(row["token_enc"]) if row and row["token_enc"] else None
 
     # ------------------------------------------------------------------ rules
 

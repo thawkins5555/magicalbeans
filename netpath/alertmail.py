@@ -7,6 +7,7 @@ rest of this app follows for BER/ASN.1, MIB parsing, and everything else.
 
 from __future__ import annotations
 
+import base64
 import json
 import queue
 import re
@@ -20,7 +21,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from email.utils import formataddr
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from .alertrules import SEVERITY_NAMES
 from .worker import Worker
@@ -417,6 +418,7 @@ class MailQueue(Worker):
     """
 
     THREAD_NAME = "alert-mail"
+    breaker_error = BREAKER_ERROR
 
     def __init__(self, *, maxsize: int = QUEUE_SIZE, on_result=None,
                  on_breaker=None, failures_to_open: int = BREAKER_FAILURES,
@@ -538,7 +540,7 @@ class MailQueue(Worker):
                 # Half open: this one job goes out. Its result decides
                 # whether the breaker closes or the cooldown restarts.
                 return ""
-            return BREAKER_ERROR
+            return self.breaker_error
 
     def _record_failure(self, error: str) -> None:
         with self._lock:
@@ -796,3 +798,143 @@ class WebhookQueue(Worker):
             self._on_result(job, ok, error)
         except Exception:
             traceback.print_exc()
+
+
+# ------------------------------------------------------------- SMS (Twilio)
+
+# Module constant so a test can point the sender at a local stub.
+TWILIO_API_BASE = "https://api.twilio.com"
+SMS_MAX_CHARS = 160
+SMS_BREAKER_ERROR = "not attempted: alert texts are failing (delivery paused)"
+_E164 = re.compile(r"^\+[1-9][0-9]{7,14}$")
+_ACCOUNT_SID = re.compile(r"^AC[0-9a-fA-F]{32}$")
+_MESSAGING_SID = re.compile(r"^MG[0-9a-fA-F]{32}$")
+
+
+def is_e164(number) -> bool:
+    return bool(_E164.match(str(number or "").strip()))
+
+
+def sms_text(tag: str, rule_name: str, entity_label: str, message: str,
+             limit: int = SMS_MAX_CHARS) -> str:
+    """One line: `[TAG] rule - entity: message`, cut to one SMS segment."""
+    parts = []
+    if tag:
+        parts.append(str(tag).strip())
+    head = " - ".join(p for p in (str(rule_name or "").strip(),
+                                  str(entity_label or "").strip()) if p)
+    if head:
+        parts.append(head)
+    text = " ".join(parts)
+    body = str(message or "").strip()
+    if body:
+        text = f"{text}: {body}" if text else body
+    text = " ".join(text.split())
+    if len(text) > limit:
+        text = text[:max(0, limit - 1)].rstrip() + "\u2026"
+    return text
+
+
+def send_sms(settings: dict, token: str | None, to_number: str, text: str) -> None:
+    """One Twilio Messages.json POST. Raises on any failure, like send()."""
+    account_sid = str(settings.get("twilio_account_sid", "") or "").strip()
+    if not account_sid:
+        raise ValueError("No Twilio Account SID configured")
+    if not token:
+        raise ValueError("No Twilio auth token stored")
+    if not is_e164(to_number):
+        raise ValueError(f"not an E.164 number: {to_number!r}")
+    fields = {"To": str(to_number).strip(), "Body": text}
+    service_sid = str(settings.get("twilio_messaging_service_sid", "") or "").strip()
+    sender = str(settings.get("twilio_from", "") or "").strip()
+    if service_sid:
+        fields["MessagingServiceSid"] = service_sid
+    elif sender:
+        fields["From"] = sender
+    else:
+        raise ValueError("No Twilio From number or Messaging Service SID configured")
+    timeout = float(settings.get("sms_timeout_s", 10.0) or 10.0)
+    url = (f"{TWILIO_API_BASE.rstrip('/')}/2010-04-01/Accounts/"
+           f"{account_sid}/Messages.json")
+    if urlparse(url).scheme not in ("http", "https"):
+        raise ValueError("unsupported Twilio API scheme")
+    request = urllib.request.Request(
+        url, data=urlencode(fields).encode("utf-8"), method="POST")
+    request.add_header("Content-Type", "application/x-www-form-urlencoded")
+    request.add_header("User-Agent", "SappiWhere-alert-sms/1.0")
+    auth = base64.b64encode(f"{account_sid}:{token}".encode("utf-8")).decode("ascii")
+    request.add_header("Authorization", f"Basic {auth}")
+    opener = urllib.request.build_opener(_RefuseRedirects)
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise ValueError(str(exc.reason)) from None
+        raise ValueError(_twilio_error_text(exc)) from None
+    if status >= 300:
+        raise ValueError(f"Twilio returned HTTP {status}")
+
+
+def _twilio_error_text(exc: urllib.error.HTTPError) -> str:
+    """Twilio's own `message`/`code` when the error body is its JSON."""
+    try:
+        payload = json.loads(exc.read().decode("utf-8", "replace"))
+    except Exception:
+        payload = None
+    if isinstance(payload, dict) and payload.get("message"):
+        code = payload.get("code")
+        return (f"Twilio error {code}: {payload['message']}" if code
+                else f"Twilio: {payload['message']}")
+    return f"Twilio returned HTTP {exc.code}"
+
+
+@dataclass
+class SmsJob:
+    """One text to every number, resolved on the tick thread like MailJob."""
+    settings: dict
+    token: str | None
+    to_numbers: list = field(default_factory=list)
+    text: str = ""
+    alert_id: int | None = None
+    kind: str = "sms_alert"
+    alert_ids: list | None = None
+
+    # _mail_result-shaped consumers read these two names.
+    @property
+    def to_addrs(self) -> list:
+        return self.to_numbers
+
+    @property
+    def subject(self) -> str:
+        return self.text
+
+
+class SmsQueue(MailQueue):
+    """MailQueue's worker, bounded queue and breaker, delivering SmsJobs:
+    one Twilio call per number, the job failed on the first error."""
+
+    THREAD_NAME = "alert-sms"
+    breaker_error = SMS_BREAKER_ERROR
+
+    def _deliver(self, job: SmsJob) -> None:
+        blocked = self._breaker_verdict()
+        if blocked:
+            job.token = None
+            self._finish(job, False, blocked)
+            return
+        try:
+            for number in list(job.to_numbers):
+                try:
+                    send_sms(job.settings, job.token, number, job.text)
+                except Exception as exc:
+                    raise ValueError(
+                        f"{number}: {str(exc) or exc.__class__.__name__}") from None
+        except Exception as exc:
+            job.token = None
+            self._record_failure(str(exc))
+            self._finish(job, False, str(exc))
+        else:
+            job.token = None
+            self._record_success()
+            self._finish(job, True, "")
