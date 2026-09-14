@@ -206,6 +206,11 @@ class AlertEngine(Worker):
         # must not compete for the same quota. See webhook_max_per_hour.
         self._webhook_sent_this_hour: list[float] = []
         self._webhook_suppression_logged_hour: int | None = None
+        # The SMS channel: same shape again, its own budget and breaker.
+        self._sms = alertmail.SmsQueue(on_result=self._sms_result,
+                                       on_breaker=self._sms_breaker)
+        self._sms_sent_this_hour: list[float] = []
+        self._sms_suppression_logged_hour: int | None = None
         # Occurrences raised by the application about itself (the mail path,
         # the poll pool) rather than read from a source. Appended from any
         # thread — the mail worker raises the SMTP one — and drained on the
@@ -218,7 +223,8 @@ class AlertEngine(Worker):
                          "rolled_up": 0, "muted": 0, "rule_muted": 0,
                          "apply_errors": 0,
                          "backlog": 0, "webhooks_sent": 0, "webhook_errors": 0,
-                         "webhook_suppressed": 0}
+                         "webhook_suppressed": 0, "sms_sent": 0, "sms_errors": 0,
+                         "sms_suppressed": 0}
         self._last_tick_ts: float = 0.0
 
     def start(self) -> None:
@@ -226,6 +232,7 @@ class AlertEngine(Worker):
         self._stop.clear()
         self._mail.start()
         self._webhook.start()
+        self._sms.start()
         self._spawn()
 
     def reconfigure(self, settings: dict) -> None:
@@ -240,6 +247,7 @@ class AlertEngine(Worker):
         self._join()
         self._mail.stop()
         self._webhook.stop()
+        self._sms.stop()
 
     def begin_stop(self) -> None:
         self._stop.set()
@@ -248,6 +256,7 @@ class AlertEngine(Worker):
         # joins then land at once instead of costing 2s each.
         self._mail.begin_stop()
         self._webhook.begin_stop()
+        self._sms.begin_stop()
 
     def finish_stop(self, deadline: float) -> None:
         self._join(timeout=max(0.0, deadline - time.monotonic()))
@@ -256,6 +265,7 @@ class AlertEngine(Worker):
         # shared deadline by up to 4s between them.
         self._mail.finish_stop(deadline)
         self._webhook.finish_stop(deadline)
+        self._sms.finish_stop(deadline)
 
     def shutdown(self) -> None:
         self.stop()
@@ -469,6 +479,32 @@ class AlertEngine(Worker):
         for alert_id in alert_ids:
             self.db.record_notification(alert_id, job.kind, to_addr,
                                         job.subject, ok, error)
+
+    def _sms_result(self, job, ok: bool, error: str) -> None:
+        """The SMS counterpart of _mail_result — same shape, its own counter
+        pair (sms_sent/sms_errors); to_addrs holds the phone numbers."""
+        with self._system_lock:                      # see _mail_result
+            if ok:
+                self.counters["sms_sent"] += 1
+            else:
+                self.counters["sms_errors"] += 1
+        alert_ids = getattr(job, "alert_ids", None) or [job.alert_id]
+        for alert_id in alert_ids:
+            self.db.record_notification(alert_id, job.kind,
+                                        ", ".join(job.to_numbers), job.text,
+                                        ok, error)
+
+    def _sms_breaker(self, is_open: bool, error: str) -> None:
+        """The SMS path itself became (un)usable — same reasoning as
+        _mail_breaker: raised as an ordinary alert so the failure that
+        silences the text channel is not itself silenced by it."""
+        if is_open:
+            self.system_occurrence(
+                "sms_failing", "sms", "Alert texts", severity=2,
+                extra={"error": error},
+                message=f"Alert texts are failing and delivery is paused: {error}")
+        else:
+            self.clear_system_occurrence("sms_failing", "sms")
 
     # ------------------------------------------------------- drain plumbing
 
@@ -2812,13 +2848,16 @@ class AlertEngine(Worker):
         # Alerts page and nowhere else.
         if rule_row["kind"] == "system":
             return
-        # A rule can be worth recording and not worth mailing about. The
-        # alert still opens, is still listed, is still counted — only the
-        # inbox is spared. Guarded on the column's presence so an engine
-        # against a database that predates it keeps notifying, which is the
-        # behaviour every rule had before.
-        if "notify" in rule_row.keys() and not rule_row["notify"]:
+        # A rule can be worth recording and not worth mailing (or texting)
+        # about. The alert still opens, is still listed, is still counted —
+        # only the channel is spared. Guarded on the column's presence so an
+        # engine against a database that predates it keeps notifying, which
+        # is the behaviour every rule had before.
+        email_on = "notify" not in rule_row.keys() or bool(rule_row["notify"])
+        sms_on = "notify_sms" in rule_row.keys() and bool(rule_row["notify_sms"])
+        if not email_on and not sms_on:
             return
+        kind = notify_kind or ("renotify" if renotify else "alert")
         # The webhook channel's own decision, entirely independent of
         # email's below it: its own enabled flag, its own URL, its own
         # hourly budget (webhook_max_per_hour) and its own queue, so an
@@ -2827,10 +2866,16 @@ class AlertEngine(Worker):
         # a clear (through _notify_clear's template_override) and a small
         # roll-up flush's per-alert release — which is every decision point
         # except the digest, which has no single alert row; see
-        # _send_digest's own webhook call.
-        self._webhook_notify(alert_row, rule_row, occurrence, settings,
-                             notify_kind or ("renotify" if renotify else "alert"),
-                             template_override)
+        # _send_digest's own webhook call. Webhook stays gated by the
+        # ordinary notify flag, same as before SMS existed.
+        if email_on:
+            self._webhook_notify(alert_row, rule_row, occurrence, settings,
+                                 kind, template_override)
+        if sms_on:
+            self._sms_notify(alert_row, rule_row, occurrence, settings,
+                             kind, template_override)
+        if not email_on:
+            return
         # The email severity floor, deliberately below the webhook dispatch
         # above: a chat room or ticket queue has its own enabled flag and
         # budget and must keep getting everything.
@@ -2858,8 +2903,7 @@ class AlertEngine(Worker):
             # not be answered. Now the alert's own detail pane says nobody
             # was told, and why.
             self.db.record_notification(
-                alert_row["id"], notify_kind or ("renotify" if renotify else "alert"),
-                "", "", False,
+                alert_row["id"], kind, "", "", False,
                 f"not sent: over the {max_per_hour}/hour email limit")
             if self._suppression_logged_hour != current_hour:
                 self._suppression_logged_hour = current_hour
@@ -2912,7 +2956,6 @@ class AlertEngine(Worker):
                 except Exception:
                     password = None
 
-        kind = notify_kind or ("renotify" if renotify else "alert")
         job = alertmail.MailJob(
             settings=dict(settings), password=password, to_addrs=list(to_addrs),
             subject=subject, body=body, is_html=bool(template["is_html"]),
@@ -3011,6 +3054,83 @@ class AlertEngine(Worker):
             self.counters["webhook_errors"] += 1
             self.db.record_notification(alert_row["id"], webhook_kind, to_addr,
                                         subject, False, "send queue full")
+
+    def _sms_notify(self, alert_row, rule_row, occurrence: Occurrence,
+                    settings, kind: str, template_override=None) -> None:
+        """The text channel's own decision, at the same point _notify
+        reaches for email and webhook: its own enabled flag, its own
+        severity floor (sms_min_severity) and hourly budget
+        (sms_max_per_hour), its own recipient list and its own queue.
+
+        mark_notified is stamped here on the submit path, same reasoning as
+        _notify's own email send: an SMS-only rule (notify off, notify_sms
+        on) never reaches _notify's email stamp, so a renotify clock with
+        nothing to measure from would fire every tick forever.
+        """
+        if not settings.get("sms_enabled"):
+            return
+        if not settings.get("twilio_account_sid"):
+            return
+        if not (settings.get("twilio_from") or settings.get("twilio_messaging_service_sid")):
+            return
+        floor = int(settings.get("sms_min_severity", 7) or 0)
+        if alert_row["severity"] > floor:
+            return
+        now = time.time()
+        hour_ago = now - 3600
+        self._sms_sent_this_hour = [ts for ts in self._sms_sent_this_hour if ts >= hour_ago]
+        max_per_hour = int(settings.get("sms_max_per_hour", 30) or 0)
+        current_hour = int(now // 3600)
+        sms_kind = f"sms_{kind}"
+        if max_per_hour and len(self._sms_sent_this_hour) >= max_per_hour:
+            self.counters["sms_suppressed"] += 1
+            self.db.record_notification(
+                alert_row["id"], sms_kind, "", "", False,
+                f"not sent: over the {max_per_hour}/hour text limit")
+            if self._sms_suppression_logged_hour != current_hour:
+                self._sms_suppression_logged_hour = current_hour
+                self.log.add(ERROR, f"Alert text volume over {max_per_hour}/hour — "
+                                    f"suppressing further sends for the rest of this hour")
+            return
+        numbers = self._sms_numbers(settings)
+        if not numbers:
+            return
+        token = self._sms_token()
+        if not token:
+            return
+        extra = dict(occurrence.extra)
+        tag = extra.get("severity_tag")
+        if not tag:
+            tag = alertmail.build_context(alert_row, rule_row, extra=extra)["severity_tag"]
+        message = alert_row["message"] if kind != "clear" else occurrence.message
+        text = alertmail.sms_text(tag, rule_row["name"], alert_row["entity_label"], message)
+        job = alertmail.SmsJob(settings=dict(settings), token=token, to_numbers=numbers,
+                               text=text, alert_id=alert_row["id"], kind=sms_kind)
+        token = None
+        self._sms_sent_this_hour.append(now)
+        self.db.mark_notified(alert_row["id"], now)
+        if not self._sms.submit(job):
+            self.counters["sms_errors"] += 1
+            self.db.record_notification(alert_row["id"], sms_kind, ", ".join(numbers),
+                                        text, False, "send queue full")
+
+    def _sms_numbers(self, settings) -> list:
+        """sms_to_default, tolerant of a comma string like smtp_to_default's
+        own upgrade fallback in _notify."""
+        raw_to = settings.get("sms_to_default", [])
+        if isinstance(raw_to, str):
+            return [a.strip() for a in raw_to.split(",") if a.strip()]
+        return [str(a).strip() for a in raw_to if str(a).strip()]
+
+    def _sms_token(self) -> str | None:
+        blob = self.db.sms_token_enc()
+        if not blob:
+            return None
+        try:
+            from . import dpapi
+            return dpapi.unprotect(blob).decode("utf-8")
+        except Exception:
+            return None
 
     def _device_ip_for(self, alert_row) -> str:
         """Best-effort recovery of the real device address for the
@@ -3176,15 +3296,19 @@ class AlertEngine(Worker):
             if rule_row is None or not rule_row["enabled"]:
                 self.db.mark_notified(alert_row["id"])
                 continue
-            if rule_row["kind"] == "system" or (
-                    "notify" in rule_row.keys() and not rule_row["notify"]):
+            email_on = "notify" not in rule_row.keys() or bool(rule_row["notify"])
+            sms_on = "notify_sms" in rule_row.keys() and bool(rule_row["notify_sms"])
+            if rule_row["kind"] == "system" or (not email_on and not sms_on):
                 self.db.mark_notified(alert_row["id"])
                 continue
-            if alert_row["severity"] > floor:
-                # Below the email floor. Asked here as well as in _notify
+            sms_floor = int(settings.get("sms_min_severity", 7) or 0)
+            if alert_row["severity"] > floor and not (
+                    sms_on and alert_row["severity"] <= sms_floor):
+                # Below both the email floor and (if texting is even on for
+                # this rule) the SMS floor. Asked here as well as in _notify
                 # because this sweep is the one path that can hand an alert
                 # to _send_digest instead, and because a "due" alert nothing
-                # will ever mail must stop being due.
+                # will ever notify about must stop being due.
                 self.db.mark_notified(alert_row["id"])
                 continue
             if alert_row["state"] == "resolved":
@@ -3274,6 +3398,21 @@ class AlertEngine(Worker):
         # The webhook channel's own digest, entirely independent of email's
         # below it — same reasoning as _notify's own webhook call.
         self._webhook_digest(sendable, settings, delay_s)
+        # Likewise the text channel's own digest, for the subset of
+        # `sendable` whose rule has notify_sms on.
+        self._sms_digest(sendable, settings, delay_s)
+        # Everything below is the email digest alone — sendable can now
+        # include an SMS-only rule (notify off, notify_sms on; see
+        # _sweep_notify_rollup), and email stays gated by the ordinary
+        # notify flag exactly like _notify itself. An SMS-only entry never
+        # reaches the email loop below, so it is stamped here — the webhook
+        # and SMS digests above already spoke for it, one way or another.
+        def _email_on(rule_row):
+            return "notify" not in rule_row.keys() or bool(rule_row["notify"])
+        for alert_row, rule_row, _occurrence in sendable:
+            if not _email_on(rule_row):
+                self.db.mark_notified(alert_row["id"])
+        sendable = [entry for entry in sendable if _email_on(entry[1])]
         # Defensive: _sweep_notify_rollup is the only caller and already
         # applied the floor, but a digest is the one place a batch of alerts
         # reaches the relay without passing through _notify's own guards.
@@ -3358,6 +3497,13 @@ class AlertEngine(Worker):
         WebhookQueue), so a receiver parses a digest exactly the way it
         parses a single notification, just with more rows.
         """
+        # sendable can now include an SMS-only rule (notify off, notify_sms
+        # on) — see _sweep_notify_rollup's own guard — and webhook stays
+        # gated by the ordinary notify flag exactly like _webhook_notify.
+        sendable = [entry for entry in sendable
+                   if "notify" not in entry[1].keys() or bool(entry[1]["notify"])]
+        if not sendable:
+            return
         if not settings.get("webhook_enabled"):
             return
         url = str(settings.get("webhook_url") or "").strip()
@@ -3408,4 +3554,59 @@ class AlertEngine(Worker):
             for alert_row, _rule_row, _occurrence in sendable:
                 self.db.record_notification(alert_row["id"], "webhook_digest",
                                             to_addr, subject, False,
+                                            "send queue full")
+
+    def _sms_digest(self, sendable, settings, delay_s: float) -> None:
+        """One text for every alert in `sendable` whose rule has notify_sms
+        on, counted once against sms_max_per_hour — same reasoning as
+        _send_digest's own email coalescing."""
+        subset = [entry for entry in sendable
+                 if "notify_sms" in entry[1].keys() and bool(entry[1]["notify_sms"])]
+        if not subset:
+            return
+        if not settings.get("sms_enabled") or not settings.get("twilio_account_sid"):
+            return
+        if not (settings.get("twilio_from") or settings.get("twilio_messaging_service_sid")):
+            return
+        floor = int(settings.get("sms_min_severity", 7) or 0)
+        subset = [entry for entry in subset if entry[0]["severity"] <= floor]
+        if not subset:
+            return
+        now = time.time()
+        hour_ago = now - 3600
+        self._sms_sent_this_hour = [ts for ts in self._sms_sent_this_hour if ts >= hour_ago]
+        max_per_hour = int(settings.get("sms_max_per_hour", 30) or 0)
+        current_hour = int(now // 3600)
+        if max_per_hour and len(self._sms_sent_this_hour) >= max_per_hour:
+            self.counters["sms_suppressed"] += 1
+            reason = f"not sent: over the {max_per_hour}/hour text limit"
+            for alert_row, _rule_row, _occurrence in subset:
+                self.db.record_notification(alert_row["id"], "sms_digest",
+                                            "", "", False, reason)
+            if self._sms_suppression_logged_hour != current_hour:
+                self._sms_suppression_logged_hour = current_hour
+                self.log.add(ERROR, f"Alert text volume over {max_per_hour}/hour — "
+                                    f"suppressing further sends for the rest of this hour")
+            return
+        numbers = self._sms_numbers(settings)
+        if not numbers:
+            return
+        token = self._sms_token()
+        if not token:
+            return
+        minutes = max(1, round(delay_s / 60.0))
+        labels = ", ".join(row["entity_label"] for row, _rule_row, _occurrence in subset)
+        text = alertmail.sms_text("", f"SappiWhere: {len(subset)} alerts in {minutes} min",
+                                  "", labels)
+        job = alertmail.SmsJob(
+            settings=dict(settings), token=token, to_numbers=numbers, text=text,
+            alert_id=subset[0][0]["id"], kind="sms_digest",
+            alert_ids=[row["id"] for row, _rule_row, _occurrence in subset])
+        token = None
+        self._sms_sent_this_hour.append(now)
+        if not self._sms.submit(job):
+            self.counters["sms_errors"] += 1
+            for alert_row, _rule_row, _occurrence in subset:
+                self.db.record_notification(alert_row["id"], "sms_digest",
+                                            ", ".join(numbers), text, False,
                                             "send queue full")

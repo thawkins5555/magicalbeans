@@ -13,8 +13,15 @@ from urllib.parse import parse_qs
 
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 
-from netpath import alertmail
+from netpath import alertmail, dpapi
 from netpath.alertsdb import AlertsDatabase, validate_sms_settings
+from netpath.alertengine import AlertEngine, DIGEST_THRESHOLD
+from netpath.alertrules import SEVERITY_NAMES
+from netpath.ipamdb import IpamDatabase
+from netpath.nodesdb import NodesDatabase
+from netpath.snmptrapdb import SnmpTrapDatabase
+from netpath.syslogdb import SyslogDatabase
+from netpath.db import Database as NetpathDatabase
 
 TMPDIR = _paths.tmpdir("alert_sms_")
 FAILS = []
@@ -232,6 +239,270 @@ check("the sms_failing system rule is seeded with the smtp_failing template",
       and db.rule_by_key("sms_failing")["template_id"]
       == db.rule_by_key("smtp_failing")["template_id"])
 db.close()
+
+# ------------------------------------------------------- 5. engine sections
+_SEQ = [0]
+SMS_SETTINGS = {"email_enabled": False, "rollup_enabled": False,
+                "new_device_grace_s": 0, "notify_rollup_delay_s": 0,
+                "sms_enabled": True, "twilio_account_sid": "AC" + "a" * 32,
+                "twilio_from": "+15550001111",
+                "twilio_messaging_service_sid": "",
+                "sms_to_default": ["+15551234567"]}
+DEVICE_DOWN_TAG = "[{}]".format(SEVERITY_NAMES[1].upper())
+
+
+def build_engine(**settings):
+    _SEQ[0] += 1
+    folder = os.path.join(TMPDIR, f"case{_SEQ[0]}")
+    os.makedirs(folder, exist_ok=True)
+    nodes = NodesDatabase(os.path.join(folder, "nodes.db"))
+    alerts = AlertsDatabase(os.path.join(folder, "alerts.db"))
+    values = dict(SMS_SETTINGS)
+    values.update(settings)
+    alerts.save_settings(values)
+    alerts.set_sms_credential(dpapi.protect(b"tok"))
+    snmp = SnmpTrapDatabase(os.path.join(folder, "traps.db"))
+    syslog = SyslogDatabase(os.path.join(folder, "syslog.db"))
+    ipam = IpamDatabase(os.path.join(folder, "ipam.db"))
+    netpath_db = NetpathDatabase(os.path.join(folder, "netpath.db"))
+    engine = AlertEngine(alerts, nodes_db=nodes, snmp_db=snmp,
+                         syslog_db=syslog, ipam_db=ipam, netpath_db=netpath_db)
+    return nodes, alerts, engine
+
+
+def add_device(nodes, ip, name):
+    gid = nodes.ensure_default_group()
+    return nodes.add_device(ip, name=name, group_id=gid)
+
+
+def go_down(nodes, device_id, detail="stopped responding"):
+    import sqlite3
+    conn = sqlite3.connect(nodes.path)
+    conn.execute("UPDATE devices SET status = 'down' WHERE id = ?", (device_id,))
+    conn.commit()
+    conn.close()
+    nodes.record_device_event(device_id, "down", detail)
+
+
+def come_up(nodes, device_id, detail="responding again"):
+    import sqlite3
+    conn = sqlite3.connect(nodes.path)
+    conn.execute("UPDATE devices SET status = 'up' WHERE id = ?", (device_id,))
+    conn.commit()
+    conn.close()
+    nodes.record_device_event(device_id, "up", detail)
+
+
+real_send_sms = alertmail.send_sms
+sms_calls = []
+
+
+def fake_send_sms(settings, token, to_number, text):
+    sms_calls.append((to_number, text))
+
+
+alertmail.send_sms = fake_send_sms
+try:
+    # --------------------------------------------------------------- E1
+    print("\nE1 — notify_sms off sends nothing; on, one text per number")
+    nodes, alerts, engine = build_engine()
+    engine._sms.start()
+    try:
+        rule = alerts.rule_by_key("device_down")
+        dev = add_device(nodes, "10.9.0.1", "sw1")
+        engine._tick()
+        sms_calls.clear()
+        go_down(nodes, dev)
+        engine._tick()
+        engine._sms.wait_idle(10.0)
+        check("notify_sms off by default: no text sent", not sms_calls, sms_calls)
+
+        alerts.update_rule(rule["id"], notify_sms=True)
+        come_up(nodes, dev)
+        engine._tick()
+        sms_calls.clear()
+        go_down(nodes, dev)
+        engine._tick()
+        engine._sms.wait_idle(10.0)
+        check("notify_sms on: one text to the one configured number",
+              len(sms_calls) == 1 and sms_calls[0][0] == "+15551234567", sms_calls)
+        check("...body opens with the severity tag and names the device",
+              sms_calls[0][1].startswith(DEVICE_DOWN_TAG) and "sw1" in sms_calls[0][1],
+              sms_calls[0][1])
+        alert_id = alerts.alerts(state="unresolved")[0]["id"]
+        rows = alerts.notifications_for(alert_id)
+        check("a sms_alert notification row is recorded, ok",
+              any(r["kind"] == "sms_alert" and r["ok"] for r in rows),
+              [(r["kind"], r["ok"]) for r in rows])
+    finally:
+        engine._sms.stop()
+
+    # --------------------------------------------------------------- E2
+    print("\nE2 — notify off, notify_sms on still texts")
+    nodes, alerts, engine = build_engine()
+    engine._sms.start()
+    try:
+        rule = alerts.rule_by_key("device_down")
+        alerts.update_rule(rule["id"], notify=False, notify_sms=True)
+        dev = add_device(nodes, "10.9.0.2", "sw2")
+        engine._tick()
+        sms_calls.clear()
+        go_down(nodes, dev)
+        engine._tick()
+        engine._sms.wait_idle(10.0)
+        check("email off for the rule, SMS still sent", len(sms_calls) == 1, sms_calls)
+    finally:
+        engine._sms.stop()
+
+    # --------------------------------------------------------------- E3
+    print("\nE3 — sms_min_severity below the alert's severity: no text")
+    nodes, alerts, engine = build_engine(sms_min_severity=0)
+    engine._sms.start()
+    try:
+        rule = alerts.rule_by_key("device_down")
+        alerts.update_rule(rule["id"], notify_sms=True)
+        dev = add_device(nodes, "10.9.0.3", "sw3")
+        engine._tick()
+        sms_calls.clear()
+        go_down(nodes, dev)
+        engine._tick()
+        engine._sms.wait_idle(10.0)
+        check("the floor suppresses a text for a less severe alert",
+              not sms_calls, sms_calls)
+    finally:
+        engine._sms.stop()
+
+    # --------------------------------------------------------------- E4
+    print("\nE4 — sms_max_per_hour caps the second alert")
+    nodes, alerts, engine = build_engine(sms_max_per_hour=1)
+    engine._sms.start()
+    try:
+        rule = alerts.rule_by_key("device_down")
+        alerts.update_rule(rule["id"], notify_sms=True)
+        dev1 = add_device(nodes, "10.9.0.4", "sw4")
+        dev2 = add_device(nodes, "10.9.0.5", "sw5")
+        engine._tick()
+        sms_calls.clear()
+        go_down(nodes, dev1)
+        go_down(nodes, dev2)
+        engine._tick()
+        engine._sms.wait_idle(10.0)
+        check("only the first alert's text goes out", len(sms_calls) == 1, sms_calls)
+        alert2 = alerts.alerts(state="unresolved", rule_id=rule["id"])
+        alert2 = [a for a in alert2 if a["entity_id"] == str(dev2)][0]
+        rows = alerts.notifications_for(alert2["id"])
+        check("...the second alert gets a capped sms_alert row",
+              any(r["kind"] == "sms_alert" and not r["ok"]
+                  and "over the 1/hour text limit" in (r["error"] or "")
+                  for r in rows),
+              [(r["kind"], r["ok"], r["error"]) for r in rows])
+    finally:
+        engine._sms.stop()
+
+    # --------------------------------------------------------------- E5
+    print("\nE5 — device recovers: a [RECOVER] clear text")
+    nodes, alerts, engine = build_engine()
+    engine._sms.start()
+    try:
+        rule = alerts.rule_by_key("device_down")
+        alerts.update_rule(rule["id"], notify_sms=True)
+        dev = add_device(nodes, "10.9.0.6", "sw6")
+        engine._tick()
+        go_down(nodes, dev)
+        engine._tick()
+        engine._sms.wait_idle(10.0)
+        sms_calls.clear()
+        come_up(nodes, dev)
+        engine._tick()
+        engine._sms.wait_idle(10.0)
+        clears = [c for c in sms_calls if c[1].startswith(alertmail.RECOVER_TAG)]
+        check("a sms_clear text starting with [RECOVER] goes out",
+              len(clears) == 1, sms_calls)
+    finally:
+        engine._sms.stop()
+
+    # --------------------------------------------------------------- E6
+    print("\nE6 — a mass outage goes out as one sms_digest")
+    nodes, alerts, engine = build_engine(notify_rollup_delay_s=1)
+    engine._sms.start()
+    try:
+        rule = alerts.rule_by_key("device_down")
+        alerts.update_rule(rule["id"], notify_sms=True)
+        devices = [add_device(nodes, f"10.9.1.{i}", f"dsw{i}")
+                  for i in range(DIGEST_THRESHOLD + 2)]
+        engine._tick()
+        sms_calls.clear()
+        for device_id in devices:
+            go_down(nodes, device_id)
+        engine._tick()
+        check("nothing sent yet — still inside the roll-up hold", not sms_calls)
+        time.sleep(1.2)
+        engine._tick()
+        engine._sms.wait_idle(10.0)
+        check("exactly one text for the whole mass outage", len(sms_calls) == 1, sms_calls)
+        for device_id in devices:
+            alert = [a for a in alerts.alerts(state="unresolved", rule_id=rule["id"])
+                    if a["entity_id"] == str(device_id)][0]
+            rows = alerts.notifications_for(alert["id"])
+            check(f"device {device_id} has its own sms_digest row",
+                  any(r["kind"] == "sms_digest" for r in rows),
+                  [r["kind"] for r in rows])
+    finally:
+        engine._sms.stop()
+
+    # --------------------------------------------------------------- E7
+    print("\nE7 — the SMS breaker opens sms_failing and clears on success")
+    nodes, alerts, engine = build_engine()
+    engine._sms.start()
+    try:
+        rule = alerts.rule_by_key("device_down")
+        alerts.update_rule(rule["id"], notify_sms=True)
+
+        def failing_send_sms(settings, token, to_number, text):
+            raise ValueError("boom")
+
+        alertmail.send_sms = failing_send_sms
+        engine._tick()
+        for i in range(engine._sms.failures_to_open):
+            dev = add_device(nodes, f"10.9.2.{i}", f"fsw{i}")
+            go_down(nodes, dev)
+            engine._tick()
+            engine._sms.wait_idle(10.0)
+        engine._tick()
+        rows = alerts.alerts(state="unresolved")
+        check("sms_failing opened once the breaker tripped",
+              any(r["entity_id"] == "sms" for r in rows),
+              [(r["entity_id"], r["message"]) for r in rows])
+        check("sms_errors counted", engine.counters["sms_errors"] > 0, engine.counters)
+        engine._sms._record_success()
+        engine._tick()
+        rows = alerts.alerts(state="unresolved")
+        check("...and clears once the channel recovers",
+              not any(r["entity_id"] == "sms" for r in rows),
+              [(r["entity_id"], r["message"]) for r in rows])
+    finally:
+        alertmail.send_sms = fake_send_sms
+        engine._sms.stop()
+
+    # --------------------------------------------------------------- E8
+    print("\nE8 — sms_sent counted on success")
+    nodes, alerts, engine = build_engine()
+    engine._sms.start()
+    try:
+        rule = alerts.rule_by_key("device_down")
+        alerts.update_rule(rule["id"], notify_sms=True)
+        dev = add_device(nodes, "10.9.0.9", "sw9")
+        engine._tick()
+        before = engine.counters["sms_sent"]
+        go_down(nodes, dev)
+        engine._tick()
+        engine._sms.wait_idle(10.0)
+        check("sms_sent counter increments", engine.counters["sms_sent"] > before,
+              engine.counters)
+    finally:
+        engine._sms.stop()
+finally:
+    alertmail.send_sms = real_send_sms
 
 server.shutdown()
 print()
