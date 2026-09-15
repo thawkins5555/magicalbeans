@@ -215,7 +215,8 @@ def _render_firmware(service, params: dict, now: float):
 
 def _render_sfp(service, params: dict, now: float):
     device_ids = _device_ids_for_group(service.nodes_db, params.get("device_group_id"))
-    include_empty = bool(params.get("include_empty"))
+    include_empty = params.get("include_empty") is True or str(
+        params.get("include_empty", "")).strip().lower() in ("1", "true", "yes")
     report = reportmod.sfp_inventory(
         service.nodes_db, device_ids=device_ids, hostnames=service.app_db.hostnames,
         include_empty=include_empty)

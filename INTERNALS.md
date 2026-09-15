@@ -6324,7 +6324,7 @@ interface rows never carry `selected` or `bulk-checked`.
 
 **`nodes.js histDeviceLabel(d)` replaces `` `${d.name || d.ip}
 (${d.ip})` `` — the raw, usually-unset manual-name field — with the
-same `displayName(d)` precedence (SNMP hostname first) the device list
+same `displayName(d)` precedence (a pinned manual name, else the SNMP hostname, else the stored name, else the IP) the device list
 itself already used elsewhere in this module.** It returns `"name
 (ip)"`, or just the bare IP when `displayName` resolves to the IP
 already, so a nameless device never reads `"10.1.2.3 (10.1.2.3)"`. Both

@@ -23,8 +23,9 @@ does not replace it.
    so a priority port is visible at a glance without opening a filter.
 2. The History device picker was reading the manual name field, which
    most devices never have set, and falling back to the bare IP. It now
-   resolves a name the same way the device list does — SNMP hostname
-   first — and the dropdown shows both name and IP together; the
+   resolves a name the same way the device list does — a pinned manual
+   name, else the SNMP hostname, else the stored name, else the IP — and
+   the dropdown shows both name and IP together; the
    server-side search already matched on IP, name, and hostname, so no
    change was needed there.
 3. New Nodes → Reports → SFP INVENTORY report, built from the per-port
@@ -35,7 +36,7 @@ does not replace it.
    a CSV export and as a scheduled emailed report kind alongside the
    existing report schedules.
 
-Outcome: (pending)
+**Outcome.** All three items shipped as 5.24.0. Full suite 166/170 with only the four known environmental failures (no passphrase, no traceroute, socket family, prune-lock timing), browser walk 77/77 with zero console, page or HTTP errors as admin and viewer, Javariius pass 1 "not ready" (three doc inaccuracies, six nits, all closed), pass 2 "ready to push". One walk step in Mapper (Connect/Remove) proved a harness race and was hardened to wait for the map reload; no product change. New tests: tests/test_sfp_report.py.
 
 ## 5.7.0 — Five reports
 

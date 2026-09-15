@@ -733,6 +733,9 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         assert(!title.includes('★'), `title still starred after unflagging: "${title}"`);
       } else {
         assert(title.includes('★'), `title has no star after flagging: "${title}"`);
+        // The pane's table behind the dialog repaints on the next poll tick
+        // and the flagged row must carry the tint class.
+        await page.waitForSelector('#nd-if-table tbody tr.priority', { timeout: 20000 });
       }
 
       // Leave the port as it was found, so a repeated walk is idempotent.
@@ -988,10 +991,20 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       const removed = page.waitForResponse((response) =>
         /\/api\/mapper\/maps\/\d+\/links\/\d+$/.test(response.url())
         && response.request().method() === 'DELETE', { timeout: 10000 });
+      // Remove awaits the DELETE and then loadMapData's own GET before
+      // repainting #mp-counters, so wait for that reload, not a fixed sleep.
+      const reloaded = page.waitForResponse((response) =>
+        /\/api\/mapper\/maps\/\d+$/.test(new URL(response.url()).pathname)
+        && response.request().method() === 'GET', { timeout: 10000 });
       await page.click('#mp-detail [data-remove-link]');
       const removeResponse = await removed;
       assert(removeResponse.ok(), `Remove line answered ${removeResponse.status()}`);
-      await sleep(500);
+      await reloaded;
+      await page.waitForFunction((expected) => {
+        const text = document.getElementById('mp-counters').textContent || '';
+        const n = Number((/(\d+) link/.exec(text) || [])[1] || -1);
+        return n === expected;
+      }, before, { timeout: 10000 });
       const afterRemove = linkCount(await countText());
       assert(afterRemove === before,
         `link count after Remove is ${afterRemove}, expected back to ${before}`);
