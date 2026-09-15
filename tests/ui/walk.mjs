@@ -1408,7 +1408,8 @@ async function checkDialog(page, dir, tag) {
       // (see api.py's post_nodes_discovery_promote). Re-reading the job's
       // own results is the request this check has to prove still succeeds.
       const reread = await page.evaluate((id) =>
-        App.get(`/api/nodes/discovery/${id}`).then(() => 'ok').catch((e) => e.message));
+        App.get(`/api/nodes/discovery/${id}`).then(() => 'ok').catch((e) => e.message),
+        setup.jobId);
       assert(reread === 'ok', `re-reading the discovery job failed: ${reread}`);
       return 'Same as column present, results re-read cleanly';
     } finally {

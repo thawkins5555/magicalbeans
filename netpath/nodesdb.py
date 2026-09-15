@@ -888,9 +888,8 @@ def alias_candidate(ip) -> str:
     """The address as it would be stored in device_addresses, or "" for one
     that must never be: every device reports 127.0.0.1 in its ipAddrTable,
     and storing that would make one arbitrary device the owner of
-    everything sent from localhost. Shared by record_device_addresses and
-    by discovery, so identity folding and alias storage can never disagree
-    about which addresses count."""
+    everything sent from localhost. The one rule for which addresses
+    record_device_addresses may store."""
     text = str(ip or "").strip()
     if not text or text.startswith("127.") or text in ("0.0.0.0", "::1", "::"):
         return ""

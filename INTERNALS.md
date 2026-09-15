@@ -3071,15 +3071,16 @@ itself.
 
 **Where an address is decided.** `alias_candidate(ip)` is the one rule
 for which addresses count: not blank, not `127.*`, not `0.0.0.0`/`::`.
-`record_device_addresses` and discovery both go through it, so alias
-storage and identity folding cannot disagree. The device's own primary
+`record_device_addresses` goes through it (discovery did too, until
+5.29.0), so alias storage and identity folding could not disagree. The device's own primary
 stays in `devices.ip` and is deliberately never mirrored into
 `device_addresses`; `device_id_for_address` checks the primary first and
 the aliases second, because the primary is the address an operator
 configured and an alias is only ever supporting evidence.
 `_migrate` adds `device_addresses.if_index`/`netmask` (COALESCEd on
-upsert, so a source that knows only the address — a trap, a discovery
-fold — never erases what the poller's fuller walk learned) and
+upsert, so a source that knew only the address — a trap, a discovery
+fold, both writers gone in 5.29.0 — never erased what the poller's fuller
+walk learned) and
 `discovery_results.ip_addresses`/`folded_into_result_id`.
 
 **Which `source` is identity evidence — history through 5.28.0, then one

@@ -962,10 +962,10 @@ own subtabs.
   hostname and device type and nothing more, which is a reason to look
   before ticking. Both levels start unticked, reading "already added as
   `<node>`: `<ip>` is on its interfaces" for the high case. Leaving a
-  **Same as** row unticked and approving the rest just marks that result
-  as already added — discovery does not write any address of its own,
-  from 5.29.0, so nothing about the existing device changes underneath
-  it. Ticking it and approving adds it as its own device instead — the
+  **Same as** row unticked and approving the rest leaves it exactly as it
+  is, still listed and still flagged — discovery does not write any
+  address of its own, from 5.29.0, so nothing about the existing device
+  changes underneath it. Ticking it and approving adds it as its own device instead — the
   match is a suggestion the operator can accept or override, never
   something Approve does silently on its behalf. The hint that explains
   the match is unchanged and still shown either way, so the operator

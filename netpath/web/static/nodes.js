@@ -340,9 +340,8 @@
       cell: (r) => escape(r.fw_version || '—') },
   ];
 
-  // A device can answer on more addresses than the one it was entered
-  // under — a merge folds the other row's address in here — so the column
-  // says how many others there are and names them.
+  // A device can have more interface addresses than the one it was
+  // entered under, so the column says how many others there are and names them.
   function deviceIpCell(r) {
     const all = (r.addresses || []).map((a) => a.ip);
     const extra = Math.max(0, all.length - 1);

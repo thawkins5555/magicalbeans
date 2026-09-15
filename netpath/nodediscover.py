@@ -99,7 +99,7 @@ class DiscoveryJob:
         self.settings = settings
         self.log = log or NullLog()
         self._stop = threading.Event()
-        # Guards the counters and fold map; never held across an SNMP probe.
+        # Guards the counters; never held across an SNMP probe.
         self._lock = threading.Lock()
         self._probed = self._responded = self._identified = 0
         self._progress_ts = 0.0
