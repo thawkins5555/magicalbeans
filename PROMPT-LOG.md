@@ -5,6 +5,48 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.26.0 — Power supplies: removed, unpowered, and reported the moment it happens
+
+**"Where do Device Details → Addresses populate from, Primary vs
+Discovery?"**
+→ Answered from a Dora exploration trace of the Addresses list's own
+code path; no code touched.
+
+**"Why are hardware sensors listed twice in the device dialog?"**
+→ Answered, no code change: the HARDWARE SENSORS tile matches on a
+sensor's `temp_`/`psu_` metric prefix, and the live envmon walk it
+draws from overlaps the same sensors the per-sensor table below it
+already lists — the two are reading the same data through two
+different paths, not a duplicate poll.
+
+**"Pulled the AC cord on one power supply on a Cisco switch. The live
+HARDWARE SENSORS tile showed 'shutdown' — but no alert fired.
+Need this to alert both when a supply loses input and when it's pulled
+out entirely."**
+
+**Planning answers, four decisions:** alert on a supply that
+disappears from the table (previously it cleared any open alert,
+because many Catalysts report a pulled supply as "not present," the
+same code an empty bay uses); read PSU state on every poll instead of
+the existing five-minute sensor cadence, so a failure is caught within
+one poll; decode the Cisco ENVMON/FRU power traps by name and give
+them a sane default severity, so they show up as more than bare OIDs
+and the existing "Critical SNMP trap received" rule can act on them;
+and have a power trap from a managed device trigger an immediate
+re-read of that device, so the alert opens (or clears) within one poll
+of the trap arriving rather than trailing the cadence. Version for
+this work: 5.26.0.
+
+**Outcome.** Thing1 built the poller and MIB side — the per-poll PSU
+cadence with the cached static table columns
+(`_vendor_psu_static`/`_vendor_psu_rows`), the not-present state (3)
+that opens `psu_failed` instead of clearing it, and the Cisco FRU
+`offEnvOther`/`offAdmin` remap. Thing2 built the trap side —
+`trapdecode.py`'s six new OID names, two enum decodes and six default
+severities, and `snmptrapd.py`/`web/service.py`'s `poll_now` re-read
+hook. (Outcome: see below)
+→ Stephen_King. `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md` written
+for 5.26.0 against the actual diff (`854c7e8..HEAD`); no code touched.
 ## 5.25.0 — SFP copper/laser identification
 
 **Operator prompt, two items:**

@@ -562,9 +562,11 @@ own subtabs.
   already use. See Alerts → Rules for the four rules this feeds, and
   INTERNALS for the full vendor-by-vendor object list.
 - **From 5.16.0, a power supply is polled too, on the same vendors' own
-  MIBs**, normalised to ok / warning / failed per bay; see Alerts →
-  Rules for what it feeds and INTERNALS for the object list. An empty
-  bay is never polled into an alerting state.
+  MIBs**, normalised to ok / warning / failed per bay — from 5.26.0
+  read on every poll rather than every five minutes, so a lost supply
+  is caught within one poll interval; see Alerts → Rules for what it
+  feeds and INTERNALS for the object list. An empty bay is never
+  polled into an alerting state.
 - **Every optic's own readings are kept per port, not just the device's
   worst one.** The same five-minute walk records `sfp_rx_dbm`,
   `sfp_tx_dbm`, `sfp_bias_ma`, `sfp_volt` and `sfp_temp_c` for each port a
@@ -2298,6 +2300,25 @@ alerts and optionally emailing about them.
   clears back to normal rather than leaving a stale alert open. Both
   rules roll up under a device outage the same way the temperature pair
   does.
+- **From 5.26.0, a supply that disappears alerts instead of clearing,
+  and it is caught within one poll.** PSU state is now read on every
+  poll instead of once every five minutes — a device already latched
+  as not vendor-sensor-capable still waits the existing hourly reprobe
+  — so **Power supply failed** no longer trails a fault by up to five
+  minutes. A bay that has reported before and now reads not-present —
+  pulled, or unpowered so its management bus goes dark, which many
+  Catalysts report the same way an empty bay does — now opens **Power
+  supply failed** instead of clearing back to normal; an empty bay
+  that has never reported still never alerts, and a hand-resolved
+  alert on a permanently removed supply still stays closed for that
+  breach run. On Cisco's FRU table, a supply reporting no input at all
+  now counts as failed rather than being read as administratively off.
+  Six Cisco ENVMON/FRU power-supply traps are now named and given a
+  default severity in the SNMP Trap Log and its rules (four Critical,
+  a FRU removal Error, a FRU insertion Notice), and receiving any of
+  them from a managed device triggers an immediate re-read of that
+  device, so the alert opens — or clears, on recovery — within one
+  poll instead of trailing the cadence.
 - **Three of those 35 are new in 4.39.0**, and each one reports a failure
   that previously had nobody to report it. `snmp_failing_ping_ok` fires
   when a device answers ping while its SNMP agent has stopped answering —
