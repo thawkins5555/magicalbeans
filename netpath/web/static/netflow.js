@@ -1194,7 +1194,7 @@
     const CONTROLS = ['nf-range', 'nf-dimension', 'nf-src', 'nf-dst', 'nf-port',
       'nf-protocol', 'nf-exporter', 'nf-order'];
     App.rememberControls('netflow', CONTROLS);
-    App.fillRanges(App.el('nf-range'), 'Last hour');
+    App.fillRanges(App.el('nf-range'), 'Last hour', undefined, { custom: true });
     const dimension = App.el('nf-dimension');
     // `dimensions` — like every other block in /api/state — is omitted
     // entirely for an account that cannot read this module (see
@@ -1219,7 +1219,16 @@
     const exporter = App.el('nf-exporter');
     exporter.innerHTML = '<option value="">All exporters</option>';
 
-    App.el('nf-range').onchange = resetWindow;
+    App.el('nf-range').onchange = async () => {
+      const select = App.el('nf-range');
+      if (select.value !== 'custom') { resetWindow(); return; }
+      const picked = await App.rangeDialog({ t0: view.t0, t1: view.t1 });
+      if (!picked) {
+        select.value = view.follow ? String(Math.round(view.t1 - view.t0)) : 'custom';
+        return;
+      }
+      setWindow(picked.t0, picked.t1, false);
+    };
     App.el('nf-reset').onclick = resetWindow;
 
     /* The documented chart shortcuts. Ctrl-modified on purpose (README

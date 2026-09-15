@@ -49,79 +49,155 @@
 
   /* --------------------------------------------------------- the catalogue */
 
-  const WINDOW_OPTIONS = [['1 hour', 3600], ['6 hours', 21600],
-                          ['24 hours', 86400], ['7 days', 604800]];
-
   function windowSelectHtml(id, selected) {
     const sel = selected || 86400;
-    return `<label>Window <select id="${id}">${WINDOW_OPTIONS.map(([label, secs]) =>
+    return `<label>Window <select id="${id}">${App.RANGES.map(([label, secs]) =>
       `<option value="${secs}"${secs === sel ? ' selected' : ''}>${escape(label)}</option>`)
       .join('')}</select></label>`;
   }
 
   function deviceFieldHtml(id) {
-    return `<label>Device <input list="dash-devices" id="${id}" autocomplete="off"></label>`;
+    return `<label>Device <input id="${id}" autocomplete="off"></label>`;
   }
 
-  /* Feeds #dash-devices from /api/nodes/devices as the operator types, and
-     remembers which displayed label meant which id — a plain <input list>
-     hands back only the text an option carried, never a value distinct from
-     it. `onPicked` also refills a dependent interface/metric <select>. */
+  /* App.comboBox over /api/nodes/devices. `onPicked` also refills a
+     dependent interface/metric <select>. Picking sets input.dataset.deviceId
+     — readDeviceConfig and friends key off that, exactly as the datalist
+     version did — and typing without picking leaves it unset, which is what
+     an unconfigured tile still needs to save (tests/ui/walk.mjs). */
   function wireDeviceField(box, id, onPicked) {
     const input = box.querySelector(`#${id}`);
     if (!input) return;
-    const labelToId = {};
-    let timer = null;
-    const search = () => {
-      App.get('/api/nodes/devices', { q: input.value.trim(), limit: 20 }).then((result) => {
-        const datalist = document.getElementById('dash-devices');
-        if (!datalist) return;
-        datalist.innerHTML = '';
-        for (const d of result.devices || []) {
-          const label = `${displayName(d)} (${d.ip})`;
-          labelToId[label] = d.id;
-          const opt = document.createElement('option');
-          opt.value = label;
-          datalist.appendChild(opt);
-        }
-      }).catch(() => {});
-    };
-    input.addEventListener('input', () => {
-      clearTimeout(timer);
-      timer = setTimeout(search, 200);
-      const picked = labelToId[input.value];
-      if (picked != null) {
-        input.dataset.deviceId = String(picked);
-        if (onPicked) onPicked(picked);
-      }
+    App.comboBox(input, {
+      search: async (q) => {
+        const result = await App.get('/api/nodes/devices', { q, limit: 20 });
+        return (result.devices || []).map((d) => ({ id: d.id, label: `${displayName(d)} (${d.ip})` }));
+      },
+      onPick(id_) {
+        input.dataset.deviceId = String(id_);
+        if (onPicked) onPicked(id_);
+      },
     });
   }
 
-  function deviceConfigForm(tile_, box, opts = {}) {
+  /* Bps ceiling for the interface traffic and device metric Configure
+     dialogs: blank (auto-scale), a bare integer, or a K/M/G/T-suffixed
+     shorthand ("100M", "2.5G"). Anything else is left unset rather than
+     guessed at. */
+  function parseBpsCeiling(raw) {
+    const text = (raw || '').trim();
+    if (!text) return null;
+    const m = /^([\d.]+)\s*([kKmMgGtT])?$/.exec(text);
+    if (!m) return null;
+    const n = parseFloat(m[1]);
+    if (!Number.isFinite(n)) return null;
+    const mult = { k: 1e3, m: 1e6, g: 1e9, t: 1e12 }[(m[2] || '').toLowerCase()] || 1;
+    return Math.round(n * mult);
+  }
+
+  function fillIfaceSelect(sel, deviceId, selectedIfIndex) {
+    if (!deviceId) { sel.innerHTML = '<option value="">—</option>'; return; }
+    App.get(`/api/nodes/devices/${deviceId}/interfaces`).then((r) => {
+      sel.innerHTML = '<option value="">—</option>';
+      for (const iface of r.interfaces || []) {
+        const opt = document.createElement('option');
+        opt.value = iface.if_index;
+        opt.textContent = (iface.descr || `if ${iface.if_index}`) + (iface.alias ? ` · ${iface.alias}` : '');
+        if (selectedIfIndex === iface.if_index) opt.selected = true;
+        sel.appendChild(opt);
+      }
+    }).catch(() => {});
+  }
+
+  const MAX_IFACE_ROWS = 8;
+
+  function ifaceRowHtml(rowId, row) {
+    return `<div class="dash-iface-row row" data-iface-row="${rowId}">
+      <label>Device <input id="dc-dev-${rowId}" autocomplete="off"></label>
+      <label>Interface <select id="dc-if-${rowId}"><option value="">—</option></select></label>
+      <button type="button" data-remove-row="${rowId}" aria-label="Remove interface">Remove</button>
+    </div>`;
+  }
+
+  function wireIfaceRow(box, rowId, row) {
+    const devInput = box.querySelector(`#dc-dev-${rowId}`);
+    const ifSel = box.querySelector(`#dc-if-${rowId}`);
+    devInput.dataset.deviceId = row.device_id != null ? String(row.device_id) : '';
+    wireDeviceField(box, `dc-dev-${rowId}`, (deviceId) => fillIfaceSelect(ifSel, deviceId, null));
+    if (row.device_id != null) {
+      App.get(`/api/nodes/devices/${row.device_id}`)
+        .then((d) => { devInput.value = `${displayName(d)} (${d.ip})`; }).catch(() => {});
+      fillIfaceSelect(ifSel, row.device_id, row.if_index);
+    }
+  }
+
+  let ifaceRowCounter = 0;
+  function addIfaceRow(box, row) {
+    const rowsBox = box.querySelector('#dc-iface-rows');
+    const count = rowsBox.querySelectorAll('[data-iface-row]').length;
+    if (count >= MAX_IFACE_ROWS) return;
+    ifaceRowCounter += 1;
+    const rowId = `r${ifaceRowCounter}`;
+    rowsBox.insertAdjacentHTML('beforeend', ifaceRowHtml(rowId, row));
+    wireIfaceRow(box, rowId, row);
+    const addBtn = box.querySelector('#dc-add-iface');
+    if (addBtn) addBtn.disabled = count + 1 >= MAX_IFACE_ROWS;
+  }
+
+  function ifaceTrafficConfigForm(tile_, box) {
     const cfg = tile_.config || {};
-    box.innerHTML = deviceFieldHtml('dc-device')
-      + (opts.withInterface ? '<label>Interface <select id="dc-iface"><option value="">—</option></select></label>' : '')
-      + (opts.withMetric ? '<label>Metric <select id="dc-metric"><option value="">—</option></select></label>' : '')
-      + windowSelectHtml('dc-window', cfg.window_s);
+    const rows = (cfg.interfaces && cfg.interfaces.length) ? cfg.interfaces
+      : (cfg.device_id != null ? [{ device_id: cfg.device_id, if_index: cfg.if_index }] : []);
+    box.innerHTML = `${App.form.text('dc-name', 'Name', escape(cfg.name || ''), 'maxlength="60" placeholder="optional"')}
+      <div id="dc-iface-rows"></div>
+      <button type="button" id="dc-add-iface">Add interface</button>
+      ${windowSelectHtml('dc-window', cfg.window_s)}
+      <label>Y max <input id="dc-ymax" value="${escape(cfg.y_max != null ? String(cfg.y_max) : '')}"
+        placeholder="auto"></label>
+      <p class="hint">Blank auto-scales; or set a ceiling — plain bps, or a shorthand like 100M or 2.5G.</p>`;
+    for (const row of (rows.length ? rows : [{}])) addIfaceRow(box, row);
+    box.querySelector('#dc-add-iface').onclick = () => addIfaceRow(box, {});
+    box.querySelector('#dc-iface-rows').addEventListener('click', (event) => {
+      const btn = event.target.closest('[data-remove-row]');
+      if (!btn) return;
+      btn.closest('[data-iface-row]').remove();
+      const addBtn = box.querySelector('#dc-add-iface');
+      if (addBtn) addBtn.disabled = false;
+    });
+  }
+
+  function readIfaceTrafficConfig(box, tile_) {
+    const interfaces = [];
+    for (const row of box.querySelectorAll('#dc-iface-rows [data-iface-row]')) {
+      const devInput = row.querySelector('input[id^="dc-dev-"]');
+      const ifSel = row.querySelector('select[id^="dc-if-"]');
+      const deviceId = devInput && devInput.dataset.deviceId ? Number(devInput.dataset.deviceId) : null;
+      const ifIndex = ifSel && ifSel.value !== '' ? Number(ifSel.value) : null;
+      if (deviceId != null && ifIndex != null) interfaces.push({ device_id: deviceId, if_index: ifIndex });
+    }
+    const out = {
+      name: box.querySelector('#dc-name').value.trim().slice(0, 60),
+      interfaces,
+      window_s: Number(box.querySelector('#dc-window').value),
+      y_max: parseBpsCeiling(box.querySelector('#dc-ymax').value),
+    };
+    const existing = (tile_ && tile_.config) || {};
+    if (existing.t0 != null && existing.t1 != null) { out.t0 = existing.t0; out.t1 = existing.t1; }
+    return out;
+  }
+
+  function deviceMetricConfigForm(tile_, box) {
+    const cfg = tile_.config || {};
+    box.innerHTML = `${App.form.text('dc-name', 'Name', escape(cfg.name || ''), 'maxlength="60" placeholder="optional"')}
+      ${deviceFieldHtml('dc-device')}
+      <label>Metric <select id="dc-metric"><option value="">—</option></select></label>
+      ${windowSelectHtml('dc-window', cfg.window_s)}
+      <label>Y max <input id="dc-ymax" type="number" step="any"
+        value="${cfg.y_max != null ? cfg.y_max : ''}" placeholder="auto"></label>`;
     const input = box.querySelector('#dc-device');
     input.dataset.deviceId = cfg.device_id != null ? String(cfg.device_id) : '';
-    const fillIface = (deviceId) => {
-      if (!opts.withInterface || deviceId == null) return;
-      App.get(`/api/nodes/devices/${deviceId}/interfaces`).then((r) => {
-        const sel = box.querySelector('#dc-iface');
-        if (!sel) return;
-        sel.innerHTML = '<option value="">—</option>';
-        for (const iface of r.interfaces || []) {
-          const opt = document.createElement('option');
-          opt.value = iface.if_index;
-          opt.textContent = (iface.descr || `if ${iface.if_index}`) + (iface.alias ? ` · ${iface.alias}` : '');
-          if (cfg.if_index === iface.if_index) opt.selected = true;
-          sel.appendChild(opt);
-        }
-      }).catch(() => {});
-    };
     const fillMetric = (deviceId) => {
-      if (!opts.withMetric || deviceId == null) return;
+      if (deviceId == null) return;
       App.get(`/api/nodes/devices/${deviceId}/metrics`).then((r) => {
         const sel = box.querySelector('#dc-metric');
         if (!sel) return;
@@ -135,24 +211,27 @@
         }
       }).catch(() => {});
     };
-    wireDeviceField(box, 'dc-device', (deviceId) => { fillIface(deviceId); fillMetric(deviceId); });
+    wireDeviceField(box, 'dc-device', fillMetric);
     if (cfg.device_id != null) {
       App.get(`/api/nodes/devices/${cfg.device_id}`)
         .then((d) => { input.value = `${displayName(d)} (${d.ip})`; }).catch(() => {});
-      fillIface(cfg.device_id);
       fillMetric(cfg.device_id);
     }
   }
 
-  function readDeviceConfig(box, opts = {}) {
+  function readDeviceMetricConfig(box, tile_) {
     const input = box.querySelector('#dc-device');
     const deviceId = input && input.dataset.deviceId ? Number(input.dataset.deviceId) : null;
-    const out = { device_id: deviceId, window_s: Number(box.querySelector('#dc-window').value) };
-    if (opts.withInterface) {
-      const v = box.querySelector('#dc-iface').value;
-      out.if_index = v === '' ? null : Number(v);
-    }
-    if (opts.withMetric) out.metric_key = box.querySelector('#dc-metric').value || '';
+    const yRaw = box.querySelector('#dc-ymax').value.trim();
+    const out = {
+      name: box.querySelector('#dc-name').value.trim().slice(0, 60),
+      device_id: deviceId,
+      metric_key: box.querySelector('#dc-metric').value || '',
+      window_s: Number(box.querySelector('#dc-window').value),
+      y_max: yRaw === '' ? null : Number(yRaw),
+    };
+    const existing = (tile_ && tile_.config) || {};
+    if (existing.t0 != null && existing.t1 != null) { out.t0 = existing.t0; out.t1 = existing.t1; }
     return out;
   }
 
@@ -221,8 +300,8 @@
 
   function defaultConfigFor(type) {
     switch (type) {
-      case 'iface_traffic': return { device_id: null, if_index: null, window_s: 86400 };
-      case 'device_metric': return { device_id: null, metric_key: '', window_s: 86400 };
+      case 'iface_traffic': return { name: '', interfaces: [], window_s: 86400 };
+      case 'device_metric': return { name: '', device_id: null, metric_key: '', window_s: 86400 };
       case 'device_status': return { device_id: null };
       case 'top_metric': return { metric_key: '', n: 10, window_s: 86400, rank_by: 'peak', ascending: false };
       case 'recent_alerts': return { max_severity: 7, n: 10 };
@@ -308,50 +387,56 @@
 
     iface_traffic: {
       catalogTitle: 'Interface traffic',
-      title: (t, data) => `Traffic · ${(data && data.deviceName) || '…'} · ${(data && data.portLabel) || '…'}`,
+      title: (t, data) => (t.config && t.config.name) || (data && data.title) || 'Interface traffic',
       family: 'Graphs', module: 'nodes',
-      description: 'In/out bandwidth for one interface, 240-bucket chart.',
+      description: 'In/out bandwidth for up to 8 interfaces, one batched chart.',
       w: 2, h: 2, configurable: true, every: 60000,
       async fetch(t) {
         const cfg = t.config || {};
-        if (cfg.device_id == null || cfg.if_index == null) return { chart: null };
+        const rows = (cfg.interfaces && cfg.interfaces.length) ? cfg.interfaces
+          : (cfg.device_id != null && cfg.if_index != null
+             ? [{ device_id: cfg.device_id, if_index: cfg.if_index }] : []);
+        if (!rows.length) return { chart: null };
         const windowS = cfg.window_s || 86400;
-        const [device, ifaces, metrics] = await Promise.all([
-          App.get(`/api/nodes/devices/${cfg.device_id}`),
-          App.get(`/api/nodes/devices/${cfg.device_id}/interfaces`, { if_index: cfg.if_index }),
-          App.get(`/api/nodes/devices/${cfg.device_id}/metrics`),
-        ]);
-        const iface = (ifaces.interfaces || []).find((r) => r.if_index === cfg.if_index);
-        const portLabel = iface ? (iface.descr || iface.alias || `if ${cfg.if_index}`) : `if ${cfg.if_index}`;
-        const list = metrics.metrics || [];
-        const inM = list.find((m) => m.key === `if_in_bps.${cfg.if_index}`);
-        const outM = list.find((m) => m.key === `if_out_bps.${cfg.if_index}`);
-        const t1 = Date.now() / 1000;
-        const t0 = t1 - windowS;
+        const pinned = cfg.t0 != null && cfg.t1 != null;
+        const t1 = pinned ? cfg.t1 : Date.now() / 1000;
+        const t0 = pinned ? cfg.t0 : t1 - windowS;
         const bucketS = Math.max(15, (t1 - t0) / 240);
-        const [inS, outS] = await Promise.all([
-          inM ? App.get(`/api/nodes/devices/${cfg.device_id}/series`,
-            { metric_id: inM.id, t0, t1, bucket_s: bucketS }) : null,
-          outM ? App.get(`/api/nodes/devices/${cfg.device_id}/series`,
-            { metric_id: outM.id, t0, t1, bucket_s: bucketS }) : null,
-        ]);
-        return {
-          deviceName: displayName(device), portLabel,
-          chart: { t0, t1, unit: 'bps', series: [
-            { label: 'in', color: 'var(--ok)', points: (inS && inS.points) || [] },
-            { label: 'out', color: 'var(--accent)', points: (outS && outS.points) || [] },
-          ] },
-        };
+        const q = rows.flatMap((r) => [`${r.device_id}:if_in_bps.${r.if_index}`,
+                                        `${r.device_id}:if_out_bps.${r.if_index}`]).join(',');
+        const result = await App.get('/api/nodes/series/batch', { q, t0, t1, bucket_s: bucketS });
+        const series = result.series || [];
+        const sameDevice = rows.length > 1
+          && rows.every((r) => r.device_id === rows[0].device_id);
+        const chartSeries = [];
+        rows.forEach((row, i) => {
+          const color = i < 8 ? `var(--cat-${i + 1})` : 'var(--muted)';
+          const inS = series[i * 2];
+          const outS = series[i * 2 + 1];
+          const devicePrefix = (s) => (sameDevice ? '' : `${(s && s.device_name) || ''} · `);
+          chartSeries.push({ label: `${devicePrefix(inS)}${(inS && inS.label) || 'in'} in`,
+                              color, points: (inS && inS.points) || [] });
+          chartSeries.push({ label: `${devicePrefix(outS)}${(outS && outS.label) || 'out'} out`,
+                              color, dash: '4 3', points: (outS && outS.points) || [] });
+        });
+        const first = series[0];
+        const title = rows.length === 1
+          ? `Traffic · ${(first && first.device_name) || '…'} · ${(first && first.label) || '…'}`
+          : `Traffic · ${rows.length} interfaces`;
+        return { title, chart: {
+          t0: result.t0 != null ? result.t0 : t0, t1: result.t1 != null ? result.t1 : t1,
+          unit: 'bps', series: chartSeries } };
       },
       render: (t, data) => (data && data.chart)
         ? '<div class="tile-chart"><svg></svg></div>'
-        : '<p class="hint">Configure a device and interface for this tile.</p>',
-      configForm: (t, box) => deviceConfigForm(t, box, { withInterface: true }),
-      readConfig: (box) => readDeviceConfig(box, { withInterface: true }),
+        : '<p class="hint">Configure at least one device and interface for this tile.</p>',
+      configForm: ifaceTrafficConfigForm,
+      readConfig: readIfaceTrafficConfig,
     },
     device_metric: {
       catalogTitle: 'Device metric',
-      title: (t, data) => `${(data && data.deviceName) || '…'} · ${(data && data.metricLabel) || (t.config && t.config.metric_key) || 'Metric'}`,
+      title: (t, data) => (t.config && t.config.name)
+        || `${(data && data.deviceName) || '…'} · ${(data && data.metricLabel) || (t.config && t.config.metric_key) || 'Metric'}`,
       family: 'Graphs', module: 'nodes',
       description: 'One metric over time for one device.',
       w: 2, h: 2, configurable: true, every: 60000,
@@ -364,8 +449,9 @@
           App.get(`/api/nodes/devices/${cfg.device_id}/metrics`),
         ]);
         const m = (metrics.metrics || []).find((x) => x.key === cfg.metric_key);
-        const t1 = Date.now() / 1000;
-        const t0 = t1 - windowS;
+        const pinned = cfg.t0 != null && cfg.t1 != null;
+        const t1 = pinned ? cfg.t1 : Date.now() / 1000;
+        const t0 = pinned ? cfg.t0 : t1 - windowS;
         const bucketS = Math.max(15, (t1 - t0) / 240);
         const series = m ? await App.get(`/api/nodes/devices/${cfg.device_id}/series`,
           { metric_id: m.id, t0, t1, bucket_s: bucketS }) : null;
@@ -378,8 +464,8 @@
       render: (t, data) => (data && data.chart)
         ? '<div class="tile-chart"><svg></svg></div>'
         : '<p class="hint">Configure a device and metric for this tile.</p>',
-      configForm: (t, box) => deviceConfigForm(t, box, { withMetric: true }),
-      readConfig: (box) => readDeviceConfig(box, { withMetric: true }),
+      configForm: deviceMetricConfigForm,
+      readConfig: readDeviceMetricConfig,
     },
     device_status: {
       catalogTitle: 'Device status',
@@ -910,6 +996,22 @@
     </div>`;
   }
 
+  // The on-tile time-window control for the two graph families, shown only
+  // outside edit mode (edit mode keeps the tileTools toolbar above it).
+  function tileRangeHtml(layoutTile, def) {
+    if (def.family !== 'Graphs') return '';
+    const cfg = layoutTile.config || {};
+    const id = escape(layoutTile.id);
+    const pinned = cfg.t0 != null && cfg.t1 != null;
+    const options = App.RANGES.map(([label, secs]) =>
+      `<option value="${secs}"${!pinned && secs === (cfg.window_s || 86400) ? ' selected' : ''}>${escape(label)}</option>`)
+      .join('') + `<option value="custom"${pinned ? ' selected' : ''}>${pinned ? 'Custom' : 'Custom…'}</option>`;
+    return `<div class="tile-tools">
+      <select class="tile-range" aria-label="Time window" data-tile-range="${id}">${options}</select>
+      ${pinned ? `<button type="button" class="tile-live" data-tile-live="${id}">Live</button>` : ''}
+    </div>`;
+  }
+
   function renderTile(layoutTile) {
     const def = TILE_TYPES[layoutTile.type];
     if (!def) return '';
@@ -925,11 +1027,59 @@
       body = def.render(layoutTile, entry && entry.data);
       if (entry && entry.error) body += `<p class="warn-text">${escape(entry.error)}</p>`;
     }
-    const tools = view.editing ? tileTools(layoutTile, def) : '';
+    const tools = view.editing ? tileTools(layoutTile, def) : tileRangeHtml(layoutTile, def);
     return tile(title, body, {
       w: layoutTile.w || def.w, h: layoutTile.h || def.h,
       id: layoutTile.id, tools, tone,
     });
+  }
+
+  // Persists the layout with the tile's own change (window preset, a custom
+  // pin, or Live) and forces an immediate refetch of just that tile, rather
+  // than waiting out the next refresh() tick.
+  async function saveLayoutAndRefetch(layoutTile) {
+    if (view.editing) { draw(); return; }
+    try {
+      const payload = await App.put('/api/dashboard/layout', { layout: sanitizedLayout(view.layout) });
+      view.layout = payload.layout || view.layout;
+    } catch (error) {
+      App.toast(error.message || 'Could not save the layout', 'fail');
+    }
+    delete view.tileData[layoutTile.id];
+    draw();
+    const fresh = (view.editing ? view.draft : view.layout).tiles.find((t) => t.id === layoutTile.id);
+    const def = fresh && TILE_TYPES[fresh.type];
+    if (!fresh || !def || !def.fetch) return;
+    try {
+      view.tileData[fresh.id] = { data: await def.fetch(fresh), fetchedAt: Date.now(), error: null };
+    } catch (error) {
+      view.tileData[fresh.id] = { data: null, fetchedAt: Date.now(), error: error.message || String(error) };
+    }
+    draw();
+  }
+
+  async function onTileRangeChange(select) {
+    const id = select.dataset.tileRange;
+    const layoutTile = activeTiles().find((t) => t.id === id);
+    if (!layoutTile) return;
+    const cfg = layoutTile.config || (layoutTile.config = {});
+    if (select.value === 'custom') {
+      const picked = await App.rangeDialog({ t0: cfg.t0, t1: cfg.t1 });
+      if (!picked) { draw(); return; }
+      cfg.t0 = picked.t0; cfg.t1 = picked.t1;
+    } else {
+      delete cfg.t0; delete cfg.t1;
+      cfg.window_s = Number(select.value);
+    }
+    saveLayoutAndRefetch(layoutTile);
+  }
+
+  function onTileLiveClick(id) {
+    const layoutTile = activeTiles().find((t) => t.id === id);
+    if (!layoutTile || !layoutTile.config) return;
+    delete layoutTile.config.t0;
+    delete layoutTile.config.t1;
+    saveLayoutAndRefetch(layoutTile);
   }
 
   function drawCharts() {
@@ -937,10 +1087,29 @@
     if (!root) return;
     for (const wrap of root.querySelectorAll('.tile-chart')) {
       const host = wrap.closest('[data-tile]');
-      const entry = host && view.tileData[host.dataset.tile];
+      const tileId = host && host.dataset.tile;
+      const layoutTile = tileId ? activeTiles().find((t) => t.id === tileId) : null;
+      const entry = tileId && view.tileData[tileId];
       const chart = entry && entry.data && entry.data.chart;
       const svg = wrap.querySelector('svg');
-      if (svg) App.drawSeriesChart(svg, wrap, chart || null, { emptyText: 'No data in this window' });
+      if (!svg) continue;
+      const cfg = (layoutTile && layoutTile.config) || {};
+      const geo = App.drawSeriesChart(svg, wrap, chart || null,
+        { emptyText: 'No data in this window', peak: cfg.y_max || undefined });
+      if (layoutTile && !view.editing && geo) {
+        App.attachChartZoom(svg, geo, {
+          onWindow: (t0, t1) => {
+            layoutTile.config = layoutTile.config || {};
+            layoutTile.config.t0 = t0; layoutTile.config.t1 = t1;
+            saveLayoutAndRefetch(layoutTile);
+          },
+          onReset: () => {
+            if (!layoutTile.config) return;
+            delete layoutTile.config.t0; delete layoutTile.config.t1;
+            saveLayoutAndRefetch(layoutTile);
+          },
+        });
+      }
     }
   }
 
@@ -1001,7 +1170,7 @@
     const box = App.modal(`Configure: ${def.catalogTitle}`, '<div id="dc-body"></div>', [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: (b) => {
-          layoutTile.config = def.readConfig(b.querySelector('#dc-body'));
+          layoutTile.config = def.readConfig(b.querySelector('#dc-body'), layoutTile);
           delete view.tileData[layoutTile.id];
           App.closeModal();
           draw();
@@ -1107,6 +1276,8 @@
   function findDraftIndex(id) { return view.draft.tiles.findIndex((t) => t.id === id); }
 
   function onGridClick(event) {
+    const liveButton = event.target.closest('[data-tile-live]');
+    if (liveButton) { onTileLiveClick(liveButton.dataset.tileLive); return; }
     if (!view.editing) return;
     const button = event.target.closest('button[data-tile]');
     if (!button) return;
@@ -1179,10 +1350,16 @@
     if (root) for (const el of root.querySelectorAll('.tile.drop-before')) el.classList.remove('drop-before');
   }
 
+  function onGridChange(event) {
+    const select = event.target.closest('select.tile-range');
+    if (select) onTileRangeChange(select);
+  }
+
   function wireGridEvents() {
     const root = App.el('dash-grid');
     if (!root) return;
     root.addEventListener('click', onGridClick);
+    root.addEventListener('change', onGridChange);
     root.addEventListener('dragstart', onDragStart);
     root.addEventListener('dragover', onDragOver);
     root.addEventListener('dragleave', onDragLeave);

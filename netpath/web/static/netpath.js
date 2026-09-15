@@ -1513,9 +1513,18 @@
   }
 
   function init() {
-    App.fillRanges(App.el('range-select'), 'Last hour');
+    App.fillRanges(App.el('range-select'), 'Last hour', undefined, { custom: true });
     view.windows = loadWindows();
-    App.el('range-select').onchange = resetWindow;
+    App.el('range-select').onchange = async () => {
+      const select = App.el('range-select');
+      if (select.value !== 'custom') { resetWindow(); return; }
+      const picked = await App.rangeDialog({ t0: view.t0, t1: view.t1 });
+      if (!picked) {
+        select.value = view.follow ? String(Math.round(view.t1 - view.t0)) : 'custom';
+        return;
+      }
+      setWindow(picked.t0, picked.t1, false);
+    };
     App.el('tl-follow').onchange = (event) => {
       view.follow = event.target.checked;
       if (view.follow) {

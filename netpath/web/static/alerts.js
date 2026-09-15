@@ -108,7 +108,12 @@
   }
 
   function window_() {
-    const seconds = Number(App.el('alerts-range').value) || 86400;
+    const select = App.el('alerts-range');
+    if (select && select.value === 'custom' && view.customRange) {
+      view.t0 = view.customRange.t0; view.t1 = view.customRange.t1;
+      return { t0: view.t0, t1: view.t1 };
+    }
+    const seconds = Number(select && select.value) || 86400;
     view.t1 = Date.now() / 1000;
     view.t0 = view.t1 - seconds;
     return { t0: view.t0, t1: view.t1 };
@@ -2194,7 +2199,7 @@
         selectSub(btn.dataset.subtab);
       };
     }
-    App.fillRanges(App.el('alerts-range'), 'Last 24 hours');
+    App.fillRanges(App.el('alerts-range'), 'Last 24 hours', undefined, { custom: true });
     const sev = App.el('alerts-filter-sev');
     sev.innerHTML = '<option value="">Any severity</option>';
     (App.state.severities || []).forEach((name, index) => {
@@ -2218,6 +2223,23 @@
       clears: ['alerts-filter-device', 'alerts-filter-text', 'alerts-filter-sev',
                'alerts-filter-state', 'alerts-filter-rule'],
     });
+    // filterBar wired a plain refresh to alerts-range's change above; this
+    // replaces that handler (same element, last assignment wins) so
+    // "Custom…" opens the range dialog instead of asking window_() to parse
+    // "custom" as a number of seconds.
+    const rangeSelect = App.el('alerts-range');
+    if (rangeSelect) {
+      rangeSelect.onchange = async () => {
+        if (rangeSelect.value === 'custom') {
+          const picked = await App.rangeDialog(view.customRange || {});
+          if (!picked) { rangeSelect.value = view.customRange ? 'custom' : '86400'; return; }
+          view.customRange = picked;
+        } else {
+          view.customRange = null;
+        }
+        App.refreshNow('alerts');
+      };
+    }
     App.el('alerts-export-csv').onclick = exportAlertsCsv;
     App.el('alerts-page-prev').onclick = () => {
       view.pageOffset = Math.max(0, view.pageOffset - view.pageLimit);

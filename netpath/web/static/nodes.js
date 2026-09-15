@@ -25,8 +25,12 @@
     // for the device that dialog is about rather than the selected one.
     metrics: [],
     timeline: null,
-    // The status timeline's window, set by the range dropdown above it.
+    // The status timeline's window, set by the range dropdown above it
+    // (#nd-d-range) — or, once a drag/wheel zoom on the bar or "Custom…"
+    // pins an absolute one, chartPinned instead. The Bridge & RF pane's
+    // charts (loadRfChart) follow the same window.
     chartRange: 3600,
+    chartPinned: null,
     // The packet-loss chart lives in the device dialog now (double-click a
     // device); its window and data are local to that dialog's own closure,
     // not pane-wide state — see deviceDialog.
@@ -1101,8 +1105,26 @@
   }
 
   function timelineWindow() {
+    if (view.chartPinned) return [view.chartPinned.t0, view.chartPinned.t1];
     const now = Date.now() / 1000;
     return [now - view.chartRange, now];
+  }
+
+  function syncTimelineRangeSelect() {
+    const select = App.el('nd-d-range');
+    if (select) select.value = view.chartPinned ? 'custom' : String(view.chartRange);
+  }
+
+  function setTimelineWindow(t0, t1) {
+    view.chartPinned = { t0, t1 };
+    syncTimelineRangeSelect();
+    loadStatusTimeline().catch(() => {});
+  }
+
+  function resetTimelineWindow() {
+    view.chartPinned = null;
+    syncTimelineRangeSelect();
+    loadStatusTimeline().catch(() => {});
   }
 
   /* The status timeline owns its own range dropdown and its own window.
@@ -1292,6 +1314,12 @@
       x: width, y: height - 2, 'text-anchor': 'end', fill: 'var(--dim)',
       'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
     }, App.stamp(t1, span)));
+    // Drag-select the same brush/wheel/keyboard machinery drawSeriesChart's
+    // charts get, over a geo shaped the way that function returns one — the
+    // bar has no y-axis, so plot.h is just the full drawn height.
+    App.attachChartZoom(svg, { plot: { x: 0, y: 0, w: width, h: height }, width, t0, t1 }, {
+      onWindow: setTimelineWindow, onReset: resetTimelineWindow,
+    });
   }
 
   // r.media is written by nodepoll's environment poll. Prepended to the
@@ -1511,7 +1539,10 @@
      than reading view.detail / view.ifaces / view.events, which always
      describe the selection. Opened by double-clicking a row; `trigger` is
      that row, passed explicitly (see the ondblclick assignment above). */
-  function deviceDialog(deviceId, trigger) {
+  // initialLossWindow: {t0, t1} to reopen already pinned to — see
+  // interfaceDialog's own initialWindow for why "Custom…" has to close and
+  // reopen this dialog rather than resume it in place.
+  function deviceDialog(deviceId, trigger, initialLossWindow) {
     if (deviceId == null) return;
     // The same ticket idiom the interface and OID dialogs use: App.modal
     // reuses one #modal-box, so a slow fetch must not paint into whatever
@@ -1528,6 +1559,10 @@
     // and a dialog's own data belongs to its own closure the same way the
     // interface dialog's bandwidth chart already works.
     let lossRange = 3600;
+    // Non-null once a drag, a wheel zoom, a reopen with initialLossWindow or
+    // "Custom…" pins an absolute window on the loss chart — the #ifd-range
+    // idiom, one dialog over.
+    let lossPinned = initialLossWindow || null;
     let lossRequestId = 0;
 
     // Not escaped here: App.modal escapes a plain-string title itself, and
@@ -1560,7 +1595,12 @@
 
     // The full range set: past three days the series reads samples_hourly,
     // which compact_rollup populates.
-    App.fillRanges(box.querySelector('#ndd-loss-range'), 'Last hour');
+    App.fillRanges(box.querySelector('#ndd-loss-range'), 'Last hour', undefined, { custom: true });
+    const syncLossRangeSelect = () => {
+      const select = box.querySelector('#ndd-loss-range');
+      if (select) select.value = lossPinned ? 'custom' : String(lossRange);
+    };
+    syncLossRangeSelect();   // reflects initialLossWindow (a reopen after Custom…) if set
 
     // Escape and a backdrop click close the modal without Close ever being
     // pressed, so the timer hangs off the close event rather than off that
@@ -1581,7 +1621,7 @@
       const points = ((lossData.series || [])[0] || {}).points || [];
       const last = points.length ? points[points.length - 1] : null;
       const lastValue = last ? (last.avg !== undefined ? last.avg : last.value) : null;
-      drawSeriesChart(svg, wrap, lossData, {
+      const geo = drawSeriesChart(svg, wrap, lossData, {
         // Pinned, because loss is a percentage of a known whole and an
         // auto-scaled axis lies about a healthy device: a flat 0% series
         // would otherwise be drawn against a ceiling of 0.001 and read as
@@ -1593,6 +1633,20 @@
         ariaLabel: lastValue == null ? 'Packet loss chart, no samples in this window'
           : `Packet loss chart, ${lastValue.toFixed(1)}% most recently`,
       });
+      if (geo) {
+        App.attachChartZoom(svg, geo, {
+          onWindow: (t0, t1) => {
+            lossPinned = { t0, t1 };
+            syncLossRangeSelect();
+            loadCharts().catch(() => {});
+          },
+          onReset: () => {
+            lossPinned = null;
+            syncLossRangeSelect();
+            loadCharts().catch(() => {});
+          },
+        });
+      }
     }
 
     /* Packet loss and the RESOURCES charts share one window and one
@@ -1602,8 +1656,8 @@
     async function loadCharts() {
       if (!current()) { stopLoss(); return; }
       const requestId = (lossRequestId += 1);
-      const t1 = Date.now() / 1000;
-      const t0 = t1 - lossRange;
+      const t1 = lossPinned ? lossPinned.t1 : Date.now() / 1000;
+      const t0 = lossPinned ? lossPinned.t0 : t1 - lossRange;
       // Bucketed only once the window is wide enough that raw points would
       // otherwise be thousands of them — a 3-day window at 300 buckets is
       // one every ~14 minutes, still far finer than the fault these charts
@@ -1658,7 +1712,18 @@
       head.hidden = present.length === 0;
     }
 
-    box.querySelector('#ndd-loss-range').onchange = (e) => {
+    box.querySelector('#ndd-loss-range').onchange = async (e) => {
+      if (e.target.value === 'custom') {
+        // Same "close, then reopen already pinned" fix interfaceDialog's
+        // own #ifd-range uses — App.rangeDialog opens in this dialog's own
+        // shared #modal-box, replacing it.
+        const picked = await App.rangeDialog(lossPinned || {});
+        if (!picked) { syncLossRangeSelect(); return; }
+        App.closeModal();
+        deviceDialog(deviceId, trigger, picked);
+        return;
+      }
+      lossPinned = null;
       lossRange = Number(e.target.value);
       loadCharts().catch(() => {});
     };
@@ -2525,7 +2590,14 @@
      `onBack`, when given, adds a button returning to the dialog this was
      opened from — there is only one #modal-box, so opening this one replaced
      its parent. */
-  function interfaceDialog(iface, deviceId, onBack) {
+  // initialWindow: {t0, t1} to reopen already pinned to, after "Custom…"
+  // below closes this same dialog to show App.rangeDialog — App.modal is
+  // one shared box that a second modal() call replaces wholesale, so a
+  // range picker opened from inside this dialog cannot float over it the
+  // way it can over the plain (non-dialog) range controls; closing and
+  // reopening is the pattern every other nested flow here already uses
+  // (see the "← Back to device" button below).
+  function interfaceDialog(iface, deviceId, onBack, initialWindow) {
     if (deviceId == null) deviceId = view.selected;
     const ifIndex = iface.if_index;
     // One ticket per opened dialog, checked by everything asynchronous this
@@ -2540,6 +2612,11 @@
 
     let smooth = true;
     let chartRange = 3600;
+    // Non-null once a drag, a wheel zoom, a reopen with initialWindow or
+    // "Custom…" pins an absolute window; refreshChart() reads it ahead of
+    // chartRange, and picking a preset from #ifd-range or Home in the chart
+    // clears it back to "follow the last N seconds".
+    let pinned = initialWindow || null;
     let lastChart = null;   // last data drawn, so the checkbox can redraw it
     // The chart owns its own axis-hysteresis memory across redraws of this
     // one dialog; a fresh dialog (a different port, or this one reopened)
@@ -2579,12 +2656,18 @@
     // Stamped by App.modal above; every paint below checks it first.
     token = App.modalToken();
     box.classList.add('wide');
-    App.fillRanges(box.querySelector('#ifd-range'), 'Last hour');
+    App.fillRanges(box.querySelector('#ifd-range'), 'Last hour', undefined, { custom: true });
     const rangeLabel = () => {
+      if (pinned) return App.rangeLabel(pinned.t0, pinned.t1, false);
       const select = box.querySelector('#ifd-range');
       const chosen = select && select.selectedOptions[0];
       return chosen ? chosen.textContent : 'Last hour';
     };
+    const syncRangeSelect = () => {
+      const select = box.querySelector('#ifd-range');
+      if (select) select.value = pinned ? 'custom' : String(chartRange);
+    };
+    syncRangeSelect();   // reflects initialWindow (a reopen after Custom…) if set
     const configrxLink = box.querySelector('#ifd-configrx');
     if (configrxLink) {
       configrxLink.onclick = () => {
@@ -2624,13 +2707,19 @@
       const label = rangeLabel();
       const title = box.querySelector('#ifd-bw-title');
       if (title) title.textContent = `BANDWIDTH — ${label.toUpperCase()}`;
-      drawSeriesChart(svg, wrap, lastChart, {
+      const geo = drawSeriesChart(svg, wrap, lastChart, {
         emptyText: 'No samples yet — they arrive with each poll',
         smooth,
         axisMemory,
         ariaLabel: `Bandwidth chart for ${portName}, ${label.toLowerCase()}` +
           (parts.length ? `, most recently ${parts.join(', ')}` : ', no samples yet'),
       });
+      if (geo) {
+        App.attachChartZoom(svg, geo, {
+          onWindow: (t0, t1) => { pinned = { t0, t1 }; syncRangeSelect(); refreshChart().catch(() => {}); },
+          onReset: () => { pinned = null; syncRangeSelect(); refreshChart().catch(() => {}); },
+        });
+      }
     }
 
     box.querySelector('#ifd-smooth').onchange = (event) => {
@@ -2638,7 +2727,20 @@
       drawChart();
     };
 
-    box.querySelector('#ifd-range').onchange = (event) => {
+    box.querySelector('#ifd-range').onchange = async (event) => {
+      if (event.target.value === 'custom') {
+        // App.rangeDialog opens through the same shared #modal-box this
+        // dialog is already showing in — modal() replaces a box's contents
+        // rather than stacking over it, so this dialog is gone the moment
+        // that one opens. Reopening with the picked window is the fix, the
+        // same "close, then rebuild" shape "← Back to device" already uses.
+        const picked = await App.rangeDialog(pinned || {});
+        if (!picked) { syncRangeSelect(); return; }
+        App.closeModal();
+        interfaceDialog(iface, deviceId, onBack, picked);
+        return;
+      }
+      pinned = null;
       chartRange = Number(event.target.value);
       refreshChart().catch(() => {});
     };
@@ -2706,8 +2808,8 @@
       }
       const inM = found.in;
       const outM = found.out;
-      const t1 = Date.now() / 1000;
-      const t0 = t1 - chartRange;
+      const t1 = pinned ? pinned.t1 : Date.now() / 1000;
+      const t0 = pinned ? pinned.t0 : t1 - chartRange;
       // 240 buckets across the chosen range — enough to look continuous
       // without redrawing thousands of raw 3 s focus-poll samples every
       // tick; a wider window asks for a proportionally wider bucket.
@@ -3213,18 +3315,19 @@
     return holder;
   }
 
-  /* One RF metric's last hour, in its own small chart — the same
-     drawSeriesChart the packet-loss and per-port bandwidth charts use, so
-     wheel-zoom and the rest of that machinery come for free. A ticket
-     guards against a slow fetch landing after the pane has moved to
-     another device, the same discipline deviceDialog's loss chart uses. */
+  /* One RF metric, over the same window #nd-d-range drives for the status
+     timeline — the same drawSeriesChart the packet-loss and per-port
+     bandwidth charts use, so wheel-zoom and the rest of that machinery come
+     for free. A ticket guards against a slow fetch landing after the pane
+     has moved to another device, the same discipline deviceDialog's loss
+     chart uses. */
   async function loadRfChart(wrap, metricId) {
     const svg = wrap.querySelector('svg');
     const deviceId = view.selected;
     const metric = (view.metrics || []).find((m) => m.id === metricId);
     if (!svg || !metric || deviceId == null) return;
     const requestId = (wrap.dataset.requestId = String(Date.now()));
-    const t1 = Date.now() / 1000, t0 = t1 - 3600;
+    const [t0, t1] = timelineWindow();
     const result = await App.get(`/api/nodes/devices/${deviceId}/series`,
       { metric_id: metricId, t0, t1 });
     if (!wrap.isConnected || wrap.dataset.requestId !== requestId
@@ -6798,11 +6901,18 @@
     App.el('nd-bulk-maintenance-off').onclick = () => bulkMaintenance(true);
     App.el('nd-bulk-delete').onclick = bulkDeleteDevices;
     App.el('nd-bulk-clear').onclick = bulkClearSelection;
-    App.el('nd-d-range').onchange = (e) => {
+    App.el('nd-d-range').onchange = async (e) => {
+      if (e.target.value === 'custom') {
+        const picked = await App.rangeDialog(view.chartPinned || {});
+        if (!picked) { syncTimelineRangeSelect(); return; }
+        setTimelineWindow(picked.t0, picked.t1);
+        return;
+      }
+      view.chartPinned = null;
       view.chartRange = Number(e.target.value);
       loadStatusTimeline();
     };
-    App.fillRanges(App.el('nd-d-range'), 'Last hour');
+    App.fillRanges(App.el('nd-d-range'), 'Last hour', undefined, { custom: true });
     App.el('nd-add-profile').onclick = addProfile;
     App.el('nd-edit-profile').onclick = editProfile;
     App.el('nd-remove-profile').onclick = removeProfile;

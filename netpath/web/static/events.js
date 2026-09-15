@@ -287,7 +287,7 @@
          start reads it back — listeners run in registration order. */
       const CONTROLS = spec.controls.map((suffix) => `${spec.prefix}-${suffix}`);
       App.rememberControls(spec.tab, CONTROLS);
-      App.fillRanges(el('range'), 'Last 24 hours');
+      App.fillRanges(el('range'), 'Last 24 hours', undefined, { custom: true });
       const severity = el('severity');
       severity.innerHTML = '<option value="">Any severity</option>';
       (App.state.severities || []).forEach((name, index) => {
@@ -304,6 +304,21 @@
         apply: `${spec.prefix}-apply`, clear: `${spec.prefix}-clear`,
         clears: spec.bar.clears.map((suffix) => `${spec.prefix}-${suffix}`),
       });
+      // filterBar wired a plain refresh to range's change above; this
+      // replaces that handler (same element, last assignment wins) so
+      // "Custom…" opens the range dialog and pins the window the same way
+      // clicking a histogram bucket already does, instead of window_()
+      // trying to parse "custom" as a number of seconds.
+      const rangeSelect = el('range');
+      rangeSelect.onchange = async () => {
+        if (rangeSelect.value !== 'custom') { App.refreshNow(spec.tab); return; }
+        const picked = await App.rangeDialog({ t0: view.t0, t1: view.t1 });
+        if (!picked) {
+          rangeSelect.value = view.follow ? String(Math.round(view.t1 - view.t0)) : 'custom';
+          return;
+        }
+        pinWindow(picked.t0, picked.t1);
+      };
       el('export-csv').onclick = exportCsv;
       el('live').onclick = returnToLive;
       el('follow').onchange = (event) => {

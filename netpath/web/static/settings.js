@@ -102,6 +102,16 @@
     App.el('set-ldap-template').value = s.ldap_bind_dn_template || '';
     App.el('set-ldap-cleartext').checked = !!s.ldap_allow_cleartext;
     App.el('set-ldap-timeout').value = s.ldap_timeout_s ?? 10;
+    App.el('set-tacacs-enabled').checked = !!s.tacacs_enabled;
+    App.el('set-tacacs-servers').value = s.tacacs_servers || '';
+    App.el('set-tacacs-timeout').value = s.tacacs_timeout_s ?? 10;
+    App.el('set-tacacs-autocreate').checked = !!s.tacacs_auto_create;
+    App.el('set-tacacs-role').value = s.tacacs_default_role || 'viewer';
+    // tacacs_secret is write-only and never comes back from the server —
+    // the field starts blank every load, and tacacs_secret_set (read-only)
+    // is what says whether a secret is saved at all.
+    App.el('set-tacacs-secret').value = '';
+    paintTacacsSecretGate(!!s.tacacs_secret_set);
 
     const storage = server.storage || {};
     App.el('set-app-path').value = storage.app_path || '';
@@ -732,6 +742,100 @@
     }
   }
 
+  /* ------------------------------------------------------------- tacacs */
+
+  /* Gates the shared-secret field on whether this host can store one at
+     all — the same App.canStoreSecrets()/credentialUnavailableHtml pair
+     every other credential field in the product reads /api/platform
+     through, adapted to a field that is static markup rather than one
+     built fresh per dialog. */
+  function paintTacacsSecretGate(secretSet) {
+    const field = App.el('set-tacacs-secret');
+    const hint = App.el('tacacs-secret-hint');
+    if (!field || !hint) return;
+    if (App.canStoreSecrets()) {
+      field.disabled = false;
+      field.placeholder = '';
+      hint.className = 'hint';
+      hint.innerHTML = 'Leave blank to keep the saved secret. ' +
+        `<span id="set-tacacs-secret-state">${secretSet ? 'A secret is saved' : 'No secret saved'}</span>`;
+    } else {
+      field.disabled = true;
+      field.value = '';
+      field.placeholder = 'unavailable on this host';
+      hint.className = 'hint warn-text';
+      hint.innerHTML = App.credentialUnavailableHtml('A TACACS+ shared secret')
+        .replace(/^<p[^>]*>/, '').replace(/<\/p>$/, '');
+    }
+  }
+
+  function tacacsStatus(message, colour) {
+    const el = App.el('tacacs-status');
+    el.textContent = message;
+    el.style.color = colour || 'var(--muted)';
+  }
+
+  function tacacsTestStatus(message, colour) {
+    const el = App.el('tacacs-test-status');
+    el.textContent = message;
+    el.style.color = colour || 'var(--muted)';
+  }
+
+  /* Its own save, same reasoning as applyLdapSettings: every key here is
+     admin-only, and folding it into the general Apply button would fail
+     that button outright for a settings:write account touching an
+     unrelated field. tacacs_secret is omitted entirely when left blank —
+     that is "keep the saved one", not "clear it". */
+  async function applyTacacsSettings() {
+    const values = {
+      tacacs_enabled: App.el('set-tacacs-enabled').checked,
+      tacacs_servers: App.el('set-tacacs-servers').value.trim(),
+      tacacs_timeout_s: Number(App.el('set-tacacs-timeout').value) || 10,
+      tacacs_auto_create: App.el('set-tacacs-autocreate').checked,
+      tacacs_default_role: App.el('set-tacacs-role').value,
+    };
+    const secret = App.el('set-tacacs-secret').value;
+    if (secret) values.tacacs_secret = secret;
+    try {
+      await App.post('/api/settings', { scope: 'global', values });
+      await App.loadState();
+      App.el('set-tacacs-secret').value = '';
+      paintTacacsSecretGate(!!(App.state.settings || {}).tacacs_secret_set);
+      tacacsStatus(`Saved — TACACS+ sign-in is ${values.tacacs_enabled ? 'on' : 'off'}.`,
+                   'var(--ok)');
+    } catch (error) {
+      tacacsStatus(error.message, 'var(--fail)');
+    }
+  }
+
+  /* A dry-run auth against whatever is in the fields right now, or the
+     saved settings for any field left blank. Creates no session and
+     stores nothing. */
+  async function testTacacs() {
+    const username = App.el('tacacs-test-username').value.trim();
+    const password = App.el('tacacs-test-password').value;
+    if (!username || !password) {
+      tacacsTestStatus('Enter a test username and password first', 'var(--fail)');
+      return;
+    }
+    tacacsTestStatus('Testing…', 'var(--muted)');
+    try {
+      const body = { username, password };
+      const servers = App.el('set-tacacs-servers').value.trim();
+      if (servers) body.servers = servers;
+      const secret = App.el('set-tacacs-secret').value;
+      if (secret) body.secret = secret;
+      const timeout = Number(App.el('set-tacacs-timeout').value);
+      if (timeout) body.timeout_s = timeout;
+      const result = await App.post('/api/settings/tacacs-test', body);
+      tacacsTestStatus(result.message, result.ok ? 'var(--ok)' : 'var(--fail)');
+    } catch (error) {
+      tacacsTestStatus(error.message, 'var(--fail)');
+    } finally {
+      App.el('tacacs-test-password').value = '';
+    }
+  }
+
   /* ------------------------------------------------------------- tokens */
 
   function tokensStatus(message, colour) {
@@ -1138,7 +1242,7 @@
     const table = App.el('users-table');
     const me = (App.state.session || {}).username;
     table.innerHTML = '<caption class="sr-only">User accounts</caption><thead><tr>' +
-      '<th scope="col">User</th><th scope="col">Created</th>' +
+      '<th scope="col">User</th><th scope="col">Source</th><th scope="col">Created</th>' +
       '<th scope="col">Last sign-in</th><th scope="col">State</th><th scope="col"></th></tr></thead>';
     const body = document.createElement('tbody');
 
@@ -1147,6 +1251,7 @@
       const isMe = user.username === me;
       tr.innerHTML =
         `<td>${escape(user.username)}${isMe ? ' <span class="hint">(you)</span>' : ''}</td>` +
+        `<td>${escape(AUTH_SOURCE_LABEL[user.auth_source] || 'Local')}</td>` +
         `<td>${when(user.created)}</td>` +
         `<td>${when(user.last_login)}</td>` +
         `<td>${user.must_change ? 'must change password' : 'active'}</td>` +
@@ -1211,26 +1316,36 @@
     el.style.color = colour || 'var(--muted)';
   }
 
-  /* 'local' or 'ldap' — whichever radio in the auth-source pair is checked. */
+  // 'local', 'ldap' or 'tacacs' — whichever radio in the auth-source group
+  // is checked.
   function newAuthSource() {
-    return App.el('new-auth-ldap').checked ? 'ldap' : 'local';
+    if (App.el('new-auth-ldap').checked) return 'ldap';
+    if (App.el('new-auth-tacacs').checked) return 'tacacs';
+    return 'local';
   }
 
-  /* An LDAP account has no local password at all, so the initial-password
-     field means nothing for one — disabled (not merely ignored) so it
-     cannot look like it did something. */
+  const AUTH_SOURCE_LABEL = { local: 'Local', ldap: 'LDAP', tacacs: 'TACACS+' };
+
+  /* Neither an LDAP nor a TACACS+ account has a local password at all, so
+     the initial-password field means nothing for either — disabled (not
+     merely ignored) so it cannot look like it did something. */
   function updateNewAuthFields() {
-    const ldap = newAuthSource() === 'ldap';
+    const source = newAuthSource();
+    const external = source !== 'local';
     const field = App.el('new-password');
-    field.disabled = ldap;
-    field.placeholder = ldap
-      ? 'not used — verified by the directory' : 'initial password';
+    field.disabled = external;
+    field.placeholder = external
+      ? `not used — verified by ${source === 'ldap' ? 'the directory' : 'TACACS+'}`
+      : 'initial password';
     // The placeholder alone said this to a sighted operator who noticed it
     // change; a title says it to anyone who hovers a disabled field instead
     // of reading it, the same courtesy every write-denied control gets.
-    if (ldap) field.title = 'LDAP accounts have no local password to set.';
-    else field.removeAttribute('title');
-    if (ldap) field.value = '';
+    if (external) {
+      field.title = source === 'ldap'
+        ? 'LDAP accounts have no local password to set.'
+        : 'TACACS+ accounts have no local password to set.';
+    } else field.removeAttribute('title');
+    if (external) field.value = '';
   }
 
   async function addUser() {
@@ -1247,10 +1362,9 @@
       App.el('new-auth-local').checked = true;
       updateNewAuthFields();
       await loadUsers();
-      usersStatus(authSource === 'ldap'
-        ? `Added ${username}, signing in via the directory.`
-        : `Added ${username}. They must change this password when they ` +
-          'first sign in.', 'var(--ok)');
+      usersStatus(authSource === 'local'
+        ? `Added ${username}. They must change this password when they ` + 'first sign in.'
+        : `Added ${username}, signing in via ${AUTH_SOURCE_LABEL[authSource]}.`, 'var(--ok)');
     } catch (error) {
       usersStatus(error.message, 'var(--fail)');
     }
@@ -1447,6 +1561,7 @@
     App.el('new-password').onkeydown = (e) => { if (e.key === 'Enter') addUser(); };
     App.el('new-auth-local').onchange = updateNewAuthFields;
     App.el('new-auth-ldap').onchange = updateNewAuthFields;
+    App.el('new-auth-tacacs').onchange = updateNewAuthFields;
     updateNewAuthFields();
     loadUsers().catch(() => {});
     loadTokens().catch(() => {});
@@ -1475,6 +1590,8 @@
     auditLoad();
     App.el('ldap-apply').onclick = applyLdapSettings;
     App.el('ldap-test').onclick = testLdap;
+    App.el('tacacs-apply').onclick = applyTacacsSettings;
+    App.el('tacacs-test').onclick = testTacacs;
     for (const id of ['set-trace-cap', 'set-flow-cap', 'set-snmp-cap', 'set-syslog-cap',
                      'set-ipam-cap', 'set-nodes-cap', 'set-nodes-series-cap',
                      'set-alerts-cap']) {

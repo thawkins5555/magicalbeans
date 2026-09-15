@@ -1548,7 +1548,10 @@ check("view.failed = false;" in _NF_REFRESH and "view.failed = false;" in _NF_LO
 ALLOWED_BARE_FIELDS = {
     "alerts.js": {"d.id", "g.id", "o.device_id", "r.severity", "row.count", "row.severity",
                   "t.id", "w.id"},
-    "app.js": {"c.key", "entry.html", "entry.title"},
+    # list.id: App.comboBox's own dropdown element id, built here as
+    # `${input.id}-list` a few lines above the template that reads it back —
+    # never a server-supplied row field.
+    "app.js": {"c.key", "entry.html", "entry.title", "list.id"},
     "configrx.js": {"device.ssh_port", "g.id", "ids.length", "r.rule_set_id",
                     "s.backup_interval_hours", "s.capture_timeout_s", "s.configrx_workers",
                     "s.retention_count_per_device", "s.retention_days"},
@@ -3141,6 +3144,103 @@ _DRAGSTART = DASH64[DASH64.index("function onDragStart(event)"):
 check(_DRAGSTART.strip().startswith("function onDragStart(event) {\n    if (!view.editing) return;"),
       "onDragStart bails out in view mode before it can preventDefault() a "
       "plain link or text drag")
+
+# --- 66. TACACS+ AAA, the themed combobox, dashboard graph tiles and
+#         drill-down everywhere ---------------------------------------------
+# C. App.comboBox replaces the Dashboard's <input list="dash-devices">
+# datalist — the datalist is gone from index.html, and dashboard.js's device
+# field goes through the shared widget instead of its own datalist wiring.
+check("function comboBox(input, opts = {})" in APP,
+      "app.js defines App.comboBox(input, opts)")
+check(", comboBox," in APP or "figures, comboBox," in APP,
+      "App.comboBox is exported on the api object")
+check('id="dash-devices"' not in INDEX,
+      "index.html no longer carries the shared #dash-devices datalist")
+check(".combo-list {" in read("app.css") and ".combo-item {" in read("app.css"),
+      "app.css styles .combo-list/.combo-item off tokens.css variables")
+DASH66 = read("dashboard.js")
+check("App.comboBox(input" in DASH66,
+      "dashboard.js's wireDeviceField wires the field through App.comboBox")
+check("WINDOW_OPTIONS" not in DASH66,
+      "dashboard.js's own fixed WINDOW_OPTIONS list is gone, replaced by App.RANGES")
+check("App.RANGES.map(" in DASH66,
+      "windowSelectHtml offers every App.RANGES entry")
+
+# B3. Dashboard graph tiles: interface traffic batches every row through the
+# new /api/nodes/series/batch route, a tile carries a name and a Y max, and a
+# non-edit-mode tile gets its own time-window control.
+check("'/api/nodes/series/batch'" in DASH66,
+      "the iface_traffic tile fetches through /api/nodes/series/batch")
+for _id in ("dc-name", "dc-ymax", "dc-iface-rows", "dc-add-iface"):
+    check('#%s' % _id in DASH66 or "'%s'" % _id in DASH66 or '"%s"' % _id in DASH66,
+          "dashboard.js's Configure dialogs carry the %s control" % _id)
+check('class="tile-range"' in DASH66,
+      "renderTile draws a select.tile-range outside edit mode for graph tiles")
+check("data-tile-live" in DASH66,
+      "a pinned graph tile gets a Live button to clear its custom window")
+check("s.dash" in APP and "'stroke-dasharray': s.dash" in APP,
+      "drawSeriesChart draws a dashed stroke for a series carrying opts.dash")
+
+# D1/D2. The shared range dialog and chart zoom/brush, in app.js.
+check("function rangeDialog(current = {})" in APP,
+      "app.js defines App.rangeDialog({t0, t1}) -> Promise<{t0,t1}|null>")
+check("function rangeLabel(t0, t1, follow, presetLabel)" in APP,
+      "app.js defines App.rangeLabel(t0, t1, follow, presetLabel)")
+check("function attachChartZoom(svg, geo, opts = {})" in APP,
+      "app.js defines App.attachChartZoom(svg, geo, opts)")
+check("option.textContent = 'Custom…';" in APP,
+      "fillRanges(..., {custom: true}) appends a literal 'Custom…' option")
+
+# D3. Every "Custom…" call site and, where the plan calls for it, a pinned
+# zoom/brush window that follows the same control.
+NODES66 = read("nodes.js")
+check("{ custom: true }" in NODES66
+      and NODES66.count("App.rangeDialog(") >= 3,
+      "nodes.js wires Custom… through App.rangeDialog at #ifd-range, "
+      "#ndd-loss-range and #nd-d-range")
+check("App.attachChartZoom(svg, geo" in NODES66,
+      "the interface dialog's and the device dialog's charts attach "
+      "App.attachChartZoom")
+check("function setTimelineWindow(t0, t1)" in NODES66
+      and "App.attachChartZoom(svg, { plot:" in NODES66,
+      "drawStatusTimeline attaches App.attachChartZoom over its own bar geometry")
+check("timelineWindow()" in NODES66[NODES66.index("async function loadRfChart("):],
+      "loadRfChart follows the #nd-d-range window instead of a fixed last hour")
+for _name, _needle in (
+        ("netpath.js", "App.rangeDialog("),
+        ("netflow.js", "App.rangeDialog("),
+        ("events.js", "App.rangeDialog("),
+        ("alerts.js", "App.rangeDialog(")):
+    check(_needle in read(_name), "%s wires its range select's Custom… to App.rangeDialog" % _name)
+check("{ custom: true }" in read("netpath.js") and "{ custom: true }" in read("netflow.js")
+      and "{ custom: true }" in read("events.js") and "{ custom: true }" in read("alerts.js"),
+      "each of those range selects is filled with fillRanges(..., {custom: true})")
+check("(hourly ${formatMetricValue(unit, p.min)}" in APP,
+      "attachChartHover's rollup min-max band says 'hourly' beside the figures")
+
+# A5. Settings -> SIGN-IN: the AAA (TACACS+) fieldset, and USERS' third
+# auth-source radio.
+INDEX66 = read("index.html")
+check("AAA (TACACS+)" in INDEX66, "index.html carries the AAA (TACACS+) legend")
+for _id in ("set-tacacs-enabled", "set-tacacs-servers", "set-tacacs-secret",
+            "set-tacacs-secret-state", "tacacs-secret-hint", "set-tacacs-timeout",
+            "set-tacacs-autocreate", "set-tacacs-role", "tacacs-apply", "tacacs-status",
+            "tacacs-test-username", "tacacs-test-password", "tacacs-test",
+            "tacacs-test-status", "new-auth-tacacs"):
+    check('id="%s"' % _id in INDEX66, "index.html carries the %s AAA control" % _id)
+SETTINGS66 = read("settings.js")
+check("applyTacacsSettings" in SETTINGS66 and "testTacacs" in SETTINGS66,
+      "settings.js defines applyTacacsSettings()/testTacacs()")
+check("/api/settings/tacacs-test" in SETTINGS66,
+      "testTacacs posts to /api/settings/tacacs-test")
+check("paintTacacsSecretGate" in SETTINGS66 and "App.canStoreSecrets()" in SETTINGS66,
+      "the shared secret field is gated on App.canStoreSecrets() like every "
+      "other credential field")
+check("tacacs_secret_set" in SETTINGS66,
+      "settings.js reads the read-only tacacs_secret_set flag rather than "
+      "ever painting a saved secret into the field")
+check("AUTH_SOURCE_LABEL" in SETTINGS66 and "scope=\"col\">Source<" in SETTINGS66,
+      "the users table gets a Source column naming local/LDAP/TACACS+")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

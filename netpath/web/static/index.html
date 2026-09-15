@@ -1453,6 +1453,38 @@
       <p class="hint" id="ldap-test-status">Tests a bind against the settings above (or the saved
         ones, for any left blank) without saving anything or creating a session.</p>
     </fieldset>
+
+    <fieldset data-requires-write="admin">
+      <legend>AAA (TACACS+)</legend>
+      <p class="hint">Local accounts are never sent to the AAA server. A TACACS+ account, or an
+        unknown username when auto-create is on below, is verified there instead. Unknown users
+        are created with the default role when auto-create is on; an unreachable server is
+        reported as such, never as a wrong password.</p>
+      <label class="check"><input type="checkbox" id="set-tacacs-enabled"> Enable TACACS+ sign-in</label>
+      <label>Server(s) <input id="set-tacacs-servers" placeholder="10.0.0.5, 10.0.0.6:49" size="34"></label>
+      <label>Shared secret <input type="password" id="set-tacacs-secret" size="28"></label>
+      <p class="hint" id="tacacs-secret-hint">Leave blank to keep the saved secret.
+        <span id="set-tacacs-secret-state"></span></p>
+      <label>Connection timeout <input type="number" id="set-tacacs-timeout" min="1" max="60" step="1"> s</label>
+      <label class="check"><input type="checkbox" id="set-tacacs-autocreate">
+        Create an account on first successful sign-in</label>
+      <label>Default role <select id="set-tacacs-role">
+        <option value="viewer">Viewer — read everything</option>
+        <option value="operator">Operator — write to every module, not Settings</option>
+        <option value="admin">Admin — write to everything</option>
+      </select></label>
+      <div class="row gap-t-sm">
+        <button id="tacacs-apply" data-requires-write="admin">Save AAA settings</button>
+      </div>
+      <p class="hint" id="tacacs-status"></p>
+      <div class="row gap-t-sm">
+        <input id="tacacs-test-username" placeholder="test username" size="16" aria-label="Test username">
+        <input id="tacacs-test-password" type="password" placeholder="test password" size="18" aria-label="Test password">
+        <button id="tacacs-test" type="button" data-requires-write="admin">Test connection</button>
+      </div>
+      <p class="hint" id="tacacs-test-status">Tests against the settings above (or the saved ones,
+        for any left blank) without saving anything or creating a session.</p>
+    </fieldset>
     </div>
 
     <div id="settings-sub-users" class="subpage scroll">
@@ -1471,6 +1503,8 @@
           Local password</label>
         <label class="check"><input type="radio" name="new-auth-source" id="new-auth-ldap" value="ldap">
           Sign in via LDAP directory</label>
+        <label class="check"><input type="radio" name="new-auth-source" id="new-auth-tacacs" value="tacacs">
+          Sign in via TACACS+</label>
       </div>
       <!-- A preset sets the whole twelve-module grid in one click; "copy
            from" repeats an account that already has the shape a new one
@@ -1622,9 +1656,6 @@
 <div id="toasts" class="toasts" aria-hidden="true"></div>
 
 <div id="modal" class="modal" hidden><div class="modal-box" id="modal-box"></div></div>
-<!-- Filled on input by the Dashboard's device-picker field (dashboard.js),
-     one shared list rather than one per Configure dialog. -->
-<datalist id="dash-devices"></datalist>
 
 <!-- `defer` on both, and never on boot.js above: they download in
      parallel and run in this order, before DOMContentLoaded, which is what

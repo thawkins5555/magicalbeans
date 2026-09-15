@@ -631,6 +631,63 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       }
       return `${audit.patterns} textures, ${audit.segments} segment(s)`;
     });
+
+  await check('the interface dialog\'s Custom… range pins an absolute window (D3)',
+    async () => {
+      await selectTab(page, 'nodes');
+      await settle(page, 800);
+      await page.click('#nodes-table tbody tr:first-child').catch(() => {});
+      await sleep(1500);
+      const hasRow = await page.evaluate(
+        () => !!document.querySelector('#nd-if-table tbody tr'));
+      if (!hasRow) return 'skipped: the selected device has no interfaces to open';
+      await page.click('#nd-if-table tbody tr:first-child');
+      await page.waitForSelector('#modal:not([hidden]) #ifd-range', { timeout: 10000 });
+      await sleep(600);
+
+      const seriesRequests = [];
+      const onRequest = (request) => {
+        const url = new URL(request.url());
+        if (url.pathname.endsWith('/series')) seriesRequests.push(url.search);
+      };
+      page.on('request', onRequest);
+      try {
+        await page.selectOption('#modal:not([hidden]) #ifd-range', 'custom');
+        await page.waitForSelector('#modal:not([hidden]) #rd-start', { timeout: 10000 });
+        const values = await page.evaluate(() => {
+          const pad = (n) => String(n).padStart(2, '0');
+          const iso = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+            `T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+          return { start: iso(new Date(Date.now() - 3 * 3600000)),
+                   end: iso(new Date(Date.now() - 3600000)) };
+        });
+        await page.fill('#modal:not([hidden]) #rd-start', values.start);
+        await page.fill('#modal:not([hidden]) #rd-end', values.end);
+        seriesRequests.length = 0;
+        await page.click('#modal:not([hidden]) .modal-buttons button.primary');
+        // Custom… closes and reopens this same dialog (App.modal is one
+        // shared box) rather than floating a second one over it, so this
+        // waits for the REOPENED #ifd-range to exist before reading it.
+        await page.waitForSelector('#modal:not([hidden]) #ifd-range', { timeout: 10000 });
+        await page.waitForFunction(() => {
+          const title = document.getElementById('ifd-bw-title');
+          return title && !/LAST HOUR/.test(title.textContent);
+        }, null, { timeout: 10000 });
+        await sleep(600);
+      } finally {
+        page.off('request', onRequest);
+      }
+      const withWindow = seriesRequests.find((s) => s.includes('t0=') && s.includes('t1='));
+      assert(withWindow, 'no /series request carried t0 and t1 after Apply');
+      const title = await page.evaluate(
+        () => (document.getElementById('ifd-bw-title') || {}).textContent || '');
+      assert(!/LAST HOUR/.test(title), `title still reads "${title}"`);
+      const selectValue = await page.evaluate(
+        () => (document.getElementById('ifd-range') || {}).value);
+      assert(selectValue === 'custom', `#ifd-range reads "${selectValue}", expected "custom"`);
+      await page.click('#modal:not([hidden]) .modal-buttons button').catch(() => {});
+      return `title now "${title}"`;
+    });
 }
 
 async function checkDialog(page, dir, tag) {
@@ -1168,6 +1225,70 @@ async function checkDashboard(page, dir, tag) {
       await page.click('#dash-done');
       await sleep(600);
       return 'saved with a null device_id, then cleaned up';
+    });
+
+  // B3.6: the non-edit-mode range control on a graph tile — add another
+  // Interface traffic tile (cancel its Configure dialog, same regression
+  // pattern above), Done, then change its select.tile-range and prove the
+  // change PUTs the layout rather than only redrawing.
+  await check('an Interface traffic tile carries a tile-range control that PUTs the layout',
+    async () => {
+      await selectTab(page, 'dashboard');
+      await settle(page, 900);
+      await page.click('#dash-edit');
+      await sleep(300);
+      await page.click('#dash-add');
+      await page.waitForSelector('#modal:not([hidden]) [data-add-type="iface_traffic"]',
+                                 { timeout: 10000 });
+      await page.click('#modal:not([hidden]) [data-add-type="iface_traffic"]');
+      await page.waitForSelector('#modal:not([hidden]) #dc-name', { timeout: 10000 });
+      const cancelled = await page.evaluate(() => {
+        const cancel = [...document.querySelectorAll('#modal:not([hidden]) .modal-buttons button')]
+          .find((b) => b.textContent.trim() === 'Cancel');
+        if (!cancel) return false;
+        cancel.click();
+        return true;
+      });
+      assert(cancelled, 'no Cancel button in the Configure dialog');
+      await sleep(300);
+      await page.click('#dash-done');
+      await sleep(700);
+
+      const rangeSelector = '#dash-grid [data-tile^="iface_traffic-"] select.tile-range';
+      await page.waitForSelector(rangeSelector, { timeout: 10000 });
+      const options = await page.evaluate(
+        (sel) => [...document.querySelector(sel).options].map((o) => o.value), rangeSelector);
+      assert(options.includes('custom'), 'the tile-range select has no Custom… option');
+
+      let putSeen = false;
+      const onPut = (request) => {
+        if (request.method() === 'PUT'
+            && new URL(request.url()).pathname === '/api/dashboard/layout') putSeen = true;
+      };
+      page.on('request', onPut);
+      try {
+        await page.selectOption(rangeSelector, '3600');
+        await sleep(800);
+      } finally {
+        page.off('request', onPut);
+      }
+      assert(putSeen, 'changing select.tile-range never PUT /api/dashboard/layout');
+
+      // Clean up: remove the tile this check added.
+      await page.click('#dash-edit');
+      await sleep(300);
+      const removed = await page.evaluate(() => {
+        const t = document.querySelector('#dash-grid [data-tile^="iface_traffic-"]');
+        const button = t && t.querySelector('[data-tt-remove]');
+        if (!button) return false;
+        button.click();
+        return true;
+      });
+      assert(removed, 'could not find the tile to clean it up');
+      await sleep(300);
+      await page.click('#dash-done');
+      await sleep(600);
+      return 'tile-range select present outside edit mode, its change PUT the layout';
     });
 
   // 5.21.0: the layout is now per-account and editable — add a tile, save,

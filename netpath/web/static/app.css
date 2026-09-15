@@ -112,7 +112,17 @@ body {
 .tile.drop-before { box-shadow: -3px 0 0 var(--accent); }
 .tile-chart { height: 200px; }
 .tile.tall .tile-chart { height: 280px; }
-.tile-chart svg { width: 100%; height: 100%; }
+.tile-chart svg { width: 100%; height: 100%; cursor: crosshair; }
+/* The non-edit-mode range control (B3.6): a compact select beside a Live
+   button, same tools row the edit-mode toolbar uses. */
+.tile-tools select.tile-range, .tile-tools button.tile-live {
+  padding: 1px var(--space-xs);
+  font-size: var(--fs-2xs);
+}
+/* Interface traffic Configure dialog: one device combobox + interface
+   select + Remove button per row. */
+.dash-iface-row { align-items: flex-end; }
+.dash-iface-row label { flex: 1; min-width: 0; }
 .gsearch-note { margin-top: 6px; }
 .dash-add-family { margin-bottom: var(--space-md); }
 /* A figure is one number with its label under it — the Dashboard's tiles
@@ -1718,6 +1728,40 @@ body.login-page {
   color: var(--muted);
   font-size: var(--fs-2xs);
 }
+
+/* App.comboBox: a themed <input list> replacement, dropped under the input
+   it is attached to (the input's wrapper is given position: relative). */
+.combo-list {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 2px;
+  z-index: calc(var(--z-modal) + 1);
+  max-height: 220px;
+  overflow: auto;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-pop);
+}
+.combo-item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+  text-align: left;
+  padding: var(--space-sm) 8px;
+  border-radius: var(--radius-sm);
+  border: none;
+  background: none;
+  color: var(--text);
+  cursor: pointer;
+}
+.combo-item .name { font-weight: 600; }
+.combo-item .hint { color: var(--muted); font-size: var(--fs-2xs); }
+.combo-item:hover, .combo-item.active { background: var(--raised); }
 
 /* ---------------------------------------------------------------- kiosk
    /?kiosk=1 — a wall display. The root font grows a quarter, which through

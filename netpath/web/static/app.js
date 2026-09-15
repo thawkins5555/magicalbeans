@@ -1398,7 +1398,7 @@ const App = (() => {
     setWindow(view.t0 + shift, view.t1 + shift, false);
   }
 
-  function fillRanges(select, defaultLabel, maxSeconds) {
+  function fillRanges(select, defaultLabel, maxSeconds, opts = {}) {
     select.innerHTML = '';
     for (const [label, seconds] of RANGES) {
       if (maxSeconds && seconds > maxSeconds) continue;
@@ -1407,8 +1407,84 @@ const App = (() => {
       option.textContent = label;
       select.appendChild(option);
     }
+    if (opts.custom) {
+      const option = document.createElement('option');
+      option.value = 'custom';
+      option.textContent = 'Custom…';
+      select.appendChild(option);
+    }
     const match = RANGES.find(([label]) => label === defaultLabel);
     if (match) select.value = String(match[1]);
+  }
+
+  // datetime-local wants the browser's own local wall clock, with no
+  // timezone suffix — the same value every "Custom…" picker in this app
+  // (alerts.js's maintenance windows, now this) reads back with `new
+  // Date(value).getTime()`.
+  function localInputValue(d) {
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}` +
+      `T${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+
+  /* A custom absolute time window, shared by every "Custom…" range option
+     in the product. Resolves {t0, t1} on Apply, null on Cancel, Escape or
+     a backdrop click — modal-closed fires for all three, and only one of
+     resolve/reject ever wins a race, so listening for it here costs
+     nothing when Apply got there first. */
+  function rangeDialog(current = {}) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (value) => { if (settled) return; settled = true; resolve(value); };
+      const now = Date.now() / 1000;
+      const t1 = current.t1 != null ? current.t1 : now;
+      const t0 = current.t0 != null ? current.t0 : t1 - 3600;
+      const box = modal('Custom range', `
+        <label>Start <input id="rd-start" type="datetime-local" value="${localInputValue(new Date(t0 * 1000))}"></label>
+        <label>End <input id="rd-end" type="datetime-local" value="${localInputValue(new Date(t1 * 1000))}"></label>
+        <div class="row start">
+          <button type="button" id="rd-quick-1h">Last hour</button>
+          <button type="button" id="rd-quick-24h">Last 24 hours</button>
+          <button type="button" id="rd-quick-7d">Last 7 days</button>
+        </div>`, [
+        { label: 'Cancel', onClick: () => { closeModal(); } },
+        { label: 'Apply', primary: true, onClick: (b) => {
+            const start = new Date(b.querySelector('#rd-start').value).getTime() / 1000;
+            let end = new Date(b.querySelector('#rd-end').value).getTime() / 1000;
+            if (!(end > start)) throw new Error('End must be after start');
+            end = Math.min(end, Date.now() / 1000);
+            const seconds = end - start;
+            if (seconds < WINDOW_MIN_S || seconds > WINDOW_MAX_S) {
+              throw new Error(`The range must be between ${span(WINDOW_MIN_S)} and ${span(WINDOW_MAX_S)}`);
+            }
+            closeModal();
+            finish({ t0: start, t1: end });
+          } },
+      ]);
+      const setQuick = (seconds) => {
+        const end = Date.now() / 1000;
+        box.querySelector('#rd-start').value = localInputValue(new Date((end - seconds) * 1000));
+        box.querySelector('#rd-end').value = localInputValue(new Date(end * 1000));
+      };
+      box.querySelector('#rd-quick-1h').onclick = () => setQuick(3600);
+      box.querySelector('#rd-quick-24h').onclick = () => setQuick(86400);
+      box.querySelector('#rd-quick-7d').onclick = () => setQuick(604800);
+      window.addEventListener('modal-closed', () => finish(null), { once: true });
+    });
+  }
+
+  // "Last hour" when following a preset, else an absolute span like
+  // "14 Sep 09:00 – 11:30" (same day drops the end date).
+  function rangeLabel(t0, t1, follow, presetLabel) {
+    if (follow && presetLabel) return presetLabel;
+    if (t0 == null || t1 == null) return presetLabel || '';
+    const d0 = new Date(t0 * 1000);
+    const d1 = new Date(t1 * 1000);
+    const sameDay = d0.toDateString() === d1.toDateString();
+    const t = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    const start = `${dateShort(d0)} ${t(d0)}`;
+    const end = sameDay ? t(d1) : `${dateShort(d1)} ${t(d1)}`;
+    return `${start} – ${end}`;
   }
 
   /* ----------------------------------------------------------- tooltip */
@@ -2950,7 +3026,8 @@ const App = (() => {
         .map((p) => `${xFor(p.ts)},${yFor(value(p))}`).join(' ');
       if (line) {
         svg.appendChild(svgNode('polyline', {
-          points: line, fill: 'none', stroke: s.color, 'stroke-width': 1.5 }));
+          points: line, fill: 'none', stroke: s.color, 'stroke-width': 1.5,
+          'stroke-dasharray': s.dash || null }));
       }
     }
 
@@ -2959,8 +3036,10 @@ const App = (() => {
     if (labelled.length > 1) {
       let x = plot.x + 8;
       for (const s of labelled) {
-        svg.appendChild(svgNode('rect', {
-          x, y: plot.y + 4, width: 14, height: 3, fill: s.color }));
+        svg.appendChild(svgNode(s.dash ? 'line' : 'rect', s.dash
+          ? { x1: x, y1: plot.y + 5, x2: x + 14, y2: plot.y + 5, stroke: s.color,
+              'stroke-width': 3, 'stroke-dasharray': s.dash }
+          : { x, y: plot.y + 4, width: 14, height: 3, fill: s.color }));
         const text = svgNode('text', {
           x: x + 18, y: plot.y + 9, fill: 'var(--dim)',
           'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)' }, s.label);
@@ -3033,8 +3112,12 @@ const App = (() => {
         dots[i].setAttribute('cx', xFor(p.ts));
         dots[i].setAttribute('cy', yFor(v));
         dots[i].setAttribute('visibility', 'visible');
+        // A rollup point (p.avg set) is always an hourly bucket \u2014 the only
+        // rollup table this product has (compact_rollup) \u2014 so the band
+        // beside it says so, rather than reading like the same per-poll
+        // min/max a raw point never carries at all.
         const band = p.avg !== undefined && p.min != null && p.max != null && p.min !== p.max
-          ? ` (${formatMetricValue(unit, p.min)} \u2013 ${formatMetricValue(unit, p.max)})` : '';
+          ? ` (hourly ${formatMetricValue(unit, p.min)} \u2013 ${formatMetricValue(unit, p.max)})` : '';
         rows.push({ color: s.color, text: `${s.label || 'Value'} ${formatMetricValue(unit, v)}${band}` });
       });
       if (anchor === null) { hide(); return; }
@@ -3044,6 +3127,126 @@ const App = (() => {
       tooltip([{ text: when(anchor) }, ...rows], event);
     });
     rect.addEventListener('mouseleave', hide);
+  }
+
+  /* Drag-select, wheel-zoom, double-click and keyboard zoom/pan for a
+     drawSeriesChart plot. `geo` is what drawSeriesChart returned for this
+     draw (plot rect, current t0/t1); onWindow(t0, t1) is called with the
+     new absolute window, onReset (optional) with none, for Home to clear a
+     pinned window back to "follow now". Listens on the svg itself rather
+     than fighting attachChartHover's own rect for one set of handlers —
+     both are addEventListener, so a pointerdown here and a mousemove there
+     coexist without either overwriting the other's `.onX`. */
+  function attachChartZoom(svg, geo, opts = {}) {
+    if (!geo) return;
+    // A dialog that redraws its chart in place on a timer (the same svg
+    // node, a new geo every tick) would stack a duplicate listener set on
+    // every re-attach; a dashboard tile that rebuilds the whole DOM each
+    // draw hands attachChartZoom a fresh svg instead. Either way, this
+    // node's live geo/opts live in one mutable object every handler below
+    // reads fresh, so a second call just updates it rather than attaching
+    // twice — but every drawSeriesChart/drawStatusTimeline redraw clears
+    // the svg's children first, which would silently orphan the brush rect
+    // forever, so re-attaching also puts it back if it is missing.
+    if (svg._chartZoom) {
+      const existing = svg._chartZoom;
+      existing.geo = geo;
+      existing.opts = opts;
+      if (!svg.contains(existing.brush)) svg.appendChild(existing.brush);
+      return;
+    }
+    const state = { geo, opts };
+    svg._chartZoom = state;
+    const xAt = (x) => {
+      const { plot, t0, t1 } = state.geo;
+      return t0 + ((x - plot.x) / Math.max(plot.w, 1)) * (t1 - t0);
+    };
+    const brush = svgNode('rect', {
+      x: geo.plot.x, y: geo.plot.y, width: 0, height: geo.plot.h,
+      fill: 'var(--accent)', 'fill-opacity': 0.14, stroke: 'var(--accent)',
+      visibility: 'hidden',
+    });
+    state.brush = brush;
+    svg.appendChild(brush);
+    const svgX = (event) => {
+      const box = svg.getBoundingClientRect();
+      const scale = state.geo.width ? state.geo.width / Math.max(box.width, 1) : 1;
+      return (event.clientX - box.left) * scale;
+    };
+    let drag = null;
+    const paintBrush = () => {
+      if (!drag || !drag.moved) { brush.setAttribute('visibility', 'hidden'); return; }
+      const a = Math.min(drag.startX, drag.x);
+      const b = Math.max(drag.startX, drag.x);
+      brush.setAttribute('x', a);
+      brush.setAttribute('width', Math.max(b - a, 1));
+      brush.setAttribute('visibility', 'visible');
+    };
+    svg.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0 || !event.isPrimary) return;
+      const { plot } = state.geo;
+      const x = svgX(event);
+      if (x < plot.x || x > plot.x + plot.w) return;
+      svg.setPointerCapture(event.pointerId);
+      drag = { startX: x, x, moved: false };
+    });
+    svg.addEventListener('pointermove', (event) => {
+      if (!drag) return;
+      drag.x = svgX(event);
+      drag.moved = drag.moved || Math.abs(drag.x - drag.startX) >= 4;
+      paintBrush();
+    });
+    const endDrag = () => {
+      if (!drag) return;
+      const { startX, x, moved } = drag;
+      drag = null;
+      paintBrush();
+      if (moved && state.opts.onWindow) {
+        state.opts.onWindow(xAt(Math.min(startX, x)), xAt(Math.max(startX, x)));
+      }
+    };
+    svg.addEventListener('pointerup', endDrag);
+    svg.addEventListener('pointercancel', () => { drag = null; paintBrush(); });
+    svg.addEventListener('wheel', (event) => {
+      if (!state.opts.onWindow) return;
+      event.preventDefault();
+      const { plot, t0, t1 } = state.geo;
+      const x = Math.min(Math.max(svgX(event), plot.x), plot.x + plot.w);
+      const [a, b] = wheelWindow(event, t0, t1, xAt(x));
+      state.opts.onWindow(a, b);
+    }, { passive: false });
+    svg.addEventListener('dblclick', (event) => {
+      if (!state.opts.onWindow) return;
+      event.preventDefault();
+      const { t0, t1 } = state.geo;
+      const mid = (t0 + t1) / 2;
+      const s = clampSpan((t1 - t0) * 2);
+      state.opts.onWindow(mid - s / 2, mid + s / 2);
+    });
+    const wrap = svg.parentElement || svg;
+    wrap.addEventListener('keydown', (event) => {
+      const { t0, t1 } = state.geo;
+      const cur = t1 - t0;
+      const mid = (t0 + t1) / 2;
+      if ((event.key === '+' || event.key === '=') && state.opts.onWindow) {
+        event.preventDefault();
+        const s = clampSpan(cur / 1.25);
+        state.opts.onWindow(mid - s / 2, mid + s / 2);
+      } else if ((event.key === '-' || event.key === '_') && state.opts.onWindow) {
+        event.preventDefault();
+        const s = clampSpan(cur * 1.25);
+        state.opts.onWindow(mid - s / 2, mid + s / 2);
+      } else if (event.key === 'ArrowLeft' && state.opts.onWindow) {
+        event.preventDefault();
+        state.opts.onWindow(t0 - cur * 0.25, t1 - cur * 0.25);
+      } else if (event.key === 'ArrowRight' && state.opts.onWindow) {
+        event.preventDefault();
+        state.opts.onWindow(t0 + cur * 0.25, t1 + cur * 0.25);
+      } else if (event.key === 'Home' && state.opts.onReset) {
+        event.preventDefault();
+        state.opts.onReset();
+      }
+    });
   }
 
   /* A tiny inline bar chart for overview tiles — no axes, no hover, just the
@@ -3104,6 +3307,114 @@ const App = (() => {
   // A row of figures: [{value, label, route?, className?, title?}, …].
   function figures(items) {
     return `<div class="figures">${items.map((f) => figure(f.value, f.label, f.route, f)).join('')}</div>`;
+  }
+
+  /* A themed replacement for <input list>: search(q) returns
+     [{id, label, hint}], onPick(id, item) runs when one is chosen. The
+     input keeps working as a plain text field — nothing here stops the
+     caller reading input.value — and typing without picking an item is a
+     supported outcome, not an error state (dashboard.js relies on it for an
+     unconfigured tile). Returns a teardown function the caller rarely
+     needs, since the list dies with the input's own dialog. */
+  function comboBox(input, opts = {}) {
+    const wrap = input.parentElement;
+    if (wrap && getComputedStyle(wrap).position === 'static') wrap.style.position = 'relative';
+    input.autocomplete = 'off';
+    input.setAttribute('role', 'combobox');
+    input.setAttribute('aria-expanded', 'false');
+    input.setAttribute('aria-autocomplete', 'list');
+    const list = document.createElement('div');
+    list.className = 'combo-list';
+    list.setAttribute('role', 'listbox');
+    list.hidden = true;
+    if (!input.id) input.id = `combo-${Math.random().toString(36).slice(2, 9)}`;
+    list.id = `${input.id}-list`;
+    input.setAttribute('aria-controls', list.id);
+    input.insertAdjacentElement('afterend', list);
+    let items = [];
+    let active = -1;
+    let timer = null;
+    let closeTimer = null;
+    let requestId = 0;
+
+    function close() {
+      list.hidden = true;
+      input.setAttribute('aria-expanded', 'false');
+      input.removeAttribute('aria-activedescendant');
+      active = -1;
+    }
+    function renderItems() {
+      list.innerHTML = items.map((item, i) => `<button type="button" role="option"
+          class="combo-item${i === active ? ' active' : ''}" id="${list.id}-${i}"
+          aria-selected="${i === active ? 'true' : 'false'}">
+          <span class="name">${escapeHtml(item.label)}</span>${
+            item.hint ? `<span class="hint">${escapeHtml(item.hint)}</span>` : ''}
+        </button>`).join('');
+      if (active >= 0) input.setAttribute('aria-activedescendant', `${list.id}-${active}`);
+      else input.removeAttribute('aria-activedescendant');
+    }
+    function open() {
+      if (!items.length) { close(); return; }
+      list.hidden = false;
+      input.setAttribute('aria-expanded', 'true');
+      renderItems();
+    }
+    function pick(i) {
+      const item = items[i];
+      if (!item) return;
+      input.value = item.label;
+      close();
+      if (opts.onPick) opts.onPick(item.id, item);
+    }
+    async function search() {
+      const q = input.value.trim();
+      if (q.length < (opts.minChars || 0)) { items = []; close(); return; }
+      const id = (requestId += 1);
+      try {
+        const result = await opts.search(q);
+        if (id !== requestId) return;
+        items = result || [];
+        active = -1;
+        open();
+      } catch (error) { /* a failed lookup just leaves the list as it was */ }
+    }
+    list.addEventListener('mousedown', (event) => {
+      // mousedown, ahead of the input's own blur, so a click on an item
+      // picks it instead of the list closing out from under the pointer.
+      const button = event.target.closest('.combo-item');
+      if (!button) return;
+      event.preventDefault();
+      pick([...list.children].indexOf(button));
+    });
+    input.addEventListener('input', () => {
+      clearTimeout(timer);
+      timer = setTimeout(search, 200);
+    });
+    input.addEventListener('focus', () => { if (items.length) open(); });
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowDown') {
+        if (list.hidden) { search(); return; }
+        event.preventDefault();
+        active = Math.min(active + 1, items.length - 1);
+        renderItems();
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        active = Math.max(active - 1, 0);
+        renderItems();
+      } else if (event.key === 'Enter') {
+        if (!list.hidden && active >= 0) { event.preventDefault(); pick(active); }
+      } else if (event.key === 'Escape') {
+        if (!list.hidden) { event.preventDefault(); close(); }
+      } else if (event.key === 'Tab') {
+        close();
+      }
+    });
+    input.addEventListener('blur', () => {
+      // Short delay so a click on a list item (mousedown, above) has already
+      // fired before the list is torn down.
+      closeTimer = setTimeout(close, 150);
+    });
+    return () => { clearTimeout(timer); clearTimeout(closeTimer); list.remove(); };
   }
 
   /* One status renderer for the whole application.
@@ -5939,8 +6250,9 @@ const App = (() => {
     announce, desktopNotifyEnabled, setDesktopNotify, titleForAlerts,
     canStoreSecrets, credentialUnavailableHtml,
     registerHelp, helpLink,
-    resetLayout, onRelayout, setTheme, currentTheme, tile, figure, figures,
-    drawSeriesChart, formatMetricValue, sparkline,
+    resetLayout, onRelayout, setTheme, currentTheme, tile, figure, figures, comboBox,
+    drawSeriesChart, formatMetricValue, sparkline, RANGES, rangeDialog, rangeLabel,
+    attachChartZoom,
     recallSort, rememberSort, restoreControls, rememberControls,
     rememberControl, savedControl, controlOrSaved, syncControls,
     recallSub, rememberSub, selectSub,
