@@ -634,15 +634,18 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
 
   await check('the interface dialog\'s Custom… range pins an absolute window (D3)',
     async () => {
+      await page.keyboard.press('Escape');
       await selectTab(page, 'nodes');
       await settle(page, 800);
       await page.click('#nodes-table tbody tr:first-child').catch(() => {});
-      await sleep(1500);
-      const hasRow = await page.evaluate(
-        () => !!document.querySelector('#nd-if-table tbody tr'));
+      // The interface list arrives with the device detail fetch, which a
+      // freshly seeded fleet answers slowly; wait for rows, not a fixed nap.
+      const hasRow = await page.waitForSelector('#nd-if-table tbody tr', { timeout: 20000 })
+        .then(() => true).catch(() => false);
       if (!hasRow) return 'skipped: the selected device has no interfaces to open';
+      await sleep(500);
       await page.click('#nd-if-table tbody tr:first-child');
-      await page.waitForSelector('#modal:not([hidden]) #ifd-range', { timeout: 10000 });
+      await page.waitForSelector('#modal:not([hidden]) #ifd-range', { timeout: 20000 });
       await sleep(600);
 
       const seriesRequests = [];
@@ -668,7 +671,7 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         // Custom… closes and reopens this same dialog (App.modal is one
         // shared box) rather than floating a second one over it, so this
         // waits for the REOPENED #ifd-range to exist before reading it.
-        await page.waitForSelector('#modal:not([hidden]) #ifd-range', { timeout: 10000 });
+        await page.waitForSelector('#modal:not([hidden]) #ifd-range', { timeout: 20000 });
         await page.waitForFunction(() => {
           const title = document.getElementById('ifd-bw-title');
           return title && !/LAST HOUR/.test(title.textContent);
