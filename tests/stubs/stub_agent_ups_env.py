@@ -77,12 +77,16 @@ Modes:
              and precision, plus a partly-published band, two rows naming
              no band at all, a duplicated level and a chassis probe mapped
              to no port. See CISCO_DOM_THRESHOLD_TABLE.
-  sfp_media  Seven ports covering every media verdict and the dark optic: a
-             working optic, an occupied cage with no DOM, an empty cage, a
-             copper port an agent models as container+port too (which must
-             stay unbadged), a two-lane optic with one lane dark, one dark on
-             both lanes, and one transmitting at exactly 0 dBm. See
-             SFP_MEDIA_TABLE.
+  sfp_media  Eleven ports covering every media verdict, the dark optic, and
+             copper (5.25.0): a working optic, an occupied cage with no DOM,
+             an empty cage, a copper port an agent models as container+port
+             too (which must stay unbadged), a two-lane optic with one lane
+             dark, one dark on both lanes, one transmitting at exactly
+             0 dBm, a copper module named by text alone with no sensor, a
+             copper module named by text with a temperature-only sensor, a
+             module ifMauType alone proves copper, and an optical module
+             whose ifMauType fiber arc must not downgrade it. See
+             SFP_MEDIA_TABLE and SFP_MAU_TABLE.
   sfp_media_no_class
              `sfp_media`, except that every request into the
              entPhysicalClass column goes unanswered -- the flaky device
@@ -90,11 +94,16 @@ Modes:
              so that walk times out rather than coming back empty. The
              difference matters to a caller that deletes rows its walk did
              not produce. See DEAD_COLUMNS.
+  sfp_media_no_mau
+             `sfp_media`'s SFP_MEDIA_TABLE with no SFP_MAU_TABLE merged in
+             -- ifMauType answers nothing (a clean empty walk, not a
+             timeout), the noSuchObject case the reprobe gate is for.
 
 Three control datagrams, on the same socket as SNMP itself (see
 stub_agent_fdb.py, which established this convention):
   STATS       -> the request count so far, as decimal text
-  COLUMNS     -> the entPhysicalEntry columns asked for, space-separated
+  COLUMNS     -> the entPhysicalEntry columns (and ifMauType) asked for,
+                 space-separated
   RESET       -> zeroes both
 """
 import os
@@ -414,7 +423,7 @@ CISCO_DOM_THRESHOLD_TABLE = {
     "1.3.6.1.4.1.9.9.91.1.2.1.1.4.2000.1": ("int", 55),
 }
 # ------------------------------------------- SFP media and the dark optic
-# Seven ports, one row of ENTITY-MIB reality each. Ports 1/5/6/7 carry
+# Eleven ports, one row of ENTITY-MIB reality each. Ports 1/5/6/7 carry
 # standard ENTITY-SENSOR-MIB optical-power rows (dBm(14), scale units(9),
 # precision 1) and are aliased to their ifIndex; ports 2/3/4 have no sensor
 # of any kind, which is exactly why entPhysicalClass has to answer for them:
@@ -429,6 +438,20 @@ CISCO_DOM_THRESHOLD_TABLE = {
 #   if 7  a single-lane optic transmitting at exactly 0.0 dBm -- 1 mW, a
 #         nominal level for an ER/ZR part, and what an agent quoting 0.1 dBm
 #         units rounds -0.04 to
+#
+# Copper (5.25.0), added without renumbering the seven ports above:
+#   if 8  module text "1000BaseT SFP" / model "GLC-T", no sensor at all
+#         -> media 'copper' from text alone
+#   if 9  module text "SFP-10G-T-S", one temperature-only sensor (no
+#         optical-power row) -> media 'copper': medium wins over "has a
+#         DOM reading", and sfp_temp_c.9 is still recorded
+#   if 10 module names a transceiver but nothing telling ("Transceiver
+#         module"), no sensor -> text alone leaves it 'sfp'; ifMauType
+#         arc 30 (1000BASE-T) is what makes it 'copper' -- see SFP_MAU_TABLE
+#   if 11 module text "SFP-10G-SR" (optical, not copper) plus a real DOM
+#         Rx row, AND an ifMauType arc 36 (10GBASE-SR) row on the same
+#         port -- proves fiber wins a MAU/text disagreement, and that a
+#         MAU fiber verdict never turns off a genuine optic
 SFP_MEDIA_TABLE = {
     # --- if 1: an ordinary DOM optic
     "1.3.6.1.2.1.47.1.1.1.1.2.101": ("str", "GigabitEthernet1/0/1"),
@@ -519,6 +542,80 @@ SFP_MEDIA_TABLE = {
     "1.3.6.1.2.1.99.1.1.1.3.171": ("int", 1),
     "1.3.6.1.2.1.99.1.1.1.4.171": ("int", 0),                  # 0.0 dBm
     "1.3.6.1.2.1.99.1.1.1.5.171": ("int", 1),
+
+    # --- if 8: copper module text, no sensor at all
+    "1.3.6.1.2.1.47.1.1.1.1.2.208": ("str", "SFP+ container"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.208": ("int", 5),                # container
+    "1.3.6.1.2.1.47.1.1.1.1.2.258": ("str", "GigabitEthernet1/0/8"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.258": ("int", 10),
+    "1.3.6.1.2.1.47.1.1.1.1.4.258": ("int", 208),
+    "1.3.6.1.2.1.47.1.3.2.1.2.258.1": ("str", "1.3.6.1.2.1.2.2.1.1.8"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.308": ("str", "1000BaseT SFP"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.308": ("int", 9),                # module
+    "1.3.6.1.2.1.47.1.1.1.1.4.308": ("int", 208),
+    "1.3.6.1.2.1.47.1.1.1.1.13.308": ("str", "GLC-T"),
+
+    # --- if 9: copper module text, one temperature-only sensor
+    "1.3.6.1.2.1.47.1.1.1.1.2.209": ("str", "SFP+ container"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.209": ("int", 5),
+    "1.3.6.1.2.1.47.1.1.1.1.2.259": ("str", "GigabitEthernet1/0/9"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.259": ("int", 10),
+    "1.3.6.1.2.1.47.1.1.1.1.4.259": ("int", 209),
+    "1.3.6.1.2.1.47.1.3.2.1.2.259.1": ("str", "1.3.6.1.2.1.2.2.1.1.9"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.309": ("str", "SFP-10G-T-S"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.309": ("int", 9),
+    "1.3.6.1.2.1.47.1.1.1.1.4.309": ("int", 209),
+    "1.3.6.1.2.1.47.1.1.1.1.2.359": ("str", "Gi1/0/9 Temperature Sensor"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.359": ("int", 259),
+    "1.3.6.1.2.1.99.1.1.1.1.359": ("int", 8),                  # temperature
+    "1.3.6.1.2.1.99.1.1.1.2.359": ("int", 9),
+    "1.3.6.1.2.1.99.1.1.1.3.359": ("int", 1),
+    "1.3.6.1.2.1.99.1.1.1.4.359": ("int", 350),                # 35.0 C
+    "1.3.6.1.2.1.99.1.1.1.5.359": ("int", 1),
+
+    # --- if 10: module text names a transceiver but nothing telling; only
+    # ifMauType (SFP_MAU_TABLE, arc 30) proves it copper
+    "1.3.6.1.2.1.47.1.1.1.1.2.210": ("str", "SFP+ container"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.210": ("int", 5),
+    "1.3.6.1.2.1.47.1.1.1.1.2.260": ("str", "GigabitEthernet1/0/10"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.260": ("int", 10),
+    "1.3.6.1.2.1.47.1.1.1.1.4.260": ("int", 210),
+    "1.3.6.1.2.1.47.1.3.2.1.2.260.1": ("str", "1.3.6.1.2.1.2.2.1.1.10"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.310": ("str", "Transceiver module"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.310": ("int", 9),
+    "1.3.6.1.2.1.47.1.1.1.1.4.310": ("int", 210),
+
+    # --- if 11: an optical module (real DOM Rx row) that also answers an
+    # ifMauType fiber arc (SFP_MAU_TABLE, arc 36) -- fiber must not be
+    # downgraded, and must stay 'optic'
+    "1.3.6.1.2.1.47.1.1.1.1.2.211": ("str", "SFP+ container"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.211": ("int", 5),
+    "1.3.6.1.2.1.47.1.1.1.1.2.261": ("str", "GigabitEthernet1/0/11"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.261": ("int", 10),
+    "1.3.6.1.2.1.47.1.1.1.1.4.261": ("int", 211),
+    "1.3.6.1.2.1.47.1.3.2.1.2.261.1": ("str", "1.3.6.1.2.1.2.2.1.1.11"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.311": ("str", "SFP-10G-SR"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.311": ("int", 9),
+    "1.3.6.1.2.1.47.1.1.1.1.4.311": ("int", 211),
+    "1.3.6.1.2.1.47.1.1.1.1.2.371": ("str", "Gi1/0/11 Receive Power"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.371": ("int", 261),
+    "1.3.6.1.2.1.99.1.1.1.1.371": ("int", 14),
+    "1.3.6.1.2.1.99.1.1.1.2.371": ("int", 9),
+    "1.3.6.1.2.1.99.1.1.1.3.371": ("int", 1),
+    "1.3.6.1.2.1.99.1.1.1.4.371": ("int", -60),                # -6.0 dBm
+    "1.3.6.1.2.1.99.1.1.1.5.371": ("int", 1),
+}
+
+# MAU-MIB ifMauType rows (index ifIndex.mauIndex, value an OID whose last
+# arc is a dot3MauType) for the two ports that need MAU-MIB rather than
+# module text to classify: if 10 arc 30 (1000BASE-T, copper) and if 11 arc
+# 36 (10GBASE-SR, fiber -- must not downgrade a real optic). Merged into
+# 'sfp_media' only, never into 'sfp_media_no_class' or 'sfp_media_no_mau',
+# so those two keep exercising the no-MAU-answered path.
+IF_MAU_TYPE = "1.3.6.1.2.1.26.2.1.1.3"
+SFP_MAU_TABLE = {
+    f"{IF_MAU_TYPE}.10.1": ("str", "1.3.6.1.2.1.26.4.30"),
+    f"{IF_MAU_TYPE}.11.1": ("str", "1.3.6.1.2.1.26.4.36"),
 }
 
 # A mode may refuse a whole column outright, which is not the same as
@@ -530,11 +627,11 @@ DEAD_COLUMNS = {
     "sfp_media_no_class": ("1.3.6.1.2.1.47.1.1.1.1.5",),
 }
 
-# Which entPhysicalEntry columns a run was asked for at all. A walk asks for
-# its column's base OID and then resumes from the last row it accepted, so
-# every request it makes carries that column -- which is what makes "was
-# this column ever walked?" a question a test can put, and each column is a
-# whole table walk of cost.
+# Which entPhysicalEntry columns (and ifMauType) a run was asked for at
+# all. A walk asks for its column's base OID and then resumes from the last
+# row it accepted, so every request it makes carries that column -- which is
+# what makes "was this column ever walked?" a question a test can put, and
+# each column is a whole table walk of cost.
 ENT_PHYSICAL_ENTRY = "1.3.6.1.2.1.47.1.1.1.1."
 COLUMNS_SEEN: set = set()
 
@@ -566,7 +663,9 @@ def table_for():
     if MODE == "cisco_dom_thresholds":
         return {**CISCO_SCALARS, **CISCO_DOM_TABLE,
                 **CISCO_DOM_THRESHOLD_TABLE}
-    if MODE in ("sfp_media", "sfp_media_no_class"):
+    if MODE == "sfp_media":
+        return {**GENERIC_SCALARS, **SFP_MEDIA_TABLE, **SFP_MAU_TABLE}
+    if MODE in ("sfp_media_no_class", "sfp_media_no_mau"):
         return {**GENERIC_SCALARS, **SFP_MEDIA_TABLE}
     return dict(GENERIC_SCALARS)
 
@@ -620,6 +719,8 @@ def main():
         oids = [vb["oid"] for vb in request.varbinds]
         if oids[0].startswith(ENT_PHYSICAL_ENTRY):
             COLUMNS_SEEN.add(".".join(oids[0].split(".")[:12]))
+        elif oids[0].startswith(IF_MAU_TYPE):
+            COLUMNS_SEEN.add(IF_MAU_TYPE)
         if refuses(oids[0]):
             continue
         if request.pdu_tag == PDU_GET:

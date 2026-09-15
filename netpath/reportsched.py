@@ -222,18 +222,19 @@ def _render_sfp(service, params: dict, now: float):
         include_empty=include_empty)
     subject = (f"SFP inventory — {report.port_count} port(s) on "
               f"{report.device_count} device(s), {report.dom_count} DOM / "
-              f"{report.sfp_count} SFP")
+              f"{report.sfp_count} SFP / {report.copper_count} COP")
     lines = [subject,
             f"Generated {time.strftime('%Y-%m-%d %H:%M', time.localtime(now))}", ""]
     for r in report.rows[:_BODY_ROW_CAP]:
-        lines.append(f"  {r.name[:28]:<28} {r.port[:20]:<20} {r.kind:<10}")
+        lines.append(f"  {r.name[:28]:<28} {r.port[:20]:<20} {r.kind:<10} "
+                    f"{r.medium:<6}")
     if len(report.rows) > _BODY_ROW_CAP:
         lines.append(f"  ... and {len(report.rows) - _BODY_ROW_CAP} more "
                     "(see the attached CSV)")
     body = "\n".join(lines) + "\n"
 
     csv_rows = [[r.device_id, r.name, r.ip, r.if_index, r.port, r.alias, r.kind,
-                r.media, r.oper_status, r.admin_status, r.speed_bps,
+                r.medium, r.media, r.oper_status, r.admin_status, r.speed_bps,
                 r.last_seen_ts, r.device] for r in report.rows]
     return subject, body, csvout.csv_text(reportmod.SFP_CSV_HEADER, csv_rows)
 

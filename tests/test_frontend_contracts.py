@@ -3597,6 +3597,42 @@ _SERVER79 = open(os.path.join(REPO_ROOT, "netpath", "web", "server.py"),
 for needle in (r'r"^/api/nodes/reports/sfp$"', r'r"^/api/nodes/reports/sfp/export\.csv$"'):
     check(needle in _SERVER79, "server.py routes the SFP report literal %s" % needle)
 
+
+# --- 80. Copper transceivers: the COP badge (5.25.0) ------------------------
+# interfaces.media gains 'copper'; sfpBadge grows a third case and the
+# device-dialog live-DOM upgrade must never flip a COP row off a bare
+# temperature reading.
+NODES80 = read("nodes.js")
+check("badge badge-cop" in NODES80 and "r.media === 'copper'" in NODES80,
+      "sfpBadge renders the copper case off the stored media column, same "
+      "as DOM/SFP")
+check(".badge-cop" in APP_CSS,
+      "app.css styles the COP badge, or it inherits the amber warning fill "
+      "every other badge uses")
+_DEV_DIALOG80 = NODES80[NODES80.index("  function deviceDialog("):
+                        NODES80.index("  /* ------------------------------------------- temperature alert overrides")]
+check("r.media !== 'copper' && dialogOptics.has(r.if_index)" in _DEV_DIALOG80,
+      "a stored COP row is never upgraded to DOM by the live /dom read, "
+      "whatever it carries for that port")
+check("dialogOptics = new Set(rows.filter((s) => s.unit === 'dBm')" in _DEV_DIALOG80,
+      "the live read only counts an optical-power (dBm) row toward DOM -- "
+      "a copper port's own temperature/voltage rows must not qualify")
+check("{ key: 'medium', label: 'Medium', width: 80, cell: (r) => escape(r.medium || '') }"
+      in NODES80,
+      "the SFP report table has a Medium column, escaped like every other "
+      "server-supplied string cell")
+check("${result.dom_count} DOM · ${result.sfp_count} SFP · ${result.copper_count} COP`"
+      in NODES80,
+      "the SFP report summary line counts copper ports alongside DOM/SFP")
+check("['device_id', 'name', 'ip', 'if_index', 'port', 'alias', 'kind',\n"
+      "    'medium', 'media', 'oper_status', 'admin_status', 'speed_bps', "
+      "'last_seen_ts', 'device']" in NODES80,
+      "the client SFP_CSV_HEADER mirrors the server's CSV header order -- "
+      "kind, medium, media")
+check("r.alias, r.kind, r.medium, r.media, r.oper_status" in NODES80,
+      "exportSfpReportCsv's row values are built in the same order as "
+      "SFP_CSV_HEADER")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

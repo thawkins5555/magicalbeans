@@ -5,6 +5,35 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.25.0 — SFP copper/laser identification
+
+**Operator prompt, two items:**
+- "Is there a way via SNMP to determine the difference between a fiber
+  SFP and a copper SFP?"
+- "I want the Nodes -> Devices -> Interfaces -> should show one of
+  three icons - DOM for laser DOM SFP's, 'SFP' for laser non DOM, and
+  'COP' for non-DOM copper SFP's.  The Report should have an
+  additional copper identifying if the type is copper or laser."
+
+**Notes:**
+1. Answered in chat, no code changed. ENTITY-MIB's module description
+   and vendor-type name the part number (GLC-T, SFP-10G-T vs SX/SR/LR),
+   which is the most reliable signal. MAU-MIB's ifMauType names the
+   media type outright where the vendor fills it in. Wavelength and
+   connector type from the transceiver EEPROM work where a vendor MIB
+   exposes them — copper modules report a wavelength of 0. DOM sensor
+   absence is only a hint, since some copper modules report a
+   temperature sensor. Plain IF-MIB type and speed cannot tell copper
+   and fiber apart.
+2. Planning answers: "Module text plus MAU-MIB" for the proof a module
+   is copper, and "COP" for a copper module that still reports a
+   temperature sensor. The plan adds a `copper` media value decided
+   from the module description text plus a new MAU-MIB column walk,
+   badges each interface DOM/SFP/COP in the interface list and the
+   report's Kind column, and adds a Medium column (Copper/Laser) to
+   the SFP inventory report and its CSV/email output. Alerting is
+   unchanged. Outcome: (pending)
+
 ## 5.24.0 — Priority port tint, History search by name, SFP inventory report
 
 **Operator prompt, three items:**

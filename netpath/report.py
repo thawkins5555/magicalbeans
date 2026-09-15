@@ -524,7 +524,16 @@ def firmware_inventory(nodesdb, device_ids: list[int] | None = None,
         unknown_count=sum(1 for r in rows if not r.sw_version), rows=rows)
 
 
-_MEDIA_KIND = {"optic": "DOM", "sfp": "SFP", "sfp_empty": "Empty cage"}
+_MEDIA_KIND = {"optic": "DOM", "sfp": "SFP", "copper": "COP",
+              "sfp_empty": "Empty cage"}
+
+# The "what does the light do" column beside kind's "what did we prove it
+# with": DOM and SFP are both laser transceivers (they differ only in
+# whether DOM sensors answered), copper is BASE-T, and an empty cage is
+# neither yet. api.py and reportsched.py both read this rather than
+# repeating the mapping.
+MEDIA_MEDIUM = {"optic": "Laser", "sfp": "Laser", "copper": "Copper",
+                "sfp_empty": ""}
 
 
 @dataclass
@@ -537,6 +546,7 @@ class SfpRow:
     port: str
     alias: str
     kind: str
+    medium: str
     media: str
     oper_status: str
     admin_status: str
@@ -548,7 +558,7 @@ class SfpRow:
 
 
 SFP_CSV_HEADER = ["device_id", "name", "ip", "if_index", "port", "alias", "kind",
-                  "media", "oper_status", "admin_status", "speed_bps",
+                  "medium", "media", "oper_status", "admin_status", "speed_bps",
                   "last_seen_ts", "device"]
 
 
@@ -559,6 +569,7 @@ class SfpReport:
     port_count: int
     dom_count: int
     sfp_count: int
+    copper_count: int
     empty_count: int
     rows: list[SfpRow]
 
@@ -568,6 +579,7 @@ class SfpReport:
                 "port_count": self.port_count,
                 "dom_count": self.dom_count,
                 "sfp_count": self.sfp_count,
+                "copper_count": self.copper_count,
                 "empty_count": self.empty_count,
                 "rows": [r.to_dict() for r in self.rows]}
 
@@ -576,10 +588,10 @@ def sfp_inventory(nodesdb, device_ids: list[int] | None = None,
                   dns_names: dict | None = None, hostnames=None,
                   include_empty: bool = False) -> SfpReport:
     """Every switch port holding a transceiver: DOM (optic, with sensors),
-    SFP (named by ENTITY-MIB, no DOM) and, when `include_empty`, empty
-    cages. `dns_names`/`hostnames` name a device the same way
-    firmware_inventory does when it has neither a manual name nor a
-    sysName."""
+    SFP (named by ENTITY-MIB, no DOM), COP (copper, module text or
+    MAU-MIB) and, when `include_empty`, empty cages. `dns_names`/
+    `hostnames` name a device the same way firmware_inventory does when it
+    has neither a manual name nor a sysName."""
     rows_in = nodesdb.interfaces_with_media(device_ids=device_ids,
                                             include_empty=include_empty)
     if dns_names is None and hostnames is not None:
@@ -595,6 +607,7 @@ def sfp_inventory(nodesdb, device_ids: list[int] | None = None,
             device_id=row["device_id"], name=label, ip=ip, device=device,
             if_index=row["if_index"], port=port, alias=row["alias"] or "",
             kind=_MEDIA_KIND.get(row["media"], row["media"] or ""),
+            medium=MEDIA_MEDIUM.get(row["media"], ""),
             media=row["media"] or "", oper_status=row["oper_status"] or "",
             admin_status=row["admin_status"] or "",
             speed_bps=row["speed_bps"], last_seen_ts=row["last_seen_ts"]))
@@ -604,6 +617,7 @@ def sfp_inventory(nodesdb, device_ids: list[int] | None = None,
         port_count=len(rows),
         dom_count=sum(1 for r in rows if r.media == "optic"),
         sfp_count=sum(1 for r in rows if r.media == "sfp"),
+        copper_count=sum(1 for r in rows if r.media == "copper"),
         empty_count=sum(1 for r in rows if r.media == "sfp_empty"),
         rows=rows)
 

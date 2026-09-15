@@ -325,6 +325,7 @@ ENT_CLASS = "1.3.6.1.2.1.47.1.1.1.1.5"
 ENT_MODEL_NAME = "1.3.6.1.2.1.47.1.1.1.1.13"
 ENT_ALIAS_MAPPING = "1.3.6.1.2.1.47.1.3.2.1.2"
 ENT_SENSOR = "1.3.6.1.2.1.99.1.1.1"
+IF_MAU_TYPE = "1.3.6.1.2.1.26.2.1.1.3"   # ifMauType, MAU-MIB
 UCD_CPU_IDLE = "1.3.6.1.4.1.2021.11.11.0"
 UCD_MEM_TOTAL = "1.3.6.1.4.1.2021.4.5.0"
 UCD_MEM_AVAIL = "1.3.6.1.4.1.2021.4.6.0"
@@ -813,17 +814,20 @@ def sfp_cages(populated: dict | None = None, empty: dict | None = None) -> dict:
     the half of the estate entity_sensors() above cannot represent, since a
     cage reporting nothing has no entPhySensor row to be found by.
 
-    populated/empty: {if_index: that port's ifDescr}. Each cage is a
-    container(5) holding a port(10) that carries the
-    entAliasMappingIdentifier row (the real Cisco shape: the cage itself is
-    aliased to nothing, the port in it is aliased to the ifIndex). A
-    populated cage additionally holds a module(9) naming the transceiver
-    plugged into it; an empty one holds nothing, which is the only thing
-    that tells the two apart.
+    populated/empty: {if_index: that port's ifDescr}, or, to name the
+    plugged-in module as something other than the fleet's default 10G-LR
+    laser optic (a copper part, say), {if_index: (ifDescr, module_descr,
+    model_name)}. Each cage is a container(5) holding a port(10) that
+    carries the entAliasMappingIdentifier row (the real Cisco shape: the
+    cage itself is aliased to nothing, the port in it is aliased to the
+    ifIndex). A populated cage additionally holds a module(9) naming the
+    transceiver plugged into it; an empty one holds nothing, which is the
+    only thing that tells the two apart.
     """
     populated, empty = populated or {}, empty or {}
     entries: dict = {}
-    for if_index, descr in {**populated, **empty}.items():
+    for if_index, spec in {**populated, **empty}.items():
+        descr = spec[0] if isinstance(spec, tuple) else spec
         cage, port, module = 2000 + if_index, 2500 + if_index, 3000 + if_index
         entries[f"{ENT_DESCR}.{cage}"] = (T_OCTET_STRING, f"{descr} Container SFP+")
         entries[f"{ENT_CLASS}.{cage}"] = (T_INTEGER, 5)          # container
@@ -834,11 +838,23 @@ def sfp_cages(populated: dict | None = None, empty: dict | None = None) -> dict:
         entries[f"{ENT_ALIAS_MAPPING}.{port}.0"] = (
             T_OID, f"1.3.6.1.2.1.2.2.1.1.{if_index}")
         if if_index in populated:
-            entries[f"{ENT_DESCR}.{module}"] = (T_OCTET_STRING, "10Gbase-LR SFP+")
+            module_descr, model_name = spec[1:] if isinstance(spec, tuple) \
+                else ("10Gbase-LR SFP+", "SFP-10G-LR")
+            entries[f"{ENT_DESCR}.{module}"] = (T_OCTET_STRING, module_descr)
             entries[f"{ENT_CLASS}.{module}"] = (T_INTEGER, 9)    # module
             entries[f"{ENT_CONTAINED_IN}.{module}"] = (T_INTEGER, cage)
-            entries[f"{ENT_MODEL_NAME}.{module}"] = (T_OCTET_STRING, "SFP-10G-LR")
+            entries[f"{ENT_MODEL_NAME}.{module}"] = (T_OCTET_STRING, model_name)
     return entries
+
+
+def if_mau_type(port_arcs: dict[int, int]) -> dict:
+    """ifMauType (MAU-MIB) rows: {if_index: arc} under
+    1.3.6.1.2.1.26.4, the medium a port's PHY reports — the proof
+    5.25.0's copper/fiber classification falls back on when a module's own
+    text is silent or ambiguous. Index is ifIndex.1, the lone MAU real
+    fixed-port and SFP-based interfaces both report themselves as."""
+    return {f"{IF_MAU_TYPE}.{if_index}.1": (T_OID, f"1.3.6.1.2.1.26.4.{arc}")
+            for if_index, arc in port_arcs.items()}
 
 
 def arc_objects(arc: int, extra_scalars: dict | None = None) -> dict:
@@ -1204,6 +1220,19 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     # lit on the other end, the case a -40 dBm reading must never alert on.
     entries.update(entity_sensors({access + 1: DOM_SENSORS,
                                    access + 2: DOM_SENSORS_DARK}))
+    # Two combo ports carry copper modules, not lasers: 5.25.0's fixture for
+    # the COP badge. access - 1 (GLC-T) reports no sensors at all — proven
+    # copper by module text alone; access (SFP-10G-T-S) additionally reports
+    # a lone temperature sensor, proving a temperature-only read must not
+    # earn a port the DOM badge. ifMauType backs both up (arc 30/54), and
+    # the uplink's real SR optic (access + 1) gets its own fiber arc so a
+    # MAU answer never overrides a proven laser either.
+    entries.update(sfp_cages(populated={
+        access - 1: (names[access - 2], "1000BaseT SFP", "GLC-T"),
+        access: (names[access - 1], "10GBase-T SFP+", "SFP-10G-T-S"),
+    }))
+    entries.update(entity_sensors({access: [DOM_SENSORS[0]]}))
+    entries.update(if_mau_type({access - 1: 30, access: 54, access + 1: 36}))
     entries.update(host_resources(1, [("Physical memory", 1024, 524288, 0.61)]))
     entries.update(arc_objects(9, {
         # CISCO-PROCESS-MIB cpmCPUTotal5minRev, one of the two objects an

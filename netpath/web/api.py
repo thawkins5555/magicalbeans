@@ -6561,7 +6561,7 @@ def get_nodes_reports_sfp(service, params, body) -> dict:
 def get_nodes_reports_sfp_export(service, params, body) -> dict:
     report = _sfp_report(service, params)
     csv_rows = [[r.device_id, r.name, r.ip, r.if_index, r.port, r.alias, r.kind,
-                r.media, r.oper_status, r.admin_status, r.speed_bps,
+                r.medium, r.media, r.oper_status, r.admin_status, r.speed_bps,
                 r.last_seen_ts, r.device] for r in report.rows]
     return _csv_response("sfp", reportmod.SFP_CSV_HEADER, csv_rows)
 

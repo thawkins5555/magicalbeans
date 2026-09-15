@@ -388,6 +388,34 @@ try:
 finally:
     stub.kill()
 
+# --- copper proof overrides "any sensor -> optic" (5.25.0) ---------------
+# The port above (a bare temperature sensor, no copper text anywhere) is
+# still 'optic': readings alone never imply copper. Here the module's own
+# text ALSO says copper (SFP-10G-T-S), so the same kind of reading -- one
+# temperature-only sensor, no optical-power row -- must badge 'copper'
+# instead, and still record sfp_temp_c: copper only changes the badge, not
+# what gets measured.
+stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_nodes_db("copper_temp")
+    did = device_against(db, "hw-copper")
+    db.replace_interfaces(did, [{"if_index": 9, "descr": "GigabitEthernet1/0/9"}])
+    poller = NodePoller(db)
+    device = db.device(did)
+    poller._poll_environment(did, device, db.effective_config(device), set(),
+                             time.time())
+    media = {r["if_index"]: r["media"] for r in db.interfaces(did)}
+    metrics = {m["key"]: m["last_value"] for m in db.metrics(did)}
+    check("a temperature-only sensor on a module whose text says copper "
+          "(SFP-10G-T-S) is badged 'copper', not 'optic'",
+          media.get(9) == "copper", media)
+    check("...and the temperature is still recorded under sfp_temp_c",
+          metrics.get("sfp_temp_c.9") == 35.0, sorted(metrics))
+    db.close()
+finally:
+    stub.kill()
+
 # --- a walk that answered nothing must never strip the badge --------------
 stub, port = spawn_stub("stub_agent_ups_env.py", "no_ups")
 nodepoll_mod.DEFAULT_SNMP_PORT = port

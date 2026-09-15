@@ -29,7 +29,12 @@ def check(name, ok, detail=""):
 PORTS = [{"if_index": 1, "descr": "GigabitEthernet1/0/1"},
         {"if_index": 2, "descr": "GigabitEthernet1/0/2", "alias": "uplink-a"},
         {"if_index": 3, "descr": "GigabitEthernet1/0/3"},
-        {"if_index": 4, "descr": "GigabitEthernet1/0/4"}]
+        {"if_index": 4, "descr": "GigabitEthernet1/0/4"},
+        {"if_index": 5, "descr": "TenGigabitEthernet1/0/5"}]
+
+SFP_CSV_HEADER_ROW = ["device_id", "name", "ip", "if_index", "port", "alias",
+                      "kind", "medium", "media", "oper_status", "admin_status",
+                      "speed_bps", "last_seen_ts", "device"]
 
 
 # ============================================================ 1. report.py
@@ -46,6 +51,7 @@ db.update_interface_media(sw1, [
     {"if_index": 2, "media": "sfp"},
     {"if_index": 3, "media": "sfp_empty"},
     # if_index 4 stays NULL -- a copper port, no cage at all.
+    {"if_index": 5, "media": "copper"},
 ])
 
 sw2 = db.add_device("10.60.0.2", "acc-sw-02", group_id=gid)
@@ -63,6 +69,12 @@ check("an optic port is a row",
       (sw1, 1) in by_key and by_key[(sw1, 1)].kind == "DOM", by_key.get((sw1, 1)))
 check("a plain sfp port is a row",
       (sw1, 2) in by_key and by_key[(sw1, 2)].kind == "SFP", by_key.get((sw1, 2)))
+check("a copper port is a row with kind 'COP'",
+      (sw1, 5) in by_key and by_key[(sw1, 5)].kind == "COP", by_key.get((sw1, 5)))
+check("medium is Laser for DOM/SFP, Copper for COP",
+      by_key[(sw1, 1)].medium == "Laser" and by_key[(sw1, 2)].medium == "Laser"
+      and by_key[(sw1, 5)].medium == "Copper",
+      {k: r.medium for k, r in by_key.items()})
 check("port label falls back to descr", by_key[(sw1, 1)].port == "GigabitEthernet1/0/1",
       by_key[(sw1, 1)].port)
 check("alias is carried through separately from port",
@@ -70,9 +82,9 @@ check("alias is carried through separately from port",
 check("device/ip carried through the same device_label chain firmware uses",
       by_key[(sw1, 1)].device == "acc-sw-01 (10.60.0.1)", by_key[(sw1, 1)])
 
-check("port_count is every row, dom/sfp counts split by kind",
-      result.port_count == 3 and result.dom_count == 2 and result.sfp_count == 1
-      and result.empty_count == 0, result.to_dict())
+check("port_count is every row, dom/sfp/copper counts split by kind",
+      result.port_count == 4 and result.dom_count == 2 and result.sfp_count == 1
+      and result.copper_count == 1 and result.empty_count == 0, result.to_dict())
 check("device_count is devices with >=1 row, not the whole fleet",
       result.device_count == 2, result.device_count)
 
@@ -80,10 +92,12 @@ with_empty = report.sfp_inventory(db, include_empty=True)
 check("include_empty adds the empty-cage row",
       (sw1, 3) in {(r.device_id, r.if_index) for r in with_empty.rows}, with_empty.to_dict())
 check("...counted separately as empty_count, port_count grows by one",
-      with_empty.empty_count == 1 and with_empty.port_count == 4, with_empty.to_dict())
-check("an empty cage's kind reads 'Empty cage'",
-      next(r for r in with_empty.rows if r.if_index == 3).kind == "Empty cage",
-      [r.kind for r in with_empty.rows])
+      with_empty.empty_count == 1 and with_empty.port_count == 5, with_empty.to_dict())
+check("an empty cage's kind reads 'Empty cage', medium is blank -- neither "
+      "copper nor laser until something is proven in it",
+      next(r for r in with_empty.rows if r.if_index == 3).kind == "Empty cage"
+      and next(r for r in with_empty.rows if r.if_index == 3).medium == "",
+      [(r.kind, r.medium) for r in with_empty.rows])
 
 narrowed = report.sfp_inventory(db, device_ids=[sw2])
 check("device_ids narrows the report to that device's ports only",
@@ -105,7 +119,7 @@ check("to_dict() is JSON-shaped all the way down",
       isinstance(payload["rows"], list) and isinstance(payload["rows"][0], dict)
       and set(payload["rows"][0]) == {
           "device_id", "name", "ip", "device", "if_index", "port", "alias",
-          "kind", "media", "oper_status", "admin_status", "speed_bps",
+          "kind", "medium", "media", "oper_status", "admin_status", "speed_bps",
           "last_seen_ts"},
       payload["rows"][0])
 
@@ -131,7 +145,8 @@ gid2 = nodes_db.ensure_default_group()
 rsw1 = nodes_db.add_device("10.61.0.1", "rep-sw-01", group_id=gid2)
 nodes_db.replace_interfaces(rsw1, PORTS)
 nodes_db.update_interface_media(rsw1, [
-    {"if_index": 1, "media": "optic"}, {"if_index": 2, "media": "sfp"}])
+    {"if_index": 1, "media": "optic"}, {"if_index": 2, "media": "sfp"},
+    {"if_index": 5, "media": "copper"}])
 rsw2 = nodes_db.add_device("10.61.0.2", "rep-sw-02", group_id=gid2)
 nodes_db.replace_interfaces(rsw2, PORTS[:1])
 nodes_db.update_interface_media(rsw2, [{"if_index": 1, "media": "sfp_empty"}])
@@ -141,29 +156,27 @@ now = time.time()
 subject, body, csv_text, filename = reportsched.render(service, sfp_row, now)
 check("kind 'sfp' is registered and renders without error",
       subject.startswith("SFP audit:"), subject)
-check("subject carries the port/device/DOM/SFP counts",
-      "2 port(s) on 1 device(s)" in subject and "1 DOM" in subject and "1 SFP" in subject,
+check("subject carries the port/device/DOM/SFP/COP counts",
+      "3 port(s) on 1 device(s)" in subject and "1 DOM" in subject
+      and "1 SFP" in subject and "1 COP" in subject,
       subject)
 check("body names the device with transceivers",
       "rep-sw-01" in body, body)
 check("empty cages are excluded from the default schedule render",
       "rep-sw-02" not in body, body)
 csv_lines = csv_text.lstrip("﻿").splitlines()
-check("CSV header matches the Reports subtab's own export",
-      csv_lines[0].split(",") == [
-          "device_id", "name", "ip", "if_index", "port", "alias", "kind",
-          "media", "oper_status", "admin_status", "speed_bps",
-          "last_seen_ts", "device"],
+check("CSV header matches the Reports subtab's own export, medium after kind",
+      csv_lines[0].split(",") == SFP_CSV_HEADER_ROW,
       csv_lines[0])
 check("one CSV row per transceiver port",
-      len(csv_lines) == 3, csv_lines)
+      len(csv_lines) == 4, csv_lines)
 check("filename is a .csv", filename.endswith(".csv"), filename)
 
 empty_row = {"kind": "sfp", "name": "SFP audit (with empties)",
             "params_json": json.dumps({"include_empty": True})}
 subject, body, csv_text, filename = reportsched.render(service, empty_row, now)
 check("include_empty=True in a schedule's params reaches the render",
-      "3 port(s) on 2 device(s)" in subject, subject)
+      "4 port(s) on 2 device(s)" in subject, subject)
 
 dgid = nodes_db.add_device_group("Access switches")
 nodes_db.update_device(rsw1, device_group_id=dgid)
@@ -171,7 +184,7 @@ group_row = {"kind": "sfp", "name": "Group only",
             "params_json": json.dumps({"device_group_id": dgid})}
 subject, _, _, _ = reportsched.render(service, group_row, now)
 check("device_group_id resolves through _device_ids_for_group like availability does",
-      "2 port(s) on 1 device(s)" in subject, subject)
+      "3 port(s) on 1 device(s)" in subject, subject)
 
 
 # ============================================================== 3. routes
@@ -215,11 +228,12 @@ admin = login(DEFAULT_USER, DEFAULT_PASSWORD)
 
 status, payload = call("GET", "/api/nodes/reports/sfp", token=admin)
 check("200, no device_ids -> the whole fleet's transceiver ports",
-      status == 200 and payload["port_count"] == 2, (status, payload))
+      status == 200 and payload["port_count"] == 3
+      and payload["copper_count"] == 1, (status, payload))
 
 status, payload = call("GET", "/api/nodes/reports/sfp?include_empty=1", token=admin)
 check("include_empty=1 also counts the empty cage",
-      status == 200 and payload["port_count"] == 3 and payload["empty_count"] == 1,
+      status == 200 and payload["port_count"] == 4 and payload["empty_count"] == 1,
       (status, payload))
 
 status, payload = call(
@@ -230,15 +244,15 @@ check("device_ids narrows the route the same way as report.py",
 
 status, payload = call("GET", "/api/nodes/reports/sfp/export.csv", token=admin)
 check("the server-side CSV route answers a csv/filename/count payload",
-      status == 200 and payload["count"] == 2
+      status == 200 and payload["count"] == 3
       and payload["filename"].endswith(".csv")
       and payload["csv"].splitlines()[0].lstrip("﻿") ==
-      "device_id,name,ip,if_index,port,alias,kind,media,oper_status,"
+      "device_id,name,ip,if_index,port,alias,kind,medium,media,oper_status,"
       "admin_status,speed_bps,last_seen_ts,device",
       (status, payload))
 check("...and honours include_empty too",
       call("GET", "/api/nodes/reports/sfp/export.csv?include_empty=1",
-          token=admin)[1]["count"] == 3, "")
+          token=admin)[1]["count"] == 4, "")
 
 # -------------------------------------------------------------- gates
 print("gates: nodes:read allowed, no grant refused (viewer 403 pattern)")
@@ -294,7 +308,7 @@ check("include_empty: \"false\" stores as the boolean False",
 group_row = nodes_db.report_schedule(group_sched_id)
 subject, _, _, _ = reportsched.render(service, group_row, now)
 check("the stored schedule's own render narrows to its saved device group",
-      "2 port(s) on 1 device(s)" in subject, subject)
+      "3 port(s) on 1 device(s)" in subject, subject)
 
 status, payload = call(
     "POST", "/api/nodes/reports/schedules",

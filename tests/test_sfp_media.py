@@ -36,7 +36,13 @@ PORTS = [{"if_index": 1, "descr": "GigabitEthernet1/0/1"},
          {"if_index": 4, "descr": "GigabitEthernet1/0/4"},
          {"if_index": 5, "descr": "GigabitEthernet1/0/5"},
          {"if_index": 6, "descr": "GigabitEthernet1/0/6"},
-         {"if_index": 7, "descr": "GigabitEthernet1/0/7"}]
+         {"if_index": 7, "descr": "GigabitEthernet1/0/7"},
+         {"if_index": 8, "descr": "GigabitEthernet1/0/8"},
+         {"if_index": 9, "descr": "GigabitEthernet1/0/9"},
+         {"if_index": 10, "descr": "GigabitEthernet1/0/10"},
+         {"if_index": 11, "descr": "GigabitEthernet1/0/11"}]
+
+IF_MAU_TYPE = "1.3.6.1.2.1.26.2.1.1.3"
 
 
 def check(name, ok, detail=""):
@@ -45,19 +51,23 @@ def check(name, ok, detail=""):
         FAILS.append(name)
 
 
-def stub_columns(port: int) -> set:
-    """The entPhysicalEntry columns the stub was asked for, over its own
-    control datagram -- the stub_agent_fdb.py convention every stub here
-    follows. A column is a whole table walk of cost every cadence, so which
-    ones are asked for is part of the contract, not an implementation
-    detail."""
+def stub_control(port: int, command: bytes) -> str:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(2.0)
-    sock.sendto(b"COLUMNS", ("127.0.0.1", port))
+    sock.sendto(command, ("127.0.0.1", port))
     try:
-        return set(sock.recv(4096).decode("utf-8", "replace").split())
+        return sock.recv(4096).decode("utf-8", "replace")
     finally:
         sock.close()
+
+
+def stub_columns(port: int) -> set:
+    """The entPhysicalEntry columns (and ifMauType) the stub was asked for,
+    over its own control datagram -- the stub_agent_fdb.py convention every
+    stub here follows. A column is a whole table walk of cost every cadence,
+    so which ones are asked for is part of the contract, not an
+    implementation detail."""
+    return set(stub_control(port, b"COLUMNS").split())
 
 
 def new_nodes_db(name: str) -> NodesDatabase:
@@ -105,6 +115,24 @@ try:
     check("a copper port the agent also models as container+port names no "
           "transceiver anywhere and stays unbadged",
           media.get(4) is None, media)
+    check("a copper module named by text alone ('1000BaseT SFP' / GLC-T), "
+          "no sensor at all, is 'copper'",
+          media.get(8) == "copper", media)
+    check("a copper module named by text, with a temperature-only sensor, "
+          "is still 'copper' -- medium wins over 'has a DOM reading'",
+          media.get(9) == "copper", media)
+    check("module text alone ('Transceiver module') cannot tell copper from "
+          "laser; ifMauType arc 30 (1000BASE-T) is what makes if 10 'copper'",
+          media.get(10) == "copper", media)
+    check("an optical module (real DOM Rx row) whose ifMauType answers a "
+          "fiber arc (36, 10GBASE-SR) is not downgraded: fiber proof still "
+          "leaves it 'optic'",
+          media.get(11) == "optic", media)
+
+    metrics = {m["key"]: m["last_value"] for m in db.metrics(did)}
+    check("a copper module's temperature sensor is still recorded -- "
+          "copper only changes the badge, not what gets measured",
+          metrics.get("sfp_temp_c.9") == 35.0, metrics.get("sfp_temp_c.9"))
 
     # Every column here is a full walk of entPhysical, every
     # _SENSOR_REFRESH_S, for every port-mapped device, so which ones are
@@ -116,6 +144,37 @@ try:
           "column, so what comes back is a dotted number, and no vendor's "
           "own name for a part reads as transceiver text either",
           ENT_VENDOR_TYPE not in columns, sorted(columns))
+    check("...and now also ifMauType, the MAU-MIB copper/fiber proof",
+          IF_MAU_TYPE in columns, sorted(columns))
+    db.close()
+finally:
+    stub.kill()
+
+# --- ifMauType's own probe-once-remember: noSuchObject is not re-walked --
+stub, port = spawn_stub("stub_agent_ups_env.py", "sfp_media_no_mau")
+nodepoll_mod.DEFAULT_SNMP_PORT = port
+try:
+    db = new_nodes_db("mau_reprobe")
+    did = device_against(db, "no-mau-sw")
+    db.replace_interfaces(did, PORTS)
+    poller = NodePoller(db)
+    t0 = time.time()
+    device = db.device(did)
+    poller._poll_environment(did, device, db.effective_config(device), set(), t0)
+    check("a device that answers nothing under ifMauType is still walked "
+          "once, to find that out",
+          IF_MAU_TYPE in stub_columns(port), stub_columns(port))
+
+    stub_control(port, b"RESET")
+    # Past _SENSOR_REFRESH_S (300 s) so the outer sensor-cadence gate reopens
+    # this poll, but well inside _SENSOR_REPROBE_S (3600 s) -- the window
+    # that matters here is ifMauType's own.
+    device = db.device(did)
+    poller._poll_environment(did, device, db.effective_config(device), set(),
+                             t0 + 301)
+    check("...and is not re-walked on the next poll inside the hourly "
+          "reprobe window, once it is known unsupported",
+          IF_MAU_TYPE not in stub_columns(port), stub_columns(port))
     db.close()
 finally:
     stub.kill()

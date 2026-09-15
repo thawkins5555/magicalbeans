@@ -1320,9 +1320,10 @@ class NodesDatabase(SqliteStore):
         # and refreshed by the same poll cycle rather than a table of its own.
         # media: 'optic' once a port-mapped ENTITY-SENSOR row proves a
         # transceiver with DOM, 'sfp' for a transceiver the ENTITY-MIB names
-        # but that reports no DOM, 'sfp_empty' for a cage with nothing in it,
-        # else NULL. Written by _poll_environment — IF-MIB has no media
-        # column of its own.
+        # but that reports no DOM, 'copper' for a BASE-T transceiver (module
+        # text or MAU-MIB proves it, and that proof outranks a DOM reading),
+        # 'sfp_empty' for a cage with nothing in it, else NULL. Written by
+        # _poll_environment — IF-MIB has no media column of its own.
         self.ensure_columns("interfaces", {
             "poe_admin": "TEXT", "poe_detect_status": "TEXT",
             "stp_state": "TEXT", "poe_power_mw": "INTEGER",
@@ -3201,12 +3202,12 @@ class NodesDatabase(SqliteStore):
 
     def interfaces_with_media(self, device_ids=None,
                               include_empty: bool = False) -> list[sqlite3.Row]:
-        """Every interface row carrying a transceiver (media = 'optic' or
-        'sfp'; also 'sfp_empty' cages when `include_empty`), joined to the
-        device columns a report needs to label and export it by. Excludes
-        purged devices the way device() does. `device_ids` narrows the
-        fleet; omitted, every device is considered."""
-        media_values = ["optic", "sfp"]
+        """Every interface row carrying a transceiver (media = 'optic',
+        'sfp' or 'copper'; also 'sfp_empty' cages when `include_empty`),
+        joined to the device columns a report needs to label and export it
+        by. Excludes purged devices the way device() does. `device_ids`
+        narrows the fleet; omitted, every device is considered."""
+        media_values = ["optic", "sfp", "copper"]
         if include_empty:
             media_values.append("sfp_empty")
         clauses = ["i.media IN ({})".format(",".join("?" * len(media_values))),

@@ -160,6 +160,32 @@ _TRANSCEIVER_TEXT = re.compile(
     r"\b(?:[cq]?sfp\d*|xfp|x2|gbic|xcvr|transceiver)\b|\bglc-|\bsfp-"
     r"|base-?(?:sx|lx|lh|zx|sr|lr|er|zr|bx)\b", re.I)
 
+# Copper proof for a cage/module _TRANSCEIVER_TEXT already matched -- a
+# fixed copper port that names none of the above never reaches this regex
+# at all, so it stays unbadged as before. BASE-T(X) form factors, the two
+# common copper SFP part-number families (Cisco GLC-T[E], the SFP-10G-T
+# family) and the generic copper/cat5e/6/6a words a vendor's own text uses.
+_COPPER_TEXT = re.compile(
+    r"\b(?:\d+g?base-?tx?|glc-te?|sfp-?10g-?t(?:-s|-x)?|rj-?45|copper"
+    r"|cat[56]a?)\b", re.I)
+
+# MAU-MIB (RFC 3636/4836) ifMauType's value is an OID; the last arc is a
+# dot3MauType. Text can be wrong or absent (an opaque part number, a cage
+# that names nothing), so a device that answers this MIB gets the last say
+# -- fiber wins a tie against ambiguous text (see _poll_environment).
+# Copper dot3MauTypes: 10/100/1000BASE-T(X) and -FD, 1000BASE-CX(-FD),
+# 10GBASE-CX4, 10GBASE-T.
+_COPPER_MAU_ARCS = frozenset({
+    5, 10, 11, 14, 15, 16, 19, 20, 27, 28, 29, 30, 41, 54,
+})
+# Fiber dot3MauTypes: the AUI/10BASE-F(B/L/P) family, 100BASE-FX(-FD),
+# 1000BASE-SX/LX(-FD), and every 10G/40G/100G dot3MauType this catalog
+# vintage defines.
+_FIBER_MAU_ARCS = frozenset({
+    3, 6, 7, 8, 12, 13, 17, 18,
+    *range(21, 27), *range(31, 41), *range(44, 54),
+})
+
 # dBm(14) says a sensor reads optical power but not which way the light is
 # going, so the direction comes out of the sensor's own name.
 _OPTIC_RX = re.compile(r"\b(rx|receive[d]?|input)\b", re.I)
@@ -1673,6 +1699,14 @@ class NodePoller(Worker):
         # device_id -> when the vendor table's own published thresholds
         # were last walked. See _SENSOR_THRESHOLD_REFRESH_S.
         self._vendor_sensor_threshold_read: dict[int, float] = {}
+        # device_id -> when ifMauType was last walked, and whether it
+        # answered anything -- its own probe-once-remember pair, same
+        # _SENSOR_REPROBE_S cadence as sensor_capable above, but in memory
+        # only: a routed/copper-only device with no ENTITY-SENSOR-MIB table
+        # at all still needs this walk gated so it costs one GET an hour,
+        # not one every _poll_environment cadence.
+        self._mau_read: dict[int, float] = {}
+        self._mau_capable: dict[int, bool] = {}
         # device_id -> when a sensor-diagnostic event was last written for
         # it. See _log_sensor_diag.
         self._sensor_diag_ts: dict[int, float] = {}
@@ -2127,6 +2161,7 @@ class NodePoller(Worker):
         self._sensor_threshold_read.pop(device_id, None)
         self._vendor_sensor_read.pop(device_id, None)
         self._vendor_sensor_threshold_read.pop(device_id, None)
+        self._mau_read.pop(device_id, None)
         # And "start from nothing": an explicit retry is the one place a
         # per-device cache is discarded on request. The operator is asking
         # for the attempt the scheduler would make with no history — the
@@ -2681,6 +2716,7 @@ class NodePoller(Worker):
                       self._addresses_read, self._bulk_repetitions,
                       self._sensor_read, self._sensor_threshold_read,
                       self._vendor_sensor_read, self._vendor_sensor_threshold_read,
+                      self._mau_read, self._mau_capable,
                       self._sensor_diag_ts, self._snmp_backoff,
                       self._snmp_failing_count, self._get_batch,
                       self._poll_cost):
@@ -5661,20 +5697,23 @@ class NodePoller(Worker):
 
     def _sfp_slot_media(self, device, config: dict, port_map: dict[int, int],
                         contained_in: dict[int, int], descrs: dict) -> tuple:
-        """({ifIndex: 'sfp' | 'sfp_empty'}, whether every walk it made
-        finished) for the transceiver cages this device describes. The DOM
-        scan cannot see these: a cage with nothing in it, or holding a
+        """({ifIndex: 'sfp' | 'sfp_empty' | 'copper'}, whether every walk it
+        made finished) for the transceiver cages this device describes. The
+        DOM scan cannot see these: a cage with nothing in it, or holding a
         transceiver that reports no sensors, has no sensor row to be found
         by, and until 5.2.0 an SFP slot like that was indistinguishable from
         a copper port.
 
         'sfp' is an entity whose own entPhysical text names a transceiver
         (the module plugged into a cage, or a port an agent puts that text
-        on directly); 'sfp_empty' is a container(5) that says it is a
-        transceiver cage and holds nothing that does. A container that names
-        nothing is left alone rather than guessed at: some platforms give
-        every copper port one too, and a copper port must never wear an SFP
-        badge.
+        on directly); 'copper' is the same, except the text ALSO names a
+        copper form factor (_COPPER_TEXT) -- a BASE-T SFP is still a
+        transceiver, just not an optical one; 'sfp_empty' is a container(5)
+        that says it is a transceiver cage and holds nothing that does. A
+        container that names nothing is left alone rather than guessed at:
+        some platforms give every copper port one too, and a copper port
+        must never wear an SFP badge from text alone (see _poll_environment
+        for the MAU-MIB proof that can still badge one).
 
         The completeness flag is the caller's to act on, and it must: a walk
         cut short answers with what it had reached, which reads as a cage
@@ -5699,6 +5738,10 @@ class NodePoller(Worker):
             return any(_TRANSCEIVER_TEXT.search(str(column.get(entity) or ""))
                        for column in (by_descr, models))
 
+        def names_copper(entity: int) -> bool:
+            return any(_COPPER_TEXT.search(str(column.get(entity) or ""))
+                       for column in (by_descr, models))
+
         def descendants(root: int) -> list[int]:
             found: list[int] = []
             queue, depth = list(children.get(root, ())), 0
@@ -5718,7 +5761,8 @@ class NodePoller(Worker):
                 # The cage's own text names it either way, so only something
                 # OTHER than the container proves one is occupied.
                 if names_transceiver(entity) and entity in port_map:
-                    media[port_map[entity]] = "sfp"
+                    media[port_map[entity]] = (
+                        "copper" if names_copper(entity) else "sfp")
                 continue
             if not names_transceiver(entity):
                 continue
@@ -5728,8 +5772,12 @@ class NodePoller(Worker):
                              if e in port_map), None)
             if if_index is None:
                 continue
-            if any(names_transceiver(child) for child in descendants(entity)):
-                media[if_index] = "sfp"
+            occupants = [child for child in descendants(entity)
+                        if names_transceiver(child)]
+            if occupants:
+                copper = names_copper(entity) or any(
+                    names_copper(child) for child in occupants)
+                media[if_index] = "copper" if copper else "sfp"
             else:
                 media.setdefault(if_index, "sfp_empty")
         return media, complete
@@ -6251,7 +6299,11 @@ class NodePoller(Worker):
         worst-of; there is deliberately no device-level `sfp_*` key, since a
         chassis has no one true Rx power. The same mapping writes
         interfaces.media, rewritten only when the walk answered, so a
-        timeout never strips the badge.
+        timeout never strips the badge. interfaces.media also gains
+        'copper' (5.25.0) for a BASE-T transceiver — module text
+        (_sfp_slot_media) or MAU-MIB ifMauType (this method, below) — which
+        outranks a DOM reading: a copper module's own temperature sensor is
+        still recorded, it just does not make the port read as optical.
 
         Best-effort, gated twice: nothing runs inside the cadence window
         (_SENSOR_REFRESH_S normally, _SENSOR_REPROBE_S — a cheap hourly
@@ -6311,6 +6363,39 @@ class NodePoller(Worker):
             if port_map else ({}, True))
         slots_complete = slots_complete and descrs_done
 
+        # MAU-MIB: the module text's copper proof, checked against the wire.
+        # Gated the same as the cage scan above (an empty port map means
+        # nothing here maps to anything), and separately probe-once-
+        # remember'd (_mau_read/_mau_capable) so a device that has never
+        # answered it is not asked every _SENSOR_REFRESH_S forever -- only
+        # once an hour, the same reprobe _sensor_capable gets.
+        mau_copper_ports: set[int] = set()
+        mau_fiber_ports: set[int] = set()
+        if port_map:
+            mau_capable = self._mau_capable.get(device_id)
+            due = now - self._mau_read.get(device_id, 0.0) >= self._SENSOR_REPROBE_S
+            if mau_capable is not False or due:
+                self._mau_read[device_id] = now
+                raw_mau, mau_complete = self._walk_column_status(
+                    device, config, nodeoids.IF_MAU_TYPE)
+                if raw_mau:
+                    self._mau_capable[device_id] = True
+                    for suffix, value in raw_mau.items():
+                        try:
+                            if_index = int(str(suffix).split(".")[0])
+                            arc = int(str(value).rsplit(".", 1)[-1])
+                        except (TypeError, ValueError):
+                            continue
+                        if arc in _COPPER_MAU_ARCS:
+                            mau_copper_ports.add(if_index)
+                        elif arc in _FIBER_MAU_ARCS:
+                            mau_fiber_ports.add(if_index)
+                elif mau_complete and mau_capable is None:
+                    # A clean empty walk (endOfMibView straight away, not a
+                    # timeout) is the noSuchObject verdict: this device does
+                    # not have the column, so stop asking every cadence.
+                    self._mau_capable[device_id] = False
+
         has_humidity = any(int(types.get(suffix) or 0) == self._SENSOR_TYPE_HUMIDITY
                            for suffix in sensor_values)
 
@@ -6341,7 +6426,8 @@ class NodePoller(Worker):
             if_index = port_map.get(entity)
             if if_index is not None:
                 # A failed optic is still an optic: any sensor resolving to
-                # a port is proof one is there, whatever it reads.
+                # a port is proof one is there, whatever it reads -- unless
+                # copper proof (module text or MAU-MIB) overrides it below.
                 optic_ports.add(if_index)
             root = self._sfp_root_for(sensor_type, suffix, names, descrs)
             if if_index is not None and root is not None:
@@ -6437,23 +6523,36 @@ class NodePoller(Worker):
                             unit, "gauge", now, worst))
         if samples:
             self.db.record_metric_samples(device_id, samples)
-        # DOM sensors win over anything the entity table says about the cage:
-        # a port with readings is an optic whatever it is plugged into.
+        # copper_ports: module text (_sfp_slot_media already returned
+        # 'copper') union MAU-MIB copper arcs, minus MAU-MIB fiber arcs --
+        # the wire beats an ambiguous part number, per port.
+        copper_ports = ((
+            {if_index for if_index, media in sfp_slots.items()
+             if media == "copper"} | mau_copper_ports)
+            - mau_fiber_ports)
+        # DOM sensors win over anything the entity table says about the cage
+        # -- unless copper proof says otherwise: a BASE-T module with a
+        # temperature-only sensor is still copper, medium wins over "has
+        # readings". Precedence: copper > optic (any port-mapped sensor) >
+        # whatever the cage scan alone decided.
         media_by_if = dict(sfp_slots)
         media_by_if.update({if_index: "optic" for if_index in optic_ports})
+        media_by_if.update({if_index: "copper" for if_index in copper_ports})
         if not slots_complete:
             # A walk cut short is not evidence of anything: a cage it never
             # reached reads as absent, and a module it never reached reads
             # as an empty cage, so the pass would strip or downgrade every
-            # SFP badge on a device that is merely slow -- and restore them
-            # next cadence, flickering the list every five minutes. Only a
-            # port this poll's own sensors proved is an optic may overwrite
-            # what is stored.
+            # SFP/copper badge on a device that is merely slow -- and
+            # restore them next cadence, flickering the list every five
+            # minutes. Only a port THIS poll's own sensors or MAU-MIB proved
+            # is optic/copper may overwrite what is stored.
             for row in interfaces:
                 stored = row["media"] if "media" in row.keys() else None
-                if (stored in ("sfp", "sfp_empty")
-                        and media_by_if.get(row["if_index"]) != "optic"):
-                    media_by_if[row["if_index"]] = stored
+                if_index = row["if_index"]
+                if (stored in ("sfp", "sfp_empty", "copper")
+                        and if_index not in optic_ports
+                        and if_index not in copper_ports):
+                    media_by_if[if_index] = stored
         media_rows = [{"if_index": if_index, "media": media}
                       for if_index, media in sorted(media_by_if.items())]
         media_rows += [{"if_index": row["if_index"], "media": None}

@@ -830,7 +830,68 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         `unexpected SFP report summary: "${summary}"`);
       const exportVisible = await page.isVisible('#nd-rep-sfp-export-csv');
       assert(exportVisible, 'Export CSV button is not visible on the SFP report');
+
+      // Copper transceivers (5.25.0): the demo access switches carry two
+      // seeded combo ports, but nodepoll's environment poll (300s cadence)
+      // may not have classified them yet by the time this check runs -- poll
+      // Run rather than racing it.
+      let copSummary = summary;
+      let copCell = await page.$('#nd-rep-sfp-table .badge-cop');
+      const copDeadline = Date.now() + 30000;
+      while (!copCell && Date.now() < copDeadline) {
+        await sleep(2000);
+        const rerun = page.waitForResponse((response) =>
+          response.url().includes('/api/nodes/reports/sfp')
+          && !response.url().includes('export.csv')
+          && response.request().method() === 'GET', { timeout: 10000 });
+        await page.click('#nd-rep-sfp-run');
+        await rerun;
+        await page.waitForFunction(
+          () => (document.querySelector('#nd-rep-sfp-summary') || {}).textContent.trim().length > 0,
+          { timeout: 10000 });
+        copSummary = await page.locator('#nd-rep-sfp-summary').textContent();
+        copCell = await page.$('#nd-rep-sfp-table .badge-cop');
+      }
+      assert(copCell,
+        'expected a .badge-cop cell in the SFP report table within 30s of polling Run');
+      assert(/\d+ COP/.test(copSummary || ''),
+        `expected the SFP report summary to name a COP count, got "${copSummary}"`);
       return `summary "${summary.trim()}"`;
+    });
+
+  await check('the Nodes interface list shows a COP badge for a copper transceiver (5.25.0)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await page.waitForSelector('#modal[hidden]', { state: 'attached', timeout: 5000 }).catch(() => {});
+      await selectTab(page, 'nodes');
+      await settle(page, 800);
+      await page.click('#page-nodes > .subtabs > .subtab[data-subtab="devices"]').catch(() => {});
+      // acc-sw-001 is the demo fleet's first ordinary cisco_access instance
+      // (personas.fleet_plan's naming), and every cisco_access persona now
+      // seeds two copper combo ports -- see demo/personas.py's
+      // _build_cisco_access.
+      const row = page.locator('#nodes-table tbody tr', { hasText: 'acc-sw-001' }).first();
+      const found = await row.count() > 0;
+      if (!found) return 'skipped: acc-sw-001 is not in this fleet';
+      await row.click();
+      const hasRow = await page.waitForSelector('#nd-if-table tbody tr', { timeout: 20000 })
+        .then(() => true).catch(() => false);
+      if (!hasRow) return 'skipped: acc-sw-001 lists no interfaces';
+      await page.waitForResponse((res) => new URL(res.url()).pathname.endsWith('/interfaces')
+        && res.request().method() === 'GET', { timeout: 5000 }).catch(() => {});
+      await sleep(500);
+
+      // Same tolerance as the SFP report check above: give the environment
+      // poll up to 30s to have classified the seeded copper ports.
+      let cell = await page.$('#nd-if-table .badge-cop');
+      const deadline = Date.now() + 30000;
+      while (!cell && Date.now() < deadline) {
+        await sleep(2000);
+        cell = await page.$('#nd-if-table .badge-cop');
+      }
+      assert(cell,
+        'expected #nd-if-table to carry a .badge-cop cell for acc-sw-001 within 30s');
+      return 'COP badge present';
     });
 
   await check('the NetFlow export CSV starts with a readable start/end pair (A1)',

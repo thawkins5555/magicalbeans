@@ -1329,9 +1329,10 @@
 
   // r.media is written by nodepoll's environment poll. Prepended to the
   // descr cell rather than given a column of its own so it is visible in
-  // the default column set. DOM and SFP are told apart because they answer
+  // the default column set. DOM/SFP/COP are told apart because they answer
   // different questions: DOM says this port's light levels can be alerted
-  // on, SFP only says there is a cage there.
+  // on, SFP only says there is a laser cage there, COP says the cage (or
+  // fixed port) is copper — no light levels ever apply.
   function sfpBadge(r) {
     if (r.media === 'optic') {
       return '<span class="badge badge-dom" title="Optical transceiver ' +
@@ -1340,7 +1341,11 @@
     if (r.media === 'sfp' || r.media === 'sfp_empty') {
       return '<span class="badge badge-sfp" title="' + (r.media === 'sfp_empty'
         ? 'SFP cage, nothing plugged into it'
-        : 'SFP transceiver, reporting no DOM sensors') + '">SFP</span> ';
+        : 'Optical transceiver, reporting no DOM sensors') + '">SFP</span> ';
+    }
+    if (r.media === 'copper') {
+      return '<span class="badge badge-cop" title="Copper transceiver ' +
+        '(BASE-T); no light levels">COP</span> ';
     }
     return '';
   }
@@ -1751,9 +1756,12 @@
         // Only ever an upgrade: the live read proves DOM on the ports it
         // names, and says nothing about the ports it does not — a stored
         // 'sfp' cage must not be downgraded by a read that never looked
-        // for one.
+        // for one. A stored 'copper' row is never upgraded at all: a
+        // temperature-only reading off a COP port must not earn it DOM,
+        // so the live read has to name an optical-power (dBm) row for
+        // that port, not merely any sensor.
         dialogIfaces.forEach((r) => {
-          if (dialogOptics.has(r.if_index)) r.media = 'optic';
+          if (r.media !== 'copper' && dialogOptics.has(r.if_index)) r.media = 'optic';
         });
       }
       // Opening a port from here replaces this dialog — there is only one
@@ -1853,7 +1861,10 @@
             `<td>${escape(s.label)}</td>${domValueCell(s)}${domLimitsCell(s)}` +
             `<td>${escape(s.status)}</td></tr>`).join('') + '</tbody></table>' +
           domLimitsHint(rows);
-        dialogOptics = new Set(rows.map((s) => s.if_index));
+        // Only a light-level row proves DOM — see paintDialogIfaces' guard
+        // above; a copper port's own temperature/voltage readings must
+        // never earn it one just for being present.
+        dialogOptics = new Set(rows.filter((s) => s.unit === 'dBm').map((s) => s.if_index));
         paintDialogIfaces();
       })
       .catch(() => {
@@ -4260,6 +4271,7 @@
       cell: (r) => escape(r.port || `port ${r.if_index}`) },
     { key: 'alias', label: 'Alias', width: 150, cell: (r) => escape(r.alias || '—') },
     { key: 'kind', label: 'Kind', width: 90, cell: (r) => sfpBadge(r) },
+    { key: 'medium', label: 'Medium', width: 80, cell: (r) => escape(r.medium || '') },
     { key: 'oper_status', label: 'Oper', width: 80,
       cell: (r) => `<span style="color:${r.oper_status === 'up' ? 'var(--ok)'
         : r.oper_status === 'down' ? 'var(--fail)' : 'var(--line)'}">` +
@@ -4322,14 +4334,14 @@
       drawSfpReportTable();
       App.setText(App.el('nd-rep-sfp-summary'),
         `${result.port_count} port(s) on ${result.device_count} device(s) · ` +
-        `${result.dom_count} DOM · ${result.sfp_count} SFP` +
+        `${result.dom_count} DOM · ${result.sfp_count} SFP · ${result.copper_count} COP` +
         (result.empty_count ? ` · ${result.empty_count} empty` : ''));
       return result;
     })());
   }
 
   const SFP_CSV_HEADER = ['device_id', 'name', 'ip', 'if_index', 'port', 'alias', 'kind',
-    'media', 'oper_status', 'admin_status', 'speed_bps', 'last_seen_ts', 'device'];
+    'medium', 'media', 'oper_status', 'admin_status', 'speed_bps', 'last_seen_ts', 'device'];
 
   function exportSfpReportCsv() {
     const report = view.repSfp;
@@ -4338,7 +4350,7 @@
       return;
     }
     const rows = report.rows.map((r) => [r.device_id, r.name, r.ip, r.if_index, r.port,
-      r.alias, r.kind, r.media, r.oper_status, r.admin_status, r.speed_bps,
+      r.alias, r.kind, r.medium, r.media, r.oper_status, r.admin_status, r.speed_bps,
       r.last_seen_ts, r.device]);
     saveReportCsv(`sfp-${App.isoLocal(report.generated_ts).slice(0, 10)}.csv`,
       SFP_CSV_HEADER, rows);
