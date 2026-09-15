@@ -50,9 +50,23 @@ traceroute, the prune-lock timing check, IPv6 in the web-gates test),
 and the browser walk passed 77 of 77 with no console, page or HTTP
 errors as admin or viewer. Main had moved on to 5.25.0 (copper SFP
 badge) while this was built, so the branch was rebased onto it and the
-release renumbered 5.26.0. Javariius review: JAVARIIUS_PLACEHOLDER
+release renumbered 5.26.0. Javariius reviewed once and returned "not
+ready" with one blocker (a placeholder left in this file) and six
+should-fix items, all taken before push: the trap re-read matched two
+whole Cisco notification arcs instead of the six power OIDs and had no
+throttle (now exact-match, debounced to once a minute per device); a
+timed-out static-column walk was cached empty for five minutes (now
+only a complete answer is cached, with tests for the empty, TTL and
+eviction cases); the one-time upgrade alert burst on long-removed bays
+was undocumented (now in the changelog with the hand-resolve remedy and
+a never-fitted-bay hardware check); comment density over the 20% rule
+(trimmed); the stale `psu_state` scale comment in `alertsdb.py`; and a
+full-suite run on the rebased head. Nits noted and left: the alert text
+reads the raw `3.0` (only the sensors table words it), one extra
+metrics SELECT per poll per PSU device.
 → Stephen_King. `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md` written
-for 5.26.0 against the actual diff (`854c7e8..HEAD`); no code touched.
+for 5.26.0 against the actual diff (`origin/main..HEAD`); no code touched.
+
 ## 5.25.0 — SFP copper/laser identification
 
 **Operator prompt, two items:**

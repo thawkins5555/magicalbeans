@@ -118,6 +118,20 @@ except Exception:
 check("a poll_now that raises does not propagate",
       not raised and rec.calls == [7])
 
+rec = _Recorder()
+coll = collector(nodes, rec)
+coll._power_trap_reread(Trap(trap_oid="1.3.6.1.4.1.9.9.13.3.0.9", source="10.0.0.1"))
+coll._power_trap_reread(Trap(trap_oid="1.3.6.1.4.1.9.9.13.3.0.9", source="10.0.0.1"))
+check("a second power trap inside POWER_TRAP_REREAD_S is debounced", rec.calls == [7], rec.calls)
+coll._power_reread_ts[7] = 0.0
+coll._power_trap_reread(Trap(trap_oid="1.3.6.1.4.1.9.9.117.2.0.4", source="10.0.0.1"))
+check("...and fires again once the window has passed", rec.calls == [7, 7], rec.calls)
+
+rec = _Recorder()
+collector(nodes, rec)._power_trap_reread(
+    Trap(trap_oid="1.3.6.1.4.1.9.9.13.3.0.4", source="10.0.0.1"))
+check("an ENVMON fan notification does not trigger a re-read", rec.calls == [], rec.calls)
+
 print()
 if FAILS:
     print(f"{len(FAILS)} check(s) failed: {', '.join(FAILS)}")

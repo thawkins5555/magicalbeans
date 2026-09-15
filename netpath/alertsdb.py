@@ -847,7 +847,8 @@ _BUILTIN_RULES = [
     # temp_sensor_c), or against its own status enum where a vendor
     # exposes only that; the chassis pair above stays as the fallback for
     # a device with neither (alertrules.FALLBACK_OF). psu_state is 0 ok,
-    # 1 degraded, 2 failed or no input; an empty bay writes nothing.
+    # 1 degraded, 2 failed or no input, 3 not present after being seen; an
+    # empty bay writes nothing.
     ("temp_sensor_high", "Sensor temperature high (device limit)", "threshold", "temp_sensor_c", 4, "threshold_breach", None, None, 2),
     ("temp_sensor_critical", "Sensor temperature critical (device limit)", "threshold", "temp_sensor_c", 2, "threshold_breach", None, None, 2),
     ("temp_sensor_state_warning", "Sensor reports temperature warning", "threshold", "temp_sensor_state", 4, "threshold_breach", 1.0, 1.0, 1),

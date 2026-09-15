@@ -2317,8 +2317,11 @@ alerts and optionally emailing about them.
   default severity in the SNMP Trap Log and its rules (four Critical,
   a FRU removal Error, a FRU insertion Notice), and receiving any of
   them from a managed device triggers an immediate re-read of that
-  device, so the alert opens — or clears, on recovery — within one
-  poll instead of trailing the cadence.
+  device (at most once a minute per device), so the alert opens — or
+  clears, on recovery — within one poll instead of trailing the
+  cadence. Upgrading writes the new state once onto every bay that was
+  removed before this release, so expect one alert per such bay on the
+  first poll; resolve them by hand.
 - **Three of those 35 are new in 4.39.0**, and each one reports a failure
   that previously had nobody to report it. `snmp_failing_ping_ok` fires
   when a device answers ping while its SNMP agent has stopped answering —

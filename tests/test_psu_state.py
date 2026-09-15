@@ -262,6 +262,36 @@ poller_nc._poll_vendor_sensors(10, dev_nc2, CONFIG, 1_700_000_060.0)
 check("cadence: a latched-incapable device walks nothing on the second call, 60s later",
       walked_nc == [], walked_nc)
 
+# ------------------------------------------------ static-column cache rules
+walked_c = []
+cols_c = {envmon.state: {"1": 1}, envmon.name: {}}   # name walk timed out
+poller_c = new_poller()
+poller_c._walk_column = recording_walker(cols_c, walked_c)
+dev_c = device(CISCO_OID, vendor_sensor_capable=True, id=11)
+poller_c._poll_vendor_sensors(11, dev_c, CONFIG, 1_700_000_000.0)
+check("cache: an empty static walk is not cached",
+      (11, envmon.state) not in poller_c._vendor_psu_static, poller_c._vendor_psu_static)
+cols_c[envmon.name] = {"1": "PSU1"}
+walked_c.clear()
+poller_c._poll_vendor_sensors(11, dev_c, CONFIG, 1_700_000_060.0)
+check("cache: the name column is walked again on the next poll after an empty answer",
+      envmon.name in walked_c, walked_c)
+check("cache: a full answer is cached",
+      (11, envmon.state) in poller_c._vendor_psu_static)
+walked_c.clear()
+poller_c._poll_vendor_sensors(11, dev_c, CONFIG, 1_700_000_120.0)
+check("cache: inside the TTL the name column is not walked", envmon.name not in walked_c, walked_c)
+walked_c.clear()
+poller_c._poll_vendor_sensors(11, dev_c, CONFIG, 1_700_000_060.0 + 300.0)
+check("cache: after _SENSOR_REFRESH_S the name column is walked again",
+      envmon.name in walked_c, walked_c)
+poller_c._forget_vendor_psu_static(11)
+check("cache: _forget_vendor_psu_static drops the device's entries",
+      not any(k[0] == 11 for k in poller_c._vendor_psu_static))
+walked_c.clear()
+poller_c._poll_vendor_sensors(11, dev_c, CONFIG, 1_700_000_400.0)
+check("cache: a dropped entry is rebuilt on the next poll", envmon.name in walked_c, walked_c)
+
 print()
 if FAILS:
     print(f"{len(FAILS)} check(s) failed: {', '.join(FAILS)}")

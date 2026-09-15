@@ -1687,8 +1687,7 @@ class NodePoller(Worker):
         # device_id -> when the vendor temperature table was last walked
         # (_poll_vendor_sensors); PSU state is not gated by it.
         self._vendor_sensor_read: dict[int, float] = {}
-        # (device_id, PsuTable.state) -> the table's static columns, cached
-        # for _SENSOR_REFRESH_S so only the state column walks every poll.
+        # (device_id, PsuTable.state) -> static PSU columns, _SENSOR_REFRESH_S TTL.
         self._vendor_psu_static: dict[tuple, dict] = {}
         # device_id -> when the vendor table's own published thresholds
         # were last walked. See _SENSOR_THRESHOLD_REFRESH_S.
@@ -2713,8 +2712,7 @@ class NodePoller(Worker):
                       self._poll_cost):
             for device_id in [k for k in list(cache) if k not in keep]:
                 cache.pop(device_id, None)
-        # _vendor_psu_static is keyed by (device_id, table.state), not bare
-        # device_id, so it does not fit the loop above.
+        # Tuple-keyed, so not in the loop above.
         for cache_key in [k for k in list(self._vendor_psu_static)
                           if k[0] not in keep]:
             self._vendor_psu_static.pop(cache_key, None)
@@ -6063,8 +6061,7 @@ class NodePoller(Worker):
     # table at all. An hour bounds how long that mistake can last.
     _SENSOR_REPROBE_S = 3600.0
 
-    # psu_state for a bay seen before that now reads not-present: removed,
-    # or unpowered so its management bus vanished. psu_failed (>= 2) opens.
+    # psu_state for a bay seen before that now reads not-present (>= 2 alerts).
     _PSU_STATE_ABSENT = 3.0
 
     # How often the published-threshold walk runs, against _SENSOR_REFRESH_S's
@@ -6607,10 +6604,8 @@ class NodePoller(Worker):
         overwriting the other's reading. PSU_TABLES has no such overlap —
         ENTITY-SENSOR-MIB carries no PSU state at all — so it always runs.
 
-        Temperature keeps the _SENSOR_REFRESH_S/_SENSOR_REPROBE_S cadence.
-        PSU state is read on every poll (latched-incapable devices aside)
-        so a lost supply alerts within one poll interval; the table's
-        static columns stay cached on the cadence (_vendor_psu_rows).
+        Temperature keeps the _SENSOR_REFRESH_S/_SENSOR_REPROBE_S cadence;
+        PSU state is read on every poll (latched-incapable devices aside).
         """
         if not config.get("snmp_enabled", True):
             return
@@ -6671,10 +6666,8 @@ class NodePoller(Worker):
             for idx, row in rows.items():
                 key = f"psu_state.{idx}"
                 if row["state"] is None:
-                    # Not present this poll. A key that never existed stays
-                    # that way (an empty bay must never alert); one seen
-                    # present before gets _PSU_STATE_ABSENT so a supply that
-                    # disappears opens psu_failed instead of reading ok.
+                    # Not present: a bay never seen stays silent, one seen
+                    # before writes _PSU_STATE_ABSENT so psu_failed opens.
                     if key in existing:
                         samples.append((key, row["label"], "state", "gauge",
                                         now, self._PSU_STATE_ABSENT))
@@ -6758,7 +6751,8 @@ class NodePoller(Worker):
         """idx -> {"label", "state" (0/1/2, or None to skip/clear)} for one
         nodeoids.PsuTable. See _poll_vendor_sensors for what a None state
         means to the caller. The state column is walked every call; the
-        class/skip/name columns are cached for _SENSOR_REFRESH_S.
+        class/skip/name columns are cached for _SENSOR_REFRESH_S, but only
+        once every one of them answered (a timed-out walk is not a fact).
         """
         device_id = device["id"]
         cache_key = (device_id, table.state)
@@ -6766,6 +6760,7 @@ class NodePoller(Worker):
         if cached is not None and now - cached["ts"] < self._SENSOR_REFRESH_S:
             class_map, skip_map, names = cached["class_map"], cached["skip_map"], cached["names"]
         else:
+            self._vendor_psu_static.pop(cache_key, None)
             class_map = ({_flatten_vendor_idx(k): v for k, v in
                           self._walk_column(device, config, table.class_col).items()}
                          if table.class_col else {})
@@ -6775,8 +6770,11 @@ class NodePoller(Worker):
             names = ({_flatten_vendor_idx(k): v for k, v in
                       self._walk_column(device, config, table.name).items()}
                      if table.name else {})
-            self._vendor_psu_static[cache_key] = {
-                "class_map": class_map, "skip_map": skip_map, "names": names, "ts": now}
+            if all(m for col, m in ((table.class_col, class_map),
+                                    (table.skip_when_col, skip_map),
+                                    (table.name, names)) if col):
+                self._vendor_psu_static[cache_key] = {
+                    "class_map": class_map, "skip_map": skip_map, "names": names, "ts": now}
         rows: dict[str, dict] = {}
         states = {_flatten_vendor_idx(k): v for k, v in
                   self._walk_column(device, config, table.state).items()}

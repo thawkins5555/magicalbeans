@@ -196,6 +196,17 @@ denied by the power budget (`offAdmin`/`offDenied`) now maps to
 warning rather than being silently ignored. Device Details' per-sensor
 table shows the new state as "not present (removed or no input)".
 
+**Expect a one-time burst on the first poll after upgrading.** Metric
+keys are never deleted, so every bay that reported once and has since
+been permanently removed still carries its `psu_state` key; the first
+poll writes 3 to each of those and **Power supply failed** opens for
+all of them together. Resolve each by hand — it stays closed until that
+bay reports again. Two things to check on your own hardware afterwards:
+a chassis with a never-fitted bay should stay quiet (some IOS-XE
+platforms keep a powerSupply row for an empty slot reading
+`offEnvOther`, which this release counts as no input), and a supply
+whose cord is pulled should show as failed within one poll.
+
 **Cisco power-supply traps are named, rated, and now trigger an
 immediate re-read.** Six ENVMON/FRU OIDs that used to show up in the
 SNMP Trap Log as bare numbers now resolve to their real names and enum
@@ -204,11 +215,12 @@ values: `ciscoEnvMonShutdownNotification`,
 `ciscoEnvMonSuppStatusChangeNotif` and `cefcPowerStatusChange` default
 to Critical severity, `cefcFRURemoved` to Error, `cefcFRUInserted` to
 Notice — so the shipped "Critical SNMP trap received" rule fires on
-them with no admin-side rule to write by hand. Receiving any of the six
-from a managed device now also triggers an immediate poll of that
-device, so the stateful PSU alert opens — or clears, since a
-status-change trap also arrives on recovery — within one poll instead
-of trailing the five-minute cadence.
+them with no admin-side rule to write by hand. Receiving any of those
+six exact OIDs from a managed device now also triggers an immediate
+poll of that device (at most once a minute per device, so a trap storm
+cannot keep it on back-to-back walks), so the stateful PSU alert opens
+— or clears, since a status-change trap also arrives on recovery —
+within one poll instead of trailing the five-minute cadence.
 
 Files: `netpath/nodeoids.py`, `netpath/nodepoll.py`,
 `netpath/snmptrapd.py`, `netpath/trapdecode.py`, `netpath/web/api.py`,

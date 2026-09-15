@@ -22,10 +22,12 @@ from .worker import ago
 BATCH = 200
 FLUSH_S = 1.0
 
-# ENVMON supply notifications and FRU power-status traps: a device sending
-# either one gets its PSU state re-read within one poll instead of trailing
-# by a full cadence interval.
-POWER_TRAP_PREFIXES = ("1.3.6.1.4.1.9.9.13.3.0", "1.3.6.1.4.1.9.9.117.2.0")
+# Cisco supply/power traps that trigger an immediate PSU re-read, at most
+# once per device per POWER_TRAP_REREAD_S.
+POWER_TRAP_OIDS = frozenset({
+    "1.3.6.1.4.1.9.9.13.3.0.1", "1.3.6.1.4.1.9.9.13.3.0.5", "1.3.6.1.4.1.9.9.13.3.0.9",
+    "1.3.6.1.4.1.9.9.117.2.0.2", "1.3.6.1.4.1.9.9.117.2.0.3", "1.3.6.1.4.1.9.9.117.2.0.4"})
+POWER_TRAP_REREAD_S = 60.0
 
 
 class TrapCollector(udpsock.UdpReceiver):
@@ -47,10 +49,9 @@ class TrapCollector(udpsock.UdpReceiver):
         # agent-address is recorded as another address of the sending device,
         # so the next message from that address correlates by name.
         self.nodes_db = nodes_db
-        # Optional: callable(device_id) that triggers an immediate poll —
-        # wired to NodePoller.poll_now so a power trap re-reads PSU state
-        # instead of waiting out the cadence.
+        # Optional callable(device_id): NodePoller.poll_now, for power traps.
         self.poll_now = poll_now
+        self._power_reread_ts: dict[int, float] = {}
         self.on_batch = on_batch
         self.decoder = Decoder()
         # The v3 users' passwords are not in the settings text the decoder is
@@ -231,22 +232,21 @@ class TrapCollector(udpsock.UdpReceiver):
             self._note_error(exc)
 
     def _power_trap_reread(self, trap) -> None:
-        """A Cisco ENVMON/FRU power trap from a managed device triggers an
-        immediate poll, so psu_state (and the alert reading it) catches the
-        event within one poll instead of trailing the cadence by up to
-        `_SENSOR_REFRESH_S`. Best-effort, like `_learn_agent_address`: a
-        trap whose device cannot be resolved, or a re-read that fails,
-        still gets logged and queued normally."""
+        """A Cisco power trap from a managed device polls it now, so
+        psu_state catches the event within one poll. Best-effort, like
+        _learn_agent_address; debounced per device."""
         if not self.poll_now or not self.nodes_db:
             return
-        oid = trap.trap_oid or ""
-        if not any(oid == prefix or oid.startswith(prefix + ".")
-                   for prefix in POWER_TRAP_PREFIXES):
+        if (trap.trap_oid or "") not in POWER_TRAP_OIDS:
             return
         try:
             device_id = self.nodes_db.device_id_for_address(trap.source)
             if device_id is None:
                 return
+            now = time.time()
+            if now - self._power_reread_ts.get(device_id, 0.0) < POWER_TRAP_REREAD_S:
+                return
+            self._power_reread_ts[device_id] = now
             self.poll_now(device_id)
         except Exception as exc:
             self._note_error(exc)

@@ -5216,7 +5216,11 @@ due. Only `table.state` pays that cost each call — `_vendor_psu_rows`
 caches a table's `class_col`/`skip_when_col`/`name` columns (which
 change only when a supply is physically added or removed) in
 `_vendor_psu_static`, keyed `(device_id, table.state)`, refreshed on
-the same `_SENSOR_REFRESH_S` cadence temperature keeps; a retry, a
+the same `_SENSOR_REFRESH_S` cadence temperature keeps. An answer is
+cached only when every static column the table defines came back
+non-empty: a timed-out class or name walk would otherwise blind the
+FRU class filter for five minutes, so it is re-walked next poll
+instead. A retry, a
 device delete, or a device poll-now call clears a device's entries via
 `_forget_vendor_psu_static` alongside the other per-device sensor
 caches.
@@ -5243,7 +5247,8 @@ into warning(1), so neither reading is silently invisible anymore.
 **Trap-triggered re-read, from 5.26.0.** A managed device that sends
 one of the six Cisco power traps `trapdecode.py` now names (see the
 Decoding section below) gets `NodePoller.poll_now` called on it from
-`TrapCollector._power_trap_reread` in `snmptrapd.py`, so `psu_state` —
+`TrapCollector._power_trap_reread` in `snmptrapd.py`, at most once per
+`POWER_TRAP_REREAD_S` (60 s) per device, so `psu_state` —
 and `psu_warning`/`psu_failed` reading it — updates within one poll
 instead of trailing `_SENSOR_REFRESH_S` by up to five minutes. A
 status-change trap arrives on recovery too, so the same hook clears the
@@ -7537,9 +7542,14 @@ optional `poll_now` callable; `web/service.py` wires it to
 construction order (the collector is built before `NodePoller`) does
 not matter. `_power_trap_reread`, called from `_handle_datagram` right after
 `_learn_agent_address`, checks the decoded trap's OID against
-`POWER_TRAP_PREFIXES` (the same two Cisco ENVMON/FRU arcs `trapdecode.WELL_KNOWN`
-now names), resolves the sending source to a device with
-`nodes_db.device_id_for_address`, and calls `poll_now(device_id)` —
+`POWER_TRAP_OIDS` (exactly the six Cisco ENVMON/FRU power traps
+`trapdecode.WELL_KNOWN` now names — a fan or temperature notification
+on the same arc does not qualify), resolves the sending source to a
+device with `nodes_db.device_id_for_address`, and calls
+`poll_now(device_id)` unless one fired for that device within
+`POWER_TRAP_REREAD_S` — `poll_now` is the operator's retry-from-nothing
+button (it drops every sensor cache and the SNMPv3 engine), so a trap
+storm must not hold a device on back-to-back full walks —
 best-effort, like `_learn_agent_address` beside it: an unresolved
 source, a missing `nodes_db`/`poll_now`, or an exception from the call
 itself is caught and logged, never allowed to cost the trap its normal
