@@ -32,7 +32,7 @@ does not replace it.
    badges each interface DOM/SFP/COP in the interface list and the
    report's Kind column, and adds a Medium column (Copper/Laser) to
    the SFP inventory report and its CSV/email output. Alerting is
-   unchanged. Outcome: (pending)
+   unchanged. **Outcome.** Shipped as 5.25.0. Javariius pass 1 "not ready" with one blocker (a MAU copper answer would have badged every fixed copper port on a Catalyst) and five should-fixes, pass 2 one should-fix (the "unknown PMD" MAU codes must not veto copper text), pass 3 "ready to push". Along the way a 5.24.0 bug surfaced: the SFP inventory table on screen collapsed each device to one row (rows keyed by device id); fixed. Targeted tests green; the operator asked for the push ahead of Testy's final full-suite and walk run, whose result is reported in chat.
 
 ## 5.24.0 — Priority port tint, History search by name, SFP inventory report
 
