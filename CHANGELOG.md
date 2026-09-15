@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.25.0 — Copper transceivers get their own badge](#5250--copper-transceivers-get-their-own-badge)
 - [5.24.0 — SFP inventory, priority-port tint, and names in the History picker](#5240--sfp-inventory-priority-port-tint-and-names-in-the-history-picker)
 - [5.23.0 — Scheduled reports, a history explorer, priority ports, and NetFlow's missing blocks](#5230--scheduled-reports-a-history-explorer-priority-ports-and-netflows-missing-blocks)
 - [5.22.0 — TACACS+ sign-in, richer dashboard graphs, and a look at history](#5220--tacacs-sign-in-richer-dashboard-graphs-and-a-look-at-history)
@@ -157,6 +158,76 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.25.0 — Copper transceivers get their own badge
+
+One item from the operator: `PROMPT-LOG.md` carries the request in full;
+this entry is the shipped result.
+
+**A copper SFP (BASE-T) no longer wears the same SFP badge as a laser
+transceiver — it now reads COP, in the interface list and the SFP
+inventory report alike.** Until now `media` only told an optic with
+light-level readings (**DOM**) apart from a transceiver the switch
+names but that publishes no sensors (**SFP**) — a BASE-T copper module
+fell into that second bucket too, since nothing distinguished it from
+an unread laser part. Copper is proven two ways, either is enough: the
+module's own ENTITY-MIB text or part number naming a BASE-T form
+factor, RJ45, or a copper SFP family (Cisco's GLC-T/GLC-TE, the
+SFP-10G-T family), or — when that text is silent or ambiguous — the
+standard MAU-MIB answering 10/100/1000BASE-T, 1000BASE-CX or
+10GBASE-CX4/10GBASE-T for that port. A MAU answer that instead names a
+fiber medium never turns a port copper, whatever its text says. A
+copper module that reports only a temperature sensor and no light
+levels now reads **COP** rather than the old **DOM** — its temperature
+is still recorded and the **Optic temperature high** alert rule
+watches it exactly as before; only the badge changes. A transceiver
+with no DOM readings and no copper proof of either kind still reads
+plain **SFP** — a laser is assumed, since that is what an unidentified
+SFP-family part almost always is.
+
+**The MAU-MIB check is a new column walk, run alongside the existing
+five-minute environment poll and only where it can mean something.**
+It only runs on a device the entity walk has already mapped sensors to
+a port on; a switch that never answers it is asked once, then left
+alone for an hour before being asked again, the same probe-once-
+remember pattern the entity-sensor walk already uses, so a device
+without the MIB does not pay for it every cycle.
+
+**SFP inventory (Nodes → Reports → SFP INVENTORY) gains a Medium
+column — Copper or Laser, blank for an empty cage — and a COP count**
+alongside the existing DOM/SFP counts, in the on-screen report, both
+CSV exports, and the scheduled email summary line.
+
+**The device dialog's live DOM read still only ever upgrades a row,
+and now more carefully.** Opening a device and reading its DOM sensors
+live can promote a port to DOM before the next poll catches up, same
+as before — but that promotion now requires an actual optical-power
+(dBm) reading for that port, not just any sensor at all, so a copper
+port's own temperature reading can no longer flip it to DOM. A copper
+row is never touched by this upgrade path regardless. Alerting itself
+was never keyed on the badge — it reads the sensor value directly — so
+nothing about alert behaviour changes here.
+
+Existing interfaces re-badge on their own on the next environment
+poll; no migration or manual action is needed.
+
+Files: `nodepoll.py`, `nodeoids.py`, `nodesdb.py`, `report.py`,
+`reportsched.py`, `web/api.py`, `web/static/app.css`,
+`web/static/nodes.js`, `demo/personas.py`.
+
+Verification: `test_sfp_media.py` extends with stub ports 8–11 covering
+a copper module named by text alone, one with a temperature-only
+sensor, one proven copper by MAU-MIB alone, and a real optic whose
+MAU-MIB answer is fiber (never downgraded); plus the MAU-MIB reprobe
+gate (walked once, then not again inside the hour once a device proves
+it does not answer). `test_hardware_dom_sensors.py` adds the
+temperature-only-copper case end to end. `test_sfp_report.py` covers
+the Medium column and COP count in the report, both CSVs, and the
+scheduled-email render. `test_frontend_contracts.py` adds section 80
+pinning the COP badge, the Medium column, and the dialog's copper
+guard. `tests/ui/walk.mjs` walks the COP badge in both the SFP report
+table and the acc-sw-001 interface list, tolerant of the environment
+poll's own cadence.
 
 ### 5.24.0 — SFP inventory, priority-port tint, and names in the History picker
 

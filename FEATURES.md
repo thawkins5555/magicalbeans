@@ -602,16 +602,22 @@ own subtabs.
   past three healthy ones, and a port dark on every lane still records
   the floor so its chart keeps its history. In the DOM tables the reading
   itself shows as **No signal**, with the raw figure on the row.
-- **A port with an optic in it says so, and so does an empty SFP slot.**
-  A port whose transceiver reports DOM readings shows a **DOM** badge
-  beside its name in the interface list; an SFP slot the device describes
-  but that reports no DOM at all — a transceiver without the sensors, or
-  a cage with nothing plugged into it — shows an **SFP** badge instead,
-  whose tooltip says which of the two it is. This is the only reliable
-  media signal there is, since IF-MIB has no media column. A badge is
-  cleared by the first walk that answers and finds nothing there; a walk
-  that times out leaves it alone rather than blinking the whole fleet's
-  optics out of existence.
+- **A port with an optic in it says so, and so does an empty SFP slot —
+  and a copper transceiver is told apart from a laser one, from
+  5.25.0.** A port whose transceiver reports DOM readings shows a
+  **DOM** badge beside its name in the interface list; a BASE-T copper
+  module — proven either by the module's own text/part number (RJ45,
+  BASE-T, GLC-T, SFP-10G-T and the like) or, when that is silent, by
+  the switch answering the standard MAU-MIB with a copper medium for
+  that port — shows a **COP** badge instead, even if all it reports is
+  a bare temperature sensor; a laser transceiver the device describes
+  but that reports no DOM at all shows plain **SFP** (a laser is
+  assumed once copper is ruled out); and an SFP slot with nothing
+  plugged into it also shows **SFP**, with its tooltip naming the empty
+  cage. This is the only reliable media signal there is, since IF-MIB
+  has no media column of its own. A badge is cleared by the first walk
+  that answers and finds nothing there; a walk that times out leaves it
+  alone rather than blinking the whole fleet's optics out of existence.
 - **A device inherits its settings from a "polling profile"** (a group) —
   credentials, poll interval, timeout, retries, which of ping/SNMP are
   enabled, how many ping probes to send and how long to wait for them,
@@ -1325,10 +1331,12 @@ question actually gets answered.
 The interface list sorts by any column — Descr, Admin, Oper, Speed,
 In, Out and, from 5.23.0, a sortable **★** priority column — the same way
 every other table in the app does. A port carrying a
-transceiver that reports DOM shows a **DOM** badge beside its description
-and an SFP slot without one shows **SFP**; opening a device's dialog
-upgrades a port to **DOM** if its live read finds sensors there, even one
-the poller has not yet walked. Which SNMP identity
+transceiver that reports DOM shows a **DOM** badge beside its description, a
+copper (BASE-T) transceiver shows **COP** instead (from 5.25.0), and an SFP
+slot that is neither shows **SFP**; opening a device's dialog upgrades a
+port to **DOM** if its live read finds an optical-power reading there, even
+one the poller has not yet walked — a copper port's own temperature or
+voltage readings never earn it that upgrade. Which SNMP identity
 fields the header shows (sysDescr, sysName, sysObjectID, contact,
 location, vendor, SNMP version, software version and, from 5.15.0,
 firmware version and software image) is chosen in Nodes → Settings'
@@ -1786,18 +1794,23 @@ through the API: `GET /api/nodes/reports/availability`, `/top-metrics` and
 
 **SFP inventory, from 5.24.0** — every switch port currently holding a
 transceiver, fleet-wide or narrowed to a device **Group**: device, IP,
-port, alias, a **Kind**, oper status, speed and last seen. **Kind** is
-**DOM** for an optic that reports light levels and so can be alerted on,
-plain **SFP** for a transceiver the switch identifies by ENTITY-MIB but
-that publishes no sensors of its own, and — only with **Include empty
-cages** ticked (off by default) — **Empty cage** for a slot with
-nothing plugged in. Nothing new is polled for this: every row comes
-from the same per-port media read behind the DOM/SFP badge already on
-the interface list (see *Drill-down*, below), so the report is free.
-Same two export buttons as Firmware inventory — **Export CSV** from
-the rows on screen, **Download CSV from server** for a fresh build —
-and the same API reach: `GET /api/nodes/reports/sfp` and
-`/sfp/export.csv`.
+port, alias, a **Kind**, a **Medium** (from 5.25.0), oper status, speed
+and last seen. **Kind** is **DOM** for an optic that reports light
+levels and so can be alerted on, **COP** for a copper (BASE-T)
+transceiver, plain **SFP** for a laser transceiver the switch
+identifies by ENTITY-MIB but that publishes no sensors of its own, and
+— only with **Include empty cages** ticked (off by default) — **Empty
+cage** for a slot with nothing plugged in. **Medium** spells the same
+distinction out in one word — **Copper** or **Laser** — blank for an
+empty cage, since nothing is proven either way until something is
+plugged in. The summary line and both CSV exports also carry a COP
+count alongside the DOM/SFP ones. Nothing new is polled for this:
+every row comes from the same per-port media read behind the DOM/SFP/
+COP badge already on the interface list (see *Drill-down*, below), so
+the report is free. Same two export buttons as Firmware inventory —
+**Export CSV** from the rows on screen, **Download CSV from server**
+for a fresh build — and the same API reach: `GET
+/api/nodes/reports/sfp` and `/sfp/export.csv`.
 
 ### Scheduled reports — Nodes → REPORTS → SCHEDULED, from 5.23.0
 

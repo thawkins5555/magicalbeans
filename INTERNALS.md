@@ -1313,6 +1313,20 @@ the badge on a device the poller has not yet walked. That patch only ever
 UPGRADES a row to `'optic'`: the live read proves DOM on the ports it names
 and says nothing about the ones it does not.
 
+**5.25.0 narrows that live-read upgrade twice, now that a copper badge
+exists to protect.** `dialogOptics` — the set of `if_index` values the
+`/dom` read is allowed to upgrade — used to be every `if_index` that
+came back on any row at all; it is now `new Set(rows.filter((s) =>
+s.unit === 'dBm').map((s) => s.if_index))`, so a row with only a
+temperature or voltage reading no longer counts, only one carrying an
+actual optical-power figure. `paintDialogIfaces`'s own patch loop
+guards the write a second time — `if (r.media !== 'copper' &&
+dialogOptics.has(r.if_index)) r.media = 'optic'` — so a stored
+`'copper'` row is never upgraded at all, whatever the live read
+carries for that port; between the two, a BASE-T module's own
+temperature sensor can no longer earn its port a DOM badge through
+this path.
+
 **5.2.0 widened `media` past the ports that answer sensors.** A DOM walk
 cannot see an SFP slot that reports no DOM — a transceiver without the
 sensors, or an empty cage — and until now those were indistinguishable from
@@ -1355,6 +1369,73 @@ back the next cadence, so the list flickered every five minutes. A partial
 downgrading an occupied cage to `'sfp_empty'`. The `'optic'` path has had
 this protection since 5.1.0 (`if port_map:`); this is the same guarantee for
 the two states the entity table alone can see.
+
+**5.25.0 adds a third medium, `'copper'`, decided by text first and the
+wire itself second.** `_sfp_slot_media` (`nodepoll.py`) runs the module
+text it already has (`entPhysicalDescr`, `entPhysicalModelName`) through
+a second regex, `_COPPER_TEXT`:
+
+```
+r"\b(?:\d+g?base-?tx?|glc-te?|sfp-?10g-?t(?:-s|-x)?|rj-?45|copper"
+r"|cat[56]a?)\b"
+```
+
+— BASE-T(X) form factors, Cisco's GLC-T/GLC-TE part numbers, the
+SFP-10G-T family, RJ45, and the plain words "copper"/"cat5"/"cat6"/
+"cat6a" a vendor's own text sometimes uses instead of a part number.
+It only ever runs on text `_TRANSCEIVER_TEXT` already matched — a fixed
+copper port whose entity text names nothing never reaches either regex,
+so it stays unbadged exactly as before 5.25.0. A cage or module that
+matches both regexes badges `'copper'` in place of `'sfp'`.
+
+**Text can be silent or wrong, so a device that answers MAU-MIB gets a
+second, independent vote.** `nodeoids.IF_MAU_TYPE` is `ifMauType`
+(`1.3.6.1.2.1.26.2.1.1.3`, MAU-MIB, RFC 3636/4836), indexed
+`ifIndex.mauIndex`; its value is an OID whose last arc is a
+`dot3MauType`. `_poll_environment` walks it as a column
+(`_walk_column_status`), gated exactly like the cage/sensor walks above
+— only on a device with a non-empty `port_map` — and separately
+probe-once-remember'd: `self._mau_read`/`self._mau_capable`
+(`dict[int, float]`/`dict[int, bool]`) hold, per device, when it was
+last asked and whether it has ever answered. A device that has not
+answered it is walked again only once `_SENSOR_REPROBE_S` (3600 s) has
+passed since the last attempt — read `mau_capable is not False or due`
+— so a device without the MIB costs one failed GET an hour, not one
+every `_SENSOR_REFRESH_S`. The arc is matched against two frozensets:
+
+```python
+_COPPER_MAU_ARCS = frozenset({
+    5, 10, 11, 14, 15, 16, 19, 20, 27, 28, 29, 30, 41, 54,
+})
+_FIBER_MAU_ARCS = frozenset({
+    3, 6, 7, 8, 12, 13, 17, 18,
+    *range(21, 27), *range(31, 41), *range(44, 54),
+})
+```
+
+`_COPPER_MAU_ARCS` is 10/100/1000BASE-T(X)/-FD, 1000BASE-CX(-FD) and
+10GBASE-CX4/10GBASE-T; `_FIBER_MAU_ARCS` is the AUI/10BASE-F(B/L/P)
+family, 100BASE-FX(-FD), 1000BASE-SX/LX(-FD), and every 10G/40G/100G
+`dot3MauType` this MIB revision defines. A port whose MAU arc lands in
+neither set (an unrecognised or vendor-private arc) votes for nothing
+either way.
+
+**Precedence, per port, once both sources are in: copper beats optic,
+optic beats whatever the cage scan alone decided.**
+`copper_ports = (sfp_slots-as-'copper' ∪ mau_copper_ports) −
+mau_fiber_ports` — module text and a copper MAU arc both count toward
+copper, but a fiber MAU arc always vetoes it, so a device whose text is
+ambiguous and whose wire answers fiber can never be badged copper by a
+stray text match elsewhere. `media_by_if` is then built by applying,
+in order, the cage-scan result, `'optic'` for every sensor-mapped port,
+then `'copper'` for `copper_ports` last — so a BASE-T module reporting
+only a temperature sensor ends up `'copper'`, not `'optic'`, even
+though a sensor resolved to that port. The walk-cut-short preservation
+5.2.0 added is widened the same way: a stored `'copper'` badge is kept
+whenever *this* poll's own sensors or MAU-MIB did not themselves prove
+that port optic or copper, exactly the same "advisory only" treatment
+`'sfp'`/`'sfp_empty'` already had — a slow device does not flicker a
+copper badge off and back every five minutes either.
 
 **A −40 dBm optic is dark, not dying.** A transceiver with its port powered
 down or no fiber in it clamps at the bottom of its scale, and
@@ -6240,12 +6321,14 @@ their JSON routes build.
 
 **`nodesdb.interfaces_with_media(device_ids=None, include_empty=False)`
 is a plain join, not a new poll.** `interfaces.media` (`'optic'` /
-`'sfp'` / `'sfp_empty'` / `NULL`, set by the existing entity-sensor and
-transceiver-presence walk in `nodepoll.py`) already backs the DOM/SFP
-badge on the interface list; this method is the first caller to select
-on it directly. It filters `media IN ('optic', 'sfp')`, adding
-`'sfp_empty'` to that list only when `include_empty` is set — a `NULL`
-media (a copper port, or a cage never walked) is never a row — and
+`'sfp'` / `'copper'` (5.25.0) / `'sfp_empty'` / `NULL`, set by the
+existing entity-sensor and transceiver-presence walk in `nodepoll.py`)
+already backs the DOM/SFP/COP badge on the interface list; this method
+is the first caller to select on it directly. It filters `media IN
+('optic', 'sfp', 'copper')`, adding `'sfp_empty'` to that list only
+when `include_empty` is set — a `NULL` media (a fixed copper port whose
+entity text named nothing at all, or a cage never walked) is never a
+row — and
 excludes a purged device with the same `d.id NOT IN (SELECT device_id
 FROM device_purges)` clause `device()` uses, so a device mid-delete
 never leaks into the report. An optional `device_ids` filter is
@@ -6266,16 +6349,29 @@ contract exactly.** `device_label(row, dns_names)` — manual name, then
 `dns_names`/`hostnames` reverse DNS, then the IP — fills `SfpRow.name`,
 and `device` mirrors Firmware inventory's own field: `"name (ip)"`, or
 the bare IP when the label already is the IP. `_MEDIA_KIND = {"optic":
-"DOM", "sfp": "SFP", "sfp_empty": "Empty cage"}` is the one place the
-media value is turned into the label a row's **Kind** column shows, so
-the report and its CSV can never disagree on the wording. `port` reads
-`descr`, falling back to `alias` and then `f"port {if_index}"`, so a
-port with neither a description nor an alias is still an identifiable
-row rather than blank. `SfpReport` carries `device_count` (distinct
-devices seen, not the group's whole membership — a device in the group
-with no transceiver at all contributes no row and is not counted),
-`port_count`, and `dom_count`/`sfp_count`/`empty_count` split by
-`media`, all folded once here rather than recomputed by every caller.
+"DOM", "sfp": "SFP", "copper": "COP", "sfp_empty": "Empty cage"}` is
+the one place the media value is turned into the label a row's **Kind**
+column shows, so the report and its CSV can never disagree on the
+wording. **5.25.0 adds a second lookup beside it,** `MEDIA_MEDIUM =
+{"optic": "Laser", "sfp": "Laser", "copper": "Copper", "sfp_empty":
+""}`, read by both `report.py` and `reportsched.py` rather than
+duplicating the mapping — DOM and SFP are both laser transceivers (they
+differ only in whether DOM sensors answered, which `Kind` already
+says), copper is BASE-T, and an empty cage is neither until something
+is proven in it, so it renders blank rather than a guess. `SfpRow`
+gains a `medium` field (`MEDIA_MEDIUM.get(row["media"], "")`) sitting
+right after `kind`, and `SFP_CSV_HEADER` gains `"medium"` in the same
+position — `[..., "alias", "kind", "medium", "media", "oper_status",
+...]` — so the CSV, the on-screen table and the client's own mirrored
+header (`nodes.js`'s `SFP_CSV_HEADER`) all agree on column order.
+`port` reads `descr`, falling back to `alias` and then `f"port
+{if_index}"`, so a port with neither a description nor an alias is
+still an identifiable row rather than blank. `SfpReport` carries
+`device_count` (distinct devices seen, not the group's whole
+membership — a device in the group with no transceiver at all
+contributes no row and is not counted), `port_count`, and
+`dom_count`/`sfp_count`/`copper_count`/`empty_count` split by `media`,
+all folded once here rather than recomputed by every caller.
 
 **The two routes share one body, the same pattern Firmware inventory's
 export already set.** `web/api._sfp_report(service, params)` parses
@@ -6283,10 +6379,11 @@ export already set.** `web/api._sfp_report(service, params)` parses
 optional `device_ids` list, and calls `sfp_inventory` with
 `hostnames=service.app_db.hostnames`; `get_nodes_reports_sfp` returns
 its `.to_dict()` and `get_nodes_reports_sfp_export` builds the same CSV
-header (`device_id, name, ip, if_index, port, alias, kind, media,
-oper_status, admin_status, speed_bps, last_seen_ts, device`) from the
-same rows, so the downloaded file can never drift from what the screen
-showed for the same filter. Both routes are `nodes:read`, matching
+header (`device_id, name, ip, if_index, port, alias, kind, medium,
+media, oper_status, admin_status, speed_bps, last_seen_ts, device` —
+`medium` added ahead of `media` in 5.25.0) from the same rows, so the
+downloaded file can never drift from what the screen showed for the
+same filter. Both routes are `nodes:read`, matching
 every other reports route, and so are reachable with an API token the
 same way. Routes: `GET /api/nodes/reports/sfp`,
 `/api/nodes/reports/sfp/export.csv`.
@@ -6301,9 +6398,10 @@ accepts `include_empty` (coerced to `bool`) and an optional
 calls `reportmod.sfp_inventory` with `device_ids` resolved from
 `device_group_id` via the same `_device_ids_for_group` helper every
 other group-scoped renderer uses, builds a subject line
-(`"SFP inventory — N port(s) on M device(s), D DOM / S SFP"`), a body
-listing up to `_BODY_ROW_CAP` rows (name, port, kind) with a "…and N
-more" tail, and the full CSV as the attachment — the same
+(`"SFP inventory — N port(s) on M device(s), D DOM / S SFP / C COP"`,
+the COP count added in 5.25.0), a body listing up to `_BODY_ROW_CAP`
+rows (name, port, kind, medium — `medium` added in 5.25.0) with a "…and
+N more" tail, and the full CSV as the attachment — the same
 subject/body/CSV shape `_render_firmware` returns, so `run_due` and
 `_RENDERERS["sfp"]` need no special-casing.
 
