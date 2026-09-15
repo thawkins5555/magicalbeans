@@ -165,9 +165,17 @@ try:
     check("ticking the folded row promotes its primary, once",
           len(fold_devices) == 1 and
           nodes.device(fold_devices[0])["ip"] == "10.30.0.1", fold_devices)
-    check("...and the folded sibling is marked promoted to the same device",
-          nodes.discovery_result(folded_id)["promoted_device_id"] == fold_devices[0])
     folded_device = fold_devices[0]
+    check("...and the folded sibling itself stays unpromoted",
+          not nodes.discovery_result(folded_id)["promoted_device_id"])
+    status, fold_listing = call("GET", f"/api/nodes/discovery/{fold_job}", token=admin)
+    fold_row = next(r for r in fold_listing["results"] if r["id"] == folded_id)
+    check("...and the listing shows it as a high-confidence duplicate of the "
+          "primary's device, not added",
+          status == 200 and fold_row.get("duplicate_confidence") == "high"
+          and fold_row.get("duplicate_of_device_id") == folded_device
+          and not fold_row.get("existing_device_id")
+          and not fold_row.get("promoted_device_id"), fold_row)
 
     # -------------------- 4b. force promotes a folded result as itself
     print("4b. force keeps a folded result as its own device")
@@ -271,6 +279,37 @@ try:
           and ids_4c3b[0] != forced_only_device_4c3, (status, result_4c3b))
     nodes.remove_device(forced_only_device_4c3)
     nodes.remove_device(ids_4c3b[0])
+
+    # --------- 4d. ordering E: primary approved, folded sibling forced after
+    print("4d. primary approved via the route, then its folded sibling force-added")
+    job_4d = nodes.add_discovery_job("subnet", "10.37.0.0/30")
+    primary_4d, folded_4d = add_fold_pair(job_4d, "10.37.0.1", "10.37.0.2")
+    status, result_4d1 = call(
+        "POST", f"/api/nodes/discovery/{job_4d}/promote",
+        {"result_ids": [primary_4d]}, token=admin)
+    ids_4d1 = result_4d1.get("device_ids") or []
+    check("primary approved alone promotes to one device",
+          status == 200 and len(ids_4d1) == 1
+          and nodes.device(ids_4d1[0])["ip"] == "10.37.0.1", (status, result_4d1))
+    primary_device_4d = ids_4d1[0]
+    status, result_4d2 = call(
+        "POST", f"/api/nodes/discovery/{job_4d}/promote",
+        {"force_result_ids": [folded_4d]}, token=admin)
+    ids_4d2 = result_4d2.get("device_ids") or []
+    check("force-adding the folded row afterward still adds a second device",
+          status == 200 and len(ids_4d2) == 1
+          and nodes.device(ids_4d2[0])["ip"] == "10.37.0.2"
+          and ids_4d2[0] != primary_device_4d, (status, result_4d2))
+    folded_device_4d = ids_4d2[0]
+    promoted_primary_4d = nodes.discovery_result(primary_4d)["promoted_device_id"]
+    promoted_folded_4d = nodes.discovery_result(folded_4d)["promoted_device_id"]
+    check("...each row carries its own promoted_device_id",
+          promoted_primary_4d == primary_device_4d
+          and promoted_folded_4d == folded_device_4d
+          and promoted_primary_4d != promoted_folded_4d,
+          (promoted_primary_4d, promoted_folded_4d))
+    nodes.remove_device(primary_device_4d)
+    nodes.remove_device(folded_device_4d)
 
     # ------------------------------------- 5. what the discovery listing says
     print("5. the discovery listing serves primaries and flags duplicates")

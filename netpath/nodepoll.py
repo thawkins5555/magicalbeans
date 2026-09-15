@@ -2291,15 +2291,17 @@ class NodePoller(Worker):
         promoted as its primary, so ticking either row adds one device;
         a result whose walked addresses match a device's configured
         addresses is recorded on that device rather than added beside it.
+        Only the promoted row itself is marked — a folded sibling that
+        was not force-added stays untouched and keeps reading as a
+        duplicate of whatever device its primary became.
         `force_ids` (or `force=True` for everything) adds those rows as
-        their own device, processed first so a primary ticked alongside still gets one.
+        their own device, processed first so a primary ticked alongside
+        still gets one.
         """
         job = self.db.discovery_job(job_id)
         allow_ping_only = bool(job and job["allow_ping_only"])
-        family = self._folded_family(job_id)
         forced = set(force_ids) | (set(result_ids) if force else set())
         ordered_ids = list(force_ids) + [rid for rid in result_ids if rid not in force_ids]
-        ordered_ids.sort(key=lambda rid: 0 if rid in forced else 1)
         device_ids = []
         seen_results = set()
         forced_devices: set[int] = set()
@@ -2334,10 +2336,7 @@ class NodePoller(Worker):
                         break
             if existing is not None:
                 self._record_promoted_addresses(existing["id"], result, addresses)
-                if is_folded:
-                    self.db.mark_promoted(result_id, existing["id"])
-                else:
-                    self._mark_promoted_family(result_id, existing["id"], family, forced)
+                self.db.mark_promoted(result_id, existing["id"])
                 device_ids.append(existing["id"])
                 if is_forced:
                     forced_devices.add(existing["id"])
@@ -2382,10 +2381,7 @@ class NodePoller(Worker):
                     vendor_evidence=(result["vendor_evidence"]
                                      if "vendor_evidence" in keys else None))
             self._record_promoted_addresses(device_id, result, addresses)
-            if is_folded:
-                self.db.mark_promoted(result_id, device_id)
-            else:
-                self._mark_promoted_family(result_id, device_id, family, forced)
+            self.db.mark_promoted(result_id, device_id)
             device_ids.append(device_id)
             if is_forced:
                 forced_devices.add(device_id)
@@ -2406,30 +2402,6 @@ class NodePoller(Worker):
         remaining = [a for a in addresses if a not in walked]
         if remaining:
             self.db.record_device_addresses(device_id, remaining, "discovery")
-
-    def _folded_family(self, job_id: int) -> dict[int, list[int]]:
-        """`{primary result id: [ids folded into it]}`, read once per
-        promote() rather than once per row (promote-all on a large job)."""
-        family: dict[int, list[int]] = {}
-        for row in self.db.discovery_results(job_id):
-            if "folded_into_result_id" not in row.keys():
-                break
-            primary = row["folded_into_result_id"]
-            if primary and not row["promoted_device_id"]:
-                family.setdefault(primary, []).append(row["id"])
-        return family
-
-    def _mark_promoted_family(self, result_id: int, device_id: int,
-                              family: dict[int, list[int]], skip: set[int]) -> None:
-        """Mark the promoted row and every row folded into it, so all of
-        that device's addresses show as added, not only the one ticked —
-        except a sibling in `skip`, which is (or will be) promoted on its
-        own."""
-        self.db.mark_promoted(result_id, device_id)
-        for folded_id in family.get(result_id, ()):
-            if folded_id in skip:
-                continue
-            self.db.mark_promoted(folded_id, device_id)
 
     # ------------------------------------------------------------------ loop
 

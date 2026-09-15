@@ -3159,20 +3159,25 @@ force=False, force_ids=())` handles the two lists as one call, forced
 ids first: each forced id is promoted with `force=True` from its own
 `ip`/identity/`_result_addresses` rather than swapped for its primary
 (`is_folded` stays true, and only that one row is marked promoted via
-`mark_promoted`, not `_mark_promoted_family`), so a forced folded row
-becomes its own device even when its primary is ticked in the same
-call — `_mark_promoted_family` skips a sibling result that is itself
-forced, and a non-forced row's own fold-resolution ignores any device a
-forced row in this same call just created, so a primary ticked
-alongside its forced folded row is never quietly swapped onto that new
-device. Device ids from both lists are deduplicated before being
-returned to the caller. The primary keeps its own unpromoted state when
-its forced folded row is added alone; promoted in a later call, it by
-then resolves to a high-confidence match on the device the forced row
-became (its walked address was recorded as `CONFIGURED_SOURCE` even
-though it was force-added), so it needs a plain, non-forced promote of
-its own — a second tick and a second Approve — to be added as a second
-device. Both the pane and the dialog now seed their default tick sets
+`mark_promoted` — a plain, non-forced promote of a primary marks only
+its own row too, now that `_mark_promoted_family`/`_folded_family` are
+gone, so a folded sibling left unticked is never swept along), so a
+forced folded row becomes its own device even when its primary is
+ticked in the same call — a non-forced row's own fold-resolution
+ignores any device a forced row in this same call just created, whether
+that device is the forced row's own or one it matched by primary ip
+(`forced_devices` covers both), so a primary ticked alongside its
+forced folded row is never quietly swapped onto that new device. Device
+ids from both lists are deduplicated before being returned to the
+caller. The primary keeps its own unpromoted state when its forced
+folded row is added alone; promoted in a later call, it by then
+resolves to a high-confidence match on the device the forced row became
+(its walked address was recorded as `CONFIGURED_SOURCE` even though it
+was force-added) and now carries `duplicate_of_device_id`, so
+`discForceSplit` sorts its tick into `force_result_ids` on its own — a
+plain promote would fold it — so it needs its own tick, which the
+screen sends as a forced promote, plus a second Approve, to be added as
+a second device. Both the pane and the dialog now seed their default tick sets
 excluding `duplicate_of_device_id` and `folded_into_result_id` rows the
 same way, closing the gap where the pane pre-ticked a **Same as** row
 the dialog would not have.

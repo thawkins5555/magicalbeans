@@ -6005,9 +6005,7 @@
     for (const x of view.discResults) {
       if (!view.discSeen.has(x.id)) {
         view.discSeen.add(x.id);
-        // A flagged (duplicate_of_device_id) or folded (folded_into_result_id)
-        // row never pre-ticks: adding it is a deliberate "yes, a separate
-        // box" call, not a default.
+        // A flagged or folded row never pre-ticks; that's a deliberate tick, not a default.
         if (x.snmp_ok && !x.existing_device_id && !x.duplicate_of_device_id
             && !x.folded_into_result_id) view.discChecked.add(x.id);
       }
@@ -6065,11 +6063,7 @@
       escape(c.confidence)}</span>`;
   }
 
-  // What the sweep thinks this row already is: `high` (a known address,
-  // folded by promote()) or `medium` (name+sysObjectID match only — look
-  // before ticking, don't skip). A folded row (the sweep reached the same
-  // box on this address too) shows alongside a duplicate verdict rather
-  // than instead of one — a row can be both.
+  // `high` confidence is a known address folded by promote(); `medium` is a name+sysObjectID match only.
   function discDuplicateCell(r) {
     if (r.existing_device_id) {
       return `<a href="#/nodes/device/${r.existing_device_id}">${
@@ -6194,8 +6188,7 @@
      The results table gets this from App.grid's own selectAll now; what is
      left here is the approval dialog, whose table is a plain modal one. */
   function wireDiscSelectAll(table, cls, checkedSet, redraw) {
-    // Same as/Folded into rows still carry a box (discCheckCell) but must
-    // not be part of "all", matching discSelectable's exclusion on the grid.
+    // Flagged/folded rows carry a box but are excluded from "all", matching the grid's select-all.
     const boxes = [...table.querySelectorAll(`.${cls}`)].filter((b) => !b.dataset.flagged);
     const head = table.querySelector('thead th');
     if (!head || !boxes.length) return;
@@ -6458,13 +6451,9 @@
     const r = await App.get(`/api/nodes/discovery/${job.id}`);
     const results = r.results;
     const found = results.filter((x) => x.ping_ok || x.snmp_ok);
-    // Folded rows are counted with the box the sweep folded them onto, not
-    // as their own device — so both counts below exclude them.
+    // Folded rows count toward the box they were folded onto, not as their own device.
     const foundCount = found.filter((x) => !x.folded_into_result_id).length;
-    // A row matched to a device already on file, flagged as a probable
-    // duplicate, or folded into another address, starts unticked regardless
-    // of confidence — pre-ticking any of those is how one gets added on
-    // trust in the dialog's defaults.
+    // Existing, duplicate, or folded rows start unticked regardless of confidence.
     const seed = new Set(results.filter(
       (x) => x.snmp_ok && !x.existing_device_id && !x.duplicate_of_device_id
         && !x.folded_into_result_id)

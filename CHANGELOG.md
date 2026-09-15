@@ -213,7 +213,12 @@ their own devices, since each is promoted from its own identity and
 address; left for a later batch, the primary by then reads **Same as**
 the device the folded row became — at *high* confidence — and starts
 unticked like any other match, so it needs its own tick and a second
-Approve to be added as a second device. Select-all, in both the
+Approve to be added as a second device. The reverse now works the same
+way: approve the pre-ticked primary today and promoting it marks only
+its own row, never the folded sibling, so the folded row is free to be
+ticked and approved tomorrow — by then it reads **Same as** the device
+the primary became, at the same *high* confidence, and needs its own
+tick and a second Approve to be added as a second device. Select-all, in both the
 Results pane and the approval dialog, still skips every flagged or
 folded row, so a tick against either kind of match is always a
 deliberate one, not something a bulk select just swept in. The scan's
