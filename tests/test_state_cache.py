@@ -401,10 +401,11 @@ try:
           ("canary-twin", "1.3.6.1.4.1.4243") in index_b["by_identity"],
           sorted(index_b["by_identity"])[:3])
 
-    # Same argument for a learned alias, which feeds by_address.
-    service.nodes_db.record_device_addresses(canary_id, ["10.77.77.79"], "test")
+    # Same argument for a configured alias (the only source by_address
+    # reads, from 5.26.0).
+    service.nodes_db.record_device_addresses(canary_id, ["10.77.77.79"], "ipAddrTable")
     index_c = api._device_index(service)
-    check("a learned alias reaches the next index too",
+    check("a configured alias reaches the next index too",
           "10.77.77.79" in index_c["by_address"],
           sorted(index_c["by_address"])[-3:])
     check("no generation-keyed memo was left on the Service",
