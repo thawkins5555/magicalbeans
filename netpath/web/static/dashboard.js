@@ -1126,7 +1126,6 @@
           onWindow: (t0, t1) => {
             layoutTile.config = layoutTile.config || {};
             layoutTile.config.t0 = Math.round(t0); layoutTile.config.t1 = Math.round(t1);
-            drawCharts();
             queueLayoutSave(layoutTile);
           },
           onReset: () => {

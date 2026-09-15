@@ -3259,6 +3259,15 @@ check("state.opts.wheelRequiresCtrl && !event.ctrlKey && !event.metaKey" in APP,
 check("function queueLayoutSave(layoutTile)" in DASH67 and ", 400)" in DASH67,
       "dashboard.js debounces a tile's zoom-driven layout save by 400ms "
       "instead of PUTting once per wheel tick")
+_zoom67 = APP[APP.find("function attachChartZoom("):]
+check("state.geo = { ...state.geo, t0: a, t1: b };" in _zoom67
+      and "state.opts.onWindow(a, b);" in _zoom67
+      and _zoom67.count("emit(") >= 6,
+      "attachChartZoom advances its live window before calling onWindow, so "
+      "a burst of wheel ticks compounds instead of recomputing from a stale geo")
+_onwin67 = DASH67[DASH67.find("onWindow: (t0, t1) => {"):DASH67.find("onReset:")]
+check("drawCharts()" not in _onwin67,
+      "the tile's onWindow does not redraw from cached data between ticks")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

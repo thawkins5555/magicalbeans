@@ -412,6 +412,7 @@ class Service:
         self._mib_lock = threading.Lock()
         # Negative cache for authenticate_tacacs — see _TACACS_OUTAGE_S.
         self._tacacs_outage_until = 0.0
+        self._tacacs_outage_reason = ""
         self.alerts_settings = self.alerts_db.settings()
         self.wireless_settings = self.wireless_db.settings()
         self.configrx_settings = self.configrx_db.settings()
@@ -615,7 +616,7 @@ class Service:
         if password == "" or len(password.encode("utf-8", "replace")) > 255:
             return False
         if self._tacacs_outage_until and time.monotonic() < self._tacacs_outage_until:
-            raise TacacsUnavailable("TACACS+ server recently unreachable")
+            raise TacacsUnavailable(f"{self._tacacs_outage_reason} (retry paused)")
         try:
             try:
                 servers = tacacsclient.parse_servers(
@@ -638,8 +639,9 @@ class Service:
             except (tacacsclient.TacacsConnectError,
                     tacacsclient.TacacsProtocolError) as exc:
                 raise TacacsUnavailable(str(exc)) from exc
-        except TacacsUnavailable:
+        except TacacsUnavailable as exc:
             self._tacacs_outage_until = time.monotonic() + self._TACACS_OUTAGE_S
+            self._tacacs_outage_reason = str(exc)
             raise
         self._tacacs_outage_until = 0.0
         return result

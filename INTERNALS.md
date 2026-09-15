@@ -7868,18 +7868,19 @@ that distinction matters at all. `client_ip` is sent as TACACS+'s own
 rules key off.
 
 **`authenticate_tacacs` also keeps a short "unreachable" memory, ten
-seconds long.** The first `TacacsConnectError` or timeout against the
-configured server list starts that clock; any further sign-in attempt
-inside the window raises `TacacsUnavailable` immediately, without
-opening a new TCP connection or waiting out the configured timeout
-again. Left unguarded, an AAA outage would mean every concurrent login
+seconds long.** Any `TacacsUnavailable` outcome — a connect failure or
+timeout, a bad servers string, a missing or undecodable secret, or a
+reply that would not decode — starts that clock; any further sign-in
+attempt inside the window raises `TacacsUnavailable` immediately with
+the original cause and "(retry paused)", without opening a new TCP
+connection or waiting out the configured timeout again. Left unguarded, an AAA outage would mean every concurrent login
 attempt pays the full connect timeout before failing — the ten-second
 memory turns that into one slow failure per outage rather than one per
 attempt, so login slots are not held open waiting on a server that has
 already been shown to be down. It clears on its own once the ten
 seconds pass, so a server that comes back is tried again promptly
 rather than staying written off for longer than the outage actually
-lasted.
+lasted; a definite server answer or a settings save clears it at once.
 
 **Auto-create** happens inside `post_login`, not inside
 `authenticate_tacacs`: an unknown username, `tacacs_enabled` and

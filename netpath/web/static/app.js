@@ -3178,6 +3178,12 @@ const App = (() => {
       return (event.clientX - box.left) * scale;
     };
     let drag = null;
+    // Advance the live window so a burst of ticks compounds before the
+    // caller's next redraw hands back a fresh geo.
+    const emit = (a, b) => {
+      state.geo = { ...state.geo, t0: a, t1: b };
+      state.opts.onWindow(a, b);
+    };
     const paintBrush = () => {
       if (!drag || !drag.moved) { brush.setAttribute('visibility', 'hidden'); return; }
       const a = Math.min(drag.startX, drag.x);
@@ -3206,7 +3212,7 @@ const App = (() => {
       drag = null;
       paintBrush();
       if (moved && state.opts.onWindow) {
-        state.opts.onWindow(xAt(Math.min(startX, x)), xAt(Math.max(startX, x)));
+        emit(xAt(Math.min(startX, x)), xAt(Math.max(startX, x)));
       }
     };
     svg.addEventListener('pointerup', endDrag);
@@ -3218,7 +3224,7 @@ const App = (() => {
       const { plot, t0, t1 } = state.geo;
       const x = Math.min(Math.max(svgX(event), plot.x), plot.x + plot.w);
       const [a, b] = wheelWindow(event, t0, t1, xAt(x));
-      state.opts.onWindow(a, b);
+      emit(a, b);
     }, { passive: false });
     svg.addEventListener('dblclick', (event) => {
       if (!state.opts.onWindow) return;
@@ -3226,7 +3232,7 @@ const App = (() => {
       const { t0, t1 } = state.geo;
       const mid = (t0 + t1) / 2;
       const s = clampSpan((t1 - t0) * 2);
-      state.opts.onWindow(mid - s / 2, mid + s / 2);
+      emit(mid - s / 2, mid + s / 2);
     });
     const wrap = svg.parentElement || svg;
     wrap.addEventListener('keydown', (event) => {
@@ -3236,17 +3242,17 @@ const App = (() => {
       if ((event.key === '+' || event.key === '=') && state.opts.onWindow) {
         event.preventDefault();
         const s = clampSpan(cur / 1.25);
-        state.opts.onWindow(mid - s / 2, mid + s / 2);
+        emit(mid - s / 2, mid + s / 2);
       } else if ((event.key === '-' || event.key === '_') && state.opts.onWindow) {
         event.preventDefault();
         const s = clampSpan(cur * 1.25);
-        state.opts.onWindow(mid - s / 2, mid + s / 2);
+        emit(mid - s / 2, mid + s / 2);
       } else if (event.key === 'ArrowLeft' && state.opts.onWindow) {
         event.preventDefault();
-        state.opts.onWindow(t0 - cur * 0.25, t1 - cur * 0.25);
+        emit(t0 - cur * 0.25, t1 - cur * 0.25);
       } else if (event.key === 'ArrowRight' && state.opts.onWindow) {
         event.preventDefault();
-        state.opts.onWindow(t0 + cur * 0.25, t1 + cur * 0.25);
+        emit(t0 + cur * 0.25, t1 + cur * 0.25);
       } else if (event.key === 'Home' && state.opts.onReset) {
         event.preventDefault();
         state.opts.onReset();

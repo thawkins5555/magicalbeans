@@ -31,9 +31,7 @@ CREATE TABLE IF NOT EXISTS users (
     updated_ts   REAL NOT NULL,
     last_login   REAL,
     must_change  INTEGER NOT NULL DEFAULT 0,
-    -- 'local' (hash in `password` is authoritative), 'ldap', or 'tacacs'
-    -- (see post_login / Service.authenticate_ldap|_tacacs; `password` is
-    -- stored empty for either). Added by _migrate() for old databases.
+    -- 'local' (hash authoritative), 'ldap' or 'tacacs' (hash stored empty)
     auth_source  TEXT NOT NULL DEFAULT 'local'
 );
 
@@ -299,7 +297,6 @@ GLOBAL_DEFAULTS = {
     "tacacs_servers": "",
     "tacacs_timeout_s": 5.0,
     "tacacs_auto_create": True,
-    # Never "admin" by default -- a compromised AAA server must not mint accounts at that role.
     "tacacs_default_role": "viewer",
     "tacacs_secret_enc": "",
 }
