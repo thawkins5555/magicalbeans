@@ -6234,7 +6234,10 @@
   function drawDiscResultsTable(force) {
     const table = App.el('disc-results-table');
     const job = discSelectedJob();
-    const selectable = view.discResults.filter((r) => discSelectable(r, job));
+    // Select-all governs only the rows the sweep did not flag or fold: a
+    // "Same as"/"Folded into" row is added separately only by its own tick.
+    const selectable = view.discResults.filter((r) => discSelectable(r, job)
+      && !r.duplicate_of_device_id && !r.folded_into_result_id);
     const ticked = () => selectable.filter((r) => view.discChecked.has(r.id)).length;
     const chosen = ticked();
     // existing_device_id and snmp_ok are the only fields the server ever
@@ -6246,7 +6249,8 @@
       view.discSelected || '', view.discSort.key, view.discSort.descending ? 'd' : 'a',
       view.discResults.map((r) =>
         `${r.id}:${r.snmp_ok ? 1 : 0}:${r.existing_device_id || ''}` +
-        `:${r.duplicate_of_device_id || ''}:${(r.addresses || []).length}`).join(','),
+        `:${r.duplicate_of_device_id || ''}:${r.folded_into_result_id || ''}` +
+        `:${(r.addresses || []).length}`).join(','),
     ].join('|');
     if (!force && signature === discDrawnSignature) {
       App.refreshSelectAll(table, selectable.length, ticked());

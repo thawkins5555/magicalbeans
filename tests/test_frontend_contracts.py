@@ -3718,6 +3718,10 @@ check(HINT83 in INDEX83,
       "the Results pane (#disc-promote) carries the same hint sentence, "
       "as a <p class=\"hint\"> near the Promote button")
 
+check("!r.duplicate_of_device_id && !r.folded_into_result_id);" in NODES,
+      "the results grid's select-all skips flagged and folded rows, which are "
+      "added separately only by their own tick")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
