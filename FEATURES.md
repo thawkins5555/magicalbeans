@@ -143,9 +143,11 @@ sign-in page says so until someone has signed in — and insists on a new
 password. Accounts are managed on the Settings tab and are local by
 default; from 4.47.0 an account can instead be bound to an LDAP directory
 (**auth_source: ldap**), verified against the directory on every sign-in
-rather than a locally stored hash — see **Permissions** below. A script or
-another system reaches the API through a bearer **API token** rather than
-a stored username and password; see the same section.
+rather than a locally stored hash, and from 5.22.0 to a TACACS+ AAA
+server instead (**auth_source: tacacs**) the same way — see
+**Permissions** below. A script or another system reaches the API
+through a bearer **API token** rather than a stored username and
+password; see the same section.
 
 The server uses only the Python standard library. PySide6 is needed for the
 console window and nothing else, so a headless install needs neither it nor a
@@ -400,8 +402,8 @@ never saved one.
 | Lists | Recent alerts | Unresolved alerts up to a chosen severity | Max severity, rows |
 | Lists | Recent events | The most recent device events fleet-wide | Rows, window |
 | Lists | Note | A free-text note pinned to the dashboard — the one tile with no module to read, so every account can add it | Title, text |
-| Graphs | Interface traffic | In/out bandwidth for one interface, a 24-hour window by default | Device, interface, window |
-| Graphs | Device metric | One metric over time for one device, a 24-hour window by default | Device, metric, window |
+| Graphs | Interface traffic | In/out bandwidth for up to 8 interfaces on one chart, any devices, a 24-hour window by default | Name, up to 8 device/interface pairs, Y max, window |
+| Graphs | Device metric | One metric over time for one device, a 24-hour window by default | Name, device, metric, Y max, window |
 | Devices | Device status | One device's status, RTT, loss, CPU and open alert count | Device |
 | Module overviews | Syslog rate / Trap rate | Volume over time and the busiest sources | Window |
 | Module overviews | Top flows | Top talkers by a chosen NetFlow dimension | Dimension, rows, window |
@@ -409,6 +411,34 @@ never saved one.
 | Module overviews | ConfigRX summary | Devices backing up configuration and the worker's status | No |
 | Module overviews | IPAM subnets | Subnet utilization, most full first | Rows |
 | Module overviews | HTTPS monitors | State, response code and latency for every NetPath destination with a web check | No |
+
+**From 5.22.0, Interface traffic plots up to eight interfaces on one
+chart, from any devices — not necessarily the same one.** Each interface
+adds an in/out pair to the same axis, in solid for in and dashed for
+out, one colour per interface, so several links can be compared on one
+tile instead of one tile per link. The tile also takes an optional
+**Name** (shown as the tile's title in place of the device/interface
+label), and a **Y max** — blank auto-scales, or a ceiling like `100M` or
+`2.5G` pins the axis so a quiet link's tile does not rescale every time a
+busy one's does. A single request, `GET /api/nodes/series/batch`, fetches
+every interface's in and out series together, so an eight-interface tile
+costs one round trip rather than sixteen. A layout saved before 5.22.0
+keeps working unchanged — its one device/interface pair is read as a
+one-entry list. Device metric gains the same Name and Y max.
+
+**Every graph tile carries its own window control, outside Edit layout.**
+A select on the tile itself offers the same range list Nodes' own charts
+use — 15 minutes to 30 days — plus **Custom…** for an explicit date/time
+range, and changing it saves straight back to the account's layout at
+once: no need to open Edit layout and then Configure just to look
+further back. A pinned custom range shows a **Live** button beside the
+select to return to a rolling window. Drag-to-zoom, wheel-zoom and the
+keyboard on the chart itself do the same thing, and pin the same way.
+
+**The device field in every dashboard Configure dialog is a themed
+search-and-pick list**, matching the rest of the application, rather than
+the browser's own `<input list>` popup, which read enough like an
+unrelated autofill suggestion to be confusing.
 
 **Every count is a link**, and a real one — an anchor with an `href`, so it
 can be middle-clicked into a second tab or copied into a ticket. Clicking
@@ -1153,7 +1183,11 @@ window, sized to match NetPath's own status lane rather than reading as
 a chart panel. It's built from `device_events` (a sparse transition log,
 not a dense per-poll sample table), so a device that's been up for a week
 with zero events still renders as one solid "up" segment rather than
-appearing to have no data. The range dropdown beside it sets the window.
+appearing to have no data. The range dropdown beside it sets the window,
+with **Custom…** from 5.22.0 opening a shared date/time dialog for an
+explicit range; dragging across the bar, the wheel and the keyboard (Home
+to reset) pin the same way. The Bridge & RF pane's own charts, on a
+device that has them, follow this same window.
 
 **From 4.53.0, a device polled by both SNMP and ping draws two lanes
 instead of one** — SNMP above, PING below — since the combined status
@@ -1180,6 +1214,15 @@ number — three days for a device-level metric, one day by default for a
 per-port one — so a chart picks the right source for the metric it is
 actually drawing. The status timeline keeps every range, since it is built
 from the event log rather than from samples.
+
+**From 5.22.0, the loss chart (and RESOURCES with it) also offers
+Custom…**, the same shared date/time dialog every other chart's range
+list now has, plus drag-to-zoom, wheel-zoom and the keyboard directly on
+the chart. Picking a custom range, or dragging one, closes and reopens
+the device dialog already pinned to it — this dialog shares one
+on-screen box with every other dialog in the application, so a second one
+replaces rather than stacks over the first, and reopening pinned is how
+every nested range picker here already handles that.
 
 **From 5.0.0, a RESOURCES section under PACKET LOSS charts CPU, memory and
 chassis temperature** over that same range, sharing its dropdown and its
@@ -1252,6 +1295,12 @@ scrolled out of view by the time anyone went looking for it. Choosing a
 different range redraws the chart at once, at that range's own bucket
 size; the fifteen-second live refresh continues underneath it exactly as
 before.
+
+**From 5.22.0, the same chart takes Custom…, drag-to-zoom, wheel-zoom
+and the keyboard.** Picking Custom… or dragging a range on the chart
+closes and reopens the interface dialog already pinned to it, the same
+"one shared dialog box" pattern the device dialog's loss chart uses just
+above.
 
 **Bandwidth is still a per-port question, so it is still asked per port** —
 there is no device-level bandwidth chart or metric picker. Clicking an
@@ -1710,6 +1759,11 @@ alerts and optionally emailing about them.
 
 ### Working the alert list
 
+- **From 5.22.0, the alert-rate histogram's range control offers
+  Custom…** — the same shared date/time dialog every other chart's range
+  list now has — for a window other than one of the presets. Unlike a
+  line chart, the histogram's bars do not yet drag-narrow a range on
+  their own, and a picked range is not remembered across a page reload.
 - **Severity 1 and 2 rows are highlighted, and flash until somebody picks
   them up.** Severity is the syslog scale and counts down, so this covers
   severity 0 (emergency) as well — anything at or below 2, the same floor
@@ -2608,15 +2662,19 @@ from 5.10.0 — the destination's up/down state and either its average
 latency or its last failure reason, blank for a destination with no URL
 set.
 
-Presets run 15 minutes to 30 days. Drag to focus a range, scroll to zoom
-(anchored on the cursor), buttons to zoom and pan, right-click to clear.
+Presets run 15 minutes to 30 days, plus **Custom…** from 5.22.0 for an
+explicit date/time range through the same shared dialog every other
+chart's range list now offers. Drag to focus a range, scroll to zoom
+(anchored on the cursor), buttons to zoom and pan, the keyboard, or
+right-click to clear.
 
 **Each destination keeps its own window.** A link you watch by the hour and
 one you watch by the minute no longer drag their range onto each other:
 selecting a destination restores the window, preset and Follow state you last
 left it on, and a destination you have never opened starts on the page default
 of the last hour. The windows are remembered in your browser and survive a
-reload; entries for deleted destinations are dropped automatically.
+reload; entries for deleted destinations are dropped automatically. A range
+picked through **Custom…** is remembered the same way a dragged one is.
 
 ### Point-in-time snapshots
 
@@ -2826,6 +2884,11 @@ so spinning the wheel out several steps costs one query rather than one per
 step; the window label tracks the gesture live meanwhile. A response for a
 window you have already zoomed away from is discarded rather than drawn.
 
+**From 5.22.0, the range list also offers Custom…**, the same shared
+date/time dialog every other chart's range list now has, for an explicit
+range rather than one of the presets. Unlike the destination windows on
+Routes, a range picked here is not remembered across a page reload.
+
 ### Storage
 
 Flows live in their own database so a busy exporter does not contend with the
@@ -2951,6 +3014,11 @@ kind of hourly rollup table Syslog's histogram reads — it does not get
 slower as the database fills. Clicking an hour narrows the search to it and
 shows **Return to live**, as on Syslog.
 
+**From 5.22.0 the range control above it offers Custom…**, the same
+shared date/time dialog as every other chart's range list, for a window
+other than one of the presets; the picked range is not remembered across
+a page reload.
+
 ### Detail panel
 
 Every varbind for the selected trap, each with its resolved name, OID,
@@ -3064,6 +3132,10 @@ hovering gives the per-severity breakdown.
 The counts come from a rollup table maintained as messages arrive, so drawing
 this costs 24 rows to read rather than a scan of the message table — it does
 not get slower as the database fills.
+
+**From 5.22.0 the range control above it offers Custom…** as well, the
+same shared date/time dialog every other chart's range list now has; the
+picked range is not remembered across a page reload.
 
 ### A caveat about time
 
@@ -3919,7 +3991,14 @@ Sign-in, Users, Tokens, Maintenance, Modules and, from
 every other module's subtabs are. From 4.53.0 the LDAP directory settings
 that used to live on the Tokens subtab are on Sign-in instead, alongside
 session and lockout policy, which is why Tokens now only holds API tokens.
-**Modules** is one list linking to all
+From 5.22.0, Sign-in also holds an **AAA (TACACS+)** form beside LDAP:
+enable, up to four servers, the shared secret, a connection timeout,
+auto-create and a default role, plus its own **Test connection**. Both
+forms are administrator-only, and a plain hint above each states the
+rule an operator most needs to know before turning it on — that a local
+account is never sent to the directory or AAA server, only an account
+bound to it (or, for TACACS+ with auto-create on, an unrecognised
+username) is. **Modules** is one list linking to all
 ten per-module Settings dialogs (Nodes, Alerts, Routes/NetPath, NetFlow,
 SNMP Trap, Syslog, IPAM, FORTI-AP, ConfigRX, MAPPER) rather than each
 module's own Settings button being the only way to reach it — one place
@@ -4125,6 +4204,27 @@ locally, and the attempt is audited as its own action. Local accounts are
 completely unaffected, and the last local administrator can never be
 converted to `ldap` or demoted — an LDAP outage can never be the reason
 nobody can reach the application at all.
+
+**An account can authenticate against a TACACS+ AAA server instead, from
+5.22.0.** Set on the account (`auth_source: tacacs`), the same shape as
+LDAP above: no local password is kept, and every sign-in runs a PAP login
+against the servers configured under **Settings → Sign-in → AAA
+(TACACS+)** rather than checking a stored hash. Turning **Create an
+account on first successful sign-in** on lets an unknown username be
+provisioned automatically the moment the AAA server first answers PASS
+for it, with the configured **Default role**'s grants — so a fleet
+already run through TACACS+ does not need every account created here by
+hand first. A definite reject from the server reads as a wrong password;
+an AAA server that cannot be reached at all is reported as exactly that,
+never as a wrong password, so an outage is never mistaken for a mistyped
+credential. With TACACS+ turned off, a `tacacs` account simply cannot
+sign in — it never falls back to a local password, because it never had
+one. Local accounts are never sent to the AAA server for verification,
+and the last local administrator can never be converted to `tacacs` or
+demoted, for the same reason LDAP's cannot: an AAA outage must never be
+the reason nobody can reach the application at all. **Test connection**
+on the same Settings page runs a real sign-in against the configured (or
+typed-in) servers without saving anything or creating a session.
 
 ---
 

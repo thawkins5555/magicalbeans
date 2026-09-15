@@ -19,6 +19,7 @@ ways:
 | An optional SNMP credential (Wireless controller) | Encrypted in `wireless.db`, if you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
 | An optional SSH config-backup password (ConfigRX) | Encrypted in `configrx.db`, if you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
 | An optional enable-mode secret (ConfigRX) | Encrypted in `configrx.db`, if the device's vendor needs one to reach privileged EXEC and you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
+| An optional TACACS+ shared secret (Settings → Sign-in → AAA), from 5.22.0 | Encrypted in `app.db`, one value shared by every configured AAA server, if you chose to store one | No — same guarantee as the DHCP credential (DPAPI on Windows, the portable secret store elsewhere — see §10). |
 | **The device secrets inside a stored configuration backup (ConfigRX)** | In `configrx.db`, compressed, as part of the captured config text | **Yes, and this row is the reason the table now has six entries instead of five.** A device's running configuration contains that device's own secrets — SNMP communities, enable secrets, TACACS and RADIUS keys, IPsec pre-shared keys, local user password hashes — and none of those are SappiWhere's credentials, so none of them went through DPAPI. They were stored exactly as the device printed them, behind zlib compression, which is not encryption. From 4.39.0 a redaction pass runs over every captured configuration before it is stored. Reading one backup's content is `configrx: read`, same as the listing beside it, with a verbatim (unredacted) capture redacted on the fly for a caller without `configrx: write`; comparing two backups is `configrx: read` too as of 4.49.0 (through 4.48.0 it required `configrx: write`), with redaction applied unconditionally to both sides regardless of caller or stored flag. See §6a. |
 
 Everything below explains why each row is true.
@@ -1324,3 +1325,61 @@ as §4 already records for the poller, and a decrypted password is an
 ordinary Python string while the receiver is running. This is
 encryption at rest, not against someone who already has the running
 process.
+
+## 12. The optional TACACS+ shared secret (Settings → Sign-in → AAA), from 5.22.0
+
+Turning on TACACS+ sign-in needs one shared secret, the same value every
+device pointed at the same AAA server is configured with — RFC 8907's PAP
+body is obfuscated with a keystream derived from it, not encrypted with a
+key unique to this application, so the secret has to reach the AAA server
+verification exactly, the same shape as the SNMPv3 and ConfigRX
+credentials above.
+
+**Where it lives.** `app.db`'s `settings` table, key `tacacs_secret_enc`
+(`netpath/appdb.py`) — a `dpapi.protect()`-encrypted blob, base64-encoded
+for the table's `TEXT` column, exactly the mechanism §4's SNMPv3
+passwords and §6's ConfigRX credential already use: Windows DPAPI where
+one is available, machine-scoped, and §10's portable secret store
+everywhere else. A host that can do neither refuses the save, naming what
+to configure, the same as every other credential in this document.
+
+**Write-only, the same "has\_credential" idiom as everywhere else.** The
+Settings form posts a `tacacs_secret` field only when a new value is
+typed — left blank, the setting write keeps whatever is already stored,
+the same "blank keeps" convention the Nodes credential form and the SNMP
+Trap `v3_users` textarea both use. `GET /api/config` never returns the
+ciphertext to any caller: `_visible_settings` strips `tacacs_secret_enc`
+out of every response and substitutes `tacacs_secret_set: bool`, so the
+Settings page can say a secret is on file without ever being handed one,
+administrator account or not.
+
+**Decrypted only where a sign-in actually needs it.** Two call sites
+decrypt the stored blob, both immediately before using it and neither
+caching the plaintext: `Service.authenticate_tacacs` — the real sign-in
+path, called from `post_login` for a `tacacs`-sourced account or an
+unknown username when auto-create is on — and `post_tacacs_test`, the
+**Test connection** dry run, which decrypts the saved secret only when
+the operator leaves the test form's own secret field blank (typing one
+there tests that value instead, never touching the stored blob at all).
+Neither route, nor any other, ever returns the secret — decrypted or
+not — in a response body.
+
+**Never logged.** The Debug log and the audit log both record that a
+TACACS+ sign-in or a test was attempted, by whom, from where, and the
+plain outcome (accepted, rejected, unreachable) — never the secret, and
+never the password being verified either, the same restraint every
+sign-in path in this document already observes.
+
+**A secret this host cannot decrypt fails the same way an unreachable
+server does.** `authenticate_tacacs` raises `TacacsUnavailable` rather
+than treating a DPAPI failure as "no secret configured" — the operator
+sees "Could not reach the AAA server...", not a silent wrong-password
+result, so a host moved to different hardware (DPAPI) or missing its
+passphrase (the portable store) reports the actual cause rather than
+looking like every login is simply wrong.
+
+**A TACACS+ account has no local password to protect in the first
+place.** Exactly like an LDAP-bound account, `users.password` is stored
+empty for `auth_source = 'tacacs'` and never consulted; there is nothing
+for this section's threat model to cover on the account side beyond the
+one shared secret above.

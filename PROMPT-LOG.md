@@ -786,4 +786,11 @@ both a chat summary and a standing reference doc,
 yet — it is a menu of options for a future decision. Version for this
 work: 5.22.0.
 
-→ (outcome to follow)
+→ Thing1 the backend (`tacacsclient.py`, the third `auth_source` and
+auto-create path in `post_login`, the widened dashboard layout schema and
+`GET /api/nodes/series/batch`), Thing2 the frontend (the multi-interface
+tile config form, the on-tile window control, the themed device
+combobox, and the shared `Custom…` range dialog plus drag/wheel/keyboard
+zoom wired onto every time-axis chart), Stephen_King the paper and the
+docs. Testy's full-suite and browser-walk results and Javariius's
+verdict: (Bob fills in)

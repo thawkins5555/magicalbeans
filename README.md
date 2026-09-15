@@ -5,9 +5,11 @@ each one actually works — file by file, mechanism by mechanism —
 `NETWORK-AND-STORAGE-REQUIREMENTS.md` for ports and protocols, `CHANGELOG.md`
 for the build history, `CREDENTIAL-SECURITY.md` for exactly how passwords
 and stored credentials are protected, and `RUNBOOK.md` for what to do at
-02:00 when something has stopped. [Quick start](#quick-start),
-[Releasing](#releasing) and [Backup and restore](#backup-and-restore) are
-sections of this document.
+02:00 when something has stopped. `docs/HISTORICAL-DATA-OPTIONS.md` is a
+research paper on how other network monitoring products handle historical
+data, and a menu of options for this one — nothing under it is built yet.
+[Quick start](#quick-start), [Releasing](#releasing) and [Backup and
+restore](#backup-and-restore) are sections of this document.
 
 ## Contents
 
@@ -95,6 +97,19 @@ an explicit cleartext opt-in) rather than a local password, and Settings can
 issue a scoped API token for a script or another system to authenticate
 with instead of holding a session. Local accounts are unaffected either
 way, and the last local administrator can never be converted or demoted.
+
+From 5.22.0 an account can be bound to a TACACS+ AAA server instead, the
+same shape as LDAP: no local password, sign-in verifies against up to
+four configured servers (**Settings → Sign-in → AAA**), and turning on
+**Create an account on first successful sign-in** provisions an unknown
+username automatically, with a configurable default role, the moment the
+server first answers PASS for it. A local account is never sent to the
+AAA server; an explicit reject reads as a wrong password; a server that
+cannot be reached at all is reported as exactly that rather than as a
+wrong password, so an outage is never mistaken for a mistyped
+credential. As with LDAP, the last local administrator can never be
+converted to TACACS+ or demoted, so an AAA outage can never be the
+reason nobody can reach the application at all.
 
 Passwords are stored as salted scrypt hashes at the parameters OWASP currently
 recommends, never in plain text and never recoverable. If the only account's
@@ -926,6 +941,7 @@ netpath/
   secretstore.py   the portable secret store: a passphrase-derived key,
                    a stand-in for DPAPI on hosts without it
   ldapclient.py    a minimal LDAPv3 simple-bind client for directory auth
+  tacacsclient.py  a minimal RFC 8907 TACACS+ PAP client for AAA sign-in
   udpsock.py       dual-stack UDP bind and drop-counter helpers, and the
                    UdpReceiver base class the three collectors subclass
   web/

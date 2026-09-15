@@ -138,6 +138,7 @@ reachable.
 | Wireless SNMP polling | UDP | 161 (fixed) | GETNEXT to each configured FortiGate Wireless Controller, on its own poll interval — never to the APs behind it individually |
 | ConfigRX config backup | TCP (SSH) | 22 (configurable per device) | Only for a device with backup enabled and a credential stored; read-only — one fixed "show config" command, plus, for a vendor whose login shell is not already privileged EXEC (currently just Cisco ASA), a fixed `enable` step; never a push |
 | NetPath web page check, from 5.10.0 | TCP (HTTPS) | 443, or the URL's own port | Only for a destination with a page URL set — one GET per destination per trace interval, to whatever host and port the URL names |
+| TACACS+ AAA sign-in, from 5.22.0 | TCP | 49 (default, configurable per server) | Only if TACACS+ sign-in is enabled — one connection per sign-in attempt (or per **Test connection**), to whichever of up to four configured servers answers first; never a query on its own, only in response to somebody signing in |
 
 Traceroute probes go to every destination you add, and to every router on the
 path to it. Firewalls between here and a destination need to permit the probe

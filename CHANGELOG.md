@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.22.0 — TACACS+ sign-in, richer dashboard graphs, and a look at history](#5220--tacacs-sign-in-richer-dashboard-graphs-and-a-look-at-history)
 - [5.21.0 — A modular Dashboard, and global find to the switch port](#5210--a-modular-dashboard-and-global-find-to-the-switch-port)
 - [5.20.5 — The auto-assigned MIB, repaired for the fleet (second pass)](#5205--the-auto-assigned-mib-repaired-for-the-fleet-second-pass)
 - [5.20.4 — The auto-assigned MIB, repaired for the fleet](#5204--the-auto-assigned-mib-repaired-for-the-fleet)
@@ -154,6 +155,104 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.22.0 — TACACS+ sign-in, richer dashboard graphs, and a look at history
+
+Five items from the operator, landing together: `PROMPT-LOG.md` carries
+the planning answers in full; this entry is the shipped result.
+
+**TACACS+ joins LDAP as a second AAA option for signing in.**
+`netpath/tacacsclient.py` is a new, dependency-free RFC 8907 client — PAP
+only, one TCP connection per attempt, hand-rolled wire format, modelled on
+`ldapclient.py`'s own shape. Turned on under **Settings → Sign-in → AAA
+(TACACS+)**: up to four servers (`host[:port]`, default port 49, tried in
+order), a shared secret (stored encrypted the same way every other stored
+credential in this application is, write-only — the form only ever says
+whether one is saved), a 1–60 second timeout, auto-create on/off and a
+default role for an account TACACS+ creates on its own. Accounts gain a
+third sign-in source alongside local and LDAP, **Sign in via TACACS+**.
+The rules match LDAP's: a local account is never sent to the AAA server; a
+TACACS+ account, or an unknown username when auto-create is on, is
+verified there instead; an unknown user auto-create accepts is created on
+the spot with the default role (audited as `user.autocreate`); an explicit
+reject reads "Wrong username or password", the same as any other failed
+sign-in; a server that cannot be reached at all reads "Could not reach the
+AAA server..." and audits `signin.tacacs_unreachable` — never the
+wrong-password message, so an outage never looks like a mistyped
+password. With the feature off, a TACACS+ account simply cannot sign in —
+there is no fallback to a local password, because it never had one. The
+last local administrator rule is unchanged, and is exactly what keeps
+somebody in when the AAA server is down. **Test connection** on the same
+page runs a real PAP login against the settings on the form (or the saved
+ones, for anything left blank) without saving anything or creating a
+session, audited as `tacacs.test`. Every `tacacs_*` setting is
+administrator-only, the same as `ldap_*`. New network requirement:
+outbound TCP/49 to the AAA server(s).
+
+**A dashboard interface traffic tile now plots up to eight interfaces on
+one chart**, from any devices, in and out on the same axis — solid for
+in, dashed for out, one colour per interface. It also takes a **Name**, a
+**Y max** ("100M", "1G", or blank for auto-scale), and its own window
+control right on the tile — the same range list Nodes' own charts use,
+plus **Custom…** — so changing the period no longer means opening Edit
+layout and then Configure first. A pinned custom range shows a **Live**
+button to drop back to a rolling window. The Device metric tile picks up
+the same Name, Y max and on-tile window. One new route, `GET
+/api/nodes/series/batch`, answers a tile's whole chart — every interface,
+in and out — in a single request rather than one per series. Existing
+single-interface layouts keep working unchanged.
+
+**The device picker in dashboard tile configuration is now themed**,
+matching the rest of the application, in place of the browser's own
+`<input list>` popup — which read enough like an unrelated browser
+autofill suggestion to be confusing. It is `App.comboBox`, the same
+themed search-and-pick control now backing every device field on the
+Dashboard.
+
+**Every chart with a time axis can be drilled into.** A shared
+**Custom…** date/time dialog (From/To, plus Last hour/24 hours/7 days
+quick buttons) is now an option on every range list that has one: the
+Nodes interface bandwidth chart, the device packet-loss chart, the device
+metric chart, and the device status timeline — whose window the Bridge &
+RF pane's own charts follow too — plus NetFlow, the Routes (NetPath)
+timeline, and the Syslog/Trap and Alerts histograms. Every line chart on
+that list also takes drag-to-zoom, wheel-zoom anchored on the cursor,
+double-click to zoom back out, and the keyboard (`+`/`-` to zoom, arrow
+keys to pan, Home to reset) — the same interaction NetFlow and Routes
+already had, now shared through one `App.attachChartZoom` helper rather
+than reimplemented per chart. Hovering an hourly rollup point still says
+so. A window past a metric's own raw retention still reads hourly
+min/avg/max, exactly as before.
+
+**Known limits, stated honestly.** The Alerts histogram offers
+**Custom…**, but its bars do not yet drag-narrow the way a line chart
+does. A **Custom…** range picked on the Alerts, Syslog or NetFlow pages
+is not remembered across a page reload — a Dashboard tile's own range is,
+since it saves straight to the layout, and Routes keeps it in the
+per-destination window memory it already had. The Bridge & RF charts
+pick up a changed window within about 15 seconds rather than
+immediately.
+
+**A paper on historical data, for a later decision.**
+`docs/HISTORICAL-DATA-OPTIONS.md` surveys how LibreNMS, PRTG, Zabbix,
+SolarWinds and Grafana retrieve, display, filter and export history, and
+lays out seven implementation options for this platform. Nothing under
+its Options section is built — it is the menu for a future release, not
+this one.
+
+Files: `appdb.py`, `nodesdb.py`, `nodesseriesdb.py`, `permissions.py`,
+`tacacsclient.py`, `web/api.py`, `web/server.py`, `web/service.py`,
+`web/static/alerts.js`, `web/static/app.css`, `web/static/app.js`,
+`web/static/dashboard.js`, `web/static/events.js`,
+`web/static/index.html`, `web/static/netflow.js`, `web/static/netpath.js`,
+`web/static/nodes.js`, `web/static/settings.js`.
+
+Verification: `test_tacacs_auth.py` covers the PAP wire format and every
+sign-in path (an unreachable server, an explicit reject, auto-create, the
+feature switched off); `test_dashboard_layout.py` covers the widened tile
+schema (up to 8 interfaces, name, Y max, a pinned t0/t1, the extended
+window list); `test_frontend_contracts.py` is updated for the new UI
+strings; `tests/ui/walk.mjs` adds a walk of the changed modules.
 
 ### 5.21.0 — A modular Dashboard, and global find to the switch port
 

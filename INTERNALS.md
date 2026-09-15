@@ -123,6 +123,8 @@ netpath/
   secretstore.py   portable secret store: passphrase-derived key,
                    stand-in for DPAPI off Windows
   ldapclient.py    minimal LDAPv3 simple-bind client for directory auth
+  tacacsclient.py  minimal RFC 8907 TACACS+ PAP client for AAA sign-in,
+                   modelled on ldapclient.py's own shape
   udpsock.py       dual-stack UDP bind and drop-counter helpers, and
                    the `UdpReceiver` base class the three collectors
                    subclass
@@ -7823,6 +7825,63 @@ shared address (a NAT gateway, for instance). The delay is exponential
 once past the threshold (`2 ** (failures - threshold)`, capped at 30s) —
 5 failures adds a one-second delay, 10 adds thirty.
 
+### TACACS+ AAA sign-in (`tacacsclient.py`, `web/service.py`,
+`web/api.py`) — 5.22.0
+
+**`tacacsclient.py`** is a minimal RFC 8907 client, stdlib-only, modelled
+on `ldapclient.py`'s own shape: an error hierarchy
+(`TacacsConfigError`/`TacacsConnectError`/`TacacsProtocolError`), pure
+encode/decode helpers, and one public `authenticate(servers, secret,
+username, password, ...)`. PAP only — no CHAP/MSCHAP, no AUTHOR or ACCT,
+no `TAC_PLUS_SINGLE_CONNECT_FLAG` session reuse — one TCP connection per
+login attempt, one START and one REPLY, then closed. `parse_servers`
+reads the `tacacs_servers` setting's `"host[:port], ..."` text into up to
+`MAX_SERVERS` (4) `(host, port)` pairs, default port 49;
+`authenticate()` tries each in the order given and raises
+`TacacsConnectError` naming the last failure only once every server has
+refused. A reply that sets `TAC_PLUS_UNENCRYPTED_FLAG` — the body was
+sent in the clear — is refused rather than trusted, the same posture the
+client takes toward its own requests. `MAX_BODY_LEN` (65535) bounds what
+a single `recv()` loop will read for one reply, so a garbage or malicious
+length prefix cannot turn into a memory or time sink.
+
+**`Service.authenticate_tacacs(username, password, client_ip)`**
+(`web/service.py`) is `authenticate_ldap`'s TACACS+ counterpart, same
+three-outcome shape: `True` (PASS), `False` (a definite FAIL — never
+raised as an error, so `post_login` treats it exactly like a wrong local
+password), or `TacacsUnavailable` for anything that means the AAA server
+itself could not be used — no servers configured, no secret saved, a
+secret this host cannot decrypt, a connect/read timeout, or a protocol
+error. That three-way split is what lets `post_login` (`web/api.py`)
+answer "Wrong username or password" for a real reject and "Could not
+reach the AAA server..." (audited as `signin.tacacs_unreachable`) for an
+outage, rather than one message doing for both — see Auth above for why
+that distinction matters at all. `client_ip` is sent as TACACS+'s own
+`rem_addr` field, the value an AAA server's own logs and authorization
+rules key off.
+
+**Auto-create** happens inside `post_login`, not inside
+`authenticate_tacacs`: an unknown username, `tacacs_enabled` and
+`tacacs_auto_create` all true skips straight to a TACACS+ round trip —
+for a username with no local row, the AAA server's answer *is* whether
+the account should exist — and a PASS calls `app_db.add_user(username,
+"", auth_source="tacacs")` then `set_permissions(username,
+permissions.role_grants(tacacs_default_role))`, audited as
+`user.autocreate`. No dummy-hash timing padding runs on this path, unlike
+the "no such account" branch just below it — a network round trip to the
+AAA server already dominates whatever timing the dummy hash exists to
+flatten.
+
+**The shared secret** is `tacacs_secret_enc` in `appdb.py`'s
+`GLOBAL_DEFAULTS`, `dpapi.protect()`-encrypted the same way the SNMPv3
+and SMTP credentials are (`api._encrypt_secret`) and stored as base64
+text, since the settings table's value column is `TEXT`. `api.py`'s
+`_visible_settings` strips it from every read, substituting a plain
+`tacacs_secret_set: bool` the same "has\_credential" idiom every other
+stored credential in this application uses — see
+`CREDENTIAL-SECURITY.md` §12 for the full account of where it lives and
+what does and does not decrypt it.
+
 ---
 
 ## Permissions (`permissions.py`, `appdb.py`'s `user_permissions`)
@@ -9312,6 +9371,128 @@ checkbox alone, so every poll that appended a row yanked the view back
 down regardless of where an operator had scrolled to read history. The
 checkbox's meaning is unchanged — it still means "stay pinned to the
 newest row" — only *when* that pinning is allowed to act has changed.
+
+### Multi-interface graph tiles, on-tile drill-down, and the batch series route (`web/api.py`, `web/static/dashboard.js`, `web/static/app.js`) — 5.22.0
+
+**The `iface_traffic` config schema widens without breaking a saved
+layout.** `_DASHBOARD_CONFIG_SCHEMA["iface_traffic"]` keeps its legacy
+`device_id`/`if_index` pair — still accepted, and `dashboard.js`'s
+fetcher still reads it as a one-entry list when `interfaces` is absent —
+and adds `interfaces` (`_dash_interfaces`: 1–8 `{device_id, if_index}`
+objects, each validated by `_dash_interface_pair`, duplicates refused),
+`name` (`_dash_str`, 60 chars), `y_max` (`_dash_int`, 0–10¹³) and `t0`/`t1`
+(`_dash_int`, bounded by `MAX_TIMESTAMP`). `device_metric` gains the
+identical `name`, `y_max` and `t0`/`t1` triple. `window_s` on every graph
+type widens from four values to the full seven-entry
+`_DASHBOARD_WINDOW_S_VALUES` (900/3600/21600/86400/259200/604800/2592000)
+— `App.RANGES` in full, where it used to mirror only four of them.
+`_check_dash_t0_t1` (called once the whole config is clean) refuses a
+tile with only one of `t0`/`t1` set, and caps a pinned span at
+`_DASHBOARD_MAX_SPAN_S` (120 days, `app.js`'s own `WINDOW_MAX_S`) — the
+same ceiling the shared range dialog already enforces everywhere else a
+chart lets someone pick an absolute range, so a hand-crafted `PUT` cannot
+ask for a wider one than the UI itself could ever produce.
+
+**`GET /api/nodes/series/batch`** (`get_nodes_series_batch`) answers a
+whole tile's chart in one request rather than one per interface per
+direction: `q=<device_id>:<metric_key>[,...]`, up to
+`_SERIES_BATCH_MAX` (16) pairs, resolved through
+`NodesSeriesDatabase.metric_by_key(device_id, key)` — a single indexed
+lookup on `(device_id, key)`, the pair `UNIQUE(device_id, key)` already
+indexes — rather than the per-device `/metrics` fetch the single-interface
+fetcher used to make first. Interface labels for the whole batch are read
+in one query per distinct device (`interface_port_labels_for_devices`),
+not one per pair. A device or metric this account cannot see, or that
+simply is not on file, answers with an empty `points` list for that one
+entry rather than failing the whole batch with a 404 — one bad pair in
+`q` must not blank a tile with seven good ones. `_series_bucket_s` (the
+raw/rollup bucket-width rule `get_nodes_device_series` already used) is
+shared by both routes, so a batched chart and a single-metric one bucket
+identically for the same window.
+
+**`dashboard.js`'s `ifaceTrafficConfigForm`** replaces the single
+device/interface pair with up to `MAX_IFACE_ROWS` (8) rows, each its own
+`App.comboBox` device field plus a dependent interface `<select>`,
+added/removed with **Add interface**/**Remove** rather than the tile
+type needing a second config form. `readIfaceTrafficConfig` collects the
+rows into the `interfaces` list the schema above expects, and carries a
+config's existing `t0`/`t1` forward untouched — Configure must not
+silently drop a pinned range that Save didn't touch. The fetcher
+(`iface_traffic.fetch`) builds one `q` string across every row, colours
+each interface `var(--cat-N)` (falling back to `var(--muted)` past the
+eighth, though the schema caps rows at 8 so that branch is unreachable
+today), draws `in` solid and `out` dashed (`dash: '4 3'`), and prefixes
+each series label with the device name only when the rows span more than
+one device.
+
+**The on-tile window control** (`tileRangeHtml`) replaces the edit-mode
+toolbar, for the two Graphs-family tile types only, outside edit mode: a
+`<select>` built from `App.RANGES` plus a `Custom…`/`Custom` option, and
+a **Live** button that appears only once `cfg.t0`/`cfg.t1` are set.
+`onTileRangeChange` either sets `cfg.window_s` (clearing `t0`/`t1`) or
+opens `App.rangeDialog` and stores the picked `t0`/`t1`; `onTileLiveClick`
+clears them. Either path calls `saveLayoutAndRefetch`, which `PUT`s the
+whole layout immediately — a tile's own window is account state the
+moment it changes, not something that waits for an explicit Save — and
+adopts whatever canonical layout the server hands back before forcing an
+immediate re-`fetch` of just that one tile, rather than waiting out its
+`every: 60000` cadence. `drawCharts` wires `App.attachChartZoom` onto
+every tile chart's `<svg>` the same way, outside edit mode, so a drag or
+wheel zoom on the chart itself pins `t0`/`t1` and saves exactly like the
+select does.
+
+**`App.rangeDialog`** (`app.js`) is the one `Custom…` dialog behind every
+range list in the product from this release on — Dashboard tiles, Nodes'
+per-port bandwidth and packet-loss charts, the device status timeline,
+NetFlow, NetPath/Routes, Syslog, SNMP Trap and Alerts. A `datetime-local`
+From/To pair plus three quick buttons (Last hour/24 hours/7 days),
+resolving `{t0, t1}` on Apply and `null` on Cancel, Escape or a backdrop
+click alike (`modal-closed` fires for all three; only the first of
+resolve/reject to run wins the race, so listening for it costs nothing
+when Apply already settled the promise). It clamps to the same
+`WINDOW_MIN_S`/`WINDOW_MAX_S` (60 s – 120 days) every other absolute
+range in the app is bound by.
+
+**`App.attachChartZoom`** is the drag-select/wheel-zoom/double-click/
+keyboard handler NetFlow and NetPath already had, lifted to `App` and
+generalised to any `drawSeriesChart`-shaped `geo` (a plot rect plus the
+current `t0`/`t1`) — this is what puts the identical interaction on the
+Nodes bandwidth and loss charts, the device status timeline (a bar, not
+a line chart, so it passes a `geo` with no y-axis: `{plot: {x:0, y:0, w,
+h}, width, t0, t1}`), and every Dashboard graph tile, without
+reimplementing pointer/wheel/keyboard handling per caller. It listens on
+the `<svg>` itself, alongside whatever hover handler is already attached
+(both are plain `addEventListener`, so they coexist without one
+overwriting the other's `.onX`), and is idempotent against a redraw: a
+second call on the same node updates the live `geo`/`opts` in place and
+re-appends the brush rect if a fresh draw cleared the node's children,
+rather than attaching a second listener set.
+
+**The "one shared modal box" caveat.** `App.modal` always renders into
+the same `#modal-box`; a second call while one dialog is open replaces
+its content wholesale rather than opening a second, stacked dialog.
+`App.rangeDialog` opens through this same box, so a `Custom…` picked from
+*inside* another dialog (the device or interface dialog's own range
+select) cannot float over it — the caller closes its own dialog first
+(`App.closeModal()`), waits for `rangeDialog` to resolve, then reopens
+itself with the picked range passed in as an explicit `initial*`
+argument (`deviceDialog`'s `initialLossWindow`, `interfaceDialog`'s
+`initialWindow`) so it comes back already pinned rather than losing the
+pick. Every nested `Custom…` in this release — the device dialog's loss
+chart, the interface dialog's bandwidth chart — follows this same
+close-then-reopen-pinned pattern; a `Custom…` opened from a page-level
+range control (Dashboard, NetFlow, NetPath, Syslog, SNMP Trap, Alerts)
+has no dialog under it to protect and opens directly.
+
+**`App.comboBox`** (`app.js`) replaces the plain `<input list>` the
+device field used, themed rather than the browser's own popup: `search(q)`
+returns `[{id, label, hint}]`, `onPick(id, item)` runs on a pick, and
+typing without picking is a supported, unexceptional outcome — an
+unconfigured tile's device field stays blank on purpose, and
+`dashboard.js` relies on that rather than treating it as an error state.
+Full keyboard support (arrows, Enter, Escape, Tab-to-close) and ARIA
+(`role="combobox"`/`"listbox"`, `aria-activedescendant`) come with it,
+which the plain `<input list>` never had consistently across browsers.
 
 ### Tab bar: flat groups, icon collapse, the overflow fade (`index.html`, `app.css`, `app.js`) — 4.49.0
 
