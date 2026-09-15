@@ -1076,7 +1076,7 @@ def test_c8_device_correlation_through_aliases() -> None:
           and namelookup.resolve_name(legacy, None, "10.0.0.1") == "core-sw-a",
           "a nodes database without the alias table is simply skipped")
 
-    # --- the v1 agent address is learned from the trap --------------------
+    # --- the v1 agent address is no longer recorded (5.29.0) --------------
     nodes = FakeNodes({"10.0.0.1": core})
     trap_db = SnmpTrapDatabase(db_path("c8-traps.db"))
     traps = TrapCollector(trap_db, nodes_db=nodes)
@@ -1084,17 +1084,15 @@ def test_c8_device_correlation_through_aliases() -> None:
         for _ in range(50):
             traps._handle_datagram(v1_trap(agent_addr="192.168.255.7"),
                            ("10.0.0.1", 40000))
-        check(nodes.recorded == [(7, ["192.168.255.7"], "trap_agent_addr")],
-              f"the agent address is recorded once, not once per trap "
+        check(nodes.recorded == [],
+              f"the agent address is never written to device_addresses "
               f"({len(nodes.recorded)} write(s))")
-        check(namelookup.resolve_name(nodes, None, "192.168.255.7") == "core-sw-a",
-              "so the next message from that address names the device")
+        check(namelookup.resolve_name(nodes, None, "192.168.255.7") is None,
+              "so a message from the loopback address alone still names nothing")
 
-        # An unknown source teaches nothing, and must not cost the trap.
-        before = len(nodes.recorded)
         traps._handle_datagram(v1_trap(agent_addr="192.168.255.9"), ("10.99.99.99", 40000))
-        check(len(nodes.recorded) == before,
-              "a trap from a source that maps to no device records nothing")
+        check(nodes.recorded == [],
+              "a trap from a source that maps to no device records nothing either")
         check(traps.counters["traps"] == 51,
               "and every trap is still counted and queued")
     finally:

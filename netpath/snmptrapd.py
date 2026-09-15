@@ -7,7 +7,6 @@ in practice.
 
 from __future__ import annotations
 
-import collections
 import queue
 import socket
 import time
@@ -45,9 +44,8 @@ class TrapCollector(udpsock.UdpReceiver):
                  nodes_db=None, poll_now=None):
         super().__init__(log)
         self.db = db
-        # Optional: when the Nodes database is available, a v1 trap's
-        # agent-address is recorded as another address of the sending device,
-        # so the next message from that address correlates by name.
+        # Optional: the Nodes database, for source-address correlation
+        # (device_id_for_address) and power-trap rereads.
         self.nodes_db = nodes_db
         # Optional callable(device_id): NodePoller.poll_now, for power traps.
         self.poll_now = poll_now
@@ -67,10 +65,6 @@ class TrapCollector(udpsock.UdpReceiver):
         self._ack_informs = True
         self._reject_failed_auth = True
         self._min_severity = 7
-        # (source, agent address) pairs already written to the alias table, so
-        # a steady stream of v1 traps costs one database write, not one per
-        # trap. Keyed on spoofable data, so bounded and LRU.
-        self._learned: collections.OrderedDict = collections.OrderedDict()
 
     # --------------------------------------------------------------- lifecycle
 
@@ -186,7 +180,6 @@ class TrapCollector(udpsock.UdpReceiver):
         # figure a 10,000-varbind trap arrives as 64 varbinds with nothing to
         # say the rest was thrown away.
         self.counters["too_many_varbinds"] = self.decoder.stats["too_many_varbinds"]
-        self._learn_agent_address(trap)
         self._power_trap_reread(trap)
         if self._first_from(source):
             self.log.add(SNMP, f"First SNMP trap from {source} "
@@ -204,37 +197,10 @@ class TrapCollector(udpsock.UdpReceiver):
         except queue.Full:
             self.counters["dropped"] += 1
 
-    def _learn_agent_address(self, trap) -> None:
-        """Record a v1 trap's agent-address as another address of the sender.
-
-        RFC 1157 traps carry the agent's own idea of its address, which on a
-        device with a management VRF or a loopback trap-source is not the
-        address the datagram came from. Writing it into the Nodes alias table
-        means the operator sees the device's name against those traps.
-        """
-        if trap.version != 0 or not trap.agent_addr:
-            return
-        if trap.agent_addr == trap.source or trap.agent_addr == "0.0.0.0":
-            return
-        if not udpsock.lru_add(self._learned, (trap.source, trap.agent_addr)):
-            return
-
-        record = getattr(self.nodes_db, "record_device_addresses", None)
-        if record is None:
-            return
-        try:
-            device = self.nodes_db.device_by_ip(trap.source)
-            if device is None:
-                return
-            record(device["id"], [trap.agent_addr], "trap_agent_addr")
-        except Exception as exc:
-            # Correlation is a convenience; never let it cost a trap.
-            self._note_error(exc)
-
     def _power_trap_reread(self, trap) -> None:
         """A Cisco power trap from a managed device polls it now, so
-        psu_state catches the event within one poll. Best-effort, like
-        _learn_agent_address; debounced per device."""
+        psu_state catches the event within one poll. Best-effort;
+        debounced per device."""
         if not self.poll_now or not self.nodes_db:
             return
         if (trap.trap_oid or "") not in POWER_TRAP_OIDS:

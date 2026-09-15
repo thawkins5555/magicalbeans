@@ -342,8 +342,7 @@
 
   // A device can answer on more addresses than the one it was entered
   // under — a merge folds the other row's address in here — so the column
-  // says how many others there are and names them, the same way the
-  // discovery table's discIpCell does for a box a sweep reached twice.
+  // says how many others there are and names them.
   function deviceIpCell(r) {
     const all = (r.addresses || []).map((a) => a.ip);
     const extra = Math.max(0, all.length - 1);
@@ -3159,17 +3158,16 @@
     const box = App.modal('Possible duplicates', duplicates.length ? `
       <p class="hint">Pairs that look like one device entered twice. Nothing is
         merged until you say so — open one to see exactly what a merge would
-        move before it happens. Only addresses a device reports in its own
-        address table count as shared; discovered or trap-learned addresses
-        never do.</p>
+        move before it happens. Only addresses a device reports on its own
+        interfaces count as shared.</p>
       <div class="table-wrap scrollbox large">
         <table><caption class="sr-only">Possible duplicate devices</caption>
         <thead><tr><th scope="col">Confidence</th><th scope="col">Device</th>
         <th scope="col">Device</th><th scope="col">Why</th><th scope="col"></th></tr></thead>
         <tbody>${rowsHtml}</tbody></table>
       </div>` : '<p>No two devices here look like the same box.</p>' +
-        '<p class="hint">Only addresses a device reports in its own address ' +
-        'table count as shared; discovered or trap-learned addresses never do.</p>',
+        '<p class="hint">Only addresses a device reports on its own interfaces ' +
+        'count as shared.</p>',
       [{ label: 'Close', onClick: App.closeModal }]);
     for (const button of box.querySelectorAll('.nd-dup-open')) {
       button.onclick = () => {
@@ -6005,9 +6003,8 @@
     for (const x of view.discResults) {
       if (!view.discSeen.has(x.id)) {
         view.discSeen.add(x.id);
-        // A flagged or folded row never pre-ticks; that's a deliberate tick, not a default.
-        if (x.snmp_ok && !x.existing_device_id && !x.duplicate_of_device_id
-            && !x.folded_into_result_id) view.discChecked.add(x.id);
+        // A flagged row never pre-ticks; that's a deliberate tick, not a default.
+        if (x.snmp_ok && !x.existing_device_id && !x.duplicate_of_device_id) view.discChecked.add(x.id);
       }
     }
     drawDiscResultsTable();
@@ -6039,14 +6036,14 @@
     return !r.existing_device_id && !!(r.snmp_ok || (job && job.allow_ping_only));
   }
 
-  // Ticked ids, split into the plain promote list and force_result_ids for rows the sweep flagged or folded.
+  // Ticked ids, split into the plain promote list and force_result_ids for rows the sweep flagged.
   function discForceSplit(ids, rows) {
     const byId = new Map(rows.map((r) => [r.id, r]));
     const result_ids = [];
     const force_result_ids = [];
     for (const id of ids) {
       const row = byId.get(id);
-      const force = !!(row && (row.duplicate_of_device_id || row.folded_into_result_id));
+      const force = !!(row && row.duplicate_of_device_id);
       (force ? force_result_ids : result_ids).push(id);
     }
     return { result_ids, force_result_ids };
@@ -6063,33 +6060,21 @@
       escape(c.confidence)}</span>`;
   }
 
-  // `high` confidence is a known address folded by promote(); `medium` is a name+sysObjectID match only.
+  // `high` confidence is a known address on an existing device's own interfaces; `medium` is a name+sysObjectID match only.
   function discDuplicateCell(r) {
     if (r.existing_device_id) {
       return `<a href="#/nodes/device/${r.existing_device_id}">${
         escape(r.existing_device_name || 'added')}</a>`;
     }
-    const parts = [];
-    if (r.duplicate_of_device_id) {
-      const color = CONFIDENCE_COLOR[r.duplicate_confidence] || 'var(--muted)';
-      parts.push(`<span style="color:${color}" title="${escape(r.duplicate_reason || '')}">` +
-        `${escape(r.duplicate_of_device_name || String(r.duplicate_of_device_id))}` +
-        `</span> <span class="hint">(${escape(r.duplicate_confidence || '')})</span>`);
-    }
-    if (r.folded_into_result_id) {
-      parts.push('<span class="hint" title="The sweep reached the same box on this ' +
-        `address too; tick it to add this address as its own device">Folded into ${
-        escape(r.folded_into_ip || '')}</span>`);
-    }
-    return parts.length ? parts.join(' ') : '\u2014';
+    if (!r.duplicate_of_device_id) return '\u2014';
+    const color = CONFIDENCE_COLOR[r.duplicate_confidence] || 'var(--muted)';
+    return `<span style="color:${color}" title="${escape(r.duplicate_reason || '')}">` +
+      `${escape(r.duplicate_of_device_name || String(r.duplicate_of_device_id))}` +
+      `</span> <span class="hint">(${escape(r.duplicate_confidence || '')})</span>`;
   }
 
-  // Shows how many OTHER addresses this box answered on, so one row for a
-  // 3-address router doesn't read as a sweep that missed the other two.
   function discIpCell(r) {
-    const extra = Math.max(0, (r.addresses || []).length - 1);
-    return `${escape(r.ip)}${extra ? ` <span class="hint" title="${
-      escape((r.addresses || []).join(', '))}">+${extra}</span>` : ''}`;
+    return escape(r.ip);
   }
 
   /* The first cell of a discovery row: a box for a result that may be
@@ -6107,12 +6092,10 @@
       return '<span class="hint" title="Only devices identified over SNMP can be ' +
         'added from this scan">\u2014</span>';
     }
-    // A flagged/folded row still gets a box: ticking it overrules the sweep's guess.
-    const flagged = r.duplicate_of_device_id || r.folded_into_result_id;
-    const flagReason = r.duplicate_of_device_id ? (r.duplicate_reason || '')
-      : `Reached on another address of ${r.folded_into_ip}`;
+    // A flagged row still gets a box: ticking it overrules the sweep's guess.
+    const flagged = !!r.duplicate_of_device_id;
     const warn = flagged
-      ? ` title="Ticking adds it as a separate device \u2014 ${escape(flagReason)}"`
+      ? ` title="Ticking adds it as a separate device \u2014 ${escape(r.duplicate_reason || '')}"`
       : '';
     return `<input type="checkbox" class="${cls}" data-result="${r.id}"${warn}` +
       `${flagged ? ' data-flagged="1"' : ''}` +
@@ -6188,7 +6171,7 @@
      The results table gets this from App.grid's own selectAll now; what is
      left here is the approval dialog, whose table is a plain modal one. */
   function wireDiscSelectAll(table, cls, checkedSet, redraw) {
-    // Flagged/folded rows carry a box but are excluded from "all", matching the grid's select-all.
+    // Flagged rows carry a box but are excluded from "all", matching the grid's select-all.
     const boxes = [...table.querySelectorAll(`.${cls}`)].filter((b) => !b.dataset.flagged);
     const head = table.querySelector('thead th');
     if (!head || !boxes.length) return;
@@ -6226,10 +6209,10 @@
   function drawDiscResultsTable(force) {
     const table = App.el('disc-results-table');
     const job = discSelectedJob();
-    // Select-all governs only the rows the sweep did not flag or fold: a
-    // "Same as"/"Folded into" row is added separately only by its own tick.
+    // Select-all governs only the rows the sweep did not flag: a
+    // "Same as" row is added separately only by its own tick.
     const selectable = view.discResults.filter((r) => discSelectable(r, job)
-      && !r.duplicate_of_device_id && !r.folded_into_result_id);
+      && !r.duplicate_of_device_id);
     const ticked = () => selectable.filter((r) => view.discChecked.has(r.id)).length;
     const chosen = ticked();
     // existing_device_id and snmp_ok are the only fields the server ever
@@ -6241,8 +6224,7 @@
       view.discSelected || '', view.discSort.key, view.discSort.descending ? 'd' : 'a',
       view.discResults.map((r) =>
         `${r.id}:${r.snmp_ok ? 1 : 0}:${r.existing_device_id || ''}` +
-        `:${r.duplicate_of_device_id || ''}:${r.folded_into_result_id || ''}` +
-        `:${(r.addresses || []).length}`).join(','),
+        `:${r.duplicate_of_device_id || ''}`).join(','),
     ].join('|');
     if (!force && signature === discDrawnSignature) {
       App.refreshSelectAll(table, selectable.length, ticked());
@@ -6451,12 +6433,10 @@
     const r = await App.get(`/api/nodes/discovery/${job.id}`);
     const results = r.results;
     const found = results.filter((x) => x.ping_ok || x.snmp_ok);
-    // Folded rows count toward the box they were folded onto, not as their own device.
-    const foundCount = found.filter((x) => !x.folded_into_result_id).length;
-    // Existing, duplicate, or folded rows start unticked regardless of confidence.
+    const foundCount = found.length;
+    // Existing or duplicate-flagged rows start unticked regardless of confidence.
     const seed = new Set(results.filter(
-      (x) => x.snmp_ok && !x.existing_device_id && !x.duplicate_of_device_id
-        && !x.folded_into_result_id)
+      (x) => x.snmp_ok && !x.existing_device_id && !x.duplicate_of_device_id)
       .map((x) => x.id));
     const finish = async () => {
       await App.post(`/api/nodes/discovery/${job.id}/reviewed`, {}).catch(() => {});
@@ -6517,7 +6497,7 @@
         // of this scan's hits were monitored before the operator ever
         // pressed this button, said back so the count of newly-added
         // devices is never mistaken for the size of the sweep.
-        const already = found.filter((x) => x.existing_device_id && !x.folded_into_result_id).length;
+        const already = found.filter((x) => x.existing_device_id).length;
         const added = checked.size;
         if (checked.size) {
           await App.post(`/api/nodes/discovery/${job.id}/promote`,
@@ -6532,7 +6512,7 @@
       <p class="hint">${lead} ${job.allow_ping_only
         ? 'Ping-only devices can be approved too, but start unchecked.'
         : 'Devices that only answered ping are listed but cannot be added — restart the scan with the ping-only option to include them.'}</p>
-      <p class="hint">Rows marked Same as or Folded into start unticked; ticking one adds it as a separate device.</p>
+      <p class="hint">A row marked Same as is a device already added; it starts unticked, and ticking it adds it as a separate device.</p>
       <div class="table-wrap scrollbox large">
         <table><caption class="sr-only">Discovered addresses</caption><thead><tr><th scope="col"></th><th scope="col">IP</th><th scope="col">Ping</th><th scope="col">SNMP</th><th scope="col">Name</th><th scope="col">Vendor</th><th scope="col">Same as</th></tr></thead>
         <tbody>${discResultRowsHtml(found, job, 'disc-approve', checked)}</tbody></table>
@@ -6981,11 +6961,6 @@
           profile's own credentials — see the Profile picker on the
           Discovery subtab.</p>
         ${number('np-maxscan', 'Max addresses per subnet sweep', s.max_scan_addresses, 'min=1')}
-        ${check('np-discaddr', 'Ask each device it finds which addresses it answers on',
-                s.discovery_addresses !== false)}
-        <p class="hint">One bounded read of the device's own address table, so a
-          router reached on two of its addresses is offered once instead of
-          twice. Off, a sweep lists one row per address that answered.</p>
         ${number('np-discworkers', 'Addresses probed at once',
                  s.discovery_workers, 'min=1 max=256')}
         <p class="hint">How many addresses a sweep identifies in parallel. It
@@ -7070,7 +7045,6 @@
           vendor_walk_parallel: num('#np-vendorparallel'),
           discovery_arc_hop: on('#np-dischop'),
           max_scan_addresses: num('#np-maxscan'),
-          discovery_addresses: on('#np-discaddr'),
           discovery_workers: Math.max(1, num('#np-discworkers') || 0),
           detail_fields: DETAIL_FIELDS.map(([key]) => key)
             .filter((key) => on(`#np-df-${key}`)).join(','),

@@ -3863,31 +3863,22 @@ def _device_index(service) -> dict:
             "by_identity": service.nodes_db.devices_by_identity()}
 
 
-def _result_addresses(row) -> list[str]:
-    keys = row.keys()
-    if "ip_addresses" not in keys or not row["ip_addresses"]:
-        return []
-    try:
-        walked = json.loads(row["ip_addresses"])
-    except (TypeError, ValueError):
-        return []
-    return [str(a) for a in walked if a] if isinstance(walked, list) else []
-
-
-def _discovery_duplicate(row, index, addresses) -> dict:
+def _discovery_duplicate(row, index) -> dict:
     """Which device, if any, this result looks like, and how sure. High
-    means a shared address, which nothing else can honestly explain;
-    medium means only sysName+sysObjectID match — a reason to look, not
-    to fold. Only high changes what promote() does."""
+    means the probed address is already on an existing device's own
+    interfaces, which nothing else can honestly explain; medium means only
+    sysName+sysObjectID match — a reason to look, not a verdict. Only high
+    changes what promote() does."""
     if not index:
         return {}
-    for address in [row["ip"], *addresses]:
-        device = index["by_address"].get(address)
-        if device is not None:
-            return {"duplicate_of_device_id": device["id"],
-                    "duplicate_of_device_name": _device_display_name(device),
-                    "duplicate_confidence": "high",
-                    "duplicate_reason": f"{address} is configured on it"}
+    ip = row["ip"]
+    device = index["by_address"].get(ip)
+    if device is not None:
+        name = _device_display_name(device)
+        return {"duplicate_of_device_id": device["id"],
+                "duplicate_of_device_name": name,
+                "duplicate_confidence": "high",
+                "duplicate_reason": f"already added as {name}: {ip} is on its interfaces"}
     key = ((row["sys_name"] or "").lower(), row["sys_object_id"] or "")
     device = index["by_identity"].get(key) if all(key) else None
     if device is not None:
@@ -3899,8 +3890,7 @@ def _discovery_duplicate(row, index, addresses) -> dict:
 
 
 def _discovery_result_json(row, installed=None, devices_by_ip=None,
-                           index=None, folded_ips=(), reveal: bool = False,
-                           folded_into_ip=None) -> dict:
+                           index=None, reveal: bool = False) -> dict:
     """`installed` is the set of MIB filenames present, and `devices_by_ip`
     an ip -> device row map, each passed by the caller once per listing so
     neither the MIB hint nor the already-added check is a query per row.
@@ -3908,9 +3898,7 @@ def _discovery_result_json(row, installed=None, devices_by_ip=None,
     way — by hand, or from an earlier scan — so `devices_by_ip` is checked
     too; either source wins because promote() always reuses that same row.
 
-    `index` adds the duplicate verdict; `folded_ips` are absorbed siblings'
-    addresses, for a primary row. `folded_into_ip` is the primary's own ip,
-    set only when this row is itself folded into another.
+    `index` adds the duplicate verdict, on the probed address alone.
 
     `community_or_user` is the credential that actually answered this
     address, so it follows _community_fields' rule rather than riding out
@@ -3920,11 +3908,6 @@ def _discovery_result_json(row, installed=None, devices_by_ip=None,
     existing = devices_by_ip.get(row["ip"]) if devices_by_ip else None
     existing_id = existing["id"] if existing else row["promoted_device_id"]
     existing_name = _device_display_name(existing) if existing else None
-    keys = row.keys()
-    addresses = _result_addresses(row)
-    for address in folded_ips:
-        if address not in addresses:
-            addresses.append(address)
     return {"id": row["id"], "job_id": row["job_id"], "ip": row["ip"],
             "ping_ok": bool(row["ping_ok"]), "snmp_ok": bool(row["snmp_ok"]),
             "has_community_or_user": bool(row["community_or_user"]),
@@ -3935,11 +3918,7 @@ def _discovery_result_json(row, installed=None, devices_by_ip=None,
             "promoted_device_id": row["promoted_device_id"],
             "existing_device_id": existing_id,
             "existing_device_name": existing_name,
-            "addresses": addresses,
-            "folded_into_result_id": (row["folded_into_result_id"]
-                                      if "folded_into_result_id" in keys else None),
-            "folded_into_ip": folded_into_ip,
-            **_discovery_duplicate(row, index, addresses),
+            **_discovery_duplicate(row, index),
             **_discovery_identification(row, installed)}
 
 
@@ -7183,28 +7162,9 @@ def get_nodes_discovery_job(service, params, body, job_id) -> dict:
     # of a /22 can carry over a thousand results.
     index = _device_index(service)
     devices_by_ip = index["by_ip"]
-    # A folded row's addresses still ride on its primary row too, so the
-    # primary reads as one box with every address it answers on; the
-    # folded row is also listed in its own right, marked with the primary
-    # it was folded into, so it can be added as a second device.
-    by_id = {row["id"]: row for row in results}
-    folded: dict[int, list[str]] = {}
-    for row in results:
-        into = row["folded_into_result_id"] if "folded_into_result_id" in row.keys() else None
-        if into:
-            folded.setdefault(into, []).append(row["ip"])
     reveal = _may_read_secrets(service, params, "nodes")
-    rows_json = []
-    for row in sorted(results, key=lambda r: r["id"]):
-        into = row["folded_into_result_id"] if "folded_into_result_id" in row.keys() else None
-        if into:
-            primary = by_id.get(into)
-            rows_json.append(_discovery_result_json(
-                row, installed, devices_by_ip, index, (), reveal,
-                folded_into_ip=primary["ip"] if primary else None))
-        else:
-            rows_json.append(_discovery_result_json(
-                row, installed, devices_by_ip, index, folded.get(row["id"], ()), reveal))
+    rows_json = [_discovery_result_json(row, installed, devices_by_ip, index, reveal)
+                for row in sorted(results, key=lambda r: r["id"])]
     return {"job": _discovery_job_json(job), "results": rows_json}
 
 

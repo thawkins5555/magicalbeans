@@ -3639,30 +3639,39 @@ check("r.alias, r.kind, r.medium, r.media, r.oper_status" in NODES80,
 check("row.id = `${row.device_id}:${row.if_index}`;" in NODES80,
       "runSfpReport keys each report row by device and if_index, not device alone")
 
-# --- 82. Duplicate evidence is scoped to ipAddrTable addresses -------------
-# Only addresses a device reports in its own ipAddrTable count toward
-# duplicate detection; discovered, trap-learned and merge-inherited
-# addresses stay on file for correlation but never make two devices look
-# like duplicates.
+# --- 82. Duplicate evidence is scoped to a device's own interfaces ---------
+# Only addresses a device reports on its own interfaces count toward
+# duplicate detection; the discovery-addresses walk and the trap/merge
+# writers are gone, so device_addresses now holds nothing else.
 NODES82 = read("nodes.js")
 INDEX82 = read("index.html")
-check("Only addresses a device reports in its own\n"
-      "        address table count as shared; discovered or trap-learned addresses\n"
-      "        never do." in NODES82,
+check("Only addresses a device reports on its own\n"
+      "        interfaces count as shared." in NODES82,
       "the Duplicates dialog's hint paragraph says shared-address evidence "
-      "is scoped to a device's own address table")
-check("'<p class=\"hint\">Only addresses a device reports in its own address ' +\n"
-      "        'table count as shared; discovered or trap-learned addresses never do.</p>'"
+      "is scoped to a device's own interfaces")
+check("'<p class=\"hint\">Only addresses a device reports on its own interfaces ' +\n"
+      "        'count as shared.</p>'"
       in NODES82,
       "the Duplicates dialog repeats that scope note in the empty-state "
       "branch too, so the caveat holds even when nothing looks like a "
       "duplicate today")
-check("Only addresses with source ipAddrTable (the\n"
-      "                device's own address table) count toward duplicate detection;\n"
-      "                discovered and trap-learned addresses are kept for trap and\n"
-      "                syslog correlation." in INDEX82,
+check("Addresses on this device's own interfaces\n"
+      "                (physical, VLAN, loopback, tunnel), read from its address\n"
+      "                table every hour. Its ARP table is on the ARP subtab." in INDEX82,
       "the Addresses subtab (nd-d-sub-addresses) carries a static hint "
-      "explaining which source counts toward duplicate detection")
+      "explaining what the table holds and where the ARP table is")
+check("np-discaddr" not in NODES82,
+      "the discovery-addresses checkbox (np-discaddr) is gone from the "
+      "Discovery settings dialog and the settings save payload")
+check("discovery_addresses" not in NODES82,
+      "discovery_addresses is gone from nodes.js entirely -- the setting "
+      "no longer exists server-side")
+check("Folded into" not in NODES82,
+      "the \"Folded into\" note is gone from nodes.js -- folding no longer "
+      "exists, every discovery result is its own row")
+check("folded_into_result_id" not in NODES82,
+      "folded_into_result_id is gone from nodes.js -- the server JSON no "
+      "longer carries it")
 _API82 = open(os.path.join(REPO_ROOT, "netpath", "web", "api.py"), encoding="utf-8").read()
 _NODEPOLL82 = open(os.path.join(REPO_ROOT, "netpath", "nodepoll.py"), encoding="utf-8").read()
 check("address_owners(configured=True)" in _API82,
@@ -3676,71 +3685,68 @@ check("device_id_for_address(address, configured=True)" in _NODEPOLL82,
       "so a discovered or trap-learned address never folds a result "
       "onto a device")
 
-# --- 83. A flagged or folded discovery result never pre-ticks, and ticking
-# one forces it in as its own device rather than folding it onto the box
-# the sweep guessed. Server contract: POST .../promote takes
-# {result_ids, force_result_ids}.
+# --- 83. A flagged discovery result never pre-ticks, and ticking one forces
+# it in as its own device rather than the "Same as" match. Server contract:
+# POST .../promote takes {result_ids, force_result_ids}. Every result is its
+# own row now -- there is no folding, so the rules key on
+# duplicate_of_device_id alone.
 NODES83 = read("nodes.js")
 INDEX83 = read("index.html")
-HINT83 = ("Rows marked Same as or Folded into start unticked; ticking one "
-          "adds it as a separate device.")
-check("&& !x.folded_into_result_id) view.discChecked.add(x.id);" in NODES83,
-      "loadDiscResults' pre-tick seeding excludes a folded row "
-      "(folded_into_result_id), not just an existing/duplicate one")
-check("(x) => x.snmp_ok && !x.existing_device_id && !x.duplicate_of_device_id\n"
-      "        && !x.folded_into_result_id)" in NODES83,
-      "openApprovalDialog's seed also excludes a folded row, alongside "
-      "existing_device_id and duplicate_of_device_id")
+HINT83 = ("A row marked Same as is a device already added; it starts "
+          "unticked, and ticking it adds it as a separate device.")
+check("if (x.snmp_ok && !x.existing_device_id && !x.duplicate_of_device_id) "
+      "view.discChecked.add(x.id);" in NODES83,
+      "loadDiscResults' pre-tick seeding excludes an existing or "
+      "duplicate-flagged row, keyed on duplicate_of_device_id alone")
+check("(x) => x.snmp_ok && !x.existing_device_id && !x.duplicate_of_device_id)"
+      in NODES83,
+      "openApprovalDialog's seed excludes existing_device_id and "
+      "duplicate_of_device_id rows, with no folded-row exclusion")
 check("function discForceSplit(ids, rows) {" in NODES83,
       "discForceSplit is the one place ticked ids are split into the two "
       "promote() keys")
 check("return { result_ids, force_result_ids };" in NODES83,
-      "discForceSplit returns force_result_ids for a flagged or folded row, "
-      "so ticking one adds it as a separate device instead of folding it")
+      "discForceSplit returns force_result_ids for a flagged row, so "
+      "ticking one adds it as a separate device")
+check("const force = !!(row && row.duplicate_of_device_id);" in NODES83,
+      "discForceSplit keys the force decision on duplicate_of_device_id alone")
 check("discForceSplit([...checked], results)).catch(() => {});" in NODES83,
       "the approval dialog's Add approved button posts through "
       "discForceSplit, not a bare result_ids array")
 check("discForceSplit([...view.discChecked], view.discResults));" in NODES83,
       "promoteSelected (the Results pane) posts through discForceSplit too")
-check('Folded into ${' in NODES83,
-      "discDuplicateCell shows \"Folded into <ip>\" for a folded row")
-check("The sweep reached the same box on this ' +\n"
-      '        `address too; tick it to add this address as its own device">'
-      in NODES83,
-      "the Folded into span carries the hint explaining what ticking it does")
-check("Ticking adds it as a separate device \\u2014 ${escape(flagReason)}"
-      in NODES83,
-      "discCheckCell's title on a flagged or folded row leads with "
-      "\"Ticking adds it as a separate device\"")
 check(HINT83 in NODES83,
-      "the approval dialog carries the Same as/Folded into hint sentence")
+      "the approval dialog carries the new Same as hint sentence")
 check(HINT83 in INDEX83,
       "the Results pane (#disc-promote) carries the same hint sentence, "
       "as a <p class=\"hint\"> near the Promote button")
+check("Ticking adds it as a separate device \\u2014 ${escape(r.duplicate_reason || '')}"
+      in NODES83,
+      "discCheckCell's title on a flagged row is "
+      "\"Ticking adds it as a separate device — <duplicate_reason>\"")
 
-check("!r.duplicate_of_device_id && !r.folded_into_result_id);" in NODES83,
-      "the results grid's select-all skips flagged and folded rows, which are "
-      "added separately only by their own tick")
+check("const selectable = view.discResults.filter((r) => discSelectable(r, job)\n"
+      "      && !r.duplicate_of_device_id);" in NODES83,
+      "the results grid's select-all skips flagged rows, which are added "
+      "separately only by their own tick")
 check("${flagged ? ' data-flagged=\"1\"' : ''}" in NODES83,
-      "discCheckCell marks a flagged or folded row's box with data-flagged, "
-      "so it can be told apart from a plain selectable one")
+      "discCheckCell marks a flagged row's box with data-flagged, so it "
+      "can be told apart from a plain selectable one")
 check("const boxes = [...table.querySelectorAll(`.${cls}`)]"
       ".filter((b) => !b.dataset.flagged);" in NODES83,
-      "wireDiscSelectAll (the approval dialog's header box) excludes flagged/"
-      "folded boxes from its subset, the same rule the Results grid's "
+      "wireDiscSelectAll (the approval dialog's header box) excludes "
+      "flagged boxes from its subset, the same rule the Results grid's "
       "select-all applies")
-check("const foundCount = found.filter((x) => !x.folded_into_result_id).length;"
-      in NODES83,
-      "the discard confirm's device count excludes folded rows, which are "
-      "not their own device")
+check("const foundCount = found.length;" in NODES83,
+      "the discard confirm's device count is just found.length -- there "
+      "are no folded rows to exclude any more")
 check("`<p>Discard this scan and all <b>${foundCount}</b> device(s) it found?</p>`"
       in NODES83,
-      "the discard confirm text uses the folded-excluding foundCount, not "
-      "found.length")
-check("const already = found.filter((x) => x.existing_device_id "
-      "&& !x.folded_into_result_id).length;" in NODES83,
-      "the already-monitored count excludes folded rows too, since a "
-      "primary promote also marks its folded siblings existing_device_id")
+      "the discard confirm text uses foundCount")
+check("const already = found.filter((x) => x.existing_device_id).length;"
+      in NODES83,
+      "the already-monitored count is a plain existing_device_id filter, "
+      "with no folded-row exclusion")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

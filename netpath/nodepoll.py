@@ -13,7 +13,6 @@ right shape, not IpamWorker's coarser "unseen = immediately due" one.
 from __future__ import annotations
 
 import ipaddress
-import json
 import math
 import random
 import re
@@ -2237,36 +2236,6 @@ class NodePoller(Worker):
             job = self._discovery_jobs.get(job_id)
             return job is not None and job.running
 
-    @staticmethod
-    def _walked_addresses(result) -> list[str]:
-        """Every address the sweep's own ipAdEntAddr walk reached (not the
-        probed address), deduped and filtered through
-        nodesdb.alias_candidate. Empty for a row written before 5.0 or by a
-        sweep with discovery_addresses off."""
-        addresses = []
-        keys = result.keys()
-        if "ip_addresses" in keys and result["ip_addresses"]:
-            try:
-                walked = json.loads(result["ip_addresses"])
-            except (TypeError, ValueError):
-                walked = []
-            for address in walked if isinstance(walked, list) else []:
-                text = nodesdb.alias_candidate(address)
-                if text and text not in addresses:
-                    addresses.append(text)
-        return addresses
-
-    @staticmethod
-    def _result_addresses(result) -> list[str]:
-        """Every address the sweep reached this result on, the probed one
-        first. Blank for a row written before 5.0 or by a sweep with
-        discovery_addresses off."""
-        addresses = [result["ip"]]
-        for address in NodePoller._walked_addresses(result):
-            if address not in addresses:
-                addresses.append(address)
-        return addresses
-
     def promote(self, job_id: int, result_ids: list[int],
                 force: bool = False, force_ids=()) -> list[int]:
         """Creates a devices row per discovery result. The target profile
@@ -2287,16 +2256,14 @@ class NodePoller(Worker):
         unless its job was started with the allow-ping-only option — the
         checkbox state in the browser is a convenience, this is the rule.
 
-        A result folded into another (same box, second L3 address) is
-        promoted as its primary, so ticking either row adds one device;
-        a result whose walked addresses match a device's configured
-        addresses is recorded on that device rather than added beside it.
-        Only the promoted row itself is marked — a folded sibling that
-        was not force-added stays untouched and keeps reading as a
-        duplicate of whatever device its primary became.
+        A result whose probed address is already a device folds onto
+        it; unless forced, a result whose probed address is on an
+        existing device's interfaces folds onto that device too.
         `force_ids` (or `force=True` for everything) adds those rows as
-        their own device, processed first so a primary ticked alongside
-        still gets one.
+        their own device regardless, processed first so an address a
+        later row would otherwise have folded onto still gets its own
+        row. A promoted device writes nothing to device_addresses; its
+        first poll fills the interface list.
         """
         job = self.db.discovery_job(job_id)
         allow_ping_only = bool(job and job["allow_ping_only"])
@@ -2308,13 +2275,6 @@ class NodePoller(Worker):
         for raw_id in ordered_ids:
             result = self.db.discovery_result(raw_id)
             is_forced = raw_id in forced
-            is_folded = result is not None and result.keys().__contains__("folded_into_result_id") \
-                and bool(result["folded_into_result_id"])
-            if is_folded and not is_forced:
-                primary = self.db.discovery_result(result["folded_into_result_id"])
-                if primary is not None:
-                    result = primary
-                    is_folded = False
             if result is None or result["job_id"] != job_id:
                 continue
             result_id = result["id"]
@@ -2326,16 +2286,12 @@ class NodePoller(Worker):
             if result["promoted_device_id"]:
                 device_ids.append(result["promoted_device_id"])
                 continue
-            addresses = self._result_addresses(result)
             existing = self.db.device_by_ip(result["ip"])
             if existing is None and not is_forced:
-                for address in addresses:
-                    owner = self.db.device_id_for_address(address, configured=True)
-                    if owner is not None and owner not in forced_devices:
-                        existing = self.db.device(owner)
-                        break
+                owner = self.db.device_id_for_address(result["ip"], configured=True)
+                if owner is not None and owner not in forced_devices:
+                    existing = self.db.device(owner)
             if existing is not None:
-                self._record_promoted_addresses(existing["id"], result, addresses)
                 self.db.mark_promoted(result_id, existing["id"])
                 device_ids.append(existing["id"])
                 if is_forced:
@@ -2380,7 +2336,6 @@ class NodePoller(Worker):
                                        if "vendor_confidence" in keys else "") or "",
                     vendor_evidence=(result["vendor_evidence"]
                                      if "vendor_evidence" in keys else None))
-            self._record_promoted_addresses(device_id, result, addresses)
             self.db.mark_promoted(result_id, device_id)
             device_ids.append(device_id)
             if is_forced:
@@ -2392,16 +2347,6 @@ class NodePoller(Worker):
                 seen_devices.add(did)
                 deduped.append(did)
         return deduped
-
-    def _record_promoted_addresses(self, device_id: int, result, addresses: list[str]) -> None:
-        """The sweep's own ipAdEntAddr walk is configured evidence at once;
-        the probed address, when not walked, is correlation-only."""
-        walked = self._walked_addresses(result)
-        if walked:
-            self.db.record_device_addresses(device_id, walked, nodesdb.CONFIGURED_SOURCE)
-        remaining = [a for a in addresses if a not in walked]
-        if remaining:
-            self.db.record_device_addresses(device_id, remaining, "discovery")
 
     # ------------------------------------------------------------------ loop
 

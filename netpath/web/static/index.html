@@ -261,17 +261,15 @@
               <div id="nd-arp-note" hidden></div>
               <div class="table-wrap"><table id="nd-arp-table"></table></div>
             </div>
-            <!-- Every L3 address this device answers on: its configured
-                 one, plus whatever its ipAddrTable reported. What makes a
-                 trap or syslog line from a loopback attributable, and what
-                 says why a second address was not added as a second
-                 device. -->
+            <!-- Every L3 address this device answers on, read from its own
+                 interface table hourly. What makes a trap or syslog line
+                 from a loopback attributable, and what says why a second
+                 address was not added as a second device. -->
             <div id="nd-d-sub-addresses" class="subpage">
               <div class="table-wrap"><table id="nd-addr-table"></table></div>
-              <p class="hint">Only addresses with source ipAddrTable (the
-                device's own address table) count toward duplicate detection;
-                discovered and trap-learned addresses are kept for trap and
-                syslog correlation.</p>
+              <p class="hint">Addresses on this device's own interfaces
+                (physical, VLAN, loopback, tunnel), read from its address
+                table every hour. Its ARP table is on the ARP subtab.</p>
             </div>
             <!-- STP state, the PSE power pair and PtP radio RF are
                  per-device capabilities most devices don't have, so each
@@ -307,7 +305,7 @@
       <div class="pane pad-x pad-b" data-grow="2">
         <div class="bar"><span class="section">RESULTS</span><span class="grow"></span>
           <button id="disc-promote" data-requires-write="nodes" class="primary">Promote selected</button></div>
-        <p class="hint">Rows marked Same as or Folded into start unticked; ticking one adds it as a separate device.</p>
+        <p class="hint">A row marked Same as is a device already added; it starts unticked, and ticking it adds it as a separate device.</p>
         <div class="table-wrap"><table id="disc-results-table"></table></div>
       </div>
     </div>

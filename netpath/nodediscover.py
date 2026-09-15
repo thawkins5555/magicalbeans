@@ -18,7 +18,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from . import mibcatalog, nodeoids, nodesdb, vendorid
+from . import mibcatalog, nodeoids, vendorid
 from .eventlog import ERROR, NODES, NullLog
 from .ipam_scan import (DEFAULT_PROBES_PER_SECOND, SubnetTooLarge,
                         is_never_scanned, parse_never_scan, sweep,
@@ -89,50 +89,6 @@ def _snmp_getnext_one(ip: str, version: int, community: str, timeout_s: float,
     raise last_error or SnmpError(f"no reply from {ip}")
 
 
-def _snmp_walk_column(ip: str, version: int, community: str, timeout_s: float,
-                      retries: int, base_oid: str, max_rows: int = 32) -> list:
-    """One table column, walked with the arc hop's own single GETNEXT, not
-    nodepoll's GETBULK walker (needs a polled device's merged config).
-    Bounded by the subtree prefix, `max_rows`, non-advancing answers and
-    the end of the MIB; a mid-walk SnmpError returns what was collected
-    rather than losing it."""
-    values = []
-    current = base_oid
-    prefix = base_oid + "."
-    while len(values) < max_rows:
-        try:
-            step = _snmp_getnext_one(ip, version, community, timeout_s,
-                                     retries, current)
-        except SnmpError:
-            break
-        if step is None:
-            break
-        oid, _type, value = step
-        if not oid.startswith(prefix) or oid == current:
-            break
-        values.append((oid[len(prefix):], value))
-        current = oid
-    return values
-
-
-def fold_target(mine: list[str], owners: dict[str, int]) -> int | None:
-    """The earlier result in this sweep that already claimed one of these
-    addresses, or None. Pure so the rule can be tested without a socket."""
-    for address in mine:
-        owner = owners.get(address)
-        if owner is not None:
-            return owner
-    return None
-
-
-def register_addresses(owners: dict[str, int], result_id: int,
-                       mine: list[str]) -> None:
-    """First result to reach an address keeps it — a later one folds into
-    this one rather than stealing its addresses."""
-    for address in mine:
-        owners.setdefault(address, result_id)
-
-
 class DiscoveryJob:
     def __init__(self, db: NodesDatabase, job_id: int, kind: str, target: str,
                 settings: dict, log=None):
@@ -146,9 +102,6 @@ class DiscoveryJob:
         # Guards the counters and fold map; never held across an SNMP probe.
         self._lock = threading.Lock()
         self._probed = self._responded = self._identified = 0
-        # Address -> the result id that reached it first, this sweep only —
-        # folds a router probed on two of its own addresses into one offer.
-        self._owners: dict[str, int] = {}
         self._progress_ts = 0.0
         self._thread = threading.Thread(target=self._run_safe,
                                         name=f"discovery-{job_id}", daemon=True)
@@ -349,26 +302,19 @@ class DiscoveryJob:
                 result["suggested_group_id"] = nodeoids.suggest_group(
                     identity.get("sys_descr", ""),
                     identity.get("sys_object_id", ""), groups)
-        self._record(ip, result)
+        self._record(result)
 
-    def _record(self, ip: str, result: dict) -> None:
-        """A worker's whole share of the job state, under one lock: the fold
-        decision and the row it depends on have to be one step, or two
-        addresses of the same router landing together would each find the
-        other unclaimed and the box would be offered twice."""
+    def _record(self, result: dict) -> None:
+        """A worker's whole share of the job state, under one lock: every
+        result is its own row, no folding — the probed address is all this
+        sweep ever asserts about a target."""
         with self._lock:
             self._probed += 1
             if result["ping_ok"]:
                 self._responded += 1
-            mine = self._result_addresses(ip, result)
-            folded = fold_target(mine, self._owners)
-            if folded is not None:
-                result["folded_into_result_id"] = folded
-            elif result["snmp_ok"]:
-                self._identified += 1  # a folded row is the same device again
-            result_id = self.db.add_discovery_result(self.job_id, **result)
-            if folded is None:
-                register_addresses(self._owners, result_id, mine)
+            if result["snmp_ok"]:
+                self._identified += 1
+            self.db.add_discovery_result(self.job_id, **result)
             self._write_progress()
 
     _PROGRESS_INTERVAL_S = 0.25
@@ -422,44 +368,8 @@ class DiscoveryJob:
                 result.update(self._identify_vendor(
                     ip, version, community, timeout_s, retries,
                     sys_object_id, sys_descr))
-                result["ip_addresses"] = json.dumps(self._walk_addresses(
-                    ip, version, community, timeout_s, retries))
                 return result
         return None
-
-    @staticmethod
-    def _result_addresses(ip: str, result: dict) -> list[str]:
-        """The probed address plus everything walked behind it. The probed
-        one leads because it is the address the sweep can prove answers."""
-        addresses = [address for address in (nodesdb.alias_candidate(ip),) if address]
-        try:
-            walked = json.loads(result.get("ip_addresses") or "[]")
-        except (TypeError, ValueError):
-            walked = []
-        for address in walked if isinstance(walked, list) else []:
-            if address and address not in addresses:
-                addresses.append(address)
-        return addresses
-
-    _MAX_WALKED_ADDRESSES = 32
-
-    def _walk_addresses(self, ip: str, version: int, community: str,
-                        timeout_s: float, retries: int) -> list[str]:
-        """Every L3 address this box answers on (ipAdEntAddr alone, so at
-        most 33 GETNEXTs) — lets a router reached on two addresses be
-        offered once. Off (discovery_addresses) makes the sweep exactly
-        4.54's: one row per address, nothing folded."""
-        if not self.settings.get("discovery_addresses", True):
-            return []
-        rows = _snmp_walk_column(ip, version, community, timeout_s, retries,
-                                 nodeoids.IP_ADDR_TABLE,
-                                 max_rows=self._MAX_WALKED_ADDRESSES)
-        addresses = []
-        for _suffix, value in rows:
-            address = nodesdb.alias_candidate(value)
-            if address and address not in addresses:
-                addresses.append(address)
-        return addresses
 
     def _identify_vendor(self, ip: str, version: int, community: str,
                          timeout_s: float, retries: int, sys_object_id: str,

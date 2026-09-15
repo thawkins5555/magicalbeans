@@ -1,13 +1,12 @@
 """The discovery thread pool: that it actually overlaps addresses, that one
-worker still means one at a time, that the fold rule survives two addresses
-of the same device landing together, and that the worker count reaches a job
-from settings and from the per-scan override.
+worker still means one at a time, that two addresses of the same device
+answering together are recorded as two separate results (no fold), and that
+the worker count reaches a job from settings and from the per-scan override.
 
 Hermetic: the ping sweep is patched all-alive and _snmp_identify is replaced
 with a stand-in that counts how many probes are in flight and sleeps instead
 of touching a socket, so the timings measure the pool and nothing else.
 """
-import json
 import os
 import threading
 import time
@@ -112,10 +111,9 @@ try:
           probes.peak == 1, probes.peak)
     print(f"   peak in flight {probes.peak}, {probes.calls} probes, {elapsed:.2f}s")
 
-    # --------------------------------- 3. the fold rule under a real race
+    # ------------------------------- 3. two results under a real race, no fold
     print("3. two addresses of one device, answering at the same instant, "
-          "fold into one offer")
-    shared = ["10.55.0.1", "10.55.0.2"]
+          "are recorded as two separate results")
     barrier = threading.Barrier(2, timeout=30)
 
     def racing_try_snmp(self, ip, communities, timeout_s, retries=0):
@@ -124,24 +122,18 @@ try:
         barrier.wait()
         return {"community_or_user": "public", "snmp_version": 1,
                 "sys_descr": "shared router", "sys_name": "r1",
-                "sys_object_id": "1.3.6.1.4.1.9.1.1",
-                "ip_addresses": json.dumps(shared)}
+                "sys_object_id": "1.3.6.1.4.1.9.1.1"}
 
     DiscoveryJob._try_snmp = racing_try_snmp
     _elapsed, job_id, job = run_sweep(
         db, poller, "127.0.0.16/30", dict(BASE, discovery_workers=2))
     DiscoveryJob._try_snmp = real_try_snmp
     rows = db.discovery_results(job_id)
-    folded = [r for r in rows if r["folded_into_result_id"]]
-    primary = [r for r in rows if not r["folded_into_result_id"]]
     check("both addresses were recorded", len(rows) == 2, len(rows))
-    check("exactly one of them folded into the other",
-          len(folded) == 1 and len(primary) == 1, (len(folded), len(primary)))
-    check("...into a row of this same job",
-          bool(folded) and folded[0]["folded_into_result_id"] == primary[0]["id"],
-          [dict(r) for r in rows])
-    check("the job counts one device found, not two",
-          job["identified"] == 1, job["identified"])
+    check("neither row carries a fold", all(not r["folded_into_result_id"]
+                                            for r in rows), [dict(r) for r in rows])
+    check("the job counts both as identified",
+          job["identified"] == 2, job["identified"])
 
     # ------------------------------------------- 4. the setting and override
     print("4. the worker count reaches a job from settings and per scan")

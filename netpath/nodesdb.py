@@ -470,17 +470,14 @@ CREATE INDEX IF NOT EXISTS ix_port_vlans_seen ON port_vlans(seen_ts);
 -- (see nodesseriesdb.py); mib_files and mib_objects in nodes_mibs.db (see
 -- nodesmibdb.py). NodesDatabase still exposes every one of their methods.
 
--- Every address a device is known to answer on, beside its primary `ip`.
--- A switch sends its traps from a loopback and its syslog from a
--- management VRF, and both are addresses the devices table has never
--- heard of, so the alert engine could not tell whose they were. Filled
--- best-effort from each poll's ipAddrTable read (source 'ipAddrTable');
--- `source` is kept so a later manual or protocol-learned entry can be
--- told apart from a polled one. The device's own `ip` is deliberately NOT
--- mirrored here — device_id_for_address falls back to devices.ip — so
--- there is one place a primary address is stored. Only 'ipAddrTable' rows
--- are duplicate-device identity evidence; discovered/trap/merge rows are
--- correlation-only (see nodesdb.CONFIGURED_SOURCE).
+-- The device's own interface addresses, beside its primary `ip`: a switch
+-- sends its traps from a loopback and its syslog from a management VRF,
+-- and both are addresses the devices table has never heard of, so the
+-- alert engine could not tell whose they were. Refreshed by the hourly
+-- poll's ipAddrTable walk (source CONFIGURED_SOURCE, 'ipAddrTable') — the
+-- only writer. The device's own `ip` is deliberately NOT mirrored here —
+-- device_id_for_address falls back to devices.ip — so there is one place
+-- a primary address is stored.
 CREATE TABLE IF NOT EXISTS device_addresses (
     device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     ip              TEXT NOT NULL,
@@ -757,9 +754,6 @@ DEFAULTS = {
     "vendor_walk_budget_s": 20.0,
     "vendor_walk_parallel": 4,
     "discovery_arc_hop": True,
-    # Folds a router reached on two L3 addresses into one offer; off makes
-    # a sweep exactly 4.54's (one row per address, nothing folded).
-    "discovery_addresses": True,
     # How many addresses a sweep has in flight at once. Not a packet rate:
     # discovery_probes_per_second still paces every probe.
     "discovery_workers": 32,
@@ -1082,6 +1076,8 @@ class NodesDatabase(SqliteStore):
     # 5.10.0's default, superseded by fw_version in 5.15.0.
     _DETAIL_FIELDS_PRE_5_15 = "sys_descr,vendor,snmp_version,sw_version,sw_image"
     _DETAIL_FIELDS_MIGRATED_5_15 = "detail_fields_widened_5_15"
+    # Marker for the one-time device_addresses wipe of non-interface rows.
+    _ADDRESSES_INTERFACE_ONLY_5_29 = "addresses_interface_only_5_29"
     LABEL = "nodes"
     # The two event logs; the device rows themselves are inventory.
     OLDEST_TS_SQL = ("SELECT MIN(ts) FROM (SELECT MIN(ts) AS ts FROM"
@@ -1458,6 +1454,18 @@ class NodesDatabase(SqliteStore):
             self._conn.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                 (self._DETAIL_FIELDS_MIGRATED_5_15, json.dumps(True)))
+
+        # One-time wipe: device_addresses used to carry discovery/trap/merge
+        # rows as well as interface rows. From 5.29.0 only the interface
+        # walk (CONFIGURED_SOURCE) writes this table, so anything else on
+        # disk from before is stale and is deleted once.
+        if not self._private_setting(self._ADDRESSES_INTERFACE_ONLY_5_29):
+            self._conn.execute(
+                "DELETE FROM device_addresses WHERE source <> ?",
+                (CONFIGURED_SOURCE,))
+            self._conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (self._ADDRESSES_INTERFACE_ONLY_5_29, json.dumps(True)))
 
     def _seed(self) -> None:
         """Creates a `Default` polling profile if none exists yet. Idempotent
@@ -3153,15 +3161,14 @@ class NodesDatabase(SqliteStore):
     def merge_devices(self, loser_id: int, winner_id: int) -> dict:
         """Fold the loser into the winner in one transaction. Moves what
         belongs to the box (addresses, event history, anything pointing at
-        it); leaves the polled state both rows hold twice over (interfaces,
-        metrics, MAC/neighbour tables) to the FK cascade and the winner's
-        own refresh, except vlans/vlan_ports/port_vlans, which have no FK
-        and are deleted here by hand."""
+        it) to the winner; the loser's primary ip is not carried over as an
+        alias, so the winner's next interface-table walk is what confirms or
+        drops it. Leaves the polled state both rows hold twice over
+        (interfaces, metrics, MAC/neighbour tables) to the FK cascade and
+        the winner's own refresh, except vlans/vlan_ports/port_vlans, which
+        have no FK and are deleted here by hand."""
         plan = self.merge_plan(loser_id, winner_id)
-        now = time.time()
         with self._lock:
-            loser = self._conn.execute(
-                "SELECT * FROM devices WHERE id = ?", (loser_id,)).fetchone()
             winner = self._conn.execute(
                 "SELECT * FROM devices WHERE id = ?", (winner_id,)).fetchone()
             try:
@@ -3173,19 +3180,6 @@ class NodesDatabase(SqliteStore):
                 self._conn.execute(
                     "DELETE FROM device_addresses WHERE device_id = ? AND ip = ?",
                     (winner_id, winner["ip"]))
-                if loser["ip"] and loser["ip"] != winner["ip"]:
-                    # The loser's primary ip has no device_addresses row of its
-                    # own (see the table's comment), so its first_seen_ts is
-                    # the loser's created_ts rather than NULL.
-                    self._conn.execute(
-                        "INSERT INTO device_addresses(device_id, ip, source,"
-                        " seen_ts, first_seen_ts) VALUES (?,?,?,?,?)"
-                        " ON CONFLICT(device_id, ip) DO UPDATE SET"
-                        " source=excluded.source, seen_ts=excluded.seen_ts,"
-                        " first_seen_ts=COALESCE(device_addresses.first_seen_ts,"
-                        " excluded.first_seen_ts)",
-                        (winner_id, loser["ip"], "merge", now,
-                         loser["created_ts"] or now))
                 self._conn.execute(
                     "UPDATE devices SET upstream_id = ? WHERE upstream_id = ?"
                     " AND id <> ?", (winner_id, loser_id, winner_id))

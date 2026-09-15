@@ -5,6 +5,58 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.29.0 — Discovery addresses removed: interfaces and ARP only
+
+**Operator prompt:**
+"I would like a 1 time wipe of the 'Discovery' addresses on each node -
+the only IP's I want associated with each node are ones that are
+actually assigned to physical or logical interfaces on that device and
+then IP's in the ARP table.  I do not want to document or include any
+type of information of the IP address a device was 'discovered
+through' or whatever the 'discovery' IP addresses are currently.  I do
+not want the 'Discovery' addresses functionality."
+
+**Planning answers:**
+1. Scope — wipe and stop everything on a node's address list that
+   doesn't come from the device's own interface table: discovery
+   addresses, a trap's agent-address, and addresses a merge carried
+   over from the losing device. The ARP table is a separate table and
+   is untouched.
+2. The operator's own restatement, and the answer to it: "When a
+   subnet is scanned during a discovery and a device replies to SNMP
+   a check should then be done to see if there is an existing device
+   in the Nodes module that has the same IP address assigned to one
+   of it's physical or logical interfaces.  If a matching node is
+   found it should alert the user that the device is a duplicate and
+   is already added to the system.  I am not sure how the 'discovery'
+   can reach any IP's other than what is explicitly listed in the
+   Target field." Confirmed: discovery never contacted anything
+   outside the Target field. What it did was ask each responding box
+   for its own address table (an `ipAdEntAddr` walk) and record those
+   addresses on the node at promote time — that extra read is what's
+   being removed.
+3. Discovery now compares only the address it probed — no interface-
+   table read during discovery, no "+N addresses" count, no folding
+   two results together because they turned out to share an interface
+   table. The Discovery settings checkbox "Ask each device it finds
+   which addresses it answers on" is removed, with the operator's
+   permission.
+
+**Notes:** a one-time migration deletes every `device_addresses` row
+whose source isn't the interface-table walk (`ipAdEntAddr`) — marker-
+gated so it runs once per database and never repeats on restart. The
+trap daemon no longer records a trap's agent-address as a node
+address. A merge no longer carries the losing device's old primary
+address forward as an alias on the survivor. A newly promoted device
+carries no addresses at all until its first regular poll walks its
+interface table. The "Same as" duplicate flag now reads "already
+added as `<node>`: `<ip>` is on its interfaces" — it only ever meant
+interface-table evidence, this just says so plainly — and the
+5.28.0 tick-to-add-separately override is unchanged and still works
+the same way.
+
+**Outcome.** [to be filled in at release]
+
 ## 5.28.0 — Discovery duplicates: an override, and folded rows no longer hidden
 
 **Operator prompt:**
