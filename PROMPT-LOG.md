@@ -44,7 +44,7 @@ isn't a silent change. Added `tests/test_duplicate_evidence.py` and a
 new section in the existing device-identity tests covering the
 configured-vs-discovered split.
 
-**Outcome.** [to be filled in at release]
+**Outcome.** Shipped as 5.26.0. Full suite 167/171 with only the four known environmental failures (no passphrase, no traceroute, socket family, prune-lock timing), Nodes browser walk 80/80 with zero console, page or HTTP errors as admin and viewer. One existing test (test_state_cache) seeded its alias with a made-up source and needed to seed a configured one. Javariius pass 1 "not ready" on one false INTERNALS sentence about the 409 wording plus the empty outcome line, no code faults; four nits taken (comment trims, bulk-import hint wording, contract description, an upgrade note in CHANGELOG). Pass 2 reported in chat. Held on the session branch until the operator clears the push to main.
 
 ## 5.25.0 — SFP copper/laser identification
 
