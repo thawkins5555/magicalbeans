@@ -834,3 +834,53 @@ for ten seconds so a server outage fails every concurrent sign-in fast
 instead of making each one sit out the full timeout.
 → Stephen_King. `FEATURES.md`, `CHANGELOG.md`, `CREDENTIAL-SECURITY.md`,
 `INTERNALS.md` corrected and extended; no code touched.
+
+## 5.23.0 — History options A/E/G, priority-port alerting, NetFlow gaps, and Mapper fixes
+
+**Operator prompt, nine items:**
+- Proceed with options A, E and G from `docs/HISTORICAL-DATA-OPTIONS.md`.
+- Add uptime as a column choice on Nodes → Devices.
+- Question: does the app have an API receiver for external API requests,
+  or is the API only how the GUI talks to the backend?
+- Do not include poll overruns in the device details dialog's event log.
+- NetFlow export has no timestamps.
+- NetFlow randomly misses large blocks of data over 24 hours and over
+  3 days.
+- Mapper PNG export uses different fonts than the screen and items
+  overlap.
+- Add a manual line between two devices on Mapper.
+- Alert only on ports flagged Priority when they drop link.
+
+**Planning answers** — Wireless history (option G) covers only what is
+already polled today — client counts per AP and radio, channel, tx
+power, online state — no new SNMP columns are added to get there.
+Priority-flagged ports get a new, dedicated built-in rule, "Priority
+interface down"; the existing Interface down rule is untouched and
+keeps firing for every port as before. Scheduled reports (option E)
+send a summary body plus a CSV attachment on a daily, weekly, or
+monthly schedule. The NetFlow gaps get all three suspected causes
+fixed, not just one: templates being dropped on any NetFlow settings
+save, the raw-row cap deleting flows before they're summarised into
+rollups, and wide chart windows silently falling back to thinned raw
+rows when the minute rollup doesn't reach back far enough — plus a
+coverage readout so a gap is visible instead of silent. Version for
+this work: 5.23.0.
+
+**Bob's answer on the API question** — Yes: every `/api/*` route
+accepts an `Authorization: Bearer` API token as well as the browser
+session cookie. Tokens are issued and revoked under Settings → Tokens
+(admin-only), carry the issuing account's own permissions, never
+expire from inactivity, and never mint a cookie. Scripts get past the
+CSRF check because a request with no `Origin` header is accepted.
+There is no inbound data-push receiver beyond the existing syslog,
+trap, and NetFlow protocol listeners — nothing else accepts pushed
+data from outside.
+
+**Also recorded:** a short Status paragraph was added under the
+Recommendation section of `docs/HISTORICAL-DATA-OPTIONS.md` noting the
+operator's choice of A, E and G and how each shipped — A as the Nodes
+→ HISTORY sub-tab with a series CSV export route, E as Nodes → Reports
+→ SCHEDULED, and G as per-AP client/radio history in the Wireless AP
+detail pane.
+
+(in progress)

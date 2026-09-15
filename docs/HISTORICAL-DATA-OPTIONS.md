@@ -213,3 +213,14 @@ history) is its own piece of work, sized separately, since it is new data
 collection rather than a new view on data already collected.
 
 Nothing here is scheduled; pick the options and Bob will plan them.
+
+### Status
+
+The operator chose **A, E, and G**; all three ship in 5.23.0. Option A
+landed as the Nodes → HISTORY sub-tab, with a series CSV export route
+alongside it. Option E landed as Nodes → Reports → SCHEDULED, sending a
+summary body plus a CSV attachment on a daily, weekly, or monthly
+schedule. Option G landed as per-AP client and radio history in the
+Wireless AP detail pane, covering only the metrics already polled
+today (client counts, channel, tx power, online state) with no new
+SNMP columns added.
