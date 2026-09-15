@@ -4321,7 +4321,11 @@
       if (App.el('nd-rep-sfp-empty').checked) params.include_empty = '1';
       const result = await App.get('/api/nodes/reports/sfp', params);
       const { byId } = await App.deviceIndex();
-      for (const row of result.rows) { row.id = row.device_id; row._known = byId.has(row.device_id); }
+      for (const row of result.rows) {
+        // One row per port, so the row cache must not key on the device.
+        row.id = `${row.device_id}:${row.if_index}`;
+        row._known = byId.has(row.device_id);
+      }
       view.repSfp = result;
       drawSfpReportTable();
       App.setText(App.el('nd-rep-sfp-summary'),

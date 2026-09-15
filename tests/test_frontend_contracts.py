@@ -3633,6 +3633,12 @@ check("r.alias, r.kind, r.medium, r.media, r.oper_status" in NODES80,
       "exportSfpReportCsv's row values are built in the same order as "
       "SFP_CSV_HEADER")
 
+# --- 81. SFP report rows are keyed per port (5.25.0) ------------------------
+# App.drawRows caches <tr>s by row.id; keying the SFP report on device_id
+# collapsed every device to one on-screen row.
+check("row.id = `${row.device_id}:${row.if_index}`;" in NODES80,
+      "runSfpReport keys each report row by device and if_index, not device alone")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:
