@@ -44,7 +44,13 @@ that opens `psu_failed` instead of clearing it, and the Cisco FRU
 `offEnvOther`/`offAdmin` remap. Thing2 built the trap side —
 `trapdecode.py`'s six new OID names, two enum decodes and six default
 severities, and `snmptrapd.py`/`web/service.py`'s `poll_now` re-read
-hook. (Outcome: see below)
+hook. Testing: the full suite passed 159 of 163 with only the four
+environmental failures this container always shows (SMS passphrase,
+traceroute, the prune-lock timing check, IPv6 in the web-gates test),
+and the browser walk passed 77 of 77 with no console, page or HTTP
+errors as admin or viewer. Main had moved on to 5.25.0 (copper SFP
+badge) while this was built, so the branch was rebased onto it and the
+release renumbered 5.26.0. Javariius review: JAVARIIUS_PLACEHOLDER
 → Stephen_King. `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md` written
 for 5.26.0 against the actual diff (`854c7e8..HEAD`); no code touched.
 ## 5.25.0 — SFP copper/laser identification
