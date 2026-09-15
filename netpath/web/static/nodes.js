@@ -6005,7 +6005,11 @@
     for (const x of view.discResults) {
       if (!view.discSeen.has(x.id)) {
         view.discSeen.add(x.id);
-        if (x.snmp_ok && !x.existing_device_id) view.discChecked.add(x.id);
+        // A flagged (duplicate_of_device_id) or folded (folded_into_result_id)
+        // row never pre-ticks: adding it is a deliberate "yes, a separate
+        // box" call, not a default.
+        if (x.snmp_ok && !x.existing_device_id && !x.duplicate_of_device_id
+            && !x.folded_into_result_id) view.discChecked.add(x.id);
       }
     }
     drawDiscResultsTable();
@@ -6037,6 +6041,22 @@
     return !r.existing_device_id && !!(r.snmp_ok || (job && job.allow_ping_only));
   }
 
+  /* Ticked ids, split into the plain promote list and the ones that need
+     force_result_ids because the sweep flagged or folded them — the only
+     way an operator adds a "Same as"/"Folded into" row as its own device
+     rather than onto the box the sweep guessed. */
+  function discForceSplit(ids, rows) {
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const result_ids = [];
+    const force_result_ids = [];
+    for (const id of ids) {
+      const row = byId.get(id);
+      const force = !!(row && (row.duplicate_of_device_id || row.folded_into_result_id));
+      (force ? force_result_ids : result_ids).push(id);
+    }
+    return { result_ids, force_result_ids };
+  }
+
   /* The three tiers a duplicate pair and an upstream candidate are both
      scored into. Two consumers here — the cell below and duplicatesDialog
      — and a third in mapper.js's upstream-suggestions dialog, which keeps
@@ -6050,17 +6070,27 @@
 
   // What the sweep thinks this row already is: `high` (a known address,
   // folded by promote()) or `medium` (name+sysObjectID match only — look
-  // before ticking, don't skip).
+  // before ticking, don't skip). A folded row (the sweep reached the same
+  // box on this address too) shows alongside a duplicate verdict rather
+  // than instead of one — a row can be both.
   function discDuplicateCell(r) {
     if (r.existing_device_id) {
       return `<a href="#/nodes/device/${r.existing_device_id}">${
         escape(r.existing_device_name || 'added')}</a>`;
     }
-    if (!r.duplicate_of_device_id) return '\u2014';
-    const color = CONFIDENCE_COLOR[r.duplicate_confidence] || 'var(--muted)';
-    return `<span style="color:${color}" title="${escape(r.duplicate_reason || '')}">` +
-      `${escape(r.duplicate_of_device_name || String(r.duplicate_of_device_id))}` +
-      `</span> <span class="hint">(${escape(r.duplicate_confidence || '')})</span>`;
+    const parts = [];
+    if (r.duplicate_of_device_id) {
+      const color = CONFIDENCE_COLOR[r.duplicate_confidence] || 'var(--muted)';
+      parts.push(`<span style="color:${color}" title="${escape(r.duplicate_reason || '')}">` +
+        `${escape(r.duplicate_of_device_name || String(r.duplicate_of_device_id))}` +
+        `</span> <span class="hint">(${escape(r.duplicate_confidence || '')})</span>`);
+    }
+    if (r.folded_into_result_id) {
+      parts.push('<span class="hint" title="The sweep reached the same box on this ' +
+        `address too; tick it to add this address as its own device">Folded into ${
+        escape(r.folded_into_ip || '')}</span>`);
+    }
+    return parts.length ? parts.join(' ') : '\u2014';
   }
 
   // Shows how many OTHER addresses this box answered on, so one row for a
@@ -6086,9 +6116,13 @@
       return '<span class="hint" title="Only devices identified over SNMP can be ' +
         'added from this scan">\u2014</span>';
     }
-    const warn = r.duplicate_of_device_id
-      ? ` title="Looks like ${escape(r.duplicate_of_device_name || 'a device already added')}`
-        + ` \u2014 ${escape(r.duplicate_reason || '')}"`
+    // A flagged or folded row still gets a box: ticking it is how the
+    // operator overrules the sweep's guess and adds it as its own device.
+    const flagged = r.duplicate_of_device_id || r.folded_into_result_id;
+    const flagReason = r.duplicate_of_device_id ? (r.duplicate_reason || '')
+      : `Reached on another address of ${r.folded_into_ip}`;
+    const warn = flagged
+      ? ` title="Ticking adds it as a separate device \u2014 ${escape(flagReason)}"`
       : '';
     return `<input type="checkbox" class="${cls}" data-result="${r.id}"${warn}` +
       ` aria-label="Select ${escape(r.ip || 'result')}"` +
@@ -6421,11 +6455,13 @@
     const r = await App.get(`/api/nodes/discovery/${job.id}`);
     const results = r.results;
     const found = results.filter((x) => x.ping_ok || x.snmp_ok);
-    // A row matched to a device already on file starts unticked regardless
-    // of confidence — pre-ticking a probable duplicate is how one gets
-    // added on trust in the dialog's defaults.
+    // A row matched to a device already on file, flagged as a probable
+    // duplicate, or folded into another address, starts unticked regardless
+    // of confidence — pre-ticking any of those is how one gets added on
+    // trust in the dialog's defaults.
     const seed = new Set(results.filter(
-      (x) => x.snmp_ok && !x.existing_device_id && !x.duplicate_of_device_id)
+      (x) => x.snmp_ok && !x.existing_device_id && !x.duplicate_of_device_id
+        && !x.folded_into_result_id)
       .map((x) => x.id));
     const finish = async () => {
       await App.post(`/api/nodes/discovery/${job.id}/reviewed`, {}).catch(() => {});
@@ -6490,7 +6526,7 @@
         const added = checked.size;
         if (checked.size) {
           await App.post(`/api/nodes/discovery/${job.id}/promote`,
-            { result_ids: [...checked] }).catch(() => {});
+            discForceSplit([...checked], results)).catch(() => {});
         }
         await finish();
         App.toast(already ? `Added ${added}; ${already} already monitored.`
@@ -6501,6 +6537,7 @@
       <p class="hint">${lead} ${job.allow_ping_only
         ? 'Ping-only devices can be approved too, but start unchecked.'
         : 'Devices that only answered ping are listed but cannot be added — restart the scan with the ping-only option to include them.'}</p>
+      <p class="hint">Rows marked Same as or Folded into start unticked; ticking one adds it as a separate device.</p>
       <div class="table-wrap scrollbox large">
         <table><caption class="sr-only">Discovered addresses</caption><thead><tr><th scope="col"></th><th scope="col">IP</th><th scope="col">Ping</th><th scope="col">SNMP</th><th scope="col">Name</th><th scope="col">Vendor</th><th scope="col">Same as</th></tr></thead>
         <tbody>${discResultRowsHtml(found, job, 'disc-approve', checked)}</tbody></table>
@@ -6608,7 +6645,7 @@
   async function promoteSelected() {
     if (!view.discSelected || !view.discChecked.size) return;
     await App.post(`/api/nodes/discovery/${view.discSelected}/promote`,
-      { result_ids: [...view.discChecked] });
+      discForceSplit([...view.discChecked], view.discResults));
     view.discChecked = new Set();
     loadDiscResults();
     App.refreshNow('nodes');

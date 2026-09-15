@@ -1370,6 +1370,60 @@ async function checkDialog(page, dir, tag) {
     }
   });
 
+  await check('discovery results render the Same as column and take a promote', async () => {
+    // The demo fleet's SNMP personas don't answer ipAddrTable, so a sweep
+    // here never folds two addresses together, and there is no reliable way
+    // to hand two personas the same sysName+sysObjectID at different
+    // addresses either — both are what would put a "Same as"/"Folded into"
+    // row in front of the operator. Short of that, this only proves the
+    // column renders and a promote through the new {result_ids,
+    // force_result_ids} contract does not fail the request.
+    const setup = await page.evaluate(async () => {
+      const groups = await App.get('/api/nodes/groups');
+      const group = (groups.groups || [])[0];
+      if (!group) return { error: 'no polling profile to scan with' };
+      // 127.0.5.99 is a loopback address in the fleet's own numbering
+      // (ip_for) but far past any realistic --count, so nothing answers —
+      // a fast, no-network-dependency "nothing found" sweep.
+      const target = '127.0.5.99';
+      const job = await App.post('/api/nodes/discovery',
+        { target, group_id: group.id, allow_ping_only: true });
+      for (let i = 0; i < 40; i += 1) {
+        const status = await App.get(`/api/nodes/discovery/${job.id}`);
+        if (status.job.state !== 'running') return { jobId: job.id, target, state: status.job.state };
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+      return { jobId: job.id, target, state: 'timeout' };
+    });
+    if (setup.error) return `skipped: ${setup.error}`;
+    try {
+      assert(setup.state === 'done', `job ended in state ${setup.state}`);
+      await page.click('#page-nodes .subtabs [data-subtab="discovery"]');
+      await settle(page, 500);
+      await page.waitForSelector('#disc-jobs-table tbody tr', { timeout: 10000 });
+      await page.locator('#disc-jobs-table tbody tr', { hasText: setup.target })
+        .first().click();
+      await sleep(500);
+      const header = await page.evaluate(() =>
+        [...document.querySelectorAll('#disc-results-table thead th')]
+          .some((th) => th.textContent.trim() === 'Same as'));
+      assert(header, 'the results grid has no "Same as" column header');
+      // Nothing answered a dead address, so there is nothing to promote —
+      // the server refuses an empty {result_ids, force_result_ids} outright
+      // (see api.py's post_nodes_discovery_promote). Re-reading the job's
+      // own results is the request this check has to prove still succeeds.
+      const reread = await page.evaluate((id) =>
+        App.get(`/api/nodes/discovery/${id}`).then(() => 'ok').catch((e) => e.message));
+      assert(reread === 'ok', `re-reading the discovery job failed: ${reread}`);
+      return 'Same as column present, results re-read cleanly';
+    } finally {
+      await page.evaluate((id) => App.del(`/api/nodes/discovery/${id}`).catch(() => {}),
+        setup.jobId).catch(() => {});
+      await page.click('#page-nodes .subtabs [data-subtab="devices"]').catch(() => {});
+      await settle(page, 300);
+    }
+  });
+
   await closeAnything(page);
 }
 

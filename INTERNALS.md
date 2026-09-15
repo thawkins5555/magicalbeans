@@ -3013,7 +3013,22 @@ not how many addresses answered. Since 5.0.1 "first" means first to
 *finish*, not lowest address, and both calls happen inside `_record`'s
 lock together with the INSERT whose id `register_addresses` stores —
 `test_nodediscover_workers.py` runs two addresses of one device into
-`_record` off a barrier to pin exactly that.
+`_record` off a barrier to pin exactly that. Through 5.27.0
+`get_nodes_discovery_job` (`api.py`) only ever built its `results` list
+from `primaries` — rows with no `folded_into_result_id` — so a folded
+row's own JSON was never even built and `drawDiscResultsTable` had
+nothing to draw it from: the sweep's own primary/fold decision, made by
+whichever address answered first, was final, with no way for the
+operator to see the folded row, let alone add it separately. From
+5.28.0 every row is listed, folded or not: `_discovery_result_json`
+gains a `folded_into_ip` parameter — the primary's own address, not its
+id, since an id is a worse key once the primary itself may have been
+promoted — so a folded row's JSON carries `"folded_into_ip"` beside the
+`folded_into_result_id` it already had, and the browser draws it with a
+**Folded into <ip>** note and its own checkbox instead of leaving it
+out of `results` entirely. A folded row's addresses still ride on the
+primary's own `addresses` list too, unchanged, so the primary continues
+to read as one box with every address it answers on.
 
 ### Device identity, addresses and merge (`nodesdb.py`, `nodepoll.py`, `web/api.py`) — 5.0.0
 
@@ -3101,21 +3116,56 @@ stale claim about what it covers is corrected to match.
 - **high** — one of the addresses this box was reached on is already
   configured on a device (`device_id_for_address(address, configured=True)`,
   from 5.27.0 — the device's own `ipAddrTable`, not merely another
-  result's probe address). Nothing else honestly explains that, so
-  `promote()` records the addresses on the existing device and marks the
-  result promoted to it instead of adding a row beside it.
+  result's probe address). Nothing else honestly explains that, so by
+  default `promote()` records the addresses on the existing device and
+  marks the result promoted to it instead of adding a row beside it —
+  unless the operator forces it (5.28.0, below), in which case it adds
+  as its own device instead.
 - **medium** — sysName and sysObjectID both match a device the sweep
   never reached on any shared address. Two switches out of the same
   carton share that honestly, so it is a reason to look before ticking
-  and never a reason to fold. The approval dialog leaves such a row
-  unticked; ticking it adds the device.
+  and never a reason to fold. The row starts unticked; ticking it adds
+  the device (it was never eligible to fold in the first place, since
+  nothing here proves a shared address).
 
 `promote(job_id, result_ids, force=False)` resolves a folded result to
-its primary first (ticking either row adds the one device), and `force`
-skips the fold for the operator who has looked at the pair and says they
-really are two boxes. The approval dialog never passes `force` — folding
-is the whole point of the review it presents; "Add anyway" is offered by
-**Add device** alone, where the operator typed the address themselves.
+its primary first when `force` is false (ticking either row adds the one
+device) and, for an unfolded result, still checks `device_id_for_address`
+for a high-confidence match unless `force` is true. Through 5.27.0
+nothing in the discovery flow ever passed `force=True` — the approval
+dialog always posted `{"result_ids": [...]}`, so a **Same as** or folded
+row that got ticked (the Results pane pre-ticked **Same as** rows by
+default; the dialog did not) was folded onto the existing device or its
+primary regardless, with no way to say "no, add it anyway." "Add
+anyway" existed only on **Add device**, where the operator typed the
+address themselves and a plain `force=True` on a single manual add is
+unambiguous.
+
+**5.28.0: `force` per result, not per call.** `POST
+.../discovery/<job>/promote` now reads two bodies —`result_ids`
+(promotes normally: any fold or high-confidence match still applies) and
+`force_result_ids` (each one promoted with `force=True`) — and calls
+`promote()` once per list, concatenating the device ids; a legacy
+`{"result_ids": [...], "force": true}` body still applies `force` to the
+whole list, so nothing that scripted the old contract breaks. An empty
+body (neither list, and no legacy ids) is refused with 400. On the
+frontend, `discForceSplit(ids, rows)` (`nodes.js`) does the sorting: a
+ticked id whose row carries `duplicate_of_device_id` or
+`folded_into_result_id` goes into `force_result_ids`, everything else
+into `result_ids` — both the Results pane's Promote button and the
+approval dialog's Add approved button call it before posting. Inside
+`promote()`, forcing a *folded* result (as opposed to a plain
+high-confidence match) takes a different path from forcing a fold away:
+`is_folded` stays true, so the result is promoted from its own
+`ip`/identity/`_result_addresses` rather than swapped for its primary,
+and only that one row is marked promoted (`mark_promoted`, not
+`_mark_promoted_family`) — the primary keeps its own unpromoted state
+and can still be promoted separately, in the same call or a later one.
+Both the pane and the dialog now seed their default tick sets excluding
+`duplicate_of_device_id` and `folded_into_result_id` rows the same way,
+closing the gap where the pane pre-ticked a **Same as** row the dialog
+would not have.
+
 `_record_promoted_addresses`, added in 5.27.0, splits what a promoted
 result writes to `device_addresses` the same way `_refresh_addresses`
 would rather than recording everything as `discovery`: `_walked_addresses`
@@ -9622,6 +9672,26 @@ the pane's `scrollTop`. The approval dialog keeps its plain string builder
 but is handed its checked set explicitly instead of swapping
 `view.discChecked` in and out of the module global for the length of one
 build.
+
+**5.28.0: a folded row is a row, not an omission.** `discDuplicateCell`
+used to render exactly one of "Same as \<device\>" or an em dash; it now
+renders both a **Same as** verdict and a **Folded into \<ip\>** note when
+a row carries both — a result can be a high-confidence match on its own
+address *and* the sweep's second address for the same box, and the two
+are independent facts. `discCheckCell` still puts a box on a flagged or
+folded row (never an em dash, and never the "Already added" link that
+`existing_device_id` alone earns) with a `title` explaining that ticking
+it adds a separate device — that box is the entire override; there is no
+other affordance for it. `discForceSplit(ids, rows)` is what actually
+turns a tick into an override: it reads back each ticked row's
+`duplicate_of_device_id`/`folded_into_result_id` and sorts the id into
+`result_ids` or `force_result_ids` accordingly, so Promote never needs
+the operator to know which list a tick belongs in. Both the pane's
+default-tick loop (new results streaming in on a live job) and the
+approval dialog's `seed` now exclude `duplicate_of_device_id` and
+`folded_into_result_id` rows identically — before 5.28.0 only the dialog
+did, so a **Same as** row could arrive pre-ticked in the pane and fold
+silently on Promote with nothing said about it.
 
 ### Bulk selection (`nodes.js`, `alerts.js`, `configrx.js`)
 

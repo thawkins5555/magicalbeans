@@ -3899,7 +3899,8 @@ def _discovery_duplicate(row, index, addresses) -> dict:
 
 
 def _discovery_result_json(row, installed=None, devices_by_ip=None,
-                           index=None, folded_ips=(), reveal: bool = False) -> dict:
+                           index=None, folded_ips=(), reveal: bool = False,
+                           folded_into_ip=None) -> dict:
     """`installed` is the set of MIB filenames present, and `devices_by_ip`
     an ip -> device row map, each passed by the caller once per listing so
     neither the MIB hint nor the already-added check is a query per row.
@@ -3908,7 +3909,8 @@ def _discovery_result_json(row, installed=None, devices_by_ip=None,
     too; either source wins because promote() always reuses that same row.
 
     `index` adds the duplicate verdict; `folded_ips` are absorbed siblings'
-    addresses.
+    addresses, for a primary row. `folded_into_ip` is the primary's own ip,
+    set only when this row is itself folded into another.
 
     `community_or_user` is the credential that actually answered this
     address, so it follows _community_fields' rule rather than riding out
@@ -3936,6 +3938,7 @@ def _discovery_result_json(row, installed=None, devices_by_ip=None,
             "addresses": addresses,
             "folded_into_result_id": (row["folded_into_result_id"]
                                       if "folded_into_result_id" in keys else None),
+            "folded_into_ip": folded_into_ip,
             **_discovery_duplicate(row, index, addresses),
             **_discovery_identification(row, installed)}
 
@@ -7180,21 +7183,29 @@ def get_nodes_discovery_job(service, params, body, job_id) -> dict:
     # of a /22 can carry over a thousand results.
     index = _device_index(service)
     devices_by_ip = index["by_ip"]
-    # A folded row is a second address for a device already listed; its
-    # address rides on the primary row instead of offering the box twice.
+    # A folded row's addresses still ride on its primary row too, so the
+    # primary reads as one box with every address it answers on; the
+    # folded row is also listed in its own right, marked with the primary
+    # it was folded into, so it can be added as a second device.
+    by_id = {row["id"]: row for row in results}
     folded: dict[int, list[str]] = {}
-    primaries = []
     for row in results:
         into = row["folded_into_result_id"] if "folded_into_result_id" in row.keys() else None
         if into:
             folded.setdefault(into, []).append(row["ip"])
-        else:
-            primaries.append(row)
     reveal = _may_read_secrets(service, params, "nodes")
-    return {"job": _discovery_job_json(job),
-            "results": [_discovery_result_json(r, installed, devices_by_ip, index,
-                                               folded.get(r["id"], ()), reveal)
-                        for r in primaries]}
+    rows_json = []
+    for row in sorted(results, key=lambda r: r["id"]):
+        into = row["folded_into_result_id"] if "folded_into_result_id" in row.keys() else None
+        if into:
+            primary = by_id.get(into)
+            rows_json.append(_discovery_result_json(
+                row, installed, devices_by_ip, index, (), reveal,
+                folded_into_ip=primary["ip"] if primary else None))
+        else:
+            rows_json.append(_discovery_result_json(
+                row, installed, devices_by_ip, index, folded.get(row["id"], ()), reveal))
+    return {"job": _discovery_job_json(job), "results": rows_json}
 
 
 def delete_nodes_discovery_job(service, params, body, job_id) -> dict:
@@ -7210,10 +7221,23 @@ def delete_nodes_discovery_job(service, params, body, job_id) -> dict:
 
 
 def post_nodes_discovery_promote(service, params, body, job_id) -> dict:
+    """`result_ids` promote normally (a folded row still folds onto its
+    primary); `force_result_ids` promote with force=True, so a flagged
+    duplicate or a folded row is added as its own device instead. The
+    legacy body `{"result_ids": [...], "force": true}` still applies
+    force to the whole list."""
     _require(service.nodes_db.discovery_job(job_id), "discovery job")
-    result_ids = _bulk_ids(body, "result_ids", noun="discovery results")
-    device_ids = service.node_poller.promote(
-        job_id, result_ids, force=bool(body.get("force")))
+    legacy_force = bool(body.get("force"))
+    result_ids = _bulk_ids(body, "result_ids", noun="discovery results", required=False)
+    force_result_ids = _bulk_ids(body, "force_result_ids", noun="discovery results",
+                                 required=False)
+    if not result_ids and not force_result_ids:
+        raise ValueError("No results selected")
+    device_ids = []
+    if result_ids:
+        device_ids += service.node_poller.promote(job_id, result_ids, force=legacy_force)
+    if force_result_ids:
+        device_ids += service.node_poller.promote(job_id, force_result_ids, force=True)
     service.log.add(NODES_CATEGORY,
                     f"Promoted {len(device_ids)} device(s) from discovery job #{job_id}")
     return {"device_ids": device_ids}

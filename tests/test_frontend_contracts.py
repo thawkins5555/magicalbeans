@@ -3676,6 +3676,48 @@ check("device_id_for_address(address, configured=True)" in _NODEPOLL82,
       "so a discovered or trap-learned address never folds a result "
       "onto a device")
 
+# --- 83. A flagged or folded discovery result never pre-ticks, and ticking
+# one forces it in as its own device rather than folding it onto the box
+# the sweep guessed. Server contract: POST .../promote takes
+# {result_ids, force_result_ids}.
+NODES83 = read("nodes.js")
+INDEX83 = read("index.html")
+HINT83 = ("Rows marked Same as or Folded into start unticked; ticking one "
+          "adds it as a separate device.")
+check("&& !x.folded_into_result_id) view.discChecked.add(x.id);" in NODES83,
+      "loadDiscResults' pre-tick seeding excludes a folded row "
+      "(folded_into_result_id), not just an existing/duplicate one")
+check("(x) => x.snmp_ok && !x.existing_device_id && !x.duplicate_of_device_id\n"
+      "        && !x.folded_into_result_id)" in NODES83,
+      "openApprovalDialog's seed also excludes a folded row, alongside "
+      "existing_device_id and duplicate_of_device_id")
+check("function discForceSplit(ids, rows) {" in NODES83,
+      "discForceSplit is the one place ticked ids are split into the two "
+      "promote() keys")
+check("return { result_ids, force_result_ids };" in NODES83,
+      "discForceSplit returns force_result_ids for a flagged or folded row, "
+      "so ticking one adds it as a separate device instead of folding it")
+check("discForceSplit([...checked], results)).catch(() => {});" in NODES83,
+      "the approval dialog's Add approved button posts through "
+      "discForceSplit, not a bare result_ids array")
+check("discForceSplit([...view.discChecked], view.discResults));" in NODES83,
+      "promoteSelected (the Results pane) posts through discForceSplit too")
+check('Folded into ${' in NODES83,
+      "discDuplicateCell shows \"Folded into <ip>\" for a folded row")
+check("The sweep reached the same box on this ' +\n"
+      '        `address too; tick it to add this address as its own device">'
+      in NODES83,
+      "the Folded into span carries the hint explaining what ticking it does")
+check("Ticking adds it as a separate device \\u2014 ${escape(flagReason)}"
+      in NODES83,
+      "discCheckCell's title on a flagged or folded row leads with "
+      "\"Ticking adds it as a separate device\"")
+check(HINT83 in NODES83,
+      "the approval dialog carries the Same as/Folded into hint sentence")
+check(HINT83 in INDEX83,
+      "the Results pane (#disc-promote) carries the same hint sentence, "
+      "as a <p class=\"hint\"> near the Promote button")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

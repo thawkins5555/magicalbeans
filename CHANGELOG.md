@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.28.0 — Discovery duplicates: an override, and folded rows no longer hidden](#5280--discovery-duplicates-an-override-and-folded-rows-no-longer-hidden)
 - [5.27.0 — Duplicate devices only share a configured address, not a discovered one](#5270--duplicate-devices-only-share-a-configured-address-not-a-discovered-one)
 - [5.26.0 — Power supplies: removed, unpowered, and reported the moment it happens](#5260--power-supplies-removed-unpowered-and-reported-the-moment-it-happens)
 - [5.25.0 — Copper transceivers get their own badge](#5250--copper-transceivers-get-their-own-badge)
@@ -160,6 +161,72 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.28.0 — Discovery duplicates: an override, and folded rows no longer hidden
+
+One item from the operator: `PROMPT-LOG.md` carries the request in full;
+this entry is the shipped result.
+
+5.27.0 fixed *what counts as evidence* two discovery results are the same
+device — only an address the device's own address table (`ipAdEntAddr`)
+reports, never one merely seen on an ARP table or probed by the sweep.
+That rule was correct and stays unchanged. What 5.27.0 did not fix is
+what the operator can *do* once the screen shows a verdict: a result
+marked **Same as** an existing device was always folded onto it the
+moment the operator hit Approve, with no way to add it as its own device
+even after confirming the "match" was wrong — the approval dialog and the
+Results pane ticked the row but never sent anything telling `promote()`
+to keep it separate. The same was true of the other kind of fold: two
+addresses that both reached one physical box in a single sweep used to
+be offered once, as a single row — but that row was the *only* one of
+the pair ever shown; the address it folded into replaced it in the list
+entirely, so an operator who wanted both addresses recorded, or wanted
+to check the folded address itself, had nothing to look at.
+
+**Both kinds of row now start unticked, and ticking one keeps it
+separate.** The approval dialog already left a **Same as** row unticked
+by default; the Results pane did not — its own pre-tick logic only
+skipped a result already added under some other device, so a **Same
+as** row came in ticked like any other SNMP-identified find, and
+approving it folded it onto the existing device with no warning that a
+tick had just done that. The pane's default now matches the dialog's:
+any row carrying a **Same as** or **Folded into** match starts unticked
+in both places. Ticking the row and approving it now adds it as its own
+device: the Results pane and the approval dialog send the ticked row's
+id in a new `force_result_ids` list alongside the existing `result_ids`,
+and `promote()` honours it per result instead of the all-or-nothing
+`force` flag it took before, which the approval dialog never set and
+which existed only for **Add device**'s "Add anyway".
+
+**Folded rows are listed, not hidden.** The row for a second address
+that reached the same box in one sweep used to be left out of the
+Results pane and the approval dialog entirely — the server's own listing
+route never built it, since it walked only the sweep's primary rows —
+so an operator had no way to even see it, let alone add it. It now gets
+its own row with the same checkbox every other row has and a **Folded
+into <ip>** note beside it. Ticking it and approving behaves exactly
+like a **Same as** row: it adds that address as its own device, using
+the address and identity the sweep read from that row alone, and marks
+only that row promoted. The primary row it had folded into is untouched
+and can still be added on its own, in the same batch or a later one.
+
+**The hint's evidence is unchanged.** Every row still shows why it was
+flagged — which address is configured on the existing device, or which
+of the sweep's own addresses it folded into — so the operator ticks with
+the same information as before; only the ability to act on it changed.
+**Add device**'s "Add anyway" override is untouched by this release.
+
+Files: `web/api.py`, `nodepoll.py`, `web/static/nodes.js`,
+`web/static/index.html`.
+
+Verification: `tests/test_device_identity.py` adds a section on
+`promote(force=True)` keeping a folded result as its own device rather
+than its primary, and a section on the `/promote` route's
+`result_ids`/`force_result_ids` split, including that an empty body is
+refused. `tests/test_frontend_contracts.py` pins the pre-tick exclusions
+in both the Results pane and the approval dialog, the `discForceSplit`
+helper, the "Folded into <ip>" cell text, and the new hint sentence in
+both the dialog and `index.html`'s Results pane.
 
 ### 5.27.0 — Duplicate devices only share a configured address, not a discovered one
 

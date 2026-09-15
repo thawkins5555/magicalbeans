@@ -2291,8 +2291,10 @@ class NodePoller(Worker):
         promoted as its primary, so ticking either row adds one device;
         a result whose walked addresses match a device's configured
         addresses is recorded on that device rather than added beside it.
-        `force` skips that fold for an operator who says they're genuinely
-        two boxes.
+        `force` keeps a folded result as itself instead — the sweep
+        identified it fully before folding it, so it is promoted from its
+        own ip/identity/walked addresses, as a second device, and only
+        that one row is marked promoted.
         """
         job = self.db.discovery_job(job_id)
         allow_ping_only = bool(job and job["allow_ping_only"])
@@ -2301,11 +2303,13 @@ class NodePoller(Worker):
         seen_results = set()
         for raw_id in result_ids:
             result = self.db.discovery_result(raw_id)
-            if result is not None and result.keys().__contains__("folded_into_result_id") \
-                    and result["folded_into_result_id"]:
+            is_folded = result is not None and result.keys().__contains__("folded_into_result_id") \
+                and bool(result["folded_into_result_id"])
+            if is_folded and not force:
                 primary = self.db.discovery_result(result["folded_into_result_id"])
                 if primary is not None:
                     result = primary
+                    is_folded = False
             if result is None or result["job_id"] != job_id:
                 continue
             result_id = result["id"]
@@ -2327,7 +2331,10 @@ class NodePoller(Worker):
                         break
             if existing is not None:
                 self._record_promoted_addresses(existing["id"], result, addresses)
-                self._mark_promoted_family(result_id, existing["id"], family)
+                if is_folded:
+                    self.db.mark_promoted(result_id, existing["id"])
+                else:
+                    self._mark_promoted_family(result_id, existing["id"], family)
                 device_ids.append(existing["id"])
                 continue
             job_group_id = job["group_id"] if job and "group_id" in job.keys() else None
@@ -2370,7 +2377,10 @@ class NodePoller(Worker):
                     vendor_evidence=(result["vendor_evidence"]
                                      if "vendor_evidence" in keys else None))
             self._record_promoted_addresses(device_id, result, addresses)
-            self._mark_promoted_family(result_id, device_id, family)
+            if is_folded:
+                self.db.mark_promoted(result_id, device_id)
+            else:
+                self._mark_promoted_family(result_id, device_id, family)
             device_ids.append(device_id)
         return device_ids
 

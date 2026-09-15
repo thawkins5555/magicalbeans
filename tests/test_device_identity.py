@@ -169,15 +169,45 @@ try:
           nodes.discovery_result(folded_id)["promoted_device_id"] == fold_devices[0])
     folded_device = fold_devices[0]
 
+    # -------------------- 4b. force promotes a folded result as itself
+    print("4b. force keeps a folded result as its own device")
+    fold_job2 = nodes.add_discovery_job("subnet", "10.32.0.0/30")
+    primary_id2 = nodes.add_discovery_result(
+        fold_job2, ip="10.32.0.1", ping_ok=1, snmp_ok=1, sys_name="folder2",
+        sys_object_id="1.3.6.1.4.1.99998", community_or_user="public",
+        snmp_version=1)
+    folded_id2 = nodes.add_discovery_result(
+        fold_job2, ip="10.32.0.2", ping_ok=1, snmp_ok=1, sys_name="folder2b",
+        sys_object_id="1.3.6.1.4.1.99998", community_or_user="public",
+        snmp_version=1, folded_into_result_id=primary_id2)
+    forced_folded_devices = service.node_poller.promote(fold_job2, [folded_id2], force=True)
+    check("force promotes a folded result at its own ip",
+          len(forced_folded_devices) == 1
+          and nodes.device(forced_folded_devices[0])["ip"] == "10.32.0.2",
+          forced_folded_devices)
+    check("...marking only that row promoted, not the primary",
+          nodes.discovery_result(folded_id2)["promoted_device_id"] == forced_folded_devices[0]
+          and not nodes.discovery_result(primary_id2)["promoted_device_id"],
+          (nodes.discovery_result(folded_id2)["promoted_device_id"],
+           nodes.discovery_result(primary_id2)["promoted_device_id"]))
+    primary_devices2 = service.node_poller.promote(fold_job2, [primary_id2])
+    check("...and the primary still promotes to its own device afterwards",
+          len(primary_devices2) == 1
+          and nodes.device(primary_devices2[0])["ip"] == "10.32.0.1"
+          and primary_devices2[0] != forced_folded_devices[0], primary_devices2)
+    check("...without re-marking the already-promoted sibling",
+          nodes.discovery_result(folded_id2)["promoted_device_id"] == forced_folded_devices[0],
+          nodes.discovery_result(folded_id2))
+
     # ------------------------------------- 5. what the discovery listing says
     print("5. the discovery listing serves primaries and flags duplicates")
     status, listing = call("GET", f"/api/nodes/discovery/{fold_job}", token=admin)
-    ips = [row["ip"] for row in listing["results"]]
-    check("a folded row is not offered as a second device",
-          status == 200 and ips == ["10.30.0.1"], (status, ips))
-    check("...its address rides on the primary's row instead",
-          "10.30.0.2" in listing["results"][0]["addresses"],
-          listing["results"][0]["addresses"])
+    by_ip = {row["ip"]: row for row in listing["results"]}
+    check("the folded row is listed too, marked with its primary",
+          status == 200 and by_ip.get("10.30.0.2", {}).get("folded_into_result_id") == primary_id
+          and by_ip["10.30.0.2"]["folded_into_ip"] == "10.30.0.1", (status, by_ip))
+    check("...its address still rides on the primary's row as well",
+          "10.30.0.2" in by_ip["10.30.0.1"]["addresses"], by_ip["10.30.0.1"]["addresses"])
 
     dup_job = nodes.add_discovery_job("subnet", "10.31.0.0/30")
     high_id = nodes.add_discovery_result(
@@ -206,6 +236,37 @@ try:
     high_devices = service.node_poller.promote(dup_job, [high_id])
     check("a high (address) match folds instead of adding",
           high_devices == [existing_id], high_devices)
+
+    # ------------- 5b. the promote route: force_result_ids vs result_ids
+    print("5b. POST .../promote: force_result_ids adds anyway, result_ids folds")
+    fresh_high_id = nodes.add_discovery_result(
+        dup_job, ip="10.31.0.3", ping_ok=1, snmp_ok=1, sys_name="whatever",
+        sys_object_id="1.3.6.1.4.1.1", community_or_user="public", snmp_version=1,
+        ip_addresses=json.dumps(["10.8.8.8"]))
+    status, forced_result = call(
+        "POST", f"/api/nodes/discovery/{dup_job}/promote",
+        {"result_ids": [], "force_result_ids": [fresh_high_id]}, token=admin)
+    forced_new_device_id = (forced_result.get("device_ids") or [None])[0]
+    check("force_result_ids on a flagged duplicate adds a new device instead of folding",
+          status == 200 and forced_new_device_id and forced_new_device_id != existing_id,
+          (status, forced_result))
+    if forced_new_device_id and forced_new_device_id != existing_id:
+        nodes.remove_device(forced_new_device_id)
+
+    other_high_id = nodes.add_discovery_result(
+        dup_job, ip="10.31.0.4", ping_ok=1, snmp_ok=1, sys_name="whatever",
+        sys_object_id="1.3.6.1.4.1.1", community_or_user="public", snmp_version=1,
+        ip_addresses=json.dumps(["10.8.8.8"]))
+    status, folded_result = call(
+        "POST", f"/api/nodes/discovery/{dup_job}/promote",
+        {"result_ids": [other_high_id]}, token=admin)
+    check("result_ids without force still folds a high match",
+          status == 200 and folded_result.get("device_ids") == [existing_id],
+          (status, folded_result))
+
+    status, empty_body = call(
+        "POST", f"/api/nodes/discovery/{dup_job}/promote", {}, token=admin)
+    check("an empty promote body is refused", status == 400, (status, empty_body))
 
     # ---------------------------------------------------- 6. manual add 409
     print("6. adding an address another device already answers on")

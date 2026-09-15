@@ -5,6 +5,40 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.28.0 — Discovery duplicates: an override, and folded rows no longer hidden
+
+**Operator prompt:**
+"The discovery function is still not letting me add a device from a
+discovery as a stand alone device because it sees the IP as a
+'discovery' IP on a device's arp table or something - this must be
+corrected - only IP's that are actually assigned to interfaces,
+vlans, loop backs, etc should flag a device as a duplicate."
+
+**Planning answers:**
+1. Override — ticking a flagged row and approving it adds that row as
+   its own device, separately from whatever it was flagged against.
+2. Folded rows — a result the sweep folded into another (same box
+   reached on two of its own addresses) is shown in the list, marked
+   with what it folded into, and addable on its own the same way.
+
+**Notes:** the evidence rule from 5.27.0 was checked and confirmed
+correct — only a device's own interface/VLAN/loopback address table
+(`ipAdEntAddr`) has ever fed a duplicate verdict; nothing reads ARP for
+this. The actual problem was that the discovery screen gave no way to
+act against a verdict: a result marked **Same as** an existing device
+always folded onto it on Approve, because neither the approval dialog
+nor the Results pane ever told the server to keep it separate, and a
+result the sweep folded into another address of the same box was left
+out of the list altogether — always promoted as the row it folded into,
+with no way to add it, or even see it, on its own. Now: a **Same as**
+or **Folded into** row starts unticked; ticking it and approving adds it
+as its own device, using its own address and identity rather than the
+row it was flagged or folded against. The hint explaining why a row was
+flagged is unchanged and still shown, so the operator ticks with the
+same evidence as before — only the ability to override it is new.
+
+**Outcome.** [to be filled in at release]
+
 ## 5.27.0 — Duplicate devices: configured addresses only, not discovery IPs
 
 **Operator prompt:**

@@ -953,21 +953,35 @@ own subtabs.
   back to `Default`, and pre-fills the discovered identity so the new
   device shows its sysName immediately instead of waiting for the first
   poll.
-- **A device reached on two of its addresses is offered once.** Each
-  device that answers is asked which addresses it answers on (one short,
-  bounded read of its own address table), so a router probed on both its
-  loopback and its management address is one row in the results, its IP
+- **A device reached on two of its addresses is offered once, but the
+  address it folded into stays visible.** Each device that
+  answers is asked which addresses it answers on (one short, bounded
+  read of its own address table), so a router probed on both its
+  loopback and its management address is one row to promote, its IP
   cell marked `+1`, rather than two devices to add. The setting is in
-  Nodes → Settings → Discovery and can be switched off.
-- **A result that looks like a device you already have says which one.**
-  A **Same as** column names it and how sure the scan is: *high* means an
-  address that device already has configured (from 5.27.0, that device's
-  own address table — not merely another discovery run's probe or a
-  trap), and approving the result records the new addresses on the
-  existing device instead of adding a second one; *medium* means a
-  matching hostname and device type and nothing more, which is a reason
-  to look before ticking — it starts unticked, and ticking it still adds
-  the device.
+  Nodes → Settings → Discovery and can be switched off. The other
+  address is no longer dropped from the list: it shows as its own row
+  with a **Folded into <ip>** note, and starts unticked. Leave it
+  unticked and Promote adds only the primary row, exactly as before;
+  tick it too and approve, and it (from 5.28.0) is added as a separate
+  device in its own right, using the identity and address that row was
+  actually reached on — useful when what looks like one box on two
+  addresses is genuinely two, or when both addresses are worth having
+  as independent devices regardless.
+- **A result that looks like a device you already have says which one —
+  and, from 5.28.0, the operator can overrule it.** A **Same as** column
+  names it and how sure the scan is: *high* means an address that
+  device already has configured (from 5.27.0, that device's own address
+  table — not merely another discovery run's probe or a trap); *medium*
+  means a matching hostname and device type and nothing more, which is
+  a reason to look before ticking. Both levels start unticked. Leaving
+  a **Same as** row unticked and approving the rest records the new
+  addresses on the existing device, same as before. Ticking it and
+  approving now adds it as its own device instead — the fold is a
+  suggestion the operator can accept or override, never something
+  Approve does silently on its behalf. The hint that explains the match
+  is unchanged and still shown either way, so the operator ticks with
+  the same evidence in front of them.
 
 ### Vendor MIBs
 
