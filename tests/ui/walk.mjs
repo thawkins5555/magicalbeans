@@ -216,6 +216,42 @@ async function selectTab(page, tab) {
   await page.evaluate(async (name) => { await App.refreshNow(name); }, tab);
 }
 
+async function waitForCopperClassification(page, name) {
+  // Deterministic replacement for racing nodepoll's environment poll (300s
+  // cadence): wait, via the API the walk already authenticates against,
+  // until some interface on `name` carries media === 'copper'.
+  const origin = new URL(page.url()).origin;
+  const list = await page.request.get(
+    `${origin}/api/nodes/devices?q=${encodeURIComponent(name)}`);
+  const devices = list.ok() ? (await list.json()).devices || [] : [];
+  const device = devices.find((d) => d.name === name);
+  if (!device) return { present: false };
+  const started = Date.now();
+  const deadline = started + 150000;
+  let polled = false;
+  for (;;) {
+    const res = await page.request.get(
+      `${origin}/api/nodes/devices/${device.id}/interfaces`);
+    const interfaces = res.ok() ? (await res.json()).interfaces || [] : [];
+    if (interfaces.some((row) => row.media === 'copper')) {
+      return { present: true, id: device.id, classified: true };
+    }
+    if (!polled) {
+      // Poll now re-runs the environment walk at once instead of at its
+      // 300 s cadence, so the first pass being cut short under load does
+      // not cost the walk five minutes.
+      polled = true;
+      await page.request.post(`${origin}/api/nodes/devices/${device.id}/poll`,
+        { data: {} }).catch(() => {});
+    }
+    if (Date.now() >= deadline) {
+      return { present: true, id: device.id, classified: false,
+               waited_s: Math.round((Date.now() - started) / 1000) };
+    }
+    await sleep(3000);
+  }
+}
+
 async function shoot(page, dir, name) {
   try {
     await page.screenshot({ path: path.join(dir, `${name}.png`), fullPage: false });
@@ -813,6 +849,12 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       await page.waitForSelector('#nd-rep-sfp-run:not([hidden])', { timeout: 20000 });
       await sleep(400);
 
+      // acc-sw-001's seeded copper combo ports (demo/personas.py's
+      // _build_cisco_access) only show up once nodepoll's environment poll
+      // has classified them -- wait for that via the API before running
+      // the report, rather than racing it.
+      const copper = await waitForCopperClassification(page, 'acc-sw-001');
+
       const ran = page.waitForResponse((response) =>
         response.url().includes('/api/nodes/reports/sfp')
         && !response.url().includes('export.csv')
@@ -824,38 +866,19 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         () => (document.querySelector('#nd-rep-sfp-summary') || {}).textContent.trim().length > 0,
         { timeout: 10000 });
       const summary = await page.locator('#nd-rep-sfp-summary').textContent();
-      // The demo fleet has no transceivers seeded, so "0 port(s)" is the
-      // expected, correct outcome here -- not a sign the report is broken.
       assert(/\d+ port\(s\) on \d+ device\(s\)/.test(summary || ''),
         `unexpected SFP report summary: "${summary}"`);
       const exportVisible = await page.isVisible('#nd-rep-sfp-export-csv');
       assert(exportVisible, 'Export CSV button is not visible on the SFP report');
 
-      // Copper transceivers (5.25.0): the demo access switches carry two
-      // seeded combo ports, but nodepoll's environment poll (300s cadence)
-      // may not have classified them yet by the time this check runs -- poll
-      // Run rather than racing it.
-      let copSummary = summary;
-      let copCell = await page.$('#nd-rep-sfp-table .badge-cop');
-      const copDeadline = Date.now() + 30000;
-      while (!copCell && Date.now() < copDeadline) {
-        await sleep(2000);
-        const rerun = page.waitForResponse((response) =>
-          response.url().includes('/api/nodes/reports/sfp')
-          && !response.url().includes('export.csv')
-          && response.request().method() === 'GET', { timeout: 10000 });
-        await page.click('#nd-rep-sfp-run');
-        await rerun;
-        await page.waitForFunction(
-          () => (document.querySelector('#nd-rep-sfp-summary') || {}).textContent.trim().length > 0,
-          { timeout: 10000 });
-        copSummary = await page.locator('#nd-rep-sfp-summary').textContent();
-        copCell = await page.$('#nd-rep-sfp-table .badge-cop');
+      if (copper.present) {
+        assert(copper.classified,
+          `acc-sw-001 had no copper interface after ${copper.waited_s}s, poll-now included`);
+        const copCell = await page.$('#nd-rep-sfp-table .badge-cop');
+        assert(copCell, 'expected a .badge-cop cell in the SFP report table');
+        assert(/\d+ COP/.test(summary || ''),
+          `expected the SFP report summary to name a COP count, got "${summary}"`);
       }
-      assert(copCell,
-        'expected a .badge-cop cell in the SFP report table within 30s of polling Run');
-      assert(/\d+ COP/.test(copSummary || ''),
-        `expected the SFP report summary to name a COP count, got "${copSummary}"`);
       return `summary "${summary.trim()}"`;
     });
 
@@ -873,6 +896,12 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       const row = page.locator('#nodes-table tbody tr', { hasText: 'acc-sw-001' }).first();
       const found = await row.count() > 0;
       if (!found) return 'skipped: acc-sw-001 is not in this fleet';
+      // Wait for nodepoll's environment poll to classify the copper ports
+      // via the API before opening the row, rather than racing the UI.
+      const copper = await waitForCopperClassification(page, 'acc-sw-001');
+      if (!copper.present) return 'skipped: acc-sw-001 is not in this fleet';
+      assert(copper.classified,
+        `acc-sw-001 had no copper interface after ${copper.waited_s}s, poll-now included`);
       await row.click();
       const hasRow = await page.waitForSelector('#nd-if-table tbody tr', { timeout: 20000 })
         .then(() => true).catch(() => false);
@@ -881,16 +910,8 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
         && res.request().method() === 'GET', { timeout: 5000 }).catch(() => {});
       await sleep(500);
 
-      // Same tolerance as the SFP report check above: give the environment
-      // poll up to 30s to have classified the seeded copper ports.
-      let cell = await page.$('#nd-if-table .badge-cop');
-      const deadline = Date.now() + 30000;
-      while (!cell && Date.now() < deadline) {
-        await sleep(2000);
-        cell = await page.$('#nd-if-table .badge-cop');
-      }
-      assert(cell,
-        'expected #nd-if-table to carry a .badge-cop cell for acc-sw-001 within 30s');
+      const cell = await page.$('#nd-if-table .badge-cop');
+      assert(cell, 'expected #nd-if-table to carry a .badge-cop cell for acc-sw-001');
       return 'COP badge present';
     });
 
