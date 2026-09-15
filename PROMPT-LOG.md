@@ -904,7 +904,7 @@ Stephen_King wrote `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`,
 code for every claim rather than the task description alone; the wireless
 history disk estimate in `NETWORK-AND-STORAGE-REQUIREMENTS.md` is
 arithmetic from the row layout, not a measured benchmark, and is
-labelled as such. (test and review results: pending)
+labelled as such. Testing: the full suite on the release commit passed 159 of 164 with only the four environmental failures this container always shows (SMS passphrase, traceroute, the prune-lock timing check and the SNMP socket family in the web-gates test), and the browser walk passed 76 of 76 with no console, page or HTTP errors as admin or viewer. One real regression surfaced on the first pass and was fixed: the Reports UI contract test pinned four Nodes sub-tabs and now pins five. Javariius reviewed twice; the first pass found five should-fix items (a whole-fleet Top-N schedule with no window cap, a v5 exporter with a future clock able to pin the NetFlow row cap, unvalidated wireless history settings, missing tests for the rollup catch-up and coverage code, and comment density) plus nits, all closed before the second pass returned "ready to push".
 → Stephen_King. `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`,
 `NETWORK-AND-STORAGE-REQUIREMENTS.md` written for 5.23.0; no code
 touched.
