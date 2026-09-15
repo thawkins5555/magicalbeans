@@ -741,6 +741,25 @@ try:
               "socket to the AAA server",
               stall_srv.connections == conns_after_first,
               (stall_srv.connections, conns_after_first))
+
+        from netpath.web.service import TacacsUnavailable
+        try:
+            service.authenticate_tacacs("brandnewperson", "whatever", "127.0.0.1")
+            paused = ""
+        except TacacsUnavailable as exc:
+            paused = str(exc)
+        check("the paused refusal carries the original cause and says it is paused",
+              "(retry paused)" in paused and "reachable" in paused.lower(), paused)
+        service.apply_global_settings({"tacacs_timeout_s": 1})
+        check("a settings save clears the pause",
+              service._tacacs_outage_until == 0.0, service._tacacs_outage_until)
+        try:
+            service.authenticate_tacacs("brandnewperson", "whatever", "127.0.0.1")
+        except TacacsUnavailable:
+            pass
+        check("...so the next attempt reaches the server again",
+              stall_srv.connections == conns_after_first + 1,
+              (stall_srv.connections, conns_after_first))
     finally:
         stall_srv.stop()
 

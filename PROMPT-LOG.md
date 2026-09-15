@@ -792,8 +792,22 @@ auto-create path in `post_login`, the widened dashboard layout schema and
 tile config form, the on-tile window control, the themed device
 combobox, and the shared `Custom…` range dialog plus drag/wheel/keyboard
 zoom wired onto every time-axis chart), Stephen_King the paper and the
-docs. Testy's full-suite and browser-walk results and Javariius's
-verdict: (Bob fills in)
+docs. Testy ran the full suite once (161/167; the six failures were the
+four known environmental ones plus two real single-assertion misses in
+the frontend commit) and a headless walk of Dashboard, Nodes, Settings,
+NetFlow, Routes, Syslog/Trap and Alerts (61/69 first time). Fisty found
+the walk's real causes: the shared range dialog answered Apply as
+cancelled because the modal closed before the promise settled, an
+unconfigured Interface traffic tile sent an empty interface list the
+server refuses, and the combobox duplicated the panel-surface rule.
+Javariius reviewed three times: first pass "not ready" with two high
+findings (drag-zoom wrote fractional timestamps the server refuses; the
+PAP START carried minor version 0, which the reference daemon rejects)
+and eleven smaller ones, all closed by Fisty; second pass caught that
+wheel ticks recomputed from a stale window, closed by Bob; third pass
+"ready to push". Final state: full suite 163/167 with exactly the four
+environmental failures, the walk 69/69 on the release commit. Shipped
+as 5.22.0 on `main`.
 
 **Javariius's review, four corrections before push:** two `FEATURES.md`
 passages overstated what a drag or a wheel-turn does to the device and
