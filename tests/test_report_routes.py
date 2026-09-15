@@ -293,6 +293,12 @@ try:
           (status, payload))
     check("...and words a power supply's state",
           psu and psu["state"] == 2 and psu["state_text"] == "failed / no input", psu)
+    service.nodes_db.record_metric_sample(sdev, "psu_state.2", "Power supply 2", "", "gauge", time.time(), 3.0)
+    status, payload = call("GET", f"/api/nodes/devices/{sdev}/sensors", token=reader)
+    psu2 = next((s for s in payload.get("sensors", []) if s["kind"] == "psu" and s["index"] == 2), None)
+    check("...and a removed/unpowered supply (state 3) too",
+          psu2 and psu2["state"] == 3
+          and psu2["state_text"] == "not present (removed or no input)", psu2)
     status, payload = call("GET", f"/api/nodes/devices/{sdev}/sensors", token=outsider)
     check("an account with no nodes grant is refused /sensors", status == 403, status)
 
