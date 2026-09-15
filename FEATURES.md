@@ -1597,7 +1597,10 @@ Rules — so an operator can mark the handful of links that actually
 matter (a WAN uplink, a core trunk) and give just those their own
 severity or notification routing, on top of, not instead of, the
 existing **Interface down** rule that still fires for every port
-unchanged.
+unchanged. **From 5.24.0, a flagged port's row also gets a faint accent
+tint in both copies of the interface table** — the device details
+dialog and its embedded view — so a priority port stands out at a
+glance instead of only after sorting or filtering by the ★ column.
 
 **From 5.16.0, the dialog shows what's already stored before it asks
 the device again.** The MAC section used to be empty until the live SNMP
@@ -1781,15 +1784,32 @@ tab having stayed open while it ran. All three are also reachable directly
 through the API: `GET /api/nodes/reports/availability`, `/top-metrics` and
 `/firmware`, plus `/firmware/export.csv` for the server-built file.
 
+**SFP inventory, from 5.24.0** — every switch port currently holding a
+transceiver, fleet-wide or narrowed to a device **Group**: device, IP,
+port, alias, a **Kind**, oper status, speed and last seen. **Kind** is
+**DOM** for an optic that reports light levels and so can be alerted on,
+plain **SFP** for a transceiver the switch identifies by ENTITY-MIB but
+that publishes no sensors of its own, and — only with **Include empty
+cages** ticked (off by default) — **Empty cage** for a slot with
+nothing plugged in. Nothing new is polled for this: every row comes
+from the same per-port media read behind the DOM/SFP badge already on
+the interface list (see *Drill-down*, below), so the report is free.
+Same two export buttons as Firmware inventory — **Export CSV** from
+the rows on screen, **Download CSV from server** for a fresh build —
+and the same API reach: `GET /api/nodes/reports/sfp` and
+`/sfp/export.csv`.
+
 ### Scheduled reports — Nodes → REPORTS → SCHEDULED, from 5.23.0
 
-Any of the three reports above, sent by email on a repeating schedule
-instead of run by hand. Up to 50 schedules, each its own **daily**,
-**weekly** (pick the weekday) or **monthly** (pick the day of month —
-clamped to the last day of a shorter month, so "the 31st" still sends
-in February) cadence at a chosen local hour and minute, its own list of
-recipients, and the same report kind and parameters (device group,
-period, metric, top-N) the on-demand report takes.
+Any of the reports above, sent by email on a repeating schedule instead
+of run by hand — availability, top-N by metric, firmware inventory,
+and, from 5.24.0, SFP inventory. Up to 50 schedules, each its own
+**daily**, **weekly** (pick the weekday) or **monthly** (pick the day
+of month — clamped to the last day of a shorter month, so "the 31st"
+still sends in February) cadence at a chosen local hour and minute, its
+own list of recipients, and the same report kind and parameters (device
+group, period, metric, top-N, or — for SFP inventory — device group and
+include-empty) the on-demand report takes.
 
 **The email is a text summary, not a spreadsheet pretending to be one.**
 The period covered, the totals, and up to 20 rows in the body — the
@@ -1829,6 +1849,13 @@ list — including, for an interface, its **in** and **out** counters as
 two separate picks, so one port's send and receive sides can sit on the
 chart side by side, or beside a different port on a different device
 entirely.
+
+**From 5.24.0, the device picker's dropdown shows "name (ip)"**, named
+the same way the device list itself is — SNMP hostname first, then a
+manual name, then reverse DNS, then the IP alone — in place of reading
+the manual name field, which most devices never have set and so showed
+a bare IP for nearly every row even on a well-known device. Typing
+still searches by IP, name or SNMP hostname.
 
 Pick a preset range or **Custom…**, and a bucket size — **auto**, 1
 minute, 5 minutes or 1 hour — then **Run**. The chart overlays every

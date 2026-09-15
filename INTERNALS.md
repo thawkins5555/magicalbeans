@@ -6236,6 +6236,103 @@ it are the other two callers this same release adds; none of the three
 CSV exports needed a schema change, since they already read the same rows
 their JSON routes build.
 
+### SFP inventory: `interfaces_with_media`, `sfp_inventory`, priority tint, `histDeviceLabel` (`nodesdb.py`, `report.py`, `reportsched.py`, `web/api.py`, `web/static/app.css`, `nodes.js`) — 5.24.0
+
+**`nodesdb.interfaces_with_media(device_ids=None, include_empty=False)`
+is a plain join, not a new poll.** `interfaces.media` (`'optic'` /
+`'sfp'` / `'sfp_empty'` / `NULL`, set by the existing entity-sensor and
+transceiver-presence walk in `nodepoll.py`) already backs the DOM/SFP
+badge on the interface list; this method is the first caller to select
+on it directly. It filters `media IN ('optic', 'sfp')`, adding
+`'sfp_empty'` to that list only when `include_empty` is set — a `NULL`
+media (a copper port, or a cage never walked) is never a row — and
+excludes a purged device with the same `d.id NOT IN (SELECT device_id
+FROM device_purges)` clause `device()` uses, so a device mid-delete
+never leaks into the report. An optional `device_ids` filter is
+chunked through `_id_chunks(ids, self._IDS_PER_QUERY)` (500 ids per
+`IN (...)`) exactly as every other multi-id nodesdb query is, rather
+than a bespoke limit for this one method. The `SELECT` joins
+`interfaces` to `devices` for the columns a report needs to label and
+sort a row by (`name`, `sys_name`, `display_name_source`, `ip`,
+`vendor`) in one query rather than a second lookup per row, ordered
+`d.name COLLATE NOCASE, d.ip, i.if_index` so a report and its CSV
+export are always in the same, stable order.
+
+**`report.sfp_inventory(nodesdb, device_ids=None, dns_names=None,
+hostnames=None, include_empty=False)` reshapes those rows into
+`SfpRow`/`SfpReport`, following `firmware_inventory`'s own naming
+contract exactly.** `device_label(row, dns_names)` — manual name, then
+`sysName`, then a stored name that isn't the bare IP, then
+`dns_names`/`hostnames` reverse DNS, then the IP — fills `SfpRow.name`,
+and `device` mirrors Firmware inventory's own field: `"name (ip)"`, or
+the bare IP when the label already is the IP. `_MEDIA_KIND = {"optic":
+"DOM", "sfp": "SFP", "sfp_empty": "Empty cage"}` is the one place the
+media value is turned into the label a row's **Kind** column shows, so
+the report and its CSV can never disagree on the wording. `port` reads
+`descr`, falling back to `alias` and then `f"port {if_index}"`, so a
+port with neither a description nor an alias is still an identifiable
+row rather than blank. `SfpReport` carries `device_count` (distinct
+devices seen, not the group's whole membership — a device in the group
+with no transceiver at all contributes no row and is not counted),
+`port_count`, and `dom_count`/`sfp_count`/`empty_count` split by
+`media`, all folded once here rather than recomputed by every caller.
+
+**The two routes share one body, the same pattern Firmware inventory's
+export already set.** `web/api._sfp_report(service, params)` parses
+`include_empty` (`"1"`/`"true"`/`"yes"`, case-insensitive) and an
+optional `device_ids` list, and calls `sfp_inventory` with
+`hostnames=service.app_db.hostnames`; `get_nodes_reports_sfp` returns
+its `.to_dict()` and `get_nodes_reports_sfp_export` builds the same CSV
+header (`device_id, name, ip, if_index, port, alias, kind, media,
+oper_status, admin_status, speed_bps, last_seen_ts, device`) from the
+same rows, so the downloaded file can never drift from what the screen
+showed for the same filter. Both routes are `nodes:read`, matching
+every other reports route, and so are reachable with an API token the
+same way. Routes: `GET /api/nodes/reports/sfp`,
+`/api/nodes/reports/sfp/export.csv`.
+
+**Scheduled reports gain a fourth kind, `sfp`, following the same
+`_RENDERERS`/`KINDS` shape `firmware` already used.**
+`reportsched.KINDS` and `web/api._REPORT_SCHEDULE_KINDS` both add
+`"sfp"`; `_clean_report_schedule_params` gets an `sfp` branch that
+accepts `include_empty` (coerced to `bool`) and an optional
+`device_group_id` (`int`, only when not empty) — the same shape
+`availability`'s params take, minus the period. `reportsched._render_sfp`
+calls `reportmod.sfp_inventory` with `device_ids` resolved from
+`device_group_id` via the same `_device_ids_for_group` helper every
+other group-scoped renderer uses, builds a subject line
+(`"SFP inventory — N port(s) on M device(s), D DOM / S SFP"`), a body
+listing up to `_BODY_ROW_CAP` rows (name, port, kind) with a "…and N
+more" tail, and the full CSV as the attachment — the same
+subject/body/CSV shape `_render_firmware` returns, so `run_due` and
+`_RENDERERS["sfp"]` need no special-casing.
+
+**Priority tint is one CSS rule and one class name, nothing in the
+data.** `nodes.js`'s interface-table row-draw callback (the function
+both the device dialog's own interface table and its embedded view
+share) now sets `tr.className = r.priority ? 'clickable priority' :
+'clickable'` — `r.priority` already existed as a column on the rows
+Nodes' own interface query returns (see *Priority ports*, above); this
+release only reads it to add a class. `tr.priority { background:
+color-mix(in srgb, var(--accent) 10%, var(--panel)) }` in `app.css`
+mixes against `--panel` rather than a flat colour, deliberately, so the
+tint still reads correctly under a zebra-striped or `bulk-checked` row
+instead of a `background` shorthand stomping either.
+
+**`nodes.js histDeviceLabel(d)` replaces `` `${d.name || d.ip}
+(${d.ip})` `` — the raw, usually-unset manual-name field — with the
+same `displayName(d)` precedence (SNMP hostname first) the device list
+itself already used elsewhere in this module.** It returns `"name
+(ip)"`, or just the bare IP when `displayName` resolves to the IP
+already, so a nameless device never reads `"10.1.2.3 (10.1.2.3)"`. Both
+call sites the History row's device field had — the `App.comboBox`
+`search` callback (`/api/nodes/devices?q=...`, unchanged server-side:
+it already matched IP, name and SNMP hostname) and the pre-fill when a
+saved row already names a `device_id` — now build the label through
+this one function instead of duplicating the string by hand, so the
+dropdown and the field's own resting value can never disagree on how a
+device is named.
+
 ### Scheduled reports: `report_schedules`, `reportsched.py` (`nodesdb.py`, `alertmail.py`, `web/service.py`, `web/api.py`) — 5.23.0
 
 `reportsched.py` sits above `report.py` the way `report.py` sits above

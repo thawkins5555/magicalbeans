@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.24.0 — SFP inventory, priority-port tint, and names in the History picker](#5240--sfp-inventory-priority-port-tint-and-names-in-the-history-picker)
 - [5.23.0 — Scheduled reports, a history explorer, priority ports, and NetFlow's missing blocks](#5230--scheduled-reports-a-history-explorer-priority-ports-and-netflows-missing-blocks)
 - [5.22.0 — TACACS+ sign-in, richer dashboard graphs, and a look at history](#5220--tacacs-sign-in-richer-dashboard-graphs-and-a-look-at-history)
 - [5.21.0 — A modular Dashboard, and global find to the switch port](#5210--a-modular-dashboard-and-global-find-to-the-switch-port)
@@ -156,6 +157,59 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.24.0 — SFP inventory, priority-port tint, and names in the History picker
+
+Three items from the operator, landing together: `PROMPT-LOG.md` carries
+the requests in full; this entry is the shipped result.
+
+**A new report — Nodes → Reports → SFP INVENTORY — lists every switch
+port holding a transceiver, fleet-wide or narrowed to a device group.**
+Device, IP, port, alias, a **Kind** of **DOM** (an optic reporting light
+levels, so it can be alerted on), **SFP** (a transceiver the switch
+names by ENTITY-MIB but that publishes no sensors) or, with **Include
+empty cages** ticked (off by default), **Empty cage** (a slot with
+nothing plugged into it), plus the port's oper status, speed and last
+seen time. It costs nothing extra to poll: every row comes from the
+same per-port media read the environment poll already learns for the
+existing DOM/SFP badges on the interface list, so this report is a new
+view of data already being collected, not a new SNMP walk. **Export
+CSV** builds the file from the rows already on screen; **Download CSV
+from server** asks the server to build it again, the same two-button
+pattern Firmware inventory already offers. SFP inventory joins the
+three existing reports as a fourth scheduled-report kind under Nodes →
+Reports → SCHEDULED, with its own device-group and include-empty
+options, sent by email on the same daily/weekly/monthly cadence the
+others use. Reachable directly through the API too: `GET
+/api/nodes/reports/sfp` and `/sfp/export.csv`, both readable with an
+API token the same as every other reports route.
+
+**A priority port now shows at a glance, not only after opening its own
+dialog.** A row flagged **Priority** gets a faint accent tint in both
+copies of the interface table — the device details dialog and its
+embedded view — the same ★ flag from 5.23.0, just visible without
+filtering or scrolling to the ★ column first.
+
+**The HISTORY device picker shows a name again, not just an IP.** It
+was reading the manual name field, which most devices never have set,
+so nearly every row in the dropdown read as a bare IP even for
+well-known, named devices. It now labels each device "name (ip)" using
+the same name precedence the device list itself uses — SNMP hostname
+first, then a manual name, then reverse DNS, then the IP alone — and
+still searches by IP, name or SNMP hostname exactly as before.
+
+Files: `nodesdb.py`, `report.py`, `reportsched.py`, `web/api.py`,
+`web/server.py`, `web/static/app.css`, `web/static/index.html`,
+`web/static/nodes.js`.
+
+Verification: `test_sfp_report.py` (new) covers
+`nodesdb.interfaces_with_media` (the empty-cage and no-media exclusions,
+the device-group filter, the purge exclusion), `report.sfp_inventory`'s
+row shaping and counts, `reportsched.py`'s `sfp` render, and both
+`/api/nodes/reports/sfp` routes end to end; `test_reports_ui.py` and
+`test_frontend_contracts.py` extend to cover the new subtab and every
+new UI string; `tests/ui/walk.mjs` adds a walk of the SFP INVENTORY
+subtab, the priority tint and the HISTORY picker.
 
 ### 5.23.0 — Scheduled reports, a history explorer, priority ports, and NetFlow's missing blocks
 
