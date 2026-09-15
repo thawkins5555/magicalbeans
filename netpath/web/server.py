@@ -231,6 +231,8 @@ ROUTES = [
     # settings — same shape as the SMTP test route below, and gated the
     # same way the settings that configure it are (ADMIN_ONLY_SETTINGS).
     ("POST", r"^/api/settings/ldap-test$", api.post_ldap_test, ("admin", W)),
+    # The TACACS+ counterpart, same shape and same gate.
+    ("POST", r"^/api/settings/tacacs-test$", api.post_tacacs_test, ("admin", W)),
     ("GET", r"^/api/state$", api.get_state, None),
     # The per-table breakdown of every database, behind `settings: read` the
     # way the storage block inside /api/state is. Its own route because it
@@ -359,6 +361,11 @@ ROUTES = [
      api.post_nodes_upstream_suggestions_apply, ("nodes", W)),
     ("GET", r"^/api/nodes/devices/(\d+)/metrics$", api.get_nodes_device_metrics, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/series$", api.get_nodes_device_series, ("nodes", R)),
+    # Several devices'/metrics' series in one request -- what a dashboard
+    # graph tile with several interfaces on it reads instead of one request
+    # per interface. Matched before nothing here could confuse it with the
+    # per-device route above: "series/batch" never matches "(\d+)".
+    ("GET", r"^/api/nodes/series/batch$", api.get_nodes_series_batch, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/events$", api.get_nodes_device_events, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/timeline$", api.get_nodes_device_timeline, ("nodes", R)),
     # Fleet-wide reports (netpath/report.py), not scoped to one device the

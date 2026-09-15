@@ -240,6 +240,141 @@ try:
           and rows[0].get("ip") == "10.60.0.2" and rows[0].get("kind") == "device_down",
           rows)
 
+    print("12. iface_traffic: interfaces list, name, y_max, t0/t1, widened window_s")
+
+    def put_tile(config, tile_type="iface_traffic"):
+        layout = {"version": 1, "tiles": [
+            {"id": "sch1", "type": tile_type, "w": 1, "h": 1, "config": config}]}
+        return call("PUT", "/api/dashboard/layout", {"layout": layout}, token=admin)
+
+    second_device = service.nodes_db.add_device("10.60.0.3", name="core-b")
+
+    good_cases = [
+        ("a legacy single-interface config",
+         {"device_id": keep_device, "if_index": 3, "window_s": 3600}),
+        ("an interfaces list of two",
+         {"interfaces": [{"device_id": keep_device, "if_index": 1},
+                         {"device_id": second_device, "if_index": 2}]}),
+        ("a name at the 60-char limit", {"name": "x" * 60}),
+        ("y_max 0 (auto)", {"y_max": 0}),
+        ("y_max at the 10**13 ceiling", {"y_max": 10**13}),
+        ("window_s 900 (new: 15 minutes)", {"window_s": 900}),
+        ("window_s 2592000 (new: 30 days)", {"window_s": 2592000}),
+        ("a pinned t0/t1 range", {"t0": 1000, "t1": 5000}),
+    ]
+    for name, config in good_cases:
+        status, payload = put_tile(config)
+        check(f"iface_traffic accepts {name}", status == 200, (status, payload))
+
+    bad_iface_cases = [
+        ("interfaces: empty list", {"interfaces": []}),
+        ("interfaces: 9 entries (over the 8 max)",
+         {"interfaces": [{"device_id": keep_device, "if_index": i} for i in range(9)]}),
+        ("interfaces: a duplicate device/if_index pair",
+         {"interfaces": [{"device_id": keep_device, "if_index": 1},
+                         {"device_id": keep_device, "if_index": 1}]}),
+        ("interfaces: wrong shape (missing if_index)",
+         {"interfaces": [{"device_id": keep_device}]}),
+        ("interfaces: an extra key beyond device_id/if_index",
+         {"interfaces": [{"device_id": keep_device, "if_index": 1, "extra": 1}]}),
+        ("interfaces: string ids instead of ints",
+         {"interfaces": [{"device_id": str(keep_device), "if_index": "1"}]}),
+        ("name over 60 chars", {"name": "x" * 61}),
+        ("y_max negative", {"y_max": -1}),
+        ("y_max above the 10**13 ceiling", {"y_max": 10**13 + 1}),
+        ("y_max as a bool, not an int", {"y_max": True}),
+        ("window_s not in the allowed set", {"window_s": 120}),
+        ("t0 without t1", {"t0": 1000}),
+        ("t1 without t0", {"t1": 5000}),
+        ("t1 <= t0", {"t0": 5000, "t1": 5000}),
+        ("a span over 120 days", {"t0": 0, "t1": 2592000 * 4 + 1}),
+        ("an unknown config key", {"bogus_key": 1}),
+    ]
+    for name, config in bad_iface_cases:
+        status, payload = put_tile(config)
+        check(f"iface_traffic rejects {name}", status == 400, (status, payload))
+
+    print("12b. device_metric: name, y_max, t0/t1 too")
+    good_metric_cases = [
+        ("name at the 60-char limit",
+         {"device_id": keep_device, "metric_key": "cpu_pct", "name": "y" * 60}),
+        ("y_max at the 10**15 ceiling",
+         {"device_id": keep_device, "metric_key": "cpu_pct", "y_max": 10**15}),
+        ("a pinned t0/t1 range",
+         {"device_id": keep_device, "metric_key": "cpu_pct", "t0": 1000, "t1": 5000}),
+    ]
+    for name, config in good_metric_cases:
+        status, payload = put_tile(config, tile_type="device_metric")
+        check(f"device_metric accepts {name}", status == 200, (status, payload))
+
+    bad_metric_cases = [
+        ("name over 60 chars", {"metric_key": "cpu_pct", "name": "y" * 61}),
+        ("y_max above the 10**15 ceiling",
+         {"metric_key": "cpu_pct", "y_max": 10**15 + 1}),
+        ("t1 <= t0", {"metric_key": "cpu_pct", "t0": 5000, "t1": 5000}),
+    ]
+    for name, config in bad_metric_cases:
+        status, payload = put_tile(config, tile_type="device_metric")
+        check(f"device_metric rejects {name}", status == 400, (status, payload))
+
+    print("13. GET /api/nodes/series/batch")
+    batch_device = service.nodes_db.add_device("10.60.0.4", name="batch-sw")
+    service.nodes_db.replace_interfaces(batch_device, [
+        {"if_index": 1, "descr": "Gi0/1", "alias": "uplink"},
+        {"if_index": 2, "descr": "", "alias": "srv-2"},
+    ])
+    service.nodes_db.record_metric_sample(
+        batch_device, "if_in_bps.1", "Gi0/1 in_bps", "bps", "gauge",
+        time.time() - 30, 1000.0)
+    service.nodes_db.record_metric_sample(
+        batch_device, "if_out_bps.1", "Gi0/1 out_bps", "bps", "gauge",
+        time.time() - 30, 2000.0)
+    service.nodes_db.record_metric_sample(
+        batch_device, "cpu_pct", "CPU", "%", "gauge", time.time() - 30, 42.0)
+
+    status, payload = call(
+        "GET", f"/api/nodes/series/batch?q={batch_device}:if_in_bps.1,"
+              f"{batch_device}:if_out_bps.1", token=admin)
+    check("batch: two metrics for one device return two series",
+          status == 200 and len(payload.get("series", [])) == 2, (status, payload))
+    series_by_key = {s["metric_key"]: s for s in payload.get("series", [])}
+    check("...ports are labelled from the interface's descr",
+          series_by_key.get("if_in_bps.1", {}).get("label") == "Gi0/1", series_by_key)
+    check("...each carries its device_name and unit",
+          series_by_key.get("if_in_bps.1", {}).get("device_name") == "batch-sw"
+          and series_by_key.get("if_in_bps.1", {}).get("unit") == "bps", series_by_key)
+    check("...and actual points",
+          len(series_by_key.get("if_in_bps.1", {}).get("points", [])) >= 1, series_by_key)
+
+    status, payload = call(
+        "GET", f"/api/nodes/series/batch?q={batch_device}:no_such_metric_key",
+        token=admin)
+    check("batch: an unknown metric key answers 200 with empty points, not 404",
+          status == 200 and payload["series"][0]["points"] == []
+          and payload["series"][0]["label"] == "no_such_metric_key", (status, payload))
+
+    status, payload = call(
+        "GET", "/api/nodes/series/batch?q=999999:cpu_pct", token=admin)
+    check("batch: an unknown device also answers empty points, not 404",
+          status == 200 and payload["series"][0]["points"] == []
+          and payload["series"][0]["device_name"] == "", (status, payload))
+
+    q17 = ",".join(f"{batch_device}:cpu_pct" for _ in range(17))
+    status, payload = call("GET", f"/api/nodes/series/batch?q={q17}", token=admin)
+    check("batch: 17 entries is refused (400), the cap is 16",
+          status == 400, (status, payload))
+
+    status, payload = call(
+        "GET", "/api/nodes/series/batch?q=not-a-valid-entry", token=admin)
+    check("batch: a malformed q entry is refused (400)", status == 400, (status, payload))
+
+    status, payload = call("GET", "/api/nodes/series/batch", token=admin)
+    check("batch: q is required", status == 400, (status, payload))
+
+    status, payload = call(
+        "GET", f"/api/nodes/series/batch?q={batch_device}:cpu_pct", token=no_nodes)
+    check("batch: refuses an account without Nodes read", status == 403, (status, payload))
+
 finally:
     server.stop()
     service.shutdown()

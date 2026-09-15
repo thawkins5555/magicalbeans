@@ -15,6 +15,7 @@ import ipaddress
 import sqlite3
 import json
 import math
+import re
 import secrets
 import threading
 import time
@@ -24,7 +25,7 @@ from .. import alertrules
 from ..alertrules import device_id_for
 from .. import alertsdb
 from ..alertsdb import is_window_active
-from ..analysis import (MAX_BUCKETS, availability, build_timeline,
+from ..analysis import (MAX_BUCKETS, MAX_TIMESTAMP, availability, build_timeline,
                         build_topology, clamp_window)
 from .. import namelookup
 from ..services import format_bytes, format_packets, format_rate, port_name, protocol_name
@@ -533,7 +534,10 @@ SETTINGS_ONLY_KEYS = ("web_host", "web_port", "web_cert", "web_key",
                       "session_idle_minutes", "session_max_hours",
                       "dns_server", "asn_server",
                       "ldap_url", "ldap_bind_dn_template",
-                      "ldap_allow_cleartext", "ldap_timeout_s")
+                      "ldap_allow_cleartext", "ldap_timeout_s",
+                      "tacacs_servers", "tacacs_timeout_s",
+                      "tacacs_auto_create", "tacacs_default_role",
+                      "tacacs_secret_enc")
 
 
 def _visible_settings(settings: dict, granted: dict) -> dict:
@@ -542,7 +546,12 @@ def _visible_settings(settings: dict, granted: dict) -> dict:
     post_settings echoing the unfiltered dict would hand back exactly what
     SETTINGS_ONLY_KEYS exists to withhold."""
     if _permissions.allows(granted.get("settings"), _permissions.READ):
-        return settings
+        visible = dict(settings)
+        # Whether a secret is stored, never the ciphertext -- the same
+        # "has_credential" idiom other stored credentials use, none of
+        # which return their encrypted blob to any reader either.
+        visible["tacacs_secret_set"] = bool(visible.pop("tacacs_secret_enc", ""))
+        return visible
     return {k: v for k, v in settings.items() if k not in SETTINGS_ONLY_KEYS}
 
 
@@ -2090,6 +2099,13 @@ SETTINGS_SCOPES = {
 ADMIN_ONLY_SETTINGS = ("updates_enabled", "ldap_enabled", "ldap_url",
                       "ldap_bind_dn_template", "ldap_allow_cleartext",
                       "ldap_timeout_s",
+                      # TACACS+: the same "who may sign in at all" call as
+                      # the ldap_* keys above.
+                      "tacacs_enabled", "tacacs_servers", "tacacs_timeout_s",
+                      "tacacs_auto_create", "tacacs_default_role",
+                      # The write-only field a client posts; the stored
+                      # tacacs_secret_enc blob is never client-settable.
+                      "tacacs_secret",
                       "session_idle_minutes", "session_max_hours",
                       "web_host", "web_port", "web_cert", "web_key",
                       # Same kind of decision as where the listener binds.
@@ -2114,6 +2130,7 @@ def _may_change_admin_settings(service, params) -> bool:
 _GLOBAL_SETTINGS_RANGES = {
     "dns_workers": (1, 32),
     "dns_timeout_s": (0.5, 30),
+    "tacacs_timeout_s": (1, 60),
     "dns_cache_days": (1, 365),
     "asn_cache_days": (1, 365),
     "netpath_refresh_s": (1, 300),
@@ -2302,6 +2319,24 @@ def _check_configrx_settings(values: dict) -> None:
             raise ValueError(f"Line ignore pattern {line!r} is invalid: {exc}") from exc
 
 
+def _check_tacacs_settings(values: dict) -> None:
+    """`tacacs_servers` parses (a clear error naming the bad entry rather
+    than a client-side surprise on first sign-in) and `tacacs_default_role`
+    is one of permissions.role_grants' names, whichever of the two the
+    caller actually posted."""
+    from .. import tacacsclient
+
+    if "tacacs_servers" in values and str(values["tacacs_servers"]).strip():
+        try:
+            tacacsclient.parse_servers(values["tacacs_servers"])
+        except tacacsclient.TacacsConfigError as exc:
+            raise ValueError(f"tacacs_servers: {exc}") from exc
+    if "tacacs_default_role" in values:
+        if values["tacacs_default_role"] not in ("viewer", "operator", "admin"):
+            raise ValueError(
+                "tacacs_default_role must be viewer, operator or admin")
+
+
 def _check_disk_free_settings(service, values: dict) -> None:
     """The critical free-space floor has to sit below the warning one.
 
@@ -2338,11 +2373,19 @@ def post_settings(service, params, body) -> dict:
     # field into a 403. Filtering by the scope's own defaults still refuses
     # the write that would really land.
     scope_keys = _scope_defaults(scope)
+    # The ciphertext column is derived from "tacacs_secret" below, never
+    # taken from a client as-is.
+    values.pop("tacacs_secret_enc", None)
     touched = [key for key in ADMIN_ONLY_SETTINGS
-               if key in values and key in scope_keys]
+               if key in values and (key in scope_keys
+                                     or (key == "tacacs_secret" and scope == "global"))]
     if touched and not _may_change_admin_settings(service, params):
         raise _permissions.Forbidden(
             f"Changing {', '.join(touched)} needs administrator access")
+    # Read before coerce_settings drops it (it is not a key of GLOBAL_DEFAULTS
+    # under this name): blank or absent means keep the currently stored
+    # secret, so only a genuinely non-empty value gets encrypted below.
+    raw_tacacs_secret = values.get("tacacs_secret") if scope == "global" else None
     # Typed before anything is written: apply_settings saves first and the
     # loaders hand back whatever was stored, so a null or "abc" for a
     # numeric key would persist and then raise from every subsequent start's
@@ -2358,6 +2401,17 @@ def post_settings(service, params, body) -> dict:
         _check_mapper_settings(service, values)
     if scope == "configrx":
         _check_configrx_settings(values)
+    if scope == "global":
+        _check_tacacs_settings(values)
+        if raw_tacacs_secret:
+            import base64
+
+            encrypted = _encrypt_secret(str(raw_tacacs_secret), (
+                "This machine cannot encrypt a stored credential — DPAPI is "
+                "Windows-only. See CREDENTIAL-SECURITY.md for the portable "
+                "secret store this platform needs instead; nothing will be "
+                "saved here until then."))
+            values["tacacs_secret_enc"] = base64.b64encode(encrypted).decode("ascii")
     # The keys, never the values: a settings value can be a credential-
     # adjacent path or a hostname, and an audit trail is a record of what
     # was touched, not a second copy of the configuration.
@@ -6191,18 +6245,115 @@ def get_nodes_device_metrics(service, params, body, device_id) -> dict:
         for r in rows]}
 
 
+def _series_bucket_s(params, t0: float, t1: float) -> float:
+    """The bucket width a series route applies to a resolved [t0, t1]: 0
+    (raw) unless `bucket_s` asks for wider, floored at 0 and capped at half
+    the window so a caller cannot ask for one bucket covering the whole
+    span. Shared by get_nodes_device_series and the batch route below."""
+    bucket_s = _num(params, "bucket_s", 0)
+    if bucket_s < 0:
+        bucket_s = 0
+    return min(bucket_s, (t1 - t0) / 2)
+
+
 def get_nodes_device_series(service, params, body, device_id) -> dict:
     _require(service.nodes_db.device(device_id), "device")
     metric_id = params.get("metric_id")
     if not metric_id:
         raise ValueError("metric_id is required")
     t0, t1 = _window(params)
-    bucket_s = _num(params, "bucket_s", 0)
-    if bucket_s < 0:
-        bucket_s = 0
-    bucket_s = min(bucket_s, (t1 - t0) / 2)
+    bucket_s = _series_bucket_s(params, t0, t1)
     points = service.nodes_db.series(device_id, int(metric_id), t0, t1, bucket_s=bucket_s)
     return {"t0": t0, "t1": t1, "points": points}
+
+
+# ------------------------------------------------------- batch series route
+#
+# One request for several devices'/metrics' series, so a dashboard tile
+# with several interfaces on one graph does not cost one request per
+# interface per metric per refresh. A device or metric this account cannot
+# see -- or that simply is not on file -- answers with an empty series
+# rather than a 404: one bad entry in `q` must not fail the whole tile.
+
+_SERIES_BATCH_MAX = 16
+# "if_in_bps.<if_index>" / "if_out_bps.<if_index>" -- the per-port metric
+# keys nodepoll.py records (see _INTERFACE_METRICS) -- get an interface's
+# own descr/alias as their label instead of the metric's generic one.
+_IFACE_METRIC_KEY_RE = re.compile(r"^if_(?:in|out)_bps\.(\d+)$")
+
+
+def _parse_series_batch_q(raw: str) -> list[tuple[int, str]]:
+    pairs = []
+    for piece in str(raw or "").split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        device_id_s, sep, metric_key = piece.partition(":")
+        metric_key = metric_key.strip()
+        if not sep or not metric_key:
+            raise ValueError(
+                f"q entries must be <device_id>:<metric_key>, not {piece!r}")
+        try:
+            device_id = int(device_id_s)
+        except ValueError:
+            raise ValueError(
+                f"q entries must be <device_id>:<metric_key>, not {piece!r}")
+        pairs.append((device_id, metric_key))
+    if not pairs:
+        raise ValueError("q is required")
+    if len(pairs) > _SERIES_BATCH_MAX:
+        raise ValueError(f"q accepts at most {_SERIES_BATCH_MAX} entries")
+    return pairs
+
+
+def get_nodes_series_batch(service, params, body) -> dict:
+    """{t0, t1, series: [{device_id, device_name, metric_key, unit, label,
+    points}, ...]}, in `q`'s order, for `q=<device_id>:<metric_key>[,...]`.
+    Resolves each pair through NodesSeriesDatabase.metric_by_key (one
+    indexed lookup) and reads interface labels for the whole batch in one
+    query per distinct device, rather than one per pair."""
+    pairs = _parse_series_batch_q(params.get("q", ""))
+    t0, t1 = _window(params, 86400.0)
+    bucket_s = _series_bucket_s(params, t0, t1)
+
+    device_ids = sorted({device_id for device_id, _key in pairs})
+    devices = {device_id: service.nodes_db.device(device_id)
+              for device_id in device_ids}
+    iface_device_ids = {device_id for device_id, key in pairs
+                        if _IFACE_METRIC_KEY_RE.match(key)}
+    port_labels: dict[int, dict[int, str]] = {}
+    if iface_device_ids:
+        for row in service.nodes_db.interface_port_labels_for_devices(iface_device_ids):
+            port_labels.setdefault(row["device_id"], {})[row["if_index"]] = (
+                row["descr"] or row["alias"] or "")
+
+    series = []
+    for device_id, key in pairs:
+        device = devices.get(device_id)
+        if device is None:
+            series.append({"device_id": device_id, "device_name": "",
+                          "metric_key": key, "unit": "", "label": key,
+                          "points": []})
+            continue
+        device_name = _device_display_name(device)
+        metric_row = service.nodes_db.metric_by_key(device_id, key)
+        if metric_row is None:
+            series.append({"device_id": device_id, "device_name": device_name,
+                          "metric_key": key, "unit": "", "label": key,
+                          "points": []})
+            continue
+        iface_match = _IFACE_METRIC_KEY_RE.match(key)
+        if iface_match:
+            if_index = int(iface_match.group(1))
+            label = port_labels.get(device_id, {}).get(if_index) or f"if {if_index}"
+        else:
+            label = metric_row["label"]
+        points = service.nodes_db.series(device_id, metric_row["id"], t0, t1,
+                                         bucket_s=bucket_s)
+        series.append({"device_id": device_id, "device_name": device_name,
+                      "metric_key": key, "unit": metric_row["unit"],
+                      "label": label, "points": points})
+    return {"t0": t0, "t1": t1, "series": series}
 
 
 def get_nodes_device_timeline(service, params, body, device_id) -> dict:
@@ -9816,7 +9967,7 @@ def post_login(service, params, body) -> dict:
     """Verify a password. Deliberately slow to fail, and vague about why."""
     from ..auth import (AuthError, LockedOut, check_username, needs_rehash,
                         hash_password, verify_password)
-    from .service import LdapUnavailable
+    from .service import LdapUnavailable, TacacsUnavailable
 
     password = str(body.get("password", ""))
     client = _client(params)
@@ -9860,14 +10011,61 @@ def post_login(service, params, body) -> dict:
                         f"password-verification slot busy for "
                         f"{_LOGIN_SLOT_WAIT_S:.0f}s")
         raise Busy("The server is busy verifying sign-ins. Try again in a moment.")
+    # Whether the credential was already verified below (the auto-create
+    # branch), so the auth_source=="tacacs" branch further down does not
+    # spend a second AAA round trip re-checking what it just checked.
+    already_authed = False
+
     try:
         row = service.app_db.user(username) if username else None
         stored = row["password"] if row else None
 
+        if (row is None and username
+                and service.settings.get("tacacs_enabled")
+                and service.settings.get("tacacs_auto_create")):
+            # An unknown username, TACACS+ on, and auto-create on: ask the
+            # AAA server before falling to the dummy-hash "no such account"
+            # path below, since for this account the AAA server's answer IS
+            # whether it should exist. No dummy hash here — a network round
+            # trip to the AAA server already dominates the timing a dummy
+            # hash exists to flatten.
+            role = str(service.settings.get("tacacs_default_role", "viewer"))
+            try:
+                accepted = service.authenticate_tacacs(username, password, client)
+            except TacacsUnavailable as exc:
+                service.log.add(
+                    ERROR_CATEGORY,
+                    f"TACACS+ AAA server unreachable while signing in "
+                    f"{label} from {client}: {exc}")
+                _audit(service, dict(params, _username=label),
+                       "signin.tacacs_unreachable", target=label,
+                       detail=str(exc)[:200])
+                raise PermissionError(
+                    "Could not reach the AAA server. Try again shortly, or "
+                    "contact an administrator.") from exc
+            if not accepted:
+                service.throttle.record_failure(username, client)
+                service.log.add(ERROR_CATEGORY,
+                                f"Failed sign-in for {label} from {client}")
+                _audit(service, dict(params, _username=label), "signin.failed",
+                       target=label, detail="tacacs rejected")
+                raise PermissionError("Wrong username or password")
+            service.app_db.add_user(username, "", must_change=False,
+                                    auth_source="tacacs")
+            service.app_db.set_permissions(username, _permissions.role_grants(role))
+            service.log.add(
+                SYSTEM_CATEGORY,
+                f"Auto-created TACACS+ account {username} (role {role})")
+            _audit(service, dict(params, _username=username), "user.autocreate",
+                   target=username, detail=f"tacacs, role {role}")
+            row = service.app_db.user(username)
+            stored = row["password"]
+            already_authed = True
+
         # Hash something even when the account does not exist, so the time
         # taken cannot be used to discover which usernames are real. Only
         # "no such account" versus "an account exists" — it says nothing
-        # about whether that account is local or LDAP.
+        # about whether that account is local, LDAP or TACACS+.
         if stored is None:
             verify_password(password, _dummy_hash())
             service.throttle.record_failure(username, client)
@@ -9879,7 +10077,45 @@ def post_login(service, params, body) -> dict:
 
         auth_source = row["auth_source"]
 
-        if auth_source == "ldap":
+        if auth_source == "tacacs" and not already_authed:
+            # A tacacs-mapped account: the AAA server verifies the
+            # password, not the empty, never-consulted local hash. With the
+            # feature switched off this account simply cannot sign in — it
+            # never falls back to an empty local hash (verify_password
+            # refuses that anyway), and failing here first gives a clearer
+            # audit trail than "wrong password".
+            if not service.settings.get("tacacs_enabled"):
+                service.throttle.record_failure(username, client)
+                service.log.add(
+                    ERROR_CATEGORY,
+                    f"Failed sign-in for {row['username']} from {client}: "
+                    f"TACACS+ sign-in is switched off")
+                _audit(service, dict(params, _username=row["username"]),
+                       "signin.failed", target=row["username"],
+                       detail="tacacs disabled")
+                raise PermissionError("Wrong username or password")
+            try:
+                bound = service.authenticate_tacacs(row["username"], password, client)
+            except TacacsUnavailable as exc:
+                service.log.add(
+                    ERROR_CATEGORY,
+                    f"TACACS+ AAA server unreachable while signing in "
+                    f"{row['username']} from {client}: {exc}")
+                _audit(service, dict(params, _username=row["username"]),
+                       "signin.tacacs_unreachable", target=row["username"],
+                       detail=str(exc)[:200])
+                raise PermissionError(
+                    "Could not reach the AAA server. Try again shortly, or "
+                    "contact an administrator.") from exc
+            if not bound:
+                service.throttle.record_failure(username, client)
+                service.log.add(ERROR_CATEGORY,
+                                f"Failed sign-in for {row['username']} from {client}")
+                _audit(service, dict(params, _username=row["username"]),
+                       "signin.failed", target=row["username"],
+                       detail="tacacs rejected")
+                raise PermissionError("Wrong username or password")
+        elif auth_source == "ldap":
             # An LDAP-mapped account: the directory verifies the password,
             # not the empty, never-consulted local hash. With the feature
             # switched off this account simply cannot sign in — it never
@@ -9921,7 +10157,7 @@ def post_login(service, params, body) -> dict:
                        "signin.failed", target=row["username"],
                        detail="ldap bind refused")
                 raise PermissionError("Wrong username or password")
-        elif not verify_password(password, stored):
+        elif not already_authed and not verify_password(password, stored):
             service.throttle.record_failure(username, client)
             service.log.add(ERROR_CATEGORY,
                             f"Failed sign-in for {row['username']} from {client}")
@@ -10061,19 +10297,19 @@ def post_user(service, params, body) -> dict:
         raise ValueError(str(exc)) from exc
 
     auth_source = str(body.get("auth_source", "local") or "local").strip().lower()
-    if auth_source not in ("local", "ldap"):
-        raise ValueError("auth_source must be 'local' or 'ldap'")
+    if auth_source not in ("local", "ldap", "tacacs"):
+        raise ValueError("auth_source must be 'local', 'ldap' or 'tacacs'")
 
     if service.app_db.user(username):
         raise ValueError(f"There is already an account called {username}")
 
-    if auth_source == "ldap":
-        # No local password hash at all — the directory is the only place
-        # this account's credential lives, so a database compromise finds
-        # nothing here for it. must_change is meaningless without a local
-        # password to change, so it starts False rather than locking the
-        # account behind a change it has no route to make.
-        service.app_db.add_user(username, "", must_change=False, auth_source="ldap")
+    if auth_source in ("ldap", "tacacs"):
+        # No local password hash at all — the directory or AAA server is
+        # the only place this account's credential lives, so a database
+        # compromise finds nothing here for it. must_change is meaningless
+        # without a local password to change, so it starts False rather
+        # than locking the account behind a change it has no route to make.
+        service.app_db.add_user(username, "", must_change=False, auth_source=auth_source)
     else:
         password = str(body.get("password", ""))
         try:
@@ -10203,14 +10439,15 @@ def post_password(service, params, body) -> dict:
     if not row:
         raise ValueError(f"No account called {target}")
 
-    if row["auth_source"] == "ldap":
-        # post_login's ldap branch never looks at `row["password"]`, so
-        # setting one here would sit unused while suggesting a local
-        # fallback exists. The directory is the only place this account's
-        # password is ever changed.
+    if row["auth_source"] in ("ldap", "tacacs"):
+        # post_login's ldap/tacacs branches never look at `row["password"]`,
+        # so setting one here would sit unused while suggesting a local
+        # fallback exists. The directory or AAA server is the only place
+        # this account's password is ever changed.
+        source = "the directory (LDAP)" if row["auth_source"] == "ldap" else "TACACS+"
         raise ValueError(
-            f"{target} signs in through the directory (LDAP); there is no "
-            f"local password to change here.")
+            f"{target} signs in through {source}; there is no local "
+            f"password to change here.")
 
     if not resetting:
         # Changing your own password needs the current one, so a walk-up at an
@@ -10394,6 +10631,62 @@ def post_ldap_test(service, params, body) -> dict:
            detail=f"ok={ok}: {message}"[:400])
     return {"ok": ok, "message": message}
 
+
+# ------------------------------------------------------------ TACACS+ test
+#
+# The TACACS+ counterpart to post_ldap_test above: a dry-run PAP login
+# against tacacs_servers/tacacs_secret (or the overrides in the body), so
+# an administrator finds out whether AAA sign-in works before turning
+# tacacs_enabled on for a real account. Never creates a session and never
+# consults or changes a stored account.
+
+def post_tacacs_test(service, params, body) -> dict:
+    import base64
+
+    from .. import dpapi, tacacsclient
+
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", ""))
+    if not username or not password:
+        raise ValueError("A username and password are needed to test a sign-in")
+
+    servers_text = str(body.get("servers", "")
+                       or service.settings.get("tacacs_servers", ""))
+    secret_override = str(body.get("secret", ""))
+    timeout = float(body.get("timeout_s", 0)
+                    or service.settings.get("tacacs_timeout_s", 5.0) or 5.0)
+
+    try:
+        servers = tacacsclient.parse_servers(servers_text)
+        secret = secret_override
+        if not secret:
+            secret_enc = str(service.settings.get("tacacs_secret_enc", ""))
+            if not secret_enc:
+                raise tacacsclient.TacacsConfigError(
+                    "No shared secret is set, or saved yet")
+            try:
+                secret = dpapi.unprotect(base64.b64decode(secret_enc)).decode("utf-8")
+            except dpapi.DpapiUnavailable as exc:
+                raise tacacsclient.TacacsConfigError(
+                    f"The stored shared secret could not be decrypted: {exc}") from exc
+        accepted = tacacsclient.authenticate(
+            servers, secret, username, password, timeout=timeout,
+            rem_addr=str(params.get("_client", "")))
+        ok = accepted
+        message = ("Accepted" if accepted else
+                   "The AAA server rejected that username or password")
+    except tacacsclient.TacacsConfigError as exc:
+        ok, message = False, str(exc)
+    except tacacsclient.TacacsConnectError as exc:
+        ok, message = False, f"Could not reach the AAA server: {exc}"
+    except tacacsclient.TacacsProtocolError as exc:
+        ok, message = False, str(exc)
+
+    # No password or secret, either way — only whether the test was run and
+    # against what result.
+    _audit(service, params, "tacacs.test", target=username,
+           detail=f"ok={ok}: {message}"[:400])
+    return {"ok": ok, "message": message}
 
 
 # An honest denominator for the same filters `GET /api/alerts` applies, so
@@ -10724,10 +11017,15 @@ DEFAULT_DASHBOARD_LAYOUT = {
     ],
 }
 
-# The graph tiles' window choices: 1h/6h/24h/7d, the only four dashboard.js
-# ever offers, so a config carrying anything else did not come from the
-# grid's own dialog.
-_DASHBOARD_WINDOW_S_VALUES = (3600, 21600, 86400, 604800)
+# The graph tiles' window choices -- mirrors App.RANGES in app.js (15m/1h/
+# 6h/24h/3d/7d/30d), the only seven dashboard.js ever offers, so a config
+# carrying anything else did not come from the grid's own dialog.
+_DASHBOARD_WINDOW_S_VALUES = (900, 3600, 21600, 86400, 259200, 604800, 2592000)
+
+# A pinned t0/t1 range's widest allowed span -- app.js's own WINDOW_MAX_S
+# (2592000 * 4, 120 days), the ceiling the shared zoom/range dialog already
+# clamps to everywhere else a chart lets someone pick an absolute range.
+_DASHBOARD_MAX_SPAN_S = 2592000 * 4
 
 
 def _dash_int(value, lo=None, hi=None, allowed=None):
@@ -10764,19 +11062,67 @@ def _dash_enum(*options):
     return validate
 
 
+def _dash_list(item_validator, max_len, min_len=1):
+    """A config value as a list of `min_len`..`max_len` items, each run
+    through `item_validator` -- the interface_traffic tile's `interfaces`
+    key is the one config value here that is itself a list rather than a
+    scalar."""
+    def validate(value):
+        if not isinstance(value, list):
+            raise ValueError(f"expected a list, got {value!r}")
+        if not (min_len <= len(value) <= max_len):
+            raise ValueError(
+                f"expected between {min_len} and {max_len} item(s), got {len(value)}")
+        return [item_validator(item) for item in value]
+    return validate
+
+
+def _dash_interface_pair(value):
+    """One {device_id, if_index} entry of an iface_traffic tile's
+    `interfaces` list -- exactly those two keys, both plain ints."""
+    if not isinstance(value, dict) or set(value) != {"device_id", "if_index"}:
+        raise ValueError(
+            f"expected an object with exactly device_id and if_index, got {value!r}")
+    return {"device_id": _dash_int(value["device_id"]),
+            "if_index": _dash_int(value["if_index"])}
+
+
+def _dash_interfaces(value):
+    items = _dash_list(_dash_interface_pair, 8)(value)
+    seen = set()
+    for item in items:
+        pair = (item["device_id"], item["if_index"])
+        if pair in seen:
+            raise ValueError(f"duplicate interface in the list: {item!r}")
+        seen.add(pair)
+    return items
+
+
 # type key -> {config key: validator}. A type absent here (or a key absent
 # from its entry) accepts no config keys at all — `config: {}` is the only
 # legal value for the tile families with nothing to configure.
 _DASHBOARD_CONFIG_SCHEMA = {
     "iface_traffic": {
+        # device_id/if_index: legacy single-interface config, still
+        # accepted -- a saved layout from before `interfaces` existed keeps
+        # working, and the fetcher treats the pair as a one-entry list.
         "device_id": lambda v: _dash_int(v),
         "if_index": lambda v: _dash_int(v),
+        "interfaces": _dash_interfaces,
+        "name": lambda v: _dash_str(v, 60),
+        "y_max": lambda v: _dash_int(v, 0, 10**13),
         "window_s": lambda v: _dash_int(v, allowed=_DASHBOARD_WINDOW_S_VALUES),
+        "t0": lambda v: _dash_int(v, 0, int(MAX_TIMESTAMP)),
+        "t1": lambda v: _dash_int(v, 0, int(MAX_TIMESTAMP)),
     },
     "device_metric": {
         "device_id": lambda v: _dash_int(v),
         "metric_key": lambda v: _dash_str(v, 200),
+        "name": lambda v: _dash_str(v, 60),
+        "y_max": lambda v: _dash_int(v, 0, 10**15),
         "window_s": lambda v: _dash_int(v, allowed=_DASHBOARD_WINDOW_S_VALUES),
+        "t0": lambda v: _dash_int(v, 0, int(MAX_TIMESTAMP)),
+        "t1": lambda v: _dash_int(v, 0, int(MAX_TIMESTAMP)),
     },
     "device_status": {"device_id": lambda v: _dash_int(v)},
     "top_metric": {
@@ -10869,9 +11215,29 @@ def _validate_dashboard_layout(layout) -> dict:
                 raise ValueError(
                     f"Tile {tile_id}: unknown config key {key!r} for {tile_type}")
             clean_config[key] = validator(value)
+        _check_dash_t0_t1(tile_id, clean_config)
         clean_tiles.append({"id": tile_id, "type": tile_type,
                             "w": w, "h": h, "config": clean_config})
     return {"version": 1, "tiles": clean_tiles}
+
+
+def _check_dash_t0_t1(tile_id: str, config: dict) -> None:
+    """t0/t1 are validated one key at a time by the per-key loop above,
+    which cannot see the other key -- so the pairing rule (both or
+    neither, ordered, not absurdly wide) is checked here instead, once the
+    whole config is in hand. A no-op for every tile type that has no t0/t1
+    in its schema at all, since neither key is ever in `config` then."""
+    has_t0, has_t1 = "t0" in config, "t1" in config
+    if has_t0 != has_t1:
+        raise ValueError(f"Tile {tile_id}: t0 and t1 must both be set, or neither")
+    if not has_t0:
+        return
+    if config["t1"] <= config["t0"]:
+        raise ValueError(f"Tile {tile_id}: t1 must be greater than t0")
+    if config["t1"] - config["t0"] > _DASHBOARD_MAX_SPAN_S:
+        raise ValueError(
+            f"Tile {tile_id}: a pinned range may span at most "
+            f"{_DASHBOARD_MAX_SPAN_S // 86400} days")
 
 
 def get_dashboard_layout(service, params, body) -> dict:

@@ -352,6 +352,15 @@ class LdapUnavailable(Exception):
     """
 
 
+class TacacsUnavailable(Exception):
+    """The AAA server could not be used at all — unreachable, timed out, or
+    misconfigured (no servers, an unset/empty shared secret, or one this
+    host cannot decrypt) — the TACACS+ counterpart to LdapUnavailable, and
+    answered the same way: api.post_login logs and audits it distinctly
+    from a plain wrong-password refusal, and never lets it surface as an
+    unhandled 500."""
+
+
 class Service:
     def __init__(self, db_path: str, flow_db_path: str, syslog_db_path: str,
                  app_db_path: str, ipam_db_path: str, snmp_db_path: str,
@@ -591,6 +600,45 @@ class Service:
         except (ldapclient.LDAPConnectError, ldapclient.LDAPProtocolError,
                 ldapclient.LDAPConfigError) as exc:
             raise LdapUnavailable(str(exc)) from exc
+
+    def authenticate_tacacs(self, username: str, password: str,
+                            client_ip: str = "") -> bool:
+        """True if `username`/`password` PASSes against the configured
+        TACACS+ AAA server(s); False for a definite FAIL. Raises
+        TacacsUnavailable when the AAA server itself could not be used at
+        all (unreachable, timed out, no servers configured, or a shared
+        secret this host cannot decrypt) — see authenticate_ldap's
+        docstring for why that needs its own outcome rather than reading as
+        a wrong password. `client_ip` is sent as rem_addr, the same field
+        an AAA server's own logs and authorization rules key off.
+        """
+        import base64
+
+        from .. import dpapi, tacacsclient
+
+        if password == "":
+            return False
+        try:
+            servers = tacacsclient.parse_servers(
+                str(self.settings.get("tacacs_servers", "")))
+            secret_enc = str(self.settings.get("tacacs_secret_enc", ""))
+            if not secret_enc:
+                raise TacacsUnavailable(
+                    "No TACACS+ shared secret is configured")
+            try:
+                secret = dpapi.unprotect(base64.b64decode(secret_enc)).decode("utf-8")
+            except dpapi.DpapiUnavailable as exc:
+                raise TacacsUnavailable(
+                    f"The stored TACACS+ shared secret could not be "
+                    f"decrypted: {exc}") from exc
+            return tacacsclient.authenticate(
+                servers, secret, username, password, rem_addr=client_ip,
+                timeout=float(self.settings.get("tacacs_timeout_s", 5.0) or 5.0))
+        except tacacsclient.TacacsConfigError as exc:
+            raise TacacsUnavailable(str(exc)) from exc
+        except (tacacsclient.TacacsConnectError,
+                tacacsclient.TacacsProtocolError) as exc:
+            raise TacacsUnavailable(str(exc)) from exc
 
     def authenticate_api_token(self, raw_token: str, client: str = "") -> str | None:
         """The username an API token authenticates as, or None if it does

@@ -5127,6 +5127,9 @@ class NodesDatabase(SqliteStore):
     def metric(self, metric_id: int) -> sqlite3.Row | None:
         return self.series_db.metric(metric_id)
 
+    def metric_by_key(self, device_id: int, key: str) -> sqlite3.Row | None:
+        return self.series_db.metric_by_key(device_id, key)
+
     def compact_rollup(self, max_hours: int = 48) -> int:
         return self.series_db.compact_rollup(max_hours)
 

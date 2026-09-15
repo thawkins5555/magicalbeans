@@ -72,6 +72,25 @@ class Forbidden(PermissionError):
     """
 
 
+def role_grants(name: str) -> dict:
+    """The permission grid a TACACS+ auto-created account starts with,
+    mirroring settings.js's ROLE_PRESETS exactly (same three names, same
+    module exclusions) so an account created by the preset picker in
+    Settings and one auto-created on first TACACS+ sign-in land on the
+    identical grant. Raises ValueError for anything else, the same way an
+    unknown auth_source does — a typo in a stored default must not silently
+    grant nothing.
+    """
+    if name == "viewer":
+        # `web` has no read tier to hand out — the relay is a write.
+        return {m: READ for m in MODULES if m not in ("admin", "ssh", "web")}
+    if name == "operator":
+        return {m: WRITE for m in MODULES if m not in ("admin", "settings", "debug")}
+    if name == "admin":
+        return {m: WRITE for m in MODULES}
+    raise ValueError(f"unknown role {name!r}")
+
+
 def allows(granted: str | None, required: str) -> bool:
     """True if a `granted` level (None, 'read' or 'write' — whatever a user
     actually has for a module) satisfies a route's `required` level. write
