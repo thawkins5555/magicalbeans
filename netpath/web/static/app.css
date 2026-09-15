@@ -733,7 +733,7 @@ body.tiny .terms { display: none; }
    dialog, the sign-in card, the SSH overlay's card. */
 .panel, .card, fieldset, .target-list, .detail, .subnet-detail, .table-wrap,
 .canvas.chart, .bars, .timeline, .scrollbox,
-.login-box, .ssh-panel, .modal-box, .gsearch-box {
+.login-box, .ssh-panel, .modal-box, .gsearch-box, .combo-list {
   background: var(--panel);
   border: 1px solid var(--hairline);
   border-radius: var(--radius);
@@ -1741,8 +1741,6 @@ body.login-page {
   max-height: 220px;
   overflow: auto;
   padding: 4px;
-  background: var(--panel);
-  border: 1px solid var(--hairline);
   border-radius: var(--radius-sm);
   box-shadow: var(--shadow-pop);
 }

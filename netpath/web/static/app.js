@@ -1457,8 +1457,11 @@ const App = (() => {
             if (seconds < WINDOW_MIN_S || seconds > WINDOW_MAX_S) {
               throw new Error(`The range must be between ${span(WINDOW_MIN_S)} and ${span(WINDOW_MAX_S)}`);
             }
-            closeModal();
+            // finish() first: closeModal() dispatches modal-closed
+            // synchronously, and the once-listener below would otherwise
+            // resolve this promise with null before the real value lands.
             finish({ t0: start, t1: end });
+            closeModal();
           } },
       ]);
       const setQuick = (seconds) => {
@@ -3378,8 +3381,8 @@ const App = (() => {
         open();
       } catch (error) { /* a failed lookup just leaves the list as it was */ }
     }
-    list.addEventListener('mousedown', (event) => {
-      // mousedown, ahead of the input's own blur, so a click on an item
+    list.addEventListener('pointerdown', (event) => {
+      // pointerdown, ahead of the input's own blur, so a click on an item
       // picks it instead of the list closing out from under the pointer.
       const button = event.target.closest('.combo-item');
       if (!button) return;
@@ -3410,7 +3413,7 @@ const App = (() => {
       }
     });
     input.addEventListener('blur', () => {
-      // Short delay so a click on a list item (mousedown, above) has already
+      // Short delay so a click on a list item (pointerdown, above) has already
       // fired before the list is torn down.
       closeTimer = setTimeout(close, 150);
     });

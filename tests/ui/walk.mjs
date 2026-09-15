@@ -1449,7 +1449,10 @@ async function checkMisc(page, watcher) {
     }, sel);
     const before = await count('#nd-if-table');
     if (before < 1) return 'skipped: the selected device lists no interfaces';
-    await row.dblclick();
+    // Not row.dblclick(): selecting the device above re-renders
+    // #nodes-table (selected-row styling), detaching this handle. A
+    // selector re-queries the live row at click time instead.
+    await page.dblclick('#nodes-table tbody tr');
     await page.waitForTimeout(1500);
     const pane = await count('#nd-if-table');
     const dialog = await count('#ndd-if-table');
@@ -1716,7 +1719,12 @@ async function checkMisc(page, watcher) {
           return real(input, init);
         };
         const range = document.getElementById('nf-range');
-        const values = [...range.options].map((option) => option.value);
+        // 'custom' opens App.rangeDialog and waits on it — not a preset
+        // step, and dispatching change without answering that dialog would
+        // hang it open for the rest of this loop. Only the numeric presets
+        // are real "windows the dropdown lands on".
+        const values = [...range.options].map((option) => option.value)
+          .filter((value) => value !== 'custom');
         for (const value of values) {
           range.value = value;
           range.dispatchEvent(new Event('change'));

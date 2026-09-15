@@ -111,19 +111,19 @@
 
   const MAX_IFACE_ROWS = 8;
 
-  function ifaceRowHtml(rowId, row) {
+  function ifaceRowHtml(rowId, row, inputId) {
     return `<div class="dash-iface-row row" data-iface-row="${rowId}">
-      <label>Device <input id="dc-dev-${rowId}" autocomplete="off"></label>
+      <label>Device <input id="${inputId}" autocomplete="off"></label>
       <label>Interface <select id="dc-if-${rowId}"><option value="">—</option></select></label>
       <button type="button" data-remove-row="${rowId}" aria-label="Remove interface">Remove</button>
     </div>`;
   }
 
-  function wireIfaceRow(box, rowId, row) {
-    const devInput = box.querySelector(`#dc-dev-${rowId}`);
+  function wireIfaceRow(box, rowId, row, inputId) {
+    const devInput = box.querySelector(`#${inputId}`);
     const ifSel = box.querySelector(`#dc-if-${rowId}`);
     devInput.dataset.deviceId = row.device_id != null ? String(row.device_id) : '';
-    wireDeviceField(box, `dc-dev-${rowId}`, (deviceId) => fillIfaceSelect(ifSel, deviceId, null));
+    wireDeviceField(box, inputId, (deviceId) => fillIfaceSelect(ifSel, deviceId, null));
     if (row.device_id != null) {
       App.get(`/api/nodes/devices/${row.device_id}`)
         .then((d) => { devInput.value = `${displayName(d)} (${d.ip})`; }).catch(() => {});
@@ -136,10 +136,15 @@
     const rowsBox = box.querySelector('#dc-iface-rows');
     const count = rowsBox.querySelectorAll('[data-iface-row]').length;
     if (count >= MAX_IFACE_ROWS) return;
+    // The lead row keeps the fixed id #dc-device (App.comboBox and the
+    // regression walk both key off it, like every other single-device
+    // config form); rows after it get dc-dev-<n>.
+    const inputId = box.querySelector('#dc-device') ? null : 'dc-device';
     ifaceRowCounter += 1;
     const rowId = `r${ifaceRowCounter}`;
-    rowsBox.insertAdjacentHTML('beforeend', ifaceRowHtml(rowId, row));
-    wireIfaceRow(box, rowId, row);
+    const resolvedId = inputId || `dc-dev-${rowId}`;
+    rowsBox.insertAdjacentHTML('beforeend', ifaceRowHtml(rowId, row, resolvedId));
+    wireIfaceRow(box, rowId, row, resolvedId);
     const addBtn = box.querySelector('#dc-add-iface');
     if (addBtn) addBtn.disabled = count + 1 >= MAX_IFACE_ROWS;
   }
@@ -169,7 +174,7 @@
   function readIfaceTrafficConfig(box, tile_) {
     const interfaces = [];
     for (const row of box.querySelectorAll('#dc-iface-rows [data-iface-row]')) {
-      const devInput = row.querySelector('input[id^="dc-dev-"]');
+      const devInput = row.querySelector('input[id="dc-device"], input[id^="dc-dev-"]');
       const ifSel = row.querySelector('select[id^="dc-if-"]');
       const deviceId = devInput && devInput.dataset.deviceId ? Number(devInput.dataset.deviceId) : null;
       const ifIndex = ifSel && ifSel.value !== '' ? Number(ifSel.value) : null;
@@ -177,7 +182,11 @@
     }
     const out = {
       name: box.querySelector('#dc-name').value.trim().slice(0, 60),
-      interfaces,
+      // The server's interfaces validator requires 1-8 items whenever the
+      // key is present at all; an empty list is sent as null instead, so
+      // sanitizedLayout drops it — the same "not configured yet"
+      // convention a blank device_id/if_index already used.
+      interfaces: interfaces.length ? interfaces : null,
       window_s: Number(box.querySelector('#dc-window').value),
       y_max: parseBpsCeiling(box.querySelector('#dc-ymax').value),
     };
@@ -300,7 +309,11 @@
 
   function defaultConfigFor(type) {
     switch (type) {
-      case 'iface_traffic': return { name: '', interfaces: [], window_s: 86400 };
+      // interfaces: null, not [] — a Cancelled Configure dialog saves this
+      // default config untouched, and the server's interfaces validator
+      // refuses a present-but-empty list; null is dropped by
+      // sanitizedLayout, same as every other "not configured yet" field.
+      case 'iface_traffic': return { name: '', interfaces: null, window_s: 86400 };
       case 'device_metric': return { name: '', device_id: null, metric_key: '', window_s: 86400 };
       case 'device_status': return { device_id: null };
       case 'top_metric': return { metric_key: '', n: 10, window_s: 86400, rank_by: 'peak', ascending: false };
