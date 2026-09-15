@@ -77,16 +77,20 @@ Modes:
              and precision, plus a partly-published band, two rows naming
              no band at all, a duplicated level and a chassis probe mapped
              to no port. See CISCO_DOM_THRESHOLD_TABLE.
-  sfp_media  Eleven ports covering every media verdict, the dark optic, and
-             copper (5.25.0): a working optic, an occupied cage with no DOM,
-             an empty cage, a copper port an agent models as container+port
-             too (which must stay unbadged), a two-lane optic with one lane
-             dark, one dark on both lanes, one transmitting at exactly
-             0 dBm, a copper module named by text alone with no sensor, a
-             copper module named by text with a temperature-only sensor, a
-             module ifMauType alone proves copper, and an optical module
-             whose ifMauType fiber arc must not downgrade it. See
-             SFP_MEDIA_TABLE and SFP_MAU_TABLE.
+  sfp_media  Fourteen ports covering every media verdict, the dark optic,
+             copper (5.25.0) and the MAU gate/veto/prefix fixes (5.25.1):
+             a working optic, an occupied cage with no DOM, an empty cage,
+             a copper port an agent models as container+port too (which
+             must stay unbadged), a two-lane optic with one lane dark, one
+             dark on both lanes, one transmitting at exactly 0 dBm, a
+             copper module named by text alone with no sensor, a copper
+             module named by text with a temperature-only sensor, a
+             module ifMauType alone proves copper, an optical module whose
+             ifMauType fiber arc must not downgrade it, copper text vetoed
+             by a fiber arc with no sensor, a combo port a real Rx dBm
+             sensor wins over copper text, and a MAU row under the wrong
+             OID prefix that must be ignored. See SFP_MEDIA_TABLE and
+             SFP_MAU_TABLE.
   sfp_media_no_class
              `sfp_media`, except that every request into the
              entPhysicalClass column goes unanswered -- the flaky device
@@ -115,7 +119,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
 from netpath.snmppoll import decode_response
 from netpath.trapdecode import (
     PDU_GET, PDU_GETBULK, PDU_GETNEXT, PDU_RESPONSE, T_END_OF_MIB_VIEW,
-    T_NO_SUCH_OBJECT, T_SEQUENCE, V2C, _tlv, enc_int, enc_octets, enc_varbind,
+    T_NO_SUCH_OBJECT, T_SEQUENCE, V2C, _tlv, enc_int, enc_octets, enc_oid,
+    enc_varbind,
 )
 
 GENERIC_SCALARS = {
@@ -452,6 +457,12 @@ CISCO_DOM_THRESHOLD_TABLE = {
 #         Rx row, AND an ifMauType arc 36 (10GBASE-SR) row on the same
 #         port -- proves fiber wins a MAU/text disagreement, and that a
 #         MAU fiber verdict never turns off a genuine optic
+#
+# Gate/veto edge cases (5.25.1 review):
+#   if 12 copper text (GLC-T), fiber ifMauType (arc 36), no sensor -> 'sfp'
+#   if 13 combo port text, real Rx dBm sensor -> 'optic' beats copper text
+#   if 14 ambiguous transceiver text, a MAU row under the wrong OID prefix
+#         -> ignored, stays 'sfp'
 SFP_MEDIA_TABLE = {
     # --- if 1: an ordinary DOM optic
     "1.3.6.1.2.1.47.1.1.1.1.2.101": ("str", "GigabitEthernet1/0/1"),
@@ -604,18 +615,73 @@ SFP_MEDIA_TABLE = {
     "1.3.6.1.2.1.99.1.1.1.3.371": ("int", 1),
     "1.3.6.1.2.1.99.1.1.1.4.371": ("int", -60),                # -6.0 dBm
     "1.3.6.1.2.1.99.1.1.1.5.371": ("int", 1),
+
+    # --- if 12: copper text (GLC-T), no sensor -- ifMauType fiber arc
+    # (SFP_MAU_TABLE) must veto the text down to 'sfp'
+    "1.3.6.1.2.1.47.1.1.1.1.2.212": ("str", "SFP+ container"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.212": ("int", 5),
+    "1.3.6.1.2.1.47.1.1.1.1.2.262": ("str", "GigabitEthernet1/0/12"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.262": ("int", 10),
+    "1.3.6.1.2.1.47.1.1.1.1.4.262": ("int", 212),
+    "1.3.6.1.2.1.47.1.3.2.1.2.262.1": ("str", "1.3.6.1.2.1.2.2.1.1.12"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.312": ("str", "1000BaseT SFP"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.312": ("int", 9),
+    "1.3.6.1.2.1.47.1.1.1.1.4.312": ("int", 212),
+    "1.3.6.1.2.1.47.1.1.1.1.13.312": ("str", "GLC-T"),
+
+    # --- if 13: combo port text with a real Rx dBm sensor -- DOM must beat
+    # copper text (5.25.0's dbm_ports subtraction)
+    "1.3.6.1.2.1.47.1.1.1.1.2.213": ("str", "1000BASE-T/SFP combo"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.213": ("int", 10),
+    "1.3.6.1.2.1.47.1.3.2.1.2.213.1": ("str", "1.3.6.1.2.1.2.2.1.1.13"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.413": ("str", "Gi1/0/13 Receive Power"),
+    "1.3.6.1.2.1.47.1.1.1.1.4.413": ("int", 213),
+    "1.3.6.1.2.1.99.1.1.1.1.413": ("int", 14),
+    "1.3.6.1.2.1.99.1.1.1.2.413": ("int", 9),
+    "1.3.6.1.2.1.99.1.1.1.3.413": ("int", 1),
+    "1.3.6.1.2.1.99.1.1.1.4.413": ("int", -50),                # -5.0 dBm
+    "1.3.6.1.2.1.99.1.1.1.5.413": ("int", 1),
+
+    # --- if 14: ambiguous transceiver text, no sensor, a MAU row whose
+    # value OID is NOT under dot3MauType -- must be ignored, leaving 'sfp'
+    "1.3.6.1.2.1.47.1.1.1.1.2.214": ("str", "SFP+ container"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.214": ("int", 5),
+    "1.3.6.1.2.1.47.1.1.1.1.2.264": ("str", "GigabitEthernet1/0/14"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.264": ("int", 10),
+    "1.3.6.1.2.1.47.1.1.1.1.4.264": ("int", 214),
+    "1.3.6.1.2.1.47.1.3.2.1.2.264.1": ("str", "1.3.6.1.2.1.2.2.1.1.14"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.314": ("str", "Transceiver module"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.314": ("int", 9),
+    "1.3.6.1.2.1.47.1.1.1.1.4.314": ("int", 214),
+
+    # --- if 15: module text "SFP-GE-T", no sensor -- 5.25.1's widened
+    # _COPPER_TEXT alternative, from text alone
+    "1.3.6.1.2.1.47.1.1.1.1.2.215": ("str", "SFP+ container"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.215": ("int", 5),
+    "1.3.6.1.2.1.47.1.1.1.1.2.265": ("str", "GigabitEthernet1/0/15"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.265": ("int", 10),
+    "1.3.6.1.2.1.47.1.1.1.1.4.265": ("int", 215),
+    "1.3.6.1.2.1.47.1.3.2.1.2.265.1": ("str", "1.3.6.1.2.1.2.2.1.1.15"),
+    "1.3.6.1.2.1.47.1.1.1.1.2.315": ("str", "SFP-GE-T"),
+    "1.3.6.1.2.1.47.1.1.1.1.5.315": ("int", 9),
+    "1.3.6.1.2.1.47.1.1.1.1.4.315": ("int", 215),
 }
 
-# MAU-MIB ifMauType rows (index ifIndex.mauIndex, value an OID whose last
-# arc is a dot3MauType) for the two ports that need MAU-MIB rather than
-# module text to classify: if 10 arc 30 (1000BASE-T, copper) and if 11 arc
-# 36 (10GBASE-SR, fiber -- must not downgrade a real optic). Merged into
-# 'sfp_media' only, never into 'sfp_media_no_class' or 'sfp_media_no_mau',
-# so those two keep exercising the no-MAU-answered path.
+# MAU-MIB ifMauType rows (ifIndex.mauIndex -> an OID whose last arc is a
+# dot3MauType, or a bogus prefix for if 14's negative case). if 10/11 prove
+# copper/fiber from the wire; 3/4 pin the entity-scan gate (an empty cage
+# and a bare copper port must not be confirmed copper by the arc alone);
+# 12 is the fiber-veto-with-no-sensor case; 14 is the wrong-OID-prefix
+# case. Merged into 'sfp_media' only, never into 'sfp_media_no_class' or
+# 'sfp_media_no_mau', so those two keep exercising the no-MAU-answered path.
 IF_MAU_TYPE = "1.3.6.1.2.1.26.2.1.1.3"
 SFP_MAU_TABLE = {
-    f"{IF_MAU_TYPE}.10.1": ("str", "1.3.6.1.2.1.26.4.30"),
-    f"{IF_MAU_TYPE}.11.1": ("str", "1.3.6.1.2.1.26.4.36"),
+    f"{IF_MAU_TYPE}.3.1": ("oid", "1.3.6.1.2.1.26.4.30"),
+    f"{IF_MAU_TYPE}.4.1": ("oid", "1.3.6.1.2.1.26.4.30"),
+    f"{IF_MAU_TYPE}.10.1": ("oid", "1.3.6.1.2.1.26.4.30"),
+    f"{IF_MAU_TYPE}.11.1": ("oid", "1.3.6.1.2.1.26.4.36"),
+    f"{IF_MAU_TYPE}.12.1": ("oid", "1.3.6.1.2.1.26.4.36"),
+    f"{IF_MAU_TYPE}.14.1": ("oid", "1.3.6.1.4.1.9.9.99.30"),
 }
 
 # A mode may refuse a whole column outright, which is not the same as
@@ -677,6 +743,8 @@ def oid_key(oid):
 def encode_value(kind, value):
     if kind in ("str", "bytes"):
         return enc_octets(value)
+    if kind == "oid":
+        return enc_oid(value)
     return enc_int(value)
 
 

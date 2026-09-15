@@ -1803,8 +1803,11 @@ identifies by ENTITY-MIB but that publishes no sensors of its own, and
 cage** for a slot with nothing plugged in. **Medium** spells the same
 distinction out in one word — **Copper** or **Laser** — blank for an
 empty cage, since nothing is proven either way until something is
-plugged in. The summary line and both CSV exports also carry a COP
-count alongside the DOM/SFP ones. Nothing new is polled for this:
+plugged in. DAC/twinax parts (SFP-H10GB-CU, 10GBASE-CR) read as plain
+**SFP** by design — they carry no copper form-factor text the badge
+logic knows. The summary line carries a COP count alongside the
+DOM/SFP ones; both CSV exports carry the **Medium** column instead,
+not a count. Nothing new is polled for this:
 every row comes from the same per-port media read behind the DOM/SFP/
 COP badge already on the interface list (see *Drill-down*, below), so
 the report is free. Same two export buttons as Firmware inventory —

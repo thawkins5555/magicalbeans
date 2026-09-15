@@ -160,27 +160,20 @@ _TRANSCEIVER_TEXT = re.compile(
     r"\b(?:[cq]?sfp\d*|xfp|x2|gbic|xcvr|transceiver)\b|\bglc-|\bsfp-"
     r"|base-?(?:sx|lx|lh|zx|sr|lr|er|zr|bx)\b", re.I)
 
-# Copper proof for a cage/module _TRANSCEIVER_TEXT already matched -- a
-# fixed copper port that names none of the above never reaches this regex
-# at all, so it stays unbadged as before. BASE-T(X) form factors, the two
-# common copper SFP part-number families (Cisco GLC-T[E], the SFP-10G-T
-# family) and the generic copper/cat5e/6/6a words a vendor's own text uses.
+# Copper proof for text _TRANSCEIVER_TEXT already matched: BASE-T(X), the
+# GLC-T[E]/SFP-*-T part-number families, and copper/RJ45/catX words.
 _COPPER_TEXT = re.compile(
-    r"\b(?:\d+g?base-?tx?|glc-te?|sfp-?10g-?t(?:-s|-x)?|rj-?45|copper"
-    r"|cat[56]a?)\b", re.I)
+    r"\b(?:\d+g?base-?tx?|glc-te?|sfp-?(?:10g|1ge?|ge)?-?t(?:-s|-x)?|rj-?45"
+    r"|copper|cat[56][ae]?)\b", re.I)
 
-# MAU-MIB (RFC 3636/4836) ifMauType's value is an OID; the last arc is a
-# dot3MauType. Text can be wrong or absent (an opaque part number, a cage
-# that names nothing), so a device that answers this MIB gets the last say
-# -- fiber wins a tie against ambiguous text (see _poll_environment).
-# Copper dot3MauTypes: 10/100/1000BASE-T(X) and -FD, 1000BASE-CX(-FD),
-# 10GBASE-CX4, 10GBASE-T.
+# ifMauType's value OID's last arc is a dot3MauType (RFC 3636/4836); a
+# device that answers it gets the last say over ambiguous/wrong text.
+# Copper dot3MauTypes: 10/100/1000BASE-T(X)/-FD, 1000BASE-CX(-FD), 10GBASE-CX4/T.
 _COPPER_MAU_ARCS = frozenset({
     5, 10, 11, 14, 15, 16, 19, 20, 27, 28, 29, 30, 41, 54,
 })
-# Fiber dot3MauTypes: the AUI/10BASE-F(B/L/P) family, 100BASE-FX(-FD),
-# 1000BASE-SX/LX(-FD), and every 10G/40G/100G dot3MauType this catalog
-# vintage defines.
+# Fiber dot3MauTypes: AUI/10BASE-F family, 100BASE-FX(-FD), 1000BASE-SX/LX(-FD),
+# and every 10G/40G/100G arc this catalog vintage defines.
 _FIBER_MAU_ARCS = frozenset({
     3, 6, 7, 8, 12, 13, 17, 18,
     *range(21, 27), *range(31, 41), *range(44, 54),
@@ -1699,12 +1692,8 @@ class NodePoller(Worker):
         # device_id -> when the vendor table's own published thresholds
         # were last walked. See _SENSOR_THRESHOLD_REFRESH_S.
         self._vendor_sensor_threshold_read: dict[int, float] = {}
-        # device_id -> when ifMauType was last walked, and whether it
-        # answered anything -- its own probe-once-remember pair, same
-        # _SENSOR_REPROBE_S cadence as sensor_capable above, but in memory
-        # only: a routed/copper-only device with no ENTITY-SENSOR-MIB table
-        # at all still needs this walk gated so it costs one GET an hour,
-        # not one every _poll_environment cadence.
+        # device_id -> when ifMauType was last walked/whether it answered,
+        # probe-once-remember'd at the same _SENSOR_REPROBE_S cadence.
         self._mau_read: dict[int, float] = {}
         self._mau_capable: dict[int, bool] = {}
         # device_id -> when a sensor-diagnostic event was last written for
@@ -6364,11 +6353,8 @@ class NodePoller(Worker):
         slots_complete = slots_complete and descrs_done
 
         # MAU-MIB: the module text's copper proof, checked against the wire.
-        # Gated the same as the cage scan above (an empty port map means
-        # nothing here maps to anything), and separately probe-once-
-        # remember'd (_mau_read/_mau_capable) so a device that has never
-        # answered it is not asked every _SENSOR_REFRESH_S forever -- only
-        # once an hour, the same reprobe _sensor_capable gets.
+        # Gated like the cage scan (empty port_map); probe-once-remember'd
+        # via _mau_read/_mau_capable at the hourly _SENSOR_REPROBE_S cadence.
         mau_copper_ports: set[int] = set()
         mau_fiber_ports: set[int] = set()
         if port_map:
@@ -6381,9 +6367,15 @@ class NodePoller(Worker):
                 if raw_mau:
                     self._mau_capable[device_id] = True
                     for suffix, value in raw_mau.items():
+                        # ifMauType's value is a dot3MauType OID; reject
+                        # anything not under that prefix before trusting
+                        # its trailing arc as one.
+                        text = str(value).lstrip(".")
+                        if not text.startswith("1.3.6.1.2.1.26.4."):
+                            continue
                         try:
                             if_index = int(str(suffix).split(".")[0])
-                            arc = int(str(value).rsplit(".", 1)[-1])
+                            arc = int(text.rsplit(".", 1)[-1])
                         except (TypeError, ValueError):
                             continue
                         if arc in _COPPER_MAU_ARCS:
@@ -6407,6 +6399,9 @@ class NodePoller(Worker):
         # one row per lane, so a port can have several of the same root.
         per_port: dict[tuple[int, str], list[float]] = {}
         optic_ports: set[int] = set()
+        # Ports with an actual optical-power (dBm, type 14) sensor -- copper
+        # text must not beat a real DOM reading. Subset of optic_ports.
+        dbm_ports: set[int] = set()
         # Sensor index suffix -> the (index, root) its published limits
         # belong to. See _poll_published_thresholds.
         threshold_roots: dict[str, tuple] = {}
@@ -6429,6 +6424,8 @@ class NodePoller(Worker):
                 # a port is proof one is there, whatever it reads -- unless
                 # copper proof (module text or MAU-MIB) overrides it below.
                 optic_ports.add(if_index)
+                if sensor_type == self._SENSOR_TYPE_OPTICAL:
+                    dbm_ports.add(if_index)
             root = self._sfp_root_for(sensor_type, suffix, names, descrs)
             if if_index is not None and root is not None:
                 # Recorded BEFORE the status filter below: a transceiver
@@ -6523,19 +6520,25 @@ class NodePoller(Worker):
                             unit, "gauge", now, worst))
         if samples:
             self.db.record_metric_samples(device_id, samples)
-        # copper_ports: module text (_sfp_slot_media already returned
-        # 'copper') union MAU-MIB copper arcs, minus MAU-MIB fiber arcs --
-        # the wire beats an ambiguous part number, per port.
+        # A MAU copper arc only CONFIRMS a port the entity scan already
+        # holds a transceiver on -- a Catalyst answers 1000BASE-T for every
+        # fixed copper port too, and none of those may badge from the wire
+        # alone.
+        mau_copper_ports &= ({i for i, m in sfp_slots.items()
+                              if m in ("sfp", "copper")} | optic_ports)
+        # copper_ports: module text ('copper') union confirmed MAU-MIB
+        # copper arcs, minus MAU-MIB fiber arcs and any real DOM (dBm) row
+        # -- the wire, and a lit optic, beat an ambiguous part number.
         copper_ports = ((
             {if_index for if_index, media in sfp_slots.items()
              if media == "copper"} | mau_copper_ports)
-            - mau_fiber_ports)
+            - mau_fiber_ports - dbm_ports)
         # DOM sensors win over anything the entity table says about the cage
-        # -- unless copper proof says otherwise: a BASE-T module with a
-        # temperature-only sensor is still copper, medium wins over "has
-        # readings". Precedence: copper > optic (any port-mapped sensor) >
-        # whatever the cage scan alone decided.
-        media_by_if = dict(sfp_slots)
+        # -- unless copper proof says otherwise; a fiber MAU arc downgrades
+        # text-copper to 'sfp' even with no sensor. Precedence: copper >
+        # optic (any port-mapped sensor) > whatever the cage scan decided.
+        media_by_if = {i: ("sfp" if m == "copper" and i in mau_fiber_ports else m)
+                       for i, m in sfp_slots.items()}
         media_by_if.update({if_index: "optic" for if_index in optic_ports})
         media_by_if.update({if_index: "copper" for if_index in copper_ports})
         if not slots_complete:

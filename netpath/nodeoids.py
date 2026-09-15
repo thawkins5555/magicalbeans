@@ -63,10 +63,8 @@ IFX_TABLE = {   # ifXTable, preferred when present (RFC 2863)
     "if_discontinuity": "1.3.6.1.2.1.31.1.1.1.19",
 }
 
-# MAU-MIB (RFC 3636/4836) ifMauType, indexed ifIndex.mauIndex; the value is
-# an OID whose last arc names a dot3MauType (nodepoll._COPPER_MAU_ARCS /
-# _FIBER_MAU_ARCS decode it). Walked once per environment poll, port-mapped
-# devices only, to prove a transceiver is copper rather than laser.
+# MAU-MIB (RFC 3636/4836) ifMauType: value's last arc is a dot3MauType (see
+# nodepoll._COPPER_MAU_ARCS/_FIBER_MAU_ARCS).
 IF_MAU_TYPE = "1.3.6.1.2.1.26.2.1.1.3"
 
 # Best-effort scalars: near-universal across net-snmp/Linux and many

@@ -40,7 +40,11 @@ PORTS = [{"if_index": 1, "descr": "GigabitEthernet1/0/1"},
          {"if_index": 8, "descr": "GigabitEthernet1/0/8"},
          {"if_index": 9, "descr": "GigabitEthernet1/0/9"},
          {"if_index": 10, "descr": "GigabitEthernet1/0/10"},
-         {"if_index": 11, "descr": "GigabitEthernet1/0/11"}]
+         {"if_index": 11, "descr": "GigabitEthernet1/0/11"},
+         {"if_index": 12, "descr": "GigabitEthernet1/0/12"},
+         {"if_index": 13, "descr": "GigabitEthernet1/0/13"},
+         {"if_index": 14, "descr": "GigabitEthernet1/0/14"},
+         {"if_index": 15, "descr": "GigabitEthernet1/0/15"}]
 
 IF_MAU_TYPE = "1.3.6.1.2.1.26.2.1.1.3"
 
@@ -109,11 +113,13 @@ try:
     check("a cage holding a transceiver that reports no DOM is 'sfp': the "
           "slot is identified even though nothing measurable is in it",
           media.get(2) == "sfp", media)
-    check("a cage with nothing in it is 'sfp_empty', told apart from the "
-          "occupied one only by what it contains",
+    check("a cage with nothing in it is 'sfp_empty' even with an ifMauType "
+          "copper arc on it -- an empty cage is not a confirmed transceiver, "
+          "so the entity-scan gate refuses the arc",
           media.get(3) == "sfp_empty", media)
     check("a copper port the agent also models as container+port names no "
-          "transceiver anywhere and stays unbadged",
+          "transceiver anywhere and stays unbadged, and an ifMauType copper "
+          "arc on it cannot confirm one either -- same gate",
           media.get(4) is None, media)
     check("a copper module named by text alone ('1000BaseT SFP' / GLC-T), "
           "no sensor at all, is 'copper'",
@@ -128,6 +134,20 @@ try:
           "fiber arc (36, 10GBASE-SR) is not downgraded: fiber proof still "
           "leaves it 'optic'",
           media.get(11) == "optic", media)
+    check("copper text (GLC-T) with no sensor at all is downgraded to 'sfp' "
+          "by an ifMauType fiber arc -- the wire vetoes the text even with "
+          "nothing else to go on",
+          media.get(12) == "sfp", media)
+    check("a combo port's text ('1000BASE-T/SFP combo') is copper, but a "
+          "real Rx dBm sensor on it wins: DOM beats copper text",
+          media.get(13) == "optic", media)
+    check("an ifMauType row whose value OID is not under the dot3MauType "
+          "prefix is ignored outright -- ambiguous text alone leaves if 14 "
+          "'sfp', not 'copper'",
+          media.get(14) == "sfp", media)
+    check("module text 'SFP-GE-T' alone (5.25.1's widened _COPPER_TEXT) is "
+          "'copper'",
+          media.get(15) == "copper", media)
 
     metrics = {m["key"]: m["last_value"] for m in db.metrics(did)}
     check("a copper module's temperature sensor is still recorded -- "
@@ -327,6 +347,20 @@ check("a genuinely dim optic is untouched: -25 is still a breach, and the "
 check("another 'below' rule reading -40 is unaffected -- it breaches, and "
       "the dark verdict is keyed to the optic power families",
       evaluate_threshold(other_low, -40.0, 1) == "breach")
+
+# ========================================= § 5 _COPPER_TEXT, regex-only
+
+_COPPER_TEXT = nodepoll_mod._COPPER_TEXT
+COPPER_POSITIVES = ["SFP-GE-T", "SFP-1G-T", "EX-SFP-1GE-T", "SFP-T",
+                    "1000BaseT SFP", "GLC-T", "GLC-TE", "SFP-10G-T-S",
+                    "SFP-10G-T-X", "RJ45", "copper", "Cat5e", "Cat6a"]
+FIBER_NEGATIVES = ["SFP-10G-SR-S", "1000BASE-BX", "GLC-SX-MMD",
+                   "GLC-LH-SMD", "GLC-BX-D", "SFP-10G-LRM", "1000BASE-X"]
+for text in COPPER_POSITIVES:
+    check(f"_COPPER_TEXT matches {text!r}", bool(_COPPER_TEXT.search(text)))
+for text in FIBER_NEGATIVES:
+    check(f"_COPPER_TEXT does not match laser part {text!r}",
+          not _COPPER_TEXT.search(text))
 
 print()
 print("FAILURES:", FAILS if FAILS else "none")

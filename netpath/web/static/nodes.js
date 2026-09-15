@@ -1753,13 +1753,7 @@
     function paintDialogIfaces() {
       if (!dialogIfaces || !current()) return;
       if (dialogOptics) {
-        // Only ever an upgrade: the live read proves DOM on the ports it
-        // names, and says nothing about the ports it does not — a stored
-        // 'sfp' cage must not be downgraded by a read that never looked
-        // for one. A stored 'copper' row is never upgraded at all: a
-        // temperature-only reading off a COP port must not earn it DOM,
-        // so the live read has to name an optical-power (dBm) row for
-        // that port, not merely any sensor.
+        // Only ever an upgrade: a live dBm read can promote a port to 'optic' but never downgrades 'sfp', and never touches a stored 'copper' row.
         dialogIfaces.forEach((r) => {
           if (r.media !== 'copper' && dialogOptics.has(r.if_index)) r.media = 'optic';
         });
@@ -1861,9 +1855,7 @@
             `<td>${escape(s.label)}</td>${domValueCell(s)}${domLimitsCell(s)}` +
             `<td>${escape(s.status)}</td></tr>`).join('') + '</tbody></table>' +
           domLimitsHint(rows);
-        // Only a light-level row proves DOM — see paintDialogIfaces' guard
-        // above; a copper port's own temperature/voltage readings must
-        // never earn it one just for being present.
+        // Only a light-level (dBm) row proves DOM; other sensor kinds must not.
         dialogOptics = new Set(rows.filter((s) => s.unit === 'dBm').map((s) => s.if_index));
         paintDialogIfaces();
       })

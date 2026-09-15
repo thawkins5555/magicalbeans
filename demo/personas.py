@@ -1232,7 +1232,11 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
         access: (names[access - 1], "10GBase-T SFP+", "SFP-10G-T-S"),
     }))
     entries.update(entity_sensors({access: [DOM_SENSORS[0]]}))
-    entries.update(if_mau_type({access - 1: 30, access: 54, access + 1: 36}))
+    # Every fixed copper port also answers ifMauType arc 30, as a real
+    # Catalyst does -- exercises the gate that only lets a MAU copper arc
+    # confirm a port the entity scan already holds a transceiver on.
+    entries.update(if_mau_type({**{i: 30 for i in range(1, access - 1)},
+                               access - 1: 30, access: 54, access + 1: 36}))
     entries.update(host_resources(1, [("Physical memory", 1024, 524288, 0.61)]))
     entries.update(arc_objects(9, {
         # CISCO-PROCESS-MIB cpmCPUTotal5minRev, one of the two objects an

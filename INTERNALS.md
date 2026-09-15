@@ -1376,13 +1376,14 @@ text it already has (`entPhysicalDescr`, `entPhysicalModelName`) through
 a second regex, `_COPPER_TEXT`:
 
 ```
-r"\b(?:\d+g?base-?tx?|glc-te?|sfp-?10g-?t(?:-s|-x)?|rj-?45|copper"
-r"|cat[56]a?)\b"
+r"\b(?:\d+g?base-?tx?|glc-te?|sfp-?(?:10g|1ge?|ge)?-?t(?:-s|-x)?|rj-?45"
+r"|copper|cat[56][ae]?)\b"
 ```
 
 — BASE-T(X) form factors, Cisco's GLC-T/GLC-TE part numbers, the
-SFP-10G-T family, RJ45, and the plain words "copper"/"cat5"/"cat6"/
-"cat6a" a vendor's own text sometimes uses instead of a part number.
+SFP-*-T copper families (SFP-GE-T, SFP-1G-T, SFP-10G-T, bare SFP-T),
+RJ45, and the plain words "copper"/"cat5"/"cat5e"/"cat6"/"cat6a" a
+vendor's own text sometimes uses instead of a part number.
 It only ever runs on text `_TRANSCEIVER_TEXT` already matched — a fixed
 copper port whose entity text names nothing never reaches either regex,
 so it stays unbadged exactly as before 5.25.0. A cage or module that
