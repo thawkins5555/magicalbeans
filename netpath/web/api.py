@@ -3831,8 +3831,9 @@ def _device_display_name(row) -> str:
 def _device_index(service) -> dict:
     """One pass over the fleet, built once per discovery listing, that
     every result row is tested against. `by_address` covers a device's
-    primary IP plus every learned alias; `by_identity` is a hint only, not
-    an answer — two switches from the same carton share it honestly.
+    primary IP plus every alias its own address table reported;
+    `by_identity` is a hint only, not an answer — two switches from the
+    same carton share it honestly.
 
     Deliberately NOT memoised against `nodes_db.config_generation()`, which
     is the obvious thing to reach for and is wrong here. That counter moves
@@ -3854,7 +3855,7 @@ def _device_index(service) -> dict:
     devices = service.nodes_db.devices()
     by_id = {row["id"]: row for row in devices}
     by_address = {row["ip"]: row for row in devices}
-    for address, device_id in service.nodes_db.address_owners().items():
+    for address, device_id in service.nodes_db.address_owners(configured=True).items():
         if address not in by_address and device_id in by_id:
             by_address[address] = by_id[device_id]
     return {"by_id": by_id, "by_ip": {row["ip"]: row for row in devices},
@@ -3886,7 +3887,7 @@ def _discovery_duplicate(row, index, addresses) -> dict:
             return {"duplicate_of_device_id": device["id"],
                     "duplicate_of_device_name": _device_display_name(device),
                     "duplicate_confidence": "high",
-                    "duplicate_reason": f"already answers on {address}"}
+                    "duplicate_reason": f"{address} is configured on it"}
     key = ((row["sys_name"] or "").lower(), row["sys_object_id"] or "")
     device = index["by_identity"].get(key) if all(key) else None
     if device is not None:
@@ -4741,7 +4742,7 @@ def _duplicate_conflict(service, ip: str) -> Conflict | None:
     """
     if service.nodes_db.device_by_ip(ip):
         raise ValueError(f"{ip} is already a device")
-    owner = service.nodes_db.device_id_for_address(ip)
+    owner = service.nodes_db.device_id_for_address(ip, configured=True)
     device = service.nodes_db.device(owner) if owner else None
     if device is None:
         return None
@@ -5347,7 +5348,7 @@ def post_nodes_devices_bulk_import(service, params, body) -> dict:
     # A router's second L3 address, from a spreadsheet listing interfaces
     # not devices — reported as `duplicate` like the primary-IP case, and
     # imported anyway when `force`.
-    alias_owners = {} if body.get("force") else service.nodes_db.address_owners()
+    alias_owners = {} if body.get("force") else service.nodes_db.address_owners(configured=True)
     seen_in_batch = set()
 
     created, duplicate, invalid = [], [], []

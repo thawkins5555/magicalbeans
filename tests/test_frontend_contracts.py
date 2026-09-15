@@ -3639,6 +3639,43 @@ check("r.alias, r.kind, r.medium, r.media, r.oper_status" in NODES80,
 check("row.id = `${row.device_id}:${row.if_index}`;" in NODES80,
       "runSfpReport keys each report row by device and if_index, not device alone")
 
+# --- 82. Duplicate evidence is scoped to ipAddrTable addresses -------------
+# Only addresses a device reports in its own ipAddrTable count toward
+# duplicate detection; discovered, trap-learned and merge-inherited
+# addresses stay on file for correlation but never make two devices look
+# like duplicates.
+NODES82 = read("nodes.js")
+INDEX82 = read("index.html")
+check("Only addresses a device reports in its own\n"
+      "        address table count as shared; discovered or trap-learned addresses\n"
+      "        never do." in NODES82,
+      "the Duplicates dialog's hint paragraph says shared-address evidence "
+      "is scoped to a device's own address table")
+check("'<p class=\"hint\">Only addresses a device reports in its own address ' +\n"
+      "        'table count as shared; discovered or trap-learned addresses never do.</p>'"
+      in NODES82,
+      "the Duplicates dialog repeats that scope note in the empty-state "
+      "branch too, so the caveat holds even when nothing looks like a "
+      "duplicate today")
+check("Only addresses with source ipAddrTable (the\n"
+      "                device's own address table) count toward duplicate detection;\n"
+      "                discovered and trap-learned addresses are kept for trap and\n"
+      "                syslog correlation." in INDEX82,
+      "the Addresses subtab (nd-d-sub-addresses) carries a static hint "
+      "explaining which source counts toward duplicate detection")
+_API82 = open(os.path.join(REPO_ROOT, "netpath", "web", "api.py"), encoding="utf-8").read()
+_NODEPOLL82 = open(os.path.join(REPO_ROOT, "netpath", "nodepoll.py"), encoding="utf-8").read()
+check("address_owners(configured=True)" in _API82,
+      "api.py's duplicate-evidence paths call address_owners(configured=True), "
+      "so only ipAddrTable-sourced addresses feed duplicate detection")
+check("device_id_for_address(ip, configured=True)" in _API82,
+      "api.py's per-address conflict check calls device_id_for_address(ip, "
+      "configured=True), the same configured-only rule")
+check("device_id_for_address(address, configured=True)" in _NODEPOLL82,
+      "nodepoll.py's poll-time address ownership lookup passes "
+      "configured=True too, so a poll never treats a discovered or "
+      "trap-learned address as duplicate evidence")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

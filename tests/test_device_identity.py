@@ -139,9 +139,11 @@ try:
           promoted == [existing_id], (promoted, existing_id))
     check("...and creates no second device",
           nodes.device_by_ip("127.0.0.1") is None)
-    aliases = {row["ip"] for row in nodes.device_addresses(existing_id)}
+    address_rows = {row["ip"]: row for row in nodes.device_addresses(existing_id)}
     check("...and records the addresses it walked on that device",
-          "10.8.8.8" in aliases, aliases)
+          "10.8.8.8" in address_rows, address_rows)
+    check("...as configured evidence (ipAddrTable), not discovery",
+          address_rows["10.8.8.8"]["source"] == "ipAddrTable", address_rows.get("10.8.8.8"))
 
     forced = service.node_poller.promote(job_off, [result_off["id"]], force=True)
     check("force adds the device anyway", len(forced) == 1 and
@@ -243,6 +245,60 @@ try:
                                  token=admin)
     check("...and force imports it", status == 200
           and len(forced_import["created"]) == 1, (status, forced_import))
+
+    # ---------------------------- 7b. a discovered address is not evidence
+    print("7b. a discovered address is not duplicate evidence")
+    nodes.record_device_addresses(existing_id, ["10.45.0.9"], "discovery")
+    status, created = call("POST", "/api/nodes/devices", {"ip": "10.45.0.9"}, token=admin)
+    check("a discovery-only alias never blocks a manual add",
+          status == 200 and created.get("id"), (status, created))
+    nodes.remove_device(created["id"])
+
+    status, imported_fresh = call("POST", "/api/nodes/devices/bulk-import",
+                                  {"devices": [{"ip": "10.45.0.9"}]}, token=admin)
+    check("...nor a bulk import",
+          status == 200 and len(imported_fresh.get("created") or []) == 1
+          and not imported_fresh.get("duplicate"), (status, imported_fresh))
+    nodes.remove_device(imported_fresh["created"][0]["id"])
+
+    fresh_job = nodes.add_discovery_job("subnet", "10.45.0.0/30")
+    fresh_id = nodes.add_discovery_result(
+        fresh_job, ip="10.45.0.9", ping_ok=1, snmp_ok=1, sys_name="fresh",
+        sys_object_id="1.3.6.1.4.1.5", community_or_user="public", snmp_version=1)
+    status, fresh_listing = call("GET", f"/api/nodes/discovery/{fresh_job}", token=admin)
+    fresh_row = next(r for r in fresh_listing["results"] if r["id"] == fresh_id)
+    check("...nor the discovery listing's duplicate hint",
+          not fresh_row.get("duplicate_of_device_id"), fresh_row)
+    fresh_devices = service.node_poller.promote(fresh_job, [fresh_id])
+    check("...and promote() adds a new device rather than folding",
+          len(fresh_devices) == 1 and fresh_devices[0] != existing_id, fresh_devices)
+    nodes.remove_device(fresh_devices[0])
+
+    nodes.record_device_addresses(existing_id, ["10.45.0.9"], "ipAddrTable")
+    status, refused_fresh = call("POST", "/api/nodes/devices", {"ip": "10.45.0.9"}, token=admin)
+    check("a configured alias blocks a manual add with 409 naming the owner",
+          status == 409
+          and (refused_fresh.get("duplicate_of") or {}).get("device_id") == existing_id,
+          (status, refused_fresh))
+    status, imported_conf = call("POST", "/api/nodes/devices/bulk-import",
+                                 {"devices": [{"ip": "10.45.0.9"}]}, token=admin)
+    conf_dup = (imported_conf.get("duplicate") or [{}])[0]
+    check("...and bulk import reports it as a duplicate of the same device",
+          status == 200 and not imported_conf["created"]
+          and conf_dup.get("device_id") == existing_id, (status, imported_conf))
+
+    conf_job = nodes.add_discovery_job("subnet", "10.45.0.4/30")
+    conf_id = nodes.add_discovery_result(
+        conf_job, ip="10.45.0.9", ping_ok=1, snmp_ok=1, sys_name="fresh2",
+        sys_object_id="1.3.6.1.4.1.6", community_or_user="public", snmp_version=1)
+    status, conf_listing = call("GET", f"/api/nodes/discovery/{conf_job}", token=admin)
+    conf_row = next(r for r in conf_listing["results"] if r["id"] == conf_id)
+    check("...and the listing now shows a high-confidence duplicate hint",
+          conf_row.get("duplicate_confidence") == "high"
+          and conf_row.get("duplicate_of_device_id") == existing_id, conf_row)
+    conf_devices = service.node_poller.promote(conf_job, [conf_id])
+    check("...and promote() folds onto the existing device instead of adding",
+          conf_devices == [existing_id], conf_devices)
 
     # -------------------------------------------------- 8. the addresses view
     print("8. the addresses route and the device JSON")

@@ -478,7 +478,9 @@ CREATE INDEX IF NOT EXISTS ix_port_vlans_seen ON port_vlans(seen_ts);
 -- `source` is kept so a later manual or protocol-learned entry can be
 -- told apart from a polled one. The device's own `ip` is deliberately NOT
 -- mirrored here — device_id_for_address falls back to devices.ip — so
--- there is one place a primary address is stored.
+-- there is one place a primary address is stored. Only 'ipAddrTable' rows
+-- are duplicate-device identity evidence; discovered/trap/merge rows are
+-- correlation-only (see nodesdb.CONFIGURED_SOURCE).
 CREATE TABLE IF NOT EXISTS device_addresses (
     device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     ip              TEXT NOT NULL,
@@ -882,6 +884,13 @@ def clean_community(text):
 
 
 _CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+# The only device_addresses source that proves an address is bound to one of
+# the device's own interfaces (physical, VLAN, loopback, tunnel, management).
+# Duplicate-device verdicts trust this source alone; discovery/trap/merge
+# rows stay on file for alert and conflict correlation but never fold two
+# devices together.
+CONFIGURED_SOURCE = "ipAddrTable"
 
 
 def alias_candidate(ip) -> str:
@@ -2938,11 +2947,13 @@ class NodesDatabase(SqliteStore):
             self._conn.commit()
         return len(rows)
 
-    def device_id_for_address(self, ip: str) -> int | None:
+    def device_id_for_address(self, ip: str, configured: bool = False) -> int | None:
         """Which device answers on this address: its primary `ip` first,
         then any alias learned for it. Primary first because that is the
         address the operator configured, and an alias is only ever
-        supporting evidence."""
+        supporting evidence. With configured=True the alias fallback only
+        considers rows proven by the device's own address table
+        (CONFIGURED_SOURCE, present)."""
         text = str(ip or "").strip()
         if not text:
             return None
@@ -2951,9 +2962,16 @@ class NodesDatabase(SqliteStore):
                 "SELECT id FROM devices WHERE ip = ?", (text,)).fetchone()
             if row is not None:
                 return row["id"]
-            row = self._conn.execute(
-                "SELECT device_id FROM device_addresses WHERE ip = ?"
-                " ORDER BY present DESC, seen_ts DESC LIMIT 1", (text,)).fetchone()
+            if configured:
+                row = self._conn.execute(
+                    "SELECT device_id FROM device_addresses WHERE ip = ?"
+                    " AND source = ? AND present = 1"
+                    " ORDER BY present DESC, seen_ts DESC LIMIT 1",
+                    (text, CONFIGURED_SOURCE)).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT device_id FROM device_addresses WHERE ip = ?"
+                    " ORDER BY present DESC, seen_ts DESC LIMIT 1", (text,)).fetchone()
         return row["device_id"] if row else None
 
     def device_addresses(self, device_id: int) -> list[sqlite3.Row]:
@@ -2983,13 +3001,21 @@ class NodesDatabase(SqliteStore):
 
     # ------------------------------------------- identity, duplicates, merge
 
-    def address_owners(self) -> dict[str, int]:
+    def address_owners(self, configured: bool = False) -> dict[str, int]:
         """Every alias address -> the device that answers on it. One read
-        for discovery to test a whole sweep against, not one per address."""
+        for discovery to test a whole sweep against, not one per address.
+        With configured=True, only rows proven by the device's own address
+        table (CONFIGURED_SOURCE, present) are included."""
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT ip, device_id FROM device_addresses"
-                " ORDER BY seen_ts").fetchall()
+            if configured:
+                rows = self._conn.execute(
+                    "SELECT ip, device_id FROM device_addresses"
+                    " WHERE source = ? AND present = 1"
+                    " ORDER BY seen_ts", (CONFIGURED_SOURCE,)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT ip, device_id FROM device_addresses"
+                    " ORDER BY seen_ts").fetchall()
         return {row["ip"]: row["device_id"] for row in rows}
 
     def devices_by_identity(self) -> dict[tuple, sqlite3.Row]:
@@ -3018,7 +3044,9 @@ class NodesDatabase(SqliteStore):
         wrong in a way only a human can see (a NAT'd address, a chassis MAC
         reused across a stack, a templated hostname), so confidence reflects
         how much the evidence alone can carry, from a shared address (high)
-        down to a shared hostname alone (low)."""
+        down to a shared hostname alone (low). Only a device's own address
+        table (CONFIGURED_SOURCE) is address evidence here; discovered,
+        trap-learned and merge-carried rows never produce a pair."""
         pairs: dict[tuple, dict] = {}
 
         def entry(a_id: int, b_id: int) -> dict:
@@ -3032,11 +3060,15 @@ class NodesDatabase(SqliteStore):
             alias_primary = self._conn.execute(
                 "SELECT da.device_id AS a_id, d.id AS b_id, da.ip AS ip"
                 " FROM device_addresses da JOIN devices d ON d.ip = da.ip"
-                " WHERE d.id <> da.device_id").fetchall()
+                " WHERE d.id <> da.device_id"
+                " AND da.source = ? AND da.present = 1", (CONFIGURED_SOURCE,)).fetchall()
             alias_alias = self._conn.execute(
                 "SELECT a.device_id AS a_id, b.device_id AS b_id, a.ip AS ip"
                 " FROM device_addresses a JOIN device_addresses b"
-                " ON a.ip = b.ip AND a.device_id < b.device_id").fetchall()
+                " ON a.ip = b.ip AND a.device_id < b.device_id"
+                " WHERE a.source = ? AND a.present = 1"
+                " AND b.source = ? AND b.present = 1",
+                (CONFIGURED_SOURCE, CONFIGURED_SOURCE)).fetchall()
             macs = self._conn.execute(
                 "SELECT i1.device_id AS a_id, i2.device_id AS b_id,"
                 " i1.phys_addr AS mac FROM interfaces i1 JOIN interfaces i2"
@@ -3054,7 +3086,7 @@ class NodesDatabase(SqliteStore):
 
         for row in list(alias_primary) + list(alias_alias):
             item = entry(row["a_id"], row["b_id"])
-            reason = f"both answer on {row['ip']}"
+            reason = f"both have {row['ip']} configured"
             if reason not in item["reasons"]:
                 item["reasons"].append(reason)
             item["confidence"] = "high"

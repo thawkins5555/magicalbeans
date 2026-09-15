@@ -3159,13 +3159,17 @@
     const box = App.modal('Possible duplicates', duplicates.length ? `
       <p class="hint">Pairs that look like one device entered twice. Nothing is
         merged until you say so — open one to see exactly what a merge would
-        move before it happens.</p>
+        move before it happens. Only addresses a device reports in its own
+        address table count as shared; discovered or trap-learned addresses
+        never do.</p>
       <div class="table-wrap scrollbox large">
         <table><caption class="sr-only">Possible duplicate devices</caption>
         <thead><tr><th scope="col">Confidence</th><th scope="col">Device</th>
         <th scope="col">Device</th><th scope="col">Why</th><th scope="col"></th></tr></thead>
         <tbody>${rowsHtml}</tbody></table>
-      </div>` : '<p>No two devices here look like the same box.</p>',
+      </div>` : '<p>No two devices here look like the same box.</p>' +
+        '<p class="hint">Only addresses a device reports in its own address ' +
+        'table count as shared; discovered or trap-learned addresses never do.</p>',
       [{ label: 'Close', onClick: App.closeModal }]);
     for (const button of box.querySelectorAll('.nd-dup-open')) {
       button.onclick = () => {

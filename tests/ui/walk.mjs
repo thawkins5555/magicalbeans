@@ -1164,6 +1164,42 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       await page.waitForSelector('#modal[hidden]', { timeout: 10000 }).catch(() => {});
       return `Uptime header ${wasChecked ? 'removed' : 'appeared'}, then reverted`;
     });
+
+  await check('the Duplicates dialog explains that only a device\'s own address table counts',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'nodes');
+      await settle(page, 800);
+      await page.click('#nd-duplicates');
+      await page.waitForSelector('#modal:not([hidden])', { timeout: 20000 });
+      const text = await page.evaluate(
+        () => (document.getElementById('modal') || {}).textContent || '');
+      assert(/own address table/.test(text),
+        `Duplicates dialog text did not mention "own address table": "${text}"`);
+      await page.click('#modal:not([hidden]) .modal-buttons button');
+      await page.waitForSelector('#modal[hidden]', { timeout: 10000 }).catch(() => {});
+      return 'Duplicates dialog carries the address-table scope note';
+    });
+
+  await check('the Addresses subtab explains which address source counts toward duplicate detection',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'nodes');
+      await settle(page, 800);
+      await page.waitForSelector('#nodes-table tbody tr', { timeout: 20000 });
+      await page.click('#nodes-table tbody tr:first-child');
+      await page.waitForSelector('#nd-detail:not([hidden])', { timeout: 20000 });
+      await page.click('#nd-d-subs .subtab[data-subtab="addresses"]');
+      await settle(page, 400);
+      const text = await page.evaluate(
+        () => (document.getElementById('nd-d-sub-addresses') || {}).textContent || '');
+      assert(/count toward duplicate detection/.test(text),
+        `Addresses subtab text did not mention "count toward duplicate detection": "${text}"`);
+      // Leave the device pane on its default subtab, like every other
+      // check here that switches nested subtabs.
+      await page.click('#nd-d-subs .subtab[data-subtab="interfaces"]').catch(() => {});
+      return 'Addresses subtab carries the duplicate-detection scope note';
+    });
 }
 
 async function checkDialog(page, dir, tag) {

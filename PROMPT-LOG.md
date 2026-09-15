@@ -5,6 +5,47 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.26.0 — Duplicate devices: configured addresses only, not discovery IPs
+
+**Operator prompt:**
+"ONLY IP's that are actually configured on a device's physical
+interfaces or vlan interfaces should be considered when detecting
+duplicate devices.  Currently it seems the system is using
+'discovery' IP addresses and considering it a device duplicate when
+that IP address isn't actually assigned to an interface on the
+device.  Those discovered IP's should be used for things like IP
+address conflict (if multiple MACS arp to a single IP) etc but not
+for actual NODE Device Duplicates."
+
+**Planning answers:**
+1. Which addresses count as "configured" — everything in the
+   device's own address table: physical interface IPs, VLAN
+   interface IPs, loopbacks, tunnel interfaces, and management
+   addresses (i.e. what SNMP's address table on the device itself
+   reports, not what the discovery sweep merely probed).
+2. Scope — all three places the system tells the operator two
+   devices are the same box: the Duplicates button, the discovery
+   screen's "Same as an existing device" hint and its promote step,
+   and the 409 conflict check when adding a device by hand or
+   through bulk import.
+
+**Notes:** an address now only counts as duplicate evidence when it
+came from reading the device's own address table and is currently
+present there; addresses picked up purely by discovery probing, by
+SNMP traps, or inherited during a merge are kept — they still feed
+IP-conflict detection (two MACs answering for one IP) and IPAM — but
+no longer make two unrelated devices look like the same one. The
+discovery sweep now records what it actually reads off each device's
+address table as configured evidence, separately from the one address
+it used to reach the device, which is recorded as discovery-only. The
+Duplicates dialog and the device's Addresses tab now say which
+addresses are configured versus merely seen by discovery, so this
+isn't a silent change. Added `tests/test_duplicate_evidence.py` and a
+new section in the existing device-identity tests covering the
+configured-vs-discovered split.
+
+**Outcome.** [to be filled in at release]
+
 ## 5.25.0 — SFP copper/laser identification
 
 **Operator prompt, two items:**

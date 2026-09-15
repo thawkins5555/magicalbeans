@@ -2237,11 +2237,12 @@ class NodePoller(Worker):
             return job is not None and job.running
 
     @staticmethod
-    def _result_addresses(result) -> list[str]:
-        """Every address the sweep reached this result on, the probed one
-        first. Blank for a row written before 5.0 or by a sweep with
-        discovery_addresses off."""
-        addresses = [result["ip"]]
+    def _walked_addresses(result) -> list[str]:
+        """Every address the sweep's own ipAdEntAddr walk reached (not the
+        probed address), deduped and filtered through
+        nodesdb.alias_candidate. Empty for a row written before 5.0 or by a
+        sweep with discovery_addresses off."""
+        addresses = []
         keys = result.keys()
         if "ip_addresses" in keys and result["ip_addresses"]:
             try:
@@ -2252,6 +2253,17 @@ class NodePoller(Worker):
                 text = nodesdb.alias_candidate(address)
                 if text and text not in addresses:
                     addresses.append(text)
+        return addresses
+
+    @staticmethod
+    def _result_addresses(result) -> list[str]:
+        """Every address the sweep reached this result on, the probed one
+        first. Blank for a row written before 5.0 or by a sweep with
+        discovery_addresses off."""
+        addresses = [result["ip"]]
+        for address in NodePoller._walked_addresses(result):
+            if address not in addresses:
+                addresses.append(address)
         return addresses
 
     def promote(self, job_id: int, result_ids: list[int],
@@ -2276,9 +2288,10 @@ class NodePoller(Worker):
 
         A result folded into another (same box, second L3 address) is
         promoted as its primary, so ticking either row adds one device;
-        a result whose walked addresses match a device already on file is
-        recorded on that device rather than added beside it. `force` skips
-        that fold for an operator who says they're genuinely two boxes.
+        a result whose walked addresses match a device's configured
+        addresses is recorded on that device rather than added beside it.
+        `force` skips that fold for an operator who says they're genuinely
+        two boxes.
         """
         job = self.db.discovery_job(job_id)
         allow_ping_only = bool(job and job["allow_ping_only"])
@@ -2307,13 +2320,12 @@ class NodePoller(Worker):
             existing = self.db.device_by_ip(result["ip"])
             if existing is None and not force:
                 for address in addresses:
-                    owner = self.db.device_id_for_address(address)
+                    owner = self.db.device_id_for_address(address, configured=True)
                     if owner is not None:
                         existing = self.db.device(owner)
                         break
             if existing is not None:
-                self.db.record_device_addresses(
-                    existing["id"], addresses, "discovery")
+                self._record_promoted_addresses(existing["id"], result, addresses)
                 self._mark_promoted_family(result_id, existing["id"], family)
                 device_ids.append(existing["id"])
                 continue
@@ -2356,10 +2368,23 @@ class NodePoller(Worker):
                                        if "vendor_confidence" in keys else "") or "",
                     vendor_evidence=(result["vendor_evidence"]
                                      if "vendor_evidence" in keys else None))
-            self.db.record_device_addresses(device_id, addresses, "discovery")
+            self._record_promoted_addresses(device_id, result, addresses)
             self._mark_promoted_family(result_id, device_id, family)
             device_ids.append(device_id)
         return device_ids
+
+    def _record_promoted_addresses(self, device_id: int, result, addresses: list[str]) -> None:
+        """Splits promote()'s address list the way _refresh_addresses would:
+        the sweep's own ipAdEntAddr walk counts immediately as
+        CONFIGURED_SOURCE, so it doesn't wait up to a poll interval;
+        whatever's left — the probed address when it wasn't walked — is
+        recorded as discovery, which is correlation-only."""
+        walked = self._walked_addresses(result)
+        if walked:
+            self.db.record_device_addresses(device_id, walked, nodesdb.CONFIGURED_SOURCE)
+        remaining = [a for a in addresses if a not in walked]
+        if remaining:
+            self.db.record_device_addresses(device_id, remaining, "discovery")
 
     def _folded_family(self, job_id: int) -> dict[int, list[int]]:
         """`{primary result id: [ids folded into it]}`, read once per
@@ -4295,7 +4320,7 @@ class NodePoller(Worker):
                     continue
                 details.setdefault(address, {})[key] = entry
         addresses = [str(value) for value in rows.values() if value]
-        self.db.record_device_addresses(device_id, addresses, "ipAddrTable",
+        self.db.record_device_addresses(device_id, addresses, nodesdb.CONFIGURED_SOURCE,
                                         details=details, complete=True)
 
     def _poll_vendor_health(self, device, config: dict, identity: dict,
