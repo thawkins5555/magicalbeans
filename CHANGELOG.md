@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.26.0 — Duplicate devices only share a configured address, not a discovered one](#5260--duplicate-devices-only-share-a-configured-address-not-a-discovered-one)
 - [5.25.0 — Copper transceivers get their own badge](#5250--copper-transceivers-get-their-own-badge)
 - [5.24.0 — SFP inventory, priority-port tint, and names in the History picker](#5240--sfp-inventory-priority-port-tint-and-names-in-the-history-picker)
 - [5.23.0 — Scheduled reports, a history explorer, priority ports, and NetFlow's missing blocks](#5230--scheduled-reports-a-history-explorer-priority-ports-and-netflows-missing-blocks)
@@ -158,6 +159,82 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.26.0 — Duplicate devices only share a configured address, not a discovered one
+
+One item from the operator: `PROMPT-LOG.md` carries the request in full;
+this entry is the shipped result.
+
+**An address only counts as evidence two devices are the same box when
+it came off that device's own address table.** Every place the
+application has ever told an operator "these look like the same
+device" — the Devices bar's **Duplicates** button, the discovery
+screen's **Same as an existing device** hint and the fold `promote()`
+performs on it, and the 409 refusal on **Add device** and bulk import
+— read the same `device_addresses` table for shared-address evidence,
+and that table has always held more than the device's own interfaces:
+an address a discovery sweep merely probed, one learned off an SNMP
+trap's agent-address, or one carried over from an earlier merge, sat
+there next to the addresses the device's own hourly `ipAddrTable` walk
+found, with no way to tell them apart. A router probed at a stale or
+misconfigured address, or a device whose trap agent-address happened
+to collide with another box's, could be flagged a duplicate of a
+device it had nothing to do with. Now only a row whose source is the
+device's own `ipAddrTable` walk, and which that walk still confirms as
+present, counts toward a duplicate verdict in any of the three places.
+A discovered, trap-learned, or merge-carried address is still kept and
+still does everything else it always has — it attributes a trap or
+syslog line to the right device, it still feeds IP-conflict detection
+(two MACs answering for one address), and it still shows on the
+device's **Addresses** subtab — it simply never makes two devices
+"duplicates" on its own.
+
+**Discovery now tells its own probe address apart from what it
+actually read off the box.** Promoting a discovery result to a device
+used to record every address the sweep touched, probed and walked
+alike, as one undifferentiated "discovery" batch — so a device
+promoted a second ago had no configured evidence at all, and a
+purely-probed address that was never on the device's own table could
+sit there indefinitely with nothing to age it out. Promoting a result
+now records the sweep's own `ipAdEntAddr` walk as configured evidence
+immediately, and only the address actually used to reach the device as
+discovery-only; the next hourly complete walk then confirms or demotes
+those rows exactly like any other. This also closes a small leak: a
+discovery-only address that was never itself walked by the owning
+device's `ipAddrTable` poll never aged out, because that poll only
+ever marks its own source absent — recording the walked half under the
+right source means the walk now governs it.
+
+**The Duplicates dialog and the Addresses subtab now say which source
+counts.** A hint on the Duplicates dialog explains that only addresses
+a device reports in its own address table count as shared; a hint
+under the device pane's Addresses table says the same for that view.
+Wording on the individual duplicate rows and the discovery **Same as**
+hint changed to match — "both have 10.1.2.3 configured" and "10.1.2.3 is
+configured on it" in place of "both answer on" and "already answers
+on", since an address can appear on the Addresses subtab without the
+device having ever answered on it directly.
+
+No schema change and no migration: every existing discovery-sourced
+row stops counting the moment this ships, stays visible on the
+Addresses subtab with its source labelled, and ages out on the
+existing 180-day prune like before. Two edge cases are worth knowing
+about: a device whose `ipAddrTable` walk fails contributes only its
+primary address as evidence until the walk succeeds again, and on
+Cisco IOS `ipAddrTable` only lists addresses in the global routing
+table — a management address configured inside a VRF is evidence only
+when it also happens to be the device's primary.
+
+Files: `nodesdb.py`, `nodepoll.py`, `web/api.py`, `web/static/index.html`,
+`web/static/nodes.js`.
+
+Verification: new `tests/test_duplicate_evidence.py` exercises
+`NodesDatabase` directly — configured vs. discovered vs. trap vs.
+merge-carried rows at every reader. `test_device_identity.py` adds
+section 7b covering the same split through the discovery promote path.
+`test_frontend_contracts.py` adds section 82 pinning the new hint text
+and reworded reasons. `tests/ui/walk.mjs` adds two checks on the Nodes
+walk covering the Duplicates dialog hint and the Addresses subtab hint.
 
 ### 5.25.0 — Copper transceivers get their own badge
 

@@ -3041,6 +3041,30 @@ upsert, so a source that knows only the address — a trap, a discovery
 fold — never erases what the poller's fuller walk learned) and
 `discovery_results.ip_addresses`/`folded_into_result_id`.
 
+**Which `source` is identity evidence, from 5.26.0.** `device_addresses`
+is written from four places, and only one of them proves an address is
+actually bound to one of the device's own interfaces:
+
+| `source` | Written by | Duplicate-device evidence? |
+|---|---|---|
+| `ipAddrTable` | `_refresh_addresses` (the hourly complete walk) and the walked half of `promote()`'s split, below | yes — the only source that is |
+| `discovery` | `promote()`, for the address actually used to reach the device when that address wasn't also read off its own table | no |
+| `trap_agent_addr` | `snmptrapd._learn_agent_address`, an SNMPv1 trap's agent-address field | no |
+| `merge` | `merge_devices`, the loser's former primary, kept as a historical alias | no |
+
+`nodesdb.CONFIGURED_SOURCE` (`= "ipAddrTable"`) names the one source
+that counts. `address_owners(configured=True)` and
+`device_id_for_address(ip, configured=True)` are the two readers filtered
+to it (`source = CONFIGURED_SOURCE AND present = 1`); every other reader
+of `device_addresses` — the Addresses subtab, trap/syslog attribution,
+IP-conflict detection — keeps reading every source unfiltered, since
+those questions are about correlation, not identity. `_device_index`
+(`api.py`) builds `by_address` off `address_owners(configured=True)`;
+`_duplicate_conflict` (the 409 check) and bulk import's alias lookup both
+call `device_id_for_address`/`address_owners` with `configured=True` for
+the same reason. `duplicate_candidates`'s two alias self-joins add
+`source = CONFIGURED_SOURCE AND present = 1` to both sides of the join.
+
 **`device_addresses` ages out, from 5.14.0.** Before this it was the one
 table in `nodes.db` with no age-out path at all: an address a device
 stopped reporting stayed forever. `_migrate` adds `present` and
@@ -3050,9 +3074,15 @@ gains a `complete` keyword, defaulting `False`; only `_refresh_addresses`
 — the full `ipAddrTable` walk — passes `complete=True`, and only then are
 rows this walk did not see marked `present=0`. A trap or a discovery fold
 writes a partial set and must never mark the rest of a device's addresses
-absent, so it always calls with the default. An empty complete walk (a
-device that has genuinely stopped answering `ipAddrTable`) still reaches
-the marking step and marks everything absent, rather than being treated
+absent, so it always calls with the default — still true from 5.26.0, and
+now the reason `_record_promoted_addresses` (below) records the sweep's
+own walked addresses under `CONFIGURED_SOURCE`: that half is the same
+table `_refresh_addresses` writes, so the next complete walk governs it
+like any other `ipAddrTable` row, while the probed-only half stays
+`discovery` and is never touched by a walk that never saw it. An empty
+complete walk (a device that has genuinely stopped answering
+`ipAddrTable`) still reaches the marking step and marks everything
+absent, rather than being treated
 as "nothing to report." `device_id_for_address` orders candidates
 `present DESC, seen_ts DESC`, so a present alias beats a stale one when a
 trap or syslog address happens to resolve to more than one row.
@@ -3068,10 +3098,12 @@ stale claim about what it covers is corrected to match.
 (one pass over the fleet per listing: primary IPs, aliases, and a
 `(sysName, sysObjectID)` map):
 
-- **high** — one of the addresses this box answered on is already a
-  device's. Nothing else honestly explains that, so `promote()` records
-  the addresses on the existing device and marks the result promoted to
-  it instead of adding a row beside it.
+- **high** — one of the addresses this box was reached on is already
+  configured on a device (`device_id_for_address(address, configured=True)`,
+  from 5.26.0 — the device's own `ipAddrTable`, not merely another
+  result's probe address). Nothing else honestly explains that, so
+  `promote()` records the addresses on the existing device and marks the
+  result promoted to it instead of adding a row beside it.
 - **medium** — sysName and sysObjectID both match a device the sweep
   never reached on any shared address. Two switches out of the same
   carton share that honestly, so it is a reason to look before ticking
@@ -3084,14 +3116,29 @@ skips the fold for the operator who has looked at the pair and says they
 really are two boxes. The approval dialog never passes `force` — folding
 is the whole point of the review it presents; "Add anyway" is offered by
 **Add device** alone, where the operator typed the address themselves.
+`_record_promoted_addresses`, added in 5.26.0, splits what a promoted
+result writes to `device_addresses` the same way `_refresh_addresses`
+would rather than recording everything as `discovery`: `_walked_addresses`
+(the sweep's own `ipAdEntAddr` read of the box, as distinct from
+`_result_addresses`'s probed-address-first list) is written under
+`CONFIGURED_SOURCE` immediately, and whatever address is left over — the
+one actually used to reach the device, when that address wasn't also on
+its own table — is written `discovery`. A device promoted a second ago
+therefore already carries configured evidence rather than waiting up to
+an hour for the next poll, and the next complete walk ages each half
+correctly instead of the old single undifferentiated batch.
 
 **Manual add and bulk import.** `api.Conflict(ValueError)` carries a
 `payload`; `server.py`'s arm for it sits **before** the `ValueError` arm
 and answers 409 with that payload merged into the body. `POST
 /api/nodes/devices` raises it when the address is another device's
-learned **alias** — naming that device, so the browser can offer "Add
-anyway" (`force: true`) rather than only printing a refusal. A collision
-with a device's own primary IP is a plain 400 with or without `force`:
+**configured** alias — from 5.26.0, `_duplicate_conflict` calls
+`device_id_for_address(ip, configured=True)`, so only an address that
+device's own `ipAddrTable` reports triggers it, not one only a discovery
+probe or a trap saw for that device — naming the device, so the browser
+can offer "Add anyway" (`force: true`) rather than only printing a
+refusal. A collision with a device's own primary IP is a plain 400 with
+or without `force`:
 the UNIQUE index behind the insert would refuse it however hard the
 button was pressed, so offering "Add anyway" only bought a second
 refusal. Bulk import puts the same case in its existing `duplicate`
@@ -3103,10 +3150,17 @@ runs three self-joins and merges them per pair:
 
 | Source | Confidence |
 |---|---|
-| An address two devices both claim (alias vs primary, alias vs alias) | high |
+| An address configured on both devices (alias vs primary, alias vs alias — from 5.26.0, `source = CONFIGURED_SOURCE AND present = 1` on both sides) | high |
 | A shared interface MAC | high with two or more, or with a matching sysName; medium alone |
 | sysName plus sysObjectID | medium |
 | sysName alone | low |
+
+The reason text for the address row reads "both have `<ip>` configured",
+in place of the pre-5.26.0 "both answer on `<ip>`" — a device can now
+appear here without ever having answered on that address itself, since
+`ipAddrTable` reports what an interface is configured with regardless of
+whether that address has replied to anything. The 409 conflict message
+changed the same way, to "`<ip>` is configured on it".
 
 The MAC source excludes the all-zero and broadcast addresses and the
 HSRP/VRRP virtual prefixes (`00005e0001`, `00005e0002`, `00000c07ac`):

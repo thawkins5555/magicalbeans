@@ -958,12 +958,14 @@ own subtabs.
   cell marked `+1`, rather than two devices to add. The setting is in
   Nodes → Settings → Discovery and can be switched off.
 - **A result that looks like a device you already have says which one.**
-  A new **Same as** column names it and how sure the scan is: *high* means
-  an address that device already answers on, and approving the result
-  records the new addresses on the existing device instead of adding a
-  second one; *medium* means a matching hostname and device type and
-  nothing more, which is a reason to look before ticking — it starts
-  unticked, and ticking it still adds the device.
+  A **Same as** column names it and how sure the scan is: *high* means an
+  address that device already has configured (from 5.26.0, that device's
+  own address table — not merely another discovery run's probe or a
+  trap), and approving the result records the new addresses on the
+  existing device instead of adding a second one; *medium* means a
+  matching hostname and device type and nothing more, which is a reason
+  to look before ticking — it starts unticked, and ticking it still adds
+  the device.
 
 ### Vendor MIBs
 
@@ -1704,24 +1706,36 @@ From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
 
 One device answering on several addresses is one device. From 5.0.0 the
 application says so everywhere it can, and asks rather than assumes
-everywhere it cannot.
+everywhere it cannot. From 5.26.0, only an address the device's own
+address table reports counts toward that "same device" call — an
+address merely seen by a discovery probe, an SNMP trap, or carried
+over from an earlier merge is kept on file but never on its own turns
+two devices into a duplicate.
 
 - **The device pane has an ADDRESSES subtab** listing every address the
   device answers on: the one you configured, marked as the primary, and
   every other one its own address table has reported, with the interface
   and netmask where it gave them and when each was last seen. This is why
   a trap or a syslog line arriving from a loopback is attributed to the
-  right device.
-- **Adding an address another device already answers on is refused, and
-  says which device.** The message names it, links to it, and offers **Add
-  anyway** for the case where two boxes really do sit behind one address.
-  A bulk import lists the same rows in its `duplicate` column, naming the
-  device each belongs to, with one button to import them anyway.
+  right device. A hint on this tab notes that only rows sourced from the
+  device's own address table (not a discovery probe or a trap) count
+  toward duplicate detection — every row still shows here regardless of
+  source, since this tab is about correlation, not verdicts.
+- **Adding an address another device already has configured is refused,
+  and says which device.** The message names it, links to it, and offers
+  **Add anyway** for the case where two boxes really do sit behind one
+  address. An address only a discovery probe or a trap picked up for
+  another device does not trigger this refusal. A bulk import lists the
+  same rows in its `duplicate` column, naming the device each belongs to,
+  with one button to import them anyway.
 - **A Duplicates button in the Devices bar** lists pairs that look like
-  one device entered twice — the same address claimed by both, a shared
-  interface MAC, or the same hostname and device type — each with what the
-  evidence is and how strong it is. Nothing is fetched for it until it is
-  opened, and nothing is ever merged automatically.
+  one device entered twice — an address both devices have configured, a
+  shared interface MAC, or the same hostname and device type — each with
+  what the evidence is and how strong it is. Only addresses each device's
+  own address table reports count as a shared address here; a discovery-
+  or trap-learned address never does, and the dialog says so. Nothing is
+  fetched for it until it is opened, and nothing is ever merged
+  automatically.
 - **Merging is an operator's decision, previewed first.** Opening a pair
   shows which row survives (swap it if the suggestion is wrong) and
   exactly what the merge would move: addresses, event history, upstream
