@@ -55,7 +55,7 @@ interface-table evidence, this just says so plainly — and the
 5.28.0 tick-to-add-separately override is unchanged and still works
 the same way.
 
-**Outcome.** [to be filled in at release]
+**Outcome.** Shipped as 5.29.0. Full suite 169/173 with only the four known environmental failures (no passphrase, no traceroute, socket family, prune-lock timing); Nodes browser walk 81/81 with zero console, page or HTTP errors as admin and viewer, after fixing a walk-script bug from 5.28.0 that had never run (the discovery re-read asked for job "undefined"). Javariius pass 1 "not ready" on two doc sentences and no code faults (a FEATURES claim that an unticked Same-as row is marked added, and this empty outcome line), five stale comments taken; pass 2 "ready to push". New tests/test_address_wipe.py proves the one-time wipe runs once and leaves only interface-table rows.
 
 ## 5.28.0 — Discovery duplicates: an override, and folded rows no longer hidden
 
