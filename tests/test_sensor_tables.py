@@ -313,21 +313,24 @@ check("a device answering nothing at all is latched incapable, once",
 
 # ------------------------------------------------------------ cadence gate
 poller14 = new_poller()
-calls = {"n": 0}
+walked14 = []
 
 
 def counting(device, config, oid, raise_on_timeout=False, deadline=None):
-    calls["n"] += 1
+    walked14.append(oid)
     return {"1": 40} if oid == t.value else {}
 
 
 poller14._walk_column = counting
 dev14 = device(CISCO_OID)
 poller14._poll_vendor_sensors(14, dev14, CONFIG, 1_700_000_000.0)
-first_calls = calls["n"]
+walked14.clear()
 poller14._poll_vendor_sensors(14, dev14, CONFIG, 1_700_000_000.0 + 1.0)
-check("a second poll one second later does not re-walk (inside "
-      "_SENSOR_REFRESH_S)", calls["n"] == first_calls, calls)
+check("a second poll one second later does not re-walk the temperature "
+      "table (inside _SENSOR_REFRESH_S) -- PSU state has its own cadence "
+      "and runs every poll (see test_psu_state.py), so this only pins the "
+      "temperature half",
+      t.value not in walked14, walked14)
 
 print()
 if FAILS:

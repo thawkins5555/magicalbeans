@@ -1,9 +1,11 @@
 """netpath/nodepoll.py's _poll_vendor_sensors PSU half: nodeoids.PSU_TABLES
-read into psu_state.<idx> (0 ok / 1 warning / 2 failed), Cisco's two-table
-fallback (ENVMON then FRU, class-filtered to power-supply rows), and the
-pulled-supply clear rule: a not-present/off-admin row writes nothing while
-its key has never existed, but writes one explicit 0 once it has, so an
-open psu_failed alert on a pulled supply clears instead of going stale.
+read into psu_state.<idx> (0 ok / 1 warning / 2 failed / 3 not present),
+Cisco's two-table fallback (ENVMON then FRU, class-filtered to power-supply
+rows), the pulled-supply alert rule: a not-present/off-admin row writes
+nothing while its key has never existed, but writes an explicit 3 (not
+present) once it has, so an open psu_failed alert on a pulled supply stays
+open instead of clearing, and the per-poll PSU cadence (state column every
+call, static name/class columns cached).
 
 No real SNMP session: _walk_column is replaced on the NodePoller instance
 directly, the way tests/test_swversion_entity_walk.py does. self.db is the
@@ -104,9 +106,12 @@ check("vendor_sensor_capable latches true", poller.db.capable_calls == [(1, True
 # --------------------------------------- Cisco FRU: class-filtered chassis PSU
 poller_fru = new_poller()
 poller_fru._walk_column = table_walker({
-    fru.state: {"10": 2, "11": 9, "12": 8, "20": 2},   # on, onButFanFail, failed, on
-    fru.name: {"10": "PSU-0", "11": "PSU-1", "12": "PSU-2", "20": "Fan Tray"},
-    fru.class_col: {"10": 6, "11": 6, "12": 6, "20": 4},   # 4 = fan, not powerSupply
+    fru.state: {"10": 2, "11": 9, "12": 8, "20": 2, "13": 1, "14": 3},
+        # on, onButFanFail, failed, on, offEnvOther, offAdmin
+    fru.name: {"10": "PSU-0", "11": "PSU-1", "12": "PSU-2", "20": "Fan Tray",
+              "13": "PSU-3", "14": "PSU-4"},
+    fru.class_col: {"10": 6, "11": 6, "12": 6, "20": 4, "13": 6, "14": 6},
+        # 4 = fan, not powerSupply; the rest are powerSupply-class
 })
 dev_fru = device(CISCO_OID)
 poller_fru._poll_vendor_sensors(2, dev_fru, CONFIG, 1_700_000_000.0)
@@ -115,6 +120,8 @@ check("Cisco FRU: on(2) on a powerSupply-class row -> ok(0)",
       samples_fru.get("psu_state.10") == 0.0, samples_fru)
 check("...onButFanFail(9) -> warning(1)", samples_fru.get("psu_state.11") == 1.0, samples_fru)
 check("...failed(8) -> failed(2)", samples_fru.get("psu_state.12") == 2.0, samples_fru)
+check("...offEnvOther(1) -> failed(2), no input", samples_fru.get("psu_state.13") == 2.0, samples_fru)
+check("...offAdmin(3) -> warning(1), deliberately off", samples_fru.get("psu_state.14") == 1.0, samples_fru)
 check("...a non-PSU FRU row (entPhysicalClass != powerSupply) is not "
       "written at all, however it reads",
       "psu_state.20" not in samples_fru, samples_fru)
@@ -130,9 +137,9 @@ dev_clear = device(CISCO_OID)
 poller_clear._poll_vendor_sensors(3, dev_clear, CONFIG, 1_700_000_000.0)
 samples_clear = poller_clear.db.samples_dict(3)
 check("a supply that was present and now reads notPresent writes an "
-      "explicit 0 to its EXISTING key, so an open alert clears rather "
-      "than going stale",
-      samples_clear.get("psu_state.1") == 0.0, samples_clear)
+      "explicit 3 (not present) to its EXISTING key, so psu_failed opens "
+      "on a removed/unpowered supply instead of clearing",
+      samples_clear.get("psu_state.1") == 3.0, samples_clear)
 
 # ------------------------------------------------------- Juniper class filter
 jn = nodeoids.PSU_TABLES[2636]
@@ -213,6 +220,77 @@ dev_none = device(CISCO_OID)
 poller_none._poll_vendor_sensors(8, dev_none, CONFIG, 1_700_000_000.0)
 check("a device answering neither table is latched incapable, once",
       poller_none.db.capable_calls == [(8, False)], poller_none.db.capable_calls)
+
+# ------------------------------------------- per-poll PSU cadence (section 2)
+def recording_walker(columns: dict, calls: list):
+    def fake(device, config, oid, raise_on_timeout=False, deadline=None):
+        calls.append(oid)
+        return dict(columns.get(oid, {}))
+    return fake
+
+temp_table = nodeoids.SENSOR_TABLES[9]
+walked = []
+poller_cad = new_poller()
+poller_cad._walk_column = recording_walker({
+    envmon.state: {"1": 1}, envmon.name: {"1": "PSU1"},
+    temp_table.value: {"1": 42}, temp_table.state: {"1": 1},
+}, walked)
+dev_cad = device(CISCO_OID, sensor_capable=None, vendor_sensor_capable=None, id=9)
+poller_cad._poll_vendor_sensors(9, dev_cad, CONFIG, 1_700_000_000.0)
+check("cadence: first call walks the PSU state column", envmon.state in walked, walked)
+check("cadence: first call walks the temperature table", temp_table.value in walked, walked)
+
+walked.clear()
+dev_cad2 = device(CISCO_OID, sensor_capable=None, vendor_sensor_capable=True, id=9)
+poller_cad._poll_vendor_sensors(9, dev_cad2, CONFIG, 1_700_000_060.0)
+check("cadence: second call, 60s later, still walks the PSU state column",
+      envmon.state in walked, walked)
+check("cadence: second call does NOT walk the temperature table (not due)",
+      temp_table.value not in walked, walked)
+check("cadence: second call does NOT re-walk the PSU name column (cache hit)",
+      envmon.name not in walked, walked)
+
+# a latched-incapable device waits the hourly reprobe, PSU state included
+walked_nc = []
+poller_nc = new_poller()
+poller_nc._walk_column = recording_walker({}, walked_nc)
+dev_nc = device(CISCO_OID, vendor_sensor_capable=None, id=10)
+poller_nc._poll_vendor_sensors(10, dev_nc, CONFIG, 1_700_000_000.0)
+walked_nc.clear()
+dev_nc2 = device(CISCO_OID, vendor_sensor_capable=0, id=10)
+poller_nc._poll_vendor_sensors(10, dev_nc2, CONFIG, 1_700_000_060.0)
+check("cadence: a latched-incapable device walks nothing on the second call, 60s later",
+      walked_nc == [], walked_nc)
+
+# ------------------------------------------------ static-column cache rules
+walked_c = []
+cols_c = {envmon.state: {"1": 1}, envmon.name: {}}   # name walk timed out
+poller_c = new_poller()
+poller_c._walk_column = recording_walker(cols_c, walked_c)
+dev_c = device(CISCO_OID, vendor_sensor_capable=True, id=11)
+poller_c._poll_vendor_sensors(11, dev_c, CONFIG, 1_700_000_000.0)
+check("cache: an empty static walk is not cached",
+      (11, envmon.state) not in poller_c._vendor_psu_static, poller_c._vendor_psu_static)
+cols_c[envmon.name] = {"1": "PSU1"}
+walked_c.clear()
+poller_c._poll_vendor_sensors(11, dev_c, CONFIG, 1_700_000_060.0)
+check("cache: the name column is walked again on the next poll after an empty answer",
+      envmon.name in walked_c, walked_c)
+check("cache: a full answer is cached",
+      (11, envmon.state) in poller_c._vendor_psu_static)
+walked_c.clear()
+poller_c._poll_vendor_sensors(11, dev_c, CONFIG, 1_700_000_120.0)
+check("cache: inside the TTL the name column is not walked", envmon.name not in walked_c, walked_c)
+walked_c.clear()
+poller_c._poll_vendor_sensors(11, dev_c, CONFIG, 1_700_000_060.0 + 300.0)
+check("cache: after _SENSOR_REFRESH_S the name column is walked again",
+      envmon.name in walked_c, walked_c)
+poller_c._forget_vendor_psu_static(11)
+check("cache: _forget_vendor_psu_static drops the device's entries",
+      not any(k[0] == 11 for k in poller_c._vendor_psu_static))
+walked_c.clear()
+poller_c._poll_vendor_sensors(11, dev_c, CONFIG, 1_700_000_400.0)
+check("cache: a dropped entry is rebuilt on the next poll", envmon.name in walked_c, walked_c)
 
 print()
 if FAILS:

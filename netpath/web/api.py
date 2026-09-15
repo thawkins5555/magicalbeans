@@ -5499,7 +5499,8 @@ def get_nodes_device_hardware(service, params, body, device_id) -> dict:
 
 _SENSOR_FAMILY_KINDS = {"temp_sensor_c": "temperature", "temp_sensor_state": "temperature",
                         "psu_state": "psu"}
-_PSU_STATE_WORDS = {0: "ok", 1: "degraded", 2: "failed / no input"}
+_PSU_STATE_WORDS = {0: "ok", 1: "degraded", 2: "failed / no input",
+                    3: "not present (removed or no input)"}
 _TEMP_STATE_WORDS = {0: "normal", 1: "warning", 2: "critical", 3: "shutdown"}
 
 

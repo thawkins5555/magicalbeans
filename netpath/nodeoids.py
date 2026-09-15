@@ -1047,9 +1047,11 @@ class PsuTable:
     """One vendor's power-supply state table.
 
     Same shape as SensorTable's state half: `state_map` normalises to 0 ok,
-    1 warning, 2 failed/no input/shutdown, and a raw value missing from the
-    map (an empty bay, an admin-off slot) is skipped rather than written as
-    a fourth state. `class_col`/`class_values` gates a shared ENTITY-MIB-
+    1 warning, 2 failed/no input/shutdown. A raw value missing from the map
+    (an empty bay never reported before) is skipped; for a bay that HAS
+    reported before, the poller writes state 3 (not present -- removed, or
+    unpowered so it vanished) instead, so a supply that disappears still
+    alerts. `class_col`/`class_values` gates a shared ENTITY-MIB-
     style table down to just the power-supply rows (Cisco's FRU table
     carries every powered module; VMware's env table carries fans and CPUs
     beside PSUs). `skip_when_col`/`skip_when_values` reads a SECOND column
@@ -1234,9 +1236,11 @@ PSU_TABLES = {
             class_col=_ENT_PHYSICAL_CLASS, class_values=(_ENT_CLASS_POWER_SUPPLY,),
             # on(2) -> ok; onButFanFail(9)/onButInlinePowerFail(12) ->
             # warning; offEnvPower(5)/offEnvTemp(6)/offEnvFan(7)/failed(8)/
-            # offCooling(10) -> failed; offAdmin(3)/offDenied(4)/
-            # offEnvOther(1) skipped (administratively off, not a failure).
-            state_map={2: 0, 9: 1, 12: 1, 5: 2, 6: 2, 7: 2, 8: 2, 10: 2},
+            # offCooling(10)/offEnvOther(1) -> failed (no input); offAdmin(3)/
+            # offDenied(4) -> warning (deliberately off / power denied,
+            # redundancy lost, not a fault).
+            state_map={2: 0, 9: 1, 12: 1, 5: 2, 6: 2, 7: 2, 8: 2, 10: 2,
+                      1: 2, 3: 1, 4: 1},
         ),
     ),
     2636: PsuTable(   # Juniper JUNIPER-MIB jnxFruTable, PSU/power-entry rows

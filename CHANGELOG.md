@@ -4,7 +4,8 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
-- [5.26.0 — Duplicate devices only share a configured address, not a discovered one](#5260--duplicate-devices-only-share-a-configured-address-not-a-discovered-one)
+- [5.27.0 — Duplicate devices only share a configured address, not a discovered one](#5270--duplicate-devices-only-share-a-configured-address-not-a-discovered-one)
+- [5.26.0 — Power supplies: removed, unpowered, and reported the moment it happens](#5260--power-supplies-removed-unpowered-and-reported-the-moment-it-happens)
 - [5.25.0 — Copper transceivers get their own badge](#5250--copper-transceivers-get-their-own-badge)
 - [5.24.0 — SFP inventory, priority-port tint, and names in the History picker](#5240--sfp-inventory-priority-port-tint-and-names-in-the-history-picker)
 - [5.23.0 — Scheduled reports, a history explorer, priority ports, and NetFlow's missing blocks](#5230--scheduled-reports-a-history-explorer-priority-ports-and-netflows-missing-blocks)
@@ -160,7 +161,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
-### 5.26.0 — Duplicate devices only share a configured address, not a discovered one
+### 5.27.0 — Duplicate devices only share a configured address, not a discovered one
 
 One item from the operator: `PROMPT-LOG.md` carries the request in full;
 this entry is the shipped result.
@@ -240,6 +241,83 @@ section 7b covering the same split through the discovery promote path.
 and reworded reasons. `tests/ui/walk.mjs` adds two checks on the Nodes
 walk covering the Duplicates dialog hint and the Addresses subtab hint.
 
+### 5.26.0 — Power supplies: removed, unpowered, and reported the moment it happens
+
+Pulling the AC cord from one supply on a Cisco switch showed "shutdown"
+on the live HARDWARE SENSORS tile — but no alert ever fired. Two
+separate gaps caused that, and both are closed this release.
+
+**PSU state is now read on every poll, not once every five minutes.**
+`_poll_vendor_sensors` used to walk a vendor's power-supply table on
+the same 300-second cadence as temperature, so a supply could fail and
+sit unreported for up to five minutes. PSU state now walks every poll;
+a device already latched as not vendor-sensor-capable still waits out
+the existing hourly reprobe, same as before. Only the state column pays
+that cost each time — a table's name, class and skip-when columns
+barely change poll to poll, so those stay cached for 300 seconds
+(`_vendor_psu_static`) and are only re-walked once that cache goes
+stale.
+
+**A supply that disappears now opens an alert instead of clearing
+one.** Many Catalysts report an unplugged or unpowered supply as "not
+present" — the same code an empty, never-fitted bay uses. The poller
+used to treat that as a clean 0 (ok) once a bay had reported before,
+which cleared **Power supply failed** on the exact fault an operator
+would want to know about. A bay seen present on an earlier poll that
+now reads not-present writes `psu_state` 3 ("not present") instead,
+and **Power supply failed** (which opens at 2 or higher) treats it
+exactly like an outright failure. An empty bay that has never reported
+still gets no key and never alerts, and a hand-resolved alert on a
+supply that stays permanently removed stays closed for that breach run
+— the alert engine's existing resolve behaviour, unchanged. On Cisco's
+FRU table specifically, a supply reporting no input at all
+(`offEnvOther`) now maps to failed rather than being skipped as
+administratively off, and a supply that is deliberately powered down or
+denied by the power budget (`offAdmin`/`offDenied`) now maps to
+warning rather than being silently ignored. Device Details' per-sensor
+table shows the new state as "not present (removed or no input)".
+
+**Expect a one-time burst on the first poll after upgrading.** Metric
+keys are never deleted, so every bay that reported once and has since
+been permanently removed still carries its `psu_state` key; the first
+poll writes 3 to each of those and **Power supply failed** opens for
+all of them together. Resolve each by hand — it stays closed until that
+bay reports again. Two things to check on your own hardware afterwards:
+a chassis with a never-fitted bay should stay quiet (some IOS-XE
+platforms keep a powerSupply row for an empty slot reading
+`offEnvOther`, which this release counts as no input), and a supply
+whose cord is pulled should show as failed within one poll.
+
+**Cisco power-supply traps are named, rated, and now trigger an
+immediate re-read.** Six ENVMON/FRU OIDs that used to show up in the
+SNMP Trap Log as bare numbers now resolve to their real names and enum
+values: `ciscoEnvMonShutdownNotification`,
+`ciscoEnvMonRedundantSupplyNotification`,
+`ciscoEnvMonSuppStatusChangeNotif` and `cefcPowerStatusChange` default
+to Critical severity, `cefcFRURemoved` to Error, `cefcFRUInserted` to
+Notice — so the shipped "Critical SNMP trap received" rule fires on
+them with no admin-side rule to write by hand. Receiving any of those
+six exact OIDs from a managed device now also triggers an immediate
+poll of that device (at most once a minute per device, so a trap storm
+cannot keep it on back-to-back walks), so the stateful PSU alert opens
+— or clears, since a status-change trap also arrives on recovery —
+within one poll instead of trailing the five-minute cadence.
+
+Files: `netpath/nodeoids.py`, `netpath/nodepoll.py`,
+`netpath/snmptrapd.py`, `netpath/trapdecode.py`, `netpath/web/api.py`,
+`netpath/web/service.py`.
+
+Verification: `test_psu_state.py` extends for the new not-present (3)
+state, the Cisco FRU `offEnvOther`/`offAdmin` remap, and the per-poll
+PSU cadence against the cached static columns; `test_alert_sensor_rules.py`
+adds a state-3 case opening `psu_failed` the same as state 2;
+`test_sensor_tables.py`'s cadence check is split so it pins only the
+temperature table's five-minute gate, since PSU state no longer shares
+it; `test_report_routes.py` covers the new state-3 wording on
+`/api/nodes/devices/<id>/sensors`; new `test_trap_psu.py` covers the
+six trap names, their default severities, the two new enum decodes, and
+`TrapCollector`'s re-read hook firing on a managed source and staying
+silent otherwise.
 ### 5.25.0 — Copper transceivers get their own badge
 
 One item from the operator: `PROMPT-LOG.md` carries the request in full;

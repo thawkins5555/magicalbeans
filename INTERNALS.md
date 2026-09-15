@@ -3041,7 +3041,7 @@ upsert, so a source that knows only the address — a trap, a discovery
 fold — never erases what the poller's fuller walk learned) and
 `discovery_results.ip_addresses`/`folded_into_result_id`.
 
-**Which `source` is identity evidence, from 5.26.0.** `device_addresses`
+**Which `source` is identity evidence, from 5.27.0.** `device_addresses`
 is written from four places, and only one of them proves an address is
 actually bound to one of the device's own interfaces:
 
@@ -3074,7 +3074,7 @@ gains a `complete` keyword, defaulting `False`; only `_refresh_addresses`
 — the full `ipAddrTable` walk — passes `complete=True`, and only then are
 rows this walk did not see marked `present=0`. A trap or a discovery fold
 writes a partial set and must never mark the rest of a device's addresses
-absent, so it always calls with the default — still true from 5.26.0, and
+absent, so it always calls with the default — still true from 5.27.0, and
 now the reason `_record_promoted_addresses` (below) records the sweep's
 own walked addresses under `CONFIGURED_SOURCE`: that half is the same
 table `_refresh_addresses` writes, so the next complete walk governs it
@@ -3100,7 +3100,7 @@ stale claim about what it covers is corrected to match.
 
 - **high** — one of the addresses this box was reached on is already
   configured on a device (`device_id_for_address(address, configured=True)`,
-  from 5.26.0 — the device's own `ipAddrTable`, not merely another
+  from 5.27.0 — the device's own `ipAddrTable`, not merely another
   result's probe address). Nothing else honestly explains that, so
   `promote()` records the addresses on the existing device and marks the
   result promoted to it instead of adding a row beside it.
@@ -3116,7 +3116,7 @@ skips the fold for the operator who has looked at the pair and says they
 really are two boxes. The approval dialog never passes `force` — folding
 is the whole point of the review it presents; "Add anyway" is offered by
 **Add device** alone, where the operator typed the address themselves.
-`_record_promoted_addresses`, added in 5.26.0, splits what a promoted
+`_record_promoted_addresses`, added in 5.27.0, splits what a promoted
 result writes to `device_addresses` the same way `_refresh_addresses`
 would rather than recording everything as `discovery`: `_walked_addresses`
 (the sweep's own `ipAdEntAddr` read of the box, as distinct from
@@ -3132,7 +3132,7 @@ correctly instead of the old single undifferentiated batch.
 `payload`; `server.py`'s arm for it sits **before** the `ValueError` arm
 and answers 409 with that payload merged into the body. `POST
 /api/nodes/devices` raises it when the address is another device's
-**configured** alias — from 5.26.0, `_duplicate_conflict` calls
+**configured** alias — from 5.27.0, `_duplicate_conflict` calls
 `device_id_for_address(ip, configured=True)`, so only an address that
 device's own `ipAddrTable` reports triggers it, not one only a discovery
 probe or a trap saw for that device — naming the device, so the browser
@@ -3150,13 +3150,13 @@ runs three self-joins and merges them per pair:
 
 | Source | Confidence |
 |---|---|
-| An address configured on both devices (alias vs primary, alias vs alias — from 5.26.0, `source = CONFIGURED_SOURCE AND present = 1` on both sides) | high |
+| An address configured on both devices (alias vs primary, alias vs alias — from 5.27.0, `source = CONFIGURED_SOURCE AND present = 1` on both sides) | high |
 | A shared interface MAC | high with two or more, or with a matching sysName; medium alone |
 | sysName plus sysObjectID | medium |
 | sysName alone | low |
 
 The reason text for the address row reads "both have `<ip>` configured",
-in place of the pre-5.26.0 "both answer on `<ip>`" — a device can now
+in place of the pre-5.27.0 "both answer on `<ip>`" — a device can now
 appear here without ever having answered on that address itself, since
 `ipAddrTable` reports what an interface is configured with regardless of
 whether that address has replied to anything. The discovery hint's
@@ -5252,18 +5252,62 @@ on a common 0/1/2/3 (normal/warning/critical/shutdown) scale instead —
 `temp_sensor_state_warning` (>= 1) and `temp_sensor_state_critical`
 (>= 2) read it directly, zero hysteresis, the same shape the UPS enum
 rules already use. `psu_state.<idx>` is the same idea for power
-supplies: 0 ok, 1 warning (degraded, fan fault), 2 failed/no input/
-shutdown, written by `_poll_vendor_sensors`/the Part D poller from
-whichever object `nodeoids.PSU_TABLES[arc]` names for that device's
-enterprise. A bay that has never reported writes nothing — so an empty
-bay never gets a `psu_state` key to alert on at all — and a bay that
-*was* present on a previous poll and now reads not-present writes 0 back
-onto its existing key rather than leaving it at its last (possibly
-failed) value: nothing today deletes a per-index metric key once
-written, so an alert on a pulled supply is cleared by that explicit
-0-write through the normal threshold-clear path, not by the key going
-stale (`threshold_stale_s` only resets a streak, it does not clear an
-open alert).
+supplies, on a 0/1/2/3 scale — 0 ok, 1 warning (degraded, fan fault,
+or deliberately off), 2 failed/no input/shutdown, 3 not present —
+written by `_poll_vendor_sensors`/the Part D poller from whichever
+object `nodeoids.PSU_TABLES[arc]` names for that device's enterprise.
+
+**Cadence, from 5.26.0: PSU state is decoupled from the temperature
+table's 300 s gate.** Before 5.26.0 the whole vendor-sensor walk,
+temperature and PSU together, shared one `_vendor_sensor_read` stamp
+and `_SENSOR_REFRESH_S`/`_SENSOR_REPROBE_S` cadence — a supply could
+fail and sit unreported for up to five minutes. `_poll_vendor_sensors`
+now computes `due_psu = capable != 0 or due_sensors` alongside the
+existing `due_sensors` gate: unless a device is latched
+`vendor_sensor_capable == 0` (not vendor-sensor-capable at all, which
+still waits the hourly `_SENSOR_REPROBE_S` reprobe), PSU state is read
+on every poll regardless of whether temperature's own 300 s window is
+due. Only `table.state` pays that cost each call — `_vendor_psu_rows`
+caches a table's `class_col`/`skip_when_col`/`name` columns (which
+change only when a supply is physically added or removed) in
+`_vendor_psu_static`, keyed `(device_id, table.state)`, refreshed on
+the same `_SENSOR_REFRESH_S` cadence temperature keeps. An answer is
+cached only when every static column the table defines came back
+non-empty: a timed-out class or name walk would otherwise blind the
+FRU class filter for five minutes, so it is re-walked next poll
+instead. A retry, a
+device delete, or a device poll-now call clears a device's entries via
+`_forget_vendor_psu_static` alongside the other per-device sensor
+caches.
+
+A bay that has never reported writes nothing — so an empty bay never
+gets a `psu_state` key to alert on at all. A bay that *was* present on
+a previous poll and now reads not-present writes `_PSU_STATE_ABSENT`
+(3.0) onto its existing key. Before 5.26.0 that write was an explicit 0
+(ok), which cleared `psu_failed` on the exact fault — a pulled or
+unpowered supply — the rule exists to catch, because many Catalysts
+report an unplugged supply the same not-present/administratively-off
+shape an empty bay uses; `psu_failed`'s threshold (>= 2.0) now treats
+state 3 the same as an outright failure, so the alert opens instead.
+Nothing today deletes a per-index metric key once written, so that
+explicit 3-write reaches the alert through the normal threshold-breach
+path, not by the key going stale (`threshold_stale_s` only resets a
+streak, it does not clear or open an alert on its own). On the Cisco
+FRU table (`PSU_TABLES`'s ENTITY-FRU-CONTROL-MIB entry), `offEnvOther`
+(no input at all) moved from `state_map`'s skip set into the failed(2)
+bucket, and `offAdmin`/`offDenied` (deliberately powered down, or
+denied by the power budget — not a hardware fault) moved from skip
+into warning(1), so neither reading is silently invisible anymore.
+
+**Trap-triggered re-read, from 5.26.0.** A managed device that sends
+one of the six Cisco power traps `trapdecode.py` now names (see the
+Decoding section below) gets `NodePoller.poll_now` called on it from
+`TrapCollector._power_trap_reread` in `snmptrapd.py`, at most once per
+`POWER_TRAP_REREAD_S` (60 s) per device, so `psu_state` —
+and `psu_warning`/`psu_failed` reading it — updates within one poll
+instead of trailing `_SENSOR_REFRESH_S` by up to five minutes. A
+status-change trap arrives on recovery too, so the same hook clears the
+alert about as fast as it opened it.
 
 `alertrules.SENSOR_FAMILIES = {"temp_sensor_c", "temp_sensor_state",
 "psu_state"}` tells the child-entity loop in `alertengine.py` to treat a
@@ -7506,6 +7550,21 @@ whenever admin-supplied rules are appended in `configure()`, so a specific
 rule always beats a vendor-wide one regardless of the order either list
 was written in.
 
+**Six Cisco power-supply OIDs, from 5.26.0** — three ENVMON notifications
+(`ciscoEnvMonShutdownNotification`, `ciscoEnvMonRedundantSupplyNotification`,
+`ciscoEnvMonSuppStatusChangeNotif`, under `1.3.6.1.4.1.9.9.13.3.0`) and
+three FRU-control ones (`cefcPowerStatusChange`, `cefcFRUInserted`,
+`cefcFRURemoved`, under `1.3.6.1.4.1.9.9.117.2.0`) — were added to
+`WELL_KNOWN`, alongside the two varbind OIDs a trap of that kind carries
+(`ciscoEnvMonSupplyState`, `cefcFRUPowerOperStatus`) and `ENUMS` entries
+so those varbinds render as words (`notPresent`, `shutdown`,
+`offEnvPower`, and the rest of each MIB's own enum) rather than bare
+integers. `DEFAULT_SEVERITY_RULES` rates the four status/shutdown
+notifications Critical(2), `cefcFRURemoved` Error(3) and
+`cefcFRUInserted` Notice(5), so the shipped "Critical SNMP trap
+received" rule fires on the four Critical ones without an admin having
+to write a rule by hand.
+
 The encoder half (`build_v1_trap`, `build_v2c_trap`,
 `build_inform_response`) is small and total, used by `post_snmp_test` and
 by the inform-acknowledgement path. `build_inform_response()` splices the
@@ -7531,6 +7590,25 @@ together without re-encoding. v3 informs are deliberately not
 acknowledged: doing so correctly means acting as the authoritative SNMP
 engine (answering discovery `Report`s, tracking `engineBoots`/
 `engineTime`), which is USM's other half and belongs with a future poller.
+
+**Power-trap re-read, from 5.26.0.** `TrapCollector.__init__` takes an
+optional `poll_now` callable; `web/service.py` wires it to
+`self.node_poller.poll_now`, via a lambda so `Service.__init__`'s
+construction order (the collector is built before `NodePoller`) does
+not matter. `_power_trap_reread`, called from `_handle_datagram` right after
+`_learn_agent_address`, checks the decoded trap's OID against
+`POWER_TRAP_OIDS` (exactly the six Cisco ENVMON/FRU power traps
+`trapdecode.WELL_KNOWN` now names — a fan or temperature notification
+on the same arc does not qualify), resolves the sending source to a
+device with `nodes_db.device_id_for_address`, and calls
+`poll_now(device_id)` unless one fired for that device within
+`POWER_TRAP_REREAD_S` — `poll_now` is the operator's retry-from-nothing
+button (it drops every sensor cache and the SNMPv3 engine), so a trap
+storm must not hold a device on back-to-back full walks —
+best-effort, like `_learn_agent_address` beside it: an unresolved
+source, a missing `nodes_db`/`poll_now`, or an exception from the call
+itself is caught and logged, never allowed to cost the trap its normal
+decode/store/queue path.
 
 ### Storage (`snmptrapdb.py`)
 

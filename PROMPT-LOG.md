@@ -5,7 +5,7 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
-## 5.26.0 — Duplicate devices: configured addresses only, not discovery IPs
+## 5.27.0 — Duplicate devices: configured addresses only, not discovery IPs
 
 **Operator prompt:**
 "ONLY IP's that are actually configured on a device's physical
@@ -44,7 +44,69 @@ isn't a silent change. Added `tests/test_duplicate_evidence.py` and a
 new section in the existing device-identity tests covering the
 configured-vs-discovered split.
 
-**Outcome.** Shipped as 5.26.0. Full suite 167/171 with only the four known environmental failures (no passphrase, no traceroute, socket family, prune-lock timing), Nodes browser walk 80/80 with zero console, page or HTTP errors as admin and viewer. One existing test (test_state_cache) seeded its alias with a made-up source and needed to seed a configured one. Javariius pass 1 "not ready" on one false INTERNALS sentence about the 409 wording plus the empty outcome line, no code faults; four nits taken (comment trims, bulk-import hint wording, contract description, an upgrade note in CHANGELOG). Pass 2 reported in chat. Held on the session branch until the operator clears the push to main.
+**Outcome.** Shipped as 5.27.0: main took the other session's power-supply work as 5.26.0 while this was held, so it was merged in and this release renumbered. Full suite 167/171 with only the four known environmental failures (no passphrase, no traceroute, socket family, prune-lock timing), Nodes browser walk 80/80 with zero console, page or HTTP errors as admin and viewer. One existing test (test_state_cache) seeded its alias with a made-up source and needed to seed a configured one. Javariius pass 1 "not ready" on one false INTERNALS sentence about the 409 wording plus the empty outcome line, no code faults; four nits taken (comment trims, bulk-import hint wording, contract description, an upgrade note in CHANGELOG). Pass 2 reported in chat. Held on the session branch until the operator clears the push to main.
+
+## 5.26.0 — Power supplies: removed, unpowered, and reported the moment it happens
+
+**"Where do Device Details → Addresses populate from, Primary vs
+Discovery?"**
+→ Answered from a Dora exploration trace of the Addresses list's own
+code path; no code touched.
+
+**"Why are hardware sensors listed twice in the device dialog?"**
+→ Answered, no code change: the HARDWARE SENSORS tile matches on a
+sensor's `temp_`/`psu_` metric prefix, and the live envmon walk it
+draws from overlaps the same sensors the per-sensor table below it
+already lists — the two are reading the same data through two
+different paths, not a duplicate poll.
+
+**"Pulled the AC cord on one power supply on a Cisco switch. The live
+HARDWARE SENSORS tile showed 'shutdown' — but no alert fired.
+Need this to alert both when a supply loses input and when it's pulled
+out entirely."**
+
+**Planning answers, four decisions:** alert on a supply that
+disappears from the table (previously it cleared any open alert,
+because many Catalysts report a pulled supply as "not present," the
+same code an empty bay uses); read PSU state on every poll instead of
+the existing five-minute sensor cadence, so a failure is caught within
+one poll; decode the Cisco ENVMON/FRU power traps by name and give
+them a sane default severity, so they show up as more than bare OIDs
+and the existing "Critical SNMP trap received" rule can act on them;
+and have a power trap from a managed device trigger an immediate
+re-read of that device, so the alert opens (or clears) within one poll
+of the trap arriving rather than trailing the cadence. Version for
+this work: 5.26.0.
+
+**Outcome.** Thing1 built the poller and MIB side — the per-poll PSU
+cadence with the cached static table columns
+(`_vendor_psu_static`/`_vendor_psu_rows`), the not-present state (3)
+that opens `psu_failed` instead of clearing it, and the Cisco FRU
+`offEnvOther`/`offAdmin` remap. Thing2 built the trap side —
+`trapdecode.py`'s six new OID names, two enum decodes and six default
+severities, and `snmptrapd.py`/`web/service.py`'s `poll_now` re-read
+hook. Testing: the full suite passed 159 of 163 with only the four
+environmental failures this container always shows (SMS passphrase,
+traceroute, the prune-lock timing check, IPv6 in the web-gates test),
+and the browser walk passed 77 of 77 with no console, page or HTTP
+errors as admin or viewer. Main had moved on to 5.25.0 (copper SFP
+badge) while this was built, so the branch was rebased onto it and the
+release renumbered 5.26.0. Javariius reviewed once and returned "not
+ready" with one blocker (a placeholder left in this file) and six
+should-fix items, all taken before push: the trap re-read matched two
+whole Cisco notification arcs instead of the six power OIDs and had no
+throttle (now exact-match, debounced to once a minute per device); a
+timed-out static-column walk was cached empty for five minutes (now
+only a complete answer is cached, with tests for the empty, TTL and
+eviction cases); the one-time upgrade alert burst on long-removed bays
+was undocumented (now in the changelog with the hand-resolve remedy and
+a never-fitted-bay hardware check); comment density over the 20% rule
+(trimmed); the stale `psu_state` scale comment in `alertsdb.py`; and a
+full-suite run on the rebased head. Nits noted and left: the alert text
+reads the raw `3.0` (only the sensors table words it), one extra
+metrics SELECT per poll per PSU device.
+→ Stephen_King. `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md` written
+for 5.26.0 against the actual diff (`origin/main..HEAD`); no code touched.
 
 ## 5.25.0 — SFP copper/laser identification
 

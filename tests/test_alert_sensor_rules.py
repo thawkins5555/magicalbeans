@@ -154,6 +154,14 @@ engine._tick()
 check("1 opens psu_warning only",
       len(open_rows(alerts, "psu_warning")) == 1 and open_rows(alerts, "psu_failed") == [])
 
+sample(nodes, did, "psu_state.2", "Power supply 2", "", base + 2.5, 3.0)
+engine._tick()
+check("3 (not present) opens psu_failed, same as an outright failure",
+      len(open_rows(alerts, "psu_failed")) == 1)
+sample(nodes, did, "psu_state.2", "Power supply 2", "", base + 2.7, 0.0)
+engine._tick()
+check("...and 0 clears it", open_rows(alerts, "psu_failed") == [])
+
 sample(nodes, did, "temp_sensor_state.1", "Board temperature", "", base + 3, 1.0)
 engine._tick()
 check("a vendor status enum of 1 opens the state warning",

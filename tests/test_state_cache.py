@@ -402,7 +402,7 @@ try:
           sorted(index_b["by_identity"])[:3])
 
     # Same argument for a configured alias (the only source by_address
-    # reads, from 5.26.0).
+    # reads, from 5.27.0).
     service.nodes_db.record_device_addresses(canary_id, ["10.77.77.79"], "ipAddrTable")
     index_c = api._device_index(service)
     check("a configured alias reaches the next index too",
