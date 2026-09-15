@@ -175,6 +175,17 @@ try:
 except ValueError:
     check("top_metrics with no metric_key configured is refused", True)
 
+# A row that predates api.py's write-time cap (or was written some other
+# way) must still be refused at render time, not run the whole-fleet query.
+wide_topn_row = {"kind": "top_metrics", "name": "Too wide",
+                 "params_json": json.dumps({"metric_key": "if_in_util_pct.1",
+                                            "period_days": 30})}
+try:
+    reportsched.render(service, wide_topn_row, now)
+    check("top_metrics past the whole-fleet cost ceiling is refused at render time", False)
+except ValueError:
+    check("top_metrics past the whole-fleet cost ceiling is refused at render time", True)
+
 fw_row = {"kind": "firmware", "name": "Firmware inventory", "params_json": "{}"}
 subject, body, csv_text, filename = reportsched.render(service, fw_row, now)
 check("firmware: subject carries the schedule's own name",
@@ -264,6 +275,33 @@ service.alerts_db.save_settings({
     "email_enabled": True, "smtp_host": "relay.invalid",
 })
 
+# A single failing schedule must not abort the rest of the tick: a row with
+# a cadence next_due cannot compute (a hand-corrupted or pre-migration row)
+# due in the same tick as a healthy one.
+bad_cadence_id = nodes_db.add_report_schedule(
+    "Corrupt cadence", "firmware", "{}", "bogus-cadence", 3, 0, None, None,
+    json.dumps(["noc@example.invalid"]), enabled=True, next_run_ts=time.time() - 1)
+healthy_id = nodes_db.add_report_schedule(
+    "Healthy sibling", "firmware", "{}", "daily", 3, 0, None, None,
+    json.dumps(["noc@example.invalid"]), enabled=True, next_run_ts=time.time() - 1)
+fake2 = FakeMail()
+alertmail.send = fake2
+try:
+    ran = reportsched.run_due(service, time.time())
+finally:
+    alertmail.send = real_send
+check("run_due processes every schedule due in the tick, not just the first",
+      ran == 2, ran)
+bad_row = nodes_db.report_schedule(bad_cadence_id)
+check("the bad-cadence row records its own failure",
+      bad_row["last_status"].startswith("failed:"), bad_row["last_status"])
+check("...and is parked roughly a day out, not retried every minute",
+      bad_row["next_run_ts"] > time.time() + 80000, bad_row["next_run_ts"])
+healthy_row = nodes_db.report_schedule(healthy_id)
+check("...while its healthy sibling in the same tick still sent",
+      healthy_row["last_status"].startswith("sent to") and len(fake2.calls) == 1,
+      (healthy_row["last_status"], fake2.calls))
+
 
 # ==================================================== 4. routes + gating
 
@@ -349,6 +387,9 @@ bad_cases = [
     ({**valid_body, "recipients": [f"a{i}@example.invalid" for i in range(21)]},
      "21 recipients, one over the cap"),
     ({**valid_body, "kind": "top_metrics", "params": {}}, "top_metrics with no metric_key"),
+    ({**valid_body, "kind": "top_metrics",
+     "params": {"metric_key": "cpu_pct", "period_days": 8}},
+     "top_metrics period_days over the whole-fleet cost ceiling (7 days)"),
 ]
 for body, label in bad_cases:
     status, payload = call("POST", "/api/nodes/reports/schedules", body, token=admin)

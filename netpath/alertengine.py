@@ -967,11 +967,7 @@ class AlertEngine(Worker):
     def _drain_interface_events(self, settings) -> list[Occurrence]:
         occurrences = []
         touched_interfaces: set[int] = set()
-        # Read once per drain, not once per row: which ports are flagged
-        # Priority (nodesdb.interface_flags), so alertrules.PRIORITY_ONLY_
-        # RULES can gate priority_interface_down without a query per event.
-        # getattr-guarded for a fake nodes_db in a test that predates the
-        # method.
+        # Flagged ports, read once per drain rather than once per row; getattr-guarded for a fake nodes_db without the method.
         priority_get = getattr(self.nodes_db, "priority_interfaces", None)
         priority = priority_get() if priority_get else set()
         for row in self._drain_from("interface_events",
@@ -998,11 +994,7 @@ class AlertEngine(Worker):
                 cleared_rule = self._rule_by_key(
                     CLEARS.get(("interface_event", "link_up"), ""))
                 if cleared_rule:
-                    # The paired rule and every rule CLEARS_COMPANIONS says
-                    # shares its dedup shape (priority_interface_down rides
-                    # interface_down's) -- a link_up closes both rather than
-                    # leaving the priority alert open once its plain twin
-                    # clears.
+                    # Closes the paired rule and its CLEARS_COMPANIONS too, so priority_interface_down clears alongside interface_down.
                     for rule_key in (cleared_rule["key"],
                                      *CLEARS_COMPANIONS.get(cleared_rule["key"], ())):
                         companion_rule = (cleared_rule if rule_key == cleared_rule["key"]
@@ -2862,12 +2854,7 @@ class AlertEngine(Worker):
     # -------------------------------------------------------------- notify
 
     def smtp_credentials(self, settings=None):
-        """(settings, password) for a real SMTP send, or None when email is
-        not enabled/configured. Factored out of _notify below so
-        reportsched.run_due can reuse the exact same "is email usable at
-        all" check and the same encrypted-password decrypt, rather than a
-        second copy that could drift from it. `settings` defaults to a
-        fresh alerts settings read."""
+        """(settings, password) for a real SMTP send, or None when email is not enabled/configured."""
         if settings is None:
             settings = self.db.settings()
         if not settings.get("email_enabled") or not settings.get("smtp_host"):
@@ -2990,9 +2977,7 @@ class AlertEngine(Worker):
         if not to_addrs:
             return
 
-        # Already known enabled/configured (the bail-out above), so this
-        # only ever extracts the decrypted password -- same check,
-        # same decrypt, as smtp_credentials's own doc says.
+        # Already known enabled/configured (the bail-out above); just extracts the decrypted password.
         password = (self.smtp_credentials(settings) or (settings, None))[1]
 
         job = alertmail.MailJob(

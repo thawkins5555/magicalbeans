@@ -342,8 +342,7 @@ ROUTES = [
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces$", api.get_nodes_device_interfaces, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces/export\.csv$",
      api.get_nodes_device_interfaces_export, ("nodes", R)),
-    # Priority ports: flags one interface so priority_interface_down can
-    # fire on it -- see nodesdb.interface_flags.
+    # Priority ports: flags one interface so priority_interface_down can fire on it.
     ("PUT", r"^/api/nodes/devices/(\d+)/interfaces/(\d+)/priority$",
      api.put_nodes_interface_priority, ("nodes", W)),
     # The device detail pane's Neighbours section:
@@ -370,8 +369,7 @@ ROUTES = [
     # per interface. Matched before nothing here could confuse it with the
     # per-device route above: "series/batch" never matches "(\d+)".
     ("GET", r"^/api/nodes/series/batch$", api.get_nodes_series_batch, ("nodes", R)),
-    # E2: the History query builder's Export CSV, over the identical q=
-    # string the chart/table above already ran.
+    # E2: the History query builder's Export CSV, over the same q= the chart/table above already ran.
     ("GET", r"^/api/nodes/series/export\.csv$", api.get_nodes_series_export, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/events$", api.get_nodes_device_events, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/timeline$", api.get_nodes_device_timeline, ("nodes", R)),
@@ -387,8 +385,7 @@ ROUTES = [
      api.get_nodes_reports_firmware, ("nodes", R)),
     ("GET", r"^/api/nodes/reports/firmware/export\.csv$",
      api.get_nodes_reports_firmware_export, ("nodes", R)),
-    # Scheduled emailed reports (netpath/reportsched.py): a saved
-    # name/kind/cadence definition, run automatically or on demand.
+    # Scheduled emailed reports (netpath/reportsched.py): run automatically or on demand.
     ("GET", r"^/api/nodes/reports/schedules$", api.get_nodes_report_schedules, ("nodes", R)),
     ("POST", r"^/api/nodes/reports/schedules$", api.post_nodes_report_schedule, ("nodes", W)),
     ("PUT", r"^/api/nodes/reports/schedules/(\d+)$",

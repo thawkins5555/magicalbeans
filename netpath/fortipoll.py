@@ -280,10 +280,7 @@ class WirelessPoller(Worker):
         width_by_profile = _channel_widths(widths)
         now = time.time()
         seen: set[tuple[str, str]] = set()
-        # G, 5.23.0: history samples for this sweep, written in one
-        # executemany each (record_samples below) rather than one INSERT per
-        # AP/radio -- _append_history only adds a row when this AP's last
-        # sample has aged past history_sample_s.
+        # This sweep's history samples, one executemany each at the end (record_samples).
         self._history_sample_s = float(self.db.settings().get("history_sample_s", 300))
         ap_sample_rows: list[tuple] = []
         radio_sample_rows: list[tuple] = []
@@ -362,12 +359,8 @@ class WirelessPoller(Worker):
 
     def _append_history(self, ap_id, status, station_count, radios, now,
                         ap_sample_rows: list[tuple], radio_sample_rows: list[tuple]) -> None:
-        """Appends one ap_samples row and one radio_samples row per radio
-        for this AP, unless its last sample is younger than
-        history_sample_s (the 5-min-default throttle a 60s poll_interval_s
-        would otherwise overrun by 5x). One query per AP, not per poll --
-        cheap against the (ap_id, ts) index and simpler than tracking a
-        second in-memory clock the poller would lose on every restart."""
+        """Appends one ap_samples row and one radio_samples row per radio, unless
+        this AP's last sample is younger than history_sample_s."""
         last = self.db.last_sample_ts(ap_id)
         if last is not None and (now - last) < self._history_sample_s:
             return

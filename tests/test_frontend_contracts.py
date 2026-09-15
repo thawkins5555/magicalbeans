@@ -1574,7 +1574,7 @@ ALLOWED_BARE_FIELDS = {
                  "ev.walk.objects", "f.id", "g.id", "ids.length", "names.length", "owned.length",
                  "p.row", "r.caveats.length", "r.matched_device_id", "r.override_count",
                  "row.override_count"},
-    "wireless.js": {"c.id", "s.poll_interval_s"},
+    "wireless.js": {"c.id", "s.poll_interval_s", "s.history_days", "s.history_sample_s"},
 }
 # mapper_upstream.js carries the upstream-suggestions dialog cut out of mapper.js.
 ALLOWED_BARE_FIELDS["mapper_upstream.js"] = ALLOWED_BARE_FIELDS["mapper.js"]
@@ -3542,6 +3542,20 @@ check('self._trim_db("max_wireless_db_mb", self.wireless_db, "Wireless database"
       in _SERVICE76,
       "_run_maintenance_body trims wireless.db to its cap, beside its own "
       "prune_ap_events/prune_history calls")
+
+# --- 77. Review: wireless history_days/history_sample_s are range-checked --
+WIRELESS77 = read("wireless.js")
+for _id in ("wl-hist-days", "wl-hist-sample-s"):
+    check('id="%s"' % _id in WIRELESS77,
+          "the Wireless settings dialog carries #%s" % _id)
+check("history_days: Number(m.querySelector('#wl-hist-days').value)," in WIRELESS77
+      and "history_sample_s: Number(m.querySelector('#wl-hist-sample-s').value)," in WIRELESS77,
+      "Save posts both fields to the wireless settings scope")
+check('"wireless": {"history_days": (1, 3650), "history_sample_s": (60, 86400)},' in
+      open(os.path.join(REPO_ROOT, "netpath", "web", "api.py"), encoding="utf-8").read(),
+      "api.py's _SCOPE_SETTINGS_RANGES carries the wireless override, so "
+      "POST /api/settings refuses history_days <= 0 and history_sample_s "
+      "below 60 the same way every other range-checked setting is refused")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

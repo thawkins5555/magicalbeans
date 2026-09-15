@@ -321,11 +321,11 @@ def send(smtp_settings: dict, password: str | None, to_addrs: list[str],
     the caller decides what to do with that; this never swallows an error.
 
     `attachments`, when given, is (filename, data, maintype, subtype) tuples
-    added via EmailMessage.add_attachment — reportsched's CSV, one per
-    scheduled report. With attachments the body always goes through
-    set_content() first (the plain-text branch below), whatever `is_html`
-    says: an HTML alternative complicates add_attachment's placement for no
-    reader this app has, and no built-in alert ever carries one."""
+    added via EmailMessage.add_attachment, after the body -- reportsched's
+    CSV, one per scheduled report. `is_html` still applies with attachments:
+    add_attachment promotes an existing multipart/alternative (set_content
+    + add_alternative) to multipart/mixed, so an HTML body keeps its plain-
+    text fallback rather than being sent as literal tags."""
     host = str(smtp_settings.get("smtp_host", "")).strip()
     if not host:
         raise ValueError("No SMTP host configured")
@@ -348,9 +348,7 @@ def send(smtp_settings: dict, password: str | None, to_addrs: list[str],
     message["Subject"] = subject
     message["From"] = formataddr((from_name, from_addr)) if from_name else from_addr
     message["To"] = ", ".join(to_addrs)
-    if attachments:
-        message.set_content(body)
-    elif is_html:
+    if is_html:
         message.set_content("This message requires an HTML-capable mail reader.")
         message.add_alternative(body, subtype="html")
     else:

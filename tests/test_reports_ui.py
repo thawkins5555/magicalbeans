@@ -55,9 +55,9 @@ check('data-subtab="reports"' in NODES_SECTION and 'id="nodes-sub-reports"' in N
 TOP_NAV = NODES_SECTION[NODES_SECTION.index('<nav class="subtabs">'):
                          NODES_SECTION.index('</nav>')]
 check(re.findall(r'data-subtab="(\w+)"', TOP_NAV)
-      == ["devices", "discovery", "profiles", "reports"],
+      == ["devices", "discovery", "profiles", "reports", "history"],
       "REPORTS is a fourth top-level Nodes subtab, after Profiles & MIBs, "
-      "not a nested view mistaken for one")
+      "followed by HISTORY, not a nested view mistaken for one")
 
 # ---------------------------------------------------------------------------
 # 3. Inside REPORTS, the two reports are nested subtabs following the same
@@ -65,7 +65,8 @@ check(re.findall(r'data-subtab="(\w+)"', TOP_NAV)
 #    <nav class="subtabs"> whose parent is NOT the page itself, so app.js's
 #    generic top-level routing correctly leaves it alone and nodes.js wires
 #    it by hand — see selectReportsSub).
-REPORTS_SECTION = NODES_SECTION[NODES_SECTION.index('id="nodes-sub-reports"'):]
+REPORTS_SECTION = NODES_SECTION[NODES_SECTION.index('id="nodes-sub-reports"'):
+                                 NODES_SECTION.index('id="nodes-sub-history"')]
 check('data-subtab="availability"' in REPORTS_SECTION
       and 'id="nd-rep-sub-availability"' in REPORTS_SECTION,
       "the Availability report subtab and its subpage exist")
@@ -85,9 +86,18 @@ check("recallSub('nodes.reports'" in NODES and "rememberSub('nodes.reports'" in 
 # 4. Both reports are read-only end to end — a "nodes": read (viewer)
 #    account can use this screen in full, which is the point of a reporting
 #    screen. Matched on the REPORTS subpage's own markup slice, the same
-#    way test_frontend_contracts.py checks the Audit subpage.
-check("data-requires-write" not in REPORTS_SECTION,
-      "no control inside the REPORTS subtab writes anything")
+#    way test_frontend_contracts.py checks the Audit subpage. The SCHEDULED
+#    nested subtab is excluded from this: scheduling a report needs nodes
+#    write, and is checked separately below.
+SCHEDULED_START = REPORTS_SECTION.index('id="nd-rep-sub-scheduled"')
+REPORTS_READONLY_SECTION = REPORTS_SECTION[:SCHEDULED_START]
+SCHEDULED_SECTION = REPORTS_SECTION[SCHEDULED_START:]
+check("data-requires-write" not in REPORTS_READONLY_SECTION,
+      "no control inside the REPORTS subtab writes anything, "
+      "except the SCHEDULED nested subtab")
+check('data-requires-write="nodes"' in SCHEDULED_SECTION,
+      "the SCHEDULED nested subtab's write controls carry "
+      "data-requires-write=\"nodes\"")
 
 # ---------------------------------------------------------------------------
 # 5. The filter bar, tables and actions an operator needs exist: a period

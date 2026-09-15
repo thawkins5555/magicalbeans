@@ -270,7 +270,10 @@
     const apId = view.historyApId;
     if (apId == null) return;
     const { t0, t1 } = historyWindow();
-    const data = await App.get(`/api/wireless/aps/${apId}/history`, { t0, t1 });
+    // Same span-to-bucket floor nodes.js's own device-dialog chart uses:
+    // unbucketed would be ~8,640 raw points per series over a 30-day range.
+    const bucketS = Math.max(15, (t1 - t0) / 240);
+    const data = await App.get(`/api/wireless/aps/${apId}/history`, { t0, t1, bucket_s: bucketS });
     if (view.historyApId !== apId) return;   // selection moved on while this was in flight
     drawHistoryCharts(data);
   }
@@ -526,6 +529,17 @@
           radio reports above 30 dBm. The raw number is always shown in the AP detail
           pane either way.</p>
       </fieldset>
+      <fieldset><legend>HISTORY</legend>
+        <label>Keep AP/radio history for <input id="wl-hist-days" type="number"
+          min="1" max="3650" value="${s.history_days}"></label> days
+        <label>Minimum gap between samples <input id="wl-hist-sample-s" type="number"
+          min="60" max="86400" value="${s.history_sample_s}"></label> seconds
+        <p class="hint">Backs the AP detail pane's clients/tx-power charts (a row per
+          AP and per radio, no more often than the gap here) — a poll_interval_s well
+          under it is normal and simply skips a write until the last sample has aged
+          past it. Both floors keep a busy fleet from writing a row on every poll or
+          erasing its own history on the next maintenance sweep.</p>
+      </fieldset>
       ${App.columnPickerFieldset('ACCESS POINT COLUMNS', 'wireless', ALL_COLUMNS,
                                  s.table_columns)}`, [
       { label: 'Cancel', onClick: App.closeModal },
@@ -536,6 +550,8 @@
           poll_interval_s: Number(m.querySelector('#wl-interval').value),
           v3_verify_replies: m.querySelector('#wl-v3verify').checked,
           radio_power_unit: m.querySelector('#wl-power-unit').value,
+          history_days: Number(m.querySelector('#wl-hist-days').value),
+          history_sample_s: Number(m.querySelector('#wl-hist-sample-s').value),
           table_columns: App.readColumnPicker(
             m.querySelector('#cols-wireless'), ALL_COLUMNS),
         } });

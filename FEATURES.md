@@ -2080,7 +2080,7 @@ alerts and optionally emailing about them.
 
 ### Rules
 
-- **61 built-in rules ship, 60 of them enabled**: a device not responding, a
+- **62 built-in rules ship, 61 of them enabled**: a device not responding, a
   device recovering, a device rebooting, SNMP authentication failing, a
   device needing unsupported SNMPv3 privacy, a poll running longer than its
   own interval, a device whose vendor MIB is missing, an interface going

@@ -105,14 +105,11 @@ db.close()
 
 # ------------------------------------------- 3b. trim_to_size (size cap)
 #
-# max_wireless_db_mb (5.23.0): WirelessDatabase.trim_to_size does not go
-# through the base class's id-keyed TRIM_TABLE (ap_samples/radio_samples
-# carry no `id` column by design) -- it deletes oldest-by-ts directly from
-# radio_samples then ap_samples, in a loop, until the file is back under
-# cap or there is nothing left to remove. Same shape
-# test_netflow_prune.py's own size-cap test uses: several thousand rows so
-# the file size actually moves, not a handful that never leaves page
-# rounding.
+# max_wireless_db_mb (5.23.0): trim_to_size deletes oldest-by-a-shared-ts-
+# cutoff from both sample tables per loop, until the file is under cap.
+# Several thousand rows, same shape test_netflow_prune.py's own size-cap
+# test uses, so the file size actually moves rather than sitting on a
+# rounding boundary.
 
 db_trim = WirelessDatabase(os.path.join(TMPDIR, "wireless-trim.db"))
 trim_controller_id = db_trim.add_controller("C1", "192.0.2.9", snmp_version=1,
@@ -158,6 +155,10 @@ check("radio_samples lost rows too, oldest-first",
       radio_count_after["n"] < radio_count_before
       and (radio_count_after["oldest"] is None or radio_count_after["oldest"] > base_ts),
       (radio_count_before, radio_count_after["n"], radio_count_after["oldest"]))
+check("both tables advanced to the same ts floor (one shared cutoff, not a "
+      "fixed row count each -- radio_samples has 2x ap_samples' rows)",
+      ap_count_after["oldest"] == radio_count_after["oldest"],
+      (ap_count_after["oldest"], radio_count_after["oldest"]))
 # Nothing newer than the seeded window was ever touched: the most recent
 # sample (base_ts + (N_SAMPLES-1)*5) must still be there regardless of how
 # much got trimmed, or this would be deleting by something other than age.
@@ -348,6 +349,28 @@ try:
     status, payload = call("GET", f"/api/wireless/aps/{wap_id}/history/export.csv",
                            token=outsider)
     check("...and the CSV export too", status == 403, (status, payload))
+
+    # ------------------------------------ 5b. settings range validation
+    #
+    # history_days=-1 makes prune_history's cutoff (now - days*86400) land
+    # in the future, so every row reads as "older than the cutoff" on the
+    # next sweep; history_sample_s=0 defeats the poller's own throttle
+    # entirely, writing a row on every poll.
+    status, payload = call("POST", "/api/settings",
+                           {"scope": "wireless", "values": {"history_days": -1}},
+                           token=admin)
+    check("history_days = -1 is refused", status == 400, (status, payload))
+    status, payload = call("POST", "/api/settings",
+                           {"scope": "wireless", "values": {"history_sample_s": 0}},
+                           token=admin)
+    check("history_sample_s = 0 is refused", status == 400, (status, payload))
+    status, payload = call("POST", "/api/settings",
+                           {"scope": "wireless",
+                            "values": {"history_days": 10, "history_sample_s": 120}},
+                           token=admin)
+    check("a valid pair is accepted", status == 200
+          and payload["wireless_settings"]["history_days"] == 10
+          and payload["wireless_settings"]["history_sample_s"] == 120, (status, payload))
 finally:
     server.stop()
     service.shutdown()

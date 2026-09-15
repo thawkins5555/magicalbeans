@@ -3193,6 +3193,12 @@ class NodesDatabase(SqliteStore):
                 "SELECT * FROM interfaces WHERE device_id = ? ORDER BY if_index",
                 (device_id,)).fetchall()
 
+    def interface_exists(self, device_id: int, if_index: int) -> bool:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT 1 FROM interfaces WHERE device_id = ? AND if_index = ?",
+                (device_id, if_index)).fetchone() is not None
+
     # ------------------------------------------------ forwarding tables
 
     def replace_mac_entries(self, device_id: int, entries: list[dict],

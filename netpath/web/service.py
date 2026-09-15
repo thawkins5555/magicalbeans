@@ -519,9 +519,7 @@ class Service:
         # rebuilding the same bucket at once is how a dimension's rows came
         # to be paired with a span row built from a different set of flows.
         self._rollup_lock = threading.Lock()
-        # Throttle for the A5 "minute rollup is behind" SYSTEM log line —
-        # 0.0 so the first lagging pass after startup can always log.
-        self._flow_coverage_warned_ts = 0.0
+        self._flow_coverage_warned_ts = 0.0   # A5 log throttle; 0.0 lets the first lagging pass log
         self.started_at = time.time()
         # Bumped by every write to something /api/config carries. The
         # browser refetches /api/config only when this number moves.
@@ -1510,9 +1508,7 @@ class Service:
             except Exception:
                 import traceback
                 traceback.print_exc()
-            # F4: scheduled report sends, on every 60s wake independent of
-            # the 15 min maintenance gate above -- a schedule due at 09:00
-            # must not wait for the next maintenance pass.
+            # F4: scheduled report sends, independent of the 15 min maintenance gate above.
             try:
                 from .. import reportsched
                 reportsched.run_due(self, time.time())
@@ -1540,15 +1536,9 @@ class Service:
         self._flow_rollup_behind = behind
         return written
 
-    # Catch-up mode (A3): a busy store falling behind budget is worth extra
-    # passes right away rather than waiting out ROLLUP_INTERVAL_S each time,
-    # bounded so one wake never blocks the thread indefinitely.
-    _ROLLUP_CATCHUP_BUDGET_S = 30.0
+    _ROLLUP_CATCHUP_BUDGET_S = 30.0   # A3: bound on extra passes right away, rather than waiting out ROLLUP_INTERVAL_S
 
-    # A5: the minute watermark lagging sealed time past this is worth an
-    # operator's attention; logged at most once per interval of the same
-    # length, so a store stuck behind does not fill the event log.
-    _FLOW_COVERAGE_LAG_WARN_S = 900.0
+    _FLOW_COVERAGE_LAG_WARN_S = 900.0   # A5: SYSTEM log line past this lag, at most once per this interval
     _FLOW_COVERAGE_WARN_INTERVAL_S = 900.0
 
     def _check_flow_coverage_lag(self) -> None:

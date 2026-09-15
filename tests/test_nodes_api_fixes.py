@@ -19,7 +19,7 @@ import sys
 
 import _paths  # noqa: F401  (repo root + tests dir on sys.path)
 
-from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER
+from netpath.auth import DEFAULT_PASSWORD, DEFAULT_USER, hash_password
 from netpath.web import Service, WebServer
 
 TMPDIR = _paths.tmpdir("nodes_api_fixes_")
@@ -274,6 +274,25 @@ try:
         {"priority": True}, token=admin)
     check("an unknown device is a 404, like every other device sub-route",
           status == 404, (status, missing))
+
+    status, no_such_if = call(
+        "PUT", f"/api/nodes/devices/{ports}/interfaces/9999/priority",
+        {"priority": True}, token=admin)
+    check("an if_index not on that device is a 404, not a silent insert",
+          status == 404, (status, no_such_if))
+    check("...and nothing was stored for it",
+          9999 not in service.nodes_db.priority_if_indexes(ports),
+          service.nodes_db.priority_if_indexes(ports))
+
+    service.app_db.add_user("nodes-viewer", hash_password("NodesViewerPW2026"),
+                            must_change=False)
+    service.app_db.set_permissions("nodes-viewer", {"nodes": "read"})
+    nodes_viewer = login("nodes-viewer", "NodesViewerPW2026")
+    status, refused = call(
+        "PUT", f"/api/nodes/devices/{ports}/interfaces/7/priority",
+        {"priority": True}, token=nodes_viewer)
+    check("a nodes:read account is refused PUT .../priority (needs write)",
+          status == 403, (status, refused))
 
     # A device delete cascades interface_flags, like interface_thresholds --
     # nodesdb._PURGE_TABLES.

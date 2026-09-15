@@ -718,12 +718,7 @@ _BUILTIN_RULES = [
     ("interface_down", "Interface down", "interface_event", "link_down", 3, "event_notice", None, None, 1),
     ("interface_up", "Interface recovered", "interface_event", "link_up", 6, "device_up", None, None, 1),
     ("interface_flapping", "Interface flapping", "interface_event", "flapping", 3, "event_notice", None, None, 1),
-    # Same source_kind as interface_down ("link_down"), but restricted by
-    # alertrules.PRIORITY_ONLY_RULES to ports flagged Priority in the port
-    # dialog (nodesdb.interface_flags) — a dedicated, more severe rule
-    # rather than a threshold on the existing one, so the plain
-    # interface_down rule is untouched for everyone who does not flag ports.
-    ("priority_interface_down", "Priority interface down", "interface_event", "link_down", 2, "event_notice", None, None, 1),
+    ("priority_interface_down", "Priority interface down", "interface_event", "link_down", 2, "event_notice", None, None, 1),  # gated to flagged ports by alertrules.PRIORITY_ONLY_RULES
     ("cpu_high", "CPU utilization high", "threshold", "cpu_pct", 4, "threshold_breach", 90.0, 80.0, 2),
     ("mem_high", "Memory utilization high", "threshold", "mem_pct", 4, "threshold_breach", 90.0, 80.0, 2),
     ("if_in_util_high", "Interface inbound utilization high", "threshold", "if_in_util_pct", 4, "threshold_breach", 90.0, 80.0, 2),

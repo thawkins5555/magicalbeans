@@ -381,11 +381,7 @@ CLEARS = {
     # not this map, since they're keyed by (rule, entity) not a fixed pair
 }
 
-# A CLEARS pairing's primary rule key -> other rule keys the same clearing
-# occurrence also resolves, for the same entity. priority_interface_down
-# reuses interface_down's ("interface_event", "link_down") pairing above but
-# is its own rule row with its own dedup key, so a link_up has to close both
-# rather than leaving the priority alert open once its plain twin clears.
+# A CLEARS primary rule key -> other rule keys the same clearing occurrence also resolves, for the same entity.
 CLEARS_COMPANIONS: dict[str, tuple[str, ...]] = {
     "interface_down": ("priority_interface_down",),
 }
@@ -423,18 +419,12 @@ def _threshold_rule_matches(rule, occurrence) -> bool:
     return not occurrence.rule_key or rule["key"] == occurrence.rule_key
 
 
-# Rules in here share a (kind, source_kind) with a plain rule -- priority_
-# interface_down reuses interface_down's ("interface_event", "link_down") --
-# and are narrowed to only the occurrences _priority_gate lets through, so
-# the plain rule keeps matching every interface exactly as it always has.
+# Rule keys narrowed by _priority_gate to occurrences with extra["priority"] set, sharing a (kind, source_kind) with a plain rule.
 PRIORITY_ONLY_RULES = frozenset({"priority_interface_down"})
 
 
 def _priority_gate(rule, occurrence) -> bool:
-    """A PRIORITY_ONLY_RULES rule fires only when the occurrence is about an
-    interface flagged Priority (nodesdb.interface_flags) --
-    AlertEngine._drain_interface_events sets occurrence.extra["priority"]
-    from nodes_db.priority_interfaces(), read once per drain."""
+    """Gates a PRIORITY_ONLY_RULES rule to a Priority-flagged interface."""
     if (rule["key"] or "") not in PRIORITY_ONLY_RULES:
         return True
     return bool(occurrence.extra.get("priority"))

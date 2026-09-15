@@ -4636,7 +4636,7 @@ occurrence increments one alert instead of opening a duplicate" behavior
 lives in the database's own conflict resolution, not in application code
 that could race between a read and a write.
 
-61 built-in rules (5.10.0 adds `wireless_ap_rebooted`,
+62 built-in rules (5.10.0 adds `wireless_ap_rebooted`,
 `wireless_radio_channel_changed` and `netpath_https_down`; the middle one
 ships disabled via `_BUILTIN_DISABLED`; 5.23.0 adds
 `priority_interface_down`, sharing `interface_down`'s `(kind,

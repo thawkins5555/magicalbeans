@@ -482,12 +482,10 @@ class WirelessDatabase(SqliteStore):
         return row["ts"] if row and row["ts"] is not None else None
 
     def record_samples(self, ap_rows: list[tuple], radio_rows: list[tuple]) -> None:
-        """One executemany per table. `ap_rows` is (ap_id, ts, online,
-        station_count) tuples, `radio_rows` is (ap_id, radio_id, ts,
-        station_count, channel, operating_power_dbm) -- the caller (fortipoll)
-        already has both shapes ready from the same poll that just wrote
-        upsert_ap/replace_radios, so this takes plain tuples rather than
-        dicts to avoid a second round of key lookups for rows already built."""
+        """One executemany per table: ap_rows (ap_id, ts, online, station_count)
+        tuples, radio_rows (ap_id, radio_id, ts, station_count, channel,
+        operating_power_dbm) -- plain tuples since the caller already has both
+        shapes built from the same poll that wrote upsert_ap/replace_radios."""
         if not ap_rows and not radio_rows:
             return
         with self._lock:
@@ -517,43 +515,60 @@ class WirelessDatabase(SqliteStore):
                 " ORDER BY radio_id, ts", (ap_id, t0, t1)).fetchall()
         return {"ap": ap_rows, "radios": radio_rows}
 
-    def prune_history(self, older_than_days: float = 35) -> int:
-        """Called from the service maintenance loop beside prune_ap_events."""
+    def prune_history(self, older_than_days: float = 35, budget_s: float = 30.0) -> int:
+        """Batched and deadline-bounded like trim_to_size below, not one big
+        DELETE under the lock: history disabled for a while then re-enabled
+        can leave a backlog the poller's own writes should not be blocked
+        behind for its whole duration."""
         cutoff = time.time() - older_than_days * 86400
-        with self._lock:
-            cur = self._conn.execute("DELETE FROM ap_samples WHERE ts < ?", (cutoff,))
-            removed = cur.rowcount or 0
-            cur = self._conn.execute("DELETE FROM radio_samples WHERE ts < ?", (cutoff,))
-            removed += cur.rowcount or 0
-            self._conn.commit()
-        if removed:
-            reclaim(self._conn, self._lock, label="ap_samples/radio_samples")
+        removed = 0
+        deadline = time.monotonic() + budget_s
+        while time.monotonic() < deadline:
+            with self._lock:
+                cur = self._conn.execute(
+                    "DELETE FROM ap_samples WHERE rowid IN"
+                    " (SELECT rowid FROM ap_samples WHERE ts < ? LIMIT 5000)", (cutoff,))
+                gone = cur.rowcount or 0
+                cur = self._conn.execute(
+                    "DELETE FROM radio_samples WHERE rowid IN"
+                    " (SELECT rowid FROM radio_samples WHERE ts < ? LIMIT 5000)", (cutoff,))
+                gone += cur.rowcount or 0
+                self._conn.commit()
+            removed += gone
+            if not gone:
+                break
+            self._reclaim_until(min(deadline, time.monotonic() + 2.0))
         return removed
 
     def trim_to_size(self, max_bytes: int, budget_s: float | None = None) -> int:
-        """The base class's TRIM_TABLE mechanism assumes an `id` column
-        every table here does not carry (ap_samples/radio_samples are
-        plain fact rows, not keyed for it) -- so the two sample tables,
-        the cheapest and by far the fastest-growing data in this store,
-        are deleted oldest-by-ts-first here directly, ahead of anything
-        else, rather than through that mechanism. There is currently no
-        `max_wireless_db_mb` setting wired up to call this, but a future
-        one (or a direct call) trims the right tables first either way."""
+        """Deletes oldest-by-ts-first from the two sample tables, ahead of
+        anything else -- the base class's id-keyed TRIM_TABLE mechanism does
+        not fit them (no `id` column by design), and max_wireless_db_mb
+        (service._run_maintenance_body) calls this directly."""
         if max_bytes <= 0:
             return 0
         removed = 0
         deadline = time.monotonic() + (30.0 if budget_s is None else budget_s)
         while self._trim_size() > max_bytes and time.monotonic() < deadline:
             with self._lock:
-                cur = self._conn.execute(
-                    "DELETE FROM radio_samples WHERE rowid IN"
-                    " (SELECT rowid FROM radio_samples ORDER BY ts LIMIT 5000)")
-                gone = cur.rowcount or 0
-                cur = self._conn.execute(
-                    "DELETE FROM ap_samples WHERE rowid IN"
-                    " (SELECT rowid FROM ap_samples ORDER BY ts LIMIT 5000)")
-                gone += cur.rowcount or 0
-                self._conn.commit()
+                # One shared ts cutoff for both tables: radio_samples has
+                # ~2x ap_samples' row count (one row per radio per tick), so
+                # deleting a fixed row count from each independently would
+                # advance ap_samples' floor twice as far in time.
+                row = (self._conn.execute(
+                    "SELECT ts FROM ap_samples ORDER BY ts LIMIT 1 OFFSET 4999").fetchone()
+                    or self._conn.execute("SELECT MAX(ts) AS ts FROM ap_samples").fetchone())
+                cutoff = row["ts"] if row else None
+                if cutoff is None:
+                    gone = 0
+                else:
+                    cur = self._conn.execute(
+                        "DELETE FROM ap_samples WHERE ts <= ?", (cutoff,))
+                    gone = cur.rowcount or 0
+                    cur = self._conn.execute(
+                        "DELETE FROM radio_samples WHERE ts <= ?", (cutoff,))
+                    gone += cur.rowcount or 0
+                    self._conn.commit()
             removed += gone
             if not gone:
                 break

@@ -837,6 +837,38 @@ def test_16_the_row_cap_never_outruns_the_minute_watermark() -> None:
           f"{db.cap_held_back} held back)")
     db.close()
 
+    # A row with a wild future clock (nfdecode.py's v5 decode did not clamp
+    # one until this fix; v9/IPFIX already did) has ts_end past every real
+    # watermark forever -- an unbounded probe returns its own (oldest) id as
+    # "the oldest unsummarised row" and pins the whole cap on it permanently.
+    db2 = store("cap_watermark_poisoned.db")
+    poisoned = flow(9999, now + 10 * 86400)
+    db2.insert_flows([poisoned, *rows])
+    db2._set_private_setting(flowdb._FLOOR % 60, flowdb._align_down(start, 60))
+    db2._set_private_setting(flowdb._WATERMARK % 60, watermark_bucket)
+    db2.prune(3650, max_flows, minute_days=3650, rollup_days=3650, budget_s=30)
+    with db2._lock:
+        remaining2 = db2._conn.execute(
+            "SELECT COUNT(*) AS n FROM flows").fetchone()["n"]
+        still_protected2 = db2._conn.execute(
+            "SELECT COUNT(*) AS n FROM flows WHERE ts_end >= ? AND ts_end < ?",
+            (watermark_bucket, now + 3600)).fetchone()["n"]
+        poisoned_gone = db2._conn.execute(
+            "SELECT COUNT(*) AS n FROM flows WHERE ts_end = ?",
+            (poisoned.ts_end,)).fetchone()["n"] == 0
+    check(still_protected2 == protected,
+          f"a poisoned future-clock row does not change which sane rows the "
+          f"watermark protects ({still_protected2} of {protected})")
+    check(remaining2 == max_flows + db2.cap_held_back,
+          f"...the cap still removes exactly what it is allowed to, not "
+          f"nothing at all ({remaining2} remaining = {max_flows} cap + "
+          f"{db2.cap_held_back} held back)")
+    check(poisoned_gone,
+          "...and the poisoned row itself is not specially protected -- it "
+          "is the oldest id, so the normal cap removes it like any other "
+          "old row")
+    db2.close()
+
 
 # ------------------------------------------------------------------------ 17
 
@@ -875,6 +907,50 @@ def test_17_wide_charts_widen_to_the_hourly_tier() -> None:
     db.close()
 
 
+# ------------------------------------------------------------------------ 18
+
+def test_18_compact_hit_limit_reports_backlog_and_clears() -> None:
+    print("18: compact_hit_limit reports a bucket-limited pass, clears once "
+          "the backlog is gone")
+    db = store("hit_limit.db")
+    sealed = flowdb._align_down(time.time() - flowdb._ROLLUP_LAG_S, 60)
+    start = sealed - 300 * 60
+    db.insert_flows([flow(i, start + i * (300 * 60) / 1500.0) for i in range(1500)])
+    # compact_rollup seeds a fresh tier at the NEWEST sealed bucket, which
+    # would leave nothing to backfill through here -- pushed back by hand
+    # instead, as test_9 does, so there really are 300 sealed buckets queued.
+    db._set_private_setting(flowdb._FLOOR % 60, start)
+    db._set_private_setting(flowdb._WATERMARK % 60, start)
+
+    written = db.compact_rollup(60, max_buckets=90, budget_s=120)
+    check(written > 0, f"a pass over part of the backlog wrote rollup rows ({written})")
+    check(db.compact_hit_limit(60) is True,
+          "90 of 300 sealed buckets used the full allowance")
+    db.compact_rollup(60, max_buckets=90, budget_s=120)   # 180 done
+    db.compact_rollup(60, max_buckets=90, budget_s=120)   # 270 done
+    check(db.compact_hit_limit(60) is True,
+          "30 buckets still queued after three passes -- still at the limit")
+    db.compact_rollup(60, max_buckets=90, budget_s=120)   # the last 30
+    check(db.compact_hit_limit(60) is False,
+          "the final pass processes fewer than its allowance, catching up")
+    db.close()
+
+
+# ------------------------------------------------------------------------ 19
+
+def test_19_coverage_returns_the_documented_keys() -> None:
+    print("19: coverage() returns the documented keys")
+    db = store("coverage_keys.db")
+    cov = db.coverage()
+    expected = {"raw_oldest", "raw_newest", "minute_floor", "minute_watermark",
+               "hourly_floor", "hourly_watermark", "cap_held_back",
+               "prune_incomplete"}
+    check(set(cov) == expected, f"coverage() keys: {sorted(cov)}")
+    check(cov["cap_held_back"] == 0 and cov["prune_incomplete"] is False,
+          "a fresh store starts with nothing held back and no incomplete prune")
+    db.close()
+
+
 TESTS = [
     test_1_rollup_and_raw_agree,
     test_2_totals_survive_truncation,
@@ -893,6 +969,8 @@ TESTS = [
     test_15_the_repair_statement_fits_an_old_sqlite,
     test_16_the_row_cap_never_outruns_the_minute_watermark,
     test_17_wide_charts_widen_to_the_hourly_tier,
+    test_18_compact_hit_limit_reports_backlog_and_clears,
+    test_19_coverage_returns_the_documented_keys,
 ]
 
 

@@ -314,17 +314,12 @@ class Decoder:
     """Stateful across packets: holds the template cache and per-exporter sampling."""
 
     def __init__(self, default_sampling: int = 1, trust_exporter_sampling: bool = True,
-                templates: "_TemplateCache | None" = None):
-        # `templates`, when passed, carries a prior Decoder's learned v9/IPFIX
-        # templates across a settings-triggered restart (collector.py's
-        # `start`) -- templates are wire state independent of settings, and
-        # rebuilding from an empty cache left every flow undecodable
-        # (no_template) until the exporter's next template resend, minutes
-        # to tens of minutes on most platforms.
+                templates: "_TemplateCache | None" = None, sampling: "_Lru | None" = None):
+        # `templates`/`sampling` carry a prior Decoder's caches across a settings restart, so learned v9/IPFIX state is not dropped.
         self.templates: _TemplateCache = templates if templates is not None else _TemplateCache(
             MAX_TEMPLATES_PER_EXPORTER, MAX_TEMPLATE_EXPORTERS)
         # (exporter, observation domain, sampler id) -> rate
-        self.sampling: _Lru = _Lru(MAX_SAMPLING)
+        self.sampling: _Lru = sampling if sampling is not None else _Lru(MAX_SAMPLING)
         # Rates learned since the caller last drained this, so it can correct
         # flows stored before the options record that announced them. Keyed
         # like self.sampling and bounded the same way: as a list, a sender
@@ -438,6 +433,7 @@ class Decoder:
         sampling = self.sampling_for(exporter)
 
         boot = unix_secs - sys_uptime / 1000.0
+        now = time.time()
         flows = []
         for index in range(min(count, (len(data) - 24) // 48)):
             offset = 24 + index * 48
@@ -445,10 +441,14 @@ class Decoder:
              src_port, dst_port, _, tcp_flags, protocol, tos,
              src_as, dst_as, _, _, _) = struct.unpack_from(
                 "!IIIHHIIIIHHBBBBHHBBH", data, offset)
+            ts_start, ts_end = boot + first / 1000.0, boot + last / 1000.0
+            # Same clamp _build_flow applies to v9/IPFIX, against a bad exporter clock.
+            if not (now - 86400 * 30 < ts_end < now + 3600):
+                ts_end = now
+                ts_start = min(ts_start, ts_end)
             flows.append(Flow(
                 exporter=exporter, version=V5,
-                ts_start=boot + first / 1000.0,
-                ts_end=boot + last / 1000.0,
+                ts_start=ts_start, ts_end=ts_end,
                 src_ip=socket.inet_ntop(socket.AF_INET, struct.pack("!I", src)),
                 dst_ip=socket.inet_ntop(socket.AF_INET, struct.pack("!I", dst)),
                 next_hop=socket.inet_ntop(socket.AF_INET, struct.pack("!I", nexthop)),

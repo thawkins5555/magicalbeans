@@ -86,13 +86,11 @@ class Collector(udpsock.UdpReceiver):
         self._allowed = {item.strip() for item in allow.replace(",", "\n").split("\n")
                          if item.strip()}
 
-        # Carry the previous decoder's learned templates through the restart
-        # (settings save calls stop()+start() -- see service.py) so a v9/IPFIX
-        # exporter stays decodable instead of going dark until it resends.
+        # Carry the previous decoder's learned templates/sampling through the restart, so a v9/IPFIX exporter stays decodable.
         self.decoder = Decoder(
             default_sampling=int(settings.get("default_sampling", 1)),
             trust_exporter_sampling=bool(settings.get("trust_exporter_sampling", True)),
-            templates=self.decoder.templates,
+            templates=self.decoder.templates, sampling=self.decoder.sampling,
         )
 
         address = settings.get("bind_address", "0.0.0.0")

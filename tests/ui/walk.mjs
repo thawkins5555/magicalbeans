@@ -635,6 +635,11 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
   await check('the interface dialog\'s Custom… range pins an absolute window (D3)',
     async () => {
       await page.keyboard.press('Escape');
+      // The previous check (E3) also selects this device and leaves its own
+      // async redraws in flight; wait for any modal that Escape just asked
+      // to close before clicking through to a new one, or the close and the
+      // reopen race and the reopen can lose.
+      await page.waitForSelector('#modal[hidden]', { state: 'attached', timeout: 5000 }).catch(() => {});
       await selectTab(page, 'nodes');
       await settle(page, 800);
       await page.click('#nodes-table tbody tr:first-child').catch(() => {});
@@ -643,6 +648,12 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       const hasRow = await page.waitForSelector('#nd-if-table tbody tr', { timeout: 20000 })
         .then(() => true).catch(() => false);
       if (!hasRow) return 'skipped: the selected device has no interfaces to open';
+      // The interface list can still be mid-poll-refresh right after that
+      // wait resolves (it rebuilds the whole tbody on every tick); wait for
+      // a settled /interfaces response, then re-query the row rather than
+      // reusing one that may already have been replaced under it.
+      await page.waitForResponse((res) => new URL(res.url()).pathname.endsWith('/interfaces')
+        && res.request().method() === 'GET', { timeout: 5000 }).catch(() => {});
       await sleep(500);
       await page.click('#nd-if-table tbody tr:first-child');
       await page.waitForSelector('#modal:not([hidden]) #ifd-range', { timeout: 20000 });
@@ -786,6 +797,22 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
     await row.waitFor({ state: 'detached', timeout: 10000 }).catch(() => {});
     return `created, sent (status "${statusText}"), removed`;
   });
+
+  await check('the NetFlow export CSV starts with a readable start/end pair (A1)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'netflow');
+      await settle(page, 800);
+      const header = await page.evaluate(async () => {
+        const res = await fetch('/api/netflow/records/export.csv');
+        const data = await res.json();
+        const csv = (data.csv || '').replace(/^﻿/, '');
+        return (csv.split('\r\n')[0] || csv.split('\n')[0] || '');
+      });
+      assert(header.startsWith('start,end,ts'),
+        `expected the export header to start with "start,end,ts", got "${header}"`);
+      return `header: "${header}"`;
+    });
 
   await check('Nodes -> HISTORY: a query runs and the table/CSV button respond (E1)',
     async () => {

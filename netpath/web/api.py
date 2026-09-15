@@ -2201,6 +2201,10 @@ _SCOPE_SETTINGS_RANGES = {
     "nodes": {"rollup_retention_days": (1, 3650),
               "interface_sample_retention_days": (1, 3650),
               "interface_rollup_retention_days": (1, 3650)},
+    # -1 deletes every ap_samples/radio_samples row on the next sweep
+    # (prune_history reads it as "everything is older than this"); 0
+    # writes a row every poll instead of every history_sample_s.
+    "wireless": {"history_days": (1, 3650), "history_sample_s": (60, 86400)},
 }
 
 
@@ -6234,6 +6238,8 @@ def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
 def put_nodes_interface_priority(service, params, body, device_id, if_index) -> dict:
     device = _require(service.nodes_db.device(device_id), "device")
     if_index = int(if_index)
+    if not service.nodes_db.interface_exists(device_id, if_index):
+        raise NotFound("No such interface")
     on = bool(body.get("priority"))
     service.nodes_db.set_interface_priority(device_id, if_index, on)
     _audit(service, params, "interface.priority",
@@ -6579,8 +6585,15 @@ def _clean_report_schedule_params(kind: str, params) -> dict:
         return cleaned
     if kind == "top_metrics":
         period_days = _num(params, "period_days", 7, float)
-        if not (0 < period_days <= 366):
-            raise ValueError("period_days must be between 0 and 366")
+        # A schedule always ranks the whole fleet (no device_ids to narrow
+        # it), so this is the same cap get_nodes_reports_top_metrics applies
+        # to a whole-fleet request -- a scheduled run has no request thread
+        # to time out, but the query is exactly as slow.
+        top_metrics_max_days = REPORT_TOP_METRICS_WHOLE_FLEET_MAX_WINDOW_S / 86400.0
+        if not (0 < period_days <= top_metrics_max_days):
+            raise ValueError(
+                f"period_days must be between 0 and {top_metrics_max_days:.0f} "
+                "for a whole-fleet top_metrics schedule")
         metric_key = str(params.get("metric_key", "")).strip()
         if not metric_key:
             raise ValueError("metric_key is required for a top_metrics report")

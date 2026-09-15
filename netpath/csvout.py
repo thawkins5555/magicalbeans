@@ -11,11 +11,7 @@ from __future__ import annotations
 import csv
 import io
 
-# A spreadsheet treats a cell beginning = + - or @ as a formula, and the DDE
-# forms prompt to launch a program -- while the content here is often written
-# by whatever can reach UDP/514, answer an SNMP walk, or supply a device
-# name, not by an operator. The leading apostrophe is the conventional inert
-# prefix.
+# A spreadsheet treats a cell starting with one of these as a formula; the leading apostrophe is the conventional inert prefix.
 CSV_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
 
 

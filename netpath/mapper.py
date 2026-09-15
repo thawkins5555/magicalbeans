@@ -776,10 +776,7 @@ def link_csv_rows(links, device_name) -> list[list]:
     column carries is "nothing reported it", not "zero"."""
     rows = []
     for link in links:
-        # A discovered link's A side is always the reporting device (see
-        # assemble_links), so a_device_id is always set there -- but a
-        # manual line (D2) can join two unmanaged peers, so the A side
-        # needs the same peer-key fallback the B side has always had.
+        # A manual line (D2) can put a peer on the A side too, unlike a discovered link.
         if link["a_device_id"] is not None:
             a_name = device_name(link["a_device_id"])
             a_id = link["a_device_id"]

@@ -25,6 +25,12 @@ KINDS = ("availability", "top_metrics", "firmware")
 # in one screen without an attachment.
 _BODY_ROW_CAP = 20
 
+# Kept equal to api.py's REPORT_TOP_METRICS_WHOLE_FLEET_MAX_WINDOW_S: a
+# schedule always ranks the whole fleet, so it is the whole-fleet case of
+# that same live-request cost ceiling, checked again here in case a row
+# predates api.py's own write-time cap.
+_TOP_METRICS_MAX_WINDOW_S = 7 * 86400.0
+
 
 def _local_at(base_ts: float, *, day_delta: int, hour: int, minute: int) -> float:
     """A local-calendar timestamp `day_delta` days from base_ts's own day,
@@ -144,6 +150,10 @@ def _render_availability(service, params: dict, now: float):
 
 def _render_top_metrics(service, params: dict, now: float):
     period_days = float(params.get("period_days") or 7)
+    if period_days * 86400 > _TOP_METRICS_MAX_WINDOW_S:
+        raise ValueError(
+            f"period_days ({period_days:.0f}) exceeds the whole-fleet top_metrics "
+            f"cost ceiling ({_TOP_METRICS_MAX_WINDOW_S / 86400:.0f} days)")
     metric_key = str(params.get("metric_key") or "").strip()
     if not metric_key:
         raise ValueError("top_metrics report has no metric_key configured")
@@ -228,35 +238,26 @@ def render(service, row, now: float) -> tuple[str, str, str, str]:
 
 
 def run_due(service, now: float) -> int:
-    """Sends every schedule whose next_run_ts has arrived. next_run_ts is
-    advanced BEFORE the render/send below, so a crash mid-send cannot repeat
-    the run on the next tick; last_run_ts/last_status are stamped after,
-    whatever the outcome. Returns how many schedules were due."""
+    """Sends every schedule whose next_run_ts has arrived. Returns how many were due."""
     nodes_db = service.nodes_db
     due = nodes_db.due_report_schedules(now)
     for row in due:
-        schedule_id = row["id"]
-        name = row["name"]
-        try:
-            next_ts = next_due(row, now)
-        except Exception as exc:
-            # A row whose cadence fields do not compute must not be asked
-            # again every minute forever; park it a day out and say why.
-            nodes_db.update_report_schedule(schedule_id, next_run_ts=now + 86400)
-            status = f"failed: could not schedule the next run ({exc})"
-            nodes_db.record_report_schedule_run(schedule_id, status)
-            service.log.add(SYSTEM, f"Scheduled report {name!r}: {status}")
-            continue
-        nodes_db.update_report_schedule(schedule_id, next_run_ts=next_ts)
+        _run_one_schedule(service, row, now)
+    return len(due)
 
-        try:
-            subject, body, csv_text, filename = render(service, row, now)
-        except Exception as exc:
-            status = f"failed: {exc}"
-            nodes_db.record_report_schedule_run(schedule_id, status)
-            service.log.add(SYSTEM, f"Scheduled report {name!r}: {status}")
-            continue
 
+def _run_one_schedule(service, row, now: float) -> None:
+    """One schedule's next_due/render/send, wrapped in one try so a bad row
+    (or a transient render/send failure) cannot abort the rest of the tick."""
+    nodes_db = service.nodes_db
+    schedule_id, name = row["id"], row["name"]
+    advanced = False
+    try:
+        # Advanced before the render/send below, so a crash mid-send cannot repeat this run on the next tick.
+        nodes_db.update_report_schedule(schedule_id, next_run_ts=next_due(row, now))
+        advanced = True
+
+        subject, body, csv_text, filename = render(service, row, now)
         recipients = json.loads(row["recipients"] or "[]")
         creds = service.alert_engine.smtp_credentials() if service.alert_engine else None
         if creds is None:
@@ -272,6 +273,10 @@ def run_due(service, now: float) -> int:
                 status = f"sent to {len(recipients)} recipient(s)"
             except Exception as exc:
                 status = f"failed to send: {exc}"
-        nodes_db.record_report_schedule_run(schedule_id, status)
-        service.log.add(SYSTEM, f"Scheduled report {name!r}: {status}")
-    return len(due)
+    except Exception as exc:
+        status = f"failed: {exc}"
+        if not advanced:
+            # A row whose cadence fields do not compute must not be asked again every minute forever.
+            nodes_db.update_report_schedule(schedule_id, next_run_ts=now + 86400)
+    nodes_db.record_report_schedule_run(schedule_id, status)
+    service.log.add(SYSTEM, f"Scheduled report {name!r}: {status}")
