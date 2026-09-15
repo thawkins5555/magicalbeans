@@ -194,9 +194,10 @@ filtering or scrolling to the ★ column first.
 was reading the manual name field, which most devices never have set,
 so nearly every row in the dropdown read as a bare IP even for
 well-known, named devices. It now labels each device "name (ip)" using
-the same name precedence the device list itself uses — SNMP hostname
-first, then a manual name, then reverse DNS, then the IP alone — and
-still searches by IP, name or SNMP hostname exactly as before.
+the same name precedence the device list itself uses — a manual name
+when the device is pinned to one, else the SNMP hostname, else the
+stored name, else the IP — and still searches by IP, name or SNMP
+hostname exactly as before.
 
 Files: `nodesdb.py`, `report.py`, `reportsched.py`, `web/api.py`,
 `web/server.py`, `web/static/app.css`, `web/static/index.html`,
@@ -205,11 +206,13 @@ Files: `nodesdb.py`, `report.py`, `reportsched.py`, `web/api.py`,
 Verification: `test_sfp_report.py` (new) covers
 `nodesdb.interfaces_with_media` (the empty-cage and no-media exclusions,
 the device-group filter, the purge exclusion), `report.sfp_inventory`'s
-row shaping and counts, `reportsched.py`'s `sfp` render, and both
+row shaping and counts, `reportsched.py`'s `sfp` render and its
+`device_group_id`, 400, and `include_empty` "false" cases, and both
 `/api/nodes/reports/sfp` routes end to end; `test_reports_ui.py` and
 `test_frontend_contracts.py` extend to cover the new subtab and every
 new UI string; `tests/ui/walk.mjs` adds a walk of the SFP INVENTORY
-subtab, the priority tint and the HISTORY picker.
+subtab and the HISTORY picker, and after flagging a port asserts a
+`tr.priority` row.
 
 ### 5.23.0 — Scheduled reports, a history explorer, priority ports, and NetFlow's missing blocks
 

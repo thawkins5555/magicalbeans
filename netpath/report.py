@@ -547,6 +547,11 @@ class SfpRow:
         return asdict(self)
 
 
+SFP_CSV_HEADER = ["device_id", "name", "ip", "if_index", "port", "alias", "kind",
+                  "media", "oper_status", "admin_status", "speed_bps",
+                  "last_seen_ts", "device"]
+
+
 @dataclass
 class SfpReport:
     generated_ts: float

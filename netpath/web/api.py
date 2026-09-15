@@ -6542,33 +6542,28 @@ def get_nodes_reports_firmware_export(service, params, body) -> dict:
     return _csv_response("firmware", _FIRMWARE_CSV_HEADER, csv_rows)
 
 
-_SFP_CSV_HEADER = ["device_id", "name", "ip", "if_index", "port", "alias", "kind",
-                   "media", "oper_status", "admin_status", "speed_bps",
-                   "last_seen_ts", "device"]
+def _truthy(value) -> bool:
+    """The lax "1/true/yes" form a query string or a JSON string param uses."""
+    return str(value).strip().lower() in ("1", "true", "yes")
 
 
 def _sfp_report(service, params):
-    """Shared body of the JSON route and the CSV one, so they cannot drift."""
-    include_empty = str(params.get("include_empty", "")).strip().lower() in (
-        "1", "true", "yes")
     return reportmod.sfp_inventory(
         service.nodes_db, _id_list(params.get("device_ids")),
-        hostnames=service.app_db.hostnames, include_empty=include_empty)
+        hostnames=service.app_db.hostnames,
+        include_empty=_truthy(params.get("include_empty", "")))
 
 
 def get_nodes_reports_sfp(service, params, body) -> dict:
-    """Every switch port holding a transceiver. `device_ids` narrows to a
-    group; `include_empty=1` also lists empty transceiver cages."""
     return _sfp_report(service, params).to_dict()
 
 
 def get_nodes_reports_sfp_export(service, params, body) -> dict:
-    """The same report as a CSV file, built server-side."""
     report = _sfp_report(service, params)
     csv_rows = [[r.device_id, r.name, r.ip, r.if_index, r.port, r.alias, r.kind,
                 r.media, r.oper_status, r.admin_status, r.speed_bps,
                 r.last_seen_ts, r.device] for r in report.rows]
-    return _csv_response("sfp", _SFP_CSV_HEADER, csv_rows)
+    return _csv_response("sfp", reportmod.SFP_CSV_HEADER, csv_rows)
 
 
 # --------------------------------------------------- scheduled reports (F)
@@ -6611,7 +6606,10 @@ def _clean_report_schedule_params(kind: str, params) -> dict:
         cleaned = {"period_days": period_days}
         group_id = params.get("device_group_id")
         if group_id not in (None, ""):
-            cleaned["device_group_id"] = int(group_id)
+            try:
+                cleaned["device_group_id"] = int(group_id)
+            except (TypeError, ValueError):
+                raise ValueError("device_group_id must be an integer")
         return cleaned
     if kind == "top_metrics":
         period_days = _num(params, "period_days", 7, float)
@@ -6632,10 +6630,13 @@ def _clean_report_schedule_params(kind: str, params) -> dict:
             raise ValueError("top_n must be between 1 and 500")
         return {"period_days": period_days, "metric_key": metric_key, "top_n": top_n}
     if kind == "sfp":
-        cleaned = {"include_empty": bool(params.get("include_empty"))}
+        cleaned = {"include_empty": _truthy(params.get("include_empty"))}
         group_id = params.get("device_group_id")
         if group_id not in (None, ""):
-            cleaned["device_group_id"] = int(group_id)
+            try:
+                cleaned["device_group_id"] = int(group_id)
+            except (TypeError, ValueError):
+                raise ValueError("device_group_id must be an integer")
         return cleaned
     return {}   # firmware takes no params of its own
 

@@ -6313,11 +6313,14 @@ both the device dialog's own interface table and its embedded view
 share) now sets `tr.className = r.priority ? 'clickable priority' :
 'clickable'` — `r.priority` already existed as a column on the rows
 Nodes' own interface query returns (see *Priority ports*, above); this
-release only reads it to add a class. `tr.priority { background:
+release only reads it to add a class. `tr.priority td { background:
 color-mix(in srgb, var(--accent) 10%, var(--panel)) }` in `app.css`
 mixes against `--panel` rather than a flat colour, deliberately, so the
-tint still reads correctly under a zebra-striped or `bulk-checked` row
-instead of a `background` shorthand stomping either.
+tint does not get washed out by the zebra stripe under it. The rule has
+the same specificity as `tr.selected td` and `tr.bulk-checked td` and
+is declared after both, so on a row that carried one of those classes
+too it would win outright rather than blend — harmless today because
+interface rows never carry `selected` or `bulk-checked`.
 
 **`nodes.js histDeviceLabel(d)` replaces `` `${d.name || d.ip}
 (${d.ip})` `` — the raw, usually-unset manual-name field — with the

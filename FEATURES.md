@@ -1851,11 +1851,11 @@ chart side by side, or beside a different port on a different device
 entirely.
 
 **From 5.24.0, the device picker's dropdown shows "name (ip)"**, named
-the same way the device list itself is — SNMP hostname first, then a
-manual name, then reverse DNS, then the IP alone — in place of reading
-the manual name field, which most devices never have set and so showed
-a bare IP for nearly every row even on a well-known device. Typing
-still searches by IP, name or SNMP hostname.
+the same way the device list itself is — a manual name when the device
+is pinned to one, else the SNMP hostname, else the stored name, else
+the IP — in place of reading the manual name field, which most devices
+never have set and so showed a bare IP for nearly every row even on a
+well-known device. Typing still searches by IP, name or SNMP hostname.
 
 Pick a preset range or **Custom…**, and a bucket size — **auto**, 1
 minute, 5 minutes or 1 hour — then **Run**. The chart overlays every

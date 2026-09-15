@@ -213,11 +213,6 @@ def _render_firmware(service, params: dict, now: float):
     return subject, body, csvout.csv_text(_FIRMWARE_CSV_HEADER, csv_rows)
 
 
-_SFP_CSV_HEADER = ["device_id", "name", "ip", "if_index", "port", "alias", "kind",
-                   "media", "oper_status", "admin_status", "speed_bps",
-                   "last_seen_ts", "device"]
-
-
 def _render_sfp(service, params: dict, now: float):
     device_ids = _device_ids_for_group(service.nodes_db, params.get("device_group_id"))
     include_empty = bool(params.get("include_empty"))
@@ -239,7 +234,7 @@ def _render_sfp(service, params: dict, now: float):
     csv_rows = [[r.device_id, r.name, r.ip, r.if_index, r.port, r.alias, r.kind,
                 r.media, r.oper_status, r.admin_status, r.speed_bps,
                 r.last_seen_ts, r.device] for r in report.rows]
-    return subject, body, csvout.csv_text(_SFP_CSV_HEADER, csv_rows)
+    return subject, body, csvout.csv_text(reportmod.SFP_CSV_HEADER, csv_rows)
 
 
 _RENDERERS = {

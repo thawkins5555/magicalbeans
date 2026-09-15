@@ -92,6 +92,13 @@ check("device_ids narrows the report to that device's ports only",
 
 check("an empty device_ids list reports on nothing rather than the fleet",
       report.sfp_inventory(db, device_ids=[]).rows == [], "")
+check("...same for interfaces_with_media directly",
+      db.interfaces_with_media(device_ids=[]) == [], "")
+
+db.request_device_removal([sw1])
+purged = report.sfp_inventory(db)
+check("a purged device's ports drop out of the report",
+      sw1 not in {r.device_id for r in purged.rows}, purged.to_dict())
 
 payload = result.to_dict()
 check("to_dict() is JSON-shaped all the way down",
@@ -264,6 +271,35 @@ check("a 'sfp' kind schedule can be created", status == 200 and created.get("id"
       (status, created))
 status, payload = call("POST", "/api/nodes/reports/schedules", sched_body, token=reader)
 check("...but a nodes:read account may not create one", status == 403, (status, payload))
+
+# device_group_id and include_empty round-trip through the params cleaner
+# with the same typing every other schedule kind gets.
+group_sched_body = {"name": "Group SFP", "kind": "sfp", "cadence": "weekly",
+                    "hour": 6, "minute": 0, "weekday": 1,
+                    "recipients": ["ops@example.invalid"],
+                    "params": {"device_group_id": str(dgid), "include_empty": "false"}}
+status, created = call("POST", "/api/nodes/reports/schedules", group_sched_body, token=admin)
+check("a schedule may target one device group", status == 200 and created.get("id"),
+      (status, created))
+group_sched_id = created["id"]
+
+status, listing = call("GET", "/api/nodes/reports/schedules", token=admin)
+stored = next(s for s in listing["schedules"] if s["id"] == group_sched_id)
+check("device_group_id is stored as an int, not the submitted string",
+      stored["params"]["device_group_id"] == dgid
+      and isinstance(stored["params"]["device_group_id"], int), stored["params"])
+check("include_empty: \"false\" stores as the boolean False",
+      stored["params"]["include_empty"] is False, stored["params"])
+
+group_row = nodes_db.report_schedule(group_sched_id)
+subject, _, _, _ = reportsched.render(service, group_row, now)
+check("the stored schedule's own render narrows to its saved device group",
+      "2 port(s) on 1 device(s)" in subject, subject)
+
+status, payload = call(
+    "POST", "/api/nodes/reports/schedules",
+    {**group_sched_body, "params": {"device_group_id": "abc"}}, token=admin)
+check("a non-integer device_group_id is refused with 400", status == 400, (status, payload))
 
 server.stop()
 service.shutdown()
