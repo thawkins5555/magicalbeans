@@ -37,7 +37,7 @@ row it was flagged or folded against. The hint explaining why a row was
 flagged is unchanged and still shown, so the operator ticks with the
 same evidence as before — only the ability to override it is new.
 
-**Outcome.** [to be filled in at release]
+**Outcome.** Shipped as 5.28.0. The evidence rule from 5.27.0 stood; the block was the discovery screen never sending the override (a "Same as" row always folded on Approve, a folded row was hidden and always resolved to its primary). Ticking either now adds it as its own device; folded rows are listed. Javariius pass 1 "not ready" with one real blocker: primary and folded row ticked together still gave one device (family marking plus the forced row's walked addresses); fixed as one promote per Approve, forced rows first. Pass 2 found the mirror case (approve the primary today, the folded address could never be added tomorrow); fixed by no longer marking folded siblings when a primary promotes, which also deleted the family-marking code. Pass 3 "ready to push" after re-running eight orderings through the route. Targeted suites green (device identity 4b/4c/4d, discovery workers and end-to-end, contracts); no browser walk and no full suite this round at the operator's instruction.
 
 ## 5.27.0 — Duplicate devices: configured addresses only, not discovery IPs
 
