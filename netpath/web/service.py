@@ -465,7 +465,12 @@ class Service:
         )
         self.collector = Collector(self.flow_db, log=self.log)
         self.syslog = SyslogCollector(self.syslog_db, log=self.log)
-        self.snmp = TrapCollector(self.snmp_db, log=self.log, nodes_db=self.nodes_db)
+        # The lambda defers the self.node_poller attribute lookup to call
+        # time, so construction order against NodePoller below does not
+        # matter.
+        self.snmp = TrapCollector(
+            self.snmp_db, log=self.log, nodes_db=self.nodes_db,
+            poll_now=lambda device_id: self.node_poller.poll_now(device_id))
         self.ipam = IpamWorker(self.ipam_db, log=self.log,
                                global_settings=lambda: self.settings,
                                nodes_db=self.nodes_db)

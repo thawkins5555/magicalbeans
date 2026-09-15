@@ -952,6 +952,15 @@ WELL_KNOWN = {
     "1.3.6.1.4.1.9.9.41.2.0.1": "clogMessageGenerated",
     "1.3.6.1.4.1.9.9.43.2.0.1": "ciscoConfigManEvent",
     "1.3.6.1.4.1.9.9.187.0.1": "cbgpFsmStateChange",
+    "1.3.6.1.4.1.9.9.13.3.0.1": "ciscoEnvMonShutdownNotification",
+    "1.3.6.1.4.1.9.9.13.3.0.5": "ciscoEnvMonRedundantSupplyNotification",
+    "1.3.6.1.4.1.9.9.13.3.0.9": "ciscoEnvMonSuppStatusChangeNotif",
+    "1.3.6.1.4.1.9.9.117.2.0.2": "cefcPowerStatusChange",
+    "1.3.6.1.4.1.9.9.117.2.0.3": "cefcFRUInserted",
+    "1.3.6.1.4.1.9.9.117.2.0.4": "cefcFRURemoved",
+    "1.3.6.1.4.1.9.9.13.1.5.1.2": "ciscoEnvMonSupplyStatusDescr",
+    "1.3.6.1.4.1.9.9.13.1.5.1.3": "ciscoEnvMonSupplyState",
+    "1.3.6.1.4.1.9.9.117.1.1.2.1.2": "cefcFRUPowerOperStatus",
     "1.3.6.1.4.1.232":         "hpCompaq",
     "1.3.6.1.4.1.311":         "microsoft",
     "1.3.6.1.4.1.318":         "apc",
@@ -1052,6 +1061,12 @@ DEFAULT_SEVERITY_RULES = [
     ("1.3.6.1.2.1.17.0.1",  4),   # newRoot              -> warning
     ("1.3.6.1.2.1.17.0.2",  5),   # topologyChange       -> notice
     ("1.3.6.1.2.1.33.2.1",  2),   # upsTrapOnBattery     -> critical
+    ("1.3.6.1.4.1.9.9.13.3.0.1", 2),   # ciscoEnvMonShutdownNotification      -> critical
+    ("1.3.6.1.4.1.9.9.13.3.0.5", 2),   # ciscoEnvMonRedundantSupplyNotification -> critical
+    ("1.3.6.1.4.1.9.9.13.3.0.9", 2),   # ciscoEnvMonSuppStatusChangeNotif     -> critical
+    ("1.3.6.1.4.1.9.9.117.2.0.2", 2),  # cefcPowerStatusChange                -> critical
+    ("1.3.6.1.4.1.9.9.117.2.0.4", 3),  # cefcFRURemoved                       -> error
+    ("1.3.6.1.4.1.9.9.117.2.0.3", 5),  # cefcFRUInserted                      -> notice
 ]
 
 # The shortest OID that can be a table column here (1.3.6.1.2.1.x.y.1.z is
@@ -1068,6 +1083,15 @@ ENUMS = {
     "1.3.6.1.2.1.15.3.1.2": {1: "idle", 2: "connect", 3: "active",
                              4: "opensent", 5: "openconfirm",
                              6: "established"},                          # bgpPeerState
+    "1.3.6.1.4.1.9.9.13.1.5.1.3": {1: "normal", 2: "warning", 3: "critical",
+                                   4: "shutdown", 5: "notPresent",
+                                   6: "notFunctioning"},                  # ciscoEnvMonSupplyState
+    "1.3.6.1.4.1.9.9.117.1.1.2.1.2": {1: "offEnvOther", 2: "on", 3: "offAdmin",
+                                      4: "offDenied", 5: "offEnvPower",
+                                      6: "offEnvTemp", 7: "offEnvFan",
+                                      8: "failed", 9: "onButFanFail",
+                                      10: "offCooling", 11: "offConnectorRating",
+                                      12: "onButInlinePowerFail"},        # cefcFRUPowerOperStatus
 }
 
 
