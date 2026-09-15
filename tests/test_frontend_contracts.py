@@ -3672,9 +3672,9 @@ check("device_id_for_address(ip, configured=True)" in _API82,
       "api.py's per-address conflict check calls device_id_for_address(ip, "
       "configured=True), the same configured-only rule")
 check("device_id_for_address(address, configured=True)" in _NODEPOLL82,
-      "nodepoll.py's poll-time address ownership lookup passes "
-      "configured=True too, so a poll never treats a discovered or "
-      "trap-learned address as duplicate evidence")
+      "nodepoll.py's promote() fold lookup passes configured=True too, "
+      "so a discovered or trap-learned address never folds a result "
+      "onto a device")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

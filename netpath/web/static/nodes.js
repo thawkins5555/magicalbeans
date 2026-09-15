@@ -4914,7 +4914,7 @@
     if (owned.length && retryForced) {
       html += `<p><button type="button" id="nd-import-force">Import those ` +
         `${owned.length} anyway</button> <span class="hint">Adds a second device ` +
-        `for an address another device already answers on.</span></p>`;
+        `for an address another device already has configured.</span></p>`;
     }
     el.innerHTML = html;
     const forceButton = el.querySelector('#nd-import-force');

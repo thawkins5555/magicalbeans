@@ -218,7 +218,11 @@ device having ever answered on it directly.
 No schema change and no migration: every existing discovery-sourced
 row stops counting the moment this ships, stays visible on the
 Addresses subtab with its source labelled, and ages out on the
-existing 180-day prune like before. Two edge cases are worth knowing
+existing 180-day prune like before. A polled device re-earns its
+evidence within the hour, when its next address-table walk rewrites
+those rows under the right source; a device promoted before this
+release and never polled (SNMP off) keeps them as discovery-only until
+it is polled once. Two edge cases are worth knowing
 about: a device whose `ipAddrTable` walk fails contributes only its
 primary address as evidence until the walk succeeds again, and on
 Cisco IOS `ipAddrTable` only lists addresses in the global routing

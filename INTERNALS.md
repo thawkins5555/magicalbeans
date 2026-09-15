@@ -3159,8 +3159,9 @@ The reason text for the address row reads "both have `<ip>` configured",
 in place of the pre-5.26.0 "both answer on `<ip>`" — a device can now
 appear here without ever having answered on that address itself, since
 `ipAddrTable` reports what an interface is configured with regardless of
-whether that address has replied to anything. The 409 conflict message
-changed the same way, to "`<ip>` is configured on it".
+whether that address has replied to anything. The discovery hint's
+reason changed the same way, to "`<ip>` is configured on it"; the 409
+conflict message keeps "`<ip>` is another address of ...".
 
 The MAC source excludes the all-zero and broadcast addresses and the
 HSRP/VRRP virtual prefixes (`00005e0001`, `00005e0002`, `00000c07ac`):

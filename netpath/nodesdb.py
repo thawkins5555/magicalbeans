@@ -885,11 +885,8 @@ def clean_community(text):
 
 _CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}
 
-# The only device_addresses source that proves an address is bound to one of
-# the device's own interfaces (physical, VLAN, loopback, tunnel, management).
-# Duplicate-device verdicts trust this source alone; discovery/trap/merge
-# rows stay on file for alert and conflict correlation but never fold two
-# devices together.
+# The one device_addresses source that proves an address is bound to an
+# interface; duplicate verdicts trust it alone, other sources only correlate.
 CONFIGURED_SOURCE = "ipAddrTable"
 
 

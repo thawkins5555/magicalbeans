@@ -2374,11 +2374,8 @@ class NodePoller(Worker):
         return device_ids
 
     def _record_promoted_addresses(self, device_id: int, result, addresses: list[str]) -> None:
-        """Splits promote()'s address list the way _refresh_addresses would:
-        the sweep's own ipAdEntAddr walk counts immediately as
-        CONFIGURED_SOURCE, so it doesn't wait up to a poll interval;
-        whatever's left — the probed address when it wasn't walked — is
-        recorded as discovery, which is correlation-only."""
+        """The sweep's own ipAdEntAddr walk is configured evidence at once;
+        the probed address, when not walked, is correlation-only."""
         walked = self._walked_addresses(result)
         if walked:
             self.db.record_device_addresses(device_id, walked, nodesdb.CONFIGURED_SOURCE)
