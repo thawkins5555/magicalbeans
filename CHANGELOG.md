@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.29.0 — Discovery addresses removed: interfaces and ARP only](#5290--discovery-addresses-removed-interfaces-and-arp-only)
 - [5.28.0 — Discovery duplicates: an override, and folded rows no longer hidden](#5280--discovery-duplicates-an-override-and-folded-rows-no-longer-hidden)
 - [5.27.0 — Duplicate devices only share a configured address, not a discovered one](#5270--duplicate-devices-only-share-a-configured-address-not-a-discovered-one)
 - [5.26.0 — Power supplies: removed, unpowered, and reported the moment it happens](#5260--power-supplies-removed-unpowered-and-reported-the-moment-it-happens)
@@ -161,6 +162,83 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.29.0 — Discovery addresses removed: interfaces and ARP only
+
+One item from the operator: `PROMPT-LOG.md` carries the request in full;
+this entry is the shipped result.
+
+**A node's address list is now exactly its own interface table — nothing
+else.** Through 5.28.0, `device_addresses` held four kinds of row: the ones
+a device's own hourly `ipAddrTable` walk found (physical, VLAN, loopback,
+tunnel and management addresses), the address a trap daemon happened to
+learn off a v1 trap's agent-address field, the address a discovery sweep
+used to reach a device, and — after a merge — the losing device's old
+primary, kept as a historical alias. Only the first kind was ever used as
+duplicate-device evidence, but all four sat in the same list on the
+Addresses subtab with no way to tell them apart, and the operator does not
+want the other three recorded at all. A one-time migration deletes every
+row that is not sourced from the interface walk, gated behind a marker
+(`_ADDRESSES_INTERFACE_ONLY_5_29` in `nodesdb.NodesDatabase._migrate`) so
+it runs exactly once per database and never touches a row added
+afterward. The device's ARP table is a separate table entirely and is not
+touched by this — an ARP entry was never in `device_addresses` and stays
+exactly as it was.
+
+**Three things stopped writing to it.** The trap daemon no longer records
+a v1 trap's agent-address as a node address (`snmptrapd._learn_agent_address`
+is removed outright, along with the LRU that throttled it). A device merge
+no longer carries the losing device's old primary address forward as an
+alias on the survivor — the loser's own interface rows still move to the
+winner, same as always, but its primary address is simply gone once the
+loser's row is, and whether it belongs on the winner is left to the
+winner's own next interface poll like any other address. And promoting a
+device out of a discovery scan no longer writes anything to its address
+list at all — a freshly promoted device's Addresses subtab is empty until
+its first regular poll walks its interface table, at most one poll
+interval away.
+
+**Discovery compares only the address it actually probed.** A sweep used
+to also ask each responding host for its own address table (one bounded
+read, up to 33 GETNEXTs) so a router reached on two addresses could be
+offered as one row instead of two — that read, the "fold" it fed, the
+"+N addresses" count on a result's IP cell, and the Discovery settings
+checkbox that controlled it ("Ask each device it finds which addresses it
+answers on") are all removed, with the operator's permission. Two target
+addresses that both belong to one box are now two independent results;
+adding both adds two devices, which the Duplicates button then pairs up
+once each has had its first poll and its interfaces are on file. A result
+is flagged high-confidence — "already added as `<node>`: `<ip>` is on its
+interfaces" — when the address it was probed on is a node's primary
+address or already on that node's own interfaces; the medium-confidence
+sysName-plus-sysObjectID hint is unchanged, and the 5.28.0 override (tick
+a flagged row to add it separately anyway, `force_result_ids`) still works
+exactly as before.
+
+**Trap and syslog correlation still resolves through the interface
+rows** — that was always the mechanism that actually mattered; the
+agent-address learning removed above only ever covered a case the hourly
+interface walk already covers on its own within the hour. After a merge,
+a message from the loser's old primary address correlates to the winner
+only if that address turns out to be on the winner's own interfaces —
+the same rule a message from any other address is held to now.
+
+Files: `nodesdb.py`, `nodepoll.py`, `nodediscover.py`, `snmptrapd.py`,
+`web/api.py`, `web/static/nodes.js`, `web/static/index.html`.
+
+Verification: `tests/test_address_wipe.py` (new) proves the migration
+marker — a mixed set of `discovery`/`trap_agent_addr`/`merge`/`ipAddrTable`
+rows is wiped down to the `ipAddrTable` row alone on the first upgrade,
+and a second open, even with a fresh non-interface row added in between,
+deletes nothing further. `tests/test_device_identity.py` is rewritten
+around the new rule: two addresses of one device are two discovery
+results and promote two devices, not one folded into the other; a
+promoted device carries no `device_addresses` rows until it is polled;
+and a result whose probed address is already on a device's own interfaces
+folds onto it unless forced. `tests/test_collectors_hardening.py` and
+`tests/test_device_address_search.py` are updated for the stopped writers.
+`tests/test_frontend_contracts.py` contracts 82 and 83 are rewritten for
+the new hint text and the removed fold fields/settings.
 
 ### 5.28.0 — Discovery duplicates: an override, and folded rows no longer hidden
 

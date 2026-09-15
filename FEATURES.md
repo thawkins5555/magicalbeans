@@ -953,43 +953,26 @@ own subtabs.
   back to `Default`, and pre-fills the discovered identity so the new
   device shows its sysName immediately instead of waiting for the first
   poll.
-- **A device reached on two of its addresses is offered once, but the
-  address it folded into stays visible.** Each device that
-  answers is asked which addresses it answers on (one short, bounded
-  read of its own address table), so a router probed on both its
-  loopback and its management address is one row to promote, its IP
-  cell marked `+1`, rather than two devices to add. The setting is in
-  Nodes → Settings → Discovery and can be switched off. The other
-  address is no longer dropped from the list: it shows as its own row
-  with a **Folded into <ip>** note, and starts unticked. Leave it
-  unticked and Promote adds only the primary row, exactly as before;
-  tick it too and approve, and it (from 5.28.0) is added as a separate
-  device in its own right, using the identity and address that row was
-  actually reached on — useful when what looks like one box on two
-  addresses is genuinely two, or when both addresses are worth having
-  as independent devices regardless. Tick and approve the folded row
-  alone, leaving its primary for a later batch, and the primary then
-  shows up as its own **Same as** match on that new device — it needs
-  its own tick and a second Approve to be added too. It works the other
-  way round as well: approve the pre-ticked primary alone, leaving the
-  folded row unticked, and the folded row keeps its own unpromoted
-  state rather than being swept along — on a later visit it shows the
-  same **Same as** match, at *high* confidence, against the device the
-  primary became, ready for its own tick and Approve.
 - **A result that looks like a device you already have says which one —
-  and, from 5.28.0, the operator can overrule it.** A **Same as** column
-  names it and how sure the scan is: *high* means an address that
-  device already has configured (from 5.27.0, that device's own address
-  table — not merely another discovery run's probe or a trap); *medium*
-  means a matching hostname and device type and nothing more, which is
-  a reason to look before ticking. Both levels start unticked. Leaving
-  a **Same as** row unticked and approving the rest records the new
-  addresses on the existing device, same as before. Ticking it and
-  approving now adds it as its own device instead — the fold is a
-  suggestion the operator can accept or override, never something
-  Approve does silently on its behalf. The hint that explains the match
-  is unchanged and still shown either way, so the operator ticks with
-  the same evidence in front of them.
+  and the operator can overrule it.** A **Same as** column names it and
+  how sure the scan is: *high* means the address the sweep actually
+  probed is a node's primary address or already on that node's own
+  interfaces (physical, VLAN, loopback, tunnel, management) — the only
+  address evidence discovery relies on; *medium* means a matching
+  hostname and device type and nothing more, which is a reason to look
+  before ticking. Both levels start unticked, reading "already added as
+  `<node>`: `<ip>` is on its interfaces" for the high case. Leaving a
+  **Same as** row unticked and approving the rest just marks that result
+  as already added — discovery does not write any address of its own,
+  from 5.29.0, so nothing about the existing device changes underneath
+  it. Ticking it and approving adds it as its own device instead — the
+  match is a suggestion the operator can accept or override, never
+  something Approve does silently on its behalf. The hint that explains
+  the match is unchanged and still shown either way, so the operator
+  ticks with the same evidence in front of them. Two addresses that both
+  belong to one physical box are simply two results now, each addable on
+  its own; adding both creates two devices, which the Duplicates button
+  then pairs up once each has had its first poll.
 
 ### Vendor MIBs
 
@@ -1730,21 +1713,22 @@ From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
 
 One device answering on several addresses is one device. From 5.0.0 the
 application says so everywhere it can, and asks rather than assumes
-everywhere it cannot. From 5.27.0, only an address the device's own
-address table reports counts toward that "same device" call — an
-address merely seen by a discovery probe, an SNMP trap, or carried
-over from an earlier merge is kept on file but never on its own turns
-two devices into a duplicate.
+everywhere it cannot. From 5.29.0, a device's address list is exactly
+what its own interface table reports — physical, VLAN, loopback, tunnel
+and management addresses, refreshed by the hourly poll — and nothing
+else: not a discovery probe, not a trap's agent-address, not a losing
+device's old primary carried over by a merge. That is also the only
+evidence, since 5.27.0, that ever made two devices look like one.
 
-- **The device pane has an ADDRESSES subtab** listing every address the
-  device answers on: the one you configured, marked as the primary, and
-  every other one its own address table has reported, with the interface
-  and netmask where it gave them and when each was last seen. This is why
-  a trap or a syslog line arriving from a loopback is attributed to the
-  right device. A hint on this tab notes that only rows sourced from the
-  device's own address table (not a discovery probe or a trap) count
-  toward duplicate detection — every row still shows here regardless of
-  source, since this tab is about correlation, not verdicts.
+- **The device pane has an ADDRESSES subtab** listing every address on
+  the device's own interfaces: the one you configured, marked as the
+  primary, and every other one its own interface table has reported,
+  with the interface and netmask where it gave them and when each was
+  last seen, refreshed by the hourly poll. This is why a trap or a
+  syslog line arriving from a loopback is attributed to the right
+  device. A newly added or promoted device shows nothing here until its
+  first poll fills it in, at most one poll interval away. Its ARP table
+  is a separate table, on its own ARP subtab.
 - **Adding an address another device already has configured is refused,
   and says which device.** The message names it, links to it, and offers
   **Add anyway** for the case where two boxes really do sit behind one
@@ -1753,20 +1737,23 @@ two devices into a duplicate.
   same rows in its `duplicate` column, naming the device each belongs to,
   with one button to import them anyway.
 - **A Duplicates button in the Devices bar** lists pairs that look like
-  one device entered twice — an address both devices have configured, a
-  shared interface MAC, or the same hostname and device type — each with
-  what the evidence is and how strong it is. Only addresses each device's
-  own address table reports count as a shared address here; a discovery-
-  or trap-learned address never does, and the dialog says so. Nothing is
-  fetched for it until it is opened, and nothing is ever merged
-  automatically.
+  one device entered twice — an address both devices have on their own
+  interfaces, a shared interface MAC, or the same hostname and device
+  type — each with what the evidence is and how strong it is. Only
+  addresses a device reports on its own interfaces count as shared here,
+  and the dialog says so; from 5.29.0 there is nothing else in a
+  device's address list to confuse this with. Nothing is fetched for it
+  until it is opened, and nothing is ever merged automatically.
 - **Merging is an operator's decision, previewed first.** Opening a pair
   shows which row survives (swap it if the suggestion is wrong) and
   exactly what the merge would move: addresses, event history, upstream
   links, map placements, backups, thresholds, mutes and maintenance
-  windows. The surviving device keeps the lot; the other row's address
-  becomes one of its addresses. It cannot be undone, needs Nodes write,
-  and is recorded in the audit trail.
+  windows. The surviving device keeps the lot, including the losing
+  device's own interface addresses; the losing device's old primary
+  address is not carried over as one of the survivor's addresses — the
+  survivor's own next interface poll is what confirms or drops it, the
+  same as any other address. It cannot be undone, needs Nodes write, and
+  is recorded in the audit trail.
 
 ### Reporting — Nodes → REPORTS
 

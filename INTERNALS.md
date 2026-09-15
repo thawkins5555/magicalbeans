@@ -2899,12 +2899,15 @@ its timeouts. The job thread now submits each address to a
 - **One lock, and nothing SNMP under it.** `_probe_one` runs on a pool
   thread and does only network work; `_record` takes the job's single
   lock and does all of the shared-state work in one step: the counters,
-  `_result_addresses` → `fold_target` → `add_discovery_result` →
-  `register_addresses`, and the coalesced progress write. The fold
-  decision and the row it depends on cannot be separated, or two
-  addresses of the same router finishing together would each find the
-  other unclaimed and the box would be offered twice. Lock order is job
-  lock → nodesdb lock, never the reverse.
+  `add_discovery_result`, and the coalesced progress write. Through
+  5.28.0 this step also ran `_result_addresses` → `fold_target` →
+  `register_addresses` here, since the fold decision and the row it
+  depended on could not be separated — two addresses of the same router
+  finishing together would each have found the other unclaimed and the
+  box would have been offered twice. From 5.29.0 there is no fold left
+  to decide, so `_record` is shorter, not just still-correct; the lock
+  is still needed for the counters and the coalesced write. Lock order
+  is job lock → nodesdb lock, never the reverse.
 - **Progress writes are coalesced** to one `update_discovery_job` per 250
   ms, since 256 workers finishing at once otherwise means 256 UPDATEs for
   a figure only the browser's poll reads. The single terminal write
@@ -2919,12 +2922,15 @@ its timeouts. The job thread now submits each address to a
   sweep should not claim to have probed addresses it never sent a packet
   to. One already in flight still records what it found.
 
-One consequence worth knowing: the primary row of a multi-address device
-is now whichever of its addresses answered *first*, not its lowest
-address. Nothing downstream depends on which one it is — `discovery_results`
-is `ORDER BY ip` and the browser's `drawDiscResultsTable` sorts client-side
-— but a folded pair can come back the other way round from one sweep to the
-next.
+One consequence worth knowing, historical through 5.28.0: the primary row
+of a multi-address device used to be whichever of its addresses answered
+*first*, not its lowest address, because a later result sharing an address
+folded onto whichever row got there first. Nothing downstream depended on
+which one it was — `discovery_results` is `ORDER BY ip` and the browser's
+`drawDiscResultsTable` sorts client-side — but a folded pair could come
+back the other way round from one sweep to the next. From 5.29.0 there is
+no fold to resolve: every address a sweep probes is its own row, always,
+so this no longer applies.
 
 The `device`/`subnet` kind still exists internally (it decides "try SNMP
 even without a ping reply") but is derived server-side by
@@ -2991,46 +2997,66 @@ so a row stranded by a killed process cannot wedge the button, and a
 missing or deleted profile, which answers `needs_profile` so the browser
 opens the Start dialog on that target rather than the server guessing one).
 
-Address walk (5.0.0): a result that answered the identity GET is then
-asked for `ipAdEntAddr` alone — one column, through
-`_snmp_walk_column`, which is `_snmp_getnext_one` in a loop bounded by
-the subtree prefix, 32 rows, a non-advancing answer and the end of the
-MIB. It is not `nodepoll._walk_column`: that needs a polled device's
-merged config and a session this module has no business building. A
-mid-walk `SnmpError` returns what was already collected. The addresses
-land in `discovery_results.ip_addresses` as JSON, filtered through
-`nodesdb.alias_candidate` so the loopback every agent reports is never
-one of them. `discovery_addresses` (default on) turns the whole thing
-off, which makes a sweep exactly 4.54's.
+Address walk, history through 5.28.0 (added 5.0.0): a result that
+answered the identity GET was then asked for `ipAdEntAddr` alone — one
+column, through `_snmp_walk_column`, which was `_snmp_getnext_one` in a
+loop bounded by the subtree prefix, 32 rows, a non-advancing answer and
+the end of the MIB. It was not `nodepoll._walk_column`: that needs a
+polled device's merged config and a session this module has no business
+building. A mid-walk `SnmpError` returned what was already collected. The
+addresses landed in `discovery_results.ip_addresses` as JSON, filtered
+through `nodesdb.alias_candidate` so the loopback every agent reports was
+never one of them. `discovery_addresses` (default on) turned the whole
+thing off, which made a sweep exactly 4.54's.
 
-Within one sweep, `owners` (`DiscoveryJob._owners`) maps each address to
+Within one sweep, `owners` (`DiscoveryJob._owners`) mapped each address to
 the first result that reached it; `fold_target(mine, owners)` and
-`register_addresses(owners, id, mine)` are pure so the rule is testable
-without a socket. A later result that shares an address gets
-`folded_into_result_id` and does not count towards the job's
-`identified` figure — that figure is how many devices the sweep found,
-not how many addresses answered. Since 5.0.1 "first" means first to
-*finish*, not lowest address, and both calls happen inside `_record`'s
-lock together with the INSERT whose id `register_addresses` stores —
-`test_nodediscover_workers.py` runs two addresses of one device into
+`register_addresses(owners, id, mine)` were pure so the rule was testable
+without a socket. A later result that shared an address got
+`folded_into_result_id` and did not count towards the job's `identified`
+figure — that figure is how many devices the sweep found, not how many
+addresses answered. Since 5.0.1 "first" meant first to *finish*, not
+lowest address, and both calls happened inside `_record`'s lock together
+with the INSERT whose id `register_addresses` stored —
+`test_nodediscover_workers.py` ran two addresses of one device into
 `_record` off a barrier to pin exactly that. Through 5.27.0
 `get_nodes_discovery_job` (`api.py`) only ever built its `results` list
 from `primaries` — rows with no `folded_into_result_id` — so a folded
 row's own JSON was never even built and `drawDiscResultsTable` had
 nothing to draw it from: the sweep's own primary/fold decision, made by
 whichever address answered first, was final, with no way for the
-operator to see the folded row, let alone add it separately. From
-5.28.0 every row is listed, folded or not: `_discovery_result_json`
-gains a `folded_into_ip` parameter — the primary's own address, not its
-id, since an id is a worse key once the primary itself may have been
-promoted — so a folded row's JSON carries `"folded_into_ip"` beside the
-`folded_into_result_id` it already had, and the browser draws it with a
-**Folded into <ip>** note and its own checkbox instead of leaving it
-out of `results` entirely. A folded row's addresses still ride on the
-primary's own `addresses` list too, unchanged, so the primary continues
-to read as one box with every address it answers on.
+operator to see the folded row, let alone add it separately. From 5.28.0
+every row was listed, folded or not: `_discovery_result_json` gained a
+`folded_into_ip` parameter — the primary's own address, not its id, since
+an id is a worse key once the primary itself may have been promoted — so
+a folded row's JSON carried `"folded_into_ip"` beside the
+`folded_into_result_id` it already had, and the browser drew it with a
+**Folded into <ip>** note and its own checkbox instead of leaving it out
+of `results` entirely. A folded row's addresses rode on the primary's own
+`addresses` list too, unchanged, so the primary continued to read as one
+box with every address it answered on.
 
-### Device identity, addresses and merge (`nodesdb.py`, `nodepoll.py`, `web/api.py`) — 5.0.0
+**5.29.0: the walk and the fold are both gone.** A discovery sweep no
+longer reads `ipAdEntAddr` at all: `_snmp_walk_column`, `_walk_addresses`,
+`fold_target`, `register_addresses` and the job's `_owners` map are
+deleted outright, `discovery_results.ip_addresses` is never written again
+(the column stays in the schema — a row from before this release can
+still carry one — but nothing sets it going forward), and the
+`discovery_addresses` setting is removed. `DiscoveryJob._record`
+(`nodediscover.py`) is now the whole of what a worker does under the job
+lock: bump the `_probed`/`_responded`/`_identified` counters,
+`add_discovery_result`, write progress — no address list to compute, no
+fold decision to make. Two addresses of the same router that answer in
+the same sweep are simply two independent results now, not one folded
+into the other; `test_nodediscover_workers.py`'s barrier race, which used
+to pin the fold, now pins the opposite — that both rows land, neither
+carrying a `folded_into_result_id`, and the job counts both as
+identified. `folded_into_result_id` stays queryable on an old row but
+`_discovery_result_json` (`api.py`) no longer reads or returns it, nor
+`folded_into_ip` or an `addresses` list — a result's JSON carries only the
+one address (`ip`) it was actually probed on.
+
+### Device identity, addresses and merge (`nodesdb.py`, `nodepoll.py`, `web/api.py`) — 5.0.0, current shape from 5.29.0
 
 `devices.ip` is UNIQUE and, until 5.0, was the whole of a device's
 identity. A router reached on its loopback and again on a management
@@ -3056,24 +3082,42 @@ upsert, so a source that knows only the address — a trap, a discovery
 fold — never erases what the poller's fuller walk learned) and
 `discovery_results.ip_addresses`/`folded_into_result_id`.
 
-**Which `source` is identity evidence, from 5.27.0.** `device_addresses`
-is written from four places, and only one of them proves an address is
-actually bound to one of the device's own interfaces:
+**Which `source` is identity evidence — history through 5.28.0, then one
+writer from 5.29.0.** Through 5.28.0 `device_addresses` was written from
+four places, and only one of them proved an address was actually bound
+to one of the device's own interfaces:
 
-| `source` | Written by | Duplicate-device evidence? |
-|---|---|---|
-| `ipAddrTable` | `_refresh_addresses` (the hourly complete walk) and the walked half of `promote()`'s split, below | yes — the only source that is |
-| `discovery` | `promote()`, for the address actually used to reach the device when that address wasn't also read off its own table | no |
-| `trap_agent_addr` | `snmptrapd._learn_agent_address`, an SNMPv1 trap's agent-address field | no |
-| `merge` | `merge_devices`, the loser's former primary, kept as a historical alias | no |
+| `source` | Written by | Duplicate-device evidence? | Still written, from 5.29.0? |
+|---|---|---|---|
+| `ipAddrTable` | `_refresh_addresses` (the hourly complete walk) | yes — the only source that ever was | yes — the only writer left |
+| `discovery` | `promote()`, for the address actually used to reach the device when that address wasn't also read off its own table | no | removed — `promote()` writes nothing |
+| `trap_agent_addr` | `snmptrapd._learn_agent_address`, an SNMPv1 trap's agent-address field | no | removed — the method is deleted |
+| `merge` | `merge_devices`, the loser's former primary, kept as a historical alias | no | removed — the loser's primary is not carried over |
 
-`nodesdb.CONFIGURED_SOURCE` (`= "ipAddrTable"`) names the one source
-that counts. `address_owners(configured=True)` and
-`device_id_for_address(ip, configured=True)` are the two readers filtered
-to it (`source = CONFIGURED_SOURCE AND present = 1`); every other reader
-of `device_addresses` — the Addresses subtab, trap/syslog attribution,
-IP-conflict detection — keeps reading every source unfiltered, since
-those questions are about correlation, not identity. `_device_index`
+**The one-time wipe, 5.29.0.** `NodesDatabase._migrate`, gated on the
+`_ADDRESSES_INTERFACE_ONLY_5_29` private setting (the same gating pattern
+as `_DETAIL_FIELDS_MIGRATED_5_15` elsewhere in this file), runs `DELETE
+FROM device_addresses WHERE source <> ?` with `CONFIGURED_SOURCE`, once,
+then marks the setting so it never runs again — a database that upgrades
+straight to 5.29.0 loses every `discovery`/`trap_agent_addr`/`merge` row
+on its first open after the upgrade; a row already sourced `ipAddrTable`
+is untouched, and a fresh non-`ipAddrTable` row added after the marker is
+set is not retroactively deleted, since nothing writes one any more
+anyway. `tests/test_address_wipe.py` seeds one row of each of the four
+sources, runs the migration, and checks only the `ipAddrTable` row
+survives with its own `source` intact; a second `_migrate()` call, with a
+`discovery` row added in between, deletes nothing further.
+
+`nodesdb.CONFIGURED_SOURCE` (`= "ipAddrTable"`) still names the one
+source that ever counted as identity evidence, and from 5.29.0 it is also
+the only source `device_addresses` holds for anything at all —
+correlation included, not just identity. `address_owners(configured=True)`
+and `device_id_for_address(ip, configured=True)` are unchanged
+(`source = CONFIGURED_SOURCE AND present = 1`); every other reader of
+`device_addresses` — the Addresses subtab, trap/syslog attribution,
+IP-conflict detection — still reads every source unfiltered, but from
+5.29.0 that filter is a no-op safety net rather than a real distinction,
+since there is nothing else left in the table to filter out. `_device_index`
 (`api.py`) builds `by_address` off `address_owners(configured=True)`;
 `_duplicate_conflict` (the 409 check) and bulk import's alias lookup both
 call `device_id_for_address`/`address_owners` with `configured=True` for
@@ -3087,15 +3131,13 @@ stopped reporting stayed forever. `_migrate` adds `present` and
 `first_seen_ts = seen_ts` for existing rows. `record_device_addresses`
 gains a `complete` keyword, defaulting `False`; only `_refresh_addresses`
 — the full `ipAddrTable` walk — passes `complete=True`, and only then are
-rows this walk did not see marked `present=0`. A trap or a discovery fold
-writes a partial set and must never mark the rest of a device's addresses
-absent, so it always calls with the default — still true from 5.27.0, and
-now the reason `_record_promoted_addresses` (below) records the sweep's
-own walked addresses under `CONFIGURED_SOURCE`: that half is the same
-table `_refresh_addresses` writes, so the next complete walk governs it
-like any other `ipAddrTable` row, while the probed-only half stays
-`discovery` and is never touched by a walk that never saw it. An empty
-complete walk (a device that has genuinely stopped answering
+rows this walk did not see marked `present=0`. Through 5.28.0 a trap or a
+discovery fold wrote a partial set with the default, `complete=False`, so
+neither ever marked the rest of a device's addresses absent; from
+5.29.0 `_refresh_addresses` is the only caller of `record_device_addresses`
+left, so `complete=True` is effectively the only case that still runs —
+there is no partial-set writer any more to worry about undercutting it.
+An empty complete walk (a device that has genuinely stopped answering
 `ipAddrTable`) still reaches the marking step and marks everything
 absent, rather than being treated
 as "nothing to report." `device_id_for_address` orders candidates
@@ -3111,88 +3153,121 @@ stale claim about what it covers is corrected to match.
 **Confidence, and what each level may do.** `_discovery_duplicate` in
 `api.py` grades every discovery result against `_device_index(service)`
 (one pass over the fleet per listing: primary IPs, aliases, and a
-`(sysName, sysObjectID)` map):
+`(sysName, sysObjectID)` map). Through 5.28.0 it took an `addresses` list
+built from the probed address plus whatever the sweep's own walk had
+read off the box (`_result_addresses`), and checked every one of them
+against the index. **From 5.29.0 it takes only `(row, index)`** — there
+is no walk to add addresses from any more, so the one address on the row,
+`row["ip"]`, is the whole of what gets checked:
 
-- **high** — one of the addresses this box was reached on is already
-  configured on a device (`device_id_for_address(address, configured=True)`,
-  from 5.27.0 — the device's own `ipAddrTable`, not merely another
-  result's probe address). Nothing else honestly explains that, so by
-  default `promote()` records the addresses on the existing device and
-  marks the result promoted to it instead of adding a row beside it —
-  unless the operator forces it (5.28.0, below), in which case it adds
-  as its own device instead.
+- **high** — the probed address, `row["ip"]`, is already a device's
+  primary address or already on that device's own interfaces
+  (`device_id_for_address(ip, configured=True)`, unchanged since 5.27.0 —
+  the device's own `ipAddrTable`). Nothing else honestly explains that,
+  so by default `promote()` folds the result onto the existing device
+  instead of adding a row beside it — unless the operator forces it,
+  in which case it adds as its own device instead. The reason text is
+  built here too, from 5.29.0: `f"already added as {name}: {ip} is on
+  its interfaces"`, replacing the 5.27.0-era `"<ip> is configured on
+  it"` — it names the device outright rather than leaving the operator
+  to read it off the linked name alone.
 - **medium** — sysName and sysObjectID both match a device the sweep
   never reached on any shared address. Two switches out of the same
   carton share that honestly, so it is a reason to look before ticking
   and never a reason to fold. The row starts unticked; ticking it adds
   the device (it was never eligible to fold in the first place, since
-  nothing here proves a shared address).
+  nothing here proves a shared address). Unchanged by 5.29.0.
 
-`promote(job_id, result_ids, force=False)` resolves a folded result to
-its primary first when `force` is false (ticking either row adds the one
-device) and, for an unfolded result, still checks `device_id_for_address`
-for a high-confidence match unless `force` is true. Through 5.27.0
-nothing in the discovery flow ever passed `force=True` — the approval
-dialog always posted `{"result_ids": [...]}`, so a **Same as** or folded
-row that got ticked (the Results pane pre-ticked **Same as** rows by
-default; the dialog did not) was folded onto the existing device or its
-primary regardless, with no way to say "no, add it anyway." "Add
-anyway" existed only on **Add device**, where the operator typed the
-address themselves and a plain `force=True` on a single manual add is
-unambiguous.
+Through 5.27.0, nothing in the discovery flow ever passed `force=True` —
+the approval dialog always posted `{"result_ids": [...]}`, so a **Same
+as** or folded row that got ticked (the Results pane pre-ticked **Same
+as** rows by default; the dialog did not) was folded onto the existing
+device or its primary regardless, with no way to say "no, add it
+anyway." "Add anyway" existed only on **Add device**, where the operator
+typed the address themselves and a plain `force=True` on a single manual
+add is unambiguous.
 
-**5.28.0: `force` per result, not per call.** `POST
-.../discovery/<job>/promote` now reads two bodies —`result_ids`
-(promotes normally: any fold or high-confidence match still applies) and
-`force_result_ids` (each one promoted with `force=True`) — and calls
-`promote()` once, passing both lists in the one call; a legacy
-`{"result_ids": [...], "force": true}` body still applies `force` to the
-whole list, so nothing that scripted the old contract breaks. An empty
-body (neither list, and no legacy ids) is refused with 400. On the
-frontend, `discForceSplit(ids, rows)` (`nodes.js`) does the sorting: a
-ticked id whose row carries `duplicate_of_device_id` or
-`folded_into_result_id` goes into `force_result_ids`, everything else
-into `result_ids` — both the Results pane's Promote button and the
-approval dialog's Add approved button call it before posting, sending
-both lists to the server in the one call. `promote(job_id, result_ids,
-force=False, force_ids=())` handles the two lists as one call, forced
-ids first: each forced id is promoted with `force=True` from its own
+**5.28.0, history through 5.28.0: `force` per result, not per call, and a
+fold to resolve first.** `promote(job_id, result_ids, force=False)`
+resolved a folded result to its primary first when `force` was false
+(ticking either row added the one device) and, for an unfolded result,
+still checked `device_id_for_address` for a high-confidence match unless
+`force` was true. `POST .../discovery/<job>/promote` took two bodies —
+`result_ids` (promotes normally: any fold or high-confidence match still
+applies) and `force_result_ids` (each one promoted with `force=True`) —
+and called `promote()` once, passing both lists in the one call; a
+legacy `{"result_ids": [...], "force": true}` body still applied `force`
+to the whole list. `promote(job_id, result_ids, force=False,
+force_ids=())` handled the two lists as one call, forced ids first: each
+forced id was promoted with `force=True` from its own
 `ip`/identity/`_result_addresses` rather than swapped for its primary
-(`is_folded` stays true, and only that one row is marked promoted via
-`mark_promoted` — a plain, non-forced promote of a primary marks only
-its own row too, now that `_mark_promoted_family`/`_folded_family` are
-gone, so a folded sibling left unticked is never swept along), so a
-forced folded row becomes its own device even when its primary is
-ticked in the same call — a non-forced row's own fold-resolution
-ignores any device a forced row in this same call just created, whether
-that device is the forced row's own or one it matched by primary ip
-(`forced_devices` covers both), so a primary ticked alongside its
-forced folded row is never quietly swapped onto that new device. Device
-ids from both lists are deduplicated before being returned to the
-caller. The primary keeps its own unpromoted state when its forced
-folded row is added alone; promoted in a later call, it by then
-resolves to a high-confidence match on the device the forced row became
-(its walked address was recorded as `CONFIGURED_SOURCE` even though it
-was force-added) and now carries `duplicate_of_device_id`, so
-`discForceSplit` sorts its tick into `force_result_ids` on its own — a
-plain promote would fold it — so it needs its own tick, which the
-screen sends as a forced promote, plus a second Approve, to be added as
-a second device. Both the pane and the dialog now seed their default tick sets
-excluding `duplicate_of_device_id` and `folded_into_result_id` rows the
-same way, closing the gap where the pane pre-ticked a **Same as** row
-the dialog would not have.
+(`is_folded` stayed true, and only that one row was marked promoted via
+`mark_promoted` — `_mark_promoted_family`/`_folded_family` kept a plain,
+non-forced promote of a primary from sweeping an untouched folded
+sibling along too), so a forced folded row became its own device even
+when its primary was ticked in the same call — a non-forced row's own
+fold-resolution ignored any device a forced row in this same call had
+just created, whether that device was the forced row's own or one it
+matched by primary ip (`forced_devices` covered both). The primary kept
+its own unpromoted state when its forced folded row was added alone;
+promoted in a later call, it by then resolved to a high-confidence match
+on the device the forced row became and carried `duplicate_of_device_id`,
+so `discForceSplit` sorted its tick into `force_result_ids` on its own.
 
-`_record_promoted_addresses`, added in 5.27.0, splits what a promoted
-result writes to `device_addresses` the same way `_refresh_addresses`
-would rather than recording everything as `discovery`: `_walked_addresses`
-(the sweep's own `ipAdEntAddr` read of the box, as distinct from
-`_result_addresses`'s probed-address-first list) is written under
-`CONFIGURED_SOURCE` immediately, and whatever address is left over — the
-one actually used to reach the device, when that address wasn't also on
-its own table — is written `discovery`. A device promoted a second ago
-therefore already carries configured evidence rather than waiting up to
-an hour for the next poll, and the next complete walk ages each half
-correctly instead of the old single undifferentiated batch.
+**5.29.0: `promote()`, with no fold left to resolve.** The route
+contract is unchanged — `POST .../discovery/<job>/promote` still reads
+`result_ids` and `force_result_ids`, an empty body still refused with
+400, and `discForceSplit(ids, rows)` (`nodes.js`) still splits a ticked
+id into one list or the other before posting — but the check it sorts
+on is `duplicate_of_device_id` alone now; through 5.28.0 it also checked
+`folded_into_result_id`, and that check is simply gone, since nothing
+sets the field on a new row any more. `promote(job_id, result_ids,
+force=False, force_ids=())` (`nodepoll.py`) is correspondingly plainer:
+forced ids are still processed first (so an address a later, unforced
+row would otherwise have folded onto still gets its own row), but there
+is no primary to swap a result for — every result already is its own
+row. For each id, if `result["promoted_device_id"]` is already set it is
+reused (idempotent re-promote, unchanged); otherwise `existing =
+db.device_by_ip(result["ip"])` (an exact match on some device's own
+primary address), and, only when the row is not forced,
+`existing = db.device(db.device_id_for_address(result["ip"],
+configured=True))` — the same interface-table lookup
+`_discovery_duplicate` used to grade the result high-confidence in the
+listing, checked again here rather than trusted from it. If either
+resolves, the result is marked promoted to that device via
+`mark_promoted` and nothing is written to `device_addresses` — see
+`_record_promoted_addresses`, below. Otherwise a new device is created
+from the result's own identity, again with no address write. Device ids
+from both lists are deduplicated before being returned to the caller.
+Both the pane and the dialog seed their default tick sets excluding
+`duplicate_of_device_id` rows the same way — the `folded_into_result_id`
+half of that exclusion is deleted outright, not left dormant, since
+nothing sets it.
+
+`_record_promoted_addresses`, added in 5.27.0, used to split what a
+promoted result wrote to `device_addresses` the same way
+`_refresh_addresses` would rather than recording everything as
+`discovery`: `_walked_addresses` (the sweep's own `ipAdEntAddr` read of
+the box) was written under `CONFIGURED_SOURCE` immediately, and whatever
+address was left over — the one actually used to reach the device, when
+that address wasn't also on its own table — was written `discovery`. A
+device promoted a second ago therefore already carried configured
+evidence rather than waiting up to an hour for the next poll.
+
+**5.29.0: promote writes no addresses at all.**
+`_record_promoted_addresses`, `NodePoller._walked_addresses` and
+`NodePoller._result_addresses` are all deleted — there is no walked half
+left to record, since discovery never reads a device's address table any
+more, and the probed address alone is not evidence of anything about the
+device's own interfaces. A freshly promoted device therefore has zero
+`device_addresses` rows: its Addresses subtab is empty until its own
+first regular poll runs `_refresh_addresses` and walks its interface
+table, at most one poll interval away rather than up to an hour as the
+5.27.0 text above describes for the discovery-only half. This is the
+`_ADDRESSES_INTERFACE_ONLY_5_29` wipe's natural conclusion — if promote
+wrote nothing to the table any more, there was no reason to let the old
+discovery/trap/merge rows already on disk keep reading as evidence
+either, which is what the one-time migration above cleans up.
 
 **Manual add and bulk import.** `api.Conflict(ValueError)` carries a
 `payload`; `server.py`'s arm for it sits **before** the `ValueError` arm
@@ -3201,9 +3276,12 @@ and answers 409 with that payload merged into the body. `POST
 **configured** alias — from 5.27.0, `_duplicate_conflict` calls
 `device_id_for_address(ip, configured=True)`, so only an address that
 device's own `ipAddrTable` reports triggers it, not one only a discovery
-probe or a trap saw for that device — naming the device, so the browser
-can offer "Add anyway" (`force: true`) rather than only printing a
-refusal. A collision with a device's own primary IP is a plain 400 with
+probe or a trap saw for that device (from 5.29.0, that carve-out is
+simpler still: there is no discovery- or trap-sourced row left in
+`device_addresses` to have been the one that triggered it instead) —
+naming the device, so the browser can offer "Add anyway" (`force: true`)
+rather than only printing a refusal. A collision with a device's own
+primary IP is a plain 400 with
 or without `force`:
 the UNIQUE index behind the insert would refuse it however hard the
 button was pressed, so offering "Add anyway" only bought a second
@@ -3226,7 +3304,9 @@ in place of the pre-5.27.0 "both answer on `<ip>`" — a device can now
 appear here without ever having answered on that address itself, since
 `ipAddrTable` reports what an interface is configured with regardless of
 whether that address has replied to anything. The discovery hint's
-reason changed the same way, to "`<ip>` is configured on it"; the 409
+reason changed the same way in 5.27.0, to "`<ip>` is configured on it";
+from 5.29.0 it reads "already added as `<name>`: `<ip>` is on its
+interfaces" instead (built in `_discovery_duplicate`, above). The 409
 conflict message keeps "`<ip>` is another address of ...".
 
 The MAC source excludes the all-zero and broadcast addresses and the
@@ -3245,10 +3325,17 @@ owns whatever has not moved yet, rather than rows in three other files
 keyed on an id SQLite is about to reissue.
 
 `merge_devices` moves what belongs to the box rather than to the row: its
-addresses (its own primary among them, now an alias with source `merge`,
-saying where it used to be reachable), its `device_events`, the
-`upstream_id` children pointing at it, and the `discovery_results` /
-`vendor_learned` rows naming it. What it does **not** move is the polled
+own `device_addresses` rows (its interface aliases), its `device_events`,
+the `upstream_id` children pointing at it, and the `discovery_results` /
+`vendor_learned` rows naming it. Through 5.28.0 it also inserted the
+loser's own primary `ip` into the winner's `device_addresses` as a
+`source = 'merge'` alias, so the address it used to be reachable at
+stayed on file. **From 5.29.0 it does not** — `merge_devices` is no
+longer a writer of `device_addresses` at all beyond moving the loser's
+existing rows, so the loser's old primary is simply gone the moment the
+loser's row is; whether it belongs on the winner is left entirely to the
+winner's own next `_refresh_addresses` walk, the same as any other
+address a poll might or might not find. What it does **not** move is the polled
 state both rows hold twice over — interfaces, metrics, MAC and neighbour
 tables are the same physical ports read through a second address, and the
 winner is already refreshing them. Those go with the loser through the FK
@@ -7657,12 +7744,30 @@ acknowledged: doing so correctly means acting as the authoritative SNMP
 engine (answering discovery `Report`s, tracking `engineBoots`/
 `engineTime`), which is USM's other half and belongs with a future poller.
 
+**Agent-address learning, removed 5.29.0.** Through 5.28.0,
+`_learn_agent_address` read a v1 trap's own `agent_addr` field — RFC 1157
+carries the sending agent's idea of its own address, which on a device
+with a management VRF or a loopback trap-source is not the address the
+UDP datagram actually arrived from — and recorded it as another address
+of the device found at `trap.source`, under `source = "trap_agent_addr"`,
+throttled by `_learned`, a bounded `(source, agent address)` LRU so a
+steady stream of v1 traps cost one database write rather than one per
+trap. Both the method and the LRU are deleted outright: `device_addresses`
+has one writer now, the hourly interface walk (see **Device identity,
+addresses and merge**, above), and a trap still correlates by its own
+source address through `device_id_for_address`, which already checked a
+device's own interface rows first — the case this method existed for, a
+device whose trap-source is its loopback or a management VRF, is exactly
+the case the interface walk covers on its own, usually within the hour,
+since that address is on the device's own `ipAddrTable` regardless of
+which trap ever mentioned it.
+
 **Power-trap re-read, from 5.26.0.** `TrapCollector.__init__` takes an
 optional `poll_now` callable; `web/service.py` wires it to
 `self.node_poller.poll_now`, via a lambda so `Service.__init__`'s
 construction order (the collector is built before `NodePoller`) does
-not matter. `_power_trap_reread`, called from `_handle_datagram` right after
-`_learn_agent_address`, checks the decoded trap's OID against
+not matter. `_power_trap_reread`, called from `_handle_datagram` right
+after the trap is decoded, checks the decoded trap's OID against
 `POWER_TRAP_OIDS` (exactly the six Cisco ENVMON/FRU power traps
 `trapdecode.WELL_KNOWN` now names — a fan or temperature notification
 on the same arc does not qualify), resolves the sending source to a
@@ -7671,10 +7776,9 @@ device with `nodes_db.device_id_for_address`, and calls
 `POWER_TRAP_REREAD_S` — `poll_now` is the operator's retry-from-nothing
 button (it drops every sensor cache and the SNMPv3 engine), so a trap
 storm must not hold a device on back-to-back full walks —
-best-effort, like `_learn_agent_address` beside it: an unresolved
-source, a missing `nodes_db`/`poll_now`, or an exception from the call
-itself is caught and logged, never allowed to cost the trap its normal
-decode/store/queue path.
+best-effort: an unresolved source, a missing `nodes_db`/`poll_now`, or an
+exception from the call itself is caught and logged, never allowed to
+cost the trap its normal decode/store/queue path.
 
 ### Storage (`snmptrapdb.py`)
 
@@ -9708,6 +9812,17 @@ approval dialog's `seed` now exclude `duplicate_of_device_id` and
 `folded_into_result_id` rows identically — before 5.28.0 only the dialog
 did, so a **Same as** row could arrive pre-ticked in the pane and fold
 silently on Promote with nothing said about it.
+
+**5.29.0: no more folded rows to render.** `discDuplicateCell` has only
+the **Same as** case left — the "Folded into \<ip\>" branch and its own
+hint text are deleted, since a discovery sweep never folds one result
+into another any more. `discCheckCell`'s box, `discForceSplit`'s sort,
+and both the pane's default-tick loop and the dialog's `seed` all key on
+`duplicate_of_device_id` alone now, with the `folded_into_result_id`
+half of each check removed rather than left dormant. The hint sentence
+by the results table and in the approval dialog is singular to match:
+**"A row marked Same as is a device already added; it starts unticked,
+and ticking it adds it as a separate device."**
 
 ### Bulk selection (`nodes.js`, `alerts.js`, `configrx.js`)
 
