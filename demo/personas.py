@@ -1220,21 +1220,14 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     # lit on the other end, the case a -40 dBm reading must never alert on.
     entries.update(entity_sensors({access + 1: DOM_SENSORS,
                                    access + 2: DOM_SENSORS_DARK}))
-    # Two combo ports carry copper modules, not lasers: 5.25.0's fixture for
-    # the COP badge. access - 1 (GLC-T) reports no sensors at all — proven
-    # copper by module text alone; access (SFP-10G-T-S) additionally reports
-    # a lone temperature sensor, proving a temperature-only read must not
-    # earn a port the DOM badge. ifMauType backs both up (arc 30/54), and
-    # the uplink's real SR optic (access + 1) gets its own fiber arc so a
-    # MAU answer never overrides a proven laser either.
+    # Copper modules for the COP badge: GLC-T with no sensors, SFP-10G-T-S
+    # with a lone temperature sensor; MAU arcs 30/54, and 36 on the SR uplink.
     entries.update(sfp_cages(populated={
         access - 1: (names[access - 2], "1000BaseT SFP", "GLC-T"),
         access: (names[access - 1], "10GBase-T SFP+", "SFP-10G-T-S"),
     }))
     entries.update(entity_sensors({access: [DOM_SENSORS[0]]}))
-    # Every fixed copper port also answers ifMauType arc 30, as a real
-    # Catalyst does -- exercises the gate that only lets a MAU copper arc
-    # confirm a port the entity scan already holds a transceiver on.
+    # Every fixed copper port answers arc 30 too, as a real Catalyst does.
     entries.update(if_mau_type({**{i: 30 for i in range(1, access - 1)},
                                access - 1: 30, access: 54, access + 1: 36}))
     entries.update(host_resources(1, [("Physical memory", 1024, 524288, 0.61)]))

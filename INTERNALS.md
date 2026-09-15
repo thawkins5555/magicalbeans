@@ -1409,17 +1409,20 @@ _COPPER_MAU_ARCS = frozenset({
     5, 10, 11, 14, 15, 16, 19, 20, 27, 28, 29, 30, 41, 54,
 })
 _FIBER_MAU_ARCS = frozenset({
-    3, 6, 7, 8, 12, 13, 17, 18,
-    *range(21, 27), *range(31, 41), *range(44, 54),
+    3, 6, 7, 8, 12, 13, 17, 18, 23, 24, 25, 26,
+    32, 34, 35, 36, 38, 39, 40, *range(44, 54),
 })
 ```
 
 `_COPPER_MAU_ARCS` is 10/100/1000BASE-T(X)/-FD, 1000BASE-CX(-FD) and
 10GBASE-CX4/10GBASE-T; `_FIBER_MAU_ARCS` is the AUI/10BASE-F(B/L/P)
-family, 100BASE-FX(-FD), 1000BASE-SX/LX(-FD), and every 10G/40G/100G
-`dot3MauType` this MIB revision defines. A port whose MAU arc lands in
-neither set (an unrecognised or vendor-private arc) votes for nothing
-either way.
+family, 100BASE-FX(-FD), 1000BASE-SX/LX(-FD), and the 10G arcs that name
+an optical PMD (LX4, ER/LR/SR, EW/LW/SW) plus the BX/LX10/PX family. The
+"unknown PMD" codings 1000BASE-X (21, 22) and 10GBASE-X/R/W (31, 33, 37)
+are deliberately in neither set: a switch may answer 1000BASE-X for every
+SFP cage whatever is plugged in, so they must not veto a module the text
+names as copper. A port whose MAU arc lands in neither set votes for
+nothing either way.
 
 **Precedence, per port, once both sources are in: copper beats optic,
 optic beats whatever the cage scan alone decided.**

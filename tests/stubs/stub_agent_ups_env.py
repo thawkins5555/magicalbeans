@@ -677,6 +677,7 @@ SFP_MEDIA_TABLE = {
 IF_MAU_TYPE = "1.3.6.1.2.1.26.2.1.1.3"
 SFP_MAU_TABLE = {
     f"{IF_MAU_TYPE}.3.1": ("oid", "1.3.6.1.2.1.26.4.30"),
+    f"{IF_MAU_TYPE}.8.1": ("oid", "1.3.6.1.2.1.26.4.22"),    # 1000BASE-X: no vote
     f"{IF_MAU_TYPE}.4.1": ("oid", "1.3.6.1.2.1.26.4.30"),
     f"{IF_MAU_TYPE}.10.1": ("oid", "1.3.6.1.2.1.26.4.30"),
     f"{IF_MAU_TYPE}.11.1": ("oid", "1.3.6.1.2.1.26.4.36"),

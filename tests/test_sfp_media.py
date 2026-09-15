@@ -138,6 +138,9 @@ try:
           "by an ifMauType fiber arc -- the wire vetoes the text even with "
           "nothing else to go on",
           media.get(12) == "sfp", media)
+    check("an 'unknown PMD' ifMauType arc (22, 1000BASE-XFD) is neither "
+          "copper nor fiber: GLC-T text on if 8 stays 'copper' despite it",
+          media.get(8) == "copper", media)
     check("a combo port's text ('1000BASE-T/SFP combo') is copper, but a "
           "real Rx dBm sensor on it wins: DOM beats copper text",
           media.get(13) == "optic", media)

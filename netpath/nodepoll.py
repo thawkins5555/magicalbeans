@@ -172,11 +172,11 @@ _COPPER_TEXT = re.compile(
 _COPPER_MAU_ARCS = frozenset({
     5, 10, 11, 14, 15, 16, 19, 20, 27, 28, 29, 30, 41, 54,
 })
-# Fiber dot3MauTypes: AUI/10BASE-F family, 100BASE-FX(-FD), 1000BASE-SX/LX(-FD),
-# and every 10G/40G/100G arc this catalog vintage defines.
+# Fiber dot3MauTypes: arcs naming an optical PMD. 1000BASE-X (21, 22),
+# 10GBASE-X/R/W (31, 33, 37) are "unknown PMD" and vote for nothing.
 _FIBER_MAU_ARCS = frozenset({
-    3, 6, 7, 8, 12, 13, 17, 18,
-    *range(21, 27), *range(31, 41), *range(44, 54),
+    3, 6, 7, 8, 12, 13, 17, 18, 23, 24, 25, 26,
+    32, 34, 35, 36, 38, 39, 40, *range(44, 54),
 })
 
 # dBm(14) says a sensor reads optical power but not which way the light is
@@ -6520,23 +6520,16 @@ class NodePoller(Worker):
                             unit, "gauge", now, worst))
         if samples:
             self.db.record_metric_samples(device_id, samples)
-        # A MAU copper arc only CONFIRMS a port the entity scan already
-        # holds a transceiver on -- a Catalyst answers 1000BASE-T for every
-        # fixed copper port too, and none of those may badge from the wire
-        # alone.
+        # A MAU copper arc only confirms a cage the entity scan found
+        # occupied: a Catalyst answers 1000BASE-T for every fixed port too.
         mau_copper_ports &= ({i for i, m in sfp_slots.items()
                               if m in ("sfp", "copper")} | optic_ports)
-        # copper_ports: module text ('copper') union confirmed MAU-MIB
-        # copper arcs, minus MAU-MIB fiber arcs and any real DOM (dBm) row
-        # -- the wire, and a lit optic, beat an ambiguous part number.
+        # Precedence: a fiber arc or a lit optic beats copper text; copper
+        # beats optic (any port-mapped sensor); both beat the cage scan.
         copper_ports = ((
             {if_index for if_index, media in sfp_slots.items()
              if media == "copper"} | mau_copper_ports)
             - mau_fiber_ports - dbm_ports)
-        # DOM sensors win over anything the entity table says about the cage
-        # -- unless copper proof says otherwise; a fiber MAU arc downgrades
-        # text-copper to 'sfp' even with no sensor. Precedence: copper >
-        # optic (any port-mapped sensor) > whatever the cage scan decided.
         media_by_if = {i: ("sfp" if m == "copper" and i in mau_fiber_ports else m)
                        for i, m in sfp_slots.items()}
         media_by_if.update({if_index: "optic" for if_index in optic_ports})
