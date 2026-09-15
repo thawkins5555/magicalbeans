@@ -104,6 +104,8 @@
     repTopnSort: App.recallSort('nodes-rep-topn', { key: 'peak', descending: true }),
     repFirmware: null,
     repFirmwareSort: App.recallSort('nodes-rep-fw', { key: 'sw_version', descending: false }),
+    repSfp: null,
+    repSfpSort: App.recallSort('nodes-rep-sfp', { key: 'name', descending: false }),
   };
 
   const escape = App.escapeHtml;
@@ -1506,7 +1508,7 @@
     const sorted = App.sortRows(list, view.ifaceSort.key,
       view.ifaceSort.descending, columns);
     App.drawRows(body, sorted, columns, (tr, r) => {
-      tr.className = 'clickable';
+      tr.className = r.priority ? 'clickable priority' : 'clickable';
       tr.onclick = () => (onOpen ? onOpen(r) : interfaceDialog(r, id));
     }, error
       ? `No interfaces read — SNMP failed: ${error}. Fix the credential and poll again.`
@@ -3865,7 +3867,7 @@
 
   function fillReportDevGroupSelects() {
     for (const id of ['nd-rep-avail-devgroup', 'nd-rep-topn-devgroup',
-                      'nd-rep-fw-devgroup']) {
+                      'nd-rep-fw-devgroup', 'nd-rep-sfp-devgroup']) {
       const select = App.el(id);
       const current = select.value;
       select.innerHTML = reportDevGroupOptionsHtml();
@@ -4247,6 +4249,113 @@
     App.exportCsv('/api/nodes/reports/firmware/export.csv', params);
   }
 
+  // ------------------------------------------------------ sfp inventory
+  const SFP_COLUMNS = [
+    { key: 'name', label: 'Device', width: 200,
+      value: (r) => r.device || r.name || r.ip || `#${r.device_id}`,
+      cell: (r) => App.deviceNameLink(r.name || r.ip || `#${r.device_id}`,
+                                      { id: r.device_id }) },
+    { key: 'ip', label: 'IP', width: 120, cell: (r) => escape(r.ip || '') },
+    { key: 'port', label: 'Port', width: 150,
+      cell: (r) => escape(r.port || `port ${r.if_index}`) },
+    { key: 'alias', label: 'Alias', width: 150, cell: (r) => escape(r.alias || '—') },
+    { key: 'kind', label: 'Kind', width: 90, cell: (r) => sfpBadge(r) },
+    { key: 'oper_status', label: 'Oper', width: 80,
+      cell: (r) => `<span style="color:${r.oper_status === 'up' ? 'var(--ok)'
+        : r.oper_status === 'down' ? 'var(--fail)' : 'var(--line)'}">` +
+        `${escape(r.oper_status || '—')}</span>` },
+    { key: 'speed_bps', label: 'Speed', width: 95, numeric: true,
+      cell: (r) => (r.speed_bps ? App.rate(r.speed_bps / 8, 1) : '—') },
+    { key: 'last_seen_ts', label: 'Last seen', width: 100, numeric: true,
+      value: (r) => r.last_seen_ts || 0, cell: (r) => App.agoCell(r.last_seen_ts) },
+  ];
+
+  function onSfpSort(key, descending) {
+    view.repSfpSort = { key, descending };
+    drawSfpReportTable();
+  }
+
+  function drawSfpReportTable() {
+    const report = view.repSfp;
+    const rows = report ? report.rows : [];
+    const table = App.grid(App.el('nd-rep-sfp-table'), {
+      name: 'nodes-rep-sfp', caption: 'SFP inventory report',
+      columns: SFP_COLUMNS, sort: view.repSfpSort, onSort: onSfpSort });
+    const body = document.createElement('tbody');
+    const sorted = App.sortRows(rows, view.repSfpSort.key,
+      view.repSfpSort.descending, SFP_COLUMNS);
+    App.drawRows(body, sorted, SFP_COLUMNS, (tr, r) => {
+      if (!r._known) { tr.className = ''; tr.onclick = null; return; }
+      tr.className = 'clickable';
+      tr.title = 'Open this device on the Devices subtab';
+      tr.onclick = () => {
+        App.rememberSub('nodes', 'devices');
+        selectSub('devices');
+        selectDevice(r.device_id);
+      };
+    }, report ? 'No transceivers matched this report.'
+      : 'Click Run report.');
+    table.appendChild(body);
+    App.wireRowKeyboard(body);
+  }
+
+  function runSfpReport() {
+    const button = App.el('nd-rep-sfp-run');
+    return App.runJob(button, {
+      queued: 'Running…',
+      done: (result) => (result ? `${result.rows.length} port(s)` : 'No matching devices'),
+    }, (async () => {
+      const device_ids = await reportDeviceIds('nd-rep-sfp-devgroup');
+      if (device_ids && !device_ids.length) {
+        view.repSfp = null;
+        drawSfpReportTable();
+        App.setText(App.el('nd-rep-sfp-summary'), 'No devices in that group.');
+        return null;
+      }
+      const params = {};
+      if (device_ids) params.device_ids = device_ids.join(',');
+      if (App.el('nd-rep-sfp-empty').checked) params.include_empty = '1';
+      const result = await App.get('/api/nodes/reports/sfp', params);
+      const { byId } = await App.deviceIndex();
+      for (const row of result.rows) { row.id = row.device_id; row._known = byId.has(row.device_id); }
+      view.repSfp = result;
+      drawSfpReportTable();
+      App.setText(App.el('nd-rep-sfp-summary'),
+        `${result.port_count} port(s) on ${result.device_count} device(s) · ` +
+        `${result.dom_count} DOM · ${result.sfp_count} SFP` +
+        (result.empty_count ? ` · ${result.empty_count} empty` : ''));
+      return result;
+    })());
+  }
+
+  const SFP_CSV_HEADER = ['device_id', 'name', 'ip', 'if_index', 'port', 'alias', 'kind',
+    'media', 'oper_status', 'admin_status', 'speed_bps', 'last_seen_ts', 'device'];
+
+  function exportSfpReportCsv() {
+    const report = view.repSfp;
+    if (!report || !report.rows.length) {
+      App.toast('Run the report first.', 'warn');
+      return;
+    }
+    const rows = report.rows.map((r) => [r.device_id, r.name, r.ip, r.if_index, r.port,
+      r.alias, r.kind, r.media, r.oper_status, r.admin_status, r.speed_bps,
+      r.last_seen_ts, r.device]);
+    saveReportCsv(`sfp-${App.isoLocal(report.generated_ts).slice(0, 10)}.csv`,
+      SFP_CSV_HEADER, rows);
+  }
+
+  async function exportSfpReportCsvFromServer() {
+    const device_ids = await reportDeviceIds('nd-rep-sfp-devgroup');
+    if (device_ids && !device_ids.length) {
+      App.toast('No devices in that group.', 'warn');
+      return;
+    }
+    const params = {};
+    if (device_ids) params.device_ids = device_ids.join(',');
+    if (App.el('nd-rep-sfp-empty').checked) params.include_empty = '1';
+    App.exportCsv('/api/nodes/reports/sfp/export.csv', params);
+  }
+
   function selectReportsSub(name) {
     App.selectSub('nodes', name, { host: 'nodes-sub-reports', prefix: 'nd-rep-sub-' });
     if (name === 'scheduled') loadReportSchedules().catch(() => {});
@@ -4261,7 +4370,7 @@
      App.grid's column picker/sort machinery for it. */
 
   const SCHED_KIND_LABEL = { availability: 'Availability', top_metrics: 'Top-N by metric',
-                             firmware: 'Firmware inventory' };
+                             firmware: 'Firmware inventory', sfp: 'SFP inventory' };
   const SCHED_WEEKDAY_LABEL = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday',
                                'Saturday', 'Sunday'];
 
@@ -4299,6 +4408,11 @@
     if (kind === 'firmware') {
       return '<p class="hint">No parameters: the whole fleet, as it stands.</p>';
     }
+    if (kind === 'sfp') {
+      return `<label>Device group <select id="nd-sched-devgroup">${reportDevGroupOptionsHtml()}</select></label>` +
+        `<label class="check"><input type="checkbox" id="nd-sched-sfp-empty"` +
+        `${params.include_empty ? ' checked' : ''}> Include empty cages</label>`;
+    }
     return period +
       `<label>Device group <select id="nd-sched-devgroup">${reportDevGroupOptionsHtml()}</select></label>`;
   }
@@ -4310,6 +4424,12 @@
                top_n: Number(App.el('nd-sched-topn').value) || 20 };
     }
     if (kind === 'firmware') return {};
+    if (kind === 'sfp') {
+      const params = { include_empty: App.el('nd-sched-sfp-empty').checked };
+      const group = App.el('nd-sched-devgroup').value;
+      if (group) params.device_group_id = Number(group);
+      return params;
+    }
     const params = { period_days: Number(App.el('nd-sched-period').value) || 7 };
     const group = App.el('nd-sched-devgroup').value;
     if (group) params.device_group_id = Number(group);
@@ -4325,6 +4445,7 @@
         <option value="availability">Availability</option>
         <option value="top_metrics">Top-N by metric</option>
         <option value="firmware">Firmware inventory</option>
+        <option value="sfp">SFP inventory</option>
       </select></label>
       <div id="nd-sched-params">${schedParamsHtml(kind, existing && existing.params)}</div>
       <label>Cadence <select id="nd-sched-cadence">
@@ -4504,6 +4625,16 @@
     </div>`;
   }
 
+  /* "name (ip)" using the same auto/manual precedence as the rest of the
+     module (displayName above), so a device known only by its SNMP sysName
+     still reads by name here instead of falling back to the IP. A device
+     with no name at all (displayName === d.ip) shows just the IP once,
+     not "ip (ip)". */
+  function histDeviceLabel(d) {
+    const name = displayName(d);
+    return name && name !== d.ip ? `${name} (${d.ip})` : (d.ip || '');
+  }
+
   function histWireRow(box, rowId, row) {
     const devInput = box.querySelector(`#nd-hist-dev-${rowId}`);
     const metricSel = box.querySelector(`#nd-hist-metric-${rowId}`);
@@ -4512,7 +4643,7 @@
       search: async (q) => {
         const result = await App.get('/api/nodes/devices', { q, limit: 20 });
         return (result.devices || [])
-          .map((d) => ({ id: d.id, label: `${d.name || d.ip} (${d.ip})` }));
+          .map((d) => ({ id: d.id, label: histDeviceLabel(d) }));
       },
       onPick(id_) {
         devInput.dataset.deviceId = String(id_);
@@ -4521,7 +4652,7 @@
     });
     if (row.device_id != null) {
       App.get(`/api/nodes/devices/${row.device_id}`)
-        .then((d) => { devInput.value = `${d.name || d.ip} (${d.ip})`; }).catch(() => {});
+        .then((d) => { devInput.value = histDeviceLabel(d); }).catch(() => {});
       histFillMetricSelect(metricSel, row.device_id, row.metric_key).catch(() => {});
     }
   }
@@ -7458,10 +7589,16 @@
     App.el('nd-rep-fw-export-server').onclick = () => {
       exportFirmwareReportCsvFromServer().catch(() => {});
     };
+    App.el('nd-rep-sfp-run').onclick = () => { runSfpReport()?.catch(() => {}); };
+    App.el('nd-rep-sfp-export-csv').onclick = exportSfpReportCsv;
+    App.el('nd-rep-sfp-export-server').onclick = () => {
+      exportSfpReportCsvFromServer().catch(() => {});
+    };
     App.el('nd-sched-new').onclick = () => scheduleDialog(null);
     drawAvailReportTable();
     drawTopnReportTable();
     drawFirmwareReportTable();
+    drawSfpReportTable();
     drawScheduleTable();
 
     // The timeline is drawn into a viewBox sized from its box, so a

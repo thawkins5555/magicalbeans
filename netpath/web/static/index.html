@@ -340,6 +340,7 @@
       <button class="subtab active" data-subtab="availability">AVAILABILITY</button>
       <button class="subtab" data-subtab="topmetrics">TOP-N BY METRIC</button>
       <button class="subtab" data-subtab="firmware">FIRMWARE INVENTORY</button>
+      <button class="subtab" data-subtab="sfp">SFP INVENTORY</button>
       <button class="subtab" data-subtab="scheduled">SCHEDULED</button>
     </nav>
 
@@ -411,6 +412,24 @@
         <span id="nd-rep-fw-summary" class="hint"></span>
       </div>
       <div class="table-wrap"><table id="nd-rep-fw-table"></table></div>
+    </div>
+
+    <div id="nd-rep-sub-sfp" class="subpage">
+      <div class="bar wrap">
+        <span class="section">SFP INVENTORY</span>
+        <span class="hint">Every port holding a transceiver, from the last environment poll. DOM means the optic reports light levels and can be alerted on; SFP means a transceiver the switch names but that publishes no sensors.</span>
+      </div>
+      <div class="bar wrap">
+        <label>Group <select id="nd-rep-sfp-devgroup"></select></label>
+        <label class="check"><input type="checkbox" id="nd-rep-sfp-empty"> Include empty cages</label>
+        <button id="nd-rep-sfp-run" class="primary">Run report</button>
+        <button id="nd-rep-sfp-export-csv">Export CSV</button>
+        <button id="nd-rep-sfp-export-server">Download CSV from server</button>
+      </div>
+      <div class="bar wrap">
+        <span id="nd-rep-sfp-summary" class="hint"></span>
+      </div>
+      <div class="table-wrap"><table id="nd-rep-sfp-table"></table></div>
     </div>
 
     <div id="nd-rep-sub-scheduled" class="subpage">

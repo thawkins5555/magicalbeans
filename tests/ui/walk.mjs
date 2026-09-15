@@ -798,6 +798,38 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
     return `created, sent (status "${statusText}"), removed`;
   });
 
+  await check('the SFP inventory report runs and offers an export (Reports -> SFP INVENTORY)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'nodes');
+      await settle(page, 800);
+      await page.click('#page-nodes > .subtabs > .subtab[data-subtab="reports"]');
+      await page.waitForSelector('#nodes-sub-reports > .subtabs > .subtab[data-subtab="sfp"]',
+        { timeout: 20000 });
+      await page.click('#nodes-sub-reports > .subtabs > .subtab[data-subtab="sfp"]');
+      await page.waitForSelector('#nd-rep-sfp-run:not([hidden])', { timeout: 20000 });
+      await sleep(400);
+
+      const ran = page.waitForResponse((response) =>
+        response.url().includes('/api/nodes/reports/sfp')
+        && !response.url().includes('export.csv')
+        && response.request().method() === 'GET', { timeout: 10000 });
+      await page.click('#nd-rep-sfp-run');
+      const ranResponse = await ran;
+      assert(ranResponse.ok(), `running the SFP report answered ${ranResponse.status()}`);
+      await page.waitForFunction(
+        () => (document.querySelector('#nd-rep-sfp-summary') || {}).textContent.trim().length > 0,
+        { timeout: 10000 });
+      const summary = await page.locator('#nd-rep-sfp-summary').textContent();
+      // The demo fleet has no transceivers seeded, so "0 port(s)" is the
+      // expected, correct outcome here -- not a sign the report is broken.
+      assert(/\d+ port\(s\) on \d+ device\(s\)/.test(summary || ''),
+        `unexpected SFP report summary: "${summary}"`);
+      const exportVisible = await page.isVisible('#nd-rep-sfp-export-csv');
+      assert(exportVisible, 'Export CSV button is not visible on the SFP report');
+      return `summary "${summary.trim()}"`;
+    });
+
   await check('the NetFlow export CSV starts with a readable start/end pair (A1)',
     async () => {
       await page.keyboard.press('Escape').catch(() => {});
@@ -838,6 +870,20 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       await page.fill(`#${devInputId}`, firstDevice.ip);
       await page.waitForSelector(`#${devInputId}-list .combo-item`, { timeout: 10000 });
       await page.click(`#${devInputId}-list .combo-item`);
+
+      // The combo picks a device by name/sysName/IP search, but the label
+      // it paints back must read by name, not just the IP it was typed
+      // as -- displayName()'s precedence (histDeviceLabel in nodes.js).
+      const pickedLabel = await page.evaluate(
+        (id) => document.getElementById(id).value, devInputId);
+      if (firstDevice.sys_name) {
+        assert(pickedLabel.includes(firstDevice.sys_name),
+          `HISTORY device combo label "${pickedLabel}" does not include ` +
+          `sysName "${firstDevice.sys_name}"`);
+      } else {
+        assert(pickedLabel !== firstDevice.ip,
+          `HISTORY device combo label is still the bare IP: "${pickedLabel}"`);
+      }
 
       const metricSelId = devInputId.replace('nd-hist-dev-', 'nd-hist-metric-');
       await page.waitForFunction((id) => {

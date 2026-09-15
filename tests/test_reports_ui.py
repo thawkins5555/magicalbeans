@@ -1,7 +1,7 @@
 """Static checks for the Nodes -> REPORTS subtab (nodes.js/index.html), in the
 style of test_frontend_contracts.py: shipped files read as text, no browser.
 Covers: every report route is called from nodes.js; the subtab and its
-AVAILABILITY / TOP-N BY METRIC / FIRMWARE INVENTORY subpages use the standard subtab markup; no
+AVAILABILITY / TOP-N BY METRIC / FIRMWARE INVENTORY / SFP INVENTORY subpages use the standard subtab markup; no
 data-requires-write control anywhere; CSV export goes through App.saveCsv;
 tables use App.grid/sortRows/drawRows; a run request runs inside App.runJob."""
 import os
@@ -43,6 +43,10 @@ check("'/api/nodes/reports/firmware'" in NODES,
 check("'/api/nodes/reports/firmware/export.csv'" in NODES,
       "nodes.js offers the server-side firmware CSV as well as the "
       "client-side one, so a 900-device fleet is a file rather than a table")
+check("'/api/nodes/reports/sfp'" in NODES,
+      "nodes.js calls GET /api/nodes/reports/sfp")
+check("'/api/nodes/reports/sfp/export.csv'" in NODES,
+      "nodes.js offers the server-side SFP CSV as well as the client-side one")
 
 # ---------------------------------------------------------------------------
 # 2. The REPORTS subtab exists on the Nodes page, alongside the other four,
@@ -76,6 +80,9 @@ check('data-subtab="topmetrics"' in REPORTS_SECTION
 check('data-subtab="firmware"' in REPORTS_SECTION
       and 'id="nd-rep-sub-firmware"' in REPORTS_SECTION,
       "the Firmware inventory report subtab and its subpage exist")
+check('data-subtab="sfp"' in REPORTS_SECTION
+      and 'id="nd-rep-sub-sfp"' in REPORTS_SECTION,
+      "the SFP inventory report subtab and its subpage exist")
 check("function selectReportsSub(" in NODES,
       "nodes.js wires the nested reports subtabs by hand, like selectDetailSub")
 check("recallSub('nodes.reports'" in NODES and "rememberSub('nodes.reports'" in NODES,
@@ -122,6 +129,13 @@ for element_id in ["nd-rep-fw-devgroup", "nd-rep-fw-run", "nd-rep-fw-export-csv"
                    "nd-rep-fw-table"]:
     check('id="%s"' % element_id in NODES_SECTION,
           "Firmware report control #%s exists" % element_id)
+# The SFP report likewise has no period -- a group filter, an include-empty
+# checkbox, Run, and the two exports.
+for element_id in ["nd-rep-sfp-devgroup", "nd-rep-sfp-empty", "nd-rep-sfp-run",
+                   "nd-rep-sfp-export-csv", "nd-rep-sfp-export-server",
+                   "nd-rep-sfp-summary", "nd-rep-sfp-table"]:
+    check('id="%s"' % element_id in NODES_SECTION,
+          "SFP report control #%s exists" % element_id)
 
 # ---------------------------------------------------------------------------
 # 6. report.py's own query parameters are the ones actually sent: rank_by,
@@ -140,12 +154,14 @@ for param in ["key", "t0", "t1", "rank_by", "ascending", "like", "n", "device_id
 #    deviceIndex/plottedRange, applied to App.grid/App.sortRows/App.drawRows.
 check(NODES.count("App.grid(App.el('nd-rep-avail-table')") == 1
       and NODES.count("App.grid(App.el('nd-rep-topn-table')") == 1
-      and NODES.count("App.grid(App.el('nd-rep-fw-table')") == 1,
-      "all three report tables are built with App.grid")
+      and NODES.count("App.grid(App.el('nd-rep-fw-table')") == 1
+      and NODES.count("App.grid(App.el('nd-rep-sfp-table')") == 1,
+      "all four report tables are built with App.grid")
 check("App.sortRows(rows, view.repAvailSort.key" in NODES
       and "App.sortRows(rows, view.repTopnSort.key" in NODES
-      and "App.sortRows(rows, view.repFirmwareSort.key" in NODES,
-      "all three report tables sort with App.sortRows, not an inline .sort()")
+      and "App.sortRows(rows, view.repFirmwareSort.key" in NODES
+      and "App.sortRows(rows, view.repSfpSort.key" in NODES,
+      "all four report tables sort with App.sortRows, not an inline .sort()")
 check(NODES.count("App.drawRows(body,") >= 2 or NODES.count("App.drawRows(body, sorted") >= 1,
       "row rendering goes through App.drawRows")
 
@@ -166,11 +182,14 @@ check("new Blob(" not in CSV_HELPER,
       "OID walk download — this checks only the report CSV code)")
 check("App.el('nd-rep-avail-export-csv').onclick = exportAvailReportCsv" in NODES
       and "App.el('nd-rep-topn-export-csv').onclick = exportTopnReportCsv" in NODES
-      and "App.el('nd-rep-fw-export-csv').onclick = exportFirmwareReportCsv" in NODES,
+      and "App.el('nd-rep-fw-export-csv').onclick = exportFirmwareReportCsv" in NODES
+      and "App.el('nd-rep-sfp-export-csv').onclick = exportSfpReportCsv" in NODES,
       "every Export CSV button is wired to a report-specific export function")
 check("App.exportCsv('/api/nodes/reports/firmware/export.csv'" in NODES,
       "the firmware report's server-side download goes through App.exportCsv, "
       "the same helper every other server-built export uses")
+check("App.exportCsv('/api/nodes/reports/sfp/export.csv'" in NODES,
+      "the SFP report's server-side download goes through App.exportCsv too")
 
 # ---------------------------------------------------------------------------
 # 9. The device-group filter resolves through App.deviceIndex(), the one
@@ -189,7 +208,8 @@ check("function reportDeviceIds(" in NODES and "App.deviceIndex()" in NODES,
 #     a failure that never actually happened.
 for fn_name, call_name in [("runAvailabilityReport", "reportDeviceIds('nd-rep-avail-devgroup')"),
                            ("runTopMetricsReport", "reportDeviceIds('nd-rep-topn-devgroup')"),
-                           ("runFirmwareReport", "reportDeviceIds('nd-rep-fw-devgroup')")]:
+                           ("runFirmwareReport", "reportDeviceIds('nd-rep-fw-devgroup')"),
+                           ("runSfpReport", "reportDeviceIds('nd-rep-sfp-devgroup')")]:
     body = NODES[NODES.index("function %s(" % fn_name):]
     body = body[:body.index("\n  }\n", body.index("App.runJob("))]
     run_job_at = body.index("App.runJob(")

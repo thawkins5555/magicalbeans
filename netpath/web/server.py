@@ -385,6 +385,11 @@ ROUTES = [
      api.get_nodes_reports_firmware, ("nodes", R)),
     ("GET", r"^/api/nodes/reports/firmware/export\.csv$",
      api.get_nodes_reports_firmware_export, ("nodes", R)),
+    # SFP inventory, and the same report as a file.
+    ("GET", r"^/api/nodes/reports/sfp$",
+     api.get_nodes_reports_sfp, ("nodes", R)),
+    ("GET", r"^/api/nodes/reports/sfp/export\.csv$",
+     api.get_nodes_reports_sfp_export, ("nodes", R)),
     # Scheduled emailed reports (netpath/reportsched.py): run automatically or on demand.
     ("GET", r"^/api/nodes/reports/schedules$", api.get_nodes_report_schedules, ("nodes", R)),
     ("POST", r"^/api/nodes/reports/schedules$", api.post_nodes_report_schedule, ("nodes", W)),

@@ -19,7 +19,7 @@ from . import report as reportmod
 from .eventlog import SYSTEM
 
 CADENCES = ("daily", "weekly", "monthly")
-KINDS = ("availability", "top_metrics", "firmware")
+KINDS = ("availability", "top_metrics", "firmware", "sfp")
 
 # Body text formats a period as whole days; 20 rows is what an inbox reads
 # in one screen without an attachment.
@@ -213,10 +213,40 @@ def _render_firmware(service, params: dict, now: float):
     return subject, body, csvout.csv_text(_FIRMWARE_CSV_HEADER, csv_rows)
 
 
+_SFP_CSV_HEADER = ["device_id", "name", "ip", "if_index", "port", "alias", "kind",
+                   "media", "oper_status", "admin_status", "speed_bps",
+                   "last_seen_ts", "device"]
+
+
+def _render_sfp(service, params: dict, now: float):
+    device_ids = _device_ids_for_group(service.nodes_db, params.get("device_group_id"))
+    include_empty = bool(params.get("include_empty"))
+    report = reportmod.sfp_inventory(
+        service.nodes_db, device_ids=device_ids, hostnames=service.app_db.hostnames,
+        include_empty=include_empty)
+    subject = (f"SFP inventory — {report.port_count} port(s) on "
+              f"{report.device_count} device(s), {report.dom_count} DOM / "
+              f"{report.sfp_count} SFP")
+    lines = [subject,
+            f"Generated {time.strftime('%Y-%m-%d %H:%M', time.localtime(now))}", ""]
+    for r in report.rows[:_BODY_ROW_CAP]:
+        lines.append(f"  {r.name[:28]:<28} {r.port[:20]:<20} {r.kind:<10}")
+    if len(report.rows) > _BODY_ROW_CAP:
+        lines.append(f"  ... and {len(report.rows) - _BODY_ROW_CAP} more "
+                    "(see the attached CSV)")
+    body = "\n".join(lines) + "\n"
+
+    csv_rows = [[r.device_id, r.name, r.ip, r.if_index, r.port, r.alias, r.kind,
+                r.media, r.oper_status, r.admin_status, r.speed_bps,
+                r.last_seen_ts, r.device] for r in report.rows]
+    return subject, body, csvout.csv_text(_SFP_CSV_HEADER, csv_rows)
+
+
 _RENDERERS = {
     "availability": _render_availability,
     "top_metrics": _render_top_metrics,
     "firmware": _render_firmware,
+    "sfp": _render_sfp,
 }
 
 

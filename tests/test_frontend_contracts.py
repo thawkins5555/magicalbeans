@@ -3557,6 +3557,46 @@ check('"wireless": {"history_days": (1, 3650), "history_sample_s": (60, 86400)},
       "POST /api/settings refuses history_days <= 0 and history_sample_s "
       "below 60 the same way every other range-checked setting is refused")
 
+# --- 78. Priority-port row tint; HISTORY device combo shows a real name --
+NODES78 = read("nodes.js")
+check("tr.className = r.priority ? 'clickable priority' : 'clickable';" in NODES78,
+      "drawIfaceTable's App.drawRows callback adds 'priority' to a "
+      "priority port's row class, alongside 'clickable', so the tint and "
+      "the click handler share one row exactly like every other flagged "
+      "row in this codebase")
+check("tr.priority td { background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }"
+      in read("app.css"),
+      "app.css tints a priority-port row off --accent/--panel tokens, so "
+      "every theme block picks it up without a per-theme override")
+check("function histDeviceLabel(d) {" in NODES78,
+      "nodes.js's HISTORY device combo has its own label helper rather "
+      "than repeating `${d.name || d.ip} (${d.ip})`")
+check("const name = displayName(d);" in NODES78,
+      "...and that helper reads the module's shared display-name "
+      "precedence (manual name / sysName / name / ip), the same one "
+      "the device pane, the device dialog and the interface dialog use, "
+      "so a device known only by its SNMP sysName still shows a name "
+      "instead of just its IP")
+check(".map((d) => ({ id: d.id, label: histDeviceLabel(d) }));" in NODES78
+      and "devInput.value = histDeviceLabel(d);" in NODES78,
+      "...used for both the dropdown items and the label painted back "
+      "after a reload, so the two never drift")
+
+
+# --- 79. SFP inventory report, modelled on the firmware report -------------
+NODES79 = read("nodes.js")
+INDEX79 = read("index.html")
+check('data-subtab="sfp"' in INDEX79, "the Reports nested nav carries the SFP INVENTORY subtab")
+check('id="nd-rep-sub-sfp"' in INDEX79, "the SFP report has its own subpage")
+for needle in ("'/api/nodes/reports/sfp'", "'/api/nodes/reports/sfp/export.csv'",
+              "function runSfpReport(", "function drawSfpReportTable(",
+              "function exportSfpReportCsv("):
+    check(needle in NODES79, "nodes.js carries the SFP report route / handler %s" % needle)
+_SERVER79 = open(os.path.join(REPO_ROOT, "netpath", "web", "server.py"),
+                 encoding="utf-8").read()
+for needle in (r'r"^/api/nodes/reports/sfp$"', r'r"^/api/nodes/reports/sfp/export\.csv$"'):
+    check(needle in _SERVER79, "server.py routes the SFP report literal %s" % needle)
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

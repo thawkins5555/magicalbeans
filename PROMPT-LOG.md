@@ -5,6 +5,38 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.24.0 — Priority port tint, History search by name, SFP inventory report
+
+**Operator prompt, three items:**
+- "Priority ports should be slightly tinted in the Nodes -> Devices ->
+  Devices Details -> Interfaces list"
+- "Nodes -> History -> Device doesn't  show names but only IP's - should
+  be abLE TO search by IP or name and should show both in the drop
+  down."
+- "Create a report that will export a full list of Node SFP's ->
+  Should show the device name, device IP, switch port and whether it's
+  a regular SFP or a DOM SFP."
+
+**Notes:**
+1. Rows flagged Priority get a light tint in both copies of the
+   interface table (the device details dialog and its embedded view),
+   so a priority port is visible at a glance without opening a filter.
+2. The History device picker was reading the manual name field, which
+   most devices never have set, and falling back to the bare IP. It now
+   resolves a name the same way the device list does — SNMP hostname
+   first — and the dropdown shows both name and IP together; the
+   server-side search already matched on IP, name, and hostname, so no
+   change was needed there.
+3. New Nodes → Reports → SFP INVENTORY report, built from the per-port
+   media data the environment poll already collects: device name,
+   device IP, switch port, and a DOM/SFP call — DOM for an optic that
+   publishes light levels, plain SFP for a transceiver the switch names
+   but that reports no sensors, with empty cages left out. Available as
+   a CSV export and as a scheduled emailed report kind alongside the
+   existing report schedules.
+
+Outcome: (pending)
+
 ## 5.7.0 — Five reports
 
 **"Five things..."** — the standing working policy, plus five field reports:

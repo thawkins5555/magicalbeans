@@ -3199,6 +3199,42 @@ class NodesDatabase(SqliteStore):
                 "SELECT 1 FROM interfaces WHERE device_id = ? AND if_index = ?",
                 (device_id, if_index)).fetchone() is not None
 
+    def interfaces_with_media(self, device_ids=None,
+                              include_empty: bool = False) -> list[sqlite3.Row]:
+        """Every interface row carrying a transceiver (media = 'optic' or
+        'sfp'; also 'sfp_empty' cages when `include_empty`), joined to the
+        device columns a report needs to label and export it by. Excludes
+        purged devices the way device() does. `device_ids` narrows the
+        fleet; omitted, every device is considered."""
+        media_values = ["optic", "sfp"]
+        if include_empty:
+            media_values.append("sfp_empty")
+        clauses = ["i.media IN ({})".format(",".join("?" * len(media_values))),
+                  "d.id NOT IN (SELECT device_id FROM device_purges)"]
+        params: list = list(media_values)
+        if device_ids is not None:
+            ids = [int(i) for i in dict.fromkeys(device_ids)]
+            if not ids:
+                return []
+            ors = []
+            for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
+                ors.append(f"d.id IN ({','.join('?' * len(chunk))})")
+                params.extend(chunk)
+            clauses.append(f"({' OR '.join(ors)})")
+        where = " AND ".join(clauses)
+        with self._lock:
+            return self._conn.execute(
+                "SELECT d.id AS device_id, d.name AS name, d.sys_name AS sys_name,"
+                " d.display_name_source AS display_name_source, d.ip AS ip,"
+                " d.vendor AS vendor, i.if_index AS if_index, i.descr AS descr,"
+                " i.alias AS alias, i.media AS media, i.oper_status AS oper_status,"
+                " i.admin_status AS admin_status, i.speed_bps AS speed_bps,"
+                " i.last_seen_ts AS last_seen_ts"
+                " FROM interfaces i JOIN devices d ON d.id = i.device_id"
+                f" WHERE {where}"
+                " ORDER BY d.name COLLATE NOCASE, d.ip, i.if_index",
+                params).fetchall()
+
     # ------------------------------------------------ forwarding tables
 
     def replace_mac_entries(self, device_id: int, entries: list[dict],

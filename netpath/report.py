@@ -524,6 +524,85 @@ def firmware_inventory(nodesdb, device_ids: list[int] | None = None,
         unknown_count=sum(1 for r in rows if not r.sw_version), rows=rows)
 
 
+_MEDIA_KIND = {"optic": "DOM", "sfp": "SFP", "sfp_empty": "Empty cage"}
+
+
+@dataclass
+class SfpRow:
+    device_id: int
+    name: str
+    ip: str
+    device: str
+    if_index: int
+    port: str
+    alias: str
+    kind: str
+    media: str
+    oper_status: str
+    admin_status: str
+    speed_bps: int | None
+    last_seen_ts: float | None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class SfpReport:
+    generated_ts: float
+    device_count: int
+    port_count: int
+    dom_count: int
+    sfp_count: int
+    empty_count: int
+    rows: list[SfpRow]
+
+    def to_dict(self) -> dict:
+        return {"generated_ts": self.generated_ts,
+                "device_count": self.device_count,
+                "port_count": self.port_count,
+                "dom_count": self.dom_count,
+                "sfp_count": self.sfp_count,
+                "empty_count": self.empty_count,
+                "rows": [r.to_dict() for r in self.rows]}
+
+
+def sfp_inventory(nodesdb, device_ids: list[int] | None = None,
+                  dns_names: dict | None = None, hostnames=None,
+                  include_empty: bool = False) -> SfpReport:
+    """Every switch port holding a transceiver: DOM (optic, with sensors),
+    SFP (named by ENTITY-MIB, no DOM) and, when `include_empty`, empty
+    cages. `dns_names`/`hostnames` name a device the same way
+    firmware_inventory does when it has neither a manual name nor a
+    sysName."""
+    rows_in = nodesdb.interfaces_with_media(device_ids=device_ids,
+                                            include_empty=include_empty)
+    if dns_names is None and hostnames is not None:
+        dns_names = hostnames([row["ip"] for row in rows_in])
+    rows: list[SfpRow] = []
+    device_ids_seen: set[int] = set()
+    for row in rows_in:
+        ip = row["ip"]
+        label, _name_source = device_label(row, dns_names or {})
+        device = label if label == ip else f"{label} ({ip})"
+        port = row["descr"] or row["alias"] or f"port {row['if_index']}"
+        rows.append(SfpRow(
+            device_id=row["device_id"], name=label, ip=ip, device=device,
+            if_index=row["if_index"], port=port, alias=row["alias"] or "",
+            kind=_MEDIA_KIND.get(row["media"], row["media"] or ""),
+            media=row["media"] or "", oper_status=row["oper_status"] or "",
+            admin_status=row["admin_status"] or "",
+            speed_bps=row["speed_bps"], last_seen_ts=row["last_seen_ts"]))
+        device_ids_seen.add(row["device_id"])
+    return SfpReport(
+        generated_ts=time.time(), device_count=len(device_ids_seen),
+        port_count=len(rows),
+        dom_count=sum(1 for r in rows if r.media == "optic"),
+        sfp_count=sum(1 for r in rows if r.media == "sfp"),
+        empty_count=sum(1 for r in rows if r.media == "sfp_empty"),
+        rows=rows)
+
+
 def top_metric_ranking(nodesdb, key: str, t0: float, t1: float, *,
                        n: int = 20, rank_by: str = "peak",
                        ascending: bool = False, like: bool = False,

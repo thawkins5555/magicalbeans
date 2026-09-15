@@ -1036,6 +1036,8 @@ tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
    Nodes, Alerts and ConfigRX, which all use the same class. */
 tr.bulk-checked td { background: var(--checked); }
 tr.bulk-checked.selected td { background: var(--checked-strong); }
+/* Priority port: faint accent wash, mixed against --panel so the zebra stripe does not show through. */
+tr.priority td { background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
 /* Severity 1 and 2 are the alerts somebody is meant to walk over to, so
    they colour the whole row rather than one 62px badge. Severity is the
    syslog scale and counts DOWN — 0 (emergency) is worse than 1 — so the
