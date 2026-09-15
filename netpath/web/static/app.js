@@ -1449,10 +1449,11 @@ const App = (() => {
         </div>`, [
         { label: 'Cancel', onClick: () => { closeModal(); } },
         { label: 'Apply', primary: true, onClick: (b) => {
-            const start = new Date(b.querySelector('#rd-start').value).getTime() / 1000;
-            let end = new Date(b.querySelector('#rd-end').value).getTime() / 1000;
+            const start = Math.round(new Date(b.querySelector('#rd-start').value).getTime() / 1000);
+            let end = Math.round(new Date(b.querySelector('#rd-end').value).getTime() / 1000);
             if (!(end > start)) throw new Error('End must be after start');
-            end = Math.min(end, Date.now() / 1000);
+            // Rounded again -- Math.round(Date.now() / 1000) must also refuse a float.
+            end = Math.min(end, Math.round(Date.now() / 1000));
             const seconds = end - start;
             if (seconds < WINDOW_MIN_S || seconds > WINDOW_MAX_S) {
               throw new Error(`The range must be between ${span(WINDOW_MIN_S)} and ${span(WINDOW_MAX_S)}`);
@@ -3212,6 +3213,7 @@ const App = (() => {
     svg.addEventListener('pointercancel', () => { drag = null; paintBrush(); });
     svg.addEventListener('wheel', (event) => {
       if (!state.opts.onWindow) return;
+      if (state.opts.wheelRequiresCtrl && !event.ctrlKey && !event.metaKey) return;
       event.preventDefault();
       const { plot, t0, t1 } = state.geo;
       const x = Math.min(Math.max(svgX(event), plot.x), plot.x + plot.w);

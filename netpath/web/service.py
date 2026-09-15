@@ -353,12 +353,7 @@ class LdapUnavailable(Exception):
 
 
 class TacacsUnavailable(Exception):
-    """The AAA server could not be used at all — unreachable, timed out, or
-    misconfigured (no servers, an unset/empty shared secret, or one this
-    host cannot decrypt) — the TACACS+ counterpart to LdapUnavailable, and
-    answered the same way: api.post_login logs and audits it distinctly
-    from a plain wrong-password refusal, and never lets it surface as an
-    unhandled 500."""
+    """The AAA server could not be used at all -- the TACACS+ counterpart to LdapUnavailable."""
 
 
 class Service:
@@ -415,6 +410,8 @@ class Service:
         # is threaded, so two clicks land on two threads.
         self._mib_job = None
         self._mib_lock = threading.Lock()
+        # Negative cache for authenticate_tacacs — see _TACACS_OUTAGE_S.
+        self._tacacs_outage_until = 0.0
         self.alerts_settings = self.alerts_db.settings()
         self.wireless_settings = self.wireless_db.settings()
         self.configrx_settings = self.configrx_db.settings()
@@ -601,44 +598,51 @@ class Service:
                 ldapclient.LDAPConfigError) as exc:
             raise LdapUnavailable(str(exc)) from exc
 
+    # How long a TacacsUnavailable outcome is remembered before the next
+    # call tries the server again (see authenticate_tacacs).
+    _TACACS_OUTAGE_S = 10.0
+
     def authenticate_tacacs(self, username: str, password: str,
                             client_ip: str = "") -> bool:
-        """True if `username`/`password` PASSes against the configured
-        TACACS+ AAA server(s); False for a definite FAIL. Raises
-        TacacsUnavailable when the AAA server itself could not be used at
-        all (unreachable, timed out, no servers configured, or a shared
-        secret this host cannot decrypt) — see authenticate_ldap's
-        docstring for why that needs its own outcome rather than reading as
-        a wrong password. `client_ip` is sent as rem_addr, the same field
-        an AAA server's own logs and authorization rules key off.
+        """True/False for a definite PASS/FAIL; raises TacacsUnavailable
+        when the AAA server itself could not be used (see LdapUnavailable).
         """
         import base64
+        import binascii
 
         from .. import dpapi, tacacsclient
 
-        if password == "":
+        if password == "" or len(password.encode("utf-8", "replace")) > 255:
             return False
+        if self._tacacs_outage_until and time.monotonic() < self._tacacs_outage_until:
+            raise TacacsUnavailable("TACACS+ server recently unreachable")
         try:
-            servers = tacacsclient.parse_servers(
-                str(self.settings.get("tacacs_servers", "")))
-            secret_enc = str(self.settings.get("tacacs_secret_enc", ""))
-            if not secret_enc:
-                raise TacacsUnavailable(
-                    "No TACACS+ shared secret is configured")
             try:
-                secret = dpapi.unprotect(base64.b64decode(secret_enc)).decode("utf-8")
-            except dpapi.DpapiUnavailable as exc:
-                raise TacacsUnavailable(
-                    f"The stored TACACS+ shared secret could not be "
-                    f"decrypted: {exc}") from exc
-            return tacacsclient.authenticate(
-                servers, secret, username, password, rem_addr=client_ip,
-                timeout=float(self.settings.get("tacacs_timeout_s", 5.0) or 5.0))
-        except tacacsclient.TacacsConfigError as exc:
-            raise TacacsUnavailable(str(exc)) from exc
-        except (tacacsclient.TacacsConnectError,
-                tacacsclient.TacacsProtocolError) as exc:
-            raise TacacsUnavailable(str(exc)) from exc
+                servers = tacacsclient.parse_servers(
+                    str(self.settings.get("tacacs_servers", "")))
+                secret_enc = str(self.settings.get("tacacs_secret_enc", ""))
+                if not secret_enc:
+                    raise TacacsUnavailable(
+                        "No TACACS+ shared secret is configured")
+                try:
+                    secret = dpapi.unprotect(base64.b64decode(secret_enc)).decode("utf-8")
+                except (dpapi.DpapiUnavailable, binascii.Error, ValueError) as exc:
+                    raise TacacsUnavailable(
+                        f"The stored TACACS+ shared secret could not be "
+                        f"decrypted: {exc}") from exc
+                result = tacacsclient.authenticate(
+                    servers, secret, username, password, rem_addr=client_ip,
+                    timeout=float(self.settings.get("tacacs_timeout_s", 5.0) or 5.0))
+            except tacacsclient.TacacsConfigError as exc:
+                raise TacacsUnavailable(str(exc)) from exc
+            except (tacacsclient.TacacsConnectError,
+                    tacacsclient.TacacsProtocolError) as exc:
+                raise TacacsUnavailable(str(exc)) from exc
+        except TacacsUnavailable:
+            self._tacacs_outage_until = time.monotonic() + self._TACACS_OUTAGE_S
+            raise
+        self._tacacs_outage_until = 0.0
+        return result
 
     def authenticate_api_token(self, raw_token: str, client: str = "") -> str | None:
         """The username an API token authenticates as, or None if it does
@@ -977,6 +981,7 @@ class Service:
         return value
 
     def apply_global_settings(self, values: dict) -> dict:
+        self._tacacs_outage_until = 0.0
         self.settings.update(values)
         self.app_db.save_settings(self.settings)
         self.sessions.configure(

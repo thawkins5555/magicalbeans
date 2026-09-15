@@ -73,14 +73,7 @@ class Forbidden(PermissionError):
 
 
 def role_grants(name: str) -> dict:
-    """The permission grid a TACACS+ auto-created account starts with,
-    mirroring settings.js's ROLE_PRESETS exactly (same three names, same
-    module exclusions) so an account created by the preset picker in
-    Settings and one auto-created on first TACACS+ sign-in land on the
-    identical grant. Raises ValueError for anything else, the same way an
-    unknown auth_source does — a typo in a stored default must not silently
-    grant nothing.
-    """
+    """Permission grid a TACACS+ auto-created account starts with; mirrors settings.js's ROLE_PRESETS."""
     if name == "viewer":
         # `web` has no read tier to hand out — the relay is a write.
         return {m: READ for m in MODULES if m not in ("admin", "ssh", "web")}

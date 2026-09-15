@@ -3242,6 +3242,24 @@ check("tacacs_secret_set" in SETTINGS66,
 check("AUTH_SOURCE_LABEL" in SETTINGS66 and "scope=\"col\">Source<" in SETTINGS66,
       "the users table gets a Source column naming local/LDAP/TACACS+")
 
+# --- 67. Dashboard zoom: rounded t0/t1, ctrl-gated wheel, debounced saves --
+DASH67 = read("dashboard.js")
+check("(key === 't0' || key === 't1') ? Math.round(value) : value" in DASH67,
+      "sanitizedLayout rounds t0/t1 to an int -- the server's _dash_int refuses a float")
+check("Math.round(new Date(b.querySelector('#rd-start').value)" in APP
+      and "Math.round(new Date(b.querySelector('#rd-end').value)" in APP,
+      "App.rangeDialog's Apply handler rounds the start/end it resolves")
+check("Math.round(Date.now() / 1000)" in APP,
+      "App.rangeDialog's Date.now() clamp is rounded too")
+check("wheelRequiresCtrl: true" in DASH67,
+      "dashboard.js's tile zoom requires ctrl/meta on a wheel, so a plain "
+      "wheel over a tile scrolls the page instead of zooming")
+check("state.opts.wheelRequiresCtrl && !event.ctrlKey && !event.metaKey" in APP,
+      "App.attachChartZoom's wheel listener honours opts.wheelRequiresCtrl")
+check("function queueLayoutSave(layoutTile)" in DASH67 and ", 400)" in DASH67,
+      "dashboard.js debounces a tile's zoom-driven layout save by 400ms "
+      "instead of PUTting once per wheel tick")
+
 if failures:
     print("FAILED %d contract(s):" % len(failures))
     for message in failures:

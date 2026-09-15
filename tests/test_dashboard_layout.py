@@ -289,6 +289,9 @@ try:
         ("t1 <= t0", {"t0": 5000, "t1": 5000}),
         ("a span over 120 days", {"t0": 0, "t1": 2592000 * 4 + 1}),
         ("an unknown config key", {"bogus_key": 1}),
+        # Documents the contract dashboard.js's sanitizedLayout and app.js's
+        # rangeDialog round for: _dash_int refuses a non-int t0/t1.
+        ("t0 as a float", {"t0": 1000.5, "t1": 5000}),
     ]
     for name, config in bad_iface_cases:
         status, payload = put_tile(config)
@@ -302,6 +305,8 @@ try:
          {"device_id": keep_device, "metric_key": "cpu_pct", "y_max": 10**15}),
         ("a pinned t0/t1 range",
          {"device_id": keep_device, "metric_key": "cpu_pct", "t0": 1000, "t1": 5000}),
+        ("y_max 0.5 (a fractional unit)",
+         {"device_id": keep_device, "metric_key": "cpu_pct", "y_max": 0.5}),
     ]
     for name, config in good_metric_cases:
         status, payload = put_tile(config, tile_type="device_metric")

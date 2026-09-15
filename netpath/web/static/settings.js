@@ -104,7 +104,7 @@
     App.el('set-ldap-timeout').value = s.ldap_timeout_s ?? 10;
     App.el('set-tacacs-enabled').checked = !!s.tacacs_enabled;
     App.el('set-tacacs-servers').value = s.tacacs_servers || '';
-    App.el('set-tacacs-timeout').value = s.tacacs_timeout_s ?? 10;
+    App.el('set-tacacs-timeout').value = s.tacacs_timeout_s ?? 5;
     App.el('set-tacacs-autocreate').checked = !!s.tacacs_auto_create;
     App.el('set-tacacs-role').value = s.tacacs_default_role || 'viewer';
     // tacacs_secret is write-only and never comes back from the server —
@@ -790,7 +790,7 @@
     const values = {
       tacacs_enabled: App.el('set-tacacs-enabled').checked,
       tacacs_servers: App.el('set-tacacs-servers').value.trim(),
-      tacacs_timeout_s: Number(App.el('set-tacacs-timeout').value) || 10,
+      tacacs_timeout_s: Number(App.el('set-tacacs-timeout').value) || 5,
       tacacs_auto_create: App.el('set-tacacs-autocreate').checked,
       tacacs_default_role: App.el('set-tacacs-role').value,
     };

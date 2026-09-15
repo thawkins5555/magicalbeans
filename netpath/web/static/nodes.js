@@ -25,10 +25,7 @@
     // for the device that dialog is about rather than the selected one.
     metrics: [],
     timeline: null,
-    // The status timeline's window, set by the range dropdown above it
-    // (#nd-d-range) — or, once a drag/wheel zoom on the bar or "Custom…"
-    // pins an absolute one, chartPinned instead. The Bridge & RF pane's
-    // charts (loadRfChart) follow the same window.
+    // Set by the #nd-d-range dropdown, or chartPinned once a drag/wheel/Custom pins one.
     chartRange: 3600,
     chartPinned: null,
     // The packet-loss chart lives in the device dialog now (double-click a
@@ -1314,9 +1311,7 @@
       x: width, y: height - 2, 'text-anchor': 'end', fill: 'var(--dim)',
       'font-family': 'var(--mono)', 'font-size': 'var(--fs-2xs)',
     }, App.stamp(t1, span)));
-    // Drag-select the same brush/wheel/keyboard machinery drawSeriesChart's
-    // charts get, over a geo shaped the way that function returns one — the
-    // bar has no y-axis, so plot.h is just the full drawn height.
+    // Same brush/wheel/keyboard zoom as drawSeriesChart; the bar has no y-axis, so plot.h is the full height.
     App.attachChartZoom(svg, { plot: { x: 0, y: 0, w: width, h: height }, width, t0, t1 }, {
       onWindow: setTimelineWindow, onReset: resetTimelineWindow,
     });
@@ -1539,9 +1534,7 @@
      than reading view.detail / view.ifaces / view.events, which always
      describe the selection. Opened by double-clicking a row; `trigger` is
      that row, passed explicitly (see the ondblclick assignment above). */
-  // initialLossWindow: {t0, t1} to reopen already pinned to — see
-  // interfaceDialog's own initialWindow for why "Custom…" has to close and
-  // reopen this dialog rather than resume it in place.
+  // initialLossWindow: {t0, t1} to reopen already pinned to (see interfaceDialog's initialWindow).
   function deviceDialog(deviceId, trigger, initialLossWindow) {
     if (deviceId == null) return;
     // The same ticket idiom the interface and OID dialogs use: App.modal
@@ -1559,9 +1552,7 @@
     // and a dialog's own data belongs to its own closure the same way the
     // interface dialog's bandwidth chart already works.
     let lossRange = 3600;
-    // Non-null once a drag, a wheel zoom, a reopen with initialLossWindow or
-    // "Custom…" pins an absolute window on the loss chart — the #ifd-range
-    // idiom, one dialog over.
+    // Non-null once a drag/wheel/Custom pins an absolute window on the loss chart.
     let lossPinned = initialLossWindow || null;
     let lossRequestId = 0;
 
@@ -1714,9 +1705,7 @@
 
     box.querySelector('#ndd-loss-range').onchange = async (e) => {
       if (e.target.value === 'custom') {
-        // Same "close, then reopen already pinned" fix interfaceDialog's
-        // own #ifd-range uses — App.rangeDialog opens in this dialog's own
-        // shared #modal-box, replacing it.
+        // Close and reopen already pinned, same as interfaceDialog's #ifd-range.
         const picked = await App.rangeDialog(lossPinned || {});
         if (!picked) { syncLossRangeSelect(); return; }
         App.closeModal();
@@ -2591,12 +2580,7 @@
      opened from — there is only one #modal-box, so opening this one replaced
      its parent. */
   // initialWindow: {t0, t1} to reopen already pinned to, after "Custom…"
-  // below closes this same dialog to show App.rangeDialog — App.modal is
-  // one shared box that a second modal() call replaces wholesale, so a
-  // range picker opened from inside this dialog cannot float over it the
-  // way it can over the plain (non-dialog) range controls; closing and
-  // reopening is the pattern every other nested flow here already uses
-  // (see the "← Back to device" button below).
+  // closes this dialog to show App.rangeDialog (one shared #modal-box).
   function interfaceDialog(iface, deviceId, onBack, initialWindow) {
     if (deviceId == null) deviceId = view.selected;
     const ifIndex = iface.if_index;
@@ -2612,10 +2596,7 @@
 
     let smooth = true;
     let chartRange = 3600;
-    // Non-null once a drag, a wheel zoom, a reopen with initialWindow or
-    // "Custom…" pins an absolute window; refreshChart() reads it ahead of
-    // chartRange, and picking a preset from #ifd-range or Home in the chart
-    // clears it back to "follow the last N seconds".
+    // Non-null once pinned; refreshChart() reads it ahead of chartRange.
     let pinned = initialWindow || null;
     let lastChart = null;   // last data drawn, so the checkbox can redraw it
     // The chart owns its own axis-hysteresis memory across redraws of this
@@ -2729,11 +2710,7 @@
 
     box.querySelector('#ifd-range').onchange = async (event) => {
       if (event.target.value === 'custom') {
-        // App.rangeDialog opens through the same shared #modal-box this
-        // dialog is already showing in — modal() replaces a box's contents
-        // rather than stacking over it, so this dialog is gone the moment
-        // that one opens. Reopening with the picked window is the fix, the
-        // same "close, then rebuild" shape "← Back to device" already uses.
+        // Same "close, then rebuild" shape "← Back to device" already uses.
         const picked = await App.rangeDialog(pinned || {});
         if (!picked) { syncRangeSelect(); return; }
         App.closeModal();

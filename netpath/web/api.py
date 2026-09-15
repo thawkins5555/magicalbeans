@@ -6269,16 +6269,12 @@ def get_nodes_device_series(service, params, body, device_id) -> dict:
 
 # ------------------------------------------------------- batch series route
 #
-# One request for several devices'/metrics' series, so a dashboard tile
-# with several interfaces on one graph does not cost one request per
-# interface per metric per refresh. A device or metric this account cannot
-# see -- or that simply is not on file -- answers with an empty series
-# rather than a 404: one bad entry in `q` must not fail the whole tile.
+# One request for several devices'/metrics' series -- a bad or unseeable
+# entry in `q` answers empty rather than failing the whole tile.
 
 _SERIES_BATCH_MAX = 16
-# "if_in_bps.<if_index>" / "if_out_bps.<if_index>" -- the per-port metric
-# keys nodepoll.py records (see _INTERFACE_METRICS) -- get an interface's
-# own descr/alias as their label instead of the metric's generic one.
+# Per-port metric keys nodepoll.py records -- get the interface's own
+# descr/alias as their label instead of the metric's generic one.
 _IFACE_METRIC_KEY_RE = re.compile(r"^if_(?:in|out)_bps\.(\d+)$")
 
 
@@ -10023,16 +10019,23 @@ def post_login(service, params, body) -> dict:
         if (row is None and username
                 and service.settings.get("tacacs_enabled")
                 and service.settings.get("tacacs_auto_create")):
-            # An unknown username, TACACS+ on, and auto-create on: ask the
-            # AAA server before falling to the dummy-hash "no such account"
-            # path below, since for this account the AAA server's answer IS
-            # whether it should exist. No dummy hash here — a network round
-            # trip to the AAA server already dominates the timing a dummy
-            # hash exists to flatten.
+            # No dummy hash here -- the AAA round trip already dominates
+            # the timing a dummy hash exists to flatten.
             role = str(service.settings.get("tacacs_default_role", "viewer"))
+            try:
+                grants = _permissions.role_grants(role)
+            except ValueError as exc:
+                service.log.add(
+                    ERROR_CATEGORY,
+                    f"Refused auto-create for {label}: tacacs_default_role "
+                    f"{role!r} is not a known role: {exc}")
+                raise PermissionError(
+                    "Sign-in is misconfigured. Contact an administrator."
+                ) from exc
             try:
                 accepted = service.authenticate_tacacs(username, password, client)
             except TacacsUnavailable as exc:
+                service.throttle.record_failure(username, client)
                 service.log.add(
                     ERROR_CATEGORY,
                     f"TACACS+ AAA server unreachable while signing in "
@@ -10050,9 +10053,14 @@ def post_login(service, params, body) -> dict:
                 _audit(service, dict(params, _username=label), "signin.failed",
                        target=label, detail="tacacs rejected")
                 raise PermissionError("Wrong username or password")
-            service.app_db.add_user(username, "", must_change=False,
-                                    auth_source="tacacs")
-            service.app_db.set_permissions(username, _permissions.role_grants(role))
+            try:
+                service.app_db.add_user(username, "", must_change=False,
+                                        auth_source="tacacs")
+            except sqlite3.IntegrityError:
+                # Two PASSes for the same new username raced; the loser
+                # just re-reads the row the winner created.
+                pass
+            service.app_db.set_permissions(username, grants)
             service.log.add(
                 SYSTEM_CATEGORY,
                 f"Auto-created TACACS+ account {username} (role {role})")
@@ -10078,12 +10086,7 @@ def post_login(service, params, body) -> dict:
         auth_source = row["auth_source"]
 
         if auth_source == "tacacs" and not already_authed:
-            # A tacacs-mapped account: the AAA server verifies the
-            # password, not the empty, never-consulted local hash. With the
-            # feature switched off this account simply cannot sign in — it
-            # never falls back to an empty local hash (verify_password
-            # refuses that anyway), and failing here first gives a clearer
-            # audit trail than "wrong password".
+            # tacacs-mapped: the AAA server verifies, never the empty local hash.
             if not service.settings.get("tacacs_enabled"):
                 service.throttle.record_failure(username, client)
                 service.log.add(
@@ -10634,11 +10637,8 @@ def post_ldap_test(service, params, body) -> dict:
 
 # ------------------------------------------------------------ TACACS+ test
 #
-# The TACACS+ counterpart to post_ldap_test above: a dry-run PAP login
-# against tacacs_servers/tacacs_secret (or the overrides in the body), so
-# an administrator finds out whether AAA sign-in works before turning
-# tacacs_enabled on for a real account. Never creates a session and never
-# consults or changes a stored account.
+# The TACACS+ counterpart to post_ldap_test above: a dry-run PAP login,
+# never touching a stored account.
 
 def post_tacacs_test(service, params, body) -> dict:
     import base64
@@ -10655,6 +10655,7 @@ def post_tacacs_test(service, params, body) -> dict:
     secret_override = str(body.get("secret", ""))
     timeout = float(body.get("timeout_s", 0)
                     or service.settings.get("tacacs_timeout_s", 5.0) or 5.0)
+    timeout = min(max(timeout, 1.0), 60.0)
 
     try:
         servers = tacacsclient.parse_servers(servers_text)
@@ -11017,14 +11018,10 @@ DEFAULT_DASHBOARD_LAYOUT = {
     ],
 }
 
-# The graph tiles' window choices -- mirrors App.RANGES in app.js (15m/1h/
-# 6h/24h/3d/7d/30d), the only seven dashboard.js ever offers, so a config
-# carrying anything else did not come from the grid's own dialog.
+# Mirrors App.RANGES in app.js -- the only window choices dashboard.js offers.
 _DASHBOARD_WINDOW_S_VALUES = (900, 3600, 21600, 86400, 259200, 604800, 2592000)
 
-# A pinned t0/t1 range's widest allowed span -- app.js's own WINDOW_MAX_S
-# (2592000 * 4, 120 days), the ceiling the shared zoom/range dialog already
-# clamps to everywhere else a chart lets someone pick an absolute range.
+# A pinned t0/t1 range's widest allowed span -- mirrors app.js's WINDOW_MAX_S.
 _DASHBOARD_MAX_SPAN_S = 2592000 * 4
 
 
@@ -11035,6 +11032,19 @@ def _dash_int(value, lo=None, hi=None, allowed=None):
         raise ValueError(f"expected an integer, got {value!r}")
     if allowed is not None and value not in allowed:
         raise ValueError(f"{value!r} is not one of {allowed!r}")
+    if lo is not None and value < lo:
+        raise ValueError(f"{value!r} is below the minimum {lo}")
+    if hi is not None and value > hi:
+        raise ValueError(f"{value!r} is above the maximum {hi}")
+    return value
+
+
+def _dash_num(value, lo=None, hi=None):
+    """A finite int or float, never a bool -- some metrics' y_max is fractional."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"expected a number, got {value!r}")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"expected a finite number, got {value!r}")
     if lo is not None and value < lo:
         raise ValueError(f"{value!r} is below the minimum {lo}")
     if hi is not None and value > hi:
@@ -11119,7 +11129,7 @@ _DASHBOARD_CONFIG_SCHEMA = {
         "device_id": lambda v: _dash_int(v),
         "metric_key": lambda v: _dash_str(v, 200),
         "name": lambda v: _dash_str(v, 60),
-        "y_max": lambda v: _dash_int(v, 0, 10**15),
+        "y_max": lambda v: _dash_num(v, 0, 10**15),
         "window_s": lambda v: _dash_int(v, allowed=_DASHBOARD_WINDOW_S_VALUES),
         "t0": lambda v: _dash_int(v, 0, int(MAX_TIMESTAMP)),
         "t1": lambda v: _dash_int(v, 0, int(MAX_TIMESTAMP)),

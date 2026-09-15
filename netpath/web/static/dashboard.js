@@ -1047,6 +1047,17 @@
     });
   }
 
+  // Coalesces repeated zoom-wheel onWindow calls on one tile into a single
+  // PUT, 400ms after the last tick, instead of one save per wheel event.
+  const dashZoomSaveTimers = {};
+  function queueLayoutSave(layoutTile) {
+    clearTimeout(dashZoomSaveTimers[layoutTile.id]);
+    dashZoomSaveTimers[layoutTile.id] = setTimeout(() => {
+      delete dashZoomSaveTimers[layoutTile.id];
+      saveLayoutAndRefetch(layoutTile);
+    }, 400);
+  }
+
   // Persists the layout with the tile's own change (window preset, a custom
   // pin, or Live) and forces an immediate refetch of just that tile, rather
   // than waiting out the next refresh() tick.
@@ -1111,10 +1122,12 @@
         { emptyText: 'No data in this window', peak: cfg.y_max || undefined });
       if (layoutTile && !view.editing && geo) {
         App.attachChartZoom(svg, geo, {
+          wheelRequiresCtrl: true,
           onWindow: (t0, t1) => {
             layoutTile.config = layoutTile.config || {};
-            layoutTile.config.t0 = t0; layoutTile.config.t1 = t1;
-            saveLayoutAndRefetch(layoutTile);
+            layoutTile.config.t0 = Math.round(t0); layoutTile.config.t1 = Math.round(t1);
+            drawCharts();
+            queueLayoutSave(layoutTile);
           },
           onReset: () => {
             if (!layoutTile.config) return;
@@ -1232,7 +1245,10 @@
       tiles: (layout.tiles || []).map((t) => {
         const config = {};
         for (const [key, value] of Object.entries(t.config || {})) {
-          if (value !== null && value !== undefined) config[key] = value;
+          if (value !== null && value !== undefined) {
+            // _dash_int refuses a float, so a drag/wheel/dialog t0-t1 is rounded here too.
+            config[key] = (key === 't0' || key === 't1') ? Math.round(value) : value;
+          }
         }
         return { id: t.id, type: t.type, w: t.w, h: t.h, config };
       }),

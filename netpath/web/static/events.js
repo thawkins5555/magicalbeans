@@ -304,11 +304,7 @@
         apply: `${spec.prefix}-apply`, clear: `${spec.prefix}-clear`,
         clears: spec.bar.clears.map((suffix) => `${spec.prefix}-${suffix}`),
       });
-      // filterBar wired a plain refresh to range's change above; this
-      // replaces that handler (same element, last assignment wins) so
-      // "Custom…" opens the range dialog and pins the window the same way
-      // clicking a histogram bucket already does, instead of window_()
-      // trying to parse "custom" as a number of seconds.
+      // Replaces filterBar's plain-refresh handler so "Custom…" opens the range dialog.
       const rangeSelect = el('range');
       rangeSelect.onchange = async () => {
         if (rangeSelect.value !== 'custom') { App.refreshNow(spec.tab); return; }

@@ -1,11 +1,6 @@
 """A minimal TACACS+ (RFC 8907) client for PAP login authentication over one
-shared secret — verifies a username and password against an AAA server,
-hand-rolling the fixed-width wire format since the standard library ships no
-TACACS+ client and this app is stdlib-only. No AUTHOR, no ACCT, no CHAP/
-MSCHAP, no TAC_PLUS_SINGLE_CONNECT_FLAG session reuse: one TCP connection
-per login attempt, one START and one REPLY, then closed. Modelled on
-ldapclient.py's shape (error hierarchy, pure encode/decode helpers, one
-public authenticate()).
+shared secret. No AUTHOR, no ACCT, no CHAP/MSCHAP, no session reuse: one TCP
+connection per login attempt. Modelled on ldapclient.py's shape.
 """
 
 from __future__ import annotations
@@ -20,21 +15,20 @@ DEFAULT_TIMEOUT_S = 5.0
 MAX_SERVERS = 4
 # The wire format's user/port/rem_addr/data lengths are each one byte.
 MAX_FIELD_LEN = 255
-# A garbage or malicious reply length must not be handed straight to a
-# blocking recv() loop as a memory/time bomb -- a real AUTHEN REPLY is a
-# status byte and a short message, nowhere near this.
+# Well above a real AUTHEN REPLY's size -- guards recv() against a garbage/malicious length.
 MAX_BODY_LEN = 65535
 
-# TAC_PLUS_MAJOR_VER (0xc) << 4 | TAC_PLUS_MINOR_VER_DEFAULT (0).
+# TAC_PLUS_MAJOR_VER << 4 | TAC_PLUS_MINOR_VER_DEFAULT (0); kept as the header default.
 VERSION = 0xC0
+# minor_version 1 -- RFC 8907 5.4.2.2 requires this on a PAP START; tac_plus rejects 0xC0.
+VERSION_PAP = 0xC1
+ACCEPTED_VERSIONS = (VERSION, VERSION_PAP)
 TYPE_AUTHEN = 0x01
 
 SEQ_NO_START = 1
 SEQ_NO_REPLY = 2
 
-# TAC_PLUS_UNENCRYPTED_FLAG (RFC 8907 §4.1): the body was sent in the
-# clear. This client never sets it on a request and refuses a reply that
-# sets it -- see authenticate()'s docstring.
+# TAC_PLUS_UNENCRYPTED_FLAG (RFC 8907 §4.1) -- never set on a request; a reply setting it is refused.
 FLAG_UNENCRYPTED = 0x01
 
 ACTION_LOGIN = 0x01
@@ -63,46 +57,25 @@ class TacacsError(Exception):
 
 
 class TacacsConfigError(TacacsError):
-    """The caller's own setup is wrong: an unparsable/empty servers string,
-    an empty shared secret, or a field (username, password, rem_addr) too
-    long to fit the wire format's one-byte length. Never sent a byte over
-    the network."""
+    """Bad caller-side setup (servers string, secret, or an oversized field) -- never sent a byte."""
 
 
 class TacacsConnectError(TacacsError):
-    """No server in the list could be reached at all: DNS/TCP refusal, a
-    connect or read timeout, or a connection reset -- on every server, not
-    just one. Reported with the last such error, in `authenticate()`'s own
-    per-server order."""
+    """No server in the list could be reached; carries the last connect/read error."""
 
 
 class TacacsProtocolError(TacacsError):
-    """A reply arrived but is not a usable authentication answer: an
-    oversized claimed length, a session_id/seq_no mismatch, the header's
-    own TAC_PLUS_UNENCRYPTED_FLAG set (a server that skipped obfuscation
-    entirely), or a status this client does not treat as a credential
-    decision (ERROR, RESTART, FOLLOW, or an unexpected GETUSER/GETPASS/
-    GETDATA round trip -- PAP answers PASS/FAIL in the one exchange this
-    client sends). A body obfuscated with the wrong shared secret decodes
-    to the same kind of nonsense as any other malformed reply, so it
-    surfaces here too, on purpose: raised immediately out of
-    `authenticate()` rather than treated as "try the next server", because
-    a wrong secret must be visible, not silently swallowed as a mere
-    connectivity blip."""
+    """A reply arrived but isn't a usable PASS/FAIL -- includes a wrong shared secret, so it is
+    raised immediately rather than tried against the next server."""
 
 
 _SERVER_SPLIT_RE = re.compile(r"[,\s]+")
 
 
 def parse_servers(text: str) -> list[tuple[str, int]]:
-    """`tacacs_servers` as stored -> [(host, port)]: comma- or whitespace-
-    separated "host[:port]" entries, default port DEFAULT_PORT, at most
-    MAX_SERVERS. An IPv6 literal needs [brackets] to pair with a ":port"
-    the same way any URL host does; a bare (unbracketed) one is accepted
-    with the default port, since every colon in it is part of the address.
-    Raises TacacsConfigError for anything that does not parse cleanly, or
-    an empty string -- there is no safe guess for a AAA server's address.
-    """
+    """`tacacs_servers` as stored -> [(host, port)]: comma/whitespace-separated
+    "host[:port]" entries, default port DEFAULT_PORT, at most MAX_SERVERS.
+    Raises TacacsConfigError for anything that does not parse, or is empty."""
     pieces = [p for p in _SERVER_SPLIT_RE.split(str(text or "").strip()) if p]
     if not pieces:
         raise TacacsConfigError("at least one TACACS+ server is required")
@@ -164,8 +137,7 @@ def encode_header(*, session_id: bytes, seq_no: int, length: int, flags: int = 0
 
 
 def decode_header(data: bytes) -> dict:
-    """The inverse of encode_header, for tests and the reply path: {"version",
-    "type", "seq_no", "flags", "session_id", "length"}."""
+    """The inverse of encode_header, for tests and the reply path."""
     if len(data) != 12:
         raise TacacsProtocolError("a TACACS+ header is exactly 12 bytes")
     return {
@@ -300,9 +272,9 @@ def authenticate(servers, secret: str, username: str, password: str, *,
                 continue
 
             session_id = os.urandom(4)
-            encrypted = obfuscate(body_plain, session_id, key, VERSION, SEQ_NO_START)
+            encrypted = obfuscate(body_plain, session_id, key, VERSION_PAP, SEQ_NO_START)
             header = encode_header(session_id=session_id, seq_no=SEQ_NO_START,
-                                   length=len(encrypted))
+                                   length=len(encrypted), version=VERSION_PAP)
             try:
                 sock.sendall(header + encrypted)
                 reply_header = _recv_exact(sock, 12)
@@ -314,6 +286,14 @@ def authenticate(servers, secret: str, username: str, password: str, *,
                 continue
 
             head = decode_header(reply_header)
+            if head["version"] not in ACCEPTED_VERSIONS:
+                raise TacacsProtocolError(
+                    f"{host}:{port} replied with an unsupported TACACS+ "
+                    f"version (0x{head['version']:02x})")
+            if head["type"] != TYPE_AUTHEN:
+                raise TacacsProtocolError(
+                    f"{host}:{port} replied with packet type "
+                    f"0x{head['type']:02x}, expected AUTHEN")
             if head["length"] > MAX_BODY_LEN:
                 raise TacacsProtocolError(
                     f"{host}:{port} claims an implausible reply length "
@@ -341,7 +321,7 @@ def authenticate(servers, secret: str, username: str, password: str, *,
                     f"{host}:{port} answered out of sequence "
                     f"(seq_no={head['seq_no']}, expected {SEQ_NO_REPLY})")
 
-            r_body = obfuscate(r_body_enc, session_id, key, VERSION, head["seq_no"])
+            r_body = obfuscate(r_body_enc, session_id, key, head["version"], head["seq_no"])
             status, _reply_flags, _server_msg, _data = parse_authen_reply(r_body)
             if status == STATUS_PASS:
                 return True

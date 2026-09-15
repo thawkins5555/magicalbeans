@@ -201,14 +201,15 @@ CREDS = {"alice": "correct-horse"}
 
 
 def _reply_bytes(session_id, secret, seq_no, status, *, flags=0, server_msg=b"",
-                 data=b"", header_flags=0, key=None):
+                 data=b"", header_flags=0, key=None,
+                 version=tacacsclient.VERSION, packet_type=tacacsclient.TYPE_AUTHEN):
     body = (bytes([status, flags]) + len(server_msg).to_bytes(2, "big")
            + len(data).to_bytes(2, "big") + server_msg + data)
     use_key = key if key is not None else secret.encode("utf-8")
-    encrypted = tacacsclient.obfuscate(body, session_id, use_key,
-                                       tacacsclient.VERSION, seq_no)
+    encrypted = tacacsclient.obfuscate(body, session_id, use_key, version, seq_no)
     head = tacacsclient.encode_header(session_id=session_id, seq_no=seq_no,
-                                      length=len(encrypted), flags=header_flags)
+                                      length=len(encrypted), flags=header_flags,
+                                      version=version, packet_type=packet_type)
     return head + encrypted
 
 
@@ -227,6 +228,7 @@ class FakeTacacsServer:
         self.secret = secret
         self.host = host
         self.received: list[tuple[str, str]] = []
+        self.received_versions: list[int] = []
         self.connections = 0
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
         self.sock = socket.socket(family, socket.SOCK_STREAM)
@@ -269,6 +271,7 @@ class FakeTacacsServer:
             pos += r_len   # rem_addr -- ditto
             password = body[pos:pos + d_len].decode("utf-8")
             self.received.append((user, password))
+            self.received_versions.append(head["version"])
             reply = self.respond(user, password, head)
             if reply is not None:
                 conn.sendall(reply)
@@ -299,7 +302,8 @@ print("scripted fake TACACS+ server -- the PASS/FAIL outcomes")
 def credentialed(user, password, head):
     status = (tacacsclient.STATUS_PASS if CREDS.get(user) == password
              else tacacsclient.STATUS_FAIL)
-    return _reply_bytes(head["session_id"], SHARED_SECRET, head["seq_no"] + 1, status)
+    return _reply_bytes(head["session_id"], SHARED_SECRET, head["seq_no"] + 1, status,
+                        version=head["version"])
 
 
 server = FakeTacacsServer(credentialed)
@@ -313,8 +317,37 @@ try:
     ok = tacacsclient.authenticate(server.servers(), SHARED_SECRET, "alice",
                                    "wrong", timeout=3)
     check("FAIL: a wrong password returns False, does not raise", ok is False, ok)
+    check("the PAP START carries minor_version 1 (0xC1), not 0xC0",
+          server.received_versions[-1] == tacacsclient.VERSION_PAP,
+          hex(server.received_versions[-1]))
 finally:
     server.stop()
+
+print("a reply that echoes 0xC0 instead of the client's own 0xC1 still decodes")
+echo_c0_srv = FakeTacacsServer(lambda u, p, h: _reply_bytes(
+    h["session_id"], SHARED_SECRET, h["seq_no"] + 1, tacacsclient.STATUS_PASS,
+    version=tacacsclient.VERSION))
+try:
+    ok = tacacsclient.authenticate(echo_c0_srv.servers(), SHARED_SECRET, "alice",
+                                   "correct-horse", timeout=3)
+    check("a 0xC0 reply to a 0xC1 START is still accepted and decodes to PASS",
+          ok is True, ok)
+finally:
+    echo_c0_srv.stop()
+
+print("a reply whose packet type is not AUTHEN is a TacacsProtocolError")
+wrong_type_srv = FakeTacacsServer(lambda u, p, h: _reply_bytes(
+    h["session_id"], SHARED_SECRET, h["seq_no"] + 1, tacacsclient.STATUS_PASS,
+    version=h["version"], packet_type=0x02))
+try:
+    try:
+        tacacsclient.authenticate(wrong_type_srv.servers(), SHARED_SECRET, "alice",
+                                  "correct-horse", timeout=3)
+        check("a non-AUTHEN reply type: did not raise (unexpected)", False)
+    except tacacsclient.TacacsProtocolError:
+        check("a non-AUTHEN reply type raises TacacsProtocolError", True)
+finally:
+    wrong_type_srv.stop()
 
 print("empty password refused before any I/O")
 dead_port = free_tcp_port()
@@ -543,6 +576,19 @@ try:
               f"{status} {payload}")
 
         status, payload, _h = call(
+            "POST", "/api/settings",
+            {"scope": "global", "values": {"tacacs_servers": "10.0.0.1:notaport"}},
+            token=admin_cookie)
+        check("a bad tacacs_servers port is refused (400), not silently stored",
+              status == 400, f"{status} {payload}")
+        status, payload, _h = call(
+            "POST", "/api/settings",
+            {"scope": "global", "values": {"tacacs_default_role": "root"}},
+            token=admin_cookie)
+        check("an unknown tacacs_default_role is refused (400) at save time",
+              status == 400, f"{status} {payload}")
+
+        status, payload, _h = call(
             "POST", "/api/users",
             {"username": "alice", "auth_source": "tacacs",
              "grants": {"nodes": "read"}}, token=admin_cookie)
@@ -663,6 +709,41 @@ try:
     finally:
         auto_srv.stop()
 
+    # ------------------------------------------ auto-create + AAA outage
+    print("auto-create + AAA outage: unknown username holds no login slot "
+         "past the negative cache")
+    stall_srv = FakeTacacsServer(_HANG_FOREVER)
+    try:
+        status, payload, _h = enable_tacacs(stall_srv, auto_create=True,
+                                            default_role="viewer",
+                                            extra_values={"tacacs_timeout_s": 1})
+        check("setup: tacacs pointed at a server that never answers",
+              status == 200, f"{status} {payload}")
+
+        status, payload, _h = call(
+            "POST", "/api/login", {"username": "brandnewperson", "password": "whatever"})
+        check("unknown username + AAA outage: refused, not a 500",
+              status == 401, f"{status} {payload}")
+        check("...with the distinct AAA-unreachable message, not 'wrong password'",
+              "aaa server" in str(payload.get("error", "")).lower(), payload)
+        check("...and no account was created",
+              service.app_db.user("brandnewperson") is None)
+
+        conns_after_first = stall_srv.connections
+        check("...the first attempt actually reached the server",
+              conns_after_first >= 1, conns_after_first)
+
+        status, payload, _h = call(
+            "POST", "/api/login", {"username": "brandnewperson", "password": "whatever"})
+        check("a second immediate attempt also fails closed, not a 500",
+              status == 401, f"{status} {payload}")
+        check("...answered from the negative cache without opening a new "
+              "socket to the AAA server",
+              stall_srv.connections == conns_after_first,
+              (stall_srv.connections, conns_after_first))
+    finally:
+        stall_srv.stop()
+
     print("tacacs disabled: a tacacs account cannot sign in")
     status, payload, _h = call(
         "POST", "/api/settings", {"scope": "global", "values": {"tacacs_enabled": False}},
@@ -754,6 +835,43 @@ try:
               status == 403, f"{status} {payload}")
     finally:
         test_srv.stop()
+
+    # ------------------------------------------------- direct Service unit checks
+    print("Service.authenticate_tacacs: over-long password, bad role, bad secret")
+
+    long_password = "x" * 256
+    ok = service.authenticate_tacacs("alice", long_password)
+    check("a password over 255 bytes is a plain False reject, before any I/O",
+          ok is False, ok)
+
+    status, payload, _h = call(
+        "POST", "/api/settings", {"scope": "global", "values": {
+            "tacacs_enabled": True, "tacacs_servers": "127.0.0.1:1",
+            "tacacs_auto_create": True, "tacacs_default_role": "viewer"}},
+        token=admin_cookie)
+    check("setup: tacacs re-enabled for the role/secret checks below",
+          status == 200, f"{status} {payload}")
+    # apply_global_settings bypasses post_global_settings' own validation --
+    # simulates a role that was valid when stored and no longer is.
+    service.apply_global_settings({"tacacs_default_role": "not-a-real-role"})
+    status, payload, _h = call(
+        "POST", "/api/login", {"username": "roleprobe", "password": "whatever"})
+    check("an unknown tacacs_default_role is refused before add_user runs, "
+         "not a 500", status == 401, f"{status} {payload}")
+    check("...and no half-created account is left behind",
+          service.app_db.user("roleprobe") is None)
+    service.apply_global_settings({"tacacs_default_role": "viewer"})
+
+    service.apply_global_settings({"tacacs_secret_enc": "not valid base64 at all!!"})
+    try:
+        service.authenticate_tacacs("alice", "correct-horse")
+        check("an undecodable stored secret raises TacacsUnavailable, not "
+              "an unhandled exception", False)
+    except Exception as exc:
+        from netpath.web.service import TacacsUnavailable
+        check("an undecodable stored secret raises TacacsUnavailable, not "
+              "an unhandled exception", isinstance(exc, TacacsUnavailable),
+              type(exc))
 
     print("FAILED: " + ", ".join(failures) if failures else "ALL TACACS+ ASSERTIONS PASSED")
 finally:

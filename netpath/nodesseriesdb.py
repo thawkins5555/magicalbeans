@@ -266,13 +266,7 @@ class NodesSeriesDatabase(SqliteStore):
                 "SELECT * FROM metrics WHERE id = ?", (metric_id,)).fetchone()
 
     def metric_by_key(self, device_id: int, key: str) -> sqlite3.Row | None:
-        """One metric row by its natural (device_id, key) key -- the same
-        pair UNIQUE(device_id, key) indexes, so this is a single indexed
-        lookup rather than a scan. metrics_for_keys() answers "the newest
-        value of this key, fleet-wide"; this answers "does THIS device have
-        THIS metric, and what id/unit/label does it use" -- what the
-        dashboard batch series route (api.get_nodes_series_batch) resolves
-        a "<device_id>:<key>" pair through."""
+        """One metric row by its (device_id, key) unique index."""
         with self._lock:
             return self._conn.execute(
                 "SELECT * FROM metrics WHERE device_id = ? AND key = ?",

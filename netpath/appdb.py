@@ -31,17 +31,9 @@ CREATE TABLE IF NOT EXISTS users (
     updated_ts   REAL NOT NULL,
     last_login   REAL,
     must_change  INTEGER NOT NULL DEFAULT 0,
-    -- 'local' (the default: this row's `password` hash is authoritative),
-    -- 'ldap' (sign-in verifies against the configured directory instead —
-    -- see post_login and Service.authenticate_ldap) or 'tacacs' (sign-in
-    -- verifies against a TACACS+ AAA server -- see post_login and
-    -- Service.authenticate_tacacs). Either way `password` is stored empty
-    -- and never consulted. A column rather than a second table because
-    -- every other property of an account — its grants, its sessions, its
-    -- audit trail — is identical regardless; only how the password check
-    -- is done differs. Added by _migrate() below for a database that
-    -- predates this feature, the same way every other column added after
-    -- a table's first CREATE is.
+    -- 'local' (hash in `password` is authoritative), 'ldap', or 'tacacs'
+    -- (see post_login / Service.authenticate_ldap|_tacacs; `password` is
+    -- stored empty for either). Added by _migrate() for old databases.
     auth_source  TEXT NOT NULL DEFAULT 'local'
 );
 
@@ -303,32 +295,12 @@ GLOBAL_DEFAULTS = {
     # smtp_allow_plain_auth already uses for the same reason.
     "ldap_allow_cleartext": False,
     "ldap_timeout_s": 10.0,
-    # TACACS+ (RFC 8907) AAA sign-in, the same administrator-only shape as
-    # the ldap_* keys above: applies only to accounts created with
-    # auth_source='tacacs' — see users.auth_source, permissions.role_grants
-    # and api.post_login.
     "tacacs_enabled": False,
-    # Comma/whitespace-separated "host[:port]" entries, default port 49, up
-    # to 4 — see tacacsclient.parse_servers. No default host, the same
-    # reason ldap_url has none.
     "tacacs_servers": "",
     "tacacs_timeout_s": 5.0,
-    # Off: an unknown username that PASSes against the AAA server never
-    # gets an account here at all, matching ldap's "the directory decides
-    # who exists, this only decides who local sign-in trusts" model as
-    # closely as a feature that auto-provisions can. On: the first PASS for
-    # a username with no local row creates one, with tacacs_default_role's
-    # grants — see api.post_login.
     "tacacs_auto_create": True,
-    # One of permissions.role_grants' names ("viewer"/"operator"/"admin"),
-    # applied to an auto-created account. Never "admin" by default: a
-    # misconfigured or compromised AAA server must not be able to mint
-    # local administrators just by answering PASS to a made-up username.
+    # Never "admin" by default -- a compromised AAA server must not mint accounts at that role.
     "tacacs_default_role": "viewer",
-    # The shared secret, dpapi.protect()-encrypted the same way the SNMPv3
-    # and SMTP credentials are (see api._encrypt_secret) — never stored or
-    # returned in the clear. Base64 text, since this table's value column is
-    # TEXT rather than a dedicated BLOB column.
     "tacacs_secret_enc": "",
 }
 
