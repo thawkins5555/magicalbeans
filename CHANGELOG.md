@@ -207,8 +207,20 @@ its own row with the same checkbox every other row has and a **Folded
 into <ip>** note beside it. Ticking it and approving behaves exactly
 like a **Same as** row: it adds that address as its own device, using
 the address and identity the sweep read from that row alone, and marks
-only that row promoted. The primary row it had folded into is untouched
-and can still be added on its own, in the same batch or a later one.
+only that row promoted. The primary row it had folded into is
+untouched: ticked and approved in the same batch, both rows become
+their own devices, since each is promoted from its own identity and
+address; left for a later batch, the primary by then reads **Same as**
+the device the folded row became — at *high* confidence — and starts
+unticked like any other match, so it needs its own tick and a second
+Approve to be added as a second device. Select-all, in both the
+Results pane and the approval dialog, still skips every flagged or
+folded row, so a tick against either kind of match is always a
+deliberate one, not something a bulk select just swept in. The scan's
+own device counts — the discard-scan confirmation and the "already
+monitored" tally on Add approved — count a folded row together with
+its primary as one device, not two, so those numbers are unchanged by
+a folded row now being listed.
 
 **The hint's evidence is unchanged.** Every row still shows why it was
 flagged — which address is configured on the existing device, or which

@@ -1370,14 +1370,9 @@ async function checkDialog(page, dir, tag) {
     }
   });
 
-  await check('discovery results render the Same as column and take a promote', async () => {
-    // The demo fleet's SNMP personas don't answer ipAddrTable, so a sweep
-    // here never folds two addresses together, and there is no reliable way
-    // to hand two personas the same sysName+sysObjectID at different
-    // addresses either — both are what would put a "Same as"/"Folded into"
-    // row in front of the operator. Short of that, this only proves the
-    // column renders and a promote through the new {result_ids,
-    // force_result_ids} contract does not fail the request.
+  await check('discovery results render the Same as column and re-read cleanly', async () => {
+    // The demo fleet never folds/flags a result, so this only proves the
+    // column renders and re-reading the job's results still succeeds.
     const setup = await page.evaluate(async () => {
       const groups = await App.get('/api/nodes/groups');
       const group = (groups.groups || [])[0];

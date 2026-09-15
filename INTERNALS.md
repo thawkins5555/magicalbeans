@@ -3145,7 +3145,7 @@ unambiguous.
 .../discovery/<job>/promote` now reads two bodies —`result_ids`
 (promotes normally: any fold or high-confidence match still applies) and
 `force_result_ids` (each one promoted with `force=True`) — and calls
-`promote()` once per list, concatenating the device ids; a legacy
+`promote()` once, passing both lists in the one call; a legacy
 `{"result_ids": [...], "force": true}` body still applies `force` to the
 whole list, so nothing that scripted the old contract breaks. An empty
 body (neither list, and no legacy ids) is refused with 400. On the
@@ -3153,18 +3153,29 @@ frontend, `discForceSplit(ids, rows)` (`nodes.js`) does the sorting: a
 ticked id whose row carries `duplicate_of_device_id` or
 `folded_into_result_id` goes into `force_result_ids`, everything else
 into `result_ids` — both the Results pane's Promote button and the
-approval dialog's Add approved button call it before posting. Inside
-`promote()`, forcing a *folded* result (as opposed to a plain
-high-confidence match) takes a different path from forcing a fold away:
-`is_folded` stays true, so the result is promoted from its own
-`ip`/identity/`_result_addresses` rather than swapped for its primary,
-and only that one row is marked promoted (`mark_promoted`, not
-`_mark_promoted_family`) — the primary keeps its own unpromoted state
-and can still be promoted separately, in the same call or a later one.
-Both the pane and the dialog now seed their default tick sets excluding
-`duplicate_of_device_id` and `folded_into_result_id` rows the same way,
-closing the gap where the pane pre-ticked a **Same as** row the dialog
-would not have.
+approval dialog's Add approved button call it before posting, sending
+both lists to the server in the one call. `promote(job_id, result_ids,
+force=False, force_ids=())` handles the two lists as one call, forced
+ids first: each forced id is promoted with `force=True` from its own
+`ip`/identity/`_result_addresses` rather than swapped for its primary
+(`is_folded` stays true, and only that one row is marked promoted via
+`mark_promoted`, not `_mark_promoted_family`), so a forced folded row
+becomes its own device even when its primary is ticked in the same
+call — `_mark_promoted_family` skips a sibling result that is itself
+forced, and a non-forced row's own fold-resolution ignores any device a
+forced row in this same call just created, so a primary ticked
+alongside its forced folded row is never quietly swapped onto that new
+device. Device ids from both lists are deduplicated before being
+returned to the caller. The primary keeps its own unpromoted state when
+its forced folded row is added alone; promoted in a later call, it by
+then resolves to a high-confidence match on the device the forced row
+became (its walked address was recorded as `CONFIGURED_SOURCE` even
+though it was force-added), so it needs a plain, non-forced promote of
+its own — a second tick and a second Approve — to be added as a second
+device. Both the pane and the dialog now seed their default tick sets
+excluding `duplicate_of_device_id` and `folded_into_result_id` rows the
+same way, closing the gap where the pane pre-ticked a **Same as** row
+the dialog would not have.
 
 `_record_promoted_addresses`, added in 5.27.0, splits what a promoted
 result writes to `device_addresses` the same way `_refresh_addresses`

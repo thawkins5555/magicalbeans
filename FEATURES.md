@@ -967,7 +967,10 @@ own subtabs.
   device in its own right, using the identity and address that row was
   actually reached on — useful when what looks like one box on two
   addresses is genuinely two, or when both addresses are worth having
-  as independent devices regardless.
+  as independent devices regardless. Tick and approve the folded row
+  alone, leaving its primary for a later batch, and the primary then
+  shows up as its own **Same as** match on that new device — it needs
+  its own tick and a second Approve to be added too.
 - **A result that looks like a device you already have says which one —
   and, from 5.28.0, the operator can overrule it.** A **Same as** column
   names it and how sure the scan is: *high* means an address that

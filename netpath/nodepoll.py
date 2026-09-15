@@ -2268,7 +2268,7 @@ class NodePoller(Worker):
         return addresses
 
     def promote(self, job_id: int, result_ids: list[int],
-                force: bool = False) -> list[int]:
+                force: bool = False, force_ids=()) -> list[int]:
         """Creates a devices row per discovery result. The target profile
         is the job's own group_id when the job carries one and that
         profile still exists (a job started under a non-default profile
@@ -2291,21 +2291,24 @@ class NodePoller(Worker):
         promoted as its primary, so ticking either row adds one device;
         a result whose walked addresses match a device's configured
         addresses is recorded on that device rather than added beside it.
-        `force` keeps a folded result as itself instead — the sweep
-        identified it fully before folding it, so it is promoted from its
-        own ip/identity/walked addresses, as a second device, and only
-        that one row is marked promoted.
+        `force_ids` (or `force=True` for everything) adds those rows as
+        their own device, processed first so a primary ticked alongside still gets one.
         """
         job = self.db.discovery_job(job_id)
         allow_ping_only = bool(job and job["allow_ping_only"])
         family = self._folded_family(job_id)
+        forced = set(force_ids) | (set(result_ids) if force else set())
+        ordered_ids = list(force_ids) + [rid for rid in result_ids if rid not in force_ids]
+        ordered_ids.sort(key=lambda rid: 0 if rid in forced else 1)
         device_ids = []
         seen_results = set()
-        for raw_id in result_ids:
+        forced_devices: set[int] = set()
+        for raw_id in ordered_ids:
             result = self.db.discovery_result(raw_id)
+            is_forced = raw_id in forced
             is_folded = result is not None and result.keys().__contains__("folded_into_result_id") \
                 and bool(result["folded_into_result_id"])
-            if is_folded and not force:
+            if is_folded and not is_forced:
                 primary = self.db.discovery_result(result["folded_into_result_id"])
                 if primary is not None:
                     result = primary
@@ -2323,10 +2326,10 @@ class NodePoller(Worker):
                 continue
             addresses = self._result_addresses(result)
             existing = self.db.device_by_ip(result["ip"])
-            if existing is None and not force:
+            if existing is None and not is_forced:
                 for address in addresses:
                     owner = self.db.device_id_for_address(address, configured=True)
-                    if owner is not None:
+                    if owner is not None and owner not in forced_devices:
                         existing = self.db.device(owner)
                         break
             if existing is not None:
@@ -2334,8 +2337,10 @@ class NodePoller(Worker):
                 if is_folded:
                     self.db.mark_promoted(result_id, existing["id"])
                 else:
-                    self._mark_promoted_family(result_id, existing["id"], family)
+                    self._mark_promoted_family(result_id, existing["id"], family, forced)
                 device_ids.append(existing["id"])
+                if is_forced:
+                    forced_devices.add(existing["id"])
                 continue
             job_group_id = job["group_id"] if job and "group_id" in job.keys() else None
             group_id = result["suggested_group_id"]
@@ -2380,9 +2385,17 @@ class NodePoller(Worker):
             if is_folded:
                 self.db.mark_promoted(result_id, device_id)
             else:
-                self._mark_promoted_family(result_id, device_id, family)
+                self._mark_promoted_family(result_id, device_id, family, forced)
             device_ids.append(device_id)
-        return device_ids
+            if is_forced:
+                forced_devices.add(device_id)
+        seen_devices = set()
+        deduped = []
+        for did in device_ids:
+            if did not in seen_devices:
+                seen_devices.add(did)
+                deduped.append(did)
+        return deduped
 
     def _record_promoted_addresses(self, device_id: int, result, addresses: list[str]) -> None:
         """The sweep's own ipAdEntAddr walk is configured evidence at once;
@@ -2407,11 +2420,15 @@ class NodePoller(Worker):
         return family
 
     def _mark_promoted_family(self, result_id: int, device_id: int,
-                              family: dict[int, list[int]]) -> None:
+                              family: dict[int, list[int]], skip: set[int]) -> None:
         """Mark the promoted row and every row folded into it, so all of
-        that device's addresses show as added, not only the one ticked."""
+        that device's addresses show as added, not only the one ticked —
+        except a sibling in `skip`, which is (or will be) promoted on its
+        own."""
         self.db.mark_promoted(result_id, device_id)
         for folded_id in family.get(result_id, ()):
+            if folded_id in skip:
+                continue
             self.db.mark_promoted(folded_id, device_id)
 
     # ------------------------------------------------------------------ loop

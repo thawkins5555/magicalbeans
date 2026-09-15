@@ -6041,10 +6041,7 @@
     return !r.existing_device_id && !!(r.snmp_ok || (job && job.allow_ping_only));
   }
 
-  /* Ticked ids, split into the plain promote list and the ones that need
-     force_result_ids because the sweep flagged or folded them — the only
-     way an operator adds a "Same as"/"Folded into" row as its own device
-     rather than onto the box the sweep guessed. */
+  // Ticked ids, split into the plain promote list and force_result_ids for rows the sweep flagged or folded.
   function discForceSplit(ids, rows) {
     const byId = new Map(rows.map((r) => [r.id, r]));
     const result_ids = [];
@@ -6116,8 +6113,7 @@
       return '<span class="hint" title="Only devices identified over SNMP can be ' +
         'added from this scan">\u2014</span>';
     }
-    // A flagged or folded row still gets a box: ticking it is how the
-    // operator overrules the sweep's guess and adds it as its own device.
+    // A flagged/folded row still gets a box: ticking it overrules the sweep's guess.
     const flagged = r.duplicate_of_device_id || r.folded_into_result_id;
     const flagReason = r.duplicate_of_device_id ? (r.duplicate_reason || '')
       : `Reached on another address of ${r.folded_into_ip}`;
@@ -6125,6 +6121,7 @@
       ? ` title="Ticking adds it as a separate device \u2014 ${escape(flagReason)}"`
       : '';
     return `<input type="checkbox" class="${cls}" data-result="${r.id}"${warn}` +
+      `${flagged ? ' data-flagged="1"' : ''}` +
       ` aria-label="Select ${escape(r.ip || 'result')}"` +
       `${checkedSet.has(r.id) ? ' checked' : ''}>`;
   }
@@ -6197,7 +6194,9 @@
      The results table gets this from App.grid's own selectAll now; what is
      left here is the approval dialog, whose table is a plain modal one. */
   function wireDiscSelectAll(table, cls, checkedSet, redraw) {
-    const boxes = [...table.querySelectorAll(`.${cls}`)];
+    // Same as/Folded into rows still carry a box (discCheckCell) but must
+    // not be part of "all", matching discSelectable's exclusion on the grid.
+    const boxes = [...table.querySelectorAll(`.${cls}`)].filter((b) => !b.dataset.flagged);
     const head = table.querySelector('thead th');
     if (!head || !boxes.length) return;
     const all = document.createElement('input');
@@ -6459,6 +6458,9 @@
     const r = await App.get(`/api/nodes/discovery/${job.id}`);
     const results = r.results;
     const found = results.filter((x) => x.ping_ok || x.snmp_ok);
+    // Folded rows are counted with the box the sweep folded them onto, not
+    // as their own device — so both counts below exclude them.
+    const foundCount = found.filter((x) => !x.folded_into_result_id).length;
     // A row matched to a device already on file, flagged as a probable
     // duplicate, or folded into another address, starts unticked regardless
     // of confidence — pre-ticking any of those is how one gets added on
@@ -6479,7 +6481,7 @@
       // and that nobody has approved yet goes with it, so confirm first.
       // The confirm replaces this dialog; cancelling reopens it.
       App.confirmDestructive('Discard scan',
-        `<p>Discard this scan and all <b>${found.length}</b> device(s) it found?</p>` +
+        `<p>Discard this scan and all <b>${foundCount}</b> device(s) it found?</p>` +
         '<p class="hint">Nothing found by this scan is added to Nodes. Devices you ' +
         'already approved from an earlier scan are not affected.</p>',
         'Discard', async () => {
@@ -6526,7 +6528,7 @@
         // of this scan's hits were monitored before the operator ever
         // pressed this button, said back so the count of newly-added
         // devices is never mistaken for the size of the sweep.
-        const already = found.filter((x) => x.existing_device_id).length;
+        const already = found.filter((x) => x.existing_device_id && !x.folded_into_result_id).length;
         const added = checked.size;
         if (checked.size) {
           await App.post(`/api/nodes/discovery/${job.id}/promote`,

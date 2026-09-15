@@ -3718,9 +3718,29 @@ check(HINT83 in INDEX83,
       "the Results pane (#disc-promote) carries the same hint sentence, "
       "as a <p class=\"hint\"> near the Promote button")
 
-check("!r.duplicate_of_device_id && !r.folded_into_result_id);" in NODES,
+check("!r.duplicate_of_device_id && !r.folded_into_result_id);" in NODES83,
       "the results grid's select-all skips flagged and folded rows, which are "
       "added separately only by their own tick")
+check("${flagged ? ' data-flagged=\"1\"' : ''}" in NODES83,
+      "discCheckCell marks a flagged or folded row's box with data-flagged, "
+      "so it can be told apart from a plain selectable one")
+check("const boxes = [...table.querySelectorAll(`.${cls}`)]"
+      ".filter((b) => !b.dataset.flagged);" in NODES83,
+      "wireDiscSelectAll (the approval dialog's header box) excludes flagged/"
+      "folded boxes from its subset, the same rule the Results grid's "
+      "select-all applies")
+check("const foundCount = found.filter((x) => !x.folded_into_result_id).length;"
+      in NODES83,
+      "the discard confirm's device count excludes folded rows, which are "
+      "not their own device")
+check("`<p>Discard this scan and all <b>${foundCount}</b> device(s) it found?</p>`"
+      in NODES83,
+      "the discard confirm text uses the folded-excluding foundCount, not "
+      "found.length")
+check("const already = found.filter((x) => x.existing_device_id "
+      "&& !x.folded_into_result_id).length;" in NODES83,
+      "the already-monitored count excludes folded rows too, since a "
+      "primary promote also marks its folded siblings existing_device_id")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

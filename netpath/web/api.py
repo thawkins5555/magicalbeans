@@ -7221,11 +7221,8 @@ def delete_nodes_discovery_job(service, params, body, job_id) -> dict:
 
 
 def post_nodes_discovery_promote(service, params, body, job_id) -> dict:
-    """`result_ids` promote normally (a folded row still folds onto its
-    primary); `force_result_ids` promote with force=True, so a flagged
-    duplicate or a folded row is added as its own device instead. The
-    legacy body `{"result_ids": [...], "force": true}` still applies
-    force to the whole list."""
+    """`result_ids` promote normally; `force_result_ids` (or legacy
+    `force: true`) add those rows as their own device instead."""
     _require(service.nodes_db.discovery_job(job_id), "discovery job")
     legacy_force = bool(body.get("force"))
     result_ids = _bulk_ids(body, "result_ids", noun="discovery results", required=False)
@@ -7233,11 +7230,12 @@ def post_nodes_discovery_promote(service, params, body, job_id) -> dict:
                                  required=False)
     if not result_ids and not force_result_ids:
         raise ValueError("No results selected")
-    device_ids = []
-    if result_ids:
-        device_ids += service.node_poller.promote(job_id, result_ids, force=legacy_force)
-    if force_result_ids:
-        device_ids += service.node_poller.promote(job_id, force_result_ids, force=True)
+    combined = []
+    for result_id in result_ids + force_result_ids:
+        if result_id not in combined:
+            combined.append(result_id)
+    device_ids = service.node_poller.promote(
+        job_id, combined, force=legacy_force, force_ids=force_result_ids)
     service.log.add(NODES_CATEGORY,
                     f"Promoted {len(device_ids)} device(s) from discovery job #{job_id}")
     return {"device_ids": device_ids}
