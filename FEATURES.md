@@ -432,8 +432,11 @@ use — 15 minutes to 30 days — plus **Custom…** for an explicit date/time
 range, and changing it saves straight back to the account's layout at
 once: no need to open Edit layout and then Configure just to look
 further back. A pinned custom range shows a **Live** button beside the
-select to return to a rolling window. Drag-to-zoom, wheel-zoom and the
-keyboard on the chart itself do the same thing, and pin the same way.
+select to return to a rolling window. Drag-to-zoom and the keyboard on
+the chart itself do the same thing, and pin the same way. Wheel-zoom on a
+tile needs **Ctrl** (or **Cmd** on a Mac) held — a tile sits inside a
+scrolling Dashboard page, so a plain wheel over the chart scrolls the
+page like everywhere else, and only the modified scroll zooms it.
 
 **The device field in every dashboard Configure dialog is a themed
 search-and-pick list**, matching the rest of the application, rather than
@@ -1218,11 +1221,13 @@ from the event log rather than from samples.
 **From 5.22.0, the loss chart (and RESOURCES with it) also offers
 Custom…**, the same shared date/time dialog every other chart's range
 list now has, plus drag-to-zoom, wheel-zoom and the keyboard directly on
-the chart. Picking a custom range, or dragging one, closes and reopens
-the device dialog already pinned to it — this dialog shares one
-on-screen box with every other dialog in the application, so a second one
-replaces rather than stacks over the first, and reopening pinned is how
-every nested range picker here already handles that.
+the chart. Dragging a range or turning the wheel pins the chart in place
+without disturbing the dialog underneath; only picking **Custom…** closes
+and reopens the device dialog, already pinned to the chosen range — this
+dialog shares one on-screen box with every other dialog in the
+application, so a second one replaces rather than stacks over the first,
+and reopening pinned is how every nested range picker here already
+handles that.
 
 **From 5.0.0, a RESOURCES section under PACKET LOSS charts CPU, memory and
 chassis temperature** over that same range, sharing its dropdown and its
@@ -1297,10 +1302,11 @@ size; the fifteen-second live refresh continues underneath it exactly as
 before.
 
 **From 5.22.0, the same chart takes Custom…, drag-to-zoom, wheel-zoom
-and the keyboard.** Picking Custom… or dragging a range on the chart
-closes and reopens the interface dialog already pinned to it, the same
-"one shared dialog box" pattern the device dialog's loss chart uses just
-above.
+and the keyboard.** Dragging a range or turning the wheel pins the chart
+in place without touching the dialog; only picking **Custom…** closes and
+reopens the interface dialog, already pinned to the chosen range — the
+same "one shared dialog box" pattern the device dialog's loss chart uses
+just above.
 
 **Bandwidth is still a per-port question, so it is still asked per port** —
 there is no device-level bandwidth chart or metric picker. Clicking an
@@ -3998,7 +4004,14 @@ forms are administrator-only, and a plain hint above each states the
 rule an operator most needs to know before turning it on — that a local
 account is never sent to the directory or AAA server, only an account
 bound to it (or, for TACACS+ with auto-create on, an unrecognised
-username) is. **Modules** is one list linking to all
+username) is. One honest side effect of that rule: with auto-create on,
+a caller can tell a local account name from an unknown one just by
+watching which reply comes back, since an existing local account is
+answered locally while an unrecognised username is sent on to the AAA
+server — a direct consequence of two deliberate choices (the distinct
+"AAA unreachable" message and auto-create itself), so turn auto-create
+off where that distinction matters on a given network. **Modules** is
+one list linking to all
 ten per-module Settings dialogs (Nodes, Alerts, Routes/NetPath, NetFlow,
 SNMP Trap, Syslog, IPAM, FORTI-AP, ConfigRX, MAPPER) rather than each
 module's own Settings button being the only way to reach it — one place

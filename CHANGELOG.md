@@ -197,7 +197,10 @@ control right on the tile — the same range list Nodes' own charts use,
 plus **Custom…** — so changing the period no longer means opening Edit
 layout and then Configure first. A pinned custom range shows a **Live**
 button to drop back to a rolling window. The Device metric tile picks up
-the same Name, Y max and on-tile window. One new route, `GET
+the same Name, Y max and on-tile window. Drag-to-zoom works as on any
+other chart; wheel-zoom on a tile needs **Ctrl** (or **Cmd**) held, since
+a tile lives on a scrolling Dashboard page and a plain wheel over it has
+to keep scrolling the page. One new route, `GET
 /api/nodes/series/batch`, answers a tile's whole chart — every interface,
 in and out — in a single request rather than one per series. Existing
 single-interface layouts keep working unchanged.
@@ -219,10 +222,12 @@ timeline, and the Syslog/Trap and Alerts histograms. Every line chart on
 that list also takes drag-to-zoom, wheel-zoom anchored on the cursor,
 double-click to zoom back out, and the keyboard (`+`/`-` to zoom, arrow
 keys to pan, Home to reset) — the same interaction NetFlow and Routes
-already had, now shared through one `App.attachChartZoom` helper rather
-than reimplemented per chart. Hovering an hourly rollup point still says
-so. A window past a metric's own raw retention still reads hourly
-min/avg/max, exactly as before.
+already had. NetFlow and Routes keep their own wheel/keyboard/brush
+handlers and only gained **Custom…** here; the new shared
+`App.attachChartZoom` helper is what the Dashboard tiles and the Nodes
+charts are built on. Hovering an hourly rollup point still says so. A
+window past a metric's own raw retention still reads hourly min/avg/max,
+exactly as before.
 
 **Known limits, stated honestly.** The Alerts histogram offers
 **Custom…**, but its bars do not yet drag-narrow the way a line chart

@@ -794,3 +794,29 @@ combobox, and the shared `Custom…` range dialog plus drag/wheel/keyboard
 zoom wired onto every time-axis chart), Stephen_King the paper and the
 docs. Testy's full-suite and browser-walk results and Javariius's
 verdict: (Bob fills in)
+
+**Javariius's review, four corrections before push:** two `FEATURES.md`
+passages overstated what a drag or a wheel-turn does to the device and
+interface dialogs — only picking **Custom…** actually closes and
+reopens the dialog; drag and wheel just pin the chart where it is,
+dialog untouched. `CHANGELOG.md` overstated the zoom refactor — NetFlow
+and Routes keep their own existing wheel/keyboard/brush code and only
+picked up **Custom…**; the new shared `App.attachChartZoom` helper is
+what the Dashboard tiles and the Nodes charts actually run on. One gap
+Javariius flagged in the TACACS+ write-up: with auto-create on, an
+existing local account is answered without ever reaching the AAA
+server while an unknown one is sent on to it, so a caller can tell a
+real local username from a made-up one just by which reply comes
+back — called out plainly in `FEATURES.md` and
+`CREDENTIAL-SECURITY.md` §12, with auto-create-off as the way round it
+where that matters. One addition alongside the fixes: Dashboard tile
+wheel-zoom now needs Ctrl/Cmd held, since a tile lives on a page that
+still needs to scroll under a plain wheel; drag-zoom is unchanged.
+Noted for the record in `INTERNALS.md` too: the PAP START this client
+sends carries minor version 1 (`0xC1`, RFC 8907 §5.4.2.2) and the reply
+is decoded using the version byte the *reply* actually carries, and
+`Service.authenticate_tacacs` now remembers an unreachable AAA server
+for ten seconds so a server outage fails every concurrent sign-in fast
+instead of making each one sit out the full timeout.
+→ Stephen_King. `FEATURES.md`, `CHANGELOG.md`, `CREDENTIAL-SECURITY.md`,
+`INTERNALS.md` corrected and extended; no code touched.

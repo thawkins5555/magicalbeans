@@ -7834,7 +7834,14 @@ on `ldapclient.py`'s own shape: an error hierarchy
 encode/decode helpers, and one public `authenticate(servers, secret,
 username, password, ...)`. PAP only — no CHAP/MSCHAP, no AUTHOR or ACCT,
 no `TAC_PLUS_SINGLE_CONNECT_FLAG` session reuse — one TCP connection per
-login attempt, one START and one REPLY, then closed. `parse_servers`
+login attempt, one START and one REPLY, then closed. The START header
+sends minor version 1 (`VERSION_PAP = 0xC1`, RFC 8907 §5.4.2.2's PAP
+minor version), and the reply is decoded against whatever version byte
+comes back in the REPLY's own header rather than assuming it matches:
+the pseudo-pad that de-obfuscates the reply body is derived from that
+header's version, not the version this client sent, so a server that
+answers on a different minor version still decodes correctly.
+`parse_servers`
 reads the `tacacs_servers` setting's `"host[:port], ..."` text into up to
 `MAX_SERVERS` (4) `(host, port)` pairs, default port 49;
 `authenticate()` tries each in the order given and raises
@@ -7859,6 +7866,20 @@ outage, rather than one message doing for both — see Auth above for why
 that distinction matters at all. `client_ip` is sent as TACACS+'s own
 `rem_addr` field, the value an AAA server's own logs and authorization
 rules key off.
+
+**`authenticate_tacacs` also keeps a short "unreachable" memory, ten
+seconds long.** The first `TacacsConnectError` or timeout against the
+configured server list starts that clock; any further sign-in attempt
+inside the window raises `TacacsUnavailable` immediately, without
+opening a new TCP connection or waiting out the configured timeout
+again. Left unguarded, an AAA outage would mean every concurrent login
+attempt pays the full connect timeout before failing — the ten-second
+memory turns that into one slow failure per outage rather than one per
+attempt, so login slots are not held open waiting on a server that has
+already been shown to be down. It clears on its own once the ten
+seconds pass, so a server that comes back is tried again promptly
+rather than staying written off for longer than the outage actually
+lasted.
 
 **Auto-create** happens inside `post_login`, not inside
 `authenticate_tacacs`: an unknown username, `tacacs_enabled` and

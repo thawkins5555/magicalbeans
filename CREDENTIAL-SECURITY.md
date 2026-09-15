@@ -1383,3 +1383,17 @@ place.** Exactly like an LDAP-bound account, `users.password` is stored
 empty for `auth_source = 'tacacs'` and never consulted; there is nothing
 for this section's threat model to cover on the account side beyond the
 one shared secret above.
+
+**Auto-create is also a username oracle, stated plainly.** With
+auto-create on, a sign-in attempt for a name that matches an existing
+local account is answered locally and never reaches the AAA server,
+while an unrecognised username is sent on to it — so a caller who can
+distinguish the resulting outcomes (not least the distinct "AAA
+unreachable" message this document's Auth outage handling deliberately
+gives an outage — see above) can infer which usernames are already
+local accounts and which are not. That
+inference is the direct, foreseeable result of two choices made on
+purpose elsewhere in this document — never sending a local account to
+the AAA server, and auto-create's own "ask the server" fallback for an
+unknown one — not a separate bug; turn auto-create off if that
+distinction is a concern on a given network.
