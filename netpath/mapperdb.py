@@ -59,6 +59,25 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_map_nodes_peer
 -- map. Global rather than per-map: VLAN 20 should draw the same colour
 -- everywhere, or a strand followed from one map to another would appear to
 -- change identity for no reason.
+-- A line an operator drew by hand between two placed nodes -- discovery
+-- found nothing there, or found it and got it wrong, so this is asserted
+-- rather than learned. UNIQUE(map_id, a_node_id, b_node_id) stops the same
+-- ordered pair being drawn twice; the map itself does not care about
+-- direction, but the app always resolves A/B the same way it stored them.
+CREATE TABLE IF NOT EXISTS map_links (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    map_id     INTEGER NOT NULL,
+    a_node_id  INTEGER NOT NULL,
+    b_node_id  INTEGER NOT NULL,
+    label      TEXT NOT NULL DEFAULT '',
+    added_ts   REAL NOT NULL,
+    FOREIGN KEY (map_id) REFERENCES maps(id) ON DELETE CASCADE,
+    FOREIGN KEY (a_node_id) REFERENCES map_nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (b_node_id) REFERENCES map_nodes(id) ON DELETE CASCADE,
+    UNIQUE(map_id, a_node_id, b_node_id)
+);
+CREATE INDEX IF NOT EXISTS ix_map_links_map ON map_links(map_id);
+
 CREATE TABLE IF NOT EXISTS vlan_colors (
     vlan         INTEGER PRIMARY KEY,
     color_index  INTEGER NOT NULL
@@ -343,6 +362,50 @@ class MapperDatabase(SqliteStore):
         with self._lock:
             cur = self._conn.execute(
                 "DELETE FROM map_nodes WHERE id = ? AND map_id = ?", (node_id, map_id))
+            if cur.rowcount:
+                self._touch_map(map_id)
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    # ----------------------------------------------------------------- links
+
+    def links(self, map_id: int) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM map_links WHERE map_id = ? ORDER BY id",
+                (map_id,)).fetchall()
+
+    def add_link(self, map_id: int, a_node_id: int, b_node_id: int,
+                 label: str = "", now: float | None = None) -> int:
+        if a_node_id == b_node_id:
+            raise ValueError("A manual line needs two different nodes.")
+        label = (label or "").strip()
+        if len(label) > 60:
+            raise ValueError("Line label is limited to 60 characters.")
+        now = time.time() if now is None else now
+        with self._lock:
+            on_map = {row["id"] for row in self._conn.execute(
+                "SELECT id FROM map_nodes WHERE map_id = ?", (map_id,)).fetchall()}
+            if a_node_id not in on_map or b_node_id not in on_map:
+                raise ValueError("Both ends of a manual line must be on this map.")
+            existing = self._conn.execute(
+                "SELECT id FROM map_links WHERE map_id = ?"
+                " AND ((a_node_id = ? AND b_node_id = ?)"
+                "  OR (a_node_id = ? AND b_node_id = ?))",
+                (map_id, a_node_id, b_node_id, b_node_id, a_node_id)).fetchone()
+            if existing is not None:
+                raise ValueError("A line already connects these two nodes.")
+            cur = self._conn.execute(
+                "INSERT INTO map_links(map_id, a_node_id, b_node_id, label, added_ts)"
+                " VALUES (?,?,?,?,?)", (map_id, a_node_id, b_node_id, label, now))
+            self._touch_map(map_id, now)
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def delete_link(self, map_id: int, link_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM map_links WHERE id = ? AND map_id = ?", (link_id, map_id))
             if cur.rowcount:
                 self._touch_map(map_id)
             self._conn.commit()

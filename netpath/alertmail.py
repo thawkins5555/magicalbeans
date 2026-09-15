@@ -315,9 +315,17 @@ def _https_opener():
 
 
 def send(smtp_settings: dict, password: str | None, to_addrs: list[str],
-        subject: str, body: str, is_html: bool = False) -> None:
+        subject: str, body: str, is_html: bool = False,
+        attachments: list[tuple[str, bytes, str, str]] | None = None) -> None:
     """stdlib smtplib + email.message.EmailMessage. Raises on any failure —
-    the caller decides what to do with that; this never swallows an error."""
+    the caller decides what to do with that; this never swallows an error.
+
+    `attachments`, when given, is (filename, data, maintype, subtype) tuples
+    added via EmailMessage.add_attachment — reportsched's CSV, one per
+    scheduled report. With attachments the body always goes through
+    set_content() first (the plain-text branch below), whatever `is_html`
+    says: an HTML alternative complicates add_attachment's placement for no
+    reader this app has, and no built-in alert ever carries one."""
     host = str(smtp_settings.get("smtp_host", "")).strip()
     if not host:
         raise ValueError("No SMTP host configured")
@@ -340,11 +348,16 @@ def send(smtp_settings: dict, password: str | None, to_addrs: list[str],
     message["Subject"] = subject
     message["From"] = formataddr((from_name, from_addr)) if from_name else from_addr
     message["To"] = ", ".join(to_addrs)
-    if is_html:
+    if attachments:
+        message.set_content(body)
+    elif is_html:
         message.set_content("This message requires an HTML-capable mail reader.")
         message.add_alternative(body, subtype="html")
     else:
         message.set_content(body)
+    for filename, data, maintype, subtype in (attachments or ()):
+        message.add_attachment(data, maintype=maintype, subtype=subtype,
+                               filename=filename)
 
     if security == "ssl":
         smtp = smtplib.SMTP_SSL(host, port, timeout=timeout, context=context)

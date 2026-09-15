@@ -342,6 +342,10 @@ ROUTES = [
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces$", api.get_nodes_device_interfaces, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/interfaces/export\.csv$",
      api.get_nodes_device_interfaces_export, ("nodes", R)),
+    # Priority ports: flags one interface so priority_interface_down can
+    # fire on it -- see nodesdb.interface_flags.
+    ("PUT", r"^/api/nodes/devices/(\d+)/interfaces/(\d+)/priority$",
+     api.put_nodes_interface_priority, ("nodes", W)),
     # The device detail pane's Neighbours section:
     # one device's own LLDP/CDP rows, present and stale alike.
     ("GET", r"^/api/nodes/devices/(\d+)/neighbors$", api.get_nodes_device_neighbors, ("nodes", R)),
@@ -366,6 +370,9 @@ ROUTES = [
     # per interface. Matched before nothing here could confuse it with the
     # per-device route above: "series/batch" never matches "(\d+)".
     ("GET", r"^/api/nodes/series/batch$", api.get_nodes_series_batch, ("nodes", R)),
+    # E2: the History query builder's Export CSV, over the identical q=
+    # string the chart/table above already ran.
+    ("GET", r"^/api/nodes/series/export\.csv$", api.get_nodes_series_export, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/events$", api.get_nodes_device_events, ("nodes", R)),
     ("GET", r"^/api/nodes/devices/(\d+)/timeline$", api.get_nodes_device_timeline, ("nodes", R)),
     # Fleet-wide reports (netpath/report.py), not scoped to one device the
@@ -380,6 +387,16 @@ ROUTES = [
      api.get_nodes_reports_firmware, ("nodes", R)),
     ("GET", r"^/api/nodes/reports/firmware/export\.csv$",
      api.get_nodes_reports_firmware_export, ("nodes", R)),
+    # Scheduled emailed reports (netpath/reportsched.py): a saved
+    # name/kind/cadence definition, run automatically or on demand.
+    ("GET", r"^/api/nodes/reports/schedules$", api.get_nodes_report_schedules, ("nodes", R)),
+    ("POST", r"^/api/nodes/reports/schedules$", api.post_nodes_report_schedule, ("nodes", W)),
+    ("PUT", r"^/api/nodes/reports/schedules/(\d+)$",
+     api.put_nodes_report_schedule, ("nodes", W)),
+    ("DELETE", r"^/api/nodes/reports/schedules/(\d+)$",
+     api.delete_nodes_report_schedule, ("nodes", W)),
+    ("POST", r"^/api/nodes/reports/schedules/(\d+)/run$",
+     api.post_nodes_report_schedule_run, ("nodes", W)),
     ("POST", r"^/api/nodes/devices/(\d+)/credential$", api.post_nodes_device_credential, ("nodes", W)),
     ("DELETE", r"^/api/nodes/devices/(\d+)/credential$", api.delete_nodes_device_credential, ("nodes", W)),
     ("GET", r"^/api/nodes/device-groups$", api.get_nodes_device_groups, ("nodes", R)),
@@ -434,6 +451,9 @@ ROUTES = [
     ("PUT", r"^/api/mapper/maps/(\d+)/nodes$", api.put_mapper_map_nodes, ("mapper", W)),
     ("DELETE", r"^/api/mapper/maps/(\d+)/nodes/(\d+)$",
      api.delete_mapper_map_node, ("mapper", W)),
+    ("POST", r"^/api/mapper/maps/(\d+)/links$", api.post_mapper_map_links, ("mapper", W)),
+    ("DELETE", r"^/api/mapper/maps/(\d+)/links/(\d+)$",
+     api.delete_mapper_map_link, ("mapper", W)),
     # Matched before the "(\d+)" map route above would ever get the chance:
     # "candidates" and "export.csv" are not \d+, so there is no actual
     # ordering hazard, but this keeps every /maps/(\d+)/... sub-route
@@ -512,6 +532,9 @@ ROUTES = [
     ("POST", r"^/api/wireless/controllers/(\d+)/poll$", api.post_wireless_controller_poll, ("wireless", W)),
     ("GET", r"^/api/wireless/aps$", api.get_wireless_aps, ("wireless", R)),
     ("GET", r"^/api/wireless/aps/export\.csv$", api.get_wireless_aps_export, ("wireless", R)),
+    ("GET", r"^/api/wireless/aps/(\d+)/history$", api.get_wireless_ap_history, ("wireless", R)),
+    ("GET", r"^/api/wireless/aps/(\d+)/history/export\.csv$",
+     api.get_wireless_ap_history_export, ("wireless", R)),
     ("POST", r"^/api/wireless/aps/(\d+)/service$", api.post_wireless_ap_service, ("wireless", W)),
     ("DELETE", r"^/api/wireless/aps/(\d+)$", api.delete_wireless_ap, ("wireless", W)),
     ("POST", r"^/api/wireless/collector$", api.post_wireless_collector, ("wireless", W)),

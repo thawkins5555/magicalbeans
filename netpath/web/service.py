@@ -98,7 +98,7 @@ STORES = (
           "max_nodes_series_db_mb"),
     Store("nodes_mibs", "Nodes MIBs", "nodes_db.mib_db", None),
     Store("alerts", "Alerts", "alerts_db", "max_alerts_db_mb"),
-    Store("wireless", "Wireless", "wireless_db", None),
+    Store("wireless", "Wireless", "wireless_db", "max_wireless_db_mb"),
     Store("configrx", "ConfigRX", "configrx_db", None),
     Store("mapper", "Mapper", "mapper_db", None),
 )
@@ -519,6 +519,9 @@ class Service:
         # rebuilding the same bucket at once is how a dimension's rows came
         # to be paired with a span row built from a different set of flows.
         self._rollup_lock = threading.Lock()
+        # Throttle for the A5 "minute rollup is behind" SYSTEM log line —
+        # 0.0 so the first lagging pass after startup can always log.
+        self._flow_coverage_warned_ts = 0.0
         self.started_at = time.time()
         # Bumped by every write to something /api/config carries. The
         # browser refetches /api/config only when this number moves.
@@ -1507,6 +1510,15 @@ class Service:
             except Exception:
                 import traceback
                 traceback.print_exc()
+            # F4: scheduled report sends, on every 60s wake independent of
+            # the 15 min maintenance gate above -- a schedule due at 09:00
+            # must not wait for the next maintenance pass.
+            try:
+                from .. import reportsched
+                reportsched.run_due(self, time.time())
+            except Exception:
+                import traceback
+                traceback.print_exc()
             finally:
                 if requested and not self._maintenance_request.is_set():
                     self._maintenance_done.set()
@@ -1515,13 +1527,41 @@ class Service:
         """Summarise sealed flow buckets into both tiers.
 
         The minute tier first: the hourly one is built from it wherever it
-        covers a whole hour.
+        covers a whole hour. Sets `self._flow_rollup_behind` for the loop
+        below: whether any tier used its full bucket allowance this pass, so
+        the sealed backlog likely still reaches past where it stopped (A3).
         """
         written = 0
+        behind = False
         with self._rollup_lock:
             for tier in ROLLUP_TIERS:
                 written += self.flow_db.compact_rollup(tier)
+                behind = behind or self.flow_db.compact_hit_limit(tier)
+        self._flow_rollup_behind = behind
         return written
+
+    # Catch-up mode (A3): a busy store falling behind budget is worth extra
+    # passes right away rather than waiting out ROLLUP_INTERVAL_S each time,
+    # bounded so one wake never blocks the thread indefinitely.
+    _ROLLUP_CATCHUP_BUDGET_S = 30.0
+
+    # A5: the minute watermark lagging sealed time past this is worth an
+    # operator's attention; logged at most once per interval of the same
+    # length, so a store stuck behind does not fill the event log.
+    _FLOW_COVERAGE_LAG_WARN_S = 900.0
+    _FLOW_COVERAGE_WARN_INTERVAL_S = 900.0
+
+    def _check_flow_coverage_lag(self) -> None:
+        lag = self.flow_db.minute_lag_s()
+        if lag is None or lag <= self._FLOW_COVERAGE_LAG_WARN_S:
+            return
+        now = time.time()
+        if now - self._flow_coverage_warned_ts < self._FLOW_COVERAGE_WARN_INTERVAL_S:
+            return
+        self._flow_coverage_warned_ts = now
+        self.log.add(SYSTEM, f"NetFlow: the minute rollup is {lag / 60:.0f} min "
+                     "behind sealed flows; wide charts may be served from an "
+                     "older tier or raw until it catches up")
 
     def _rollup_loop(self) -> None:
         while not self._stop.is_set():
@@ -1529,6 +1569,12 @@ class Service:
                 break
             try:
                 self.compact_flow_rollups()
+                deadline = time.monotonic() + self._ROLLUP_CATCHUP_BUDGET_S
+                while (getattr(self, "_flow_rollup_behind", False)
+                       and time.monotonic() < deadline
+                       and not self._stop.is_set()):
+                    self.compact_flow_rollups()
+                self._check_flow_coverage_lag()
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -1649,6 +1695,10 @@ class Service:
             return
 
         self.wireless_db.prune_ap_events()
+        self.wireless_db.prune_history(
+            float(self.wireless_settings.get("history_days", 35)))
+        self._trim_db("max_wireless_db_mb", self.wireless_db, "Wireless database",
+                      "oldest history samples")
 
         removed = self.configrx_db.prune(
             float(self.configrx_settings.get("retention_days", 90)),

@@ -23,7 +23,8 @@ from dataclasses import asdict
 
 from . import alertmail
 from . import namelookup
-from .alertrules import CLEARS, FALLBACK_OF, PREDICATES, PUBLISHED_HYSTERESIS, \
+from .alertrules import CLEARS, CLEARS_COMPANIONS, FALLBACK_OF, PREDICATES, \
+    PUBLISHED_HYSTERESIS, \
     SENSOR_FAMILIES, \
     PUBLISHED_THRESHOLD_RULES, ROLLED_UP_BY, ROLLS_UP, ROLLUP_ENTITY_KINDS, \
     UNMANAGED_ONLY_RULES, Occurrence, breaches, dedup_key, device_id_for, \
@@ -966,6 +967,13 @@ class AlertEngine(Worker):
     def _drain_interface_events(self, settings) -> list[Occurrence]:
         occurrences = []
         touched_interfaces: set[int] = set()
+        # Read once per drain, not once per row: which ports are flagged
+        # Priority (nodesdb.interface_flags), so alertrules.PRIORITY_ONLY_
+        # RULES can gate priority_interface_down without a query per event.
+        # getattr-guarded for a fake nodes_db in a test that predates the
+        # method.
+        priority_get = getattr(self.nodes_db, "priority_interfaces", None)
+        priority = priority_get() if priority_get else set()
         for row in self._drain_from("interface_events",
                                     self.nodes_db.interface_events_since,
                                     self.nodes_db.max_interface_event_id):
@@ -979,20 +987,33 @@ class AlertEngine(Worker):
             device_label = namelookup.resolve_name(
                 self.nodes_db, self.app_db, device["ip"], device=device) or device["ip"]
             label = f"{device_label} / {interface_label(interface)}"
+            is_priority = (device["id"], interface["if_index"]) in priority
             occurrences.append(Occurrence(
                 kind="interface_event", source_kind=row["kind"], entity_kind="interface",
                 entity_id=f"{device['id']}:{interface['if_index']}", entity_label=label,
                 ts=row["ts"], message=row["detail"] or f"{label}: {row['kind']}",
-                device_name=device["name"] or "", device_ip=device["ip"]))
+                device_name=device["name"] or "", device_ip=device["ip"],
+                extra={"priority": is_priority}))
             if row["kind"] == "link_up":
                 cleared_rule = self._rule_by_key(
                     CLEARS.get(("interface_event", "link_up"), ""))
                 if cleared_rule:
-                    paired_dedup = f"{cleared_rule['key']}:interface:{device['id']}:{interface['if_index']}"
-                    resolved = self.db.resolve_by_dedup(paired_dedup, by="")
-                    if resolved:
-                        self.counters["resolved"] += 1
-                        self._notify_clear(resolved, cleared_rule, settings)
+                    # The paired rule and every rule CLEARS_COMPANIONS says
+                    # shares its dedup shape (priority_interface_down rides
+                    # interface_down's) -- a link_up closes both rather than
+                    # leaving the priority alert open once its plain twin
+                    # clears.
+                    for rule_key in (cleared_rule["key"],
+                                     *CLEARS_COMPANIONS.get(cleared_rule["key"], ())):
+                        companion_rule = (cleared_rule if rule_key == cleared_rule["key"]
+                                         else self._rule_by_key(rule_key))
+                        if not companion_rule:
+                            continue
+                        paired_dedup = f"{rule_key}:interface:{device['id']}:{interface['if_index']}"
+                        resolved = self.db.resolve_by_dedup(paired_dedup, by="")
+                        if resolved:
+                            self.counters["resolved"] += 1
+                            self._notify_clear(resolved, companion_rule, settings)
         # The flapping rule's own thresholds, looked up once rather than per
         # interface. NULL columns mean "as shipped", so an install that has
         # never touched them behaves exactly as it did before they existed.
@@ -2840,6 +2861,28 @@ class AlertEngine(Worker):
 
     # -------------------------------------------------------------- notify
 
+    def smtp_credentials(self, settings=None):
+        """(settings, password) for a real SMTP send, or None when email is
+        not enabled/configured. Factored out of _notify below so
+        reportsched.run_due can reuse the exact same "is email usable at
+        all" check and the same encrypted-password decrypt, rather than a
+        second copy that could drift from it. `settings` defaults to a
+        fresh alerts settings read."""
+        if settings is None:
+            settings = self.db.settings()
+        if not settings.get("email_enabled") or not settings.get("smtp_host"):
+            return None
+        password = None
+        if self.app_db is not None:
+            blob = self.db.smtp_password_enc()
+            if blob:
+                try:
+                    from . import dpapi
+                    password = dpapi.unprotect(blob).decode("utf-8")
+                except Exception:
+                    password = None
+        return settings, password
+
     def _notify(self, alert_row, rule_row, occurrence: Occurrence, settings,
                renotify: bool = False, notify_kind: str | None = None,
                template_override=None) -> None:
@@ -2947,15 +2990,10 @@ class AlertEngine(Worker):
         if not to_addrs:
             return
 
-        password = None
-        if self.app_db is not None:
-            blob = self.db.smtp_password_enc()
-            if blob:
-                try:
-                    from . import dpapi
-                    password = dpapi.unprotect(blob).decode("utf-8")
-                except Exception:
-                    password = None
+        # Already known enabled/configured (the bail-out above), so this
+        # only ever extracts the decrypted password -- same check,
+        # same decrypt, as smtp_credentials's own doc says.
+        password = (self.smtp_credentials(settings) or (settings, None))[1]
 
         job = alertmail.MailJob(
             settings=dict(settings), password=password, to_addrs=list(to_addrs),

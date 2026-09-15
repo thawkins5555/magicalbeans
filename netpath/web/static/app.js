@@ -4384,6 +4384,9 @@ const App = (() => {
       }
       // A Time column says which zone it is in, one hover away.
       if (column.title) th.title = column.title;
+      // A symbol-only header (the priority ★ column) needs its own name;
+      // the glyph alone is not reliably announced.
+      if (column.ariaLabel) th.setAttribute('aria-label', column.ariaLabel);
       // `numeric` governs how the column sorts. Right-alignment is a
       // separate question: "14s ago" sorts by a timestamp but reads as text,
       // and aligning the header right while the cells stayed left was what

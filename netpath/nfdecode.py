@@ -313,8 +313,15 @@ def _pick(*candidates: bytes | None) -> bytes:
 class Decoder:
     """Stateful across packets: holds the template cache and per-exporter sampling."""
 
-    def __init__(self, default_sampling: int = 1, trust_exporter_sampling: bool = True):
-        self.templates: _TemplateCache = _TemplateCache(
+    def __init__(self, default_sampling: int = 1, trust_exporter_sampling: bool = True,
+                templates: "_TemplateCache | None" = None):
+        # `templates`, when passed, carries a prior Decoder's learned v9/IPFIX
+        # templates across a settings-triggered restart (collector.py's
+        # `start`) -- templates are wire state independent of settings, and
+        # rebuilding from an empty cache left every flow undecodable
+        # (no_template) until the exporter's next template resend, minutes
+        # to tens of minutes on most platforms.
+        self.templates: _TemplateCache = templates if templates is not None else _TemplateCache(
             MAX_TEMPLATES_PER_EXPORTER, MAX_TEMPLATE_EXPORTERS)
         # (exporter, observation domain, sampler id) -> rate
         self.sampling: _Lru = _Lru(MAX_SAMPLING)

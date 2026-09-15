@@ -366,6 +366,72 @@ try:
     check("...with one data row per link (A-B, plus the address-matched "
           "B-D link added just above)", len(csv_rows) == 3, csv_rows)
 
+    # -------------------------------------------------- 7b. manual links (D2)
+    #
+    # The unmanaged peer was removed from the map in step 5 -- place it
+    # again (add_node is idempotent on peer_key) so B and the peer are both
+    # here but not connected by discovery, making a manual line between
+    # them a genuinely new link and exercising linkNodeA's new a_peer_key
+    # fallback (the A side of a discovered link is always a real device; a
+    # manual line can put a peer on either end).
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/nodes",
+                           {"peer_key": "chassis:aa:bb:cc:00:11:22"}, token=admin)
+    check("re-placing the peer for the manual-link tests works",
+          status == 200 and "id" in payload, (status, payload))
+    node_peer = payload["id"]
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/links",
+                           {"a_node_id": node_peer, "b_node_id": node_b,
+                            "label": "spare fiber"}, token=admin)
+    check("connecting two placed nodes is accepted", status == 200 and "id" in payload,
+          (status, payload))
+    manual_link_id = payload["id"]
+
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    manual = next((l for l in payload["links"] if l.get("manual")), None) \
+        if status == 200 else None
+    check("the manual link appears in the map payload, carrying manual: true",
+          manual is not None, payload.get("links") if status == 200 else payload)
+    check("...with the label stored and protocols naming it manual",
+          manual is not None and manual["label"] == "spare fiber"
+          and manual["protocols"] == ["manual"], manual)
+    check("...resolved to a peer_key on the A side (an unmanaged peer, not a device)",
+          manual is not None and manual["a_device_id"] is None
+          and manual["a_peer_key"] == "chassis:aa:bb:cc:00:11:22", manual)
+    check("...and to a device id on the B side",
+          manual is not None and manual["b_device_id"] == dev_b, manual)
+    check("...marked unmanaged, since one end is",
+          manual is not None and manual["unmanaged"] is True, manual)
+    check("...with every key a discovered link carries also present, so a "
+          "client that reads them blind does not throw",
+          manual is not None and {"a_port", "b_port", "a_if_index", "b_if_index",
+                                  "vlans", "native_vlan", "seen_ts", "plan"}
+          <= set(manual), manual)
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/links",
+                           {"a_node_id": node_b, "b_node_id": node_peer, "label": ""},
+                           token=admin)
+    check("the same pair, reversed, is a 409", status == 409, (status, payload))
+
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/links",
+                           {"a_node_id": node_a, "b_node_id": node_a}, token=admin)
+    check("a==b is a 400", status == 400, (status, payload))
+
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}/export.csv", token=admin)
+    manual_csv_rows = (list(csv.reader(io.StringIO(payload["csv"].lstrip("﻿"))))
+                       if status == 200 else [])
+    check("the CSV export gains one manual row with Protocols 'manual'",
+          status == 200 and any(row and row[10] == "manual" for row in manual_csv_rows[1:]),
+          manual_csv_rows)
+
+    status, payload = call("DELETE",
+                           f"/api/mapper/maps/{map_id}/links/{manual_link_id}", token=admin)
+    check("removing the manual link is accepted", status == 200 and payload["ok"],
+          (status, payload))
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    check("...and it is gone from the map payload",
+          status == 200 and not any(l.get("manual") for l in payload["links"]), payload)
+
     # ---------------------------------------- 8. a device deleted from Nodes
 
     status, payload = call("POST", f"/api/mapper/maps/{map_id}/nodes",
@@ -453,6 +519,11 @@ try:
     status, payload = call("POST", f"/api/mapper/maps/{map_id}/nodes",
                            {"device_id": dev_c}, token=viewer)
     check("...nor add a node", status == 403, (status, payload))
+    status, payload = call("POST", f"/api/mapper/maps/{map_id}/links",
+                           {"a_node_id": node_a, "b_node_id": node_b}, token=viewer)
+    check("...nor connect two nodes with a manual line", status == 403, (status, payload))
+    status, payload = call("DELETE", f"/api/mapper/maps/{map_id}/links/1", token=viewer)
+    check("...nor delete a manual line", status == 403, (status, payload))
 
     status, payload = call("GET", "/api/mapper/maps", token=outsider)
     check("an account with no mapper grant is refused even a read",

@@ -496,6 +496,50 @@ def test_r6_syslog_strips_control_and_ansi_bytes() -> None:
           "a normal message with nothing to strip is unaffected")
 
 
+def test_r7_templates_survive_a_settings_restart() -> None:
+    """A2: `Collector.start` used to build a fresh `Decoder` every call, so a
+    NetFlow settings save (which stops then restarts the worker) dropped
+    every learned v9/IPFIX template -- the exporter's next data record went
+    undecodable (no_template) until its own resend cycle, minutes to tens of
+    minutes later. `start` now carries the outgoing decoder's template cache
+    into the replacement."""
+    print("R7: a v9 template survives start() being called again "
+          "(settings restart)")
+
+    flow_db = FlowDatabase(db_path("r7-flows.db"))
+    log = eventlog.EventLog()
+    collector = Collector(flow_db, log=log)
+    port = free_udp_port()
+    exporter = "127.0.0.1"
+    fields = [(nfdecode.OCTETS, 4), (nfdecode.PACKETS, 4)]
+    template = struct.pack("!HH", 600, len(fields))
+    for field_id, size in fields:
+        template += struct.pack("!HH", field_id, size)
+    record = struct.pack("!I", 4000) + struct.pack("!I", 40)
+
+    try:
+        assert collector.start({"port": port, "bind_address": "127.0.0.1"})
+        send_udp(port, v9_packet(ipfix_set(0, template)))
+        check(wait_for(lambda: (exporter, 0, 600) in collector.decoder.templates),
+              "the template is learned before the restart")
+
+        # A settings save calls start() again while the collector is running
+        # (service.py stops then restarts the worker); the port is unchanged.
+        assert collector.start({"port": port, "bind_address": "127.0.0.1"})
+        check((exporter, 0, 600) in collector.decoder.templates,
+              "the template is still cached right after the restart")
+
+        no_template_before = collector.decoder.stats["no_template"]
+        send_udp(port, v9_packet(ipfix_set(600, record)))
+        check(wait_for(lambda: collector.counters["flows"] >= 1),
+              "the data record decodes on the new decoder without a resend")
+        check(collector.decoder.stats["no_template"] == no_template_before,
+              "stats['no_template'] did not rise")
+    finally:
+        collector.stop()
+        flow_db.close()
+
+
 TESTS = [
     test_r1_options_sampling_rate_is_clamped,
     test_r2_writer_thread_survives_and_running_reflects_death,
@@ -503,6 +547,7 @@ TESTS = [
     test_r4_field_count_cap_rejects_absurd_templates,
     test_r5_v1_oversized_integer_clamped_and_batch_survives,
     test_r6_syslog_strips_control_and_ansi_bytes,
+    test_r7_templates_survive_a_settings_restart,
 ]
 
 

@@ -222,6 +222,68 @@ try:
     check("an if_index the device does not have is an empty list, not an error",
           status == 200 and none["interfaces"] == [], (status, none))
 
+    # ----------------- 5b. PUT .../interfaces/<n>/priority (priority ports)
+    status, before = call("GET", f"/api/nodes/devices/{ports}/interfaces?if_index=7",
+                          token=admin)
+    check("a port starts unflagged", status == 200
+          and before["interfaces"][0]["priority"] is False, (status, before))
+
+    status, put = call("PUT", f"/api/nodes/devices/{ports}/interfaces/7/priority",
+                       {"priority": True}, token=admin)
+    check("PUT .../priority answers 200 with the flag it set",
+          status == 200 and put == {"device_id": ports, "if_index": 7,
+                                    "priority": True}, (status, put))
+    check("...and it is stored", service.nodes_db.priority_if_indexes(ports) == {7},
+          service.nodes_db.priority_if_indexes(ports))
+
+    status, flagged = call("GET", f"/api/nodes/devices/{ports}/interfaces?if_index=7",
+                           token=admin)
+    check("the interface JSON now carries priority: true",
+          status == 200 and flagged["interfaces"][0]["priority"] is True,
+          (status, flagged))
+    status, other = call("GET", f"/api/nodes/devices/{ports}/interfaces?if_index=8",
+                         token=admin)
+    check("a different port is unaffected", status == 200
+          and other["interfaces"][0]["priority"] is False, (status, other))
+
+    status, csv_payload = call(
+        "GET", f"/api/nodes/devices/{ports}/interfaces/export.csv", token=admin)
+    csv_lines = csv_payload["csv"].lstrip("﻿").splitlines()
+    csv_header = csv_lines[0].split(",")
+    priority_col = csv_header.index("Priority")
+    flagged_row = next(line.split(",") for line in csv_lines[1:]
+                       if line.split(",")[0] == "7")
+    unflagged_row = next(line.split(",") for line in csv_lines[1:]
+                         if line.split(",")[0] == "8")
+    check("the interfaces CSV export gains a Priority column",
+          "Priority" in csv_header, csv_header)
+    check("...'yes' for the flagged port, 'no' for one that is not",
+          flagged_row[priority_col] == "yes" and unflagged_row[priority_col] == "no",
+          (flagged_row, unflagged_row))
+
+    status, unset = call("PUT", f"/api/nodes/devices/{ports}/interfaces/7/priority",
+                         {"priority": False}, token=admin)
+    check("clearing the flag answers priority: false",
+          status == 200 and unset["priority"] is False, (status, unset))
+    check("...and priority_if_indexes agrees",
+          service.nodes_db.priority_if_indexes(ports) == set(),
+          service.nodes_db.priority_if_indexes(ports))
+
+    status, missing = call(
+        "PUT", "/api/nodes/devices/999999/interfaces/7/priority",
+        {"priority": True}, token=admin)
+    check("an unknown device is a 404, like every other device sub-route",
+          status == 404, (status, missing))
+
+    # A device delete cascades interface_flags, like interface_thresholds --
+    # nodesdb._PURGE_TABLES.
+    call("PUT", f"/api/nodes/devices/{ports}/interfaces/9/priority",
+        {"priority": True}, token=admin)
+    service.nodes_db.bulk_remove_devices([ports])
+    check("deleting the device takes its interface_flags rows with it",
+          service.nodes_db.priority_if_indexes(ports) == set(),
+          service.nodes_db.priority_if_indexes(ports))
+
     # --------------------------- 6. GET /api/nodes/devices?fields=index
     INDEX_KEYS = {"id", "ip", "name", "sys_name", "display_name_source",
                   "device_group_id", "status"}
@@ -249,6 +311,24 @@ try:
           [d["id"] for d in full["devices"]] == [d["id"] for d in paged["devices"]],
           ([d["id"] for d in full["devices"]][:4],
            [d["id"] for d in paged["devices"]][:4]))
+
+    # ------------------------- 7. poll_overrun is out of the dialog's log
+    #
+    # (B2) A slow poll cycle is operational noise in the device dialog's
+    # event list, not an event an operator is hunting for -- but the alert
+    # engine reads device_events() directly, so the row must still exist.
+    overrun_dev = service.nodes_db.add_device("203.0.113.210", name="overrun",
+                                              group_id=group_id)
+    service.nodes_db.record_device_event(overrun_dev, "poll_overrun", "took 12.4s")
+    service.nodes_db.record_device_event(overrun_dev, "down", "no response")
+    status, dialog = call("GET", f"/api/nodes/devices/{overrun_dev}/events", token=admin)
+    kinds = [e["kind"] for e in dialog.get("device_events", [])] if status == 200 else []
+    check("the device dialog's event feed omits poll_overrun",
+          status == 200 and "poll_overrun" not in kinds and "down" in kinds,
+          (status, kinds))
+    stored_kinds = [e["kind"] for e in service.nodes_db.device_events(device_id=overrun_dev)]
+    check("...but nodes_db.device_events() itself still returns it, for alerting",
+          "poll_overrun" in stored_kinds, stored_kinds)
 finally:
     server.stop()
     service.shutdown()

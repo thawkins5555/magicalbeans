@@ -4,7 +4,9 @@ each self-service and per account (appdb.py's `dashboard_layout` column beside
 /api/nodes/events route the Recent events tile reads. HTTP-level through a
 real Service + WebServer over loopback, test_api_helpers.py's own scaffolding.
 """
+import csv
 import http.client
+import io
 import json
 import os
 import time
@@ -24,6 +26,12 @@ def check(name, ok, detail=""):
     print(("PASS  " if ok else "FAIL  ") + name + (f"   {detail}" if detail and not ok else ""))
     if not ok:
         FAILS.append(name)
+
+
+def parse_csv(text):
+    if text.startswith("﻿"):
+        text = text[1:]
+    return list(csv.reader(io.StringIO(text)))
 
 
 DB_NAMES = ("netpath", "flows", "syslog", "app", "ipam", "snmptraps",
@@ -379,6 +387,49 @@ try:
     status, payload = call(
         "GET", f"/api/nodes/series/batch?q={batch_device}:cpu_pct", token=no_nodes)
     check("batch: refuses an account without Nodes read", status == 403, (status, payload))
+
+    print("14. GET /api/nodes/series/export.csv (E2)")
+    status, exported = call(
+        "GET", f"/api/nodes/series/export.csv?q={batch_device}:if_in_bps.1,"
+              f"{batch_device}:if_out_bps.1", token=admin)
+    check("export: answers 200", status == 200, (status, exported))
+    rows = parse_csv(exported["csv"])
+    check("export: long-format header",
+          rows[0] == ["time", "ts", "device", "metric", "unit", "value", "min", "max"],
+          rows[0])
+    check("export: one row per point per series (both series have samples)",
+          len(rows) - 1 == 2, rows)
+    # In q= order (if_in_bps.1 then if_out_bps.1); both share the port's own
+    # label ("Gi0/1", the batch route's own answer -- in/out are told apart
+    # by column position there, not by the label text).
+    in_row, out_row = rows[1], rows[2]
+    check("export: device/metric/unit/value line up with the batch route's own answer",
+          in_row[2] == "batch-sw" and in_row[3] == "Gi0/1" and in_row[4] == "bps"
+          and float(in_row[5]) == 1000.0 and float(out_row[5]) == 2000.0,
+          (in_row, out_row))
+    import re as _re
+    check("export: the readable time column parses as a local timestamp",
+          _re.match(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$", rows[1][0]) is not None, rows[1])
+    check("export: cap is SERIES_EXPORT_CAP (200000)",
+          exported.get("cap") == api_mod.SERIES_EXPORT_CAP, exported.get("cap"))
+    check("export: not truncated for two points under the cap",
+          exported.get("truncated") is False, exported)
+
+    real_cap = api_mod.SERIES_EXPORT_CAP
+    api_mod.SERIES_EXPORT_CAP = 1
+    try:
+        status, capped = call(
+            "GET", f"/api/nodes/series/export.csv?q={batch_device}:if_in_bps.1,"
+                  f"{batch_device}:if_out_bps.1", token=admin)
+    finally:
+        api_mod.SERIES_EXPORT_CAP = real_cap
+    check("export: a cap of 1 truncates two points to one, and says so",
+          status == 200 and capped.get("truncated") is True
+          and capped.get("count") == 1, (status, capped))
+
+    status, payload = call(
+        "GET", f"/api/nodes/series/export.csv?q={batch_device}:cpu_pct", token=no_nodes)
+    check("export: refuses an account without Nodes read", status == 403, (status, payload))
 
 finally:
     server.stop()

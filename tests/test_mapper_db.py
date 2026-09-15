@@ -71,13 +71,18 @@ db.close()
 db = new_db("cascade")
 map_id = db.create_map("Cascade Map")
 node_id = db.add_node(map_id, device_id=1, x=1, y=2)
-check("node exists before delete", len(db.nodes(map_id)) == 1)
+node2_id = db.add_node(map_id, device_id=2, x=3, y=4)
+link_id = db.add_link(map_id, node_id, node2_id, "")
+check("node exists before delete", len(db.nodes(map_id)) == 2)
 db.delete_map(map_id)
 with db._lock:
     remaining = db._conn.execute(
         "SELECT COUNT(*) AS n FROM map_nodes WHERE id = ?", (node_id,)).fetchone()["n"]
+    remaining_links = db._conn.execute(
+        "SELECT COUNT(*) AS n FROM map_links WHERE id = ?", (link_id,)).fetchone()["n"]
 check("deleting a map cascades its map_nodes rows away (foreign_keys=ON is live)",
       remaining == 0, remaining)
+check("...and its map_links rows too", remaining_links == 0, remaining_links)
 db.close()
 
 # ------------------------------------------------------------------ nodes
@@ -155,6 +160,63 @@ check("remove_node returns False for an id that is not there",
 check("remove_node returns True and removes a real node",
       db.remove_node(map_id, peer_id) is True)
 check("...it is actually gone", all(r["id"] != peer_id for r in db.nodes(map_id)))
+db.close()
+
+# ---------------------------------------------------------------- map_links
+
+db = new_db("links")
+map_id = db.create_map("Links map")
+a_id = db.add_node(map_id, device_id=1)
+b_id = db.add_node(map_id, device_id=2)
+c_id = db.add_node(map_id, device_id=3)
+
+link_id = db.add_link(map_id, a_id, b_id, "spare fiber")
+check("add_link returns an int id", isinstance(link_id, int))
+rows = db.links(map_id)
+check("links(map_id) reads it back",
+      len(rows) == 1 and rows[0]["a_node_id"] == a_id and rows[0]["b_node_id"] == b_id
+      and rows[0]["label"] == "spare fiber", [dict(r) for r in rows])
+
+try:
+    db.add_link(map_id, a_id, a_id, "")
+    check("a==b raises ValueError", False)
+except ValueError:
+    check("a==b raises ValueError", True)
+
+try:
+    db.add_link(map_id, b_id, a_id, "reverse")
+    check("a duplicate in the reverse direction raises ValueError", False)
+except ValueError:
+    check("a duplicate in the reverse direction raises ValueError", True)
+check("...and no second row was written", len(db.links(map_id)) == 1)
+
+try:
+    db.add_link(map_id, a_id, 999999, "")
+    check("a node id off this map raises ValueError", False)
+except ValueError:
+    check("a node id off this map raises ValueError", True)
+
+try:
+    db.add_link(map_id, a_id, c_id, "x" * 61)
+    check("a label over 60 chars raises ValueError", False)
+except ValueError:
+    check("a label over 60 chars raises ValueError", True)
+
+link2_id = db.add_link(map_id, a_id, c_id, "")
+check("a second, distinct pair is allowed", len(db.links(map_id)) == 2)
+
+check("delete_link returns False for an id that is not there",
+      db.delete_link(map_id, 999999) is False)
+check("delete_link returns True and removes a real link",
+      db.delete_link(map_id, link2_id) is True)
+check("...it is actually gone", len(db.links(map_id)) == 1)
+
+# Cascade: removing a node this store's own FOREIGN KEY ... ON DELETE
+# CASCADE covers (foreign_keys=ON is one of SqliteStore.PRAGMAS) -- no
+# explicit delete_link call needed in remove_node itself.
+db.remove_node(map_id, b_id)
+check("removing a node the remaining link points at cascades the link away",
+      db.links(map_id) == [])
 db.close()
 
 # --------------------------------------------------------------- settings

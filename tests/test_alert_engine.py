@@ -783,6 +783,7 @@ print("\nA8 — non-outage rules stop saying \"is not responding\"")
 
 REBOUND = ("device_auth_fail", "device_unsupported", "poll_overrun",
            "mib_missing", "interface_down", "interface_flapping",
+           "priority_interface_down",
            "wireless_ap_removed", "wireless_ap_offline", "smtp_failing")
 
 nodes, alerts, snmp, syslog, ipam, engine = build(**MAIL_SETTINGS)
@@ -1784,6 +1785,52 @@ reopened = AlertsDatabase(trim_path)
 assert reopened._conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
 reopened.close()
 ok("the mode survives a reopen")
+
+
+# =================================================================== C3
+print("\nC3 — priority_interface_down fires only for a flagged port, and "
+      "link_up clears both rules")
+
+nodes, alerts, snmp, syslog, ipam, engine = build()
+try:
+    engine._tick()
+    did = add_device(nodes, "10.13.0.1", "acc-sw-priority")
+    nodes.replace_interfaces(did, [
+        {"if_index": 7, "descr": "Gi1/0/7", "alias": "uplink",
+         "admin_status": "up", "oper_status": "down"},
+        {"if_index": 8, "descr": "Gi1/0/8", "alias": "",
+         "admin_status": "up", "oper_status": "down"},
+    ])
+    by_index = {r["if_index"]: r["id"] for r in nodes.interfaces(did)}
+    nodes.set_interface_priority(did, 7, True)
+    assert nodes.priority_if_indexes(did) == {7}
+    assert (did, 7) in nodes.priority_interfaces()
+    assert (did, 8) not in nodes.priority_interfaces()
+    ok("set_interface_priority/priority_if_indexes/priority_interfaces agree "
+       "on which port is flagged")
+
+    nodes.record_interface_event(by_index[7], "link_down", "Gi1/0/7 down")
+    nodes.record_interface_event(by_index[8], "link_down", "Gi1/0/8 down")
+    engine._tick()
+    assert len(open_rows(alerts, "interface_down", f"{did}:7")) == 1
+    assert len(open_rows(alerts, "priority_interface_down", f"{did}:7")) == 1
+    ok("the flagged port's link_down raises both interface_down and "
+       "priority_interface_down")
+    assert len(open_rows(alerts, "interface_down", f"{did}:8")) == 1
+    assert open_rows(alerts, "priority_interface_down", f"{did}:8") == []
+    ok("the unflagged port's link_down raises only the generic rule")
+
+    nodes.record_interface_event(by_index[7], "link_up", "Gi1/0/7 up")
+    nodes.record_interface_event(by_index[8], "link_up", "Gi1/0/8 up")
+    engine._tick()
+    assert open_rows(alerts, "interface_down", f"{did}:7") == []
+    assert open_rows(alerts, "priority_interface_down", f"{did}:7") == []
+    assert open_rows(alerts, "interface_down", f"{did}:8") == []
+    ok("link_up on the flagged port clears both interface_down and "
+       "priority_interface_down; the unflagged port's generic alert clears "
+       "the same way it always did")
+finally:
+    nodes.close(); alerts.close(); snmp.close(); syslog.close(); ipam.close()
 
 
 print(f"\nALL {len(PASSED)} ALERT-ENGINE ASSERTIONS PASSED")

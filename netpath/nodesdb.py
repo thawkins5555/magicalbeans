@@ -239,6 +239,18 @@ CREATE TABLE IF NOT EXISTS interface_thresholds (
 CREATE INDEX IF NOT EXISTS ix_interface_thresholds_root
     ON interface_thresholds(metric_root);
 
+-- Priority ports: an operator flag on one interface, keyed like
+-- interface_thresholds so it survives a re-walk. Backs the
+-- priority_interface_down alert rule (alertsdb._BUILTIN_RULES) -- a port
+-- with no row here is not priority.
+CREATE TABLE IF NOT EXISTS interface_flags (
+    device_id    INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    if_index     INTEGER NOT NULL,
+    priority     INTEGER NOT NULL DEFAULT 0,
+    updated_ts   REAL    NOT NULL,
+    PRIMARY KEY (device_id, if_index)
+);
+
 -- Forwarding-database entries: which MAC addresses each switch port has
 -- learned. Stored so "find the port this MAC is on" is a query rather than
 -- a live walk of every switch in the estate — the same address can sit on
@@ -565,6 +577,34 @@ CREATE TABLE IF NOT EXISTS vendor_learned (
     set_by           TEXT,
     set_ts           REAL NOT NULL,
     source_device_id INTEGER
+);
+
+-- Scheduled emailed reports (netpath/reportsched.py): a recurring "run this
+-- report and send it" definition. `params_json` carries the kind-specific
+-- arguments (period_days, device_group_id, metric_key, top_n -- see
+-- reportsched.render); `recipients` is a JSON list, validated the same way
+-- the Alerts email recipients setting is. `weekday` (0=Monday) and
+-- `day_of_month` are used only by their matching `cadence` and are NULL
+-- otherwise. `next_run_ts` is advanced BEFORE a run sends, so a crash mid-
+-- send cannot repeat it; `last_status` is a short human sentence, not a
+-- code, for the SCHEDULED table's Status column.
+CREATE TABLE IF NOT EXISTS report_schedules (
+    id             INTEGER PRIMARY KEY,
+    name           TEXT NOT NULL,
+    kind           TEXT NOT NULL,   -- 'availability'|'top_metrics'|'firmware'
+    params_json    TEXT NOT NULL DEFAULT '{}',
+    cadence        TEXT NOT NULL,   -- 'daily'|'weekly'|'monthly'
+    hour           INTEGER NOT NULL,
+    minute         INTEGER NOT NULL,
+    weekday        INTEGER,
+    day_of_month   INTEGER,
+    recipients     TEXT NOT NULL DEFAULT '[]',
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    next_run_ts    REAL,
+    last_run_ts    REAL,
+    last_status    TEXT NOT NULL DEFAULT '',
+    created_ts     REAL NOT NULL,
+    updated_ts     REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -1019,6 +1059,12 @@ def _group_upstream_candidates(rows) -> dict[int, dict]:
 # kinds by construction rather than by two lists agreeing.
 TIMELINE_ONLY_EVENT_KINDS = frozenset(
     {"snmp_up", "snmp_down", "ping_up", "ping_down"})
+
+# The device dialog's event log additionally drops poll_overrun: a slow
+# poll cycle is operational noise for that list, not a device event an
+# operator is looking for. Alerting still reads device_events directly, so
+# the poll_overrun alert rule sees every occurrence regardless.
+DIALOG_HIDDEN_EVENT_KINDS = TIMELINE_ONLY_EVENT_KINDS | {"poll_overrun"}
 
 
 class NodesDatabase(SqliteStore):
@@ -2358,6 +2404,7 @@ class NodesDatabase(SqliteStore):
          "interface_id IN (SELECT id FROM interfaces WHERE device_id = ?)"),
         ("interfaces", "device_id = ?"),
         ("interface_thresholds", "device_id = ?"),
+        ("interface_flags", "device_id = ?"),
         ("mac_entries", "device_id = ?"),
         ("arp_entries", "device_id = ?"),
         ("neighbors", "device_id = ?"),
@@ -4311,6 +4358,37 @@ class NodesDatabase(SqliteStore):
         return {(row["device_id"], row["metric_root"], row["if_index"]): row
                 for row in rows if row["device_id"] not in disabled}
 
+    def set_interface_priority(self, device_id: int, if_index: int, on: bool) -> None:
+        """Flag or unflag one port as priority -- the operator toggle behind
+        the priority_interface_down alert rule."""
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO interface_flags(device_id, if_index, priority,"
+                " updated_ts) VALUES (?,?,?,?)"
+                " ON CONFLICT(device_id, if_index) DO UPDATE SET"
+                " priority=excluded.priority, updated_ts=excluded.updated_ts",
+                (device_id, if_index, 1 if on else 0, now))
+            self._conn.commit()
+
+    def priority_if_indexes(self, device_id: int) -> set[int]:
+        """The flagged if_index values for one device -- what the interface
+        list and CSV export read per request."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT if_index FROM interface_flags"
+                " WHERE device_id = ? AND priority = 1", (device_id,)).fetchall()
+        return {row["if_index"] for row in rows}
+
+    def priority_interfaces(self) -> set[tuple[int, int]]:
+        """Every flagged (device_id, if_index) fleet-wide, in one read --
+        what the alert engine drains once per pass rather than per device."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT device_id, if_index FROM interface_flags"
+                " WHERE priority = 1").fetchall()
+        return {(row["device_id"], row["if_index"]) for row in rows}
+
     def update_interface_stp(self, device_id: int, rows: list[dict]) -> None:
         """update_interface_poe's own counterpart for per-port STP state."""
         if not rows:
@@ -5025,6 +5103,94 @@ class NodesDatabase(SqliteStore):
                 "UPDATE discovery_results SET promoted_device_id = ? WHERE id = ?",
                 (device_id, result_id))
             self._conn.commit()
+
+    # ------------------------------------------------------- report schedules
+    #
+    # netpath/reportsched.py owns due-date math and rendering; this is
+    # storage alone.
+
+    REPORT_SCHEDULE_MAX = 50
+
+    def add_report_schedule(self, name: str, kind: str, params_json: str,
+                            cadence: str, hour: int, minute: int,
+                            weekday: int | None, day_of_month: int | None,
+                            recipients: str, enabled: bool = True,
+                            next_run_ts: float | None = None) -> int:
+        now = time.time()
+        with self._lock:
+            count = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM report_schedules").fetchone()["n"]
+            if count >= self.REPORT_SCHEDULE_MAX:
+                raise ValueError(
+                    f"At most {self.REPORT_SCHEDULE_MAX} scheduled reports are allowed")
+            cursor = self._conn.execute(
+                "INSERT INTO report_schedules(name, kind, params_json, cadence,"
+                " hour, minute, weekday, day_of_month, recipients, enabled,"
+                " next_run_ts, last_run_ts, last_status, created_ts, updated_ts)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,'',?,?)",
+                (name, kind, params_json, cadence, hour, minute, weekday,
+                 day_of_month, recipients, 1 if enabled else 0, next_run_ts,
+                 now, now))
+            self._conn.commit()
+            return cursor.lastrowid
+
+    def report_schedules(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM report_schedules ORDER BY name COLLATE NOCASE"
+            ).fetchall()
+
+    def report_schedule(self, schedule_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM report_schedules WHERE id = ?",
+                (schedule_id,)).fetchone()
+
+    def due_report_schedules(self, now: float) -> list[sqlite3.Row]:
+        """Enabled schedules whose next_run_ts has arrived -- run_due's own
+        worklist, oldest-due first."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM report_schedules WHERE enabled = 1"
+                " AND next_run_ts IS NOT NULL AND next_run_ts <= ?"
+                " ORDER BY next_run_ts", (now,)).fetchall()
+
+    _REPORT_SCHEDULE_EDITABLE = ("name", "kind", "params_json", "cadence",
+                                 "hour", "minute", "weekday", "day_of_month",
+                                 "recipients", "enabled", "next_run_ts")
+
+    def update_report_schedule(self, schedule_id: int, **fields) -> None:
+        """Also how run_due advances next_run_ts BEFORE it sends -- a crash
+        mid-send cannot then repeat the run on the next tick."""
+        cols = [k for k in fields if k in self._REPORT_SCHEDULE_EDITABLE]
+        if not cols:
+            return
+        set_sql = ", ".join(f"{c} = ?" for c in cols)
+        values = [(1 if fields[c] else 0) if c == "enabled" else fields[c]
+                 for c in cols]
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE report_schedules SET {set_sql}, updated_ts = ?"
+                " WHERE id = ?", (*values, time.time(), schedule_id))
+            self._conn.commit()
+
+    def record_report_schedule_run(self, schedule_id: int, last_status: str) -> None:
+        """Stamped AFTER the send attempt, once its outcome (or refusal) is
+        known -- next_run_ts has already moved by then, via
+        update_report_schedule above."""
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE report_schedules SET last_run_ts = ?, last_status = ?,"
+                " updated_ts = ? WHERE id = ?", (now, last_status, now, schedule_id))
+            self._conn.commit()
+
+    def delete_report_schedule(self, schedule_id: int) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM report_schedules WHERE id = ?", (schedule_id,))
+            self._conn.commit()
+            return bool(cursor.rowcount)
 
     # -------------------------------------------------------------- storage
 

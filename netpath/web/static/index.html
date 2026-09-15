@@ -123,6 +123,7 @@
     <button class="subtab" data-subtab="discovery">DISCOVERY</button>
     <button class="subtab" data-subtab="profiles">PROFILES &amp; MIBS</button>
     <button class="subtab" data-subtab="reports">REPORTS</button>
+    <button class="subtab" data-subtab="history">HISTORY</button>
   </nav>
 
   <div id="nodes-sub-devices" class="subpage active">
@@ -339,6 +340,7 @@
       <button class="subtab active" data-subtab="availability">AVAILABILITY</button>
       <button class="subtab" data-subtab="topmetrics">TOP-N BY METRIC</button>
       <button class="subtab" data-subtab="firmware">FIRMWARE INVENTORY</button>
+      <button class="subtab" data-subtab="scheduled">SCHEDULED</button>
     </nav>
 
     <div id="nd-rep-sub-availability" class="subpage active">
@@ -410,6 +412,46 @@
       </div>
       <div class="table-wrap"><table id="nd-rep-fw-table"></table></div>
     </div>
+
+    <div id="nd-rep-sub-scheduled" class="subpage">
+      <div class="bar wrap">
+        <span class="section">SCHEDULED</span>
+        <span class="hint">Run one of the three reports above automatically and email it, summary in the body, full data as a CSV attachment.</span>
+      </div>
+      <div class="bar wrap" id="nd-sched-mail-hint" hidden>
+        <span class="hint">Alerts email is not configured, so a scheduled report will run but not send.
+          Set it up under Alerts &rarr; Settings.</span>
+      </div>
+      <div class="bar wrap">
+        <span class="grow"></span>
+        <button id="nd-sched-new" data-requires-write="nodes" class="primary">New schedule</button>
+      </div>
+      <div class="table-wrap"><table id="nd-sched-table"></table></div>
+    </div>
+  </div>
+
+  <div id="nodes-sub-history" class="subpage">
+    <div class="bar wrap">
+      <span class="section">HISTORY</span>
+      <span class="hint">Chart and table of up to 8 device or interface metrics over a chosen period.</span>
+    </div>
+    <div id="nd-hist-rows"></div>
+    <div class="bar wrap">
+      <button id="nd-hist-add" type="button">Add series</button>
+      <span class="grow"></span>
+      <select id="nd-hist-range" aria-label="History range"></select>
+      <label>Bucket <select id="nd-hist-bucket">
+        <option value="0">Auto</option>
+        <option value="60">1 min</option>
+        <option value="300">5 min</option>
+        <option value="3600">1 hour</option>
+      </select></label>
+      <button id="nd-hist-run" class="primary">Run</button>
+      <button id="nd-hist-csv">Export CSV</button>
+      <button id="nd-hist-clear">Clear</button>
+    </div>
+    <div id="nd-hist-chart" class="canvas chart" style="height:220px"><svg id="nd-hist-chart-svg"></svg></div>
+    <div class="table-wrap"><table id="nd-hist-table"></table></div>
   </div>
 </section>
 
@@ -925,6 +967,18 @@
       <button id="wl-oos" data-requires-write="wireless" hidden>Mark out of service</button>
       <button id="wl-remove-ap" data-requires-write="wireless" hidden>Remove</button>
     </header>
+    <div id="wl-hist" hidden>
+      <div class="bar">
+        <span class="section">HISTORY</span>
+        <select id="wl-hist-range" aria-label="History range"></select>
+        <span class="grow"></span>
+        <button id="wl-hist-csv">Export CSV</button>
+      </div>
+      <div id="wl-hist-clients" class="canvas chart" style="height:120px">
+        <svg id="wl-hist-clients-svg"></svg></div>
+      <div id="wl-hist-power" class="canvas chart" style="height:120px">
+        <svg id="wl-hist-power-svg"></svg></div>
+    </div>
     <pre id="wl-detail" class="detail" data-empty="Select an AP to see its per-radio detail."></pre>
    </div>
   </div>
@@ -1120,6 +1174,7 @@
     <button id="mp-add-device" data-requires-write="mapper">Add device</button>
     <button id="mp-add-neighbours" data-requires-write="mapper">Add neighbours</button>
     <button id="mp-remove-node" data-requires-write="mapper">Remove</button>
+    <button id="mp-connect" data-requires-write="mapper">Connect</button>
     <span class="grow"></span>
     <label>Snap <input type="checkbox" id="mp-snap" data-requires-write="mapper"></label>
     <label title="Left-drag on empty canvas pans the map instead of selecting devices">Drag pans <input type="checkbox" id="mp-drag-pans"></label>
@@ -1360,6 +1415,8 @@
         <span class="usage" id="use-nodes-series"></span></label>
       <label>Alerts database cap <input type="number" id="set-alerts-cap" min="16" step="16"> MB
         <span class="usage" id="use-alerts"></span></label>
+      <label>Wireless database cap <input type="number" id="set-wireless-cap" min="16" step="64"> MB
+        <span class="usage" id="use-wireless"></span></label>
       <p class="hint" id="set-sizes"></p>
       <p class="hint" id="set-series-bound"></p>
       <p class="hint">Checked every 15 minutes. When a file is over its cap the oldest records are
@@ -1377,9 +1434,11 @@
       <p class="hint">The application file has no cap because it is the one file worth
         backing up.<button type="button" class="help-link" data-help="settings.data.appfile"
         title="What does this control?" aria-label="Help">?</button></p>
-      <p class="hint">Wireless, ConfigRX and Mapper have no cap either: an access-point event
-        log, a device's configuration backups and a drawn map are each small enough that a cap
-        would only ever cost history nobody was short of space for.</p>
+      <p class="hint">Wireless caps its AP/radio history samples (clients, tx power) —
+        oldest first, ahead of the access-point event log those samples chart alongside — while
+        ConfigRX and Mapper have no cap: a device's configuration backups and a drawn map are
+        each small enough that a cap would only ever cost history nobody was short of space
+        for.</p>
     </fieldset>
 
     <fieldset>

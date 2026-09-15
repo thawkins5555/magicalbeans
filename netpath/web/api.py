@@ -25,6 +25,7 @@ from .. import alertrules
 from ..alertrules import device_id_for
 from .. import alertsdb
 from ..alertsdb import is_window_active
+from .. import csvout
 from ..analysis import (MAX_BUCKETS, MAX_TIMESTAMP, availability, build_timeline,
                         build_topology, clamp_window)
 from .. import namelookup
@@ -66,32 +67,28 @@ _UNSET = object()
 
 # ---------------------------------------------------------------------- CSV
 #
-# A spreadsheet treats a cell beginning = + - or @ as a formula, and the DDE
-# forms prompt to launch a program — while the content here is written by
-# whatever can reach UDP/514 or answer an SNMP walk, not by an operator. The
-# leading apostrophe is the conventional inert prefix. Exports answer as
-# JSON (server.py has no Content-Disposition path); the browser saves the
-# `text` field itself.
-_CSV_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
-
-
-def _csv_cell(value):
-    if isinstance(value, str) and value.startswith(_CSV_FORMULA_LEAD):
-        return "'" + value
-    return value
-
-
-def _csv_text(header: list[str], rows) -> str:
-    buf = io.StringIO()
-    writer = csv.writer(buf, lineterminator="\r\n")
-    writer.writerow(header)
-    writer.writerows([_csv_cell(cell) for cell in row] for row in rows)
-    return "\ufeff" + buf.getvalue()
+# csv_cell/csv_text themselves live in netpath/csvout.py now (F2), so
+# reportsched's emailed CSV attachment shares the exact same formula-safe
+# formatting without importing this route module. Aliased here under their
+# old names so every _csv_cell/_csv_text call site below is unchanged.
+# Exports answer as JSON (server.py has no Content-Disposition path); the
+# browser saves the `text` field itself.
+_csv_cell = csvout.csv_cell
+_csv_text = csvout.csv_text
 
 
 def _csv_filename(module: str) -> str:
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
     return f"sappiwhere-{module}-{stamp}.csv"
+
+
+def _csv_time(ts) -> str:
+    """A local-time reading alongside the epoch column every export keeps,
+    so a spreadsheet opened straight from the download already reads as a
+    clock time instead of a raw float."""
+    if ts is None:
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
 def _csv_response(module: str, header: list[str], rows, *, truncated: bool = False,
@@ -796,6 +793,10 @@ def get_state(service, params, body) -> dict:
             "status": service.collector.status_text(),
             "counters": service.collector.counters,
             "decoder": service.collector.decoder.stats,
+            # A5: how far back each tier reaches, cached — this is polled
+            # every 2s by every open tab and coverage() reads the raw table.
+            "coverage": service.cached_poll(
+                "flow_coverage", 10.0, service.flow_db.coverage),
         },
         "dns": {
             "running": bool(service.resolver._thread
@@ -1574,6 +1575,7 @@ def _flow_records_rows(service, params, limit: int) -> tuple[list[dict], bool, b
         sampling = row["sampling"] or 1
         records.append({
             "ts": row["ts_end"],
+            "ts_start": row["ts_start"],
             "src_ip": row["src_ip"],
             "src_name": names.get(row["src_ip"]),
             "src_port": port_name(row["src_port"], resolve_ports),
@@ -1612,10 +1614,11 @@ def get_flow_records(service, params, body) -> dict:
 def get_flow_records_export(service, params, body) -> dict:
     records, truncated, _bounded = _flow_records_rows(
         service, params, FLOW_EXPORT_CAP)
-    header = ["ts", "src_ip", "src_name", "src_port", "dst_ip", "dst_name",
-             "dst_port", "protocol", "bytes", "packets", "in_if", "out_if",
-             "exporter", "exporter_name"]
-    csv_rows = [[r.get(key) for key in header] for r in records]
+    header = ["start", "end", "ts", "src_ip", "src_name", "src_port", "dst_ip",
+             "dst_name", "dst_port", "protocol", "bytes", "packets", "in_if",
+             "out_if", "exporter", "exporter_name"]
+    csv_rows = [[_csv_time(r.get("ts_start")), _csv_time(r.get("ts"))] +
+                [r.get(key) for key in header[2:]] for r in records]
     return _csv_response("netflow", header, csv_rows, truncated=truncated,
                          cap=FLOW_EXPORT_CAP)
 
@@ -2164,6 +2167,7 @@ _GLOBAL_SETTINGS_RANGES = {
     "max_snmp_db_mb": (16, None),
     "max_syslog_db_mb": (16, None),
     "max_ipam_db_mb": (16, None),
+    "max_wireless_db_mb": (16, None),
     "max_nodes_db_mb": (16, None),
     "max_nodes_series_db_mb": (16, None),
     "max_alerts_db_mb": (16, None),
@@ -2768,9 +2772,10 @@ def get_syslog_search(service, params, body) -> dict:
 def get_syslog_search_export(service, params, body) -> dict:
     messages, truncated, _elapsed_ms, _effective, _fts = _syslog_search_rows(
         service, params, EXPORT_ROW_CAP, use_request_limit=False)
-    header = ["id", "ts", "source", "source_name", "host", "app", "procid",
+    header = ["time", "id", "ts", "source", "source_name", "host", "app", "procid",
              "msgid", "severity_name", "facility_name", "message"]
-    csv_rows = [[m.get(key) for key in header] for m in messages]
+    csv_rows = [[_csv_time(m.get("ts"))] + [m.get(key) for key in header[1:]]
+               for m in messages]
     return _csv_response("syslog", header, csv_rows, truncated=truncated,
                          cap=EXPORT_ROW_CAP)
 
@@ -2938,12 +2943,14 @@ def get_snmp_traps(service, params, body) -> dict:
 def get_snmp_traps_export(service, params, body) -> dict:
     traps, truncated, _elapsed_ms, _effective = _snmp_trap_rows(
         service, params, EXPORT_ROW_CAP, use_request_limit=False)
-    header = ["id", "ts", "source", "source_name", "version_name", "trap_name",
-             "trap_oid", "trap_kind", "severity_name", "community",
+    header = ["time", "id", "ts", "source", "source_name", "version_name",
+             "trap_name", "trap_oid", "trap_kind", "severity_name", "community",
              "agent_addr", "is_inform"]
 
     # A blank cell would say "carried none" instead of "not shown".
     def _cell(trap, key):
+        if key == "time":
+            return _csv_time(trap.get("ts"))
         if key == "community" and "community" not in trap:
             return "not shown" if trap.get("has_community") else ""
         return trap.get(key)
@@ -4185,7 +4192,8 @@ _DEVICE_CSV_HEADER = ["id", "name", "ip", "status", "group_id", "device_group_id
                      "vendor", "sys_descr", "sys_name", "polling", "muted_until",
                      "maintenance_since", "poll_interval_s", "last_poll_ts",
                      "override_count", "addresses",
-                     "sw_version", "sw_image", "sw_image_file", "fw_version"]
+                     "sw_version", "sw_image", "sw_image_file", "fw_version",
+                     "uptime_s"]
 
 
 def get_nodes_devices_export(service, params, body) -> dict:
@@ -4210,7 +4218,7 @@ def get_nodes_devices_export(service, params, body) -> dict:
                 d.get("override_count"),
                 ", ".join(a["ip"] for a in d.get("addresses") or ()),
                 d.get("sw_version"), d.get("sw_image"), d.get("sw_image_file"),
-                d.get("fw_version")]
+                d.get("fw_version"), d.get("sys_uptime_s")]
                for d in devices]
     return _csv_response("devices", header, csv_rows)
 
@@ -6200,6 +6208,7 @@ def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
     # asking.
     note = (device["interfaces_note"] or ""
             if "interfaces_note" in device.keys() else "")
+    priority = service.nodes_db.priority_if_indexes(device_id)
     # poe_admin/poe_detect_status/poe_power_mw/stp_state/media are read
     # defensively like every other column a migration added: a row fetched
     # before the ALTER TABLE has run on this database will not have them.
@@ -6217,8 +6226,20 @@ def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
          "poe_detect_status": (r["poe_detect_status"] if "poe_detect_status" in keys else None),
          "poe_power_mw": (r["poe_power_mw"] if "poe_power_mw" in keys else None),
          "stp_state": (r["stp_state"] if "stp_state" in keys else None),
-         "media": (r["media"] if "media" in keys else None)}
+         "media": (r["media"] if "media" in keys else None),
+         "priority": r["if_index"] in priority}
         for r in rows]}
+
+
+def put_nodes_interface_priority(service, params, body, device_id, if_index) -> dict:
+    device = _require(service.nodes_db.device(device_id), "device")
+    if_index = int(if_index)
+    on = bool(body.get("priority"))
+    service.nodes_db.set_interface_priority(device_id, if_index, on)
+    _audit(service, params, "interface.priority",
+          target=f"device:{device['ip']} if:{if_index}",
+          detail=f"priority {'set' if on else 'cleared'}")
+    return {"device_id": int(device_id), "if_index": if_index, "priority": on}
 
 
 def get_nodes_device_interfaces_export(service, params, body, device_id) -> dict:
@@ -6231,8 +6252,9 @@ def get_nodes_device_interfaces_export(service, params, body, device_id) -> dict
              "admin_status", "oper_status", "in_bps", "out_bps",
              "in_error_rate", "out_error_rate", "last_in_errors", "last_out_errors",
              "last_seen_ts", "poe_admin", "poe_detect_status", "poe_power_mw",
-             "stp_state", "media"]
-    csv_rows = [[i.get(key) for key in header] for i in interfaces]
+             "stp_state", "media", "Priority"]
+    csv_rows = [[i.get(key) for key in header[:-1]] +
+                ["yes" if i.get("priority") else "no"] for i in interfaces]
     return _csv_response("interfaces", header, csv_rows)
 
 
@@ -6350,6 +6372,39 @@ def get_nodes_series_batch(service, params, body) -> dict:
                       "metric_key": key, "unit": metric_row["unit"],
                       "label": label, "points": points})
     return {"t0": t0, "t1": t1, "series": series}
+
+
+# E2: capped well past what the History query builder's 8-row, one-window
+# ask could ever return in practice (8 series x a raw window of samples),
+# so the cap only ever bites a pathological bucket_s=0 request over a very
+# wide window -- truncated rather than refused, the same shape every other
+# capped export in this file takes.
+SERIES_EXPORT_CAP = 200_000
+
+
+def get_nodes_series_export(service, params, body) -> dict:
+    """The History query builder's Export CSV: the same q=<device_id>:
+    <metric_key>[,...] the chart/table already ran, reusing
+    get_nodes_series_batch's own parsing and fetch so the two can never
+    disagree about which points a given q names. Long format -- one row per
+    point per series -- so a spreadsheet can pivot either way."""
+    result = get_nodes_series_batch(service, params, body)
+    header = ["time", "ts", "device", "metric", "unit", "value", "min", "max"]
+    csv_rows = []
+    truncated = False
+    for s in result["series"]:
+        if truncated:
+            break
+        for p in s["points"]:
+            if len(csv_rows) >= SERIES_EXPORT_CAP:
+                truncated = True
+                break
+            value = p["avg"] if "avg" in p else p.get("value")
+            csv_rows.append([_csv_time(p["ts"]), p["ts"], s["device_name"],
+                            s["label"] or s["metric_key"], s["unit"], value,
+                            p.get("min"), p.get("max")])
+    return _csv_response("history", header, csv_rows, truncated=truncated,
+                         cap=SERIES_EXPORT_CAP)
 
 
 def get_nodes_device_timeline(service, params, body, device_id) -> dict:
@@ -6481,16 +6536,199 @@ def get_nodes_reports_firmware_export(service, params, body) -> dict:
     return _csv_response("firmware", _FIRMWARE_CSV_HEADER, csv_rows)
 
 
+# --------------------------------------------------- scheduled reports (F)
+
+_REPORT_SCHEDULE_KINDS = ("availability", "top_metrics", "firmware")
+_REPORT_SCHEDULE_CADENCES = ("daily", "weekly", "monthly")
+_REPORT_SCHEDULE_RECIPIENTS_MAX = 20
+
+
+def _clean_report_schedule_recipients(raw) -> list[str]:
+    """The same lax "must contain @" rule the Alerts recipients Add button
+    applies (alerts.js), so a schedule cannot save an address the Alerts
+    page itself would refuse."""
+    if isinstance(raw, str):
+        items = [a.strip() for a in raw.split(",") if a.strip()]
+    else:
+        items = [str(a).strip() for a in (raw or []) if str(a).strip()]
+    if not items:
+        raise ValueError("At least one recipient is required")
+    if len(items) > _REPORT_SCHEDULE_RECIPIENTS_MAX:
+        raise ValueError(
+            f"At most {_REPORT_SCHEDULE_RECIPIENTS_MAX} recipients are allowed")
+    for addr in items:
+        if "@" not in addr:
+            raise ValueError(f"{addr!r} does not look like an email address")
+    return items
+
+
+def _clean_report_schedule_params(kind: str, params) -> dict:
+    """Params per kind, the shape reportsched.py's own renderers read back:
+    availability {period_days, device_group_id?}, top_metrics {period_days,
+    metric_key, top_n}, firmware {} (nothing of its own to configure)."""
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    if kind == "availability":
+        period_days = _num(params, "period_days", 7, float)
+        if not (0 < period_days <= 366):
+            raise ValueError("period_days must be between 0 and 366")
+        cleaned = {"period_days": period_days}
+        group_id = params.get("device_group_id")
+        if group_id not in (None, ""):
+            cleaned["device_group_id"] = int(group_id)
+        return cleaned
+    if kind == "top_metrics":
+        period_days = _num(params, "period_days", 7, float)
+        if not (0 < period_days <= 366):
+            raise ValueError("period_days must be between 0 and 366")
+        metric_key = str(params.get("metric_key", "")).strip()
+        if not metric_key:
+            raise ValueError("metric_key is required for a top_metrics report")
+        top_n = _num(params, "top_n", 20, int)
+        if not (1 <= top_n <= 500):
+            raise ValueError("top_n must be between 1 and 500")
+        return {"period_days": period_days, "metric_key": metric_key, "top_n": top_n}
+    return {}   # firmware takes no params of its own
+
+
+def _report_schedule_fields(body) -> dict:
+    """Validated write-fields for add_report_schedule/update_report_schedule.
+    The New/Edit dialog always submits the whole form, so POST and PUT share
+    this one validation rather than PUT allowing a partial, possibly
+    inconsistent, patch (a weekly schedule saved with no weekday, say)."""
+    name = str(body.get("name", "")).strip()
+    if not name:
+        raise ValueError("A name is required")
+    if len(name) > 60:
+        raise ValueError("Name must be 60 characters or fewer")
+
+    kind = str(body.get("kind", "")).strip()
+    if kind not in _REPORT_SCHEDULE_KINDS:
+        raise ValueError("kind must be one of " + ", ".join(_REPORT_SCHEDULE_KINDS))
+
+    cadence = str(body.get("cadence", "")).strip()
+    if cadence not in _REPORT_SCHEDULE_CADENCES:
+        raise ValueError("cadence must be one of " + ", ".join(_REPORT_SCHEDULE_CADENCES))
+
+    hour = _num(body, "hour", None, int)
+    if hour is None or not (0 <= hour <= 23):
+        raise ValueError("hour must be 0-23")
+    minute = _num(body, "minute", None, int)
+    if minute is None or not (0 <= minute <= 59):
+        raise ValueError("minute must be 0-59")
+
+    weekday = day_of_month = None
+    if cadence == "weekly":
+        weekday = _num(body, "weekday", None, int)
+        if weekday is None or not (0 <= weekday <= 6):
+            raise ValueError("weekday (0=Monday) is required for a weekly schedule")
+    elif cadence == "monthly":
+        day_of_month = _num(body, "day_of_month", None, int)
+        if day_of_month is None or not (1 <= day_of_month <= 31):
+            raise ValueError("day_of_month (1-31) is required for a monthly schedule")
+
+    return {
+        "name": name, "kind": kind,
+        "params_json": json.dumps(
+            _clean_report_schedule_params(kind, body.get("params") or {})),
+        "cadence": cadence, "hour": hour, "minute": minute,
+        "weekday": weekday, "day_of_month": day_of_month,
+        "recipients": json.dumps(
+            _clean_report_schedule_recipients(body.get("recipients"))),
+        "enabled": bool(body.get("enabled", True)),
+    }
+
+
+def _report_schedule_json(row) -> dict:
+    return {
+        "id": row["id"], "name": row["name"], "kind": row["kind"],
+        "params": json.loads(row["params_json"] or "{}"),
+        "cadence": row["cadence"], "hour": row["hour"], "minute": row["minute"],
+        "weekday": row["weekday"], "day_of_month": row["day_of_month"],
+        "recipients": json.loads(row["recipients"] or "[]"),
+        "enabled": bool(row["enabled"]),
+        "next_run_ts": row["next_run_ts"], "last_run_ts": row["last_run_ts"],
+        "last_status": row["last_status"],
+    }
+
+
+def get_nodes_report_schedules(service, params, body) -> dict:
+    return {"schedules": [_report_schedule_json(r)
+                          for r in service.nodes_db.report_schedules()]}
+
+
+def post_nodes_report_schedule(service, params, body) -> dict:
+    from .. import reportsched
+    fields = _report_schedule_fields(body)
+    next_run_ts = reportsched.next_due(fields, time.time())
+    schedule_id = service.nodes_db.add_report_schedule(
+        fields["name"], fields["kind"], fields["params_json"], fields["cadence"],
+        fields["hour"], fields["minute"], fields["weekday"], fields["day_of_month"],
+        fields["recipients"], enabled=fields["enabled"], next_run_ts=next_run_ts)
+    _audit(service, params, "report.schedule", target=fields["name"], detail="created")
+    return {"id": schedule_id}
+
+
+def put_nodes_report_schedule(service, params, body, schedule_id) -> dict:
+    from .. import reportsched
+    _require(service.nodes_db.report_schedule(schedule_id), "report schedule")
+    fields = _report_schedule_fields(body)
+    fields["next_run_ts"] = reportsched.next_due(fields, time.time())
+    service.nodes_db.update_report_schedule(schedule_id, **fields)
+    _audit(service, params, "report.schedule", target=fields["name"], detail="updated")
+    return {"ok": True}
+
+
+def delete_nodes_report_schedule(service, params, body, schedule_id) -> dict:
+    row = _require(service.nodes_db.report_schedule(schedule_id), "report schedule")
+    service.nodes_db.delete_report_schedule(schedule_id)
+    _audit(service, params, "report.schedule", target=row["name"], detail="deleted")
+    return {"ok": True}
+
+
+def post_nodes_report_schedule_run(service, params, body, schedule_id) -> dict:
+    """Send now, outside the schedule -- does not move next_run_ts, so a
+    manual send never displaces the automatic one."""
+    from .. import reportsched
+    row = _require(service.nodes_db.report_schedule(schedule_id), "report schedule")
+    try:
+        subject, body_text, csv_text, filename = reportsched.render(
+            service, row, time.time())
+    except Exception as exc:
+        status = f"failed: {exc}"
+        service.nodes_db.record_report_schedule_run(schedule_id, status)
+        return {"ok": False, "status": status}
+    recipients = json.loads(row["recipients"] or "[]")
+    creds = service.alert_engine.smtp_credentials() if service.alert_engine else None
+    if creds is None:
+        status = "not sent: email is not configured"
+    else:
+        from .. import alertmail
+        settings, password = creds
+        try:
+            alertmail.send(settings, password, recipients, subject, body_text,
+                           attachments=[(filename, csv_text.encode("utf-8"),
+                                        "text", "csv")])
+            status = f"sent to {len(recipients)} recipient(s)"
+        except Exception as exc:
+            status = f"failed to send: {exc}"
+    service.nodes_db.record_report_schedule_run(schedule_id, status)
+    _audit(service, params, "report.schedule", target=row["name"],
+          detail=f"send now: {status}")
+    return {"ok": status.startswith("sent"), "status": status}
+
+
 def get_nodes_device_events(service, params, body, device_id) -> dict:
     _require(service.nodes_db.device(device_id), "device")
     since_s = _num(params, "since_s", None)
     # The per-method lane events are drawn on the timeline, never listed:
     # every outage would otherwise show three rows (down, snmp_down,
-    # ping_down) that all say the same thing. Same exclusion the overview
-    # histogram applies.
+    # ping_down) that all say the same thing. poll_overrun is dropped too --
+    # operational noise, not a device event -- but device_events() itself
+    # still returns it to any other caller (alerting reads the table direct).
     device_events = service.nodes_db.device_events(
         device_id=device_id, since_s=since_s,
-        exclude_kinds=tuple(nodesdb.TIMELINE_ONLY_EVENT_KINDS))
+        exclude_kinds=tuple(nodesdb.DIALOG_HIDDEN_EVENT_KINDS))
     interface_events = [
         {"id": ev["id"], "interface_id": ev["interface_id"],
          "if_index": ev["if_index"], "descr": ev["descr"],
@@ -8637,6 +8875,74 @@ def delete_wireless_ap(service, params, body, ap_id) -> dict:
     return {"ok": True}
 
 
+def _wireless_history_points(rows, value_key: str, bucket_s: float) -> list[dict]:
+    """Raw {ts, value} points, or (bucket_s > 0) the same {ts, avg, min,
+    max, n} shape nodesseriesdb.series' own bucketed branch returns --
+    App.drawSeriesChart already draws either without caring which store
+    it came from."""
+    if bucket_s and bucket_s > 0:
+        buckets: dict[float, list] = {}
+        for row in rows:
+            value = row[value_key]
+            if value is None:
+                continue
+            slot = (row["ts"] // bucket_s) * bucket_s
+            buckets.setdefault(slot, []).append(value)
+        return [{"ts": slot, "avg": sum(vals) / len(vals), "min": min(vals),
+                "max": max(vals), "n": len(vals)}
+               for slot, vals in sorted(buckets.items())]
+    return [{"ts": row["ts"], "value": row[value_key]} for row in rows
+           if row[value_key] is not None]
+
+
+def _wireless_history_series(service, ap_id: int, t0: float, t1: float,
+                             bucket_s: float) -> list[dict]:
+    """The AP-total clients series plus, per radio, a clients and a tx-power
+    series -- exactly what fortipoll already samples, no new SNMP columns.
+    Radio order is the radio id sorted, so the series list (and the two
+    charts wireless.js builds from it) draws the same radios in the same
+    order on every request."""
+    raw = service.wireless_db.ap_history(ap_id, t0, t1)
+    series = [{"key": "clients", "label": "Clients", "unit": "",
+              "points": _wireless_history_points(raw["ap"], "station_count", bucket_s)}]
+    by_radio: dict[str, list] = {}
+    for row in raw["radios"]:
+        by_radio.setdefault(row["radio_id"], []).append(row)
+    for radio_id in sorted(by_radio):
+        rows = by_radio[radio_id]
+        series.append({"key": f"radio:{radio_id}:clients",
+                       "label": f"Radio {radio_id} clients", "unit": "",
+                       "points": _wireless_history_points(rows, "station_count", bucket_s)})
+        series.append({"key": f"radio:{radio_id}:power",
+                       "label": f"Radio {radio_id} tx power", "unit": "dBm",
+                       "points": _wireless_history_points(rows, "operating_power_dbm",
+                                                          bucket_s)})
+    return series
+
+
+def get_wireless_ap_history(service, params, body, ap_id) -> dict:
+    _require(service.wireless_db.access_point(ap_id), "access point")
+    t0, t1 = _window(params, 86400.0)
+    bucket_s = _series_bucket_s(params, t0, t1)
+    series = _wireless_history_series(service, ap_id, t0, t1, bucket_s)
+    return {"t0": t0, "t1": t1, "bucket_s": bucket_s, "series": series}
+
+
+def get_wireless_ap_history_export(service, params, body, ap_id) -> dict:
+    ap = _require(service.wireless_db.access_point(ap_id), "access point")
+    t0, t1 = _window(params, 86400.0)
+    bucket_s = _series_bucket_s(params, t0, t1)
+    series = _wireless_history_series(service, ap_id, t0, t1, bucket_s)
+    header = ["time", "ts", "series", "value", "min", "max"]
+    csv_rows = []
+    for s in series:
+        for p in s["points"]:
+            value = p["avg"] if "avg" in p else p.get("value")
+            csv_rows.append([_csv_time(p["ts"]), p["ts"], s["key"], value,
+                            p.get("min"), p.get("max")])
+    return _csv_response(f"wireless-ap-{ap['id']}-history", header, csv_rows)
+
+
 def post_wireless_collector(service, params, body) -> dict:
     action = str(body.get("action", "")).lower()
     if action == "start":
@@ -9743,6 +10049,33 @@ def get_mapper_map(service, params, body, map_id) -> dict:
             "port_count": port_count_by_device.get(device_id) if badge_ports else None,
         })
 
+    # D2: manual lines the operator drew by hand, appended to the same
+    # `links` list the discovered ones already fill -- mapper.js's drawLink
+    # and friends see one list and branch on `manual`. Every key a
+    # discovered link carries is present here too (even where always None),
+    # so a code path that reads e.g. link.a_port_mode without checking
+    # `manual` first does not throw.
+    node_by_id = {row["id"]: row for row in node_rows}
+    for row in service.mapper_db.links(map_id):
+        a_node = node_by_id.get(row["a_node_id"])
+        b_node = node_by_id.get(row["b_node_id"])
+        if a_node is None or b_node is None:
+            continue    # placement removed since; the FK cascade will catch up
+        links.append({
+            "id": f"m{row['id']}", "link_id": row["id"], "manual": True,
+            "a_device_id": a_node["device_id"], "a_peer_key": a_node["peer_key"] or "",
+            "b_device_id": b_node["device_id"], "b_peer_key": b_node["peer_key"] or "",
+            "a_port": "", "b_port": "", "a_if_index": None, "b_if_index": None,
+            "a_port_mode": None, "a_native_vlan": None,
+            "b_port_mode": None, "b_native_vlan": None,
+            "label": row["label"], "protocols": ["manual"], "vlans": [],
+            "native_vlan": None,
+            "unmanaged": a_node["device_id"] is None or b_node["device_id"] is None,
+            "seen_ts": row["added_ts"],
+            "plan": {"mode": "manual", "width": width_min, "strands": [],
+                    "known": False, "vlan_count": 0, "vlans": [], "label_step": 0.0},
+        })
+
     return {
         "map": _mapper_map_json(map_row),
         "nodes": nodes,
@@ -9808,6 +10141,42 @@ def delete_mapper_map_node(service, params, body, map_id, node_id) -> dict:
     if ok:
         _audit(service, params, "mapper.node.remove", target=str(map_id),
               detail=f"node_id={node_id}")
+    return {"ok": ok}
+
+
+def post_mapper_map_links(service, params, body, map_id) -> dict:
+    """A manual line an operator draws between two placed nodes -- asserted,
+    not learned from LLDP/CDP. Both ends must already be on this map (the
+    same rule add_node enforces for device placement); the duplicate check
+    runs here, ahead of mapperdb.add_link's own, so a repeat click reports
+    409 with the existing pair rather than a generic 400."""
+    _require(service.mapper_db.map_row(map_id), "map")
+    try:
+        a_node_id = int(body.get("a_node_id"))
+        b_node_id = int(body.get("b_node_id"))
+    except (TypeError, ValueError):
+        raise ValueError("a_node_id and b_node_id are required")
+    if a_node_id == b_node_id:
+        raise ValueError("A manual line needs two different nodes.")
+    label = str(body.get("label", "") or "").strip()
+    if len(label) > 60:
+        raise ValueError("Line label is limited to 60 characters.")
+    for existing in service.mapper_db.links(map_id):
+        pair = {existing["a_node_id"], existing["b_node_id"]}
+        if pair == {a_node_id, b_node_id}:
+            raise Conflict("A line already connects these two nodes.",
+                          {"link_id": existing["id"]})
+    link_id = service.mapper_db.add_link(map_id, a_node_id, b_node_id, label)
+    _audit(service, params, "mapper.link", target=str(map_id),
+          detail=f"a_node_id={a_node_id} b_node_id={b_node_id}")
+    return {"id": link_id}
+
+
+def delete_mapper_map_link(service, params, body, map_id, link_id) -> dict:
+    ok = service.mapper_db.delete_link(map_id, link_id)
+    if ok:
+        _audit(service, params, "mapper.link.remove", target=str(map_id),
+              detail=f"link_id={link_id}")
     return {"ok": ok}
 
 

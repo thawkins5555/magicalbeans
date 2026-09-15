@@ -325,6 +325,12 @@ class FlowDatabase(SqliteStore):
         # inside budget, so a caller can tell a partial sweep from a
         # complete one.
         self.last_prune_incomplete = False
+        # Rows the row-cap stage of the last prune() left alone because the
+        # minute rollup had not summarised them yet (A3).
+        self.cap_held_back = 0
+        # Per-tier: whether compact_rollup's last call processed its full
+        # bucket limit, i.e. more sealed buckets likely remain (A3 catch-up).
+        self._compact_hit_limit: dict[int, bool] = {}
         super().__init__(path)
 
     def _migrate(self) -> None:
@@ -609,6 +615,7 @@ class FlowDatabase(SqliteStore):
             # revisit it, because compaction only ever moves forward.
             self._set_private_setting(_WATERMARK % tier, sealed)
             self._set_private_setting(_FLOOR % tier, sealed)
+            self._compact_hit_limit[tier] = False
             return 0
         limit = _ROLLUP_MAX_BUCKETS[tier] if max_buckets is None else max_buckets
         deadline = time.monotonic() + budget_s
@@ -622,8 +629,17 @@ class FlowDatabase(SqliteStore):
             processed += 1
         if bucket != watermark:
             self._set_private_setting(_WATERMARK % tier, bucket)
+        # Whether this pass used up its whole bucket allowance, i.e. the
+        # sealed backlog likely still reaches past where it stopped -- the
+        # signal _rollup_loop's catch-up mode (A3) repeats on.
+        self._compact_hit_limit[tier] = processed >= limit
         return written + self._redo_dirty(tier, watermark, floor,
                                           limit - processed, deadline)
+
+    def compact_hit_limit(self, tier: int) -> bool:
+        """Whether the last compact_rollup(tier) call used its full bucket
+        allowance -- see _compact_hit_limit above."""
+        return self._compact_hit_limit.get(tier, False)
 
     def _redo_dirty(self, tier: int, upto: int, floor: int | None,
                     limit: int, deadline: float) -> int:
@@ -814,6 +830,7 @@ class FlowDatabase(SqliteStore):
             removed += gone
             incomplete = incomplete or reached < aged
 
+        held_back = 0
         if max_flows:
             # Two index probes rather than the COUNT(*) full scan this used
             # to pay on every maintenance pass: ids are handed out in arrival
@@ -825,11 +842,34 @@ class FlowDatabase(SqliteStore):
             low, high = bounds["lo"], bounds["hi"]
             over = 0 if low is None else (high - low + 1) - max_flows
             if over > 0:
-                capped, reached = self._delete_batches(
-                    low, low + over, deadline, chunk=TRIM_CHUNK,
-                    chunk_min=TRIM_CHUNK_MIN, chunk_max=TRIM_CHUNK_MAX)
-                removed += capped
-                incomplete = incomplete or reached < low + over
+                cap_upper = low + over
+                # Never cap past what the minute rollup has summarised: on a
+                # busy store where compact_rollup falls behind, capping by id
+                # alone deleted minutes the rollup had not built yet, a
+                # permanent hole in every chart wider than the raw window.
+                # Rows at/after the watermark survive; how many is reported
+                # as cap_held_back rather than dropped silently.
+                _minute_floor, minute_watermark = self.rollup_bounds(60)
+                if minute_watermark is not None:
+                    with self._lock:
+                        row = self._conn.execute(
+                            "SELECT MIN(id) AS id FROM flows WHERE ts_end >= ?",
+                            (minute_watermark,)).fetchone()
+                    watermark_id = row["id"]
+                    if watermark_id is not None and watermark_id < cap_upper:
+                        held_back = cap_upper - watermark_id
+                        cap_upper = watermark_id
+                if cap_upper > low:
+                    capped, reached = self._delete_batches(
+                        low, cap_upper, deadline, chunk=TRIM_CHUNK,
+                        chunk_min=TRIM_CHUNK_MIN, chunk_max=TRIM_CHUNK_MAX)
+                    removed += capped
+                    incomplete = incomplete or reached < cap_upper
+        self.cap_held_back = held_back
+        if held_back:
+            log.warning("netpath.flowdb: row cap held back %d flow(s) not yet"
+                        " summarised by the minute rollup (watermark behind)",
+                        held_back)
 
         for tier, days in ((60, minute_days), (3600, rollup_days)):
             if days is None:
@@ -927,6 +967,36 @@ class FlowDatabase(SqliteStore):
                 " SUM(bytes * sampling) AS bytes FROM flows").fetchone()
         return {"flows": row["flows"] or 0, "lo": row["lo"], "hi": row["hi"],
                 "bytes": row["bytes"] or 0}
+
+    def minute_lag_s(self) -> float | None:
+        """Seconds sealed time is ahead of the minute rollup watermark, or
+        None before the tier is seeded. Backs coverage()'s strip line and
+        the caller's SYSTEM-log throttle (A5)."""
+        _floor, watermark = self.rollup_bounds(60)
+        if watermark is None:
+            return None
+        sealed = _align_down(time.time() - _ROLLUP_LAG_S, 60)
+        return max(0.0, sealed - watermark)
+
+    def coverage(self) -> dict:
+        """What each tier still covers, for the NetFlow status strip (A5):
+        the raw table's own span (MIN/MAX(ts_end), an ix_flows_ts index
+        probe rather than stats()'s full scan) plus both rollup tiers'
+        floor/watermark and the last prune's own bookkeeping.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MIN(ts_end) AS oldest, MAX(ts_end) AS newest"
+                " FROM flows").fetchone()
+        minute_floor, minute_watermark = self.rollup_bounds(60)
+        hourly_floor, hourly_watermark = self.rollup_bounds(3600)
+        return {
+            "raw_oldest": row["oldest"], "raw_newest": row["newest"],
+            "minute_floor": minute_floor, "minute_watermark": minute_watermark,
+            "hourly_floor": hourly_floor, "hourly_watermark": hourly_watermark,
+            "cap_held_back": self.cap_held_back,
+            "prune_incomplete": self.last_prune_incomplete,
+        }
 
     # ------------------------------------------------------------------ query
 
@@ -1069,6 +1139,22 @@ class FlowDatabase(SqliteStore):
             align, n_buckets = float(min(ROLLUP_TIERS)), 1
         else:
             bucket_s = max(float(bucket_s), 1.0)
+            # A4: a wide, unfiltered chart whose bucket the minute tier
+            # cannot reach (its floor sits above t0 -- aged out by its own
+            # shorter retention) used to fall straight back to raw, already
+            # thinned by the row cap or by retention on a store this old,
+            # even where the hourly tier covers the whole window. Widen the
+            # bucket to the hourly tier's width instead; the response's own
+            # bucket_s is what the chart draws, and the hover already states it.
+            if (bucket_s % 60 == 0 and bucket_s < 3600
+                    and not (filters and any(filters.values()))):
+                minute_floor, _minute_watermark = self.rollup_bounds(60)
+                hourly_floor, hourly_watermark = self.rollup_bounds(3600)
+                if (minute_floor is not None and t0 < minute_floor
+                        and hourly_floor is not None
+                        and hourly_watermark is not None
+                        and t0 >= hourly_floor and hourly_watermark > t0):
+                    bucket_s = 3600.0
             # Under a minute nothing is rollup-served anyway.
             align = bucket_s if bucket_s % 60 == 0 else 0.0
         if align:

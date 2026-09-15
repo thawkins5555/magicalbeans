@@ -28,6 +28,11 @@
     // Set by the #nd-d-range dropdown, or chartPinned once a drag/wheel/Custom pins one.
     chartRange: 3600,
     chartPinned: null,
+    // The HISTORY subtab's own window pin and last result -- unrelated to
+    // chartPinned above (the device dialog's own chart), local instead to
+    // the ad-hoc query builder's chart/table pair.
+    histPinned: null,
+    histResult: null,
     // The packet-loss chart lives in the device dialog now (double-click a
     // device); its window and data are local to that dialog's own closure,
     // not pane-wide state — see deviceDialog.
@@ -299,6 +304,9 @@
         : (r.ping_ok ? `${(r.ping_rtt_ms || 0).toFixed(0)} ms (ping only)` : '\u2014')) },
     { key: 'last_poll_ts', label: 'Last poll', width: 100, numeric: true, on: true,
       value: (r) => r.last_poll_ts || 0, cell: (r) => App.agoCell(r.last_poll_ts) },
+    { key: 'uptime', label: 'Uptime', width: 110, numeric: true, on: false,
+      value: (r) => (r.sys_uptime_s == null ? null : r.sys_uptime_s),
+      cell: (r) => (r.sys_uptime_s != null ? App.duration(r.sys_uptime_s) : '—') },
     { key: 'overrides', label: 'Overrides', width: 90, numeric: true,
       value: (r) => r.override_count || null,
       cell: (r) => (r.override_count
@@ -1408,6 +1416,10 @@
   const IFACE_COLUMNS = [
     { key: 'if_index', label: '#', width: 55, numeric: true, on: true,
       cell: (r) => r.if_index },
+    { key: 'priority', label: '★', width: 40, on: true,
+      ariaLabel: 'Priority',
+      value: (r) => (r.priority ? 1 : 0),
+      cell: (r) => (r.priority ? '★' : '') },
     { key: 'descr', label: 'Descr', width: 170, on: true,
       value: (r) => (r.descr || r.alias || '').toLowerCase(),
       cell: (r) => sfpBadge(r) + escape(r.descr || r.alias || '') },
@@ -2270,7 +2282,8 @@
     // page currently holds: a wrong parent name is worse than none.
     const parent = device
       ? `<div class="ifd-parent">${escape(displayName(device))}</div>` : '';
-    return parent + `<div>${escape(row.descr || `Interface ${ifIndex}`)}` +
+    const star = row.priority ? '★ ' : '';
+    return parent + `<div>${star}${escape(row.descr || `Interface ${ifIndex}`)}` +
       (row.alias ? ` <span class="hint">${escape(row.alias)}</span>` : '') +
       '</div>';
   }
@@ -2616,6 +2629,9 @@
         <span class="hint">(<span style="color:var(--ok)">▬</span> in ·
         <span style="color:var(--accent)">▬</span> out)</span>
         <select id="ifd-range" aria-label="Chart range"></select>
+        <label class="check" style="margin-left:8px;font-weight:400">
+          <input type="checkbox" id="ifd-priority" data-requires-write="nodes"
+            ${iface.priority ? 'checked' : ''}> Priority port</label>
         <label class="check" style="margin-left:auto;font-weight:400">
           <input type="checkbox" id="ifd-smooth" checked> Smoothed</label></div>
       <div id="ifd-chart" class="canvas chart" style="height:150px"><svg id="ifd-chart-svg"></svg></div>
@@ -2706,6 +2722,25 @@
     box.querySelector('#ifd-smooth').onchange = (event) => {
       smooth = event.target.checked;
       drawChart();
+    };
+
+    box.querySelector('#ifd-priority').onchange = async (event) => {
+      const checkbox = event.target;
+      const on = checkbox.checked;
+      checkbox.disabled = true;
+      try {
+        await App.put(`/api/nodes/devices/${deviceId}/interfaces/${ifIndex}/priority`,
+          { priority: on });
+        iface.priority = on;
+        App.toast(on ? 'Flagged as a priority port' : 'Priority flag cleared', 'ok');
+        const h2 = box.querySelector('h2');
+        if (h2) h2.innerHTML = ifaceTitle(iface, ifIndex, deviceId);
+      } catch (error) {
+        checkbox.checked = !on;
+        App.toast(`Could not save: ${error.message}`, 'fail');
+      } finally {
+        checkbox.disabled = false;
+      }
     };
 
     box.querySelector('#ifd-range').onchange = async (event) => {
@@ -4214,6 +4249,477 @@
 
   function selectReportsSub(name) {
     App.selectSub('nodes', name, { host: 'nodes-sub-reports', prefix: 'nd-rep-sub-' });
+    if (name === 'scheduled') loadReportSchedules().catch(() => {});
+  }
+
+  /* ----------------------------------------------------- scheduled reports
+
+     F6: a saved name/kind/cadence/recipients row (netpath/reportsched.py
+     owns due-date math and rendering; here it is CRUD plus a table). Small
+     enough a handful of rows at most (nodesdb caps it at 50) that a plain
+     rebuilt table, the drawMibsTable() pattern, is simpler than wiring
+     App.grid's column picker/sort machinery for it. */
+
+  const SCHED_KIND_LABEL = { availability: 'Availability', top_metrics: 'Top-N by metric',
+                             firmware: 'Firmware inventory' };
+  const SCHED_WEEKDAY_LABEL = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday',
+                               'Saturday', 'Sunday'];
+
+  function scheduleCadenceText(row) {
+    const time = `${String(row.hour).padStart(2, '0')}:${String(row.minute).padStart(2, '0')}`;
+    if (row.cadence === 'weekly') {
+      return `Weekly, ${SCHED_WEEKDAY_LABEL[row.weekday] ?? ''} ${time}`;
+    }
+    if (row.cadence === 'monthly') return `Monthly, day ${row.day_of_month} ${time}`;
+    return `Daily ${time}`;
+  }
+
+  /* Whether Alerts email is set up at all -- alertsSettings is dropped from
+     /api/config for an account with no "alerts" read (api.py's
+     _CONFIG_MODULE_KEYS), so a nodes-only viewer sees no hint either way
+     rather than one this page cannot actually help them act on. */
+  function updateSchedMailHint() {
+    const hint = App.el('nd-sched-mail-hint');
+    if (!hint) return;
+    const s = App.state.alertsSettings;
+    hint.hidden = !s || !!(s.email_enabled && s.smtp_host);
+  }
+
+  function schedParamsHtml(kind, params) {
+    params = params || {};
+    const period = `<label>Period <input id="nd-sched-period" type="number" min="1" max="366"
+      value="${params.period_days != null ? params.period_days : 7}"> day(s)</label>`;
+    if (kind === 'top_metrics') {
+      return period +
+        `<label>Metric key <input id="nd-sched-metrickey" size="20"
+          value="${escape(params.metric_key || '')}" placeholder="cpu_pct"></label>` +
+        `<label>Top <input id="nd-sched-topn" type="number" min="1" max="500"
+          value="${params.top_n || 20}"></label>`;
+    }
+    if (kind === 'firmware') {
+      return '<p class="hint">No parameters: the whole fleet, as it stands.</p>';
+    }
+    return period +
+      `<label>Device group <select id="nd-sched-devgroup">${reportDevGroupOptionsHtml()}</select></label>`;
+  }
+
+  function readSchedParams(kind) {
+    if (kind === 'top_metrics') {
+      return { period_days: Number(App.el('nd-sched-period').value) || 7,
+               metric_key: App.el('nd-sched-metrickey').value.trim(),
+               top_n: Number(App.el('nd-sched-topn').value) || 20 };
+    }
+    if (kind === 'firmware') return {};
+    const params = { period_days: Number(App.el('nd-sched-period').value) || 7 };
+    const group = App.el('nd-sched-devgroup').value;
+    if (group) params.device_group_id = Number(group);
+    return params;
+  }
+
+  function scheduleDialog(existing) {
+    const kind = existing ? existing.kind : 'availability';
+    const cadence = existing ? existing.cadence : 'daily';
+    const box = App.modal(existing ? 'Edit scheduled report' : 'New scheduled report', `
+      <label>Name <input id="nd-sched-name" value="${existing ? escape(existing.name) : ''}"></label>
+      <label>Report <select id="nd-sched-kind">
+        <option value="availability">Availability</option>
+        <option value="top_metrics">Top-N by metric</option>
+        <option value="firmware">Firmware inventory</option>
+      </select></label>
+      <div id="nd-sched-params">${schedParamsHtml(kind, existing && existing.params)}</div>
+      <label>Cadence <select id="nd-sched-cadence">
+        <option value="daily">Daily</option>
+        <option value="weekly">Weekly</option>
+        <option value="monthly">Monthly</option>
+      </select></label>
+      <label>Time <input id="nd-sched-hour" type="number" min="0" max="23" size="3"
+        value="${existing ? existing.hour : 6}">
+        : <input id="nd-sched-minute" type="number" min="0" max="59" size="3"
+        value="${existing ? existing.minute : 0}"></label>
+      <div id="nd-sched-weekday-row"><label>Weekday <select id="nd-sched-weekday">${
+        SCHED_WEEKDAY_LABEL.map((label, i) => `<option value="${i}" ` +
+          `${existing && existing.weekday === i ? 'selected' : ''}>${label}</option>`).join('')
+      }</select></label></div>
+      <div id="nd-sched-dom-row"><label>Day of month <input id="nd-sched-dom" type="number"
+        min="1" max="31" value="${existing && existing.day_of_month ? existing.day_of_month : 1}"></label></div>
+      <label>Recipients (comma-separated) <input id="nd-sched-recipients" size="40"
+        value="${existing ? escape(existing.recipients.join(', ')) : ''}"
+        placeholder="name@example.com"></label>
+      <label class="check"><input type="checkbox" id="nd-sched-enabled"
+        ${!existing || existing.enabled ? 'checked' : ''}> Enabled</label>`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: existing ? 'Save' : 'Create', primary: true, onClick: async (box) => {
+        const kindNow = box.querySelector('#nd-sched-kind').value;
+        const cadenceNow = box.querySelector('#nd-sched-cadence').value;
+        const body = {
+          name: box.querySelector('#nd-sched-name').value.trim(),
+          kind: kindNow,
+          params: readSchedParams(kindNow),
+          cadence: cadenceNow,
+          hour: Number(box.querySelector('#nd-sched-hour').value),
+          minute: Number(box.querySelector('#nd-sched-minute').value),
+          recipients: box.querySelector('#nd-sched-recipients').value
+            .split(',').map((a) => a.trim()).filter(Boolean),
+          enabled: box.querySelector('#nd-sched-enabled').checked,
+        };
+        if (cadenceNow === 'weekly') {
+          body.weekday = Number(box.querySelector('#nd-sched-weekday').value);
+        }
+        if (cadenceNow === 'monthly') {
+          body.day_of_month = Number(box.querySelector('#nd-sched-dom').value);
+        }
+        try {
+          if (existing) await App.put(`/api/nodes/reports/schedules/${existing.id}`, body);
+          else await App.post('/api/nodes/reports/schedules', body);
+        } catch (error) {
+          App.toast(`Could not save: ${error.message}`, 'fail');
+          return;
+        }
+        App.closeModal();
+        loadReportSchedules().catch(() => {});
+      } },
+    ]);
+    box.querySelector('#nd-sched-kind').value = kind;
+    box.querySelector('#nd-sched-cadence').value = cadence;
+    const syncCadenceRows = () => {
+      const c = box.querySelector('#nd-sched-cadence').value;
+      box.querySelector('#nd-sched-weekday-row').hidden = c !== 'weekly';
+      box.querySelector('#nd-sched-dom-row').hidden = c !== 'monthly';
+    };
+    syncCadenceRows();
+    box.querySelector('#nd-sched-cadence').onchange = syncCadenceRows;
+    box.querySelector('#nd-sched-kind').onchange = (event) => {
+      box.querySelector('#nd-sched-params').innerHTML = schedParamsHtml(event.target.value, {});
+    };
+  }
+
+  async function sendScheduleNow(id) {
+    let result;
+    try {
+      result = await App.post(`/api/nodes/reports/schedules/${id}/run`, {});
+    } catch (error) {
+      App.toast(`Could not send: ${error.message}`, 'fail');
+      return;
+    }
+    App.toast(result.status || 'Sent', result.ok ? 'ok' : 'warn');
+    loadReportSchedules().catch(() => {});
+  }
+
+  function removeSchedule(id, name) {
+    App.confirmDestructive('Delete scheduled report',
+      `<p>Delete <b>${escape(name)}</b>? This does not affect reports already sent.</p>`,
+      'Delete', async () => {
+        await App.del(`/api/nodes/reports/schedules/${id}`);
+        loadReportSchedules().catch(() => {});
+      });
+  }
+
+  function drawScheduleTable() {
+    const table = App.el('nd-sched-table');
+    if (!table) return;
+    table.innerHTML = '<caption class="sr-only">Scheduled reports</caption>' +
+      '<thead><tr><th scope="col">Name</th><th scope="col">Report</th>' +
+      '<th scope="col">Cadence</th><th scope="col">Recipients</th>' +
+      '<th scope="col">Next run</th><th scope="col">Last run</th>' +
+      '<th scope="col">Status</th><th scope="col"></th></tr></thead>';
+    const body = document.createElement('tbody');
+    const rows = view.reportSchedules || [];
+    if (!rows.length) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td colspan="8">${App.emptyState('No scheduled reports yet.')}</td>`;
+      body.appendChild(tr);
+    }
+    for (const r of rows) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        `<td>${escape(r.name)}</td>` +
+        `<td>${escape(SCHED_KIND_LABEL[r.kind] || r.kind)}</td>` +
+        `<td>${escape(scheduleCadenceText(r))}${r.enabled ? '' : ' <span class="hint">(disabled)</span>'}</td>` +
+        `<td>${escape(r.recipients.join(', '))}</td>` +
+        `<td>${r.next_run_ts ? App.agoCell(r.next_run_ts) : '—'}</td>` +
+        `<td>${r.last_run_ts ? App.agoCell(r.last_run_ts) : 'never'}</td>` +
+        `<td>${escape(r.last_status || '')}</td>` +
+        '<td><button type="button" class="nd-sched-run" data-requires-write="nodes">Send now</button> ' +
+        '<button type="button" class="nd-sched-edit" data-requires-write="nodes">Edit</button> ' +
+        '<button type="button" class="nd-sched-remove" data-requires-write="nodes">Delete</button></td>';
+      tr.querySelector('.nd-sched-run').onclick = () => sendScheduleNow(r.id);
+      tr.querySelector('.nd-sched-edit').onclick = () => scheduleDialog(r);
+      tr.querySelector('.nd-sched-remove').onclick = () => removeSchedule(r.id, r.name);
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+  }
+
+  async function loadReportSchedules() {
+    const result = await App.get('/api/nodes/reports/schedules');
+    view.reportSchedules = result.schedules;
+    drawScheduleTable();
+    updateSchedMailHint();
+  }
+
+  /* --------------------------------------------------------------- history
+
+     E1: an ad-hoc query builder over /api/nodes/series/batch -- up to 8
+     rows, each a device (App.comboBox, as dashboard.js's tile forms wire
+     it) plus a metric picked from that device's own metrics() and its
+     interfaces() in/out pairs. Chart via App.drawSeriesChart with one
+     colour per row (--cat-1..8, the same palette dashboard.js's interface
+     traffic tile cycles through), an "out" series dashed so two lines on
+     one port read apart without relying on colour alone. Table beneath it
+     mirrors the chart's own buckets, not a second query. The last query
+     (rows + range + bucket) is remembered per browser in localStorage,
+     never sent anywhere -- App.get already carries the account's own
+     session for the actual data. */
+
+  const HIST_LOCAL_KEY = 'nodes.history';
+  const HIST_MAX_ROWS = 8;
+  let histRowCounter = 0;
+
+  async function histFillMetricSelect(sel, deviceId, selectedKey) {
+    if (deviceId == null) { sel.innerHTML = '<option value="">—</option>'; return; }
+    const [metrics, ifaces] = await Promise.all([
+      App.get(`/api/nodes/devices/${deviceId}/metrics`).catch(() => ({ metrics: [] })),
+      App.get(`/api/nodes/devices/${deviceId}/interfaces`).catch(() => ({ interfaces: [] })),
+    ]);
+    sel.innerHTML = '<option value="">—</option>';
+    const addOption = (value, label) => {
+      const opt = document.createElement('option');
+      opt.value = value; opt.textContent = label;
+      if (selectedKey === value) opt.selected = true;
+      sel.appendChild(opt);
+    };
+    for (const m of metrics.metrics || []) addOption(m.key, m.label || m.key);
+    for (const iface of ifaces.interfaces || []) {
+      const port = iface.descr || iface.alias || `if ${iface.if_index}`;
+      addOption(`if_in_bps.${iface.if_index}`, `${port} in`);
+      addOption(`if_out_bps.${iface.if_index}`, `${port} out`);
+    }
+  }
+
+  function histRowHtml(rowId, row) {
+    return `<div class="row" data-hist-row="${rowId}">
+      <label>Device <input id="nd-hist-dev-${rowId}" autocomplete="off"></label>
+      <label>Metric <select id="nd-hist-metric-${rowId}"><option value="">—</option></select></label>
+      <button type="button" data-remove-row="${rowId}" aria-label="Remove series">Remove</button>
+    </div>`;
+  }
+
+  function histWireRow(box, rowId, row) {
+    const devInput = box.querySelector(`#nd-hist-dev-${rowId}`);
+    const metricSel = box.querySelector(`#nd-hist-metric-${rowId}`);
+    devInput.dataset.deviceId = row.device_id != null ? String(row.device_id) : '';
+    App.comboBox(devInput, {
+      search: async (q) => {
+        const result = await App.get('/api/nodes/devices', { q, limit: 20 });
+        return (result.devices || [])
+          .map((d) => ({ id: d.id, label: `${d.name || d.ip} (${d.ip})` }));
+      },
+      onPick(id_) {
+        devInput.dataset.deviceId = String(id_);
+        histFillMetricSelect(metricSel, id_, null).catch(() => {});
+      },
+    });
+    if (row.device_id != null) {
+      App.get(`/api/nodes/devices/${row.device_id}`)
+        .then((d) => { devInput.value = `${d.name || d.ip} (${d.ip})`; }).catch(() => {});
+      histFillMetricSelect(metricSel, row.device_id, row.metric_key).catch(() => {});
+    }
+  }
+
+  function histAddRow(row) {
+    const rowsBox = App.el('nd-hist-rows');
+    const count = rowsBox.querySelectorAll('[data-hist-row]').length;
+    if (count >= HIST_MAX_ROWS) return;
+    histRowCounter += 1;
+    const rowId = `r${histRowCounter}`;
+    rowsBox.insertAdjacentHTML('beforeend', histRowHtml(rowId, row || {}));
+    histWireRow(App.el('nodes-sub-history'), rowId, row || {});
+    const addBtn = App.el('nd-hist-add');
+    if (addBtn) addBtn.disabled = count + 1 >= HIST_MAX_ROWS;
+  }
+
+  function histRows() {
+    const out = [];
+    for (const rowEl of App.el('nd-hist-rows').querySelectorAll('[data-hist-row]')) {
+      const devInput = rowEl.querySelector('input[id^="nd-hist-dev-"]');
+      const metricSel = rowEl.querySelector('select[id^="nd-hist-metric-"]');
+      const deviceId = devInput && devInput.dataset.deviceId ? Number(devInput.dataset.deviceId) : null;
+      const metricKey = metricSel ? metricSel.value : '';
+      if (deviceId != null && metricKey) out.push({ device_id: deviceId, metric_key: metricKey });
+    }
+    return out;
+  }
+
+  function histWindow() {
+    if (view.histPinned) return view.histPinned;
+    const seconds = Number(App.el('nd-hist-range').value) || 86400;
+    const t1 = Date.now() / 1000;
+    return { t0: t1 - seconds, t1 };
+  }
+
+  function histSyncRangeSelect() {
+    const select = App.el('nd-hist-range');
+    if (select && view.histPinned) select.value = 'custom';
+  }
+
+  function histSaveLocal() {
+    try {
+      const rows = histRows();
+      const bucket = App.el('nd-hist-bucket').value;
+      const range = App.el('nd-hist-range').value;
+      localStorage.setItem(HIST_LOCAL_KEY, JSON.stringify({
+        rows, bucket, range, pinned: view.histPinned || null }));
+    } catch (error) { /* private window or blocked storage: not fatal */ }
+  }
+
+  function histLoadLocal() {
+    try {
+      const raw = localStorage.getItem(HIST_LOCAL_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function histQueryString(rows) {
+    return rows.map((r) => `${r.device_id}:${r.metric_key}`).join(',');
+  }
+
+  async function histRun() {
+    const rows = histRows();
+    const runBtn = App.el('nd-hist-run');
+    const csvBtn = App.el('nd-hist-csv');
+    if (!rows.length) {
+      App.toast('Add at least one device and metric first', 'warn');
+      return;
+    }
+    histSaveLocal();
+    const { t0, t1 } = histWindow();
+    const bucketS = Number(App.el('nd-hist-bucket').value) || 0;
+    if (runBtn) runBtn.disabled = true;
+    try {
+      const q = histQueryString(rows);
+      const result = await App.get('/api/nodes/series/batch', { q, t0, t1, bucket_s: bucketS });
+      view.histResult = result;
+      histDrawChart(result);
+      histDrawTable(result);
+      if (csvBtn) csvBtn.disabled = false;
+    } catch (error) {
+      App.toast(`Could not run: ${error.message}`, 'fail');
+    } finally {
+      if (runBtn) runBtn.disabled = false;
+    }
+  }
+
+  function histDrawChart(result) {
+    const svg = App.el('nd-hist-chart-svg');
+    const wrap = App.el('nd-hist-chart');
+    if (!svg || !wrap) return;
+    const chartSeries = (result.series || []).map((s, i) => {
+      const iface = /^if_(in|out)_bps\./.exec(s.metric_key);
+      return { ...s, color: `var(--cat-${(i % 8) + 1})`,
+        dash: iface && iface[1] === 'out' ? '4 3' : undefined,
+        label: `${s.device_name || ''} · ${s.label || s.metric_key}` };
+    });
+    const geo = App.drawSeriesChart(svg, wrap,
+      { t0: result.t0, t1: result.t1, series: chartSeries },
+      { emptyText: 'No data for this query', ariaLabel: 'History chart' });
+    if (geo) {
+      App.attachChartZoom(svg, geo, {
+        onWindow: (t0, t1) => { view.histPinned = { t0, t1 }; histSyncRangeSelect(); histRun().catch(() => {}); },
+        onReset: () => { view.histPinned = null; histSyncRangeSelect(); histRun().catch(() => {}); },
+      });
+    }
+  }
+
+  function histDrawTable(result) {
+    const table = App.el('nd-hist-table');
+    const series = result.series || [];
+    if (!series.length) { table.innerHTML = ''; return; }
+    // Every series is bucketed on the same request window, but a server
+    // that answered one from raw and another from the hourly rollup (a
+    // metric class with less raw retention than its neighbour) can hand
+    // back two different bucket sets -- the union of every ts seen, not
+    // the first series' own list, is what a row-per-bucket table needs.
+    const tsSet = new Set();
+    for (const s of series) for (const p of s.points || []) tsSet.add(p.ts);
+    const allTs = [...tsSet].sort((a, b) => a - b);
+    const byTs = series.map((s) => new Map((s.points || []).map((p) => [p.ts, p])));
+    const head = `<thead><tr><th>Time</th>${series.map((s) =>
+      `<th>${escape(`${s.device_name || ''} · ${s.label || s.metric_key}`)}</th>`).join('')}</tr></thead>`;
+    const rows = allTs.map((ts) => {
+      const cells = byTs.map((map) => {
+        const p = map.get(ts);
+        if (!p) return '<td>—</td>';
+        const value = p.avg !== undefined ? p.avg : p.value;
+        if (value == null) return '<td>—</td>';
+        const title = (p.min != null && p.max != null)
+          ? ` title="${escape(`${App.formatMetricValue('', p.min)}–${App.formatMetricValue('', p.max)}`)}"`
+          : '';
+        return `<td${title}>${escape(App.formatMetricValue('', value))}</td>`;
+      }).join('');
+      return `<tr><td>${escape(App.when(ts))}</td>${cells}</tr>`;
+    }).join('');
+    table.innerHTML = `${head}<tbody>${rows}</tbody>`;
+  }
+
+  function histExportCsv() {
+    const rows = histRows();
+    if (!rows.length) return;
+    const { t0, t1 } = histWindow();
+    const bucketS = Number(App.el('nd-hist-bucket').value) || 0;
+    App.exportCsv('/api/nodes/series/export.csv',
+      { q: histQueryString(rows), t0, t1, bucket_s: bucketS });
+  }
+
+  function histClear() {
+    App.el('nd-hist-rows').innerHTML = '';
+    histRowCounter = 0;
+    App.el('nd-hist-chart-svg').innerHTML = '';
+    App.el('nd-hist-table').innerHTML = '';
+    view.histResult = null;
+    view.histPinned = null;
+    const csvBtn = App.el('nd-hist-csv');
+    if (csvBtn) csvBtn.disabled = true;
+    histAddRow({});
+    histSaveLocal();
+  }
+
+  function initHistory() {
+    App.fillRanges(App.el('nd-hist-range'), 'Last 24 hours', undefined, { custom: true });
+    const saved = histLoadLocal();
+    if (saved && Array.isArray(saved.rows) && saved.rows.length) {
+      for (const row of saved.rows) histAddRow(row);
+      if (saved.bucket != null) App.el('nd-hist-bucket').value = saved.bucket;
+      if (saved.pinned) { view.histPinned = saved.pinned; histSyncRangeSelect(); }
+      else if (saved.range != null) App.el('nd-hist-range').value = saved.range;
+    } else {
+      histAddRow({});
+    }
+    App.el('nd-hist-csv').disabled = true;
+    App.el('nd-hist-add').onclick = () => histAddRow({});
+    App.el('nd-hist-rows').addEventListener('click', (event) => {
+      const btn = event.target.closest('[data-remove-row]');
+      if (!btn) return;
+      btn.closest('[data-hist-row]').remove();
+      const addBtn = App.el('nd-hist-add');
+      if (addBtn) addBtn.disabled = false;
+    });
+    App.el('nd-hist-range').onchange = async (event) => {
+      if (event.target.value === 'custom') {
+        const picked = await App.rangeDialog(view.histPinned || {});
+        if (!picked) { histSyncRangeSelect(); return; }
+        view.histPinned = picked;
+        histRun().catch(() => {});
+        return;
+      }
+      view.histPinned = null;
+      histRun().catch(() => {});
+    };
+    App.el('nd-hist-bucket').onchange = () => histRun().catch(() => {});
+    App.el('nd-hist-run').onclick = () => histRun().catch(() => {});
+    App.el('nd-hist-csv').onclick = histExportCsv;
+    App.el('nd-hist-clear').onclick = histClear;
   }
 
   /* ---------------------------------------------------------- bulk import
@@ -6952,9 +7458,11 @@
     App.el('nd-rep-fw-export-server').onclick = () => {
       exportFirmwareReportCsvFromServer().catch(() => {});
     };
+    App.el('nd-sched-new').onclick = () => scheduleDialog(null);
     drawAvailReportTable();
     drawTopnReportTable();
     drawFirmwareReportTable();
+    drawScheduleTable();
 
     // The timeline is drawn into a viewBox sized from its box, so a
     // resize needs a redraw from the data already loaded — no refetch.
@@ -6977,6 +7485,7 @@
                                   App.el('nd-detail')));
     selectReportsSub(App.recallSub('nodes.reports', 'availability',
                                    App.el('nodes-sub-reports')));
+    initHistory();
   }
 
   function selectSub(name) {

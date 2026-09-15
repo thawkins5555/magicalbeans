@@ -790,6 +790,91 @@ def test_15_the_repair_statement_fits_an_old_sqlite() -> None:
     db.close()
 
 
+# ------------------------------------------------------------------------ 16
+
+def test_16_the_row_cap_never_outruns_the_minute_watermark() -> None:
+    """A3: on a store where compaction has fallen behind, capping raw rows
+    by id alone deleted minutes the rollup had not summarised yet -- a
+    permanent hole in every chart wider than the raw window. The cap's
+    upper bound is now clamped to the minute watermark, and what it could
+    not remove because of that is reported as cap_held_back."""
+    print("16: the row cap holds back rows the minute rollup has not reached")
+    db = store("cap_watermark.db")
+    now = time.time()
+    n = 200
+    start = now - n * 2
+    rows = [flow(i, start + i * 2.0) for i in range(n)]
+    db.insert_flows(rows)
+
+    # Park the minute watermark partway through the store, as if a busy
+    # collector has outrun compaction -- no compact_rollup call at all, the
+    # same "compaction fell behind" state A3 is written for.
+    watermark_ts = start + 120 * 2.0
+    watermark_bucket = flowdb._align_down(watermark_ts, 60)
+    db._set_private_setting(flowdb._FLOOR % 60, flowdb._align_down(start, 60))
+    db._set_private_setting(flowdb._WATERMARK % 60, watermark_bucket)
+    protected = sum(1 for r in rows if r.ts_end >= watermark_bucket)
+
+    # A cap tight enough that, ignoring the watermark, it would reach well
+    # past it.
+    max_flows = 40
+    db.prune(3650, max_flows, minute_days=3650, rollup_days=3650, budget_s=30)
+
+    with db._lock:
+        remaining = db._conn.execute(
+            "SELECT COUNT(*) AS n FROM flows").fetchone()["n"]
+        still_protected = db._conn.execute(
+            "SELECT COUNT(*) AS n FROM flows WHERE ts_end >= ?",
+            (watermark_bucket,)).fetchone()["n"]
+    check(db.cap_held_back > 0,
+          f"cap_held_back reports the rows the cap spared ({db.cap_held_back})")
+    check(still_protected == protected,
+          f"every row at/after the watermark survives ({still_protected} of "
+          f"{protected})")
+    check(remaining == max_flows + db.cap_held_back,
+          f"the cap removed exactly what it was allowed to, no more "
+          f"({remaining} remaining = {max_flows} cap + "
+          f"{db.cap_held_back} held back)")
+    db.close()
+
+
+# ------------------------------------------------------------------------ 17
+
+def test_17_wide_charts_widen_to_the_hourly_tier() -> None:
+    """A4: a 24h/900s chart asked for a bucket the hourly tier cannot serve
+    (900 % 3600) and the minute tier could not reach either (its floor sits
+    above t0, aged out by its own 2-day retention), so it fell back to raw
+    -- already thinned by the row cap or retention on a store this old. The
+    fix widens bucket_s to 3600 first, when the hourly tier does reach t0."""
+    print("17: an unfiltered wide query widens to the hourly bucket when only "
+          "the hourly tier reaches back far enough")
+    db = store("tier_widen.db")
+    now = time.time()
+    t1 = now - 300
+    t0 = t1 - 24 * 3600
+
+    hourly_floor = flowdb._align_down(t0 - 3 * 86400, 3600)
+    hourly_watermark = flowdb._align_down(t1 + 3600, 3600)
+    minute_floor = flowdb._align_down(t1 - 3600, 60)     # inside the window
+    minute_watermark = flowdb._align_down(t1, 60)
+    db._set_private_setting(flowdb._FLOOR % 3600, hourly_floor)
+    db._set_private_setting(flowdb._WATERMARK % 3600, hourly_watermark)
+    db._set_private_setting(flowdb._FLOOR % 60, minute_floor)
+    db._set_private_setting(flowdb._WATERMARK % 60, minute_watermark)
+
+    check(db._rollup_plan(t0, t1, None, NO_FILTERS, 900) is None,
+          "the raw _rollup_plan still rejects 900s outright (900 % 3600, and "
+          "the minute floor does not reach t0) -- the widening happens above it")
+
+    _t0, bucket_s, _n_buckets, _rows, _spans = db._agg_rows(
+        t0, t1, None, NO_FILTERS, 900)
+    check(bucket_s == 3600,
+          f"the response widens to the hourly bucket instead of falling back "
+          f"to raw (got {bucket_s})")
+
+    db.close()
+
+
 TESTS = [
     test_1_rollup_and_raw_agree,
     test_2_totals_survive_truncation,
@@ -806,6 +891,8 @@ TESTS = [
     test_13_one_slot_takes_the_coarsest_tier,
     test_14_a_named_series_is_whole_in_every_bucket,
     test_15_the_repair_statement_fits_an_old_sqlite,
+    test_16_the_row_cap_never_outruns_the_minute_watermark,
+    test_17_wide_charts_widen_to_the_hourly_tier,
 ]
 
 

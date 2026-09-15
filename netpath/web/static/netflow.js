@@ -1060,6 +1060,35 @@
     return parts;
   }
 
+  /* A5: "history: raw 13h · minute 2.0d (3m behind) · hourly 41d" — how
+     far back each tier reaches, from FlowDatabase.coverage(). The minute
+     figure grows a "(behind)" note once the rollup watermark has fallen
+     more than a minute short of sealed time, the same lag the server's own
+     SYSTEM log line watches at a coarser 15-minute threshold. */
+  function coverageLine(coverage) {
+    if (!coverage) return '';
+    const bits = [];
+    if (coverage.raw_oldest != null && coverage.raw_newest != null) {
+      bits.push(`raw ${App.span(coverage.raw_newest - coverage.raw_oldest)}`);
+    }
+    if (coverage.minute_floor != null && coverage.minute_watermark != null) {
+      let text = `minute ${App.span(coverage.minute_watermark - coverage.minute_floor)}`;
+      const lagS = Date.now() / 1000 - coverage.minute_watermark;
+      if (lagS > 60) text += ` (${App.span(lagS)} behind)`;
+      bits.push(text);
+    }
+    if (coverage.hourly_floor != null && coverage.hourly_watermark != null) {
+      bits.push(`hourly ${App.span(coverage.hourly_watermark - coverage.hourly_floor)}`);
+    }
+    if (!bits.length) return '';
+    let line = `history: ${bits.join(' · ')}`;
+    if (coverage.cap_held_back) {
+      line += ` · ${coverage.cap_held_back} row(s) held back by the row `
+             + 'cap pending the minute rollup';
+    }
+    return line;
+  }
+
   function drawStatus() {
     const server = App.state.serverState || {};
     const collector = server.collector || { counters: {}, decoder: {} };
@@ -1087,6 +1116,8 @@
       const age = Math.round((Date.now() - view.fetchedAt) / 1000);
       parts.push(`charts ${age}s old`);
     }
+    const historyLine = coverageLine(collector.coverage);
+    if (historyLine) parts.push(historyLine);
     App.strip('nf', collector, { stopped: 'Collector stopped', start: 'Start collector',
       stop: 'Stop collector', parts, tooltip: true });
   }

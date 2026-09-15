@@ -1308,6 +1308,9 @@
       <p class="hint">Fires when an interface records this many link up/down
         transitions inside the window. Blank uses the shipped defaults, 3
         transitions within 10 minutes.</p>` : ''}
+      ${r.key === 'priority_interface_down' ? `
+      <p class="hint">Fires only for ports flagged Priority in the port
+        dialog under Nodes.</p>` : ''}
       `, [
       { label: 'Cancel', onClick: App.closeModal },
       { label: 'Save', primary: true, onClick: async (box) => {

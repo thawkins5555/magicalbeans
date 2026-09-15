@@ -208,7 +208,16 @@
      which map happens to place it. view.nodeByDevice/nodeByPeer (rebuilt
      alongside view.nodes in loadMapData) are the join back from that
      identity to THIS map's own placement, which is what drawing needs. */
-  function linkNodeA(link) { return view.nodeByDevice.get(link.a_device_id) || null; }
+  function linkNodeA(link) {
+    // Every discovered link's A end is the reporting device, so
+    // a_device_id is always set -- but a manual line (D2) can join two
+    // unmanaged peers or one of each, so it needs the same peer_key
+    // fallback linkNodeB already has.
+    if (link.a_device_id !== null && link.a_device_id !== undefined) {
+      return view.nodeByDevice.get(link.a_device_id) || null;
+    }
+    return view.nodeByPeer.get(link.a_peer_key) || null;
+  }
   function linkNodeB(link) {
     if (link.b_device_id !== null && link.b_device_id !== undefined) {
       return view.nodeByDevice.get(link.b_device_id) || null;
@@ -673,6 +682,29 @@
       });
   }
 
+  // D2: a manual line between two selected nodes -- discovery found nothing
+  // there (or found it and drew it wrong), so the operator asserts it
+  // instead. Enabled only when exactly two nodes are selected (drawToolbarState).
+  function openConnect() {
+    if (view.selection.size !== 2) return;
+    const [aId, bId] = [...view.selection];
+    App.modal('Connect', `
+      <label>Label (optional) <input id="mpc-label" maxlength="60"></label>`, [
+      { label: 'Cancel', onClick: App.closeModal },
+      { label: 'Connect', primary: true, onClick: async (box) => {
+        const label = box.querySelector('#mpc-label').value.trim();
+        try {
+          await App.post(`/api/mapper/maps/${view.mapId}/links`,
+            { a_node_id: aId, b_node_id: bId, label });
+          App.closeModal();
+          await loadMapData();
+        } catch (error) {
+          App.toast(`Could not connect: ${error.message}`, 'fail');
+        }
+      } },
+    ]);
+  }
+
   /* ------------------------------------------------------------- geometry
      Where a link's drawn line actually touches a node: clipped to the
      node's own ellipse (a cheap, corner-free approximation of the
@@ -851,12 +883,18 @@
     const path = App.svgNode('path', {
       d: `M ${from.x} ${from.y} L ${to.x} ${to.y}`, stroke: neutral, 'stroke-width': plan.width,
     });
-    wireOne(path, plan.known === false ? 'unknown' : null);
+    wireOne(path, link.manual ? 'manual' : (plan.known === false ? 'unknown' : null));
     if (plan.mode === 'collapsed' && view.settings.show_vlan_labels) {
       const mx = (from.x + to.x) / 2, my = (from.y + to.y) / 2;
       labelLayer.appendChild(App.svgNode('text', {
         class: 'mp-link-label', x: mx, y: my - 4, 'text-anchor': 'middle',
       }, `${plan.vlan_count} VLANs`));
+    }
+    if (link.manual && link.label) {
+      const mx = (from.x + to.x) / 2, my = (from.y + to.y) / 2;
+      labelLayer.appendChild(App.svgNode('text', {
+        class: 'mp-link-label', x: mx, y: my - 4, 'text-anchor': 'middle',
+      }, link.label));
     }
   }
 
@@ -900,6 +938,9 @@
   function linkAriaLabel(link) {
     const a = resolveNode(linkNodeA(link)).name;
     const b = resolveNode(linkNodeB(link)).name;
+    if (link.manual) {
+      return `Manual line, ${a} to ${b}${link.label ? `, ${link.label}` : ''}.`;
+    }
     const plan = link.plan || {};
     let vlanText;
     if (plan.known === false) {
@@ -927,6 +968,9 @@
   function linkTooltip(link) {
     const a = resolveNode(linkNodeA(link)).name;
     const b = resolveNode(linkNodeB(link)).name;
+    if (link.manual) {
+      return [`Manual line`, `${a} — ${b}`, link.label || ''].filter(Boolean).join('\n');
+    }
     const plan = link.plan || {};
     const lines = [`${a} (${link.a_port || '—'})${portMode(link.a_port_mode)}`,
       `↕ ${(link.protocols || []).join(', ').toUpperCase()}`,
@@ -1333,6 +1377,16 @@
       detail.innerHTML = linkDetailHtml(link);
       const showAll = detail.querySelector('[data-show-all-vlans]');
       if (showAll) showAll.onclick = () => { view.detailShowAllVlans = true; drawDetail(); };
+      const removeLink = detail.querySelector('[data-remove-link]');
+      if (removeLink) removeLink.onclick = async () => {
+        try {
+          await App.del(`/api/mapper/maps/${view.mapId}/links/${link.link_id}`);
+          view.selectedLinkId = null;
+          await loadMapData();
+        } catch (error) {
+          App.toast(`Could not remove line: ${error.message}`, 'fail');
+        }
+      };
       return;
     }
     if (view.selection.size === 1) {
@@ -1494,6 +1548,14 @@
   function linkDetailHtml(link) {
     const a = resolveNode(linkNodeA(link));
     const b = resolveNode(linkNodeB(link));
+    if (link.manual) {
+      const lines = ['Manual line', '', `${escape(a.name)}`, '  —', `${escape(b.name)}`, ''];
+      if (link.label) lines.push(`Label       ${escape(link.label)}`, '');
+      lines.push(`Added       ${escape(App.ago(link.seen_ts))}`, '',
+        `<button data-remove-link="${link.link_id}" data-requires-write="mapper"` +
+        `${App.canWrite('mapper') ? '' : ' disabled'}>Remove line</button>`);
+      return lines.join('\n');
+    }
     const plan = link.plan || {};
     const lines = [`${escape(a.name)} (${escape(link.a_port || '—')})`,
       `  ↕  ${escape((link.protocols || []).join(', ').toUpperCase())}`,
@@ -1851,6 +1913,7 @@
     // no App.setDisabled to borrow.
     const states = [
       ['mp-remove-node', !canWrite || view.selection.size === 0],
+      ['mp-connect', !canWrite || view.selection.size !== 2],
       ['mp-align', !canWrite || view.selection.size < 2],
       ['mp-add-device', !canWrite || !hasMap],
       ['mp-add-neighbours', !canWrite || !hasMap],
@@ -2035,7 +2098,9 @@
   function inlineComputedColors(liveRoot, cloneRoot) {
     const liveEls = liveRoot.querySelectorAll('*');
     const cloneEls = cloneRoot.querySelectorAll('*');
-    const props = ['fill', 'stroke', 'color', 'stop-color', 'stroke-width', 'paint-order', 'stroke-linejoin'];
+    const props = ['fill', 'stroke', 'color', 'stop-color', 'stroke-width', 'paint-order', 'stroke-linejoin',
+      'font-family', 'font-size', 'font-weight', 'text-anchor', 'letter-spacing',
+      'opacity', 'fill-opacity', 'stroke-opacity', 'stroke-dasharray', 'dominant-baseline'];
     // Only the CLONE is touched — the live, on-screen canvas must come out
     // of an export exactly as it went in, background included.
     cloneRoot.style.background = getComputedStyle(App.el('mp-canvas')).backgroundColor;
@@ -2065,10 +2130,16 @@
     const svgBlob = new Blob([xml], { type: 'image/svg+xml;charset=utf-8' });
     const url = URL.createObjectURL(svgBlob);
     const img = new Image();
+    // Rendered at device pixel ratio (capped at 2x) so the exported PNG is
+    // as crisp as the screen instead of a 1:1 canvas that looks blurry on
+    // any HiDPI display; drawImage still targets the CSS size, so the
+    // scale-up happens once, on the canvas backing store, not in the image.
+    const scale = Math.min(window.devicePixelRatio || 1, 2);
     img.onload = () => {
       const canvas = document.createElement('canvas');
-      canvas.width = width; canvas.height = height;
+      canvas.width = width * scale; canvas.height = height * scale;
       const ctx = canvas.getContext('2d');
+      ctx.scale(scale, scale);
       ctx.drawImage(img, 0, 0, width, height);
       URL.revokeObjectURL(url);
       canvas.toBlob((blob) => {
@@ -2174,6 +2245,7 @@
     App.el('mp-add-device').onclick = openAddDevice;
     App.el('mp-add-neighbours').onclick = openAddNeighbours;
     App.el('mp-remove-node').onclick = removeSelected;
+    App.el('mp-connect').onclick = openConnect;
     App.el('mp-align').onclick = alignDialog;
     // Recomputes the frame from what's on screen, then moves the scene —
     // nothing about the drawing itself changes.

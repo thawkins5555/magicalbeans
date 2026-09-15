@@ -35,6 +35,7 @@
     ['max_nodes_db_mb', 'set-nodes-cap', 'num'],
     ['max_nodes_series_db_mb', 'set-nodes-series-cap', 'num'],
     ['max_alerts_db_mb', 'set-alerts-cap', 'num'],
+    ['max_wireless_db_mb', 'set-wireless-cap', 'num'],
     ['disk_free_warn_pct', 'set-disk-warn', 'num'],
     ['disk_free_critical_pct', 'set-disk-critical', 'num'],
     ['session_idle_minutes', 'set-idle-minutes', 'num'],
@@ -85,6 +86,7 @@
     App.el('set-nodes-cap').value = s.max_nodes_db_mb;
     App.el('set-nodes-series-cap').value = s.max_nodes_series_db_mb;
     App.el('set-alerts-cap').value = s.max_alerts_db_mb;
+    App.el('set-wireless-cap').value = s.max_wireless_db_mb;
     App.el('set-disk-warn').value = s.disk_free_warn_pct;
     App.el('set-disk-critical').value = s.disk_free_critical_pct;
     App.el('set-idle-minutes').value = s.session_idle_minutes;
@@ -454,7 +456,7 @@
        'use-nodes-series', 'set-nodes-series-cap', true],
       ['nodes_mibs', 'size-nodes-mibs', 'age-nodes-mibs', null, null, false],
       ['alerts', 'size-alerts', 'age-alerts', 'use-alerts', 'set-alerts-cap', true],
-      ['wireless', 'size-wireless', 'age-wireless', null, null, true],
+      ['wireless', 'size-wireless', 'age-wireless', 'use-wireless', 'set-wireless-cap', true],
       ['configrx', 'size-configrx', 'age-configrx', null, null, true],
       ['mapper', 'size-mapper', 'age-mapper', null, null, false],
     ];

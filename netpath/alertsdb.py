@@ -675,7 +675,7 @@ _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "auto_resolve_after_s", "notify", "notify_sms")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 61 built-in rules: 10 device_event + 3 interface_event + 29 threshold +
+# 62 built-in rules: 10 device_event + 4 interface_event + 29 threshold +
 # 3 trap + 1 syslog + 1 ipam + 4 wireless_event + 1 dhcp_threshold +
 # 3 netpath_threshold + 1 netpath_event + 5 system. Each `template` name is a
 # templates.key —
@@ -718,6 +718,12 @@ _BUILTIN_RULES = [
     ("interface_down", "Interface down", "interface_event", "link_down", 3, "event_notice", None, None, 1),
     ("interface_up", "Interface recovered", "interface_event", "link_up", 6, "device_up", None, None, 1),
     ("interface_flapping", "Interface flapping", "interface_event", "flapping", 3, "event_notice", None, None, 1),
+    # Same source_kind as interface_down ("link_down"), but restricted by
+    # alertrules.PRIORITY_ONLY_RULES to ports flagged Priority in the port
+    # dialog (nodesdb.interface_flags) — a dedicated, more severe rule
+    # rather than a threshold on the existing one, so the plain
+    # interface_down rule is untouched for everyone who does not flag ports.
+    ("priority_interface_down", "Priority interface down", "interface_event", "link_down", 2, "event_notice", None, None, 1),
     ("cpu_high", "CPU utilization high", "threshold", "cpu_pct", 4, "threshold_breach", 90.0, 80.0, 2),
     ("mem_high", "Memory utilization high", "threshold", "mem_pct", 4, "threshold_breach", 90.0, 80.0, 2),
     ("if_in_util_high", "Interface inbound utilization high", "threshold", "if_in_util_pct", 4, "threshold_breach", 90.0, 80.0, 2),

@@ -691,6 +691,98 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       await page.click('#modal:not([hidden]) .modal-buttons button').catch(() => {});
       return `title now "${title}"`;
     });
+
+  await check('ticking Priority on the interface dialog stars the title (C4)',
+    async () => {
+      await page.keyboard.press('Escape');
+      await selectTab(page, 'nodes');
+      await settle(page, 800);
+      await page.click('#nodes-table tbody tr:first-child').catch(() => {});
+      const hasRow = await page.waitForSelector('#nd-if-table tbody tr', { timeout: 20000 })
+        .then(() => true).catch(() => false);
+      if (!hasRow) return 'skipped: the selected device has no interfaces to open';
+      await sleep(500);
+      await page.click('#nd-if-table tbody tr:first-child');
+      await page.waitForSelector('#modal:not([hidden]) #ifd-priority', { timeout: 20000 });
+      const wasChecked = await page.evaluate(
+        () => document.getElementById('ifd-priority').checked);
+
+      const waitPut = () => page.waitForResponse((response) =>
+        response.url().includes('/priority') && response.request().method() === 'PUT',
+        { timeout: 10000 });
+
+      let [response] = await Promise.all([
+        waitPut(), page.click('#modal:not([hidden]) #ifd-priority'),
+      ]);
+      assert(response.ok(), `PUT .../priority answered ${response.status()}`);
+      await sleep(300);
+      const title = await page.evaluate(
+        () => (document.querySelector('#modal h2') || {}).textContent || '');
+      if (wasChecked) {
+        assert(!title.includes('★'), `title still starred after unflagging: "${title}"`);
+      } else {
+        assert(title.includes('★'), `title has no star after flagging: "${title}"`);
+      }
+
+      // Leave the port as it was found, so a repeated walk is idempotent.
+      [response] = await Promise.all([
+        waitPut(), page.click('#modal:not([hidden]) #ifd-priority'),
+      ]);
+      assert(response.ok(), `revert PUT .../priority answered ${response.status()}`);
+      await page.click('#modal:not([hidden]) .modal-buttons button').catch(() => {});
+      return `title now "${title}"`;
+    });
+
+  await check('a scheduled report can be created and sent now (F6)', async () => {
+    await page.keyboard.press('Escape');
+    await selectTab(page, 'nodes');
+    await settle(page, 800);
+    await page.click('#page-nodes > .subtabs > .subtab[data-subtab="reports"]');
+    await page.waitForSelector('#nodes-sub-reports > .subtabs > .subtab[data-subtab="scheduled"]',
+      { timeout: 20000 });
+    await page.click('#nodes-sub-reports > .subtabs > .subtab[data-subtab="scheduled"]');
+    await page.waitForSelector('#nd-sched-new:not([hidden])', { timeout: 20000 });
+    await sleep(400);
+
+    await page.click('#nd-sched-new');
+    await page.waitForSelector('#modal:not([hidden]) #nd-sched-name', { timeout: 20000 });
+    const name = `Walk test ${Date.now()}`;
+    await page.fill('#modal:not([hidden]) #nd-sched-name', name);
+    await page.selectOption('#modal:not([hidden]) #nd-sched-kind', 'firmware');
+    await page.fill('#modal:not([hidden]) #nd-sched-recipients', 'noc@example.invalid');
+
+    const created = page.waitForResponse((response) =>
+      response.url().includes('/api/nodes/reports/schedules')
+      && response.request().method() === 'POST', { timeout: 10000 });
+    await page.click('#modal:not([hidden]) .modal-buttons button.primary');
+    const createdResponse = await created;
+    assert(createdResponse.ok(), `creating the schedule answered ${createdResponse.status()}`);
+    await page.waitForSelector('#modal[hidden]', { timeout: 10000 }).catch(() => {});
+    await sleep(500);
+
+    const row = page.locator('#nd-sched-table tr', { hasText: name });
+    await row.waitFor({ timeout: 10000 });
+    const ran = page.waitForResponse((response) =>
+      /\/api\/nodes\/reports\/schedules\/\d+\/run$/.test(response.url())
+      && response.request().method() === 'POST', { timeout: 10000 });
+    await row.locator('.nd-sched-run').click();
+    const ranResponse = await ran;
+    assert(ranResponse.ok(), `Send now answered ${ranResponse.status()}`);
+    await sleep(500);
+    const statusText = await row.locator('td').nth(6).textContent();
+    assert(/not configured/i.test(statusText || ''),
+      `expected "not configured" (the demo has no SMTP set up), got "${statusText}"`);
+
+    // Clean up: the demo's own walk should not accumulate schedules.
+    // App.confirmDestructive is a modal (Cancel + a danger-styled confirm
+    // button), not a native browser dialog.
+    await row.locator('.nd-sched-remove').click();
+    await page.waitForSelector('#modal:not([hidden]) .modal-buttons button.danger',
+      { timeout: 10000 });
+    await page.click('#modal:not([hidden]) .modal-buttons button.danger');
+    await row.waitFor({ state: 'detached', timeout: 10000 }).catch(() => {});
+    return `created, sent (status "${statusText}"), removed`;
+  });
 }
 
 async function checkDialog(page, dir, tag) {

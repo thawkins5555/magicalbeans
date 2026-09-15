@@ -235,6 +235,11 @@ GLOBAL_DEFAULTS = {
     "max_snmp_db_mb": 1024,
     "max_syslog_db_mb": 1024,
     "max_ipam_db_mb": 256,
+    # ap_samples/radio_samples (5.23.0): one row per AP and per radio every
+    # history_sample_s (300s default) -- light rows, and a handful of
+    # controllers' worth of APs is nowhere near IPAM's scan history volume,
+    # so this starts at the same 256 MB rather than syslog/snmp's 1024.
+    "max_wireless_db_mb": 256,
     # The volume under all of the above. A cap governs one file; nothing
     # else in the product notices the disk itself filling up, and every
     # database stops being written the moment it does — whatever their caps

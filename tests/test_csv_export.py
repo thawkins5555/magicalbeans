@@ -208,6 +208,11 @@ try:
     check("the comma/quote/newline syslog message round-trips exactly",
           any(row[msg_col] == tricky_message for row in syslog_rows[1:]),
           [row[msg_col] for row in syslog_rows[1:]])
+    check("syslog export header leads with a readable time column",
+          syslog_header[0] == "time", syslog_header)
+    check("syslog export time cell reads as a local timestamp",
+          re.match(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$", syslog_rows[1][0]) is not None,
+          syslog_rows[1])
 
     # The export buttons send only time/filter params, no `limit` — before
     # the fix, the export handler fed the request's absent `limit` through
@@ -243,6 +248,13 @@ try:
     status, trap_export = call("GET", "/api/snmp/traps/export.csv", token=admin)
     check("snmp traps export answers 200 and sees the inserted trap",
           status == 200 and trap_export.get("count", 0) >= 1, (status, trap_export))
+    trap_rows = parse_csv(trap_export["csv"])
+    trap_header = trap_rows[0]
+    check("snmp traps export header leads with a readable time column",
+          trap_header[0] == "time", trap_header)
+    check("snmp traps export time cell reads as a local timestamp",
+          re.match(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$", trap_rows[1][0]) is not None,
+          trap_rows[1])
 
     print("snmp traps export past the 300-row screen default")
     TRAP_N = 350
@@ -275,6 +287,17 @@ try:
     status, flow_export = call("GET", "/api/netflow/records/export.csv", token=admin)
     check("netflow export answers 200 and sees the inserted flow",
           status == 200 and flow_export.get("count", 0) >= 1, (status, flow_export))
+    flow_rows = parse_csv(flow_export["csv"])
+    flow_header = flow_rows[0]
+    TS_RE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$")
+    check("netflow export header has readable start/end alongside epoch ts",
+          flow_header[:3] == ["start", "end", "ts"], flow_header)
+    check("netflow export start cell reads as a local timestamp",
+          TS_RE.match(flow_rows[1][flow_header.index("start")]) is not None,
+          flow_rows[1])
+    check("netflow export end cell reads as a local timestamp",
+          TS_RE.match(flow_rows[1][flow_header.index("end")]) is not None,
+          flow_rows[1])
 
     # ----------------------------------------------------------- ipam
     print("ipam hosts + dhcp leases export")

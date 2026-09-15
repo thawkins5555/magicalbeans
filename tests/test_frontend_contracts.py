@@ -784,7 +784,9 @@ INDEX_HTML = read("index.html")
 check("group.append(gridLayer, linkLayer, nodeLayer, labelLayer)" in MAPPER,
       "the label layer paints above both links and node boxes")
 check("function drawLink(layer, link, labelLayer = layer)" in MAPPER
-      and MAPPER.count("labelLayer.appendChild(App.svgNode('text'") == 2
+      # 3: the per-strand VLAN number, the collapsed-trunk VLAN count, and
+      # (5.23.0, D2) a manual line's own label.
+      and MAPPER.count("labelLayer.appendChild(App.svgNode('text'") == 3
       and "drawPortLabels(labelLayer, link" in MAPPER,
       "every link label is appended to the label layer, none to the link holder")
 check("paint-order: stroke; stroke: var(--canvas)" in APP_CSS,
@@ -1558,10 +1560,11 @@ ALLOWED_BARE_FIELDS = {
     "dashboard.js": {"pool.busy", "pool.queued"},
     "events.js": {"r.severity"},
     "ipam.js": {"result.scope_count", "s.id"},
-    "mapper.js": {"c.matched_device_id", "m.id", "m.node_count", "node.id", "r.id",
-                  "s.candidates.length", "s.device_id", "s.grid_size", "s.link_width_max",
-                  "s.link_width_min", "s.max_strand_vlans", "s.refresh_interval_s",
-                  "s.stale_link_hours", "s.vlan_collapse_threshold", "v.vlan", "vlans.length"},
+    "mapper.js": {"c.matched_device_id", "link.link_id", "m.id", "m.node_count", "node.id",
+                  "r.id", "s.candidates.length", "s.device_id", "s.grid_size",
+                  "s.link_width_max", "s.link_width_min", "s.max_strand_vlans",
+                  "s.refresh_interval_s", "s.stale_link_hours", "s.vlan_collapse_threshold",
+                  "v.vlan", "vlans.length"},
     "netflow.js": {"row.bytes_text", "row.rate_text"},
     "netpath.js": {"s.default_interval_s", "s.default_max_hops", "s.default_probes",
                    "s.default_timeout_s", "s.default_warn_loss", "s.default_warn_rtt_ms",
@@ -2590,10 +2593,15 @@ check("get('/api/nodes/devices', { fields: 'index' })" in _INDEX59,
 # 49g. F7. The availability and Top-N exports are the only two CSVs built in
 #      the browser, and the only two that skipped the formula guard every
 #      server-side export applies.
-with open(os.path.join(REPO_ROOT, "netpath", "web", "api.py"), encoding="utf-8") as _handle:
-    _API59 = _handle.read()
+#
+# 5.23.0/F2: the constant moved from api.py into netpath/csvout.py (as
+# CSV_FORMULA_LEAD, api.py's own leading underscore dropped) alongside
+# csv_cell/csv_text, so reportsched.py's emailed CSV shares the exact same
+# formula-safe formatting without importing the route module.
+with open(os.path.join(REPO_ROOT, "netpath", "csvout.py"), encoding="utf-8") as _handle:
+    _CSVOUT59 = _handle.read()
 _SERVER_LEADS59 = [json.loads('"%s"' % _part.strip().strip('"'))
-                   for _part in _slice59(_API59, "_CSV_FORMULA_LEAD = (", ")").split("(")[1].split(",")
+                   for _part in _slice59(_CSVOUT59, "CSV_FORMULA_LEAD = (", ")").split("(")[1].split(",")
                    if _part.strip()]
 _CSV_FIELD59 = _slice59(_N59, "  function csvField(value) {", "  function saveReportCsv(")
 check("CSV_FORMULA_LEAD.test(s)" in _CSV_FIELD59,
@@ -2603,7 +2611,7 @@ _JS_CLASS59 = _JS_LEAD59.split("= ")[1].strip().strip(";")[1:-1] if "= " in _JS_
 _missing59 = [c for c in _SERVER_LEADS59
               if not _JS_CLASS59 or not re.compile(_JS_CLASS59).match(c)]
 check(_SERVER_LEADS59 and not _missing59,
-      "...over exactly api.py's _CSV_FORMULA_LEAD set (missing: %s)"
+      "...over exactly csvout.py's CSV_FORMULA_LEAD set (missing: %s)"
       % (", ".join(repr(c) for c in _missing59) or "none"))
 
 # 49h. F8. App.modal escapes a plain-string title itself — the three call
@@ -3268,6 +3276,272 @@ check("state.geo = { ...state.geo, t0: a, t1: b };" in _zoom67
 _onwin67 = DASH67[DASH67.find("onWindow: (t0, t1) => {"):DASH67.find("onReset:")]
 check("drawCharts()" not in _onwin67,
       "the tile's onWindow does not redraw from cached data between ticks")
+
+# --- 68. 5.23.0: Nodes -> Devices gets an Uptime column (off by default) --
+NODES68 = read("nodes.js")
+check("{ key: 'uptime', label: 'Uptime', width: 110, numeric: true, on: false,"
+      in NODES68,
+      "nodes.js's COLUMNS carries the Uptime column, off by default")
+check("r.sys_uptime_s != null ? App.duration(r.sys_uptime_s) : '—'" in NODES68,
+      "...rendered through App.duration like every other elapsed-time cell")
+
+# --- 69. 5.23.0: Mapper PNG export carries font/opacity/dash props too, and
+# renders at device pixel ratio.
+MAPPER69 = read("mapper.js")
+_INLINE69 = MAPPER69[MAPPER69.index("function inlineComputedColors("):
+                     MAPPER69.index("function exportPng(")]
+check("'font-family'" in _INLINE69 and "'font-size'" in _INLINE69,
+      "inlineComputedColors' props list carries font-family and font-size, so "
+      "a label serialised for PNG export keeps its on-screen font instead of "
+      "re-flowing into the browser default and overlapping neighbours")
+for _prop in ("font-weight", "text-anchor", "letter-spacing", "opacity",
+             "fill-opacity", "stroke-opacity", "stroke-dasharray", "dominant-baseline"):
+    check("'%s'" % _prop in _INLINE69,
+          "...and %s, so a manual link's dashed stroke and any faded element "
+          "survive the export too" % _prop)
+_EXPORT69 = MAPPER69[MAPPER69.index("function exportPng("):
+                     MAPPER69.index("function exportCsvClick(")]
+check("Math.min(window.devicePixelRatio || 1, 2)" in _EXPORT69,
+      "exportPng renders at devicePixelRatio, capped at 2x, instead of a 1:1 "
+      "canvas that looks soft on any HiDPI screen")
+check("canvas.width = width * scale" in _EXPORT69 and "ctx.scale(scale, scale)" in _EXPORT69,
+      "...by scaling the canvas backing store and the context, while drawImage "
+      "still targets the CSS size")
+
+# --- 70. 5.23.0: NetFlow coverage readout on the collector status strip --
+NETFLOW70 = read("netflow.js")
+check("function coverageLine(coverage)" in NETFLOW70,
+      "netflow.js defines coverageLine(), the A5 history strip formatter")
+check("`history: ${bits.join(' · ')}`" in NETFLOW70,
+      "the strip line leads with the literal 'history: ' prefix the "
+      "operator was told to expect")
+check("`raw ${App.span(coverage.raw_newest - coverage.raw_oldest)}`" in NETFLOW70,
+      "...the raw span is rendered through App.span")
+check("`minute ${App.span(coverage.minute_watermark - coverage.minute_floor)}`"
+      in NETFLOW70 and "(${App.span(lagS)} behind)" in NETFLOW70,
+      "...the minute span carries a '(... behind)' note once the rollup "
+      "watermark has fallen behind sealed time")
+check("`hourly ${App.span(coverage.hourly_watermark - coverage.hourly_floor)}`"
+      in NETFLOW70,
+      "...and the hourly span is rendered the same way")
+check("collector.coverage" in NETFLOW70,
+      "drawStatus reads coverage off the /api/state collector payload")
+
+# --- 71. 5.23.0: Mapper manual links (D2) -----------------------------------
+INDEX71 = read("index.html")
+check('id="mp-connect" data-requires-write="mapper"' in INDEX71,
+      "index.html's Mapper bar carries the Connect button, gated on mapper write")
+MAPPER71 = read("mapper.js")
+check("App.el('mp-connect').onclick = openConnect;" in MAPPER71,
+      "mapper.js wires Connect to openConnect()")
+check("['mp-connect', !canWrite || view.selection.size !== 2]" in MAPPER71,
+      "Connect is enabled only when exactly two nodes are selected")
+check("function openConnect()" in MAPPER71
+      and "/api/mapper/maps/${view.mapId}/links`," in MAPPER71,
+      "openConnect POSTs the two selected node ids to the manual-links route")
+check(".mp-link.manual { stroke: var(--canvas-muted); stroke-dasharray: 6 4; }" in APP_CSS,
+      "app.css draws a manual link as a dashed neutral path")
+check("wireOne(path, link.manual ? 'manual' :" in MAPPER71,
+      "drawLink tags a manual link's path with the .manual class")
+check("data-remove-link=\"${link.link_id}\"" in MAPPER71,
+      "linkDetailHtml's manual branch offers a Remove line button")
+check("await App.del(`/api/mapper/maps/${view.mapId}/links/${link.link_id}`);" in MAPPER71,
+      "...wired in renderDetail() to DELETE the line and reload the map")
+check("return view.nodeByPeer.get(link.a_peer_key) || null;" in MAPPER71,
+      "linkNodeA falls back to a_peer_key, so a manual line to an unmanaged "
+      "peer on the A side still resolves")
+# server.py is not under STATIC, but the CSP check above (5.7's PNG export
+# fix) already reads its current content into SERVER_PY -- reused rather
+# than reopening the file a second time.
+check(r'r"^/api/mapper/maps/(\d+)/links$", api.post_mapper_map_links, ("mapper", W)' in SERVER_PY,
+      "server.py routes POST .../maps/<id>/links to post_mapper_map_links, mapper write")
+check(r'r"^/api/mapper/maps/(\d+)/links/(\d+)$"' in SERVER_PY
+      and "api.delete_mapper_map_link" in SERVER_PY,
+      "...and DELETE .../maps/<id>/links/<link_id> to delete_mapper_map_link")
+
+# --- 72. 5.23.0: Priority ports -- flag a port, alert only on it going down
+NODES72 = read("nodes.js")
+check('id="ifd-priority"' in NODES72,
+      "the interface dialog carries the ifd-priority checkbox")
+_IFD_PRIORITY72 = NODES72[max(0, NODES72.index('id="ifd-priority"') - 100):
+                          NODES72.index('id="ifd-priority"') + 100]
+check('data-requires-write="nodes"' in _IFD_PRIORITY72,
+      "...gated on nodes write access like every other control that changes "
+      "stored state")
+check("{ key: 'priority', label: '★', width: 40, on: true," in NODES72,
+      "IFACE_COLUMNS carries the priority (★) column, on by default")
+check(r'r"^/api/nodes/devices/(\d+)/interfaces/(\d+)/priority$"' in SERVER_PY
+      and "api.put_nodes_interface_priority" in SERVER_PY,
+      "server.py routes PUT .../interfaces/<if>/priority to "
+      "put_nodes_interface_priority, nodes write")
+ALERTS72 = read("alerts.js")
+check("r.key === 'priority_interface_down'" in ALERTS72,
+      "the rule editor hints that priority_interface_down only fires for "
+      "flagged ports")
+
+# --- 73. 5.23.0: Wireless AP history charts (G3) ----------------------------
+INDEX73 = read("index.html")
+for _id in ("wl-hist", "wl-hist-range", "wl-hist-csv", "wl-hist-clients", "wl-hist-power"):
+    check('id="%s"' % _id in INDEX73, "index.html's AP detail pane carries #%s" % _id)
+check('<pre id="wl-detail"' in INDEX73
+      and INDEX73.index('id="wl-hist"') < INDEX73.index('id="wl-detail"'),
+      "the history block sits above the text detail <pre>, not inside it -- "
+      "showDetail() rewrites that pre's innerHTML on every refresh, which "
+      "would otherwise tear out the chart on every poll")
+WIRELESS73 = read("wireless.js")
+check("App.fillRanges(App.el('wl-hist-range'), 'Last 24 hours', undefined, { custom: true });"
+      in WIRELESS73,
+      "wireless.js fills #wl-hist-range through App.fillRanges with a Custom… option")
+check("App.rangeDialog(view.historyPinned || {})" in WIRELESS73,
+      "...and Custom… opens App.rangeDialog, the same picker every other "
+      "chart's range select uses")
+check("function loadHistory()" in WIRELESS73
+      and "/api/wireless/aps/${apId}/history`" in WIRELESS73,
+      "loadHistory reads the new per-AP history route")
+check("App.drawSeriesChart(clientsSvg, App.el('wl-hist-clients')" in WIRELESS73
+      and "App.drawSeriesChart(powerSvg, App.el('wl-hist-power')" in WIRELESS73,
+      "both charts are drawn through App.drawSeriesChart, the same "
+      "renderer /api/nodes/series/batch's charts use")
+check("App.attachChartZoom(clientsSvg, clientsGeo, { onWindow });" in WIRELESS73
+      and "App.attachChartZoom(powerSvg, powerGeo, { onWindow });" in WIRELESS73,
+      "...and both attach App.attachChartZoom so a drag/wheel re-fetches "
+      "the window instead of only rescaling what's already drawn")
+check("if (view.historyApId !== row.id) {" in WIRELESS73,
+      "history is (re)loaded only when the selected AP actually changes, "
+      "not on the page's own 5s refresh tick")
+check("function exportHistoryCsv()" in WIRELESS73
+      and "App.el('wl-hist-csv').onclick = exportHistoryCsv;" in WIRELESS73
+      and "App.exportCsv(`/api/wireless/aps/${view.historyApId}/history/export.csv`"
+      in WIRELESS73,
+      "the Export CSV button calls App.exportCsv against the history CSV route")
+check(r'r"^/api/wireless/aps/(\d+)/history$", api.get_wireless_ap_history, ("wireless", R)'
+      in SERVER_PY,
+      "server.py routes GET .../aps/<id>/history to get_wireless_ap_history, wireless read")
+check(r'r"^/api/wireless/aps/(\d+)/history/export\.csv$"' in SERVER_PY
+      and "api.get_wireless_ap_history_export" in SERVER_PY,
+      "...and GET .../aps/<id>/history/export.csv to get_wireless_ap_history_export")
+
+# --- 74. 5.23.0: Nodes -> HISTORY, the series query builder (E1) -----------
+INDEX74 = read("index.html")
+check('data-subtab="history"' in INDEX74 and 'id="nodes-sub-history"' in INDEX74,
+      "index.html has the HISTORY subtab button and the pane its prefix resolves to, "
+      "the same subtab/pane pairing every nested subtab in this file already uses")
+check(INDEX74.index('data-subtab="history"') > INDEX74.index('data-subtab="reports"'),
+      "HISTORY sits after REPORTS in the Nodes nav, as specified")
+for _id in ("nd-hist-rows", "nd-hist-add", "nd-hist-range", "nd-hist-bucket",
+           "nd-hist-run", "nd-hist-csv", "nd-hist-clear", "nd-hist-chart", "nd-hist-table"):
+    check('id="%s"' % _id in INDEX74, "index.html's HISTORY pane carries #%s" % _id)
+NODES74 = read("nodes.js")
+check("App.comboBox(devInput, {" in NODES74
+      and "await App.get('/api/nodes/devices', { q, limit: 20 });" in NODES74,
+      "each row's device field is wired over App.comboBox against "
+      "/api/nodes/devices, the same helper dashboard.js's tile forms use")
+check("function histFillMetricSelect(" in NODES74
+      and "await App.get(`/api/nodes/devices/${deviceId}/metrics`)" in NODES74
+      and "await App.get(`/api/nodes/devices/${deviceId}/interfaces`)" in NODES74,
+      "the metric select is filled from both the device's own metrics and "
+      "its interfaces, offering '<port> in'/'<port> out' entries")
+check("addOption(`if_in_bps.${iface.if_index}`, `${port} in`);" in NODES74
+      and "addOption(`if_out_bps.${iface.if_index}`, `${port} out`);" in NODES74,
+      "...using the exact if_in_bps./if_out_bps. keys the batch route's "
+      "_IFACE_METRIC_KEY_RE matches")
+check("const HIST_MAX_ROWS = 8;" in NODES74,
+      "the query builder caps at 8 rows, the batch route's own _SERIES_BATCH_MAX")
+check("App.fillRanges(App.el('nd-hist-range'), 'Last 24 hours', undefined, { custom: true });"
+      in NODES74,
+      "the range select offers Custom… through App.fillRanges/App.rangeDialog "
+      "like every other chart range picker")
+check("await App.get('/api/nodes/series/batch', { q, t0, t1, bucket_s: bucketS });" in NODES74,
+      "Run queries the existing batch route with the built q= string")
+check("App.drawSeriesChart(svg, wrap," in NODES74[NODES74.index("function histDrawChart("):]
+      and "App.attachChartZoom(svg, geo, {" in NODES74[NODES74.index("function histDrawChart("):],
+      "the chart is drawn through App.drawSeriesChart and wired to "
+      "App.attachChartZoom, so a drag/wheel re-runs the query over the new window")
+check("dash: iface && iface[1] === 'out' ? '4 3' : undefined," in NODES74,
+      "an interface's out series is dashed, the same '4 3' dashboard.js's "
+      "interface-traffic tile uses to tell in/out apart without colour alone")
+check("function histDrawTable(" in NODES74 and "const tsSet = new Set();" in NODES74,
+      "the table builds its row set from the union of every series' "
+      "buckets, not just the first series' own list")
+check("App.exportCsv('/api/nodes/series/export.csv'," in NODES74,
+      "Export CSV calls the new server-side history export route")
+check("localStorage.setItem(HIST_LOCAL_KEY, JSON.stringify({" in NODES74
+      and "try {" in NODES74[NODES74.index("function histSaveLocal("):
+                            NODES74.index("function histSaveLocal(") + 200]
+      and "localStorage.getItem(HIST_LOCAL_KEY)" in NODES74,
+      "the last query is remembered in localStorage under 'nodes.history', "
+      "guarded by try/catch for a private window or blocked storage")
+check("HIST_LOCAL_KEY = 'nodes.history';" in NODES74,
+      "...under the literal key the walk/spec name")
+
+# --- 75. 5.23.0: Nodes -> Reports -> SCHEDULED, emailed report schedules (F6)
+INDEX75 = read("index.html")
+check('data-subtab="scheduled"' in INDEX75 and 'id="nd-rep-sub-scheduled"' in INDEX75,
+      "index.html has the SCHEDULED nested subtab button and the pane its "
+      "prefix (nd-rep-sub-) resolves to")
+for _id in ("nd-sched-mail-hint", "nd-sched-new", "nd-sched-table"):
+    check('id="%s"' % _id in INDEX75, "index.html's SCHEDULED pane carries #%s" % _id)
+NODES75 = read("nodes.js")
+for _id in ("nd-sched-name", "nd-sched-kind", "nd-sched-params", "nd-sched-cadence",
+           "nd-sched-hour", "nd-sched-minute", "nd-sched-weekday", "nd-sched-dom",
+           "nd-sched-recipients", "nd-sched-enabled"):
+    check('id="%s"' % _id in NODES75, "the New/Edit dialog carries #%s" % _id)
+check("api.get_nodes_report_schedules" in SERVER_PY
+      and r'r"^/api/nodes/reports/schedules$", api.post_nodes_report_schedule' in SERVER_PY,
+      "server.py routes GET/POST /api/nodes/reports/schedules, nodes read/write")
+check(r'r"^/api/nodes/reports/schedules/(\d+)$"' in SERVER_PY
+      and "api.put_nodes_report_schedule" in SERVER_PY
+      and "api.delete_nodes_report_schedule" in SERVER_PY,
+      "...PUT/DELETE .../schedules/<id>, nodes write")
+check(r'r"^/api/nodes/reports/schedules/(\d+)/run$"' in SERVER_PY
+      and "api.post_nodes_report_schedule_run" in SERVER_PY,
+      "...and POST .../schedules/<id>/run to send one now, nodes write")
+check("function updateSchedMailHint()" in NODES75
+      and "App.state.alertsSettings" in NODES75,
+      "the mail-not-configured hint reads alertsSettings off the shared "
+      "/api/config poll, the same way alerts.js's own settings dialog does")
+check("function scheduleDialog(existing)" in NODES75,
+      "nodes.js defines the New/Edit dialog function")
+
+# --- 76. 5.23.0: max_wireless_db_mb, the wireless history size cap --------
+INDEX76 = read("index.html")
+check('id="set-wireless-cap"' in INDEX76 and 'id="use-wireless"' in INDEX76,
+      "index.html's Data & Retention fieldset carries the Wireless database "
+      "cap input and its usage meter, the same pair every other capped "
+      "store's row has")
+check("Wireless caps its AP/radio history samples" in INDEX76,
+      "...and the hint paragraph explaining the caps no longer lists "
+      "Wireless among the uncapped stores")
+check("Wireless, ConfigRX and Mapper have no cap either" not in INDEX76,
+      "...the stale 'Wireless has no cap' sentence is gone, not just added "
+      "alongside a contradicting one")
+SETTINGS76 = read("settings.js")
+check("['max_wireless_db_mb', 'set-wireless-cap', 'num']" in SETTINGS76,
+      "settings.js reads/writes max_wireless_db_mb through the same "
+      "APPLY_FIELDS table every other cap uses")
+check("App.el('set-wireless-cap').value = s.max_wireless_db_mb;" in SETTINGS76,
+      "...and paints it back on load")
+check("['wireless', 'size-wireless', 'age-wireless', 'use-wireless', "
+      "'set-wireless-cap', true]" in SETTINGS76,
+      "...and showUsage's per-store table now gives Wireless a meter/cap "
+      "pair instead of the null/null a store with no cap gets")
+check('"max_wireless_db_mb": (16, None),' in
+      open(os.path.join(REPO_ROOT, "netpath", "web", "api.py"), encoding="utf-8").read(),
+      "api.py's settings-range check has an entry for max_wireless_db_mb, "
+      "like every other db-mb cap")
+_APPDB76 = open(os.path.join(REPO_ROOT, "netpath", "appdb.py"), encoding="utf-8").read()
+check('"max_wireless_db_mb": 256,' in _APPDB76,
+      "appdb.py's GLOBAL_DEFAULTS carries the new key's default")
+_SERVICE76 = open(os.path.join(REPO_ROOT, "netpath", "web", "service.py"),
+                  encoding="utf-8").read()
+check('Store("wireless", "Wireless", "wireless_db", "max_wireless_db_mb"),' in _SERVICE76,
+      "service.py's STORES entry for wireless now carries its cap key, so "
+      "the Dashboard headroom tile and the maintenance size-alert sweep "
+      "both pick it up automatically")
+check('self._trim_db("max_wireless_db_mb", self.wireless_db, "Wireless database",'
+      in _SERVICE76,
+      "_run_maintenance_body trims wireless.db to its cap, beside its own "
+      "prune_ap_events/prune_history calls")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

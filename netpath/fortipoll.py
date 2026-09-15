@@ -280,6 +280,13 @@ class WirelessPoller(Worker):
         width_by_profile = _channel_widths(widths)
         now = time.time()
         seen: set[tuple[str, str]] = set()
+        # G, 5.23.0: history samples for this sweep, written in one
+        # executemany each (record_samples below) rather than one INSERT per
+        # AP/radio -- _append_history only adds a row when this AP's last
+        # sample has aged past history_sample_s.
+        self._history_sample_s = float(self.db.settings().get("history_sample_s", 300))
+        ap_sample_rows: list[tuple] = []
+        radio_sample_rows: list[tuple] = []
         for suffix, mac in macs.items():
             vdom_wtp = _split_vdom_wtp(suffix)
             if vdom_wtp is None:
@@ -334,7 +341,11 @@ class WirelessPoller(Worker):
                 })
             self.db.replace_radios(ap_id, radios, controller_id=controller["id"],
                                    wtp_id=wtp_id, vdom=vdom, name=name)
+            self._append_history(ap_id, status, _as_int(stations.get(suffix)),
+                                 radios, now, ap_sample_rows, radio_sample_rows)
 
+        if ap_sample_rows or radio_sample_rows:
+            self.db.record_samples(ap_sample_rows, radio_sample_rows)
         self.db.record_poll(controller["id"], ok=True)
         stale_after_polls = int(self.db.settings().get("stale_after_polls", 5))
         removed = self.db.prune_stale(controller["id"], seen, stale_after_polls)
@@ -348,6 +359,23 @@ class WirelessPoller(Worker):
                         detail=f"wtp id   {ap['wtp_id']}\n"
                                f"vdom     {ap['vdom'] or '-'}\n"
                                f"missed   {ap['missed_polls']} consecutive poll(s)")
+
+    def _append_history(self, ap_id, status, station_count, radios, now,
+                        ap_sample_rows: list[tuple], radio_sample_rows: list[tuple]) -> None:
+        """Appends one ap_samples row and one radio_samples row per radio
+        for this AP, unless its last sample is younger than
+        history_sample_s (the 5-min-default throttle a 60s poll_interval_s
+        would otherwise overrun by 5x). One query per AP, not per poll --
+        cheap against the (ap_id, ts) index and simpler than tracking a
+        second in-memory clock the poller would lose on every restart."""
+        last = self.db.last_sample_ts(ap_id)
+        if last is not None and (now - last) < self._history_sample_s:
+            return
+        ap_sample_rows.append((ap_id, now, 1 if status == "online" else 0, station_count))
+        for radio in radios:
+            radio_sample_rows.append((
+                ap_id, radio["radio_id"], now, radio.get("station_count"),
+                radio.get("channel"), radio.get("operating_power_dbm")))
 
     # ------------------------------------------------------------ SNMP layer
 

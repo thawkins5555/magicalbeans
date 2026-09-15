@@ -13,6 +13,13 @@
     controllerFilter: '',
     lastReportedTs: null,
     apSort: App.recallSort('wireless-aps', { key: 'name', descending: false }),
+    // History (G, 5.23.0): which AP the two charts above the text detail
+    // are currently drawn for, and the window -- `pinned` set by Custom…
+    // or a chart zoom, cleared by picking a preset again, the same
+    // follow-vs-absolute split every other range picker in the app uses.
+    historyApId: null,
+    historyPinned: null,
+    historyAxisMemory: { clients: {}, power: {} },
   };
 
   const escape = App.escapeHtml;
@@ -230,6 +237,82 @@
     }
     App.el('wl-detail').innerHTML = lines.join('\n');
     linkController(row.controller_id, row.id);
+    App.el('wl-hist').hidden = false;
+    if (view.historyApId !== row.id) {
+      view.historyApId = row.id;
+      view.historyPinned = null;
+      syncHistoryRangeSelect();
+      loadHistory().catch(() => {});
+    }
+  }
+
+  /* ------------------------------------------------------------- history
+     Two charts above the text detail block (App.drawSeriesChart, same
+     shape /api/nodes/series/batch answers): AP-total clients, and one
+     tx-power series per radio. Loaded once per AP selection, then again on
+     a Custom… pick or a chart zoom/pan -- never on the page's own 5s
+     refresh tick, which would otherwise re-fetch history for no reason on
+     every poll of the AP list. */
+  function historyWindow() {
+    if (view.historyPinned) return view.historyPinned;
+    const select = App.el('wl-hist-range');
+    const seconds = Number(select && select.value) || 86400;
+    const t1 = Date.now() / 1000;
+    return { t0: t1 - seconds, t1 };
+  }
+
+  function syncHistoryRangeSelect() {
+    const select = App.el('wl-hist-range');
+    if (select) select.value = view.historyPinned ? 'custom' : select.value;
+  }
+
+  async function loadHistory() {
+    const apId = view.historyApId;
+    if (apId == null) return;
+    const { t0, t1 } = historyWindow();
+    const data = await App.get(`/api/wireless/aps/${apId}/history`, { t0, t1 });
+    if (view.historyApId !== apId) return;   // selection moved on while this was in flight
+    drawHistoryCharts(data);
+  }
+
+  // --vlan-1..16 (tuned for a --panel background, the same ground this
+  // chart draws on) rather than a new token set for what is, per AP, a
+  // small handful of radio lines.
+  const seriesColor = (i) => `var(--vlan-${(i % 16) + 1})`;
+
+  function drawHistoryCharts(data) {
+    const rangeOption = App.el('wl-hist-range').selectedOptions[0];
+    const label = App.rangeLabel(data.t0, data.t1, !view.historyPinned,
+      rangeOption ? rangeOption.textContent : '');
+    const clientsSeries = data.series.filter((s) => s.key.endsWith(':clients') || s.key === 'clients')
+      .map((s, i) => ({ ...s, color: seriesColor(i) }));
+    const powerSeries = data.series.filter((s) => s.key.endsWith(':power'))
+      .map((s, i) => ({ ...s, color: seriesColor(i) }));
+    const clientsSvg = App.el('wl-hist-clients-svg');
+    const powerSvg = App.el('wl-hist-power-svg');
+    const clientsGeo = App.drawSeriesChart(clientsSvg, App.el('wl-hist-clients'),
+      { t0: data.t0, t1: data.t1, unit: '', series: clientsSeries },
+      { emptyText: 'No samples yet — they arrive with each poll',
+        axisMemory: view.historyAxisMemory.clients,
+        ariaLabel: `Client count, ${label.toLowerCase()}` });
+    const powerGeo = App.drawSeriesChart(powerSvg, App.el('wl-hist-power'),
+      { t0: data.t0, t1: data.t1, unit: 'dBm', series: powerSeries },
+      { emptyText: 'No samples yet — they arrive with each poll',
+        axisMemory: view.historyAxisMemory.power,
+        ariaLabel: `Radio tx power, ${label.toLowerCase()}` });
+    const onWindow = (t0, t1) => {
+      view.historyPinned = { t0, t1 };
+      syncHistoryRangeSelect();
+      loadHistory().catch(() => {});
+    };
+    if (clientsGeo) App.attachChartZoom(clientsSvg, clientsGeo, { onWindow });
+    if (powerGeo) App.attachChartZoom(powerSvg, powerGeo, { onWindow });
+  }
+
+  function exportHistoryCsv() {
+    if (view.historyApId == null) return;
+    const { t0, t1 } = historyWindow();
+    App.exportCsv(`/api/wireless/aps/${view.historyApId}/history/export.csv`, { t0, t1 });
   }
 
   /* Upgrades the plain controller name above into a link to the matching
@@ -510,6 +593,9 @@
     if (view.selected != null && !fresh) {
       view.selected = null;
       App.el('wl-detail').textContent = 'Select an AP to see its per-radio detail.';
+      App.el('wl-hist').hidden = true;
+      view.historyApId = null;
+      view.historyPinned = null;
     } else if (fresh) {
       showDetail(fresh);
     }
@@ -537,6 +623,19 @@
     });
     App.el('wl-export-csv').onclick = exportApsCsv;
     App.el('wl-state').onchange = () => App.refreshNow('wireless');
+    App.fillRanges(App.el('wl-hist-range'), 'Last 24 hours', undefined, { custom: true });
+    App.el('wl-hist-range').onchange = async (event) => {
+      if (event.target.value === 'custom') {
+        const picked = await App.rangeDialog(view.historyPinned || {});
+        if (!picked) { syncHistoryRangeSelect(); return; }
+        view.historyPinned = picked;
+        loadHistory().catch(() => {});
+        return;
+      }
+      view.historyPinned = null;
+      loadHistory().catch(() => {});
+    };
+    App.el('wl-hist-csv').onclick = exportHistoryCsv;
     App.el('wl-controllers').onclick = controllersModal;
     App.el('wl-settings').onclick = settingsDialog;
     App.el('wl-oos').onclick = async () => {

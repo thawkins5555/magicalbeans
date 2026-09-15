@@ -1867,6 +1867,10 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
    #mp-legend spells it out in words for a viewer who cannot rely on the
    visual alone. */
 .mp-link.unknown { stroke-dasharray: 5 4; }
+/* A manual line an operator drew rather than one discovery found -- a
+   single dashed neutral path, so it reads as "not backed by evidence"
+   the same way .unknown does, but distinctly (wider dash). */
+.mp-link.manual { stroke: var(--canvas-muted); stroke-dasharray: 6 4; }
 /* A VLAN picked in the table dims every strand that is not it rather than
    hiding them outright, so the rest of the topology stays legible while
    the chosen VLAN's path stands out from it. */

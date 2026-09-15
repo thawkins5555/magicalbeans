@@ -71,6 +71,28 @@ CREATE TABLE IF NOT EXISTS ap_events (
 );
 CREATE INDEX IF NOT EXISTS ix_ap_events_ts ON ap_events(ts);
 
+-- History for the AP detail pane's charts (G, 5.23.0): one row per AP and
+-- one per radio, written no more than once every history_sample_s seconds
+-- (record_samples' caller throttles on last_sample_ts) -- covers only what
+-- the controller already reports on every poll, no new SNMP columns.
+CREATE TABLE IF NOT EXISTS ap_samples (
+    ap_id         INTEGER NOT NULL REFERENCES access_points(id) ON DELETE CASCADE,
+    ts            REAL NOT NULL,
+    online        INTEGER NOT NULL,
+    station_count INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_ap_samples_ap_ts ON ap_samples(ap_id, ts);
+
+CREATE TABLE IF NOT EXISTS radio_samples (
+    ap_id                INTEGER NOT NULL REFERENCES access_points(id) ON DELETE CASCADE,
+    radio_id             TEXT NOT NULL,
+    ts                   REAL NOT NULL,
+    station_count        INTEGER,
+    channel              TEXT,
+    operating_power_dbm  INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_radio_samples_ap_radio_ts ON radio_samples(ap_id, radio_id, ts);
+
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -100,6 +122,13 @@ DEFAULTS = {
     # per controller from the values that controller actually returns;
     # "dbm" and "percent" force one reading when an operator knows better.
     "radio_power_unit": "auto",
+    # G, 5.23.0: how long ap_samples/radio_samples are kept, and the
+    # minimum gap between two samples for the same AP. 35 days matches
+    # ipamdb's dhcp_scope_history default; 300s (5 min, not every 60s
+    # poll) keeps a 1000-radio fleet at roughly 300k rows/day rather than
+    # 1.4M -- see the module docstring risk note for the arithmetic.
+    "history_days": 35,
+    "history_sample_s": 300,
 }
 
 CONTROLLER_EDITABLE = ("name", "ip", "enabled", "snmp_version", "community",
@@ -437,6 +466,98 @@ class WirelessDatabase(SqliteStore):
         # Reclaim after the lock, in steps.
         if removed:
             reclaim(self._conn, self._lock, label="ap_events")
+        return removed
+
+    # ----------------------------------------------------------------- history
+
+    def last_sample_ts(self, ap_id: int) -> float | None:
+        """The poller's own throttle: called once per AP per poll so a
+        poll_interval_s well under history_sample_s (the common case, 60s
+        polls against a 300s default) writes a fresh sample only when the
+        last one has actually aged past the gap."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(ts) AS ts FROM ap_samples WHERE ap_id = ?",
+                (ap_id,)).fetchone()
+        return row["ts"] if row and row["ts"] is not None else None
+
+    def record_samples(self, ap_rows: list[tuple], radio_rows: list[tuple]) -> None:
+        """One executemany per table. `ap_rows` is (ap_id, ts, online,
+        station_count) tuples, `radio_rows` is (ap_id, radio_id, ts,
+        station_count, channel, operating_power_dbm) -- the caller (fortipoll)
+        already has both shapes ready from the same poll that just wrote
+        upsert_ap/replace_radios, so this takes plain tuples rather than
+        dicts to avoid a second round of key lookups for rows already built."""
+        if not ap_rows and not radio_rows:
+            return
+        with self._lock:
+            if ap_rows:
+                self._conn.executemany(
+                    "INSERT INTO ap_samples(ap_id, ts, online, station_count)"
+                    " VALUES (?,?,?,?)", ap_rows)
+            if radio_rows:
+                self._conn.executemany(
+                    "INSERT INTO radio_samples(ap_id, radio_id, ts, station_count,"
+                    " channel, operating_power_dbm) VALUES (?,?,?,?,?,?)", radio_rows)
+            self._conn.commit()
+
+    def ap_history(self, ap_id: int, t0: float, t1: float) -> dict:
+        """Raw samples for one AP over [t0, t1] -- the route buckets/averages
+        these; this method just answers what was recorded, the same
+        division of labour nodesseriesdb.series has with api.py's batch
+        route."""
+        with self._lock:
+            ap_rows = self._conn.execute(
+                "SELECT ts, online, station_count FROM ap_samples"
+                " WHERE ap_id = ? AND ts >= ? AND ts <= ? ORDER BY ts",
+                (ap_id, t0, t1)).fetchall()
+            radio_rows = self._conn.execute(
+                "SELECT radio_id, ts, station_count, channel, operating_power_dbm"
+                " FROM radio_samples WHERE ap_id = ? AND ts >= ? AND ts <= ?"
+                " ORDER BY radio_id, ts", (ap_id, t0, t1)).fetchall()
+        return {"ap": ap_rows, "radios": radio_rows}
+
+    def prune_history(self, older_than_days: float = 35) -> int:
+        """Called from the service maintenance loop beside prune_ap_events."""
+        cutoff = time.time() - older_than_days * 86400
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM ap_samples WHERE ts < ?", (cutoff,))
+            removed = cur.rowcount or 0
+            cur = self._conn.execute("DELETE FROM radio_samples WHERE ts < ?", (cutoff,))
+            removed += cur.rowcount or 0
+            self._conn.commit()
+        if removed:
+            reclaim(self._conn, self._lock, label="ap_samples/radio_samples")
+        return removed
+
+    def trim_to_size(self, max_bytes: int, budget_s: float | None = None) -> int:
+        """The base class's TRIM_TABLE mechanism assumes an `id` column
+        every table here does not carry (ap_samples/radio_samples are
+        plain fact rows, not keyed for it) -- so the two sample tables,
+        the cheapest and by far the fastest-growing data in this store,
+        are deleted oldest-by-ts-first here directly, ahead of anything
+        else, rather than through that mechanism. There is currently no
+        `max_wireless_db_mb` setting wired up to call this, but a future
+        one (or a direct call) trims the right tables first either way."""
+        if max_bytes <= 0:
+            return 0
+        removed = 0
+        deadline = time.monotonic() + (30.0 if budget_s is None else budget_s)
+        while self._trim_size() > max_bytes and time.monotonic() < deadline:
+            with self._lock:
+                cur = self._conn.execute(
+                    "DELETE FROM radio_samples WHERE rowid IN"
+                    " (SELECT rowid FROM radio_samples ORDER BY ts LIMIT 5000)")
+                gone = cur.rowcount or 0
+                cur = self._conn.execute(
+                    "DELETE FROM ap_samples WHERE rowid IN"
+                    " (SELECT rowid FROM ap_samples ORDER BY ts LIMIT 5000)")
+                gone += cur.rowcount or 0
+                self._conn.commit()
+            removed += gone
+            if not gone:
+                break
+            self._reclaim_until(min(deadline, time.monotonic() + 2.0))
         return removed
 
     def prune_stale(self, controller_id: int, seen_wtp_ids: set[tuple[str, str]],
