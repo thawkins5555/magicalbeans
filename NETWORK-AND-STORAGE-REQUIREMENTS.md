@@ -134,7 +134,7 @@ reachable.
 | Nodes per-port VLAN membership walk, for MAPPER | UDP | 161 (fixed) | Q-BRIDGE-MIB column walk against every device, plus CISCO-VTP-MIB on Cisco gear, on `vlan_interval_s` (default one hour, 0 disables it) — the same port and the same GET/GETBULK shape as ordinary SNMP polling, no new port and no new device credential |
 | Nodes ARP cache walk | UDP | 161 (fixed) | `ipNetToMediaTable`, falling back to `ipNetToPhysicalTable` only when the first answers no rows at all, on `arp_table_interval_s` — **0, disabled, unless a polling profile or device sets it**, unlike the VLAN walk above: the same port, credential and GET/GETBULK shape as ordinary SNMP polling, but a router's ARP cache is routinely the largest table this poller reads, so it is opt-in rather than on for every upgraded fleet |
 | Nodes software version/image identification, from 5.10.0 | UDP | 161 (fixed) | One extra best-effort GET per device per identity poll, of that device's own vendor version/image objects plus ENTITY-MIB's `entPhysicalSoftwareRev` — the same port and credential as ordinary SNMP polling, and never a cause of poll failure on its own |
-| Alerts email notification | TCP (SMTP) | 25/587/465 (server-dependent) | Only if email notification is enabled; none, STARTTLS or SSL/TLS per the configured server |
+| Alerts email notification, and Nodes → REPORTS → SCHEDULED (5.23.0) | TCP (SMTP) | 25/587/465 (server-dependent) | Only if email notification is enabled; none, STARTTLS or SSL/TLS per the configured server. Scheduled reports send through this exact same server and settings — there is no separate SMTP configuration for them, and no separate firewall rule to open: if Alerts email already works, scheduled reports work too, and a schedule sends nothing until Alerts email is configured |
 | Wireless SNMP polling | UDP | 161 (fixed) | GETNEXT to each configured FortiGate Wireless Controller, on its own poll interval — never to the APs behind it individually |
 | ConfigRX config backup | TCP (SSH) | 22 (configurable per device) | Only for a device with backup enabled and a credential stored; read-only — one fixed "show config" command, plus, for a vendor whose login shell is not already privileged EXEC (currently just Cisco ASA), a fixed `enable` step; never a push |
 | NetPath web page check, from 5.10.0 | TCP (HTTPS) | 443, or the URL's own port | Only for a destination with a page URL set — one GET per destination per trace interval, to whatever host and port the URL names |
@@ -268,7 +268,7 @@ code directory can be read-only.
 | `nodes_series.db` | Polled metric definitions, their raw samples and the hourly rollups | Device count × poll frequency × metrics per device — the Nodes file that actually grows |
 | `nodes_mibs.db` | Uploaded MIB files (original text kept for re-parsing) and the objects parsed out of them | How many vendor MIB bundles you install — a few MB each, and static between uploads |
 | `alerts.db` | Rules, email templates, alerts, notification history, Alerts settings, an optional SMTP credential | Alert volume — normally light; a flapping device or a noisy threshold is the exception |
-| `wireless.db` | Controllers, access points, per-radio detail, Wireless settings, optional SNMP credentials | Controller count × AP count per controller — normally small, a handful of controllers rather than hundreds |
+| `wireless.db` | Controllers, access points, per-radio detail, per-AP/per-radio history samples (from 5.23.0), Wireless settings, optional SNMP credentials | Controller and AP inventory itself stays small — a handful of controllers, not hundreds. The history samples are the module's real growth line now; see *Wireless history*, below |
 | `configrx.db` | Per-device backup configuration, stored config backups (compressed, hash-deduped), ConfigRX settings, optional SSH and enable-mode credentials | Device count × how often a device's config actually changes — an unchanged config never adds a row |
 | `mapper.db` | Named maps, the devices and unmanaged peers placed on each and where, a VLAN colour override table, Mapper settings | Number of maps × devices placed on them — hand-placed bookkeeping, not per-poll samples, so it stays small regardless of fleet size |
 
@@ -404,7 +404,7 @@ Rough shapes to start from:
 | Syslog | messages per second | **~455 bytes per message**, measured, not the ~150 this table used to claim — a stored row is the decoded fields *plus* the original line *plus* its entry in the FTS5 trigram search index, and the index is most of the difference. Budget for it: 10 messages/s is about 390 MB a day. |
 | Nodes | devices × poll frequency × metrics per device | ~33 bytes per sample row; see the per-port arithmetic below. Raw samples are kept for `sample_retention_days` (3 by default) and rolled up into hourly min/avg/max, which are kept for `rollup_retention_days` (400). A second limit runs beside the day count: `sample_row_cap_per_metric` (5,000) is the most raw rows any one metric keeps, and from 4.39.0 it is applied per metric rather than to the whole `samples` table — as a whole-table cap of 50,000 rows it left a 2,000-device fleet with under a third of one poll cycle of history. **The rollup genuinely runs from 4.39.0** too; in every earlier release `compact_rollup()` had no caller, `samples_hourly` was always empty, and a chart wider than the raw window drew nothing. |
 | Alerts | alert volume | normally the smallest of all — resolved alerts and notification history, not a per-poll log |
-| Wireless | controller count × AP count | a few KB per AP; normally tiny, since a site has a handful of controllers, not hundreds |
+| Wireless | controller/AP inventory: a few KB per AP, tiny either way; history (from 5.23.0): AP count × radios per AP, at 300s sampling — see *Wireless history*, below |
 | ConfigRX | device count × how often configs actually change | a device's own config text, compressed, once per change — most devices add nothing between backups |
 | Mapper | maps × devices placed on them | negligible — a row per placed device/peer, not a sample; a fleet-sized map with a few hundred nodes on it is still kilobytes |
 
@@ -441,6 +441,37 @@ Two practical consequences. First, if you only need trends, shorten
 shape of the history at a fiftieth of the size. Second, doubling the poll rate
 doubles the storage exactly, with no economies anywhere; 60 seconds is a
 meaningful decision, not a free one.
+
+### Wireless history, from 5.23.0
+
+Every AP poll (default every 60 s) can now also write one `ap_samples` row
+and one `radio_samples` row per radio, throttled to at most once every
+`history_sample_s` — **300 seconds by default**, five times coarser than
+the poll itself, which is the deliberate reason this stays affordable: at
+a 60-second poll, a fleet of 1,000 radios would write roughly 1.4 million
+rows a day; at 300 seconds it is roughly 300,000. That works out to a
+fixed **288 samples per AP per day**, and 288 samples per radio per day,
+regardless of how often the underlying poll actually runs.
+
+Rough shapes to start from — estimated from the column layout, not a
+measured benchmark, so treat this the way the rest of this table asks you
+to treat any of these figures: a starting point, not a guarantee.
+`ap_samples` (device id, timestamp, online flag, client count) is a
+narrow row, on the order of 25 bytes with its index; `radio_samples`
+(device id, radio id, timestamp, client count, channel, tx power) carries
+more columns and text fields, on the order of 40 bytes with its index. For
+a typical dual-radio AP that is roughly:
+
+    288 × 25 B (ap_samples)  +  288 × 2 × 40 B (radio_samples)  ≈  30 KB/AP/day
+
+At the default 35-day `history_days` retention, that is **about 1 MB per
+AP** over the full window. A 250-AP site lands around 250 MB — which is
+close to no accident: `max_wireless_db_mb` defaults to **256 MB**, sized
+for roughly this order of fleet. A larger site, or one that wants the
+full 35 days kept, should raise the cap (Settings → Data & Retention) or
+shorten `history_days` rather than let the cap start trimming samples
+before retention would have. As with every other capped store, the size
+cap wins if the two disagree — see *What keeps it bounded*, below.
 
 ### How many devices
 
@@ -502,20 +533,22 @@ Three limits, checked every 15 minutes, in this order:
    (keep at most N backups per device).
 3. **Size cap** — delete oldest records in chunks until the file fits. Per
    database, defaulting to 512 MB for traces, 2 GB for flows, 256 MB for
-   SNMP traps, 1 GB for syslog, 1 GB for Nodes and 128 MB for Alerts.
+   SNMP traps, 1 GB for syslog, 1 GB for Nodes, 128 MB for Alerts and,
+   from 5.23.0, **256 MB for Wireless** — trimming only the per-AP/per-
+   radio history samples (`ap_samples`/`radio_samples`; see *Wireless
+   history*, above), never the controller/AP/radio inventory itself.
    Nodes and Alerts trim only their genuinely historical tables — metric
    samples and device/interface events for Nodes, resolved alerts and
    notification history for Alerts — never the current-state tables
    (devices, polling profiles, interfaces, MIB objects, rules, templates)
-   that describe things as they are configured now, not a log. Wireless,
-   ConfigRX and Mapper have no absolute size cap of their own — Wireless
-   because its data volume is inherently small (a handful of controllers
-   and their APs, not per-poll samples), ConfigRX because retention (1)
-   and the per-device count cap (2) together already bound it, and its
-   own hash-dedup means an unchanging fleet of devices adds nothing between
-   backups regardless, and Mapper for the same reason as Wireless — a map
-   is hand-placed layout, not per-poll samples, so nothing in it grows on
-   its own.
+   that describe things as they are configured now, not a log. ConfigRX
+   and Mapper have no absolute size cap of their own — ConfigRX because
+   retention (1) and the per-device count cap (2) together already bound
+   it, and its own hash-dedup means an unchanging fleet of devices adds
+   nothing between backups regardless, and Mapper because a map is
+   hand-placed layout, not per-poll samples, so nothing in it grows on
+   its own. Wireless carried the same reasoning as Mapper before 5.23.0;
+   its per-poll history samples are why that stopped being true.
 
 The size cap wins over the other two: if retention says keep 30 days but the
 cap is reached at 9, the ninth day is where it stops. That is deliberate —

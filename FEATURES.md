@@ -177,7 +177,11 @@ set of table behaviours:
   has applied — it is the rows on screen, not a fixed dump — and writes
   RFC 4180-quoted CSV with a UTF-8 BOM and a timestamped filename. Alerts
   exports up to 50,000 rows, well past its own console page; every other
-  table exports what its search already caps at.
+  table exports what its search already caps at. **From 5.23.0, the flow
+  record, Syslog and SNMP Trap exports lead with a plain local-time
+  column** (`start`/`end` for flow records, `time` for Syslog and SNMP
+  Trap) ahead of the raw epoch column each already carried — see
+  *Export timestamps*, under NetFlow.
 
 The Debug page is deliberately outside this: its tables are live worker state
 rather than records to work through.
@@ -834,6 +838,11 @@ own subtabs.
   hours and days, not in the raw hundredths of a second SNMP reports them
   in, and the reboot email fills in its own "previous/current reported
   uptime" lines from them.
+- **An Uptime column, from 5.23.0** — off by default, in the Devices
+  column picker — reads the same `sysUpTime` reboot detection already
+  polls, formatted as days/hours rather than raw ticks. The device CSV
+  export always carries the underlying `uptime_s` column regardless of
+  what the picker shows on screen.
 - **Test** checks ping and SNMP against whatever is currently typed in
   the add/edit form, before it is saved, the same idiom IPAM's DHCP
   server test already uses. It runs the poll's own first table walk as
@@ -1314,7 +1323,8 @@ interface opens that port's own graph (below), which is where a traffic
 question actually gets answered.
 
 The interface list sorts by any column — Descr, Admin, Oper, Speed,
-In, Out — the same way every other table in the app does. A port carrying a
+In, Out and, from 5.23.0, a sortable **★** priority column — the same way
+every other table in the app does. A port carrying a
 transceiver that reports DOM shows a **DOM** badge beside its description
 and an SFP slot without one shows **SFP**; opening a device's dialog
 upgrades a port to **DOM** if its live read finds sensors there, even one
@@ -1403,7 +1413,12 @@ about the device you double-clicked, which is not necessarily the one
 selected, so it reads that device by id rather than borrowing the pane's
 data. Opening a port from the dialog charts *that* device, and offers a
 way back to the dialog it came from. A single click still just moves the
-detail pane.
+detail pane. **From 5.23.0, the dialog's own event log no longer lists
+poll overruns** — a poller running long against a slow device is
+housekeeping noise on a screen meant to answer "what happened to this
+device", not an event an operator needs to read one at a time; the
+overview histogram and Alerts still see it, only this one list is
+filtered.
 
 **The Find box accepts a MAC address** as well as a name, an IP or a
 sysName. Any notation works — `AA-BB-CC-DD-EE-FF`, `aa:bb:cc:dd:ee:ff`,
@@ -1571,6 +1586,18 @@ VLAN list read from CISCO-VTP-MIB). The first source that returns
 anything wins. Devices that answer none of them show "no MAC address
 data" instead of an empty table. Per-interface "show run" still appears as a placeholder
 until SSH integration lands.
+
+**Priority port, from 5.23.0.** A checkbox in the port dialog's own
+header — a ★ appears beside the dialog title and in the interface list's
+★ column once it is ticked, and the flag survives a re-walk of the
+device and is only ever cleared by hand or by the device being deleted.
+Nothing polls differently for a flagged port; what it feeds is a second,
+dedicated alert rule — see **Priority interface down**, under Alerts →
+Rules — so an operator can mark the handful of links that actually
+matter (a WAN uplink, a core trunk) and give just those their own
+severity or notification routing, on top of, not instead of, the
+existing **Interface down** rule that still fires for every port
+unchanged.
 
 **From 5.16.0, the dialog shows what's already stored before it asks
 the device again.** The MAC section used to be empty until the live SNMP
@@ -1753,6 +1780,74 @@ somebody then does not depend on the report still being on screen, or the
 tab having stayed open while it ran. All three are also reachable directly
 through the API: `GET /api/nodes/reports/availability`, `/top-metrics` and
 `/firmware`, plus `/firmware/export.csv` for the server-built file.
+
+### Scheduled reports — Nodes → REPORTS → SCHEDULED, from 5.23.0
+
+Any of the three reports above, sent by email on a repeating schedule
+instead of run by hand. Up to 50 schedules, each its own **daily**,
+**weekly** (pick the weekday) or **monthly** (pick the day of month —
+clamped to the last day of a shorter month, so "the 31st" still sends
+in February) cadence at a chosen local hour and minute, its own list of
+recipients, and the same report kind and parameters (device group,
+period, metric, top-N) the on-demand report takes.
+
+**The email is a text summary, not a spreadsheet pretending to be one.**
+The period covered, the totals, and up to 20 rows in the body — the
+same shape as reading the report on screen — plus the full result as a
+CSV attachment for anyone who wants to open it in a spreadsheet or feed
+it into something else.
+
+**Scheduled reports send through the same SMTP server as Alerts, and
+nowhere else.** There is no separate mail setup for this: a schedule
+with nothing configured under **Alerts → Settings → Notifications**
+simply does not send, and its own status column says so in words
+("not sent: email is not configured") rather than failing silently. No
+new firewall rule is needed if Alerts email already works.
+
+**The New/Edit dialog, Send now and Delete** live on the table itself —
+Send now fires that one schedule immediately, off its own schedule,
+useful for proving recipients and formatting are right before waiting
+for the next real run. Every send records when it last ran and what
+happened (sent, not sent, or failed and why) right on the row, so a
+schedule that has quietly stopped sending is visible without digging
+into the event log. The runner checks for anything due once a minute,
+independently of the fifteen-minute housekeeping pass everything else on
+the maintenance thread runs on, so a report due at 09:00 sends at 09:00,
+not whenever the next housekeeping sweep happens to land.
+
+Reachable through the API too: `GET`/`POST /api/nodes/reports/schedules`,
+`PUT`/`DELETE .../schedules/<id>`, and `POST .../schedules/<id>/run` for
+Send now.
+
+### History explorer — Nodes → HISTORY, from 5.23.0
+
+An ad-hoc chart builder for comparing metrics across devices, rather
+than one device's own dashboard-style chart. Add up to **8 series**,
+each a device (the same themed search-and-pick control every other
+device field uses) and a metric picked from that device's own metric
+list — including, for an interface, its **in** and **out** counters as
+two separate picks, so one port's send and receive sides can sit on the
+chart side by side, or beside a different port on a different device
+entirely.
+
+Pick a preset range or **Custom…**, and a bucket size — **auto**, 1
+minute, 5 minutes or 1 hour — then **Run**. The chart overlays every
+series on one time axis, one colour per row, an interface's **out**
+series drawn dashed so two lines on the same port read apart without
+depending on colour alone; drag, wheel and the keyboard all zoom it,
+each re-running the query for the new window rather than just
+rescaling what is already on screen. A table underneath lists one row
+per time bucket and one column per series, matching the chart exactly;
+where a series answered from the hourly rollup rather than raw samples,
+hovering a cell shows that bucket's actual min–max spread, not just its
+average. **Export CSV** downloads the same query as one file, in long
+format (one row per series per bucket) rather than the wide table on
+screen, capped at 200,000 rows with a note if a query ran over that.
+The last query — every row, the range and the bucket size — is
+remembered in the browser, so reopening the tab picks up where it was
+left.
+
+Also reachable directly: `GET /api/nodes/series/export.csv`.
 
 ---
 
@@ -1985,11 +2080,12 @@ alerts and optionally emailing about them.
 
 ### Rules
 
-- **60 built-in rules ship, 59 of them enabled**: a device not responding, a
+- **61 built-in rules ship, 60 of them enabled**: a device not responding, a
   device recovering, a device rebooting, SNMP authentication failing, a
   device needing unsupported SNMPv3 privacy, a poll running longer than its
   own interval, a device whose vendor MIB is missing, an interface going
-  down/up/flapping, twenty-three CPU/memory/interface-utilization/
+  down/up/flapping, a **priority-flagged** interface going down (below),
+  twenty-three CPU/memory/interface-utilization/
   error-and-discard-rate/disk/ping-latency/packet-loss/UPS/
   environmental thresholds, a critical or cold-start SNMP trap, a
   linkDown trap from a device Nodes is not itself polling, a critical
@@ -1997,8 +2093,8 @@ alerts and optionally emailing about them.
   its controller or gone offline, an access point rebooting, a DHCP scope
   running out of leases, and four NetPath path rules (below), the newest of
   which watches a destination's web page (see NetPath and Alerts → NetPath
-  destinations). The sixtieth, **Access point radio changed channel**, is the
-  one rule from 5.10.0 that ships **disabled** rather than enabled: a
+  destinations). The one rule that ships **disabled** rather than enabled is
+  **Access point radio changed channel**, from 5.10.0: a
   FortiAP running DARRP changes channel on its own by design, and paging an
   operator for every one of those would be noise rather than signal — it is
   there to turn on for a site that wants to know anyway. Seven of the interface and disk
@@ -2060,6 +2156,19 @@ alerts and optionally emailing about them.
   alarm, so it is not additionally suppressed by an outage the way the
   alarm half is — the same trade **Chassis temperature high** already
   makes behind **Chassis temperature critical**.
+- **Priority interface down, from 5.23.0.** A second, dedicated rule on
+  the same link-down event the existing **Interface down** rule already
+  watches, gated to only the ports an operator has ticked **Priority
+  port** in that port's dialog (see Nodes → interfaces, above) — a
+  handful of uplinks and core trunks rather than every port on the
+  fleet. It ships enabled, at severity **critical** against Interface
+  down's own **error**, so a flagged port's outage can be routed or
+  paged differently from an ordinary access-port flap; the two are
+  independent rules, so both can be edited, muted or overridden on their
+  own. The rule editor names which rule this is with a short hint next to
+  it. A port coming back up (**link_up**) clears both the plain and the
+  priority alert for it at once — an operator never has to close two
+  alerts for the same one event.
 - **An interface threshold names the port, from 5.1.0.** The six
   interface rules (inbound/outbound utilization, error rate, discard
   rate) used to read the device-level *busiest port* value, so the alert
@@ -2934,6 +3043,74 @@ chart. Only a bucket old enough that its individual records have already
 been pruned still shows the gap; the totals were never affected either
 way.
 
+### Three causes of missing blocks on a wide chart, fixed — 5.23.0
+
+A wide NetFlow chart — a day, a week, 30 days — could show a block of
+nothing where flows genuinely were exported, for three separate reasons
+that all looked the same on screen. All three are fixed.
+
+**Saving any NetFlow setting used to blank the collector's memory of
+v9/IPFIX templates.** A v9 or IPFIX exporter sends its record layout
+(the "template") only occasionally, then relies on the collector
+remembering it. Any settings save restarts the collector, and the
+restart used to start it with an empty template cache — every record
+from that exporter was then undecodable until it resent its template on
+its own schedule, which on some platforms is many minutes away. A
+routine settings change could black out an exporter's flows for that
+long. The collector now carries its learned templates across its own
+restart, so a settings save no longer costs an exporter's history.
+
+**The row cap used to delete flows the minute-by-minute summary had not
+gotten to yet.** When the raw flow table hits its row limit, the oldest
+rows are deleted to make room — but "oldest" was decided purely by
+arrival order, with no regard for whether the once-a-minute summariser
+had actually processed those rows into the rollup yet. On a busy
+exporter where the summariser fell behind, the row cap could delete
+minutes of flows before they were ever counted into the rollup — gone
+from both the raw table and the summary that was supposed to preserve
+them. The cap now stops at whatever the minute summary has reached, and
+reports how many rows it held back rather than dropping them, so a
+lagging summariser is visible instead of silently costing history.
+
+**A summariser that fell behind now catches up, instead of staying
+behind.** The rollup runs once a minute normally; if a pass used its
+whole time budget without finishing the backlog, it now runs again
+right away — repeatedly, for up to 30 seconds per tick — instead of
+waiting out the full minute between passes only to fall further behind
+on a sustained burst.
+
+**A chart window the minute-level summary can no longer reach now
+widens to the hourly summary instead of falling back to raw.** Minute
+summaries are kept for 2 days; a chart asking for sub-hour detail over
+an older window used to fall back to whatever raw flow rows happened to
+survive the row cap — thinned, incomplete, and often empty — even where
+the hourly summary covered that whole window cleanly. It now widens
+its own bucket size to match the hourly summary instead, which is a
+coarser chart but a complete one; the response says what bucket size it
+actually used, and the chart's own hover already states it.
+
+**A new history readout says how far back each tier actually reaches,
+right on the status strip** — "history: raw 13h · minute 2.0d (3m
+behind) · hourly 41d" — so a gap in coverage is something you can see
+rather than something you discover the day you need a chart that isn't
+there. The "(behind)" note appears once the minute summary has fallen
+more than a minute behind sealed flow time; the same lag, past 15
+minutes, also writes one line to the SYSTEM event log (at most every 15
+minutes, so a store stuck behind does not fill the log) naming how far
+behind it is.
+
+### Export timestamps, from 5.23.0
+
+Every exported CSV — flow records, Syslog messages, SNMP traps — now
+leads with a plain local-time column instead of only a raw epoch
+number. Flow record exports gain **start** and **end** columns ahead of
+the existing epoch `ts`; Syslog and SNMP Trap exports gain a leading
+**time** column the same way. Opening the file straight from the
+download already reads as a clock time in a spreadsheet, rather than a
+column of numbers that needs converting by hand before it means
+anything. The existing epoch columns are unchanged and still there for
+anything that was already parsing them.
+
 ---
 
 ## SNMP Trap — trap and inform receiver
@@ -3495,6 +3672,37 @@ reports on all of them in one SNMP walk.
   came from the same controller poll, so a per-row age said the same
   thing on every line.
 
+### Per-AP history, from 5.23.0
+
+Selecting an AP now shows two charts above the existing text detail: a
+**clients** chart (the AP's total, plus one line per radio) and a
+**tx power** chart, one line per radio. Both take the same range presets
+and **Custom…** as every other chart, plus drag/wheel/keyboard zoom and
+their own **Export CSV**.
+
+This is not new polling — it is a history of the same client counts,
+channel and tx power the AP table already reads live every cycle,
+sampled at most once every five minutes (`history_sample_s`, default
+300) per AP and kept for 35 days (`history_days`) — a coarser cadence
+than the 60-second poll on purpose, since five-minute resolution is
+already fine enough to see a fleet-wide trend and keeping every poll
+would cost roughly five times the disk for no chart anyone reads at
+that resolution. No new SNMP objects are read for this: online state,
+client counts, channel and tx power all already come from the walk
+described above.
+
+**A dedicated size cap keeps this history bounded.** Wireless never had
+a file size cap before — a handful of controllers and their APs is
+naturally small — but per-AP, per-radio history samples are a different
+kind of growth, so `max_wireless_db_mb` (Settings → Data & Retention,
+256 MB by default) now trims the oldest history samples first if the
+file ever gets there, the same way every other capped database in the
+application does. Controller, AP and radio inventory itself is
+untouched by the cap; only the sample history is trimmed.
+
+Also reachable through the API: `GET /api/wireless/aps/<id>/history` and
+`.../history/export.csv`.
+
 ## ConfigRX — SSH config backups
 
 Scheduled, read-only backups of a device's running configuration, pulled
@@ -3847,7 +4055,27 @@ like any other module.
   both ports, which protocols confirmed it, the VLAN count, the VLAN list
   itself, the native VLAN and when it was last seen — built from the same
   figures the drawing itself uses, so the export can never disagree with
-  what is on screen.
+  what is on screen. **From 5.23.0, the PNG actually looks like the
+  screen.** Font, size and weight, label alignment, opacity and dashed
+  lines used to come from the page's own stylesheet, which an exported
+  copy does not carry with it — so a PNG re-flowed in the browser's plain
+  default font, and labels that fit cleanly on screen could overlap in
+  the file. Those properties are now written into the exported copy
+  directly rather than left to a stylesheet that never travels with it.
+  The PNG is also rendered at the screen's own pixel density (capped at
+  2x) instead of a flat one-pixel-per-point image, so it reads sharp on
+  a HiDPI display instead of soft.
+- **Connect** draws a line between two devices by hand. Select exactly
+  two nodes on the map and **Connect** enables in the toolbar — an
+  optional label, up to 60 characters — for the cases discovery finds
+  nothing to draw on its own, or draws wrong: a link over a medium LLDP
+  and CDP do not see, or one an operator simply wants documented before
+  discovery catches up. It draws as a dashed neutral line, distinct from
+  a discovered link, with its label at the midpoint; selecting it offers
+  **Remove line**. It rides along wherever the two nodes are moved or the
+  map is refreshed, is removed automatically if either node or the map
+  itself is removed, and is included in the CSV export as its own
+  **manual** row.
 - **The map refreshes on the page's own cadence while it is the visible
   tab** (MAPPER's own **Refresh interval**, 30 seconds by default; 0 turns
   auto-refresh off and leaves the **Refresh** button as the only way),
@@ -4205,7 +4433,11 @@ plus 256 bits from `secrets`, shown once — that carries exactly that
 account's own grants, never wider. It is checked wherever the session
 cookie is, but it is not a session: it never enters the session store, so
 no idle timeout applies to it and it can never be used to open a kiosk. A
-token is revocable, and every issue and revoke is audited.
+token is revocable, and every issue and revoke is audited. **A token can
+call every `/api/*` route this application serves**, the same ones the
+browser interface itself calls — there is no separate, smaller API surface
+for scripts, and nothing beyond the syslog, trap and NetFlow protocol
+listeners accepts pushed data from outside; confirmed 5.23.0.
 
 **An account can authenticate against an LDAP directory instead of a local
 password, from 4.47.0.** Set on the account (`auth_source: ldap`) in the

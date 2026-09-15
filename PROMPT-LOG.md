@@ -883,4 +883,28 @@ operator's choice of A, E and G and how each shipped — A as the Nodes
 → SCHEDULED, and G as per-AP client/radio history in the Wireless AP
 detail pane.
 
-(in progress)
+**Outcome.** Thing1 and Thing2 built the nine items above: three NetFlow
+gap causes closed (template carry-over across a collector restart, the
+row cap no longer outrunning the minute rollup, a wide chart widening
+its own bucket instead of falling back to thinned raw rows) plus a
+history/coverage readout on the NetFlow status strip; readable local-time
+columns on the flow, Syslog and SNMP Trap CSV exports; priority ports
+(`interface_flags`, a dedicated `priority_interface_down` alert rule
+gated to flagged ports, `link_up` clearing it alongside the existing
+`interface_down` rule); scheduled emailed reports (`reportsched.py`,
+`report_schedules`, up to 50 schedules, reusing Alerts' own SMTP
+settings); the Nodes → HISTORY explorer and its series CSV export; wireless
+AP/radio history sampling with a new `max_wireless_db_mb` size cap; the
+Mapper PNG export's font/style fidelity and pixel-density fix, plus the
+new Connect tool for manually drawn map links; an optional device Uptime
+column; and the device dialog's event log dropping poll-overrun entries.
+Stephen_King wrote `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`,
+`NETWORK-AND-STORAGE-REQUIREMENTS.md` and this entry against the diff
+(`e8cdc01..HEAD`, implementation commit `bf9b5ee`), reading the actual
+code for every claim rather than the task description alone; the wireless
+history disk estimate in `NETWORK-AND-STORAGE-REQUIREMENTS.md` is
+arithmetic from the row layout, not a measured benchmark, and is
+labelled as such. (test and review results: pending)
+→ Stephen_King. `CHANGELOG.md`, `FEATURES.md`, `INTERNALS.md`,
+`NETWORK-AND-STORAGE-REQUIREMENTS.md` written for 5.23.0; no code
+touched.

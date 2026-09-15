@@ -42,6 +42,8 @@ netpath/
   collector.py     NetFlow UDP listener and batched writer
   flowdb.py        flow storage, settings, aggregation queries
   services.py      port/protocol names, byte/rate formatting
+  csvout.py        formula-safe CSV cell/text helpers, shared by every
+                   export.csv route and reportsched.py's attachment — 5.23.0
   syslogparse.py   RFC 3164 / RFC 5424 parsing
   syslogd.py       syslog UDP/TCP listener
   syslogdb.py      syslog storage, rollup counts, FTS5 trigram search
@@ -114,6 +116,8 @@ netpath/
   report.py        availability, link-saturation and (5.10.0) firmware-
                    inventory reports, from history and identity data Nodes
                    and Alerts already keep
+  reportsched.py   due-date math, rendering and the send loop behind
+                   scheduled emailed reports (report_schedules) — 5.23.0
   sqlitebase.py    the `SqliteStore` base class every database module
                    subclasses (open/pragma/migrate/close, settings,
                    trim/reclaim); opens a SQLite file with owner-only
@@ -339,9 +343,14 @@ forever. `db.py`'s `Database` overrides `_trim_size` to `live_size_bytes()`
 still inside the retention window) and `_trim_delete` to remove a trace's
 hops before the trace row itself; `syslogdb.py` routes `_trim_delete`
 through its own FTS-aware `_delete_logs()` so the search index and the
-message rows never disagree; `nodesdb.py`, `nodesseriesdb.py` and `alertsdb.py` keep their own
+message rows never disagree; `nodesdb.py`, `nodesseriesdb.py`, `alertsdb.py`
+and, from 5.23.0, `wirelessdb.py` keep their own
 `trim_to_size()` entirely, since each spans several tables rather than one
-dominant one. `nodesseriesdb.trim_to_size` runs in two stages, and from
+dominant one — `wirelessdb`'s own reason is narrower than the others':
+`ap_samples`/`radio_samples` are plain fact rows with no `id` column the
+base class's `TRIM_TABLE` mechanism could key off, so it deletes
+oldest-by-`ts`-first from both directly instead, ahead of anything else in
+the file. `nodesseriesdb.trim_to_size` runs in two stages, and from
 5.14.0 in this order: `samples_hourly` oldest-first by `hour` first, down
 to `_hourly_floor()`, then — only once that floor is reached and the file
 is still over cap — raw `samples` oldest-first down to `_sample_floor()`,
@@ -358,10 +367,11 @@ sitting on its cap spent every maintenance pass shredding the window the
 stage clear of the two-hour redo window `compact_rollup` rewrites. Before
 5.1.0 there was no rollup stage at all, so a file whose bulk was rollups
 sat over its cap for good. `Service.run_maintenance()` (`web/service.py`) calls
-`Service._trim_db()` for each of the eight databases that has a
+`Service._trim_db()` for each of the nine databases that has a
 `max_*_db_mb` setting (netpath, flow, syslog, snmp, ipam, nodes,
-nodes_series, alerts — not `app.db`, `wireless.db`, `configrx.db`,
-`mapper.db` or `nodes_mibs.db`, none of which has a size cap), plus the
+nodes_series, alerts and, from 5.23.0, wireless — not `app.db`,
+`configrx.db`, `mapper.db` or `nodes_mibs.db`, none of which has a size
+cap), plus the
 day-based retention prunes for each module,
 `AppDatabase.prune_hostnames()` for the reverse-DNS cache and
 `AppDatabase.prune_asn_cache()` for the ASN/owner cache.
@@ -485,14 +495,14 @@ fourth setting).
 | `flows.db` | `FlowDatabase` (`flowdb.py`) | `flows`, `flow_rollup` (top-K per dimension per bucket, two tiers), `flow_rollup_span` (each bucket's grand total), `flow_rollup_trunc` (5.7.0: which `(tier, dim, bucket)` cells the top-K cap actually cut short, so a read can repair them from `flows` instead of serving the incomplete rollup), `exporters`, `interfaces`, `samplers`, NetFlow's own settings |
 | `syslog.db` | `SyslogDatabase` (`syslogdb.py`) | `logs`, `log_counts` (hourly rollup), the FTS5 index, Syslog's own settings |
 | `ipam.db` | `IpamDatabase` (`ipamdb.py`) | `subnets`, `hosts`, `conflicts`, `scans`, `dhcp_servers`, `dhcp_scopes`, `dhcp_leases`, `dhcp_scope_history` (leased-IP trend), IPAM's own settings |
-| `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `device_groups` (organizational, unrelated to `groups`), `devices`, `interfaces`, `device_events`/`interface_events`, `discovery_jobs`/`discovery_results`, `vlans`/`vlan_ports`/`port_vlans` (per-port VLAN membership, for MAPPER), `mac_entries`, `arp_entries` (5.7.0: a device's own ARP cache — IP-to-MAC per interface, off by default), `neighbors`, `device_addresses`, `vendor_learned`, `interface_thresholds` (the alarm/warning levels a port's own transceiver publishes), Nodes' own settings. Also the facade over the two files below |
+| `nodes.db` | `NodesDatabase` (`nodesdb.py`) | `groups` (polling profiles), `device_groups` (organizational, unrelated to `groups`), `devices`, `interfaces`, `device_events`/`interface_events`, `discovery_jobs`/`discovery_results`, `vlans`/`vlan_ports`/`port_vlans` (per-port VLAN membership, for MAPPER), `mac_entries`, `arp_entries` (5.7.0: a device's own ARP cache — IP-to-MAC per interface, off by default), `neighbors`, `device_addresses`, `vendor_learned`, `interface_thresholds` (the alarm/warning levels a port's own transceiver publishes), `interface_flags` (5.23.0: which ports are flagged Priority, keyed `device_id`/`if_index`, surviving a re-walk and purged with the device), `report_schedules` (5.23.0: scheduled emailed reports, capped at 50), Nodes' own settings. Also the facade over the two files below |
 | `nodes_series.db` | `NodesSeriesDatabase` (`nodesseriesdb.py`) | `metrics` (from 5.14.0, with its own `scope` column), `samples`, `samples_hourly` — the Nodes tables that grow |
 | `nodes_mibs.db` | `NodesMibDatabase` (`nodesmibdb.py`) | `mib_files` (including each file's original text), `mib_objects` |
 | `alerts.db` | `AlertsDatabase` (`alertsdb.py`) | `rules`, `templates`, `alerts`, `notifications`, `meta` (per-source evaluation cursors), `smtp_credential`, `device_thresholds` (per-device threshold-rule overrides), Alerts' own settings |
 | `snmptraps.db` | `SnmpTrapDatabase` (`snmptrapdb.py`) | `traps` (received traps and informs, decoded), `trap_counts` (hourly rollup), SNMP Trap's own settings |
-| `wireless.db` | `WirelessDatabase` (`wirelessdb.py`) | `controllers` (each with its own SNMP credential columns), `access_points`, `radios`, Wireless' own settings |
+| `wireless.db` | `WirelessDatabase` (`wirelessdb.py`) | `controllers` (each with its own SNMP credential columns), `access_points`, `radios`, `ap_samples`/`radio_samples` (5.23.0: per-AP and per-radio history, at most one row every `history_sample_s` seconds), Wireless' own settings |
 | `configrx.db` | `ConfigRxDatabase` (`configrxdb.py`) | `device_config` (per-device backup settings, SSH credential and optional enable secret, keyed by a Nodes device id with no real FK), `backups` (zlib-compressed, hash-deduped), ConfigRX's own settings |
-| `mapper.db` | `MapperDatabase` (`mapperdb.py`) | `maps`, `map_nodes` (devices/unmanaged peers placed on a map, and where), `vlan_colors` (a global VLAN colour override, not per-map), Mapper's own settings |
+| `mapper.db` | `MapperDatabase` (`mapperdb.py`) | `maps`, `map_nodes` (devices/unmanaged peers placed on a map, and where), `map_links` (5.23.0: manually drawn lines between two placed nodes, cascading when either node or the map is removed), `vlan_colors` (a global VLAN colour override, not per-map), Mapper's own settings |
 
 ---
 
@@ -3668,6 +3678,71 @@ so it inherits the heading's size — a line in the body would render as
 `.section` at 11px. The 5s refresh re-sets that whole `<h2>` from
 `ifaceTitle`, so both lines are rebuilt together and cannot drift apart.
 
+### Priority ports: `interface_flags`, the priority gate, and one `link_up` clearing two rules (`nodesdb.py`, `alertrules.py`, `alertengine.py`, `web/api.py`, `nodes.js`) — 5.23.0
+
+`interface_flags(device_id, if_index, priority)` is a small standalone
+table, not a column on `interfaces` — a re-walk replaces the interface
+row wholesale on every poll, so a flag column there would not survive
+one, and a purged device's row is deleted by cascade the same as
+everything else keyed to it. `set_interface_priority()` writes it (an
+upsert on `(device_id, if_index)`), `priority_if_indexes(device_id)`
+answers the interface dialog and the CSV export's Priority column, and
+`priority_interfaces()` returns every flagged `(device_id, if_index)`
+pair fleet-wide for the alert engine. `PUT
+/api/nodes/devices/<id>/interfaces/<if>/priority` (nodes write) is the
+one route that changes it, audited as `interface.priority`.
+
+**The gate is a predicate composed onto the existing one, not a new alert
+kind.** `priority_interface_down` is an ordinary rule sharing
+`interface_down`'s own `(kind, source_kind)` = `("interface_event",
+"link_down")` — same source, same trigger — so `PREDICATES["interface_event"]`
+becomes `_both(_source_kind_matches, _priority_gate)`: every interface
+rule now also has to pass `_priority_gate`, which is a no-op (`True`) for
+any rule not in `alertrules.PRIORITY_ONLY_RULES` (currently just this
+one) and, for a rule that is, reads `occurrence.extra["priority"]`.
+`AlertEngine._drain_interface_events` sets that flag by reading
+`nodes_db.priority_interfaces()` **once per drain**, not once per row —
+a set lookup per occurrence rather than a query per occurrence — via a
+`getattr`-guarded call so a test double `nodes_db` predating the method
+still runs. The plain `interface_down` rule is completely unaffected: it
+is not in `PRIORITY_ONLY_RULES`, so `_priority_gate` always passes it.
+
+**`link_up` has to close two alerts, not one, and they don't share a
+dedup key.** `alertrules.CLEARS_COMPANIONS` is a second, small map
+(`{"interface_down": ("priority_interface_down",)}`) read alongside the
+existing `CLEARS` map: `_drain_interface_events`'s `link_up` handling now
+loops over the paired rule *and* every rule its key names in
+`CLEARS_COMPANIONS`, resolving each one's own dedup key
+(`f"{rule_key}:interface:{device_id}:{if_index}"`) and notifying its own
+clear separately — because `priority_interface_down` is its own rule row
+with its own dedup key, a `link_up` that only closed the paired
+`interface_down` rule the old way would leave the priority alert open
+forever once its plain twin cleared.
+
+**Scheduled reports' and Alerts' SMTP reuse the exact same check, not a
+second copy of it.** `AlertEngine.smtp_credentials(settings=None)`,
+factored out of `_notify`, is "(settings, password) for a real send, or
+`None` when email is not enabled/configured" — `_notify` itself now
+calls it for the same decrypt it always did, and `reportsched.run_due`
+(see Alerts, below) calls it too, so a schedule's "is email usable"
+answer can never drift from what Alerts' own notification path already
+checks for the identical settings.
+
+### History explorer's export route (`web/api.py`) — 5.23.0
+
+`get_nodes_series_export` is not a second query path: it calls
+`get_nodes_series_batch` — the same `q=<device_id>:<metric_key>[,...]`
+parser and fetch the 5.22.0 dashboard tile batch route already runs —
+and reshapes the same `series` result into long format (one row per
+point per series, `time`/`ts`/`device`/`metric`/`unit`/`value`/`min`/`max`)
+rather than answering with a second implementation that could disagree
+with what the chart and table already show. `SERIES_EXPORT_CAP`
+(200,000) is sized well past what the History query builder's own
+8-row, one-window UI could produce in practice — it only ever bites a
+pathological `bucket_s=0` request over a very wide window — truncated
+rather than refused, the same shape every other capped export in this
+file takes.
+
 ---
 
 ## MAPPER
@@ -4490,6 +4565,61 @@ Nodes screen but the decision it takes is an Alerts one. `nodes.js` calls
 the gate would sit unapplied on freshly rendered controls until some
 unrelated event happened to trigger it.
 
+### Manual lines: `map_links` (`mapperdb.py`, `mapper.py`, `web/api.py`, `mapper.js`) — 5.23.0
+
+`map_links` is deliberately its own table rather than a variant
+`map_nodes` row: it names two *existing* `map_nodes` rows
+(`a_node_id`/`b_node_id`, both `FOREIGN KEY ... ON DELETE CASCADE`) plus
+an optional `label` (≤60 chars) and `added_ts`, so removing either
+placed node — or the map itself — removes the line with it for free,
+through SQLite's own cascade rather than an explicit cleanup pass.
+`UNIQUE(map_id, a_node_id, b_node_id)` stops the same ordered pair being
+drawn twice; `MapperDatabase.add_link` checks both directions
+(`a=X,b=Y` OR `a=Y,b=X`) before inserting, since the map itself does not
+care which node is A and which is B and the app always resolves them the
+same way it stored them. `POST /api/mapper/maps/<id>/links` (mapper
+write, audited `mapper.link`) and `DELETE .../links/<link_id>` are the
+only two routes; there is no PUT — the label is read-only-after-creation
+in this release, so re-labelling a line is delete-and-redraw.
+
+`mapper.js`'s `linkNodeA`/`linkNodeB` resolve a link's two ends back to
+this map's own placement of them; a *discovered* link's A end is always
+the reporting device, so `a_device_id` is always set for one, but a
+manual line can join two unmanaged peers (or one of each), so
+`linkNodeA` needed the same `peer_key` fallback `linkNodeB` already had
+for exactly that case. `link_csv_rows` (`mapper.py`) picked up the
+matching fallback on its own A-side name/id resolution, for the CSV
+export's **manual** row. The Connect toolbar button
+(`openConnect`/`mp-connect`) is enabled only when `view.selection.size
+=== 2` (`drawToolbarState`), draws as a dashed neutral line (`link.manual`
+routes `wireOne` to the `unknown`/`manual` CSS class and skips the
+VLAN-count plan entirely), and shows **Remove line** in the selection
+pane instead of the discovered-link detail.
+
+### Export PNG fidelity and pixel density (`mapper.js`) — 5.23.0
+
+`inlineComputedColors` (the function that walks the live SVG and copies
+each element's *computed* style onto the cloned copy before serialising
+it to an `<img>`, because the clone carries no stylesheet of its own once
+detached) previously copied only paint properties — `fill`, `stroke`,
+`color`, `stop-color`, `stroke-width`, `paint-order`, `stroke-linejoin`.
+Everything text-related — `font-family`, `font-size`, `font-weight`,
+`text-anchor`, `letter-spacing` — and everything else CSS-class-driven —
+`opacity`, `fill-opacity`, `stroke-opacity`, `stroke-dasharray`,
+`dominant-baseline` — came only from the page's stylesheet, so the
+serialised copy lost all of it: every label rendered in the browser's
+default font at its default size, and text that fit cleanly on screen
+(sized and positioned by the missing properties) could overlap once
+those properties silently reverted to nothing. Both lists are now copied
+the same way. Separately, the canvas the SVG is rasterised onto used to
+be sized 1:1 with CSS pixels; it is now sized to
+`window.devicePixelRatio` (capped at 2, `Math.min(devicePixelRatio || 1,
+2)`) with `ctx.scale(scale, scale)` applied before `drawImage` still
+targets the CSS-pixel size — so the scale-up happens once, on the
+canvas's own backing store, rather than stretching an already-rasterised
+1x image, which is what made the exported PNG read soft next to the
+on-screen canvas on any HiDPI display.
+
 ---
 
 ## Alerts
@@ -4506,9 +4636,12 @@ occurrence increments one alert instead of opening a duplicate" behavior
 lives in the database's own conflict resolution, not in application code
 that could race between a read and a write.
 
-60 built-in rules (5.10.0 adds `wireless_ap_rebooted`,
+61 built-in rules (5.10.0 adds `wireless_ap_rebooted`,
 `wireless_radio_channel_changed` and `netpath_https_down`; the middle one
-ships disabled via `_BUILTIN_DISABLED`) and 6 built-in templates are
+ships disabled via `_BUILTIN_DISABLED`; 5.23.0 adds
+`priority_interface_down`, sharing `interface_down`'s `(kind,
+source_kind)` and gated by `PRIORITY_ONLY_RULES` — see Priority ports,
+under Nodes) and 6 built-in templates are
 seeded via `INSERT OR IGNORE` keyed on each row's unique `key`, run on
 every open — idempotent,
 so a re-open never duplicates, and an admin's edit to a built-in rule's
@@ -6103,6 +6236,70 @@ it are the other two callers this same release adds; none of the three
 CSV exports needed a schema change, since they already read the same rows
 their JSON routes build.
 
+### Scheduled reports: `report_schedules`, `reportsched.py` (`nodesdb.py`, `alertmail.py`, `web/service.py`, `web/api.py`) — 5.23.0
+
+`reportsched.py` sits above `report.py` the way `report.py` sits above
+`nodesdb.py`/`alertsdb.py`: it owns everything that is not storage —
+`next_due` (when a schedule fires next), `render` (subject/body/CSV for
+one firing, calling the same three `report.py` builders the on-demand
+routes already call) and `run_due` (the once-a-minute tick). Storage is
+`nodesdb.report_schedules`, capped at `REPORT_SCHEDULE_MAX` (50) checked
+in `add_report_schedule` before the insert.
+
+**Cadence math (`next_due`) is calendar arithmetic left to `mktime`'s own
+normalisation, not hand-rolled month/DST handling.** `_local_at(base_ts,
+day_delta, hour, minute)` builds `(year, mon, mday + day_delta, hour,
+minute, 0, 0, 0, -1)` and lets `time.mktime` roll an out-of-range
+`tm_mday` into the next month itself — the standard trick, and how daily
+and weekly both compute "N days from now at hour:minute" without their
+own carry logic. Monthly is different because a day-of-month has no such
+built-in normalisation for an actually-shorter month: `_month_at(year,
+month, day_of_month, hour, minute)` clamps `day_of_month` to
+`calendar.monthrange(year, month)[1]` (that month's real last day)
+itself, so a schedule set for the 31st fires on the 28th/29th/30th in a
+shorter month rather than mktime silently rolling it into the *next*
+month and skipping the one just clamped.
+
+**`run_due` advances `next_run_ts` before it renders or sends, not
+after.** `update_report_schedule(schedule_id, next_run_ts=next_ts)` runs
+first; render and send happen after, and `record_report_schedule_run`
+stamps `last_run_ts`/`last_status` once the outcome (sent, not sent, or
+an exception from either step) is known. So a crash mid-send cannot
+repeat the same run indefinitely on the next tick — the worst case is one
+run silently skipped, never one repeated. A `next_due` that itself raises
+(a corrupt cadence field) parks the schedule a day out
+(`next_run_ts=now + 86400`) and records why, rather than being retried
+every single minute forever.
+
+**Email reuses Alerts' SMTP setup exactly, through
+`AlertEngine.smtp_credentials()`** (factored out for this — see Priority
+ports, above) — there is no separate mail configuration for scheduled
+reports, so a schedule with nothing set under Alerts → Settings →
+Notifications gets `last_status = "not sent: email is not configured"`
+rather than attempting a send that can only fail. `alertmail.send` gained
+an `attachments` keyword (`list[(filename, bytes, maintype, subtype)]`,
+via `EmailMessage.add_attachment`) for this — with attachments present
+the body always goes through `set_content()` regardless of `is_html`,
+since no built-in alert has ever needed an HTML body alongside an
+attachment and complicating `add_attachment`'s placement for a case
+nothing uses was not worth it. The CSV attachment itself is built with
+`csvout.csv_text` (see the Layout file list) — the same formula-safe,
+BOM-prefixed CSV every `export.csv` route in `web/api.py` writes, without
+`reportsched.py` importing the web package's route handlers just to reach
+two small functions.
+
+**The tick runs every 60 seconds on the maintenance thread, independent
+of its own 15-minute housekeeping gate.** `Service._maintenance_loop`
+calls `reportsched.run_due(self, time.time())` on every wake of that
+loop — which is every 60s, the loop's own base interval — rather than
+being folded into the pass that only actually runs every
+`MAINTENANCE_INTERVAL_S` (15 min); a schedule due at 09:00 sends at
+09:00, not whenever the next 15-minute sweep happens to land.
+
+Routes: `GET`/`POST /api/nodes/reports/schedules`, `PUT`/`DELETE
+.../schedules/<id>`, `POST .../schedules/<id>/run` (Send now — calls the
+same `render`/send path `run_due` does, for one schedule, immediately).
+
 ---
 
 ## NetPath
@@ -6894,6 +7091,110 @@ triggered inside `activate()` no-ops (`refresh()` returns immediately when
 already-updated target/window state. The window itself pads ±5 minutes
 around the flow's own timestamp — a single flow record is a point in
 time, but the route graph needs a span to draw traces from.
+
+### Template carry-over across a collector restart (`collector.py`, `nfdecode.py`) — 5.23.0
+
+`Collector.start()` builds a brand-new `Decoder` on every call, and
+every NetFlow settings save calls `stop()` then `start()` (`post_collector`
+in `web/api.py`, via `service.collector.start(service.flow_settings)`) —
+so a settings save that changes nothing about template handling still
+rebuilt the decoder from scratch, and `Decoder.__init__` used to always
+build a fresh, empty `_TemplateCache`. Templates are v9/IPFIX wire state
+independent of settings — an exporter sends its record layout once, then
+relies on the collector remembering it, on a resend interval the
+collector does not control — so an empty cache after a restart meant
+every record from that exporter came back `no_template` until its next
+scheduled resend, minutes to tens of minutes on most platforms. `Decoder`
+now takes an optional `templates` keyword; `Collector.start()` passes
+`self.decoder.templates` — the *old* decoder's cache, read before the new
+one replaces it — so a settings save carries every exporter's learned
+templates straight through the restart. A genuinely fresh process still
+starts with an empty cache, since there is no prior decoder to read one
+from.
+
+### The row cap stops at the minute watermark, and the rollup catches up (`flowdb.py`, `web/service.py`) — 5.23.0
+
+Two related fixes to the same failure mode: the raw-row cap and the
+minute-tier rollup racing each other, with the cap sometimes winning and
+deleting flows the rollup had not summarised yet.
+
+**`prune()`'s row-cap stage now never deletes past the minute
+watermark.** Previously it capped by row id alone: find the id span over
+`max_flows`, delete it. `rollup_bounds(60)` (the minute tier's own
+`(floor, watermark)`) now bounds that upper edge — a `MIN(id) WHERE
+ts_end >= minute_watermark` probe finds where the still-unsummarised
+rows start, and the cap's delete range is clamped to stop there. Rows at
+or after the watermark survive the pass regardless of how far over
+`max_flows` the table has grown; `self.cap_held_back` (and the `warning`
+log line it triggers) is how many rows the cap wanted to remove but
+didn't, so a store where this actually happens is visible rather than
+quietly losing history. `coverage()` (below) exposes the same figure to
+the UI as `cap_held_back`.
+
+**A rollup pass that used its whole bucket budget now triggers
+immediate catch-up passes, not just a longer wait.** `compact_rollup(tier)`
+already had a per-call bucket limit (`_ROLLUP_MAX_BUCKETS[tier]`); it now
+also sets `self._compact_hit_limit[tier]` to whether this call actually
+used the whole limit (`processed >= limit`), read back through the new
+`compact_hit_limit(tier)`. `Service.compact_flow_rollups()` ORs that
+across both tiers into `self._flow_rollup_behind`; `_rollup_loop()`, after
+its normal once-a-minute call, loops calling `compact_flow_rollups()`
+again — bounded by `_ROLLUP_CATCHUP_BUDGET_S` (30 s) and `self._stop` —
+for as long as `_flow_rollup_behind` stays true. A store whose summariser
+falls behind on a burst now works through the backlog inside the same
+wake instead of only making one bucket-limited pass every
+`ROLLUP_INTERVAL_S` and falling further behind on a sustained one.
+
+### A wide window widens its own bucket instead of falling back to raw (`flowdb.py`) — 5.23.0
+
+The bucket-size logic inside the query path (around where `align`/
+`n_buckets` are chosen) used to have one fallback for "the requested
+bucket is finer than what a rollup tier can serve for this window": read
+raw `flows` and thin them. That is fine when raw genuinely has the
+range — but minute rows are kept only 2 days, and the size cap trims the
+*oldest rollup buckets first* on top of that, so a chart asking for
+sub-hour buckets over an older window could find raw already gone too,
+and drew from whatever thinned, incomplete rows the row cap had left
+behind rather than actually empty. The fix adds one more branch, tried
+first: if the window's start is older than the minute tier's own floor
+*and* the hourly tier's floor/watermark actually cover the window, the
+bucket size is silently widened to 3600 (hourly) instead of falling
+through to raw. It only fires for an unfiltered query — `filters and
+any(filters.values())` disqualifies it, since a filtered query cannot be
+answered from the rollup tiers at all and has always read raw. The
+response's own `bucket_s` says what was actually used, which is what the
+chart's existing hover-shows-the-bucket-size behaviour already surfaces
+to an operator without a separate flag.
+
+### `coverage()` and the lag warning (`flowdb.py`, `web/api.py`, `netflow.js`, `web/service.py`) — 5.23.0
+
+`FlowDatabase.coverage()` is one query (`MIN(ts_end)`/`MAX(ts_end)` off
+the `ix_flows_ts` index, not `stats()`'s full scan) plus both tiers'
+`rollup_bounds()` and the two prune-bookkeeping fields above, returned as
+one dict: `raw_oldest`/`raw_newest`, `minute_floor`/`minute_watermark`,
+`hourly_floor`/`hourly_watermark`, `cap_held_back`, `prune_incomplete`.
+`minute_lag_s()` is the one further figure it doesn't carry directly —
+seconds sealed time is ahead of the minute watermark — read separately
+since only the service's own SYSTEM-log throttle needs it, not the UI.
+`GET /api/state` serves `coverage()` as `collector.coverage`, through
+`service.cached_poll("flow_coverage", 10.0, ...)` — the same
+"expensive-ish, polled every 2s by every tab, so cache it" pattern
+`/api/state` already uses elsewhere, at a 10s TTL since coverage does not
+need to be fresher than that. `netflow.js`'s `coverageLine()` renders it
+on the status strip as `history: raw 13h · minute 2.0d (3m behind) ·
+hourly 41d`, appending the held-back-rows note when `cap_held_back` is
+nonzero; the "(behind)" qualifier is computed client-side from
+`Date.now()/1000 - minute_watermark` rather than reusing the server's own
+`minute_lag_s()`, so it ticks up between polls instead of jumping every
+10 seconds.
+
+`Service._check_flow_coverage_lag()`, called at the end of every
+`_rollup_loop()` pass (after the catch-up loop above), is the operator-
+facing backstop: past `_FLOW_COVERAGE_LAG_WARN_S` (900s / 15 min) of lag,
+it writes one SYSTEM event-log line, throttled to at most one every
+`_FLOW_COVERAGE_WARN_INTERVAL_S` (also 900s) via `self._flow_coverage_warned_ts`
+— so a store stuck behind says so once every 15 minutes rather than
+filling the log on every rollup wake while it stays behind.
 
 ---
 
@@ -8266,6 +8567,67 @@ seed every controller's due time from one `now` taken once per pass — see
 *Controllers are staggered*, above — so controllers polled together no
 longer stay phase-locked for the life of the process the way the node
 poller stopped doing in 5.9.0.
+
+### AP and radio history: `ap_samples`/`radio_samples`, the wireless size cap (`wirelessdb.py`, `fortipoll.py`, `web/api.py`, `wireless.js`) — 5.23.0
+
+**No new SNMP is read for this.** `_append_history` (`fortipoll.py`,
+called once per AP from `_poll_controller` after `replace_radios`) writes
+from the same `status`, `station_count` and per-radio `channel`/
+`operating_power_dbm` values the ordinary per-cycle walk already
+collected — it is a second write of the same poll's own data, not a
+second poll.
+
+**Throttled to `history_sample_s` (default 300s), checked once per AP,
+not once per table.** `last_sample_ts(ap_id)` reads that AP's own most
+recent `ap_samples` row; if `now - last < history_sample_s`,
+`_append_history` writes nothing at all for that AP this cycle — for
+*both* tables, since one check governs both, which is why an AP with two
+radios writes one `ap_samples` row and two `radio_samples` rows on the
+same tick rather than the two tables drifting out of step with each
+other. This is a 5x-coarser cadence than the poll itself by design: at
+the default 60s `poll_interval_s`, sampling every poll would be 1000
+radios × 1440 samples/day ≈ 1.4M rows/day fleet-wide; at 300s it is
+≈300k — the arithmetic behind why 300s, not 60s, is the shipped default.
+Rows are collected into `ap_sample_rows`/`radio_sample_rows` lists across
+the whole controller sweep and written once via `record_samples`
+(one `executemany` each), not one `INSERT` per AP.
+
+**Storage has no `id`/rowid indexing convenience, on purpose.**
+`ap_samples`/`radio_samples` are plain fact rows — `ap_id`, `ts`,
+`online`, `station_count` / `radio_id`, `ts`, `station_count`,
+`channel`, `operating_power_dbm` — indexed `(ap_id, ts)` and `(ap_id,
+radio_id, ts)` respectively, no primary key column of their own to key a
+delete range off. `prune_history(older_than_days)` (default 35, called
+from the service maintenance loop beside `prune_ap_events`) is a plain
+`DELETE ... WHERE ts < cutoff` on each, reclaiming afterward.
+
+**The size cap needed its own `trim_to_size` for the same reason** — see
+*Size caps share one algorithm*, in the Data layer section: the base
+class's `TRIM_TABLE` mechanism assumes an `id` column to bound a delete
+range by id span, which neither sample table has, so `wirelessdb`
+overrides `trim_to_size` to delete oldest-by-`ts` directly from both
+tables in 5,000-row batches until under `max_bytes` or the budget runs
+out. `max_wireless_db_mb` (`appdb.DEFAULTS`, 256, minimum 16 —
+`web/api.py`'s settings-bounds table) is now wired into `STORES` (a
+`cap_key` where it was `None` before) and into
+`Service._prune_wireless`'s call to `self._trim_db(...)`, so Wireless
+joins the nine databases with a live size cap — see the Data layer
+section, corrected this release from "eight" to "nine". Controller/AP/
+radio inventory itself is untouched by the trim; only the two sample
+tables are.
+
+`GET /api/wireless/aps/<id>/history?t0&t1&bucket_s` and `.../history/
+export.csv` (both `wireless` read) run `_wireless_history_series`, which
+answers the same `{key, label, unit, points}` series shape the rest of
+the application's history charts already use: a bare `"clients"` series
+for the AP total, plus per radio (sorted by `radio_id`, so the series
+list and the two charts draw the same radios in the same order on every
+request) `"radio:<id>:clients"` and `"radio:<id>:power"`. That shared
+shape is what lets `wireless.js` draw both charts with the exact same
+`App.drawSeriesChart`/`App.attachChartZoom` every other history chart in
+the application uses, rather than a bespoke renderer for this one pane.
+
+---
 
 ## ConfigRX (`configrxdb.py`, `configrx.py`)
 

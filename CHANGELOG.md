@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.23.0 — Scheduled reports, a history explorer, priority ports, and NetFlow's missing blocks](#5230--scheduled-reports-a-history-explorer-priority-ports-and-netflows-missing-blocks)
 - [5.22.0 — TACACS+ sign-in, richer dashboard graphs, and a look at history](#5220--tacacs-sign-in-richer-dashboard-graphs-and-a-look-at-history)
 - [5.21.0 — A modular Dashboard, and global find to the switch port](#5210--a-modular-dashboard-and-global-find-to-the-switch-port)
 - [5.20.5 — The auto-assigned MIB, repaired for the fleet (second pass)](#5205--the-auto-assigned-mib-repaired-for-the-fleet-second-pass)
@@ -155,6 +156,159 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.23.0 — Scheduled reports, a history explorer, priority ports, and NetFlow's missing blocks
+
+Nine items from the operator, landing together: `PROMPT-LOG.md` carries
+the planning answers in full; this entry is the shipped result. Three of
+the nine — options A, E and G from `docs/HISTORICAL-DATA-OPTIONS.md`,
+the paper 5.22.0 shipped for a later decision — were chosen this round:
+a history explorer, scheduled emailed reports, and wireless AP/radio
+history.
+
+**Three separate causes of missing blocks on a wide NetFlow chart are
+fixed, in plain terms.** All three could make a chart show empty where
+flows genuinely were exported, and all three looked identical on
+screen, so each had to be run down and closed on its own. First: saving
+any NetFlow setting restarts the collector, and the restart used to
+wipe its memory of v9/IPFIX exporter templates — without a template a
+v9/IPFIX record cannot be decoded at all, and an exporter only resends
+its template every few minutes on its own schedule, so a routine
+settings change could black out an exporter's flows for that long. The
+collector now carries its learned templates across its own restart.
+Second, the raw-flow row cap — which deletes the oldest rows once the
+table hits its limit — decided "oldest" purely by arrival order, with
+no regard for whether the once-a-minute summariser had actually
+processed those rows yet; on a busy exporter where the summariser fell
+behind, the cap could delete flows before they were ever rolled up,
+losing them from both the raw table and the summary meant to preserve
+them. The cap now stops at whatever the summariser has reached and
+reports how many rows it held back instead of silently dropping them.
+Third, a chart asking for sub-hour detail over a window the minute-level
+summary can no longer reach (kept 2 days; older than that, or aged out
+early by the row cap on a busy store) used to fall back to whatever thin,
+incomplete raw rows survived, even where the hourly summary covered the
+window cleanly — it now widens its own bucket size to the hourly summary
+instead, a coarser chart rather than an empty one. A summariser that
+falls behind budget on one pass now also runs extra catch-up passes
+right away rather than waiting out the full minute between them. A new
+readout on the NetFlow status strip — "history: raw 13h · minute 2.0d
+(3m behind) · hourly 41d" — says how far back each tier actually
+reaches, so a gap is something you can see rather than something you
+discover the day you need a chart that isn't there; the same lag, past
+15 minutes, also writes a throttled SYSTEM log line.
+
+**Flow, Syslog and SNMP Trap CSV exports now lead with a readable
+local-time column** (`start`/`end` for flow records, `time` for Syslog
+and SNMP Trap) ahead of the raw epoch column each already carried, so a
+file opened straight from the download reads as a clock time in a
+spreadsheet rather than a number that needs converting by hand first.
+
+**Priority ports.** A **Priority port** checkbox in the port dialog
+header flags a port as one that matters — a WAN uplink, a core trunk —
+surviving a re-walk of the device and shown as a ★ beside the dialog
+title and in a new ★ column on the interface list. A flagged port feeds
+a second, dedicated alert rule, **Priority interface down** (severity
+critical, gated to flagged ports only), sitting alongside the existing
+**Interface down** rule (severity error, unchanged, still fires for
+every port) rather than replacing it — the two are independent rules,
+so a flagged port's outage can be routed or paged differently from an
+ordinary access-port flap. A port coming back up clears both alerts for
+it at once.
+
+**Scheduled reports — Nodes → REPORTS → SCHEDULED.** Any of the three
+existing reports (availability, top-N by metric, firmware inventory),
+sent by email on a daily, weekly or monthly schedule instead of run by
+hand — up to 50 schedules, each with its own recipients, local time of
+day, and (for weekly or monthly) weekday or day of month, clamped to a
+shorter month's own last day. The email is a text summary — period,
+totals, up to 20 rows — plus the full result as a CSV attachment.
+Reports send through the same SMTP server Alerts already uses and
+nowhere else: a schedule with no Alerts email configured simply does
+not send, and says so in its own status rather than failing silently.
+The runner checks for anything due once a minute, independent of the
+fifteen-minute housekeeping pass everything else runs on, so a 09:00
+schedule sends at 09:00.
+
+**History explorer — Nodes → HISTORY.** An ad-hoc chart builder: up to
+8 rows, each a device and a metric (including a port's in/out counters
+as two separate picks), any range or **Custom…**, and an auto/1-minute/
+5-minute/1-hour bucket size. One overlaid chart with drag/wheel/keyboard
+zoom, a table beneath it with one row per bucket and one column per
+series (min–max on hover where a rollup answered), an **Export CSV** in
+long format capped at 200,000 rows, and the last query remembered per
+browser.
+
+**Wireless history — the AP detail pane.** Selecting an AP now shows a
+clients chart (AP total plus per-radio) and a tx-power chart, both with
+the same range/zoom/Export CSV as any other chart in the application —
+not new polling, but a history of the same client counts, channel and
+tx power the AP table already reads live, sampled at most once every
+five minutes and kept 35 days. Wireless never had its own file size cap
+before; it now does — `max_wireless_db_mb`, 256 MB by default — trimming
+the oldest history samples first, the way every other capped database
+already works. Inventory itself (controllers, APs, radios) is untouched
+by the cap.
+
+**Mapper: export fidelity and manual lines.** The exported PNG used to
+read its font, size, weight, label alignment, opacity and dashes off
+the page's own stylesheet, which an export does not carry with it, so a
+PNG re-flowed in the browser's default font and labels that fit cleanly
+on screen could overlap in the file; those properties are now written
+into the exported copy directly, which is also now rendered at the
+screen's own pixel density (capped at 2x) instead of a flat image that
+read soft on a HiDPI display. A new **Connect** tool draws a line
+between two selected nodes by hand — an optional label, dashed and
+visually distinct from a discovered link — for a link discovery finds
+nothing on, or gets wrong; it survives the two nodes being moved, is
+removed automatically with either node or the map itself, and exports
+as its own **manual** row in the link CSV.
+
+**Small items.** An optional **Uptime** device-list column and an
+`uptime_s` devices-CSV column, off the same `sysUpTime` reboot detection
+already polls. The device details dialog's own event log no longer
+lists poll-taking-longer-than-its-interval events — housekeeping noise
+on a screen meant to answer "what happened to this device"; alerting
+and the overview histogram are unchanged.
+
+**The API question, answered in chat and recorded here.** Yes: every
+`/api/*` route accepts an `Authorization: Bearer` API token issued and
+revoked under Settings → Tokens, carrying the issuing account's own
+permissions — the same routes the browser interface itself calls, no
+smaller surface for scripts. There is no inbound data-push receiver
+beyond the existing syslog, trap and NetFlow protocol listeners.
+
+Files: `alertengine.py`, `alertmail.py`, `alertrules.py`, `alertsdb.py`,
+`appdb.py`, `collector.py`, `csvout.py` (new — the CSV-cell/CSV-text
+helpers, factored out of `web/api.py` so every export handler shares
+one implementation), `flowdb.py`, `fortipoll.py`, `mapper.py`,
+`mapperdb.py`, `nfdecode.py`, `nodesdb.py`, `reportsched.py` (new —
+schedule due-date math, report rendering and the once-a-minute send
+loop), `web/api.py`, `web/server.py`, `web/service.py`,
+`web/static/alerts.js`, `web/static/app.css`, `web/static/app.js`,
+`web/static/index.html`, `web/static/mapper.js`, `web/static/netflow.js`,
+`web/static/nodes.js`, `web/static/settings.js`,
+`web/static/wireless.js`, `wirelessdb.py`.
+
+Verification: `test_netflow_rollup.py` covers the row-cap watermark,
+the rollup catch-up loop and the tier-widening fallback;
+`test_collector_errors.py` extends to cover template carry-over across
+a collector restart; `test_csv_export.py` covers the new leading time
+columns on the flow, Syslog and SNMP Trap exports; `test_mapper_db.py`
+and `test_mapper_api.py` cover `map_links` and its routes;
+`test_report_schedules.py` covers `reportsched.py`'s due-date math
+(including month-end clamping) and the send path end to end;
+`test_wireless_history.py` covers the sample tables, the size cap and
+the history routes; `test_nodes_api_fixes.py` covers priority ports
+(the PUT route, the interfaces CSV column) and the device dialog's
+event-log filter; `test_dashboard_layout.py` extends to cover the new
+series export CSV route (History explorer); `test_alert_engine.py`
+extends to cover `priority_interface_down` firing only for a flagged
+port and clearing alongside `interface_down` on `link_up`;
+`test_frontend_contracts.py` is updated for every new UI string;
+`tests/ui/walk.mjs` adds a walk of every changed module. The Uptime
+column is a read of an existing polled field (`sys_uptime_s`), so it
+adds no new backend test of its own beyond the pinned frontend string.
 
 ### 5.22.0 — TACACS+ sign-in, richer dashboard graphs, and a look at history
 
