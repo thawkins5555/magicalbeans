@@ -770,8 +770,11 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
     assert(ranResponse.ok(), `Send now answered ${ranResponse.status()}`);
     await sleep(500);
     const statusText = await row.locator('td').nth(6).textContent();
-    assert(/not configured/i.test(statusText || ''),
-      `expected "not configured" (the demo has no SMTP set up), got "${statusText}"`);
+    // The seed points Alerts email at 127.0.0.1:1025 with nothing listening,
+    // so the send either reports "not configured" or a refused connection;
+    // both prove the schedule rendered and reached the mail step.
+    assert(/not configured|failed to send/i.test(statusText || ''),
+      `expected "not configured" or "failed to send", got "${statusText}"`);
 
     // Clean up: the demo's own walk should not accumulate schedules.
     // App.confirmDestructive is a modal (Cancel + a danger-styled confirm
@@ -783,6 +786,216 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
     await row.waitFor({ state: 'detached', timeout: 10000 }).catch(() => {});
     return `created, sent (status "${statusText}"), removed`;
   });
+
+  await check('Nodes -> HISTORY: a query runs and the table/CSV button respond (E1)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'nodes');
+      await settle(page, 800);
+      const firstDevice = await page.evaluate(async () => {
+        const res = await fetch('/api/nodes/devices?limit=1');
+        const data = await res.json();
+        return (data.devices || [])[0] || null;
+      });
+      if (!firstDevice) return 'skipped: no demo devices to query';
+
+      await page.click('#page-nodes > .subtabs > .subtab[data-subtab="history"]');
+      await page.waitForSelector('#nd-hist-rows [data-hist-row]', { timeout: 20000 });
+      const devInputId = await page.evaluate(() => {
+        const row = document.querySelector('#nd-hist-rows [data-hist-row]');
+        const input = row && row.querySelector('input[id^="nd-hist-dev-"]');
+        return input ? input.id : null;
+      });
+      assert(devInputId, 'no device input in the first HISTORY row');
+
+      await page.fill(`#${devInputId}`, firstDevice.ip);
+      await page.waitForSelector(`#${devInputId}-list .combo-item`, { timeout: 10000 });
+      await page.click(`#${devInputId}-list .combo-item`);
+
+      const metricSelId = devInputId.replace('nd-hist-dev-', 'nd-hist-metric-');
+      await page.waitForFunction((id) => {
+        const sel = document.getElementById(id);
+        return sel && sel.options.length > 1;
+      }, metricSelId, { timeout: 10000 });
+      const metricValue = await page.evaluate((id) => {
+        const sel = document.getElementById(id);
+        const opt = [...sel.options].find((o) => o.value);
+        if (opt) sel.value = opt.value;
+        return opt ? opt.value : null;
+      }, metricSelId);
+      // The demo fleet does not simulate the same metrics for every
+      // persona (see demo/personas.py) -- whatever the first offered
+      // metric is stands in for "cpu_pct, or whatever this device
+      // publishes", which is what the plan text itself allows for.
+      assert(metricValue, `no metric options offered for device ${firstDevice.ip}`);
+
+      const ran = page.waitForResponse((response) =>
+        response.url().includes('/api/nodes/series/batch'), { timeout: 15000 });
+      await page.click('#nd-hist-run');
+      const ranResponse = await ran;
+      assert(ranResponse.ok(), `Run answered ${ranResponse.status()}`);
+      await page.waitForSelector('#nd-hist-table tbody tr', { timeout: 10000 });
+      const rowCount = await page.evaluate(
+        () => document.querySelectorAll('#nd-hist-table tbody tr').length);
+      assert(rowCount > 0, '#nd-hist-table has no data rows after Run');
+      const csvDisabled = await page.evaluate(
+        () => document.getElementById('nd-hist-csv').disabled);
+      assert(!csvDisabled, '#nd-hist-csv is still disabled after a successful Run');
+      return `metric "${metricValue}", ${rowCount} table row(s)`;
+    });
+
+  await check('Mapper: Connect draws a manual line, Remove line takes it back off (D2)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'mapper');
+      await settle(page, 1500);
+      // Restricted to nodes actually on screen: the demo map can place a
+      // node (e.g. a device with no laid-out position of its own) far
+      // outside the current pan/zoom, and shift-clicking one there is not
+      // what a real operator does -- nor can Playwright reliably click a
+      // node/line that renders off in the extreme distance.
+      const nodeIds = await page.evaluate(() => {
+        const vw = window.innerWidth, vh = window.innerHeight;
+        return [...document.querySelectorAll('#mp-svg .mp-node')]
+          .map((g) => ({ id: g.dataset.nodeId, rect: g.getBoundingClientRect() }))
+          .filter((n) => n.rect.width > 0 && n.rect.right > 0 && n.rect.left < vw
+                       && n.rect.bottom > 0 && n.rect.top < vh)
+          .map((n) => n.id);
+      });
+      if (nodeIds.length < 2) return 'skipped: fewer than two devices visible on the demo map';
+      const nodeSel = (id) => `#mp-svg .mp-node[data-node-id="${id}"]`;
+
+      await page.click(nodeSel(nodeIds[0]));
+      await sleep(200);
+      await page.click(nodeSel(nodeIds[1]), { modifiers: ['Shift'] });
+      await page.waitForFunction(
+        () => !document.getElementById('mp-connect').disabled, { timeout: 10000 });
+
+      const countText = () => page.evaluate(
+        () => document.getElementById('mp-counters').textContent || '');
+      const linkCount = (text) => Number((/(\d+) link/.exec(text) || [])[1] || 0);
+      const before = linkCount(await countText());
+
+      await page.click('#mp-connect');
+      await page.waitForSelector('#modal:not([hidden]) #mpc-label', { timeout: 10000 });
+      const connected = page.waitForResponse((response) =>
+        /\/api\/mapper\/maps\/\d+\/links$/.test(response.url())
+        && response.request().method() === 'POST', { timeout: 10000 });
+      await page.click('#modal:not([hidden]) .modal-buttons button.primary');
+      const connectResponse = await connected;
+      assert(connectResponse.ok(), `Connect answered ${connectResponse.status()}`);
+      await sleep(500);
+      // #mp-status is the map's own NAME (drawStatus in mapper.js) -- the
+      // node/link/VLAN counts this check is really after live in
+      // #mp-counters, right beside it.
+      const afterConnect = linkCount(await countText());
+      assert(afterConnect === before + 1,
+        `#mp-counters' link count went ${before} -> ${afterConnect}, expected +1`);
+
+      const manualLinkId = await page.evaluate(() => {
+        const path = document.querySelector('#mp-svg path.mp-link.manual');
+        return path ? path.dataset.linkId : null;
+      });
+      assert(manualLinkId, 'no .manual link path found on the canvas after Connect');
+      // A thin diagonal <path>'s bounding-box CENTER (Playwright's default
+      // click point, and any screen-coordinate click computed from it) is
+      // unreliable to hit pixel-for-pixel -- a synthetic click dispatched
+      // straight on the element invokes drawLink's own listener directly,
+      // which is what this check is actually after (that selecting the
+      // link works), not a test of SVG hit-testing geometry.
+      const dispatched = await page.evaluate((linkId) => {
+        const path = document.querySelector(
+          `#mp-svg path.mp-link.manual[data-link-id="${linkId}"]`);
+        if (!path) return false;
+        path.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        return true;
+      }, manualLinkId);
+      assert(dispatched, 'could not find the manual link path to click');
+      await page.waitForSelector('#mp-detail [data-remove-link]', { timeout: 10000 });
+      const removed = page.waitForResponse((response) =>
+        /\/api\/mapper\/maps\/\d+\/links\/\d+$/.test(response.url())
+        && response.request().method() === 'DELETE', { timeout: 10000 });
+      await page.click('#mp-detail [data-remove-link]');
+      const removeResponse = await removed;
+      assert(removeResponse.ok(), `Remove line answered ${removeResponse.status()}`);
+      await sleep(500);
+      const afterRemove = linkCount(await countText());
+      assert(afterRemove === before,
+        `link count after Remove is ${afterRemove}, expected back to ${before}`);
+      return `${before} -> ${afterConnect} -> ${afterRemove}`;
+    });
+
+  await check('Wireless: opening an AP draws (or explains an empty) history chart (G3)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'wireless');
+      await settle(page, 1200);
+      const hasRow = await page.waitForSelector('#wireless-table tbody tr', { timeout: 20000 })
+        .then(() => true).catch(() => false);
+      if (!hasRow) return 'skipped: no demo access points';
+      await page.click('#wireless-table tbody tr:first-child');
+      await page.waitForSelector('#wl-hist:not([hidden])', { timeout: 20000 });
+      // loadHistory() is an async fetch fired off the selection, not
+      // something the click itself waits on; there is no response to key
+      // a waitForResponse off ahead of time since the AP id is only known
+      // once the row click above resolves.
+      await page.waitForResponse((response) =>
+        /\/api\/wireless\/aps\/\d+\/history(\?|$)/.test(response.url()),
+        { timeout: 10000 }).catch(() => {});
+      await sleep(500);
+      const state = await page.evaluate(() => {
+        // App.drawSeriesChart's line is a <polyline> (app.js ~3032), not a
+        // <path> -- and every axis, drawn or empty, carries <text> (tick
+        // labels when drawn, emptyText's single line when not), so the
+        // polyline is what actually tells "has data" from "does not".
+        const chart = document.getElementById('wl-hist-clients');
+        const svg = chart && chart.querySelector('svg');
+        return {
+          hasLine: !!(svg && svg.querySelector('polyline')),
+          hasHint: !!(svg && svg.querySelector('text')),
+        };
+      });
+      assert(state.hasLine || state.hasHint,
+        '#wl-hist-clients shows neither a drawn line nor an empty-state hint');
+      return state.hasLine ? 'chart drawn' : 'empty-state hint shown';
+    });
+
+  await check('Nodes -> Devices settings: ticking Uptime adds a grid column (B1)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'nodes');
+      await settle(page, 800);
+      await page.click('#page-nodes > .subtabs > .subtab[data-subtab="devices"]').catch(() => {});
+      await sleep(300);
+
+      const hasUptimeHeader = () => page.evaluate(() =>
+        [...document.querySelectorAll('#nodes-table thead th')]
+          .some((th) => th.textContent.includes('Uptime')));
+
+      await page.click('#nd-settings');
+      await page.waitForSelector('#modal:not([hidden]) #cols-devices', { timeout: 10000 });
+      const uptimeBox = '#modal:not([hidden]) #cols-devices input[data-column="uptime"]';
+      const wasChecked = await page.evaluate(
+        (sel) => document.querySelector(sel).checked, uptimeBox);
+      await page.click(uptimeBox);
+      await page.click('#modal:not([hidden]) .modal-buttons button.primary');
+      await page.waitForSelector('#modal[hidden]', { timeout: 10000 }).catch(() => {});
+      await sleep(500);
+      const afterToggle = await hasUptimeHeader();
+      if (wasChecked) {
+        assert(!afterToggle, 'unticking Uptime left the "Uptime" header showing');
+      } else {
+        assert(afterToggle, 'ticking Uptime did not add an "Uptime" header to #nodes-table');
+      }
+
+      // Revert, so a repeated walk finds the picker as it did.
+      await page.click('#nd-settings');
+      await page.waitForSelector('#modal:not([hidden]) #cols-devices', { timeout: 10000 });
+      await page.click(uptimeBox);
+      await page.click('#modal:not([hidden]) .modal-buttons button.primary');
+      await page.waitForSelector('#modal[hidden]', { timeout: 10000 }).catch(() => {});
+      return `Uptime header ${wasChecked ? 'removed' : 'appeared'}, then reverted`;
+    });
 }
 
 async function checkDialog(page, dir, tag) {
