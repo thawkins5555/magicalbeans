@@ -7009,38 +7009,42 @@ class NodePoller(Worker):
         return rows
 
     def _vendor_psu_rows(self, device, config: dict, table, now: float) -> tuple:
-        """({idx -> {"label", "state" (0/1/2, or None to skip/clear)}},
-        whether the state column's own walk reached the end) for one
-        nodeoids.PsuTable. See _poll_vendor_sensors for what a None state
-        means to the caller, and _mark_vendor_rows_absent for what the
-        completeness flag is for. The state column is walked every call;
-        the class/skip/name columns are cached for _SENSOR_REFRESH_S, but
-        only once every one of them answered (a timed-out walk is not a
-        fact).
-        """
+        """({idx -> {"label", "state"}}, whether state/class/skip/name all
+        walked to completion) for one nodeoids.PsuTable; an incomplete walk
+        must not be read as evidence a row is gone."""
         device_id = device["id"]
         cache_key = (device_id, table.state)
         cached = self._vendor_psu_static.get(cache_key)
         if cached is not None and now - cached["ts"] < self._SENSOR_REFRESH_S:
             class_map, skip_map, names = cached["class_map"], cached["skip_map"], cached["names"]
+            static_complete = True
         else:
             self._vendor_psu_static.pop(cache_key, None)
-            class_map = ({_flatten_vendor_idx(k): v for k, v in
-                          self._walk_column(device, config, table.class_col).items()}
-                         if table.class_col else {})
-            skip_map = ({_flatten_vendor_idx(k): v for k, v in
-                         self._walk_column(device, config, table.skip_when_col).items()}
-                        if table.skip_when_col else {})
-            names = ({_flatten_vendor_idx(k): v for k, v in
-                      self._walk_column(device, config, table.name).items()}
-                     if table.name else {})
-            if all(m for col, m in ((table.class_col, class_map),
-                                    (table.skip_when_col, skip_map),
-                                    (table.name, names)) if col):
+            static_complete = True
+            if table.class_col:
+                raw_class, class_done = self._walk_column_status(device, config, table.class_col)
+                class_map = {_flatten_vendor_idx(k): v for k, v in raw_class.items()}
+                static_complete = static_complete and class_done
+            else:
+                class_map = {}
+            if table.skip_when_col:
+                raw_skip, skip_done = self._walk_column_status(device, config, table.skip_when_col)
+                skip_map = {_flatten_vendor_idx(k): v for k, v in raw_skip.items()}
+                static_complete = static_complete and skip_done
+            else:
+                skip_map = {}
+            if table.name:
+                raw_names, names_done = self._walk_column_status(device, config, table.name)
+                names = {_flatten_vendor_idx(k): v for k, v in raw_names.items()}
+                static_complete = static_complete and names_done
+            else:
+                names = {}
+            if static_complete:
                 self._vendor_psu_static[cache_key] = {
                     "class_map": class_map, "skip_map": skip_map, "names": names, "ts": now}
         rows: dict[str, dict] = {}
         raw_states, complete = self._walk_column_status(device, config, table.state)
+        complete = complete and static_complete
         states = {_flatten_vendor_idx(k): v for k, v in raw_states.items()}
         for idx, raw in states.items():
             if table.class_col:
