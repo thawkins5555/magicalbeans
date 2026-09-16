@@ -4252,6 +4252,42 @@ like any other module.
   between them at all. Add-neighbours and link drawing both now share the
   same address-based match Nodes uses, so a peer matched that way is
   offered, named and linked as the managed device it is.
+- **From 5.31.0, a Find box sits right after the Map select.** Type a
+  device's name, its on-map label or its IP — a datalist built off this
+  map's own devices autocompletes as you type — and press Enter: the
+  canvas centres on the first match, zooming in to at least 1x so a Find
+  never leaves you squinting at a map that was zoomed further out, and
+  selects it, with the detail pane following. Enter again on the same text
+  cycles to the next match, for a name several devices share. No match at
+  all reports through a toast. Find only selects; it carries no write of
+  its own and works with read-only Mapper access.
+- **From 5.31.0, Add device and Add neighbours both gained a select-all
+  checkbox in their table header.** It ticks (or clears) every row
+  currently listed — with Add device's own search box narrowing that list,
+  exactly the rows the filter left showing, never the full candidate list
+  behind it — and Add takes whatever is ticked. Useful the moment a
+  floor's worth of devices or peers needs placing in one pass instead of
+  one checkbox at a time.
+- **From 5.31.0, Frames: labelled rectangles for grouping devices
+  visually, saved with the map.** Click **Frame**, then drag on empty
+  canvas (at least 40×40) to draw one. Select it by its dashed border, its
+  label or the resize handle at its bottom-right corner; drag the border
+  to move it, the handle to resize it. The detail pane offers a
+  60-character label, six colours — the same six a VLAN strand on this map
+  already draws with — and **Remove**; Delete/Backspace on the canvas
+  removes a selected frame the same way it removes a selected device, and
+  it is reachable by keyboard the same way too (Tab lands on it, Enter or
+  Space selects it). A frame is decoration only: moving or resizing one
+  never moves a device it encloses, and the inside of a frame passes
+  clicks straight through, so a rubber-band selection or a pan started
+  over a frame's interior works exactly as it did before frames existed.
+  Frames draw under every link and node so nothing they enclose is ever
+  hidden behind one, are included in **Fit** and the PNG export, and are
+  left out of the CSV export, which lists links rather than drawing
+  decoration. A position edit (a drag or a resize) saves debounced, the
+  same way a node move already does; renaming or recolouring a frame is
+  audited, moving one is not, the same split already drawn between a
+  node's position and its name.
 
 ---
 

@@ -4992,6 +4992,171 @@ canvas's own backing store, rather than stretching an already-rasterised
 1x image, which is what made the exported PNG read soft next to the
 on-screen canvas on any HiDPI display.
 
+### Find and select-all (`mapper.js`) — 5.31.0
+
+`findMatches(text)` ranks every node against the same four fields
+(`label`, `name`, `resolved_name`, `ip`) that `rebuildFindList` reads to
+build `#mp-find-list`'s `<option>`s, so nothing the datalist offers can
+ever fail to be found — one rank per node, the best of an exact match (0),
+a prefix match (1) or a plain substring (2) across the four fields, ties
+broken by `view.nodes`' own order so results are stable call to call.
+`findNode(text)` compares the incoming text against `view.findQuery`
+case-insensitively to decide whether Enter is a fresh search (index 0) or
+a repeat of the last one (`view.findIndex + 1`, wrapped); `centerOn`
+recentres `view.frame` on the match, raises `view.zoom` to at least 1 (a
+Find should never leave a match smaller than it already was), selects the
+node through the ordinary `setSelection`, and calls `focusCanvas` so the
+same Delete/arrow-key handling a click would have enabled works
+immediately. `tests/test_frontend_contracts.py` §86 pins the four-field
+list, the rank order and the cycling comparison so a future edit to any
+one of them cannot drift from the others unnoticed.
+
+Add device and Add neighbours each keep their own picked set
+(`devicePicked`/`neighbourPicked`, both module-level `let`s reassigned to
+a fresh empty `Set` at the top of each `openAddDevice`/`openAddNeighbours`
+call) **outside the DOM**, because `draw2`/`redrawNeighbourRows` tear the
+`<tbody>` down and rebuild it on every keystroke and every sort — a
+checkbox's own `checked` attribute cannot survive that, so both the
+header select-all box and the Add button read the Set, never a
+`querySelectorAll('.mp-pick:checked')` over a `<tbody>` that may already be
+gone. `App.grid`'s `selectAll` option (existing, `app.js`) takes `checked`
+(every currently listed row is picked), `some` (the indeterminate state)
+and `onToggle`; Add device passes `rows` — this redraw's *filtered* set,
+recomputed from the search box each time — so its header checkbox only
+ever means "every row shown", never "every row that exists" behind an
+active filter; Add neighbours has no filter box of its own, so its `rows`
+already is the full listed set. A checkbox's own `change` event is caught
+by delegation on the `<tbody>` for the same rebuild-on-every-redraw
+reason. `tests/test_frontend_contracts.py` §87 pins this shape for both
+dialogs identically.
+
+### Frames: `map_frames` (`mapperdb.py`, `web/api.py`, `mapper.js`) — 5.31.0
+
+**Storage.** `map_frames` is deliberately its own table, the same
+reasoning `map_links` (5.23.0, above) already established: a frame's
+`x`/`y` are a top-left corner, not a `map_nodes` row's centre, and a frame
+never owns or moves a device, so folding it into `map_nodes` would blur a
+distinction the schema should keep explicit. `FOREIGN KEY (map_id)
+REFERENCES maps(id) ON DELETE CASCADE` removes a map's frames the same
+way `delete_map`'s own comment already describes for `map_nodes`/
+`map_links` — one place decides what deleting a map takes with it.
+Validation constants live in `mapperdb.py` next to `ROLES`/`MAP_STYLES`:
+`FRAME_MIN_SIZE = 40.0` (width and height, both ways: a drag that draws a
+frame smaller is dropped client-side before it ever reaches the route,
+and a resize is clamped to the same floor), `FRAME_LABEL_MAX = 60`,
+`FRAME_COLOR_MAX = 5` (a frame's colour is a fixed 0-5 palette index, six
+entries, not a VLAN's free-form colour choice). `_validate_frame_fields`
+is a module-level function, not a method, checking only the keys present
+in the `fields` dict it is handed — `add_frame` always passes all six,
+`update_frame` whatever subset the caller sent — so one function serves
+both without either one working around the other's assumptions; it also
+strips and rewrites `fields["label"]` in place when present, the same
+mutate-the-dict idiom the label/name validators elsewhere in this file
+use. `update_frame`'s allowed-column dict-comprehension silently drops an
+unrecognised key exactly the way `update_nodes`' fixed column list already
+does, and returns `False` rather than raising for a `frame_id`/`map_id`
+that no longer matches a row — a stale edit from a tab open on a
+since-deleted frame must not explode, matching `add_frame`/every other
+`update_*`/`delete_*` in this module.
+
+**Routes** (`web/api.py`, `web/server.py`, all gated `mapper` write except
+the frame list itself, which rides along on the ordinary `GET
+/api/mapper/maps/<id>` read): `POST /api/mapper/maps/<id>/frames` (`x`,
+`y`, `width`, `height` required; `label`/`color` optional, `add_frame`'s
+own `ValueError` on a bad size/label/colour surfaces unchanged as the
+route's 400), `PUT .../frames/<fid>` (any of the six fields;
+`_FRAME_UPDATE_FIELDS` names them, an empty body is a 400 rather than a
+silent no-op) and `DELETE .../frames/<fid>`. `get_mapper_map` (the
+existing per-map GET) now also returns `frames`, one dict per row with
+every column, built the same list-comprehension-over-`mapper_db.frames()`
+shape the route already used for nodes and links. A label or colour PUT
+is audited (`mapper.frame.update`); a position-only PUT is not, the same
+split `put_mapper_map_nodes` already draws between a node's position (not
+audited — every drag would otherwise flood the audit log) and its name (an
+accountability-worthy edit an operator made on purpose).
+
+**Rendering and layering (`mapper.js`).** `draw()`'s scene group now
+appends `gridLayer, frameLayer, linkLayer, nodeLayer, labelLayer` in that
+order — `frameLayer` sits directly above the grid and below everything
+else, so a frame reads as a backdrop an operator draws to group boxes
+visually and never sits over a link or a node it encloses. Each frame is
+one `<g class="mp-frame mp-frame-cN">` of four children in a fixed order —
+fill, stroke, label, resize handle — with `updateFrameElement` the one
+function that repositions all four from a frame's live rect, shared by
+the initial draw and every drag/resize redraw so the geometry is written
+in exactly one place (`liveFrameRect`, the `livePos`-equivalent for a
+frame, resolves from an in-flight `view.frameDrag`, a still-unflushed
+`view.pendingFramePatches` entry, or the row itself, in that order). The
+fill carries `pointer-events: none` and the stroke `pointer-events:
+stroke` — the fill (and so the frame's whole interior) is transparent to
+the pointer, so a rubber-band selection or a pan started with the pointer
+resting over the inside of a frame still reaches the canvas underneath it
+unchanged, and only the dashed outline itself, the label or the handle
+starts a frame gesture. The six `.mp-frame-c0`..`.mp-frame-c5` classes
+(`app.css`) each set one `--mp-frame-color` custom property to
+`--canvas-vlan-1`..`-6` — the same six canvas-tuned hues a VLAN strand
+already draws with — so a frame reads correctly in every theme with no
+palette of its own to keep in step.
+
+**Drawing a frame reuses the rubber-band gesture wholesale.** Clicking
+**Frame** arms `view.framing`; the next pointerdown on empty canvas sets
+`view.rubber = { x0, y0, x1, y1, drawFrame: true }` instead of an ordinary
+multi-select rubber band, so `onSvgPointerMove` and `drawRubber` need no
+changes at all — only `onSvgPointerUp` branches on the `drawFrame` flag,
+before the ordinary rubber-band/multi-select handling runs, to POST the
+finished rectangle (via `createFrame`) instead of computing a selection,
+and only when it clears `FRAME_MIN_SIZE` both ways; anything smaller is
+dropped rather than sent. `disarmFraming()` is the one function that
+un-arms the tool — the toolbar button's pressed state and the canvas's
+crosshair cursor — called after a finished drag (including a too-small
+one), on Escape (`wireFrameEscape`, gated to the Mapper tab and an open
+`view.framing`), and from `drawToolbarState` itself when write access or
+the selected map disappears out from under an armed tool.
+
+**Selecting, editing and moving/resizing** follow the node/link
+selection's own shape: `onFramePointerDown` (border, label or handle)
+selects the frame and clears any node/link selection, `setSelection`/
+`selectLink` clear it back, and `renderDetail`'s frame branch runs before
+the link/node branches. The detail pane (`frameDetailHtml`) is a label
+input plus Save, six colour swatches, an Added timestamp and Remove, every
+control gated `data-requires-write="mapper"` and `disabled` rather than
+hidden, the same as a node's own rename field. Delete/Backspace on the
+canvas with a frame selected calls the same `removeFrame` the pane's own
+Remove button does, which confirms through `App.confirmDestructive`
+exactly as `removeSelected` already does for nodes. **A frame also picks
+up the same keyboard reach a device already has**: its `<g>` carries
+`tabindex="0"`, `role="button"` and an `aria-label`, and its own keydown
+handler routes Enter/Space to the same `selectFrame` helper
+`onFramePointerDown` now shares, and Delete/Backspace to `removeFrame`.
+A move or resize queues its own debounced write — `queueFrameWrite`/
+`flushFrameWrite`, one `setTimeout` per frame id in
+`view.frameWriteTimers`/`frameWriteRetryTimers` rather than one shared
+timer for every node, because a frame write is its own `PUT` (there is no
+batched `updates` route for frames the way there is for node positions),
+so two frames dragged one after another must not have the second cancel
+the first's still-pending save. It debounces on the same
+`WRITE_DEBOUNCE_MS` and retries on the same `WRITE_RETRY_MS` (with a
+toast on failure) that `flushPositionWrites` already uses for a node
+drag — one set of timing constants, not a second one to keep in step.
+
+**`contentBounds()` (Fit, and the PNG export's own framing) now folds
+every frame's live rect into the same min/max it already computed for
+nodes**, through `liveFrameRect`, and returns a bounds object for an
+all-frames, no-devices map rather than reading it as empty. The CSV
+export is untouched — it lists links, not drawing decoration, so a frame
+is deliberately absent from it.
+
+`tests/test_frontend_contracts.py` §88 (with sub-checks 88a-88f) pins the
+three routes, the fill/stroke pointer-events split, the fixed
+fill/stroke/label/handle child order, the six `--canvas-vlan-N` swatch
+classes, the rubber-band reuse and its `FRAME_MIN` floor, `disarmFraming`,
+the selection/detail-pane wiring, the per-frame debounce/retry, and
+`contentBounds`' frame folding — the same one-line-grep-per-invariant
+idiom every other MAPPER contract section in this file already uses.
+`tests/ui/walk.mjs` exercises all three 5.31.0 items end to end: a Find
+that selects a device by name, Add device's select-all ticking every
+listed row, and a frame drawn, renamed and removed in one pass.
+
 ---
 
 ## Alerts

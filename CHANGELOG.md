@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.31.0 — Mapper: find a device, select-all in the picker dialogs, and frames](#5310--mapper-find-a-device-select-all-in-the-picker-dialogs-and-frames)
 - [5.30.0 — Device links reveal the row, named interfaces and a default gateway on Addresses, tagged digests](#5300--device-links-reveal-the-row-named-interfaces-and-a-default-gateway-on-addresses-tagged-digests)
 - [5.29.0 — Discovery addresses removed: interfaces and ARP only](#5290--discovery-addresses-removed-interfaces-and-arp-only)
 - [5.28.0 — Discovery duplicates: an override, and folded rows no longer hidden](#5280--discovery-duplicates-an-override-and-folded-rows-no-longer-hidden)
@@ -163,6 +164,65 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.31.0 — Mapper: find a device, select-all in the picker dialogs, and frames
+
+5.30.0 left the Mapper work (search, select-all, frames) and Cisco Stack
+Power open, deferred by risk and independence from a longer operator
+request; `PROMPT-LOG.md` carries the full ask. This entry ships all three
+Mapper items together. Cisco Stack Power remains open as 5.32.0.
+
+**A Find box on the Mapper action bar, right after the Map select.** Type a
+device's name, its on-map label or its IP and press Enter: the canvas
+centres on the first match, zooms to no less than 1x so the box is never
+left too small to read, and selects it — the detail pane follows, and the
+matching text autocompletes as you type from a datalist built off the same
+map. Pressing Enter again with the same text cycles to the next match, so a
+name shared by several devices (a stack, a cluster of similar switches) is
+reachable without retyping. No match at all reports through a toast rather
+than doing nothing. Find only selects what is already on the map; it has no
+write of its own and stays enabled with read-only Mapper access.
+
+**Select-all in Add device and Add neighbours.** Both dialogs' tables now
+carry a header checkbox that ticks (or clears) every row currently listed
+— which, with a search term typed into Add device's own filter box, means
+every row the filter left showing, not the full candidate list behind it.
+Add then adds exactly the ticked set. Previously each row had to be ticked
+one at a time, which got tedious the moment a floor's worth of unmanaged
+peers needed placing in one pass.
+
+**Frames: labelled rectangles for grouping devices visually, saved with
+the map.** Click **Frame**, then drag on empty canvas (at least 40×40) to
+draw one. A frame is selected by its dashed border, its label or its
+bottom-right resize handle; dragging the border moves it, the handle
+resizes it, and the detail pane offers a 60-character label, six colours
+(the same six the map's VLAN strands already draw with) and **Remove**.
+Delete/Backspace on the canvas removes a selected frame the same way it
+removes a selected node. A frame is decoration only — moving or resizing
+one never moves a device, by the operator's own instruction — and the
+inside of a frame passes clicks straight through to whatever is under it,
+so a rubber-band selection or a pan started over a frame's interior still
+works exactly as it did before frames existed. Frames draw under every
+link and node, so nothing they enclose is ever obscured; they are included
+in **Fit** and the PNG export, and left out of the CSV export, which lists
+links, not drawing decoration. Position edits (a drag or a resize) save
+debounced and retry on failure the same way a node move already does;
+renaming or recolouring a frame is audited, moving one is not — the same
+split already drawn between a node's position and its name. A frame is
+also reachable by keyboard: Tab lands on it, Enter or Space selects it, and
+Delete removes it, matching the reach devices already have.
+
+Files: `mapperdb.py`, `web/api.py`, `web/server.py`, `web/static/app.css`,
+`web/static/index.html`, `web/static/mapper.js`.
+
+Verification: `tests/test_mapper_db.py` and `tests/test_mapper_api.py`
+gained full coverage of the new `map_frames` table and its three routes,
+including the size/label/colour validation and the read-only-account
+checks; `tests/test_frontend_contracts.py` gained three new sections (Find,
+select-all, frames) pinning the exact JS this entry describes;
+`tests/ui/walk.mjs` gained three checks — Find selects a device by name,
+Add device's select-all ticks every listed row, and the Frame tool draws,
+renames and removes a frame end to end.
 
 ### 5.30.0 — Device links reveal the row, named interfaces and a default gateway on Addresses, tagged digests
 
