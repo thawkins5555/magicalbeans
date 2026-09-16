@@ -29,6 +29,21 @@ Modes:
                 BUMP_TOPO control datagram increments the topology-change
                 counter, for the "the counter actually moves" test.
   no_stp        no dot1dStp scalars at all.
+  pvst          Classic PVST+: the DEFAULT context (community "public")
+                answers dot1dStpPortState port 7 forwarding, the same as
+                `stp` mode's bridge/scalar tables; `public@20` answers
+                port 7 blocking, `public@30` answers it forwarding again
+                -- the per-VLAN read nodepoll._cisco_vlan_stp needs to see
+                the redundant uplink other than in VLAN 20. vtpVlanState
+                also answers VLAN 1002 (legacy), operational but never
+                actually walked (nodepoll drops the 1002-1005 range before
+                asking) -- see the COMMUNITIES control datagram below.
+  pvst-slow     Same as `pvst`, except `public@30` is never answered at
+                all, so its column walk times out -- the "cut short, keep
+                what is stored" case.
+  pvst_no_vtp   Same bridge/scalar tables as `pvst`, no vtpVlanState table
+                at all -- the "no VTP means no per-VLAN capability" latch.
+
   airfiber      a Ubiquiti sysObjectID and the four RF_METRICS[41112]
                 scalars, numbered exactly as demo/personas.py's
                 ubiquiti_airfiber persona answers them.
@@ -67,6 +82,10 @@ stub_agent_fdb.py, which established this convention):
                  second walk sees the entry gone — for the "the entry aged
                  out of the cache" history test. stub_agent_fdb.py's
                  HIDE <mac>, keyed by address instead.
+  COMMUNITIES -> comma-joined community strings seen since the last RESET,
+                 so a test can prove which `@vlan` contexts were actually
+                 asked for (pvst modes only -- every other mode answers on
+                 the plain community alone).
 """
 import os
 import socket
@@ -204,6 +223,36 @@ STP_PORT_STATE = {
 }
 TOPO_CHANGES = 5   # mutated by BUMP_TOPO
 
+# ----------------------------------------------------------------- PVST
+# Classic PVST+: dot1dStpPortState only tells the truth inside each VLAN's
+# own community context (nodepoll._cisco_vlan_stp), the STP counterpart of
+# stub_agent_fdb.py's "cisco" mode for the MAC table. Port 7 (-> ifIndex 2
+# via BRIDGE_PORTS above) forwards in the DEFAULT context and in VLAN 30,
+# but blocks in VLAN 20 -- the redundant uplink the global-only read
+# misses entirely. Port 5 (-> ifIndex 1) is the opposite proof: the
+# DEFAULT context calls it blocking, but every VLAN that answers it says
+# forwarding, so the per-VLAN merge must win over a stale global reading.
+PVST_PORT_STATE = {
+    "1.3.6.1.2.1.17.2.15.1.3.5": ("int", 2),      # DEFAULT context: blocking
+    "1.3.6.1.2.1.17.2.15.1.3.7": ("int", 5),      # DEFAULT context: forwarding
+}
+PVST_VTP = {
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.2.1.20": ("int", 1),
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.2.1.30": ("int", 1),
+    "1.3.6.1.4.1.9.9.46.1.3.1.1.2.1.1002": ("int", 1),   # legacy -- never walked
+}
+PVST_PER_VLAN = {
+    "20": {"1.3.6.1.2.1.17.2.15.1.3.5": ("int", 5),      # port 5: forwarding
+          "1.3.6.1.2.1.17.2.15.1.3.7": ("int", 2)},      # port 7: blocking
+    "30": {"1.3.6.1.2.1.17.2.15.1.3.5": ("int", 5),      # port 5: forwarding
+          "1.3.6.1.2.1.17.2.15.1.3.7": ("int", 5)},      # port 7: forwarding
+    # Would flip both ports' verdicts if the 1002-1005 drop ever failed and
+    # this got asked.
+    "1002": {"1.3.6.1.2.1.17.2.15.1.3.5": ("int", 2),
+            "1.3.6.1.2.1.17.2.15.1.3.7": ("int", 2)},
+}
+SEEN_COMMUNITIES = set()   # communities seen since the last RESET (pvst modes)
+
 # --------------------------------------------------------------- PtP RF
 AIRFIBER_TABLE = {
     "1.3.6.1.4.1.41112.1.3.2.1.1.0": ("int", -58),
@@ -325,7 +374,28 @@ def _without_hidden(table):
 MODE = "lldp"
 
 
-def table_for():
+def read_community(data: bytes) -> str:
+    """Pulls the community straight off the wire -- stub_agent_fdb.py's own
+    read_community, needed here for the same reason: pvst mode's VLAN
+    lives in the community, and decode_response skips it."""
+    def length_at(i):
+        first = data[i]
+        if first < 0x80:
+            return first, i + 1
+        n = first & 0x7F
+        return int.from_bytes(data[i + 1:i + 1 + n], "big"), i + 1 + n
+
+    i = 1                       # past the outer SEQUENCE tag
+    _outer, i = length_at(i)
+    assert data[i] == 0x02      # version INTEGER
+    vlen, i = length_at(i + 1)
+    i += vlen
+    assert data[i] == 0x04      # community OCTET STRING
+    clen, i = length_at(i + 1)
+    return data[i:i + clen].decode("utf-8", "replace")
+
+
+def table_for(community="public"):
     if MODE == "arp":
         return {**GENERIC_SCALARS, **_without_hidden(ARP_MEDIA_TABLE)}
     if MODE == "arp_physical":
@@ -360,6 +430,15 @@ def table_for():
         return table
     if MODE == "no_stp":
         return {**GENERIC_SCALARS, **BRIDGE_PORTS}
+    if MODE in ("pvst", "pvst-slow"):
+        table = {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_PORT_STATE,
+                 **PVST_VTP}
+        if "@" in community:
+            vlan = community.split("@", 1)[1]
+            table.update(PVST_PER_VLAN.get(vlan, {}))
+        return table
+    if MODE == "pvst_no_vtp":
+        return {**GENERIC_SCALARS, **BRIDGE_PORTS, **STP_SCALARS, **PVST_PORT_STATE}
     if MODE == "airfiber":
         return {**GENERIC_SCALARS, **AIRFIBER_TABLE,
                 "1.3.6.1.2.1.1.2.0": ("str", "1.3.6.1.4.1.41112.1.3")}
@@ -381,10 +460,10 @@ def encode_value(kind, value):
     return enc_int(value)
 
 
-def reply(request_id, body):
+def reply(request_id, body, community="public"):
     pdu = _tlv(PDU_RESPONSE, enc_int(request_id) + enc_int(0) + enc_int(0) +
               _tlv(T_SEQUENCE, body))
-    return _tlv(T_SEQUENCE, enc_int(V2C) + enc_octets("public") + pdu)
+    return _tlv(T_SEQUENCE, enc_int(V2C) + enc_octets(community) + pdu)
 
 
 def main():
@@ -402,7 +481,11 @@ def main():
             continue
         if data == b"RESET":
             count = 0
+            SEEN_COMMUNITIES.clear()
             sock.sendto(b"0", addr)
+            continue
+        if data == b"COMMUNITIES":
+            sock.sendto(",".join(sorted(SEEN_COMMUNITIES)).encode(), addr)
             continue
         if data == b"BUMP_TOPO":
             TOPO_CHANGES += 1
@@ -420,8 +503,15 @@ def main():
             continue
         if not request.varbinds:
             continue
+        try:
+            community = read_community(data)
+        except Exception:
+            community = "public"
+        SEEN_COMMUNITIES.add(community)
+        if MODE == "pvst-slow" and community == "public@30":
+            continue                # the agent stalling on this one VLAN
         count += 1
-        table = table_for()
+        table = table_for(community)
         keys = sorted(table, key=oid_key)
         oids = [vb["oid"] for vb in request.varbinds]
         if request.pdu_tag == PDU_GET:
@@ -449,7 +539,7 @@ def main():
                 cursor = nxt
         else:
             continue
-        sock.sendto(reply(request.request_id, body), addr)
+        sock.sendto(reply(request.request_id, body, community), addr)
 
 
 if __name__ == "__main__":

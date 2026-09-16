@@ -1758,6 +1758,9 @@ class NodePoller(Worker):
         # entPhysicalClass answered, probe-once-remember like _mau_read.
         self._cage_read: dict[int, float] = {}
         self._cage_capable: dict[int, bool] = {}
+        # device_id -> when the per-VLAN STP pass was last tried. See
+        # _cisco_vlan_stp/devices.stp_vlan_capable.
+        self._stp_vlan_read: dict[int, float] = {}
         # device_id -> when a sensor-diagnostic event was last written for
         # it. See _log_sensor_diag.
         self._sensor_diag_ts: dict[int, float] = {}
@@ -2775,6 +2778,7 @@ class NodePoller(Worker):
                       self._vendor_sensor_read, self._vendor_sensor_threshold_read,
                       self._mau_read, self._mau_capable,
                       self._cage_read, self._cage_capable,
+                      self._stp_vlan_read,
                       self._stack_power_read, self._stack_power_capable,
                       self._sensor_diag_ts, self._snmp_backoff,
                       self._snmp_failing_count, self._get_batch,
@@ -7614,6 +7618,72 @@ class NodePoller(Worker):
                 fdb_port, set(mapping), vlan, False, mapping))
         return entries, answered
 
+    def _cisco_vlan_stp(self, device, config: dict, port_map: dict):
+        """dot1dStpPortState read inside each VLAN's own `community@vlan`
+        context — same path as _cisco_vlan_device_fdb, because classic
+        PVST+'s real per-port state lives in each VLAN's own STP instance,
+        not the device's default (VLAN 1) context the estate prunes off
+        every trunk.
+
+        Returns ({if_index: {"blocking": [vlan, ...], "vlans": count}},
+        answered, complete); complete is False on a cut-short pass (sliced
+        VLAN list, an unfinished column walk, or the budget running out),
+        telling the caller to keep the stored detail rather than write a
+        partial view.
+        """
+        if snmp_version_of(config) == 3:
+            return {}, False, True
+        community = config.get("community")
+        if not community:
+            return {}, False, True
+        vlan_states = self._walk_column(device, config, self._VTP_VLAN_STATE)
+        vlans = []
+        for suffix, state in vlan_states.items():
+            try:
+                if int(state) != 1:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            vlan = suffix.split(".")[-1]
+            if vlan.isdigit() and not (1002 <= int(vlan) <= 1005):
+                vlans.append(vlan)
+        if not vlans:
+            return {}, False, True
+        ordered = sorted(vlans, key=int)
+        sliced = ordered[:self._MAX_VLAN_CONTEXTS]
+        complete = len(sliced) == len(ordered)
+        deadline = time.time() + self._VLAN_WALK_BUDGET_S
+        rows: dict[int, dict] = {}
+        answered = False
+        for vlan in sliced:
+            if time.time() > deadline:
+                complete = False
+                break
+            scoped = {**config, "community": f"{community}@{vlan}"}
+            mapping = port_map
+            if not mapping:
+                mapping = self._bridge_port_map(device, scoped, deadline=deadline)
+                if not mapping:
+                    continue
+            state, done = self._walk_column_status(
+                device, scoped, nodeoids.DOT1D_STP_PORT_STATE, deadline=deadline)
+            if state:
+                answered = True
+            complete = complete and done
+            for suffix, value in state.items():
+                try:
+                    bridge_port = int(suffix)
+                except ValueError:
+                    continue
+                if_index = mapping.get(bridge_port)
+                if if_index is None or not isinstance(value, (int, float)):
+                    continue
+                entry = rows.setdefault(if_index, {"blocking": [], "vlans": 0})
+                entry["vlans"] += 1
+                if int(value) == 2:                      # blocking
+                    entry["blocking"].append(vlan)
+        return rows, answered, complete
+
     # ------------------------------------------------------------- PoE / STP
 
     @staticmethod
@@ -7804,6 +7874,36 @@ class NodePoller(Worker):
             state = nodeoids.DOT1D_STP_PORT_STATE_ENUM.get(int(value))
             if state is not None:
                 rows[if_index] = {"stp_state": state}
+
+        # Per-VLAN pass (see _cisco_vlan_stp). Probed once like stp_capable,
+        # but a miss is re-tried hourly rather than latched forever.
+        if detected_vendor(device).lower() == "cisco" and snmp_version_of(config) != 3:
+            vlan_capable = device["stp_vlan_capable"]
+            now = time.time()
+            due = now - self._stp_vlan_read.get(device_id, 0.0) >= self._SENSOR_REPROBE_S
+            if vlan_capable != 0 or due:
+                self._stp_vlan_read[device_id] = now
+                vlan_rows, vlan_answered, vlan_complete = self._cisco_vlan_stp(
+                    device, config, port_map)
+                if vlan_answered:
+                    if not vlan_capable:
+                        self.db.set_stp_vlan_capable(device_id, True)
+                elif vlan_capable is None:
+                    self.db.set_stp_vlan_capable(device_id, False)
+                if vlan_answered and vlan_complete:
+                    for if_index, detail in vlan_rows.items():
+                        blocking = detail["blocking"]
+                        row = rows.setdefault(if_index, {})
+                        row["stp_state"] = "blocking" if blocking else "forwarding"
+                        row["stp_blocking_vlans"] = ",".join(sorted(blocking, key=int))
+                        row["stp_vlan_count"] = detail["vlans"]
+                elif vlan_answered and not vlan_complete:
+                    # SFP badge scan's own cut-short rule: keep what is stored.
+                    self._log_media_diag(
+                        device, f"Per-VLAN STP scan on {device['ip']}: cut "
+                                f"short, stored per-VLAN detail kept",
+                        "stp_vlan_cut_short")
+
         if rows:
             self.db.update_interface_stp(
                 device_id, [{"if_index": i, **fields} for i, fields in rows.items()])

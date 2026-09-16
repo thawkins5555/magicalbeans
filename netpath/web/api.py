@@ -6459,6 +6459,8 @@ def get_nodes_device_interfaces(service, params, body, device_id) -> dict:
          "poe_detect_status": (r["poe_detect_status"] if "poe_detect_status" in keys else None),
          "poe_power_mw": (r["poe_power_mw"] if "poe_power_mw" in keys else None),
          "stp_state": (r["stp_state"] if "stp_state" in keys else None),
+         "stp_blocking_vlans": (r["stp_blocking_vlans"] if "stp_blocking_vlans" in keys else None),
+         "stp_vlan_count": (r["stp_vlan_count"] if "stp_vlan_count" in keys else None),
          "media": (r["media"] if "media" in keys else None),
          "optic_mode": (r["optic_mode"] if "optic_mode" in keys else None),
          "priority": r["if_index"] in priority}
@@ -6488,7 +6490,8 @@ def get_nodes_device_interfaces_export(service, params, body, device_id) -> dict
              "admin_status", "oper_status", "in_bps", "out_bps",
              "in_error_rate", "out_error_rate", "last_in_errors", "last_out_errors",
              "last_seen_ts", "poe_admin", "poe_detect_status", "poe_power_mw",
-             "stp_state", "media", "optic_mode", "Priority"]
+             "stp_state", "stp_blocking_vlans", "stp_vlan_count",
+             "media", "optic_mode", "Priority"]
     csv_rows = [[i.get(key) for key in header[:-1]] +
                 ["yes" if i.get("priority") else "no"] for i in interfaces]
     return _csv_response("interfaces", header, csv_rows)
@@ -10322,6 +10325,8 @@ def get_mapper_map(service, params, body, map_id) -> dict:
         b_stp = b_facts["stp_state"] if b_facts else None
         link["a_stp"] = a_stp
         link["b_stp"] = b_stp
+        link["a_stp_vlans"] = a_facts["stp_blocking_vlans"] if a_facts else None
+        link["b_stp_vlans"] = b_facts["stp_blocking_vlans"] if b_facts else None
         link["blocking"] = a_stp == "blocking" or b_stp == "blocking"
         link["plan"] = mapper.render_plan(
             link, threshold=threshold, max_strands=max_strands,
@@ -10406,7 +10411,8 @@ def get_mapper_map(service, params, body, map_id) -> dict:
             "b_port_mode": None, "b_native_vlan": None,
             "a_media": None, "b_media": None, "fiber": False,
             "a_optic_mode": None, "b_optic_mode": None, "fiber_mode": None,
-            "a_stp": None, "b_stp": None, "blocking": False,
+            "a_stp": None, "b_stp": None, "a_stp_vlans": None, "b_stp_vlans": None,
+            "blocking": False,
             "label": row["label"], "protocols": ["manual"], "vlans": [],
             "native_vlan": None,
             "unmanaged": a_node["device_id"] is None or b_node["device_id"] is None,

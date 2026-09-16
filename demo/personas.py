@@ -1181,6 +1181,15 @@ def _access_trunk_vlans(name: str) -> tuple[int, ...]:
     return _ACCESS_TRUNK_VLANS.get(name, _DEFAULT_TRUNK_VLANS)
 
 
+# CiscoVlanPersona.vlan_list for cisco_access (5.37.0): the whole plant VLAN
+# set any access switch's trunk might carry, so nodepoll's per-VLAN STP pass
+# (community@vlan) finds a context to answer for every device, not just the
+# ones named in _ACCESS_TRUNK_VLANS.
+_ACCESS_VLAN_LIST = tuple(str(v) for v in sorted(
+    {v for vlans in _ACCESS_TRUNK_VLANS.values() for v in vlans}
+    | set(_DEFAULT_TRUNK_VLANS)))
+
+
 # FiberView demo fixture (5.36.0): acc-sw-001 and acc-sw-003 plug a
 # multimode optic into both 10G uplinks, everyone else single-mode --
 # matched against _build_cisco_core's own per-instance downlink text
@@ -1202,6 +1211,28 @@ def _access_second_uplink_port(name: str) -> int:
     return _ACCESS_SECOND_UPLINK_PORT.get(name, 20)
 
 
+def _access_uplink2_vlan_state(vlan_ctx: str):
+    """dot1dStpPortState for the second uplink, inside the per-VLAN
+    community context built for `vlan_ctx` -- blocking in every context
+    for most instances; acc-sw-004 blocks only in VLAN 30 (its own
+    DEFAULT-context reply for this port is forced to forwarding, below, so
+    its Mapper dotted line can only come from the per-VLAN read). A
+    lambda on `st.name` because every cisco_access instance shares one
+    memoised Table per vlan_ctx (Persona.table()) -- see _uplink_optic_text."""
+    def state(st, now):
+        if st.name == "acc-sw-004":
+            return 2 if vlan_ctx == "30" else 5
+        return 2
+    return state
+
+
+def _access_uplink2_default_state(st, now) -> int:
+    """The second uplink's DEFAULT-context (VLAN 1) dot1dStpPortState --
+    blocking, except acc-sw-004, which is forwarding here so its dotted
+    Mapper line can only come from the per-VLAN read above."""
+    return 5 if st.name == "acc-sw-004" else 2
+
+
 def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     access = 48
     names, kinds, rates = _gig_ports(access, 2)
@@ -1221,6 +1252,15 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     # numbering).
     port_to_if[100 + access + 1] = access + 1
     port_to_if[100 + access + 2] = access + 2
+    if vlan is not None:
+        # Classic IOS: dot1dStpPortState only exists inside a per-VLAN
+        # community context (nodepoll._cisco_vlan_stp) -- only the second
+        # uplink's blocking state matters to that pass, so nothing else
+        # this persona answers in its DEFAULT context is repeated here.
+        return {
+            **bridge_ports(port_to_if),
+            **dot1d_stp_ports({100 + access + 2: _access_uplink2_vlan_state(vlan)}),
+        }
     entries.update(bridge_ports(port_to_if))
     entries.update(qbridge_fdb(port_macs, vlan=10))
     # Per-port VLAN membership (Q-BRIDGE-MIB standards path): a real
@@ -1335,6 +1375,11 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     # trunked into it, whether or not this switch's own uplink currently
     # carries every entry — see PLANT_VLAN_NAMES' own comment.
     entries.update(vtp_vlan_names(PLANT_VLAN_NAMES))
+    # vtpVlanState (5.37.0): the VLAN list nodepoll's per-VLAN MAC/STP walk
+    # reads before it tries each community@vlan context -- the whole plant
+    # set, the same VTP-domain-wide answer as vtpVlanName above, not just
+    # this instance's own trunk allow-list.
+    entries.update(vtp_vlans(_ACCESS_VLAN_LIST))
     # PoE: every access port capable, roughly a third actually drawing
     # power right now — a real closet switch with more PoE ports than
     # currently-plugged-in phones/APs.
@@ -1347,7 +1392,7 @@ def _build_cisco_access(wrap32: bool, ports: int, vlan: str | None) -> dict:
     # The second uplink (access + 2) is the redundant/blocked one -- every
     # other port forwards.
     entries.update(dot1d_stp_ports({
-        port: (2 if port == if_to_port[access + 2] else 5)
+        port: (_access_uplink2_default_state if port == if_to_port[access + 2] else 5)
         for port in port_to_if}))
     # CISCO-STACKWISE-MIB (5.32.0): 3-member ring, redundant mode, 30 A cables;
     # entPhysicalIndex 1001/2001/3001 sit outside this persona's ~50-port range.
@@ -1424,6 +1469,10 @@ def _build_cisco_core(wrap32: bool, ports: int, vlan: str | None) -> dict:
         slice_macs = {port: macs[(int(vlan) // 10) % len(macs):][:2]
                       for port, macs in port_macs.items()}
         entries.update(dot1d_fdb(slice_macs))
+        # bridge_ports is already unconditional above; dot1dStpPortState
+        # (5.37.0) all-forwarding here so the core's own per-VLAN STP pass
+        # finds rows too -- the core is never the blocked end of a link.
+        entries.update(dot1d_stp_ports({port: 5 for port in port_to_if}))
     # L2 topology: only the DEFAULT-sized core (core-sw-01, access == 88 —
     # Persona.table() always resolves `ports` to a real int, never None:
     # it falls back to the persona's own declared 96 when no override is
@@ -2265,8 +2314,8 @@ def _build_windows_endpoint(wrap32: bool, ports: int, vlan: str | None) -> dict:
 
 
 PERSONAS: dict[str, Persona] = {
-    "cisco_access": Persona("cisco_access", _build_cisco_access, 50,
-                            "Cisco 2960X access switch"),
+    "cisco_access": CiscoVlanPersona("cisco_access", _build_cisco_access, 50,
+                                     "Cisco 2960X access switch", _ACCESS_VLAN_LIST),
     "cisco_core": CiscoVlanPersona("cisco_core", _build_cisco_core, 96,
                                    "Cisco 9500 core switch",
                                    tuple(str(v) for v in CORE_VLANS)),

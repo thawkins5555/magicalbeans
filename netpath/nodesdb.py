@@ -1286,6 +1286,11 @@ class NodesDatabase(SqliteStore):
             # deliberately absent from _OVERRIDE_COLUMNS.
             "poe_capable": "INTEGER",
             "stp_capable": "INTEGER",
+            # The per-VLAN STP probe's own latch (nodepoll._cisco_vlan_stp):
+            # unlike stp_capable, a 0 here is re-tried hourly rather than
+            # forever, since a VTP domain can grow a VLAN after the first
+            # miss — see nodepoll._SENSOR_REPROBE_S/self._stp_vlan_read.
+            "stp_vlan_capable": "INTEGER",
             "ups_capable": "INTEGER",
             "sensor_capable": "INTEGER",
             # _poll_vendor_sensors' own probe-once-remember latch, alongside
@@ -1346,6 +1351,16 @@ class NodesDatabase(SqliteStore):
             "poe_admin": "TEXT", "poe_detect_status": "TEXT",
             "stp_state": "TEXT", "poe_power_mw": "INTEGER",
             "media": "TEXT", "optic_mode": "TEXT",
+        })
+        # Per-VLAN STP detail (5.37.0): the VLAN ids (ascending, comma-
+        # joined) a port is blocking in and how many VLAN contexts answered
+        # it at all. "" means blocked nowhere; NULL means no per-VLAN read
+        # has ever completed for this port (classic IOS's default STP
+        # context is VLAN 1, which this estate prunes off every trunk, so
+        # stp_state alone can miss a blocked redundant uplink entirely —
+        # see nodepoll._cisco_vlan_stp).
+        self.ensure_columns("interfaces", {
+            "stp_blocking_vlans": "TEXT", "stp_vlan_count": "INTEGER",
         })
 
         # The device's own default-route next hop(s) — see
@@ -2268,8 +2283,9 @@ class NodesDatabase(SqliteStore):
         return self.interface_port_labels_for_devices([device_id])
 
     def interface_link_facts_for_devices(self, device_ids) -> dict[tuple[int, int], dict]:
-        """(device_id, if_index) -> {"media", "optic_mode", "stp_state"} for
-        every interface of the named devices with any of the three non-NULL."""
+        """(device_id, if_index) -> {"media", "optic_mode", "stp_state",
+        "stp_blocking_vlans"} for every interface of the named devices with
+        any of media/optic_mode/stp_state non-NULL."""
         ids = list(dict.fromkeys(int(d) for d in device_ids))
         if not ids:
             return {}
@@ -2278,7 +2294,8 @@ class NodesDatabase(SqliteStore):
             for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
                 marks = ",".join("?" * len(chunk))
                 for row in self._conn.execute(
-                        "SELECT device_id, if_index, media, optic_mode, stp_state"
+                        "SELECT device_id, if_index, media, optic_mode,"
+                        " stp_state, stp_blocking_vlans"
                         " FROM interfaces WHERE device_id IN ({})"
                         " AND (media IS NOT NULL OR optic_mode IS NOT NULL"
                         " OR stp_state IS NOT NULL)".format(marks),
@@ -2286,6 +2303,7 @@ class NodesDatabase(SqliteStore):
                     facts[(row["device_id"], row["if_index"])] = {
                         "media": row["media"], "optic_mode": row["optic_mode"],
                         "stp_state": row["stp_state"],
+                        "stp_blocking_vlans": row["stp_blocking_vlans"],
                     }
         return facts
 
@@ -4326,6 +4344,17 @@ class NodesDatabase(SqliteStore):
                 (None if capable is None else (1 if capable else 0), device_id))
             self._conn.commit()
 
+    def set_stp_vlan_capable(self, device_id: int, capable: bool | None) -> None:
+        """set_stp_capable's own counterpart for the per-VLAN STP pass
+        (nodepoll._cisco_vlan_stp) — a separate latch because a classic
+        IOS device can answer dot1dStp globally but not per-VLAN, or vice
+        versa on a v1-only box."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE devices SET stp_vlan_capable = ? WHERE id = ?",
+                (None if capable is None else (1 if capable else 0), device_id))
+            self._conn.commit()
+
     def set_default_gateway(self, device_id: int, text: str) -> None:
         """The comma-joined next hop(s) _refresh_default_gateway read, or ""
         for an answered read with no default route; NULL means never read
@@ -4561,15 +4590,24 @@ class NodesDatabase(SqliteStore):
         return {(row["device_id"], row["if_index"]) for row in rows}
 
     def update_interface_stp(self, device_id: int, rows: list[dict]) -> None:
-        """update_interface_poe's own counterpart for per-port STP state."""
+        """update_interface_poe's own counterpart for per-port STP state.
+
+        stp_blocking_vlans/stp_vlan_count are COALESCEd rather than
+        overwritten: a row from the global-only read (no per-VLAN pass, or
+        one cut short) carries neither key, and must leave whatever
+        per-VLAN detail is already stored alone rather than blank it.
+        """
         if not rows:
             return
-        params = [(row.get("stp_state"), device_id, row["if_index"])
+        params = [(row.get("stp_state"), row.get("stp_blocking_vlans"),
+                  row.get("stp_vlan_count"), device_id, row["if_index"])
                   for row in rows]
         with self._lock:
             try:
                 self._conn.executemany(
-                    "UPDATE interfaces SET stp_state=?"
+                    "UPDATE interfaces SET stp_state=?,"
+                    " stp_blocking_vlans=COALESCE(?, stp_blocking_vlans),"
+                    " stp_vlan_count=COALESCE(?, stp_vlan_count)"
                     " WHERE device_id=? AND if_index=?", params)
                 self._conn.commit()
             except sqlite3.DatabaseError:

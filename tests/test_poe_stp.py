@@ -161,6 +161,9 @@ try:
           ifaces[1]["stp_state"] == "forwarding", ifaces[1])
     check("bridge port 7 (-> ifIndex 2) is blocking",
           ifaces[2]["stp_state"] == "blocking", ifaces[2])
+    check("a non-Cisco device's rows carry no per-VLAN detail",
+          ifaces[1]["stp_blocking_vlans"] is None
+          and ifaces[2]["stp_blocking_vlans"] is None, ifaces)
 
     metrics = {m["key"]: m for m in db.metrics(did)}
     check("the topology-change counter is stored as a metric sample",
