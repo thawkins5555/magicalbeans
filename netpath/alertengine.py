@@ -23,7 +23,8 @@ from dataclasses import asdict
 
 from . import alertmail
 from . import namelookup
-from .alertrules import CLEARS, CLEARS_COMPANIONS, FALLBACK_OF, PREDICATES, \
+from .alertrules import BASELINE_FAMILIES, CLEARS, CLEARS_COMPANIONS, FALLBACK_OF, \
+    PREDICATES, \
     PUBLISHED_HYSTERESIS, \
     SENSOR_FAMILIES, \
     PUBLISHED_THRESHOLD_RULES, ROLLED_UP_BY, ROLLS_UP, ROLLUP_ENTITY_KINDS, \
@@ -1291,6 +1292,10 @@ class AlertEngine(Worker):
         # Loaded on first use and only when a breach has no new sample behind
         # it, so a tick with nothing breaching costs nothing extra.
         open_keys: set | None = None
+        # Sensor Snapshot baselines (nodesdb.sensor_baselines), loaded at
+        # most once per device and only for a device this pass actually
+        # judges a BASELINE_FAMILIES rule against.
+        baselines_by_device: dict[int, dict] = {}
         for device_id in device_ids:
             device = devices.get(device_id)
             if device is None:
@@ -1432,6 +1437,28 @@ class AlertEngine(Worker):
                              and now - sample_ts > stale_after)
                     if stale:
                         value, sample_ts = None, None
+                    # Sensor Snapshot: a psu_state/stack_power_port/fan_state
+                    # reading that still equals the baseline an operator
+                    # already accepted for THIS metric key never breaches --
+                    # a value that gets WORSE than the baseline still does,
+                    # the same as any key with no baseline at all. Anything
+                    # already open for this target is resolved on the way
+                    # past, the same way the no-published-limit branch above
+                    # does when a rule stops applying to a target.
+                    if metric is not None and value is not None \
+                            and rule["source_kind"] in BASELINE_FAMILIES:
+                        device_baselines = baselines_by_device.get(device_id)
+                        if device_baselines is None:
+                            device_baselines = self.nodes_db.sensor_baselines(device_id)
+                            baselines_by_device[device_id] = device_baselines
+                        if device_baselines.get(metric["key"]) == value:
+                            if open_keys is None:
+                                open_keys = self.db.open_dedup_keys()
+                            key = f"{rule['key']}:{entity_kind}:{entity_id}"
+                            if key in open_keys:
+                                if self.db.resolve_by_dedup(key, by=""):
+                                    self.counters["resolved"] += 1
+                            continue
                     # Keyed on (rule, entity id) alone -- NOT the effective
                     # threshold/clear pair -- because _child_first_breach_ts
                     # has to find this same streak given only a rule and an

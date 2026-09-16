@@ -1358,6 +1358,37 @@ PSU_TABLES = {
     ),
 }
 
+_ENT_CLASS_FAN = 7
+
+# Cisco fan state (5.33.0), arc 9 only -- the same two-table shape PSU_TABLES
+# uses for arc 9, but a real fallback rather than "poll both": the FRU
+# control table (cefcFanTrayStatusTable) is tried first, on the chassis
+# platforms that also publish PSU state through cefcFRUPowerOperStatus, and
+# the classic CISCO-ENVMON-MIB table is read only when it comes back empty
+# -- the two tables share no index space, so "poll both" would leave a
+# platform answering neither believed to answer both. Reuses PsuTable: the
+# shape (a state column, an optional class filter, a state_map) is
+# identical, and _vendor_psu_rows already normalises to 0 ok/1 warning/2
+# failed/3 not present with no PSU-specific logic in it.
+FAN_TABLES = {
+    9: (
+        PsuTable(   # CISCO-ENTITY-FRU-CONTROL-MIB cefcFanTrayOperStatus
+            state="1.3.6.1.4.1.9.9.117.1.4.1.1.1",
+            name=_ENT_PHYSICAL_NAME,
+            class_col=_ENT_PHYSICAL_CLASS, class_values=(_ENT_CLASS_FAN,),
+            # unknown(1) skipped; up(2) -> ok; down(3) -> failed; warning(4) -> warning.
+            state_map={2: 0, 3: 2, 4: 1},
+        ),
+        PsuTable(   # CISCO-ENVMON-MIB ciscoEnvMonFanState, fallback when the FRU table is empty
+            state="1.3.6.1.4.1.9.9.13.1.4.1.3",
+            name="1.3.6.1.4.1.9.9.13.1.4.1.2",
+            # normal(1) -> ok; warning(2) -> warning; critical(3)/shutdown(4)/
+            # notFunctioning(6) -> failed; notPresent(5) -> not present.
+            state_map={1: 0, 2: 1, 3: 2, 4: 2, 6: 2, 5: 3},
+        ),
+    ),
+}
+
 # ---------------------------------------------------------------------------
 # Cisco Stack Power (5.32.0) -- CISCO-STACKWISE-MIB, arc 9 only. A flat OID
 # list, not a SensorTable/PsuTable: the port/stack/switch tables below have

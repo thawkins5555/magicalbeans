@@ -251,6 +251,21 @@ CREATE TABLE IF NOT EXISTS interface_flags (
     PRIMARY KEY (device_id, if_index)
 );
 
+-- Sensor Snapshot baselines: one accepted value per (device, metric key)
+-- for the state-enum sensor families a snapshot can cover
+-- (alertrules.BASELINE_FAMILIES -- psu_state/stack_power_port/fan_state).
+-- Written wholesale by POST .../sensor-snapshot; read by the threshold
+-- evaluator (alertengine._evaluate_thresholds) to skip a breach that is
+-- still exactly the value an operator already accepted, so hardware known
+-- to be degraded does not keep re-raising the same alert forever.
+CREATE TABLE IF NOT EXISTS sensor_baselines (
+    device_id    INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    metric_key   TEXT    NOT NULL,
+    value        REAL    NOT NULL,
+    ts           REAL    NOT NULL,
+    PRIMARY KEY (device_id, metric_key)
+);
+
 -- Forwarding-database entries: which MAC addresses each switch port has
 -- learned. Stored so "find the port this MAC is on" is a query rather than
 -- a live walk of every switch in the estate — the same address can sit on
@@ -2423,6 +2438,7 @@ class NodesDatabase(SqliteStore):
         ("interfaces", "device_id = ?"),
         ("interface_thresholds", "device_id = ?"),
         ("interface_flags", "device_id = ?"),
+        ("sensor_baselines", "device_id = ?"),
         ("mac_entries", "device_id = ?"),
         ("arp_entries", "device_id = ?"),
         ("neighbors", "device_id = ?"),
@@ -3234,6 +3250,12 @@ class NodesDatabase(SqliteStore):
             return self._conn.execute(
                 "SELECT 1 FROM interfaces WHERE device_id = ? AND if_index = ?",
                 (device_id, if_index)).fetchone() is not None
+
+    def interface_row(self, device_id: int, if_index: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM interfaces WHERE device_id = ? AND if_index = ?",
+                (device_id, if_index)).fetchone()
 
     def interfaces_with_media(self, device_ids=None,
                               include_empty: bool = False) -> list[sqlite3.Row]:
@@ -4413,6 +4435,49 @@ class NodesDatabase(SqliteStore):
             except sqlite3.DatabaseError:
                 self._conn.rollback()
                 raise
+
+    def replace_sensor_baselines(self, device_id: int, rows: list[dict]) -> None:
+        """Wholesale replace of one device's Sensor Snapshot baseline --
+        every prior baseline for this device is dropped and replaced with
+        exactly the rows handed in, the same shape
+        replace_interface_thresholds uses for one (device, source)."""
+        params = [(device_id, row["metric_key"], row["value"], row["ts"])
+                 for row in rows]
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "DELETE FROM sensor_baselines WHERE device_id = ?", (device_id,))
+                if params:
+                    self._conn.executemany(
+                        "INSERT INTO sensor_baselines(device_id, metric_key,"
+                        " value, ts) VALUES (?,?,?,?)", params)
+                self._conn.commit()
+            except sqlite3.DatabaseError:
+                self._conn.rollback()
+                raise
+
+    def sensor_baselines(self, device_id: int) -> dict[str, float]:
+        """metric_key -> accepted value, for one device."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT metric_key, value FROM sensor_baselines WHERE device_id = ?",
+                (device_id,)).fetchall()
+        return {row["metric_key"]: row["value"] for row in rows}
+
+    def sensor_baseline_meta(self, device_id: int) -> dict:
+        """{"count", "ts"} for the Sensor Snapshot dialog line -- the
+        newest ts across every baselined key, or None when there is none."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT ts FROM sensor_baselines WHERE device_id = ?",
+                (device_id,)).fetchall()
+        return {"count": len(rows), "ts": max((r["ts"] for r in rows), default=None)}
+
+    def delete_sensor_baselines(self, device_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM sensor_baselines WHERE device_id = ?", (device_id,))
+            self._conn.commit()
 
     def interface_thresholds(self, device_id: int) -> dict[tuple, sqlite3.Row]:
         """(if_index, metric_root) -> the published limits row, for one

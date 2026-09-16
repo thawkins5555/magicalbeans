@@ -675,7 +675,7 @@ _RULE_EDITABLE = ("name", "severity", "enabled", "device_filter", "threshold",
                   "auto_resolve_after_s", "notify", "notify_sms")
 _RULE_CUSTOM_EDITABLE = _RULE_EDITABLE + ("kind", "source_kind")
 
-# 70 built-in rules: 10 device_event + 4 interface_event + 36 threshold +
+# 72 built-in rules: 10 device_event + 4 interface_event + 38 threshold +
 # 4 trap + 1 syslog + 1 ipam + 4 wireless_event + 1 dhcp_threshold +
 # 3 netpath_threshold + 1 netpath_event + 5 system. Each `template` name is a
 # templates.key —
@@ -858,6 +858,11 @@ _BUILTIN_RULES = [
     # stack_power_port: 0 ok/admin-disabled, 2 cable down; no "not present"
     # state (nodepoll._poll_stack_power writes nothing for a vanished row).
     ("stack_power_cable_down", "Stack Power cable down", "threshold", "stack_power_port", 2, "threshold_breach", 2.0, 2.0, 1),
+    # fan_state: same 0 ok/1 warning/2 failed/3 not present enum psu_state
+    # uses, and the same Sensor Snapshot baseline (alertrules.
+    # BASELINE_FAMILIES) can mark an already-known bay accepted.
+    ("fan_warning", "Fan degraded", "threshold", "fan_state", 4, "threshold_breach", 1.0, 1.0, 1),
+    ("fan_failed", "Fan failed or not present", "threshold", "fan_state", 2, "threshold_breach", 2.0, 2.0, 1),
     # RH above ~80% starts to risk condensation on anything metal in the
     # room — unambiguous on its own: nothing but a dedicated environmental
     # monitor answers a humidity sensor at all, so this one metric key

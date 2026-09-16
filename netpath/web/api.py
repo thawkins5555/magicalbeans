@@ -46,6 +46,7 @@ from .. import configrx
 from .. import dbreport
 from .. import configrx_compliance
 from .. import configrx_redact
+from .. import configrx_stanza
 from .. import sshterm, webrelay
 from .. import enterprises, mibcatalog, vendorid
 from .. import mapper
@@ -5503,11 +5504,13 @@ def get_nodes_device_hardware(service, params, body, device_id) -> dict:
 
 
 _SENSOR_FAMILY_KINDS = {"temp_sensor_c": "temperature", "temp_sensor_state": "temperature",
-                        "psu_state": "psu", "stack_power_port": "stack_power"}
+                        "psu_state": "psu", "stack_power_port": "stack_power",
+                        "fan_state": "fan"}
 _PSU_STATE_WORDS = {0: "ok", 1: "degraded", 2: "failed / no input",
                     3: "not present (removed or no input)"}
 _TEMP_STATE_WORDS = {0: "normal", 1: "warning", 2: "critical", 3: "shutdown"}
 _STACK_POWER_STATE_WORDS = {0: "ok", 2: "cable down"}
+_FAN_STATE_WORDS = {0: "ok", 1: "degraded", 2: "failed", 3: "not present"}
 
 
 def get_nodes_device_sensors(service, params, body, device_id) -> dict:
@@ -5538,6 +5541,7 @@ def get_nodes_device_sensors(service, params, body, device_id) -> dict:
         else:
             words = (_PSU_STATE_WORDS if root == "psu_state" else
                      _STACK_POWER_STATE_WORDS if root == "stack_power_port" else
+                     _FAN_STATE_WORDS if root == "fan_state" else
                      _TEMP_STATE_WORDS)
             entry["state"] = None if value is None else int(value)
             entry["state_text"] = words.get(entry["state"], str(value) if value is not None else "")
@@ -5547,6 +5551,49 @@ def get_nodes_device_sensors(service, params, body, device_id) -> dict:
                                                              or e["high_alarm"] is not None
                                                              or e["state"] is not None)
                            for e in sensors)}
+
+
+# metric root -> the rules a Sensor Snapshot baseline on that root can
+# resolve (alertrules.BASELINE_FAMILIES/ROLLED_UP_BY): the two severities a
+# psu_state/fan_state reading can open, or stack_power_port's one rule.
+_BASELINE_RULE_KEYS = {
+    "psu_state": ("psu_warning", "psu_failed"),
+    "stack_power_port": ("stack_power_cable_down",),
+    "fan_state": ("fan_warning", "fan_failed"),
+}
+
+
+def post_nodes_device_sensor_snapshot(service, params, body, device_id) -> dict:
+    """Marks every current psu_state/stack_power_port/fan_state reading as
+    the accepted baseline for this device (nodesdb.sensor_baselines) and
+    resolves whatever is currently open on those rules for it -- by
+    construction the value that just became the baseline IS each such
+    alert's current reading, so every one of them is a match. See
+    alertengine._evaluate_thresholds for the other half: a later reading
+    that still equals the baseline never re-opens the rule; one that gets
+    worse still does.
+    """
+    device_id = int(device_id)
+    _require(service.nodes_db.device(device_id), "device")
+    now = time.time()
+    rows = [{"metric_key": row["key"], "value": row["last_value"], "ts": now}
+           for row in service.nodes_db.metrics(device_id)
+           if row["last_value"] is not None
+           and str(row["key"]).partition(".")[0] in _BASELINE_RULE_KEYS]
+    service.nodes_db.replace_sensor_baselines(device_id, rows)
+    for row in rows:
+        root, _, suffix = row["metric_key"].partition(".")
+        for rule_key in _BASELINE_RULE_KEYS[root]:
+            resolved = service.alerts_db.resolve_by_dedup(
+                f"{rule_key}:sensor:{device_id}:{suffix}", by="")
+            if resolved is not None:
+                service.alerts_db.add_rollup_note(resolved["id"], "Sensor snapshot")
+    return {"count": len(rows), "ts": now}
+
+
+def get_nodes_device_sensor_snapshot(service, params, body, device_id) -> dict:
+    _require(service.nodes_db.device(device_id), "device")
+    return service.nodes_db.sensor_baseline_meta(int(device_id))
 
 
 _STACK_POWER_SWITCH_LABEL_RE = re.compile(r"^Switch (?P<switch>\S+)$")
@@ -5681,6 +5728,35 @@ def get_nodes_device_mac_table(service, params, body, device_id, if_index) -> di
                 "walked": service.nodes_db.has_mac_entries(device_id)}
     macs = service.node_poller.read_mac_table(device_id, if_index)
     return {"macs": macs, "supported": macs is not None}
+
+
+def get_nodes_device_interface_config(service, params, body, device_id, if_index) -> dict:
+    """This port's own stanza out of the device's most recent ConfigRX
+    backup, for the Interface Detail dialog's RUNNING CONFIGURATION tile.
+
+    Gated on nodes read (this is a per-device page) AND configrx read
+    (a stored configuration is what it hands over) -- the route table can
+    only carry one module, so the second is checked here, the same shape
+    get_dashboard_offenders' _dash_can uses for its own second gate.
+    Redacted like get_configrx_backup for a caller without configrx write.
+    """
+    device_id, if_index = int(device_id), int(if_index)
+    _require(service.nodes_db.device(device_id), "device")
+    if not _permissions.allows(
+            request_permissions(service, params).get("nodes"), _permissions.READ):
+        raise _permissions.Forbidden("Reading devices is not permitted")
+    backups = service.configrx_db.backups_for(device_id, limit=1)
+    if not backups:
+        return {"backup_id": None, "ts": None, "text": None}
+    backup = backups[0]
+    content = service.configrx_db.backup_content(backup["id"]) or ""
+    if not _may_read_secrets(service, params, "configrx"):
+        content, _ = configrx_redact.redact(content)
+    iface = service.nodes_db.interface_row(device_id, if_index)
+    names = [iface["name"] if iface and "name" in iface.keys() else None,
+            iface["descr"] if iface else None]
+    text = configrx_stanza.interface_stanza(content, [n for n in names if n])
+    return {"backup_id": backup["id"], "ts": backup["ts"], "text": text}
 
 
 # Bumped by every handler below that edits the MIB corpus in a way

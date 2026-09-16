@@ -1302,7 +1302,93 @@
     return `${a} ↔ ${b}\nVLAN ${vlanDisplay(strand.vlan)}${native}`;
   }
 
-  function drawNode(layer, node) {
+  // ------------------------------------------------------ label collision
+  // A dragged box can land arbitrarily close to another — nothing stops it
+  // — and a name is drawn at a fixed spot inside its own box, so two boxes
+  // overlapping means one name sits under the other box, or under the
+  // other name. This measures every name the way the browser will actually
+  // render it and pushes a colliding one straight down, in whole-line
+  // steps, until it clears both. Only the (single) name label's own y
+  // drifts inside its <g> — the box itself never moves, since links attach
+  // at each node's real position, and no leader line points back to it.
+  //
+  // A detached canvas 2D context does the measuring, not the SVG text's own
+  // getBBox(): draw() builds its whole scene off-document and appends it
+  // once (see the comment beside svg.appendChild(group) below), precisely
+  // to avoid a reflow per node — getBBox() before that attach is exactly
+  // that reflow, paid once per label.
+  const LABEL_X = 30, LABEL_BASE_Y = 22, LABEL_SUB_GAP = 14, LABEL_GAP_PX = 3;
+  const LABEL_STEP_CAP = 6;
+  const labelMeasureCtx = document.createElement('canvas').getContext('2d');
+  let labelFontCache = '';
+  function labelFont() {
+    if (!labelFontCache) {
+      const root = getComputedStyle(document.documentElement);
+      const remPx = parseFloat(root.fontSize) || 16;
+      const sizeRem = parseFloat(root.getPropertyValue('--fs-2xs')) || 0.6875;
+      const family = root.getPropertyValue('--ui').trim() || 'sans-serif';
+      labelFontCache = `${sizeRem * remPx}px ${family}`;
+    }
+    return labelFontCache;
+  }
+
+  function measureLabel(text) {
+    labelMeasureCtx.font = labelFont();
+    const m = labelMeasureCtx.measureText(text);
+    return {
+      width: m.width,
+      ascent: m.fontBoundingBoxAscent || m.actualBoundingBoxAscent || 8,
+      descent: m.fontBoundingBoxDescent || m.actualBoundingBoxDescent || 3,
+    };
+  }
+
+  // The one place a label's scene rect is computed, at a given number of
+  // down-steps — draw() (via drawNode below) writes the result straight
+  // into the live SVG, so hit-testing, hover/focus and the PNG export (a
+  // clone of that same SVG) all agree on it for free, with nothing of
+  // their own left to keep in sync.
+  function labelRect(node, info, steps) {
+    const pos = livePos(node);
+    const { width, ascent, descent } = measureLabel(truncate(info.name, 24));
+    const lineStep = ascent + descent + LABEL_GAP_PX;
+    const baseY = pos.y - NODE_H / 2 + LABEL_BASE_Y + steps * lineStep;
+    return { x: pos.x - NODE_W / 2 + LABEL_X, y: baseY - ascent, w: width, h: ascent + descent };
+  }
+
+  function rectsOverlap(a, b) {
+    if (a.y + a.h <= b.y || b.y + b.h <= a.y) return false;   // vertical early exit
+    return a.x < b.x + b.w && a.x + a.w > b.x;
+  }
+
+  // node.id -> how many line-steps its name was pushed down. Processed by
+  // y then x for a stable result call to call; a node's own box is excluded
+  // from its own label's collision test (the untouched default position
+  // always sits inside it by design).
+  function placeLabels(nodes) {
+    const boxes = nodes.map((node) => {
+      const pos = livePos(node);
+      return { x: pos.x - NODE_W / 2, y: pos.y - NODE_H / 2, w: NODE_W, h: NODE_H };
+    });
+    const order = nodes.map((node, index) => ({ node, index }))
+      .sort((a, b) => livePos(a.node).y - livePos(b.node).y || livePos(a.node).x - livePos(b.node).x);
+    const placed = [];
+    const offsets = new Map();
+    for (const { node, index } of order) {
+      const info = resolveNode(node);
+      let steps = 0;
+      let rect = labelRect(node, info, steps);
+      while (steps < LABEL_STEP_CAP && (placed.some((r) => rectsOverlap(rect, r))
+        || boxes.some((box, j) => j !== index && rectsOverlap(rect, box)))) {
+        steps += 1;
+        rect = labelRect(node, info, steps);
+      }
+      offsets.set(node.id, steps);
+      placed.push(rect);
+    }
+    return offsets;
+  }
+
+  function drawNode(layer, node, labelOffsets) {
     const info = resolveNode(node);
     const pos = livePos(node);
     const g = App.svgNode('g', {
@@ -1322,12 +1408,16 @@
     if (!info.unmanaged && !info.gone) {
       g.appendChild(statusGlyph(info.tone, NODE_W - 14, 12));
     }
+    const steps = (labelOffsets && labelOffsets.get(node.id)) || 0;
+    const { ascent, descent } = measureLabel(truncate(info.name, 24));
+    const nameY = LABEL_BASE_Y + steps * (ascent + descent + LABEL_GAP_PX);
     const nameNode = App.svgNode('text', {
-      class: 'mp-node-label', x: 30, y: 22,
+      class: 'mp-node-label', x: LABEL_X, y: nameY,
     }, truncate(info.name, 24));
     g.appendChild(nameNode);
     if (info.sub) {
-      g.appendChild(App.svgNode('text', { class: 'mp-node-sub', x: 30, y: 36 }, truncate(info.sub, 26)));
+      g.appendChild(App.svgNode('text',
+        { class: 'mp-node-sub', x: LABEL_X, y: nameY + LABEL_SUB_GAP }, truncate(info.sub, 26)));
     }
     // Badges: only ever present when the matching setting is on (the
     // server nulls each one out otherwise, see get_mapper_map), so no
@@ -1698,7 +1788,8 @@
       view.linkLabelEls.set(link.id, labels);
       drawLink(holder, link, labels);
     }
-    for (const node of view.nodes) view.nodeEls.set(node.id, drawNode(nodeLayer, node));
+    const labelOffsets = placeLabels(view.nodes);
+    for (const node of view.nodes) view.nodeEls.set(node.id, drawNode(nodeLayer, node, labelOffsets));
 
     view.rubberEl = App.svgNode('rect', { class: 'mp-rubber' });
     group.appendChild(view.rubberEl);

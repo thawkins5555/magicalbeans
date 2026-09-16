@@ -2016,7 +2016,8 @@
       '<tr><th scope="col">Sensor</th><th scope="col">Reading</th><th scope="col">Warning</th>' +
       '<th scope="col">Critical</th><th scope="col">Status</th><th scope="col">Last poll</th></tr>' +
       rows.map((s) => `<tr><td>${escape(s.name)}${s.kind === 'psu' ? ' <span class="hint">(power supply)</span>'
-          : s.kind === 'stack_power' ? ' <span class="hint">(stack power)</span>' : ''}</td>` +
+          : s.kind === 'stack_power' ? ' <span class="hint">(stack power)</span>'
+          : s.kind === 'fan' ? ' <span class="hint">(fan)</span>' : ''}</td>` +
         `<td>${s.value == null ? '\u2014' : escape(`${s.value}${s.unit}`)}</td>` +
         `<td title="${escape(s.limit_source || '')}">${limit(s.high_warn)}</td><td title="${escape(s.limit_source || '')}">${limit(s.high_alarm)}</td>` +
         `<td>${escape(s.state_text || '\u2014')}</td><td>${App.agoCell(s.last_ts)}</td></tr>`).join('') + '</table>';
@@ -2753,11 +2754,11 @@
       <p class="section">EVENTS</p>
       <div id="ifd-events"><p class="hint">Reading events…</p></div>
       <p class="section">RUNNING CONFIGURATION</p>
-      <p class="hint">Stored configurations live in
+      <div id="ifd-configrx-body"><p class="hint">Stored configurations live in
         <button type="button" class="linkish inline" id="ifd-configrx">ConfigRX</button>,
         which backs up this device over SSH and keeps every version it has
         seen. There is no per-port view of a configuration — a config is a
-        whole-device thing.</p>
+        whole-device thing.</p></div>
       <p class="section">MAC ADDRESSES ON PORT</p>
       <div id="ifd-mac"><p class="hint">Reading MAC address table…</p></div>
       <p class="section">DOM / SFP SENSORS</p>
@@ -2966,6 +2967,27 @@
     });
     refreshStats().catch(() => {});
     refreshChart().catch(() => {});
+
+    // Reads the device's latest ConfigRX backup for this port's own stanza.
+    // Fetched only with configrx read -- a viewer without it keeps today's
+    // static hint rather than being pointed at a fetch that would 403.
+    if (App.canRead('configrx')) {
+      App.get(`/api/nodes/devices/${deviceId}/interfaces/${ifIndex}/config`)
+        .then((r) => {
+          const configBody = box.querySelector('#ifd-configrx-body');
+          if (!configBody || !current()) return;
+          if (r.backup_id == null) return;   // no backup yet: keep the static hint
+          const content = r.text
+            ? `<pre class="detail" style="max-height:220px">${escape(r.text)}</pre>`
+            : '<p class="hint">No stanza for this interface in the latest backup.</p>';
+          configBody.innerHTML = `<p class="hint">From backup ${escape(App.when(r.ts))} — ` +
+            '<button type="button" class="linkish inline" id="ifd-configrx">ConfigRX</button></p>' +
+            content;
+          const link = configBody.querySelector('#ifd-configrx');
+          if (link) link.onclick = () => { App.closeModal(); App.selectTab('configrx'); };
+        })
+        .catch(() => {});
+    }
 
     App.get(`/api/nodes/devices/${deviceId}/interfaces/${ifIndex}/dom`)
       .then((r) => {

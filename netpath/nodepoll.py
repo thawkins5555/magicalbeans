@@ -6655,8 +6655,11 @@ class NodePoller(Worker):
     def _poll_vendor_sensors(self, device_id: int, device, config: dict,
                              now: float) -> None:
         """Per-sensor temp_sensor_c.<idx>/temp_sensor_state.<idx>/
-        psu_state.<idx> from nodeoids.SENSOR_TABLES/PSU_TABLES, keyed on
-        the device's own enterprise arc.
+        psu_state.<idx>/fan_state.<idx> from nodeoids.SENSOR_TABLES/
+        PSU_TABLES/FAN_TABLES, keyed on the device's own enterprise arc.
+        fan_state reads FAN_TABLES on the same cadence as psu_state
+        (due_psu), trying the FRU control table first and only falling back
+        to the classic ENVMON one when the first came back empty.
 
         The temperature table is only tried for a device NOT already
         confirmed to answer ENTITY-SENSOR-MIB (device['sensor_capable']):
@@ -6698,7 +6701,10 @@ class NodePoller(Worker):
         psu_tables = nodeoids.PSU_TABLES.get(arc) if due_psu else None
         if psu_tables is not None and not isinstance(psu_tables, tuple):
             psu_tables = (psu_tables,)
-        if sensor_table is None and not psu_tables:
+        # Same cadence as PSU_TABLES (due_psu): fan_state is read wherever
+        # psu_state is, not on its own schedule.
+        fan_tables = nodeoids.FAN_TABLES.get(arc) if due_psu else None
+        if sensor_table is None and not psu_tables and not fan_tables:
             if capable is None and due_sensors:
                 self.db.set_vendor_sensor_capable(device_id, False)
             return
@@ -6735,6 +6741,27 @@ class NodePoller(Worker):
                 if row["state"] is None:
                     # Not present: a bay never seen stays silent, one seen
                     # before writes _PSU_STATE_ABSENT so psu_failed opens.
+                    if key in existing:
+                        samples.append((key, row["label"], "state", "gauge",
+                                        now, self._PSU_STATE_ABSENT))
+                    continue
+                samples.append((key, row["label"], "state", "gauge", now,
+                                float(row["state"])))
+
+        if fan_tables:
+            primary, fallback = fan_tables
+            fan_rows = self._vendor_psu_rows(device, config, primary, now)
+            if not fan_rows:
+                fan_rows = self._vendor_psu_rows(device, config, fallback, now)
+            if fan_rows:
+                answered = True
+            for idx, row in fan_rows.items():
+                key = f"fan_state.{idx}"
+                if row["state"] is None:
+                    # Same "seen before, now silent" rule psu_state uses:
+                    # only a fan tray this device has answered for before
+                    # writes _PSU_STATE_ABSENT, so a chassis that never had
+                    # one stays silent rather than opening fan_failed.
                     if key in existing:
                         samples.append((key, row["label"], "state", "gauge",
                                         now, self._PSU_STATE_ABSENT))

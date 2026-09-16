@@ -1970,6 +1970,31 @@ body.kiosk .card.strip > .hint { overflow: visible; white-space: normal; }
 }
 .mp-frame-handle { fill: var(--mp-frame-color); opacity: 0.8; cursor: nwse-resize; }
 
+/* #mp-find's suggestion dropdown: plain HTML, not SVG (the canvas above is
+   the map itself), positioned under the input the same way .tooltip is —
+   fixed, sized and placed from JS since it floats over the toolbar, not
+   inside any positioned ancestor of its own. */
+.mp-suggest {
+  position: fixed;
+  z-index: var(--z-tooltip);
+  background: var(--raised);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-float);
+  max-height: 260px;
+  overflow-y: auto;
+}
+.mp-suggest-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  padding: var(--space-xs) var(--space-sm);
+  cursor: pointer;
+}
+.mp-suggest-item.active { background: var(--selected); }
+.mp-suggest-name { color: var(--text); font: var(--fs-sm) var(--ui); flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mp-suggest-ip { color: var(--dim); font: var(--fs-xs) var(--mono); flex: 0 0 auto; }
+
 /* ----------------------------------------------------------- breakpoints
    Density above keys on height only, so a narrow, tall window still got the
    full sidebar and a 420px dialog. Width steps: below 1200px the fixed

@@ -569,6 +569,8 @@ ROLLED_UP_BY = {
     "psu_failed": "device_down",
     # Rolls up under the device, not psu_failed, which is about a supply not a link.
     "stack_power_cable_down": "device_down",
+    "fan_warning": "fan_failed",
+    "fan_failed": "device_down",
 }
 
 
@@ -618,7 +620,15 @@ PUBLISHED_HYSTERESIS = {"sfp_rx_dbm": 1.0, "sfp_tx_dbm": 1.0, "temp_sensor_c": 2
 # engine names them from the metric's own label and keys the alert
 # "<device_id>:<sensor index>" under entity kind `sensor`.
 SENSOR_FAMILIES = frozenset({"temp_sensor_c", "temp_sensor_state", "psu_state",
-                             "stack_power_port"})
+                             "stack_power_port", "fan_state"})
+
+# The families a Sensor Snapshot baseline can cover (api.post_nodes_device_
+# sensor_snapshot / nodesdb.sensor_baselines) -- the state-enum families
+# whose "already known bad, and accepted" hardware a snapshot is for. Not
+# temp_sensor_c/temp_sensor_state: a temperature is judged against a limit,
+# not a fixed enum, and has its own published-threshold and hysteresis
+# handling already.
+BASELINE_FAMILIES = frozenset({"psu_state", "stack_power_port", "fan_state"})
 
 # A rule that is only the fallback for a device with no per-sensor
 # coverage: rule key -> the families whose presence (a published
