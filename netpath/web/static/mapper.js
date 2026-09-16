@@ -710,9 +710,9 @@
     showFindSuggestions(event.target.value);
   }
 
-  // A click on an option must not blur #mp-find first — mousedown fires
+  // A click on an option must not blur #mp-find first — pointerdown fires
   // before click and would close the dropdown out from under the click.
-  function onFindListMousedown(event) {
+  function onFindListPointerdown(event) {
     event.preventDefault();
   }
 
@@ -722,7 +722,7 @@
     pickFindSuggestion(Number(item.dataset.index));
   }
 
-  // Never races a click on an option: onFindListMousedown keeps focus on
+  // Never races a click on an option: onFindListPointerdown keeps focus on
   // the input for the whole click, so this only fires for a genuine move
   // away from the field (Tab, clicking anything the list does not cover).
   function onFindBlur() {
@@ -3030,9 +3030,9 @@
     App.el('mp-find').addEventListener('keydown', onFindKeydown);
     App.el('mp-find').addEventListener('input', onFindInput);
     App.el('mp-find').addEventListener('blur', onFindBlur);
-    App.el('mp-find-list').addEventListener('mousedown', onFindListMousedown);
+    App.el('mp-find-list').addEventListener('pointerdown', onFindListPointerdown);
     App.el('mp-find-list').addEventListener('click', onFindListClick);
-    document.addEventListener('mousedown', onFindOutsideClick);
+    document.addEventListener('pointerdown', onFindOutsideClick);
     App.el('mp-add-frame').onclick = () => {
       if (!App.canWrite('mapper') || !view.mapId) return;
       view.framing = !view.framing;
