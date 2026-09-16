@@ -67,7 +67,7 @@ Scope: a node search/find box added to the Mapper module; a
 "Select all" control added to Mapper's Add Device dialog; freehand
 frames drawable around groups of nodes on the Mapper canvas, decoration
 only — dragging a frame never moves the devices inside it.
-**Outcome:** _pending — to be filled in at push._
+**Outcome.** Shipped as 5.31.0 together with 5.32.0 in one push (the operator asked for a single walk and review after all changes). Javariius pass 1: the frame drag never saved because the press requested a full redraw that replaced the element the pointer was captured on (fixed by selecting in place; the walk now drags the border and the handle and waits for the PUTs), two 500s on bad frame input, keyboard remove ungated for readers, a frames-only map not drawing; all fixed. Frames also gained keyboard reach and work on an empty map.
 
 **5.32.0 — Cisco Stack Power**
 Scope: Stack Power info (per-port link state, enabled/disabled,
@@ -86,7 +86,7 @@ fault trap without also opening the generic Critical SNMP trap alert;
 list; and the Link column in the STACK POWER table now shows a dash
 for an administratively disabled port instead of a wrong "up" — docs
 corrected to match in all four places.
-**Outcome:** _pending — to be filled in at push._
+**Outcome.** Shipped as 5.32.0. Full suite 172/176 with only the four known environmental failures (no passphrase, no traceroute, socket family, prune-lock timing); browser walk 88/88 with zero console, page or HTTP errors as admin and viewer, STACK POWER rendered on the demo stack, frames drawn, dragged, resized, renamed and removed. Javariius (updated definition): fault-trap alerts now auto-resolve after 24 h, the four critical-rated traps lowered to error so a trap opens one alert, trap kinds filterable in the Trap Log, no invented link state for a disabled port, poll-cost latch narrowed to the tables that yield rows; final verdict ready to push with nothing above P3. Two walk steps that lost runs under back-to-back use were hardened.
 
 ## 5.29.0 — Discovery addresses removed: interfaces and ARP only
 
