@@ -24,6 +24,7 @@ from netpath.mapper import (
     detect_role,
     link_csv_rows,
     link_identity,
+    link_is_fiber,
     peer_identity,
     render_plan,
     vlan_color_index,
@@ -478,6 +479,25 @@ for mode_name, plan_link in (("plain", {"vlans": []}),
           plan_any.get("vlan_count") == len(plan_link["vlans"]), plan_any)
     check(f"...and {mode_name} mode is the mode that ran",
           plan_any["mode"] == mode_name, plan_any)
+
+# --------------------------------------------------------------- link_is_fiber
+
+# Precedence: optic beats everything (even the far end's copper text),
+# copper beats an unproven sfp, sfp alone still reads fiber, and
+# sfp_empty/None settle to copper/unknown.
+for a_media, b_media, expected, why in (
+    ("optic", None, True, "a lit optic on the A side alone"),
+    (None, "optic", True, "a lit optic on the B side alone"),
+    ("sfp", None, True, "an unproven transceiver on one end, nothing on the other"),
+    ("copper", "sfp", False, "copper on one end outranks an unproven sfp on the other"),
+    ("optic", "copper", True, "a lit optic outranks the far end's copper text"),
+    ("sfp_empty", None, False, "an empty cage on one end, nothing on the other"),
+    (None, None, False, "no media known on either end"),
+    ("copper", "copper", False, "copper on both ends"),
+):
+    got = link_is_fiber(a_media, b_media)
+    check(f"link_is_fiber({a_media!r}, {b_media!r}) is {expected} -- {why}",
+          got == expected, got)
 
 # --------------------------------------------------------------- detect_role
 

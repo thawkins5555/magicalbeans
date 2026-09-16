@@ -355,6 +355,25 @@ try:
     check("once both ends are placed, the address-matched link draws too",
           status == 200 and ip_link is not None, (status, links))
 
+    # ------------------------------------------------------- 6c. FiberView
+    #
+    # A's port carries a lit optic (DOM-proven transceiver); nothing else on
+    # the map has media set, so the A-B link should read fiber and the
+    # address-matched B-D one, with no media on either end, should not.
+    service.nodes_db.update_interface_media(dev_a, [{"if_index": 1, "media": "optic"}])
+
+    status, payload = call("GET", f"/api/mapper/maps/{map_id}", token=admin)
+    links = payload.get("links", []) if status == 200 else []
+    ab_link = next((l for l in links
+                    if {l.get("a_device_id"), l.get("b_device_id")} == {dev_a, dev_b}), None)
+    check("a link with a lit optic on one end reports fiber True",
+          ab_link is not None and ab_link.get("fiber") is True
+          and ab_link.get("a_media") == "optic", ab_link)
+    ip_link = next((l for l in links
+                    if {l.get("a_device_id"), l.get("b_device_id")} == {dev_b, dev_d}), None)
+    check("a link with no media on either end reports fiber False",
+          ip_link is not None and ip_link.get("fiber") is False, ip_link)
+
     # ------------------------------------------------------ 7. export.csv
 
     status, payload = call("GET", f"/api/mapper/maps/{map_id}/export.csv", token=admin)
@@ -405,8 +424,12 @@ try:
     check("...with every key a discovered link carries also present, so a "
           "client that reads them blind does not throw",
           manual is not None and {"a_port", "b_port", "a_if_index", "b_if_index",
-                                  "vlans", "native_vlan", "seen_ts", "plan"}
+                                  "vlans", "native_vlan", "seen_ts", "plan",
+                                  "a_media", "b_media", "fiber"}
           <= set(manual), manual)
+    check("...with FiberView's keys defaulted (no media on a manual line)",
+          manual is not None and manual["a_media"] is None
+          and manual["b_media"] is None and manual["fiber"] is False, manual)
 
     status, payload = call("POST", f"/api/mapper/maps/{map_id}/links",
                            {"a_node_id": node_b, "b_node_id": node_peer, "label": ""},

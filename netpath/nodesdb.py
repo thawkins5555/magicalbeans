@@ -2265,6 +2265,23 @@ class NodesDatabase(SqliteStore):
         """interface_port_labels_for_devices for one device."""
         return self.interface_port_labels_for_devices([device_id])
 
+    def interface_media_for_devices(self, device_ids) -> dict[tuple[int, int], str | None]:
+        """(device_id, if_index) -> media for every interface of the named
+        devices that has a non-NULL media -- MAPPER's FiberView badge."""
+        ids = list(dict.fromkeys(int(d) for d in device_ids))
+        if not ids:
+            return {}
+        media: dict[tuple[int, int], str | None] = {}
+        with self._lock:
+            for chunk in _id_chunks(ids, self._IDS_PER_QUERY):
+                marks = ",".join("?" * len(chunk))
+                for row in self._conn.execute(
+                        "SELECT device_id, if_index, media FROM interfaces"
+                        f" WHERE device_id IN ({marks}) AND media IS NOT NULL",
+                        chunk).fetchall():
+                    media[(row["device_id"], row["if_index"])] = row["media"]
+        return media
+
     def device_summaries(self) -> list[sqlite3.Row]:
         """The seven columns a device picker needs, not devices()'s
         forty-odd (SELECT * including sysDescr and vendor-evidence text)."""

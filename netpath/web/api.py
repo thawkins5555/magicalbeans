@@ -10203,6 +10203,9 @@ def get_mapper_map(service, params, body, map_id) -> dict:
     max_strands = int(settings.get("max_strand_vlans", 30))
     width_min = float(settings.get("link_width_min", 1.5))
     width_max = float(settings.get("link_width_max", 14.0))
+    # FiberView: one read for every on-map device's per-port media, then a
+    # pure lookup per link -- mapper.link_is_fiber never touches the db.
+    media_by_port = service.nodes_db.interface_media_for_devices(device_ids)
     for link in links:
         # Each end's own vlan_ports row (never the far end's -- same
         # locality rule _mapper_vlan_ports' docstring gives port_vlans):
@@ -10220,6 +10223,14 @@ def get_mapper_map(service, params, body, map_id) -> dict:
             b_info = vlan_ports.get((link["b_device_id"], link["b_if_index"]))
         link["b_port_mode"] = b_info["mode"] if b_info else None
         link["b_native_vlan"] = b_info["native_vlan"] if b_info else None
+        a_media = media_by_port.get((link["a_device_id"], link["a_if_index"])) \
+            if link["a_if_index"] is not None else None
+        b_media = None
+        if link["b_device_id"] is not None and link["b_if_index"] is not None:
+            b_media = media_by_port.get((link["b_device_id"], link["b_if_index"]))
+        link["a_media"] = a_media
+        link["b_media"] = b_media
+        link["fiber"] = mapper.link_is_fiber(a_media, b_media)
         link["plan"] = mapper.render_plan(
             link, threshold=threshold, max_strands=max_strands,
             width_min=width_min, width_max=width_max,
@@ -10301,6 +10312,7 @@ def get_mapper_map(service, params, body, map_id) -> dict:
             "a_port": "", "b_port": "", "a_if_index": None, "b_if_index": None,
             "a_port_mode": None, "a_native_vlan": None,
             "b_port_mode": None, "b_native_vlan": None,
+            "a_media": None, "b_media": None, "fiber": False,
             "label": row["label"], "protocols": ["manual"], "vlans": [],
             "native_vlan": None,
             "unmanaged": a_node["device_id"] is None or b_node["device_id"] is None,

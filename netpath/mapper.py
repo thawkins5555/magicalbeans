@@ -754,6 +754,17 @@ def render_plan(link, *, threshold, max_strands, width_min, width_max,
             "vlan_count": count, "vlans": vlans, "label_step": 0.0}
 
 
+def link_is_fiber(a_media, b_media) -> bool:
+    """A link is fiber if either end is a lit optic, copper if either end is
+    proven copper (and neither end is a lit optic), else fiber only if
+    either end is an unproven SFP."""
+    if a_media == "optic" or b_media == "optic":
+        return True
+    if a_media == "copper" or b_media == "copper":
+        return False
+    return a_media == "sfp" or b_media == "sfp"
+
+
 LINK_CSV_HEADER = ["A Device", "A Device ID", "A Port", "A Port Mode", "A Native VLAN",
                    "B Device", "B Device ID", "B Port", "B Port Mode", "B Native VLAN",
                    "Protocols", "VLAN Count", "VLANs", "Native VLAN", "Seen"]
