@@ -1624,6 +1624,8 @@
       <div id="ndd-hardware"><p class="hint">Reading sensors\u2026</p></div>
       <p class="section">TEMPERATURE ALERTS</p>
       <div id="ndd-temp-alerts"><p class="hint">Reading thresholds\u2026</p></div>
+      <p class="section" id="ndd-stack-power-head" hidden>STACK POWER</p>
+      <div id="ndd-stack-power" hidden></div>
       <p class="section">DOM / SFP SENSORS</p>
       <div id="ndd-dom"><p class="hint">Reading sensors\u2026</p></div>
       <p class="section">INTERFACES</p>
@@ -1810,6 +1812,14 @@
       box.querySelector('h2').textContent = displayName(device);
       box.querySelector('#ndd-summary').innerHTML = deviceSummaryHtml(device);
       renderVendorSection(box, device, deviceId, current);
+      // Stack Power is a Cisco stacking feature (StackWise/StackPower);
+      // the vendor arc (sysObjectID 9) the device already carries is the
+      // cheapest gate — no dedicated hardware read needed to decide it.
+      if (device.vendor === 'cisco') {
+        box.querySelector('#ndd-stack-power-head').hidden = false;
+        box.querySelector('#ndd-stack-power').hidden = false;
+        renderStackPower(box, deviceId, current);
+      }
       dialogIfaces = ifaces.interfaces || [];
       dialogSnmpError = device.snmp_error;
       dialogIfaceNote = ifaces.note || '';
@@ -1999,10 +2009,65 @@
       '<table><caption class="sr-only">Per-sensor temperature and power-supply state</caption>' +
       '<tr><th scope="col">Sensor</th><th scope="col">Reading</th><th scope="col">Warning</th>' +
       '<th scope="col">Critical</th><th scope="col">Status</th><th scope="col">Last poll</th></tr>' +
-      rows.map((s) => `<tr><td>${escape(s.name)}${s.kind === 'psu' ? ' <span class="hint">(power supply)</span>' : ''}</td>` +
+      rows.map((s) => `<tr><td>${escape(s.name)}${s.kind === 'psu' ? ' <span class="hint">(power supply)</span>'
+          : s.kind === 'stack_power' ? ' <span class="hint">(stack power)</span>' : ''}</td>` +
         `<td>${s.value == null ? '\u2014' : escape(`${s.value}${s.unit}`)}</td>` +
         `<td title="${escape(s.limit_source || '')}">${limit(s.high_warn)}</td><td title="${escape(s.limit_source || '')}">${limit(s.high_alarm)}</td>` +
         `<td>${escape(s.state_text || '\u2014')}</td><td>${App.agoCell(s.last_ts)}</td></tr>`).join('') + '</table>';
+  }
+
+  /* STACK POWER: Cisco StackPower/StackWise cabling (device dialog, after
+     TEMPERATURE ALERTS) -- stored data from the last poll, no live SNMP,
+     the same idiom as renderSensorTable just above. Only ever called for a
+     Cisco device (see the deviceDialog vendor gate); a non-Cisco device
+     never gets this section shown at all. */
+  async function renderStackPower(box, deviceId, current) {
+    const el = box.querySelector('#ndd-stack-power');
+    if (!el) return;
+    let r;
+    try { r = await App.get(`/api/nodes/devices/${deviceId}/stack-power`); } catch (error) {
+      if (el && current()) el.innerHTML = `<p class="hint">Could not read stack power: ${escape(error.message)}</p>`;
+      return;
+    }
+    if (!current()) return;
+    if (!r.present) {
+      el.innerHTML = '<p class="hint">No Stack Power ports reported by this switch. Stacked Catalyst ' +
+        '3750-X/3850/9300 switches report them after the next poll.</p>';
+      return;
+    }
+    const stacks = r.stacks || [];
+    const switches = r.switches || [];
+    const ports = r.ports || [];
+    const stackLines = stacks.map((s) =>
+      `<p>Power stack ${escape(String(s.name || s.number))}: ${escape(s.mode_text)}, ` +
+      `${escape(s.topology)}, ${escape(String(s.members))} members</p>`).join('');
+    const switchTable = switches.length ? '<table><caption class="sr-only">Stack power switches</caption>' +
+      '<tr><th scope="col">Switch</th><th scope="col">Budget W</th><th scope="col">Committed W</th>' +
+      '<th scope="col">Allocated W</th></tr>' +
+      switches.map((s) => `<tr><td>${escape(String(s.switch))}</td>` +
+        `<td>${escape(String(s.budget_w))}</td><td>${escape(String(s.committed_w))}</td>` +
+        `<td>${escape(String(s.allocated_w))}</td></tr>`).join('') + '</table>' : '';
+    const portTable = ports.length ? '<table><caption class="sr-only">Stack power ports</caption>' +
+      '<tr><th scope="col">Switch</th><th scope="col">Port</th><th scope="col">Neighbour</th>' +
+      '<th scope="col">Admin</th><th scope="col">Link</th>' +
+      '<th scope="col">Over-current limit (A)</th><th scope="col">Status</th>' +
+      '<th scope="col">Last poll</th></tr>' +
+      ports.map((p) => {
+        // Disabled wins over a stale cable-down reading; state 2 (cable
+        // down) is the one status this table marks 'bad', the same class
+        // used elsewhere in this dialog for a failed read (e.g. #ndd-summary
+        // above) -- a failed PSU has no styled row of its own to match, so
+        // this reuses that same .err convention rather than inventing one.
+        const status = p.admin_text === 'disabled' ? 'disabled'
+          : p.state === 2 ? '<span class="err">cable down \u2014 Stack Power cable down rule</span>'
+          : escape(p.state_text || '\u2014');
+        return `<tr><td>${escape(String(p.switch))}</td><td>${escape(p.name)}</td>` +
+          `<td>${p.neighbour_switch ? escape(String(p.neighbour_switch)) : '\u2014'}</td>` +
+          `<td>${escape(p.admin_text)}</td><td>${escape(p.link_text)}</td>` +
+          `<td>${p.limit_a == null ? '\u2014' : escape(String(p.limit_a))}</td>` +
+          `<td>${status}</td><td>${App.agoCell(p.last_ts)}</td></tr>`;
+      }).join('') + '</table>' : '';
+    el.innerHTML = stackLines + switchTable + portTable;
   }
 
   /* Fetches the two chassis rules and this device's overrides of them, and

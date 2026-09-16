@@ -4114,12 +4114,24 @@ check("for (const frame of view.frames) {" in _CONTENT_BOUNDS88
       "a frame that sticks out past every node on the map")
 # Scoped to draw() (not contentBounds, which shares this exact substring in
 # its own null-bounds guard): the empty-canvas branch must check frames too
-# (5.31.1 fix), or a frames-only, no-devices map draws as empty.
+# (5.31.1 fix), or a frames-only, no-devices map draws as empty. It must
+# also fall through while the Frame tool is armed (5.32.0 fix), or a
+# brand-new empty map can never draw its first frame.
 _DRAW88F = MAPPER88[MAPPER88.index("  function draw() {"):
                     MAPPER88.index("  function emptyCanvas(svg, canvas, message)")]
-check("if (!view.nodes.length && !view.frames.length) {" in _DRAW88F,
+check("if (!view.nodes.length && !view.frames.length) {" not in _DRAW88F
+      and "if (!view.nodes.length && !view.frames.length && !view.framing) {" in _DRAW88F,
       "an all-frames, no-devices map still has content to fit, rather than "
-      "reading as empty")
+      "reading as empty, and an armed Frame tool keeps the real canvas up "
+      "on a wholly empty map")
+check("requestDraw();" in MAPPER88[MAPPER88.index("App.el('mp-add-frame').onclick"):
+                                    MAPPER88.index("App.el('mp-refresh').onclick")],
+      "arming or disarming the Frame tool redraws, so the placeholder and "
+      "the real canvas swap in step with it")
+check("requestDraw();" in MAPPER88[MAPPER88.index("function disarmFraming()"):
+                                    MAPPER88.index("async function createFrame(")],
+      "Escape and a click-with-no-drag disarm through disarmFraming(), "
+      "which redraws the same way the toolbar button's own disarm does")
 
 # 88g. A frame gets the same Tab reach a node already has (5.31.0
 #      follow-up): tabindex/role/aria-label set the same way a node's own
@@ -4148,6 +4160,37 @@ check("ArrowLeft" not in _DRAW_FRAME88G and "ArrowRight" not in _DRAW_FRAME88G
       and "ArrowUp" not in _DRAW_FRAME88G and "ArrowDown" not in _DRAW_FRAME88G,
       "no arrow-key nudging: a node's own keydown handler does not nudge "
       "either, so a frame does not gain a capability nodes lack")
+
+# ---------------------------------------------------------------------------
+# 89. The device dialog's STACK POWER section (Cisco StackPower/StackWise
+#     cabling), placed after TEMPERATURE ALERTS and gated to Cisco devices
+#     only -- stored data from /stack-power, never a live SNMP walk.
+check('<p class="section" id="ndd-stack-power-head" hidden>STACK POWER</p>' in NODES
+      and 'id="ndd-stack-power" hidden' in NODES
+      and NODES.index('id="ndd-stack-power-head"') > NODES.index('id="ndd-temp-alerts"')
+      and NODES.index('id="ndd-stack-power-head"') < NODES.index('DOM / SFP SENSORS'),
+      "STACK POWER is a hidden-by-default section placed right after "
+      "TEMPERATURE ALERTS and before DOM / SFP SENSORS")
+check("device.vendor === 'cisco'" in NODES,
+      "STACK POWER is revealed only for a device whose detected vendor "
+      "(sysObjectID arc 9) is Cisco")
+check("async function renderStackPower(" in NODES
+      and "/api/nodes/devices/${deviceId}/stack-power`" in NODES,
+      "the STACK POWER section reads /api/nodes/devices/<id>/stack-power")
+check("s.kind === 'stack_power' ? ' <span class=\"hint\">(stack power)</span>'" in NODES,
+      "the per-sensor table hints a stack_power row the same way a psu row "
+      "is hinted '(power supply)'")
+check("No Stack Power ports reported by this switch. Stacked Catalyst " in NODES
+      and "3750-X/3850/9300 switches report them after the next poll." in NODES,
+      "a Cisco device with no stack power data yet shows the not-present hint")
+check("Could not read stack power: " in NODES,
+      "a failed /stack-power fetch shows 'Could not read stack power: <message>'")
+check("cable down \\u2014 Stack Power cable down rule" in NODES,
+      "a state-2 stack power port names the rule that judges it: "
+      "'cable down — Stack Power cable down rule'")
+check('class="err">cable down' in NODES,
+      "a cable-down port's Status cell carries the same .err 'bad' class "
+      "used elsewhere in this dialog for a failed read")
 
 if failures:
     print("FAILED %d contract(s):" % len(failures))

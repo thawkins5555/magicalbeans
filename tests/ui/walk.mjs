@@ -915,6 +915,43 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       return 'COP badge present';
     });
 
+  await check('the Device Details dialog shows STACK POWER for a Cisco access switch (stack power)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await page.waitForSelector('#modal[hidden]', { state: 'attached', timeout: 5000 }).catch(() => {});
+      await selectTab(page, 'nodes');
+      await settle(page, 800);
+      await page.click('#page-nodes > .subtabs > .subtab[data-subtab="devices"]').catch(() => {});
+      // acc-sw-001 is the fleet's cisco_access persona (see the COP badge
+      // check just above) -- STACK POWER only renders for a Cisco device,
+      // so it is the row to open rather than whatever the pane selects
+      // first.
+      const row = page.locator('#nodes-table tbody tr', { hasText: 'acc-sw-001' }).first();
+      const found = await row.count() > 0;
+      if (!found) return 'skipped: acc-sw-001 is not in this fleet';
+      await row.dblclick();
+      await page.waitForSelector('#ndd-stack-power-head:not([hidden])', { timeout: 20000 });
+      const head = await page.locator('#ndd-stack-power-head').textContent();
+      assert((head || '').trim() === 'STACK POWER',
+        `expected the STACK POWER heading, got "${head}"`);
+      // A generous wait: the poller may not have reached this device's
+      // stack power tables within the walk's own timeframe. Either outcome
+      // (ports rendered, or the "not present" hint) is fine here -- only a
+      // fetch error is not.
+      await page.waitForFunction(() => {
+        const el = document.querySelector('#ndd-stack-power');
+        if (!el) return false;
+        return el.querySelector('table') !== null
+          || /No Stack Power ports reported/.test(el.textContent || '');
+      }, { timeout: 60000 });
+      const bodyText = await page.locator('#ndd-stack-power').textContent();
+      assert(!/Could not read/.test(bodyText || ''),
+        `stack power section reported an error: "${bodyText}"`);
+      await page.keyboard.press('Escape');
+      await page.waitForTimeout(500);
+      return /No Stack Power ports reported/.test(bodyText || '') ? 'not present yet' : 'ports rendered';
+    });
+
   await check('the NetFlow export CSV starts with a readable start/end pair (A1)',
     async () => {
       await page.keyboard.press('Escape').catch(() => {});

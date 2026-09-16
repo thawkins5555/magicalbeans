@@ -1527,7 +1527,10 @@
     if (!view.mapId) {
       return emptyCanvas(svg, canvas, 'No map selected. Use Maps to create or pick one.');
     }
-    if (!view.nodes.length && !view.frames.length) {
+    // The Frame tool needs the real canvas to draw the first frame on, so
+    // an armed Frame button falls through here even with nothing on the
+    // map yet — otherwise a brand-new map could never get its first frame.
+    if (!view.nodes.length && !view.frames.length && !view.framing) {
       return emptyCanvas(svg, canvas,
         `${view.map ? view.map.name : 'This map'} has no devices yet. Use Add device or Add neighbours.`);
     }
@@ -2313,6 +2316,10 @@
     if (btn) btn.classList.remove('active');
     const canvas = App.el('mp-canvas');
     if (canvas) canvas.classList.remove('framing');
+    // Escape and a click-with-no-drag both disarm through here rather than
+    // the toolbar button — an empty map must fall back to the placeholder
+    // the same way the button's own disarm does.
+    requestDraw();
   }
 
   async function createFrame(x, y, width, height) {
@@ -2799,6 +2806,10 @@
       view.framing = !view.framing;
       App.el('mp-add-frame').classList.toggle('active', view.framing);
       App.el('mp-canvas').classList.toggle('framing', view.framing);
+      // Arming on an empty map swaps the placeholder for the real canvas
+      // (see draw()'s gate above); disarming without drawing a frame must
+      // bring the placeholder back the same way.
+      requestDraw();
     };
 
     App.el('mp-refresh').onclick = () => App.runJob(App.el('mp-refresh'),
