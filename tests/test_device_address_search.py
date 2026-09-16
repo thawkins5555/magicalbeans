@@ -119,7 +119,7 @@ db._conn.execute(
     "INSERT INTO interfaces(device_id, if_index, descr, name, last_seen_ts)"
     " VALUES (?, 6, NULL, 'Gi0/6', ?)", (winner_id, time.time()))
 db._conn.commit()
-names = {r["if_index"]: r for r in db.interfaces(winner_id)}
+names = db.interface_labels(winner_id)
 built = {a["ip"]: a for a in api._device_addresses_json(
     db.device(winner_id), db.device_addresses(winner_id), names)}
 check("descr wins when the interface has one",

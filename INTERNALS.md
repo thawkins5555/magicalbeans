@@ -10188,8 +10188,8 @@ branch unchanged, since a search term of its own means the operator (or the
 page) already chose what the grid should show.
 
 `opts.initial` is the boot-route guard: `app.js`'s own startup path (the
-`selectTab(landing, ...)` call that replays whatever route was on the URL
-when the page loaded) now passes `initial: true` down through `deliverRoute`
+`applyRoute(true)` call that replays whatever route was on the URL when the
+page loaded) now passes `initial: true` down through `deliverRoute`
 to every module's `activate(opts)`, and a normal in-app hash change never
 sets it. A page reload or a first load landing on `#/nodes/device/<id>` is
 exactly this boot replay — the remembered Find text and filters (restored

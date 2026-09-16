@@ -57,8 +57,8 @@ Device Details; the Addresses subtab resolves the numeric interface
 index to the actual VLAN/interface name and adds the device's IP
 default gateway where SNMP exposes one; every built-in alert
 template's (email/SMS/webhook) subject line is reset to its built-in
-default carrying `[SEVERITY]` / `[RECOVER]` (an operator-edited
-template is left alone), and the digest roll-up subject gains a
+default carrying `[SEVERITY]` / `[RECOVER]` (custom, non-built-in
+templates are left alone), and the digest roll-up subject gains a
 worst-severity tag.
 **Outcome:** _pending — to be filled in at push._
 

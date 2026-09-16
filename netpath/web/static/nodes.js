@@ -731,8 +731,6 @@
     const deviceId = Number(parts[1]);
     if (!Number.isFinite(deviceId)) return;
     if (!filtered && !opts.initial) {
-      // No q/name/filter of its own: a plain device link, which is exactly
-      // when the row it names might not be showing (see revealDevice).
       // A boot-time replay (opts.initial) skips this: the row was already
       // selected under whatever filters restoreControls put back.
       await revealDevice(deviceId);
