@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.34.0 — Mapper FiberView: fiber links draw bold and glowing blue](#5340--mapper-fiberview-fiber-links-draw-bold-and-glowing-blue)
 - [5.33.0 — Per-port running config from ConfigRX, Poll Now's three walks, fan alerts, Sensor Snapshot, and Mapper/Dashboard fixes](#5330--per-port-running-config-from-configrx-poll-nows-three-walks-fan-alerts-sensor-snapshot-and-mapperdashboard-fixes)
 - [5.32.0 — Cisco Stack Power: cable-down and fault-trap alerts on Device Details](#5320--cisco-stack-power-cable-down-and-fault-trap-alerts-on-device-details)
 - [5.31.0 — Mapper: find a device, select-all in the picker dialogs, and frames](#5310--mapper-find-a-device-select-all-in-the-picker-dialogs-and-frames)
@@ -166,6 +167,54 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 ## Releases
 
 Listed newest first. Version numbers are build order, not dates.
+
+### 5.34.0 — Mapper FiberView: fiber links draw bold and glowing blue
+
+One item from the operator: `PROMPT-LOG.md` carries the request in full;
+this entry is the shipped result.
+
+**Mapper gains a FiberView checkbox, right beside Snap and Drag pans.**
+Tick it and every link the map can prove is fiber redraws bold and glowing
+blue, pulsing gently between dim and full — untick it and the map returns
+to its normal lines exactly as before. It is a viewing preference only,
+remembered in the browser the same way Drag pans is: nothing is written
+to the map, no permission beyond ordinary Mapper read is needed, and
+toggling it never refetches or redraws the underlying map data. The glow
+is included in **Export PNG**, so a snapshot taken with FiberView on shows
+the same bold blue lines the screen did.
+
+**The fiber call rides on the port media the poller already learns for
+each end of a link** — the same ENTITY-MIB/transceiver-text/MAU-MIB/DOM
+optical-power evidence the interface list's DOM/SFP/COP badges have used
+since 5.24.0/5.25.0. The rule, per link: a lit optic on either end makes it
+fiber; failing that, proven copper on either end makes it copper; failing
+that, a transceiver present on either end with nothing proving it copper
+still reads fiber (an unidentified SFP is almost always laser); anything
+else — an empty cage, a fixed port with no transceiver data, or nothing
+known at all — is not fiber. A link is judged on whichever end SNMP has
+actually answered, so a link to an unmanaged or name-only neighbour is
+judged on the local port alone. A manually drawn line (**Connect**) is
+never fiber, since it carries no port media of its own.
+
+**One known gap:** the demo fleet answers no ENTITY-MIB, so FiberView has
+nothing to show on `demo/fleet.py` — it needs real switches with
+transceivers reporting media to Nodes.
+
+Files: `netpath/mapper.py`, `netpath/nodesdb.py`, `netpath/web/api.py`,
+`netpath/web/static/mapper.js`, `netpath/web/static/app.css`,
+`netpath/web/static/tokens.css`, `netpath/web/static/index.html`.
+
+Verification: `tests/test_mapper_links.py` adds the `link_is_fiber` rule
+table (optic beats copper, copper beats an unproven sfp, sfp alone still
+reads fiber, an empty cage and unknown settle to not-fiber).
+`tests/test_mapper_api.py` extends the map GET with a seeded lit-optic
+link (reports `fiber: true`) against an address-matched link with no media
+on either end (`fiber: false`), and confirms a manual line carries
+`a_media`/`b_media`/`fiber` defaulted to `null`/`null`/`false` rather than
+missing keys. `tests/test_frontend_contracts.py` adds section 92, pinning
+the FiberView checkbox as a non-write control, the per-browser
+`localStorage` remembering, and that `--fiber` is defined once per themed
+`tokens.css` block with `app.css`'s glow/pulse rule reading it.
 
 ### 5.33.0 — Per-port running config from ConfigRX, Poll Now's three walks, fan alerts, Sensor Snapshot, and Mapper/Dashboard fixes
 

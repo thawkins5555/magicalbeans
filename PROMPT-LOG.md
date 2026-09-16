@@ -5,6 +5,42 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.34.0 — Mapper FiberView: fiber links draw bold and glowing blue
+
+**Operator prompt, verbatim:**
+> I want to add a feature to the MAPPER MODULE.  There should be a new
+> checkbox next to 'Snap' and 'Drag pans'.  The checkbox should be
+> called 'FiberView'.  When this box is checked the system will then
+> need to determine if those specific links listed are via FIBER or
+> Copper based off of the SFP types and port types.  If the connection
+> between two devices is determined to be fiber then the lines
+> connecting devices together on the MAP should change to BOLD and
+> Glowing Blue phasing in and out when the checkbox is selected.
+> Revert back to normal view when unselecting the checkbox.
+
+**Plan.** A per-browser view toggle, not a map edit or a shared setting
+— same footing as the existing Drag pans checkbox, so it needs no write
+permission and never touches the database. The fiber/copper call
+reuses the port media the poller already learns for the DOM/SFP/COP
+badges (5.24.0/5.25.0: ENTITY-MIB text, MAU-MIB, DOM optical-power
+sensors) rather than asking devices anything new: a lit optic on either
+end of a link is fiber, proven copper on either end (with no lit optic)
+is copper, an unidentified transceiver on either end is still called
+fiber, and anything else — empty cage, fixed port, unknown — is not
+fiber. "Phasing in and out" is built as a slow stroke-opacity pulse,
+off entirely when the browser's reduced-motion setting is on. Dora
+mapped the existing link-drawing and media pipeline first so the new
+rule and the new draw path would land on the right seams rather than
+duplicating logic Nodes already has. Thing2 built the backend verdict
+and API surface (`mapper.link_is_fiber`, `nodesdb.
+interface_media_for_devices`, the three new keys on every mapper map
+link); Thing1 built the checkbox, the per-browser remembering, and the
+CSS glow/pulse. Testy ran the affected test files plus the full suite
+once, and a Mapper-only browser walk. Javariius reviewed the whole diff
+before push.
+
+**Outcome.** Shipped as 5.34.0. [test and review results: Bob fills in]
+
 ## 5.33.0 — Per-port running config, Poll Now's three walks, fan alerts, Sensor Snapshot, Mapper/Dashboard fixes
 
 **Operator prompt — ten items, one message, given while the operator was

@@ -5542,6 +5542,73 @@ same case "Open in Nodes" already treats as one, since only a real,
 still-present device has a dialog to open. `App.state.tab` is never
 touched, so Mapper stays the active tab underneath the dialog.
 
+### FiberView (`mapper.py`, `nodesdb.py`, `web/api.py`, `mapper.js`, `app.css`, `tokens.css`) — 5.34.0
+
+**The verdict is a pure function.** `mapper.link_is_fiber(a_media,
+b_media)` takes each end's `interfaces.media` value — `"optic"`,
+`"copper"`, `"sfp"`, `"sfp_empty"` or `None`, the same column the
+DOM/SFP/COP badge (5.24.0/5.25.0) already reads — and returns a bool:
+`optic` on either end wins outright, else `copper` on either end reads
+copper, else `sfp` on either end (with neither end copper) reads fiber,
+else `False`. It touches no database and takes no device id, so
+`tests/test_mapper_links.py` exercises the whole precedence table with
+plain strings.
+
+**Fetching the media is one query, not one per link.**
+`nodesdb.interface_media_for_devices(device_ids)` chunks the on-map
+device ids through `sqlitebase`'s `id_chunks` helper (the same chunking
+every other multi-device Nodes lookup uses) and returns a
+`{(device_id, if_index): media}` dict for every interface that has a
+non-NULL media, in one pass. `web/api.py`'s `get_mapper_map()` calls it
+once, after assembling the map's links, then does a plain dict lookup
+per link for `a_media`/`b_media` and calls `link_is_fiber` on the pair;
+a manual line (`map_links`, no discovered port on either end) defaults
+`a_media`/`b_media` to `None` and `fiber` to `False` rather than omitting
+the keys, keeping the "every key a discovered link carries" contract
+`tests/test_mapper_api.py` pins for manual links. `a_media`, `b_media`
+and `fiber` all travel to the browser on every `GET
+/api/mapper/maps/<id>`, whether or not FiberView is even checked —
+the checkbox is purely a client-side draw toggle, not a second request.
+
+**Drawing is CSS, keyed off one data attribute.** `mapper.js` tags a
+link's `<path>` with class `fiber` at draw time when `link.fiber ===
+true`, unconditionally — the class is always on a fiber link's markup,
+FiberView on or off. The checkbox itself only sets
+`#mp-canvas`'s `data-fiberview` attribute (`applyFiberView()`, called on
+load and on every toggle) and writes the choice to
+`localStorage['mapper.fiberView']`, the same per-browser pattern Drag
+pans (5.16.0) uses — no map settings call, no redraw. `app.css` does the
+rest: `#mp-canvas[data-fiberview="1"] .mp-link.fiber` sets the stroke to
+the new `--fiber` token (a theme token, per `tokens.css`, lighter on
+Contrast's dark canvas than the other six themes' shared value) at
+`max(5px, 1.6× the link's own plan width)` — a floor plus a multiplier,
+so a fat, VLAN-collapsed trunk never draws thinner glowing than it does
+plain — plus a blue `drop-shadow` glow, and pulses `stroke-opacity`
+(never plain `opacity`) between 0.45 and 1 over a 1.4s ease-in-out
+alternate, so `.dimmed`'s own `opacity` (the VLAN-filter dim) still
+applies to a fiber link under an active VLAN pick instead of the two
+rules overwriting each other. The pulse itself is wrapped in `@media
+(prefers-reduced-motion: no-preference)`, the same opt-in-to-motion
+pattern every other Mapper/alert animation uses, so a browser with
+reduced motion set gets the bold blue glow with no pulse rather than no
+indication at all.
+
+**Export PNG carries the glow because it inlines computed style, not
+because it copies the checkbox.** `exportPng()`'s existing
+`inlineComputedColors` (5.23.0) walks every live element and writes its
+*computed* `stroke`/`stroke-opacity`/`filter` onto the cloned element
+before serialising — `filter` was already in that property list for
+drop shadows generally, so a fiber link's glow (whatever its
+stroke-opacity happens to be at the instant of export) comes along for
+free; nothing FiberView-specific was added to the export path.
+
+`tests/test_frontend_contracts.py` section 92 pins that `--fiber` is
+declared exactly once per themed `:root[data-theme=]` block in
+`tokens.css`, and that `app.css` keys the glow/pulse off
+`#mp-canvas[data-fiberview] .mp-link.fiber`, gates the pulse behind
+`prefers-reduced-motion`, and never lets the bold stroke draw thinner
+than the link's own plan width.
+
 ---
 
 ## Alerts

@@ -4462,6 +4462,25 @@ like any other module.
   name is pushed straight down, in whole line steps, until it clears
   both — the box itself, and where links attach to it, never move; only
   where its name is drawn shifts.
+- **From 5.34.0, FiberView — a checkbox beside Snap and Drag pans —
+  highlights every link the map can prove is fiber.** Tick it and a
+  fiber link redraws bold and glowing blue, pulsing gently between dim
+  and full (a steady glow with no pulse if the browser's reduced-motion
+  setting is on); untick it and the map returns to normal. It is a view
+  preference only, remembered per browser like Drag pans — nothing is
+  written to the map, and toggling it never refetches or redraws the
+  data underneath. The glow is included in **Export PNG**. The call is
+  made from the same port media already behind the DOM/SFP/COP badges
+  (see Nodes, above): a lit optic on either end of a link is fiber; failing
+  that, proven copper on either end is copper; failing that, a
+  transceiver present on either end with nothing proving it copper is
+  still called fiber; an empty cage, a fixed port with no transceiver
+  data, or nothing known at all is not fiber. A link is judged on
+  whichever end has actually answered, so a link to an unmanaged or
+  name-only neighbour is judged on the local port alone; a manually
+  drawn **Connect** line is never fiber. The demo fleet answers no
+  ENTITY-MIB, so FiberView has nothing to show there — it needs real
+  switches whose transceivers report media to Nodes.
 
 ---
 
