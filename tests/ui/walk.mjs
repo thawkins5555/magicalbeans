@@ -334,6 +334,73 @@ async function waitForFiberViewLinks(page, mapId) {
   }
 }
 
+async function waitForStpVlanClassification(page, name) {
+  // Same deterministic wait as waitForOpticModeClassification, for a
+  // per-VLAN STP read -- acc-sw-004's second uplink forwards in the
+  // DEFAULT SNMP context but blocks only in VLAN 30 (demo/personas.py's
+  // _access_uplink2_vlan_state/_access_uplink2_default_state, 5.37.0).
+  const origin = new URL(page.url()).origin;
+  const list = await page.request.get(
+    `${origin}/api/nodes/devices?q=${encodeURIComponent(name)}`);
+  const devices = list.ok() ? (await list.json()).devices || [] : [];
+  const device = devices.find((d) => d.name === name);
+  if (!device) return { present: false };
+  const started = Date.now();
+  const deadline = started + 150000;
+  let polled = false;
+  for (;;) {
+    const res = await page.request.get(
+      `${origin}/api/nodes/devices/${device.id}/interfaces`);
+    const interfaces = res.ok() ? (await res.json()).interfaces || [] : [];
+    if (interfaces.some((row) => row.stp_blocking_vlans)) {
+      return { present: true, id: device.id, classified: true };
+    }
+    if (!polled) {
+      polled = true;
+      await page.request.post(`${origin}/api/nodes/devices/${device.id}/poll`,
+        { data: {} }).catch(() => {});
+    }
+    if (Date.now() >= deadline) {
+      return { present: true, id: device.id, classified: false,
+               waited_s: Math.round((Date.now() - started) / 1000) };
+    }
+    await sleep(3000);
+  }
+}
+
+async function waitForStpVlanBlockingLink(page, mapId) {
+  // Deterministic wait for the map JSON to carry acc-sw-004's per-VLAN STP
+  // fact on its own end: TenGigabitEthernet1/1/2 forwards in the DEFAULT
+  // context but blocks only in VLAN 30, so link.blocking/*_stp_vlans only
+  // appear once nodepoll's per-VLAN pass has reached this device --
+  // waitForStpVlanClassification above waits for that first.
+  const stp = await waitForStpVlanClassification(page, 'acc-sw-004');
+  if (!stp.present) return { present: false };
+  if (!stp.classified) {
+    return { present: true, ready: false, waited_s: stp.waited_s };
+  }
+  const origin = new URL(page.url()).origin;
+  const started = Date.now();
+  const deadline = started + 60000;
+  for (;;) {
+    const res = await page.request.get(`${origin}/api/mapper/maps/${mapId}`);
+    const links = res.ok() ? (await res.json()).links || [] : [];
+    for (const link of links) {
+      if (link.a_device_id === stp.id && link.a_port === 'TenGigabitEthernet1/1/2') {
+        if (link.blocking) return { present: true, ready: true, link, side: 'a' };
+      } else if (link.b_device_id === stp.id
+          && link.b_port === 'TenGigabitEthernet1/1/2') {
+        if (link.blocking) return { present: true, ready: true, link, side: 'b' };
+      }
+    }
+    if (Date.now() >= deadline) {
+      return { present: true, ready: false,
+               waited_s: Math.round((Date.now() - started) / 1000) };
+    }
+    await sleep(2000);
+  }
+}
+
 async function shoot(page, dir, name) {
   try {
     await page.screenshot({ path: path.join(dir, `${name}.png`), fullPage: false });
@@ -1065,6 +1132,42 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
       return '·MM badge present';
     });
 
+  await check('the Nodes interface list shows a partial-VLAN STP blocking '
+    + 'cell for a per-VLAN read (5.37.0)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await page.waitForSelector('#modal[hidden]', { state: 'attached', timeout: 5000 }).catch(() => {});
+      await selectTab(page, 'nodes');
+      await settle(page, 800);
+      await page.click('#page-nodes > .subtabs > .subtab[data-subtab="devices"]').catch(() => {});
+      // acc-sw-004's second uplink blocks only in VLAN 30 of its 5-VLAN
+      // trunk -- see demo/personas.py's _access_uplink2_vlan_state.
+      const row = page.locator('#nodes-table tbody tr', { hasText: 'acc-sw-004' }).first();
+      const found = await row.count() > 0;
+      if (!found) return 'skipped: acc-sw-004 is not in this fleet';
+      const stp = await waitForStpVlanClassification(page, 'acc-sw-004');
+      if (!stp.present) return 'skipped: acc-sw-004 is not in this fleet';
+      assert(stp.classified,
+        `acc-sw-004 had no per-VLAN STP read after ${stp.waited_s}s, poll-now included`);
+      await row.click();
+      const hasRow = await page.waitForSelector('#nd-if-table tbody tr', { timeout: 20000 })
+        .then(() => true).catch(() => false);
+      if (!hasRow) return 'skipped: acc-sw-004 lists no interfaces';
+      await page.waitForResponse((res) => new URL(res.url()).pathname.endsWith('/interfaces')
+        && res.request().method() === 'GET', { timeout: 5000 }).catch(() => {});
+      await sleep(500);
+
+      const cell = await page.evaluate(() => {
+        const cells = [...document.querySelectorAll('#nd-if-table td')];
+        const match = cells.find((c) => c.textContent.includes('blocking · '));
+        return match ? { text: match.textContent, title: match.title } : null;
+      });
+      assert(cell, 'expected a "blocking · " cell in #nd-if-table for acc-sw-004');
+      assert(cell.title.startsWith('Blocking in VLANs'),
+        `expected the cell's title to start with "Blocking in VLANs", got "${cell.title}"`);
+      return cell.text;
+    });
+
   await check('the Device Details dialog shows STACK POWER for a Cisco access switch (stack power)',
     async () => {
       await page.keyboard.press('Escape').catch(() => {});
@@ -1322,6 +1425,39 @@ async function checkTabsAndAria(page, dir, tag, watcher) {
 
       return `sm=${counts.sm} mismatch=${counts.mismatch} blocking=${counts.blocking}, `
         + `${drawnForPair} link(s) drawn for the parallel pair`;
+    });
+
+  await check('Mapper: a per-VLAN STP read draws acc-sw-004\'s second uplink '
+    + 'blocking though its default-context state forwards (5.37.0)',
+    async () => {
+      await page.keyboard.press('Escape').catch(() => {});
+      await selectTab(page, 'mapper');
+      await settle(page, 1000);
+      const mapId = await page.evaluate(() => {
+        const sel = document.getElementById('mp-map');
+        return sel && sel.value ? sel.value : null;
+      });
+      if (!mapId) return 'skipped: no map selected on the demo Mapper';
+
+      const state = await waitForStpVlanBlockingLink(page, mapId);
+      if (!state.present) return 'skipped: acc-sw-004 is not in this fleet';
+      assert(state.ready,
+        `acc-sw-004's TenGigabitEthernet1/1/2 carried no per-VLAN blocking `
+        + `link after ${state.waited_s}s, poll-now included`);
+
+      const { link, side } = state;
+      const stpVlans = side === 'a' ? link.a_stp_vlans : link.b_stp_vlans;
+      assert(stpVlans === '30',
+        `expected acc-sw-004's end to read stp_vlans "30", got ${JSON.stringify(stpVlans)}`);
+
+      const linkId = String(link.id);
+      const hasBlockingPath = await page.evaluate((id) =>
+        [...document.querySelectorAll(`#mp-svg path.mp-link[data-link-id="${id}"]`)]
+          .some((p) => p.classList.contains('blocking')), linkId);
+      assert(hasBlockingPath,
+        'expected a .mp-link.blocking path for acc-sw-004\'s TenGigabitEthernet1/1/2 link');
+
+      return `link ${linkId} blocking, stp_vlans=${stpVlans}`;
     });
 
   await check('Mapper: Find selects a device by name (#mp-find)',
