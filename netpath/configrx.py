@@ -1147,8 +1147,6 @@ class ConfigRxWorker(Worker):
         previous_size = self.db.latest_backup_size(device_id)
         backup_id, _digest = self.db.add_backup(
             device_id, cleaned, redacted=not store_secrets)
-        # SNMP's own default-gateway read takes precedence in the API; this
-        # is only the fallback for a switch whose route tables answer nothing.
         self.db.set_config_gateway(device_id, _config_gateway(cleaned))
         # Only when a key was actually stored, and said once: the note used to
         # be appended to every backup, because the accepted key was thrown

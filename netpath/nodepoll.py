@@ -6511,9 +6511,12 @@ class NodePoller(Worker):
         slots_complete = slots_complete and descrs_done and names_done
         if not slots_complete and media_reasons:
             for reason in media_reasons:
+                # cause is the column name only: the row/dropped counts in
+                # `reason` change every poll and would defeat the hourly key.
                 self._log_media_diag(
                     device, f"SFP scan on {device['ip']}: {reason}, "
-                            f"stored badges kept", reason)
+                            f"stored badges kept",
+                    reason.split(" walk cut short", 1)[0])
 
         # MAU-MIB: the module text's copper proof, checked against the wire.
         # Gated like the cage scan (empty port_map); probe-once-remember'd
@@ -6995,9 +6998,10 @@ class NodePoller(Worker):
                 static_complete = static_complete and names_done
             else:
                 names = {}
-            if all(m for col, m in ((table.class_col, class_map),
-                                    (table.skip_when_col, skip_map),
-                                    (table.name, names)) if col):
+            if static_complete and all(
+                    m for col, m in ((table.class_col, class_map),
+                                     (table.skip_when_col, skip_map),
+                                     (table.name, names)) if col):
                 self._vendor_psu_static[cache_key] = {
                     "class_map": class_map, "skip_map": skip_map, "names": names, "ts": now}
         rows: dict[str, dict] = {}

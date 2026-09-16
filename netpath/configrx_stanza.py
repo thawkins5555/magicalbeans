@@ -9,10 +9,7 @@ import re
 
 _INTERFACE_HEADER_RE = re.compile(r"^interface\s+(\S.*?)\s*$", re.IGNORECASE)
 
-# A header nested under something else -- IOS-XR's `interface X` inside a
-# `router ospf` stanza, or a paged capture with pager residue ahead of the
-# line. Column-0 headers are always tried first, so a real column-0 stanza
-# never loses to one of these.
+# Nested/paged headers (e.g. IOS-XR under `router ospf`); column-0 headers are tried first so a real one always wins.
 _INTERFACE_HEADER_INDENTED_RE = re.compile(r"^(\s+)interface\s+(\S.*?)\s*$", re.IGNORECASE)
 
 # A candidate's alphabetic lead (Gi, Port-channel) split from its digits/
@@ -73,10 +70,8 @@ def _indent_len(line: str) -> int:
 
 
 def _indented_header_block(lines: list[str], start: int, header_indent: int) -> str:
-    """Collects an indented header plus following lines indented deeper
-    than it. A bare '!' or a line at the header's own indent or shallower
-    ends the block and is not part of it -- there is no trailing '!' left
-    to strip afterwards, unlike the column-0 form."""
+    """Collects an indented header plus deeper-indented lines after it.
+    Unlike the column-0 form, there is no trailing '!' to strip."""
     block = [lines[start]]
     for line in lines[start + 1:]:
         if line.strip() == "!":
@@ -125,13 +120,8 @@ def _juniper_block(text: str, candidates: list[str]) -> str | None:
 
 
 def interface_stanza(text: str, names: list[str]) -> str | None:
-    """The stored config's own block for one of `names` (ifName/ifDescr),
-    or None. Column-0 headers are tried first -- exact equality, then the
-    prefix rule -- so an earlier prefix-only hit (Tw1/0/1 against
-    TwentyFiveGigE1/0/1), or an indented header nested under something
-    else, never wins over a later exact column-0 one. Indented headers are
-    then tried the same way, for a paged capture with pager residue ahead
-    of the line."""
+    """The stored config's own block for one of `names` (ifName/ifDescr), or
+    None. Column-0 exact match, then column-0 prefix, then indented, same order."""
     if not text:
         return None
     candidates = [n for n in names if n]
@@ -164,9 +154,7 @@ def interface_stanza(text: str, names: list[str]) -> str | None:
 
 
 def count_interface_headers(text: str) -> int:
-    """How many 'interface' headers (column-0 or indented) the stored
-    config carries -- what the interface dialog tells the operator it
-    searched among when none of them matched."""
+    """Count of 'interface' headers, for the no-match message the interface dialog shows."""
     if not text:
         return 0
     lines = text.split("\n")
