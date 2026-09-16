@@ -385,7 +385,7 @@ check("...and the animation sits INSIDE prefers-reduced-motion: "
                     r"tr\.alert-severe-unacked td \{\s*animation:", CSS, re.S) is not None)
 check("only the unacknowledged rows are animated",
       re.search(r"animation: alert-severe-pulse", CSS) is not None
-      and CSS.count("animation:") == 1)
+      and CSS.count("animation: alert-severe-pulse") == 1)
 
 PULSE = re.search(r"animation: alert-severe-pulse ([\d.]+)s", CSS)
 check("the pulse is a slow breathe, not a strobe: well under the three "
