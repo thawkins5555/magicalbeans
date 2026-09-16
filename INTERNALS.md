@@ -6095,6 +6095,113 @@ one), the `fiber-sm`/`fiber-mismatch`/`blocking` CSS presence checks,
 and a check that `mapper.js` defines `fanOffsets()` and reads
 `view.linkFan`.
 
+### Per-VLAN spanning-tree state — 5.37.0
+
+**`_cisco_vlan_stp(device, config, port_map)`** (`nodepoll.py:7621`) is
+the STP counterpart of `_cisco_vlan_device_fdb`, walking the same ground
+a second time for a different column. It bails out early — `({}, False,
+True)` — on an SNMPv3 config (`snmp_version_of(config) != 3` gates the
+whole feature) or a config with no `community`. Otherwise it reads the
+VTP VLAN table (`_VTP_VLAN_STATE`, the same OID base `_cisco_vlan_device_
+fdb` already uses), keeps only operational VLANs (state 1, dropping the
+1002-1005 legacy range), sorts them, and slices to `_MAX_VLAN_CONTEXTS`
+(48, a class attribute at `nodepoll.py:7314`) — a slice already makes
+the pass incomplete. For each VLAN in the (possibly sliced) list, inside
+a `deadline = time.time() + _VLAN_WALK_BUDGET_S` (15.0s, `nodepoll.py:
+7315`) budget, it builds a scoped config with `community` rewritten to
+`f"{community}@{vlan}"`, resolves a bridge-port map (the caller's
+`port_map` when non-empty, else its own `_bridge_port_map` call), and
+walks `nodeoids.DOT1D_STP_PORT_STATE` through `_walk_column_status`
+(passing the same `deadline` so a slow column reports its own
+incompleteness). Every row that answers, in any VLAN, counts toward that
+port's `"vlans"` tally; a value of `2` (blocking) also appends that VLAN
+id to the port's `"blocking"` list. The method returns `(rows, answered,
+complete)` — `complete` goes `False` the moment the VLAN list was
+sliced, any column walk came back incomplete, or the deadline is hit
+between VLANs.
+
+**`_poll_stp`** (`nodepoll.py:7787`) calls it after its own existing
+global, default-context read and before `update_interface_stp`, gated on
+`detected_vendor(device).lower() == "cisco"` (`nodesdb.py:957`) and
+`snmp_version_of(config) != 3`. Whether a device answers at all is
+probed once and remembered on `devices.stp_vlan_capable`, the same
+probe-once-remember idiom `_mau_read`/`_cage_read` use
+(`nodepoll.py:6431`): a miss re-probes once an hour off `self.
+_stp_vlan_read: dict[int, float]` (`nodepoll.py:1763`, cleared/reset
+alongside `_mau_read`/`_cage_read` at `nodepoll.py:2781`) checked
+against `_SENSOR_REPROBE_S` (3600.0, `nodepoll.py:6200`) — unlike
+`stp_capable`, a `False` latch is not permanent.
+
+**The merge rule**: for a port present in the per-VLAN result, `rows[if_
+index]["stp_state"]` is set to `"blocking"` when its `"blocking"` list
+is non-empty, `"forwarding"` otherwise — this overrides whatever the
+global default-context read wrote for that port a few lines earlier, so
+a port the default context called blocking but every answering VLAN
+called forwarding ends up `"forwarding"`. `stp_blocking_vlans` is the
+comma-joined, numerically sorted VLAN id list (`""` when the port blocks
+nowhere); `stp_vlan_count` is that port's `"vlans"` tally. **The
+cut-short rule**: this merge, and the two new columns, are only written
+when `vlan_answered and vlan_complete`; a pass that answered something
+but finished incomplete instead logs one diagnostic per hour (the `_log_
+media_diag` pattern, `nodepoll.py:6017`, cause `stp_vlan_cut_short`) and
+writes nothing for the per-VLAN columns, leaving the stored detail from
+the prior complete pass untouched.
+
+**Storage**: `nodesdb.ensure_columns` adds `devices.stp_vlan_capable
+INTEGER` beside `stp_capable`, and `interfaces.stp_blocking_vlans TEXT`/
+`stp_vlan_count INTEGER` beside `stp_state`. `set_stp_vlan_capable`
+(`nodesdb.py:4341`) mirrors `set_stp_capable` exactly. `update_interface_
+stp` (`nodesdb.py:4583`) now writes `stp_blocking_vlans=COALESCE(?,
+stp_blocking_vlans), stp_vlan_count=COALESCE(?, stp_vlan_count)` rather
+than a plain overwrite — a row from the global-only read, or a cut-short
+per-VLAN pass, carries neither key (`None`), and `COALESCE` leaves
+whatever per-VLAN detail is already stored alone rather than blank it.
+`interface_link_facts_for_devices` (`nodesdb.py:2279`) adds `stp_
+blocking_vlans` to its per-port dict alongside `media`/`optic_mode`/
+`stp_state`, one column added to the one query 5.36.0 already built.
+
+**API**: `get_nodes_device_interfaces` and its CSV export (`web/api.py`)
+add `stp_blocking_vlans`/`stp_vlan_count` right after `stp_state`, on
+both the JSON row and the CSV header. `get_mapper_map` adds `a_stp_
+vlans`/`b_stp_vlans` to a link's JSON, read straight off the same `a_
+facts`/`b_facts` dict the existing `a_stp`/`b_stp` keys come from; a
+manual link defaults both to `None` alongside its other FiberView/STP
+keys.
+
+**`nodes.js`'s `stpStateText(r)`** builds the interface table's STP
+cell text: when `stp_blocking_vlans` is non-empty and its VLAN count is
+fewer than `stp_vlan_count`, it returns `blocking · 2/12 VLANs` with a
+`title` naming the blocked ids (`Blocking in VLANs 20, 30`, through
+`escape()`); otherwise it falls back to the plain `stp_state` word with
+no title, covering a port blocked everywhere it runs and a device the
+per-VLAN read never touched alike.
+
+**`mapper.js`'s `stpVlanSuffix(vlans)`** turns a comma-joined VLAN
+string into ` (VLANs 20, 30)`, empty string when there is none;
+`stpBlockingText` appends it, through `esc()`, after each blocking end's
+device/port text, so the tooltip, aria label and detail pane all carry
+the same VLAN list. `mapper.link_csv_rows`'s own `stp_vlan_suffix`
+helper does the same for the CSV's STP column text (`"blocking on A
+(VLANs 20, 30)"`).
+
+**What each test pins.** `tests/test_stp_vlan.py` is new, against `tests/
+stubs/stub_agent_l2.py`'s three added modes: `pvst` (a DEFAULT-context
+table plus `public@20`/`public@30` community contexts, proving the
+per-VLAN merge overrides a stale default-context reading in both
+directions, that VLAN 1002 is read off VTP but never walked, and that
+only Cisco devices ever send a `community@vlan` request at all — a
+`COMMUNITIES` control datagram on the stub reports every community seen
+since the last `RESET`), `pvst-slow` (`public@30` never answers, for the
+cut-short/keep-stored-detail case), and `pvst_no_vtp` (no VTP table at
+all, for the `stp_vlan_capable` latch and its hourly re-probe via `poller.
+_stp_vlan_read`). `tests/test_poe_stp.py` adds a check that a non-Cisco
+device's rows carry `stp_blocking_vlans` `None`. `tests/
+test_frontend_contracts.py` section 94 pins the `blocking · ` cell text
+and the `Blocking in VLANs` title in `nodes.js`, and the `(VLANs `
+fragment in `mapper.js`. `tests/test_mapper_api.py` checks the map JSON's
+`a_stp_vlans`/`b_stp_vlans` keys, `None` on a manual link, and the CSV
+row's VLAN suffix.
+
 ---
 
 ## Alerts

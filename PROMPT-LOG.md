@@ -5,6 +5,34 @@ grouped by the version that carries it. This is a working record for the
 operator — the full story of each change is in `CHANGELOG.md`, and this file
 does not replace it.
 
+## 5.37.0 — Spanning-tree state per VLAN: blocked links on PVST switches
+
+**Operator prompt, verbatim:**
+> Sorry - just to make sure I understand - is this only going to pick up the spanning tree state for VLAN 1?  We use all vlans EXCEPT vlan 1.
+
+**Plan.** The 5.36.0 blocked-link read only ever looked at the switch's
+default SNMP context, which on Cisco PVST+/Rapid-PVST is the VLAN 1
+spanning-tree instance — exactly the VLAN the operator's estate prunes
+off its trunks, so the feature as shipped would have shown nothing on
+this fleet. Confirmed Rapid-PVST/PVST+ is the spanning-tree mode in use;
+the fix walks port state a second time inside each VLAN's own SNMP
+context, the same `community@vlan` trick the MAC-table walk already
+uses. Planning answers given: SNMP v2c only, no v3 context work (a v3
+device keeps today's single default-context read); read on every poll,
+the same cadence STP state already gets, bounded by the existing
+48-VLAN/15-second walk budget; a port counts as blocking the moment it
+blocks in any one VLAN it carries, with the blocking VLAN ids shown
+alongside it on both Nodes and Mapper rather than just a bare
+blocking/forwarding word. Team split: Thing1 took the poller's per-VLAN
+walk, the database columns and API/CSV fields, and the demo fleet's
+per-VLAN fixtures; Thing2 took the Nodes STP cell, the Mapper tooltip/
+detail pane/CSV and the frontend contract pins. Testy ran the new and
+touched test files as the work landed, then the full suite once at the
+end, plus a browser walk on Nodes and Mapper only (the two modules whose
+code changed). Stephen_King wrote CHANGELOG/FEATURES/INTERNALS and this
+entry. Javariius reviewed the whole diff before the push to main. Version
+bumped to 5.37.0.
+
 ## 5.36.0 — Optic single/multimode per port, FiberView by mode, STP-blocked and parallel Mapper links
 
 **Operator prompt, verbatim:**

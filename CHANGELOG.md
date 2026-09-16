@@ -4,6 +4,7 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 ## Contents
 
+- [5.37.0 — Spanning-tree state per VLAN: blocked links on PVST switches](#5370--spanning-tree-state-per-vlan-blocked-links-on-pvst-switches)
 - [5.36.0 — Optic single/multimode per port, FiberView by mode, STP-blocked and parallel Mapper links](#5360--optic-singlemultimode-per-port-fiberview-by-mode-stp-blocked-and-parallel-mapper-links)
 - [5.35.0 — Interface stanzas by indent, default gateways from ConfigRX, a single-PSU report, sensor vanish alerts, and SFP badges restored fleet-wide](#5350--interface-stanzas-by-indent-default-gateways-from-configrx-a-single-psu-report-sensor-vanish-alerts-and-sfp-badges-restored-fleet-wide)
 - [5.34.0 — Mapper FiberView: fiber links draw bold and glowing blue](#5340--mapper-fiberview-fiber-links-draw-bold-and-glowing-blue)
@@ -170,6 +171,86 @@ Firewall and protocol requirements are in `NETWORK-AND-STORAGE-REQUIREMENTS.md`.
 
 Listed newest first. Version numbers are build order, not dates.
 
+### 5.37.0 — Spanning-tree state per VLAN: blocked links on PVST switches
+
+A follow-up question on the 5.36.0 blocked-link feature: `PROMPT-LOG.md`
+carries it in full, and the planning answers given for it.
+
+**5.36.0's blocked-link line only ever read VLAN 1.** It pulled
+`dot1dStpPortState` from the switch's default SNMP context, which on
+Cisco PVST+/Rapid-PVST *is* the VLAN 1 spanning-tree instance — every
+other VLAN runs its own, separate instance with its own port states. An
+estate that prunes VLAN 1 off its trunks (routing everything else across
+them instead) got a default context with nothing useful in it, so a
+genuinely blocked redundant uplink read as forwarding and the Mapper line
+never went dotted at all.
+
+**The poller now reads spanning-tree state inside every VLAN a device
+actually runs**, not just the default one. On a Cisco device it walks
+`dot1dStpPortState` a second time per port, once inside each operational
+VLAN's own `community@vlan` SNMP context — the same path the MAC-table
+walk has used since 5.x — and calls a port blocking the moment it blocks
+in *any* of those VLANs, even if its default-context reading (or every
+other VLAN it carries) says forwarding.
+
+**Nodes and Mapper both show the detail behind that verdict, not just
+the verdict.** A port blocking in only some of the VLANs it carries
+shows `blocking · 2/12 VLANs` in the Nodes interface table's STP column,
+with the blocking VLAN ids in the cell's tooltip; a port blocking
+everywhere it runs still reads the plain `blocking`. The Mapper's link
+tooltip, aria label, detail pane and CSV export all name the same VLAN
+ids next to the blocking end. The per-interface JSON and CSV export gain
+two columns, `stp_blocking_vlans` (the VLAN ids, ascending) and
+`stp_vlan_count` (how many VLAN contexts answered); the Mapper map JSON
+carries the same detail per link as `a_stp_vlans`/`b_stp_vlans`.
+
+**Limits, stated plainly.** This only runs against a device whose
+detected vendor is Cisco, and only over an SNMP v1/v2c credential — an
+SNMPv3 device keeps today's single default-context read, since v3's
+context model does not map onto the community-string trick the same
+way. Cisco's own MST estates are unaffected either way: MST already
+covers every VLAN in one CIST instance, so the original default-context
+read was never missing anything there. Each pass is bounded to 48 VLANs
+and 15 seconds, the same envelope the MAC-table walk already runs
+under, and it runs on every poll, exactly like the rest of STP state
+today — nothing about the cadence changed. A pass that runs out of VLANs
+or time before finishing leaves the stored per-VLAN detail alone rather
+than overwrite it with a partial view; only the plain, cheap global read
+still updates on a cut-short pass. Whether a device answers a per-VLAN
+context at all is probed once and remembered (`stp_vlan_capable`), the
+same idiom the media/sensor probes use, with a device that has never
+answered re-tried once an hour rather than given up on for good.
+
+This replaces the "per-VLAN is a possible follow-up" caveat 5.36.0
+shipped with below — see that entry's own note, and **FEATURES.md**'s
+Mapper section, both of which now point here instead.
+
+**Demo:** `cisco_access` now answers per-VLAN SNMP contexts the same way
+`cisco_core` already did, and acc-sw-004's second uplink is rebuilt to
+prove the read actually matters — it blocks only in VLAN 30 and reads
+forwarding in the default (VLAN 1) context, so its dotted Mapper line can
+only be explained by the per-VLAN read, not the old one.
+
+Files: `demo/personas.py`, `netpath/mapper.py`, `netpath/nodepoll.py`,
+`netpath/nodesdb.py`, `netpath/web/api.py`,
+`netpath/web/static/mapper.js`, `netpath/web/static/nodes.js`.
+
+Verification: new `tests/test_stp_vlan.py`, against `tests/stubs/
+stub_agent_l2.py`'s new `pvst`/`pvst-slow`/`pvst_no_vtp` modes, covers the
+per-VLAN merge (blocking in one VLAN out of two wins over a forwarding
+default context, and vice versa), a non-Cisco device never sending a
+`community@vlan` request, an SNMPv3 config skipping the pass outright,
+the `stp_vlan_capable` latch and its hourly re-probe, and a cut-short
+walk keeping its previously stored VLAN detail. `tests/test_poe_stp.py`
+adds a check that a non-Cisco device's interface rows carry no per-VLAN
+detail. `tests/test_mapper_api.py` and `tests/test_mapper_links.py`
+extend for the `a_stp_vlans`/`b_stp_vlans` map-JSON keys (`None` on a
+manual link) and the CSV row's ` (VLANs 20, 30)` suffix.
+`tests/test_frontend_contracts.py` section 94 pins the Nodes `blocking ·
+` cell text and the Mapper `(VLANs ` tooltip fragment. `tests/ui/
+walk.mjs` extends its existing FiberView and Nodes checks to acc-sw-004's
+own blocked uplink.
+
 ### 5.36.0 — Optic single/multimode per port, FiberView by mode, STP-blocked and parallel Mapper links
 
 Two items from one operator prompt: `PROMPT-LOG.md` carries the request in
@@ -221,8 +302,8 @@ both the normal view and FiberView.** This reads the same BRIDGE-MIB
 port-state table the poller has polled since 5.x (`dot1dStpPortState`,
 default spanning-tree instance) — nothing new is polled for it. A port
 blocked only in a non-default PVST instance (a secondary VLAN on a
-trunk, say) is not covered by this read and will not show — per-VLAN STP
-state is a possible follow-up, not something this release claims. A link
+trunk, say) is not covered by this read and will not show — see 5.37.0,
+which reads every VLAN a device runs. A link
 that is both a single/multimode mismatch and spanning-tree blocked draws
 as a dotted red line; colour still tells the two apart from a plain
 blocked line.

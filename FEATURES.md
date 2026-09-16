@@ -1866,7 +1866,13 @@ From 4.47.0, Nodes walks past the SNMP poll to see the wire itself.
   lists what that device's own ports have reported; BRIDGE & RF shows STP
   bridge and per-port state (BRIDGE-MIB) and, for a radio, RSSI, remote
   RSSI and capacity (airFiber/airMAX and Cambium PtP links) as history
-  alongside the other metric charts.
+  alongside the other metric charts. **From 5.37.0, the interface
+  table's STP column names how many of a port's VLANs are actually
+  blocking** on a Cisco PVST+/Rapid-PVST switch — `blocking · 2/12
+  VLANs` when only some of the VLANs it carries are blocked, with the
+  blocked VLAN ids in the cell's tooltip; a port blocked in every VLAN
+  it carries still reads the plain `blocking`, and a device this
+  per-VLAN read doesn't cover shows the same as it always has.
 - **PoE power draw** — budget and per-port wattage, Cisco's own per-port
   milliwatt object where present — appears on the interface table for a
   device that answers POWER-ETHERNET-MIB. A device is asked for any of
@@ -4598,12 +4604,20 @@ like any other module.
   blue when neither end's mode is known.
 - **From 5.36.0, a spanning-tree-blocked link draws dotted, in normal
   view and FiberView alike**, read off the same BRIDGE-MIB port-state
-  table the poller already polls — nothing new is polled for it. Only
-  the default spanning-tree instance is read, so a port blocked only in
-  a non-default PVST VLAN does not show this way; per-VLAN coverage is
-  a possible future step, not something shipped here. A link that is
-  both a mismatch and blocked draws dotted red — colour still separates
-  it from a plain blocked line.
+  table the poller already polls — nothing new is polled for it. A link
+  that is both a mismatch and blocked draws dotted red — colour still
+  separates it from a plain blocked line.
+- **From 5.37.0, a Cisco PVST+/Rapid-PVST switch's blocked-link line
+  reads every VLAN the port carries, not just the default spanning-tree
+  instance (VLAN 1).** The poller now walks `dot1dStpPortState` a
+  second time inside each operational VLAN's own SNMP context and calls
+  a port blocking the moment it blocks in any one of them — the estates
+  that prune VLAN 1 off their trunks, so the original read never saw a
+  blocked port at all, are exactly the case this covers. It only runs
+  against a device whose detected vendor is Cisco, and only over an
+  SNMP v1/v2c credential — an SNMPv3 device keeps the single
+  default-context read. MST is unaffected either way, since its one
+  CIST instance already covered every VLAN.
 - **From 5.36.0, every cable between the same two devices draws as its
   own line, fanned apart from the others** rather than stacking on
   identical coordinates. Each line in the fan keeps its own strands,
