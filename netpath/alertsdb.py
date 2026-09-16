@@ -858,9 +858,7 @@ _BUILTIN_RULES = [
     # stack_power_port: 0 ok/admin-disabled, 2 cable down; no "not present"
     # state (nodepoll._poll_stack_power writes nothing for a vanished row).
     ("stack_power_cable_down", "Stack Power cable down", "threshold", "stack_power_port", 2, "threshold_breach", 2.0, 2.0, 1),
-    # fan_state: same 0 ok/1 warning/2 failed/3 not present enum psu_state
-    # uses, and the same Sensor Snapshot baseline (alertrules.
-    # BASELINE_FAMILIES) can mark an already-known bay accepted.
+    # fan_state: same enum and Sensor Snapshot baseline as psu_state.
     ("fan_warning", "Fan degraded", "threshold", "fan_state", 4, "threshold_breach", 1.0, 1.0, 1),
     ("fan_failed", "Fan failed or not present", "threshold", "fan_state", 2, "threshold_breach", 2.0, 2.0, 1),
     # RH above ~80% starts to risk condensation on anything metal in the

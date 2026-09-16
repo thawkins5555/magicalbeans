@@ -2143,10 +2143,7 @@ class NodePoller(Worker):
     def poll_now(self, device_id: int, walks: bool = False) -> bool:
         """Submits this device to the worker pool now, ahead of its interval.
         True when it was queued, False when a poll for it was already queued
-        or running — a click during an in-flight poll starts no second poll
-        (though the walks below still run for walks=True), and reporting
-        "Polled" off the first one's completion claimed credit for work the
-        click did not cause."""
+        or running — a click during an in-flight poll starts no second poll (the walks still run)."""
         # Also doubles as "try the sensor walk again": dropping the cadence
         # stamp skips both _SENSOR_REFRESH_S and the hourly reprobe window.
         self._sensor_read.pop(device_id, None)
@@ -2172,8 +2169,7 @@ class NodePoller(Worker):
             self._walk_now(device_id)
         return self._submit(device_id)
 
-    # Starts each table's walk via the same in-flight guard/executor
-    # _maybe_walk_mac_table/_maybe_walk_vlans/_maybe_walk_arp_table use.
+    # Same in-flight guard/executor as the scheduled MAC/VLAN/ARP walks.
     def _walk_now(self, device_id: int) -> None:
         device = self.db.device(device_id)
         if device is None:

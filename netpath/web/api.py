@@ -5553,9 +5553,7 @@ def get_nodes_device_sensors(service, params, body, device_id) -> dict:
                            for e in sensors)}
 
 
-# metric root -> the rules a Sensor Snapshot baseline on that root can
-# resolve (alertrules.BASELINE_FAMILIES/ROLLED_UP_BY): the two severities a
-# psu_state/fan_state reading can open, or stack_power_port's one rule.
+# metric root -> the rules a Sensor Snapshot baseline on it can resolve.
 _BASELINE_RULE_KEYS = {
     "psu_state": ("psu_warning", "psu_failed"),
     "stack_power_port": ("stack_power_cable_down",),
@@ -5564,15 +5562,9 @@ _BASELINE_RULE_KEYS = {
 
 
 def post_nodes_device_sensor_snapshot(service, params, body, device_id) -> dict:
-    """Marks every current psu_state/stack_power_port/fan_state reading as
-    the accepted baseline for this device (nodesdb.sensor_baselines) and
-    resolves whatever is currently open on those rules for it -- by
-    construction the value that just became the baseline IS each such
-    alert's current reading, so every one of them is a match. See
-    alertengine._evaluate_thresholds for the other half: a later reading
-    that still equals the baseline never re-opens the rule; one that gets
-    worse still does.
-    """
+    """Accepts every current psu_state/stack_power_port/fan_state reading as
+    this device's baseline and resolves whatever is open on those rules for
+    it (see alertengine._evaluate_thresholds for the baseline-skip half)."""
     device_id = int(device_id)
     device = _require(service.nodes_db.device(device_id), "device")
     now = time.time()
@@ -5733,15 +5725,10 @@ def get_nodes_device_mac_table(service, params, body, device_id, if_index) -> di
 
 
 def get_nodes_device_interface_config(service, params, body, device_id, if_index) -> dict:
-    """This port's own stanza out of the device's most recent ConfigRX
-    backup, for the Interface Detail dialog's RUNNING CONFIGURATION tile.
-
-    Gated on nodes read (this is a per-device page) AND configrx read
-    (a stored configuration is what it hands over) -- the route table can
-    only carry one module, so the second is checked here, the same shape
-    get_dashboard_offenders' _dash_can uses for its own second gate.
-    Redacted like get_configrx_backup for a caller without configrx write.
-    """
+    """This port's own stanza from the device's latest ConfigRX backup.
+    Gated on nodes read AND configrx read (checked here, like
+    get_dashboard_offenders' _dash_can); redacted like get_configrx_backup
+    for a caller without configrx write."""
     device_id, if_index = int(device_id), int(if_index)
     if not _permissions.allows(
             request_permissions(service, params).get("nodes"), _permissions.READ):
@@ -11581,9 +11568,7 @@ def _offender_rows(rows, n: int, value_key: str, unit: str) -> list[dict]:
 def _offender_node_lists(service, since: float, n: int) -> tuple[list, list]:
     """(event lists, metric lists); the gated alerts list goes between them."""
     events = service.nodes_db.count_events_by_device(since, limit=n)
-    # Flaps are their own list so a flapping port is not hidden by a noisy
-    # device. Port transitions live in interface_events (link_up/link_down),
-    # not device_events, hence the separate query.
+    # Its own list so a flapping port is not hidden by a noisy device.
     flaps = service.nodes_db.count_interface_events_by_device(since, limit=n)
     head = [
         {"key": "events", "title": "Most device events (24 h)",

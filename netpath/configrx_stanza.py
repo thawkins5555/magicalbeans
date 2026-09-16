@@ -1,13 +1,7 @@
-"""Pulls one interface's own block out of a whole-device stored
-configuration -- the Interface Detail dialog's RUNNING CONFIGURATION tile
-reads a device's latest ConfigRX backup and shows just this port's stanza,
-never the whole file.
-
-Handles the indented-block vendors (Cisco IOS/IOS-XE/NX-OS/IOS-XR, Arista,
-Aruba/HP ProCurve, Aruba CX) and a simplified brace-matcher for Juniper's
-`interfaces { ge-0/0/0 { ... } }` style. Pure text in, text or None out --
-no device access, no SNMP, so this is trivially unit-testable.
-"""
+"""Pulls one interface's own block out of a whole-device stored config, for
+the Interface Detail dialog's RUNNING CONFIGURATION tile. Covers the
+indented-block vendors (Cisco, Arista, Aruba) plus a Juniper brace-matcher.
+Pure text in, text or None out."""
 
 from __future__ import annotations
 
@@ -15,10 +9,8 @@ import re
 
 _INTERFACE_HEADER_RE = re.compile(r"^interface\s+(\S.*?)\s*$", re.IGNORECASE)
 
-# A candidate's alphabetic (and hyphen -- "Port-channel") lead, split from
-# whatever follows (digits/slashes/dots/colons for every vendor this ships
-# against). A name with no letter at all (ProCurve's "1/A1") has no prefix,
-# so it only ever matches by exact equality below.
+# A candidate's alphabetic lead (Gi, Port-channel) split from its digits/
+# slashes/dots/colons; ProCurve's "1/A1" has no letter lead, so no prefix.
 _PREFIX_RE = re.compile(r"^([A-Za-z][A-Za-z-]*)(.*)$")
 
 
@@ -33,11 +25,9 @@ def _exact_match(a: str, b: str) -> bool:
 
 
 def _prefix_match(a: str, b: str) -> bool:
-    """The Gi/GigabitEthernet, Po/Port-channel style match: same trailing
-    digits/slashes/dots/colons, and one's alphabetic prefix a
-    case-insensitive prefix of the other's -- so Gi1/0/1 never matches
-    Gi1/0/10. Ambiguous on its own (Tw also prefixes TwentyFiveGigE), so
-    callers try _exact_match across every header first."""
+    """Gi/GigabitEthernet-style match: same trailing digits, one's prefix a
+    prefix of the other's. Ambiguous alone (Tw also prefixes TwentyFiveGigE)
+    -- callers try _exact_match across every header first."""
     a, b = a.strip(), b.strip()
     if not a or not b:
         return False
@@ -52,19 +42,15 @@ def _prefix_match(a: str, b: str) -> bool:
 
 
 def _names_match(a: str, b: str) -> bool:
-    """Nodes' SNMP ifName/ifDescr (short or long form) against a config's
-    own interface name -- exact match or the prefix rule (see
-    _prefix_match). Used by the Juniper brace-matcher, which has no
-    multi-header ambiguity to resolve with a two-pass search."""
+    """Exact or prefix match; used by the Juniper brace-matcher, which has
+    no multi-header ambiguity to resolve with a two-pass search."""
     return _exact_match(a, b) or _prefix_match(a, b)
 
 
 def _indented_block(lines: list[str], start: int) -> str:
-    """`lines[start]` is the 'interface ...' header. Collects it plus every
-    following line that is indented or is a bare '!' separator, stopping at
-    the first non-indented line that is not '!' -- which is either the next
-    stanza's own header (NX-OS's no-separator style) or a '!'-delimited
-    block's separator. The trailing '!', if any, is dropped."""
+    """Collects the header at lines[start] plus every indented or bare '!'
+    line after it, stopping at the next non-indented line; a trailing '!'
+    is dropped."""
     block = [lines[start]]
     for line in lines[start + 1:]:
         if line.startswith((" ", "\t")) or line.strip() == "!":
@@ -81,9 +67,8 @@ _JUNIPER_NAMED_BLOCK_RE = re.compile(r"^\s*(\S+)\s*\{\s*$")
 
 
 def _juniper_block(text: str, candidates: list[str]) -> str | None:
-    """A simplified brace-matcher for Junos' pretty-printed `interfaces {
-    ge-0/0/0 { ... } }` form -- one token per line, as `show configuration`
-    prints it. Does not attempt Junos' single-line `set` output."""
+    """Brace-matcher for Junos' pretty-printed `interfaces { ge-0/0/0 { ...
+    } }` form; does not attempt the single-line `set` output."""
     lines = text.split("\n")
     depth = 0
     inside = False
@@ -114,14 +99,10 @@ def _juniper_block(text: str, candidates: list[str]) -> str | None:
 
 
 def interface_stanza(text: str, names: list[str]) -> str | None:
-    """The stored config's own block for one interface, or None when no
-    line names it. `names` is the caller's candidate list (typically the
-    interface's ifName and ifDescr); any one of them matching is enough.
-
-    Two passes over every header: exact equality first, then the prefix
-    rule -- otherwise an earlier prefix-only match (Tw1/0/1 against
-    TwentyFiveGigE1/0/1) could win over a later exact one for the same
-    file."""
+    """The stored config's own block for one of `names` (ifName/ifDescr),
+    or None. Two passes over every header -- exact equality, then the
+    prefix rule -- so an earlier prefix-only hit (Tw1/0/1 against
+    TwentyFiveGigE1/0/1) never wins over a later exact one."""
     if not text:
         return None
     candidates = [n for n in names if n]
